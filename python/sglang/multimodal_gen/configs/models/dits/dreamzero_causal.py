@@ -37,10 +37,20 @@ class DreamZeroCausalWanArchConfig(DiTArchConfig):
     num_action_per_block: int = 24
     num_state_per_block: int = 1
     concat_first_frame_latent: bool = True
+    rope_video_max_positions: tuple[int, int, int] = (1024, 1024, 1024)
+    rope_action_max_positions: int = 10240
+    rope_state_max_positions: int = 1024
     use_tensor_parallel: bool = False
 
     def __post_init__(self) -> None:
         super().__post_init__()
+        for name, value in (
+            ("rope_video_max_positions", min(self.rope_video_max_positions)),
+            ("rope_action_max_positions", self.rope_action_max_positions),
+            ("rope_state_max_positions", self.rope_state_max_positions),
+        ):
+            if value < 1:
+                raise ValueError(f"{name} must be at least 1")
         self.num_attention_heads = self.num_heads
         self.num_channels_latents = self.out_dim
 

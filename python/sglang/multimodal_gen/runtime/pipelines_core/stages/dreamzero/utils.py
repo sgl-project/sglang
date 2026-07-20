@@ -125,16 +125,8 @@ def infer_dreamzero_model_input_batch_size(model_inputs: Mapping[str, Any]) -> i
         "state",
         "text",
         "text_negative",
-        "clip_feature",
-        "y",
-        "latent_video",
     ):
         value = model_inputs.get(key)
         if torch.is_tensor(value) and value.ndim > 0:
             return int(value.shape[0])
-    prompt_embs = model_inputs.get("prompt_embs")
-    if isinstance(prompt_embs, (list, tuple)):
-        for value in prompt_embs:
-            if torch.is_tensor(value) and value.ndim > 0:
-                return int(value.shape[0])
     raise ValueError("Cannot infer DreamZero batch size from normalized input")

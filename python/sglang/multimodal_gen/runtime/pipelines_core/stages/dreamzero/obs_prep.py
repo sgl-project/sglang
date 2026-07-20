@@ -34,7 +34,7 @@ class DreamZeroObsPrepStage(PipelineStage):
         result = VerificationResult()
         result.add_check(
             "dreamzero_inputs",
-            getattr(batch, "dreamzero_inputs", None),
+            batch.dreamzero_inputs,
             lambda value: isinstance(value, dict),
         )
         return result
@@ -63,13 +63,7 @@ class DreamZeroObsPrepStage(PipelineStage):
             )
 
         if not isinstance(normalized_input, Mapping):
-            if hasattr(normalized_input, "__getstate__"):
-                normalized_input = normalized_input.__getstate__()
-            else:
-                raise TypeError(
-                    "DreamZero normalized input must be a mapping or expose "
-                    "__getstate__()"
-                )
+            raise TypeError("DreamZero normalized input must be a mapping")
 
         model_inputs = self._to_tensor_tree(dict(normalized_input))
         normalize_start = time.perf_counter()

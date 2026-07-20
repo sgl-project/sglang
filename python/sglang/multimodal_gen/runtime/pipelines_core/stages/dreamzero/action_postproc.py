@@ -18,7 +18,7 @@ class DreamZeroActionOutputStage(PipelineStage):
         result = VerificationResult()
         result.add_check(
             "dreamzero_action_pred",
-            getattr(batch, "dreamzero_action_pred", None),
+            batch.dreamzero_action_pred,
             torch.is_tensor,
         )
         return result

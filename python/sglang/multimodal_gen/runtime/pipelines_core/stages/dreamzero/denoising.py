@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -536,7 +535,6 @@ class DreamZeroCausalDenoisingStage(PipelineStage):
             dtype=dtype,
         )
         kv_caches, crossattn_caches = self._prepare_branch_caches(
-            request_cache=request_cache,
             session_state=session_state,
             slots=slots,
             current_start_frame=current_start_frame,
@@ -572,8 +570,6 @@ class DreamZeroCausalDenoisingStage(PipelineStage):
         cfg_parallel = bool(getattr(server_args, "enable_cfg_parallel", False))
         source_prompt_embs = batch.dreamzero_prompt_embs
         prompt_embs = [emb.to(device=device, dtype=dtype) for emb in source_prompt_embs]
-        if not cfg_parallel and len(prompt_embs) == 1:
-            prompt_embs = [prompt_embs[0], prompt_embs[0]]
         if cfg_parallel:
             if len(prompt_embs) not in (1, 2):
                 raise RuntimeError(
@@ -605,7 +601,6 @@ class DreamZeroCausalDenoisingStage(PipelineStage):
     def _prepare_branch_caches(
         self,
         *,
-        request_cache: Any,
         session_state: Any,
         slots: list[int],
         current_start_frame: int,
@@ -715,27 +710,6 @@ class DreamZeroCausalDenoisingStage(PipelineStage):
             )
             self._scatter_active_branch_caches(ctx)
 
-    def _maybe_return_prefill_only(
-        self,
-        batch: Req,
-        ctx: DreamZeroDenoisingContext,
-    ) -> Req | None:
-        if os.environ.get("DREAMZERO_SELF_CONTAINED_PREFILL_ONLY", "0") != "1":
-            return None
-        batch.dreamzero_prefill_only = True
-        batch.dreamzero_action_pred = torch.zeros(
-            ctx.inputs.batch_size,
-            ctx.noise.action_horizon,
-            ctx.noise.action_dim,
-            device=ctx.inputs.device,
-            dtype=torch.float32,
-        )
-        record_session_timing(batch, "kv_split_append_ms", 0.0)
-        record_session_timing(batch, "session_scatter_ms", 0.0)
-        self._set_request_metadata(batch, ctx)
-        batch.output = batch.dreamzero_action_pred
-        return batch
-
     def _prepare_rollout_state(self, ctx: DreamZeroDenoisingContext) -> torch.Tensor:
         state = ctx.inputs.request_inputs.get("state")
         if state is None:
@@ -816,11 +790,19 @@ class DreamZeroCausalDenoisingStage(PipelineStage):
         )
         cfg_scale = server_args.pipeline_config.cfg_scale
         if ctx.branches.cfg_rank is None:
-            flow_pred_cond, flow_pred_action_cond = predictions[0]
-            flow_pred_uncond, _ = predictions[1]
-            flow_pred = flow_pred_uncond + cfg_scale * (
-                flow_pred_cond - flow_pred_uncond
-            )
+            if len(predictions) == 1:
+                flow_pred, flow_pred_action_cond = predictions[0]
+            elif len(predictions) == 2:
+                flow_pred_cond, flow_pred_action_cond = predictions[0]
+                flow_pred_uncond, _ = predictions[1]
+                flow_pred = flow_pred_uncond + cfg_scale * (
+                    flow_pred_cond - flow_pred_uncond
+                )
+            else:
+                raise RuntimeError(
+                    "DreamZero local CFG expects one cond branch or two "
+                    f"cond/uncond branches, got {len(predictions)}"
+                )
         else:
             flow_pred, flow_pred_action_cond = self._combine_cfg_parallel_predictions(
                 local_prediction=predictions[0],
@@ -934,9 +916,6 @@ class DreamZeroCausalDenoisingStage(PipelineStage):
             self.transformer = transformer
             ctx = self._prepare_context(batch, server_args)
             self._run_prefill(ctx)
-            prefill_result = self._maybe_return_prefill_only(batch, ctx)
-            if prefill_result is not None:
-                return prefill_result
             self._run_action_rollout(batch, server_args, ctx)
             return self._finalize_request(batch, ctx)
 

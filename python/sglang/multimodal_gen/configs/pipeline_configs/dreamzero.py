@@ -46,7 +46,7 @@ class DreamZeroPipelineConfig(PipelineConfig):
     )
     image_encoder_precision: str = "bf16"
     dreamzero_compile_components: bool = True
-    dreamzero_use_tensor_parallel: bool = False
+    dreamzero_tensor_parallel_size: int = 1
     dreamzero_sequence_parallel_size: int = 1
     dreamzero_max_sessions: int = 10
 
@@ -106,6 +106,8 @@ class DreamZeroPipelineConfig(PipelineConfig):
     tiled: bool = False
 
     def __post_init__(self) -> None:
+        if self.dreamzero_tensor_parallel_size < 1:
+            raise ValueError("dreamzero_tensor_parallel_size must be at least 1")
         if self.dreamzero_sequence_parallel_size < 1:
             raise ValueError("dreamzero_sequence_parallel_size must be at least 1")
         self.vae_config.load_encoder = True

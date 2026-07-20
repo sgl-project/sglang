@@ -54,7 +54,6 @@ class DreamZeroSamplingParams(VLASamplingParams):
         elif self.prompt is None:
             self.prompt = ""
         super()._adjust(server_args)
-        self.num_inference_steps = type(self).num_inference_steps
 
     def _set_output_file_name(self):
         if self.output_file_name is None:

@@ -13,6 +13,9 @@ import math
 import torch
 import torch.nn as nn
 
+from sglang.multimodal_gen.configs.models.dits.dreamzero_causal import (
+    DreamZeroCausalWanConfig,
+)
 from sglang.multimodal_gen.runtime.distributed import (
     divide,
     get_sp_parallel_rank,
@@ -37,6 +40,7 @@ from sglang.multimodal_gen.runtime.models.dits.dreamzero_causal_ops import (
     rope_params,
     sinusoidal_embedding_1d,
 )
+from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.pipelines_core.stages.dreamzero.utils import (
     flatten_dim_sp_into_sequence,
     gather_full_sequence_parallel_tensor,
@@ -1036,9 +1040,27 @@ class MLPProj(nn.Module):
         return self.proj(image_embeds)
 
 
-class DreamZeroCausalWanModel(nn.Module):
+class DreamZeroCausalWanModel(CachableDiT):
+    _fsdp_shard_conditions = (
+        DreamZeroCausalWanConfig().arch_config._fsdp_shard_conditions
+    )
+    _compile_conditions = DreamZeroCausalWanConfig().arch_config._compile_conditions
+    _supported_attention_backends = (
+        DreamZeroCausalWanConfig().arch_config._supported_attention_backends
+    )
+    param_names_mapping = DreamZeroCausalWanConfig().arch_config.param_names_mapping
+    reverse_param_names_mapping = (
+        DreamZeroCausalWanConfig().arch_config.reverse_param_names_mapping
+    )
+    lora_param_names_mapping = (
+        DreamZeroCausalWanConfig().arch_config.lora_param_names_mapping
+    )
+
     def __init__(
         self,
+        config: DreamZeroCausalWanConfig | None = None,
+        hf_config: dict | None = None,
+        quant_config=None,
         model_type: str = "t2v",
         patch_size: tuple[int, int, int] = (1, 2, 2),
         frame_seqlen: int = 220,
@@ -1062,9 +1084,46 @@ class DreamZeroCausalWanModel(nn.Module):
         num_action_per_block: int = 32,
         num_state_per_block: int = 1,
         concat_first_frame_latent: bool = True,
+        rope_video_max_positions: tuple[int, int, int] = (1024, 1024, 1024),
+        rope_action_max_positions: int = 10240,
+        rope_state_max_positions: int = 1024,
         use_tensor_parallel: bool = False,
     ):
-        super().__init__()
+        if config is not None:
+            arch = config.arch_config
+            model_type = arch.model_type
+            patch_size = arch.patch_size
+            frame_seqlen = arch.frame_seqlen
+            text_len = arch.text_len
+            in_dim = arch.in_dim
+            dim = arch.dim
+            ffn_dim = arch.ffn_dim
+            freq_dim = arch.freq_dim
+            text_dim = arch.text_dim
+            out_dim = arch.out_dim
+            num_heads = arch.num_heads
+            num_layers = arch.num_layers
+            max_chunk_size = arch.max_chunk_size
+            qk_norm = arch.qk_norm
+            cross_attn_norm = arch.cross_attn_norm
+            eps = arch.eps
+            num_frame_per_block = arch.num_frame_per_block
+            action_dim = arch.action_dim
+            max_state_dim = arch.max_state_dim
+            hidden_size = arch.hidden_size
+            num_action_per_block = arch.num_action_per_block
+            num_state_per_block = arch.num_state_per_block
+            concat_first_frame_latent = arch.concat_first_frame_latent
+            rope_video_max_positions = arch.rope_video_max_positions
+            rope_action_max_positions = arch.rope_action_max_positions
+            rope_state_max_positions = arch.rope_state_max_positions
+            use_tensor_parallel = arch.use_tensor_parallel
+            super().__init__(config=config, hf_config=hf_config or {})
+        else:
+            super().__init__(
+                config=DreamZeroCausalWanConfig(),
+                hf_config=hf_config or {},
+            )
         assert model_type in ["t2v", "i2v", "ti2v"]
         self.model_type = model_type
         self.patch_size = patch_size
@@ -1094,6 +1153,9 @@ class DreamZeroCausalWanModel(nn.Module):
         self.num_action_per_block = num_action_per_block
         self.num_state_per_block = num_state_per_block
         self.concat_first_frame_latent = concat_first_frame_latent
+        self.rope_video_max_positions = rope_video_max_positions
+        self.rope_action_max_positions = rope_action_max_positions
+        self.rope_state_max_positions = rope_state_max_positions
         self.use_tensor_parallel = use_tensor_parallel
 
         self.state_encoder = CategorySpecificMLP(
@@ -1153,16 +1215,24 @@ class DreamZeroCausalWanModel(nn.Module):
         self.head = DreamZeroCausalHead(dim, out_dim, patch_size, eps)
 
         assert (dim % num_heads) == 0 and (dim // num_heads) % 2 == 0
-        head_dim = dim // num_heads
-        self.freqs_action = rope_params(1024 * 10, head_dim)
-        self.freqs_state = rope_params(1024, head_dim)
-        self.freqs = [
-            rope_params(1024, head_dim - 4 * (head_dim // 6)),
-            rope_params(1024, 2 * (head_dim // 6)),
-            rope_params(1024, 2 * (head_dim // 6)),
-        ]
+        self._init_rope_freqs(torch.device("cpu"))
         if model_type in ("i2v", "ti2v"):
             self.img_emb = MLPProj(1280, dim)
+
+    def _init_rope_freqs(self, device: torch.device) -> None:
+        head_dim = self.dim // self.num_heads
+        max_frames, max_height, max_width = self.rope_video_max_positions
+        with torch.device(device):
+            self.freqs_action = rope_params(self.rope_action_max_positions, head_dim)
+            self.freqs_state = rope_params(self.rope_state_max_positions, head_dim)
+            self.freqs = [
+                rope_params(max_frames, head_dim - 4 * (head_dim // 6)),
+                rope_params(max_height, 2 * (head_dim // 6)),
+                rope_params(max_width, 2 * (head_dim // 6)),
+            ]
+
+    def post_load_weights(self) -> None:
+        self._init_rope_freqs(self.patch_embedding.weight.device)
 
     def _create_freqs(self, grid_size: torch.Tensor, start_frame: int) -> torch.Tensor:
         device = self.patch_embedding.weight.device
@@ -1357,9 +1427,7 @@ class DreamZeroCausalWanModel(nn.Module):
         return video_noise_pred, action_noise_pred, updated_kv_caches
 
     def forward(self, *args, **kwargs):
-        if kwargs.get("kv_cache", None) is not None:
-            return self._forward_inference(*args, **kwargs)
-        raise NotImplementedError("DreamZero training forward is outside Phase 2.3")
+        return self._forward_inference(*args, **kwargs)
 
     def unpatchify(self, x: torch.Tensor, grid_size: torch.Tensor) -> torch.Tensor:
         batch = x.shape[0]

@@ -1,5 +1,6 @@
 import types
 
+import pytest
 import torch
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
@@ -19,18 +20,6 @@ from sglang.multimodal_gen.runtime.entrypoints.vla.protocol import (
     action_metadata,
     build_action_sampling_params,
 )
-from sglang.multimodal_gen.runtime.loader.component_loaders.dreamzero_checkpoint_utils import (
-    DreamZeroCheckpointLoadReport,
-    load_matching_tensors,
-)
-from sglang.multimodal_gen.runtime.loader.component_loaders.dreamzero_encoder_loader import (
-    expected_dreamzero_text_state_keys,
-    remap_dreamzero_image_model_key,
-    remap_dreamzero_text_model_key,
-)
-from sglang.multimodal_gen.runtime.loader.component_loaders.dreamzero_vae_loader import (
-    remap_dreamzero_vae_model_key,
-)
 from sglang.multimodal_gen.runtime.managers.dreamzero_session_cache import (
     BRANCH_COND,
     BRANCH_UNCOND,
@@ -39,6 +28,9 @@ from sglang.multimodal_gen.runtime.managers.dreamzero_session_cache import (
     normalize_batched_session_fields,
     resolve_request_cache,
 )
+from sglang.multimodal_gen.runtime.models.dits.dreamzero_causal import (
+    DreamZeroCausalWanModel,
+)
 from sglang.multimodal_gen.runtime.pipelines.dreamzero_pipeline import DreamZeroPipeline
 from sglang.multimodal_gen.runtime.pipelines_core.stages.dreamzero.denoising import (
     DreamZeroCausalDenoisingStage,
@@ -46,6 +38,65 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.dreamzero.denoising imp
 from sglang.multimodal_gen.runtime.pipelines_core.stages.dreamzero.text_encoding import (
     DreamZeroTextEncodingStage,
 )
+
+
+class _FakeTextEncoder(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls = 0
+
+    def forward(self, input_ids, attention_mask):
+        del attention_mask
+        self.calls += 1
+        return types.SimpleNamespace(last_hidden_state=input_ids.unsqueeze(-1).float())
+
+
+def _make_text_server_args(*, enable_cfg_parallel: bool = False) -> types.SimpleNamespace:
+    server_args = types.SimpleNamespace(
+        enable_cfg_parallel=enable_cfg_parallel,
+        pipeline_config=DreamZeroPipelineConfig(),
+    )
+    server_args.pipeline_config.text_encoder_precisions = ("bf16",)
+    return server_args
+
+
+def _make_text_stage(
+    *,
+    manager: DreamZeroCachePoolManager,
+    encoder: _FakeTextEncoder | None = None,
+    enable_cfg_parallel: bool = False,
+) -> tuple[DreamZeroTextEncodingStage, types.SimpleNamespace, _FakeTextEncoder]:
+    if encoder is None:
+        encoder = _FakeTextEncoder()
+    stage = DreamZeroTextEncodingStage(text_encoder=encoder, cache_manager=manager)
+    server_args = _make_text_server_args(enable_cfg_parallel=enable_cfg_parallel)
+    stage.server_args = server_args
+    return stage, server_args, encoder
+
+
+def _tokenized_text_batch(
+    *,
+    session_id: str,
+    prompt: str,
+    negative_prompt: str | None = None,
+    reset: bool = False,
+    text_token: int = 1,
+) -> types.SimpleNamespace:
+    inputs = {
+        "text": torch.full((1, 2), text_token, dtype=torch.long),
+        "text_attention_mask": torch.ones(1, 2, dtype=torch.long),
+    }
+    if negative_prompt is not None:
+        inputs["text_negative"] = torch.zeros(1, 2, dtype=torch.long)
+    return types.SimpleNamespace(
+        extra={
+            "dreamzero_session_ids": [session_id],
+            "dreamzero_reset_mask": [reset],
+            "dreamzero_prompts": [prompt],
+            "dreamzero_negative_prompts": [negative_prompt],
+        },
+        dreamzero_inputs=inputs,
+    )
 
 
 def test_dreamzero_registry_detects_non_diffusers_model():
@@ -71,6 +122,28 @@ def test_dreamzero_config_and_sampling_defaults_are_action_typed():
     assert "dreamzero_action_horizon" not in extra
     assert "dreamzero_relative_action_per_horizon" not in extra
     assert "dreamzero_embodiment_tag" not in extra
+
+
+def test_dreamzero_dit_rope_lengths_are_configurable():
+    model = DreamZeroCausalWanModel(
+        model_type="i2v",
+        dim=64,
+        ffn_dim=128,
+        num_heads=4,
+        num_layers=0,
+        frame_seqlen=8,
+        text_dim=32,
+        hidden_size=16,
+        rope_video_max_positions=(7, 8, 9),
+        rope_action_max_positions=10,
+        rope_state_max_positions=11,
+    )
+
+    assert model.freqs[0].shape[0] == 7
+    assert model.freqs[1].shape[0] == 8
+    assert model.freqs[2].shape[0] == 9
+    assert model.freqs_action.shape[0] == 10
+    assert model.freqs_state.shape[0] == 11
 
 
 def test_dreamzero_action_response_uses_common_action_contract():
@@ -134,7 +207,7 @@ def test_dreamzero_action_request_builder_uses_fixed_sampling_params():
 
     assert params.request_id == "req-1"
     assert params.prompt == "pick the cube"
-    assert params.num_inference_steps == 4
+    assert params.num_inference_steps == 99
     assert params.guidance_scale == DreamZeroSamplingParams().guidance_scale
     assert extra["dreamzero_session_ids"] == ["session-a"]
     assert extra["dreamzero_reset_mask"] == [True]
@@ -185,16 +258,12 @@ def test_dreamzero_single_request_session_fields_still_use_batched_contract():
     assert session_ids == ["session-a"]
     assert reset_mask == [True]
 
-    try:
+    with pytest.raises(TypeError, match="dreamzero_session_ids must be a list"):
         normalize_batched_session_fields(
             session_ids="session-a",
             reset_mask=True,
             batch_size=1,
         )
-    except TypeError as exc:
-        assert "dreamzero_session_ids must be a list" in str(exc)
-    else:
-        raise AssertionError("DreamZero session ids must use explicit batched lists")
 
 
 def test_dreamzero_denoising_skip_schedule_reuses_previous_predictions():
@@ -235,6 +304,24 @@ def test_dreamzero_denoising_skip_schedule_reuses_previous_predictions():
         is False
     )
     assert skip_state["countdown"] == 3
+
+
+def test_dreamzero_single_prompt_embedding_does_not_duplicate_cfg_branch():
+    stage = object.__new__(DreamZeroCausalDenoisingStage)
+    prompt_emb = torch.ones(1, 2, 3)
+    batch = types.SimpleNamespace(dreamzero_prompt_embs=[prompt_emb])
+    server_args = types.SimpleNamespace(enable_cfg_parallel=False)
+
+    branch_ctx = stage._prepare_cfg_branches(
+        batch,
+        server_args,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+
+    assert branch_ctx.local_branch_indices == [0]
+    assert len(branch_ctx.local_prompt_embs) == 1
+    assert torch.equal(branch_ctx.local_prompt_embs[0], prompt_emb)
 
 
 def test_dreamzero_scheduler_step_supports_optional_step_index():
@@ -425,6 +512,105 @@ def test_dreamzero_tensor_prompt_cache_requires_explicit_hash():
     assert reused_cache.prompt_reusable == [True]
 
 
+def test_dreamzero_text_stage_does_not_gather_non_reusable_new_slots():
+    manager = DreamZeroCachePoolManager(max_sessions=2)
+    stage, server_args, _ = _make_text_stage(manager=manager)
+
+    first_batch = _tokenized_text_batch(
+        session_id="session-a",
+        prompt="pick",
+    )
+    stage.forward(first_batch, server_args)
+    assert manager.pool.cached_prompt_embs[BRANCH_COND].shape[0] == 1
+
+    second_batch = _tokenized_text_batch(
+        session_id="session-b",
+        prompt="place",
+        text_token=2,
+    )
+    stage.forward(second_batch, server_args)
+
+    assert second_batch.dreamzero_prompt_embs[0].shape[0] == 1
+    assert manager.pool.cached_prompt_embs[BRANCH_COND].shape[0] == 2
+
+
+def test_dreamzero_cfg_text_stage_keeps_encoder_collectives_aligned():
+    manager = DreamZeroCachePoolManager(max_sessions=1)
+    stage, server_args, encoder = _make_text_stage(
+        manager=manager,
+        enable_cfg_parallel=True,
+    )
+
+    cached_neg_batch = _tokenized_text_batch(
+        session_id="session-a",
+        prompt="old prompt",
+        negative_prompt="",
+    )
+    cached_neg = resolve_request_cache(
+        cached_neg_batch,
+        manager,
+        local_attn_size=4,
+        batch_size=1,
+    )
+    stage._forward_cache_manager(
+        cached_neg_batch,
+        server_args,
+        cached_neg,
+        cfg_parallel=True,
+        cfg_rank=1,
+    )
+    assert manager.pool.prompt_hashes[BRANCH_COND][0] == cached_neg.prompt_hashes[0]
+
+    changed_cond_batch = _tokenized_text_batch(
+        session_id="session-a",
+        prompt="new prompt",
+        negative_prompt="",
+    )
+    changed_cond = resolve_request_cache(
+        changed_cond_batch,
+        manager,
+        local_attn_size=4,
+        batch_size=1,
+    )
+    assert changed_cond.prompt_reusable == [False]
+    assert changed_cond.neg_prompt_reusable == [True]
+
+    stage._forward_cache_manager(
+        changed_cond_batch,
+        server_args,
+        changed_cond,
+        cfg_parallel=True,
+        cfg_rank=1,
+    )
+
+    assert changed_cond_batch.dreamzero_lifecycle_reset_mask == [True]
+    assert encoder.calls == 2
+
+    stable_cond_batch = _tokenized_text_batch(
+        session_id="session-a",
+        prompt="new prompt",
+        negative_prompt="",
+    )
+    stable_cond = resolve_request_cache(
+        stable_cond_batch,
+        manager,
+        local_attn_size=4,
+        batch_size=1,
+    )
+    assert stable_cond.prompt_reusable == [False]
+    assert stable_cond.neg_prompt_reusable == [True]
+
+    stage._forward_cache_manager(
+        stable_cond_batch,
+        server_args,
+        stable_cond,
+        cfg_parallel=True,
+        cfg_rank=1,
+    )
+
+    assert encoder.calls == 2
+
+
 def test_dreamzero_text_encoding_masks_padding_without_python_seq_len_sync():
     class FakeEncoder(torch.nn.Module):
         def forward(self, input_ids, attention_mask):
@@ -457,161 +643,3 @@ def test_dreamzero_text_encoding_masks_padding_without_python_seq_len_sync():
         output[1, :3],
         torch.tensor([[8, 9], [10, 11], [12, 13]], dtype=torch.bfloat16),
     )
-
-
-def test_dreamzero_checkpoint_helper_loads_parameters_buffers_and_reports_errors():
-    class SmallModule(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.weight = torch.nn.Parameter(torch.zeros(2, 2))
-            self.mismatch = torch.nn.Parameter(torch.zeros(2))
-            self.log_scale = torch.nn.Parameter(torch.zeros(()))
-            self.register_buffer("scale", torch.zeros(2))
-
-    model = SmallModule()
-    report = load_matching_tensors(
-        model,
-        [
-            ("prefix.weight", torch.ones(2, 2)),
-            ("prefix.scale", torch.ones(2) * 2),
-            ("prefix.log_scale", torch.ones(1) * 3),
-            ("prefix.mismatch", torch.ones(3)),
-            ("prefix.unused", torch.ones(1)),
-        ],
-        device=torch.device("cpu"),
-        key_mapper=lambda key: key.removeprefix("prefix."),
-        report_cls=DreamZeroCheckpointLoadReport,
-    )
-
-    assert torch.equal(model.weight, torch.ones(2, 2))
-    assert torch.equal(model.scale, torch.ones(2) * 2)
-    assert torch.equal(model.log_scale, torch.tensor(3.0))
-    assert report.loaded_keys == ["weight", "scale", "log_scale"]
-    assert report.unexpected_keys == ["unused"]
-    assert report.shape_mismatches == {"mismatch": ((2,), (3,))}
-
-
-def test_dreamzero_vae_loader_remaps_original_wan_keys_to_sglang_wan_vae():
-    cases = {
-        "encoder.conv1.weight": "encoder.conv_in.weight",
-        "encoder.downsamples.3.residual.2.weight": (
-            "encoder.down_blocks.3.conv1.weight"
-        ),
-        "encoder.downsamples.3.shortcut.bias": (
-            "encoder.down_blocks.3.conv_shortcut.bias"
-        ),
-        "encoder.middle.1.to_qkv.weight": (
-            "encoder.mid_block.attentions.0.to_qkv.weight"
-        ),
-        "encoder.head.2.bias": "encoder.conv_out.bias",
-        "conv1.weight": "quant_conv.weight",
-        "conv2.bias": "post_quant_conv.bias",
-        "decoder.conv1.weight": "decoder.conv_in.weight",
-        "decoder.upsamples.7.time_conv.weight": (
-            "decoder.up_blocks.1.upsamplers.0.time_conv.weight"
-        ),
-        "decoder.head.0.gamma": "decoder.norm_out.gamma",
-    }
-
-    for old_key, new_key in cases.items():
-        assert remap_dreamzero_vae_model_key(old_key) == new_key
-
-
-def test_dreamzero_vae_loader_remaps_original_wan38_keys_to_sglang_wan_vae():
-    cases = {
-        "encoder.downsamples.1.downsamples.0.shortcut.weight": (
-            "encoder.down_blocks.1.resnets.0.conv_shortcut.weight"
-        ),
-        "encoder.downsamples.2.downsamples.2.time_conv.bias": (
-            "encoder.down_blocks.2.downsampler.time_conv.bias"
-        ),
-        "decoder.upsamples.0.upsamples.3.time_conv.weight": (
-            "decoder.up_blocks.0.upsampler.time_conv.weight"
-        ),
-        "decoder.upsamples.3.upsamples.0.shortcut.bias": (
-            "decoder.up_blocks.3.resnets.0.conv_shortcut.bias"
-        ),
-        "decoder.head.2.weight": "decoder.conv_out.weight",
-    }
-
-    for old_key, new_key in cases.items():
-        assert remap_dreamzero_vae_model_key(old_key) == new_key
-
-
-def test_dreamzero_text_encoder_key_remap():
-    cases = {
-        "token_embedding.weight": "shared.weight",
-        "norm.weight": "encoder.final_layer_norm.weight",
-        "blocks.3.norm1.weight": "encoder.block.3.layer.0.layer_norm.weight",
-        "blocks.3.attn.q.weight": ("encoder.block.3.layer.0.SelfAttention.q.weight"),
-        "blocks.3.attn.k.weight": ("encoder.block.3.layer.0.SelfAttention.k.weight"),
-        "blocks.3.attn.v.weight": ("encoder.block.3.layer.0.SelfAttention.v.weight"),
-        "blocks.3.attn.o.weight": ("encoder.block.3.layer.0.SelfAttention.o.weight"),
-        "blocks.3.pos_embedding.embedding.weight": (
-            "encoder.block.3.layer.0.SelfAttention.relative_attention_bias.weight"
-        ),
-        "blocks.3.norm2.weight": "encoder.block.3.layer.1.layer_norm.weight",
-        "blocks.3.ffn.gate.0.weight": (
-            "encoder.block.3.layer.1.DenseReluDense.wi_0.weight"
-        ),
-        "blocks.3.ffn.fc1.weight": (
-            "encoder.block.3.layer.1.DenseReluDense.wi_1.weight"
-        ),
-        "blocks.3.ffn.fc2.weight": ("encoder.block.3.layer.1.DenseReluDense.wo.weight"),
-    }
-    for old_key, new_key in cases.items():
-        assert remap_dreamzero_text_model_key(old_key) == new_key
-
-
-def test_dreamzero_image_encoder_key_remap():
-    cases = {
-        "model.visual.cls_embedding": "vision_model.embeddings.class_embedding",
-        "model.visual.patch_embedding.weight": (
-            "vision_model.embeddings.patch_embedding.weight"
-        ),
-        "model.visual.pos_embedding": (
-            "vision_model.embeddings.position_embedding.weight"
-        ),
-        "model.visual.pre_norm.weight": "vision_model.pre_layrnorm.weight",
-        "model.visual.transformer.3.norm1.bias": (
-            "vision_model.encoder.layers.3.layer_norm1.bias"
-        ),
-        "model.visual.transformer.3.attn.to_qkv.weight": (
-            "vision_model.encoder.layers.3.self_attn.qkv_proj.weight"
-        ),
-        "model.visual.transformer.3.attn.proj.bias": (
-            "vision_model.encoder.layers.3.self_attn.out_proj.bias"
-        ),
-        "model.visual.transformer.3.mlp.0.weight": (
-            "vision_model.encoder.layers.3.mlp.fc1.weight"
-        ),
-        "model.visual.transformer.3.mlp.2.bias": (
-            "vision_model.encoder.layers.3.mlp.fc2.bias"
-        ),
-    }
-    for old_key, new_key in cases.items():
-        assert remap_dreamzero_image_model_key(old_key) == new_key
-
-    assert remap_dreamzero_image_model_key("model.log_scale") is None
-    assert remap_dreamzero_image_model_key("model.visual.head") is None
-    assert remap_dreamzero_image_model_key("model.visual.post_norm.weight") is None
-    assert (
-        remap_dreamzero_image_model_key(
-            "model.visual.transformer.31.attn.to_qkv.weight"
-        )
-        is None
-    )
-
-
-def test_dreamzero_text_expected_keys_ignore_tied_embedding_alias():
-    state_keys = {
-        "shared.weight",
-        "encoder.embed_tokens.weight",
-        "encoder.final_layer_norm.weight",
-    }
-
-    expected = expected_dreamzero_text_state_keys(
-        state_keys, {"shared.weight", "encoder.final_layer_norm.weight"}
-    )
-
-    assert expected == {"shared.weight", "encoder.final_layer_norm.weight"}

@@ -35,7 +35,7 @@ class DreamZeroCachePool:
     kv_lengths: dict[int, list[int]] = field(init=False)
     crossattn_valid: dict[int, list[bool]] = field(init=False)
 
-    kv_cache1: list[torch.Tensor] = field(default_factory=list)
+    kv_cache_pos: list[torch.Tensor] = field(default_factory=list)
     kv_cache_neg: list[torch.Tensor] = field(default_factory=list)
     crossattn_cache: list[dict[str, Any]] = field(default_factory=list)
     crossattn_cache_neg: list[dict[str, Any]] = field(default_factory=list)
@@ -57,11 +57,11 @@ class DreamZeroCachePool:
         self.cached_prompt_embs = {branch: None for branch in BRANCHES}
 
     def branch_kv_cache(self, branch: int) -> list[torch.Tensor]:
-        return self.kv_cache1 if branch == BRANCH_COND else self.kv_cache_neg
+        return self.kv_cache_pos if branch == BRANCH_COND else self.kv_cache_neg
 
     def set_branch_kv_cache(self, branch: int, value: list[torch.Tensor]) -> None:
         if branch == BRANCH_COND:
-            self.kv_cache1 = value
+            self.kv_cache_pos = value
         else:
             self.kv_cache_neg = value
 
@@ -207,7 +207,7 @@ class DreamZeroCachePool:
         lengths = [self.kv_lengths[branch][slot] for slot in slots]
         if len(set(lengths)) != 1:
             raise ValueError(
-                "DreamZero v1 requires uniform KV lengths within one batch: "
+                "DreamZero cache now only surpports uniform KV lengths within one batch"
                 f"{lengths}"
             )
         if not all(self.kv_valid[branch][slot] for slot in slots):
@@ -367,20 +367,15 @@ class DreamZeroRequestCache:
     def batch_size(self) -> int:
         return len(self.logical_session_ids)
 
-    def pool(
-        self, cache_manager: DreamZeroCachePoolManager | None
-    ) -> DreamZeroCachePool:
-        if cache_manager is None:
-            raise RuntimeError(
-                "DreamZero request cache view requires a rank-local cache manager"
-            )
-        return cache_manager.pool
-
     def current_start_frames(
         self,
         cache_manager: DreamZeroCachePoolManager | None,
     ) -> list[int]:
-        pool = self.pool(cache_manager)
+        if cache_manager is None:
+            raise RuntimeError(
+                "DreamZero request cache view requires a rank-local cache manager"
+            )
+        pool = cache_manager.pool
         return [int(pool.current_start_frames[slot]) for slot in self.slot_indices]
 
     def uniform_current_start_frame(
@@ -400,7 +395,11 @@ class DreamZeroRequestCache:
         cache_manager: DreamZeroCachePoolManager | None,
         value: int,
     ) -> None:
-        pool = self.pool(cache_manager)
+        if cache_manager is None:
+            raise RuntimeError(
+                "DreamZero request cache view requires a rank-local cache manager"
+            )
+        pool = cache_manager.pool
         for slot in self.slot_indices:
             pool.current_start_frames[slot] = int(value)
 
@@ -698,7 +697,7 @@ def apply_request_lifecycle_resets(
         cache_manager._active_reset_apply_token = token
         cache_manager._applied_reset_tokens.clear()
 
-    pool = request_cache.pool(cache_manager)
+    pool = cache_manager.pool
     for index, slot in enumerate(request_cache.slot_indices):
         request_reset = bool(request_cache.reset_mask[index])
         lifecycle_reset = bool(lifecycle_mask[index])
@@ -730,7 +729,9 @@ def enter_request_cache(
         batch_size=batch_size,
     )
     apply_request_lifecycle_resets(batch, cache_manager, request_cache)
-    return request_cache, request_cache.pool(cache_manager)
+    if cache_manager is None:
+        raise RuntimeError("DreamZero session cache requires a cache manager")
+    return request_cache, cache_manager.pool
 
 
 def _prompt_hash(

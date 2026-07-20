@@ -286,16 +286,6 @@ class DreamZeroVisualEncodingStage(PipelineStage):
         *,
         image: torch.Tensor | None,
     ) -> torch.Tensor:
-        inputs: dict[str, Any] = batch.dreamzero_inputs
-        precomputed = inputs.get("clip_feature")
-        if precomputed is not None:
-            device = (
-                _module_device(self.image_encoder)
-                if self.image_encoder is not None
-                else precomputed.device
-            )
-            return precomputed.to(device=device, dtype=_dit_dtype(server_args))
-
         with self.use_declared_component(
             component_name="image_encoder", module=self.image_encoder
         ) as image_encoder:
@@ -343,37 +333,6 @@ class DreamZeroVisualEncodingStage(PipelineStage):
         image: torch.Tensor | None,
         videos: torch.Tensor | None,
     ) -> Req:
-        inputs: dict[str, Any] = batch.dreamzero_inputs
-        if all(key in inputs for key in ("y", "latent_video")):
-            y = inputs["y"]
-            latent_video = inputs["latent_video"]
-            device = _module_device(self.vae) if self.vae is not None else y.device
-            dtype = _dit_dtype(server_args)
-            y = y.to(device=device, dtype=dtype)
-            batch.dreamzero_latent_video = latent_video.to(device=device, dtype=dtype)
-            latent_channels = int(
-                getattr(
-                    server_args.pipeline_config.vae_config.arch_config,
-                    "z_dim",
-                    y.shape[1],
-                )
-            )
-            if y.shape[1] == latent_channels:
-                batch = self._write_vae_outputs(batch, server_args, y)
-                batch.dreamzero_latent_video = latent_video.to(
-                    device=device,
-                    dtype=dtype,
-                )
-                return batch
-            if y.shape[1] != latent_channels + 4:
-                raise ValueError(
-                    "DreamZero precomputed y must be either VAE latent channels "
-                    "or DreamZero ys=[mask, latent]: "
-                    f"got {y.shape[1]}, latent_channels={latent_channels}"
-                )
-            batch.dreamzero_y = y
-            return batch
-
         with self.use_declared_component(component_name="vae", module=self.vae) as vae:
             if vae is None:
                 raise ValueError("DreamZero VAE module is not loaded")
@@ -425,14 +384,6 @@ class DreamZeroVisualEncodingStage(PipelineStage):
         *,
         videos: torch.Tensor | None,
     ) -> torch.Tensor:
-        inputs: dict[str, Any] = batch.dreamzero_inputs
-        precomputed = inputs.get("latent_video")
-        if precomputed is not None:
-            device = (
-                _module_device(self.vae) if self.vae is not None else precomputed.device
-            )
-            return precomputed.to(device=device, dtype=_dit_dtype(server_args))
-
         with self.use_declared_component(component_name="vae", module=self.vae) as vae:
             if vae is None:
                 raise ValueError("DreamZero VAE module is not loaded")
@@ -504,7 +455,9 @@ class DreamZeroVisualEncodingStage(PipelineStage):
         server_args: ServerArgs,
         request_cache: DreamZeroRequestCache,
     ):
-        state: DreamZeroCachePool = request_cache.pool(self.cache_manager)
+        if self.cache_manager is None:
+            raise RuntimeError("DreamZero visual stage requires a cache manager")
+        state: DreamZeroCachePool = self.cache_manager.pool
         slots = request_cache.slot_indices
         dtype = _dit_dtype(server_args)
         device: torch.device | None = None
@@ -515,12 +468,8 @@ class DreamZeroVisualEncodingStage(PipelineStage):
 
         videos = None
         image = None
-        inputs: dict[str, Any] = batch.dreamzero_inputs
         arch = server_args.pipeline_config.dit_config.arch_config
-        needs_image = "clip_feature" not in inputs or not all(
-            key in inputs for key in ("y", "latent_video")
-        )
-        if needs_image and device is not None:
+        if device is not None:
             videos = self._videos_for_visual_context(
                 batch,
                 server_args,

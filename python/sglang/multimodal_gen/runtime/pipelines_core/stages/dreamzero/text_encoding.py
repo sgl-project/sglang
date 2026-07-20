@@ -200,7 +200,9 @@ class DreamZeroTextEncodingStage(PipelineStage):
         cfg_parallel: bool = False,
         cfg_rank: int = 0,
     ):
-        state: DreamZeroCachePool = request_cache.pool(self.cache_manager)
+        if self.cache_manager is None:
+            raise RuntimeError("DreamZero text stage requires a cache manager")
+        state: DreamZeroCachePool = self.cache_manager.pool
         slots = request_cache.slot_indices
         inputs: dict[str, Any] = batch.dreamzero_inputs
         input_ids = inputs.get("text")
@@ -271,12 +273,26 @@ class DreamZeroTextEncodingStage(PipelineStage):
         ]
         # Text stage owns the lifecycle-adjusted reusable view. Later stages
         # resolve a fresh request cache and should not depend on these fields.
+        if cfg_parallel:
+            # Negative prompts are static for DreamZero eval. Use positive
+            # prompt metadata to keep CFG ranks aligned on encode-vs-cache.
+            prompt_reusable = [
+                bool(
+                    cache_hit
+                    and prompt_hash is not None
+                    and state.prompt_hashes[BRANCH_COND][slot] == prompt_hash
+                )
+                for slot, cache_hit, prompt_hash in zip(
+                    slots,
+                    request_cache.cache_hit,
+                    request_cache.prompt_hashes,
+                    strict=True,
+                )
+            ]
+            neg_prompt_reusable = prompt_reusable
         request_cache.prompt_reusable = prompt_reusable
         request_cache.neg_prompt_reusable = neg_prompt_reusable
 
-        precomputed = inputs.get("prompt_embs")
-        if precomputed is None:
-            precomputed = batch.extra.get("dreamzero_prompt_embs")
         attention_mask = inputs.get("text_attention_mask")
         text_len = server_args.pipeline_config.dit_config.arch_config.text_len
         prompt_embs: list[torch.Tensor] = []
@@ -284,42 +300,42 @@ class DreamZeroTextEncodingStage(PipelineStage):
         def get_branch_prompt(
             branch: int, *, ids, mask, hashes, reusable
         ) -> torch.Tensor:
-            cached = state.gather_prompt(branch, slots)
-            if cached is not None and all(reusable):
-                return cached
-            if precomputed is not None:
-                values = list(precomputed)
-                if branch >= len(values):
-                    raise ValueError(
-                        f"DreamZero precomputed prompt_embs is missing branch {branch}"
+            if all(reusable):
+                prompt_pool = state.cached_prompt_embs[branch]
+                if (
+                    prompt_pool is not None
+                    and (not slots or prompt_pool.shape[0] > max(slots))
+                    and all(state.prompt_valid[branch][slot] for slot in slots)
+                ):
+                    cached = state.gather_prompt(branch, slots)
+                    if cached is not None:
+                        return cached
+                if cfg_parallel:
+                    raise RuntimeError(
+                        "DreamZero CFG prompt cache metadata is reusable but "
+                        f"branch {branch} embeddings are missing"
                     )
-                prompt = values[branch]
-            else:
-                if ids is None:
-                    raise ValueError(
-                        "DreamZero text stage requires tokenized text or "
-                        "precomputed prompt_embs"
-                    )
-                with self.use_declared_component(
-                    component_name="text_encoder", module=self.text_encoder
-                ) as encoder:
-                    if encoder is None:
-                        raise ValueError("DreamZero text encoder module is not loaded")
-                    self.text_encoder = encoder
-                    prompt = self._encode_prompt(
-                        encoder,
-                        ids,
-                        mask,
-                        text_len=text_len,
-                    )
+            if ids is None:
+                raise ValueError("DreamZero text stage requires tokenized text")
+            with self.use_declared_component(
+                component_name="text_encoder", module=self.text_encoder
+            ) as encoder:
+                if encoder is None:
+                    raise ValueError("DreamZero text encoder module is not loaded")
+                self.text_encoder = encoder
+                prompt = self._encode_prompt(
+                    encoder,
+                    ids,
+                    mask,
+                    text_len=text_len,
+                )
             state.scatter_prompt(branch, slots, prompt, hashes)
             return prompt
 
         if cfg_parallel:
-            if neg_ids is None and precomputed is None:
+            if neg_ids is None:
                 raise ValueError(
-                    "DreamZero CFG parallel requires tokenized text_negative "
-                    "or precomputed negative prompt embeddings"
+                    "DreamZero CFG parallel requires tokenized text_negative"
                 )
             if cfg_rank == 0:
                 prompt_embs = [
@@ -352,7 +368,7 @@ class DreamZeroTextEncodingStage(PipelineStage):
                 )
             ]
             if server_args.pipeline_config.should_use_guidance and (
-                neg_ids is not None or precomputed is not None
+                neg_ids is not None
             ):
                 prompt_embs.append(
                     get_branch_prompt(
@@ -363,6 +379,14 @@ class DreamZeroTextEncodingStage(PipelineStage):
                         reusable=neg_prompt_reusable,
                     )
                 )
+        for slot, prompt_hash, neg_prompt_hash in zip(
+            slots,
+            request_cache.prompt_hashes,
+            request_cache.neg_prompt_hashes,
+            strict=True,
+        ):
+            state.prompt_hashes[BRANCH_COND][slot] = prompt_hash
+            state.prompt_hashes[BRANCH_UNCOND][slot] = neg_prompt_hash
         self._set_prompt_metadata(
             batch,
             prompt_embs,
