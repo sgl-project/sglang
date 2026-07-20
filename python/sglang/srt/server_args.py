@@ -946,13 +946,6 @@ class ServerArgs:
             aliases=["--moe-data-parallel-size"],
         ),
     ] = 1
-    dcp_size: A[
-        int,
-        Arg(
-            help="The decode context parallelism size.",
-            aliases=["--decode-context-parallel-size"],
-        ),
-    ] = 1
     dcp_comm_backend: A[
         str,
         Arg(
@@ -3133,9 +3126,11 @@ class ServerArgs:
         handle_pd_disaggregation(self)
 
     def _handle_dcp_validation(self):
-        # Decode context parallel (DCP) is currently implemented and validated
-        # only on AMD HIP/ROCm. Reject invalid or unverified configurations
-        # early instead of letting them fail deeper in model initialization.
+        # Decode context parallel (DCP) is validated on AMD HIP/ROCm and, on
+        # CUDA, for MLA models via the tokenspeed_mla decode/verify path (see
+        # the speculative-decoding gate below). Reject invalid or unverified
+        # configurations early instead of letting them fail deeper in model
+        # initialization.
         if self.dcp_size < 1:
             raise ValueError(
                 "Decode context parallel size (--dcp-size / "
@@ -3169,15 +3164,30 @@ class ServerArgs:
         if not self.dcp_size > 1:
             return
         if is_hip():
+            # HIP intentionally skips the CUDA speculative-decoding gate below;
+            # spec + DCP on HIP is an unvalidated regime (the validated verify
+            # cascade is the CUDA tokenspeed_mla path).
             return
         elif is_cuda():
-            if self.speculative_algorithm is not None:
+            # Speculative + DCP is validated only for the tokenspeed_mla verify
+            # backend on the a2a/fi_a2a comm path (2-pass cascade); every other
+            # backend/comm-backend still lacks a correct verify-DCP path.
+            _ts_attn = "tokenspeed_mla" in (
+                self.attention_backend,
+                self.decode_attention_backend,
+                self.prefill_attention_backend,
+            )
+            _dcp_spec_ok = _ts_attn and self.dcp_comm_backend in ("a2a", "fi_a2a")
+            if self.speculative_algorithm is not None and not _dcp_spec_ok:
                 raise ValueError(
                     "Decode context parallel (--dcp-size / "
                     "--decode-context-parallel-size > 1) on CUDA platform "
-                    "does not support any speculative algorithm, but got "
-                    f"dcp_size={self.dcp_size} on a CUDA platform with "
-                    "speculative decoding enabled."
+                    "supports speculative decoding only with "
+                    "--attention-backend tokenspeed_mla and "
+                    "--dcp-comm-backend a2a/fi_a2a, but got "
+                    f"dcp_size={self.dcp_size}, attention_backend="
+                    f"{self.attention_backend}, dcp_comm_backend="
+                    f"{self.dcp_comm_backend}."
                 )
         else:
             raise ValueError(

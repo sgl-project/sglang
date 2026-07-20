@@ -360,6 +360,8 @@ def _dcp_lse_combine_kernel(
     out_stride_B,
     out_stride_H,
     out_stride_D,
+    out_lse_stride_B,
+    out_lse_stride_H,
     N: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     IS_BASE_E: tl.constexpr,
@@ -431,7 +433,12 @@ def _dcp_lse_combine_kernel(
             global_lse = tl.log(weight_sum) + lse_max
         else:
             global_lse = tl.log2(weight_sum) + lse_max
-        out_lse_offset = batch_idx * recv_lse_stride_B + head_idx * recv_lse_stride_H
+        # Store with out_lse's OWN strides. The recv_lse strides used before
+        # only worked because every caller passed a contiguous [N, B, H]
+        # recv_lse whose (B, H) strides coincide with contiguous out_lse's;
+        # a strided recv_lse (the zero-copy packed-tail view of
+        # comm.dcp_unpack_lse_combine) made the store scatter out of bounds.
+        out_lse_offset = batch_idx * out_lse_stride_B + head_idx * out_lse_stride_H
         tl.store(out_lse_ptr + out_lse_offset, global_lse)
 
 
@@ -457,11 +464,14 @@ def dcp_lse_combine_triton(
     out = torch.empty(
         (B, H_local, D), device=recv_output.device, dtype=recv_output.dtype
     )
-    out_lse = (
-        torch.empty((B, H_local), device=recv_lse.device, dtype=recv_lse.dtype)
-        if return_lse
-        else recv_lse.new_empty(0)
-    )
+    if return_lse:
+        out_lse = torch.empty(
+            (B, H_local), device=recv_lse.device, dtype=recv_lse.dtype
+        )
+        out_lse_stride_b, out_lse_stride_h = out_lse.stride(0), out_lse.stride(1)
+    else:
+        out_lse = recv_lse.new_empty(0)  # 1-D placeholder, never stored to
+        out_lse_stride_b = out_lse_stride_h = 0
 
     grid = (B, H_local)
     _dcp_lse_combine_kernel[grid](
@@ -479,6 +489,8 @@ def dcp_lse_combine_triton(
         out.stride(0),
         out.stride(1),
         out.stride(2),
+        out_lse_stride_b,
+        out_lse_stride_h,
         N=N,
         HEAD_DIM=D,
         IS_BASE_E=is_lse_base_on_e,
@@ -530,3 +542,366 @@ def _lse_weighted_combine_cpu(
     # Weighted sum: [N, B, H_local, D] * [N, B, H_local, 1] -> sum -> [B, H_local, D]
     combined = (partial_outputs * weights.unsqueeze(-1)).sum(dim=0)
     return combined
+
+
+# ---------------------------------------------------------------------------
+# Fused mask+pack for the DCP verify cascade: build the a2a send buffer
+# (comm.dcp_a2a_lse_reduce eager layout) directly from the strided pass-1
+# outputs, applying the zero-owner row mask inline. Replaces, per layer:
+# 2x torch.where + 2x .contiguous() + the two pack copies (~6 kernels).
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _dcp_mask_pack_kernel(
+    o_ptr,
+    lse_ptr,
+    zero_ptr,
+    send_ptr,
+    send_f32_ptr,
+    o_stride_b,
+    o_stride_t,
+    o_stride_h,
+    o_stride_d,
+    lse_stride_b,
+    lse_stride_t,
+    lse_stride_h,
+    send_stride_n,
+    send_stride_tok,
+    send_stride_h,
+    sendf_stride_n,
+    sendf_stride_tok,
+    sendf_stride_h,
+    T,
+    H_PER_RANK,
+    LSE_F32_IDX,
+    D: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """One program per (token, full head): write the head's D output values
+    into send[rank_slot, token, local_head, :D] and its fp32 LSE into the
+    packed tail (through the fp32 alias of the same buffer). Masked batch
+    rows (zero_ptr[b] != 0) get out -> 0 and lse -> -inf, bit-identical to
+    the torch.where pair they replace (pure select, no dtype promotion)."""
+    tok = tl.program_id(0).to(tl.int64)
+    hf = tl.program_id(1).to(tl.int64)
+    b = tok // T
+    t = tok - b * T
+    n = hf // H_PER_RANK
+    h = hf - n * H_PER_RANK
+
+    masked = tl.load(zero_ptr + b) != 0
+
+    d_off = tl.arange(0, BLOCK_D)
+    d_msk = d_off < D
+    o = tl.load(
+        o_ptr + b * o_stride_b + t * o_stride_t + hf * o_stride_h + d_off * o_stride_d,
+        mask=d_msk,
+    )
+    o = tl.where(masked, tl.zeros_like(o), o)
+    tl.store(
+        send_ptr
+        + n * send_stride_n
+        + tok * send_stride_tok
+        + h * send_stride_h
+        + d_off,
+        o,
+        mask=d_msk,
+    )
+
+    lse = tl.load(lse_ptr + b * lse_stride_b + t * lse_stride_t + hf * lse_stride_h).to(
+        tl.float32
+    )
+    lse = tl.where(masked, float("-inf"), lse)
+    tl.store(
+        send_f32_ptr
+        + n * sendf_stride_n
+        + tok * sendf_stride_tok
+        + h * sendf_stride_h
+        + LSE_F32_IDX,
+        lse,
+    )
+
+
+def dcp_mask_pack_triton(
+    o1: torch.Tensor,
+    lse1: torch.Tensor,
+    zero_mask: torch.Tensor,
+    cp_world: int,
+    send_buf: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Fused zero-owner mask + a2a-send pack for the DCP verify cascade.
+
+    Produces EXACTLY the eager send layout of ``comm.dcp_a2a_lse_reduce``:
+    ``send_combined [cp_world, bs*T, H_per_rank, D + lse_pack_dim]`` in the
+    output dtype, with the fp32 LSE bit-packed (reinterpreted as output-dtype
+    elements) into the ``[D:]`` tail columns. The zero-owner row mask is
+    applied inline (masked rows: out -> 0, lse -> -inf), collapsing the two
+    ``torch.where``, the two ``.contiguous()`` and the pack copies of the old
+    path into a single kernel.
+
+    Args:
+        o1:        [bs, T, H_full, D] pass-1 attention output (any stride).
+        lse1:      [bs, T, H_full]    fp32 pass-1 LSE (any stride).
+        zero_mask: [bs] bool — requests whose rank-local prefix is empty.
+        cp_world:  DCP world size (H_full % cp_world == 0).
+        send_buf:  optional preallocated [cp_world, bs*T, H_per_rank, D+lpd]
+                   contiguous buffer in ``o1.dtype``.
+
+    Returns:
+        The packed send buffer, ready for the byte-level all_to_all
+        (``comm.dcp_a2a_exchange_packed``).
+    """
+    bs, T, H_full, D = o1.shape
+    assert (
+        H_full % cp_world == 0
+    ), f"num_heads ({H_full}) must be divisible by dcp_size ({cp_world})"
+    H_per_rank = H_full // cp_world
+    out_dtype = o1.dtype
+    lpd = _lse_pack_dim(out_dtype)
+    itemsize = out_dtype.itemsize
+    # The fp32 LSE tail is written through an fp32 alias of the send buffer,
+    # so every LSE slot must be 4-byte aligned.
+    assert (D * itemsize) % 4 == 0 and ((D + lpd) * itemsize) % 4 == 0, (
+        f"dcp_mask_pack_triton needs 4-byte-aligned LSE slots "
+        f"(D={D}, itemsize={itemsize}, lse_pack_dim={lpd})"
+    )
+    assert lse1.dtype == torch.float32 and zero_mask.dtype == torch.bool
+
+    B = bs * T
+    if send_buf is None:
+        send_buf = torch.empty(
+            (cp_world, B, H_per_rank, D + lpd), dtype=out_dtype, device=o1.device
+        )
+    assert send_buf.is_contiguous() and send_buf.dtype == out_dtype
+    send_f32 = send_buf.view(torch.float32)
+
+    grid = (B, H_full)
+    _dcp_mask_pack_kernel[grid](
+        o1,
+        lse1,
+        zero_mask.view(torch.uint8),
+        send_buf,
+        send_f32,
+        o1.stride(0),
+        o1.stride(1),
+        o1.stride(2),
+        o1.stride(3),
+        lse1.stride(0),
+        lse1.stride(1),
+        lse1.stride(2),
+        send_buf.stride(0),
+        send_buf.stride(1),
+        send_buf.stride(2),
+        send_f32.stride(0),
+        send_f32.stride(1),
+        send_f32.stride(2),
+        T,
+        H_per_rank,
+        (D * itemsize) // 4,
+        D=D,
+        BLOCK_D=triton.next_power_of_2(D),
+    )
+    return send_buf
+
+
+# ---------------------------------------------------------------------------
+# Verify-cascade pass-2: tiny causal attention over the per-request draft
+# chain (T <= 8 tokens). Replaces the full tokenspeed decode-kernel call,
+# whose launch/tiling floor dwarfs the actual workload.
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _dcp_pass2_causal_attn_kernel(
+    q_ptr,
+    k_ptr,
+    kr_ptr,
+    seq_ptr,
+    out_ptr,
+    lse_ptr,
+    q_stride_b,
+    q_stride_t,
+    q_stride_h,
+    q_stride_d,
+    k_stride_n,
+    k_stride_d,
+    kr_stride_n,
+    kr_stride_d,
+    out_stride_b,
+    out_stride_t,
+    out_stride_h,
+    out_stride_d,
+    lse_stride_b,
+    lse_stride_t,
+    lse_stride_h,
+    softmax_scale_log2,
+    output_scale,
+    T,
+    D_LATENT: tl.constexpr,
+    D_ROPE: tl.constexpr,
+    T_BLOCK: tl.constexpr,
+    BLOCK_DL: tl.constexpr,
+    BLOCK_DR: tl.constexpr,
+):
+    """Tiny causal MLA attention over the per-request draft chain (verify
+    pass-2). Grid: (bs*T, H) — one program per (batch, q_token, head) row.
+
+    Score/softmax math mirrors the tokenspeed fp8 decode kernel it replaces
+    (mla_decode_fp8.py epilogue): scores are the RAW fp8-value dots, the
+    softmax runs in the exp2 domain with ``softmax_scale_log2 = softmax_scale
+    * log2(e)``, the output is ``P @ V / row_sum * output_scale``, and the LSE
+    is base-2: ``lse = log2(row_sum) + softmax_scale_log2 * row_max`` (the
+    convention ``dcp_lse_combine_triton(is_lse_base_on_e=False)`` consumes).
+    All compute is fp32 (the tokenspeed kernel additionally quantizes P to
+    fp8 for its PV MMA; this kernel keeps P in fp32, so it is strictly more
+    accurate). K doubles as V: MLA draft KV is the latent, V = K[:, :D_LATENT].
+
+    Masking: q token ``qt`` attends KV ``j`` iff ``j <= qt`` and ``j <
+    seq_lens[b]`` (runtime tensor — capture-safe; grid/shape are static). A
+    row with zero valid positions emits lse = -inf (combine weights it out)
+    and a non-finite out, same class of edge as the tokenspeed kernel's
+    seq_len==0 NaN; verify always has seq_lens[b] == T >= 1.
+    """
+    n = tl.program_id(0).to(tl.int64)
+    h = tl.program_id(1).to(tl.int64)
+    b = n // T
+    qt = n - b * T
+
+    seq_b = tl.load(seq_ptr + b)
+    offs_t = tl.arange(0, T_BLOCK)
+    valid = (offs_t <= qt) & (offs_t < seq_b)
+    k_rows = b * T + offs_t
+
+    # ---- scores s[j] = sum_d q[d] * k[j, d]  (latent + rope, raw fp32) ----
+    q_base = q_ptr + b * q_stride_b + qt * q_stride_t + h * q_stride_h
+    s = tl.zeros([T_BLOCK], dtype=tl.float32)
+    for d0 in tl.static_range(0, D_LATENT, BLOCK_DL):
+        d = d0 + tl.arange(0, BLOCK_DL)
+        qv = tl.load(q_base + d * q_stride_d).to(tl.float32)
+        kv = tl.load(
+            k_ptr + k_rows[:, None] * k_stride_n + d[None, :] * k_stride_d,
+            mask=valid[:, None],
+            other=0.0,
+        ).to(tl.float32)
+        s += tl.sum(kv * qv[None, :], axis=1)
+    dr = tl.arange(0, BLOCK_DR)
+    dr_msk = dr < D_ROPE
+    qr = tl.load(q_base + (D_LATENT + dr) * q_stride_d, mask=dr_msk, other=0.0).to(
+        tl.float32
+    )
+    krv = tl.load(
+        kr_ptr + k_rows[:, None] * kr_stride_n + dr[None, :] * kr_stride_d,
+        mask=valid[:, None] & dr_msk[None, :],
+        other=0.0,
+    ).to(tl.float32)
+    s += tl.sum(krv * qr[None, :], axis=1)
+
+    # ---- softmax in the exp2 domain (tokenspeed convention) ----
+    s = tl.where(valid, s, float("-inf"))
+    row_max = tl.max(s, axis=0)
+    row_max = tl.where(row_max == float("-inf"), 0.0, row_max)
+    p = tl.exp2((s - row_max) * softmax_scale_log2)  # -inf -> 0
+    row_sum = tl.sum(p, axis=0)
+    lse = tl.log2(row_sum) + softmax_scale_log2 * row_max
+    tl.store(lse_ptr + b * lse_stride_b + qt * lse_stride_t + h * lse_stride_h, lse)
+
+    # ---- out = P @ V / row_sum * output_scale  (V = K latent) ----
+    epi_scale = output_scale / row_sum
+    out_base = out_ptr + b * out_stride_b + qt * out_stride_t + h * out_stride_h
+    for d0 in tl.static_range(0, D_LATENT, BLOCK_DL):
+        d = d0 + tl.arange(0, BLOCK_DL)
+        v = tl.load(
+            k_ptr + k_rows[:, None] * k_stride_n + d[None, :] * k_stride_d,
+            mask=valid[:, None],
+            other=0.0,
+        ).to(tl.float32)
+        acc = tl.sum(v * p[:, None], axis=0) * epi_scale
+        tl.store(out_base + d * out_stride_d, acc.to(out_ptr.dtype.element_ty))
+
+
+def dcp_pass2_causal_attn_triton(
+    q: torch.Tensor,
+    k_latent: torch.Tensor,
+    k_rope: torch.Tensor,
+    seq_lens: torch.Tensor,
+    softmax_scale: float,
+    output_scale: float = 1.0,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Causal draft-chain attention for the DCP verify cascade pass-2.
+
+    Replaces the tokenspeed decode-kernel call (SGLANG_DCP_TRITON_PASS2=0
+    reverts): per sequence, T query tokens attend causally to that sequence's
+    own T draft-token latents (chain topk=1, T <= 8), so the whole workload is
+    a few thousand MACs — far below the big kernel's launch/tiling floor. Reads
+    q and k/k_rope directly (any strides), so the per-layer draft page-pool
+    build (torch.cat + zeros + copy) of the old path disappears too.
+
+    Args:
+        q:        [bs, T, H, D_latent + D_rope] query (fp8/bf16/fp16; may be a
+                  strided head-slice view — no .contiguous() needed).
+        k_latent: [bs*T, D_latent] draft-token latents (same dtype as q).
+                  Row b*T + j is sequence b's j-th draft token. Doubles as V.
+        k_rope:   [bs*T, D_rope] draft-token rope keys (same dtype as q).
+        seq_lens: [bs] int32 valid draft-token counts (runtime tensor; == T
+                  for target-verify).
+        softmax_scale: raw-score scale (layer.scaling * k_scale for fp8 KV,
+                  mirroring the tokenspeed backend's _run_decode_kernel).
+        output_scale: linear output scale (k_scale for fp8 KV).
+
+    Returns:
+        (out [bs, T, H, D_latent] bf16 for fp8 q / q.dtype otherwise,
+         lse [bs, T, H] fp32 base-2) — the exact (o2, lse2) contract of the
+        tokenspeed pass-2 call this replaces.
+    """
+    bs, T, H, D_qk = q.shape
+    N, D_latent = k_latent.shape
+    D_rope = k_rope.shape[1]
+    assert N == bs * T, f"k_latent rows ({N}) != bs*T ({bs * T})"
+    assert D_qk == D_latent + D_rope, f"q last dim {D_qk} != {D_latent}+{D_rope}"
+    assert k_rope.shape[0] == N
+    assert k_latent.dtype == q.dtype and k_rope.dtype == q.dtype
+    assert seq_lens.dtype == torch.int32 and seq_lens.numel() == bs
+
+    BLOCK_DL = 128
+    assert D_latent % BLOCK_DL == 0, f"D_latent ({D_latent}) % {BLOCK_DL} != 0"
+
+    out_dtype = torch.bfloat16 if q.dtype == torch.float8_e4m3fn else q.dtype
+    out = torch.empty((bs, T, H, D_latent), dtype=out_dtype, device=q.device)
+    lse = torch.empty((bs, T, H), dtype=torch.float32, device=q.device)
+
+    # Static grid (bs, T, H all shape-derived — capture-safe); runtime data
+    # dependence only through seq_lens.
+    grid = (bs * T, H)
+    _dcp_pass2_causal_attn_kernel[grid](
+        q,
+        k_latent,
+        k_rope,
+        seq_lens,
+        out,
+        lse,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        q.stride(3),
+        k_latent.stride(0),
+        k_latent.stride(1),
+        k_rope.stride(0),
+        k_rope.stride(1),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        out.stride(3),
+        lse.stride(0),
+        lse.stride(1),
+        lse.stride(2),
+        softmax_scale * 1.4426950408889634,  # log2(e)
+        output_scale,
+        T,
+        D_LATENT=D_latent,
+        D_ROPE=D_rope,
+        T_BLOCK=triton.next_power_of_2(T),
+        BLOCK_DL=BLOCK_DL,
+        BLOCK_DR=triton.next_power_of_2(D_rope),
+    )
+    return out, lse

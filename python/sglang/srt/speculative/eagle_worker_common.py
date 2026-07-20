@@ -488,6 +488,15 @@ def run_eagle_verify(
 
     # Batch 1: Target verify
     # Prepare for target verify in a separate stream
+    if plan_stream:
+        # The plan-stream kernels below read fwd-stream products: draft_token
+        # (torch.cat written during draft()), this-iteration seq_lens (relay
+        # gather on the schedule stream, which fwd already waited on), and
+        # the draft req_to_token writes. Without this wait the plan stream
+        # runs immediately (it is otherwise idle) and reads unwritten
+        # memory -> negative input_ids / garbage out_cache_loc -> async IMA.
+        # Same contract as DFlashDraftInputV2.prepare_for_decode.
+        plan_stream.wait_stream(fwd_stream)
     with plan_stream_ctx:
         verify_forward_batch, can_run_cuda_graph = eagle_prepare_for_verify(
             verify_input,

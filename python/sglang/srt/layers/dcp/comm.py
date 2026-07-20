@@ -20,6 +20,7 @@ PR #25090 vs #14194):
   - cp_lse_ag_out_rs_mla: Triton (log2/exp2) correction / reduce-scatter
 """
 
+import contextlib
 import warnings
 from typing import Optional
 
@@ -44,6 +45,25 @@ def _warn_deprecated_dcp_accessor(name: str, replacement: str) -> None:
         DeprecationWarning,
         stacklevel=2,
     )
+
+
+# DCP shards only the TARGET's decode/verify. The speculative DRAFT model runs
+# unsharded (dcp_size=1, its own small KV pool); disable DCP for the duration of
+# any draft forward so its (MLA) attention + KV write stay full and match its
+def draft_forward_guard(is_draft: bool):
+    """Run a (draft) forward with DCP disabled.
+
+    The draft model's KV pool is deliberately unsharded (dcp_size=1), so every DCP
+    branch must see dcp_enabled == False for the whole draft forward. Implemented
+    over ParallelContext.override so the authoritative get_parallel().dcp_enabled
+    (and the deprecated module accessors that delegate to it) are all covered.
+    No-op when is_draft is False.
+    """
+    if not is_draft:
+        return contextlib.nullcontext()
+    from sglang.srt.runtime_context import get_parallel
+
+    return get_parallel().override(dcp_enabled=False)
 
 
 def dcp_enabled() -> bool:
@@ -436,6 +456,7 @@ def init_fi_a2a_workspace(cp_group: "GroupCoordinator") -> None:
     # REQUIRED barrier before the first alltoall: every rank must finish init,
     # else a rank writes a peer's FIFO before it is ready -> deadlock.
     dist.barrier(group=cp_group.device_group)
+    # cp_size not stored: dcp_a2a_lse_reduce recomputes N from cp_group at call time.
     _FI_A2A_STATE = {
         "workspace": workspace,
         "cp_rank": cp_rank,
@@ -449,18 +470,21 @@ def dcp_a2a_lse_reduce(
     is_lse_base_on_e: bool = True,
     cuda_graph_buffers: Optional[dict] = None,
     comm_backend: str = "a2a",
+    return_lse: bool = False,
 ) -> torch.Tensor:
     """A2A DCP reduce: all-to-all exchange of head partials, then local Triton
     combine. Output + fp32 LSE are packed into ONE all_to_all (LSE reinterpreted
     as output-dtype columns along D) -> 1 NCCL call/layer instead of 2.
     is_lse_base_on_e: True=base-e (FlashAttention), False=base-2 (FlashInfer-MLA).
+    Returns [B, H_local, D], or ``(out, lse[B, H_local])`` when ``return_lse=True``
+    (the verify-DCP cascade needs the merged-prefix LSE to combine with the draft pass).
     """
     if cp_group.world_size == 1:
-        return cp_attn_out
+        return (cp_attn_out, cp_attn_lse) if return_lse else cp_attn_out
 
     if comm_backend == "fi_a2a":
         return _dcp_fi_a2a_lse_reduce(
-            cp_attn_out, cp_attn_lse, cp_group, is_lse_base_on_e
+            cp_attn_out, cp_attn_lse, cp_group, is_lse_base_on_e, return_lse=return_lse
         )
 
     N = cp_group.world_size
@@ -533,10 +557,79 @@ def dcp_a2a_lse_reduce(
         )
         recv_lse = recv_lse_stg
 
-    combined, _ = dcp_lse_combine_triton(
-        recv_output, recv_lse, is_lse_base_on_e=is_lse_base_on_e
+    combined, combined_lse = dcp_lse_combine_triton(
+        recv_output, recv_lse, is_lse_base_on_e=is_lse_base_on_e, return_lse=return_lse
     )
-    return combined
+    return (combined, combined_lse) if return_lse else combined
+
+
+# ---------------------------------------------------------------------------
+# Pre-packed a2a entry points (verify-DCP fast path). The send buffer is
+# built by the fused kernels.dcp_mask_pack_triton (mask + pack in one kernel),
+# so these skip dcp_a2a_lse_reduce's own pack. The exchange and the unpack+
+# combine are split so the caller can run the exchange on a side stream and
+# overlap it with independent compute (pass-2 of the verify cascade).
+# dcp_a2a_lse_reduce itself is untouched — the decode path still uses it.
+# ---------------------------------------------------------------------------
+
+
+def dcp_a2a_exchange_packed(
+    send_combined: torch.Tensor,
+    recv_combined: torch.Tensor,
+    cp_group: "GroupCoordinator",
+) -> None:
+    """Cross-rank exchange of a PRE-PACKED [N, B, H_per_rank, D+lpd] buffer.
+
+    Byte-level (uint8) all_to_all for dtype-agnostic transport, identical to
+    the exchange inside dcp_a2a_lse_reduce. Runs on the CURRENT stream — the
+    caller owns any side-stream fork/join and the buffers' lifetimes.
+    """
+    cp_group.all_to_all_single(
+        recv_combined.reshape(-1).view(torch.uint8),
+        send_combined.reshape(-1).view(torch.uint8),
+    )
+
+
+def dcp_unpack_lse_combine(
+    recv_combined: torch.Tensor,
+    D: int,
+    is_lse_base_on_e: bool = True,
+    return_lse: bool = False,
+):
+    """Local LSE combine of a recv buffer in the packed a2a layout.
+
+    Zero-copy unpack: the output partials are the [:D] slice and the fp32 LSE
+    is read through a strided fp32 alias of the [D:] tail (the Triton combine
+    kernel handles both strides), replacing the old staging-copy unpack with
+    no extra kernel. Bit-identical bytes reach the combine either way.
+
+    Returns (out [B, H_per_rank, D], lse [B, H_per_rank] or None).
+    """
+    out_dtype = recv_combined.dtype
+    recv_output = recv_combined[:, :, :, :D]
+    # 4-byte alignment of the LSE slots is guaranteed by dcp_mask_pack_triton
+    # (it asserts at pack time); the fp32 alias below relies on it.
+    lse_f32_idx = (D * out_dtype.itemsize) // 4
+    recv_lse = recv_combined.view(torch.float32)[:, :, :, lse_f32_idx]
+    return dcp_lse_combine_triton(
+        recv_output, recv_lse, is_lse_base_on_e=is_lse_base_on_e, return_lse=return_lse
+    )
+
+
+def dcp_a2a_lse_reduce_prepacked(
+    send_combined: torch.Tensor,
+    D: int,
+    cp_group: "GroupCoordinator",
+    is_lse_base_on_e: bool = True,
+    return_lse: bool = False,
+):
+    """Synchronous pre-packed sibling of dcp_a2a_lse_reduce: exchange + local
+    combine, skipping the pack (already fused into dcp_mask_pack_triton)."""
+    recv_combined = torch.empty_like(send_combined)
+    dcp_a2a_exchange_packed(send_combined, recv_combined, cp_group)
+    return dcp_unpack_lse_combine(
+        recv_combined, D, is_lse_base_on_e=is_lse_base_on_e, return_lse=return_lse
+    )
 
 
 def _dcp_fi_a2a_lse_reduce(
@@ -544,6 +637,7 @@ def _dcp_fi_a2a_lse_reduce(
     cp_attn_lse: torch.Tensor,
     cp_group: "GroupCoordinator",
     is_lse_base_on_e: bool = True,
+    return_lse: bool = False,
 ) -> torch.Tensor:
     """fi_a2a: delegate only the cross-rank exchange to FlashInfer's MNNVL kernel,
     then reuse the local Triton LSE combine. FlashInfer takes output + LSE as
@@ -588,7 +682,7 @@ def _dcp_fi_a2a_lse_reduce(
     recv_output = o_out.permute(2, 0, 1, 3).contiguous()  # [N, B, H_per_rank, D]
     recv_lse = stats_out[..., 0].permute(2, 0, 1).contiguous()  # [N, B, H_per_rank]
 
-    combined, _ = dcp_lse_combine_triton(
-        recv_output, recv_lse, is_lse_base_on_e=is_lse_base_on_e
+    combined, combined_lse = dcp_lse_combine_triton(
+        recv_output, recv_lse, is_lse_base_on_e=is_lse_base_on_e, return_lse=return_lse
     )
-    return combined
+    return (combined, combined_lse) if return_lse else combined

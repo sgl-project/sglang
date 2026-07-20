@@ -627,6 +627,15 @@ class DeepseekMLAForwardMixin:
                     q_nope_out=q_nope_out,
                     q_pe=q_pe,
                 )
+            elif forward_batch.forward_mode.is_target_verify():
+                # verify: gather Q to full heads (num_local_heads*dcp_world) for the
+                # DCP 2-pass cascade, exactly like decode (the helper is batch-dim
+                # agnostic, so the bs*T verify rows gather fine). Must come BEFORE
+                # the generic is_extend() KV-gather since verify is also is_extend().
+                q_nope_out, q_pe = all_gather_q_for_mla_decode(
+                    q_nope_out=q_nope_out,
+                    q_pe=q_pe,
+                )
             elif forward_batch.forward_mode.is_extend():
                 # for extend, gather kv
                 all_gather_kv_cache_for_mla_extend(
@@ -780,6 +789,28 @@ class DeepseekMLAForwardMixin:
                 ):
                     # set return_lse=True to correct attn_output
                     attn_output, lse = self.attn_mqa_for_dcp_decode(
+                        q_nope_out,
+                        k_nope,
+                        k_nope,
+                        forward_batch,
+                        q_rope=q_pe,
+                        k_rope=k_pe,
+                        **extra_args,
+                        **(
+                            dict(topk_indices=topk_indices)
+                            if topk_indices is not None
+                            else {}
+                        ),
+                    )
+                elif (
+                    forward_batch.forward_mode.is_target_verify()
+                    and get_parallel().dcp_enabled
+                ):
+                    # verify: the backend runs the 2-pass cascade and returns the
+                    # already cross-rank-merged FINAL output (a single tensor), so
+                    # the decode-only LSE merge below (is_decode()-guarded) is
+                    # skipped. Q was gathered to full heads in forward_absorb_prepare.
+                    attn_output = self.attn_mqa_for_dcp_decode(
                         q_nope_out,
                         k_nope,
                         k_nope,

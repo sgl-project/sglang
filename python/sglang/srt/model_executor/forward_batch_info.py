@@ -889,6 +889,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
             model_runner.lora_manager.prepare_lora_batch(ret)
 
+        # dcp_kv_mask drives the masked MHA KV write on HIP. On CUDA, DCP is
+        # MLA-only and the owner-rule filter lives inside set_mla_kv_buffer
+        # (memory_pool / triton_ops.mla_buffer), so no mask is built here; a
+        # non-MLA CUDA model under DCP would need this mask plus a masked
+        # set_kv_buffer path before it could work.
         if (
             getattr(model_runner, "dcp_size", 1) > 1
             and ret.out_cache_loc is not None
