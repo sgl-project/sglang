@@ -21,6 +21,7 @@ from typing import (
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from piecewise_cuda_graphs import no_graph
 
 import sglang.srt.models.deepseek_v2 as deepseek_v2
 from sglang.jit_kernel.dsv4 import (
@@ -109,9 +110,6 @@ from sglang.srt.model_executor.forward_context import (
 from sglang.srt.model_executor.runner import (
     compile_in_capture_mode,
     get_is_capture_mode,
-)
-from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
-    eager_on_graph,
 )
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
@@ -365,8 +363,8 @@ def deepseek_v4_attention_with_output(
     return
 
 
-bcg_deepseek_v4_attention_with_output = eager_on_graph(True)(
-    deepseek_v4_attention_with_output
+bcg_deepseek_v4_attention_with_output = no_graph(
+    deepseek_v4_attention_with_output, enable=True
 )
 
 

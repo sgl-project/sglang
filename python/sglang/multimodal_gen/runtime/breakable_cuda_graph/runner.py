@@ -35,13 +35,10 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+from piecewise_cuda_graphs import CUDAGraphSequence, piecewise_graph
 
 from sglang.multimodal_gen.runtime.breakable_cuda_graph.replay_token import (
     replay_token_scope,
-)
-from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
-    BreakableCUDAGraph,
-    BreakableCUDAGraphCapture,
 )
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     enable_breakable_cuda_graph,
@@ -183,7 +180,7 @@ def _clone_output(out: Any) -> Any:
 
 @dataclass
 class _CaptureEntry:
-    graph: BreakableCUDAGraph
+    graph: CUDAGraphSequence
     # full captured kwargs with persistent static buffers at every tensor leaf
     static_kwargs: dict[str, Any]
     # the same static buffers, flattened in _flatten_kwargs order (replay copies
@@ -421,11 +418,9 @@ class BaseBreakableCudaGraphRunner:
         self._capture_stream.synchronize()
         self.device_module.synchronize()
 
-        graph = BreakableCUDAGraph()
+        graph = CUDAGraphSequence(pool=self._pool)
         with enable_breakable_cuda_graph():
-            with BreakableCUDAGraphCapture(
-                cuda_graph=graph, pool=self._pool, stream=self._capture_stream
-            ):
+            with piecewise_graph(graph, stream=self._capture_stream):
                 output = self.transformer(**static_kwargs)
         self.device_module.synchronize()
 
