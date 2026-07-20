@@ -69,7 +69,9 @@ def _get_fused_kv_materialize_helper():
     return _FusedKVMaterializeHelper
 
 
-def _prefix_valid_indices(commit_lens: torch.Tensor, block_size: int) -> torch.Tensor:
+def _prefix_valid_indices(
+    commit_lens: torch.Tensor, block_size: int
+) -> torch.Tensor:
     offsets = torch.arange(
         int(block_size), device=commit_lens.device, dtype=torch.int64
     )
@@ -1576,10 +1578,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             # prefix lengths, not the full allocator reservation length.
             draft_seq_lens = prefix_lens
             if batch.seq_lens_cpu is not None:
+                # Host bound = committed prefix + one verify block.
                 seq_lens_cpu.copy_(batch.seq_lens_cpu)
-                # TARGET_VERIFY metadata adds the verify block itself on npu.
-                if not _is_npu:
-                    seq_lens_cpu.add_(block_size)
+                seq_lens_cpu.add_(block_size)
                 draft_seq_lens_sum = int(seq_lens_cpu.sum())
             elif draft_input.reserved_seq_lens_cpu is not None:
                 # GPU-only backend: reserved is a safe over-estimate.
@@ -1651,12 +1652,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         seq_lens_cpu_backup = batch.seq_lens_cpu
         seq_lens_sum_backup = batch.seq_lens_sum
         if seq_lens_cpu_backup is not None:
-            # TARGET_VERIFY metadata adds block_size in place on npu
-            verify_host_seq_lens = (
-                seq_lens_cpu_backup.clone()
-                if _is_npu
-                else seq_lens_cpu_backup + block_size
-            )
+            # Verify host bound = committed prefix + one verify block (matches draft).
+            verify_host_seq_lens = seq_lens_cpu_backup + block_size
             batch.seq_lens_cpu = verify_host_seq_lens
             batch.seq_lens_sum = int(verify_host_seq_lens.sum())
         elif draft_input.reserved_seq_lens_cpu is not None:

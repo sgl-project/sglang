@@ -27,7 +27,7 @@ from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_flags
-from sglang.srt.speculative.spec_info import SpecInput
+from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.utils import get_bool_env_var, get_current_device_stream_fast
 
 if TYPE_CHECKING:
@@ -42,6 +42,13 @@ from sglang.srt.runtime_context import get_parallel
 
 logger = logging.getLogger(__name__)
 FULL_ATTENTION_WINDOW = 2147483647
+
+
+def _is_dflash_verify(spec_info: Optional[SpecInput]) -> bool:
+    return (
+        spec_info is not None
+        and spec_info.spec_input_type == SpecInputType.DFLASH_VERIFY
+    )
 
 
 def _expand_dsa_sparse_indices(topk_indices: torch.Tensor) -> torch.Tensor:
@@ -421,9 +428,9 @@ class AscendAttnBackend(AttentionBackend):
             req_pool_indices=forward_batch.req_pool_indices,
             seq_lens=forward_batch.seq_lens,
             seq_lens_cpu=(
-                forward_batch.seq_lens.cpu()
-                if in_capture
-                else forward_batch.seq_lens_cpu
+                forward_batch.seq_lens_cpu
+                if not in_capture or _is_dflash_verify(forward_batch.spec_info)
+                else forward_batch.seq_lens.cpu()
             ),
             forward_mode=forward_batch.forward_mode,
             spec_info=forward_batch.spec_info,
@@ -480,7 +487,10 @@ class AscendAttnBackend(AttentionBackend):
             seq_lens_list_cumsum = np.cumsum(forward_batch.extend_seq_lens_cpu)
             self.forward_metadata.seq_lens_list_cumsum = seq_lens_list_cumsum
 
-        if forward_batch.forward_mode.is_target_verify():
+        if (
+            forward_batch.forward_mode.is_target_verify()
+            and not _is_dflash_verify(forward_batch.spec_info)
+        ):
             self.forward_metadata.seq_lens_cpu_int += self.speculative_num_draft_tokens
         elif (
             forward_batch.forward_mode.is_decode_or_idle()
@@ -667,7 +677,7 @@ class AscendAttnBackend(AttentionBackend):
                 self.token_to_kv_pool.translate_loc_from_full_to_swa(out_cache_loc)
             )
         max_len = seq_lens_cpu[:bs].max().item()
-        if forward_mode.is_target_verify():
+        if forward_mode.is_target_verify() and not _is_dflash_verify(spec_info):
             max_len += self.speculative_num_draft_tokens
         elif forward_mode.is_decode_or_idle() and spec_info is not None:
             max_len += self.speculative_step_id + 1
