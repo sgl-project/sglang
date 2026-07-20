@@ -26,6 +26,11 @@ Tests:
 import os
 import unittest
 
+import threading
+import time
+
+import requests
+
 from sglang.srt.environ import envs
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.ascend.test_ascend_utils import (
@@ -43,6 +48,210 @@ from sglang.test.test_utils import (
 )
 
 register_npu_ci(est_time=900, suite="full-1-npu-a3", nightly=True)
+
+
+# Qwen3-8B has a 40960-token context. The upstream kit hard-codes
+# `max_new_tokens=100000` in two abort-recovery tests, which the server
+# rejects with HTTP 400 ("Requested token count exceeds the model's maximum
+# context length"), causing `KeyError: 'meta_info'`. We override those two
+# methods with a smaller `max_new_tokens` that fits Qwen3-8B's context.
+# See .claude/2.log for the original failure.
+_NPU_ABORT_MAX_NEW_TOKENS = 40000
+
+
+class NPUStreamingSessionKitMixin(StreamingSessionKitMixin):
+    """NPU-specific overrides for StreamingSessionKitMixin.
+
+    Overrides `test_nth_mid_abort_recovery` and `test_first_mid_abort_recovery`
+    to use a smaller `max_new_tokens` (40000 < Qwen3-8B's 40960 context).
+    Logic is otherwise identical to the upstream kit.
+    """
+
+    def test_nth_mid_abort_recovery(self) -> None:
+        """Abort an Nth-turn request mid-decode; session rolls back to last
+        successful turn."""
+        requests.post(self.base_url + "/flush_cache")
+
+        resp = requests.post(
+            self.base_url + "/open_session",
+            json={"capacity_of_str_len": 50000, "streaming": True},
+        )
+        self.assertEqual(resp.status_code, 200)
+        session_id = resp.json()
+
+        try:
+            # Turn 1: normal generate to create slot.
+            ids_1 = self.tokenizer.encode("Tell me a very long story about a wizard.")
+            resp_1 = requests.post(
+                self.base_url + "/generate",
+                json={
+                    "input_ids": ids_1,
+                    "sampling_params": {"temperature": 0, "max_new_tokens": 16},
+                    "session_params": {"id": session_id, "rid": None},
+                },
+                timeout=30,
+            )
+            self.assertEqual(resp_1.status_code, 200, resp_1.text)
+            data_1 = resp_1.json()
+            turn_1_total = (
+                data_1["meta_info"]["prompt_tokens"]
+                + data_1["meta_info"]["completion_tokens"]
+            )
+
+            # Turn 2: long generate, then abort mid-decode.
+            ids_2 = self.tokenizer.encode(" Continue the story in great detail.")
+
+            result = [None]
+
+            def do_generate():
+                r = requests.post(
+                    self.base_url + "/generate",
+                    json={
+                        "input_ids": ids_2,
+                        "sampling_params": {
+                            "temperature": 0,
+                            "max_new_tokens": _NPU_ABORT_MAX_NEW_TOKENS,
+                        },
+                        "session_params": {"id": session_id, "rid": None},
+                    },
+                    timeout=60,
+                )
+                result[0] = r
+
+            t = threading.Thread(target=do_generate)
+            t.start()
+            time.sleep(0.5)
+            abort_resp = requests.post(
+                self.base_url + "/abort_request",
+                json={"rid": "", "abort_all": True},
+                timeout=10,
+            )
+            self.assertEqual(abort_resp.status_code, 200, abort_resp.text)
+            t.join(timeout=30)
+
+            self.assertIsNotNone(result[0], "Turn 2 should have returned")
+            data_2 = result[0].json()
+            self.assertEqual(
+                data_2["meta_info"]["finish_reason"]["type"],
+                "abort",
+                "Turn 2 should be aborted, not finished normally",
+            )
+
+            # Turn 3: recovery. Rolls back to turn 1.
+            ids_3 = self.tokenizer.encode(" What happens next?")
+            for attempt in range(20):
+                resp_3 = requests.post(
+                    self.base_url + "/generate",
+                    json={
+                        "input_ids": ids_3,
+                        "sampling_params": {"temperature": 0, "max_new_tokens": 8},
+                        "session_params": {"id": session_id, "rid": None},
+                    },
+                    timeout=30,
+                )
+                if resp_3.status_code == 200:
+                    break
+                time.sleep(0.5)
+            self.assertEqual(resp_3.status_code, 200, resp_3.text)
+            data_3 = resp_3.json()
+            # prompt_tokens = turn_1_total + append (BOS stripped).
+            bos = 1 if ids_3[0] == self.tokenizer.bos_token_id else 0
+            expected_prompt_3 = turn_1_total + len(ids_3) - bos
+            self.assertEqual(
+                data_3["meta_info"]["prompt_tokens"],
+                expected_prompt_3,
+                "prompt_tokens must equal turn_1_total + append (no stale abort context)",
+            )
+        finally:
+            requests.post(
+                self.base_url + "/close_session",
+                json={"session_id": session_id},
+            )
+
+        health = requests.get(self.base_url + "/health", timeout=10)
+        self.assertEqual(health.status_code, 200)
+
+    def test_first_mid_abort_recovery(self) -> None:
+        """Abort the very first request mid-decode (no slot yet; ephemeral
+        slot is created and nuked). Session must still be usable."""
+        requests.post(self.base_url + "/flush_cache")
+
+        resp = requests.post(
+            self.base_url + "/open_session",
+            json={"capacity_of_str_len": 50000, "streaming": True},
+        )
+        self.assertEqual(resp.status_code, 200)
+        session_id = resp.json()
+
+        try:
+            ids_1 = self.tokenizer.encode("Tell me a very long story about a wizard.")
+
+            result = [None]
+
+            def do_generate():
+                r = requests.post(
+                    self.base_url + "/generate",
+                    json={
+                        "input_ids": ids_1,
+                        "sampling_params": {
+                            "temperature": 0,
+                            "max_new_tokens": _NPU_ABORT_MAX_NEW_TOKENS,
+                        },
+                        "session_params": {"id": session_id, "rid": None},
+                    },
+                    timeout=60,
+                )
+                result[0] = r
+
+            t = threading.Thread(target=do_generate)
+            t.start()
+            time.sleep(0.5)
+            abort_resp = requests.post(
+                self.base_url + "/abort_request",
+                json={"rid": "", "abort_all": True},
+                timeout=10,
+            )
+            self.assertEqual(abort_resp.status_code, 200, abort_resp.text)
+            t.join(timeout=30)
+
+            self.assertIsNotNone(result[0], "Turn 1 should have returned")
+            data_1 = result[0].json()
+            self.assertEqual(
+                data_1["meta_info"]["finish_reason"]["type"],
+                "abort",
+                "Turn 1 should be aborted, not finished normally",
+            )
+
+            # Turn 2: recovery. No inherited context (req_nodes empty).
+            ids_2 = self.tokenizer.encode("Tell me a short joke.")
+            for attempt in range(20):
+                resp_2 = requests.post(
+                    self.base_url + "/generate",
+                    json={
+                        "input_ids": ids_2,
+                        "sampling_params": {"temperature": 0, "max_new_tokens": 8},
+                        "session_params": {"id": session_id, "rid": None},
+                    },
+                    timeout=30,
+                )
+                if resp_2.status_code == 200:
+                    break
+                time.sleep(0.5)
+            self.assertEqual(resp_2.status_code, 200, resp_2.text)
+            data_2 = resp_2.json()
+            self.assertEqual(
+                data_2["meta_info"]["prompt_tokens"],
+                len(ids_2),
+                "prompt_tokens must equal turn 2 input only (no inherited context)",
+            )
+        finally:
+            requests.post(
+                self.base_url + "/close_session",
+                json={"session_id": session_id},
+            )
+
+        health = requests.get(self.base_url + "/health", timeout=10)
+        self.assertEqual(health.status_code, 200)
 
 
 class NPUStreamingSessionExtraServerBase(StreamingSessionServerBase):
@@ -95,7 +304,7 @@ _NPU_COMMON_ARGS = [
 
 
 class TestNPUStreamingSessionRetractMixedChunk(
-    NPUStreamingSessionExtraServerBase, StreamingSessionKitMixin
+    NPUStreamingSessionExtraServerBase, NPUStreamingSessionKitMixin
 ):
     """Retract + --enable-mixed-chunk.
 
@@ -117,7 +326,7 @@ class TestNPUStreamingSessionRetractMixedChunk(
 
 
 class TestNPUStreamingSessionRetractLargePage(
-    NPUStreamingSessionExtraServerBase, StreamingSessionKitMixin
+    NPUStreamingSessionExtraServerBase, NPUStreamingSessionKitMixin
 ):
     """Retract + page=128: exercises page-aligned `_free_tail`.
 
@@ -156,7 +365,7 @@ _EAGLE3_SPEC_ARGS = [
 
 
 class TestNPUStreamingSessionEagle(
-    NPUStreamingSessionExtraServerBase, StreamingSessionKitMixin
+    NPUStreamingSessionExtraServerBase, NPUStreamingSessionKitMixin
 ):
     """EAGLE3 spec v1 (overlap disabled); offset=-1 — see kit's note."""
 
@@ -175,7 +384,7 @@ class TestNPUStreamingSessionEagle(
 
 
 class TestNPUStreamingSessionEagleV2(
-    NPUStreamingSessionExtraServerBase, StreamingSessionKitMixin
+    NPUStreamingSessionExtraServerBase, NPUStreamingSessionKitMixin
 ):
     """EAGLE3 spec v2 (overlap on).
 
@@ -197,7 +406,7 @@ class TestNPUStreamingSessionEagleV2(
 
 
 class TestNPUStreamingSessionEagleRetractLargePage(
-    NPUStreamingSessionExtraServerBase, StreamingSessionKitMixin
+    NPUStreamingSessionExtraServerBase, NPUStreamingSessionKitMixin
 ):
     """EAGLE3 spec v1 + retract + page=128: max-pressure on `_free_tail`
     (spec tail + retract alloc-commit gap + page alignment)."""
