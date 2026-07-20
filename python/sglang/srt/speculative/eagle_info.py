@@ -9,7 +9,11 @@ from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.runtime_context import get_server_args
-from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
+from sglang.srt.speculative.spec_info import (
+    PrecomputedExtendLayout,
+    SpecInput,
+    SpecInputType,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -326,10 +330,13 @@ class EagleDraftExtendInput(SpecInput):
     seq_lens_cpu: torch.Tensor = None
     req_pool_indices: torch.Tensor = None
 
-    #   - positions: shape `[total_accepted]`.
+    #   - positions: full uniform draft-extend window, shape `[extend_num_tokens]`.
+    #   - precomputed_extend_layout: positions and flat per-request window starts,
+    #     produced together by the fused GPU prolog.
     #   - bonus_tokens: shape `[bs]`; read post-extend to populate next iter's
     #     `EagleDraftInput.bonus_tokens`.
     positions: Optional[torch.Tensor] = None
+    precomputed_extend_layout: Optional[PrecomputedExtendLayout] = None
     bonus_tokens: Optional[torch.Tensor] = None
 
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.LAST

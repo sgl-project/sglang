@@ -1550,15 +1550,6 @@ class DeepseekSparseAttnBackend(
             max_seqlen_k = self._graph_page_table_width(metadata)
             total_extend_len = self.speculative_num_draft_tokens * bs
 
-            # See target-verify note: fill on-device to avoid the blocking
-            # pageable H2D from torch.tensor(list, device=cuda).
-            extend_seq_lens = torch.full(
-                (bs,),
-                self.speculative_num_draft_tokens,
-                dtype=torch.int32,
-                device=self.device,
-            )
-
             if is_cuda() and not _is_hip:
                 from sglang.kernels.ops.attention.dsa_metadata import (
                     fused_dsa_draft_extend_metadata,
@@ -1566,7 +1557,6 @@ class DeepseekSparseAttnBackend(
 
                 fused_dsa_draft_extend_metadata(
                     seq_lens=seq_lens,
-                    extend_seq_lens=extend_seq_lens,
                     req_pool_indices=req_pool_indices,
                     req_to_token=self.req_to_token,
                     cache_seqlens=metadata.cache_seqlens_int32,
@@ -1577,13 +1567,10 @@ class DeepseekSparseAttnBackend(
                     dsa_cu_seqlens_k=metadata.dsa_cu_seqlens_k,
                     real_page_table=metadata.real_page_table,
                     bs=bs,
-                    total_len=total_extend_len,
+                    qo_len=self.speculative_num_draft_tokens,
                     max_seqlen_k=max_seqlen_k,
                     dsa_index_topk=self.dsa_index_topk,
                     real_page_size=self.real_page_size,
-                    max_extend_len=self.speculative_num_draft_tokens,
-                    max_total_len=bs * self.speculative_num_draft_tokens,
-                    static_extend_len=True,
                 )
                 cache_seqlens = metadata.cache_seqlens_int32
                 seqlens_expanded = metadata.dsa_seqlens_expanded[:total_extend_len]
@@ -1592,6 +1579,12 @@ class DeepseekSparseAttnBackend(
                 used_fused_metadata_generation = True
 
             if not used_fused_metadata_generation:
+                extend_seq_lens = torch.full(
+                    (bs,),
+                    self.speculative_num_draft_tokens,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
                 cache_seqlens = seq_lens.to(torch.int32)
                 metadata.cache_seqlens_int32.copy_(cache_seqlens)
                 metadata.cu_seqlens_k[1:].copy_(

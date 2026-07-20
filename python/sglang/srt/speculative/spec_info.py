@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import warnings
 from abc import ABC
+from dataclasses import dataclass
 from enum import Enum, IntEnum, auto
 from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Type, Union
 
@@ -25,6 +26,14 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
     from sglang.srt.speculative.ngram_worker import NGRAMWorker
     from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
+
+
+@dataclass(frozen=True)
+class PrecomputedExtendLayout:
+    """Position tensors precomputed together for one extend forward."""
+
+    positions: torch.Tensor
+    extend_start_loc: torch.Tensor
 
 
 class SpeculativeAlgorithm(Enum):
@@ -313,6 +322,9 @@ class SpecInput(ABC):
     # a field and run __post_init__ -> super().__init__ *after* field
     # assignment, so an init-time default would clobber the passed layout.
     ragged_verify_layout: Optional[RaggedVerifyLayout] = None
+
+    # Atomic pair: consumers either adopt both tensors or compute both.
+    precomputed_extend_layout: Optional[PrecomputedExtendLayout] = None
 
     # Uniform per-request token width of this forward (and its logits-row
     # counterpart). Doubles as the DP-attention global_num_tokens multiplier

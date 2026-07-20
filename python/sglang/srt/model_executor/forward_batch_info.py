@@ -851,14 +851,25 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 ret.extend_seq_lens = extend_seq_lens
                 ret.extend_prefix_lens = extend_prefix_lens
             ret.extend_num_tokens = batch.extend_num_tokens
-            positions, ret.extend_start_loc = compute_position(
-                model_runner.server_args.attention_backend,
-                ret.extend_prefix_lens,
-                ret.extend_seq_lens,
-                ret.extend_num_tokens,
+            precomputed_layout = (
+                ret.spec_info.precomputed_extend_layout
+                if ret.spec_info is not None
+                else None
             )
-            if ret.positions is None:
-                ret.positions = positions
+            if precomputed_layout is not None:
+                assert precomputed_layout.positions.shape == (ret.extend_num_tokens,)
+                assert precomputed_layout.extend_start_loc.shape == (ret.batch_size,)
+                ret.positions = precomputed_layout.positions
+                ret.extend_start_loc = precomputed_layout.extend_start_loc
+            else:
+                positions, ret.extend_start_loc = compute_position(
+                    model_runner.server_args.attention_backend,
+                    ret.extend_prefix_lens,
+                    ret.extend_seq_lens,
+                    ret.extend_num_tokens,
+                )
+                if ret.positions is None:
+                    ret.positions = positions
             ret.extend_logprob_start_lens_cpu = extend_logprob_start_lens
 
         if model_runner.ngram_embedding_manager.enabled:
