@@ -1096,6 +1096,10 @@ _AMD_READY_NESTED_UNIT_TESTS = (
     "sana_wm/test_streaming_realtime_path.py",
     # Stub gap already fixed upstream; only needs enabling here.
     "realtime/test_lingbot_causal_denoising.py",
+    # Enabled with a LAPACK-availability skip (camera-pose tests use
+    # torch.linalg.inv; they run on ROCm 7.2.0/CUDA and skip on ROCm 7.0.0).
+    "sana_wm/test_pipeline_config.py",
+    "sana_wm/test_realtime_chain.py",
 )
 
 
