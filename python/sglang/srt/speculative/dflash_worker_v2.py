@@ -648,9 +648,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         draft_prefix_lens: torch.Tensor,
         out: torch.Tensor,
     ) -> None:
-        """Fill the seq_lens_cpu planning bound without a device sync; backends
-        consume it as a safe upper bound (same contract as the non-compact
-        path in forward_batch_generation)."""
+        """Fill the seq_lens_cpu planning bound, sync-free when a host-side
+        length source is available; backends consume it as a safe upper bound
+        (same contract as the non-compact path in forward_batch_generation)."""
         if batch_seq_lens_cpu is not None:
             self._compute_compact_draft_seq_lens_host(batch_seq_lens_cpu, out=out)
         elif reserved_seq_lens_cpu is not None:
@@ -670,7 +670,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         block_size: int,
     ) -> None:
         """Write the draft-local compact req->token rows: the committed suffix
-        window at [0, prefix_len) plus the verify block slots after it."""
+        window at [0, draft_prefix_len) plus the verify block slots after it."""
         suffix_start = prefix_lens.to(torch.int64) - draft_prefix_lens.to(torch.int64)
         if self._use_triton_compact_rebuild:
             rebuild_compact_draft_req_to_token_func(
