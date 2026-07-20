@@ -353,7 +353,7 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
 
         if intermediate_state is not None:
             intermediate_state = intermediate_state.view(
-                -1, num_value_heads, head_k_dim, head_v_dim
+                -1, num_value_heads, head_v_dim, head_k_dim
             )
 
         if self.graph_mode:
@@ -386,6 +386,6 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
 
         if intermediate_state is not None:
             intermediate_state = intermediate_state.view(
-                -1, seq_len, num_value_heads, head_k_dim, head_v_dim
+                -1, seq_len, num_value_heads, head_v_dim, head_k_dim
             )
         return attn_core_out

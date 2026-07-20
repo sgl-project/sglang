@@ -182,10 +182,11 @@ class TritonGDNKernel(LinearAttnKernelBase):
         recurrent_state = ssm_states
         recurrent_state_indices_args = {"initial_state_indices": cache_indices}
         if is_npu():
-            recurrent_state = ssm_states[cache_indices]
+            # sgl_kernel_npu chunk uses [H, K, V]; SGLang keeps the pool as [H, V, K].
+            recurrent_state = ssm_states[cache_indices].transpose(-1, -2).contiguous()
             recurrent_state_indices_args = {}
 
-        return chunk_gated_delta_rule(
+        core_attn_out, last_recurrent_state, h = chunk_gated_delta_rule(
             q=q,
             k=k,
             v=v,
@@ -197,6 +198,14 @@ class TritonGDNKernel(LinearAttnKernelBase):
             use_qk_l2norm_in_kernel=True,
             **recurrent_state_indices_args,
         )
+        if is_npu():
+            if last_recurrent_state is not None:
+                last_recurrent_state = last_recurrent_state.transpose(
+                    -1, -2
+                ).contiguous()
+            if h is not None:
+                h = h.transpose(-1, -2).contiguous()
+        return core_attn_out, last_recurrent_state, h
 
     def target_verify(
         self,
