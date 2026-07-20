@@ -3,22 +3,16 @@ from sglang.test.ci.ci_register import register_cuda_ci
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 
 import unittest
-from types import SimpleNamespace
-from unittest.mock import patch
 
 import torch
 
 from sglang.kernels.ops.speculative.eagle import fill_bonus_tokens_func
 from sglang.kernels.ops.speculative.topk1 import (
+    TargetVerifyTopk1Output,
     draft_topk1_postprocess,
     target_verify_topk1_postprocess,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.speculative.eagle_utils import (
-    maybe_eagle_sample_target_verify_topk1,
-    verify_tree_greedy_func,
-)
-from sglang.srt.speculative.spec_info import SpecInputType
+from sglang.srt.speculative.eagle_utils import verify_tree_greedy_func
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -58,7 +52,7 @@ def _eager_target_verify_topk1(
     retrieve_index: torch.Tensor,
     retrieve_next_token: torch.Tensor,
     seq_lens: torch.Tensor,
-):
+) -> TargetVerifyTopk1Output:
     batch_size, num_tokens = candidates.shape
     predict = torch.zeros(
         (batch_size * num_tokens,), dtype=torch.int32, device=logits.device
@@ -103,107 +97,26 @@ def _eager_target_verify_topk1(
         + accept_lens
         - 1
     )
-    return (
-        predict,
-        accept_lens - 1,
-        accept_lens,
-        accept_index,
-        bonus_tokens,
-        new_seq_lens,
-        select_index,
-        predict.to(torch.int64),
+    return TargetVerifyTopk1Output(
+        predict=predict,
+        num_correct_drafts=accept_lens - 1,
+        accept_lens=accept_lens,
+        accept_index=accept_index,
+        bonus_tokens=bonus_tokens,
+        new_seq_lens=new_seq_lens,
+        select_index=select_index,
+        draft_input_ids=predict.to(torch.int64),
     )
 
 
-def _assert_target_verify_outputs(
-    outputs,
-    target_ids: torch.Tensor,
-    accepted_drafts: list[int],
-    seq_lens: torch.Tensor,
+def _assert_target_verify_matches_eager(
+    actual: TargetVerifyTopk1Output,
+    expected: TargetVerifyTopk1Output,
 ):
-    (
-        predict,
-        num_correct_drafts,
-        accept_lens,
-        accept_index,
-        bonus_tokens,
-        new_seq_lens,
-        select_index,
-        draft_input_ids,
-    ) = outputs
-    batch_size, num_tokens = target_ids.shape
-    expected_predict = torch.zeros_like(target_ids, dtype=torch.int32)
-    expected_accept_index = torch.full(
-        (batch_size, num_tokens), -1, dtype=torch.int32, device=target_ids.device
-    )
-    for batch_idx, num_accepted in enumerate(accepted_drafts):
-        accept_len = num_accepted + 1
-        expected_predict[batch_idx, :accept_len] = target_ids[batch_idx, :accept_len]
-        expected_accept_index[batch_idx, :accept_len] = torch.arange(
-            batch_idx * num_tokens,
-            batch_idx * num_tokens + accept_len,
-            dtype=torch.int32,
-            device=target_ids.device,
+    for field in TargetVerifyTopk1Output._fields:
+        torch.testing.assert_close(
+            getattr(actual, field), getattr(expected, field), rtol=0, atol=0
         )
-
-    expected_num_correct = torch.tensor(
-        accepted_drafts, dtype=torch.int32, device=target_ids.device
-    )
-    expected_accept_lens = expected_num_correct + 1
-    expected_bonus = target_ids[
-        torch.arange(batch_size, device=target_ids.device), expected_num_correct.long()
-    ].to(torch.int32)
-    expected_select = (
-        torch.arange(batch_size, device=target_ids.device) * num_tokens
-        + expected_num_correct
-    ).long()
-
-    torch.testing.assert_close(predict, expected_predict.flatten(), rtol=0, atol=0)
-    torch.testing.assert_close(num_correct_drafts, expected_num_correct, rtol=0, atol=0)
-    torch.testing.assert_close(accept_lens, expected_accept_lens, rtol=0, atol=0)
-    torch.testing.assert_close(accept_index, expected_accept_index, rtol=0, atol=0)
-    torch.testing.assert_close(bonus_tokens, expected_bonus, rtol=0, atol=0)
-    torch.testing.assert_close(
-        new_seq_lens, seq_lens + expected_accept_lens, rtol=0, atol=0
-    )
-    torch.testing.assert_close(select_index, expected_select, rtol=0, atol=0)
-    torch.testing.assert_close(
-        draft_input_ids, expected_predict.flatten().long(), rtol=0, atol=0
-    )
-
-
-def _make_target_verify_selection_case(device: torch.device):
-    batch_size, num_tokens, vocab_size = 1, 2, 16
-    logits = torch.zeros(
-        (batch_size * num_tokens, vocab_size), device=device, dtype=torch.float32
-    )
-    additive_penalty = torch.zeros((batch_size, vocab_size), device=device)
-    additive_penalty[:, 3] = 10.0
-    sampling_info = SimpleNamespace(
-        is_all_greedy=True,
-        acc_additive_penalties=additive_penalty,
-        acc_scaling_penalties=None,
-        logit_bias=None,
-    )
-    retrieve_index, retrieve_next_token = _make_topk1_chain(
-        batch_size, num_tokens, device
-    )
-    verify_input = SimpleNamespace(
-        spec_input_type=SpecInputType.EAGLE_VERIFY,
-        tree_topk=1,
-        draft_token_num=num_tokens,
-        max_tree_depth=num_tokens,
-        draft_token=torch.tensor([0, 3], device=device),
-        retrieve_index=retrieve_index,
-        retrieve_next_token=retrieve_next_token,
-    )
-    batch = SimpleNamespace(
-        forward_mode=ForwardMode.DECODE,
-        sampling_info=sampling_info,
-        seq_lens=torch.tensor([32], dtype=torch.int32, device=device),
-    )
-    logits_output = SimpleNamespace(next_token_logits=logits)
-    return verify_input, batch, logits_output
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for this test.")
@@ -335,21 +248,24 @@ class TestSpecTopk1Triton(CustomTestCase):
         with self.assertRaises(AssertionError):
             draft_topk1_postprocess(torch.empty((4, 16), device=self.device), positions)
 
-    def test_target_verify_mixed_acceptance_and_row_stride(self):
-        batch_size, num_tokens, vocab_size = 4, 6, 8193
+    def test_target_verify_fused_matches_eager_exactly(self):
+        batch_size, num_tokens, vocab_size = 4, 6, 154880
         accepted_drafts = [0, 1, num_tokens - 2, num_tokens - 1]
+        dense_logits, target_ids = _make_logits_with_unique_argmax(
+            batch_size * num_tokens,
+            vocab_size,
+            dtype=torch.bfloat16,
+            device=self.device,
+            seed=3,
+        )
         backing = torch.full(
-            (batch_size * num_tokens, vocab_size + 64),
+            (batch_size * num_tokens, vocab_size + 17),
             2000.0,
-            dtype=torch.float32,
+            dtype=torch.bfloat16,
             device=self.device,
         )
         logits = backing[:, :vocab_size]
-        target_ids = (
-            torch.arange(batch_size * num_tokens, device=self.device) * 9973 + 17
-        ) % vocab_size
-        logits.fill_(-1000.0)
-        logits.scatter_(1, target_ids[:, None], 1000.0)
+        logits.copy_(dense_logits)
         target_ids = target_ids.view(batch_size, num_tokens)
 
         candidates = torch.zeros(
@@ -367,7 +283,14 @@ class TestSpecTopk1Triton(CustomTestCase):
             100, 100 + batch_size, dtype=torch.long, device=self.device
         )
 
-        outputs = target_verify_topk1_postprocess(
+        fused = target_verify_topk1_postprocess(
+            logits,
+            candidates,
+            retrieve_index,
+            retrieve_next_token,
+            seq_lens,
+        )
+        eager = _eager_target_verify_topk1(
             logits,
             candidates,
             retrieve_index,
@@ -376,76 +299,13 @@ class TestSpecTopk1Triton(CustomTestCase):
         )
 
         self.assertFalse(logits.is_contiguous())
-        _assert_target_verify_outputs(outputs, target_ids, accepted_drafts, seq_lens)
-
-    def test_target_verify_fused_matches_eager_exactly(self):
-        batch_size, num_tokens, vocab_size = 4, 6, 8193
-        accepted_drafts = [0, 1, num_tokens - 2, num_tokens - 1]
-        output_names = (
-            "predict",
-            "num_correct_drafts",
-            "accept_lens",
-            "accept_index",
-            "bonus_tokens",
-            "new_seq_lens",
-            "select_index",
-            "draft_input_ids",
+        _assert_target_verify_matches_eager(fused, eager)
+        torch.testing.assert_close(
+            fused.num_correct_drafts,
+            torch.tensor(accepted_drafts, dtype=torch.int32, device=self.device),
+            rtol=0,
+            atol=0,
         )
-
-        for dtype in (torch.float16, torch.bfloat16, torch.float32):
-            with self.subTest(dtype=dtype):
-                dense_logits, target_ids = _make_logits_with_unique_argmax(
-                    batch_size * num_tokens,
-                    vocab_size,
-                    dtype=dtype,
-                    device=self.device,
-                    seed=3,
-                )
-                backing = torch.full(
-                    (batch_size * num_tokens, vocab_size + 17),
-                    2000.0,
-                    dtype=dtype,
-                    device=self.device,
-                )
-                logits = backing[:, :vocab_size]
-                logits.copy_(dense_logits)
-                target_ids = target_ids.view(batch_size, num_tokens)
-
-                candidates = torch.zeros(
-                    (batch_size, num_tokens), dtype=torch.long, device=self.device
-                )
-                candidates[:, 1:] = (target_ids[:, :-1] + 1) % vocab_size
-                for batch_idx, num_accepted in enumerate(accepted_drafts):
-                    candidates[batch_idx, 1 : num_accepted + 1] = target_ids[
-                        batch_idx, :num_accepted
-                    ]
-                retrieve_index, retrieve_next_token = _make_topk1_chain(
-                    batch_size, num_tokens, self.device
-                )
-                seq_lens = torch.arange(
-                    100, 100 + batch_size, dtype=torch.long, device=self.device
-                )
-
-                fused = target_verify_topk1_postprocess(
-                    logits,
-                    candidates,
-                    retrieve_index,
-                    retrieve_next_token,
-                    seq_lens,
-                )
-                eager = _eager_target_verify_topk1(
-                    logits,
-                    candidates,
-                    retrieve_index,
-                    retrieve_next_token,
-                    seq_lens,
-                )
-
-                for name, fused_tensor, eager_tensor in zip(output_names, fused, eager):
-                    with self.subTest(dtype=dtype, output=name):
-                        torch.testing.assert_close(
-                            fused_tensor, eager_tensor, rtol=0, atol=0
-                        )
 
     def test_target_verify_leftmost_ties_and_all_negative_infinity(self):
         batch_size, num_tokens, vocab_size = 1, 3, 8193
@@ -460,14 +320,20 @@ class TestSpecTopk1Triton(CustomTestCase):
         # Row 1 remains all -inf, whose leftmost argmax is zero.
         logits[2, 8191] = 1.0
         logits[2, 8192] = 1.0
-        target_ids = torch.tensor([[7, 0, 8191]], device=self.device)
         candidates = torch.tensor([[0, 7, 0]], device=self.device)
         retrieve_index, retrieve_next_token = _make_topk1_chain(
             batch_size, num_tokens, self.device
         )
         seq_lens = torch.tensor([41], dtype=torch.int32, device=self.device)
 
-        outputs = target_verify_topk1_postprocess(
+        fused = target_verify_topk1_postprocess(
+            logits,
+            candidates,
+            retrieve_index,
+            retrieve_next_token,
+            seq_lens,
+        )
+        eager = _eager_target_verify_topk1(
             logits,
             candidates,
             retrieve_index,
@@ -475,7 +341,13 @@ class TestSpecTopk1Triton(CustomTestCase):
             seq_lens,
         )
 
-        _assert_target_verify_outputs(outputs, target_ids, [2], seq_lens)
+        _assert_target_verify_matches_eager(fused, eager)
+        torch.testing.assert_close(
+            fused.predict,
+            torch.tensor([7, 0, 8191], dtype=torch.int32, device=self.device),
+            rtol=0,
+            atol=0,
+        )
 
     def test_target_verify_trivial_chain(self):
         logits = torch.tensor([[0.0, 3.0, 1.0]], device=self.device)
@@ -483,7 +355,14 @@ class TestSpecTopk1Triton(CustomTestCase):
         retrieve_index, retrieve_next_token = _make_topk1_chain(1, 1, self.device)
         seq_lens = torch.tensor([9], dtype=torch.long, device=self.device)
 
-        outputs = target_verify_topk1_postprocess(
+        fused = target_verify_topk1_postprocess(
+            logits,
+            candidates,
+            retrieve_index,
+            retrieve_next_token,
+            seq_lens,
+        )
+        eager = _eager_target_verify_topk1(
             logits,
             candidates,
             retrieve_index,
@@ -491,103 +370,13 @@ class TestSpecTopk1Triton(CustomTestCase):
             seq_lens,
         )
 
-        _assert_target_verify_outputs(
-            outputs, torch.tensor([[1]], device=self.device), [0], seq_lens
-        )
-
-    def test_target_verify_trace_shape(self):
-        batch_size, num_tokens, vocab_size = 1, 6, 154880
-        logits, target_ids = _make_logits_with_unique_argmax(
-            batch_size * num_tokens,
-            vocab_size,
-            dtype=torch.float32,
-            device=self.device,
-            seed=2,
-        )
-        target_ids = target_ids.view(batch_size, num_tokens)
-        candidates = torch.zeros(
-            (batch_size, num_tokens), dtype=torch.long, device=self.device
-        )
-        candidates[:, 1:] = target_ids[:, :-1]
-        retrieve_index, retrieve_next_token = _make_topk1_chain(
-            batch_size, num_tokens, self.device
-        )
-        seq_lens = torch.tensor([2048], dtype=torch.long, device=self.device)
-
-        outputs = target_verify_topk1_postprocess(
-            logits,
-            candidates,
-            retrieve_index,
-            retrieve_next_token,
-            seq_lens,
-        )
-
-        _assert_target_verify_outputs(outputs, target_ids, [num_tokens - 1], seq_lens)
-
-    def test_target_verify_selection_applies_logits_transform_once(self):
-        verify_input, batch, logits_output = _make_target_verify_selection_case(
-            self.device
-        )
-
-        result = maybe_eagle_sample_target_verify_topk1(
-            verify_input, batch, logits_output
-        )
-
-        self.assertIsNotNone(result)
+        _assert_target_verify_matches_eager(fused, eager)
         torch.testing.assert_close(
-            result.predict,
-            torch.tensor([3, 3], dtype=torch.int32, device=self.device),
+            fused.bonus_tokens,
+            torch.tensor([1], dtype=torch.int32, device=self.device),
             rtol=0,
             atol=0,
         )
-        # The in-place penalty application is the same one used by the eager
-        # sampler and must run exactly once before kernel selection.
-        torch.testing.assert_close(
-            logits_output.next_token_logits[:, 3],
-            torch.full((2,), 10.0, device=self.device),
-            rtol=0,
-            atol=0,
-        )
-
-    def test_target_verify_selection_fallbacks(self):
-        cases = (
-            "non_greedy",
-            "input_type",
-            "topk",
-            "idle",
-            "simulation",
-            "stride",
-        )
-        for case in cases:
-            with self.subTest(case=case):
-                verify_input, batch, logits_output = _make_target_verify_selection_case(
-                    self.device
-                )
-                simulation = 0
-                if case == "non_greedy":
-                    batch.sampling_info.is_all_greedy = False
-                elif case == "input_type":
-                    verify_input.spec_input_type = SpecInputType.FROZEN_KV_MTP_VERIFY
-                elif case == "topk":
-                    verify_input.tree_topk = 2
-                elif case == "idle":
-                    batch.forward_mode = ForwardMode.IDLE
-                elif case == "simulation":
-                    simulation = 1
-                elif case == "stride":
-                    logits_output.next_token_logits = torch.empty(
-                        (16, 2), device=self.device
-                    ).t()
-
-                with patch(
-                    "sglang.srt.speculative.spec_utils.SIMULATE_ACC_LEN", simulation
-                ):
-                    result = maybe_eagle_sample_target_verify_topk1(
-                        verify_input,
-                        batch,
-                        logits_output,
-                    )
-                self.assertIsNone(result)
 
 
 if __name__ == "__main__":

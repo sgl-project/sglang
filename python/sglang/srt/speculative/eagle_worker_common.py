@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Callable, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
@@ -9,6 +9,7 @@ from sglang.kernels.ops.speculative.cache_locs import (
     assign_draft_cache_locs_contiguous,
 )
 from sglang.kernels.ops.speculative.eagle import fill_bonus_tokens_func
+from sglang.kernels.ops.speculative.topk1 import TargetVerifyTopk1Output
 from sglang.srt.layers.logprob_processor import compute_spec_v2_logprobs
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import (
@@ -16,11 +17,9 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
-from sglang.srt.speculative.eagle_info import (
-    EagleDraftExtendPreparation,
-    EagleDraftInput,
-    EagleVerifyFinalizeOutput,
-    EagleVerifyInput,
+from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
+from sglang.srt.speculative.eagle_target_verify import (
+    maybe_eagle_sample_target_verify_topk1,
 )
 from sglang.srt.speculative.eagle_utils import (
     TreeMaskMode,
@@ -65,7 +64,7 @@ class EagleVerifyStepResult:
     """Worker-internal verify result retained only until draft-extend starts."""
 
     batch_result: GenerationBatchResult
-    draft_extend_preparation: Optional[EagleDraftExtendPreparation]
+    target_verify_topk1_output: Optional[TargetVerifyTopk1Output]
 
 
 def duplicate_prefix_tail_to_draft_branches(
@@ -481,9 +480,7 @@ def run_eagle_verify(
     device: str,
     metadata_ready_pre_pad: bool,
     finalize_tree_path: bool,
-    target_verify_postprocessor: Optional[
-        Callable[..., Optional[EagleVerifyFinalizeOutput]]
-    ],
+    enable_target_verify_topk1: bool,
 ) -> EagleVerifyStepResult:
     """Shared verify step: target-verify forward, sampling, acceptance bookkeeping.
 
@@ -496,8 +493,8 @@ def run_eagle_verify(
     - ``finalize_tree_path``: single-layer compacts the accepted tree path to
       the front of each per-req block for topk > 1; multi-layer has never run
       this compaction.
-    - ``target_verify_postprocessor``: an explicit worker-owned fast-path
-      strategy. ``None`` always uses the canonical eager sampler.
+    - ``enable_target_verify_topk1``: only the single-layer internal
+      verify-to-draft-extend path enables the CUDA topk=1 optimization.
     """
     fwd_stream = torch.get_device_module(device).current_stream()
     verify_input: EagleVerifyInput = batch.spec_info
@@ -600,21 +597,21 @@ def run_eagle_verify(
     # Sample
     maybe_detect_nan(logits_output.next_token_logits, "verify: target model logits")
     maybe_detect_inf(logits_output.next_token_logits, "verify: target model logits")
-    target_verify_finalize = (
-        target_verify_postprocessor(
+    target_verify_topk1_output = (
+        maybe_eagle_sample_target_verify_topk1(
             verify_input,
             batch,
             logits_output,
             vocab_mask,
         )
-        if target_verify_postprocessor is not None
+        if enable_target_verify_topk1
         else None
     )
-    if target_verify_finalize is not None:
-        predict = target_verify_finalize.predict
-        accept_lens = target_verify_finalize.accept_lens
-        accept_index = target_verify_finalize.accept_index
-        new_seq_lens = target_verify_finalize.new_seq_lens
+    if target_verify_topk1_output is not None:
+        predict = target_verify_topk1_output.predict
+        accept_lens = target_verify_topk1_output.accept_lens
+        accept_index = target_verify_topk1_output.accept_index
+        new_seq_lens = target_verify_topk1_output.new_seq_lens
     else:
         (
             predict,
@@ -644,8 +641,8 @@ def run_eagle_verify(
         num_draft_tokens,
     )
 
-    if target_verify_finalize is not None:
-        bonus_tokens = target_verify_finalize.bonus_tokens
+    if target_verify_topk1_output is not None:
+        bonus_tokens = target_verify_topk1_output.bonus_tokens
     elif not batch.forward_mode.is_idle():
         accept_tokens = predict[accept_index]
         bonus_tokens = torch.empty_like(accept_lens, dtype=torch.int32)
@@ -697,13 +694,5 @@ def run_eagle_verify(
             indexer_topk_output=forward_batch_output.indexer_topk_output,
             extra_keep_alive_refs=[verify_forward_batch],
         ),
-        draft_extend_preparation=(
-            EagleDraftExtendPreparation(
-                num_correct_drafts=target_verify_finalize.num_correct_drafts,
-                select_index=target_verify_finalize.select_index,
-                input_ids=target_verify_finalize.draft_input_ids,
-            )
-            if target_verify_finalize is not None
-            else None
-        ),
+        target_verify_topk1_output=target_verify_topk1_output,
     )

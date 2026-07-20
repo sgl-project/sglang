@@ -1,10 +1,23 @@
 from __future__ import annotations
 
+from typing import NamedTuple
+
 import torch
 import triton
 import triton.language as tl
 
 _DRAFT_TOPK1_BLOCK = 8192
+
+
+class TargetVerifyTopk1Output(NamedTuple):
+    predict: torch.Tensor
+    num_correct_drafts: torch.Tensor
+    accept_lens: torch.Tensor
+    accept_index: torch.Tensor
+    bonus_tokens: torch.Tensor
+    new_seq_lens: torch.Tensor
+    select_index: torch.Tensor
+    draft_input_ids: torch.Tensor
 
 
 @triton.jit
@@ -249,13 +262,57 @@ def draft_topk1_postprocess(
     return topk_p, topk_index
 
 
+def target_verify_topk1_is_supported(
+    next_token_logits: torch.Tensor,
+    candidates: torch.Tensor,
+    retrieve_index: torch.Tensor,
+    retrieve_next_token: torch.Tensor,
+    seq_lens: torch.Tensor,
+) -> bool:
+    """Return whether the tensors satisfy the fused verifier's contract."""
+    if (
+        next_token_logits.ndim != 2
+        or next_token_logits.device.type != "cuda"
+        or next_token_logits.stride(1) != 1
+        or next_token_logits.dtype not in (torch.float16, torch.bfloat16, torch.float32)
+        or candidates.ndim != 2
+        or candidates.dtype != torch.long
+        or not candidates.is_contiguous()
+        or retrieve_index.shape != candidates.shape
+        or retrieve_index.dtype != torch.long
+        or not retrieve_index.is_contiguous()
+        or retrieve_next_token.shape != candidates.shape
+        or retrieve_next_token.dtype != torch.long
+        or not retrieve_next_token.is_contiguous()
+        or seq_lens.ndim != 1
+        or not seq_lens.is_contiguous()
+        or seq_lens.dtype not in (torch.int32, torch.int64)
+    ):
+        return False
+
+    batch_size, num_draft_tokens = candidates.shape
+    total_rows, vocab_size = next_token_logits.shape
+    if (
+        num_draft_tokens <= 0
+        or vocab_size <= 0
+        or total_rows != batch_size * num_draft_tokens
+        or seq_lens.shape[0] != batch_size
+    ):
+        return False
+
+    return all(
+        tensor.device == next_token_logits.device
+        for tensor in (candidates, retrieve_index, retrieve_next_token, seq_lens)
+    )
+
+
 def target_verify_topk1_postprocess(
     next_token_logits: torch.Tensor,
     candidates: torch.Tensor,
     retrieve_index: torch.Tensor,
     retrieve_next_token: torch.Tensor,
     seq_lens: torch.Tensor,
-):
+) -> TargetVerifyTopk1Output:
     """Reduce target logits and finalize greedy topk=1 verification.
 
     This reuses the split argmax reduction used by draft decoding, then folds
@@ -263,33 +320,16 @@ def target_verify_topk1_postprocess(
     finalizer launch. The caller is responsible for selecting this CUDA-only
     fast path only after penalties, grammar masks, and NaN sanitization.
     """
-    assert next_token_logits.ndim == 2
-    assert next_token_logits.device.type == "cuda"
-    assert next_token_logits.stride(1) == 1
-    assert next_token_logits.dtype in (torch.float16, torch.bfloat16, torch.float32)
-    assert candidates.ndim == 2
-    assert candidates.dtype == torch.long
-    assert candidates.is_contiguous()
-    assert retrieve_index.shape == candidates.shape
-    assert retrieve_index.dtype == torch.long
-    assert retrieve_index.is_contiguous()
-    assert retrieve_next_token.shape == candidates.shape
-    assert retrieve_next_token.dtype == torch.long
-    assert retrieve_next_token.is_contiguous()
-    assert seq_lens.ndim == 1
-    assert seq_lens.is_contiguous()
-    assert seq_lens.dtype in (torch.int32, torch.int64)
+    assert target_verify_topk1_is_supported(
+        next_token_logits,
+        candidates,
+        retrieve_index,
+        retrieve_next_token,
+        seq_lens,
+    ), "Unsupported tensor shape, layout, dtype, or device"
 
     batch_size, num_draft_tokens = candidates.shape
     total_rows, vocab_size = next_token_logits.shape
-    assert num_draft_tokens > 0
-    assert vocab_size > 0
-    assert total_rows == batch_size * num_draft_tokens
-    assert seq_lens.shape[0] == batch_size
-    assert all(
-        tensor.device == next_token_logits.device
-        for tensor in (candidates, retrieve_index, retrieve_next_token, seq_lens)
-    )
 
     device = next_token_logits.device
     predict = torch.empty((total_rows,), dtype=torch.int32, device=device)
@@ -303,15 +343,15 @@ def target_verify_topk1_postprocess(
     select_index = torch.empty((batch_size,), dtype=torch.int64, device=device)
     draft_input_ids = torch.empty((total_rows,), dtype=torch.int64, device=device)
     if batch_size == 0:
-        return (
-            predict,
-            num_correct_drafts,
-            accept_lens,
-            accept_index,
-            bonus_tokens,
-            new_seq_lens,
-            select_index,
-            draft_input_ids,
+        return TargetVerifyTopk1Output(
+            predict=predict,
+            num_correct_drafts=num_correct_drafts,
+            accept_lens=accept_lens,
+            accept_index=accept_index,
+            bonus_tokens=bonus_tokens,
+            new_seq_lens=new_seq_lens,
+            select_index=select_index,
+            draft_input_ids=draft_input_ids,
         )
 
     block = _DRAFT_TOPK1_BLOCK
@@ -353,13 +393,13 @@ def target_verify_topk1_postprocess(
         SPLIT_BLOCK=triton.next_power_of_2(num_splits),
         num_warps=4,
     )
-    return (
-        predict,
-        num_correct_drafts,
-        accept_lens,
-        accept_index,
-        bonus_tokens,
-        new_seq_lens,
-        select_index,
-        draft_input_ids,
+    return TargetVerifyTopk1Output(
+        predict=predict,
+        num_correct_drafts=num_correct_drafts,
+        accept_lens=accept_lens,
+        accept_index=accept_index,
+        bonus_tokens=bonus_tokens,
+        new_seq_lens=new_seq_lens,
+        select_index=select_index,
+        draft_input_ids=draft_input_ids,
     )

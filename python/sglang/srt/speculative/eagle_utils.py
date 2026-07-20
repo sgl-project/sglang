@@ -17,7 +17,7 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
 from sglang.srt.mem_cache.allocation import alloc_for_spec_decode
 from sglang.srt.mem_cache.allocation_sizing import get_alloc_reserve_per_decode
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.speculative.spec_info import SpecInputType
+from sglang.srt.speculative.eagle_target_verify import prepare_eagle_verify_logits
 from sglang.srt.utils import (
     is_cpu,
     is_cuda,
@@ -600,7 +600,7 @@ def eagle_sample(
 
     bs = len(batch.seq_lens)
     sampling_info = batch.sampling_info
-    next_token_logits = _prepare_eagle_verify_logits(
+    next_token_logits = prepare_eagle_verify_logits(
         verify_input, batch, logits_output, vocab_mask
     )
 
@@ -765,136 +765,6 @@ def eagle_sample(
     # tensor includes the trailing/bonus token via out-of-place +1 so the
     # name no longer flips semantics mid-function (naming doc C2).
     return predict, num_correct_drafts + 1, accept_index
-
-
-def _prepare_eagle_verify_logits(
-    verify_input: EagleVerifyInput,
-    batch: ScheduleBatch,
-    logits_output: LogitsProcessorOutput,
-    vocab_mask: torch.Tensor = None,
-) -> torch.Tensor:
-    from sglang.srt.sampling.penaltylib.repetition_penalty import (
-        apply_scaling_penalties,
-    )
-    from sglang.srt.utils.async_probe import sanitize_nan_logits
-
-    sampling_info = batch.sampling_info
-    next_token_logits = logits_output.next_token_logits
-    sanitize_nan_logits(next_token_logits, "verify: target model logits")
-
-    # Apply penalty
-    # This is a relaxed version of penalties for speculative decoding.
-    if sampling_info.acc_additive_penalties is not None:
-        next_token_logits.add_(
-            torch.repeat_interleave(
-                sampling_info.acc_additive_penalties,
-                verify_input.draft_token_num,
-                dim=0,
-            )
-        )
-    if sampling_info.acc_scaling_penalties is not None:
-        apply_scaling_penalties(
-            next_token_logits,
-            torch.repeat_interleave(
-                sampling_info.acc_scaling_penalties, verify_input.draft_token_num, dim=0
-            ),
-        )
-    if sampling_info.logit_bias is not None:
-        next_token_logits.add_(
-            torch.repeat_interleave(
-                sampling_info.logit_bias, verify_input.draft_token_num, dim=0
-            )
-        )
-
-    # Apply grammar mask if provided
-    if vocab_mask is not None:
-        assert verify_input.grammar is not None
-        verify_input.grammar.apply_vocab_mask(
-            logits=next_token_logits, vocab_mask=vocab_mask
-        )
-
-    return next_token_logits
-
-
-def maybe_eagle_sample_target_verify_topk1(
-    verify_input: EagleVerifyInput,
-    batch: ScheduleBatch,
-    logits_output: LogitsProcessorOutput,
-    vocab_mask: torch.Tensor = None,
-):
-    """Run the CUDA topk=1 verify fast path when all selection invariants hold."""
-    from sglang.srt.speculative.spec_utils import SIMULATE_ACC_LEN
-
-    if (
-        not _is_cuda
-        or batch.forward_mode.is_idle()
-        or not batch.sampling_info.is_all_greedy
-        or verify_input.spec_input_type != SpecInputType.EAGLE_VERIFY
-        or verify_input.tree_topk != 1
-        or verify_input.draft_token_num != verify_input.max_tree_depth
-        or SIMULATE_ACC_LEN > 0
-    ):
-        return None
-
-    logits = logits_output.next_token_logits
-    candidates = verify_input.draft_token.reshape(
-        len(batch.seq_lens), verify_input.draft_token_num
-    )
-    expected_shape = candidates.shape
-    integer_tensors = (
-        candidates,
-        verify_input.retrieve_index,
-        verify_input.retrieve_next_token,
-    )
-    if (
-        logits.ndim != 2
-        or logits.device.type != "cuda"
-        or logits.stride(1) != 1
-        or logits.dtype not in (torch.float16, torch.bfloat16, torch.float32)
-        or logits.shape[0] != candidates.numel()
-        or any(t.shape != expected_shape for t in integer_tensors)
-        or any(t.dtype != torch.long or not t.is_contiguous() for t in integer_tensors)
-        or batch.seq_lens.ndim != 1
-        or not batch.seq_lens.is_contiguous()
-        or batch.seq_lens.dtype not in (torch.int32, torch.int64)
-        or any(t.device != logits.device for t in (*integer_tensors, batch.seq_lens))
-    ):
-        return None
-
-    from sglang.kernels.ops.speculative.topk1 import (
-        target_verify_topk1_postprocess,
-    )
-    from sglang.srt.speculative.eagle_info import EagleVerifyFinalizeOutput
-
-    logits = _prepare_eagle_verify_logits(
-        verify_input, batch, logits_output, vocab_mask
-    )
-    (
-        predict,
-        num_correct_drafts,
-        accept_lens,
-        accept_index,
-        bonus_tokens,
-        new_seq_lens,
-        select_index,
-        draft_input_ids,
-    ) = target_verify_topk1_postprocess(
-        logits,
-        candidates,
-        verify_input.retrieve_index,
-        verify_input.retrieve_next_token,
-        batch.seq_lens,
-    )
-    return EagleVerifyFinalizeOutput(
-        predict=predict,
-        num_correct_drafts=num_correct_drafts,
-        accept_lens=accept_lens,
-        accept_index=accept_index,
-        bonus_tokens=bonus_tokens,
-        new_seq_lens=new_seq_lens,
-        select_index=select_index,
-        draft_input_ids=draft_input_ids,
-    )
 
 
 def eagle_prepare_for_decode(batch: ScheduleBatch):

@@ -6,7 +6,10 @@ from typing import List, Optional
 
 import torch
 
-from sglang.kernels.ops.speculative.topk1 import draft_topk1_postprocess
+from sglang.kernels.ops.speculative.topk1 import (
+    TargetVerifyTopk1Output,
+    draft_topk1_postprocess,
+)
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_extend_npu_graph_runner import (
@@ -59,7 +62,6 @@ from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
 )
 from sglang.srt.speculative.eagle_info import (
     EagleDraftExtendInput,
-    EagleDraftExtendPreparation,
     EagleDraftInput,
     EagleVerifyInput,
 )
@@ -67,7 +69,6 @@ from sglang.srt.speculative.eagle_utils import (
     _eagle_prefill_tail_tokens,
     default_tree_mask_mode,
     get_draft_recurrent_hidden_state_spec,
-    maybe_eagle_sample_target_verify_topk1,
     organize_draft_results,
     per_step_draft_out_cache_loc,
 )
@@ -118,36 +119,6 @@ _is_xpu = is_xpu()
 
 
 logger = logging.getLogger(__name__)
-
-
-def _make_draft_extend_preparation(
-    batch_result: GenerationBatchResult,
-    fused_preparation: Optional[EagleDraftExtendPreparation],
-    num_draft_tokens: int,
-) -> EagleDraftExtendPreparation:
-    if fused_preparation is not None:
-        return fused_preparation
-
-    accept_lens = batch_result.accept_lens
-    batch_size = accept_lens.numel()
-    select_index = (
-        torch.arange(
-            0,
-            batch_size * num_draft_tokens,
-            num_draft_tokens,
-            device=accept_lens.device,
-        )
-        + accept_lens
-        - 1
-    )
-    # Cast before entering the plan stream. Casting there creates a cross-stream
-    # dependency that can race with MTP draft-extend preparation.
-    input_ids = batch_result.next_token_ids.to(torch.int64)
-    return EagleDraftExtendPreparation(
-        num_correct_drafts=accept_lens - 1,
-        select_index=select_index,
-        input_ids=input_ids,
-    )
 
 
 class EagleDraftWorker(EagleDraftWorkerBase):
@@ -903,27 +874,46 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self,
         batch: ScheduleBatch,
         batch_result: GenerationBatchResult,
-        preparation: EagleDraftExtendPreparation,
+        target_verify_topk1_output: Optional[TargetVerifyTopk1Output],
     ):
+        if target_verify_topk1_output is None:
+            accept_lens = batch_result.accept_lens
+            num_correct_drafts = accept_lens - 1
+            select_index = (
+                torch.arange(
+                    0,
+                    accept_lens.numel() * self.speculative_num_draft_tokens,
+                    self.speculative_num_draft_tokens,
+                    device=accept_lens.device,
+                )
+                + accept_lens
+                - 1
+            )
+            # Cast before entering the plan stream. Casting there creates a
+            # cross-stream dependency that can race with MTP draft-extend.
+            input_ids = batch_result.next_token_ids.to(torch.int64)
+        else:
+            num_correct_drafts = target_verify_topk1_output.num_correct_drafts
+            select_index = target_verify_topk1_output.select_index
+            input_ids = target_verify_topk1_output.draft_input_ids
+
         # Batch 2: Draft extend
         draft_extend_input = EagleDraftExtendInput(
             hidden_states=batch_result.logits_output.hidden_states,
             # accept_lens includes the bonus token; correct drafts exclude it.
-            num_correct_drafts=preparation.num_correct_drafts,
+            num_correct_drafts=num_correct_drafts,
             num_accept_tokens=batch_result.accept_lens,
             # Draft-extend fills the whole tree width (num_draft_tokens) per req,
             # not num_steps + 1, so DP MLP-sync padding stays consistent for topk > 1.
             num_tokens_per_req=self.speculative_num_draft_tokens,
             num_tokens_for_logprob_per_req=self.speculative_num_draft_tokens,
         )
-        select_index = preparation.select_index
-
         # Prepare for draft extend in a separate stream
         with self.plan_stream_ctx:
             forward_batch = prepare_for_draft_extend(
                 draft_extend_input,
                 batch,
-                preparation.input_ids,
+                input_ids,
                 self.speculative_num_draft_tokens,
                 self.draft_runner,
                 self.cuda_graph_runner_for_draft_extend,
@@ -1234,13 +1224,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     speculative_moe_a2a_backend_context(),
                     spec_stage_span("draft_extend"),
                 ):
-                    preparation = _make_draft_extend_preparation(
-                        batch_output,
-                        verify_step.draft_extend_preparation,
-                        self.speculative_num_draft_tokens,
-                    )
                     self.draft_worker._draft_extend_for_decode(
-                        batch, batch_output, preparation
+                        batch,
+                        batch_output,
+                        verify_step.target_verify_topk1_output,
                     )
 
             return batch_output
@@ -1529,7 +1516,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
     def _run_verify(
         self,
         batch: ScheduleBatch,
-        target_verify_postprocessor,
+        enable_target_verify_topk1: bool,
     ) -> EagleVerifyStepResult:
         return run_eagle_verify(
             batch,
@@ -1544,14 +1531,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
             device=self.device,
             metadata_ready_pre_pad=False,
             finalize_tree_path=True,
-            target_verify_postprocessor=target_verify_postprocessor,
+            enable_target_verify_topk1=enable_target_verify_topk1,
         )
 
     def _verify_for_draft_extend(self, batch: ScheduleBatch) -> EagleVerifyStepResult:
-        return self._run_verify(batch, maybe_eagle_sample_target_verify_topk1)
+        return self._run_verify(batch, enable_target_verify_topk1=True)
 
     def verify(self, batch: ScheduleBatch):
-        return self._run_verify(batch, None).batch_result
+        return self._run_verify(batch, enable_target_verify_topk1=False).batch_result
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         monkey_patch_torch_reductions()
