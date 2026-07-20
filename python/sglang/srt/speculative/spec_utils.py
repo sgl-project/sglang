@@ -114,7 +114,25 @@ def resolve_num_tokens_per_req(
 
 
 def fast_sample(probs: torch.Tensor, num_samples: int = 1):
-    sample_index = torch.multinomial(probs, num_samples=num_samples)
+    """Draw from `probs` via the Gumbel-max trick: argmax(probs / Exp(1)).
+
+    Distributionally equivalent to torch.multinomial, but avoids multinomial's
+    device-side distribution-validity assert, which the draft CUDA graph would
+    otherwise capture and replay every step. q is clamped off zero so a zero
+    draw can't yield inf/NaN scores that argmax would wrongly select; fp32
+    avoids bf16 argmax ties biasing the draw. Set SGLANG_OPT_USE_GUMBEL_SAMPLE=0
+    to fall back to torch.multinomial.
+    """
+    if not envs.SGLANG_OPT_USE_GUMBEL_SAMPLE.get():
+        sample_index = torch.multinomial(probs, num_samples=num_samples)
+        return probs.gather(1, sample_index), sample_index
+    q = torch.empty_like(probs, dtype=torch.float32).exponential_(1.0)
+    q.clamp_min_(torch.finfo(torch.float32).tiny)
+    scores = probs.float() / q
+    if num_samples == 1:
+        sample_index = scores.argmax(dim=-1, keepdim=True)
+    else:
+        sample_index = scores.topk(num_samples, dim=-1).indices
     sample_p = probs.gather(1, sample_index)
     return sample_p, sample_index
 
@@ -678,9 +696,74 @@ def commit_mamba_states_after_verify(
     model_runner = target_worker.model_runner
     if mambaish_config(model_runner.model_config) is None:
         return
-    attn_backend = model_runner.attn_backend
-    if not hasattr(attn_backend, "update_mamba_state_after_mtp_verify"):
+
+    # ReplaySSM spec-verify path (Part B of #28511): the accepted drafts already
+    # live in the per-slot circular ring (written during verify). Instead of
+    # scattering an intermediate full SSM state into `temporal`, advance the
+    # block-keyed cursors by the accepted count (the ring owns the SSM state; the
+    # verify/flush kernel folds it into `temporal` periodically). The CONV state
+    # still needs its usual accept-rollback, so we keep the conv-window scatter and
+    # skip only the SSM scatter. GDN-only + linear-chain (topk<=1) -- the runtime
+    # ring is allocated only then; KDA never allocates the cursors.
+    req_pool = model_runner.req_to_token_pool
+    mamba_pool = getattr(req_pool, "mamba_pool", None)
+    if (
+        mamba_pool is not None
+        and getattr(mamba_pool, "replayssm_cache_base", None) is not None
+        and not getattr(mamba_pool, "replayssm_is_kda", False)
+    ):
+        if batch.forward_mode.is_idle() or accept_index.numel() == 0:
+            return
+        from sglang.kernels.ops.attention.fla.gdn_replayssm_spec_decode import (
+            commit_gdn_replayssm_spec,
+        )
+        from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
+            fused_conv_window_scatter_with_mask,
+        )
+
+        spec_state = req_pool.get_speculative_mamba2_params_all_layers()
+        bs = accept_lens.shape[0]
+        state_batch_indices = req_pool.get_mamba_indices(batch.req_pool_indices)
+        # Advance the per-slot circular cursors by the accepted count (incl. the
+        # bonus token). max_cache_len = ring length L = replayssm_d.shape[-2].
+        commit_gdn_replayssm_spec(
+            write_pos=mamba_pool.replayssm_write_pos,
+            cache_base=mamba_pool.replayssm_cache_base,
+            is_flush=mamba_pool.replayssm_is_flush,
+            num_accepted=accept_lens,  # [bs], includes the bonus token
+            state_batch_indices=state_batch_indices,
+            max_cache_len=spec_state.replayssm_d.shape[-2],
+            max_spec_len=draft_token_num,
+            null_block_id=-1,  # SGLang: valid slots >= 0, padding == -1
+        )
+        # Roll back / commit the conv state to the last accepted draft step
+        # (same logic as the recurrent commit, but conv-only).
+        accept_indices_offset = torch.arange(
+            0,
+            bs * draft_token_num,
+            step=draft_token_num,
+            dtype=accept_lens.dtype,
+            device=accept_lens.device,
+        )
+        req_idx = torch.arange(bs, dtype=torch.int64, device=accept_lens.device)
+        last_correct_step_indices = (
+            accept_index[req_idx, (accept_lens - 1).to(torch.int64)]
+            - accept_indices_offset
+        )
+        fused_conv_window_scatter_with_mask(
+            spec_state.conv[0],
+            spec_state.intermediate_conv_window[0],
+            state_batch_indices,
+            last_correct_step_indices,
+        )
+        # NOTE: radix mamba prefix-caching (mamba_track / extra_buffer) would need
+        # a device-side force-flush so `temporal` reflects the ring before a
+        # snapshot; not wired for Part B (server_args forbids extra_buffer with
+        # --enable-gdn-replayssm-spec), so the per-track scatters are intentionally
+        # skipped here.
         return
+
+    attn_backend = model_runner.attn_backend
 
     bs = accept_lens.shape[0]
     # `accept_lens` already includes the bonus token (drafts + 1 per req).
@@ -727,12 +810,23 @@ def commit_mamba_states_after_verify(
         else:
             mamba_steps_to_track = None
 
-        attn_backend.update_mamba_state_after_mtp_verify(
-            last_correct_step_indices=last_correct_step_indices,
-            mamba_track_indices=batch.mamba_track_indices,
-            mamba_steps_to_track=mamba_steps_to_track,
-            model=model_runner.model,
-        )
+        if hasattr(attn_backend, "update_mamba_state_after_mtp_verify"):
+            attn_backend.update_mamba_state_after_mtp_verify(
+                last_correct_step_indices=last_correct_step_indices,
+                mamba_track_indices=batch.mamba_track_indices,
+                mamba_steps_to_track=mamba_steps_to_track,
+                model=model_runner.model,
+            )
+        elif hasattr(model_runner.model, "update_conv_state_after_mtp_verify"):
+            # Models whose conv layers bypass the attention-backend wrapper
+            # (Inkling) own the commit themselves.
+            model_runner.model.update_conv_state_after_mtp_verify(
+                req_to_token_pool=model_runner.req_to_token_pool,
+                req_pool_indices=batch.req_pool_indices[:bs],
+                last_correct_step_indices=last_correct_step_indices,
+                mamba_track_indices=batch.mamba_track_indices,
+                mamba_steps_to_track=mamba_steps_to_track,
+            )
 
 
 def spec_prepare_for_decode(batch: ScheduleBatch) -> None:
