@@ -6,9 +6,12 @@ invariants hold (tokens * per_token_cost <= available_bytes).
 """
 
 import contextlib
+import json
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
+
+import torch
 
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.runtime_context import get_parallel
@@ -78,6 +81,7 @@ def _make_model_runner(
     disaggregation_mode="null",
     max_running_requests=None,
     disaggregation_decode_extra_slots=0,
+    enable_runtime_sparse_attention=False,
 ):
     """Create a mock ModelRunner with the fields configurators need."""
     mr = MagicMock()
@@ -114,7 +118,9 @@ def _make_model_runner(
     mc.linear_attn_registry_result = None
     mr.model_config = mc
 
-    mr.kv_cache_dtype = "fake_bf16"
+    mr.kv_cache_dtype = (
+        torch.bfloat16 if enable_runtime_sparse_attention else "fake_bf16"
+    )
 
     sa = SimpleNamespace()
     sa.swa_full_tokens_ratio = swa_full_tokens_ratio
@@ -134,6 +140,21 @@ def _make_model_runner(
     sa.disaggregation_decode_extra_slots = disaggregation_decode_extra_slots
     sa.enable_dsa_cache_layer_split = False
     sa.kv_cache_dtype = "auto"
+    sa.enable_hisparse = enable_runtime_sparse_attention
+    sa.hisparse_config = (
+        json.dumps(
+            {
+                "algorithm": "quest",
+                "backend": "fa3",
+                "page_size": page_size,
+            }
+        )
+        if enable_runtime_sparse_attention
+        else None
+    )
+    sa.prefill_attention_backend = None
+    sa.decode_attention_backend = None
+    sa.attention_backend = "fa3" if enable_runtime_sparse_attention else None
     mr.server_args = sa
 
     spec = MagicMock()
@@ -229,6 +250,40 @@ class TestDefaultConfigurator(unittest.TestCase):
         _, _, config = self._run(10_000_000)
         self.assertIsNone(config.full_max_total_num_tokens)
         self.assertIsNone(config.swa_max_total_num_tokens)
+
+    def test_runtime_quest_representation_memory_is_budgeted(self):
+        available = 10_000_000
+        page_size = 16
+        kvc, cfg, config = self._run(
+            available,
+            page_size=page_size,
+            enable_runtime_sparse_attention=True,
+        )
+        kv_bytes_per_token = _actual_memory_used(
+            kvc,
+            SimpleNamespace(max_total_num_tokens=1),
+        )
+        representation_bytes_per_page = kvc.layer_info.num_effective_layers * (
+            2 * kvc.model_config.get_num_kv_heads(1) * kvc.model_config.head_dim * 4 + 1
+        )
+        representation_pages = config.max_total_num_tokens // page_size + 1
+        used = (
+            config.max_total_num_tokens * kv_bytes_per_token
+            + representation_pages * representation_bytes_per_page
+        )
+        expected_pages = (available - representation_bytes_per_page) // (
+            page_size * kv_bytes_per_token + representation_bytes_per_page
+        )
+
+        self.assertEqual(
+            cfg._runtime_sparse_representation_bytes_per_page,
+            representation_bytes_per_page,
+        )
+        self.assertEqual(
+            config.max_total_num_tokens,
+            expected_pages * page_size,
+        )
+        self.assertLessEqual(used, available)
 
 
 class TestHybridSWAConfigurator(unittest.TestCase):

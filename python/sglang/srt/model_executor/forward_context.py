@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING, Optional
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
     from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
+    from sglang.srt.mem_cache.sparsity.core.sparse_coordinator import SparseCoordinator
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,6 +39,7 @@ class ForwardContext:
     write time — use dataclasses.replace for per-call overrides."""
 
     attn_backend: AttentionBackend
+    runtime_sparse_coordinator: Optional[SparseCoordinator] = None
 
 
 _current: Optional[ForwardContext] = None

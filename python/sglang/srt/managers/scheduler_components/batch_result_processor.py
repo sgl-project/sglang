@@ -92,7 +92,7 @@ class SchedulerBatchResultProcessor:
             req.update_finish_state()
             if req.finished():
                 req.time_stats.set_quick_finish_time()
-                if self.server_args.enable_hisparse:
+                if self.hisparse_coordinator is not None:
                     self.hisparse_coordinator.request_finished(req)
                 release_kv_cache(req, self.tree_cache)
 
@@ -243,7 +243,7 @@ class SchedulerBatchResultProcessor:
                         req.time_stats.set_completion_time()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         maybe_cache_unfinished_req(req, self.tree_cache)
-                        if self.server_args.enable_hisparse:
+                        if self.hisparse_coordinator is not None:
                             self.hisparse_coordinator.admit_request_into_staging(req)
 
                     self._maybe_collect_customized_info(i, req, logits_output)
@@ -964,7 +964,7 @@ class SchedulerBatchResultProcessor:
                 if not self.decode_offload_manager.offload_kv_cache(req):
                     self.decode_offload_manager.finalize_release_on_finish(req)
             else:
-                if self.server_args.enable_hisparse:
+                if self.hisparse_coordinator is not None:
                     self.hisparse_coordinator.request_finished(req)
                 prepare_release = getattr(
                     self.model_worker, "prepare_for_kv_cache_release", None
