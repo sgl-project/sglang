@@ -182,7 +182,9 @@ class FullComponent(TreeComponent):
         # Only the last host node needs to be protected.
         if lock_host:
             cd = node.component_data[ct]
-            if cd.host_value is None:
+            # write_back mode: the anchor may be device-only (no host_value);
+            # pin it anyway so the host-pressure drop fallback cannot delete it.
+            if cd.host_value is None and not self.cache.is_write_back:
                 return result
             cd.host_lock_ref += 1
             self.cache._update_evictable_leaf_sets(node)
@@ -223,7 +225,10 @@ class FullComponent(TreeComponent):
         ct = self.component_type
         if lock_host:
             cd = node.component_data[ct]
-            if cd.host_value is None or cd.host_lock_ref == 0:
+            if cd.host_lock_ref == 0:
+                return
+            # Mirror of `acquire`. write_back uses a pure counter.
+            if cd.host_value is None and not self.cache.is_write_back:
                 return
             cd.host_lock_ref -= 1
             self.cache._update_evictable_leaf_sets(node)
