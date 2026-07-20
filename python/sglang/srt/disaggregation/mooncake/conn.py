@@ -1965,11 +1965,11 @@ class MooncakeKVReceiver(CommonKVReceiver):
             self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
             return
 
+        self.chunk_staging_infos = []
         if (
             self.kv_mgr.enable_staging
             and self.kv_mgr._staging_ctx.allocator is not None
         ):
-            self.chunk_staging_infos = []
             self.kv_mgr.register_staging_room_bootstrap(
                 self.bootstrap_room, self.bootstrap_infos, self
             )

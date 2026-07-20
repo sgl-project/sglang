@@ -2540,10 +2540,7 @@ class NixlKVSender(CommonKVSender):
 
     def clear(self) -> None:
         super().clear()
-        if (
-            getattr(self.kv_mgr, "enable_staging", False)
-            and getattr(self.kv_mgr, "_staging_ctx", None) is not None
-        ):
+        if self.kv_mgr.enable_staging and self.kv_mgr._staging_ctx is not None:
             self.kv_mgr._staging_ctx.prefetched_rooms.discard(self.bootstrap_room)
             self.kv_mgr._staging_ctx.prefetch_requested = {
                 key
@@ -2599,11 +2596,11 @@ class NixlKVReceiver(CommonKVReceiver):
             return
 
         # Register staging room bootstrap info for staging handler
+        self.chunk_staging_infos = []
         if (
             self.kv_mgr.enable_staging
             and self.kv_mgr._staging_ctx.allocator is not None
         ):
-            self.chunk_staging_infos = []
             self.kv_mgr.register_staging_room_bootstrap(
                 self.bootstrap_room, self.bootstrap_infos, self
             )

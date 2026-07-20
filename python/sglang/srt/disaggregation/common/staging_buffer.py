@@ -194,6 +194,9 @@ class StagingAllocator:
         self.watermark_round = 0
         self.watermark_tail = 0
         self.lock = threading.Lock()
+        # Lazily created on the decode side by the first scatter; stays None
+        # until then so release_room can drain it without a defensive check.
+        self._scatter_stream = None
 
         logger.info(
             f"StagingAllocator (ring+overcommit): "
