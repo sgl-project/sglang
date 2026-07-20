@@ -2155,7 +2155,7 @@ def _build_warmup_json(
 
         # TODO: ChatCompletionRequest does not have bootstrap info required by disaggregation mode, disable image-warmup for now
         # Only use chat completions format for generation models, not embedding models
-        return request_name, {
+        json_data = {
             "model": served_model_name,
             "messages": [
                 {
