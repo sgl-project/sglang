@@ -264,9 +264,6 @@ def _forward_with_allreduce_fusion_quant_per_group(
         return None
 
     from sglang.srt.distributed import (
-        get_attn_tensor_model_parallel_world_size,
-        get_moe_expert_parallel_world_size,
-        get_moe_tensor_parallel_world_size,
         tensor_model_parallel_fused_allreduce_rmsnorm,
         tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_group,
     )
@@ -278,12 +275,12 @@ def _forward_with_allreduce_fusion_quant_per_group(
     )
 
     if use_attn_tp_group:
-        world_size = get_attn_tensor_model_parallel_world_size()
+        world_size = get_parallel().attn_tp_size
     else:
-        if get_moe_expert_parallel_world_size() > 1:
-            world_size = get_moe_expert_parallel_world_size()
+        if get_parallel().moe_ep_size > 1:
+            world_size = get_parallel().moe_ep_size
         else:
-            world_size = get_moe_tensor_parallel_world_size()
+            world_size = get_parallel().moe_tp_size
     if world_size <= 1:
         return None
 
