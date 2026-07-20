@@ -18,10 +18,7 @@ def main() -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
-    from aiter.jit.core import get_user_jit_dir
-    from aiter.ops.gemm_op_a8w8 import (
-        gemm_a8w8_blockscale_bpreshuffle_cktile,
-    )
+    from aiter.jit.core import build_module, get_args_of_build, get_user_jit_dir
 
     commit = subprocess.check_output(
         ["git", "-C", "/sgl-workspace/aiter", "rev-parse", "HEAD"],
@@ -42,16 +39,27 @@ def main() -> int:
 
     started = time.perf_counter()
     try:
-        # compile_ops loads/builds the extension before pybind validates the
-        # deliberately omitted runtime tensors. This isolates compilation from
-        # kernel execution and model/runtime behavior.
-        gemm_a8w8_blockscale_bpreshuffle_cktile()
-    except TypeError as exc:
-        if not shared_object.exists():
-            print("BUILD_FAILED TypeError occurred before .so was produced", flush=True)
-            traceback.print_exc()
-            return 2
-        print(f"EXPECTED_POST_BUILD_CALL_ERROR {exc}", flush=True)
+        # This is the same get_args_of_build -> build_module path taken by
+        # compile_ops after its initial import raises ModuleNotFoundError. Calling
+        # it directly isolates JIT compilation from torch dispatcher schema
+        # validation and from launching the compiled GPU kernel.
+        args = get_args_of_build(MODULE)
+        build_module(
+            MODULE,
+            args["srcs"],
+            args["flags_extra_cc"],
+            args["flags_extra_hip"],
+            args["blob_gen_cmd"],
+            args["extra_include"],
+            args["extra_ldflags"],
+            args["verbose"],
+            args["is_python_module"],
+            args["is_standalone"],
+            args["torch_exclude"],
+            args.get("third_party", []),
+            args.get("hipify", False),
+            flags_extra_hip_per_source=args.get("flags_extra_hip_per_source", {}),
+        )
     except BaseException:
         print(f"BUILD_FAILED so_exists={shared_object.exists()}", flush=True)
         traceback.print_exc()
