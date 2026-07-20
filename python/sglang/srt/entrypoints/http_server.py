@@ -1532,11 +1532,8 @@ async def load_lora_adapter_from_distributed(
     result = await _global_state.tokenizer_manager.load_lora_adapter_from_distributed(
         obj, request
     )
-
-    if result.success:
-        return ORJSONResponse(result, status_code=HTTPStatus.OK)
-    else:
-        return ORJSONResponse(result, status_code=HTTPStatus.BAD_REQUEST)
+    status_code = HTTPStatus.OK if result.success else HTTPStatus.BAD_REQUEST
+    return ORJSONResponse(msgspec_to_builtins(result), status_code=status_code)
 
 
 @app.api_route("/unload_lora_adapter", methods=["POST"])
