@@ -74,6 +74,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "disable_overlap_schedule",
                     "uses_mamba_radix_cache",
                     "mamba_radix_cache_strategy",
+                    "mamba_full_memory_ratio",
                     "speculative_moe_runner_backend",
                     "speculative_moe_a2a_backend",
                     "disable_shared_experts_fusion",
