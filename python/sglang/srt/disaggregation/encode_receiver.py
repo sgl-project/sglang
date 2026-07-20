@@ -173,13 +173,14 @@ class EncoderBootstrapServer:
         revival set so it does not come back automatically.
         """
         with self._lock:
-            self._evicted_urls.discard(url)
-            self._health_fail_counts.pop(url, None)
+            removed = url in self._urls or url in self._evicted_urls
             if url in self._urls:
                 self._urls.remove(url)
+            self._evicted_urls.discard(url)
+            self._health_fail_counts.pop(url, None)
+            if removed:
                 logger.info(f"Unregistered encoder URL: {url}")
-                return True
-            return False
+            return removed
 
     def list_urls(self) -> List[str]:
         """Return a snapshot of all registered encoder URLs."""
