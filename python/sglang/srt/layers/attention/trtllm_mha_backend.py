@@ -25,6 +25,8 @@ from sglang.srt.layers.attention.flashinfer_backend import (
     FlashInferAttnBackend,
     FlashInferMultiStepDraftBackend,
 )
+from sglang.srt.layers.cp.base import CPAttentionBackendKind, get_cp_strategy
+from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     KVCacheAttentionAccessKind,
 )
@@ -643,9 +645,16 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         """Get the fill value for sequence lengths in CUDA graph."""
         return 1
 
-    def _should_use_fused_fp8_path(self, save_kv_cache: bool, k: torch.Tensor) -> bool:
+    def _should_use_fused_fp8_path(
+        self, save_kv_cache: bool, k: torch.Tensor, forward_batch: ForwardBatch
+    ) -> bool:
         """Check if we should use the fused FP8 KV cache write path."""
-        return save_kv_cache and k is not None and self.data_type == torch.float8_e4m3fn
+        return (
+            not is_cp_v2_active(forward_batch)
+            and save_kv_cache
+            and k is not None
+            and self.data_type == torch.float8_e4m3fn
+        )
 
     def _fused_fp8_qkv_kv_cache(
         self,
@@ -931,7 +940,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         """Run forward for decode using TRTLLM MHA kernel."""
         cache_loc = forward_batch.out_cache_loc
 
-        use_fused_fp8_path = self._should_use_fused_fp8_path(save_kv_cache, k)
+        use_fused_fp8_path = self._should_use_fused_fp8_path(
+            save_kv_cache, k, forward_batch
+        )
         use_fused_qkv = use_fused_fp8_path and not self.is_xqa_impl
         pool = self.token_to_kv_pool
 
@@ -1020,8 +1031,13 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             )
 
         cache_loc = forward_batch.out_cache_loc
+        cp_v2_active = is_cp_v2_active(forward_batch)
 
-        use_fused_fp8_path = self._should_use_fused_fp8_path(save_kv_cache, k)
+        # The fused path writes rank-local K/V directly to cache. CP-v2 needs
+        # the strategy to gather K/V into full logical token order first.
+        use_fused_fp8_path = self._should_use_fused_fp8_path(
+            save_kv_cache, k, forward_batch
+        )
         use_fused_qkv = use_fused_fp8_path and not self.is_xqa_impl
 
         if use_fused_fp8_path:
@@ -1033,16 +1049,26 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             k = None
             v = None
         else:
-            # Use original set_kv_buffer path
             if save_kv_cache and k is not None:
-                self.token_to_kv_pool.set_kv_buffer(
-                    layer,
-                    KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
-                    k,
-                    v,
-                    layer.k_scale,
-                    layer.v_scale,
-                )
+                if cp_v2_active:
+                    cp_strategy = get_cp_strategy()
+                    assert cp_strategy is not None
+                    cp_strategy.materialize_full_kv(
+                        forward_batch,
+                        layer,
+                        k,
+                        v,
+                        swa_loc=self.forward_metadata.swa_out_cache_loc,
+                    )
+                else:
+                    self.token_to_kv_pool.set_kv_buffer(
+                        layer,
+                        KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
+                        k,
+                        v,
+                        layer.k_scale,
+                        layer.v_scale,
+                    )
 
         q_scale = 1.0
         if (
@@ -1116,24 +1142,51 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     q_len_per_req=self.forward_metadata.max_seq_len_q,
                 )
         else:
-            o = flashinfer.prefill.trtllm_batch_context_with_kv_cache(
-                query=q,
-                kv_cache=kv_cache,
-                workspace_buffer=self.workspace_buffer,
-                block_tables=page_table,
-                seq_lens=self.forward_metadata.cache_seqlens_int32,
-                max_q_len=self.forward_metadata.max_seq_len_q,
-                max_kv_len=self.max_context_len,
-                bmm1_scale=bmm1_scale,
-                bmm2_scale=bmm2_scale,
-                batch_size=self.forward_metadata.cu_seqlens_q.shape[0] - 1,
-                cum_seq_lens_q=self.forward_metadata.cu_seqlens_q,
-                cum_seq_lens_kv=self.forward_metadata.cu_seqlens_k,
-                window_left=layer.sliding_window_size,
-                sinks=attention_sink,
-                skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get(),
-                out_dtype=self.q_data_type,  # model_runner.dtype
-            )
+
+            def _trtllm_context_attn(
+                q_chunk,
+                cu_seqlens_q,
+                cache_seqlens,
+                max_seqlen_q,
+                cu_seqlens_kv,
+            ):
+                return flashinfer.prefill.trtllm_batch_context_with_kv_cache(
+                    query=q_chunk,
+                    kv_cache=kv_cache,
+                    workspace_buffer=self.workspace_buffer,
+                    block_tables=page_table,
+                    seq_lens=cache_seqlens,
+                    max_q_len=max_seqlen_q,
+                    max_kv_len=self.max_context_len,
+                    bmm1_scale=bmm1_scale,
+                    bmm2_scale=bmm2_scale,
+                    batch_size=cu_seqlens_q.shape[0] - 1,
+                    cum_seq_lens_q=cu_seqlens_q,
+                    cum_seq_lens_kv=cu_seqlens_kv,
+                    window_left=layer.sliding_window_size,
+                    sinks=attention_sink,
+                    skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get(),
+                    out_dtype=self.q_data_type,
+                )
+
+            if cp_v2_active:
+                cp_strategy = get_cp_strategy()
+                assert cp_strategy is not None
+                o = cp_strategy.run_attention(
+                    q,
+                    forward_batch,
+                    self.device,
+                    _trtllm_context_attn,
+                    attention_backend=CPAttentionBackendKind.TRTLLM_MHA,
+                )
+            else:
+                o = _trtllm_context_attn(
+                    q,
+                    self.forward_metadata.cu_seqlens_q,
+                    self.forward_metadata.cache_seqlens_int32,
+                    self.forward_metadata.max_seq_len_q,
+                    cu_seqlens_kv=self.forward_metadata.cu_seqlens_k,
+                )
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
