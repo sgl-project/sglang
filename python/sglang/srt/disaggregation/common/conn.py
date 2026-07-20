@@ -1373,7 +1373,7 @@ class CommonKVReceiver(BaseKVReceiver):
         self.kv_mgr.record_failure(
             self.bootstrap_room,
             f"Request {self.bootstrap_room} timed out after {elapsed:.1f}s "
-            f"in KVPoll.WaitingForInput",
+            f"waiting for KV Cache transfer to complete",
         )
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
         if (
