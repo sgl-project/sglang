@@ -530,6 +530,7 @@ def _flash_mla_flashinfer(
     # --- Page-split: convert pbs=N kv_cache to pbs=64 view ---
     kv_u8 = k_cache.view(torch.uint8) if k_cache.dtype != torch.uint8 else k_cache
     src_pbs = k_cache.shape[1] if k_cache.ndim >= 3 else _PBS_SRC
+    # Indices: no remapping needed (page-split preserves token addressing).
     idx = indices.squeeze(1) if indices.dim() == 3 else indices
     if src_pbs != _PBS_DST:
         # Avoids re-copying the whole KV pool (~105MB/layer) every step.
@@ -545,8 +546,6 @@ def _flash_mla_flashinfer(
     )
     extra_kv_64 = extra_kv_u8
 
-    # Indices: no remapping needed (page-split preserves token addressing).
-    idx = indices.squeeze(1) if indices.dim() == 3 else indices
     extra_idx = (
         extra_indices.squeeze(1)
         if extra_indices is not None and extra_indices.dim() == 3
