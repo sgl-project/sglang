@@ -7,6 +7,10 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.configs.pipeline_configs.dreamzero import (
     DreamZeroPipelineConfig,
 )
+from sglang.multimodal_gen.configs.models.dits.dreamzero_causal import (
+    DreamZeroCausalWanArchConfig,
+    DreamZeroCausalWanConfig,
+)
 from sglang.multimodal_gen.configs.sample.dreamzero import DreamZeroSamplingParams
 from sglang.multimodal_gen.configs.sample.sampling_params import (
     DataType,
@@ -20,7 +24,7 @@ from sglang.multimodal_gen.runtime.entrypoints.vla.protocol import (
     action_metadata,
     build_action_sampling_params,
 )
-from sglang.multimodal_gen.runtime.managers.dreamzero_session_cache import (
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.dreamzero.session_cache import (
     BRANCH_COND,
     BRANCH_UNCOND,
     DreamZeroCachePoolManager,
@@ -32,10 +36,10 @@ from sglang.multimodal_gen.runtime.models.dits.dreamzero_causal import (
     DreamZeroCausalWanModel,
 )
 from sglang.multimodal_gen.runtime.pipelines.dreamzero_pipeline import DreamZeroPipeline
-from sglang.multimodal_gen.runtime.pipelines_core.stages.dreamzero.denoising import (
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.dreamzero.denoising import (
     DreamZeroCausalDenoisingStage,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.dreamzero.text_encoding import (
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.dreamzero.text_encoding import (
     DreamZeroTextEncodingStage,
 )
 
@@ -125,18 +129,23 @@ def test_dreamzero_config_and_sampling_defaults_are_action_typed():
 
 
 def test_dreamzero_dit_rope_lengths_are_configurable():
+    config = DreamZeroCausalWanConfig(
+        arch_config=DreamZeroCausalWanArchConfig(
+            model_type="i2v",
+            dim=64,
+            ffn_dim=128,
+            num_heads=4,
+            num_layers=0,
+            frame_seqlen=8,
+            text_dim=32,
+            hidden_size=16,
+            rope_video_max_positions=(7, 8, 9),
+            rope_action_max_positions=10,
+            rope_state_max_positions=11,
+        )
+    )
     model = DreamZeroCausalWanModel(
-        model_type="i2v",
-        dim=64,
-        ffn_dim=128,
-        num_heads=4,
-        num_layers=0,
-        frame_seqlen=8,
-        text_dim=32,
-        hidden_size=16,
-        rope_video_max_positions=(7, 8, 9),
-        rope_action_max_positions=10,
-        rope_state_max_positions=11,
+        config=config,
     )
 
     assert model.freqs[0].shape[0] == 7

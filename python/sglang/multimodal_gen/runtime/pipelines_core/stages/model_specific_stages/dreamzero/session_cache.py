@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import hashlib
 import time
-import uuid
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any
@@ -207,7 +206,7 @@ class DreamZeroCachePool:
         lengths = [self.kv_lengths[branch][slot] for slot in slots]
         if len(set(lengths)) != 1:
             raise ValueError(
-                "DreamZero cache now only surpports uniform KV lengths within one batch"
+                "DreamZero cache now only supports uniform KV lengths within one batch"
                 f"{lengths}"
             )
         if not all(self.kv_valid[branch][slot] for slot in slots):
@@ -312,8 +311,6 @@ class DreamZeroCachePoolManager:
         self.pool = DreamZeroCachePool(capacity=max_sessions)
         self._sessions: OrderedDict[str, int] = OrderedDict()
         self._free_slots = list(range(max_sessions))
-        self._active_reset_apply_token: str | None = None
-        self._applied_reset_tokens: set[tuple[str, int]] = set()
 
     def lookup_or_allocate(
         self,
@@ -649,8 +646,6 @@ def resolve_request_cache(
     batch.dreamzero_cache = request_cache
     batch.dreamzero_session_ids = logical_session_ids
     batch.dreamzero_reset_mask = reset_mask
-    if getattr(batch, "dreamzero_reset_apply_token", None) is None:
-        batch.dreamzero_reset_apply_token = uuid.uuid4().hex
     record_session_timing(
         batch,
         "session_gather_ms",
@@ -664,12 +659,7 @@ def apply_request_lifecycle_resets(
     cache_manager: DreamZeroCachePoolManager | None,
     request_cache: DreamZeroRequestCache,
 ) -> None:
-    """Apply logical request/lifecycle resets to this rank's physical pool.
-
-    Reset decisions may be produced on rank 0 and carried by a broadcasted
-    batch. Applied markers therefore live on the rank-local cache manager, not
-    on the batch.
-    """
+    """Apply logical request/lifecycle resets to this rank's physical pool."""
     if cache_manager is None:
         raise RuntimeError("DreamZero session cache requires a cache manager")
     size = request_cache.batch_size
@@ -689,13 +679,6 @@ def apply_request_lifecycle_resets(
         getattr(batch, "dreamzero_session_reset_reason", None),
         size,
     )
-    token = getattr(batch, "dreamzero_reset_apply_token", None)
-    if token is None:
-        token = uuid.uuid4().hex
-        batch.dreamzero_reset_apply_token = token
-    if cache_manager._active_reset_apply_token != token:
-        cache_manager._active_reset_apply_token = token
-        cache_manager._applied_reset_tokens.clear()
 
     pool = cache_manager.pool
     for index, slot in enumerate(request_cache.slot_indices):
@@ -704,34 +687,11 @@ def apply_request_lifecycle_resets(
         if not request_reset and not lifecycle_reset:
             continue
         preserve_text = bool(lifecycle_preserve_text[index]) and not request_reset
-        key = (f"{token}:{index}", int(slot))
-        if key in cache_manager._applied_reset_tokens:
-            continue
         pool.reset_slot(slot, preserve_text=preserve_text)
-        cache_manager._applied_reset_tokens.add(key)
         if request_reset and request_reasons[index] is None:
             request_reasons[index] = "request_reset"
 
     batch.dreamzero_session_reset_reason = request_reasons
-
-
-def enter_request_cache(
-    batch,
-    cache_manager: DreamZeroCachePoolManager | None,
-    *,
-    local_attn_size: int,
-    batch_size: int,
-) -> tuple[DreamZeroRequestCache, DreamZeroCachePool]:
-    request_cache = resolve_request_cache(
-        batch,
-        cache_manager,
-        local_attn_size=local_attn_size,
-        batch_size=batch_size,
-    )
-    apply_request_lifecycle_resets(batch, cache_manager, request_cache)
-    if cache_manager is None:
-        raise RuntimeError("DreamZero session cache requires a cache manager")
-    return request_cache, cache_manager.pool
 
 
 def _prompt_hash(

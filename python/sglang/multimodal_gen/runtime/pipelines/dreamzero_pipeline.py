@@ -25,7 +25,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     patch_tensor_parallel_group,
     world_group_is_initialized,
 )
-from sglang.multimodal_gen.runtime.managers.dreamzero_session_cache import (
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.dreamzero.session_cache import (
     DreamZeroCachePoolManager,
 )
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_unipc_multistep import (
@@ -34,12 +34,16 @@ from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_unipc_multi
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.dreamzero import (
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.dreamzero.denoising import (
     DreamZeroActionOutputStage,
     DreamZeroCausalDenoisingStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.dreamzero.image_encoding import (
     DreamZeroObsPrepStage,
-    DreamZeroTextEncodingStage,
     DreamZeroVisualEncodingStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.dreamzero.text_encoding import (
+    DreamZeroTextEncodingStage,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum

@@ -9,9 +9,11 @@ https://github.com/dreamzero0/dreamzero/blob/main/groot/vla/model/dreamzero/acti
 from __future__ import annotations
 
 import math
+from functools import cache
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from sglang.multimodal_gen.configs.models.dits.dreamzero_causal import (
     DreamZeroCausalWanConfig,
@@ -25,29 +27,279 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     RowParallelLinear,
 )
-from sglang.multimodal_gen.runtime.models.dits.dreamzero_causal_ops import (
-    CategorySpecificMLP,
-    MultiEmbodimentActionEncoder,
-    WanLayerNorm,
-    WanRMSNorm,
-    _attention,
-    _linear,
-    _maybe_qk_norm,
-    _residual_add,
-    align_modulation,
-    causal_rope_action_apply,
-    rope_action_apply,
-    rope_params,
-    sinusoidal_embedding_1d,
+from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
+from sglang.multimodal_gen.runtime.layers.layernorm import (
+    FP32LayerNorm,
+    RMSNorm,
+    tensor_parallel_rms_norm,
 )
+from sglang.multimodal_gen.runtime.layers.visual_embedding import timestep_embedding
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
-from sglang.multimodal_gen.runtime.pipelines_core.stages.dreamzero.utils import (
+from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.dreamzero.utils import (
     flatten_dim_sp_into_sequence,
     gather_full_sequence_parallel_tensor,
     remove_redundant_action_register,
     shard_sequence_parallel_sequence,
     shard_sequence_parallel_time_embedding,
 )
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
+
+_DREAMZERO_SUPPORTED_ATTENTION_BACKENDS = {
+    AttentionBackendEnum.FA,
+    AttentionBackendEnum.TORCH_SDPA,
+}
+
+
+def _residual_add(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    scale: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if scale is None:
+        return x + y
+    return x + (y * scale)
+
+
+def rope_params(max_seq_len: int, dim: int, theta: int = 10000) -> torch.Tensor:
+    return rope_params_polar(max_seq_len, dim, theta)
+
+
+def rope_params_polar(max_seq_len: int, dim: int, theta: int = 10000) -> torch.Tensor:
+    assert dim % 2 == 0
+    freqs = torch.outer(
+        torch.arange(max_seq_len),
+        1.0
+        / torch.pow(
+            theta,
+            torch.arange(0, dim, 2).to(torch.float64).div(dim),
+        ),
+    )
+    return torch.polar(torch.ones_like(freqs), freqs)
+
+
+def _linear(layer: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    out = layer(x)
+    if not isinstance(out, tuple):
+        return out
+    output, output_bias = out
+    if output_bias is not None:
+        output = output + output_bias
+    return output
+
+
+def _maybe_qk_norm(
+    x: torch.Tensor, norm: nn.Module, *, tensor_parallel: bool
+) -> torch.Tensor:
+    if isinstance(norm, nn.Identity):
+        return x
+    if tensor_parallel:
+        return tensor_parallel_rms_norm(x, norm)
+    return norm(x)
+
+
+def align_modulation(
+    parts: tuple[torch.Tensor, ...], target_len: int
+) -> tuple[torch.Tensor, ...]:
+    aligned = []
+    for part in parts:
+        part_len = part.shape[1]
+        if part_len == target_len:
+            aligned.append(part)
+        elif part_len >= target_len:
+            aligned.append(part[:, :target_len])
+        else:
+            repeat = (target_len + part_len - 1) // part_len
+            aligned.append(part.repeat_interleave(repeat, dim=1)[:, :target_len])
+    return tuple(aligned)
+
+
+class SinusoidalPositionalEncoding(nn.Module):
+    def __init__(self, embedding_dim: int):
+        super().__init__()
+        self.embedding_dim = embedding_dim
+
+    def forward(self, timesteps: torch.Tensor) -> torch.Tensor:
+        timesteps = timesteps.float()
+        half_dim = self.embedding_dim // 2
+        exponent = -torch.arange(
+            half_dim, dtype=torch.float, device=timesteps.device
+        ) * (torch.log(torch.tensor(10000.0, device=timesteps.device)) / half_dim)
+        freqs = timesteps.unsqueeze(-1) * exponent.exp()
+        return torch.cat([torch.sin(freqs), torch.cos(freqs)], dim=-1)
+
+
+class CategorySpecificLinear(nn.Module):
+    def __init__(self, num_categories: int, input_dim: int, hidden_dim: int):
+        super().__init__()
+        self.num_categories = num_categories
+        self.W = nn.Parameter(0.02 * torch.randn(num_categories, input_dim, hidden_dim))
+        self.b = nn.Parameter(torch.zeros(num_categories, hidden_dim))
+
+    def forward(self, x: torch.Tensor, cat_ids: torch.Tensor) -> torch.Tensor:
+        selected_w = self.W[cat_ids]
+        selected_b = self.b[cat_ids]
+        return torch.bmm(x, selected_w) + selected_b.unsqueeze(1)
+
+
+class CategorySpecificMLP(nn.Module):
+    def __init__(
+        self,
+        num_categories: int,
+        input_dim: int,
+        hidden_dim: int,
+        output_dim: int,
+    ):
+        super().__init__()
+        self.num_categories = num_categories
+        self.layer1 = CategorySpecificLinear(num_categories, input_dim, hidden_dim)
+        self.layer2 = CategorySpecificLinear(num_categories, hidden_dim, output_dim)
+
+    def forward(self, x: torch.Tensor, cat_ids: torch.Tensor) -> torch.Tensor:
+        hidden = F.relu(self.layer1(x, cat_ids))
+        return self.layer2(hidden, cat_ids)
+
+
+class MultiEmbodimentActionEncoder(nn.Module):
+    def __init__(self, action_dim: int, hidden_size: int, num_embodiments: int):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.num_embodiments = num_embodiments
+        self.W1 = CategorySpecificLinear(num_embodiments, action_dim, hidden_size)
+        self.W2 = CategorySpecificLinear(num_embodiments, 2 * hidden_size, hidden_size)
+        self.W3 = CategorySpecificLinear(num_embodiments, hidden_size, hidden_size)
+        self.pos_encoding = SinusoidalPositionalEncoding(hidden_size)
+
+    def forward(
+        self, actions: torch.Tensor, timesteps: torch.Tensor, cat_ids: torch.Tensor
+    ) -> torch.Tensor:
+        action_emb = self.W1(actions, cat_ids)
+        timestep_emb = self.pos_encoding(timesteps).to(dtype=action_emb.dtype)
+        x = torch.cat([action_emb, timestep_emb], dim=-1)
+        x = self.W2(x, cat_ids)
+        x = x * torch.sigmoid(x)
+        return self.W3(x, cat_ids)
+
+
+def _attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    causal: bool = False,
+    attention_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    out_dtype = q.dtype
+    if attention_dtype is None:
+        attention_dtype = q.dtype
+    q = q.to(attention_dtype)
+    k = k.to(attention_dtype)
+    v = v.to(attention_dtype)
+
+    impl = _dreamzero_attention_impl(
+        q.shape[-2],
+        q.shape[-1],
+        causal,
+        attention_dtype,
+    )
+    return impl.forward(q, k, v, attn_metadata=None).contiguous().to(out_dtype)
+
+
+@cache
+def _dreamzero_attention_impl(
+    num_heads: int,
+    head_size: int,
+    causal: bool,
+    dtype: torch.dtype,
+):
+    backend_cls = get_attn_backend(
+        head_size,
+        dtype,
+        supported_attention_backends=_DREAMZERO_SUPPORTED_ATTENTION_BACKENDS,
+    )
+    backend = backend_cls.get_enum()
+    logger.info_once(
+        f"DreamZero attention backend: {backend.name} (causal={causal})"
+    )
+    return backend_cls.get_impl_cls()(
+        num_heads=num_heads,
+        head_size=head_size,
+        num_kv_heads=num_heads,
+        softmax_scale=head_size**-0.5,
+        causal=causal,
+    )
+
+
+def rope_action_apply_polar(
+    x: torch.Tensor,
+    freqs: torch.Tensor,
+    freqs_action: torch.Tensor,
+    freqs_state: torch.Tensor,
+    action_register_length: int | None,
+    num_action_per_block: int | None = None,
+    num_state_per_block: int | None = None,
+) -> torch.Tensor:
+    batch, seq_len, num_heads, _ = x.shape
+    out_dtype = x.dtype
+    x = torch.view_as_complex(
+        x.to(torch.float64).reshape(batch, seq_len, num_heads, -1, 2)
+    )
+
+    if action_register_length is not None:
+        assert num_action_per_block is not None
+        assert num_state_per_block is not None
+        chunk_size = action_register_length // (
+            num_action_per_block + num_state_per_block
+        )
+        freqs_action = freqs_action[: chunk_size * num_action_per_block].view(
+            chunk_size * num_action_per_block, 1, -1
+        )
+        freqs_state = freqs_state[: chunk_size * num_state_per_block].view(
+            chunk_size * num_state_per_block, 1, -1
+        )
+        freqs = torch.cat([freqs, freqs_action, freqs_state], dim=0)
+
+    freqs = freqs.unsqueeze(0)
+    return torch.view_as_real(x * freqs).flatten(3).to(out_dtype)
+
+
+def causal_rope_action_apply_polar(
+    x: torch.Tensor,
+    freqs: torch.Tensor,
+    freqs_action: torch.Tensor,
+    freqs_state: torch.Tensor,
+    action_register_length: int | None,
+    num_action_per_block: int,
+    num_state_per_block: int,
+    action_state_index: int,
+) -> torch.Tensor:
+    batch, seq_len, num_heads, _ = x.shape
+    out_dtype = x.dtype
+    x = torch.view_as_complex(
+        x.to(torch.float64).reshape(batch, seq_len, num_heads, -1, 2)
+    )
+
+    if action_register_length is not None:
+        assert action_register_length == (num_action_per_block + num_state_per_block)
+        freqs_action = freqs_action[
+            action_state_index
+            * num_action_per_block : (action_state_index + 1)
+            * num_action_per_block
+        ]
+        freqs_state = freqs_state[
+            action_state_index
+            * num_state_per_block : (action_state_index + 1)
+            * num_state_per_block
+        ]
+        freqs_1d = torch.cat([freqs_action, freqs_state], dim=0).view(
+            action_register_length, 1, -1
+        )
+        freqs = torch.cat([freqs, freqs_1d], dim=0)
+
+    freqs = freqs.unsqueeze(0)
+    return torch.view_as_real(x * freqs).flatten(3).to(out_dtype)
 
 
 class DreamZeroT2VCrossAttention(nn.Module):
@@ -91,8 +343,8 @@ class DreamZeroT2VCrossAttention(nn.Module):
         self.k = linear_in()
         self.v = linear_in()
         self.o = linear_out()
-        self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
-        self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
+        self.norm_q = RMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
+        self.norm_k = RMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
     def _project_query(self, x: torch.Tensor, batch: int) -> torch.Tensor:
         return _maybe_qk_norm(
@@ -160,7 +412,7 @@ class DreamZeroI2VCrossAttention(DreamZeroT2VCrossAttention):
             if use_tensor_parallel
             else nn.Linear(dim, dim)
         )
-        self.norm_k_img = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
+        self.norm_k_img = RMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
     def forward(
         self,
@@ -253,8 +505,8 @@ class DreamZeroCausalWanSelfAttention(nn.Module):
             if use_tensor_parallel
             else nn.Linear(dim, dim)
         )
-        self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
-        self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
+        self.norm_q = RMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
+        self.norm_k = RMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
     def _process_clean_image_only(
         self,
@@ -606,14 +858,14 @@ class DreamZeroCausalWanSelfAttention(nn.Module):
                 k_noisy = k[:, half_seq_len:]
                 roped_query = torch.cat(
                     [
-                        rope_action_apply(
+                        rope_action_apply_polar(
                             q_context,
                             freqs,
                             freqs_action,
                             freqs_state,
                             action_register_length=None,
                         ).type_as(v),
-                        rope_action_apply(
+                        rope_action_apply_polar(
                             q_noisy,
                             freqs,
                             freqs_action,
@@ -627,14 +879,14 @@ class DreamZeroCausalWanSelfAttention(nn.Module):
                 )
                 roped_key = torch.cat(
                     [
-                        rope_action_apply(
+                        rope_action_apply_polar(
                             k_context,
                             freqs,
                             freqs_action,
                             freqs_state,
                             action_register_length=None,
                         ).type_as(v),
-                        rope_action_apply(
+                        rope_action_apply_polar(
                             k_noisy,
                             freqs,
                             freqs_action,
@@ -764,7 +1016,7 @@ class DreamZeroCausalWanSelfAttention(nn.Module):
                     )
                     out = torch.cat([clean_out, noisy_out], dim=1)
             else:
-                roped_query = rope_action_apply(
+                roped_query = rope_action_apply_polar(
                     q,
                     freqs,
                     freqs_action,
@@ -773,7 +1025,7 @@ class DreamZeroCausalWanSelfAttention(nn.Module):
                     self.num_action_per_block,
                     self.num_state_per_block,
                 ).type_as(v)
-                roped_key = rope_action_apply(
+                roped_key = rope_action_apply_polar(
                     k,
                     freqs,
                     freqs_action,
@@ -808,7 +1060,7 @@ class DreamZeroCausalWanSelfAttention(nn.Module):
                 )
         else:
             action_state_index = (current_start_frame - 1) // self.num_frame_per_block
-            roped_query = causal_rope_action_apply(
+            roped_query = causal_rope_action_apply_polar(
                 q,
                 freqs,
                 freqs_action,
@@ -818,7 +1070,7 @@ class DreamZeroCausalWanSelfAttention(nn.Module):
                 self.num_state_per_block,
                 action_state_index,
             ).type_as(v)
-            roped_key = causal_rope_action_apply(
+            roped_key = causal_rope_action_apply_polar(
                 k,
                 freqs,
                 freqs_action,
@@ -895,7 +1147,7 @@ class DreamZeroCausalWanTransformerBlock(nn.Module):
         self.cross_attn_norm = cross_attn_norm
         self.eps = eps
         self.use_tensor_parallel = use_tensor_parallel
-        self.norm1 = WanLayerNorm(dim, eps)
+        self.norm1 = FP32LayerNorm(dim, eps, elementwise_affine=False)
         self.self_attn = DreamZeroCausalWanSelfAttention(
             dim=dim,
             num_heads=num_heads,
@@ -909,14 +1161,14 @@ class DreamZeroCausalWanTransformerBlock(nn.Module):
             use_tensor_parallel=use_tensor_parallel,
         )
         self.norm3 = (
-            WanLayerNorm(dim, eps, elementwise_affine=True)
+            FP32LayerNorm(dim, eps, elementwise_affine=True)
             if cross_attn_norm
             else nn.Identity()
         )
         self.cross_attn = WAN_CROSSATTENTION_CLASSES[cross_attn_type](
             dim, num_heads, qk_norm, eps, use_tensor_parallel=use_tensor_parallel
         )
-        self.norm2 = WanLayerNorm(dim, eps)
+        self.norm2 = FP32LayerNorm(dim, eps, elementwise_affine=False)
         if use_tensor_parallel:
             self.ffn = nn.ModuleList(
                 [
@@ -982,7 +1234,6 @@ class DreamZeroCausalWanTransformerBlock(nn.Module):
             x,
             y,
             e_parts[2].squeeze(2),
-            tensor_parallel=self.use_tensor_parallel,
         )
         cross_attn_input = self.norm3(x)
         cross = self.cross_attn(
@@ -990,11 +1241,7 @@ class DreamZeroCausalWanTransformerBlock(nn.Module):
             context,
             crossattn_cache=crossattn_cache,
         )
-        x = _residual_add(
-            x,
-            cross,
-            tensor_parallel=self.use_tensor_parallel,
-        )
+        x = _residual_add(x, cross)
         norm2_input = self.norm2(x) * (1 + e_parts[4].squeeze(2)) + e_parts[3].squeeze(
             2
         )
@@ -1003,7 +1250,6 @@ class DreamZeroCausalWanTransformerBlock(nn.Module):
             x,
             y,
             e_parts[5].squeeze(2),
-            tensor_parallel=self.use_tensor_parallel,
         )
         return x, updated_kv_cache
 
@@ -1015,7 +1261,7 @@ class DreamZeroCausalHead(nn.Module):
         self.out_dim = out_dim
         self.patch_size = patch_size
         self.eps = eps
-        self.norm = WanLayerNorm(dim, eps)
+        self.norm = FP32LayerNorm(dim, eps, elementwise_affine=False)
         self.head = nn.Linear(dim, math.prod(patch_size) * out_dim)
         self.modulation = nn.Parameter(torch.randn(1, 2, dim) / dim**0.5)
 
@@ -1061,69 +1307,39 @@ class DreamZeroCausalWanModel(CachableDiT):
         config: DreamZeroCausalWanConfig | None = None,
         hf_config: dict | None = None,
         quant_config=None,
-        model_type: str = "t2v",
-        patch_size: tuple[int, int, int] = (1, 2, 2),
-        frame_seqlen: int = 220,
-        text_len: int = 512,
-        in_dim: int = 16,
-        dim: int = 2048,
-        ffn_dim: int = 8192,
-        freq_dim: int = 256,
-        text_dim: int = 4096,
-        out_dim: int = 16,
-        num_heads: int = 16,
-        num_layers: int = 32,
-        max_chunk_size: int = -1,
-        qk_norm: bool = True,
-        cross_attn_norm: bool = True,
-        eps: float = 1e-6,
-        num_frame_per_block: int = 1,
-        action_dim: int = 32,
-        max_state_dim: int = 64,
-        hidden_size: int = 1024,
-        num_action_per_block: int = 32,
-        num_state_per_block: int = 1,
-        concat_first_frame_latent: bool = True,
-        rope_video_max_positions: tuple[int, int, int] = (1024, 1024, 1024),
-        rope_action_max_positions: int = 10240,
-        rope_state_max_positions: int = 1024,
-        use_tensor_parallel: bool = False,
     ):
-        if config is not None:
-            arch = config.arch_config
-            model_type = arch.model_type
-            patch_size = arch.patch_size
-            frame_seqlen = arch.frame_seqlen
-            text_len = arch.text_len
-            in_dim = arch.in_dim
-            dim = arch.dim
-            ffn_dim = arch.ffn_dim
-            freq_dim = arch.freq_dim
-            text_dim = arch.text_dim
-            out_dim = arch.out_dim
-            num_heads = arch.num_heads
-            num_layers = arch.num_layers
-            max_chunk_size = arch.max_chunk_size
-            qk_norm = arch.qk_norm
-            cross_attn_norm = arch.cross_attn_norm
-            eps = arch.eps
-            num_frame_per_block = arch.num_frame_per_block
-            action_dim = arch.action_dim
-            max_state_dim = arch.max_state_dim
-            hidden_size = arch.hidden_size
-            num_action_per_block = arch.num_action_per_block
-            num_state_per_block = arch.num_state_per_block
-            concat_first_frame_latent = arch.concat_first_frame_latent
-            rope_video_max_positions = arch.rope_video_max_positions
-            rope_action_max_positions = arch.rope_action_max_positions
-            rope_state_max_positions = arch.rope_state_max_positions
-            use_tensor_parallel = arch.use_tensor_parallel
-            super().__init__(config=config, hf_config=hf_config or {})
-        else:
-            super().__init__(
-                config=DreamZeroCausalWanConfig(),
-                hf_config=hf_config or {},
-            )
+        config = config or DreamZeroCausalWanConfig()
+        arch = config.arch_config
+        super().__init__(config=config, hf_config=hf_config or {})
+
+        model_type = arch.model_type
+        patch_size = arch.patch_size
+        frame_seqlen = arch.frame_seqlen
+        text_len = arch.text_len
+        in_dim = arch.in_dim
+        dim = arch.dim
+        ffn_dim = arch.ffn_dim
+        freq_dim = arch.freq_dim
+        text_dim = arch.text_dim
+        out_dim = arch.out_dim
+        num_heads = arch.num_heads
+        num_layers = arch.num_layers
+        max_chunk_size = arch.max_chunk_size
+        qk_norm = arch.qk_norm
+        cross_attn_norm = arch.cross_attn_norm
+        eps = arch.eps
+        num_frame_per_block = arch.num_frame_per_block
+        action_dim = arch.action_dim
+        max_state_dim = arch.max_state_dim
+        hidden_size = arch.hidden_size
+        num_action_per_block = arch.num_action_per_block
+        num_state_per_block = arch.num_state_per_block
+        concat_first_frame_latent = arch.concat_first_frame_latent
+        rope_video_max_positions = arch.rope_video_max_positions
+        rope_action_max_positions = arch.rope_action_max_positions
+        rope_state_max_positions = arch.rope_state_max_positions
+        use_tensor_parallel = arch.use_tensor_parallel
+
         assert model_type in ["t2v", "i2v", "ti2v"]
         self.model_type = model_type
         self.patch_size = patch_size
@@ -1321,8 +1537,11 @@ class DreamZeroCausalWanModel(CachableDiT):
             timestep_state = timestep_action[:, ::stride]
             timestep = torch.cat([timestep, timestep_action, timestep_state], dim=1)
 
+        assert self.freq_dim % 2 == 0
         e = self.time_embedding(
-            sinusoidal_embedding_1d(self.freq_dim, timestep.flatten()).type_as(x)
+            timestep_embedding(
+                timestep.flatten(), self.freq_dim, dtype=torch.float64
+            ).type_as(x)
         )
         e = e.unflatten(dim=0, sizes=(batch, -1))
         e0 = self.time_projection(e).unflatten(dim=2, sizes=(6, self.dim))

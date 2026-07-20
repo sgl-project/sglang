@@ -14,11 +14,11 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_classifier_free_guidance_rank,
     get_classifier_free_guidance_world_size,
 )
-from sglang.multimodal_gen.runtime.managers.dreamzero_session_cache import (
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.dreamzero.session_cache import (
     BRANCH_COND,
     BRANCH_UNCOND,
     DreamZeroCachePoolManager,
-    enter_request_cache,
+    DreamZeroRequestCache,
     record_session_timing,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
@@ -27,7 +27,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager im
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_unipc_multistep import (
     FlowUniPCMultistepScheduler,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
     StageParallelismType,
@@ -507,13 +507,10 @@ class DreamZeroCausalDenoisingStage(PipelineStage):
         dtype = self._module_dtype(self.transformer)
         device = self._module_device(self.transformer)
         input_ctx = self._materialize_input_tensors(batch, dtype=dtype, device=device)
-        local_attn_size = int(getattr(self.transformer, "local_attn_size", -1))
-        request_cache, session_state = enter_request_cache(
-            batch,
-            self.cache_manager,
-            local_attn_size=local_attn_size,
-            batch_size=input_ctx.batch_size,
-        )
+        if self.cache_manager is None:
+            raise RuntimeError("DreamZero denoising stage requires a cache manager")
+        request_cache: DreamZeroRequestCache = batch.dreamzero_cache
+        session_state = self.cache_manager.pool
         slots = request_cache.slot_indices
         current_start_frame = request_cache.uniform_current_start_frame(
             self.cache_manager
@@ -934,3 +931,32 @@ class DreamZeroCausalDenoisingStage(PipelineStage):
         timing["session_cache_overhead_ms"] = overhead_ms
         timing["session_store_overhead_ms"] = overhead_ms
         batch.dreamzero_session_timing = timing
+
+
+class DreamZeroActionOutputStage(PipelineStage):
+    """Publish normalized DreamZero action chunks as pipeline output."""
+
+    def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
+        result = VerificationResult()
+        result.add_check(
+            "dreamzero_action_pred",
+            batch.dreamzero_action_pred,
+            torch.is_tensor,
+        )
+        return result
+
+    def forward(self, batch: Req, server_args: ServerArgs) -> OutputBatch:
+        normalized_action = batch.dreamzero_action_pred.float()
+        action_payload = {
+            "request_id": batch.request_id,
+            "actions": normalized_action.detach().cpu().numpy(),
+            "parameters": {
+                "num_inference_steps": server_args.pipeline_config.default_num_inference_steps
+            },
+        }
+
+        return OutputBatch(
+            output=[action_payload],
+            action_pred=normalized_action,
+            metrics=batch.metrics,
+        )

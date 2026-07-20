@@ -348,13 +348,13 @@ def build_action_sampling_params(
                 ),
             )
         ),
+        "session_ids": parameters.get("session_ids"),
+        "reset_mask": parameters.get("reset_mask"),
+        "negative_prompts": parameters.get("negative_prompts"),
         "output_format": output_format,
         "return_timing": _runtime_bool(runtime.get("return_timing"), True),
         "enable_prefix_cache": _runtime_bool(prefix_cache, True),
         "enable_cuda_graph": _runtime_bool(cuda_graph, True),
-        "session_ids": parameters.get("session_ids"),
-        "reset_mask": parameters.get("reset_mask"),
-        "negative_prompts": parameters.get("negative_prompts"),
     }
     supported_fields = _sampling_params_field_names(sampling_params_cls)
     sp = sampling_params_cls(

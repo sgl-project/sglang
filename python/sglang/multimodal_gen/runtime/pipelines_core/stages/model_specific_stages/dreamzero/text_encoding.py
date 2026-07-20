@@ -9,7 +9,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_classifier_free_guidance_rank,
     get_classifier_free_guidance_world_size,
 )
-from sglang.multimodal_gen.runtime.managers.dreamzero_session_cache import (
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.dreamzero.session_cache import (
     BRANCH_COND,
     BRANCH_UNCOND,
     DreamZeroCachePool,
@@ -26,7 +26,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
     StageParallelismType,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.dreamzero.utils import (
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.dreamzero.utils import (
     infer_dreamzero_batch_size,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
@@ -271,8 +271,8 @@ class DreamZeroTextEncodingStage(PipelineStage):
                 strict=True,
             )
         ]
-        # Text stage owns the lifecycle-adjusted reusable view. Later stages
-        # resolve a fresh request cache and should not depend on these fields.
+        # Text stage owns the request cache and lifecycle-adjusted reusable
+        # view. Later stages only consume batch.dreamzero_cache.
         if cfg_parallel:
             # Negative prompts are static for DreamZero eval. Use positive
             # prompt metadata to keep CFG ranks aligned on encode-vs-cache.
