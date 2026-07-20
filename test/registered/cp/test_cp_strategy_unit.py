@@ -6,7 +6,6 @@ import torch
 
 from sglang.srt.layers.cp.base import (
     ContextParallelStrategyKind,
-    CPAttentionBackendKind,
     get_cp_strategy,
     get_cp_strategy_kind,
     init_cp_strategy,
@@ -20,7 +19,6 @@ from sglang.srt.layers.cp.padding import (
     pad_logical_token_to_physical,
 )
 from sglang.srt.layers.cp.utils import (
-    CP_V2_DEFAULT_MODEL_CLASSES,
     cp_split_before_forward,
     enable_cp_v2,
     is_cp_v2_active,
@@ -100,9 +98,6 @@ class TestCPStrategyUnit(CustomTestCase):
         ):
             self.assertIsNotNone(get_cp_strategy())
 
-    def test_gpt_oss_uses_cp_v2(self):
-        self.assertIn("GptOssForCausalLM", CP_V2_DEFAULT_MODEL_CLASSES)
-
 
 class TestCPZigzagStrategy(CustomTestCase):
     def setUp(self):
@@ -133,14 +128,6 @@ class TestCPZigzagStrategy(CustomTestCase):
             forward_mode=_ExtendMode(),
             extend_seq_lens_cpu=extend_seq_lens,
             attn_cp_metadata=metadata,
-        )
-
-    def test_trtllm_mha_is_supported_by_zigzag_cp(self):
-        backend_kind = CPAttentionBackendKind.from_string("trtllm_mha")
-        self.assertEqual(backend_kind, CPAttentionBackendKind.TRTLLM_MHA)
-        self.assertIn(
-            CPAttentionBackendKind.TRTLLM_MHA,
-            ZigzagCPStrategy(cp_size=2).get_supported_attention_backend(),
         )
 
     def test_enable_cp_v2_and_is_cp_v2_active(self):

@@ -645,9 +645,16 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         """Get the fill value for sequence lengths in CUDA graph."""
         return 1
 
-    def _should_use_fused_fp8_path(self, save_kv_cache: bool, k: torch.Tensor) -> bool:
+    def _should_use_fused_fp8_path(
+        self, save_kv_cache: bool, k: torch.Tensor, forward_batch: ForwardBatch
+    ) -> bool:
         """Check if we should use the fused FP8 KV cache write path."""
-        return save_kv_cache and k is not None and self.data_type == torch.float8_e4m3fn
+        return (
+            not is_cp_v2_active(forward_batch)
+            and save_kv_cache
+            and k is not None
+            and self.data_type == torch.float8_e4m3fn
+        )
 
     def _fused_fp8_qkv_kv_cache(
         self,
@@ -933,7 +940,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         """Run forward for decode using TRTLLM MHA kernel."""
         cache_loc = forward_batch.out_cache_loc
 
-        use_fused_fp8_path = self._should_use_fused_fp8_path(save_kv_cache, k)
+        use_fused_fp8_path = self._should_use_fused_fp8_path(
+            save_kv_cache, k, forward_batch
+        )
         use_fused_qkv = use_fused_fp8_path and not self.is_xqa_impl
         pool = self.token_to_kv_pool
 
@@ -1026,8 +1035,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         # The fused path writes rank-local K/V directly to cache. CP-v2 needs
         # the strategy to gather K/V into full logical token order first.
-        use_fused_fp8_path = (
-            self._should_use_fused_fp8_path(save_kv_cache, k) and not cp_v2_active
+        use_fused_fp8_path = self._should_use_fused_fp8_path(
+            save_kv_cache, k, forward_batch
         )
         use_fused_qkv = use_fused_fp8_path and not self.is_xqa_impl
 
@@ -1139,13 +1148,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 cu_seqlens_q,
                 cache_seqlens,
                 max_seqlen_q,
-                cu_seqlens_kv=None,
+                cu_seqlens_kv,
             ):
-                if cu_seqlens_kv is None:
-                    cu_seqlens_kv = torch.nn.functional.pad(
-                        torch.cumsum(cache_seqlens, dim=0, dtype=torch.int32),
-                        (1, 0),
-                    )
                 return flashinfer.prefill.trtllm_batch_context_with_kv_cache(
                     query=q_chunk,
                     kv_cache=kv_cache,

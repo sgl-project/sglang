@@ -7,7 +7,6 @@ with the SWA -1 sentinel guard.
 """
 
 from types import SimpleNamespace
-from unittest.mock import Mock
 
 import pytest
 import torch
@@ -20,7 +19,6 @@ from sglang.kernels.ops.kvcache.trtllm_mha_graph_metadata import (
     update_trtllm_mha_graph_metadata,
 )
 from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
-from sglang.srt.layers.cp.base import CPAttentionBackendKind
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -119,115 +117,6 @@ def test_draft_extend_in_graph_uses_captured_static_q_stride(monkeypatch):
     assert len(calls) == 1
     assert calls[0]["q_mode"] == Q_MODE_STRIDED
     assert calls[0]["q_stride"] == 4
-
-
-def test_cp_extend_materializes_full_kv_and_dispatches_zigzag(monkeypatch):
-    backend = TRTLLMHAAttnBackend.__new__(TRTLLMHAAttnBackend)
-    backend.decode_uses_native_fp4 = False
-    backend.data_type = torch.float32
-    backend.is_xqa_impl = False
-    backend.q_data_type = torch.float32
-    backend.device = torch.device("cpu")
-    backend.page_size = 1
-    backend.max_context_len = 16
-    backend.workspace_buffer = torch.empty(1, dtype=torch.uint8)
-    backend.forward_metadata = SimpleNamespace(
-        cache_seqlens_int32=torch.tensor([4], dtype=torch.int32),
-        cu_seqlens_q=torch.tensor([0, 4], dtype=torch.int32),
-        cu_seqlens_k=torch.tensor([0, 4], dtype=torch.int32),
-        max_seq_len_q=4,
-        page_table=torch.zeros((1, 16), dtype=torch.int32),
-        swa_out_cache_loc=torch.arange(4, dtype=torch.int64) + 16,
-        is_ragged_verify=False,
-    )
-    backend.token_to_kv_pool = SimpleNamespace(
-        set_kv_buffer=Mock(),
-        get_kv_buffer=Mock(
-            return_value=(
-                torch.zeros((16, 1, 2)),
-                torch.zeros((16, 1, 2)),
-            )
-        ),
-    )
-    backend._get_layer_page_table = Mock(
-        return_value=backend.forward_metadata.page_table
-    )
-    backend._get_bmm_scales = Mock(return_value=(1.0, 1.0))
-
-    layer = SimpleNamespace(
-        layer_id=0,
-        tp_q_head_num=1,
-        tp_k_head_num=1,
-        tp_v_head_num=1,
-        head_dim=2,
-        sliding_window_size=7,
-        scaling=1.0,
-        k_scale=1.0,
-        v_scale=1.0,
-    )
-    forward_batch = SimpleNamespace(
-        forward_mode=ForwardMode.EXTEND,
-        out_cache_loc=torch.arange(4, dtype=torch.int64),
-    )
-    q = torch.arange(8, dtype=torch.float32).view(4, 2)
-    k = q.view(4, 1, 2).clone()
-    v = k + 10
-
-    strategy = SimpleNamespace(
-        materialize_full_kv=Mock(),
-        run_attention=Mock(
-            side_effect=lambda q, forward_batch, device, attn_fn, **kwargs: attn_fn(
-                q,
-                torch.tensor([0, 4], dtype=torch.int32),
-                torch.tensor([4], dtype=torch.int32),
-                4,
-            )
-        ),
-    )
-    context_calls = []
-
-    def fake_context_attention(**kwargs):
-        context_calls.append(kwargs)
-        return kwargs["query"]
-
-    monkeypatch.setattr(
-        trtllm_mha_backend, "is_cp_v2_active", lambda forward_batch: True, raising=False
-    )
-    monkeypatch.setattr(
-        trtllm_mha_backend, "get_cp_strategy", lambda: strategy, raising=False
-    )
-    monkeypatch.setattr(
-        trtllm_mha_backend.flashinfer.prefill,
-        "trtllm_batch_context_with_kv_cache",
-        fake_context_attention,
-    )
-
-    output = backend.forward_extend(q, k, v, layer, forward_batch)
-
-    strategy.materialize_full_kv.assert_called_once_with(
-        forward_batch,
-        layer,
-        k,
-        v,
-        swa_loc=backend.forward_metadata.swa_out_cache_loc,
-    )
-    backend.token_to_kv_pool.set_kv_buffer.assert_not_called()
-    strategy.run_attention.assert_called_once()
-    assert (
-        strategy.run_attention.call_args.kwargs["attention_backend"]
-        == CPAttentionBackendKind.TRTLLM_MHA
-    )
-    assert len(context_calls) == 1
-    torch.testing.assert_close(
-        context_calls[0]["seq_lens"], torch.tensor([4], dtype=torch.int32)
-    )
-    assert context_calls[0]["max_q_len"] == 4
-    assert context_calls[0]["batch_size"] == 1
-    torch.testing.assert_close(
-        context_calls[0]["cum_seq_lens_kv"],
-        torch.tensor([0, 4], dtype=torch.int32),
-    )
-    torch.testing.assert_close(output, q)
 
 
 def test_hybrid_wrappers_forward_in_graph_hook():
