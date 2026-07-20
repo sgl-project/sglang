@@ -237,6 +237,9 @@ class CompressorPrefillPlan(NamedTuple):
         ring_size: int,
         num_q_tokens: int,
         use_cuda_graph: bool = False,
+        recompute_boundary: Optional[torch.Tensor] = None,
+        swa_out_cache_loc_override: Optional[torch.Tensor] = None,
+        extend_start_loc: Optional[torch.Tensor] = None,
     ) -> CompressorPrefillPlan:
         is_gpu_input = seq_lens.device.type in ["cuda", "xpu"]
         pin_buffer = torch.empty(
@@ -258,19 +261,64 @@ class CompressorPrefillPlan(NamedTuple):
                 torch.empty((0, 8), dtype=torch.uint8, device=_dev),
                 pin_buffer,
             )
-        module = _jit_compress_plan_module()
-        if _is_xpu:
-            fn = plan_compress_prefill
-        else:
-            module = _jit_compress_plan_module()
-            fn = module.plan_prefill
 
-        plan_c, plan_w = fn(
+        if _is_xpu:
+            assert (
+                recompute_boundary is None
+            ), "SWA recompute is not supported on XPU"
+            assert swa_out_cache_loc_override is None
+            assert extend_start_loc is None
+            plan_c, plan_w = plan_compress_prefill(
+                req_pool_indices,
+                req_to_token,
+                full_to_state,
+                seq_lens,
+                extend_lens,
+                pin_buffer,
+                int(num_q_tokens),
+                int(compress_ratio),
+                int(swa_page_size),
+                int(ring_size),
+                bool(use_cuda_graph),
+            )
+            return CompressorPrefillPlan(
+                compress_ratio,
+                plan_c,
+                plan_w,
+                pin_buffer,
+            )
+
+        # Empty boundary tensor means normal prefill.
+        if recompute_boundary is None:
+            recompute_boundary = torch.empty(
+                0, dtype=torch.int64, device=seq_lens.device
+            )
+        if swa_out_cache_loc_override is None:
+            swa_out_cache_loc_override = torch.empty(
+                0, dtype=torch.int32, device=req_pool_indices.device
+            )
+            extend_start_loc = torch.empty(
+                0, dtype=torch.int32, device=req_pool_indices.device
+            )
+        else:
+            assert (
+                extend_start_loc is not None
+            ), "swa_out_cache_loc_override requires extend_start_loc"
+            swa_out_cache_loc_override = swa_out_cache_loc_override.to(torch.int32)
+            extend_start_loc = extend_start_loc.to(torch.int32)
+            assert (
+                swa_out_cache_loc_override.numel() >= num_q_tokens
+            ), f"{swa_out_cache_loc_override.numel()=} < {num_q_tokens=}"
+        module = _jit_compress_plan_module()
+        plan_c, plan_w = module.plan_prefill(
             req_pool_indices,
             req_to_token,
             full_to_state,
             seq_lens,
             extend_lens,
+            recompute_boundary,
+            swa_out_cache_loc_override,
+            extend_start_loc,
             pin_buffer,
             int(num_q_tokens),
             int(compress_ratio),
@@ -280,8 +328,8 @@ class CompressorPrefillPlan(NamedTuple):
         )
         return CompressorPrefillPlan(
             compress_ratio,
-            torch.from_dlpack(plan_c) if not _is_xpu else plan_c,
-            torch.from_dlpack(plan_w) if not _is_xpu else plan_w,
+            torch.from_dlpack(plan_c),
+            torch.from_dlpack(plan_w),
             pin_buffer,
         )
 

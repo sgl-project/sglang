@@ -418,6 +418,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     is_extend_in_batch: bool = False
     can_run_dp_cuda_graph: bool = False
     can_run_dp_breakable_cuda_graph: bool = False
+    allow_prefill_cuda_graph: bool = True
     global_forward_mode: Optional[ForwardMode] = None
 
     # For two-batch overlap
@@ -739,6 +740,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             spec_info=batch.spec_info,
         )
 
+        cache_update = batch.pending_cache_update
+        if cache_update is not None and cache_update.is_pending:
+            cache_update.apply_forward_metadata(ret)
         ret._maybe_init_non_generation_fields(batch)
 
         device = model_runner.device
@@ -1386,6 +1390,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             )
 
         self.out_cache_loc = self._pad_tensor_to_size(self.out_cache_loc, num_tokens)
+        self.pad_deepseek_mha_metadata(num_tokens)
         if self.encoder_lens is not None:
             self.encoder_lens = self._pad_tensor_to_size(self.encoder_lens, bs)
         self.positions = self._pad_tensor_to_size(self.positions, num_tokens)

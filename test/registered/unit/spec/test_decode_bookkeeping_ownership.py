@@ -52,11 +52,20 @@ _OWNER_SITES = {
     (_SB, "ScheduleBatch.prepare_for_decode", "kv_committed_len"): 1,
     (_SB, "ScheduleBatch.prepare_for_extend", "extend_batch_idx"): 1,
     (_SB, "ScheduleBatch.prepare_for_extend", "kv_committed_len"): 1,
-    # kv_allocated_len is settled inside the owned-kv alloc functions (op28).
+    # KV allocation bookkeeping is settled by the shared extend helper.
     ("mem_cache/allocation.py", "alloc_for_extend", "evict"): 1,
-    ("mem_cache/allocation.py", "alloc_for_extend", "kv_allocated_len"): 1,
+    (
+        "mem_cache/allocation.py",
+        "update_extend_kv_bookkeeping",
+        "kv_allocated_len",
+    ): 1,
     ("mem_cache/allocation.py", "alloc_for_decode", "evict"): 1,
     ("mem_cache/allocation.py", "alloc_for_decode", "kv_allocated_len"): 1,
+    (
+        "mem_cache/swa_recompute.py",
+        "SWARecomputeBatchState._allocate_full_slots",
+        "evict",
+    ): 1,
     # spec v2: no pre-claim; resolve commits the full accepted run uniformly.
     # kv_allocated_len for spec v2 draft decode (eagle + dflash) is settled
     # inside the owned-kv alloc_for_spec_decode function (op42).

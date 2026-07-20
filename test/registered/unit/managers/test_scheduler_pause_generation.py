@@ -30,6 +30,7 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
     def _new_scheduler(self) -> Scheduler:
         scheduler = Scheduler.__new__(Scheduler)
         scheduler._engine_paused = False
+        scheduler._war_barrier_enabled = False
         scheduler.enable_overlap = False
         scheduler.last_batch = None
         scheduler.cur_batch_for_debug = None
@@ -477,6 +478,28 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
 
         scheduler.disagg_decode_prealloc_queue.enqueue_held_rebootstrap.assert_called_once_with()
         self.assertFalse(scheduler._engine_paused)
+
+    def test_retract_drains_overlap_queue_after_war_barrier(self):
+        """retract must fence the in-flight forward before processing its result."""
+        scheduler = self._new_scheduler()
+        scheduler.enable_overlap = True
+        mock_batch = MagicMock()
+        mock_batch.forward_mode.is_extend.return_value = False
+        scheduler.last_batch = mock_batch
+        scheduler.result_queue = deque([(MagicMock(), MagicMock())])
+        call_order = []
+        scheduler._apply_war_barrier = MagicMock(
+            side_effect=lambda: call_order.append("barrier")
+        )
+        scheduler.process_batch_result = MagicMock(
+            side_effect=lambda *_: call_order.append("process")
+        )
+
+        scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
+
+        self.assertEqual(call_order, ["barrier", "process"])
+        scheduler.process_batch_result.assert_called_once()
+        self.assertEqual(len(scheduler.result_queue), 0)
 
 
 if __name__ == "__main__":

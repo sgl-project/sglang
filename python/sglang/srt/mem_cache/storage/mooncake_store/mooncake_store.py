@@ -807,7 +807,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     boundary = page_exists.index(False)
                 except ValueError:
                     boundary = kv_pages
-            elif transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES:
+            elif transfer.hit_policy in (
+                PoolHitPolicy.TRAILING_PAGES,
+                PoolHitPolicy.OPTIONAL_TRAILING_PAGES,
+            ):
                 trailing = max(1, len(transfer.keys) if transfer.keys else 1)
                 for prefix_len in range(kv_pages, 0, -1):
                     if all(
@@ -818,7 +821,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                         break
             if boundary:
                 hit_count[transfer.name] = boundary
-            final_pages = min(final_pages, boundary)
+            if transfer.hit_policy != PoolHitPolicy.OPTIONAL_TRAILING_PAGES:
+                final_pages = min(final_pages, boundary)
 
         return PoolTransferResult(final_pages, hit_count)
 

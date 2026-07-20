@@ -2,12 +2,15 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import torch
+
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefResult,
     IncLockRefResult,
 )
+from sglang.srt.mem_cache.swa_recompute import resolve_swa_recompute_prefix
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.srt.utils.common import Range
 from sglang.test.ci.ci_register import (
@@ -36,12 +39,35 @@ class TestPrefillAdder(CustomTestCase):
         evictable_size: int = 0,
     ) -> MagicMock:
         tree_cache = MagicMock()
+        tree_cache.root_node = MagicMock(name="root_node")
         tree_cache.full_evictable_size.return_value = full_evictable_size
         tree_cache.swa_evictable_size.return_value = swa_evictable_size
         tree_cache.evictable_size.return_value = evictable_size
         tree_cache.disable = False
         tree_cache.inc_lock_ref.return_value = IncLockRefResult()
+        tree_cache.inc_lock_ref_excluding_components.side_effect = (
+            lambda _node, skipped_components: IncLockRefResult(
+                skipped_components=set(skipped_components)
+            )
+        )
+        tree_cache.prefix_lock_exclusions.side_effect = lambda req: (
+            {"swa"} if req.extra_compute_prefix_len > 0 else set()
+        )
+
+        def inc_request_lock_ref(req):
+            result = tree_cache.inc_lock_ref_excluding_components(
+                req.last_node, tree_cache.prefix_lock_exclusions(req)
+            )
+            req.swa_prefix_lock_released = bool(result.skipped_components)
+            return result
+
+        tree_cache.inc_request_lock_ref.side_effect = inc_request_lock_ref
         tree_cache.dec_lock_ref.return_value = DecLockRefResult()
+        tree_cache.is_tree_cache.return_value = False
+        tree_cache.supports_mamba.return_value = False
+        tree_cache.resolve_extra_compute_prefix.side_effect = (
+            lambda req: resolve_swa_recompute_prefix(req, tree_cache)
+        )
         return tree_cache
 
     def create_token_allocator(
@@ -83,6 +109,7 @@ class TestPrefillAdder(CustomTestCase):
         req.sampling_params = SimpleNamespace(max_new_tokens=max_new_tokens)
         req.time_stats = SimpleNamespace(wait_queue_entry_time=wait_time)
         req.retracted_stain = False
+        req.extra_compute_prefix_len = 0
         req.finished.return_value = False
         req.needs_host_load_back.return_value = False
         return req
@@ -519,15 +546,18 @@ class TestPrefillAdder(CustomTestCase):
 
     def test_swa_budget_for_req(self):
         cases = [
-            # (extend, rem_chunk, window, page, expected, label)
-            (64, None, 128, 16, 128 + 16, "no_cap_floor_active"),
-            (200, None, 256, 32, 256 + 32, "no_cap_floor_active_other_dims"),
-            (300, None, 128, 16, 300 + 16, "no_cap_floor_inactive"),
-            (200, 50, 64, 8, 64 + 8, "cap_binds_then_floor"),
-            (300, 500, 64, 64, 300 + 64, "cap_does_not_bind"),
-            (0, None, 128, 16, 128 + 16, "extend_zero_floor_only"),
+            # (extend, rem_chunk, window, page, recompute, expected, label)
+            (64, None, 128, 16, 0, 128 + 16, "no_cap_floor_active"),
+            (200, None, 256, 32, 0, 256 + 32, "no_cap_floor_active_other_dims"),
+            (300, None, 128, 16, 0, 300 + 16, "no_cap_floor_inactive"),
+            (200, 50, 64, 8, 0, 64 + 8, "cap_binds_then_floor"),
+            (300, 500, 64, 64, 0, 300 + 64, "cap_does_not_bind"),
+            (0, None, 128, 16, 0, 128 + 16, "extend_zero_floor_only"),
+            (32, None, 128, 16, 96, 128 + 16, "recompute_inside_window_floor"),
+            (64, None, 128, 16, 96, 64 + 96 + 16, "recompute_exceeds_floor"),
+            (300, None, 128, 16, 64, 300 + 64 + 16, "recompute_extends_live_tail"),
         ]
-        for extend, rem_chunk, window, page, expected, label in cases:
+        for extend, rem_chunk, window, page, recompute, expected, label in cases:
             with self.subTest(label=label):
                 self.mock_tree_cache.sliding_window_size = window
                 adder = self.create_adder(
@@ -535,7 +565,168 @@ class TestPrefillAdder(CustomTestCase):
                     page_size=page,
                     rem_chunk_tokens=rem_chunk,
                 )
-                self.assertEqual(adder._swa_budget_for_req(extend), expected)
+                self.assertEqual(
+                    adder._swa_budget_for_req(
+                        extend, extra_compute_prefix_len=recompute
+                    ),
+                    expected,
+                )
+
+    def _make_prefill_req(
+        self,
+        *,
+        rid: str,
+        prefix_len: int = 0,
+        extend_input_len: int = 64,
+        swa_recompute_len: int = 0,
+    ):
+        req = self.create_mock_req(rid, priority=0, max_new_tokens=16)
+        req.prefix_indices = list(range(prefix_len))
+        req.host_hit_length = 0
+        req.swa_host_hit_length = 0
+        req.full_untruncated_fill_ids = list(range(prefix_len + extend_input_len))
+        req.extend_range = Range(prefix_len, prefix_len + extend_input_len)
+        req.set_extend_range = MagicMock(
+            side_effect=lambda start, end: setattr(
+                req, "extend_range", Range(start, end)
+            )
+        )
+        req.last_node = MagicMock()
+        req.sampling_params.ignore_eos = False
+        req.extra_compute_prefix_len = swa_recompute_len
+        return req
+
+    def _make_tensor_prefill_req(
+        self,
+        *,
+        rid: str,
+        prefix_len: int,
+        extend_input_len: int,
+        host_hit_length: int = 0,
+        swa_recompute_len: int = 0,
+    ):
+        req = self._make_prefill_req(
+            rid=rid,
+            prefix_len=0,
+            extend_input_len=extend_input_len,
+            swa_recompute_len=swa_recompute_len,
+        )
+        req.prefix_indices = torch.arange(prefix_len, dtype=torch.int64)
+        req.host_hit_length = host_hit_length
+        req.swa_host_hit_length = 0
+        req.mamba_host_hit_length = 0
+        req.storage_hit_length = 0
+        req.num_matched_prefix_tokens = prefix_len + host_hit_length
+        req.full_untruncated_fill_ids = list(range(prefix_len + extend_input_len))
+        req.extend_range = Range(prefix_len, prefix_len + extend_input_len)
+        req.cache_protected_len = prefix_len
+        req.last_node = MagicMock(name=f"{rid}_last_node")
+        req.last_host_node = MagicMock(name=f"{rid}_last_host_node")
+        req.best_match_node = MagicMock(name=f"{rid}_best_match_node")
+
+        req.needs_host_load_back.return_value = host_hit_length > 0
+        return req
+
+    def test_swa_recompute_falls_back_if_load_back_cannot_cover_window(self):
+        self.mock_token_allocator.full_available_size.return_value = 100_000
+        self.mock_token_allocator.swa_available_size.return_value = 100_000
+        self.mock_token_allocator.available_size.return_value = 100_000
+        self.mock_tree_cache.sliding_window_size = 128
+        adder = self.create_adder(self.create_running_batch(), page_size=16)
+        adder.is_hybrid_swa = True
+
+        req = self._make_tensor_prefill_req(
+            rid="loadback-fail",
+            prefix_len=64,
+            extend_input_len=256,
+            host_hit_length=128,
+            swa_recompute_len=128,
+        )
+        self.mock_tree_cache.init_load_back.return_value = (
+            torch.empty((0,), dtype=torch.int64),
+            req.last_node,
+        )
+
+        result = adder.add_one_req(
+            req, has_chunked_req=False, truncation_align_size=None
+        )
+
+        self.assertEqual(result, AddReqResult.CONTINUE)
+        self.assertEqual(req.extra_compute_prefix_len, 0)
+        self.assertEqual(len(req.prefix_indices), 0)
+        self.assertEqual(req.extend_range, Range(0, len(req.full_untruncated_fill_ids)))
+        self.assertEqual(req.last_node, self.mock_tree_cache.root_node)
+        self.assertEqual(req.host_hit_length, 0)
+        self.assertEqual(adder.can_run_list, [req])
+
+    def test_swa_budget_excludes_full_host_hit_only_for_extra_compute(self):
+        self.mock_token_allocator.full_available_size.return_value = 100_000
+        self.mock_token_allocator.swa_available_size.return_value = 200
+        self.mock_token_allocator.available_size.return_value = 100_000
+        self.mock_tree_cache.sliding_window_size = 128
+        host_hit = 896
+        for extra_compute_len, expected in (
+            (0, AddReqResult.NO_TOKEN),
+            (96, AddReqResult.CONTINUE),
+        ):
+            with self.subTest(extra_compute_len=extra_compute_len):
+                adder = self.create_adder(self.create_running_batch(), page_size=16)
+                adder.is_hybrid_swa = True
+                req = self._make_tensor_prefill_req(
+                    rid=f"host-hit-budget-{extra_compute_len}",
+                    prefix_len=512,
+                    extend_input_len=host_hit + 64,
+                    host_hit_length=host_hit,
+                    swa_recompute_len=extra_compute_len,
+                )
+                self.mock_tree_cache.init_load_back.reset_mock()
+                self.mock_tree_cache.init_load_back.return_value = (
+                    torch.arange(host_hit, dtype=torch.int64),
+                    req.best_match_node,
+                )
+
+                result = adder.add_one_req(
+                    req, has_chunked_req=False, truncation_align_size=None
+                )
+
+                self.assertEqual(result, expected)
+                self.assertEqual(
+                    self.mock_tree_cache.init_load_back.called,
+                    extra_compute_len > 0,
+                )
+
+                if extra_compute_len > 0:
+                    self.assertEqual(req.extra_compute_prefix_len, extra_compute_len)
+                    self.assertEqual(
+                        req.extend_range,
+                        Range(512 + host_hit, 512 + host_hit + 64),
+                    )
+                    self.assertEqual(len(req.prefix_indices), 512 + host_hit)
+                    self.assertEqual(adder.can_run_list, [req])
+
+    def test_swa_recompute_mixed_batch_allowed(self):
+        self.mock_token_allocator.full_available_size.return_value = 100_000
+        self.mock_token_allocator.swa_available_size.return_value = 100_000
+        self.mock_token_allocator.available_size.return_value = 100_000
+        self.mock_tree_cache.sliding_window_size = 128
+        adder = self.create_adder(self.create_running_batch(), page_size=16)
+        adder.is_hybrid_swa = True
+
+        normal_req = self._make_prefill_req(rid="normal")
+        recompute_req = self._make_prefill_req(
+            rid="recompute", prefix_len=256, swa_recompute_len=128
+        )
+
+        first = adder.add_one_req(
+            normal_req, has_chunked_req=False, truncation_align_size=None
+        )
+        second = adder.add_one_req(
+            recompute_req, has_chunked_req=False, truncation_align_size=None
+        )
+
+        self.assertEqual(first, AddReqResult.CONTINUE)
+        self.assertEqual(second, AddReqResult.CONTINUE)
+        self.assertEqual(adder.can_run_list, [normal_req, recompute_req])
 
     def test_add_chunked_req_non_hybrid_no_swa_reservation(self):
         # Non-hybrid path: the SWA-pool reservation must NOT apply, otherwise

@@ -81,12 +81,15 @@ class PoolName(str, Enum):
 class PoolHitPolicy(str, Enum):
     """Hit policy for batch_exists_v2 per-pool prefix matching.
 
-    ALL_PAGES      : every page in [0, kv_hit) must exist (e.g. DSA).
-    TRAILING_PAGES : only the last N pages must exist (e.g. Mamba/SWA states).
+    ALL_PAGES               : every page in [0, kv_hit) must exist (e.g. DSA).
+    TRAILING_PAGES          : only the last N pages must exist (e.g. Mamba/SWA states).
+    OPTIONAL_TRAILING_PAGES : trailing pages are fetched if present, but misses do
+                              not shrink the usable KV prefix.
     """
 
     ALL_PAGES = "all_pages"
     TRAILING_PAGES = "trailing_pages"
+    OPTIONAL_TRAILING_PAGES = "optional_trailing_pages"
 
 
 @dataclass
@@ -165,9 +168,9 @@ class HiCacheStorage(ABC):
         Extra-pool hit policies (``PoolTransfer.hit_policy``)
         ------------------------------------------------------
         Each ``PoolTransfer`` in ``pool_transfers`` describes a secondary
-        cache pool (e.g. Mamba SSM states) that must be co-present with the
-        KV pages.  The final ``final_pages`` is the minimum across all pools,
-        so a missing auxiliary page shrinks the usable prefix.
+        cache pool (e.g. Mamba SSM states) associated with the KV pages.
+        Required auxiliary pools shrink the usable prefix; optional pools only
+        report how many pages can be fetched opportunistically.
 
         - ``"all_pages"`` (default):  every page in [0, kv_hit) must exist
           for this pool.  Used for pools that are required for every token
@@ -176,6 +179,10 @@ class HiCacheStorage(ABC):
         - ``"trailing_pages"``:  only the *last* ``len(transfer.keys)`` pages
           of the KV prefix need to exist.  Used for pools whose data covers
           only the tail of a prefix (e.g. Mamba/SWA Pool).
+
+        - ``"optional_trailing_pages"``: same tail query as ``"trailing_pages"``,
+          but a miss does not reduce ``kv_hit_pages``. Used when the caller can
+          recover the auxiliary tail by recomputation.
 
         Returns
         -------
@@ -624,7 +631,7 @@ class HiCacheFile(HiCacheStorage):
                 boundary = next(
                     (i for i in range(kv_pages) if not has_component(i, name)), kv_pages
                 )
-            else:  # trailing_pages
+            else:  # trailing_pages / optional_trailing_pages
                 trailing = max(1, len(transfer.keys) if transfer.keys else 1)
                 boundary = 0
                 for prefix_len in range(kv_pages, 0, -1):
@@ -636,7 +643,8 @@ class HiCacheFile(HiCacheStorage):
                         break
             if boundary:
                 hit_count[name] = boundary
-            final_pages = min(final_pages, boundary)
+            if transfer.hit_policy != PoolHitPolicy.OPTIONAL_TRAILING_PAGES:
+                final_pages = min(final_pages, boundary)
 
         return PoolTransferResult(final_pages, hit_count)
 

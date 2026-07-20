@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import contextlib
 import logging
-from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Tuple, Union
 
 import torch
@@ -33,6 +32,7 @@ from sglang.srt.layers.cp.utils import (
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput
 from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     build_eager_registry,
+    shallow_copy_forward_batch,
 )
 from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
     create_chunked_prefix_cache_kv_indices,
@@ -168,7 +168,7 @@ class EagerRunner(BaseRunner):
         this batch's shape) — the eager counterpart of the cuda-graph runners'
         load_batch."""
         if envs.SGLANG_EAGER_INPUT_NO_COPY.get():
-            return replace(forward_batch)
+            return shallow_copy_forward_batch(forward_batch)
         raw_bs = forward_batch.batch_size
         if forward_batch.input_ids is not None:
             raw_num_tokens = forward_batch.input_ids.shape[0]

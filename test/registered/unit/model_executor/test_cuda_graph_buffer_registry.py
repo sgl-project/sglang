@@ -31,9 +31,13 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
+class _MiniForwardBatchMixin:
+    backend_metadata = None
+
+
 @dataclasses.dataclass
-class _MiniForwardBatch:
-    """Minimal FB stand-in: dataclass so ``dataclasses.replace`` works."""
+class _MiniForwardBatch(_MiniForwardBatchMixin):
+    """Minimal FB stand-in with metadata owned by a non-dataclass mixin."""
 
     batch_size: int = 0
     input_ids: Optional[torch.Tensor] = None
@@ -302,6 +306,8 @@ class TestFillFromAndExtract(unittest.TestCase):
             forward_mode="DECODE",
             spec_info="dummy_spec",
         )
+        backend_metadata = object()
+        fb.backend_metadata = backend_metadata
         r.fill_from(
             fb,
             raw_bs=2,
@@ -327,7 +333,8 @@ class TestFillFromAndExtract(unittest.TestCase):
         # Non-slot fields carried from template.
         self.assertEqual(fb_view.forward_mode, "DECODE")
         self.assertEqual(fb_view.spec_info, "dummy_spec")
-        # Template itself NOT mutated (replace returns a new instance).
+        self.assertIs(fb_view.backend_metadata, backend_metadata)
+        # Template itself is not mutated by the shallow copy.
         self.assertEqual(fb.batch_size, 2)
         self.assertIsNot(fb_view, fb)
 

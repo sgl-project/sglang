@@ -12,7 +12,10 @@ from unittest.mock import patch
 import torch
 
 import sglang.srt.batch_overlap.two_batch_overlap as tbo
-from sglang.srt.batch_overlap.two_batch_overlap import TboForwardBatchPreparer
+from sglang.srt.batch_overlap.two_batch_overlap import (
+    TboDPAttentionPreparer,
+    TboForwardBatchPreparer,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -66,6 +69,32 @@ class TestTboFilterBatchMarker(CustomTestCase):
         child = _filter(parent, lo=0, hi=4)
         self.assertFalse(child.forward_metadata_ready)
         self.assertFalse(child.forward_metadata_replan_equivalent)
+
+
+class TestTboTransactionalIsolation(CustomTestCase):
+    def test_isolated_batch_is_not_split(self):
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            requires_isolated_forward=True,
+        )
+        with patch.object(tbo, "is_tbo_enabled", return_value=True):
+            preparer = TboDPAttentionPreparer()
+            can_run_tbo, forward_mode = preparer.prepare_all_gather(batch)
+
+        self.assertFalse(can_run_tbo)
+        self.assertIsNone(preparer.local_tbo_split_seq_index)
+        self.assertEqual(forward_mode, ForwardMode.EXTEND.value)
+
+        split_index, global_forward_mode = preparer.compute_output(
+            torch.tensor(
+                [
+                    [can_run_tbo, forward_mode],
+                    [True, ForwardMode.EXTEND.value],
+                ]
+            )
+        )
+        self.assertIsNone(split_index)
+        self.assertIsNone(global_forward_mode)
 
 
 def _make_valued_batch(bs: int) -> ForwardBatch:
