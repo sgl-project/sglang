@@ -33,6 +33,7 @@ from typing import TYPE_CHECKING, Optional
 
 import msgspec
 import torch
+from piecewise_cuda_graphs import no_graph
 
 from sglang.kernels.ops.kvcache.trtllm_mha_graph_metadata import (
     update_trtllm_mha_graph_metadata,
@@ -46,7 +47,6 @@ from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
-    eager_on_graph,
     is_in_breakable_cuda_graph,
 )
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
@@ -697,4 +697,4 @@ def hpc_ops_fp8_rope_store_kv(
     )
 
 
-breakable_hpc_ops_fp8_rope_store_kv = eager_on_graph(True)(hpc_ops_fp8_rope_store_kv)
+breakable_hpc_ops_fp8_rope_store_kv = no_graph(hpc_ops_fp8_rope_store_kv, enable=True)

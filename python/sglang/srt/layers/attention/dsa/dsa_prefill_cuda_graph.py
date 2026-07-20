@@ -1,12 +1,10 @@
 from __future__ import annotations
 
 import torch
+from piecewise_cuda_graphs import no_graph
 
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.model_executor.forward_context import get_attn_backend
-from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
-    eager_on_graph,
-)
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
 )
@@ -188,4 +186,4 @@ def pcg_dsa_indexer_prefill_split(
     )
 
 
-bcg_dsa_indexer_prefill_split = eager_on_graph(True)(pcg_dsa_indexer_prefill_split)
+bcg_dsa_indexer_prefill_split = no_graph(pcg_dsa_indexer_prefill_split, enable=True)

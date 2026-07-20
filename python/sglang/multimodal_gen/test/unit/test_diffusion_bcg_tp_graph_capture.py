@@ -175,14 +175,14 @@ class TestBCGTPGraphCapture(CustomTestCase):
             "_tp_graph_capture",
             _recording_context(events, "tp"),
         ), patch.object(
-            runner_mod, "BreakableCUDAGraph", return_value=graph
+            runner_mod, "CUDAGraphSequence", return_value=graph
         ), patch.object(
             runner_mod,
             "enable_breakable_cuda_graph",
             _recording_context(events, "bcg_enable"),
         ), patch.object(
             runner_mod,
-            "BreakableCUDAGraphCapture",
+            "piecewise_graph",
             _recording_context(events, "bcg_capture"),
         ):
             runner._capture(kwargs, key=runner_mod._signature_kwargs(kwargs))

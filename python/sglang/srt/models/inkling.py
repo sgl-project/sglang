@@ -6,6 +6,7 @@ import re
 from typing import Iterable, Optional, Set, Tuple
 
 import torch
+from piecewise_cuda_graphs import no_graph
 from torch import nn
 
 from sglang.srt.configs.inkling import (
@@ -39,7 +40,6 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
-    eager_on_graph,
     is_in_breakable_cuda_graph,
 )
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
@@ -267,8 +267,8 @@ class InklingDecoderLayer(nn.Module):
         # ONE eager break; only mlp_norm + MoE stay captured. Outside a capture
         # these wrappers just run inline. `_breakable_mlp_sconv` runs the final
         # layer's deferred mlp_sconv after the layer loop.
-        self._breakable_attn_group = eager_on_graph(True)(self._attn_group_impl)
-        self._breakable_mlp_sconv = eager_on_graph(True)(self._mlp_sconv_impl)
+        self._breakable_attn_group = no_graph(self._attn_group_impl, enable=True)
+        self._breakable_mlp_sconv = no_graph(self._mlp_sconv_impl, enable=True)
 
     def _attn_block(
         self,
@@ -402,7 +402,7 @@ class InklingDecoderLayer(nn.Module):
     ) -> None:
         """Eager break: run `_attn_block` on the REAL (non-padded) tokens with the LIVE
         forward_batch and write the result into the padded output buffers. Mutates
-        attn_out / residual_out and returns None (the eager_on_graph copy-back is
+        attn_out / residual_out and returns None (the no_graph copy-back is
         per-tensor, not per-tuple, so outputs must be pre-allocated buffers)."""
         forward_batch = get_tc_piecewise_forward_context().forward_batch
         n = forward_batch.num_token_non_padded_cpu

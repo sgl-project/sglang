@@ -12,6 +12,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+from piecewise_cuda_graphs import no_graph
 
 from sglang.kernels.ops.activation.activation import (
     silu_and_mul_with_activation_rounding_,
@@ -62,9 +63,6 @@ from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
-)
-from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
-    eager_on_graph,
 )
 
 _ARCH_DEFAULTS = MiniMaxH3DiTArchConfig()
@@ -502,7 +500,7 @@ def _minimax_h3_attention_core_impl(
     return out
 
 
-_minimax_h3_attention_core_bcg = eager_on_graph(True)(_minimax_h3_attention_core_impl)
+_minimax_h3_attention_core_bcg = no_graph(_minimax_h3_attention_core_impl, enable=True)
 
 
 class MiniMaxH3Attention(nn.Module):
@@ -1318,7 +1316,7 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             ),
         )
 
-    @eager_on_graph(True)
+    @no_graph(enable=True)
     def _embed(
         self,
         *,

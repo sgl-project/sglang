@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
 import torch
+from piecewise_cuda_graphs import no_graph
 
 from sglang.kernels.ops.kvcache.cache_ops import absorbed_bmm_concat_cast_q_fp8
 from sglang.kernels.ops.quantization.fp8_kernel import (
@@ -42,9 +43,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
     get_token_to_kv_pool,
-)
-from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
-    eager_on_graph,
 )
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
@@ -965,6 +963,6 @@ def mla_bmm_then_unified_attention(
     )
 
 
-bcg_mla_bmm_then_unified_attention = eager_on_graph(True)(
-    mla_bmm_then_unified_attention
+bcg_mla_bmm_then_unified_attention = no_graph(
+    mla_bmm_then_unified_attention, enable=True
 )

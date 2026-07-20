@@ -4,6 +4,7 @@ import logging
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import torch
+from piecewise_cuda_graphs import no_graph
 
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.environ import envs
@@ -33,9 +34,6 @@ from sglang.srt.layers.moe.topk import (
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8MoEMethod
-from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
-    eager_on_graph,
-)
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
 )
@@ -198,21 +196,7 @@ class DeepEPMoE(FusedMoE):
         finally:
             set_is_extend_in_batch(saved_is_extend_in_batch)
 
-    def _a2a_forward_capture_stub(
-        self,
-        hidden_states: torch.Tensor,
-        topk_weights: torch.Tensor,
-        topk_ids: torch.Tensor,
-        router_logits: torch.Tensor,
-        output: torch.Tensor,
-    ) -> None:
-        # Capture pass only: record the buffer address, skip the
-        # rank-coupled a2a. Warmup and replay run the real body.
-        output.zero_()
-
-    a2a_forward_with_output = eager_on_graph(
-        True, capture_stub=_a2a_forward_capture_stub
-    )(_a2a_forward_with_output_impl)
+    a2a_forward_with_output = no_graph(_a2a_forward_with_output_impl, enable=True)
 
     def forward(
         self,
