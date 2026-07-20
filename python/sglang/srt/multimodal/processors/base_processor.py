@@ -409,7 +409,13 @@ class BaseMultimodalProcessor(ABC):
         )
 
     def process_mm_data(
-        self, input_text, images=None, videos=None, audios=None, **kwargs
+        self,
+        input_text,
+        images=None,
+        videos=None,
+        audios=None,
+        processor_video_config: Optional[Dict[str, Any]] = None,
+        **kwargs,
     ) -> dict:
         """
         process multimodal data with transformers AutoProcessor
@@ -420,8 +426,13 @@ class BaseMultimodalProcessor(ABC):
                 kwargs.setdefault("images_kwargs", {}).update(self.image_config)
         if videos:
             kwargs["videos"] = videos
-            if self.video_config:
-                kwargs.setdefault("videos_kwargs", {}).update(self.video_config)
+            video_config = (
+                self.video_config
+                if processor_video_config is None
+                else processor_video_config
+            )
+            if video_config:
+                kwargs.setdefault("videos_kwargs", {}).update(video_config)
         if audios:
             if self._processor.__class__.__name__ in {
                 "Gemma3nProcessor",
@@ -479,35 +490,12 @@ class BaseMultimodalProcessor(ABC):
             if bos and input_text.startswith(bos):
                 kwargs.setdefault("add_special_tokens", False)
 
-        try:
-            result = processor.__call__(
-                text=[input_text],
-                padding=True,
-                return_tensors="pt",
-                **kwargs,
-            )
-        except (TypeError, ValueError) as e:
-            logger.warning(
-                f"Processor call failed with video kwargs, retrying without video-specific params: {e}"
-            )
-            sglang_video_keys = (
-                "fps",
-                "max_pixels",
-                "min_pixels",
-                "total_pixels",
-                "max_frames",
-                "min_frames",
-                "resized_height",
-                "resized_width",
-            )
-            for k in sglang_video_keys:
-                kwargs["videos_kwargs"].pop(k, None)
-            result = processor.__call__(
-                text=[input_text],
-                padding=True,
-                return_tensors="pt",
-                **kwargs,
-            )
+        result = processor.__call__(
+            text=[input_text],
+            padding=True,
+            return_tensors="pt",
+            **kwargs,
+        )
         if not self.keep_mm_feature_on_device:
             # move feature tensors to cpu
             for feature_name in self.FEATURE_NAMES:

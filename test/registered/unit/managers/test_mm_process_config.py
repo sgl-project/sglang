@@ -169,6 +169,37 @@ class TestProcessMmDataKwargs(unittest.TestCase):
             call_kwargs.kwargs.get("videos_kwargs"), {"fps": 3, "max_frames": 60}
         )
 
+    def test_preprocessed_video_config_is_filtered_before_single_call(self):
+        config = {
+            "video": {
+                "fps": 3,
+                "max_frames": 60,
+                "do_normalize": False,
+            }
+        }
+        proc, mock_proc, _ = self._make_base_processor(config)
+
+        proc.process_mm_data(
+            "test",
+            videos=["vid1"],
+            processor_video_config={"do_normalize": False},
+        )
+
+        self.assertEqual(mock_proc.__call__.call_count, 1)
+        self.assertEqual(
+            mock_proc.__call__.call_args.kwargs.get("videos_kwargs"),
+            {"do_normalize": False},
+        )
+
+    def test_processor_error_is_not_retried(self):
+        proc, mock_proc, _ = self._make_base_processor({"video": {"max_frames": 60}})
+        mock_proc.__call__.side_effect = ValueError("processor failure")
+
+        with self.assertRaisesRegex(ValueError, "processor failure"):
+            proc.process_mm_data("test", videos=["vid1"])
+
+        self.assertEqual(mock_proc.__call__.call_count, 1)
+
     def test_no_collision_with_overlapping_keys(self):
         """Core test: image and video both have max_pixels but stay separate."""
         config = {

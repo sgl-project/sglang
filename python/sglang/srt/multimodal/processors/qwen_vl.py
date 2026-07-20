@@ -59,6 +59,30 @@ FPS = 2.0
 FPS_MIN_FRAMES = 4
 FPS_MAX_FRAMES = 768
 
+QWEN_VIDEO_PREPROCESS_CONFIG_KEYS = frozenset(
+    {
+        "fps",
+        "nframes",
+        "min_frames",
+        "max_frames",
+        "min_pixels",
+        "max_pixels",
+        "total_pixels",
+        "resized_height",
+        "resized_width",
+    }
+)
+
+
+def _get_processor_video_config(video_config, video_metadata):
+    if video_metadata and all(metadata is not None for metadata in video_metadata):
+        return {
+            key: value
+            for key, value in video_config.items()
+            if key not in QWEN_VIDEO_PREPROCESS_CONFIG_KEYS
+        }
+    return None
+
 
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
@@ -703,6 +727,13 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
 
         preprocess_time = time.perf_counter()
 
+        processor_kwargs = {}
+        processor_video_config = _get_processor_video_config(
+            self.video_config, video_metadata
+        )
+        if processor_video_config is not None:
+            processor_kwargs["processor_video_config"] = processor_video_config
+
         # NOTE: for qwen3-vl, video_meta need to be passed in, since do_sample_frames is already done in preprocess_video
         if self.hf_config.model_type in (
             "qwen3_vl",
@@ -711,16 +742,14 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             "qwen3_5_moe",
             "intern_s2_preview",
         ):
-            mm_items, input_ids, ret = self.process_and_combine_mm_data(
-                base_output,
-                self.mm_tokens,
+            processor_kwargs.update(
                 video_metadata=video_metadata,
                 do_sample_frames=False,
             )
-        else:
-            mm_items, input_ids, ret = self.process_and_combine_mm_data(
-                base_output, self.mm_tokens
-            )
+
+        mm_items, input_ids, ret = self.process_and_combine_mm_data(
+            base_output, self.mm_tokens, **processor_kwargs
+        )
 
         audio_feature_lengths = None
 
