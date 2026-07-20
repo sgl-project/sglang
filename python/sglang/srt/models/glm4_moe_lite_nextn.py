@@ -35,7 +35,7 @@ from sglang.srt.models.glm4_moe_lite import (
     Glm4MoeLiteDecoderLayer,
     Glm4MoeLiteForCausalLM,
 )
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args, get_spec
 from sglang.srt.utils import BumpAllocator, add_prefix, is_npu
 
 logger = logging.getLogger(__name__)
@@ -139,7 +139,7 @@ class Glm4MoeLiteForCausalLMNextN(Glm4MoeLiteForCausalLM):
         nn.Module.__init__(self)
         self.config = config
         self.tp_size = get_parallel().tp_size
-        if is_npu() and get_server_args().speculative_draft_model_quantization is None:
+        if is_npu() and get_spec().speculative_draft_model_quantization is None:
             quant_config = None
         self.quant_config = quant_config
 
@@ -156,7 +156,7 @@ class Glm4MoeLiteForCausalLMNextN(Glm4MoeLiteForCausalLM):
         self.logits_processor = LogitsProcessor(config)
 
         self.num_fused_shared_experts = (
-            0 if get_server_args().disable_shared_experts_fusion else 1
+            0 if get_exec().moe.disable_shared_experts_fusion else 1
         )
 
     @torch.no_grad()

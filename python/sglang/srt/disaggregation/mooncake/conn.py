@@ -55,6 +55,7 @@ from sglang.srt.observability.trace import (
     TraceReqContext,
     trace_set_thread_info,
 )
+from sglang.srt.runtime_context import get_schedule
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.network import NetworkAddress
 
@@ -314,9 +315,7 @@ class MooncakeKVManager(CommonKVManager):
         self.kv_buffer_tensors = None
 
     def _handle_staging_req(self, msg):
-        from sglang.srt.disaggregation.common.staging_handler import (
-            handle_staging_req,
-        )
+        from sglang.srt.disaggregation.common.staging_handler import handle_staging_req
 
         room = int(msg[1].decode("ascii"))
         session_id = msg[4].decode("ascii")
@@ -350,9 +349,7 @@ class MooncakeKVManager(CommonKVManager):
     def _is_watermark_ready(
         self, session_id: str, alloc_round: int, alloc_end: int
     ) -> bool:
-        from sglang.srt.disaggregation.common.staging_handler import (
-            is_watermark_ready,
-        )
+        from sglang.srt.disaggregation.common.staging_handler import is_watermark_ready
 
         return is_watermark_ready(self._staging_ctx, session_id, alloc_round, alloc_end)
 
@@ -469,7 +466,7 @@ class MooncakeKVManager(CommonKVManager):
             room,
             self.transfer_infos,
             self.kv_buffer_tensors,
-            self.server_args.chunked_prefill_size,
+            get_schedule().chunked_prefill_size,
             self._staging_ctx.prefetch_requested,
             self._staging_ctx.prefetch_sockets,
         )

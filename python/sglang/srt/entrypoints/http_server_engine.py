@@ -55,6 +55,8 @@ class HttpServerEngineAdapter(EngineBase):
 
     def __init__(self, **kwargs):
         self.server_args = ServerArgs(**kwargs)
+        # Read host/port from the adapter's own args: no config is published yet
+        # in this process (publish happens in the child from launch_server_process).
         print(
             f"Launch HttpServerEngineAdapter at: {self.server_args.host}:{self.server_args.port}"
         )
