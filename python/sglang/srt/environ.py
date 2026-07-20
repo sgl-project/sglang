@@ -1082,6 +1082,9 @@ class Envs:
     SGLANG_OPT_FUSE_WQA_WKV = EnvBool(True)
     SGLANG_OPT_SWIGLU_CLAMP_FUSION = EnvBool(True)
 
+    # Disable the single-token (decode, M==1) fused MoE fast path (Triton).
+    SGLANG_DISABLE_MOE_DECODE_SINGLE = EnvBool(False)
+
     # Cache / overlap
     SGLANG_OPT_USE_FUSED_STORE_CACHE = EnvBool(True)
     SGLANG_OPT_USE_JIT_NORM = EnvBool(True)

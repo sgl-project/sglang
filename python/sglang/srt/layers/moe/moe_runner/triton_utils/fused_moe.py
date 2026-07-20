@@ -43,6 +43,7 @@ from sglang.srt.utils.custom_op import register_custom_op
 
 from .fused_moe_triton_config import get_config_dtype_str, try_get_optimal_moe_config
 from .moe_align_block_size import moe_align_block_size
+from .moe_decode_single import decode_single_moe, decode_single_moe_supported
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.topk import StandardTopKOutput
@@ -877,6 +878,42 @@ def fused_experts_impl(
     assert w1.is_contiguous(), "Expert weights1 must be contiguous"
     assert w2.is_contiguous(), "Expert weights2 must be contiguous"
     assert hidden_states.dtype in [torch.float32, torch.float16, torch.bfloat16]
+
+    # Single-token (decode, M==1) fast path: skip align/sort and fuse the whole
+    # op into two small Triton kernels. Pure performance shortcut with a generic
+    # fallback; can be disabled via SGLANG_DISABLE_MOE_DECODE_SINGLE=1.
+    if not envs.SGLANG_DISABLE_MOE_DECODE_SINGLE.get() and decode_single_moe_supported(
+        hidden_states,
+        w1,
+        w2,
+        activation=activation,
+        is_gated=is_gated,
+        apply_router_weight_on_input=apply_router_weight_on_input,
+        use_fp8_w8a8=use_fp8_w8a8,
+        use_int8_w8a8=use_int8_w8a8,
+        use_int8_w8a16=use_int8_w8a16,
+        use_int4_w4a16=use_int4_w4a16,
+        b1=b1,
+        b2=b2,
+        block_shape=block_shape,
+        gemm1_alpha=gemm1_alpha,
+        gemm1_limit=gemm1_limit,
+        swiglu_limit=swiglu_limit,
+        gate_up_interleaved=gate_up_interleaved,
+        no_combine=no_combine,
+    ):
+        out = decode_single_moe(
+            hidden_states,
+            w1,
+            w2,
+            topk_weights,
+            topk_ids,
+            routed_scaling_factor=routed_scaling_factor,
+        )
+        if inplace:
+            hidden_states.copy_(out)
+            return hidden_states
+        return out
 
     (
         config,
