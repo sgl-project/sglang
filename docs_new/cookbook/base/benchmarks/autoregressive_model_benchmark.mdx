@@ -1,0 +1,287 @@
+---
+title: Autoregressive Model Benchmark Documentation
+metatags:
+    description: "Benchmark LLM and VLM serving throughput and latency with sglang.bench_serving - supports SGLang, vLLM, and multiple datasets."
+---
+
+`sglang.bench_serving` is a command-line tool designed to benchmark the online serving throughput and latency of Large Language Models (LLMs) and Vision Language Models(VLMs). It supports various backends (`SGLang`, `vLLM`, etc.) and offers flexible configurations for request rates, dataset types, and profiling.
+
+## 1. Quick Start
+
+### Basic Usage (Random Data)
+
+Run a benchmark using randomly generated prompts with a local SGLang server.
+
+```bash Command
+python -m sglang.bench_serving --backend sglang --port 30000 --dataset-name random --num-prompts 100
+```
+
+### Real-World Data (ShareGPT)
+
+Run a benchmark using the ShareGPT dataset with a specific request rate.
+
+```shell Command
+python -m sglang.bench_serving \
+  --backend sglang \
+  --dataset-name sharegpt \
+  --dataset-path ./ShareGPT_V3_unfiltered_cleaned_split.json \
+  --num-prompts 1000 \
+  --request-rate 10
+```
+
+## 2. Parameter Reference
+
+### 2.1 Backend & Server Configuration
+
+These parameters define the target server and the inference engine being used.
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "50%"}} />
+    <col style={{width: "50%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Parameter</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--backend`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>**Required.** Specifies the backend engine. Options: `sglang`, `sglang-native`, `sglang-oai`, `sglang-oai-chat`, `vllm`, `vllm-chat`, `lmdeploy`, `lmdeploy-chat`, `trt`, `gserver`, `truss`.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--base-url`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The API base URL (if not using specific host/port flags).</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--host`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Server hostname. Default: `0.0.0.0`.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--port`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Server port. If not set, it defaults to the specific backend's standard port.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--model`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Model name or path. If unset, it queries `/v1/models` for configuration.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--served-model-name`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The model name used in the API request body. Defaults to the value of `--model`.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--tokenizer`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Path or name of the tokenizer. Defaults to the model configuration.</td>
+    </tr>
+  </tbody>
+</table>
+
+### 2.2 Dataset Configuration
+
+Controls the source of the prompts used for benchmarking.
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "50%"}} />
+    <col style={{width: "50%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Parameter</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--dataset-name`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The type of dataset. Options: `sharegpt`, `custom`, `random`, `random-ids`, `generated-shared-prefix`, `mmmu`, `image`, `mooncake`.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--dataset-path`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>File path to the dataset (e.g., local JSON file for ShareGPT).</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--num-prompts`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Total number of prompts to process. Default: `1000`.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--seed`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Random seed for reproducibility.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--tokenize-prompt`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Uses integer IDs instead of strings for inputs. Useful for precise length control.</td>
+    </tr>
+  </tbody>
+</table>
+
+### 2.3 Input/Output Length Control
+
+Parameters to control the shape of requests (context length and generation length).
+
+#### For Random/Image Datasets:
+
+- `--random-input-len`: Number of input tokens per request.
+- `--random-output-len`: Number of output tokens per request.
+- `--random-range-ratio`: Range ratio for sampling input/output lengths.
+
+#### For ShareGPT Dataset:
+
+- `--sharegpt-output-len`: Overrides the output length defined in the dataset for each request.
+- `--sharegpt-context-len`: Max context length. Requests exceeding this are dropped.
+
+#### General Request Modifiers:
+
+- `--extra-request-body`: Appends a JSON object to the request payload (e.g., \{"key": "value"\}). Useful for passing sampling parameters.
+- `--prompt-suffix`: A string suffix appended to all user prompts.
+- `--disable-ignore-eos`: If set, the model will stop generation upon hitting the EOS token (benchmarks usually ignore EOS to force max generation length).
+- `--apply-chat-template`: Applies the model's chat template to the input.
+
+### 2.4 Traffic & Concurrency
+
+Controls how fast requests are sent to the server.
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "50%"}} />
+    <col style={{width: "50%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Parameter</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--request-rate`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Requests per second (RPS). If `inf` (default), all requests are sent immediately (burst). Otherwise, arrival times follow a Poisson process.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--max-concurrency`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The maximum number of active requests allowed at once. Even if `request-rate` is high, the client will hold back requests if this limit is reached.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--warmup-requests`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Number of requests to run before the actual measurement begins to warm up the server.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--flush-cache`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Flushes the server cache before starting the benchmark.</td>
+    </tr>
+  </tbody>
+</table>
+
+### 2.5 Output & Logging
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "50%"}} />
+    <col style={{width: "50%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Parameter</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--output-file`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Path to save the results in JSONL format.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--output-details`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Includes detailed metrics in the output.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--print-requests`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Prints requests to stdout as they are sent (useful for debugging).</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--disable-tqdm`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Hides the progress bar.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--disable-stream`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Disables streaming mode (waits for full response).</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--return-logprob`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Requests logprobs from the server.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--tag`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>An arbitrary string tag added to the output file for identification.</td>
+    </tr>
+  </tbody>
+</table>
+
+### 2.6 Advanced
+
+#### 2.6.1 Image / Multi-modal
+
+Only applicable when --dataset-name is set to image.
+
+- `--image-count`: Number of images per request.
+- `--image-resolution`: Resolution (e.g., 1080p, 4k, or custom 1080x1920).
+- `--image-format`: jpeg or png.
+- `--image-content`: random (noise) or blank.
+
+#### 2.6.2 LoRA Benchmarking
+
+Used to simulate multi-LoRA serving scenarios.
+
+- `--lora-name`: A list of LoRA adapter names (e.g., `--lora-name` adapter1 adapter2).
+- `--lora-request-distribution`: How requests are assigned to adapters:
+  - `uniform`: Equal probability.
+  - `distinct`: New adapter for every request.
+  - `skewed`: Follows a Zipf distribution (simulating hot/cold adapters).
+- `--lora-zipf-alpha`: The alpha parameter for the Zipf distribution (if `skewed` is used).
+
+#### 2.6.3 Profiling
+
+Tools for deep performance analysis.
+
+- `--profile`: Enables Torch Profiler (Requires `SGLANG_TORCH_PROFILER_DIR` env var on server).
+- `--plot-throughput`: Generates throughput/concurrency plots (requires `termplotlib` and `gnuplot`).
+- `--profile-activities`: Activities to profile (CPU, GPU, CUDA_PROFILER).
+- `--profile-num-steps`: Number of steps to profile.
+- `--profile-by-stage` / `--profile-stages`: Profile specific processing stages.
+
+#### 2.6.4 PD Disaggregation
+
+For benchmarking Prefill-Decode (PD) separated architectures.
+
+- `--pd-separated`: Enable PD disaggregation benchmarking.
+- `--profile-prefill-url`: URL(s) of prefill workers for profiling.
+- `--profile-decode-url`: URL(s) of decode workers for profiling.
+
+<span style={{color:"red"}}>Note</span>: In PD mode, `prefill` and `decode` must be profiled separately.
+
+### 2.7 Specialized Datasets
+
+#### 2.7.1 Generated Shared Prefix (GSP):
+
+Designed to test system prompt caching/prefix sharing performance.
+
+- `--gsp-num-groups`: Number of unique system prompts.
+- `--gsp-prompts-per-group`: How many user questions share the same system prompt.
+- `--gsp-system-prompt-len`: Length of the shared prefix.
+- `--gsp-fast-prepare`: Skips some statistics calculation for faster startup.
+
+#### 2.7.2 Mooncake
+
+Designed for trace replay.
+
+- `--mooncake-slowdown-factor`: Slows down the trace replay (e.g., 2.0 = 2x slower).
+- `--mooncake-num-rounds`: Number of conversation rounds (supports multi-turn).
+- `--use-trace-timestamps`: Schedules requests based on timestamps found in the trace file.
+
+## 3. Metrics
+
+After running the benchmark, the tool generally reports:
+
+- `E2E` (End-to-End Latency): The total time from sending the request to receiving the final token.
+- `TTFT` (Time To First Token): The time between sending the request and seeing the first word appear. This represents the Prefill time (processing the image and text prompt).
+- `TPOT` (Time per Output Token): The average time it takes to generate one token (excluding the first one). This is calculated per request.
+- `ITL` (Inter-Token Latency): The time gap between two distinct streaming packets. While TPOT is an average, ITL measures the "jitter" or smoothness of the stream.

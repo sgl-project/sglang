@@ -16,10 +16,18 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ModelTaskType,
     PipelineConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
+    ModelDeploymentConfig,
+)
 from sglang.multimodal_gen.runtime.distributed import (
     get_sp_parallel_rank,
     get_sp_world_size,
 )
+
+# Distilled 3-step stage-2 sigma schedule. Single source of truth shared by
+# LTX2TwoStagePipeline and the SANA-WM refiner stages (matches NVlabs
+# `inference_sana_wm.py` / the LTX-2 distilled refiner).
+STAGE_2_DISTILLED_SIGMA_VALUES: tuple[float, ...] = (0.909375, 0.725, 0.421875, 0.0)
 
 
 def pack_text_embeds(
@@ -128,6 +136,8 @@ def sync_ltx23_runtime_vae_markers(
     for key in (
         "ltx_variant",
         "condition_encoder_subdir",
+        "video_encoder_variant",
+        "video_encoder_config",
         "video_decoder_variant",
         "video_decoder_config",
     ):
@@ -176,8 +186,9 @@ class LTX2PipelineConfig(PipelineConfig):
 
     # Audio VAE configuration
     vae_config: LTXVideoVAEConfig = field(default_factory=LTXVideoVAEConfig)
+    vae_precision: str = "bf16"
     audio_vae_config: LTXAudioVAEConfig = field(default_factory=LTXAudioVAEConfig)
-    audio_vae_precision: str = "fp32"
+    audio_vae_precision: str = "bf16"
 
     @property
     def vae_scale_factor(self):
@@ -186,6 +197,13 @@ class LTX2PipelineConfig(PipelineConfig):
     @property
     def vae_temporal_compression(self):
         return self.vae_config.arch_config.temporal_compression_ratio
+
+    def get_model_deployment_config(self) -> ModelDeploymentConfig:
+        return ModelDeploymentConfig(
+            keep_resident_min_available_gb=70,
+            keep_resident_components=("dit",),
+            auto_cfg_parallel_degree_by_num_gpus=((4, 1), (8, 1)),
+        )
 
     def prepare_latent_shape(self, batch, batch_size, num_frames):
         """Return unpacked latent shape [B, C, F, H, W]."""
@@ -244,6 +262,9 @@ class LTX2PipelineConfig(PipelineConfig):
     def tokenize_prompt(self, prompt: list[str], tokenizer, tok_kwargs) -> dict:
         # Adapted from diffusers_pipeline.py _get_gemma_prompt_embeds
         # But we only need tokenization here, the embedding happens in TextEncodingStage
+        # Official LTX Gemma tokenizer trims surrounding whitespace before
+        # tokenization.
+        prompt = [text.strip() for text in prompt]
 
         # Gemma expects left padding for chat-style prompts
         tokenizer.padding_side = "left"
@@ -690,6 +711,11 @@ class LTX2PipelineConfig(PipelineConfig):
         )
 
         return latents, audio_latents
+
+
+@dataclasses.dataclass
+class LTX23PipelineConfig(LTX2PipelineConfig):
+    """Configuration overrides for LTX-2.3."""
 
 
 @dataclasses.dataclass

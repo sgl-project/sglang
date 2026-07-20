@@ -1,0 +1,330 @@
+---
+title: "Support New Diffusion Models"
+description: "A concise implementation guide for adding diffusion model families to SGLang-Diffusion."
+---
+
+Use this guide as a triage flow for finding the smallest change that can
+support a model. Most new model work should touch a small set of files, even
+though the runtime is split into separate folders.
+
+## Read the Code in This Order
+
+The files are split by runtime responsibility. For a new model, read the
+request path first:
+
+1. `registry.py` chooses the model family, sampling params, and pipeline config.
+2. `configs/pipeline_configs/{model}.py` defines model-specific denoising and
+   decoding behavior.
+3. `runtime/pipelines/{model}.py` wires modules into stages.
+4. `runtime/pipelines_core/stages/` runs the shared stage logic.
+5. `runtime/models/` contains native model components only when the architecture
+   cannot be reused.
+
+That is the dependency direction. Avoid making a model PR that requires readers
+to jump between folders in a different order.
+
+`runtime/models/` owns modeling code: checkpoint-defined neural modules,
+architecture wrappers, and weight-loading or forward-path details that are
+intrinsic to one model family. Reusable serving infrastructure belongs in
+SGLang-Diffusion runtime folders such as `runtime/cache/`,
+`runtime/distributed/`, `runtime/utils/`, or shared pipeline stages. This
+includes cache managers, graph runners, process-group transport, request
+utilities, and common action-policy helpers. Model packages may call these
+helpers. Keep ownership in shared runtime folders unless the code is truly
+architecture-specific.
+
+## Start With the Smallest Change
+
+Before adding files, decide which path fits the model.
+
+| Situation | What to do |
+| --- | --- |
+| A new checkpoint uses an existing native family | Add the Hugging Face path and, if needed, a small `SamplingParams` or `PipelineConfig` variant. Reuse the existing pipeline and modules. |
+| The model has a new native DiT/UNet architecture | Add a native SGLang pipeline and the missing model components. Keep denoising and decoding on the shared stages unless measured behavior requires model-specific logic. |
+| The model is long-tail or you only need compatibility first | Prefer the Diffusers backend for compatibility-first support. Add native support later if performance or deployment needs justify it. |
+
+Do not add a folder just to mirror the Diffusers repository layout. Add a new
+file only when an existing pipeline, stage, module, config, or sampler cannot
+express the behavior clearly.
+
+## Minimal File Map
+
+The source tree is split by runtime responsibility. That split is useful for
+optimization. Keep new model PRs focused on the files required by model
+behavior.
+
+| Area | Add or edit when | Typical file |
+| --- | --- | --- |
+| Registry | Always, unless extending an already registered family | `python/sglang/multimodal_gen/registry.py` |
+| Runtime parameters | The request schema differs from existing models | `configs/sample/{model}.py` |
+| Pipeline config | Denoising, decoding, precision, position encoding, or CFG hooks differ | `configs/pipeline_configs/{model}.py` |
+| Pipeline wiring | The model needs a new stage layout or module list | `runtime/pipelines/{model}.py` |
+| DiT/UNet module | The denoising network is new | `runtime/models/dits/{model}.py` |
+| dVLA or policy module | The checkpoint defines a new action-policy architecture | `runtime/models/{family}/modeling_*.py` or a task-specific model subfolder |
+| Shared runtime infrastructure | Cache, CUDA graph, distributed transfer, request utilities, or action-policy helpers can be reused by future models | `runtime/cache/`, `runtime/distributed/`, `runtime/utils/`, `runtime/pipelines_core/stages/` |
+| Model component config | A model component has static architecture config | `configs/models/dits/{model}.py`, `configs/models/vaes/{model}.py` |
+| Model-specific stage | Pre-processing is too custom for the standard stages | `runtime/pipelines_core/stages/model_specific_stages/{model}.py` |
+| Encoder, VAE, scheduler | No existing implementation can be reused | `runtime/models/encoders/`, `runtime/models/vaes/`, `runtime/models/schedulers/` |
+
+For a new native architecture, the common minimum is:
+
+1. `registry.py`
+2. `configs/sample/{model}.py`
+3. `configs/pipeline_configs/{model}.py`
+4. `runtime/pipelines/{model}.py`
+5. `runtime/models/dits/{model}.py`
+
+Every extra file should map to model behavior that existing code cannot express
+clearly.
+
+For dVLA or other non-image diffusion policies, keep the same ownership rule.
+The policy network, VLM/action expert modules, checkpoint mapping, and
+model-specific forward code belong under `runtime/models/`. Prefix caches,
+request-local contexts, denoising graph runners, OpenPI-compatible transport,
+and prefix/action process-group utilities should be shared SGLang-Diffusion
+runtime infrastructure when they are useful beyond the first model.
+
+## Read the Reference First
+
+Use the model's Diffusers pipeline, official implementation, or
+`model_index.json` as the source of truth. Write down:
+
+- Which modules must be loaded: tokenizer, text encoder, image encoder,
+  transformer, scheduler, VAE, processor, and any extra adapters.
+- The prompt and image encoding flow.
+- Latent shape, packing, scale, shift, dtype, and device rules.
+- Timestep and sigma schedule.
+- The exact `forward()` kwargs expected by the denoising network.
+- VAE decode rules and output post-processing.
+
+If the new model is close to Flux, Qwen-Image, GLM-Image, Wan, HunyuanVideo, or
+LTX, extend that implementation before starting from an empty file.
+
+## Choose a Pipeline Shape
+
+SGLang-Diffusion uses `ComposedPipelineBase` to wire stages together. Most
+native pipelines should use one of these two shapes.
+
+| Shape | Use when | Layout |
+| --- | --- | --- |
+| Standard stages | Text/image encoding, latent prep, denoising, and decoding match existing helpers | `add_standard_t2i_stages()`, `add_standard_ti2i_stages()`, or a similar helper |
+| Model-specific pre-processing | The reference pipeline has custom captioning, image conditioning, latent packing, or timestep preparation | `{Model}BeforeDenoisingStage -> DenoisingStage -> DecodingStage` |
+
+Prefer standard stages when possible. Use a model-specific
+`BeforeDenoisingStage` when trying to force the model into shared stages would
+create many conditionals.
+
+## Implement the Pieces
+
+### 1. Sampling Params
+
+Create request parameters only for values users can set at runtime.
+
+```python
+# python/sglang/multimodal_gen/configs/sample/my_model.py
+from dataclasses import dataclass
+
+from sglang.multimodal_gen.configs.sample.sampling_params import ImageSamplingParams
+
+
+@dataclass
+class MyModelSamplingParams(ImageSamplingParams):
+    guidance_scale: float = 4.0
+    num_inference_steps: int = 28
+```
+
+### 2. Pipeline Config
+
+`PipelineConfig` is where shared denoising and decoding stages get model-specific
+callbacks.
+
+```python
+# python/sglang/multimodal_gen/configs/pipeline_configs/my_model.py
+from dataclasses import dataclass, field
+
+
+@dataclass
+class MyModelPipelineConfig(ImagePipelineConfig):
+    task_type: ModelTaskType = ModelTaskType.T2I
+    should_use_guidance: bool = True
+    dit_config: DiTConfig = field(default_factory=MyModelDiTConfig)
+    vae_config: VAEConfig = field(default_factory=MyModelVAEConfig)
+
+    def prepare_pos_cond_kwargs(self, batch, latent_model_input, t, **kwargs):
+        return {
+            "hidden_states": latent_model_input,
+            "encoder_hidden_states": batch.prompt_embeds[0],
+            "timestep": t,
+        }
+
+    def prepare_neg_cond_kwargs(self, batch, latent_model_input, t, **kwargs):
+        return {
+            "hidden_states": latent_model_input,
+            "encoder_hidden_states": batch.negative_prompt_embeds[0],
+            "timestep": t,
+        }
+```
+
+Make these kwargs match the denoising module's `forward()` signature exactly.
+
+### 3. Pipeline Wiring
+
+Use the standard helper when the model fits it.
+
+```python
+# python/sglang/multimodal_gen/runtime/pipelines/my_model.py
+class MyModelPipeline(LoRAPipeline, ComposedPipelineBase):
+    pipeline_name = "MyModelPipeline"
+
+    _required_config_modules = [
+        "text_encoder",
+        "tokenizer",
+        "transformer",
+        "scheduler",
+        "vae",
+    ]
+
+    def create_pipeline_stages(self, server_args: ServerArgs):
+        self.add_standard_t2i_stages()
+
+
+EntryClass = [MyModelPipeline]
+```
+
+Use a model-specific pre-processing stage when the reference pipeline cannot be
+cleanly expressed by standard helpers.
+
+```python
+class MyModelPipeline(LoRAPipeline, ComposedPipelineBase):
+    pipeline_name = "MyModelPipeline"
+
+    _required_config_modules = [
+        "text_encoder",
+        "tokenizer",
+        "transformer",
+        "scheduler",
+        "vae",
+    ]
+
+    def create_pipeline_stages(self, server_args: ServerArgs):
+        self.add_stage(
+            MyModelBeforeDenoisingStage(
+                text_encoder=self.get_module("text_encoder"),
+                tokenizer=self.get_module("tokenizer"),
+                transformer=self.get_module("transformer"),
+                scheduler=self.get_module("scheduler"),
+                vae=self.get_module("vae"),
+            )
+        )
+        self.add_stage(
+            DenoisingStage(
+                transformer=self.get_module("transformer"),
+                scheduler=self.get_module("scheduler"),
+            )
+        )
+        self.add_standard_decoding_stage()
+
+
+EntryClass = [MyModelPipeline]
+```
+
+### 4. Optional Before-Denoising Stage
+
+A `BeforeDenoisingStage` should populate the batch fields consumed by
+`DenoisingStage`.
+
+```python
+class MyModelBeforeDenoisingStage(PipelineStage):
+    @torch.no_grad()
+    def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+        prompt_embeds, negative_prompt_embeds = self._encode_prompt(batch)
+        latents = self._prepare_latents(batch)
+        timesteps, sigmas = self._prepare_timesteps(batch)
+
+        batch.prompt_embeds = [prompt_embeds]
+        batch.negative_prompt_embeds = [negative_prompt_embeds]
+        batch.latents = latents
+        batch.timesteps = timesteps
+        batch.num_inference_steps = len(timesteps)
+        batch.sigmas = sigmas.tolist()
+        batch.raw_latent_shape = latents.shape
+        return batch
+```
+
+Required fields for `DenoisingStage`:
+
+| Field | Notes |
+| --- | --- |
+| `batch.latents` | Initial latent tensor, including any packing required by the model. |
+| `batch.timesteps` | Timestep tensor in the exact order used by the reference pipeline. |
+| `batch.sigmas` | Python list when the scheduler expects sigma values. |
+| `batch.prompt_embeds` | Positive embeddings, wrapped in a list. |
+| `batch.negative_prompt_embeds` | Negative embeddings, wrapped in a list when CFG is used. |
+| `batch.num_inference_steps` | Number of denoising iterations. |
+| `batch.raw_latent_shape` | Original latent shape before packing, if decode needs it. |
+
+### 5. Denoising Module
+
+Add a file under `runtime/models/dits/` only when the architecture is new. Reuse
+existing encoders, VAEs, schedulers, normalization layers, and fused kernels
+whenever possible.
+
+For multi-GPU serving, add TP/SP support after the single-GPU path is correct.
+Useful references:
+
+- `runtime/models/dits/wanvideo.py` for TP plus SP.
+- `runtime/models/dits/qwen_image.py` for USP attention.
+
+### 6. Registry
+
+Register the family once the sampling params and pipeline config exist.
+
+```python
+register_configs(
+    model_family="my_model",
+    sampling_param_cls=MyModelSamplingParams,
+    pipeline_config_cls=MyModelPipelineConfig,
+    hf_model_paths=["org/my-model"],
+)
+```
+
+The pipeline file is discovered through its `EntryClass`; do not add a second
+pipeline registry unless the existing registry requires it.
+
+## Verify the Port
+
+Use one deterministic prompt and seed while comparing with the reference
+implementation.
+
+1. Run a single-GPU smoke test and check that the output contains coherent
+   content.
+2. Compare latent scale and shift, timestep order, sigma values, and conditioning
+   kwargs against Diffusers or the official implementation.
+3. Verify VAE decode and post-processing separately from denoising.
+4. If the model supports LoRA, CFG parallelism, TP, SP, or disaggregation, test
+   each feature explicitly.
+5. Add or update docs, examples, or the compatibility matrix when users need a
+   new launch command.
+
+Common failure points:
+
+- Wrong latent scale or shift.
+- Reversed or dtype-mismatched timesteps.
+- Missing negative embeddings when CFG is enabled.
+- Conditioning kwarg names mismatched with the DiT `forward()`.
+- Rotary embedding shape or style mismatch.
+- Decoding packed latents without restoring `raw_latent_shape`.
+
+## PR Checklist
+
+- [ ] Reused an existing family, stage, module, scheduler, or VAE wherever
+      possible.
+- [ ] Kept the new-model touch surface small and justified any extra files.
+- [ ] Added `SamplingParams`, `PipelineConfig`, pipeline wiring, DiT module, and
+      registry entry when native support is needed.
+- [ ] Confirmed `pipeline_name` matches the Diffusers `model_index.json`
+      `_class_name` when applicable.
+- [ ] Confirmed `_required_config_modules` matches the model repo.
+- [ ] Verified image or video quality against a reference output.
+- [ ] Tested multi-GPU paths if the PR claims TP, SP, CFG parallelism, or
+      distributed serving support.

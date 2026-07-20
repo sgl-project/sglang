@@ -7,9 +7,12 @@ from diffusers.models.embeddings import PixArtAlphaTextProjection, TimestepEmbed
 
 from sglang.multimodal_gen.configs.models.dits.sana import SanaConfig
 from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
+from sglang.multimodal_gen.runtime.layers.linear import MergedColumnParallelLinear
 from sglang.multimodal_gen.runtime.layers.visual_embedding import Timesteps
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
-from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -95,9 +98,11 @@ class SanaLinearAttention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = head_dim
 
-        self.to_q = nn.Linear(query_dim, inner_dim, bias=bias)
-        self.to_k = nn.Linear(query_dim, inner_dim, bias=bias)
-        self.to_v = nn.Linear(query_dim, inner_dim, bias=bias)
+        self.inner_dim = inner_dim
+        # Self-attention q/k/v share the same input -> one packed GEMM.
+        self.to_qkv = MergedColumnParallelLinear(
+            query_dim, [inner_dim, inner_dim, inner_dim], bias=bias, gather_output=True
+        )
         self.to_out = nn.ModuleList(
             [nn.Linear(inner_dim, query_dim, bias=True), nn.Identity()]
         )
@@ -105,9 +110,10 @@ class SanaLinearAttention(nn.Module):
     def forward(self, hidden_states):
         B, S, _ = hidden_states.shape
 
-        query = self.to_q(hidden_states)
-        key = self.to_k(hidden_states)
-        value = self.to_v(hidden_states)
+        qkv, _ = self.to_qkv(hidden_states)
+        query, key, value = qkv.split(
+            [self.inner_dim, self.inner_dim, self.inner_dim], dim=-1
+        )
 
         query = query.view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
         key = key.view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
@@ -134,9 +140,12 @@ class SanaCrossAttention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = head_dim
 
+        self.inner_dim = inner_dim
         self.to_q = nn.Linear(query_dim, inner_dim, bias=bias)
-        self.to_k = nn.Linear(cross_attention_dim, inner_dim, bias=bias)
-        self.to_v = nn.Linear(cross_attention_dim, inner_dim, bias=bias)
+        # k/v share the (step-invariant) encoder input -> one packed GEMM.
+        self.to_kv = MergedColumnParallelLinear(
+            cross_attention_dim, [inner_dim, inner_dim], bias=bias, gather_output=True
+        )
         self.to_out = nn.ModuleList(
             [nn.Linear(inner_dim, query_dim, bias=True), nn.Identity()]
         )
@@ -148,8 +157,8 @@ class SanaCrossAttention(nn.Module):
         T = encoder_hidden_states.shape[1]
 
         query = self.to_q(hidden_states)
-        key = self.to_k(encoder_hidden_states)
-        value = self.to_v(encoder_hidden_states)
+        kv, _ = self.to_kv(encoder_hidden_states)
+        key, value = kv.split([self.inner_dim, self.inner_dim], dim=-1)
 
         query = query.view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
         key = key.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
@@ -239,7 +248,7 @@ class SanaTransformerBlock(nn.Module):
         return hidden_states
 
 
-class SanaTransformer2DModel(CachableDiT, OffloadableDiTMixin):
+class SanaTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
 
     _fsdp_shard_conditions = [
         lambda n, m: isinstance(m, SanaTransformerBlock),

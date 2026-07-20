@@ -356,5 +356,57 @@ class TestBuildResponse(unittest.TestCase):
         self.assertIsNotNone(resps[0].generated_output)
 
 
+class TestBuildSamplingKwargs(unittest.TestCase):
+    def _make_request(self, **overrides):
+        from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
+            RolloutRequest,
+        )
+
+        base = dict(prompt="x", num_inference_steps=4, rollout=True)
+        base.update(overrides)
+        return RolloutRequest(**base)
+
+    def test_step_index_filters_forwarded(self):
+        from sglang.multimodal_gen.runtime.entrypoints.post_training.rollout_api import (
+            _build_sampling_kwargs,
+        )
+
+        kwargs = _build_sampling_kwargs(
+            self._make_request(
+                rollout_sde_step_indices=[0, 2],
+                rollout_return_step_indices=[1, 3],
+            )
+        )
+        self.assertEqual(kwargs["rollout_sde_step_indices"], [0, 2])
+        self.assertEqual(kwargs["rollout_return_step_indices"], [1, 3])
+
+    def test_step_index_filters_default_dropped_as_none(self):
+        from sglang.multimodal_gen.runtime.entrypoints.post_training.rollout_api import (
+            _build_sampling_kwargs,
+        )
+
+        kwargs = _build_sampling_kwargs(self._make_request())
+        # None values are stripped; absence here is the correct default-path behavior.
+        self.assertNotIn("rollout_sde_step_indices", kwargs)
+        self.assertNotIn("rollout_return_step_indices", kwargs)
+
+    def test_sampling_params_exposes_filters_via_req_getattr(self):
+        from sglang.multimodal_gen.configs.sample.sampling_params import (
+            SamplingParams,
+        )
+        from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+
+        sp = SamplingParams(
+            prompt="x",
+            num_inference_steps=4,
+            rollout=True,
+            rollout_sde_step_indices=[0, 2],
+            rollout_return_step_indices=[1, 3],
+        )
+        req = Req(sampling_params=sp)
+        self.assertEqual(req.rollout_sde_step_indices, [0, 2])
+        self.assertEqual(req.rollout_return_step_indices, [1, 3])
+
+
 if __name__ == "__main__":
     unittest.main()

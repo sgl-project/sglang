@@ -28,6 +28,7 @@ def _fake_fp8_block_scale_moe(
     enable_pdl: Optional[bool] = None,
     tune_max_num_tokens: int = 8192,
     fp8_quantization_type: Optional[int] = None,
+    activation_type: Optional[int] = None,
 ) -> torch.Tensor:
     return torch.empty(
         hidden_states.shape, dtype=torch.bfloat16, device=hidden_states.device
@@ -58,6 +59,7 @@ def trtllm_fp8_block_scale_moe_wrapper(
     enable_pdl: Optional[bool] = None,
     tune_max_num_tokens: int = 8192,
     fp8_quantization_type: Optional[int] = None,
+    activation_type: Optional[int] = None,
 ) -> torch.Tensor:
     try:
         from flashinfer.fused_moe import trtllm_fp8_block_scale_moe
@@ -94,6 +96,11 @@ def trtllm_fp8_block_scale_moe_wrapper(
 
         kwargs["fp8_quantization_type"] = Fp8QuantizationType(fp8_quantization_type)
 
+    if activation_type is not None:
+        from flashinfer.fused_moe.core import ActivationType
+
+        kwargs["activation_type"] = ActivationType(activation_type)
+
     return trtllm_fp8_block_scale_moe(**kwargs)
 
 
@@ -120,6 +127,7 @@ def _fake_fp8_block_scale_routed_moe(
     enable_pdl: Optional[bool] = None,
     tune_max_num_tokens: int = 8192,
     fp8_quantization_type: Optional[int] = None,
+    activation_type: Optional[int] = None,
 ) -> torch.Tensor:
     return torch.empty(
         hidden_states.shape, dtype=torch.bfloat16, device=hidden_states.device
@@ -150,6 +158,7 @@ def trtllm_fp8_block_scale_routed_moe_wrapper(
     enable_pdl: Optional[bool] = None,
     tune_max_num_tokens: int = 8192,
     fp8_quantization_type: Optional[int] = None,
+    activation_type: Optional[int] = None,
 ) -> torch.Tensor:
     try:
         from flashinfer.fused_moe import trtllm_fp8_block_scale_routed_moe
@@ -186,6 +195,11 @@ def trtllm_fp8_block_scale_routed_moe_wrapper(
 
         kwargs["fp8_quantization_type"] = Fp8QuantizationType(fp8_quantization_type)
 
+    if activation_type is not None:
+        from flashinfer.fused_moe.core import ActivationType
+
+        kwargs["activation_type"] = ActivationType(activation_type)
+
     return trtllm_fp8_block_scale_routed_moe(**kwargs)
 
 
@@ -210,6 +224,7 @@ def _fake_fp8_per_tensor_scale_moe(
     routing_method_type: int = 0,
     enable_pdl: Optional[bool] = None,
     tune_max_num_tokens: int = 8192,
+    activation_type: Optional[int] = None,
 ) -> torch.Tensor:
     return torch.empty(
         hidden_states.shape, dtype=torch.bfloat16, device=hidden_states.device
@@ -238,6 +253,7 @@ def trtllm_fp8_per_tensor_scale_moe_wrapper(
     routing_method_type: int = 0,
     enable_pdl: Optional[bool] = None,
     tune_max_num_tokens: int = 8192,
+    activation_type: Optional[int] = None,
 ) -> torch.Tensor:
     # lazy import
     try:
@@ -270,5 +286,10 @@ def trtllm_fp8_per_tensor_scale_moe_wrapper(
         "enable_pdl": enable_pdl,
         "tune_max_num_tokens": tune_max_num_tokens,
     }
+
+    if activation_type is not None:
+        from flashinfer.fused_moe.core import ActivationType
+
+        kwargs["activation_type"] = ActivationType(activation_type)
 
     return trtllm_fp8_per_tensor_scale_moe(**kwargs)

@@ -18,7 +18,7 @@ def compare_topk_values(gating_output, topk_indices_ref, topk_indices):
         itertools.product(
             [1, 16, 128, 512, 1024, 2048],  # num_tokens
             [512],  # num_experts
-            [1, 2, 3, 4, 5, 8],  # topk
+            [1, 2, 3, 4, 5, 8, 10],  # topk
         )
     ),
 )

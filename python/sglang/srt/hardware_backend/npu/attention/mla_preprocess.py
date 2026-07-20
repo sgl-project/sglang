@@ -6,6 +6,10 @@ import torch
 import torch.nn.functional as F
 
 from sglang.srt.hardware_backend.npu.utils import npu_format_cast
+from sglang.srt.model_executor.forward_context import (
+    get_attn_backend,
+    get_token_to_kv_pool,
+)
 from sglang.srt.utils import get_bool_env_var
 
 if TYPE_CHECKING:
@@ -253,7 +257,7 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
         return cos, sin
 
     def get_kv_cache_and_cache_idx(self, forward_batch):
-        k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(self.layer_id)
+        k_cache, v_cache = get_token_to_kv_pool().get_kv_buffer(self.layer_id)
         slot_mapping = forward_batch.out_cache_loc.to(dtype=torch.int32)
         return k_cache, v_cache, slot_mapping
 
@@ -314,15 +318,15 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
         cache_mode = "PA_NZ" if is_fia_nz() else "PA_BNSD"
         self.kvCache = self.kvCache.view(
             -1,
-            forward_batch.attn_backend.page_size,
+            get_attn_backend().page_size,
             1,
-            forward_batch.attn_backend.kv_lora_rank,
+            get_attn_backend().kv_lora_rank,
         )
         self.kvCacheRope = self.kvCacheRope.view(
             -1,
-            forward_batch.attn_backend.page_size,
+            get_attn_backend().page_size,
             1,
-            forward_batch.attn_backend.qk_rope_head_dim,
+            get_attn_backend().qk_rope_head_dim,
         )
         k_rope, k_nope, _, _ = torch.ops.npu.npu_kv_rmsnorm_rope_cache(
             latent_cache,

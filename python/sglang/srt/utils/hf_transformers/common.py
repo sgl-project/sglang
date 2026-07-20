@@ -32,27 +32,41 @@ from sglang.srt.configs import (
     ExaoneConfig,
     FalconH1Config,
     GraniteMoeHybridConfig,
+    InklingAudioConfig,
+    InklingMMConfig,
+    InklingModelConfig,
+    InklingVisionConfig,
+    InternS2PreviewConfig,
     JetNemotronConfig,
     JetVLMConfig,
     KimiK25Config,
     KimiLinearConfig,
     KimiVLConfig,
+    LagunaConfig,
+    LocateAnythingConfig,
     LongcatFlashConfig,
+    MiniCPMV4_6Config,
+    MiniCPMV4_6VisionConfig,
+    MiniMaxM3VLConfig,
     MultiModalityConfig,
+    NemotronH_Nano_Omni_Reasoning_V3_Config,
     NemotronH_Nano_VL_V2_Config,
     NemotronHConfig,
+    NemotronHPuzzleConfig,
     Olmo3Config,
     Qwen3_5Config,
     Qwen3_5MoeConfig,
     Qwen3NextConfig,
     Step3p5Config,
+    Step3p7Config,
     Step3VLConfig,
 )
 from sglang.srt.configs.deepseek_ocr import DeepseekVLV2Config
 from sglang.srt.configs.internvl import InternVLChatConfig
 from sglang.srt.utils import get_bool_env_var, logger, lru_cache_frozenset
+from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
 
-from .compat import normalize_rope_scaling_compat
+from ..hf_transformers_patches import normalize_rope_scaling_compat
 
 if get_bool_env_var("SGLANG_USE_MODELSCOPE"):
     from modelscope import AutoConfig, GenerationConfig
@@ -76,7 +90,9 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
         DeepseekVL2Config,
         MultiModalityConfig,
         KimiVLConfig,
+        LocateAnythingConfig,
         InternVLChatConfig,
+        LagunaConfig,
         Step3VLConfig,
         LongcatFlashConfig,
         Olmo3Config,
@@ -87,16 +103,92 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
         DotsVLMConfig,
         DotsOCRConfig,
         NemotronH_Nano_VL_V2_Config,
+        NemotronH_Nano_Omni_Reasoning_V3_Config,
         NemotronHConfig,
+        NemotronHPuzzleConfig,
         DeepseekVLV2Config,
         Qwen3_5Config,
         Qwen3_5MoeConfig,
+        InternS2PreviewConfig,
         JetNemotronConfig,
         JetVLMConfig,
         KimiK25Config,
         Step3p5Config,
+        Step3p7Config,
+        MiniCPMV4_6Config,
+        MiniCPMV4_6VisionConfig,
+        InklingModelConfig,
+        InklingAudioConfig,
+        InklingVisionConfig,
+        InklingMMConfig,
+        MiniMaxM3VLConfig,
     ]
 }
+
+# DeepSeek V3.2 / V4 reuse the V3 config schema. Subclass the upstream
+# transformers class with each model_type so AutoConfig.register passes its
+# consistency check (which requires class.model_type == registered key).
+# Default-value divergences (e.g. V4's topk_group) are handled in
+# model_config.py post-load.
+try:
+    from transformers import DeepseekV3Config as _HFDeepseekV3Config
+
+    class _DeepseekV32ConfigAlias(_HFDeepseekV3Config):
+        model_type = "deepseek_v32"
+
+    class _DeepseekV4ConfigAlias(_HFDeepseekV3Config):
+        model_type = "deepseek_v4"
+
+    _CONFIG_REGISTRY["deepseek_v32"] = _DeepseekV32ConfigAlias
+    _CONFIG_REGISTRY["deepseek_v4"] = _DeepseekV4ConfigAlias
+
+    # For kimi_k25_eagle3
+    class _KimiK2ConfigAlias(_HFDeepseekV3Config):
+        model_type = "kimi_k2"
+
+    _CONFIG_REGISTRY["kimi_k2"] = _KimiK2ConfigAlias
+except ImportError:
+    pass
+
+# Newer transformers versions (>=5.10.2) expose MellumConfig directly,
+# but fallback to Qwen3MoeConfig for older versions.
+try:
+    import transformers as _hf_transformers
+
+    _HFMellumConfig = getattr(_hf_transformers, "MellumConfig", None)
+
+    if _HFMellumConfig is not None:
+        _CONFIG_REGISTRY["mellum"] = _HFMellumConfig
+    else:
+        from transformers import Qwen3MoeConfig as _HFQwen3MoeConfig
+
+        class _MellumConfigAlias(_HFQwen3MoeConfig):
+            model_type = "mellum"
+
+            def __post_init__(self, **kwargs):
+                # Qwen3MoeConfig.__post_init__ wipes sliding_window unless
+                # use_sliding_window=True. Mellum gates sliding attention
+                # per-layer via layer_types, so preserve sliding_window
+                # regardless of the legacy use_sliding_window flag.
+                sliding_window = getattr(self, "sliding_window", None)
+                super().__post_init__(**kwargs)
+                self.sliding_window = sliding_window
+
+        _CONFIG_REGISTRY["mellum"] = _MellumConfigAlias
+
+except ImportError:
+    pass
+
+
+try:
+    from transformers import Gemma4Config as _HFGemma4Config
+
+    class _Gemma4UnifiedConfigAlias(_HFGemma4Config):
+        model_type = "gemma4_unified"
+
+    _CONFIG_REGISTRY["gemma4_unified"] = _Gemma4UnifiedConfigAlias
+except ImportError:
+    pass
 
 for name, cls in _CONFIG_REGISTRY.items():
     try:
@@ -125,6 +217,12 @@ def download_from_hf(
     return snapshot_download(model_path, allow_patterns=allow_patterns)
 
 
+def resolve_runai_obj_uri(model_name_or_path: str) -> str:
+    if is_runai_obj_uri(model_name_or_path):
+        return ObjectStorageModel.get_path(model_name_or_path)
+    return model_name_or_path
+
+
 def _resolve_local_or_cached_file(model_name_or_path, filename, revision=None):
     """Resolve a file from a local directory or HF hub cache (no network)."""
     local_path = Path(model_name_or_path) / filename
@@ -135,6 +233,33 @@ def _resolve_local_or_cached_file(model_name_or_path, filename, revision=None):
     return hf_hub_download(
         model_name_or_path, filename, revision=revision, local_files_only=True
     )
+
+
+def _cached_file_exists(model_name_or_path, filename, revision=None) -> bool:
+    """Whether *filename* is available locally or in the HF cache (no network)."""
+    try:
+        _resolve_local_or_cached_file(model_name_or_path, filename, revision)
+        return True
+    except Exception:
+        return False
+
+
+def _remote_file_exists(repo_id, filename, revision=None) -> bool:
+    """Whether *filename* exists on the HF hub (HEAD request only, no download).
+
+    Returns False on any error (offline, gated, network, invalid id) so callers
+    fall back to their default path instead of crashing.
+    """
+    from huggingface_hub.constants import HF_HUB_OFFLINE
+
+    if HF_HUB_OFFLINE:
+        return False
+    try:
+        from huggingface_hub import HfApi
+
+        return HfApi().file_exists(repo_id, filename, revision=revision)
+    except Exception:
+        return False
 
 
 def check_gguf_file(model: Union[str, os.PathLike]) -> bool:
@@ -169,7 +294,7 @@ def get_rope_config(config):
     rope_params = getattr(config, "rope_parameters", None)
     if rope_params is not None:
         return rope_params["rope_theta"], rope_params
-    return config.rope_theta, getattr(config, "rope_scaling", None)
+    return getattr(config, "rope_theta", 10000), getattr(config, "rope_scaling", None)
 
 
 def _patch_text_config(parent_config: PretrainedConfig, text_config):
@@ -217,17 +342,22 @@ def get_hf_text_config(config: PretrainedConfig):
 
     # Some models (e.g. DeepSeek-OCR) store sub-configs as plain dicts.
     # Convert to PretrainedConfig early so hasattr() checks and asserts work.
-    parent_dtype = getattr(config, "torch_dtype", None)
+    parent_dtype = getattr(config, "dtype", None)
     for _attr in ("text_config", "llm_config", "language_config", "thinker_config"):
         _sub = getattr(config, _attr, None)
         if isinstance(_sub, dict):
             _converted = PretrainedConfig(**_sub)
-            if (
-                getattr(_converted, "torch_dtype", None) is None
-                and parent_dtype is not None
-            ):
-                _converted.torch_dtype = parent_dtype
+            if getattr(_converted, "dtype", None) is None and parent_dtype is not None:
+                _converted.dtype = parent_dtype
             setattr(config, _attr, _converted)
+        elif _sub is not None and parent_dtype is not None:
+            # transformers v5 multimodal configs (e.g. Mistral3Config) carry
+            # `dtype` only on the top-level config, leaving the sub-configs at
+            # None. Without this, _get_and_verify_dtype falls back to float32
+            # and then "auto" downcasts to float16, which overflows the Pixtral
+            # vision tower on real images and produces NaN features.
+            if getattr(_sub, "dtype", None) is None:
+                _sub.dtype = parent_dtype
 
     # Priority: thinker_config > llm_config > language_config > text_config
     if hasattr(config, "thinker_config"):
@@ -236,8 +366,8 @@ def get_hf_text_config(config: PretrainedConfig):
         if hasattr(thinker_config, "text_config"):
             setattr(
                 thinker_config.text_config,
-                "torch_dtype",
-                getattr(thinker_config, "torch_dtype", None),
+                "dtype",
+                getattr(thinker_config, "dtype", None),
             )
             text_config = thinker_config.text_config
         else:
@@ -305,37 +435,6 @@ def _override_v_head_dim_if_zero(config: PretrainedConfig, patch: int = 128) -> 
         logger.warning(
             f"Overriding v_head_dim from 0 to {patch} to avoid potential issues."
         )
-
-
-def _load_deepseek_v32_model(
-    model_path: str,
-    trust_remote_code: bool = False,
-    revision: Optional[str] = None,
-    **kwargs,
-):
-    import tempfile
-
-    local_path = download_from_hf(model_path)
-    config_file = os.path.join(local_path, "config.json")
-    if not os.path.exists(config_file):
-        raise RuntimeError(f"Can't find config file in {local_path}.")
-
-    with open(config_file, "r") as f:
-        config_json = json.load(f)
-
-    config_json["architectures"] = ["DeepseekV3ForCausalLM"]
-    config_json["model_type"] = "deepseek_v3"
-
-    tmp_path = os.path.join(tempfile.gettempdir(), "_tmp_config_folder")
-    os.makedirs(tmp_path, exist_ok=True)
-
-    unique_path = os.path.join(tmp_path, f"deepseek_v32_{os.getpid()}")
-    with open(unique_path, "w") as f:
-        json.dump(config_json, f)
-
-    return AutoConfig.from_pretrained(
-        unique_path, trust_remote_code=trust_remote_code, revision=revision, **kwargs
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -430,9 +529,13 @@ def get_tokenizer_from_processor(processor):
     return processor.tokenizer
 
 
+# Turn-final markers that some checkpoints ship without EOS metadata:
+# <|eom_id|> (Llama-3 tool use) and <|content_model_end_sampling|> (Inkling,
+# whose bundled tokenizer config leaves eos_token unset).
+_ADDITIONAL_STOP_TOKEN_TEXTS = ("<|eom_id|>", "<|content_model_end_sampling|>")
+
+
 def attach_additional_stop_token_ids(tokenizer):
     added = tokenizer.get_added_vocab()
-    if "<|eom_id|>" in added:
-        tokenizer.additional_stop_token_ids = {added["<|eom_id|>"]}
-    else:
-        tokenizer.additional_stop_token_ids = None
+    stop_ids = {added[text] for text in _ADDITIONAL_STOP_TOKEN_TEXTS if text in added}
+    tokenizer.additional_stop_token_ids = stop_ids or None

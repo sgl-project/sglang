@@ -7,11 +7,8 @@ from torch import nn
 
 from sglang.srt.distributed import (
     get_pp_group,
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
 )
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
-from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import QKVParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -22,7 +19,13 @@ from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.rotary_embedding.mrope import MRotaryEmbedding
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    Phase,
+    check_cuda_graph_backend,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
@@ -30,7 +33,7 @@ from sglang.srt.model_loader.weight_utils import (
 from sglang.srt.models.qwen2 import Qwen2MLP as Qwen3MLP
 from sglang.srt.models.qwen2 import Qwen2Model
 from sglang.srt.models.utils import apply_qk_norm
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_parallel, get_server_args, get_stream
 from sglang.srt.utils import add_prefix, get_bool_env_var, is_cuda, is_hip, is_npu
 
 Qwen3Config = None
@@ -64,6 +67,7 @@ class Qwen3Attention(nn.Module):
         num_heads: int,
         num_kv_heads: int,
         layer_id: int = 0,
+        start_layer: int = 0,
         rope_theta: float = 1000000,
         rope_scaling: Optional[Dict[str, Any]] = None,
         head_dim: Optional[int] = None,
@@ -76,10 +80,11 @@ class Qwen3Attention(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
-        self.tp_size = get_tensor_model_parallel_world_size()
+        self.start_layer = start_layer
+        self.tp_size = get_parallel().tp_size
         self.total_num_heads = num_heads
-        attn_tp_rank = get_attention_tp_rank()
-        attn_tp_size = get_attention_tp_size()
+        attn_tp_rank = get_parallel().attn_tp_rank
+        attn_tp_size = get_parallel().attn_tp_size
 
         assert self.total_num_heads % attn_tp_size == 0
         self.num_heads = self.total_num_heads // attn_tp_size
@@ -99,14 +104,14 @@ class Qwen3Attention(nn.Module):
         self.scaling = self.head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
-        self.tp_rank = get_tensor_model_parallel_rank()
+        self.tp_rank = get_parallel().tp_rank
 
         norm_kwargs = (
             dict(
                 weight_dtype=torch.float32,
                 cast_x_before_out_mul=True,
             )
-            if get_global_server_args().rl_on_policy_target is not None
+            if get_server_args().rl_on_policy_target is not None
             else {}
         )
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps, **norm_kwargs)
@@ -181,7 +186,7 @@ class Qwen3Attention(nn.Module):
     def forward_prepare_npu(self, positions, hidden_states, forward_batch):
         qkv, _ = self.qkv_proj(hidden_states)
 
-        if self.attn.layer_id == forward_batch.token_to_kv_pool.start_layer:
+        if self.attn.layer_id == self.start_layer:
             self.rotary_emb.get_cos_sin_with_position(positions)
         q, k, v = split_qkv_rmsnorm_rope(
             qkv,
@@ -212,7 +217,7 @@ class Qwen3Attention(nn.Module):
 
         qkv_3d = qkv.view(num_tokens, -1, self.head_dim)
 
-        token_to_kv_pool = forward_batch.token_to_kv_pool
+        token_to_kv_pool = get_token_to_kv_pool()
         k_cache, v_cache = token_to_kv_pool.get_kv_buffer(self.attn.layer_id)
         slot_mapping = forward_batch.out_cache_loc
 
@@ -266,14 +271,14 @@ class Qwen3Attention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        if get_global_server_args().rl_on_policy_target is not None:
+        if get_server_args().rl_on_policy_target is not None:
             hidden_states = hidden_states.bfloat16()
 
         save_kv_cache = True
         use_aiter_fused = (
             self.use_fused_qk_norm_mrope
             and forward_batch.forward_mode.is_decode()
-            and get_global_server_args().rl_on_policy_target is None
+            and get_server_args().rl_on_policy_target is None
         )
 
         if use_aiter_fused:
@@ -281,10 +286,7 @@ class Qwen3Attention(nn.Module):
                 positions, hidden_states, forward_batch
             )
             save_kv_cache = False
-        elif (
-            not _is_npu
-            or forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
-        ):
+        elif not _is_npu:
             q, k, v = self.forward_prepare_native(
                 positions=positions,
                 hidden_states=hidden_states,
@@ -296,7 +298,7 @@ class Qwen3Attention(nn.Module):
                 forward_batch=forward_batch,
             )
 
-        if get_global_server_args().rl_on_policy_target is not None:
+        if get_server_args().rl_on_policy_target is not None:
             q = q.to(torch.bfloat16)
             k = k.to(torch.bfloat16)
 
@@ -310,6 +312,7 @@ class Qwen3DecoderLayer(nn.Module):
         self,
         config: Qwen3Config,
         layer_id: int = 0,
+        start_layer: int = 0,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
@@ -333,6 +336,7 @@ class Qwen3DecoderLayer(nn.Module):
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
             layer_id=layer_id,
+            start_layer=start_layer,
             rope_theta=rope_theta,
             rope_scaling=rope_scaling,
             head_dim=head_dim,
@@ -358,7 +362,7 @@ class Qwen3DecoderLayer(nn.Module):
                 override_orig_dtype=torch.float32,
                 fp32_residual=True,
             )
-            if get_global_server_args().rl_on_policy_target is not None
+            if get_server_args().rl_on_policy_target is not None
             else {}
         )
         self.input_layernorm = RMSNorm(
@@ -411,7 +415,7 @@ class Qwen3DecoderLayer(nn.Module):
             cache=(
                 [self.mlp.gate_up_proj.weight, self.mlp.down_proj.weight]
                 if _is_npu
-                and not get_global_server_args().disable_piecewise_cuda_graph
+                and check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
                 and (
                     hasattr(self.mlp.gate_up_proj, "weight")
                     and hasattr(self.mlp.down_proj, "weight")
@@ -419,7 +423,7 @@ class Qwen3DecoderLayer(nn.Module):
                 else None
             ),
         )
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp(hidden_states, forward_batch=forward_batch)
         if _is_npu and get_cmo_stream():
             wait_cmo_stream()
         hidden_states, residual = self.layer_communicator.postprocess_layer(
@@ -435,7 +439,7 @@ class Qwen3Model(Qwen2Model):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
-        alt_stream = torch.cuda.Stream() if _is_cuda else None
+        alt_stream = get_stream("alt") if _is_cuda else None
         super().__init__(
             config=config,
             quant_config=quant_config,
@@ -488,7 +492,7 @@ class Qwen3ForCausalLM(nn.Module):
                     config.vocab_size,
                     config.hidden_size,
                     quant_config=quant_config,
-                    use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+                    use_attn_tp_group=get_server_args().enable_dp_lm_head,
                     prefix=add_prefix("lm_head", prefix),
                 )
         else:
@@ -669,8 +673,10 @@ class Qwen3ForCausalLM(nn.Module):
         return self.model.embed_tokens.weight, self.lm_head.weight
 
     def set_embed_and_head(self, embed, head):
-        del self.model.embed_tokens.weight
-        del self.lm_head.weight
+        if hasattr(self.model.embed_tokens, "weight"):
+            del self.model.embed_tokens.weight
+        if hasattr(self.lm_head, "weight"):
+            del self.lm_head.weight
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
         torch.cuda.empty_cache()

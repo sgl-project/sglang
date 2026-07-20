@@ -2,7 +2,7 @@
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
 import types
 import unittest
@@ -10,14 +10,16 @@ import unittest
 import torch
 
 from sglang.srt.eplb.expert_location import (
+    _compute_logical_to_all_physical_map,
+    append_trivial_expert_slots,
     compute_logical_to_rank_dispatch_physical_map,
 )
 from sglang.test.test_utils import CustomTestCase
 
 
 def _make_server_args(ep_size: int, nnodes: int):
-    """Minimal server_args stub — only ep_size and nnodes are used."""
-    return types.SimpleNamespace(ep_size=ep_size, nnodes=nnodes)
+    """Minimal server_args stub for expert placement tests."""
+    return types.SimpleNamespace(ep_size=ep_size, nnodes=nnodes, ep_join_mode=None)
 
 
 def _make_logical_to_all_physical_map(
@@ -98,15 +100,6 @@ class TestComputeLogicalToRankDispatchPhysicalMap(CustomTestCase):
             self.assertTrue(
                 torch.all(result < self.NUM_PHYSICAL),
                 f"ep_rank={ep_rank} has out-of-range values",
-            )
-
-    def test_no_minus_one_in_output(self):
-        """No -1 sentinel values remain in the output (all ranks are assigned)."""
-        for ep_rank in range(self.EP_SIZE):
-            result = self._call(ep_rank=ep_rank)
-            self.assertFalse(
-                torch.any(result == -1),
-                f"ep_rank={ep_rank} still has unassigned entries",
             )
 
     # ------------------------------------------------------------------ correctness
@@ -202,6 +195,24 @@ class TestComputeLogicalToRankDispatchPhysicalMap(CustomTestCase):
         )
         self.assertEqual(result.shape, (self.NUM_LAYERS, 1))
         self.assertTrue(torch.all(result >= 0))
+
+    def test_scale_joiner_maps_appended_expert_slots(self):
+        physical_to_logical = torch.arange(64).unsqueeze(0)
+        physical_to_logical = append_trivial_expert_slots(
+            physical_to_logical, count=16, num_logical_experts=64
+        )
+        server_args = _make_server_args(ep_size=5, nnodes=1)
+        server_args.ep_join_mode = "scale"
+
+        logical_to_physical = _compute_logical_to_all_physical_map(
+            server_args=server_args,
+            physical_to_logical_map=physical_to_logical,
+            num_logical_experts=64,
+            ep_size=5,
+            moe_ep_rank=4,
+        )
+
+        self.assertEqual(logical_to_physical[0, :16, 0].tolist(), list(range(64, 80)))
 
 
 if __name__ == "__main__":

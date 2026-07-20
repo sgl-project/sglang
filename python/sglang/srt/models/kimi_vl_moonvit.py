@@ -61,10 +61,18 @@ except ImportError:
 
 from sglang.srt.configs import MoonViTConfig
 from sglang.srt.layers.conv import Conv2dLayer
-from sglang.srt.layers.linear import ReplicatedLinear
+from sglang.srt.layers.linear import (
+    ColumnParallelLinear,
+    QKVParallelLinear,
+    ReplicatedLinear,
+    RowParallelLinear,
+)
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
-from sglang.srt.utils import add_prefix
+from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils import add_prefix, get_device
+
+_MAX_INFERENCE_POS_EMB_CACHE_ENTRIES = 256
 
 
 @debug_kernel_api
@@ -74,6 +82,7 @@ def multihead_attention(
     v: torch.Tensor,
     q_cu_seqlens: Optional[torch.Tensor] = None,
     k_cu_seqlens: Optional[torch.Tensor] = None,
+    max_seqlen: Optional[int] = None,
 ):
     """Multi-head attention using flash attention 2.
     This function is used to handle the case where the query, key, and value are packed.
@@ -94,25 +103,28 @@ def multihead_attention(
         )
     # Unified format legal check
     assert q.dim() == k.dim() == v.dim() == 3, "q, k, v must have 3 dims"
-    assert q_cu_seqlens[-1] == q.shape[0], "q_cu_seqlens must sum to q.shape[0]"
-    assert (
-        k_cu_seqlens[-1] == k.shape[0] == v.shape[0]
-    ), "k_cu_seqlens must sum to k.shape[0]"
+    # Keep validation on CPU for debugging, but avoid synchronizing the GPU
+    # once per MoonViT layer in the normal packed CUDA path.
+    if not q_cu_seqlens.is_cuda:
+        assert q_cu_seqlens[-1] == q.shape[0], "q_cu_seqlens must sum to q.shape[0]"
+        assert (
+            k_cu_seqlens[-1] == k.shape[0] == v.shape[0]
+        ), "k_cu_seqlens must sum to k.shape[0]"
     assert q.dtype in [
         torch.bfloat16,
         torch.float16,
     ], f"unsupported dtype {q.dtype} for multihead attn"
 
-    max_seqlen_q = (q_cu_seqlens[1:] - q_cu_seqlens[:-1]).max().item()
-    max_seqlen_k = (k_cu_seqlens[1:] - k_cu_seqlens[:-1]).max().item()
+    if max_seqlen is None:
+        max_seqlen = (q_cu_seqlens[1:] - q_cu_seqlens[:-1]).max().item()
     attn_out = flash_attn_varlen_func(
         q,
         k,
         v,
         q_cu_seqlens,
         k_cu_seqlens,
-        max_seqlen_q,
-        max_seqlen_k,
+        max_seqlen,
+        max_seqlen,
         causal=False,
     )
     attn_out = attn_out.flatten(start_dim=-2)
@@ -126,6 +138,7 @@ def sdpa_attention(
     v: torch.Tensor,
     q_cu_seqlens: Optional[torch.Tensor] = None,
     k_cu_seqlens: Optional[torch.Tensor] = None,
+    max_seqlen: Optional[int] = None,
 ) -> torch.Tensor:
     """Multi-head attention using torch scaled dot product attention.
     This function is used to handle the case where the query, key, and value are packed.
@@ -208,6 +221,13 @@ class Learnable2DInterpPosEmb(nn.Module):
         self.width = width
         self.interpolation_mode = interpolation_mode
         self.weight = nn.Parameter(torch.empty(height, width, dim))
+        # In serving, MoonViT weights are immutable and image grids commonly
+        # repeat. Avoid launching bicubic interpolation for every request.
+        # Keep this as a plain cache (rather than a buffer) so it is neither
+        # serialized nor used during training.
+        self._interpolated_pos_emb_cache: dict[
+            tuple[tuple[int, int], torch.dtype, torch.device], torch.Tensor
+        ] = {}
         self.reset_parameters()
 
     def reset_parameters(self):
@@ -216,19 +236,33 @@ class Learnable2DInterpPosEmb(nn.Module):
     def forward(self, x: torch.Tensor, grid_hws: torch.Tensor) -> torch.Tensor:
         pos_embs = []
         for shape in grid_hws.tolist():
+            shape = tuple(shape)
             if shape == self.weight.shape[:-1]:
                 pos_embs.append(self.weight.flatten(end_dim=1))
             else:
-                pos_embs.append(
-                    F.interpolate(
-                        self.weight.permute((2, 0, 1)).unsqueeze(0),
-                        size=shape,
-                        mode=self.interpolation_mode,
+                cache_key = (shape, self.weight.dtype, self.weight.device)
+                pos_emb = self._interpolated_pos_emb_cache.get(cache_key)
+                if pos_emb is None:
+                    pos_emb = (
+                        F.interpolate(
+                            self.weight.permute((2, 0, 1)).unsqueeze(0),
+                            size=shape,
+                            mode=self.interpolation_mode,
+                        )
+                        .squeeze(0)
+                        .permute((1, 2, 0))
+                        .flatten(end_dim=1)
                     )
-                    .squeeze(0)
-                    .permute((1, 2, 0))
-                    .flatten(end_dim=1)
-                )
+                    if not self.training:
+                        if (
+                            len(self._interpolated_pos_emb_cache)
+                            >= _MAX_INFERENCE_POS_EMB_CACHE_ENTRIES
+                        ):
+                            self._interpolated_pos_emb_cache.pop(
+                                next(iter(self._interpolated_pos_emb_cache))
+                            )
+                        self._interpolated_pos_emb_cache[cache_key] = pos_emb
+                pos_embs.append(pos_emb)
         out = x + torch.cat(pos_embs)
         return out
 
@@ -300,7 +334,7 @@ class Rope2DPosEmb(nn.Module):
     """
 
     def __init__(
-        self, dim: int, max_height: int, max_width: int, theta_base=10000, device="cuda"
+        self, dim: int, max_height: int, max_width: int, theta_base=10000, device=None
     ):
         super().__init__()
         self.dim = dim
@@ -308,7 +342,7 @@ class Rope2DPosEmb(nn.Module):
         self.max_height = max_height
         self.max_width = max_width
         self.theta_base = theta_base
-        self.device = device
+        self.device = device if device is not None else get_device()
 
     def extra_repr(self):
         return f"dim={self.dim}, max_height={self.max_height}, max_width={self.max_width}, theta_base={self.theta_base}"
@@ -408,11 +442,16 @@ class MLP2(nn.Module):
         bias: bool = True,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        use_data_parallel: bool = False,
+        use_tensor_parallel: bool = False,
     ):
         super().__init__()
         assert len(dims) == 3
 
         self.quant_config = quant_config
+        use_tensor_parallel = use_tensor_parallel and not use_data_parallel
+        tp_size = get_parallel().attn_tp_size if use_tensor_parallel else 1
+        tp_rank = get_parallel().attn_tp_rank if use_tensor_parallel else 0
         if isinstance(self.quant_config, ModelSlimConfig):
             self.fc0 = ReplicatedLinear(
                 dims[0],
@@ -428,6 +467,23 @@ class MLP2(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("fc1", prefix),
             )
+        elif use_tensor_parallel:
+            self.fc0 = ColumnParallelLinear(
+                dims[0],
+                dims[1],
+                bias=bias,
+                prefix=add_prefix("fc0", prefix),
+                tp_rank=tp_rank,
+                tp_size=tp_size,
+            )
+            self.fc1 = RowParallelLinear(
+                dims[1],
+                dims[2],
+                bias=bias,
+                prefix=add_prefix("fc1", prefix),
+                tp_rank=tp_rank,
+                tp_size=tp_size,
+            )
         else:
             self.fc0 = nn.Linear(dims[0], dims[1], bias=bias)
             self.fc1 = nn.Linear(dims[1], dims[2], bias=bias)
@@ -440,6 +496,10 @@ class MLP2(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if isinstance(self.quant_config, ModelSlimConfig):
             x = x.flatten(0, 1)
+            x, _ = self.fc0(x)
+            x = self.activation(x)
+            x, _ = self.fc1(x)
+        elif isinstance(self.fc0, ColumnParallelLinear):
             x, _ = self.fc0(x)
             x = self.activation(x)
             x, _ = self.fc1(x)
@@ -461,6 +521,9 @@ class MoonVitEncoderLayer(nn.Module):
         attn_implementation: str = "flash_attention_2",  # use fa2 in sglang by default
         activation=F.gelu,
         attn_bias: bool = False,
+        prefix: str = "",
+        use_data_parallel: bool = False,
+        use_tensor_parallel: bool = False,
     ):
         super().__init__()
         self.num_heads = num_heads
@@ -468,28 +531,63 @@ class MoonVitEncoderLayer(nn.Module):
         self.hidden_size_per_attention_head = self.hidden_dim // self.num_heads
         self.attn_implementation = attn_implementation
 
+        self.use_tensor_parallel = use_tensor_parallel and not use_data_parallel
+        tp_size = get_parallel().attn_tp_size if self.use_tensor_parallel else 1
+        tp_rank = get_parallel().attn_tp_rank if self.use_tensor_parallel else 0
+        self.num_attention_heads_per_partition = self.num_heads // tp_size
+
         self.norm0 = nn.LayerNorm(hidden_dim)
         self.norm1 = nn.LayerNorm(hidden_dim)
-        self.mlp = MLP2([hidden_dim, mlp_dim, hidden_dim], activation)
-        self.wqkv = nn.Linear(hidden_dim, hidden_dim * 3, bias=attn_bias)
-        self.wo = nn.Linear(hidden_dim, hidden_dim, bias=attn_bias)
+        self.mlp = MLP2(
+            [hidden_dim, mlp_dim, hidden_dim],
+            activation,
+            prefix=add_prefix("mlp", prefix),
+            use_data_parallel=use_data_parallel,
+            use_tensor_parallel=self.use_tensor_parallel,
+        )
+        if self.use_tensor_parallel:
+            self.wqkv = QKVParallelLinear(
+                hidden_size=hidden_dim,
+                head_size=self.hidden_size_per_attention_head,
+                total_num_heads=num_heads,
+                total_num_kv_heads=num_heads,
+                bias=attn_bias,
+                prefix=add_prefix("wqkv", prefix),
+                tp_rank=tp_rank,
+                tp_size=tp_size,
+            )
+            self.wo = RowParallelLinear(
+                hidden_dim,
+                hidden_dim,
+                bias=attn_bias,
+                prefix=add_prefix("wo", prefix),
+                tp_rank=tp_rank,
+                tp_size=tp_size,
+            )
+        else:
+            self.wqkv = nn.Linear(hidden_dim, hidden_dim * 3, bias=attn_bias)
+            self.wo = nn.Linear(hidden_dim, hidden_dim, bias=attn_bias)
 
     def attention_qkvpacked(
         self,
         x: torch.Tensor,
         cu_seqlens: torch.Tensor,
         rope_freqs_cis: Optional[torch.Tensor] = None,
+        max_seqlen: Optional[int] = None,
     ):
         """
         Args:
             x (torch.Tensor): (batch_size, seqlen, hidden_dim)
             cu_seqlens (torch.Tensor):
         """
-        xqkv = self.wqkv(x)
+        if self.use_tensor_parallel:
+            xqkv, _ = self.wqkv(x)
+        else:
+            xqkv = self.wqkv(x)
 
         qkv_shape = xqkv.size()[:-1] + (
             3,
-            self.num_heads,
+            self.num_attention_heads_per_partition,
             self.hidden_size_per_attention_head,
         )
         # xqkv: (batch_size, seqlen, 3, nheads, headdim)
@@ -500,10 +598,18 @@ class MoonVitEncoderLayer(nn.Module):
 
         attn_func = VL_VISION_ATTENTION_FUNCTIONS[self.attn_implementation]
         attn_out = attn_func(
-            xq, xk, xv, q_cu_seqlens=cu_seqlens, k_cu_seqlens=cu_seqlens
+            xq,
+            xk,
+            xv,
+            q_cu_seqlens=cu_seqlens,
+            k_cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
         )
 
-        attn_out = self.wo(attn_out)
+        if self.use_tensor_parallel:
+            attn_out, _ = self.wo(attn_out)
+        else:
+            attn_out = self.wo(attn_out)
         return attn_out
 
     def forward(
@@ -511,6 +617,7 @@ class MoonVitEncoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         cu_seqlens: torch.Tensor,
         rope_freqs_cis: Union[torch.Tensor, None] = None,
+        max_seqlen: Optional[int] = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -522,7 +629,10 @@ class MoonVitEncoderLayer(nn.Module):
         residual = hidden_states
         hidden_states = self.norm0(hidden_states)
         attn_out = self.attention_qkvpacked(
-            hidden_states, cu_seqlens, rope_freqs_cis=rope_freqs_cis
+            hidden_states,
+            cu_seqlens,
+            rope_freqs_cis=rope_freqs_cis,
+            max_seqlen=max_seqlen,
         )
         hidden_states = residual + attn_out
 
@@ -539,6 +649,9 @@ class MoonVitEncoder(nn.Module):
         hidden_dim: int,
         num_layers: int,
         block_cfg: dict,
+        prefix: str = "",
+        use_data_parallel: bool = False,
+        use_tensor_parallel: bool = False,
     ) -> None:
         super().__init__()
 
@@ -546,12 +659,23 @@ class MoonVitEncoder(nn.Module):
             block_cfg["hidden_dim"] // block_cfg["num_heads"], 512, 512
         )
         self.blocks = nn.ModuleList(
-            [MoonVitEncoderLayer(**block_cfg) for _ in range(num_layers)]
+            [
+                MoonVitEncoderLayer(
+                    prefix=add_prefix(f"blocks.{layer_idx}", prefix),
+                    use_data_parallel=use_data_parallel,
+                    use_tensor_parallel=use_tensor_parallel,
+                    **block_cfg,
+                )
+                for layer_idx in range(num_layers)
+            ]
         )
         self.final_layernorm = nn.LayerNorm(hidden_dim)
 
     def forward(
-        self, hidden_states: torch.Tensor, grid_hw: torch.Tensor
+        self,
+        hidden_states: torch.Tensor,
+        grid_hw: torch.Tensor,
+        max_seqlen: Optional[int] = None,
     ) -> torch.Tensor:
         rope_freqs_cis = self.rope_2d.get_freqs_cis_by_seqlens(grid_hws=grid_hw)
 
@@ -562,10 +686,15 @@ class MoonVitEncoder(nn.Module):
             )
         )
         cu_seqlens = lengths.cumsum(dim=0, dtype=torch.int32)
+        if max_seqlen is None:
+            max_seqlen = (grid_hw[:, 0] * grid_hw[:, 1]).max().item()
 
         for _, block in enumerate(self.blocks):
             hidden_states = block(
-                hidden_states, cu_seqlens, rope_freqs_cis=rope_freqs_cis
+                hidden_states,
+                cu_seqlens,
+                rope_freqs_cis=rope_freqs_cis,
+                max_seqlen=max_seqlen,
             )
 
         hidden_states = self.final_layernorm(hidden_states)
@@ -635,7 +764,15 @@ class MoonVitPretrainedModel(PreTrainedModel):
     _supports_flash_attn_2 = True
     _supports_sdpa = True
 
-    def __init__(self, config: MoonViTConfig, *inputs, **kwargs):
+    def __init__(
+        self,
+        config: MoonViTConfig,
+        prefix: str = "",
+        use_data_parallel: bool = False,
+        use_tensor_parallel: bool = False,
+        *inputs,
+        **kwargs,
+    ):
         from transformers.activations import GELUTanh
 
         super().__init__(config, *inputs, **kwargs)
@@ -660,10 +797,16 @@ class MoonVitPretrainedModel(PreTrainedModel):
                 "attn_bias": True,
                 "attn_implementation": config._attn_implementation,
             },
+            prefix=add_prefix("encoder", prefix),
+            use_data_parallel=use_data_parallel,
+            use_tensor_parallel=use_tensor_parallel,
         )
 
     def forward(
-        self, pixel_values: torch.Tensor, grid_hw: torch.Tensor
+        self,
+        pixel_values: torch.Tensor,
+        grid_hw: torch.Tensor,
+        max_seqlen: Optional[int] = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -674,7 +817,7 @@ class MoonVitPretrainedModel(PreTrainedModel):
             torch.Tensor: The output tokens.
         """
         hidden_states = self.patch_embed(pixel_values, grid_hw)
-        hidden_states = self.encoder(hidden_states, grid_hw)
+        hidden_states = self.encoder(hidden_states, grid_hw, max_seqlen=max_seqlen)
         hidden_states = patch_merger(
             hidden_states, grid_hw, merge_kernel_size=self.merge_kernel_size
         )

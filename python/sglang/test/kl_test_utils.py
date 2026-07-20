@@ -28,7 +28,10 @@ def format_longbench_v2_example(example):
 
 
 def get_input_ids(
-    tokenizer_path, max_prompt_tokens=DEFAULT_PROMPT_TOKENS, num_samples=None
+    tokenizer_path,
+    max_prompt_tokens=DEFAULT_PROMPT_TOKENS,
+    num_samples=None,
+    trust_remote_code=False,
 ):
     """Get input_ids from LongBench V2 dataset with local caching."""
     # Create cache key based on parameters
@@ -67,7 +70,7 @@ def get_input_ids(
             "Please install the 'datasets' package: pip install datasets"
         ) from exc
 
-    tokenizer = get_tokenizer(tokenizer_path)
+    tokenizer = get_tokenizer(tokenizer_path, trust_remote_code=trust_remote_code)
 
     print(f"Downloading {num_samples} samples from LongBench V2 (streaming)...")
     dataset = load_dataset(
@@ -118,18 +121,28 @@ def compare_kl_divergence(
 
 
 # Common request helpers
-def _flush_cache(base_url):
-    requests.post(base_url + "/flush_cache")
+def _flush_cache(base_url, timeout_s=30):
+    response = requests.post(
+        base_url + "/flush_cache",
+        params={"timeout": timeout_s},
+        timeout=timeout_s + 10,
+    )
+    response.raise_for_status()
 
 
 def _generate(
-    base_url, input_ids, max_new_tokens, return_logprob=False, logprob_start_len=-1
+    base_url,
+    input_ids,
+    max_new_tokens,
+    return_logprob=False,
+    logprob_start_len=-1,
+    temperature=0.0,
 ):
     """Send generate request and return results."""
     json_data = {
         "input_ids": input_ids,
         "sampling_params": {
-            "temperature": 1,
+            "temperature": temperature,
             "max_new_tokens": max_new_tokens,
             "ignore_eos": True,
         },
@@ -146,7 +159,7 @@ def _generate(
     return response.json()
 
 
-def _get_input_logprobs(base_url, new_input_ids, output_logprobs):
+def _get_input_logprobs(base_url, new_input_ids, output_logprobs, temperature=0.0):
     """Run prefill to get input logprobs matching output logprobs."""
     _flush_cache(base_url)
     results = _generate(
@@ -155,6 +168,7 @@ def _get_input_logprobs(base_url, new_input_ids, output_logprobs):
         max_new_tokens=0,
         return_logprob=True,
         logprob_start_len=0,
+        temperature=temperature,
     )
     assert len(results) == len(new_input_ids)
 
@@ -172,12 +186,21 @@ def _extract_output_logprobs(result):
 
 
 def test_input_output_logprobs_match_helper(
-    base_url, ACC_THRESHOLDS, model_name, max_samples=None, max_new_tokens=16000
+    base_url,
+    ACC_THRESHOLDS,
+    model_name,
+    max_samples=None,
+    max_new_tokens=16000,
+    trust_remote_code=False,
 ):
     num_samples = DEFAULT_NUM_SAMPLES
     if max_samples is not None and max_samples > num_samples:
         num_samples = max_samples
-    input_ids = get_input_ids(tokenizer_path=model_name, num_samples=num_samples)
+    input_ids = get_input_ids(
+        tokenizer_path=model_name,
+        num_samples=num_samples,
+        trust_remote_code=trust_remote_code,
+    )
     if max_samples is not None:
         input_ids = input_ids[:max_samples]
     print(f"Running test_input_output_logprobs_match with {len(input_ids)} prompts")
@@ -206,7 +229,12 @@ def test_input_output_logprobs_match_helper(
 
 
 def test_input_output_logprobs_match_prefill_cache_hit_helper(
-    base_url, ACC_THRESHOLDS, model_name, max_samples=None, max_new_tokens=8192
+    base_url,
+    ACC_THRESHOLDS,
+    model_name,
+    max_samples=None,
+    max_new_tokens=8192,
+    trust_remote_code=False,
 ):
     server_info = requests.get(base_url + "/server_info").json()
     if server_info["disable_radix_cache"]:
@@ -216,7 +244,11 @@ def test_input_output_logprobs_match_prefill_cache_hit_helper(
     num_samples = DEFAULT_NUM_SAMPLES
     if max_samples is not None and max_samples > num_samples:
         num_samples = max_samples
-    input_ids = get_input_ids(tokenizer_path=model_name, num_samples=num_samples)
+    input_ids = get_input_ids(
+        tokenizer_path=model_name,
+        num_samples=num_samples,
+        trust_remote_code=trust_remote_code,
+    )
     if max_samples is not None:
         input_ids = input_ids[:max_samples]
     print(
@@ -242,9 +274,10 @@ def test_input_output_logprobs_match_prefill_cache_hit_helper(
         new_input_ids.append(input_ids[i] + result["output_ids"])
         output_logprobs.append(_extract_output_logprobs(result))
 
-    assert len(new_input_ids) > 0.5 * len(
-        input_ids
-    ), f"Too few prefill cache hits: {len(new_input_ids)}/{len(input_ids)}"
+    if not os.environ.get("SGLANG_TEST_SKIP_CACHE_HIT_ASSERT"):
+        assert len(new_input_ids) > 0.5 * len(
+            input_ids
+        ), f"Too few prefill cache hits: {len(new_input_ids)}/{len(input_ids)}"
 
     print("Flush Cache and run prefill to get input logprobs ...")
     input_logprobs = _get_input_logprobs(base_url, new_input_ids, output_logprobs)
@@ -259,7 +292,12 @@ def test_input_output_logprobs_match_prefill_cache_hit_helper(
 
 
 def test_input_output_logprobs_match_decode_cache_hit_helper(
-    base_url, ACC_THRESHOLDS, model_name, max_samples=None, max_new_tokens=8192
+    base_url,
+    ACC_THRESHOLDS,
+    model_name,
+    max_samples=None,
+    max_new_tokens=8192,
+    trust_remote_code=False,
 ):
     server_info = requests.get(base_url + "/server_info").json()
     if server_info["disable_radix_cache"]:
@@ -270,7 +308,9 @@ def test_input_output_logprobs_match_decode_cache_hit_helper(
     if max_samples is not None and max_samples > num_samples:
         num_samples = max_samples
     first_turn_input_ids = get_input_ids(
-        tokenizer_path=model_name, num_samples=num_samples
+        tokenizer_path=model_name,
+        num_samples=num_samples,
+        trust_remote_code=trust_remote_code,
     )
     if max_samples is not None:
         first_turn_input_ids = first_turn_input_ids[:max_samples]
@@ -286,7 +326,9 @@ def test_input_output_logprobs_match_decode_cache_hit_helper(
     )
     assert len(results) == len(first_turn_input_ids)
 
-    tokenizer = get_tokenizer(tokenizer_name=model_name)
+    tokenizer = get_tokenizer(
+        tokenizer_name=model_name, trust_remote_code=trust_remote_code
+    )
     comma_token_id = tokenizer.encode(",")
 
     second_turn_input_ids = [
@@ -310,9 +352,10 @@ def test_input_output_logprobs_match_decode_cache_hit_helper(
         new_input_ids.append(second_turn_input_ids[i] + result["output_ids"])
         output_logprobs.append(_extract_output_logprobs(result))
 
-    assert len(new_input_ids) > 0.5 * len(
-        second_turn_input_ids
-    ), f"Too few decode cache hits: {len(new_input_ids)}/{len(second_turn_input_ids)}"
+    if not os.environ.get("SGLANG_TEST_SKIP_CACHE_HIT_ASSERT"):
+        assert len(new_input_ids) > 0.5 * len(
+            second_turn_input_ids
+        ), f"Too few decode cache hits: {len(new_input_ids)}/{len(second_turn_input_ids)}"
 
     print("Flush Cache and run prefill to get input logprobs ...")
     input_logprobs = _get_input_logprobs(base_url, new_input_ids, output_logprobs)

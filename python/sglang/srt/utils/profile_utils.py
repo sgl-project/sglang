@@ -8,10 +8,14 @@ from typing import Callable, Dict, List, Optional
 
 import torch
 
+from sglang.srt.distributed.parallel_state_wrapper import ParallelState
+from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import ProfileReqOutput
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.platforms import current_platform
+from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import is_npu
+from sglang.srt.utils.torch_npu_patch_utils import apply_torch_npu_patches
 
 _is_npu = is_npu()
 if _is_npu:
@@ -22,20 +26,43 @@ if _is_npu:
         ["profiler.ProfilerActivity.CUDA", torch_npu.profiler.ProfilerActivity.NPU],
         ["profiler.ProfilerActivity.CPU", torch_npu.profiler.ProfilerActivity.CPU],
     ]
-    torch_npu._apply_patches(patches)
+    apply_torch_npu_patches(torch_npu, patches)
 
 logger = logging.getLogger(__name__)
 
 
+def export_cuda_graph_capture_trace(prof_context, *, runner_name: str, tp_rank: int):
+    """Persist a CUDA-graph capture profiler trace (chrome trace) to disk.
+
+    Opt-in via ``SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE`` (no-op otherwise). The
+    capture profiler must have run with ``record_shapes=True`` so the trace can
+    be inspected offline as a per-kernel shape/identity record. The file lands in
+    ``<SGLANG_TORCH_PROFILER_DIR>/graph_capture_profile/`` and is namespaced by
+    runner class and TP rank so concurrent capture passes (e.g. EAGLE3
+    target/draft/draft-extend) and ranks don't overwrite each other.
+    """
+    if not envs.SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE.get():
+        return
+    output_dir = os.path.join(
+        envs.SGLANG_TORCH_PROFILER_DIR.get(), "graph_capture_profile"
+    )
+    os.makedirs(output_dir, exist_ok=True)
+    path = os.path.join(
+        output_dir, f"cuda_graph_capture-{runner_name}-TP-{tp_rank}.json.gz"
+    )
+    prof_context.export_chrome_trace(path)
+    logger.info(f"CUDA graph capture trace saved to: {path}")
+
+
 class ProfileManager:
-    def __init__(self, tp_rank: int, cpu_group, gpu_id: int):
+    def __init__(self, ps: ParallelState, cpu_group):
         self.stage_based_trigger = _StageBasedTrigger(
             on_start=self._do_start,
             on_stop=self._do_stop,
         )
-        self.tp_rank = tp_rank
+        self.ps = ps
         self.cpu_group = cpu_group
-        self.first_rank_in_node = gpu_id == get_global_server_args().base_gpu_id
+        self.first_rank_in_node = ps.gpu_id == get_server_args().base_gpu_id
         self.profiler_kwargs = None
         self.profiler = None
 
@@ -105,7 +132,7 @@ class ProfileManager:
         assert self.profiler is None
         self.profiler = _ProfilerBase.create(
             **self.profiler_kwargs,
-            tp_rank=self.tp_rank,
+            ps=self.ps,
             cpu_group=self.cpu_group,
             first_rank_in_node=self.first_rank_in_node,
             output_suffix=f"-{stage}" if stage else "",
@@ -195,6 +222,16 @@ class _ProfilerBase(ABC):
     @staticmethod
     def create(activities, with_stack, record_shapes, **kwargs):
         inners = []
+        if current_platform.is_out_of_tree():
+            if current_platform.get_torch_profiler_activity_str() in activities:
+                inners.append(
+                    _ProfilerTorch(
+                        **kwargs,
+                        activities=activities,
+                        with_stack=with_stack,
+                        record_shapes=record_shapes,
+                    )
+                )
         if ("CPU" in activities) or ("GPU" in activities):
             inners.append(
                 _ProfilerTorch(
@@ -240,7 +277,7 @@ class _ProfilerConcreteBase(_ProfilerBase):
         output_prefix: str,
         output_suffix: str,
         profile_id: str,
-        tp_rank: int,
+        ps: ParallelState,
         cpu_group,
         first_rank_in_node: bool,
     ):
@@ -248,7 +285,7 @@ class _ProfilerConcreteBase(_ProfilerBase):
         self.output_prefix = output_prefix
         self.output_suffix = output_suffix
         self.profile_id = profile_id
-        self.tp_rank = tp_rank
+        self.ps = ps
         self.cpu_group = cpu_group
         self.first_rank_in_node = first_rank_in_node
 
@@ -265,6 +302,12 @@ class _ProfilerTorch(_ProfilerConcreteBase):
             "CPU": torch.profiler.ProfilerActivity.CPU,
             "GPU": torch.profiler.ProfilerActivity.CUDA,
         }
+
+        if current_platform.is_out_of_tree():
+            activity_map[current_platform.get_torch_profiler_activity_str()] = (
+                current_platform.get_torch_profiler_activity()
+            )
+
         torchprof_activities = [
             activity_map[a] for a in self.activities if a in activity_map
         ]
@@ -289,15 +332,15 @@ class _ProfilerTorch(_ProfilerConcreteBase):
         self.torch_profiler.stop()
         if not _is_npu:
             # Build filename with only non-zero ranks to maintain backward compatibility
-            filename_parts = [self.profile_id, f"TP-{self.tp_rank}"]
+            filename_parts = [self.profile_id, f"TP-{self.ps.tp_rank}"]
 
             # Only add other ranks if parallelism is enabled (size > 1)
-            if getattr(self, "dp_size", 1) > 1:
-                filename_parts.append(f"DP-{getattr(self, 'dp_rank', 0)}")
-            if getattr(self, "pp_size", 1) > 1:
-                filename_parts.append(f"PP-{getattr(self, 'pp_rank', 0)}")
-            if getattr(self, "moe_ep_size", 1) > 1:
-                filename_parts.append(f"EP-{getattr(self, 'moe_ep_rank', 0)}")
+            if self.ps.dp_size > 1:
+                filename_parts.append(f"DP-{self.ps.dp_rank}")
+            if self.ps.pp_size > 1:
+                filename_parts.append(f"PP-{self.ps.pp_rank}")
+            if self.ps.moe_ep_size > 1:
+                filename_parts.append(f"EP-{self.ps.moe_ep_rank}")
 
             filename = (
                 (self.output_prefix + "-" if self.output_prefix else "")
@@ -324,7 +367,7 @@ class _ProfilerMemory(_ProfilerConcreteBase):
         memory_profile_path = os.path.join(
             self.output_dir,
             str(time.time())
-            + f"-TP-{self.tp_rank}-memory"
+            + f"-TP-{self.ps.tp_rank}-memory"
             + self.output_suffix
             + ".pickle",
         )
@@ -354,10 +397,10 @@ class _ProfilerRPD(_ProfilerConcreteBase):
 
         self.rpd_profile_path = os.path.join(
             self.output_dir,
-            "rpd-" + str(time.time()) + f"-TP-{self.tp_rank}" + ".trace.json.gz",
+            "rpd-" + str(time.time()) + f"-TP-{self.ps.tp_rank}" + ".trace.json.gz",
         )
 
-        if self.tp_rank == 0:
+        if self.ps.tp_rank == 0:
             import sqlite3
 
             from rocpd.schema import RocpdSchema
@@ -382,7 +425,17 @@ class _ProfilerRPD(_ProfilerConcreteBase):
         self.rpd_profiler.flush()
 
         torch.distributed.barrier(self.cpu_group)
-        if self.tp_rank == 0:
+        if self.ps.tp_rank == 0:
             from sglang.srt.utils.rpd_utils import rpd_to_chrome_trace
 
             rpd_to_chrome_trace("trace.rpd", self.rpd_profile_path)
+
+
+def build_step_span_name(forward_batch: ForwardBatch) -> str:
+    """Build a profile-trace span name for one forward step."""
+    mode = forward_batch.forward_mode
+    bs = forward_batch.batch_size
+    if mode == ForwardMode.EXTEND:
+        ext_toks = forward_batch.extend_num_tokens or 0
+        return f"step[EXTEND bs={bs} toks={ext_toks}]"
+    return f"step[{mode.name} bs={bs}]"

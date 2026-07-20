@@ -35,12 +35,19 @@ def flash_attn_with_kvcache(
     scheduler_metadata=None,
     num_splits=0,  # Can be tuned for speed
     pack_gqa=None,  # Can be tuned for speed
+    only_qv=False,  # ver=3 only: skip K matmul when qk rope dim is 0
     sm_margin=0,  # Can be tuned if some SMs are used for communication
     return_softmax_lse=False,
     sinks=None,
     score_mod=None,
     aux_tensors=None,
+    sfq=None,
+    sfk=None,
+    sfv=None,
+    rel_bias=None,
+    rel_bias_prep_cache=None,
     ver=3,
+    out=None,
 ):
     """
     If k and v are not None, k_cache and v_cache will be updated *inplace* with the new values from
@@ -161,9 +168,11 @@ def flash_attn_with_kvcache(
             scheduler_metadata=scheduler_metadata,
             num_splits=num_splits,
             pack_gqa=pack_gqa,
+            only_qv=only_qv,
             sm_margin=sm_margin,
             return_softmax_lse=return_softmax_lse,
             sinks=sinks,
+            out=out,
         )
     elif ver == 4:
         from .flash_attention_v4 import (
@@ -198,6 +207,11 @@ def flash_attn_with_kvcache(
             sinks=sinks,
             score_mod=score_mod,
             aux_tensors=aux_tensors,
+            sfq=sfq,
+            sfk=sfk,
+            sfv=sfv,
+            rel_bias=rel_bias,
+            rel_bias_prep_cache=rel_bias_prep_cache,
             return_softmax_lse=return_softmax_lse,
         )
     else:
@@ -226,12 +240,19 @@ def flash_attn_varlen_func(
     softcap=0.0,
     num_splits=1,
     pack_gqa=None,
+    only_qv=False,
     sm_margin=0,
     return_softmax_lse=False,
     sinks=None,
     score_mod=None,
     aux_tensors=None,
+    sfq=None,
+    sfk=None,
+    sfv=None,
+    rel_bias=None,
+    rel_bias_prep_cache=None,
     ver=3,
+    out=None,
 ):
 
     if ver == 3:
@@ -257,9 +278,11 @@ def flash_attn_varlen_func(
             softcap=softcap,
             num_splits=num_splits,
             pack_gqa=pack_gqa,
+            only_qv=only_qv,
             sm_margin=sm_margin,
             return_softmax_lse=return_softmax_lse,
             sinks=sinks,
+            out=out,
         )
     elif ver == 4:
         from .flash_attention_v4 import (
@@ -286,6 +309,14 @@ def flash_attn_varlen_func(
             pack_gqa=pack_gqa,
             score_mod=score_mod,
             aux_tensors=aux_tensors,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            sfq=sfq,
+            sfk=sfk,
+            sfv=sfv,
+            rel_bias=rel_bias,
+            rel_bias_prep_cache=rel_bias_prep_cache,
             return_softmax_lse=return_softmax_lse,
         )
     else:

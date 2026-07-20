@@ -59,13 +59,12 @@ inline void copy_add_stub(
   constexpr int kVecSize = bVec::size();
 
   for (int64_t d = 0; d < N; d += kVecSize) {
-    fVec bias0, bias1;
-    bVec bias_vec = bVec::loadu(bias + d);
-    std::tie(bias0, bias1) = at::vec::convert_to_float(bias_vec);
+    auto [bias0, bias1] = load_float_vec2(bias + d);
 
     for (int64_t m = 0; m < M; ++m) {
-      fVec data0 = fVec::loadu(Ctmp + m * N + d) + bias0;
-      fVec data1 = fVec::loadu(Ctmp + m * N + d + fVec::size()) + bias1;
+      auto [data0, data1] = load_float_vec2(Ctmp + m * N + d);
+      data0 = data0 + bias0;
+      data1 = data1 + bias1;
       bVec out_vec = convert_from_float_ext<scalar_t>(data0, data1);
       out_vec.store(C + m * ldc + d);
     }
@@ -195,8 +194,6 @@ at::Tensor conv3d_embed_weight_pack(const at::Tensor& weight) {
 
 // conv3d mapped to gemm in embedding
 at::Tensor conv3d_embed_cpu(const at::Tensor& input, const at::Tensor& weight, const at::Tensor& bias, bool is_vnni) {
-  RECORD_FUNCTION("sgl_kernel::conv3d_embed_cpu", std::vector<c10::IValue>({input, weight, bias}));
-
   auto packed_w = is_vnni ? weight : conv3d_embed_weight_pack(weight);
 
   CHECK_CONTIGUOUS(input);

@@ -14,16 +14,23 @@ from __future__ import annotations
 import logging
 import os
 import pprint
+from collections import Counter
 from copy import deepcopy
 from dataclasses import MISSING, asdict, dataclass, field, fields
-from typing import Any, Optional
+from typing import Any, Optional, Sequence, Union
 
 import PIL.Image
 import torch
 
-from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.configs.sample.sampling_params import (
+    DataType,
+    SamplingParams,
+)
 from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
     RolloutTrajectoryData,
+)
+from sglang.multimodal_gen.runtime.realtime.session import (
+    RealtimeSession,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
@@ -32,10 +39,28 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
 )
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestMetrics
 from sglang.multimodal_gen.utils import align_to
+from sglang.srt.observability.trace import TraceNullContext, TraceReqContext
 
 logger = init_logger(__name__)
 
 SAMPLING_PARAMS_FIELDS = {f.name for f in fields(SamplingParams)}
+
+
+@dataclass
+class BatchMetricsWindow:
+    """Counters accumulated between dynamic batching metric logs.
+
+    `total_capacity` uses each dispatch's effective admission cap, so
+    utilization reflects model/config limits instead of only the user max.
+    """
+
+    dispatches: int = 0
+    total_requests: int = 0
+    total_capacity: int = 0
+    merged_dispatches: int = 0
+    full_dispatches: int = 0
+    wait_times_ms: list[float] = field(default_factory=list)
+    reject_reasons: Counter[str] = field(default_factory=Counter)
 
 
 @dataclass(init=False)
@@ -63,13 +88,19 @@ class Req:
     vae_image: torch.Tensor | PIL.Image.Image | None = None
     pixel_values: torch.Tensor | PIL.Image.Image | None = None
     preprocessed_image: torch.Tensor | None = None
+    preprocessed_video: torch.Tensor | None = None
 
     output_file_ext: str | None = None
     # Primary encoder embeddings
     prompt_embeds: list[torch.Tensor] | torch.Tensor = field(default_factory=list)
     negative_prompt_embeds: list[torch.Tensor] | None = None
-    prompt_attention_mask: list[torch.Tensor] | None = None
-    negative_attention_mask: list[torch.Tensor] | None = None
+    prompt_attention_mask: list[torch.Tensor | None] | None = None
+    negative_attention_mask: list[torch.Tensor | None] | None = None
+    # Masks and lengths aligned to postprocessed embeddings, one entry per text encoder.
+    prompt_embeds_mask: list[torch.Tensor | None] | None = None
+    negative_prompt_embeds_mask: list[torch.Tensor | None] | None = None
+    prompt_seq_lens: list[list[int]] | None = None
+    negative_prompt_seq_lens: list[list[int]] | None = None
     clip_embedding_pos: list[torch.Tensor] | None = None
     clip_embedding_neg: list[torch.Tensor] | None = None
 
@@ -109,6 +140,9 @@ class Req:
     # Audio Parameters
     generate_audio: bool = True
 
+    # Action Latents (Cosmos3 action-conditioned generation)
+    action_latents: torch.Tensor | None = None
+
     raw_latent_shape: torch.Tensor | None = None
     did_sp_shard_latents: bool = False
     sp_video_start_frame: int = 0
@@ -117,6 +151,7 @@ class Req:
     image_latent: torch.Tensor | list[torch.Tensor] | None = None
     condition_image_latent_ids: torch.Tensor | list[torch.Tensor] | None = None
     vae_image_sizes: list[tuple[int, int]] | None = None
+    c2ws_plucker_emb: torch.Tensor | None = None
 
     # Latent dimensions
     height_latents: list[int] | int | None = None
@@ -127,6 +162,14 @@ class Req:
     paired_timesteps: torch.Tensor | None = None
     timestep: torch.Tensor | float | int | None = None
     step_index: int | None = None
+
+    # request-local scheduler used by timestep/denoising stages.
+    # This is optional because the normal worker path executes one request at a time, so it can
+    # point at the stage-local scheduler and preserve warmup/device caches.
+    # Request-local cloned schedulers are only needed when a request can run
+    # concurrently with another request or outlive the stage-local scheduler
+    # state, such as grouped execution or disaggregation.
+    scheduler: Any | None = None
 
     eta: float = 0.0
     sigmas: list[float] | None = None
@@ -147,6 +190,8 @@ class Req:
     # Extra parameters that might be needed by specific pipeline implementations (e.g., LTX2.3 DenoisingAVStage)
     extra: dict[str, Any] = field(default_factory=dict)
 
+    condition_inputs: dict[str, Any] = field(default_factory=dict)
+
     is_warmup: bool = False
 
     # STA parameters
@@ -159,7 +204,27 @@ class Req:
     VSA_sparsity: float = 0.0
 
     # stage logging
-    metrics: Optional["RequestMetrics"] = None
+    metrics: Optional[RequestMetrics] = None
+
+    # tracing context (TraceReqContext or TraceNullContext)
+    trace_ctx: Union[TraceReqContext, TraceNullContext] = field(
+        default_factory=TraceNullContext
+    )
+
+    # realtime
+    realtime_session_id: str | None = None
+    session: RealtimeSession | None = None
+    block_idx: int = 0
+    realtime_chunk_size: int | None = None
+    realtime_event_id: int | None = None
+    realtime_output_format: str | None = None
+    realtime_preview_max_width: int | None = None
+    realtime_output_pacing: bool = False
+    realtime_causal_sink_size: int | None = None
+    realtime_causal_kv_cache_num_frames: int | None = None
+    realtime_causal_kv_sample_tokens: int | None = None
+    # return websocket-friendly raw RGB frame bytes instead of rwa tensors
+    return_raw_frames: bool = False
 
     # results
     output: torch.Tensor | None = None
@@ -255,20 +320,37 @@ class Req:
             return None
         return os.path.join(self.output_path, output_file_name)
 
+    @property
+    def resolution_key(self) -> str | None:
+        """Return the batching config resolution key, e.g. "1024x1024"."""
+        width = getattr(self, "width", None)
+        height = getattr(self, "height", None)
+        if width is None or height is None:
+            return None
+        return f"{int(width)}x{int(height)}"
+
     def set_as_warmup(self, warmup_steps: int = 1):
         self.is_warmup = True
         self.save_output = False
         self.suppress_logs = True
+        self.metrics.suppress_stage_breakdown = True
         self.extra["cache_dit_num_inference_steps"] = self.num_inference_steps
         self.num_inference_steps = warmup_steps
 
-    def copy_as_warmup(self, warmup_steps: int = 1) -> "Req":
+    def copy_as_warmup(self, warmup_steps: int = 1) -> Req:
         req = deepcopy(self)
         req.set_as_warmup(warmup_steps)
         return req
 
     def validate(self):
         """Initialize dependent fields after dataclass initialization."""
+        if getattr(self.sampling_params, "data_type", None) == DataType.ACTION:
+            self.do_classifier_free_guidance = False
+            if self.negative_prompt_embeds is None:
+                self.negative_prompt_embeds = []
+            self.metrics = RequestMetrics(request_id=self.request_id)
+            return
+
         # Prefer true_cfg_scale when it is explicitly provided.
         cfg_scale = (
             self.true_cfg_scale
@@ -284,15 +366,28 @@ class Req:
 
         self.metrics = RequestMetrics(request_id=self.request_id)
 
-    def adjust_size(self, server_args: ServerArgs):
-        pass
-
     def __str__(self):
         return pprint.pformat(asdict(self), indent=2, width=120)
 
     def log(self, server_args: ServerArgs):
         if self.is_warmup or self.suppress_logs:
             return
+        if getattr(self.sampling_params, "data_type", None) == DataType.ACTION:
+            if not logger.isEnabledFor(logging.DEBUG):
+                return
+            logger.debug(
+                "VLA request: prompt=%s seed=%s steps=%s outputs=%s action=%sx%s "
+                "save_output=%s",
+                _sanitize_for_logging(self.prompt, key_hint="prompt"),
+                self.seed,
+                self.num_inference_steps,
+                self.num_outputs_per_prompt,
+                getattr(self, "action_horizon", None),
+                getattr(self, "action_dim", None),
+                self.save_output,
+            )
+            return
+
         # TODO: in some cases (e.g., TI2I), height and weight might be undecided at this moment
         if self.height:
             target_height = align_to(self.height, 16)
@@ -312,6 +407,12 @@ class Req:
                 self.negative_prompt, key_hint="negative_prompt"
             )
 
+        effective_flow_shift = (
+            self.flow_shift
+            if self.flow_shift is not None
+            else getattr(server_args.pipeline_config, "flow_shift", None)
+        )
+
         debug_str = f"""Sampling params:
                        width: {target_width}
                       height: {target_height}
@@ -325,7 +426,7 @@ class Req:
               guidance_scale: {self.guidance_scale}
      embedded_guidance_scale: {server_args.pipeline_config.embedded_cfg_scale}
                     n_tokens: {self.n_tokens}
-                  flow_shift: {server_args.pipeline_config.flow_shift}
+                  flow_shift: {effective_flow_shift}
                   image_path: {self.image_path}
                  save_output: {self.save_output}
             output_file_path: {self.output_file_path()}
@@ -339,9 +440,17 @@ class OutputBatch:
     Final output (after pipeline completion)
     """
 
-    output: torch.Tensor | None = None
+    # tensors or numpy frames
+    output: Sequence[Any] | None = None
+    raw_frame_batches: list[list[bytes]] | None = None
+    raw_frame_content_type: str = "application/x-raw-rgb"
+    raw_frame_metadata: dict[str, Any] | None = None
     audio: torch.Tensor | None = None
     audio_sample_rate: int | None = None
+    action_pred: torch.Tensor | None = None
+    action_mode: str | None = None
+    action_domain_id: int | None = None
+    action_raw_action_dim: int | None = None
     trajectory_timesteps: torch.Tensor | None = None
     trajectory_latents: torch.Tensor | None = None
     rollout_trajectory_data: RolloutTrajectoryData | None = None
@@ -350,8 +459,20 @@ class OutputBatch:
     output_file_paths: list[str] | None = None
 
     # logged metrics info, directly from Req.timings
-    metrics: Optional["RequestMetrics"] = None
+    metrics: Optional[RequestMetrics] = None
+    metrics_list: Optional[list[Optional[RequestMetrics]]] = None
 
     # For ComfyUI integration: noise prediction from denoising stage
     noise_pred: torch.Tensor | None = None
     peak_memory_mb: float = 0.0
+
+    def drop_payload_for_warmup(self) -> None:
+        self.output = None
+        self.audio = None
+        self.trajectory_timesteps = None
+        self.trajectory_latents = None
+        self.rollout_trajectory_data = None
+        self.trajectory_decoded = None
+        self.output_file_paths = None
+        self.raw_frame_batches = None
+        self.noise_pred = None

@@ -33,21 +33,33 @@ logger = init_logger(__name__)
 router = APIRouter(prefix="/rollout", tags=["rollout"])
 
 
-def _extract_single_sample_tensor(obj: Any, sample_idx: int, batch_size: int) -> Any:
+def _extract_single_sample_tensor(
+    obj: Any, sample_idx: int, batch_size: int, *, current_key: str | None = None
+) -> Any:
     if isinstance(obj, torch.Tensor):
         if obj.dim() >= 1 and obj.shape[0] == batch_size:
             return obj[sample_idx].contiguous()
         return obj
     if isinstance(obj, dict):
         return {
-            k: _extract_single_sample_tensor(v, sample_idx, batch_size)
+            k: _extract_single_sample_tensor(v, sample_idx, batch_size, current_key=k)
             for k, v in obj.items()
         }
     if isinstance(obj, list):
-        return [_extract_single_sample_tensor(v, sample_idx, batch_size) for v in obj]
+        if current_key == "img_shapes" and len(obj) == batch_size:
+            return [obj[sample_idx]]
+        return [
+            _extract_single_sample_tensor(
+                v, sample_idx, batch_size, current_key=current_key
+            )
+            for v in obj
+        ]
     if isinstance(obj, tuple):
         return tuple(
-            _extract_single_sample_tensor(v, sample_idx, batch_size) for v in obj
+            _extract_single_sample_tensor(
+                v, sample_idx, batch_size, current_key=current_key
+            )
+            for v in obj
         )
     return obj
 
@@ -206,7 +218,9 @@ def _build_response(
 
     responses: list[RolloutResponse] = []
     for sample_idx in range(batch_size):
-        out_i = result.output[sample_idx].contiguous()
+        out_i = result.output[sample_idx]
+        if isinstance(out_i, torch.Tensor):
+            out_i = out_i.contiguous()
         serialized_generated_output = _maybe_serialize(out_i)
         if not rollout:
             responses.append(
@@ -249,10 +263,7 @@ def _build_response(
     return responses
 
 
-@router.post("/generate", response_model=list[RolloutResponse])
-async def rollout_generate(request: RolloutRequest):
-    request_id = generate_request_id()
-    server_args = get_global_server_args()
+def _build_sampling_kwargs(request: RolloutRequest) -> dict:
     sampling_kwargs: dict = dict(
         prompt=request.prompt,
         negative_prompt=request.negative_prompt,
@@ -274,6 +285,8 @@ async def rollout_generate(request: RolloutRequest):
         rollout_debug_mode=request.rollout_debug_mode,
         rollout_return_denoising_env=request.rollout_return_denoising_env,
         rollout_return_dit_trajectory=request.rollout_return_dit_trajectory,
+        rollout_sde_step_indices=request.rollout_sde_step_indices,
+        rollout_return_step_indices=request.rollout_return_step_indices,
         suppress_logs=request.suppress_logs,
         save_output=False,
         return_trajectory_latents=False,
@@ -282,7 +295,14 @@ async def rollout_generate(request: RolloutRequest):
     if request.extra_sampling_params:
         sampling_kwargs.update(request.extra_sampling_params)
         sampling_kwargs["rollout"] = request.rollout
-    sampling_kwargs = {k: v for k, v in sampling_kwargs.items() if v is not None}
+    return {k: v for k, v in sampling_kwargs.items() if v is not None}
+
+
+@router.post("/generate", response_model=list[RolloutResponse])
+async def rollout_generate(request: RolloutRequest):
+    request_id = generate_request_id()
+    server_args = get_global_server_args()
+    sampling_kwargs = _build_sampling_kwargs(request)
     try:
         sampling_params = build_sampling_params(request_id, **sampling_kwargs)
     except Exception as exc:
