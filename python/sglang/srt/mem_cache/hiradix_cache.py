@@ -972,8 +972,8 @@ class HiRadixCache(RadixCache):
     def loading_check(self):
         finish_count = 0
         if self.pp_rank == 0:
-            for _, finish_event, ack_list in self.cache_controller.ack_load_queue:
-                if not finish_event.query():
+            for ack in self.cache_controller.ack_load_queue:
+                if not ack.finish_event.query():
                     break
                 finish_count += 1
         finish_count_tensor = torch.tensor(finish_count, dtype=torch.int, device="cpu")
@@ -983,9 +983,9 @@ class HiRadixCache(RadixCache):
         if finish_count > 0:
             logger.debug(f"Process {finish_count} load operations")
         while finish_count > 0:
-            _, finish_event, ack_list = self.cache_controller.ack_load_queue.pop(0)
-            finish_event.synchronize()
-            for ack_id in ack_list:
+            ack = self.cache_controller.ack_load_queue.pop(0)
+            ack.finish_event.synchronize()
+            for ack_id in ack.node_ids:
                 load_back_entry = self.ongoing_load_back.pop(ack_id)
                 if isinstance(load_back_entry, tuple):
                     end_node, protected_host_nodes = load_back_entry
@@ -994,6 +994,14 @@ class HiRadixCache(RadixCache):
                 self.dec_lock_ref(end_node)
                 for host_node in protected_host_nodes:
                     host_node.release_host()
+
+            if self.metrics_collector is not None:
+                self.metrics_collector.increment_load_back_num_tokens(ack.num_tokens)
+                if ack.timing_enabled:
+                    duration_ms = ack.start_event.elapsed_time(ack.finish_event)
+                    self.metrics_collector.observe_load_back_duration(
+                        duration_ms / 1000.0
+                    )
             finish_count -= 1
 
     def is_load_back_event_done(self, consumer_index: int) -> bool:
