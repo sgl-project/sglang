@@ -18,7 +18,7 @@ from typing import Iterable, Optional
 import torch
 from torch import nn
 
-from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
+from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -37,7 +37,7 @@ from sglang.srt.models.gigachat35 import (
     _remap_gigachat_weight_names,
     build_norm,
 )
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import BumpAllocator, add_prefix
 
 
@@ -141,7 +141,7 @@ class GigaChat35ForCausalLMNextN(DeepseekV2WeightLoaderMixin, nn.Module):
         self.config = config
         self.quant_config = quant_config
         self.pp_group = get_pp_group()
-        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_size = get_parallel().tp_size
         self.num_fused_shared_experts = 0
         self.draft_model_idx = draft_model_idx or 0
 

@@ -23,7 +23,7 @@ from transformers import PretrainedConfig
 
 import sglang.srt.models.deepseek_v2 as deepseek_v2
 from sglang.srt.configs.gigachat35 import GigaChat35Config
-from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
+from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.layernorm import GemmaRMSNorm, RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear
@@ -606,7 +606,7 @@ class GigaChat35ForCausalLM(DeepseekV2WeightLoaderMixin, nn.Module):
         self.config = config
         self.quant_config = quant_config
         self.pp_group = get_pp_group()
-        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_size = get_parallel().tp_size
         self.num_fused_shared_experts = 0
 
         self.model = GigaChat35Model(
