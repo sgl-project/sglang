@@ -5,8 +5,8 @@ from typing import Optional
 import torch
 
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
-from sglang.srt.layers.dp_attention import get_attention_tp_group
 from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.adaptive_runtime_state import (
     AdaptiveController,
@@ -67,7 +67,7 @@ class StandaloneDraftWorker(EagleDraftWorker):
         # Under DP attention, the draft is a dense model that runs in the attention
         # TP group, instead of the global TP group.
         ctx = (
-            draft_tp_context(get_attention_tp_group())
+            draft_tp_context(get_parallel().attn_tp_group)
             if server_args.enable_dp_attention
             else empty_context()
         )
