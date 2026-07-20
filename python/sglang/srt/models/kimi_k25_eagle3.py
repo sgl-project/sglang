@@ -408,16 +408,16 @@ class Eagle3DeepseekV2ForCausalLM(nn.Module):
             return
         del self.model.embed_tokens.weight
         self.model.embed_tokens.weight = embed
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        torch.get_device_module().empty_cache()
+        torch.get_device_module().synchronize()
 
     def set_embed_and_head(self, embed: torch.Tensor, head: torch.Tensor) -> None:
         del self.model.embed_tokens.weight
         del self.lm_head.weight
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        torch.get_device_module().empty_cache()
+        torch.get_device_module().synchronize()
 
     def get_hot_token_id(self):
         return self.hot_token_id

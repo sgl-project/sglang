@@ -390,8 +390,8 @@ class MiMoV2MTP(MiMoV2ForCausalLM):
         del self.lm_head.weight
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        torch.get_device_module().empty_cache()
+        torch.get_device_module().synchronize()
 
 
 EntryClass = MiMoV2MTP

@@ -1707,8 +1707,8 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
             torch.xpu.empty_cache()
             torch.xpu.synchronize()
         else:
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
+            torch.get_device_module().empty_cache()
+            torch.get_device_module().synchronize()
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
@@ -1866,8 +1866,8 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             torch.xpu.empty_cache()
             torch.xpu.synchronize()
         else:
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
+            torch.get_device_module().empty_cache()
+            torch.get_device_module().synchronize()
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
