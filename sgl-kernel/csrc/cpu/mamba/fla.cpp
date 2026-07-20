@@ -1146,14 +1146,10 @@ void fused_sigmoid_gating_delta_rule_update_kernel_impl(
         int64_t d;
 #pragma GCC unroll 4
         for (d = 0; d <= head_dim - VecSize; d += VecSize) {
-          bVec q_bvec = bVec::loadu(q_ptr + q_offset + d);
-          fVec q_fvec0, q_fvec1;
-          std::tie(q_fvec0, q_fvec1) = at::vec::convert_to_float(q_bvec);
+          auto [q_fvec0, q_fvec1] = load_float_vec2(q_ptr + q_offset + d);
           sum_q_fvec += q_fvec0 * q_fvec0;
           sum_q_fvec += q_fvec1 * q_fvec1;
-          bVec k_bvec = bVec::loadu(k_ptr + k_offset + d);
-          fVec k_fvec0, k_fvec1;
-          std::tie(k_fvec0, k_fvec1) = at::vec::convert_to_float(k_bvec);
+          auto [k_fvec0, k_fvec1] = load_float_vec2(k_ptr + k_offset + d);
           sum_k_fvec += k_fvec0 * k_fvec0;
           sum_k_fvec += k_fvec1 * k_fvec1;
         }
@@ -1200,14 +1196,11 @@ void fused_sigmoid_gating_delta_rule_update_kernel_impl(
         fVec kv_mem_vec1 = fVec(float(0));
         for (int di = 0; di < head_dim; ++di) {
           fVec k_val_vec = fVec(k_ptr[k_offset + di] * k_scale);
-          fVec state_vec0 = fVec::loadu(state_ptr + state_offset + di * v_head_dim + dvi);
-          fVec state_vec1 = fVec::loadu(state_ptr + state_offset + di * v_head_dim + dvi + fVecSize);
+          auto [state_vec0, state_vec1] = load_float_vec2(state_ptr + state_offset + di * v_head_dim + dvi);
           kv_mem_vec0 = kv_mem_vec0 + state_vec0 * g_val_exp_vec * k_val_vec;
           kv_mem_vec1 = kv_mem_vec1 + state_vec1 * g_val_exp_vec * k_val_vec;
         }
-        bVec v_bvec = bVec::loadu(v_ptr + v_offset + dvi);
-        fVec v_vec0, v_vec1;
-        std::tie(v_vec0, v_vec1) = at::vec::convert_to_float(v_bvec);
+        auto [v_vec0, v_vec1] = load_float_vec2(v_ptr + v_offset + dvi);
         fVec dt_vec0 = (v_vec0 - kv_mem_vec0) * beta_vec;
         fVec dt_vec1 = (v_vec1 - kv_mem_vec1) * beta_vec;
         fVec o_vec0 = fVec(float(0));
@@ -1215,8 +1208,7 @@ void fused_sigmoid_gating_delta_rule_update_kernel_impl(
         for (int di = 0; di < head_dim; ++di) {
           fVec q_vec = fVec(q_ptr[q_offset + di] * q_scale);
           fVec k_vec = fVec(k_ptr[k_offset + di] * k_scale);
-          fVec state_vec0 = fVec::loadu(state_ptr + state_offset + di * v_head_dim + dvi);
-          fVec state_vec1 = fVec::loadu(state_ptr + state_offset + di * v_head_dim + dvi + fVecSize);
+          auto [state_vec0, state_vec1] = load_float_vec2(state_ptr + state_offset + di * v_head_dim + dvi);
           state_vec0 = state_vec0 * g_val_exp_vec + k_vec * dt_vec0;
           state_vec1 = state_vec1 * g_val_exp_vec + k_vec * dt_vec1;
           o_vec0 = o_vec0 + state_vec0 * q_vec * scale_vec;
@@ -1265,25 +1257,19 @@ void fused_gdn_gating_kernel_impl(
   constexpr int vec_size = bVec::size();
   constexpr int fvec_size = fVec::size();
   const fVec neg_one(-1.0f);
-  const fVec one(1.0f);
   at::parallel_for(0, batch, 0, [&](int64_t begin, int64_t end) {
     for (int64_t i = begin; i < end; ++i) {
       int64_t j = 0;
       for (; j < num_heads - (num_heads % vec_size); j += vec_size) {
-        fVec A_log_vec0 = fVec::loadu(A_log + j);
-        fVec A_log_vec1 = fVec::loadu(A_log + j + fvec_size);
-        bVec dt_bias_vec = bVec::loadu(dt_bias + j);
-        bVec a_bvec = bVec::loadu(a + i * num_heads + j);
-        bVec b_bvec = bVec::loadu(b + i * num_heads + j);
-        fVec a0, a1, dt_bias_vec0, dt_bias_vec1, b0, b1;
-        std::tie(a0, a1) = at::vec::convert_to_float(a_bvec);
-        std::tie(b0, b1) = at::vec::convert_to_float(b_bvec);
-        std::tie(dt_bias_vec0, dt_bias_vec1) = at::vec::convert_to_float(dt_bias_vec);
+        auto [A_log_vec0, A_log_vec1] = load_float_vec2(A_log + j);
+        auto [dt_bias_vec0, dt_bias_vec1] = load_float_vec2(dt_bias + j);
+        auto [a0, a1] = load_float_vec2(a + i * num_heads + j);
+        auto [b0, b1] = load_float_vec2(b + i * num_heads + j);
 
         fVec g0 = neg_one * A_log_vec0.exp_u20() * softplus(a0 + dt_bias_vec0);
         fVec g1 = neg_one * A_log_vec1.exp_u20() * softplus(a1 + dt_bias_vec1);
-        fVec beta0 = one / (one + (neg_one * b0).exp_u20());
-        fVec beta1 = one / (one + (neg_one * b1).exp_u20());
+        fVec beta0 = fast_sigmoid(b0);
+        fVec beta1 = fast_sigmoid(b1);
 
         g0.store(out + i * num_heads + j);
         g1.store(out + i * num_heads + j + fvec_size);
@@ -1313,26 +1299,19 @@ void fused_gdn_gating_kernel_impl(
   constexpr int vec_size = bVec::size();
   constexpr int fvec_size = fVec::size();
   const fVec neg_one(-1.0f);
-  const fVec one(1.0f);
   at::parallel_for(0, batch, 0, [&](int64_t begin, int64_t end) {
     for (int64_t i = begin; i < end; ++i) {
       int64_t j = 0;
       for (; j < num_heads - (num_heads % vec_size); j += vec_size) {
-        bVec A_log_bvec = bVec::loadu(A_log + j);
-        fVec A_log_vec0, A_log_vec1;
-        std::tie(A_log_vec0, A_log_vec1) = at::vec::convert_to_float(A_log_bvec);
-        bVec dt_bias_vec = bVec::loadu(dt_bias + j);
-        bVec a_bvec = bVec::loadu(a + i * num_heads + j);
-        bVec b_bvec = bVec::loadu(b + i * num_heads + j);
-        fVec a0, a1, dt_bias_vec0, dt_bias_vec1, b0, b1;
-        std::tie(a0, a1) = at::vec::convert_to_float(a_bvec);
-        std::tie(b0, b1) = at::vec::convert_to_float(b_bvec);
-        std::tie(dt_bias_vec0, dt_bias_vec1) = at::vec::convert_to_float(dt_bias_vec);
+        auto [A_log_vec0, A_log_vec1] = load_float_vec2(A_log + j);
+        auto [dt_bias_vec0, dt_bias_vec1] = load_float_vec2(dt_bias + j);
+        auto [a0, a1] = load_float_vec2(a + i * num_heads + j);
+        auto [b0, b1] = load_float_vec2(b + i * num_heads + j);
 
         fVec g0 = neg_one * A_log_vec0.exp_u20() * softplus(a0 + dt_bias_vec0);
         fVec g1 = neg_one * A_log_vec1.exp_u20() * softplus(a1 + dt_bias_vec1);
-        fVec beta0 = one / (one + (neg_one * b0).exp_u20());
-        fVec beta1 = one / (one + (neg_one * b1).exp_u20());
+        fVec beta0 = fast_sigmoid(b0);
+        fVec beta1 = fast_sigmoid(b1);
 
         g0.store(out + i * num_heads + j);
         g1.store(out + i * num_heads + j + fvec_size);

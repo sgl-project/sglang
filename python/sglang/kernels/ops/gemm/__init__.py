@@ -16,12 +16,12 @@ from sglang.kernels.spec import (
 if TYPE_CHECKING:
     import torch
 
-_CUDA = CapabilityRequirement(requires_cuda=True)
+_CUDA = frozenset({CapabilityRequirement.CUDA})
 
 register_kernel(
     KernelSpec(
         op="gemm.fp8_scaled_mm",
-        backend=KernelBackend.CUDA_AOT,
+        backend=KernelBackend.AOT,
         target="sgl_kernel:fp8_scaled_mm",
         format_signature=FormatSignature(
             supported_dtypes=("float8_e4m3fn",),
@@ -33,7 +33,7 @@ register_kernel(
 register_kernel(
     KernelSpec(
         op="gemm.dsv3_fused_a_gemm",
-        backend=KernelBackend.CUDA_AOT,
+        backend=KernelBackend.AOT,
         target="sgl_kernel:dsv3_fused_a_gemm",
         format_signature=FormatSignature(
             supported_dtypes=("bfloat16",),
@@ -45,9 +45,9 @@ register_kernel(
 register_kernel(
     KernelSpec(
         op="gemm.dsv3_fused_a_gemm",
-        backend=KernelBackend.CUDA_JIT,
+        backend=KernelBackend.JIT,
         target="sglang.jit_kernel.dsv3_fused_a_gemm:dsv3_fused_a_gemm",
-        capability=_CUDA,
+        capabilities=_CUDA,
         format_signature=FormatSignature(
             supported_dtypes=("bfloat16",),
             description="DeepSeek-V3 fused QKV-A GEMM (drop-in with AOT signature)",
@@ -58,9 +58,9 @@ register_kernel(
 register_kernel(
     KernelSpec(
         op="gemm.dsv3_router_gemm",
-        backend=KernelBackend.CUDA_JIT,
+        backend=KernelBackend.JIT,
         target="sglang.jit_kernel.dsv3_router_gemm:dsv3_router_gemm",
-        capability=_CUDA,
+        capabilities=_CUDA,
         format_signature=FormatSignature(
             supported_dtypes=("bfloat16",),
             description="DeepSeek-V3 router GEMM; num_tokens in [1, 16]",
@@ -79,7 +79,7 @@ def fp8_scaled_mm(
     bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """FP8 scaled matmul: ``(mat_a @ mat_b) * scales_a * scales_b (+ bias)``."""
-    return get_kernel("gemm.fp8_scaled_mm", KernelBackend.CUDA_AOT)(
+    return get_kernel("gemm.fp8_scaled_mm", KernelBackend.AOT)(
         mat_a, mat_b, scales_a, scales_b, out_dtype, bias
     )
 
@@ -90,9 +90,7 @@ def dsv3_fused_a_gemm(
     output: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """DeepSeek-V3 fused QKV-A GEMM."""
-    return get_kernel("gemm.dsv3_fused_a_gemm", KernelBackend.CUDA_AOT)(
-        mat_a, mat_b, output
-    )
+    return get_kernel("gemm.dsv3_fused_a_gemm", KernelBackend.AOT)(mat_a, mat_b, output)
 
 
 def dsv3_router_gemm(
@@ -102,7 +100,7 @@ def dsv3_router_gemm(
     output: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """DeepSeek-V3 router GEMM (JIT-backed). ``out_dtype`` defaults to bfloat16."""
-    impl = get_kernel("gemm.dsv3_router_gemm", KernelBackend.CUDA_JIT)
+    impl = get_kernel("gemm.dsv3_router_gemm", KernelBackend.JIT)
     if out_dtype is None:
         return impl(hidden_states, router_weights, output=output)
     return impl(hidden_states, router_weights, out_dtype, output)

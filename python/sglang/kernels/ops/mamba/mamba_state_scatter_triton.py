@@ -452,3 +452,52 @@ def fused_conv_window_scatter_with_mask(
         dst_req_size,
         BLOCK_SIZE=BLOCK_SIZE,
     )
+
+
+def scatter_mamba_states_after_mtp_verify(
+    mamba_caches,
+    state_indices_tensor: torch.Tensor,
+    last_correct_step_indices: torch.Tensor,
+    mamba_track_indices: torch.Tensor | None,
+    mamba_steps_to_track: torch.Tensor | None,
+) -> None:
+    """Scatter per-step verify states (ssm + all conv types) into the
+    persistent caches, plus the interval-crossing track slots."""
+    ssm_states = mamba_caches.temporal
+    intermediate_state_cache = mamba_caches.intermediate_ssm
+
+    if ssm_states.numel() > 0:
+        fused_mamba_state_scatter_with_mask(
+            ssm_states,
+            intermediate_state_cache,
+            state_indices_tensor,
+            last_correct_step_indices,
+        )
+    for conv_states, intermediate_conv_window_cache in zip(
+        mamba_caches.conv, mamba_caches.intermediate_conv_window
+    ):
+        fused_conv_window_scatter_with_mask(
+            conv_states,
+            intermediate_conv_window_cache,
+            state_indices_tensor,
+            last_correct_step_indices,
+        )
+
+    if mamba_track_indices is not None:
+        assert mamba_steps_to_track is not None
+        if ssm_states.numel() > 0:
+            fused_mamba_state_scatter_with_mask(
+                ssm_states,
+                intermediate_state_cache,
+                mamba_track_indices,
+                mamba_steps_to_track,
+            )
+        for conv_states, intermediate_conv_window_cache in zip(
+            mamba_caches.conv, mamba_caches.intermediate_conv_window
+        ):
+            fused_conv_window_scatter_with_mask(
+                conv_states,
+                intermediate_conv_window_cache,
+                mamba_track_indices,
+                mamba_steps_to_track,
+            )

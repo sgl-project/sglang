@@ -25,7 +25,7 @@ from cutlass import BFloat16, Int32, Int64, Uint32, cute
 from cutlass.cute.nvgpu import cpasync, warp
 from quack.compile_utils import make_fake_tensor
 
-from sglang.srt.layers.attention.cute_utils import (
+from sglang.kernels.ops.attention.cute_utils import (
     EVICT_FIRST,
     _tcgen05,
     cvt,

@@ -112,6 +112,28 @@ def enable_nextn_moe_bf16_cast_to_fp8(
     )
 
 
+def is_wint4afp8_or_wint4a16_config(
+    quant_config: Optional[QuantizationConfig],
+) -> bool:
+    if quant_config is None:
+        return False
+    if quant_config.get_name() == "w4afp8":
+        return True
+
+    from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+        CompressedTensorsConfig,
+    )
+
+    if not isinstance(quant_config, CompressedTensorsConfig):
+        return False
+    linear_scheme = quant_config.target_scheme_map.get("Linear", {})
+    weight_quant = linear_scheme.get("weights")
+    input_quant = linear_scheme.get("input_activations")
+    return quant_config._is_wint4afp8(
+        weight_quant, input_quant
+    ) or quant_config._is_wint4abf16(weight_quant, input_quant)
+
+
 def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
     if scale <= 1:
         return 1.0

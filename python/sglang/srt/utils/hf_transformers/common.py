@@ -32,6 +32,10 @@ from sglang.srt.configs import (
     ExaoneConfig,
     FalconH1Config,
     GraniteMoeHybridConfig,
+    InklingAudioConfig,
+    InklingMMConfig,
+    InklingModelConfig,
+    InklingVisionConfig,
     InternS2PreviewConfig,
     JetNemotronConfig,
     JetVLMConfig,
@@ -113,6 +117,10 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
         Step3p7Config,
         MiniCPMV4_6Config,
         MiniCPMV4_6VisionConfig,
+        InklingModelConfig,
+        InklingAudioConfig,
+        InklingVisionConfig,
+        InklingMMConfig,
         MiniMaxM3VLConfig,
     ]
 }
@@ -521,9 +529,13 @@ def get_tokenizer_from_processor(processor):
     return processor.tokenizer
 
 
+# Turn-final markers that some checkpoints ship without EOS metadata:
+# <|eom_id|> (Llama-3 tool use) and <|content_model_end_sampling|> (Inkling,
+# whose bundled tokenizer config leaves eos_token unset).
+_ADDITIONAL_STOP_TOKEN_TEXTS = ("<|eom_id|>", "<|content_model_end_sampling|>")
+
+
 def attach_additional_stop_token_ids(tokenizer):
     added = tokenizer.get_added_vocab()
-    if "<|eom_id|>" in added:
-        tokenizer.additional_stop_token_ids = {added["<|eom_id|>"]}
-    else:
-        tokenizer.additional_stop_token_ids = None
+    stop_ids = {added[text] for text in _ADDITIONAL_STOP_TOKEN_TEXTS if text in added}
+    tokenizer.additional_stop_token_ids = stop_ids or None

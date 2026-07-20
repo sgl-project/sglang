@@ -21,6 +21,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
 from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
     ModelDeploymentConfig,
 )
+from sglang.multimodal_gen.runtime.utils.condition_expansion import (
+    PromptToSampleBatchExpander,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -96,6 +99,20 @@ class WanT2V480PConfig(PipelineConfig):
         return ModelDeploymentConfig(
             auto_dit_layerwise_offload=True,
         )
+
+    def expand_conditioning_to_sample_batch(self, batch):
+        expander = PromptToSampleBatchExpander.from_batch(batch)
+        if expander is None:
+            return batch
+
+        for field_name in (
+            "prompt_embeds",
+            "negative_prompt_embeds",
+            "image_embeds",
+            "image_latent",
+        ):
+            expander.expand_field(batch, field_name)
+        return batch
 
     def get_pos_prompt_embeds(self, batch):
         return batch.prompt_embeds[0]

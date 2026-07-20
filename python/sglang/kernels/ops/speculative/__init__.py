@@ -15,9 +15,13 @@ _TRITON_KERNELS = [
     ("eagle", "fill_bonus_tokens"),
     ("eagle", "fill_accept_out_cache_loc"),
     ("gather_spec_extras", "gather_spec_extras"),
-    ("multi_layer_eagle", "rotate_input_ids_triton"),
+    ("multi_layer_eagle", "rotate_input_ids"),
     ("spec_tree", "sgl_build_tree_kernel_efficient_triton"),
     ("spec_tree", "verify_tree_greedy_kernel_triton"),
+    ("topk1", "draft_topk1_postprocess"),
+    ("ragged_verify_kernels", "pad_verify_lens_to_bucket"),
+    ("ragged_verify_kernels", "build_qo_indptr"),
+    ("reject_sampling", "chain_speculative_sampling_triton"),
 ]
 for _mod, _fn in _TRITON_KERNELS:
     register_kernel(

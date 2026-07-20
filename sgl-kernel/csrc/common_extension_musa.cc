@@ -100,9 +100,6 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
   m.def("dsv3_fused_a_gemm(Tensor! output, Tensor mat_a, Tensor mat_b) -> ()");
   m.impl("dsv3_fused_a_gemm", torch::kMUSA, &dsv3_fused_a_gemm);
 
-  m.def("dsv3_router_gemm(Tensor! output, Tensor mat_a, Tensor mat_b) -> ()");
-  m.impl("dsv3_router_gemm", torch::kMUSA, &dsv3_router_gemm);
-
   /*
    * From csrc/moe
    */

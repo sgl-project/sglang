@@ -22,6 +22,7 @@ from sglang.srt.function_call.gigachat3_detector import GigaChat3Detector
 from sglang.srt.function_call.glm4_moe_detector import Glm4MoeDetector
 from sglang.srt.function_call.glm47_moe_detector import Glm47MoeDetector
 from sglang.srt.function_call.gpt_oss_detector import GptOssDetector
+from sglang.srt.function_call.inkling_detector import InklingDetector
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.function_call.kimik2_detector import KimiK2Detector
 from sglang.srt.function_call.lfm2_detector import Lfm2Detector
@@ -33,6 +34,249 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 register_cpu_ci(est_time=61, suite="base-c-test-cpu")
+
+
+class TestInklingDetector(unittest.TestCase):
+    def setUp(self):
+        self.tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="weather",
+                    description="Lookup weather",
+                    parameters={"type": "object"},
+                ),
+            )
+        ]
+
+    def test_canonical_header_is_not_visible_content(self):
+        detector = InklingDetector()
+        source = (
+            "<|message_model|>weather<|content_invoke_tool_json|>"
+            '{"name":"weather","args":{"city":"SF"}}<|end_message|>'
+        )
+        result = detector.detect_and_parse(source, self.tools)
+        self.assertEqual(result.normal_text, "")
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "weather")
+        self.assertEqual(json.loads(result.calls[0].parameters), {"city": "SF"})
+
+    def test_streaming_header_is_buffered_until_the_tool_kind(self):
+        detector = InklingDetector()
+        chunks = [
+            "<|message_model|>",
+            "weat",
+            "her",
+            "<|content_invoke_tool_json|>",
+            '{"name":"weather",',
+            '"args":{"city":"SF"}}',
+            "<|end_message|>",
+        ]
+        normal_text = ""
+        name = None
+        parameters = ""
+        for chunk in chunks:
+            result = detector.parse_streaming_increment(chunk, self.tools)
+            normal_text += result.normal_text
+            for call in result.calls:
+                name = call.name or name
+                parameters += call.parameters
+        self.assertEqual(normal_text, "")
+        self.assertEqual(name, "weather")
+        self.assertEqual(json.loads(parameters), {"city": "SF"})
+
+    def test_mismatched_header_is_rejected(self):
+        detector = InklingDetector()
+        source = (
+            "<|message_model|>other<|content_invoke_tool_json|>"
+            '{"name":"weather","args":{}}<|end_message|>'
+        )
+        result = detector.detect_and_parse(source, self.tools)
+        self.assertEqual(result.calls, [])
+
+    def test_rejected_call_does_not_leak_protocol_tokens(self):
+        """Bug regression: the no-surviving-calls path returned the RAW text,
+        so a rejected call (e.g. header/payload mismatch) leaked <|...|>
+        protocol tokens into user-visible content."""
+        detector = InklingDetector()
+        source = (
+            "<|message_model|>other<|content_invoke_tool_json|>"
+            '{"name":"weather","args":{}}<|end_message|>'
+        )
+        result = detector.detect_and_parse(source, self.tools)
+        self.assertNotIn("<|", result.normal_text)
+        # Framework parity: the rejected tool-call REGION is dropped entirely
+        # (normal_text = content before the marker), like every other detector
+        # — the JSON payload must not surface as visible content either.
+        self.assertEqual(result.normal_text, "")
+
+    def test_headerless_legacy_tool_call_still_parses(self):
+        """Spec tolerance: a bare <|content_invoke_tool_json|> block with no
+        <|message_model|>name header (the pre-canonical form) must keep
+        parsing in both modes."""
+        source = '<|content_invoke_tool_json|>{"name":"weather","args":{"city":"SF"}}<|end_message|>'
+        result = InklingDetector().detect_and_parse(source, self.tools)
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "weather")
+
+        streaming = InklingDetector()
+        name = None
+        parameters = ""
+        for char in source:
+            for call in streaming.parse_streaming_increment(char, self.tools).calls:
+                name = call.name or name
+                parameters += call.parameters
+        self.assertEqual(name, "weather")
+        self.assertEqual(json.loads(parameters), {"city": "SF"})
+
+    def test_streaming_two_sequential_tool_calls_get_distinct_indices(self):
+        """Coverage for multi-call responses: two back-to-back canonical tool
+        calls must stream as tool_index 0 and 1 with per-call args."""
+        detector = InklingDetector()
+        source = (
+            "<|message_model|>weather<|content_invoke_tool_json|>"
+            '{"name":"weather","args":{"city":"SF"}}<|end_message|>'
+            "<|message_model|>weather<|content_invoke_tool_json|>"
+            '{"name":"weather","args":{"city":"NY"}}<|end_message|>'
+        )
+        args_by_index: dict = {}
+        for char in source:
+            for call in detector.parse_streaming_increment(char, self.tools).calls:
+                args_by_index[call.tool_index] = (
+                    args_by_index.get(call.tool_index, "") + call.parameters
+                )
+        self.assertEqual(sorted(args_by_index), [0, 1])
+        self.assertEqual(json.loads(args_by_index[0]), {"city": "SF"})
+        self.assertEqual(json.loads(args_by_index[1]), {"city": "NY"})
+
+    def test_streaming_rejection_does_not_collide_tool_indices(self):
+        """Bug regression: a rejected mid-stream call reset current_tool_id to
+        -1, so the NEXT valid call re-announced as tool_index 0 — colliding
+        with the first call's index and slicing its arguments against index
+        0's already-streamed args."""
+        detector = InklingDetector()
+        chunks = [
+            "<|message_model|>weather<|content_invoke_tool_json|>",
+            '{"name":"weather","args":{"city":"SF"}}<|end_message|>',
+            # header/payload mismatch -> rejected
+            "<|message_model|>other<|content_invoke_tool_json|>",
+            '{"name":"weather","args":{"city":"NY"}}<|end_message|>',
+            # valid again
+            "<|message_model|>weather<|content_invoke_tool_json|>",
+            '{"name":"weather","args":{"city":"LA"}}<|end_message|>',
+        ]
+        args_by_index: dict = {}
+        for chunk in chunks:
+            for call in detector.parse_streaming_increment(chunk, self.tools).calls:
+                args_by_index[call.tool_index] = (
+                    args_by_index.get(call.tool_index, "") + call.parameters
+                )
+        self.assertEqual(json.loads(args_by_index[0]), {"city": "SF"})
+        self.assertEqual(len(args_by_index), 2)
+        second_index = max(args_by_index)
+        self.assertGreater(second_index, 0)
+        self.assertEqual(json.loads(args_by_index[second_index]), {"city": "LA"})
+
+    def test_undeclared_tool_name_is_surfaced(self):
+        """A call to a tool absent from the request's tool list surfaces as a
+        structured tool_call (OpenAI behavior for hallucinated tools) so agent
+        harnesses can return a tool error and let the model self-correct,
+        instead of the serialized invocation becoming terminal answer text."""
+        detector = InklingDetector()
+        source = (
+            "<|message_model|>document_search<|content_invoke_tool_json|>"
+            '{"name":"document_search","args":{"query":"q"}}<|end_message|>'
+        )
+        result = detector.detect_and_parse(source, self.tools)
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "document_search")
+        self.assertEqual(json.loads(result.calls[0].parameters), {"query": "q"})
+        self.assertNotIn("<|", result.normal_text)
+
+    def test_undeclared_tool_name_surfaces_in_streaming(self):
+        detector = InklingDetector()
+        source = (
+            "<|message_model|>document_search<|content_invoke_tool_json|>"
+            '{"name":"document_search","args":{"query":"q"}}<|end_message|>'
+        )
+        normal_text = ""
+        name = None
+        parameters = ""
+        for char in source:
+            result = detector.parse_streaming_increment(char, self.tools)
+            normal_text += result.normal_text
+            for call in result.calls:
+                name = call.name or name
+                parameters += call.parameters
+        self.assertEqual(name, "document_search")
+        self.assertEqual(json.loads(parameters), {"query": "q"})
+        self.assertNotIn("<|", normal_text)
+
+    def test_malformed_json_does_not_leak_protocol_tokens(self):
+        """Malformed JSON must drop the protocol region and its tool header."""
+        detector = InklingDetector()
+        source = (
+            "<|message_model|>weather<|content_invoke_tool_json|>"
+            "{not json at all<|end_message|>"
+        )
+        result = detector.detect_and_parse(source, self.tools)
+        self.assertEqual(result.calls, [])
+        self.assertEqual(result.normal_text, "")
+
+    def test_parser_does_not_restore_malformed_tool_call_as_text(self):
+        """The parser wrapper must preserve the detector's sanitized fallback."""
+        from sglang.srt.function_call.function_call_parser import FunctionCallParser
+
+        source = (
+            "Visible prefix."
+            "<|message_model|>weather<|content_invoke_tool_json|>"
+            "{not json at all<|end_message|>"
+        )
+        normal_text, calls = FunctionCallParser(self.tools, "inkling").parse_non_stream(
+            source
+        )
+        self.assertEqual(normal_text, "Visible prefix.")
+        self.assertEqual(calls, [])
+
+    def test_parser_preserves_text_without_tool_call_marker(self):
+        from sglang.srt.function_call.function_call_parser import FunctionCallParser
+
+        source = "  Ordinary assistant text.  "
+        normal_text, calls = FunctionCallParser(self.tools, "inkling").parse_non_stream(
+            source
+        )
+        self.assertEqual(normal_text, source)
+        self.assertEqual(calls, [])
+
+    def test_malformed_call_does_not_discard_an_earlier_valid_call(self):
+        source = (
+            "<|message_model|>weather<|content_invoke_tool_json|>"
+            '{"name":"weather","args":{"city":"SF"}}<|end_message|>'
+            "<|message_model|>weather<|content_invoke_tool_json|>"
+            "{not json at all<|end_message|>"
+        )
+        result = InklingDetector().detect_and_parse(source, self.tools)
+        self.assertEqual(result.normal_text, "")
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "weather")
+        self.assertEqual(json.loads(result.calls[0].parameters), {"city": "SF"})
+
+    def test_clean_normal_text_strips_the_full_control_alphabet(self):
+        """Fall-through text is cleaned against the whole shared control-token
+        alphabet, not a hand-picked subset."""
+        detector = InklingDetector()
+        source = (
+            "<|message_model|><|content_thinking|>leak<|end_message|>"
+            "<|message_user|>x<|content_audio_input|><|audio_end|>"
+        )
+        result = detector.detect_and_parse(source, self.tools)
+        self.assertNotIn("<|", result.normal_text)
+
+    def test_structural_tag_uses_the_canonical_header(self):
+        info = InklingDetector().structure_info()("weather")
+        header = "<|message_model|>weather<|content_invoke_tool_json|>"
+        self.assertEqual(info.trigger, header)
+        self.assertTrue(info.begin.startswith(header + '{"name":"weather"'))
 
 
 class TestPythonicDetector(unittest.TestCase):
@@ -3967,6 +4211,31 @@ class TestGetStructureConstraint(unittest.TestCase):
         parser = self._make_parser("kimi_k2", strict=False)
         result = parser.get_structure_constraint("auto")
         self.assertIsNone(result)
+
+    def test_inkling_auto_constrains_json_after_tool_trigger(self):
+        import xgrammar as xgr
+
+        from sglang.srt.parser.inkling_tokenizer import INKLING_SPECIAL_TOKEN_IDS
+
+        parser = self._make_parser("inkling", strict=False)
+        result = parser.get_structure_constraint("auto")
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result[0], "structural_tag")
+        self.assertIsInstance(result[1], xgr.StructuralTag)
+        format_ = result[1].model_dump()["format"]
+        self.assertEqual(format_["type"], "token_triggered_tags")
+        self.assertEqual(
+            format_["trigger_tokens"],
+            [INKLING_SPECIAL_TOKEN_IDS["<|content_invoke_tool_json|>"]],
+        )
+        tag = format_["tags"][0]
+        self.assertEqual(
+            tag["end"]["token"], INKLING_SPECIAL_TOKEN_IDS["<|end_message|>"]
+        )
+        schema = tag["content"]["json_schema"]
+        self.assertEqual(schema["required"], ["name", "args"])
+        self.assertFalse(schema["additionalProperties"])
 
     def test_kimi_named_tool_choice_returns_structural_tag(self):
         from sglang.srt.entrypoints.openai.protocol import (

@@ -19,6 +19,7 @@ _GROUPS = (
     "attention",
     "communication",
     "diffusion",
+    "embeddings",
     "gemm",
     "grammar",
     "kvcache",
