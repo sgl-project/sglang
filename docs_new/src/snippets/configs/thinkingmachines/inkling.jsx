@@ -33,6 +33,20 @@ export const config = {
     { id: "multi-2", label: "Multi-Nodes" },
   ],
 
+  // Eval set rendered in the benchmark card, keyed to per-cell `accuracy` in
+  // inkling-benchmarks.jsx. All measured at reasoning_effort `max` (0.99).
+  // AIME25 = pass@1 averaged over 8 repeats; NIAH = single-needle retrieval at
+  // that context length; HLE = self-judged on the text-only subset.
+  accuracyLabels: [
+    ["bfcl_pct",      "BFCL (EXACT)",    "%"],
+    ["mmau_pct",      "MMAU",            "%"],
+    ["mmmu_pro_pct",  "MMMU-Pro",        "%"],
+    ["aime25_pct",    "AIME25 (pass@1)", "%"],
+    ["niah_512k_pct", "NIAH @512K",      "%"],
+    ["niah_1m_pct",   "NIAH @1M",        "%"],
+    ["hle_pct",       "HLE",             "%"],
+  ],
+
   // HF repos under the thinkingmachines org.
   modelNames: {
     "default|nvfp4": "thinkingmachines/Inkling-NVFP4",
