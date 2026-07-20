@@ -54,7 +54,14 @@ def l2norm_fwd_kernel1(
 # )
 @triton.jit
 def _l2norm_row_block(
-    x, y, eps, i_t, T: tl.constexpr, D: tl.constexpr, BT: tl.constexpr, BD: tl.constexpr
+    x,
+    y,
+    eps,
+    i_t,
+    T,
+    D: tl.constexpr,
+    BT: tl.constexpr,
+    BD: tl.constexpr,
 ):
     # The packed fused path's 0-ULP contract also depends on this block-pointer
     # load and round-to-nearest store in the input dtype. The numerical formula
@@ -66,13 +73,12 @@ def _l2norm_row_block(
     tl.store(p_y, b_y.to(p_y.dtype.element_ty), boundary_check=(0, 1))
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["T"])
 def l2norm_fwd_kernel(
     x,
     y,
     eps,
-    NB: tl.constexpr,
-    T: tl.constexpr,
+    T,
     D: tl.constexpr,
     BT: tl.constexpr,
     BD: tl.constexpr,
@@ -100,7 +106,6 @@ def l2norm_fwd(
         raise RuntimeError("This layer doesn't support feature dim >= 64KB.")
 
     if D <= 512:
-        NB = triton.cdiv(T, 2048)
 
         def grid(meta):
             return (triton.cdiv(T, meta["BT"]),)
@@ -109,7 +114,6 @@ def l2norm_fwd(
             x,
             y,
             eps,
-            NB=NB,
             T=T,
             D=D,
             BD=BD,
