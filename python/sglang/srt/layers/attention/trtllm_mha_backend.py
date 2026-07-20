@@ -962,7 +962,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             and not use_fused_qkv
         ):
             q = q.to(torch.float8_e4m3fn)
-        q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+        if self.is_xqa_impl:
+            q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+        else:
+            q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
 
         if self.is_nvfp4_kvcache:
             kv_cache, kv_cache_block_scales = self._get_nvfp4_decode_kv_cache(layer)
