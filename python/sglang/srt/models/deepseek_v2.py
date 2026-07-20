@@ -545,7 +545,8 @@ def _deepep_moe_experts_eager(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     router_logits: torch.Tensor,
-) -> torch.Tensor:
+    output: torch.Tensor,
+) -> None:
     """Run dispatch -> experts -> combine eagerly between BCG segments.
 
     The prefill graph runner pins is_extend_in_batch=False so that MoE
@@ -554,6 +555,10 @@ def _deepep_moe_experts_eager(
     captured under BCG — it re-runs on every replay — so NORMAL mode is
     legal here (its host-synchronizing dispatch happens between segments)
     and is the bandwidth-efficient transport for prefill-sized payloads.
+
+    Mutates output (allocated by the caller inside the captured region,
+    i.e. graph-pool storage the pool reuses across shapes) and returns None,
+    so eager_on_graph retains no per-shape bridge tensor for this break.
     """
     from sglang.srt.layers.dp_attention import (
         get_is_extend_in_batch,
@@ -564,9 +569,11 @@ def _deepep_moe_experts_eager(
     saved_is_extend_in_batch = get_is_extend_in_batch()
     set_is_extend_in_batch(True)
     try:
-        return experts(
-            hidden_states=hidden_states,
-            topk_output=StandardTopKOutput(topk_weights, topk_ids, router_logits),
+        output.copy_(
+            experts(
+                hidden_states=hidden_states,
+                topk_output=StandardTopKOutput(topk_weights, topk_ids, router_logits),
+            )
         )
     finally:
         set_is_extend_in_batch(saved_is_extend_in_batch)
@@ -1443,12 +1450,14 @@ class DeepseekV2MoE(nn.Module):
         from sglang.srt.layers.moe.topk import StandardTopKOutput
 
         if is_in_breakable_cuda_graph() and isinstance(topk_output, StandardTopKOutput):
-            final_hidden_states = bcg_deepep_moe_experts(
+            final_hidden_states = torch.empty_like(hidden_states)
+            bcg_deepep_moe_experts(
                 self.experts,
                 hidden_states,
                 topk_output.topk_weights,
                 topk_output.topk_ids,
                 topk_output.router_logits,
+                final_hidden_states,
             )
         else:
             final_hidden_states = self.experts(
