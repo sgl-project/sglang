@@ -82,6 +82,17 @@ class SchedulerDllmMixin:
         if result.copy_done is not None:
             result.copy_done.synchronize()
 
+        # Pure prefill only commits prompt KV. It produces neither a denoising
+        # state nor generated tokens, including when FDFO is enabled.
+        if batch.is_dllm_prefill:
+            self.metrics_reporter.report_prefill_stats(
+                batch=batch,
+                prefill_stats=batch.prefill_stats,
+                can_run_cuda_graph=result.can_run_cuda_graph,
+                dp_cooperation_info=batch.dp_cooperation_info,
+            )
+            return
+
         fdfo_mode = self.dllm_config.first_done_first_out_mode
         assert (
             not fdfo_mode or result.accept_length_per_req_cpu is not None

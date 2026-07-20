@@ -506,6 +506,18 @@ class TpModelWorker(BaseTpWorker):
         forward_batch: ForwardBatch,
         batch: Optional[ScheduleBatch] = None,
     ) -> GenerationBatchResult:
+        # Pure prefill only populates the KV cache. It may contain more than one
+        # dLLM block and therefore must not enter the fixed-block denoising loop.
+        if forward_batch.is_dllm_prefill:
+            out = self.model_runner.forward(forward_batch, pp_proxy_tensors=None)
+            return GenerationBatchResult(
+                logits_output=out.logits_output,
+                can_run_cuda_graph=out.can_run_graph,
+                expert_distribution_metrics=out.expert_distribution_metrics,
+                routed_experts_output=out.routed_experts_output,
+                indexer_topk_output=out.indexer_topk_output,
+            )
+
         algo_states = None
         if self.dllm_algorithm.fdfo and batch is not None:
             algo_states = [req.dllm_algo_state for req in batch.reqs]

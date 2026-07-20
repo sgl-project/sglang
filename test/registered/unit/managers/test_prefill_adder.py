@@ -381,6 +381,67 @@ class TestPrefillAdder(CustomTestCase):
             self.assertEqual(init.call_args.kwargs["is_dllm_prefill"], expected)
             self.assertEqual(batch.forward_mode, forward_mode)
 
+    def test_dllm_prefill_worker_bypasses_denoising_algorithm(self):
+        from sglang.srt.managers.tp_worker import TpModelWorker
+
+        logits_output = object()
+        runner_output = SimpleNamespace(
+            logits_output=logits_output,
+            can_run_graph=True,
+            expert_distribution_metrics=None,
+            routed_experts_output=None,
+            indexer_topk_output=None,
+        )
+        model_runner = MagicMock()
+        model_runner.forward.return_value = runner_output
+        algorithm = MagicMock()
+        algorithm.fdfo = True
+        worker = SimpleNamespace(model_runner=model_runner, dllm_algorithm=algorithm)
+        forward_batch = SimpleNamespace(is_dllm_prefill=True)
+
+        result = TpModelWorker._forward_batch_generation_dllm(
+            worker, forward_batch, batch=MagicMock()
+        )
+
+        model_runner.forward.assert_called_once_with(
+            forward_batch, pp_proxy_tensors=None
+        )
+        algorithm.run.assert_not_called()
+        self.assertIs(result.logits_output, logits_output)
+        self.assertTrue(result.can_run_cuda_graph)
+        self.assertIsNone(result.next_token_ids)
+        self.assertIsNone(result.accept_length_per_req_cpu)
+
+    def test_dllm_prefill_result_skips_fdfo_token_processing(self):
+        scheduler = SimpleNamespace(
+            metrics_reporter=MagicMock(),
+            dllm_config=SimpleNamespace(first_done_first_out_mode=True, block_size=32),
+            token_to_kv_pool_allocator=MagicMock(),
+            output_streamer=MagicMock(),
+        )
+        batch = SimpleNamespace(
+            is_dllm_prefill=True,
+            prefill_stats=object(),
+            dp_cooperation_info=object(),
+        )
+        result = SimpleNamespace(
+            copy_done=None,
+            can_run_cuda_graph=True,
+            accept_length_per_req_cpu=None,
+            next_token_ids=None,
+        )
+
+        SchedulerDllmMixin.process_batch_result_dllm(scheduler, batch, result)
+
+        scheduler.token_to_kv_pool_allocator.free_group_begin.assert_not_called()
+        scheduler.output_streamer.stream_output.assert_not_called()
+        scheduler.metrics_reporter.report_prefill_stats.assert_called_once_with(
+            batch=batch,
+            prefill_stats=batch.prefill_stats,
+            can_run_cuda_graph=True,
+            dp_cooperation_info=batch.dp_cooperation_info,
+        )
+
     def test_dllm_prefill_cuda_graph_capability_gate(self):
         class FakeBreakableBackend:
             pass
