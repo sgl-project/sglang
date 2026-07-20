@@ -447,7 +447,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             self.backend.capture_one(
                 shape_key,
                 run_once,
-                dummies=None,
+                capture_inputs=None,
                 post_warmup_hook=post_warmup_hook,
             )
 

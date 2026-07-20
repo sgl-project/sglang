@@ -225,7 +225,7 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
         self,
         shape_key: ShapeKey,
         forward_fn: Callable[[], Any],
-        dummies: Optional[Any] = None,
+        capture_inputs: Optional[Any] = None,
         post_warmup_hook: Optional[Callable[[], None]] = None,
     ) -> None:
         # Call 1 warms FX state; call 2 captures the cuda graph inside capture_session.
