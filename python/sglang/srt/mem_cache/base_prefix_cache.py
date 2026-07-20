@@ -68,6 +68,11 @@ class InsertParams:
     chunked: bool = False
     priority: int = 0
 
+    # Logical-page KV sharding: rotation base of the chain the inserted
+    # values belong to (stamped onto new TreeNodes; None when sharding is
+    # off). See TreeNode.rotation_base.
+    rotation_base: Optional[int] = None
+
 
 @dataclasses.dataclass
 class InsertResult:

@@ -133,11 +133,12 @@ def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
 def _evict_until_allocatable(
     tree_cache: BasePrefixCache, allocator, num_tokens: int
 ) -> None:
-    """Sub-granule KV sharding: evicted tokens may strand in partially-live
-    groups (the allocator reclaims a group only when its last live page dies),
-    so one evict() sized in tokens can yield less allocatable memory than it
-    freed. Iterate — deterministic and mirrored across shard-group ranks —
-    until whole free groups cover the need or the tree runs dry."""
+    """Classed KV sharding: available_size() is the MIN-CLASS capacity floor,
+    and one evict() sized in tokens can raise the tight class by less than
+    the tokens it freed (evicted pages spread across all classes). Iterate —
+    deterministic and mirrored across shard-group ranks — until the min-class
+    floor covers the need or the tree runs dry (the per-class evict loop of
+    DESIGN_kv_shard_classed_page_alloc.md §4)."""
     if page_interleave_shard_size(allocator) <= 1:
         return
     while allocator.available_size() < num_tokens:

@@ -5421,11 +5421,13 @@ class ServerArgs:
                 "--enable-kv-cache-sharding currently requires the fa3 "
                 f"prefill attention backend, got {prefill_backend!r}."
             )
-        if self.disaggregation_transfer_backend != "mooncake":
+        if self.disaggregation_transfer_backend not in ("mooncake", "nixl"):
             raise ValueError(
                 "--enable-kv-cache-sharding currently only supports the "
-                "mooncake transfer backend (the owner-strided send filter is "
-                "only vetted there). Got --disaggregation-transfer-backend "
+                "mooncake and nixl transfer backends: both route sends "
+                "through CommonKVSender._prepare_send_indices (the "
+                "owner-strided filter) and pair destinations by fancy "
+                "index. Got --disaggregation-transfer-backend "
                 f"{self.disaggregation_transfer_backend!r}."
             )
         if envs.SGLANG_DISAGG_STAGING_BUFFER.get():

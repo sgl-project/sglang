@@ -83,6 +83,7 @@ class MockReq:
         self.priority = 0
         self.kv_committed_len = len(fill_ids)
         self.kv = SimpleNamespace(kv_allocated_len=len(fill_ids))
+        self.kv_rotation_base = None
 
     def get_fill_ids(self):
         return self.full_untruncated_fill_ids[: self.extend_range.end]

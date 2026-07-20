@@ -202,30 +202,18 @@ def alloc_paged_token_slots_extend(
     # Over estimate the number of tokens: assume each request needs a new page.
     allocator = tree_cache.token_to_kv_pool_allocator
     num_tokens = extend_num_tokens + len(seq_lens_cpu) * allocator.page_size
-    if page_interleave_shard_size(allocator) > 1:
-        # Sub-granule prefix reuse: each mid-group prefix hit consumes one
-        # fresh group for the adoption prologue below. Counted exactly so
-        # granule-aligned batches keep pre-adoption eviction behavior.
-        n_adopt = int((prefix_lens_cpu % allocator.page_size > 0).sum())
-        num_tokens += n_adopt * allocator.page_size
     evict_from_tree_cache(tree_cache, num_tokens)
 
     state = None
     if backup_state:
         state = allocator.backup_state()
 
-    if page_interleave_shard_size(allocator) > 1:
-        # Fresh-group adoption: a prefix hit ending mid-group must never
-        # extend in place into the shared boundary group (concurrent
-        # extenders would write the same dead slots, and the group would
-        # straddle the prefix/chunk scratch regions); the first new token
-        # goes to the position-congruent offset of a fresh group instead.
-        # None means the free list could not supply the adopted groups —
-        # flow into the shared OOM error path below.
-        last_loc = allocator.adopt_partial_prefix_groups(prefix_lens_cpu, last_loc)
-
     is_dsv4 = req_pool_indices is not None and hasattr(allocator, "c4_attn_allocator")
     extra_alloc_kwargs = {}
+    if page_interleave_shard_size(allocator) > 1:
+        extra_alloc_kwargs["rotation_base"] = _kv_shard_rotation_base(
+            batch=batch, prefix_lens_cpu=prefix_lens_cpu, allocator=allocator
+        )
     if is_dsv4:
         extra_alloc_kwargs["req_pool_indices"] = req_pool_indices
         # Per-call per-req tables for the c-pool / state last_loc lookup.
@@ -234,18 +222,14 @@ def alloc_paged_token_slots_extend(
         if dsv4_state_lens is not None:
             extra_alloc_kwargs["dsv4_state_lens"] = dsv4_state_lens
 
-    out = (
-        allocator.alloc_extend(
-            prefix_lens,
-            prefix_lens_cpu,
-            seq_lens,
-            seq_lens_cpu,
-            last_loc,
-            extend_num_tokens,
-            **extra_alloc_kwargs,
-        )
-        if last_loc is not None
-        else None
+    out = allocator.alloc_extend(
+        prefix_lens,
+        prefix_lens_cpu,
+        seq_lens,
+        seq_lens_cpu,
+        last_loc,
+        extend_num_tokens,
+        **extra_alloc_kwargs,
     )
 
     if is_dsv4:
@@ -268,6 +252,50 @@ def alloc_paged_token_slots_extend(
         raise RuntimeError(error_msg)
 
     return (out_cache_loc, state) if backup_state else out_cache_loc
+
+
+def _kv_shard_rotation_base(
+    batch: ScheduleBatch, prefix_lens_cpu: torch.Tensor, allocator
+) -> int:
+    """Rotation base ``b`` of the (single) request's chain, host-only.
+
+    Class of position-page P is ``(b + P) % shard_size``
+    (DESIGN_kv_shard_classed_page_alloc.md §3). Rules:
+
+    - Read through ``req.last_node`` at alloc time, never a value cached on
+      the request: ``cache_unfinished_req`` can rebind a chunked request onto
+      another chain's canonical locs between chunks, changing the base.
+    - A request without a cached prefix starts a new chain: draw ``b`` from
+      the least-full class (mirrored, deterministic tie-break).
+    - ChunkCache has no tree nodes (``last_node`` is None); its chunked
+      continuations fall back to the base recorded on the request at the
+      previous chunk's alloc (no cross-request reuse, no rebind there).
+
+    The chosen base is recorded on the request for the radix insert to stamp
+    onto new tree nodes (``TreeNode.rotation_base``).
+    """
+    from sglang.srt.mem_cache.radix_cache import TreeNode
+
+    assert batch is not None and len(batch.reqs) == 1, (
+        "logical-page KV sharding v1 allocates one request per extend batch, "
+        f"got {0 if batch is None else len(batch.reqs)}"
+    )
+    req = batch.reqs[0]
+    if int(prefix_lens_cpu[0]) == 0:
+        base = allocator.least_full_class()
+    elif (
+        isinstance(req.last_node, TreeNode) and req.last_node.rotation_base is not None
+    ):
+        base = req.last_node.rotation_base
+    else:
+        base = req.kv_rotation_base
+        assert base is not None, (
+            "sharded extend with a cached prefix but no rotation base: "
+            "req.last_node carries none and the request recorded none at a "
+            "previous alloc"
+        )
+    req.kv_rotation_base = base
+    return base
 
 
 def alloc_req_slots(

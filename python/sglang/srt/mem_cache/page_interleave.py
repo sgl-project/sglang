@@ -38,8 +38,6 @@ from typing import TYPE_CHECKING, Optional, Tuple
 import msgspec
 import torch
 
-from sglang.srt.environ import envs
-
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state import GroupCoordinator
     from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
@@ -146,15 +144,14 @@ def compute_page_shard_scratch_bytes(kvc: KVCacheConfigurator) -> int:
 
     model_config = kvc.model_config
     granule = shard_size * kvc.page_size
-    # The prefix region carries one extra granule per provisioned turn (a
-    # cached mid-group turn boundary in a reused chain costs one plan
-    # group; the chunk region one extra granule (a mid-group prefix hit
-    # shifts the chunk's group span by up to one group).
+    # Rotated owner-classed allocation: a K-page prefix gathers as
+    # N * ceil(K / N) pages <= ceil_align(context_len, granule), exactly —
+    # rotation keeps per-rank owned counts within 1, so there is no per-turn
+    # seam term. The chunk region is per-page (chunk boundaries are
+    # ps-floored).
     rows = (
         ceil_align(model_config.context_len, granule)
-        + envs.SGLANG_KV_SHARD_MAX_PREFIX_TURNS.get() * granule
-        + ceil_align(kvc.server_args.chunked_prefill_size, granule)
-        + granule
+        + ceil_align(kvc.server_args.chunked_prefill_size, kvc.page_size)
         + kvc.page_size
     )
     kv_size = torch._utils._element_size(kvc.kv_cache_dtype)

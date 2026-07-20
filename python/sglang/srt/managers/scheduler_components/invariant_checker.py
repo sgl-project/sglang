@@ -105,7 +105,9 @@ class SchedulerInvariantChecker:
             session_held = self.pool_stats_observer.session_held_tokens()
             total = self.max_total_num_tokens
         full_evictable_size = ps.full_evictable_size
+        full_available_size = ps.full_available_size
         allocator = self.token_to_kv_pool_allocator
+        class_watermark_msg = ""
         widened_page_alloc = (
             getattr(self.server_args, "dcp_size", 1) > 1
             or self.server_args.enable_kv_cache_sharding
@@ -116,13 +118,17 @@ class SchedulerInvariantChecker:
             )
 
             if page_interleave_shard_size(allocator) > 1:
-                # Logical-page KV sharding: the tree quantizes at the PHYSICAL
-                # page (sub-granule reuse), so round cached tokens up to
-                # physical pages, and count dead pages trapped inside
-                # partially-live groups — they are neither allocatable nor
-                # evictable until their group drains.
+                # Rotated owner-classed KV sharding: the accounting identity
+                # needs the AGGREGATE free size — the admission-facing
+                # available_size() is the min-class capacity floor and
+                # under-reports the aggregate by the (bounded) class skew.
+                # Export the per-class free-page watermarks here: they gate
+                # the deferred rebalancing knobs (design §4.1).
                 round_to = allocator.physical_page_size
-                full_evictable_size += allocator.dead_size()
+                full_available_size = allocator.aggregate_free_size()
+                class_watermark_msg = (
+                    f", class_free_pages={allocator.class_free_page_counts()}"
+                )
             else:
                 # DCP stores logical tokens in widened allocator pages. Prefix
                 # cache counters are logical-token based, while the allocator
@@ -134,13 +140,14 @@ class SchedulerInvariantChecker:
             )
         leak, msg = self._check_pool_invariant(
             "full",
-            ps.full_available_size,
+            full_available_size,
             full_evictable_size,
             protected,
             session_held,
             total,
             uncached,
         )
+        msg += class_watermark_msg
         if leak and widened_page_alloc:
             # Radix/Mamba cache accounting is logical-token based while the
             # widened-page allocation is page based. Partial allocator pages
@@ -361,11 +368,18 @@ class SchedulerInvariantChecker:
         owner_locs = rtt[idx][mask]
 
         # Sub-allocators to check: a flat allocator is its own single sub; a
-        # hybrid-SWA wrapper exposes full_attn_allocator + swa_attn_allocator.
+        # hybrid-SWA wrapper exposes full_attn_allocator + swa_attn_allocator;
+        # the classed sharding allocator keeps per-class lists instead of a
+        # flat free_pages and exposes them through debug_all_free_pages().
+        from sglang.srt.mem_cache.allocator.page_interleave import (
+            page_interleave_shard_size,
+        )
+
         alloc = self.token_to_kv_pool_allocator
         sub_allocs = (
             [alloc]
             if getattr(alloc, "free_pages", None) is not None
+            or page_interleave_shard_size(alloc) > 1
             else [
                 sub
                 for n in ("full_attn_allocator", "swa_attn_allocator")
@@ -376,12 +390,14 @@ class SchedulerInvariantChecker:
         if not sub_allocs:
             return
 
-        # Page ids must be in the ALLOCATOR's page units — under DCP /
-        # logical-page KV sharding the full allocator's page is widened
-        # relative to the kernel page size self.page_size.
+        # Page ids in the ALLOCATOR's page units (== the physical page for
+        # the classed sharding allocator, whose free lists hold logical page
+        # ids in the same unit).
         owner_pages = owner_locs // sub_allocs[0].page_size
 
         def _free_pages(a):
+            if page_interleave_shard_size(a) > 1:
+                return a.debug_all_free_pages()
             free = a.free_pages
             release = getattr(a, "release_pages", None)
             return (

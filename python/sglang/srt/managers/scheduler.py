@@ -1334,10 +1334,10 @@ class Scheduler(
 
     def _apply_kv_shard_truncation_align(self):
         # Logical-page KV sharding: every chunk boundary must land on a
-        # logical-page (allocator-granule) boundary so each chunk's writes
-        # cover whole groups and the prefix gather stays a regular allgather
-        # (design doc §5). Compose with the deterministic-inference value via
-        # lcm when both are set.
+        # physical-page boundary (the allocator's working quantum) so no
+        # page straddles the prefix/chunk scratch regions and the stride-ps
+        # wire sampling stays exact. Compose with the deterministic-inference
+        # value via lcm when both are set.
         from sglang.srt.mem_cache.allocator.page_interleave import (
             page_interleave_shard_size,
         )

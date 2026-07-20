@@ -540,27 +540,29 @@ class PrefillAdder:
         self.dsa_prefill_cp_in_seq_split = is_dsa_prefill_cp_in_seq_split()
         self.max_running_requests = max_running_requests
         self.prefill_context_parallel_enabled = is_prefill_context_parallel_enabled()
-        # Logical-page KV sharding: the allocation granule (allocator page) all
-        # mid-request chunk boundaries must land on; 0 when sharding is off.
-        # v1 also restricts sharded prefill batches to a single request (the
-        # assembly scratch is sized for one request's [prefix | chunk]).
+        # Logical-page KV sharding: the physical-page quantum all mid-request
+        # chunk boundaries must land on (the allocator's working page under
+        # the classed rewrite); 0 when sharding is off. v1 also restricts
+        # sharded prefill batches to a single request (the assembly scratch
+        # is sized for one request's [prefix | chunk]).
         from sglang.srt.mem_cache.allocator.page_interleave import (
             page_interleave_shard_size,
         )
 
+        kv_shard_size = page_interleave_shard_size(self.token_to_kv_pool_allocator)
         self.kv_shard_granule = (
-            self.token_to_kv_pool_allocator.page_size
-            if page_interleave_shard_size(self.token_to_kv_pool_allocator) > 1
-            else 0
+            self.token_to_kv_pool_allocator.page_size if kv_shard_size > 1 else 0
         )
         # Per-request KV reserve charged at admission. Stock alloc_extend can
         # consume up to one extra page per request beyond the extend length;
-        # under sharding a request can additionally consume one granule of
-        # whole-group tail rounding plus one adopted group (mid-group prefix
-        # hit) — reserve both so admission defers (NO_TOKEN) instead of
+        # under sharding the min-class admission gate needs one page per
+        # class (the ceil(K/N) rounding of cyclic class draws, phase-
+        # agnostic) — reserve N*ps so admission defers (NO_TOKEN) instead of
         # over-committing into the alloc path's fail-loud RuntimeError.
         self.per_req_token_overhead = (
-            2 * self.kv_shard_granule if self.kv_shard_granule else self.page_size
+            kv_shard_size * self.kv_shard_granule
+            if self.kv_shard_granule
+            else self.page_size
         )
         self.prefill_max_requests = prefill_max_requests
         self.prefill_delayer_single_pass = prefill_delayer_single_pass
@@ -844,15 +846,14 @@ class PrefillAdder:
                 _rem_tokens = self.rem_chunk_tokens
             if self.kv_shard_granule:
                 # Logical-page KV sharding: mid-request chunk boundaries land
-                # on the allocation granule so the next chunk's prefix stays
-                # group-aligned (a mid-group boundary re-triggers fresh-group
-                # adoption and strands one granule per chunk). Floor the
-                # ABSOLUTE boundary: after a mid-group prefix hit the chunk
-                # starts off-granule, so flooring the extend length alone
-                # would keep every later boundary off-granule. When flooring
-                # would leave no budget, fall back to rem_chunk_tokens like
-                # the <= 0 case above — alignment then self-heals on the
-                # next chunk.
+                # on the physical page so the next chunk's prefix stays
+                # page-aligned (an off-page boundary would straddle one page
+                # across the prefix/chunk scratch regions and break the
+                # stride-ps wire sampling). Floor the ABSOLUTE boundary so
+                # alignment holds regardless of where the prefix hit landed.
+                # When flooring would leave no budget, fall back to
+                # rem_chunk_tokens like the <= 0 case above — alignment then
+                # self-heals on the next chunk.
                 prefix_len = len(req.prefix_indices)
                 floored = (
                     prefix_len + _rem_tokens
@@ -1168,12 +1169,12 @@ class PrefillAdder:
                 now_input_len = trunc_len + len(req.prefix_indices)
                 now_input_len = now_input_len // self.page_size * self.page_size
                 if self.kv_shard_granule:
-                    # Logical-page KV sharding: floor the absolute boundary to
-                    # the allocation granule so later chunks' prefixes stay
-                    # group-aligned even after a mid-group prefix hit (see
-                    # add_chunked_req). Deferring (<= 0 below) when the budget
-                    # cannot reach the first granule boundary matches the
-                    # truncation_align_size behavior above.
+                    # Logical-page KV sharding: floor the absolute boundary
+                    # to the physical page so later chunks' prefixes stay
+                    # page-aligned (see add_chunked_req). Deferring (<= 0
+                    # below) when the budget cannot reach the first page
+                    # boundary matches the truncation_align_size behavior
+                    # above.
                     now_input_len = (
                         now_input_len // self.kv_shard_granule * self.kv_shard_granule
                     )

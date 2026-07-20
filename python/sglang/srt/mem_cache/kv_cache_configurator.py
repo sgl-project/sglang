@@ -209,14 +209,13 @@ class KVCacheConfigurator:
             shard_rank=self.kv_shard_rank,
             shard_size=self.kv_shard_size,
             page_size=self.page_size,
-            # One extra prefix granule per provisioned turn (each cached
-            # mid-group turn boundary in a reused prefix costs one plan
-            # group); the extra chunk granule covers a mid-group prefix
-            # hit shifting the chunk's group span by one.
-            max_prefix_tokens=ceil_align(self.model_config.context_len, granule)
-            + envs.SGLANG_KV_SHARD_MAX_PREFIX_TURNS.get() * granule,
-            chunk_tokens=ceil_align(self.server_args.chunked_prefill_size, granule)
-            + granule,
+            # Rotated owner-classed allocation: a K-page prefix gathers as
+            # N * ceil(K / N) pages <= ceil_align(context_len, granule),
+            # exactly; the chunk region is per-page (boundaries ps-floored).
+            max_prefix_tokens=ceil_align(self.model_config.context_len, granule),
+            chunk_tokens=ceil_align(
+                self.server_args.chunked_prefill_size, self.page_size
+            ),
         )
 
     def configure(self, *, pre_model_load_memory: int) -> KVCacheConfigResult:

@@ -1050,10 +1050,6 @@ class CommonKVSender(BaseKVSender):
         self._transfer_num_state_indices = 0
         # inner state
         self.curr_idx = 0
-        # Absolute sequence page index of send position 0 (the decode-cached
-        # prefix length in pages); consumed by the logical-page KV sharding
-        # ownership filter. Set by the prefill scheduler after bootstrap.
-        self.page_offset = 0
         self.init_time: Optional[float] = None
         if self.kv_mgr.is_dummy_cp_rank:
             # Non-authoritative CP ranks are dummy participants.
@@ -1150,14 +1146,14 @@ class CommonKVSender(BaseKVSender):
         is_last_chunk = self.curr_idx == self.num_kv_indices
 
         if self.kv_mgr.kv_shard_size > 1:
-            # Logical-page KV sharding: send only the pages this rank owns,
+            # Logical-page KV sharding: send only the pages this rank owns
+            # (ownership derived from the logical page ids in kv_indices),
             # paired with their canonical positions (an index array replaces
             # the contiguous slice).
             kv_indices, index_slice = filter_kv_indices_for_shard_rank(
                 self.kv_mgr,
                 kv_indices,
                 index_slice,
-                page_offset=self.page_offset,
             )
         elif (
             self.kv_mgr.enable_all_cp_ranks_for_transfer

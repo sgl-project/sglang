@@ -238,6 +238,14 @@ class TreeNode:
         self.hash_value: Optional[List[str]] = None
         # priority for priority-aware eviction
         self.priority = priority
+        # Logical-page KV sharding: rotation base of the chain this node's
+        # KV pages belong to — the owner rank of position-page P along the
+        # chain is (rotation_base + P) % shard_size. A host-side mirror of
+        # the loc-derived owners (node.value is a device tensor; reading it
+        # would put a D2H sync on the alloc path): set at insert from the
+        # inserting request's host base, copied on split, read through
+        # req.last_node at alloc time. None when sharding is off.
+        self.rotation_base: Optional[int] = None
 
         self.id = TreeNode.counter if id is None else id
         TreeNode.counter += 1
@@ -430,7 +438,12 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
             value = torch.tensor(key.token_ids[: len(key)], dtype=torch.int64)
 
         prefix_len, last_node = self._insert_helper(
-            self.root_node, key, value, priority, chunked
+            self.root_node,
+            key,
+            value,
+            priority,
+            chunked,
+            rotation_base=params.rotation_base,
         )
         return InsertResult(prefix_len=prefix_len, last_device_node=last_node)
 
@@ -464,7 +477,12 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         if is_insert:
             priority = getattr(req, "priority", 0) or 0
             result = self.insert(
-                InsertParams(key=radix_key, value=values, priority=priority)
+                InsertParams(
+                    key=radix_key,
+                    value=values,
+                    priority=priority,
+                    rotation_base=req.kv_rotation_base,
+                )
             )
             session_leaf = result.last_device_node
             # Free the duplicates that were already in the tree
@@ -508,6 +526,7 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
                 value=values,
                 chunked=chunked,
                 priority=getattr(req, "priority", 0) or 0,
+                rotation_base=req.kv_rotation_base,
             )
         )
         new_prefix_len = result.prefix_len
@@ -682,6 +701,9 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         new_node.lock_ref = child.lock_ref
         new_node.key = child.key[:split_len]
         new_node.value = child.value[:split_len].clone()
+        # The rotation base is constant along a chain (position-page P keeps
+        # owner (b + P) % N on both sides of the split).
+        new_node.rotation_base = child.rotation_base
         child.parent = new_node
         child.key = child.key[split_len:]
         child.value = child.value[split_len:].clone()
@@ -709,6 +731,7 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         value,
         priority: int = 0,
         chunked: bool = False,
+        rotation_base: Optional[int] = None,
     ):
         # Convert None priority to 0
         if priority is None:
@@ -747,6 +770,11 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
             new_node.parent = node
             new_node.key = key
             new_node.value = value.clone()
+            # Chain-constant under sharding: the tail node's values continue
+            # the matched prefix's rotation (bs=1 sharded prefill — a
+            # concurrent sharer could break this, which is why bs>1 fails
+            # loud at the allocator).
+            new_node.rotation_base = rotation_base
             self._inc_hit_count(new_node, chunked)
             node.children[child_key] = new_node
             self.evictable_size_ += len(key)

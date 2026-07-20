@@ -312,14 +312,17 @@ class PrefillBootstrapQueue:
             self.scheduler.server_args.enable_kv_cache_sharding
             and self.kv_manager.kv_shard_size > 1
         ):
-            # Logical-page KV sharding: page ownership is by ABSOLUTE sequence
-            # page index; tell the sender where send position 0 sits.
+            # Logical-page KV sharding: chunk starts must stay page-aligned —
+            # the sender samples one wire entry per physical page (stride
+            # ps), so an off-page start would misalign every sample.
+            # Ownership itself is value-derived (owner = logical page % N in
+            # filter_kv_indices_for_shard_rank), independent of where send
+            # position 0 sits.
             physical_page_size = self.token_to_kv_pool.page_size
             assert decode_prefix_len % physical_page_size == 0, (
                 f"decode-cached prefix ({decode_prefix_len}) must be "
                 f"page-aligned under KV sharding"
             )
-            req.disagg_kv_sender.page_offset = decode_prefix_len // physical_page_size
         req.pending_bootstrap = False
         return True
 
@@ -1188,25 +1191,12 @@ class SchedulerDisaggregationPrefillMixin:
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, start_idx:end_idx
         ]
-        if self.server_args.enable_kv_cache_sharding:
-            # Logical-page KV sharding: one entry per PHYSICAL page position.
-            # The wire value — the owner's local page id, loc // (N * ps) —
-            # is placement-policy-independent (symmetric allocation makes it
-            # the same integer on every rank), so this canonical array is
-            # correct for every rank; each rank's sender keeps only the
-            # positions it owns (filter_kv_indices_for_shard_rank). The
-            # divisor is spelled N * ps explicitly rather than through
-            # allocator.page_size so the wire format cannot drift with the
-            # allocator's working quantum.
-            physical_page_size = self.token_to_kv_pool_allocator.physical_page_size
-            wire_divisor = physical_page_size * page_interleave_shard_size(
-                self.token_to_kv_pool_allocator
-            )
-            page_indices = (
-                (kv_indices[::physical_page_size] // wire_divisor).cpu().numpy()
-            )
-        else:
-            page_indices = kv_to_page_indices(kv_indices, page_size)
+        # Under logical-page KV sharding this is one LOGICAL page id
+        # (loc // ps) per physical page position — the canonical array is
+        # identical on every rank; each rank's sender derives ownership from
+        # the value (owner = l % N) and emits the wire value l // N (the
+        # owner's local page id) in filter_kv_indices_for_shard_rank.
+        page_indices = kv_to_page_indices(kv_indices, page_size)
         if not req.disagg_kv_sender.should_send_kv_chunk(len(page_indices), last_chunk):
             return
         req.disagg_kv_sender.send(page_indices, state_indices)

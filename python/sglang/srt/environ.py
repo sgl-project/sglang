@@ -273,6 +273,9 @@ class Envs:
     SGLANG_ENABLE_NVTX_OPERATIONS = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_OPERATIONS_ENABLE_PROFILE"
     )
+    # NVTX ranges for the logical-page KV sharding forward path (plan
+    # capture, layer-ahead prefix gather, compute-side slot waits).
+    SGLANG_ENABLE_NVTX_KV_SHARD = EnvBool(False)
     SGLANG_RECORD_STEP_TIME = EnvBool(False)
     SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE = EnvBool(False)
     SGLANG_FORCE_SHUTDOWN = EnvBool(False)
@@ -322,13 +325,6 @@ class Envs:
 
     # size the KV pool after CUDA-graph capture
     SGLANG_ENABLE_POST_CAPTURE_KV_SIZING = EnvBool(False)
-
-    # Logical-page KV sharding: max conversation turns a reused prefix chain
-    # is provisioned for. Each cached turn boundary that ended mid-group
-    # (fresh-group adoption) needs one extra granule of prefix scratch;
-    # chains carrying more trip the plan-capacity assert in
-    # begin_shard_extend. Must be set identically on every rank.
-    SGLANG_KV_SHARD_MAX_PREFIX_TURNS = EnvInt(64)
 
     # Scheduler: memory leak test
     SGLANG_TEST_RETRACT = EnvBool(False)

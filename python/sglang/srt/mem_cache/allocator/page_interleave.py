@@ -12,11 +12,40 @@
 # limitations under the License.
 # ==============================================================================
 
-"""Allocator for logical-page KV sharding (see mem_cache/page_interleave.py)."""
+"""Allocator for logical-page KV sharding (see mem_cache/page_interleave.py).
+
+Rotated owner-classed page allocation (DESIGN_kv_shard_classed_page_alloc.md):
+physical pages are handed out one at a time from N mirrored per-rank class
+free lists. Logical page ``l = loc // ps`` is owned by rank ``l % N`` and is
+that rank's local physical page ``l // N``, so class ``r``'s free list IS
+rank ``r``'s free pages. Ownership is derived from ``loc`` everywhere (write
+filter, gather plan, scratch translation, P/D send filter), which makes any
+class choice correct; balance is pure policy:
+
+- ``class(position-page P of a chain) = (b + P) % N`` where ``b`` is the
+  chain's rotation base — a new chain draws ``b`` from the least-full class,
+  an extension continues from the phase recorded on ``req.last_node``
+  (``TreeNode.rotation_base``). Within one cached prefix the owners are
+  exactly cyclic, so per-rank page counts differ by <= 1 and the prefix
+  gather stays a regular padded allgather.
+
+Every list, cursor decision, and pop is a pure function of the mirrored
+alloc/free stream, so the state is byte-identical across shard-group ranks
+by construction (SPMD, no consensus protocol). A freed page is immediately
+reusable — the whole-group design's per-turn granule stranding (adoption,
+liveness counting, dead-at-birth padding) is gone.
+
+``available_size`` reports the MIN-CLASS capacity floor
+(``N * min_r free_pages(r) * ps``): in-flight P/D transfers lock tree nodes,
+so an aggregate gate could admit a request whose tight class has nothing
+evictable — fail-loud where min-class admission defers. Rotation plus
+least-full seeding keeps the classes near-balanced, so the floor tracks the
+aggregate within the bounded skew (design §4.1).
+"""
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
@@ -28,26 +57,13 @@ if TYPE_CHECKING:
 
 
 class PageInterleavePoolAllocator(PagedTokenToKVPoolAllocator):
-    """Paged allocator handing out ATOMIC, shard-aligned groups of ``shard_size``
-    physical pages (one per shard-group rank), guaranteeing every rank allocates
-    the same number of physical pages for every sequence.
+    """Classed paged allocator over the shard-widened logical index space.
 
-    The inherited ``page_size`` attribute is the ALLOCATION GRANULE
-    (``shard_size * physical_page_size``) — consumed by the alloc rounding.
-    Kernels, pool tensors, attention page tables, RDMA descriptors, and the
-    radix-tree match quantum all keep ``physical_page_size``.
-
-    Because the tree quantum (``physical_page_size``) is finer than the
-    allocation granule, frees arrive at physical-page granularity and may
-    cover only part of a group. ``free()`` therefore tracks per-group
-    liveness: freed physical pages are marked dead, and a group re-enters
-    the free list only when its last live page dies. Dead pages inside a
-    partially-live group are *stranded* — neither allocatable nor evictable —
-    until the group drains (``DESIGN_kv_shard_subgranule_reuse.md`` §4.2).
-
-    Every liveness transition is a pure function of the mirrored alloc/free
-    stream, so ``_live_pages`` is byte-identical across shard-group ranks by
-    construction, like the free list it guards (SPMD, no consensus protocol).
+    The inherited ``page_size`` is the PHYSICAL page — the working quantum of
+    every seam that reads it (radix-tree match, chunk flooring, admission
+    reserve arithmetic, free alignment, wire sampling). The widening is pure
+    index space: ``size`` logical slots = ``shard_size`` x one rank's
+    physical slots; per-rank HBM is unchanged.
     """
 
     def __init__(
@@ -62,17 +78,14 @@ class PageInterleavePoolAllocator(PagedTokenToKVPoolAllocator):
     ):
         # size              — PHYSICAL token slots of one rank's pool (1x HBM)
         # size * shard_size — logical slots managed (index-space widening only)
-        # One allocator page = one logical page = shard_size physical pages,
-        # one per rank; the allocator therefore has size/physical_page_size
-        # pages — exactly today's per-rank physical page count.
         assert shard_size > 1, "PageInterleavePoolAllocator requires shard_size > 1"
         # Set before super().__init__: the base constructor calls clear(),
-        # which sizes the liveness table from these.
+        # which builds the class lists from these.
         self.physical_page_size = physical_page_size
         self.shard_size = shard_size
         super().__init__(
             size * shard_size,
-            page_size=physical_page_size * shard_size,
+            page_size=physical_page_size,
             dtype=dtype,
             device=device,
             kvcache=kvcache,
@@ -80,18 +93,182 @@ class PageInterleavePoolAllocator(PagedTokenToKVPoolAllocator):
         )
 
     def clear(self):
-        super().clear()
-        # Live physical pages per logical group (index = group id; group 0 is
-        # the reserved padded page, never allocated). Groups on the free list
-        # are kept at shard_size — "ready for their next allocation" — so no
-        # alloc path needs a hook: free() decrements and resets on
-        # reclamation; adoption and tail-padding marking subtract dead pages
-        # explicitly.
-        self._live_pages = torch.full(
-            (self.num_pages + 1,),
-            self.shard_size,
-            dtype=torch.int64,
-            device=self.device,
+        # Logical pages l ∈ [0, shard_size) are reserved — physical page 0 of
+        # every rank (loc ∈ [0, shard_size * ps) is the padded/trash range).
+        # Class r's free list holds the allocatable logical pages with
+        # l % shard_size == r, ascending — exactly rank r's free physical
+        # pages 1..pages_per_rank at local page l // shard_size.
+        pages_per_rank = self.num_pages // self.shard_size
+        self.class_free_pages: List[torch.Tensor] = [
+            torch.arange(1, pages_per_rank + 1, dtype=torch.int64, device=self.device)
+            * self.shard_size
+            + r
+            for r in range(self.shard_size)
+        ]
+        self.class_release_pages: List[torch.Tensor] = [
+            torch.empty((0,), dtype=torch.int64, device=self.device)
+            for _ in range(self.shard_size)
+        ]
+        self.is_not_in_free_group = True
+        self.free_group = []
+        # Neutralize the base single-list attributes: every consumer of this
+        # allocator must go through the classed API (or fail loud on None),
+        # never a stale flat free list.
+        self.free_pages = None
+        self.release_pages = None
+
+    # ---- classed accounting ---------------------------------------------------
+
+    def class_free_page_counts(self) -> List[int]:
+        """Free pages per class (free + release) — the per-class watermarks
+        exported at the scheduler invariant-checker seam."""
+        return [
+            len(free) + len(release)
+            for free, release in zip(self.class_free_pages, self.class_release_pages)
+        ]
+
+    def available_size(self) -> int:
+        # Min-class capacity floor: a K-page request needs up to
+        # ceil(K / N) pages of EACH class (cyclic draws), so admission must
+        # gate on the tightest class, not the aggregate — the aggregate can
+        # be large while one class is fully protected by locked chains.
+        return self.shard_size * self.page_size * min(self.class_free_page_counts())
+
+    def aggregate_free_size(self) -> int:
+        """Total free logical slots across all classes — the accounting
+        identity's `available` term (the invariant checker); NOT an admission
+        gate (see available_size)."""
+        return self.page_size * sum(self.class_free_page_counts())
+
+    def least_full_class(self) -> int:
+        """Rotation base for a new chain: the class with the most free pages,
+        ties broken by the lowest class id. A pure function of the mirrored
+        class fills (SPMD-safe). Least-full seeding is required, not
+        cosmetic: oblivious round-robin drifts unboundedly under adversarial
+        traffic, least-full self-corrects the per-chain <= 1-page remainders
+        to multinomial noise (design §4.1)."""
+        counts = self.class_free_page_counts()
+        return max(range(self.shard_size), key=lambda r: (counts[r], -r))
+
+    def merge_and_sort_free(self):
+        for r in range(self.shard_size):
+            if len(self.class_release_pages[r]) > 0:
+                merged = torch.cat(
+                    (self.class_free_pages[r], self.class_release_pages[r])
+                )
+                self.class_free_pages[r], _ = torch.sort(merged)
+                self.class_release_pages[r] = torch.empty(
+                    (0,), dtype=torch.int64, device=self.device
+                )
+
+    # ---- alloc / free -----------------------------------------------------------
+
+    def alloc(self, need_size: int):
+        raise NotImplementedError(
+            "PageInterleavePoolAllocator allocates through alloc_extend only "
+            "(class draws follow the chain's rotation; a bare alloc has no "
+            "rotation base)"
+        )
+
+    def alloc_extend(
+        self,
+        prefix_lens: torch.Tensor,
+        prefix_lens_cpu: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        last_loc: torch.Tensor,
+        extend_num_tokens: int,
+        num_new_pages: int = None,
+        rotation_base: Optional[int] = None,
+    ):
+        """Pop one page per new position-page, class ``(b + P) % N``.
+
+        Sync-free: per-class pop counts are closed-form from the host
+        lengths and the host rotation base (the reason the base is host
+        metadata on radix nodes rather than derived from device locs).
+        Returns None when some needed class cannot supply its pages — the
+        caller's admission gate (min-class available_size + the N*ps
+        reserve) makes that unreachable outside true OOM.
+        """
+        ps, shard_size = self.page_size, self.shard_size
+        assert len(prefix_lens_cpu) == 1, (
+            "logical-page KV sharding v1 allocates one request per extend "
+            f"batch, got {len(prefix_lens_cpu)} (the rotation plan and the "
+            "assembly scratch are sized for a single request)"
+        )
+        assert rotation_base is not None, (
+            "sharded alloc_extend needs the chain's rotation base "
+            "(alloc_paged_token_slots_extend derives it from req.last_node)"
+        )
+        prefix_len = int(prefix_lens_cpu[0])
+        seq_len = int(seq_lens_cpu[0])
+        assert prefix_len % ps == 0, (
+            f"sharded extends start page-aligned (the radix-tree match "
+            f"quantum and the chunk flooring guarantee it), got "
+            f"prefix_len={prefix_len}, page_size={ps}"
+        )
+        assert extend_num_tokens == seq_len - prefix_len
+        new_pages = -(-seq_len // ps) - prefix_len // ps
+        assert new_pages > 0
+        start_class = (rotation_base + prefix_len // ps) % shard_size
+
+        if self.debug_mode and prefix_len > 0:
+            # Owner congruence of the prefix end: the host-tracked phase must
+            # agree with the loc-derived owner (one D2H sync, debug only). A
+            # mismatch means a stale rotation base — the pool's plan would
+            # translate into the wrong rank's scratch block.
+            actual = int(last_loc[0].item()) // ps % shard_size
+            expected = (start_class - 1) % shard_size
+            assert actual == expected, (
+                f"rotation base out of sync with the prefix locs: owner of "
+                f"the last prefix page is {actual}, host phase says {expected}"
+            )
+
+        counts = [
+            new_pages // shard_size
+            + (1 if (c - start_class) % shard_size < new_pages % shard_size else 0)
+            for c in range(shard_size)
+        ]
+        if self.need_sort and any(
+            counts[c] > len(self.class_free_pages[c]) for c in range(shard_size)
+        ):
+            self.merge_and_sort_free()
+        if any(counts[c] > len(self.class_free_pages[c]) for c in range(shard_size)):
+            return None
+
+        # Interleave the class pops into one position-ordered page vector:
+        # position-page j draws class (start_class + j) % N, so class c fills
+        # plan slots (c - start_class) % N, +N, +2N, ...
+        pages = torch.empty((new_pages,), dtype=torch.int64, device=self.device)
+        for c in range(shard_size):
+            if counts[c] == 0:
+                continue
+            pages[
+                torch.arange(
+                    (c - start_class) % shard_size,
+                    new_pages,
+                    shard_size,
+                    device=self.device,
+                )
+            ] = self.class_free_pages[c][: counts[c]]
+            self.class_free_pages[c] = self.class_free_pages[c][counts[c] :]
+
+        offsets = torch.arange(extend_num_tokens, dtype=torch.int64, device=self.device)
+        out_indices = pages[offsets // ps] * ps + offsets % ps
+
+        if self.debug_mode:
+            assert len(torch.unique(out_indices)) == len(out_indices)
+        return out_indices
+
+    def alloc_decode(
+        self,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        last_loc: torch.Tensor,
+    ):
+        raise NotImplementedError(
+            "PageInterleavePoolAllocator does not support decode allocation "
+            "(logical-page KV sharding runs on prefill nodes only)"
         )
 
     def free(self, free_index: torch.Tensor):
@@ -103,175 +280,65 @@ class PageInterleavePoolAllocator(PagedTokenToKVPoolAllocator):
             return
 
         # The tree quantum is the physical page, so every free covers whole
-        # physical pages (any partial in-page coverage means the rest of that
-        # page belongs to the same free — stock whole-page semantics, one
-        # level down). Mark them dead; reclaim groups that drained to zero.
-        phys_pages = torch.unique(free_index.long() // self.physical_page_size)
-        groups, dead_counts = torch.unique(
-            phys_pages // self.shard_size, return_counts=True
-        )
-        if self.debug_mode:
-            assert torch.all(self._live_pages[groups] >= dead_counts), (
-                f"double free: group live counts {self._live_pages[groups]} "
-                f"< freed page counts {dead_counts}"
-            )
-        self._live_pages[groups] -= dead_counts
-        reclaimed = groups[self._live_pages[groups] == 0]
-        if reclaimed.numel() > 0:
-            self._live_pages[reclaimed] = self.shard_size
+        # pages (any partial in-page coverage means the rest of that page
+        # belongs to the same free). Split by owner class; a freed page is
+        # immediately reusable — nothing strands.
+        pages = torch.unique(free_index.long() // self.page_size)
+        owners = pages % self.shard_size
+        for r in range(self.shard_size):
+            freed = pages[owners == r]
+            if freed.numel() == 0:
+                continue
             if self.need_sort:
-                self.release_pages = torch.cat((reclaimed, self.release_pages))
+                self.class_release_pages[r] = torch.cat(
+                    (freed, self.class_release_pages[r])
+                )
             else:
-                self.free_pages = torch.cat((reclaimed, self.free_pages))
+                self.class_free_pages[r] = torch.cat((freed, self.class_free_pages[r]))
 
         if self.debug_mode:
-            assert len(torch.unique(self.free_pages)) == len(self.free_pages)
+            self.debug_check_classes()
 
-    def alloc_extend(
-        self,
-        prefix_lens: torch.Tensor,
-        prefix_lens_cpu: torch.Tensor,
-        seq_lens: torch.Tensor,
-        seq_lens_cpu: torch.Tensor,
-        last_loc: torch.Tensor,
-        extend_num_tokens: int,
-        num_new_pages: int = None,
-    ):
-        out_indices = super().alloc_extend(
-            prefix_lens,
-            prefix_lens_cpu,
-            seq_lens,
-            seq_lens_cpu,
-            last_loc,
-            extend_num_tokens,
-            num_new_pages,
-        )
-        if out_indices is None:
-            return None
-        self._mark_tail_padding_dead(
-            prefix_lens_cpu=prefix_lens_cpu,
-            seq_lens_cpu=seq_lens_cpu,
-            out_indices=out_indices,
-        )
-        return out_indices
-
-    def alloc_decode(
-        self,
-        seq_lens: torch.Tensor,
-        seq_lens_cpu: torch.Tensor,
-        last_loc: torch.Tensor,
-    ):
-        # Sharding is prefill-disaggregation-only; a decode allocation would
-        # have to resurrect tail-padding pages already marked dead by
-        # _mark_tail_padding_dead, silently corrupting the liveness table.
-        raise NotImplementedError(
-            "PageInterleavePoolAllocator does not support decode allocation "
-            "(logical-page KV sharding runs on prefill nodes only)"
-        )
-
-    def adopt_partial_prefix_groups(
-        self, prefix_lens_cpu: torch.Tensor, last_loc: torch.Tensor
-    ) -> Optional[torch.Tensor]:
-        """Fresh-group adoption: for each request whose prefix ends mid-group,
-        pop one free group and return a synthetic ``last_loc`` placing the
-        first new token at the position-congruent offset of that group.
-
-        The popped group's head pages ``[0, prefix_len % granule)`` are
-        position-covered by the (shared, read-only) boundary group of the
-        prefix, so they are dead at birth; stock ``alloc_extend`` then
-        continues from the synthetic ``last_loc`` and its page arithmetic
-        works out unchanged (``DESIGN_kv_shard_subgranule_reuse.md`` §4.3).
-
-        Requests with group-aligned prefixes keep their ``last_loc`` entries —
-        the path is bit-identical to no-adoption. Returns None when the free
-        list cannot supply the adopted groups (caller must have evicted).
-        """
-        gs, ps = self.page_size, self.physical_page_size
-        offsets = prefix_lens_cpu % gs
-        need = offsets > 0
-        n_adopt = int(need.sum())
-        if n_adopt == 0:
-            return last_loc
-        if self.debug_mode:
-            # ps-aligned by the radix tree's match quantum.
-            assert torch.all(offsets % ps == 0)
-
-        if self.need_sort and n_adopt > len(self.free_pages):
-            self.merge_and_sort_free()
-        if n_adopt > len(self.free_pages):
-            return None
-        adopted_groups = self.free_pages[:n_adopt]
-        self.free_pages = self.free_pages[n_adopt:]
-
-        adopted_offsets = offsets[need].to(self.device)
-        self._live_pages[adopted_groups] = self.shard_size - adopted_offsets // ps
-
-        new_last_loc = last_loc.clone()
-        new_last_loc[need.to(self.device)] = adopted_groups * gs + adopted_offsets - 1
-        return new_last_loc
-
-    def _mark_tail_padding_dead(
-        self,
-        prefix_lens_cpu: torch.Tensor,
-        seq_lens_cpu: torch.Tensor,
-        out_indices: torch.Tensor,
-    ):
-        """Mark each request's tail-group padding pages dead at birth.
-
-        Whole-group allocation consumes those slots, but they are never
-        entered into ``req_to_token``, so no tree free will ever cover them;
-        without this the tail group could never drain to zero and would leak.
-        Mid-request chunk boundaries are granule-aligned (scheduler flooring),
-        so this fires at most once per request, on its final chunk.
-        """
-        gs, ps = self.page_size, self.physical_page_size
-        tail_lens = seq_lens_cpu % gs
-        extend_lens = seq_lens_cpu - prefix_lens_cpu
-        mask = (tail_lens > 0) & (extend_lens > 0)
-        if not bool(mask.any()):
-            return
-        dead_tails = ((gs - tail_lens[mask]) // ps).to(self.device)
-        last_slot_idx = (torch.cumsum(extend_lens, 0) - 1)[mask].to(self.device)
-        tail_groups = out_indices[last_slot_idx] // gs
-        self._live_pages[tail_groups] -= dead_tails
-
-    def dead_size(self) -> int:
-        """Logical token slots dead inside partially-live groups: freed by the
-        tree (or dead at birth) but not yet reclaimable because their group
-        still holds live pages ("stranded" in the design docs). Free-list
-        groups count zero (their live count is reset to shard_size on
-        reclamation). Completes the accounting identity with the allocator's
-        available_size and the tree's evictable_size/protected_size."""
-        live = int(self._live_pages[1:].sum().item())
-        return (self.num_pages * self.shard_size - live) * self.physical_page_size
+    # ---- state / debug ----------------------------------------------------------
 
     def backup_state(self):
-        return (*super().backup_state(), self._live_pages.clone())
+        return (list(self.class_free_pages), list(self.class_release_pages))
 
     def restore_state(self, state):
-        free_pages, release_pages, live_pages = state
-        super().restore_state((free_pages, release_pages))
-        self._live_pages = live_pages
+        class_free_pages, class_release_pages = state
+        self.class_free_pages = list(class_free_pages)
+        self.class_release_pages = list(class_release_pages)
 
-    def debug_check_equal_allocation(self):
-        # Groups leave the free list whole, so consumed capacity is a whole
-        # number of groups at all times (stranded dead pages live inside
-        # consumed groups); per-rank physical usage is identical on every
-        # rank without any cross-rank consensus.
-        used_slots = self.size - self.available_size()
-        assert used_slots % self.page_size == 0, (
-            f"partial logical-page group leaked: used_slots={used_slots} is not "
-            f"a multiple of the group span {self.page_size}"
+    def resize(self, config) -> None:
+        raise NotImplementedError(
+            "post-capture KV resizing is not supported under logical-page "
+            "KV sharding"
         )
+
+    def debug_all_free_pages(self) -> torch.Tensor:
+        """All free logical page ids across classes (free + release) — for
+        the scheduler invariant checker's use-after-free / double-free sweep
+        (page unit = the physical page = self.page_size)."""
+        return torch.cat(self.class_free_pages + self.class_release_pages)
+
+    def debug_check_classes(self):
+        for r in range(self.shard_size):
+            merged = torch.cat((self.class_free_pages[r], self.class_release_pages[r]))
+            assert bool(
+                (merged % self.shard_size == r).all()
+            ), f"page of another owner leaked into class {r}"
+            assert len(torch.unique(merged)) == len(
+                merged
+            ), f"double free: duplicate pages in class {r}"
 
 
 def page_interleave_shard_size(allocator: BaseTokenToKVPoolAllocator) -> int:
     """Shard-group size of a widened allocator, or 1 for stock allocators.
 
-    The scheduler-side seam predicate: the sites that must treat the allocator
-    page as the working quantum (alloc-path page size, budget widening,
-    invariant slack, adoption) branch on this, exactly parallel to their
-    existing DCP conditions.
+    The scheduler-side seam predicate: the sites that must treat the
+    index space as shard-widened (capacity reporting, admission reserve,
+    rotation-base plumbing, invariant slack) branch on this, exactly
+    parallel to their existing DCP conditions.
     """
     if isinstance(allocator, PageInterleavePoolAllocator):
         return allocator.shard_size
