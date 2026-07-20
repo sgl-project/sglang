@@ -15,9 +15,9 @@ concurrency:
 jobs:
   single-node-poc:
     name: single-node-poc
-    runs-on: linux-aarch64-a3-2
+    runs-on: linux-aarch64-a3-4
     container:
-      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.0.0-a3-20260622
+      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann9.0.0-a3
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -40,7 +40,8 @@ jobs:
 
           # Test cases - 使用时替换为实际的测试用例路径
           test_cases=(
-            "test/registered/ascend/llm_models/test_npu_deepseek_v3_2_w8a8.py"
+            "test/registered/ascend/basic_function/sessions/test_npu_streaming_session_extra.py"
+            "test/registered/ascend/basic_function/rl/test_npu_multi_instance_release_memory_occupation.py"
           )
 
           for test_case in "${test_cases[@]}"; do
