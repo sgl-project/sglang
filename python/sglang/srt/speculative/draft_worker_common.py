@@ -97,7 +97,9 @@ def build_draft_tp_worker(
         context_length=target_model_config.context_len,
     )
 
+    # The draft's layers must resolve config from the draft's own bags.
     with get_context().preserve_config():
+        get_context().set_server_args(draft_server_args)
         draft_worker = TpModelWorker(
             server_args=draft_server_args,
             gpu_id=gpu_id,
