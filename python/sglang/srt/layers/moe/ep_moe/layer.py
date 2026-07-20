@@ -25,6 +25,12 @@ from sglang.srt.layers.moe.topk import TopKOutput, TopKOutputChecker
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8MoEMethod
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    eager_on_graph,
+)
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
+    is_in_breakable_cuda_graph,
+)
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
@@ -44,6 +50,50 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 
 logger = logging.getLogger(__name__)
+
+
+def _a2a_moe_forward_eager(
+    moe_layer,
+    hidden_states: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    router_logits: torch.Tensor,
+    output: torch.Tensor,
+) -> None:
+    """Run the whole a2a MoE (dispatch -> experts -> combine) eagerly
+    between BCG segments, for any model using an a2a dispatcher.
+
+    The prefill graph runner pins is_extend_in_batch=False so MoE captured
+    inside a graph resolves to the capture-safe low-latency a2a mode
+    (required by PCG, which captures the MoE). This block is never captured
+    under BCG - it re-runs on every replay - so NORMAL mode is legal here
+    (its host-synchronizing dispatch happens between segments) and is the
+    bandwidth-efficient transport for prefill-sized payloads.
+
+    Mutates ``output`` (allocated by the caller inside the captured region,
+    i.e. graph-pool storage the pool reuses across shapes) and returns None,
+    so eager_on_graph retains no per-shape bridge tensor for this break.
+    """
+    from sglang.srt.layers.dp_attention import (
+        get_is_extend_in_batch,
+        set_is_extend_in_batch,
+    )
+    from sglang.srt.layers.moe.topk import StandardTopKOutput
+
+    saved_is_extend_in_batch = get_is_extend_in_batch()
+    set_is_extend_in_batch(True)
+    try:
+        output.copy_(
+            moe_layer.forward_impl(
+                hidden_states,
+                StandardTopKOutput(topk_weights, topk_ids, router_logits),
+            )
+        )
+    finally:
+        set_is_extend_in_batch(saved_is_extend_in_batch)
+
+
+bcg_a2a_moe_forward = eager_on_graph(True)(_a2a_moe_forward_eager)
 
 
 class DeepEPMoE(FusedMoE):
@@ -160,6 +210,20 @@ class DeepEPMoE(FusedMoE):
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
     ):
+        if is_in_breakable_cuda_graph():
+            assert TopKOutputChecker.format_is_standard(
+                topk_output
+            ), "Only standard topk output is supported for breakable cuda graph"
+            output = torch.empty_like(hidden_states)
+            bcg_a2a_moe_forward(
+                self,
+                hidden_states,
+                topk_output.topk_weights,
+                topk_output.topk_ids,
+                topk_output.router_logits,
+                output,
+            )
+            return output
         if is_in_tc_piecewise_cuda_graph():
             assert TopKOutputChecker.format_is_standard(
                 topk_output
