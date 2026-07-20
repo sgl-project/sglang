@@ -281,7 +281,7 @@ async def lifespan(fast_api_app: FastAPI):
     # Apps built by `build_app` carry their own engine binding on
     # `app.state.global_state` (set by `init_app_state`); the module-level app
     # relies on the process-global state set by `set_global_state`.
-    global_state = fast_api_app.state.global_state or _global_state
+    global_state = getattr(fast_api_app.state, "global_state", None) or _global_state
     if global_state is None:
         raise RuntimeError(
             "SGLang global state is not initialized. When embedding the app in "
