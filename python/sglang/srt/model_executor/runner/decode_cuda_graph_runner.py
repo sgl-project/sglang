@@ -100,8 +100,6 @@ from sglang.srt.utils import (
     require_attn_tp_gather,
     require_mlp_tp_gather,
 )
-from sglang.srt.utils.profile_utils import export_cuda_graph_capture_trace
-
 try:
     from kt_kernel import KTMoEWrapper
 
@@ -226,7 +224,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.speculative_algorithm = model_runner.server_args.speculative_algorithm
         self.enable_profile_cuda_graph = (
             model_runner.server_args.enable_profile_cuda_graph
-        ) and get_parallel().tp_rank == 0
+        )
         self.enable_pdmux = model_runner.server_args.enable_pdmux
 
         self.attn_tp_size = get_parallel().attn_tp_size
@@ -632,21 +630,28 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
     def _init_profile_context_and_memory_record(self):
         rank = get_parallel().tp_rank
-        trace_dir = os.path.join(
-            os.environ.get("SGLANG_TORCH_PROFILER_DIR", "traces"), "capture_traces"
-        )
-        os.makedirs(trace_dir, exist_ok=True)
 
-        # Track which BS is currently being captured for trace file naming
-        self._profile_bs_list = list(reversed(self.capture_bs))
-        self._profile_bs_idx = 0
+        # Per-bs capture traces are opt-in via SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE.
+        # When it is unset the profiler still runs (for the summary tables and the
+        # memory snapshot in _post_process_after_profile), but no per-bs chrome
+        # trace is written to disk and on_trace_ready stays None.
+        on_trace_ready = None
+        if envs.SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE.get():
+            trace_dir = os.path.join(
+                os.environ.get("SGLANG_TORCH_PROFILER_DIR", "traces"), "capture_traces"
+            )
+            os.makedirs(trace_dir, exist_ok=True)
 
-        def on_trace_ready(prof):
-            bs = self._profile_bs_list[self._profile_bs_idx]
-            trace_file = os.path.join(trace_dir, f"bs_{bs}_rank{rank}.json.gz")
-            prof.export_chrome_trace(trace_file)
-            logger.info(f"Saved trace for bs={bs} to {trace_file}")
-            self._profile_bs_idx += 1
+            # Track which BS is currently being captured for trace file naming
+            self._profile_bs_list = list(reversed(self.capture_bs))
+            self._profile_bs_idx = 0
+
+            def on_trace_ready(prof):
+                bs = self._profile_bs_list[self._profile_bs_idx]
+                trace_file = os.path.join(trace_dir, f"bs_{bs}_rank{rank}.json.gz")
+                prof.export_chrome_trace(trace_file)
+                logger.info(f"Saved trace for bs={bs} to {trace_file}")
+                self._profile_bs_idx += 1
 
         # Schedule: wait=2 (skip 2 dummy runs), warmup=0, active=1 (capture run)
         # repeat=0 means repeat indefinitely for each batch size
@@ -663,7 +668,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return profile_context
 
     def _post_process_after_profile(self, prof_context):
-        torch.cuda.memory._dump_snapshot("cuda_graph_runner_memory_usage.pickle")
+        # Namespace the snapshot by TP rank so profiling on every rank does not
+        # clobber a single shared file.
+        rank = get_parallel().tp_rank
+        memory_snapshot_file = f"cuda_graph_runner_memory_usage_rank{rank}.pickle"
+        torch.cuda.memory._dump_snapshot(memory_snapshot_file)
         torch.cuda.memory._record_memory_history(enabled=None)
         log_message = (
             "Sorted by CUDA Time:\n"
@@ -674,19 +683,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             + prof_context.key_averages(group_by_input_shape=True).table(
                 sort_by="cpu_time_total", row_limit=10
             )
-            + "\n\nMemory Usage is saved to cuda_graph_runner_memory_usage.pickle\n"
+            + f"\n\nMemory Usage is saved to {memory_snapshot_file}\n"
         )
         logger.info(log_message)
-
-        # Optionally persist the shaped capture trace (record_shapes=True) for
-        # offline per-kernel analysis -- opt-in via
-        # SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE; the in-log tables above are
-        # unchanged.
-        export_cuda_graph_capture_trace(
-            prof_context,
-            runner_name=type(self).__name__,
-            tp_rank=get_parallel().tp_rank,
-        )
 
     def capture_prepare(
         self,

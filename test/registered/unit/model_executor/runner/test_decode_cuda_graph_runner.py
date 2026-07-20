@@ -1,10 +1,12 @@
 """Unit tests for ``DecodeCudaGraphRunner`` capture-phase profiling — CPU-only.
 
 These cover the changes from the "cuda graph profile traces" PR that make the
-graph-capture phase export one torch profiler trace per captured batch size
-when ``--enable-profile-cuda-graph`` is set:
+graph-capture phase export one torch profiler trace per captured batch size.
+The per-bs traces are opt-in via ``SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE``
+(the profiler itself is still built by ``--enable-profile-cuda-graph`` for the
+summary tables / memory snapshot):
 
-  * ``_init_profile_context_and_memory_record`` creates the
+  * With the flag set, ``_init_profile_context_and_memory_record`` creates the
     ``<SGLANG_TORCH_PROFILER_DIR>/capture_traces`` directory, primes the
     per-bs bookkeeping (``_profile_bs_list`` reversed to match capture order,
     ``_profile_bs_idx`` reset to 0), and builds the profiler with the
@@ -14,6 +16,8 @@ when ``--enable-profile-cuda-graph`` is set:
     ``bs_{bs}_rank{rank}.json.gz`` against the reversed capture-bs list and
     advances the index on every flush, so successive batch sizes land in
     distinct files.
+  * With the flag unset, ``on_trace_ready`` is ``None`` and no per-bs trace
+    directory or bookkeeping is created.
 
 The profiler / CUDA-memory APIs are mocked; the directory + naming + schedule
 logic is pure-Python and runs on CPU. The method is invoked unbound against a
@@ -42,7 +46,7 @@ class TestInitProfileContext(CustomTestCase):
         (fake_self, mock_profile, mock_schedule, mock_record_history)."""
         fake_self = SimpleNamespace(capture_bs=list(capture_bs))
 
-        env = {}
+        env = {"SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE": "1"}
         if profiler_dir is not None:
             env["SGLANG_TORCH_PROFILER_DIR"] = profiler_dir
 
@@ -94,9 +98,12 @@ class TestInitProfileContext(CustomTestCase):
 
     def test_default_dir_used_when_env_unset(self):
         # No SGLANG_TORCH_PROFILER_DIR -> falls back to the "traces" base dir.
+        # (Capture-trace export is enabled; only the profiler dir env is unset.)
         # Patch makedirs so the test never writes to the cwd.
         fake_self = SimpleNamespace(capture_bs=[1])
-        with mock.patch.dict(os.environ, {}, clear=False), mock.patch.object(
+        with mock.patch.dict(
+            os.environ, {"SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE": "1"}, clear=False
+        ), mock.patch.object(
             mod, "get_parallel", return_value=SimpleNamespace(tp_rank=0)
         ), mock.patch.object(mod, "profile") as mock_profile, mock.patch(
             "torch.profiler.schedule"
@@ -113,12 +120,44 @@ class TestInitProfileContext(CustomTestCase):
         created_dir = mock_makedirs.call_args.args[0]
         self.assertEqual(created_dir, os.path.join("traces", "capture_traces"))
 
+    def test_no_trace_export_when_flag_unset(self):
+        # Without SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE the profiler is still
+        # built (so the summary tables / memory snapshot still work), but no
+        # per-bs trace is written: on_trace_ready is None, no capture_traces
+        # directory is created, and the per-bs bookkeeping is not primed.
+        fake_self = SimpleNamespace(capture_bs=[1, 2])
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict(
+                os.environ, {"SGLANG_TORCH_PROFILER_DIR": tmp}, clear=False
+            ), mock.patch.object(
+                mod, "get_parallel", return_value=SimpleNamespace(tp_rank=0)
+            ), mock.patch.object(
+                mod, "profile"
+            ) as mock_profile, mock.patch(
+                "torch.profiler.schedule"
+            ), mock.patch(
+                "torch.cuda.memory._record_memory_history"
+            ):
+                os.environ.pop("SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE", None)
+                DecodeCudaGraphRunner._init_profile_context_and_memory_record(
+                    fake_self
+                )
+
+            self.assertIsNone(mock_profile.call_args.kwargs["on_trace_ready"])
+            self.assertFalse(os.path.isdir(os.path.join(tmp, "capture_traces")))
+            self.assertFalse(hasattr(fake_self, "_profile_bs_list"))
+
 
 class TestOnTraceReadyNaming(CustomTestCase):
     def _build_on_trace_ready(self, *, capture_bs, rank, tmp):
         fake_self = SimpleNamespace(capture_bs=list(capture_bs))
         with mock.patch.dict(
-            os.environ, {"SGLANG_TORCH_PROFILER_DIR": tmp}, clear=False
+            os.environ,
+            {
+                "SGLANG_TORCH_PROFILER_DIR": tmp,
+                "SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE": "1",
+            },
+            clear=False,
         ), mock.patch.object(
             mod, "get_parallel", return_value=SimpleNamespace(tp_rank=rank)
         ), mock.patch.object(
