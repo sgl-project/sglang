@@ -40,10 +40,12 @@ include_dirs = [
     root / "csrc",
 ]
 
+# The custom/deterministic/quick all-reduce collectives are CDNA-only: they use
+# multi-GPU peer IPC and CDNA-specific buffer/scope semantics.
+# They are appended below for CDNA targets only; on RDNA they are omitted and
+# their registration is #ifdef'd out via -DSGL_IS_RDNA, so multi-GPU all-reduce
+# falls back to RCCL and single-GPU never calls all-reduce.
 sources = [
-    "csrc/allreduce/custom_all_reduce.hip",
-    "csrc/allreduce/deterministic_all_reduce.hip",
-    "csrc/allreduce/quick_all_reduce.cu",
     "csrc/common_extension_rocm.cc",
     "csrc/elementwise/activation.cu",
     "csrc/elementwise/deepseek_v4_topk.cu",
@@ -80,8 +82,12 @@ if amdgpu_target_env == default_target and torch.cuda.is_available():
         print(f"Warning: Failed to detect GPU properties: {e}")
         print(f"Using default target: {default_target}")
 
-# Validate all target architectures
-supported_archs = ["gfx942", "gfx950", "gfx1100", "gfx1201"]
+# Validate all target architectures. Wave width is resolved at runtime (host) /
+# per-arch constexpr (device) in include/utils.h, so no warp-size compile flag
+# is passed here.
+CDNA_TARGETS = ["gfx942", "gfx950"]
+RDNA_TARGETS = ["gfx1100", "gfx1151", "gfx1201"]
+supported_archs = CDNA_TARGETS + RDNA_TARGETS
 for arch in amdgpu_targets:
     if arch not in supported_archs:
         print(
@@ -90,6 +96,21 @@ for arch in amdgpu_targets:
         sys.exit(1)
 
 print(f"Building for architectures: {', '.join(amdgpu_targets)}")
+
+# If any RDNA (wave32) arch is in the (possibly multi-arch) target list, treat the
+# whole wheel as an RDNA build: the CDNA-only all-reduce collectives can't compile
+# for RDNA, so they're omitted for the entire wheel and their registration is
+# #ifdef'd out via -DSGL_IS_RDNA (multi-GPU all-reduce falls back to RCCL;
+# single-GPU never calls all-reduce).
+is_rdna = any(arch in RDNA_TARGETS for arch in amdgpu_targets)
+
+# CDNA-only multi-GPU all-reduce collectives (see note above the sources list).
+if not is_rdna:
+    sources += [
+        "csrc/allreduce/custom_all_reduce.hip",
+        "csrc/allreduce/deterministic_all_reduce.hip",
+        "csrc/allreduce/quick_all_reduce.cu",
+    ]
 
 # Multi-arch build: Define both FP8 types so compile-time selection can work
 # For single-arch builds, we still define both to keep code consistent
@@ -118,6 +139,15 @@ for arch in amdgpu_targets:
 
 # Add FP8 macros
 hipcc_flags.extend(fp8_macros)
+
+# On RDNA the CDNA-only all-reduce collectives are not built; guard their
+# registration (common_extension_rocm.cc) and declarations (sgl_kernel_ops.h).
+# The flag must reach BOTH compilers: hipcc for the .hip/.cu sources (headers)
+# and the host C++ compiler for common_extension_rocm.cc (a .cc file), otherwise
+# the registration is compiled in and links against the excluded symbols.
+if is_rdna:
+    hipcc_flags.append("-DSGL_IS_RDNA")
+    cxx_flags.append("-DSGL_IS_RDNA")
 
 ext_modules = [
     CUDAExtension(
