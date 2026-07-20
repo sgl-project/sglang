@@ -1726,8 +1726,7 @@ def _post_process_topk_ids(
         log2phy_prob = None
         if (
             expert_location_dispatch_info is not None
-            and getattr(expert_location_dispatch_info, "ep_dispatch_algorithm", None)
-            == "lp"
+            and expert_location_dispatch_info.ep_dispatch_algorithm == "lp"
         ):
             from sglang.srt.eplb.lplb_solver import get_global_lplb_solver
 

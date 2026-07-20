@@ -23,7 +23,7 @@ from sglang.srt.runtime_context import get_server_args
 
 @dataclass
 class ExpertLocationDispatchInfo:
-    ep_dispatch_algorithm: Literal["static", "random"]
+    ep_dispatch_algorithm: Literal["static", "dynamic", "fake", "lp"]
     # (num_logical_experts,)
     partial_logical_to_rank_dispatch_physical_map: Optional[torch.Tensor]
     # (num_logical_experts, X)
