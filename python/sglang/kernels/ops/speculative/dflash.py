@@ -141,6 +141,105 @@ def _compute_dflash_accept_bonus_triton_unchecked(
 
 
 @triton.jit
+def _dflash_tree_accept_compact_kernel(
+    accept_index_ptr,  # [bs, block] int32, absolute (row*block baked in), -1 = no node
+    predicts_ptr,  # [bs*block] int32, target prediction following each verify node
+    commit_lens_ptr,  # [bs] int32 (= accept_len + 1)
+    prefix_lens_ptr,  # [bs] int (KV len before this verify block)
+    # outputs
+    accept_local_safe_ptr,  # [bs, block] int64: valid -> block-local idx, else 0
+    out_tokens_ptr,  # [bs, block] int64: valid -> predicts[accept], else 0
+    bonus_ptr,  # [bs] int64: last accepted node's target prediction
+    committed_positions_ptr,  # [bs, block] int64: prefix + col
+    new_seq_lens_ptr,  # [bs] (prefix_lens.dtype): prefix + commit
+    accept_index_row_stride,
+    out_row_stride,
+    block_size,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row = tl.program_id(0)
+    cols = tl.arange(0, BLOCK_SIZE)
+    row_mask = cols < block_size
+
+    commit = tl.load(commit_lens_ptr + row).to(tl.int32)
+    prefix = tl.load(prefix_lens_ptr + row)
+    valid = row_mask & (cols < commit)
+
+    ai_ptr = accept_index_ptr + row * accept_index_row_stride
+    accept_abs = tl.load(ai_ptr + cols, mask=row_mask, other=-1).to(tl.int64)
+    base = (row * block_size).to(tl.int64)
+    accept_local = accept_abs - base
+
+    # predicts[safe_abs]; masked-off cols read predicts[base] (in-range, discarded).
+    safe_abs = tl.where(valid, accept_abs, base)
+    pred = tl.load(predicts_ptr + safe_abs).to(tl.int64)
+    out_tokens = tl.where(valid, pred, 0)
+    local_safe = tl.where(valid, accept_local, 0)
+
+    tl.store(out_tokens_ptr + row * out_row_stride + cols, out_tokens, mask=row_mask)
+    tl.store(
+        accept_local_safe_ptr + row * out_row_stride + cols, local_safe, mask=row_mask
+    )
+    tl.store(
+        committed_positions_ptr + row * out_row_stride + cols,
+        prefix.to(tl.int64) + cols,
+        mask=row_mask,
+    )
+
+    # bonus = out_tokens at the last accepted node (col == commit - 1 == accept_len).
+    accept_len = commit - 1
+    bonus = tl.load(predicts_ptr + tl.load(ai_ptr + accept_len).to(tl.int64)).to(
+        tl.int64
+    )
+    tl.store(bonus_ptr + row, bonus)
+    tl.store(new_seq_lens_ptr + row, prefix + commit)
+
+
+def dflash_tree_accept_compact(
+    accept_index: torch.Tensor,
+    predicts: torch.Tensor,
+    commit_lens: torch.Tensor,
+    prefix_lens: torch.Tensor,
+):
+    """One launch for the tree-accept compaction (replaces ~14 elementwise ops).
+
+    Returns (accept_local_safe, out_tokens, bonus, committed_positions, new_seq_lens).
+    """
+    bs, block_size = accept_index.shape
+    device = accept_index.device
+    accept_local_safe = torch.empty((bs, block_size), dtype=torch.int64, device=device)
+    out_tokens = torch.empty((bs, block_size), dtype=torch.int64, device=device)
+    bonus = torch.empty((bs,), dtype=torch.int64, device=device)
+    committed_positions = torch.empty(
+        (bs, block_size), dtype=torch.int64, device=device
+    )
+    new_seq_lens = torch.empty((bs,), dtype=prefix_lens.dtype, device=device)
+    if bs == 0:
+        return accept_local_safe, out_tokens, bonus, committed_positions, new_seq_lens
+
+    accept_index = accept_index.contiguous()
+    predicts = predicts.contiguous()
+    block = triton.next_power_of_2(block_size)
+    _dflash_tree_accept_compact_kernel[(bs,)](
+        accept_index,
+        predicts,
+        commit_lens.contiguous(),
+        prefix_lens.contiguous(),
+        accept_local_safe,
+        out_tokens,
+        bonus,
+        committed_positions,
+        new_seq_lens,
+        accept_index.stride(0),
+        out_tokens.stride(0),
+        block_size,
+        BLOCK_SIZE=block,
+        num_warps=_pick_num_warps(block),
+    )
+    return accept_local_safe, out_tokens, bonus, committed_positions, new_seq_lens
+
+
+@triton.jit
 def _prepare_dflash_draft_block_contig_kernel(
     bonus_tokens_ptr,
     prefix_lens_ptr,

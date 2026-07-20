@@ -1728,6 +1728,13 @@ class ServerArgs:
         Optional[int],
         "DFLASH only. Block size (verify window length). Alias of --speculative-num-draft-tokens for DFLASH.",
     ] = None
+    speculative_dflash_tree_verify: A[
+        bool,
+        "DFLASH only. Enable EAGLE-style draft-tree verification (fused GPU tree builder). "
+        "Requires --speculative-eagle-topk > 1 (tree branching factor); the verify node "
+        "budget is --speculative-num-draft-tokens and may exceed the draft block size. "
+        "Default False = chain verify.",
+    ] = False
     speculative_dspark_block_size: A[
         Optional[int],
         "DSPARK only. Draft block size gamma (number of proposed draft tokens). The verify window is gamma + 1, so this sets --speculative-num-draft-tokens = gamma + 1. Omit to auto-infer gamma from the draft checkpoint block_size.",
