@@ -40,10 +40,12 @@ include_dirs = [
     root / "csrc",
 ]
 
+# The custom/deterministic/quick all-reduce collectives are CDNA-only: they use
+# multi-GPU peer IPC and CDNA-specific buffer/scope semantics.
+# They are appended below for CDNA targets only; on RDNA they are omitted and
+# their registration is #ifdef'd out via -DSGL_IS_RDNA, so multi-GPU all-reduce
+# falls back to RCCL and single-GPU never calls all-reduce.
 sources = [
-    "csrc/allreduce/custom_all_reduce.hip",
-    "csrc/allreduce/deterministic_all_reduce.hip",
-    "csrc/allreduce/quick_all_reduce.cu",
     "csrc/common_extension_rocm.cc",
     "csrc/elementwise/activation.cu",
     "csrc/elementwise/deepseek_v4_topk.cu",
@@ -74,11 +76,28 @@ if torch.cuda.is_available():
 else:
     print(f"Warning: torch.cuda not available. Using default target: {amdgpu_target}")
 
-if amdgpu_target not in ["gfx942", "gfx950"]:
+# Wave width is resolved at runtime (host) / per-arch constexpr (device) in
+# include/utils.h, so no warp-size compile flag is passed here.
+CDNA_TARGETS = ["gfx942", "gfx950"]
+RDNA_TARGETS = ["gfx1100", "gfx1151", "gfx1201"]
+SUPPORTED_TARGETS = CDNA_TARGETS + RDNA_TARGETS
+
+if amdgpu_target not in SUPPORTED_TARGETS:
     print(
-        f"Warning: Unsupported GPU architecture detected '{amdgpu_target}'. Expected 'gfx942' or 'gfx950'."
+        f"Warning: Unsupported GPU architecture detected '{amdgpu_target}'. "
+        f"Supported: {SUPPORTED_TARGETS}."
     )
     sys.exit(1)
+
+is_rdna = amdgpu_target in RDNA_TARGETS
+
+# CDNA-only multi-GPU all-reduce collectives (see note above the sources list).
+if not is_rdna:
+    sources += [
+        "csrc/allreduce/custom_all_reduce.hip",
+        "csrc/allreduce/deterministic_all_reduce.hip",
+        "csrc/allreduce/quick_all_reduce.cu",
+    ]
 
 fp8_macro = (
     "-DHIP_FP8_TYPE_FNUZ" if amdgpu_target == "gfx942" else "-DHIP_FP8_TYPE_E4M3"
@@ -87,8 +106,11 @@ fp8_macro = (
 # Dynamic shared-memory budget for the TopK kernels.
 # - gfx942 (MI300/MI325): LDS is typically 64KB per workgroup -> keep dynamic smem <= ~48KB
 #   (leaves room for static shared allocations in the kernel).
+# - RDNA (gfx11xx/gfx12xx): 64KB LDS per workgroup -> same 48KB cap as gfx942.
 # - gfx95x (MI350): LDS is larger (e.g. 160KB per CU) -> allow the original 128KB dynamic smem.
-topk_dynamic_smem_bytes = 48 * 1024 if amdgpu_target == "gfx942" else 32 * 1024 * 4
+topk_dynamic_smem_bytes = (
+    48 * 1024 if (amdgpu_target == "gfx942" or is_rdna) else 32 * 1024 * 4
+)
 
 hipcc_flags = [
     "-DNDEBUG",
@@ -103,6 +125,15 @@ hipcc_flags = [
     fp8_macro,
     f"-DSGL_TOPK_DYNAMIC_SMEM_BYTES={topk_dynamic_smem_bytes}",
 ]
+
+# On RDNA the CDNA-only all-reduce collectives are not built; guard their
+# registration (common_extension_rocm.cc) and declarations (sgl_kernel_ops.h).
+# The flag must reach BOTH compilers: hipcc for the .hip/.cu sources (headers)
+# and the host C++ compiler for common_extension_rocm.cc (a .cc file), otherwise
+# the registration is compiled in and links against the excluded symbols.
+if is_rdna:
+    hipcc_flags.append("-DSGL_IS_RDNA")
+    cxx_flags.append("-DSGL_IS_RDNA")
 
 ext_modules = [
     CUDAExtension(

@@ -337,8 +337,8 @@ __launch_bounds__(TPB) __global__ void moeTopK(
   2) This implementation assumes k is small, but will work for any k.
 */
 
-template <typename T, int VPT, int NUM_EXPERTS, int WARPS_PER_CTA, int BYTES_PER_LDG>
-__launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__ void topkGatingSoftmax(
+template <typename T, int VPT, int NUM_EXPERTS, int WARPS_PER_CTA, int BYTES_PER_LDG, int WARP_SIZE_PARAM>
+__launch_bounds__(WARPS_PER_CTA* WARP_SIZE_PARAM) __global__ void topkGatingSoftmax(
     const T* input,
     const bool* finished,
     float* output,
@@ -364,12 +364,12 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__ void topkGatingSoftmax(
 
   // Restrictions based on previous section.
   static_assert(VPT % ELTS_PER_LDG == 0, "The elements per thread must be a multiple of the elements per ldg");
-  static_assert(WARP_SIZE % THREADS_PER_ROW == 0, "The threads per row must cleanly divide the threads per warp");
+  static_assert(WARP_SIZE_PARAM % THREADS_PER_ROW == 0, "The threads per row must cleanly divide the threads per warp");
   static_assert(THREADS_PER_ROW == (THREADS_PER_ROW & -THREADS_PER_ROW), "THREADS_PER_ROW must be power of 2");
-  static_assert(THREADS_PER_ROW <= WARP_SIZE, "THREADS_PER_ROW can be at most warp size");
+  static_assert(THREADS_PER_ROW <= WARP_SIZE_PARAM, "THREADS_PER_ROW can be at most warp size");
 
   // We have NUM_EXPERTS elements per row. We specialize for small #experts
-  static constexpr int ELTS_PER_WARP = WARP_SIZE * VPT;
+  static constexpr int ELTS_PER_WARP = WARP_SIZE_PARAM * VPT;
   static constexpr int ROWS_PER_WARP = ELTS_PER_WARP / ELTS_PER_ROW;
   static constexpr int ROWS_PER_CTA = WARPS_PER_CTA * ROWS_PER_WARP;
 
@@ -590,18 +590,21 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__ void topkGatingSoftmax(
 
 namespace detail {
 // Constructs some constants needed to partition the work across threads at compile time.
-template <typename T, int EXPERTS, int BYTES_PER_LDG>
+template <typename T, int EXPERTS, int BYTES_PER_LDG, int WARP_SIZE_PARAM>
 struct TopkConstants {
   static constexpr int ELTS_PER_LDG = BYTES_PER_LDG / sizeof(T);
-  static_assert(EXPERTS / (ELTS_PER_LDG * WARP_SIZE) == 0 || EXPERTS % (ELTS_PER_LDG * WARP_SIZE) == 0, "");
-  static constexpr int VECs_PER_THREAD = MAX(1, EXPERTS / (ELTS_PER_LDG * WARP_SIZE));
+  static_assert(EXPERTS / (ELTS_PER_LDG * WARP_SIZE_PARAM) == 0 || EXPERTS % (ELTS_PER_LDG * WARP_SIZE_PARAM) == 0, "");
+  static constexpr int VECs_PER_THREAD = MAX(1, EXPERTS / (ELTS_PER_LDG * WARP_SIZE_PARAM));
   static constexpr int VPT = VECs_PER_THREAD * ELTS_PER_LDG;
   static constexpr int THREADS_PER_ROW = EXPERTS / VPT;
-  static constexpr int ROWS_PER_WARP = WARP_SIZE / THREADS_PER_ROW;
+  // const (not constexpr): with both the 32- and 64-wide instantiations now
+  // compiled for every expert count, constexpr's eager evaluation would hard-error
+  // on never-launched degenerate combos. Matches vLLM (PR #21205).
+  static const int ROWS_PER_WARP = WARP_SIZE_PARAM / THREADS_PER_ROW;
 };
 }  // namespace detail
 
-template <typename T, int EXPERTS, int WARPS_PER_TB>
+template <typename T, int EXPERTS, int WARPS_PER_TB, int WARP_SIZE_PARAM>
 void topkGatingSoftmaxLauncherHelper(
     const T* input,
     const bool* finished,
@@ -618,41 +621,82 @@ void topkGatingSoftmaxLauncherHelper(
   static constexpr std::size_t MAX_BYTES_PER_LDG = 16;
 
   static constexpr int BYTES_PER_LDG = MIN(MAX_BYTES_PER_LDG, sizeof(T) * EXPERTS);
-  using Constants = detail::TopkConstants<T, EXPERTS, BYTES_PER_LDG>;
+  using Constants = detail::TopkConstants<T, EXPERTS, BYTES_PER_LDG, WARP_SIZE_PARAM>;
   static constexpr int VPT = Constants::VPT;
   static constexpr int ROWS_PER_WARP = Constants::ROWS_PER_WARP;
   const int num_warps = (num_rows + ROWS_PER_WARP - 1) / ROWS_PER_WARP;
   const int num_blocks = (num_warps + WARPS_PER_TB - 1) / WARPS_PER_TB;
 
-  dim3 block_dim(WARP_SIZE, WARPS_PER_TB);
-  topkGatingSoftmax<T, VPT, EXPERTS, WARPS_PER_TB, BYTES_PER_LDG><<<num_blocks, block_dim, 0, stream>>>(
-      input,
-      finished,
-      output,
-      num_rows,
-      indices,
-      k,
-      start_expert,
-      end_expert,
-      renormalize,
-      moe_softcapping,
-      correction_bias);
+  dim3 block_dim(WARP_SIZE_PARAM, WARPS_PER_TB);
+  topkGatingSoftmax<T, VPT, EXPERTS, WARPS_PER_TB, BYTES_PER_LDG, WARP_SIZE_PARAM>
+      <<<num_blocks, block_dim, 0, stream>>>(
+          input,
+          finished,
+          output,
+          num_rows,
+          indices,
+          k,
+          start_expert,
+          end_expert,
+          renormalize,
+          moe_softcapping,
+          correction_bias);
 }
 
-#define LAUNCH_SOFTMAX(TYPE, NUM_EXPERTS, WARPS_PER_TB)             \
-  topkGatingSoftmaxLauncherHelper<TYPE, NUM_EXPERTS, WARPS_PER_TB>( \
-      gating_output,                                                \
-      nullptr,                                                      \
-      topk_weights,                                                 \
-      topk_indices,                                                 \
-      num_tokens,                                                   \
-      topk,                                                         \
-      0,                                                            \
-      num_experts,                                                  \
-      renormalize,                                                  \
-      moe_softcapping,                                              \
-      correction_bias,                                              \
+// WARP_SIZE is a compile-time literal on CUDA and a runtime value on ROCm
+// The kernel needs it as a template parameter, so on
+// ROCm we branch on the runtime width and dispatch the matching pre-compiled
+// instantiation; on CUDA we keep the single 32-wide instantiation.
+#ifndef USE_ROCM
+#define LAUNCH_SOFTMAX(TYPE, NUM_EXPERTS, WARPS_PER_TB)                                   \
+  static_assert(WARP_SIZE == 32, "Unsupported warp size. Only 32 is supported for CUDA"); \
+  topkGatingSoftmaxLauncherHelper<TYPE, NUM_EXPERTS, WARPS_PER_TB, WARP_SIZE>(            \
+      gating_output,                                                                      \
+      nullptr,                                                                            \
+      topk_weights,                                                                       \
+      topk_indices,                                                                       \
+      num_tokens,                                                                         \
+      topk,                                                                               \
+      0,                                                                                  \
+      num_experts,                                                                        \
+      renormalize,                                                                        \
+      moe_softcapping,                                                                    \
+      correction_bias,                                                                    \
       stream);
+#else
+#define LAUNCH_SOFTMAX(TYPE, NUM_EXPERTS, WARPS_PER_TB)                                 \
+  if (WARP_SIZE == 64) {                                                                \
+    topkGatingSoftmaxLauncherHelper<TYPE, NUM_EXPERTS, WARPS_PER_TB, 64>(               \
+        gating_output,                                                                  \
+        nullptr,                                                                        \
+        topk_weights,                                                                   \
+        topk_indices,                                                                   \
+        num_tokens,                                                                     \
+        topk,                                                                           \
+        0,                                                                              \
+        num_experts,                                                                    \
+        renormalize,                                                                    \
+        moe_softcapping,                                                                \
+        correction_bias,                                                                \
+        stream);                                                                        \
+  } else if (WARP_SIZE == 32) {                                                         \
+    topkGatingSoftmaxLauncherHelper<TYPE, NUM_EXPERTS, WARPS_PER_TB, 32>(               \
+        gating_output,                                                                  \
+        nullptr,                                                                        \
+        topk_weights,                                                                   \
+        topk_indices,                                                                   \
+        num_tokens,                                                                     \
+        topk,                                                                           \
+        0,                                                                              \
+        num_experts,                                                                    \
+        renormalize,                                                                    \
+        moe_softcapping,                                                                \
+        correction_bias,                                                                \
+        stream);                                                                        \
+  } else {                                                                              \
+    TORCH_CHECK(false, "Unsupported warp size. Only 32 and 64 are supported for ROCm"); \
+  }
+#endif
 
 template <typename T>
 void topkGatingSoftmaxKernelLauncher(
