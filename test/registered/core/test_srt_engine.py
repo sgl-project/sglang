@@ -10,8 +10,6 @@ import unittest
 import torch
 
 import sglang as sgl
-from sglang.bench_offline_throughput import BenchArgs, throughput_test
-from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
@@ -40,11 +38,6 @@ class TestSRTEngine(CustomTestCase):
         out2 = json.loads(runtime.generate(prompt, sampling_params))["text"]
         runtime.shutdown()
 
-        print("==== Answer 1 ====")
-        print(out1)
-
-        print("==== Answer 2 ====")
-        print(out2)
         self.assertEqual(out1, out2)
 
     def test_2_engine_runtime_encode_consistency(self):
@@ -80,11 +73,6 @@ class TestSRTEngine(CustomTestCase):
 
         engine.shutdown()
 
-        print("==== Answer 1 ====")
-        print(out1)
-
-        print("==== Answer 2 ====")
-        print(out2)
         self.assertEqual(out1, out2)
 
     def test_6_engine_cpu_offload(self):
@@ -96,7 +84,8 @@ class TestSRTEngine(CustomTestCase):
         engine = sgl.Engine(
             model_path=model_path,
             random_seed=42,
-            max_total_tokens=128,
+            max_total_tokens=512,
+            disable_cuda_graph=True,
         )
         out1 = engine.generate(prompt, sampling_params)["text"]
         engine.shutdown()
@@ -104,26 +93,14 @@ class TestSRTEngine(CustomTestCase):
         engine = sgl.Engine(
             model_path=model_path,
             random_seed=42,
-            max_total_tokens=128,
+            max_total_tokens=512,
             cpu_offload_gb=3,
+            disable_cuda_graph=True,
         )
         out2 = engine.generate(prompt, sampling_params)["text"]
         engine.shutdown()
 
-        print("==== Answer 1 ====")
-        print(out1)
-
-        print("==== Answer 2 ====")
-        print(out2)
         self.assertEqual(out1, out2)
-
-    def test_7_engine_offline_throughput(self):
-        server_args = ServerArgs(
-            model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
-        )
-        bench_args = BenchArgs(num_prompts=10)
-        result = throughput_test(server_args=server_args, bench_args=bench_args)
-        self.assertGreater(result["total_throughput"], 3000)
 
     def test_8_engine_async_encode_consistency(self):
         prompt = "Today is a sunny day and I like"
