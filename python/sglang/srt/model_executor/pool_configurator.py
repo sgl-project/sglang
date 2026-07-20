@@ -509,11 +509,11 @@ class SWAChunkCapPoolConfigurator(HybridSWAPoolConfigurator):
 
     @staticmethod
     def is_applicable(kvc: KVCacheConfigurator) -> bool:
-        """True when SWAChunkCache can be sized from explicit max requests."""
+        """True when active SWA use can be sized from explicit max requests."""
         sa = kvc.server_args
         if sa.max_running_requests is None:
             return False
-        if not sa.disable_radix_cache:
+        if not (sa.disable_radix_cache or sa.enable_hierarchical_cache):
             return False
         if sa.chunked_prefill_size is None:
             return False

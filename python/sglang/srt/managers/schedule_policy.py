@@ -620,49 +620,50 @@ class PrefillAdder:
         return available_and_evictable - self.cur_rem_token_offset
 
     def _swa_budget_for_req(
-        self, extend_input_len: int, swa_host_hit_length: int = 0
+        self,
+        extend_input_len: int,
+        swa_host_hit_length: int = 0,
+        swa_device_hit_length: int = 0,
     ) -> int:
-        """SWA pool budget per request. Only valid when is_hybrid_swa is True.
-
-        With chunked prefill + overlap scheduler, the peak SWA occupancy is:
-          chunk N (running, not yet in tree) + sliding window (locked in tree)
-          + chunk N+1 (new allocation)
-        Since chunk N and locked tokens are already excluded from
-        swa_available + swa_evictable, the budget only needs to cover the
-        chunk N+1 allocation. We floor at sliding_window_size to reserve
-        room for the decode phase.
-        """
+        """Additional SWA capacity needed after the device prefix is locked."""
         if self.rem_chunk_tokens is not None:
             alloc = min(extend_input_len, self.rem_chunk_tokens)
         else:
             alloc = extend_input_len
-        window = self.tree_cache.sliding_window_size
-        return max(alloc - window, 0) + self._swa_reserved_tokens(swa_host_hit_length)
+        return max(
+            alloc + self.ceil_paged_tokens(swa_host_hit_length),
+            self.tree_cache.sliding_window_size
+            - self.ceil_paged_tokens(swa_device_hit_length),
+        ) + self.page_size
 
-    def _swa_reserved_tokens(self, swa_host_hit_length: int = 0) -> int:
-        """SWA tokens a request needs regardless of extend length: the sliding
-        window (decode headroom) + allocator page slack + the load-back window
-        charge. Shared floor of _swa_budget_for_req and _swa_chunk_cap."""
-        reserved = self.tree_cache.sliding_window_size + self.page_size
-        if swa_host_hit_length > 0:
-            reserved += self.ceil_paged_tokens(swa_host_hit_length)
-        return reserved
+    def _swa_match_lengths(self, req: Req) -> tuple[int, int, int]:
+        if req.best_match_node is None:
+            return len(req.full_untruncated_fill_ids) - len(req.prefix_indices), 0, 0
+        matched_prefix_tokens = 0
+        node = req.best_match_node
+        while node is not self.tree_cache.root_node:
+            matched_prefix_tokens += len(node.key)
+            node = node.parent
+        matched = min(
+            matched_prefix_tokens, self.tree_cache.sliding_window_size
+        )
+        host = min(self.ceil_paged_tokens(req.swa_host_hit_length), matched)
+        device = matched - host
+        uncached = len(req.full_untruncated_fill_ids) - matched_prefix_tokens
+        return uncached, host, device
 
-    def _swa_chunk_cap(self, swa_host_hit_length: int = 0) -> int:
-        """Largest page-aligned extend chunk the SWA pool can admit right now,
-        keeping a sliding window of headroom below rem_swa_tokens; 0 if not
-        even one page fits. Only valid when is_hybrid_swa is True.
+    def _swa_budget_for_matched_req(self, req: Req) -> int:
+        return self._swa_budget_for_req(*self._swa_match_lengths(req))
 
-        Escape hatch for a request whose budget can never pass the
-        _swa_budget_for_req gate (extend near/above the pool size, or a large
-        load-back charge): without shrinking its chunk it would be rejected
-        forever (head-of-line livelock). Shrinking is sound because past a
-        chunk boundary only the sliding window stays locked — the rest turns
-        evictable — so each pass's transient footprint fits the pool."""
-        cap = int(self.rem_swa_tokens) - self._swa_reserved_tokens(swa_host_hit_length)
-        if cap <= 0:
+    def _swa_chunk_cap(self, req: Req) -> int:
+        """Largest page-aligned extend chunk the SWA pool can admit."""
+        _, host, device = self._swa_match_lengths(req)
+        available = int(self.rem_swa_tokens) - self.page_size
+        if available <= max(
+            host, self.tree_cache.sliding_window_size - device
+        ):
             return 0
-        return cap // self.page_size * self.page_size
+        return (available - host) // self.page_size * self.page_size
 
     def _mamba_gap_budget_for_req(self, req: Req) -> int:
         """Shared-gap reservation (full-token-equivalents) for a request's new
@@ -712,6 +713,7 @@ class PrefillAdder:
         max_new_tokens: int,
         retracted_stain: bool,
         mamba_gap_reserve: int = 0,
+        swa_budget: Optional[int] = None,
     ):
         # TODO(lsyin): check this workaround logic, which only ensures the prefill will not out of memory, and may be too conservative
         extend_input_len = self.ceil_paged_tokens(extend_input_len)
@@ -735,7 +737,11 @@ class PrefillAdder:
         self.rem_input_tokens -= extend_input_len
 
         if self.is_hybrid_swa:
-            self.rem_swa_token_offset += self._swa_budget_for_req(extend_input_len)
+            self.rem_swa_token_offset += (
+                swa_budget
+                if swa_budget is not None
+                else self._swa_budget_for_req(extend_input_len)
+            )
 
         if self.dllm_config is not None:
             self.rem_dllm_tokens -= extend_input_len
@@ -1042,20 +1048,16 @@ class PrefillAdder:
         real_input_tokens = cand_extend_input_len - req.host_hit_length
         real_input_tokens = self.ceil_paged_tokens(real_input_tokens)
         prefix_len = len(req.prefix_indices)
+        swa_needed = None
 
         if total_tokens >= self.rem_total_tokens:
             return AddReqResult.NO_TOKEN
 
         chunk_tokens_limit = self.rem_chunk_tokens
         if self.is_hybrid_swa:
-            # host-hit prefix is loaded back, not re-prefilled, so the SWA peak is
-            # driven only by the freshly-prefilled tail (the loaded window is
-            # charged separately via swa_host_hit_length).
-            swa_needed = self._swa_budget_for_req(
-                real_input_tokens, swa_host_hit_length=req.swa_host_hit_length
-            )
+            swa_needed = self._swa_budget_for_matched_req(req)
             if swa_needed >= self.rem_swa_tokens:
-                swa_cap = self._swa_chunk_cap(req.swa_host_hit_length)
+                swa_cap = self._swa_chunk_cap(req)
                 if self.rem_chunk_tokens is None or swa_cap <= 0:
                     return AddReqResult.NO_TOKEN
                 chunk_tokens_limit = min(self.rem_chunk_tokens, swa_cap)
@@ -1076,12 +1078,9 @@ class PrefillAdder:
                 return AddReqResult.NO_TOKEN
 
             if self.is_hybrid_swa:
-                # self.rem_swa_tokens may decrease after the lock acquisition
-                swa_needed = self._swa_budget_for_req(
-                    real_input_tokens, swa_host_hit_length=req.swa_host_hit_length
-                )
+                swa_needed = self._swa_budget_for_matched_req(req)
                 if swa_needed >= self.rem_swa_tokens:
-                    swa_cap = self._swa_chunk_cap(req.swa_host_hit_length)
+                    swa_cap = self._swa_chunk_cap(req)
                     if self.rem_chunk_tokens is None or swa_cap <= 0:
                         return AddReqResult.NO_TOKEN
                     chunk_tokens_limit = min(self.rem_chunk_tokens, swa_cap)
@@ -1139,6 +1138,16 @@ class PrefillAdder:
                     ),
                     req.retracted_stain,
                     mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
+                    swa_budget=(
+                        self._swa_budget_for_req(
+                            input_tokens,
+                            swa_device_hit_length=min(
+                                prefix_len, self.tree_cache.sliding_window_size
+                            ),
+                        )
+                        if self.is_hybrid_swa
+                        else None
+                    ),
                 )
             else:
                 # Make sure at least one page is available
@@ -1180,6 +1189,16 @@ class PrefillAdder:
                     0,
                     req.retracted_stain,
                     mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
+                    swa_budget=(
+                        self._swa_budget_for_req(
+                            trunc_len,
+                            swa_device_hit_length=min(
+                                prefix_len, self.tree_cache.sliding_window_size
+                            ),
+                        )
+                        if self.is_hybrid_swa
+                        else None
+                    ),
                 )
 
         return self.budget_state()

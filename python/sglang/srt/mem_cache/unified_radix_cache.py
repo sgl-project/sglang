@@ -1670,6 +1670,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if self.cache_controller is None:
             return False
 
+        swa = self.components.get(ComponentType.SWA)
+        if swa is not None:
+            swa.prepare_load_back(best_match_node)
         host_anchor_params = self.inc_host_lock_ref(best_match_node).to_dec_params()
         # Build KV transfer
         kv_xfer = self.components[BASE_COMPONENT_TYPE].build_hicache_transfers(
@@ -2515,6 +2518,20 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return self.cache_controller.start_loading()
         return 0
 
+    def is_load_back_event_done(self, consumer_index: int) -> bool:
+        """Return True after the local load-back event is complete."""
+        if consumer_index < 0 or self.cache_controller is None:
+            return True
+
+        finish_event = self.cache_controller.layer_done_counter.events[
+            consumer_index
+        ].finish_event
+        if not finish_event.query():
+            return False
+
+        self.loading_check()
+        return True
+
     # ---- Query / Inspection APIs ----
     # These APIs exist for compatibility with other RadixTree implementations.
     # TODO: simplify and consolidate in a future refactor.
@@ -2851,6 +2868,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     if n is not self.root_node
                     and n.component_data[ct].value is None
                     and n.component_data[ct].host_value is not None
+                    and n.component_data[ct].host_lock_ref == 0
                 }
                 host_lru_ids = set(host_lru.cache.keys())
                 if s3_ids != host_lru_ids:
