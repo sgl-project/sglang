@@ -2,6 +2,7 @@
 
 import fnmatch
 import logging
+import os
 from typing import TYPE_CHECKING, Any, List, Optional, cast
 
 import torch
@@ -492,6 +493,16 @@ class QuarkConfig(QuantizationConfig):
 
         # Find the quant_scheme
         scheme = self._get_scheme_from_config(layer_quant_config)
+
+        # Optionally route the DeepSeek attention output projection through the
+        # aiter ASM a4w4 MXFP4 gemm (opt-in). Only the standard MXFP4 linear
+        # scheme on the o_proj layer is affected.
+        if (
+            isinstance(scheme, QuarkW4A4MXFP4)
+            and layer_name.endswith("o_proj")
+            and os.environ.get("SGLANG_DSR_OPROJ_MXFP4_ASM", "0") == "1"
+        ):
+            scheme.enable_asm()
 
         # Raise error if device does not support the scheme
         # (e.g. fp8 needs ada lovelace)

@@ -11,6 +11,7 @@ from sglang.srt.utils import is_hip
 from sglang.srt.utils.common import direct_register_custom_op, mxfp_supported
 
 _is_hip = is_hip()
+_HAS_ASM_A4W4 = False
 if _is_hip:
     from aiter.ops.triton.gemm.fused.fused_gemm_afp4wfp4_split_cat import (
         fused_gemm_afp4wfp4_split_cat as _fused_gemm_afp4wfp4_split_cat_orig,
@@ -20,6 +21,20 @@ if _is_hip:
         gemm_afp4wfp4_pre_quant as _gemm_afp4wfp4_pre_quant_orig,
     )
     from aiter.ops.triton.quant import dynamic_mxfp4_quant as _dynamic_mxfp4_quant_orig
+
+    # aiter ASM a4w4 MXFP4 gemm (opt-in for DSR o_proj via
+    # SGLANG_DSR_OPROJ_MXFP4_ASM=1); fall back to triton if unavailable.
+    try:
+        from aiter.ops.gemm_op_a4w4 import gemm_a4w4 as _asm_gemm_a4w4
+        from aiter.ops.shuffle import shuffle_weight as _asm_shuffle_weight
+        from aiter.utility.fp4_utils import (
+            dynamic_mxfp4_quant as _asm_dynamic_mxfp4_quant,
+        )
+        from aiter.utility.fp4_utils import e8m0_shuffle as _asm_e8m0_shuffle
+
+        _HAS_ASM_A4W4 = True
+    except Exception:  # pragma: no cover - depends on aiter build
+        _HAS_ASM_A4W4 = False
 
     def _aiter_gemm_afp4wfp4(
         x: torch.Tensor,
@@ -168,6 +183,7 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
         self.weight_quant_spec = weight_quant_spec
         self.input_quant_spec = input_quant_spec
         self.is_checkpoint_mxfp4_serialized = is_checkpoint_mxfp4_serialized
+        self.use_asm = False
 
         if not self.is_checkpoint_mxfp4_serialized:
             if not mxfp_supported():
@@ -183,10 +199,41 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
     def get_min_capability(cls) -> int:
         return 70
 
+    def enable_asm(self) -> None:
+        """Route this layer's MXFP4 gemm through the aiter ASM a4w4 kernel.
+
+        Requires a gfx95x device with the prebuilt module_gemm_a4w4_asm and
+        the fp4 shuffle helpers; otherwise keeps the default triton kernel.
+        """
+        if not (_is_hip and _HAS_ASM_A4W4):
+            logger.warning_once(
+                "SGLANG_DSR_OPROJ_MXFP4_ASM was requested but the aiter ASM "
+                "a4w4 MXFP4 gemm is unavailable; using the triton kernel."
+            )
+            return
+        self.use_asm = True
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if not self.is_checkpoint_mxfp4_serialized:
             assert layer.weight.dtype == torch.uint8
             assert layer.weight_scale.dtype == torch.uint8
+
+        if self.use_asm:
+            # The serialized checkpoint stores the weight/scale in the plain
+            # (triton) MXFP4 layout. The ASM a4w4 kernel expects the weight
+            # bytes preshuffled and the e8m0 block-scale in the matching
+            # padded/shuffled layout, so convert both once at load time.
+            weight = layer.weight.data.view(torch.uint8)
+            weight_scale = layer.weight_scale.data.view(torch.uint8)
+            weight = _asm_shuffle_weight(weight, layout=(16, 16))
+            weight_scale = _asm_e8m0_shuffle(weight_scale)
+            layer.weight = torch.nn.Parameter(weight.contiguous(), requires_grad=False)
+            layer.weight_scale = torch.nn.Parameter(
+                weight_scale.contiguous(), requires_grad=False
+            )
+            # Tell the fused-decode MLA path to skip its triton pre-quant for
+            # this layer (see deepseek_common/.../forward_mla.py).
+            layer.mxfp4_use_asm = True
 
     def create_weights(
         self,
@@ -277,6 +324,25 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         # Bias will be added after the GEMM if provided
+        if self.use_asm and not isinstance(x, tuple):
+            out_features = layer.weight.shape[0]
+            if x.dim() == 3:
+                out_shape = (*x.shape[:-1], out_features)
+                x = x.view(-1, x.shape[-1])
+            else:
+                out_shape = (x.shape[0], out_features)
+            x_q, x_s = _asm_dynamic_mxfp4_quant(x, shuffle=True)
+            y = _asm_gemm_a4w4(
+                x_q,
+                layer.weight,
+                x_s,
+                layer.weight_scale,
+                bpreshuffle=True,
+            )
+            if bias is not None:
+                y = y + bias
+            return y.view(*out_shape)
+
         three_d = False
         fused_gemm_split_cat = False
         x_s = None
