@@ -8,6 +8,7 @@ use crate::policies::itl::ItlTable;
 use crate::policies::PolicyRegistry;
 use crate::proxy::Proxy;
 use crate::server::admission::AdmissionQueue;
+use crate::server::cache_sim_tee::CacheSimTee;
 use crate::server::metrics::MetricsRegistry;
 use crate::tokenizer::TokenizerRegistry;
 use crate::workers::WorkerRegistry;
@@ -40,6 +41,11 @@ pub struct AppContext {
     /// pump's `on_inter_chunk` hook and read by the retry path to avoid
     /// re-dispatching onto a decode-congested worker.
     pub itl: Arc<ItlTable>,
+    /// Best-effort tee of each request's ingress-computed `input_ids` to the
+    /// theoretical cache-sim (`--cache-sim-url`). `None` when the flag is
+    /// unset. The chat/completions handler offers to it after tokenizing;
+    /// see [`crate::server::cache_sim_tee`].
+    pub cache_sim_tee: Option<Arc<CacheSimTee>>,
     ready: AtomicBool,
 }
 
@@ -119,6 +125,15 @@ impl AppContext {
         // permanently zero even though the WARN log still fires per abort.
         proxy.attach_metrics(Arc::clone(&metrics));
         let admission = Arc::new(AdmissionQueue::new(config.admission, Arc::clone(&metrics)));
+        // Spawn the cache-sim tee when configured. Read before `config` is
+        // moved into `Self`; an empty/whitespace URL is treated as unset.
+        let cache_sim_tee = config
+            .observability
+            .cache_sim_url
+            .as_ref()
+            .map(|u| u.trim())
+            .filter(|u| !u.is_empty())
+            .map(|url| CacheSimTee::spawn(url.to_owned(), Arc::clone(&metrics)));
         Self {
             config,
             tokenizers,
@@ -129,6 +144,7 @@ impl AppContext {
             metrics,
             admission,
             itl,
+            cache_sim_tee,
             ready: AtomicBool::new(false),
         }
     }
@@ -196,6 +212,7 @@ impl AppContext {
             )),
             metrics,
             itl: ItlTable::new(),
+            cache_sim_tee: None,
             ready: AtomicBool::new(false),
         }
     }

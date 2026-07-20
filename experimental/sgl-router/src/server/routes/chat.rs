@@ -267,6 +267,14 @@ async fn chat_completions_inner(
         .as_ref()
         .and_then(|v| request_tokens_for(&ctx.tokenizers, &model_id, v));
     let at_post_tokenize = start.elapsed();
+
+    // Best-effort tee of the ingress-computed ids to the theoretical cache-sim.
+    // Fires only when we already tokenized (so it adds no latency), and is
+    // fire-and-forget — never blocks or fails the request. No-op unless
+    // `--cache-sim-url` is set.
+    if let (Some(tee), Some(t)) = (ctx.cache_sim_tee.as_ref(), request_tokens.as_ref()) {
+        tee.offer(&model_str, &t.ids);
+    }
     // Diagnostic: ingress-tokenize cost, sampled. Fires for EVERY request that
     // reaches here — including those about to be shed at admission below — so a
     // shed request's pre-admission time (the latency the access log shows on a

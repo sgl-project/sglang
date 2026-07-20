@@ -354,6 +354,15 @@ pub struct MetricsRegistry {
     sticky_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
     ingress_tokenize_errors_total: Mutex<HashMap<String, Arc<AtomicU64>>>,
     backpressure_rejected_total: Mutex<HashMap<String, Arc<AtomicU64>>>,
+    /// Outcomes of the best-effort cache-sim tee (see
+    /// [`crate::server::cache_sim_tee`]), keyed by `result` — one of `sent`
+    /// (2xx), `http_error` (cache-sim returned 4xx/5xx — misconfigured URL or an
+    /// overloaded/OOM cache-sim), `error` (transport: connect/DNS/timeout),
+    /// `dropped` (queue full), `closed` (sender task gone). The tee is
+    /// observational and fire-and-forget, so this counter is the only signal a
+    /// broken tee is failing while serving stays healthy — `http_error` +
+    /// `error` are the two that indict it.
+    cache_sim_tee_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
     /// Per-reason count of `/abort_request` POSTs the router has sent to
     /// engines. Fixed-length array indexed by [`AbortReason::as_index`], so
     /// the hot path is a single `AtomicU64::fetch_add` with **zero locks and
@@ -412,6 +421,7 @@ impl Default for MetricsRegistry {
             stale_requests_total: Default::default(),
             decode_affinity_total: Default::default(),
             sticky_total: Default::default(),
+            cache_sim_tee_total: Default::default(),
             ingress_tokenize_errors_total: Default::default(),
             backpressure_rejected_total: Default::default(),
             engine_aborts_total: std::array::from_fn(|_| AtomicU64::new(0)),
@@ -796,6 +806,19 @@ impl MetricsRegistry {
         let mut guard = self.backpressure_rejected_total.lock();
         let counter = guard
             .entry(model_id.to_owned())
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .clone();
+        drop(guard);
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Bump `sgl_router_cache_sim_tee_total{result}`. `result` is a fixed
+    /// `&'static str` ({sent, http_error, error, dropped, closed}), so label
+    /// cardinality is bounded regardless of traffic.
+    pub fn record_cache_sim_tee(&self, result: &'static str) {
+        let mut guard = self.cache_sim_tee_total.lock();
+        let counter = guard
+            .entry(result)
             .or_insert_with(|| Arc::new(AtomicU64::new(0)))
             .clone();
         drop(guard);
@@ -1250,6 +1273,25 @@ impl MetricsRegistry {
             out.push_str(&format!(
                 "sgl_router_sticky_total{{outcome=\"{}\"}} {}\n",
                 outcome, value,
+            ));
+        }
+        drop(guard);
+
+        // cache_sim_tee_total
+        out.push_str(
+            "# HELP sgl_router_cache_sim_tee_total Best-effort cache-sim tee outcomes (result=sent|http_error|error|dropped|closed). Observational tee to the theoretical cache-sim; a nonzero http_error (cache-sim 4xx/5xx) or error (transport) while serving is healthy means the tee is broken.\n",
+        );
+        out.push_str("# TYPE sgl_router_cache_sim_tee_total counter\n");
+        let guard = self.cache_sim_tee_total.lock();
+        let mut entries: Vec<(&&str, u64)> = guard
+            .iter()
+            .map(|(k, v)| (k, v.load(Ordering::Relaxed)))
+            .collect();
+        entries.sort_by_key(|e| *e.0);
+        for (result, value) in entries {
+            out.push_str(&format!(
+                "sgl_router_cache_sim_tee_total{{result=\"{}\"}} {}\n",
+                result, value,
             ));
         }
         drop(guard);

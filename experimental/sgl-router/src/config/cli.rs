@@ -232,6 +232,15 @@ pub struct Cli {
     /// Log output format.
     #[arg(long, value_enum, default_value = "text")]
     pub log_format: LogFormat,
+    /// Base URL of the theoretical cache-sim service (e.g.
+    /// `http://radixark-cache-sim:9095`). When set, each request's
+    /// ingress-computed `input_ids` are teed to `<url>/ingest_ids`
+    /// (best-effort, fire-and-forget — never blocks or fails a request).
+    /// Unset disables the tee. Also read from `RADIXARK_CACHE_SIM_URL` so the
+    /// platform can wire it via env — an env var an older router (without this
+    /// flag) simply ignores, rather than crash-looping on an unknown CLI flag.
+    #[arg(long, env = "RADIXARK_CACHE_SIM_URL")]
+    pub cache_sim_url: Option<String>,
 }
 
 impl Cli {
@@ -371,6 +380,7 @@ impl Cli {
             observability: ObservabilityConfig {
                 log_level: self.log_level,
                 log_format: self.log_format,
+                cache_sim_url: self.cache_sim_url,
             },
             model: ModelConfig {
                 // Default the tokenizer source to the model id (treated as a

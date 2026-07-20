@@ -4,6 +4,7 @@
 pub mod admission;
 pub mod app;
 pub mod app_context;
+pub mod cache_sim_tee;
 pub mod error;
 pub mod header_utils;
 pub mod metrics;

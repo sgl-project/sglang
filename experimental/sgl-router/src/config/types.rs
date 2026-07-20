@@ -265,6 +265,11 @@ pub struct ObservabilityConfig {
     /// similar typos surface as an error instead of silently degrading
     /// to text).
     pub log_format: LogFormat,
+    /// Base URL of the theoretical cache-sim service (e.g.
+    /// `http://radixark-cache-sim:9095`). When set, each request's
+    /// ingress-computed `input_ids` are teed to `<url>/ingest_ids`
+    /// (best-effort, fire-and-forget). `None` disables the tee.
+    pub cache_sim_url: Option<String>,
 }
 
 /// `text` for human-readable dev output, `json` for one-line-per-record
@@ -287,6 +292,7 @@ impl Default for ObservabilityConfig {
         Self {
             log_level: default_log_level(),
             log_format: LogFormat::default(),
+            cache_sim_url: None,
         }
     }
 }
