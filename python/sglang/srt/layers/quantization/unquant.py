@@ -475,6 +475,14 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             set_weight_attrs(w2_weight_bias, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if get_moe_runner_backend().is_flashinfer_megamoe():
+            from sglang.srt.layers.moe.flashinfer_megamoe import (
+                prepare_bf16_moe_weights_for_flashinfer_megamoe,
+            )
+
+            prepare_bf16_moe_weights_for_flashinfer_megamoe(layer)
+            return
+
         _should_use_aiter_moe = (
             _use_aiter
             and (
@@ -701,7 +709,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
-        if self.use_flashinfer_trtllm_moe:
+        if get_moe_runner_backend().is_flashinfer_megamoe():
+            backend = MoeRunnerBackend.FLASHINFER_MEGAMOE
+        elif self.use_flashinfer_trtllm_moe:
             backend = (
                 MoeRunnerBackend.FLASHINFER_TRTLLM_ROUTED
                 if get_moe_runner_backend().is_flashinfer_trtllm_routed()
@@ -788,6 +798,19 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         x = dispatch_output.hidden_states
 
         backend = self.runner.runner_backend
+        if backend.is_flashinfer_megamoe():
+            from sglang.srt.layers.moe.flashinfer_megamoe import (
+                FlashInferMegaMoeQuantInfo,
+                ensure_bf16_moe_layer_for_flashinfer_megamoe,
+            )
+
+            quant_info = FlashInferMegaMoeQuantInfo(
+                mega=ensure_bf16_moe_layer_for_flashinfer_megamoe(layer),
+                apply_routed_scaling_factor=(
+                    not layer.should_fuse_routed_scaling_factor_in_topk
+                ),
+            )
+            return self.runner.run(dispatch_output, quant_info)
         if backend.is_triton_kernels():
             from sglang.srt.layers.moe.moe_runner.triton_kernels import (
                 TritonKernelsQuantInfo,

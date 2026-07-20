@@ -7049,21 +7049,14 @@ class ServerArgs:
             assert (
                 self.enable_dp_attention and self.dp_size == self.tp_size
             ), "FlashInfer MegaMOE is only supported with dp_size == tp_size and --enable-dp-attention"
+            assert (
+                is_sm100_supported()
+            ), "FlashInfer MegaMOE requires Blackwell SM100 CUDA devices."
             if self.moe_runner_backend == "auto":
                 self.moe_runner_backend = "flashinfer_megamoe"
             assert (
                 self.moe_runner_backend == "flashinfer_megamoe"
             ), "FlashInfer MegaMOE a2a backend requires --moe-runner-backend flashinfer_megamoe"
-            if self.quantization == "modelopt_fp4":
-                assert is_sm100_supported(), (
-                    "FlashInfer MegaMOE NVFP4 requires Blackwell (sm_100+) "
-                    "CUDA devices."
-                )
-            if self.quantization == "mxfp8":
-                assert is_sm100_supported(), (
-                    "FlashInfer MegaMOE MXFP8 requires Blackwell (sm_100+) "
-                    "CUDA devices."
-                )
             logger.info(
                 f"FlashInfer MegaMOE is enabled. The expert parallel size is "
                 f"adjusted to be the same as the tensor parallel size[{self.tp_size}]."

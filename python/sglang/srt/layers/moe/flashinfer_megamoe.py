@@ -232,24 +232,34 @@ def _bind_transformed_weights(
     layer: FusedMoE,
     transformed_weights: Any,
     *,
-    w13_scale_name: str,
-    w2_scale_name: str,
+    w13_scale_name: str | None,
+    w2_scale_name: str | None,
 ) -> None:
     from sglang.srt.layers.utils.common import copy_or_rebind_param
 
     (w13_weight, w13_scale), (w2_weight, w2_scale) = transformed_weights
     copy_or_rebind_param(layer, "w13_weight", w13_weight)
-    copy_or_rebind_param(layer, w13_scale_name, w13_scale)
     copy_or_rebind_param(layer, "w2_weight", w2_weight)
-    copy_or_rebind_param(layer, w2_scale_name, w2_scale)
+    if w13_scale_name is not None:
+        assert w13_scale is not None
+        copy_or_rebind_param(layer, w13_scale_name, w13_scale)
+    if w2_scale_name is not None:
+        assert w2_scale is not None
+        copy_or_rebind_param(layer, w2_scale_name, w2_scale)
+
+
+def _get_moe_ep_process_group():
+    from sglang.srt.distributed import get_moe_ep_group
+
+    return get_moe_ep_group().device_group
 
 
 def _ensure_flashinfer_megamoe_layer(
     layer: FusedMoE,
     *,
     megakernel_config: Any,
-    w13_scale_name: str,
-    w2_scale_name: str,
+    w13_scale_name: str | None,
+    w2_scale_name: str | None,
 ) -> Any:
     mega = getattr(layer, "_flashinfer_megamoe_layer", None)
     if mega is not None:
@@ -262,11 +272,13 @@ def _ensure_flashinfer_megamoe_layer(
         MoEEpMegaLayer,
     )
 
-    w13_scale = getattr(layer, w13_scale_name)
-    w2_scale = getattr(layer, w2_scale_name)
+    w13_scale = (
+        getattr(layer, w13_scale_name).data if w13_scale_name is not None else None
+    )
+    w2_scale = getattr(layer, w2_scale_name).data if w2_scale_name is not None else None
     transformed_weights = (
-        (layer.w13_weight.data, w13_scale.data),
-        (layer.w2_weight.data, w2_scale.data),
+        (layer.w13_weight.data, w13_scale),
+        (layer.w2_weight.data, w2_scale),
     )
     world_size, rank = _layer_ep_world_rank(layer)
 
@@ -283,7 +295,11 @@ def _ensure_flashinfer_megamoe_layer(
     )
 
     mega = MoEEpMegaLayer(
-        bootstrap=BootstrapConfig(world_size=world_size, rank=rank),
+        bootstrap=BootstrapConfig(
+            world_size=world_size,
+            rank=rank,
+            process_group=_get_moe_ep_process_group(),
+        ),
         fleet_params=FleetParams(
             num_experts=layer.num_experts,
             max_tokens_per_rank=max_tokens_per_rank,
@@ -368,6 +384,25 @@ def ensure_mxfp8_moe_layer_for_flashinfer_megamoe(layer: FusedMoE) -> Any:
     )
 
 
+def ensure_bf16_moe_layer_for_flashinfer_megamoe(layer: FusedMoE) -> Any:
+    mega = getattr(layer, "_flashinfer_megamoe_layer", None)
+    if mega is not None:
+        return mega
+
+    from flashinfer.moe_ep import Bf16CutedslMegaMoeConfig
+
+    return _ensure_flashinfer_megamoe_layer(
+        layer,
+        megakernel_config=Bf16CutedslMegaMoeConfig(
+            intermediate_size=layer.intermediate_size_per_partition,
+            top_k=layer.top_k,
+            gate_up_clamp=layer.moe_runner_config.swiglu_limit,
+        ),
+        w13_scale_name=None,
+        w2_scale_name=None,
+    )
+
+
 def prepare_fp4_moe_weights_for_flashinfer_megamoe(
     layer: FusedMoE,
 ) -> None:
@@ -409,6 +444,14 @@ def prepare_nvfp4_moe_weights_for_flashinfer_megamoe(
         preprocess_nvfp4_cutedsl_mega_weights,
     )
 
+    if not layer.moe_runner_config.is_gated:
+        raise ValueError("FlashInfer NVFP4 MegaMOE requires gated SwiGLU experts.")
+    if layer.moe_runner_config.activation != "silu":
+        raise ValueError(
+            "FlashInfer NVFP4 MegaMOE requires silu activation for SwiGLU experts."
+        )
+    if hasattr(layer, "w13_weight_bias") or hasattr(layer, "w2_weight_bias"):
+        raise ValueError("FlashInfer NVFP4 MegaMOE does not support expert biases.")
     if layer.hidden_size % 128 != 0:
         raise ValueError(
             "FlashInfer NVFP4 MegaMOE requires hidden_size to be a multiple "
@@ -502,6 +545,59 @@ def prepare_mxfp8_moe_weights_for_flashinfer_megamoe(
     )
 
 
+def prepare_bf16_moe_weights_for_flashinfer_megamoe(layer: FusedMoE) -> None:
+    if (
+        layer.w13_weight.dtype != torch.bfloat16
+        or layer.w2_weight.dtype != torch.bfloat16
+    ):
+        raise ValueError("FlashInfer BF16 MegaMOE requires bfloat16 expert weights.")
+    if not layer.moe_runner_config.is_gated:
+        raise ValueError("FlashInfer BF16 MegaMOE requires gated SwiGLU experts.")
+    if layer.moe_runner_config.activation != "silu":
+        raise ValueError(
+            "FlashInfer BF16 MegaMOE requires silu activation for SwiGLU experts."
+        )
+    if hasattr(layer, "w13_weight_bias") or hasattr(layer, "w2_weight_bias"):
+        raise ValueError("FlashInfer BF16 MegaMOE does not support expert biases.")
+    if layer.hidden_size % 128 != 0:
+        raise ValueError(
+            "FlashInfer BF16 MegaMOE requires hidden_size to be a multiple "
+            f"of 128, got {layer.hidden_size}."
+        )
+    if layer.intermediate_size_per_partition % 128 != 0:
+        raise ValueError(
+            "FlashInfer BF16 MegaMOE requires intermediate_size_per_partition "
+            f"to be a multiple of 128, got {layer.intermediate_size_per_partition}."
+        )
+    if layer.num_experts % layer.moe_ep_size != 0:
+        raise ValueError(
+            "FlashInfer BF16 MegaMOE requires num_experts to be divisible by "
+            f"ep_size, got {layer.num_experts=} and {layer.moe_ep_size=}."
+        )
+    if hasattr(layer, "_flashinfer_megamoe_layer"):
+        raise RuntimeError(
+            "Cannot reprocess FlashInfer MegaMOE weights after its layer is built. "
+            "Reload the model to rebuild the backend safely."
+        )
+
+    from flashinfer.moe_ep import (
+        MoEWeightPack,
+        preprocess_bf16_cutedsl_mega_weights,
+    )
+
+    transformed_weights = preprocess_bf16_cutedsl_mega_weights(
+        MoEWeightPack(w13=layer.w13_weight.data, w2=layer.w2_weight.data),
+        intermediate_size=layer.intermediate_size_per_partition,
+        hidden_size=layer.hidden_size,
+    )
+    _bind_transformed_weights(
+        layer,
+        transformed_weights,
+        w13_scale_name=None,
+        w2_scale_name=None,
+    )
+
+
 # One symmetric-memory workspace shared across all mega layers. FlashInfer's
 # MoEEpMegaLayer allocates a workspace per instance; MoE layers run
 # sequentially and the workspace is weight-independent, so a per-layer buffer
@@ -565,6 +661,21 @@ def run_flashinfer_megamoe(
     topk_output = dispatch_output.topk_output
     topk_weights = topk_output.topk_weights
     topk_ids = topk_output.topk_ids
+    num_tokens = x.shape[0]
+
+    # MegaMOE is collective across EP ranks but its current BF16 frontend
+    # requires at least one local token. Keep zero-token ranks in the
+    # collective with a zero-weight dummy route, then discard its output.
+    if num_tokens == 0:
+        x = x.new_zeros((1, x.shape[1]))
+        topk_ids = torch.zeros(
+            (1, topk_ids.shape[1]), device=topk_ids.device, dtype=topk_ids.dtype
+        )
+        topk_weights = torch.zeros(
+            (1, topk_weights.shape[1]),
+            device=topk_weights.device,
+            dtype=topk_weights.dtype,
+        )
 
     mega = quant_info.mega
     _ensure_shared_workspace(mega)
@@ -594,4 +705,4 @@ def run_flashinfer_megamoe(
         if rsf is not None and rsf != 1.0:
             y.mul_(rsf)
 
-    return StandardCombineInput(hidden_states=y)
+    return StandardCombineInput(hidden_states=y[:num_tokens])

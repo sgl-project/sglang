@@ -1430,6 +1430,18 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             self._ensure_cutlass_buffers_initialized(layer)
 
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
+        if get_moe_runner_backend().is_flashinfer_megamoe():
+            if not self.use_mxfp8 and not self.is_fp4_expert:
+                raise ValueError(
+                    "FlashInfer MegaMOE supports MXFP8 or packed FP4 experts, "
+                    "not ordinary FP8 experts."
+                )
+            if self.use_mxfp8 and not self.is_checkpoint_fp8_serialized:
+                raise ValueError(
+                    "FlashInfer MegaMOE requires an MXFP8-serialized checkpoint; "
+                    "online MXFP8 quantization is unsupported."
+                )
+
         # AMD FP4 experts: use aiter's native MXFP4 MoE path
         if _use_aiter and self.is_fp4_expert:
             gu_intv = envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
