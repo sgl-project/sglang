@@ -704,11 +704,6 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
 
         weight: torch.Tensor = getattr(layer, f"{weight_prefix}_weight")
         weight.data = npu_format_cast(weight)
-        setattr(
-            layer,
-            f"{weight_prefix}_weight",
-            torch.nn.Parameter(weight, requires_grad=False),
-        )
 
         if weight_prefix == "w13":
             self._set_dispatcher_output_dtype(layer, "bf16")
