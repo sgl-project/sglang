@@ -1460,6 +1460,11 @@ class Scheduler(
         # HostKVCache.destroy. Called from run_scheduler_process's finally.
         if self.hisparse_coordinator is not None:
             self.hisparse_coordinator.destroy()
+        # A plain HiRadixCache (no hisparse) also holds a large pinned host KV
+        # pool; unregister it here too, else the kernel unpins it during reclaim.
+        host_pool = getattr(self.tree_cache, "token_to_kv_pool_host", None)
+        if host_pool is not None:
+            host_pool.destroy()
 
     def run_event_loop(self) -> None:
         """Run the scheduler's event loop.
