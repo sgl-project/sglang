@@ -1,10 +1,10 @@
 """CPU unit tests for the decoupled-spec verifier-side slot table + landing plan.
 
-``DecoupledSlotTable`` is the ``rid -> (pool_idx, generation)`` map the recv
-daemon uses to route an incoming enumeration block to GPU seats;
-``plan_landing`` is the pure-host routing that decides which rows land (and where)
-vs which are dropped because their request has left. Both are torch-free, so
-these tests exercise every routing outcome without a GPU or transport.
+DecoupledSlotTable is the rid -> pool_idx map the recv daemon uses to route an
+incoming enumeration block to GPU seats; plan_landing is the pure-host routing
+that decides which rows land (and where) vs which are dropped because their
+request has left. Both are torch-free, so these tests exercise every routing
+outcome without a GPU or transport.
 """
 
 import unittest
@@ -13,7 +13,6 @@ from sglang.srt.speculative.decoupled_slot_table import (
     DecoupledSlotTable,
     LandingPlan,
     PlannedWrite,
-    SlotBinding,
     plan_landing,
 )
 from sglang.srt.speculative.decoupled_spec_io import DraftEnumerationBufferBatch
@@ -44,8 +43,8 @@ def _block(
 class TestDecoupledSlotTable(CustomTestCase):
     def test_assign_then_lookup(self):
         table = DecoupledSlotTable()
-        table.assign("a", pool_idx=5, generation=1)
-        self.assertEqual(table.lookup("a"), SlotBinding(pool_idx=5, generation=1))
+        table.assign("a", pool_idx=5)
+        self.assertEqual(table.lookup("a"), 5)
         self.assertEqual(len(table), 1)
 
     def test_lookup_missing_returns_none(self):
@@ -54,7 +53,7 @@ class TestDecoupledSlotTable(CustomTestCase):
 
     def test_remove_then_lookup_none(self):
         table = DecoupledSlotTable()
-        table.assign("a", pool_idx=5, generation=1)
+        table.assign("a", pool_idx=5)
         table.remove("a")
         self.assertIsNone(table.lookup("a"))
         self.assertEqual(len(table), 0)
@@ -65,42 +64,46 @@ class TestDecoupledSlotTable(CustomTestCase):
         self.assertEqual(len(table), 0)
 
     def test_reassign_overwrites(self):
-        # Re-open after retraction: same rid, new seat + generation, last wins.
+        # Re-open after retraction: same rid, new seat, last write wins.
         table = DecoupledSlotTable()
-        table.assign("a", pool_idx=5, generation=1)
-        table.assign("a", pool_idx=8, generation=2)
-        self.assertEqual(table.lookup("a"), SlotBinding(pool_idx=8, generation=2))
+        table.assign("a", pool_idx=5)
+        table.assign("a", pool_idx=8)
+        self.assertEqual(table.lookup("a"), 8)
         self.assertEqual(len(table), 1)
 
     def test_clear(self):
         # clear() is the cache-flush hook: after it, no binding may survive
-        # (a stale (pool_idx, generation) would alias a live one post-flush).
+        # (a stale seat would route a late block into a reused seat post-flush).
         table = DecoupledSlotTable()
-        table.assign("a", pool_idx=5, generation=1)
-        table.assign("b", pool_idx=6, generation=1)
+        table.assign("a", pool_idx=5)
+        table.assign("b", pool_idx=6)
         table.clear()
         self.assertIsNone(table.lookup("a"))
         self.assertIsNone(table.lookup("b"))
         self.assertEqual(len(table), 0)
 
+    def test_lookup_many_aligned_with_input(self):
+        # Positionally aligned with the input rids, None where unbound -- the
+        # daemon routes a whole block against this one snapshot.
+        table = DecoupledSlotTable()
+        table.assign("a", pool_idx=3)
+        table.assign("c", pool_idx=5)
+        self.assertEqual(table.lookup_many(["a", "b", "c"]), [3, None, 5])
+
 
 class TestPlanLanding(CustomTestCase):
     def test_all_hit(self):
         table = DecoupledSlotTable()
-        table.assign("a", pool_idx=3, generation=7)
-        table.assign("b", pool_idx=4, generation=9)
+        table.assign("a", pool_idx=3)
+        table.assign("b", pool_idx=4)
         plan = plan_landing(_block(["a", "b"], [10, 20]), table, verifier_rank=0)
 
         self.assertEqual(plan.dropped_rids, [])
         self.assertEqual(
             plan.writes,
             [
-                PlannedWrite(
-                    row_index=0, pool_idx=3, generation=7, base_committed_len=10
-                ),
-                PlannedWrite(
-                    row_index=1, pool_idx=4, generation=9, base_committed_len=20
-                ),
+                PlannedWrite(row_index=0, pool_idx=3, base_committed_len=10),
+                PlannedWrite(row_index=1, pool_idx=4, base_committed_len=20),
             ],
         )
 
@@ -112,7 +115,7 @@ class TestPlanLanding(CustomTestCase):
 
     def test_mixed_hit_and_drop(self):
         table = DecoupledSlotTable()
-        table.assign("b", pool_idx=4, generation=9)  # only b is live
+        table.assign("b", pool_idx=4)  # only b is live
         plan = plan_landing(
             _block(["a", "b", "c"], [10, 20, 30]), table, verifier_rank=0
         )
@@ -120,31 +123,26 @@ class TestPlanLanding(CustomTestCase):
         self.assertEqual(plan.dropped_rids, ["a", "c"])
         self.assertEqual(
             plan.writes,
-            [
-                PlannedWrite(
-                    row_index=1, pool_idx=4, generation=9, base_committed_len=20
-                )
-            ],
+            [PlannedWrite(row_index=1, pool_idx=4, base_committed_len=20)],
         )
 
     def test_row_index_tracks_original_position(self):
         # A dropped leading row must not shift the surviving row's row_index:
         # row_index must always point back into the block's own rows.
         table = DecoupledSlotTable()
-        table.assign("b", pool_idx=4, generation=9)
+        table.assign("b", pool_idx=4)
         plan = plan_landing(_block(["a", "b"], [10, 20]), table, verifier_rank=0)
         self.assertEqual(plan.writes[0].row_index, 1)
 
-    def test_stamp_carries_block_base_and_table_generation(self):
-        # base comes from the block (freshness), generation from the table
-        # (occupancy) -- they must not be crossed.
+    def test_base_committed_len_from_block(self):
+        # base_committed_len comes from the block; pool_idx from the table.
         table = DecoupledSlotTable()
-        table.assign("a", pool_idx=3, generation=7)
+        table.assign("a", pool_idx=3)
         plan = plan_landing(_block(["a"], [42]), table, verifier_rank=0)
-        write = plan.writes[0]
-        self.assertEqual(write.base_committed_len, 42)
-        self.assertEqual(write.generation, 7)
-        self.assertEqual(write.pool_idx, 3)
+        self.assertEqual(
+            plan.writes[0],
+            PlannedWrite(row_index=0, pool_idx=3, base_committed_len=42),
+        )
 
     def test_empty_block(self):
         table = DecoupledSlotTable()
@@ -154,10 +152,9 @@ class TestPlanLanding(CustomTestCase):
     def test_rank_mismatch_raises(self):
         # A block routed to a different verifier must be rejected before any
         # routing: rids are only unique within the owning verifier, so a foreign
-        # rid colliding with a live local rid would land into the local seat and
-        # the (base, generation) stamp (generation is LOCAL) cannot catch it.
+        # rid colliding with a live local rid would land into the local seat.
         table = DecoupledSlotTable()
-        table.assign("a", pool_idx=3, generation=7)
+        table.assign("a", pool_idx=3)
         with self.assertRaises(RuntimeError):
             plan_landing(
                 _block(["a"], [10], dst_verifier_rank=1), table, verifier_rank=0
@@ -168,7 +165,7 @@ class TestPlanLanding(CustomTestCase):
         # the ingest path via block.validate() -- an uncaught raise here kills
         # the recv daemon loop, stalling landing for ALL requests.
         table = DecoupledSlotTable()
-        table.assign("a", pool_idx=3, generation=7)
+        table.assign("a", pool_idx=3)
         row_stride = (2 + 1) * 2 * 2
         malformed = DraftEnumerationBufferBatch(
             src_drafter_rank=0,
@@ -183,11 +180,10 @@ class TestPlanLanding(CustomTestCase):
             plan_landing(malformed, table, verifier_rank=0)
 
     def test_duplicate_rid_raises(self):
-        # Duplicate rids resolve to the same seat, making the vectorized
-        # scatter's winning row/stamp nondeterministic. Rejected by
-        # block.validate() (called on the ingest path), which raises ValueError.
+        # Duplicate rids resolve to the same seat, making the scatter's winning
+        # row/stamp nondeterministic. Rejected by block.validate() (ValueError).
         table = DecoupledSlotTable()
-        table.assign("a", pool_idx=3, generation=7)
+        table.assign("a", pool_idx=3)
         with self.assertRaises(ValueError):
             plan_landing(_block(["a", "a"], [10, 20]), table, verifier_rank=0)
 
