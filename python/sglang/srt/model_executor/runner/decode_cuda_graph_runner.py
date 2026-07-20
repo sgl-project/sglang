@@ -225,7 +225,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.enable_profile_cuda_graph = (
             model_runner.server_args.enable_profile_cuda_graph
         )
-        self.enable_pdmux = model_runner.server_args.enable_pdmux
 
         self.attn_tp_size = get_parallel().attn_tp_size
         self.attn_tp_rank = get_parallel().attn_tp_rank
@@ -668,11 +667,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return profile_context
 
     def _post_process_after_profile(self, prof_context):
-        # Namespace the snapshot by TP rank so profiling on every rank does not
-        # clobber a single shared file.
-        rank = get_parallel().tp_rank
-        memory_snapshot_file = f"cuda_graph_runner_memory_usage_rank{rank}.pickle"
-        torch.cuda.memory._dump_snapshot(memory_snapshot_file)
+        torch.cuda.memory._dump_snapshot("cuda_graph_runner_memory_usage.pickle")
         torch.cuda.memory._record_memory_history(enabled=None)
         log_message = (
             "Sorted by CUDA Time:\n"
@@ -683,7 +678,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             + prof_context.key_averages(group_by_input_shape=True).table(
                 sort_by="cpu_time_total", row_limit=10
             )
-            + f"\n\nMemory Usage is saved to {memory_snapshot_file}\n"
+            + "\n\nMemory Usage is saved to cuda_graph_runner_memory_usage.pickle\n"
         )
         logger.info(log_message)
 
