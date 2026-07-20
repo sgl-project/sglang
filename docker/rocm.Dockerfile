@@ -407,6 +407,10 @@ ENV CARGO_BUILD_JOBS=4
 
 RUN pip uninstall -y sgl_kernel sglang
 
+# Dynamically generate constraints file for torch and triton based on current environment
+RUN pip freeze | grep -E '^(torch|triton)' > /tmp/rocm-constraints.txt \
+    && echo "Generated constraints:" && cat /tmp/rocm-constraints.txt
+
 # Obtain sglang source: copied from the build context (BRANCH_TYPE=local) or git clone.
 COPY --from=local_src /src /tmp/local_src
 RUN if [ "$BRANCH_TYPE" = "local" ]; then \
@@ -424,8 +428,8 @@ RUN if [ "$BRANCH_TYPE" = "local" ]; then \
             fi \
          && cd ..; \
        fi \
-    && rm -rf /tmp/local_src \
-    && cd sglang \
+    && rm -rf /tmp/local_src
+RUN cd sglang \
     && cd sgl-kernel \
     && rm -f pyproject.toml \
     && mv pyproject_rocm.toml pyproject.toml \
@@ -433,9 +437,9 @@ RUN if [ "$BRANCH_TYPE" = "local" ]; then \
     && cd .. \
     && rm -rf python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml \
     && if [ "$BUILD_TYPE" = "srt" ]; then \
-         export SETUPTOOLS_SCM_PRETEND_VERSION="${SETUPTOOLS_SCM_PRETEND_VERSION}" && python -m pip --no-cache-dir install -e "python[srt_hip,diffusion_hip]"; \
+         export SETUPTOOLS_SCM_PRETEND_VERSION="${SETUPTOOLS_SCM_PRETEND_VERSION}" && python -m pip --no-cache-dir install -c /tmp/rocm-constraints.txt -e "python[srt_hip,diffusion_hip]"; \
        else \
-         export SETUPTOOLS_SCM_PRETEND_VERSION="${SETUPTOOLS_SCM_PRETEND_VERSION}" && python -m pip --no-cache-dir install -e "python[all_hip]"; \
+         export SETUPTOOLS_SCM_PRETEND_VERSION="${SETUPTOOLS_SCM_PRETEND_VERSION}" && python -m pip --no-cache-dir install -c /tmp/rocm-constraints.txt -e "python[all_hip]"; \
        fi
 
 RUN python -m pip cache purge
