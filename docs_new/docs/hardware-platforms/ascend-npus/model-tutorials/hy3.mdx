@@ -1,42 +1,39 @@
 ---
 title: "Hy3"
 metatags:
-  description: "Deploy Hy3 model with SGLang on Ascend NPUs, including single-node deployment, multimodal support, and speculative decoding."
+  description: "Deploy Hy3 model with SGLang on Ascend NPUs, including single-node deployment and speculative decoding."
 ---
 
 ## Introduction
 
 Hy3 is a 295B-parameter Mixture-of-Experts (MoE) model with 21B active parameters and 3.8B MTP layer
 parameters, developed by the Tencent Hy Team. It features 192 experts with top-8 activation per token, GQA attention
-(64 heads, 8 KV heads, head dim 128), and a 256K context length. The model supports multimodal inputs (text and
-images), built-in reasoning via `reasoning_effort`, tool calling, and multi-token prediction (MTP) for speculative
-decoding. Hy3 significantly outperforms similar-size models and rivals flagship open-source models with 2–5× the
-parameters, with notable improvements in agentic workflows, long-context tasks, and production reliability.
+(64 heads, 8 KV heads, head dim 128), and a 256K context length. The model supports built-in reasoning via
+`reasoning_effort`, tool calling, and multi-token prediction (MTP) for speculative decoding. Hy3 significantly
+outperforms similar-size models and rivals flagship open-source models with 2–5× the parameters, with notable
+improvements in agentic workflows, long-context tasks, and production reliability.
 
 This document demonstrates the deployment of Hy3 on Ascend NPUs using SGLang, including single-node PD mixed
-mode, feature configuration, and performance optimization.
+mode and speculative decoding.
 
-This document is validated and written based on **SGLang v0.5.13**. The current model (Hy3) is fully supported in
-this version. To use the latest features (e.g., speculative decoding, multimodal), it is recommended to use
-v0.5.13 or a later version.
+This document is validated and written based on **SGLang v0.5.13**. To use the latest features (e.g., speculative
+decoding), it is recommended to use v0.5.13 or a later version.
 
 ## Supported features
 
 | Feature                  | Example usage                                                                                                                          |
 |--------------------------|----------------------------------------------------------------------------------------------------------------------------------------|
 | Tensor Parallelism       | `--tp-size 16`                                                                                                                         |
-| NPU Graph                | enabled by default; disable with `--disable-cuda-graph`;<br/>control range via `--cuda-graph-bs` or `--cuda-graph-max-bs-decode`; e.g., `--cuda-graph-bs 4 8 16 20 24 28 32 36 40` |
-| Speculative Decoding     | `--speculative-algorithm EAGLE \`<br/>`--speculative-num-steps 2 \`<br/>`--speculative-eagle-topk 1 \`<br/>`--speculative-num-draft-tokens 3` |
+| NPU Graph                | enabled by default; disable with `--disable-cuda-graph`;<br/>control range via `--cuda-graph-bs`; e.g. `--cuda-graph-bs 4 8 16 20 24 28 32 36 40` |
+| Speculative Decoding     | `--speculative-algorithm EAGLE \`<br/>`--speculative-num-steps 1 \`<br/>`--speculative-eagle-topk 1 \`<br/>`--speculative-num-draft-tokens 2` |
 | Overlap Schedule         | `export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`                                                                                           |
-| Multimodal               | `--enable-multimodal --mm-attention-backend ascend_attn`                                                                               |
 | Reasoning Mode           | `extra_body={"chat_template_kwargs": {"reasoning_effort": "high"}}` — deep chain-of-thought;<br/>`"reasoning_effort": "low"` — short thinking chain;<br/>`"reasoning_effort": "no_think"` — direct response, no thinking |
 | Tool Calling             | `--tool-call-parser auto --reasoning-parser auto`                                                                                      |
 
 <Note>
 The values in the **Example usage** column are for illustration only. Adjust them according to your hardware, deployment
 mode, and workload. For parameter details, see
-[Feature descriptions](/docs/hardware-platforms/ascend-npus/ascend_npu_optimization#feature-descriptions); for
-recommended configurations for each deployment scenario, see [Best practices](#best-practices).
+[Feature descriptions](/docs/hardware-platforms/ascend-npus/ascend_npu_optimization#feature-descriptions).
 </Note>
 
 For feature compatibility and conflict information between features,
@@ -58,28 +55,14 @@ Before following this tutorial, complete the environment setup in the documents 
 
 ### Model weights
 
-Before downloading model weights, check the model size to reserve enough disk space.
-For multi-node deployment, download the weights to a shared directory accessible to all nodes.
+<Warning>
+Hy3 has 295B total parameters. If you need to download model weights, check the model size before downloading to reserve enough space.
+</Warning>
 
-- [Hy3](https://www.modelscope.cn/models/Tencent-Hunyuan/Hy3) (BF16, ~590GB) /
-  [Hugging Face](https://huggingface.co/tencent/Hy3) /
-  [GitCode](https://ai.gitcode.com/tencent_hunyuan/Hy3) /
-  [CNB](https://cnb.cool/ai-models/tencent/Hy3)
-- [Hy3-FP8](https://www.modelscope.cn/models/Tencent-Hunyuan/Hy3-FP8) (FP8, ~300GB) /
-  [Hugging Face](https://huggingface.co/tencent/Hy3-FP8) /
-  [GitCode](https://ai.gitcode.com/tencent_hunyuan/Hy3-FP8) /
-  [CNB](https://cnb.cool/ai-models/tencent/Hy3-FP8)
+- [tencent/Hy3](https://huggingface.co/tencent/Hy3) (Instruct model, BF16) / [ModelScope](https://modelscope.cn/models/Tencent-Hunyuan/Hy3) / [GitCode](https://ai.gitcode.com/tencent_hunyuan/Hy3) / [CNB](https://cnb.cool/ai-models/tencent/Hy3)
+- [tencent/Hy3-FP8](https://huggingface.co/tencent/Hy3-FP8) (FP8 quantized instruct model) / [ModelScope](https://modelscope.cn/models/Tencent-Hunyuan/Hy3-FP8) / [GitCode](https://ai.gitcode.com/tencent_hunyuan/Hy3-FP8) / [CNB](https://cnb.cool/ai-models/tencent/Hy3-FP8)
 
-<Tip>
-The BF16 variant (~590GB) can be deployed on 16 × 64GB of device memory (`--tp-size 16`), which corresponds to one full
-Atlas 800I A3 node (8 cards × 2 dies).
-</Tip>
-
-This is the minimum recommended configuration. For optimized configurations,
-see [Best practices](#best-practices), which may require additional cards or nodes.
-
-For the hardware specifications (memory per die, dies per card, and the difference between A2 and A3),
-see [Ascend NPU Reference — Hardware](/docs/hardware-platforms/ascend-npus/ascend_npu_reference#hardware).
+It is recommended to download the model weights to a shared directory accessible from within the container.
 
 ## Installation
 
@@ -96,7 +79,7 @@ For details, see [Docker image versions](/docs/hardware-platforms/ascend-npus/as
 ```bash Command
 docker pull quay.io/ascend/sglang:v0.5.13.post1-cann9.0.0-a3
 
-docker run -itd --shm-size=16g --name ${NAME} \
+docker run -itd --shm-size=64g --name ${NAME} \
 --privileged=true --net=host \
 -v /var/queue_schedule:/var/queue_schedule \
 -v /etc/ascend_install.info:/etc/ascend_install.info \
@@ -129,6 +112,7 @@ quay.io/ascend/sglang:v0.5.13.post1-cann9.0.0-a3
 - If the model weights have already been downloaded to a shared directory, use `-v` to mount the model path into the
   container, for example: `-v /path/to/models:/models`.
 - Replace `${NAME}` with your own container name or remove `--name` to use default name.
+- `--shm-size=64g` is recommended for 16-NPU deployments with large batch sizes.
 </Tip>
 
 ## Online service deployment
@@ -136,64 +120,105 @@ quay.io/ascend/sglang:v0.5.13.post1-cann9.0.0-a3
 ### Single-node online deployment
 
 Single-node deployment completes both prefill and decode within the same node (PD mixed mode). Hy3 with 295B
-parameters requires all 16 logical NPUs on an Atlas 800I A3 server. This scenario is already covered in the best
-practice. For the complete deployment commands, see
-[Hy3 Best Practice — PD Mixed On A3](/docs/hardware-platforms/ascend-npus/best_practice/hy3#single-node-pd-mixed).
+parameters requires all 16 logical NPUs on an Atlas 800I A3 server (8 physical NPUs × 2 logical cores each, 64 GB HBM
+per logical NPU).
+
+Set the following environment variables before launching the server:
+
+```bash
+# Performance tuning
+export SGLANG_SET_CPU_AFFINITY=1
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+
+# CANN environment (adjust paths to match your installation)
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+
+# Ascend NPU settings
+export ASCEND_USE_FIA=1
+export STREAMS_PER_DEVICE=32
+export HCCL_BUFFSIZE=3000
+export HCCL_OP_EXPANSION_MODE=AIV
+export HCCL_SOCKET_IFNAME=lo
+export GLOO_SOCKET_IFNAME=lo
+
+# SGLang settings
+export SGLANG_ENABLE_SPEC_V2=1
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
+```
+
+Launch the server:
+
+```bash
+MODEL_PATH="/path/to/Hy3"
+
+python3 -m sglang.launch_server \
+    --model-path ${MODEL_PATH} \
+    --attention-backend ascend \
+    --reasoning-parser auto \
+    --tool-call-parser auto \
+    --device npu \
+    --tp-size 16 \
+    --host 0.0.0.0 \
+    --port 9999 \
+    --mem-fraction-static 0.84 \
+    --dtype bfloat16 \
+    --base-gpu-id 0 \
+    --prefill-max-requests 40 \
+    --max-running-requests 40 \
+    --cuda-graph-bs 4 8 16 20 24 28 32 36 40 \
+    --speculative-algorithm EAGLE \
+    --speculative-num-steps 2 \
+    --speculative-eagle-topk 1 \
+    --speculative-num-draft-tokens 3
+```
 
 ## Functional verification
 
-After the service is started, you can invoke the model by sending a prompt:
+After the server prints `The server is fired up and ready to roll!`, send a test request:
 
-```shell
+```bash
 # ============================================================
 # Before running, update the following variables:
 #   HOST: the server host address (e.g., localhost)
-#   PORT: the server port number (e.g., 6688)
+#   PORT: the server port number (e.g., 9999)
 # ============================================================
 
-curl http://${HOST}:${PORT}/generate \
-    -H "Content-Type: application/json" \
-    -d '{
-        "text": "What is the capital of France?",
-        "sampling_params": {
-            "max_new_tokens": 64,
-            "temperature": 0
-        }
-    }'
-```
-
-Expected result: an HTTP 200 response with the generated text containing "Paris".
-
-For multimodal requests (text + image):
-
-```shell
-# ============================================================
-# Before running, update the following variables:
-#   HOST: the server host address (e.g., localhost)
-#   PORT: the server port number (e.g., 6688)
-# ============================================================
-
+# Text generation (no thinking)
 curl http://${HOST}:${PORT}/v1/chat/completions \
     -H "Content-Type: application/json" \
     -d '{
         "model": "Hy3",
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image_url", "image_url": {"url": "https://raw.githubusercontent.com/sgl-project/sglang/main/examples/assets/example_image.png"}},
-                    {"type": "text", "text": "Describe this image."}
-                ]
-            }
-        ],
+        "messages": [{"role": "user", "content": "What is the capital of France?"}],
+        "max_tokens": 64,
+        "temperature": 0.9,
         "extra_body": {"chat_template_kwargs": {"reasoning_effort": "no_think"}}
     }'
 ```
 
-Expected result: an HTTP 200 response with a description of the image.
+Expected result: an HTTP 200 response with `"Paris"` in the content field.
 
-Once the server prints `The server is fired up and ready to roll!` in the logs, it is ready to accept requests. For more
-testing examples (Health Check, Generate, Chat Completions, and port usage guidance),
+To enable chain-of-thought reasoning for math or coding tasks, set `reasoning_effort` to `"high"`:
+
+```bash
+curl http://${HOST}:${PORT}/v1/chat/completions \
+    -H "Content-Type: application/json" \
+    -d '{
+        "model": "Hy3",
+        "messages": [{"role": "user", "content": "Solve: if 3x + 7 = 22, what is x?"}],
+        "max_tokens": 8192,
+        "temperature": 0.9,
+        "extra_body": {"chat_template_kwargs": {"reasoning_effort": "high"}}
+    }'
+```
+
+The response will contain a `reasoning_content` field with the thinking process and a `content` field with the final
+answer.
+
+For more testing examples (Health Check, Generate, Chat Completions, and port usage guidance),
 see [Testing the Service](/docs/hardware-platforms/ascend-npus/ascend_npu#testing-the-service).
 
 ## Accuracy evaluation
@@ -208,18 +233,16 @@ For performance data and benchmark commands, see [Performance Testing on Ascend 
 
 ### Best practice configuration reference
 
-For complete deployment scripts, see the
-[Hy3 Best Practice](/docs/hardware-platforms/ascend-npus/best_practice/hy3) page.
+Hy3 has no standalone best practice page yet. The [Single-node online deployment](#single-node-online-deployment)
+section above provides the ready-to-use script for the supported single-node PD mixed case.
+
+For the full catalog of optimization features and their parameter and compatibility details,
+see [Optimization on Ascend NPU](/docs/hardware-platforms/ascend-npus/ascend_npu_optimization).
 
 ## Performance tuning
 
 For the full list of supported features, see [Supported features](#supported-features). For detailed optimization
 guidance, see [Optimization on Ascend NPU](/docs/hardware-platforms/ascend-npus/ascend_npu_optimization).
-
-## FAQ
-
-For common environment, installation, and general parameter issues, please refer to the [Ascend NPU FAQ](/docs/hardware-platforms/ascend-npus/ascend_npu_faq).
-This section only covers model-specific issues.
 
 ### Reasoning mode selection
 
@@ -233,19 +256,7 @@ Hy3 supports three reasoning modes via `chat_template_kwargs`:
 
 Use `no_think` for interactive or latency-sensitive applications to reduce output token count significantly.
 
-To enable chain-of-thought reasoning for math or coding tasks:
+## FAQ
 
-```shell
-curl http://${HOST}:${PORT}/v1/chat/completions \
-    -H "Content-Type: application/json" \
-    -d '{
-        "model": "Hy3",
-        "messages": [{"role": "user", "content": "Solve: if 3x + 7 = 22, what is x?"}],
-        "max_tokens": 8192,
-        "temperature": 0.9,
-        "extra_body": {"chat_template_kwargs": {"reasoning_effort": "high"}}
-    }'
-```
-
-The response will contain a `reasoning_content` field with the thinking process and a `content` field with the final
-answer.
+For common environment, installation, and general parameter issues, please refer to the [Ascend NPU FAQ](/docs/hardware-platforms/ascend-npus/ascend_npu_faq).
+This section only covers model-specific issues.
