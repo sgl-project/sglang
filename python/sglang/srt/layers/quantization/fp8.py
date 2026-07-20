@@ -83,6 +83,7 @@ from sglang.srt.layers.utils import copy_or_rebind_param
 from sglang.srt.runtime_context import (
     get_parallel,
     get_platform,
+    get_server_args,
 )
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -1446,6 +1447,18 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             self._ensure_cutlass_buffers_initialized(layer)
 
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
+        if get_moe_runner_backend().is_flashinfer_megamoe():
+            if not self.use_mxfp8 and not self.is_fp4_expert:
+                raise ValueError(
+                    "FlashInfer MegaMOE supports MXFP8 or packed FP4 experts, "
+                    "not ordinary FP8 experts."
+                )
+            if self.use_mxfp8 and not self.quant_config.is_checkpoint_fp8_serialized:
+                raise ValueError(
+                    "FlashInfer MegaMOE requires an MXFP8-serialized checkpoint; "
+                    "online MXFP8 quantization is unsupported."
+                )
+
         # AMD FP4 experts: use aiter's native MXFP4 MoE path
         if _use_aiter and self.is_fp4_expert:
             gu_intv = envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
@@ -1622,10 +1635,14 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             return
         elif self.use_mxfp8 and get_moe_a2a_backend().is_flashinfer_megamoe():
             from sglang.srt.layers.moe.flashinfer_megamoe import (
+                prepare_mxfp8_bf16_moe_weights_for_flashinfer_megamoe,
                 prepare_mxfp8_moe_weights_for_flashinfer_megamoe,
             )
 
-            prepare_mxfp8_moe_weights_for_flashinfer_megamoe(layer)
+            if get_server_args().flashinfer_megamoe_mxfp8_precision == "bf16":
+                prepare_mxfp8_bf16_moe_weights_for_flashinfer_megamoe(layer)
+            else:
+                prepare_mxfp8_moe_weights_for_flashinfer_megamoe(layer)
             return
         elif self.use_mxfp8:
             self._process_mxfp8_moe_weights(
@@ -2565,11 +2582,16 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             from sglang.srt.layers.moe.flashinfer_megamoe import (
                 FlashInferMegaMoeQuantInfo,
                 ensure_fp4_moe_layer_for_flashinfer_megamoe,
+                ensure_mxfp8_bf16_moe_layer_for_flashinfer_megamoe,
                 ensure_mxfp8_moe_layer_for_flashinfer_megamoe,
             )
 
             if self.use_mxfp8:
-                ensure_megamoe_layer = ensure_mxfp8_moe_layer_for_flashinfer_megamoe
+                ensure_megamoe_layer = (
+                    ensure_mxfp8_bf16_moe_layer_for_flashinfer_megamoe
+                    if get_server_args().flashinfer_megamoe_mxfp8_precision == "bf16"
+                    else ensure_mxfp8_moe_layer_for_flashinfer_megamoe
+                )
             elif self.is_fp4_expert:
                 ensure_megamoe_layer = ensure_fp4_moe_layer_for_flashinfer_megamoe
             else:

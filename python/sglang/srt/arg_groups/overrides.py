@@ -1547,6 +1547,11 @@ def _moe_runner_fusion_disable(view: Any) -> dict:
             "FlashInfer TRTLLM routed MoE is enabled. --disable-shared-experts-fusion is automatically set."
         )
         return {"disable_shared_experts_fusion": True}
+    if runner == "flashinfer_megamoe":
+        logger.warning(
+            "FlashInfer MegaMOE is enabled. --disable-shared-experts-fusion is automatically set."
+        )
+        return {"disable_shared_experts_fusion": True}
     return {}
 
 
@@ -1565,7 +1570,7 @@ def _a2a_fusion_adjustments(view: Any) -> dict:
         return {}
     if view.moe_a2a_backend in ("flashinfer", "flashinfer_megamoe"):
         logger.warning(
-            "Flashinfer MoE A2A is enabled. --disable-shared-experts-fusion is automatically set."
+            "FlashInfer MoE A2A is enabled. --disable-shared-experts-fusion is automatically set."
         )
         return {"disable_shared_experts_fusion": True}
     if view.moe_a2a_backend == "deepep_v2":

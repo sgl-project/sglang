@@ -227,16 +227,26 @@ def _bind_transformed_weights(
     layer: FusedMoE,
     transformed_weights: Any,
     *,
-    w13_scale_name: str,
-    w2_scale_name: str,
+    w13_scale_name: str | None,
+    w2_scale_name: str | None,
 ) -> None:
     from sglang.srt.layers.utils.common import copy_or_rebind_param
 
     (w13_weight, w13_scale), (w2_weight, w2_scale) = transformed_weights
     copy_or_rebind_param(layer, "w13_weight", w13_weight)
-    copy_or_rebind_param(layer, w13_scale_name, w13_scale)
     copy_or_rebind_param(layer, "w2_weight", w2_weight)
-    copy_or_rebind_param(layer, w2_scale_name, w2_scale)
+    if w13_scale_name is not None:
+        assert w13_scale is not None
+        copy_or_rebind_param(layer, w13_scale_name, w13_scale)
+    if w2_scale_name is not None:
+        assert w2_scale is not None
+        copy_or_rebind_param(layer, w2_scale_name, w2_scale)
+
+
+def _get_moe_ep_process_group():
+    from sglang.srt.distributed import get_moe_ep_group
+
+    return get_moe_ep_group().device_group
 
 
 def _init_flashinfer_megamoe_layer_state(layer: FusedMoE) -> None:
@@ -255,8 +265,8 @@ def _ensure_flashinfer_megamoe_layer(
     layer: FusedMoE,
     *,
     megakernel_config: Any,
-    w13_scale: torch.Tensor,
-    w2_scale: torch.Tensor,
+    w13_scale: torch.Tensor | None,
+    w2_scale: torch.Tensor | None,
 ) -> Any:
     mega = _get_or_init_flashinfer_megamoe_layer_state(layer)
     if mega is not None:
@@ -270,8 +280,8 @@ def _ensure_flashinfer_megamoe_layer(
     )
 
     transformed_weights = (
-        (layer.w13_weight.data, w13_scale.data),
-        (layer.w2_weight.data, w2_scale.data),
+        (layer.w13_weight.data, None if w13_scale is None else w13_scale.data),
+        (layer.w2_weight.data, None if w2_scale is None else w2_scale.data),
     )
     world_size, rank = _layer_ep_world_rank(layer)
 
@@ -289,7 +299,10 @@ def _ensure_flashinfer_megamoe_layer(
 
     mega = MoEEpMegaLayer(
         bootstrap=BootstrapConfig(
-            world_size=world_size, rank=rank, device=torch.cuda.current_device()
+            world_size=world_size,
+            rank=rank,
+            device=torch.cuda.current_device(),
+            process_group=_get_moe_ep_process_group(),
         ),
         fleet_params=FleetParams(
             num_experts=layer.num_experts,
@@ -315,11 +328,11 @@ def ensure_fp4_moe_layer_for_flashinfer_megamoe(layer: FusedMoE) -> Any:
     if mega is not None:
         return mega
 
-    from flashinfer.moe_ep import DeepGemmMegaMoeConfig
+    from flashinfer.moe_ep import Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig
 
     return _ensure_flashinfer_megamoe_layer(
         layer,
-        megakernel_config=DeepGemmMegaMoeConfig(
+        megakernel_config=Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig(
             intermediate_size=layer.intermediate_size_per_partition,
             top_k=layer.top_k,
             activation_clamp=layer.moe_runner_config.swiglu_limit,
@@ -334,7 +347,7 @@ def ensure_nvfp4_moe_layer_for_flashinfer_megamoe(layer: FusedMoE) -> Any:
     if mega is not None:
         return mega
 
-    from flashinfer.moe_ep import Nvfp4CutedslMegaMoeConfig
+    from flashinfer.moe_ep import Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
 
     input_norm_const = layer._flashinfer_megamoe_input_norm_const
     if input_norm_const is None:
@@ -355,7 +368,7 @@ def ensure_nvfp4_moe_layer_for_flashinfer_megamoe(layer: FusedMoE) -> Any:
 
     return _ensure_flashinfer_megamoe_layer(
         layer,
-        megakernel_config=Nvfp4CutedslMegaMoeConfig(
+        megakernel_config=Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
             intermediate_size=layer.intermediate_size_per_partition,
             top_k=layer.top_k,
             gate_up_clamp=layer.moe_runner_config.swiglu_limit,
@@ -377,11 +390,11 @@ def ensure_mxfp8_moe_layer_for_flashinfer_megamoe(layer: FusedMoE) -> Any:
     if mega is not None:
         return mega
 
-    from flashinfer.moe_ep import Mxfp8CutedslMegaMoeConfig
+    from flashinfer.moe_ep import Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig
 
     return _ensure_flashinfer_megamoe_layer(
         layer,
-        megakernel_config=Mxfp8CutedslMegaMoeConfig(
+        megakernel_config=Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(
             intermediate_size=layer.intermediate_size_per_partition,
             top_k=layer.top_k,
             kind="mxfp8_e4m3",
@@ -390,6 +403,46 @@ def ensure_mxfp8_moe_layer_for_flashinfer_megamoe(layer: FusedMoE) -> Any:
         ),
         w13_scale=layer.w13_weight_scale_inv,
         w2_scale=layer.w2_weight_scale_inv,
+    )
+
+
+def ensure_mxfp8_bf16_moe_layer_for_flashinfer_megamoe(layer: FusedMoE) -> Any:
+    mega = _get_or_init_flashinfer_megamoe_layer_state(layer)
+    if mega is not None:
+        return mega
+
+    from flashinfer.moe_ep import Sm100_Bf16_Mxfp8_Bf16_Cutedsl_MegaMoeConfig
+
+    return _ensure_flashinfer_megamoe_layer(
+        layer,
+        megakernel_config=Sm100_Bf16_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(
+            intermediate_size=layer.intermediate_size_per_partition,
+            top_k=layer.top_k,
+            kind="bf16_mxfp8_e4m3",
+            gate_up_clamp=layer.moe_runner_config.swiglu_limit,
+            in_kernel_fc2_reduce=envs.SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE.get(),
+        ),
+        w13_scale=layer.w13_weight_scale_inv,
+        w2_scale=layer.w2_weight_scale_inv,
+    )
+
+
+def ensure_bf16_moe_layer_for_flashinfer_megamoe(layer: FusedMoE) -> Any:
+    mega = _get_or_init_flashinfer_megamoe_layer_state(layer)
+    if mega is not None:
+        return mega
+
+    from flashinfer.moe_ep import Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig
+
+    return _ensure_flashinfer_megamoe_layer(
+        layer,
+        megakernel_config=Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig(
+            intermediate_size=layer.intermediate_size_per_partition,
+            top_k=layer.top_k,
+            gate_up_clamp=layer.moe_runner_config.swiglu_limit,
+        ),
+        w13_scale=None,
+        w2_scale=None,
     )
 
 
@@ -438,6 +491,14 @@ def prepare_nvfp4_moe_weights_for_flashinfer_megamoe(
         preprocess_nvfp4_cutedsl_mega_weights,
     )
 
+    if not layer.moe_runner_config.is_gated:
+        raise ValueError("FlashInfer NVFP4 MegaMOE requires gated SwiGLU experts.")
+    if layer.moe_runner_config.activation != "silu":
+        raise ValueError(
+            "FlashInfer NVFP4 MegaMOE requires silu activation for SwiGLU experts."
+        )
+    if hasattr(layer, "w13_weight_bias") or hasattr(layer, "w2_weight_bias"):
+        raise ValueError("FlashInfer NVFP4 MegaMOE does not support expert biases.")
     if layer.hidden_size % 128 != 0:
         raise ValueError(
             "FlashInfer NVFP4 MegaMOE requires hidden_size to be a multiple "
@@ -536,17 +597,125 @@ def prepare_mxfp8_moe_weights_for_flashinfer_megamoe(
     )
 
 
+def prepare_mxfp8_bf16_moe_weights_for_flashinfer_megamoe(
+    layer: FusedMoE,
+) -> None:
+    _init_flashinfer_megamoe_layer_state(layer)
+
+    from flashinfer.moe_ep import MoEWeightPack
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.bf16_mxfp8_bf16_cutedsl import (
+        preprocess_mega_weights,
+    )
+
+    if not layer.moe_runner_config.is_gated:
+        raise ValueError(
+            "FlashInfer MXFP8 x BF16 MegaMOE requires gated SwiGLU experts."
+        )
+    if layer.moe_runner_config.activation != "silu":
+        raise ValueError(
+            "FlashInfer MXFP8 x BF16 MegaMOE requires silu activation for SwiGLU experts."
+        )
+    if hasattr(layer, "w13_weight_bias") or hasattr(layer, "w2_weight_bias"):
+        raise ValueError(
+            "FlashInfer MXFP8 x BF16 MegaMOE does not support expert biases."
+        )
+    if layer.hidden_size % 32 != 0:
+        raise ValueError(
+            "FlashInfer MXFP8 x BF16 MegaMOE requires hidden_size to be a multiple "
+            f"of 32, got {layer.hidden_size}."
+        )
+    if layer.intermediate_size_per_partition % 64 != 0:
+        raise ValueError(
+            "FlashInfer MXFP8 x BF16 MegaMOE requires intermediate_size_per_partition "
+            f"to be a multiple of 64, got {layer.intermediate_size_per_partition}."
+        )
+    if layer.num_experts % layer.moe_ep_size != 0:
+        raise ValueError(
+            "FlashInfer MXFP8 x BF16 MegaMOE requires num_experts to be divisible by "
+            f"ep_size, got {layer.num_experts=} and {layer.moe_ep_size=}."
+        )
+
+    weights = MoEWeightPack(
+        w13=layer.w13_weight.data,
+        w2=layer.w2_weight.data,
+        w13_scale=layer.w13_weight_scale_inv.data,
+        w2_scale=layer.w2_weight_scale_inv.data,
+    )
+    transformed_weights = preprocess_mega_weights(
+        weights,
+        intermediate_size=layer.intermediate_size_per_partition,
+        hidden_size=layer.hidden_size,
+        kind="bf16_mxfp8_e4m3",
+    )
+    _bind_transformed_weights(
+        layer,
+        transformed_weights,
+        w13_scale_name="w13_weight_scale_inv",
+        w2_scale_name="w2_weight_scale_inv",
+    )
+
+
+def prepare_bf16_moe_weights_for_flashinfer_megamoe(layer: FusedMoE) -> None:
+    _init_flashinfer_megamoe_layer_state(layer)
+
+    if (
+        layer.w13_weight.dtype != torch.bfloat16
+        or layer.w2_weight.dtype != torch.bfloat16
+    ):
+        raise ValueError("FlashInfer BF16 MegaMOE requires bfloat16 expert weights.")
+    if not layer.moe_runner_config.is_gated:
+        raise ValueError("FlashInfer BF16 MegaMOE requires gated SwiGLU experts.")
+    if layer.moe_runner_config.activation != "silu":
+        raise ValueError(
+            "FlashInfer BF16 MegaMOE requires silu activation for SwiGLU experts."
+        )
+    if hasattr(layer, "w13_weight_bias") or hasattr(layer, "w2_weight_bias"):
+        raise ValueError("FlashInfer BF16 MegaMOE does not support expert biases.")
+    if layer.hidden_size % 128 != 0:
+        raise ValueError(
+            "FlashInfer BF16 MegaMOE requires hidden_size to be a multiple "
+            f"of 128, got {layer.hidden_size}."
+        )
+    if layer.intermediate_size_per_partition % 128 != 0:
+        raise ValueError(
+            "FlashInfer BF16 MegaMOE requires intermediate_size_per_partition "
+            f"to be a multiple of 128, got {layer.intermediate_size_per_partition}."
+        )
+    if layer.num_experts % layer.moe_ep_size != 0:
+        raise ValueError(
+            "FlashInfer BF16 MegaMOE requires num_experts to be divisible by "
+            f"ep_size, got {layer.num_experts=} and {layer.moe_ep_size=}."
+        )
+
+    from flashinfer.moe_ep import (
+        MoEWeightPack,
+        preprocess_bf16_cutedsl_mega_weights,
+    )
+
+    transformed_weights = preprocess_bf16_cutedsl_mega_weights(
+        MoEWeightPack(w13=layer.w13_weight.data, w2=layer.w2_weight.data),
+        intermediate_size=layer.intermediate_size_per_partition,
+        hidden_size=layer.hidden_size,
+    )
+    _bind_transformed_weights(
+        layer,
+        transformed_weights,
+        w13_scale_name=None,
+        w2_scale_name=None,
+    )
+
+
 def _ensure_shared_workspace(mega: Any) -> None:
     """Point this layer at a runtime-context-owned shared symmetric buffer.
 
     FlashInfer's own workspace_pool shares by a key that includes
     ``epilogue_pool_key(fc1_alpha/fc2_alpha/fc1_norm_const)`` (see
-    ``flashinfer.moe_ep.backends.mega.kernel.nvfp4_cutedsl.backend
-    ._workspace_pool_key``), and that key is identity-keyed for tensors, not
-    value-keyed. sglang binds distinct per-layer alpha/norm-const tensor
-    objects on every FusedMoE layer, so FlashInfer's pool never actually hits
-    across layers and every layer independently pays a full CuteDSL compile
-    (removed in b07d9012a3 "fix: rely on FlashInfer MegaMoE workspace
+    ``flashinfer.moe_ep.backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl
+    .backend._workspace_pool_key``), and that key is identity-keyed for
+    tensors, not value-keyed. sglang binds distinct per-layer alpha/norm-const
+    tensor objects on every FusedMoE layer, so FlashInfer's pool never actually
+    hits across layers and every layer independently pays a full CuteDSL
+    compile (removed in b07d9012a3 "fix: rely on FlashInfer MegaMoE workspace
     pooling", which assumed FlashInfer's pooling alone was equivalent).
 
     All layers share identical fleet/kernel geometry, and the alpha/norm-const

@@ -207,18 +207,22 @@ def validate_flashinfer_megamoe_model(server_args: Any) -> None:
             f"{sorted(validated_architectures)}."
         )
 
+    import torch
+
     quantization = resolved_view(server_args).quantization
     supports_megamoe_quantization = (
         quantization in ("mxfp8", "modelopt_fp4")
         or model_config.is_fp4_experts
         or model_config.nvfp4_moe_meta is not None
+        or (quantization is None and model_config.dtype == torch.bfloat16)
     )
     if not supports_megamoe_quantization:
         raise ValueError(
-            "FlashInfer MegaMOE currently supports only MXFP8, ModelOpt "
-            "NVFP4, FP4-expert, or hybrid NVFP4 MoE checkpoints; got "
-            f"quantization={quantization!r}. Standard FP8 MoE checkpoints "
-            "are not supported."
+            "FlashInfer MegaMOE currently supports only BF16, "
+            "MXFP8, MXFP8xBF16, ModelOpt NVFP4, FP4-expert, or hybrid NVFP4 MoE "
+            f"checkpoints; got quantization={quantization!r} with "
+            f"dtype={model_config.dtype}. Standard FP8 MoE checkpoints are "
+            "not supported."
         )
 
 
