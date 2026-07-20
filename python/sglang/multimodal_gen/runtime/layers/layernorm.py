@@ -887,6 +887,7 @@ def apply_qk_norm(
     q_eps = q_norm.variance_epsilon
     k_eps = k_norm.variance_epsilon
     # Only try fused path on CUDA and when it won't introduce implicit copies.
+    # The in-place kernel needs a real view (no copy), so it also requires contiguity.
     if (
         _is_cuda
         and allow_inplace
@@ -894,6 +895,8 @@ def apply_qk_norm(
         and q.dtype in (torch.float16, torch.bfloat16)
         and q_norm.weight.dtype == q.dtype
         and k_norm.weight.dtype == k.dtype
+        and q.is_contiguous()
+        and k.is_contiguous()
         and can_use_fused_inplace_qknorm(head_dim, q.dtype)
     ):
         fused_inplace_qknorm(
@@ -908,8 +911,9 @@ def apply_qk_norm(
 
     q_shape = q.shape
     k_shape = k.shape
-    q_out = q_norm(q.view(-1, head_dim)).view(q_shape)
-    k_out = k_norm(k.view(-1, head_dim)).view(k_shape)
+    # reshape (not view) so a non-contiguous q/k (e.g. a chunked qkv view) is handled.
+    q_out = q_norm(q.reshape(-1, head_dim)).view(q_shape)
+    k_out = k_norm(k.reshape(-1, head_dim)).view(k_shape)
     return q_out, k_out
 
 
