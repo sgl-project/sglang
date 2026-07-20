@@ -467,6 +467,104 @@ void fused_qk_norm4d_kernel_impl(
   });
 }
 
+template <typename scalar_t>
+float sum_squares(const scalar_t* __restrict__ input, int64_t size) {
+  using bVec = at::vec::Vectorized<scalar_t>;
+  using fVec = at::vec::Vectorized<float>;
+  constexpr int kVecSize = bVec::size();
+
+  fVec sum_fvec{0.f};
+  float sum_val{0.f};
+  int64_t i = 0;
+  for (; i <= size - kVecSize; i += kVecSize) {
+    auto [input_fvec0, input_fvec1] = load_float_vec2(input + i);
+    sum_fvec += input_fvec0 * input_fvec0;
+    sum_fvec += input_fvec1 * input_fvec1;
+  }
+  for (; i < size; ++i) {
+    const float input_val = static_cast<float>(input[i]);
+    sum_val += input_val * input_val;
+  }
+  return sum_val + vec_reduce_sum(sum_fvec);
+}
+
+template <typename scalar_t>
+void apply_rmsnorm_from_sum(
+    scalar_t* __restrict__ output,
+    const scalar_t* __restrict__ input,
+    const scalar_t* __restrict__ weight,
+    int64_t size,
+    float sum_sq,
+    int64_t tp_world_size,
+    float eps) {
+  using bVec = at::vec::Vectorized<scalar_t>;
+  using fVec = at::vec::Vectorized<float>;
+  constexpr int kVecSize = bVec::size();
+
+  const float scale = 1.f / std::sqrt(sum_sq / static_cast<float>(size * tp_world_size) + eps);
+  const fVec scale_fvec{scale};
+  int64_t i = 0;
+  for (; i <= size - kVecSize; i += kVecSize) {
+    auto [input_fvec0, input_fvec1] = load_float_vec2(input + i);
+    auto [weight_fvec0, weight_fvec1] = load_float_vec2(weight + i);
+    input_fvec0 = input_fvec0 * scale_fvec * weight_fvec0;
+    input_fvec1 = input_fvec1 * scale_fvec * weight_fvec1;
+    convert_from_float_ext<scalar_t>(input_fvec0, input_fvec1).store(output + i);
+  }
+  for (; i < size; ++i) {
+    output[i] = static_cast<scalar_t>(static_cast<float>(input[i]) * scale * static_cast<float>(weight[i]));
+  }
+}
+
+template <typename scalar_t>
+void fused_qk_rmsnorm_sumsq_kernel_impl(
+    float* __restrict__ sum_sq,
+    const scalar_t* __restrict__ q,
+    const scalar_t* __restrict__ k,
+    const NormParams& q_params,
+    const NormParams& k_params) {
+  at::parallel_for(0, q_params.B, 0, [&](int64_t begin, int64_t end) {
+    for (int64_t b = begin; b < end; ++b) {
+      sum_sq[b * 2] = sum_squares(q + q_params.input_offset(b, 0, 0), q_params.D);
+      sum_sq[b * 2 + 1] = sum_squares(k + k_params.input_offset(b, 0, 0), k_params.D);
+    }
+  });
+}
+
+template <typename scalar_t>
+void fused_qk_rmsnorm_apply_kernel_impl(
+    scalar_t* __restrict__ q_out,
+    scalar_t* __restrict__ k_out,
+    const scalar_t* __restrict__ q,
+    const scalar_t* __restrict__ k,
+    const scalar_t* __restrict__ q_weight,
+    const scalar_t* __restrict__ k_weight,
+    const float* __restrict__ sum_sq,
+    const NormParams& q_params,
+    const NormParams& k_params,
+    int64_t tp_world_size) {
+  at::parallel_for(0, q_params.B, 0, [&](int64_t begin, int64_t end) {
+    for (int64_t b = begin; b < end; ++b) {
+      apply_rmsnorm_from_sum(
+          q_out + q_params.output_offset(b, 0, 0),
+          q + q_params.input_offset(b, 0, 0),
+          q_weight,
+          q_params.D,
+          sum_sq[b * 2],
+          tp_world_size,
+          q_params.eps);
+      apply_rmsnorm_from_sum(
+          k_out + k_params.output_offset(b, 0, 0),
+          k + k_params.input_offset(b, 0, 0),
+          k_weight,
+          k_params.D,
+          sum_sq[b * 2 + 1],
+          tp_world_size,
+          k_params.eps);
+    }
+  });
+}
+
 #undef LAUNCH_PARALLEL_LOOP
 #undef LAUNCH_PARALLEL_LOOP_HD
 }  // anonymous namespace
@@ -692,6 +790,101 @@ at::Tensor fused_add_layernorm_cpu(
         output.data_ptr<scalar_t>(), input.data_ptr<scalar_t>(), residual.data_ptr<scalar_t>(), p);
   });
   return output;
+}
+
+// q: {batch_size, q_hidden_size} 2D
+// k: {batch_size, k_hidden_size} 2D
+std::tuple<at::Tensor, at::Tensor> fused_qk_rmsnorm_cpu(
+    const at::Tensor& q, const at::Tensor& k, const at::Tensor& q_weight, const at::Tensor& k_weight, double eps) {
+  const auto st = q.scalar_type();
+  CHECK_INPUT_ND<2>(q);
+  CHECK_INPUT_ND<2>(k);
+
+  CHECK_EQ(k.size(0), q.size(0));
+  CHECK_EQ(k.scalar_type(), st);
+  CHECK_INPUT_SHAPE_DTYPE<false>(q_weight, {q.size(1)}, st);
+  CHECK_INPUT_SHAPE_DTYPE<false>(k_weight, {k.size(1)}, st);
+
+  NormParams q_params{q, static_cast<float>(eps)};
+  q_params.weight = q_weight.data_ptr();
+
+  NormParams k_params{k, static_cast<float>(eps)};
+  k_params.weight = k_weight.data_ptr();
+
+  at::Tensor q_out = at::empty_like(q);
+  at::Tensor k_out = at::empty_like(k);
+  AT_DISPATCH_REDUCED_FLOATING_TYPES(st, "fused_qk_rmsnorm_kernel", [&] {
+    fused_qk_norm4d_kernel_impl<NormMode::RMSNorm, scalar_t, false>(
+        q_out.data_ptr<scalar_t>(),
+        k_out.data_ptr<scalar_t>(),
+        nullptr,
+        q.data_ptr<scalar_t>(),
+        k.data_ptr<scalar_t>(),
+        q_params,
+        k_params);
+  });
+  return std::make_tuple(q_out, k_out);
+}
+
+// q: {batch_size, local_q_hidden_size} 2D
+// k: {batch_size, local_k_hidden_size} 2D
+// output: local Q/K squared sums, {batch_size, 2} FP32
+at::Tensor fused_qk_rmsnorm_sumsq_cpu(const at::Tensor& q, const at::Tensor& k) {
+  const auto st = q.scalar_type();
+  CHECK_INPUT_ND<2>(q);
+  CHECK_INPUT_ND<2>(k);
+  CHECK_EQ(k.size(0), q.size(0));
+  CHECK_EQ(k.scalar_type(), st);
+
+  NormParams q_params{q, 0.f};
+  NormParams k_params{k, 0.f};
+  at::Tensor sum_sq = at::empty({q.size(0), 2}, q.options().dtype(at::kFloat));
+  AT_DISPATCH_REDUCED_FLOATING_TYPES(st, "fused_qk_rmsnorm_sumsq_kernel", [&] {
+    fused_qk_rmsnorm_sumsq_kernel_impl<scalar_t>(
+        sum_sq.data_ptr<float>(), q.data_ptr<scalar_t>(), k.data_ptr<scalar_t>(), q_params, k_params);
+  });
+  return sum_sq;
+}
+
+// q: {batch_size, local_q_hidden_size} 2D
+// k: {batch_size, local_k_hidden_size} 2D
+// sum_sq: globally reduced Q/K squared sums, {batch_size, 2} FP32
+std::tuple<at::Tensor, at::Tensor> fused_qk_rmsnorm_apply_cpu(
+    const at::Tensor& q,
+    const at::Tensor& k,
+    const at::Tensor& q_weight,
+    const at::Tensor& k_weight,
+    const at::Tensor& sum_sq,
+    int64_t tp_world_size,
+    double eps) {
+  const auto st = q.scalar_type();
+  CHECK_INPUT_ND<2>(q);
+  CHECK_INPUT_ND<2>(k);
+  CHECK_EQ(k.size(0), q.size(0));
+  CHECK_EQ(k.scalar_type(), st);
+  CHECK_INPUT_SHAPE_DTYPE<false>(q_weight, {q.size(1)}, st);
+  CHECK_INPUT_SHAPE_DTYPE<false>(k_weight, {k.size(1)}, st);
+  CHECK_INPUT_SHAPE_DTYPE<true>(sum_sq, {q.size(0), 2}, at::kFloat);
+  TORCH_CHECK(tp_world_size > 0, "tp_world_size must be positive, got ", tp_world_size);
+
+  NormParams q_params{q, static_cast<float>(eps)};
+  NormParams k_params{k, static_cast<float>(eps)};
+  at::Tensor q_out = at::empty_like(q);
+  at::Tensor k_out = at::empty_like(k);
+  AT_DISPATCH_REDUCED_FLOATING_TYPES(st, "fused_qk_rmsnorm_apply_kernel", [&] {
+    fused_qk_rmsnorm_apply_kernel_impl<scalar_t>(
+        q_out.data_ptr<scalar_t>(),
+        k_out.data_ptr<scalar_t>(),
+        q.data_ptr<scalar_t>(),
+        k.data_ptr<scalar_t>(),
+        q_weight.data_ptr<scalar_t>(),
+        k_weight.data_ptr<scalar_t>(),
+        sum_sq.data_ptr<float>(),
+        q_params,
+        k_params,
+        tp_world_size);
+  });
+  return std::make_tuple(q_out, k_out);
 }
 
 // q : {batch_size, num_head * head_dim} 2D

@@ -199,6 +199,18 @@ def register_fake_ops(tp_size: int):
         def _(input, *args, **kwargs):
             return torch.empty_like(input)
 
+    @register_cpu_compile_fake("fused_qk_rmsnorm_cpu")
+    def _(q, k, *args, **kwargs):
+        return torch.empty_like(q), torch.empty_like(k)
+
+    @register_cpu_compile_fake("fused_qk_rmsnorm_sumsq_cpu")
+    def _(q, k):
+        return torch.empty((q.shape[0], 2), dtype=torch.float32, device=q.device)
+
+    @register_cpu_compile_fake("fused_qk_rmsnorm_apply_cpu")
+    def _(q, k, *args, **kwargs):
+        return torch.empty_like(q), torch.empty_like(k)
+
     @register_cpu_compile_fake("shm_allgather")
     def _(data, dim):
         return torch.cat([data] * tp_size, dim=dim)
