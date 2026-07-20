@@ -185,6 +185,7 @@ from sglang.srt.models.deepseek_common.utils import (
 from sglang.srt.runtime_context import (
     get_flags,
     get_forward,
+    get_model,
     get_parallel,
     get_server_args,
 )
@@ -1605,7 +1606,7 @@ class DeepseekV2AttentionMLA(
         self.scaling = self.qk_head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
-        self.kv_cache_dtype = get_server_args().kv_cache_dtype
+        self.kv_cache_dtype = get_model().kv_cache_dtype
 
         # NOTE modification to rope_scaling must be done early enough, b/c e.g. Indexer needs it
         if rope_scaling:
