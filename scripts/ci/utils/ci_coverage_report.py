@@ -108,6 +108,9 @@ _MM_GEN_FILE_BACKENDS = {
     # Enabled with a LAPACK-availability skip (ROCm 7.2.0/CUDA run; 7.0.0 skips).
     "unit/sana_wm/test_pipeline_config.py": ("AMD",),
     "unit/sana_wm/test_realtime_chain.py": ("AMD",),
+    # Enabled with one pre-existing failing test quarantined (tracked for owners).
+    "unit/realtime/test_realtime_runtime.py": ("AMD",),
+    "unit/sana_wm/test_streaming_forward_long.py": ("AMD",),
 }
 
 # Filenames that match `test_*.py` by convention but contain no real tests

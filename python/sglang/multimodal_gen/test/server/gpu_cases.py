@@ -966,6 +966,10 @@ _AMD_READY_NESTED_UNIT_TESTS = (
     # torch.linalg.inv; they run on ROCm 7.2.0/CUDA and skip on ROCm 7.0.0).
     "sana_wm/test_pipeline_config.py",
     "sana_wm/test_realtime_chain.py",
+    # Enabled with one pre-existing failing test quarantined (tracked for the
+    # diffusion owners); the rest of each file passes on ROCm.
+    "realtime/test_realtime_runtime.py",
+    "sana_wm/test_streaming_forward_long.py",
 )
 
 
