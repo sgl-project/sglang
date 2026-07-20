@@ -531,6 +531,8 @@ class TestDoubleBosGuard(unittest.TestCase):
 
         server_args = MagicMock()
         server_args.mm_process_config = {}
+        server_args.mm_processor_worker_num = 0
+        server_args.mm_io_worker_num = 0
         server_args.mm_feature_transport = "cpu"
         server_args.disable_fast_image_processor = True
         server_args.keep_mm_feature_on_device = True
