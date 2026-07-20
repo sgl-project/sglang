@@ -79,8 +79,10 @@ def load_cache_to_device_buffer_mla_sharded(
         raise ValueError("num_ctas must not exceed logical_shards")
     if num_ctas & (num_ctas - 1) or logical_shards % num_ctas:
         raise ValueError("num_ctas must be a power-of-two divisor of shards")
-    if block_size not in (32, 64, 128, 256, 512, 768, 1024):
-        raise ValueError("block_size must be one of 32, 64, 128, 256, 512, 768, 1024")
+    if block_size not in (32, 64, 128, 256, 512, 640, 768, 1024):
+        raise ValueError(
+            "block_size must be one of 32, 64, 128, 256, 512, 640, 768, 1024"
+        )
     if min_blocks_per_sm not in (1, 2, 3, 4, 5, 6, 8):
         raise ValueError("unsupported launch-bounds min_blocks_per_sm")
     if req_pool_indices.dtype != torch.int64 or seq_lens.dtype != torch.int32:

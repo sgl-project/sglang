@@ -50,6 +50,8 @@ SHARDED_BLOCK_SIZE = 512
 SHARDED_MIN_BLOCKS_PER_SM = 3
 SHARDED_N1_BLOCK_SIZE = 1024
 SHARDED_N1_MIN_BLOCKS_PER_SM = 1
+SHARDED_N1_LARGE_BATCH_BLOCK_SIZE = 640
+SHARDED_N1_LARGE_BATCH_MIN_BLOCKS_PER_SM = 2
 SHARDED_MAX_CTAS_PER_REQUEST = 64
 KINETO_TESTS = 100
 
@@ -250,14 +252,15 @@ def _launch_kernel(
     if provider == "sharded":
         num_ctas = _sharded_num_ctas(batch_size)
         sm_count = torch.cuda.get_device_properties(DEVICE).multi_processor_count
-        block_size = (
-            SHARDED_BLOCK_SIZE
-            if num_ctas > 1 or batch_size > sm_count
-            else SHARDED_N1_BLOCK_SIZE
-        )
-        min_blocks_per_sm = (
-            SHARDED_N1_MIN_BLOCKS_PER_SM if num_ctas == 1 else SHARDED_MIN_BLOCKS_PER_SM
-        )
+        if num_ctas > 1:
+            block_size = SHARDED_BLOCK_SIZE
+            min_blocks_per_sm = SHARDED_MIN_BLOCKS_PER_SM
+        elif batch_size > sm_count:
+            block_size = SHARDED_N1_LARGE_BATCH_BLOCK_SIZE
+            min_blocks_per_sm = SHARDED_N1_LARGE_BATCH_MIN_BLOCKS_PER_SM
+        else:
+            block_size = SHARDED_N1_BLOCK_SIZE
+            min_blocks_per_sm = SHARDED_N1_MIN_BLOCKS_PER_SM
         load_cache_to_device_buffer_mla_sharded(
             top_k_tokens=state["top_k_tokens"],
             device_buffer_tokens=state["device_buffer_tokens"],
