@@ -21,30 +21,34 @@ case.
 ## Progress-resource reservation
 
 Completion must never compete with new requests for a generic control/protocol
-resource after a role crosses its full-control gate. The two gates therefore
-reserve the following logical resources before either role can acquire model
-capacity:
+resource after P commits or D becomes eligible. The acquisition graph therefore
+reserves the following logical resources before the corresponding role can
+cross that scarce-capacity boundary. P acquires its control row before
+`P_PRECOMMIT`; D acquires request-local control before `D_REGISTERED` and the
+physical channel row while still registered with zero model capacity:
 
 | Role | Reserved before scarce capacity | Released |
 | --- | --- | --- |
-| P | LIVE entry, retained control/request-byte credit, and successor tombstone slot | After request release and tombstone retention, respectively |
+| P | LIVE entry, retained control/request-byte credit, and successor tombstone slot including compact cancel replay credit | After request release and tombstone retention, respectively |
+| P | Bounded sender/session creation, tracking, and retained-byte credit | After sender/session detachment during cleanup |
 | P | One inbound `WAIT_COMMIT` logical correlation/replay-response credit | After matching V1 metadata proves D accepted the commitment, or after the terminal commit-replay window closes |
 | P | Reusable metadata-register command credit | After immutable transfer snapshot publication or terminal cleanup |
 | P | Metadata receive-byte credit, including retained zero-copy owners and decoded heap expansion | After the last payload reference is released |
 | P | Reusable `TransferCompletionCommand` credit | After the backend callback is detached and every already queued completion command is consumed; local terminal waits for this owner |
 | P | One inbound transfer-status logical correlation/replay-response credit | After the replay window closes; at a pre-commit terminal with no snapshot |
 | P | One fixed-size immutable transfer-status snapshot slot and byte credit | After the full replay-retention formula; at a pre-commit terminal with no snapshot |
-| P | One inbound matching pair-cancel logical correlation/command credit | At local terminal |
+| P | One inbound matching pair-cancel logical correlation/command/response credit | After successor tombstone GC; at pre-entry rejection with no state |
 | P | Fixed deadline-node/phase-transition overlap credit | After local terminal |
 | P | Terminal/deadline cleanup command credit | After terminal transition |
-| D | LIVE entry, registered request/receiver retained-byte credit, and successor tombstone slot | After request/receiver release and tombstone retention, respectively |
-| D | Complete deduplicated peer-channel lease set from the hard-bounded shared cache | At `D_RUNNING` or earlier local pair terminal |
+| D | LIVE entry, registered request/receiver retained-byte credit, and successor tombstone slot including compact cancel replay credit | After request/receiver release and tombstone retention, respectively |
+| D | One bounded two-sided channel-reservation command/response operation | When the complete lease set is ready or terminal cleanup finishes |
+| D | Complete deduplicated two-sided peer-channel lease set from the hard-bounded endpoint managers | D refs at `D_RUNNING` or earlier terminal; P refs at logical replay closure |
 | D | One Mooncake receiver/topology/session creation and tracking credit | At `D_RUNNING` or earlier terminal cleanup |
 | D | One outbound `WAIT_COMMIT` logical correlation and commit-response command credit | At commit acceptance or terminal cleanup |
-| D | Metadata-send command and conservative send-byte credit | After the last send-buffer reference is released |
+| D | One logical metadata-delivery command plus immutable canonical send-buffer and retry-overlap byte credit | Retry operation closes at matching transfer snapshot acceptance or terminal cleanup; bytes return after all transport refs detach |
 | D | One outbound `WAIT_TRANSFER_STATUS` logical correlation credit | At `D_RUNNING` or terminal cleanup |
 | D | `TransferStatusCommand` receive credit | At `D_RUNNING` or terminal cleanup |
-| D | One inbound matching pair-cancel logical correlation/command credit | At local terminal |
+| D | One inbound matching pair-cancel logical correlation/command/response credit | After successor tombstone GC; at pre-entry rejection with no state |
 | D | Fixed deadline-node/phase-transition overlap credit | After local terminal |
 | D | Terminal/deadline cleanup command credit | After terminal transition |
 
@@ -52,16 +56,42 @@ Duplicate waits/cancels and reconnects rebind the same logical credit. They do
 not allocate one correlation per transport attempt. P retains the commit-response
 credit until matching metadata proves D received the commitment or the terminal
 commit-replay window closes, and retains the status replay credit for the full
-snapshot replay window. Closing a socket or completing the first response does
-not release those logical credits.
+snapshot replay window. The successor tombstone retains compact matching-cancel
+response capacity through its complete lifetime. Closing a socket or completing
+the first response does not release those logical credits.
 Unknown or malformed messages use a separate bounded parse/correlation budget
 and cannot consume a live pair's reserved completion resources.
+
+Every release point in the table closes the logical operation and prevents new
+attempts. A payload/response byte credit is returned to an admission pool only
+after every transport reference created by that operation has completed or been
+cancelled and detached. Until then, the fixed old/new-attempt overlap remains an
+explicit auxiliary transport owner; closing scheduler state never frees memory
+still referenced by ZMQ or another backend.
+
+D owns one logical metadata delivery for `transfer_generation=1`. Its reusable
+command and conservative byte credit cover the immutable canonical frame,
+transport-buffer ownership, and bounded send/reconnect overlap for every
+byte-identical retry. A first local send completion releases only an individual
+transport reference; it does not return the pair's logical metadata credit to a
+generic pool. Matching snapshot acceptance or terminal cleanup closes the retry
+operation; its immutable send bytes remain charged until every already queued
+transport reference is detached.
 
 D reserves and charges all non-model receiver/session capacity before
 `D_REGISTERED`, then may perform the already charged initialization while in
 `D_REGISTERED`; readiness is required before `D_ELIGIBLE`. Worker-startup
 registered memory remains shared, but every per-request receiver object and
-reconnect overlap is charged.
+reconnect overlap is charged. P likewise charges per-request sender/session
+tracking before `P_PRECOMMIT`.
+
+The P-side model/aux `metadata_buffer_index` is scarce model capacity, not a
+control credit in the table above. It may be acquired after `P_PRECOMMIT`, but
+the P scheduler must own it, along with the request slot, source KV, required
+cache/radix ownership, and every other finite P prerequisite, before publishing
+`P_COMMITTED`. If the buffer is unavailable, the request remains pre-commit and
+D remains in zero-scarce-capacity state; P cannot commit and wait for that
+buffer later.
 
 This RFC does not reserve a Mooncake executor thread or change the existing
 data-plane transfer scheduler. Backend service delay/failure remains covered by
@@ -73,8 +103,8 @@ to new control/protocol resources required to reach transfer or release them.
 Deadline credit covers either one update-in-place timer node or the fixed
 maximum number of old/new heap nodes created by all V1 phase transitions. A
 transition can therefore arm its successor before invalidating its predecessor
-without allocating from a generic timer pool; stale heap nodes are generation-
-checked and bounded by the fixed state graph. The separately reserved successor
+without allocating from a generic timer pool; stale heap nodes carry generation
+checks and are bounded by the fixed state graph. The separately reserved successor
 tombstone slot includes its retention/GC timer node until collection.
 
 Count bounds alone are insufficient for registered requests. The policy also
@@ -83,20 +113,29 @@ receiver/topology bytes, and process-wide live-control bytes. P charges the
 validated request before `P_PRECOMMIT`; D charges its request and receiver upper
 bound before `D_REGISTERED`. Endpoint strings and diagnostic fields have fixed
 protocol maxima. An object whose conservative retained size does not fit is
-rejected at the full-control gate, before model capacity, rather than admitted
-under only a queue-count credit.
+rejected at its request-control gate, before model capacity, rather than
+admitted under only a queue-count credit.
 
-An authenticated cancel matching an existing pair uses that pair's reserved
-cancel ingress/response credit; unrelated or unknown cancel traffic cannot
-starve cleanup for a pair that already owns model capacity. Cancel-first
-requests still use the independent bounded pool described below.
+An authenticated cancel matching an existing LIVE/tombstone pair uses that
+pair's reserved cancel ingress/response credit; unrelated or unknown cancel
+traffic cannot starve cleanup or `ALREADY_TERMINAL` replay for an accepted pair.
+Cancel-first requests still use the independent bounded pool described below.
 
-The D lease-set reservation is all-or-nothing and precedes `D_ELIGIBLE`; a
-matching `COMMITTED` response does not waive any missing lease. LIVE admission
-also reserves its successor terminal slot, so success, cancel, and deadline do
-not compete with new requests for tombstone capacity. Valid cancel-first
-requests use a separate hard-bounded tombstone pool because they have no LIVE
-predecessor from which to inherit a reserved successor slot.
+The D lease-set reservation is all-or-nothing and precedes `D_ELIGIBLE`; it is
+ready only when the matching P inbound physical entry is also reserved and
+ready. A matching `COMMITTED` response does not waive a missing endpoint lease.
+D discovery bounds outbound P authority/epoch entries, P discovery bounds
+inbound D authority/epoch entries, and support-cell readiness proves both sides
+can cover the complete allowed topology plus old/new-epoch and reconnect
+overlap. An active or disconnected-but-reserved entry with live pair refs cannot
+be evicted or consumed by a new peer.
+
+LIVE admission also reserves its successor terminal slot, so success, cancel,
+deadline, and matching cancel replay do not compete with new requests for
+tombstone capacity. Valid cancel-first requests use a separate hard-bounded
+tombstone pool because they have no LIVE predecessor from which to inherit a
+reserved successor slot; that pool also includes the compact cancel replay
+credit through tombstone GC.
 
 A WAIT-first P entry does not yet know the validated request length and therefore
 reserves only its bounded waiter/identity, inbound commit correlation, admission
@@ -106,8 +145,11 @@ snapshot, metadata-byte, status-replay, cancel, and cleanup credit before
 creating `P_PRECOMMIT` or allowing model admission. An HTTP-first request
 atomically acquires the same complete P row before creating `P_PRECOMMIT`.
 Failure terminalizes an existing waiter without model allocation. D has its
-validated request at `D_REGISTERED` admission and reserves its complete row,
-including the complete channel lease set, before creating that state.
+validated request at `D_REGISTERED` admission and reserves its complete
+request-local row, including the bounded operation used to acquire the
+two-sided channel set, before creating that state. It obtains that physical
+lease set while remaining `D_REGISTERED`/`D_COMMIT_RECEIVED` with zero model
+capacity and must have the full set ready before `D_ELIGIBLE`.
 
 `P_REGISTERED` has its own hard sub-budget and cannot consume capacity reserved
 for accepted HTTP-first/full-control entries or terminal cleanup. Exhausting the
@@ -139,6 +181,12 @@ multipart receive API allocates the complete message before application checks,
 the enforce handler must use a bounded size-delimited receive mechanism or an
 equivalent transport-level hard limit.
 
+The D send-side credit remains logically owned after the first transport send.
+Reconnect or ambiguous completion may retain at most the policy's fixed
+old/new-buffer overlap and must retransmit the exact canonical bytes. No retry
+may serialize a second uncharged frame or recalculate destination indices after
+their ownership has changed.
+
 ## Validation matrix
 
 The protocol and requested decisions end above. The correctness,
@@ -151,20 +199,29 @@ not introduce additional protocol states.
    before `COMMITTED(B)`.
 2. Cover P-first, D-first, and simultaneous arrival.
 3. Assert that P launch does not wait for a control response.
-4. Cover metadata-before-forward-completion and forward-completion-before-
-   metadata. P must remain `P_COMMITTED` after the first bit and submit exactly
+4. Cover both event orders: metadata before forward completion, and forward
+   completion before metadata. P must remain `P_COMMITTED` after the first bit and submit exactly
    one transfer only after both bits are true.
 5. Guard every D allocator entry with an explicit eligibility predicate that
    rejects `D_REGISTERED`, `D_COMMIT_RECEIVED`, expired commitment validity, and
    a reconnecting/unready channel lease; do not rely only on enum ordinal
    ordering.
 6. Prove that a committed P request cannot re-enter admission in the supported
-   cell.
-7. Verify exact-once ownership release on success, cancel, and every deadline.
-8. Cover WAIT-first `P_REGISTERED`, HTTP-first `P_PRECOMMIT`, and the atomic
+   cell. Complete its forward before metadata arrives and assert that it parks
+   in the committed-wait owner without calling
+   `optimistic_release_and_requeue()`, `reset_for_retract()`, or releasing any
+   source owner.
+7. Set P model/aux metadata-buffer capacity to one. Let request B own that
+   buffer while waiting for D(B), then attempt final admission of request A.
+   A must remain `P_PRECOMMIT` and must not publish `COMMITTED(A)` until it owns
+   the buffer. In particular, D(A) must never hold scarce capacity while A waits
+   for the buffer held by B. Repeat this assertion for every finite prerequisite
+   in the normative P commit checklist.
+8. Verify exact-once ownership release on success, cancel, and every deadline.
+9. Cover WAIT-first `P_REGISTERED`, HTTP-first `P_PRECOMMIT`, and the atomic
    registered-to-full-control upgrade. A gate failure must own zero model
    capacity and no event may bypass the failed gate.
-9. Stall success/cancel cleanup past its cleanup deadline and verify that the
+10. Stall success/cancel cleanup past its cleanup deadline and verify that the
    support cell is isolated while local terminal remains unpublished until all
    real owners are released.
 
@@ -173,7 +230,7 @@ not introduce additional protocol states.
 - Before `PAIR_BOUND`, inject selection and request-preparation failures and
   verify that reselection occurs only when neither role performed network I/O.
 - For every supported route, derive both role bodies from one immutable typed
-  request and assert that preparation changes only the allowlisted private/
+  request and assert that preparation changes only the allowlisted private and
   routing fields, never public prompt/model/sampling/expansion semantics.
 - At every point after either P or D send can perform I/O, inject a transport
   error and a retryable 5xx; `select_pd_pair()` must be called once and no new
@@ -181,10 +238,10 @@ not introduce additional protocol states.
 - Fail P while the D send is pending, and fail D after P has accepted its body;
   both races must cancel the originally bound identity and return an error
   without a replacement dispatch.
-- Make D reject at its full-control gate after P has committed. The enforce
-  supervisor must observe the early D error, cancel both pinned roles, and
-  return without waiting for P's post-commit deadline. Keep the current
-  D-error-waits-for-P behavior only on the disabled path.
+- Make D reject at its request-control or channel-readiness gate after P has
+  committed. The enforce supervisor must observe the early D error, cancel both
+  pinned roles, and return without waiting for P's post-commit deadline. Keep
+  the current D-error-waits-for-P behavior only on the disabled path.
 - Break a decode stream after 200/headers. The stream must terminate, cancel the
   originally pinned pair best-effort, and never enter worker reselection or
   replay already exposed bytes.
@@ -210,6 +267,16 @@ not introduce additional protocol states.
 - Timeout/reconnect every commit and status wait and verify `wait_seq=1` and
   `status_wait_seq=1` remain unchanged; the response wrapper echoes the matching
   logical sequence while the semantic snapshot remains byte-for-byte stable.
+- Drop or make ambiguous the first V1 metadata send, fill generic send/correlation
+  capacity, and reconnect. D must retransmit the exact same canonical bytes,
+  digest, identity, and `transfer_generation=1` through its reserved logical
+  delivery credit; P registers once and the pair can still reach `D_RUNNING`.
+  A retry with different content must follow the conflicting-metadata failure
+  rule instead of silently replacing the first frame.
+- After P accepts matching V1 metadata, deliver a late duplicate `WAIT_COMMIT`
+  and an already queued commit response. Both are transport-stale, create no
+  scheduler command or correlation, and cannot restart D's closed commit retry
+  loop.
 - Send a different logical sequence, second generation, second `status_seq`,
   and conflicting SUCCESS/FAILED during the active transition; none may
   overwrite the first snapshot or allocate a second correlation, and an active
@@ -220,9 +287,14 @@ not introduce additional protocol states.
   matching immutable SUCCESS snapshot may enter `D_RUNNING`; UNKNOWN must create
   no P state and must not be treated as terminal proof.
 - Accept SUCCESS and FAILED snapshots and verify that neither path sends a
-  post-result acknowledgment or retains a channel lease after D reaches
-  `D_RUNNING` or terminal cleanup. P must retain the same fixed-size immutable
-  snapshot for the full replay window.
+  post-result acknowledgment. D releases its pair refs at `D_RUNNING` or
+  terminal cleanup. P may retain only the already charged physical-entry ref
+  required by the bounded status-replay operation, and releases it at replay
+  closure independently of decode lifetime. P must retain the same fixed-size
+  immutable snapshot for the full replay window. If a metadata retry send is
+  still queued when the snapshot arrives, D stops retrying and enters the
+  matching state once, but it does not return the send-byte credit until the
+  queued transport reference is cancelled or completes and detaches.
 - Wrong pair key, request UID, P/D epoch, support cell, and generation.
 - Replay byte-identical V1 metadata and require a no-op; then change one
   destination index under the same identity/generation and require immutable
@@ -230,7 +302,9 @@ not introduce additional protocol states.
   overwrite or a second transfer.
 - Run shared Rust/Python golden vectors for canonical capability digests,
   `pair_policy_digest`, `support_cell_id`, and `request_uid`, including integer
-  endianness, UTF-8, length prefixes, and fixed-width raw fields.
+  endianness, UTF-8, length prefixes, and fixed-width raw fields. The parsers
+  must reject uppercase hex, prefixed hex, UUID punctuation, base64, padding,
+  and the wrong textual width rather than normalizing alternate identities.
 - Keep protocol versions equal while changing each proof-relevant capability
   in turn: framing, KV layout/model generation, parallelism, event-loop/radix
   mode, chunk/retract/rebootstrap flag, deadline policy, selected budget, and
@@ -264,7 +338,10 @@ not introduce additional protocol states.
 - Send cancel before HTTP/WAIT, after HTTP, and after terminal; verify fixed
   `cancel_seq=1`, exact identity/time matching, bounded cancel-first tombstone,
   `RETRY_LATER` on tombstone-budget exhaustion, and no state for expired unknown
-  cancel.
+  cancel. Drop the first matching cancel response, fill generic response
+  capacity, and retry the same `cancel_seq=1`; cleanup-in-progress must replay
+  `ACCEPTED` and a terminal tombstone must replay `ALREADY_TERMINAL` from the
+  pair's retained compact response credit.
 - Change discovery after `PAIR_BOUND` and verify SMG still sends every cancel
   attempt to the originally pinned P/D cancel endpoints and serving epochs.
 - Cancel requests separately from the P WAIT, bootstrap, precommit, batch,
@@ -274,36 +351,48 @@ not introduce additional protocol states.
   local terminal publication.
 - On P transfer success, verify immutable SUCCESS publication, exact source
   cleanup, LIVE-to-terminal replacement, replay after cleanup, and no retained
-  model ownership. Verify the analogous D running-to-success-cleanup terminal
-  transition after generation completes.
+  model ownership, including the source KV/request slot, cache/radix ownership,
+  model/aux metadata-buffer index, and sender/session state. Verify the analogous
+  D running-to-success-cleanup terminal transition after generation completes.
 
 ### Reservation and memory tests
 
 - Fill all generic correlation capacity after pair reservation; matching
-  commit, metadata, completion, transfer-status replay, cancel ingress, and
-  terminal cleanup must still finish.
+  commit, byte-identical metadata delivery/retry, completion, transfer-status
+  replay, cancel ingress/replay, and terminal cleanup must still finish.
 - Unknown requests receive bounded backpressure and cannot consume pair-reserved
   credits.
-- Reconnect repeatedly and verify one logical commit/status correlation per
-  pair.
-- Dispatch through many P endpoints and serving epochs; the D peer-channel
-  count, file descriptors, and socket memory must stay below the hard limit.
-- Verify that active-refcount channels are never evicted, idle channels are
-  reclaimed by TTL/LRU, and the same endpoint with a new P epoch cannot reuse
-  the old epoch's channel identity.
+- Reconnect repeatedly and verify one logical commit wait, metadata delivery,
+  and status wait per pair; reconnect must not allocate a second logical credit
+  or retain more than the charged old/new transport overlap.
+- Dispatch through many P endpoints and serving epochs and through many D
+  authorities into one P. D outbound and P inbound channel counts, file
+  descriptors, socket memory, and reconnect overlap must each stay below their
+  separate hard limit.
+- Verify that active-refcount entries on both endpoints are never evicted, idle
+  entries are reclaimed by TTL/LRU, and the same address with a new P or D epoch
+  cannot reuse the old epoch's channel identity.
 - Verify that accepting matching SUCCESS atomically enters `D_RUNNING` and
-  releases the pair's complete channel lease set without a post-success send;
-  long-running decode must not pin the P channel.
-- Fill the peer-channel cache with active leases and verify that a new pair
-  fails before D scarce allocation without creating a temporary socket or
-  triggering SMG reroute.
-- Use distinct wait, metadata, and status authorities and verify D atomically
-  reserves the complete deduplicated lease set in `D_REGISTERED`. After that
-  reservation, fill all remaining channel capacity, deliver `COMMITTED`, and
-  verify the original pair still reaches metadata/status without acquiring a
-  new cache entry; an incomplete lease set must fail before `_pre_alloc()`.
+  releases the pair's D-side refs without a post-success send. The bounded P
+  replay-side ref expires at logical replay closure; a long-running decode must
+  not extend it.
+- Fill either D's outbound manager or P's inbound manager with active leases and
+  verify that a new pair fails before D scarce allocation without creating a
+  temporary socket or triggering SMG reroute.
+- Use distinct wait, metadata, and status authorities and verify the bounded
+  reservation operation in `D_REGISTERED` obtains the complete deduplicated D
+  entries and matching P inbound entries all-or-nothing while D owns zero model
+  capacity. After that reservation, fill all remaining capacity on both sides,
+  deliver `COMMITTED`, and verify the original pair still reaches metadata/status
+  without acquiring a new cache entry; an incomplete two-sided lease set must
+  fail before `_pre_alloc()`.
+- Disconnect after `D_PREALLOCATED`, then admit unrelated peers until every
+  unreserved channel slot is full. They cannot steal either reserved endpoint
+  entry; the matching reconnect must reuse the charged entries and let the
+  original pair finish within its unchanged deadline.
 - Configure a routing topology whose simultaneous P authority/epoch set exceeds
-  the D channel budget and verify readiness rejects the cell. In a supported
+  D's outbound budget, or whose simultaneous D authority/epoch set exceeds P's
+  inbound budget, and verify readiness rejects the cell. In a supported
   topology, reuse a single physical channel across many pair refcounts and
   verify there is no per-request socket creation.
 - Reject oversized parts, aggregate frames, false declared lengths, truncated
@@ -314,7 +403,9 @@ not introduce additional protocol states.
   size. Queue-count capacity must not allow registered request/receiver retained
   bytes to exceed the process-wide live-control byte budget.
 - Verify all credits return to baseline after success, cancel, timeout,
-  malformed input, and duplicate input.
+  malformed input, and duplicate input, including P metadata buffers and
+  sender/session state, both channel endpoint refs, metadata retry buffers, and
+  compact cancel replay credits after their specified replay windows.
 - Drive every required observability outcome and verify that counters, gauges,
   and histograms update without scanning the pair registry. Reject any metric
   label containing request/pair identity, endpoint, epoch, or an unbounded
@@ -325,8 +416,9 @@ not introduce additional protocol states.
   backpressure, never budget overrun or unbounded growth.
 - At target QPS and the maximum replay TTL, verify fixed-size transfer-snapshot
   occupancy remains within the advertised count/byte budget. When that budget
-  is full, new pairs must fail at the full-control gate before model allocation;
-  existing snapshot replay and cleanup must continue from reserved credits.
+  is full, new pairs must fail at the appropriate request-control gate before
+  model allocation; existing snapshot replay and cleanup must continue from
+  reserved credits.
 
 ### Transfer-status replay test
 
@@ -338,7 +430,9 @@ once.
 
 ### End-to-end tests
 
-- A cross-process Mooncake integration test for the complete enforce path.
+- A cross-process Mooncake integration test for the complete enforce path,
+  including loss/ambiguity of the first metadata send, a two-sided channel
+  reconnect, byte-identical retransmission, and exact-once transfer.
 - A real-GPU A/B benchmark for each enabled rollout cell.
 - Disabled-path regression tests against the existing legacy behavior.
 
