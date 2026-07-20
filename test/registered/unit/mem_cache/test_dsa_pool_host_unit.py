@@ -4,14 +4,12 @@ import unittest
 import torch
 
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
-from sglang.srt.mem_cache.memory_pool_host import (
-    DSAIndexerPoolHost,
-    MLATokenToKVPoolHost,
-)
+from sglang.srt.mem_cache.memory_pool_host import DSAIndexerPoolHost
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
     alloc_with_pin_memory,
 )
+from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
@@ -148,7 +146,7 @@ class TestDSAHiCacheTransfer(unittest.TestCase):
 
     @unittest.skipIf(
         is_hip(),
-        '`io_backend="kernel"` path in memory_pool_host.backup_from_device_all_layer '
+        '`io_backend="kernel"` path in MLATokenToKVPoolHost.backup_from_device_all_layer '
         "raises ValueError on AMD (only the `direct` IO backend is wired for ROCm). "
         "The other 62 tests in this file pass on AMD.",
     )
