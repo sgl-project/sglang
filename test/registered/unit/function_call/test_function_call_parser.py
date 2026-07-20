@@ -4299,6 +4299,44 @@ class TestGetStructureConstraint(unittest.TestCase):
         self.assertEqual(schema["required"], ["name", "args"])
         self.assertFalse(schema["additionalProperties"])
 
+    def test_auto_engages_structural_tag_under_dflash_spec(self):
+        """Under a non-bit-exact spec algorithm (DFLASH/DSPARK) the target-verify
+        argmax can flip and corrupt the exact tool-call markers, so tool_choice=
+        "auto" must engage the model-native structural tag; without spec it stays
+        unconstrained. Guards the DSPARK auto tool-call corruption fix."""
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        # control: no spec context -> auto is not constrained
+        parser = self._make_parser("deepseekv4", strict=False)
+        self.assertFalse(parser._spec_needs_auto_structural_tag)
+        self.assertIsNone(parser.get_structure_constraint("auto"))
+
+        # DFLASH-family spec active + native-tag detector -> auto engages the tag
+        with patch(
+            "sglang.srt.function_call.function_call_parser.get_server_args",
+            return_value=SimpleNamespace(speculative_algorithm="DSPARK"),
+        ):
+            spec_parser = self._make_parser("deepseekv4", strict=False)
+            result = spec_parser.get_structure_constraint("auto")
+        self.assertTrue(spec_parser._spec_needs_auto_structural_tag)
+        self.assertIsNotNone(result)
+        self.assertEqual(result[0], "structural_tag")
+
+    def test_spec_auto_tag_requires_native_structural_tag(self):
+        """A detector with no model-native structural tag must NOT be
+        force-constrained on auto even under spec (llama3 has none)."""
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        with patch(
+            "sglang.srt.function_call.function_call_parser.get_server_args",
+            return_value=SimpleNamespace(speculative_algorithm="DSPARK"),
+        ):
+            parser = self._make_parser("llama3", strict=False)
+        self.assertFalse(parser._spec_needs_auto_structural_tag)
+        self.assertIsNone(parser.get_structure_constraint("auto"))
+
     def test_kimi_named_tool_choice_returns_structural_tag(self):
         from sglang.srt.entrypoints.openai.protocol import (
             ToolChoice,
