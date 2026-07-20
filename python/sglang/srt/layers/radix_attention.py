@@ -161,7 +161,12 @@ class RadixAttention(nn.Module):
         if (
             forward_batch.forward_mode.is_extend()
             and get_tc_piecewise_forward_context() is not None
-            and not _force_eager_attn.get()
+            # ``_force_eager_attn`` is only set inside Inkling's eager
+            # norm+attn+sconv region, never during tc-piecewise capture. Reading
+            # the ContextVar under the fullgraph torch.compile trace is
+            # untraceable ("Unsupported method call: ContextVar.get"), so
+            # short-circuit it while compiling -- force-eager is always off there.
+            and (torch.compiler.is_compiling() or not _force_eager_attn.get())
         ):
             if kwargs.get("idx_q") is not None:
                 if is_in_breakable_cuda_graph():
