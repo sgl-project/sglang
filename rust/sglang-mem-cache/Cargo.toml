@@ -1,0 +1,25 @@
+[package]
+name = "sglang-mem-cache"
+version = "0.1.0"
+edition = "2024"
+description = "Rust unified radix cache for SGLang (core logic + PyO3 wrapper)"
+license = "Apache-2.0"
+
+[lib]
+# Name must equal the `#[pymodule]` fn in lib.rs and the last component of the
+# future `setuptools-rust` target (`sglang.srt.mem_cache._mem_cache_core`).
+name = "_mem_cache_core"
+crate-type = ["cdylib"]
+
+[dependencies]
+# pyo3 pinned to 0.22 to match the verbatim-ported wrapper / py_interop source
+# (rust/sglang-grpc uses 0.23 — aligning the two is a follow-up).
+pyo3 = { version = "0.22", features = ["extension-module"] }
+# `python-extension` makes tch reuse the Python torch's libtorch instead of
+# linking its own — required for an in-wheel extension. Building needs a torch
+# install on PYTHONPATH.
+tch = { version = "0.22", features = ["python-extension"] }
+thiserror = "1"
+
+# Python packaging is wired through python/pyproject.toml as
+# `sglang.srt.mem_cache._mem_cache_core`.

@@ -231,3 +231,12 @@ def create_tree_cache(ctx: TreeCacheBuildContext) -> BasePrefixCache:
         streaming_wrapped,
     )
     return cache
+
+
+def _install_builtin_radix_cache_backends() -> None:
+    from sglang.srt.mem_cache.rust_unified_radix_cache import install_rust_radix_cache
+
+    install_rust_radix_cache()
+
+
+_install_builtin_radix_cache_backends()
