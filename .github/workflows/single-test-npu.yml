@@ -40,7 +40,7 @@ jobs:
 
           # Test cases - 使用时替换为实际的测试用例路径
           test_cases=(
-            "test/registered/ascend/basic_function/sessions/test_npu_streaming_session_extra.py"
+            #"test/registered/ascend/basic_function/sessions/test_npu_streaming_session_extra.py"
             "test/registered/ascend/basic_function/rl/test_npu_multi_instance_release_memory_occupation.py"
           )
 
