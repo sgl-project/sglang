@@ -20,6 +20,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from typing import (
+    Annotated,
     Any,
     Dict,
     List,
@@ -356,10 +357,13 @@ class CompletionRequest(BaseModel):
     ignore_eos: bool = False
     skip_special_tokens: bool = True
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
+    session_id: Optional[str] = None
     session_params: Optional[Dict] = None
     response_format: Optional[Union[ResponseFormat, StructuralTagResponseFormat]] = None
     custom_params: Optional[Dict] = None
     custom_logit_processor: Optional[str] = None
+
+    images_config: Optional[Dict] = None
 
     # For PD disaggregation
     bootstrap_host: Optional[Union[List[str], str]] = None
@@ -487,6 +491,20 @@ class ChatCompletionMessageContentTextPart(BaseModel):
     text: str
 
 
+class ChatCompletionMessageContentThinkingPart(BaseModel):
+    type: Literal["thinking", "reasoning"]
+    thinking: Optional[str] = None
+    text: Optional[str] = None
+
+    @model_validator(mode="after")
+    def validate_payload(self):
+        if (self.thinking is None) == (self.text is None):
+            raise ValueError(
+                "thinking parts require exactly one of 'thinking' or 'text'"
+            )
+        return self
+
+
 class ChatCompletionMessageContentImageURL(BaseModel):
     url: str
     detail: Optional[Literal["auto", "low", "high"]] = "auto"
@@ -533,6 +551,7 @@ class ChatCompletionMessageContentToolReferenceBlock(BaseModel):
 
 ChatCompletionMessageContentPart = Union[
     ChatCompletionMessageContentTextPart,
+    ChatCompletionMessageContentThinkingPart,
     ChatCompletionMessageContentImagePart,
     ChatCompletionMessageContentVideoPart,
     ChatCompletionMessageContentAudioPart,
@@ -593,10 +612,30 @@ class ChatCompletionMessageGenericParam(BaseModel):
             return v_lower
         raise ValueError("'role' must be a string")
 
+    @model_validator(mode="after")
+    def validate_thinking_parts_role(self):
+        if self.role != "assistant" and isinstance(self.content, list):
+            for part in self.content:
+                if isinstance(part, ChatCompletionMessageContentThinkingPart):
+                    raise ValueError(
+                        "thinking content parts are only valid in assistant messages"
+                    )
+        return self
+
 
 class ChatCompletionMessageUserParam(BaseModel):
     role: Literal["user"]
     content: Union[str, List[ChatCompletionMessageContentPart]]
+
+    @model_validator(mode="after")
+    def validate_thinking_parts_role(self):
+        if isinstance(self.content, list):
+            for part in self.content:
+                if isinstance(part, ChatCompletionMessageContentThinkingPart):
+                    raise ValueError(
+                        "thinking content parts are only valid in assistant messages"
+                    )
+        return self
 
 
 ChatCompletionMessageParam = Union[
@@ -691,9 +730,16 @@ class ChatCompletionRequest(BaseModel):
     return_cached_tokens_details: bool = False
     return_prompt_token_ids: bool = False
     return_meta_info: bool = False
-    reasoning_effort: Optional[Literal["none", "low", "medium", "high", "max"]] = Field(
+    reasoning_effort: Optional[
+        Union[
+            Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"],
+            Annotated[float, Field(ge=0.0, le=0.99, allow_inf_nan=False)],
+        ]
+    ] = Field(
         default=None,
         description="Constrains effort on reasoning for reasoning models. "
+        "Accepts string levels ('none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max') or a "
+        "float in [0.0, 1.0] for fine-grained control. "
         "'none' disables reasoning entirely, 'low' is the least effort, 'high' is the most effort. "
         "Reducing reasoning effort can result in faster responses and fewer tokens used on reasoning "
         "in a response. 'none' defaults thinking and enable_thinking to false in "
@@ -726,6 +772,7 @@ class ChatCompletionRequest(BaseModel):
     continue_final_message: bool = False
     skip_special_tokens: bool = True
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
+    session_id: Optional[str] = None
     session_params: Optional[Dict] = None
     separate_reasoning: bool = True
     stream_reasoning: bool = True
@@ -735,6 +782,8 @@ class ChatCompletionRequest(BaseModel):
     max_dynamic_patch: Optional[int] = None
     min_dynamic_patch: Optional[int] = None
     use_audio_in_video: bool = False
+
+    images_config: Optional[Dict] = None
 
     # Custom logit processor for advanced sampling control
     custom_logit_processor: Optional[Union[List[Optional[str]], str]] = None
@@ -790,15 +839,43 @@ class ChatCompletionRequest(BaseModel):
                 values["tool_choice"] = "auto"
         return values
 
+    @field_validator("reasoning_effort", mode="before")
+    @classmethod
+    def validate_reasoning_effort_type(cls, value):
+        if isinstance(value, bool):
+            raise ValueError("reasoning_effort must not be a boolean")
+        return value
+
     @model_validator(mode="before")
     @classmethod
     def normalize_reasoning_inputs(cls, values: Dict):
         r = values.get("reasoning")
+        thinking = None
 
         if r is not None and isinstance(r, dict):
-            effort = r.get("effort") or r.get("reasoning_effort")
-            if effort in {"none", "low", "medium", "high"}:
+            effort = r.get("effort")
+            if effort is None:
+                effort = r.get("reasoning_effort")
+            if isinstance(effort, str) and effort in {
+                "none",
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "max",
+            }:
                 values["reasoning_effort"] = effort
+            elif isinstance(effort, (int, float)) and not isinstance(effort, bool):
+                values["reasoning_effort"] = float(effort)
+            elif isinstance(effort, str):
+                # Keep parity with the top-level reasoning_effort field, whose
+                # lax union coerces numeric strings; range checks then apply.
+                try:
+                    values["reasoning_effort"] = float(effort)
+                except ValueError as exc:
+                    raise ValueError(f"invalid reasoning effort: {effort!r}") from exc
+            elif effort is not None:
+                raise ValueError(f"invalid reasoning effort: {effort!r}")
 
             enabled = (
                 r.get("enabled")
@@ -808,25 +885,21 @@ class ChatCompletionRequest(BaseModel):
             if isinstance(enabled, str):
                 enabled = enabled.strip().lower() in {"1", "true", "yes", "y", "on"}
             if enabled:
-                ctk = values.get("chat_template_kwargs")
-                if not isinstance(ctk, dict):
-                    ctk = {}
-                # different models check different keys:
-                # - "thinking" for deepseek-v3, kimi_k2
-                # - "enable_thinking" for qwen3, glm45, nemotron_3, interns1, mimo
-                ctk.setdefault("thinking", True)
-                ctk.setdefault("enable_thinking", True)
-                values["chat_template_kwargs"] = ctk
+                thinking = True
 
-        if values.get("reasoning_effort") == "none":
+        effort = values.get("reasoning_effort")
+        if effort is not None:
+            thinking = effort != "none"
+
+        if thinking is not None:
             ctk = values.get("chat_template_kwargs")
             if not isinstance(ctk, dict):
                 ctk = {}
             # different models check different keys:
             # - "thinking" for deepseek-v3, kimi_k2
             # - "enable_thinking" for qwen3, glm45, nemotron_3, interns1
-            ctk.setdefault("thinking", False)
-            ctk.setdefault("enable_thinking", False)
+            ctk.setdefault("thinking", thinking)
+            ctk.setdefault("enable_thinking", thinking)
             values["chat_template_kwargs"] = ctk
 
         return values
@@ -1228,7 +1301,9 @@ class TokenizeRequest(BaseModel):
     tool_choice: Optional[Union[ToolChoice, Literal["auto", "required", "none"]]] = (
         Field(default=None, examples=["auto"])
     )
-    reasoning_effort: Optional[Literal["none", "low", "medium", "high"]] = None
+    reasoning_effort: Optional[Literal["none", "minimal", "low", "medium", "high"]] = (
+        None
+    )
     continue_final_message: bool = False
     chat_template_kwargs: Optional[Dict] = None
     add_special_tokens: bool = Field(
@@ -1391,6 +1466,7 @@ class ResponsesRequest(BaseModel):
         default_factory=lambda: f"resp_{uuid.uuid4().hex}",
         description="The request_id related to this request. If the caller does not set it, a random uuid will be generated.",
     )
+    session_id: Optional[str] = None
     priority: int = Field(default=0, description="Request priority")
     extra_key: Optional[str] = Field(
         default=None,

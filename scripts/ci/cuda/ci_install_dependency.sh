@@ -196,12 +196,57 @@ setup_pip_toolchain() {
     mark_step_done "${FUNCNAME[0]}"
 }
 
+remove_stale_cuda12_nvidia_wheels() {
+    local package_name spec
+    local -a INSTALLED_NVIDIA_WHEELS=()
+    local -a NVIDIA_WHEELS_TO_RESTORE=()
+    local -a STALE_CUDA12_NVIDIA_WHEELS=()
+
+    if [ "$CU_MAJOR" != "13" ]; then
+        mark_step_done "${FUNCNAME[0]}"
+        return
+    fi
+
+    mapfile -t INSTALLED_NVIDIA_WHEELS < <(
+        python3 -m pip list --format=freeze | sed -n '/^nvidia-.*==/p'
+    )
+    for spec in "${INSTALLED_NVIDIA_WHEELS[@]}"; do
+        package_name="${spec%%==*}"
+        case "$package_name" in
+            *-cu12) STALE_CUDA12_NVIDIA_WHEELS+=("$package_name") ;;
+            *) NVIDIA_WHEELS_TO_RESTORE+=("$spec") ;;
+        esac
+    done
+
+    if [ ${#STALE_CUDA12_NVIDIA_WHEELS[@]} -eq 0 ]; then
+        echo "No stale CUDA 12 NVIDIA wheels found for ${CU_VERSION} job"
+        mark_step_done "${FUNCNAME[0]}"
+        return
+    fi
+
+    echo "Removing stale CUDA 12 NVIDIA wheels from ${CU_VERSION} job: ${STALE_CUDA12_NVIDIA_WHEELS[*]}"
+    $PIP_UNINSTALL_CMD "${STALE_CUDA12_NVIDIA_WHEELS[@]}" $PIP_UNINSTALL_SUFFIX
+
+    # CUDA 12 and CUDA 13 wheels can own the same nvidia/* paths. Uninstalling
+    # the stale variant deletes those shared files even though the remaining
+    # wheel metadata still says they are installed. Restore every remaining
+    # NVIDIA wheel at its already-installed version to make the transition
+    # atomic and avoid package-specific payload checks.
+    if [ ${#NVIDIA_WHEELS_TO_RESTORE[@]} -gt 0 ]; then
+        echo "Restoring NVIDIA wheels after CUDA 12 cleanup: ${NVIDIA_WHEELS_TO_RESTORE[*]}"
+        $PIP_CMD install --force-reinstall --no-deps "${NVIDIA_WHEELS_TO_RESTORE[@]}" $PIP_INSTALL_SUFFIX
+    fi
+
+    mark_step_done "${FUNCNAME[0]}"
+}
+
 uninstall_stale_flashinfer() {
     # Keep flashinfer packages if version matches to avoid re-downloading:
     # - flashinfer-cubin: 150+ MB
     # - flashinfer-jit-cache: 1.2+ GB
     FLASHINFER_PYTHON_REQUIRED=$(grep -Po -m1 'flashinfer_python(\[[^]]+\])?==\K[0-9A-Za-z\.\-]+' python/pyproject.toml || echo "")
-    FLASHINFER_CUBIN_REQUIRED=$(grep -Po -m1 'flashinfer_cubin(\[[^]]+\])?==\K[0-9A-Za-z\.\-]+' python/pyproject.toml || echo "")
+    # flashinfer-cubin is no longer a pyproject dependency (installed explicitly below), tracks the same version as flashinfer_python
+    FLASHINFER_CUBIN_REQUIRED="$FLASHINFER_PYTHON_REQUIRED"
     FLASHINFER_CUBIN_INSTALLED=$(pip show flashinfer-cubin 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
     FLASHINFER_JIT_INSTALLED=$(pip show flashinfer-jit-cache 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed 's/+.*//' || echo "")
     FLASHINFER_JIT_CU_VERSION=$(pip show flashinfer-jit-cache 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed -n 's/.*+//p' || echo "")
@@ -350,6 +395,17 @@ install_sglang_router() {
     mark_step_done "${FUNCNAME[0]}"
 }
 
+install_flashinfer_cubin() {
+    if [ "$UNINSTALL_CUBIN" = false ]; then
+        echo "flashinfer-cubin==${FLASHINFER_CUBIN_REQUIRED} already installed, skipping install"
+    else
+        # flashinfer-cubin is CUDA-version-agnostic, unlike jit-cache, so its index-url has no cu${CU_VERSION} suffix
+        $PIP_CMD install "flashinfer-cubin==${FLASHINFER_CUBIN_REQUIRED}" --index-url https://flashinfer.ai/whl $PIP_INSTALL_SUFFIX
+    fi
+
+    mark_step_done "${FUNCNAME[0]}"
+}
+
 download_flashinfer_cache() {
     UNINSTALL_JIT_CACHE="$UNINSTALL_JIT_CACHE" \
         FLASHINFER_PYTHON_REQUIRED="$FLASHINFER_PYTHON_REQUIRED" \
@@ -357,34 +413,6 @@ download_flashinfer_cache() {
         PIP_CMD="$PIP_CMD" \
         PIP_INSTALL_SUFFIX="$PIP_INSTALL_SUFFIX" \
         bash "${SCRIPT_DIR}/ci_download_flashinfer_jit_cache.sh"
-
-    mark_step_done "${FUNCNAME[0]}"
-}
-
-force_reinstall_cutlass_dsl_libs_cu13() {
-    # nvidia-cutlass-dsl[cu13] has additive PyPI extras: installing it pulls in
-    # both -libs-base and -libs-cu13. The two wheels ship intentionally-different
-    # content for the same paths (cutlass/_mlir/dialects/_gpu_ops_gen.py and
-    # cutlass/_mlir/_mlir_libs/_cutlass_ir.cpython-*.so) -- each Python wrapper
-    # is paired with a matching pybind11 .so. If install order leaves the .py
-    # from one wheel and the .so from the other, GPUModuleOp.__init__ raises
-    # TypeError: incompatible function arguments at kernel-compile time.
-    #
-    # Force-reinstall -libs-cu13 LAST so both files come from the same wheel
-    # (BOTH-cu13 state), eliminating the mismatch. The version is parsed from
-    # pyproject.toml so this stays in sync with whatever nvidia-cutlass-dsl
-    # version the project pins.
-    if [ "$CU_MAJOR" != "13" ]; then
-        return
-    fi
-
-    CUTLASS_DSL_VERSION=$(grep -Po -m1 'nvidia-cutlass-dsl(\[[^]]+\])?==\K[0-9A-Za-z\.\-]+' "${REPO_ROOT}/python/pyproject.toml" || echo "")
-    if [ -z "$CUTLASS_DSL_VERSION" ]; then
-        echo "WARNING: could not detect nvidia-cutlass-dsl version from pyproject.toml; skipping libs-cu13 force-reinstall"
-        return
-    fi
-
-    $PIP_CMD install --force-reinstall --no-deps "nvidia-cutlass-dsl-libs-cu13==${CUTLASS_DSL_VERSION}" $PIP_INSTALL_SUFFIX
 
     mark_step_done "${FUNCNAME[0]}"
 }
@@ -441,13 +469,17 @@ stabilize_flashinfer_jit_paths() {
 }
 
 install_extra_deps() {
+    MOONCAKE_VERSION="0.3.11.post1"
+    NIXL_VERSION="1.3.0"
     if [ "$CU_MAJOR" = "13" ]; then
-        MOONCAKE_PKG="mooncake-transfer-engine-cuda13==0.3.11.post1"
+        MOONCAKE_PKG="mooncake-transfer-engine-cuda13==${MOONCAKE_VERSION}"
         MOONCAKE_STALE_PKG="mooncake-transfer-engine"
+        NIXL_BIN_NAME="nixl-cu13"
         EXTRA_NVIDIA_SPECS="nvidia-cuda-nvrtc"
     else
-        MOONCAKE_PKG="mooncake-transfer-engine==0.3.11.post1"
+        MOONCAKE_PKG="mooncake-transfer-engine==${MOONCAKE_VERSION}"
         MOONCAKE_STALE_PKG="mooncake-transfer-engine-cuda13"
+        NIXL_BIN_NAME="nixl-cu12"
         EXTRA_NVIDIA_SPECS="nvidia-cuda-nvrtc-cu12"
     fi
     # Both variants own the same mooncake/ package files and bin/ scripts
@@ -461,12 +493,26 @@ install_extra_deps() {
     fi
     $PIP_CMD install ${MOONCAKE_PKG} ${EXTRA_NVIDIA_SPECS} py-spy scipy huggingface_hub[hf_xet] pytest $PIP_INSTALL_SUFFIX
 
-    # Best-effort NIXL install for decode-radix disaggregation coverage.
-    $PIP_CMD install nixl $PIP_INSTALL_SUFFIX || echo "Warning: nixl install failed; continuing without nixl"
+    NIXL_INSTALLED=$(pip show nixl 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
+    NIXL_BIN_INSTALLED=$(pip show "${NIXL_BIN_NAME}" 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
+    if [ "$NIXL_INSTALLED" = "$NIXL_VERSION" ] && [ "$NIXL_BIN_INSTALLED" = "$NIXL_VERSION" ]; then
+        echo "nixl==${NIXL_VERSION} and ${NIXL_BIN_NAME}==${NIXL_VERSION} already installed, keeping them"
+    else
+        echo "nixl mismatch (meta: ${NIXL_INSTALLED:-none}, ${NIXL_BIN_NAME}: ${NIXL_BIN_INSTALLED:-none}, required: ${NIXL_VERSION}); installing"
+        # Meta stub owns the nixl import path; install only the CUDA binary for
+        # this runner's torch CUDA major. --no-deps avoids pulling the other CUDA
+        # variant; leave any other variant already on the runner image untouched.
+        $PIP_CMD install "nixl==${NIXL_VERSION}" "${NIXL_BIN_NAME}==${NIXL_VERSION}" \
+            --no-deps --force-reinstall $PIP_INSTALL_SUFFIX
+    fi
 
     if [ "$IS_BLACKWELL" != "1" ]; then
         git clone --branch v0.5 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
         $PIP_CMD install -e lmms-eval/ $PIP_INSTALL_SUFFIX
+        # lmms-eval v0.5 pulls antlr4-python3-runtime==4.7.2, clobbering the
+        # 4.9.3 that sgl-eval's latex2sympy2_extended needs (4.7.2 ImportError
+        # at sgl-eval import). Pin it back so the nightly sgl-eval path works.
+        $PIP_CMD install "antlr4-python3-runtime==4.9.3" --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
     fi
     $PIP_CMD uninstall xformers || true
 
@@ -538,12 +584,18 @@ main() {
     install_apt_packages
     clean_site_packages
     setup_pip_toolchain
+    remove_stale_cuda12_nvidia_wheels
     uninstall_stale_flashinfer
     install_sglang
+    # Diffusion B200 CI imports torch inside install_sglang_kernel after removing
+    # stale CUDA 12 NVIDIA wheels, so opt into one early LD_LIBRARY_PATH refresh.
+    if [ "${SGLANG_CI_EARLY_LD_LIBRARY_PATH:-0}" = "1" ]; then
+        setup_ld_library_path
+    fi
     install_sglang_kernel
     install_sglang_router
+    install_flashinfer_cubin
     download_flashinfer_cache
-    force_reinstall_cutlass_dsl_libs_cu13
     stabilize_flashinfer_jit_paths
     install_extra_deps
     install_test_tools

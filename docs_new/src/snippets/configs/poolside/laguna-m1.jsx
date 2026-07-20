@@ -100,16 +100,14 @@ sgl-eval run gsm8k \\
     ["gsm8k_pct", "GSM8K", "%"],
   ],
 
-  // Pinned nightly with the Laguna-M.1 build (PR #28400 + #28604 + #28649; cu13 covers H200 + all Blackwell).
-  // dev-cu13-618-nightly was generated after the FP8 g_proj fix (#28649) landed, so it serves FP8 too.
-  // (Equivalent pip nightly: 0.5.14.dev20260618+g97e3b8998d.) Blackwell FP8 additionally needs the
-  // --fp8-gemm-backend triton flag (in those cells) until PR #28662 merges.
+  // lmsysorg/sglang:latest (cu13) covers H200 + all Blackwell and carries the
+  // Laguna-M.1 build (PR #28400 + #28604 + #28649, incl. the FP8 g_proj fix).
   dockerImages: {
-    h200:  "lmsysorg/sglang:dev-cu13-618-nightly",
-    b200:  "lmsysorg/sglang:dev-cu13-618-nightly",
-    b300:  "lmsysorg/sglang:dev-cu13-618-nightly",
-    gb200: "lmsysorg/sglang:dev-cu13-618-nightly",
-    gb300: "lmsysorg/sglang:dev-cu13-618-nightly",
+    h200:  "lmsysorg/sglang:latest",
+    b200:  "lmsysorg/sglang:latest",
+    b300:  "lmsysorg/sglang:latest",
+    gb200: "lmsysorg/sglang:latest",
+    gb300: "lmsysorg/sglang:latest",
   },
 
   github: {
@@ -118,9 +116,14 @@ sgl-eval run gsm8k \\
 
   playgroundFeatures: {
 
-    // M.1 is global-attention (no SWA); expose TP + DP-Attention. No CP.
-    // DP-Attention is a Playground experiment only — ~15% slower than plain TP on this GQA
-    // model (8 KV heads), so it is NOT in the shipped Balanced recipe.
+    // M.1 is global-attention (no SWA); expose TP + DP-Attention here. No CP: the default
+    // trtllm_mha backend has no CP-aware KV-store (crashes), and the engine's built-in attention CP
+    // knob emits prefill-CP flags (--enable-prefill-cp / --cp-strategy / --attn-cp-size) that apply
+    // to DeepSeek-family models, not M.1. (CP works only via the fa3 backend, which is Hopper
+    // SM90 — left out here.)
+    // DP-Attention: VERIFIED functionally correct on 8×B200 BF16 (GSM8K 0.94, identical to the TP
+    // baseline) but ~15–28% slower on this GQA model (8 KV heads). Playground experiment only —
+    // deliberately NOT in the shipped Balanced recipe.
     attention: {
       knobs: [
         { id: "tp",     label: "TP",           values: [null, 1, 2, 4, 8] },
@@ -129,14 +132,12 @@ sgl-eval run gsm8k \\
       ],
     },
 
-    // 256-expert top-16 MoE. DeepEP all-to-all + EP degree.
+    // 256-expert top-16 MoE — EP degree only.
+    // EP: VERIFIED on 8×B200 BF16 (--ep-size 8, GSM8K 0.94, identical to the TP baseline).
+    // DeepEP intentionally NOT exposed — it does not work on M.1: top-16 routing exceeds DeepEP's
+    // low-latency internode kernel cap of 11 (internode_ll.cu kNumMaxTopK=11) → assert at decode
+    // CUDA-graph capture, and `--deepep-mode normal` is NotImplemented for unquantized weights. Use EP.
     moe: {
-      backend: {
-        options: [
-          { id: null,     label: "Inherited" },
-          { id: "deepep", label: "DeepEP", flags: ["--moe-a2a-backend deepep"] },
-        ],
-      },
       ep: { label: "EP", values: [null, 1, 2, 4, 8] },
     },
 
@@ -146,6 +147,20 @@ sgl-eval run gsm8k \\
       items: [
         { id: "reasoning", label: "Reasoning Parser", flag: "--reasoning-parser poolside_v1" },
         { id: "toolCall",  label: "Tool Call Parser", flag: "--tool-call-parser poolside_v1" },
+      ],
+    },
+
+    // HiCache (hierarchical KV cache). VERIFIED on 8×B200 BF16: enabling the host L2 tier on a
+    // zipfian shared-prefix workload cut mean TTFT ~36% (median ~43%) and lifted throughput ~19% vs
+    // GPU-only, with ~1.14M tokens served from the host tier (TPOT unchanged — the win is on prefill
+    // / prefix reuse). Biggest gains on reuse-heavy traffic: shared system prompts, multi-turn
+    // agentic coding, repeated long contexts. "Enable" emits --enable-hierarchical-cache (+host L2);
+    // Write policy is optional. (L3 storage backends exist but were not validated, so none exposed.)
+    hicache: {
+      writePolicies: [
+        { id: "auto",          label: "Auto" },
+        { id: "write_through", label: "Write-through" },
+        { id: "write_back",    label: "Write-back" },
       ],
     },
 
@@ -215,7 +230,7 @@ sgl-eval run gsm8k \\
     },
     {
       // VERIFIED on 8xH200 (FP8, tp8): GSM8K 93.25%. FP8 needs the g_proj fix (PR #28649, MERGED) on
-      // top of #28400+#28604 — the pinned dev-cu13-618-nightly image has it. Hopper does NOT hit the
+      // top of #28400+#28604 — lmsysorg/sglang:latest has it. Hopper does NOT hit the
       // Blackwell DeepGEMM UE8M0 issue, so no --fp8-gemm-backend flag here.
       match: { hw: "h200", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" },
       verified: true,
