@@ -1268,6 +1268,20 @@ class FusedMoE(torch.nn.Module):
             dispatch_output=dispatch_output,
         )
 
+        return self.combine_and_reduce(combine_input, origin_hidden_states_dim)
+
+    def combine_and_reduce(
+        self, combine_input: CombineInput, origin_hidden_states_dim: int
+    ) -> torch.Tensor:
+        """Combine dispatched expert outputs and apply the trailing
+        reduce_results all-reduce.
+
+        Shared by ``forward_impl`` and ``FusedMoEWithLoRA``, which replaces
+        the forward but must end the pipeline identically: under multi-rank
+        MoE (TP inner-shard or EP) each rank holds only a partial expert
+        output after combine, so skipping the reduction silently returns
+        partial sums.
+        """
         with use_symmetric_memory(
             get_tp_group(), disabled=not is_allocation_symmetric()
         ):

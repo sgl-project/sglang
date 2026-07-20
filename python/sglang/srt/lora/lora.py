@@ -165,7 +165,7 @@ class LoRAAdapter(nn.Module):
         from sglang.srt.lora.utils import get_normalized_target_modules
 
         normalized_target_modules = get_normalized_target_modules(
-            self.config.target_modules
+            self.config.target_modules, self.base_model
         )
 
         # Remap PEFT "unembed_tokens" key to "lm_head" so the weight is
@@ -200,14 +200,24 @@ class LoRAAdapter(nn.Module):
             )
 
     def _normalize_weights(self):
+        from sglang.srt.lora.utils import has_literal_w_modules
+
+        # Skip the HF w1/w3/w2 renames for models that keep those literal
+        # module names at runtime (e.g. InternLM2) — see has_literal_w_modules.
+        rename_w_to_proj = self.base_model is None or not has_literal_w_modules(
+            self.base_model
+        )
         for layer in self.layers:
             weight_names = list(layer.weights.keys())
             self.normalize_qkv_proj(weight_names, layer.weights)
-            self._rename_expert_w_to_proj(layer.weights)
+            if rename_w_to_proj:
+                self._rename_expert_w_to_proj(layer.weights)
             # Stack gate_proj + x_proj → in_proj for Mamba layers (before gate_up normalization)
             self._normalize_in_proj(layer.weights)
             # Stack in_proj_q + in_proj_k + in_proj_v + in_proj_z → in_proj_qkvz for GDN layers
             self._normalize_in_proj_qkvz(layer.weights)
+            # Tile single-rank lora_A for merged multi-partition in_proj modules
+            self._replicate_merged_in_proj_lora_a(layer.weights)
             weight_names = list(layer.weights.keys())
             self.normalize_gate_up_proj(weight_names, layer.weights)
             weight_names = list(layer.weights.keys())
@@ -355,6 +365,34 @@ class LoRAAdapter(nn.Module):
                 repeat_dims[ndim - 2] = 4
                 weights[weight_name] = weights[weight_name].repeat(*repeat_dims)
             # else (in_proj_qkvz lora_B, or unrelated): no-op.
+
+    def _replicate_merged_in_proj_lora_a(self, weights: Dict[str, torch.Tensor]):
+        """Tile lora_A for adapters trained against a merged multi-partition
+        ``in_proj`` as a single Linear.
+
+        Such adapters carry one shared rank-r LoRA whose B is already
+        full-output-width but whose A is just ``(r, in)``, while the stacked
+        buffer expects one A block per partition (``(c*r, in)``). Replicating
+        A c times along the rank dim makes the stacked-LoRA computation
+        produce an identical contribution per slice. The partition count c
+        comes from the base model's stacked-multiply declaration. Weights
+        already stacked by an earlier normalizer (rows != r) are left alone.
+        """
+        from sglang.srt.lora.utils import get_stacked_multiply
+
+        rank = self.config.r
+        for weight_name in list(weights.keys()):
+            if ".in_proj." not in weight_name or "lora_A" not in weight_name:
+                continue
+            tensor = weights[weight_name]
+            if tensor.shape[-2] != rank:
+                continue
+            c = get_stacked_multiply("in_proj", self.base_model)
+            if c <= 1:
+                continue
+            repeat_dims = [1] * tensor.dim()
+            repeat_dims[tensor.dim() - 2] = c
+            weights[weight_name] = tensor.repeat(*repeat_dims)
 
     def normalize_gate_up_proj(
         self, weight_names: List[str], weights: Dict[str, torch.Tensor]
