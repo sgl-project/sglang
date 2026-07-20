@@ -63,18 +63,20 @@ ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 RUN python3 -m pip install --no-cache-dir -U pip setuptools setuptools_scm wheel
 
 # ROCm SDK and PyTorch dependencies
-ARG PIP_EXTRA_INDEX_URL="https://rocm.prereleases.amd.com/whl-multi-arch/"
-# Pin to a specific ROCm SDK version (e.g. 7.14.0a20260604). Leave empty for latest.
-ARG ROCM_SDK_VERSION="7.14.0rc1"
-ARG TORCH_VERSION="2.10.0"
-ARG TORCHVISION_VERSION="0.25.0"
-ARG TORCHAUDIO_VERSION="2.10.0"
+ARG PIP_EXTRA_INDEX_URL="https://repo.amd.com/rocm/whl-multi-arch/"
+ARG ROCM_SDK_VERSION="7.14.0"
+ARG TORCH_VERSION="2.11.0"
+ARG TORCHVISION_VERSION="0.26.0"
+ARG TORCHAUDIO_VERSION="2.11.0"
 
 # Install ROCm SDK
 RUN ROCM_SPEC="${ROCM_SDK_VERSION:+==${ROCM_SDK_VERSION}}" \
-    && python3 -m pip install --no-cache-dir --pre \
+    && python3 -m pip install --no-cache-dir \
          --index-url "${PIP_EXTRA_INDEX_URL}" \
-         "rocm[libraries,devel,device-gfx950]${ROCM_SPEC}"
+         "rocm[libraries,devel,device-gfx950]${ROCM_SPEC}" \
+         "torch[device-gfx950]==${TORCH_VERSION}" \
+         "torchvision[device-gfx950]==${TORCHVISION_VERSION}" \
+         "torchaudio==${TORCHAUDIO_VERSION}"
 
 # Initialize ROCm SDK
 RUN rocm-sdk init && rocm-sdk targets
@@ -84,14 +86,6 @@ ENV LIBRARY_PATH=$ROCM_HOME/lib
 ENV LD_LIBRARY_PATH=$ROCM_HOME/lib
 ENV ROCM_PATH=$ROCM_HOME
 RUN echo 'export PATH=$ROCM_HOME/llvm/bin:$ROCM_HOME/bin:$PATH' >> /etc/bash.bashrc
-
-# Install PyTorch ROCm wheels
-RUN python3 -m pip install --no-cache-dir numpy \
-    && python3 -m pip install --no-cache-dir --pre \
-         --index-url "${PIP_EXTRA_INDEX_URL}" \
-         "torch[device-gfx950]==${TORCH_VERSION}" \
-         "torchvision[device-gfx950]==${TORCHVISION_VERSION}" \
-         "torchaudio==${TORCHAUDIO_VERSION}"
 
 # Workaround: ROCm SDK hsakmtTargets.cmake contains hardcoded /usr/lib64/libc.so from
 # the upstream build system, but Ubuntu uses /lib/x86_64-linux-gnu/. Create symlink to
