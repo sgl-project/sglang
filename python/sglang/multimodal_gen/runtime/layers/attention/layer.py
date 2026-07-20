@@ -9,6 +9,7 @@ from typing import Type
 
 import torch
 import torch.nn as nn
+from piecewise_cuda_graphs import no_graph
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from sglang.jit_kernel.diffusion.triton.varlen_pack_pad import (
@@ -57,7 +58,6 @@ from sglang.multimodal_gen.runtime.managers.forward_context import (
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.utils import get_compute_dtype
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
-    eager_on_graph,
     is_in_breakable_cuda_graph,
 )
 
@@ -1213,7 +1213,7 @@ def _make_breakable_attention_forward(forward_method):
         out = forward_method(*args, **kwargs)
         return _BCGBoxedTupleOutput(out) if isinstance(out, tuple) else out
 
-    bcg_forward = eager_on_graph(True)(_forward_boxing_tuples)
+    bcg_forward = no_graph(_forward_boxing_tuples, enable=True)
 
     @functools.wraps(forward_method)
     def forward(self, *args, **kwargs):

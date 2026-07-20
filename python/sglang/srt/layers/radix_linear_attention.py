@@ -18,12 +18,12 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Optional, Tuple, Union
 
 import torch
+from piecewise_cuda_graphs import no_graph
 from torch import nn
 
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
-    eager_on_graph,
     is_in_breakable_cuda_graph,
 )
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
@@ -156,6 +156,6 @@ def unified_linear_attention_with_output(
     return
 
 
-bcg_unified_linear_attention_with_output = eager_on_graph(True)(
-    unified_linear_attention_with_output
+bcg_unified_linear_attention_with_output = no_graph(
+    unified_linear_attention_with_output, enable=True
 )

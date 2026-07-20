@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import torch
 from einops import rearrange
+from piecewise_cuda_graphs import no_graph
 
 from sglang.jit_kernel.fused_store_index_cache import (
     can_use_dsa_fused_store,
@@ -27,9 +28,6 @@ from sglang.srt.layers.attention.dsa.utils import (
 from sglang.srt.layers.dp_attention import attn_tp_all_gather_into_tensor
 from sglang.srt.layers.layernorm import LayerNorm, RMSNorm
 from sglang.srt.layers.utils import MultiPlatformOp
-from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
-    eager_on_graph,
-)
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
 )
@@ -2505,7 +2503,7 @@ def pcg_dsa_indexer_prefill_split(
     )
 
 
-bcg_dsa_indexer_prefill_split = eager_on_graph(True)(pcg_dsa_indexer_prefill_split)
+bcg_dsa_indexer_prefill_split = no_graph(pcg_dsa_indexer_prefill_split, enable=True)
 
 
 def scattered_to_tp_attn_full(
