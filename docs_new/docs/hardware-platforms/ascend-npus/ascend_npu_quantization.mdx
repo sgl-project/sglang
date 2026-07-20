@@ -353,11 +353,11 @@ python3 -m sglang.launch_server \
 > **Implementation Notes:**
 > - Online path: `Fp8Config.get_quant_method()` dispatches to `NPUMXFP8LinearMethod`. Weights are quantized once at load via `npu_dynamic_mx_quant(weight, dst_type=torch_npu.float8_e4m3fn)` and pre-transposed to `[in, out]`; activations are per-token quantized at inference and matmul runs via `npu_quant_matmul(..., group_sizes=[1, 1, 32])` (block_size = 32).
 > - Offline path: `ModelSlimMXFP8Scheme` loads `float8_e4m3fn` weights + `float8_e8m0fnu` block scales pre-exported by msmodelslim. Transpose is kept as a non-contiguous view (`.data` assignment) — calling `.contiguous()` would physically reorder the pre-quantized layout and break the block-scale mapping.
-> - MoE MXFP8 (FusedMoE, TP) for LLMs is documented in **MXFP8 for LLM MoE models** below.
+> - MoE MXFP8 (FusedMoE) for LLMs is documented in **MXFP8 for LLM MoE models** below.
 
 **MXFP8 for LLM MoE models (e.g. Qwen3-30B-A3B / Qwen3.5 MoE):**
 
-LLM MoE W8A8 MXFP8 (FusedMoE, TP) support builds on the dense MXFP8 path. Requires Ascend A5 series or newer — the fused MoE MX kernels (`npu_grouped_matmul_swiglu_quant_v2`, `npu_dynamic_mx_quant`) are A5-only.
+LLM MoE W8A8 MXFP8 (FusedMoE) support builds on the dense MXFP8 path. Requires Ascend A5 series or newer — the fused MoE MX kernels (`npu_grouped_matmul_swiglu_quant_v2`, `npu_dynamic_mx_quant`) are A5-only.
 
 - Online MXFP8 quantization (BF16/FP16 expert weights → MXFP8 at load time):
 
@@ -386,7 +386,7 @@ python3 -m sglang.launch_server \
 > - Offline path: `ModelSlimMXFP8MoEScheme` (one instance per weight group) loads `float8_e4m3fn` expert weights + uint8 (e8m0, exponent + 127) block scales. The scale is reshaped `[E, N, K/32] → [E, N, K/64, 2]` (contiguous pairing, matching `npu_dynamic_mx_quant`) then transposed.
 > - Forward: `AscendTPDispatcher` runs `npu_moe_init_routing_v2(quant_mode=3)`, which fuses the per-token MX activation quant into routing (e4m3 payload + e8m0 block scale, reshaped to the pair-split layout). `AscendRunnerCore` then runs gmm1 `npu_grouped_matmul_swiglu_quant_v2` (cumulative `group_list`; fuses gate/up + swiglu + requant, so no separate activation step) → gmm2 `npu_grouped_matmul` (count `group_list`). The UE8M0 (`float8_e8m0fnu`) scale dtypes are passed explicitly; the e4m3 `x`/`weight` dtypes are left implicit.
 > - **Router gate**: msmodelslim may also quantize `mlp.gate` (`W8A8_MXFP8`). The gate is a `ReplicatedLinear`, so its quantization must be **description-driven**: for the offline `modelslim` path the gate is passed the quant config and dequantized correctly; the online path keeps it in BF16. Loading a quantized gate as BF16 without its block scale scrambles routing and produces garbage output.
-> - MoE is TP-only: the activation quant comes from `npu_moe_init_routing_v2`, which the DeepEP dispatch path does not go through, so EP / DeepEP is rejected at runner construction. Validated end-to-end on Ascend A5.
+> - Where the activation quant happens depends on the dispatcher. On `ascend_tp` it is fused into routing as described above. DeepEP has no MXFP8 dispatch dtype, so it keeps dispatching BF16 and gmm1 quantizes the hidden states itself via `npu_dynamic_mx_quant` before the fused kernel — the two paths reach the same gmm1 input. Only the `ascend_tp` path has been validated end-to-end on Ascend A5.
 
 **MXFP4 W4A8 for LLM dense models (e.g. Qwen3 / Qwen3.5):**
 

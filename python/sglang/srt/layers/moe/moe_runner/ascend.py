@@ -89,17 +89,12 @@ class AscendRunnerCore(MoeRunnerCore):
         kernel = config.layer.w2_kernel
 
         if isinstance(kernel, NPUMXFP8MoEMethod):
-            if get_moe_a2a_backend().is_deepep():
-                raise ValueError(
-                    "MXFP8 MoE on Ascend is TP-only: it takes its activation "
-                    "quant from npu_moe_init_routing_v2(quant_mode=3), which the "
-                    "DeepEP dispatch path does not go through. Run without "
-                    "--moe-a2a-backend deepep."
-                )
             # MXFP8 fuses gate/up + swiglu + requant into gmm1, so there is no
             # separate activation step — run() skips it. Left None on purpose so
             # that reaching for it fails loudly instead of silently applying an
-            # unfused swiglu to already-requantised activations.
+            # unfused swiglu to already-requantised activations. This holds for
+            # both dispatchers: ascend_tp gets its activation quant fused into
+            # routing, DeepEP dispatches bf16 and gmm1 quantises it itself.
             self.activation = None
         elif get_moe_a2a_backend().is_deepep():
             # DeepEP path: use a unified kernel that decides quantisation

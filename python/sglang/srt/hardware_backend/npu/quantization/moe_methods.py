@@ -780,19 +780,28 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
     (weights already quantised); ``process_weights_after_loading`` tells the two
     apart by weight dtype.
 
-    Unlike the int8/int4 methods this one does not quantise activations itself:
-    the dispatcher's ``npu_moe_init_routing_v2(quant_mode=3)`` emits the e4m3
-    payload and e8m0 scale as part of routing, and gmm1 re-quantises its own
-    output. Consequently gmm1 is a single fused kernel rather than a matmul plus
-    a separate activation, so the runner calls ``apply_fused_gmm1_swiglu`` for
-    w13 and ``apply`` only for w2 — hence the per-prefix matmul chosen here.
+    gmm1 re-quantises its own output, so it is a single fused kernel rather than
+    a matmul plus a separate activation: the runner calls
+    ``apply_fused_gmm1_swiglu`` for w13 and ``apply`` only for w2 — hence the
+    per-prefix matmul chosen here.
+
+    Where the *activation* quant happens depends on the dispatcher. On
+    ``ascend_tp`` it comes for free from ``npu_moe_init_routing_v2(quant_mode=3)``,
+    which emits the e4m3 payload and e8m0 scale as part of routing. DeepEP has no
+    mxfp8 dispatch dtype, so it hands over bf16 and w13 quantises the hidden
+    states itself before gmm1.
     """
 
     def __init__(self, weight_prefix: str):
         super().__init__(quant_config=None)
-        self.matmul = (
-            GroupedMatmulSwigluQuant() if weight_prefix == "w13" else GroupedMatmul()
-        )
+        if weight_prefix == "w13":
+            self.matmul = GroupedMatmulSwigluQuant()
+            self.hidden_states_quantizer = HiddenStatesDynamicQuant(
+                quant_dtype=torch.float8_e4m3fn
+            )
+        else:
+            self.matmul = GroupedMatmul()
+            self.hidden_states_quantizer = None
 
     @staticmethod
     def _quantize_weight_online(
@@ -852,14 +861,19 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
         )
 
         if weight_prefix == "w13":
-            self._set_dispatcher_output_dtype(layer, "mxfp8")
+            from sglang.srt.layers.moe import get_moe_a2a_backend
+
+            # DeepEP has no mxfp8 entry in its dispatch dtype table, so let it
+            # keep sending bf16; apply_fused_gmm1_swiglu quantises instead.
+            dispatcher_dtype = "bf16" if get_moe_a2a_backend().is_deepep() else "mxfp8"
+            self._set_dispatcher_output_dtype(layer, dispatcher_dtype)
 
     def apply_fused_gmm1_swiglu(
         self,
         quant_info: "AscendQuantInfo",
         hidden_states: torch.Tensor,
         expert_tokens: torch.Tensor,
-        pertoken_scale: torch.Tensor,
+        pertoken_scale: Optional[torch.Tensor],
         group_list_type,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Gate/up projection, swiglu and requantisation in one kernel (gmm1).
@@ -867,7 +881,15 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
         Returns the e4m3 activations and their e8m0 block scale, i.e. exactly
         what the w2 gmm needs, which is why the runner skips its activation step
         for MXFP8.
+
+        ``pertoken_scale`` is None when the dispatcher handed over unquantised
+        hidden states (the DeepEP path), in which case the activation quant that
+        ascend_tp fuses into routing is done here instead. Both dispatchers
+        therefore reach the kernel below with the same e4m3 + e8m0 input.
         """
+        if pertoken_scale is None:
+            hidden_states, pertoken_scale = self.hidden_states_quantizer(hidden_states)
+
         e8m0_dtype = _require_e8m0_dtype()
         return self.matmul.forward(
             quant_info,
