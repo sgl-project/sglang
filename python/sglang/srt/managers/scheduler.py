@@ -264,7 +264,7 @@ from sglang.srt.utils import (
     set_random_seed,
     suppress_other_loggers,
 )
-from sglang.srt.utils.common import is_npu
+from sglang.srt.utils.common import install_graceful_sigterm_handler, is_npu
 from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
     get_tokenizer,
@@ -4411,21 +4411,17 @@ def run_scheduler_process(
     parent_process = psutil.Process().parent()
     scheduler = None
 
-    def sigterm_handler(signum, frame):
-        """Exit normally on SIGTERM so atexit/C++ destructors run (RDMA teardown).
-
-        Exit code 0 avoids SubprocessWatchdog crash detection.
-        """
-        signal.signal(signal.SIGTERM, signal.SIG_IGN)  # prevent re-entry
-        logger.info(
-            f"SIGTERM received in scheduler process (TP{tp_rank} PP{pp_rank}); "
-            "exiting normally to allow cleanup..."
-        )
-        if scheduler is not None:
-            scheduler.gracefully_exit = True
-        sys.exit(0)
-
-    signal.signal(signal.SIGTERM, sigterm_handler)
+    # SIGTERM → mark gracefully_exit so the finally block frees host resources.
+    # The lambda is evaluated at signal time, seeing the scheduler created below.
+    install_graceful_sigterm_handler(
+        logger,
+        f"scheduler process (TP{tp_rank} PP{pp_rank})",
+        on_shutdown=lambda: (
+            setattr(scheduler, "gracefully_exit", True)
+            if scheduler is not None
+            else None
+        ),
+    )
 
     # Set up tracing
     if server_args.enable_trace:

@@ -17,7 +17,6 @@ import faulthandler
 import logging
 import multiprocessing as mp
 import signal
-import sys
 import threading
 import time
 from enum import Enum, auto
@@ -57,6 +56,7 @@ from sglang.srt.utils import numa_utils
 from sglang.srt.utils.common import (
     configure_logger,
     graceful_kill_process_tree,
+    install_graceful_sigterm_handler,
     kill_itself_when_parent_died,
     maybe_reindex_device_id,
 )
@@ -675,22 +675,15 @@ def run_data_parallel_controller_process(
     kill_itself_when_parent_died()
     parent_process = psutil.Process().parent()
 
-    def sigterm_handler(signum, frame):
-        """SIGTERM → gracefully stop schedulers before exiting.
-
-        Exits with code 0 to avoid SubprocessWatchdog treating it as a crash.
-        """
-        signal.signal(signal.SIGTERM, signal.SIG_IGN)  # prevent re-entry
-        logger.info(
-            "SIGTERM received in data_parallel_controller; propagating graceful "
-            "shutdown to scheduler children..."
-        )
-        graceful_kill_process_tree(
+    # SIGTERM → propagate graceful shutdown to scheduler children, which would
+    # otherwise be SIGKILLed via PR_SET_PDEATHSIG before they finish cleanup.
+    install_graceful_sigterm_handler(
+        logger,
+        "data_parallel_controller",
+        on_shutdown=lambda: graceful_kill_process_tree(
             timeout=envs.SGLANG_CHILD_PROCESS_SHUTDOWN_TIMEOUT.get()
-        )
-        sys.exit(0)
-
-    signal.signal(signal.SIGTERM, sigterm_handler)
+        ),
+    )
 
     configure_logger(server_args)
     if server_args.enable_trace:

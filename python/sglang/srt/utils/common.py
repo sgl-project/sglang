@@ -2111,6 +2111,35 @@ def graceful_kill_process_tree(
             pass
 
 
+def install_graceful_sigterm_handler(
+    logger: logging.Logger,
+    label: str,
+    on_shutdown: Optional[Callable[[], None]] = None,
+):
+    """Install a SIGTERM handler that runs an optional hook, then exits with 0.
+
+    Re-arms SIGTERM to SIG_IGN to block re-entry, logs, runs on_shutdown, then
+    sys.exit(0). Exit 0 lets atexit/C++ destructors run (Mooncake/hicache RDMA
+    teardown) and avoids SubprocessWatchdog treating it as a crash. on_shutdown
+    is evaluated when the signal fires, so it may reference objects created after
+    this call; its exceptions are logged and swallowed.
+    """
+
+    def _handler(signum, frame):
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)  # prevent re-entry
+        logger.info(
+            f"SIGTERM received in {label}; exiting normally to allow cleanup..."
+        )
+        if on_shutdown is not None:
+            try:
+                on_shutdown()
+            except Exception:
+                logger.exception("Error in SIGTERM cleanup hook")
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, _handler)
+
+
 def monkey_patch_p2p_access_check():
     """
     Monkey patch the slow p2p access check.
