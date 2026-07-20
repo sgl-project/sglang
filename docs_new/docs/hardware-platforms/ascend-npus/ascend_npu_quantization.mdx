@@ -370,12 +370,11 @@ python3 -m sglang.launch_server \
     --mem-fraction-static 0.8 --tp-size 1
 ```
 
-- Offline MXFP8 quantization (msmodelslim pre-quantized weights, `W8A8_MXFP8` scheme; selected via `--quantization modelslim` and detected from `quant_model_description.json`):
+- Offline MXFP8 quantization (msmodelslim pre-quantized weights, `W8A8_MXFP8` scheme). No `--quantization` flag is needed: the `quant_model_description.json` shipped with the checkpoint selects both the ModelSlim path and the scheme automatically.
 
 ```bash Command
 python3 -m sglang.launch_server \
     --model-path /path/to/Qwen3-30B-A3B-W8A8-MXFP8 \
-    --quantization modelslim \
     --device npu --attention-backend ascend \
     --host 0.0.0.0 --port 30000 \
     --mem-fraction-static 0.8 --tp-size 1
