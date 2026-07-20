@@ -856,11 +856,61 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             decode_req.kv_receiver.init(prefill_dp_rank)
 
     def pop_preallocated(
-        self, rids_to_check: Optional[List[str]] = None
+        self,
+        rids_to_check: Optional[List[str]] = None,
+        pp_good_rids: Optional[List[str]] = None,
+        pp_bad_rids: Optional[List[str]] = None,
     ) -> Tuple[List[DecodeRequest], List[DecodeRequest]]:
-        """Pop the preallocated requests from the pending queue (FIFO)."""
+        """Pop requests, optionally applying an authoritative PP consensus."""
+        if (pp_good_rids is None) != (pp_bad_rids is None):
+            raise ValueError("pp_good_rids and pp_bad_rids must be provided together")
+        is_pp_mode = pp_good_rids is not None
+        if is_pp_mode and rids_to_check is not None:
+            raise ValueError(
+                "rids_to_check cannot be combined with a PP consensus result"
+            )
+
+        good_rids = set(pp_good_rids or [])
+        bad_rids = set(pp_bad_rids or [])
+        # Failure wins defensively if a malformed payload overlaps.
+        good_rids.difference_update(bad_rids)
+
         self._resolve_pending_reqs()
-        self._update_handshake_waiters(rids_to_check)
+        if not is_pp_mode:
+            self._update_handshake_waiters(rids_to_check)
+        else:
+            # The PP ring has already polled every stage. Do not poll again:
+            # an abort arriving between consensus and application must not make
+            # stages apply different outcomes.
+            for decode_req in self.queue:
+                rid = decode_req.req.rid
+                if rid in good_rids and not decode_req.waiting_for_input:
+                    decode_req.waiting_for_input = True
+                    decode_req.req.time_stats.set_bootstrap_done_time()
+                elif rid in bad_rids:
+                    error_message = (
+                        "Decode handshake failed by PP consensus for request "
+                        f"rank={self.tp_rank} {decode_req.req.rid=} "
+                        f"{decode_req.req.bootstrap_room=}"
+                    )
+                    is_propagated = False
+                    try:
+                        decode_req.kv_receiver.failure_exception()
+                    except Exception as e:
+                        error_message += f" with exception {e}"
+                        is_propagated = getattr(e, "is_from_another_rank", False)
+                    if is_propagated:
+                        logger.debug(error_message)
+                    else:
+                        logger.error(error_message)
+                    if not isinstance(decode_req.req.finished_reason, FINISH_ABORT):
+                        prepare_abort(
+                            decode_req.req,
+                            error_message,
+                            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                        )
+                    if self.scheduler.metrics_reporter.enable_metrics:
+                        self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
 
         failed_reqs = []
         preallocated_reqs = []
@@ -903,7 +953,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         # First, remove all failed requests from the queue
         for i, decode_req in enumerate(self.queue):
-            if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
+            rid = decode_req.req.rid
+            if is_pp_mode:
+                if rid not in bad_rids:
+                    continue
+            elif rids_to_check is not None and rid not in rids_to_check:
                 continue
             if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
                 if not getattr(decode_req.req, "finished_output", False):
@@ -941,7 +995,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         # Then, preallocate the remaining requests if possible
         for i, decode_req in enumerate(self.queue):
-            if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
+            rid = decode_req.req.rid
+            if is_pp_mode:
+                if rid not in good_rids:
+                    continue
+            elif rids_to_check is not None and rid not in rids_to_check:
                 continue
 
             if i in indices_to_remove:
@@ -1844,6 +1902,38 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             server_args=self.scheduler.server_args,
         )
 
+    def get_finished_rids(self) -> Tuple[List[str], List[str]]:
+        """Return locally finished transfer rids as (successful, failed)."""
+        if not self.queue:
+            return [], []
+
+        if self.scheduler.enable_decode_hicache:
+            self._process_hicache_local_restores(self.queue)
+
+        if self.enable_staging:
+            polls = self._poll_with_staging()
+        else:
+            polls = self._poll_with_metadata_gate()
+
+        successful_rids: List[str] = []
+        failed_rids: List[str] = []
+        for decode_req, poll in zip(self.queue, polls):
+            hicache_restore_status = decode_req.hicache_restore_status
+            if (
+                poll == KVPoll.Failed
+                or hicache_restore_status == HiCacheRestoreResult.FAILED
+            ):
+                failed_rids.append(decode_req.req.rid)
+            elif poll == KVPoll.Success:
+                if (
+                    self.scheduler.enable_decode_hicache
+                    and hicache_restore_status == HiCacheRestoreResult.PENDING
+                ):
+                    continue
+                successful_rids.append(decode_req.req.rid)
+
+        return successful_rids, failed_rids
+
     def _init_staging_handler(self, kv_manager):
         """Create staging handler from kv_manager. Must be called exactly once."""
         from sglang.srt.disaggregation.common.staging_handler import (
@@ -1855,11 +1945,30 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         )
         kv_manager._staging_handler = self.staging_handler
 
-    def pop_transferred(self, rids_to_check: Optional[List[str]] = None) -> List[Req]:
+    def pop_transferred(
+        self,
+        rids_to_check: Optional[List[str]] = None,
+        pp_good_rids: Optional[List[str]] = None,
+        pp_bad_rids: Optional[List[str]] = None,
+    ) -> List[Req]:
+        """Pop finished transfers, optionally applying a PP consensus result.
+
+        In PP mode, the consensus is authoritative. Re-polling local state here
+        can make stages apply different outcomes when a failure or abort arrives
+        between consensus and queue processing.
+        """
+        if (pp_good_rids is None) != (pp_bad_rids is None):
+            raise ValueError("pp_good_rids and pp_bad_rids must be provided together")
+        is_pp_mode = pp_good_rids is not None
+        if is_pp_mode and rids_to_check is not None:
+            raise ValueError(
+                "rids_to_check cannot be combined with a PP consensus result"
+            )
+
         if not self.queue:
             return []
 
-        if self.scheduler.enable_decode_hicache:
+        if self.scheduler.enable_decode_hicache and not is_pp_mode:
             self._process_hicache_local_restores(
                 [
                     decode_req
@@ -1868,7 +1977,20 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 ]
             )
 
-        if self.enable_staging:
+        if is_pp_mode:
+            good_rids = set(pp_good_rids or [])
+            bad_rids = set(pp_bad_rids or [])
+            polls = []
+            for decode_req in self.queue:
+                rid = decode_req.req.rid
+                if rid in bad_rids:
+                    # Failure wins defensively if a malformed payload overlaps.
+                    polls.append(KVPoll.Failed)
+                elif rid in good_rids:
+                    polls.append(KVPoll.Success)
+                else:
+                    polls.append(None)
+        elif self.enable_staging:
             polls = self._poll_with_staging()
         else:
             polls = self._poll_with_metadata_gate()
@@ -1876,6 +1998,8 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         transferred_reqs = []
         indices_to_remove = set()
         for i, (decode_req, poll) in enumerate(zip(self.queue, polls)):
+            if poll is None:
+                continue
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
 

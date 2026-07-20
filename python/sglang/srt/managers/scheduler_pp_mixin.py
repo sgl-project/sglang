@@ -46,6 +46,17 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
 
 
+def _split_decode_transfer_rids(release_rids):
+    if (
+        isinstance(release_rids, list)
+        and len(release_rids) == 2
+        and isinstance(release_rids[0], list)
+        and isinstance(release_rids[1], list)
+    ):
+        return release_rids[0], release_rids[1]
+    return release_rids, []
+
+
 def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
     """Check if output send/recv can be skipped for this batch."""
     return (
@@ -1372,29 +1383,27 @@ class SchedulerPPMixin:
         return [good_prealloc_rids, bad_prealloc_rids]
 
     def _pp_pd_get_decode_transferred_ids(self: Scheduler):
-        # get the current stage transfer success
+        # Successful transfers require every PP stage to observe success. A
+        # failure observed by any stage must be applied by every stage.
         if self.pp_group.is_first_rank:
-            transferred_rids = self.get_rids(
-                self.disagg_decode_transfer_queue.queue,
-                False,
-                [KVPoll.Success, KVPoll.Failed],
+            good_transferred_rids, bad_transferred_rids = (
+                self.disagg_decode_transfer_queue.get_finished_rids()
             )
-        # if other ranks, do intersection with the previous rank's transferred rids
         else:
-            # 2 (Release): Receive the transferred rids from the previous rank
-            # 1. recv previous stage's transferred reqs info
             prev_transferred_rids = self._pp_recv_pyobj_from_prev_stage()
-            # 2. get the current stage's transferred reqs info
-            curr_transferred_rids = self.get_rids(
-                self.disagg_decode_transfer_queue.queue,
-                False,
-                [KVPoll.Success, KVPoll.Failed],
+            prev_good_transferred_rids, prev_bad_transferred_rids = (
+                _split_decode_transfer_rids(prev_transferred_rids)
             )
-            # 3. new consensus rids = intersection(previous consensus rids, transfer finished rids)
-            transferred_rids = list(
-                set(prev_transferred_rids) & set(curr_transferred_rids)
+            curr_good_transferred_rids, curr_bad_transferred_rids = (
+                self.disagg_decode_transfer_queue.get_finished_rids()
             )
-        return transferred_rids
+            good_transferred_rids = list(
+                set(prev_good_transferred_rids) & set(curr_good_transferred_rids)
+            )
+            bad_transferred_rids = list(
+                set(prev_bad_transferred_rids) | set(curr_bad_transferred_rids)
+            )
+        return [good_transferred_rids, bad_transferred_rids]
 
     def process_retract_queue(self: Scheduler, retract_rids: Optional[List[str]]):
         if retract_rids is not None:
@@ -1416,29 +1425,32 @@ class SchedulerPPMixin:
                 good_consensus_prealloc_rids,
                 bad_consensus_prealloc_rids,
             ) = prealloc_rids
-            good_reqs, failed_reqs = self.disagg_decode_prealloc_queue.pop_preallocated(
-                rids_to_check=good_consensus_prealloc_rids
-                + bad_consensus_prealloc_rids,
+            good_reqs, _ = self.disagg_decode_prealloc_queue.pop_preallocated(
+                pp_good_rids=good_consensus_prealloc_rids,
+                pp_bad_rids=bad_consensus_prealloc_rids,
             )
             self.disagg_decode_transfer_queue.extend(good_reqs)
-            return [
-                [req.req.rid for req in good_reqs],
-                [req.req.rid for req in failed_reqs],
-            ]
+            # Keep both consensus classes intact around the PP ring. Rebuilding
+            # this payload from local outcomes can lose a global failure.
+            return prealloc_rids
         return None
 
     def process_decode_transfer_queue(
         self: Scheduler, release_rids: Optional[List[str]]
     ):
         if release_rids is not None:
-            released_reqs = self.disagg_decode_transfer_queue.pop_transferred(
+            good_release_rids, bad_release_rids = _split_decode_transfer_rids(
                 release_rids
+            )
+            released_reqs = self.disagg_decode_transfer_queue.pop_transferred(
+                pp_good_rids=good_release_rids,
+                pp_bad_rids=bad_release_rids,
             )
             if self.enable_hisparse:
                 for req in released_reqs:
                     self.hisparse_coordinator.admit_request_direct(req)
             self.waiting_queue.extend(released_reqs)
-            return [req.rid for req in released_reqs]
+            return release_rids
         return None
 
 
