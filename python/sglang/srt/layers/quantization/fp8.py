@@ -1380,7 +1380,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             is_fp4_expert=self.is_fp4_expert,
             params_dtype=params_dtype,
             with_bias=with_bias,
-            extra_weight_attrs=extra_weight_attrs,
+            **extra_weight_attrs,
         )
 
         if (

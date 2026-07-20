@@ -107,7 +107,8 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
         original_weight_loader = extra_weight_attrs.get("weight_loader")
-        with_bias = extra_weight_attrs.get("with_bias", False)
+        with_bias = extra_weight_attrs.pop("with_bias", False)
+        self.with_bias = with_bias
 
         # Handle FP8 to MXFP4 requantization
         if self.dequantization_config is not None:
@@ -155,8 +156,8 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
                     is_checkpoint_fp8_serialized=True,
                     is_fp4_expert=False,
                     params_dtype=params_dtype,
-                    extra_weight_attrs=extra_weight_attrs,
                     with_bias=with_bias,
+                    **extra_weight_attrs,
                 )
             return
 
