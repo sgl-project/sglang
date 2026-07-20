@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import importlib.util
 import logging
 from typing import Any, Callable, Optional
 
@@ -11,7 +12,12 @@ from sglang.srt.utils import is_hip
 from sglang.srt.utils.common import direct_register_custom_op, mxfp_supported
 
 _is_hip = is_hip()
-if _is_hip:
+# aiter is optional on ROCm, so is_hip() alone must not trigger
+# these imports -- a default RDNA/no-aiter startup would otherwise crash importing this
+# module. Gate on availability, NOT SGLANG_USE_AITER.
+# If aiter is present but unimportable, the import below fails loud.
+_has_aiter = _is_hip and importlib.util.find_spec("aiter") is not None
+if _has_aiter:
     from aiter.ops.triton.gemm.fused.fused_gemm_afp4wfp4_split_cat import (
         fused_gemm_afp4wfp4_split_cat as _fused_gemm_afp4wfp4_split_cat_orig,
     )

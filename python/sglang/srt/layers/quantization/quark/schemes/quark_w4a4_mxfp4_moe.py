@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import logging
 from typing import TYPE_CHECKING, Any
 
@@ -31,13 +32,17 @@ _is_shuffle_moe_mxfp4 = is_gfx95_supported()
 __all__ = ["QuarkW4A4MXFp4MoE"]
 
 _is_hip = is_hip()
+# _use_aiter selects the aiter MoE kernel at runtime (is_aiter_moe below). _has_aiter
+# gates the aiter imports on availability -- same as the other quark schemes -- so a
+# no-aiter startup (RDNA) doesn't crash, while CDNA (aiter installed) imports them
+# regardless of SGLANG_USE_AITER. dynamic_mxfp4_quant stays None when unavailable
+# (the online MoE path guards for it).
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
-if _use_aiter:
+_has_aiter = _is_hip and importlib.util.find_spec("aiter") is not None
+if _has_aiter:
     from aiter.ops.shuffle import shuffle_weight
-    from aiter.utility.fp4_utils import e8m0_shuffle
-
-if _is_hip:
     from aiter.ops.triton.quant import dynamic_mxfp4_quant
+    from aiter.utility.fp4_utils import e8m0_shuffle
 else:
     dynamic_mxfp4_quant = None
 

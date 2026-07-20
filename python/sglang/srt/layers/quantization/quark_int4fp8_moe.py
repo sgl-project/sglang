@@ -1,3 +1,4 @@
+import importlib.util
 import logging
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
@@ -24,11 +25,17 @@ if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import DispatchOutput
 
 _is_hip = is_hip()
+# aiter is optional on ROCm, so is_hip() alone must not trigger
+# these imports -- a default RDNA/no-aiter startup would otherwise crash importing this
+# module. Gate on availability, NOT SGLANG_USE_AITER.
+# If aiter is present but unimportable, the import below fails loud.
+_has_aiter = _is_hip and importlib.util.find_spec("aiter") is not None
 
-
-if _is_hip:
+if _has_aiter:
     from aiter.ops.shuffle import shuffle_weight
 
+# ON_GFX950 is an arch probe unrelated to aiter, so keep it under is_hip().
+if _is_hip:
     ON_GFX950 = "gfx950" in torch.cuda.get_device_properties("cuda").gcnArchName
 
 logger = logging.getLogger(__name__)
