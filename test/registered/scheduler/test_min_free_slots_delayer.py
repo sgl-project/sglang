@@ -6,7 +6,7 @@ from sglang.srt.managers.min_free_slots_delayer import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
 
 class TestResolveMinFreeSlots(unittest.TestCase):

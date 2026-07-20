@@ -11,7 +11,7 @@ from sglang.test.scripted_runtime import background_http_poster as bg_poster
 from sglang.test.scripted_runtime.background_http_poster import BackgroundHttpPoster
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=8, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class _FakeResponse:

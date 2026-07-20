@@ -11,7 +11,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=500, stage="extra-b", runner_config="deepep-4-gpu-h100")
+register_cuda_ci(est_time=465, stage="extra-b", runner_config="deepep-4-gpu-h100")
 
 GQA_MODEL_PATH = "Qwen/Qwen3-30B-A3B-FP8"
 

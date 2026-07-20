@@ -23,7 +23,7 @@ from sglang.test.kits import eval_accuracy_kit as kit
 from sglang.test.kits.eval_accuracy_kit import GPQAMixin, GSM8KMixin
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 def _fake_get(url, *args, **kwargs):
