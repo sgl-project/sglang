@@ -361,11 +361,11 @@ class Fp8Config(QuantizationConfig):
                 )
 
             if is_npu() and self.use_mxfp8:
-                from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
-                    NPUMXFP8FusedMoEMethod,
+                from sglang.srt.hardware_backend.npu.quantization.online_moe_methods import (
+                    NPUMXFP8OnlineMoEMethod,
                 )
 
-                return NPUMXFP8FusedMoEMethod(self)
+                return NPUMXFP8OnlineMoEMethod(self)
 
             fp8_method = Fp8MoEMethod(self)
 

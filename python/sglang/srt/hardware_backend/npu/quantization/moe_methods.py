@@ -9,8 +9,6 @@ from sglang.srt.hardware_backend.npu.utils import npu_format_cast
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
-    from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
     from sglang.srt.layers.moe.moe_runner.ascend import AscendQuantInfo
 
@@ -947,95 +945,3 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
             transposed=True,
             **scale_args,
         )
-
-
-# ---------------------------------------------------------------------------
-#  NPUMXFP8FusedMoEMethod
-# ---------------------------------------------------------------------------
-class NPUMXFP8FusedMoEMethod(FusedMoEMethodBase):
-    """Online MXFP8 FusedMoE entry point (``--quantization mxfp8`` on A5).
-
-    Owns the BF16 weight placeholders and the runner wiring; the per-gmm work
-    lives in ``NPUMXFP8MoEMethod``, which quantises the weights to MXFP8 at load
-    time. The offline ModelSlim path reuses that same kernel via
-    ``ModelSlimMXFP8MoEScheme`` instead of this class.
-
-    TP only: MoE EP / DeepEP is not supported on this path.
-    """
-
-    def __init__(self, quant_config: Optional["QuantizationConfig"] = None):
-        super().__init__()
-        self.quant_config = quant_config
-        self.w13_kernel = NPUMXFP8MoEMethod("w13")
-        self.w2_kernel = NPUMXFP8MoEMethod("w2")
-
-    def create_weights(
-        self,
-        layer: torch.nn.Module,
-        num_experts: int,
-        hidden_size: int,
-        intermediate_size_per_partition: int,
-        params_dtype: torch.dtype,
-        **extra_weight_attrs,
-    ):
-        from sglang.srt.utils import set_weight_attrs
-
-        # Weights load in params_dtype (BF16/FP16) and are quantised to MXFP8 in
-        # process_weights_after_loading.
-        w13_weight = torch.nn.Parameter(
-            torch.empty(
-                num_experts,
-                2 * intermediate_size_per_partition,
-                hidden_size,
-                dtype=params_dtype,
-            ),
-            requires_grad=False,
-        )
-        layer.register_parameter("w13_weight", w13_weight)
-        set_weight_attrs(w13_weight, extra_weight_attrs)
-
-        w2_weight = torch.nn.Parameter(
-            torch.empty(
-                num_experts,
-                hidden_size,
-                intermediate_size_per_partition,
-                dtype=params_dtype,
-            ),
-            requires_grad=False,
-        )
-        layer.register_parameter("w2_weight", w2_weight)
-        set_weight_attrs(w2_weight, extra_weight_attrs)
-
-    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        self.w13_kernel.process_weights_after_loading(layer, "w13")
-        self.w2_kernel.process_weights_after_loading(layer, "w2")
-
-    def create_moe_runner(
-        self, layer: torch.nn.Module, moe_runner_config: "MoeRunnerConfig"
-    ):
-        from sglang.srt.layers.moe.moe_runner import MoeRunner
-        from sglang.srt.layers.moe.utils import MoeRunnerBackend, get_moe_runner_backend
-
-        layer.w13_kernel = self.w13_kernel
-        layer.w2_kernel = self.w2_kernel
-        moe_runner_config.layer = layer
-        self.moe_runner_config = moe_runner_config
-        backend = get_moe_runner_backend()
-        if backend.is_auto():
-            backend = MoeRunnerBackend.ASCEND
-        self.runner = MoeRunner(backend, moe_runner_config)
-
-    def apply(
-        self,
-        layer: torch.nn.Module,
-        dispatch_output: "DispatchOutput",
-    ) -> "CombineInput":
-        from sglang.srt.layers.moe.moe_runner.ascend import AscendQuantInfo
-
-        quant_info = AscendQuantInfo(
-            w13_weight=layer.w13_weight,
-            w2_weight=layer.w2_weight,
-            w13_weight_scale=layer.w13_weight_scale,
-            w2_weight_scale=layer.w2_weight_scale,
-        )
-        return self.runner.run(dispatch_output, quant_info)
