@@ -461,9 +461,9 @@ class HiCacheController:
         self.storage_config = self._generate_storage_config(
             model_name, storage_backend_extra_config
         )
-        # for MLA models, only one rank needs to backup the KV cache
+        # for MLA models, only one rank needs to backup the KV cache when dcp not enabled
         self.backup_skip = (
-            self.storage_config.is_mla_model
+            (self.storage_config.is_mla_model and self.attn_dcp_size <= 1)
             # todo: load balancing
             and self.storage_config.tp_rank != 0
         )
@@ -593,6 +593,14 @@ class HiCacheController:
             self.tp_rank = get_parallel().tp_rank
             self.tp_size = get_parallel().tp_size
             self.dp_rank = 0
+        # initialize dcp rank and world size
+        if get_parallel().dcp_enabled:
+            self.attn_dcp_rank = get_parallel().attn_dcp_rank
+            self.attn_dcp_size = get_parallel().attn_dcp_size
+        else:
+            self.attn_dcp_rank = 0
+            self.attn_dcp_size = 1
+
 
         self.pp_rank = get_parallel().pp_rank
         self.pp_size = get_parallel().pp_size
@@ -630,6 +638,8 @@ class HiCacheController:
             pp_size=self.pp_size,
             attn_cp_rank=attn_cp_rank,
             attn_cp_size=attn_cp_size,
+            attn_dcp_size=self.attn_dcp_size,
+            attn_dcp_rank=self.attn_dcp_rank,
             # TODO(hzh): Rename is_mla_model to is_rank_replicated.
             is_mla_model=is_rank_replicated,
             enable_storage_metrics=self.enable_storage_metrics,
@@ -669,6 +679,17 @@ class HiCacheController:
             )
             self.prefetch_thread.start()
             self.backup_thread.start()
+
+    def _filter_indices_for_dcp(self, device_indices: torch.Tensor) -> torch.Tensor:
+        """Filter device indices for DCP ranks.
+        This is used to ensure that only the relevant device indices are processed
+        by each DCP rank, avoiding redundant operations and potential conflicts.
+        """
+        if self.attn_dcp_size <= 1:
+            return device_indices
+         # Filter indices based on DCP rank and size
+        filtered_indices = device_indices[device_indices % self.attn_dcp_size == self.attn_dcp_rank] // self.attn_dcp_size
+        return filtered_indices
 
     def write(
         self,
@@ -711,6 +732,9 @@ class HiCacheController:
             host_indices, device_indices = self.move_indices(
                 op.host_indices, op.device_indices
             )
+        # filter device indices for DCP ranks
+        device_indices = self._filter_indices_for_dcp(device_indices)
+        host_indices = self._filter_indices_for_dcp(host_indices)
         self.write_queue.clear()
 
         start_event = device_module.Event()
@@ -788,6 +812,8 @@ class HiCacheController:
         host_indices, device_indices = self.move_indices(
             op.host_indices, op.device_indices
         )
+        device_indices = self._filter_indices_for_dcp(device_indices)
+        host_indices = self._filter_indices_for_dcp(host_indices)
         self.load_queue.clear()
         producer_event = self.layer_done_counter.events[producer_id]
         producer_event.start_event.record()
@@ -957,7 +983,7 @@ class HiCacheController:
             # Must set the data before increasing the completed tokens.
             # Otherwise this page may be read before being set.
             self.mem_pool_host.set_from_flat_data_page(
-                host_indices[i * self.page_size],
+                host_indices[i * self.page_size] // self.attn_dcp_size if self.attn_dcp_size > 1 else host_indices[i * self.page_size],
                 page_data[i],
             )
             if not operation.increment(self.page_size):
@@ -1106,7 +1132,7 @@ class HiCacheController:
     # todo: deprecate
     def _generic_page_set(self, hash_values, host_indices, extra_info=None) -> bool:
         data = [
-            self.mem_pool_host.get_data_page(host_indices[i * self.page_size])
+            self.mem_pool_host.get_data_page(host_indices[i * self.page_size] // self.attn_dcp_size if self.attn_dcp_size > 1 else host_indices[i * self.page_size])
             for i in range(len(hash_values))
         ]
         return self.storage_backend.batch_set(hash_values, data)

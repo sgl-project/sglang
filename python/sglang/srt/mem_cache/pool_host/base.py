@@ -263,17 +263,15 @@ class HostKVCache(abc.ABC):
     @synchronized
     def clear(self):
         # Initialize memory states and tracking structures.
+        from sglang.srt.layers.dcp.comm import get_attention_dcp_world_size, dcp_enabled
+        allocator_size = self.size * get_attention_dcp_world_size() if dcp_enabled() else self.size
         self.mem_state = torch.zeros(
-            (self.size,), dtype=torch.uint8, device=self.device
+            (allocator_size,), dtype=torch.uint8, device=self.device
         )
-        self.free_slots = torch.arange(self.size, dtype=torch.int64)
-        # Keep freed chunks aside and consume them lazily from alloc() to avoid
-        # concatenating a large free-list on every host-pool free.
-        self.release_slots = []
-        self.num_release_slots = 0
+        self.free_slots = torch.arange(allocator_size, dtype=torch.int64)
         # Per-slot flag used to detect double-free.
         # slot_used[k] is true if slot k is allocated.
-        self.slot_used = torch.zeros(self.size, dtype=torch.bool)
+        self.slot_used = torch.zeros(allocator_size, dtype=torch.bool)
 
     def available_size(self):
         return len(self.free_slots) + self.num_release_slots

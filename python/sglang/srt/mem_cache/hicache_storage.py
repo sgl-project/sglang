@@ -31,6 +31,8 @@ class HiCacheStorageConfig:
     pp_size: int
     attn_cp_rank: int
     attn_cp_size: int
+    attn_dcp_rank: int
+    attn_dcp_size: int
     is_mla_model: bool
     enable_storage_metrics: bool
     is_page_first_layout: bool
@@ -377,6 +379,8 @@ class HiCacheFile(HiCacheStorage):
         # page, so give each rank its own file key to avoid a cross-rank write race.
         if attn_cp_size > 1:
             self.config_suffix += f"_cp{attn_cp_rank}_{attn_cp_size}"
+        if storage_config.attn_dcp_size > 1:
+            self.config_suffix += f"_dcp{storage_config.attn_dcp_rank}_{storage_config.attn_dcp_size}"
 
         if not os.path.exists(self.file_path) and tp_rank == 0 and attn_cp_rank == 0:
             os.makedirs(self.file_path)
