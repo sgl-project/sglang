@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.srt.layers.attention.dsa import index_buf_accessor
+from sglang.kernels.ops.attention.dsa import index_buf_accessor
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
