@@ -2104,7 +2104,7 @@ class ServerArgs:
         Arg(
             help="Storage backend for the multimodal global embedding cache. "
             "Used when --enable-mm-global-cache is set.",
-            choices=["mooncake", "file"],
+            choices=["mooncake"],
         ),
     ] = "mooncake"
     disable_fast_image_processor: A[
