@@ -683,7 +683,7 @@ def run_dp_sharded_mrope_vision_model(
             out_dim = getattr(vision_model.config, "hidden_size", None)
             image_embeds_local = torch.empty(
                 (0, embed_dim_reduction_factor, out_dim),
-                device=input_device,
+                device=get_parallel().attn_tp_group.device,
                 dtype=input_dtype,
             )
     else:
