@@ -12,6 +12,7 @@ import torch.nn.functional as F
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import is_cuda, is_musa
 
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
@@ -793,14 +794,19 @@ def build_dflash_verify_target_probs(
     return target_probs.view(bs, draft_token_num, -1).contiguous()
 
 
-def validate_dflash_request(req: Req, enable_overlap: bool) -> Optional[str]:
+def validate_dflash_request(
+    req: Req, enable_overlap: bool, spec_algorithm: SpeculativeAlgorithm
+) -> Optional[str]:
     if req.return_logprob:
         return "DFLASH speculative decoding does not support return_logprob yet."
 
     if enable_overlap and req.return_hidden_states:
         return "DFLASH speculative decoding does not support return_hidden_states yet."
 
-    if (
+    # DSPARK supports grammar-constrained decoding: DSparkWorkerV2 masks the
+    # target verify logits to the grammar-allowed vocabulary along the linear
+    # verify chain before accept. DFLASH does not implement this yet.
+    if not spec_algorithm.is_dspark() and (
         req.sampling_params.json_schema is not None
         or req.sampling_params.regex is not None
         or req.sampling_params.ebnf is not None
