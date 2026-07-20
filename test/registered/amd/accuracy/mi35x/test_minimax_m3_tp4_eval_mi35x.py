@@ -1,6 +1,6 @@
-"""MI35x MiniMax-M3 MXFP8 GSM8K Completion Evaluation Test (4-GPU, TP=4)
+"""MI35x MiniMax-M3 MXFP8 GSM8K Completion Evaluation Test (8-GPU, TP=8)
 
-Tests MiniMax-M3 (MXFP8 checkpoint) with TP=4 configuration using few-shot
+Tests MiniMax-M3 (MXFP8 checkpoint) with TP=8 configuration using few-shot
 completion benchmark on MI35x. MI35x (gfx950 / CDNA4) has hardware MX-scaled
 matmul, so the MXFP8 MoE weights are served natively; you still pass
 `--quantization mxfp8`. The launch flags mirror the SGLang MiniMax-M3 cookbook
@@ -65,10 +65,10 @@ class ModelConfig:
 MI35X_MINIMAX_M3_TP4_MODELS = [
     ModelConfig(
         model_path="MiniMaxAI/MiniMax-M3-MXFP8",
-        tp_size=4,
+        tp_size=8,
         accuracy_threshold=0.93,
         timeout=5400,
-        variant="TP4+MXFP8",
+        variant="TP8+MXFP8",
         other_args=[
             "--quantization",
             "mxfp8",
@@ -171,7 +171,7 @@ def run_gsm8k_benchmark(
 
 
 class TestMiniMaxM3TP4EvalMI35x(unittest.TestCase):
-    """MiniMax-M3 MXFP8 TP=4 GSM8K Completion Evaluation Test for AMD MI35x."""
+    """MiniMax-M3 MXFP8 TP=8 GSM8K Completion Evaluation Test for AMD MI35x."""
 
     @classmethod
     def setUpClass(cls):
@@ -180,9 +180,9 @@ class TestMiniMaxM3TP4EvalMI35x(unittest.TestCase):
         cls.num_questions = int(os.environ.get("GSM8K_NUM_QUESTIONS", "1319"))
 
     def test_minimax_m3_tp4_accuracy(self):
-        """Test MiniMax-M3 MXFP8 TP=4 with GSM8K completion benchmark."""
+        """Test MiniMax-M3 MXFP8 TP=8 with GSM8K completion benchmark."""
         all_results = []
-        summary = "### MiniMax-M3 MXFP8 TP=4 (MI35x)\n\n"
+        summary = "### MiniMax-M3 MXFP8 TP=8 (MI35x)\n\n"
         summary += "| Model | Variant | TP | Accuracy | Threshold | Status |\n"
         summary += "| ----- | ------- | -- | -------- | --------- | ------ |\n"
 
