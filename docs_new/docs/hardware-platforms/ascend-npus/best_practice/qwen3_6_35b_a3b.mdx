@@ -326,7 +326,6 @@ python -m sglang.bench_serving \
     --random-range-ratio 1
 ```
 
-
 ### Qwen3.6-35B-A3B 1P IN254K OUT1K
 
 **Model**: Qwen3.6-35B-A3B
@@ -678,7 +677,7 @@ python3 -m sglang.launch_server \
     --max-total-tokens 470784 \
     --max-prefill-tokens 65536 \
     --trust-remote-code \
-    --mamba-scheduler-strategy extra_buffer \
+    --mamba-radix-cache-strategy extra_buffer \
     --max-running-requests 40 \
     --max-mamba-cache-size 200 \
     --mem-fraction-static 0.9 \

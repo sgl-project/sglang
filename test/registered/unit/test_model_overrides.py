@@ -521,6 +521,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             "llama",
             dllm_algorithm="LowConfidence",
             disable_radix_cache=True,
+            attention_backend="triton",
         )
         self.assertEqual(sa.attention_backend, "flashinfer")  # materialized
         self.assertIn(
@@ -821,7 +822,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
 
         with patch.object(overrides_module, "is_sm120_supported", return_value=True):
             self.assertEqual(
-                _deepseek_v4_sm120_moe(_view()), {"moe_runner_backend": "marlin"}
+                _deepseek_v4_sm120_moe(_view()),
+                {"moe_runner_backend": "flashinfer_mxfp4"},
             )
             self.assertEqual(
                 _deepseek_v4_sm120_moe(_view(moe_runner_backend="triton")), {}
@@ -1812,11 +1814,16 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         )
 
         self.assertEqual(
-            _data_parallelism_defaults(ResolvedView(SimpleNamespace(dp_size=1))),
+            _data_parallelism_defaults(
+                ResolvedView(SimpleNamespace(dp_size=1, ep_join_mode=None))
+            ),
             {"enable_dp_attention": False, "enable_dp_lm_head": False},
         )
         self.assertEqual(
-            _data_parallelism_defaults(ResolvedView(SimpleNamespace(dp_size=2))), {}
+            _data_parallelism_defaults(
+                ResolvedView(SimpleNamespace(dp_size=2, ep_join_mode=None))
+            ),
+            {},
         )
 
         with patch("sglang.srt.environ.envs.SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE") as e:
