@@ -3,8 +3,11 @@ Streaming session extra tests for NPU.
 
 Ported from test/registered/sessions/test_streaming_session_extra.py.
 Adapted for Ascend NPU backend:
-  - Replaces CUDA model paths with NPU-local weights (Llama-3.1-8B-Instruct
-    and its EAGLE3 draft).
+  - Replaces CUDA model paths with NPU-local weights. Uses Qwen3-8B +
+    Qwen3-8B_eagle3 for EAGLE3 variants (Llama-3.1-8B + EAGLE3-Llama-3.1-8B
+    is incompatible with NPU aclnnRmsNorm: the draft's RMSNorm weight is
+    float16 while the main model hidden state is bfloat16, a combination
+    not in the supported list).
   - Adds `--attention-backend ascend`, `--disable-cuda-graph`,
     `--disable-piecewise-cuda-graph` to all server launches.
   - Sets `PYTORCH_NPU_ALLOC_CONF=expandable_segments:True` and a longer
@@ -16,7 +19,7 @@ Tests:
   - TestNPUStreamingSessionRetractMixedChunk: retract + mixed-chunk
   - TestNPUStreamingSessionRetractLargePage: retract + page=128
   - TestNPUStreamingSessionEagle: EAGLE3 spec v1 (overlap disabled)
-  - TestNPUStreamingSessionEagleV2: EAGLE3 spec v2 (overlap on)
+  - TestNPUStreamingSessionEagleV2: EAGLE3 spec v2 (overlap on, default env)
   - TestNPUStreamingSessionEagleRetractLargePage: EAGLE3 + retract + page=128
 """
 
@@ -26,8 +29,8 @@ import unittest
 from sglang.srt.environ import envs
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.ascend.test_ascend_utils import (
-    EAGLE3_LLAMA3_1_INSTRUCT_8B_WEIGHTS_PATH,
-    LLAMA_3_1_8B_INSTRUCT_WEIGHTS_PATH,
+    QWEN3_8B_EAGLE3_WEIGHTS_PATH,
+    QWEN3_8B_WEIGHTS_PATH,
 )
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.kits.streaming_session_kit import StreamingSessionKitMixin
@@ -101,7 +104,7 @@ class TestNPUStreamingSessionRetractMixedChunk(
     prefill chunks small enough to exercise mixed-chunk interleaving.
     """
 
-    model = LLAMA_3_1_8B_INSTRUCT_WEIGHTS_PATH
+    model = QWEN3_8B_WEIGHTS_PATH
     extra_args = [
         *_NPU_COMMON_ARGS,
         "--chunked-prefill-size",
@@ -124,7 +127,7 @@ class TestNPUStreamingSessionRetractLargePage(
     4096 is divisible by 128.
     """
 
-    model = LLAMA_3_1_8B_INSTRUCT_WEIGHTS_PATH
+    model = QWEN3_8B_WEIGHTS_PATH
     extra_args = [
         *_NPU_COMMON_ARGS,
         "--chunked-prefill-size",
@@ -136,12 +139,13 @@ class TestNPUStreamingSessionRetractLargePage(
 
 
 # Common EAGLE3 spec args; reused by Eagle/EagleV2/EagleRetractLargePage variants.
-# Uses NPU-local draft weights instead of the HF hub DEFAULT_DRAFT_MODEL_EAGLE3.
+# Uses NPU-local Qwen3-8B_eagle3 draft weights (Llama-3.1-8B + EAGLE3-Llama-3.1-8B
+# is incompatible with NPU aclnnRmsNorm — see module docstring).
 _EAGLE3_SPEC_ARGS = [
     "--speculative-algorithm",
     "EAGLE3",
     "--speculative-draft-model-path",
-    EAGLE3_LLAMA3_1_INSTRUCT_8B_WEIGHTS_PATH,
+    QWEN3_8B_EAGLE3_WEIGHTS_PATH,
     "--speculative-num-steps",
     "3",
     "--speculative-eagle-topk",
@@ -157,7 +161,7 @@ class TestNPUStreamingSessionEagle(
     """EAGLE3 spec v1 (overlap disabled); offset=-1 — see kit's note."""
 
     kv_inherit_offset = -1
-    model = LLAMA_3_1_8B_INSTRUCT_WEIGHTS_PATH
+    model = QWEN3_8B_WEIGHTS_PATH
     extra_args = [
         *_NPU_COMMON_ARGS,
         "--disable-overlap-schedule",
@@ -173,9 +177,14 @@ class TestNPUStreamingSessionEagle(
 class TestNPUStreamingSessionEagleV2(
     NPUStreamingSessionExtraServerBase, StreamingSessionKitMixin
 ):
-    """EAGLE3 spec v2 (overlap on)."""
+    """EAGLE3 spec v2 (overlap on).
 
-    model = LLAMA_3_1_8B_INSTRUCT_WEIGHTS_PATH
+    Note: `SGLANG_ENABLE_SPEC_V2` defaults to True in current sglang; no
+    explicit env override needed. Older CI images may not have this attr
+    on `Envs`, so overriding it would raise `AttributeError`.
+    """
+
+    model = QWEN3_8B_WEIGHTS_PATH
     extra_args = [
         *_NPU_COMMON_ARGS,
         "--chunked-prefill-size",
@@ -184,10 +193,7 @@ class TestNPUStreamingSessionEagleV2(
         "--page-size",
         "4",
     ]
-    env_overrides = [
-        ("SGLANG_ENABLE_SPEC_V2", True),
-        ("SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN", True),
-    ]
+    env_overrides = [("SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN", True)]
 
 
 class TestNPUStreamingSessionEagleRetractLargePage(
@@ -197,7 +203,7 @@ class TestNPUStreamingSessionEagleRetractLargePage(
     (spec tail + retract alloc-commit gap + page alignment)."""
 
     kv_inherit_offset = -1
-    model = LLAMA_3_1_8B_INSTRUCT_WEIGHTS_PATH
+    model = QWEN3_8B_WEIGHTS_PATH
     extra_args = [
         *_NPU_COMMON_ARGS,
         "--disable-overlap-schedule",
