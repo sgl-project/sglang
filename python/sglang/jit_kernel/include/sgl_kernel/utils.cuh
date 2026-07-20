@@ -65,6 +65,8 @@ using fp16x2_t = __half2;
 using bf16x2_t = __nv_bfloat162;
 using fp8x2_e4m3_t = __nv_fp8x2_e4m3;
 using fp8x2_e5m2_t = __nv_fp8x2_e5m2;
+using fp8x4_e4m3_t = __nv_fp8x4_e4m3;
+using fp8x4_e5m2_t = __nv_fp8x4_e5m2;
 
 using fp32x4_t = float4;
 #else
@@ -78,6 +80,8 @@ using fp16x2_t = half2;
 using bf16x2_t = __hip_bfloat162;
 using fp8x2_e4m3_t = uint16_t;
 using fp8x2_e5m2_t = uint16_t;
+using fp8x4_e4m3_t = uint32_t;
+using fp8x4_e5m2_t = uint32_t;
 using fp32x4_t = float4;
 #endif
 
@@ -214,9 +218,7 @@ SGL_DEVICE auto offset(const void* ptr, U... offset) -> const void* {
 
 }  // namespace pointer
 
-/// PTX pragma that lets the compiler spill registers into otherwise-unused
-/// shared memory instead of local memory. The radix kernels run at occupancy 2
-/// (32 regs/thread) and rely on this to avoid local-memory traffic.
+/// PTX pragma that lets the compiler spill registers into shared memory
 SGL_DEVICE void enable_smem_spilling() {
 #if defined(__CUDA_ARCH__) && CUDART_VERSION >= 13000
   asm(".pragma \"enable_smem_spilling\";");
@@ -376,5 +378,12 @@ struct LaunchKernel {
   const DebugInfo m_location;
   cudaLaunchAttribute m_attrs[2];
 };
+
+// The empty-true-branch if/else form keeps a trailing `else` in user code
+// bound to the user's `if`, not to the macro's.
+#define CHECK_CUDA(COND)                                              \
+  if (const auto error = (COND); error == ::cudaSuccess) [[likely]] { \
+  } else                                                              \
+    ::host::Error() << "CUDA error: " << ::cudaGetErrorString(error) << ". "
 
 }  // namespace host
