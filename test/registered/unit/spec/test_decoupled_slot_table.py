@@ -184,10 +184,11 @@ class TestPlanLanding(CustomTestCase):
 
     def test_duplicate_rid_raises(self):
         # Duplicate rids resolve to the same seat, making the vectorized
-        # scatter's winning row/stamp nondeterministic -- reject before routing.
+        # scatter's winning row/stamp nondeterministic. Rejected by
+        # block.validate() (called on the ingest path), which raises ValueError.
         table = DecoupledSlotTable()
         table.assign("a", pool_idx=3, generation=7)
-        with self.assertRaises(RuntimeError):
+        with self.assertRaises(ValueError):
             plan_landing(_block(["a", "a"], [10, 20]), table, verifier_rank=0)
 
 

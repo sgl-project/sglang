@@ -36,7 +36,6 @@ import torch
 
 from sglang.srt.speculative.decoupled_slot_table import (
     DecoupledSlotTable,
-    LandingPlan,
     plan_landing,
 )
 from sglang.srt.speculative.decoupled_spec_io import DraftEnumerationBufferBatch
@@ -85,12 +84,20 @@ class DecoupledEnumBuffer:
         self.buf_count = 2 if enable_overlap else 1
         self._write_slot = 0
 
+        # int64 (torch.long) matches the forward's token-id convention: these
+        # rows are consumed as input_ids (int64) and are the analog of
+        # FutureMap.output_tokens_buf / EagleDraftInput.draft_token (both int64).
+        # int32 would suffice numerically (vocab < 2^31) but would force an
+        # up-cast on the forward path -- do NOT model this on req_to_token
+        # (int32), which is a KV-slot index pool, not vocab ids.
         self.enum_tokens = [
             torch.zeros((self.seats, self.row_width), dtype=torch.int64, device=device)
             for _ in range(self.buf_count)
         ]
         # Stamp travels as two parallel per-seat arrays; both start at the
-        # sentinel so an unwritten seat reads as fallback.
+        # sentinel so an unwritten seat reads as fallback. int64 matches the
+        # values compared downstream: ReqToTokenPool.req_generation and the
+        # request's committed length / seq_lens (all int64).
         self.enum_base_committed_lens = [
             torch.full((self.seats,), _STAMP_EMPTY, dtype=torch.int64, device=device)
             for _ in range(self.buf_count)
@@ -111,14 +118,13 @@ class DecoupledEnumBuffer:
         self,
         block: DraftEnumerationBufferBatch,
         slot_table: DecoupledSlotTable,
-    ) -> LandingPlan:
+    ) -> None:
         """Scatter an incoming block's rows into their seats on the GPU.
 
         Called by the recv daemon. Routing (which rows survive, which are dropped
         because their request left) is decided host-side by
         :func:`plan_landing`; the surviving rows plus their stamps are scattered
-        into the write-side buffer at their seats. Returns the plan so the caller
-        can observe / log drops.
+        into the write-side buffer at their seats.
 
         Phase 1b: the scatter runs on the current stream (SYNC). Phase 6.3 moves
         it onto a private copy stream with pinned staging + non_blocking H2D so
@@ -143,13 +149,17 @@ class DecoupledEnumBuffer:
             )
         plan = plan_landing(block, slot_table, verifier_rank=self.verifier_rank)
         if not plan.writes:
-            return plan
+            return
 
-        # Build the host-side scatter tensors from the surviving rows. Reshape the
-        # block's whole flat token tuple ONCE (single C-level pass, host-side)
-        # into per-row form; C-order reshape makes rows_host[i] exactly equal to
-        # block.row_tokens(i). (Phase 6.3 will stage these through a reusable
-        # pinned buffer instead of a fresh allocation per land.)
+        # Build the host-side scatter tensors from the surviving rows and copy
+        # them to the device. Every host->device transfer below (the .to(device)
+        # and each torch.tensor(..., device=self.device)) is a BLOCKING copy from
+        # pageable host memory in phase 1b, on the recv daemon thread. Phase 6.3
+        # moves these onto a private copy stream with pinned staging +
+        # non_blocking H2D so the daemon can write ahead of the forward.
+        # rows: reshape the block's whole flat token tuple ONCE (single C-level
+        # pass); C-order reshape makes rows_host[i] exactly equal to
+        # block.row_tokens(i).
         pool_indices = torch.tensor(
             [w.pool_idx for w in plan.writes], dtype=torch.int64, device=self.device
         )
@@ -168,7 +178,7 @@ class DecoupledEnumBuffer:
                 [w.row_index for w in plan.writes], dtype=torch.int64
             )
             rows_selected = rows_host[row_indices]
-        rows = rows_selected.to(device=self.device)
+        rows = rows_selected.to(device=self.device)  # blocking H2D (pageable src)
         base_committed_lens = torch.tensor(
             [w.base_committed_len for w in plan.writes],
             dtype=torch.int64,
@@ -184,7 +194,6 @@ class DecoupledEnumBuffer:
         self.enum_tokens[slot][pool_indices] = rows
         self.enum_base_committed_lens[slot][pool_indices] = base_committed_lens
         self.enum_generations[slot][pool_indices] = generations
-        return plan
 
     def gather(
         self, req_pool_indices: torch.Tensor

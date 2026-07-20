@@ -33,11 +33,22 @@ if TYPE_CHECKING:
 class SlotBinding(msgspec.Struct, frozen=True, gc=False):
     """A request's current seat plus the generation captured when it was bound.
 
-    ``(pool_idx, generation)`` identifies one occupancy episode of a
-    ``ReqToTokenPool`` seat: if the seat is freed and reassigned to another
-    request, ``req_generation[pool_idx]`` is bumped, so this binding's
-    ``generation`` no longer matches the seat's live generation and any data
-    landed under it is rejected downstream.
+    ``(pool_idx, generation)`` distinguishes occupancy episodes of a
+    ``ReqToTokenPool`` seat *only for reuse that goes through* ``alloc()``:
+    ``alloc`` bumps ``req_generation[pool_idx]``, so after a normal free +
+    realloc a stale binding's ``generation`` no longer matches the seat's live
+    generation and its data is rejected downstream. This is a BACKUP net, not
+    the primary one -- the primary defense is :meth:`DecoupledSlotTable.remove`
+    on the request's close / finish path, which drops the binding so a late
+    block is dropped before it can reach a reused seat.
+
+    The generation net does NOT cover seat handoffs that bypass ``alloc()``:
+    a streaming session moves a seat directly between turns
+    (``SessionSlot.save_from_req`` / ``restore_to_req`` copy ``req_pool_idx``
+    with no alloc/free, so ``req_generation`` is unchanged), so a stale binding
+    would still match. For those, the finish-path ``remove()`` is the ONLY
+    defense. TODO(phase 5b): ensure the scheduler calls ``remove()`` on every
+    finish path, streaming-session turn boundaries included.
     """
 
     pool_idx: int
@@ -101,6 +112,18 @@ class DecoupledSlotTable:
         with self._lock:
             return self._rid_to_slot.get(rid)
 
+    def lookup_many(self, rids: list[str]) -> list[Optional[SlotBinding]]:
+        """Look up many rids under a single lock acquisition.
+
+        The recv daemon routes a whole enumeration block at once; taking the
+        lock once (instead of once per row) keeps it off the scheduler's rare
+        writes for all but one short critical section, and gives a consistent
+        snapshot of the mapping for the block. The result is positionally
+        aligned with ``rids`` (``None`` where a rid is not bound).
+        """
+        with self._lock:
+            return [self._rid_to_slot.get(rid) for rid in rids]
+
     def __len__(self) -> int:
         with self._lock:
             return len(self._rid_to_slot)
@@ -161,21 +184,14 @@ def plan_landing(
             f"src_drafter_rank={block.src_drafter_rank} "
             f"batch_size={block.batch_size} first_rid={first_rid}"
         )
+    # validate() also rejects duplicate rids (one row per request) -- see
+    # DraftEnumerationBufferBatch.validate.
     block.validate()
-    if len(set(block.rids)) != len(block.rids):
-        raise RuntimeError(
-            "Enumeration block has duplicate rids: duplicate rows resolve to the "
-            "same seat and make the vectorized scatter's winner nondeterministic "
-            "(rows and stamps could come from different source rows): "
-            f"dst_verifier_rank={block.dst_verifier_rank} "
-            f"src_drafter_rank={block.src_drafter_rank} "
-            f"batch_size={block.batch_size} rids={block.rids}"
-        )
+    # One lock acquisition for the whole block, then route against the snapshot.
+    bindings = slot_table.lookup_many(block.rids)
     writes: list[PlannedWrite] = []
     dropped: list[str] = []
-    for i in range(block.batch_size):
-        rid = block.rids[i]
-        binding = slot_table.lookup(rid)
+    for i, (rid, binding) in enumerate(zip(block.rids, bindings)):
         if binding is None:
             dropped.append(rid)
             continue
