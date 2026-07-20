@@ -251,7 +251,9 @@ def create_bench_cache(
         )
         _rid[0] += 1
         req_to_token_pool.alloc([req])
-        # fabricated reqs bypass alloc_for_extend, the normal creator of req.kv
+        # Fabricated reqs bypass alloc_for_extend, the normal creator of req.kv.
+        # SWA caching reads req.kv.swa_evicted_seqlen; give every req the same
+        # zero-initialized kv info the unittest suite's _make_req sets.
         req.kv = ReqKvInfo(kv_allocated_len=0, swa_evicted_seqlen=0)
         return req
 
