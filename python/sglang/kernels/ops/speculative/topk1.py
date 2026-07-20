@@ -406,39 +406,30 @@ def target_verify_topk1_is_supported(
     seq_lens: torch.Tensor,
 ) -> bool:
     """Return whether the tensors satisfy the fused verifier's contract."""
-    if (
-        next_token_logits.ndim != 2
-        or next_token_logits.device.type != "cuda"
-        or next_token_logits.stride(1) != 1
-        or next_token_logits.dtype not in (torch.float16, torch.bfloat16, torch.float32)
-        or candidates.ndim != 2
-        or candidates.dtype != torch.long
-        or not candidates.is_contiguous()
-        or retrieve_index.shape != candidates.shape
-        or retrieve_index.dtype != torch.long
-        or not retrieve_index.is_contiguous()
-        or retrieve_next_token.shape != candidates.shape
-        or retrieve_next_token.dtype != torch.long
-        or not retrieve_next_token.is_contiguous()
-        or seq_lens.ndim != 1
-        or not seq_lens.is_contiguous()
-        or seq_lens.dtype not in (torch.int32, torch.int64)
-    ):
+    if next_token_logits.ndim != 2 or candidates.ndim != 2:
         return False
 
     batch_size, num_draft_tokens = candidates.shape
-    total_rows, vocab_size = next_token_logits.shape
-    if (
-        num_draft_tokens <= 0
-        or vocab_size <= 0
-        or total_rows != batch_size * num_draft_tokens
-        or seq_lens.shape[0] != batch_size
-    ):
-        return False
-
-    return all(
-        tensor.device == next_token_logits.device
-        for tensor in (candidates, retrieve_index, retrieve_next_token, seq_lens)
+    expected_shape = candidates.shape
+    index_tensors = (candidates, retrieve_index, retrieve_next_token)
+    return (
+        next_token_logits.device.type == "cuda"
+        and next_token_logits.stride(1) == 1
+        and next_token_logits.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        and num_draft_tokens > 0
+        and next_token_logits.shape[1] > 0
+        and next_token_logits.shape[0] == batch_size * num_draft_tokens
+        and all(
+            tensor.shape == expected_shape
+            and tensor.dtype == torch.long
+            and tensor.is_contiguous()
+            and tensor.device == next_token_logits.device
+            for tensor in index_tensors
+        )
+        and seq_lens.shape == (batch_size,)
+        and seq_lens.dtype in (torch.int32, torch.int64)
+        and seq_lens.is_contiguous()
+        and seq_lens.device == next_token_logits.device
     )
 
 

@@ -6,7 +6,6 @@ import torch
 
 from sglang.kernels.ops.speculative.topk1 import (
     TargetVerifyTopk1Output,
-    target_verify_topk1_is_supported,
     target_verify_topk1_postprocess,
 )
 from sglang.srt.speculative.spec_info import SpecInputType
@@ -96,13 +95,13 @@ def maybe_eagle_sample_target_verify_topk1(
         return None
     candidates = draft_tokens.view(batch_size, verify_input.draft_token_num)
     logits = logits_output.next_token_logits
-
-    if not target_verify_topk1_is_supported(
-        logits,
-        candidates,
-        verify_input.retrieve_index,
-        verify_input.retrieve_next_token,
-        batch.seq_lens,
+    if (
+        logits.ndim != 2
+        or logits.device.type != "cuda"
+        or logits.stride(1) != 1
+        or logits.dtype not in (torch.float16, torch.bfloat16, torch.float32)
+        or logits.shape[0] != candidates.numel()
+        or logits.shape[1] == 0
     ):
         return None
 

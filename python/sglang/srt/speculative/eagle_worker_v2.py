@@ -892,11 +892,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             )
             # Cast before entering the plan stream. Casting there creates a
             # cross-stream dependency that can race with MTP draft-extend.
-            input_ids = batch_result.next_token_ids.to(torch.int64)
+            draft_extend_input_ids = batch_result.next_token_ids.to(torch.int64)
         else:
             num_correct_drafts = target_verify_topk1_output.num_correct_drafts
             select_index = target_verify_topk1_output.select_index
-            input_ids = target_verify_topk1_output.draft_input_ids
+            draft_extend_input_ids = target_verify_topk1_output.draft_input_ids
 
         # Batch 2: Draft extend
         draft_extend_input = EagleDraftExtendInput(
@@ -914,7 +914,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             forward_batch = prepare_for_draft_extend(
                 draft_extend_input,
                 batch,
-                input_ids,
+                draft_extend_input_ids,
                 self.speculative_num_draft_tokens,
                 self.draft_runner,
                 self.cuda_graph_runner_for_draft_extend,
