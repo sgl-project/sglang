@@ -1,0 +1,1443 @@
+---
+title: "RFC: Commit-gated decode preallocation for PD optimistic prefill"
+description: "Prevent cross-stage capacity inversion—decode preallocation only after prefill scheduler commits the matching request."
+sidebarTitle: "PD commit-gated preallocation"
+tag: "DRAFT"
+---
+
+<Warning>
+  This RFC proposes an experimental protocol. It does not describe an implemented
+  or enabled feature. The existing path must remain unchanged when the new
+  protocol is disabled.
+</Warning>
+
+## Summary
+
+Optimistic prefill lets the prefill worker (P) schedule a request before the
+decode worker (D) finishes bootstrapping. The problem: D can independently
+preallocate decode KV and request slots. This means two requests can grab P and
+D capacity in opposite orders:
+
+```text
+P: request A completed prefill and holds source KV while waiting for D(A)
+D: request B completed preallocation and holds decode KV while waiting for P(B)
+
+P cannot admit B because P capacity is held by A
+D cannot preallocate A because D capacity is held by B
+```
+
+Polling does not resolve this dependency cycle. The system eventually escapes
+through bootstrap timeout, failure cleanup, or unrelated capacity release, so
+this is a timeout-bounded capacity stall rather than a process-level permanent
+deadlock.
+
+This RFC proposes a simple ordering rule:
+
+```text
+P final scheduler admission
+          happens before
+D scarce-capacity preallocation
+```
+
+SMG still dispatches the P and D HTTP requests concurrently. D may create a
+receiver and bounded control state immediately, but it remains `D_REGISTERED`
+and owns no model capacity. D enters the existing preallocation queue only
+after its scheduler verifies an immutable `COMMITTED` result produced by the P
+scheduler for the exact request pair.
+
+D owns retries for both commit notification and transfer completion. P stores
+immutable scheduler snapshots and never runs a per-request reliable outbox.
+The protocol uses complete pair identity, serving-epoch fencing, bounded
+control resources, and local phase deadlines.
+
+Version 1 intentionally disables SMG internal rerouting after the pair reaches
+the `PAIR_BOUND` fence defined below. An ambiguous failure returns an error and
+triggers best-effort identity-bound cancellation; it does not create another
+P/D pair. Safe transparent rerouting requires scheduler-confirmed terminal
+proofs from both workers and is deferred to a follow-up design.
+
+## Status and evidence
+
+- Analysis baseline: SGLang `main` at `b3570a453108`
+- Tracking issue: [#31473](https://github.com/sgl-project/sglang/issues/31473)
+- CPU reproducer: [optimistic capacity inversion reproducer](https://gist.github.com/N3u0ns/419458d91f1329c25062e7584a76a908)
+- Current default: `optimistic_prefill_attempts=0` (feature off by default)
+- Implementation status: not implemented
+- GPU performance: not measured; the real-GPU A/B gate below is required before rollout
+
+The relevant current boundaries already exist in SGLang:
+
+- P can return a still-bootstrapping request from
+  `PrefillBootstrapQueue.pop_bootstrapped()` for optimistic prefill.
+- D acquires request slots, KV, metadata buffers, and related ownership in
+  `DecodePreallocQueue.pop_preallocated()`.
+- SMG already prepares and dispatches the P and D requests concurrently.
+- `bootstrap_pair_key` already exists in the request schema.
+
+The proposal adds an eligibility fence at the existing D preallocation
+boundary without replacing the existing admission or allocation policy, and
+without serializing the P/D HTTP dispatch.
+
+## Goals
+
+Version 1 has four goals:
+
+1. Eliminate the reproduced P/D capacity inversion by construction.
+2. Keep P GPU launch independent of D, the control network, and acknowledgments.
+3. Bound every new queue, correlation, payload, snapshot, and tombstone.
+4. Keep the disabled path behaviorally and measurably unchanged.
+
+## Non-goals
+
+Version 1 explicitly does not cover:
+
+- Transparent SMG rerouting after `PAIR_BOUND`
+- Exactly-once execution across router crashes or client retries
+- NIXL, chunked prefill, PP, DP, multi-rank transfer, retraction, rebootstrap,
+  or runtime topology changes
+- A generic distributed deadlock detector
+- Revocable decode reservations
+- A new Mooncake data-plane executor or transfer-service fairness guarantee
+- New hard timeouts for requests already in `D_RUNNING`
+
+These exclusions keep the first implementation focused on the resource-ordering
+fix and local failure handling. They don't weaken the core safety invariant.
+
+## Maintainer decisions requested
+
+The first review needs decisions on nine points:
+
+1. Use `P final admission -> D scarce preallocation` as the ordering rule.
+2. Accept the proposed no-retraction P scheduler hook in the narrow support cell.
+3. Confirm `D_REGISTERED` receiver/topology setup owns no listed model capacity.
+4. Bind compatibility to canonical role-capability and actual pair-policy
+   digests, not protocol-version equality.
+5. Disable post-`PAIR_BOUND` rerouting and make the first enforcement PR change
+   the current `RetryExecutor`/early-error supervisor behavior.
+6. Use an isolated V1 Mooncake metadata/status namespace with scheduler-only
+   state transitions.
+7. Reserve the complete deduplicated wait/metadata/status channel lease set
+   before D eligibility.
+8. Use fixed logical sequences plus scheduler-owned success/cancel
+   terminalization and replay.
+9. Require the reservation, deadline, correctness, and performance gates below
+   before rollout.
+
+If decisions 1-4, complete pre-eligibility control reservation, or the
+scheduler single-writer rule cannot hold, the correctness contract is
+incomplete. Implementation should stop rather than add acknowledgments or
+silently weaken a support cell.
+
+## Version 1 support cell
+
+The first enforceable cell is intentionally narrow:
+
+| Dimension | Version 1 requirement |
+| --- | --- |
+| Transfer backend | Mooncake |
+| Parallelism | `TP=CP=PP=DP=EP=1` |
+| Prefill | Non-chunked |
+| Scheduler | Normal scheduler; overlap is a separate rollout cell |
+| Decode radix cache | Disabled in the first rollout cell |
+| Request expansion | `batch=1`, `n=1` |
+| Generation | Finite positive `max_new_tokens` |
+| Tokenizer | One tokenizer |
+| Optimistic attempts | `optimistic_prefill_attempts=1` |
+| Router | SGLang Model Gateway HTTP PD router |
+| Retraction and rebootstrap | Disabled |
+| Runtime mutation and active-pair pause | Disabled |
+| Staging, HiCache, speculative decoding | Disabled |
+| SMG post-`PAIR_BOUND` reroute | Disabled |
+| Clock discipline | Actual SMG/P/D wall-clock offset is bounded by the selected `max_clock_skew_ms` |
+
+A new experimental flag, separate from
+`optimistic_prefill_attempts`, enables the protocol. The flag name is an
+implementation decision. Unsupported combinations fail closed or use the
+existing protocol before either worker request is sent. A request must never
+be partially enabled.
+
+## Core invariant and progress argument
+
+### What P_COMMITTED means
+
+`P_COMMITTED` does not mean that the HTTP request was received, that the request
+was queued, or that a Mooncake sender was created.
+
+The P scheduler may only commit when all of the following hold:
+
+1. The request is in the final admitted prefill batch.
+2. Its request slot and source KV have been acquired.
+3. The non-chunked request will not require another P admission to complete
+   prefill.
+4. The supported scheduler path will not retract, yield, or rebootstrap it.
+5. The GPU forward has not been launched yet.
+
+The transition and batch admission occur in the same scheduler thread:
+
+```python
+entry = pair_registry.must_get(req.request_uid)
+assert entry.state == P_PRECOMMIT
+assert req_is_in_final_admitted_batch(req)
+assert req_will_not_need_another_prefill_admission(req)
+
+entry.state = P_COMMITTED
+entry.commit_generation = 1
+entry.post_commit_readiness_deadline = now() + p_post_commit_readiness_timeout
+control_mailbox.mark_ready(entry)  # O(1), local, non-blocking
+
+launch_forward(batch)
+```
+
+The commit hook performs no socket I/O, RPC, collective, allocator operation,
+or wait. If an SGLang scheduler mode cannot provide this linearization point,
+that mode cannot advertise support for version 1.
+
+### D scarce capacity
+
+Before verifying the matching commitment, D must not:
+
+- obtain a slot from `req_to_token_pool`;
+- allocate device or host KV;
+- reserve decode tokens or a model metadata buffer;
+- lock a radix node or start cache loadback;
+- enter the existing decode preallocation queue;
+- enter a running batch or generate a token.
+
+D may create bounded identity state, receiver topology, transport handles, and
+logical control correlations. These are control resources, not model capacity,
+and are covered by separate hard budgets.
+
+### Why the capacity cycle is impossible
+
+The enforce path guarantees:
+
+```text
+D holds scarce capacity
+  → D state ≥ D_ELIGIBLE
+  → D verified COMMITTED (same request, same generation)
+  → P completed final admission for that request
+  → P doesn't need more admission capacity to finish it
+```
+
+Now suppose D holds capacity for B while waiting for P(B). The invariant tells
+us P already finished final admission for B—but that contradicts the original
+capacity-cycle condition where P could not admit B because A was holding its
+capacity.
+
+D might still wait on transfer or fail, but every post-commit phase has a local
+deadline and cleanup path. The cross-stage capacity cycle is gone by design.
+
+## State machines
+
+P owns the following scheduler state:
+
+```text
+P_EMPTY -> P_REGISTERED -> P_PRECOMMIT
+P_EMPTY ----------------> P_PRECOMMIT
+P_PRECOMMIT -> P_COMMITTED -> P_TRANSFERRING
+  -> P_SUCCESS_CLEANUP -> P_TERMINAL(SUCCESS)
+
+any nonterminal state
+  -> P_CANCELLING -> P_TERMINAL(FAILED|CANCELLED)
+```
+
+D owns:
+
+```text
+D_EMPTY -> D_REGISTERED -> D_COMMIT_RECEIVED -> D_ELIGIBLE
+                       \----------------------> D_ELIGIBLE
+  -> D_PREALLOCATED -> D_TRANSFERRING -> D_RUNNING
+  -> D_SUCCESS_CLEANUP -> D_TERMINAL(SUCCESS)
+
+any nonterminal state
+  -> D_CANCELLING -> D_TERMINAL(FAILED|CANCELLED)
+```
+
+`D_REGISTERED` performs receiver/topology setup and commit waiting in parallel.
+`D_COMMIT_RECEIVED` is used when commitment wins that race; if local setup is
+already ready, the scheduler may atomically go from `D_REGISTERED` to
+`D_ELIGIBLE` while recording the same validated commitment.
+`D_ELIGIBLE` is the only state allowed to enter the existing decode
+preallocation queue.
+
+`P_REGISTERED` is the control-only WAIT-first state. It owns no request slot,
+KV, cache lock, model metadata buffer, or runnable batch membership. A matching
+HTTP body may merge it into `P_PRECOMMIT`; an expired, cancelled, or mismatched
+body may not bypass it or create a second entry.
+
+`P_COMMITTED` is a two-condition rendezvous, not proof that prefill compute has
+finished. Its scheduler entry contains monotonic `prefill_compute_done` and
+`metadata_ready` bits. GPU/batch completion and metadata registration set those
+bits through scheduler commands in either order. Only the scheduler may enter
+`P_TRANSFERRING`, and only when both are true; metadata that arrives while the
+committed forward is still running never starts an early KV transfer.
+
+Each request has exactly one protocol state and at most one primary admission
+queue. Auxiliary batch, inflight, result, transport, and cleanup ownership is
+tracked explicitly by the ownership ledger. Protocol-state and primary-queue
+movement are atomic scheduler-thread operations.
+
+### One acquisition graph
+
+The state names above correspond to four gates; individual message handlers do
+not invent additional resource-acquisition rules:
+
+```text
+P WAIT first -> bounded P_REGISTERED subset, zero model capacity
+P HTTP accepted -> P_FULL_CONTROL_READY -> P_PRECOMMIT
+P final scheduler admission/allocation -> P_COMMITTED -> GPU launch
+
+D HTTP accepted -> D_FULL_CONTROL_READY -> D_REGISTERED
+D commitment + receiver/channel readiness -> D_ELIGIBLE
+D allocator entry -> D_PREALLOCATED
+```
+
+`P_FULL_CONTROL_READY` means that the full P row in the reservation table is
+owned. It is required before `P_PRECOMMIT`, whether HTTP or WAIT arrived first,
+and therefore before P can acquire model capacity. `D_FULL_CONTROL_READY` means
+that the full D row, including the complete channel lease set, is owned before
+`D_REGISTERED`. `D_ELIGIBLE` additionally requires the matching immutable
+commitment and ready non-scarce receiver/channel setup.
+
+After either full-control gate and until P terminalizes or D enters
+`D_RUNNING`/earlier terminal cleanup, a protocol phase may consume or release
+only the pair's reserved resources. It may not acquire a generic command slot,
+correlation, response handle, payload byte, control-channel entry, cleanup slot,
+or tombstone slot. Existing decode-generation scheduling after `D_RUNNING` and
+application output backpressure are not new protocol resources. A failure at
+either gate terminalizes a zero-model-capacity entry. This single acquisition
+graph applies to normal progress, duplicate and reconnected waits, success,
+failure, cancel, and deadline cleanup.
+
+The end-to-end lifecycle is therefore fixed:
+
+| Event | Scheduler transition | Model-capacity effect |
+| --- | --- | --- |
+| Valid unknown commit wait at P | `P_EMPTY -> P_REGISTERED` | None |
+| Matching P HTTP body and full-control gate | `P_EMPTY/P_REGISTERED -> P_PRECOMMIT` | None |
+| P final admission/allocation | `P_PRECOMMIT -> P_COMMITTED` | P acquires; no later P admission required |
+| Valid D HTTP body and full-control gate | `D_EMPTY -> D_REGISTERED` | None |
+| Matching commitment plus local readiness | `D_REGISTERED/D_COMMIT_RECEIVED -> D_ELIGIBLE` | None |
+| Existing D preallocator accepts eligible request | `D_ELIGIBLE -> D_PREALLOCATED` | D acquires |
+| D arms transfer and submits V1 metadata | `D_PREALLOCATED -> D_TRANSFERRING` | No new generic control resource |
+| P forward completion or matching metadata arrives first | Set one `P_COMMITTED` readiness bit | No transfer yet |
+| Both P readiness bits are true | `P_COMMITTED -> P_TRANSFERRING` | Submit transfer and arm transfer deadline |
+| First immutable SUCCESS | P cleanup/terminal; `D_TRANSFERRING -> D_RUNNING` | P releases; D retains runtime ownership |
+| Failure, cancel, or phase deadline | Current nonterminal -> cancelling -> terminal | Release every local owner exactly once |
+
+An event that is not valid for the current state can only replay an already
+fixed result or be rejected/dropped as stale. It cannot take an alternative
+transition, reacquire a released owner, or create an entry in another queue.
+
+## Pair identity and serving-epoch fence
+
+SMG generates a random 128-bit `bootstrap_pair_key` after selecting P and D.
+It injects a private, role-specific envelope into both worker requests:
+
+```text
+dispatch_protocol_version
+request_schema_version
+role
+bootstrap_room
+bootstrap_pair_key
+expected_p_instance_epoch
+expected_d_instance_epoch
+expected_p_capability_digest
+expected_d_capability_digest
+pair_policy_version
+pair_policy_digest
+support_cell_id
+issued_at_unix_ms
+not_after_unix_ms
+pair_cancel_protocol_version
+wait_commit_protocol_version
+metadata_protocol_version
+transfer_status_protocol_version
+p_wait_commit_endpoint
+p_metadata_v1_endpoint
+p_transfer_status_endpoint
+p_pair_cancel_endpoint
+d_pair_cancel_endpoint
+```
+
+Each worker publishes a random, non-reused serving epoch and one immutable,
+role-specific capability digest. The digest binds every setting that can change
+the commit hook, ownership lifecycle, wire interpretation, or deadline proof:
+
+```text
+capability_digest = BLAKE2b-256(canonical_tuple(
+  capability_schema_version,
+  role,
+  dispatch/request/cancel/wait/metadata/transfer-status protocol versions,
+  transfer_backend,
+  metadata_and_status_framing,
+  KV_layout_page_size_and_dtype,
+  model_identity_and_immutable_weight_generation,
+  TP_CP_PP_DP_EP,
+  scheduler_event_loop_mode,
+  radix_mode,
+  chunk_retract_rebootstrap_flags,
+  staging_HiCache_speculative_and_runtime_mutation_flags,
+  request_expansion_and_max_new_tokens_policy,
+  deadline_policy_id,
+  max_clock_skew_ms_and_clock_health_policy,
+  metadata_size_policy_id,
+  control_endpoint_protocol_suite,
+  control_channel_and_budget_capability_limits,
+))
+
+pair_policy_digest = BLAKE2b-256(canonical_tuple(
+  pair_policy_schema_version,
+  pair_policy_version,
+  allowed_p_capability_digest,
+  allowed_d_capability_digest,
+  selected_deadline_and_replay_policy,
+  selected_control_channel_and_metadata_budgets,
+  selected_v1_support_cell_restrictions,
+))
+
+support_cell_id = BLAKE2b-256(canonical_tuple(
+  "sglang-pd-support-v1",
+  p_capability_digest,
+  d_capability_digest,
+  pair_policy_digest,
+))
+```
+
+`pair_policy_version` selects a canonical policy schema; it is not itself proof
+that two processes loaded identical policy contents. `pair_policy_digest` binds
+the actual immutable record, including the allowed P/D capability pair, timeout
+and replay-TTL relationships, selected control/channel/metadata budgets, and
+version 1 support-cell restrictions. SMG pins both discovery records, verifies
+that the digest pair and selected limits are allowed by the policy, computes the
+policy and support-cell digests, and injects them into each role envelope.
+
+P and D independently recompute their local role digest, verify the expected
+local digest, verify that the expected peer digest is allowed by the same pair
+policy, verify that every selected budget/deadline can be enforced locally,
+recompute `pair_policy_digest`, and then recompute `support_cell_id`. Any
+mismatch is rejected before tokenization, pair entry, waiter creation, or model
+allocation. Equal protocol or policy version numbers alone never make two
+workers compatible.
+
+Each discovery record also publishes the configured `max_clock_skew_ms` and a
+current bounded clock-health result. The configured bound is immutable and
+digest-bound; the health result is dynamic readiness state. SMG may select an
+enforce pair only while its own clock and both pinned worker clocks report that
+their maximum offset/uncertainty is within the selected bound. A stale or
+unhealthy result removes that support cell from new enforce dispatch before
+either role request is sent. Each worker rechecks its local health before
+creating unknown enforce state; a later health failure does not invalidate or
+resurrect an existing matching LIVE/tombstone entry.
+
+All cross-language hashes use a versioned canonical tuple encoding with fixed
+field order. Unsigned integers use fixed-width big-endian encoding, booleans use
+one byte, enums use assigned integer IDs, and every byte/string field uses a
+big-endian length prefix followed by raw bytes. UTF-8 is the only string
+encoding. Rust/Python runtime dictionaries, default JSON serialization, native
+integer layout, and delimiter-joined strings are not valid digest inputs.
+
+The request UID is derived from the complete pair identity, not from a user
+`rid`. Version 1 encodes `bootstrap_room` as unsigned 64-bit big-endian,
+`bootstrap_pair_key` and both epochs as 16 raw bytes, and `support_cell_id` as
+32 raw bytes inside the canonical tuple:
+
+```text
+request_uid = BLAKE2b-128(canonical_tuple(
+  "sglang-pd-commit-v1",
+  bootstrap_room,
+  bootstrap_pair_key,
+  expected_p_instance_epoch,
+  expected_d_instance_epoch,
+  support_cell_id,
+))
+```
+
+The domain string and tuple schema version are part of the encoded input. P, D,
+and SMG must pass shared golden vectors before advertising version 1 readiness.
+A worker rejects an envelope before pair creation if the local epoch,
+capability digests, pair policy, support cell, protocol versions, or expiry do
+not match.
+
+In later message schemas, `identity` is shorthand for the complete immutable
+set below; implementations send the fields explicitly rather than serializing
+an opaque language object:
+
+```text
+request_uid
+bootstrap_room
+bootstrap_pair_key
+p_instance_epoch
+d_instance_epoch
+support_cell_id
+```
+
+Terminal and cancel-first tombstones are retained until at least:
+
+```text
+max(
+  not_after + max_clock_skew_ms,
+  terminal_time + terminal_tombstone_ttl,
+)
+```
+
+At the first accepted envelope, each worker validates the wall-clock acceptance
+window once and converts its remaining duration, including the skew allowance,
+to a non-refreshable local monotonic retention deadline. The symbolic
+`not_after + max_clock_skew_ms` term above refers to that stored conversion; GC
+does not repeatedly compare wall clock. The accepted delivery window is capped
+by pair policy, so a forward wall-clock jump cannot create a negative deadline
+and a backward jump cannot extend retention.
+
+A body that arrives after the dispatch-expiry term is rejected by expiry even
+if its tombstone was later collected. A restarted worker has a new epoch and
+cannot accept an old envelope.
+
+Although SMG v1 never resends a role HTTP request after `PAIR_BOUND`, worker
+ingress is still duplicate-safe. A second body with the same complete identity
+and dispatch times receives a bounded duplicate-in-progress/terminal response
+from the existing scheduler entry; it cannot create another `Req`, queue owner,
+long-lived response producer, or model execution. Conflicting bodies are
+`INCOMPATIBLE`. A body matching a cancel-first or terminal tombstone replays the
+stored disposition and never resurrects execution.
+
+Private envelope fields must be overwritten by SMG and transported over a
+trusted internal path. The pair key is correlation data, not authentication.
+The two cancel endpoints are pinned with the selected serving epochs before
+`PAIR_BOUND`; SMG never rediscovers a target while cancelling the bound pair.
+
+## Commit protocol
+
+D is the only retry owner for worker-to-worker commit and transfer-status
+operations. After entering `D_REGISTERED`, it starts one logical long poll on
+the P endpoint pinned in the dispatch envelope:
+
+```text
+WaitCommitRequest {
+  versions,
+  request_uid,
+  bootstrap_room,
+  bootstrap_pair_key,
+  expected_p_instance_epoch,
+  expected_d_instance_epoch,
+  expected_p_capability_digest,
+  expected_d_capability_digest,
+  pair_policy_version,
+  pair_policy_digest,
+  support_cell_id,
+  dispatch_issued_at_unix_ms,
+  dispatch_not_after_unix_ms,
+  wait_seq,
+}
+```
+
+P returns one of:
+
+```text
+WaitCommitResponse {
+  identity,
+  wait_seq,
+  result: COMMITTED | RETRY_LATER | TERMINAL | EXPIRED | INCOMPATIBLE,
+  commit_generation?,
+  p_commit_time_unix_ms?,
+  p_post_commit_readiness_not_after_unix_ms?,
+  terminal_kind?,
+  retry_after_ms?,
+  reason?,
+}
+```
+
+Ordering rules:
+
+- If the D wait arrives first for an unknown identity, P may create bounded
+  `P_REGISTERED` only after validating the full identity, capability/policy
+  digests, both dispatch times, the maximum accepted delivery window, and
+  current time against `dispatch_not_after_unix_ms` plus the configured
+  clock-skew rule. The entry stores both times, owns only the WAIT-first subset
+  of the P reservation row, and starts its non-refreshable admission deadline.
+- When the matching P HTTP body arrives for `P_REGISTERED`, the scheduler must
+  validate the same identity and times and atomically upgrade to
+  `P_FULL_CONTROL_READY` before entering `P_PRECOMMIT`. If the upgrade cannot be
+  obtained, P terminalizes the zero-model-capacity waiter; it does not retain
+  the body for a later capacity race.
+- If the P HTTP request arrives first, P atomically obtains
+  `P_FULL_CONTROL_READY` and creates `P_PRECOMMIT`; the wait later attaches only
+  if both dispatch times and the full identity exactly match the stored
+  envelope.
+- If P is committed, duplicate waits replay the same immutable commitment.
+- If P is terminal, duplicate waits replay the same terminal result.
+- While P is `P_REGISTERED`/`P_PRECOMMIT`, the logical wait remains attached or
+  receives non-terminal RETRY_LATER. If a pre-running failure has entered
+  `P_CANCELLING`, P does not replay a stale COMMITTED response to a new wait; it
+  returns RETRY_LATER until local ownership is gone and TERMINAL is publishable.
+- For a matching existing LIVE or terminal entry, a wait may be answered after
+  `dispatch_not_after_unix_ms`; expiry prevents creation of unknown state, not
+  replay for an already accepted pair.
+- An unknown wait that is already outside the dispatch acceptance window
+  returns `EXPIRED` and creates no waiter, tombstone, or execution state.
+- A transient control-budget failure returns `RETRY_LATER`; it is not terminal
+  proof and cannot change identity.
+- `TERMINAL` is emitted only from a matching scheduler-owned terminal entry or
+  tombstone whose cleanup/ownership rule has completed. READY-state overload,
+  missing generic capacity, HTTP status, and transport failure can never be
+  translated into `TERMINAL`.
+- Identity, protocol, epoch, capability, policy, or support-cell mismatch
+  returns `INCOMPATIBLE` and cannot modify an existing entry.
+
+D accepts `COMMITTED` only with `commit_generation=1`. It treats `RETRY_LATER`
+as retryable only within the unchanged admission deadline. D accepts
+`TERMINAL`, `EXPIRED`, or `INCOMPATIBLE` only when the response wrapper itself
+matches the bound request and `wait_seq`; it then terminalizes its
+zero-scarce-capacity state and makes the D HTTP request return an enforce-pair
+error. SMG then best-effort cancels both originally pinned role endpoints and
+returns the error without rerouting. A response whose wrapper does not match is
+stale input and is dropped while the unchanged logical wait continues to its
+admission deadline.
+
+D keeps at most one logical in-flight wait. In version 1, `wait_seq=1`
+identifies that logical wait and remains unchanged across timeout, reconnect,
+backoff, and transport retry. Reconnect rebinds the same logical correlation;
+it does not create a new waiter or sequence. P does not maintain a reliable
+network outbox. A lost response is recovered by D repeating the identical
+logical wait and P replaying the immutable scheduler snapshot.
+
+Readiness requires a dedicated terminal commit-response replay window that
+covers D's complete admission-wait retry window:
+
+```text
+commit_terminal_replay_ttl
+>= D admission timeout
+ + maximum commit-wait retry backoff
+ + commit-response delivery margin
+```
+
+This bound is measured from P terminalization and is conservative: D's
+admission deadline began earlier. It ensures that loss of the first matching
+TERMINAL response cannot turn completed P cleanup into a D admission timeout.
+For a P tombstone that can answer a commit wait, retention is the maximum of the
+normal tombstone formula and
+`terminal_time + commit_terminal_replay_ttl`; unrelated D terminal tombstones
+do not pay this longer retention.
+
+The immutable COMMITTED snapshot fixes `p_commit_time_unix_ms` and
+`p_post_commit_readiness_not_after_unix_ms`; retries replay the same values. After
+validating COMMITTED, D requires enough policy-defined remaining time, including
+`max_clock_skew_ms` and a conservative preallocation/metadata-submit margin. It
+converts P's advertised wall-clock boundary once and atomically replaces its
+admission deadline with a positive, non-refreshable local monotonic post-commit
+deadline no later than that boundary. If the margin is already insufficient, D
+terminalizes before scarce allocation. A later clock adjustment never extends
+the stored deadline.
+
+D enters `D_ELIGIBLE` only after both the commitment and local non-scarce
+receiver preparation are ready. The existing preallocator must recheck the
+effective deadline and current receiver/channel readiness immediately before
+`_pre_alloc()`; queueing or a known disconnect cannot let an expired/unready
+commitment allocate. A reconnecting pair stays deadline-covered and owns zero
+scarce capacity until its already reserved lease is ready again. At P, metadata
+acceptance, committed-forward completion, and post-commit readiness timeout are
+serialized. The first readiness event only sets its bit and retains the
+post-commit deadline; the event that makes both bits true arms the transfer
+deadline before invalidating it. Timeout accepted first fixes FAILED, rejects a
+late readiness event, and cleans up. No wall-clock field replaces the local
+monotonic timers; it only fences cross-worker validity under the configured
+skew bound.
+
+The cross-worker fence assumes:
+
+```text
+actual wall-clock offset among SMG, P, and D <= max_clock_skew_ms
+```
+
+Rollout therefore requires NTP, chrony, or an equivalent monitored clock
+discipline. If any participant cannot prove the selected bound, SMG stops new
+enforce dispatch for the affected support cell. Already bound pairs continue
+under their unchanged local monotonic deadlines and scheduler-owned cleanup;
+clock-health loss is not terminal proof and does not cause rerouting. Wall
+clock is used only to reject a cross-worker commit or unknown late ingress.
+Safety, ownership release, and finite local retention never depend on wall-clock
+time moving forward or remaining synchronized.
+
+### Persistent peer-channel lease set
+
+D uses a hard-bounded cache of persistent multiplexed channels for
+`WAIT_COMMIT`, metadata, and `WAIT_TRANSFER_STATUS`. Its immutable discovery
+capability publishes a positive `max_pd_peer_channels` and the physical
+authority/protocol binding for every logical endpoint.
+
+The cache key includes normalized physical peer authority, P serving epoch, and
+the service/protocol suite. If multiple logical endpoints are carried by the
+same physical multiplexed connection, normalization deduplicates them to one
+key. If they use different authorities or transports, they require distinct
+keys. A new P epoch at the same address never inherits the old epoch's channel
+identity.
+
+Admission into `D_REGISTERED` atomically reserves the complete set of cache
+entries/leases required by the pinned `p_wait_commit_endpoint`,
+`p_metadata_v1_endpoint`, and `p_transfer_status_endpoint`. Connection setup may
+then run in parallel with P queueing, but every channel in the reserved set must
+be ready before `D_ELIGIBLE`. Receiving `COMMITTED` while setup is incomplete
+only moves D to deadline-covered `D_COMMIT_RECEIVED`; it does not permit
+preallocation.
+
+If any lease or reserved cache slot is unavailable, D releases the partial set
+and terminalizes the pair before acquiring scarce capacity. It must not wait
+until `D_PREALLOCATED` to acquire a metadata or status channel, borrow a generic
+channel slot, or create a temporary unbounded socket. Thus a pair that owns D
+model capacity already owns every peer-channel resource required to finish the
+transfer protocol.
+
+Each pre-running D pair holds one logical lease/refcount for each key in the
+deduplicated set. After D accepts a matching SUCCESS and atomically enters
+`D_RUNNING`, it releases the pair's complete lease set; no post-success control
+send owns or extends that lease. A failed pair releases its complete set during
+terminal cleanup. Only
+zero-refcount idle channels may be evicted, using bounded idle TTL/LRU. The
+budget includes file descriptors, socket buffers, reconnect state, reserved but
+not-yet-connected entries, idle cache entries, and the bounded old/new socket
+overlap needed to reconnect one key. Reconnect reuses the same entry/lease; it
+cannot temporarily allocate an uncharged second cache entry. Cache exhaustion
+returns an error through SMG without rerouting the enforce request.
+
+For the first SGLang/Mooncake cell, the preferred mapping is one bidirectional,
+multiplexed control service per P authority/epoch; the three logical operations
+then deduplicate to one physical key. The protocol still defines a lease set so
+an implementation cannot silently add a second endpoint later and acquire it
+after preallocation. The current endpoint-keyed `_socket_cache` has no hard
+entry/memory bound and therefore cannot be used unchanged for enforce traffic.
+
+Readiness also checks the deployment topology: the configured cache capacity
+must cover the maximum number of distinct P authority/epoch keys that SMG may
+route concurrently to one D, including the allowed old/new-epoch overlap during
+rollout. If it cannot, that routing cell is unsupported rather than relying on
+steady-state cache-exhaustion errors. Multiple pairs to one key share a physical
+channel and hold separate logical refcounts; the design never creates one socket
+per request.
+
+## Destination metadata and transfer completion
+
+The enforce path uses a versioned metadata namespace. It never appends optional
+fields to the legacy room-based Mooncake frame.
+
+```text
+PD_COMMITTED_METADATA_V1 {
+  metadata_protocol_version,
+  declared_total_frame_bytes,
+  reserved_metadata_credit_bytes,
+  identity,
+  commit_generation,
+  transfer_generation,
+  endpoint_and_session,
+  destination_kv_indices,
+  destination_state_indices,
+  required_destination_count,
+  decode_prefix_len,
+}
+```
+
+P validates version, declared sizes, complete identity, epochs, support cell,
+and generations before changing any Mooncake or scheduler table. Enforce
+metadata is keyed by `request_uid`. The legacy room-keyed
+`transfer_infos`, `request_status`, and related tables remain isolated and can
+only serve the feature-disabled path.
+
+On first acceptance, P computes and stores a fixed canonical digest of every
+semantic metadata field and destination/state index byte. An exact duplicate
+for the same identity/generation is an idempotent no-op. A same-generation frame
+with different content cannot replace
+the registration: while the pair is active it is a protocol invariant violation
+that fixes FAILED, starts scheduler cleanup, and removes the support cell from
+new dispatch; after the pair left that state it is stale-dropped. Digest storage
+is fixed-size and charged to the metadata-register reservation.
+
+Before submitting metadata, D transitions to `D_TRANSFERRING`, chooses the
+non-reused `transfer_generation=1`, and arms its transfer deadline. It also
+starts one logical transfer-status wait:
+
+```text
+WaitTransferStatusRequest {
+  transfer_status_protocol_version,
+  identity,
+  commit_generation,
+  transfer_generation,
+  status_wait_seq,
+}
+
+PD_TRANSFER_STATUS_V1 {
+  transfer_status_protocol_version,
+  identity,
+  commit_generation,
+  transfer_generation,
+  status_wait_seq,
+  result: SNAPSHOT | RETRY_LATER | UNKNOWN | INCOMPATIBLE,
+  status_seq?,
+  prefill_rank?,
+  status?: SUCCESS | FAILED,
+  failure_reason?,
+}
+```
+
+Only `result=SNAPSHOT` carries `status_seq`, rank, and the immutable semantic
+SUCCESS/FAILED result. `RETRY_LATER` and `UNKNOWN` never advance D and never
+constitute terminal proof; D repeats the same logical wait within its unchanged
+transfer deadline. For a matching LIVE entry, `RETRY_LATER` means only that the
+bounded long-poll interval ended before a snapshot was fixed; it uses the
+pair-reserved response credit and can never mean generic-capacity overload.
+`UNKNOWN` creates no P state and covers an otherwise valid identity for which P
+has no LIVE/tombstone snapshot. A matching
+`INCOMPATIBLE` response makes D enter cancellation and return an error for the
+bound pair. A mismatching response wrapper is stale input and is dropped. None
+of these control dispositions permits SMG worker reselection in version 1.
+
+### Logical sequence and immutable replay contract
+
+Logical sequence numbers identify one pair-level operation, not a socket or
+transport attempt. Version 1 fixes:
+
+```text
+wait_seq = 1
+commit_generation = 1
+transfer_generation = 1
+status_wait_seq = 1
+status_seq = 1
+cancel_seq = 1
+```
+
+`wait_seq`, `status_wait_seq`, and `cancel_seq` remain unchanged across timeout,
+reconnect, backoff, duplicate delivery, and transport retry. A different value
+for the same version 1 pair/operation is `INCOMPATIBLE` and cannot allocate a
+second correlation or mutate the pair.
+
+The transport may use an ephemeral local attempt/handle token solely to close
+and replace sockets. It is not sent as protocol identity and is never stored in
+an immutable semantic snapshot. Scheduler attach/rebind atomically swaps the
+single response handle owned by the logical credit and closes the old handle;
+simultaneous duplicate attempts cannot retain two long-poll correlations.
+
+The immutable commit snapshot contains the semantic result, identity,
+`commit_generation`, commit time, and fixed P post-commit validity deadline; it
+does not contain transport-attempt state. A
+`WaitCommitResponse` wrapper echoes `wait_seq` from the matching validated
+request. The immutable transfer snapshot contains the semantic status,
+identity, both generations, `status_seq`, and rank; it does not contain
+transport-attempt state, `status_wait_seq`, or a non-semantic control
+disposition. A `PD_TRANSFER_STATUS_V1` wrapper echoes `status_wait_seq` from the
+matching validated request. This permits the same immutable snapshot to answer
+the original request and every reconnect.
+
+P publishes at most one transfer result for the pair/generation. A duplicate
+identical result is idempotent. A backend completion arriving after the
+scheduler has already left `P_TRANSFERRING` because cancel/timeout fixed the
+result is expected stale input: it is dropped with a bounded metric and never
+overwrites the snapshot. By contrast, conflicting SUCCESS/FAILED while the same
+generation is still the current active transition, a second scheduler
+publication, a second `status_seq`, or a second generation is a local invariant
+violation: P keeps the first immutable snapshot, starts scheduler-owned cleanup,
+and removes the support cell from new enforce dispatch.
+
+An unknown `WaitTransferStatusRequest` never creates a pair, waiter, or
+tombstone. It may only attach to or replay a matching existing LIVE/terminal
+entry, so WAIT-first expiry creation applies only to `WaitCommitRequest`.
+
+The status wait may arrive before P finishes metadata registration. The P
+scheduler serializes both commands against the same pair and generation and
+attaches the early wait using the pair-reserved logical correlation. It does
+not return a false terminal result or allocate an additional waiter.
+
+The P transfer worker only emits a fixed-size `TransferCompletionCommand` to a
+reserved scheduler mailbox. It contains the complete identity, both fixed
+generations, prefill rank, and backend SUCCESS/FAILED outcome; it is never keyed
+only by room. The P scheduler verifies that the pair is still the matching
+`P_TRANSFERRING` generation and publishes one immutable status snapshot. If a
+committed P pair becomes terminal before transfer completes, the scheduler
+publishes `FAILED(P_TERMINAL)` for the same generation.
+
+The D transport thread only emits a fixed-size `TransferStatusCommand` for a
+validated bounded wrapper. Only the D scheduler may perform
+`D_TRANSFERRING -> D_RUNNING`, and only for `result=SNAPSHOT` after validating
+the full identity, both generations, `status_wait_seq`, `status_seq`, semantic
+status, and the required rank set. Version 1 requires rank 0 only. Control
+dispositions follow the retry/cancel rules above and cannot enter `D_RUNNING`.
+
+The current three-part room-only status message remains legacy-only. It cannot
+advance an enforce pair, even if a bootstrap room is reused.
+
+P retains the fixed-size immutable transfer snapshot until:
+
+```text
+max(
+  not_after + max_clock_skew_ms,
+  terminal_time + terminal_tombstone_ttl,
+  transfer_snapshot_time + transfer_status_replay_ttl,
+)
+```
+
+Readiness requires:
+
+```text
+transfer_status_replay_ttl
+>= D transfer timeout
+ + maximum status retry backoff
+ + status delivery margin
+```
+
+This allows D to recover a lost success response without adding a reliable P
+outbox. Version 1 has no post-result acknowledgment and never releases this
+snapshot early. The snapshot contains only the bounded semantic fields listed
+above; admission reserves its count and byte credit for the full worst-case
+retention window. Snapshot-budget exhaustion rejects a new pair at the full
+control gate before either role acquires model capacity.
+
+## Scheduler and transport ownership
+
+The P and D scheduler threads are the only writers of:
+
+- pair registry state;
+- queue membership;
+- ownership bits;
+- deadlines;
+- waiter membership;
+- immutable commit and transfer snapshots;
+- terminal tombstones.
+
+HTTP and transport threads may authenticate, apply fixed-size parsing limits,
+enqueue bounded commands, and send scheduler-produced responses. They may not
+call allocators, mutate scheduler queues, write pair state, or advance an
+enforce request from a room-only status table.
+
+Every control frame has a protocol-defined maximum byte size before parsing.
+Endpoint/authority lengths are bounded by discovery policy, and `reason` or
+`failure_reason` is a fixed enum/diagnostic code rather than an unbounded
+string. Oversized or malformed unknown input uses only the untrusted parse
+budget and cannot retain a pair-reserved correlation or payload owner.
+
+Every scheduler inbox uses bounded, budgeted draining. Deadline processing is
+`O(expired + fixed_budget)` through a heap, timer wheel, or equivalent; the hot
+loop must not scan all live pairs.
+
+## Success and cancellation ownership closure
+
+### Successful P transfer
+
+When the backend reports transfer success, the P scheduler performs one
+serialized transition:
+
+1. Validate the full identity, current `P_TRANSFERRING` state, and fixed
+   generations/rank.
+2. Publish the immutable `SUCCESS(status_seq=1)` transfer snapshot.
+3. Arm the worker cleanup deadline, enter `P_SUCCESS_CLEANUP`, and invalidate
+   the transfer deadline in the same scheduler transition.
+4. Remove the request from every bootstrap, waiting, batch, inflight, transfer,
+   and result owner.
+5. Release sender, source KV, request slot, cache/radix lock, metadata payload
+   references, and all other ownership exactly once through explicit ownership
+   bits/refcounts.
+6. Replace the LIVE entry with `P_TERMINAL(SUCCESS)`, retaining only the bounded
+   identity, terminal disposition, and immutable transfer snapshot until the
+   replay-retention formula expires.
+
+The transfer-status response and P role HTTP success may be produced from the
+immutable semantic snapshot before source cleanup finishes; neither is local
+terminal proof and version 1 never uses an HTTP 2xx to reroute. Only the
+scheduler terminal tombstone waits for actual source ownership to be released.
+A cleanup timeout never rewrites a published SUCCESS snapshot; it isolates the
+worker/support cell and continues scheduler-owned cleanup.
+
+After D validates that SUCCESS, it atomically commits transferred ownership to
+the request, releases the pair's complete control-channel lease set, and enters
+`D_RUNNING` without further network I/O. On
+normal generation completion or stream EOF, D enters `D_SUCCESS_CLEANUP`,
+removes the request from all scheduler/result owners, releases request slot, KV,
+metadata buffer, and cache locks exactly once, then replaces the LIVE entry with
+`D_TERMINAL(SUCCESS)`. D terminal replay state is bounded by the same dispatch
+expiry/tombstone policy; it does not retain P's transfer snapshot.
+
+### Failed transfer and other pre-running failures
+
+Every failure follows the same ownership graph rather than a message-specific
+shortcut:
+
+- Before `P_COMMITTED`, P publishes only the immutable commit-terminal
+  disposition, enters `P_CANCELLING`, releases its owners, and then creates the
+  terminal tombstone. No transfer snapshot exists.
+- At or after `P_COMMITTED`, if no transfer result has been fixed, P first
+  publishes immutable `FAILED(status_seq=1)` for the fixed generation, then
+  enters `P_CANCELLING`. Backend failure, metadata rejection, phase deadline,
+  and cancel all use this rule. If SUCCESS or FAILED was already fixed, cleanup
+  preserves that first semantic snapshot.
+- A D pair that validates FAILED, or reaches any deadline before `D_RUNNING`,
+  enters `D_CANCELLING`, removes itself from registered/eligible/preallocation/
+  transfer owners, releases every reserved control and scarce owner exactly
+  once, and publishes terminal only after release.
+
+A semantic FAILED response may be replayed while P cleanup is in progress, but
+neither role advertises scheduler-terminal state before its ownership ledger is
+empty. A late success/failure/cancel event for an older state or generation is
+idempotently dropped or treated as the invariant conflict defined above; it
+never selects a second cleanup path.
+
+### Identity-bound cancel
+
+Version 1 uses the following minimum scheduler-backed cancel contract:
+
+```text
+PairCancelRequest {
+  pair_cancel_protocol_version,
+  role,
+  request_uid,
+  bootstrap_room,
+  bootstrap_pair_key,
+  expected_p_instance_epoch,
+  expected_d_instance_epoch,
+  expected_p_capability_digest,
+  expected_d_capability_digest,
+  pair_policy_version,
+  pair_policy_digest,
+  support_cell_id,
+  dispatch_issued_at_unix_ms,
+  dispatch_not_after_unix_ms,
+  cancel_seq,
+}
+
+PairCancelResponse {
+  pair_cancel_protocol_version,
+  role,
+  request_uid,
+  bootstrap_room,
+  bootstrap_pair_key,
+  p_instance_epoch,
+  d_instance_epoch,
+  support_cell_id,
+  cancel_seq,
+  result: ACCEPTED | ALREADY_TERMINAL | RETRY_LATER | EXPIRED | INCOMPATIBLE,
+  terminal_kind?,
+}
+```
+
+`cancel_seq=1` is the fixed logical cancel operation for version 1 and is reused
+across reconnect and retry. The response echoes it. `ACCEPTED` means only that
+the matching scheduler accepted or is processing cancellation; it is not
+terminal proof and does not assert that allocator cleanup completed.
+`ALREADY_TERMINAL` is emitted only from a scheduler terminal tombstone, but
+version 1 still does not use a one-sided response to start a replacement pair.
+
+Retry ownership is unique per operation: D owns commit/status-wait retries;
+SMG owns at most one logical cancel operation per pinned role endpoint. SMG may
+make a bounded number of same-endpoint transport retries with the identical
+`cancel_seq=1`, but it has no reliable cancel outbox and cancellation delivery
+does not delay the user-visible error indefinitely. If SMG or its client task
+disappears, the workers' non-refreshable local deadlines remain the cleanup
+backstop.
+
+The ingress thread validates fixed framing and enqueues a bounded command. The
+scheduler recomputes and matches the full identity and serializes cancel with
+HTTP entry, WAIT, commitment, metadata registration, transfer completion,
+deadline expiry, and success cleanup. Identity mismatch never modifies an
+existing entry. If a transfer snapshot was already fixed, cancel may change the
+local execution/terminal disposition and accelerate cleanup, but it never
+rewrites that semantic SUCCESS/FAILED snapshot.
+
+For a valid unknown identity inside the dispatch acceptance window, cancel may
+atomically create a bounded cancel-first `TERMINAL(CANCELLED)` tombstone. It
+stores both dispatch times and is retained through at least
+`dispatch_not_after_unix_ms + max_clock_skew_ms`; a later matching HTTP body or
+WAIT cannot create execution. If the independent cancel-first tombstone budget
+is full, P/D returns `RETRY_LATER` without state and SMG may retry the same
+logical cancel. An expired unknown cancel returns `EXPIRED` without state. For
+an existing LIVE/terminal entry, both dispatch times must exactly match the
+stored envelope even when current time is past `not_after`.
+
+For an existing request, cancel and deadline cleanup must remove or mark the
+request in every possible owner before terminalization. Version 1 explicitly
+includes:
+
+- P WAIT-first, bootstrap, precommit/waiting, final batch, transferring,
+  success-cleanup, inflight, and result state;
+- D `D_REGISTERED`, `D_COMMIT_RECEIVED`, eligible, existing preallocation,
+  transfer, running/current/last batch, success-cleanup, and result state;
+- channel lease sets, correlations, metadata payload owners, request/KV slots,
+  cache/radix locks, sender/receiver state, and deadline entries.
+
+The current decode abort path must therefore be extended to address the new
+registered/commit-received owners by `request_uid`; scanning only the existing
+preallocation and transfer queues is insufficient. Each allocator/owner has one
+release bit/refcount, so duplicate cancel, timeout, disconnect, and success
+races release it at most once. The scheduler publishes
+`P/D_TERMINAL(FAILED|CANCELLED)` only after all actual local ownership is gone.
+Deadline expiry uses the same cleanup routine and ownership ledger as cancel.
+
+## Progress-resource reservation
+
+The full per-role credit inventory, release points, byte-accounting rules, and
+reservation fault tests are normative and live in the
+[reservation and validation appendix](/docs/developer_guide/pd_optimistic_prefill_commit_rfc_appendix).
+
+Before either role can acquire model capacity, its full-control gate atomically
+reserves the bounded LIVE/tombstone state, logical wait/response correlations,
+scheduler commands, deadline/cleanup capacity, retained payload bytes, and
+cancel path needed for every later transition. D also reserves its complete
+deduplicated peer-channel lease set and receiver/session capacity. A partial
+reservation fails before model allocation.
+
+Duplicates and reconnects rebind the pair's existing logical credits. Unknown
+or malformed input uses a separate bounded ingress budget and cannot consume a
+live pair's completion resources. Count limits are accompanied by conservative
+per-pair and process-wide byte limits, including retained request/receiver
+objects, transport buffers, zero-copy owners, decoded heap expansion, and fixed
+transfer snapshots.
+
+The reservation claim covers the new control/protocol path. It does not reserve
+a Mooncake executor thread or change data-plane scheduling; those delays remain
+covered by local transfer deadlines and cannot recreate the cross-stage
+capacity cycle after P has committed.
+
+## Deadlines and failure closure
+
+Every pre-running live phase has exactly one positive, non-refreshable local
+deadline:
+
+| Deadline | Starts | Covers | Expiry action |
+| --- | --- | --- | --- |
+| Dispatch expiry | SMG creates envelope | Body not accepted by worker | Reject before pair creation |
+| Admission | First local pair/waiter entry | `P_REGISTERED`, `P_PRECOMMIT`, `D_REGISTERED`, commit retries | Scheduler cleanup and tombstone |
+| P post-commit readiness | P publishes `COMMITTED` | Commit delivery, committed forward completion, and metadata rendezvous | Fix FAILED and enter P scheduler cleanup |
+| D post-commit | D accepts `COMMITTED` | `D_COMMIT_RECEIVED`, receiver readiness, eligibility, preallocation, metadata submit | D scheduler cleanup |
+| P transfer | Both committed-forward and metadata readiness bits are true | Submitted KV transfer | Enter cancelling and publish a failed snapshot if no result was fixed |
+| D transfer | Before D submits metadata | KV transfer and status replay | D scheduler cleanup |
+| Worker cleanup | First entry to success-cleanup or cancelling | Queue removal and actual ownership release | Isolate the support cell/epoch; do not publish terminal until release completes |
+
+Readiness checks deadline sizing against the maximum request shape admitted by
+the support cell. In particular, P post-commit readiness must cover the larger
+of the configured committed-prefill runtime bound and worst-case commit
+delivery + D preallocation/metadata-submit budget, plus scheduling/skew margin.
+D transfer timeout must cover remaining committed-prefill runtime, metadata
+handoff, Mooncake transfer, status retry/backoff, and delivery margin. A request
+whose declared shape is outside those bounds uses legacy behavior before
+dispatch or fails closed; it is not allowed to enter enforce and predictably
+timeout on long prompts.
+
+A transition arms the successor deadline before invalidating the previous one.
+Retries, reconnects, and queue movement cannot refresh a deadline. Scheduler
+deadline and cleanup work must run while idle and before any scheduler pause
+fast path. A phase timeout atomically enters cancelling and arms the worker
+cleanup deadline; normal D completion arms the same cleanup deadline before
+entering `D_SUCCESS_CLEANUP`. If cleanup exceeds that deadline, the worker stops
+accepting new enforce pairs for the affected support cell/epoch but continues
+cleanup and serves matching immutable commit/status replays from already
+reserved resources. Timeout alone never fabricates terminal state.
+
+The finite-cleanup claim assumes that the worker scheduler and backend cleanup
+path continue to execute. A worker process crash releases its process-local
+resources and is fenced by a new serving epoch. Permanent GPU/driver hangs,
+permanent scheduler stalls, and exactly-once recovery after router state loss
+are outside the version 1 guarantee. A timeout may request cleanup, but the
+worker must not publish local terminal state until actual ownership is released
+or the process epoch is retired.
+
+### Router pair-bound fence
+
+SMG uses one pair-level linearization point for enforce requests:
+
+```text
+UNBOUND
+  -> select and pin P/D workers, epochs, capabilities, and endpoints
+  -> create the bootstrap room, pair key, and request UID
+  -> prepare both role-specific requests
+  -> PAIR_BOUND
+  -> either P or D request may perform network I/O
+```
+
+`PAIR_BOUND` occurs immediately before either role request can perform its first
+network I/O. Before that point, selection or preparation may restart only while
+SMG can prove that neither worker request performed I/O. At and after that
+point:
+
+- the logical request must not call `select_pd_pair()` again;
+- SMG must not generate a new pair key, room, request UID, or worker binding;
+- version 1 performs no automatic HTTP resend and does not wrap the pair in an
+  outer retry that can reselect workers;
+- a P or D HTTP error triggers best-effort cancellation of the originally
+  bound pair and returns an error;
+- retries of `WAIT_COMMIT` and `WAIT_TRANSFER_STATUS` remain allowed because
+  they reuse the same identity, endpoint, serving epoch, and logical credit.
+
+SMG is a trusted, non-Byzantine participant in version 1. It derives both role
+bodies from the same immutable typed request before `PAIR_BOUND`; role-specific
+preparation may add only the allowlisted private/routing fields and may not
+change the public prompt, model, sampling, or request-expansion semantics. This
+construction is covered by cross-route tests. Version 1 does not add a second
+full-request canonical hash merely to detect an SMG implementation bug.
+
+The enforce dispatch supervisor is symmetric and fail-fast. Before a successful
+decode response/stream is exposed, a transport error or non-success response
+from either P or D immediately stops waiting for normal completion of the peer,
+starts the same identity-bound cancel on both pinned role endpoints, and returns
+the appropriate error after only the bounded cancel attempt. In particular, it
+must not preserve the current behavior that stores an early D error while
+continuing to wait for P: D may reject at its full-control gate after P has
+committed, and P would otherwise wait until its post-commit deadline for
+metadata that can never arrive. A successful early D response may still wait
+for the P response required by the existing result/logprob merge.
+
+The feature-disabled path retains the current outer `RetryExecutor` behavior.
+If a future enforce version permits same-pair HTTP resend, it must resend the
+identical role envelope to the identical endpoint and serving epoch and prove
+worker-side idempotent merge. That optimization is not part of version 1.
+
+Because version 1 does not create a replacement pair after `PAIR_BOUND`,
+SMG does not need terminal proof as a retry barrier:
+
+- selection or preparation failures before `PAIR_BOUND` may choose another
+  pair only when neither role performed network I/O;
+- at or after `PAIR_BOUND`, generic HTTP errors, timeouts, disconnects, overload,
+  or control failures trigger best-effort cancellation and return an error;
+- streaming responses are never replayed after headers are exposed;
+- worker-local deadlines guarantee finite retention even if SMG crashes or the
+  cancel message is lost.
+
+A future transparent-reroute design must add scheduler-confirmed terminal
+receipts for both P and D and must wait for both before creating a new pair. It
+must not reinterpret HTTP failure, `NOT_FOUND`, epoch mismatch, or transient
+overload as terminal proof.
+
+## Normative invariants
+
+The implementation and tests must preserve all of the following together:
+
+1. **Capability and policy fence before state.** SMG, P, and D agree on the
+   canonical role capabilities, actual pair-policy digest, serving epochs, and
+   support cell before tokenization or execution-capable pair-state creation.
+2. **Commit before D capacity.** D owns a request/KV/metadata slot or cache lock
+   only after its scheduler validates the matching immutable commitment.
+3. **Non-blocking P launch.** P commitment performs only O(1) scheduler-local
+   state publication before GPU launch; it never waits for D or transport.
+4. **One acquisition graph.** P owns its complete P reservation row before
+   `P_PRECOMMIT`; D owns its complete D row before `D_REGISTERED`; and D also
+   verifies commitment and channel/receiver readiness before `D_ELIGIBLE`.
+   No later pre-running protocol phase acquires generic control/protocol
+   capacity; existing Mooncake data-plane service remains deadline-bounded.
+5. **One retry owner and fixed logical sequences.** D retries commit/status waits
+   with the same version 1 sequence; SMG alone retries the bounded same-pair
+   cancel operation. P stores semantic immutable snapshots and no
+   transport-attempt state or reliable outbox.
+6. **No resurrection.** Serving epochs, canonical identity, dispatch expiry,
+   WAIT-first validation, cancel-first tombstones, and terminal retention prevent
+   an unknown late message from recreating an old pair.
+7. **Scheduler single writer.** HTTP, control, metadata, and transfer threads
+   only validate bounded input, enqueue commands, or consume immutable output.
+8. **Terminal means ownership is gone.** Success, cancel, failure, and deadline
+   all use the same ownership ledger; a worker publishes local terminal state
+   only after every actual local owner releases exactly once.
+9. **Continuous deadline coverage.** Every non-running LIVE phase has exactly
+   one non-refreshable local deadline, and each transition arms its successor
+   before invalidating its predecessor.
+10. **No replacement after `PAIR_BOUND`.** Enforce v1 never creates a new worker
+   binding or identity after either role may have performed network I/O.
+11. **Legacy isolation.** Room-only metadata/status cannot create a V1 command
+    or advance an enforce pair, and V1 input never mutates legacy tables.
+12. **Clock-health fail closed.** New enforce dispatch requires the selected
+    SMG/P/D clocks to satisfy the digest-bound `max_clock_skew_ms`. Existing
+    pairs and all cleanup continue using local monotonic deadlines if that
+    readiness condition later fails.
+
+If any implementation shortcut violates one invariant to satisfy another, the
+support cell remains disabled. The capacity-ordering proof alone is necessary
+but not sufficient for rollout.
+
+## Observability contract
+
+The first enforcement implementation must expose low-cardinality metrics that
+let a canary distinguish protocol pressure from scheduler or backend delay. The
+exact metric prefix follows repository conventions, but the following signals
+and bounded dimensions are required:
+
+| Signal | Required bounded dimensions |
+| --- | --- |
+| Pair admission and terminal totals | `role`, `result`, bounded `reason` |
+| Full-control gate rejection totals | `role`, bounded `reason` |
+| Commit/status wait retry totals and latency | `wait_kind`, bounded `result` |
+| Phase and cleanup timeout totals | `role`, `phase` |
+| Peer-channel cache entries and exhaustion | `state=active|idle|reserved`, bounded `reason` |
+| LIVE pair, tombstone, and snapshot count/bytes | `role`, `object_kind` |
+| Post-`PAIR_BOUND` dispatch failures | `role`, bounded `stage` and `reason` |
+| Support-cell isolation and clock-health events | bounded `reason`; allowlisted configured cell version only |
+
+Metrics must be updated in O(1) at the scheduler or bounded transport event; a
+collector must not scan all live pairs. `rid`, `request_uid`, bootstrap room,
+pair key, serving epoch, endpoint, and capability/policy digests are forbidden
+as metric labels. They may appear only in sampled or rate-limited structured
+logs/traces. Reason values are fixed enums, not free-form backend strings.
+
+Canary dashboards must correlate request success/TTFT with gate rejection,
+wait latency/retry, timeout, channel exhaustion, clock-health, and retained-byte
+signals. Hard gates enforce the configured control/channel/snapshot budgets
+independently of alert delivery; budget exhaustion produces bounded rejection,
+not over-allocation. Canary threshold or clock-health violations stop new
+enforce dispatch for the affected support cell. Disabled-path metric updates
+must remain limited to the existing legacy metrics.
+
+## Performance model
+
+The design keeps the useful overlap:
+
+```text
+SMG: concurrently dispatch P and D
+
+D: validate -> receiver/topology -----------------------------+
+               WAIT_COMMIT -----------------------------------+
+P: validate -> queue -> COMMITTED -> GPU launch                |
+                                  \-> control response --------+
+D: verify commit -> ELIGIBLE -> existing preallocation -> metadata
+                                                   \-> WAIT_TRANSFER_STATUS
+P: prefill compute -> KV transfer -> immutable status response
+D: verify status -> RUNNING
+```
+
+P never waits for D or for control delivery. D performs non-scarce receiver
+work before commitment. With an outstanding transfer-status wait, completion
+still has one P-to-D response and does not add a post-completion request RTT.
+Among requests that have become `D_ELIGIBLE`, version 1 preserves the existing
+decode preallocation FIFO/priority policy; the gate does not introduce a second
+cross-request ordering or an EDF scheduler.
+
+The unavoidable cost: control latency shows up for very short or cached prefill.
+
+If P admission takes ~0.3ms and commit delivery + D scheduler mailbox takes
+~0.2ms, D preallocation starts ~0.2ms later. For long prefill this is noise.
+For sub-millisecond cache hits it's visible. D can't hide it by allocating KV
+early—that would just recreate the original capacity cycle.
+
+Required implementation properties:
+
+- Persistent, multiplexed control channels
+- Batched commit and transfer-status messages
+- O(1) P commit hook
+- Bounded D inbox draining (no busy polling)
+- No pair scan in the scheduler hot loop
+- No per-request TCP connections
+- Hard-bounded peer-channel cache with active refcounts and idle eviction
+- No request-identity metric labels
+- Zero envelope/control/registry/deadline work on the disabled path
+
+## Acceptance gates
+
+The feature stays disabled until the first support cell passes deterministic
+correctness tests, fault injection, memory accounting, and a real-GPU A/B run.
+
+Candidate performance gates (subject to maintainer agreement):
+
+| Metric | Enforce relative to baseline |
+| --- | --- |
+| Request throughput | 95% confidence interval lower bound at least `-1%` |
+| p50 TTFT | 95% confidence interval upper bound at most `+1%` |
+| p99 TTFT | 95% confidence interval upper bound at most `+2%` |
+| p99 inter-token latency | Upper bound at most `+1%` |
+| Scheduler CPU/core time | At most `+2%` |
+| GPU utilization | At least `-1%` |
+| Successful request rate before baseline saturation | No new control-budget, channel-budget, or protocol timeout failures |
+| Control and metadata memory | Never exceeds configured hard budgets |
+| Peer-channel FD/socket memory | Never exceeds the configured hard budget |
+
+The matrix must separate prompt lengths `1/8/32/128/1K/8K`, cache-hit ratios
+`0/50/90/100%`, concurrency `1/8/32/saturation`, streaming/non-streaming, and
+available/near-full/inversion D capacity. Short or cache-hit regressions cannot
+be hidden by an average over long prompts.
+
+The disabled-path microbenchmark must show no new control traffic, pair state,
+deadline scan, or statistically significant throughput/latency change.
+
+## Validation plan
+
+The mandatory state, router, protocol/restart, reservation/memory, replay, and
+end-to-end cases are listed in the
+[reservation and validation appendix](/docs/developer_guide/pd_optimistic_prefill_commit_rfc_appendix).
+Rollout requires the deterministic A/B reproducer, identity/generation and
+cancel races, bounded-memory/fault injection, a cross-process Mooncake test,
+real-GPU A/B results for every enabled support cell, and disabled-path
+regression coverage. Mock transport tests alone cannot enable the feature.
+
+## Implementation plan
+
+This RFC is design-only. Implementation should split into reviewable PRs:
+
+1. **Reproducer and protocol types.** Land the deterministic A/B regression,
+   canonical capability/identity encoding with Rust/Python golden vectors,
+   fixed logical-sequence contracts, cancel types, state-machine types, and
+   pure state tests. No behavior change.
+2. **Shadow protocol.** Exercise commit observation, reservations, and metrics
+   while D still follows the legacy eligibility path. Shadow mode doesn't fix
+   the bug and must not be reported as enforce mode.
+3. **Mooncake single-rank enforcement.** Add D registration/eligibility, P
+   scheduler commitment, success/cancel ownership closure, complete peer-channel
+   lease-set reservation, V1 metadata/status namespaces, and deadlines. In the
+   same PR, add the SMG `PAIR_BOUND` fence and make enforce requests bypass the
+   current outer worker-reselection `RetryExecutor` before the first enforce
+   request can be dispatched. Add fault injection for the first support cell.
+   Default off.
+4. **GPU canary and rollout.** Run the mandatory performance matrix and enable
+   only approved rollout cells.
+5. **Transparent reroute follow-up.** Separately design terminal receipts,
+   router pair state, cancellation reconciliation, and the old-pair terminal
+   barrier. Only after both old roles provide matching scheduler-terminal proof
+   may enforce pairs re-enter worker-reselection retry.
+
+The enforcement PR maps to existing SGLang boundaries as follows:
+
+- In `sgl-model-gateway/src/routers/http/pd_router.rs`, move enforce pair
+  selection/preparation outside the worker-reselection retry closure, pin the
+  envelope and cancel endpoints, and cross `PAIR_BOUND` immediately before the
+  two `.send()` futures can first be polled. Keep the current closure unchanged
+  for the disabled path. Add a symmetric enforce-only dispatch supervisor:
+  unlike the current loop, an early D error must cancel P and finish promptly
+  instead of being cached until P resolves.
+- In the P scheduler path, publish commitment after final `prepare_for_extend()`
+  allocation succeeds and before `run_batch()`/forward can launch. The hook is a
+  scheduler-local registry write plus bounded mailbox-ready mark.
+- In `python/sglang/srt/disaggregation/decode.py`, add a separate registered/
+  commit-received owner. Do not insert enforce requests into the existing
+  `DecodePreallocQueue.queue` until the scheduler predicate is `D_ELIGIBLE`, and
+  guard `_pre_alloc()` itself as a second line of defense.
+- In the Mooncake/control layer, keep legacy room-keyed frames and the current
+  unbounded endpoint socket cache off the enforce namespace. V1 uses the bounded
+  multiplexed channel manager, byte-limited parsing, and fixed scheduler
+  commands defined here. The existing data-plane executor remains unchanged.
+- In `scheduler.py`, extend abort/deadline lookup by `request_uid` across the new
+  registered/commit states and route success, failure, cancel, and timeout
+  through the same ownership ledger.
+
+Expected size for steps 1-4: approximately 3,500-5,500 lines of production code
+plus 3,000-5,000 lines of tests. This is not an acceptance criterion; it
+explains why implementation should remain split into dependent reviewable PRs.
+
+## Alternatives considered
+
+### Wait for P before sending D request
+
+Establishes ordering but serializes D receiver + topology setup. Our proposal
+keeps concurrent dispatch and only delays scarce D allocation.
+
+### P pushes a reliable admission ticket
+
+Reliable P outbox = registration leases + delivery acks + replay + restart
+handling + ack-loss semantics. Version 1 uses a single D retry owner instead.
+A future best-effort P push could be a latency hint, but D wait remains the
+correctness path.
+
+### Allocate on D, revoke under pressure
+
+Safe revocation needs complete ownership tracking across request slots, KV,
+metadata, radix locks, backend transfer state, and ranks. SGLang doesn't
+currently expose an atomic revocable reservation covering all of these.
+
+### Change priority or randomize dispatch
+
+Priority and random order don't establish cross-worker resource ordering.
+Network and scheduler reordering can recreate the same cycle.
+
+### Transparent rerouting in v1
+
+Needs a second distributed guarantee: new pair can't start until both roles of
+the old pair are scheduler-confirmed terminal. Valuable, but independent of the
+capacity-ordering fix, and it materially expands SMG, worker cleanup, tombstone,
+and streaming semantics. Version 1 returns an error rather than risk overlapping
+executions.
