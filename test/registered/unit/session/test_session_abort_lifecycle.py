@@ -404,6 +404,42 @@ class TestQueuedSessionAbortMambaOwnership(CustomTestCase):
         self.assertFalse(session._inflight)
         self.assertEqual(list(session.req_nodes), ["r1"])
 
+    def test_waiting_timeout_releases_first_turn_mamba_state(self):
+        """The timeout path must free request-owned Mamba state like abort does.
+
+        A streaming session's first turn has no slot yet, so a Mamba index the
+        cache allocated during match_prefix belongs to the request. The
+        admission-rejection path deliberately keeps it for session requests, so
+        a request can sit in the waiting queue holding it until it times out.
+        """
+        session = Session(capacity_of_str_len=0, session_id="s0", streaming=True)
+        tree_cache = _RecordingTreeCache()
+        scheduler = _make_scheduler(tree_cache, waiting_queue=[])
+
+        req = _queue_turn(session, scheduler, "r1", [11, 12, 13])
+        req.req_pool_idx = None
+        req.kv = None
+        req.mamba_pool_idx = torch.tensor([2], dtype=torch.int64)
+        req.time_stats = SimpleNamespace(wait_queue_entry_time=1e-6)
+
+        released = []
+        tree_cache.supports_mamba = lambda: True
+        tree_cache.req_to_token_pool = SimpleNamespace(
+            mamba_allocator=SimpleNamespace(free=released.append)
+        )
+
+        with unittest.mock.patch(
+            "sglang.srt.managers.scheduler.envs.SGLANG_REQ_WAITING_TIMEOUT.get",
+            return_value=1,
+        ):
+            scheduler._abort_on_waiting_timeout()
+
+        self.assertEqual(scheduler.waiting_queue, [])
+        self.assertEqual([t.tolist() for t in released], [[[2]]])
+        self.assertIsNone(req.mamba_pool_idx)
+        self.assertEqual(tree_cache.cache_finished_req_calls, [])
+        self.assertFalse(session._inflight)
+
     def test_first_turn_exclusive_mamba_state_is_released(self):
         """Without a slot the Mamba state is the request's own and must be freed."""
         session = Session(capacity_of_str_len=0, session_id="s0", streaming=True)

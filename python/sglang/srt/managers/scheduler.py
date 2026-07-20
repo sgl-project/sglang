@@ -2521,7 +2521,12 @@ class Scheduler(
                 if self.enable_hicache_storage:
                     # Release prefetch events associated with the request
                     self.tree_cache.release_aborted_request(req.rid)
-                self._finalize_queued_session_turn(req)
+                slot_owned_state = self._finalize_queued_session_turn(req)
+                # A request that never ran still owns any Mamba state the cache
+                # allocated for it, and nothing else will free it. State on loan
+                # from a session slot is skipped: the slot keeps owning it.
+                if req.mamba_pool_idx is not None and not slot_owned_state:
+                    release_kv_cache(req, self.tree_cache, is_insert=False)
                 self.ipc_channels.send_to_tokenizer.send_output(
                     AbortReq(
                         finished_reason={
