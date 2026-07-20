@@ -1449,6 +1449,17 @@ jobs:
           bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
           bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
 
+      - name: Prebuild AITER CKTile module before 8-rank DSV4 startup
+        if: inputs.aiter_ref != ''
+        timeout-minutes: 15
+        run: |
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout \
+            -e AITER_LOG_MORE=1 \
+            -e PROBE_CASE_NAME=dsv4-prebuild \
+            python3 -u scripts/ci/amd/aiter_cktile_jit_probe.py
+          docker exec ci_sglang ls -lh \
+            /sgl-workspace/aiter/aiter/jit/module_gemm_a8w8_blockscale_bpreshuffle_cktile.so
+
       - name: Accuracy + Performance Test MI35x ROCm 7.2 (8-GPU DeepSeek-V4-Flash FP8 + FP4, unified_kv_triton)
         timeout-minutes: 300
         run: |
