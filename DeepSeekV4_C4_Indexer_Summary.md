@@ -439,3 +439,299 @@ Attention A2A: DCP8/B128/128K 已有约 4% 正收益，但新增约 3.5 GB/GPU g
 ```text
 /data/models/dev0616/c4_c128_p0/d804277991/a2a_dcp8_fixed_batch/
 ```
+
+## 16. 128K Timeline 与 C4 Shard 闭环（2026-07-18）
+
+### 16.1 DCP8 Runtime Blocker 与修复
+
+首次启用 C4 shard 时，B128 CUDA Graph capture 在 packed candidate merge 处失败：
+
+```text
+DCP candidate path currently requires dcp_size=2
+```
+
+根因是 fused candidate merge 只实例化了 DCP2。当前实现已扩展到 DCP2/4/8，并按 DCP size 分别实例化 merge kernel，避免 DCP2 总是承担 DCP8 的 shared-memory 配置。相关提交：
+
+- `36d600aeb9`: DCP2/4/8 packed C4 top-k；
+- `ae418cee2a`: 修复模板 kernel launcher 命名空间；
+- `9d9edbea06`: 局部格式整理。
+
+`test/registered/jit/test_dsv4_dcp_topk.py` 已在 H20/CUDA 13 容器通过，覆盖 DCP2/4/8、短 history、非整页尾部、长 history、tie 和空 shard。DCP8 B128 的全部 decode CUDA Graph bucket 也已成功 capture/replay。
+
+### 16.2 GPU-only CUDA Graph Trace
+
+CPU+GPU Kineto 会严重扰动 NCCL，因此定量结果只使用 GPU-only profiler。每个变体包含 8 rank，每个 rank 取 4 次稳定 graph replay；profile 后的 HTTP TPOT 不参与性能结论。
+
+固定 shape：TP8/DCP8/DP1/EP8、B128、prefix 128000、固定 round-robin expert、online C128、FP8 KV cache。
+
+| 变体 | C4 shard | Attention merge | Graph span (ms) | 相对 A |
+|---|---:|---|---:|---:|
+| A | 0 | AG/AR | 46.031 | - |
+| B | 0 | A2A | 44.319 | -3.72% |
+| C | 1 | packed candidate + AG/AR | 42.401 | -7.89% |
+| D | 1 | packed candidate + A2A | 40.722 | -11.53% |
+
+C4 shard 的主要拆账：
+
+| 项目 | A (ms) | C (ms) | Delta (ms) |
+|---|---:|---:|---:|
+| 21 层 C4 paged-MQA score | 5.208 | 0.771 | -4.438 |
+| C4 top-k/candidate/merge | 0.934 | 0.580 | -0.354 |
+| 全 step NCCL AllGather | 3.719 | 4.391 | +0.672 |
+| Graph span | 46.031 | 42.401 | -3.630 |
+
+这证明 128K/DCP8 下，history shard 将 C4 score 缩短约 `85.2%`，21 次 candidate collective 没有抵消计算收益。AllGather 增量是全 step 聚合差值，可视为 candidate 通信成本的近似上界，而不是单独 NCCL event 的精确计费。
+
+A2A 在 C4 shard 之上仍有独立收益：C 到 D 的 graph span 再下降 `1.679 ms`（`3.96%`）。它移除 43 次 FP32 attention-output AllReduce（`4.469 ms`），新增 86 次 SendRecv（`2.383 ms`），同时 FP32 reduce128 增加约 `0.317 ms`。两项优化在当前 shape 下基本可叠加。
+
+### 16.3 无 Profiler E2E
+
+使用 pretokenized fixed B128、prefix 128000、output 512；计时从最后一个请求收到首 token 后开始，因此 256-token page tail admission 不计入 TPOT。
+
+| 变体 | TPOT runs (ms) | Median TPOT (ms) | Median output tok/s |
+|---|---|---:|---:|
+| A tail | 51.968, 52.049 | 52.009 | 2461.13 |
+| C | 48.716, 48.804 | 48.760 | 2625.11 |
+| D | 46.661, 46.667 | 46.664 | 2743.02 |
+
+相对当前 commit 的 A tail：
+
+- C4-only：TPOT `-6.247%`，吞吐 `+6.663%`，decode speedup `1.06663x`；
+- C4 + A2A：TPOT `-10.277%`，吞吐 `+11.454%`，decode speedup `1.11454x`；
+- D 相对 C：TPOT再下降 `4.299%`，吞吐再提高 `4.492%`。
+
+A tail 与之前 6 次 bracketed A 的 `52.151 ms` 相差 `0.27%`，说明基线漂移较小。一次 output 64 的 C4 首轮曾得到 `62.75 ms`，但 output 512 的两轮结果和 graph trace 都稳定为正；短输出单次结果不能用于该 shape 的 go/no-go。
+
+当前 C/D 各只有两次无 profiler 长跑，足以确认方向和量级，但尚未替代最终验收要求的三次 A-B-C-D-A 矩阵。
+
+### 16.4 CUDA Graph 显存
+
+代表性非 TP7 rank：
+
+| 变体 | Graph memory (GB) | Capture 后 available (GB) |
+|---|---:|---:|
+| A | 8.43 | 9.34 |
+| C | 8.44 | 9.34 |
+| B | 11.93 | 5.84 |
+| D | 11.96 | 5.82 |
+
+C4 packed candidate 在 DCP8/B128 下只增加约 `0.01-0.03 GB/GPU`，不是显存问题来源。约 `3.5 GB/GPU` 的增量仍由 A2A 路径和其 graph/NCCL 资源主导；D 变体虽然性能最好，但 A2A 仍必须默认关闭。
+
+### 16.5 剩余 Step 结构
+
+D 变体 `40.722 ms` graph 的主要聚合 kernel 为：
+
+- 4096x4096 GEMM：`5.342 ms`；
+- NCCL AllGather：`3.638 ms`；
+- DeepEP combine：`3.132 ms`；
+- 4096x2048 GEMM：`2.954 ms`；
+- A2A SendRecv：`2.383 ms`；
+- sparse FlashMLA：`1.923 ms`；
+- direct-copy/layout kernels：`1.658 ms`。
+
+其中 GEMM、DeepEP 和 FlashMLA 不是这轮新增的 DCP 通信优化。DCP attention 下一批最明确的目标是 A2A direct-copy/layout 链、recv-side weighted/LSE merge，以及 graph-stable workspace 复用；它们同时关系到约 2 ms 的残余 kernel 开销和 3.5 GB 显存问题。
+
+## 17. 更新后的下一步
+
+1. **A2A 显存拆账与压缩**：采集 allocator snapshot，区分显式 tensor、graph private pool 和 NCCL resource；实现跨层 graph-stable workspace 复用。
+2. **Recv-side fusion**：融合 unpack、global LSE、weighted accumulation，优先消除 full-size `nan_to_num`/FP32 中间量和 direct-copy 链。
+3. **正式 E2E 验收**：在 128K 上补齐 A-B-C-D-A、每变体至少三次，并扩展 B8/32/64/128；随后测 16K/64K crossover，决定 C4 shard 的启用策略。
+4. **C4 正确性加固**：保留 DCP2/4/8 kernel 单测，并补 full score、raw index、physical slot 的 distributed graph 测试。
+5. **最后评估 head-chunk overlap**：只有 recv-side fusion 和显存压缩后，trace 仍显示 SendRecv 暴露在 critical path，才实现 chunk overlap。
+
+C128 独立 fusion 继续不属于本轮 DCP 优化范围。
+
+本轮产物：
+
+```text
+/data/models/dev0616/c4_c128_p0/93a5f85efa/dcp8_128k_timeline/
+/data/models/dev0616/c4_c128_p0/9d9edbea06/dcp8_128k_timeline/
+/data/models/dev0616/c4_c128_p0/9d9edbea06/dcp8_128k_trace_analysis/
+/data/models/dev0616/c4_c128_p0/9d9edbea06/dcp8_128k_e2e/
+```
+
+## 18. A2A 定向 Profiling 与 128K TPOT/显存归因（2026-07-20）
+
+### 18.1 公平对照与计时有效性
+
+当前线上函数名 `cp_lse_ag_out_rs` 容易造成误解。它实际执行的是：
+
+1. LSE all-gather；
+2. FP32 weighted output all-reduce；
+3. 每个 rank 本地切出自己的 head chunk。
+
+它不是 reduce-scatter。本轮在 benchmark 中恢复了一个不进入 production 的真
+`AG+RS` 候选，并将三条路径放在相同的 TP8/DCP8 communicator 下比较：
+
+- `AG+AR`：当前 runtime reference；
+- `AG+RS`：LSE all-gather + FP32 output reduce-scatter；
+- `A2A`：destination-head output A2A + LSE A2A + recv-side merge。
+
+目标 shape 为 `B=128, H=64, D=512`，一个 CUDA Graph 顺序 capture 43 次
+attention merge。每条路径使用独立 `torchrun` 进程，避免前一张 graph 的内存池
+污染后一条路径；CUDA Event 与全设备 synchronize wall time 的差异均小于 `0.1%`。
+
+| 路径 | Event ms/层 | Wall ms/层 | 43 层 graph wall (ms) | Graph reserved delta |
+|---|---:|---:|---:|---:|
+| 当前 AG+AR | 0.197906 | 0.197918 | 8.510 | 0.039 GiB |
+| 真 AG+RS | 0.164134 | 0.164159 | 7.059 | 0.055 GiB |
+| A2A | 0.195437 | 0.195449 | 8.404 | 0.059 GiB |
+
+正确性相对当前 reference：
+
+- AG+RS output max abs diff：`4.77e-7`；
+- A2A output max abs diff：`7.15e-7`；
+- 两条候选的 LSE max abs diff 均为 `0`。
+
+### 18.2 问题一：为什么 A2A 比真 AG+RS 慢
+
+8 rank x 4 graph replay 的 GPU-only trace 中：
+
+| 指标 | AG+RS (ms/graph) | A2A (ms/graph) | A2A delta |
+|---|---:|---:|---:|
+| Graph span | 7.186 | 8.479 | +1.293 (+18.0%) |
+| Kernel sum | 6.698 | 5.807 | -0.890 (-13.3%) |
+| NCCL AllGather | 0.596 | 0 | -0.596 |
+| NCCL ReduceScatter | 2.830 | 0 | -2.830 |
+| NCCL SendRecv | 0 | 2.244 | +2.244 |
+| FP32 reduce128 family | 0.372 | 0.680 | +0.308 |
+
+关键现象是 A2A 的 **kernel sum 更低，但 graph span 更长**：
+
+- AG+RS 的 `span - kernel_sum` 约为 `0.488 ms`；
+- A2A 的 `span - kernel_sum` 约为 `2.672 ms`；
+- A2A 多出约 `2.184 ms` 的未覆盖间隙，抵消了 `0.890 ms` 的 kernel work 节省，
+  最终反而慢 `1.293 ms`。
+
+当前 A2A 每层发起两次 `all_to_all_single`，43 层对应 86 个 NCCL
+`SendRecv` kernel。第二次 LSE A2A 每个 destination 只有约 4 KiB，是纯 latency-bound
+collective；output A2A 还要求 destination-major pack，并在 recv 侧增加 FP32 weighted
+sum。相比之下，reduce-scatter 把传输与求和放进一个专用 NCCL ring-LL collective，
+没有 recv-side output reduction。
+
+Profiler 中 A2A 的 `cudaGraphLaunch` API duration 也接近整个 graph span，而 AG+RS
+只有约 `0.64 ms`。该 API 数字受 profiler 影响，不能单独当作性能结论，但与 P2P graph
+依赖导致 launch/stream 间隙的判断一致。
+
+因此应区分两个结论：
+
+- 对真 AG+RS：A2A 在该 shape 下慢约 `18-19%`；
+- 对当前 AG+AR：A2A 的 standalone graph 快约 `1.3%`，整模型 B128 graph 快
+  `3.72%`，因为它移除了较慢的 43 次 FP32 custom all-reduce。
+
+43 层 graph 的 batch sweep：
+
+| Batch | AG+AR ms/层 | AG+RS ms/层 | A2A ms/层 | A2A vs AG+RS | A2A vs AG+AR |
+|---:|---:|---:|---:|---:|---:|
+| 2 | 0.0460 | 0.0482 | 0.0560 | +16.3% | +21.7% |
+| 8 | 0.0548 | 0.0550 | 0.0598 | +8.7% | +9.2% |
+| 32 | 0.0853 | 0.0787 | 0.1073 | +36.4% | +25.8% |
+| 64 | 0.1184 | 0.1112 | 0.1630 | +46.6% | +37.7% |
+| 128 | 0.1979 | 0.1641 | 0.1954 | +19.1% | -1.3% |
+
+这也解释了之前 B64 加速比下降。B64 的 output chunk 约为 512 KiB/peer，P2P 固定
+间隙尚未被有效摊薄；B128 达到约 1 MiB/peer 后，A2A 才能追平当前 AG+AR。A2A 不应
+按 DCP size 单独启用，至少还要使用 batch bucket 与可用显存做 gating。
+
+### 18.3 问题二：为什么 128K TPOT 大幅增加
+
+使用无 profiler、pretokenized fixed B128、output 256 的同 server sweep。计时从最后
+一个请求收到首 token 后开始，排除了 shared-prefix admission 与 residual prefill：
+
+| Prefix | Median TPOT (ms) | 相对 3.5K delta | Output tok/s |
+|---:|---:|---:|---:|
+| 3.5K | 44.137 | - | 2900.04 |
+| 16K | 45.058 | +0.921 (+2.1%) | 2840.79 |
+| 64K | 48.739 | +4.601 (+10.4%) | 2626.25 |
+| 128K | 54.589 | +10.452 (+23.7%) | 2344.78 |
+
+已由 128K trace 直接量到的首要线性项是冗余 C4 indexer：
+
+- 21 层 full-history C4 score：`5.208 ms`；
+- 21 层 C4 top-k/merge：`0.934 ms`；
+- 合计约 `6.142 ms`。
+
+启用 C4 shard 后，score 下降到 `0.771 ms`、top-k/merge 下降到 `0.580 ms`，二者
+合计节省 `4.792 ms`；candidate collective 增加后，整 graph 净节省 `3.630 ms`，
+无 profiler output512 E2E 净节省约 `3.249 ms`。
+
+因此 128K TPOT 增量可拆成：
+
+1. **已证明的主要项**：C4 full-history score/top-k 随上下文增长，128K 时约占
+   `6.14 ms`；
+2. **待 paired trace 精确拆分的剩余项**：C128 compressed-history attention、相关
+   metadata/compaction、page-table 访问以及 graph 间隙随历史增长；
+3. **固定底座**：即使 3.5K 仍有约 `44 ms`，来自 43 层 GEMM、MoE/DeepEP、
+   attention merge 和其他固定 decode kernel，绝对 TPOT 并不是全部由 128K 引入；
+4. **普通 serving benchmark 的额外噪声**：rolling arrival、cache admission、batch
+   retraction 和 TTFT 混入会把涨幅进一步放大。固定 batch 结果应作为上下文斜率主判据。
+
+A2A 的 output/LSE payload 仅由 `B x H x D` 决定，与 128K context 无关，因此它不是
+128K TPOT 上升的来源。要把剩余约 4 ms 继续闭环，应补 3.5K/16K/64K/128K 的 paired
+GPU-only graph trace，并增加 C128 attention/metadata kernel family。
+
+### 18.4 问题三：为什么 A2A 增加约 3.5 GB/GPU
+
+整模型 capture 日志：
+
+| 变体 | Graph memory | Capture 后 available | PyTorch default pool | PyTorch graph pool |
+|---|---:|---:|---:|---:|
+| AG+AR | 8.43 GB | 9.34 GB | 75.477 GiB | 0.486 GiB |
+| A2A | 11.93 GB | 5.84 GB | 75.477 GiB | 0.504 GiB |
+
+两边在第一个 B128 graph 前的 available 都约为 `17.80 GB`。第一个最大 graph capture
+完成后：
+
+- AG+AR available 为 `10.10 GB`；
+- A2A available 为 `6.65 GB`；
+- `3.45 GB` 差异已经一次性出现，后续小 bucket 只复用最大 pool。
+
+这证明增量：
+
+- 出现在 B128 CUDA Graph capture，而不是 128K KV cache；
+- 与 C4 packed candidate 无关；
+- 也不是普通 PyTorch tensor pool 的 3.5 GB 增长。8 rank runtime allocator snapshot 中，
+  代表性普通 rank 的 default pool 完全相同，graph pool 只增加约 `18 MiB`；
+- standalone 43 层 merge graph 中，A2A 相对 AG+AR 也只多约 `20 MiB` reserved。
+
+当前 A2A 每层显式临时量的量纲约为：
+
+- BF16 output send/recv：`8 + 8 MiB`；
+- recv `nan_to_num`：约 `8 MiB`；
+- FP32 weighted output：约 `16 MiB`；
+- FP32 local output 与 LSE 临时量：约 `2 MiB`；
+- 合计约 `42 MiB/层`，43 层约 `1.76 GiB`。
+
+`1.76 GiB` 若因 NCCL side stream 生命周期、P2P staging 或 capture 双份地址资源而接近
+两份，量纲正好接近观测的 3.5 GB。但 allocator snapshot 证明普通 tensor 本身并未以
+这个规模常驻，所以“哪里发生双份”仍属于推断，不能写成已证明事实。
+
+进一步排除实验：
+
+- `NCCL_GRAPH_REGISTER=0`：整模型仍为 `11.93 GB`，capture 每个 bucket 的 available
+  与默认 A2A 完全一致；
+- `NCCL_GRAPH_HELPER_DISABLE=1`：standalone reserved 不变，A2A 反而从 `0.1954`
+  轻微变慢到 `0.1991 ms/层`。
+
+当前最严格的结论是：**超过 99% 的 A2A 增量位于 PyTorch allocator snapshot 之外，
+由最大 B128 graph 中 86 个 NCCL SendRecv 节点及其跨 stream/capture 资源触发；它不是
+NCCL user-buffer graph registration 开关能够消除的内存。** 要定位到具体 `cudaMalloc`
+调用，需要下一步使用 CUDA API memory trace 或在 ProcessGroupNCCL allocator 上加计数。
+
+### 18.5 下一步 Attention 优化顺序
+
+1. 将真 AG+RS 接入 runtime 临时开关，跑 full-model graph memory 与 A-B E2E。当前
+   standalone B128 比 A2A 快约 `19%`，也没有 A2A 的 P2P graph 间隙。
+2. 保留 A2A 默认关闭。若继续优化，先把 output 与 bit-preserving LSE 合为一次 packed
+   A2A，将 86 个 SendRecv 降到 43 个，再测 graph span 与外部显存。
+3. 为 A2A 使用 backend-owned graph-stable workspace，显式建立跨 NCCL stream 的复用
+   依赖；不能在未证明生命周期安全时直接让 43 层别名到同一 buffer。
+4. 补 paired context trace，拆清 C128 compressed-history 与 metadata 的剩余斜率。
+5. 只有 A2A 的 graph gap 与显存收敛后，再评估 head-chunk compute/communication overlap。
+
+本轮产物：
+
+```text
+/data/models/dev0616/c4_c128_p0/c3e4766409/a2a_profile/
+/data/models/dev0616/c4_c128_p0/c3e4766409/full_model_profile/
+```

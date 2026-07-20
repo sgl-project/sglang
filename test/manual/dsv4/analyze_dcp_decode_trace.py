@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare DCP decode CUDA-graph replay traces from PyTorch profiler."""
+"""Compare DCP CUDA-graph replay traces from PyTorch profiler."""
 
 from __future__ import annotations
 
@@ -14,13 +14,14 @@ from typing import Any
 
 
 GPU_EVENT_CATEGORIES = {"kernel", "gpu_memcpy", "gpu_memset"}
-RANK_PATTERN = re.compile(r"TP-(\d+)")
+RANK_PATTERN = re.compile(r"(?:TP-|rank)(\d+)")
 
 # These labels intentionally describe kernel families, not inferred model stages.
 KERNEL_FAMILIES = (
     ("c4_score", ("paged_mqa_logits",)),
     ("c4_topk", ("radixSortKVInPlace", "topk_combine_transform")),
     ("nccl_allgather", ("ncclDevKernel_AllGather",)),
+    ("nccl_reducescatter", ("ncclDevKernel_ReduceScatter",)),
     ("nccl_sendrecv", ("ncclDevKernel_SendRecv",)),
     ("attn_allreduce_fp32", ("all_reduce_two_shot_kernel<float",)),
     ("allreduce_bf16", ("all_reduce_two_shot_kernel<__nv_bfloat16",)),
@@ -68,7 +69,8 @@ def get_rank(path: Path) -> int:
 
 
 def load_trace(path: Path) -> list[dict[str, Any]]:
-    with gzip.open(path, "rt") as file:
+    opener = gzip.open if path.suffix == ".gz" else open
+    with opener(path, "rt") as file:
         payload = json.load(file)
     events = payload.get("traceEvents")
     if not isinstance(events, list):
@@ -159,7 +161,9 @@ def summarize_variant(
 ) -> dict[str, Any]:
     paths = sorted(trace_dir.glob("*DECODE.trace.json.gz"))
     if not paths:
-        raise FileNotFoundError(f"no DECODE traces found in {trace_dir}")
+        paths = sorted(trace_dir.glob("*.json"))
+    if not paths:
+        raise FileNotFoundError(f"no CUDA graph traces found in {trace_dir}")
 
     rank_samples = {get_rank(path): analyze_trace(path) for path in paths}
     step_counts = {rank: len(samples) for rank, samples in rank_samples.items()}
@@ -237,6 +241,7 @@ def compare_metrics(
         "c4_score_ms",
         "c4_topk_ms",
         "nccl_allgather_ms",
+        "nccl_reducescatter_ms",
         "nccl_sendrecv_ms",
         "attn_allreduce_fp32_ms",
         "allreduce_bf16_ms",
@@ -279,7 +284,7 @@ def render_markdown(
     comparison: list[dict[str, float | str | None]],
 ) -> str:
     lines = [
-        "# DCP Decode CUDA Graph Trace Summary",
+        "# DCP CUDA Graph Trace Summary",
         "",
         (
             f"- {baseline['label']}: {baseline['rank_count']} ranks x "
