@@ -19,20 +19,26 @@ import torch
 import torch.nn.functional as F
 
 from sglang.jit_kernel.dsv4.online_c128_mtp import OnlineC128MTPController
-from sglang.srt.environ import envs
-from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.dsv4.attn_metadata_kernels import (
+from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (
+    dequantize_k_cache_paged,
+)
+from sglang.kernels.ops.attention.dsv4.metadata_kernel import (
+    init_compression_metadata as _init_compression_metadata_triton,
+)
+from sglang.kernels.ops.attention.dsv4.quant_k_cache import (
+    quant_to_nope_fp8_rope_bf16_pack_triton,
+)
+from sglang.kernels.ops.attention.dsv4_attn_metadata_kernels import (
     BuildCausalSwaPageIndices,
     BuildPageTablePositions,
     ExpandPrefillCausally,
 )
+from sglang.srt.environ import envs
+from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.dsv4.compressor_v2 import (
     CompressorBackendMixin,
     FusedCompressMetadata,
     create_paged_compressor_data,
-)
-from sglang.srt.layers.attention.dsv4.dequant_k_cache import (
-    dequantize_k_cache_paged,
 )
 from sglang.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
 from sglang.srt.layers.attention.dsv4.metadata import (
@@ -40,12 +46,6 @@ from sglang.srt.layers.attention.dsv4.metadata import (
     PagedIndexerMetadata,
     copy_metadata,
     maybe_copy_inplace,
-)
-from sglang.srt.layers.attention.dsv4.metadata_kernel import (
-    init_compression_metadata as _init_compression_metadata_triton,
-)
-from sglang.srt.layers.attention.dsv4.quant_k_cache import (
-    quant_to_nope_fp8_rope_bf16_pack_triton,
 )
 from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
     SparsePrefillChunkCache,
@@ -93,6 +93,8 @@ def _get_logical_forward_mode(forward_batch: ForwardBatch) -> ForwardMode:
     # IDLE is a real per-DP-rank mode. Do not let a stale _original_forward_mode
     # from a reused/padded ForwardBatch turn an empty rank into TARGET_VERIFY.
     if forward_batch.forward_mode.is_idle():
+        return forward_batch.forward_mode
+    if forward_batch.forward_mode == ForwardMode.EXTEND:
         return forward_batch.forward_mode
     return (
         getattr(forward_batch, "_original_forward_mode", None)
@@ -564,6 +566,8 @@ class DeepseekV4AttnBackend(
         )
 
         self.is_dspark_draft = model_runner.is_draft_worker and spec_alg.is_dspark()
+        self.is_draft_runner = model_runner.is_draft_worker
+        self.cuda_graph_custom_mask = None
 
     def _move_to_device(self, x: List[int]) -> torch.Tensor:
         pin_tensor = torch.tensor(x, dtype=torch.int32, pin_memory=True)
@@ -1496,6 +1500,20 @@ class DeepseekV4AttnBackend(
         self.draft_extend_num_tokens_per_req = (
             max_num_tokens // max_bs if max_bs > 0 else 1
         )
+        if self.speculative_num_draft_tokens and not self.is_draft_runner:
+            # DSV4's verify metadata ignores custom_mask, but handing
+            # build_tree a preallocated scratch keeps it from dynamically
+            # allocating a FULL_MASK buffer (bs * max_context_len under the
+            # GPU-only spec path) every verify step.
+            self.cuda_graph_custom_mask = torch.zeros(
+                max_num_tokens
+                * (self.max_context_len + self.speculative_num_draft_tokens),
+                dtype=torch.bool,
+                device=self.device,
+            )
+
+    def get_verify_buffers_to_fill_after_draft(self):
+        return [self.cuda_graph_custom_mask, None]
 
     def replay_cuda_graph_metadata_from(
         self,
@@ -1672,9 +1690,14 @@ class DeepseekV4AttnBackend(
                     extra_indices.shape[-1] % 64 == 0
                 ), f"{extra_indices.shape=}'s last dimension is not aligned to 64"
 
-            if forward_batch.forward_mode.is_extend_without_speculative() and (
-                q.shape[0] > _LARGE_INDEXER_QUERY_THRESHOLD
-                or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
+            # sparse_prefill_fwd does not support SM120.
+            if (
+                forward_batch.forward_mode.is_extend_without_speculative()
+                and not _is_sm120
+                and (
+                    q.shape[0] > _LARGE_INDEXER_QUERY_THRESHOLD
+                    or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
+                )
             ):
                 return self._forward_prefill_sparse(
                     q=q,
