@@ -42,7 +42,12 @@ export const FluxDeployment = () => {
         const tpSize = 2;
 
         if (version === 'flux2-dev') {
-          return `ЗАГЛУШКА: FLUX.2-dev Ascend configuration is not validated. The available FLUX.2-klein-4B benchmark is not valid for FLUX.2-dev and needs retesting.`;
+          return `sglang serve \\
+  --tp-size ${tpSize} \\
+  --sp-degree 1 \\
+  --model-path "/models/black-forest-labs/FLUX.2-dev/FLUX.2-dev" \\
+  --port 30008 \\
+  --num-gpus ${numGpus}`;
         }
 
         return `sglang serve \\

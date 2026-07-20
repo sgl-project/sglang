@@ -201,8 +201,7 @@ SGLANG_CACHE_DIT_ENABLED=true sglang serve --model-path Tongyi-MAI/Z-Image-Turbo
     SGLANG_CACHE_DIT_MC=4 \
     SGLANG_CACHE_DIT_TAYLORSEER=true \
     SGLANG_CACHE_DIT_TS_ORDER=2 \
-    # Using Z-Image, not Z-Image-Turbo.
-    sglang serve --model-path /models/Tongyi-MAI/Z-Image/ --tp-size 2 --sp-degree 1 --num-gpus 2 --port 8764
+    sglang serve --model-path /models/Tongyi-MAI/Z-Image-Turbo/Z-Image-Turbo --tp-size 2 --sp-degree 1 --num-gpus 2 --port 30069
     ```
   </Tab>
 </Tabs>
@@ -271,14 +270,13 @@ Test Environment:
     **Server Command**:
 
     ```shell Command
-    # Using Z-Image, not Z-Image-Turbo.
-    sglang serve --model-path /models/Tongyi-MAI/Z-Image/ --tp-size 2 --sp-degree 1 --num-gpus 2 --port 8764
+    sglang serve --model-path /models/Tongyi-MAI/Z-Image-Turbo/Z-Image-Turbo --tp-size 2 --sp-degree 1 --num-gpus 2 --port 30069
     ```
 
     **Benchmark Command**:
 
     ```shell Command
-    python -m sglang.multimodal_gen.benchmarks.bench_serving --port 8764 --dataset vbench --task text-to-image --num-prompts 1 --max-concurrency 1
+    python -m sglang.multimodal_gen.benchmarks.bench_serving --port 30069 --dataset vbench --task text-to-image --num-prompts 1 --max-concurrency 1
     ```
 
     **Result**:
@@ -286,27 +284,27 @@ Test Environment:
     ```text Output
     ================= Serving Benchmark Result =================
     Task:                                         text-to-image
-    Model:                                        /models/Tongyi-MAI/Z-Image/
+    Model:                                        /models/Tongyi-MAI/Z-Image-Turbo/Z-Image-Turbo
     Dataset:                                      vbench
     --------------------------------------------------
-    Benchmark duration (s):                       24.42
+    Benchmark duration (s):                       2.43
     Request rate:                                 inf
     Max request concurrency:                      1
     Successful requests:                          1/1
     Completed outputs:                            1
     Outputs per prompt:                           1
     --------------------------------------------------
-    Request throughput (req/s):                   0.04
-    Output throughput (outputs/s):                0.04
-    Latency Mean (s):                             24.42
-    Latency Median (s):                           24.42
-    Latency P90 (s):                              24.42
-    Latency P95 (s):                              24.42
-    Latency P99 (s):                              24.42
+    Request throughput (req/s):                   0.41
+    Output throughput (outputs/s):                0.41
+    Latency Mean (s):                             2.43
+    Latency Median (s):                           2.43
+    Latency P90 (s):                              2.43
+    Latency P95 (s):                              2.43
+    Latency P99 (s):                              2.43
     --------------------------------------------------
-    Peak Memory Max (MB):                         11062.00
-    Peak Memory Mean (MB):                        11062.00
-    Peak Memory Median (MB):                      11062.00
+    Peak Memory Max (MB):                         11052.00
+    Peak Memory Mean (MB):                        11052.00
+    Peak Memory Median (MB):                      11052.00
     ------------------------------------------------------------
     ```
   </Tab>
@@ -351,7 +349,7 @@ Test Environment:
     **Benchmark Command**:
 
     ```shell Command
-    python -m sglang.multimodal_gen.benchmarks.bench_serving --port 8764 --dataset vbench --task text-to-image --num-prompts 20 --max-concurrency 20
+    python -m sglang.multimodal_gen.benchmarks.bench_serving --port 30069 --dataset vbench --task text-to-image --num-prompts 20 --max-concurrency 20
     ```
 
     **Result**:
@@ -359,27 +357,27 @@ Test Environment:
     ```text Output
     ================= Serving Benchmark Result =================
     Task:                                         text-to-image
-    Model:                                        /models/Tongyi-MAI/Z-Image/
+    Model:                                        /models/Tongyi-MAI/Z-Image-Turbo/Z-Image-Turbo
     Dataset:                                      vbench
     --------------------------------------------------
-    Benchmark duration (s):                       300.37
+    Benchmark duration (s):                       49.08
     Request rate:                                 inf
     Max request concurrency:                      20
-    Successful requests:                          12/20
-    Completed outputs:                            12
+    Successful requests:                          20/20
+    Completed outputs:                            20
     Outputs per prompt:                           1
     --------------------------------------------------
-    Request throughput (req/s):                   0.04
-    Output throughput (outputs/s):                0.04
-    Latency Mean (s):                             158.47
-    Latency Median (s):                           158.50
-    Latency P90 (s):                              265.62
-    Latency P95 (s):                              279.05
-    Latency P99 (s):                              289.80
+    Request throughput (req/s):                   0.41
+    Output throughput (outputs/s):                0.41
+    Latency Mean (s):                             25.78
+    Latency Median (s):                           25.77
+    Latency P90 (s):                              44.42
+    Latency P95 (s):                              46.75
+    Latency P99 (s):                              48.61
     --------------------------------------------------
-    Peak Memory Max (MB):                         11064.00
-    Peak Memory Mean (MB):                        11063.83
-    Peak Memory Median (MB):                      11064.00
+    Peak Memory Max (MB):                         11054.00
+    Peak Memory Mean (MB):                        11054.00
+    Peak Memory Median (MB):                      11054.00
     ------------------------------------------------------------
     ```
   </Tab>
