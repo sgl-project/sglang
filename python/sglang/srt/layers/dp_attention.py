@@ -194,6 +194,10 @@ class _DpGatheredBufferWrapper:
         return cls._local_dp_buffer_len
 
     @classmethod
+    def set_local_dp_buffer_len(cls, local_dp_buffer_len: int) -> None:
+        cls._local_dp_buffer_len = local_dp_buffer_len
+
+    @classmethod
     def get_dp_global_num_tokens(cls) -> List[int]:
         return cls._global_num_tokens
 
@@ -245,6 +249,10 @@ def get_global_dp_buffer_len() -> int:
 
 def get_local_dp_buffer_len() -> int:
     return _DpGatheredBufferWrapper.get_local_dp_buffer_len()
+
+
+def set_local_dp_buffer_len(local_dp_buffer_len: int) -> None:
+    _DpGatheredBufferWrapper.set_local_dp_buffer_len(local_dp_buffer_len)
 
 
 def get_dp_global_num_tokens() -> List[int]:
