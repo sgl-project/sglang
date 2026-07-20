@@ -566,6 +566,11 @@ class Envs:
     # decode without runtime permutes.
     SGLANG_AITER_KV_CACHE_LAYOUT = EnvStr("nhd")
     SGLANG_ROCM_FUSED_DECODE_MLA = EnvBool(False)
+    # Route the DeepSeek attention output projection (o_proj) MXFP4 GEMM through
+    # the aiter ASM a4w4 kernel instead of the triton kernel. Opt-in; requires a
+    # gfx95x device with the prebuilt aiter ASM a4w4 build, otherwise it falls
+    # back to the triton kernel.
+    SGLANG_DSR_OPROJ_MXFP4_ASM = EnvBool(False)
     SGLANG_ROCM_DISABLE_LINEARQUANT = EnvBool(False)
     USE_ROCM_AITER_ROPE_BACKEND = EnvStr("0")
     SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(4096)

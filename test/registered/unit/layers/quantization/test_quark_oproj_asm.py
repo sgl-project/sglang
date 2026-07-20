@@ -16,13 +16,11 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 import unittest
 from unittest.mock import patch
 
-from sglang.srt.layers.quantization.quark import quark as quark_mod
+from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.quark.quark import QuarkConfig
 from sglang.srt.layers.quantization.quark.schemes import quark_w4a4_mxfp4 as mxfp4_mod
 from sglang.srt.layers.quantization.quark.schemes.quark_w4a4_mxfp4 import QuarkW4A4MXFP4
 from sglang.test.test_utils import CustomTestCase
-
-_ENV = "SGLANG_DSR_OPROJ_MXFP4_ASM"
 
 
 def _bare_scheme() -> QuarkW4A4MXFP4:
@@ -72,12 +70,11 @@ class TestGetLinearSchemeRouting(CustomTestCase):
 
         The scheme-selection internals are mocked so the test isolates the
         env/o_proj gate; enable_asm() is exercised for real with ASM forced
-        available.
+        available. `env_value` is passed to the env flag's override() context.
         """
         config = _bare_config()
         scheme = _bare_scheme()
 
-        env = {} if env_value is None else {_ENV: env_value}
         with patch.object(
             QuarkConfig, "_find_matched_config", return_value={}
         ), patch.object(
@@ -90,29 +87,47 @@ class TestGetLinearSchemeRouting(CustomTestCase):
             mxfp4_mod, "_is_hip", True
         ), patch.object(
             mxfp4_mod, "_HAS_ASM_A4W4", True
-        ), patch.dict(
-            quark_mod.os.environ, env, clear=False
+        ), envs.SGLANG_DSR_OPROJ_MXFP4_ASM.override(
+            env_value
         ):
-            # Ensure a stale env var from the outer environment can't leak in.
-            quark_mod.os.environ.pop(_ENV, None)
-            if env_value is not None:
-                quark_mod.os.environ[_ENV] = env_value
             return config.get_linear_scheme(layer=None, layer_name=layer_name)
 
     def test_oproj_with_env_enables_asm(self):
-        scheme = self._run("model.layers.3.self_attn.o_proj", "1")
+        scheme = self._run("model.layers.3.self_attn.o_proj", True)
         self.assertTrue(scheme.use_asm)
 
-    def test_oproj_without_env_keeps_triton(self):
-        scheme = self._run("model.layers.3.self_attn.o_proj", None)
+    def test_oproj_env_disabled_keeps_triton(self):
+        scheme = self._run("model.layers.3.self_attn.o_proj", False)
         self.assertFalse(scheme.use_asm)
 
-    def test_oproj_env_zero_keeps_triton(self):
+    def test_oproj_env_zero_string_keeps_triton(self):
         scheme = self._run("model.layers.3.self_attn.o_proj", "0")
         self.assertFalse(scheme.use_asm)
 
+    def test_oproj_unset_keeps_triton(self):
+        config = _bare_config()
+        scheme = _bare_scheme()
+        envs.SGLANG_DSR_OPROJ_MXFP4_ASM.clear()
+        with patch.object(
+            QuarkConfig, "_find_matched_config", return_value={}
+        ), patch.object(
+            QuarkConfig, "_get_scheme_from_config", return_value=scheme
+        ), patch.object(
+            QuarkConfig, "_check_scheme_supported", return_value=True
+        ), patch.object(
+            scheme, "get_min_capability", return_value=70
+        ), patch.object(
+            mxfp4_mod, "_is_hip", True
+        ), patch.object(
+            mxfp4_mod, "_HAS_ASM_A4W4", True
+        ):
+            scheme = config.get_linear_scheme(
+                layer=None, layer_name="model.layers.3.self_attn.o_proj"
+            )
+        self.assertFalse(scheme.use_asm)
+
     def test_non_oproj_with_env_keeps_triton(self):
-        scheme = self._run("model.layers.3.self_attn.kv_b_proj", "1")
+        scheme = self._run("model.layers.3.self_attn.kv_b_proj", True)
         self.assertFalse(scheme.use_asm)
 
 

@@ -2,11 +2,11 @@
 
 import fnmatch
 import logging
-import os
 from typing import TYPE_CHECKING, Any, List, Optional, cast
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.linear import LinearBase
 from sglang.srt.layers.moe import MoeRunnerConfig
 from sglang.srt.layers.quantization.base_config import (  # noqa: E501
@@ -500,7 +500,7 @@ class QuarkConfig(QuantizationConfig):
         if (
             isinstance(scheme, QuarkW4A4MXFP4)
             and layer_name.endswith("o_proj")
-            and os.environ.get("SGLANG_DSR_OPROJ_MXFP4_ASM", "0") == "1"
+            and envs.SGLANG_DSR_OPROJ_MXFP4_ASM.get()
         ):
             scheme.enable_asm()
 
