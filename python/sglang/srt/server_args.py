@@ -69,6 +69,7 @@ from sglang.srt.utils.common import (
     get_int_env_var,
     get_quantization_config,
     human_readable_int,
+    is_blackwell_supported,
     is_cpu,
     is_cuda,
     is_flashinfer_available,
@@ -169,7 +170,6 @@ QUANTIZATION_CHOICES = [
     "w8a8_int8",  # mentioned in quantization.md documentation, supporting compressed-tensors quant_method.
     "w8a8_fp8",  # mentioned in quantization.md documentation, supporting compressed-tensors quant_method.
     "moe_wna16",  # custom loading logic for gptq/awq checkpoints (likely untested/unused)
-    "qoq",
     "w4afp8",
     "mxfp4",  # MOE-only.
     "auto-round",
@@ -263,6 +263,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "aiter",
     "marlin",
     "humming",
+    "experimental_sgl_marlin",
 ]
 
 MOE_A2A_BACKEND_CHOICES = [
@@ -324,6 +325,7 @@ DEFAULT_LORA_EVICTION_POLICY = "lru"
 
 DSA_CHOICES = [
     "flashmla_sparse",
+    "flashmla_sparse_q8",
     "flashmla_kv",
     "flashmla_auto",
     "fa3",
@@ -605,10 +607,23 @@ class ServerArgs:
             help=(
                 'Data type for kv cache storage. "auto" will use model data type. '
                 '"bf16" or "bfloat16" for BF16 KV cache. "fp8_e5m2" and '
-                '"fp8_e4m3" are supported for CUDA 11.8+. "fp4_e2m1" (only '
-                "mxfp4) is supported for CUDA 12.8+ and PyTorch 2.8.0+"
+                '"fp8_e4m3" are supported for CUDA 11.8+. "mxfp8" is supported '
+                'by the FA4 backend. "nvfp4" selects '
+                'the NVFP4 FP4 E2M1 KV cache recipe; "fp4_mx_block16" '
+                "selects the MX-style block-size-16 FP4 E2M1 KV cache "
+                "recipe. Both require CUDA 12.8+ and PyTorch 2.8.0+"
             ),
-            choices=["auto", "fp8_e5m2", "fp8_e4m3", "bf16", "bfloat16", "fp4_e2m1"],
+            choices=[
+                "auto",
+                "fp8_e5m2",
+                "fp8_e4m3",
+                "mxfp8",
+                "bf16",
+                "bfloat16",
+                "nvfp4",
+                "fp4_mx_block16",
+                "fp4_e2m1",
+            ],
             resolvable=True,
         ),
     ] = "auto"
@@ -1427,7 +1442,7 @@ class ServerArgs:
     fp8_gemm_runner_backend: A[
         str,
         Arg(
-            help="Choose the runner backend for Blockwise FP8 GEMM operations. Options: 'auto' (default, auto-selects based on hardware), 'deep_gemm' (JIT-compiled; enabled by default on NVIDIA Hopper (SM90) and Blackwell (SM100) when DeepGEMM is installed), 'flashinfer_trtllm' (optimal for Blackwell and low-latency), 'flashinfer_cutlass' (FlashInfer CUTLASS groupwise FP8 GEMM), 'flashinfer_deepgemm' (Hopper SM90 only; uses swapAB optimization for small M dimensions in decoding), 'cutlass' (optimal for Hopper/Blackwell GPUs and high-throughput), 'triton' (fallback, widely compatible), 'aiter' (ROCm only). ",
+            help="Choose the runner backend for Blockwise FP8 GEMM operations. Options: 'auto' (default, auto-selects based on hardware), 'deep_gemm' (JIT-compiled; enabled by default on NVIDIA Hopper (SM90) and Blackwell (SM100) when DeepGEMM is installed), 'flashinfer_trtllm' (optimal for Blackwell and low-latency), 'flashinfer_cutlass' (FlashInfer CUTLASS groupwise FP8 GEMM), 'flashinfer_deepgemm' (Hopper SM90 only; uses swapAB optimization for small M dimensions in decoding), 'cutlass' (optimal for SM120 GPUs), 'triton' (fallback, widely compatible), 'aiter' (ROCm only). ",
             cli_name="--fp8-gemm-backend",
             choices=FP8_GEMM_RUNNER_BACKEND_CHOICES,
             resolvable=True,
@@ -1616,6 +1631,10 @@ class ServerArgs:
     enable_torch_symm_mem: A[
         bool,
         "Enable using torch symm mem for all-reduce kernel and fall back to NCCL. Only supports CUDA device SM90 and above. SM90 supports world size 4, 6, 8. SM100 supports world size 6, 8.",
+    ] = False
+    enable_scattered_sconv: A[
+        bool,
+        "Inkling: replace the attention/MLP output all-reduce with a hidden-dimension reduce-scatter, run the channelwise output short convolution on the [T, H/P] shard, then all-gather before the residual add. This shards the convolution cache across tensor-parallel ranks without changing communication volume.",
     ] = False
     pre_warm_nccl: A[
         bool,
@@ -2072,7 +2091,10 @@ class ServerArgs:
     ] = 0
     mamba_full_memory_ratio: A[
         float,
-        "The ratio of mamba state memory to full kv cache memory.",
+        Arg(
+            help="The ratio of mamba state memory to full kv cache memory.",
+            resolvable=True,
+        ),
     ] = 0.9
     mamba_radix_cache_strategy: A[
         str,
@@ -2136,7 +2158,7 @@ class ServerArgs:
         "baseline (the per-K g_cache is K x larger and the reconstruction "
         "refolds the per-K decay every step), so it is not recommended for KDA "
         "models. Requires the Triton linear-attn decode backend and "
-        "--mamba-scheduler-strategy no_buffer (the default).",
+        "--mamba-radix-cache-strategy no_buffer (the default).",
     ] = False
     linear_replayssm_cache_len: A[
         int,
@@ -2889,6 +2911,10 @@ class ServerArgs:
         self._validate_prefill_only_disable_kv_cache_args()
         self._handle_dcp_validation()
 
+        # Model-arch prefill CUDA-graph default must land before cuda-graph
+        # resolution (the declarative registry materializes too late to affect
+        # it). Inkling opts into full-graph prefill capture here.
+        self._apply_inkling_prefill_cuda_graph_default()
         self._handle_cuda_graph_config()
 
         # Handle device-specific backends.
@@ -2923,6 +2949,7 @@ class ServerArgs:
         self._handle_int8_mamba_checkpoint()
         self._handle_linear_attn_backend()
         self._handle_kv4_compatibility()
+        self._handle_mxfp8_kv_cache_compatibility()
         self._handle_page_size()
         self._handle_amd_specifics()
         self._handle_nccl_pre_warm()
@@ -2961,6 +2988,7 @@ class ServerArgs:
         self._handle_eplb_and_dispatch()
         self._handle_expert_distribution_metrics()
         self._handle_elastic_ep()
+        self._validate_experimental_sgl_marlin()
 
         # Handle pipeline parallelism.
         self._handle_pipeline_parallelism()
@@ -3470,6 +3498,25 @@ class ServerArgs:
     # ------------------------------------------------------------------
     # CUDA graph configuration resolution
     # ------------------------------------------------------------------
+    def _apply_inkling_prefill_cuda_graph_default(self):
+        """Inkling opts into full-graph prefill CUDA-graph capture. Must run
+        before _handle_cuda_graph_config: the generic breakable default is
+        auto-disabled for this multimodal arch, and declarative model overrides
+        materialize too late to steer cuda-graph resolution. Honors an explicit
+        --cuda-graph-backend-prefill / --disable-prefill-cuda-graph."""
+        if (
+            self.cuda_graph_backend_prefill is not None
+            or self.disable_prefill_cuda_graph
+            or parse_connector_type(self.model_path) == ConnectorType.INSTANCE
+        ):
+            return
+        arch = self.get_model_config().hf_config.architectures[0]
+        if arch in (
+            "InklingForConditionalGeneration",
+            "InklingForConditionalGenerationMTP",
+        ):
+            self.cuda_graph_backend_prefill = Backend.FULL
+
     def _handle_cuda_graph_config(self):
         self._parse_cuda_graph_config()
         self._apply_cuda_graph_compatibility()
@@ -4409,6 +4456,16 @@ class ServerArgs:
 
             run_post_process_pass(self, _deepseek_moe_quant_resolution)
             if is_hip():
+                if is_deepseek_dsa(hf_config):
+                    # The fused top-k v2 kernel (topk_transform_512_v2) is a
+                    # CUDA/Hopper-only path: its JIT source includes
+                    # <cooperative_groups.h> and uses cg::this_cluster()
+                    # (thread-block clusters), neither of which exists on ROCm,
+                    # so it fails to JIT-compile on gfx9xx during CUDA-graph
+                    # capture. DeepSeek-V4 already disables it on HIP; mirror that
+                    # here for the rest of the DSA family (DeepSeek-V3.2 /
+                    # GLM-5.x) that shares the same decode top-k path.
+                    envs.SGLANG_OPT_USE_TOPK_V2.set(False)
                 if not self._resolved().enable_dp_attention and self.nnodes == 1:
                     # TODO (Hubert): Put this back later
                     # self.enable_aiter_allreduce_fusion = True
@@ -4450,6 +4507,8 @@ class ServerArgs:
                 envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.set(False)
                 envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
                 envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.set(True)
+                # Prefer TileLang over the Torch fallback.
+                envs.SGLANG_OPT_USE_TILELANG_INDEXER.set(True)
             elif is_hip():
                 envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
                 envs.SGLANG_OPT_USE_FUSED_COMPRESS.set(True)
@@ -4957,11 +5016,21 @@ class ServerArgs:
             self.enable_mixed_chunk = False
             self.disable_radix_cache = True
 
+    def _handle_mxfp8_kv_cache_compatibility(self):
+        """MXFP8 KV cache uses operands available only on SM100+ (Blackwell)."""
+        if self.kv_cache_dtype != "mxfp8":
+            return
+        if not is_blackwell_supported():
+            raise ValueError(
+                "--kv-cache-dtype mxfp8 requires an SM100+ (Blackwell) GPU for the "
+                "block-scaled operands used by the FA4 MXFP8 attention path."
+            )
+
     def _handle_kv4_compatibility(self):
         """Check FP4 KV cache compatibility with the attention backend"""
         from sglang.srt.arg_groups.overrides import resolved_view
 
-        if self.kv_cache_dtype != "fp4_e2m1":
+        if self.kv_cache_dtype not in ("nvfp4", "fp4_mx_block16"):
             return
 
         use_mla_backend = self.use_mla_backend()
@@ -4969,6 +5038,13 @@ class ServerArgs:
         attention_backend = resolved_view(self).attention_backend
 
         if is_cuda():
+            if self.kv_cache_dtype == "nvfp4" and not (
+                is_sm100_supported() or is_sm120_supported()
+            ):
+                raise RuntimeError(
+                    "--kv-cache-dtype=nvfp4 requires Blackwell SM100 or SM120. "
+                    "Use --kv-cache-dtype=fp4_mx_block16 for the block-size-16 FP4 recipe."
+                )
             if (
                 prefill_backend != decode_backend and prefill_backend != "fa4"
             ):  # Take care of prefill=fa4 later
@@ -5005,7 +5081,6 @@ class ServerArgs:
                             "cutlass_mla",
                             "flashinfer",
                             "trtllm_mla",
-                            "flashmla",
                         ]
                         assert attention_backend in KV4_ATTENTION_MLA_BACKEND_CHOICES, (
                             f"KV4 MLA expects attention_backend to be one of "
@@ -5218,10 +5293,10 @@ class ServerArgs:
 
             if mamba_extra_buffer_of(resolved_view(self)):
                 raise ValueError(
-                    "--enable-linear-replayssm requires --mamba-scheduler-strategy "
+                    "--enable-linear-replayssm requires --mamba-radix-cache-strategy "
                     "no_buffer (the default); the extra_buffer ping-pong "
                     "donation path is not yet supported (follow-up). Got "
-                    f"--mamba-scheduler-strategy={self.mamba_scheduler_strategy!r}."
+                    f"--mamba-radix-cache-strategy={self.mamba_radix_cache_strategy!r}."
                 )
             if self.disaggregation_mode != "null":
                 # The disaggregated decode pool (HybridMambaDecodeReqToTokenPool)
@@ -5292,6 +5367,21 @@ class ServerArgs:
                 and not envs.SGLANG_ENABLE_CP_V2.is_set()
             ):
                 envs.SGLANG_ENABLE_CP_V2.set(True)
+
+            if (
+                self.enable_prefill_cp
+                and model_arch in ("MiMoV2ForCausalLM", "MiMoV2FlashForCausalLM")
+                and envs.SGLANG_ENABLE_CP_V2.get()
+            ):
+                if self.cp_strategy != "zigzag":
+                    raise ValueError(
+                        "MiMo V2 CP-v2 only supports --cp-strategy zigzag."
+                    )
+                if model_config.is_multimodal and not self.language_only:
+                    raise ValueError(
+                        "MiMo V2 CP-v2 only supports text inference; add "
+                        "--language-only."
+                    )
 
         if self.enable_prefill_cp and self.cp_strategy is None:
             raise ValueError(
@@ -5851,6 +5941,19 @@ class ServerArgs:
                 f"(got moe_a2a_backend={resolved.moe_a2a_backend})."
             )
 
+    def _validate_experimental_sgl_marlin(self):
+        view = self._resolved()
+        if view.moe_runner_backend != "experimental_sgl_marlin":
+            return
+
+        # ===== TO BE REFACTORED ====
+        from sglang.srt.lora.marlin_lora_temp.policy import (
+            validate_experimental_sgl_marlin_server_args,
+        )
+
+        validate_experimental_sgl_marlin_server_args(self, view)
+        # ===== END TO BE REFACTORED ====
+
     def _handle_expert_distribution_metrics(self):
         if self.enable_expert_distribution_metrics and (
             self.expert_distribution_recorder_mode is None
@@ -5892,11 +5995,17 @@ class ServerArgs:
                 "Other prefill-only workloads may be supported in a future change once "
                 "their attention paths stop reading or writing the paged KV cache."
             )
-        if self.kv_cache_dtype == "fp4_e2m1":
+        if self.kv_cache_dtype in ("nvfp4", "fp4_mx_block16"):
             raise ValueError(
                 "--prefill-only-disable-kv-cache does not currently support "
-                "--kv-cache-dtype=fp4_e2m1 because the FP4 pool uses a separate "
-                "allocation path."
+                "--kv-cache-dtype=nvfp4 or --kv-cache-dtype=fp4_mx_block16 because "
+                "the FP4 pool uses a separate allocation path."
+            )
+        if self.kv_cache_dtype == "mxfp8":
+            raise ValueError(
+                "--prefill-only-disable-kv-cache does not currently support "
+                "--kv-cache-dtype=mxfp8 because the MXFP8 pool stores separate "
+                "scale-factor buffers."
             )
 
         # Structural preconditions for the FA backend's fa_skip_kv_cache path,
