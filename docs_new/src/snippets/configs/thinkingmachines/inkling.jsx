@@ -796,7 +796,9 @@ export const config = {
         "--moe-runner-backend flashinfer_trtllm_routed",
         "--enable-torch-symm-mem",
         "--mamba-radix-cache-strategy extra_buffer",
-        "--mem-fraction-static 0.87",
+        // BF16 + MTP is tight on B300: 0.87 boots but caps the token pool near
+        // ~185k; 0.93 fits the full 1M context (matches the Balanced cell).
+        "--mem-fraction-static 0.93",
         "--swa-full-tokens-ratio 0.1",
         "--mamba-full-memory-ratio 0.1",
         "--enable-multimodal",
