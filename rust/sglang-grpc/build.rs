@@ -1,5 +1,5 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let proto_path = "../../proto/sglang/runtime/v1/sglang.proto";
+    let proto_path = "../../python/sglang/srt/grpc/sglang.proto";
 
     tonic_build::configure()
         .build_server(true)
@@ -9,7 +9,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap())
                 .join("sglang_descriptor.bin"),
         )
-        .compile_protos(&[proto_path], &["../../proto"])?;
+        .compile_protos(&[proto_path], &["../../python/sglang/srt/grpc"])?;
 
     println!("cargo:rerun-if-changed={}", proto_path);
     Ok(())

@@ -81,6 +81,9 @@ jobs:
           rm dist/*.whl
           mv dist-repaired/*.whl dist/
 
+      - name: Verify native gRPC contract in wheel
+        run: python3 scripts/ci/check_grpc_proto_in_wheel.py python/dist/*.whl
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:

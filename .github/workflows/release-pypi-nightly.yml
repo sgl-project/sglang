@@ -96,6 +96,9 @@ jobs:
           echo "commit_hash=${COMMIT_HASH}" >> $GITHUB_OUTPUT
           echo "build_date=${BUILD_DATE}" >> $GITHUB_OUTPUT
 
+      - name: Verify native gRPC contract in wheel
+        run: python3 scripts/ci/check_grpc_proto_in_wheel.py python/dist/*.whl
+
       - name: Upload wheel artifact
         uses: actions/upload-artifact@v4
         with:

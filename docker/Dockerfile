@@ -215,13 +215,13 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     ; \
     fi
 
-# Copy dep spec + Rust crate source + proto files. setuptools-rust compiles the
+# Copy dep spec + Rust crate source + proto file. setuptools-rust compiles the
 # Rust extension during the stub wheel build; the crate's build.rs references
-# ../../proto for tonic_build. Split from the pip install so source changes to
-# these paths invalidate the dep-install layer, but Python source changes don't.
+# the packaged proto for tonic_build. Split from the pip install so changes to
+# these paths invalidate the dep-install layer, but other Python source does not.
 COPY python/pyproject.toml /tmp/sglang_deps/python/pyproject.toml
+COPY python/sglang/srt/grpc/sglang.proto /tmp/sglang_deps/python/sglang/srt/grpc/sglang.proto
 COPY rust/sglang-grpc      /tmp/sglang_deps/rust/sglang-grpc
-COPY proto                 /tmp/sglang_deps/proto
 
 # Install sglang dependencies (torch, transformers, etc.)
 # Generate constraints.txt to prevent reinstalling these deps in later stages
