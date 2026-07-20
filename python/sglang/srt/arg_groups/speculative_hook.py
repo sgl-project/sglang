@@ -241,6 +241,18 @@ def _handle_dflash(server_args: ServerArgs) -> None:
             )
         server_args.speculative_num_draft_tokens = inferred_block_size
 
+    draft_block_size = int(server_args.speculative_num_draft_tokens)
+    if server_args.speculative_dflash_verify_budget is None:
+        server_args.speculative_dflash_verify_budget = draft_block_size
+    else:
+        verify_budget = int(server_args.speculative_dflash_verify_budget)
+        if verify_budget <= 0 or verify_budget > draft_block_size:
+            raise ValueError(
+                "DFLASH requires --speculative-dflash-verify-budget to be in "
+                f"[1, {draft_block_size}], got {verify_budget}."
+            )
+        server_args.speculative_dflash_verify_budget = verify_budget
+
     if server_args.speculative_draft_window_size is not None:
         draft_tokens = int(server_args.speculative_num_draft_tokens)
         if server_args.speculative_draft_window_size < draft_tokens:

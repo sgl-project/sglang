@@ -107,6 +107,10 @@ def resolve_num_tokens_per_req(
     if phase == "target_verify":
         if num_draft_tokens is None:
             num_draft_tokens = server_args.speculative_num_draft_tokens
+        if spec_algorithm.is_dflash() and not is_draft_worker:
+            num_draft_tokens = (
+                server_args.speculative_dflash_verify_budget or num_draft_tokens
+            )
         return spec_algorithm.get_num_tokens_per_req_for_target_verify(
             num_draft_tokens, is_draft_worker
         )
