@@ -3,8 +3,8 @@ from unittest.mock import patch
 
 import torch
 
-import sglang.srt.layers.attention.dsa.transform_index as transform_index_module
-from sglang.srt.layers.attention.dsa.transform_index import (
+import sglang.kernels.ops.attention.dsa.transform_index as transform_index_module
+from sglang.kernels.ops.attention.dsa.transform_index import (
     transform_index_page_table_decode_fast,
     transform_index_page_table_prefill_fast,
 )

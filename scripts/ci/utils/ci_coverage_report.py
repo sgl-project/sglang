@@ -32,8 +32,8 @@ from ci_register import CIRegistry, HWBackend, ut_parse_one_file
 # the report -- if the assert below fires, add the new backend name here in
 # the right display slot. Order isn't alphabetical: CUDA/AMD/NPU/CPU lead
 # (highest test volume historically), then accelerators that have been
-# wired into the registry more recently (XPU, MUSA).
-BACKEND_DISPLAY_ORDER = ("CUDA", "AMD", "NPU", "CPU", "XPU", "MUSA")
+# wired into the registry more recently (XPU, MUSA, MLX).
+BACKEND_DISPLAY_ORDER = ("CUDA", "AMD", "NPU", "CPU", "XPU", "MUSA", "MLX")
 assert set(BACKEND_DISPLAY_ORDER) == {
     b.name for b in HWBackend
 }, "BACKEND_DISPLAY_ORDER is out of sync with HWBackend"

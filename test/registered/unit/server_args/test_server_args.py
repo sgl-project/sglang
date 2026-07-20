@@ -59,6 +59,80 @@ class TestPrepareServerArgs(CustomTestCase):
             os.unlink(config_file)
 
 
+class TestMultimodalFeatureTransport(CustomTestCase):
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    def test_cuda_ipc_is_explicit_and_bounded(self, _mock_is_cuda):
+        server_args = ServerArgs(
+            model_path="dummy",
+            mm_feature_transport="cuda_ipc",
+            tokenizer_worker_num=4,
+            base_gpu_id=2,
+        )
+
+        with patch.dict(os.environ, {"SGLANG_USE_CUDA_IPC_TRANSPORT": "0"}):
+            with self.assertLogs(server_args_module.logger, level="INFO") as logs:
+                server_args._handle_multimodal_feature_transport()
+
+            self.assertEqual(server_args.mm_feature_transport, "cuda_ipc")
+            self.assertTrue(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
+
+        output = "\n".join(logs.output)
+        self.assertIn("base GPU 2", output)
+        self.assertIn("4 tokenizer worker", output)
+
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    def test_legacy_keep_flag_maps_to_cuda_ipc(self, _mock_is_cuda):
+        server_args = ServerArgs(model_path="dummy", keep_mm_feature_on_device=True)
+
+        with patch.dict(os.environ, {"SGLANG_USE_CUDA_IPC_TRANSPORT": "0"}):
+            with self.assertLogs(server_args_module.logger, level="WARNING") as logs:
+                server_args._handle_multimodal_feature_transport()
+
+            self.assertEqual(server_args.mm_feature_transport, "cuda_ipc")
+            self.assertFalse(server_args.keep_mm_feature_on_device)
+            self.assertTrue(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
+
+        self.assertIn("deprecated", logs.output[0])
+
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    def test_explicit_cpu_overrides_legacy_environment(self, _mock_is_cuda):
+        server_args = ServerArgs(model_path="dummy", mm_feature_transport="cpu")
+
+        with patch.dict(os.environ, {"SGLANG_USE_CUDA_IPC_TRANSPORT": "1"}):
+            with self.assertLogs(server_args_module.logger, level="WARNING") as logs:
+                server_args._handle_multimodal_feature_transport()
+
+            self.assertEqual(server_args.mm_feature_transport, "cpu")
+            self.assertFalse(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
+
+        self.assertIn("overrides", logs.output[0])
+
+    def test_default_transport_is_cpu(self):
+        server_args = ServerArgs(model_path="dummy")
+
+        with patch.dict(os.environ, {"SGLANG_USE_CUDA_IPC_TRANSPORT": "0"}):
+            server_args._handle_multimodal_feature_transport()
+
+            self.assertEqual(server_args.mm_feature_transport, "cpu")
+            self.assertFalse(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
+
+    @patch("sglang.srt.server_args.is_cuda", return_value=False)
+    def test_cuda_ipc_rejects_non_nvidia_platforms(self, _mock_is_cuda):
+        server_args = ServerArgs(model_path="dummy", mm_feature_transport="cuda_ipc")
+
+        with self.assertRaisesRegex(ValueError, "requires NVIDIA CUDA"):
+            server_args._handle_multimodal_feature_transport()
+
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    def test_cuda_ipc_rejects_multi_node(self, _mock_is_cuda):
+        server_args = ServerArgs(
+            model_path="dummy", mm_feature_transport="cuda_ipc", nnodes=2
+        )
+
+        with self.assertRaisesRegex(ValueError, "single node"):
+            server_args._handle_multimodal_feature_transport()
+
+
 class TestMambaCacheStochasticRounding(unittest.TestCase):
     def test_rejects_fp32_ssm_cache(self):
         server_args = ServerArgs(
@@ -156,6 +230,22 @@ class TestLoadBalanceMethod(unittest.TestCase):
 
         self.assertFalse(server_args.disable_radix_cache)
         self.assertEqual(server_args.disaggregation_transfer_backend, "mooncake")
+
+
+class TestSkipTokenizerInit(unittest.TestCase):
+    def test_skip_tokenizer_worker_counts(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            skip_tokenizer_init=True,
+            tokenizer_worker_num=4,
+            detokenizer_worker_num=3,
+        )
+
+        server_args._handle_tokenizer_batching()
+
+        # Tokenizer fanout preserved; detokenizer coerced to 1 (no decode work).
+        self.assertEqual(server_args.tokenizer_worker_num, 4)
+        self.assertEqual(server_args.detokenizer_worker_num, 1)
 
 
 class TestHiSparseDsaBackendPolicy(unittest.TestCase):
@@ -1046,7 +1136,7 @@ class TestPrefillOnlyDisableKvCache(unittest.TestCase):
       - disable_radix_cache (radix cache otherwise indexes empty pool slots),
       - no context-parallel attention (CP writes to the pool via set_kv_buffer),
       - no HiSparse (uses a different pool family),
-      - kv_cache_dtype != fp4_e2m1 (FP4 pool is a separate allocation path).
+      - kv_cache_dtype is not nvfp4/fp4_mx_block16 (FP4 pool is a separate allocation path).
     All other configurations must be rejected before model load.
     """
 
@@ -1096,8 +1186,10 @@ class TestPrefillOnlyDisableKvCache(unittest.TestCase):
             self._validate_prefill_only_args(enable_hisparse=True)
 
     def test_rejects_fp4_kv_cache(self):
-        with self.assertRaisesRegex(ValueError, "fp4_e2m1"):
-            self._validate_prefill_only_args(kv_cache_dtype="fp4_e2m1")
+        for kv_cache_dtype in ("nvfp4", "fp4_mx_block16"):
+            with self.subTest(kv_cache_dtype=kv_cache_dtype):
+                with self.assertRaisesRegex(ValueError, "nvfp4.*fp4_mx_block16"):
+                    self._validate_prefill_only_args(kv_cache_dtype=kv_cache_dtype)
 
 
 class TestSessionRadixCacheServerArgs(unittest.TestCase):

@@ -16,27 +16,26 @@ from sglang.srt.utils.custom_op import register_custom_op
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
-from sglang.jit_kernel.utils import CPP_DTYPE_MAP as OUTPUT_DTYPE_MAP
-
 
 @cache_once
 def _jit_per_token_group_quant_8bit_module(
     dtype: torch.dtype, output_type: torch.dtype, group_size: int
 ) -> Module:
     dtype_arg = make_cpp_args(dtype)
+    out_arg = make_cpp_args(output_type)
     gs_arg = make_cpp_args(group_size)
     pdl_arg = make_cpp_args(is_arch_support_pdl())
-    out_cpp = OUTPUT_DTYPE_MAP[output_type]
     return load_jit(
         "per_token_group_quant_8bit",
         *dtype_arg,
+        *out_arg,
         *gs_arg,
         *pdl_arg,
         cuda_files=["gemm/per_token_group_quant_8bit.cuh"],
         cuda_wrappers=[
             (
                 "per_token_group_quant_8bit",
-                f"per_token_group_quant_8bit<{dtype_arg}, {out_cpp}, {gs_arg}, {pdl_arg}>",
+                f"per_token_group_quant_8bit<{dtype_arg}, {out_arg}, {gs_arg}, {pdl_arg}>",
             )
         ],
     )

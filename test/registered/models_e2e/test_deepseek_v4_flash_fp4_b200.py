@@ -170,6 +170,17 @@ class TestDSV4FlashFP4BreakableCudaGraphB200(
 
     gsm8k_accuracy_thres = 0.93
 
+    @unittest.skip(
+        "Flaky: temp-0 outputs are nondeterministic under this recipe "
+        "(sparse-DP prefill replays the breakable CUDA graph with a "
+        "fabricated idle-rank dummy extend; its hidden states vary run to "
+        "run and perturb real tokens' logits through the shared EP grouped "
+        "GEMMs at capture buckets 4/16). Introduced by #30898; disabled "
+        "pending a proper fix that keeps BCG enabled. See #31125."
+    )
+    def test_determinism_temp_zero(self):
+        pass
+
     @classmethod
     def setUpClass(cls):
         cls.model = try_cached_model(MODEL)

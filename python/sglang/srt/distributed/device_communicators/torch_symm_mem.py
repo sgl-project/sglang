@@ -11,6 +11,7 @@ from torch.distributed import ProcessGroup
 from sglang.srt.distributed.device_communicators.all_reduce_utils import (
     TORCH_SYMM_MEM_ALL_REDUCE_MAX_SIZES,
 )
+from sglang.srt.environ import envs
 from sglang.srt.utils import is_cuda, is_hip
 
 try:
@@ -48,7 +49,7 @@ class TorchSymmMemCommunicator:
     # to the two-shot path.
     _WORLD_SIZES_MULTIMEM = {
         9: [4, 6, 8],
-        10: [6, 8],
+        10: [4, 6, 8],
     }
 
     def __init__(self, group: ProcessGroup, device: Union[int, str, torch.device]):
@@ -93,6 +94,19 @@ class TorchSymmMemCommunicator:
             )
             return
         self.max_size = supported_max_sizes[self.world_size]
+        # Keep the JIT all-reduce buffer above the largest prefill payload
+        # ([16384, 6144] bf16 = 192 MiB), including room for tail regions.
+        if envs.SGLANG_OPT_USE_INKLING_CUSTOM_AR.get():
+            self.max_size = max(self.max_size, 256 * 1024 * 1024)
+            from sglang.srt.runtime_context import get_server_args
+
+            if (
+                get_server_args().enable_scattered_sconv
+                or envs.SGLANG_OPT_USE_INKLING_FUSED_AR_SCONV.get()
+            ):
+                # Fused extend kernels are out-of-place, so OUT must hold the
+                # same maximum prefill payload as IN, including tail regions.
+                self.max_size = max(self.max_size, 512 * 1024 * 1024)
         self.buffer = torch_symm_mem.empty(
             self.max_size // self.dtype.itemsize,
             device=self.device,

@@ -1,0 +1,23 @@
+[package]
+name = "sglang-mm"
+version = "0.1.0"
+edition = "2024"
+description = "Rust-accelerated multimodal preprocessing for SGLang"
+license = "Apache-2.0"
+
+[lib]
+name = "_core"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.23", features = ["extension-module"] }
+numpy = "0.23"
+rayon = "1.10"
+half = "2.4"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+blake3 = "1"
+base64 = "0.22"
+
+[profile.release]
+lto = true
+codegen-units = 1

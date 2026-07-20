@@ -10,8 +10,8 @@ from weakref import WeakValueDictionary
 import torch
 
 from sglang.kernels.ops.moe.ep_moe_kernels import moe_permute, moe_unpermute
+from sglang.kernels.ops.moe.moe_fused_mul_sum import moe_fused_mul_sum
 from sglang.srt.environ import envs
-from sglang.srt.layers.moe.fused_moe_triton.moe_fused_mul_sum import moe_fused_mul_sum
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
     MoeRunnerConfig,

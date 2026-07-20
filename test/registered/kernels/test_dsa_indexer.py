@@ -720,7 +720,7 @@ class TestDSAIndexer(CustomTestCase):
         self.assertEqual(indexer.layer_id, self.config["layer_id"])
 
     @patch("sglang.srt.layers.attention.dsa.dsa_indexer.deep_gemm")
-    @patch("sglang.srt.layers.attention.dsa.triton_kernel.act_quant")
+    @patch("sglang.kernels.ops.attention.dsa.triton_kernel.act_quant")
     def test_forward_extend_mode(self, mock_act_quant, mock_deep_gemm):
         """Test indexer forward pass in extend mode."""
         if not self.supports_fp8:
@@ -802,7 +802,7 @@ class TestDSAIndexer(CustomTestCase):
         )
 
     @patch("sglang.srt.layers.attention.dsa.dsa_indexer.deep_gemm")
-    @patch("sglang.srt.layers.attention.dsa.triton_kernel.act_quant")
+    @patch("sglang.kernels.ops.attention.dsa.triton_kernel.act_quant")
     def test_forward_decode_mode(self, mock_act_quant, mock_deep_gemm):
         """Test indexer forward pass in decode mode."""
         if not self.supports_fp8:

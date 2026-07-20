@@ -281,6 +281,8 @@ def create_grammar_backend(
             tokenizer=tokenizer,
             any_whitespace=not server_args.constrained_json_disable_any_whitespace,
             whitespace_pattern=server_args.constrained_json_whitespace_pattern,
+            n_vocab=vocab_size,
+            eos_token_ids=eos_token_ids,
         )
     elif name == "none":
         if server_args.enable_strict_thinking:

@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from sglang.srt.server_args import ServerArgs
@@ -103,6 +104,62 @@ class TestBaseProcessorConfigExtraction(unittest.TestCase):
         self.assertEqual(proc.audio_config, {})
 
 
+class TestMultimodalFeatureTransportRuntime(unittest.TestCase):
+    @staticmethod
+    def _server_args(mm_feature_transport):
+        return SimpleNamespace(
+            mm_feature_transport=mm_feature_transport,
+            keep_mm_feature_on_device=False,
+            disable_fast_image_processor=False,
+            skip_tokenizer_init=False,
+            mm_process_config={},
+            tokenizer_worker_num=1,
+            base_gpu_id=2,
+        )
+
+    @staticmethod
+    def _processor():
+        processor = MagicMock()
+        processor.tokenizer.encode.return_value = []
+        return processor
+
+    def test_cuda_ipc_pool_uses_resolved_server_arg(self):
+        # The processor module can be imported before this instance is built;
+        # transport policy must still resolve from the instance's ServerArgs.
+        from sglang.srt.multimodal.processors import base_processor
+
+        with patch.object(
+            base_processor.BaseMultimodalProcessor, "__abstractmethods__", set()
+        ), patch.object(base_processor, "MmItemMemoryPool") as memory_pool:
+            processor = base_processor.BaseMultimodalProcessor(
+                hf_config=MagicMock(),
+                server_args=self._server_args("cuda_ipc"),
+                _processor=self._processor(),
+                transport_mode=None,
+            )
+
+        self.assertEqual(processor.mm_feature_transport, "cuda_ipc")
+        self.assertTrue(processor.use_cuda_ipc)
+        memory_pool.assert_called_once()
+
+    def test_cpu_transport_does_not_allocate_ipc_pool(self):
+        from sglang.srt.multimodal.processors import base_processor
+
+        with patch.object(
+            base_processor.BaseMultimodalProcessor, "__abstractmethods__", set()
+        ), patch.object(base_processor, "MmItemMemoryPool") as memory_pool:
+            processor = base_processor.BaseMultimodalProcessor(
+                hf_config=MagicMock(),
+                server_args=self._server_args("cpu"),
+                _processor=self._processor(),
+                transport_mode=None,
+            )
+
+        self.assertEqual(processor.mm_feature_transport, "cpu")
+        self.assertFalse(processor.use_cuda_ipc)
+        memory_pool.assert_not_called()
+
+
 class TestProcessMmDataKwargs(unittest.TestCase):
     """Verify process_mm_data injects per-modality kwargs correctly."""
 
@@ -114,6 +171,7 @@ class TestProcessMmDataKwargs(unittest.TestCase):
 
         server_args = MagicMock()
         server_args.mm_process_config = mm_process_config
+        server_args.mm_feature_transport = "cpu"
         server_args.disable_fast_image_processor = True
         server_args.keep_mm_feature_on_device = True
         server_args.skip_tokenizer_init = False
@@ -135,6 +193,8 @@ class TestProcessMmDataKwargs(unittest.TestCase):
 
         proc.server_args = server_args
         proc.keep_mm_feature_on_device = server_args.keep_mm_feature_on_device
+        proc.mm_feature_transport = server_args.mm_feature_transport
+        proc.use_cuda_ipc = False
         proc.disable_fast_image_processor = server_args.disable_fast_image_processor
         proc.skip_tokenizer_init = server_args.skip_tokenizer_init
         proc._processor = mock_processor
@@ -217,6 +277,7 @@ class TestOverrideProcessorsConfigInjection(unittest.TestCase):
         """Create an override processor with mocked dependencies."""
         server_args = MagicMock()
         server_args.mm_process_config = mm_process_config
+        server_args.mm_feature_transport = "cpu"
         server_args.disable_fast_image_processor = True
         server_args.keep_mm_feature_on_device = False
         server_args.skip_tokenizer_init = False
@@ -232,6 +293,8 @@ class TestOverrideProcessorsConfigInjection(unittest.TestCase):
 
         proc.server_args = server_args
         proc.keep_mm_feature_on_device = server_args.keep_mm_feature_on_device
+        proc.mm_feature_transport = server_args.mm_feature_transport
+        proc.use_cuda_ipc = False
         proc.disable_fast_image_processor = server_args.disable_fast_image_processor
         proc.skip_tokenizer_init = server_args.skip_tokenizer_init
         proc._processor = mock_hf_processor
@@ -317,6 +380,7 @@ class TestDoubleBosGuard(unittest.TestCase):
 
         server_args = MagicMock()
         server_args.mm_process_config = {}
+        server_args.mm_feature_transport = "cpu"
         server_args.disable_fast_image_processor = True
         server_args.keep_mm_feature_on_device = True
 

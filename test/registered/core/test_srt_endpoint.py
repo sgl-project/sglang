@@ -28,8 +28,8 @@ from sglang.test.test_utils import (
     run_logprob_check,
 )
 
-register_cuda_ci(est_time=134, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=130, suite="stage-b-test-1-gpu-small-amd")
+register_cuda_ci(est_time=160, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=160, suite="stage-b-test-1-gpu-small-amd")
 
 SERVER_ENV = {"SGLANG_USE_PICKLE_IPC": "0"}
 
@@ -43,7 +43,10 @@ class TestSRTEndpoint(CustomTestCase):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            env=SERVER_ENV,
+            # The tiny logprob chunk size routes this file's logprob tests
+            # through the multi-chunk stitching path (requests at or below 64
+            # rows still cover the non-chunked path).
+            env={**SERVER_ENV, "SGLANG_LOGITS_PROCESSER_CHUNK_SIZE": "64"},
             other_args=(
                 "--enable-custom-logit-processor",
                 "--mem-fraction-static",
@@ -268,6 +271,47 @@ class TestSRTEndpoint(CustomTestCase):
         func = partial(run_logprob_check, self)
         with ThreadPoolExecutor(8) as executor:
             list(executor.map(func, args))
+
+    def test_logprob_token_ids_chunked(self):
+        """input_token_ids_logprobs must line up with input_token_logprobs across chunks.
+
+        The two fields are stitched by separate code paths
+        (get_token_ids_logprobs_chunk vs the arange gather), so at positions
+        where the actual next token is probed their values must agree.
+        """
+        prompt_ids = list(range(5, 305))
+        probe_ids = list(range(5, 305, 37))
+        response = requests.post(
+            self.base_url + "/generate",
+            json={
+                "input_ids": prompt_ids,
+                "sampling_params": {
+                    "temperature": 0,
+                    "max_new_tokens": 4,
+                    "ignore_eos": True,
+                },
+                "return_logprob": True,
+                "logprob_start_len": 0,
+                "token_ids_logprob": probe_ids,
+            },
+        )
+        meta = response.json()["meta_info"]
+        input_token_logprobs = meta["input_token_logprobs"]
+        input_token_ids_logprobs = meta["input_token_ids_logprobs"]
+        self.assertEqual(len(input_token_ids_logprobs), len(input_token_logprobs))
+
+        probe_id_set = set(probe_ids)
+        checked = 0
+        for (logprob, token_id, *_), probes in zip(
+            input_token_logprobs, input_token_ids_logprobs
+        ):
+            if logprob is None or token_id not in probe_id_set:
+                continue
+            probe_logprobs = {tid: lp for lp, tid, *_ in probes}
+            self.assertAlmostEqual(probe_logprobs[token_id], logprob, places=4)
+            checked += 1
+        # The consecutive-id prompt guarantees every 37th position is probed.
+        self.assertGreater(checked, 4)
 
     def test_logprob_grammar(self):
         prompts = "Question: Is Paris the Capital of France? Answer:"

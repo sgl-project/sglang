@@ -1145,7 +1145,7 @@ def dsa_impl_capability(impl: str) -> tuple[bool, str]:
 
     if impl == "tilelang":
         try:
-            from sglang.srt.layers.attention.dsa.tilelang_kernel import (  # noqa: F401
+            from sglang.kernels.ops.attention.dsa.tilelang_kernel import (  # noqa: F401
                 tilelang_sparse_fwd,
             )
         except ImportError as exc:

@@ -29,10 +29,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "python"))
 import torch
 import triton
 
-from sglang.srt.layers.attention.fla.fused_recurrent import (
+from sglang.kernels.ops.attention.fla.fused_recurrent import (
     fused_recurrent_gated_delta_rule_packed_decode,
 )
-from sglang.srt.layers.attention.fla.fused_sigmoid_gating_recurrent import (
+from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update,
 )
 

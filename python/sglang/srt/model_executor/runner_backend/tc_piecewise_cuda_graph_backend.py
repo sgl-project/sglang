@@ -200,6 +200,14 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
                                     f"Compiling num tokens ({num_tokens=})"
                                 )
                             cuda_graph_runner._run_dummy_forward(num_tokens=num_tokens)
+
+                # Qwen3-VL deepstack embeddings are produced only after
+                # visual encoding. First trace the tensor branch above, then
+                # execute it once outside the compile-warmup marker so its
+                # regular kernel/JIT warmup also happens during startup.
+                cuda_graph_runner.run_dummy_multimodal_deepstack_forward(
+                    inner_model, cuda_graph_runner.capture_num_tokens[-1]
+                )
             finally:
                 _toggle_multi_platform_ops(inner_model, reverse=True, num_tokens=16)
 

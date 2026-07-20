@@ -284,6 +284,7 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
             local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
             output_dtype=layer.moe_runner_config.params_dtype,
             device=str(layer.w13_weight.device),
+            activation=layer.moe_runner_config.activation,
         )
 
     w1_alpha, fc2_input_scale, w2_alpha, used_input_scale = (
@@ -355,7 +356,10 @@ def fused_experts_none_to_flashinfer_cutedsl_fp4(
     from sglang.srt.layers.moe.topk import TopKOutputChecker
     from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
 
-    assert runner_config.activation == "silu", "Only silu is supported for CuteDSL MoE."
+    assert runner_config.activation in (
+        "silu",
+        "relu2",
+    ), f"CuteDSL MoE supports 'silu' (gated) or 'relu2' (non-gated), got {runner_config.activation!r}."
     assert quant_info.wrapper is not None, "CuteDSL v2 path requires CuteDslMoEWrapper."
 
     hidden_states = dispatch_output.hidden_states
@@ -409,7 +413,10 @@ def fused_experts_flashinfer_to_flashinfer_cutedsl_fp4(
     from sglang.srt.layers.moe.topk import TopKOutputChecker
     from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
 
-    assert runner_config.activation == "silu", "Only silu is supported for CuteDSL MoE."
+    assert runner_config.activation in (
+        "silu",
+        "relu2",
+    ), f"CuteDSL MoE supports 'silu' (gated) or 'relu2' (non-gated), got {runner_config.activation!r}."
     assert quant_info.wrapper is not None, "CuteDSL v2 path requires CuteDslMoEWrapper."
 
     hidden_states = dispatch_output.hidden_states
@@ -468,7 +475,10 @@ def fused_experts_deepep_to_flashinfer_cutedsl_fp4(
     )
     from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPLLCombineInput
 
-    assert runner_config.activation == "silu", "Only silu is supported for CuteDSL MoE."
+    assert runner_config.activation in (
+        "silu",
+        "relu2",
+    ), f"CuteDSL masked MoE supports 'silu' or 'relu2', got {runner_config.activation!r}."
     assert (
         not runner_config.apply_router_weight_on_input
     ), "apply_router_weight_on_input is not supported for Flashinfer"
@@ -504,6 +514,7 @@ def fused_experts_deepep_to_flashinfer_cutedsl_fp4(
         w2_blockscale=quant_info.w2_weight_sf,
         w2_alpha=quant_info.w2_alpha,
         masked_m=masked_m,
+        activation=runner_config.activation,
         **(
             dict(
                 down_sm_count=overlap.num_sms,

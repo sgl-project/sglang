@@ -9,9 +9,15 @@ from typing import Optional
 
 import torch
 
-from .causal_conv1d_triton import PAD_SLOT_ID
-from .causal_conv1d_triton import causal_conv1d_fn as _causal_conv1d_fn_triton
-from .causal_conv1d_triton import causal_conv1d_update as _causal_conv1d_update_triton
+from sglang.kernels.ops.mamba.causal_conv1d_triton import (
+    PAD_SLOT_ID,
+)
+from sglang.kernels.ops.mamba.causal_conv1d_triton import (
+    causal_conv1d_fn as _causal_conv1d_fn_triton,
+)
+from sglang.kernels.ops.mamba.causal_conv1d_triton import (
+    causal_conv1d_update as _causal_conv1d_update_triton,
+)
 
 try:
     from sgl_kernel import causal_conv1d_fwd

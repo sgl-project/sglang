@@ -24,7 +24,6 @@ from sglang.test.test_marlin_utils import (
 )
 
 register_cuda_ci(est_time=13, stage="base-b-kernel-unit", runner_config="1-gpu-large")
-register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
 
 MNK_FACTORS = [
     (1, 1, 1),

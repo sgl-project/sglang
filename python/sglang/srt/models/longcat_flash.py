@@ -123,6 +123,24 @@ else:
 logger = logging.getLogger(__name__)
 
 
+def _scmoe_align_rows(t, target):
+    """Align a [rows,H] tensor to `target` rows across the attn-tp group:
+    all_gather when target>rows (target==rows*attn_tp_size), or take this rank's
+    contiguous segment when target<rows."""
+    if t is None or t.shape[0] == target:
+        return t
+    from sglang.srt.layers.dp_attention import attn_tp_all_gather_into_tensor as _ag
+    from sglang.srt.runtime_context import get_parallel as _gp
+
+    cur = t.shape[0]
+    if target > cur:
+        out = t.new_empty((target, *t.shape[1:]))
+        _ag(out, t.contiguous())
+        return out
+    r = _gp().attn_tp_rank
+    return t[r * target : r * target + target].contiguous()
+
+
 class LongcatFlashMLP(nn.Module):
     def __init__(
         self,
@@ -284,7 +302,12 @@ class LongcatFlashMoE(nn.Module):
         if self.zero_expert_type is not None and hidden_states.shape[0] > 0:
             final_hidden_states += zero_expert_result.to(final_hidden_states.device)
 
-        if self.tp_size > 1:
+        # LONGCAT_MOE_A2A_SKIP_ALLREDUCE: skip the post-experts TP all-reduce when a
+        # real EP a2a backend is active -- self.experts (DeepEPMoE) already combined
+        # expert outputs across EP ranks, so an extra all-reduce double-counts.
+        from sglang.srt.layers.moe.utils import get_moe_a2a_backend as _lc_gab
+
+        if self.tp_size > 1 and _lc_gab().is_none():
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         return final_hidden_states.view(num_tokens, hidden_dim)
@@ -459,6 +482,11 @@ class LongcatFlashDecoderLayer(nn.Module):
             prev_topk_indices,
         )
 
+        # SCMOE_ATTN1_GATHER: reconcile mlp-branch (hidden/residual) with moe-branch
+        # (moe_hidden_states) row counts before the add, so residual tracks hidden.
+        _scmoe_tgt = moe_hidden_states.shape[0]
+        hidden_states = _scmoe_align_rows(hidden_states, _scmoe_tgt)
+        residual = _scmoe_align_rows(residual, _scmoe_tgt)
         hidden_states = moe_hidden_states + hidden_states
         return hidden_states, residual, prev_topk_indices
 
@@ -471,6 +499,21 @@ class LongcatFlashDecoderLayer(nn.Module):
         zero_allocator,
         prev_topk_indices,
     ):
+        # SCMOE_ATTN1_GATHER: gather the dense-branch hidden(+residual) to full
+        # tokens before mlps[0] so its all_reduce is valid; slice back at the merge.
+        from sglang.srt.layers.moe.utils import get_moe_a2a_backend as _scmoe_gab
+
+        _scmoe_ats = self.attn_tp_size
+        _scmoe_do = (
+            not _scmoe_gab().is_none()
+            and _scmoe_ats > 1
+            and hidden_states.shape[0] != 0
+            and hidden_states.shape[0] * _scmoe_ats == positions.shape[0]
+        )
+        if _scmoe_do:
+            hidden_states = _scmoe_align_rows(hidden_states, positions.shape[0])
+            residual = _scmoe_align_rows(residual, positions.shape[0])
+
         # first_mlp
         hidden_states = self.mlps[0](hidden_states)
         # TP all_reduce

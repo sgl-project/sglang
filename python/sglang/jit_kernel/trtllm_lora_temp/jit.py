@@ -24,6 +24,12 @@ def gen_sgl_trtllm_gen_fused_moe_sm100_module():
     flashinfer_data_dir = Path(flashinfer.__file__).resolve().parent / "data"
     flashinfer_csrc_dir = flashinfer_data_dir / "csrc"
     flashinfer_include_dir = flashinfer_data_dir / "include"
+    kernel_runner_header = (
+        flashinfer_include_dir / "flashinfer/trtllm/batched_gemm/KernelRunner.h"
+    )
+    has_permuted_bias_row_idx = (
+        "permutedIdxToBiasRowIdx" in kernel_runner_header.read_text()
+    )
 
     include_path = f"{ArtifactPath.TRTLLM_GEN_BMM}/include"
     header_name = "flashinferMetaInfo"
@@ -85,6 +91,7 @@ def gen_sgl_trtllm_gen_fused_moe_sm100_module():
             "-DENABLE_FP8",
             "-DENABLE_FP4",
             "-DCUTLASS_ENABLE_GDC_FOR_SM100=1",
+            f"-DSGLANG_FLASHINFER_HAS_PERMUTED_BIAS_ROW_IDX={int(has_permuted_bias_row_idx)}",
             f'-DTLLM_GEN_GEMM_CUBIN_PATH=\\"{ArtifactPath.TRTLLM_GEN_BMM}\\"',
         ]
         + nvcc_flags,

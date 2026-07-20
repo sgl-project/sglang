@@ -24,6 +24,7 @@ from sglang.kernels.ops.attention.decode_attention import _extract_kv_strides
 from sglang.kernels.ops.attention.prefill_attention import (
     context_attention_fwd,
 )
+from sglang.kernels.ops.attention.score_mod import unpack_aux_tensors
 from sglang.srt.utils import is_cuda, is_gfx95_supported, is_hip
 
 _is_cuda = is_cuda()
@@ -295,6 +296,11 @@ def _fwd_kernel(
     STORE_TRANSPOSE: tl.constexpr,
     HAS_SINK: tl.constexpr,
     PAGE_SIZE: tl.constexpr = 1,
+    SCORE_MOD: tl.constexpr = None,
+    Aux0=None,
+    aux0_stride_t=0,
+    aux0_stride_h=0,
+    aux0_len=0,
 ):
     cur_seq = tl.program_id(0)
     cur_head = tl.program_id(1)
@@ -450,6 +456,22 @@ def _fwd_kernel(
             if xai_temperature_len > 0:
                 qk *= xai_temperature_reg[:, None]
 
+            if SCORE_MOD is not None:
+                qk = SCORE_MOD(
+                    qk,
+                    (cur_seq_len_prefix + cur_block_m * BLOCK_M + offs_m)[:, None],
+                    start_n + offs_n[None, :],
+                    (cur_seq_extend_start_idx + cur_block_m * BLOCK_M + offs_m)[
+                        :, None
+                    ],
+                    cur_head,
+                    final_mask,
+                    Aux0,
+                    aux0_stride_t,
+                    aux0_stride_h,
+                    aux0_len,
+                )
+
             qk = tl.where(final_mask, qk, float("-inf"))
 
             row_max = tl.max(qk, 1)
@@ -565,6 +587,22 @@ def _fwd_kernel(
             if xai_temperature_len > 0:
                 qk *= xai_temperature_reg[:, None]
 
+            if SCORE_MOD is not None:
+                qk = SCORE_MOD(
+                    qk,
+                    (cur_seq_len_prefix + cur_block_m * BLOCK_M + offs_m)[:, None],
+                    cur_seq_len_prefix + start_n + offs_n[None, :],
+                    (cur_seq_extend_start_idx + cur_block_m * BLOCK_M + offs_m)[
+                        :, None
+                    ],
+                    cur_head,
+                    final_mask,
+                    Aux0,
+                    aux0_stride_t,
+                    aux0_stride_h,
+                    aux0_len,
+                )
+
             qk = tl.where(final_mask, qk, float("-inf"))
 
             row_max = tl.max(qk, 1)
@@ -646,6 +684,8 @@ def extend_attention_fwd(
     skip_prefix=False,
     skip_extend=False,
     page_size: int = 1,
+    score_mod=None,
+    aux_tensors=None,
 ):
     """
     q_extend, k_extend, v_extend, o_extend: contiguous tensors
@@ -656,6 +696,8 @@ def extend_attention_fwd(
     written to it (used by DCP to merge partial attention across ranks).
     ``skip_prefix`` / ``skip_extend`` skip the prefix-KV / current-chunk stage
     respectively so DCP can compute those two parts separately.
+    ``score_mod`` / ``aux_tensors`` add a custom term to the attention logits;
+    see triton_ops/score_mod.py for the contract.
     """
     Lq, Lk, Lv = (
         q_extend.shape[-1],
@@ -693,6 +735,10 @@ def extend_attention_fwd(
     )
     v_slot_stride, v_head_stride, v_page_stride, v_tok_stride = _extract_kv_strides(
         v_buffer, page_size
+    )
+
+    aux0, aux0_stride_t, aux0_stride_h, aux0_len = unpack_aux_tensors(
+        score_mod, aux_tensors
     )
 
     _fwd_kernel[grid](
@@ -751,6 +797,11 @@ def extend_attention_fwd(
         HAS_SINK=HAS_SINK,
         STORE_TRANSPOSE=_is_hip,
         PAGE_SIZE=page_size,
+        SCORE_MOD=score_mod,
+        Aux0=aux0,
+        aux0_stride_t=aux0_stride_t,
+        aux0_stride_h=aux0_stride_h,
+        aux0_len=aux0_len,
         num_warps=num_warps,
         num_stages=num_stages,
         **extra_kargs,
@@ -838,6 +889,11 @@ def _fwd_kernel_unified(
     USE_CUSTOM_MASK: tl.constexpr,
     HAS_SINK: tl.constexpr,
     PAGE_SIZE: tl.constexpr = 1,
+    SCORE_MOD: tl.constexpr = None,
+    Aux0=None,
+    aux0_stride_t=0,
+    aux0_stride_h=0,
+    aux0_len=0,
 ):
     """
     Unified 1-stage kernel for deterministic extend attention.
@@ -1026,6 +1082,20 @@ def _fwd_kernel_unified(
             if xai_temperature_len > 0:
                 qk *= xai_temperature_reg[:, None]
 
+            if SCORE_MOD is not None:
+                qk = SCORE_MOD(
+                    qk,
+                    (cur_seq_prefix_len + cur_block_m * BLOCK_M + offs_m)[:, None],
+                    start_n + offs_n[None, :],
+                    (cur_seq_q_start_idx + cur_block_m * BLOCK_M + offs_m)[:, None],
+                    cur_head,
+                    final_mask,
+                    Aux0,
+                    aux0_stride_t,
+                    aux0_stride_h,
+                    aux0_len,
+                )
+
             qk = tl.where(final_mask, qk, float("-inf"))
 
             # Online softmax
@@ -1101,6 +1171,8 @@ def extend_attention_fwd_unified(
     window_start_pos=None,
     xai_temperature_len=-1,
     page_size: int = 1,
+    score_mod=None,
+    aux_tensors=None,
 ):
     """
     Unified 1-stage extend attention for deterministic inference.
@@ -1162,6 +1234,10 @@ def extend_attention_fwd_unified(
         v_buffer, page_size
     )
 
+    aux0, aux0_stride_t, aux0_stride_h, aux0_len = unpack_aux_tensors(
+        score_mod, aux_tensors
+    )
+
     _fwd_kernel_unified[grid](
         q,
         o,
@@ -1204,6 +1280,11 @@ def extend_attention_fwd_unified(
         USE_CUSTOM_MASK=USE_CUSTOM_MASK,
         HAS_SINK=HAS_SINK,
         PAGE_SIZE=page_size,
+        SCORE_MOD=score_mod,
+        Aux0=aux0,
+        aux0_stride_t=aux0_stride_t,
+        aux0_stride_h=aux0_stride_h,
+        aux0_len=aux0_len,
         num_warps=num_warps,
         num_stages=num_stages,
         **extra_kargs,

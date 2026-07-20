@@ -15,7 +15,7 @@
 #include <sgl_kernel/tensor.h>  // For host dtype helpers and TensorView metadata
 #include <sgl_kernel/utils.h>   // For RuntimeCheck and div_ceil
 
-#include <sgl_kernel/type.cuh>   // For dtype_trait conversions
+#include <sgl_kernel/type.cuh>   // For DTypeTrait conversions
 #include <sgl_kernel/utils.cuh>  // For LaunchKernel and CUDA dtype aliases
 #include <sgl_kernel/vec.cuh>    // For device::AlignedVector
 
@@ -99,8 +99,8 @@ __device__ __forceinline__ float to_float<bf16_t>(bf16_t v) {
 
 template <typename T>
 __device__ __forceinline__ T residual_gate_value(T residual, T update, T gate) {
-  const T product = dtype_trait<T>::from(to_float(update) * to_float(gate));
-  return dtype_trait<T>::from(to_float(residual) + to_float(product));
+  const T product = DTypeTrait<T>::from(to_float(update) * to_float(gate));
+  return DTypeTrait<T>::from(to_float(residual) + to_float(product));
 }
 
 template <typename T, int kVec>

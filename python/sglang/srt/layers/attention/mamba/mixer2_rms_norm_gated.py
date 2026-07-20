@@ -2,11 +2,11 @@ from typing import Union
 
 import torch
 
+from sglang.kernels.ops.attention.fla.layernorm_gated import rms_norm_gated
 from sglang.srt.distributed.communication_op import (
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
-from sglang.srt.layers.attention.fla.layernorm_gated import rms_norm_gated
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_reduce,
     is_dp_attention_enabled,

@@ -1,6 +1,6 @@
 import logging
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 import torch
 
@@ -41,6 +41,7 @@ class EagleVerifyInput(SpecInput):
         super().__init__(SpecInputType.EAGLE_VERIFY)
         if self.num_tokens_per_req < 0:
             self.num_tokens_per_req = self.draft_token_num
+        self.num_tokens_for_logprob_per_req = self.draft_token_num
 
     @property
     def max_tree_depth(self) -> int:
@@ -54,9 +55,6 @@ class EagleVerifyInput(SpecInput):
         """Branching factor passed to the tree-verify kernels; -1 means an
         irregular tree (no fixed per-level branching)."""
         return self.topk
-
-    def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
-        return self.draft_token_num, self.draft_token_num
 
     @classmethod
     def create_idle_input(
@@ -183,9 +181,6 @@ class EagleDraftInput(SpecInput):
     def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_DRAFT)
 
-    def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
-        return self.num_tokens_per_req, self.num_tokens_for_logprob_per_req
-
     @classmethod
     def create_idle_input(
         cls,
@@ -213,7 +208,12 @@ class EagleDraftInput(SpecInput):
             capture_hidden_mode=capture_hidden_mode,
         )
 
-    def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
+    def filter_batch(
+        self,
+        new_indices: torch.Tensor,
+        has_been_filtered: bool = True,
+        new_indices_cpu: Optional[List[int]] = None,
+    ):
         if self.future_indices is not None:
             self.future_indices = self.future_indices[new_indices]
             return
@@ -313,6 +313,7 @@ class EagleDraftExtendInput(SpecInput):
     # Both kept for cuda-graph buffer indexing.
     num_correct_drafts: torch.Tensor = None
     num_accept_tokens: torch.Tensor = None
+    num_front_tokens: int = 0
     # CPU view, read by attention backends during the extend forward.
     num_accept_tokens_cpu: List[int] = None
 
@@ -338,15 +339,18 @@ class EagleDraftExtendInput(SpecInput):
     dsa_seed_topk_capture: Optional[torch.Tensor] = None
     dsa_seed_topk_select: Optional[torch.Tensor] = None
 
+    # Flat per-req index of each request's last accepted window row
+    # (i * window + front + num_correct_drafts[i]). When set, the logits
+    # processor runs lm_head only on these rows. None under gathered-buffer
+    # (DP) modes, whose logprob buffer sizing assumes all-row logits.
+    select_index: Optional[torch.Tensor] = None
+
     # None for draft-extend's idle batch; attention backends fall back to
     # rebuilding plain metadata from seq_lens when this is None.
     kv_indptr: torch.Tensor = None
 
     def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_DRAFT_EXTEND)
-
-    def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
-        return self.num_tokens_per_req, self.num_tokens_for_logprob_per_req
 
     @classmethod
     def create_idle_input(

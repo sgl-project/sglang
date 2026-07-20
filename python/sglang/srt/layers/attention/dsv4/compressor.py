@@ -12,13 +12,13 @@ from sglang.jit_kernel.dsv4.compress_old import (
     compress_forward,
     compress_fused_norm_rope_inplace,
 )
-from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
-from sglang.srt.environ import envs
-from sglang.srt.layers.attention.dsa.triton_kernel import act_quant
-from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
-from sglang.srt.layers.attention.dsv4.quant_k_cache import (
+from sglang.kernels.ops.attention.dsa.triton_kernel import act_quant
+from sglang.kernels.ops.attention.dsv4.quant_k_cache import (
     quant_to_nope_fp8_rope_bf16_pack_triton,
 )
+from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
+from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_output
@@ -99,7 +99,7 @@ class CompressorBackendMixin:
             if not is_paged:
                 raise NotImplementedError("HIP fused compressor expects paged metadata")
 
-            from sglang.srt.layers.attention.dsv4.fused_compress_triton import (
+            from sglang.kernels.ops.attention.dsv4.fused_compress_triton import (
                 hip_compress_forward,
                 hip_compress_fused_norm_rope_hadamard_inplace,
                 hip_compress_fused_norm_rope_inplace,

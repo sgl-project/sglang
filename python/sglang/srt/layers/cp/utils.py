@@ -27,6 +27,7 @@ from sglang.srt.layers.cp.interleave import (
     InterleaveContextParallelMetadata,
     InterleaveCPStrategy,
 )
+from sglang.srt.layers.cp.padding import pad_logical_token_to_physical
 from sglang.srt.layers.cp.zigzag import (
     ContextParallelMetadata,
     ZigzagContextParallelMetadata,
@@ -39,7 +40,11 @@ if TYPE_CHECKING:
 
 CP_V2_DEFAULT_MODEL_CLASSES = frozenset(
     {
+        "GptOssForCausalLM",
+        "MiMoV2FlashForCausalLM",
+        "MiMoV2ForCausalLM",
         "Qwen3MoeForCausalLM",
+        "DeepseekV3ForCausalLM",
     }
 )
 
@@ -151,15 +156,33 @@ def prepare_cp_forward(forward_batch) -> None:
     assert is_cp_v2_active(forward_batch)
     strategy = get_cp_strategy()
     assert strategy is not None
-    num_tokens = len(forward_batch.input_ids)
 
     seq_lens_cpu = _to_int_list(getattr(forward_batch, "seq_lens_cpu", None))
     extend_lens_cpu = _to_int_list(getattr(forward_batch, "extend_seq_lens_cpu", None))
-    forward_batch.attn_cp_metadata = strategy.build_metadata(
-        num_tokens=num_tokens,
-        seqs_len=seq_lens_cpu,
-        extend_seqs_len=extend_lens_cpu,
+    num_tokens = (
+        sum(extend_lens_cpu)
+        if extend_lens_cpu is not None
+        else len(forward_batch.input_ids)
     )
+    if forward_batch.attn_cp_metadata is None:
+        forward_batch.attn_cp_metadata = strategy.build_metadata(
+            num_tokens=num_tokens,
+            seqs_len=seq_lens_cpu,
+            extend_seqs_len=extend_lens_cpu,
+        )
+        pad_logical_token_to_physical(forward_batch.attn_cp_metadata)
+
+    if getattr(forward_batch, "global_num_tokens_cpu", None) is not None:
+        from sglang.srt.layers.dp_attention import set_local_dp_buffer_len
+
+        set_local_dp_buffer_len(
+            forward_batch.attn_cp_metadata.per_rank_actual_token[
+                get_parallel().attn_cp_rank
+            ]
+        )
+
+    if getattr(forward_batch, "out_cache_loc", None) is not None:
+        forward_batch.out_cache_loc = forward_batch.out_cache_loc[:num_tokens]
 
 
 def cp_split_before_forward(
@@ -190,6 +213,9 @@ def cp_gather_after_forward(x: Any, forward_batch, stream: Optional[Any] = None)
         hidden_states = strategy.gather_hidden_states(
             hidden_states, forward_batch, stream
         )
+        # MiMo's text-only body returns (hidden_states, None); logits expects a tensor.
+        if len(rest) == 1 and rest[0] is None:
+            return hidden_states
         return (hidden_states, *rest)
 
     return strategy.gather_hidden_states(x, forward_batch, stream)

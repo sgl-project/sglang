@@ -53,7 +53,7 @@ explicitly, e.g.:
 
 ```python
 from sglang.kernels import select_kernel, KernelBackend
-jit_rmsnorm = select_kernel("layernorm.rmsnorm", backend=KernelBackend.CUDA_JIT).load()
+jit_rmsnorm = select_kernel("layernorm.rmsnorm", backend=KernelBackend.JIT).load()
 ```
 
 ## `BaseFusedOp` — the per-operator implementation contract
@@ -67,7 +67,7 @@ single `forward()`:
   every other backend is checked against.
 - `forward_torch_compile` — inherited for free as
   `torch.compile(forward_native)`.
-- `forward_triton` / `forward_cuda_jit` / `forward_cuda_aot` /
+- `forward_triton` / `forward_jit` / `forward_aot` /
   `forward_cute_dsl` / `forward_flashinfer` / `forward_deepgemm` — opt-in
   overrides. A backend is *available* iff its method is overridden.
 

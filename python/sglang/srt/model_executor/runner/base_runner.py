@@ -360,11 +360,7 @@ class BaseRunner(ABC):
                 if not mr.spec_algorithm.supports_target_verify_for_draft():
                     raise RuntimeError("This should not happen")
             capture_forward_mode = ForwardMode.TARGET_VERIFY
-            num_tokens_per_req = (
-                mr.spec_algorithm.get_num_tokens_per_req_for_target_verify(
-                    mr.server_args.speculative_num_draft_tokens, mr.is_draft_worker
-                )
-            )
+            num_tokens_per_req = mr.decode_num_tokens_per_req()
 
         if mr.server_args.enable_return_hidden_states:
             capture_hidden_mode = CaptureHiddenMode.FULL
@@ -552,6 +548,7 @@ class BaseRunner(ABC):
         if lora_ids is not None:
             mr.lora_manager.prepare_lora_batch(forward_batch)
 
+        forward_batch = mr.prepare_dummy_forward_batch(forward_batch)
         mr.attn_backend.init_forward_metadata(forward_batch)
 
         def run_once():

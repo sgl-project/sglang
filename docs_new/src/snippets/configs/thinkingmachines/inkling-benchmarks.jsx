@@ -1,0 +1,36 @@
+// One entry per cell `match` tuple. Accuracy comes from config.defaultAccuracy
+// (model-level, measured at reasoning effort max). Speed is pending — fill
+// tokens_per_sec_per_gpu / ttft_ms / tpot_ms once bench_serving has been run per cell,
+// and set each entry’s `sglang_version` to a reproducible anchor (release / commit / PR).
+
+export const benchmarks = [
+  { match: { hw: "b200"   , variant: "default" , quant: "nvfp4" , strategy: "balanced"     , nodes: "single"   } },
+  { match: { hw: "b300"   , variant: "default" , quant: "nvfp4" , strategy: "balanced"     , nodes: "single"   } },
+  { match: { hw: "gb200"  , variant: "default" , quant: "nvfp4" , strategy: "balanced"     , nodes: "single"   } },
+  { match: { hw: "gb300"  , variant: "default" , quant: "nvfp4" , strategy: "balanced"     , nodes: "single"   } },
+  { match: { hw: "h200"   , variant: "default" , quant: "nvfp4" , strategy: "balanced"     , nodes: "single"   } },
+  { match: { hw: "mi350x" , variant: "default" , quant: "bf16"  , strategy: "balanced"     , nodes: "single"   } },
+  { match: { hw: "mi355x" , variant: "default" , quant: "bf16"  , strategy: "balanced"     , nodes: "single"   } },
+  { match: { hw: "b200"   , variant: "default" , quant: "nvfp4" , strategy: "mtp"          , nodes: "single"   } },
+  { match: { hw: "b300"   , variant: "default" , quant: "nvfp4" , strategy: "mtp"          , nodes: "single"   } },
+  { match: { hw: "gb200"  , variant: "default" , quant: "nvfp4" , strategy: "mtp"          , nodes: "single"   } },
+  { match: { hw: "gb300"  , variant: "default" , quant: "nvfp4" , strategy: "mtp"          , nodes: "single"   } },
+  { match: { hw: "h200"   , variant: "default" , quant: "nvfp4" , strategy: "mtp"          , nodes: "single"   } },
+  { match: { hw: "b200"   , variant: "default" , quant: "nvfp4" , strategy: "long_context" , nodes: "single"   } },
+  { match: { hw: "b300"   , variant: "default" , quant: "nvfp4" , strategy: "long_context" , nodes: "single"   } },
+  { match: { hw: "gb200"  , variant: "default" , quant: "nvfp4" , strategy: "long_context" , nodes: "single"   } },
+  { match: { hw: "gb300"  , variant: "default" , quant: "nvfp4" , strategy: "long_context" , nodes: "single"   } },
+  { match: { hw: "gb300"  , variant: "default" , quant: "bf16"  , strategy: "balanced"     , nodes: "multi-2"  } },
+  { match: { hw: "gb300"  , variant: "default" , quant: "bf16"  , strategy: "mtp"          , nodes: "multi-2"  } },
+  { match: { hw: "b300"   , variant: "default" , quant: "bf16"  , strategy: "balanced"     , nodes: "single"   } },
+  { match: { hw: "b300"   , variant: "default" , quant: "bf16"  , strategy: "mtp"          , nodes: "single"   } },
+  { match: { hw: "b200"   , variant: "default" , quant: "bf16"  , strategy: "balanced"     , nodes: "multi-2"  } },
+  { match: { hw: "b200"   , variant: "default" , quant: "bf16"  , strategy: "mtp"          , nodes: "multi-2"  } },
+  { match: { hw: "b200"   , variant: "lora"    , quant: "nvfp4" , strategy: "balanced"     , nodes: "single"   } },
+  { match: { hw: "b300"   , variant: "lora"    , quant: "nvfp4" , strategy: "balanced"     , nodes: "single"   } },
+  { match: { hw: "gb200"  , variant: "lora"    , quant: "nvfp4" , strategy: "balanced"     , nodes: "single"   } },
+  { match: { hw: "gb300"  , variant: "lora"    , quant: "nvfp4" , strategy: "balanced"     , nodes: "single"   } },
+  { match: { hw: "h200"   , variant: "lora"    , quant: "nvfp4" , strategy: "balanced"     , nodes: "single"   } },
+  { match: { hw: "gb300"  , variant: "lora"    , quant: "bf16"  , strategy: "balanced"     , nodes: "multi-2"  } },
+  { match: { hw: "h200"   , variant: "lora"    , quant: "bf16"  , strategy: "balanced"     , nodes: "single"   } },
+];

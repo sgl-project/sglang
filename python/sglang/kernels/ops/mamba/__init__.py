@@ -14,7 +14,7 @@ if TYPE_CHECKING:
 register_kernel(
     KernelSpec(
         op="mamba.causal_conv1d_fwd",
-        backend=KernelBackend.CUDA_AOT,
+        backend=KernelBackend.AOT,
         target="sgl_kernel.mamba:causal_conv1d_fwd",
         format_signature=FormatSignature(
             in_place=True, description="causal depthwise conv1d forward (prefill)"
@@ -25,7 +25,7 @@ register_kernel(
 register_kernel(
     KernelSpec(
         op="mamba.causal_conv1d_update",
-        backend=KernelBackend.CUDA_AOT,
+        backend=KernelBackend.AOT,
         target="sgl_kernel.mamba:causal_conv1d_update",
         format_signature=FormatSignature(
             in_place=True, description="causal depthwise conv1d update (decode)"
@@ -47,7 +47,7 @@ def causal_conv1d_fwd(
     pad_slot_id: int,
 ):
     """Causal depthwise conv1d forward (prefill)."""
-    return get_kernel("mamba.causal_conv1d_fwd", KernelBackend.CUDA_AOT)(
+    return get_kernel("mamba.causal_conv1d_fwd", KernelBackend.AOT)(
         x,
         weight,
         bias_,
@@ -71,7 +71,7 @@ def causal_conv1d_update(
     pad_slot_id: int,
 ):
     """Causal depthwise conv1d update (decode)."""
-    return get_kernel("mamba.causal_conv1d_update", KernelBackend.CUDA_AOT)(
+    return get_kernel("mamba.causal_conv1d_update", KernelBackend.AOT)(
         x,
         conv_state,
         weight,
@@ -84,3 +84,20 @@ def causal_conv1d_update(
 
 
 __all__ = ["causal_conv1d_fwd", "causal_conv1d_update"]
+
+
+# Vendored mamba_ssm-derived kernels relocated in Phase 2.5 (RFC #29630).
+for _mod, _fn in [
+    ("triton_ops.ssd_combined", "mamba_chunk_scan_combined"),
+    ("triton_ops.mamba_ssm", "selective_state_update"),
+    ("causal_conv1d_triton", "causal_conv1d_fn"),
+    ("mamba_state_scatter_triton", "fused_mamba_state_scatter_with_mask"),
+]:
+    register_kernel(
+        KernelSpec(
+            op=f"mamba.{_fn}",
+            backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.mamba.{_mod}:{_fn}",
+        )
+    )
+del _mod, _fn

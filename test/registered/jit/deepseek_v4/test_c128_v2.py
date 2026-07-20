@@ -16,10 +16,10 @@ from sglang.jit_kernel.tests.deepseek_v4.common import (
     make_state_pool,
     to_seq_extend,
 )
+from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
-register_cuda_ci(est_time=30, suite="nightly-kernel-1-gpu", nightly=True)
 register_amd_ci(est_time=30, suite="nightly-amd-kernel-1-gpu", nightly=True)
 
 Context = Union[LegacyContext, PagedContext]
@@ -114,7 +114,12 @@ def test_prefill_no_context(mode: str, seq_len: int) -> None:
 
     pool = make_state_pool(ctx.num_pages, RATIO, ctx.head_dim)
     out = _run_prefill(
-        ctx, pool, kv_in_cpu.cuda(), ape_cpu.cuda(), seq_lens_cpu, extend_lens_cpu
+        ctx,
+        pool,
+        kv_in_cpu.to(get_device()),
+        ape_cpu.to(get_device()),
+        seq_lens_cpu,
+        extend_lens_cpu,
     )
 
     # Compact prefill output: row per compress plan, in CPU-planner order.
@@ -146,8 +151,8 @@ def test_prefill_then_decode(mode: str, prefix_len: int) -> None:
         _run_prefill(
             ctx,
             pool,
-            kv_full_cpu[:prefix_len].cuda(),
-            ape_cpu.cuda(),
+            kv_full_cpu[:prefix_len].to(get_device()),
+            ape_cpu.to(get_device()),
             seq_lens_cpu,
             extend_lens_cpu,
         )
@@ -155,9 +160,11 @@ def test_prefill_then_decode(mode: str, prefix_len: int) -> None:
     final_out = None
     for k in range(RATIO):
         cur_seq_len = prefix_len + k + 1
-        seq_lens_gpu = torch.tensor([cur_seq_len], dtype=torch.int64, device="cuda")
-        kv_step = kv_full_cpu[prefix_len + k : prefix_len + k + 1].cuda()
-        out = _run_decode(ctx, pool, kv_step, ape_cpu.cuda(), seq_lens_gpu)
+        seq_lens_gpu = torch.tensor(
+            [cur_seq_len], dtype=torch.int64, device=get_device()
+        )
+        kv_step = kv_full_cpu[prefix_len + k : prefix_len + k + 1].to(get_device())
+        out = _run_decode(ctx, pool, kv_step, ape_cpu.to(get_device()), seq_lens_gpu)
         if cur_seq_len % RATIO == 0:
             final_out = out
 
@@ -168,13 +175,16 @@ def test_prefill_then_decode(mode: str, prefix_len: int) -> None:
 
 
 @pytest.mark.parametrize("mode", ["legacy", "paged"])
-@pytest.mark.parametrize("prefix_len", [128, 256])
-def test_prefill_then_extend(mode: str, prefix_len: int) -> None:
-    """Prefill once, then a second prefill that extends across one compress event.
+@pytest.mark.parametrize("prefix_len", [128, 120, 256])
+@pytest.mark.parametrize("extend_len", [128, 256])
+def test_prefill_then_extend(mode: str, prefix_len: int, extend_len: int) -> None:
+    """Prefill once, then a second prefill that extends across compress event(s).
 
-    First prefill ends at a 128-boundary so the second prefill starts fresh.
+    A prefix that is not a multiple of the ratio (e.g. 120) makes the first
+    compress event land at extend index j < window_size, so its buffer_len is
+    nonzero (window_size - min(j+1, window_size)) and the overlap must be read
+    out of the state buffer. Every compress event in the extend is checked.
     """
-    extend_len = RATIO
     seq_len = prefix_len + extend_len
 
     if mode == "legacy":
@@ -191,8 +201,8 @@ def test_prefill_then_extend(mode: str, prefix_len: int) -> None:
     _run_prefill(
         ctx,
         pool,
-        kv_full_cpu[:prefix_len].cuda(),
-        ape_cpu.cuda(),
+        kv_full_cpu[:prefix_len].to(get_device()),
+        ape_cpu.to(get_device()),
         seq_lens_cpu,
         extend_lens_cpu,
     )
@@ -201,16 +211,19 @@ def test_prefill_then_extend(mode: str, prefix_len: int) -> None:
     out = _run_prefill(
         ctx,
         pool,
-        kv_full_cpu[prefix_len:].cuda(),
-        ape_cpu.cuda(),
+        kv_full_cpu[prefix_len:].to(get_device()),
+        ape_cpu.to(get_device()),
         seq_lens_cpu,
         extend_lens_cpu,
     )
 
-    P = seq_len - 1
-    gt = _gt_compress(kv_full_cpu, ape_cpu, P=P, head_dim=ctx.head_dim)
-    # Single compress event in this extend; compact plan_id 0.
-    triton.testing.assert_close(out[0].cpu(), gt, atol=ATOL, rtol=RTOL)
+    # One compact output row per compress event in the extend, position-ascending.
+    first_event = ((prefix_len // RATIO) + 1) * RATIO - 1
+    for plan_id, P in enumerate(range(first_event, seq_len, RATIO)):
+        gt = _gt_compress(kv_full_cpu, ape_cpu, P=P, head_dim=ctx.head_dim)
+        triton.testing.assert_close(
+            out[plan_id].cpu(), gt, atol=ATOL, rtol=RTOL, err_msg=f"{plan_id=}, {P=}"
+        )
 
 
 @pytest.mark.parametrize("mode", ["legacy", "paged"])
@@ -229,7 +242,12 @@ def test_prefill_multibatch(mode: str) -> None:
     kv_in_cpu, ape_cpu = _make_inputs(num_q, ctx.head_dim, seed=99)
     pool = make_state_pool(ctx.num_pages, RATIO, ctx.head_dim)
     out = _run_prefill(
-        ctx, pool, kv_in_cpu.cuda(), ape_cpu.cuda(), seq_lens_cpu, extend_lens_cpu
+        ctx,
+        pool,
+        kv_in_cpu.to(get_device()),
+        ape_cpu.to(get_device()),
+        seq_lens_cpu,
+        extend_lens_cpu,
     )
 
     # Compact: walk batches in order, then positions in order; matches the
