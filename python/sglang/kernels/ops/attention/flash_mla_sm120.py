@@ -24,6 +24,11 @@ from sglang.srt.utils import is_hip
 logger = logging.getLogger(__name__)
 _is_hip = is_hip()
 
+_GLM_DSA_MODEL_ARCHS = (
+    "GlmMoeDsaForCausalLM",
+    "GlmMoeDsaForCausalLMNextN",
+)
+
 # Page layout constants for DSv4-Flash (MODEL1):
 #   nope_dim = 448, rope_dim = 64, quantize_block_size = 64
 #   nope_rope_stride = 448 + 64*2 = 576 bytes per token
@@ -489,7 +494,7 @@ def _validate_flashinfer_sparse_mla_backend(
     selected = {prefill_impl, decode_impl}
     uses_flashinfer_sparse_mla = "flashinfer_sparse_mla" in selected
     is_glm_sm12_fp8 = (
-        model_arch == "GlmMoeDsaForCausalLM"
+        model_arch in _GLM_DSA_MODEL_ARCHS
         and device_sm_major == 12
         and kv_cache_dtype == torch.float8_e4m3fn
         and not _is_hip
@@ -497,7 +502,10 @@ def _validate_flashinfer_sparse_mla_backend(
     if uses_flashinfer_sparse_mla and not is_glm_sm12_fp8:
         raise ValueError(
             "flashinfer_sparse_mla supports only GLM DSA with FP8 KV cache "
-            "on NVIDIA SM120/SM121."
+            "on NVIDIA SM120/SM121; "
+            f"got model_arch={model_arch!r}, sm_major={device_sm_major}, "
+            f"kv_cache_dtype={kv_cache_dtype}, prefill_impl={prefill_impl!r}, "
+            f"decode_impl={decode_impl!r}."
         )
     if is_glm_sm12_fp8:
         unsupported = selected - {"flashinfer_sparse_mla"}

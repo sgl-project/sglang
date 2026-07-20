@@ -73,9 +73,9 @@ class TestFlashInferSparseMLAAdapter(unittest.TestCase):
 
 
 class TestFlashInferSparseMLABackendGate(unittest.TestCase):
-    def _validate(self, prefill, decode):
+    def _validate(self, prefill, decode, model_arch="GlmMoeDsaForCausalLM"):
         return _validate_flashinfer_sparse_mla_backend(
-            model_arch="GlmMoeDsaForCausalLM",
+            model_arch=model_arch,
             device_sm_major=12,
             kv_cache_dtype=torch.float8_e4m3fn,
             prefill_impl=prefill,
@@ -83,9 +83,18 @@ class TestFlashInferSparseMLABackendGate(unittest.TestCase):
         )
 
     def test_accepts_flashinfer_for_both_phases(self):
-        self.assertTrue(
-            self._validate("flashinfer_sparse_mla", "flashinfer_sparse_mla")
-        )
+        for model_arch in (
+            "GlmMoeDsaForCausalLM",
+            "GlmMoeDsaForCausalLMNextN",
+        ):
+            with self.subTest(model_arch=model_arch):
+                self.assertTrue(
+                    self._validate(
+                        "flashinfer_sparse_mla",
+                        "flashinfer_sparse_mla",
+                        model_arch,
+                    )
+                )
 
     def test_rejects_other_or_mixed_backends(self):
         for prefill, decode in (
@@ -95,6 +104,19 @@ class TestFlashInferSparseMLABackendGate(unittest.TestCase):
             with self.subTest(prefill=prefill, decode=decode):
                 with self.assertRaisesRegex(ValueError, "only flashinfer_sparse_mla"):
                     self._validate(prefill, decode)
+
+    def test_reports_unsupported_configuration(self):
+        with self.assertRaises(ValueError) as error:
+            self._validate(
+                "flashinfer_sparse_mla",
+                "flashinfer_sparse_mla",
+                "DeepseekV3ForCausalLM",
+            )
+
+        message = str(error.exception)
+        self.assertIn("model_arch='DeepseekV3ForCausalLM'", message)
+        self.assertIn("sm_major=12", message)
+        self.assertIn("kv_cache_dtype=torch.float8_e4m3fn", message)
 
 
 if __name__ == "__main__":
