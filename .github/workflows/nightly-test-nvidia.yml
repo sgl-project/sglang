@@ -2,7 +2,7 @@ name: Nightly Test (Nvidia)
 
 on:
   schedule:
-    - cron: '0 0 * * *'
+    - cron: '0 14 */2 * *'
   workflow_dispatch:
     inputs:
       job_filter:
