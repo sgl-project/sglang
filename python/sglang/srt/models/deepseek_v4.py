@@ -136,7 +136,6 @@ from sglang.srt.models.deepseek_v2 import (
     _is_npu,
     _is_xpu,
 )
-from sglang.srt.models.deepseek_v2 import ParallelLMHead, _is_cuda, _is_hip, _is_npu
 from sglang.srt.runtime_context import get_forward, get_parallel, get_server_args
 
 if not _is_hip:

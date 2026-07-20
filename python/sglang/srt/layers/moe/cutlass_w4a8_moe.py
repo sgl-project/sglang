@@ -220,9 +220,7 @@ def cutlass_w4a8_moe(
 
         alpha = float(gemm1_alpha)
         limit = None if gemm1_clamp_limit is None else float(gemm1_clamp_limit)
-        intermediate = torch.empty(
-            (m * topk, n), dtype=torch.bfloat16, device=device
-        )
+        intermediate = torch.empty((m * topk, n), dtype=torch.bfloat16, device=device)
         swiglu_gpt_oss_sigmoid_alpha_contiguous(intermediate, c1, alpha, limit)
         if a2_scale is None:
             a2_scale = torch.zeros(1, dtype=torch.float32, device=device)
@@ -230,9 +228,7 @@ def cutlass_w4a8_moe(
             per_tensor_quant_fp8(intermediate, intermediate_q, a2_scale, False)
         else:
             # is_static=True: caller-provided scale is reused as-is.
-            per_tensor_quant_fp8(
-                intermediate, intermediate_q, a2_scale.float(), True
-            )
+            per_tensor_quant_fp8(intermediate, intermediate_q, a2_scale.float(), True)
     elif a2_scale is None:
         a2_scale = torch.zeros(1, dtype=torch.float32, device=device)
         silu_mul_dynamic_tensorwise_quant_for_cutlass_moe(
