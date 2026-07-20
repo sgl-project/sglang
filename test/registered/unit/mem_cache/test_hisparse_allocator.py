@@ -169,6 +169,7 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
             rid="req-0",
             origin_input_ids=list(range(fill_len)),
             output_ids=[],
+            kv=None,
         )
 
         def set_extend_range(start, end):
@@ -227,8 +228,8 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         _, kwargs = allocator.alloc_extend_swa_tail.call_args
         self.assertEqual(kwargs["extend_num_tokens"], fill_len)
         self.assertEqual(kwargs["swa_tail_len"], swa_tail_len)
-        self.assertEqual(req.swa_evicted_seqlen, fill_len - swa_tail_len)
-        self.assertEqual(req.kv_allocated_len, fill_len)
+        self.assertEqual(req.kv.swa_evicted_seqlen, fill_len - swa_tail_len)
+        self.assertEqual(req.kv.kv_allocated_len, fill_len)
         self.assertEqual(req.kv_committed_len, fill_len)
         self.assertEqual(req.extend_range.length, fill_len)
         self.assertEqual(len(req_to_token_pool.writes), 1)

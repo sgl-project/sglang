@@ -37,6 +37,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple, Union
 import torch
 
 from sglang.kernels.ops.attention.position import compute_position_triton
+from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
 from sglang.srt.kv_canary.req_to_expected_token_ids_manager import (
     compute_req_all_ids_info,
@@ -45,6 +46,7 @@ from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     set_dp_buffer_len,
     set_is_extend_in_batch,
+    world_dp_gather_enabled,
 )
 from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
     ForwardBatchDeepSeekMHAMixin,
@@ -72,6 +74,25 @@ if TYPE_CHECKING:
 _skip_attn_backend_init_warned = False
 
 _is_npu = is_npu()
+
+
+def _elastic_should_preserve_local_token_counts(
+    *,
+    model_runner: ModelRunner,
+    dp_padding_mode: DpPaddingMode,
+    global_num_tokens: List[int],
+) -> bool:
+    if not getattr(model_runner, "enable_elastic_ep", False):
+        return False
+    if not world_dp_gather_enabled():
+        return False
+    if not dp_padding_mode.is_max_len():
+        return False
+    if len(global_num_tokens) <= 1:
+        return False
+
+    uneven_token_count = len(set(global_num_tokens)) > 1
+    return uneven_token_count
 
 
 class ForwardMode(IntEnum):
@@ -395,8 +416,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For DP attention
     is_extend_in_batch: bool = False
-    # Mirrors ScheduleBatch.all_extend_in_batch; kept for downstream forks.
-    all_extend_in_batch: bool = False
     can_run_dp_cuda_graph: bool = False
     can_run_dp_breakable_cuda_graph: bool = False
     global_forward_mode: Optional[ForwardMode] = None
@@ -434,7 +453,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For dumper: request IDs for cross-step sequence tracking
     rids: Optional[List[str]] = None
 
-    # === Resolved from SB one-shot overrides (consumed + reset by init_new) ===
+    # === Per-forward overrides passed explicitly to init_new ===
     capture_hidden_mode: CaptureHiddenMode = None
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False
@@ -501,9 +520,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     dp_local_start_pos: Optional[torch.Tensor] = None  # cached info at runtime
     dp_local_num_tokens: Optional[torch.Tensor] = None  # cached info at runtime
     global_dp_buffer_len: Optional[int] = None
-
-    # For padding
-    padded_static_len: int = -1  # -1 if not padded
 
     # For Qwen2-VL
     mrope_positions: torch.Tensor = None
@@ -628,19 +644,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         cls,
         batch: ScheduleBatch,
         model_runner: ModelRunner,
+        *,
+        capture_hidden_mode: Optional[CaptureHiddenMode] = None,
+        return_hidden_states_before_norm: bool,
     ):
-        # Consume one-shot per-forward overrides from SB; reset to defaults so
-        # the next forward on the same SB starts clean. See SB field comment
-        # for the contract.
-        capture_hidden_mode = batch.capture_hidden_mode
-        batch.capture_hidden_mode = None
-        seq_lens_cpu_cache = batch.seq_lens_cpu_cache
-        batch.seq_lens_cpu_cache = None
-        return_hidden_states_before_norm = batch.return_hidden_states_before_norm
-        batch.return_hidden_states_before_norm = False
+        # init_new must not mutate the input ScheduleBatch; per-forward
+        # overrides go through explicit keyword arguments.
 
-        # capture_hidden_mode default: derive from SB.return_hidden_states /
-        # spec_info.capture_hidden_mode when caller did not override.
+        # capture_hidden_mode=None means no override: derive from
+        # SB.return_hidden_states / spec_info.capture_hidden_mode.
         if capture_hidden_mode is None:
             if batch.return_hidden_states:
                 capture_hidden_mode = CaptureHiddenMode.FULL
@@ -670,19 +682,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # ScheduleBatch.sampling_info is already swapped to the forward-only
         # copy by Scheduler.run_batch under overlap mode (see save/restore
         # block there). Use it directly.
-        if seq_lens_cpu_cache is not None:
-            # Stale-cache guard: shape must match current GPU seq_lens. Mismatch
-            # means caller forgot to refresh the override after batch size
-            # changed (e.g. filter/merge_batch); using a stale cache would
-            # propagate wrong CPU mirror to downstream DP / cudagraph logic.
-            assert seq_lens_cpu_cache.shape == batch.seq_lens.shape, (
-                f"seq_lens_cpu_cache shape {seq_lens_cpu_cache.shape} != "
-                f"seq_lens {batch.seq_lens.shape}; stale override on batch?"
-            )
-            seq_lens_cpu = seq_lens_cpu_cache
-        else:
-            seq_lens_cpu = batch.seq_lens_cpu
+        seq_lens_cpu = batch.seq_lens_cpu
 
+        # TODO(seq-lens-removal): the whole ScheduleBatch seq_lens family
+        # (incl. seq_lens_sum) is slated for removal in favor of kv-committed
+        # lengths, so this init_new-time backfill onto the ScheduleBatch is
+        # tolerated for now despite the init_new-must-not-mutate-SB rule.
         if batch.seq_lens_sum is None and seq_lens_cpu is not None:
             batch.seq_lens_sum = int(seq_lens_cpu.sum())
 
@@ -713,7 +718,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             # Scalar config / flags
             return_logprob=batch.return_logprob,
             is_extend_in_batch=batch.is_extend_in_batch,
-            all_extend_in_batch=batch.all_extend_in_batch,
             can_run_dp_cuda_graph=batch.can_run_dp_cuda_graph,
             can_run_dp_breakable_cuda_graph=batch.can_run_dp_breakable_cuda_graph,
             global_forward_mode=batch.global_forward_mode,
@@ -776,9 +780,16 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
             # process global_num_tokens and global_num_tokens_for_logprob
             if batch.spec_info is not None:
-                spec_info: SpecInput = batch.spec_info
+                from sglang.srt.speculative.spec_info import (
+                    spec_scale_global_num_tokens,
+                )
+
                 global_num_tokens, global_num_tokens_for_logprob = (
-                    spec_info.get_spec_adjusted_global_num_tokens(batch)
+                    spec_scale_global_num_tokens(
+                        batch.spec_info,
+                        batch.global_num_tokens,
+                        batch.global_num_tokens_for_logprob,
+                    )
                 )
             else:
                 global_num_tokens = batch.global_num_tokens
@@ -850,10 +861,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 ret.positions = positions
             ret.extend_logprob_start_lens_cpu = extend_logprob_start_lens
 
-        if model_runner.use_ngram_embedding:
+        if model_runner.ngram_embedding_manager.enabled:
             ret._init_ngram_embedding_info(batch, device)
 
-        if model_runner.model_is_mrope:
+        if model_runner.model_config.model_is_mrope:
             if (
                 ret.spec_info is not None
                 and getattr(ret.spec_info, "positions", None) is not None
@@ -1149,14 +1160,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     def prepare_mlp_sync_batch(self, model_runner: ModelRunner):
         from sglang.srt.batch_overlap.two_batch_overlap import TboForwardBatchPreparer
 
-        # Local import: a module-level cp_utils import here is circular (#27014).
-        from sglang.srt.layers.utils.cp_utils import get_cp_padding_align_size
+        # Local imports: module-level CP helper imports here are circular (#27014).
+        from sglang.srt.layers.cp.padding import get_cp_padding_align_size
+        from sglang.srt.layers.cp.utils import enable_cp_v2
 
         assert self.global_num_tokens_cpu is not None
         assert self.global_num_tokens_for_logprob_cpu is not None
 
         self._original_batch_size = self.batch_size
-        global_num_tokens = self.global_num_tokens_cpu
+        global_num_tokens = list(self.global_num_tokens_cpu)
         sync_group_size = len(global_num_tokens)
         attn_tp_size = get_parallel().attn_tp_size
 
@@ -1170,13 +1182,41 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # pad to attn_cp_size; CP off pads nothing (extra padding breaks EAGLE/MTP draft
         # prefill with NaN draft logits, see #23269).
         # FIXME(kpham-sgl): revisit so draft prefill-extend tolerates padded dummy tokens.
-        cp_align_size = get_cp_padding_align_size()
-        for i in range(sync_group_size):
-            global_num_tokens[i] = ceil_align(global_num_tokens[i], cp_align_size)
+        if not enable_cp_v2():
+            cp_align_size = get_cp_padding_align_size()
+            for i in range(sync_group_size):
+                global_num_tokens[i] = ceil_align(global_num_tokens[i], cp_align_size)
 
         dp_padding_mode = DpPaddingMode.get_dp_padding_mode(
             self.is_extend_in_batch, global_num_tokens
         )
+        if _elastic_should_preserve_local_token_counts(
+            model_runner=model_runner,
+            dp_padding_mode=dp_padding_mode,
+            global_num_tokens=global_num_tokens,
+        ):
+            # Joined ranks require real token counts instead of MAX_LEN padding.
+            dp_padding_mode = DpPaddingMode.SUM_LEN
+        # Prefill breakable CUDA graph requires every DP rank to run the SAME
+        # captured shape. Under SUM_LEN each rank pads to its own local token
+        # count and can select a different capture bucket, so the in-graph DP
+        # collectives (all_gather / reduce_scatter) mismatch across ranks and
+        # corrupt the output. Force MAX_LEN so every rank pads to the global
+        # max and picks the same bucket (mirrors the decode cuda graph
+        # contract, which always runs MAX_LEN).
+        #
+        # Only force MAX_LEN when the batch fits a captured breakable prefill
+        # graph; larger prefills fall back to eager and keep the
+        # memory-efficient SUM_LEN. global_num_tokens is identical across ranks
+        # (all-gathered), so the decision is consistent cluster-wide.
+        prefill_cg = model_runner.server_args.cuda_graph_config.prefill
+        if (
+            self.can_run_dp_breakable_cuda_graph
+            and self.is_extend_in_batch
+            and prefill_cg.bs
+            and max(global_num_tokens) <= max(prefill_cg.bs)
+        ):
+            dp_padding_mode = DpPaddingMode.MAX_LEN
         self.dp_padding_mode = dp_padding_mode
 
         if dp_padding_mode.is_max_len():
@@ -1197,7 +1237,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         self.global_dp_buffer_len = buffer_len
         set_dp_buffer_len(
-            buffer_len, num_tokens, dp_padding_mode.is_max_len(), global_num_tokens
+            buffer_len,
+            num_tokens,
+            dp_padding_mode.is_max_len(),
+            global_num_tokens,
         )
         set_is_extend_in_batch(self.is_extend_in_batch)
 
@@ -1212,7 +1255,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             # Mamba-hybrid families need the fabricated-row idle conversion
             # below; this includes their MTP draft workers, whose mamba-less
             # "*E" pattern makes mambaish_config return None.
-            hybrid_ssm = model_runner.mambaish_config is not None or (
+            hybrid_ssm = mambaish_config(model_runner.model_config) is not None or (
                 model_runner.is_draft_worker
                 and getattr(
                     model_runner.model_config.hf_config,
@@ -1229,11 +1272,18 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 if self.forward_mode.is_idle():
                     self._original_forward_mode = self.forward_mode
                     self.forward_mode = ForwardMode.TARGET_VERIFY
+                # Invert the spec_scale_global_num_tokens scaling.
                 bs = self.batch_size = num_tokens // self.spec_info.num_tokens_per_req
             elif self.is_extend_in_batch and dp_padding_mode.is_max_len():
                 self._original_forward_mode = self.forward_mode
                 self.forward_mode = ForwardMode.EXTEND
-                if hybrid_ssm:
+                # Fabricate a single dummy request covering num_tokens for an
+                # empty (idle) rank. Hybrid-SSM families always take this path;
+                # non-hybrid ranks reach it once MAX_LEN is forced for the
+                # prefill breakable CUDA graph (idle + prefill), which needs
+                # every DP rank to run the same captured shape. The `else`
+                # branch handles decode rows padded to a 1-token extend.
+                if hybrid_ssm or self.seq_lens.shape[0] == 0:
                     dev = self.seq_lens.device
                     assert (
                         self.seq_lens.shape[0] == 0
@@ -1251,6 +1301,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     self.seq_lens = torch.tensor(
                         [num_tokens], dtype=self.seq_lens.dtype, device=dev
                     )
+                    # orig_seq_lens is not padded by _pad_inputs_to_size, so
+                    # fabricate it to match the dummy request (the breakable
+                    # prefill CUDA graph runner reads it).
+                    self.orig_seq_lens = torch.tensor(
+                        [num_tokens], dtype=self.orig_seq_lens.dtype, device=dev
+                    )
                     self.seq_lens_sum = int(num_tokens)
                     if self.seq_lens_cpu is not None:
                         self.seq_lens_cpu = torch.tensor(
@@ -1260,6 +1316,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     self.extend_seq_lens_cpu = [int(num_tokens)]
                     self.extend_logprob_start_lens_cpu = [0]
                     bs = self.batch_size = 1
+                    # Count the dummy tokens as real, else MoE topk/all-to-all
+                    # treats this rank as empty and starves later layers.
+                    # (num_token_non_padded is None unless moe_ep_size > 1.)
+                    if self.num_token_non_padded is not None:
+                        self.num_token_non_padded.fill_(num_tokens)
+                    self.num_token_non_padded_cpu = num_tokens
                 else:
                     self.extend_num_tokens = bs
                     self.extend_seq_lens = torch.full_like(self.seq_lens, 1)
@@ -1272,6 +1334,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     self.extend_logprob_start_lens_cpu = self.extend_prefix_lens_cpu
             else:
                 if self.spec_info is not None:
+                    # Invert the spec_scale_global_num_tokens scaling.
                     bs = self.batch_size = (
                         num_tokens // self.spec_info.num_tokens_per_req
                     )
