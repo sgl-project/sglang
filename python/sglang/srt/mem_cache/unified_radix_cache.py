@@ -315,7 +315,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.enable_kv_cache_events = params.enable_kv_cache_events
         self.kv_event_queue = []
         self.eviction_policy = params.eviction_policy.lower()
-        self.eviction_strategy = get_eviction_strategy(self.eviction_policy)
+        self._low_priority_values_first = params.schedule_low_priority_values_first
+        self.eviction_strategy = get_eviction_strategy(
+            self.eviction_policy,
+            low_values_first=params.schedule_low_priority_values_first,
+        )
 
         if self.token_to_kv_pool_allocator:
             self.device = self.token_to_kv_pool_allocator.device
@@ -452,7 +456,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     def _reset_full(self) -> None:
         """Full reset: destroy entire tree and all state."""
         self.root_node = UnifiedTreeNode(self.tree_components)
-        self.root_node.priority = -sys.maxsize
+        self.root_node.priority = (
+            sys.maxsize if self._low_priority_values_first else -sys.maxsize
+        )
         self.root_node.key = RadixKey(array("q"), None)
         self.root_node.component_data[BASE_COMPONENT_TYPE].value = []
         self.root_node.hash_value = []
@@ -1060,6 +1066,17 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self._update_evictable_leaf_sets(child)
         return new_node
 
+    def _aggregate_priority(self, node: UnifiedTreeNode, priority: int) -> None:
+        """Aggregate priority on a shared prefix node.
+
+        Normal mode: higher priority = more important → use max.
+        Low-values-first mode: lower priority = more important → use min.
+        """
+        if self._low_priority_values_first:
+            node.priority = min(node.priority, priority)
+        else:
+            node.priority = max(node.priority, priority)
+
     def _touch_node(self, node: UnifiedTreeNode):
         node.last_access_time = get_and_increase_time_counter()
         if node != self.root_node:
@@ -1116,7 +1133,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if priority is None:
             priority = 0
         self._touch_node(node)
-        node.priority = max(node.priority, priority)
+        self._aggregate_priority(node, priority)
         if len(key) == 0:
             return InsertResult(prefix_len=0, mamba_exist=True)
 
@@ -1128,7 +1145,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             prefix_len = node.key.match(key, page_size=self.page_size)
             if prefix_len < len(node.key):
                 node = self._split_node(node.key, node, prefix_len)
-            node.priority = max(node.priority, priority)
+            self._aggregate_priority(node, priority)
 
             if node.evicted:
                 self._unevict_node_on_insert(node, value[:prefix_len])

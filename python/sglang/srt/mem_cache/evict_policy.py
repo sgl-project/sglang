@@ -39,11 +39,21 @@ class FILOStrategy(EvictionStrategy):
 
 
 class PriorityStrategy(EvictionStrategy):
-    """Priority-aware eviction: lower priority values evicted first, then LRU within same priority."""
+    """Priority-aware eviction: lower priority values evicted first, then LRU within same priority.
+
+    When *low_values_first* is True, the direction is inverted: smaller priority values
+    are treated as *more important* and are retained longer, matching the scheduler's
+    ``--schedule-low-priority-values-first`` mode.
+    """
+
+    def __init__(self, low_values_first: bool = False):
+        self._low_values_first = low_values_first
 
     def get_priority(self, node: TreeNode) -> Tuple[int, float]:
-        # Return (priority, last_access_time) so lower priority nodes are evicted first
-        return (node.priority, node.last_access_time)
+        # Invert priority so that smaller (more important) values map to larger
+        # eviction keys (retained longer) when low_values_first is enabled.
+        p = -node.priority if self._low_values_first else node.priority
+        return (p, node.last_access_time)
 
 
 class SLRUStrategy(EvictionStrategy):

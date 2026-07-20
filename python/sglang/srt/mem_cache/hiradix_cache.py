@@ -1808,7 +1808,7 @@ class HiRadixCache(RadixCache):
         while len(key) > 0 and child_key in node.children.keys():
             node = node.children[child_key]
             node.last_access_time = time.monotonic()
-            node.priority = max(node.priority, priority)
+            self._aggregate_priority(node, priority)
             prefix_len = node.key.match(key, page_size=self.page_size)
 
             if prefix_len == len(node.key):
@@ -1827,8 +1827,8 @@ class HiRadixCache(RadixCache):
             else:
                 # partial match, split the node
                 new_node = self._split_node(node.key, node, prefix_len)
-                # shared-prefix node should also reflect max priority
-                new_node.priority = max(new_node.priority, priority)
+                # shared-prefix node should also reflect aggregated priority
+                self._aggregate_priority(new_node, priority)
                 if new_node.evicted:
                     new_node.value = value[:prefix_len].clone()
                     self.evictable_size_ += len(new_node.value)
