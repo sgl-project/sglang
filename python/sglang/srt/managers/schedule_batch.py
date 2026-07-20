@@ -1084,6 +1084,9 @@ class Req(ReqDllmMixin):
 
         # For hisparse
         self.hisparse_staging = False
+        # Per-request EAGLE draft state carried across HiSparse staging
+        # (prefill -> decode) so MTP can resume the draft chain.
+        self.hisparse_spec_info = None
 
     @property
     def seqlen(self) -> int:

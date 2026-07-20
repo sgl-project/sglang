@@ -182,7 +182,6 @@ def _make_state(
     }
 
 
-@pytest.mark.skipif(is_hip(), reason="DSV4 paged-layout HiSparse test is CUDA-only.")
 def test_transfer_cache_dsv4_mla_copies_paged_token() -> None:
     src_cache = torch.zeros((2, DSV4_PAGE_BYTES), dtype=torch.uint8, device=DEVICE)
     dst_cache = torch.zeros(
@@ -206,7 +205,6 @@ def test_transfer_cache_dsv4_mla_copies_paged_token() -> None:
     )
 
 
-@pytest.mark.skipif(is_hip(), reason="DSV4 paged-layout HiSparse test is CUDA-only.")
 def test_dsv4_swap_in_reads_paged_host_layout() -> None:
     host_cache = torch.zeros(
         (2, DSV4_PAGE_BYTES), dtype=torch.uint8, device="cpu", pin_memory=True

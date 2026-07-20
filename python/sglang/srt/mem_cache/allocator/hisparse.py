@@ -1,3 +1,4 @@
+from typing import Optional, Tuple
 import weakref
 
 import torch
@@ -7,6 +8,7 @@ from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     DeepSeekV4TokenToKVPool,
     HiSparseC4DevicePool,
+    HiSparseUnifiedC4DevicePool,
 )
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
 from sglang.srt.utils.common import get_num_new_pages
@@ -225,6 +227,42 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.full_to_hisparse_device_index_mapping[logical_indices] = hisparse_indices
         return logical_indices
 
+    def alloc_extend_with_device_mapping(
+        self,
+        prefix_lens: torch.Tensor,
+        prefix_lens_cpu: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        last_loc: torch.Tensor,
+        extend_num_tokens: int,
+        device_slots: torch.Tensor,
+        backup_state: bool = False,
+    ):
+        """Allocate logical indices and map them to caller-managed HiSparse slots (DSV4)."""
+        logical_state = (
+            self.logical_attn_allocator.backup_state() if backup_state else None
+        )
+        out = self.logical_attn_allocator.alloc_extend(
+            prefix_lens,
+            prefix_lens_cpu,
+            seq_lens,
+            seq_lens_cpu,
+            last_loc,
+            extend_num_tokens,
+        )
+        if out is None:
+            raise RuntimeError(
+                f"DSV4 HiSparse logical alloc failed for {extend_num_tokens} tokens."
+            )
+        self.full_to_hisparse_device_index_mapping[out] = device_slots
+        if backup_state:
+            return out, (logical_state, out.clone())
+        return out
+
+    def clear_device_mapping(self, logical_indices: torch.Tensor):
+        """Clear mappings for caller-managed slots."""
+        self.full_to_hisparse_device_index_mapping[logical_indices] = 0
+
     def alloc_decode(
         self,
         seq_lens: torch.Tensor,
@@ -273,6 +311,71 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
 
 
+    def alloc_extend_with_device_mapping(
+        self,
+        prefix_lens: torch.Tensor,
+        prefix_lens_cpu: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        last_loc: torch.Tensor,
+        extend_num_tokens: int,
+        device_slots: torch.Tensor,
+        backup_state: bool = False,
+    ):
+        """Allocate logical indices and map them to caller-managed HiSparse slots."""
+        avail = self.logical_attn_allocator.available_size()
+        if avail < extend_num_tokens:
+            raise RuntimeError(
+                f"HiSparse logical alloc: need {extend_num_tokens} tokens but only "
+                f"{avail} are available."
+            )
+
+        logical_state = (
+            self.logical_attn_allocator.backup_state() if backup_state else None
+        )
+        out = self.logical_attn_allocator.alloc_extend(
+            prefix_lens,
+            prefix_lens_cpu,
+            seq_lens,
+            seq_lens_cpu,
+            last_loc,
+            extend_num_tokens,
+        )
+        if out is None:
+            raise RuntimeError(
+                f"HiSparse logical alloc failed for {extend_num_tokens} tokens. "
+                f"Logical pool available: {self.logical_attn_allocator.available_size()}"
+            )
+
+        self.full_to_hisparse_device_index_mapping[out] = device_slots
+        if backup_state:
+            return out, (logical_state, out.clone())
+        return out
+
+    def clear_device_mapping(self, logical_indices: torch.Tensor):
+        """Clear mappings for caller-managed slots before freeing logical indices."""
+        self.full_to_hisparse_device_index_mapping[logical_indices] = 0
+
+    def backup_state(self):
+        return (
+            self.logical_attn_allocator.backup_state(),
+            self.hisparse_attn_allocator.backup_state(),
+            self.full_to_hisparse_device_index_mapping.clone(),
+        )
+
+    def restore_state(self, state):
+        if len(state) == 2:
+            self.logical_attn_allocator.restore_state(state[0])
+            return
+
+        logical_state, hisparse_state, mapping_snapshot = state
+        self.logical_attn_allocator.restore_state(logical_state)
+        self.hisparse_attn_allocator.restore_state(hisparse_state)
+        self.full_to_hisparse_device_index_mapping[: mapping_snapshot.shape[0]].copy_(mapping_snapshot)
+        if mapping_snapshot.shape[0] < self.full_to_hisparse_device_index_mapping.shape[0]:
+            self.full_to_hisparse_device_index_mapping[mapping_snapshot.shape[0] :] = 0
+
+
 class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def __init__(
@@ -286,6 +389,11 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.compress_ratio = 4
 
         self.hisparse_kvcache = logical_attn_allocator._kvcache.c4_kv_pool
+        # Unified-KV (ROCm) mirrors the full C4 budget on the host cold pool;
+        # only it reports host-backed capacity. CUDA separate-KV is unchanged.
+        self._is_unified_hisparse = isinstance(
+            self.hisparse_kvcache, HiSparseUnifiedC4DevicePool
+        )
         self._size_full = logical_attn_allocator.size_full
         self._size_hisparse = self.hisparse_kvcache.size
 
@@ -360,10 +468,14 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return self.logical_attn_allocator.translate_loc_from_full_to_swa(kv_indices)
 
     def full_available_size(self):
-        return min(
-            self.logical_attn_allocator.full_available_size(),
-            self.hisparse_attn_allocator.available_size() * self.compress_ratio,
-        )
+        if not self._is_unified_hisparse:
+            return min(
+                self.logical_attn_allocator.full_available_size(),
+                self.hisparse_attn_allocator.available_size() * self.compress_ratio,
+            )
+        # unified-KV: cold C4 is host-resident, so capacity tracks the logical
+        # full-token pool; device pressure is handled by alloc_extend.
+        return self.logical_attn_allocator.full_available_size()
 
     def swa_available_size(self):
         return self.logical_attn_allocator.swa_available_size()
@@ -372,10 +484,13 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.logical_attn_allocator.free_swa(free_indices)
 
     def available_size(self) -> int:
-        return min(
-            self.logical_attn_allocator.available_size(),
-            self.hisparse_attn_allocator.available_size() * self.compress_ratio,
-        )
+        if not self._is_unified_hisparse:
+            return min(
+                self.logical_attn_allocator.available_size(),
+                self.hisparse_attn_allocator.available_size() * self.compress_ratio,
+            )
+        # unified-KV: see full_available_size.
+        return self.logical_attn_allocator.available_size()
 
     def alloc(self, need_size: int):
         raise NotImplementedError(
@@ -546,6 +661,54 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
         return logical_indices
 
+    def alloc_extend_with_device_mapping(
+        self,
+        prefix_lens: torch.Tensor,
+        prefix_lens_cpu: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        last_loc: torch.Tensor,
+        extend_num_tokens: int,
+        device_slots: torch.Tensor,
+        backup_state: bool = False,
+    ):
+        """Allocate logical indices and map them to caller-managed HiSparse slots (DSV4)."""
+        logical_state = (
+            self.logical_attn_allocator.backup_state() if backup_state else None
+        )
+        out = self.logical_attn_allocator.alloc_extend(
+            prefix_lens,
+            prefix_lens_cpu,
+            seq_lens,
+            seq_lens_cpu,
+            last_loc,
+            extend_num_tokens,
+        )
+        if out is None:
+            raise RuntimeError(
+                f"DSV4 HiSparse logical alloc failed for {extend_num_tokens} tokens."
+            )
+        # Map logical indices to the caller-provided device buffer slots
+        compressed = self.hisparse_kvcache.translate_loc_from_full_to_compressed(out)
+        if compressed.numel() > 0:
+            if device_slots.numel() < compressed.numel():
+                raise RuntimeError(
+                    f"DSV4 HiSparse device_slots too small: {device_slots.numel()} < {compressed.numel()}"
+                )
+            self.full_to_hisparse_device_index_mapping[compressed] = (
+                device_slots[:compressed.numel()].to(torch.int64)
+            )
+        if backup_state:
+            return out, (logical_state, out.clone())
+        return out
+
+    def clear_device_mapping(self, logical_indices: torch.Tensor):
+        """Clear mappings for caller-managed slots."""
+        compressed = self.hisparse_kvcache.translate_loc_from_full_to_compressed(
+            logical_indices
+        )
+        self.full_to_hisparse_device_index_mapping[compressed] = 0
+
     def alloc_decode(
         self,
         seq_lens: torch.Tensor,
@@ -586,3 +749,22 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.logical_attn_allocator.free(free_index)
         else:
             self.free_group.append(free_index)
+
+    def backup_state(self):
+        return (
+            self.logical_attn_allocator.backup_state(),
+            self.hisparse_attn_allocator.backup_state(),
+            self.full_to_hisparse_device_index_mapping.clone(),
+        )
+
+    def restore_state(self, state):
+        if len(state) == 2:
+            self.logical_attn_allocator.restore_state(state[0])
+            return
+
+        logical_state, hisparse_state, mapping_snapshot = state
+        self.logical_attn_allocator.restore_state(logical_state)
+        self.hisparse_attn_allocator.restore_state(hisparse_state)
+        self.full_to_hisparse_device_index_mapping[: mapping_snapshot.shape[0]].copy_(mapping_snapshot)
+        if mapping_snapshot.shape[0] < self.full_to_hisparse_device_index_mapping.shape[0]:
+            self.full_to_hisparse_device_index_mapping[mapping_snapshot.shape[0] :] = 0

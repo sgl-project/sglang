@@ -550,6 +550,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # kv-canary token-id validator snapshot
     req_all_ids_flat: Optional[torch.Tensor] = None
     req_all_ids_lens: Optional[torch.Tensor] = None
+    # HiSparse coordinator (passed from ScheduleBatch)
+    hisparse_coordinator: "Any" = None
 
     # Attention planning state. True iff attention metadata for this batch has
     # already been planned outside ModelRunner.forward (multi-step draft
@@ -733,6 +735,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             encoder_cached=batch.encoder_cached,
             encoder_lens_cpu=batch.encoder_lens_cpu,
             lora_ids=[req.lora_id for req in batch.reqs],
+            hisparse_coordinator=batch.hisparse_coordinator,
             rids=[req.rid for req in batch.reqs],
             # Compound (carry their own device tensors)
             sampling_info=batch.sampling_info,

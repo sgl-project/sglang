@@ -14,7 +14,11 @@ from sglang.kernels.ops.speculative.spec_tree import (
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_build_dsv4_verify_bundle,
 )
-from sglang.srt.mem_cache.allocation import alloc_for_spec_decode
+from sglang.srt.mem_cache.allocation import (
+    alloc_for_spec_decode,
+    assign_req_to_token_pool_func,
+    get_last_loc,
+)
 from sglang.srt.mem_cache.allocation_sizing import get_alloc_reserve_per_decode
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import (
@@ -857,21 +861,58 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
     # barrier has chained to the prev forward -> host stalls a full forward.
     cur_kv_lens_device = cur_kv_lens_cpu.to(device=batch.device, non_blocking=True)
     nxt_kv_lens_device = nxt_kv_lens_cpu.to(device=batch.device, non_blocking=True)
-    tree_cache = batch.tree_cache
-    req_to_token_pool = batch.req_to_token_pool
-    req_pool_indices = batch.req_pool_indices
-    reqs = batch.reqs
-    cur_kv_lens = cur_kv_lens_device
-    nxt_kv_lens = nxt_kv_lens_device
-    alloc_for_spec_decode(
-        tree_cache,
-        req_to_token_pool,
-        reqs=reqs,
-        req_pool_indices=req_pool_indices,
-        cur_kv_lens=cur_kv_lens,
-        cur_kv_lens_cpu=cur_kv_lens_cpu,
-        nxt_kv_lens=nxt_kv_lens,
-        nxt_kv_lens_cpu=nxt_kv_lens_cpu,
-        num_needed_tokens=num_needed_tokens,
-        batch=batch,
-    )
+    # HiSparse needs a device-slots-aware extend path (get_draft_device_slots +
+    # alloc_extend_with_device_mapping); fall back to the shared
+    # alloc_for_spec_decode() helper otherwise so we stay in sync with its
+    # num_needed_tokens>0 guard and kv_allocated_len bookkeeping.
+    hisparse_coordinator = getattr(batch, "hisparse_coordinator", None)
+    if (
+        num_needed_tokens > 0
+        and page_size > 1
+        and hisparse_coordinator is not None
+        and hisparse_coordinator.supports_hisparse_draft_slots()
+    ):
+        last_loc = get_last_loc(
+            batch.req_to_token_pool.req_to_token,
+            batch.req_pool_indices,
+            cur_kv_lens_device,
+        )
+        device_slots = hisparse_coordinator.get_draft_device_slots(
+            batch.req_pool_indices,
+            double_alloc,
+            cur_kv_lens_cpu,
+        )
+        out_cache_loc = batch.token_to_kv_pool_allocator.alloc_extend_with_device_mapping(
+            cur_kv_lens_device,
+            cur_kv_lens_cpu,
+            nxt_kv_lens_device,
+            nxt_kv_lens_cpu,
+            last_loc,
+            num_needed_tokens,
+            device_slots,
+        )
+        assign_req_to_token_pool_func(
+            batch.req_pool_indices,
+            batch.req_to_token_pool.req_to_token,
+            cur_kv_lens_device,
+            nxt_kv_lens_device,
+            out_cache_loc,
+            bs,
+        )
+        for i, req in enumerate(batch.reqs):
+            req.kv.kv_allocated_len = max(
+                req.kv.kv_allocated_len, int(nxt_kv_lens_cpu[i])
+            )
+    else:
+        alloc_for_spec_decode(
+            batch.tree_cache,
+            batch.req_to_token_pool,
+            reqs=batch.reqs,
+            req_pool_indices=batch.req_pool_indices,
+            cur_kv_lens=cur_kv_lens_device,
+            cur_kv_lens_cpu=cur_kv_lens_cpu,
+            nxt_kv_lens=nxt_kv_lens_device,
+            nxt_kv_lens_cpu=nxt_kv_lens_cpu,
+            num_needed_tokens=num_needed_tokens,
+            batch=batch,
+        )

@@ -177,6 +177,18 @@ class SchedulerBatchResultProcessor:
                     elem = elem.copy()
                 req.customized_info[k].append(elem)
 
+    def _stash_hisparse_spec_info(
+        self, batch: ScheduleBatch, batch_index: int, req: Req
+    ) -> None:
+        if not self.server_args.enable_hisparse or batch.spec_info is None:
+            return
+        if not hasattr(batch.spec_info, "slice_single"):
+            raise RuntimeError(
+                "HiSparse cannot stash speculative state for "
+                f"{type(batch.spec_info).__name__}"
+            )
+        req.hisparse_spec_info = batch.spec_info.slice_single(batch_index)
+
     def process_batch_result_prefill(
         self,
         batch: ScheduleBatch,
@@ -205,6 +217,13 @@ class SchedulerBatchResultProcessor:
                 result.extend_input_len_per_req,
                 result.extend_logprob_start_len_per_req,
             )
+
+            if (
+                self.server_args.enable_hisparse
+                and batch.spec_info is None
+                and result.next_draft_input is not None
+            ):
+                batch.spec_info = result.next_draft_input
 
             # Move next_token_ids and logprobs to cpu
             next_token_ids = next_token_ids.tolist()
@@ -243,6 +262,7 @@ class SchedulerBatchResultProcessor:
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         maybe_cache_unfinished_req(req, self.tree_cache)
                         if self.server_args.enable_hisparse:
+                            self._stash_hisparse_spec_info(batch, i, req)
                             self.hisparse_coordinator.admit_request_into_staging(req)
 
                     self._maybe_collect_customized_info(i, req, logits_output)

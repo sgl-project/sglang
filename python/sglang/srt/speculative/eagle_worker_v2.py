@@ -1119,7 +1119,36 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     ),
                 )
 
+    @property
+    def target_worker(self):
+        return self._target_worker
+
+    @property
+    def draft_worker(self):
+        return self._draft_worker
+
+    def clear_cache_pool(self):
+        # allocator and kv cache pool are shared with target worker, which are cleared in scheduler
+        pass
+
+    def _finish_hisparse_pending_draft_extend_backup(self, batch):
+        hisparse_coordinator = getattr(batch, "hisparse_coordinator", None)
+        if (
+            hisparse_coordinator is not None
+            and hisparse_coordinator.supports_hisparse_draft_slots()
+        ):
+            hisparse_coordinator.finish_pending_draft_extend_backup()
+
+    def _clear_hisparse_pending_draft_extend_backup(self, batch):
+        hisparse_coordinator = getattr(batch, "hisparse_coordinator", None)
+        if (
+            hisparse_coordinator is not None
+            and hisparse_coordinator.supports_hisparse_draft_slots()
+        ):
+            hisparse_coordinator.clear_pending_draft_extend_backup()
+
     def forward_batch_generation(self, batch: ScheduleBatch, on_publish=None):
+        self._finish_hisparse_pending_draft_extend_backup(batch)
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             # Target prefill
             target_capture_mode = (

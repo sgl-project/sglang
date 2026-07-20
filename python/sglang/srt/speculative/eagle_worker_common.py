@@ -587,6 +587,20 @@ def run_eagle_verify(
         accept_index,
     ) = eagle_sample(verify_input, batch, logits_output, vocab_mask)
     new_seq_lens = batch.seq_lens + accept_lens
+
+    hisparse_coordinator = getattr(batch, "hisparse_coordinator", None)
+    if (
+        hisparse_coordinator is not None
+        and hisparse_coordinator.supports_hisparse_draft_slots()
+        and not batch.forward_mode.is_idle()
+    ):
+        hisparse_coordinator.finalize_accepted_tokens_spec_v2(
+            req_pool_indices=batch.req_pool_indices,
+            seq_lens=batch.seq_lens,
+            verify_cache_locs=batch.out_cache_loc,
+            accept_index=accept_index,
+        )
+
     clear_unaccepted_c128 = getattr(
         token_to_kv_pool_allocator.get_kvcache(),
         "clear_unaccepted_c128_draft_states",
