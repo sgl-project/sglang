@@ -1038,6 +1038,84 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             multiprocess_mode="mostrecent",
         )
 
+        # =================================================================
+        # NCCL RAS health collector
+        # =================================================================
+        # `comm_hash` is bounded by the communicator count; `rank` (high
+        # cardinality) and `comm_name` are intentionally NOT labelnames here.
+        ras_comm_labels = list(labels.keys()) + ["comm_hash"]
+        ras_comm_type_labels = ras_comm_labels + ["collective"]
+        ras_comm_state_labels = ras_comm_labels + ["state"]
+        self.nccl_ras_missing_ranks = Gauge(
+            name="sglang:nccl_ras_missing_ranks",
+            documentation="Number of ranks in missing_ranks[] for a communicator.",
+            labelnames=ras_comm_labels,
+            multiprocess_mode="mostrecent",
+        )
+        self.nccl_ras_unresponsive_ranks = Gauge(
+            name="sglang:nccl_ras_unresponsive_ranks",
+            documentation="Number of missing ranks flagged unresponsive (immediate).",
+            labelnames=ras_comm_labels,
+            multiprocess_mode="mostrecent",
+        )
+        self.nccl_ras_dead_ranks = Gauge(
+            name="sglang:nccl_ras_dead_ranks",
+            documentation="Number of missing ranks flagged considered_dead (~60s).",
+            labelnames=ras_comm_labels,
+            multiprocess_mode="mostrecent",
+        )
+        self.nccl_ras_ranks_in_error = Gauge(
+            name="sglang:nccl_ras_ranks_in_error",
+            documentation="Live ranks with an NCCL error state (async_error/abort/finalize/destroy).",
+            labelnames=ras_comm_labels,
+            multiprocess_mode="mostrecent",
+        )
+        self.nccl_ras_collective_divergence = Gauge(
+            name="sglang:nccl_ras_collective_divergence",
+            documentation="Cross-rank (max-min) collective_counts spread per type (advisory).",
+            labelnames=ras_comm_type_labels,
+            multiprocess_mode="mostrecent",
+        )
+        self.nccl_ras_stuck = Gauge(
+            name="sglang:nccl_ras_stuck",
+            documentation="1 if a communicator is in the advisory STUCK state, else 0.",
+            labelnames=ras_comm_labels,
+            multiprocess_mode="mostrecent",
+        )
+        self.nccl_ras_communicator_state = Gauge(
+            name="sglang:nccl_ras_communicator_state",
+            documentation="1 for the communicator's current RasState, else 0.",
+            labelnames=ras_comm_state_labels,
+            multiprocess_mode="mostrecent",
+        )
+        self.nccl_ras_peer_dead_transitions_total = Counter(
+            name="sglang:nccl_ras_peer_dead_transitions_total",
+            documentation="Total considered_dead (False→True) transitions observed across polls.",
+            labelnames=ras_comm_labels,
+        )
+        self.nccl_ras_poll_success = Gauge(
+            name="sglang:nccl_ras_poll_success",
+            documentation="1 if the last RAS STATUS poll succeeded, else 0.",
+            labelnames=list(labels.keys()),
+            multiprocess_mode="mostrecent",
+        )
+        self.nccl_ras_poll_errors_total = Counter(
+            name="sglang:nccl_ras_poll_errors_total",
+            documentation="Total RAS STATUS poll failures (refused/timeout/malformed).",
+            labelnames=list(labels.keys()),
+        )
+        self.nccl_ras_last_collection_age_sec = Gauge(
+            name="sglang:nccl_ras_last_collection_age_sec",
+            documentation="Age of the RAS snapshot in seconds (unset when poll failed/stale).",
+            labelnames=list(labels.keys()),
+            multiprocess_mode="mostrecent",
+        )
+        # RasState names for the one-hot state gauge — derived from the enum
+        # (the detector owns the enum; metrics must not redeclare its values).
+        from sglang.srt.distributed.nccl_ras import RasState
+
+        self._ras_state_values = [s.name for s in RasState]
+
     @classmethod
     def init_new(
         cls,
@@ -1372,6 +1450,47 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         )
 
         self.last_log_time = time.perf_counter()
+
+    def log_nccl_ras(self, findings) -> None:
+        """Publish NCCL RAS findings to Prometheus.
+
+        Called only by the world-rank-0 RAS collector daemon (no
+        cross-process double-counting). Gauges use ``mostrecent``; the
+        dead-transition Counter incs by ``comm.peer_dead_transitions``
+        (newly-confirmed dead ranks this poll, so a rank already dead does
+        not re-transition).
+        """
+        base = self.labels
+        # Poll-level (job-wide) series.
+        self.nccl_ras_poll_success.labels(**base).set(1 if findings.poll_success else 0)
+        if not findings.poll_success:
+            self.nccl_ras_poll_errors_total.labels(**base).inc(1)
+        if findings.last_collection_age_sec is not None:
+            self.nccl_ras_last_collection_age_sec.labels(**base).set(
+                findings.last_collection_age_sec
+            )
+
+        for comm_key, comm in findings.per_comm.items():
+            comm_labels = {**base, "comm_hash": comm_key}
+            self.nccl_ras_missing_ranks.labels(**comm_labels).set(comm.missing)
+            self.nccl_ras_unresponsive_ranks.labels(**comm_labels).set(comm.unresponsive)
+            self.nccl_ras_dead_ranks.labels(**comm_labels).set(comm.dead)
+            self.nccl_ras_ranks_in_error.labels(**comm_labels).set(comm.ranks_in_error)
+            self.nccl_ras_stuck.labels(**comm_labels).set(1 if comm.stuck else 0)
+            if comm.peer_dead_transitions > 0:
+                self.nccl_ras_peer_dead_transitions_total.labels(
+                    **comm_labels
+                ).inc(comm.peer_dead_transitions)
+            # State as a one-hot gauge over the enum values.
+            state_name = comm.state.name
+            for s in self._ras_state_values:
+                self.nccl_ras_communicator_state.labels(
+                    **comm_labels, state=s
+                ).set(1 if s == state_name else 0)
+            for ctype, spread in comm.divergence.items():
+                self.nccl_ras_collective_divergence.labels(
+                    **comm_labels, collective=ctype
+                ).set(spread)
 
     def log_grammar_stats(self, grammar_stats) -> None:
         if grammar_stats.compilation_time is not None:

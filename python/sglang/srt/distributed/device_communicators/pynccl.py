@@ -35,6 +35,7 @@ class PyNcclCommunicator:
         device: Union[int, str, torch.device],
         library_path: Optional[str] = None,
         is_symmetric_memory_enabled: bool = False,
+        name: Optional[str] = None,
     ):
         """
         Args:
@@ -45,6 +46,8 @@ class PyNcclCommunicator:
             library_path: the path to the NCCL library. If None, it will
                 use the default library path.
             is_symmetric_memory_enabled: whether symmetric memory is enabled.
+            name: an optional human-readable communicator name (e.g. the
+                group coordinator's unique_name).
         It is the caller's responsibility to make sure each communicator
         is bind to a unique device.
         """
@@ -61,6 +64,7 @@ class PyNcclCommunicator:
             self.world_size = group.world_size
 
         self.group = group
+        self.name = name
 
         # if world_size == 1, no need to create communicator
         if self.world_size == 1:

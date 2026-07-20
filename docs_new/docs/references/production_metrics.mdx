@@ -132,7 +132,64 @@ sglang:spec_num_steps{model_name="meta-llama/Llama-3.1-8B-Instruct"} 3.0
 # HELP sglang:spec_num_draft_tokens Currently active speculative_num_draft_tokens (decouples from steps under topk>1).
 # TYPE sglang:spec_num_draft_tokens gauge
 sglang:spec_num_draft_tokens{model_name="meta-llama/Llama-3.1-8B-Instruct"} 4.0
+# HELP sglang:nccl_ras_poll_success 1 if the last RAS STATUS poll succeeded, else 0.
+# TYPE sglang:nccl_ras_poll_success gauge
+sglang:nccl_ras_poll_success{model_name="meta-llama/Llama-3.1-8B-Instruct",engine_type="frpc"} 1.0
+# HELP sglang:nccl_ras_ranks_in_error Number of live ranks with an NCCL error state (async_error!=0, abort_flag, finalize_called, or destroy_flag).
+# TYPE sglang:nccl_ras_ranks_in_error gauge
+sglang:nccl_ras_ranks_in_error{model_name="meta-llama/Llama-3.1-8B-Instruct",engine_type="frpc",comm_hash="0xafda22ff4305bcd2"} 0.0
+# HELP sglang:nccl_ras_missing_ranks Number of ranks in missing_ranks[] for a communicator.
+# TYPE sglang:nccl_ras_missing_ranks gauge
+sglang:nccl_ras_missing_ranks{model_name="meta-llama/Llama-3.1-8B-Instruct",engine_type="frpc",comm_hash="0xafda22ff4305bcd2"} 0.0
+# HELP sglang:nccl_ras_unresponsive_ranks Number of missing ranks flagged unresponsive (immediate).
+# TYPE sglang:nccl_ras_unresponsive_ranks gauge
+# HELP sglang:nccl_ras_dead_ranks Number of missing ranks flagged considered_dead (~60s).
+# TYPE sglang:nccl_ras_dead_ranks gauge
+# HELP sglang:nccl_ras_collective_divergence Cross-rank (max-min) collective_counts spread per type (advisory; symmetric hangs do not diverge).
+# TYPE sglang:nccl_ras_collective_divergence gauge
+# HELP sglang:nccl_ras_stuck 1 if a communicator is in the advisory STUCK state, else 0. Symmetric whole-collective hangs are NOT reported here.
+# TYPE sglang:nccl_ras_stuck gauge
+# HELP sglang:nccl_ras_communicator_state 1 for the communicator's current RasState, else 0.
+# TYPE sglang:nccl_ras_communicator_state gauge
+# HELP sglang:nccl_ras_peer_dead_transitions_total Total considered_dead (absent/False→True) transitions across polls.
+# TYPE sglang:nccl_ras_peer_dead_transitions_total counter
+# HELP sglang:nccl_ras_poll_errors_total Total RAS STATUS poll failures (refused/timeout/malformed).
+# TYPE sglang:nccl_ras_poll_errors_total counter
+# HELP sglang:nccl_ras_last_collection_age_sec Age of the RAS snapshot (now - status.timestamp). Unset when the poll failed or the timestamp was unparseable/stale.
+# TYPE sglang:nccl_ras_last_collection_age_sec gauge
 ```
+
+### NCCL RAS Health Metrics
+
+When `SGLANG_NCCL_RAS_ENABLE=true` (and `--enable-metrics`), a job-wide singleton
+collector on world rank 0 pulls NCCL RAS `STATUS` from the RAS socket and
+publishes the `sglang:nccl_ras_*` series above. The reliable primary signals are:
+
+- **`nccl_ras_poll_success` / `nccl_ras_poll_errors_total`** — a refused/timed-out
+  RAS socket is the main single-node crash signal (`poll_success=0`).
+- **`nccl_ras_ranks_in_error`** — live ranks in an NCCL error state
+  (`async_error!=0`, `abort_flag`, `finalize_called`, `destroy_flag`); the
+  cleanest per-rank RAS signal.
+- **`nccl_ras_missing_ranks` / `nccl_ras_unresponsive_ranks` / `nccl_ras_dead_ranks`
+  / `nccl_ras_peer_dead_transitions_total`** — (cross-node) dead/unresponsive
+  ranks, where `unresponsive` is immediate and `considered_dead` lags ~60s.
+- **`nccl_ras_last_collection_age_sec`** — snapshot freshness; use this as the
+  primary "collector alive" signal rather than the mere presence of series
+  (an absent/stale age distinguishes "collector crashed" from "never enabled").
+
+#### Blind spots (important)
+
+- **RAS HEALTHY ≠ system healthy.** RAS keep-alive sees process liveness, not
+  collective progress. A rank that is alive but stalled is not flagged by RAS.
+- **`nccl_ras_stuck` / `nccl_ras_collective_divergence` are advisory only.**
+  RAS `collective_counts` are cached and intermittently all-zero, and a
+  *symmetric* whole-collective hang does not diverge (all ranks stall together,
+  spread stays ~constant) — so RAS does **not** report symmetric hangs. The
+  forward watchdog remains the primary hang detector; RAS augments it for
+  per-rank errors, cross-node death, and job-level crash observability.
+- **Single-point collector.** Only world rank 0 collects; if that node dies,
+  RAS series stop (visible as a rising/stale `nccl_ras_last_collection_age_sec`
+  and `nccl_ras_poll_success=0`).
 
 ## Setup Guide
 

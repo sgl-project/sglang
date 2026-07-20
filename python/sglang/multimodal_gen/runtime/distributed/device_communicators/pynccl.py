@@ -32,6 +32,7 @@ class PyNcclCommunicator:
         group: ProcessGroup | StatelessProcessGroup,
         device: int | str | torch.device,
         library_path: str | None = None,
+        name: str | None = None,
     ):
         """
         Args:
@@ -41,6 +42,8 @@ class PyNcclCommunicator:
                 it will be bind to f"cuda:{local_rank}".
             library_path: the path to the NCCL library. If None, it will
                 use the default library path.
+            name: an optional human-readable communicator name (e.g. the
+                group coordinator's unique_name).
         It is the caller's responsibility to make sure each communicator
         is bind to a unique device.
         """
@@ -57,6 +60,7 @@ class PyNcclCommunicator:
             self.world_size = group.world_size
 
         self.group = group
+        self.name = name
 
         # if world_size == 1, no need to create communicator
         if self.world_size == 1:

@@ -1,0 +1,56 @@
+{
+  "nccl_version": "2.30.7",
+  "cuda_runtime_version": 13030,
+  "cuda_driver_version": 13020,
+  "timestamp": "2026-07-19 11:18:36",
+  "communicators_count": 1,
+  "communicators": [
+    {
+      "hash": "0x22826a5eaccee420",
+      "secondary_hash": "0x845bbcd39e46ed92:0xe31a74ed627ac897",
+      "size": 2,
+      "ranks_count": 1,
+      "missing_ranks_count": 1,
+      "ranks": [
+        {
+          "rank": 0,
+          "host": "172.17.0.8",
+          "pid": 4671,
+          "cuda_dev": 0,
+          "nvml_dev": 0,
+          "status": {
+            "init_state": 0,
+            "async_error": 0,
+            "finalize_called": false,
+            "destroy_flag": false,
+            "abort_flag": false
+          },
+          "collective_counts": {
+            "Broadcast": 0,
+            "Reduce": 0,
+            "AllGather": 0,
+            "ReduceScatter": 0,
+            "AllReduce": 20
+          }
+        }
+      ],
+      "missing_ranks": [
+        {
+          "rank": 1,
+          "host": "172.17.0.8",
+          "pid": 4672,
+          "cuda_dev": 1,
+          "nvml_dev": 1,
+          "status": {
+            "unresponsive": true,
+            "considered_dead": false
+          }
+        }
+      ]
+    }
+  ],
+  "ras": {
+    "collection_time_sec": 0.0,
+    "timeouts_count": 0
+  }
+}

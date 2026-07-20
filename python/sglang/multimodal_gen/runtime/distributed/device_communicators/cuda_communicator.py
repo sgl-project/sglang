@@ -32,6 +32,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             self.pynccl_comm = PyNcclCommunicator(
                 group=self.cpu_group,
                 device=self.device,
+                name=self.unique_name,
             )
 
     def all_reduce(self, input_, op: torch.distributed.ReduceOp | None = None):
