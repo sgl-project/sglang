@@ -417,7 +417,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         """Get the fill value for sequence lengths in CUDA graph."""
         return 1
 
-    def init_mha_chunk_metadata(self, forward_batch: ForwardBatch) -> None:
+    def init_mha_chunk_metadata(
+        self, forward_batch: ForwardBatch, disable_flashinfer_ragged: bool = False
+    ) -> None:
         has_prefix = any(forward_batch.extend_prefix_lens_cpu)
         fallback_to_flashinfer_impl = (
             self.disable_chunked_prefix_cache and has_prefix
