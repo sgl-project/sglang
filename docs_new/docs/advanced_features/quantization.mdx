@@ -248,7 +248,7 @@ Backend selection applies to **blockwise FP8**, **MXFP8** (dense linear), and **
     </tr>
     <tr>
       <td><code>cutlass</code></td>
-      <td>SM90, SM100/120</td>
+      <td>SM120</td>
       <td>sgl-kernel CUTLASS</td>
     </tr>
     <tr>
@@ -264,7 +264,7 @@ Backend selection applies to **blockwise FP8**, **MXFP8** (dense linear), and **
   </tbody>
 </table>
 
-**`auto` selection order:** 1) DeepGEMM (SM90/SM100, installed); 2) FlashInfer TRTLLM (SM100, FlashInfer available); 3) CUTLASS (SM90/SM100/120); 4) AITER (AMD); 5) Triton. **Exception:** SM120 always resolves to Triton.
+**`auto` selection order:** 1) DeepGEMM (SM90/SM100, installed); 2) FlashInfer TRTLLM (SM100, FlashInfer available); 3) CUTLASS (SM120); 4) AITER (AMD); 5) Triton (fallback).
 
 **MXFP8 dense linear:** `auto` uses `flashinfer_cutlass` on SM100 (else `triton`). `flashinfer_cutlass` is fastest on most shapes; `flashinfer_trtllm` is faster only at small M.
 

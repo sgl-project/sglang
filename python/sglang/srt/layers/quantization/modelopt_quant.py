@@ -1715,6 +1715,26 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         return out.view(*output_shape)
 
 
+def deinterleave_w13(weight: torch.Tensor, *, up_first: bool = False) -> torch.Tensor:
+    """De-interleave a checkpoint ``[g0,u0,g1,u1,...]`` fused gate/up tensor.
+
+    Default returns the block layout ``[gate...; up...]`` (gate half first), which
+    the CUTLASS NVFP4 prep expects. With ``up_first=True`` it returns
+    ``[up...; gate...]``, the layout the FlashInfer TRT-LLM FP4 prep + kernel
+    expect (the kernel applies the up/gate GEMM1 scales to the first/second halves
+    on that assumption). Operates on the row dim (-2), so it covers both the packed
+    weight and its block scale.
+    """
+    assert weight.shape[-2] % 2 == 0
+    grouped = weight.reshape(
+        *weight.shape[:-2], weight.shape[-2] // 2, 2, weight.shape[-1]
+    )
+    if up_first:
+        # Flip each [gate, up] pair to [up, gate] before the block transpose.
+        grouped = grouped.flip(-2)
+    return grouped.transpose(-3, -2).reshape_as(weight).contiguous()
+
+
 class ModelOptNvFp4A16LinearMethod(LinearMethodBase):
     """Linear method for ModelOpt NVFP4A16 checkpoints.
 
@@ -2108,6 +2128,18 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         Only supports pre-quantized checkpoints with FP8 weights and scales.
         """
+        if getattr(layer, "inference_moe_w13_interleaved", False) and not getattr(
+            layer, "_w13_deinterleaved", False
+        ):
+            up_first = self.enable_flashinfer_trtllm_moe
+            layer.w13_weight.data = deinterleave_w13(
+                layer.w13_weight.data, up_first=up_first
+            )
+            layer.w13_weight_scale.data = deinterleave_w13(
+                layer.w13_weight_scale.data, up_first=up_first
+            )
+            layer._w13_deinterleaved = True
+
         # GEMM1 scale processing is deferred until the input scale is known;
         # see _compute_gemm1_alphas, which splits w13's gate/up weight scales.
         moe_runner_backend = self.get_moe_runner_backend()
@@ -2432,6 +2464,35 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         return self._moe_runner_backend
 
+    def get_marlin_quant_info(self, layer: torch.nn.Module):
+        """Marlin payload for the fp4-marlin (W4A16) fallback; the weights were
+        repacked by prepare_moe_nvfp4_layer_for_marlin. Also consumed by
+        FusedMoEWithLoRA's marlin branch."""
+        from sglang.srt.layers.moe.moe_runner.marlin import MarlinMoeQuantInfo
+
+        expert_map = None
+        global_num_experts = -1
+        if hasattr(layer, "dispatcher") and hasattr(
+            layer.dispatcher, "local_expert_mapping"
+        ):
+            expert_map = layer.dispatcher.local_expert_mapping
+            if expert_map is not None:
+                global_num_experts = self.moe_runner_config.num_experts
+
+        return MarlinMoeQuantInfo(
+            w13_qweight=layer.w13_weight,
+            w2_qweight=layer.w2_weight,
+            w13_scales=layer.w13_weight_scale,
+            w2_scales=layer.w2_weight_scale,
+            w13_g_idx_sort_indices=None,
+            w2_g_idx_sort_indices=None,
+            weight_bits=4,
+            w13_global_scale=layer.w13_weight_scale_2,
+            w2_global_scale=layer.w2_weight_scale_2,
+            expert_map=expert_map,
+            global_num_experts=global_num_experts,
+        )
+
     def apply(
         self,
         layer: FusedMoE,
@@ -2451,30 +2512,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         moe_runner_config = self.moe_runner_config
 
         if moe_runner_backend.is_marlin():
-            from sglang.srt.layers.moe.moe_runner.marlin import MarlinMoeQuantInfo
-
-            expert_map = None
-            global_num_experts = -1
-            if hasattr(layer, "dispatcher") and hasattr(
-                layer.dispatcher, "local_expert_mapping"
-            ):
-                expert_map = layer.dispatcher.local_expert_mapping
-                if expert_map is not None:
-                    global_num_experts = self.moe_runner_config.num_experts
-
-            quant_info = MarlinMoeQuantInfo(
-                w13_qweight=layer.w13_weight,
-                w2_qweight=layer.w2_weight,
-                w13_scales=layer.w13_weight_scale,
-                w2_scales=layer.w2_weight_scale,
-                w13_g_idx_sort_indices=None,
-                w2_g_idx_sort_indices=None,
-                weight_bits=4,
-                w13_global_scale=layer.w13_weight_scale_2,
-                w2_global_scale=layer.w2_weight_scale_2,
-                expert_map=expert_map,
-                global_num_experts=global_num_experts,
-            )
+            quant_info = self.get_marlin_quant_info(layer)
             return self.runner.run(dispatch_output, quant_info)
 
         # FlashInfer TRTLLM FP4 path
