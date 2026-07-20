@@ -49,6 +49,7 @@ from sglang.srt.utils import (
     is_gfx95_supported,
     is_hip,
     is_npu,
+    is_xpu,
 )
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -58,6 +59,7 @@ global _use_multi_stream
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
+_is_xpu = is_xpu()
 
 if not _is_npu:
     from sglang.jit_kernel.dsa import (
@@ -338,6 +340,8 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     # from sgl_kernel import hadamard_transform
     if _is_hip:
         from fast_hadamard_transform import hadamard_transform
+    elif _is_xpu:
+        from sgl_kernel import hadamard_transform
     else:
         from sglang.jit_kernel.hadamard import hadamard_transform
 
@@ -1551,7 +1555,7 @@ class Indexer(MultiPlatformOp):
             "piecewise/breakable CUDA graph"
         )
         if not _is_npu:
-            from sglang.srt.layers.attention.dsa.tilelang_kernel import fp8_index
+            from sglang.kernels.ops.attention.dsa.tilelang_kernel import fp8_index
 
         page_size = get_token_to_kv_pool().page_size
         assert page_size == 64, "only support page size 64"
@@ -1730,9 +1734,9 @@ class Indexer(MultiPlatformOp):
         return_indices: bool = True,
     ) -> Optional[torch.Tensor]:
         if _is_hip:
-            from sglang.srt.layers.attention.dsa.tilelang_kernel import act_quant
+            from sglang.kernels.ops.attention.dsa.tilelang_kernel import act_quant
         elif not _is_npu:
-            from sglang.srt.layers.attention.dsa.triton_kernel import act_quant
+            from sglang.kernels.ops.attention.dsa.triton_kernel import act_quant
 
         if TYPE_CHECKING:
             assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)
@@ -2338,7 +2342,8 @@ class Indexer(MultiPlatformOp):
                 sparse_count=self.index_topk,
                 sparse_mode=3,
             )
-            return topk_indices[0]
+            # Keep DSA top-k as [T, K]; NPU attention expands it when needed.
+            return topk_indices[0].squeeze(1)
 
     def do_npu_cp_balance_indexer(
         self,
@@ -2415,7 +2420,7 @@ def pcg_dsa_indexer_prefill_split(
     # captured graph reads it at a fixed address; eager code instead allocates
     # and returns a fresh, naturally-sized tensor each call.
     assert _is_cuda, "Internal error: DSA graph dispatch is only supported on CUDA"
-    from sglang.srt.layers.attention.dsa.triton_kernel import act_quant
+    from sglang.kernels.ops.attention.dsa.triton_kernel import act_quant
 
     forward_context = get_tc_piecewise_forward_context()
     forward_batch = forward_context.forward_batch
