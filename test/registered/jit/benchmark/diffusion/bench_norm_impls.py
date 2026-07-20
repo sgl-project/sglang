@@ -19,14 +19,16 @@ from sglang.jit_kernel.diffusion.triton.rmsnorm_onepass import triton_one_pass_r
 from sglang.jit_kernel.norm import fused_add_rmsnorm as jit_fused_add_rmsnorm
 from sglang.jit_kernel.norm import rmsnorm as jit_rmsnorm
 from sglang.jit_kernel.utils import KERNEL_PATH
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.utils import is_in_ci
 
 register_cuda_ci(
     est_time=120,
-    suite="base-b-kernel-benchmark-1-gpu-large",
+    stage="base-b-kernel-benchmark",
+    runner_config="1-gpu-large",
     disabled="self-skips in CI, standalone tool",
 )
+register_amd_ci(est_time=120, stage="jit-kernel-benchmark", runner_config="amd")
 
 os.environ.setdefault("FLASHINFER_DISABLE_VERSION_CHECK", "1")
 

@@ -53,6 +53,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ToolChoiceFuncName,
 )
 from sglang.srt.observability.req_time_stats import monotonic_time
+from sglang.srt.parser.template_detection import detect_inline_system_support
 
 if TYPE_CHECKING:
     from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
@@ -132,6 +133,26 @@ def _anthropic_usage_from_openai(
     return AnthropicUsage(**usage_fields)
 
 
+def _extract_system_text(
+    content: Union[str, list[AnthropicContentBlock]],
+) -> Optional[str]:
+    """Flatten a system message's content to a trimmed string, or ``None``."""
+    if isinstance(content, str):
+        return content.strip() or None
+    texts = []
+    for block in content:
+        if isinstance(block, BaseModel) and getattr(block, "type", None) == "text":
+            text = getattr(block, "text", "")
+        elif isinstance(block, dict) and block.get("type") == "text":
+            text = block.get("text", "")
+        else:
+            continue
+        text = (text or "").strip()
+        if text:
+            texts.append(text)
+    return "\n".join(texts) if texts else None
+
+
 def _wrap_sse_event(data: str, event_type: str) -> str:
     """Format an Anthropic SSE event with event type and data lines."""
     return f"event: {event_type}\ndata: {data}\n\n"
@@ -169,6 +190,18 @@ class AnthropicServing:
 
     def __init__(self, openai_serving_chat: OpenAIServingChat):
         self.openai_serving_chat = openai_serving_chat
+        self._merge_inline_system = not detect_inline_system_support(
+            self._chat_template()
+        )
+
+    def _chat_template(self) -> Optional[str]:
+        tokenizer_manager = getattr(self.openai_serving_chat, "tokenizer_manager", None)
+        if tokenizer_manager is None:
+            return None
+        tokenizer = getattr(tokenizer_manager, "tokenizer", None)
+        if tokenizer is None:
+            return None
+        return getattr(tokenizer, "chat_template", None)
 
     async def handle_messages(
         self,
@@ -356,19 +389,28 @@ class AnthropicServing:
                 )
                 return None
 
-        # Add system message if provided
+        system_parts: list[str] = []
         if anthropic_request.system:
             if isinstance(anthropic_request.system, str):
-                openai_messages.append(
-                    {"role": "system", "content": anthropic_request.system}
-                )
+                if anthropic_request.system.strip():
+                    system_parts.append(anthropic_request.system)
             else:
-                system_parts = []
                 for block in anthropic_request.system:
                     if block.type == "text" and block.text:
                         system_parts.append(block.text)
-                system_text = "\n".join(system_parts)
-                openai_messages.append({"role": "system", "content": system_text})
+
+        if self._merge_inline_system:
+            for msg in anthropic_request.messages:
+                if msg.role != "system":
+                    continue
+                text = _extract_system_text(msg.content)
+                if text:
+                    system_parts.append(text)
+
+        if system_parts:
+            openai_messages.append(
+                {"role": "system", "content": "\n".join(system_parts)}
+            )
 
         def _emit_user_message(parts: list[dict]) -> None:
             """Append accumulated parts as a user message, then clear them.
@@ -388,6 +430,8 @@ class AnthropicServing:
 
         # Convert messages
         for msg in anthropic_request.messages:
+            if msg.role == "system" and self._merge_inline_system:
+                continue
             if isinstance(msg.content, str):
                 openai_messages.append({"role": msg.role, "content": msg.content})
                 continue

@@ -78,14 +78,23 @@ Use `sglang generate --help` and `sglang serve --help` for the full argument lis
 - `--lora-path {PATH}` and `--lora-nickname {NAME}`: load a LoRA adapter
 - `--lora-merge-mode {auto|merge|dynamic}`: choose how LoRA is applied. `auto` statically merges regular weights and uses dynamic LoRA for FSDP-sharded weights to avoid full-gather peaks.
 - `--num-gpus {N}`: number of GPUs to use
-- `--performance-mode {manual|auto|speed|memory}` / `--mode`: preset for latency/throughput and memory defaults. `auto` is the default and keeps safe offload defaults, using FSDP only for validated DiT-offload replacement paths; use `manual` to keep performance-related server args under explicit user control. Explicit offload, FSDP, and parallelism flags take precedence in all modes.
+- `--performance-mode {manual|auto|speed|memory}` / `--mode`: preset for latency/throughput and memory defaults. `auto` is the default and keeps safe offload defaults, using FSDP only for validated DiT-offload replacement paths; `speed` also enables `--enable-torch-compile` by default unless you explicitly disable it. Use `manual` to keep performance-related server args under explicit user control. Explicit offload, FSDP, and parallelism flags take precedence in all modes.
 - `--tp-size {N}`: tensor parallelism size, mainly for encoders
 - `--sp-degree {N}`: sequence parallelism size
 - `--ulysses-degree {N}` and `--ring-degree {N}`: USP parallelism controls
 - `--enable-cfg-parallel {true|false}`: enable or explicitly disable CFG parallelism
+- `--warmup-mode {off|request|server}`: control startup warmup for `sglang serve`; `off` skips warmup, `request` primes the request path, and `server` runs a full synthetic server warmup before serving traffic
+- `--enable-torch-compile {true|false}`: compile native diffusion hot paths. When no warmup mode is configured, this also enables server warmup so first real requests do not pay compile latency.
+- `--offload-during-compile {true|false}`: when compile warmup is active, temporarily layerwise-offload DiT weights and move resident non-DiT components off-device so `max-autotune` fits on tighter-memory GPUs; the configured serving residency is restored before real traffic. Skipped under existing layerwise offload, Cache-DiT, or FSDP.
+- `--enable-breakable-cuda-graph {true|false}`: capture supported DiT forwards as breakable CUDA graph segments to reduce launch overhead. Requires `--warmup-resolutions` for every served resolution because each resolution is captured separately.
+- `--bcg-text-buckets {N...}`: prompt-length padding buckets for breakable CUDA graph capture/replay reuse.
 - `--attention-backend {BACKEND}`: attention backend for native SGLang and diffusers pipelines
 - `--component-attention-backends {MAP}`: per-component attention backend overrides, for example `text_encoder=torch_sdpa,transformer=fa`
 - `--attention-backend-config {CONFIG}`: attention backend configuration
+- `--srt-encoder-url {HTTPADDRESS}`: address of SGLang srt server with AR model for GLM-Image like models
+- `--srt-encoder-timeout {SECONDS}`: Timeout in seconds for HTTP requests to the SGLang encoder server
+- `--srt-encoder-connection-timeout {SECONDS}`: TCP connection timeout in seconds for SGLang encoder server
+- `--pe-server-url {HTTPADDRESS}`: url of SGLang server hosting the PE model (e.g., for ERNIE-Image)
 - `--original-dtype {auto|bfloat16}`: Original data type of model, `auto` will use original published weights. Use other options if the data type of weights differs from the original one and weights do not have a quantization config.
 
 ### Sampling and output
@@ -109,6 +118,13 @@ For quantized transformer checkpoints, prefer:
 - `--quantization-ignored-layers` layer name patterns to keep unquantized (e.g. `attention.to_`)
 
 See [Quantization](../quantization) for supported quantization families and examples.
+
+### Request logging
+
+- `--log-requests`: Log user-facing fields of all requests (default: `False`). The verbosity is decided by `--log-requests-level`.
+- `--log-requests-level &#123;0|1|2|3&#125;`: Verbosity level for request logging (default: `2`). 0: Log metadata (request id). 1: Log metadata and sampling config (seed, steps, guidance, resolution, frames, fps, ...). 2: Log metadata, sampling config and prompt (truncated to 2 KiB). 3: Log metadata, sampling config and full prompt.
+- `--log-requests-format &#123;text|json&#125;`: Format for request logging (default: `text`). `text` is human-readable; `json` outputs structured JSON lines.
+- `--log-requests-target &#123;TARGET...&#125;`: Target(s) for request logging. Use `stdout` for console output and/or directory path(s) for file output. Can specify multiple targets, e.g., `--log-requests-target stdout /my/log/dir`.
 
 ## Configuration Files
 
@@ -163,6 +179,8 @@ HTTP server-only arguments are ignored by `sglang generate`.
 </Note>
 
 For diffusers pipelines, Cache-DiT can be enabled with `SGLANG_CACHE_DIT_ENABLED=true` or `--cache-dit-config`. See [Cache-DiT](../cache_dit).
+
+For supported image pipelines, breakable CUDA graph can be enabled with `--enable-breakable-cuda-graph`, but you must declare every served resolution in `--warmup-resolutions` so warmup captures matching graph signatures.
 
 ### Layerwise Offload
 

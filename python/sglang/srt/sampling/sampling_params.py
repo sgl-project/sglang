@@ -15,7 +15,7 @@
 
 import logging
 import math
-from typing import Any, Dict, List, Optional, Set, Union
+from typing import Dict, List, Optional, Set, Union
 
 import msgspec
 
@@ -24,6 +24,17 @@ try:
     import re._parser as sre_parse
 except ImportError:
     import sre_parse  # Python < 3.11
+
+# JSON-safe value types for custom_params.  Must survive msgpack IPC
+# without PickleWrapper.  After deserialization on the scheduler side,
+# Req.__init__ injects "__req__" (a Req object) into the dict in-process;
+# that augmented dict is never re-serialized.
+_JsonScalar = Union[None, bool, int, float, str]
+CustomParamValue = Union[
+    _JsonScalar,
+    List[_JsonScalar],
+    Dict[str, _JsonScalar],
+]
 
 _SAMPLING_EPS = 1e-6
 TOP_K_ALL = 1 << 30
@@ -65,8 +76,7 @@ class SamplingParams(msgspec.Struct, kw_only=True, omit_defaults=True):
     """
     The sampling parameters.
 
-    See docs/backend/sampling_params.md or
-    https://docs.sglang.io/backend/sampling_params.html
+    See docs_new/docs/basic_usage/sampling_params.mdx
     for the documentation.
     """
 
@@ -96,7 +106,7 @@ class SamplingParams(msgspec.Struct, kw_only=True, omit_defaults=True):
     skip_special_tokens: bool = True
     spaces_between_special_tokens: bool = True
     no_stop_trim: bool = False
-    custom_params: Optional[Dict[str, Any]] = None
+    custom_params: Optional[Dict[str, CustomParamValue]] = None
     stream_interval: Optional[int] = None
     logit_bias: Optional[Dict[str, float]] = None
     sampling_seed: Optional[int] = None
