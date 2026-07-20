@@ -337,6 +337,216 @@ def _fused_metadata_kernel_ps1_no_swa(
     tl.store(page_table + pt_offsets, page_index, mask=mask, cache_modifier=".cg")
 
 
+@triton.jit
+def _draft_extend_metadata_kernel(
+    # Input tensors
+    seq_lens,
+    seq_lens_stride_0,
+    extend_seq_lens,
+    extend_seq_lens_stride_0,
+    req_to_token,
+    req_to_token_stride_0,
+    req_to_token_stride_1,
+    req_pool_indices,
+    req_pool_indices_stride_0,
+    # Output buffers
+    cache_seqlens_int32,
+    cache_seqlens_int32_stride_0,
+    cu_seqlens_k,
+    cu_seqlens_k_stride_0,
+    cu_seqlens_q,
+    cu_seqlens_q_stride_0,
+    page_table,
+    page_table_stride_0,
+    page_table_stride_1,
+    full_to_swa_index_mapping,
+    swa_page_table,
+    out_cache_loc,
+    swa_out_cache_loc,
+    # Scalar parameters
+    B,
+    max_seq_pages,
+    tokens_per_req,
+    PAGE_SIZE_ONE: tl.constexpr,
+    SHIFT: tl.constexpr,
+    BLOCK_COLS: tl.constexpr,
+    HAS_SWA: tl.constexpr,
+    OUT_BLOCK: tl.constexpr,
+):
+    pid_b = tl.program_id(0)  # batch index
+    pid_c = tl.program_id(1)  # column chunk index
+
+    # 1. Prefix sums (only one block does them): cache_seqlens + cu_seqlens_k
+    #    from seq_lens, cu_seqlens_q from extend_seq_lens.
+    if pid_b == 0 and pid_c == 0:
+        acc_k = 0
+        acc_q = 0
+        for idx in range(B):
+            seq = tl.load(seq_lens + idx * seq_lens_stride_0).to(tl.int32)
+            tl.store(cache_seqlens_int32 + idx * cache_seqlens_int32_stride_0, seq)
+            tl.store(cu_seqlens_k + idx * cu_seqlens_k_stride_0, acc_k)
+            acc_k += seq
+            ext = tl.load(extend_seq_lens + idx * extend_seq_lens_stride_0).to(tl.int32)
+            tl.store(cu_seqlens_q + idx * cu_seqlens_q_stride_0, acc_q)
+            acc_q += ext
+        tl.store(cu_seqlens_k + B * cu_seqlens_k_stride_0, acc_k)
+        tl.store(cu_seqlens_q + B * cu_seqlens_q_stride_0, acc_q)
+
+    # 2. SWA write-loc translation for this request's extend tokens. Runs
+    #    before the seq_len early-return so padded rows (seq_len 0) keep
+    #    swa_out_cache_loc consistent with out_cache_loc.
+    if HAS_SWA:
+        if pid_c == 0:
+            tok_idx = tl.arange(0, OUT_BLOCK)
+            tok_mask = tok_idx < tokens_per_req
+            tok_offsets = pid_b * tokens_per_req + tok_idx
+            full_locs = tl.load(out_cache_loc + tok_offsets, mask=tok_mask, other=0)
+            swa_locs = tl.load(
+                full_to_swa_index_mapping + full_locs, mask=tok_mask, other=0
+            )
+            tl.store(swa_out_cache_loc + tok_offsets, swa_locs, mask=tok_mask)
+
+    # 3. Page-table gather for this batch row and column chunk, self-guarded
+    #    on the device-side seq_len (no host max; tails keep stale values the
+    #    attention kernels never read past cache_seqlens).
+    if max_seq_pages == 0:
+        return
+
+    seq_len = tl.load(seq_lens + pid_b * seq_lens_stride_0).to(tl.int32)
+    if PAGE_SIZE_ONE:
+        num_live_pages = seq_len
+    else:
+        num_live_pages = (seq_len + (1 << SHIFT) - 1) >> SHIFT
+    num_live_pages = tl.minimum(num_live_pages, max_seq_pages)
+    if pid_c * BLOCK_COLS >= num_live_pages:
+        return
+
+    row_idx = tl.load(req_pool_indices + pid_b * req_pool_indices_stride_0)
+    row_offset = row_idx * req_to_token_stride_0
+
+    col_offsets = pid_c * BLOCK_COLS + tl.arange(0, BLOCK_COLS)
+    mask = col_offsets < num_live_pages
+
+    if PAGE_SIZE_ONE:
+        col_idx = col_offsets
+    else:
+        col_idx = col_offsets << SHIFT
+
+    rt_offsets = row_offset + col_idx * req_to_token_stride_1
+    page_index = tl.load(
+        req_to_token + rt_offsets, mask=mask, other=0, cache_modifier=".cg"
+    )
+
+    if PAGE_SIZE_ONE:
+        page_table_val = page_index
+    else:
+        page_table_val = page_index >> SHIFT
+
+    pt_offsets = pid_b * page_table_stride_0 + col_offsets * page_table_stride_1
+    tl.store(page_table + pt_offsets, page_table_val, mask=mask, cache_modifier=".cg")
+
+    if HAS_SWA:
+        swa_loc = tl.load(full_to_swa_index_mapping + page_index, mask=mask, other=0)
+        if PAGE_SIZE_ONE:
+            swa_page_table_val = swa_loc
+        else:
+            swa_page_table_val = swa_loc >> SHIFT
+        tl.store(
+            swa_page_table + pt_offsets,
+            swa_page_table_val.to(tl.int32),
+            mask=mask,
+            cache_modifier=".cg",
+        )
+
+
+def draft_extend_set_metadata(
+    cache_seqlens_int32: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    page_table: torch.Tensor,
+    req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    extend_seq_lens: torch.Tensor,
+    page_size: int,
+    full_to_swa_index_mapping: Optional[torch.Tensor] = None,
+    swa_page_table: Optional[torch.Tensor] = None,
+    out_cache_loc: Optional[torch.Tensor] = None,
+    swa_out_cache_loc: Optional[torch.Tensor] = None,
+):
+    """Fused, graph-recordable DRAFT_EXTEND_V2 metadata update (one launch):
+      1. cache_seqlens = seq_lens (int32 cast)
+      2. cu_seqlens_k = pad(cumsum(cache_seqlens))
+      3. cu_seqlens_q = pad(cumsum(extend_seq_lens))
+      4. page_table[:, :pages(seq_len)] = req_to_token[pool_idx, ::page_size] // page_size
+      5. (SWA pools) swa_page_table likewise via the full->swa lookup, and
+         swa_out_cache_loc = full_to_swa_index_mapping[out_cache_loc]
+
+    The page gathers self-guard on the device-side seq_lens (no host max);
+    row tails keep stale values that attention kernels never read past
+    cache_seqlens, matching the eager replay path's bounded writes.
+    """
+    assert (
+        page_size > 0 and (page_size & (page_size - 1)) == 0
+    ), f"page_size must be a power of two, got {page_size}"
+
+    batch_size = cache_seqlens_int32.shape[0]
+    max_seq_pages = page_table.shape[1]
+
+    has_swa = full_to_swa_index_mapping is not None
+    if has_swa:
+        assert swa_page_table is not None
+        assert swa_page_table.shape == page_table.shape
+        assert swa_page_table.stride() == page_table.stride()
+        assert out_cache_loc is not None and swa_out_cache_loc is not None
+        num_out_tokens = out_cache_loc.shape[0]
+        assert swa_out_cache_loc.shape[0] == num_out_tokens
+        assert num_out_tokens > 0 and num_out_tokens % batch_size == 0
+        tokens_per_req = num_out_tokens // batch_size
+        out_block = triton.next_power_of_2(tokens_per_req)
+    else:
+        tokens_per_req = 0
+        out_block = 1
+
+    BLOCK_COLS = 256
+    grid = (batch_size, max(1, triton.cdiv(max_seq_pages, BLOCK_COLS)))
+
+    _draft_extend_metadata_kernel[grid](
+        seq_lens,
+        seq_lens.stride(0),
+        extend_seq_lens,
+        extend_seq_lens.stride(0),
+        req_to_token,
+        req_to_token.stride(0),
+        req_to_token.stride(1),
+        req_pool_indices,
+        req_pool_indices.stride(0),
+        cache_seqlens_int32,
+        cache_seqlens_int32.stride(0),
+        cu_seqlens_k,
+        cu_seqlens_k.stride(0),
+        cu_seqlens_q,
+        cu_seqlens_q.stride(0),
+        page_table,
+        page_table.stride(0),
+        page_table.stride(1),
+        full_to_swa_index_mapping,
+        swa_page_table,
+        out_cache_loc,
+        swa_out_cache_loc,
+        batch_size,
+        max_seq_pages,
+        tokens_per_req,
+        PAGE_SIZE_ONE=page_size == 1,
+        SHIFT=(page_size).bit_length() - 1 if page_size > 1 else 0,
+        BLOCK_COLS=BLOCK_COLS,
+        num_warps=8,
+        num_stages=3,
+        HAS_SWA=has_swa,
+        OUT_BLOCK=out_block,
+    )
+
+
 def normal_decode_set_metadata(
     cache_seqlens_int32: torch.Tensor,
     cu_seqlens_k: torch.Tensor,
