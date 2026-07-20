@@ -14,6 +14,7 @@ from sglang.jit_kernel.benchmark.utils import (
 )
 from sglang.kernels.ops.speculative.eagle import fill_bonus_tokens_func
 from sglang.kernels.ops.speculative.topk1 import (
+    draft_extend_topk1_postprocess,
     draft_topk1_postprocess,
     target_verify_topk1_postprocess,
 )
@@ -43,6 +44,14 @@ TARGET_VERIFY_BATCH_SIZE_RANGE = get_benchmark_range(
     full_range=[1, 2, 4, 8, 16, 32, 64, 128],
     ci_range=[1, 8, 32],
 )
+DRAFT_EXTEND_BATCH_SIZE_RANGE = get_benchmark_range(
+    full_range=[1, 2, 4, 8, 16, 32, 64, 128],
+    ci_range=[1, 16, 64],
+)
+DRAFT_EXTEND_TREE_WIDTH = 6
+DRAFT_EXTEND_VOCAB_SIZE = 154880
+DRAFT_EXTEND_HIDDEN_SIZE = 6144
+DRAFT_EXTEND_DSA_TOPK = 2048
 
 
 def make_logits(batch_size: int, vocab_size: int) -> torch.Tensor:
@@ -71,6 +80,28 @@ def make_chain_case(batch_size: int, vocab_size: int):
     return seed_topk_index, logits, positions
 
 
+def make_draft_extend_case(batch_size: int):
+    num_rows = batch_size * DRAFT_EXTEND_TREE_WIDTH
+    logits = make_logits(num_rows, DRAFT_EXTEND_VOCAB_SIZE)
+    hidden_states = torch.empty(
+        (num_rows, DRAFT_EXTEND_HIDDEN_SIZE),
+        dtype=torch.bfloat16,
+        device=DEFAULT_DEVICE,
+    )
+    dsa_topk_indices = torch.empty(
+        (max(720, num_rows), DRAFT_EXTEND_DSA_TOPK),
+        dtype=torch.int32,
+        device=DEFAULT_DEVICE,
+    )
+    row_indices = (
+        torch.arange(batch_size, dtype=torch.long, device=DEFAULT_DEVICE)
+        * DRAFT_EXTEND_TREE_WIDTH
+        + DRAFT_EXTEND_TREE_WIDTH
+        - 1
+    )
+    return logits, row_indices, hidden_states, dsa_topk_indices
+
+
 def eager_draft_topk1_postprocess(logits: torch.Tensor, positions: torch.Tensor):
     topk_index = torch.argmax(logits, dim=-1, keepdim=True)
     topk_p = torch.ones_like(topk_index, dtype=torch.float32)
@@ -80,6 +111,20 @@ def eager_draft_topk1_postprocess(logits: torch.Tensor, positions: torch.Tensor)
 
 def fused_draft_topk1_postprocess(logits: torch.Tensor, positions: torch.Tensor):
     return draft_topk1_postprocess(logits, positions)
+
+
+def eager_draft_extend_topk1_postprocess(
+    logits: torch.Tensor,
+    row_indices: torch.Tensor,
+    hidden_states: torch.Tensor,
+    dsa_topk_indices: torch.Tensor,
+):
+    selected_dsa = dsa_topk_indices[row_indices]
+    selected_logits = logits[row_indices]
+    selected_hidden = hidden_states[row_indices]
+    topk_index = torch.argmax(selected_logits, dim=-1, keepdim=True)
+    topk_p = torch.ones_like(topk_index, dtype=torch.float32)
+    return topk_p, topk_index, selected_hidden, selected_dsa
 
 
 def eager_chain_materialize(
@@ -306,7 +351,45 @@ def benchmark_target_verify(
     return run_benchmark(fn)
 
 
+@triton.testing.perf_report(
+    triton.testing.Benchmark(
+        x_names=["batch_size"],
+        x_vals=DRAFT_EXTEND_BATCH_SIZE_RANGE,
+        line_arg="provider",
+        line_vals=["fused", "eager"],
+        line_names=["Fused indexed Triton", "Eager index + argmax"],
+        styles=[("blue", "-"), ("orange", "--")],
+        ylabel="us",
+        plot_name="spec-topk1-draft-extend-postprocess",
+        args={},
+    )
+)
+def benchmark_draft_extend_postprocess(
+    batch_size: int, provider: str
+) -> tuple[float, float, float]:
+    logits, row_indices, hidden_states, dsa_topk_indices = make_draft_extend_case(
+        batch_size
+    )
+    if provider == "fused":
+        fn = lambda: draft_extend_topk1_postprocess(
+            logits,
+            row_indices,
+            hidden_states=hidden_states,
+            dsa_topk_indices=dsa_topk_indices,
+        )
+    elif provider == "eager":
+        fn = lambda: eager_draft_extend_topk1_postprocess(
+            logits, row_indices, hidden_states, dsa_topk_indices
+        )
+    else:
+        raise ValueError(f"Unknown provider: {provider}")
+    fn()
+    torch.cuda.synchronize()
+    return run_benchmark(fn)
+
+
 if __name__ == "__main__":
     benchmark_draft_postprocess.run(print_data=True)
     benchmark_chain_materialize.run(print_data=True)
     benchmark_target_verify.run(print_data=True)
+    benchmark_draft_extend_postprocess.run(print_data=True)

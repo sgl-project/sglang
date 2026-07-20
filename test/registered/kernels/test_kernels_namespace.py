@@ -46,6 +46,7 @@ EXPECTED = {
     "quantization.nvfp4_gemm_swiglu_nvfp4_quant": {"cute_dsl"},
     "kvcache.reshape_and_cache_flash": {"triton"},
     "speculative.target_verify_topk1_postprocess": {"triton"},
+    "speculative.draft_extend_topk1_postprocess": {"triton"},
 }
 
 _CPU = PlatformInfo(device_type="cpu")
