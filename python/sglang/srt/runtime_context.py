@@ -655,6 +655,7 @@ class RuntimeContext:
         "parallel",
         "_server_args",
         "_config_bags",
+        "_overrides_log",
         "flags",
         "resources",
         "forward",
@@ -664,6 +665,7 @@ class RuntimeContext:
         self.parallel = parallel
         self._server_args: ServerArgs | None = None
         self._config_bags: dict | None = None
+        self._overrides_log: list = []
         self.flags = Flags()
         self.resources = Resources()
         self.forward = ForwardFlags()
@@ -725,6 +727,8 @@ class RuntimeContext:
         # truth for config reads). Driven by NS(...) metadata; a mock/partial
         # config with no NS markers yields an empty tree (no bags projected).
         self._config_bags = _build_config_bags(server_args)
+        # Fresh config lifecycle: prior override provenance no longer applies.
+        self._overrides_log = []
 
     def config_bag(self, name: str) -> _ConfigBag:
         """Return the top-level config namespace bag (``device`` / ``model`` /
@@ -735,6 +739,55 @@ class RuntimeContext:
         if not bags or name not in bags:
             raise ValueError(f"config namespace {name!r} not published")
         return bags[name]
+
+    def override(self, source: str, **fields) -> None:
+        """The business mutation entry: write resolved config
+        leaves onto the namespace bags — the single source of truth. It does
+        **not** touch ``server_args`` (the pristine startup record) and there is
+        no write-through, so the old "wrote one store, read another" desync class
+        cannot occur.
+
+        Each flat field name is routed to its bag by the ``NS`` metadata (flat
+        names are unique across namespaces). Validation is all-or-nothing: an
+        unknown / unprojected field aborts before any write. ``source`` is
+        recorded for provenance / reproduction.
+        """
+        if not fields:
+            return
+        bags = self._config_bags
+        if bags is None:
+            raise ValueError("config not published; cannot override")
+        from sglang.srt.arg_groups.arg_utils import namespace_of
+
+        nsmap = namespace_of(type(self._server_args))
+        targets = []  # (bag, leaf, value) — resolved before any write
+        for name, value in fields.items():
+            path = nsmap.get(name)
+            if path is None:
+                raise ValueError(
+                    f"override: unknown config field {name!r} (no NS namespace) — "
+                    "not a resolved config leaf"
+                )
+            parts = path.split(".")
+            bag = bags.get(parts[0])
+            if bag is None:
+                raise ValueError(f"override: namespace {parts[0]!r} not published")
+            for seg in parts[1:]:
+                bag = object.__getattribute__(bag, "_subs").get(seg)
+                if bag is None:
+                    raise ValueError(
+                        f"override: subgroup {seg!r} missing under {path!r}"
+                    )
+            if name not in bag:
+                raise ValueError(f"override: field {name!r} not projected on {path!r}")
+            targets.append((bag, name, value))
+        for bag, name, value in targets:
+            bag._set(name, value)
+        self._overrides_log.append((source, dict(fields)))
+
+    def overrides_log(self) -> list:
+        """Provenance of post-publish ``override`` calls: ``[(source, {field: value})]``."""
+        return list(self._overrides_log)
 
     def override_server_args(self, **fields) -> _ServerArgsOverride:
         """Test-only scoped override for the config tier — the sibling of
@@ -927,6 +980,7 @@ def reset_context() -> None:
     """
     _CONTEXT._server_args = None
     _CONTEXT._config_bags = None
+    _CONTEXT._overrides_log = []
     _CONTEXT.flags = Flags()
     _CONTEXT.resources = Resources()
     _CONTEXT.forward = ForwardFlags()
