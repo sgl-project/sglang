@@ -259,7 +259,7 @@ class SchedulerPPMixin:
                 batch = prefill_plan.batch_to_run
                 self.running_batch = prefill_plan.running_batch
                 batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(batch)
-                self._prepare_dspark_hidden_capture_for_batch(batch)
+                self._prepare_pd_hidden_capture_for_batch(batch)
                 self.mbs[mb_id] = batch
                 self.running_mbs[mb_id] = self.running_batch
 
@@ -1016,25 +1016,25 @@ class SchedulerPPMixin:
                 **logprob_dict,
             }
         if (
-            batch.dspark_hidden_capture_layer_ids
-            and not self._pp_should_owner_direct_dspark_hidden(batch)
+            batch.pd_hidden_capture_layer_ids
+            and not self._pp_should_owner_direct_pd_hidden(batch)
             and result.logits_output is not None
             and result.logits_output.hidden_states is not None
         ):
-            tensor_dict["dspark_aux_hidden_states_0"] = result.logits_output.hidden_states
+            tensor_dict["pd_aux_hidden_states_0"] = result.logits_output.hidden_states
         return tensor_dict
 
-    def _pp_should_owner_direct_dspark_hidden(
+    def _pp_should_owner_direct_pd_hidden(
         self: Scheduler, batch: ScheduleBatch
     ) -> bool:
         if not hasattr(self, "disagg_prefill_bootstrap_queue"):
             return False
-        if not batch or not batch.dspark_hidden_capture_layer_ids:
+        if not batch or not batch.pd_hidden_capture_layer_ids:
             return False
         capture_reqs = [
             req
             for req in batch.reqs
-            if getattr(req, "dspark_hidden_capture_layer_ids", None)
+            if getattr(req, "pd_hidden_capture_layer_ids", None)
         ]
         if not capture_reqs:
             return False
@@ -1042,14 +1042,14 @@ class SchedulerPPMixin:
             return False
         return all(
             bool(
-                (getattr(req, "dspark_hidden_meta", None) or {}).get(
+                (getattr(req, "pd_hidden_meta", None) or {}).get(
                     "streaming_hidden", False
                 )
             )
             for req in capture_reqs
         )
 
-    def _pp_strip_dspark_aux_hidden_from_proxy(
+    def _pp_strip_pd_aux_hidden_from_proxy(
         self: Scheduler, result: GenerationBatchResult
     ) -> None:
         proxy = result.pp_hidden_states_proxy_tensors
@@ -1057,7 +1057,7 @@ class SchedulerPPMixin:
             return
         tensors = proxy.tensors
         aux_keys = [
-            key for key in tensors if key.startswith("dspark_aux_hidden_states_")
+            key for key in tensors if key.startswith("pd_aux_hidden_states_")
         ]
         for key in aux_keys:
             tensors.pop(key, None)
@@ -1067,7 +1067,7 @@ class SchedulerPPMixin:
         batch: ScheduleBatch,
         result: GenerationBatchResult,
     ) -> None:
-        if not self._pp_should_owner_direct_dspark_hidden(batch):
+        if not self._pp_should_owner_direct_pd_hidden(batch):
             return
         send_owner_direct = getattr(
             self, "send_dspark_owner_direct_hidden_for_batch", None
@@ -1075,7 +1075,7 @@ class SchedulerPPMixin:
         if send_owner_direct is None:
             return
         if send_owner_direct(batch, result):
-            self._pp_strip_dspark_aux_hidden_from_proxy(result)
+            self._pp_strip_pd_aux_hidden_from_proxy(result)
 
     def _pp_send_dict_to_next_stage(
         self: Scheduler,
@@ -1206,17 +1206,17 @@ class SchedulerPPMixin:
         self.future_map.stash(
             batch.req_pool_indices, RelayPayload(bonus_tokens=next_token_ids)
         )
-        dspark_aux_hidden = {
+        pd_aux_hidden = {
             key: value
             for key, value in pp_outputs.tensors.items()
-            if key.startswith("dspark_aux_hidden_states_")
+            if key.startswith("pd_aux_hidden_states_")
         }
 
         batch.input_ids = None
         output_result = GenerationBatchResult(
             logits_output=logits_output,
             pp_hidden_states_proxy_tensors=(
-                PPProxyTensors(dspark_aux_hidden) if dspark_aux_hidden else None
+                PPProxyTensors(pd_aux_hidden) if pd_aux_hidden else None
             ),
             next_token_ids=pp_outputs["next_token_ids"],
             extend_input_len_per_req=extend_input_len_per_req,

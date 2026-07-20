@@ -165,10 +165,10 @@ class KVArgsRegisterInfo:
 
 class MooncakeKVManager(CommonKVManager):
     AUX_DATA_HEADER = b"AUX_DATA"
-    DSPARK_HIDDEN_CHUNK_READY_HEADER = b"DSPARK_HIDDEN_CHUNK_READY"
-    DSPARK_HIDDEN_CHUNK_ACK_HEADER = b"DSPARK_HIDDEN_CHUNK_ACK"
+    PD_HIDDEN_CHUNK_READY_HEADER = b"PD_HIDDEN_CHUNK_READY"
+    PD_HIDDEN_CHUNK_ACK_HEADER = b"PD_HIDDEN_CHUNK_ACK"
 
-    def supports_dspark_hidden_streaming(self) -> bool:
+    def supports_pd_hidden_streaming(self) -> bool:
         return True
 
     def __init__(
@@ -187,16 +187,16 @@ class MooncakeKVManager(CommonKVManager):
             self.session_failures = defaultdict(int)
             self.failed_sessions = set()
             self.session_lock = threading.Lock()
-            self.dspark_hidden_done_rooms = set()
-            self.dspark_hidden_done_lock = threading.Lock()
-            self.dspark_hidden_chunk_acks = defaultdict(int)
-            self.dspark_hidden_chunk_ack_cv = threading.Condition()
-            self.dspark_hidden_ack_waiters = {}
-            self.dspark_hidden_room_waiters = defaultdict(deque)
-            self.dspark_hidden_inflight_chunks = {}
-            self.dspark_hidden_inflight_lock = threading.Lock()
-            self.dspark_hidden_active_transfers = defaultdict(int)
-            self.dspark_hidden_active_cv = threading.Condition()
+            self.pd_hidden_done_rooms = set()
+            self.pd_hidden_done_lock = threading.Lock()
+            self.pd_hidden_chunk_acks = defaultdict(int)
+            self.pd_hidden_chunk_ack_cv = threading.Condition()
+            self.pd_hidden_ack_waiters = {}
+            self.pd_hidden_room_waiters = defaultdict(deque)
+            self.pd_hidden_inflight_chunks = {}
+            self.pd_hidden_inflight_lock = threading.Lock()
+            self.pd_hidden_active_transfers = defaultdict(int)
+            self.pd_hidden_active_cv = threading.Condition()
             # Determine the number of threads to use for kv sender
             cpu_count = os.cpu_count()
             transfer_thread_pool_size = (
@@ -256,19 +256,19 @@ class MooncakeKVManager(CommonKVManager):
                 ).start()
             self.start_prefill_thread()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
-            self.dspark_hidden_ready_chunks: Dict[int, List[dict]] = defaultdict(list)
-            self.dspark_hidden_ready_lock = threading.Lock()
-            self.dspark_hidden_ack_completions = queue.SimpleQueue()
-            self.dspark_hidden_ack_pending_counts = defaultdict(int)
-            self.dspark_hidden_ack_completion_cv = threading.Condition()
-            self.dspark_hidden_acked_chunks: Dict[int, List[dict]] = defaultdict(list)
-            self.dspark_hidden_acked_lock = threading.Lock()
-            self.dspark_hidden_ack_wakeup_endpoint = (
+            self.pd_hidden_ready_chunks: Dict[int, List[dict]] = defaultdict(list)
+            self.pd_hidden_ready_lock = threading.Lock()
+            self.pd_hidden_ack_completions = queue.SimpleQueue()
+            self.pd_hidden_ack_pending_counts = defaultdict(int)
+            self.pd_hidden_ack_completion_cv = threading.Condition()
+            self.pd_hidden_acked_chunks: Dict[int, List[dict]] = defaultdict(list)
+            self.pd_hidden_acked_lock = threading.Lock()
+            self.pd_hidden_ack_wakeup_endpoint = (
                 f"inproc://dspark-hidden-ack-{id(self)}"
             )
-            self.dspark_hidden_ack_wakeup_receiver = self._zmq_ctx.socket(zmq.PULL)
-            self.dspark_hidden_ack_wakeup_receiver.bind(
-                self.dspark_hidden_ack_wakeup_endpoint
+            self.pd_hidden_ack_wakeup_receiver = self._zmq_ctx.socket(zmq.PULL)
+            self.pd_hidden_ack_wakeup_receiver.bind(
+                self.pd_hidden_ack_wakeup_endpoint
             )
             self._staging_ctx = DecodeStagingContext() if self.enable_staging else None
             if self.enable_staging:
@@ -277,20 +277,20 @@ class MooncakeKVManager(CommonKVManager):
                 self._chunk_writer_counts: dict = defaultdict(lambda: defaultdict(list))
             self.start_decode_thread()
 
-    def mark_dspark_hidden_request_done(
+    def mark_pd_hidden_request_done(
         self,
         bootstrap_room: int,
         state_indices: Optional[List] = None,
     ) -> None:
-        if not hasattr(self, "dspark_hidden_done_rooms"):
+        if not hasattr(self, "pd_hidden_done_rooms"):
             return
-        with self.dspark_hidden_done_lock:
+        with self.pd_hidden_done_lock:
             room = int(bootstrap_room)
-            if room in self.dspark_hidden_done_rooms:
+            if room in self.pd_hidden_done_rooms:
                 return
-            self.dspark_hidden_done_rooms.add(room)
-        pool = getattr(self, "dspark_hidden_pool", None)
-        state_idx = self._dspark_hidden_state_index()
+            self.pd_hidden_done_rooms.add(room)
+        pool = getattr(self, "pd_hidden_pool", None)
+        state_idx = self._pd_hidden_state_index()
         if (
             pool is not None
             and state_indices is not None
@@ -301,27 +301,27 @@ class MooncakeKVManager(CommonKVManager):
             if indices is not None and len(indices) > 0:
                 pool.free([int(idx) for idx in indices])
 
-    def pop_dspark_hidden_request_done(self, bootstrap_room: int) -> bool:
-        if not hasattr(self, "dspark_hidden_done_rooms"):
+    def pop_pd_hidden_request_done(self, bootstrap_room: int) -> bool:
+        if not hasattr(self, "pd_hidden_done_rooms"):
             return False
-        with self.dspark_hidden_done_lock:
+        with self.pd_hidden_done_lock:
             room = int(bootstrap_room)
-            if room not in self.dspark_hidden_done_rooms:
+            if room not in self.pd_hidden_done_rooms:
                 return False
-            self.dspark_hidden_done_rooms.remove(room)
+            self.pd_hidden_done_rooms.remove(room)
             return True
 
-    def mark_dspark_hidden_done(
+    def mark_pd_hidden_done(
         self,
         bootstrap_room: int,
         state_indices: Optional[List] = None,
     ) -> None:
-        self.mark_dspark_hidden_request_done(bootstrap_room, state_indices)
+        self.mark_pd_hidden_request_done(bootstrap_room, state_indices)
 
-    def pop_dspark_hidden_done(self, bootstrap_room: int) -> bool:
-        return self.pop_dspark_hidden_request_done(bootstrap_room)
+    def pop_pd_hidden_done(self, bootstrap_room: int) -> bool:
+        return self.pop_pd_hidden_request_done(bootstrap_room)
 
-    def notify_dspark_hidden_chunk_ready(
+    def notify_pd_hidden_chunk_ready(
         self,
         *,
         remote: str,
@@ -336,7 +336,7 @@ class MooncakeKVManager(CommonKVManager):
         na = NetworkAddress(remote, dst_port)
         self._connect(na.to_tcp(), is_ipv6=na.is_ipv6).send_multipart(
             [
-                self.DSPARK_HIDDEN_CHUNK_READY_HEADER,
+                self.PD_HIDDEN_CHUNK_READY_HEADER,
                 str(room).encode("ascii"),
                 str(prefill_rank).encode("ascii"),
                 str(hidden_start).encode("ascii"),
@@ -350,7 +350,7 @@ class MooncakeKVManager(CommonKVManager):
             ]
         )
 
-    def wait_dspark_hidden_chunk_ack(
+    def wait_pd_hidden_chunk_ack(
         self,
         *,
         room: int,
@@ -361,26 +361,26 @@ class MooncakeKVManager(CommonKVManager):
     ) -> bool:
         key = (int(room), int(prefill_rank), int(hidden_start))
         deadline = time.monotonic() + float(timeout_s)
-        with self.dspark_hidden_chunk_ack_cv:
-            while self.dspark_hidden_chunk_acks.get(key, 0) < int(expected_count):
+        with self.pd_hidden_chunk_ack_cv:
+            while self.pd_hidden_chunk_acks.get(key, 0) < int(expected_count):
                 if self.request_status.get(int(room)) == KVPoll.Failed:
                     return False
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     self.record_failure(
                         int(room),
-                        "Timed out waiting for DSpark hidden chunk ACK: "
+                        "Timed out waiting for PD hidden chunk ACK: "
                         f"prefill_rank={prefill_rank}, hidden_start={hidden_start}",
                     )
                     self.update_status(int(room), KVPoll.Failed)
                     return False
-                self.dspark_hidden_chunk_ack_cv.wait(timeout=min(remaining, 1.0))
-            self.dspark_hidden_chunk_acks[key] -= int(expected_count)
-            if self.dspark_hidden_chunk_acks[key] <= 0:
-                self.dspark_hidden_chunk_acks.pop(key, None)
+                self.pd_hidden_chunk_ack_cv.wait(timeout=min(remaining, 1.0))
+            self.pd_hidden_chunk_acks[key] -= int(expected_count)
+            if self.pd_hidden_chunk_acks[key] <= 0:
+                self.pd_hidden_chunk_acks.pop(key, None)
             return True
 
-    def consume_dspark_hidden_chunk_ack(
+    def consume_pd_hidden_chunk_ack(
         self,
         *,
         room: int,
@@ -389,15 +389,15 @@ class MooncakeKVManager(CommonKVManager):
         expected_count: int = 1,
     ) -> bool:
         key = (int(room), int(prefill_rank), int(hidden_start))
-        with self.dspark_hidden_chunk_ack_cv:
-            if self.dspark_hidden_chunk_acks.get(key, 0) < int(expected_count):
+        with self.pd_hidden_chunk_ack_cv:
+            if self.pd_hidden_chunk_acks.get(key, 0) < int(expected_count):
                 return False
-            self.dspark_hidden_chunk_acks[key] -= int(expected_count)
-            if self.dspark_hidden_chunk_acks[key] <= 0:
-                self.dspark_hidden_chunk_acks.pop(key, None)
+            self.pd_hidden_chunk_acks[key] -= int(expected_count)
+            if self.pd_hidden_chunk_acks[key] <= 0:
+                self.pd_hidden_chunk_acks.pop(key, None)
             return True
 
-    def park_dspark_hidden_chunk_for_ack(
+    def park_pd_hidden_chunk_for_ack(
         self,
         *,
         transfer_queue: FastQueue,
@@ -411,115 +411,115 @@ class MooncakeKVManager(CommonKVManager):
         Returns True when the chunk was parked. False means ACKs were already
         available and the caller can finish the chunk immediately.
         """
-        if kv_chunk.dspark_hidden_start is None:
+        if kv_chunk.pd_hidden_start is None:
             return False
         key = (
             int(kv_chunk.room),
             int(prefill_rank),
-            int(kv_chunk.dspark_hidden_start),
+            int(kv_chunk.pd_hidden_start),
         )
         expected_count = int(expected_count)
         if expected_count <= 0:
-            kv_chunk.dspark_hidden_ack_ready = True
+            kv_chunk.pd_hidden_ack_ready = True
             return False
-        with self.dspark_hidden_chunk_ack_cv:
-            if self.dspark_hidden_chunk_acks.get(key, 0) >= expected_count:
-                self.dspark_hidden_chunk_acks[key] -= expected_count
-                if self.dspark_hidden_chunk_acks[key] <= 0:
-                    self.dspark_hidden_chunk_acks.pop(key, None)
-                kv_chunk.dspark_hidden_ack_ready = True
+        with self.pd_hidden_chunk_ack_cv:
+            if self.pd_hidden_chunk_acks.get(key, 0) >= expected_count:
+                self.pd_hidden_chunk_acks[key] -= expected_count
+                if self.pd_hidden_chunk_acks[key] <= 0:
+                    self.pd_hidden_chunk_acks.pop(key, None)
+                kv_chunk.pd_hidden_ack_ready = True
                 return False
-            if key in self.dspark_hidden_ack_waiters:
+            if key in self.pd_hidden_ack_waiters:
                 raise RuntimeError(
-                    "DSpark hidden ACK waiter already exists: "
+                    "PD hidden ACK waiter already exists: "
                     f"room={key[0]}, prefill_rank={key[1]}, hidden_start={key[2]}"
                 )
-            kv_chunk.dspark_hidden_ack_expected_count = expected_count
-            self.dspark_hidden_ack_waiters[key] = (transfer_queue, kv_chunk)
+            kv_chunk.pd_hidden_ack_expected_count = expected_count
+            self.pd_hidden_ack_waiters[key] = (transfer_queue, kv_chunk)
 
         def on_timeout() -> None:
-            with self.dspark_hidden_chunk_ack_cv:
-                waiter = self.dspark_hidden_ack_waiters.pop(key, None)
+            with self.pd_hidden_chunk_ack_cv:
+                waiter = self.pd_hidden_ack_waiters.pop(key, None)
             if waiter is None:
                 return
             _, timed_out_chunk = waiter
-            timed_out_chunk.dspark_hidden_ack_timed_out = True
+            timed_out_chunk.pd_hidden_ack_timed_out = True
             self.record_failure(
                 key[0],
-                "Timed out waiting for DSpark hidden chunk ACK: "
+                "Timed out waiting for PD hidden chunk ACK: "
                 f"prefill_rank={key[1]}, hidden_start={key[2]}",
             )
             self.update_status(key[0], KVPoll.Failed)
             transfer_queue.put(timed_out_chunk)
-            self._wake_dspark_hidden_ack_waiters(key[0])
+            self._wake_pd_hidden_ack_waiters(key[0])
 
         timer = threading.Timer(float(timeout_s), on_timeout)
         timer.daemon = True
         timer.start()
         return True
 
-    def _wake_dspark_hidden_ack_waiters(self, room: int) -> None:
+    def _wake_pd_hidden_ack_waiters(self, room: int) -> None:
         room = int(room)
-        with self.dspark_hidden_chunk_ack_cv:
+        with self.pd_hidden_chunk_ack_cv:
             waiters = [
-                self.dspark_hidden_ack_waiters.pop(key)
-                for key in list(self.dspark_hidden_ack_waiters)
+                self.pd_hidden_ack_waiters.pop(key)
+                for key in list(self.pd_hidden_ack_waiters)
                 if key[0] == room
             ]
-            room_waiters = list(self.dspark_hidden_room_waiters.pop(room, []))
+            room_waiters = list(self.pd_hidden_room_waiters.pop(room, []))
         for transfer_queue, kv_chunk in waiters:
             transfer_queue.put(kv_chunk)
         for transfer_queue, kv_chunk in room_waiters:
             transfer_queue.put(kv_chunk)
 
-    def _park_dspark_hidden_chunk_behind_room(
+    def _park_pd_hidden_chunk_behind_room(
         self, transfer_queue: FastQueue, kv_chunk: TransferKVChunk
     ) -> None:
-        with self.dspark_hidden_chunk_ack_cv:
-            self.dspark_hidden_room_waiters[int(kv_chunk.room)].append(
+        with self.pd_hidden_chunk_ack_cv:
+            self.pd_hidden_room_waiters[int(kv_chunk.room)].append(
                 (transfer_queue, kv_chunk)
             )
 
-    def _wake_next_dspark_hidden_room_waiter(self, room: int) -> None:
-        with self.dspark_hidden_chunk_ack_cv:
-            room_waiters = self.dspark_hidden_room_waiters.get(int(room))
+    def _wake_next_pd_hidden_room_waiter(self, room: int) -> None:
+        with self.pd_hidden_chunk_ack_cv:
+            room_waiters = self.pd_hidden_room_waiters.get(int(room))
             if not room_waiters:
                 return
             transfer_queue, kv_chunk = room_waiters.popleft()
             if not room_waiters:
-                self.dspark_hidden_room_waiters.pop(int(room), None)
+                self.pd_hidden_room_waiters.pop(int(room), None)
         transfer_queue.put(kv_chunk)
 
-    def _handle_dspark_hidden_chunk_ack(
+    def _handle_pd_hidden_chunk_ack(
         self, room: int, prefill_rank: int, hidden_start: int
     ) -> None:
         key = (int(room), int(prefill_rank), int(hidden_start))
         waiter_to_wake = None
-        with self.dspark_hidden_chunk_ack_cv:
-            self.dspark_hidden_chunk_acks[key] += 1
-            waiter = self.dspark_hidden_ack_waiters.get(key)
+        with self.pd_hidden_chunk_ack_cv:
+            self.pd_hidden_chunk_acks[key] += 1
+            waiter = self.pd_hidden_ack_waiters.get(key)
             if waiter is not None:
                 _, kv_chunk = waiter
-                expected_count = kv_chunk.dspark_hidden_ack_expected_count
-                if self.dspark_hidden_chunk_acks[key] >= expected_count:
-                    self.dspark_hidden_chunk_acks[key] -= expected_count
-                    if self.dspark_hidden_chunk_acks[key] <= 0:
-                        self.dspark_hidden_chunk_acks.pop(key, None)
-                    self.dspark_hidden_ack_waiters.pop(key, None)
-                    kv_chunk.dspark_hidden_ack_ready = True
+                expected_count = kv_chunk.pd_hidden_ack_expected_count
+                if self.pd_hidden_chunk_acks[key] >= expected_count:
+                    self.pd_hidden_chunk_acks[key] -= expected_count
+                    if self.pd_hidden_chunk_acks[key] <= 0:
+                        self.pd_hidden_chunk_acks.pop(key, None)
+                    self.pd_hidden_ack_waiters.pop(key, None)
+                    kv_chunk.pd_hidden_ack_ready = True
                     waiter_to_wake = waiter
-            self.dspark_hidden_chunk_ack_cv.notify_all()
+            self.pd_hidden_chunk_ack_cv.notify_all()
         if waiter_to_wake is not None:
             transfer_queue, kv_chunk = waiter_to_wake
             transfer_queue.put(kv_chunk)
 
-    def pop_dspark_hidden_ready_chunks(self, room: int) -> List[dict]:
-        if not hasattr(self, "dspark_hidden_ready_chunks"):
+    def pop_pd_hidden_ready_chunks(self, room: int) -> List[dict]:
+        if not hasattr(self, "pd_hidden_ready_chunks"):
             return []
-        with self.dspark_hidden_ready_lock:
-            return self.dspark_hidden_ready_chunks.pop(int(room), [])
+        with self.pd_hidden_ready_lock:
+            return self.pd_hidden_ready_chunks.pop(int(room), [])
 
-    def ack_dspark_hidden_chunk(
+    def ack_pd_hidden_chunk(
         self,
         *,
         remote: str,
@@ -531,14 +531,14 @@ class MooncakeKVManager(CommonKVManager):
         na = NetworkAddress(remote, dst_port)
         self._connect(na.to_tcp(), is_ipv6=na.is_ipv6).send_multipart(
             [
-                self.DSPARK_HIDDEN_CHUNK_ACK_HEADER,
+                self.PD_HIDDEN_CHUNK_ACK_HEADER,
                 str(room).encode("ascii"),
                 str(prefill_rank).encode("ascii"),
                 str(hidden_start).encode("ascii"),
             ]
         )
 
-    def submit_dspark_hidden_chunk_ack(
+    def submit_pd_hidden_chunk_ack(
         self,
         *,
         event,
@@ -557,8 +557,8 @@ class MooncakeKVManager(CommonKVManager):
             "hidden_start": int(hidden_start),
             "is_last_hidden_chunk": bool(is_last_hidden_chunk),
         }
-        with self.dspark_hidden_ack_completion_cv:
-            self.dspark_hidden_ack_pending_counts[int(room)] += 1
+        with self.pd_hidden_ack_completion_cv:
+            self.pd_hidden_ack_pending_counts[int(room)] += 1
 
         def wait_for_injection() -> None:
             try:
@@ -568,125 +568,125 @@ class MooncakeKVManager(CommonKVManager):
                 completion["success"] = True
             except Exception:
                 logger.exception(
-                    "DSpark hidden injection completion failed: room=%s start=%s",
+                    "PD hidden injection completion failed: room=%s start=%s",
                     room,
                     hidden_start,
                 )
                 completion["success"] = False
-            self.dspark_hidden_ack_completions.put(completion)
+            self.pd_hidden_ack_completions.put(completion)
             wakeup_sender = self._zmq_ctx.socket(zmq.PUSH)
             wakeup_sender.setsockopt(zmq.LINGER, 0)
             try:
-                wakeup_sender.connect(self.dspark_hidden_ack_wakeup_endpoint)
+                wakeup_sender.connect(self.pd_hidden_ack_wakeup_endpoint)
                 wakeup_sender.send(b"ACK_READY")
             finally:
                 wakeup_sender.close()
 
         threading.Thread(
             target=wait_for_injection,
-            name=f"DSparkHiddenAckWaiter-{room}",
+            name=f"PDHiddenAckWaiter-{room}",
             daemon=True,
         ).start()
 
-    def _drain_dspark_hidden_ack_completions(self) -> None:
+    def _drain_pd_hidden_ack_completions(self) -> None:
         while True:
             try:
-                completion = self.dspark_hidden_ack_completions.get_nowait()
+                completion = self.pd_hidden_ack_completions.get_nowait()
             except queue.Empty:
                 return
 
             room = int(completion["room"])
             try:
                 if completion.pop("success"):
-                    self.ack_dspark_hidden_chunk(
+                    self.ack_pd_hidden_chunk(
                         remote=completion["remote"],
                         dst_port=int(completion["dst_port"]),
                         room=room,
                         prefill_rank=int(completion["prefill_rank"]),
                         hidden_start=int(completion["hidden_start"]),
                     )
-                    with self.dspark_hidden_acked_lock:
-                        self.dspark_hidden_acked_chunks[room].append(completion)
+                    with self.pd_hidden_acked_lock:
+                        self.pd_hidden_acked_chunks[room].append(completion)
                 else:
                     self.record_failure(
                         room,
-                        "DSpark hidden injection CUDA completion failed: "
+                        "PD hidden injection CUDA completion failed: "
                         f"hidden_start={completion['hidden_start']}",
                     )
                     self.update_status(room, KVPoll.Failed)
             except Exception:
                 logger.exception(
-                    "Failed to send DSpark hidden chunk ACK: room=%s start=%s",
+                    "Failed to send PD hidden chunk ACK: room=%s start=%s",
                     room,
                     completion["hidden_start"],
                 )
                 self.record_failure(
                     room,
-                    "Failed to send DSpark hidden chunk ACK: "
+                    "Failed to send PD hidden chunk ACK: "
                     f"hidden_start={completion['hidden_start']}",
                 )
                 self.update_status(room, KVPoll.Failed)
             finally:
-                with self.dspark_hidden_ack_completion_cv:
-                    self.dspark_hidden_ack_pending_counts[room] -= 1
-                    if self.dspark_hidden_ack_pending_counts[room] <= 0:
-                        self.dspark_hidden_ack_pending_counts.pop(room, None)
-                    self.dspark_hidden_ack_completion_cv.notify_all()
+                with self.pd_hidden_ack_completion_cv:
+                    self.pd_hidden_ack_pending_counts[room] -= 1
+                    if self.pd_hidden_ack_pending_counts[room] <= 0:
+                        self.pd_hidden_ack_pending_counts.pop(room, None)
+                    self.pd_hidden_ack_completion_cv.notify_all()
 
-    def pop_dspark_hidden_acked_chunks(self, room: int) -> List[dict]:
-        with self.dspark_hidden_acked_lock:
-            return self.dspark_hidden_acked_chunks.pop(int(room), [])
+    def pop_pd_hidden_acked_chunks(self, room: int) -> List[dict]:
+        with self.pd_hidden_acked_lock:
+            return self.pd_hidden_acked_chunks.pop(int(room), [])
 
-    def wait_dspark_hidden_ack_completions(
+    def wait_pd_hidden_ack_completions(
         self, room: int, timeout_s: float = 300.0
     ) -> bool:
         room = int(room)
         deadline = time.monotonic() + float(timeout_s)
-        with self.dspark_hidden_ack_completion_cv:
-            while self.dspark_hidden_ack_pending_counts.get(room, 0) > 0:
+        with self.pd_hidden_ack_completion_cv:
+            while self.pd_hidden_ack_pending_counts.get(room, 0) > 0:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     return False
-                self.dspark_hidden_ack_completion_cv.wait(timeout=min(remaining, 1.0))
+                self.pd_hidden_ack_completion_cv.wait(timeout=min(remaining, 1.0))
         return True
 
-    def _begin_dspark_hidden_transfer(self, room: int) -> None:
-        if not hasattr(self, "dspark_hidden_active_cv"):
+    def _begin_pd_hidden_transfer(self, room: int) -> None:
+        if not hasattr(self, "pd_hidden_active_cv"):
             return
-        with self.dspark_hidden_active_cv:
-            self.dspark_hidden_active_transfers[int(room)] += 1
+        with self.pd_hidden_active_cv:
+            self.pd_hidden_active_transfers[int(room)] += 1
 
-    def _end_dspark_hidden_transfer(self, room: int) -> None:
-        if not hasattr(self, "dspark_hidden_active_cv"):
+    def _end_pd_hidden_transfer(self, room: int) -> None:
+        if not hasattr(self, "pd_hidden_active_cv"):
             return
-        with self.dspark_hidden_active_cv:
+        with self.pd_hidden_active_cv:
             room = int(room)
-            count = self.dspark_hidden_active_transfers.get(room, 0) - 1
+            count = self.pd_hidden_active_transfers.get(room, 0) - 1
             if count <= 0:
-                self.dspark_hidden_active_transfers.pop(room, None)
+                self.pd_hidden_active_transfers.pop(room, None)
             else:
-                self.dspark_hidden_active_transfers[room] = count
-            self.dspark_hidden_active_cv.notify_all()
+                self.pd_hidden_active_transfers[room] = count
+            self.pd_hidden_active_cv.notify_all()
 
-    def _wait_dspark_hidden_transfers_quiesced(
+    def _wait_pd_hidden_transfers_quiesced(
         self, room: int, timeout_s: float = 300.0
     ) -> bool:
-        if not hasattr(self, "dspark_hidden_active_cv"):
+        if not hasattr(self, "pd_hidden_active_cv"):
             return True
         deadline = time.monotonic() + float(timeout_s)
         room = int(room)
-        with self.dspark_hidden_active_cv:
-            while self.dspark_hidden_active_transfers.get(room, 0) > 0:
+        with self.pd_hidden_active_cv:
+            while self.pd_hidden_active_transfers.get(room, 0) > 0:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     logger.error(
-                        "Timed out waiting for DSpark hidden transfers to quiesce: "
+                        "Timed out waiting for PD hidden transfers to quiesce: "
                         "room=%s active=%s",
                         room,
-                        self.dspark_hidden_active_transfers.get(room, 0),
+                        self.pd_hidden_active_transfers.get(room, 0),
                     )
                     return False
-                self.dspark_hidden_active_cv.wait(timeout=min(remaining, 1.0))
+                self.pd_hidden_active_cv.wait(timeout=min(remaining, 1.0))
             return True
 
     def init_engine(self):
@@ -1534,7 +1534,7 @@ class MooncakeKVManager(CommonKVManager):
                         src_indices = src_indices[: len(dst_indices_local)]
                     else:
                         dst_indices_local = dst_indices_local[: len(src_indices)]
-                if st == StateType.DSPARK_HIDDEN and dynamic_dst:
+                if st == StateType.PD_HIDDEN and dynamic_dst:
                     row_chunks = dynamic_dst.get("row_chunks") or [
                         {"row_start": 0, "row_len": len(src_indices)}
                     ]
@@ -1546,7 +1546,7 @@ class MooncakeKVManager(CommonKVManager):
                         row_end = row_start + row_len
                         if row_start < 0 or row_end > len(src_indices):
                             raise RuntimeError(
-                                "Invalid DSpark hidden row chunk: "
+                                "Invalid PD hidden row chunk: "
                                 f"room={req.room}, row_start={row_start}, "
                                 f"row_len={row_len}, row_count={len(src_indices)}"
                             )
@@ -1624,45 +1624,45 @@ class MooncakeKVManager(CommonKVManager):
                 )
         return rc
 
-    def _dspark_hidden_state_index(self) -> Optional[int]:
+    def _pd_hidden_state_index(self) -> Optional[int]:
         for idx, state_type in enumerate(getattr(self.kv_args, "state_types", [])):
-            if state_type == StateType.DSPARK_HIDDEN:
+            if state_type == StateType.PD_HIDDEN:
                 return idx
         return None
 
-    def _has_dspark_hidden_state(self, state_indices: Optional[List]) -> bool:
-        idx = self._dspark_hidden_state_index()
+    def _has_pd_hidden_state(self, state_indices: Optional[List]) -> bool:
+        idx = self._pd_hidden_state_index()
         if idx is None or not state_indices or idx >= len(state_indices):
             return False
         indices = state_indices[idx]
         return indices is not None and len(indices) > 0
 
-    def _without_dspark_hidden_state(
+    def _without_pd_hidden_state(
         self, state_indices: Optional[List]
     ) -> Optional[List]:
-        idx = self._dspark_hidden_state_index()
+        idx = self._pd_hidden_state_index()
         if idx is None or not state_indices or idx >= len(state_indices):
             return state_indices
         ret = list(state_indices)
         ret[idx] = None
         return ret
 
-    def _dspark_hidden_release_state_indices(
+    def _pd_hidden_release_state_indices(
         self, kv_chunk: TransferKVChunk
     ) -> Optional[List]:
-        release_indices = kv_chunk.dspark_hidden_release_indices
+        release_indices = kv_chunk.pd_hidden_release_indices
         if not release_indices:
             return kv_chunk.state_indices
-        idx = self._dspark_hidden_state_index()
+        idx = self._pd_hidden_state_index()
         if idx is None or not kv_chunk.state_indices or idx >= len(kv_chunk.state_indices):
             return kv_chunk.state_indices
         ret = list(kv_chunk.state_indices)
         ret[idx] = [int(x) for x in release_indices]
         return ret
 
-    def _free_dspark_hidden_state_indices(self, state_indices: Optional[List]) -> None:
-        pool = getattr(self, "dspark_hidden_pool", None)
-        state_idx = self._dspark_hidden_state_index()
+    def _free_pd_hidden_state_indices(self, state_indices: Optional[List]) -> None:
+        pool = getattr(self, "pd_hidden_pool", None)
+        state_idx = self._pd_hidden_state_index()
         if (
             pool is None
             or state_idx is None
@@ -1674,19 +1674,19 @@ class MooncakeKVManager(CommonKVManager):
         if indices is not None and len(indices) > 0:
             pool.free([int(idx) for idx in indices])
 
-    def _free_dspark_hidden_chunk_rows(self, kv_chunk: TransferKVChunk) -> None:
-        self._free_dspark_hidden_state_indices(
-            self._dspark_hidden_release_state_indices(kv_chunk)
+    def _free_pd_hidden_chunk_rows(self, kv_chunk: TransferKVChunk) -> None:
+        self._free_pd_hidden_state_indices(
+            self._pd_hidden_release_state_indices(kv_chunk)
         )
 
-    def _send_dspark_hidden_packet(
+    def _send_pd_hidden_packet(
         self,
         req: TransferInfo,
         prefill_state_indices: List,
         packet_idx: int,
         executor: concurrent.futures.ThreadPoolExecutor,
     ) -> Tuple[int, bool]:
-        state_idx = self._dspark_hidden_state_index()
+        state_idx = self._pd_hidden_state_index()
         if state_idx is None or state_idx >= len(prefill_state_indices):
             return 0, True
         indices = prefill_state_indices[state_idx]
@@ -1706,7 +1706,7 @@ class MooncakeKVManager(CommonKVManager):
                 dst_indices = dst_indices[: len(src_indices)]
             if len(src_indices) != len(dst_indices):
                 raise RuntimeError(
-                    "DSPARK_HIDDEN state index length mismatch: "
+                    "PD_HIDDEN state index length mismatch: "
                     f"room={req.room}, prefill={len(src_indices)}, "
                     f"dst={len(dst_indices)}"
                 )
@@ -1726,7 +1726,7 @@ class MooncakeKVManager(CommonKVManager):
                 prefill_data_indices=src_indices,
                 dst_data_indices=dst_indices,
                 executor=executor,
-                state_type=StateType.DSPARK_HIDDEN,
+                state_type=StateType.PD_HIDDEN,
             )
             return rc, True
         row_chunks = dynamic_dst.get("row_chunks") or []
@@ -1741,7 +1741,7 @@ class MooncakeKVManager(CommonKVManager):
         row_end = row_start + row_len
         if row_start < 0 or row_end > len(src_indices):
             raise RuntimeError(
-                "Invalid DSpark hidden packet: "
+                "Invalid PD hidden packet: "
                 f"room={req.room}, packet_idx={packet_idx}, "
                 f"row_start={row_start}, row_len={row_len}, "
                 f"row_count={len(src_indices)}"
@@ -1758,7 +1758,7 @@ class MooncakeKVManager(CommonKVManager):
             prefill_data_indices=src_indices[row_start:row_end],
             dst_data_indices=np.arange(row_len, dtype=np.int32),
             executor=executor,
-            state_type=StateType.DSPARK_HIDDEN,
+            state_type=StateType.PD_HIDDEN,
         )
         return rc, packet_idx + 1 >= len(row_chunks)
 
@@ -1922,25 +1922,25 @@ class MooncakeKVManager(CommonKVManager):
                 current_status = self.request_status.get(kv_chunk.room)
                 if current_status is None or current_status == KVPoll.Failed:
                     if current_status == KVPoll.Failed:
-                        self._wake_dspark_hidden_ack_waiters(kv_chunk.room)
+                        self._wake_pd_hidden_ack_waiters(kv_chunk.room)
                     logger.debug(
                         f"Skipping chunk for room {kv_chunk.room} because it has already failed or been aborted"
                     )
-                    if kv_chunk.dspark_hidden_start is not None:
-                        with self.dspark_hidden_inflight_lock:
-                            self.dspark_hidden_inflight_chunks.pop(
+                    if kv_chunk.pd_hidden_start is not None:
+                        with self.pd_hidden_inflight_lock:
+                            self.pd_hidden_inflight_chunks.pop(
                                 kv_chunk.room, None
                             )
                     if (
-                        not kv_chunk.dspark_hidden_sent
-                        and self._has_dspark_hidden_state(kv_chunk.state_indices)
+                        not kv_chunk.pd_hidden_sent
+                        and self._has_pd_hidden_state(kv_chunk.state_indices)
                     ):
-                        if kv_chunk.dspark_hidden_start is not None:
-                            self._free_dspark_hidden_chunk_rows(kv_chunk)
+                        if kv_chunk.pd_hidden_start is not None:
+                            self._free_pd_hidden_chunk_rows(kv_chunk)
                         else:
-                            self.mark_dspark_hidden_request_done(
+                            self.mark_pd_hidden_request_done(
                                 kv_chunk.room,
-                                self._dspark_hidden_release_state_indices(kv_chunk),
+                                self._pd_hidden_release_state_indices(kv_chunk),
                             )
                     if self.enable_trace:
                         kv_chunk.trace_ctx.trace_slice_end(
@@ -1963,8 +1963,8 @@ class MooncakeKVManager(CommonKVManager):
                 )
                 polls = []
                 dst_ranks_infos = []
-                dspark_hidden_expected = 0
-                dspark_hidden_done_count = 0
+                pd_hidden_expected = 0
+                pd_hidden_done_count = 0
                 # Unique id per prefill sender so decode's response set size matches expected_response_num.
                 prefill_unique_rank = (
                     self.attn_tp_rank * (self.pp_size * self.attn_cp_size)
@@ -1974,14 +1974,14 @@ class MooncakeKVManager(CommonKVManager):
                 # When staging transfer is not yet ready (watermark/allocation pending),
                 # the chunk is re-enqueued and we break out of the req loop to retry later.
                 staging_deferred = False
-                dspark_hidden_deferred = False
-                dspark_hidden_failed = False
+                pd_hidden_deferred = False
+                pd_hidden_failed = False
                 if (
-                    not kv_chunk.dspark_hidden_sent
+                    not kv_chunk.pd_hidden_sent
                     and kv_chunk.state_indices
-                    and self._has_dspark_hidden_state(kv_chunk.state_indices)
+                    and self._has_pd_hidden_state(kv_chunk.state_indices)
                 ):
-                    state_idx = self._dspark_hidden_state_index()
+                    state_idx = self._pd_hidden_state_index()
                     for req in reqs_to_be_processed:
                         if req.is_dummy:
                             continue
@@ -1992,52 +1992,52 @@ class MooncakeKVManager(CommonKVManager):
                             target_rank_registration_info
                         )
                         if not skip_state:
-                            dspark_hidden_expected += 1
+                            pd_hidden_expected += 1
 
                     waiting_for_ack = (
-                        kv_chunk.dspark_hidden_start is not None
-                        and kv_chunk.dspark_hidden_ready_sent
+                        kv_chunk.pd_hidden_start is not None
+                        and kv_chunk.pd_hidden_ready_sent
                     )
                     hidden_inflight_key = (
-                        (prefill_unique_rank, int(kv_chunk.dspark_hidden_start))
-                        if kv_chunk.dspark_hidden_start is not None
+                        (prefill_unique_rank, int(kv_chunk.pd_hidden_start))
+                        if kv_chunk.pd_hidden_start is not None
                         else None
                     )
                     if (
                         hidden_inflight_key is not None
-                        and not kv_chunk.dspark_hidden_ready_sent
+                        and not kv_chunk.pd_hidden_ready_sent
                     ):
-                        with self.dspark_hidden_inflight_lock:
-                            inflight_key = self.dspark_hidden_inflight_chunks.get(
+                        with self.pd_hidden_inflight_lock:
+                            inflight_key = self.pd_hidden_inflight_chunks.get(
                                 kv_chunk.room
                             )
                         if inflight_key is not None and inflight_key != hidden_inflight_key:
-                            self._park_dspark_hidden_chunk_behind_room(
+                            self._park_pd_hidden_chunk_behind_room(
                                 queue, kv_chunk
                             )
                             continue
                     ack_ready = False
                     if waiting_for_ack:
-                        ack_ready = kv_chunk.dspark_hidden_ack_ready
+                        ack_ready = kv_chunk.pd_hidden_ack_ready
                         if ack_ready:
-                            dspark_hidden_done_count = dspark_hidden_expected
-                            self._free_dspark_hidden_chunk_rows(kv_chunk)
+                            pd_hidden_done_count = pd_hidden_expected
+                            self._free_pd_hidden_chunk_rows(kv_chunk)
                             if hidden_inflight_key is not None:
-                                with self.dspark_hidden_inflight_lock:
+                                with self.pd_hidden_inflight_lock:
                                     if (
-                                        self.dspark_hidden_inflight_chunks.get(
+                                        self.pd_hidden_inflight_chunks.get(
                                             kv_chunk.room
                                         )
                                         == hidden_inflight_key
                                     ):
-                                        self.dspark_hidden_inflight_chunks.pop(
+                                        self.pd_hidden_inflight_chunks.pop(
                                             kv_chunk.room, None
                                         )
-                            self._wake_next_dspark_hidden_room_waiter(
+                            self._wake_next_pd_hidden_room_waiter(
                                 kv_chunk.room
                             )
-                        elif kv_chunk.dspark_hidden_ack_timed_out:
-                            dspark_hidden_failed = True
+                        elif kv_chunk.pd_hidden_ack_timed_out:
+                            pd_hidden_failed = True
 
                     if not ack_ready and not waiting_for_ack:
                         for req in reqs_to_be_processed:
@@ -2057,18 +2057,18 @@ class MooncakeKVManager(CommonKVManager):
                             )
                             if skip_state:
                                 continue
-                            self._begin_dspark_hidden_transfer(kv_chunk.room)
+                            self._begin_pd_hidden_transfer(kv_chunk.room)
                             try:
-                                ret, dspark_hidden_done = (
-                                    self._send_dspark_hidden_packet(
+                                ret, pd_hidden_done = (
+                                    self._send_pd_hidden_packet(
                                         req,
                                         kv_chunk.state_indices,
-                                        kv_chunk.dspark_hidden_packet_idx,
+                                        kv_chunk.pd_hidden_packet_idx,
                                         executor,
                                     )
                                 )
                             finally:
-                                self._end_dspark_hidden_transfer(kv_chunk.room)
+                                self._end_pd_hidden_transfer(kv_chunk.room)
                             if ret != 0:
                                 with self.session_lock:
                                     self.session_failures[
@@ -2086,16 +2086,16 @@ class MooncakeKVManager(CommonKVManager):
                                         )
                                 self.record_failure(
                                     kv_chunk.room,
-                                    "Failed to send DSpark hidden packet "
-                                    f"{kv_chunk.dspark_hidden_packet_idx} of "
+                                    "Failed to send PD hidden packet "
+                                    f"{kv_chunk.pd_hidden_packet_idx} of "
                                     f"{kv_chunk.room} to "
                                     f"{NetworkAddress(req.endpoint, req.dst_port).to_host_port_str()}",
                                 )
                                 self.update_status(kv_chunk.room, KVPoll.Failed)
-                                self._wake_dspark_hidden_ack_waiters(kv_chunk.room)
-                                if kv_chunk.dspark_hidden_start is not None:
-                                    with self.dspark_hidden_inflight_lock:
-                                        self.dspark_hidden_inflight_chunks.pop(
+                                self._wake_pd_hidden_ack_waiters(kv_chunk.room)
+                                if kv_chunk.pd_hidden_start is not None:
+                                    with self.pd_hidden_inflight_lock:
+                                        self.pd_hidden_inflight_chunks.pop(
                                             kv_chunk.room, None
                                         )
                                 self.sync_status_to_decode_endpoint(
@@ -2105,22 +2105,22 @@ class MooncakeKVManager(CommonKVManager):
                                     KVPoll.Failed,
                                     prefill_unique_rank,
                                 )
-                                if kv_chunk.dspark_hidden_start is not None:
-                                    self._free_dspark_hidden_chunk_rows(kv_chunk)
+                                if kv_chunk.pd_hidden_start is not None:
+                                    self._free_pd_hidden_chunk_rows(kv_chunk)
                                 else:
-                                    self.mark_dspark_hidden_request_done(
+                                    self.mark_pd_hidden_request_done(
                                         kv_chunk.room,
-                                        self._dspark_hidden_release_state_indices(
+                                        self._pd_hidden_release_state_indices(
                                             kv_chunk
                                         ),
                                     )
-                                dspark_hidden_failed = True
+                                pd_hidden_failed = True
                                 break
-                            if not dspark_hidden_done:
-                                dspark_hidden_deferred = True
+                            if not pd_hidden_done:
+                                pd_hidden_deferred = True
                                 continue
                             if (
-                                kv_chunk.dspark_hidden_start is not None
+                                kv_chunk.pd_hidden_start is not None
                                 and state_idx is not None
                                 and state_idx < len(kv_chunk.state_indices)
                             ):
@@ -2129,26 +2129,26 @@ class MooncakeKVManager(CommonKVManager):
                                     if state_idx < len(req.dst_state_indices)
                                     else []
                                 )
-                                row_len = int(kv_chunk.dspark_hidden_row_len)
+                                row_len = int(kv_chunk.pd_hidden_row_len)
                                 chunk_dst_indices = [
                                     int(x) for x in dst_indices[:row_len]
                                 ]
-                                self.notify_dspark_hidden_chunk_ready(
+                                self.notify_pd_hidden_chunk_ready(
                                     remote=req.endpoint,
                                     dst_port=req.dst_port,
                                     room=req.room,
                                     prefill_rank=prefill_unique_rank,
-                                    hidden_start=int(kv_chunk.dspark_hidden_start),
+                                    hidden_start=int(kv_chunk.pd_hidden_start),
                                     row_len=row_len,
                                     is_last_hidden_chunk=bool(
-                                        kv_chunk.dspark_hidden_is_last_chunk
+                                        kv_chunk.pd_hidden_is_last_chunk
                                     ),
                                     dst_indices=chunk_dst_indices,
                                 )
                                 continue
-                            dspark_hidden_done_count += 1
+                            pd_hidden_done_count += 1
 
-                    if dspark_hidden_failed:
+                    if pd_hidden_failed:
                         continue
                     if waiting_for_ack and not ack_ready:
                         # A parked chunk is only re-enqueued by ACK/abort/timeout.
@@ -2156,54 +2156,54 @@ class MooncakeKVManager(CommonKVManager):
                         # duplicate wakeup; avoid busy requeueing it.
                         continue
                     if (
-                        kv_chunk.dspark_hidden_start is not None
-                        and not kv_chunk.dspark_hidden_ready_sent
+                        kv_chunk.pd_hidden_start is not None
+                        and not kv_chunk.pd_hidden_ready_sent
                     ):
                         if hidden_inflight_key is not None:
-                            with self.dspark_hidden_inflight_lock:
-                                self.dspark_hidden_inflight_chunks[
+                            with self.pd_hidden_inflight_lock:
+                                self.pd_hidden_inflight_chunks[
                                     kv_chunk.room
                                 ] = hidden_inflight_key
-                        kv_chunk.dspark_hidden_ready_sent = True
-                        if self.park_dspark_hidden_chunk_for_ack(
+                        kv_chunk.pd_hidden_ready_sent = True
+                        if self.park_pd_hidden_chunk_for_ack(
                             transfer_queue=queue,
                             kv_chunk=kv_chunk,
                             prefill_rank=prefill_unique_rank,
-                            expected_count=dspark_hidden_expected,
+                            expected_count=pd_hidden_expected,
                         ):
                             continue
                         ack_ready = True
-                        dspark_hidden_done_count = dspark_hidden_expected
-                        self._free_dspark_hidden_chunk_rows(kv_chunk)
+                        pd_hidden_done_count = pd_hidden_expected
+                        self._free_pd_hidden_chunk_rows(kv_chunk)
                         if hidden_inflight_key is not None:
-                            with self.dspark_hidden_inflight_lock:
-                                self.dspark_hidden_inflight_chunks.pop(
+                            with self.pd_hidden_inflight_lock:
+                                self.pd_hidden_inflight_chunks.pop(
                                     kv_chunk.room, None
                                 )
-                            self._wake_next_dspark_hidden_room_waiter(
+                            self._wake_next_pd_hidden_room_waiter(
                                 kv_chunk.room
                             )
                     current_status = self.request_status.get(kv_chunk.room)
                     if (
-                        dspark_hidden_expected > 0
-                        and dspark_hidden_done_count == dspark_hidden_expected
+                        pd_hidden_expected > 0
+                        and pd_hidden_done_count == pd_hidden_expected
                         and current_status is not None
                         and current_status != KVPoll.Failed
                     ):
-                        kv_chunk.dspark_hidden_sent = True
-                        if kv_chunk.dspark_hidden_start is not None:
-                            if kv_chunk.dspark_hidden_is_last_chunk:
-                                self.mark_dspark_hidden_request_done(
+                        kv_chunk.pd_hidden_sent = True
+                        if kv_chunk.pd_hidden_start is not None:
+                            if kv_chunk.pd_hidden_is_last_chunk:
+                                self.mark_pd_hidden_request_done(
                                     kv_chunk.room,
                                     None,
                                 )
                         else:
-                            self.mark_dspark_hidden_request_done(
+                            self.mark_pd_hidden_request_done(
                                 kv_chunk.room,
-                                self._dspark_hidden_release_state_indices(kv_chunk),
+                                self._pd_hidden_release_state_indices(kv_chunk),
                             )
-                    if dspark_hidden_deferred:
-                        kv_chunk.dspark_hidden_packet_idx += 1
+                    if pd_hidden_deferred:
+                        kv_chunk.pd_hidden_packet_idx += 1
                         queue.put(kv_chunk)
                         continue
 
@@ -2227,17 +2227,17 @@ class MooncakeKVManager(CommonKVManager):
                                 )
                                 if (
                                     kv_chunk.is_last_chunk
-                                    and not kv_chunk.dspark_hidden_sent
-                                    and self._has_dspark_hidden_state(
+                                    and not kv_chunk.pd_hidden_sent
+                                    and self._has_pd_hidden_state(
                                         kv_chunk.state_indices
                                     )
                                 ):
-                                    if kv_chunk.dspark_hidden_start is not None:
-                                        self._free_dspark_hidden_chunk_rows(kv_chunk)
+                                    if kv_chunk.pd_hidden_start is not None:
+                                        self._free_pd_hidden_chunk_rows(kv_chunk)
                                     else:
-                                        self.mark_dspark_hidden_request_done(
+                                        self.mark_pd_hidden_request_done(
                                             kv_chunk.room,
-                                            self._dspark_hidden_release_state_indices(
+                                            self._pd_hidden_release_state_indices(
                                                 kv_chunk
                                             ),
                                         )
@@ -2326,7 +2326,7 @@ class MooncakeKVManager(CommonKVManager):
                                 f"{NetworkAddress(req.endpoint, req.dst_port).to_host_port_str()}",
                             )
                             self.update_status(kv_chunk.room, KVPoll.Failed)
-                            self._wake_dspark_hidden_ack_waiters(kv_chunk.room)
+                            self._wake_pd_hidden_ack_waiters(kv_chunk.room)
                             self.sync_status_to_decode_endpoint(
                                 req.endpoint,
                                 req.dst_port,
@@ -2337,26 +2337,26 @@ class MooncakeKVManager(CommonKVManager):
                             break
 
                         if kv_chunk.is_last_chunk:
-                            has_dspark_hidden = (
+                            has_pd_hidden = (
                                 kv_chunk.state_indices
-                                and not kv_chunk.dspark_hidden_sent
+                                and not kv_chunk.pd_hidden_sent
                                 and not skip_state
-                                and self._has_dspark_hidden_state(kv_chunk.state_indices)
+                                and self._has_pd_hidden_state(kv_chunk.state_indices)
                             )
-                            if has_dspark_hidden:
-                                dspark_hidden_expected += 1
-                                self._begin_dspark_hidden_transfer(kv_chunk.room)
+                            if has_pd_hidden:
+                                pd_hidden_expected += 1
+                                self._begin_pd_hidden_transfer(kv_chunk.room)
                                 try:
-                                    ret, dspark_hidden_done = (
-                                        self._send_dspark_hidden_packet(
+                                    ret, pd_hidden_done = (
+                                        self._send_pd_hidden_packet(
                                             req,
                                             kv_chunk.state_indices,
-                                            kv_chunk.dspark_hidden_packet_idx,
+                                            kv_chunk.pd_hidden_packet_idx,
                                             executor,
                                         )
                                     )
                                 finally:
-                                    self._end_dspark_hidden_transfer(kv_chunk.room)
+                                    self._end_pd_hidden_transfer(kv_chunk.room)
                                 if ret != 0:
                                     with self.session_lock:
                                         self.session_failures[
@@ -2376,13 +2376,13 @@ class MooncakeKVManager(CommonKVManager):
                                             )
                                     self.record_failure(
                                         kv_chunk.room,
-                                        "Failed to send DSpark hidden packet "
-                                        f"{kv_chunk.dspark_hidden_packet_idx} of "
+                                        "Failed to send PD hidden packet "
+                                        f"{kv_chunk.pd_hidden_packet_idx} of "
                                         f"{kv_chunk.room} to "
                                         f"{NetworkAddress(req.endpoint, req.dst_port).to_host_port_str()}",
                                     )
                                     self.update_status(kv_chunk.room, KVPoll.Failed)
-                                    self._wake_dspark_hidden_ack_waiters(
+                                    self._wake_pd_hidden_ack_waiters(
                                         kv_chunk.room
                                     )
                                     self.sync_status_to_decode_endpoint(
@@ -2392,25 +2392,25 @@ class MooncakeKVManager(CommonKVManager):
                                         KVPoll.Failed,
                                         prefill_unique_rank,
                                     )
-                                    if kv_chunk.dspark_hidden_start is not None:
-                                        self._free_dspark_hidden_chunk_rows(kv_chunk)
+                                    if kv_chunk.pd_hidden_start is not None:
+                                        self._free_pd_hidden_chunk_rows(kv_chunk)
                                     else:
-                                        self.mark_dspark_hidden_request_done(
+                                        self.mark_pd_hidden_request_done(
                                             kv_chunk.room,
-                                            self._dspark_hidden_release_state_indices(
+                                            self._pd_hidden_release_state_indices(
                                                 kv_chunk
                                             ),
                                         )
                                     break
-                                if not dspark_hidden_done:
-                                    dspark_hidden_deferred = True
+                                if not pd_hidden_done:
+                                    pd_hidden_deferred = True
                                     continue
-                                dspark_hidden_done_count += 1
+                                pd_hidden_done_count += 1
 
                             if kv_chunk.state_indices and not skip_state:
                                 self.maybe_send_extra(
                                     req,
-                                    self._without_dspark_hidden_state(
+                                    self._without_pd_hidden_state(
                                         kv_chunk.state_indices
                                     ),
                                     executor,
@@ -2466,25 +2466,25 @@ class MooncakeKVManager(CommonKVManager):
                     kv_chunk.kv_sent = True
                 if (
                     kv_chunk.is_last_chunk
-                    and not kv_chunk.dspark_hidden_sent
-                    and dspark_hidden_expected > 0
-                    and dspark_hidden_done_count == dspark_hidden_expected
+                    and not kv_chunk.pd_hidden_sent
+                    and pd_hidden_expected > 0
+                    and pd_hidden_done_count == pd_hidden_expected
                     and current_status is not None
                     and current_status != KVPoll.Failed
                 ):
-                    if kv_chunk.dspark_hidden_start is not None:
-                        if kv_chunk.dspark_hidden_is_last_chunk:
-                            self.mark_dspark_hidden_request_done(
+                    if kv_chunk.pd_hidden_start is not None:
+                        if kv_chunk.pd_hidden_is_last_chunk:
+                            self.mark_pd_hidden_request_done(
                                 kv_chunk.room,
-                                self._dspark_hidden_release_state_indices(kv_chunk),
+                                self._pd_hidden_release_state_indices(kv_chunk),
                             )
                     else:
-                        self.mark_dspark_hidden_request_done(
+                        self.mark_pd_hidden_request_done(
                             kv_chunk.room,
-                            self._dspark_hidden_release_state_indices(kv_chunk),
+                            self._pd_hidden_release_state_indices(kv_chunk),
                         )
-                if dspark_hidden_deferred:
-                    kv_chunk.dspark_hidden_packet_idx += 1
+                if pd_hidden_deferred:
+                    kv_chunk.pd_hidden_packet_idx += 1
                     queue.put(kv_chunk)
                     continue
 
@@ -2506,11 +2506,11 @@ class MooncakeKVManager(CommonKVManager):
             # KVPoll.Bootstrapping -> KVPoll.WaitingForInput
             while True:
                 waiting_req_bytes = self.server_socket.recv_multipart()
-                if waiting_req_bytes[0] == MooncakeKVManager.DSPARK_HIDDEN_CHUNK_ACK_HEADER:
+                if waiting_req_bytes[0] == MooncakeKVManager.PD_HIDDEN_CHUNK_ACK_HEADER:
                     room = int(waiting_req_bytes[1].decode("ascii"))
                     prefill_rank = int(waiting_req_bytes[2].decode("ascii"))
                     hidden_start = int(waiting_req_bytes[3].decode("ascii"))
-                    self._handle_dspark_hidden_chunk_ack(
+                    self._handle_pd_hidden_chunk_ack(
                         room, prefill_rank, hidden_start
                     )
                     continue
@@ -2542,7 +2542,7 @@ class MooncakeKVManager(CommonKVManager):
                         and self.check_status(room_to_be_aborted) != KVPoll.Success
                     ):
                         self.update_status(room_to_be_aborted, KVPoll.Failed)
-                        self._wake_dspark_hidden_ack_waiters(room_to_be_aborted)
+                        self._wake_pd_hidden_ack_waiters(room_to_be_aborted)
                         logger.debug(
                             f"Received abort notification for room {room_to_be_aborted}, "
                             f"marked as Failed"
@@ -2552,7 +2552,7 @@ class MooncakeKVManager(CommonKVManager):
                             f"Received abort notification for room {room_to_be_aborted}, "
                             f"ignoring (already completed or unknown)"
                         )
-                    self._wait_dspark_hidden_transfers_quiesced(room_to_be_aborted)
+                    self._wait_pd_hidden_transfers_quiesced(room_to_be_aborted)
                     # Send ACK back to decode endpoint
                     try:
                         na = NetworkAddress(decode_ip, decode_port)
@@ -2617,12 +2617,12 @@ class MooncakeKVManager(CommonKVManager):
                                 info.spec_metadata
                                 for info in self.transfer_infos[room].values()
                                 if info.spec_metadata
-                                and info.spec_metadata.get("dspark_hidden")
+                                and info.spec_metadata.get("pd_hidden")
                             ),
                             None,
                         )
                         if dspark_meta:
-                            self.req_to_dspark_hidden_meta[room] = dspark_meta
+                            self.req_to_pd_hidden_meta[room] = dspark_meta
                         self.update_status(room, KVPoll.WaitingForInput)
 
         threading.Thread(target=bootstrap_thread).start()
@@ -2631,23 +2631,23 @@ class MooncakeKVManager(CommonKVManager):
         def decode_thread():
             poller = zmq.Poller()
             poller.register(self.server_socket, zmq.POLLIN)
-            poller.register(self.dspark_hidden_ack_wakeup_receiver, zmq.POLLIN)
+            poller.register(self.pd_hidden_ack_wakeup_receiver, zmq.POLLIN)
             while True:
                 events = dict(poller.poll())
-                if self.dspark_hidden_ack_wakeup_receiver in events:
+                if self.pd_hidden_ack_wakeup_receiver in events:
                     while True:
                         try:
-                            self.dspark_hidden_ack_wakeup_receiver.recv(zmq.NOBLOCK)
+                            self.pd_hidden_ack_wakeup_receiver.recv(zmq.NOBLOCK)
                         except zmq.Again:
                             break
-                    self._drain_dspark_hidden_ack_completions()
+                    self._drain_pd_hidden_ack_completions()
                 if self.server_socket not in events:
                     continue
                 msg = self.server_socket.recv_multipart()
                 if msg[0] == MooncakeKVManager.AUX_DATA_HEADER:
                     self._handle_aux_data(msg)
                     continue
-                if msg[0] == MooncakeKVManager.DSPARK_HIDDEN_CHUNK_READY_HEADER:
+                if msg[0] == MooncakeKVManager.PD_HIDDEN_CHUNK_READY_HEADER:
                     room = int(msg[1].decode("ascii"))
                     prefill_rank = int(msg[2].decode("ascii"))
                     hidden_start = int(msg[3].decode("ascii"))
@@ -2660,8 +2660,8 @@ class MooncakeKVManager(CommonKVManager):
                     )
                     ack_host = msg[7].decode("ascii")
                     ack_port = int(msg[8].decode("ascii"))
-                    with self.dspark_hidden_ready_lock:
-                        self.dspark_hidden_ready_chunks[room].append(
+                    with self.pd_hidden_ready_lock:
+                        self.pd_hidden_ready_chunks[room].append(
                             {
                                 "room": room,
                                 "prefill_rank": prefill_rank,
@@ -2674,14 +2674,14 @@ class MooncakeKVManager(CommonKVManager):
                             }
                         )
                     continue
-                if msg[0] == MooncakeKVManager.DSPARK_HIDDEN_CHUNK_ACK_HEADER:
+                if msg[0] == MooncakeKVManager.PD_HIDDEN_CHUNK_ACK_HEADER:
                     room = int(msg[1].decode("ascii"))
                     prefill_rank = int(msg[2].decode("ascii"))
                     hidden_start = int(msg[3].decode("ascii"))
                     key = (room, prefill_rank, hidden_start)
-                    with self.dspark_hidden_chunk_ack_cv:
-                        self.dspark_hidden_chunk_acks[key] += 1
-                        self.dspark_hidden_chunk_ack_cv.notify_all()
+                    with self.pd_hidden_chunk_ack_cv:
+                        self.pd_hidden_chunk_acks[key] += 1
+                        self.pd_hidden_chunk_ack_cv.notify_all()
                     continue
 
                 # Staging: prefill notifies a chunk written to staging buffer
@@ -2731,16 +2731,6 @@ class MooncakeKVManager(CommonKVManager):
                         arrived_response_num = len(
                             self.prefill_response_tracker[bootstrap_room]
                         )
-                        logger.debug(
-                            "DSPARK_HIDDEN_DECODE_STATUS_ACK room=%s "
-                            "prefill_rank=%s arrived=%s expected=%s "
-                            "status=%s",
-                            bootstrap_room,
-                            prefill_rank,
-                            arrived_response_num,
-                            expected_response_num,
-                            status,
-                        )
                         if arrived_response_num == expected_response_num:
                             if self.enable_staging:
                                 handler = self._staging_handler
@@ -2748,14 +2738,6 @@ class MooncakeKVManager(CommonKVManager):
                                     handler.submit_last_scatter_async(bootstrap_room)
                                 self._chunk_writer_counts.pop(bootstrap_room, None)
                             self.update_status(bootstrap_room, KVPoll.Success)
-                    else:
-                        logger.debug(
-                            "DSPARK_HIDDEN_DECODE_STATUS_ACK_IGNORED room=%s "
-                            "prefill_rank=%s status=%s reason=missing_request_status",
-                            bootstrap_room,
-                            prefill_rank,
-                            status,
-                        )
                 elif status == KVPoll.Failed:
                     self.record_failure(
                         bootstrap_room,
@@ -2776,10 +2758,10 @@ class MooncakeKVManager(CommonKVManager):
         state_indices: Optional[List] = None,
         trace_ctx: Optional[Union[TraceReqContext, TraceNullContext]] = None,
         source_event=None,
-        dspark_hidden_start: Optional[int] = None,
-        dspark_hidden_row_len: int = 0,
-        dspark_hidden_is_last_chunk: bool = False,
-        dspark_hidden_release_indices: Optional[List[int]] = None,
+        pd_hidden_start: Optional[int] = None,
+        pd_hidden_row_len: int = 0,
+        pd_hidden_is_last_chunk: bool = False,
+        pd_hidden_release_indices: Optional[List[int]] = None,
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         assert not is_last_chunk or (is_last_chunk and aux_index is not None)
@@ -2818,10 +2800,10 @@ class MooncakeKVManager(CommonKVManager):
                 prefill_aux_index=aux_index,
                 state_indices=state_indices,
                 source_event=source_event,
-                dspark_hidden_start=dspark_hidden_start,
-                dspark_hidden_row_len=dspark_hidden_row_len,
-                dspark_hidden_is_last_chunk=dspark_hidden_is_last_chunk,
-                dspark_hidden_release_indices=dspark_hidden_release_indices,
+                pd_hidden_start=pd_hidden_start,
+                pd_hidden_row_len=pd_hidden_row_len,
+                pd_hidden_is_last_chunk=pd_hidden_is_last_chunk,
+                pd_hidden_release_indices=pd_hidden_release_indices,
                 trace_ctx=trace_ctx,
             )
         )
@@ -2896,20 +2878,20 @@ class MooncakeKVSender(CommonKVSender):
         self.conclude_state = None
         self.init_time = time.time()
         self._source_event = None
-        self._dspark_hidden_chunk_meta = None
+        self._pd_hidden_chunk_meta = None
         self._init_trace_ctx()
 
     def set_source_event(self, source_event) -> None:
         self._source_event = source_event
 
-    def set_dspark_hidden_chunk_meta(
+    def set_pd_hidden_chunk_meta(
         self,
         hidden_start: int,
         row_len: int,
         is_last_hidden_chunk: bool,
         release_indices: Optional[List[int]] = None,
     ) -> None:
-        self._dspark_hidden_chunk_meta = (
+        self._pd_hidden_chunk_meta = (
             int(hidden_start),
             int(row_len),
             bool(is_last_hidden_chunk),
@@ -2929,8 +2911,8 @@ class MooncakeKVSender(CommonKVSender):
             self._source_event = None
             return
 
-        dspark_hidden_chunk_meta = self._dspark_hidden_chunk_meta
-        self._dspark_hidden_chunk_meta = None
+        pd_hidden_chunk_meta = self._pd_hidden_chunk_meta
+        self._pd_hidden_chunk_meta = None
         if not is_last_chunk:
             source_event = self._source_event
             self._source_event = None
@@ -2942,17 +2924,17 @@ class MooncakeKVSender(CommonKVSender):
                 state_indices=state_indices,
                 source_event=source_event,
                 trace_ctx=self.trace_ctx.copy_for_thread(),
-                dspark_hidden_start=(
-                    dspark_hidden_chunk_meta[0] if dspark_hidden_chunk_meta else None
+                pd_hidden_start=(
+                    pd_hidden_chunk_meta[0] if pd_hidden_chunk_meta else None
                 ),
-                dspark_hidden_row_len=(
-                    dspark_hidden_chunk_meta[1] if dspark_hidden_chunk_meta else 0
+                pd_hidden_row_len=(
+                    pd_hidden_chunk_meta[1] if pd_hidden_chunk_meta else 0
                 ),
-                dspark_hidden_is_last_chunk=(
-                    dspark_hidden_chunk_meta[2] if dspark_hidden_chunk_meta else False
+                pd_hidden_is_last_chunk=(
+                    pd_hidden_chunk_meta[2] if pd_hidden_chunk_meta else False
                 ),
-                dspark_hidden_release_indices=(
-                    dspark_hidden_chunk_meta[3] if dspark_hidden_chunk_meta else None
+                pd_hidden_release_indices=(
+                    pd_hidden_chunk_meta[3] if pd_hidden_chunk_meta else None
                 ),
             )
         else:
@@ -2967,17 +2949,17 @@ class MooncakeKVSender(CommonKVSender):
                 state_indices=state_indices,
                 source_event=source_event,
                 trace_ctx=self.trace_ctx.copy_for_thread(),
-                dspark_hidden_start=(
-                    dspark_hidden_chunk_meta[0] if dspark_hidden_chunk_meta else None
+                pd_hidden_start=(
+                    pd_hidden_chunk_meta[0] if pd_hidden_chunk_meta else None
                 ),
-                dspark_hidden_row_len=(
-                    dspark_hidden_chunk_meta[1] if dspark_hidden_chunk_meta else 0
+                pd_hidden_row_len=(
+                    pd_hidden_chunk_meta[1] if pd_hidden_chunk_meta else 0
                 ),
-                dspark_hidden_is_last_chunk=(
-                    dspark_hidden_chunk_meta[2] if dspark_hidden_chunk_meta else False
+                pd_hidden_is_last_chunk=(
+                    pd_hidden_chunk_meta[2] if pd_hidden_chunk_meta else False
                 ),
-                dspark_hidden_release_indices=(
-                    dspark_hidden_chunk_meta[3] if dspark_hidden_chunk_meta else None
+                pd_hidden_release_indices=(
+                    pd_hidden_chunk_meta[3] if pd_hidden_chunk_meta else None
                 ),
             )
         self._record_transfer_indices(kv_indices, state_indices)
@@ -3136,14 +3118,14 @@ class MooncakeKVReceiver(CommonKVReceiver):
                 )
                 if pp_rank_value is None:
                     raise RuntimeError(
-                        "DSpark PP hidden metadata requires target_pp_rank in "
+                        "PD hidden metadata requires target_pp_rank in "
                         f"bootstrap_info, got keys={sorted(bootstrap_info.keys())}"
                     )
                 pp_rank = int(pp_rank_value)
                 pp_slice = spec_metadata["pp_slices"].get(str(pp_rank))
                 if pp_slice is None:
                     raise RuntimeError(
-                        "DSpark PP hidden metadata is missing slice for "
+                        "PD hidden metadata is missing slice for "
                         f"target_pp_rank={pp_rank}, available_pp_slices="
                         f"{sorted(spec_metadata['pp_slices'].keys())}"
                     )
@@ -3158,7 +3140,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
                     else [None] * len(self.kv_mgr.kv_args.state_types)
                 )
                 for idx, state_type in enumerate(self.kv_mgr.kv_args.state_types):
-                    if state_type == StateType.DSPARK_HIDDEN:
+                    if state_type == StateType.PD_HIDDEN:
                         local_state_indices[idx] = pp_slice.get("dst_indices", [])
                         break
 

@@ -65,11 +65,11 @@ from sglang.srt.disaggregation.utils import (
     TransferBackend,
     get_dsa_seed_metadata_dim,
     prepare_abort,
+    resolve_disagg_metadata_config,
 )
 from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
-from sglang.srt.distributed.utils import get_pp_indices
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -1135,101 +1135,23 @@ class Scheduler(
             disagg_hidden_size = 16  # minimal padding size for RDMA
             disagg_hidden_states_dtype = torch.float32
 
-        def _infer_dspark_target_layer_ids() -> List[int]:
-            spec_aux_config = getattr(self.tp_worker.model_runner, "spec_aux_config", None)
-            target_layer_ids = getattr(spec_aux_config, "dflash_target_layer_ids", None)
-            if target_layer_ids:
-                return [int(x) for x in target_layer_ids]
-
-            env_layer_ids = os.getenv("SGLANG_DSPARK_PD_TARGET_LAYER_IDS")
-            if env_layer_ids:
-                return [int(x.strip()) for x in env_layer_ids.split(",") if x.strip()]
-
-            try:
-                from sglang.srt.speculative.dspark_components.dspark_config import (
-                    parse_dspark_draft_config,
-                )
-
-                cfg = parse_dspark_draft_config(
-                    draft_hf_config=self.model_config.hf_config
-                )
-                if cfg.target_layer_ids:
-                    return [int(x) for x in cfg.target_layer_ids]
-            except Exception:
-                logger.debug("Could not infer DSpark target layer ids.", exc_info=True)
-            return []
-
-        dspark_prefill_tail_len = 0
-        dspark_hidden_pool_size = 0
-        dspark_hidden_size = 0
-        dspark_target_layer_ids: List[int] = []
-        if (
-            self.disaggregation_mode in (DisaggregationMode.DECODE, DisaggregationMode.PREFILL)
-            and (
-                self.spec_algorithm.is_dspark()
-                or self.disaggregation_mode == DisaggregationMode.PREFILL
-                or os.getenv("SGLANG_DSPARK_PD_TARGET_LAYER_IDS")
-            )
-        ):
-            dspark_target_layer_ids = _infer_dspark_target_layer_ids()
-            if dspark_target_layer_ids:
-                if self.transfer_backend not in (
-                    TransferBackend.MOONCAKE,
-                    TransferBackend.FAKE,
-                ):
-                    raise NotImplementedError(
-                        "DSpark PD hidden transfer is implemented only for "
-                        f"Mooncake/Fake backends, got {self.transfer_backend.value}."
-                    )
-                dspark_hidden_size = len(dspark_target_layer_ids) * int(
-                    self.model_config.hidden_size
-                )
-                disagg_hidden_size = dspark_hidden_size
-                disagg_hidden_states_dtype = self.model_config.dtype
-                default_pool_rows = max(
-                    1,
-                    int(self.server_args.max_prefill_buffer_tokens() or 0),
-                    int(self.max_prefill_tokens or 0),
-                )
-                pool_env_value = os.getenv("SGLANG_DSPARK_PD_HIDDEN_POOL_TOKENS")
-                if self.disaggregation_mode == DisaggregationMode.DECODE:
-                    pool_env_value = os.getenv(
-                        "SGLANG_DSPARK_PD_HIDDEN_RECV_POOL_TOKENS"
-                    )
-                    if pool_env_value is None:
-                        pool_env_value = os.getenv(
-                            "SGLANG_DSPARK_PD_HIDDEN_POOL_TOKENS"
-                        )
-                dspark_hidden_pool_size = max(
-                    0,
-                    int(
-                        pool_env_value
-                        if pool_env_value is not None
-                        else str(default_pool_rows)
-                    ),
-                )
-                if (
-                    self.disaggregation_mode == DisaggregationMode.PREFILL
-                    and self.ps.pp_size > 1
-                ):
-                    pp_start, pp_end = get_pp_indices(
-                        self.model_config.num_hidden_layers,
-                        self.ps.pp_rank,
-                        self.ps.pp_size,
-                    )
-                    owns_dspark_layer = any(
-                        pp_start <= layer_id < pp_end
-                        for layer_id in dspark_target_layer_ids
-                    )
-                    if not owns_dspark_layer:
-                        dspark_hidden_pool_size = 0
-                dspark_hidden_device = (
-                    f"cuda:{self.ps.gpu_id}" if torch.cuda.is_available() else "cpu"
-                )
-            else:
-                dspark_hidden_device = "cpu"
-        else:
-            dspark_hidden_device = "cpu"
+        disagg_metadata_config = resolve_disagg_metadata_config(
+            hidden_size=disagg_hidden_size,
+            hidden_states_dtype=disagg_hidden_states_dtype,
+            disaggregation_mode=self.disaggregation_mode,
+            transfer_backend=self.transfer_backend,
+            spec_algorithm=self.spec_algorithm,
+            model_config=self.model_config,
+            server_args=self.server_args,
+            model_runner=self.tp_worker.model_runner,
+            pp_rank=self.ps.pp_rank,
+            pp_size=self.ps.pp_size,
+            gpu_id=self.ps.gpu_id,
+            max_prefill_tokens=self.max_prefill_tokens,
+        )
+        disagg_hidden_size = disagg_metadata_config.hidden_size
+        disagg_hidden_states_dtype = disagg_metadata_config.hidden_states_dtype
+        metadata_buffer_kwargs = disagg_metadata_config.metadata_buffer_kwargs
 
         # The PD metadata wire schema must match on P and D even when only D
         # enables spec decoding; a seedless prefill writes the invalid sentinel.
@@ -1253,10 +1175,7 @@ class Scheduler(
                 hidden_states_dtype=disagg_hidden_states_dtype,
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
                 output_dsa_topk_indices_dim=output_dsa_topk_indices_dim,
-                dspark_prefill_tail_len=dspark_prefill_tail_len,
-                dspark_hidden_pool_size=dspark_hidden_pool_size,
-                dspark_hidden_size=dspark_hidden_size,
-                dspark_hidden_device=dspark_hidden_device,
+                **metadata_buffer_kwargs,
             )
 
             # The decode requests polling kv cache
@@ -1303,10 +1222,7 @@ class Scheduler(
                 hidden_states_dtype=disagg_hidden_states_dtype,
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
                 output_dsa_topk_indices_dim=output_dsa_topk_indices_dim,
-                dspark_prefill_tail_len=dspark_prefill_tail_len,
-                dspark_hidden_pool_size=dspark_hidden_pool_size,
-                dspark_hidden_size=dspark_hidden_size,
-                dspark_hidden_device=dspark_hidden_device,
+                **metadata_buffer_kwargs,
             )
 
             self.disagg_prefill_bootstrap_queue = PrefillBootstrapQueue(
@@ -2668,7 +2584,7 @@ class Scheduler(
             maybe_release_metadata_buffer(
                 req,
                 self.req_to_metadata_buffer_idx_allocator,
-                getattr(self.disagg_metadata_buffers, "dspark_hidden_pool", None),
+                getattr(self.disagg_metadata_buffers, "pd_hidden_pool", None),
             )
             req.pending_bootstrap = False
         if self.enable_hicache_storage:
@@ -4079,7 +3995,7 @@ class Scheduler(
                     req,
                     self.req_to_metadata_buffer_idx_allocator,
                     getattr(
-                        self.disagg_metadata_buffers, "dspark_hidden_pool", None
+                        self.disagg_metadata_buffers, "pd_hidden_pool", None
                     ),
                 )
                 if (

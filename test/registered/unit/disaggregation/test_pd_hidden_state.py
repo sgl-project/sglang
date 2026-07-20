@@ -3,14 +3,14 @@ import unittest
 import torch
 
 from sglang.srt.disaggregation.common.utils import (
-    DSparkHiddenChunk,
-    DSparkHiddenRequestState,
+    PDHiddenChunk,
+    PDHiddenRequestState,
 )
-from sglang.srt.disaggregation.utils import DSparkHiddenRowPool
+from sglang.srt.disaggregation.utils import PDHiddenRowPool
 
 
-def _chunk(start: int, rows: int, is_last: bool = False) -> DSparkHiddenChunk:
-    return DSparkHiddenChunk(
+def _chunk(start: int, rows: int, is_last: bool = False) -> PDHiddenChunk:
+    return PDHiddenChunk(
         room=1,
         prefill_rank=0,
         hidden_start=start,
@@ -20,9 +20,9 @@ def _chunk(start: int, rows: int, is_last: bool = False) -> DSparkHiddenChunk:
     )
 
 
-class TestDSparkHiddenRequestState(unittest.TestCase):
+class TestPDHiddenRequestState(unittest.TestCase):
     def test_disabled_state_is_done_for_hidden_but_not_kv(self):
-        state = DSparkHiddenRequestState.disabled()
+        state = PDHiddenRequestState.disabled()
 
         self.assertFalse(state.enabled)
         self.assertFalse(state.streaming)
@@ -34,7 +34,7 @@ class TestDSparkHiddenRequestState(unittest.TestCase):
         self.assertTrue(state.request_done())
 
     def test_full_state_waits_only_for_kv_done(self):
-        state = DSparkHiddenRequestState.full(2, 6)
+        state = PDHiddenRequestState.full(2, 6)
 
         self.assertTrue(state.enabled)
         self.assertFalse(state.streaming)
@@ -48,7 +48,7 @@ class TestDSparkHiddenRequestState(unittest.TestCase):
         self.assertTrue(state.request_done())
 
     def test_streaming_hidden_done_is_separate_from_request_done(self):
-        state = DSparkHiddenRequestState.streaming_state(0, 8)
+        state = PDHiddenRequestState.streaming_state(0, 8)
 
         self.assertEqual(state.accept_chunk(_chunk(0, 4)), "accepted")
         self.assertFalse(state.hidden_request_done())
@@ -63,7 +63,7 @@ class TestDSparkHiddenRequestState(unittest.TestCase):
         self.assertTrue(state.request_done())
 
     def test_streaming_hidden_completion_can_wait_for_ack(self):
-        state = DSparkHiddenRequestState.streaming_state(0, 8)
+        state = PDHiddenRequestState.streaming_state(0, 8)
 
         self.assertEqual(state.accept_chunk(_chunk(0, 4)), "accepted")
         self.assertEqual(
@@ -77,26 +77,26 @@ class TestDSparkHiddenRequestState(unittest.TestCase):
         self.assertTrue(state.hidden_request_done())
 
     def test_streaming_hidden_rejects_future_and_stale_chunks(self):
-        state = DSparkHiddenRequestState.streaming_state(0, 8)
+        state = PDHiddenRequestState.streaming_state(0, 8)
 
         self.assertEqual(state.accept_chunk(_chunk(4, 4)), "future")
         self.assertEqual(state.accept_chunk(_chunk(0, 4)), "accepted")
         self.assertEqual(state.accept_chunk(_chunk(0, 4)), "stale")
 
     def test_streaming_hidden_last_chunk_must_end_at_expected_offset(self):
-        state = DSparkHiddenRequestState.streaming_state(0, 8)
+        state = PDHiddenRequestState.streaming_state(0, 8)
 
         with self.assertRaisesRegex(RuntimeError, "unexpected offset"):
             state.accept_chunk(_chunk(0, 4, is_last=True))
 
     def test_streaming_hidden_chunk_cannot_exceed_expected_range(self):
-        state = DSparkHiddenRequestState.streaming_state(0, 8)
+        state = PDHiddenRequestState.streaming_state(0, 8)
 
         with self.assertRaisesRegex(RuntimeError, "exceeds request range"):
             state.accept_chunk(_chunk(0, 9))
 
     def test_streaming_hidden_reset_returns_to_disabled_state(self):
-        state = DSparkHiddenRequestState.streaming_state(0, 8)
+        state = PDHiddenRequestState.streaming_state(0, 8)
         self.assertEqual(state.accept_chunk(_chunk(0, 8, is_last=True)), "accepted")
         state.mark_kv_done()
         self.assertTrue(state.request_done())
@@ -113,7 +113,7 @@ class TestDSparkHiddenRequestState(unittest.TestCase):
         self.assertFalse(state.request_done())
 
     def test_hidden_chunk_descriptor_keeps_ack_endpoint_metadata(self):
-        chunk = DSparkHiddenChunk(
+        chunk = PDHiddenChunk(
             room=3,
             prefill_rank=7,
             hidden_start=16,
@@ -134,9 +134,9 @@ class TestDSparkHiddenRequestState(unittest.TestCase):
         self.assertEqual(chunk.ack_port, 12345)
 
 
-class TestDSparkHiddenRowPool(unittest.TestCase):
+class TestPDHiddenRowPool(unittest.TestCase):
     def test_alloc_prefers_contiguous_rows_and_merges_frees(self):
-        pool = DSparkHiddenRowPool(8, 1, torch.float32)
+        pool = PDHiddenRowPool(8, 1, torch.float32)
 
         self.assertEqual(pool.alloc(3), [0, 1, 2])
         self.assertEqual(pool.alloc(2), [3, 4])
@@ -146,7 +146,7 @@ class TestDSparkHiddenRowPool(unittest.TestCase):
         self.assertEqual(pool.available_size(), 3)
 
     def test_alloc_falls_back_to_fragmented_rows_without_global_sorting(self):
-        pool = DSparkHiddenRowPool(8, 1, torch.float32)
+        pool = PDHiddenRowPool(8, 1, torch.float32)
 
         self.assertEqual(pool.alloc(8), list(range(8)))
         pool.free([0, 1, 4, 5, 7])
@@ -155,7 +155,7 @@ class TestDSparkHiddenRowPool(unittest.TestCase):
         self.assertEqual(pool.available_size(), 2)
 
     def test_free_ignores_duplicate_and_already_free_rows(self):
-        pool = DSparkHiddenRowPool(4, 1, torch.float32)
+        pool = PDHiddenRowPool(4, 1, torch.float32)
 
         allocated = pool.alloc(2)
         self.assertEqual(allocated, [0, 1])

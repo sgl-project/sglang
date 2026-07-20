@@ -200,7 +200,7 @@ class CommonKVManager(BaseKVManager):
             self.register_to_bootstrap()
             self.transfer_infos = {}
             self.req_to_decode_prefix_len: Dict[int, int] = {}
-            self.req_to_dspark_hidden_meta: Dict[int, dict] = {}
+            self.req_to_pd_hidden_meta: Dict[int, dict] = {}
             self.decode_kv_args_table = {}
             self.pp_group = get_pp_group()
             # If a timeout happens on the prefill side, it means prefill instances
@@ -245,10 +245,10 @@ class CommonKVManager(BaseKVManager):
                 f"Unsupported DisaggregationMode: {self.disaggregation_mode}"
             )
 
-    def supports_dspark_hidden_streaming(self) -> bool:
+    def supports_pd_hidden_streaming(self) -> bool:
         return False
 
-    def mark_dspark_hidden_request_done(
+    def mark_pd_hidden_request_done(
         self,
         bootstrap_room: int,
         state_indices: Optional[List] = None,
@@ -261,22 +261,22 @@ class CommonKVManager(BaseKVManager):
         del bootstrap_room, state_indices
         return None
 
-    def pop_dspark_hidden_request_done(self, bootstrap_room: int) -> bool:
+    def pop_pd_hidden_request_done(self, bootstrap_room: int) -> bool:
         """Consume a hidden-request-done event for early source-window release."""
         del bootstrap_room
         return False
 
     # Backward-compatible aliases for backend-specific implementations that have
     # not yet migrated to the request-level naming.
-    def mark_dspark_hidden_done(
+    def mark_pd_hidden_done(
         self,
         bootstrap_room: int,
         state_indices: Optional[List] = None,
     ) -> None:
-        self.mark_dspark_hidden_request_done(bootstrap_room, state_indices)
+        self.mark_pd_hidden_request_done(bootstrap_room, state_indices)
 
-    def pop_dspark_hidden_done(self, bootstrap_room: int) -> bool:
-        return self.pop_dspark_hidden_request_done(bootstrap_room)
+    def pop_pd_hidden_done(self, bootstrap_room: int) -> bool:
+        return self.pop_pd_hidden_request_done(bootstrap_room)
 
     def check_status(self, bootstrap_room: int) -> KVPoll:
         return self.request_status[bootstrap_room]
@@ -1182,8 +1182,8 @@ class CommonKVSender(BaseKVSender):
         self.kv_mgr.request_status.pop(self.bootstrap_room, None)
         if hasattr(self.kv_mgr, "req_to_decode_prefix_len"):
             self.kv_mgr.req_to_decode_prefix_len.pop(self.bootstrap_room, None)
-        if hasattr(self.kv_mgr, "req_to_dspark_hidden_meta"):
-            self.kv_mgr.req_to_dspark_hidden_meta.pop(self.bootstrap_room, None)
+        if hasattr(self.kv_mgr, "req_to_pd_hidden_meta"):
+            self.kv_mgr.req_to_pd_hidden_meta.pop(self.bootstrap_room, None)
         if hasattr(self.kv_mgr, "transfer_infos"):
             self.kv_mgr.transfer_infos.pop(self.bootstrap_room, None)
 

@@ -181,64 +181,10 @@ class SpeculativeAlgorithm(Enum):
                 make_next_draft_input,
             )
 
-            tails = [
-                getattr(req, "prefill_tail_hidden_states_tensor", None)
-                for req in batch.reqs
-            ]
-            masks = [getattr(req, "prefill_tail_valid_mask", None) for req in batch.reqs]
-            starts = [
-                int(getattr(req, "prefill_tail_hidden_start", 0))
-                for req in batch.reqs
-            ]
-            valid_lens = [
-                int(tail.shape[0])
-                if tail is not None and mask is not None and tail.numel() > 0
-                else 0
-                for tail, mask in zip(tails, masks, strict=True)
-            ]
-            if any(valid_lens):
-                valid_indices = [
-                    i for i, valid_len in enumerate(valid_lens) if valid_len > 0
-                ]
-                if len(valid_indices) == 1:
-                    i = valid_indices[0]
-                    prefill_tail_hidden_states = tails[i][
-                        : valid_lens[i]
-                    ].to(batch.device, non_blocking=True)
-                else:
-                    prefill_tail_hidden_states = torch.cat(
-                        [
-                            tail[:valid_len].to(batch.device, non_blocking=True)
-                            for tail, valid_len in zip(tails, valid_lens, strict=True)
-                            if tail is not None and valid_len > 0
-                        ],
-                        dim=0,
-                    )
-                # In the ragged representation this field stores row counts.
-                prefill_tail_valid_mask = torch.tensor(
-                    valid_lens, dtype=torch.int64, device=batch.device
-                )
-                prefill_tail_start_positions = torch.tensor(
-                    starts, dtype=torch.int64, device=batch.device
-                )
-            else:
-                prefill_tail_hidden_states = None
-                prefill_tail_valid_mask = None
-                prefill_tail_start_positions = None
-
             spec_info = make_next_draft_input(
                 bonus_tokens=last_tokens_tensor,
                 new_seq_lens=batch.seq_lens,
-                prefill_tail_hidden_states=prefill_tail_hidden_states,
-                prefill_tail_valid_mask=prefill_tail_valid_mask,
-                prefill_tail_start_positions=prefill_tail_start_positions,
-                prefill_tail_hidden_projected=False,
             )
-            if any(valid_lens):
-                for req in batch.reqs:
-                    req.prefill_tail_hidden_states_tensor = None
-                    req.prefill_tail_valid_mask = None
-                    req.prefill_tail_hidden_start = 0
             if batch.enable_overlap:
                 from sglang.srt.managers.overlap_utils import RelayPayload
 

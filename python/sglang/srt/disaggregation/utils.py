@@ -242,8 +242,8 @@ class ReqToMetadataIdxAllocator:
         self.free_slots.append(free_index)
 
 
-class DSparkHiddenRowPool:
-    """Compact row pool for DSpark PD hidden-state transfer."""
+class PDHiddenRowPool:
+    """Compact row pool for PD hidden-state transfer."""
 
     def __init__(
         self,
@@ -376,12 +376,12 @@ class DSparkHiddenRowPool:
             return
         if hidden.shape[0] != len(indices):
             raise ValueError(
-                "DSpark hidden row count mismatch: "
+                "PD hidden row count mismatch: "
                 f"hidden={hidden.shape[0]}, indices={len(indices)}"
             )
         if hidden.shape[-1] > self.hidden_size:
             raise ValueError(
-                "DSpark hidden width exceeds row pool width: "
+                "PD hidden width exceeds row pool width: "
                 f"hidden={hidden.shape[-1]}, pool={self.hidden_size}"
             )
         hidden = hidden.to(device=self.device, dtype=self.dtype, non_blocking=True)
@@ -426,13 +426,13 @@ class DSparkHiddenRowPool:
 
 
 @dataclass
-class DSparkHiddenTransferPlan:
+class PDHiddenTransferPlan:
     row_count: int
     item_len: int
     row_chunks: List[Dict[str, Any]]
 
     @classmethod
-    def build(cls, row_count: int, item_len: int) -> "DSparkHiddenTransferPlan":
+    def build(cls, row_count: int, item_len: int) -> "PDHiddenTransferPlan":
         row_count = int(row_count)
         item_len = int(item_len)
         if row_count <= 0:
@@ -495,7 +495,7 @@ class DSparkHiddenTransferPlan:
 
         if item_len > 0:
             new_dynamic_dst["ptr"] = int(new_dynamic_dst.get("ptr", 0)) + offset * item_len
-        plan = DSparkHiddenTransferPlan.build(new_row_count, item_len)
+        plan = PDHiddenTransferPlan.build(new_row_count, item_len)
         new_dynamic_dst["row_chunks"] = plan.row_chunks
         return new_dynamic_dst
 
@@ -510,21 +510,19 @@ class MetadataBuffers:
         max_sampling_mask_tokens: Optional[int] = None,
         custom_mem_pool: torch.cuda.MemPool = None,
         output_dsa_topk_indices_dim: int = 0,
-        dspark_prefill_tail_len: int = 0,
-        dspark_hidden_pool_size: int = 0,
-        dspark_hidden_size: int = 0,
-        dspark_hidden_device: str = "cpu",
+        pd_hidden_pool_size: int = 0,
+        pd_hidden_size: int = 0,
+        pd_hidden_device: str = "cpu",
     ):
         self.custom_mem_pool = custom_mem_pool
         self.output_dsa_topk_indices_dim = output_dsa_topk_indices_dim
-        self.dspark_prefill_tail_len = max(0, int(dspark_prefill_tail_len))
-        self.dspark_hidden_pool: Optional[DSparkHiddenRowPool] = None
-        if dspark_hidden_pool_size > 0 and dspark_hidden_size > 0:
-            self.dspark_hidden_pool = DSparkHiddenRowPool(
-                dspark_hidden_pool_size,
-                dspark_hidden_size,
+        self.pd_hidden_pool: Optional[PDHiddenRowPool] = None
+        if pd_hidden_pool_size > 0 and pd_hidden_size > 0:
+            self.pd_hidden_pool = PDHiddenRowPool(
+                pd_hidden_pool_size,
+                pd_hidden_size,
                 hidden_states_dtype,
-                device=dspark_hidden_device,
+                device=pd_hidden_device,
             )
         if max_sampling_mask_tokens is None:
             max_sampling_mask_tokens = (
@@ -600,19 +598,6 @@ class MetadataBuffers:
                 )
             else:
                 self.output_dsa_topk_indices = None
-            self.output_dspark_prefill_tail_hidden_states = None
-            self.output_dspark_prefill_tail_valid_mask = None
-            if self.dspark_prefill_tail_len > 0:
-                self.output_dspark_prefill_tail_hidden_states = torch.zeros(
-                    (size, self.dspark_prefill_tail_len, hidden_size),
-                    dtype=hidden_states_dtype,
-                    device=device,
-                )
-                self.output_dspark_prefill_tail_valid_mask = torch.zeros(
-                    (size, self.dspark_prefill_tail_len),
-                    dtype=torch.bool,
-                    device=device,
-                )
             # Request validation: store bootstrap_room to detect metadata corruption
             self.bootstrap_room = torch.zeros(
                 (size, 8), dtype=bootstrap_room_dtype, device=device
@@ -645,13 +630,6 @@ class MetadataBuffers:
         if self.output_dsa_topk_indices is not None:
             bufs.append(self.output_dsa_topk_indices)
         bufs.append(self.bootstrap_room)
-        if self.output_dspark_prefill_tail_hidden_states is not None:
-            bufs.extend(
-                [
-                    self.output_dspark_prefill_tail_hidden_states,
-                    self.output_dspark_prefill_tail_valid_mask,
-                ]
-            )
         ptrs = [buf.data_ptr() for buf in bufs]
         data_lens = [buf.nbytes for buf in bufs]
         item_lens = [buf[0].nbytes for buf in bufs]
@@ -685,11 +663,6 @@ class MetadataBuffers:
             ),
             self.bootstrap_room[idx].clone(),
         )
-        if self.output_dspark_prefill_tail_hidden_states is not None:
-            ret += (
-                self.output_dspark_prefill_tail_hidden_states[idx].clone(),
-                self.output_dspark_prefill_tail_valid_mask[idx].clone(),
-            )
         return ret
 
     def set_buf(self, req: Req):
@@ -811,55 +784,34 @@ class MetadataBuffers:
         self.bootstrap_room[req.metadata_buffer_index, 0] = (
             req.bootstrap_room if req.bootstrap_room is not None else 0
         )
-        if self.output_dspark_prefill_tail_hidden_states is not None:
-            self.output_dspark_prefill_tail_hidden_states[
-                req.metadata_buffer_index
-            ].zero_()
-            self.output_dspark_prefill_tail_valid_mask[
-                req.metadata_buffer_index
-            ].zero_()
-            tail_hidden = getattr(req, "prefill_tail_hidden_states_tensor", None)
-            tail_mask = getattr(req, "prefill_tail_valid_mask", None)
-            if tail_hidden is not None and tail_mask is not None:
-                tail_len = min(
-                    int(tail_hidden.shape[0]),
-                    int(self.output_dspark_prefill_tail_hidden_states.shape[1]),
-                )
-                if tail_len > 0:
-                    self.output_dspark_prefill_tail_hidden_states[
-                        req.metadata_buffer_index, :tail_len
-                    ].copy_(tail_hidden[:tail_len].to(self.output_hidden_states.device))
-                    self.output_dspark_prefill_tail_valid_mask[
-                        req.metadata_buffer_index, :tail_len
-                    ].copy_(tail_mask[:tail_len].to(self.output_hidden_states.device))
 
-    def ensure_dspark_hidden_pool(
+    def ensure_pd_hidden_pool(
         self,
         *,
         size: int,
         hidden_size: int,
         dtype: torch.dtype,
         device: str = "cpu",
-    ) -> DSparkHiddenRowPool:
-        if self.dspark_hidden_pool is None:
-            self.dspark_hidden_pool = DSparkHiddenRowPool(
+    ) -> PDHiddenRowPool:
+        if self.pd_hidden_pool is None:
+            self.pd_hidden_pool = PDHiddenRowPool(
                 size=size,
                 hidden_size=hidden_size,
                 dtype=dtype,
                 device=device,
             )
-        elif self.dspark_hidden_pool.hidden_size != int(hidden_size):
+        elif self.pd_hidden_pool.hidden_size != int(hidden_size):
             raise ValueError(
-                "DSpark hidden pool hidden_size mismatch: "
-                f"existing={self.dspark_hidden_pool.hidden_size}, "
+                "PD hidden pool hidden_size mismatch: "
+                f"existing={self.pd_hidden_pool.hidden_size}, "
                 f"requested={hidden_size}"
             )
-        return self.dspark_hidden_pool
+        return self.pd_hidden_pool
 
-    def get_dspark_hidden_state_buf_infos(self):
-        if self.dspark_hidden_pool is None:
+    def get_pd_hidden_state_buf_infos(self):
+        if self.pd_hidden_pool is None:
             return [], [], []
-        return self.dspark_hidden_pool.get_state_buf_infos()
+        return self.pd_hidden_pool.get_state_buf_infos()
 
 
 #########################
@@ -873,6 +825,55 @@ class TransferBackend(Enum):
     NIXL = "nixl"
     ASCEND = "ascend"
     FAKE = "fake"
+
+
+@dataclass(frozen=True)
+class DisaggMetadataConfig:
+    hidden_size: int
+    hidden_states_dtype: torch.dtype
+    metadata_buffer_kwargs: dict
+
+
+def resolve_disagg_metadata_config(
+    *,
+    hidden_size: int,
+    hidden_states_dtype: torch.dtype,
+    disaggregation_mode: DisaggregationMode,
+    transfer_backend: TransferBackend,
+    spec_algorithm: Any,
+    model_config: Any,
+    server_args: Any,
+    model_runner: Any,
+    pp_rank: int,
+    pp_size: int,
+    gpu_id: int,
+    max_prefill_tokens: int,
+) -> DisaggMetadataConfig:
+    from sglang.srt.speculative.dspark_components.dspark_disaggregation import (
+        resolve_disagg_metadata_config as resolve_dspark_metadata_config,
+    )
+
+    hidden_state_config = resolve_dspark_metadata_config(
+        disaggregation_mode=disaggregation_mode,
+        transfer_backend=transfer_backend,
+        spec_algorithm=spec_algorithm,
+        model_config=model_config,
+        server_args=server_args,
+        model_runner=model_runner,
+        pp_rank=pp_rank,
+        pp_size=pp_size,
+        gpu_id=gpu_id,
+        max_prefill_tokens=max_prefill_tokens,
+    )
+    if hidden_state_config.enabled:
+        hidden_size = hidden_state_config.hidden_size
+        hidden_states_dtype = hidden_state_config.hidden_states_dtype
+
+    return DisaggMetadataConfig(
+        hidden_size=hidden_size,
+        hidden_states_dtype=hidden_states_dtype,
+        metadata_buffer_kwargs=hidden_state_config.metadata_buffer_kwargs(),
+    )
 
 
 class KVClassType(Enum):
@@ -1195,7 +1196,7 @@ def setup_state_kv_args(
     draft_token_to_kv_pool=None,
     total_kv_layers: int = None,
     req_to_token_pool=None,
-    dspark_hidden_pool: Optional[DSparkHiddenRowPool] = None,
+    pd_hidden_pool: Optional[PDHiddenRowPool] = None,
 ) -> None:
     """Populate ``kv_args`` state-buffer fields from the given pool.
     Shared by prefill and decode bootstrap paths so the state_type dispatch
@@ -1310,12 +1311,12 @@ def setup_state_kv_args(
                     kv_args, StateType.DSA, data_ptrs, data_lens, item_lens
                 )
 
-    if dspark_hidden_pool is not None:
-        data_ptrs, data_lens, item_lens = dspark_hidden_pool.get_state_buf_infos()
+    if pd_hidden_pool is not None:
+        data_ptrs, data_lens, item_lens = pd_hidden_pool.get_state_buf_infos()
         if data_ptrs:
             append_state_component(
                 kv_args,
-                StateType.DSPARK_HIDDEN,
+                StateType.PD_HIDDEN,
                 data_ptrs,
                 data_lens,
                 item_lens,

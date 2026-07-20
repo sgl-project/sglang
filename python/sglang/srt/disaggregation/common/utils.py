@@ -26,16 +26,16 @@ class TransferKVChunk:
     state_indices: Optional[List]
     chunk_id: Optional[int] = None
     kv_sent: bool = False
-    dspark_hidden_packet_idx: int = 0
-    dspark_hidden_sent: bool = False
-    dspark_hidden_ready_sent: bool = False
-    dspark_hidden_ack_ready: bool = False
-    dspark_hidden_ack_expected_count: int = 0
-    dspark_hidden_ack_timed_out: bool = False
-    dspark_hidden_start: Optional[int] = None
-    dspark_hidden_row_len: int = 0
-    dspark_hidden_is_last_chunk: bool = False
-    dspark_hidden_release_indices: Optional[List[int]] = None
+    pd_hidden_packet_idx: int = 0
+    pd_hidden_sent: bool = False
+    pd_hidden_ready_sent: bool = False
+    pd_hidden_ack_ready: bool = False
+    pd_hidden_ack_expected_count: int = 0
+    pd_hidden_ack_timed_out: bool = False
+    pd_hidden_start: Optional[int] = None
+    pd_hidden_row_len: int = 0
+    pd_hidden_is_last_chunk: bool = False
+    pd_hidden_release_indices: Optional[List[int]] = None
     enqueue_time: float = 0.0
     source_event: Optional[Any] = None
     trace_ctx: Union[TraceReqContext, TraceNullContext] = dataclasses.field(
@@ -44,8 +44,8 @@ class TransferKVChunk:
 
 
 @dataclasses.dataclass
-class DSparkHiddenChunk:
-    """Transport-neutral DSpark hidden chunk descriptor."""
+class PDHiddenChunk:
+    """Transport-neutral PD hidden chunk descriptor."""
 
     room: int
     prefill_rank: int
@@ -58,7 +58,7 @@ class DSparkHiddenChunk:
 
 
 @dataclasses.dataclass
-class DSparkHiddenRequestState:
+class PDHiddenRequestState:
     """Decode-side request state for hidden transfer, separate from KV status."""
 
     enabled: bool = False
@@ -70,11 +70,11 @@ class DSparkHiddenRequestState:
     kv_done: bool = False
 
     @classmethod
-    def disabled(cls) -> "DSparkHiddenRequestState":
+    def disabled(cls) -> "PDHiddenRequestState":
         return cls()
 
     @classmethod
-    def full(cls, start: int, end: int) -> "DSparkHiddenRequestState":
+    def full(cls, start: int, end: int) -> "PDHiddenRequestState":
         return cls(
             enabled=True,
             streaming=False,
@@ -85,7 +85,7 @@ class DSparkHiddenRequestState:
         )
 
     @classmethod
-    def streaming_state(cls, start: int, end: int) -> "DSparkHiddenRequestState":
+    def streaming_state(cls, start: int, end: int) -> "PDHiddenRequestState":
         return cls(
             enabled=True,
             streaming=True,
@@ -120,7 +120,7 @@ class DSparkHiddenRequestState:
         return self.kv_request_done() and self.hidden_request_done()
 
     def accept_chunk(
-        self, chunk: DSparkHiddenChunk, *, defer_hidden_done: bool = False
+        self, chunk: PDHiddenChunk, *, defer_hidden_done: bool = False
     ) -> str:
         """Return accepted/future/stale for a streaming hidden chunk."""
         hidden_start = int(chunk.hidden_start)
@@ -131,13 +131,13 @@ class DSparkHiddenRequestState:
         next_start = hidden_start + int(chunk.row_len)
         if next_start > self.end:
             raise RuntimeError(
-                "DSpark streaming hidden chunk exceeds request range: "
+                "PD streaming hidden chunk exceeds request range: "
                 f"next_start={next_start}, expected_end={self.end}"
             )
         if chunk.is_last_hidden_chunk:
             if next_start != self.end:
                 raise RuntimeError(
-                    "DSpark streaming hidden ended at an unexpected offset: "
+                    "PD streaming hidden ended at an unexpected offset: "
                     f"next_start={next_start}, expected_end={self.end}"
                 )
             if not defer_hidden_done:

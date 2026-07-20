@@ -452,47 +452,6 @@ class DSparkWorkerV2(BaseSpecWorker):
             global_tier_num_tokens=batch.global_spec_verify_tier_num_tokens
         )
 
-    def _maybe_inject_pd_prefill_tail(
-        self,
-        batch: ScheduleBatch,
-        draft_input: DFlashDraftInputV2,
-    ) -> None:
-        tail_hidden = getattr(draft_input, "prefill_tail_hidden_states", None)
-        tail_mask = getattr(draft_input, "prefill_tail_valid_mask", None)
-        start_positions = getattr(draft_input, "prefill_tail_start_positions", None)
-        if tail_hidden is None or tail_mask is None or start_positions is None:
-            return
-        if tail_hidden.numel() == 0:
-            draft_input.prefill_tail_hidden_states = None
-            draft_input.prefill_tail_valid_mask = None
-            draft_input.prefill_tail_start_positions = None
-            return
-
-        lengths = tail_mask.to(device=batch.device, dtype=torch.int64)
-        row_req_indices = torch.repeat_interleave(
-            torch.arange(lengths.numel(), device=batch.device), lengths
-        )
-        row_starts = torch.repeat_interleave(start_positions, lengths)
-        row_offsets = torch.arange(
-            tail_hidden.shape[0], dtype=torch.int64, device=batch.device
-        ) - torch.repeat_interleave(torch.cumsum(lengths, dim=0) - lengths, lengths)
-        pos = row_starts + row_offsets
-        req_pool_indices = batch.req_pool_indices[row_req_indices]
-        cache_loc = batch.req_to_token_pool.req_to_token[req_pool_indices, pos]
-        target_hidden = tail_hidden
-        self._kv_injector.inject_target_hidden(
-            target_hidden=target_hidden,
-            cache_loc=cache_loc,
-            positions=pos,
-        )
-        draft_input.prefill_tail_hidden_states = None
-        draft_input.prefill_tail_valid_mask = None
-        draft_input.prefill_tail_start_positions = None
-        for req in batch.reqs:
-            req.prefill_tail_hidden_states_tensor = None
-            req.prefill_tail_valid_mask = None
-            req.prefill_tail_hidden_start = 0
-
     def inject_pd_hidden_chunk(
         self,
         req,
@@ -580,7 +539,6 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
         sampling_info = batch.sampling_info
-        self._maybe_inject_pd_prefill_tail(batch, draft_input)
         with self._draft_context(), self._observers.segment(InfoSegment.DRAFT):
             proposal = self._proposer.propose(
                 batch=batch,
