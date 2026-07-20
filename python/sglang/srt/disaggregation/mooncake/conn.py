@@ -398,8 +398,9 @@ class MooncakeKVManager(CommonKVManager):
         """Execute staging transfer for one chunk. Returns (ret, deferred).
 
         Handles readiness check, transfer, and CHUNK_READY notification; a chunk
-        that cannot fit raises instead of falling back to the slice path.
-        deferred=True means caller should re-enqueue and break.
+        that cannot fit returns -1 (the caller fails only this room) instead of
+        falling back to the slice path, which would leak the decode-side
+        allocation. deferred=True means caller should re-enqueue and break.
         """
         ready, chunk_idx, c_offset, _, _ = staging_strategy.check_ready(
             req,
@@ -410,11 +411,14 @@ class MooncakeKVManager(CommonKVManager):
             from sglang.srt.disaggregation.common.staging_buffer import StagingAllocator
 
             if c_offset == StagingAllocator.ALLOC_OVERSIZED:
-                raise RuntimeError(
-                    f"[Staging] Chunk staging allocation permanently failed: "
-                    f"chunk exceeds ring buffer total size (room={kv_chunk.room}). "
-                    f"Increase SGLANG_DISAGG_STAGING_POOL_SIZE_MB."
+                # Fail this room, not the worker thread: the same prefill still
+                # serves other (same-TP, non-staging) decode instances.
+                logger.warning_once(
+                    "[Staging] a chunk exceeds the staging ring; failing affected "
+                    "requests. Increase SGLANG_DISAGG_STAGING_POOL_SIZE_MB or "
+                    "reduce chunked_prefill_size."
                 )
+                return (-1, False)
             # Not ready yet: wait (bounded) for a watermark advance, then
             # re-enqueue to retry. A plain block-until-ready would head-of-line
             # block other rooms on this single worker thread.
@@ -431,18 +435,15 @@ class MooncakeKVManager(CommonKVManager):
             target_info,
         )
         if ret == -1:
-            # A silent slice fallback would leak this chunk's decode-side
-            # allocation and pin the ring watermark; with grid-aligned sends
-            # not fitting can only mean misconfiguration.
-            raise RuntimeError(
-                f"[Staging] Staged transfer cannot fit chunk "
-                f"(room={kv_chunk.room}, chunk_idx={chunk_idx}, "
-                f"pages={len(kv_chunk.prefill_kv_indices)}). Increase "
-                f"SGLANG_DISAGG_STAGING_BUFFER_SIZE_MB / "
-                f"SGLANG_DISAGG_STAGING_POOL_SIZE_MB or reduce "
-                f"chunked_prefill_size."
+            # Doesn't fit the ring: fail this room (caller's ret != 0 path), do
+            # not fall back to the slice path (leaks the decode-side allocation).
+            logger.warning_once(
+                "[Staging] a chunk does not fit the staging ring; failing affected "
+                "requests. Increase SGLANG_DISAGG_STAGING_BUFFER_SIZE_MB or "
+                "reduce chunked_prefill_size."
             )
-        elif ret == 0 and not kv_chunk.is_last_chunk:
+            return (-1, False)
+        if ret == 0 and not kv_chunk.is_last_chunk:
             self._send_chunk_ready(req, chunk_idx, kv_chunk, prefill_unique_rank)
         return (ret, False)
 

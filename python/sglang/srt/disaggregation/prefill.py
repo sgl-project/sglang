@@ -152,10 +152,13 @@ class PrefillBootstrapQueue:
             server_args = self.scheduler.server_args
             page_size = self.scheduler.token_to_kv_pool_allocator.page_size
             cps = server_args.chunked_prefill_size or 8192
-            if cps % page_size != 0:
+            # Staging slices each send into a fixed page-aligned grid, so an
+            # unbounded (-1) or non-page-aligned chunk size has no valid grid.
+            if cps <= 0 or cps % page_size != 0:
                 raise RuntimeError(
-                    f"SGLANG_DISAGG_STAGING_BUFFER requires chunked_prefill_size "
-                    f"({cps}) to be a multiple of page_size ({page_size})."
+                    f"SGLANG_DISAGG_STAGING_BUFFER requires a positive "
+                    f"chunked_prefill_size that is a multiple of page_size "
+                    f"({page_size}); got {server_args.chunked_prefill_size}."
                 )
             if self.pp_size > 1:
                 # Staging writer accounting has no pp dimension.

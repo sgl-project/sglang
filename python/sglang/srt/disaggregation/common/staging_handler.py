@@ -158,6 +158,13 @@ class DecodeStagingHandler:
     def release_room(self, room: int, decode_req: DecodeRequest, receiver) -> None:
         """Free outstanding staging allocations of a room; no-op after a
         clean Success, releases watermark-pinning leaks on failure/abort."""
+        # Drain in-flight scatters before freeing anything, including one whose
+        # event is not yet in _chunk_events (submit_chunk_scatter records it
+        # after launching the kernel), so no scatter reads a freed staging slot
+        # or writes into KV-pool pages the failure path frees for reuse.
+        stream = getattr(self.staging_allocator, "_scatter_stream", None)
+        if stream is not None:
+            stream.synchronize()
         chunk_infos = (
             getattr(receiver, "chunk_staging_infos", []) if receiver is not None else []
         )
@@ -175,11 +182,7 @@ class DecodeStagingHandler:
                 alloc_id,
             )
             self._free_and_send_watermark(alloc_id, decode_req)
-        # A recorded scatter still writes into decode KV-pool pages that the
-        # failure path (release_kv_cache) already freed for reuse; wait for it
-        # so a later request reusing those pages is not corrupted.
-        for event, alloc_id in decode_req._chunk_events:
-            event.synchronize()
+        for _event, alloc_id in decode_req._chunk_events:
             self._free_and_send_watermark(alloc_id, decode_req)
         decode_req._chunk_events.clear()
 
