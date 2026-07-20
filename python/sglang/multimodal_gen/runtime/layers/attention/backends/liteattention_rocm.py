@@ -139,11 +139,22 @@ class LiteAttentionROCMImpl(AttentionImpl):
                 f"got {self._threshold}."
             )
 
-        self._lite = LiteAttention(
-            threshold=self._threshold, round_mode=self._round_mode, layout="bshd"
-        )
         self._moonmath_forward = moonmath_forward
         self._last_timestep: int = 0
+        # Role is fixed per instance (self/joint vs cross). Cross-attention uses
+        # the exact forward only, so the stateful skip kernel is not constructed.
+        self._cross_attention: bool = bool(
+            extra_impl_args.get("is_cross_attention", False)
+        )
+        self._lite = (
+            None
+            if self._cross_attention
+            else LiteAttention(
+                threshold=self._threshold,
+                round_mode=self._round_mode,
+                layout="bshd",
+            )
+        )
 
         # Validate softmax scale (moonmath bakes in 1/sqrt(D))
         expected_scale = self.head_size**-0.5
@@ -193,7 +204,7 @@ class LiteAttentionROCMImpl(AttentionImpl):
 
         # Cross-attention uses the exact forward; self/joint-attention uses the
         # skip-optimized kernel.
-        if self._is_cross_attention(query, key):
+        if self._cross_attention:
             output = self._moonmath_forward(
                 query, key, value, round_mode=self._round_mode, layout="bshd"
             )
@@ -203,11 +214,6 @@ class LiteAttentionROCMImpl(AttentionImpl):
             output = self._lite(query, key, value)
 
         return output
-
-    @staticmethod
-    def _is_cross_attention(query: torch.Tensor, key: torch.Tensor) -> bool:
-        # k from a different sequence than q (Sq != Skv) => cross-attention.
-        return query.shape[1] != key.shape[1]
 
     def _maybe_reset_skip_state(self) -> None:
         try:

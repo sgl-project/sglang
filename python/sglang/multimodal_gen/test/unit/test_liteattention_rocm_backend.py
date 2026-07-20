@@ -126,41 +126,58 @@ def test_forward_self_attention_shape_and_dtype():
     assert torch.isfinite(out.float()).all()
 
 
-def test_cross_attention_routes_to_exact_forward(monkeypatch):
-    """Cross-attention (k from a different sequence, Sq != Skv) uses exact forward."""
-    impl = _make_impl()
-    meta = AttentionMetadata(current_timestep=0)
-
+def _make_counted_impl(**overrides):
+    impl = _make_impl(**overrides)
     calls = {"lite": 0, "forward": 0}
-    impl._lite = lambda *a, **k: calls.__setitem__("lite", calls["lite"] + 1)
+    # Only self/joint instances construct _lite; cross instances leave it None.
+    if impl._lite is not None:
+        impl._lite = lambda *a, **k: calls.__setitem__("lite", calls["lite"] + 1)
     impl._moonmath_forward = lambda *a, **k: calls.__setitem__(
         "forward", calls["forward"] + 1
     )
+    return impl, calls
+
+
+def test_cross_attention_routes_to_exact_forward():
+    """is_cross_attention=True uses exact forward regardless of q/k shapes."""
+    impl, calls = _make_counted_impl(is_cross_attention=True)
+    assert impl._lite is None  # skip kernel not constructed for cross instances
+    meta = AttentionMetadata(current_timestep=0)
 
     b, h = 1, 4
+    # Sq == Skv here on purpose: the flag, not the shape, must drive dispatch.
     q = torch.randn(b, 64, h, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
-    k = torch.randn(b, 32, h, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
-    v = torch.randn(b, 32, h, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+    k = torch.randn(b, 64, h, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+    v = torch.randn(b, 64, h, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
     impl.forward(q, k, v, meta)
 
     assert calls == {"lite": 0, "forward": 1}
 
 
-def test_self_attention_routes_to_lite_kernel(monkeypatch):
-    """Self/joint-attention (Sq == Skv) uses the skip-optimized LiteAttention kernel."""
-    impl = _make_impl()
+def test_self_attention_routes_to_lite_kernel():
+    """Self/joint-attention (default, is_cross_attention=False) uses the skip kernel."""
+    impl, calls = _make_counted_impl()
+    assert impl._lite is not None
     meta = AttentionMetadata(current_timestep=0)
-
-    calls = {"lite": 0, "forward": 0}
-    impl._lite = lambda *a, **k: calls.__setitem__("lite", calls["lite"] + 1)
-    impl._moonmath_forward = lambda *a, **k: calls.__setitem__(
-        "forward", calls["forward"] + 1
-    )
 
     b, s, h = 1, 64, 4
     q = torch.randn(b, s, h, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
     k = torch.randn(b, s, h, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
     v = torch.randn(b, s, h, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+    impl.forward(q, k, v, meta)
+
+    assert calls == {"lite": 1, "forward": 0}
+
+
+def test_self_attention_ignores_shape_when_flag_false():
+    """is_cross_attention=False takes the skip kernel even when Sq != Skv."""
+    impl, calls = _make_counted_impl(is_cross_attention=False)
+    meta = AttentionMetadata(current_timestep=0)
+
+    b, h = 1, 4
+    q = torch.randn(b, 64, h, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+    k = torch.randn(b, 32, h, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+    v = torch.randn(b, 32, h, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
     impl.forward(q, k, v, meta)
 
     assert calls == {"lite": 1, "forward": 0}

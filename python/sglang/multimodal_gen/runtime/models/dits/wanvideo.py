@@ -195,6 +195,7 @@ class WanSelfAttention(nn.Module):
             causal=False,
             supported_attention_backends=supported_attention_backends,
             skip_sequence_parallel=is_cross_attention,
+            is_cross_attention=is_cross_attention,
             quant_config=quant_config,
         )
 
