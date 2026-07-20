@@ -2135,7 +2135,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                             offset + tokens_to_strip : offset + old_contribution
                         ]
                     )
-                    extend_logprob_start_lens[i] = max(0, old_start_len - encoder_reserve)
+                    extend_logprob_start_lens[i] = max(
+                        0, old_start_len - encoder_reserve
+                    )
                 else:
                     new_token_ids_parts.append(
                         self.extend_input_logprob_token_ids[

@@ -462,7 +462,7 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
         #
         # ``encoder_offset`` is the page-aligned encoder reserve, not the true
         # encoder length: pad_input_ids reserves ceil_align(encoder_len,
-        # page_size) slots so the decoder KV starts on a page boundary 
+        # page_size) slots so the decoder KV starts on a page boundary
         # ceil_align(x, 1) == x, so for page_size==1
         # the offset equals encoder_lens and this is a no-op (encoder-decoder on
         # CUDA runs the flashinfer/page_size=1 path).
@@ -493,9 +493,7 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     # encoder reserve.
     if batch.model_config.is_encoder_decoder:
         page_size = _alloc_page_size(batch)
-        encoder_offset = (
-            (batch.encoder_lens + page_size - 1) // page_size
-        ) * page_size
+        encoder_offset = ((batch.encoder_lens + page_size - 1) // page_size) * page_size
         locs = encoder_offset + seq_lens_gpu
     else:
         locs = seq_lens_gpu.clone()

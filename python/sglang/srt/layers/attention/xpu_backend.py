@@ -380,8 +380,7 @@ class XPUAttentionBackend(AttentionBackend):
             # encoder length above. ceil_align(x, 1) == x, so this equals
             # encoder_max_seq_len_k for page_size == 1 — a no-op there.
             encoder_offset = (
-                (metadata.encoder_max_seq_len_k + self.page_size - 1)
-                // self.page_size
+                (metadata.encoder_max_seq_len_k + self.page_size - 1) // self.page_size
             ) * self.page_size
             # Currently only support forward_batch.encoder_lens.numel() == 1
             metadata.page_table = self.req_to_token_pool.req_to_token[
