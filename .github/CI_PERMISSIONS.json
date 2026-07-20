@@ -377,6 +377,13 @@
         "cooldown_interval_minutes": 0,
         "reason": "custom override"
     },
+    "ZYHowell": {
+        "can_tag_run_ci_label": true,
+        "can_rerun_failed_ci": true,
+        "can_rerun_stage": true,
+        "cooldown_interval_minutes": 0,
+        "reason": "custom override"
+    },
     "ZailiWang": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
@@ -677,6 +684,13 @@
         "can_rerun_stage": true,
         "cooldown_interval_minutes": 0,
         "reason": "top contributor"
+    },
+    "houseroad": {
+        "can_tag_run_ci_label": true,
+        "can_rerun_failed_ci": true,
+        "can_rerun_stage": true,
+        "cooldown_interval_minutes": 0,
+        "reason": "custom override"
     },
     "htzo": {
         "can_tag_run_ci_label": true,
@@ -1236,6 +1250,13 @@
         "can_rerun_failed_ci": true,
         "can_rerun_stage": true,
         "cooldown_interval_minutes": 0,
+        "reason": "custom override"
+    },
+    "tanujtiwari1998": {
+        "can_tag_run_ci_label": true,
+        "can_rerun_failed_ci": true,
+        "can_rerun_stage": true,
+        "cooldown_interval_minutes": 60,
         "reason": "custom override"
     },
     "thecodingwizard": {

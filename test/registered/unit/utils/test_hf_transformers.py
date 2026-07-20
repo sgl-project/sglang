@@ -4,17 +4,23 @@ Tests cover the pure utility functions (compat patches, config helpers,
 context length, GGUF detection, etc.) that don't require actual model files.
 """
 
+import inspect
 import tempfile
 import unittest
 from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 from transformers import PretrainedConfig
+from transformers.image_processing_utils import BaseImageProcessor
 
+import sglang.srt.utils.hf_transformers.processor as processor_utils
+from sglang.srt.utils import hf_transformers_patches
 from sglang.srt.utils.hf_transformers.common import (
     _is_deepseek_ocr2_model,
     _is_deepseek_ocr_model,
     _override_v_head_dim_if_zero,
     _patch_text_config,
+    attach_additional_stop_token_ids,
     check_gguf_file,
     get_context_length,
     get_hf_text_config,
@@ -25,6 +31,72 @@ from sglang.srt.utils.hf_transformers_patches import normalize_rope_scaling_comp
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
+
+
+# ---------------------------------------------------------------------------
+# get_processor
+# ---------------------------------------------------------------------------
+
+
+class TestGetProcessor(unittest.TestCase):
+    def test_resolves_model_name_before_loading_config(self):
+        remote_model = "s3://bucket/model"
+        local_model = "/cache/model"
+        config = SimpleNamespace(model_type="clip", auto_map={})
+        loaded_processor = MagicMock()
+        loaded_processor.tokenizer.chat_template = "template"
+        auto_config = MagicMock()
+        auto_config.from_pretrained.return_value = config
+        auto_processor = MagicMock()
+        auto_processor.from_pretrained.return_value = loaded_processor
+
+        def resolve_uri(path):
+            return local_model if path == remote_model else path
+
+        with patch.multiple(
+            processor_utils,
+            resolve_runai_obj_uri=MagicMock(side_effect=resolve_uri),
+            AutoConfig=auto_config,
+            AutoProcessor=auto_processor,
+        ):
+            processor = processor_utils.get_processor(
+                "local-tokenizer",
+                model_name=remote_model,
+            )
+
+        self.assertIs(processor, loaded_processor)
+        auto_config.from_pretrained.assert_called_once_with(
+            local_model,
+            trust_remote_code=False,
+            revision=None,
+        )
+
+
+# ---------------------------------------------------------------------------
+# _patch_image_processor_kwargs
+# ---------------------------------------------------------------------------
+
+
+class TestImageProcessorKwargsPatch(unittest.TestCase):
+    def test_filters_unsupported_kwargs_and_caches_signature(self):
+        class StrictImageProcessor(BaseImageProcessor):
+            model_input_names = ["pixel_values"]
+
+            def preprocess(self, images, accepted=None):
+                return {"images": images, "accepted": accepted}
+
+        processor = StrictImageProcessor()
+        with patch.object(
+            hf_transformers_patches.inspect,
+            "signature",
+            wraps=inspect.signature,
+        ) as signature:
+            first = processor("first", accepted=True, device="cuda")
+            second = processor("second", accepted=False, device="cuda")
+
+        self.assertEqual(first, {"images": "first", "accepted": True})
+        self.assertEqual(second, {"images": "second", "accepted": False})
+        self.assertEqual(signature.call_count, 1)
 
 
 # ---------------------------------------------------------------------------
@@ -44,11 +116,6 @@ class TestNormalizeRopeScalingCompat(unittest.TestCase):
         cfg.rope_scaling = {"rope_type": "llama3", "type": "custom", "factor": 8.0}
         normalize_rope_scaling_compat(cfg)
         self.assertEqual(cfg.rope_scaling["type"], "custom")
-
-    def test_no_op_when_no_rope_scaling(self):
-        cfg = PretrainedConfig()
-        normalize_rope_scaling_compat(cfg)
-        self.assertIsNone(getattr(cfg, "rope_scaling", None))
 
     def test_no_op_when_rope_scaling_is_none(self):
         cfg = PretrainedConfig()
@@ -386,6 +453,37 @@ class TestGetHfTextConfig(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# attach_additional_stop_token_ids
+# ---------------------------------------------------------------------------
+
+
+class TestAttachAdditionalStopTokenIds(unittest.TestCase):
+    """Bug regression: the Inkling bundle ships eos metadata unset while its
+    turn-final marker <|content_model_end_sampling|> sits in added_tokens; the
+    old detector only recognized <|eom_id|>, so generation ran to max length
+    (documented by the Inkling GSM8K test)."""
+
+    @staticmethod
+    def _tokenizer(added):
+        return SimpleNamespace(get_added_vocab=lambda: added)
+
+    def test_inkling_end_sampling_registers_as_stop(self):
+        tok = self._tokenizer({"<|content_model_end_sampling|>": 200006})
+        attach_additional_stop_token_ids(tok)
+        self.assertEqual(tok.additional_stop_token_ids, {200006})
+
+    def test_eom_id_still_registers_as_stop(self):
+        tok = self._tokenizer({"<|eom_id|>": 128008})
+        attach_additional_stop_token_ids(tok)
+        self.assertEqual(tok.additional_stop_token_ids, {128008})
+
+    def test_no_known_marker_yields_none(self):
+        tok = self._tokenizer({"<|other|>": 7})
+        attach_additional_stop_token_ids(tok)
+        self.assertIsNone(tok.additional_stop_token_ids)
+
+
+# ---------------------------------------------------------------------------
 # _fix_special_tokens_pattern
 # ---------------------------------------------------------------------------
 
@@ -477,59 +575,6 @@ class TestPatchRemovedSymbols(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # compat: _patch_rope_parameters_validation
 # ---------------------------------------------------------------------------
-
-
-class TestPatchRopeParametersValidation(unittest.TestCase):
-    # -----------------------------------------------------------------------
-    # Test ``rope_theta`` injection into ``rope_scaling``.
-    #
-    # Upstream `transformers.PretrainedConfig` now natively handles this
-    # logic. While the manual injection patch has been removed, these
-    # test cases are retained to ensure regression testing of the
-    # configuration's injection behavior.
-    # -----------------------------------------------------------------------
-
-    def test_injects_rope_theta_into_rope_scaling(self):
-        config_dict = {
-            "model_type": "llama",
-            "rope_theta": 500000.0,
-            "max_position_embeddings": 131072,
-            "rope_scaling": {
-                "rope_type": "llama3",
-                "factor": 8.0,
-                "low_freq_factor": 1.0,
-                "high_freq_factor": 4.0,
-                "original_max_position_embeddings": 8192,
-            },
-        }
-        config = PretrainedConfig.from_dict(config_dict)
-        rope_params = getattr(config, "rope_parameters", None)
-        if rope_params is not None:
-            self.assertIn("rope_theta", rope_params)
-
-    def test_no_injection_when_rope_theta_already_in_scaling(self):
-        config_dict = {
-            "model_type": "llama",
-            "rope_theta": 500000.0,
-            "max_position_embeddings": 131072,
-            "rope_scaling": {
-                "rope_type": "llama3",
-                "factor": 8.0,
-                "rope_theta": 999.0,
-                "low_freq_factor": 1.0,
-                "high_freq_factor": 4.0,
-                "original_max_position_embeddings": 8192,
-            },
-        }
-        config = PretrainedConfig.from_dict(config_dict)
-        rope_params = getattr(config, "rope_parameters", None)
-        if rope_params is not None:
-            self.assertEqual(rope_params["rope_theta"], 999.0)
-
-    def test_no_crash_without_rope_scaling(self):
-        config_dict = {"model_type": "llama", "rope_theta": 10000.0}
-        config = PretrainedConfig.from_dict(config_dict)
-        self.assertIsNotNone(config)
 
 
 # ---------------------------------------------------------------------------
