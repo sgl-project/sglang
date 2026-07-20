@@ -93,19 +93,9 @@ SGLang integrates [Cache-DiT](https://github.com/vipshop/cache-dit), a caching a
 
 **Basic Usage**
 
-<Tabs>
-  <Tab title="NVIDIA B200">
-    ```bash Command
-    SGLANG_CACHE_DIT_ENABLED=true sglang serve --model-path black-forest-labs/FLUX.1-dev
-    ```
-  </Tab>
-  <Tab title="Ascend A3">
-    ```bash Command
-    SGLANG_CACHE_DIT_ENABLED=true \
-    sglang serve --tp-size 2 --sp-degree 1 --model-path "/models/black-forest-labs/FLUX.1-dev" --port 8764 --num-gpus 2
-    ```
-  </Tab>
-</Tabs>
+```bash Command
+SGLANG_CACHE_DIT_ENABLED=true sglang serve --model-path black-forest-labs/FLUX.1-dev
+```
 
 **Advanced Usage**
 
@@ -195,34 +185,17 @@ SGLang integrates [Cache-DiT](https://github.com/vipshop/cache-dit), a caching a
 
   Combined Configuration Example:
 
-<Tabs>
-  <Tab title="NVIDIA B200">
-    ```bash Command
-    SGLANG_CACHE_DIT_ENABLED=true \
-    SGLANG_CACHE_DIT_FN=2 \
-    SGLANG_CACHE_DIT_BN=1 \
-    SGLANG_CACHE_DIT_WARMUP=4 \
-    SGLANG_CACHE_DIT_RDT=0.4 \
-    SGLANG_CACHE_DIT_MC=4 \
-    SGLANG_CACHE_DIT_TAYLORSEER=true \
-    SGLANG_CACHE_DIT_TS_ORDER=2 \
-    sglang serve --model-path black-forest-labs/FLUX.1-dev
-    ```
-  </Tab>
-  <Tab title="Ascend A3">
-    ```bash Command
-    SGLANG_CACHE_DIT_ENABLED=true \
-    SGLANG_CACHE_DIT_FN=2 \
-    SGLANG_CACHE_DIT_BN=1 \
-    SGLANG_CACHE_DIT_WARMUP=4 \
-    SGLANG_CACHE_DIT_RDT=0.4 \
-    SGLANG_CACHE_DIT_MC=4 \
-    SGLANG_CACHE_DIT_TAYLORSEER=true \
-    SGLANG_CACHE_DIT_TS_ORDER=2 \
-    sglang serve --tp-size 2 --sp-degree 1 --model-path "/models/black-forest-labs/FLUX.1-dev" --port 8764 --num-gpus 2
-    ```
-  </Tab>
-</Tabs>
+```bash Command
+SGLANG_CACHE_DIT_ENABLED=true \
+SGLANG_CACHE_DIT_FN=2 \
+SGLANG_CACHE_DIT_BN=1 \
+SGLANG_CACHE_DIT_WARMUP=4 \
+SGLANG_CACHE_DIT_RDT=0.4 \
+SGLANG_CACHE_DIT_MC=4 \
+SGLANG_CACHE_DIT_TAYLORSEER=true \
+SGLANG_CACHE_DIT_TS_ORDER=2 \
+sglang serve --model-path black-forest-labs/FLUX.1-dev
+```
 
 #### 4.2.2 CPU Offload
 

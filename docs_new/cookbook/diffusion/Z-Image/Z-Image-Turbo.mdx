@@ -177,34 +177,17 @@ SGLANG_CACHE_DIT_ENABLED=true sglang serve --model-path Tongyi-MAI/Z-Image-Turbo
 
   Combined Configuration Example:
 
-<Tabs>
-  <Tab title="AMD MI300X">
-    ```bash Command
-    SGLANG_CACHE_DIT_ENABLED=true \
-    SGLANG_CACHE_DIT_FN=2 \
-    SGLANG_CACHE_DIT_BN=1 \
-    SGLANG_CACHE_DIT_WARMUP=4 \
-    SGLANG_CACHE_DIT_RDT=0.4 \
-    SGLANG_CACHE_DIT_MC=4 \
-    SGLANG_CACHE_DIT_TAYLORSEER=true \
-    SGLANG_CACHE_DIT_TS_ORDER=2 \
-    sglang serve --model-path Tongyi-MAI/Z-Image-Turbo
-    ```
-  </Tab>
-  <Tab title="Ascend A3">
-    ```bash Command
-    SGLANG_CACHE_DIT_ENABLED=true \
-    SGLANG_CACHE_DIT_FN=2 \
-    SGLANG_CACHE_DIT_BN=1 \
-    SGLANG_CACHE_DIT_WARMUP=4 \
-    SGLANG_CACHE_DIT_RDT=0.4 \
-    SGLANG_CACHE_DIT_MC=4 \
-    SGLANG_CACHE_DIT_TAYLORSEER=true \
-    SGLANG_CACHE_DIT_TS_ORDER=2 \
-    sglang serve --model-path /models/Tongyi-MAI/Z-Image-Turbo/Z-Image-Turbo --tp-size 2 --sp-degree 1 --num-gpus 2 --port 30069
-    ```
-  </Tab>
-</Tabs>
+```bash Command
+SGLANG_CACHE_DIT_ENABLED=true \
+SGLANG_CACHE_DIT_FN=2 \
+SGLANG_CACHE_DIT_BN=1 \
+SGLANG_CACHE_DIT_WARMUP=4 \
+SGLANG_CACHE_DIT_RDT=0.4 \
+SGLANG_CACHE_DIT_MC=4 \
+SGLANG_CACHE_DIT_TAYLORSEER=true \
+SGLANG_CACHE_DIT_TS_ORDER=2 \
+sglang serve --model-path Tongyi-MAI/Z-Image-Turbo
+```
 
 #### 4.2.2 CPU Offload
 

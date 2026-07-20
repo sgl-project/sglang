@@ -137,92 +137,30 @@
 
     
         if (hardware === 'ascend2' || hardware === 'ascend3') {
-          if (task === 't2v') {
-            if (hardware === 'ascend2') {
-              return `sglang generate \\
-  --model-path /models/Wan-AI/Wan2.2-T2V-A14B-Diffusers/ \\
-  --prompt "Two anthropomorphic cats in comfy boxing gear and bright gloves fight intensely on a spotlighted stage." \\
-  --height 720 \\
-  --width 1280 \\
-  --tp-size 2 \\
-  --sp-degree 4 \\
-  --num-gpus 8 \\
-  --num-frames 81 \\
-  --num-inference-steps 40 \\
-  --warmup true`;
-            }
+          const numGpus = bestPractice === 'on' ? 4 : 2;
 
-            return `sglang generate \\
-  --model-path /models/Wan-AI/Wan2.2-T2V-A14B-Diffusers/ \\
-  --prompt "Two anthropomorphic cats in comfy boxing gear and bright gloves fight intensely on a spotlighted stage." \\
-  --height 720 \\
-  --width 1280 \\
+          if (task === 't2v') {
+            return `sglang serve \\
+  --model-path /home/weights/Wan2.2-T2V-A14B-Diffusers/ \\
   --tp-size 2 \\
-  --sp-degree 1 \\
-  --num-gpus 2 \\
-  --num-frames 81 \\
-  --num-inference-steps 40 \\
-  --warmup true`;
+  --sp-degree 2 \\
+  --num-gpus ${numGpus}`;
           }
 
           if (task === 'i2v') {
-            if (hardware === 'ascend2') {
-              return `sglang generate \\
-  --model-path /models/Wan-AI/Wan2.2-I2V-A14B-Diffusers/ \\
-  --prompt "Summer beach vacation style, a white cat wearing sunglasses sits on a surfboard. The fluffy-furred feline gazes directly at the camera with a relaxed expression. Blurred beach scenery forms the background featuring crystal-clear waters, distant green hills, and a blue sky dotted with white clouds. The cat assumes a naturally relaxed posture, as if savoring the sea breeze and warm sunlight. A close-up shot highlights the feline's intricate details and the refreshing atmosphere of the seaside." \\
-  --height 720 \\
-  --width 1280 \\
+            return `sglang serve \\
+  --model-path /home/weights/Wan2.2-I2V-A14B-Diffusers/ \\
   --tp-size 2 \\
   --sp-degree 2 \\
-  --num-gpus 4 \\
-  --num-frames 81 \\
-  --num-inference-steps 40 \\
-  --image-path /workspace/outputs/outputs/A_beautiful_sunset_over_the_ocean_retrowave_4_k_hd_wallpaper_20260714-132705_1b826001.png \\
-  --warmup true`;
-            }
-
-            return `sglang generate \\
-  --model-path /models/Wan-AI/Wan2.2-I2V-A14B-Diffusers/ \\
-  --prompt "Summer beach vacation style, a white cat wearing sunglasses sits on a surfboard. The fluffy-furred feline gazes directly at the camera with a relaxed expression. Blurred beach scenery forms the background featuring crystal-clear waters, distant green hills, and a blue sky dotted with white clouds. The cat assumes a naturally relaxed posture, as if savoring the sea breeze and warm sunlight. A close-up shot highlights the feline's intricate details and the refreshing atmosphere of the seaside." \\
-  --height 720 \\
-  --width 1280 \\
-  --tp-size 2 \\
-  --sp-degree 1 \\
-  --num-gpus 2 \\
-  --num-frames 81 \\
-  --num-inference-steps 40 \\
-  --image-path /workspace/outputs/outputs/A_beautiful_sunset_over_the_ocean_retrowave_4_k_hd_wallpaper_20260714-132705_1b826001.png \\
-  --warmup true`;
+  --num-gpus ${numGpus}`;
           }
 
           if (task === 'ti2v') {
-            if (hardware === 'ascend2') {
-              return `SGLANG_CACHE_DIT_FN=2 \\
-SGLANG_CACHE_DIT_BN=1 \\
-SGLANG_CACHE_DIT_WARMUP=4 \\
-SGLANG_CACHE_DIT_RDT=0.4 \\
-SGLANG_CACHE_DIT_MC=4 \\
-SGLANG_CACHE_DIT_TAYLORSEER=true \\
-SGLANG_CACHE_DIT_TS_ORDER=2 \\
-SGLANG_CACHE_DIT_ENABLED=true \\
-sglang generate \\
-  --model-path /models/Wan-AI/Wan2.2-TI2V-5B-Diffusers/ \\
-  --prompt "Summer beach vacation style, a white cat wearing sunglasses sits on a surfboard. The fluffy-furred feline gazes directly at the camera with a relaxed expression. Blurred beach scenery forms the background featuring crystal-clear waters, distant green hills, and a blue sky dotted with white clouds. The cat assumes a naturally relaxed posture, as if savoring the sea breeze and warm sunlight. A close-up shot highlights the feline's intricate details and the refreshing atmosphere of the seaside." \\
-  --image-path /home/memelin/projects/mindie/Wan2.2/examples/i2v_input.JPG \\
-  --sp-degree 8 \\
-  --num-gpus 8 \\
-  --warmup true`;
-            }
-
-            return `ЗАГЛУШКА: Wan2.2 TI2V 5B on Ascend A3 needs retesting. Use 2 cards / 4 devices for the next validation.
-
-sglang generate \\
-  --model-path /models/Wan-AI/Wan2.2-TI2V-5B-Diffusers/ \\
-  --prompt "Summer beach vacation style, a white cat wearing sunglasses sits on a surfboard. The fluffy-furred feline gazes directly at the camera with a relaxed expression. Blurred beach scenery forms the background featuring crystal-clear waters, distant green hills, and a blue sky dotted with white clouds. The cat assumes a naturally relaxed posture, as if savoring the sea breeze and warm sunlight. A close-up shot highlights the feline's intricate details and the refreshing atmosphere of the seaside." \\
-  --image-path /workspace/outputs/outputs/A_beautiful_sunset_over_the_ocean_retrowave_4_k_hd_wallpaper_20260714-132705_1b826001.png \\
-  --sp-degree 4 \\
-  --num-gpus 4 \\
-  --warmup true`;
+            return `sglang serve \\
+  --model-path /home/weights/Wan2.2-TI2V-5B-Diffusers/ \\
+  --tp-size 2 \\
+  --sp-degree 2 \\
+  --num-gpus ${numGpus}`;
           }
         }
         let command = `sglang serve \\\n  --model-path ${config.repoId} \\\n  --dit-layerwise-offload true`;
