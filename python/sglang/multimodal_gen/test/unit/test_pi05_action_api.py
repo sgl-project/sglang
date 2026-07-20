@@ -4,6 +4,7 @@ import dataclasses
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from sglang.multimodal_gen.configs.pipeline_configs.pi05 import Pi05PipelineConfig
 from sglang.multimodal_gen.configs.sample.pi05 import Pi05SamplingParams
@@ -20,6 +21,15 @@ from sglang.multimodal_gen.runtime.entrypoints.vla.protocol import (
     pack_msgpack,
     unpack_msgpack,
 )
+
+
+def _msgpack_available() -> bool:
+    try:
+        import msgpack  # noqa: F401
+
+        return True
+    except ModuleNotFoundError:
+        return False
 
 
 def _server_args(config: Pi05PipelineConfig | None = None) -> SimpleNamespace:
@@ -227,6 +237,11 @@ def test_action_raw_response_can_preserve_numpy_for_msgpack():
     assert response["actions"] is actions
 
 
+@pytest.mark.skipif(
+    not _msgpack_available(),
+    reason="Requires the optional `msgpack` dependency (absent in the ROCm "
+    "7.2.0 CI image; present on CUDA and ROCm 7.0.0).",
+)
 def test_msgpack_roundtrip_preserves_string_keys_and_numpy_payloads():
     payload = {
         "task": "pick",

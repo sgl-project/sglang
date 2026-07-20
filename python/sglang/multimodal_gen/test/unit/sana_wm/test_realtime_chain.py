@@ -34,6 +34,16 @@ from sglang.multimodal_gen.runtime.server_args import set_global_server_args
 MC = 8
 
 
+def _lapack_available() -> bool:
+    # torch.linalg.inv/lu_factor on CPU tensors needs a LAPACK-backed torch
+    # build. The ROCm CI image lacks it; CUDA builds have it.
+    try:
+        torch.linalg.inv(torch.eye(2))
+        return True
+    except RuntimeError:
+        return False
+
+
 class _TestRealtimeStage(SanaWMRealtimeStage):
     def forward(self, batch, server_args):
         raise NotImplementedError
@@ -123,6 +133,11 @@ def test_realtime_first_frame_uses_requested_size():
     assert crop_offset == (10, 0)
 
 
+@pytest.mark.skipif(
+    not _lapack_available(),
+    reason="torch.linalg.inv/lu_factor needs a LAPACK-backed torch build "
+    "(absent in the ROCm CI image; present on CUDA).",
+)
 def test_realtime_camera_conditioning_uses_requested_size():
     stage = _camera_stage()
     inputs = SanaWMSessionInputsState()

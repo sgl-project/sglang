@@ -67,6 +67,23 @@ _SANA_WM_REFINER_STAGE_MODULE = (
 )
 
 
+def _lapack_available() -> bool:
+    # torch.linalg.inv/lu_factor on CPU tensors needs a LAPACK-backed torch
+    # build. The ROCm CI image lacks it; CUDA builds have it.
+    try:
+        torch.linalg.inv(torch.eye(2))
+        return True
+    except RuntimeError:
+        return False
+
+
+_REQUIRES_LAPACK = unittest.skipUnless(
+    _lapack_available(),
+    "torch.linalg.inv/lu_factor needs a LAPACK-backed torch build "
+    "(absent in the ROCm CI image; present on CUDA).",
+)
+
+
 class _GlobalStageArgsMixin:
     def setUp(self) -> None:
         super().setUp()
@@ -654,6 +671,7 @@ class TestSanaWMBeforeDenoisingStage(_GlobalStageArgsMixin, unittest.TestCase):
         self.assertTrue(torch.equal(out[0, :, :1], torch.ones(128, 1, 22, 40)))
         self.assertTrue(torch.equal(out[1, :, :1], torch.full((128, 1, 22, 40), 2.0)))
 
+    @_REQUIRES_LAPACK
     def test_default_static_camera_builds_latent_raymap_and_chunk_plucker(self) -> None:
         stage = SanaWMBeforeDenoisingStage(
             vae=None,
@@ -685,6 +703,7 @@ class TestSanaWMBeforeDenoisingStage(_GlobalStageArgsMixin, unittest.TestCase):
             )
         )
 
+    @_REQUIRES_LAPACK
     def test_request_intrinsics_are_transformed_for_condition_image_crop(self) -> None:
         stage = SanaWMBeforeDenoisingStage(
             vae=None,
@@ -738,6 +757,7 @@ class TestSanaWMBeforeDenoisingStage(_GlobalStageArgsMixin, unittest.TestCase):
 
         self.assertTrue(SanaWMBeforeDenoisingStage._has_explicit_camera_request(batch))
 
+    @_REQUIRES_LAPACK
     def test_action_conditioning_uses_existing_camera_path(self) -> None:
         stage = SanaWMBeforeDenoisingStage(
             vae=None,
@@ -781,6 +801,7 @@ class TestSanaWMBeforeDenoisingStage(_GlobalStageArgsMixin, unittest.TestCase):
             places=5,
         )
 
+    @_REQUIRES_LAPACK
     def test_camera_conditioning_accepts_unbatched_chunk_plucker(self) -> None:
         stage = SanaWMBeforeDenoisingStage(
             vae=None,
@@ -836,6 +857,7 @@ class TestSanaWMBeforeDenoisingStage(_GlobalStageArgsMixin, unittest.TestCase):
         self.assertEqual(camera_conditions.shape, (1, 3, 20))
         self.assertEqual(chunk_plucker.shape, (1, 48, 3, 12, 20))
 
+    @_REQUIRES_LAPACK
     def test_camera_conditioning_rejects_bad_prepacked_shapes(self) -> None:
         stage = SanaWMBeforeDenoisingStage(
             vae=None,

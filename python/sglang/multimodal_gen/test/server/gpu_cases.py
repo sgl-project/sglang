@@ -962,6 +962,10 @@ _AMD_READY_NESTED_UNIT_TESTS = (
     "progressive_resolution/test_progressive.py",
     "realtime/test_lingbot_causal_denoising.py",
     "sana_wm/test_streaming_realtime_path.py",
+    # Enabled with a LAPACK-availability skip (camera-pose tests use
+    # torch.linalg.inv; they run on ROCm 7.2.0/CUDA and skip on ROCm 7.0.0).
+    "sana_wm/test_pipeline_config.py",
+    "sana_wm/test_realtime_chain.py",
 )
 
 
