@@ -761,23 +761,6 @@ def commit_mamba_states_after_verify(
                 mamba_steps_to_track=mamba_steps_to_track,
             )
 
-        # After committing the mamba state at the track boundary, flip the
-        # ping-pong index on each request whose boundary was crossed so the
-        # next verify cycle writes to the other slot. Non-spec decode does the
-        # same flip in prepare_for_decode; spec decode was missing it.
-        if mamba_steps_to_track is not None:
-            to_track = to_track_mask.cpu().tolist()
-            pool = batch.req_to_token_pool
-            if (
-                getattr(pool, "get_mamba_ping_pong_other_idx", None)
-                and not get_global_server_args().enable_mamba_extra_buffer_lazy()
-            ):
-                for i, req in enumerate(batch.reqs):
-                    if to_track[i] and req.mamba_next_track_idx is not None:
-                        req.mamba_next_track_idx = pool.get_mamba_ping_pong_other_idx(
-                            req.mamba_next_track_idx
-                        )
-
 
 def spec_prepare_for_decode(batch: ScheduleBatch) -> None:
     """eagle/ngram share a stateless free function; dflash keeps stateful

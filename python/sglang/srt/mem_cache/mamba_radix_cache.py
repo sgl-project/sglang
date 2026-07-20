@@ -515,9 +515,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         value, last_node, best_value_len = self._match_prefix_helper(key)
         return self._match_post_processor(params, value, last_node, best_value_len)
 
-    def insert(
-        self, params: InsertParams, *, take_value_ownership: bool = False
-    ) -> InsertResult:
+    def insert(self, params: InsertParams) -> InsertResult:
         if self.disable:
             return InsertResult(prefix_len=0, mamba_exist=False)
 
@@ -529,13 +527,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         if value is None:
             value = torch.tensor([x for x in key.raw_token_ids()], dtype=torch.int64)
         prefix_len, mamba_exist = self._insert_helper(
-            self.root_node,
-            key,
-            value,
-            mamba_value,
-            params.chunked,
-            prev_prefix_len,
-            take_value_ownership,
+            self.root_node, key, value, mamba_value, params.chunked, prev_prefix_len
         )
         return InsertResult(prefix_len=prefix_len, mamba_exist=mamba_exist)
 
@@ -570,16 +562,8 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                 if write_pos_buf is not None:
                     cache_len -= int(write_pos_buf[req.mamba_pool_idx].item())
                     write_pos_buf[req.mamba_pool_idx] = 0
-            if cache_len is None or cache_len == 0:
-                # Nothing to cache: free KV and mamba slots without inserting
-                # a key_len=0 ghost node into the radix tree. Such empty nodes
-                # poison subsequent match_prefix calls by serving as a stale
-                # mamba COW source with best_value_len=0 (see cache_finished_req
-                # of a short request with no track boundary).
-                self.token_to_kv_pool_allocator.free(kv_indices)
-                self.req_to_token_pool.free_mamba_cache(req)
-                self.dec_lock_ref(req.last_node)
-                return
+            if cache_len is None:
+                cache_len = 0
             if cache_len != len(token_ids):
                 cache_end_idx = max(cache_len, req.cache_protected_len)
                 self.token_to_kv_pool_allocator.free(kv_indices[cache_end_idx:])
@@ -636,8 +620,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                     value=page_aligned_kv_indices,
                     mamba_value=mamba_value,
                     prev_prefix_len=req.cache_protected_len,
-                ),
-                take_value_ownership=True,
+                )
             )
             mamba_exist = result.mamba_exist
             if mamba_exist and self.int8_ckpt_pool is not None:
@@ -745,8 +728,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                 mamba_value=mamba_value_donated,
                 prev_prefix_len=req.cache_protected_len,
                 chunked=chunked,
-            ),
-            take_value_ownership=True,
+            )
         )
         new_prefix_len, mamba_exist = result.prefix_len, result.mamba_exist
         if mamba_exist:
@@ -1230,7 +1212,6 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         mamba_value,
         chunked: bool = False,
         prev_prefix_len: int = 0,
-        take_value_ownership: bool = False,
     ) -> Tuple[int, bool]:
         # Refresh the full LRU from root to leaf (the whole path is reused as prefix).
         # The mamba states of these existing nodes were not recomputed this insert, so
@@ -1272,16 +1253,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             new_node = TreeNode()
             new_node.parent = node
             new_node.key = key
-            # cache_finished_req/cache_unfinished_req pass a dedicated int64
-            # tensor that is no longer used by the caller. Avoid cloning it
-            # when the whole tensor becomes a new leaf. If a prefix was
-            # consumed, keep cloning the suffix so the node does not retain
-            # the backing storage for the already-matched prefix.
-            new_node.value = (
-                value
-                if take_value_ownership and total_prefix_length == 0
-                else value.clone()
-            )
+            new_node.value = value.clone()
             new_node.mamba_value = mamba_value
             self.full_lru_list.insert_mru(new_node)
             self.mamba_lru_list.insert_mru(new_node)
