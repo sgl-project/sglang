@@ -682,6 +682,8 @@ class SchedulerBatchResultProcessor:
                 result.num_correct_drafts,
                 num_block_accept_tokens=result.num_block_accept_tokens,
                 num_cap_tokens=result.num_cap_tokens,
+                num_correct_drafts_per_req=result.num_correct_drafts_per_req_cpu,
+                num_draft_tokens=result.speculative_num_draft_tokens,
             )
         if self.server_args.enable_metrics:
             self.metrics_collector.increment_decode_cuda_graph_pass(

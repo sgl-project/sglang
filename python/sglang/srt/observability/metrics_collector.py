@@ -111,6 +111,9 @@ class SchedulerStats:
     spec_accept_rate: float = 0.0
     spec_cap_length: float = 0.0
     spec_block_accept_length: float = 0.0
+    spec_accept_rate_per_position: List[float] = field(default_factory=list)
+    spec_total_accept_rate_per_position: List[float] = field(default_factory=list)
+    spec_total_accept_length: float = 0.0
     # Adaptive speculative decoding (currently active tier).
     spec_num_steps: int = 0
     spec_num_draft_tokens: int = 0
@@ -422,6 +425,24 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self.spec_accept_rate = Gauge(
             name="sglang:spec_accept_rate",
             documentation="Speculative acceptance rate (`accepted drafts / proposed drafts` in batch).",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.spec_accept_rate_per_position = Gauge(
+            name="sglang:spec_accept_rate_per_position",
+            documentation="Per-position conditional acceptance rate of speculative decoding in the latest reporting window.",
+            labelnames=[*labels.keys(), "position"],
+            multiprocess_mode="mostrecent",
+        )
+        self.spec_total_accept_rate_per_position = Gauge(
+            name="sglang:spec_total_accept_rate_per_position",
+            documentation="Per-position conditional acceptance rate of speculative decoding over the reporter lifetime.",
+            labelnames=[*labels.keys(), "position"],
+            multiprocess_mode="mostrecent",
+        )
+        self.spec_total_accept_length = Gauge(
+            name="sglang:spec_total_accept_length",
+            documentation="Mean speculative acceptance length over the reporter lifetime (accepted drafts plus bonus token).",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -1301,6 +1322,17 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         # Speculative decoding
         self._log_gauge(self.spec_accept_length, stats.spec_accept_length)
         self._log_gauge(self.spec_accept_rate, stats.spec_accept_rate)
+        for position, rate in enumerate(stats.spec_accept_rate_per_position, start=1):
+            self.spec_accept_rate_per_position.labels(
+                **self.labels, position=str(position)
+            ).set(rate)
+        for position, rate in enumerate(
+            stats.spec_total_accept_rate_per_position, start=1
+        ):
+            self.spec_total_accept_rate_per_position.labels(
+                **self.labels, position=str(position)
+            ).set(rate)
+        self._log_gauge(self.spec_total_accept_length, stats.spec_total_accept_length)
         self._log_gauge(self.spec_cap_length, stats.spec_cap_length)
         self._log_gauge(self.spec_block_accept_length, stats.spec_block_accept_length)
         self._log_gauge(self.spec_num_steps, stats.spec_num_steps)
