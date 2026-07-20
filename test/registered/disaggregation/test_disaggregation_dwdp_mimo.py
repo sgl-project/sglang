@@ -52,7 +52,7 @@ class TestDisaggregationDWDPMiMo(PDDisaggregationServerBase):
             "--attention-backend",
             "fa4",
             "--mem-fraction-static",
-            "0.85",
+            "0.78",
         ]
         prefill_args += cls.transfer_backend + cls.rdma_devices
         cls.process_prefill = popen_launch_pd_server(
@@ -82,7 +82,7 @@ class TestDisaggregationDWDPMiMo(PDDisaggregationServerBase):
             "--attention-backend",
             "fa4",
             "--mem-fraction-static",
-            "0.85",
+            "0.78",
             "--base-gpu-id",
             str(cls.NUM_PREFILL_GPUS),
         ]
