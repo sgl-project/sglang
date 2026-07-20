@@ -285,6 +285,13 @@ sgl-eval run aime25 \\
       ],
     },
     {
+      // Memory-bound — throughput can't beat balanced here, and the Blackwell HT
+      // optimization does NOT apply. GLM-5.2-FP8 weights occupy ~76% of each H200's 143GB
+      // (min mem-fraction-static ~0.76), leaving KV for only ~256 concurrent requests.
+      // There's no headroom to grow the batch (a bigger DeepEP buffer + uncapped batch
+      // OOMs the CUDA-graph capture), so HT keeps the 256 cap. At conc 1024/4096 the excess
+      // just queues — very high TTFT for no throughput gain. Genuinely higher tok/s/GPU on
+      // H200 would require smaller weights (e.g. NVFP4) to free KV.
       match: { hw: "h200", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
       verified: true,
       env: [],
@@ -344,17 +351,20 @@ sgl-eval run aime25 \\
       ],
     },
     {
+      // Blackwell HT: raise the DeepEP dispatch buffer (default 128) and drop the
+      // --max-running-requests cap so the engine sizes the running batch to KV
+      // (~560 concurrent here, vs the old 256 cap). mem-fraction-static drops 0.85->0.80
+      // to leave room for the larger decode CUDA-graph capture. Trades TTFT for throughput.
       match: { hw: "b200", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
       verified: true,
-      env: [],
+      env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=512"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
         "--dp 8",
         "--enable-dp-attention",
         "--moe-a2a-backend deepep",
-        "--mem-fraction-static 0.85",
-        "--max-running-requests 256",
+        "--mem-fraction-static 0.80",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -465,17 +475,20 @@ sgl-eval run aime25 \\
       ],
     },
     {
+      // Blackwell HT: raise the DeepEP dispatch buffer (default 128) and drop the
+      // --max-running-requests cap so the engine sizes the running batch to KV
+      // (~1700+ concurrent here; GLM's DSA keeps KV cheap). mem-fraction-static 0.85->0.80
+      // leaves room for the larger decode CUDA-graph capture. Trades TTFT for throughput.
       match: { hw: "b300", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
       verified: true,
-      env: [],
+      env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=512"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
         "--dp 8",
         "--enable-dp-attention",
         "--moe-a2a-backend deepep",
-        "--mem-fraction-static 0.85",
-        "--max-running-requests 256",
+        "--mem-fraction-static 0.80",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],

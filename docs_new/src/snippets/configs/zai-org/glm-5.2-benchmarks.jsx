@@ -61,9 +61,9 @@ export const benchmarks = [
     sglang_version: "0.5.15",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1024 },
-        ttft_ms: 209794, tpot_ms: 46.77, tokens_per_sec_per_gpu: 4171 },
+        ttft_ms: 131858, tpot_ms: 87.27, tokens_per_sec_per_gpu: 5065 },
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 4096 },
-        ttft_ms: 1031213, tpot_ms: 47.9, tokens_per_sec_per_gpu: 4216 },
+        ttft_ms: 746012, tpot_ms: 84.66, tokens_per_sec_per_gpu: 5164 },
     ],
   },
   // ---- GB300 + FP8 ----  (4-GPU single node, TP4; real weights, --random-range-ratio 1.0, flush-cache every run)
@@ -130,9 +130,9 @@ export const benchmarks = [
     sglang_version: "0.5.15",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1024 },
-        ttft_ms: 201346, tpot_ms: 45.51, tokens_per_sec_per_gpu: 4320 },
+        ttft_ms: 67214, tpot_ms: 115.16, tokens_per_sec_per_gpu: 6353 },
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 4096 },
-        ttft_ms: 990502, tpot_ms: 46.48, tokens_per_sec_per_gpu: 4376 },
+        ttft_ms: 391273, tpot_ms: 259.62, tokens_per_sec_per_gpu: 6578 },
     ],
   },
   // ---- B300 + BF16 ----  (unquantized zai-org/GLM-5.2, TP8; serve recipe in glm-5.2.jsx; benchmark pending re-measurement)
