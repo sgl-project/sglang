@@ -411,6 +411,30 @@ class MultimodalDataItem:
             self.feature.acknowledge_consumption(consumer_count)
 
 
+def compute_image_patch_tokens(mm_items: List[MultimodalDataItem]) -> List[int]:
+    """Return post-alignment raw ViT patch counts for all image items."""
+    patch_tokens = []
+    for item in mm_items:
+        if not item.is_image():
+            continue
+
+        grid_thw = item.model_specific_data.get("image_grid_thw")
+        if grid_thw is None:
+            grid_thw = item.model_specific_data.get("image_grid_hws")
+        if grid_thw is None:
+            continue
+
+        if isinstance(grid_thw, torch.Tensor):
+            grid_thw = grid_thw.detach().cpu().numpy()
+        else:
+            grid_thw = np.asarray(grid_thw)
+        if grid_thw.ndim == 1:
+            grid_thw = grid_thw.reshape(1, -1)
+        patch_tokens.extend(np.prod(grid_thw, axis=-1, dtype=np.int64).tolist())
+
+    return [int(value) for value in patch_tokens]
+
+
 @dataclasses.dataclass
 class MultimodalProcessorOutput:
     """Raw output from multimodal processors before scheduler-side preparation (pad, hash).
@@ -449,6 +473,11 @@ class MultimodalProcessorOutput:
     media_nums_per_sample: Optional[List[int]] = None
     visible_frame_counts: Optional[torch.Tensor] = None
 
+    # Raw ViT patch counts for every image in this request. This is populated
+    # after image resizing/alignment, so it is a better admission signal than
+    # image count or encoded file size.
+    image_patch_tokens: Optional[List[int]] = None
+
     # for transformers-compatibility
     token_type_ids: Optional[torch.Tensor] = None
 
@@ -472,6 +501,7 @@ class MultimodalProcessorOutput:
             vision_position_ids=d.get("vision_position_ids"),
             media_nums_per_sample=d.get("media_nums_per_sample"),
             visible_frame_counts=d.get("visible_frame_counts"),
+            image_patch_tokens=d.get("image_patch_tokens"),
         )
 
     @staticmethod
@@ -529,6 +559,7 @@ class MultimodalInputs:
     vision_position_ids: Optional[torch.Tensor] = None
     media_nums_per_sample: Optional[List[int]] = None
     visible_frame_counts: Optional[torch.Tensor] = None
+    image_patch_tokens: Optional[List[int]] = None
 
     def release_features(self):
         """Release feature tensors to free GPU memory."""
@@ -599,6 +630,7 @@ class MultimodalInputs:
             "vision_position_ids",
             "media_nums_per_sample",
             "visible_frame_counts",
+            "image_patch_tokens",
         ]
         for arg in optional_args:
             val = getattr(obj, arg, None)
@@ -618,6 +650,11 @@ class MultimodalInputs:
 
     def contains_mm_input(self) -> bool:
         return any(True for item in self.mm_items if item.is_valid())
+
+    def total_image_patch_tokens(self) -> int:
+        if self.image_patch_tokens is None:
+            self.image_patch_tokens = compute_image_patch_tokens(self.mm_items)
+        return sum(self.image_patch_tokens)
 
     def compute_mm_token_counts(self) -> Tuple[int, int, int]:
         """Count prompt tokens consumed by each modality (image, audio, video).
@@ -647,6 +684,7 @@ class MultimodalInputs:
         optional_args = [
             "mm_items",
             "image_pad_len",
+            "image_patch_tokens",
         ]
         for arg in optional_args:
             self_arg = getattr(self, arg, None)

@@ -2926,6 +2926,7 @@ class Scheduler(
             max_prefill_bs=self.max_prefill_bs,
             max_running_requests=self.max_running_requests,
             prefill_max_requests=self.server_args.prefill_max_requests,
+            max_prefill_mm_patch_tokens=self.server_args.max_prefill_mm_patch_tokens,
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),

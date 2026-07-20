@@ -89,7 +89,10 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
 from sglang.srt.managers.mm_utils import TensorTransportMode, wrap_shm_features
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
-from sglang.srt.managers.schedule_batch import MultimodalDataItem
+from sglang.srt.managers.schedule_batch import (
+    MultimodalDataItem,
+    compute_image_patch_tokens,
+)
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
 from sglang.srt.managers.tokenizer_control_mixin import TokenizerControlMixin
 from sglang.srt.managers.tokenizer_manager_score_mixin import TokenizerManagerScoreMixin
@@ -925,6 +928,28 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     input_text=(input_text or input_ids),
                     request_obj=obj,
                     max_req_input_len=self.max_req_input_len,
+                )
+
+            if mm_inputs:
+                image_patch_tokens = compute_image_patch_tokens(mm_inputs.mm_items)
+                mm_inputs.image_patch_tokens = image_patch_tokens
+                total_image_patch_tokens = sum(image_patch_tokens)
+                max_image_patch_tokens = max(image_patch_tokens, default=0)
+                request_limit = self.server_args.max_mm_patch_tokens_per_request
+                if request_limit is not None and total_image_patch_tokens > request_limit:
+                    raise ValueError(
+                        "The multimodal input requires "
+                        f"{total_image_patch_tokens} raw ViT patch tokens after "
+                        f"image alignment, exceeding the per-request limit of "
+                        f"{request_limit}. Reduce the total image resolution."
+                    )
+                logger.debug(
+                    "Multimodal visual cost: rid=%s, images=%d, "
+                    "total_patch_tokens=%d, max_image_patch_tokens=%d",
+                    getattr(obj, "rid", "anonymous_rid"),
+                    len(image_patch_tokens),
+                    total_image_patch_tokens,
+                    max_image_patch_tokens,
                 )
 
             if mm_inputs and mm_inputs.input_ids is not None:
