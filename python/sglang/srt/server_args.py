@@ -3484,6 +3484,7 @@ class ServerArgs:
     def _handle_cuda_graph_config(self):
         self._parse_cuda_graph_config()
         self._apply_cuda_graph_compatibility()
+        self._clamp_prefill_buckets_for_deepep_bcg()
         self._apply_cuda_graph_disaggregation_roles()
         self._validate_cuda_graph_config()
         # Warn on the final resolved config (not inside the compat cascade —
@@ -3494,6 +3495,34 @@ class ServerArgs:
                 "cuda_graph_config[prefill].backend='full' is experimental. "
                 "Use breakable or tc_piecewise for production workloads."
             )
+
+    def _clamp_prefill_buckets_for_deepep_bcg(self):
+        """Breakable prefill under DeepEP runs the MoE as an eager split node
+        whose NORMAL-mode a2a rendezvouses across EP ranks *during capture*,
+        and whose per-break bridge buffers scale with sum(buckets) x layers.
+        A large fine-grained bucket list makes capture exceed DeepEP's CPU
+        recv timeout and blow the capture pool. Clamp to a small coarse list
+        unless the user explicitly chose buckets."""
+        from sglang.srt.arg_groups.overrides import resolved_view as _resolved_view
+
+        if (
+            self.cuda_graph_config.prefill.backend != Backend.BREAKABLE
+            or _resolved_view(self).moe_a2a_backend != "deepep"
+        ):
+            return
+        if (Phase.PREFILL, "bs") in self._cuda_graph_config_locked or (
+            Phase.PREFILL,
+            "max_bs",
+        ) in self._cuda_graph_config_locked:
+            return
+        clamped = [8, 32, 128, 256, 512]
+        self.cuda_graph_config.prefill.bs = clamped
+        self.cuda_graph_config.prefill.max_bs = clamped[-1]
+        logger.info(
+            "Breakable prefill CUDA graph with DeepEP: clamping prefill "
+            "bucket list to %s (override with --cuda-graph-bs-prefill).",
+            clamped,
+        )
 
     def _parse_cuda_graph_config(self):
         """Resolve cuda_graph_config from explicit JSON, per-phase
@@ -3711,9 +3740,15 @@ class ServerArgs:
             # BCG capture + LoRA adapter weights exceed host RAM headroom.
             ("LoRA", lambda: bool(self.lora_paths) or bool(self.enable_lora)),
             # BCG bucket sizes exceed FlashInfer MoE A2A's dispatch cap.
+            # DeepEP is exempt: its MoE runs as an eager split node with
+            # NORMAL-mode a2a between captured segments (see
+            # bcg_deepep_moe_experts); the prefill bucket list is clamped in
+            # _clamp_prefill_buckets_for_deepep_bcg so in-capture rendezvous
+            # and bridge-buffer memory stay bounded. Other a2a backends
+            # (mooncake/nixl/moriep/flashinfer) are unvalidated under BCG.
             (
-                "MoE A2A backend",
-                lambda: _resolved_view(self).moe_a2a_backend != "none",
+                "MoE A2A backend (non-DeepEP)",
+                lambda: _resolved_view(self).moe_a2a_backend not in ("none", "deepep"),
             ),
             # DP-attn × BCG capture/replay not yet validated.
             ("DP attention", lambda: self._resolved().enable_dp_attention),
@@ -4112,6 +4147,17 @@ class ServerArgs:
             else:
                 # MLA backend overhead is much higher than expected with fa3.
                 reserved_mem += 1.5 * 1024
+            from sglang.srt.arg_groups.overrides import resolved_view
+
+            if (
+                prefill_cuda_graph_config.backend == Backend.BREAKABLE
+                and resolved_view(self).moe_a2a_backend == "deepep"
+            ):
+                # Breakable prefill with the DeepEP eager split node retains
+                # per-shape bridge buffers and grows the capture pool to the
+                # eager MoE working set (~8 GB measured at the clamped bucket
+                # list on GLM-5.2-FP8 tp8).
+                reserved_mem += 8 * 1024
 
         return reserved_mem
 
