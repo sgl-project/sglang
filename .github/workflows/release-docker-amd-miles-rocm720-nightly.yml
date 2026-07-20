@@ -17,10 +17,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - gpu_arch: gfx950
-            rocm_tag: rocm720-mi35x
-            sglang_image_tag: v0.5.10-rocm720-mi35x
+        variant:
+          - rocm720-mi35x
     steps:
       - name: Checkout miles repository
         uses: actions/checkout@v4
@@ -29,12 +27,11 @@ jobs:
           ref: main
           fetch-depth: 0
 
+      - name: Record miles commit
+        run: echo "Building from miles main @ $(git rev-parse HEAD)"
+
       - name: Set date
         run: echo "DATE=$(date +%Y%m%d)" >> $GITHUB_ENV
-
-      - name: Record miles commit
-        id: miles
-        run: echo "sha=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
 
       - name: Login to Docker Hub (AMD)
         uses: docker/login-action@v2
@@ -42,17 +39,8 @@ jobs:
           username: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
           password: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
 
-      - name: Build and push miles image to rocm/sgl-dev
+      - name: Build via miles docker/build.py and push dated tag
         run: |
-          base="miles-${{ matrix.rocm_tag }}"
-          dated="${base}-${{ env.DATE }}"
-          echo "IMAGE_TAG=${dated}" >> $GITHUB_ENV
-          echo "Building rocm/sgl-dev:${dated} from miles main @ ${{ steps.miles.outputs.sha }}"
-          docker build . \
-            -f docker/Dockerfile.rocm \
-            --build-arg GPU_ARCH=${{ matrix.gpu_arch }} \
-            --build-arg SGLANG_IMAGE_TAG=${{ matrix.sglang_image_tag }} \
-            --build-arg MILES_COMMIT=${{ steps.miles.outputs.sha }} \
-            -t rocm/sgl-dev:${dated} \
-            --no-cache
-          docker push rocm/sgl-dev:${dated}
+          python3 docker/build.py --variant ${{ matrix.variant }} --image-tag custom --custom-tag miles
+          docker tag  rocm/sgl-dev:miles-${{ matrix.variant }} rocm/sgl-dev:miles-${{ matrix.variant }}-${DATE}
+          docker push rocm/sgl-dev:miles-${{ matrix.variant }}-${DATE}
