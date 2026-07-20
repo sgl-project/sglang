@@ -7,7 +7,7 @@ export const config = {
   latencyPercentile: "P50",
 
   supportedHardware: [
-    "h100", "h200", "b200", "b300", "gb200", "gb300",
+    "h100", "h200", "b200", "b300", "gb300",
     "rtx6000",
     // AMD ROCm — MI300X (Flash FP8) + MI355X (Flash/Pro, FP4/FP8).
     "mi300x", "mi355x",
@@ -142,21 +142,11 @@ sgl-eval run aime25 \\
   ],
 
   // Prepended as `# ...` comments above multi-node commands.
-  multiNodeHints: {
-    gb200: [
-      "The following env vars may be needed depending on your cluster:",
-      "  GLOO_SOCKET_IFNAME=<your-nic>",
-      "  NVSHMEM_ENABLE_NIC_PE_MAPPING=1",
-      "  NVSHMEM_HCA_LIST=<your-hca-list>",
-    ],
-  },
-
   dockerImages: {
     h100:  "lmsysorg/sglang:latest",
     h200:  "lmsysorg/sglang:latest",
     b200:  "lmsysorg/sglang:latest",
     b300:  "lmsysorg/sglang:latest",
-    gb200: "lmsysorg/sglang:latest",
     gb300: "lmsysorg/sglang:latest",
     // AMD daily-updated lmsysorg/sglang-rocm images. Bump the dated tag when you
     // re-verify on a newer build.
@@ -222,7 +212,7 @@ sgl-eval run aime25 \\
           // strategy for experimentation (docs recommend it on high-throughput).
           { id: "megamoe",           label: "MegaMoE",
             flags: ["--moe-a2a-backend megamoe"],
-            requiresHw: ["b200", "b300", "gb200", "gb300"] },
+            requiresHw: ["b200", "b300", "gb300"] },
           { id: "flashinfer_mxfp4",  label: "FlashInfer (MXFP4)",
             flags: ["--moe-runner-backend flashinfer_mxfp4"] },
           { id: "marlin",            label: "Marlin (W4A16)",
@@ -298,11 +288,11 @@ sgl-eval run aime25 \\
             "SGLANG_MOONCAKE_CUSTOM_MEM_POOL=True",
             "MC_FORCE_MNNVL=1",
           ],
-          envWhen: { hw: ["gb200", "gb300"] } },
+          envWhen: { hw: ["gb300"] } },
         { id: "nixl",     label: "NiXL" },
         // MORI-IO transport is AMD-only — hidden on every non-ROCm platform.
         { id: "mori",     label: "MORI",
-          hide: { hw: ["h100", "h200", "b200", "b300", "gb200", "gb300", "rtx6000"] } },
+          hide: { hw: ["h100", "h200", "b200", "b300", "gb300", "rtx6000"] } },
       ],
       // `auto` is a sentinel (emits no --disaggregation-ib-device flag).
       ibDevices: [{ id: "auto", label: "Auto" }, "mlx5_0", "mlx5_7"],
@@ -712,185 +702,6 @@ sgl-eval run aime25 \\
     },
     {
       match: { hw: "b300", variant: "pro", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
-      verified: true,
-      env: [],
-      flags: [
-        "--trust-remote-code",
-        "--model-path {{MODEL_NAME}}",
-        "--tp 8",
-        "--moe-runner-backend flashinfer_trtllm_routed",
-        "--speculative-algorithm EAGLE",
-        "--speculative-num-steps 3",
-        "--speculative-eagle-topk 1",
-        "--speculative-num-draft-tokens 4",
-        "--chunked-prefill-size 8192",
-        "--disable-flashinfer-autotune",
-        "--swa-full-tokens-ratio 0.1",
-        "--mem-fraction-static 0.90",
-        "--host {{HOST_IP}}",
-        "--port {{PORT}}",
-      ],
-    },
-
-    // ====================================================================
-    // GB200 + FP4
-    // ====================================================================
-    {
-      match: { hw: "gb200", variant: "flash", quant: "fp4", strategy: "low-latency", nodes: "single" },
-      verified: true,
-      env: [],
-      flags: [
-        "--trust-remote-code",
-        "--model-path {{MODEL_NAME}}",
-        "--tp 4",
-        "--moe-runner-backend flashinfer_mxfp4",
-        "--speculative-algorithm EAGLE",
-        "--speculative-num-steps 3",
-        "--speculative-eagle-topk 1",
-        "--speculative-num-draft-tokens 4",
-        "--chunked-prefill-size 4096",
-        "--disable-flashinfer-autotune",
-        "--swa-full-tokens-ratio 0.1",
-        "--host {{HOST_IP}}",
-        "--port {{PORT}}",
-      ],
-    },
-    {
-      match: { hw: "gb200", variant: "flash", quant: "fp4", strategy: "balanced", nodes: "single" },
-      verified: true,
-      env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024"],
-      flags: [
-        "--trust-remote-code",
-        "--model-path {{MODEL_NAME}}",
-        "--tp 4",
-        "--dp 4",
-        "--enable-dp-attention",
-        "--moe-a2a-backend deepep",
-        "--speculative-algorithm EAGLE",
-        "--speculative-num-steps 1",
-        "--speculative-eagle-topk 1",
-        "--speculative-num-draft-tokens 2",
-        "--deepep-config '{\"normal_dispatch\":{\"num_sms\":96},\"normal_combine\":{\"num_sms\":96}}'",
-        "--host {{HOST_IP}}",
-        "--port {{PORT}}",
-      ],
-    },
-    {
-      match: { hw: "gb200", variant: "flash", quant: "fp4", strategy: "high-throughput", nodes: "single" },
-      verified: true,
-      env: [
-        "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320",
-      ],
-      flags: [
-        "--trust-remote-code",
-        "--model-path {{MODEL_NAME}}",
-        "--tp 4",
-        "--dp 4",
-        "--enable-dp-attention",
-        "--moe-a2a-backend megamoe",
-        "--host {{HOST_IP}}",
-        "--port {{PORT}}",
-      ],
-    },
-    {
-      match: { hw: "gb200", variant: "pro", quant: "fp4", strategy: "low-latency", nodes: "multi-2" },
-      verified: true,
-      env: [
-        "NCCL_MNNVL_ENABLE=1",
-        "NCCL_CUMEM_ENABLE=1",
-        "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256",
-      ],
-      flags: [
-        "--trust-remote-code",
-        "--model-path {{MODEL_NAME}}",
-        "--tp 8",
-        "--moe-runner-backend flashinfer_mxfp4",
-        "--speculative-algorithm EAGLE",
-        "--speculative-num-steps 3",
-        "--speculative-eagle-topk 1",
-        "--speculative-num-draft-tokens 4",
-        "--chunked-prefill-size 8192",
-        "--disable-flashinfer-autotune",
-        "--swa-full-tokens-ratio 0.1",
-        "--mem-fraction-static 0.90",
-        "--host {{HOST_IP}}",
-        "--port {{PORT}}",
-      ],
-    },
-    {
-      match: { hw: "gb200", variant: "pro", quant: "fp4", strategy: "balanced", nodes: "multi-2" },
-      verified: true,
-      env: [
-        "NCCL_MNNVL_ENABLE=1",
-        "NCCL_CUMEM_ENABLE=1",
-        "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256",
-      ],
-      flags: [
-        "--trust-remote-code",
-        "--model-path {{MODEL_NAME}}",
-        "--tp 8",
-        "--dp 8",
-        "--enable-dp-attention",
-        "--moe-a2a-backend deepep",
-        "--speculative-algorithm EAGLE",
-        "--speculative-num-steps 1",
-        "--speculative-eagle-topk 1",
-        "--speculative-num-draft-tokens 2",
-        "--mem-fraction-static 0.78",
-        "--cuda-graph-max-bs-decode 64",
-        "--max-running-requests 128",
-        "--host {{HOST_IP}}",
-        "--port {{PORT}}",
-      ],
-    },
-    {
-      match: { hw: "gb200", variant: "pro", quant: "fp4", strategy: "high-throughput", nodes: "multi-2" },
-      verified: true,
-      env: [
-        "NCCL_MNNVL_ENABLE=1",
-        "NCCL_CUMEM_ENABLE=1",
-        "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320",
-      ],
-      flags: [
-        "--trust-remote-code",
-        "--model-path {{MODEL_NAME}}",
-        "--tp 8",
-        "--dp 8",
-        "--enable-dp-attention",
-        "--moe-a2a-backend megamoe",
-        "--mem-fraction-static 0.78",
-        "--cuda-graph-max-bs-decode 64",
-        "--max-running-requests 256",
-        "--host {{HOST_IP}}",
-        "--port {{PORT}}",
-      ],
-    },
-
-    // ====================================================================
-    // GB200 + NVFP4
-    // ====================================================================
-    {
-      match: { hw: "gb200", variant: "flash", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
-      verified: true,
-      env: [],
-      flags: [
-        "--trust-remote-code",
-        "--model-path {{MODEL_NAME}}",
-        "--tp 4",
-        "--moe-runner-backend flashinfer_trtllm_routed",
-        "--speculative-algorithm EAGLE",
-        "--speculative-num-steps 3",
-        "--speculative-eagle-topk 1",
-        "--speculative-num-draft-tokens 4",
-        "--chunked-prefill-size 4096",
-        "--disable-flashinfer-autotune",
-        "--swa-full-tokens-ratio 0.1",
-        "--host {{HOST_IP}}",
-        "--port {{PORT}}",
-      ],
-    },
-    {
-      match: { hw: "gb200", variant: "pro", quant: "nvfp4", strategy: "low-latency", nodes: "multi-2" },
       verified: true,
       env: [],
       flags: [
