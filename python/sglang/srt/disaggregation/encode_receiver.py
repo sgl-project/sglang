@@ -852,15 +852,23 @@ class WaitingImageRequest:
             else:
                 self.recv_embedding_data.add(recv_obj)
 
-        # Assemble mm_inputs. Wrapped so an assembly failure releases any pool
-        # slot and still reaches the TP-wide status all-reduce in
-        # _process_waiting_requests instead of raising past it.
+        if not self._assemble_mm_inputs_from_embeddings():
+            return
+        self.recv_socket.close()
+
+    def _assemble_mm_inputs_from_embeddings(self) -> bool:
+        """Pool-stage → get_mm_data → finalize/keep_device → SUCCESS/FAIL.
+
+        Returns False when the pool is full (stay PENDING, retry next tick) or
+        after marking FAIL for an oversized request (socket already closed).
+        Returns True after SUCCESS or an assemble-time FAIL so the caller can
+        close the recv socket. Failures are caught here so they still reach the
+        TP-wide status all-reduce in ``_process_waiting_requests``.
+        """
         try:
             if self.embedding_pool is not None:
                 if not self._try_stage_into_pool():
-                    # Pool full (stay PENDING, retried next tick) or oversize
-                    # (status already FAIL).
-                    return
+                    return False
                 recv_embedding = _view_pool_buffer_by_modality(
                     self.embeddings_buffer,
                     self.recv_embedding_data,
@@ -873,17 +881,10 @@ class WaitingImageRequest:
                 recv_embedding,
                 **self.recv_embedding_data.get_mm_extra_meta(),
             )
-            if self.embeddings_buffer is not None and mm_inputs is not None:
-                # Bind slot release to mm_inputs GC; keep the handle so abort
-                # can release the slot immediately (same as the mooncake path).
-                self._mm_finalizer = weakref.finalize(
-                    mm_inputs, self.embedding_pool.release, self._pool_slot_id
-                )
-                _mark_keep_device_embedding(mm_inputs)
-                # Detach so _cleanup_gpu_buffer no-ops; finalize now owns release.
-                self._pool_slot_id = None
-                self.embeddings_buffer = None
-            elif _recv_embedding_on_gpu():
+            if (
+                not self._bind_pool_slot_to_mm_inputs(mm_inputs)
+                and _recv_embedding_on_gpu()
+            ):
                 _mark_keep_device_embedding(mm_inputs)
             self.recv_req.mm_inputs = mm_inputs
             self.recv_req.input_ids = array("q", mm_inputs.input_ids)
@@ -895,7 +896,25 @@ class WaitingImageRequest:
             self.status = WaitingImageRequestStatus.FAIL
             self.error_msg = f"Failed to assemble multimodal inputs: {e}"
             self._cleanup_gpu_buffer()
-        self.recv_socket.close()
+        return True
+
+    def _bind_pool_slot_to_mm_inputs(self, mm_inputs) -> bool:
+        """Bind pool-slot release to mm_inputs GC. Returns True if bound."""
+        if (
+            mm_inputs is None
+            or self._pool_slot_id is None
+            or self.embedding_pool is None
+        ):
+            return False
+        # Keep the handle so abort can release the slot immediately.
+        self._mm_finalizer = weakref.finalize(
+            mm_inputs, self.embedding_pool.release, self._pool_slot_id
+        )
+        _mark_keep_device_embedding(mm_inputs)
+        # Detach so _cleanup_gpu_buffer no-ops; finalize now owns release.
+        self._pool_slot_id = None
+        self.embeddings_buffer = None
+        return True
 
     def _try_stage_into_pool(self) -> bool:
         """Copy all received parts into one pooled GPU slot.
@@ -1304,16 +1323,10 @@ class WaitingImageRDMARequest(WaitingImageRequest):
             else:
                 self.recv_embedding_data.add(recv_obj)
 
-        # Assemble mm_inputs from the landed embedding. Wrapped so that any
-        # failure (view/reshape/processor error) does not (a) leak the GPU
-        # buffer or (b) escape and skip the TP-wide status all-reduce in
-        # _process_waiting_requests, which would hang the other ranks.
+        # RDMA already landed the embedding; reuse only _bind_pool_slot_to_mm_inputs.
+        # Catch so failures don't leak the buffer or skip the TP status all-reduce.
         try:
-            # Zero-copy: build per-modality views directly from the pre-registered
-            # GPU buffer. Skips the per-part split + torch.cat round-trip — both
-            # the extra GPU allocation and the D2D copy — so mm_item.precomputed_
-            # embeddings ends up referencing the pool buffer. Slot lifetime is
-            # bound to mm_inputs GC via weakref.finalize below.
+            # Zero-copy per-modality views from the landed GPU buffer.
             if self.embeddings_buffer is not None:
                 recv_embedding = _view_pool_buffer_by_modality(
                     self.embeddings_buffer, self.recv_embedding_data, self.dtype
@@ -1325,16 +1338,7 @@ class WaitingImageRDMARequest(WaitingImageRequest):
                 recv_embedding,
                 **self.recv_embedding_data.get_mm_extra_meta(),
             )
-            # Bind slot release to mm_inputs GC; keep the handle so abort can
-            # release the slot immediately.
-            if self._buffer_from_pool and mm_inputs is not None:
-                self._mm_finalizer = weakref.finalize(
-                    mm_inputs, self.embedding_pool.release, self._pool_slot_id
-                )
-                _mark_keep_device_embedding(mm_inputs)
-                # Detach so _cleanup_gpu_buffer no-ops; finalize now owns release.
-                self._pool_slot_id = None
-                self.embeddings_buffer = None
+            if self._buffer_from_pool and self._bind_pool_slot_to_mm_inputs(mm_inputs):
                 self._buffer_from_pool = False
             self.recv_req.mm_inputs = mm_inputs
             self.recv_req.input_ids = array("q", mm_inputs.input_ids)

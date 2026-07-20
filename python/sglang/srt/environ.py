@@ -1021,11 +1021,7 @@ class Envs:
     SGLANG_ENCODER_DISPATCH_MIN_ITEMS = EnvInt(2)
     SGLANG_ENCODER_IMAGE_PROCESSOR_USE_GPU = EnvBool(False)
     SGLANG_ENCODER_MAX_BATCH_SIZE = EnvInt(8)
-    # Keep received embeddings on GPU end-to-end for the ZMQ unpooled receive
-    # path (SGLANG_EMBEDDING_POOL_SIZE_MB=0): move each part to the local CUDA
-    # device on receipt so the concat and the downstream precomputed-embedding
-    # merge happen on GPU, avoiding H2D/D2H round-trips. Opt-in; default off
-    # keeps the CPU behavior. Pooled receive is always on-GPU.
+    # Optionally keeps received embeddings end-to-end on GPU to avoid host-device transfers; off by default.
     SGLANG_ENCODER_RECV_EMBEDDING_ON_GPU = EnvBool(False)
     SGLANG_ENCODER_PREPROC_WORKERS = EnvInt(8)
     # EncoderBootstrapServer health-check tuning.  Interval == 0 disables it.
