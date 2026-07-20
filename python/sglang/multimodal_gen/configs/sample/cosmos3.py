@@ -28,8 +28,8 @@ COSMOS3_EDGE_T2I_SIZE = 640
 class Cosmos3SamplingParams(SamplingParams):
     """Cosmos3 sampling parameters (T2V defaults; also used for I2V / V2V / T2I).
 
-    ``height``/``width``/``guidance_scale`` default to ``None`` so the variant
-    (Edge vs. base) can pick the right value at request time in
+    ``height``/``width`` default to ``None`` so the variant (Edge vs. base) can
+    pick the right resolution at request time in
     :meth:`_resolve_variant_defaults`.
     """
 
@@ -38,7 +38,7 @@ class Cosmos3SamplingParams(SamplingParams):
     num_frames: int = 81
     fps: int = 24
 
-    guidance_scale: float | None = None
+    guidance_scale: float = COSMOS3_DEFAULT_GUIDANCE_SCALE
     num_inference_steps: int = 35
 
     negative_prompt: str = ""
@@ -98,6 +98,10 @@ class Cosmos3SamplingParams(SamplingParams):
         )
         super()._adjust(server_args)
 
+    def _guidance_is_explicit(self) -> bool:
+        explicit = getattr(self, "_explicit_fields", None)
+        return explicit is not None and "guidance_scale" in explicit
+
     def _resolve_variant_defaults(
         self, is_edge: bool, is_distilled: bool = False
     ) -> None:
@@ -110,12 +114,8 @@ class Cosmos3SamplingParams(SamplingParams):
         if is_distilled:
             # Guidance is distilled into the model; run a single forward.
             self.guidance_scale = 1.0
-        elif self.guidance_scale is None:
-            self.guidance_scale = (
-                COSMOS3_EDGE_T2V_GUIDANCE_SCALE
-                if is_edge and not is_t2i
-                else COSMOS3_DEFAULT_GUIDANCE_SCALE
-            )
+        elif is_edge and not is_t2i and not self._guidance_is_explicit():
+            self.guidance_scale = COSMOS3_EDGE_T2V_GUIDANCE_SCALE
         if is_edge and self.height is None and self.width is None:
             if is_t2i:
                 self.width = self.height = COSMOS3_EDGE_T2I_SIZE
