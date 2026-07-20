@@ -517,6 +517,26 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             extend_num_tokens,
         )
 
+    def alloc_extend_swa_tail(
+        self,
+        prefix_lens: torch.Tensor,
+        prefix_lens_cpu: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        last_loc: torch.Tensor,
+        extend_num_tokens: int,
+        swa_tail_len: int,
+    ):
+        return self.logical_attn_allocator.alloc_extend_swa_tail(
+            prefix_lens=prefix_lens,
+            prefix_lens_cpu=prefix_lens_cpu,
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens_cpu,
+            last_loc=last_loc,
+            extend_num_tokens=extend_num_tokens,
+            swa_tail_len=swa_tail_len,
+        )
+
     def alloc_device_buffer(self, allocated_indices, need_size: int):
         assert need_size % self.hisparse_page_size == 0
         hisparse_indices = self.full_to_hisparse_device_index_mapping[allocated_indices]

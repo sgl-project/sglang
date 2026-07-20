@@ -1,49 +1,59 @@
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import time
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Any, List, Literal, Optional, Tuple
 
 import torch
 from huggingface_hub import snapshot_download
 
+from sglang.kernels.ops.speculative.cache_locs import (
+    align_evict_mask_to_page_size as align_evict_mask_to_page_size,
+)
+from sglang.kernels.ops.speculative.cache_locs import (
+    assign_extend_cache_locs as assign_extend_cache_locs,
+)
+from sglang.kernels.ops.speculative.cache_locs import (
+    filter_finished_cache_loc_kernel as filter_finished_cache_loc_kernel,
+)
+from sglang.kernels.ops.speculative.cache_locs import (
+    generate_draft_decode_kv_indices as generate_draft_decode_kv_indices,
+)
+from sglang.kernels.ops.speculative.cache_locs import (
+    get_src_tgt_cache_loc as get_src_tgt_cache_loc,
+)
+from sglang.kernels.ops.speculative.cache_locs import (
+    get_target_cache_loc as get_target_cache_loc,
+)
+from sglang.kernels.ops.speculative.eagle import (
+    fill_accept_out_cache_loc_func as fill_accept_out_cache_loc_func,
+)
+from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed.parallel_state import (
     GroupCoordinator,
     patch_tensor_parallel_group,
 )
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import set_mamba_track_indices_from_reqs
-from sglang.srt.server_args import get_global_server_args
-from sglang.srt.speculative.triton_ops.cache_locs import (
-    align_evict_mask_to_page_size as align_evict_mask_to_page_size,
-)
-from sglang.srt.speculative.triton_ops.cache_locs import (
-    assign_extend_cache_locs as assign_extend_cache_locs,
-)
-from sglang.srt.speculative.triton_ops.cache_locs import (
+from sglang.srt.mem_cache.allocation import (
     assign_req_to_token_pool as assign_req_to_token_pool,
 )
-from sglang.srt.speculative.triton_ops.cache_locs import (
+from sglang.srt.mem_cache.allocation import (
     assign_req_to_token_pool_func as assign_req_to_token_pool_func,
 )
-from sglang.srt.speculative.triton_ops.cache_locs import (
-    filter_finished_cache_loc_kernel as filter_finished_cache_loc_kernel,
+from sglang.srt.runtime_context import get_server_args
+from sglang.srt.utils import (
+    is_cpu,
+    is_cuda,
+    is_hip,
+    is_musa,
+    is_npu,
+    is_xpu,
+    next_power_of_2,
 )
-from sglang.srt.speculative.triton_ops.cache_locs import (
-    generate_draft_decode_kv_indices as generate_draft_decode_kv_indices,
-)
-from sglang.srt.speculative.triton_ops.cache_locs import (
-    get_src_tgt_cache_loc as get_src_tgt_cache_loc,
-)
-from sglang.srt.speculative.triton_ops.cache_locs import (
-    get_target_cache_loc as get_target_cache_loc,
-)
-from sglang.srt.speculative.triton_ops.eagle import (
-    fill_accept_out_cache_loc as fill_accept_out_cache_loc,
-)
-from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu, is_xpu, next_power_of_2
 from sglang.srt.utils.async_probe import maybe_detect_oob
 from sglang.srt.utils.nvtx_utils import profile_range
 
@@ -52,6 +62,7 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 _is_musa = is_musa()
 _is_xpu = is_xpu()
+_is_cpu = is_cpu()
 
 if TYPE_CHECKING:
     from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
@@ -69,12 +80,59 @@ elif _is_hip:
 else:
     from sglang.srt.utils.common import fast_topk
 
+if _is_cpu:
+    from sgl_kernel import assign_extend_cache_locs_cpu
+
 
 logger = logging.getLogger(__name__)
 
 
+def resolve_num_tokens_per_req(
+    *,
+    phase: Literal["draft_decode", "draft_extend", "target_verify"],
+    server_args: ServerArgs,
+    spec_algorithm=None,
+    is_draft_worker: bool = False,
+    num_draft_tokens: Optional[int] = None,
+) -> int:
+    """Single static derivation point for a spec phase's per-request token
+    width (sizes capture shapes / buffers); the per-forward dynamic width
+    lives on ``SpecInput.num_tokens_per_req``. Draft phases are
+    EAGLE-family-only; "target_verify" is algorithm-generic via the hook.
+    """
+    if phase == "draft_decode":
+        return server_args.speculative_eagle_topk
+    if phase == "draft_extend":
+        return server_args.speculative_num_draft_tokens
+    if phase == "target_verify":
+        if num_draft_tokens is None:
+            num_draft_tokens = server_args.speculative_num_draft_tokens
+        return spec_algorithm.get_num_tokens_per_req_for_target_verify(
+            num_draft_tokens, is_draft_worker
+        )
+    raise ValueError(f"Unknown speculative phase: {phase}")
+
+
 def fast_sample(probs: torch.Tensor, num_samples: int = 1):
-    sample_index = torch.multinomial(probs, num_samples=num_samples)
+    """Draw from `probs` via the Gumbel-max trick: argmax(probs / Exp(1)).
+
+    Distributionally equivalent to torch.multinomial, but avoids multinomial's
+    device-side distribution-validity assert, which the draft CUDA graph would
+    otherwise capture and replay every step. q is clamped off zero so a zero
+    draw can't yield inf/NaN scores that argmax would wrongly select; fp32
+    avoids bf16 argmax ties biasing the draw. Set SGLANG_OPT_USE_GUMBEL_SAMPLE=0
+    to fall back to torch.multinomial.
+    """
+    if not envs.SGLANG_OPT_USE_GUMBEL_SAMPLE.get():
+        sample_index = torch.multinomial(probs, num_samples=num_samples)
+        return probs.gather(1, sample_index), sample_index
+    q = torch.empty_like(probs, dtype=torch.float32).exponential_(1.0)
+    q.clamp_min_(torch.finfo(torch.float32).tiny)
+    scores = probs.float() / q
+    if num_samples == 1:
+        sample_index = scores.argmax(dim=-1, keepdim=True)
+    else:
+        sample_index = scores.topk(num_samples, dim=-1).indices
     sample_p = probs.gather(1, sample_index)
     return sample_p, sample_index
 
@@ -192,12 +250,12 @@ def record_stream_for_v2_verify(batch, verify_input, fwd_stream):
 
 def spec_need_hidden_states(server_args: Optional[ServerArgs] = None) -> bool:
     if server_args is None:
-        server_args = get_global_server_args()
+        server_args = get_server_args()
 
     # STANDALONE drafts don't consume `spec_info.hidden_states` (vanilla LLM).
-    # multi_layer_eagle and DFLASH don't relay hidden_states through FutureMap.
+    # multi_layer_eagle, DFLASH, and DSPARK don't relay hidden_states through FutureMap.
     # TODO(lsyin): also skip when step == 1.
-    if server_args.speculative_algorithm in ("STANDALONE", "DFLASH"):
+    if server_args.speculative_algorithm in ("STANDALONE", "DFLASH", "DSPARK"):
         return False
     return not server_args.enable_multi_layer_eagle
 
@@ -347,7 +405,7 @@ def generate_simulated_accept_index(
 
     accept_indx_first_col = accept_index[:, 0].view(-1, 1)
     sim_accept_index = torch.full(
-        (bs, spec_steps + 1), -1, dtype=torch.int32, device="cuda"
+        (bs, spec_steps + 1), -1, dtype=torch.int32, device=accept_index.device
     )
     sim_accept_index[:, :simulate_acc_len] = accept_indx_first_col + torch.arange(
         simulate_acc_len, device=accept_index.device
@@ -571,20 +629,30 @@ def move_accept_tokens_to_target_kvcache(
         device=device,
     )
     accept_out_cache_loc = torch.zeros(size, dtype=torch.int64, device=device)
-    assign_extend_cache_locs[(bs,)](
-        batch.req_pool_indices,
-        batch.req_to_token_pool.req_to_token,
-        batch.seq_lens,
-        batch.seq_lens + num_correct_drafts + 1,
-        tgt_cache_loc,
-        batch.req_to_token_pool.req_to_token.shape[1],
-        next_power_of_2(bs),
-    )
-    fill_accept_out_cache_loc[(size,)](
+    if _is_cpu:
+        assign_extend_cache_locs_cpu(
+            batch.req_pool_indices,
+            batch.req_to_token_pool.req_to_token,
+            batch.seq_lens,
+            batch.seq_lens + num_correct_drafts + 1,
+            tgt_cache_loc,
+            batch.req_to_token_pool.req_to_token.shape[1],
+        )
+    else:
+        assign_extend_cache_locs[(bs,)](
+            batch.req_pool_indices,
+            batch.req_to_token_pool.req_to_token,
+            batch.seq_lens,
+            batch.seq_lens + num_correct_drafts + 1,
+            tgt_cache_loc,
+            batch.req_to_token_pool.req_to_token.shape[1],
+            next_power_of_2(bs),
+        )
+    fill_accept_out_cache_loc_func(
         accept_index,
         batch.out_cache_loc,
         accept_out_cache_loc,
-        next_power_of_2(size),
+        size,
     )
     token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
         tgt_cache_loc, accept_out_cache_loc
@@ -600,7 +668,7 @@ def prepare_mamba_track_for_verify(batch: ScheduleBatch) -> None:
     tracking during TARGET_VERIFY; tracking is done in
     commit_mamba_states_after_verify instead.
     """
-    if not get_global_server_args().enable_mamba_extra_buffer():
+    if not get_server_args().enable_mamba_extra_buffer():
         return
     set_mamba_track_indices_from_reqs(batch)
     batch.mamba_track_mask = None
@@ -626,11 +694,76 @@ def commit_mamba_states_after_verify(
     commit hook.
     """
     model_runner = target_worker.model_runner
-    if model_runner.mambaish_config is None:
+    if mambaish_config(model_runner.model_config) is None:
         return
+
+    # ReplaySSM spec-verify path (Part B of #28511): the accepted drafts already
+    # live in the per-slot circular ring (written during verify). Instead of
+    # scattering an intermediate full SSM state into `temporal`, advance the
+    # block-keyed cursors by the accepted count (the ring owns the SSM state; the
+    # verify/flush kernel folds it into `temporal` periodically). The CONV state
+    # still needs its usual accept-rollback, so we keep the conv-window scatter and
+    # skip only the SSM scatter. GDN-only + linear-chain (topk<=1) -- the runtime
+    # ring is allocated only then; KDA never allocates the cursors.
+    req_pool = model_runner.req_to_token_pool
+    mamba_pool = getattr(req_pool, "mamba_pool", None)
+    if (
+        mamba_pool is not None
+        and getattr(mamba_pool, "replayssm_cache_base", None) is not None
+        and not getattr(mamba_pool, "replayssm_is_kda", False)
+    ):
+        if batch.forward_mode.is_idle() or accept_index.numel() == 0:
+            return
+        from sglang.kernels.ops.attention.fla.gdn_replayssm_spec_decode import (
+            commit_gdn_replayssm_spec,
+        )
+        from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
+            fused_conv_window_scatter_with_mask,
+        )
+
+        spec_state = req_pool.get_speculative_mamba2_params_all_layers()
+        bs = accept_lens.shape[0]
+        state_batch_indices = req_pool.get_mamba_indices(batch.req_pool_indices)
+        # Advance the per-slot circular cursors by the accepted count (incl. the
+        # bonus token). max_cache_len = ring length L = replayssm_d.shape[-2].
+        commit_gdn_replayssm_spec(
+            write_pos=mamba_pool.replayssm_write_pos,
+            cache_base=mamba_pool.replayssm_cache_base,
+            is_flush=mamba_pool.replayssm_is_flush,
+            num_accepted=accept_lens,  # [bs], includes the bonus token
+            state_batch_indices=state_batch_indices,
+            max_cache_len=spec_state.replayssm_d.shape[-2],
+            max_spec_len=draft_token_num,
+            null_block_id=-1,  # SGLang: valid slots >= 0, padding == -1
+        )
+        # Roll back / commit the conv state to the last accepted draft step
+        # (same logic as the recurrent commit, but conv-only).
+        accept_indices_offset = torch.arange(
+            0,
+            bs * draft_token_num,
+            step=draft_token_num,
+            dtype=accept_lens.dtype,
+            device=accept_lens.device,
+        )
+        req_idx = torch.arange(bs, dtype=torch.int64, device=accept_lens.device)
+        last_correct_step_indices = (
+            accept_index[req_idx, (accept_lens - 1).to(torch.int64)]
+            - accept_indices_offset
+        )
+        fused_conv_window_scatter_with_mask(
+            spec_state.conv[0],
+            spec_state.intermediate_conv_window[0],
+            state_batch_indices,
+            last_correct_step_indices,
+        )
+        # NOTE: radix mamba prefix-caching (mamba_track / extra_buffer) would need
+        # a device-side force-flush so `temporal` reflects the ring before a
+        # snapshot; not wired for Part B (server_args forbids extra_buffer with
+        # --enable-gdn-replayssm-spec), so the per-track scatters are intentionally
+        # skipped here.
+        return
+
     attn_backend = model_runner.attn_backend
-    if not hasattr(attn_backend, "update_mamba_state_after_mtp_verify"):
-        return
 
     bs = accept_lens.shape[0]
     # `accept_lens` already includes the bonus token (drafts + 1 per req).
@@ -655,7 +788,7 @@ def commit_mamba_states_after_verify(
             # we need to update the mamba state for the request at the crossing point.
             seq_lens_pre_verify = batch.seq_lens
             seq_lens_post_verify = batch.seq_lens + accept_lens
-            mamba_track_interval = get_global_server_args().mamba_track_interval
+            mamba_track_interval = get_server_args().mamba_track_interval
             to_track_mask = (
                 seq_lens_pre_verify // mamba_track_interval
                 != seq_lens_post_verify // mamba_track_interval
@@ -677,21 +810,43 @@ def commit_mamba_states_after_verify(
         else:
             mamba_steps_to_track = None
 
-        attn_backend.update_mamba_state_after_mtp_verify(
-            last_correct_step_indices=last_correct_step_indices,
-            mamba_track_indices=batch.mamba_track_indices,
-            mamba_steps_to_track=mamba_steps_to_track,
-            model=model_runner.model,
-        )
+        if hasattr(attn_backend, "update_mamba_state_after_mtp_verify"):
+            attn_backend.update_mamba_state_after_mtp_verify(
+                last_correct_step_indices=last_correct_step_indices,
+                mamba_track_indices=batch.mamba_track_indices,
+                mamba_steps_to_track=mamba_steps_to_track,
+                model=model_runner.model,
+            )
+        elif hasattr(model_runner.model, "update_conv_state_after_mtp_verify"):
+            # Models whose conv layers bypass the attention-backend wrapper
+            # (Inkling) own the commit themselves.
+            model_runner.model.update_conv_state_after_mtp_verify(
+                req_to_token_pool=model_runner.req_to_token_pool,
+                req_pool_indices=batch.req_pool_indices[:bs],
+                last_correct_step_indices=last_correct_step_indices,
+                mamba_track_indices=batch.mamba_track_indices,
+                mamba_steps_to_track=mamba_steps_to_track,
+            )
 
 
 def spec_prepare_for_decode(batch: ScheduleBatch) -> None:
     """eagle/ngram share a stateless free function; dflash keeps stateful
     prep on its draft input -- the dispatcher routes.
     """
-    if batch.spec_algorithm.is_dflash():
+    if batch.spec_algorithm.is_dflash_family():
         batch.spec_info.prepare_for_decode(batch)
     else:
         from sglang.srt.speculative.eagle_utils import eagle_prepare_for_decode
 
         eagle_prepare_for_decode(batch)
+
+
+def get_plan_stream(
+    device: str,
+) -> Tuple[Any, contextlib.AbstractContextManager]:
+    if envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM.get():
+        plan_stream = torch.get_device_module(device).Stream()
+        plan_stream_ctx = torch.get_device_module(device).stream(plan_stream)
+        return plan_stream, plan_stream_ctx
+    else:
+        return None, contextlib.nullcontext()
