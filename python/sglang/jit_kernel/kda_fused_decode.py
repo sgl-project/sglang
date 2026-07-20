@@ -23,7 +23,12 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.jit_kernel.utils import cache_once, load_jit
+from sglang.jit_kernel.utils import (
+    cache_once,
+    is_arch_support_pdl,
+    load_jit,
+    make_cpp_args,
+)
 from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
@@ -39,10 +44,12 @@ _CONV_STATE_W = 3  # kernel width 4 -> 3 cached tokens
 
 @cache_once
 def _jit_kda_fused_decode_module() -> Module:
+    args = make_cpp_args(is_arch_support_pdl())
     return load_jit(
         "kda_fused_decode",
+        *args,
         cuda_files=["attention/kda_fused_decode.cuh"],
-        cuda_wrappers=[("run", "KdaFusedDecodeKernel::run")],
+        cuda_wrappers=[("run", f"KdaFusedDecodeKernel<{args}>::run")],
         extra_cuda_cflags=["-O3", "--use_fast_math"],
     )
 
