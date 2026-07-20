@@ -7,10 +7,19 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
-def _batch(reuse: bool, carried) -> SimpleNamespace:
+def _batch(
+    reuse: bool, carried, *, is_extend: bool = False, seed_buf=None, seed_select=None
+) -> SimpleNamespace:
     return SimpleNamespace(
         reuse_dsa_topk_indices=reuse,
-        spec_info=SimpleNamespace(dsa_topk_indices=carried),
+        forward_mode=SimpleNamespace(
+            is_extend=lambda include_draft_extend_v2: is_extend
+        ),
+        spec_info=SimpleNamespace(
+            dsa_topk_indices=carried,
+            dsa_seed_topk_capture=seed_buf,
+            dsa_seed_topk_select=seed_select,
+        ),
     )
 
 
@@ -32,6 +41,33 @@ class TestIndexTopKShareState(unittest.TestCase):
         state.store_topk_indices("new")
 
         self.assertEqual(batch.spec_info.dsa_topk_indices, "new")
+
+    def test_store_publishes_draft_extend_seed(self):
+        import torch
+
+        seed_buf = torch.zeros(2, 3, dtype=torch.int64)
+        batch = _batch(reuse=False, carried=None, is_extend=True, seed_buf=seed_buf)
+        state = IndexTopKShareState(batch)
+
+        self.assertTrue(state.should_update)
+        state.store_topk_indices(torch.arange(12, dtype=torch.int64).view(4, 3))
+
+        self.assertTrue(
+            torch.equal(seed_buf, torch.arange(6, dtype=torch.int64).view(2, 3))
+        )
+        # No carry write without reuse.
+        self.assertIsNone(batch.spec_info.dsa_topk_indices)
+
+    def test_seed_buf_ignored_outside_extend(self):
+        import torch
+
+        seed_buf = torch.zeros(2, 3, dtype=torch.int64)
+        batch = _batch(reuse=False, carried=None, is_extend=False, seed_buf=seed_buf)
+        state = IndexTopKShareState(batch)
+
+        self.assertFalse(state.should_update)
+        state.store_topk_indices(torch.ones(4, 3, dtype=torch.int64))
+        self.assertTrue(torch.equal(seed_buf, torch.zeros(2, 3, dtype=torch.int64)))
 
     def test_context_manager_clears_batch_state_after_mtp_iteration(self):
         batch = _batch(reuse=False, carried="stale")
