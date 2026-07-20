@@ -61,12 +61,19 @@ from sglang.srt.server_args import (
     ServerArgs,
     set_global_server_args_for_scheduler,
 )
-from sglang.srt.utils import get_device
+from sglang.srt.utils import get_device, is_cuda, is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
+
+# The HiCache device<->host KV-transfer kernels (transfer_kv_* from
+# sgl_kernel.kvcacheio) are only imported under `if _is_cuda or _is_hip` in the
+# pool-host modules, so any real backup / load-back path raises NameError on
+# other devices (e.g. XPU). Gate every test that exercises a genuine D<->H
+# transfer on this — the feature simply isn't built elsewhere.
+_HICACHE_KV_TRANSFER_AVAILABLE = is_cuda() or is_hip()
 
 
 @dataclass(frozen=True)
@@ -452,6 +459,13 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
         return match.last_device_node
 
     def _init_hicache(self, cache, *, write_policy: str = "write_through"):
+        # See the suite's _init_hicache: the D<->H transfer_kv_* kernels are
+        # CUDA/HIP-only, so skip on other devices rather than hit NameError.
+        if not _HICACHE_KV_TRANSFER_AVAILABLE:
+            self.skipTest(
+                "HiCache device<->host KV-transfer kernels require CUDA or HIP"
+            )
+
         import sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler as assembler
 
         # Wrap the host-pool factory (not MHATokenToKVPoolHost directly)
@@ -2514,6 +2528,10 @@ class UnifiedRadixCacheSuite:
         cons.sanity_check()
 
     def _skip_unsupported_hicache_test(self):
+        if not _HICACHE_KV_TRANSFER_AVAILABLE:
+            self.skipTest(
+                "HiCache device<->host KV-transfer kernels require CUDA or HIP"
+            )
         if self.cfg.has_swa and self.cfg.has_mamba:
             self.skipTest("HiCache unit fixture does not support SWA + Mamba stacks")
         return False
@@ -2552,6 +2570,14 @@ class UnifiedRadixCacheSuite:
         prefetch_threshold: Optional[int] = None,
         prefetch_policy: str = "wait_complete",
     ):
+        # Any real D<->H transfer through this hicache needs the CUDA/HIP-only
+        # transfer_kv_* kernels; on other devices (e.g. XPU) the backup/load-back
+        # path raises NameError, so skip rather than fail.
+        if not _HICACHE_KV_TRANSFER_AVAILABLE:
+            self.skipTest(
+                "HiCache device<->host KV-transfer kernels require CUDA or HIP"
+            )
+
         import sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler as assembler
 
         # See _init_hicache: wrap the factory rather than MHATokenToKVPoolHost

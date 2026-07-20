@@ -169,6 +169,8 @@ class TestMamba(unittest.TestCase):
         conv_dim = 5
 
         pool = object.__new__(WindowFirstMambaPool)
+        # Bypasses __init__, so set the device the allocator reads directly.
+        pool.device = get_device()
         physical, view = pool._allocate_deduplicated_conv_window(
             conv_shape=(window_size, conv_dim),
             num_mamba_layers=num_mamba_layers,
