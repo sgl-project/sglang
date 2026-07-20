@@ -21,8 +21,8 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     PoolTransferResult,
 )
-from sglang.srt.mem_cache.memory_pool_host import MLATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host import HostKVCache, HostTensorAllocator
+from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.observability.metrics_collector import StorageMetrics
 
 DEFAULT_LOCAL_BUFFER_SIZE = 16 * 1024 * 1024  # 16 MB
@@ -302,6 +302,9 @@ class MooncakeBaseStore:
             raise RuntimeError("Mooncake store is not initialized.")
         ptr = tensor.data_ptr()
         size = tensor.numel() * tensor.element_size()
+        if size == 0:
+            # conv-only models have a 0-element ssm state; nothing to register
+            return
         ret_code = self.store.register_buffer(ptr, size)
         if ret_code != 0:
             logger.error(f"Failed to register buffer, error code: {ret_code}")
@@ -542,8 +545,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 self.mla_suffix = ""
 
             self.storage_config = storage_config
+            self.should_split_heads = storage_config.should_split_heads
             self.split_factor = 0
-            if self.storage_config.should_split_heads:
+            if self.should_split_heads:
                 self.split_factor = (
                     self.storage_config.tp_lcm_size // self.storage_config.tp_size
                 )
@@ -715,10 +719,13 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         suffixes = []
         if pool_name == PoolName.MAMBA:
             # Mamba stores one temporal object plus one object per conv state.
+            # conv-only models have no ssm state; drop the 0-element temporal
+            # object (mooncake rejects 0-size puts). get_page_buffer_meta drops
+            # its temporal pointer under the same condition to stay aligned.
             conv_num = len(getattr(host_pool, "conv_buffer", None) or [])
-            suffixes = [f"_{self.mha_suffix}_temporal"] + [
-                f"_{self.mha_suffix}_conv_{i}" for i in range(conv_num)
-            ]
+            suffixes = [f"_{self.mha_suffix}_conv_{i}" for i in range(conv_num)]
+            if getattr(host_pool, "temporal_state_elem_size", 1) > 0:
+                suffixes = [f"_{self.mha_suffix}_temporal"] + suffixes
         elif pool_name == PoolName.DRAFT:
             # Draft pool's MLA/MHA layout is independent from the target
             # (e.g. EAGLE-MHA draft on top of an MLA target), so pick the
@@ -952,7 +959,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         if self.is_mla_backend:
             return self._get_mla_buffer_meta(keys, host_indices)
         else:
-            if self.storage_config.should_split_heads:
+            if self.should_split_heads:
                 return self._get_mha_split_heads_buffer_meta(keys, host_indices)
             else:
                 return self._get_mha_buffer_meta(keys, host_indices)
@@ -972,7 +979,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 key_multiplier = 1
             else:
                 key_multiplier = 2
-                if self.storage_config.should_split_heads:
+                if self.should_split_heads:
                     key_multiplier *= self.split_factor
 
         result_groups = [
@@ -1209,7 +1216,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             key_multiplier = 1
         else:
             query_keys = []
-            if self.storage_config.should_split_heads:
+            if self.should_split_heads:
                 for key in keys:
                     for suffix in self.mha_suffix:
                         query_keys.append(f"{key}_{suffix}_k")

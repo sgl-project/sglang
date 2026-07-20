@@ -2,17 +2,18 @@ from typing import Optional, Tuple, Union
 
 import torch
 
-from sglang.srt.layers.attention.fla.fused_gdn_gating import fused_gdn_gating
+from sglang.kernels.ops.attention.fla.fused_gdn_gating import fused_gdn_gating
+from sglang.kernels.ops.mamba.causal_conv1d_triton import (
+    causal_conv1d_fn,
+    causal_conv1d_update,
+)
+from sglang.srt.configs.hybrid_arch import hybrid_gdn_config
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
 from sglang.srt.layers.attention.linear.utils import (
     LinearAttnKernelBackend,
     get_linear_attn_decode_backend,
     get_linear_attn_prefill_backend,
-)
-from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
-    causal_conv1d_fn,
-    causal_conv1d_update,
 )
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.mem_cache.memory_pool import MambaPool
@@ -22,7 +23,7 @@ from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu
 from sglang.srt.utils.common import rank0_log
 
 if not is_cpu():
-    from sglang.srt.layers.attention.fla.chunk_delta_h import (
+    from sglang.kernels.ops.attention.fla.chunk_delta_h import (
         CHUNK_SIZE as FLA_CHUNK_SIZE,
     )
 
@@ -55,6 +56,47 @@ elif is_cpu():
     fused_gdn_gating = torch.ops.sgl_kernel.fused_gdn_gating_cpu
 
 
+def maybe_set_default_flashinfer_gdn_prefill(model_runner: ModelRunner) -> None:
+    """Use FlashInfer for the narrow SM100 GDN prefill domain we validated."""
+    args = model_runner.server_args
+    if (
+        args.linear_attn_prefill_backend is not None
+        or args.linear_attn_backend != "triton"
+        or args.enable_page_major_kv_layout
+        or not is_cuda()
+        or torch.cuda.get_device_capability()[0] != 10
+    ):
+        return
+
+    # Extra-buffer strategies need intermediate state checkpoints.
+    if args.uses_mamba_radix_cache and args.mamba_radix_cache_strategy != "no_buffer":
+        return
+
+    cuda_version = torch.version.cuda
+    chunk_size = args.chunked_prefill_size
+    config = hybrid_gdn_config(model_runner.model_config)
+    if (
+        cuda_version is None
+        or int(cuda_version.split(".", 1)[0]) < 13
+        or args.enable_dynamic_chunking
+        or chunk_size is None
+        or not 1 <= chunk_size <= 8192
+        or getattr(config, "linear_key_head_dim", None) != 128
+        or getattr(config, "linear_value_head_dim", None) != 128
+        or model_runner.req_to_token_pool.mamba_pool.mamba_cache.temporal.dtype
+        != torch.bfloat16
+    ):
+        return
+
+    from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
+        is_flashinfer_gdn_prefill_available,
+    )
+
+    if is_flashinfer_gdn_prefill_available():
+        args.linear_attn_prefill_backend = "flashinfer"
+        rank0_log("Defaulting SM100 GDN prefill backend to FlashInfer.")
+
+
 class GDNKernelDispatcher:
     """Dispatches GDN kernel calls to the appropriate backend per mode."""
 
@@ -64,6 +106,7 @@ class GDNKernelDispatcher:
         prefill_backend: LinearAttnKernelBackend,
     ):
         triton_kernel = TritonGDNKernel()
+        self.tree_verify_kernel = triton_kernel
 
         cutedsl_kernel = None
         if decode_backend.is_triton():
@@ -251,7 +294,15 @@ class GDNKernelDispatcher:
         query_start_loc: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
-        return self.verify_kernel.target_verify(
+        # FlashInfer verify supports a linear MTP chain. Tree-shaped drafts
+        # carry parent indices and must use Triton even when decode/prefill use
+        # FlashInfer.
+        verify_kernel = (
+            self.tree_verify_kernel
+            if kwargs.get("retrieve_parent_token") is not None
+            else self.verify_kernel
+        )
+        return verify_kernel.target_verify(
             A_log=A_log,
             dt_bias=dt_bias,
             q=q,

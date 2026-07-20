@@ -34,7 +34,6 @@ from sglang.srt.compilation.compile_phase import (
     enable_torch_compile_warmup,
     set_pcg_capture_stream,
 )
-from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
@@ -49,6 +48,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 from sglang.srt.model_executor.runner_utils.pool import (
     get_or_create_global_graph_memory_pool,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_hip
 
 if TYPE_CHECKING:
@@ -191,15 +191,23 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
                             tqdm.tqdm(
                                 list(reversed(cuda_graph_runner.capture_num_tokens))
                             )
-                            if get_tensor_model_parallel_rank() == 0
+                            if get_parallel().tp_rank == 0
                             else reversed(cuda_graph_runner.capture_num_tokens)
                         )
                         for num_tokens in compile_range:
-                            if get_tensor_model_parallel_rank() == 0:
+                            if get_parallel().tp_rank == 0:
                                 compile_range.set_description(
                                     f"Compiling num tokens ({num_tokens=})"
                                 )
                             cuda_graph_runner._run_dummy_forward(num_tokens=num_tokens)
+
+                # Qwen3-VL deepstack embeddings are produced only after
+                # visual encoding. First trace the tensor branch above, then
+                # execute it once outside the compile-warmup marker so its
+                # regular kernel/JIT warmup also happens during startup.
+                cuda_graph_runner.run_dummy_multimodal_deepstack_forward(
+                    inner_model, cuda_graph_runner.capture_num_tokens[-1]
+                )
             finally:
                 _toggle_multi_platform_ops(inner_model, reverse=True, num_tokens=16)
 

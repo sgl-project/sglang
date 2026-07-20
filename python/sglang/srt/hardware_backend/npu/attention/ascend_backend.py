@@ -21,7 +21,6 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
 )
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
-from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_kv_cache
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
@@ -39,8 +38,17 @@ import logging
 
 import numpy as np
 
+from sglang.srt.runtime_context import get_parallel
+
 logger = logging.getLogger(__name__)
 FULL_ATTENTION_WINDOW = 2147483647
+
+
+def _expand_dsa_sparse_indices(topk_indices: torch.Tensor) -> torch.Tensor:
+    """Expand [T, K] to [T, 1, K] for NPU sparse attention."""
+    if topk_indices.dim() == 2:
+        return topk_indices.unsqueeze(-2)
+    return topk_indices
 
 
 def _reshape_kv_for_fia_nz(
@@ -351,7 +359,8 @@ class AscendAttnBackend(AttentionBackend):
         self.q_head_num_padding = None
         if hasattr(model_runner.model_config, "num_attention_heads") and self.use_mla:
             self.tp_q_head_num = (
-                model_runner.model_config.num_attention_heads // get_attention_tp_size()
+                model_runner.model_config.num_attention_heads
+                // get_parallel().attn_tp_size
             )
             for num in self.padding_size_list:
                 if num >= self.tp_q_head_num:
@@ -365,7 +374,7 @@ class AscendAttnBackend(AttentionBackend):
             self.is_dllm_model = True
             self.dllm_block_size = self.dllm_config.block_size
 
-        self.attn_cp_size = model_runner.attn_cp_size
+        self.attn_cp_size = model_runner.ps.attn_cp_size
 
     def _is_swa_layer(self, layer: RadixAttention) -> bool:
         return (
@@ -1051,6 +1060,7 @@ class AscendAttnBackend(AttentionBackend):
                 actual_seq_lengths_kv,
             )
         else:
+            topk_indices = _expand_dsa_sparse_indices(topk_indices)
             attn_out, _, _ = torch_npu.npu_sparse_flash_attention(
                 query=q_nope,
                 key=k_nope,

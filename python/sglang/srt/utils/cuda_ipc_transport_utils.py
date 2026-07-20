@@ -9,7 +9,7 @@ import numpy as np
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils.stale_shm_cleanup import make_shm_name
 
 logger = logging.getLogger(__name__)
@@ -21,6 +21,32 @@ MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL = (
 )
 
 SHM_LOCK_FILE = "/tmp/shm_wr_lock.lock"
+
+# Processors set this marker only when their encoder consumes each IPC feature
+# on a single TP rank.  The scheduler then keeps the feature lazy until the
+# model has computed the data-parallel assignment.
+DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY = (
+    "_sglang_defer_cuda_ipc_feature_reconstruction"
+)
+
+
+def get_mm_feature_pool_size_per_worker(
+    total_pool_size: int, tokenizer_worker_num: int
+) -> int:
+    """Split the CUDA IPC feature-pool budget without exceeding it.
+
+    Each tokenizer worker owns a distinct CUDA allocation, even though all pools
+    are created on ``base_gpu_id``.  Therefore a minimum per-worker allocation
+    would make the aggregate HBM reservation larger than the configured budget.
+    Keep the configured value as a hard per-node cap and leave at most
+    ``tokenizer_worker_num - 1`` bytes unused when it is not evenly divisible.
+    """
+    if total_pool_size <= 0:
+        raise ValueError("total_pool_size must be positive")
+    if tokenizer_worker_num <= 0:
+        raise ValueError("tokenizer_worker_num must be positive")
+
+    return total_pool_size // tokenizer_worker_num
 
 
 # Cache for pool-level IPC handles on the consumer side.
@@ -104,10 +130,10 @@ class MmItemMemoryChunk:
 
     def try_to_recycle(self) -> bool:
         try:
-            tp_num = get_global_server_args().tp_size
+            tp_num = get_server_args().tp_size
         except Exception:
             logger.info(
-                "get_global_server_args has not been inited , skip this turn 's recycle"
+                "server_args has not been published yet, skip this turn's recycle"
             )
             return False
 
@@ -330,6 +356,7 @@ class CudaIpcTensorTransportProxy:
         self.reconstruct_tensor = None
         self.sync_data_meta = sync_buffer_meta
         self.sync_buffer = None
+        self._consumer_acknowledged = False
 
     @property
     def get_sync_flag(self):
@@ -404,32 +431,53 @@ class CudaIpcTensorTransportProxy:
 
         return slice_tensor, target_device, cache_key, storage_to_cache
 
+    def _acknowledge_consumption(self, consumer_count: int = 1):
+        """Mark this IPC feature as consumed without necessarily copying it.
+
+        A normal TP execution reconstructs a feature once per rank, so each
+        consumer contributes one acknowledgement.  Encoder-DP can instead
+        route a feature to exactly one rank; that rank acknowledges all TP
+        consumers after its copy completes.  Keeping this acknowledgement
+        idempotent is important for chunked-prefill cache hits, where the same
+        proxy may be visited more than once.
+        """
+        if getattr(self, "_consumer_acknowledged", False):
+            return
+        if consumer_count <= 0:
+            raise ValueError("consumer_count must be positive")
+        if self.sync_data_meta is not None:
+            open(SHM_LOCK_FILE, "a").close()
+            # Keep the counter update atomic across scheduler processes.
+            with open(SHM_LOCK_FILE, "w+") as f:
+                fcntl.flock(f, fcntl.LOCK_EX)
+                sync_flag = self.get_sync_flag
+                sync_flag += consumer_count
+                fcntl.flock(f, fcntl.LOCK_UN)
+            self.close_shm()
+        self._consumer_acknowledged = True
+
+    def acknowledge_consumption(self, consumer_count: int = 1):
+        """Release an IPC-pool slice when a cache hit needs no tensor copy."""
+        self._acknowledge_consumption(consumer_count)
+
     def _copy_slice_tensor_to_target(
         self,
         slice_tensor: torch.Tensor,
         rebuild_device: torch.device,
         recons_shape,
         recons_dtype,
+        consumer_count: int,
     ):
         with torch.cuda.device(rebuild_device):
             reconstructed_tensor = torch.empty(
                 recons_shape, dtype=recons_dtype, device=rebuild_device
             ).contiguous()
             reconstructed_tensor.view(torch.int8).view(-1).copy_(slice_tensor)
-
-            open(SHM_LOCK_FILE, "a").close()
-            # write the shm_sync_buffer with a file lock
-            with open(SHM_LOCK_FILE, "w+") as f:
-                fcntl.flock(f, fcntl.LOCK_EX)
-                sync_flag = self.get_sync_flag
-                sync_flag += 1
-                fcntl.flock(f, fcntl.LOCK_UN)
-
-            self.close_shm()
+            self._acknowledge_consumption(consumer_count)
 
         return reconstructed_tensor
 
-    def reconstruct_on_target_device(self, rebuild_device_idx):
+    def reconstruct_on_target_device(self, rebuild_device_idx, consumer_count: int = 1):
         rebuild_device = torch.device(f"cuda:{rebuild_device_idx}")
         if (
             isinstance(self.reconstruct_tensor, torch.Tensor)
@@ -501,7 +549,11 @@ class CudaIpcTensorTransportProxy:
                     raise
 
             reconstructed_tensor = self._copy_slice_tensor_to_target(
-                slice_tensor, rebuild_device, recons_shape, recons_dtype
+                slice_tensor,
+                rebuild_device,
+                recons_shape,
+                recons_dtype,
+                consumer_count,
             )
         elif isinstance(self.proxy_state["tensor_data"], torch.Tensor):
             reconstructed_tensor = self.proxy_state["tensor_data"].to(

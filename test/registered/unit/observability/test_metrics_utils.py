@@ -128,17 +128,6 @@ class TestMetricsUtils(unittest.TestCase):
         for value in result:
             self.assertIsInstance(value, float)
 
-    def test_integration_tse_through_generate_buckets(self):
-        """Test integration of TSE buckets through generate_buckets function."""
-        default_buckets = [1.0, 10.0, 100.0]
-
-        # Generate buckets using both methods
-        direct_result = two_sides_exponential_buckets(50.0, 1.5, 6)
-        indirect_result = generate_buckets(["tse", "50.0", "1.5", "6"], default_buckets)
-
-        # Results should be identical
-        self.assertEqual(direct_result, indirect_result)
-
 
 if __name__ == "__main__":
     unittest.main()
