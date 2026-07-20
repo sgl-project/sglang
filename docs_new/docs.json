@@ -918,6 +918,7 @@
                       "docs/hardware-platforms/ascend-npus/best_practice/deepseek_r1",
                       "docs/hardware-platforms/ascend-npus/best_practice/deepseek_v3_2",
                       "docs/hardware-platforms/ascend-npus/best_practice/glm5_1",
+                      "docs/hardware-platforms/ascend-npus/best_practice/hy3",
                       "docs/hardware-platforms/ascend-npus/best_practice/kimi_k2_6",
                       "docs/hardware-platforms/ascend-npus/best_practice/minimax_m2_5",
                       "docs/hardware-platforms/ascend-npus/best_practice/mimo_v2_flash",
