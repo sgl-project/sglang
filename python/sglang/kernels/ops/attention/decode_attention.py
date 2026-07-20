@@ -1073,6 +1073,17 @@ def decode_attention_fwd(
             score_mod=score_mod,
             aux_tensors=aux_tensors,
         )
+
+
+# ============================================================================
+# Work-Centric (Lean) Attention: persistent-CTA + work-stealing decode kernel.
+# ============================================================================
+
+_LEAN_BLOCK_M = 16
+
+_NUM_CU = None
+
+
 def _lean_num_cus() -> int:
     """Number of compute units on the current device (cached).
 

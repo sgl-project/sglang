@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "python"))
 
 import torch
 
-from sglang.srt.layers.attention.triton_ops.decode_attention import (
+from sglang.kernels.ops.attention.decode_attention import (
     decode_attention_fwd,
     decode_attention_fwd_grouped,
     lean_decode_seqlen_gate,
