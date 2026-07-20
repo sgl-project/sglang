@@ -220,6 +220,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # these paths invalidate the dep-install layer, but Python source changes don't.
 COPY python/pyproject.toml /tmp/sglang_deps/python/pyproject.toml
 COPY rust/sglang-grpc      /tmp/sglang_deps/rust/sglang-grpc
+COPY rust/sglang-mm        /tmp/sglang_deps/rust/sglang-mm
 COPY proto                 /tmp/sglang_deps/proto
 
 # Install sglang dependencies (torch, transformers, etc.)
@@ -254,6 +255,10 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     && cd /sgl-workspace \
     && rm -rf /tmp/sglang_deps \
     && pip freeze | grep -v "^sglang==" > /sgl-workspace/constraints.txt
+
+# distro resolves to the apt python3-distro under /usr/lib/python3, which the runtime
+# stage does not COPY; force a pip copy into /usr/local so it survives the stage split.
+RUN python3 -m pip install --ignore-installed --no-deps distro
 
 ########################################################
 # PARALLEL STAGE 2: DeepEP Builder (needs torch_deps)
