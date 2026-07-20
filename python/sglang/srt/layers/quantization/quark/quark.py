@@ -20,6 +20,7 @@ from sglang.srt.layers.quantization.quark.schemes import (
     QuarkMoEScheme,
     QuarkW4A4MXFP4,
     QuarkW4A4MXFp4MoE,
+    QuarkW4A8MXFp4MoE,
     QuarkW8A8Fp8,
     QuarkW8A8FP8MoE,
 )
@@ -353,10 +354,12 @@ class QuarkConfig(QuantizationConfig):
 
             supported = capability >= min_capability
             if error and not supported:
+                # Pass a single joined message; RuntimeError stringifies
+                # multiple positional args as a tuple repr.
                 raise RuntimeError(
-                    "Quantization scheme is not supported for ",
-                    f"the current GPU. Min capability: {min_capability}. ",
-                    f"Current capability: {capability}.",
+                    "Quantization scheme is not supported for "
+                    f"the current GPU. Min capability: {min_capability}. "
+                    f"Current capability: {capability}."
                 )
             return supported
         else:
@@ -444,6 +447,28 @@ class QuarkConfig(QuantizationConfig):
 
         return True
 
+    def _is_mx_w4a8(
+        self,
+        weight_quant: Optional[dict[str, Any]],
+        input_quant: Optional[dict[str, Any]],
+    ) -> bool:
+        if weight_quant is None or input_quant is None:
+            return False
+
+        is_mx_fp4_weight = (
+            weight_quant.get("dtype") == "fp4"
+            and weight_quant.get("qscheme") == "per_group"
+            and weight_quant.get("group_size") == 32
+            and not weight_quant.get("is_dynamic")
+            and weight_quant.get("scale_format") == "e8m0"
+        )
+        is_static_fp8_activation = (
+            input_quant.get("dtype") in ("fp8_e4m3", "fp8_e4m3fn")
+            and input_quant.get("qscheme") == "per_tensor"
+            and not input_quant.get("is_dynamic")
+        )
+        return is_mx_fp4_weight and is_static_fp8_activation
+
     def _find_matched_config(
         self, layer_name: str, module: torch.nn.Module
     ) -> dict[str, Any]:
@@ -466,7 +491,7 @@ class QuarkConfig(QuantizationConfig):
             ):
                 raise ValueError(
                     f"Found a different quantization configuration for "
-                    f"{shard_proj_names} in {layer_name}. vLLM "
+                    f"{shard_proj_names} in {layer_name}. SGLang "
                     "requires all to use the same scheme."
                 )
             return shard_configs[0]
@@ -555,6 +580,9 @@ class QuarkConfig(QuantizationConfig):
                 input_config,
                 is_checkpoint_mxfp4_serialized=self.is_prequantized,
             )
+        elif self._is_mx_w4a8(weight_config, input_config):
+            logger.info_once("Using Quark MXFP4-W/FP8-A MoE scheme")
+            return QuarkW4A8MXFp4MoE(weight_config, input_config)
         elif self._is_fp8_w8a8(weight_config, input_config):
             return QuarkW8A8FP8MoE(weight_config, input_config)
         else:

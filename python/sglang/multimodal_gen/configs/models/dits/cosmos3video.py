@@ -25,23 +25,26 @@ def _build_cosmos3_param_names_mapping() -> dict:
         norm_moe_gen.weight                                    -> norm_moe_gen.weight
         time_embedder.linear_{1,2}.weight                      -> (pass-through)
         proj_in.weight, proj_out.weight                        -> (pass-through)
+        vae2llm.weight                                         -> proj_in.weight  (FP8 ckpt alias)
+        llm2vae.weight                                         -> proj_out.weight (FP8 ckpt alias)
 
     GEN patterns (`*_moe_gen`, `add_*`, `to_add_out`, `norm_added_*`) must
     precede the UND catch-all so the catch-all can't claim GEN keys.
     `norm.weight` and `lm_head.weight` are inherited from Qwen3-VL
-    pretraining and not used at inference; audio/action keys are reserved
-    for a future modality extension — all skipped via empty-string replacement.
+    pretraining and not used at inference; both are skipped.
+    Audio and action keys (``audio_proj_*``, ``action_proj_*``, modality
+    embeds) pass through unchanged.
     """
     return {
         # Inherited from Qwen3-VL pretraining; unused at diffusion inference.
         r"^lm_head\.weight$": "",
         r"^norm\.weight$": "",
-        # Audio / action modalities — not yet wired; skip to avoid load warnings.
-        r"^audio_.*$": "",
-        r"^action_.*$": "",
         # Top-level norms / embeddings.
         r"^norm_moe_gen\.(.*)$": r"norm_moe_gen.\1",
         r"^embed_tokens\.(.*)$": r"language_model.embed_tokens.\1",
+        # FP8 checkpoint aliases for the latent projection layers.
+        r"^vae2llm\.(.*)$": r"proj_in.\1",
+        r"^llm2vae\.(.*)$": r"proj_out.\1",
         # GEN pathway: per-layer (must run before the UND catch-all below).
         # Q/K/V merge into MergedColumnParallelLinear to_qkv (concat order: Q, K, V).
         r"^layers\.(\d+)\.self_attn\.add_q_proj\.(.*)$": (
@@ -151,6 +154,17 @@ class Cosmos3VideoArchConfig(DiTArchConfig):
     temporal_compression_factor: int = 4
     unified_3d_mrope_temporal_modality_margin: int = 15000
 
+    # Audio (sound) modality
+    sound_gen: bool = False
+    sound_dim: int = 64
+    sound_latent_fps: float = 25.0
+    temporal_compression_factor_sound: int = 1
+
+    # Action modality
+    action_gen: bool = False
+    action_dim: int = 64
+    num_embodiment_domains: int = 32
+
     # Timestep embedding
     timestep_scale: float = 0.001
     frequency_embedding_size: int = 256
@@ -167,6 +181,11 @@ class Cosmos3VideoArchConfig(DiTArchConfig):
     )
     reverse_param_names_mapping: dict = field(default_factory=dict)
     lora_param_names_mapping: dict = field(default_factory=dict)
+    # FP8 checkpoint quantization_config.ignore uses checkpoint module names;
+    # translate them to model names so is_layer_excluded matches correctly.
+    quant_ignore_remap: dict = field(
+        default_factory=lambda: {"vae2llm": "proj_in", "llm2vae": "proj_out"}
+    )
 
     def __post_init__(self):
         super().__post_init__()

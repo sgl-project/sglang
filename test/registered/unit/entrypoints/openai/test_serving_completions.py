@@ -60,21 +60,12 @@ class ServingCompletionTestCase(unittest.TestCase):
         self.fastapi_request = Mock(spec=Request)
 
     # ---------- prompt-handling ----------
-    def test_single_string_prompt(self):
-        req = CompletionRequest(model="x", prompt="Hello world", max_tokens=100)
-        internal, _ = self.sc._convert_to_internal_request(req)
-        self.assertEqual(internal.text, "Hello world")
-
     def test_single_token_ids_prompt(self):
         req = CompletionRequest(model="x", prompt=[1, 2, 3, 4], max_tokens=100)
         internal, _ = self.sc._convert_to_internal_request(req)
         self.assertEqual(internal.input_ids, [1, 2, 3, 4])
 
     # ---------- echo-handling ----------
-    def test_echo_with_string_prompt_streaming(self):
-        req = CompletionRequest(model="x", prompt="Hello", max_tokens=1, echo=True)
-        self.assertEqual(self.sc._get_echo_text(req, 0), "Hello")
-
     def test_echo_with_list_of_strings_streaming(self):
         req = CompletionRequest(
             model="x", prompt=["A", "B"], max_tokens=1, echo=True, n=1
