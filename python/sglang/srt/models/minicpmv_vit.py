@@ -31,7 +31,10 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.layers.activation import get_act_fn
-from sglang.srt.layers.attention.vision import VisionAttention
+from sglang.srt.layers.attention.vision import (
+    VisionAttention,
+    prepare_vision_attention_metadata,
+)
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.models.idefics2 import (
@@ -170,7 +173,14 @@ class MiniCPMV_ViTWindowAttentionMerger(nn.Module):
             window_cu_seqlens = window_cu_seqlens.to("cpu")
 
         hidden_states = hidden_states[:, window_index, :]
-        hidden_states = self.self_attn(hidden_states, cu_seqlens=window_cu_seqlens)
+        window_metadata = prepare_vision_attention_metadata(
+            window_cu_seqlens, device=hidden_states.device
+        )
+        hidden_states = self.self_attn(
+            hidden_states,
+            cu_seqlens=window_cu_seqlens,
+            forward_metadata=window_metadata,
+        )
         hidden_states = hidden_states[:, torch.argsort(window_index), :]
         hidden_states = residual + hidden_states
 
@@ -501,13 +511,20 @@ class MiniCPMV_VisionTransformer(nn.Module):
         cu_seqlens, max_seqlens = self.compute_cu_seqlens(target_sizes)
         if is_npu():
             cu_seqlens = cu_seqlens.to("cpu")
+        forward_metadata = prepare_vision_attention_metadata(
+            cu_seqlens, device=hidden_states.device
+        )
 
         if use_vit_merger:
             # Encoder loop lives here (not inside ``MiniCPMV_VisionEncoder``)
             # so we can fire ``vit_merger`` after layer ``insert_layer_id``
             # without coupling the encoder module to it.
             for layer_index, layer in enumerate(self.encoder.layers):
-                hidden_states = layer(hidden_states, cu_seqlens=cu_seqlens)
+                hidden_states = layer(
+                    hidden_states,
+                    cu_seqlens=cu_seqlens,
+                    forward_metadata=forward_metadata,
+                )
                 if layer_index == self.insert_layer_id:
                     (
                         hidden_states,
@@ -519,8 +536,15 @@ class MiniCPMV_VisionTransformer(nn.Module):
                     )
                     if is_npu():
                         cu_seqlens = cu_seqlens.to("cpu")
+                    forward_metadata = prepare_vision_attention_metadata(
+                        cu_seqlens, device=hidden_states.device
+                    )
         else:
-            hidden_states = self.encoder(hidden_states, cu_seqlens=cu_seqlens)
+            hidden_states = self.encoder(
+                hidden_states,
+                cu_seqlens=cu_seqlens,
+                forward_metadata=forward_metadata,
+            )
 
         hidden_states = self.post_layernorm(hidden_states)
         return hidden_states, target_sizes
