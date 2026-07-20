@@ -231,6 +231,58 @@ class TestDSATransformIndex(CustomTestCase):
         self._check_decode_case(17, 8192, provide_result=True)
         self._check_decode_case(17, 8192, zero_row_stride=True)
 
+    def test_decode_fast_partial_dp_padding(self):
+        real_rows = 3
+        padded_rows = 4
+        context_length = 8192
+        page_table = self._make_page_table(real_rows, context_length)
+        topk_indices = torch.cat(
+            [
+                self._make_topk(real_rows, context_length),
+                torch.full(
+                    (padded_rows - real_rows, TOPK),
+                    -1,
+                    dtype=torch.int64,
+                    device=self.device,
+                ),
+            ]
+        )
+        expected = torch.full(
+            (padded_rows, TOPK), -1, dtype=torch.int32, device=self.device
+        )
+        real_topk = topk_indices[:real_rows]
+        torch.gather(
+            page_table,
+            dim=1,
+            index=real_topk.clamp(min=0),
+            out=expected[:real_rows],
+        )
+        expected[:real_rows].masked_fill_(real_topk < 0, -1)
+        result = torch.full_like(expected, 12345)
+
+        actual = transform_index_page_table_decode_fast(
+            page_table=page_table,
+            topk_indices=topk_indices,
+            result=result,
+        )
+        torch.cuda.synchronize()
+
+        self.assertIs(actual, result)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    def test_decode_fast_rejects_extra_page_table_rows(self):
+        page_table = self._make_page_table(4, 8192)
+        topk_indices = self._make_topk(3, 8192)
+
+        with self.assertRaisesRegex(
+            AssertionError,
+            r"page_table rows \(4\) exceed topk_indices rows \(3\)",
+        ):
+            transform_index_page_table_decode_fast(
+                page_table=page_table,
+                topk_indices=topk_indices,
+            )
+
     def test_decode_fast_extreme_shapes(self):
         self._check_decode_case(8192, 4096)
         self._check_decode_case(2, 1_000_000)
