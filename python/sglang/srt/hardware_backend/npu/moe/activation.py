@@ -65,11 +65,36 @@ class NPUSwigluQuantWithScales(BaseActivation):
 
 
 class NPUSwigluDeepEPKernel(BaseActivation):
-    def __init__(self, need_quant: bool = True):
-        from sgl_kernel_npu.activation.swiglu_quant import swiglu_quant
+    """DeepEP grouped SwiGLU activation for the Ascend MoE runner.
 
-        self._kernel = swiglu_quant
+    Selects between the standard SwiGLU (``swiglu_quant``) and the MiniMax
+    SwiGLU-OAI variant (``swiglu_oai_quant``) based on whether the OAI
+    parameters (``alpha``/``limit``) are provided. MiniMax-M3 uses SwiGLU-OAI,
+    ``gate * sigmoid(gate * alpha) * (up + 1)`` with clamping, so the runner
+    must forward ``gemm1_alpha``/``gemm1_clamp_limit`` here — otherwise the
+    experts fall back to plain SwiGLU and produce wrong outputs.
+    """
+
+    def __init__(
+        self,
+        need_quant: bool = True,
+        alpha: Optional[float] = None,
+        limit: Optional[float] = None,
+    ):
         self.need_quant = need_quant
+        self.alpha = alpha
+        self.limit = limit
+        self._use_oai = alpha is not None and limit is not None
+        if self._use_oai:
+            from sglang.kernels.ops.activation.npu_swiglu_oai_quant import (
+                swiglu_oai_quant,
+            )
+
+            self._kernel = swiglu_oai_quant
+        else:
+            from sgl_kernel_npu.activation.swiglu_quant import swiglu_quant
+
+            self._kernel = swiglu_quant
 
     def _apply_activation(
         self,
@@ -77,9 +102,19 @@ class NPUSwigluDeepEPKernel(BaseActivation):
         group_list: torch.Tensor,
         group_list_type: int,
     ):
-        hidden_states, per_token_scale = self._kernel(
-            hidden_states, group_list, group_list_type, need_quant=self.need_quant
-        )
+        if self._use_oai:
+            hidden_states, per_token_scale = self._kernel(
+                hidden_states,
+                self.alpha,
+                self.limit,
+                need_quant=self.need_quant,
+                group_list=group_list,
+                group_list_type=group_list_type,
+            )
+        else:
+            hidden_states, per_token_scale = self._kernel(
+                hidden_states, group_list, group_list_type, need_quant=self.need_quant
+            )
         if self.need_quant:
             return hidden_states, per_token_scale
         return hidden_states, None

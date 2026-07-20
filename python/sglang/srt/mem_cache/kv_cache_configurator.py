@@ -852,7 +852,15 @@ class KVCacheConfigurator:
             PageMajorMHATokenToKVPool if enable_page_major else MHATokenToKVPool
         )
 
-        if is_dsv4_model:
+        # MiniMax sparse-attention models need their dedicated sparse KV pool
+        # regardless of attention backend — without this early check the
+        # ascend/oout-of-tree/MLA branches below would route them to a generic
+        # MHA pool, which the MiniMax sparse backend rejects.
+        if is_minimax_sparse(self.model_config.hf_config):
+            token_to_kv_pool = self._build_minimax_sparse_kv_pool(
+                max_total_num_tokens=sizes.max_total_num_tokens,
+            )
+        elif is_dsv4_model:
             token_to_kv_pool = self._build_dsv4_kv_pool(
                 max_running_requests=sizes.max_running_requests,
                 swa_max_total_num_tokens=sizes.swa_max_total_num_tokens,
@@ -915,10 +923,6 @@ class KVCacheConfigurator:
                     full_max_total_num_tokens=sizes.full_max_total_num_tokens,
                     swa_max_total_num_tokens=sizes.swa_max_total_num_tokens,
                     mha_pool_class=mha_pool_class,
-                )
-            elif is_minimax_sparse(self.model_config.hf_config):
-                token_to_kv_pool = self._build_minimax_sparse_kv_pool(
-                    max_total_num_tokens=sizes.max_total_num_tokens,
                 )
             elif self.mambaish_config:
                 token_to_kv_pool = self._build_hybrid_linear_kv_pool(
@@ -1321,7 +1325,18 @@ class KVCacheConfigurator:
         disable_value_sparse_layer_ids = get_minimax_sparse_disable_value_layer_ids(
             sparse_cfg
         )
-        token_to_kv_pool = MiniMaxSparseKVPool(
+        # On NPU the wrapper must inject the NPU paged pool classes, whose
+        # _create_buffers builds data_ptrs without the uint64 cat that aclnnCat
+        # does not support.
+        if _is_npu:
+            from sglang.srt.hardware_backend.npu.memory_pool_npu import (
+                NPUMiniMaxSparseKVPool,
+            )
+
+            pool_cls = NPUMiniMaxSparseKVPool
+        else:
+            pool_cls = MiniMaxSparseKVPool
+        token_to_kv_pool = pool_cls(
             size=max_total_num_tokens,
             page_size=self.pool_page_size,
             dtype=self.kv_cache_dtype,

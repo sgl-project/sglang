@@ -101,7 +101,11 @@ class AscendRunnerCore(MoeRunnerCore):
             is_quant_kernel = isinstance(
                 kernel, (NPUW4A8Int8MoEMethod, NPUW8A8Int8MoEMethod)
             )
-            self.activation = NPUSwigluDeepEPKernel(need_quant=is_quant_kernel)
+            self.activation = NPUSwigluDeepEPKernel(
+                need_quant=is_quant_kernel,
+                alpha=config.gemm1_alpha,
+                limit=config.gemm1_clamp_limit,
+            )
         else:
             # Non‑DeepEP (ascend_tp) path
             # 1. Choose the base activation according to the quant method

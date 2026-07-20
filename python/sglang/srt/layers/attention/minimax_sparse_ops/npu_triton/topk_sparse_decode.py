@@ -6,6 +6,10 @@ import torch
 import triton
 import triton.language as tl
 
+# Default launch config for the sparse-decode kernel (overridable per call).
+_SPARSE_DECODE_NW = 4
+_SPARSE_DECODE_NS = 2
+
 # =============================================================================
 # Utilities
 # =============================================================================

@@ -190,6 +190,7 @@ from sglang.srt.server_args import (  # noqa: F401  (re-export)
 )
 from sglang.srt.speculative import spec_cycle_profiler
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
 from sglang.srt.state_capturer.base import TopkCaptureOutput
 from sglang.srt.state_capturer.indexer_topk import (
     create_indexer_capturer,

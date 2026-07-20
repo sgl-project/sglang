@@ -94,7 +94,8 @@ class ModelSlimW8A8Int8MoE(ModelSlimMoEScheme):
         set_weight_attrs(offset, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        self.kernel.process_weights_after_loading(layer)
+        """Delegate weight processing to the kernel for the assigned weight group."""
+        self.kernel.process_weights_after_loading(layer, self.weight_prefix)
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig

@@ -43,9 +43,7 @@ from sglang.srt.layers.communicator import (
     enable_moe_dense_fully_dp,
 )
 from sglang.srt.layers.dp_attention import (
-    get_attention_tp_group,
-    get_attention_tp_rank,
-    get_attention_tp_size,
+    get_attn_tp_group,
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layernorm import GemmaRMSNorm, RMSNorm
@@ -232,7 +230,7 @@ class MiniMaxM3MLP(nn.Module):
     @staticmethod
     def _swigluoai_fused(x: torch.Tensor, alpha: float, limit: float) -> torch.Tensor:
         """swiglu_oai using fused Triton kernel (sgl_kernel_npu), no quant."""
-        from sglang.srt.layers.triton_ops.npu_swiglu_oai_quant import swiglu_oai_quant
+        from sglang.kernels.ops.activation.npu_swiglu_oai_quant import swiglu_oai_quant
 
         out, _ = swiglu_oai_quant(x, alpha, limit, need_quant=False)
         return out
@@ -532,6 +530,7 @@ class MiniMaxM3Attention(nn.Module):
         self.max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         self.rotary_dim = getattr(config, "rotary_dim", self.head_dim)
 
+        self.use_qk_norm = getattr(config, "use_qk_norm", False)
         self.qk_norm_type = getattr(config, "qk_norm_type", "per_layer")
         self.use_gemma_norm = getattr(config, "use_gemma_norm", False)
 
@@ -1064,7 +1063,7 @@ class MiniMaxM3Attention(nn.Module):
             rotary_dim=self.rotary_dim,
             eps=self.q_norm.variance_epsilon,
             tp_world=getattr(self.q_norm, "attn_tp_size", self.attn_tp_size),
-            tp_group=get_attention_tp_group().device_group,
+            tp_group=get_attn_tp_group().device_group,
         )
         inner_state = (q, k, v, None, forward_batch)
         return None, forward_batch, inner_state

@@ -205,7 +205,7 @@ class ModelSlimConfig(QuantizationConfig):
             if "vision_tower" in prefix or "mm_projector" in prefix:
                 prefix = prefix.replace(r"attn.qkv_proj", r"wqkv")
                 prefix = prefix.replace(r"attn.proj", r"wo")
-            packed_modules_mapping_subset = self.packed_modules_mapping.get(key, {})
+            packed_modules_mapping_subset = self.get_packed_modules_mapping_subset(key)
             prefix_in_quant_config = prefix
             proj_name = prefix.split(".")[-1]
             if proj_name in packed_modules_mapping_subset:
@@ -344,28 +344,34 @@ class ModelSlimConfig(QuantizationConfig):
 
         w13_scheme_name = None
         w2_scheme_name = None
-        for gate_name, up_name, down_name in naming_conventions:
-            w13_keys = [
-                f"{prefix}.0.{gate_name}.weight",
-                f"{prefix}.0.{up_name}.weight",
-            ]
-            w2_key = f"{prefix}.0.{down_name}.weight"
-            w13_entries = {
-                key: self.quant_description[key]
-                for key in w13_keys
-                if key in self.quant_description
-            }
-            if w13_entries and w2_key in self.quant_description:
-                w13_names = list(w13_entries.values())
-                # For w13, both projections must agree on the scheme
-                unique_w13 = set(w13_names)
-                if len(unique_w13) > 1:
-                    raise ValueError(
-                        f"Mismatched ModelSlim quantization for W13 in layer {prefix}: "
-                        f"{w13_entries}"
-                    )
-                w13_scheme_name = w13_names[0]
-                w2_scheme_name = self.quant_description[w2_key]
+        # The model exposes experts under ``mlp.experts`` while many checkpoints
+        # (incl. MiniMax-M3) store them under ``block_sparse_moe.experts``; try
+        # both aliases via iter_moe_prefix_aliases.
+        for quant_prefix in dict.fromkeys(self.iter_moe_prefix_aliases(prefix)):
+            for gate_name, up_name, down_name in naming_conventions:
+                w13_keys = [
+                    f"{quant_prefix}.0.{gate_name}.weight",
+                    f"{quant_prefix}.0.{up_name}.weight",
+                ]
+                w2_key = f"{quant_prefix}.0.{down_name}.weight"
+                w13_entries = {
+                    key: self.quant_description[key]
+                    for key in w13_keys
+                    if key in self.quant_description
+                }
+                if w13_entries and w2_key in self.quant_description:
+                    w13_names = list(w13_entries.values())
+                    # For w13, both projections must agree on the scheme
+                    unique_w13 = set(w13_names)
+                    if len(unique_w13) > 1:
+                        raise ValueError(
+                            f"Mismatched ModelSlim quantization for W13 in layer {prefix}: "
+                            f"{w13_entries}"
+                        )
+                    w13_scheme_name = w13_names[0]
+                    w2_scheme_name = self.quant_description[w2_key]
+                    break
+            if w13_scheme_name is not None:
                 break
 
         if w13_scheme_name is None:
@@ -516,7 +522,8 @@ class ModelSlimFusedMoEMethod(FusedMoEMethodBase):
         self.quantization_config = quantization_config
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        _require_modelslim_scheme(layer, "MoE").process_weights_after_loading(layer)
+        layer.w13_scheme.process_weights_after_loading(layer)
+        layer.w2_scheme.process_weights_after_loading(layer)
 
     def create_weights(
         self,
@@ -528,11 +535,18 @@ class ModelSlimFusedMoEMethod(FusedMoEMethodBase):
         **extra_weight_attrs,
     ):
         """
-        Use the ModelSlimMoEScheme associated with the layer to create
-        the necessary parameters for the layer. See FusedMoEMethodBase for param
-        details
+        Use the w13/w2 ModelSlimMoESchemes on the layer to create the
+        parameters for each projection group. See FusedMoEMethodBase for details.
         """
-        _require_modelslim_scheme(layer, "MoE").create_weights(
+        layer.w13_scheme.create_weights(
+            layer=layer,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size_per_partition=intermediate_size_per_partition,
+            weight_prefix="w13",
+            **extra_weight_attrs,
+        )
+        layer.w2_scheme.create_weights(
             layer=layer,
             num_experts=num_experts,
             hidden_size=hidden_size,
@@ -544,9 +558,12 @@ class ModelSlimFusedMoEMethod(FusedMoEMethodBase):
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
-        return _require_modelslim_scheme(layer, "MoE").create_moe_runner(
-            layer, moe_runner_config
-        )
+        moe_runner_config.layer = layer
+        self.moe_runner_config = moe_runner_config
+        backend = get_moe_runner_backend()
+        if backend.is_auto():
+            backend = MoeRunnerBackend.ASCEND
+        self.runner = MoeRunner(backend, moe_runner_config)
 
     def apply(
         self,

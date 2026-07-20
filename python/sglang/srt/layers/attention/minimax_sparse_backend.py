@@ -13,7 +13,7 @@ from sglang.srt.configs.model_config import (
     get_minimax_sparse_score_type,
 )
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.minimax_sparse_ops.common.index import (
+from sglang.kernels.ops.attention.minimax_sparse.common.index import (
     topk_index_reduce,
 )
 from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
@@ -299,12 +299,15 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             )
         self._msa_dec_meta = None
         if self.use_msa:
-            from sglang.srt.layers.dp_attention import get_attention_tp_size
+            from sglang.srt.layers.dp_attention import (
+                get_attn_tensor_model_parallel_world_size,
+            )
 
             # Per-rank head counts for the decode plan (== runtime q.shape[1] /
             # k_cache.shape[1]); needed in out_graph where q/k_cache aren't available.
             self.num_q_heads = (
-                runner.model_config.num_attention_heads // get_attention_tp_size()
+                runner.model_config.num_attention_heads
+                // get_attn_tensor_model_parallel_world_size()
             )
             # KV head count lives on the main sub-pool (== runtime k_cache.shape[1]).
             self.num_kv_heads = self.kv_pool.main_pool.head_num
