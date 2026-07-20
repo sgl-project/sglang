@@ -84,6 +84,8 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "decode_attention_backend",
                     "flashinfer_allreduce_fusion_backend",
                     "fp8_gemm_runner_backend",
+                    "disable_custom_all_reduce",
+                    "enable_aiter_allreduce_fusion",
                 }
             ),
         )
