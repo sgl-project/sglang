@@ -33,6 +33,8 @@ on:
           - nightly-test-1-gpu-mi35x-rocm720
           # Diagnostic: isolate the AITER CKTile cold-JIT build on MI35x
           - aiter-cktile-jit-probe-rocm720
+          # Diagnostic: isolate DSV4 Pro A8W8 Triton routing regressions
+          - aiter-dsv4-a8w8-route-probe-rocm720
           # 2-GPU and 4-GPU Tests (MI30x + MI35x)
           - nightly-accuracy-2-gpu-rocm720
           - nightly-accuracy-2-gpu-vlm-rocm720
@@ -271,6 +273,123 @@ jobs:
             echo "- case: \`${{ matrix.case_name }}\`"
             echo "- AITER: \`${{ matrix.aiter_commit }}\`"
             echo "- preload patched to 16: \`${{ matrix.patch_preload }}\`"
+            echo "- probe outcome: \`${{ steps.probe.outcome }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # Diagnostic-only job. Compare the exact DSV4 Pro failure shapes with the
+  # current tuned routes, the routes before AITER #4202, and the old AITER.
+  aiter-dsv4-a8w8-route-probe-rocm720:
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && contains(format(',{0},', inputs.job_filter || inputs.job_select), ',aiter-dsv4-a8w8-route-probe-rocm720,')
+    name: AITER DSV4 A8W8 route probe (${{ matrix.case_name }})
+    runs-on: linux-mi35x-gpu-1
+    timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - case_name: pro-new-routes
+            shape_name: pro
+            aiter_commit: 2174467dfb06ad885bb973aa73dd001222de1469
+            restore_old_routes: false
+          - case_name: pro-new-old-routes
+            shape_name: pro
+            aiter_commit: 2174467dfb06ad885bb973aa73dd001222de1469
+            restore_old_routes: true
+          - case_name: pro-old
+            shape_name: pro
+            aiter_commit: 9127c94a18e4398e1eba91f6639e910f0994ad02
+            restore_old_routes: false
+          - case_name: pro-mtp-new-routes
+            shape_name: pro-mtp
+            aiter_commit: 2174467dfb06ad885bb973aa73dd001222de1469
+            restore_old_routes: false
+          - case_name: pro-mtp-new-old-routes
+            shape_name: pro-mtp
+            aiter_commit: 2174467dfb06ad885bb973aa73dd001222de1469
+            restore_old_routes: true
+          - case_name: pro-mtp-old
+            shape_name: pro-mtp
+            aiter_commit: 9127c94a18e4398e1eba91f6639e910f0994ad02
+            restore_old_routes: false
+    env:
+      AITER_COMMIT_OVERRIDE: ${{ matrix.aiter_commit }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
+
+      - name: Setup docker (ROCm 7.2)
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install selected AITER commit
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
+
+      - name: Restore pre-#4202 DeepSeek routes
+        if: matrix.restore_old_routes
+        run: |
+          docker exec ci_sglang bash -lc '
+            set -euo pipefail
+            base=95abba4755d22bab343db04b79b6840c4f44a581^
+            repo=/sgl-workspace/aiter
+            for file in \
+              aiter/configs/model_configs/a8w8_blockscale_bpreshuffle_tuned_gemm_dsv3.csv \
+              aiter/configs/model_configs/dsv4_a8w8_blockscale_bpreshuffle_tuned_gemm.csv; do
+              git -C "$repo" show "$base:$file" > "$repo/$file"
+            done
+            rm -rf /tmp/aiter_configs
+            git -C "$repo" diff --stat
+          '
+
+      - name: Verify experiment inputs
+        run: |
+          docker exec ci_sglang bash -lc '
+            git -C /sgl-workspace/aiter rev-parse HEAD
+            git -C /sgl-workspace/aiter status --short
+            python3 -c "import torch; print(torch.version.hip); print(torch.cuda.get_device_name(0))"
+          '
+
+      - name: Run routed GEMM and CUDA graph probe
+        id: probe
+        timeout-minutes: 35
+        env:
+          CASE_NAME: ${{ matrix.case_name }}
+          SHAPE_NAME: ${{ matrix.shape_name }}
+        run: |
+          set -o pipefail
+          docker exec \
+            -e AITER_LOG_MORE=1 \
+            -e AITER_LOG_TUNED_CONFIG=1 \
+            ci_sglang \
+            timeout --signal=TERM --kill-after=60s 30m \
+            python3 -u /sglang-checkout/scripts/ci/amd/aiter_dsv4_a8w8_route_probe.py \
+              --shape "${SHAPE_NAME}" \
+            2>&1 | tee "aiter-dsv4-a8w8-${CASE_NAME}.log"
+
+      - name: Upload probe log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: aiter-dsv4-a8w8-${{ matrix.case_name }}
+          path: aiter-dsv4-a8w8-${{ matrix.case_name }}.log
+          if-no-files-found: warn
+
+      - name: Summarize probe
+        if: always()
+        run: |
+          {
+            echo "### AITER DSV4 A8W8 route probe"
+            echo "- case: \`${{ matrix.case_name }}\`"
+            echo "- shape: \`${{ matrix.shape_name }}\`"
+            echo "- AITER: \`${{ matrix.aiter_commit }}\`"
+            echo "- restored pre-#4202 routes: \`${{ matrix.restore_old_routes }}\`"
             echo "- probe outcome: \`${{ steps.probe.outcome }}\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
