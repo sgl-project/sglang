@@ -14,7 +14,13 @@ from transformers.modeling_outputs import BaseModelOutput, BaseModelOutputWithPo
 from sglang.srt.environ import envs
 from sglang.srt.layers.activation import get_act_fn
 from sglang.srt.layers.attention import vision_utils
-from sglang.srt.layers.attention.vision import SingletonCache, VisionAttention
+from sglang.srt.layers.attention.vision import (
+    SingletonCache,
+    VisionAttention,
+    VisionAttentionMetadata,
+    _get_cu_seqlens_for_shape,
+    prepare_vision_attention_metadata,
+)
 from sglang.srt.layers.conv import Conv2dLayer
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
@@ -86,8 +92,14 @@ class InternAttention(nn.Module):
         hidden_states: torch.Tensor,
         cu_seqlens: torch.Tensor,
         output_ws: Optional[torch.Tensor] = None,
+        forward_metadata: Optional[VisionAttentionMetadata] = None,
     ) -> torch.Tensor:
-        out = self.attn(hidden_states, cu_seqlens=cu_seqlens, output_ws=output_ws)
+        out = self.attn(
+            hidden_states,
+            cu_seqlens=cu_seqlens,
+            output_ws=output_ws,
+            forward_metadata=forward_metadata,
+        )
         outs = self.proj_drop(out)
         return outs
 
@@ -259,11 +271,8 @@ class InternVisionEncoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         cu_seqlens: torch.Tensor,
         output_ws: Optional[torch.Tensor] = None,
-    ) -> Tuple[
-        torch.FloatTensor,
-        Optional[torch.FloatTensor],
-        Optional[Tuple[torch.FloatTensor]],
-    ]:
+        forward_metadata: Optional[VisionAttentionMetadata] = None,
+    ) -> torch.FloatTensor:
         """
         Args:
             hidden_states (`Tuple[torch.FloatTensor, Optional[torch.FloatTensor]]`): input to the layer of shape `(batch, seq_len, embed_dim)`
@@ -274,6 +283,7 @@ class InternVisionEncoderLayer(nn.Module):
                 self.norm1(hidden_states).to(hidden_states.dtype),
                 cu_seqlens=cu_seqlens,
                 output_ws=output_ws,
+                forward_metadata=forward_metadata,
             )
             * self.ls1
         )
@@ -344,7 +354,6 @@ class InternVisionEncoder(nn.Module):
                 Whether or not to return a [`~utils.ModelOutput`] instead of a plain tuple.
         """
         if self.enable_cg and (not output_hidden_states):
-            # graph path only returns last_hidden_state
             hidden_states = inputs_embeds.to(device=inputs_embeds.device).contiguous()
             hidden_states = self.cuda_graph_runner.run(hidden_states)
             if not return_dict:
@@ -364,12 +373,26 @@ class InternVisionEncoder(nn.Module):
         hidden_states = inputs_embeds
 
         if cu_seqlens is None:
+            bsz, seq_len, _ = inputs_embeds.shape
+            cu_seqlens = _get_cu_seqlens_for_shape(
+                bsz, seq_len, device=inputs_embeds.device
+            )
+        forward_metadata = None
+        if isinstance(cu_seqlens, torch.Tensor):
+            forward_metadata = prepare_vision_attention_metadata(
+                cu_seqlens, device=inputs_embeds.device
+            )
+        elif cu_seqlens is None:
             cu_seqlens = SingletonCache()
 
         for idx, encoder_layer in enumerate(self.layers):
             if output_hidden_states:
                 encoder_states = encoder_states + (hidden_states,)
-            layer_outputs = encoder_layer(hidden_states, cu_seqlens=cu_seqlens)
+            layer_outputs = encoder_layer(
+                hidden_states,
+                cu_seqlens=cu_seqlens,
+                forward_metadata=forward_metadata,
+            )
             hidden_states = layer_outputs
 
         if output_hidden_states:
