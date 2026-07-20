@@ -440,6 +440,10 @@ from sglang.srt.entrypoints.v1_loads import router as v1_loads_router
 
 app.include_router(v1_loads_router)
 
+from sglang.srt.entrypoints.elastic_ep import router as elastic_ep_router
+
+app.include_router(elastic_ep_router)
+
 
 def _anthropic_validation_message(raw_errors) -> str:
     """Render Pydantic-style errors for an Anthropic /v1/messages route.
@@ -797,6 +801,11 @@ if os.environ.get("DUMPER_SERVER_PORT") == "reuse":
     async def _dumper_control_handler(method: str, request: Request):
         body_bytes = await request.body()
         body = await request.json() if body_bytes else {}
+        if not isinstance(body, dict):
+            return ORJSONResponse(
+                status_code=400,
+                content={"error": "Request body must be a JSON object."},
+            )
         obj = DumperControlReqInput(method=method, body=body)
         results = await _global_state.tokenizer_manager.dumper_control(obj)
         if any(not r.success for r in results):
@@ -2014,6 +2023,46 @@ def _admin_api_key_missing_response(
 # Minimal 32x32 black PNG (base64, GLM4v requires at least 32x32 sized image)
 MINIMUM_PNG_PICTURE_BASE64 = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAACXBIWXMAAA7EAAAOxAGVKw4bAAAAbUlEQVRYhe3VsQ2AMAxE0Y/lIgNQULD/OqyCMgCihCKSG4yRuKuiNH6JLsoEbMACOGBcua9HOR7Y6w6swBwMy0qLTpkeI77qdEBpBFAHBBDAGH8WrwJKI4AAegUCfAKgEgpQDvh3CR3oQCuav58qlAw73kKCSgAAAABJRU5ErkJggg=="
 
+# Kimi K2.5/K2.7 runs its MoonViT position interpolation through torch.compile.
+# The minimal image above does not exercise a representative image shape and
+# leaves the first client request paying the compilation cost. Keep this
+# narrowly scoped: a larger default warmup image would unnecessarily lengthen
+# startup for VLMs whose encoders do not have this behavior.
+KIMI_VLM_WARMUP_PNG_PICTURE_BASE64 = "iVBORw0KGgoAAAANSUhEUgAAAgAAAAIACAIAAAB7GkOtAAADEUlEQVR42u3BgQAAAADDoPlTX+EAVQEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMBvArQAAf/YBFAAAAAASUVORK5CYII="
+
+# Kimi K3's native vision preprocessing uses a 14x14 spatial patch size. A
+# 448x448 image exercises a representative 32x32 patch grid without padding.
+KIMI_K3_VLM_WARMUP_PNG_PICTURE_BASE64 = "iVBORw0KGgoAAAANSUhEUgAAAcAAAAHACAIAAAC6Ry8kAAACX0lEQVR42u3BMQEAAADCoPVPbQwfoAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAtwEyRwAB32QPDQAAAABJRU5ErkJggg=="
+
+
+def _get_vlm_warmup_image_base64(model_info: dict) -> str:
+    """Choose the VLM image used by the startup warmup request.
+
+    A 512x512 image triggers Kimi K2.5/K2.7's representative compiled
+    position-interpolation path during startup. Kimi K3 uses a 448x448 image
+    matching its native vision patch grid. This keeps one-time vision setup
+    work out of the first external image request.
+    Other VLMs retain the minimal image to avoid changing their startup cost.
+    """
+
+    architectures = model_info.get("architectures") or []
+    if (
+        "KimiK3ForConditionalGeneration" in architectures
+        or model_info.get("model_type") == "kimi_k3"
+    ):
+        logger.info(
+            "Using a 448x448 image for Kimi K3 VLM startup warmup to exercise "
+            "its native 32x32 vision patch grid."
+        )
+        return KIMI_K3_VLM_WARMUP_PNG_PICTURE_BASE64
+    if "KimiK25ForConditionalGeneration" in architectures:
+        logger.info(
+            "Using a 512x512 image for Kimi VLM startup warmup to compile "
+            "MoonViT position interpolation."
+        )
+        return KIMI_VLM_WARMUP_PNG_PICTURE_BASE64
+    return MINIMUM_PNG_PICTURE_BASE64
+
 
 async def _send_disaggregation_warmup_requests(
     server_args: ServerArgs,
@@ -2086,7 +2135,13 @@ def _execute_server_warmup(server_args: ServerArgs):
     model_info = res.json()
 
     # Construct a warmup request (MLX: text warmup for VLM-advertising models; TODO: enable image warmup).
-    is_vlm = bool(model_info.get("has_image_understanding", False)) and not is_mps()
+    # A language-only worker may advertise VLM capability for encoder
+    # disaggregation, but its local warmup must stay on the text path.
+    is_vlm = (
+        bool(model_info.get("has_image_understanding", False))
+        and not server_args.language_only
+        and not is_mps()
+    )
     if model_info["is_generation"]:
         if is_vlm and not server_args.skip_tokenizer_init:
             request_name = "/v1/chat/completions"
@@ -2122,7 +2177,8 @@ def _execute_server_warmup(server_args: ServerArgs):
                         {
                             "type": "image_url",
                             "image_url": {
-                                "url": f"data:image/png;base64,{MINIMUM_PNG_PICTURE_BASE64}"
+                                "url": "data:image/png;base64,"
+                                f"{_get_vlm_warmup_image_base64(model_info)}"
                             },
                         },
                         {
@@ -2208,8 +2264,16 @@ def _wait_and_warmup(
     if server_args.checkpoint_engine_wait_weights_before_ready:
         _wait_weights_ready()
 
-    # Send a warmup request
-    if not server_args.skip_server_warmup:
+    # Joiner schedulers are served through the primary after adoption.
+    skip_elastic_joiner_warmup = server_args.is_ep_scale_joiner
+    if skip_elastic_joiner_warmup:
+        logger.debug(
+            "[Elastic EP] Skipping server warmup for elastic joiner "
+            "(ep_join_mode=%s)",
+            server_args.ep_join_mode,
+        )
+
+    if not server_args.skip_server_warmup and not skip_elastic_joiner_warmup:
         if not execute_warmup_func(server_args):
             return
     else:
