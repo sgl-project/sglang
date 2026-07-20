@@ -29,6 +29,8 @@ from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.mem_cache.unified_cache_components import ComponentType
 
 if TYPE_CHECKING:
+    import torch
+
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
     from sglang.srt.mem_cache.hi_mamba_radix_cache import HiMambaRadixCache
     from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
