@@ -22,6 +22,15 @@ from sglang.srt.model_executor.model_runner_components.layer_setup import (
 
 logger = logging.getLogger(__name__)
 
+# Ratio of auxiliary-state slots to concurrently running requests on hybrid /
+# linear-attention models when the radix cache is enabled. Each running
+# request holds one live slot (MlxAuxiliaryStateReqToTokenPool.alloc); the
+# headroom covers radix-held snapshots and chunk track buffers. Used for BOTH
+# the default pool sizing and the concurrency bound in
+# _resolve_max_running_requests so the two cannot drift apart. See
+# _aux_state_slots_per_request for the radix-disabled case.
+MLX_AUX_STATE_SIZE_MAX_RUNNING_REQUESTS_RATIO = 4
+
 
 class _DummyKVCache(KVCache):
     """Scheduler-facing KV cache that allocates no GPU memory.
@@ -123,6 +132,74 @@ class MlxModelRunnerStub(ModelRunner):
         self.dtype = self.model_config.dtype
         self.weight_load_mem_usage = 0
 
+    def _aux_state_slots_per_request(self) -> int:
+        """Auxiliary-state slots to reserve per concurrently running request.
+
+        Mirrors ``ModelRunnerKVCacheMixin._calculate_mamba_ratio``: with the
+        radix cache disabled there are no radix-held snapshots (the MLX
+        prefill path returns before any tracked-state store), so each live
+        request holds exactly one slot. No extra-buffer ratio term applies on
+        MLX: ``ServerArgs.enable_mamba_extra_buffer()`` requires the radix
+        cache to be enabled, and on that path the MLX radix component
+        (``MlxAuxiliaryStateComponent``) raises ``NotImplementedError`` for
+        the mode.
+        """
+        if self.server_args.disable_radix_cache:
+            return 1
+        return MLX_AUX_STATE_SIZE_MAX_RUNNING_REQUESTS_RATIO
+
+    def _resolve_max_running_requests(self) -> int:
+        """Concurrency cap handed to the scheduler.
+
+        Honors ``--max-running-requests``, mirroring the base runner's clamp
+        (``model_runner_kv_cache_mixin._resolve_max_num_reqs``): the requested
+        value is split per dp worker and capped by the KV pool capacity. When
+        the flag is unset, fall back to a capacity-based default.
+
+        On hybrid / linear-attention models the concurrency is additionally
+        bounded by the auxiliary-state pool: each running request allocates one
+        slot out of ``max_mamba_cache_size`` (asserting when exhausted), so a
+        cap the pool cannot back would crash mid-serving instead of failing
+        at startup. Mirrors the base resolver's mamba bound and zero-reject.
+
+        Requires ``self.max_total_num_tokens`` to already be set.
+        """
+        capacity_cap = self.max_total_num_tokens // 2
+        requested = self.server_args.max_running_requests
+        if requested is None:
+            requested_per_worker = None
+            resolved = min(capacity_cap, 4096)
+        else:
+            requested_per_worker = requested // self.dp_size
+            resolved = min(requested_per_worker, capacity_cap)
+
+        aux_state_size = self.server_args.max_mamba_cache_size
+        if (
+            mambaish_config(self.model_config) is not None
+            and aux_state_size is not None
+        ):
+            ratio = self._aux_state_slots_per_request()
+            resolved = min(resolved, aux_state_size // ratio)
+            if resolved <= 0:
+                raise RuntimeError(
+                    f"MLX auxiliary-state cache is too small to serve any "
+                    f"requests: max_mamba_cache_size={aux_state_size} backs "
+                    f"only {aux_state_size // ratio} concurrent requests "
+                    f"({ratio} slots per request). Increase "
+                    f"--max-mamba-cache-size to at least {ratio}, or leave it "
+                    f"unset to size the pool from the concurrency cap."
+                )
+
+        if requested_per_worker is not None and resolved < requested_per_worker:
+            logger.warning(
+                "max_running_requests was reduced from the requested %d to %d "
+                "(per dp worker) due to the available KV cache or "
+                "auxiliary-state capacity.",
+                requested_per_worker,
+                resolved,
+            )
+        return resolved
+
     def initialize(self):
         """Lightweight initialize that skips heavy PyTorch setup.
 
@@ -159,23 +236,26 @@ class MlxModelRunnerStub(ModelRunner):
             self.max_total_num_tokens = self._mlx_pool_size
         else:
             self.max_total_num_tokens = self.model_config.context_len
-        self.max_running_requests = min(
-            self.max_total_num_tokens // 2,
-            4096,
-        )
+        self.max_running_requests = self._resolve_max_running_requests()
         self.is_hybrid_swa = False
 
         # Create minimal pools
         if mambaish_config(self.model_config) is not None:
             auxiliary_state_size = self.server_args.max_mamba_cache_size
             if auxiliary_state_size is None:
-                auxiliary_state_size = self.max_running_requests * 4
+                auxiliary_state_size = (
+                    self.max_running_requests * self._aux_state_slots_per_request()
+                )
             self.req_to_token_pool = MlxAuxiliaryStateReqToTokenPool(
                 size=self.max_running_requests,
                 max_context_len=self.model_config.context_len,
                 device="cpu",
                 enable_memory_saver=False,
                 auxiliary_state_size=auxiliary_state_size,
+                # With the radix cache disabled no tree component exists to
+                # release auxiliary slots, so the pool owns their release
+                # (see MlxAuxiliaryStateReqToTokenPool docstring).
+                owns_auxiliary_state_release=self.server_args.disable_radix_cache,
             )
         else:
             self.req_to_token_pool = ReqToTokenPool(
