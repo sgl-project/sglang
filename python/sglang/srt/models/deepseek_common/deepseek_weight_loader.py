@@ -204,6 +204,7 @@ class DeepseekV2WeightLoaderMixin:
             futures = []
             params_dict = dict(self.named_parameters())
             weight_names = []
+
             for name, loaded_weight in weights:
                 use_async_loading = should_async_load(loaded_weight)
                 layer_id = get_layer_id(name)

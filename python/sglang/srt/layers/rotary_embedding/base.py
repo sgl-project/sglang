@@ -65,7 +65,7 @@ if _is_npu:
         )
 
 if _is_hip:
-    from sglang.srt.layers.attention.utils import (
+    from sglang.kernels.ops.attention.utils import (
         fused_qk_rope_reshape_and_cache,
     )
 
@@ -95,7 +95,7 @@ class RotaryEmbedding(MultiPlatformOp):
 
         cache = self._compute_cos_sin_cache()
         # NOTE(ByronHsu): cache needs to be in FP32 for numerical stability.
-        if not (_is_cuda or envs.SGLANG_ROPE_CACHE_FP32.get()):
+        if not (_is_cuda or _is_xpu or envs.SGLANG_ROPE_CACHE_FP32.get()):
             cache = cache.to(dtype)
 
         if (
