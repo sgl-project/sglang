@@ -7,6 +7,7 @@ from sglang.jit_kernel.utils.arch import (
 )
 from sglang.jit_kernel.utils.common import (
     cache_once,
+    empty_sentinel,
     get_ci_test_range,
     is_hip_runtime,
     is_musa_runtime,
@@ -16,6 +17,7 @@ from sglang.jit_kernel.utils.common import (
 from sglang.jit_kernel.utils.compile import KERNEL_PATH, load_jit, make_cpp_args
 
 __all__ = [
+    "empty_sentinel",
     "should_run_full_tests",
     "get_ci_test_range",
     "cache_once",
