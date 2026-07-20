@@ -83,7 +83,7 @@ def gptq_marlin_moe_repack(
 
 
 class GPTQLinearKernel:
-    def __init__(self, quant_config: Optional["QuantizationConfig"] = None):
+    def __init__(self, quant_config: Optional[QuantizationConfig] = None):
         self.quant_config = quant_config
         self.use_shuffle = True
 
@@ -129,7 +129,7 @@ class GPTQLinearKernel:
 
 
 class GPTQMarlinLinearKernel:
-    def __init__(self, quant_config: Optional["QuantizationConfig"] = None):
+    def __init__(self, quant_config: Optional[QuantizationConfig] = None):
         self.quant_config = quant_config
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
@@ -270,7 +270,7 @@ class GPTQMarlinLinearKernel:
 
 
 class GPTQMarlinMoEKernel:
-    def __init__(self, quant_config: Optional["QuantizationConfig"] = None):
+    def __init__(self, quant_config: Optional[QuantizationConfig] = None):
         self.quant_config = quant_config
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
@@ -355,7 +355,7 @@ class GPTQMarlinMoEKernel:
         replace_parameter(layer, "w2_scales", marlin_w2_scales)
 
     def create_moe_runner(
-        self, layer: torch.nn.Module, moe_runner_config: "MoeRunnerConfig"
+        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         assert get_moe_runner_backend().is_auto()
         self.moe_runner_config = moe_runner_config
@@ -364,8 +364,8 @@ class GPTQMarlinMoEKernel:
     def apply(
         self,
         layer: torch.nn.Module,
-        dispatch_output: "StandardDispatchOutput",
-    ) -> "CombineInput":
+        dispatch_output: StandardDispatchOutput,
+    ) -> CombineInput:
         quant_info = MarlinMoeQuantInfo(
             w13_qweight=layer.w13_qweight,
             w2_qweight=layer.w2_qweight,

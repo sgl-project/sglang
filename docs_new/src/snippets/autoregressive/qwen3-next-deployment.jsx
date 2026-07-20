@@ -5,11 +5,13 @@ export const Qwen3NextDeployment = () => {
       title: 'Hardware Platform',
       items: [
         { id: 'b200', label: 'B200', default: true },
+        { id: 'b300', label: 'B300', default: false },
         { id: 'h200', label: 'H200', default: false },
         { id: 'h100', label: 'H100', default: false },
         { id: 'mi300x', label: 'MI300X', default: false },
         { id: 'mi325x', label: 'MI325X', default: false },
-        { id: 'mi355x', label: 'MI355X', default: false }
+        { id: 'mi355x', label: 'MI355X', default: false },
+        { id: 'xeon', label: 'Xeon', default: false }
       ]
     },
     modelsize: {
@@ -48,6 +50,7 @@ export const Qwen3NextDeployment = () => {
     speculative: {
       name: 'speculative',
       title: 'Speculative Decoding',
+      condition: (values) => values.hardware !== 'xeon',
       items: [
         { id: 'disabled', label: 'Disabled', default: true },
         { id: 'enabled', label: 'Enabled', default: false }
@@ -57,11 +60,12 @@ export const Qwen3NextDeployment = () => {
     mambaCache: {
       name: 'mambaCache',
       title: 'Mamba Radix Cache',
+      condition: (values) => values.hardware !== 'xeon',
       items: [
         { id: 'v1', label: 'V1', default: true },
         { id: 'v2', label: 'V2', default: false }
       ],
-      commandRule: (value) => value === 'v2' ? '--mamba-scheduler-strategy extra_buffer \\\n  --page-size 64' : null
+      commandRule: (value) => value === 'v2' ? '--mamba-radix-cache-strategy extra_buffer \\\n  --page-size 64' : null
     }
   };
 
@@ -72,9 +76,11 @@ export const Qwen3NextDeployment = () => {
       h100: { tp: 4, ep: 0, bf16: true, fp8: true },
       h200: { tp: 2, ep: 0, bf16: true, fp8: true },
       b200: { tp: 2, ep: 0, bf16: true, fp8: true },
+      b300: { tp: 2, ep: 0, bf16: true, fp8: true },
       mi300x: { tp: 2, ep: 0, bf16: true, fp8: true },
       mi325x: { tp: 2, ep: 0, bf16: true, fp8: true },
-      mi355x: { tp: 2, ep: 0, bf16: true, fp8: true }
+      mi355x: { tp: 2, ep: 0, bf16: true, fp8: true },
+      xeon: { tp: 3, ep: 0, bf16: true, fp8: true }
     }
   };
 
@@ -99,6 +105,10 @@ export const Qwen3NextDeployment = () => {
     let cmd = 'python -m sglang.launch_server \\\n';
     cmd += `  --model ${modelName}`;
 
+    if (hardware === 'xeon') {
+      cmd += ` \\\n  --device cpu \\\n  --disable-overlap-schedule`;
+    }
+
     if (hwConfig.tp > 1) {
       cmd += ` \\\n  --tp ${hwConfig.tp}`;
     }
@@ -113,6 +123,9 @@ export const Qwen3NextDeployment = () => {
     }
 
     for (const [key, option] of Object.entries(options)) {
+      if (option.condition && !option.condition(values)) {
+        continue;
+      }
       if (option.commandRule) {
         const rule = option.commandRule(values[key]);
         if (rule) {
@@ -124,6 +137,10 @@ export const Qwen3NextDeployment = () => {
     // AMD GPUs require triton attention backend
     if (hardware === 'mi300x' || hardware === 'mi325x' || hardware === 'mi355x') {
       cmd += ` \\\n  --attention-backend triton`;
+    }
+    if (hardware === 'b300') {
+      cmd += ` \\\n  --attention-backend flashinfer`;
+      cmd += ` \\\n  --enforce-disable-flashinfer-allreduce-fusion`;
     }
 
     return cmd;

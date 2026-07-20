@@ -29,6 +29,8 @@ SGLang offers multiple installation methods. You can choose the most suitable in
 
 Please refer to the [official SGLang installation guide](../../../docs/get-started/install) for installation instructions.
 
+For SGLang CPU installation, please refer to the [CPU version installation guide](../../../docs/hardware-platforms/cpu_server#installation).
+
 ## 3. Model Deployment
 
 This section provides a progressive guide from quick deployment to performance optimization, suitable for users at different levels.
@@ -40,6 +42,21 @@ This section provides a progressive guide from quick deployment to performance o
 <Llama4ScoutDeployment />
 
 <Llama4MaverickDeployment />
+
+### 3.2 Configuration Tips
+
+- **OOM Mitigation:** Reduce `--context-length` to avoid GPU out-of-memory. Recommended: Scout up to 1M on 8×H100, up to 2.5M on 8×H200; Maverick doesn't need context-length set on 8×H200. With hybrid KV cache enabled, Scout can reach 5M on 8×H100 and 10M on 8×H200.
+- **Attention Backend Auto-Selection:** SGLang automatically picks the optimal backend. Manual override with `--attention-backend`:
+  - Blackwell (B200/GB200): `trtllm_mha`
+  - Hopper (H100/H200): `fa3`
+  - AMD GPUs: `aiter`
+  - Intel XPU: `intel_xpu`
+  - Other: `triton`
+- **Chat Template:** Add `--chat-template llama-4` for chat completion tasks.
+- **Multi-Modal:** Add `--enable-multimodal` to enable image input support.
+- **Hybrid KV Cache:** Set `--swa-full-tokens-ratio` to control the ratio of SWA (local attention) KV tokens to full-attention KV tokens (default: 0.8, range: 0–1).
+- **EAGLE Speculative Decoding:** Supported for Llama 4 Scout and Maverick via EAGLE3. Enable with the interactive command generator above.
+- **Xeon CPU service configuration:** Please refer to the `Notes` part in the serving engine launching section in [the SGLang CPU server document](../../../docs/hardware-platforms/cpu_server#launch-of-the-serving-engine) to better understand how to configure the arguments, especially for TP (tensor parallel) and NUMA binding settings.
 
 ## 4. Model Invocation
 
@@ -90,12 +107,27 @@ sglang serve \
 sglang serve \
   --model-path meta-llama/Llama-4-Maverick-17B-128E-Instruct \
   --tp 8 \
-  --context-length 1000000 \
   --trust-remote-code
 ```
 
+#### 4.2.3 EAGLE Speculative Decoding
+
+SGLang supports Llama 4 Maverick (400B) with [EAGLE speculative decoding](../../../docs/advanced_features/speculative_decoding). Enable with the EAGLE3 algorithm and the SGLang EAGLE3 draft model:
+
+```shell Command
+python3 -m sglang.launch_server \
+  --model-path meta-llama/Llama-4-Maverick-17B-128E-Instruct \
+  --speculative-algorithm EAGLE3 \
+  --speculative-draft-model-path lmsys/sglang-EAGLE3-Llama-4-Maverick-17B-128E-Instruct-v1 \
+  --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4 \
+  --trust-remote-code \
+  --tp 8
+```
+
 ## 5. Benchmark
-### 5.1 Speed Benchmark
+### 5.1 Speed Benchmark (Scout)
 Test Environment:
 
 Hardware: AMD MI300x GPU
@@ -273,7 +305,7 @@ Max ITL (ms):                            226.06
 ==================================================
 ```
 
-### 5.2 Speed Benchmark
+### 5.2 Speed Benchmark (Maverick)
 Test Environment:
 
 Hardware: AMD MI300x GPU
@@ -471,4 +503,70 @@ Accuracy: 0.895
 Invalid: 0.000
 Latency: 9.739 s
 Output throughput: 2405.505 token/s
+```
+
+#### 5.3.2 MMLU Pro with lm-eval
+
+Accuracy on MMLU Pro matches [Meta's official benchmark numbers](https://ai.meta.com/blog/llama-4-multimodal-intelligence/) on 8×H100 (reproduction details: [PR #5092](https://github.com/sgl-project/sglang/pull/5092)):
+
+<table style={{width: "100%", borderCollapse: "collapse"}}>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.02)"}}>Model</th>
+      <th style={{textAlign: "right", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.05)"}}>Official</th>
+      <th style={{textAlign: "right", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.02)"}}>SGLang</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Llama-4-Scout-17B-16E-Instruct</td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.05)"}}>74.3</td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.02)"}}>75.2</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Llama-4-Maverick-17B-128E-Instruct</td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.05)"}}>80.5</td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.02)"}}>80.7</td>
+    </tr>
+  </tbody>
+</table>
+
+**Scout:**
+
+```bash Command
+# Start the server
+python -m sglang.launch_server \
+  --model-path meta-llama/Llama-4-Scout-17B-16E-Instruct \
+  --port 30000 \
+  --tp 8 \
+  --mem-fraction-static 0.8 \
+  --context-length 65536
+
+# Run lm_eval
+lm_eval --model local-chat-completions \
+  --model_args model=meta-llama/Llama-4-Scout-17B-16E-Instruct,base_url=http://localhost:30000/v1/chat/completions,num_concurrent=128,timeout=999999,max_gen_toks=2048 \
+  --tasks mmlu_pro \
+  --batch_size 128 \
+  --apply_chat_template \
+  --num_fewshot 0
+```
+
+**Maverick:**
+
+```bash Command
+# Start the server
+python -m sglang.launch_server \
+  --model-path meta-llama/Llama-4-Maverick-17B-128E-Instruct \
+  --port 30000 \
+  --tp 8 \
+  --mem-fraction-static 0.8 \
+  --context-length 65536
+
+# Run lm_eval
+lm_eval --model local-chat-completions \
+  --model_args model=meta-llama/Llama-4-Maverick-17B-128E-Instruct,base_url=http://localhost:30000/v1/chat/completions,num_concurrent=128,timeout=999999,max_gen_toks=2048 \
+  --tasks mmlu_pro \
+  --batch_size 128 \
+  --apply_chat_template \
+  --num_fewshot 0
 ```

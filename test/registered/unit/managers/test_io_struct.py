@@ -15,7 +15,7 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=8, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=8, suite="stage-b-test-1-gpu-small-amd")
-register_cpu_ci(est_time=8, suite="base-b-test-cpu")
+register_cpu_ci(est_time=8, suite="base-c-test-cpu")
 
 
 class TestGenerateReqInputNormalization(CustomTestCase):
@@ -359,33 +359,6 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         with self.assertRaises(ValueError):
             req.normalize_batch_and_arguments()
 
-    def test_input_embeds_single_to_batch_conversion(self):
-        """Test that single input_embeds are properly converted to batch when using parallel sampling."""
-        # Test the specific case that was fixed: single input_embeds with n > 1
-        req = GenerateReqInput(
-            input_embeds=[[0.1, 0.2, 0.3]], sampling_params={"n": 2}  # Single embedding
-        )
-        req.normalize_batch_and_arguments()
-
-        # Should convert single to batch and then expand
-        self.assertFalse(req.is_single)
-        self.assertEqual(len(req.input_embeds), 2)
-
-        # Both should be the same single embedding
-        self.assertEqual(req.input_embeds[0], [[0.1, 0.2, 0.3]])
-        self.assertEqual(req.input_embeds[1], [[0.1, 0.2, 0.3]])
-
-        # Test with higher n value
-        req = GenerateReqInput(input_embeds=[[0.1, 0.2, 0.3]], sampling_params={"n": 5})
-        req.normalize_batch_and_arguments()
-
-        self.assertFalse(req.is_single)
-        self.assertEqual(len(req.input_embeds), 5)
-
-        # All should be the same
-        for i in range(5):
-            self.assertEqual(req.input_embeds[i], [[0.1, 0.2, 0.3]])
-
     def test_lora_path_normalization(self):
         """Test normalization of lora_path."""
         # Test single lora_path with batch input
@@ -418,6 +391,57 @@ class TestGenerateReqInputNormalization(CustomTestCase):
 
         req.normalize_batch_and_arguments()
         self.assertEqual(req.lora_path, expected_lora_paths)
+
+    def test_extra_key_normalization(self):
+        """Test normalization of extra_key."""
+        # Per-request list
+        req = GenerateReqInput(
+            text=["Hello", "World"],
+            extra_key=["tenant-A", "tenant-B"],
+            sampling_params=[{}, {}],
+        )
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req.extra_key, ["tenant-A", "tenant-B"])
+        self.assertEqual(req[0].extra_key, "tenant-A")
+        self.assertEqual(req[1].extra_key, "tenant-B")
+
+        # Scalar broadcast
+        req = GenerateReqInput(
+            text=["Hello", "World"],
+            extra_key="shared",
+            sampling_params=[{}, {}],
+        )
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req.extra_key, ["shared", "shared"])
+
+        # None stays None
+        req = GenerateReqInput(text=["Hello", "World"], sampling_params=[{}, {}])
+        req.normalize_batch_and_arguments()
+        self.assertIsNone(req.extra_key)
+        self.assertIsNone(req[0].extra_key)
+
+        # Parallel sampling expansion
+        req = GenerateReqInput(
+            text=["Hello", "World"],
+            extra_key=["tenant-A", "tenant-B"],
+            sampling_params={"n": 2},
+        )
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req.extra_key, ["tenant-A", "tenant-B"] * 2)
+
+        # Wrong-length list
+        req = GenerateReqInput(
+            text=["Hello", "World"],
+            extra_key=["only-one"],
+            sampling_params=[{}, {}],
+        )
+        with self.assertRaisesRegex(ValueError, "batch size"):
+            req.normalize_batch_and_arguments()
+
+        # Non-batched scalar unchanged
+        req = GenerateReqInput(text="Hello", extra_key="solo")
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req.extra_key, "solo")
 
     def test_logprob_parameters_normalization(self):
         """Test normalization of logprob-related parameters."""
@@ -500,6 +524,24 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         req.normalize_batch_and_arguments()
         self.assertEqual(req.session_params, [{"id": "session1"}, {"id": "session2"}])
 
+    def test_session_id_handling(self):
+        req = GenerateReqInput(
+            text=["Hello", "World"],
+            session_id="session1",
+            sampling_params={"n": 2},
+        )
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req.session_id, "session1")
+        self.assertIsNone(req.session_params)
+        self.assertEqual(req[2].session_id, "session1")
+
+        with self.assertRaisesRegex(ValueError, "cannot both be set"):
+            GenerateReqInput(
+                text="Hello",
+                session_id="explicit",
+                session_params={"id": "legacy"},
+            ).normalize_batch_and_arguments()
+
     def test_getitem_method(self):
         """Test the __getitem__ method."""
         req = GenerateReqInput(
@@ -539,6 +581,19 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         self.assertEqual(item0.custom_logit_processor, "processor1")
         self.assertEqual(item0.return_hidden_states, True)
 
+    def test_getitem_preserves_return_prompt_token_ids(self):
+        """Batch subrequests must keep the prompt-token-id return flag."""
+        req = GenerateReqInput(
+            input_ids=[[1, 2, 3], [4, 5, 6]],
+            sampling_params=[{}, {}],
+            rid=["id1", "id2"],
+            return_prompt_token_ids=True,
+        )
+        req.normalize_batch_and_arguments()
+
+        self.assertTrue(req[0].return_prompt_token_ids)
+        self.assertTrue(req[1].return_prompt_token_ids)
+
     def test_regenerate_rid(self):
         """Test the regenerate_rid method."""
         req = GenerateReqInput(text="Hello")
@@ -563,23 +618,6 @@ class TestGenerateReqInputNormalization(CustomTestCase):
                 text="Hello", input_ids=[1, 2, 3], input_embeds=[[0.1, 0.2]]
             )
             req.normalize_batch_and_arguments()
-
-    def test_multiple_input_formats(self):
-        """Test different combinations of input formats."""
-        # Test with text only
-        req = GenerateReqInput(text="Hello")
-        req.normalize_batch_and_arguments()
-        self.assertTrue(req.is_single)
-
-        # Test with input_ids only
-        req = GenerateReqInput(input_ids=[1, 2, 3])
-        req.normalize_batch_and_arguments()
-        self.assertTrue(req.is_single)
-
-        # Test with input_embeds only
-        req = GenerateReqInput(input_embeds=[[0.1, 0.2]])
-        req.normalize_batch_and_arguments()
-        self.assertTrue(req.is_single)
 
 
 if __name__ == "__main__":

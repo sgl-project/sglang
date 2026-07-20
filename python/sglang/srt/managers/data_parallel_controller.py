@@ -33,9 +33,14 @@ from sglang.srt.managers.io_struct import (
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
     BlockReqInput,
+    ElasticScaleUpdateReq,
     ProfileReq,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
+    sock_recv,
+    sock_send,
+    unwrap_from_pickle,
+    wrap_as_pickle,
 )
 from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
 from sglang.srt.managers.schedule_batch import Req
@@ -160,12 +165,22 @@ class DataParallelController:
             LoadBalanceMethod.TOTAL_TOKENS,
         )
 
-        # Load balance budget
+        self.launch_dp_size: int = server_args.dp_size
+        self.max_dp_size: int = server_args.max_ep_size or server_args.dp_size
+        assert self.max_dp_size >= self.launch_dp_size, (
+            f"--max-ep-size ({self.max_dp_size}) must be >= "
+            f"--dp ({self.launch_dp_size})."
+        )
+
+        self.dp_active: List[bool] = [True] * self.launch_dp_size + [False] * (
+            self.max_dp_size - self.launch_dp_size
+        )
+
         self.dp_budget = DPBudget(server_args.dp_size)
         self.load_snapshot_reader = create_load_snapshot_reader(
             server_args,
             port_args,
-            caller="dp_controller",
+            caller="DataParallelController",
         )
         self._last_refresh_time = 0.0
 
@@ -174,8 +189,10 @@ class DataParallelController:
 
         # Launch data parallel workers
         self.scheduler_procs = []
-        self.workers: List[zmq.Socket] = [None] * server_args.dp_size
-        self.status: List[bool] = [True] * server_args.dp_size
+        self.workers: List[Optional[zmq.Socket]] = [None] * self.max_dp_size
+        self.status: List[bool] = list(self.dp_active)
+        self._active_workers: List[int] = list(range(self.launch_dp_size))
+        self._active_count_cache: int = self.launch_dp_size
 
         if server_args.enable_dp_attention:
             self.launch_dp_attention_schedulers(server_args, port_args)
@@ -204,16 +221,80 @@ class DataParallelController:
 
     def send_to_all_workers(self, obj):
         for i, worker in enumerate(self.workers):
-            if self.status[i]:
-                worker.send_pyobj(obj)
+            if worker is not None and self.status[i]:
+                sock_send(worker, obj)
 
     def send_control_message(self, obj):
-        # Send control messages to first worker of tp group
-        for worker in self.workers[:: self.control_message_step]:
-            worker.send_pyobj(obj)
+        for i in self._active_workers[:: self.control_message_step]:
+            worker = self.workers[i]
+            if worker is not None:
+                sock_send(worker, obj)
 
     def update_active_ranks(self, ranks: ActiveRanksOutput):
-        self.status = ranks.status
+        if self.server_args.elastic_ep_backend is not None:
+            if len(ranks.status) != self.max_dp_size:
+                logger.warning(
+                    "[Elastic EP][DPC] active rank status len=%d != max_dp_size=%d; "
+                    "ignoring update",
+                    len(ranks.status),
+                    self.max_dp_size,
+                )
+                return
+            self.status = [
+                self.dp_active[i] and bool(ranks.status[i])
+                for i in range(self.max_dp_size)
+            ]
+            self._refresh_active_workers()
+            return
+        if len(ranks.status) != self.max_dp_size:
+            logger.warning(
+                "[DPC] update_active_ranks: status len=%d != max_dp_size=%d; "
+                "ignoring update",
+                len(ranks.status),
+                self.max_dp_size,
+            )
+            return
+        self.status = list(ranks.status)
+
+    def add_elastic_workers(self, slot_offset: int, slot_count: int):
+        """Activate a range of pre-bound worker slots."""
+        end = slot_offset + slot_count
+        if end > self.max_dp_size:
+            raise ValueError(
+                f"[Elastic EP] add_elastic_workers: slot_offset={slot_offset} + "
+                f"slot_count={slot_count} exceeds max_dp_size={self.max_dp_size}. "
+                f"Restart with a larger --max-ep-size."
+            )
+
+        for slot in range(slot_offset, end):
+            if self.dp_active[slot]:
+                logger.debug(
+                    "[Elastic EP] add_elastic_workers: slot %d already active; "
+                    "skipping",
+                    slot,
+                )
+                continue
+            assert self.workers[slot] is not None, (
+                f"[Elastic EP] add_elastic_workers: slot {slot} was not "
+                f"pre-bound at launch; expected a primary-bound PUSH socket."
+            )
+            self.dp_active[slot] = True
+            self.status[slot] = True
+
+        self._refresh_active_workers()
+        logger.debug(
+            "[Elastic EP] DataParallelController activated slots %s "
+            "(active=%d / max=%d)",
+            list(range(slot_offset, end)),
+            self._active_count_cache,
+            self.max_dp_size,
+        )
+
+    def _refresh_active_workers(self) -> None:
+        self._active_workers = [
+            i for i, active in enumerate(self.dp_active) if active and self.status[i]
+        ]
+        self._active_count_cache = len(self._active_workers)
 
     def refresh_load_budget(self):
         # Throttle to at most once per 20ms.  When a burst of requests
@@ -236,10 +317,14 @@ class DataParallelController:
         if refresh_load_budget and self.refresh_load_budget_on_dispatch:
             self.refresh_load_budget()
 
-        req.time_stats = DPControllerReqTimeStats.new_from_obj(req.time_stats)
+        time_stats = DPControllerReqTimeStats.new_from_obj(
+            unwrap_from_pickle(req.time_stats)
+        )
 
-        req.time_stats.set_dp_dispatch_time()
+        time_stats.set_dp_dispatch_time()
+        req.time_stats = wrap_as_pickle(time_stats)
         self.dispatching(req)
+        req.time_stats = time_stats
         req.time_stats.set_dp_dispatch_finish_time()
 
     def dispatch_batch_generate(self, batch_req: BatchTokenizedGenerateReqInput):
@@ -264,6 +349,12 @@ class DataParallelController:
                 (BlockReqInput, self.send_to_all_workers),
                 (ProfileReq, self.send_to_all_workers),
                 (ActiveRanksOutput, self.update_active_ranks),
+                (
+                    ElasticScaleUpdateReq,
+                    lambda msg: self.add_elastic_workers(
+                        msg.slot_offset, msg.slot_count
+                    ),
+                ),
             ]
         )
         self._request_dispatcher.add_fallback_fn(self.send_control_message)
@@ -347,8 +438,8 @@ class DataParallelController:
         Returns:
             List of worker ports (same on all nodes after broadcast).
         """
-        # Determine the endpoint for inter-node communication
-        if server_args.dist_init_addr is None:
+        is_joiner = server_args.is_ep_scale_joiner
+        if server_args.dist_init_addr is None or is_joiner:
             na = NetworkAddress(
                 server_args.host or "127.0.0.1",
                 server_args.port + DP_ATTENTION_HANDSHAKE_PORT_DELTA,
@@ -380,11 +471,11 @@ class DataParallelController:
             connected_clients = 0
             while connected_clients < expected_clients:
                 # Wait for client handshake
-                client_rank = rep_socket.recv().decode()
+                client_rank = sock_recv(rep_socket)
                 logger.debug(f"Received handshake from node {client_rank}")
 
                 # Send worker ports to client
-                rep_socket.send_pyobj(worker_ports)
+                sock_send(rep_socket, wrap_as_pickle(worker_ports))
                 connected_clients += 1
                 logger.debug(
                     f"Sent worker ports to {connected_clients}/{expected_clients} nodes"
@@ -403,13 +494,12 @@ class DataParallelController:
                 ).start()
 
     def _reply_ports_as_server(self, rep_socket: zmq.Socket, worker_ports: List[int]):
-        """
-        Runs as a background thread to broadcast worker ports for recovered EP ranks
-        """
+        """Background thread: serve the pre-bound worker-port list to
+        late-arriving elastic joiners. Publishes port numbers only; the primary
+        keeps ownership of every socket."""
         while True:
-            # Wait for client handshake
             try:
-                client_rank = rep_socket.recv().decode()
+                client_rank = sock_recv(rep_socket)
             except Exception:
                 logger.exception(
                     "Failed to recv/decode handshake in reply thread; continue"
@@ -418,7 +508,7 @@ class DataParallelController:
             logger.debug(f"Received handshake from node {client_rank}")
 
             # Send worker ports to client
-            rep_socket.send_pyobj(worker_ports)
+            sock_send(rep_socket, wrap_as_pickle(worker_ports))
             logger.debug(f"Sent worker ports to node {client_rank}")
 
     def _receive_ports_as_client(self, endpoint: str, node_rank: int) -> List[int]:
@@ -431,10 +521,10 @@ class DataParallelController:
 
         try:
             # Send handshake with our node rank
-            req_socket.send(str(node_rank).encode())
+            sock_send(req_socket, wrap_as_pickle(str(node_rank)))
 
             # Receive worker ports
-            worker_ports = req_socket.recv_pyobj()
+            worker_ports = sock_recv(req_socket)
             logger.debug(f"Received {len(worker_ports)} worker ports from node 0")
             return worker_ports
         except zmq.Again:
@@ -445,6 +535,12 @@ class DataParallelController:
         finally:
             req_socket.close()
 
+    def _joiner_local_tp_span(self, server_args: ServerArgs) -> int:
+        return server_args.tp_size
+
+    def _joiner_slot_offset(self, server_args: ServerArgs) -> int:
+        return server_args.ep_join_rank_offset
+
     def launch_dp_attention_schedulers(
         self, server_args: ServerArgs, port_args: PortArgs
     ):
@@ -453,25 +549,42 @@ class DataParallelController:
         else:
             bind_host = NetworkAddress.parse(server_args.dist_init_addr).host
 
-        # Pre-allocate worker ports on node 0 to avoid conflicts
         worker_ports = []
-        if server_args.node_rank == 0:
-            for dp_rank in range(server_args.dp_size):
+        if server_args.is_ep_scale_joiner:
+            # Scale joiners connect to their pre-bound primary worker sockets.
+            primary = NetworkAddress.parse(server_args.dist_init_addr)
+            primary_endpoint = NetworkAddress(
+                primary.host, primary.port + DP_ATTENTION_HANDSHAKE_PORT_DELTA
+            ).to_tcp()
+            all_ports = self._receive_ports_as_client(
+                primary_endpoint, server_args.node_rank
+            )
+            offset = self._joiner_slot_offset(server_args)
+            local_tp_span = self._joiner_local_tp_span(server_args)
+            broadcasted_ports = all_ports[offset : offset + local_tp_span]
+        elif server_args.node_rank == 0:
+            # Elastic primaries reserve sockets for the maximum DP size.
+            bind_count = (
+                self.max_dp_size
+                if server_args.elastic_ep_backend is not None
+                else server_args.dp_size
+            )
+            for slot in range(bind_count):
                 worker_port, worker_socket = get_zmq_socket_on_host(
                     self.context, zmq.PUSH, host=bind_host
                 )
                 worker_ports.append(worker_port)
-                self.workers[dp_rank] = worker_socket
+                self.workers[slot] = worker_socket
                 logger.debug(
-                    "Assigned port %s to worker %s on host %s",
+                    "Assigned port %s to worker slot %s on host %s",
                     worker_port,
-                    dp_rank,
+                    slot,
                     bind_host,
                 )
+            broadcasted_ports = self._broadcast_worker_ports(server_args, worker_ports)
+        else:
+            broadcasted_ports = self._broadcast_worker_ports(server_args, None)
 
-        broadcasted_ports = self._broadcast_worker_ports(
-            server_args, worker_ports if worker_ports else None
-        )
         self.launch_tensor_parallel_group(
             server_args, port_args, 0, None, broadcasted_ports
         )
@@ -502,10 +615,15 @@ class DataParallelController:
 
         nnodes_per_tp_group = nnodes_per_pp_rank
         tp_size_per_node = server_args.tp_size // nnodes_per_tp_group
-        tp_rank_range = range(
-            tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group),
-            tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group + 1),
-        )
+        if server_args.is_ep_scale_joiner:
+            # Scale joiners enumerate their full local TP span.
+            tp_rank_range = range(server_args.tp_size)
+            tp_size_per_node = server_args.tp_size
+        else:
+            tp_rank_range = range(
+                tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group),
+                tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group + 1),
+            )
 
         attn_cp_rank = 0
         moe_dp_rank = 0
@@ -526,6 +644,16 @@ class DataParallelController:
                     rank_port_args = PortArgs.init_new(
                         server_args, dp_rank, worker_ports
                     )
+                    if server_args.is_ep_scale_joiner:
+                        # Scale-joiner outputs return through the primary tokenizer.
+                        primary_addr = NetworkAddress.parse(server_args.dist_init_addr)
+                        primary_port_base = primary_addr.port + 1
+                        rank_port_args.tokenizer_ipc_name = NetworkAddress(
+                            primary_addr.host, primary_port_base
+                        ).to_tcp()
+                        rank_port_args.detokenizer_ipc_name = NetworkAddress(
+                            primary_addr.host, primary_port_base + 1
+                        ).to_tcp()
                     # Data parallelism reuses the tensor parallelism group,
                     # so all dp ranks should use the same nccl port.
                     rank_port_args.nccl_port = port_args.nccl_port
@@ -562,6 +690,12 @@ class DataParallelController:
                     )
                 )
 
+                # Scheduler internals use local ranks; logs use global ranks.
+                offset = server_args.ep_join_rank_offset
+                display_tp_rank = tp_rank + offset
+                display_moe_ep_rank = moe_ep_rank + offset
+                display_dp_rank = dp_rank + offset if dp_rank is not None else None
+
                 with self.env_lock, maybe_reindex_device_id(gpu_id) as gpu_id:
                     proc = mp.Process(
                         target=self.run_scheduler_process_func,
@@ -576,6 +710,9 @@ class DataParallelController:
                             pp_rank,
                             dp_rank,
                             writer,
+                            display_tp_rank,
+                            display_dp_rank,
+                            display_moe_ep_rank,
                         ),
                     )
                     with (
@@ -596,8 +733,16 @@ class DataParallelController:
 
     def maybe_external_dp_rank_routing(self, req: Req):
         if req.routed_dp_rank is not None:
-            logger.debug(f"Direct routing to DP rank {req.routed_dp_rank}")
-            self.workers[req.routed_dp_rank].send_pyobj(req)
+            rank = req.routed_dp_rank
+            if (
+                rank < 0
+                or rank >= len(self.workers)
+                or rank not in self._active_workers
+                or self.workers[rank] is None
+            ):
+                raise ValueError(f"DP rank {rank} is not active.")
+            logger.debug(f"Direct routing to DP rank {rank}")
+            sock_send(self.workers[rank], req)
             return True
         return False
 
@@ -605,17 +750,22 @@ class DataParallelController:
         if self.maybe_external_dp_rank_routing(req):
             return
 
-        while True:
-            if self.status[self.round_robin_counter]:
-                logger.debug(f"Choose worker {self.round_robin_counter}")
-                self.workers[self.round_robin_counter].send_pyobj(req)
-                self.round_robin_counter = (self.round_robin_counter + 1) % len(
-                    self.workers
-                )
-                break
-            self.round_robin_counter = (self.round_robin_counter + 1) % len(
-                self.workers
-            )
+        active = self._active_workers
+        if not active:
+            raise RuntimeError("No active DP workers are available for routing.")
+        attempts = 0
+        while attempts < len(active):
+            slot = active[self.round_robin_counter % len(active)]
+            self.round_robin_counter = (self.round_robin_counter + 1) % len(active)
+            if self.status[slot]:
+                logger.debug(f"Choose worker {slot}")
+                sock_send(self.workers[slot], req)
+                return
+            attempts += 1
+        raise RuntimeError(
+            f"Cannot route request: all {len(active)} active DP workers "
+            "are unavailable."
+        )
 
     def follow_bootstrap_room_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):
@@ -626,13 +776,13 @@ class DataParallelController:
             "prefill or decode instances; send to the router instead."
         )
         target_rank = req.bootstrap_room % len(self.workers)
-        self.workers[target_rank].send_pyobj(req)
+        sock_send(self.workers[target_rank], req)
 
     def total_requests_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):
             return
         target_worker = self.dp_budget.dispatch(LoadBalanceMethod.TOTAL_REQUESTS)
-        self.workers[target_worker].send_pyobj(req)
+        sock_send(self.workers[target_worker], req)
 
     def total_tokens_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):
@@ -641,14 +791,14 @@ class DataParallelController:
         target_worker = self.dp_budget.dispatch(
             LoadBalanceMethod.TOTAL_TOKENS, estimated_tokens=estimated_tokens
         )
-        self.workers[target_worker].send_pyobj(req)
+        sock_send(self.workers[target_worker], req)
 
     def event_loop(self):
         while True:
             while True:
                 self.soft_watchdog.feed()
                 try:
-                    recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
+                    recv_req = sock_recv(self.recv_from_tokenizer, flags=zmq.NOBLOCK)
                 except zmq.ZMQError:
                     break
                 self._request_dispatcher(recv_req)
@@ -667,7 +817,11 @@ def run_data_parallel_controller_process(
 
     configure_logger(server_args)
     if server_args.enable_trace:
-        process_tracing_init(server_args.otlp_traces_endpoint, "sglang")
+        process_tracing_init(
+            server_args.otlp_traces_endpoint,
+            "sglang",
+            trace_modules=server_args.trace_modules,
+        )
         thread_label = "DP Controller"
         if server_args.disaggregation_mode == "prefill":
             thread_label = "Prefill DP Controller"
@@ -690,7 +844,8 @@ def run_data_parallel_controller_process(
                 SCHEDULER_PIDS_ARG: scheduler_pids,
             }
         )
-        if server_args.node_rank == 0:
+        # The primary owns routing for the expanded scheduler set.
+        if server_args.node_rank == 0 and not server_args.is_ep_scale_joiner:
             controller.event_loop()
         for proc in controller.scheduler_procs:
             proc.join()

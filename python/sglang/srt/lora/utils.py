@@ -185,6 +185,21 @@ def get_hidden_dim(
                 config.num_attention_heads
                 * (config.qk_nope_head_dim + config.v_head_dim),
             )
+        elif module_name in DSA_INDEXER_LORA_NAMES:
+            from sglang.srt.configs.model_config import (
+                get_dsa_index_head_dim,
+                get_dsa_index_n_heads,
+            )
+
+            if module_name == "indexer.wq_b":
+                return (
+                    config.q_lora_rank,
+                    get_dsa_index_n_heads(config) * get_dsa_index_head_dim(config),
+                )
+            elif module_name == "indexer.wk":
+                return config.hidden_size, get_dsa_index_head_dim(config)
+            else:  # indexer.weights_proj
+                return config.hidden_size, get_dsa_index_n_heads(config)
         elif module_name == "gate_up_proj_moe":
             moe_inter = (
                 getattr(config, "moe_intermediate_size", None)
@@ -248,6 +263,12 @@ def get_normalized_target_modules(
         "unembed_tokens": "lm_head",
         "q_a_proj": "fused_qkv_a_proj_with_mqa",
         "kv_a_proj_with_mqa": "fused_qkv_a_proj_with_mqa",
+        # DSA indexer projections are qualified with their parent module name
+        # because the bare leaf names collide with unrelated modules in other
+        # models (e.g. DeepSeek-V4 attention `wq_b`, Pixtral vision `wk`).
+        "wq_b": "indexer.wq_b",
+        "wk": "indexer.wk",
+        "weights_proj": "indexer.weights_proj",
     }
 
     result = set()
@@ -272,6 +293,7 @@ def get_stacked_multiply(
         "in_proj_qkvz": 4,  # GDN packed input projection
         "gate_up_proj": 2,
         "gate_up_proj_moe": 2,
+        "gate_up_proj_shared_moe": 2,
         "in_proj": 2,
         "fused_qkv_a_proj_with_mqa": 2,
     }
@@ -301,11 +323,22 @@ def get_target_module_name(full_module_name: str, target_modules: Set[str]) -> s
 
 
 EMBEDDING_NAMES = ["embed_tokens", "lm_head"]
-ROW_PARALLELISM_LINEAR_LORA_NAMES = ["o_proj", "out_proj", "down_proj", "down_proj_moe"]
+ROW_PARALLELISM_LINEAR_LORA_NAMES = [
+    "o_proj",
+    "out_proj",
+    "down_proj",
+    "down_proj_moe",
+    "down_proj_shared_moe",
+    "wo_ud",
+]
+DSA_INDEXER_LORA_NAMES = frozenset(
+    {"indexer.wq_b", "indexer.wk", "indexer.weights_proj"}
+)
 REPLICATED_LINEAR_LORA_NAMES = [
     "fused_qkv_a_proj_with_mqa",
     "fc1_latent_proj",
     "fc2_latent_proj",
+    *DSA_INDEXER_LORA_NAMES,
 ]
 
 # Normalized module names that the LoRA system fully supports
@@ -313,7 +346,9 @@ REPLICATED_LINEAR_LORA_NAMES = [
 _KNOWN_LORA_TARGET_MODULES = frozenset(
     {
         "qkv_proj",
+        "qkvr",
         "o_proj",
+        "wo_ud",
         "out_proj",
         "in_proj",
         "in_proj_qkvz",
@@ -328,6 +363,7 @@ _KNOWN_LORA_TARGET_MODULES = frozenset(
         "q_b_proj",
         "kv_b_proj",
     }
+    | DSA_INDEXER_LORA_NAMES
 )
 
 
@@ -347,6 +383,9 @@ def auto_detect_lora_target_modules(model: "torch.nn.Module") -> set:
     )
 
     raw_names: set = set()
+    dsa_indexer_leaf_names = {
+        target_name.split(".")[-1] for target_name in DSA_INDEXER_LORA_NAMES
+    }
     for name, module in model.named_modules():
         if isinstance(module, FusedMoE):
             raw_names.add("gate_up_proj")
@@ -356,7 +395,18 @@ def auto_detect_lora_target_modules(model: "torch.nn.Module") -> set:
         elif isinstance(module, VocabParallelEmbedding):
             raw_names.add("embed_tokens")
         elif isinstance(module, LinearBase):
-            raw_names.add(name.split(".")[-1])
+            parts = name.split(".")
+            leaf_name = parts[-1]
+            parent_qualified_name = ".".join(parts[-2:])
+            if parent_qualified_name in DSA_INDEXER_LORA_NAMES:
+                raw_names.add(parent_qualified_name)
+            elif leaf_name in dsa_indexer_leaf_names:
+                # Bare DSA indexer leaf names are ambiguous across model
+                # families. Only auto-detect them when the actual module path
+                # proves they are under an `indexer` parent.
+                continue
+            else:
+                raw_names.add(leaf_name)
 
     normalized = get_normalized_target_modules(raw_names)
     result = normalized & _KNOWN_LORA_TARGET_MODULES
@@ -504,8 +554,8 @@ def build_lm_head_pass_segments(
     """
     Precompute per-pass segment info for lm_head LoRA logprobs processing.
 
-    When LogitsProcessor uses chunked logprobs processing
-    (process_input_logprobs_by_chunk), pruned hidden states are split into
+    When InputLogprobProcessor uses chunked logprobs processing
+    (_forward_by_chunk), pruned hidden states are split into
     fixed-size passes.  Each pass needs its own segmentation
     (weight_indices, seg_lens) so that lm_head LoRA operates on the
     correct adapter assignments per pass.

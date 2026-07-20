@@ -1,22 +1,22 @@
 import math
 import unittest
+from types import SimpleNamespace
 
 import numpy as np
 import torch
 
-from sglang.srt.layers import dp_attention as _dp_attn
+from sglang.srt.runtime_context import get_parallel, get_server_args
 
-# Patch DP-attention globals before importing backends
-# TODO: change the interface of both trtllm_mla and flashinfer backends to take tp_size as an argument instead of patching
-_dp_attn.get_attention_tp_size = lambda: 1  # TP size = 1 for unit test
+_parallel_override = get_parallel().override(attn_tp_size=1)
+_parallel_override.__enter__()
 
+from sglang.kernels.ops.attention.utils import get_num_page_per_block_flashmla
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.flashinfer_mla_backend import FlashInferMLAAttnBackend
 from sglang.srt.layers.attention.trtllm_mla_backend import (
     TRTLLMMLABackend,
     TRTLLMMLADecodeMetadata,
 )
-from sglang.srt.layers.attention.utils import get_num_page_per_block_flashmla
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -26,7 +26,6 @@ from sglang.srt.model_executor.forward_context import (
 )
 from sglang.srt.server_args import (
     ServerArgs,
-    get_global_server_args,
     set_global_server_args_for_scheduler,
 )
 from sglang.srt.utils import is_flashinfer_available
@@ -222,7 +221,7 @@ class MockModelRunner:
         self.page_size = config["page_size"]
 
         # Server args stub - needed by attention backends
-        self.server_args = get_global_server_args()
+        self.server_args = get_server_args()
 
         # Model-config stub with MLA attributes
         self.model_config = type(
@@ -1030,15 +1029,15 @@ class TestTRTLLMMLA(CustomTestCase):
         )
         req_pool_indices = torch.arange(batch_size, device=config["device"])
 
-        backend.init_forward_metadata_capture_cuda_graph(
-            bs=batch_size,
-            num_tokens=batch_size,
+        capture_fb = SimpleNamespace(
+            batch_size=batch_size,
+            forward_mode=ForwardMode.DECODE,
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
-            encoder_lens=None,
-            forward_mode=ForwardMode.DECODE,
+            positions=torch.arange(batch_size, device=config["device"]),
             spec_info=None,
         )
+        backend.init_forward_metadata_out_graph(capture_fb, in_capture=True)
 
         # Verify capture metadata
         self.assertIn(batch_size, backend.decode_cuda_graph_metadata)
@@ -1054,16 +1053,15 @@ class TestTRTLLMMLA(CustomTestCase):
             device=config["device"],
         )
 
-        backend.init_forward_metadata_replay_cuda_graph(
-            bs=batch_size,
+        replay_fb = SimpleNamespace(
+            batch_size=batch_size,
+            forward_mode=ForwardMode.DECODE,
             req_pool_indices=req_pool_indices,
             seq_lens=new_seq_lens,
-            seq_lens_sum=new_seq_lens.sum().item(),
-            encoder_lens=None,
-            forward_mode=ForwardMode.DECODE,
-            spec_info=None,
             seq_lens_cpu=new_seq_lens.cpu(),
+            spec_info=None,
         )
+        backend.init_forward_metadata_out_graph(replay_fb)
 
         # Verify replay updated the metadata
         replay_metadata = backend.forward_decode_metadata

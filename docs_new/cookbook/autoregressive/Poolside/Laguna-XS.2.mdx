@@ -2,7 +2,6 @@
 title: Laguna-XS.2
 metatags:
     description: "Deploy Poolside's Laguna-XS.2 hybrid SWA + MoE model with SGLang on NVIDIA H200 / B200 — agentic coding with hybrid reasoning and tool calling."
-tag: NEW
 ---
 
 ## 1. Model Introduction
@@ -63,9 +62,8 @@ python3 -m pip install --extra-index-url https://docs.sglang.ai/whl/cu130 \
 python3 -m pip install --extra-index-url https://docs.sglang.ai/whl/cu129 \
   "sglang[all]==0.5.12.dev20260509+g096ad02b0"
 
-# Or use Docker (multi-arch amd64/arm64)
-docker pull lmsysorg/sglang:dev-cu13-laguna-xs2 # CUDA 13 (H200 / B200)
-docker pull lmsysorg/sglang:dev-cu12-laguna-xs2 # CUDA 12 (H200)
+# Or use Docker (multi-arch amd64/arm64; CUDA 13, H200 / B200)
+docker pull lmsysorg/sglang:latest
 ```
 
 For the full Docker setup and other installation methods, please refer to the [official SGLang installation guide](../../../docs/get-started/install).
@@ -82,6 +80,7 @@ import { LagunaXS2Deployment } from '/src/snippets/autoregressive/laguna-xs2-dep
 
 ### 3.2 Configuration Tips
 
+- **Trust remote code** (`--trust-remote-code`): Laguna-XS.2 ships custom modeling/config code on the Hugging Face Hub, so this flag is required for the server to load the model.
 - **Quantization**: NVFP4 requires Blackwell (B200 / B300); BF16 and FP8 run on either H200 or B200. FP8's first launch triggers a multi-session DeepGEMM JIT pre-compile (~10-20 min); pre-warm with `python3 -m sglang.compile_deep_gemm --model poolside/Laguna-XS.2-FP8` to avoid that cost on every restart.
 - **Reasoning parser** (`--reasoning-parser poolside_v1`): Splits `<think>...</think>` segments into `reasoning_content` so `content` holds only the final answer. Disable only if you want the raw `<think>` tags in `content`.
 - **Tool call parser** (`--tool-call-parser poolside_v1`): Required for OpenAI-compatible tool-call streaming. Disable only for chat-only deployments.

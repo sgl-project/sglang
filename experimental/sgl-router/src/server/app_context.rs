@@ -69,6 +69,11 @@ impl AppContext {
         // Without this, the metric is permanently 0 in production even
         // though the chat handler is faithfully calling `register`.
         active_load.attach_metrics(Arc::clone(&metrics));
+        // Same rationale for the cache-aware-zmq policy's
+        // `sgl_router_overlap_blocks`: the metrics registry is built here,
+        // after the policy registry, so inject it now. No-op for policies
+        // that don't emit metrics.
+        policies.attach_metrics(Arc::clone(&metrics));
         Self {
             config,
             tokenizers,
@@ -100,14 +105,19 @@ impl AppContext {
                     port: 0,
                 },
                 observability: Default::default(),
-                models: vec![],
-                discovery: crate::config::DiscoveryConfig {
-                    backend: crate::config::DiscoveryBackend::StaticUrls(
-                        crate::config::StaticUrlsDiscoveryConfig {
-                            urls: vec!["http://placeholder:0".into()],
-                        },
-                    ),
+                model: crate::config::ModelConfig {
+                    id: "stub-model".into(),
+                    tokenizer_path: "stub".into(),
+                    policy: crate::config::PolicyKind::RoundRobin,
+                    circuit_breaker: None,
+                    cache_aware: None,
+                    sticky: None,
                 },
+                discovery: crate::config::DiscoveryBackend::StaticUrls(
+                    crate::config::StaticUrlsDiscoveryConfig {
+                        urls: vec!["http://placeholder:0".into()],
+                    },
+                ),
                 proxy: crate::config::ProxyConfig::default(),
                 active_load: crate::config::ActiveLoadConfig::default(),
             },
