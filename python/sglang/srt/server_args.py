@@ -4145,19 +4145,25 @@ class ServerArgs:
                 # Only non-torch memory is counted; torch memory is reused by cuda graph capture.
                 reserved_mem += len(prefill_cuda_graph_config.bs) * 8
             else:
-                # MLA backend overhead is much higher than expected with fa3.
-                reserved_mem += 1.5 * 1024
+                # Measured on GLM-5.2-FP8 tp8 (cuda_graph_mem_viz + capture
+                # logs): breakable prefill pool ~1.95 GB at the default bucket
+                # list, plus decode-graph usage (4.9 GB measured vs 1 GB
+                # budgeted above) and capture warmup spikes that surface once
+                # the BCG stack is active. Validated: 4 GB OOMs at auto 0.868,
+                # 6.5 GB leaves ~1.3 GB spare.
+                reserved_mem += 6.5 * 1024
             from sglang.srt.arg_groups.overrides import resolved_view
 
             if (
                 prefill_cuda_graph_config.backend == Backend.BREAKABLE
                 and resolved_view(self).moe_a2a_backend == "deepep"
             ):
-                # Breakable prefill with the DeepEP eager split node retains
-                # per-shape bridge buffers and grows the capture pool to the
-                # eager MoE working set (~8 GB measured at the clamped bucket
-                # list on GLM-5.2-FP8 tp8).
-                reserved_mem += 8 * 1024
+                # DeepEP under the BCG split node first-touches its buffer
+                # stack (LL rdma 1.53 GB at cap 128 + NVL ~0.5 GB) during
+                # prefill capture, where the margin check runs — the memory is
+                # paid by eager DeepEP configs too, just later, so reserve only
+                # the concentration slack, not the full stack.
+                reserved_mem += 2 * 1024
 
         return reserved_mem
 
