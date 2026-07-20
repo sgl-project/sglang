@@ -456,7 +456,9 @@ def _dp_gather_via_all_reduce(
             group=torch.distributed.group.WORLD,
         )
     elif force_standard_all_reduce:
-        torch.distributed.all_reduce(global_tokens, group=get_tp_group().device_group)
+        from sglang.srt.distributed.parallel_state import inplace_all_reduce
+
+        inplace_all_reduce(global_tokens, group_name=get_tp_group().unique_name)
     else:
         NUM_GPUS_PER_NODE = 8
         if (
