@@ -1961,7 +1961,15 @@ class ServerArgs:
     ] = None
     speculative_dflash_block_size: A[
         Optional[int],
-        "DFLASH only. Block size (verify window length). Alias of --speculative-num-draft-tokens for DFLASH.",
+        "DFLASH only. Draft block size. Alias of --speculative-num-draft-tokens for DFLASH.",
+        NS("spec"),
+    ] = None
+    speculative_dflash_verify_budget: A[
+        Optional[int],
+        "DFLASH only. Number of draft tokens verified by the target per decode step. "
+        "The draft model still runs with its configured block size. Must be between "
+        "1 and --speculative-num-draft-tokens; defaults to the full draft block. "
+        "A smaller budget currently requires Triton attention for TARGET_VERIFY.",
         NS("spec"),
     ] = None
     speculative_dspark_block_size: A[
