@@ -258,6 +258,14 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     current_text = current_text.replace(e_token, "")
             return StreamingParseResult(normal_text=current_text)
 
+        normal_text = ""
+        if self.current_tool_id == -1:
+            bot_token_idx = current_text.find(self.bot_token)
+            if bot_token_idx != -1:
+                normal_text = current_text[:bot_token_idx]
+                self._buffer = current_text[bot_token_idx:]
+                current_text = self._buffer
+
         all_calls: list[ToolCallItem] = []
         try:
             # Loop to handle multiple consecutive invoke blocks
@@ -355,11 +363,11 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     break
 
             # No more invoke blocks found
-            return StreamingParseResult(normal_text="", calls=all_calls)
+            return StreamingParseResult(normal_text=normal_text, calls=all_calls)
 
         except Exception as e:
             logger.error(f"Error in parse_streaming_increment: {e}")
-            return StreamingParseResult(normal_text=current_text)
+            return StreamingParseResult(normal_text=normal_text + current_text)
 
     def structure_info(self) -> _GetInfoFunc:
         return lambda name: StructureInfo(
