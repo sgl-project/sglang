@@ -59,6 +59,7 @@ class HiSparseCoordinator:
         host_to_device_ratio: int = 2,
         swap_in_block_size: int = 960,
         host_allocator_type: str = "default",
+        max_swap_in_batch_multiplier: int = 1,
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -204,12 +205,19 @@ class HiSparseCoordinator:
             self.padded_buffer_size, dtype=torch.int32, device=device
         )
 
-        # Pre-allocated output buffer for swap_in_selected_pages (CUDA-graph safe)
+        # Pre-allocated output buffer for swap_in_selected_pages (CUDA-graph safe).
+        # Sized for the worst case: TARGET_VERIFY expands the batch to
+        # (num_reqs * speculative_num_draft_tokens) rows. Never resized at
+        # runtime -- resizing would invalidate addresses baked into a captured
+        # CUDA graph and cause stale-pointer writes on replay.
+        self._max_swap_in_rows = max_num_req_slots * max(
+            1, max_swap_in_batch_multiplier
+        )
         self.top_k_device_locs_buffer = torch.full(
-            (max_num_req_slots, self.top_k), -1, dtype=torch.int32, device=device
+            (self._max_swap_in_rows, self.top_k), -1, dtype=torch.int32, device=device
         )
         self.raw_indices_buffer = torch.full(
-            (max_num_req_slots, self.top_k), -1, dtype=torch.int32, device=device
+            (self._max_swap_in_rows, self.top_k), -1, dtype=torch.int32, device=device
         )
         # Scalar tensor: number of real (non-padded) requests in the batch.
         # Updated before each graph replay so padded blocks early-return.
@@ -840,8 +848,19 @@ class HiSparseCoordinator:
             self.token_to_kv_pool_allocator.full_to_hisparse_device_index_mapping
         )
 
-        # Clear device mapping for all draft cache locs
-        full_to_device_mapping[draft_cache_locs] = 0
+        # `draft_cache_locs` are FULL (uncompressed) KV cache positions
+        # (batch.out_cache_loc), but full_to_hisparse_device_index_mapping is
+        # indexed by COMPRESSED positions. Only positions landing on a
+        # compress-group boundary ((pos + 1) % compress_ratio == 0) have a
+        # valid compressed slot; translate those before clearing the mapping
+        # (see finalize_accepted_tokens_spec_v2 / map_last_loc_to_buffer for
+        # the same pattern). Using the raw full position directly here would
+        # clear an essentially arbitrary compressed slot belonging to another
+        # request.
+        draft_boundary_mask = (draft_cache_locs + 1) % self.compress_ratio == 0
+        full_to_device_mapping[
+            draft_cache_locs[draft_boundary_mask] // self.compress_ratio
+        ] = 0
 
         total_accepted = accepted_cache_locs.numel()
         num_reqs = req_pool_indices.size(0)
@@ -895,9 +914,17 @@ class HiSparseCoordinator:
 
         last_positions = accepted_token_positions[last_offsets]
         last_slots = accepted_device_locs[last_offsets]
-        newest_slots = accepted_cache_locs[last_offsets]
-
+        # `accepted_cache_locs` holds FULL (uncompressed) KV cache positions
+        # (batch.out_cache_loc); it is NOT a valid physical HiSparse device
+        # row. Under load these values regularly exceed the HiSparse device
+        # pool's size, so using them directly as "newest_slots" (written into
+        # req_device_buffer_token_locs and used as a transfer_values_on_device
+        # index) drives out-of-bounds GPU memory accesses. The reserved slot's
+        # physical row is the request's own pre-allocated
+        # req_to_device_buffer[req_idx, device_buffer_size] entry -- the same
+        # value map_last_loc_to_buffer uses for the regular decode path.
         reserved_positions = self.device_buffer_size
+        newest_slots = self.req_to_device_buffer[req_pool_indices, reserved_positions]
         self.req_device_buffer_token_locs[:, req_pool_indices, reserved_positions] = (
             newest_slots.to(torch.int32)
         )
@@ -913,7 +940,23 @@ class HiSparseCoordinator:
                 dst_indices=newest_slots[~same_slot],
                 src_indices=last_slots[~same_slot],
             )
-        full_to_device_mapping[accepted_cache_locs[last_offsets]] = newest_slots
+        # `accepted_cache_locs` are FULL (uncompressed) KV cache positions
+        # (batch.out_cache_loc), but full_to_hisparse_device_index_mapping is
+        # indexed by COMPRESSED positions. Writing the raw full position here
+        # corrupts an essentially arbitrary compressed slot -- observed in
+        # practice as two unrelated, concurrently-active requests ending up
+        # with the SAME physical HiSparse device row (HISPARSE_DUP_ROW_DETECTED),
+        # which later causes concurrent GPU memory corruption under load.
+        # Only positions landing on a compress-group boundary
+        # ((pos + 1) % compress_ratio == 0) have a valid compressed slot;
+        # translate those before touching the mapping (mirrors
+        # map_last_loc_to_buffer's gating for the regular decode path).
+        newest_full_locs = accepted_cache_locs[last_offsets]
+        newest_boundary_mask = (newest_full_locs + 1) % self.compress_ratio == 0
+        if torch.any(newest_boundary_mask):
+            full_to_device_mapping[
+                newest_full_locs[newest_boundary_mask] // self.compress_ratio
+            ] = newest_slots[newest_boundary_mask]
 
         if backup_count > 0:
             backup_positions_in_needs = (
@@ -931,10 +974,14 @@ class HiSparseCoordinator:
 
             logical_locs_to_clear_mask = needs_backup.clone()
             logical_locs_to_clear_mask[last_offsets] = False
+            # Same full-vs-compressed unit mismatch as above: only
+            # compress-boundary positions map to a valid compressed slot.
+            _to_clear_full = accepted_cache_locs[logical_locs_to_clear_mask]
+            _to_clear_boundary_mask = (_to_clear_full + 1) % self.compress_ratio == 0
             self._pending_draft_extend_backup = (
                 host_locs,
                 post_backup_device_locs,
-                accepted_cache_locs[logical_locs_to_clear_mask],
+                _to_clear_full[_to_clear_boundary_mask] // self.compress_ratio,
             )
 
     def finalize_accepted_tokens_spec_v2(
@@ -955,7 +1002,13 @@ class HiSparseCoordinator:
             full_to_device_mapping = (
                 self.token_to_kv_pool_allocator.full_to_hisparse_device_index_mapping
             )
-            full_to_device_mapping[verify_cache_locs] = 0
+            # Same full-vs-compressed unit mismatch as finalize_accepted_tokens:
+            # verify_cache_locs are FULL (uncompressed) KV positions; only
+            # compress-group-boundary positions have a valid compressed slot.
+            _boundary_mask = (verify_cache_locs + 1) % self.compress_ratio == 0
+            full_to_device_mapping[
+                verify_cache_locs[_boundary_mask] // self.compress_ratio
+            ] = 0
             return
 
         flat_accept_index = accept_index.reshape(-1)
@@ -1194,11 +1247,11 @@ class HiSparseCoordinator:
         """
         num_reqs = req_pool_indices.size(0)
         needed = num_reqs * num_steps
-
-        if needed > self.top_k_device_locs_buffer.shape[0]:
-            self.top_k_device_locs_buffer = torch.full(
-                (needed, self.top_k), -1, dtype=torch.int32, device=self.device,
-            )
+        assert needed <= self.top_k_device_locs_buffer.shape[0], (
+            f"swap_in_selected_pages: needed={needed} exceeds pre-allocated "
+            f"buffer size {self.top_k_device_locs_buffer.shape[0]}. Increase "
+            f"max_swap_in_batch_multiplier at HiSparseCoordinator construction."
+        )
 
         if num_steps > 1:
             top_k_indices = self.top_k_device_locs_buffer[:needed].view(

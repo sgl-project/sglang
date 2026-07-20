@@ -523,10 +523,6 @@ def eagle_prepare_for_verify(
             verify_forward_batch
         )
     )
-    # HiSparse: swap_in involves host->device DMA incompatible with CUDA graph.
-    # Run TARGET_VERIFY eagerly when hisparse is enabled.
-    if can_run_cuda_graph and target_worker.model_runner.enable_hisparse:
-        can_run_cuda_graph = False
     if can_run_cuda_graph:
         target_worker.model_runner.decode_cuda_graph_runner.load_batch(
             verify_forward_batch

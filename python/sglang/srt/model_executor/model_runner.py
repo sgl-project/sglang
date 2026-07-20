@@ -873,6 +873,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 top_k=hisparse_top_k,
                 device_buffer_size=hisparse_cfg.device_buffer_size,
                 device=self.device,
+                max_swap_in_batch_multiplier=(
+                    self.server_args.speculative_num_draft_tokens or 1
+                ),
                 tp_group=(
                     self.attention_tp_group.cpu_group
                     if self.server_args.enable_dp_attention

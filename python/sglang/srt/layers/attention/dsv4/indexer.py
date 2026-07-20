@@ -756,10 +756,11 @@ class C4IndexerBackendMixin:
             raw_indices = torch.empty_like(c4_sparse_page_indices)
         elif hisparse_use_swap_in:
             num_tokens = c4_sparse_page_indices.size(0)
-            if num_tokens <= hisparse_coordinator.raw_indices_buffer.size(0):
-                raw_indices = hisparse_coordinator.raw_indices_buffer[:num_tokens]
-            else:
-                raw_indices = torch.empty_like(c4_sparse_page_indices)
+            assert num_tokens <= hisparse_coordinator.raw_indices_buffer.size(0), (
+                f"raw_indices_buffer too small ({hisparse_coordinator.raw_indices_buffer.size(0)}) "
+                f"for {num_tokens} tokens; increase max_swap_in_batch_multiplier."
+            )
+            raw_indices = hisparse_coordinator.raw_indices_buffer[:num_tokens]
         elif core_metadata.c4_sparse_raw_indices is not None:
             raw_indices = core_metadata.c4_sparse_raw_indices
 
