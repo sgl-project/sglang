@@ -2,8 +2,9 @@
 
 Tests MiniMax-M3 (MXFP8 checkpoint) with TP=4 on MI35x. MI35x (gfx950 / CDNA4)
 has hardware MX-scaled matmul, so the MXFP8 MoE weights are served natively;
-you still pass `--quantization mxfp8`. The launch flags mirror the SGLang
-MiniMax-M3 cookbook recipe for MI350X/MI355X (minus the Blackwell-only flags).
+you still pass `--quantization mxfp8`. Serves with the aiter attention backend,
+fp8 (e4m3) KV cache, and radix cache disabled — validated accuracy-neutral vs
+the bf16-KV / triton-attn baseline (0.972 vs 0.970 on GSM8K chat+thinking).
 
 MiniMax-M3 is a reasoning model: it must be evaluated through the chat template
 with thinking enabled (its `<mm:think>` reasoning path). Raw few-shot completion
@@ -74,15 +75,20 @@ MI35X_MINIMAX_M3_TP4_MODELS = [
     ModelConfig(
         model_path="MiniMaxAI/MiniMax-M3-MXFP8",
         tp_size=4,
-        accuracy_threshold=0.93,
+        accuracy_threshold=0.95,
         timeout=5400,
-        variant="TP4+MXFP8+Chat/Thinking",
+        variant="TP4+MXFP8+aiterAttn+fp8KV",
         other_args=[
             "--quantization",
             "mxfp8",
             "--dtype",
             "bfloat16",
             "--trust-remote-code",
+            "--attention-backend",
+            "aiter",
+            "--kv-cache-dtype",
+            "fp8_e4m3",
+            "--disable-radix-cache",
             "--chunked-prefill-size",
             "8192",
             "--mem-fraction-static",
