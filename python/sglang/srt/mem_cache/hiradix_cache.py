@@ -1261,10 +1261,12 @@ class HiRadixCache(RadixCache):
         else:
             ancester_node = node
 
-        # Protect the nodes being loaded from host eviction.
-        for n in nodes_to_load:
-            n.protect_host()
-        protected_host_nodes = list(nodes_to_load)
+        # HiRadix host eviction is prefix-tree leaf-first: protecting the
+        # deepest load-back leaf is enough to keep its evicted ancestor chain
+        # from being released while the async host->device copy is pending.
+        # If a future non-prefix KV cache can evict middle nodes directly,
+        # protect every node whose host_value is included in host_indices.
+        last_hit_node.protect_host()
 
         # protect the ancestor nodes from eviction
         result = self.inc_lock_ref(ancester_node)
@@ -1277,8 +1279,7 @@ class HiRadixCache(RadixCache):
         ):
             # skip loading back if the total size is too small or exceeding the memory quota
             self.dec_lock_ref(ancester_node)
-            for host_node in protected_host_nodes:
-                host_node.release_host()
+            last_hit_node.release_host()
             return None
 
         device_indices = self.cache_controller.load(
@@ -1303,13 +1304,12 @@ class HiRadixCache(RadixCache):
                 last_hit_node.id,
                 self.evictable_size_,
             )
-            for host_node in protected_host_nodes:
-                host_node.release_host()
+            last_hit_node.release_host()
             return None
 
         self.ongoing_load_back[last_hit_node.id] = (
             last_hit_node,
-            protected_host_nodes,
+            [last_hit_node],
         )
         offset = 0
         for node in nodes_to_load:

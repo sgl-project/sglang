@@ -33,7 +33,7 @@ class _DoneEvent:
 
 
 class TestHiRadixCacheLoadBackHostLocks(unittest.TestCase):
-    def test_loading_check_releases_load_back_host_locks_on_ack(self):
+    def test_loading_check_releases_load_back_leaf_host_lock_on_ack(self):
         cache = object.__new__(HiRadixCache)
         cache.pp_rank = 0
         cache.cache_controller = SimpleNamespace(
@@ -46,9 +46,9 @@ class TestHiRadixCacheLoadBackHostLocks(unittest.TestCase):
         cache._all_reduce = all_reduce_noop
 
         end_node = TreeNode()
-        host_node = TreeNode()
-        host_node.protect_host()
-        cache.ongoing_load_back = {123: (end_node, [host_node])}
+        load_back_leaf = TreeNode()
+        load_back_leaf.protect_host()
+        cache.ongoing_load_back = {123: (end_node, [load_back_leaf])}
 
         dec_locked_nodes = []
         cache.dec_lock_ref = dec_locked_nodes.append
@@ -56,7 +56,7 @@ class TestHiRadixCacheLoadBackHostLocks(unittest.TestCase):
         cache.loading_check()
 
         self.assertEqual(dec_locked_nodes, [end_node])
-        self.assertEqual(host_node.host_ref_counter, 0)
+        self.assertEqual(load_back_leaf.host_ref_counter, 0)
         self.assertEqual(cache.ongoing_load_back, {})
         self.assertEqual(cache.cache_controller.ack_load_queue, [])
 
