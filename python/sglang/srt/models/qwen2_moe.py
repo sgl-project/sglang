@@ -209,7 +209,7 @@ class Qwen2MoeMLP(nn.Module):
         # per-token quant into one aiter kernel feeding the (fp8, scale) tuple to
         # down_proj. Aiter-only; default off.
         self._fp8_silu_fuse = False
-        if _use_aiter and get_global_server_args().enable_dense_fp8:
+        if _use_aiter and get_server_args().enable_dense_fp8:
             quant_method = getattr(self.down_proj, "quant_method", None)
             # Gate on use_aiter_fp8_per_token (set in __init__): it implies the
             # bpreshuffle per-token path the tuple needs; use_per_token_if_dynamic is
@@ -236,10 +236,7 @@ class Qwen2MoeMLP(nn.Module):
             out_fp8 = torch.empty((M, N), dtype=dtypes.fp8, device=gate_up.device)
             scale = torch.empty((M, 1), dtype=torch.float32, device=gate_up.device)
             aiter.silu_and_mul_quant(out_fp8, gate_up, scale, N)
-            x, _ = self.down_proj(
-                (out_fp8, scale),
-                skip_all_reduce=should_allreduce_fusion or use_reduce_scatter,
-            )
+            x, _ = self.down_proj((out_fp8, scale))
             return x
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
