@@ -428,6 +428,13 @@ class FP32LayerNorm(CustomOp, nn.LayerNorm):
         try:
             import attentions  # noqa: F401
         except ImportError:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.warning(
+                "The 'attentions' library is not installed. Falling back to native layernorm. "
+                "Installing this library may improve performance on NPU."
+                "See: sgl-project/sgl-kernel-npu"
+            )
             self._forward_method = self.forward_native
 
     def _cached_fp32_param(
