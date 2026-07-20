@@ -2,23 +2,15 @@ name: Release Docker Images Nightly Miles ROCm7.2 (AMD)
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "0 12 * * *"
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.number || github.sha }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.run_id }}
+  cancel-in-progress: false
 
 jobs:
-  publish:
+  smoke:
     if: github.repository == 'sgl-project/sglang'
     runs-on: amd-docker-scale
-    environment: "prod"
-    strategy:
-      fail-fast: false
-      matrix:
-        variant:
-          - rocm720-mi35x
     steps:
       - name: Checkout miles repository
         uses: actions/checkout@v4
@@ -27,20 +19,56 @@ jobs:
           ref: main
           fetch-depth: 0
 
-      - name: Record miles commit
-        run: echo "Building from miles main @ $(git rev-parse HEAD)"
-
-      - name: Set date
-        run: echo "DATE=$(date +%Y%m%d)" >> $GITHUB_ENV
-
-      - name: Login to Docker Hub (AMD)
-        uses: docker/login-action@v2
-        with:
-          username: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
-
-      - name: Build via miles docker/build.py and push dated tag
+      - name: Smoke test PR 31757 workflow assumptions without pushing
         run: |
-          python3 docker/build.py --variant ${{ matrix.variant }} --image-tag custom --custom-tag miles
-          docker tag  rocm/sgl-dev:miles-${{ matrix.variant }} rocm/sgl-dev:miles-${{ matrix.variant }}-${DATE}
-          docker push rocm/sgl-dev:miles-${{ matrix.variant }}-${DATE}
+          set +e
+          overall=0
+
+          echo "===== runner/tooling ====="
+          python3 --version
+          docker version
+          docker buildx version
+          buildx_version_status=$?
+          docker buildx ls
+          buildx_ls_status=$?
+
+          echo "===== typer import in normal workflow python ====="
+          python3 - <<'PY'
+          import typer
+          print(f"typer import OK: {typer.__version__ if hasattr(typer, '__version__') else 'unknown'}")
+          PY
+          typer_status=$?
+          echo "typer_status=${typer_status}"
+          if [ "${typer_status}" -ne 0 ]; then overall=1; fi
+
+          echo "===== build.py dry-run with the PR command shape ====="
+          python3 docker/build.py --variant rocm720-mi35x --image-tag custom --custom-tag miles --dry-run
+          buildpy_status=$?
+          echo "buildpy_dry_run_status=${buildpy_status}"
+          if [ "${buildpy_status}" -ne 0 ]; then overall=1; fi
+
+          echo "===== minimal buildx build without --push/--load, then docker tag ====="
+          tag="rocm/sgl-dev:cursor-pr31757-buildx-smoke-${GITHUB_RUN_ID}"
+          docker buildx build -t "${tag}" - <<'DOCKERFILE'
+          FROM scratch
+          LABEL cursor.pr31757.buildx-smoke="true"
+          DOCKERFILE
+          build_status=$?
+          echo "buildx_build_status=${build_status}"
+
+          docker image inspect "${tag}"
+          inspect_status=$?
+          echo "docker_image_inspect_status=${inspect_status}"
+
+          docker tag "${tag}" "${tag}-retag"
+          tag_status=$?
+          echo "docker_tag_status=${tag_status}"
+
+          docker image rm "${tag}" "${tag}-retag" >/dev/null 2>&1
+
+          if [ "${buildx_version_status}" -ne 0 ] || [ "${buildx_ls_status}" -ne 0 ] || [ "${build_status}" -ne 0 ] || [ "${inspect_status}" -ne 0 ] || [ "${tag_status}" -ne 0 ]; then
+            overall=1
+          fi
+
+          echo "overall_status=${overall}"
+          exit "${overall}"
