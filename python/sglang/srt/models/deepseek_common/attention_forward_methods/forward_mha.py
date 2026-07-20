@@ -297,10 +297,11 @@ class DeepseekMHAForwardMixin:
         q[..., self.qk_nope_head_dim :] = q_pe
 
         self._set_mla_kv_buffer(latent_cache, kv_a, k_pe, forward_batch)
-        if (
+        kv_refetched = (
             forward_batch.mha_one_shot
             and sum(forward_batch.extend_prefix_lens_cpu) != 0
-        ):
+        )
+        if kv_refetched:
             if (
                 self.use_dsa
                 and self.kv_cache_dtype == "fp8_e4m3"
@@ -345,9 +346,19 @@ class DeepseekMHAForwardMixin:
                 )
             )[0]
         else:
-            if _use_aiter_gfx95 and self.kv_b_proj.weight.dtype == torch.float8_e4m3fn:
+            if (
+                _use_aiter_gfx95
+                and self.kv_b_proj.weight.dtype == torch.float8_e4m3fn
+                and not kv_refetched
+            ):
                 kv = self.kv_b_proj(kv_a_quanted)[0]
             else:
+                # On a chunked-prefill split (kv_refetched), kv_a/k_pe were re-fetched as
+                # the FULL prefix+chunk sequence, but kv_a_quanted (from the fused
+                # norm+quant above) is only the current chunk — using it makes k_nope
+                # shorter than the full-length k_pe and crashes _concat_and_cast_mha_k
+                # (GLM-5.1-FP8, TP8: "expanded size 15497 must match 15753"). Fall back
+                # to the re-fetched bf16 kv_a; the fp8 kv_b_proj quantizes it inline.
                 kv = self.kv_b_proj(kv_a)[0]
             kv = kv.view(
                 -1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim
