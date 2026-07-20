@@ -187,6 +187,13 @@ class TestElasticRecover4To4(CustomTestCase):
     def _generate_ok(self, description: str, routed_dp_rank: int | None = None) -> None:
         response = self._generate(routed_dp_rank)
         self.assertEqual(response.status_code, 200, f"{description}: {response.text}")
+        payload = response.json()
+        generated_text = payload.get("text", "")
+        self.assertIn(
+            "paris",
+            generated_text.casefold(),
+            f"{description}: unexpected generation: {generated_text!r}",
+        )
 
     def _wait_for_recover_capture(self) -> None:
         deadline = time.monotonic() + RECOVER_TIMEOUT_SECONDS
