@@ -23,6 +23,12 @@ struct PrecomputeDraftsStats {
   int64_t num_cache_entries = 0;
 };
 
+struct PrecomputeDraftsDenseCache {
+  std::vector<int32_t> bonus_tokens;
+  std::vector<int32_t> draft_tokens;
+  std::vector<uint8_t> tree_mask;
+};
+
 struct SelectPrecomputedDraftsResult {
   Result result;
   std::vector<uint8_t> bonus_prediction_hit;
@@ -119,7 +125,8 @@ class Ngram {
       const std::vector<uint8_t>& tree_mask,
       size_t bonus_topk,
       size_t max_trie_depth,
-      double wide_bonus_ratio);
+      double wide_bonus_ratio,
+      PrecomputeDraftsDenseCache* dense_cache = nullptr);
 
   SelectPrecomputedDraftsResult selectPrecomputedDrafts(
       const std::vector<int64_t>& state_ids,

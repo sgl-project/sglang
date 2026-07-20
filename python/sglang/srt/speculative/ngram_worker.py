@@ -66,7 +66,6 @@ class NGRAMWorker(BaseSpecWorker):
         self.draft_token_num: int = server_args.speculative_num_draft_tokens
         self.max_trie_depth: int = server_args.speculative_ngram_max_trie_depth
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
-        self.precompute_bonus_topk = max(1, self.draft_token_num)
         self.precompute_wide_bonus_ratio = (
             envs.SGLANG_NGRAM_PRECOMPUTE_WIDE_BONUS_RATIO.get()
         )
@@ -123,15 +122,16 @@ class NGRAMWorker(BaseSpecWorker):
                 loaded,
             )
 
-        # C++ precomputed draft cache is populated by precompute_draft_tokens
-        # and consumed by _prepare_for_speculative_decoding. Python keeps only
-        # a boolean sentinel so it can skip the select call when C++ has no
-        # cached entries.
-        self._precomputed_cache = None
+        # The selected tree is copied back asynchronously for the next CPU-side
+        # precompute while the dense precompute cache stays on GPU for selection.
         self._precomputed_draft_tokens_np = (
             None  # the current batch's draft tokens (numpy)
         )
         self._precomputed_tree_mask_np = None  # the current batch's tree mask (numpy)
+        self._gpu_precomputed_cache = None
+        self._pending_prev_accept_cpu = None
+        self._pending_selected_drafts_cpu = None
+        self._precompute_copy_stream = None
         self.prev_token_ids = None
         self.prev_accept_lens = None
         self._ngram_precompute_stats_interval = max(
@@ -161,9 +161,11 @@ class NGRAMWorker(BaseSpecWorker):
     def clear_cache_pool(self):
         self.ngram_corpus.reset()
         self._prev_decode_rids = set()
-        self._precomputed_cache = None
         self._precomputed_draft_tokens_np = None
         self._precomputed_tree_mask_np = None
+        self._gpu_precomputed_cache = None
+        self._pending_prev_accept_cpu = None
+        self._pending_selected_drafts_cpu = None
         self.prev_token_ids = None
         self.prev_accept_lens = None
         self._ngram_precompute_stats_interval = max(
@@ -350,103 +352,214 @@ class NGRAMWorker(BaseSpecWorker):
         self._precomputed_cache_hit_ct = 0
         self._precomputed_cache_total_ct = 0
 
-    def _try_use_precomputed_drafts(
-        self, batch: ScheduleBatch
-    ) -> Optional[tuple[np.ndarray, np.ndarray]]:
-        """Try to use precomputed draft tokens from the previous batch's
-        precompute_draft_tokens call. Returns (drafts, mask) on full or partial
-        hit, or None if every request misses.
+    def _copy_stream_and_event(self):
+        device_module = torch.get_device_module(self.device)
+        if self._precompute_copy_stream is None:
+            self._precompute_copy_stream = device_module.Stream()
+        return device_module, self._precompute_copy_stream, device_module.Event()
 
-        Match conditions for each request i:
-        1. predicted_bonus == bonus_token: the ngram-predicted bonus token
-           (from the first-phase batch_get in precompute) must match the
-           actual bonus token from verification.
-        2. path_cols must match the actual accepted path from verification.
-           The path includes the root/echo node, but that root is not a newly
-           generated token.
-        """
-        if not self._precomputed_cache or batch.has_grammar:
-            return None
+    def _stage_prev_accept_cpu_copy(
+        self, accept_tokens: torch.Tensor, accept_lens: torch.Tensor
+    ) -> None:
+        device_module, copy_stream, copy_event = self._copy_stream_and_event()
+        cpu_tokens = torch.empty_like(accept_tokens, device="cpu", pin_memory=True)
+        cpu_lens = torch.empty_like(accept_lens, device="cpu", pin_memory=True)
+        current_stream = device_module.current_stream()
+        with device_module.stream(copy_stream):
+            copy_stream.wait_stream(current_stream)
+            cpu_tokens.copy_(accept_tokens, non_blocking=True)
+            cpu_lens.copy_(accept_lens, non_blocking=True)
+            copy_event.record()
+        self.prev_token_ids = None
+        self.prev_accept_lens = None
+        self._pending_prev_accept_cpu = (copy_event, cpu_tokens, cpu_lens)
+
+    def _ensure_prev_accept_cpu_ready(self) -> None:
+        pending = self._pending_prev_accept_cpu
+        if pending is None:
+            return
+        copy_event, cpu_tokens, cpu_lens = pending
+        copy_event.synchronize()
+        self.prev_token_ids = cpu_tokens.tolist()
+        self.prev_accept_lens = cpu_lens.tolist()
+        self._pending_prev_accept_cpu = None
+
+    def _stage_selected_drafts_cpu_copy(
+        self,
+        draft_tokens: torch.Tensor,
+        tree_mask: torch.Tensor,
+        cache_hits: torch.Tensor,
+    ) -> None:
+        device_module, copy_stream, copy_event = self._copy_stream_and_event()
+        cpu_draft_tokens = torch.empty_like(draft_tokens, device="cpu", pin_memory=True)
+        cpu_tree_mask = torch.empty_like(tree_mask, device="cpu", pin_memory=True)
+        cpu_cache_hits = (
+            torch.empty_like(cache_hits, device="cpu", pin_memory=True)
+            if self._ngram_precompute_stats_interval > 0
+            else None
+        )
+        current_stream = device_module.current_stream()
+        with device_module.stream(copy_stream):
+            copy_stream.wait_stream(current_stream)
+            cpu_draft_tokens.copy_(draft_tokens, non_blocking=True)
+            cpu_tree_mask.copy_(tree_mask, non_blocking=True)
+            if cpu_cache_hits is not None:
+                cpu_cache_hits.copy_(cache_hits, non_blocking=True)
+            copy_event.record()
+        self._precomputed_draft_tokens_np = None
+        self._precomputed_tree_mask_np = None
+        self._pending_selected_drafts_cpu = (
+            copy_event,
+            cpu_draft_tokens,
+            cpu_tree_mask,
+            cpu_cache_hits,
+        )
+
+    def _ensure_selected_drafts_cpu_ready(self) -> None:
+        pending = self._pending_selected_drafts_cpu
+        if pending is None:
+            return
+        copy_event, cpu_draft_tokens, cpu_tree_mask, cpu_cache_hits = pending
+        copy_event.synchronize()
+        self._precomputed_draft_tokens_np = cpu_draft_tokens.numpy()
+        self._precomputed_tree_mask_np = cpu_tree_mask.numpy()
+        self._pending_selected_drafts_cpu = None
+        if cpu_cache_hits is not None:
+            cache_hits = cpu_cache_hits.bool().tolist()
+            self._record_bonus_prediction_stats(cache_hits, cache_hits)
+
+    def _stage_gpu_precomputed_cache(
+        self,
+        req_ids: list[str],
+        bonus_tokens_np: np.ndarray,
+        draft_tokens_np: np.ndarray,
+        tree_mask_np: np.ndarray,
+    ) -> None:
+        bs = len(req_ids)
+        d = self.draft_token_num
+        bonus_topk = d
+        bonus_tokens_cpu = torch.as_tensor(
+            bonus_tokens_np, dtype=torch.int32
+        ).pin_memory()
+        draft_tokens_cpu = torch.as_tensor(
+            draft_tokens_np, dtype=torch.int64
+        ).pin_memory()
+        tree_mask_cpu = torch.as_tensor(tree_mask_np, dtype=torch.bool).pin_memory()
+
+        device_module, copy_stream, copy_event = self._copy_stream_and_event()
+        with device_module.stream(copy_stream):
+            bonus_tokens_gpu = bonus_tokens_cpu.to(self.device, non_blocking=True)
+            draft_tokens_gpu = draft_tokens_cpu.to(self.device, non_blocking=True)
+            tree_mask_gpu = tree_mask_cpu.to(self.device, non_blocking=True)
+            copy_event.record()
+
+        self._gpu_precomputed_cache = {
+            "req_id_to_row": {req_id: row for row, req_id in enumerate(req_ids)},
+            "bonus_tokens": bonus_tokens_gpu.view(bs, d, bonus_topk),
+            "draft_tokens": draft_tokens_gpu.view(bs, d, bonus_topk, d),
+            "tree_mask": tree_mask_gpu.view(bs, d, bonus_topk, d, d),
+            "copy_event": copy_event,
+        }
+
+    def _try_use_precomputed_drafts(
+        self,
+        batch: ScheduleBatch,
+        draft_tokens: torch.Tensor,
+        tree_mask: torch.Tensor,
+    ) -> bool:
+        if self._gpu_precomputed_cache is None or batch.has_grammar:
+            return False
 
         bs = len(batch.reqs)
         d = self.draft_token_num
+        cache = self._gpu_precomputed_cache
+        req_id_to_row = cache["req_id_to_row"]
+        cache_rows = [req_id_to_row.get(req.rid, -1) for req in batch.reqs]
 
-        prev_token_ids, prev_accept_lens = (
-            batch.spec_info.accept_tokens,
-            batch.spec_info.accept_lens,
-        )
+        prev_accept_tokens = batch.spec_info.accept_tokens
+        prev_accept_lens = batch.spec_info.accept_lens
         prev_accept_index = batch.spec_info.accept_index
-        if prev_accept_index is None:
-            return None
+        if (
+            prev_accept_index is None
+            or not prev_accept_tokens.is_cuda
+            or not prev_accept_lens.is_cuda
+            or not prev_accept_index.is_cuda
+        ):
+            return False
 
-        if not prev_token_ids.is_cpu:
-            prev_token_ids = prev_token_ids.cpu()
-            prev_accept_lens = prev_accept_lens.cpu()
-        if not prev_accept_index.is_cpu:
-            prev_accept_index = prev_accept_index.cpu()
-        prev_token_ids_list = prev_token_ids.tolist()
-        prev_accept_lens_list = prev_accept_lens.tolist()
+        device_module = torch.get_device_module(self.device)
+        device_module.current_stream().wait_event(cache["copy_event"])
+        self._stage_prev_accept_cpu_copy(prev_accept_tokens, prev_accept_lens)
 
-        req_ids = []
-        fallback_tokens = []
-        fallback_total_lens = []
-        stride = d
-        use_prev_tokens = self.enable_overlap and not batch.has_grammar
-        for i, req in enumerate(batch.reqs):
-            prev_tokens = (
-                prev_token_ids_list[i * stride : i * stride + prev_accept_lens_list[i]]
-                if use_prev_tokens
-                else []
-            )
-            check_token = self._efficient_concat_last_n(
-                list(req.origin_input_ids),
-                list(req.output_ids[-self.max_trie_depth :]) + prev_tokens,
-                self.max_trie_depth,
-            )
-            req_ids.append(req.rid)
-            fallback_tokens.append(check_token)
-            fallback_total_lens.append(
-                len(req.origin_input_ids) + len(req.output_ids) + len(prev_tokens)
-            )
-
-        (
-            result_drafts,
-            result_masks,
-            bonus_prediction_hits,
-            precomputed_cache_hits,
-            _stats,
-        ) = self.ngram_corpus.select_precomputed_drafts(
-            req_ids,
-            prev_token_ids,
-            prev_accept_lens,
-            prev_accept_index,
-            fallback_tokens,
-            fallback_total_lens,
+        req_indices = torch.arange(bs, device=prev_accept_tokens.device)
+        cache_rows_cpu = torch.tensor(
+            cache_rows, dtype=torch.long, device="cpu", pin_memory=True
         )
-        hit_count = sum(1 for hit in precomputed_cache_hits if hit)
-
-        self._record_bonus_prediction_stats(
-            bonus_prediction_hits, precomputed_cache_hits
+        cache_rows_gpu = cache_rows_cpu.to(prev_accept_tokens.device, non_blocking=True)
+        has_precomputed_row = cache_rows_gpu >= 0
+        safe_cache_rows = torch.clamp(cache_rows_gpu, min=0)
+        req_offsets = req_indices * d
+        accept_lens = prev_accept_lens.to(dtype=torch.long)
+        last_slots = torch.clamp(accept_lens - 1, min=0, max=d - 1)
+        accept_tokens_2d = prev_accept_tokens.view(bs, d)
+        accept_index_2d = prev_accept_index.view(bs, d).to(dtype=torch.long)
+        slot_indices = torch.arange(d, device=prev_accept_tokens.device)
+        accepted_slot_mask = slot_indices[None, :] < accept_lens[:, None]
+        valid_index_mask = accepted_slot_mask & (accept_index_2d >= 0)
+        path_slots = (
+            torch.where(
+                valid_index_mask,
+                slot_indices[None, :],
+                torch.full(
+                    (bs, d), -1, dtype=torch.long, device=prev_accept_tokens.device
+                ),
+            )
+            .max(dim=1)
+            .values
         )
+        safe_path_slots = torch.clamp(path_slots, min=0, max=d - 1)
+        path_global = accept_index_2d[req_indices, safe_path_slots]
+        path_nodes = path_global - req_offsets
+        valid_path = (
+            has_precomputed_row
+            & (accept_lens > 0)
+            & (accept_lens <= d)
+            & (path_slots >= 0)
+            & (path_global >= 0)
+            & (path_nodes >= 0)
+            & (path_nodes < d)
+        )
+        safe_path_nodes = torch.clamp(path_nodes, min=0, max=d - 1)
+        bonus_tokens = accept_tokens_2d[req_indices, last_slots].to(dtype=torch.int32)
 
-        # Store prev token info (needed by precompute_draft_tokens of next batch)
-        self.prev_token_ids = prev_token_ids_list
-        self.prev_accept_lens = prev_accept_lens_list
+        bonus_candidates = cache["bonus_tokens"][safe_cache_rows, safe_path_nodes]
+        slot_matches = (bonus_candidates == bonus_tokens[:, None]) & valid_path[:, None]
+        cache_hits = torch.any(slot_matches, dim=1)
+        bonus_slots = torch.argmax(slot_matches.to(torch.int32), dim=1).to(torch.long)
 
-        if hit_count == bs:
-            logger.debug(f"Precomputed draft cache HIT for all {bs} requests")
-            return result_drafts, result_masks
-        elif hit_count == 0:
-            logger.debug(
-                f"Precomputed draft cache MISS for all {bs} requests, "
-                "used C++ fallback generation"
-            )
-            return result_drafts, result_masks
-        else:
-            logger.debug(
-                f"Precomputed draft cache partial HIT: {hit_count}/{bs} requests"
-            )
-            return result_drafts, result_masks
+        cached_drafts = cache["draft_tokens"][
+            safe_cache_rows, safe_path_nodes, bonus_slots
+        ]
+        cached_masks = cache["tree_mask"][safe_cache_rows, safe_path_nodes, bonus_slots]
+
+        fallback_drafts = torch.zeros_like(cached_drafts)
+        fallback_drafts[:, 0] = bonus_tokens.to(dtype=fallback_drafts.dtype)
+        fallback_masks = torch.zeros_like(cached_masks)
+        fallback_masks[:, :, 0] = True
+        diag_indices = torch.arange(d, device=fallback_masks.device)
+        fallback_masks[:, diag_indices, diag_indices] = True
+
+        selected_drafts = torch.where(
+            cache_hits[:, None], cached_drafts, fallback_drafts
+        )
+        selected_masks = torch.where(
+            cache_hits[:, None, None], cached_masks, fallback_masks
+        )
+        draft_tokens.copy_(selected_drafts.reshape(-1), non_blocking=True)
+        tree_mask.copy_(selected_masks.reshape(-1), non_blocking=True)
+        self._stage_selected_drafts_cpu_copy(draft_tokens, tree_mask, cache_hits)
+        self._gpu_precomputed_cache = None
+        return True
 
     def _prepare_draft_tokens(
         self, batch: ScheduleBatch
@@ -511,7 +624,6 @@ class NGRAMWorker(BaseSpecWorker):
         # IDLE batch must keep its forward_mode instead of being rewritten to
         # TARGET_VERIFY below (relevant once DP attention support lands).
         if not batch.forward_mode.is_decode():
-            self._precomputed_cache = None
             return
 
         bs = len(batch.reqs)
@@ -523,19 +635,18 @@ class NGRAMWorker(BaseSpecWorker):
         tree_mask = self.tree_mask_batch[bs]
         draft_tokens = self.draft_tokens_batch[bs]
 
-        # Try to use precomputed drafts from the previous precompute_draft_tokens call
-        precomputed_result = self._try_use_precomputed_drafts(batch)
-        if precomputed_result is not None:
-            req_drafts, mask = precomputed_result
-        else:
+        used_precomputed_drafts = self._try_use_precomputed_drafts(
+            batch, draft_tokens, tree_mask
+        )
+        if not used_precomputed_drafts:
             req_drafts, mask = self._prepare_draft_tokens(batch)
 
-        # Save for precompute_draft_tokens and _try_use_precomputed_drafts
-        self._precomputed_draft_tokens_np = req_drafts.copy()
-        self._precomputed_tree_mask_np = mask.copy()
+            # Bootstrap precompute from the ordinary batch_get tree.
+            self._precomputed_draft_tokens_np = req_drafts.copy()
+            self._precomputed_tree_mask_np = mask.copy()
 
-        tree_mask.copy_(torch.from_numpy(mask), non_blocking=True)
-        draft_tokens.copy_(torch.from_numpy(req_drafts), non_blocking=True)
+            tree_mask.copy_(torch.from_numpy(mask), non_blocking=True)
+            draft_tokens.copy_(torch.from_numpy(req_drafts), non_blocking=True)
 
         # generate positions and some indices using tree_mask
         reconstruct_indices_from_tree_mask(
@@ -552,8 +663,10 @@ class NGRAMWorker(BaseSpecWorker):
         # NOTE: QLEN_MASK is faster than FULL_MASK, but requires corresponding changes in flashinfer.
         # Testing shows about 8% performance improvement (the effect is roughly proportional to batch size).
         if USE_FULL_MASK:
-            tree_mask = []
-            mask = mask.reshape(bs, self.draft_token_num, self.draft_token_num)
+            compact_tree_mask = tree_mask.reshape(
+                bs, self.draft_token_num, self.draft_token_num
+            )
+            full_tree_mask = []
             # TODO(siyuan): the for loop here leads to significant overhead in large batch size. Can be written into a kernel.
             for i in range(bs):
                 seq_len = batch.seq_lens_cpu[i]
@@ -563,14 +676,12 @@ class NGRAMWorker(BaseSpecWorker):
                 req_mask = torch.cat(
                     (
                         req_mask,
-                        torch.from_numpy(mask[i]).to(
-                            device=self.device, non_blocking=True
-                        ),
+                        compact_tree_mask[i],
                     ),
                     dim=1,
                 ).to(torch.bool)
-                tree_mask.append(req_mask.flatten())
-            tree_mask = torch.cat(tree_mask, dim=0)
+                full_tree_mask.append(req_mask.flatten())
+            tree_mask = torch.cat(full_tree_mask, dim=0)
 
         batch.forward_mode = ForwardMode.TARGET_VERIFY
         batch.input_ids = draft_tokens
@@ -597,6 +708,7 @@ class NGRAMWorker(BaseSpecWorker):
         )
 
     def _update_ngram_corpus(self, batch: ScheduleBatch):
+        self._ensure_prev_accept_cpu_ready()
         batch_tokens = []
         i, stride = 0, self.draft_token_num
         # Same splice condition as _prepare_draft_tokens: only overlap mode
@@ -631,7 +743,7 @@ class NGRAMWorker(BaseSpecWorker):
         - At next batch's _prepare_draft_tokens: req.output_ids includes batch_{K-1}'s
         - So we include prev_tokens (batch_{K-1}'s verified tokens) in the context.
 
-        The approach (C++ two-phase precompute):
+        The approach (C++ dense two-phase precompute):
         1. From the current batch's tree mask, extract all valid paths (root to each node)
         2. For each (request, path), construct the ngram check context:
            context = last_n(output_ids + prev_tokens + generated_path_draft_tokens)
@@ -641,18 +753,23 @@ class NGRAMWorker(BaseSpecWorker):
            if target emits one of them the accepted path extends to that child.
         4. Phase 2 appends predicted bonus to each context and gets actual draft tokens
            for batch N+1.
-        5. Store results inside ngram_corpus indexed by (state_id, path_cols,
-           predicted_bonus).
-        6. At next _prepare_for_speculative_decoding, C++ selects hits and regenerates
-           misses in one call.
+        5. Export every (request row, path node, predicted bonus) result as a
+           dense cache and copy it to GPU asynchronously.
+        6. At the next _prepare_for_speculative_decoding, GPU kernels select
+           hits and use a shallow legal draft for misses without synchronizing
+           verified tokens back to CPU first.
         """
         if (
-            not batch.forward_mode.is_decode()
-            and not batch.forward_mode.is_target_verify()
-        ) or batch.has_grammar:
-            # spec v2 currently doesn't support grammar, so directly return.
-            self._precomputed_cache = None
+            not self.enable_overlap
+            or not batch.forward_mode.is_target_verify()
+            or batch.has_grammar
+        ):
+            # Precompute has no non-overlapped mode. With overlap disabled or
+            # grammar enabled, decoding uses the ordinary batch_get path.
+            self._gpu_precomputed_cache = None
             return
+
+        self._ensure_selected_drafts_cpu_ready()
 
         bs = len(batch.reqs)
         d = self.draft_token_num
@@ -660,29 +777,17 @@ class NGRAMWorker(BaseSpecWorker):
         cur_draft_tokens = self._precomputed_draft_tokens_np  # shape (bs * d,)
         cur_tree_mask = self._precomputed_tree_mask_np  # shape (bs * d * d,)
 
-        if cur_draft_tokens is None or cur_tree_mask is None:
-            self._precomputed_cache = None
-            return
-
-        if not hasattr(self, "prev_token_ids") or self.prev_token_ids is None:
-            self._precomputed_cache = None
-            return
-
         req_ids = []
         base_tokens_batch = []
         base_total_lens = []
         stride = d
-        use_prev_tokens = self.enable_overlap and not batch.has_grammar
         for req_idx in range(bs):
             req = batch.reqs[req_idx]
 
             # batch_{K-1}'s verified tokens (will be added to output_ids by scheduler)
-            if use_prev_tokens:
-                prev_tokens = self.prev_token_ids[
-                    req_idx * stride : req_idx * stride + self.prev_accept_lens[req_idx]
-                ]
-            else:
-                prev_tokens = []
+            prev_tokens = self.prev_token_ids[
+                req_idx * stride : req_idx * stride + self.prev_accept_lens[req_idx]
+            ]
 
             # Simulate the context before the current batch's verify result.
             base_output = list(req.output_ids[-self.max_trie_depth :]) + prev_tokens
@@ -700,30 +805,38 @@ class NGRAMWorker(BaseSpecWorker):
             )
             base_total_lens.append(base_total_len)
 
-        if not base_tokens_batch:
-            self._precomputed_cache = None
-            return
-
         self.ngram_corpus.synchronize()
-        num_paths, num_phase2_contexts, num_cache_entries = (
-            self.ngram_corpus.precompute_drafts(
-                req_ids,
-                base_tokens_batch,
-                base_total_lens,
-                cur_draft_tokens,
-                cur_tree_mask,
-                self.precompute_bonus_topk,
-                self.max_trie_depth,
-                self.precompute_wide_bonus_ratio,
-            )
+        (
+            precompute_stats,
+            dense_bonus_tokens,
+            dense_draft_tokens,
+            dense_tree_mask,
+        ) = self.ngram_corpus.precompute_drafts_dense(
+            req_ids,
+            base_tokens_batch,
+            base_total_lens,
+            cur_draft_tokens,
+            cur_tree_mask,
+            d,
+            self.max_trie_depth,
+            self.precompute_wide_bonus_ratio,
         )
+        num_paths, num_phase2_contexts, num_cache_entries = precompute_stats
+        if num_cache_entries > 0:
+            self._stage_gpu_precomputed_cache(
+                req_ids,
+                dense_bonus_tokens,
+                dense_draft_tokens,
+                dense_tree_mask,
+            )
+        else:
+            self._gpu_precomputed_cache = None
 
         logger.debug(
             f"Precomputed {num_cache_entries} draft combos from "
             f"{num_phase2_contexts} phase2 contexts and {num_paths} paths "
             f"for {bs} requests"
         )
-        self._precomputed_cache = num_cache_entries > 0
 
     def forward_batch_generation(
         self, batch: ScheduleBatch, on_publish=None
