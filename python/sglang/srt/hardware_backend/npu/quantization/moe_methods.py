@@ -27,20 +27,42 @@ from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
 logger = logging.getLogger(__name__)
 
 
+_E8M0_DTYPE = None
+
+
 def _require_e8m0_dtype():
     """Resolve the e8m0 block-scale dtype, failing loudly if it is unavailable.
+
+    The grouped matmuls validate their scale-dtype arguments against torch_npu's
+    own dtype enum (``torch_npu.float8_e8m0fnu``, 293 on A5) and reject the torch
+    dtype object with "weight_scale_dtype only supports float8_e8m0fnu or None,
+    but the actual value is Float8_e8m0fnu" — hence torch_npu first, torch only
+    as a fallback. Dense ``npu_quant_matmul`` accepts either, which is why
+    ``_get_float8_e8m0fnu_dtype`` reads it off torch.
 
     The MXFP8 ops take the scale dtype explicitly; passing None silently changes
     how they interpret the scales, so a missing dtype must raise rather than
     propagate.
+
+    torch_npu is imported lazily (and cached) so this module stays importable on
+    CUDA/CPU/AMD/XPU CI.
     """
-    e8m0_dtype = _get_float8_e8m0fnu_dtype()
-    if e8m0_dtype is None:
-        raise RuntimeError(
-            "float8_e8m0fnu dtype not found — MXFP8 MoE requires Ascend A5 with a "
-            "torch build exposing torch.float8_e8m0fnu (torch_npu >= 2.9)."
-        )
-    return e8m0_dtype
+    global _E8M0_DTYPE
+    if _E8M0_DTYPE is None:
+        from sglang.srt.utils import is_npu
+
+        if is_npu():
+            import torch_npu
+
+            _E8M0_DTYPE = getattr(torch_npu, "float8_e8m0fnu", None)
+        if _E8M0_DTYPE is None:
+            _E8M0_DTYPE = _get_float8_e8m0fnu_dtype()
+        if _E8M0_DTYPE is None:
+            raise RuntimeError(
+                "float8_e8m0fnu dtype not found — MXFP8 MoE requires Ascend A5 "
+                "with a torch_npu build exposing float8_e8m0fnu (torch_npu >= 2.9)."
+            )
+    return _E8M0_DTYPE
 
 
 # DEPRECATED METHOD
