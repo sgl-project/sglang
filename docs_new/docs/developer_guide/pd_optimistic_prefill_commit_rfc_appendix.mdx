@@ -197,31 +197,39 @@ not introduce additional protocol states.
 
 1. Reproduce the A/B inversion and assert that D(B) owns zero scarce capacity
    before `COMMITTED(B)`.
-2. Cover P-first, D-first, and simultaneous arrival.
-3. Assert that P launch does not wait for a control response.
-4. Cover both event orders: metadata before forward completion, and forward
+2. Reproduce the mixed-mode counterexample with A as enforce and B as legacy on
+   the same mocked P/D allocators. Direct legacy ingress to either
+   `ENFORCE_EXCLUSIVE` worker must fail before execution-capable state or
+   allocator entry. The only accepted alternative is routing B before dispatch
+   to P/D workers whose `LEGACY_ONLY` allocator-domain IDs are disjoint from
+   A's domains. Assert that no request slot, KV pool, metadata allocator, or
+   cache partition is shared across those test domains.
+3. Cover P-first, D-first, and simultaneous arrival.
+4. Assert that P launch does not wait for a control response.
+5. Cover both event orders: metadata before forward completion, and forward
    completion before metadata. P must remain `P_COMMITTED` after the first bit and submit exactly
    one transfer only after both bits are true.
-5. Guard every D allocator entry with an explicit eligibility predicate that
+6. Guard every D allocator entry with an explicit eligibility predicate that
    rejects `D_REGISTERED`, `D_COMMIT_RECEIVED`, expired commitment validity, and
-   a reconnecting/unready channel lease; do not rely only on enum ordinal
-   ordering.
-6. Prove that a committed P request cannot re-enter admission in the supported
+   a reconnecting/unready channel lease. In an `ENFORCE_EXCLUSIVE` domain it
+   must also reject any request lacking the matching V1 domain/mode fence; do
+   not rely only on enum ordinal ordering or Router behavior.
+7. Prove that a committed P request cannot re-enter admission in the supported
    cell. Complete its forward before metadata arrives and assert that it parks
    in the committed-wait owner without calling
    `optimistic_release_and_requeue()`, `reset_for_retract()`, or releasing any
    source owner.
-7. Set P model/aux metadata-buffer capacity to one. Let request B own that
+8. Set P model/aux metadata-buffer capacity to one. Let request B own that
    buffer while waiting for D(B), then attempt final admission of request A.
    A must remain `P_PRECOMMIT` and must not publish `COMMITTED(A)` until it owns
    the buffer. In particular, D(A) must never hold scarce capacity while A waits
    for the buffer held by B. Repeat this assertion for every finite prerequisite
    in the normative P commit checklist.
-8. Verify exact-once ownership release on success, cancel, and every deadline.
-9. Cover WAIT-first `P_REGISTERED`, HTTP-first `P_PRECOMMIT`, and the atomic
+9. Verify exact-once ownership release on success, cancel, and every deadline.
+10. Cover WAIT-first `P_REGISTERED`, HTTP-first `P_PRECOMMIT`, and the atomic
    registered-to-full-control upgrade. A gate failure must own zero model
    capacity and no event may bypass the failed gate.
-10. Stall success/cancel cleanup past its cleanup deadline and verify that the
+11. Stall success/cancel cleanup past its cleanup deadline and verify that the
    support cell is isolated while local terminal remains unpublished until all
    real owners are released.
 
@@ -241,14 +249,20 @@ not introduce additional protocol states.
 - Make D reject at its request-control or channel-readiness gate after P has
   committed. The enforce supervisor must observe the early D error, cancel both
   pinned roles, and return without waiting for P's post-commit deadline. Keep
-  the current D-error-waits-for-P behavior only on the disabled path.
+  the current D-error-waits-for-P behavior only on allocator-disjoint
+  `LEGACY_ONLY` workers.
 - Break a decode stream after 200/headers. The stream must terminate, cancel the
   originally pinned pair best-effort, and never enter worker reselection or
   replay already exposed bytes.
 - Verify that `WAIT_COMMIT` and `WAIT_TRANSFER_STATUS` retry the same bound pair
   without entering the HTTP pair-selection retry path.
-- With the enforce feature disabled, verify that the current outer
+- On allocator-disjoint `LEGACY_ONLY` workers, verify that the current outer
   `RetryExecutor` still retries retryable worker failures.
+- Under controlled transient connection errors, retryable P/D 5xx responses,
+  and early D request-control/channel rejection, compare V1 user-visible errors
+  with the legacy `RetryExecutor` counterfactual. Verify that shadow metrics
+  count every post-`PAIR_BOUND` failure and classify whether legacy would have
+  retried it, without adding request-identity labels.
 
 ### Protocol and restart tests
 
@@ -302,14 +316,22 @@ not introduce additional protocol states.
   overwrite or a second transfer.
 - Run shared Rust/Python golden vectors for canonical capability digests,
   `pair_policy_digest`, `support_cell_id`, and `request_uid`, including integer
-  endianness, UTF-8, length prefixes, and fixed-width raw fields. The parsers
-  must reject uppercase hex, prefixed hex, UUID punctuation, base64, padding,
-  and the wrong textual width rather than normalizing alternate identities.
+  endianness, UTF-8, length prefixes, fixed-width raw allocator-domain IDs, and
+  the allocator-domain policy digest. The parsers must reject uppercase hex,
+  prefixed hex, UUID punctuation, base64, padding, and the wrong textual width
+  rather than normalizing alternate identities.
 - Keep protocol versions equal while changing each proof-relevant capability
   in turn: framing, KV layout/model generation, parallelism, event-loop/radix
   mode, chunk/retract/rebootstrap flag, deadline policy, selected budget, and
-  channel capability limit. Readiness or worker ingress must reject every
+  channel capability limit, allocator-domain ID, allocator-domain mode, and
+  allocator-domain policy digest. Readiness or worker ingress must reject every
   mismatched pair before state creation.
+- Attempt per-request enforce sampling inside one allocator domain and require
+  readiness/configuration rejection. Then drain the workers, change the domain
+  mode or membership, publish new serving epochs/domain records, and verify old
+  legacy requests and frames cannot overlap or attach to the new enforce
+  domain. Canary routing must select a separate enforce pool before pair
+  selection.
 - Inject actual SMG/P/D clock offsets just below and above the configured
   `max_clock_skew_ms`. Healthy clocks may dispatch; an unhealthy or stale
   clock-health record must stop new enforce dispatch before worker I/O. Existing
@@ -434,6 +456,14 @@ once.
   including loss/ambiguity of the first metadata send, a two-sided channel
   reconnect, byte-identical retransmission, and exact-once transfer.
 - A real-GPU A/B benchmark for each enabled rollout cell.
-- Disabled-path regression tests against the existing legacy behavior.
+- A production-weighted fault-load run covering transient connect failure,
+  retryable P/D 5xx, and early D rejection. The report must include the legacy
+  retry counterfactual, added V1 user-visible error rate and confidence interval,
+  error-budget burn, and an exercised automatic rollback when either configured
+  threshold is exceeded.
+- An isolated-pool canary that proves `ENFORCE_EXCLUSIVE` and `LEGACY_ONLY`
+  traffic never share request slots, KV pools, metadata allocators, or cache
+  partitions. Random per-request protocol sampling inside one pool must fail.
+- Legacy-only-domain regression tests against the existing legacy behavior.
 
 Mock transport tests alone are not sufficient to enable the feature.

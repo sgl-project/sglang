@@ -7,9 +7,12 @@ tag: "DRAFT"
 
 <Warning>
   This RFC proposes an experimental protocol. It does not describe an implemented
-  or enabled feature. The existing path must remain unchanged when the new
-  protocol is disabled.
+  or enabled feature. Allocator-disjoint `LEGACY_ONLY` workers must retain the
+  existing path unchanged.
 </Warning>
+
+For a shorter explanation of the request lifecycle and failure behavior, start
+with the [execution walkthrough](/docs/developer_guide/pd_optimistic_prefill_commit_walkthrough).
 
 ## Summary
 
@@ -38,6 +41,12 @@ P final scheduler admission
           happens before
 D scarce-capacity preallocation
 ```
+
+The rule applies to an entire shared allocator domain, not to a sampled subset
+of requests. Every execution request that can consume a participating P or D
+request/KV/metadata/cache allocator must use the same commit ordering. Legacy
+D-first allocation is allowed only on disjoint legacy worker pools and allocator
+partitions.
 
 SMG still dispatches the P and D HTTP requests concurrently. D may create a
 receiver and bounded control state immediately, but it remains `D_REGISTERED`
@@ -80,12 +89,14 @@ without serializing the P/D HTTP dispatch.
 
 ## Goals
 
-Version 1 has four goals:
+Version 1 has five goals:
 
 1. Eliminate the reproduced P/D capacity inversion by construction.
-2. Keep P GPU launch independent of D, the control network, and acknowledgments.
-3. Bound every new queue, correlation, payload, snapshot, and tombstone.
-4. Keep the disabled path behaviorally and measurably unchanged.
+2. Apply the ordering to every request sharing an enforce allocator domain.
+3. Keep P GPU launch independent of D, the control network, and acknowledgments.
+4. Bound every new queue, correlation, payload, snapshot, and tombstone.
+5. Keep a separate legacy-only allocator domain behaviorally and measurably
+   unchanged.
 
 ## Non-goals
 
@@ -105,22 +116,24 @@ fix and local failure handling. They don't weaken the core safety invariant.
 
 ## Maintainer decisions requested
 
-The first review needs decisions on nine points:
+The first review needs decisions on ten points:
 
 1. Use `P final admission -> D scarce preallocation` as the ordering rule.
-2. Accept the proposed no-retraction P scheduler hook in the narrow support cell.
-3. Confirm `D_REGISTERED` receiver/topology setup owns no listed model capacity.
-4. Bind compatibility to canonical role-capability and actual pair-policy
+2. Enforce that rule for the complete participating allocator domain; do not
+   mix legacy D-first allocation with enforce requests on shared allocators.
+3. Accept the proposed no-retraction P scheduler hook in the narrow support cell.
+4. Confirm `D_REGISTERED` receiver/topology setup owns no listed model capacity.
+5. Bind compatibility to canonical role-capability and actual pair-policy
    digests, not protocol-version equality.
-5. Disable post-`PAIR_BOUND` rerouting and make the first enforcement PR change
+6. Disable post-`PAIR_BOUND` rerouting and make the first enforcement PR change
    the current `RetryExecutor`/early-error supervisor behavior.
-6. Use an isolated V1 Mooncake metadata/status namespace with scheduler-only
+7. Use an isolated V1 Mooncake metadata/status namespace with scheduler-only
    state transitions.
-7. Reserve both sides of the complete deduplicated wait/metadata/status channel
+8. Reserve both sides of the complete deduplicated wait/metadata/status channel
    lease set before D eligibility.
-8. Use fixed logical sequences plus scheduler-owned success/cancel
+9. Use fixed logical sequences plus scheduler-owned success/cancel
    terminalization and replay.
-9. Require the reservation, deadline, correctness, and performance gates below
+10. Require the reservation, deadline, correctness, availability, and performance gates below
    before rollout.
 
 If decisions 1-4, complete pre-eligibility control reservation, or the
@@ -149,12 +162,52 @@ The first enforceable cell is intentionally narrow:
 | Staging, HiCache, speculative decoding | Disabled |
 | SMG post-`PAIR_BOUND` reroute | Disabled |
 | Clock discipline | Actual SMG/P/D wall-clock offset is bounded by the selected `max_clock_skew_ms` |
+| Allocator-domain mode | `ENFORCE_EXCLUSIVE`; legacy execution is forbidden on every participating P/D allocator |
 
 A new experimental flag, separate from
 `optimistic_prefill_attempts`, enables the protocol. The flag name is an
-implementation decision. Unsupported combinations fail closed or use the
-existing protocol before either worker request is sent. A request must never
-be partially enabled.
+implementation decision. It configures a complete allocator domain for one
+serving epoch; it is not a per-request sampling flag. Unsupported combinations
+either fail closed before dispatch or are routed to a disjoint `LEGACY_ONLY`
+worker pool before either role request is sent. They cannot fall back to the
+existing protocol on an `ENFORCE_EXCLUSIVE` worker. A request must never be
+partially enabled.
+
+### Allocator-domain exclusivity
+
+An allocator domain is the smallest local set of request slots, KV pools,
+model/aux metadata buffers, and cache locks whose capacity is shared by
+schedulable execution requests. Each worker publishes a 128-bit
+`allocator_domain_id` and one immutable mode for its serving epoch:
+
+```text
+LEGACY_ONLY
+ENFORCE_EXCLUSIVE
+```
+
+Every execution request admitted by an `ENFORCE_EXCLUSIVE` P or D domain must
+carry a valid V1 envelope. In particular, every path that can reach D
+`_pre_alloc()` in that domain must first pass the commit gate. A missing,
+unsupported, malformed, or legacy envelope is rejected before tokenization,
+execution-capable pair state, scheduler admission, or allocator entry. Health,
+discovery, metrics, and administrative traffic are not execution requests and
+do not consume these allocators.
+
+SMG may route an unsupported request to legacy behavior only by selecting
+workers whose P and D allocator domains are both `LEGACY_ONLY` and disjoint from
+the enforce domains. Process names alone do not prove isolation: shared worker
+processes, request pools, KV allocators, metadata-buffer allocators, or cache
+partitions mean the requests are in the same domain. Request-percentage canary
+sampling inside one domain is forbidden. Canary percentage is implemented by
+routing traffic to a separate `ENFORCE_EXCLUSIVE` worker pool before pair
+selection.
+
+Allocator mode and membership are capability-bound and immutable for a serving
+epoch. Changing `LEGACY_ONLY <-> ENFORCE_EXCLUSIVE`, repartitioning an allocator,
+or moving a worker between rollout pools requires draining execution requests
+and publishing a new serving epoch/domain record before new dispatch. This rule
+prevents a legacy request admitted under the old mode from overlapping an
+enforce request under the new mode.
 
 ## Core invariant and progress argument
 
@@ -229,7 +282,19 @@ and are covered by separate hard budgets.
 
 ### Why the capacity cycle is impossible
 
-The enforce path guarantees:
+This proof is allocator-domain scoped. Its prerequisite is that **every**
+execution request capable of acquiring the shared P or D allocator resources is
+an enforce request. If even one legacy D-first request can use the same domain,
+the original cycle remains possible:
+
+```text
+A (enforce): P(A) is COMMITTED and holds P capacity; D(A) waits for D capacity
+B (legacy):  D(B) preallocated and holds D capacity; P(B) waits for P capacity
+```
+
+The `ENFORCE_EXCLUSIVE` ingress rule prevents B from reaching either shared
+allocator. With that domain-wide prerequisite, every request in the domain
+guarantees:
 
 ```text
 D holds scarce capacity
@@ -245,7 +310,9 @@ capacity-cycle condition where P could not admit B because A was holding its
 capacity.
 
 D might still wait on transfer or fail, but every post-commit phase has a local
-deadline and cleanup path. The cross-stage capacity cycle is gone by design.
+deadline and cleanup path. The cross-stage capacity cycle is therefore gone by
+construction for the complete allocator domain, not merely for the subset of
+requests carrying a V1 envelope.
 
 ## State machines
 
@@ -386,6 +453,10 @@ bootstrap_room
 bootstrap_pair_key
 expected_p_instance_epoch
 expected_d_instance_epoch
+expected_p_allocator_domain_id
+expected_d_allocator_domain_id
+expected_p_allocator_domain_mode
+expected_d_allocator_domain_mode
 expected_p_capability_digest
 expected_d_capability_digest
 pair_policy_version
@@ -405,14 +476,18 @@ p_pair_cancel_endpoint
 d_pair_cancel_endpoint
 ```
 
-Each worker publishes a random, non-reused serving epoch and one immutable,
-role-specific capability digest. The digest binds every setting that can change
-the commit hook, ownership lifecycle, wire interpretation, or deadline proof:
+Each worker publishes a random, non-reused serving epoch, a random non-reused
+128-bit allocator-domain ID for the current allocator incarnation, its immutable
+domain mode/policy digest, and one immutable role-specific capability digest.
+The capability digest binds every setting that can change the commit hook,
+ownership lifecycle, wire interpretation, or deadline proof:
 
 ```text
 capability_digest = BLAKE2b-256(canonical_tuple(
   capability_schema_version,
   role,
+  allocator_domain_mode,
+  allocator_domain_policy_digest,
   dispatch/request/cancel/wait/metadata/transfer-status protocol versions,
   transfer_backend,
   metadata_and_status_framing,
@@ -439,6 +514,10 @@ pair_policy_digest = BLAKE2b-256(canonical_tuple(
   selected_deadline_and_replay_policy,
   selected_control_channel_and_metadata_budgets,
   selected_v1_support_cell_restrictions,
+  selected_p_allocator_domain_mode_and_policy_digest,
+  selected_d_allocator_domain_mode_and_policy_digest,
+  legacy_d_first_forbidden,
+  allocator_domain_isolation_policy_id,
 ))
 
 support_cell_id = BLAKE2b-256(canonical_tuple(
@@ -449,21 +528,35 @@ support_cell_id = BLAKE2b-256(canonical_tuple(
 ))
 ```
 
+`allocator_domain_policy_digest` canonically binds which local request/KV,
+model/metadata-buffer, and cache partitions form the domain; the domain mode;
+whether legacy D-first execution is allowed; and the requirement that every
+execution ingress and allocator entry enforces that mode. It describes the
+isolation policy, while `allocator_domain_id` identifies one live incarnation
+of the resources governed by it.
+
 `pair_policy_version` selects a canonical policy schema; it is not itself proof
 that two processes loaded identical policy contents. `pair_policy_digest` binds
 the actual immutable record, including the allowed P/D capability pair, timeout
-and replay-TTL relationships, selected control/channel/metadata budgets, and
-version 1 support-cell restrictions. SMG pins both discovery records, verifies
-that the digest pair and selected limits are allowed by the policy, computes the
-policy and support-cell digests, and injects them into each role envelope.
+and replay-TTL relationships, selected control/channel/metadata budgets,
+allocator-domain mode/isolation policies, and version 1 support-cell
+restrictions. The actual per-deployment domain IDs are not support-cell
+capabilities: they are pinned discovery identities and are bound into the
+request UID below. SMG pins both discovery records, verifies that the digest
+pair, allocator-domain records, and selected limits are allowed by the policy,
+computes the policy and support-cell digests, and injects them into each role
+envelope. An enforce policy requires both pinned domains to be
+`ENFORCE_EXCLUSIVE` and `legacy_d_first_forbidden=true`; a legacy route must use
+separate `LEGACY_ONLY` domains.
 
 P and D independently recompute their local role digest, verify the expected
-local digest, verify that the expected peer digest is allowed by the same pair
-policy, verify that every selected budget/deadline can be enforced locally,
-recompute `pair_policy_digest`, and then recompute `support_cell_id`. Any
-mismatch is rejected before tokenization, pair entry, waiter creation, or model
-allocation. Equal protocol or policy version numbers alone never make two
-workers compatible.
+local domain ID and mode, verify the expected local digest, verify that the
+expected peer domain/digest is allowed by the same pair policy, verify that
+every selected budget/deadline can be enforced locally, recompute
+`pair_policy_digest`, and then recompute `support_cell_id`. Any mismatch is
+rejected before tokenization, pair entry, waiter creation, or model allocation.
+Equal protocol or policy version numbers alone never make two workers
+compatible.
 
 Each discovery record also publishes the configured `max_clock_skew_ms` and a
 current bounded clock-health result. The configured bound is immutable and
@@ -483,19 +576,19 @@ encoding. Rust/Python runtime dictionaries, default JSON serialization, native
 integer layout, and delimiter-joined strings are not valid digest inputs.
 
 Textual HTTP/discovery fields have one canonical wire representation. A
-16-byte pair key, serving epoch, or request UID is exactly 32 lowercase
-hexadecimal characters. A 32-byte capability, policy, or support-cell digest is
-exactly 64 lowercase hexadecimal characters. Prefixes, separators, uppercase,
-padding, UUID formatting, and alternate base64 encodings are rejected before
-state creation. Binary V1 control frames carry the decoded fixed-width raw
-bytes. Canonical hashes always consume those decoded raw bytes, never the
-textual hex representation. Shared Rust/Python vectors cover valid encoding
-and rejection of every non-canonical textual form.
+16-byte pair key, serving epoch, allocator-domain ID, or request UID is exactly
+32 lowercase hexadecimal characters. A 32-byte capability, policy, or
+support-cell digest is exactly 64 lowercase hexadecimal characters. Prefixes,
+separators, uppercase, padding, UUID formatting, and alternate base64 encodings
+are rejected before state creation. Binary V1 control frames carry the decoded
+fixed-width raw bytes. Canonical hashes always consume those decoded raw bytes,
+never the textual hex representation. Shared Rust/Python vectors cover valid
+encoding and rejection of every non-canonical textual form.
 
 The request UID is derived from the complete pair identity, not from a user
-`rid`. Version 1 encodes `bootstrap_room` as unsigned 64-bit big-endian,
-`bootstrap_pair_key` and both epochs as 16 raw bytes, and `support_cell_id` as
-32 raw bytes inside the canonical tuple:
+`rid`. Version 1 encodes `bootstrap_room` as unsigned 64-bit big-endian;
+`bootstrap_pair_key`, both epochs, and both allocator-domain IDs as 16 raw
+bytes; and `support_cell_id` as 32 raw bytes inside the canonical tuple:
 
 ```text
 request_uid = BLAKE2b-128(canonical_tuple(
@@ -504,6 +597,8 @@ request_uid = BLAKE2b-128(canonical_tuple(
   bootstrap_pair_key,
   expected_p_instance_epoch,
   expected_d_instance_epoch,
+  expected_p_allocator_domain_id,
+  expected_d_allocator_domain_id,
   support_cell_id,
 ))
 ```
@@ -511,8 +606,8 @@ request_uid = BLAKE2b-128(canonical_tuple(
 The domain string and tuple schema version are part of the encoded input. P, D,
 and SMG must pass shared golden vectors before advertising version 1 readiness.
 A worker rejects an envelope before pair creation if the local epoch,
-capability digests, pair policy, support cell, protocol versions, or expiry do
-not match.
+allocator-domain ID/mode, capability digests, pair policy, support cell,
+protocol versions, or expiry do not match.
 
 In later message schemas, `identity` is shorthand for the complete immutable
 set below; implementations send the fields explicitly rather than serializing
@@ -524,6 +619,8 @@ bootstrap_room
 bootstrap_pair_key
 p_instance_epoch
 d_instance_epoch
+p_allocator_domain_id
+d_allocator_domain_id
 support_cell_id
 ```
 
@@ -575,6 +672,10 @@ WaitCommitRequest {
   bootstrap_pair_key,
   expected_p_instance_epoch,
   expected_d_instance_epoch,
+  expected_p_allocator_domain_id,
+  expected_d_allocator_domain_id,
+  expected_p_allocator_domain_mode,
+  expected_d_allocator_domain_mode,
   expected_p_capability_digest,
   expected_d_capability_digest,
   pair_policy_version,
@@ -819,7 +920,7 @@ P validates version, declared sizes, complete identity, epochs, support cell,
 and generations before changing any Mooncake or scheduler table. Enforce
 metadata is keyed by `request_uid`. The legacy room-keyed
 `transfer_infos`, `request_status`, and related tables remain isolated and can
-only serve the feature-disabled path.
+only serve allocator-disjoint `LEGACY_ONLY` domains.
 
 On first acceptance, P computes and stores a fixed canonical digest of every
 semantic metadata field and destination/state index byte. An exact duplicate
@@ -1241,8 +1342,9 @@ delivery + D preallocation/metadata-submit budget, plus scheduling/skew margin.
 D transfer timeout must cover remaining committed-prefill runtime, metadata
 delivery retry/backoff and handoff, Mooncake transfer, status retry/backoff, and
 delivery margin. A request whose declared shape is outside those bounds uses
-legacy behavior before dispatch or fails closed; it is not allowed to enter
-enforce and predictably timeout on long prompts.
+legacy behavior only if SMG routes it before dispatch to allocator-disjoint
+`LEGACY_ONLY` workers; otherwise it fails closed. It is not allowed to enter an
+enforce domain and predictably timeout on long prompts.
 
 A transition arms the successor deadline before invalidating the previous one.
 Retries, reconnects, and queue movement cannot refresh a deadline. Scheduler
@@ -1309,7 +1411,10 @@ its post-commit deadline for metadata that can never arrive. A successful early
 D response may still wait for the P response required by the existing
 result/logprob merge.
 
-The feature-disabled path retains the current outer `RetryExecutor` behavior.
+An allocator-disjoint `LEGACY_ONLY` path retains the current outer
+`RetryExecutor` behavior. Disabling enforce on a serving pool requires draining
+that pool and starting a new legacy-only allocator-domain epoch; it is not a
+per-request branch inside an active `ENFORCE_EXCLUSIVE` domain.
 If a future enforce version permits same-pair HTTP resend, it must resend the
 identical role envelope to the identical endpoint and serving epoch and prove
 worker-side idempotent merge. That optimization is not part of version 1.
@@ -1335,16 +1440,23 @@ overload as terminal proof.
 The implementation and tests must preserve all of the following together:
 
 1. **Capability and policy fence before state.** SMG, P, and D agree on the
-   canonical role capabilities, actual pair-policy digest, serving epochs, and
-   support cell before tokenization or execution-capable pair-state creation.
-2. **Complete P commitment before D capacity.** P commits only after its request
+   canonical role capabilities, allocator-domain IDs/modes, actual pair-policy
+   digest, serving epochs, and support cell before tokenization or
+   execution-capable pair-state creation.
+2. **Allocator-domain ordering.** Commit ordering is a property of the shared
+   allocator domain, not an individual pair. Every execution request capable of
+   acquiring scarce P or D resources in an `ENFORCE_EXCLUSIVE` domain must pass
+   the commit gate. Legacy requests are rejected before execution state or
+   routed before dispatch to disjoint `LEGACY_ONLY` domains; request-level
+   enforce/legacy mixing is forbidden.
+3. **Complete P commitment before D capacity.** P commits only after its request
    slot, source KV, model/aux metadata buffer, cache ownership, sender/session
    tracking, and full-control row are owned, with no later finite per-request P
    prerequisite. D owns a request/KV/metadata slot or cache lock only after its
    scheduler validates that matching immutable commitment.
-3. **Non-blocking P launch.** P commitment performs only O(1) scheduler-local
+4. **Non-blocking P launch.** P commitment performs only O(1) scheduler-local
    state publication before GPU launch; it never waits for D or transport.
-4. **One acquisition graph.** P owns its complete P control row before
+5. **One acquisition graph.** P owns its complete P control row before
    `P_PRECOMMIT` and every finite P model prerequisite before `P_COMMITTED`. D
    owns its request-local control row, including the bounded channel-setup
    operation, before `D_REGISTERED`, then obtains the complete two-sided channel
@@ -1353,27 +1465,28 @@ The implementation and tests must preserve all of the following together:
    `P_COMMITTED` or `D_ELIGIBLE` acquires generic control/protocol capacity or a
    finite per-request prerequisite; existing Mooncake data-plane service remains
    deadline-bounded.
-5. **One retry owner and fixed logical sequences.** D retries commit/status
+6. **One retry owner and fixed logical sequences.** D retries commit/status
    waits and byte-identical metadata delivery with the same version 1 logical
    identity; SMG alone retries the bounded same-pair cancel operation. P stores
    semantic immutable snapshots and no transport-attempt state or reliable
    outbox.
-6. **No resurrection.** Serving epochs, canonical identity, dispatch expiry,
+7. **No resurrection.** Serving epochs, canonical identity, dispatch expiry,
    WAIT-first validation, cancel-first tombstones, and terminal retention prevent
    an unknown late message from recreating an old pair.
-7. **Scheduler single writer.** HTTP, control, metadata, and transfer threads
+8. **Scheduler single writer.** HTTP, control, metadata, and transfer threads
    only validate bounded input, enqueue commands, or consume immutable output.
-8. **Terminal means ownership is gone.** Success, cancel, failure, and deadline
+9. **Terminal means ownership is gone.** Success, cancel, failure, and deadline
    all use the same ownership ledger; a worker publishes local terminal state
    only after every actual local owner releases exactly once.
-9. **Continuous deadline coverage.** Every non-running LIVE phase has exactly
+10. **Continuous deadline coverage.** Every non-running LIVE phase has exactly
    one non-refreshable local deadline, and each transition arms its successor
    before invalidating its predecessor.
-10. **No replacement after `PAIR_BOUND`.** Enforce v1 never creates a new worker
+11. **No replacement after `PAIR_BOUND`.** Enforce v1 never creates a new worker
    binding or identity after either role may have performed network I/O.
-11. **Legacy isolation.** Room-only metadata/status cannot create a V1 command
+12. **Legacy isolation.** Legacy execution cannot share an enforce allocator
+    domain. In addition, room-only metadata/status cannot create a V1 command
     or advance an enforce pair, and V1 input never mutates legacy tables.
-12. **Clock-health fail closed.** New enforce dispatch requires the selected
+13. **Clock-health fail closed.** New enforce dispatch requires the selected
     SMG/P/D clocks to satisfy the digest-bound `max_clock_skew_ms`. Existing
     pairs and all cleanup continue using local monotonic deadlines if that
     readiness condition later fails.
@@ -1393,11 +1506,12 @@ and bounded dimensions are required:
 | --- | --- |
 | Pair admission and terminal totals | `role`, `result`, bounded `reason` |
 | Full-control gate rejection totals | `role`, bounded `reason` |
+| Allocator-domain ingress and isolation decisions | `role`, `mode`, bounded `reason` |
 | Commit/status wait and metadata-delivery retry totals and latency | `operation`, bounded `result` |
 | Phase and cleanup timeout totals | `role`, `phase` |
 | Peer-channel entries and exhaustion on both endpoints | `side=inbound|outbound`, `state=active|idle|reserved`, bounded `reason` |
 | LIVE pair, tombstone, and snapshot count/bytes | `role`, `object_kind` |
-| Post-`PAIR_BOUND` dispatch failures | `role`, bounded `stage` and `reason` |
+| Post-`PAIR_BOUND` dispatch failures and suppressed legacy retries | `role`, bounded `stage`, `reason`, `would_legacy_retry=yes|no` |
 | Support-cell isolation and clock-health events | bounded `reason`; allowlisted configured cell version only |
 
 Metrics must be updated in O(1) at the scheduler or bounded transport event; a
@@ -1405,14 +1519,19 @@ collector must not scan all live pairs. `rid`, `request_uid`, bootstrap room,
 pair key, serving epoch, endpoint, and capability/policy digests are forbidden
 as metric labels. They may appear only in sampled or rate-limited structured
 logs/traces. Reason values are fixed enums, not free-form backend strings.
+The `would_legacy_retry` classification must reuse, or be golden-tested against,
+the same bounded status/error predicate as the current `RetryExecutor`; a second
+hand-maintained interpretation is not acceptable.
 
 Canary dashboards must correlate request success/TTFT with gate rejection,
-wait latency/retry, timeout, channel exhaustion, clock-health, and retained-byte
-signals. Hard gates enforce the configured control/channel/snapshot budgets
-independently of alert delivery; budget exhaustion produces bounded rejection,
-not over-allocation. Canary threshold or clock-health violations stop new
-enforce dispatch for the affected support cell. Disabled-path metric updates
-must remain limited to the existing legacy metrics.
+wait latency/retry, timeout, channel exhaustion, clock-health, retained-byte
+signals, post-pair-bound failures, and the counterfactual number that the legacy
+`RetryExecutor` would have retried. Hard gates enforce the configured
+control/channel/snapshot budgets independently of alert delivery; budget
+exhaustion produces bounded rejection, not over-allocation. Canary threshold or
+clock-health violations stop new enforce dispatch for the affected support
+cell. Legacy-only domains retain only the existing legacy hot-path metrics;
+shadow-only instrumentation is separately gated and must be measured.
 
 ## Performance model
 
@@ -1455,14 +1574,42 @@ Required implementation properties:
 - No per-request TCP connections
 - Hard-bounded two-sided peer-channel managers with active refcounts and idle eviction
 - No request-identity metric labels
-- Zero envelope/control/registry/deadline work on the disabled path
+- Zero envelope/control/registry/deadline work on allocator-disjoint
+  `LEGACY_ONLY` workers
+
+### Availability trade-off
+
+Version 1 prioritizes preventing duplicate or overlapping execution over
+matching legacy transient-failure availability. After `PAIR_BOUND`, a connect
+error, timeout, retryable worker 5xx, or early D control rejection becomes a
+user-visible failure after bounded same-pair cancellation. The legacy
+`RetryExecutor` might instead have selected another pair. Version 1 therefore
+does **not** claim equal availability under transient worker faults.
+
+This is an explicit rollout trade-off, not an unmeasured correctness side
+effect. Shadow and canary stages must measure both
+`post_pair_bound_failure_total` and the subset for which the legacy policy
+would have retried. Controlled fault-load runs must inject transient connection
+failure, retryable P and D 5xx responses, and early D request-control/channel
+rejection at production-representative rates. The resulting added user-visible
+error rate and error-budget burn are hard gates alongside TTFT and throughput.
+
+Before a canary receives traffic, operators must configure both a maximum added
+user-visible error-rate threshold and a maximum fraction of the service error
+budget that suppressed retries may consume. Candidate initial limits are `0.1`
+percentage point and `10%` of the service error budget, respectively, subject
+to maintainer/operator agreement. Exceeding either rolling threshold stops new
+enforce routing, drains the enforce pool, and routes new traffic back to an
+allocator-disjoint `LEGACY_ONLY` pool. Rollback never switches individual
+requests to legacy inside the active enforce domain.
 
 ## Acceptance gates
 
 The feature stays disabled until the first support cell passes deterministic
-correctness tests, fault injection, memory accounting, and a real-GPU A/B run.
+correctness tests, fault injection, memory accounting, controlled fault-load
+availability tests, and a real-GPU A/B run.
 
-Candidate performance gates (subject to maintainer agreement):
+Candidate rollout gates (subject to maintainer agreement):
 
 | Metric | Enforce relative to baseline |
 | --- | --- |
@@ -1473,6 +1620,8 @@ Candidate performance gates (subject to maintainer agreement):
 | Scheduler CPU/core time | At most `+2%` |
 | GPU utilization | At least `-1%` |
 | Successful request rate before baseline saturation | No new control-budget, channel-budget, or protocol timeout failures |
+| Added user-visible error rate under production-weighted transient faults | 95% confidence interval upper bound at most the configured threshold; candidate `0.1` percentage point |
+| Error-budget burn attributable to suppressed post-`PAIR_BOUND` retry | At most the configured fraction; candidate `10%` of the service error budget |
 | Control and metadata memory | Never exceeds configured hard budgets |
 | Inbound and outbound peer-channel FD/socket memory | Never exceeds either configured hard budget |
 
@@ -1481,8 +1630,11 @@ The matrix must separate prompt lengths `1/8/32/128/1K/8K`, cache-hit ratios
 available/near-full/inversion D capacity. Short or cache-hit regressions cannot
 be hidden by an average over long prompts.
 
-The disabled-path microbenchmark must show no new control traffic, pair state,
-deadline scan, or statistically significant throughput/latency change.
+The legacy-only-domain microbenchmark must show no new control traffic, pair
+state, deadline scan, or statistically significant throughput/latency change.
+The fault-load report must show the injected fault distribution, legacy retry
+counterfactual, V1 user-visible error delta, confidence interval, and rollback
+decision; a healthy-workload average cannot mask the known retry difference.
 
 ## Validation plan
 
@@ -1491,33 +1643,53 @@ end-to-end cases are listed in the
 [reservation and validation appendix](/docs/developer_guide/pd_optimistic_prefill_commit_rfc_appendix).
 Rollout requires the deterministic A/B reproducer, identity/generation and
 cancel races, bounded-memory/fault injection, a cross-process Mooncake test,
-real-GPU A/B results for every enabled support cell, and disabled-path
-regression coverage. Mock transport tests alone cannot enable the feature.
+real-GPU A/B results for every enabled support cell, and regression coverage on
+allocator-disjoint legacy-only workers. Mock transport tests alone cannot
+enable the feature.
 
 ## Implementation plan
 
 This RFC is design-only. Implementation should split into reviewable PRs:
 
-1. **Reproducer and protocol types.** Land the deterministic A/B regression,
-   canonical capability/identity encoding with Rust/Python golden vectors,
-   fixed logical-sequence contracts, cancel types, state-machine types, and
-   pure state tests. No behavior change.
-2. **Shadow protocol.** Exercise commit observation, reservations, and metrics
-   while D still follows the legacy eligibility path. Shadow mode doesn't fix
-   the bug and must not be reported as enforce mode.
-3. **Mooncake single-rank enforcement.** Add D registration/eligibility, P
-   scheduler commitment, success/cancel ownership closure, complete two-sided
-   peer-channel lease-set reservation, idempotent metadata delivery, V1
-   metadata/status namespaces, and deadlines. In the same PR, add the SMG
-   `PAIR_BOUND` fence and make enforce requests bypass the current outer
-   worker-reselection `RetryExecutor` before the first enforce request can be
-   dispatched. Add fault injection for the first support cell. Default off.
-4. **GPU canary and rollout.** Run the mandatory performance matrix and enable
-   only approved rollout cells.
-5. **Transparent reroute follow-up.** Separately design terminal receipts,
+1. **Protocol substrate and allocator-domain declarations.** Land the original
+   and mixed enforce/legacy A/B reproducers; bounded channel managers; canonical
+   capability, allocator-domain, identity, and wire types; Rust/Python golden
+   vectors; and fixed sequence/cancel schemas. No Router or worker may emit or
+   accept an enforce execution request in this PR.
+2. **Registry, ownership, and deadline state machines.** Add P/D registry
+   entries, ownership-ledger primitives, reserved-credit abstractions, deadline
+   transitions, tombstones, and pure/fake-scheduler tests. The D gate remains
+   unreachable and SMG still cannot send V1 execution traffic.
+3. **Shadow observation on a legacy-only domain.** Exercise commit-point
+   observation, would-be eligibility, reservation accounting, metrics, and the
+   legacy-retry counterfactual while the complete test pool remains
+   `LEGACY_ONLY`. Shadow does not fix the bug, must not advertise enforce, and
+   must not coexist with enforce requests on the same allocator domain.
+4. **Router pair binding and cancel supervisor.** Add `PAIR_BOUND`, immutable
+   pair preparation, the symmetric failure supervisor, and bounded same-pair
+   cancellation behind a capability that is still impossible to select for
+   execution. Existing legacy dispatch remains unchanged; partial worker
+   support cannot make enforce traffic reachable.
+5. **Mooncake single-rank commit-gate integration.** Connect the Router, P and D
+   schedulers, registries, two-sided lease-set reservation, idempotent metadata,
+   V1 status namespace, deadlines, terminal cleanup, and D `_pre_alloc()` guard.
+   Enforce dispatch is allowed only for a complete `ENFORCE_EXCLUSIVE` domain
+   and remains default off. Add mixed-domain rejection and fault injection for
+   the first support cell.
+6. **GPU and availability canary.** Route traffic to a separate drained enforce
+   worker pool, run the correctness, performance, memory, and transient-fault
+   gates, and enable only approved allocator domains. Do not random-sample
+   requests between enforce and legacy within one worker pool.
+7. **Transparent reroute follow-up.** Separately design terminal receipts,
    router pair state, cancellation reconciliation, and the old-pair terminal
    barrier. Only after both old roles provide matching scheduler-terminal proof
    may enforce pairs re-enter worker-reselection retry.
+
+PRs 1-4 may land independently because enforce dispatch remains structurally
+unreachable. PR 5 is the first atomic behavior change and must contain every
+participant and guard needed by the proof; it cannot enable only the Router, P,
+or D side. This preserves protocol atomicity without making one review cover
+all infrastructure and integration code.
 
 The enforcement PR maps to existing SGLang boundaries as follows:
 
@@ -1525,9 +1697,9 @@ The enforcement PR maps to existing SGLang boundaries as follows:
   selection/preparation outside the worker-reselection retry closure, pin the
   envelope and cancel endpoints, and cross `PAIR_BOUND` immediately before the
   two `.send()` futures can first be polled. Keep the current closure unchanged
-  for the disabled path. Add a symmetric enforce-only dispatch supervisor:
-  unlike the current loop, an early D error must cancel P and finish promptly
-  instead of being cached until P resolves.
+  for allocator-disjoint legacy-only domains. Add a symmetric enforce-only
+  dispatch supervisor: unlike the current loop, an early D error must cancel P
+  and finish promptly instead of being cached until P resolves.
 - In the P scheduler path, publish commitment after final `prepare_for_extend()`
   allocation succeeds, after asserting the existing P model/aux metadata-buffer
   index and all other finite commit prerequisites, and before
@@ -1549,9 +1721,10 @@ The enforcement PR maps to existing SGLang boundaries as follows:
   registered/commit states and route success, failure, cancel, and timeout
   through the same ownership ledger.
 
-Expected size for steps 1-4: approximately 3,500-5,500 lines of production code
-plus 3,000-5,000 lines of tests. This is not an acceptance criterion; it
-explains why implementation should remain split into dependent reviewable PRs.
+Expected total size for steps 1-6: approximately 3,500-5,500 lines of
+production code plus 3,000-5,000 lines of tests. This is not an acceptance
+criterion; it explains why implementation should remain split into dependent
+reviewable PRs.
 
 ## Alternatives considered
 
