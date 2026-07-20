@@ -76,7 +76,7 @@ def rotate_input_ids(
 
     batch_size = extend_seq_lens.shape[0]
 
-    # rotate_input_ids_triton skipped: batch_size=0 (empty extend_seq_lens).
+    # rotate_input_ids kernel skipped: batch_size=0 (empty extend_seq_lens).
     # This is expected when a DP rank has no requests.
     # TODO: @iforgetmyname Remove NPU-specific guard after triton-ascend fixes zero-sized grid kernel launch abort
     if batch_size == 0 and _is_npu:

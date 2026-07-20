@@ -668,7 +668,7 @@ def eagle_sample(
             tree_speculative_sampling_target_only,
         )
 
-        from sglang.srt.speculative.reject_sampling import (
+        from sglang.kernels.ops.speculative.reject_sampling import (
             chain_speculative_sampling_triton,
         )
 
@@ -683,20 +683,22 @@ def eagle_sample(
             next_token_logits / expanded_temperature, dim=-1
         )  # (bs * num_draft_tokens, vocab_size)
         maybe_detect_nan(target_probs, "v2 verify: target_probs after softmax")
-        target_probs = top_k_renorm_prob(
-            target_probs,
-            torch.repeat_interleave(
-                sampling_info.top_ks, verify_input.draft_token_num, dim=0
-            ),
-        )  # (bs * num_draft_tokens, vocab_size)
-        maybe_detect_nan(target_probs, "v2 verify: target_probs after top_k_renorm")
-        target_probs = top_p_renorm_prob(
-            target_probs,
-            torch.repeat_interleave(
-                sampling_info.top_ps, verify_input.draft_token_num, dim=0
-            ),
-        )
-        maybe_detect_nan(target_probs, "v2 verify: target_probs after top_p_renorm")
+        if sampling_info.need_top_k_sampling:
+            target_probs = top_k_renorm_prob(
+                target_probs,
+                torch.repeat_interleave(
+                    sampling_info.top_ks, verify_input.draft_token_num, dim=0
+                ),
+            )  # (bs * num_draft_tokens, vocab_size)
+            maybe_detect_nan(target_probs, "v2 verify: target_probs after top_k_renorm")
+        if sampling_info.need_top_p_sampling:
+            target_probs = top_p_renorm_prob(
+                target_probs,
+                torch.repeat_interleave(
+                    sampling_info.top_ps, verify_input.draft_token_num, dim=0
+                ),
+            )
+            maybe_detect_nan(target_probs, "v2 verify: target_probs after top_p_renorm")
         target_probs = target_probs.reshape(bs, verify_input.draft_token_num, -1)
         draft_probs = (
             verify_input.draft_probs
