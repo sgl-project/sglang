@@ -815,6 +815,8 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
   }
   __syncthreads();
 
+  device::PDLTriggerSecondary<kUsePDL>();
+
   if constexpr (kApplyOnorm) {
     if constexpr (kAccumulateOnormSumsq) {
       if (lane == 0) {
@@ -880,8 +882,6 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
       out[out_idx] = bf16_store(s_o[tid]);
     }
   }
-  device::PDLTriggerSecondary<kUsePDL>();
-
 }
 
 // K3 decode configuration of the many-heads kernel: onorm fused, static

@@ -722,7 +722,7 @@ class Envs:
     # cp.async path. Stage count auto-dispatches by grid size (B*HV >= 1024
     # -> 3 stages, else 4); override with SGLANG_KDA_FUSED_DECODE_TMA_STAGES
     # (2/3/4). Requires sm_90+.
-    SGLANG_KDA_FUSED_DECODE_TMA_LOAD = EnvBool(False)
+    SGLANG_KDA_FUSED_DECODE_TMA_LOAD = EnvBool(True)
     SGLANG_KDA_FUSED_DECODE_TMA_STAGES = EnvInt(0)
 
     # Kimi K3 decode optimizations (all fusions default on; "0" to A/B the
