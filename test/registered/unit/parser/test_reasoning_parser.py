@@ -259,7 +259,9 @@ class TestInklingDetector(CustomTestCase):
         source = "<|message_model|><|content_thinking|>truncated thinking"
         streamed_reasoning = ""
         for char in source:
-            streamed_reasoning += detector.parse_streaming_increment(char).reasoning_text
+            streamed_reasoning += detector.parse_streaming_increment(
+                char
+            ).reasoning_text
         # The block never closed, so nothing surfaces mid-stream.
         self.assertEqual(streamed_reasoning, "")
         # finish() flushes the buffered trace instead of dropping it.
