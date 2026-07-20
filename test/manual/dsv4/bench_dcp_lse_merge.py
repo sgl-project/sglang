@@ -7,10 +7,10 @@ Run each path in a separate process for production-shape DCP8 profiling:
         --use-sglang-group --dcp-size 8 --batch-size 128 \
         --path a2a --layers 43 --cuda-graph
 
-The runtime reference called ``cp_lse_ag_out_rs`` is all-gather plus
-all-reduce followed by a local head slice. This benchmark also retains a true
-all-gather plus reduce-scatter candidate so the three communication patterns
-can be compared without changing production behavior.
+The legacy runtime reference called ``cp_lse_ag_out_rs`` is all-gather plus
+all-reduce followed by a local head slice. The true all-gather plus
+reduce-scatter path is also a runtime candidate so the three communication
+patterns can be compared before changing the default behavior.
 """
 
 from __future__ import annotations
@@ -28,6 +28,7 @@ import torch.distributed as dist
 
 from sglang.kernels.ops.attention.utils import (
     cp_lse_a2a_out_rs,
+    cp_lse_ag_out_reduce_scatter,
     cp_lse_ag_out_rs,
 )
 from sglang.srt.distributed.parallel_state import (
@@ -85,36 +86,6 @@ class DCPGroup:
         self, output: torch.Tensor, input_: torch.Tensor
     ) -> None:
         dist.all_to_all_single(output, input_)
-
-
-def cp_lse_ag_out_reduce_scatter(
-    cp_attn_out: torch.Tensor,
-    cp_attn_lse: torch.Tensor,
-    cp_group,
-    return_lse: bool = False,
-):
-    """Benchmark-only true reduce-scatter implementation."""
-    if cp_group.world_size == 1:
-        return (cp_attn_out, cp_attn_lse) if return_lse else cp_attn_out
-
-    cp_attn_lse = cp_attn_lse.contiguous()
-    lses = cp_group.all_gather(cp_attn_lse, dim=0).view(
-        (cp_group.world_size,) + cp_attn_lse.shape
-    )
-    global_lse = torch.logsumexp(lses, dim=0)
-    scale = torch.exp(cp_attn_lse - global_lse).unsqueeze(-1)
-    scale = torch.nan_to_num(scale, nan=0.0, posinf=0.0, neginf=0.0)
-
-    out = torch.nan_to_num(
-        cp_attn_out, nan=0.0, posinf=0.0, neginf=0.0
-    ) * scale
-    out = cp_group.reduce_scatter_along_dim(out, dim=1).contiguous()
-    if return_lse:
-        local_heads = global_lse.shape[1] // cp_group.world_size
-        head_start = local_heads * cp_group.rank_in_group
-        head_end = head_start + local_heads
-        return out, global_lse[:, head_start:head_end].contiguous()
-    return out
 
 
 def parse_args() -> argparse.Namespace:

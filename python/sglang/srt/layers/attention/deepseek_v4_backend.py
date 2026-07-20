@@ -58,6 +58,7 @@ from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
 )
 from sglang.kernels.ops.attention.utils import (
     cp_lse_a2a_out_rs,
+    cp_lse_ag_out_reduce_scatter,
     cp_lse_ag_out_rs,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
@@ -2018,6 +2019,10 @@ class DeepseekV4AttnBackend(
                     o = a2a_o.to(o_dtype)
                 elif envs.SGLANG_DSV4_DCP_A2A_LSE.get():
                     o = cp_lse_a2a_out_rs(o, lse, get_dcp_group()).to(o_dtype)
+                elif envs.SGLANG_DSV4_DCP_AG_RS.get():
+                    o = cp_lse_ag_out_reduce_scatter(
+                        o, lse, get_dcp_group()
+                    ).to(o_dtype)
                 else:
                     o = cp_lse_ag_out_rs(o, lse, get_dcp_group()).to(o_dtype)
 
