@@ -15,6 +15,8 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from contextvars import ContextVar
 from enum import Enum
 from typing import TYPE_CHECKING, Optional
 
@@ -30,7 +32,26 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     get_tc_piecewise_forward_context,
 )
+from sglang.srt.utils.common import is_hip
 from sglang.srt.utils.custom_op import register_custom_op
+
+_is_hip = is_hip()
+
+# When set, RadixAttention.forward runs the attention backend eagerly instead of
+# routing through the tc-piecewise split op. A caller already inside a
+# breakable-CUDA-graph eager break (e.g. Inkling wrapping norm+attn+sconv in one eager
+# region for multi-seq-correct short-conv metadata) sets this so the attn does not
+# start a nested break (which would assert on the ended segment). Default off.
+_force_eager_attn: ContextVar[bool] = ContextVar("_force_eager_attn", default=False)
+
+
+@contextmanager
+def force_eager_attention():
+    token = _force_eager_attn.set(True)
+    try:
+        yield
+    finally:
+        _force_eager_attn.reset(token)
 
 
 def _zero_padded_pcg_tail(buf: torch.Tensor, context) -> None:
@@ -140,6 +161,12 @@ class RadixAttention(nn.Module):
         if (
             forward_batch.forward_mode.is_extend()
             and get_tc_piecewise_forward_context() is not None
+            # ``_force_eager_attn`` is only set inside Inkling's eager
+            # norm+attn+sconv region, never during tc-piecewise capture. Reading
+            # the ContextVar under the fullgraph torch.compile trace is
+            # untraceable ("Unsupported method call: ContextVar.get"), so
+            # short-circuit it while compiling -- force-eager is always off there.
+            and (torch.compiler.is_compiling() or not _force_eager_attn.get())
         ):
             if kwargs.get("idx_q") is not None:
                 if is_in_breakable_cuda_graph():
@@ -166,10 +193,45 @@ class RadixAttention(nn.Module):
                     idx_v=idx_v,
                 )
                 return idx_out, attn_out
+            # FP8 q (e.g. mxfp8 KV-cache attention) still produces a bf16
+            # attention output; sizing the buffer off q's dtype would silently
+            # cast-copy the result to fp8.
+            out_dtype = (
+                torch.bfloat16
+                if q.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+                else q.dtype
+            )
             if self.qk_head_dim != self.v_head_dim:
-                output = q.new_empty((q.shape[0], self.tp_q_head_num * self.v_head_dim))
+                output = q.new_empty(
+                    (q.shape[0], self.tp_q_head_num * self.v_head_dim),
+                    dtype=out_dtype,
+                )
             else:
-                output = torch.empty_like(q)
+                output = torch.empty_like(q, dtype=out_dtype)
+            if any(
+                key in kwargs
+                for key in (
+                    "score_mod",
+                    "aux_tensors",
+                    "rel_bias",
+                    "q_descale",
+                    "k_descale",
+                    "v_descale",
+                )
+            ):
+                # A score_mod callable, aux_tensors, rel_bias, or mxfp8 descale
+                # tensors can't cross the unified_attention_with_output custom-op
+                # schema; route this backend's extend attention through the plain
+                # eager path.
+                if is_in_breakable_cuda_graph():
+                    breakable_attention_with_output_extra_kwargs(
+                        q, k, v, output, save_kv_cache, self.layer_id, kwargs
+                    )
+                else:
+                    attention_with_output_extra_kwargs(
+                        q, k, v, output, save_kv_cache, self.layer_id, kwargs
+                    )
+                return output
             if is_in_breakable_cuda_graph():
                 breakable_unified_attention_with_output(
                     q, k, v, output, save_kv_cache, self.layer_id, **kwargs
@@ -338,4 +400,63 @@ def unified_sparse_attention_with_output(
 
 breakable_unified_attention_with_output = eager_on_graph(True)(
     unified_attention_with_output
+)
+
+
+def attention_with_output_extra_kwargs(
+    query: torch.Tensor,
+    key: Optional[torch.Tensor],
+    value: Optional[torch.Tensor],
+    output: torch.Tensor,
+    save_kv_cache: bool,
+    layer_id: int,
+    extra_kwargs: dict,
+) -> None:
+    """Breakable/tc_piecewise attention for backends whose forward needs kwargs
+    that cannot cross the ``unified_attention_with_output`` custom-op schema --
+    a ``score_mod`` callable and/or ``aux_tensors`` (e.g. Inkling's relative-bias
+    fa4 attention). Plain (not a custom op) so the callable passes through; still
+    runs eagerly between graph segments under BCG via the wrapper below. Mirrors
+    the real-token narrowing + padded-output write of
+    ``unified_attention_with_output``, and narrows per-token ``aux_tensors`` too.
+    """
+    context = get_tc_piecewise_forward_context()
+    forward_batch = context.forward_batch
+    attention_layer = context.attention_layers[layer_id]
+    real_num_tokens = forward_batch.num_token_non_padded_cpu
+
+    query = query[:real_num_tokens]
+    if key is not None:
+        key = key[:real_num_tokens]
+    if value is not None:
+        value = value[:real_num_tokens]
+
+    kwargs = dict(extra_kwargs)
+    aux_tensors = kwargs.get("aux_tensors")
+    if aux_tensors is not None:
+        kwargs["aux_tensors"] = [t[:real_num_tokens] for t in aux_tensors]
+    for per_token_key in ("rel_bias", "q_descale", "k_descale", "v_descale"):
+        t = kwargs.get(per_token_key)
+        if t is not None:
+            kwargs[per_token_key] = t[:real_num_tokens]
+
+    original_out_cache_loc = forward_batch.out_cache_loc
+    forward_batch.out_cache_loc = original_out_cache_loc[:real_num_tokens]
+    forward_batch._attn_output = output[:real_num_tokens]
+
+    ret = get_attn_backend().forward(
+        query, key, value, attention_layer, forward_batch, save_kv_cache, **kwargs
+    )
+    forward_batch.out_cache_loc = original_out_cache_loc
+
+    if ret.data_ptr() != output.data_ptr():
+        output[:real_num_tokens].view(ret.shape).copy_(ret)
+
+    if _is_hip:
+        _zero_padded_pcg_tail(output, context)
+    return
+
+
+breakable_attention_with_output_extra_kwargs = eager_on_graph(True)(
+    attention_with_output_extra_kwargs
 )

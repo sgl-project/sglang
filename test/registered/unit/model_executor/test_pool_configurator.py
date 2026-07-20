@@ -118,6 +118,7 @@ def _make_model_runner(
     sa.max_running_requests = max_running_requests
     sa.disaggregation_decode_extra_slots = disaggregation_decode_extra_slots
     sa.enable_dsa_cache_layer_split = False
+    sa.kv_cache_dtype = "auto"
     mr.server_args = sa
 
     spec = MagicMock()

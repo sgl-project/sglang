@@ -172,6 +172,12 @@ class FusedMoE(torch.nn.Module):
         inplace: suggestion to compute inplace (modify input activation).
     """
 
+    # True on shared-expert FusedMoE subclasses (e.g. Inkling's sink); lets
+    # backend resolution distinguish them from routed experts.
+    is_shared_fused_moe = False
+
+    _skip_aiter_moe_shuffle: bool = False
+
     def __init__(
         self,
         num_experts: int,
@@ -1137,6 +1143,18 @@ class FusedMoE(torch.nn.Module):
         shard_id: str,
     ) -> None:
         tp_rank = self.moe_tp_rank
+
+        # Mirror _weight_loader_impl: the trtllm bf16 prep reshapes expert weights
+        # into block layout; hot weight updates must restore canonical shapes first.
+        method = self.quant_method
+        if isinstance(method, KTEPWrapperMethod):
+            method = method.gpu_method
+        if isinstance(method, UnquantizedFusedMoEMethod):
+            method.maybe_restore_flashinfer_trtllm_bf16_weight_shape_for_load(
+                layer=self,
+                param=param,
+                weight_name=weight_name,
+            )
 
         if (
             self.quant_config is not None

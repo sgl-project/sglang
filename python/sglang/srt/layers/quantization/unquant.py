@@ -303,6 +303,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 or get_moe_runner_backend().is_aiter()
             )
             and self._aiter_ck_moe_supported(layer)
+            and not layer._skip_aiter_moe_shuffle
         )
         if _should_use_aiter_moe:
             copy_or_rebind_param(

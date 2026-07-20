@@ -313,6 +313,7 @@ class EagleDraftExtendInput(SpecInput):
     # Both kept for cuda-graph buffer indexing.
     num_correct_drafts: torch.Tensor = None
     num_accept_tokens: torch.Tensor = None
+    num_front_tokens: int = 0
     # CPU view, read by attention backends during the extend forward.
     num_accept_tokens_cpu: List[int] = None
 
@@ -337,6 +338,12 @@ class EagleDraftExtendInput(SpecInput):
 
     dsa_seed_topk_capture: Optional[torch.Tensor] = None
     dsa_seed_topk_select: Optional[torch.Tensor] = None
+
+    # Flat per-req index of each request's last accepted window row
+    # (i * window + front + num_correct_drafts[i]). When set, the logits
+    # processor runs lm_head only on these rows. None under gathered-buffer
+    # (DP) modes, whose logprob buffer sizing assumes all-row logits.
+    select_index: Optional[torch.Tensor] = None
 
     # None for draft-extend's idle batch; attention backends fall back to
     # rebuilding plain metadata from seq_lens when this is None.

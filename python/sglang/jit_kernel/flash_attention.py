@@ -41,6 +41,11 @@ def flash_attn_with_kvcache(
     sinks=None,
     score_mod=None,
     aux_tensors=None,
+    sfq=None,
+    sfk=None,
+    sfv=None,
+    rel_bias=None,
+    rel_bias_prep_cache=None,
     ver=3,
     out=None,
 ):
@@ -202,6 +207,11 @@ def flash_attn_with_kvcache(
             sinks=sinks,
             score_mod=score_mod,
             aux_tensors=aux_tensors,
+            sfq=sfq,
+            sfk=sfk,
+            sfv=sfv,
+            rel_bias=rel_bias,
+            rel_bias_prep_cache=rel_bias_prep_cache,
             return_softmax_lse=return_softmax_lse,
         )
     else:
@@ -236,6 +246,11 @@ def flash_attn_varlen_func(
     sinks=None,
     score_mod=None,
     aux_tensors=None,
+    sfq=None,
+    sfk=None,
+    sfv=None,
+    rel_bias=None,
+    rel_bias_prep_cache=None,
     ver=3,
     out=None,
 ):
@@ -294,6 +309,14 @@ def flash_attn_varlen_func(
             pack_gqa=pack_gqa,
             score_mod=score_mod,
             aux_tensors=aux_tensors,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            sfq=sfq,
+            sfk=sfk,
+            sfv=sfv,
+            rel_bias=rel_bias,
+            rel_bias_prep_cache=rel_bias_prep_cache,
             return_softmax_lse=return_softmax_lse,
         )
     else:

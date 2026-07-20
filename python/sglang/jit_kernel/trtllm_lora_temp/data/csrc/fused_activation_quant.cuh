@@ -187,42 +187,58 @@ inline void launchFusedActivationQuant(
     tensorrt_llm::QuantizationSFLayout sfLayout,
     bool disableFp4FastMath,
     cudaStream_t stream) {
-  constexpr uint32_t BLOCK_SIZE = 128;  // == innerHalf/16 for inter=2048 (one SF block per thread)
-  dim3 const grid(m), block(BLOCK_SIZE);
-
-  auto launch = [&](auto layoutTag, auto fastMathTag) {
-    fusedActivationQuantKernel<BLOCK_SIZE, decltype(layoutTag)::value, decltype(fastMathTag)::value>
-        <<<grid, block, 0, stream>>>(
-            m,
-            innerHalf,
-            innerDim,
-            gateUp,
-            loraDelta,
-            loraInputOut,
-            expandedIdxToPermutedIdx,
-            globalScaleInv,
-            weightOutput,
-            scaleOutput,
-            perTokenScaleOutput);
-  };
-  auto withFastMath = [&](auto layoutTag) {
-    if (disableFp4FastMath) {
-      launch(layoutTag, std::integral_constant<bool, true>{});
+  // One SF block per thread, no stride loop: BLOCK_SIZE must cover innerHalf/16 (a fixed
+  // 128 left cols [2048,inter) unwritten at Inkling EP8's inter=3072 -> NaN from the down GEMM).
+  uint32_t const numVecs = static_cast<uint32_t>(innerHalf) / 16;
+  auto dispatchBlock = [&](auto blockTag) {
+    constexpr uint32_t BLOCK_SIZE = decltype(blockTag)::value;
+    dim3 const grid(m), block(BLOCK_SIZE);
+    auto launch = [&](auto layoutTag, auto fastMathTag) {
+      fusedActivationQuantKernel<BLOCK_SIZE, decltype(layoutTag)::value, decltype(fastMathTag)::value>
+          <<<grid, block, 0, stream>>>(
+              m,
+              innerHalf,
+              innerDim,
+              gateUp,
+              loraDelta,
+              loraInputOut,
+              expandedIdxToPermutedIdx,
+              globalScaleInv,
+              weightOutput,
+              scaleOutput,
+              perTokenScaleOutput);
+    };
+    auto withFastMath = [&](auto layoutTag) {
+      if (disableFp4FastMath) {
+        launch(layoutTag, std::integral_constant<bool, true>{});
+      } else {
+        launch(layoutTag, std::integral_constant<bool, false>{});
+      }
+    };
+    if (sfLayout == tensorrt_llm::QuantizationSFLayout::SWIZZLED_128x4) {
+      withFastMath(
+          std::integral_constant<
+              tensorrt_llm::QuantizationSFLayout,
+              tensorrt_llm::QuantizationSFLayout::SWIZZLED_128x4>{});
+    } else if (sfLayout == tensorrt_llm::QuantizationSFLayout::LINEAR) {
+      withFastMath(
+          std::integral_constant<tensorrt_llm::QuantizationSFLayout, tensorrt_llm::QuantizationSFLayout::LINEAR>{});
     } else {
-      launch(layoutTag, std::integral_constant<bool, false>{});
+      withFastMath(
+          std::integral_constant<
+              tensorrt_llm::QuantizationSFLayout,
+              tensorrt_llm::QuantizationSFLayout::SWIZZLED_8x4>{});
     }
   };
-  if (sfLayout == tensorrt_llm::QuantizationSFLayout::SWIZZLED_128x4) {
-    withFastMath(
-        std::integral_constant<
-            tensorrt_llm::QuantizationSFLayout,
-            tensorrt_llm::QuantizationSFLayout::SWIZZLED_128x4>{});
-  } else if (sfLayout == tensorrt_llm::QuantizationSFLayout::LINEAR) {
-    withFastMath(
-        std::integral_constant<tensorrt_llm::QuantizationSFLayout, tensorrt_llm::QuantizationSFLayout::LINEAR>{});
+  if (numVecs <= 128) {
+    dispatchBlock(std::integral_constant<uint32_t, 128>{});
+  } else if (numVecs <= 256) {
+    dispatchBlock(std::integral_constant<uint32_t, 256>{});
+  } else if (numVecs <= 512) {
+    dispatchBlock(std::integral_constant<uint32_t, 512>{});
   } else {
-    withFastMath(
-        std::integral_constant<tensorrt_llm::QuantizationSFLayout, tensorrt_llm::QuantizationSFLayout::SWIZZLED_8x4>{});
+    // Callers guard on numVecs <= 512 and fall back to the unfused chain.
+    dispatchBlock(std::integral_constant<uint32_t, 1024>{});
   }
 }
 

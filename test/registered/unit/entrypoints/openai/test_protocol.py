@@ -259,19 +259,27 @@ class TestChatCompletionRequest(unittest.TestCase):
         self.assertFalse(request.chat_template_kwargs.get("thinking"))
         self.assertFalse(request.chat_template_kwargs.get("enable_thinking"))
 
-    def test_chat_completion_reasoning_effort_max(self):
-        """`max` is an sglang extension on chat completion's top-level
-        `reasoning_effort` only; the Responses-API-style nested
-        `reasoning.effort` path stays aligned with OpenAI's three levels."""
+    def test_chat_completion_extended_reasoning_effort_levels(self):
+        """Extended effort levels work in both supported request forms."""
         from pydantic import ValidationError
 
         messages = [{"role": "user", "content": "Hello"}]
-        request = ChatCompletionRequest(
-            model="test-model",
-            messages=messages,
-            reasoning_effort="max",
-        )
-        self.assertEqual(request.reasoning_effort, "max")
+        for effort in ("xhigh", "max"):
+            with self.subTest(effort=effort, request_form="top-level"):
+                request = ChatCompletionRequest(
+                    model="test-model",
+                    messages=messages,
+                    reasoning_effort=effort,
+                )
+                self.assertEqual(request.reasoning_effort, effort)
+
+            with self.subTest(effort=effort, request_form="nested"):
+                request = ChatCompletionRequest(
+                    model="test-model",
+                    messages=messages,
+                    reasoning={"effort": effort},
+                )
+                self.assertEqual(request.reasoning_effort, effort)
 
         # Unknown values still rejected.
         with self.assertRaises(ValidationError):
@@ -281,14 +289,79 @@ class TestChatCompletionRequest(unittest.TestCase):
                 reasoning_effort="ultra",
             )
 
-        # Nested reasoning.effort=max is NOT promoted by normalize_reasoning_inputs:
-        # the Responses API path keeps the OpenAI low/medium/high contract.
+    def test_chat_completion_reasoning_effort_is_strictly_validated(self):
+        from pydantic import ValidationError
+
+        messages = [{"role": "user", "content": "Hello"}]
+        for request_kwargs, expected in (
+            ({"reasoning_effort": 0.99}, 0.99),
+            ({"reasoning": {"effort": 0.0}}, 0.0),
+            # numeric strings coerce identically on BOTH request surfaces
+            # (the top-level field's lax union already coerced them).
+            ({"reasoning": {"effort": "0.5"}}, 0.5),
+            ({"reasoning": {"effort": None, "reasoning_effort": 0.4}}, 0.4),
+        ):
+            request = ChatCompletionRequest(
+                model="test-model", messages=messages, **request_kwargs
+            )
+            self.assertEqual(request.reasoning_effort, expected)
+
+        for request_kwargs in (
+            {"reasoning_effort": -0.1},
+            # 0.99 is the maximum valid effort; 1.0 is out of range.
+            {"reasoning_effort": 1.0},
+            {"reasoning_effort": 1.1},
+            {"reasoning_effort": float("nan")},
+            {"reasoning_effort": True},
+            {"reasoning": {"effort": "invalid"}},
+            {"reasoning": {"effort": 1.0}},
+            {"reasoning": {"effort": 1.1}},
+            {"reasoning": {"effort": "1.5"}},
+        ):
+            with self.subTest(request_kwargs=request_kwargs), self.assertRaises(
+                ValidationError
+            ):
+                ChatCompletionRequest(
+                    model="test-model", messages=messages, **request_kwargs
+                )
+
+    def test_chat_completion_accepts_ordered_thinking_parts(self):
         request = ChatCompletionRequest(
             model="test-model",
-            messages=messages,
-            reasoning={"effort": "max"},
+            messages=[
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": "first"},
+                        {"type": "text", "text": "visible"},
+                        {"type": "reasoning", "text": "second"},
+                    ],
+                }
+            ],
         )
-        self.assertNotEqual(request.reasoning_effort, "max")
+        parts = request.messages[0].content
+        self.assertEqual(
+            [part.type for part in parts], ["thinking", "text", "reasoning"]
+        )
+
+    def test_chat_completion_rejects_thinking_parts_outside_assistant(self):
+        """Bug regression: adding the thinking part to the SHARED content-part
+        union silently widened acceptance to every role (user/system/tool) and
+        every model family, where downstream templates cannot render it —
+        replacing the previous clean 422 with template-dependent behavior."""
+        from pydantic import ValidationError
+
+        for role in ("user", "system", "tool"):
+            with self.subTest(role=role), self.assertRaises(ValidationError):
+                ChatCompletionRequest(
+                    model="test-model",
+                    messages=[
+                        {
+                            "role": role,
+                            "content": [{"type": "thinking", "thinking": "x"}],
+                        }
+                    ],
+                )
 
     def test_chat_completion_json_format(self):
         """Test chat completion json format"""

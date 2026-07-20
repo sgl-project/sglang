@@ -326,14 +326,12 @@ def _invoke_moe_lora_shrink_splitk(
     N = weight.shape[1]
     K = weight.shape[2]
     BLOCK_SIZE_M = config["BLOCK_SIZE_M"]
-    BLOCK_SIZE_N = triton.next_power_of_2(N)
+    BLOCK_SIZE_N = min(128, triton.next_power_of_2(N))
     BLOCK_SIZE_K = 256
     GROUP_SIZE_M = config.get("GROUP_SIZE_M", 1)
 
     num_m_blocks = triton.cdiv(sorted_token_ids.shape[0], BLOCK_SIZE_M)
-    num_n_blocks = triton.cdiv(
-        N, BLOCK_SIZE_N
-    )  # == 1, BLOCK_SIZE_N == next_pow2(N) >= N
+    num_n_blocks = triton.cdiv(N, BLOCK_SIZE_N)
     base_grid = num_m_blocks * num_n_blocks
     # Single source of truth shared with the caller's zero-intermediate decision:
     # split-K accumulation REQUIRES a pre-zeroed output, so the predicted and
@@ -378,26 +376,19 @@ def _get_moe_lora_shrink_split_k(
     sorted_token_ids: torch.Tensor,
     config: dict[str, Any],
 ) -> int:
-    """Rank-tiered split-K occupancy fill (PR #26899).
+    """Choose split-K from rank and available occupancy.
 
-    The K reduction (e.g. 7168 / 256 = 28 iters) dominates this skinny-N grouped
-    GEMV, so splitting K stays useful well past full SM occupancy -- a plain
-    `1 if base_grid >= num_sm else ...` rule collapses SPLIT_K too early and
-    costs up to ~2x at the decode/prefill border. Skinnier ranks want more
-    splits (their output tile carries less work). The target / tiers were picked
-    from an offline per-M B200 sweep over E in {48,96,384}, N in {16,32,64};
-    this heuristic lands within ~5% of the per-shape tuned optimum across the
-    decode regime.
+    Skinny output ranks benefit from more K splits because each output tile
+    carries less work. Block sizes must mirror _invoke_moe_lora_shrink_splitk.
 
-    Block sizes must mirror _invoke_moe_lora_shrink_splitk (BLOCK_SIZE_N =
-    next_pow2(N) -> one N block; BLOCK_SIZE_K = 256).
     """
     N = weight.shape[1]
     K = weight.shape[2]
     block_size_m = config["BLOCK_SIZE_M"]
+    block_size_n = min(128, triton.next_power_of_2(N))
     block_size_k = 256
     num_m_blocks = triton.cdiv(sorted_token_ids.shape[0], block_size_m)
-    base_grid = num_m_blocks  # num_n_blocks == 1: BLOCK_SIZE_N == next_pow2(N) >= N
+    base_grid = num_m_blocks * triton.cdiv(N, block_size_n)
     target = 512 if N <= 16 else 384 if N <= 32 else 256
     max_split_k = max(1, K // block_size_k)
     return max(1, min(triton.cdiv(target, base_grid), max_split_k, 8))
@@ -416,17 +407,10 @@ def _align_block_size_jit(
     block_size: int,
     num_experts: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """CUDA JIT align_block_size for num_experts > 1024 (up to 8191).
+    """CUDA JIT alignment for up to 8191 experts.
 
-    Uses the v2 kernel from moe_align_kernel.cu which supports large expert
-    counts via per-thread multi-expert processing and a two-level warp scan,
-    replacing the previous pure-PyTorch fallback that had excessive CPU overhead
-    from 15+ individual kernel launches and torch.argsort.
-
-    The JIT kernel uses a +1 offset convention: topk_ids are shifted by +1 so
-    that the EP sentinel value (-1) maps to bucket 0. The kernel internally
-    handles histogram, padded prefix-sum, expert_ids assignment, and token
-    scattering in just 2–3 CUDA kernel launches.
+    Expert IDs are shifted by one so ``-1`` maps to a sentinel bucket. The
+    fused allocation stays int4-aligned for the kernel's vectorized clear.
     """
     assert num_experts <= 8191, (
         f"_align_block_size_jit supports at most 8191 experts "
@@ -642,6 +626,10 @@ def _merged_experts_fused_moe_lora_add_impl(
     stage: str = "all",
     intermediate_buffer: torch.Tensor | None = None,
     expand_wait_event: "torch.cuda.Event | None" = None,
+    broadcast_intermediate: bool = False,
+    prewarm_a_routing: bool = True,
+    prewarm_b_routing: bool = True,
+    zero_intermediate: bool = False,
 ) -> "torch.Tensor | None":
     """
     1. Prepare virtual expert routing metadata from topk_ids + token_lora_mapping * num_experts.
@@ -657,12 +645,14 @@ def _merged_experts_fused_moe_lora_add_impl(
     - ``"expand"``: routing-B + LoRA-B expand/add only; requires ``intermediate_buffer`` =
       the tensor produced by the ``"shrink"`` stage.
 
-    EP: when `local_num_experts` (< global) is given, this rank only computes the
-    delta for the experts it owns. We keep the GLOBAL expert ids + global contiguous
-    weights (so the merged-weight reshape stays a free view) and mask non-owned
-    [token, k] slots to the -1 sentinel inside `_fused_virtual_topk_ids_kernel`; the
-    grid shrinks via the per-rank trim in `_get_routing`. Slicing the weight's expert
-    dim instead would force the reshape to copy every step (non-contiguous fold).
+    ``prewarm_a_routing`` and ``prewarm_b_routing`` let a staged caller skip
+    routing for a weight that it replaces with a dense operation. The B flag
+    also controls the automatic expand-route prewarm performed by ``"shrink"``.
+    ``broadcast_intermediate`` is an expand-only mode where one rank vector per
+    token is reused for every routed expert.
+
+    EP accepts either global weights/IDs with a local range or already-localized
+    weights/IDs from the standard dispatcher.
     """
     max_loras, _, max_lora_rank, _ = lora_a.shape
     # Global per-expert dim of the LoRA weights. lora_a may be shared-outer (expert
@@ -759,24 +749,18 @@ def _merged_experts_fused_moe_lora_add_impl(
             if cached is not None:
                 return cached
 
-        # Fused LoRA-local align: one kernel does inline virtual id + EP skip +
-        # compact (local experts) + single-block scatter, replacing the 3-kernel
-        # (_fused_virtual_topk_ids + moe_align + count_and_sort) pipeline. Two
-        # single-adapter (max_loras==1) regimes are fused; everything else falls back:
-        #   - per-expert EP path (ep_local): compact local-expert histogram.
-        #   - shared-outer path (shared_outer): lora-id routing (compute_virtual_id
-        #     uses base=0; the kernel + launcher already size num_experts_for_weight=1
-        #     and have no bucket-count blocker, so it just needs compact=False — compact
-        #     + shared_outer would mis-map the id as base-offset). This is the opt1
-        #     align/sort fusion: shared-outer used to fall through to the unfused
-        #     _fused_virtual_topk_ids + moe_align_block_size_small_batch pair (~10.2us/
-        #     layer at decode bs16); now it takes the single fused launch.
-        # Decode-only: the fused kernel's single-block scatter targets the small
-        # decode batch; prefill (>= 512 tokens) keeps the multi-block old path.
+        # Shared-outer routing has one bucket per adapter, so the same merged
+        # align remains valid for multi-LoRA. Compact EP routing stays single-slot.
+        compact_merged = ep_local and not shared_outer and max_loras == 1
+        bucket_experts = (
+            local_num_experts
+            if compact_merged
+            else (1 if shared_outer else num_experts) * max_loras
+        )
         if (
             lora_envs.SGLANG_OPT_LORA_FUSED_MERGED_ALIGN.get()
-            and max_loras == 1
-            and (shared_outer or ep_local)
+            and (shared_outer or compact_merged)
+            and bucket_experts + 1 <= 1024
             and topk_ids.shape[0] < 512
         ):
             from sglang.jit_kernel.trtllm_lora_temp.moe_lora_merged_align import (
@@ -799,9 +783,7 @@ def _merged_experts_fused_moe_lora_add_impl(
                 local_expert_offset,
                 local_num_experts,
                 do_skip=True,
-                # compact local-expert histogram is only valid for the per-expert EP
-                # path; shared_outer routes by lora id (base=0) so it must stay global.
-                compact=not shared_outer,
+                compact=compact_merged,
             )
             result = (
                 sorted_token_ids,
@@ -874,6 +856,12 @@ def _merged_experts_fused_moe_lora_add_impl(
         "expand",
         "routing",
     ), f"invalid stage {stage!r}"
+    if broadcast_intermediate:
+        assert stage == "expand"
+        assert use_direct_expand_add
+        assert intermediate_buffer is not None
+        assert intermediate_buffer.ndim == 2
+        assert intermediate_buffer.shape[0] == token_lora_mapping.shape[0]
     lora_a_virtual = _merge_lora_expert_weight(lora_a)
     lora_b_virtual = _merge_lora_expert_weight(lora_b)
     num_experts_a = lora_a.shape[1]
@@ -891,20 +879,32 @@ def _merged_experts_fused_moe_lora_add_impl(
         a_cfg = _get_shrink_stage_config(lora_a_virtual, token_lora_mapping.shape[0])
         if lora_envs.SGLANG_OPT_LORA_SHRINK_TUNE.get():
             a_cfg = {**a_cfg, "BLOCK_SIZE_M": 16}
-        _get_routing(
-            topk_ids,
-            token_lora_mapping,
-            num_experts_a,
-            experts_shared_outer_loras_a,
-            a_cfg["BLOCK_SIZE_M"],
-        )
-        _get_routing(
-            topk_ids,
-            token_lora_mapping,
-            num_experts_b,
-            experts_shared_outer_loras_b,
-            b_stage_config["BLOCK_SIZE_M"],
-        )
+        # Match the actual shrink-stage override below. Without this, callers
+        # that admit prefill-shaped batches into a side stream prewarm block-32
+        # routing here, then miss the cache when shrink switches to the B-stage
+        # block size. The miss allocates routing buffers on the side stream
+        # during capture, violating the allocation guarantee of stage='routing'.
+        if (
+            lora_envs.SGLANG_OPT_LORA_PREFILL_ROUTING_REUSE.get()
+            and token_lora_mapping.shape[0] >= 512
+        ):
+            a_cfg["BLOCK_SIZE_M"] = b_stage_config["BLOCK_SIZE_M"]
+        if prewarm_a_routing:
+            _get_routing(
+                topk_ids,
+                token_lora_mapping,
+                num_experts_a,
+                experts_shared_outer_loras_a,
+                a_cfg["BLOCK_SIZE_M"],
+            )
+        if prewarm_b_routing:
+            _get_routing(
+                topk_ids,
+                token_lora_mapping,
+                num_experts_b,
+                experts_shared_outer_loras_b,
+                b_stage_config["BLOCK_SIZE_M"],
+            )
         return None
 
     intermediate = intermediate_buffer
@@ -913,21 +913,14 @@ def _merged_experts_fused_moe_lora_add_impl(
             lora_a_virtual, token_lora_mapping.shape[0]
         )
         if lora_envs.SGLANG_OPT_LORA_SHRINK_TUNE.get():
-            # GB200 hand-tune knob (test-only) on top of PR #26899's heuristic config. The launcher
-            # pins BLOCK_SIZE_N (next_pow2(rank)) and BLOCK_SIZE_K (256), so only M/warps/stages apply.
+            # Test-only override; the launcher fixes N and K block sizes.
             a_stage_config = {
                 **a_stage_config,
                 "BLOCK_SIZE_M": 16,
                 "num_warps": 4,
                 "num_stages": 4,
             }
-        # F1-① prefill routing reuse: the A stage routes with BLOCK_SIZE_M 32 at prefill
-        # but the B stage with the tuned fused-moe config (typically 64), so the
-        # (num_experts, shared_outer, block_size) routing_cache key never matches across
-        # stages and the align/sort pipeline reruns per stage (4x/layer at prefill).
-        # Matching the A stage's routing block to the B stage's collapses them to one
-        # align/sort per layer-forward. Decode (<512 tokens) keeps the opt1 fused
-        # merged-align path and its tuned shrink block untouched.
+        # Match routing block sizes so prefill stages can share cached alignment.
         if (
             lora_envs.SGLANG_OPT_LORA_PREFILL_ROUTING_REUSE.get()
             and token_lora_mapping.shape[0] >= 512
@@ -957,8 +950,10 @@ def _merged_experts_fused_moe_lora_add_impl(
         # non-owned blocks (never reads them), but a shared-outer expand routes by lora id
         # and would read them into the real (all-reduced) output -> must zero. split_k > 1
         # also needs a zeroed buffer for its accumulation.
-        zero_intermediate = intermediate_split_k > 1 or (
-            ep_local and experts_shared_outer_loras_b
+        must_zero_intermediate = (
+            zero_intermediate
+            or intermediate_split_k > 1
+            or (ep_local and experts_shared_outer_loras_b)
         )
         if intermediate is None:
             intermediate = (
@@ -967,14 +962,14 @@ def _merged_experts_fused_moe_lora_add_impl(
                     dtype=hidden_states.dtype,
                     device=hidden_states.device,
                 )
-                if zero_intermediate
+                if must_zero_intermediate
                 else torch.empty(
                     intermediate_shape,
                     dtype=hidden_states.dtype,
                     device=hidden_states.device,
                 )
             )
-        elif zero_intermediate:
+        elif must_zero_intermediate:
             # Caller-provided buffer (allocated on the consumer stream): zero it in-stream.
             intermediate.zero_()
 
@@ -993,7 +988,7 @@ def _merged_experts_fused_moe_lora_add_impl(
         if stage == "shrink":
             # Pre-warm the routing-B cache on this (side) stream so the later "expand" stage
             # launches no routing kernels — they overlap finalize together with the shrink.
-            if routing_cache is not None:
+            if routing_cache is not None and prewarm_b_routing:
                 _get_routing(
                     topk_ids,
                     token_lora_mapping,
@@ -1041,8 +1036,13 @@ def _merged_experts_fused_moe_lora_add_impl(
             b_stage_config,
             mul_routed_weight,
             fuse_sum_all_reduce,
+            broadcast_intermediate=broadcast_intermediate,
         )
     else:
+        assert not broadcast_intermediate, (
+            "broadcasted LoRA-A intermediates require the rank-specialized "
+            "direct expand kernel"
+        )
         invoke_fused_moe_kernel(
             intermediate_flat,
             lora_b_virtual,
@@ -1131,6 +1131,10 @@ def merged_experts_fused_moe_lora_add(
     stage: str = "all",
     intermediate_buffer: torch.Tensor | None = None,
     expand_wait_event: "torch.cuda.Event | None" = None,
+    broadcast_intermediate: bool = False,
+    prewarm_a_routing: bool = True,
+    prewarm_b_routing: bool = True,
+    zero_intermediate: bool = False,
 ) -> "torch.Tensor | None":
     """Public API: wraps the registered op with routing_cache support."""
     return _merged_experts_fused_moe_lora_add_impl(
@@ -1153,4 +1157,8 @@ def merged_experts_fused_moe_lora_add(
         stage=stage,
         intermediate_buffer=intermediate_buffer,
         expand_wait_event=expand_wait_event,
+        broadcast_intermediate=broadcast_intermediate,
+        prewarm_a_routing=prewarm_a_routing,
+        prewarm_b_routing=prewarm_b_routing,
+        zero_intermediate=zero_intermediate,
     )

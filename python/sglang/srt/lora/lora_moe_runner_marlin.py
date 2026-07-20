@@ -73,7 +73,6 @@ class MarlinLoraRunnerCore:
         assert (
             torch.cuda.get_device_capability(hidden_states.device)[0] >= 9
         ), "MarlinLoraRunnerCore requires CUDA compute capability >= 9"
-        inplace = runner_config.inplace
         routed_scaling_factor = runner_config.routed_scaling_factor
 
         M, K = hidden_states.shape
@@ -86,20 +85,33 @@ class MarlinLoraRunnerCore:
             if M * topk / E / block_size_m < 0.9:
                 break
 
+        # Under EP the dispatcher already localized topk_ids (-1 = non-local); align
+        # over the global expert count like fused_marlin_moe, not the local E.
+        align_num_experts = (
+            quant_info.global_num_experts if quant_info.expert_map is not None else E
+        )
         sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-            topk_ids, block_size_m, E
+            topk_ids, block_size_m, align_num_experts
         )
 
-        from sglang.srt.runtime_context import get_resources
+        # Per-call workspace like fused_experts_none_to_marlin: a shared buffer aliases
+        # inter-block locks across in-flight kernels/graphs and deadlocks capture.
+        workspace = marlin_make_workspace(hidden_states.device, max_blocks_per_sm=4)
 
-        buffers = get_resources().buffers
-        workspace = buffers.get("marlin_lora_workspace")
-        if workspace is None or workspace.device != hidden_states.device:
-            workspace = marlin_make_workspace(hidden_states.device, max_blocks_per_sm=4)
-            buffers["marlin_lora_workspace"] = workspace
-
-        scalar_type1 = get_scalar_type(num_bits, quant_info.w13_qzeros is not None)
-        scalar_type2 = get_scalar_type(num_bits, quant_info.w2_qzeros is not None)
+        # Pass scales + global scale so fp4-marlin weights (the ModelOpt NVFP4
+        # W4A16 fallback) resolve to float4_e2m1f instead of uint4b8.
+        scalar_type1 = get_scalar_type(
+            num_bits,
+            quant_info.w13_qzeros is not None,
+            quant_info.w13_scales,
+            quant_info.w13_global_scale,
+        )
+        scalar_type2 = get_scalar_type(
+            num_bits,
+            quant_info.w2_qzeros is not None,
+            quant_info.w2_scales,
+            quant_info.w2_global_scale,
+        )
 
         # Stage 1: Gate/Up (Marlin)
         intermediate_cache1 = torch.empty(
@@ -109,9 +121,9 @@ class MarlinLoraRunnerCore:
             hidden_states,
             intermediate_cache1,
             quant_info.w13_qweight,
-            None,
+            quant_info.w13_bias,
             quant_info.w13_scales,
-            None,
+            quant_info.w13_global_scale,
             quant_info.w13_qzeros,
             quant_info.w13_g_idx,
             quant_info.w13_g_idx_sort_indices,
@@ -158,9 +170,9 @@ class MarlinLoraRunnerCore:
             intermediate_cache2,
             intermediate_cache3,
             quant_info.w2_qweight,
-            None,
+            quant_info.w2_bias,
             quant_info.w2_scales,
-            None,
+            quant_info.w2_global_scale,
             quant_info.w2_qzeros,
             quant_info.w2_g_idx,
             quant_info.w2_g_idx_sort_indices,
@@ -190,8 +202,9 @@ class MarlinLoraRunnerCore:
                 intermediate_cache2, intermediate_cache3, topk_weights, topk_ids
             )
 
-        # Stage 4: Reduction
-        output = hidden_states if inplace else torch.empty_like(hidden_states)
+        # Stage 4: Reduction. Never alias hidden_states even under inplace: the sink
+        # forward still reads it (stock fused_experts_none_to_marlin does the same).
+        output = torch.empty_like(hidden_states)
         if routed_scaling_factor is None:
             routed_scaling_factor = 1.0
         # NOTE: fusion opportunity here
