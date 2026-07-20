@@ -1564,8 +1564,12 @@ class MMEncoder:
         image_config = self.vision_config.get("image", {})
         if self.model_type in ["kimi_k25", "kimi_vl"]:
             images = self._normalize_kimi_encoder_images(images)
-            # kimi_vl's processor has no media_proc_cfg; GPU path is k2.5-only.
-            if self.model_type == "kimi_k25" and self.use_image_processor_gpu:
+            # kimi_gpu_preprocess is Kimi-K2.5-owned;
+            if (
+                self.model_type == "kimi_k25"
+                and self.use_image_processor_gpu
+                and self.image_processor is not None
+            ):
                 return self._kimi_preprocess_images_gpu(images)
         return await asyncio.get_running_loop().run_in_executor(
             self.preproc_executor,
