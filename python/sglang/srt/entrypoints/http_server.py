@@ -37,6 +37,7 @@ from typing import (
     Dict,
     List,
     Optional,
+    Tuple,
     Union,
 )
 
@@ -2112,9 +2113,22 @@ def _warmup_connection(server_args: ServerArgs):
     return server_args.url(), headers, server_args.ssl_verify()
 
 
-def _build_warmup_generate_json(server_args: ServerArgs, max_new_tokens: int) -> dict:
-    """The plain text/input_ids warmup body (one item per DP rank), shared by the
-    Python and Rust warmup paths."""
+def _build_warmup_json(
+    server_args: ServerArgs, model_info: Dict[str, Any]
+) -> Tuple[str, dict]:
+    """Build warmup request JSON payload."""
+    # MLX: text warmup for VLM-advertising models; TODO: enable image warmup.
+    is_vlm = bool(model_info.get("has_image_understanding", False)) and not is_mps()
+    is_generation = model_info["is_generation"]
+    if is_generation:
+        if is_vlm and not server_args.skip_tokenizer_init:
+            request_name = "/v1/chat/completions"
+        else:
+            request_name = "/generate"
+    else:
+        request_name = "/encode"
+    max_new_tokens = 8 if is_generation else 1
+
     json_data = {
         "sampling_params": {
             "temperature": 0,
@@ -2126,65 +2140,23 @@ def _build_warmup_generate_json(server_args: ServerArgs, max_new_tokens: int) ->
         # TODO Workaround the bug that embedding errors for list of size 1
         if server_args.dp_size == 1:
             json_data["input_ids"] = json_data["input_ids"][0]
-    else:
-        json_data["text"] = ["The capital city of France is"] * server_args.dp_size
-        # TODO Workaround the bug that embedding errors for list of size 1
-        if server_args.dp_size == 1:
-            json_data["text"] = json_data["text"][0]
-    return json_data
 
-
-def _execute_server_warmup(server_args: ServerArgs):
-    url, headers, ssl_verify = _warmup_connection(server_args)
-
-    # Wait until the server is launched
-    success = False
-    for _ in range(120):
-        time.sleep(1)
-        try:
-            res = requests.get(
-                url + "/model_info", timeout=5, headers=headers, verify=ssl_verify
-            )
-            assert res.status_code == 200, f"{res=}, {res.text=}"
-            success = True
-            break
-        except (AssertionError, requests.exceptions.RequestException):
-            last_traceback = get_exception_traceback()
-            pass
-
-    if not success:
-        logger.error(f"Initialization failed. warmup error: {last_traceback}")
-        kill_process_tree(os.getpid())
-        return success
-
-    model_info = res.json()
-
-    # Construct a warmup request (MLX: text warmup for VLM-advertising models; TODO: enable image warmup).
-    # A language-only worker may advertise VLM capability for encoder
-    # disaggregation, but its local warmup must stay on the text path.
-    is_vlm = (
-        bool(model_info.get("has_image_understanding", False))
-        and not server_args.language_only
-        and not is_mps()
-    )
-    if model_info["is_generation"]:
-        if is_vlm and not server_args.skip_tokenizer_init:
-            request_name = "/v1/chat/completions"
+    elif is_vlm and server_args.disaggregation_mode == "null" and is_generation:
+        served_model_name = ""
+        if not envs.SGLANG_RUST_SERVER.get():
+            served_model_name = _global_state.tokenizer_manager.served_model_name
         else:
-            request_name = "/generate"
-    else:
-        request_name = "/encode"
-    max_new_tokens = 8 if model_info["is_generation"] else 1
-    if (
-        not server_args.skip_tokenizer_init
-        and is_vlm
-        and server_args.disaggregation_mode == "null"
-        and model_info["is_generation"]
-    ):
+            # _global_state.tokenizer_manager is not initialized in the rust server,
+            # so we need to get the model name from the model_info
+            served_model_name = model_info.get(
+                "model_path", server_args.served_model_name
+            )
+            served_model_name = served_model_name or server_args.model_path
+
         # TODO: ChatCompletionRequest does not have bootstrap info required by disaggregation mode, disable image-warmup for now
         # Only use chat completions format for generation models, not embedding models
-        json_data = {
-            "model": _global_state.tokenizer_manager.served_model_name,
+        return request_name, {
+            "model": served_model_name,
             "messages": [
                 {
                     "role": "user",
@@ -2208,7 +2180,54 @@ def _execute_server_warmup(server_args: ServerArgs):
             "temperature": 0.0,
         }
     else:
-        json_data = _build_warmup_generate_json(server_args, max_new_tokens)
+        json_data["text"] = ["The capital city of France is"] * server_args.dp_size
+        # TODO Workaround the bug that embedding errors for list of size 1
+        if server_args.dp_size == 1:
+            json_data["text"] = json_data["text"][0]
+    return request_name, json_data
+
+
+def _fetch_model_info(
+    url: str, headers: dict, ssl_verify, attempts: int
+) -> Optional[dict]:
+    """GET ``/model_info``, retrying up to `attempts` times (1s apart)."""
+    last_traceback = None
+    for i in range(attempts):
+        if i:
+            time.sleep(1)
+        try:
+            res = requests.get(
+                url + "/model_info", timeout=5, headers=headers, verify=ssl_verify
+            )
+            assert res.status_code == 200, f"{res=}, {res.text=}"
+            return res.json()
+        except (AssertionError, requests.exceptions.RequestException):
+            last_traceback = get_exception_traceback()
+    logger.error(f"Initialization failed. warmup error: {last_traceback}")
+    return None
+
+
+def _prepare_warmup(
+    server_args: ServerArgs, attempts: int
+) -> Optional[Tuple[str, dict, Any, str, dict]]:
+    """Parepare the server warmup request."""
+    url, headers, ssl_verify = _warmup_connection(server_args)
+    model_info = _fetch_model_info(
+        url, headers=headers, ssl_verify=ssl_verify, attempts=attempts
+    )
+    if model_info is None:
+        return None
+
+    request_name, json_data = _build_warmup_json(server_args, model_info)
+    return url, headers, ssl_verify, request_name, json_data
+
+
+def _execute_server_warmup(server_args: ServerArgs):
+    prepared = _prepare_warmup(server_args, attempts=120)
+    if prepared is None:
+        kill_process_tree(os.getpid())
+        return False
+    url, headers, ssl_verify, request_name, json_data = prepared
 
     # Config debug dumping
     if server_args.debug_tensor_dump_input_file:
@@ -2265,7 +2284,7 @@ def _execute_server_warmup(server_args: ServerArgs):
         kill_process_tree(os.getpid())
         return False
 
-    return success
+    return True
 
 
 def _execute_rust_server_warmup(server_args: ServerArgs) -> bool:
@@ -2283,13 +2302,16 @@ def _execute_rust_server_warmup(server_args: ServerArgs) -> bool:
         )
         return False
 
-    url, headers, ssl_verify = _warmup_connection(server_args)
-    json_data = _build_warmup_generate_json(server_args, max_new_tokens=8)
+    prepared = _prepare_warmup(server_args, attempts=120)
+    if prepared is None:
+        kill_process_tree(os.getpid())
+        return False
+    url, headers, ssl_verify, request_name, json_data = prepared
 
     warmup_timeout = envs.SGLANG_WARMUP_TIMEOUT.get()
     try:
         res = requests.post(
-            url + "/generate",
+            url + request_name,
             json=json_data,
             headers=headers,
             timeout=warmup_timeout if warmup_timeout > 0 else 600,
@@ -2734,7 +2756,7 @@ def launch_server(
         logger.info("The server is fired up and ready to roll!")
         if launch_callback is not None:
             launch_callback()
-        scheduler_init_result.wait_for_completion()
+        scheduler_init_result.block_until_scheduler_exits()
         return
 
     _setup_and_run_http_server(
