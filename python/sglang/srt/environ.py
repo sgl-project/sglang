@@ -183,6 +183,19 @@ class EnvFloat(EnvField):
             raise ValueError(f'"{value}" is not a valid float value')
 
 
+class GateGemvMode(IntEnum):
+    """Small-batch Inkling gate linear implementation.
+
+    OFF: always the cublas GEMM
+    PAIR: PDL-chained GEMV and gate JIT kernels
+    FUSED: single-launch GEMV + gate epilogue (last-block ticket)
+    """
+
+    OFF = 0
+    PAIR = 1
+    FUSED = 2
+
+
 class ToolStrictLevel(IntEnum):
     """
     Defines the strictness levels for tool call parsing and validation.
@@ -345,6 +358,7 @@ class Envs:
     SGLANG_NEW_TOKEN_RATIO_DECAY_STEPS = EnvInt(600)
     SGLANG_RETRACT_DECODE_STEPS = EnvInt(20)
     SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION = EnvInt(4096)
+    SGLANG_MAX_NEW_TOKENS_LIMIT = EnvInt(None)
 
     # Scheduler: recv interval
     SGLANG_SCHEDULER_RECV_SKIPPER_WEIGHT_DEFAULT = EnvInt(1000)
@@ -376,6 +390,9 @@ class Envs:
     # even when is_cuda() is False (e.g. AMD/ROCm). On CUDA the barrier is
     # already enabled regardless of this flag (see start_event_loop).
     SGLANG_ENABLE_WAR_BARRIER = EnvBool(False)
+    # Force the WAR barrier to wait for the whole forward instead of the
+    # read-done fastpath event.
+    SGLANG_FORCE_COARSE_WAR_BARRIER = EnvBool(False)
     # PP: skip output send/recv when the entire batch consists of non-final chunked prefill requests,
     # since process_batch_result_prefill discards next_token_ids for those anyway.
     SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM = EnvBool(False)
@@ -612,6 +629,9 @@ class Envs:
     SGLANG_FLASHINFER_WORKSPACE_SIZE = EnvInt(384 * 1024 * 1024)
     # Enable NVFP4 per-token activation scaling path for FlashInfer TRT-LLM MoE.
     SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION = EnvBool(False)
+    # Launch the TRT-LLM MoE grouped GEMMs with PDL only at or below this
+    # token count.
+    SGLANG_TRTLLM_MOE_PDL_MAX_TOKENS = EnvInt(8192)
     # SGLang needs to know FlashInfer NVFP4 4over6 config to compute the global scale factor.
     FLASHINFER_NVFP4_4OVER6 = EnvBool(False)
     FLASHINFER_NVFP4_4OVER6_E4M3_USE_256 = EnvBool(False)
@@ -725,6 +745,9 @@ class Envs:
     # Set to 0: force disable (use default Aiter AR even with --enable-deterministic-inference)
     SGLANG_USE_1STAGE_ALLREDUCE = EnvBool(False)
     SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2 = EnvBool(True)
+    # Default per-direction workspace cap for CustomAllReduceV2; explicit
+    # constructor sizes take precedence over this.
+    SGLANG_CUSTOM_ALL_REDUCE_V2_MAX_SIZE_KB = EnvInt(16 * 1024)
     SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE = EnvInt(4096)
     SGLANG_FLASHINFER_DECODE_SPLIT_TILE_SIZE = EnvInt(2048)
     SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE = EnvInt(4096)
@@ -741,6 +764,8 @@ class Envs:
 
     # Spec Config
     SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK = EnvBool(True)
+    # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).
+    SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")
     SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS = EnvInt(2)
     SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE = EnvBool(False)
@@ -791,6 +816,9 @@ class Envs:
     # Mamba
     SGLANG_MAMBA_CONV_DTYPE = EnvStr("bfloat16")
     SGLANG_MAMBA_SSM_DTYPE = EnvStr(None)
+    # Kill-switch for the fused per-slot conv clear/copy kernel (MambaPool);
+    # falls back to the per-conv-type Python loop.
+    SGLANG_DISABLE_FUSED_MAMBA_SLOT_OPS = EnvBool(False)
 
     # Unified Radix Tree
     SGLANG_ENABLE_UNIFIED_RADIX_TREE = EnvBool(False)
@@ -807,7 +835,7 @@ class Envs:
     SGLANG_EMBEDDINGS_SPARSE_HEAD = EnvStr(None)
 
     # Logits processor
-    SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK = EnvBool(False)
+    SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK = EnvBool(True)
     SGLANG_LOGITS_PROCESSER_CHUNK_SIZE = EnvInt(2048)
 
     # Tool-Call behavior
@@ -890,6 +918,73 @@ class Envs:
     SGLANG_OPT_USE_FUSED_CLAMP_ACT_MUL = EnvBool(True)
     SGLANG_ENABLE_NVFP4_GEMM_SWIGLU_FUSION = EnvBool(True)
     SGLANG_FIX_MTP_HC_HIDDEN = EnvBool(False)
+    # ====================================================================
+
+    # ====================================================================
+    # Inkling
+    SGLANG_OPT_USE_FUSED_GATE_TOPK = EnvBool(True)
+    # Inside the fused gate: use the CUDA JIT top-k+renorm kernel (v2) instead
+    # of the triton kernel when the production Inkling shape applies.
+    SGLANG_OPT_USE_GATE_TOPK_JIT = EnvBool(True)
+    # Inside the fused gate: replace the cublas gate linear with the
+    # expert-per-block GEMV JIT kernel at small token counts (GateGemvMode).
+    SGLANG_OPT_GATE_GEMV_MODE = EnvInt(GateGemvMode.PAIR)
+    # Capture all multi-layer EAGLE draft-extend steps and the in-graph chain
+    # rotation into ONE CUDA graph instead of one captured graph per step.
+    SGLANG_ENABLE_SINGLE_CG_DRAFT = EnvBool(True)
+    # Draft sampler uses the Gumbel-max trick (argmax(probs / Exp(1))) instead of
+    # torch.multinomial, whose device-side validity assert breaks draft-graph replay.
+    SGLANG_OPT_USE_GUMBEL_SAMPLE = EnvBool(True)
+    # Multi-layer chain-MTP boundary-KV fix: widen the draft-extend window to
+    # rewrite rejected-draft KV rows before reuse (acc_len repair; on by default).
+    SGLANG_ENABLE_MTP_BOUNDARY_KV_FIX = EnvBool(True)
+    SGLANG_OPT_USE_INKLING_MULTI_STREAM_OVERLAP = EnvBool(True)
+    SGLANG_OPT_USE_INKLING_SHEARED_BIAS = EnvBool(True)
+    # Use feature-stacked GEMMs for the no-LoRA BF16 shared sink. Eligible LoRA
+    # serving enables this layout independently of the flag.
+    SGLANG_OPT_LINEARIZED_SHARED_SINK = EnvBool(True)
+    # Use the autotuned JIT all-reduce, falling back to torch multimem for
+    # shapes where it wins.
+    SGLANG_OPT_USE_INKLING_CUSTOM_AR = EnvBool(True)
+    # Fuse small-batch decode all-reduce, MLP convolution, and attention norm.
+    # Requires the custom all-reduce; other shapes use the unfused path.
+    SGLANG_OPT_USE_INKLING_FUSED_AR_SCONV_NORM = EnvBool(True)
+    # Fuse eligible extend all-reduce, convolution, and cache updates.
+    # Supports scattered or full-width state and requires the custom all-reduce.
+    SGLANG_OPT_USE_INKLING_FUSED_AR_SCONV = EnvBool(True)
+    # Fuse eligible convolution, QK norm, window, and KV-store prologue work.
+    # Non-BF16 caches retain the backend KV store.
+    SGLANG_OPT_USE_INKLING_FUSED_ATTN_PROLOGUE = EnvBool(True)
+    # Override shared-expert selection: true uses grouped GEMM, false uses BMM.
+    # When unset, selection follows model, quantization, and LoRA requirements.
+    SGLANG_OPT_USE_INKLING_SHARED_FUSED_MOE = EnvBool(True)
+    # Fold the conditional long-context log-scaling tau into its producers
+    # instead of separate output-sized scale kernels: the fused attn
+    # prologue's q path (bit-exact, before MXFP8 quantization there) and the
+    # rel_logits projection's r OPERAND (the diagonal scale commutes through
+    # the einsum, shrinking the pass by rel_extent/d_rel = 64x; rounding moves
+    # before the GEMM). Flag-off keeps the standalone apply_log_scaling_tau
+    # on the outputs.
+    # Fold the MoE shared-expert partials into the custom AR kernels instead
+    # of a separate {routed + shared} torch.add per MoE layer; some buckets
+    # keep a pre-add during the AR stage-in. torch.add numerics
+    # (bit-identical). Requires SGLANG_OPT_USE_INKLING_CUSTOM_AR.
+    SGLANG_OPT_USE_INKLING_FUSED_AR_SHARED = EnvBool(True)
+    SGLANG_OPT_USE_INKLING_FUSED_LOG_TAU = EnvBool(True)
+    # Dispatch the rel_logits projection around einsum's hidden compaction
+    # copy of the strided r operand (a view into the packed qkvr output):
+    # zero-copy strided-batched matmul at small t, JIT row-compact + einsum
+    # above the band, single-launch tau-folded kernel in the small-t tau
+    # band. Bit-identical to the plain einsum; flag-off restores it.
+    SGLANG_OPT_USE_INKLING_REL_PROJ_DISPATCH = EnvBool(True)
+
+    # Quantize and store MXFP8 K/V data and scales in one fused kernel.
+    SGLANG_OPT_INKLING_MXFP8_FUSED_QUANT_STORE = EnvBool(True)
+    # Default reasoning effort in [0.0, 0.99] when omitted by a request.
+    # An empty string falls back to the protocol default (0.9); the effort
+    # directive is always emitted.
+    SGLANG_INKLING_DEFAULT_REASONING_EFFORT = EnvStr("0.9")
+    SGLANG_INKLING_RS_MM_PREPROCESS = EnvBool(True)
     # ====================================================================
 
     # Set False when using FP4-to-FP8 converted DeepSeek V4 checkpoint.
@@ -1095,6 +1190,8 @@ def _convert_SGL_to_SGLANG():
     )
     _print_deprecated_env("SGLANG_PER_TOKEN_GROUP_QUANT_8BIT_V2")
     _print_deprecated_env("SGLANG_OPT_SWA_EVICT_DROP_PAGE_MARGIN")
+    # sconv-family kernels always use the CUDA-JIT ports when supported; no toggle.
+    _print_deprecated_env("SGLANG_OPT_USE_CUDA_SCONV")
     _print_deprecated_env("SGLANG_ENABLE_THINKING", "SGLANG_DEFAULT_THINKING")
     _print_deprecated_env("SGLANG_REASONING_EFFORT", "SGLANG_DSV4_REASONING_EFFORT")
     _print_deprecated_env(

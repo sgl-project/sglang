@@ -361,6 +361,7 @@ class Scheduler(
             and self.enable_hierarchical_cache
         )
         self.max_recv_per_poll = envs.SGLANG_SCHEDULER_MAX_RECV_PER_POLL.get()
+        self.max_new_tokens_limit = envs.SGLANG_MAX_NEW_TOKENS_LIMIT.get()
         self.enable_hisparse = server_args.enable_hisparse
         self.enable_dp_attention = server_args.enable_dp_attention
         self.enable_unified_memory = server_args.enable_unified_memory
@@ -1459,6 +1460,11 @@ class Scheduler(
         # HostKVCache.destroy. Called from run_scheduler_process's finally.
         if self.hisparse_coordinator is not None:
             self.hisparse_coordinator.destroy()
+        # A plain HiRadixCache (no hisparse) also holds a large pinned host KV
+        # pool; unregister it here too, else the kernel unpins it during reclaim.
+        host_pool = getattr(self.tree_cache, "token_to_kv_pool_host", None)
+        if host_pool is not None:
+            host_pool.destroy()
 
     def run_event_loop(self) -> None:
         """Run the scheduler's event loop.
@@ -1475,6 +1481,18 @@ class Scheduler(
         self.schedule_stream = self.device_module.Stream(priority=0)
         if self.device == "cpu":
             self.schedule_stream.synchronize = lambda: None  # No-op for CPU
+        elif is_cuda() or _is_hip:
+            # CUDA/HIP streams come from a fixed round-robin pool. Redraw if this
+            # stream aliases forward_stream, which would eliminate scheduler
+            # overlap. Only CUDA/HIP streams expose a ``cuda_stream`` handle;
+            # other accelerators (e.g. NPU/XPU) skip the alias check.
+            _redraws = 0
+            while (
+                self.schedule_stream.cuda_stream == self.forward_stream.cuda_stream
+                and _redraws < 64
+            ):
+                self.schedule_stream = self.device_module.Stream(priority=0)
+                _redraws += 1
         # The global WAR barrier fences the scheduler's next shared-buffer write
         # on the previous forward's read of the unified memory pool.
         self._war_barrier_enabled = is_cuda() or envs.SGLANG_ENABLE_WAR_BARRIER.get()
@@ -1482,18 +1500,19 @@ class Scheduler(
             dispatch_event_loop(self)
 
     def _apply_war_barrier(self):
-        # Wait for the prev forward to finish reading the shared buffers this
-        # iter's schedule will overwrite. Fast path: wait on the read-done event
-        # the forward published after its snapshot (non-spec: decode graph;
-        # spec: draft_extend), then clear it. Else fall back to whole-forward
-        # wait_stream.
+        # Called right after each launch: order later schedule_stream work
+        # (result processing, next iteration's writes) behind the forward's
+        # shared-buffer reads. Fast path: wait on the read-done event the
+        # forward published after its snapshot (non-spec: decode graph; spec:
+        # draft_extend), then clear it. Else whole-forward wait_stream
+        # (forceable via SGLANG_FORCE_COARSE_WAR_BARRIER).
         if not self._war_barrier_enabled:
             return
         runner = self.model_worker.war_fastpath_runner
         ev = runner.war_fastpath_read_done_event
-        if ev is not None:
+        runner.war_fastpath_read_done_event = None
+        if ev is not None and not envs.SGLANG_FORCE_COARSE_WAR_BARRIER.get():
             self.schedule_stream.wait_event(ev)
-            runner.war_fastpath_read_done_event = None
         else:
             self.schedule_stream.wait_stream(self.forward_stream)
 
@@ -1553,8 +1572,6 @@ class Scheduler(
             if self._engine_paused:
                 continue
 
-            self._apply_war_barrier()
-
             # Get the next batch to run
             plan = self.get_next_batch_to_run(
                 running_batch=self.running_batch, last_batch=self.last_batch
@@ -1582,6 +1599,8 @@ class Scheduler(
             # Launch the current batch
             if batch:
                 batch_result = self.run_batch(batch)
+                # Fence result processing behind this forward's shared reads.
+                self._apply_war_barrier()
                 self.result_queue.append((batch.copy(), batch_result))
             else:
                 batch_result = None
@@ -1865,6 +1884,20 @@ class Scheduler(
 
     def init_req_max_new_tokens(self, req):
         input_len = len(req.origin_input_ids)
+        max_new_tokens = (
+            req.sampling_params.max_new_tokens
+            if req.sampling_params.max_new_tokens is not None
+            else 1 << 30
+        )
+        if self.max_new_tokens_limit is not None and self.max_new_tokens_limit > 0:
+            if max_new_tokens > self.max_new_tokens_limit:
+                logger.warning(
+                    f"Capping max_new_tokens of request {req.rid} to "
+                    f"SGLANG_MAX_NEW_TOKENS_LIMIT={self.max_new_tokens_limit} "
+                    f"(requested: {req.sampling_params.max_new_tokens})."
+                )
+            max_new_tokens = min(max_new_tokens, self.max_new_tokens_limit)
+
         # Keep this bound consistent with PrefillAdder's admission budget:
         # ceil_page(input_len) + max_new_tokens + page_size must be strictly
         # smaller than max_total_num_tokens. Otherwise a request can be accepted
@@ -1874,15 +1907,15 @@ class Scheduler(
         req.sampling_params.max_new_tokens = max(
             0,
             min(
-                (
-                    req.sampling_params.max_new_tokens
-                    if req.sampling_params.max_new_tokens is not None
-                    else 1 << 30
-                ),
+                max_new_tokens,
                 self.max_req_len - input_len - 1,
                 self.max_total_num_tokens - paged_input_len - self.page_size - 1,
             ),
         )
+        # Clipping above can push max_new_tokens below min_new_tokens, which
+        # would suppress EOS for the whole generation. Restore the invariant.
+        if req.sampling_params.min_new_tokens > req.sampling_params.max_new_tokens:
+            req.sampling_params.min_new_tokens = req.sampling_params.max_new_tokens
 
     def _process_and_broadcast_mm_inputs(
         self,
@@ -2672,7 +2705,8 @@ class Scheduler(
                 if self.dllm_config.first_done_first_out_mode:
                     if not req.dllm_incomplete_ids:
                         self.stash_chunked_request(req)
-                    self.req_to_token_pool.free(req)
+                        self.req_to_token_pool.free(req)
+                    # Otherwise, keep req slot/KV for reuse.
                 else:
                     self.stash_chunked_request(req)
 
@@ -3990,7 +4024,7 @@ class Scheduler(
             exec = e
             logger.error(f"Failed to call rpc {recv_req.method}: {str(e)}")
 
-        barrier()
+        barrier(group=self.tp_group.cpu_group)
         return RpcReqOutput(success=success, message="" if not exec else str(exec))
 
     def abort_request(self, recv_req: AbortReq):
@@ -4039,6 +4073,22 @@ class Scheduler(
             ):
                 release_kv_cache(req, self.tree_cache, is_insert=False)
             logger.debug(f"Abort queued request. {req.rid=}")
+
+        if self.dllm_config is not None:
+            for req in self.dllm_manager.pop_aborted_reqs(
+                recv_req.abort_all, recv_req.rid
+            ):
+                if self.enable_hicache_storage:
+                    self.tree_cache.release_aborted_request(req.rid)
+                self.ipc_channels.send_to_tokenizer.send_output(
+                    AbortReq(rid=req.rid), req
+                )
+                if (
+                    req.req_pool_idx is not None
+                    or getattr(req, "mamba_pool_idx", None) is not None
+                ):
+                    release_kv_cache(req, self.tree_cache, is_insert=False)
+                logger.debug(f"Abort dLLM queued request. {req.rid=}")
 
         # Delete the requests in the grammar queue
         # Abort method 2: call `set_finish_with_abort`
