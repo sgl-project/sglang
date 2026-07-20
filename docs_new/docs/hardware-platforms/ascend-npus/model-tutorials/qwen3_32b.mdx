@@ -24,7 +24,7 @@ version.
 |-------------------------------|-----------------------------------------------------------------------------------------------|
 | Tensor Parallelism            | `--tp-size 4`                                                                                 |
 | Quantization                  | `--quantization modelslim`                                                                    |
-| NPU Graph                     | enabled by default; disable with `--disable-cuda-graph`;<br/>control range via `--cuda-graph-bs` or `--cuda-graph-max-bs-decode`; e.g. `--cuda-graph-bs 1 4 8 16` |
+| NPU Graph                     | enabled by default; disable with `--disable-cuda-graph`;<br/>control range via `--cuda-graph-bs` or `--cuda-graph-max-bs-decode`; e.g., `--cuda-graph-bs 1 4 8 16` |
 | Speculative Decoding          | `--speculative-algorithm EAGLE3 \`<br/>`--speculative-draft-model-path /path/to/draft-model-weights \`<br/>`--speculative-num-steps 3 \`<br/>`--speculative-eagle-topk 1 \`<br/>`--speculative-num-draft-tokens 4 \`<br/>`--speculative-draft-model-quantization unquant` |
 | Overlap Schedule              | `export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`                                                  |
 
@@ -48,24 +48,30 @@ Before following this tutorial, complete the environment setup in the documents 
   It walks you through launching the official container image, starting the SGLang server, and sending a test request.
   Recommended if you are new to SGLang on Ascend.
 - [SGLang Installation with NPU Support](/docs/hardware-platforms/ascend-npus/ascend_npu) — the full installation guide.
-  It covers the component version mapping (CANN, PyTorch adapter, Triton, kernels, etc.), building from source or from a
+  It covers the component version mapping (CANN, TorchNPU, Triton, kernels, etc.), building from source or from a
   Dockerfile, and recommended system settings (CPU power scheme, NUMA, swap). Use it when you need to install or customize
   the environment instead of using the official image.
 
 ### Model weights
 
-<Warning>
-If you need to download model weights, check the model size before downloading to reserve enough space.
-</Warning>
+Before downloading model weights, check the model size to reserve enough disk space.
+For multi-node deployment, download the weights to a shared directory accessible to all nodes.
 
-- [Qwen3-32B](https://www.modelscope.cn/models/Qwen/Qwen3-32B) (BF16)
-- [Qwen3-32B-W8A8](https://www.modelscope.cn/models/vllm-ascend/Qwen3-32B-W8A8) (W8A8 quantized version)
+- [Qwen3-32B](https://www.modelscope.cn/models/Qwen/Qwen3-32B) (BF16, 65.54GB)
+- [Qwen3-32B-W8A8](https://www.modelscope.cn/models/vllm-ascend/Qwen3-32B-W8A8) (W8A8 quantized version, 42.77GB)
 - [Eagle3-Qwen3-32B-zh](https://www.modelscope.cn/models/Zjcxy-SmartAI/Eagle3-Qwen3-32B-zh) (EAGLE3 draft model for speculative decoding)
 
-Ensure the available device memory exceeds the model weight size before deployment. For optimal throughput and latency,
-refer to the [best practice configurations](#best-practices) which may require additional cards.
+<Info>
+The BF16 variant (65.54GB) can be deployed on 2 × 64GB of device memory (`--tp-size 2`), which corresponds to 2 cards on A2 or 1 card (2 dies) on A3.
 
-It is recommended to download the model weights to a shared directory across multiple nodes.
+The W8A8 variant (42.77GB) fits within a single die.
+</Info>
+
+This is the minimum recommended configuration. For optimized configurations,
+see [Best practices](#best-practices), which may require additional cards or nodes.
+
+For the hardware specifications (memory per die, dies per card, and the difference between A2 and A3),
+see [Ascend NPU Reference — Hardware](/docs/hardware-platforms/ascend-npus/ascend_npu_reference#hardware).
 
 ## Installation
 

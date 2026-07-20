@@ -65,6 +65,7 @@ from sglang.srt.managers.io_struct import (
     BatchTokenizedGenerateReqInput,
     ConfigureLoggingReq,
     ContinueGenerationReqInput,
+    ElasticScaleUpdateReq,
     EmbeddingReqInput,
     FreezeGCReq,
     GenerateReqInput,
@@ -72,6 +73,8 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqInput,
     OpenSessionReqOutput,
     PauseGenerationReqInput,
+    ScaleElasticEPReqInput,
+    ScaleElasticEPReqOutput,
     SessionParams,
     ShutdownReq,
     TokenizedEmbeddingReqInput,
@@ -160,6 +163,8 @@ _INCREMENTAL_STREAMING_META_INFO_KEYS = (
     "output_token_logprobs",
     "output_top_logprobs",
     "output_token_ids_logprobs",
+    "output_token_sampling_mask",
+    "output_token_sampling_logprobs",
 )
 
 
@@ -218,6 +223,8 @@ class ReqState:
     input_token_ids_logprobs_idx: List = dataclasses.field(default_factory=list)
     output_token_ids_logprobs_val: List = dataclasses.field(default_factory=list)
     output_token_ids_logprobs_idx: List = dataclasses.field(default_factory=list)
+    output_token_sampling_mask: List = dataclasses.field(default_factory=list)
+    output_token_sampling_logprobs: List = dataclasses.field(default_factory=list)
 
     # For detokenized logprobs
     input_token_logprobs: List[Any] = dataclasses.field(default_factory=list)
@@ -275,6 +282,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     ):
         # Parse args
         self.server_args = server_args
+        self.elastic_worker_count = server_args.dp_size
+        self.elastic_pending_ep_size = None
+        self.elastic_scale_phase = "idle"
+        self.elastic_last_error = None
         self.enable_metrics = server_args.enable_metrics
         self.incremental_streaming_output = server_args.incremental_streaming_output
         self.enable_lora = server_args.enable_lora
@@ -487,6 +498,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.model_update_result: Optional[Awaitable[UpdateWeightFromDiskReqOutput]] = (
             None
         )
+        self.model_update_expected_workers = self.elastic_worker_count
+        self.model_update_tmp: List[UpdateWeightFromDiskReqOutput] = []
         self.is_pause = False
         self.is_pause_cond = asyncio.Condition()
 
@@ -597,7 +610,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 (FreezeGCReq, lambda x: None),
                 # For handling case when scheduler skips detokenizer and forwards back to the tokenizer manager, we ignore it.
                 (HealthCheckOutput, lambda x: None),
+                # Same skip-detokenizer forwarding case as above.
+                (ConfigureLoggingReq, lambda x: None),
                 (ActiveRanksOutput, self.update_active_ranks),
+                (ElasticScaleUpdateReq, self.forward_elastic_scale_update),
             ]
         )
         self.init_communicators(self.server_args)
@@ -617,7 +633,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self._set_default_priority(obj)
 
         if isinstance(obj, GenerateReqInput) and obj.routed_dp_rank is not None:
-            dp_size = self.server_args.dp_size
+            dp_size = self.elastic_worker_count
             if dp_size <= 1 and obj.routed_dp_rank == 0:
                 logger.debug(
                     f"routed_dp_rank={obj.routed_dp_rank} is ignored because dp_size={dp_size}"
@@ -1175,6 +1191,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 logprob_start_len=obj.logprob_start_len,
                 top_logprobs_num=obj.top_logprobs_num,
                 token_ids_logprob=obj.token_ids_logprob,
+                return_sampling_mask=obj.return_sampling_mask,
                 stream=obj.stream,
                 rid=obj.rid,
                 http_worker_ipc=obj.http_worker_ipc,
@@ -1774,15 +1791,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     async def _wait_for_model_update_from_disk(
         self, obj: UpdateWeightFromDiskReqInput
     ) -> Tuple[bool, str]:
-        self._dispatch_to_scheduler(obj)
+        expected_workers = self.elastic_worker_count
+        self.model_update_expected_workers = expected_workers
+        self.model_update_tmp = []
         self.model_update_result = asyncio.Future()
-        if self.server_args.dp_size == 1:
+        self._dispatch_to_scheduler(obj)
+        if expected_workers == 1:
             result = await self.model_update_result
             if result.success:
                 self._update_model_path_info(obj.model_path, obj.load_format)
             return result.success, result.message, result.num_paused_requests
-        else:  # self.server_args.dp_size > 1
-            self.model_update_tmp = []
+        else:
             result = await self.model_update_result
 
             all_success = all([r.success for r in result])
@@ -1927,6 +1946,27 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     recv_obj,
                     i,
                 )
+            if (
+                isinstance(state.obj, GenerateReqInput)
+                and state.obj.return_sampling_mask
+            ):
+                output_sampling_mask = recv_obj.output_token_sampling_mask
+                if output_sampling_mask is not None:
+                    state.output_token_sampling_mask.extend(output_sampling_mask[i])
+                    output_sampling_logprobs = recv_obj.output_token_sampling_logprobs
+                    if output_sampling_logprobs is not None:
+                        state.output_token_sampling_logprobs.extend(
+                            output_sampling_logprobs[i]
+                        )
+                    meta_info["output_token_sampling_mask"] = (
+                        state.output_token_sampling_mask
+                    )
+                    meta_info["output_token_sampling_logprobs"] = (
+                        state.output_token_sampling_logprobs
+                    )
+                    meta_info["output_token_sampling_mask_length"] = len(
+                        state.output_token_sampling_mask
+                    )
 
             if not isinstance(recv_obj, BatchEmbeddingOutput):
                 meta_info.update(
@@ -2792,6 +2832,60 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def update_active_ranks(self, ranks: ActiveRanksOutput):
         self._dispatch_to_scheduler(ranks)
 
+    def forward_elastic_scale_update(self, msg: ElasticScaleUpdateReq):
+        if not msg.success:
+            self.elastic_pending_ep_size = None
+            self.elastic_scale_phase = "failed"
+            self.elastic_last_error = msg.error
+            return
+
+        self._dispatch_to_scheduler(msg)
+        self.elastic_worker_count = msg.effective_ep_size
+        self.elastic_pending_ep_size = None
+        self.elastic_scale_phase = "serving_expanded"
+        self.elastic_last_error = None
+        self.update_control_communicator_fan_out(msg.effective_ep_size)
+
+    def get_elastic_ep_state(self):
+        return {
+            "is_scaling_elastic_ep": self.elastic_pending_ep_size is not None,
+            "effective_ep_size": self.elastic_worker_count,
+            "pending_ep_size": self.elastic_pending_ep_size,
+            "scale_phase": self.elastic_scale_phase,
+            "last_error": self.elastic_last_error,
+        }
+
+    async def scale_elastic_ep(
+        self, obj: ScaleElasticEPReqInput
+    ) -> ScaleElasticEPReqOutput:
+        """Send a scale request to every DP scheduler."""
+        if self.elastic_pending_ep_size is not None:
+            return ScaleElasticEPReqOutput(
+                success=False,
+                message=(
+                    "A previous scale operation has not completed yet. Wait until "
+                    "all pending ranks have joined before issuing another scale."
+                ),
+                old_ep_size=self.elastic_worker_count,
+                new_ep_size=obj.new_ep_size,
+                pending_ep_size=self.elastic_pending_ep_size,
+                scale_phase=self.elastic_scale_phase,
+            )
+        self.auto_create_handle_loop()
+        responses: List[ScaleElasticEPReqOutput] = (
+            await self.scale_elastic_ep_communicator(obj)
+        )
+        for res in responses:
+            if not res.success:
+                self.elastic_scale_phase = res.scale_phase
+                self.elastic_pending_ep_size = res.pending_ep_size
+                self.elastic_last_error = res.message
+                return res
+        self.elastic_pending_ep_size = responses[0].pending_ep_size
+        self.elastic_scale_phase = responses[0].scale_phase
+        self.elastic_last_error = None
+        return responses[0]
+
     def _handle_open_session_req_output(self, recv_obj):
         future = self.session_futures.get(recv_obj.session_id)
         if future is None:
@@ -2804,12 +2898,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             future.set_result(recv_obj.session_id if recv_obj.success else None)
 
     def _handle_update_weights_from_disk_req_output(self, recv_obj):
-        if self.server_args.dp_size == 1:
+        if self.model_update_expected_workers == 1:
             self.model_update_result.set_result(recv_obj)
-        else:  # self.server_args.dp_size > 1
+        else:
             self.model_update_tmp.append(recv_obj)
-            # set future if the all results are received
-            if len(self.model_update_tmp) == self.server_args.dp_size:
+            if len(self.model_update_tmp) == self.model_update_expected_workers:
                 self.model_update_result.set_result(self.model_update_tmp)
 
     async def _validate_and_resolve_lora(

@@ -100,16 +100,13 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
   m.def("dsv3_fused_a_gemm(Tensor! output, Tensor mat_a, Tensor mat_b) -> ()");
   m.impl("dsv3_fused_a_gemm", torch::kMUSA, &dsv3_fused_a_gemm);
 
-  m.def("dsv3_router_gemm(Tensor! output, Tensor mat_a, Tensor mat_b) -> ()");
-  m.impl("dsv3_router_gemm", torch::kMUSA, &dsv3_router_gemm);
-
   /*
    * From csrc/moe
    */
   m.def(
       "moe_align_block_size(Tensor topk_ids, int num_experts, int block_size, Tensor! sorted_token_ids, Tensor! "
       "experts_ids, Tensor! num_tokens_post_pad, Tensor! cumsum_buffer, bool "
-      "pad_sorted_token_ids) -> ()");
+      "pad_sorted_token_ids, bool ignore_invalid_expert) -> ()");
   m.impl("moe_align_block_size", torch::kMUSA, &moe_align_block_size);
 
   m.def(
