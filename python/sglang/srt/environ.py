@@ -901,6 +901,8 @@ class Envs:
     SGLANG_FIX_MTP_HC_HIDDEN = EnvBool(False)
     # ====================================================================
 
+    # Disable the DeepSeek V4 async per-tensor weight-loader thread pool.
+    SGLANG_DSV4_DISABLE_ASYNC_WEIGHT_LOAD = EnvBool(False)
     # Set False when using FP4-to-FP8 converted DeepSeek V4 checkpoint.
     SGLANG_DSV4_FP4_EXPERTS = EnvBool(True)
     SGLANG_DSV4_FP4_DEQUANT = EnvBool(False)
