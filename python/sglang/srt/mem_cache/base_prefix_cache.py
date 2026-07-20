@@ -82,6 +82,13 @@ class InsertResult:
     total_len: int = 0
     last_device_node: Any = None
     mamba_exist: bool = False
+
+    # Logical-page KV sharding: the un-matched tail was NOT inserted because
+    # its rotation base disagrees with the matched chain's (a cross-chain
+    # graft would break the cyclic-owner gather contract). The tail's pages
+    # stay owned by the inserting request; callers must not dedup/rebind
+    # past prefix_len.
+    rotation_tail_declined: bool = False
     inserted_host_node: Any = None
 
 

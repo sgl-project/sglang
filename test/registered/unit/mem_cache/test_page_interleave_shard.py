@@ -422,6 +422,121 @@ class TestRadixRotationBase(CustomTestCase):
         self.assertIsNone(res.last_device_node.rotation_base)
 
 
+class _GraftReq:
+    """Minimal Req stand-in for cache_unfinished/finished_req."""
+
+    def __init__(self, fill_ids, req_pool_idx=0):
+        self.fill_ids = list(fill_ids)
+        self.origin_input_ids = array("q", fill_ids)
+        self.output_ids = array("q", [])
+        self.req_pool_idx = req_pool_idx
+        self.extra_key = None
+        self.cache_protected_len = 0
+        self.prefix_indices = torch.empty(0, dtype=torch.int64)
+        self.last_node = None
+        self.priority = 0
+        self.kv_rotation_base = None
+
+    def get_fill_ids(self):
+        return array("q", self.fill_ids)
+
+
+class TestRotationGraftDecline(CustomTestCase):
+    """Bug regression (adversarial-review finding, 2026-07-20): the overlap
+    disagg-prefill loop plans batch t+1 before batch t's radix insert lands,
+    so two requests sharing a prefix can allocate under different rotation
+    bases; the second one's insert then dedups the shared prefix and used to
+    GRAFT its differently-rotated tail under the first chain. The grafted
+    path's page owners are not one cyclic run, so a later reader either
+    crashes on a negative allgather pad or silently reads the wrong rank's
+    scratch rows. Inserts must refuse the graft instead."""
+
+    PS = 4  # tree quantum for these tests
+
+    def _tree_with_pools(self):
+        from unittest.mock import MagicMock
+
+        allocator = MagicMock()
+        allocator.device = torch.device("cpu")
+        req_to_token = torch.zeros(4, 64, dtype=torch.int64)
+        pool = MagicMock()
+        pool.req_to_token = req_to_token
+        pool.write = lambda idx, values: req_to_token.__setitem__(idx, values)
+        tree = RadixCache.create_simulated(
+            mock_allocator=allocator, page_size=self.PS
+        )
+        tree.req_to_token_pool = pool
+        return tree, allocator, req_to_token
+
+    def _seed_chain(self, tree, tokens, base):
+        tree.insert(
+            InsertParams(
+                key=RadixKey(array("q", tokens)),
+                value=torch.arange(1000, 1000 + len(tokens)),
+                rotation_base=base,
+            )
+        )
+
+    def test_foreign_base_tail_declined(self):
+        tree = RadixCache.create_simulated(page_size=self.PS)
+        self._seed_chain(tree, list(range(12)), base=1)
+        # Same 8-token prefix, different suffix, allocated under base 3.
+        key = RadixKey(array("q", list(range(8)) + [90, 91, 92, 93]))
+        res = tree.insert(
+            InsertParams(key=key, value=torch.arange(12), rotation_base=3)
+        )
+        self.assertTrue(res.rotation_tail_declined)
+        self.assertEqual(res.prefix_len, 8)
+        # The suffix is NOT cached: a full-key match stops at the seam.
+        m = tree.match_prefix(MatchPrefixParams(key=key))
+        self.assertEqual(len(m.device_indices), 8)
+
+    def test_same_base_tail_attaches(self):
+        tree = RadixCache.create_simulated(page_size=self.PS)
+        self._seed_chain(tree, list(range(12)), base=1)
+        key = RadixKey(array("q", list(range(8)) + [90, 91, 92, 93]))
+        res = tree.insert(
+            InsertParams(key=key, value=torch.arange(12), rotation_base=1)
+        )
+        self.assertFalse(res.rotation_tail_declined)
+        m = tree.match_prefix(MatchPrefixParams(key=key))
+        self.assertEqual(len(m.device_indices), 12)
+
+    def test_cache_unfinished_decline_keeps_request_on_own_pages(self):
+        tree, allocator, req_to_token = self._tree_with_pools()
+        self._seed_chain(tree, list(range(8)), base=1)
+        req = _GraftReq(list(range(8)) + [90, 91, 92, 93])
+        req.kv_rotation_base = 3
+        own_locs = torch.arange(500, 512, dtype=torch.int64)
+        req_to_token[0, :12] = own_locs
+        tree.cache_unfinished_req(req)
+        # No dedup free, no rebind: the request keeps its own locs whole.
+        allocator.free.assert_not_called()
+        self.assertTrue(torch.equal(req.prefix_indices, own_locs))
+        self.assertEqual(req.cache_protected_len, 0)
+        self.assertTrue(torch.equal(req_to_token[0, :12], own_locs))
+
+    def test_cache_finished_decline_frees_duplicates_and_suffix(self):
+        tree, allocator, req_to_token = self._tree_with_pools()
+        self._seed_chain(tree, list(range(8)), base=1)
+        req = _GraftReq(list(range(8)) + [90, 91, 92, 93])
+        req.kv_rotation_base = 3
+        own_locs = torch.arange(500, 512, dtype=torch.int64)
+        req_to_token[0, :12] = own_locs
+        tree.cache_finished_req(req, kv_len_to_handle=12)
+        freed = torch.cat(
+            [torch.as_tensor(c.args[0]) for c in allocator.free.call_args_list]
+        )
+        # Everything past the protected prefix is released: the duplicates of
+        # the matched region AND the declined tail (nothing leaks, nothing is
+        # grafted).
+        self.assertEqual(set(freed.tolist()), set(own_locs.tolist()))
+        m = tree.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", req.fill_ids)))
+        )
+        self.assertEqual(len(m.device_indices), 8)
+
+
 def _chain_pages(base, n_pages, local_start=5):
     """Logical page ids of one chain: page P has owner (base + P) % N and an
     arbitrary (here: increasing) local page on its owner."""
