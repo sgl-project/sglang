@@ -91,11 +91,7 @@ def _linear(
 ):
     tp_size = _tp_size()
     use_column_parallel = tp_size > 1 and out_features % tp_size == 0
-    if (
-        quant_config is None
-        and use_weight_only_fp8_linears
-        and get_global_server_args().original_dtype == "auto"
-    ):
+    if quant_config is None and use_weight_only_fp8_linears:
         if use_column_parallel:
             return WeightOnlyFP8ColumnParallelLinear(
                 in_features,
@@ -135,11 +131,7 @@ def _merged_column_linear(
         output_size % tp_size == 0 for output_size in output_sizes
     )
     out_features = sum(output_sizes)
-    if (
-        quant_config is None
-        and use_weight_only_fp8_linears
-        and get_global_server_args().original_dtype == "auto"
-    ):
+    if quant_config is None and use_weight_only_fp8_linears:
         if use_column_parallel:
             return WeightOnlyFP8MergedColumnParallelLinear(
                 in_features,
@@ -176,11 +168,7 @@ def _row_linear(
 ):
     tp_size = _tp_size()
     use_row_parallel = tp_size > 1 and in_features % tp_size == 0
-    if (
-        quant_config is None
-        and use_weight_only_fp8_linears
-        and get_global_server_args().original_dtype == "auto"
-    ):
+    if quant_config is None and use_weight_only_fp8_linears:
         if use_row_parallel:
             return WeightOnlyFP8RowParallelLinear(
                 in_features,
@@ -474,6 +462,8 @@ class Ideogram4Transformer2DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         super().__init__(config, hf_config, **kwargs)
         cfg = config.arch_config
         use_weight_only_fp8_linears = config.use_weight_only_fp8_linears
+        if get_global_server_args().original_dtype == "bfloat16":
+            use_weight_only_fp8_linears = False
         self._supported_attention_backends = cfg._supported_attention_backends
         hidden_size = cfg.num_attention_heads * cfg.attention_head_dim
         self.hidden_size = hidden_size
