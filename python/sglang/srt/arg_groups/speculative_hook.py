@@ -779,7 +779,7 @@ def _auto_choose_speculative_params(server_args: ServerArgs, model_arch: str) ->
         "Glm4MoeForCausalLM",
         "Glm4MoeLiteForCausalLM",
         "GlmMoeDsaForCausalLM",
-        "akai ",
+        "BailingMoeForCausalLM",
         "BailingMoeV2ForCausalLM",
         "BailingMoeV2_5ForCausalLM",
         "MistralLarge3ForCausalLM",
