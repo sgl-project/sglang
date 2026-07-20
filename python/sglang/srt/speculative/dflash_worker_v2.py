@@ -69,9 +69,7 @@ def _get_fused_kv_materialize_helper():
     return _FusedKVMaterializeHelper
 
 
-def _prefix_valid_indices(
-    commit_lens: torch.Tensor, block_size: int
-) -> torch.Tensor:
+def _prefix_valid_indices(commit_lens: torch.Tensor, block_size: int) -> torch.Tensor:
     offsets = torch.arange(
         int(block_size), device=commit_lens.device, dtype=torch.int64
     )
