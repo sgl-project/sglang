@@ -89,7 +89,10 @@ def maybe_set_default_flashinfer_gdn_prefill(model_runner: ModelRunner) -> None:
     )
 
     if is_flashinfer_gdn_prefill_available():
-        args.linear_attn_prefill_backend = "flashinfer"
+        args.override(
+            "gdn_backend.auto_select_flashinfer_prefill",
+            linear_attn_prefill_backend="flashinfer",
+        )
         rank0_log("Defaulting SM100 GDN prefill backend to FlashInfer.")
 
 

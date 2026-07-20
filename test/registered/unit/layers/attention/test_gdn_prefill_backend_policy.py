@@ -39,6 +39,9 @@ def make_runner(
         enable_dynamic_chunking=False,
         chunked_prefill_size=8192,
     )
+    args.override = MagicMock(
+        side_effect=lambda _source, **fields: vars(args).update(fields)
+    )
     for name, value in arg_overrides.items():
         setattr(args, name, value)
 
@@ -86,7 +89,12 @@ class TestFlashInferGDNPrefillBackendPolicy(unittest.TestCase):
         return runner.server_args.linear_attn_prefill_backend
 
     def test_selects_flashinfer_for_supported_sm100_gdn(self):
-        self.assertEqual(self.apply_policy(make_runner()), "flashinfer")
+        runner = make_runner()
+        self.assertEqual(self.apply_policy(runner), "flashinfer")
+        runner.server_args.override.assert_called_once_with(
+            "gdn_backend.auto_select_flashinfer_prefill",
+            linear_attn_prefill_backend="flashinfer",
+        )
 
     def test_selects_flashinfer_for_radix_cache_strategies(self):
         for strategy in ("no_buffer", "extra_buffer", "extra_buffer_lazy"):
