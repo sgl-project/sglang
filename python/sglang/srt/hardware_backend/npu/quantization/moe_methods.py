@@ -16,10 +16,8 @@ if TYPE_CHECKING:
 
 import logging
 
-from sglang.srt.hardware_backend.npu.moe.hidden_states_quant import (
-    HiddenStatesDynamicQuant,
-)
 from sglang.srt.hardware_backend.npu.moe.matmul import GroupedMatmul
+from sglang.srt.hardware_backend.npu.moe.quant import HiddenStatesDynamicQuant
 from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
     _get_float8_e8m0fnu_dtype,
 )
