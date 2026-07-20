@@ -4,6 +4,7 @@ from unittest.mock import Mock, patch
 
 import torch
 
+import sglang.srt.distributed.parallel_state as parallel_state
 import sglang.srt.layers.communicator as communicator
 import sglang.srt.layers.dp_attention as dp_attention
 from sglang.srt.layers.communicator import (
@@ -88,14 +89,14 @@ class TestCommunicatorZeroScatter(CustomTestCase):
         local_tokens.is_contiguous.return_value = True
         global_tokens = Mock()
         global_tokens.is_contiguous.return_value = True
-        device_group = object()
-        tp_group = SimpleNamespace(device_group=device_group)
+        tp_group = SimpleNamespace(unique_name="tp:0")
 
         with (
             patch.object(dp_attention, "get_dp_local_info", return_value=(0, 0)),
             patch.object(dp_attention, "world_dp_gather_enabled", return_value=False),
             patch.object(dp_attention, "get_tp_group", return_value=tp_group),
             patch.object(torch.distributed, "all_reduce") as all_reduce,
+            patch.object(parallel_state, "inplace_all_reduce") as inplace_all_reduce,
             patch.object(dp_attention, "zero_triton"),
         ):
             dp_attention._dp_gather_via_all_reduce(
@@ -106,7 +107,37 @@ class TestCommunicatorZeroScatter(CustomTestCase):
                 force_standard_all_reduce=True,
             )
 
-        all_reduce.assert_called_once_with(global_tokens, group=device_group)
+        inplace_all_reduce.assert_called_once_with(global_tokens, group_name="tp:0")
+        all_reduce.assert_not_called()
+
+    def test_inplace_all_reduce_uses_enabled_pynccl(self):
+        tensor = Mock()
+        pynccl_comm = Mock(disabled=False)
+        group = SimpleNamespace(
+            pynccl_comm=pynccl_comm,
+            torch_symm_mem_comm=None,
+            device_group=object(),
+        )
+
+        with patch.object(torch.distributed, "all_reduce") as all_reduce:
+            parallel_state.GroupCoordinator._all_reduce_in_place(group, tensor)
+
+        pynccl_comm.all_reduce.assert_called_once_with(tensor)
+        all_reduce.assert_not_called()
+
+    def test_inplace_all_reduce_keeps_eager_process_group_fallback(self):
+        tensor = Mock()
+        device_group = object()
+        group = SimpleNamespace(
+            pynccl_comm=Mock(disabled=True),
+            torch_symm_mem_comm=None,
+            device_group=device_group,
+        )
+
+        with patch.object(torch.distributed, "all_reduce") as all_reduce:
+            parallel_state.GroupCoordinator._all_reduce_in_place(group, tensor)
+
+        all_reduce.assert_called_once_with(tensor, group=device_group)
 
     def test_empty_dp_scatter_skips_device_work(self):
         local_tokens = Mock()
