@@ -5,7 +5,6 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.srt.distributed import (
-    get_tensor_model_parallel_rank,
     split_tensor_along_last_dim,
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
@@ -20,12 +19,14 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopKOutput
+from sglang.srt.layers.moe.utils import should_skip_mlp_all_reduce
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.utils import LoRABatchInfo, get_lm_head_lora_b_shard_size
+from sglang.srt.runtime_context import get_parallel
 
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 
@@ -389,7 +390,7 @@ class ParallelLMHeadWithLoRA(BaseLayerWithLoRA):
     def set_lm_head_pass(self, pass_idx: int):
         """Set the active lm_head pass index before a logprobs chunk.
 
-        Called by LogitsProcessor.process_input_logprobs_by_chunk() before
+        Called by InputLogprobProcessor._forward_by_chunk() before
         each chunk's _get_logits call.  _get_lm_head_batch_info() will
         resolve to lm_head_pass_batch_infos[pass_idx].
         """
@@ -713,7 +714,7 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
         if self.base_layer.input_is_parallel:
             input_parallel = input_
         else:
-            tp_rank = get_tensor_model_parallel_rank()
+            tp_rank = get_parallel().tp_rank
             splitted_input = split_tensor_along_last_dim(
                 input_, num_partitions=self.base_layer.tp_size
             )
@@ -732,6 +733,7 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
             self.base_layer.reduce_results
             and self.base_layer.tp_size > 1
             and not skip_all_reduce
+            and not should_skip_mlp_all_reduce()
         )
 
         if self.set_lora and should_reduce:

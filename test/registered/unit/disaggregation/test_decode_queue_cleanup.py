@@ -9,6 +9,7 @@ from sglang.srt.disaggregation.decode import (
     HiCacheRestoreResult,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.managers.schedule_batch import FINISH_ABORT
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -193,9 +194,9 @@ class TestDecodeQueueCleanup(CustomTestCase):
         scheduler.dllm_manager = MagicMock()
         scheduler.dllm_manager.any_staging_reqs.return_value = False
         scheduler.last_batch = None
-        scheduler.cur_batch = None
+        scheduler.cur_batch_for_debug = None
         scheduler.enable_overlap = False
-        scheduler.ps = SimpleNamespace(pp_size=1)
+        scheduler.ps = ParallelState.trivial()
         scheduler.running_mbs = []
         scheduler.waiting_queue = []
         scheduler.grammar_manager = SimpleNamespace(grammar_queue=[])

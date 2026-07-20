@@ -33,6 +33,7 @@ from sglang.srt.layers.attention.dsa.utils import (
     can_dsa_cp_split,
     dsa_use_prefill_cp,
     is_dsa_enable_prefill_cp,
+    is_dsa_prefill_cp_round_robin_split,
 )
 from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.layernorm import RMSNorm
@@ -59,8 +60,35 @@ from sglang.srt.models.deepseek_common.utils import enable_nextn_moe_bf16_cast_t
 from sglang.srt.models.deepseek_v2 import DeepseekV2DecoderLayer, DeepseekV3ForCausalLM
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.runtime_context import get_parallel, get_server_args
-from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import BumpAllocator, add_prefix, is_cuda, is_npu
+
+
+def _gather_dsa_topk_indices_for_cp(
+    topk_indices: torch.Tensor,
+    local_num_tokens: int,
+    cp_size: int,
+    forward_batch: ForwardBatch,
+    stream,
+) -> torch.Tensor:
+    if (
+        is_dsa_prefill_cp_round_robin_split()
+        and topk_indices.shape[0] < local_num_tokens
+    ):
+        pad_rows = local_num_tokens - topk_indices.shape[0]
+        topk_indices = torch.cat(
+            [
+                topk_indices,
+                topk_indices.new_full((pad_rows, topk_indices.shape[1]), -1),
+            ],
+            dim=0,
+        )
+    return cp_all_gather_rerange_output(
+        topk_indices,
+        cp_size,
+        forward_batch,
+        stream,
+    )
+
 
 logger = logging.getLogger(__name__)
 
@@ -120,7 +148,7 @@ class DeepseekModelNextN(nn.Module):
 
         self.rot_weight = None
         if _is_npu:
-            rot_weight_path = get_global_server_args().model_path + "/rot.safetensors"
+            rot_weight_path = get_server_args().model_path + "/rot.safetensors"
             if os.path.isfile(rot_weight_path):
                 self.rot_weight = load_file(rot_weight_path)
                 self.rot_weight = self.rot_weight["rot.weight"].npu()
@@ -133,8 +161,8 @@ class DeepseekModelNextN(nn.Module):
 
         layer_name = "decoder"
         if _is_npu and (
-            get_global_server_args().speculative_draft_model_path
-            == get_global_server_args().model_path
+            get_server_args().speculative_draft_model_path
+            == get_server_args().model_path
         ):
             layer_name = "layers." + str(config.num_hidden_layers)
 
@@ -224,13 +252,23 @@ class DeepseekModelNextN(nn.Module):
                 else:
                     hidden_states = self.eh_proj(eh_input)
 
-            if not is_cp_v2_active(forward_batch) and (
+            # CP-v2 shards/gathers at the eager-runner boundary instead.
+            use_cp_v1 = (
                 dsa_use_prefill_cp(forward_batch, self.dsa_enable_prefill_cp)
                 or mla_use_prefill_cp(forward_batch, self.mla_enable_prefill_cp)
-            ):
+            ) and not is_cp_v2_active(forward_batch)
+            if use_cp_v1:
                 hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
                 positions = cp_split_and_rebuild_position(forward_batch, positions)
             residual = None
+            seed_buf = (
+                forward_batch.spec_info.dsa_seed_topk_capture
+                if forward_batch.forward_mode.is_extend(include_draft_extend_v2=True)
+                else None
+            )
+            should_update_dsa_topk_indices = (
+                forward_batch.reuse_dsa_topk_indices or seed_buf is not None
+            )
             with get_global_expert_distribution_recorder().disable_this_region():
                 hidden_states, residual, topk_indices = self.decoder(
                     positions,
@@ -244,35 +282,39 @@ class DeepseekModelNextN(nn.Module):
                         else None
                     ),
                 )
-                if forward_batch.reuse_dsa_topk_indices:
-                    forward_batch.spec_info.dsa_topk_indices = topk_indices
-
-                # MTP IndexShare: on draft-extend, publish the last-token DSA
-                # indexer top-k to seed (avoid recomputing in) the draft-decode loop.
-                if forward_batch.forward_mode.is_extend(include_draft_extend_v2=True):
-                    seed_buf = forward_batch.spec_info.dsa_seed_topk_capture
-                    if seed_buf is not None and topk_indices is not None:
-                        sel = forward_batch.spec_info.dsa_seed_topk_select
-                        src = topk_indices if sel is None else topk_indices[sel]
-                        seed_buf[: src.shape[0]].copy_(src)
-
             if not forward_batch.forward_mode.is_idle():
                 if residual is not None:
                     hidden_states, _ = self.shared_head.norm(hidden_states, residual)
                 else:
                     hidden_states = self.shared_head.norm(hidden_states)
 
-                if not is_cp_v2_active(forward_batch) and (
-                    dsa_use_prefill_cp(forward_batch, self.dsa_enable_prefill_cp)
-                    or mla_use_prefill_cp(forward_batch, self.mla_enable_prefill_cp)
-                ):
-                    # allgather + rerrange
+                if use_cp_v1:
+                    local_num_tokens = hidden_states.shape[0]
                     hidden_states = cp_all_gather_rerange_output(
                         hidden_states,
                         self.cp_size,
                         forward_batch,
                         torch.cuda.current_stream(),
                     )
+                    if should_update_dsa_topk_indices and topk_indices is not None:
+                        topk_indices = _gather_dsa_topk_indices_for_cp(
+                            topk_indices,
+                            local_num_tokens,
+                            self.cp_size,
+                            forward_batch,
+                            torch.cuda.current_stream(),
+                        )
+            if should_update_dsa_topk_indices and topk_indices is not None:
+                if forward_batch.reuse_dsa_topk_indices:
+                    forward_batch.spec_info.dsa_topk_indices = topk_indices
+                if seed_buf is not None:
+                    sel = forward_batch.spec_info.dsa_seed_topk_select
+                    src = (
+                        topk_indices[: seed_buf.shape[0]]
+                        if sel is None
+                        else topk_indices[sel]
+                    )
+                    seed_buf[: src.shape[0]].copy_(src)
         finally:
             exit_stack.close()
 
@@ -289,6 +331,18 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
             "model.layers.61": "model.decoder",
         },
     )
+
+    def _resolve_nextn_quant_config(self, config, quant_config):
+        if quant_config is None or quant_config.get_name() != "quark":
+            return quant_config
+
+        from sglang.srt.layers.quantization.quark.utils import should_ignore_layer
+
+        ckpt_prefix = f"model.layers.{config.num_hidden_layers}"
+        mapped_prefix = self.hf_to_sglang_mapper._map_name(ckpt_prefix)
+        if should_ignore_layer(mapped_prefix, quant_config.exclude_layers):
+            return None
+        return quant_config
 
     def __init__(
         self,
@@ -313,17 +367,7 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
             self.cp_rank = None
             self.cp_size = None
 
-        nextn_quant_config = quant_config
-        # For quark, if the MTP layer is listed in exclude_layers, set quant_config to None.
-        if nextn_quant_config is not None and nextn_quant_config.get_name() == "quark":
-            from sglang.srt.layers.quantization.quark.utils import (
-                should_ignore_layer,
-            )
-
-            ckpt_prefix = f"model.layers.{config.num_hidden_layers}"
-            mapped_prefix = self.hf_to_sglang_mapper._map_name(ckpt_prefix)
-            if should_ignore_layer(mapped_prefix, nextn_quant_config.exclude_layers):
-                nextn_quant_config = None
+        nextn_quant_config = self._resolve_nextn_quant_config(config, quant_config)
 
         self.model = DeepseekModelNextN(
             config, nextn_quant_config, prefix=add_prefix("model", prefix)
