@@ -154,6 +154,9 @@ typedef struct {
   thread_config_t tb_cfg;
 } exec_config_t;
 
+constexpr int kSharedMemoryValidityMargin = 512;
+constexpr int kSharedMemoryLaunchReserve = 1024;
+
 int get_scales_cache_size(
     thread_config_t const& th_config,
     int prob_m,
@@ -285,7 +288,7 @@ bool is_valid_config(
       is_k_full,
       has_zp,
       is_zp_float);
-  return cache_size + 512 <= max_shared_mem;
+  return cache_size + kSharedMemoryValidityMargin <= max_shared_mem;
 }
 
 #define _GET_IF(                                                                                                       \
@@ -550,7 +553,9 @@ exec_config_t determine_exec_config(
     cudaFuncAttributes attr;
     cudaFuncGetAttributes(&attr, kernel);
     int reg_size = max(attr.numRegs, 1) * th_config.num_threads * 4;
-    int allow_count = min(device_max_reg_size / reg_size, max_shared_mem / (cache_size + 1024));
+    int allow_count =
+        min(device_max_reg_size / reg_size,
+            max_shared_mem / (cache_size + kSharedMemoryValidityMargin + kSharedMemoryLaunchReserve));
     allow_count = max(min(allow_count, thread_m_blocks == 1 ? 4 : 2), 1);
 
     if (thread_m_blocks > 1) {
@@ -732,7 +737,7 @@ void marlin_mm(
   thread_k = thread_tfg.thread_k;
   thread_n = thread_tfg.thread_n;
   int blocks = sms * exec_cfg.blocks_per_sm;
-  if (exec_cfg.blocks_per_sm > 1) max_shared_mem = max_shared_mem / exec_cfg.blocks_per_sm - 1024;
+  if (exec_cfg.blocks_per_sm > 1) max_shared_mem = max_shared_mem / exec_cfg.blocks_per_sm - kSharedMemoryLaunchReserve;
 
   int thread_k_blocks = thread_k / 16;
   int thread_n_blocks = thread_n / 16;
