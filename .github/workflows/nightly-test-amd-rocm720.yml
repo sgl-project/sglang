@@ -31,6 +31,8 @@ on:
           - nightly-test-1-gpu-unit-rocm720
           - nightly-test-1-gpu-kernel-rocm720
           - nightly-test-1-gpu-mi35x-rocm720
+          # Diagnostic: isolate the AITER CKTile cold-JIT build on MI35x
+          - aiter-cktile-jit-probe-rocm720
           # 2-GPU and 4-GPU Tests (MI30x + MI35x)
           - nightly-accuracy-2-gpu-rocm720
           - nightly-accuracy-2-gpu-vlm-rocm720
@@ -133,6 +135,145 @@ concurrency:
   cancel-in-progress: ${{ !inputs.ref && github.event_name != 'workflow_call' && github.event_name != 'workflow_dispatch' }}
 
 jobs:
+  # Diagnostic-only job. Unlike the nightly jobs below, this intentionally does
+  # not run for job_select=all; it must be selected explicitly.
+  aiter-cktile-jit-probe-rocm720:
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && contains(format(',{0},', inputs.job_filter || inputs.job_select), ',aiter-cktile-jit-probe-rocm720,')
+    name: AITER CKTile cold-JIT probe (${{ matrix.case_name }})
+    runs-on: linux-mi35x-gpu-1
+    timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - case_name: new-32
+            aiter_commit: 2174467dfb06ad885bb973aa73dd001222de1469
+            patch_preload: false
+          - case_name: new-16
+            aiter_commit: 2174467dfb06ad885bb973aa73dd001222de1469
+            patch_preload: true
+          - case_name: old-16
+            aiter_commit: 9127c94a18e4398e1eba91f6639e910f0994ad02
+            patch_preload: false
+    env:
+      AITER_COMMIT_OVERRIDE: ${{ matrix.aiter_commit }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
+
+      - name: Setup docker (ROCm 7.2)
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install selected AITER commit
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
+
+      - name: Restore kernarg preload count to 16
+        if: matrix.patch_preload
+        run: |
+          set -euo pipefail
+          docker exec ci_sglang bash -lc '
+            core=/sgl-workspace/aiter/aiter/jit/core.py
+            grep -Fq -- "--amdgpu-kernarg-preload-count=32" "$core"
+            sed -i "s/--amdgpu-kernarg-preload-count=32/--amdgpu-kernarg-preload-count=16/" "$core"
+            grep -n -- "amdgpu-kernarg-preload-count" "$core"
+          '
+
+      - name: Verify experiment inputs
+        run: |
+          set -euo pipefail
+          docker exec ci_sglang bash -lc '
+            git -C /sgl-workspace/aiter rev-parse HEAD
+            grep -n -- "amdgpu-kernarg-preload-count" /sgl-workspace/aiter/aiter/jit/core.py
+            python3 -c "import torch; print(torch.version.hip); print(torch.cuda.get_device_name(0))"
+          '
+
+      - name: Cold-build CKTile module with compiler heartbeat
+        id: probe
+        timeout-minutes: 30
+        env:
+          CASE_NAME: ${{ matrix.case_name }}
+        run: |
+          set -uo pipefail
+          module=module_gemm_a8w8_blockscale_bpreshuffle_cktile
+          probe_log="aiter-cktile-jit-${CASE_NAME}.log"
+
+          # The AITER checkout is fresh, but assert a cold module-specific state
+          # so image contents or a partial prior build cannot bias the result.
+          docker exec ci_sglang bash -lc "
+            rm -f /sgl-workspace/aiter/aiter/jit/${module}.so
+            rm -f /sgl-workspace/aiter/aiter/jit/build/lock_${module}
+            rm -rf /sgl-workspace/aiter/aiter/jit/build/${module}
+          "
+
+          started=$(date +%s)
+          docker exec \
+            -e GPU_ARCHS=gfx950 \
+            -e AITER_LOG_MORE=1 \
+            -e PROBE_CASE_NAME="${CASE_NAME}" \
+            ci_sglang \
+            timeout --signal=TERM --kill-after=60s 25m \
+            python3 -u /sglang-checkout/scripts/ci/amd/aiter_cktile_jit_probe.py \
+            >"${probe_log}" 2>&1 &
+          probe_pid=$!
+
+          while kill -0 "${probe_pid}" 2>/dev/null; do
+            now=$(date +%s)
+            echo "[heartbeat] case=${CASE_NAME} elapsed=$((now - started))s utc=$(date -u +%FT%TZ)"
+            tail -n 20 "${probe_log}" || true
+            docker exec ci_sglang bash -lc "
+              ps -eo pid,ppid,etimes,stat,pcpu,pmem,comm,args --sort=-pcpu \
+                | grep -E '[h]ipcc|[c]lang\\+\\+|[c]lang-[0-9]|[n]inja|aiter_cktile_jit_probe' \
+                | head -n 40 || true
+              find /sgl-workspace/aiter/aiter/jit/build/${module} \
+                -maxdepth 3 -type f -printf '%s %TY-%Tm-%TdT%TH:%TM:%TS %p\\n' 2>/dev/null \
+                | sort -nr | head -n 15 || true
+            "
+            sleep 60
+          done
+
+          set +e
+          wait "${probe_pid}"
+          probe_rc=$?
+          set -e
+          finished=$(date +%s)
+
+          echo "[result] case=${CASE_NAME} rc=${probe_rc} elapsed=$((finished - started))s"
+          cat "${probe_log}"
+          docker exec ci_sglang bash -lc "
+            ls -lh /sgl-workspace/aiter/aiter/jit/${module}.so 2>/dev/null || true
+            ps -eo pid,ppid,etimes,stat,pcpu,pmem,comm,args \
+              | grep -E '[h]ipcc|[c]lang\\+\\+|[c]lang-[0-9]|[n]inja|aiter_cktile_jit_probe' || true
+          "
+          exit "${probe_rc}"
+
+      - name: Upload probe log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: aiter-cktile-jit-${{ matrix.case_name }}
+          path: aiter-cktile-jit-${{ matrix.case_name }}.log
+          if-no-files-found: warn
+
+      - name: Summarize probe
+        if: always()
+        run: |
+          {
+            echo "### AITER CKTile cold-JIT probe"
+            echo "- case: \`${{ matrix.case_name }}\`"
+            echo "- AITER: \`${{ matrix.aiter_commit }}\`"
+            echo "- preload patched to 16: \`${{ matrix.patch_preload }}\`"
+            echo "- probe outcome: \`${{ steps.probe.outcome }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   # ============================================== MI30x ROCm 7.2 Unit Tests ==============================================
   # 1-GPU Unit Tests - LoRA, debug utils, scheduler, etc. (MI30x ROCm 7.2)
 
