@@ -127,6 +127,7 @@ class TritonAttnBackend(AttentionBackend):
         # Lazy import to avoid the initialization of cuda context
         from sglang.kernels.ops.attention.decode_attention import (
             decode_attention_fwd,
+            lean_decode_seqlen_gate,
         )
         from sglang.kernels.ops.attention.extend_attention import (
             build_unified_kv_indices,
@@ -140,6 +141,10 @@ class TritonAttnBackend(AttentionBackend):
         super().__init__()
 
         self.decode_attention_fwd = torch.compiler.disable(decode_attention_fwd)
+        # Work-Centric (Lean) Attention activation. None => auto-gate from host-side
+        # seqlen metadata in forward_decode; True/False => explicit override.
+        self.enable_lean_attention = model_runner.server_args.enable_lean_attention
+        self._lean_decode_seqlen_gate = lean_decode_seqlen_gate
         self.extend_attention_fwd = torch.compiler.disable(extend_attention_fwd)
         self.extend_attention_fwd_unified = torch.compiler.disable(
             extend_attention_fwd_unified
@@ -1772,6 +1777,25 @@ class TritonAttnBackend(AttentionBackend):
         ):
             attn_logits = self.forward_metadata.swa_attn_logits
 
+        # Resolve Work-Centric (Lean) Attention activation. In auto mode (None) decide
+        # from cheap host-side metadata (batch size, seq_lens_sum) whether the sequences
+        # are long enough for Lean to win; an explicit True/False override is respected.
+        # This keeps Lean off the short-context regime where it loses to the standard kernel.
+        # The SGLANG_DISABLE_LEAN_ATTENTION kill-switch forces the standard kernel regardless.
+        from sglang.srt import envs
+
+        if envs.SGLANG_DISABLE_LEAN_ATTENTION.get():
+            enable_lean = False
+        else:
+            enable_lean = self.enable_lean_attention
+            if enable_lean is None:
+                kv_group_num = layer.tp_q_head_num // layer.tp_k_head_num
+                enable_lean = self._lean_decode_seqlen_gate(
+                    kv_group_num,
+                    forward_batch.batch_size,
+                    forward_batch.seq_lens_sum,
+                )
+
         if self.dcp_size > 1:
             if score_mod is not None:
                 raise NotImplementedError(
@@ -1806,6 +1830,7 @@ class TritonAttnBackend(AttentionBackend):
                 logit_cap=logits_soft_cap,
                 sinks=sinks,
                 xai_temperature_len=layer.xai_temperature_len,
+                enable_lean=enable_lean,
             )
             local_lse = torch.logsumexp(
                 self.forward_metadata.attn_lse[
@@ -1838,6 +1863,7 @@ class TritonAttnBackend(AttentionBackend):
             page_size=self.page_size,
             score_mod=score_mod,
             aux_tensors=aux_tensors,
+            enable_lean=enable_lean,
         )
         return o
 
