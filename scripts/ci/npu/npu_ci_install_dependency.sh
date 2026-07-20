@@ -55,8 +55,7 @@ PTA_URL="https://gitcode.com/Ascend/pytorch/releases/download/v26.0.0-pytorch2.1
 ${PIP_INSTALL} ${PTA_URL}
 
 ### Install zbal
-${UV_PIP_INSTALL} memfabric-zbal==1.1.1
-
+${UV_PIP_INSTALL} memfabric-zbal==1.2.0
 ### Install Triton-Ascend
 ${PIP_INSTALL} "https://gitcode.com/Ascend/triton-ascend/releases/download/v3.2.1/triton_ascend-3.2.1-cp311-cp311-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl"
 
