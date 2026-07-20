@@ -1579,9 +1579,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_seq_lens = prefix_lens
             if batch.seq_lens_cpu is not None:
                 seq_lens_cpu.copy_(batch.seq_lens_cpu)
-                # Ascend TARGET_VERIFY metadata adds the verify block itself.
-                # Passing prefix + block here would make NPU add the block
-                # twice and expose uninitialized KV slots to draft attention.
+                # TARGET_VERIFY metadata adds the verify block itself on npu.
                 if not _is_npu:
                     seq_lens_cpu.add_(block_size)
                 draft_seq_lens_sum = int(seq_lens_cpu.sum())
@@ -1655,8 +1653,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         seq_lens_cpu_backup = batch.seq_lens_cpu
         seq_lens_sum_backup = batch.seq_lens_sum
         if seq_lens_cpu_backup is not None:
-            # Ascend's TARGET_VERIFY metadata adds block_size in place, so it
-            # must receive a private copy of the committed prefix lengths.
+            # TARGET_VERIFY metadata adds block_size in place on npu
             verify_host_seq_lens = (
                 seq_lens_cpu_backup.clone()
                 if _is_npu
