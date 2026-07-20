@@ -362,6 +362,8 @@ class DSparkDraftMixin:
 
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
+        self._fused_kv_write_cache = None
+        self.logits_mup_width_multiplier = None
         dspark_config = parse_dspark_draft_config(draft_hf_config=config)
         if not dspark_config.require_markov():
             raise ValueError(
@@ -382,11 +384,22 @@ class DSparkDraftMixin:
     def compute_base_logits(
         self, hidden: torch.Tensor
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Project the draft's raw final hidden through the target lm_head.
+
+        muP targets (Inkling) train the draft against a FOLDED head (weights
+        pre-divided by logits_mup_width_multiplier) while serving attaches the
+        target's unfolded head, so the division happens here — exactly once,
+        keeping base logits in the scale the markov bias and confidence head
+        were trained against. DSparkWorkerV2 wires the multiplier from the
+        target config; it stays None for non-muP targets.
+        """
         if self.lm_head is None:
             raise ValueError(
                 "DSpark dense draft requires the target lm_head "
                 "(call attach_shared_modules first)."
             )
+        if self.logits_mup_width_multiplier:
+            hidden = hidden / self.logits_mup_width_multiplier
         weight = self.lm_head.weight
         if hidden.dtype != weight.dtype:
             hidden = hidden.to(weight.dtype)
@@ -458,6 +471,77 @@ class DSparkDraftMixin:
                 f"or disable the confidence head (enable_confidence_head=False)."
             )
 
+    def _fused_kv_write_bundle(self, pool):
+        cached = self._fused_kv_write_cache
+        if cached is not None and cached[0] == id(pool):
+            return cached[1]
+        bundle = self._build_fused_kv_write_bundle(pool)
+        self._fused_kv_write_cache = (id(pool), bundle)
+        return bundle
+
+    def _build_fused_kv_write_bundle(self, pool):
+        from sglang.srt.speculative.dflash_utils import can_dflash_slice_qkv_weight
+
+        layers = list(self.layers)
+        if not layers:
+            return None
+        if not (hasattr(pool, "get_key_buffer") and hasattr(pool, "get_value_buffer")):
+            return None
+        attn0 = layers[0].self_attn
+        head_dim = attn0.head_dim
+        kv_size = attn0.kv_size
+        rotary = attn0.rotary_emb
+        if type(rotary).__name__ != "RotaryEmbedding":
+            return None
+        if not getattr(rotary, "is_neox_style", False):
+            return None
+        if getattr(rotary, "rotary_dim", None) != head_dim:
+            return None
+        eps = attn0.k_norm.variance_epsilon
+        weights, knws, meta_rows = [], [], []
+        for layer in layers:
+            attn = layer.self_attn
+            ok, _ = can_dflash_slice_qkv_weight(attn.qkv_proj)
+            if not ok:
+                return None
+            if attn.qkv_proj.bias is not None:
+                return None
+            if attn.attn.k_scale is not None or attn.attn.v_scale is not None:
+                return None
+            if attn.head_dim != head_dim or attn.kv_size != kv_size:
+                return None
+            if attn.rotary_emb is not rotary and not torch.equal(
+                attn.rotary_emb.cos_sin_cache, rotary.cos_sin_cache
+            ):
+                return None
+            if attn.k_norm.variance_epsilon != eps:
+                return None
+            k_buf = pool.get_key_buffer(attn.attn.layer_id)
+            v_buf = pool.get_value_buffer(attn.attn.layer_id)
+            nh = kv_size // head_dim
+            for buf in (k_buf, v_buf):
+                if buf.dtype != torch.bfloat16:
+                    return None
+                if buf.shape[1:] != (nh, head_dim):
+                    return None
+                if buf.stride(1) != head_dim or buf.stride(2) != 1:
+                    return None
+            kv_slice = slice(attn.q_size, attn.q_size + 2 * attn.kv_size)
+            w = attn.qkv_proj.weight[kv_slice]
+            if w.dtype != torch.bfloat16:
+                return None
+            weights.append(w)
+            knws.append(attn.k_norm.weight.data)
+            meta_rows.append(
+                [k_buf.data_ptr(), v_buf.data_ptr(), k_buf.stride(0), v_buf.stride(0)]
+            )
+        device = weights[0].device
+        w_all = torch.cat(weights, dim=0).contiguous()
+        knw = torch.stack(knws).to(device)
+        meta = torch.tensor(meta_rows, dtype=torch.int64, device=device)
+        cos_sin = rotary.cos_sin_cache.to(device)
+        return (w_all, meta, knw, cos_sin, eps, len(layers), kv_size, head_dim)
+
     def write_target_hidden_kv(
         self,
         *,
@@ -469,6 +553,41 @@ class DSparkDraftMixin:
         commit_lens: Optional[torch.Tensor] = None,
     ) -> None:
         ctx_hidden = self.project_target_hidden(target_hidden)
+
+        bundle = self._fused_kv_write_bundle(pool)
+        if bundle is not None:
+            import torch.nn.functional as F
+
+            from sglang.srt.speculative.dspark_components.kernels.fused_kv_write import (
+                fused_kv_norm_rope_write,
+            )
+
+            w_all, meta, knw, cos_sin, eps, num_layers, kv_size, head_dim = bundle
+            kv_all = F.linear(ctx_hidden, w_all)
+            if cache_loc_2d is not None and commit_lens is not None:
+                locs = cache_loc_2d.reshape(-1)
+                write_commit_lens = commit_lens
+                locs_row_width = cache_loc_2d.shape[1]
+            else:
+                locs = cache_loc
+                write_commit_lens = None
+                locs_row_width = None
+            fused_kv_norm_rope_write(
+                kv_all,
+                meta,
+                knw,
+                cos_sin,
+                positions,
+                locs,
+                num_layers,
+                kv_size,
+                head_dim,
+                eps,
+                commit_lens=write_commit_lens,
+                locs_row_width=locs_row_width,
+            )
+            return
+
         for layer in self.layers:
             attn = layer.self_attn
             k, v = attn.kv_proj_only(ctx_hidden)
@@ -506,4 +625,4 @@ class Qwen3DSparkModel(DSparkDraftModel):
     pass
 
 
-EntryClass = [Qwen3DSparkModel]
+EntryClass = [DSparkDraftModel, Qwen3DSparkModel]

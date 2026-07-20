@@ -354,13 +354,64 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 params.index("input_embeds") if "input_embeds" in params else None
             )
 
+        # Body-captured backends (BCG / Full) skip the model's forward() Python
+        # at replay, so a model whose aux-hidden handoff is a Python-side
+        # stash/pop (Inkling) never re-arms the stash there; tuple-returning
+        # aux models instead flow aux through the captured output. The stash
+        # protocol is supported on the full backend only: give the model one
+        # static aux buffer shared by every captured shape, and execute()
+        # re-arms the stash with a live-row view before the eager tail. The
+        # two unsupported quadrants fail loudly here instead of replaying
+        # stale or mis-sliced aux.
+        self.static_aux_hidden_states: Optional[torch.Tensor] = None
+        if (
+            not model_runner.is_draft_worker
+            and model_runner.spec_algorithm.is_dflash_family()
+            and self.layer_model is not None
+        ):
+            has_aux_stash = hasattr(self.layer_model, "set_aux_capture_static_buffer")
+            if self._is_full_backend and not has_aux_stash:
+                raise RuntimeError(
+                    "Full prefill CUDA graph with a dflash-family target "
+                    f"requires the aux stash protocol, which "
+                    f"{type(self.layer_model).__name__} does not expose. Use "
+                    "a different --cuda-graph-backend-prefill or disable the "
+                    "prefill CUDA graph."
+                )
+            if not self._is_full_backend and has_aux_stash:
+                raise RuntimeError(
+                    "Breakable prefill CUDA graph cannot re-arm "
+                    f"{type(self.layer_model).__name__}'s aux stash at replay. "
+                    "Use --cuda-graph-backend-prefill full or disable the "
+                    "prefill CUDA graph."
+                )
+            if self._is_full_backend and self.layer_model.num_aux_capture_layers > 0:
+                aux_width = (
+                    self.layer_model.num_aux_capture_layers
+                    * model_runner.model_config.hidden_size
+                )
+                with torch.device(self.device):
+                    self.static_aux_hidden_states = torch.zeros(
+                        (self.max_num_tokens, aux_width), dtype=model_runner.dtype
+                    )
+                self.layer_model.set_aux_capture_static_buffer(
+                    self.static_aux_hidden_states
+                )
+
         # --- aiter chip info pre-warming (AMD) -------------------------
         maybe_pre_warm_aiter_chip_info()
 
         # --- capture --------------------------------------------------
         self.device_module.synchronize()
         self.model_runner.tp_group.barrier()
-        self.capture()
+        try:
+            self.capture()
+        finally:
+            # Prefill graphs have baked the static aux buffer's address;
+            # detach it so later whole-graph captures (decode/verify) and
+            # eager forwards go back to per-forward allocation.
+            if self.static_aux_hidden_states is not None:
+                self.layer_model.set_aux_capture_static_buffer(None)
 
         self.raw_num_tokens = 0
         self.raw_bs = 0
@@ -1142,6 +1193,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # uses real request metadata instead of padded slots. BCG has no
         # request-slot padding, so static_forward_batch is already the serving batch.
         tail_batch = forward_batch if full_path else static_forward_batch
+        # The armed view aliases the shared buffer the next replay
+        # overwrites; the popped aux must be consumed before then.
+        if self.static_aux_hidden_states is not None:
+            self.layer_model.stash_aux_hidden_states(
+                self.static_aux_hidden_states[:raw_num_tokens]
+            )
         try:
             with self._prefill_forward_context(
                 static_forward_batch,

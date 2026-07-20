@@ -5,6 +5,7 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -53,7 +54,10 @@ from sglang.srt.speculative.dspark_components.dspark_verify import (
     TargetVerifyExecutor,
     verify_logits_adjustments_are_noop,
 )
-from sglang.srt.speculative.spec_utils import draft_tp_context
+from sglang.srt.speculative.spec_utils import (
+    commit_mamba_states_after_verify,
+    draft_tp_context,
+)
 from sglang.srt.utils import get_available_gpu_memory, is_cuda
 
 logger = logging.getLogger(__name__)
@@ -106,13 +110,27 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.draft_model_runner = bundle.draft_model_runner
         self.draft_model = bundle.draft_model
         self._draft_sampler = None
+        self._linear_accept_index_cache = None
 
+        # The mask token is input-only (it is embedded, never sampled), so its
+        # bound is the embedding-table row count: the PADDED vocab when the
+        # target pads its embedding (e.g. Inkling true vocab 200058, padded
+        # 201024, mask 200064), else the plain vocab size.
+        target_model_config = self.target_worker.model_runner.model_config
+        target_embed_rows = (
+            getattr(target_model_config.hf_text_config, "padded_vocab_size", None)
+            or target_model_config.vocab_size
+        )
+        # muP targets declare logits_mup_width_multiplier; the draft was
+        # trained against the folded head, so compute_base_logits divides.
+        self.draft_model.logits_mup_width_multiplier = getattr(
+            target_model_config.hf_text_config, "logits_mup_width_multiplier", None
+        )
+        self._target_is_mambaish = mambaish_config(target_model_config) is not None
         runtime_config = resolve_runtime_config(
             draft_hf_config=self.draft_model_runner.model_config.hf_config,
             speculative_num_draft_tokens=server_args.speculative_num_draft_tokens,
-            target_vocab_size=int(
-                self.target_worker.model_runner.model_config.vocab_size
-            ),
+            target_vocab_size=int(target_embed_rows),
         )
         self.gamma = runtime_config.gamma
         self.verify_num_draft_tokens = runtime_config.verify_num_draft_tokens
@@ -617,6 +635,29 @@ class DSparkWorkerV2(BaseSpecWorker):
                 on_publish(accept.new_seq_lens, confidence=confidence)
             else:
                 on_publish(accept.new_seq_lens)
+
+        # Mamba-hybrid targets: commit the last-accepted step's conv state into
+        # the persistent cache. Without this, the next verify round starts from
+        # the state after ALL verify_num_draft_tokens speculative tokens and its
+        # first conv_len rows compute on a poisoned conv window.
+        if self._target_is_mambaish:
+            dtn = self.verify_num_draft_tokens
+            cache = self._linear_accept_index_cache
+            if cache is None or cache.shape[0] < bs * dtn:
+                cache = torch.arange(
+                    max(bs, 64) * dtn,
+                    device=accept.commit_lens.device,
+                    dtype=torch.int64,
+                )
+                self._linear_accept_index_cache = cache
+            linear_accept_index = cache[: bs * dtn].view(bs, dtn)
+            commit_mamba_states_after_verify(
+                self.target_worker,
+                batch,
+                accept.commit_lens,
+                linear_accept_index,
+                dtn,
+            )
 
         folded_commit = folded_accept and epilogue.folds_commit
         if not folded_commit:

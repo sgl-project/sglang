@@ -505,6 +505,8 @@ class LogitsProcessor(nn.Module):
                 pruned_states = hidden_states
             pruned_states_before_norm = hidden_states_before_norm
             if aux_hidden_states is not None:
+                if torch.is_tensor(aux_hidden_states):
+                    aux_hidden_states = (aux_hidden_states,)
                 aux_pruned_states = [hidden for hidden in aux_hidden_states]
             sample_indices = None
             input_logprob_indices = None
@@ -519,6 +521,8 @@ class LogitsProcessor(nn.Module):
             if hidden_states_before_norm is not None:
                 pruned_states_before_norm = hidden_states_before_norm[last_index]
             if aux_hidden_states is not None:
+                if torch.is_tensor(aux_hidden_states):
+                    aux_hidden_states = (aux_hidden_states,)
                 aux_pruned_states = [hidden[last_index] for hidden in aux_hidden_states]
             sample_indices = None
             input_logprob_indices = None
@@ -551,6 +555,8 @@ class LogitsProcessor(nn.Module):
             input_logprob_indices_pt = 0
             input_logprob_indices = []
             pt, pruned_states_list, pruned_states_before_norm_list = 0, [], []
+            if aux_hidden_states is not None and torch.is_tensor(aux_hidden_states):
+                aux_hidden_states = (aux_hidden_states,)
             aux_pruned_states_lists = (
                 [[] for _ in aux_hidden_states]
                 if aux_hidden_states is not None
@@ -643,8 +649,10 @@ class LogitsProcessor(nn.Module):
         if logits_metadata.capture_hidden_mode.need_capture():
             if logits_metadata.capture_hidden_mode.is_full():
                 if aux_hidden_states is not None:
-                    aux_hidden_states = torch.cat(aux_hidden_states, dim=-1)
-                    hidden_states_to_store = aux_hidden_states
+                    if torch.is_tensor(aux_hidden_states):
+                        hidden_states_to_store = aux_hidden_states
+                    else:
+                        hidden_states_to_store = torch.cat(aux_hidden_states, dim=-1)
                 else:
                     hidden_states_to_store = hidden_states
                 hidden_states_to_store_before_norm = hidden_states_before_norm
@@ -652,7 +660,11 @@ class LogitsProcessor(nn.Module):
                 # Get the last token hidden states. If sample_indices is None,
                 # pruned states only contain the last tokens already.
                 if aux_hidden_states is not None:
-                    aux_pruned_states = torch.cat(aux_pruned_states, dim=-1)
+                    aux_pruned_states = (
+                        aux_pruned_states[0]
+                        if len(aux_pruned_states) == 1
+                        else torch.cat(aux_pruned_states, dim=-1)
+                    )
                     hidden_states_to_store = (
                         aux_pruned_states[sample_indices]
                         if sample_indices is not None
