@@ -474,9 +474,32 @@ def _get_precomputed_embedding(
     return None
 
 
+# A modality's embedding function. May return the combined [tokens, hidden]
+# tensor, an EVSEmbeddingResult, or one tensor per input item. The per-item
+# form lets encoders that naturally produce per-item outputs (e.g. a wav
+# AutoEncoder looping over clips) skip an encoder-side torch.cat that
+# per-item consumers (_get_chunked_embedding_by_item) would immediately
+# split back apart — and each cached entry then owns its storage instead of
+# being a view pinning the concatenated buffer.
 DataEmbeddingFunc = Callable[
-    [List[MultimodalDataItem]], torch.Tensor | EVSEmbeddingResult
+    [List[MultimodalDataItem]],
+    torch.Tensor | List[torch.Tensor] | EVSEmbeddingResult,
 ]
+
+
+def _flatten_embedding_result(
+    embedding: torch.Tensor | List[torch.Tensor],
+) -> torch.Tensor:
+    """Normalize a DataEmbeddingFunc result to one [tokens, hidden] tensor."""
+    if isinstance(embedding, list):
+        if not embedding:
+            raise ValueError(
+                "DataEmbeddingFunc returned an empty per-item list; expected "
+                "one entry per input item"
+            )
+        flat = [e.reshape(-1, e.shape[-1]) for e in embedding]
+        return flat[0] if len(flat) == 1 else torch.cat(flat, dim=0)
+    return embedding
 
 
 def _can_skip_pre_embed_feature_move(data_embedding_func: DataEmbeddingFunc) -> bool:
@@ -553,6 +576,10 @@ def _get_chunked_embedding_full(
         if not _can_skip_pre_embed_feature_move(data_embedding_func):
             _move_items_to_device(embedding_items_per_req, device)
         embedding = data_embedding_func(embedding_items_per_req)
+        if isinstance(embedding, list):
+            # This path caches the combined per-request embedding, so the
+            # per-item form is flattened here.
+            embedding = _flatten_embedding_result(embedding)
         embedding_per_req = (
             EmbeddingResult(embedding=embedding)
             if isinstance(embedding, torch.Tensor)
@@ -700,12 +727,25 @@ def _get_chunked_embedding_by_item(
         if not _can_skip_pre_embed_feature_move(data_embedding_func):
             _move_items_to_device(miss_item_list, device)
         all_miss_embedding = data_embedding_func(miss_item_list)
-        all_miss_embedding = all_miss_embedding.reshape(
-            -1, all_miss_embedding.shape[-1]
-        )
 
-        token_counts = [end - start + 1 for _, _, start, end in miss_items]
-        split_embeddings = torch.split(all_miss_embedding, token_counts, dim=0)
+        if isinstance(all_miss_embedding, list):
+            # Per-item embeddings: no split needed, and each cache entry owns
+            # its storage (a torch.split view would pin the whole concatenated
+            # buffer for as long as any single item stays cached).
+            assert len(all_miss_embedding) == len(miss_items), (
+                f"per-item embedding count {len(all_miss_embedding)} != "
+                f"cache-miss item count {len(miss_items)}"
+            )
+            split_embeddings = [
+                emb.reshape(-1, emb.shape[-1]) for emb in all_miss_embedding
+            ]
+        else:
+            all_miss_embedding = all_miss_embedding.reshape(
+                -1, all_miss_embedding.shape[-1]
+            )
+            # Split output by per-item token count
+            token_counts = [end - start + 1 for _, _, start, end in miss_items]
+            split_embeddings = torch.split(all_miss_embedding, token_counts, dim=0)
 
         for (idx, item, _, _), emb in zip(miss_items, split_embeddings):
             cached_embeddings[idx] = emb
