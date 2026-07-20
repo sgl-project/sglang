@@ -2800,6 +2800,29 @@ class Scheduler(
         req_to_abort.time_stats.trace_ctx.abort(abort_info={"reason": message})
         return req_to_abort.rid == recv_req.rid
 
+    def _finalize_queued_session_turn(self, req: Req) -> bool:
+        """Finalize a streaming-session turn removed before it ever ran.
+
+        Returns whether the request's req-pool/KV/Mamba state is on loan from
+        the session's slot, in which case the caller must not release it.
+
+        The turn produced nothing, so it must not reach `Session.finish_req`
+        and become committed history: leaving `req_nodes` and the committed
+        lengths untouched is what lets the next turn's `_share_token_arrays`
+        trim the aborted prompt back off. `req.session` deliberately stays
+        attached so that any later cleanup keeps routing through
+        `StreamingSession` instead of the raw cache, which would free state the
+        slot still owns.
+        """
+        session = req.session
+        if session is None:
+            return False
+        # `SessionSlot.restore_to_req` is the only way a queued request holds a
+        # req-pool slot, and it lends the slot's state rather than handing it over.
+        slot_owned_state = req.req_pool_idx is not None
+        session.abort_req()
+        return slot_owned_state
+
     def _abort_on_waiting_timeout(self):
         if (timeout_s := envs.SGLANG_REQ_WAITING_TIMEOUT.get()) <= 0:
             return
@@ -2812,6 +2835,7 @@ class Scheduler(
                 if self.enable_hicache_storage:
                     # Release prefetch events associated with the request
                     self.tree_cache.release_aborted_request(req.rid)
+                self._finalize_queued_session_turn(req)
                 self.ipc_channels.send_to_tokenizer.send_output(
                     AbortReq(
                         finished_reason={
@@ -4439,6 +4463,7 @@ class Scheduler(
             if self.enable_hicache_storage:
                 # to release prefetch events associated with the request
                 self.tree_cache.release_aborted_request(req.rid)
+            slot_owned_state = self._finalize_queued_session_turn(req)
             self.ipc_channels.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
             # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
             if self.disaggregation_mode == DisaggregationMode.DECODE:
@@ -4457,9 +4482,12 @@ class Scheduler(
                     if hasattr(req.disagg_kv_sender, "abort"):
                         req.disagg_kv_sender.abort()
 
-            # For mamba radix cache
+            # For mamba radix cache. Skip state on loan from a session slot:
+            # the slot keeps owning it for the next turn, and releasing would
+            # commit this turn through StreamingSession.cache_finished_req.
             if (
                 req.mamba_pool_idx is not None
+                and not slot_owned_state
                 and self.disaggregation_mode != DisaggregationMode.DECODE
             ):
                 release_kv_cache(req, self.tree_cache, is_insert=False)
