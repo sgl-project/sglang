@@ -589,20 +589,24 @@ class HybridCacheController(BaseHiCacheController):
         )
         return producer_id
 
-    def _load_mla_on_src_rank(self, op: CacheOperation) -> None:
-        """Src-rank H2D including the extra pool transfers (DSA indexer)."""
-        host_indices, device_indices, resolved_pool_transfers = (
-            self.move_hybrid_indices(op)
+    def _prepare_mla_source_load(self, op: CacheOperation):
+        """Resolve target and extra-pool indices once for layerwise H2D."""
+        return self.move_hybrid_indices(op)
+
+    def _load_mla_source_layer(self, source_state, layer_id: int) -> None:
+        """Load one target layer and its corresponding extra-pool data."""
+        host_indices, device_indices, resolved_pool_transfers = source_state
+        self.mem_pool_host.load_to_device_per_layer(
+            self.mem_pool_device,
+            host_indices,
+            device_indices,
+            layer_id,
+            self.io_backend,
+            pool_transfers=resolved_pool_transfers,
         )
-        for i in range(self.layer_num):
-            self.mem_pool_host.load_to_device_per_layer(
-                self.mem_pool_device,
-                host_indices,
-                device_indices,
-                i,
-                self.io_backend,
-                pool_transfers=resolved_pool_transfers,
-            )
+
+    def _record_mla_source_load(self, source_state) -> None:
+        host_indices, device_indices, resolved_pool_transfers = source_state
         self._record_transfer_indices_on_stream(
             self.load_stream,
             host_indices,

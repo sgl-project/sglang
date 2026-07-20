@@ -84,8 +84,14 @@ def is_mla_dedup_dummy_rank(
 
 class MLAHostDedupBroadcaster:
     """Broadcasts host-loaded MLA KV (and DSA indexer) device pages from the
-    src rank to its attn-TP peers, over a dedicated NCCL group, coalescing
-    all layers of one token chunk into a reused staging buffer."""
+    src rank to its attn-TP peers over a dedicated NCCL group.
+
+    Layers are broadcast one at a time so the controller can release each
+    layer to the model as soon as its H2D + broadcast finishes.  The staging
+    allocation retains the old all-layer size and is reinterpreted as a larger
+    per-layer token chunk.  Consequently, layerwise mode does not multiply the
+    NCCL call count by ``layer_num`` for large loads.
+    """
 
     # Tokens (or DSA indexer pages) staged per broadcast chunk.
     CHUNK_TOKENS = 512
@@ -140,20 +146,17 @@ class MLAHostDedupBroadcaster:
         )
         return cls(device_pool, group, src_global_rank=group_ranks[0])
 
-    def broadcast_loaded(self, device_indices: torch.Tensor, load_stream) -> None:
-        """Broadcast loaded pages from the src rank. Must run with
-        ``load_stream`` as the current stream."""
+    def prepare_broadcast(
+        self, device_indices: torch.Tensor, load_stream
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Prepare reusable KV/indexer indices for one layerwise load."""
         indices = device_indices
         if not indices.is_cuda:
             indices = indices.to(self.device)
         if indices.is_cuda:
             indices.record_stream(load_stream)
-        self._bcast_rows(
-            self.device_pool.kv_buffer,
-            self.kv_staging,
-            indices,
-            self.device_pool.kv_cache_dim,
-        )
+
+        page_idx = None
         if self.idx_bufs is not None:
             page_size = self.device_pool.page_size
             page_idx = (
@@ -163,29 +166,110 @@ class MLAHostDedupBroadcaster:
             )
             if page_idx.is_cuda:
                 page_idx.record_stream(load_stream)
-            self._bcast_rows(self.idx_bufs, self.idx_staging, page_idx, self.idx_elem)
+        return indices, page_idx
 
-    def _bcast_rows(self, buf_list, staging, target, elem) -> None:
-        """Chunked broadcast of one per-layer buffer set; ``target`` indexes
-        dim 0 (token indices for KV, page indices for the DSA indexer)."""
+    def broadcast_loaded_layer(
+        self,
+        layer_id: int,
+        prepared: tuple[torch.Tensor, Optional[torch.Tensor]],
+        trace=None,
+    ) -> None:
+        """Broadcast one loaded KV layer and its optional DSA indexer layer."""
+        indices, page_idx = prepared
+        self._bcast_layer(
+            self.device_pool.kv_buffer,
+            self.kv_staging,
+            indices,
+            self.device_pool.kv_cache_dim,
+            layer_id,
+            trace=trace,
+            trace_prefix="kv",
+        )
+        if self.idx_bufs is not None:
+            assert page_idx is not None
+            self._bcast_layer(
+                self.idx_bufs,
+                self.idx_staging,
+                page_idx,
+                self.idx_elem,
+                layer_id,
+                trace=trace,
+                trace_prefix="indexer",
+            )
+
+    def _bcast_layer(
+        self,
+        buf_list,
+        staging,
+        target,
+        elem,
+        layer_id: int,
+        trace=None,
+        trace_prefix: str = "kv",
+    ) -> None:
+        """Chunked in-place broadcast for one layer.
+
+        ``staging`` is sized for ``layer_num * CHUNK_TOKENS`` rows.  Reusing
+        the full allocation for one layer preserves the previous maximum NCCL
+        payload size while enabling per-layer completion events.  ``index_select``
+        with an output tensor and ``index_copy_`` avoid the temporary tensors
+        created by advanced indexing in the original all-layer implementation.
+        """
         n = target.shape[0]
-        for start in range(0, n, self.CHUNK_TOKENS):
-            cur = min(self.CHUNK_TOKENS, n - start)
+        rows_per_chunk = staging.numel() // elem
+        assert rows_per_chunk > 0
+        layer_buf = buf_list[layer_id]
+        row_shape = layer_buf.shape[1:]
+
+        for start in range(0, n, rows_per_chunk):
+            cur = min(rows_per_chunk, n - start)
             idx = target[start : start + cur]
-            chunk = staging[: self.layer_num * cur * elem]
+            chunk = staging[: cur * elem]
+            chunk_rows = chunk.view(cur, *row_shape)
             if self.is_src:
-                for layer_id in range(self.layer_num):
-                    o = layer_id * cur * elem
-                    chunk[o : o + cur * elem].copy_(buf_list[layer_id][idx].reshape(-1))
+                pack_start = self._trace_event(trace)
+                torch.index_select(layer_buf, 0, idx, out=chunk_rows)
+                self._finish_trace_phase(
+                    trace,
+                    f"{trace_prefix}_pack",
+                    pack_start,
+                    chunk.numel() * chunk.element_size(),
+                )
+            nccl_start = self._trace_event(trace)
             torch.distributed.broadcast(
                 chunk, src=self.src_global_rank, group=self.group
             )
+            self._finish_trace_phase(
+                trace,
+                f"{trace_prefix}_nccl",
+                nccl_start,
+                chunk.numel() * chunk.element_size(),
+            )
             if not self.is_src:
-                for layer_id in range(self.layer_num):
-                    o = layer_id * cur * elem
-                    buf_list[layer_id][idx] = chunk[o : o + cur * elem].view(
-                        buf_list[layer_id][idx].shape
-                    )
+                scatter_start = self._trace_event(trace)
+                layer_buf.index_copy_(0, idx, chunk_rows)
+                self._finish_trace_phase(
+                    trace,
+                    f"{trace_prefix}_scatter",
+                    scatter_start,
+                    chunk.numel() * chunk.element_size(),
+                )
+
+    @staticmethod
+    def _trace_event(trace):
+        if trace is None:
+            return None
+        event = torch.cuda.Event(enable_timing=True)
+        event.record()
+        return event
+
+    @staticmethod
+    def _finish_trace_phase(trace, name: str, start, num_bytes: int) -> None:
+        if trace is None:
+            return
+        end = torch.cuda.Event(enable_timing=True)
+        end.record()
+        trace["events"].append((name, start, end, num_bytes))
 
     def destroy(self) -> None:
         if self.group is None:

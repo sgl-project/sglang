@@ -14,8 +14,10 @@ limitations under the License.
 """
 
 import logging
+import os
 import threading
 import time
+from collections import defaultdict
 from functools import cache
 from queue import Empty, Queue
 from typing import TYPE_CHECKING, List, NamedTuple, Optional
@@ -956,75 +958,240 @@ class HiCacheController:
         return producer_id
 
     def _start_loading_mla(self, producer_id: int, op: CacheOperation) -> int:
-        """Load on the dedup src rank, then broadcast to the peers.
-
-        Both are enqueued on ``load_stream``, so the per-layer load events
-        fire when the stream drains and the normal ack path finalizes.
-        """
+        """Layerwise H2D on the dedup source followed by layerwise broadcast."""
+        self._log_ready_mla_traces()
         producer_event = self.layer_done_counter.events[producer_id]
         producer_event.start_event.record()
 
+        ack_start_event, ack_finish_event, timing_enabled = make_timing_event_pair()
+
         with device_module.stream(self.load_stream):
             producer_event.start_event.wait(self.load_stream)
-            if self.mla_broadcaster.is_src:
-                self._load_mla_on_src_rank(op)
-                # "direct" may issue H2D off load_stream; land it fully
-                # before the broadcast reads the device KV buffer.
-                self.load_stream.synchronize()
+            ack_start_event.record()
+            trace = self._begin_mla_trace(op)
+            broadcast_plan = self.mla_broadcaster.prepare_broadcast(
+                op.device_indices, self.load_stream
+            )
 
-            self.mla_broadcaster.broadcast_loaded(op.device_indices, self.load_stream)
-            self._load_draft_on_all_ranks(op)
+            source_state = None
+            if self.mla_broadcaster.is_src:
+                source_state = self._prepare_mla_source_load(op)
+            draft_state = self._prepare_draft_load(op)
+
             for i in range(self.layer_num):
+                if source_state is not None:
+                    h2d_start = self._mla_trace_event(trace)
+                    self._load_mla_source_layer(source_state, i)
+                    self._finish_mla_trace_phase(trace, "h2d", h2d_start)
+
+                # H2D, staging gather, NCCL broadcast, and receiver scatter are
+                # all enqueued on load_stream.  Recording the layer event below
+                # therefore makes this layer visible to the forward stream while
+                # later layers continue loading.
+                broadcast_start = self._mla_trace_event(trace)
+                if trace is None:
+                    self.mla_broadcaster.broadcast_loaded_layer(i, broadcast_plan)
+                else:
+                    self.mla_broadcaster.broadcast_loaded_layer(
+                        i, broadcast_plan, trace=trace
+                    )
+                self._finish_mla_trace_phase(trace, "broadcast_total", broadcast_start)
+                if draft_state is not None:
+                    draft_start = self._mla_trace_event(trace)
+                    self._load_draft_layer(draft_state, i)
+                    self._finish_mla_trace_phase(trace, "draft_h2d", draft_start)
+
+                # A draft can theoretically contain more layers than the target.
+                # Preserve the previous dedup path's all-draft completion guarantee
+                # by placing any tail before the final target-layer event.
+                if i == self.layer_num - 1 and draft_state is not None:
+                    for draft_layer_id in range(
+                        self.layer_num, self.mem_pool_host_draft.layer_num
+                    ):
+                        draft_start = self._mla_trace_event(trace)
+                        self._load_draft_layer(draft_state, draft_layer_id)
+                        self._finish_mla_trace_phase(trace, "draft_h2d", draft_start)
                 producer_event.complete(i)
+                if trace is not None:
+                    layer_ready = device_module.Event(enable_timing=True)
+                    layer_ready.record()
+                    trace["layer_ready"].append(layer_ready)
+
+            if source_state is not None:
+                self._record_mla_source_load(source_state)
+            self._record_draft_load(draft_state)
+            ack_finish_event.record()
+            if trace is not None:
+                trace["finish"] = device_module.Event(enable_timing=True)
+                trace["finish"].record()
+                trace["cpu_submit_end"] = time.perf_counter()
+                self._mla_trace_pending.append(trace)
 
         self.ack_load_queue.append(
             HiCacheAck(
-                start_event=producer_event.start_event,
-                finish_event=producer_event.finish_event,
+                start_event=ack_start_event,
+                finish_event=ack_finish_event,
                 node_ids=op.node_ids,
+                num_tokens=len(op.device_indices),
+                timing_enabled=timing_enabled,
             )
         )
         return producer_id
 
-    def _load_mla_on_src_rank(self, op: CacheOperation) -> None:
-        """Src-rank H2D; subclasses override to add their pool transfers."""
-        host_indices, device_indices = self.move_indices(
-            op.host_indices, op.device_indices
-        )
-        for i in range(self.layer_num):
-            self.mem_pool_host.load_to_device_per_layer(
-                self.mem_pool_device,
-                host_indices,
-                device_indices,
-                i,
-                self.io_backend,
+    def _begin_mla_trace(self, op: CacheOperation):
+        """Create a bounded, asynchronous CUDA-event trace for MLA dedup."""
+        if os.environ.get("SGLANG_MLA_DEDUP_TRACE", "0") != "1":
+            return None
+        issued = getattr(self, "_mla_trace_issued", 0)
+        limit = int(os.environ.get("SGLANG_MLA_DEDUP_TRACE_LIMIT", "20"))
+        if issued >= limit:
+            return None
+        self._mla_trace_issued = issued + 1
+        if not hasattr(self, "_mla_trace_pending"):
+            self._mla_trace_pending = []
+        start = device_module.Event(enable_timing=True)
+        start.record()
+        return {
+            "id": issued,
+            "tokens": int(op.device_indices.numel()),
+            "start": start,
+            "finish": None,
+            "layer_ready": [],
+            "events": [],
+            "cpu_submit_start": time.perf_counter(),
+        }
+
+    @staticmethod
+    def _mla_trace_event(trace):
+        if trace is None:
+            return None
+        event = device_module.Event(enable_timing=True)
+        event.record()
+        return event
+
+    @staticmethod
+    def _finish_mla_trace_phase(trace, name: str, start, num_bytes: int = 0):
+        if trace is None:
+            return
+        end = device_module.Event(enable_timing=True)
+        end.record()
+        trace["events"].append((name, start, end, num_bytes))
+
+    def _log_ready_mla_traces(self) -> None:
+        pending = getattr(self, "_mla_trace_pending", None)
+        if not pending:
+            return
+
+        remaining = []
+        for trace in pending:
+            finish = trace["finish"]
+            if finish is None or not finish.query():
+                remaining.append(trace)
+                continue
+
+            phase_ms = defaultdict(float)
+            phase_calls = defaultdict(int)
+            phase_bytes = defaultdict(int)
+            for name, start, end, num_bytes in trace["events"]:
+                phase_ms[name] += start.elapsed_time(end)
+                phase_calls[name] += 1
+                phase_bytes[name] += num_bytes
+
+            layer_ready = trace["layer_ready"]
+            first_layer_ms = (
+                trace["start"].elapsed_time(layer_ready[0]) if layer_ready else 0.0
             )
+            total_ms = trace["start"].elapsed_time(finish)
+            cpu_submit_ms = (trace["cpu_submit_end"] - trace["cpu_submit_start"]) * 1000
+            role = "src" if self.mla_broadcaster.is_src else "peer"
+            rank = (
+                torch.distributed.get_rank()
+                if torch.distributed.is_initialized()
+                else 0
+            )
+            phases = ",".join(
+                f"{name}={phase_ms[name]:.3f}ms/{phase_calls[name]}calls/"
+                f"{phase_bytes[name] / (1024 * 1024):.1f}MiB"
+                for name in sorted(phase_ms)
+            )
+            logger.info(
+                "[MLA_DEDUP_TRACE] id=%d rank=%d role=%s tokens=%d "
+                "first_layer_ms=%.3f total_ms=%.3f cpu_submit_ms=%.3f phases=%s",
+                trace["id"],
+                rank,
+                role,
+                trace["tokens"],
+                first_layer_ms,
+                total_ms,
+                cpu_submit_ms,
+                phases,
+            )
+
+        self._mla_trace_pending = remaining
+
+    def _prepare_mla_source_load(
+        self, op: CacheOperation
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Resolve source-rank indices once for the layerwise H2D loop."""
+        return self.move_indices(op.host_indices, op.device_indices)
+
+    def _load_mla_source_layer(
+        self, source_state: tuple[torch.Tensor, torch.Tensor], layer_id: int
+    ) -> None:
+        """Load one target layer on the dedup source rank."""
+        host_indices, device_indices = source_state
+        self.mem_pool_host.load_to_device_per_layer(
+            self.mem_pool_device,
+            host_indices,
+            device_indices,
+            layer_id,
+            self.io_backend,
+        )
+
+    def _record_mla_source_load(
+        self, source_state: tuple[torch.Tensor, torch.Tensor]
+    ) -> None:
+        host_indices, device_indices = source_state
         if host_indices.is_cuda:
             host_indices.record_stream(self.load_stream)
         if device_indices.is_cuda:
             device_indices.record_stream(self.load_stream)
 
-    def _load_draft_on_all_ranks(self, op: CacheOperation) -> None:
-        """Restore locally-owned draft KV after the target MLA broadcast.
+    def _prepare_draft_load(
+        self, op: CacheOperation
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+        """Resolve locally owned draft indices once on every attention-TP rank.
 
         MLA host dedup is valid only for the target pool. The draft pool remains
         a complete, per-rank L2 cache because its KV layout may be TP-sharded.
-        This method intentionally runs on every attention-TP rank.
         """
         if not self.has_draft:
-            return
+            return None
 
-        host_indices, device_indices = self.move_indices(
-            op.host_indices, op.device_indices
+        return self.move_indices(op.host_indices, op.device_indices)
+
+    def _load_draft_layer(
+        self,
+        draft_state: Optional[tuple[torch.Tensor, torch.Tensor]],
+        layer_id: int,
+    ) -> None:
+        if draft_state is None or layer_id >= self.mem_pool_host_draft.layer_num:
+            return
+        host_indices, device_indices = draft_state
+        self.mem_pool_host_draft.load_to_device_per_layer(
+            self.mem_pool_device_draft,
+            host_indices,
+            device_indices,
+            layer_id,
+            self.io_backend,
         )
-        for i in range(self.mem_pool_host_draft.layer_num):
-            self.mem_pool_host_draft.load_to_device_per_layer(
-                self.mem_pool_device_draft,
-                host_indices,
-                device_indices,
-                i,
-                self.io_backend,
-            )
+
+    def _record_draft_load(
+        self, draft_state: Optional[tuple[torch.Tensor, torch.Tensor]]
+    ) -> None:
+        if draft_state is None:
+            return
+        host_indices, device_indices = draft_state
         if host_indices.is_cuda:
             host_indices.record_stream(self.load_stream)
         if device_indices.is_cuda:
