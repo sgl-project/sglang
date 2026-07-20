@@ -1,0 +1,382 @@
+"""FlexKV adapter for SGLang's component-based hybrid radix cache."""
+
+from __future__ import annotations
+
+import logging
+import threading
+from array import array
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Optional
+
+import torch
+
+from sglang.srt.mem_cache.allocator.hisparse import (
+    DeepSeekV4HiSparseTokenToKVPoolAllocator,
+)
+from sglang.srt.mem_cache.base_prefix_cache import (
+    BasePrefixCache,
+    DecLockRefParams,
+    EvictParams,
+    EvictResult,
+    IncLockRefResult,
+    InitLoadBackParams,
+    MatchPrefixParams,
+    MatchResult,
+)
+from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.storage.flexkv.flexkv_connector import FlexKVConnector
+
+if TYPE_CHECKING:
+    from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+    from sglang.srt.server_args import ServerArgs
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class _LoadMarker:
+    key: RadixKey
+    device_length: int
+
+
+class FlexKVHybridRadixCache(BasePrefixCache):
+    """Compose FlexKV I/O with an existing hybrid radix implementation.
+
+    The inner cache remains the sole owner of radix/SWA bookkeeping. FlexKV
+    only restores request-owned slots; the normal cache_finished_req path then
+    inserts those slots with the same component semantics as fresh prefill.
+    """
+
+    def __init__(
+        self,
+        *,
+        params: CacheInitParams,
+        inner_cache: BasePrefixCache,
+        model_config: Optional[ModelConfig],
+        server_args: ServerArgs,
+        tp_rank: int,
+        dp_rank: Optional[int],
+        pp_rank: int,
+        attn_cp_rank: int,
+        tp_group: Any = None,
+        pp_group: Any = None,
+        attn_tp_group: Any = None,
+        attn_cp_group: Any = None,
+    ) -> None:
+        self._inner_cache = inner_cache
+        self.req_to_token_pool = inner_cache.req_to_token_pool
+        self.token_to_kv_pool_allocator = inner_cache.token_to_kv_pool_allocator
+        self.page_size = inner_cache.page_size
+        self.disable = inner_cache.disable
+        self.device = inner_cache.device
+
+        kvcache = self.token_to_kv_pool_allocator.get_kvcache()
+        if isinstance(
+            self.token_to_kv_pool_allocator,
+            DeepSeekV4HiSparseTokenToKVPoolAllocator,
+        ):
+            raise NotImplementedError(
+                "FlexKV does not support the independent DSv4 HiSparse "
+                "device-page mapping yet"
+            )
+        self.flexkv_connector = FlexKVConnector(
+            sgl_model_config=model_config,
+            server_args=server_args,
+            page_size=self.page_size,
+            kvcache=kvcache,
+            tp_rank=tp_rank,
+            dp_rank=dp_rank,
+            pp_rank=pp_rank,
+            attn_cp_rank=attn_cp_rank,
+            pp_group=pp_group,
+            attn_tp_group=attn_tp_group if attn_tp_group is not None else tp_group,
+            attn_cp_group=attn_cp_group,
+        )
+        if self.flexkv_connector.enable_layerwise:
+            self.flexkv_connector.register_layer_transfer_counter(kvcache)
+
+        self._load_markers: dict[str, _LoadMarker] = {}
+        self._inflight_store_nodes: dict[str, tuple[Any, DecLockRefParams]] = {}
+        self._node_lock = threading.Lock()
+
+    def reset(self) -> None:
+        self._inner_cache.reset()
+        self._load_markers.clear()
+        with self._node_lock:
+            self._inflight_store_nodes.clear()
+        self.flexkv_connector.reset()
+
+    def shutdown(self) -> None:
+        self.flexkv_connector.shutdown()
+
+    def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
+        result = self._inner_cache.match_prefix(params)
+        if self.disable or params.req is None:
+            return result
+
+        key = params.key.page_aligned(self.page_size)
+        token_ids = key.raw_token_ids()
+        device_length = int(result.device_indices.numel())
+        if not token_ids or device_length >= len(token_ids):
+            return result
+
+        token_mask = torch.zeros(len(token_ids), dtype=torch.bool)
+        token_mask[device_length:] = True
+        _, hit_length = self.flexkv_connector.lookup_kv(
+            token_ids, token_mask, rid=params.req.rid
+        )
+        if hit_length <= 0:
+            return result
+
+        snapshot = token_ids[:] if token_ids is key.token_ids else token_ids
+        self._load_markers[params.req.rid] = _LoadMarker(
+            key=RadixKey(snapshot, key.extra_key, key.is_bigram),
+            device_length=device_length,
+        )
+        return result._replace(
+            last_host_node=result.last_device_node,
+            best_match_node=result.last_device_node,
+            host_hit_length=hit_length,
+            cache_protected_len=device_length,
+        )
+
+    def init_load_back(self, params: InitLoadBackParams) -> tuple[torch.Tensor, Any]:
+        req = params.req
+        marker = self._load_markers.pop(req.rid, None)
+        if marker is None or params.host_hit_length <= 0:
+            self.flexkv_connector.release_pending(req.rid)
+            return self._empty_indices(), req.last_node
+
+        device_indices = self._alloc_restore_slots(req, params.host_hit_length)
+        if device_indices is None:
+            self.flexkv_connector.release_pending(req.rid)
+            return self._empty_indices(), req.last_node
+
+        if self.flexkv_connector.enable_layerwise:
+            loaded, _ = self.flexkv_connector.start_load_kv_layerwise(
+                req.rid, device_indices
+            )
+        else:
+            loaded = self.flexkv_connector.retrieve_kv(req.rid, device_indices)
+        if loaded <= 0:
+            self.token_to_kv_pool_allocator.free(device_indices)
+            return self._empty_indices(), req.last_node
+
+        if loaded < device_indices.numel():
+            self.token_to_kv_pool_allocator.free(device_indices[loaded:])
+            device_indices = device_indices[:loaded]
+
+        # The restored tail is request-owned until the normal cache completion
+        # path inserts it. Preserve the pre-restore protection boundary so the
+        # inner cache can deduplicate or free every restored slot correctly.
+        req.cache_protected_len = marker.device_length
+        req._flexkv_uncached_restore = True
+        return device_indices, req.last_node
+
+    def _alloc_restore_slots(
+        self, req: Req, host_hit_length: int
+    ) -> Optional[torch.Tensor]:
+        allocator = self.token_to_kv_pool_allocator
+        if self.page_size == 1:
+            slots = allocator.alloc(host_hit_length)
+        else:
+            prefix_length = int(req.prefix_indices.numel())
+            sequence_length = prefix_length + host_hit_length
+            prefix_lengths = torch.tensor(
+                [prefix_length], dtype=torch.int64, device=self.device
+            )
+            prefix_lengths_cpu = torch.tensor([prefix_length], dtype=torch.int64)
+            sequence_lengths = torch.tensor(
+                [sequence_length], dtype=torch.int64, device=self.device
+            )
+            sequence_lengths_cpu = torch.tensor([sequence_length], dtype=torch.int64)
+            last_location = (
+                req.prefix_indices[-1:].to(device=self.device, dtype=torch.int64)
+                if prefix_length > 0
+                else torch.tensor([-1], dtype=torch.int64, device=self.device)
+            )
+            if hasattr(allocator, "alloc_extend_swa_tail") and self.supports_swa():
+                # FlexKV stores one page of SWA/state sidecars for a full-prefix hit.
+                swa_tail_length = min(self.page_size, host_hit_length)
+                slots = allocator.alloc_extend_swa_tail(
+                    prefix_lengths,
+                    prefix_lengths_cpu,
+                    sequence_lengths,
+                    sequence_lengths_cpu,
+                    last_location,
+                    host_hit_length,
+                    swa_tail_length,
+                )
+            else:
+                slots = allocator.alloc_extend(
+                    prefix_lengths,
+                    prefix_lengths_cpu,
+                    sequence_lengths,
+                    sequence_lengths_cpu,
+                    last_location,
+                    host_hit_length,
+                )
+
+        if slots is not None:
+            return slots
+
+        from sglang.srt.mem_cache.common import evict_from_tree_cache
+
+        evict_from_tree_cache(
+            self,
+            host_hit_length,
+            swa_num_tokens=(
+                min(self.page_size, host_hit_length) if self.supports_swa() else 0
+            ),
+        )
+        if self.page_size == 1:
+            return allocator.alloc(host_hit_length)
+        return self._alloc_restore_slots_once(req, host_hit_length)
+
+    def _alloc_restore_slots_once(
+        self, req: Req, host_hit_length: int
+    ) -> Optional[torch.Tensor]:
+        """Retry the paged allocation once after eviction."""
+        allocator = self.token_to_kv_pool_allocator
+        prefix_length = int(req.prefix_indices.numel())
+        sequence_length = prefix_length + host_hit_length
+        prefix_lengths = torch.tensor(
+            [prefix_length], dtype=torch.int64, device=self.device
+        )
+        prefix_lengths_cpu = torch.tensor([prefix_length], dtype=torch.int64)
+        sequence_lengths = torch.tensor(
+            [sequence_length], dtype=torch.int64, device=self.device
+        )
+        sequence_lengths_cpu = torch.tensor([sequence_length], dtype=torch.int64)
+        last_location = (
+            req.prefix_indices[-1:].to(device=self.device, dtype=torch.int64)
+            if prefix_length > 0
+            else torch.tensor([-1], dtype=torch.int64, device=self.device)
+        )
+        if hasattr(allocator, "alloc_extend_swa_tail") and self.supports_swa():
+            return allocator.alloc_extend_swa_tail(
+                prefix_lengths,
+                prefix_lengths_cpu,
+                sequence_lengths,
+                sequence_lengths_cpu,
+                last_location,
+                host_hit_length,
+                min(self.page_size, host_hit_length),
+            )
+        return allocator.alloc_extend(
+            prefix_lengths,
+            prefix_lengths_cpu,
+            sequence_lengths,
+            sequence_lengths_cpu,
+            last_location,
+            host_hit_length,
+        )
+
+    def cache_finished_req(self, req: Req, is_insert: bool = True, **kwargs) -> None:
+        kv_length = int(kwargs.get("kv_len_to_handle", req.kv_committed_len))
+        token_ids = (req.origin_input_ids + req.output_ids)[:kv_length]
+        self._inner_cache.cache_finished_req(req, is_insert=is_insert, **kwargs)
+        if not is_insert:
+            return
+
+        aligned_length = len(token_ids) // self.page_size * self.page_size
+        if aligned_length <= 0:
+            return
+        token_ids = token_ids[:aligned_length]
+        key = RadixKey(
+            array("q", token_ids),
+            req.extra_key,
+            is_bigram=bool(getattr(self._inner_cache, "is_eagle", False)),
+        )
+        match = self._inner_cache.match_prefix(MatchPrefixParams(key=key))
+        node = match.last_device_node
+        indices = match.device_indices
+        if node is self._inner_cache.root_node or indices.numel() == 0:
+            return
+        if indices.numel() < len(token_ids):
+            token_ids = token_ids[: indices.numel()]
+        if not token_ids or len(token_ids) != indices.numel():
+            return
+
+        lock_result = self._inner_cache.inc_lock_ref(node)
+        try:
+            task_id = self.flexkv_connector.store_kv(req.rid, token_ids, indices)
+        except Exception:
+            self._inner_cache.dec_lock_ref(node, lock_result.to_dec_params())
+            raise
+        if task_id < 0:
+            self._inner_cache.dec_lock_ref(node, lock_result.to_dec_params())
+            return
+        with self._node_lock:
+            self._inflight_store_nodes[req.rid] = (
+                node,
+                lock_result.to_dec_params(),
+            )
+
+    def cache_unfinished_req(self, req: Req, **kwargs) -> None:
+        self._inner_cache.cache_unfinished_req(req, **kwargs)
+        req._flexkv_uncached_restore = False
+
+    def evict(self, params: EvictParams) -> EvictResult:
+        self._drain_completed_stores()
+        return self._inner_cache.evict(params)
+
+    def check_hicache_events(self) -> None:
+        self._drain_completed_stores()
+        self.flexkv_connector.drain_launched_loads()
+
+    def _drain_completed_stores(self) -> None:
+        completed = self.flexkv_connector.check_completed_stores()
+        if not completed:
+            return
+        with self._node_lock:
+            for rid in completed:
+                tracked = self._inflight_store_nodes.pop(rid, None)
+                if tracked is not None:
+                    node, dec_params = tracked
+                    self._inner_cache.dec_lock_ref(node, dec_params)
+
+    def release_aborted_request(self, rid: str) -> None:
+        self._load_markers.pop(rid, None)
+        self.flexkv_connector.release_pending(rid)
+        self.flexkv_connector.cancel_prefetch(rid)
+
+    def prefetch_from_storage(self, rid: str, last_host_node: Any, token_ids) -> None:
+        del last_host_node
+        self.flexkv_connector.prefetch_async(rid, list(token_ids))
+
+    def check_prefetch_progress(self, rid: str) -> bool:
+        return self.flexkv_connector.check_prefetch_progress(rid)
+
+    def terminate_prefetch(self, rid: str) -> None:
+        self.flexkv_connector.cancel_prefetch(rid)
+
+    def pop_prefetch_loaded_tokens(self, rid: str) -> int:
+        del rid
+        return 0
+
+    def inc_lock_ref(self, node: Any) -> IncLockRefResult:
+        return self._inner_cache.inc_lock_ref(node)
+
+    def dec_lock_ref(self, node: Any, params: Optional[DecLockRefParams] = None) -> Any:
+        return self._inner_cache.dec_lock_ref(node, params)
+
+    def supports_swa(self) -> bool:
+        return self._inner_cache.supports_swa()
+
+    def supports_mamba(self) -> bool:
+        return self._inner_cache.supports_mamba()
+
+    def supports_fast_match_prefix(self) -> bool:
+        return self._inner_cache.supports_fast_match_prefix()
+
+    def _empty_indices(self) -> torch.Tensor:
+        return torch.empty((0,), dtype=torch.int64, device=self.device)
+
+    def __getattr__(self, name: str) -> Any:
+        inner = self.__dict__.get("_inner_cache")
+        if inner is None:
+            raise AttributeError(name)
+        return getattr(inner, name)

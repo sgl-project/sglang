@@ -1096,7 +1096,12 @@ class PrefillAdder:
                 )
                 req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
                 prefix_len = len(req.prefix_indices)
-                req.cache_protected_len = prefix_len
+                # FlexKV hybrid restores are request-owned until the normal
+                # cache completion path inserts them. Keep the pre-restore
+                # protection boundary so the inner radix cache can deduplicate
+                # and free those slots correctly.
+                if not getattr(req, "_flexkv_uncached_restore", False):
+                    req.cache_protected_len = prefix_len
 
             input_tokens = self.ceil_paged_tokens(
                 len(req.full_untruncated_fill_ids) - len(req.prefix_indices)
