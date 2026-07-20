@@ -769,7 +769,9 @@ export const config = {
         "--moe-runner-backend flashinfer_trtllm_routed",
         "--enable-torch-symm-mem",
         "--mamba-radix-cache-strategy extra_buffer",
-        "--mem-fraction-static 0.85",
+        // BF16 weights are large on B300 — 0.85 caps the token pool near ~315k
+        // and rejects longer requests; 0.93 fits the full 1M context.
+        "--mem-fraction-static 0.93",
         "--swa-full-tokens-ratio 0.1",
         "--mamba-full-memory-ratio 0.1",
         "--enable-multimodal",

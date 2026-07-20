@@ -25,7 +25,7 @@ export const benchmarks = [
     accuracy: { bfcl_pct: 77.0, mmau_pct: 77.7, mmmu_pro_pct: 74.3, aime25_pct: 96.7, niah_512k_pct: 90.9, niah_1m_pct: 75.8, hle_pct: 28.8 } },
   { match: { hw: "mi350x" , variant: "default" , quant: "bf16"  , strategy: "balanced"     , nodes: "single"   },
     sglang_version: "inkling-rocm700-mi35x",
-    accuracy: { bfcl_pct: 77.8, mmau_pct: 76.3, mmmu_pro_pct: 74.4, aime25_pct: 95.0, niah_512k_pct: 84.9, niah_1m_pct: 60.6, hle_pct: 29.4 } },
+    accuracy: { bfcl_pct: 77.8, mmau_pct: 76.3, mmmu_pro_pct: 74.4, aime25_pct: 95.0, hle_pct: 29.4 } },
   { match: { hw: "mi355x" , variant: "default" , quant: "bf16"  , strategy: "balanced"     , nodes: "single"   } },
   { match: { hw: "b200"   , variant: "default" , quant: "nvfp4" , strategy: "mtp"          , nodes: "single"   } },
   { match: { hw: "b300"   , variant: "default" , quant: "nvfp4" , strategy: "mtp"          , nodes: "single"   } },
