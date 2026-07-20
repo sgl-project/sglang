@@ -477,7 +477,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             hidden_states=hidden_states,
             topk_output=topk_output,
         )
-        if enable_dual_stream:
+        if hidden_states.shape[0] > 0 and enable_dual_stream:
             torch.npu.current_stream().wait_event(shared_event)
 
         if shared_output is not None:
