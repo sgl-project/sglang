@@ -14,6 +14,8 @@ jobs:
     if: github.repository == 'sgl-project/sglang'
     runs-on: amd-docker-scale
     environment: "prod"
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -27,6 +29,7 @@ jobs:
           repository: radixark/miles
           ref: main
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Record miles commit
         run: echo "Building from miles main @ $(git rev-parse HEAD)"
@@ -34,14 +37,19 @@ jobs:
       - name: Set date
         run: echo "DATE=$(date +%Y%m%d)" >> $GITHUB_ENV
 
+      - name: Install docker/build.py dependencies
+        run: python3 -m pip install --quiet typer
+
+      - name: Build image via miles docker/build.py and tag with date
+        run: |
+          python3 docker/build.py --variant ${{ matrix.variant }} --image-tag custom --custom-tag miles
+          docker tag rocm/sgl-dev:miles-${{ matrix.variant }} rocm/sgl-dev:miles-${{ matrix.variant }}-${DATE}
+
       - name: Login to Docker Hub (AMD)
         uses: docker/login-action@v2
         with:
           username: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
           password: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
 
-      - name: Build via miles docker/build.py and push dated tag
-        run: |
-          python3 docker/build.py --variant ${{ matrix.variant }} --image-tag custom --custom-tag miles
-          docker tag  rocm/sgl-dev:miles-${{ matrix.variant }} rocm/sgl-dev:miles-${{ matrix.variant }}-${DATE}
-          docker push rocm/sgl-dev:miles-${{ matrix.variant }}-${DATE}
+      - name: Push dated tag
+        run: docker push rocm/sgl-dev:miles-${{ matrix.variant }}-${DATE}
