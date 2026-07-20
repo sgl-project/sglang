@@ -480,7 +480,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         replay from the batch-max kv_len. If any request has kv_len > index_topk
         the dense (k-only) graph would be wrong for it, so the whole batch uses
         the sparse (full indexer) graph. Returns None when dual-graph is off."""
-        if not self.dsa_dual_graph:
+        if not getattr(self, "dsa_dual_graph", False):
             return None
         seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
         if seq_lens_cpu is not None and seq_lens_cpu.numel() > 0:
@@ -941,7 +941,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # Design A: capture a dense (k-only) and a sparse (full indexer) graph
         # per bs bucket. Order: dense first so its (smaller) capture-time peak
         # runs while the shared pool is fresh; sparse's peak subsumes it.
-        dsa_variants = ["dense", "sparse"] if self.dsa_dual_graph else [None]
+        # getattr default: subclasses like EAGLEDraftCudaGraphRunner reuse this
+        # capture() but don't run DecodeCudaGraphRunner.__init__ (so they never
+        # set dsa_dual_graph) and override capture_one_shape with a signature that
+        # has no dsa_variant. Default to no dual-graph and, for the None variant,
+        # call capture_one_shape without the extra arg so those overrides work.
+        dsa_variants = (
+            ["dense", "sparse"] if getattr(self, "dsa_dual_graph", False) else [None]
+        )
         for bs in capture_range:
             if get_parallel().tp_rank == 0:
                 avail_mem = get_available_gpu_memory(
@@ -963,9 +970,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                         num_tokens=bs * self.num_tokens_per_req,
                         tp_group=self.model_runner.tp_group,
                     ) as forward:
-                        self.capture_one_shape(
-                            bs, forward, stream_idx, variant_label, dsa_variant
-                        )
+                        if dsa_variant is None:
+                            self.capture_one_shape(
+                                bs, forward, stream_idx, variant_label
+                            )
+                        else:
+                            self.capture_one_shape(
+                                bs, forward, stream_idx, variant_label, dsa_variant
+                            )
         _set_capture_dsa_variant(None)
 
     def capture_one_shape(
