@@ -710,6 +710,7 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
             group_size=group_size,
             use_per_token_activation=False,
         )
+        nvfp4a16_config.quant_method = "W4A16_NVFP4"
 
         return cls(
             kv_cache_quant_algo=kv_cache_quant_algo,
@@ -1875,8 +1876,11 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
     def __init__(self, quant_config: ModelOptFp4Config):
         self.quant_config = quant_config
+        self.use_a16 = getattr(quant_config, "quant_method", None) == "W4A16_NVFP4"
         moe_runner_backend = get_moe_runner_backend()
-        if moe_runner_backend.is_auto() and is_cuda():
+        if self.use_a16:
+            use_marlin_fallback = True
+        elif moe_runner_backend.is_auto() and is_cuda():
             capability = get_device_capability()
             use_marlin_fallback = (8, 0) <= capability < (10, 0)
         else:
@@ -2401,7 +2405,15 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         self.moe_runner_config = moe_runner_config
         moe_runner_backend = get_moe_runner_backend()
 
-        if moe_runner_backend.is_auto():
+        if self.use_a16:
+            if not moe_runner_backend.is_marlin():
+                logger.warning_once(
+                    "ModelOpt W4A16_NVFP4 MoE requires weight-only Marlin kernels; "
+                    "overriding MoE runner backend %s to marlin.",
+                    moe_runner_backend.value,
+                )
+            moe_runner_backend = MoeRunnerBackend.MARLIN
+        elif moe_runner_backend.is_auto():
             if is_cuda() and (8, 0) <= get_device_capability() < (10, 0):
                 moe_runner_backend = MoeRunnerBackend.MARLIN
             else:
@@ -2447,6 +2459,15 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         if moe_runner_backend.is_marlin():
             from sglang.srt.layers.moe.moe_runner.marlin import MarlinMoeQuantInfo
+            from sglang.srt.layers.moe.topk import TopKOutputChecker
+
+            topk_output = dispatch_output.topk_output
+            if TopKOutputChecker.format_is_bypassed(topk_output):
+                dispatch_output = dispatch_output._replace(
+                    topk_output=topk_output.to_standard(
+                        layer_id=getattr(layer, "layer_id", None)
+                    )
+                )
 
             expert_map = None
             global_num_experts = -1
