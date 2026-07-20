@@ -1,3 +1,6 @@
+import asyncio
+import concurrent.futures
+import functools
 import math
 import os
 import re
@@ -178,7 +181,40 @@ async def preprocess_video(
     vr,
     image_factor: int = IMAGE_FACTOR,
     video_config: dict = {},
-) -> torch.Tensor:
+    executor: Optional[concurrent.futures.Executor] = None,
+) -> tuple[torch.Tensor, Optional[dict]]:
+    """Async wrapper around the CPU-bound video preprocessing.
+
+    The actual work (frame decode/sample, resize, tensor build) is fully
+    synchronous and previously ran inline on the asyncio event loop, stalling
+    the API server while a request's video was decoded. Offload it via
+    ``run_in_executor`` so the loop stays responsive. See issue #28247.
+
+    ``executor`` selects the worker pool: callers that own a managed pool (e.g.
+    the processor's ``io_executor``) pass it for bounded concurrency; ``None``
+    falls back to the event loop's default thread pool. A thread pool (rather
+    than a process pool) is required here because ``vr`` is a live
+    ``VideoDecoderWrapper`` holding a non-picklable torchcodec/decord decoder,
+    and the heavy decode/resize releases the GIL so threads already run it in
+    parallel.
+    """
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        executor,
+        functools.partial(
+            _preprocess_video_impl,
+            vr,
+            image_factor=image_factor,
+            video_config=video_config,
+        ),
+    )
+
+
+def _preprocess_video_impl(
+    vr,
+    image_factor: int = IMAGE_FACTOR,
+    video_config: dict = {},
+) -> tuple[torch.Tensor, Optional[dict]]:
     # preprocessed video
     is_video_obj = isinstance(vr, VideoDecoderWrapper)
     if not is_video_obj:
@@ -695,10 +731,16 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
 
         video_metadata = None
         if base_output.videos and not isinstance(base_output.videos[0], dict):
-            videos_processed = [
-                await preprocess_video(video, video_config=self.video_config)
-                for video in base_output.videos
-            ]
+            videos_processed = await asyncio.gather(
+                *(
+                    preprocess_video(
+                        video,
+                        video_config=self.video_config,
+                        executor=self.io_executor,
+                    )
+                    for video in base_output.videos
+                )
+            )
             base_output.videos, video_metadata = map(list, zip(*videos_processed))
 
         preprocess_time = time.perf_counter()
@@ -711,6 +753,15 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             "qwen3_5_moe",
             "intern_s2_preview",
         ):
+            # NOTE: process_and_combine_mm_data is intentionally NOT offloaded
+            # to a worker thread. It calls the shared HF tokenizer (the same
+            # object as tokenizer_manager.tokenizer used by serving_chat's
+            # _apply_conversation_template), whose Rust fast-tokenizer backend
+            # is not reentrant. Running it off the event loop lets it race other
+            # loop-side tokenizer access and raises "Already borrowed". Keeping
+            # it inline serializes it with the rest of the loop. Only the
+            # tokenizer-free preprocess_video work above is offloaded. See
+            # issue #28247.
             mm_items, input_ids, ret = self.process_and_combine_mm_data(
                 base_output,
                 self.mm_tokens,
