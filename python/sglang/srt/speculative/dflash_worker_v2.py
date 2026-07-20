@@ -69,6 +69,16 @@ def _get_fused_kv_materialize_helper():
     return _FusedKVMaterializeHelper
 
 
+def _prefix_valid_indices(
+    commit_lens: torch.Tensor, block_size: int
+) -> torch.Tensor:
+    offsets = torch.arange(
+        int(block_size), device=commit_lens.device, dtype=torch.int64
+    )
+    valid_mask = offsets[None, :] < commit_lens.to(torch.int64)[:, None]
+    return torch.nonzero(valid_mask.reshape(-1), as_tuple=False).flatten()
+
+
 class _DflashDraftSampler:
     """Capture-safe greedy argmax over the target LM head, run inside the draft
     cuda graph so the draft sampling is captured and counted in fwd_occupancy.
@@ -1017,6 +1027,21 @@ class DFlashWorkerV2(BaseSpecWorker):
             if commit_lens.dtype != torch.int32:
                 commit_lens = commit_lens.to(torch.int32)
 
+        # NPU KV projection must only see committed tokens. The generic
+        # prefix-valid writer masks after forward_prepare_npu has already seen
+        # the dense padded positions, which can produce invalid rotary/cache
+        # addresses. Pack before projection to preserve the V1 NPU semantics.
+        if _is_npu and cache_loc_2d is not None:
+            assert commit_lens is not None
+            valid_indices = _prefix_valid_indices(
+                commit_lens, int(cache_loc_2d.shape[1])
+            )
+            target_hidden = target_hidden.index_select(0, valid_indices)
+            cache_loc = cache_loc.index_select(0, valid_indices)
+            positions = positions.index_select(0, valid_indices)
+            cache_loc_2d = None
+            commit_lens = None
+
         with torch.inference_mode():
             ctx_hidden = self.draft_model.project_target_hidden(target_hidden)
 
@@ -1553,9 +1578,12 @@ class DFlashWorkerV2(BaseSpecWorker):
             # prefix lengths, not the full allocator reservation length.
             draft_seq_lens = prefix_lens
             if batch.seq_lens_cpu is not None:
-                # Host bound = committed prefix + one verify block.
                 seq_lens_cpu.copy_(batch.seq_lens_cpu)
-                seq_lens_cpu.add_(block_size)
+                # Ascend TARGET_VERIFY metadata adds the verify block itself.
+                # Passing prefix + block here would make NPU add the block
+                # twice and expose uninitialized KV slots to draft attention.
+                if not _is_npu:
+                    seq_lens_cpu.add_(block_size)
                 draft_seq_lens_sum = int(seq_lens_cpu.sum())
             elif draft_input.reserved_seq_lens_cpu is not None:
                 # GPU-only backend: reserved is a safe over-estimate.
@@ -1627,8 +1655,13 @@ class DFlashWorkerV2(BaseSpecWorker):
         seq_lens_cpu_backup = batch.seq_lens_cpu
         seq_lens_sum_backup = batch.seq_lens_sum
         if seq_lens_cpu_backup is not None:
-            # Verify host bound = committed prefix + one verify block (matches draft).
-            verify_host_seq_lens = seq_lens_cpu_backup + block_size
+            # Ascend's TARGET_VERIFY metadata adds block_size in place, so it
+            # must receive a private copy of the committed prefix lengths.
+            verify_host_seq_lens = (
+                seq_lens_cpu_backup.clone()
+                if _is_npu
+                else seq_lens_cpu_backup + block_size
+            )
             batch.seq_lens_cpu = verify_host_seq_lens
             batch.seq_lens_sum = int(verify_host_seq_lens.sum())
         elif draft_input.reserved_seq_lens_cpu is not None:
