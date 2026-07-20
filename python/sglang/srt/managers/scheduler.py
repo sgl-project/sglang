@@ -1476,10 +1476,11 @@ class Scheduler(
         self.schedule_stream = self.device_module.Stream(priority=0)
         if self.device == "cpu":
             self.schedule_stream.synchronize = lambda: None  # No-op for CPU
-        else:
-            # CUDA streams come from a fixed round-robin pool. Redraw if this
+        elif is_cuda() or _is_hip:
+            # CUDA/HIP streams come from a fixed round-robin pool. Redraw if this
             # stream aliases forward_stream, which would eliminate scheduler
-            # overlap. (CPU streams have no ``cuda_stream`` handle to compare.)
+            # overlap. Only CUDA/HIP streams expose a ``cuda_stream`` handle;
+            # other accelerators (e.g. NPU/XPU) skip the alias check.
             _redraws = 0
             while (
                 self.schedule_stream.cuda_stream == self.forward_stream.cuda_stream
