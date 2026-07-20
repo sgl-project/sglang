@@ -323,7 +323,6 @@ def _handle_frozen_kv_mtp(server_args: ServerArgs) -> None:
 
 def _handle_eagle_family(server_args: ServerArgs) -> None:
     from sglang.srt.arg_groups.overrides import (
-        attention_backends_of,
         resolved_view,
     )
 

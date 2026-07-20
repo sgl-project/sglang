@@ -66,7 +66,6 @@ from sglang.srt.speculative.eagle_info import (
     EagleVerifyInput,
 )
 from sglang.srt.speculative.eagle_utils import (
-    TreeMaskMode,
     _eagle_prefill_tail_tokens,
     build_tree_kernel_efficient,
     default_tree_mask_mode,
