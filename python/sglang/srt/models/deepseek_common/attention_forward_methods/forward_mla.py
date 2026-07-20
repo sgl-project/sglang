@@ -19,6 +19,7 @@ from sglang.srt.layers.attention.dsa.utils import (
     is_graph_dsa_split_op_surface,
 )
 from sglang.srt.layers.communicator import get_attn_tp_context
+from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.dcp import (
     all_gather_kv_cache_for_mla_extend,
     all_gather_q_for_mla_decode,
@@ -569,8 +570,13 @@ class DeepseekMLAForwardMixin:
             dsa_prefill_cp=dsa_prefill_cp,
             fuse_rope_for_trtllm_mla=fuse_rope_for_trtllm_mla,
         )
-        if (dsa_prefill_cp or mla_prefill_cp) and not defer_kv_gather_until_after_rope:
-            # support allgather+rerrange
+        if (
+            (dsa_prefill_cp or mla_prefill_cp)
+            and not defer_kv_gather_until_after_rope
+            and not is_cp_v2_active(forward_batch)
+        ):
+            # CP-v1 gathers the latent here; CP-v2 gathers it in the attention
+            # backend via the strategy (materialize_full_mla_kv).
             k_nope, k_pe = self.rebuild_cp_kv_cache(
                 latent_cache, forward_batch, k_nope, k_pe
             )

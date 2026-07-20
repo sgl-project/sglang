@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61.0", "setuptools-scm>=8.0", "wheel"]
+requires = ["setuptools>=61.0", "setuptools-rust>=1.10", "setuptools-scm>=8.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -30,6 +30,7 @@ runtime_common = [
   "einops",
   "fastapi",
   "gguf",
+  "helion==0.2.6",
   "interegular",
   "IPython",
   "llguidance>=1.7.6,<2.0.0",
@@ -126,7 +127,7 @@ srt_musa = [
   "sglang[runtime_common]",
   "torch",
   "torch_musa",
-  "torchada>=0.1.68",
+  "torchada>=0.1.74",
 ]
 
 diffusion_musa = [
@@ -190,6 +191,13 @@ dev_mps = ["sglang[all_mps]", "sglang[test]"]
 
 [project.scripts]
 sglang = "sglang.cli.main:main"
+
+# Rust-accelerated multimodal preprocessing (sglang.srt.multimodal._core).
+# grpc is intentionally omitted here (it needs proto/tonic); ROCm only builds mm.
+[[tool.setuptools-rust.ext-modules]]
+target = "sglang.srt.multimodal._core"
+path = "../rust/sglang-mm/Cargo.toml"
+binding = "PyO3"
 
 [tool.setuptools.package-data]
 "sglang" = [
