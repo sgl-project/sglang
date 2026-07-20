@@ -305,8 +305,11 @@ if [[ "${NEED_REBUILD}" == "true" ]]; then
     # delete old aiter directory
     docker exec ci_sglang rm -rf /sgl-workspace/aiter
 
-    # clone a fresh copy to /sgl-workspace/aiter
-    docker exec ci_sglang git clone https://github.com/ROCm/aiter.git /sgl-workspace/aiter
+    # Clone a fresh copy to /sgl-workspace/aiter. The repository override is
+    # useful for validating a commit from a fork before it lands upstream.
+    AITER_REPO_URL="${AITER_REPO_OVERRIDE:-https://github.com/ROCm/aiter.git}"
+    echo "[CI-AITER-CHECK] AITER repository=${AITER_REPO_URL}"
+    docker exec ci_sglang git clone "${AITER_REPO_URL}" /sgl-workspace/aiter
 
     # checkout correct version and install requirements
     # Use `checkout -f` so the smudge-filter-induced "dirty" working tree from

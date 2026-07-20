@@ -15,6 +15,11 @@ on:
         required: false
         type: string
         default: ''
+      aiter_repo:
+        description: 'Override AITER repository for diagnostic commits'
+        required: false
+        type: string
+        default: 'https://github.com/ROCm/aiter.git'
       continue_on_error:
         description: 'Continue on error (do not fail the workflow on test failures)'
         required: false
@@ -112,6 +117,11 @@ on:
         required: false
         type: string
         default: ''
+      aiter_repo:
+        description: 'Override AITER repository for diagnostic commits'
+        required: false
+        type: string
+        default: 'https://github.com/ROCm/aiter.git'
       job_filter:
         description: 'Select which job to run (leave empty or "all" to run all jobs)'
         required: false
@@ -125,6 +135,7 @@ on:
 
 env:
   AITER_COMMIT_OVERRIDE: ${{ inputs.aiter_ref }}
+  AITER_REPO_OVERRIDE: ${{ inputs.aiter_repo }}
   DOCKERHUB_AMD_USERNAME: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
   DOCKERHUB_AMD_TOKEN: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
 
