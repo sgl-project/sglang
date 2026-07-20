@@ -62,6 +62,7 @@ if TYPE_CHECKING:
 
 
 _MLA_DECODE_MIN_BLOCK_KV = 32
+_DEBUG_DCP_PREFIX = get_bool_env_var("SGLANG_DEBUG_DCP_PREFIX")
 
 
 def _mla_decode_kv_splits_cap(
@@ -1449,6 +1450,43 @@ class TritonAttnBackend(AttentionBackend):
                 lse_extend=current_lse,
                 skip_prefix=True,
             )
+
+        if _DEBUG_DCP_PREFIX:
+            has_prefix = kv_indices.numel() > 0
+            marker = (
+                "[SGLANG_DCP_PREFIX_DEBUG]"
+                f" global_rank={group.rank} dcp_rank={group.rank_in_group}"
+                f" dcp_ranks={group.ranks} layer={layer.layer_id}"
+                f" total_tokens={total_tokens} kv_indices_numel={kv_indices.numel()}"
+                f" has_prefix={int(has_prefix)}"
+            )
+            print(f"{marker} phase=before_cuda_sync", flush=True)
+            # Surface an asynchronous kernel stall before entering a DCP
+            # collective. If this marker is the last one from a rank, the
+            # collective below is not the original source of the stall.
+            torch.cuda.synchronize()
+            print(
+                f"{marker} phase=after_cuda_sync"
+                f" kv_indptr_last={int(kv_indptr[-1].item())}"
+                f" extend_prefix_lens={forward_batch.extend_prefix_lens.tolist()}",
+                flush=True,
+            )
+
+            # Every DCP rank must make the same early-return decision. Exchange
+            # the decision unconditionally so a mismatch becomes an immediate,
+            # explicit failure instead of a later collective watchdog timeout.
+            local_flag = torch.tensor(
+                [int(has_prefix)], dtype=torch.int32, device=q.device
+            )
+            pair_flags = group.all_gather(local_flag, dim=0)
+            torch.cuda.synchronize()
+            flags = pair_flags.tolist()
+            print(f"{marker} phase=after_flag_gather pair_flags={flags}", flush=True)
+            if min(flags) != max(flags):
+                raise RuntimeError(
+                    "DCP_PREFIX_RANK_DIVERGENCE: DCP ranks disagree on "
+                    f"whether prefix KV exists; {marker} pair_flags={flags}"
+                )
 
         if kv_indices.numel() == 0:
             return current_out.reshape(-1, layer.tp_q_head_num * layer.v_head_dim).to(

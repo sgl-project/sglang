@@ -1541,7 +1541,8 @@ jobs:
       - name: Setup docker
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh
+          bash scripts/ci/amd/amd_ci_start_container.sh \
+            --custom-image rocm/sgl-dev:v0.5.15.post1-rocm700-mi35x-20260718
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -1555,6 +1556,7 @@ jobs:
         run: |
           > github_summary.md  # Clear summary file
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e SGLANG_DEBUG_DCP_PREFIX=1 \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             python3 run_suite.py --hw amd --suite nightly-amd-accuracy-8-gpu-mi35x-qwen35-triton-dcp --nightly --timeout-per-file 7200 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
