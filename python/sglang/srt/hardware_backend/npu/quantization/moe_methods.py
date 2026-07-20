@@ -16,7 +16,10 @@ if TYPE_CHECKING:
 
 import logging
 
-from sglang.srt.hardware_backend.npu.moe.matmul import GroupedMatmul
+from sglang.srt.hardware_backend.npu.moe.matmul import (
+    GroupedMatmul,
+    GroupedMatmulSwigluQuant,
+)
 from sglang.srt.hardware_backend.npu.moe.quant import HiddenStatesDynamicQuant
 from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
     _get_float8_e8m0fnu_dtype,
@@ -782,12 +785,14 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
     payload and e8m0 scale as part of routing, and gmm1 re-quantises its own
     output. Consequently gmm1 is a single fused kernel rather than a matmul plus
     a separate activation, so the runner calls ``apply_fused_gmm1_swiglu`` for
-    w13 and ``apply`` only for w2.
+    w13 and ``apply`` only for w2 — hence the per-prefix matmul chosen here.
     """
 
-    def __init__(self):
+    def __init__(self, weight_prefix: str):
         super().__init__(quant_config=None)
-        self.matmul = GroupedMatmul()
+        self.matmul = (
+            GroupedMatmulSwigluQuant() if weight_prefix == "w13" else GroupedMatmul()
+        )
 
     @staticmethod
     def _quantize_weight_online(
@@ -864,13 +869,13 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
         for MXFP8.
         """
         e8m0_dtype = _require_e8m0_dtype()
-        # gmm1 wants a cumulative group_list while gmm2 keeps the COUNT form the
-        # dispatcher produces (group_list_type=1). The asymmetry is intentional.
-        group_list = expert_tokens.cumsum(0) if group_list_type == 1 else expert_tokens
-        return torch.ops.npu.npu_grouped_matmul_swiglu_quant_v2(
-            x=hidden_states,
-            weight=[quant_info.w13_weight],
-            group_list=group_list,
+        return self.matmul.forward(
+            quant_info,
+            "w13",
+            hidden_states,
+            expert_tokens,
+            group_list_type=group_list_type,
+            transposed=True,
             weight_scale=[quant_info.w13_weight_scale],
             x_scale=pertoken_scale,
             dequant_mode=2,
@@ -939,8 +944,8 @@ class NPUMXFP8FusedMoEMethod(FusedMoEMethodBase):
     def __init__(self, quant_config: Optional["QuantizationConfig"] = None):
         super().__init__()
         self.quant_config = quant_config
-        self.w13_kernel = NPUMXFP8MoEMethod()
-        self.w2_kernel = NPUMXFP8MoEMethod()
+        self.w13_kernel = NPUMXFP8MoEMethod("w13")
+        self.w2_kernel = NPUMXFP8MoEMethod("w2")
 
     def create_weights(
         self,

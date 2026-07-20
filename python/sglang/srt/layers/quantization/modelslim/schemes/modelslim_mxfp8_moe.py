@@ -45,13 +45,13 @@ class ModelSlimMXFP8MoEScheme(ModelSlimMoEScheme):
         quant_config: Dict[str, Any],
         weight_prefix: str,  # "w13" or "w2"
     ) -> None:
-        self.quant_config = quant_config
-        self.kernel = NPUMXFP8MoEMethod()
-        self.weight_prefix = weight_prefix
         if weight_prefix not in ("w13", "w2"):
             raise ValueError(
                 f"weight_prefix must be 'w13' or 'w2', got '{weight_prefix}'"
             )
+        self.quant_config = quant_config
+        self.weight_prefix = weight_prefix
+        self.kernel = NPUMXFP8MoEMethod(weight_prefix)
 
     def create_weights(
         self,
