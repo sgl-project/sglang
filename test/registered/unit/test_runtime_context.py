@@ -215,8 +215,10 @@ class TestServerArgsOwnership(_IsolatedServerArgs):
         self.assertIs(get_server_args(), sentinel)
         self.assertIs(get_context().server_args, sentinel)
 
-    def test_tokenizer_alias_is_same_function(self):
-        self.assertIs(
+    def test_tokenizer_alias_is_distinct_role_shim(self):
+        # Deliberately NOT an alias: the two legacy setters publish with
+        # different process roles (scheduler vs tokenizer).
+        self.assertIsNot(
             server_args_module.set_global_server_args_for_tokenizer,
             server_args_module.set_global_server_args_for_scheduler,
         )

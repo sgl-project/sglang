@@ -63,10 +63,10 @@ from sglang.srt.observability.trace import (
     process_tracing_init,
     trace_set_thread_info,
 )
+from sglang.srt.runtime_context import publish
 from sglang.srt.server_args import (
     PortArgs,
     ServerArgs,
-    set_global_server_args_for_scheduler,
 )
 from sglang.srt.utils import (
     CLIENT_MEDIA_EXCEPTIONS,
@@ -265,7 +265,7 @@ class MMEncoder:
     ):
         logger.info(f"init MMEncoder {rank}/{server_args.tp_size}")
         self.server_args = server_args
-        set_global_server_args_for_scheduler(server_args)
+        publish(server_args, role="encoder")
         self.rank = rank
         # DP rank for metric labels; overridden by run_dp_worker in DP mode.
         # 0 in the single-instance (non-DP) path.
