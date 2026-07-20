@@ -161,6 +161,8 @@ def summarize_variant(
 ) -> dict[str, Any]:
     paths = sorted(trace_dir.glob("*DECODE.trace.json.gz"))
     if not paths:
+        paths = sorted(trace_dir.glob("*.trace.json.gz"))
+    if not paths:
         paths = sorted(trace_dir.glob("*.json"))
     if not paths:
         raise FileNotFoundError(f"no CUDA graph traces found in {trace_dir}")
