@@ -142,7 +142,7 @@ class HiSparseCoordinator:
         # decode token, plus draft slots for speculative MTP tokens. When
         # speculative decoding is active, get_draft_device_slots allocates from
         # device_buffer_size+1 onwards, needing up to double_alloc extra slots.
-        from sglang.srt.mem_cache.common import get_alloc_reserve_per_decode
+        from sglang.srt.mem_cache.allocation_sizing import get_alloc_reserve_per_decode
         spec_extra = get_alloc_reserve_per_decode()
         self.padded_buffer_size = (
             self.device_buffer_size
