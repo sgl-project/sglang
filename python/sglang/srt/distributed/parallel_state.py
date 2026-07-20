@@ -1065,21 +1065,6 @@ class GroupCoordinator:
             # + wait_tensor, which invokes sycl_event.wait() and breaks XPU graph capture.
             reg_all_gather_into_tensor(output, input, group_name=self.unique_name)
 
-    def cp_all_gather_into_tensor_async(
-        self, output: torch.Tensor, input: torch.Tensor, stream: torch.cuda.Stream
-    ):
-        """
-        Implement an asynchronous `allgather` operation on a specified stream.
-        (the default `torch.distributed.all_gather_into_tensor` will trigger event synchronization),
-        eliminating the CPU-side launch-kernel blocking issue caused by synchronization problems.
-        The specific implementation uses the interface provided by pynccl to remove the synchronization logic of events.
-        """
-        pynccl_comm = self.pynccl_comm
-        if pynccl_comm is None or pynccl_comm.disabled:
-            self.all_gather_into_tensor(output, input)
-        else:
-            pynccl_comm.cp_all_gather_into_tensor(output, input, stream=stream)
-
     def all_gather(
         self,
         input_: torch.Tensor,
