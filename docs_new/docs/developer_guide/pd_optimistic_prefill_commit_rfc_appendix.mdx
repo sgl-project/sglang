@@ -267,10 +267,11 @@ not introduce additional protocol states.
   cancel.
 - Change discovery after `PAIR_BOUND` and verify SMG still sends every cancel
   attempt to the originally pinned P/D cancel endpoints and serving epochs.
-- Cancel requests separately from P WAIT/bootstrap/precommit/batch/transfer/
-  success-cleanup and D registered/commit-received/eligible/preallocation/
-  transfer/running/success-cleanup/result owners. Every owner and allocator must
-  release exactly once before local terminal publication.
+- Cancel requests separately from the P WAIT, bootstrap, precommit, batch,
+  transfer, and success-cleanup owners, and from the D registered,
+  commit-received, eligible, preallocation, transfer, running, success-cleanup,
+  and result owners. Every owner and allocator must release exactly once before
+  local terminal publication.
 - On P transfer success, verify immutable SUCCESS publication, exact source
   cleanup, LIVE-to-terminal replacement, replay after cleanup, and no retained
   model ownership. Verify the analogous D running-to-success-cleanup terminal

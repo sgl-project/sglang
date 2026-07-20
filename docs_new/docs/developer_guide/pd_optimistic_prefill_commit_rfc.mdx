@@ -1171,8 +1171,9 @@ full-request canonical hash merely to detect an SMG implementation bug.
 The enforce dispatch supervisor is symmetric and fail-fast. Before a successful
 decode response/stream is exposed, a transport error or non-success response
 from either P or D immediately stops waiting for normal completion of the peer,
-starts the same identity-bound cancel on both pinned role endpoints, and returns
-the appropriate error after only the bounded cancel attempt. In particular, it
+starts the same identity-bound cancellation on both pinned role endpoints, and
+returns the appropriate error after only the bounded cancel attempt. In
+particular, it
 must not preserve the current behavior that stores an early D error while
 continuing to wait for P: D may reject at its full-control gate after P has
 committed, and P would otherwise wait until its post-commit deadline for
