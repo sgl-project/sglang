@@ -2842,10 +2842,14 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-        # Minor fix for multi-modal model: input_ids is None
-        len_input_ids = (
-            input_ids.shape[0] if input_ids is not None else input_embeds.shape[0]
-        )
+        # Multi-modal: input_ids may be None (use input_embeds).
+        # Non-first PP ranks: both are None (activations via pp_proxy_tensors).
+        if input_ids is not None:
+            len_input_ids = input_ids.shape[0]
+        elif input_embeds is not None:
+            len_input_ids = input_embeds.shape[0]
+        else:
+            len_input_ids = pp_proxy_tensors["hidden_states"].shape[0]
         if self.dsa_enable_prefill_cp:
             if can_dsa_cp_split(
                 len_input_ids, self.cp_size, self.use_dsa, forward_batch
