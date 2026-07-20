@@ -1026,9 +1026,9 @@ class NixlKVManager(CommonKVManager):
                 assert room in self.transfer_infos
 
                 # Count each chunk once; the flag survives re-enqueue on defer.
-                if not getattr(kv_chunk, "_staging_counted", False):
+                if not kv_chunk.staging_counted:
                     self._staging_outstanding[room] += 1
-                    kv_chunk._staging_counted = True
+                    kv_chunk.staging_counted = True
 
                 # Lazily build a per-worker staging strategy bound to this
                 # worker's private staging buffer (matches mooncake).
@@ -2563,10 +2563,7 @@ class NixlKVSender(CommonKVSender):
 
     def clear(self) -> None:
         super().clear()
-        if (
-            getattr(self.kv_mgr, "enable_staging", False)
-            and getattr(self.kv_mgr, "_staging_ctx", None) is not None
-        ):
+        if self.kv_mgr.enable_staging and self.kv_mgr._staging_ctx is not None:
             self.kv_mgr._staging_ctx.prefetched_rooms.discard(self.bootstrap_room)
             self.kv_mgr._staging_ctx.prefetch_requested = {
                 key
@@ -2622,11 +2619,11 @@ class NixlKVReceiver(CommonKVReceiver):
             return
 
         # Register staging room bootstrap info for staging handler
+        self.chunk_staging_infos = []
         if (
             self.kv_mgr.enable_staging
             and self.kv_mgr._staging_ctx.allocator is not None
         ):
-            self.chunk_staging_infos = []
             self.kv_mgr.register_staging_room_bootstrap(
                 self.bootstrap_room, self.bootstrap_infos, self
             )

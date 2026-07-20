@@ -1306,9 +1306,9 @@ class MooncakeKVManager(CommonKVManager):
                     continue
 
                 # Count each chunk once; the flag survives re-enqueue on defer.
-                if not getattr(kv_chunk, "_staging_counted", False):
+                if not kv_chunk.staging_counted:
                     self._staging_outstanding[kv_chunk.room] += 1
-                    kv_chunk._staging_counted = True
+                    kv_chunk.staging_counted = True
 
                 if (
                     self.enable_staging
@@ -1983,11 +1983,11 @@ class MooncakeKVReceiver(CommonKVReceiver):
             self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
             return
 
+        self.chunk_staging_infos = []
         if (
             self.kv_mgr.enable_staging
             and self.kv_mgr._staging_ctx.allocator is not None
         ):
-            self.chunk_staging_infos = []
             self.kv_mgr.register_staging_room_bootstrap(
                 self.bootstrap_room, self.bootstrap_infos, self
             )

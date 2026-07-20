@@ -101,7 +101,7 @@ class DecodeStagingHandler:
 
     def register_wm_subscriber(self, receiver, session_id: str) -> None:
         """Register a prefill's bootstrap connection for watermark broadcasts."""
-        if receiver is None or not getattr(receiver, "bootstrap_infos", None):
+        if receiver is None or not receiver.bootstrap_infos:
             return
         key = tuple(str(bi) for bi in receiver.bootstrap_infos)
         if key not in self._wm_subscribers:
@@ -187,12 +187,10 @@ class DecodeStagingHandler:
         # event is not yet in _chunk_events (submit_chunk_scatter records it
         # after launching the kernel), so no scatter reads a freed staging slot
         # or writes into KV-pool pages the failure path frees for reuse.
-        stream = getattr(self.staging_allocator, "_scatter_stream", None)
+        stream = self.staging_allocator._scatter_stream
         if stream is not None:
             stream.synchronize()
-        chunk_infos = (
-            getattr(receiver, "chunk_staging_infos", []) if receiver is not None else []
-        )
+        chunk_infos = receiver.chunk_staging_infos if receiver is not None else []
         unscattered_allocs = []
         for chunk_idx, info in enumerate(chunk_infos):
             if info[0] >= 0:
@@ -234,7 +232,7 @@ class DecodeStagingHandler:
             )
             return False
         receiver = self._room_to_receiver.get(room)
-        chunk_infos = getattr(receiver, "chunk_staging_infos", [])
+        chunk_infos = receiver.chunk_staging_infos if receiver is not None else []
         if chunk_idx >= len(chunk_infos):
             return False
         alloc_id, staging_offset, _, _, _ = chunk_infos[chunk_idx]
@@ -349,7 +347,7 @@ class DecodeStagingHandler:
             return
         room = decode_req.req.bootstrap_room
         receiver = self._room_to_receiver.get(room)
-        chunk_infos = getattr(receiver, "chunk_staging_infos", [])
+        chunk_infos = receiver.chunk_staging_infos if receiver is not None else []
         incomplete = bool(chunk_events) or any(info[0] >= 0 for info in chunk_infos)
         if not incomplete:
             decode_req._staging_scatter_done = True
@@ -394,7 +392,7 @@ class DecodeStagingHandler:
         device = k_buffers[0].device
         torch.cuda.set_device(device)
 
-        if not hasattr(self.staging_allocator, "_scatter_stream"):
+        if self.staging_allocator._scatter_stream is None:
             self.staging_allocator._scatter_stream = torch.cuda.Stream(device=device)
 
         scatter_stream = self.staging_allocator._scatter_stream
@@ -762,7 +760,7 @@ def handle_staging_req(
             session_id,
         )
         return
-    infos = getattr(receiver, "chunk_staging_infos", [])
+    infos = receiver.chunk_staging_infos
 
     if chunk_idx < len(infos) and infos[chunk_idx][0] >= 0:
         _, offset, rnd, end, _ = infos[chunk_idx]
