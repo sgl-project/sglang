@@ -537,6 +537,7 @@ class ModelRunner:
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             memory_pool_config=self.memory_pool_config,
+            draft_model_idx=self.draft_model_idx,
         )
 
     def init_mindspore_runner(self):
@@ -745,6 +746,11 @@ class ModelRunner:
         # Keep a reference so the shared byte buffer is not GC'd.
         self._unified_memory_pool = result.unified_memory_pool
 
+        self._init_post_memory_pool_components()
+
+    def _init_post_memory_pool_components(self):
+        """Post-pool component wiring, split out of alloc_memory_pool so forks
+        that build bespoke memory pools can reuse it after allocating them."""
         # Must be called AFTER init_memory_pool so the pool object exists for
         # canary to monkey-patch, and BEFORE init_decode_cuda_graph so warmup
         # forwards captured into the graph see the patched pool methods.
@@ -1546,7 +1552,6 @@ class ModelRunner:
         self.sampler.compute_logprobs_only(
             logits_output,
             forward_batch.sampling_info,
-            forward_batch.return_logprob,
             forward_batch.top_logprobs_nums,
             forward_batch.token_ids_logprobs,
         )

@@ -390,7 +390,7 @@ class ParallelLMHeadWithLoRA(BaseLayerWithLoRA):
     def set_lm_head_pass(self, pass_idx: int):
         """Set the active lm_head pass index before a logprobs chunk.
 
-        Called by InputLogprobProcessor.process_input_logprobs_by_chunk() before
+        Called by InputLogprobProcessor._forward_by_chunk() before
         each chunk's _get_logits call.  _get_lm_head_batch_info() will
         resolve to lm_head_pass_batch_infos[pass_idx].
         """
@@ -587,6 +587,43 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
             slices.append(B[offset + start_idx : offset + end_idx, :])
             offset += full_size
         return torch.concat(slices, dim=0)
+
+
+class InklingQKVRLinearWithLoRA(MergedColumnParallelLinearWithLoRA):
+    """LoRA wrapper for Inkling's fused q/k/v/r projection.
+
+    The base layer replicates K/V at load when attn_tp_size > num_kv_heads. The
+    adapter LoRA-B is stacked at the *unreplicated* sizes ``[q | k | v | r]`` (with
+    k, v = head_dim * num_kv_heads), so we slice the K/V blocks with replication —
+    each rank takes its kv-head's rows — to match the replicated base output. q and r
+    are head-partitioned uniformly. LoRA-A stays unsharded (inherited).
+    """
+
+    def slice_lora_b_weights(self, B: torch.Tensor, tp_rank: int):
+        bl = self.base_layer
+        hd, nkv, nh, dr, tp = (
+            bl.inkling_head_dim,
+            bl.inkling_num_kv_heads,
+            bl.inkling_num_heads,
+            bl.inkling_d_rel,
+            bl.inkling_tp_size,
+        )
+        q_size, kv_size, r_size = hd * nh, hd * nkv, dr * nh
+        q_off, k_off, v_off, r_off = 0, q_size, q_size + kv_size, q_size + 2 * kv_size
+        q_per, r_per = q_size // tp, r_size // tp
+        q = B[q_off + tp_rank * q_per : q_off + (tp_rank + 1) * q_per, :]
+        r = B[r_off + tp_rank * r_per : r_off + (tp_rank + 1) * r_per, :]
+        if tp > nkv:
+            # Replicate: each rank takes the single kv-head it shares (mirrors #15).
+            replicas = tp // nkv
+            kv_idx = tp_rank // replicas
+            k = B[k_off + kv_idx * hd : k_off + (kv_idx + 1) * hd, :]
+            v = B[v_off + kv_idx * hd : v_off + (kv_idx + 1) * hd, :]
+        else:
+            kv_per = kv_size // tp
+            k = B[k_off + tp_rank * kv_per : k_off + (tp_rank + 1) * kv_per, :]
+            v = B[v_off + tp_rank * kv_per : v_off + (tp_rank + 1) * kv_per, :]
+        return torch.concat([q, k, v, r], dim=0)
 
 
 class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
@@ -919,6 +956,17 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         else:
             runner_backend = MoeRunnerBackend.TRITON
 
+        # Unquantized layers have no marlin-repacked weights, so run their LoRA
+        # on Triton. Inkling shared experts use InklingBatchDenseMLP directly
+        # and never reach this wrapper.
+        if runner_backend.is_marlin():
+            from sglang.srt.layers.quantization.unquant import (
+                UnquantizedFusedMoEMethod,
+            )
+
+            if isinstance(base_layer.quant_method, UnquantizedFusedMoEMethod):
+                runner_backend = MoeRunnerBackend.TRITON
+
         # ===== TO BE REFACTORED ====
         self._lora_runner_backend = runner_backend
         if runner_backend.is_experimental_sgl_trtllm():
@@ -927,6 +975,13 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             )
 
             init_experimental_sgl_trtllm_lora(self, base_layer)
+            return
+        if runner_backend.is_experimental_sgl_marlin():
+            from sglang.srt.lora.marlin_lora_temp.lora_layer import (
+                init_experimental_sgl_marlin_lora,
+            )
+
+            init_experimental_sgl_marlin_lora(self, base_layer)
             return
         # ===== END TO BE REFACTORED ====
 
@@ -940,12 +995,16 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
                 CompressedTensorsFusedMoEMethod,
             )
+            from sglang.srt.layers.quantization.modelopt_quant import (
+                ModelOptNvFp4FusedMoEMethod,
+            )
 
             assert isinstance(
-                base_layer.quant_method, CompressedTensorsFusedMoEMethod
+                base_layer.quant_method,
+                (CompressedTensorsFusedMoEMethod, ModelOptNvFp4FusedMoEMethod),
             ), (
-                f"Marlin MoE backend requires CompressedTensorsFusedMoEMethod, "
-                f"got {type(base_layer.quant_method).__name__}"
+                f"Marlin MoE backend requires a quant method exposing "
+                f"get_marlin_quant_info, got {type(base_layer.quant_method).__name__}"
             )
             self._quant_info = base_layer.quant_method.get_marlin_quant_info(base_layer)
         elif runner_backend.is_triton():
@@ -986,9 +1045,9 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         # the Python weight_indices list, no GPU sync needed.
         has_active_lora = bool(getattr(batch_info, "has_active_lora", False))
 
-        if self._lora_runner_backend.is_experimental_sgl_trtllm():
-            # Per-rank (local) expert count the LoRA buffers are indexed by, so
-            # virtual-experts indexing matches the buffers under EP.
+        if self._lora_runner_backend.is_experimental_sgl_trtllm() or (
+            self._lora_runner_backend.is_experimental_sgl_marlin()
+        ):
             num_experts = (
                 self.down_lora_a_weights.shape[1]
                 if self.down_lora_a_weights is not None
@@ -1062,6 +1121,17 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
 
             combine_input = dispatch_experimental_sgl_trtllm_lora(
                 dispatch_output, quant_info, base_layer, lora_info
+            )
+        elif self._lora_runner_backend.is_experimental_sgl_marlin():
+            from sglang.srt.lora.marlin_lora_temp.lora_layer import (
+                dispatch_experimental_sgl_marlin_lora,
+            )
+
+            combine_input = dispatch_experimental_sgl_marlin_lora(
+                dispatch_output,
+                quant_info,
+                base_layer,
+                lora_info,
             )
         # ===== END TO BE REFACTORED ====
         else:
@@ -1194,6 +1264,10 @@ def get_lora_layer(
         ColumnParallelLinear: ColumnParallelLinearWithLoRA,
         RowParallelLinear: RowParallelLinearWithLoRA,
     }
+    # Inkling's fused qkvr needs replication-aware LoRA-B slicing (see InklingQKVRLinear);
+    # it IS a MergedColumnParallelLinear, so this must precede the isinstance loop.
+    if getattr(layer, "is_inkling_qkvr", False):
+        return InklingQKVRLinearWithLoRA(layer, lora_backend)
     for src_layer_type, lora_layer_type in supported_layer_types.items():
         if isinstance(layer, src_layer_type):  # pylint: disable=unidiomatic-typecheck
             ret = lora_layer_type(layer, lora_backend)
