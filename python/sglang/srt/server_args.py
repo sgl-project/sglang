@@ -953,6 +953,14 @@ class ServerArgs:
             aliases=["--decode-context-parallel-size"],
         ),
     ] = 1
+    dwdp_size: A[
+        int,
+        Arg(
+            help="DWDP (Distributed Weight Data Parallelism) group size. "
+            "When > 1, MoE prefill uses weight prefetch instead of token all-to-all. "
+            "Must equal tp_size. Only supported with --disaggregation-mode null or prefill.",
+        ),
+    ] = 1
     enable_prefill_cp: A[
         bool,
         "Enable context parallelism for the prefill phase. Select the layout with --cp-strategy.",
@@ -2943,6 +2951,10 @@ class ServerArgs:
         # resolution (the declarative registry materializes too late to affect
         # it). Inkling opts into full-graph prefill capture here.
         self._apply_inkling_prefill_cuda_graph_default()
+
+        # must run before _handle_cuda_graph_config and _handle_data_parallelism
+        self._handle_dwdp()
+
         self._handle_cuda_graph_config()
 
         # Handle device-specific backends.
@@ -4607,7 +4619,7 @@ class ServerArgs:
                 )
                 if (
                     expected_attn_tp_size is not None
-                    and effective_attn_tp_size != expected_attn_tp_size
+                    and expected_attn_tp_size % effective_attn_tp_size != 0
                 ):
                     raise ValueError(
                         "MiMoV2ForCausalLM requires effective attention TP "
@@ -5560,6 +5572,61 @@ class ServerArgs:
         from sglang.srt.layers.cp.base import init_cp_strategy
 
         init_cp_strategy(self)
+
+    def _handle_dwdp(self):
+        if self.dwdp_size <= 1:
+            return
+
+        assert (
+            self.dwdp_size >= 2
+        ), f"dwdp_size must be >= 2 when enabled, got {self.dwdp_size}"
+        assert (
+            self.dwdp_size == self.tp_size
+        ), f"dwdp_size ({self.dwdp_size}) must equal tp_size ({self.tp_size})"
+        assert self.disaggregation_mode in (
+            "null",
+            "prefill",
+        ), "DWDP requires --disaggregation-mode null or prefill"
+        assert (
+            not self.enable_eplb
+        ), "EPLB dynamic migration conflicts with static DWDP partitioning"
+        assert (
+            self.speculative_algorithm is None
+        ), "DWDP does not support speculative decoding (MTP/draft workers)"
+        assert self.pp_size == 1, "DWDP requires pp_size == 1"
+        assert (
+            not self.enable_two_batch_overlap
+        ), "DWDP's prefetch event protocol does not support two-batch overlap"
+
+        if self.disaggregation_mode == "null":
+            logger.warning(
+                "DWDP with --disaggregation-mode null: decode steps re-fetch all "
+                "remote expert weights every step, which is slow. DWDP is "
+                "recommended only with --disaggregation-mode prefill."
+            )
+
+        self.dp_size = self.dwdp_size
+        self.enable_dp_attention = True
+        self.enable_dp_attention_local_control_broadcast = True
+        self.enable_dp_lm_head = True
+        self.moe_dense_tp_size = 1
+        self.ep_size = self.dwdp_size
+        self.moe_ep_size = self.dwdp_size
+        self.moe_dp_size = 1
+        self.moe_a2a_backend = "none"
+
+        envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.set(True)
+
+        self.disable_cuda_graph = True
+
+        logger.info(
+            f"DWDP enabled: dwdp_size={self.dwdp_size}, "
+            f"auto-forced dp_size={self.dp_size}, moe_ep_size={self.moe_ep_size}, "
+            f"moe_dense_tp_size=1, moe_a2a_backend=none, "
+            f"dp_attention_local_control_broadcast=True, "
+            f"enable_dp_lm_head=True, SCHEDULER_SKIP_ALL_GATHER=True, "
+            f"disable_cuda_graph=True"
+        )
 
     def _handle_data_parallelism(self):
         # The dp_size==1 resets moved to the resolution pipeline
