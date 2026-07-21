@@ -1018,6 +1018,7 @@ def apply_qk_norm_rope(
     if (
         fused_enabled
         and _is_cuda
+        and not torch.compiler.is_compiling()
         and allow_inplace
         and (q_eps == k_eps)
         and q.dtype in (torch.float16, torch.bfloat16)
