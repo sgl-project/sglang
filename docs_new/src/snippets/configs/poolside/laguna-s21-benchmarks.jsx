@@ -20,7 +20,7 @@ export const benchmarks = [
     match: { hw: "h200", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
     verified: true,
     sglang_version: "0.5.15.post1",
-    accuracy: { gsm8k_pct: 94.24, aime25_pct: 67.29 },
+    accuracy: { gsm8k_pct: 94.24, aime25_pct: null },
   },
   {
     match: { hw: "h200", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
@@ -32,7 +32,7 @@ export const benchmarks = [
     match: { hw: "h200", variant: "default", quant: "int4", strategy: "high-throughput", nodes: "single" },
     verified: true,
     sglang_version: "0.5.15.post1",
-    accuracy: { gsm8k_pct: 95.00, aime25_pct: 67.71 },
+    accuracy: { gsm8k_pct: 95.00, aime25_pct: null },
   },
   {
     match: { hw: "h200", variant: "default", quant: "int4", strategy: "low-latency", nodes: "single" },
@@ -99,25 +99,25 @@ export const benchmarks = [
   {
     match: { hw: "gb300", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" },
     verified: true,
-    sglang_version: "dev/custom build (2026-07-20)",
+    sglang_version: "0.5.15",
     accuracy: { gsm8k_pct: 93.33, aime25_pct: null },
   },
   {
     match: { hw: "gb300", variant: "default", quant: "bf16", strategy: "low-latency", nodes: "single" },
     verified: true,
-    sglang_version: "dev/custom build (2026-07-20)",
+    sglang_version: "0.5.15",
     accuracy: { gsm8k_pct: 93.86, aime25_pct: null },
   },
   {
     match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
     verified: true,
-    sglang_version: "dev/custom build (2026-07-20)",
+    sglang_version: "0.5.15",
     accuracy: { gsm8k_pct: 94.77, aime25_pct: null },
   },
   {
     match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
     verified: true,
-    sglang_version: "dev/custom build (2026-07-20)",
+    sglang_version: "0.5.15",
     accuracy: { gsm8k_pct: 94.54, aime25_pct: null },
   },
   {
@@ -135,13 +135,13 @@ export const benchmarks = [
   {
     match: { hw: "gb300", variant: "default", quant: "int4", strategy: "high-throughput", nodes: "single" },
     verified: true,
-    sglang_version: "dev/custom build (2026-07-20)",
+    sglang_version: "0.5.15",
     accuracy: { gsm8k_pct: 94.77, aime25_pct: null },
   },
   {
     match: { hw: "gb300", variant: "default", quant: "int4", strategy: "low-latency", nodes: "single" },
     verified: true,
-    sglang_version: "dev/custom build (2026-07-20)",
+    sglang_version: "0.5.15",
     accuracy: { gsm8k_pct: 95.15, aime25_pct: null },
   },
 ];
