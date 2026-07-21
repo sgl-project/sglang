@@ -6,7 +6,7 @@ import logging
 import threading
 from array import array
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Optional, Sequence
 
 import torch
 
@@ -99,14 +99,18 @@ class FlexKVHybridRadixCache(BasePrefixCache):
 
         self._load_markers: dict[str, _LoadMarker] = {}
         self._inflight_store_nodes: dict[str, tuple[Any, DecLockRefParams]] = {}
+        self._store_generation = 0
         self._node_lock = threading.Lock()
 
     def reset(self) -> None:
+        # FlexKV still owns references to GPU source/destination slots while an
+        # asynchronous store or layerwise load is in flight. Drain those tasks
+        # before the inner cache releases the slots.
+        self.flexkv_connector.reset()
         self._inner_cache.reset()
         self._load_markers.clear()
         with self._node_lock:
             self._inflight_store_nodes.clear()
-        self.flexkv_connector.reset()
 
     def shutdown(self) -> None:
         self.flexkv_connector.shutdown()
@@ -292,10 +296,27 @@ class FlexKVHybridRadixCache(BasePrefixCache):
         if not is_insert:
             return
 
+        self._store_prefix(req, token_ids)
+
+    def cache_unfinished_req(self, req: Req, **kwargs) -> None:
+        self._apply_restore_swa_boundary(req)
+        self._inner_cache.cache_unfinished_req(req, **kwargs)
+        req._flexkv_uncached_restore = False
+
+        # A chunk boundary is not a reusable request boundary and its state may
+        # still be changing. The non-chunked call marks prefill completion, when
+        # DSv4's SWA/compress state exactly describes the prompt prefix.
+        if kwargs.get("chunked", False):
+            return
+        self._store_prefix(req, list(req.get_fill_ids()))
+
+    def _store_prefix(self, req: Req, token_ids: Sequence[int]) -> None:
+        """Store a page-aligned prefix and its exact SWA/state snapshot."""
+
         aligned_length = len(token_ids) // self.page_size * self.page_size
         if aligned_length <= 0:
             return
-        token_ids = token_ids[:aligned_length]
+        token_ids = list(token_ids[:aligned_length])
         key = RadixKey(
             array("q", token_ids),
             req.extra_key,
@@ -312,8 +333,11 @@ class FlexKVHybridRadixCache(BasePrefixCache):
             return
 
         lock_result = self._inner_cache.inc_lock_ref(node)
+        with self._node_lock:
+            store_key = f"{req.rid}:flexkv-store:{self._store_generation}"
+            self._store_generation += 1
         try:
-            task_id = self.flexkv_connector.store_kv(req.rid, token_ids, indices)
+            task_id = self.flexkv_connector.store_kv(store_key, token_ids, indices)
         except Exception:
             self._inner_cache.dec_lock_ref(node, lock_result.to_dec_params())
             raise
@@ -321,15 +345,10 @@ class FlexKVHybridRadixCache(BasePrefixCache):
             self._inner_cache.dec_lock_ref(node, lock_result.to_dec_params())
             return
         with self._node_lock:
-            self._inflight_store_nodes[req.rid] = (
+            self._inflight_store_nodes[store_key] = (
                 node,
                 lock_result.to_dec_params(),
             )
-
-    def cache_unfinished_req(self, req: Req, **kwargs) -> None:
-        self._apply_restore_swa_boundary(req)
-        self._inner_cache.cache_unfinished_req(req, **kwargs)
-        req._flexkv_uncached_restore = False
 
     @staticmethod
     def _apply_restore_swa_boundary(req: Req) -> None:

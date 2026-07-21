@@ -237,8 +237,13 @@ Either flag also sets `FLEXKV_CONFIG_PATH` so you can omit
 * When `host_hit_length > 0`, the scheduler later calls
   `init_load_back`, which allocates the uncached slots and fires
   `retrieve_kv` (FlexKV `launch` + `wait`).
-* `cache_finished_req` runs `put_match` + `launch` and stashes the
-  in-flight FlexKV task id. Source-node lock is held until
+* `cache_unfinished_req` stores the page-aligned prefill boundary so hybrid
+  models have an exact SWA/compress-state snapshot for prompt-prefix reuse.
+  Chunked-prefill boundaries are skipped because their state is still changing.
+* `cache_finished_req` also stores the final committed boundary. Each store runs
+  `put_match` + `launch` and gets an independent tracking key, so a short request
+  cannot overwrite an in-flight prefill store from the same request. The
+  source-node lock is held until
   `check_completed_stores` (called from `check_hicache_events` /
   `evict`) signals completion.
 
