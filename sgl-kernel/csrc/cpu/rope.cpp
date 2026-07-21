@@ -3,6 +3,137 @@
 
 namespace {
 
+struct RopeParams {
+  // Treat all tensors as [B, S, H, D]
+  //   2D [S, H * D] -> [1, S, H, D]
+  //   3D [S, H, D]  -> [1, S, H, D]
+  //   4D               [B, S, H, D]
+  int64_t rotary_dim{0};
+  int64_t head_size{0};
+  int64_t batches{1}, seqlen{1}, num_heads{1}, num_heads_kv{1};
+  int64_t q_strideB{0}, q_strideS{0}, q_strideH{0};
+  int64_t k_strideB{0}, k_strideS{0}, k_strideH{0};
+
+  RopeParams(const at::Tensor& query, const at::Tensor& key, int64_t head_size_, int64_t rotary_dim_)
+      : rotary_dim(rotary_dim_), head_size(head_size_) {
+    int64_t ndim = query.dim();
+    switch (ndim) {
+      case 2:
+        seqlen = query.size(0);
+        num_heads = query.size(1) / head_size;
+        num_heads_kv = key.size(1) / head_size;
+        q_strideS = query.stride(0);
+        k_strideS = key.stride(0);
+        q_strideH = head_size;
+        k_strideH = head_size;
+        break;
+      case 3:
+        seqlen = query.size(0);
+        num_heads = query.size(1);
+        num_heads_kv = key.size(1);
+        q_strideS = query.stride(0);
+        k_strideS = key.stride(0);
+        q_strideH = query.stride(1);
+        k_strideH = key.stride(1);
+        break;
+      case 4:
+        batches = query.size(0);
+        seqlen = query.size(1);
+        num_heads = query.size(2);
+        num_heads_kv = key.size(2);
+        q_strideB = query.stride(0);
+        k_strideB = key.stride(0);
+        q_strideS = query.stride(1);
+        k_strideS = key.stride(1);
+        q_strideH = query.stride(2);
+        k_strideH = key.stride(2);
+        break;
+      default:
+        TORCH_CHECK(false, "Expected a 2D/3D/4D tensor, got ", ndim, "D.");
+    }
+  }
+
+  inline int64_t rows() const {
+    return batches * seqlen;
+  }
+  inline int64_t q_offset(int64_t b, int64_t s, int64_t h) const {
+    return b * q_strideB + s * q_strideS + h * q_strideH;
+  }
+  inline int64_t k_offset(int64_t b, int64_t s, int64_t h) const {
+    return b * k_strideB + s * k_strideS + h * k_strideH;
+  }
+  inline int64_t q_out_offset(int64_t b, int64_t s, int64_t h) const {
+    return ((b * seqlen + s) * num_heads + h) * head_size;
+  }
+  inline int64_t k_out_offset(int64_t b, int64_t s, int64_t h) const {
+    return ((b * seqlen + s) * num_heads_kv + h) * head_size;
+  }
+};
+
+enum class RotaryMode {
+  Interleaved,  // GPT-J
+  Neox,
+};
+
+template <typename scalar_t, RotaryMode rotary_mode>
+struct RotaryEmbedInternal;
+
+template <typename scalar_t>
+struct RotaryEmbedInternal<scalar_t, RotaryMode::Interleaved> {
+  static inline void
+  apply(scalar_t* __restrict__ out, const scalar_t* __restrict__ input, const scalar_t* __restrict__ cache, int size) {
+    constexpr int kVecSize = at::vec::Vectorized<scalar_t>::size();
+    const int half_size = size / 2;
+
+    int d = 0;
+    for (; d <= size - kVecSize; d += kVecSize) {
+      auto [xy0, xy1] = load_float_vec2(input + d);
+      auto [x, y] = at::vec::deinterleave2(xy0, xy1);
+      auto cos = load_float_vec(cache + d / 2);
+      auto sin = load_float_vec(cache + half_size + d / 2);
+      auto out0 = x * cos - y * sin;
+      auto out1 = y * cos + x * sin;
+      std::tie(xy0, xy1) = at::vec::interleave2(out0, out1);
+      convert_from_float_ext<scalar_t>(xy0, xy1).store(out + d);
+    }
+    for (; d < size; d += 2) {
+      float x = input[d], y = input[d + 1];
+      float cos = cache[d >> 1], sin = cache[half_size + (d >> 1)];
+      out[d] = static_cast<scalar_t>(x * cos - y * sin);
+      out[d + 1] = static_cast<scalar_t>(y * cos + x * sin);
+    }
+  }
+};
+
+template <typename scalar_t>
+struct RotaryEmbedInternal<scalar_t, RotaryMode::Neox> {
+  static inline void
+  apply(scalar_t* __restrict__ out, const scalar_t* __restrict__ input, const scalar_t* __restrict__ cache, int size) {
+    constexpr int kVecSize = at::vec::Vectorized<scalar_t>::size();
+
+    const int half_size = size / 2;
+    int d = 0;
+    for (; d <= half_size - kVecSize; d += kVecSize) {
+      auto [x0, x1] = load_float_vec2(input + d);
+      auto [y0, y1] = load_float_vec2(input + half_size + d);
+      auto [cos0, cos1] = load_float_vec2(cache + d);
+      auto [sin0, sin1] = load_float_vec2(cache + half_size + d);
+      auto out0 = x0 * cos0 - y0 * sin0;
+      auto out1 = x1 * cos1 - y1 * sin1;
+      auto out2 = y0 * cos0 + x0 * sin0;
+      auto out3 = y1 * cos1 + x1 * sin1;
+      convert_from_float_ext<scalar_t>(out0, out1).store(out + d);
+      convert_from_float_ext<scalar_t>(out2, out3).store(out + half_size + d);
+    }
+    for (; d < half_size; ++d) {
+      float x = input[d], y = input[d + half_size];
+      float cos = cache[d], sin = cache[d + half_size];
+      out[d] = static_cast<scalar_t>(x * cos - y * sin);
+      out[d + half_size] = static_cast<scalar_t>(y * cos + x * sin);
+    }
+  }
+};
+
 template <typename scalar_t>
 void rotary_embedding_3D_kernel_impl(
     scalar_t* __restrict__ query_out,
@@ -68,105 +199,42 @@ void rotary_embedding_3D_kernel_impl(
   });
 }
 
-template <typename scalar_t>
-void rotary_embedding_neox_4D_kernel_impl(
-    int64_t* __restrict__ positions,
+template <typename scalar_t, RotaryMode mode, bool inplace, typename CachePos>
+void rotary_embedding_kernel_impl(
+    scalar_t* __restrict__ query_out,
+    scalar_t* __restrict__ key_out,
     scalar_t* __restrict__ query,
     scalar_t* __restrict__ key,
-    scalar_t* __restrict__ cos_sin_cache,
-    int64_t rotary_dim,
-    int64_t query_stride_b,
-    int64_t query_stride_s,
-    int64_t query_stride_h,
-    int64_t key_stride_b,
-    int64_t key_stride_s,
-    int64_t key_stride_h,
-    int64_t num_heads,
-    int64_t num_kv_heads,
-    int64_t head_size,
-    int64_t batch_size,
-    int64_t seq_len) {
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
-  constexpr int64_t bVecSize = bVec::size();
-
-  int64_t embed_dim = rotary_dim / 2;
-  bool flag = (embed_dim % bVecSize == 0);
-  int64_t loop_upper = flag ? embed_dim : embed_dim - bVecSize;
-
-  auto compute_loop = [&](int64_t token_head, scalar_t* cache_ptr, scalar_t* qk) {
-    int64_t j = 0;
-    for (; j < loop_upper; j += bVecSize) {
-      int64_t rot_offset = j;
-      int64_t x_index = rot_offset;
-      int64_t y_index = embed_dim + rot_offset;
-
-      int64_t out_x = token_head + x_index;
-      int64_t out_y = token_head + y_index;
-
-      bVec _cos = bVec::loadu(cache_ptr + x_index);
-      bVec _sin = bVec::loadu(cache_ptr + y_index);
-
-      bVec _q_x = bVec::loadu(qk + out_x);
-      bVec _q_y = bVec::loadu(qk + out_y);
-      fVec _cos_0, _cos_1;
-      std::tie(_cos_0, _cos_1) = at::vec::convert_to_float(_cos);
-      fVec _sin_0, _sin_1;
-      std::tie(_sin_0, _sin_1) = at::vec::convert_to_float(_sin);
-      fVec _q_x_0, _q_x_1;
-      std::tie(_q_x_0, _q_x_1) = at::vec::convert_to_float(_q_x);
-      fVec _q_y_0, _q_y_1;
-      std::tie(_q_y_0, _q_y_1) = at::vec::convert_to_float(_q_y);
-
-      auto out1_0 = _q_x_0 * _cos_0 - _q_y_0 * _sin_0;
-      auto out1_1 = _q_x_1 * _cos_1 - _q_y_1 * _sin_1;
-      auto out1 = convert_from_float_ext<scalar_t>(out1_0, out1_1);
-      out1.store(qk + out_x);
-
-      auto out2_0 = _q_y_0 * _cos_0 + _q_x_0 * _sin_0;
-      auto out2_1 = _q_y_1 * _cos_1 + _q_x_1 * _sin_1;
-      auto out2 = convert_from_float_ext<scalar_t>(out2_0, out2_1);
-      out2.store(qk + out_y);
-    }
-    if (!flag) {
-      for (; j < embed_dim; ++j) {
-        int64_t x_index = j;
-        int64_t y_index = embed_dim + j;
-
-        int64_t out_x = token_head + x_index;
-        int64_t out_y = token_head + y_index;
-
-        float _cos = cache_ptr[x_index];
-        float _sin = cache_ptr[y_index];
-
-        float _q_x = qk[out_x];
-        float _q_y = qk[out_y];
-
-        qk[out_x] = _q_x * _cos - _q_y * _sin;
-        qk[out_y] = _q_y * _cos + _q_x * _sin;
+    const RopeParams& p,
+    const CachePos& cache_pos) {
+  at::parallel_for(0, p.rows(), 0, [&](int64_t begin, int64_t end) {
+    int64_t bs = 0, seq = 0;
+    data_index_init(begin, bs, p.batches, seq, p.seqlen);
+    for (int64_t i = begin; i < end; ++i) {
+      const scalar_t* cache = cache_pos(bs * p.seqlen + seq);
+      for (int64_t h = 0; h < p.num_heads; ++h) {
+        scalar_t* q_in = query + p.q_offset(bs, seq, h);
+        scalar_t* q_out;
+        if constexpr (inplace) {
+          q_out = q_in;
+        } else {
+          q_out = query_out + p.q_out_offset(bs, seq, h);
+        }
+        RotaryEmbedInternal<scalar_t, mode>::apply(q_out, q_in, cache, p.rotary_dim);
       }
-    }
-  };
-
-#pragma omp parallel for collapse(2)
-  for (int64_t bs = 0; bs < batch_size; ++bs) {
-    for (int64_t seq = 0; seq < seq_len; ++seq) {
-      int64_t pos = positions[bs * seq_len + seq];
-      scalar_t* cache_ptr = cos_sin_cache + pos * rotary_dim;
-
-      for (int64_t i = 0; i < num_heads; ++i) {
-        int64_t head_idx = i;
-        int64_t token_head = bs * query_stride_b + seq * query_stride_s + head_idx * query_stride_h;
-        compute_loop(token_head, cache_ptr, query);
+      for (int64_t h = 0; h < p.num_heads_kv; ++h) {
+        scalar_t* k_in = key + p.k_offset(bs, seq, h);
+        scalar_t* k_out;
+        if constexpr (inplace) {
+          k_out = k_in;
+        } else {
+          k_out = key_out + p.k_out_offset(bs, seq, h);
+        }
+        RotaryEmbedInternal<scalar_t, mode>::apply(k_out, k_in, cache, p.rotary_dim);
       }
-
-      for (int64_t i = 0; i < num_kv_heads; ++i) {
-        int64_t head_idx = i;
-        int64_t token_head = bs * key_stride_b + seq * key_stride_s + head_idx * key_stride_h;
-        compute_loop(token_head, cache_ptr, key);
-      }
+      data_index_step(bs, p.batches, seq, p.seqlen);
     }
-  }
+  });
 }
 
 template <typename scalar_t>
@@ -633,6 +701,9 @@ void multimodal_rotary_embedding_2D_kernel_impl(
 
 }  // namespace
 
+// 2D : [num_tokens, num_heads*head_size] inplace
+// 3D : [num_tokens, num_heads, head_size] outplace
+// 4D : [batch_size, seq_len, num_heads, head_size] inplace
 std::tuple<at::Tensor, at::Tensor> rotary_embedding_cpu(
     at::Tensor& positions,
     at::Tensor& query,
@@ -643,127 +714,56 @@ std::tuple<at::Tensor, at::Tensor> rotary_embedding_cpu(
   CHECK_DIM(1, positions);
   const auto input_dim = query.dim();
   const auto input_dtype = query.scalar_type();
-  TORCH_CHECK(
-      input_dim == 2 || input_dim == 3 || input_dim == 4,
-      " Query/Key must be 2D [num_tokens, num_heads*head_size] or 3D [num_tokens, num_heads, head_size] or 4D "
-      "[batch_size, seq_len, num_heads, head_size] tensor");
+
   CHECK_DIM(2, cos_sin_cache);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(query);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(key);
-
-  int64_t rotary_dim = cos_sin_cache.size(1);
-  if (input_dim == 3) {
-    // TODO: add support for head_dim != rotary_dim case when input_dim=3
-    CHECK_EQ(query.size(-1), rotary_dim);
-    // TODO: add support for kv_head != 1
-    CHECK_EQ(key.size(1), 1);
-  }
-
-  int64_t num_tokens = positions.numel();
-  if (input_dim <= 3) {
-    CHECK_EQ(key.size(0), num_tokens);
-    CHECK_EQ(query.size(0), num_tokens);
-  }
-
   TORCH_CHECK(positions.scalar_type() == at::kLong, "expect positions to be int64, got ", positions.scalar_type());
   TORCH_CHECK(input_dtype == key.scalar_type(), "query and key must have the same data type");
   TORCH_CHECK(input_dtype == cos_sin_cache.scalar_type(), "query and cos_sin_cache must have the same data type");
 
-  int64_t num_heads = input_dim == 2 ? query.size(-1) / head_size : query.size(-2);
-  int64_t num_kv_heads = input_dim == 2 ? key.size(-1) / head_size : key.size(-2);
-  int64_t key_stride_s = key.stride(0);
-  int64_t query_stride_s = query.stride(0);
+  int64_t rotary_dim = cos_sin_cache.size(1);
+  const RopeParams p{query, key, head_size, rotary_dim};
+  TORCH_CHECK(positions.numel() == p.rows(), "positions.numel() must equal batch * seqlen");
 
-  int64_t query_stride_h = input_dim == 2 ? head_size : query.stride(-2);
-  int64_t key_stride_h = input_dim == 2 ? head_size : key.stride(-2);
-  at::Tensor query_out = at::empty_like(query);
-  at::Tensor key_out = at::empty_like(key);
-  int64_t query_out_stride_s = query_out.stride(0);
-  int64_t key_out_stride_s = key_out.stride(0);
-  // output stride of num head dim is meaningful only when input dim = 3
-  int64_t query_out_stride_h = input_dim == 3 ? query_out.stride(1) : -1;
-  int64_t batch_size = 1;
-  int64_t seq_len = num_tokens;
-  int64_t query_stride_b = 0;
-  int64_t key_stride_b = 0;
+  if (input_dim == 2) {
+    TORCH_CHECK(query.size(-1) % head_size == 0, "query last dim must be divisible by head_size");
+    TORCH_CHECK(key.size(-1) % head_size == 0, "key last dim must be divisible by head_size");
+  }
+  if (input_dim == 3) {
+    // out-of-place path: align with legacy behavior, no partial rotary
+    CHECK_EQ(query.size(-1), rotary_dim);
+    CHECK_EQ(key.size(-1), rotary_dim);
+    CHECK_EQ(head_size, rotary_dim);
+  }
   if (input_dim == 4) {
-    batch_size = query.size(0);
-    seq_len = query.size(1);
-    query_stride_b = query.stride(0);
-    key_stride_b = key.stride(0);
-    query_stride_s = query.stride(1);
-    key_stride_s = key.stride(1);
-    CHECK_EQ(batch_size, key.size(0));
-    CHECK_EQ(seq_len, key.size(1));
-    CHECK_EQ(key.size(0) * key.size(1), num_tokens);
-    CHECK_EQ(query.size(0) * query.size(1), num_tokens);
+    CHECK_EQ(query.size(0), key.size(0));
+    CHECK_EQ(query.size(1), key.size(1));
   }
 
+  at::Tensor query_out = (input_dim != 3) ? query : at::empty_like(query);
+  at::Tensor key_out = (input_dim != 3) ? key : at::empty_like(key);
   AT_DISPATCH_REDUCED_FLOATING_TYPES(input_dtype, "rotary_embedding_cpu", [&] {
-    if (input_dim == 2 || input_dim == 4) {
-      if (is_neox) {
-        rotary_embedding_neox_4D_kernel_impl<scalar_t>(
-            positions.data_ptr<int64_t>(),
-            query.data_ptr<scalar_t>(),
-            key.data_ptr<scalar_t>(),
-            cos_sin_cache.data_ptr<scalar_t>(),
-            rotary_dim,
-            query_stride_b,
-            query_stride_s,
-            query_stride_h,
-            key_stride_b,
-            key_stride_s,
-            key_stride_h,
-            num_heads,
-            num_kv_heads,
-            head_size,
-            batch_size,
-            seq_len);
-      } else {
-        rotary_embedding_4D_kernel_impl<scalar_t>(
-            positions.data_ptr<int64_t>(),
-            query.data_ptr<scalar_t>(),
-            key.data_ptr<scalar_t>(),
-            cos_sin_cache.data_ptr<scalar_t>(),
-            rotary_dim,
-            query_stride_b,
-            query_stride_s,
-            query_stride_h,
-            key_stride_b,
-            key_stride_s,
-            key_stride_h,
-            num_heads,
-            num_kv_heads,
-            head_size,
-            batch_size,
-            seq_len);
-      }
-      query_out = query;
-      key_out = key;
+    AT_DISPATCH_BOOL(input_dim != 3, inplace, [&] {
+      const scalar_t* cache_base = cos_sin_cache.data_ptr<scalar_t>();
+      const int64_t* pos_ptr = positions.data_ptr<int64_t>();
+      auto cache_pos = [cache_base, pos_ptr, rotary_dim](int64_t token) -> const scalar_t* {
+        return cache_base + pos_ptr[token] * rotary_dim;
+      };
 
-    } else {
-      TORCH_CHECK(
-          is_neox == false, " Query/Key with 3D [num_tokens, num_heads, head_size] does not support neox rope yet");
-      // TODO: add neox style support for rope impl with 3D inputs
-      rotary_embedding_3D_kernel_impl<scalar_t>(
-          query_out.data_ptr<scalar_t>(),
-          key_out.data_ptr<scalar_t>(),
-          positions.data_ptr<int64_t>(),
-          query.data_ptr<scalar_t>(),
-          key.data_ptr<scalar_t>(),
-          cos_sin_cache.data_ptr<scalar_t>(),
-          num_tokens,
-          num_heads,
-          num_kv_heads,
-          head_size,
-          rotary_dim,
-          query_stride_s,
-          query_out_stride_s,
-          key_out_stride_s,
-          key_stride_s,
-          query_stride_h,
-          query_out_stride_h);
-    }
+      scalar_t* q_ptr = query.data_ptr<scalar_t>();
+      scalar_t* k_ptr = key.data_ptr<scalar_t>();
+      scalar_t* q_out_ptr = query_out.data_ptr<scalar_t>();
+      scalar_t* k_out_ptr = key_out.data_ptr<scalar_t>();
+
+      if (is_neox) {
+        rotary_embedding_kernel_impl<scalar_t, RotaryMode::Neox, inplace>(
+            q_out_ptr, k_out_ptr, q_ptr, k_ptr, p, cache_pos);
+      } else {
+        rotary_embedding_kernel_impl<scalar_t, RotaryMode::Interleaved, inplace>(
+            q_out_ptr, k_out_ptr, q_ptr, k_ptr, p, cache_pos);
+      }
+    });
   });
   return std::make_tuple(query_out, key_out);
 }
@@ -858,6 +858,11 @@ std::tuple<at::Tensor, at::Tensor> multimodal_rotary_embedding_cpu(
   TORCH_CHECK(input_dtype == key.scalar_type(), "query and key must have the same data type");
   TORCH_CHECK(input_dtype == cos_sin_cache.scalar_type(), "query and cos_sin_cache must have the same data type");
 
+  const RopeParams p{query, key, head_size, rotary_dim};
+  TORCH_CHECK(p.rotary_dim <= p.head_size, "rotary_dim must be <= head_size");
+  TORCH_CHECK(p.rotary_dim % 2 == 0, "rotary_dim must be even");
+  TORCH_CHECK(positions.numel() == p.rows(), "positions numel must equal batch*seqlen");
+
   int64_t num_heads = query.size(-1) / head_size;
   int64_t num_kv_heads = key.size(-1) / head_size;
   int64_t key_stride_s = key.stride(0);
@@ -913,42 +918,19 @@ std::tuple<at::Tensor, at::Tensor> multimodal_rotary_embedding_cpu(
     });
   } else {  // positions.dim() == 1
     AT_DISPATCH_REDUCED_FLOATING_TYPES(input_dtype, "rotary_embedding_cpu", [&] {
+      const scalar_t* cache_base = cos_sin_cache.data_ptr<scalar_t>();
+      const int64_t* pos_ptr = positions.data_ptr<int64_t>();
+      auto cache_pos = [cache_base, pos_ptr, rotary_dim](int64_t token) -> const scalar_t* {
+        return cache_base + pos_ptr[token] * rotary_dim;
+      };
+
+      scalar_t* q_ptr = query.data_ptr<scalar_t>();
+      scalar_t* k_ptr = key.data_ptr<scalar_t>();
+
       if (is_neox) {
-        rotary_embedding_neox_4D_kernel_impl<scalar_t>(
-            positions.data_ptr<int64_t>(),
-            query.data_ptr<scalar_t>(),
-            key.data_ptr<scalar_t>(),
-            cos_sin_cache.data_ptr<scalar_t>(),
-            rotary_dim,
-            0,
-            query_stride_s,
-            head_size,
-            0,
-            key_stride_s,
-            head_size,
-            num_heads,
-            num_kv_heads,
-            head_size,
-            1,
-            num_tokens);
+        rotary_embedding_kernel_impl<scalar_t, RotaryMode::Neox, true>(q_ptr, k_ptr, q_ptr, k_ptr, p, cache_pos);
       } else {
-        rotary_embedding_4D_kernel_impl<scalar_t>(
-            positions.data_ptr<int64_t>(),
-            query.data_ptr<scalar_t>(),
-            key.data_ptr<scalar_t>(),
-            cos_sin_cache.data_ptr<scalar_t>(),
-            rotary_dim,
-            0,
-            query_stride_s,
-            head_size,
-            0,
-            key_stride_s,
-            head_size,
-            num_heads,
-            num_kv_heads,
-            head_size,
-            1,
-            num_tokens);
+        rotary_embedding_kernel_impl<scalar_t, RotaryMode::Interleaved, true>(q_ptr, k_ptr, q_ptr, k_ptr, p, cache_pos);
       }
     });
   }
