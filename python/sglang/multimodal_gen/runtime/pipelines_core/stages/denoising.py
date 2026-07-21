@@ -2076,7 +2076,10 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         runner = self._maybe_get_bcg_runner(current_model)
         if runner is not None:
             model_output = self._bcg_run(runner, call_kwargs, current_model)
-        elif envs.SGLANG_DIFFUSION_DIT_FULL_CUDA_GRAPH and not self._bcg_is_warmup():
+        elif (
+            getattr(self.server_args, "dit_cuda_graph", "off") == "full"
+            and not self._bcg_is_warmup()
+        ):
             fcg = getattr(current_model, "_full_graph_runner", None)
             if fcg is None:
                 fcg = _FullGraphRunner(current_model)

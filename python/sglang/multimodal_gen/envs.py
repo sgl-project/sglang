@@ -35,7 +35,6 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_STAGE_LOGGING: bool = False
     SGLANG_DIFFUSION_CFG_GATE_STEP: float = 1.0
     # cache-dit env vars (primary transformer)
-    SGLANG_DIFFUSION_DIT_FULL_CUDA_GRAPH: bool = False
     SGLANG_CACHE_DIT_ENABLED: bool = False
     SGLANG_CACHE_DIT_FN: int = 1
     SGLANG_CACHE_DIT_BN: int = 0
@@ -271,10 +270,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # ================== cache-dit Env Vars ==================
     # Enable cache-dit acceleration for DiT inference
-    # Capture the whole DiT forward (incl. SP collectives) into one CUDA graph
-    "SGLANG_DIFFUSION_DIT_FULL_CUDA_GRAPH": _lazy_bool(
-        "SGLANG_DIFFUSION_DIT_FULL_CUDA_GRAPH"
-    ),
     "SGLANG_CACHE_DIT_ENABLED": _lazy_bool("SGLANG_CACHE_DIT_ENABLED"),
     # Number of first blocks to always compute (DBCache F parameter)
     "SGLANG_CACHE_DIT_FN": _lazy_int("SGLANG_CACHE_DIT_FN", 1),
