@@ -354,12 +354,13 @@ fn trim_stop_token(
 }
 
 /// Remove the matched stop string from the decoded final chunk (Python
-/// `trim_matched_stop`, string branch); `no_stop_trim` keeps it.
+/// `trim_matched_stop`, string branch); `no_stop_trim` keeps it. Truncates at
+/// the FIRST occurrence.
 fn trim_stop_str(text: &mut String, stop: &str, no_stop_trim: bool) {
     if stop.is_empty() {
         return;
     }
-    if let Some(pos) = text.rfind(stop) {
+    if let Some(pos) = text.find(stop) {
         text.truncate(if no_stop_trim { pos + stop.len() } else { pos });
     }
 }
@@ -426,6 +427,15 @@ mod tests {
         let mut t = "abc".to_string();
         trim_stop_str(&mut t, "", false);
         assert_eq!(t, "abc");
+
+        // The stop can occur twice in the final chunk
+        let mut t = "a STOP b STOP".to_string();
+        trim_stop_str(&mut t, "STOP", false);
+        assert_eq!(t, "a ");
+
+        let mut t = "a STOP b STOP".to_string();
+        trim_stop_str(&mut t, "STOP", true);
+        assert_eq!(t, "a STOP");
     }
 
     /// Drive a final (`finish_reason`) chunk through `handle_chunk` in skip mode and

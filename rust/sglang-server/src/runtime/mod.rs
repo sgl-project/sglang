@@ -165,6 +165,16 @@ impl ServerArgs {
             .map(str::to_owned)
     }
 
+    /// `model_config.vocab_size` — bounds client-supplied token ids (the
+    /// scheduler crashes on an out-of-vocabulary embedding lookup, so the
+    /// ingress must 400 first, mirroring the Python TokenizerManager).
+    pub fn vocab_size(&self) -> Option<u64> {
+        self.data
+            .get("model_config")
+            .and_then(|m| m.get("vocab_size"))
+            .and_then(|v| v.as_u64())
+    }
+
     /// sglang package version, stamped into the blob by `_build_server_args`.
     pub fn version(&self) -> Option<&str> {
         self.str_field("version").filter(|s| !s.is_empty())
@@ -433,6 +443,7 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
                 senders.clone(),
                 ingress_tx,
                 skip_tokenizer_init,
+                cfg.server_args.vocab_size(),
                 shutdown_rx.clone(),
             )
         });
@@ -570,6 +581,65 @@ mod tests {
             "shutdown took {elapsed:?} with an in-flight request (deadlock?)",
         );
         drop(conn);
+    }
+
+    /// Regression: a >2MB body must reach the JSON layer and fail on its
+    /// *content* (unknown field → 4xx), never on size (413).
+    #[test]
+    fn accepts_multi_megabyte_generate_body() {
+        use std::io::{Read, Write};
+
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+
+        let server_args = ServerArgs::from_json(r#"{"skip_tokenizer_init": true}"#).unwrap();
+        let cfg = RuntimeConfig {
+            http_addr: addr,
+            api_worker_num: 1,
+            tokenizer_worker_num: 1,
+            detokenizer_worker_num: 1,
+            server_args: Arc::new(server_args),
+            ..Default::default()
+        };
+        let rt = start(cfg).expect("start runtime");
+
+        // ~3MB of input_ids + an unknown field: deny_unknown_fields fails it
+        // fast at the JSON layer with a 400 — proving the body got past any
+        // size limit (a 413 would fire before parsing).
+        let ids = "1,".repeat(1_500_000);
+        let body = format!(
+            r#"{{"input_ids":[{}1],"bogus":1,"sampling_params":{{"max_new_tokens":1}}}}"#,
+            ids
+        );
+        assert!(body.len() > 2 * 1024 * 1024, "test body must exceed 2MB");
+
+        let mut conn = std::net::TcpStream::connect(addr).expect("connect");
+        let req = format!(
+            "POST /generate HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        conn.write_all(req.as_bytes()).unwrap();
+        conn.flush().unwrap();
+
+        let mut response = String::new();
+        conn.read_to_string(&mut response).unwrap();
+        let status_line = response.lines().next().unwrap_or("");
+        let code: u16 = status_line
+            .split_whitespace()
+            .nth(1)
+            .and_then(|c| c.parse().ok())
+            .unwrap_or(0);
+        // 422 (axum Json unknown-field rejection) proves the body was parsed;
+        // 413 would mean it was rejected on size before parsing.
+        assert!(
+            (400..500).contains(&code) && code != 413,
+            "expected a JSON-layer 4xx (not 413), got: {status_line}"
+        );
+
+        rt.request_shutdown();
     }
 
     /// Regression: a port conflict must fail `start` (so the scheduler doesn't
