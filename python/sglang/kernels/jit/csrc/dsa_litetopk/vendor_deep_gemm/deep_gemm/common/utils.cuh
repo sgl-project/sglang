@@ -1,7 +1,6 @@
 #pragma once
 
 #include <cuda/std/cstdint>
-
 #include <deep_gemm/common/exception.cuh>
 
 namespace deep_gemm::utils {
@@ -14,7 +13,9 @@ struct PatternVisitor {
   explicit PatternVisitor(FuncT&& func) : func(std::forward<FuncT>(func)) {}
 
   CUTLASS_HOST_DEVICE
-  auto operator[](const uint32_t& i) const { return func(i); }
+  auto operator[](const uint32_t& i) const {
+    return func(i);
+  }
 };
 
 template <uint32_t kNumBytes>
@@ -28,8 +29,7 @@ struct Vectorized {
     } else if constexpr (kNumBytes > 0 and kNumBytes % 4 == 0) {
       return 0;
     } else {
-      DG_STATIC_ASSERT(kNumBytes > 0 and kNumBytes % 4 == 0,
-                       "Invalid vectorization");
+      DG_STATIC_ASSERT(kNumBytes > 0 and kNumBytes % 4 == 0, "Invalid vectorization");
     }
   }
 
