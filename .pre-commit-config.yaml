@@ -1,5 +1,5 @@
 default_stages: [pre-commit, pre-push, manual]
-exclude: ^(python/sglang/multimodal_gen/csrc|python/sglang/jit_kernel/flash_attention/cute)
+exclude: ^(python/sglang/multimodal_gen/csrc|python/sglang/kernels/ops/diffusion/render|python/sglang/jit_kernel/flash_attention/cute)
 
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
@@ -11,9 +11,14 @@ repos:
       - id: end-of-file-fixer
       - id: check-yaml
         args: [--allow-multiple-documents]
+        # Helm chart templates embed Go template syntax ({{- ... -}})
+        # that is not valid YAML on its own; the rendered output is
+        # validated by `helm template` / `helm lint`.
+        exclude: ^experimental/sgl-router/helm/.*/templates/.*\.(yaml|tpl)$
       - id: check-toml
       - id: check-ast
       - id: check-added-large-files
+        args: ['--maxkb=1500']
       - id: check-merge-conflict
       - id: check-shebang-scripts-are-executable
       - id: detect-private-key
@@ -30,9 +35,9 @@ repos:
     hooks:
       - id: ruff
         args:
-          - --select=F401,F821
+          - --select=F401,F821,UP037
           - --fix
-        files: ^(benchmark/|docs/|examples/|python/sglang/|sgl-model-gateway/py_*|test/)
+        files: ^(benchmark/|docs_new/|examples/|python/sglang/|sgl-model-gateway/py_*|test/)
         exclude: |
           (?x)^(
           .*/__init__\.py$|
@@ -88,25 +93,37 @@ repos:
         files: ^\.github/workflows/.*\.yml$
         pass_filenames: false
       - id: check-registered-tests
-        name: check registered tests have CI registry
+        name: validate registered test CI registries
         entry: python3 scripts/ci/check_registered_tests.py
         language: system
         files: ^test/registered/.*\.py$
         exclude: ^test/registered/.*/utils\.py$
         pass_filenames: false
-      - id: check-no-docs-changes
-        name: reject changes under legacy docs/
-        entry: python3 scripts/ci/check_no_docs_changes.py
+      - id: check-no-registered-tests-in-package
+        name: reject CI-registered tests inside the sglang package
+        entry: python3 scripts/ci/check_no_registered_tests_in_package.py
         language: system
+        files: ^python/sglang/.*\.py$
         pass_filenames: false
-        always_run: true
-        stages: [pre-commit]
       - id: rustfmt-sgl-model-gateway
         name: rustfmt sgl-model-gateway (nightly)
         entry: bash -c 'rustup component add --toolchain nightly rustfmt >/dev/null && cd sgl-model-gateway && cargo +nightly fmt -- --check'
         language: system
         files: ^sgl-model-gateway/.*\.rs$
         pass_filenames: false
+      - id: rustfmt-sgl-router
+        name: rustfmt experimental/sgl-router
+        entry: bash -c 'cd experimental/sgl-router && cargo fmt -- --check'
+        language: system
+        files: ^experimental/sgl-router/.*\.rs$
+        pass_filenames: false
+      - id: mint-broken-links
+        name: check docs_new links (Mintlify; opt-in, requires `mint` on PATH)
+        entry: bash -c 'cd docs_new && mint broken-links --check-anchors --check-redirects'
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [manual]
   - repo: https://github.com/lycheeverse/lychee.git
     rev: lychee-v0.22.0
     hooks:
@@ -114,9 +131,7 @@ repos:
         name: check doc links (offline)
         args: ["--config", ".github/linters/lychee.toml"]
         stages: [manual]
-        exclude: ^docs/_build/
         files: |
           (?x)^(
-            README\.md|
-            docs/.*\.(md|rst|ipynb)
+            README\.md
           )$

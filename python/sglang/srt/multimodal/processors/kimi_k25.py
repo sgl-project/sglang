@@ -19,6 +19,9 @@ from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
 )
 from sglang.srt.multimodal.processors.kimi_common import KimiGridMMDataMixin
+from sglang.srt.utils.cuda_ipc_transport_utils import (
+    DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
+)
 
 # ---------------------------------------------------------------------------
 # GPU image preprocessing utilities (resize, pad, normalize, patchify on CUDA)
@@ -82,6 +85,32 @@ def _pil_to_cuda_chw(image: Image.Image) -> torch.Tensor:
     return torch.from_numpy(arr).permute(2, 0, 1).cuda()
 
 
+def _ensure_chw_rgb(image: torch.Tensor) -> torch.Tensor:
+    """Coerce an already-decoded (C, H, W) image tensor to 3-channel RGB.
+
+    PIL inputs are RGB-normalized by _pil_to_cuda_chw, but pre-decoded
+    tensor inputs (e.g. nvJPEG / cached CUDA tensors) keep their native
+    channel count. Grayscale (1ch) or RGBA (4ch) images then break the
+    downstream torch.cat over a batch of images, which requires a
+    consistent channel dimension. Normalize every tensor to 3 channels.
+
+    Also move the tensor to the GPU (matching _pil_to_cuda_chw) so a CPU
+    input does not trip a device mismatch against the CUDA image_mean /
+    image_std_inv normalization constants downstream. No-op if already on
+    the device.
+    """
+    image = image.cuda()
+    if image.dim() == 2:  # (H, W) grayscale -> (1, H, W)
+        image = image.unsqueeze(0)
+    c = image.shape[0]
+    if c == 3:
+        return image
+    if c == 1:
+        return image.repeat(3, 1, 1)
+    # RGBA or other multi-channel layouts: keep the first 3 channels.
+    return image[:3]
+
+
 def _process_single_image(
     image: Union[torch.Tensor, Image.Image],
     config: dict,
@@ -92,6 +121,8 @@ def _process_single_image(
     """Process a single image on GPU: resize -> pad -> normalize -> patchify."""
     if isinstance(image, Image.Image):
         image = _pil_to_cuda_chw(image)
+    else:
+        image = _ensure_chw_rgb(image)
 
     new_h, new_w = config["new_height"], config["new_width"]
     pad_h, pad_w = config["pad_height"], config["pad_width"]
@@ -113,6 +144,49 @@ def _process_single_image(
 
     grid_thw = torch.tensor([T, gh, gw], dtype=torch.int64, device=x.device)
     return x, grid_thw
+
+
+def _resize_images_by_source_shape(
+    indexed_images: list[tuple[int, torch.Tensor]],
+    target_height: int,
+    target_width: int,
+) -> list[torch.Tensor]:
+    """Resize images while batching only inputs with an identical source layout.
+
+    A NaViT target-size group can still contain images with different source
+    dimensions.  Interpolation requires a rectangular batch, so preserve the
+    individual path for those images and batch only equal ``(shape, dtype)``
+    inputs.  The returned tensors retain the caller's original image order.
+    """
+    by_source_shape = defaultdict(list)
+    for index, image in indexed_images:
+        by_source_shape[(tuple(image.shape), image.dtype)].append((index, image))
+
+    resized_by_index = {}
+    for images in by_source_shape.values():
+        if len(images) == 1:
+            index, image = images[0]
+            resized_by_index[index] = F.interpolate(
+                image.unsqueeze(0).float(),
+                size=(target_height, target_width),
+                mode="bicubic",
+                align_corners=False,
+            )
+            continue
+
+        source_batch = torch.cat(
+            [image.unsqueeze(0) for _, image in images], dim=0
+        ).float()
+        resized_batch = F.interpolate(
+            source_batch,
+            size=(target_height, target_width),
+            mode="bicubic",
+            align_corners=False,
+        )
+        for local_index, (index, _) in enumerate(images):
+            resized_by_index[index] = resized_batch[local_index : local_index + 1]
+
+    return [resized_by_index[index] for index, _ in indexed_images]
 
 
 def _gpu_preprocess_images(
@@ -154,19 +228,22 @@ def _gpu_preprocess_images(
             all_patches[idx] = patches
             all_grids[idx] = grid
         else:
-            tensors = []
-            for _, image, _ in group:
+            indexed_images = []
+            for idx, image, _ in group:
                 if isinstance(image, Image.Image):
                     image = _pil_to_cuda_chw(image)
-                tensors.append(image.unsqueeze(0).float())
+                else:
+                    image = _ensure_chw_rgb(image)
+                indexed_images.append((idx, image))
 
-            resized = []
-            for t in tensors:
-                r = F.interpolate(
-                    t, size=(target_h, target_w), mode="bicubic", align_corners=False
-                )
-                resized.append(r)
-            batch = torch.cat(resized, dim=0)
+            # One NaViT target group can include several original resolutions.
+            # Batch only source-compatible images, which removes redundant
+            # bicubic launches for common multi-image requests without padding
+            # random-size inputs to a larger source resolution.
+            batch = torch.cat(
+                _resize_images_by_source_shape(indexed_images, target_h, target_w),
+                dim=0,
+            )
 
             pad_h = padded_h - target_h
             pad_w = padded_w - target_w
@@ -373,7 +450,7 @@ class KimiK2_5VLImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
         *args,
         **kwargs,
     ):
-        base_output = self.load_mm_data(
+        base_output = await self.load_mm_data(
             prompt=input_text,
             image_data=image_data,
             multimodal_tokens=self.mm_tokens,
@@ -382,6 +459,16 @@ class KimiK2_5VLImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
         mm_items, input_ids, _ = self.process_and_combine_mm_data(
             base_output, self.mm_tokens
         )
+
+        # K2.5/K2.7 encoder-DP assigns an image to exactly one TP rank. Keep
+        # its IPC proxy lazy until that assignment is known, avoiding a full
+        # image copy to every rank. The scheduler only honors this marker once
+        # the processor has already set the item's hash and pad value.
+        if self.use_cuda_ipc and self.server_args.mm_enable_dp_encoder:
+            for item in mm_items:
+                item.model_specific_data[DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY] = (
+                    True
+                )
 
         return MultimodalProcessorOutput(
             input_ids=input_ids.tolist(),

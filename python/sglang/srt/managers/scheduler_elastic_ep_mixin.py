@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import logging
+from functools import partial
 from http import HTTPStatus
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, Callable, List, Optional
 
 import torch
 
@@ -12,9 +13,10 @@ from sglang.srt.elastic_ep.elastic_ep import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import AbortReq
-from sglang.srt.managers.schedule_batch import FINISH_ABORT
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, release_req
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
     from sglang.srt.managers.scheduler import EmbeddingBatchResult, Scheduler
     from sglang.srt.managers.utils import GenerationBatchResult
 
@@ -25,6 +27,7 @@ class SchedulerElasticEPMixin:
     def _handle_elastic_ep_result_boundary(
         self: Scheduler,
         result: GenerationBatchResult | EmbeddingBatchResult,
+        cur_batch: Optional[ScheduleBatch],
     ) -> bool:
         """Handle the elastic EP result boundary before processing outputs.
 
@@ -40,9 +43,9 @@ class SchedulerElasticEPMixin:
         ):
             self._publish_active_ranks_from_committed_snapshot()
             if elastic_ep_state.is_stale_snapshot():
-                self._retract_all_and_rebalance_on_rank_fault()
+                self._retract_all_and_rebalance_on_rank_fault(cur_batch)
                 return False
-            if self._maybe_recover_ep_ranks_from_cpu_snapshot():
+            if self._maybe_recover_ep_ranks_from_cpu_snapshot(cur_batch):
                 return False
 
         return True
@@ -61,17 +64,15 @@ class SchedulerElasticEPMixin:
         elastic_ep_state = ElasticEPStateManager.instance()
         assert elastic_ep_state is not None
 
-        return (
-            torch.nonzero(
-                elastic_ep_state.committed_active_ranks_cpu == 0, as_tuple=False
-            )
-            .flatten()
-            .tolist()
-        )
+        committed = elastic_ep_state.committed_active_ranks_cpu[
+            : elastic_ep_state.effective_ep_size
+        ]
+        return torch.nonzero(committed == 0, as_tuple=False).flatten().tolist()
 
     def _retract_inflight_batches_for_elastic_ep(
         self: Scheduler,
         *,
+        cur_batch: Optional[ScheduleBatch],
         abort_message: str,
         err_type: str,
     ) -> tuple[int, int]:
@@ -91,40 +92,80 @@ class SchedulerElasticEPMixin:
         # launched prefill, cur_batch is a separate batch whose reqs are not
         # yet merged into running_batch — drain both in that case.
         batches = [self.running_batch]
-        if self.cur_batch is not None and self.cur_batch is not self.running_batch:
-            batches.append(self.cur_batch)
+        if cur_batch is not None and cur_batch is not self.running_batch:
+            batches.append(cur_batch)
+
+        reqs_with_releasers: list[tuple[Req, Callable[[], None]]] = []
+        collected_req_ids = set()
+        for batch in batches:
+            for idx, req in enumerate(batch.reqs):
+                if id(req) in collected_req_ids:
+                    continue
+                collected_req_ids.add(id(req))
+                reqs_with_releasers.append(
+                    (
+                        req,
+                        partial(batch.release_req, idx, 0, self.server_args),
+                    )
+                )
+
+        if (
+            self.chunked_req is not None
+            and id(self.chunked_req) not in collected_req_ids
+        ):
+            req = self.chunked_req
+            collected_req_ids.add(id(req))
+            reqs_with_releasers.append(
+                (
+                    req,
+                    partial(
+                        release_req,
+                        req=req,
+                        remaing_req_count=0,
+                        server_args=self.server_args,
+                        req_to_token_pool=self.req_to_token_pool,
+                        token_to_kv_pool_allocator=(
+                            self.token_to_kv_pool_allocator
+                        ),
+                        tree_cache=self.tree_cache,
+                        hisparse_coordinator=self.hisparse_coordinator,
+                    ),
+                )
+            )
 
         requeued_count = 0
         aborted_count = 0
-        for batch in batches:
-            for idx, req in enumerate(batch.reqs):
-                batch.release_req(idx, 0, self.server_args)
-                if req.retraction_count > max_retraction:
-                    req.finished_reason = abort_reason
-                    self.ipc_channels.send_to_tokenizer.send_output(
-                        AbortReq(
-                            finished_reason=abort_reason.to_json(),
-                            rid=req.rid,
-                            http_worker_ipc=req.http_worker_ipc,
-                        ),
-                        req,
-                    )
-                    aborted_count += 1
-                else:
-                    self._add_request_to_queue(req, is_retracted=True)
-                    requeued_count += 1
+        for req, releaser in reqs_with_releasers:
+            releaser()
+            if req.retraction_count > max_retraction:
+                req.finished_reason = abort_reason
+                self.ipc_channels.send_to_tokenizer.send_output(
+                    AbortReq(
+                        finished_reason=abort_reason.to_json(),
+                        rid=req.rid,
+                        http_worker_ipc=req.http_worker_ipc,
+                    ),
+                    req,
+                )
+                aborted_count += 1
+            else:
+                self._add_request_to_queue(req, is_retracted=True)
+                requeued_count += 1
 
         self.running_batch.filter_batch(keep_indices=[])
-        self.last_batch = self.cur_batch = None
-        # Clear stale pointer to a chunked-prefill req we just released; the
-        # next iteration's stash_chunked_request would otherwise dereference
+        self.last_batch = None
+        # Clear the stale pointer to the chunked-prefill req we just released;
+        # the next iteration's stash_chunked_request would otherwise dereference
         # its now-None req_pool_idx.
         self.chunked_req = None
         return requeued_count, aborted_count
 
-    def _retract_all_and_rebalance_on_rank_fault(self: Scheduler):
+    def _retract_all_and_rebalance_on_rank_fault(
+        self: Scheduler, cur_batch: Optional[ScheduleBatch]
+    ):
         """Rank fault: drain GPU, retract in-flight decode reqs, rebalance."""
         requeued_count, aborted_count = self._retract_inflight_batches_for_elastic_ep(
+            cur_batch=cur_batch,
             abort_message=(
                 "Elastic EP rank fault; aborted after {max_retraction} retractions."
             ),
@@ -146,12 +187,20 @@ class SchedulerElasticEPMixin:
             aborted_count,
         )
 
-    def _maybe_recover_ep_ranks_from_cpu_snapshot(self: Scheduler) -> bool:
+    def _maybe_recover_ep_ranks_from_cpu_snapshot(
+        self: Scheduler, cur_batch: Optional[ScheduleBatch]
+    ) -> bool:
+        inst = ElasticEPStateManager.instance()
+        if inst is not None and inst.has_scaled:
+            # Rank recovery is unsupported after append-only scale-up;
+            # maybe_join_ep_ranks latches recovery_unsupported for observability.
+            return False
         ranks_to_recover = self._get_elastic_ep_ranks_to_recover_from_cpu_snapshot()
         if not ranks_to_recover or not can_recover_ranks(ranks_to_recover):
             return False
 
         requeued_count, aborted_count = self._retract_inflight_batches_for_elastic_ep(
+            cur_batch=cur_batch,
             abort_message=(
                 "Elastic EP rank recovery; aborted after "
                 "{max_retraction} retractions."

@@ -28,9 +28,11 @@ SGLang offers multiple installation methods. You can choose the most suitable in
 
 Please refer to the [official SGLang installation guide](../../../docs/get-started/install) for installation instructions.
 
+For SGLang CPU installation, please refer to the [CPU version installation guide](../../../docs/hardware-platforms/cpu_server#installation).
+
 ## 3. Model Deployment
 
-This section provides deployment configurations verified on AMD MI300X, MI325X, MI355X and NVIDIA B200, GB200 hardware platforms.
+This section provides deployment configurations verified on AMD MI300X, MI325X, MI355X, NVIDIA B200, GB200, and Intel Xeon CPU hardware platforms.
 
 ### 3.1 Configuration
 
@@ -47,9 +49,12 @@ This section provides deployment configurations verified on AMD MI300X, MI325X, 
 * **Environment Variable**: If you encounter aiter-related issues, try setting `SGLANG_USE_AITER=0`.
 
 **NVIDIA (B200/GB200):**
-* **MOE Runner Backend**: FP8 uses `--moe-runner-backend triton`, NVFP4 uses `--moe-runner-backend flashinfer_cutlass`.
+* **GB200 Parallelism**: Use `--tp 4 --ep 4` on GB200. B200 uses the default NVIDIA settings generated above.
 * **NVFP4 Quantization**: Requires `--quantization modelopt_fp4` and uses a different model path (`nvidia/Qwen3-Coder-...`).
 * **DP Attention**: NVFP4 configuration supports `--enable-dp-attention` for improved throughput.
+
+**Intel Xeon CPU:**
+* Please refer to the `Notes` part in the serving engine launching section in [the SGLang CPU server document](../../../docs/hardware-platforms/cpu_server#launch-of-the-serving-engine) to better understand how to configure the arguments, especially for TP (tensor parallel) and NUMA binding settings.
 
 **General:**
 * **Tool Use**: To enable tool calling capabilities, add `--tool-call-parser qwen3_coder` to the launch command.
@@ -292,7 +297,7 @@ Arguments: {"code": "def factorial(n):\n    if n == 0 or n == 1:\n        return
 
 We use SGLang's built-in benchmarking tool to conduct performance evaluation with random dataset.
 
-#### 5.1.1 Standard Scenario Benchmark
+#### 5.1.1 AMD Standard Scenario Benchmark
 
 - Model Deployment Command:
 
@@ -477,6 +482,269 @@ Max ITL (ms):                            36863.32
 ==================================================
 ```
 
+#### 5.1.2 NVIDIA (B200/GB200) Standard Scenario Benchmark
+
+The following runs use the same random dataset benchmark client commands as the AMD section. On B200, launch the server with the following command:
+
+```bash
+sglang serve --model Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8 --tp 8 --ep 8 --context-length 8192 --page-size 32 --trust-remote-code
+
+##### 5.1.2.1 FP8 Model
+
+- Low Concurrency:
+
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 1
+Successful requests:                     10
+Benchmark duration (s):                  42.68
+Total input tokens:                      6101
+Total input text tokens:                 6101
+Total generated tokens:                  4220
+Total generated tokens (retokenized):    4204
+Request throughput (req/s):              0.23
+Input token throughput (tok/s):          142.95
+Output token throughput (tok/s):         98.88
+Peak output token throughput (tok/s):    102.00
+Peak concurrent requests:                2
+Total token throughput (tok/s):          241.83
+Concurrency:                             1.00
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   4266.06
+Median E2E Latency (ms):                 3420.24
+P90 E2E Latency (ms):                    7717.19
+P99 E2E Latency (ms):                    9504.50
+---------------Time to First Token----------------
+Mean TTFT (ms):                          112.03
+Median TTFT (ms):                        112.70
+P99 TTFT (ms):                           115.35
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          9.87
+Median TPOT (ms):                        9.86
+P99 TPOT (ms):                           9.92
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           9.87
+Median ITL (ms):                         9.87
+P95 ITL (ms):                            10.06
+P99 ITL (ms):                            10.18
+Max ITL (ms):                            14.80
+==================================================
+```
+
+- Medium Concurrency:
+
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 16
+Successful requests:                     80
+Benchmark duration (s):                  60.80
+Total input tokens:                      39668
+Total input text tokens:                 39668
+Total generated tokens:                  40805
+Total generated tokens (retokenized):    40543
+Request throughput (req/s):              1.32
+Input token throughput (tok/s):          652.43
+Output token throughput (tok/s):         671.13
+Peak output token throughput (tok/s):    864.00
+Peak concurrent requests:                20
+Total token throughput (tok/s):          1323.57
+Concurrency:                             13.93
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   10587.26
+Median E2E Latency (ms):                 11486.18
+P90 E2E Latency (ms):                    17374.75
+P99 E2E Latency (ms):                    21107.18
+---------------Time to First Token----------------
+Mean TTFT (ms):                          155.27
+Median TTFT (ms):                        121.57
+P99 TTFT (ms):                           294.31
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          20.77
+Median TPOT (ms):                        21.13
+P99 TPOT (ms):                           23.62
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           20.49
+Median ITL (ms):                         18.73
+P95 ITL (ms):                            19.65
+P99 ITL (ms):                            98.85
+Max ITL (ms):                            536.87
+==================================================
+```
+
+- High Concurrency:
+
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 64
+Successful requests:                     320
+Benchmark duration (s):                  100.07
+Total input tokens:                      158939
+Total input text tokens:                 158939
+Total generated tokens:                  170134
+Total generated tokens (retokenized):    169119
+Request throughput (req/s):              3.20
+Input token throughput (tok/s):          1588.32
+Output token throughput (tok/s):         1700.19
+Peak output token throughput (tok/s):    2303.00
+Peak concurrent requests:                71
+Total token throughput (tok/s):          3288.51
+Concurrency:                             57.93
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   18114.01
+Median E2E Latency (ms):                 18279.15
+P90 E2E Latency (ms):                    30557.22
+P99 E2E Latency (ms):                    35889.84
+---------------Time to First Token----------------
+Mean TTFT (ms):                          346.40
+Median TTFT (ms):                        129.75
+P99 TTFT (ms):                           1370.20
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          33.76
+Median TPOT (ms):                        34.62
+P99 TPOT (ms):                           39.97
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           33.48
+Median ITL (ms):                         25.70
+P95 ITL (ms):                            99.36
+P99 ITL (ms):                            132.30
+Max ITL (ms):                            1132.39
+==================================================
+```
+
+##### 5.1.2.2 NVFP4 Model
+
+- Low Concurrency:
+
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 1
+Successful requests:                     10
+Benchmark duration (s):                  34.49
+Total input tokens:                      6101
+Total input text tokens:                 6101
+Total generated tokens:                  4220
+Total generated tokens (retokenized):    4218
+Request throughput (req/s):              0.29
+Input token throughput (tok/s):          176.87
+Output token throughput (tok/s):         122.34
+Peak output token throughput (tok/s):    127.00
+Peak concurrent requests:                2
+Total token throughput (tok/s):          299.21
+Concurrency:                             1.00
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   3448.01
+Median E2E Latency (ms):                 2768.11
+P90 E2E Latency (ms):                    6225.73
+P99 E2E Latency (ms):                    7668.26
+---------------Time to First Token----------------
+Mean TTFT (ms):                          104.55
+Median TTFT (ms):                        105.38
+P99 TTFT (ms):                           105.63
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          7.94
+Median TPOT (ms):                        7.95
+P99 TPOT (ms):                           7.97
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           7.94
+Median ITL (ms):                         7.94
+P95 ITL (ms):                            8.05
+P99 ITL (ms):                            8.11
+Max ITL (ms):                            24.64
+==================================================
+```
+
+- Medium Concurrency:
+
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 16
+Successful requests:                     80
+Benchmark duration (s):                  43.30
+Total input tokens:                      39668
+Total input text tokens:                 39668
+Total generated tokens:                  40805
+Total generated tokens (retokenized):    39975
+Request throughput (req/s):              1.85
+Input token throughput (tok/s):          916.16
+Output token throughput (tok/s):         942.42
+Peak output token throughput (tok/s):    1264.00
+Peak concurrent requests:                21
+Total token throughput (tok/s):          1858.57
+Concurrency:                             13.90
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   7521.95
+Median E2E Latency (ms):                 8246.89
+P90 E2E Latency (ms):                    12370.93
+P99 E2E Latency (ms):                    15023.96
+---------------Time to First Token----------------
+Mean TTFT (ms):                          137.27
+Median TTFT (ms):                        109.59
+P99 TTFT (ms):                           208.78
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          14.69
+Median TPOT (ms):                        14.87
+P99 TPOT (ms):                           17.63
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           14.51
+Median ITL (ms):                         12.75
+P95 ITL (ms):                            13.33
+P99 ITL (ms):                            92.85
+Max ITL (ms):                            113.70
+==================================================
+```
+
+- High Concurrency:
+
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 64
+Successful requests:                     320
+Benchmark duration (s):                  73.93
+Total input tokens:                      158939
+Total input text tokens:                 158939
+Total generated tokens:                  170134
+Total generated tokens (retokenized):    168841
+Request throughput (req/s):              4.33
+Input token throughput (tok/s):          2149.98
+Output token throughput (tok/s):         2301.42
+Peak output token throughput (tok/s):    3497.00
+Peak concurrent requests:                71
+Total token throughput (tok/s):          4451.40
+Concurrency:                             58.28
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   13463.58
+Median E2E Latency (ms):                 13498.74
+P90 E2E Latency (ms):                    22957.10
+P99 E2E Latency (ms):                    26656.95
+---------------Time to First Token----------------
+Mean TTFT (ms):                          239.00
+Median TTFT (ms):                        113.42
+P99 TTFT (ms):                           713.87
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          25.13
+Median TPOT (ms):                        26.02
+P99 TPOT (ms):                           30.90
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           24.92
+Median ITL (ms):                         16.68
+P95 ITL (ms):                            93.33
+P99 ITL (ms):                            119.26
+Max ITL (ms):                            548.82
+==================================================
+```
+
 ### 5.2 Accuracy Benchmark
 
 #### 5.2.1 GSM8K Benchmark
@@ -501,20 +769,20 @@ python3 -m sglang.test.few_shot_gsm8k --num-questions 200
 
 ##### NVIDIA (B200/GB200)
 
-For deployment commands, see [Section 3.1](#31-configuration).
+For deployment commands, see [Section 3.1](#3-1-configuration).
 
-  - Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8 (tp=8, ep=2)
+  - Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8
     ```
-    Accuracy: 0.950
+    Accuracy: 0.965
     Invalid: 0.000
-    Latency: 12.914 s
-    Output throughput: 2065.515 token/s
+    Latency: 14.870 s
+    Output throughput: 1777.726 token/s
     ```
 
-  - nvidia/Qwen3-Coder-480B-A35B-Instruct-NVFP (NVFP4, tp=8, ep=1)
+  - nvidia/Qwen3-Coder-480B-A35B-Instruct-NVFP (NVFP4)
     ```
-    Accuracy: 0.970
+    Accuracy: 0.960
     Invalid: 0.000
-    Latency: 71.280 s
-    Output throughput: 390.080 token/s
+    Latency: 13.948 s
+    Output throughput: 1988.548 token/s
     ```

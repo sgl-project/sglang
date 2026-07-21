@@ -52,12 +52,13 @@ class ControllerElasticEPStatusPublisher(ElasticEPStatusPublisher):
 def create_elastic_ep_status_publisher(
     server_args: ServerArgs, send_to_controller: Any
 ) -> ElasticEPStatusPublisher:
+    dp_worker_capacity = server_args.max_ep_size or server_args.dp_size
     if (
         server_args.enable_dp_attention
         and server_args.elastic_ep_backend is not None
-        and server_args.dp_size > 1
+        and dp_worker_capacity > 1
     ):
         return ControllerElasticEPStatusPublisher(
-            send_to_controller, server_args.dp_size
+            send_to_controller, dp_worker_capacity
         )
     return ElasticEPStatusPublisher()

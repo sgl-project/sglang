@@ -19,27 +19,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=7, suite="base-a-test-cpu")
-
-
-class TestFimPosition(CustomTestCase):
-    def test_middle_and_end_are_distinct(self):
-        """Test that MIDDLE and END are different enum values."""
-        self.assertNotEqual(FimPosition.MIDDLE, FimPosition.END)
-
-
-class TestCompletionTemplate(CustomTestCase):
-    def test_dataclass_fields(self):
-        """Test creating a CompletionTemplate with all fields."""
-        t = CompletionTemplate(
-            name="test",
-            fim_begin_token="<begin>",
-            fim_middle_token="<middle>",
-            fim_end_token="<end>",
-            fim_position=FimPosition.MIDDLE,
-        )
-        self.assertEqual(t.name, "test")
-        self.assertEqual(t.fim_begin_token, "<begin>")
-        self.assertEqual(t.fim_position, FimPosition.MIDDLE)
+register_cpu_ci(est_time=7, suite="base-c-test-cpu")
 
 
 class TestRegisterCompletionTemplate(CustomTestCase):

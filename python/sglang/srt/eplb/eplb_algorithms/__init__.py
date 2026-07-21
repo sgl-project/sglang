@@ -53,22 +53,27 @@ def rebalance_experts(
     ]:
         from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
 
+        num_gpus = num_physical_experts // num_local_physical_experts
+        inst = ElasticEPStateManager.instance()
+        active_ranks = (
+            inst.committed_active_ranks_cpu[:num_gpus]
+            if inst is not None
+            else ElasticEPStateManager.healthy_rank_state(
+                ep_size=num_gpus, device=torch.device("cpu")
+            )
+        )
+        assert active_ranks.numel() == num_gpus
+
         return elasticity_aware.rebalance_experts(
             weight=tokens_per_expert.sum(dim=0),
             num_replicas=num_physical_experts,
             num_groups=num_groups,
             num_nodes=num_nodes,
-            num_gpus=num_physical_experts // num_local_physical_experts,
+            num_gpus=num_gpus,
             enable_hierarchical=(
                 algorithm == EplbAlgorithm.elasticity_aware_hierarchical
             ),
-            active_ranks=(
-                ElasticEPStateManager.instance().committed_active_ranks_cpu
-                if ElasticEPStateManager.instance() is not None
-                else ElasticEPStateManager.healthy_rank_state(
-                    device=torch.device("cpu")
-                )
-            ),
+            active_ranks=active_ranks,
         )
 
     raise NotImplementedError

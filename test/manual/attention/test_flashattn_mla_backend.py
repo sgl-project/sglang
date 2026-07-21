@@ -8,6 +8,10 @@ from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBack
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_context import (
+    ForwardContext,
+    set_forward_context,
+)
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -72,6 +76,7 @@ class MockModelRunner:
             device=self.device,
             enable_memory_saver=False,
         )
+        self.hisparse_coordinator = None
 
 
 class MockReqToTokenPool:
@@ -112,6 +117,8 @@ class TestFlashAttentionMLABackend(CustomTestCase):
         self.backend = FlashAttentionBackend(self.model_runner)
         self.ref_backend = TorchNativeAttnBackend(self.model_runner)
         self.num_local_heads = 2
+        # Publish the backend so RadixAttention.forward resolves correctly.
+        set_forward_context(ForwardContext(attn_backend=self.backend))
 
     def _init_model_runner(self):
         self.model_runner = MockModelRunner(
@@ -183,16 +190,11 @@ class TestFlashAttentionMLABackend(CustomTestCase):
                 extend_prefix_lens=torch.tensor(
                     [prefix_len] * self.batch_size, device=self.device
                 ),
-                extend_prefix_lens_cpu=torch.tensor(
-                    [prefix_len] * self.batch_size, device="cpu"
-                ),
+                extend_prefix_lens_cpu=[prefix_len] * self.batch_size,
                 extend_seq_lens=torch.tensor(
                     [q_len] * self.batch_size, device=self.device
                 ),
-                extend_seq_lens_cpu=torch.tensor(
-                    [q_len] * self.batch_size, device="cpu"
-                ),
-                attn_backend=self.backend,
+                extend_seq_lens_cpu=[q_len] * self.batch_size,
             )
 
         else:  # ForwardMode.DECODE
@@ -216,15 +218,10 @@ class TestFlashAttentionMLABackend(CustomTestCase):
                     [total_len] * self.batch_size, device=self.device
                 ),
                 seq_lens_cpu=torch.tensor([total_len] * self.batch_size, device="cpu"),
-                attn_backend=self.backend,
             )
 
-        # Add token pool from model runner to forward batch
-        forward_batch.req_to_token_pool = self.model_runner.req_to_token_pool
-
-        # Add KV cache from model runner to forward batch
-        forward_batch.token_to_kv_pool = self.model_runner.token_to_kv_pool
-
+        # Pool refs are resolved via the active ForwardContext (published in
+        # setUp); the fixture no longer needs to attach them to forward_batch.
         return forward_batch
 
     def _setup_kv_cache(self, forward_batch, layer, cache_len):
@@ -250,7 +247,7 @@ class TestFlashAttentionMLABackend(CustomTestCase):
         )
 
         # Set the prefix KV cache using MLA-specific method
-        forward_batch.token_to_kv_pool.set_mla_kv_buffer(
+        self.model_runner.token_to_kv_pool.set_mla_kv_buffer(
             layer,
             torch.arange(self.batch_size * cache_len, device=self.device),
             cache_k_nope,

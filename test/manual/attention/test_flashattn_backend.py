@@ -11,6 +11,10 @@ from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBack
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_context import (
+    ForwardContext,
+    set_forward_context,
+)
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -87,6 +91,7 @@ class MockModelRunner:
             device=self.device,
             enable_memory_saver=False,
         )
+        self.hisparse_coordinator = None
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
@@ -109,6 +114,9 @@ class TestFlashAttentionBackend(CustomTestCase):
         self.backend = FlashAttentionBackend(self.model_runner)
         self.ref_backend = TorchNativeAttnBackend(self.model_runner)
         self.model_runner.model_config.num_attention_heads = self.num_heads
+        # Publish the backend for any RadixAttention.forward path the tests
+        # exercise; tearDown is unnecessary here since each test re-inits.
+        set_forward_context(ForwardContext(attn_backend=self.backend))
 
     def _mock_write_to_req_to_token_pool(self, batch_size, seq_len, page_size):
         # if page_size > 1, the token pool stores the index to the page.
@@ -214,16 +222,11 @@ class TestFlashAttentionBackend(CustomTestCase):
                 extend_prefix_lens=torch.tensor(
                     [prefix_len] * self.batch_size, device=self.device
                 ),
-                extend_prefix_lens_cpu=torch.tensor(
-                    [prefix_len] * self.batch_size, device="cpu"
-                ),
+                extend_prefix_lens_cpu=[prefix_len] * self.batch_size,
                 extend_seq_lens=torch.tensor(
                     [q_len] * self.batch_size, device=self.device
                 ),
-                extend_seq_lens_cpu=torch.tensor(
-                    [q_len] * self.batch_size, device="cpu"
-                ),
-                attn_backend=self.backend,
+                extend_seq_lens_cpu=[q_len] * self.batch_size,
             )
             if attn_cp_size > 1:
                 forward_batch.attn_cp_metadata = type(
@@ -273,16 +276,11 @@ class TestFlashAttentionBackend(CustomTestCase):
                     [total_len] * self.batch_size, device=self.device
                 ),
                 seq_lens_cpu=torch.tensor([total_len] * self.batch_size, device="cpu"),
-                attn_backend=self.backend,
             )
 
-        # Add token pool
-        forward_batch.req_to_token_pool = self.model_runner.req_to_token_pool
-
-        # Write current batch's req_to_token to req_to_token_pool
+        # Pool refs are resolved via the active ForwardContext (published in
+        # setUp). Write the test fixture's req_to_token mapping.
         self._mock_write_to_req_to_token_pool(self.batch_size, total_len, page_size)
-        # Add kv pool for this forward batch
-        forward_batch.token_to_kv_pool = self.model_runner.token_to_kv_pool
 
         return forward_batch
 
@@ -307,7 +305,7 @@ class TestFlashAttentionBackend(CustomTestCase):
         )
 
         # Set the prefix KV cache
-        forward_batch.token_to_kv_pool.set_kv_buffer(
+        self.model_runner.token_to_kv_pool.set_kv_buffer(
             layer,
             torch.arange(self.batch_size * cache_len, device=self.device),
             cache_k,
@@ -506,6 +504,37 @@ class TestUpdateDraftDecodeSetExpandMetadata(CustomTestCase):
             )
             self.assertTrue(torch.equal(cache_seqlens_int32, expected_cache_seqlens))
             self.assertTrue(torch.equal(page_table, expected_page_table))
+
+    def test_draft_decode_set_expand_metadata_page_crossing(self):
+        """
+        Regression for fa3 EAGLE draft decode with topk > 1 and page_size > 1.
+        cache_loc arrives num_steps-wide; callers pre-slice it to `decode_length`
+        (the live draft tokens) before this helper runs, so the dedup'd scatter
+        never writes past the (decode_length + 1)-wide expand page_table row even
+        when consecutive draft tokens land on distinct pages.
+        """
+        bs, topk, page_size = 1, 2, 4
+        decode_length = 2
+        last_page_lens = torch.tensor([3], dtype=torch.int32)
+        # 2 live draft tokens per (batch, topk) crossing into distinct pages.
+        cache_loc = torch.tensor([[23, 28], [31, 36]], dtype=torch.int32)
+        cache_seqlens_int32 = torch.zeros(bs * topk, dtype=torch.int32)
+        # page_table is (decode_length + 1) wide (extra slot for the last partial
+        # page); the trailing column must stay zero.
+        page_table = torch.zeros(bs * topk, decode_length + 1, dtype=torch.int32)
+        draft_decode_set_expand_metadata(
+            cache_seqlens_int32=cache_seqlens_int32,
+            page_table=page_table,
+            last_page_lens=last_page_lens,
+            decode_length=decode_length,
+            cache_loc=cache_loc,
+            topk=topk,
+            page_size=page_size,
+        )
+        expected_page_table = torch.tensor([[5, 7, 0], [7, 9, 0]], dtype=torch.int32)
+        expected_cache_seqlens = torch.tensor([5, 5], dtype=torch.int32)
+        self.assertTrue(torch.equal(page_table, expected_page_table))
+        self.assertTrue(torch.equal(cache_seqlens_int32, expected_cache_seqlens))
 
     def test_update_draft_decode_set_expand_metadata_multi_batch(self):
         """

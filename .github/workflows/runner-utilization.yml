@@ -47,8 +47,19 @@ jobs:
         with:
           python-version: '3.10'
 
+      - name: Unit-test report logic
+        # Pure-logic tests (stdlib only, no API calls) — guards the
+        # queue-time accounting and status/link rendering before the
+        # (API-heavy) report runs.
+        run: |
+          python -m unittest discover -s scripts/ci/utils \
+            -p 'test_runner_utilization_report.py' -v
+
       - name: Generate Utilization Report
-        timeout-minutes: 30
+        # Full-coverage fetch (created-filtered listing + 12h lookback) is
+        # ~2-3x the truncated 5000-run fetch this replaces; the old fetch
+        # took ~10 min, so give the full one comfortable headroom.
+        timeout-minutes: 55
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |

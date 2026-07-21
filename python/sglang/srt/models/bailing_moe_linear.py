@@ -9,21 +9,18 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.kernels.ops.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
+from sglang.kernels.ops.attention.fla.layernorm_gated import layernorm_fn
+from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.distributed import (
     get_pp_group,
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
-from sglang.srt.layers.attention.fla.layernorm_gated import layernorm_fn
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.dp_attention import (
-    get_attention_tp_rank,
-    get_attention_tp_size,
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layernorm import RMSNorm
@@ -39,7 +36,6 @@ from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.quantization.fp8_utils import (
     block_quant_dequant,
     block_quant_to_tensor_quant,
@@ -58,10 +54,16 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA, DeepseekV2MLP, _is_hip
 from sglang.srt.models.utils import WeightsMapper
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import (
+    get_forward,
+    get_parallel,
+    get_server_args,
+    get_stream,
+)
 from sglang.srt.utils import (
     BumpAllocator,
     add_prefix,
@@ -100,7 +102,7 @@ if _is_cuda:
 elif _is_cpu and _is_cpu_amx_available:
     pass
 elif _is_hip:
-    from sglang.srt.layers.quantization.awq.awq_triton import (
+    from sglang.kernels.ops.quantization.awq_triton import (
         awq_dequantize_triton as awq_dequantize,
     )
 else:
@@ -192,15 +194,10 @@ class BailingMLP(nn.Module):
     def forward(
         self,
         x,
-        should_allreduce_fusion: bool = False,
-        use_reduce_scatter: bool = False,
     ):
         x, _ = self.gate_up_proj(x)
         x = self.act_fn(x)
-        x, _ = self.down_proj(
-            x,
-            skip_all_reduce=use_reduce_scatter or should_allreduce_fusion,
-        )
+        x, _ = self.down_proj(x)
         return x
 
 
@@ -243,13 +240,15 @@ class BailingMoE(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         layer_id: int = 0,
         prefix: str = "moe",
+        alt_stream=None,
     ):
         super().__init__()
 
+        self.alt_stream = alt_stream
         self.layer_id = layer_id
 
-        self.tp_size = get_tensor_model_parallel_world_size()
-        self.tp_rank = get_tensor_model_parallel_rank()
+        self.tp_size = get_parallel().tp_size
+        self.tp_rank = get_parallel().tp_rank
 
         self.top_k = config.num_experts_per_tok
         self.norm_expert_prob = getattr(config, "norm_topk_prob", False)
@@ -333,25 +332,41 @@ class BailingMoE(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        should_allreduce_fusion: bool = False,
-        use_reduce_scatter: bool = False,
     ) -> torch.Tensor:
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_size)
-        if self.num_shared_experts > 0:
-            shared_output = self.shared_experts(hidden_states)
 
-        router_logits = self.gate(hidden_states)
-        topk_output = self.topk(hidden_states, router_logits)
-        final_hidden_states = self.experts(hidden_states, topk_output)
+        if (
+            self.alt_stream is not None
+            and self.num_shared_experts > 0
+            and hidden_states.shape[0] > 0
+            and get_is_capture_mode()
+        ):
+            with torch.no_grad():
+                current_stream = torch.cuda.current_stream()
+                self.alt_stream.wait_stream(current_stream)
+                # Main stream: shared experts (smaller computation)
+                shared_output = self.shared_experts(hidden_states)
+                # Alt stream: gate + topk + routed experts
+                with torch.cuda.stream(self.alt_stream):
+                    router_logits = self.gate(hidden_states)
+                    topk_output = self.topk(hidden_states, router_logits)
+                    final_hidden_states = self.experts(hidden_states, topk_output)
+                current_stream.wait_stream(self.alt_stream)
+                final_hidden_states = final_hidden_states + shared_output
+        else:
+            if self.num_shared_experts > 0:
+                shared_output = self.shared_experts(hidden_states)
 
-        if self.num_shared_experts > 0:
-            final_hidden_states = final_hidden_states + shared_output
+            router_logits = self.gate(hidden_states)
+            topk_output = self.topk(hidden_states, router_logits)
+            final_hidden_states = self.experts(hidden_states, topk_output)
+
+            if self.num_shared_experts > 0:
+                final_hidden_states = final_hidden_states + shared_output
 
         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
             is_tp_path=True,
-            use_reduce_scatter=use_reduce_scatter,
-            should_allreduce_fusion=should_allreduce_fusion,
         ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states
@@ -383,8 +398,8 @@ class BailingGroupRMSNormGate(RMSNormGated):
         param: torch.nn.Parameter,
         loaded_weight: torch.Tensor,
     ) -> None:
-        tp_size = get_attention_tp_size()
-        tp_rank = get_attention_tp_rank()
+        tp_size = get_parallel().attn_tp_size
+        tp_rank = get_parallel().attn_tp_rank
         shard_size = loaded_weight.shape[0] // tp_size
         shard = slice(tp_rank * shard_size, (tp_rank + 1) * shard_size)
         param.data.copy_(loaded_weight[shard].contiguous())
@@ -398,9 +413,11 @@ class BailingMoELinearAttention(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         layer_id: int = 0,
         prefix: str = "linear_attn",
+        alt_stream=None,
     ):
         super().__init__()
 
+        self.alt_stream = alt_stream
         self.layer_id = layer_id
         self.hidden_size = config.hidden_size
         self.total_num_heads = config.num_attention_heads
@@ -412,8 +429,8 @@ class BailingMoELinearAttention(nn.Module):
 
         self.hidden_inner_size = self.head_dim * self.total_num_heads
         self.scaling = self.head_dim**-0.5
-        self.tp_size = get_attention_tp_size()
-        self.tp_rank = get_attention_tp_rank()
+        self.tp_size = get_parallel().attn_tp_size
+        self.tp_rank = get_parallel().attn_tp_rank
 
         assert self.total_num_heads % self.tp_size == 0
         self.tp_heads = self.total_num_heads // self.tp_size
@@ -512,7 +529,7 @@ class BailingMoELinearAttention(nn.Module):
             base=self.rope_theta,
             rope_scaling=config.rope_scaling,
             is_neox_style=True,
-            device=get_global_server_args().device,
+            device=get_server_args().device,
             dtype=torch.float32,
         )
 
@@ -530,8 +547,6 @@ class BailingMoELinearAttention(nn.Module):
         **kwargs,
     ) -> torch.Tensor:
         qkv, _ = self.query_key_value(hidden_states)
-        # logger.warning(f"===={self.layer_id=}, 1-1 {qkv.shape=}")
-        # use rotary_emb support fp32
         qkv = qkv.to(torch.float32)
         if self.linear_silu:
             qkv = F.silu(qkv)
@@ -544,20 +559,40 @@ class BailingMoELinearAttention(nn.Module):
         if self.use_qk_norm:
             q = q.reshape(-1, self.tp_heads, self.head_dim)
             k = k.reshape(-1, self.tp_kv_heads, self.head_dim)
-            q = layernorm_fn(
-                q,
-                self.query_layernorm.weight.data,
-                bias=None,
-                eps=self.rms_norm_eps,
-                is_rms_norm=True,
-            )
-            k = layernorm_fn(
-                k,
-                self.key_layernorm.weight.data,
-                bias=None,
-                eps=self.rms_norm_eps,
-                is_rms_norm=True,
-            )
+            if self.alt_stream is not None and get_is_capture_mode():
+                current_stream = torch.cuda.current_stream()
+                self.alt_stream.wait_stream(current_stream)
+                q = layernorm_fn(
+                    q,
+                    self.query_layernorm.weight.data,
+                    bias=None,
+                    eps=self.rms_norm_eps,
+                    is_rms_norm=True,
+                )
+                with torch.cuda.stream(self.alt_stream):
+                    k = layernorm_fn(
+                        k,
+                        self.key_layernorm.weight.data,
+                        bias=None,
+                        eps=self.rms_norm_eps,
+                        is_rms_norm=True,
+                    )
+                current_stream.wait_stream(self.alt_stream)
+            else:
+                q = layernorm_fn(
+                    q,
+                    self.query_layernorm.weight.data,
+                    bias=None,
+                    eps=self.rms_norm_eps,
+                    is_rms_norm=True,
+                )
+                k = layernorm_fn(
+                    k,
+                    self.key_layernorm.weight.data,
+                    bias=None,
+                    eps=self.rms_norm_eps,
+                    is_rms_norm=True,
+                )
             q = q.reshape(-1, self.q_size_per_rank)
             k = k.reshape(-1, self.kv_size_per_rank)
 
@@ -571,23 +606,18 @@ class BailingMoELinearAttention(nn.Module):
 
         if self.linear_scale:
             q = q * self.scaling
-        # q = q.to(torch.float32)
-        # k = k.to(torch.float32)
-        # v = v.to(torch.float32)
         hidden = self.attn(q, k, v, forward_batch).to(hidden_states.dtype)
         gate, _ = self.g_proj(hidden_states)
-        # logger.warning(
-        #     f"===={self.layer_id=}, 1-3 {gate.shape=}, {hidden.shape=}, {gate.dtype=}, {hidden_states.dtype=}, {hidden.dtype=}"
-        # )
+
         if self.group_norm_size > 1:
             hidden = self.g_norm(hidden, gate)
         else:
             hidden = self.g_norm(hidden)
             hidden = F.sigmoid(gate) * hidden
-        # logger.warning(f"===={self.layer_id=}, 1-4 {hidden.shape=}")
+
         hidden = hidden.data.to(hidden_states.dtype)
         hidden, _ = self.dense(hidden)
-        # logger.warning(f"===={self.layer_id=}, 1-5 {hidden.shape=}")
+
         return hidden
 
 
@@ -604,7 +634,7 @@ class BailingMoEAttention(nn.Module):
         self.layer_id = layer_id
 
         self.hidden_size = config.hidden_size
-        tp_size = get_attention_tp_size()
+        tp_size = get_parallel().attn_tp_size
         self.total_num_heads = config.num_attention_heads
         assert self.total_num_heads % tp_size == 0
         self.num_heads = self.total_num_heads // tp_size
@@ -660,7 +690,7 @@ class BailingMoEAttention(nn.Module):
             max_position=self.max_position_embeddings,
             base=self.rope_theta,
             rope_scaling=config.rope_scaling,
-            device=get_global_server_args().device,
+            device=get_server_args().device,
         )
         self.attn = RadixAttention(
             self.num_heads,
@@ -709,12 +739,11 @@ class BailingMoELinearDecoderLayer(nn.Module):
         layer_id: int = 0,
         prefix: str = "layer",
         is_nextn: bool = False,
+        alt_stream=None,
     ) -> None:
         super().__init__()
         self.layer_id = layer_id
         self.use_mla = getattr(config, "full_attention_type", "mla") == "mla"
-        alt_stream = None  # tptest
-        # todo nextn
 
         if config.attention_type == 0:  # Linear layer
             self.attention = BailingMoELinearAttention(
@@ -722,6 +751,7 @@ class BailingMoELinearDecoderLayer(nn.Module):
                 quant_config=quant_config,
                 layer_id=self.layer_id,
                 prefix=prefix + ".attention",
+                alt_stream=alt_stream,
             )
         elif config.attention_type == 1:  # softmax layer
             if self.use_mla:
@@ -776,6 +806,7 @@ class BailingMoELinearDecoderLayer(nn.Module):
                     quant_config=quant_config,
                     layer_id=self.layer_id,
                     prefix=add_prefix("mlp", prefix),
+                    alt_stream=alt_stream,
                 )
             else:
                 # dense layer
@@ -855,20 +886,25 @@ class BailingMoELinearDecoderLayer(nn.Module):
         # logger.warning(
         #     f"===={self.layer_id=}, 3 shape= {hidden_states.shape}, {residual.shape}"
         # )
-        should_allreduce_fusion = (
+        fuse_mlp_allreduce = (
             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
                 forward_batch
             )
         )
-        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+        mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             forward_batch
         )
-        hidden_states = self.mlp(
-            hidden_states, should_allreduce_fusion, use_reduce_scatter
-        )
-        hidden_states, residual = self.layer_communicator.postprocess_layer(
-            hidden_states, residual, forward_batch
-        )
+        with get_forward().scoped(
+            fuse_mlp_allreduce=fuse_mlp_allreduce,
+            mlp_reduce_scatter=mlp_reduce_scatter,
+        ):
+            hidden_states = self.mlp(hidden_states)
+        if fuse_mlp_allreduce:
+            hidden_states._sglang_needs_allreduce_fusion = True
+        else:
+            hidden_states, residual = self.layer_communicator.postprocess_layer(
+                hidden_states, residual, forward_batch
+            )
         return hidden_states, residual
 
     @staticmethod
@@ -921,6 +957,8 @@ class BailingMoELinearModel(nn.Module):
         else:
             self.word_embeddings = PPMissingLayer()
 
+        self.alt_stream = get_stream("alt") if _is_cuda else None
+
         def layer_fn(idx, prefix):
             layer_idx = idx
             layer_config = copy.deepcopy(config)
@@ -928,7 +966,10 @@ class BailingMoELinearModel(nn.Module):
 
             decoder_kwargs = {"quant_config": quant_config, "layer_id": layer_idx}
             return BailingMoELinearDecoderLayer(
-                layer_config, **decoder_kwargs, prefix=prefix
+                layer_config,
+                **decoder_kwargs,
+                prefix=prefix,
+                alt_stream=self.alt_stream,
             )
 
         self.layers, self.start_layer, self.end_layer = make_layers(
@@ -1048,7 +1089,7 @@ class BailingMoELinearForCausalLM(nn.Module):
                     config.hidden_size,
                     params_dtype=torch.float32,
                     quant_config=quant_config,
-                    use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+                    use_attn_tp_group=get_server_args().enable_dp_lm_head,
                 )
             )
             self.logits_processor = LogitsProcessor(config)

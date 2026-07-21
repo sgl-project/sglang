@@ -8,6 +8,10 @@ import inspect
 import json
 import logging
 import os
+
+# Registered tests run with the strict config-mutation guard: bare
+# server_args assignments after resolution raise (use ServerArgs.override).
+os.environ.setdefault("SGLANG_STRICT_CONFIG_MUTATION", "1")
 import random
 import re
 import shlex
@@ -31,7 +35,7 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 
-from sglang.bench_serving import run_benchmark
+from sglang.benchmark.serving import run_benchmark
 from sglang.global_config import global_config
 from sglang.srt.environ import envs
 from sglang.srt.utils import (
@@ -66,6 +70,8 @@ DEFAULT_MODEL_NAME_FOR_TEST_MLA_NEXTN = "lmsys/sglang-ci-dsv3-test-NextN"
 
 # Hybrid Mamba models
 DEFAULT_HYBRID_MAMBA_MODEL_NAME_FOR_TEST = "Qwen/Qwen3-Next-80B-A3B-Instruct"
+# Small GDN-hybrid (gated delta net) model that fits a single GPU
+DEFAULT_HYBRID_GDN_SMALL_MODEL_NAME_FOR_TEST = "Qwen/Qwen3.5-4B"
 # VL test models
 DEFAULT_MODEL_NAME_FOR_TEST_VL_PP = "Qwen/Qwen3-VL-2B-Thinking"
 DEFAULT_MODEL_NAME_FOR_TEST_GLM_41V_PP = "zai-org/GLM-4.1V-9B-Thinking"
@@ -144,7 +150,9 @@ DEFAULT_DEEPSEEK_W4AFP8_MODEL_FOR_TEST = "Barrrrry/DeepSeek-R1-W4AFP8"
 DEFAULT_ENABLE_ROUTED_EXPERTS_MODEL_NAME_FOR_TEST = "Qwen/Qwen3-30B-A3B"
 
 # Nightly tests
-DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1 = "meta-llama/Llama-3.1-8B-Instruct,mistralai/Mistral-7B-Instruct-v0.3,deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct,google/gemma-2-27b-it"
+DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1 = (
+    "meta-llama/Llama-3.1-8B-Instruct,Qwen/Qwen3-8B,Qwen/Qwen3-4B"
+)
 DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2 = "meta-llama/Llama-3.1-70B-Instruct,mistralai/Mixtral-8x7B-Instruct-v0.1,Qwen/Qwen2-57B-A14B-Instruct"
 DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1 = "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8,neuralmagic/Mistral-7B-Instruct-v0.3-FP8,neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8,neuralmagic/gemma-2-2b-it-FP8"
 DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2 = "neuralmagic/Meta-Llama-3.1-70B-Instruct-FP8,neuralmagic/Mixtral-8x7B-Instruct-v0.1-FP8,neuralmagic/Qwen2-72B-Instruct-FP8,neuralmagic/Qwen2-57B-A14B-Instruct-FP8,neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8,zai-org/GLM-4.5-Air-FP8"
@@ -574,6 +582,41 @@ def popen_with_error_check(command: list[str]):
     return process
 
 
+def start_subprocess_fail_fast_watcher(
+    named_procs: list[tuple[str, subprocess.Popen]],
+) -> threading.Event:
+    """Abort the test runner the moment any watched subprocess exits non-zero.
+
+    Caller must `.set()` the returned Event before intentional teardown."""
+    stop = threading.Event()
+
+    def watcher():
+        while not stop.is_set():
+            for name, proc in named_procs:
+                rc = proc.poll() if proc else None
+                if rc is None or rc == 0:
+                    continue
+                if stop.is_set():
+                    return
+                sys.stderr.write(
+                    f"[FIXTURE FAIL-FAST] {name} (pid={proc.pid}) exited "
+                    f"rc={rc}; aborting.\n"
+                )
+                sys.stderr.flush()
+                for _, sib in named_procs:
+                    if sib and sib is not proc:
+                        try:
+                            kill_process_tree(sib.pid, wait_timeout=10)
+                        except Exception:
+                            pass
+                # POSIX: signal N -> 128+N (os._exit masks negatives via & 0xff).
+                os._exit(rc if rc >= 0 else 128 + (-rc))
+            time.sleep(0.1)
+
+    threading.Thread(target=watcher, daemon=True, name="SubprocFailFastWatcher").start()
+    return stop
+
+
 def _try_enable_offline_mode_if_cache_complete(
     model_name_or_path: str, env: dict, other_args: Optional[list[str]] = None
 ) -> Optional[str]:
@@ -720,6 +763,48 @@ def _create_clean_subprocess_env(env: dict) -> dict:
     return child_env
 
 
+def _subprocess_popen_with_outputs(
+    command: list,
+    env: Optional[dict],
+    return_stdout_stderr: Optional[tuple],
+) -> subprocess.Popen:
+    # Release allocator-cached GPU memory to the driver before spawning a
+    # server: cached blocks stay cudaMalloc'd and shrink the child's memory.
+    if torch.cuda.is_initialized():
+        torch.cuda.empty_cache()
+
+    if not return_stdout_stderr:
+        return subprocess.Popen(command, stdout=None, stderr=None, env=env)
+
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        text=True,
+        bufsize=1,
+    )
+
+    def _dump(src, sinks):
+        for line in iter(src.readline, ""):
+            for sink in sinks:
+                sink.write(line)
+                sink.flush()
+        src.close()
+
+    threading.Thread(
+        target=_dump,
+        args=(process.stdout, [return_stdout_stderr[0], sys.stdout]),
+        daemon=True,
+    ).start()
+    threading.Thread(
+        target=_dump,
+        args=(process.stderr, [return_stdout_stderr[1], sys.stderr]),
+        daemon=True,
+    ).start()
+    return process
+
+
 def _launch_server_process(
     command: List[str],
     env: dict,
@@ -742,37 +827,11 @@ def _launch_server_process(
     hf_hub_offline = child_env.get("HF_HUB_OFFLINE", "0")
     print(f"CI_OFFLINE: Launching server HF_HUB_OFFLINE={hf_hub_offline} model={model}")
 
-    if return_stdout_stderr:
-        proc = subprocess.Popen(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=child_env,
-            text=True,
-            bufsize=1,
-        )
-
-        def _dump(src, sinks):
-            for line in iter(src.readline, ""):
-                for sink in sinks:
-                    sink.write(line)
-                    sink.flush()
-            src.close()
-
-        threading.Thread(
-            target=_dump,
-            args=(proc.stdout, [return_stdout_stderr[0], sys.stdout]),
-            daemon=True,
-        ).start()
-        threading.Thread(
-            target=_dump,
-            args=(proc.stderr, [return_stdout_stderr[1], sys.stderr]),
-            daemon=True,
-        ).start()
-    else:
-        proc = subprocess.Popen(command, stdout=None, stderr=None, env=child_env)
-
-    return proc
+    return _subprocess_popen_with_outputs(
+        command=command,
+        env=child_env,
+        return_stdout_stderr=return_stdout_stderr,
+    )
 
 
 def _wait_for_server_health(
@@ -867,6 +926,11 @@ def popen_launch_server(
         merged = os.environ.copy()
         merged.update(env)
         env = merged
+
+    # A dying predecessor can hold the derived port plan past
+    # kill_process_tree() while GPU teardown completes; give CI launches
+    # teardown-sized patience (see wait_port_available).
+    env.setdefault("SGLANG_WAIT_PORT_TIMEOUT", "120")
 
     # Store per-run marker path for potential invalidation
     per_run_marker_path = None
@@ -989,6 +1053,7 @@ def popen_launch_pd_server(
     api_key: Optional[str] = None,
     other_args: list[str] = (),
     env: Optional[dict] = None,
+    return_stdout_stderr: Optional[tuple] = None,
 ):
     _, host, port = base_url.split(":")
     host = host[2:]
@@ -1024,9 +1089,11 @@ def popen_launch_pd_server(
     if env is not None:
         env = {**os.environ, **env}
 
-    process = subprocess.Popen(command, stdout=None, stderr=None, env=env)
-
-    return process
+    return _subprocess_popen_with_outputs(
+        command=command,
+        env=env,
+        return_stdout_stderr=return_stdout_stderr,
+    )
 
 
 def get_similarities(vec1, vec2):
@@ -1515,7 +1582,7 @@ def run_bench_one_batch(model, other_args):
     command = [
         "python3",
         "-m",
-        "sglang.bench_one_batch",
+        "sglang.benchmark.one_batch",
         "--batch-size",
         "1",
         "--input",
@@ -1567,7 +1634,7 @@ def run_bench_offline_throughput(model, other_args):
     command = [
         "python3",
         "-m",
-        "sglang.bench_offline_throughput",
+        "sglang.benchmark.offline_throughput",
         "--num-prompts",
         "1",
         "--dataset-name",
@@ -2120,6 +2187,110 @@ def maybe_stub_sgl_kernel():
     sys.meta_path.insert(0, _SglKernelFinder())
 
 
+_GPU_IDLE_TIMEOUT_SECS = 30.0
+_GPU_IDLE_POLL_INTERVAL_SECS = 2.0
+_GPU_IDLE_USED_MEMORY_THRESHOLD = 2 << 30  # 2 GiB
+
+
+def _format_gib(num_bytes: Optional[int]) -> str:
+    if num_bytes is None:
+        return "N/A"
+    return f"{num_bytes / (1 << 30):.2f} GiB"
+
+
+def _visible_gpu_indices(pynvml) -> List[int]:
+    num_gpus = pynvml.nvmlDeviceGetCount()
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if visible is None:
+        return list(range(num_gpus))
+    entries = [entry.strip() for entry in visible.split(",") if entry.strip()]
+    if not all(entry.isdigit() for entry in entries):
+        # UUID-style entries; fall back to checking all GPUs.
+        return list(range(num_gpus))
+    return [int(entry) for entry in entries if int(entry) < num_gpus]
+
+
+def _collect_busy_gpu_reports(pynvml, gpu_indices: List[int]) -> List[str]:
+    self_pid = os.getpid()
+    reports = []
+    for index in gpu_indices:
+        handle = pynvml.nvmlDeviceGetHandleByIndex(index)
+        used_bytes = pynvml.nvmlDeviceGetMemoryInfo(handle).used
+        if used_bytes < _GPU_IDLE_USED_MEMORY_THRESHOLD:
+            continue
+        try:
+            procs = pynvml.nvmlDeviceGetComputeRunningProcesses(handle)
+        except pynvml.NVMLError:
+            procs = None
+        if procs is not None:
+            # Discount our own usage: the caching allocator retains memory
+            # across test classes, and waiting on ourselves never succeeds.
+            self_used = sum(
+                proc.usedGpuMemory or 0 for proc in procs if proc.pid == self_pid
+            )
+            if used_bytes - self_used < _GPU_IDLE_USED_MEMORY_THRESHOLD:
+                continue
+            proc_info = ", ".join(
+                f"pid={proc.pid} {_format_gib(proc.usedGpuMemory)}"
+                for proc in procs
+                if proc.pid != self_pid
+            ) or (
+                f"no other compute processes;"
+                f" self pid={self_pid} holds {_format_gib(self_used)}"
+            )
+        else:
+            proc_info = ""
+        reports.append(
+            f"GPU {index} uses {_format_gib(used_bytes)}"
+            f" ({proc_info or 'no compute processes found'})"
+        )
+    return reports
+
+
+def _wait_for_gpu_idle_in_ci(
+    timeout: float = _GPU_IDLE_TIMEOUT_SECS,
+    poll_interval: float = _GPU_IDLE_POLL_INTERVAL_SECS,
+) -> None:
+    """Wait until visible GPUs release residual memory from earlier tests.
+
+    Killed server processes return GPU memory asynchronously; launching the
+    next server too early makes memory profiling over-commit the KV cache and
+    OOM. Abort with the offending processes if the memory is never returned.
+    """
+    if not is_in_ci():
+        return
+    try:
+        import pynvml
+
+        pynvml.nvmlInit()
+    except Exception:
+        # Non-NVIDIA runner (CPU/AMD) or NVML unavailable; nothing to check.
+        return
+    try:
+        gpu_indices = _visible_gpu_indices(pynvml)
+        deadline = time.monotonic() + timeout
+        while True:
+            busy_reports = _collect_busy_gpu_reports(pynvml, gpu_indices)
+            if not busy_reports:
+                return
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    f"GPU(s) still not idle after waiting {timeout:.0f}s "
+                    f"before setUpClass: {'; '.join(busy_reports)}"
+                )
+            print(
+                f"[CI GPU Idle] Waiting for GPU to become idle: "
+                f"{'; '.join(busy_reports)}",
+                flush=True,
+            )
+            time.sleep(poll_interval)
+    finally:
+        try:
+            pynvml.nvmlShutdown()
+        except Exception:
+            pass
+
+
 class CustomTestCase(unittest.TestCase):
 
     def __init_subclass__(cls, **kwargs):
@@ -2136,6 +2307,7 @@ class CustomTestCase(unittest.TestCase):
 
         def safe_setUpClass(klass):
             try:
+                _wait_for_gpu_idle_in_ci()
                 orig_func(klass)
             except Exception:
                 # Best-effort cleanup; suppress teardown errors so the

@@ -2,11 +2,16 @@ import unittest
 
 import sglang as sgl
 from sglang.srt.environ import envs
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cpu_ci,
+    register_cuda_ci,
+)
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=29, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=45, suite="stage-b-test-1-gpu-small-amd")
+register_cpu_ci(est_time=203, suite="base-c-test-cpu")
 
 
 class TestExternalModels(CustomTestCase):
@@ -18,7 +23,7 @@ class TestExternalModels(CustomTestCase):
 
         engine = sgl.Engine(
             model_path=model_path,
-            cuda_graph_max_bs=1,
+            cuda_graph_max_bs_decode=1,
             max_total_tokens=64,
             enable_multimodal=True,
         )

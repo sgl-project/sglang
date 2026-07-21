@@ -26,13 +26,15 @@ SGLang offers multiple installation methods. You can choose the most suitable in
 
 Please refer to the [official SGLang installation guide](../../../docs/get-started/install) for installation instructions.
 
+For SGLang CPU installation, please refer to the [CPU version installation guide](../../../docs/hardware-platforms/cpu_server#installation).
+
 ## 3. Model Deployment
 
 This section provides deployment configurations optimized for different hardware platforms and use cases.
 
 ### 3.1 Basic Configuration
 
-The Qwen3 series offers models in various sizes and architectures, optimized for different hardware platforms including NVIDIA and AMD GPUs. The recommended launch configurations vary by hardware and model size.
+The Qwen3 series offers models in various sizes and architectures, optimized for different hardware platforms including NVIDIA GPUs, AMD GPUs, and Intel Xeon CPUs. The recommended launch configurations vary by hardware and model size.
 
 **Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform, model size, quantization method, and thinking capabilities.
 
@@ -42,15 +44,16 @@ import { Qwen3Deployment } from "/src/snippets/autoregressive/qwen3-deployment.j
 
 ### 3.2 Configuration Tips
 
-- **Memory Management** : Set lower `--context-length` to conserve memory. A value of `128000` is sufficient for most scenarios, down from the default 262K.
-- **Expert Parallelism** : SGLang supports Expert Parallelism (EP) via `--ep`, allowing experts in MoE models to be deployed on separate GPUs for better throughput. One thing to note is that, for quantized models, you need to set `--ep` to a value that satisfies the requirement: `(moe_intermediate_size / moe_tp_size) % weight_block_size_n == 0, where moe_tp_size is equal to tp_size divided by ep_size.` Note that EP may perform worse in low concurrency scenarios due to additional communication overhead. Check out [Expert Parallelism Deployment](../../../docs/advanced_features/expert_parallelism) for more details.
-- **Kernel Tuning** : For MoE Triton kernel tuning on your specific hardware, refer to [fused_moe_triton](https://github.com/sgl-project/sglang/tree/main/benchmark/kernels/fused_moe_triton).
-- **Speculative Decoding**: Using Speculative Decoding for latency-sensitive scenarios.
+- **Memory Management:** Set lower `--context-length` to conserve memory. A value of `128000` is sufficient for most scenarios, down from the default 262K.
+- **Expert Parallelism:** SGLang supports Expert Parallelism (EP) via `--ep`, allowing experts in MoE models to be deployed on separate GPUs for better throughput. One thing to note is that, for quantized models, you need to set `--ep` to a value that satisfies the requirement: `(moe_intermediate_size / moe_tp_size) % weight_block_size_n == 0, where moe_tp_size is equal to tp_size divided by ep_size.` Note that EP may perform worse in low concurrency scenarios due to additional communication overhead. Check out [Expert Parallelism Deployment](../../../docs/advanced_features/expert_parallelism) for more details.
+- **Kernel Tuning:** For MoE Triton kernel tuning on your specific hardware, refer to [fused_moe_triton](https://github.com/sgl-project/sglang/tree/main/benchmark/kernels/fused_moe_triton).
+- **Speculative Decoding:** Using Speculative Decoding for latency-sensitive scenarios.
   - `--speculative-algorithm EAGLE3`: Speculative decoding algorithm
   - `--speculative-num-steps 3`: Number of speculative verification rounds
   - `--speculative-eagle-topk 1`: Top-k sampling for draft tokens
   - `--speculative-num-draft-tokens 4`: Number of draft tokens per step
   - `--speculative-draft-model-path`: The path of the draft model weights. This can be a local folder or a Hugging Face repo ID such as [`lmsys/SGLang-EAGLE3-Qwen3-235B-A22B-Instruct-2507-SpecForge-Meituan`](https://huggingface.co/lmsys/SGLang-EAGLE3-Qwen3-235B-A22B-Instruct-2507-SpecForge-Meituan).
+- **Xeon CPU service configuration:** Please refer to the `Notes` part in the serving engine launching section in [the SGLang CPU server document](../../../docs/hardware-platforms/cpu_server#launch-of-the-serving-engine) to better understand how to configure the arguments, especially for TP (tensor parallel) and NUMA binding settings.
 
 ## 4. Model Invocation
 

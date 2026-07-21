@@ -7,6 +7,7 @@ import triton.language as tl
 from sglang.jit_kernel.utils import (
     cache_once,
     is_arch_support_pdl,
+    is_hip_runtime,
     load_jit,
     make_cpp_args,
 )
@@ -58,13 +59,18 @@ def fused_store_cache(
     page_size: int,
     type: Literal["flashmla", "indexer"],
 ) -> None:
-    module = _jit_fused_store_module(
-        name=type,
-        input_dtype=input.dtype,
-        index_dtype=indices.dtype,
-        page_size=page_size,
-    )
-    module.run(input, cache, indices)
+    if is_hip_runtime():
+        from sglang.jit_kernel.triton_store_cache import triton_fused_store_cache
+
+        triton_fused_store_cache(input, cache, indices, page_size=page_size, type=type)
+    else:
+        module = _jit_fused_store_module(
+            name=type,
+            input_dtype=input.dtype,
+            index_dtype=indices.dtype,
+            page_size=page_size,
+        )
+        module.run(input, cache, indices)
 
 
 @triton.jit
@@ -116,18 +122,21 @@ def create_paged_compress_data_kernel(
         else:
             pos = write_overlap_pos
         pos = tl.maximum(pos, 0)
-        loc = tl.load(
-            req_to_token_ptr
-            + rid.to(tl.int64) * stride_req_to_token_0
-            + pos.to(tl.int64) * stride_req_to_token_1,
-            mask=mask,
-            other=0,
-        ).to(tl.int32)
-        swa_loc = tl.load(full_to_swa_index_mapping_ptr + loc, mask=mask, other=0).to(
-            tl.int32
-        )
-        swa_page = swa_loc // swa_page_size
-        state_loc = swa_page * ring_size + (swa_loc % ring_size)
+        if compress_ratio == 128:
+            state_loc = rid * ring_size + (pos % ring_size)
+        else:
+            loc = tl.load(
+                req_to_token_ptr
+                + rid.to(tl.int64) * stride_req_to_token_0
+                + pos.to(tl.int64) * stride_req_to_token_1,
+                mask=mask,
+                other=0,
+            ).to(tl.int32)
+            swa_loc = tl.load(
+                full_to_swa_index_mapping_ptr + loc, mask=mask, other=0
+            ).to(tl.int32)
+            swa_page = swa_loc // swa_page_size
+            state_loc = swa_page * ring_size + (swa_loc % ring_size)
         state_loc = state_loc // cr
         if i == 0:
             v0 = state_loc
