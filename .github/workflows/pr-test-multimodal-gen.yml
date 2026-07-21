@@ -418,6 +418,7 @@ jobs:
           RUNAI_STREAMER_MEMORY_LIMIT: 0
           CONTINUE_ON_ERROR_FLAG: ${{ inputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
           SGLANG_DIFFUSION_ARTIFACT_DIR: ${{ github.workspace }}/diffusion-failures
+          SGLANG_INKLING_FA4_USE_PIP: "1"
         run: |
           cd python
           python3 sglang/multimodal_gen/test/run_suite.py \
