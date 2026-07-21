@@ -1460,6 +1460,11 @@ class Scheduler(
         # HostKVCache.destroy. Called from run_scheduler_process's finally.
         if self.hisparse_coordinator is not None:
             self.hisparse_coordinator.destroy()
+        # A plain HiRadixCache (no hisparse) also holds a large pinned host KV
+        # pool; unregister it here too, else the kernel unpins it during reclaim.
+        host_pool = getattr(self.tree_cache, "token_to_kv_pool_host", None)
+        if host_pool is not None:
+            host_pool.destroy()
 
     def run_event_loop(self) -> None:
         """Run the scheduler's event loop.
@@ -1476,6 +1481,18 @@ class Scheduler(
         self.schedule_stream = self.device_module.Stream(priority=0)
         if self.device == "cpu":
             self.schedule_stream.synchronize = lambda: None  # No-op for CPU
+        elif is_cuda() or _is_hip:
+            # CUDA/HIP streams come from a fixed round-robin pool. Redraw if this
+            # stream aliases forward_stream, which would eliminate scheduler
+            # overlap. Only CUDA/HIP streams expose a ``cuda_stream`` handle;
+            # other accelerators (e.g. NPU/XPU) skip the alias check.
+            _redraws = 0
+            while (
+                self.schedule_stream.cuda_stream == self.forward_stream.cuda_stream
+                and _redraws < 64
+            ):
+                self.schedule_stream = self.device_module.Stream(priority=0)
+                _redraws += 1
         # The global WAR barrier fences the scheduler's next shared-buffer write
         # on the previous forward's read of the unified memory pool.
         self._war_barrier_enabled = is_cuda() or envs.SGLANG_ENABLE_WAR_BARRIER.get()
@@ -1629,18 +1646,33 @@ class Scheduler(
             and last_batch_is_extend
         )
 
-        # We do not support overlap + spec + grammar yet,
-        # so we need to turn off overlap for this batch.
-        # TODO(lsyin): support overlap + spec + grammar
+        # Spec algorithms that don't advance the grammar FSM inside verify() (see
+        # supports_grammar_overlap) still need overlap forced off for grammar decode
+        # batches, so the FSM is advanced before the next batch's bitmask.
         need_grammar_sync = (
             batch
             and not batch.spec_algorithm.is_none()
+            and not batch.spec_algorithm.supports_grammar_overlap()
             and batch.has_grammar
             and batch.forward_mode.is_decode()
             and len(self.result_queue) > 0
         )
 
+        # Algorithms that support grammar overlap advance the FSM inside verify()
+        # via the grammar barrier (overlapping the target forward), which resolves
+        # whatever result is still pending in the queue — including the
+        # extend->decode boundary — so no grammar-specific overlap disable is needed.
         return disable_overlap_for_batch or need_grammar_sync
+
+    def _advance_pending_grammar(self):
+        """Grammar barrier (spec-v2 overlap): advance the FSM over any not-yet
+        -processed decode result still in the queue, so a following verify()'s
+        bitmask sees the previous batch's committed tokens. Invoked mid-worker
+        (before generate_token_bitmask) so the CPU advance overlaps the target
+        verify forward. Idempotent; no-op when the queue is empty or has no grammar.
+        """
+        for prev_batch, prev_result in self.result_queue:
+            self.batch_result_processor.advance_grammar_fsm(prev_result, prev_batch)
 
     @scheduler_nvtx_method("scheduler.process_input_requests")
     def process_input_requests(self, recv_reqs: List):
@@ -2688,7 +2720,8 @@ class Scheduler(
                 if self.dllm_config.first_done_first_out_mode:
                     if not req.dllm_incomplete_ids:
                         self.stash_chunked_request(req)
-                    self.req_to_token_pool.free(req)
+                        self.req_to_token_pool.free(req)
+                    # Otherwise, keep req slot/KV for reuse.
                 else:
                     self.stash_chunked_request(req)
 
@@ -3319,15 +3352,19 @@ class Scheduler(
                         # Spec_v2 fires on_publish mid-worker (between verify and
                         # draft_extend) so schedule prep can overlap with draft_extend.
                         # Non-spec has no later work — scheduler publishes after return.
-                        fwd_kwargs = (
-                            {
-                                "on_publish": partial(
-                                    self.future_map.publish, future_indices
+                        fwd_kwargs = {}
+                        if not batch.spec_algorithm.is_none():
+                            fwd_kwargs["on_publish"] = partial(
+                                self.future_map.publish, future_indices
+                            )
+                            # Grammar-overlap-capable workers advance the grammar FSM
+                            # inside verify() before building the bitmask; hand them the
+                            # barrier that resolves the previous batch's committed
+                            # tokens (overlapping the target forward).
+                            if batch.spec_algorithm.supports_grammar_overlap():
+                                fwd_kwargs["grammar_barrier"] = (
+                                    self._advance_pending_grammar
                                 )
-                            }
-                            if not batch.spec_algorithm.is_none()
-                            else {}
-                        )
 
                         # FIXME: pp is not compatible with overlap
                         batch_result = self.model_worker.forward_batch_generation(
@@ -4055,6 +4092,22 @@ class Scheduler(
             ):
                 release_kv_cache(req, self.tree_cache, is_insert=False)
             logger.debug(f"Abort queued request. {req.rid=}")
+
+        if self.dllm_config is not None:
+            for req in self.dllm_manager.pop_aborted_reqs(
+                recv_req.abort_all, recv_req.rid
+            ):
+                if self.enable_hicache_storage:
+                    self.tree_cache.release_aborted_request(req.rid)
+                self.ipc_channels.send_to_tokenizer.send_output(
+                    AbortReq(rid=req.rid), req
+                )
+                if (
+                    req.req_pool_idx is not None
+                    or getattr(req, "mamba_pool_idx", None) is not None
+                ):
+                    release_kv_cache(req, self.tree_cache, is_insert=False)
+                logger.debug(f"Abort dLLM queued request. {req.rid=}")
 
         # Delete the requests in the grammar queue
         # Abort method 2: call `set_finish_with_abort`
