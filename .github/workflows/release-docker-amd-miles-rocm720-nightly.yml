@@ -1,4 +1,4 @@
-name: Release Docker Images Nightly Miles ROCm7.2 (AMD)
+name: "[EXPERIMENT] PR 31757 Miles ROCm7.2 build (no push)"
 
 on:
   workflow_dispatch:
@@ -8,9 +8,12 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  smoke:
+  build-rocm720-mi35x:
     if: github.repository == 'sgl-project/sglang'
     runs-on: amd-docker-scale
+    timeout-minutes: 180
+    permissions:
+      contents: read
     steps:
       - name: Checkout miles repository
         uses: actions/checkout@v4
@@ -18,57 +21,26 @@ jobs:
           repository: radixark/miles
           ref: main
           fetch-depth: 0
+          persist-credentials: false
 
-      - name: Smoke test PR 31757 workflow assumptions without pushing
+      - name: Record miles commit
+        run: echo "Building from miles main @ $(git rev-parse HEAD)"
+
+      - name: Install docker/build.py dependencies
+        run: python3 -m pip install --quiet typer
+
+      - name: Build ROCm 7.2 MI35X image without pushing
         run: |
-          set +e
-          overall=0
+          python3 docker/build.py --variant rocm720-mi35x --image-tag custom --custom-tag miles
+          source_image="rocm/sgl-dev:miles-rocm720-mi35x"
+          experiment_image="${source_image}-pr31757-${GITHUB_RUN_ID}"
+          docker image inspect "${source_image}" >/dev/null
+          docker tag "${source_image}" "${experiment_image}"
+          docker image inspect "${experiment_image}" --format '{{.Id}} {{.RepoTags}}'
 
-          echo "===== runner/tooling ====="
-          python3 --version
-          docker version
-          docker buildx version
-          buildx_version_status=$?
-          docker buildx ls
-          buildx_ls_status=$?
-
-          echo "===== typer import in normal workflow python ====="
-          python3 - <<'PY'
-          import typer
-          print(f"typer import OK: {typer.__version__ if hasattr(typer, '__version__') else 'unknown'}")
-          PY
-          typer_status=$?
-          echo "typer_status=${typer_status}"
-          if [ "${typer_status}" -ne 0 ]; then overall=1; fi
-
-          echo "===== build.py dry-run with the PR command shape ====="
-          python3 docker/build.py --variant rocm720-mi35x --image-tag custom --custom-tag miles --dry-run
-          buildpy_status=$?
-          echo "buildpy_dry_run_status=${buildpy_status}"
-          if [ "${buildpy_status}" -ne 0 ]; then overall=1; fi
-
-          echo "===== minimal buildx build without --push/--load, then docker tag ====="
-          tag="rocm/sgl-dev:cursor-pr31757-buildx-smoke-${GITHUB_RUN_ID}"
-          docker buildx build -t "${tag}" - <<'DOCKERFILE'
-          FROM scratch
-          LABEL cursor.pr31757.buildx-smoke="true"
-          DOCKERFILE
-          build_status=$?
-          echo "buildx_build_status=${build_status}"
-
-          docker image inspect "${tag}"
-          inspect_status=$?
-          echo "docker_image_inspect_status=${inspect_status}"
-
-          docker tag "${tag}" "${tag}-retag"
-          tag_status=$?
-          echo "docker_tag_status=${tag_status}"
-
-          docker image rm "${tag}" "${tag}-retag" >/dev/null 2>&1
-
-          if [ "${buildx_version_status}" -ne 0 ] || [ "${buildx_ls_status}" -ne 0 ] || [ "${build_status}" -ne 0 ] || [ "${inspect_status}" -ne 0 ] || [ "${tag_status}" -ne 0 ]; then
-            overall=1
-          fi
-
-          echo "overall_status=${overall}"
-          exit "${overall}"
+      - name: Remove experiment tags
+        if: always()
+        run: |
+          source_image="rocm/sgl-dev:miles-rocm720-mi35x"
+          experiment_image="${source_image}-pr31757-${GITHUB_RUN_ID}"
+          docker image rm "${experiment_image}" "${source_image}" >/dev/null 2>&1 || true
