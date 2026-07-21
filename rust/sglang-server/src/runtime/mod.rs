@@ -20,7 +20,6 @@ pub mod channels;
 pub mod ring;
 pub mod threads;
 
-use crate::ids::RequestIdGen;
 use crate::runtime::channels::{DetokMsg, Senders, TmEvent};
 use crate::runtime::ring::{
     EgressConsumer, EgressProducer, IngressConsumer, IngressProducer, egress_ring, ingress_ring,
@@ -326,7 +325,6 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
         tok: tok_tx,
         detok: detok_tx,
     };
-    let id_gen = Arc::new(RequestIdGen::default());
 
     // `skip_tokenizer_init`: clients send token ids and receive token ids — no
     // tokenizer is loaded, and the egress emits raw `output_ids` (no decode).
@@ -390,7 +388,7 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
     // --- Egress dispatcher: drains egress ring → routes chunks to shards ---
     {
         // First TM core; egress is the hotter router (every output token). One
-        // worker today via `spawn_pool`, so sharding by `RequestId` later (see
+        // worker today via `spawn_pool`, so sharding by `RidHash` later (see
         // `TM_CORES`) is just a larger count + per-shard receivers.
         let cores = plan
             .as_ref()
@@ -436,7 +434,6 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
         let cfg = cfg.clone();
         let api_cores = plan.as_ref().map(|p| p.api.clone());
         let senders = senders.clone();
-        let id_gen = id_gen.clone();
         let api_activity = egress_activity.clone();
         let shutdown_rx = shutdown_rx.clone();
         let handle = std::thread::Builder::new()
@@ -457,7 +454,6 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
                 rt.block_on(api_server::serve(
                     listener,
                     senders,
-                    id_gen,
                     cfg.channel_cap,
                     cfg.server_args.clone(),
                     // Egress heartbeat watched by `/health_generate`.
