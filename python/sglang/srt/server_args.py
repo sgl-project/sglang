@@ -953,6 +953,14 @@ class ServerArgs:
             aliases=["--decode-context-parallel-size"],
         ),
     ] = 1
+    dwdp_size: A[
+        int,
+        Arg(
+            help="DWDP (Distributed Weight Data Parallelism) group size. "
+            "When > 1, MoE prefill uses weight prefetch instead of token all-to-all. "
+            "Must equal tp_size. Only supported with --disaggregation-mode null or prefill.",
+        ),
+    ] = 1
     enable_prefill_cp: A[
         bool,
         "Enable context parallelism for the prefill phase. Select the layout with --cp-strategy.",
@@ -1622,7 +1630,10 @@ class ServerArgs:
     ] = False
     disable_custom_all_reduce: A[
         bool,
-        "Disable the custom all-reduce kernel and fall back to NCCL.",
+        Arg(
+            help="Disable the custom all-reduce kernel and fall back to NCCL.",
+            resolvable=True,
+        ),
     ] = False
     enable_mscclpp: A[
         bool,
@@ -1666,7 +1677,10 @@ class ServerArgs:
             resolvable=True,
         ),
     ] = None
-    enable_aiter_allreduce_fusion: A[bool, "Enable Aiter AllReduce Fusion."] = False
+    enable_aiter_allreduce_fusion: A[
+        bool,
+        Arg(help="Enable Aiter AllReduce Fusion.", resolvable=True),
+    ] = False
 
     # -------------------------------------------------------------------------
     # Torch compile and torchao
@@ -2277,6 +2291,18 @@ class ServerArgs:
             type_parser=json.loads,
         ),
     ] = None
+    mm_processor_worker_num: A[
+        int,
+        "Number of threads for multimodal processor calls. 0 selects the "
+        "model-specific default. Only processors with isolated-worker support "
+        "can use more than one thread.",
+    ] = 0
+    mm_io_worker_num: A[
+        int,
+        "Number of threads for multimodal data loading and decoding. 0 selects "
+        "the model-specific default. SGLANG_IO_WORKERS remains supported as an "
+        "environment override when this argument is 0.",
+    ] = 0
     limit_mm_data_per_request: A[
         Optional[Union[str, Dict[str, int]]],
         Arg(
@@ -2925,6 +2951,10 @@ class ServerArgs:
         # resolution (the declarative registry materializes too late to affect
         # it). Inkling opts into full-graph prefill capture here.
         self._apply_inkling_prefill_cuda_graph_default()
+
+        # must run before _handle_cuda_graph_config and _handle_data_parallelism
+        self._handle_dwdp()
+
         self._handle_cuda_graph_config()
 
         # Handle device-specific backends.
@@ -3498,16 +3528,6 @@ class ServerArgs:
                 )
                 self.cuda_graph_config.decode.backend = Backend.DISABLED
 
-            if self.cuda_graph_config.prefill.backend not in (
-                Backend.DISABLED,
-                Backend.TC_PIECEWISE,
-            ):
-                logger.warning(
-                    "XPU platform currently only supports prefill tc_piecewise CUDA graph; "
-                    "disabling unsupported prefill backend."
-                )
-                self.cuda_graph_config.prefill.backend = Backend.DISABLED
-
     # ------------------------------------------------------------------
     # CUDA graph configuration resolution
     # ------------------------------------------------------------------
@@ -3756,8 +3776,6 @@ class ServerArgs:
                 "MoE A2A backend",
                 lambda: _resolved_view(self).moe_a2a_backend != "none",
             ),
-            # DP-attn × BCG capture/replay not yet validated.
-            ("DP attention", lambda: self._resolved().enable_dp_attention),
             # Multimodal prefill replay faults under BCG; allowlisted archs opt back in.
             (
                 "multimodal model",
@@ -4599,7 +4617,7 @@ class ServerArgs:
                 )
                 if (
                     expected_attn_tp_size is not None
-                    and effective_attn_tp_size != expected_attn_tp_size
+                    and expected_attn_tp_size % effective_attn_tp_size != 0
                 ):
                     raise ValueError(
                         "MiMoV2ForCausalLM requires effective attention TP "
@@ -4798,10 +4816,18 @@ class ServerArgs:
         assert (
             is_cuda() or is_musa() or is_npu() or is_hip()
         ), "extra_buffer needs CUDA/MUSA/NPU/ROCm (FLA)."
+        if view.mamba_radix_cache_strategy == "extra_buffer_lazy":
+            # The PD-disagg decode pool is not wired for lazy slots.
+            assert view.disaggregation_mode == "null", (
+                "extra_buffer_lazy unsupported under PD disaggregation; use "
+                "--mamba-radix-cache-strategy extra_buffer."
+            )
+            algo = (view.speculative_algorithm or "").upper()
+            assert algo not in ("DFLASH", "DSPARK"), (
+                f"extra_buffer_lazy unsupported with {view.speculative_algorithm}; "
+                "use --mamba-radix-cache-strategy extra_buffer."
+            )
         if view.speculative_num_draft_tokens is not None:
-            assert (
-                view.mamba_radix_cache_strategy != "extra_buffer_lazy"
-            ), "extra_buffer_lazy unsupported with spec."
             assert view.mamba_track_interval >= view.speculative_num_draft_tokens
         if view.page_size is not None:
             assert view.mamba_track_interval % view.page_size == 0
@@ -5552,6 +5578,61 @@ class ServerArgs:
         from sglang.srt.layers.cp.base import init_cp_strategy
 
         init_cp_strategy(self)
+
+    def _handle_dwdp(self):
+        if self.dwdp_size <= 1:
+            return
+
+        assert (
+            self.dwdp_size >= 2
+        ), f"dwdp_size must be >= 2 when enabled, got {self.dwdp_size}"
+        assert (
+            self.dwdp_size == self.tp_size
+        ), f"dwdp_size ({self.dwdp_size}) must equal tp_size ({self.tp_size})"
+        assert self.disaggregation_mode in (
+            "null",
+            "prefill",
+        ), "DWDP requires --disaggregation-mode null or prefill"
+        assert (
+            not self.enable_eplb
+        ), "EPLB dynamic migration conflicts with static DWDP partitioning"
+        assert (
+            self.speculative_algorithm is None
+        ), "DWDP does not support speculative decoding (MTP/draft workers)"
+        assert self.pp_size == 1, "DWDP requires pp_size == 1"
+        assert (
+            not self.enable_two_batch_overlap
+        ), "DWDP's prefetch event protocol does not support two-batch overlap"
+
+        if self.disaggregation_mode == "null":
+            logger.warning(
+                "DWDP with --disaggregation-mode null: decode steps re-fetch all "
+                "remote expert weights every step, which is slow. DWDP is "
+                "recommended only with --disaggregation-mode prefill."
+            )
+
+        self.dp_size = self.dwdp_size
+        self.enable_dp_attention = True
+        self.enable_dp_attention_local_control_broadcast = True
+        self.enable_dp_lm_head = True
+        self.moe_dense_tp_size = 1
+        self.ep_size = self.dwdp_size
+        self.moe_ep_size = self.dwdp_size
+        self.moe_dp_size = 1
+        self.moe_a2a_backend = "none"
+
+        envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.set(True)
+
+        self.disable_cuda_graph = True
+
+        logger.info(
+            f"DWDP enabled: dwdp_size={self.dwdp_size}, "
+            f"auto-forced dp_size={self.dp_size}, moe_ep_size={self.moe_ep_size}, "
+            f"moe_dense_tp_size=1, moe_a2a_backend=none, "
+            f"dp_attention_local_control_broadcast=True, "
+            f"enable_dp_lm_head=True, SCHEDULER_SKIP_ALL_GATHER=True, "
+            f"disable_cuda_graph=True"
+        )
 
     def _handle_data_parallelism(self):
         # The dp_size==1 resets moved to the resolution pipeline
@@ -7624,6 +7705,10 @@ class ServerArgs:
 
         assert self.tokenizer_worker_num > 0, "Tokenizer worker num must >= 1"
         assert self.detokenizer_worker_num > 0, "Detokenizer worker num must >= 1"
+        assert (
+            self.mm_processor_worker_num >= 0
+        ), "Multimodal processor worker num must >= 0"
+        assert self.mm_io_worker_num >= 0, "Multimodal I/O worker num must >= 0"
         self.validate_buckets_rule(
             "--prompt-tokens-buckets", self.prompt_tokens_buckets
         )
