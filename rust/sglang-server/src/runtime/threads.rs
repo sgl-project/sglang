@@ -54,16 +54,12 @@ pub(super) struct CorePlan {
 }
 
 pub(super) fn plan_cores(cfg: &RuntimeConfig) -> Option<CorePlan> {
-    if !cfg.pin_cores {
-        return None;
-    }
-    // Prefer an explicit core list (NUMA-local cores minus the scheduler's
-    // reserved launch cores); otherwise use every core this process is allowed
-    // on. When NUMA binding is active, `get_core_ids` already reflects the
-    // NUMA-local set via `sched_getaffinity`.
+    // `cores` carries the pinning decision: `None`/empty → run unpinned. The
+    // caller (Python `_partition_cores`) passes this rank's NUMA-local cores
+    // minus the scheduler's reserved launch cores.
     let cores: Vec<CoreId> = match &cfg.cores {
         Some(ids) if !ids.is_empty() => ids.iter().map(|&id| CoreId { id }).collect(),
-        _ => core_affinity::get_core_ids()?,
+        _ => return None,
     };
     if cores.len() < cfg.api_worker_num + cfg.tokenizer_worker_num + cfg.detokenizer_worker_num {
         tracing::warn!(

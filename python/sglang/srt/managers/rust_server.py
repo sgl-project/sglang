@@ -22,7 +22,11 @@ from sglang.srt.managers.utils import (
     MsgpackDecodeError,
     msgpack_decode_explained,
 )
-from sglang.srt.utils.flatten import flatten_hidden, flatten_ragged
+from sglang.srt.utils.flatten import (
+    FlatPairColumns,
+    NestedRowColumns,
+    RaggedPairColumns,
+)
 
 if TYPE_CHECKING:
     from sglang_server import Server
@@ -59,13 +63,13 @@ class RustServer:
         os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
         server_args = scheduler.server_args
-        bind = f"{server_args.host}:{server_args.port}"
+        http_addr = f"{server_args.host}:{server_args.port}"
         launch_cores, server_cores = cls._partition_cores()
 
         server = Server(
-            pin_cores=server_cores is not None,
+            # None -> run unpinned; the list carries the pinning decision.
             cores=server_cores,
-            bind=bind,
+            http_addr=http_addr,
             server_args_json=cls._build_server_args(scheduler),
         )
 
@@ -79,7 +83,7 @@ class RustServer:
 
         logger.info(
             "SGLANG_RUST_SERVER enabled, Rust server listen on %s",
-            bind,
+            http_addr,
         )
 
         return cls(server)
@@ -146,26 +150,20 @@ class RustServer:
         scheduler's GIL.
         """
 
-        try:
-            payload = (
-                msgspec.structs.asdict(output)
-                if isinstance(output, msgspec.Struct)
-                else output
-            )
-            # enc_hook stringifies non-native types (paths, enums); JSON
-            # rendering happens in Rust.
-            encoded = msgspec.msgpack.encode(payload, enc_hook=str)
-            rid = getattr(recv_req, "rid", None) or "0"
-            self.server.push_result(rid, encoded)
-        except Exception as e:
-            logger.warning(
-                "rust control response push failed (%s): %s",
-                type(output).__name__,
-                e,
-            )
-            raise ValueError(
-                f"rust control response push failed ({type(output).__name__}): {e}"
-            )
+        # No local try/except: a failed push propagates to run_scheduler_process's
+        # outer handler, which logs the full traceback (scheduler-fatal either way).
+        payload = (
+            msgspec.structs.asdict(output)
+            if isinstance(output, msgspec.Struct)
+            else output
+        )
+        # enc_hook stringifies non-native types (paths, enums); JSON
+        # rendering happens in Rust.
+        encoded = msgspec.msgpack.encode(payload, enc_hook=str)
+        # Every control request is a BaseReq, so `rid` always exists; only its
+        # value may be None (unrouted control paths) — then fall back to "0".
+        rid = recv_req.rid or "0"
+        self.server.push_result(rid, encoded)
 
     def push_generation(self, payload: BatchTokenIDOutput) -> None:
         """Egress redirect for generation output (replaces the zmq detokenizer).
@@ -192,33 +190,17 @@ class RustServer:
         """
         output_ids = payload.output_ids or []
         prompt_tokens = payload.prompt_tokens or []
-        out_lp_val = payload.output_token_logprobs_val or []
-        out_lp_idx = payload.output_token_logprobs_idx or []
-        in_lp_val = payload.input_token_logprobs_val or []
-        in_lp_idx = payload.input_token_logprobs_idx or []
-        out_top_val = payload.output_top_logprobs_val or []
-        out_top_idx = payload.output_top_logprobs_idx or []
-        in_top_val = payload.input_top_logprobs_val or []
-        in_top_idx = payload.input_top_logprobs_idx or []
-        out_tid_val = payload.output_token_ids_logprobs_val or []
-        out_tid_idx = payload.output_token_ids_logprobs_idx or []
-        in_tid_val = payload.input_token_ids_logprobs_val or []
-        in_tid_idx = payload.input_token_ids_logprobs_idx or []
-        hidden = payload.output_hidden_states or []
 
-        def at(seq_, j):
-            return seq_[j] if j < len(seq_) else None
-
-        # Hot-path guard: almost no decode step wants logprobs / hidden states, so
-        # only then do we pay the per-request flatten + raw-buffer packing.
+        # Hot-path guard: almost no decode step wants logprobs / hidden states,
+        # so only then pay the per-request flatten + buffer packing below.
         has_extra = bool(
-            out_lp_val
-            or in_lp_val
-            or out_top_val
-            or in_top_val
-            or out_tid_val
-            or in_tid_val
-            or hidden
+            payload.output_token_logprobs_val
+            or payload.input_token_logprobs_val
+            or payload.output_top_logprobs_val
+            or payload.input_top_logprobs_val
+            or payload.output_token_ids_logprobs_val
+            or payload.input_token_ids_logprobs_val
+            or payload.output_hidden_states
         )
 
         # Runs on the scheduler's CUDA-launch thread every decode step, so each
@@ -233,101 +215,75 @@ class RustServer:
         flat_ids = array("i", chain.from_iterable(output_ids))
 
         # Column order here MUST match BatchHeader (header_cols) and
-        # decode_batch_frame's read order (data_cols).
+        # decode_batch_frame's read order (data_cols); the extras contribution
+        # is ordered by the `extras` tuple below.
         header_cols = [rids, finish_reasons, prompt_tokens, tok_lens]
         data_cols = [flat_ids.tobytes()]
 
         if has_extra:
-            # Rare: at least one request wants logprobs/hidden states. Append the
-            # numeric columns concatenated across all requests (column-major).
-            # Flat families carry a per-request element count; ragged families and
-            # hidden states carry a per-request position/row count + a flat
-            # per-position length stream.
-            olp_v, olp_i, out_lp_lens = array("f"), array("i"), []
-            ilp_v, ilp_i, in_lp_lens = array("f"), array("i"), []
-            ot_v, ot_i, ot_pos, ot_req = array("f"), array("i"), [], []
-            it_v, it_i, it_pos, it_req = array("f"), array("i"), [], []
-            od_v, od_i, od_pos, od_req = array("f"), array("i"), [], []
-            id_v, id_i, id_pos, id_req = array("f"), array("i"), [], []
-            h_v, h_pos, h_req = array("f"), [], []
-
-            # TODO(perf): this per-request flatten assumes the logprob/hidden
+            # The `extras` tuple is the SINGLE source of the extras column
+            # order — it must match the Rust ``BatchHeader`` fields and
+            # ``decode_batch_frame``'s read order.
+            #
+            # TODO(perf): the per-request flatten assumes the logprob/hidden
             # columns are ragged, non-contiguous nested Python lists — which is
             # only an assumption. The scheduler moves these off the GPU with
-            # `tensor.tolist()`, so revisit whether the underlying values are
-            # still contiguous tensors upstream. If so, ship them as raw bytes
-            # (`tensor.contiguous().numpy().tobytes()`) + a shape descriptor and
-            # skip this flatten entirely, making the extras path loop-free too.
-            for i in range(len(rids)):
-                # Output logprobs are always real, no None check.
-                olv = at(out_lp_val, i) or []
-                olp_v.extend(olv)
-                olp_i.extend(at(out_lp_idx, i) or [])
-                out_lp_lens.append(len(olv))
-                # Input logprobs: only the first prompt token's logprob is the
-                # `None` sentinel.
-                ilv = at(in_lp_val, i) or []
-                if ilv and ilv[0] is None:
-                    ilp_v.append(float("nan"))
-                    ilp_v.extend(ilv[1:])
-                else:
-                    ilp_v.extend(ilv)
-                ilp_i.extend(at(in_lp_idx, i) or [])
-                in_lp_lens.append(len(ilv))
-                otv, oti, otl = flatten_ragged(at(out_top_val, i), at(out_top_idx, i))
-                ot_v.extend(otv)
-                ot_i.extend(oti)
-                ot_pos.extend(otl)
-                ot_req.append(len(otl))
-                itv, iti, itl = flatten_ragged(at(in_top_val, i), at(in_top_idx, i))
-                it_v.extend(itv)
-                it_i.extend(iti)
-                it_pos.extend(itl)
-                it_req.append(len(itl))
-                odv, odi, odl = flatten_ragged(at(out_tid_val, i), at(out_tid_idx, i))
-                od_v.extend(odv)
-                od_i.extend(odi)
-                od_pos.extend(odl)
-                od_req.append(len(odl))
-                idv, idi, idl = flatten_ragged(at(in_tid_val, i), at(in_tid_idx, i))
-                id_v.extend(idv)
-                id_i.extend(idi)
-                id_pos.extend(idl)
-                id_req.append(len(idl))
-                hv, hlens = flatten_hidden(at(hidden, i))
-                h_v.extend(hv)
-                h_pos.extend(hlens)
-                h_req.append(len(hlens))
+            # `tensor.tolist()`, so revisit whether the upstream values are
+            # still contiguous tensors; if so, ship raw bytes + a shape
+            # descriptor and skip the flatten entirely.
+            batch_size = len(rids)
+            extras = (
+                FlatPairColumns(
+                    "output_token_logprobs",
+                    payload.output_token_logprobs_val or [],
+                    payload.output_token_logprobs_idx or [],
+                ),
+                FlatPairColumns(
+                    "input_token_logprobs",
+                    payload.input_token_logprobs_val or [],
+                    payload.input_token_logprobs_idx or [],
+                    first_none_to_nan=True,
+                ),
+                RaggedPairColumns(
+                    "output_top_logprobs",
+                    payload.output_top_logprobs_val or [],
+                    payload.output_top_logprobs_idx or [],
+                ),
+                RaggedPairColumns(
+                    "input_top_logprobs",
+                    payload.input_top_logprobs_val or [],
+                    payload.input_top_logprobs_idx or [],
+                ),
+                RaggedPairColumns(
+                    "output_token_ids_logprobs",
+                    payload.output_token_ids_logprobs_val or [],
+                    payload.output_token_ids_logprobs_idx or [],
+                ),
+                RaggedPairColumns(
+                    "input_token_ids_logprobs",
+                    payload.input_token_ids_logprobs_val or [],
+                    payload.input_token_ids_logprobs_idx or [],
+                ),
+                NestedRowColumns(
+                    "output_hidden_states", payload.output_hidden_states or []
+                ),
+            )
 
-            header_cols += [
-                out_lp_lens,
-                in_lp_lens,
-                ot_req,
-                ot_pos,
-                it_req,
-                it_pos,
-                od_req,
-                od_pos,
-                id_req,
-                id_pos,
-                h_req,
-                h_pos,
-            ]
-            data_cols += [
-                olp_v.tobytes(),
-                olp_i.tobytes(),
-                ilp_v.tobytes(),
-                ilp_i.tobytes(),
-                ot_v.tobytes(),
-                ot_i.tobytes(),
-                it_v.tobytes(),
-                it_i.tobytes(),
-                od_v.tobytes(),
-                od_i.tobytes(),
-                id_v.tobytes(),
-                id_i.tobytes(),
-                h_v.tobytes(),
-            ]
+            # Every column is all-or-nothing per payload.
+            for extra in extras:
+                for name, col in extra.columns():
+                    assert len(col) in (
+                        0,
+                        batch_size,
+                    ), f"extras column {name}: {len(col)} entries for a batch of {batch_size}"
+
+            for i in range(batch_size):
+                for extra in extras:
+                    extra.accept(i)
+
+            for extra in extras:
+                header_cols += extra.header_cols()
+                data_cols += extra.data_cols()
 
         header = msgspec.msgpack.encode(header_cols)
         # Pass the raw column list; the Rust side concatenates it into the frame

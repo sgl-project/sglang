@@ -32,18 +32,15 @@ pub use threads::Runnable;
 
 #[derive(Clone, Debug)]
 pub struct RuntimeConfig {
-    pub bind: SocketAddr,
+    pub http_addr: SocketAddr,
     pub api_worker_num: usize,
     pub tokenizer_worker_num: usize,
     pub detokenizer_worker_num: usize,
     pub ingress_ring_cap: usize,
     pub egress_ring_cap: usize,
     pub channel_cap: usize,
-    /// If true, pin pools to distinct CPU cores via `core_affinity`.
-    pub pin_cores: bool,
-    /// Explicit CPU core ids the pools may pin to (e.g. this rank's NUMA-local
-    /// cores minus the scheduler's reserved launch cores). `None` → use every
-    /// core this process is allowed on (`sched_getaffinity`).
+    /// CPU core ids the pools pin to (e.g. this rank's NUMA-local cores minus
+    /// the scheduler's reserved launch cores). `None` → run unpinned.
     pub cores: Option<Vec<usize>>,
     /// Path to a `tokenizer.json` (or a model dir containing one, a tiktoken
     /// model file, or an HF Hub repo id resolved via the local cache). `None`
@@ -60,14 +57,13 @@ pub struct RuntimeConfig {
 impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
-            bind: "127.0.0.1:30000".parse().unwrap(),
+            http_addr: "127.0.0.1:30000".parse().unwrap(),
             api_worker_num: 2,
             tokenizer_worker_num: 2,
             detokenizer_worker_num: 2,
             ingress_ring_cap: 8192,
             egress_ring_cap: 8192,
             channel_cap: 8192,
-            pin_cores: true,
             cores: None,
             tokenizer_path: None,
             revision: None,
@@ -294,8 +290,8 @@ impl Drop for Runtime {
 pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
     // Bind the API server port before spawning any thread, so an unavailable
     // port (EADDRINUSE) is a hard startup error.
-    let listener = std::net::TcpListener::bind(cfg.bind)
-        .map_err(|e| format!("bind {} failed: {e}", cfg.bind))?;
+    let listener = std::net::TcpListener::bind(cfg.http_addr)
+        .map_err(|e| format!("bind {} failed: {e}", cfg.http_addr))?;
     listener
         .set_nonblocking(true)
         .map_err(|e| format!("listener set_nonblocking failed: {e}"))?;
@@ -490,8 +486,7 @@ mod tests {
         // `skip_tokenizer_init` → no tokenizer/detok model load; minimal boot.
         let server_args = ServerArgs::from_json(r#"{"skip_tokenizer_init": true}"#).unwrap();
         let cfg = RuntimeConfig {
-            bind: addr,
-            pin_cores: false,
+            http_addr: addr,
             api_worker_num: 1,
             tokenizer_worker_num: 1,
             detokenizer_worker_num: 1,
@@ -531,8 +526,7 @@ mod tests {
 
         let server_args = ServerArgs::from_json(r#"{"skip_tokenizer_init": true}"#).unwrap();
         let cfg = RuntimeConfig {
-            bind: addr,
-            pin_cores: false,
+            http_addr: addr,
             api_worker_num: 1,
             tokenizer_worker_num: 1,
             detokenizer_worker_num: 1,
@@ -575,8 +569,7 @@ mod tests {
 
         let server_args = ServerArgs::from_json(r#"{"skip_tokenizer_init": true}"#).unwrap();
         let cfg = RuntimeConfig {
-            bind: addr,
-            pin_cores: false,
+            http_addr: addr,
             api_worker_num: 1,
             tokenizer_worker_num: 1,
             detokenizer_worker_num: 1,
