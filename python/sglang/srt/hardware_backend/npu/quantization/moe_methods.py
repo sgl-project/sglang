@@ -839,14 +839,27 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
         else:
             weight, scale = self._quantize_weight_online(weight, weight_prefix)
 
+        # FRACTAL_NZ before the transpose, never after. gmm1 asserts that weight
+        # and weight_scale carry the SAME transpose flag (CheckMXTranspose: "the
+        # transposition of weightScale/weight should be equal"), and the cast
+        # yields a physically retiled — hence non-transposed — tensor. Casting
+        # the [E, K, N] view would therefore leave the weight at false against a
+        # true scale and fail outright, which is why this cannot copy the int8
+        # MoE methods above (they transpose first, but carry no MX scale to keep
+        # in sync). Same order as the dense W4A8 path in linear_method_npu.py.
+        #
+        # A5 measurement, Qwen3-30B-A3B shapes, 128 experts (see
+        # llm/probe_mxfp8_moe_nz.py): +1.4% decode, +3.8% prefill against a 0.2-
+        # 0.3% noise floor, bit-identical outputs. Set
+        # SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT to fall back to plain ND.
+        weight = npu_format_cast(weight)
+
         # Both paths hand the grouped matmul weight [E, K, N] and scale
         # [E, K//64, N, 2] as strided transpose views — DO NOT call
-        # .contiguous(). The reduction loop scans the K-dim per output column,
-        # which the [E, N, K] row-major source gives at stride 1 through the
-        # transpose view (matches NPUMXFP8LinearMethod, msmodelslim's offline
-        # layout and vllm-ascend's AscendW8A8MXFP8DynamicFusedMoEMethod).
-        # .contiguous() would physically reorder to [E, K, N] row-major, making
-        # the inner-loop stride = N and tanking HBM bandwidth.
+        # .contiguous(). Beyond breaking the transpose-flag match above, it
+        # measures slower on the same probe: making both sides contiguous costs
+        # 6.2% on decode. This matches NPUMXFP8LinearMethod, msmodelslim's
+        # offline layout and vllm-ascend's AscendW8A8MXFP8DynamicFusedMoEMethod.
         setattr(
             layer,
             f"{weight_prefix}_weight",
