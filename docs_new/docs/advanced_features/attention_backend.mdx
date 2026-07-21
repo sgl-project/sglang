@@ -125,7 +125,7 @@ The support matrix is split into two parts: MHA (standard attention) and MLA (mu
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>**HPC-Ops**</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>64</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>✅</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
@@ -620,11 +620,23 @@ python3 -m sglang.launch_server \
   --trust-remote-code
 ```
 
-- HPC-Ops (MHA kernels from [HPC-Ops](https://github.com/Tencent/hpc-ops) by the Tencent Hunyuan AI Infra team; Hopper+, requires installing the `hpc` package from source, page size 64, bf16 KV cache, head_dim 128, q/kv head group 4 or 8)
+- HPC-Ops (MHA kernels from [HPC-Ops](https://github.com/Tencent/hpc-ops) by the Tencent Hunyuan AI Infra team; Hopper+, requires installing the `hpc` package from source, page size 64, bf16 or fp8_e4m3 KV cache, head_dim 128, q/kv head group 4 or 8)
 ```bash Command
 python3 -m sglang.launch_server \
   --model Qwen/Qwen3-30B-A3B-Instruct-2507-FP8 \
   --attention-backend hpc_ops \
+  --page-size 64 \
+  --trust-remote-code
+
+# FP8 models should also set --kv-cache-dtype fp8_e4m3 to run the FP8 attention
+# kernels. This enables the fused QKNorm+RoPE+FP8-quant+StoreKV op, which is
+# currently wired for Hunyuan V3 and requires per-rank (q_heads, kv_heads) of
+# (64, 8) or (8, 1), e.g. --tp 1 or --tp 8 for Hy3.
+python3 -m sglang.launch_server \
+  --tp 8 \
+  --model tencent/Hy3-FP8 \
+  --attention-backend hpc_ops \
+  --kv-cache-dtype fp8_e4m3 \
   --page-size 64 \
   --trust-remote-code
 ```

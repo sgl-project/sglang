@@ -107,7 +107,7 @@ class HPCOpsMetadata(msgspec.Struct):
 
 
 class HPCOpsAttnBackend(AttentionBackend):
-    """HPC-Ops paged MHA attention backend (bf16 KV cache)."""
+    """HPC-Ops paged MHA attention backend (bf16 or fp8_e4m3 KV cache)."""
 
     # The page table is built on-device from seq_lens, so the D2H sync for
     # seq_lens_cpu is not needed (same as trtllm_mha / triton).
@@ -120,6 +120,12 @@ class HPCOpsAttnBackend(AttentionBackend):
             raise ImportError(
                 "The hpc_ops attention backend requires the `hpc` package. "
                 "Install it from https://github.com/Tencent/hpc-ops"
+            )
+
+        if model_runner.spec_algorithm.is_speculative():
+            raise ValueError(
+                "The hpc_ops attention backend does not support speculative "
+                "decoding (MTP/EAGLE) yet."
             )
 
         self.page_size = model_runner.page_size
