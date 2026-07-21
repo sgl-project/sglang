@@ -580,10 +580,6 @@ def fused_qk_gemma_rmsnorm(
     q_out = torch.empty(q_rows, head_dim, dtype=q.dtype, device=q.device)
     k_out = torch.empty(k_rows, head_dim, dtype=k.dtype, device=k.device)
 
-    # Empty batch (e.g. an idle DP-attention rank): the launch grid would be
-    # (0,). CUDA tolerates a zero-sized grid as a no-op, but HIP aborts with
-    # `invalid configuration argument`. Return the correctly-shaped empty
-    # outputs without launching. See issue #31350.
     if q_rows == 0:
         return q_out, k_out
 
@@ -703,10 +699,6 @@ def fused_qk_gemma_rmsnorm_with_gate(
     k_out = torch.empty(k_rows, head_dim, dtype=k.dtype, device=k.device)
     gate_out = torch.empty(q_rows, head_dim, dtype=q_gate.dtype, device=q_gate.device)
 
-    # Empty batch (e.g. an idle DP-attention rank): the launch grid would be
-    # (0,). CUDA tolerates a zero-sized grid as a no-op, but HIP aborts with
-    # `invalid configuration argument`. Return the correctly-shaped empty
-    # outputs without launching. See issue #31350.
     if q_rows == 0:
         return q_out, k_out, gate_out
 
