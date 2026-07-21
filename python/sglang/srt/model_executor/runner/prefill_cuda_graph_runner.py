@@ -758,9 +758,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 "req_pool_indices": torch.arange(bs, device=self.device),
                 "seq_lens": torch.tensor(capture_seq_lens, device=self.device),
                 "orig_seq_lens": torch.tensor(capture_seq_lens, device=self.device),
-                "extend_seq_lens": torch.tensor(
-                    capture_seq_lens, device=self.device
-                ),
+                "extend_seq_lens": torch.tensor(capture_seq_lens, device=self.device),
                 "extend_prefix_lens": torch.zeros((bs,), dtype=torch.int64),
                 "extend_start_loc": torch.tensor(
                     capture_start_locs, device=self.device
