@@ -87,6 +87,31 @@ def compute_row_logsumexp(
     return torch.logsumexp(torch.stack(partials, dim=-1), dim=-1)
 
 
+_INT32_MAX = 2**31 - 1
+
+
+def _logits_topk(logits: torch.Tensor, k: int):
+    """Row-wise top-k, sorted descending.
+
+    flashinfer's top_k reads the row once (3-6x over torch.topk's multi-pass
+    radix select at LLM vocab sizes) but breaks value ties in
+    implementation-defined order rather than lowest-index-first.
+    """
+    if logits.is_cuda and logits.shape[-1] <= _INT32_MAX:
+        try:
+            from flashinfer import top_k as flashinfer_top_k
+        except ImportError:
+            flashinfer_top_k = None
+        if flashinfer_top_k is not None:
+            values, indices = flashinfer_top_k(
+                logits, k=k, sorted=False, deterministic=True
+            )
+            order = values.argsort(dim=-1, descending=True)
+            return values.gather(-1, order), indices.gather(-1, order)
+    values, indices = torch.topk(logits, k=k, dim=-1, sorted=True)
+    return values, indices
+
+
 def get_top_logprobs_raw(
     logprobs: torch.Tensor,
     top_logprobs_nums: List[int],
@@ -216,12 +241,13 @@ def get_top_logprobs_chunk(
     """
     # Empty chunks still walk the slice to emit placeholder entries.
     max_k = max(top_k_nums)
-    ret = logprobs.topk(max_k, dim=1)
-    values_tensor = ret.values
     if log_normalizer is not None:
+        values_tensor, indices_tensor = _logits_topk(logprobs, max_k)
         values_tensor = values_tensor.float() - log_normalizer[:, None]
+    else:
+        values_tensor, indices_tensor = logprobs.topk(max_k, dim=1)
     values = values_tensor.tolist()
-    indices = ret.indices.tolist()
+    indices = indices_tensor.tolist()
 
     pt = 0
     next_split_pruned_len = 0
