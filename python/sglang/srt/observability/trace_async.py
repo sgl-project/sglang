@@ -63,7 +63,7 @@ import threading
 import time
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
-from sglang.srt.utils import get_int_env_var
+from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
     import zmq as _zmq_type
@@ -231,7 +231,7 @@ def maybe_start_trace_exporter(
     otlp_endpoint: str, server_name: str, trace_modules: Optional[str] = None
 ):
     """Conditionally start the async exporter based on SGLANG_TRACE_ASYNC env var."""
-    if os.environ.get("SGLANG_TRACE_ASYNC", "0") == "1":
+    if envs.SGLANG_TRACE_ASYNC.get():
         start_trace_exporter(otlp_endpoint, server_name, trace_modules=trace_modules)
 
 
@@ -399,6 +399,7 @@ class _TraceExporterProcess(multiprocessing.Process):
                         role=init_args.get("role", "unified"),
                         module_name=init_args.get("module_name", ""),
                         external_trace_header=init_args.get("external_trace_header"),
+                        trace_level=init_args.get("trace_level"),
                     )
                     if not trace_ctx.tracing_enable:
                         return
@@ -577,11 +578,10 @@ class TraceReqContextAsync:
             "role": role,
             "module_name": module_name,
             "external_trace_header": external_trace_header,
+            "trace_level": self.trace_level,
         }
         self._operations: List[Dict[str, Any]] = []
-        self._flush_threshold: int = get_int_env_var(
-            "SGLANG_TRACE_ASYNC_FLUSH_THRESHOLD", 100
-        )
+        self._flush_threshold: int = envs.SGLANG_TRACE_ASYNC_FLUSH_THRESHOLD.get()
 
         # Root span (created in this process for cross-process propagation)
         self.root_span = None
@@ -979,9 +979,7 @@ class TraceReqContextAsync:
         self.trace_level = state.get("trace_level", _trace_mod.global_trace_level)
         self._init_args = state["init_args"]
         self._operations = []
-        self._flush_threshold = get_int_env_var(
-            "SGLANG_TRACE_ASYNC_FLUSH_THRESHOLD", 100
-        )
+        self._flush_threshold = envs.SGLANG_TRACE_ASYNC_FLUSH_THRESHOLD.get()
         self.is_copy = True
         self.root_span = None
         self.root_span_context = None

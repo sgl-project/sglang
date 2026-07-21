@@ -24,6 +24,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional
 
+from sglang.srt.environ import envs
 from sglang.srt.utils import get_int_env_var
 
 logger = logging.getLogger(__name__)
@@ -227,12 +228,8 @@ def process_tracing_init(
             resource=resource, id_generator=TraceCustomIdGenerator()
         )
 
-        schedule_delay_millis = get_int_env_var(
-            "SGLANG_OTLP_EXPORTER_SCHEDULE_DELAY_MILLIS", 500
-        )
-        max_export_batch_size = get_int_env_var(
-            "SGLANG_OTLP_EXPORTER_MAX_EXPORT_BATCH_SIZE", 64
-        )
+        schedule_delay_millis = envs.SGLANG_OTLP_EXPORTER_SCHEDULE_DELAY_MILLIS.get()
+        max_export_batch_size = envs.SGLANG_OTLP_EXPORTER_MAX_EXPORT_BATCH_SIZE.get()
 
         processor = BatchSpanProcessor(
             span_exporter=get_otlp_span_exporter(otlp_endpoint),
@@ -251,7 +248,7 @@ def process_tracing_init(
     tracer = trace.get_tracer("sglang server")
 
     # Auto-start async trace exporter when SGLANG_TRACE_ASYNC=1
-    if os.environ.get("SGLANG_TRACE_ASYNC", "0") == "1":
+    if envs.SGLANG_TRACE_ASYNC.get():
         from sglang.srt.observability.trace_async import start_trace_exporter
 
         start_trace_exporter(otlp_endpoint, server_name, trace_modules=trace_modules)
@@ -312,9 +309,12 @@ class TraceReqContext:
         role="unified",
         module_name="",
         external_trace_header: Optional[Dict[str, str]] = None,
+        trace_level: Optional[int] = None,
     ):
         self.rid: str = str(rid)
-        self.trace_level = global_trace_level
+        self.trace_level = (
+            trace_level if trace_level is not None else global_trace_level
+        )
         self.tracing_enable: bool = opentelemetry_initialized and self.trace_level > 0
 
         # Filter by --trace-modules only for explicitly named modules; contexts
