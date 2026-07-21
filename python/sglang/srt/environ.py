@@ -368,8 +368,10 @@ class Envs:
     # inside the kernel (causal_seqs = prefix + T). The a2a-combined result is
     # final: pass-2 and the second combine are skipped. Contract validated
     # bit-exact by the fp32-reference poison probe (q_len=8, cp_world=8).
-    # Default OFF pending e2e gates; 1 enables for A/B.
-    SGLANG_DCP_SINGLE_CALL_VERIFY = EnvBool(False)
+    # Default ON: measured faster than the 2-pass cascade at every point
+    # (DFlash 50K/cc4 8.07 vs 9.18 ms tpot; 128K/cc16 ratio 1.07 -> 1.15) with
+    # AL parity and GSM8K green; 0 reverts to the cascade for A/B.
+    SGLANG_DCP_SINGLE_CALL_VERIFY = EnvBool(True)
 
     # Scheduler: memory leak test
     SGLANG_TEST_RETRACT = EnvBool(False)
