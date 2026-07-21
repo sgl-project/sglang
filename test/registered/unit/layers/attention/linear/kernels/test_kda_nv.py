@@ -11,6 +11,16 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
+_EXPECTED_FUSED_KWARGS = {
+    "scale",
+    "initial_state",
+    "output_final_state",
+    "safe_gate",
+    "lower_bound",
+    "A_log",
+    "dt_bias",
+}
+
 
 class _RejectTriton:
     def extend(self, *args, **kwargs):
@@ -33,8 +43,7 @@ class TestNVKDAAllPrefillWrapper(CustomTestCase):
                     "g": g.clone(),
                     "beta": beta.clone(),
                     "initial_state": kwargs["initial_state"].clone(),
-                    "cu_seqlens": kwargs["cu_seqlens"],
-                    "use_fused_k1234": kwargs["use_fused_k1234"],
+                    "kwargs": set(kwargs),
                 }
             )
             return v.clone(), kwargs["initial_state"] + 1.0
@@ -81,8 +90,7 @@ class TestNVKDAAllPrefillWrapper(CustomTestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(tuple(calls[0]["q"].shape), (1, 2048, 1, 128))
         self.assertEqual(calls[0]["beta"].dtype, torch.float32)
-        self.assertIsNone(calls[0]["cu_seqlens"])
-        self.assertTrue(calls[0]["use_fused_k1234"])
+        self.assertEqual(calls[0]["kwargs"], _EXPECTED_FUSED_KWARGS)
         self.assertTrue(torch.equal(output, x["v"]))
         self.assertTrue(torch.equal(states[1], torch.ones_like(states[1])))
 
@@ -110,8 +118,7 @@ class TestNVKDAAllPrefillWrapper(CustomTestCase):
         self.assertEqual(len(calls), 1)
         call = calls[0]
         self.assertEqual(tuple(call["q"].shape), (3, 2048, 1, 128))
-        self.assertIsNone(call["cu_seqlens"])
-        self.assertTrue(call["use_fused_k1234"])
+        self.assertEqual(call["kwargs"], _EXPECTED_FUSED_KWARGS)
         self.assertTrue(torch.equal(output, x["v"]))
 
         start = 0

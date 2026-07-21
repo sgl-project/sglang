@@ -1,11 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""NVIDIA chunked KDA prefill backend (K1-K4 CuTe/Triton/cuTile pipeline).
+"""NVIDIA fused KDA prefill backend for Blackwell.
 
-Wraps the vendored ``kda_nv_prefill`` package through its FLA-compatible
-``chunk_kda_fwd`` interface. Serving selects the single-kernel fused K1-K4
-implementation: besides removing launch/intermediate overhead, it retains the
-triangular solve in FP32/TF32. The split pipeline's BF16 inverse is not stable
-for Kimi-K3's trained safe-gate distribution.
+Wraps the vendored ``kda_nv_prefill`` package through its fused-only
+``chunk_kda_fwd`` entry point. Besides removing launch/intermediate overhead,
+the kernel retains the triangular solve in FP32/TF32.
 
 The serving wrapper repacks ordinary packed prefill batches into bounded
 equal-length groups (B <= 8) and pads every sequence to one of
@@ -394,13 +392,10 @@ class NVKDAKernel(LinearAttnKernelBase):
                     scale=head_k_dim**-0.5,
                     initial_state=st["s0"],
                     output_final_state=True,
-                    cu_seqlens=None,
                     safe_gate=lower_bound is not None,
                     lower_bound=lower_bound,
-                    use_gate_in_kernel=True,
                     A_log=alog_flat,
                     dt_bias=dtb_flat,
-                    use_fused_k1234=True,
                 )
                 group_output, final_state = res[0], res[1]
 
