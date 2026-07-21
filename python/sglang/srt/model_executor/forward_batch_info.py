@@ -490,9 +490,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For padding
     num_token_non_padded: Optional[torch.Tensor] = None  # scalar tensor
+    # Number of tokens model layers treat as non-padding. This includes fabricated
+    # idle tokens to keep MoE collectives participating.
     num_token_non_padded_cpu: int = None
-    # Token count before DP padding; used to unpad after MLP sync.
-    original_num_tokens: Optional[int] = None
+    # Local token count used as unpad width in post_forward_mlp_sync_batch.
+    num_tokens_before_dp_padding: Optional[int] = None
 
     # === Runtime-filled (set during the forward pass / cuda graph / managers; not at construction) ===
     # For logits and logprobs post processing
@@ -1360,8 +1362,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     def _pad_inputs_to_size(self, model_runner: ModelRunner, num_tokens, bs):
         # padding
-        # Token count before DP padding; used to unpad after MLP sync.
-        self.original_num_tokens = self.input_ids.shape[0]
+        self.num_tokens_before_dp_padding = self.input_ids.shape[0]
         self.input_ids = self._pad_tensor_to_size(self.input_ids, num_tokens)
         self.req_pool_indices = self._pad_tensor_to_size(self.req_pool_indices, bs)
         if self.lora_ids is not None:
@@ -1476,12 +1477,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         if self.spec_info is not None:
             if self.forward_mode.is_decode():  # draft
-                # STANDALONE has no hidden_states_backup; use original_num_tokens.
-                num_tokens = (
-                    self.hidden_states_backup.shape[0]
-                    if self.hidden_states_backup is not None
-                    else self.original_num_tokens
-                )
+                num_tokens = self.num_tokens_before_dp_padding
                 self.positions = self.positions[:num_tokens]
                 self.seq_lens = self.seq_lens[:bs]
                 self.req_pool_indices = self.req_pool_indices[:bs]
