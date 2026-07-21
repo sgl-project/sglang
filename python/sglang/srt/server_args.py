@@ -4535,11 +4535,18 @@ class ServerArgs:
                 # DeepGEMM or require >99KB SMEM (topk_v2).
                 envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
                 envs.SGLANG_OPT_USE_TOPK_V2.set(False)
-                envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.set(False)
-                envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
-                envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.set(True)
-                # Prefer TileLang over the Torch fallback.
-                envs.SGLANG_OPT_USE_TILELANG_INDEXER.set(True)
+                if not envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.is_set():
+                    envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.set(False)
+                if not envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.is_set():
+                    envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
+                # Out of the box the indexer runs the TileLang kernel (works on
+                # stock DeepGEMM); both knobs stay env-overridable so a DeepGEMM
+                # build with SM120 attention support can opt into
+                # fp8_paged_mqa_logits by setting them to 0.
+                if not envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.is_set():
+                    envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.set(True)
+                if not envs.SGLANG_OPT_USE_TILELANG_INDEXER.is_set():
+                    envs.SGLANG_OPT_USE_TILELANG_INDEXER.set(True)
             elif is_hip():
                 envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
                 envs.SGLANG_OPT_USE_FUSED_COMPRESS.set(True)

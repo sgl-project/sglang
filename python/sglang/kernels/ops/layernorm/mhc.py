@@ -6,6 +6,8 @@ import threading
 from typing import Tuple
 
 import torch
+import triton
+import triton.language as tl
 
 from sglang.jit_kernel.utils import is_arch_support_pdl
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -413,6 +415,23 @@ def mhc_pre_gemm_sqrsum_tilelang(
 
 
 @functools.cache
+def _mhc_pre_gemm_sqrsum_dispatch():
+    """SM120's TileLang pipeline cannot warp-specialize this kernel (the role
+    marker fails on tirx.Bind), so re-wrap it there with warp specialization
+    and TMA lowering disabled. Other archs keep the original compiled form."""
+    from sglang.srt.utils import is_sm120_supported
+
+    if not is_sm120_supported():
+        return mhc_pre_gemm_sqrsum_tilelang
+    _tl = _load_tilelang()
+    cfg = {
+        _tl.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+        _tl.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+    }
+    return _tl.jit(pass_configs=cfg)(mhc_pre_gemm_sqrsum_tilelang.__wrapped__)
+
+
+@functools.cache
 def mhc_pre_gemm_sqrsum_splitk_kernel(
     hc_mult3: int,
     hc_hidden_size: int,
@@ -432,7 +451,21 @@ def mhc_pre_gemm_sqrsum_splitk_kernel(
 
     ENABLE_PDL = is_arch_support_pdl()
 
-    @tilelang.jit
+    from sglang.srt.utils import is_sm120_supported
+
+    _tl = _load_tilelang()
+    # See _mhc_pre_gemm_sqrsum_dispatch: SM120 cannot compile the
+    # warp-specialized form of these kernels.
+    _cfg = (
+        {
+            _tl.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+            _tl.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+        }
+        if is_sm120_supported()
+        else None
+    )
+
+    @tilelang.jit(pass_configs=_cfg)
     def mhc_pre_gemm_sqrsum_splitk_stage_0(
         x: T.Tensor[(num_tokens, hc_hidden_size), T.bfloat16],
         fn: T.Tensor[(hc_mult3, hc_hidden_size), T.float32],
@@ -908,7 +941,7 @@ def mhc_pre(
             assert (
                 n_splits == 1
             ), "The simple TileLang version gemm_sqrsum doesn't support split-k"
-            mhc_pre_gemm_sqrsum_tilelang(
+            _mhc_pre_gemm_sqrsum_dispatch()(
                 residual_flat.view(num_tokens, hc_mult * hidden_size),
                 fn_flat,
                 gemm_out_mul.squeeze(0),
@@ -1464,7 +1497,7 @@ def mhc_fused_post_pre(
             gemm_out_sqrsum_1d = torch.empty(
                 num_tokens, dtype=torch.float32, device=residual.device
             )
-            mhc_pre_gemm_sqrsum_tilelang(
+            _mhc_pre_gemm_sqrsum_dispatch()(
                 residual_cur.view(num_tokens, hc_hidden_size),
                 fn,
                 gemm_out_mul_2d,
@@ -1616,3 +1649,49 @@ def npu_hc_pre(
     # not fold input_layernorm. Return norm_fused=False so the caller
     # applies the layernorm itself, matching the deepgemm/torch paths.
     return y.to(dtype), post, comb, False
+
+
+@triton.jit
+def _hc_combine_kernel(
+    x_ptr,
+    pre_ptr,
+    y_ptr,
+    H,
+    x_stride_m,
+    y_stride_m,
+    HC: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_h = tl.program_id(1)
+    offs_h = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+    mask = offs_h < H
+    acc = tl.zeros([BLOCK_H], dtype=tl.float32)
+    for k in tl.static_range(HC):
+        pk = tl.load(pre_ptr + pid_m * HC + k).to(tl.float32)
+        xv = tl.load(
+            x_ptr + pid_m * x_stride_m + k * H + offs_h, mask=mask, other=0.0
+        ).to(tl.float32)
+        acc += pk * xv
+    tl.store(y_ptr + pid_m * y_stride_m + offs_h, acc, mask=mask)
+
+
+def hc_combine(
+    x_flat: torch.Tensor, pre: torch.Tensor, hc: int, out_dtype: torch.dtype
+) -> torch.Tensor:
+    """Fused y[m, h] = sum_k pre[m, k] * x_flat[m, k*H + h]."""
+    m = x_flat.shape[0]
+    h = x_flat.shape[1] // hc
+    y = torch.empty((m, h), dtype=out_dtype, device=x_flat.device)
+    block_h = 1024
+    _hc_combine_kernel[(m, triton.cdiv(h, block_h))](
+        x_flat,
+        pre,
+        y,
+        h,
+        x_flat.stride(0),
+        y.stride(0),
+        HC=hc,
+        BLOCK_H=block_h,
+    )
+    return y
