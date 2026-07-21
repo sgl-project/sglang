@@ -3,20 +3,26 @@
 // H200 cells: REAL measured values (sglang 0.5.15.post1, lmsysorg/sglang:latest,
 //   8×H200 TP=8, 2026-07-20). GSM8K = sgl-eval run gsm8k, full 1319 questions, greedy.
 //   AIME25 = sgl-eval run aime25, 30 problems × 16 repeats, temp 1.0, top_p 0.95,
-//   max_tokens 64000, 128 threads, thinking ON via enable_thinking (not the generic
-//   'thinking' key). AIME25 measured on high-throughput cells only.
+//   max_tokens 64000, 128 threads, thinking ON via patched sgl-eval (enable_thinking).
+//   AIME25 measured on high-throughput cells only.
+//   BF16 AIME25 null: BF16 reasons ~2× longer than FP8/INT4 (median 34.8k vs 16.9k tokens),
+//   truncating at 33.8% at max_tokens=64000. Valid score requires max_tokens ≥ 131072.
 //
-// BF16 AIME25 invalidity: BF16 reasons ~2× longer than FP8/INT4 (median 34.8k vs
-//   16.9k tokens); 33.8% of responses truncated at max_tokens=64000. aime25_pct is
-//   left null — re-run with max_tokens ≥ 128k for a valid score.
+// GB300 cells (BF16/FP8/INT4): REAL measured values (sglang dev/custom build,
+//   4×GB300 TP=4, 2026-07-20). GSM8K = sgl-eval run gsm8k, full 1319 questions, greedy.
+//   AIME25 not measured on GB300: the sgl-eval `--thinking` flag sends the generic
+//   `thinking` key which Laguna's template ignores (it requires `enable_thinking`);
+//   without the sgl-eval patch applied on H200, thinking was not activated — the
+//   fp8_ht result (13.54%) is therefore invalid and omitted.
+//   GB300 NVFP4: quality broken (degenerate loop) — no accuracy numbers.
 //
-// B300/GB300 cells: PENDING (bare match stubs — benchmark card renders "pending").
+// B300 cells: PENDING (bare match stubs — benchmark card renders "pending").
 
 export const benchmarks = [
   // ===== H200 (8-GPU HGX, tp 8) — ✅ REAL, full GSM8K =====
   {
-    // ✅ REAL — 8×H200, BF16 dense, tp8, fa3 (Hopper auto-select), mem-frac 0.80.
-    // GSM8K 93.18%. AIME25 pending re-run with higher max_tokens (truncation at 64k).
+    // ✅ REAL — 8×H200, BF16 dense, tp8, fa3, mem-frac 0.80. GSM8K 93.18%.
+    // AIME25 null: truncation at 64k (BF16 reasons ~2× longer; needs max_tokens ≥ 131072).
     match: { hw: "h200", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" },
     verified: true,
     sglang_version: "0.5.15.post1",
@@ -47,7 +53,7 @@ export const benchmarks = [
     accuracy: { gsm8k_pct: 94.47, aime25_pct: null },
   },
   {
-    // ✅ REAL — 8×H200, INT4 dense, tp8, fa3. INT4 shared expert stays bf16 (no flag).
+    // ✅ REAL — 8×H200, INT4 dense, tp8, fa3. INT4 shared expert stays bf16.
     // GSM8K 95.00%, AIME25 67.71% pass@1 (avg-16, pass@16 86.7%, majority@16 80.0%).
     match: { hw: "h200", variant: "default", quant: "int4", strategy: "high-throughput", nodes: "single" },
     verified: true,
@@ -73,13 +79,56 @@ export const benchmarks = [
   { match: { hw: "b300", variant: "default", quant: "int4",  strategy: "high-throughput", nodes: "single" } },
   { match: { hw: "b300", variant: "default", quant: "int4",  strategy: "low-latency",     nodes: "single" } },
 
-  // ===== GB300 (4-GPU single node, tp 4) — PENDING =====
-  { match: { hw: "gb300", variant: "default", quant: "bf16",  strategy: "high-throughput", nodes: "single" } },
-  { match: { hw: "gb300", variant: "default", quant: "bf16",  strategy: "low-latency",     nodes: "single" } },
-  { match: { hw: "gb300", variant: "default", quant: "fp8",   strategy: "high-throughput", nodes: "single" } },
-  { match: { hw: "gb300", variant: "default", quant: "fp8",   strategy: "low-latency",     nodes: "single" } },
+  // ===== GB300 (4-GPU single node, tp 4) =====
+  {
+    // ✅ REAL — 4×GB300, BF16 dense, tp4, trtllm_mha (auto-select).
+    // GSM8K 93.33%. AIME25 not measured (enable_thinking patch not applied on GB300).
+    match: { hw: "gb300", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+    verified: true,
+    sglang_version: "dev/custom build (2026-07-20)",
+    accuracy: { gsm8k_pct: 93.33, aime25_pct: null },
+  },
+  {
+    // ✅ REAL — 4×GB300, BF16 + DFlash (matched bf16 draft), tp4, trtllm_mha.
+    // GSM8K 93.86%. AIME25 not measured.
+    match: { hw: "gb300", variant: "default", quant: "bf16", strategy: "low-latency", nodes: "single" },
+    verified: true,
+    sglang_version: "dev/custom build (2026-07-20)",
+    accuracy: { gsm8k_pct: 93.86, aime25_pct: null },
+  },
+  {
+    // ✅ REAL — 4×GB300, FP8 dense, tp4, trtllm_mha, SGLANG_SHARED_EXPERT_TP1=1.
+    // GSM8K 94.77%. AIME25 not measured (enable_thinking patch not applied on GB300).
+    match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+    verified: true,
+    sglang_version: "dev/custom build (2026-07-20)",
+    accuracy: { gsm8k_pct: 94.77, aime25_pct: null },
+  },
+  {
+    // ✅ REAL — 4×GB300, FP8 + DFlash (fp8-calibrated draft, patched rope_theta),
+    // tp4, trtllm_mha, SGLANG_SHARED_EXPERT_TP1=1. GSM8K 94.54%.
+    match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
+    verified: true,
+    sglang_version: "dev/custom build (2026-07-20)",
+    accuracy: { gsm8k_pct: 94.54, aime25_pct: null },
+  },
+  // NVFP4: quality broken on GB300 (degenerate loop) — no accuracy numbers, pending stubs.
   { match: { hw: "gb300", variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "single" } },
   { match: { hw: "gb300", variant: "default", quant: "nvfp4", strategy: "low-latency",     nodes: "single" } },
-  { match: { hw: "gb300", variant: "default", quant: "int4",  strategy: "high-throughput", nodes: "single" } },
-  { match: { hw: "gb300", variant: "default", quant: "int4",  strategy: "low-latency",     nodes: "single" } },
+  {
+    // ✅ REAL — 4×GB300, INT4 dense, tp4, trtllm_mha. INT4 shared expert stays bf16.
+    // GSM8K 94.77%. AIME25 skipped per user decision.
+    match: { hw: "gb300", variant: "default", quant: "int4", strategy: "high-throughput", nodes: "single" },
+    verified: true,
+    sglang_version: "dev/custom build (2026-07-20)",
+    accuracy: { gsm8k_pct: 94.77, aime25_pct: null },
+  },
+  {
+    // ✅ REAL — 4×GB300, INT4 + DFlash (int4-calibrated draft), tp4, trtllm_mha.
+    // GSM8K 95.15%.
+    match: { hw: "gb300", variant: "default", quant: "int4", strategy: "low-latency", nodes: "single" },
+    verified: true,
+    sglang_version: "dev/custom build (2026-07-20)",
+    accuracy: { gsm8k_pct: 95.15, aime25_pct: null },
+  },
 ];

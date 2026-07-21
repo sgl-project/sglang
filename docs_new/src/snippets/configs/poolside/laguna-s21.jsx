@@ -22,40 +22,53 @@
 //   default), sglang applies top_k=0 at serving time and rejects any non-greedy sampling
 //   request with HTTP 400. --sampling-defaults openai uses OpenAI API defaults instead,
 //   ignoring the model-level top_k=0. Greedy (GSM8K) is unaffected; non-greedy
-//   (AIME25, chat sampling) requires this flag. Verified 2026-07-20 on 8×H200.
+//   (AIME25, chat sampling) requires this flag. Verified 2026-07-20 on 8×H200 and
+//   4×GB300.
 //
 // TP sizing (118B BF16 ≈ 236 GB; FP8 ≈ 118 GB; NVFP4/INT4 ≈ 59 GB):
 //   - H200 8-GPU (8×141 GB): --tp 8 for all quants (29.5 GB weights/GPU for BF16).
 //     Unlike Laguna-XS-2.1, the much larger moe_intermediate_size of this 118B model
-//     is expected to allow plain TP=8 for FP8 and INT4 without --ep-size (the XS-2.1
-//     constraint was 512/8=64 < block_size=128; that does not hold at the larger expert
-//     width in S-2.1). Confirmed on H200 for BF16, FP8, INT4 (2026-07-20).
+//     allows plain TP=8 for FP8 and INT4 without --ep-size. Confirmed on H200 (2026-07-20).
 //   - B300 8-GPU (8×288 GB): same --tp 8 reasoning.
 //   - GB300 4-GPU (4×288 GB): --tp 4 throughout (59 GB/GPU for BF16, ≥229 GB KV budget).
+//     Confirmed on GB300 (2026-07-20).
 //
 // BF16 memory on H200:
-//   BF16 (29.5 GB/GPU) consumes ~2× more weight memory than FP8 on H200, leaving less
-//   headroom for CUDA-graph capture and NCCL allocs. Default mem-fraction 0.893 → OOM
-//   at cuda-graph capture; 0.88 → NCCL crash at high concurrency. --mem-fraction-static
-//   0.80 is required for BF16 high-throughput on H200. Low-latency already carries 0.7.
-//   B300/GB300 (288 GB/GPU) are unaffected and use the default heuristic.
+//   BF16 (29.5 GB/GPU) leaves less headroom on H200 for CUDA-graph capture and NCCL
+//   allocs than FP8/INT4. Default mem-fraction 0.893 → OOM at cuda-graph capture; 0.88
+//   → NCCL crash at high concurrency. --mem-fraction-static 0.80 is required for BF16
+//   high-throughput on H200. Low-latency already carries 0.7.
+//   GB300 (288 GB/GPU) and B300 (288 GB/GPU) are unaffected — default heuristic suffices.
 //
-// SGLANG_SHARED_EXPERT_TP1=1 (FP8 cells only):
-//   Confirmed required: the FP8 checkpoint block-quantizes the shared expert (128×128
-//   scales, can't TP-shard cleanly). INT4 keeps the shared expert in BF16 (no flag
-//   needed). BF16 is unquantized. Verified 2026-07-20 on 8×H200.
+// SGLANG_SHARED_EXPERT_TP1=1 (FP8 cells, ALL hardware):
+//   Confirmed required on H200 (TP=8) and GB300 (TP=4): the FP8 checkpoint
+//   block-quantizes the shared expert (128×128 scales), which cannot TP-shard cleanly at
+//   either TP degree on S-2.1. INT4 keeps the shared expert in BF16 (no flag needed);
+//   BF16 is unquantized. Note: Laguna-XS-2.1 at TP=4 does NOT need this flag — the
+//   difference is architecture-specific (XS-2.1 shared expert shards cleanly at TP=4).
+//
+// NVFP4 on GB300 — BROKEN (2026-07-20):
+//   Both NVFP4 cells produce degenerate output (repetition loop, never emits EOS) on
+//   4×GB300 — verified identical behaviour with and without spec-decode. Perf numbers
+//   exist (mechanically valid) but quality is unusable. Root cause: likely a checkpoint
+//   or sglang sm103 kernel issue; needs poolside/sglang follow-up. NVFP4 cells on GB300
+//   remain verified:false until resolved. NVFP4 on B300 is unverified.
 //
 // NVFP4 is Blackwell-only → no h200×nvfp4 cells.
 //
 // DFlash memory: Low-Latency cells carry --mem-fraction-static 0.7.
 //
-// FP8 DFlash draft rope issue:
-//   poolside/Laguna-S-2.1-DFlash-FP8 (as of 2026-07-20) is missing rope_theta in
-//   rope_parameters. If the server crashes at draft model load, patch the draft config
-//   locally: add "rope_theta" to the rope_parameters block. INT4 draft is unaffected.
+// FP8 / NVFP4 DFlash draft rope issue:
+//   poolside/Laguna-S-2.1-DFlash-FP8 and poolside/Laguna-S-2.1-DFlash-NVFP4 (as of
+//   2026-07-20) are missing rope_theta in rope_parameters. If the server crashes at
+//   draft model load, patch the draft config locally by adding "rope_theta": 500000.0
+//   to the rope_parameters block. The BF16 and INT4 draft models are unaffected.
 //
-// verified:true = command ran and passed full GSM8K on that cell. H200 cells verified
-// 2026-07-20 (sglang 0.5.15.post1). B300/GB300 cells are unverified pending measurement.
+// verified:true = command ran and passed full GSM8K on that cell.
+//   H200 cells: verified 2026-07-20, sglang 0.5.15.post1.
+//   GB300 cells (BF16/FP8/INT4): verified 2026-07-20, sglang dev/custom build.
+//   B300 cells: unverified pending measurement.
+//   GB300 NVFP4 cells: verified:false — quality broken, see note above.
 //
 // Draft/target precision ALWAYS matches: each quantized target pairs with the DFlash
 // draft calibrated for it (poolside/Laguna-S-2.1-DFlash[-FP8/-NVFP4/-INT4]).
@@ -128,8 +141,7 @@ sgl-eval run gsm8k \\
       // Laguna's template gates on enable_thinking (not the generic 'thinking' key).
       // Serve with a copy of the model's chat template whose enable_thinking default
       // is flipped to true, passed via --chat-template.
-      // Note: BF16 reasons ~2× longer than FP8/INT4 (median 34.8k vs 16.9k tokens)
-      // and routinely truncates at 64k — use max_tokens ≥ 128k for a valid BF16 score.
+      // For BF16: use --max-tokens 131072 (see Configuration Tips: BF16 reasoning length).
       aime25_pct:
 `# pip install git+https://github.com/sgl-project/sgl-eval
 # Serve with an enable_thinking=true chat template (see Configuration Tips: Thinking).
@@ -189,21 +201,18 @@ sgl-eval run aime25 \\
 
   // Cells: (h200 × {bf16,fp8,int4} + b300/gb300 × {bf16,fp8,nvfp4,int4}) × {low-latency, high-throughput}.
   // NVFP4 is Blackwell-only: no h200×nvfp4 cells.
-  // H200 cells: verified:true (measured 2026-07-20, sglang 0.5.15.post1).
-  // B300/GB300 cells: verified:false — commands follow the H200 verified shape + TP scaling.
+  // H200 cells: verified (2026-07-20, sglang 0.5.15.post1).
+  // GB300 BF16/FP8/INT4 cells: verified (2026-07-20, sglang dev/custom build).
+  // GB300 NVFP4 cells: verified:false — output quality broken (see header).
+  // B300 cells: verified:false — pending measurement.
   cells: [
 
     // ══════════════ NVIDIA Hopper H200 (8-GPU HGX, --tp 8) — VERIFIED ══════════════
-    // Dense auto-selects fa3 on Hopper (no flag needed). LL pins fa3 (DFlash-safe on
-    // Hopper; with a spec algorithm active, auto would fall back to flashinfer).
-    // BF16 high-throughput requires --mem-fraction-static 0.80 on H200: default 0.893
-    // OOMs at cuda-graph capture; 0.88 crashes at high concurrency under NCCL alloc.
-    // BF16 low-latency already carries 0.7 (sufficient).
-    // FP8/INT4 use default mem-fraction (their smaller weight footprint leaves enough
-    // headroom).
+    // Dense auto-selects fa3 on Hopper (no flag needed). LL pins fa3.
+    // BF16 high-throughput requires --mem-fraction-static 0.80 on H200 (see header).
+    // BF16 low-latency already carries 0.7; FP8/INT4 use default.
     {
       // VERIFIED 8×H200 tp8 (2026-07-20): GSM8K 93.18%.
-      // --mem-fraction-static 0.80 required — default/0.88 OOMs (see header comment).
       match: { hw: "h200", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" },
       verified: true,
       env: [],
@@ -242,7 +251,7 @@ sgl-eval run aime25 \\
     },
     {
       // VERIFIED 8×H200 tp8 (2026-07-20): GSM8K 94.24%, AIME25 67.29%.
-      // SGLANG_SHARED_EXPERT_TP1=1 confirmed required (FP8 block-quantizes shared expert).
+      // SGLANG_SHARED_EXPERT_TP1=1 confirmed required (block-FP8 shared expert).
       match: { hw: "h200", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
       verified: true,
       env: ["SGLANG_SHARED_EXPERT_TP1=1"],
@@ -259,7 +268,7 @@ sgl-eval run aime25 \\
     },
     {
       // VERIFIED 8×H200 tp8 (2026-07-20): GSM8K 94.47%.
-      // Note: DFlash-FP8 draft may crash at load (rope_theta missing) — see header.
+      // DFlash-FP8 draft: see rope_theta note in header.
       match: { hw: "h200", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
       verified: true,
       env: ["SGLANG_SHARED_EXPERT_TP1=1"],
@@ -319,11 +328,9 @@ sgl-eval run aime25 \\
     },
 
     // ══════════════ NVIDIA Blackwell Ultra B300 (8-GPU HGX) — UNVERIFIED ══════════════
-    // Dense auto-selects trtllm_mha on Blackwell (no flag). LL MUST pin trtllm_mha —
-    // with DFlash active, auto falls back to flashinfer, which is broken for this
-    // hybrid-SWA model at tp≥4 (reproduced + bisected on GB300 with Laguna-XS-2.1).
-    // B300 has 288 GB/GPU: BF16 29.5 GB/GPU leaves ≥258 GB for KV — no mem-fraction
-    // adjustment needed for dense cells (unlike H200).
+    // Dense auto-selects trtllm_mha on Blackwell. LL MUST pin trtllm_mha (flashinfer
+    // breaks hybrid-SWA at tp≥4 with DFlash active — reproduced on Laguna-XS-2.1).
+    // B300 (288 GB/GPU): BF16 29.5 GB/GPU leaves ≥258 GB for KV — no mem-fraction needed.
     {
       match: { hw: "b300", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" },
       verified: false,
@@ -465,13 +472,19 @@ sgl-eval run aime25 \\
       ],
     },
 
-    // ══════════════ NVIDIA Grace-Blackwell GB300 (4-GPU single node, --tp 4) — UNVERIFIED ══════════════
-    // BF16 118B at tp 4 = 59 GB/GPU (out of 288 GB): ample KV budget, no mem-fraction
-    // adjustment needed for dense cells. Dense auto-selects trtllm_mha on Blackwell.
-    // LL pins trtllm_mha (same flashinfer concern as B300 above).
+    // ══════════════ NVIDIA Grace-Blackwell GB300 (4-GPU single node, --tp 4) ══════════════
+    // BF16/FP8/INT4 verified 2026-07-20 (sglang dev/custom build).
+    // NVFP4: verified:false — degenerate output (repetition loop, never terminates);
+    //   see header comment. Perf is mechanically valid but quality is broken.
+    // Dense auto-selects trtllm_mha on Blackwell. LL pins trtllm_mha.
+    // BF16 59 GB/GPU (out of 288 GB): ample KV budget, default mem-fraction suffices.
+    // FP8 cells require SGLANG_SHARED_EXPERT_TP1=1 — confirmed on GB300 at TP=4
+    //   (S-2.1's FP8 shared expert cannot shard 4-way; this differs from XS-2.1
+    //   where TP=4 works without the flag due to different expert widths).
     {
+      // VERIFIED 4×GB300 tp4 (2026-07-20): GSM8K 93.33%.
       match: { hw: "gb300", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" },
-      verified: false,
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -485,8 +498,9 @@ sgl-eval run aime25 \\
       ],
     },
     {
+      // VERIFIED 4×GB300 tp4 (2026-07-20): GSM8K 93.86%.
       match: { hw: "gb300", variant: "default", quant: "bf16", strategy: "low-latency", nodes: "single" },
-      verified: false,
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -505,9 +519,11 @@ sgl-eval run aime25 \\
       ],
     },
     {
+      // VERIFIED 4×GB300 tp4 (2026-07-20): GSM8K 94.77%.
+      // SGLANG_SHARED_EXPERT_TP1=1 confirmed required at TP=4 on S-2.1 (see header).
       match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
-      verified: false,
-      env: [],
+      verified: true,
+      env: ["SGLANG_SHARED_EXPERT_TP1=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--trust-remote-code",
@@ -520,9 +536,11 @@ sgl-eval run aime25 \\
       ],
     },
     {
+      // VERIFIED 4×GB300 tp4 (2026-07-20): GSM8K 94.54%.
+      // DFlash-FP8 draft: see rope_theta note in header.
       match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
-      verified: false,
-      env: [],
+      verified: true,
+      env: ["SGLANG_SHARED_EXPERT_TP1=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--trust-remote-code",
@@ -540,6 +558,8 @@ sgl-eval run aime25 \\
       ],
     },
     {
+      // verified:false — NVFP4 output quality broken on GB300 (degenerate loop).
+      // See header comment. Perf kernel runs but model quality is unusable.
       match: { hw: "gb300", variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "single" },
       verified: false,
       env: [],
@@ -555,6 +575,8 @@ sgl-eval run aime25 \\
       ],
     },
     {
+      // verified:false — NVFP4 output quality broken on GB300 (degenerate loop).
+      // DFlash-NVFP4 draft also has rope_theta issue (see header).
       match: { hw: "gb300", variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
       verified: false,
       env: [],
@@ -575,8 +597,10 @@ sgl-eval run aime25 \\
       ],
     },
     {
+      // VERIFIED 4×GB300 tp4 (2026-07-20): GSM8K 94.77%.
+      // INT4 shared expert stays bf16 — no SGLANG_SHARED_EXPERT_TP1 needed.
       match: { hw: "gb300", variant: "default", quant: "int4", strategy: "high-throughput", nodes: "single" },
-      verified: false,
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -590,8 +614,9 @@ sgl-eval run aime25 \\
       ],
     },
     {
+      // VERIFIED 4×GB300 tp4 (2026-07-20): GSM8K 95.15%.
       match: { hw: "gb300", variant: "default", quant: "int4", strategy: "low-latency", nodes: "single" },
-      verified: false,
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",

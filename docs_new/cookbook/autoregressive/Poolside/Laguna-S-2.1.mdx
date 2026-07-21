@@ -137,11 +137,15 @@ BF16 weights consume ~29.5 GB/GPU on H200 (about 2× FP8), leaving less headroom
 
 **FP8 shared expert**
 
-`SGLANG_SHARED_EXPERT_TP1=1` is required for FP8 cells: the FP8 checkpoint block-quantizes the shared expert (128×128 scales), which cannot TP-shard cleanly. This env var replicates the shared expert instead of sharding it. INT4 keeps the shared expert in BF16 (no flag needed); BF16 is unquantized.
+`SGLANG_SHARED_EXPERT_TP1=1` is required for FP8 cells on **all hardware** — confirmed on both H200 (TP=8) and GB300 (TP=4). The FP8 checkpoint block-quantizes the shared expert (128×128 scales), which cannot TP-shard cleanly at either TP degree on S-2.1. This env var replicates the shared expert instead of sharding it. INT4 keeps the shared expert in BF16 (no flag needed); BF16 is unquantized. Note: this differs from Laguna-XS-2.1 where TP=4 does not require the flag — the constraint is architecture-specific.
 
-**FP8 DFlash draft**
+**FP8 and NVFP4 DFlash drafts**
 
-The HF checkpoint `poolside/Laguna-S-2.1-DFlash-FP8` (as of 2026-07-20) is missing `rope_theta` in `rope_parameters`. If the server crashes at draft-model load, patch the draft config locally by adding `"rope_theta"` to that block. The BF16 and INT4 draft models are unaffected.
+The HF checkpoints `poolside/Laguna-S-2.1-DFlash-FP8` and `poolside/Laguna-S-2.1-DFlash-NVFP4` (as of 2026-07-20) are missing `rope_theta` in `rope_parameters`. If the server crashes at draft-model load with a `KeyError: 'rope_theta'`, patch the draft config locally: add `"rope_theta": 500000.0` to the `rope_parameters` block. The BF16 and INT4 draft models are unaffected.
+
+**NVFP4 on GB300**
+
+NVFP4 produces degenerate output on 4×GB300 (repetition loop, never emits EOS) — reproduced identically with and without DFlash spec-decode, ruling out a draft interaction. Root cause is likely the NVFP4 checkpoint or the sglang sm103 kernel path. The NVFP4 cells on GB300 remain unverified until this is resolved upstream. NVFP4 on B300 is unverified.
 
 **DFlash memory**
 
