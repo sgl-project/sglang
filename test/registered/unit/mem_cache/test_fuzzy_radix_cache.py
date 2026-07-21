@@ -101,10 +101,7 @@ class _StubReq:
         self.output_ids = list(output_ids or [])
         self.req_pool_idx = req_pool_idx
         self.last_node = None
-        self._committed_kv_len = committed_kv_len
-
-    def pop_committed_kv_cache(self) -> int:
-        return self._committed_kv_len
+        self.kv_committed_len = committed_kv_len
 
 
 class _ScriptedProvider(FuzzyMatchProvider):
@@ -444,7 +441,7 @@ class TestDonorLifecycle(CustomTestCase):
         realized = req.fuzzy_realized_locs
         self.assertIsNotNone(realized)
 
-        cache.cache_finished_req(req)
+        cache.cache_finished_req(req, kv_len_to_handle=req.kv_committed_len)
 
         self.assertEqual(donor.lock_ref, 0)
         self.assertIsNone(req.fuzzy_donor_node)
@@ -483,7 +480,7 @@ class TestDonorLifecycle(CustomTestCase):
 
         self.assertEqual(donor.lock_ref, 1)
 
-        cache.cache_finished_req(req)
+        cache.cache_finished_req(req, kv_len_to_handle=req.kv_committed_len)
 
         self.assertEqual(donor.lock_ref, 0)
         self.assertEqual(allocator.outstanding_slots, 0)
@@ -592,7 +589,7 @@ class TestDonorLifecycle(CustomTestCase):
             committed_kv_len=3,
         )
 
-        cache.cache_finished_req(req)
+        cache.cache_finished_req(req, kv_len_to_handle=req.kv_committed_len)
 
         self.assertEqual(captured["rid"], "donor-req")
         self.assertEqual(captured["token_ids"], [90, 91, 92])

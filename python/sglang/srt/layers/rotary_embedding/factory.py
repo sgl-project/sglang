@@ -244,7 +244,14 @@ def get_rope(
                 k: v
                 for k, v in rope_scaling.items()
                 if k
-                in ("extrapolation_factor", "attn_factor", "beta_fast", "beta_slow")
+                in (
+                    "extrapolation_factor",
+                    "attn_factor",
+                    "beta_fast",
+                    "beta_slow",
+                    "mscale",
+                    "mscale_all_dim",
+                )
             }
             extra_kwargs["truncate"] = rope_scaling.get("truncate", True)
             if "mrope_section" in rope_scaling:

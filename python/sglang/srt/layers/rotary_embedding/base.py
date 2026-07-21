@@ -98,7 +98,7 @@ class RotaryEmbedding(MultiPlatformOp):
 
         cache = self._compute_cos_sin_cache()
         # NOTE(ByronHsu): cache needs to be in FP32 for numerical stability.
-        if not (_is_cuda or envs.SGLANG_ROPE_CACHE_FP32.get()):
+        if not (_is_cuda or _is_xpu or envs.SGLANG_ROPE_CACHE_FP32.get()):
             cache = cache.to(dtype)
 
         if (
@@ -613,7 +613,7 @@ class ReverseRotaryEmbedding(MultiPlatformOp):
         cos = freqs.cos()
         sin = freqs.sin()
         cache = torch.cat((cos, sin), dim=-1)
-        if not _is_cuda:
+        if not (_is_cuda or _is_xpu or envs.SGLANG_ROPE_CACHE_FP32.get()):
             cache = cache.to(dtype)
         self.cos_sin_cache: torch.Tensor
         self.register_buffer("cos_sin_cache", cache, persistent=False)

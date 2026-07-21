@@ -125,9 +125,13 @@ class FuzzyRadixCache(RadixCache):
             total_len=total_len,
         )
 
-    def cache_finished_req(self, req: Req, is_insert: bool = True):
+    def cache_finished_req(
+        self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int
+    ):
         self._reclaim_realization_slots(req)
-        super().cache_finished_req(req, is_insert=is_insert)
+        super().cache_finished_req(
+            req, is_insert=is_insert, kv_len_to_handle=kv_len_to_handle
+        )
         self._release_donor(req)
 
     ##### Internal Helper Functions #####
