@@ -2014,6 +2014,7 @@ class LoadLoRAAdapterFromTensorsReqInput(BaseReq, kw_only=True):
     load_format: Optional[str] = None
     # If already loaded, refresh weights in place instead of failing.
     upsert: bool = False
+    expected_checksums: Optional[Dict[str, str]] = None
 
     def to_ref(self) -> LoRARef:
         return LoRARef(
