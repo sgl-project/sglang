@@ -48,6 +48,7 @@ from sglang.srt.disaggregation.utils import (
     prepare_abort,
     setup_state_kv_args,
 )
+from sglang.srt.distributed.parallel_state import get_dcp_rank, get_dcp_world_size
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
@@ -173,6 +174,8 @@ class PrefillBootstrapQueue:
             if layer_shard_enabled
             else self.token_to_kv_pool.start_layer
         )
+        kv_args.dcp_size = get_dcp_world_size()
+        kv_args.dcp_rank = get_dcp_rank()
         kv_args.mla_compression_ratios = None
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             self.token_to_kv_pool.get_contiguous_buf_infos()
@@ -202,6 +205,7 @@ class PrefillBootstrapQueue:
                 self.scheduler.model_config.get_total_num_kv_heads()
             )
         kv_args.page_size = self.token_to_kv_pool.page_size
+        kv_args.swa_page_size = getattr(self.token_to_kv_pool, "swa_page_size", None)
 
         kv_args.aux_data_ptrs, kv_args.aux_data_lens, kv_args.aux_item_lens = (
             self.metadata_buffers.get_buf_infos()
@@ -301,7 +305,15 @@ class PrefillBootstrapQueue:
         num_pages = kv_to_page_num(
             num_kv_indices_to_send, self.token_to_kv_pool.page_size
         )
-        req.disagg_kv_sender.init(num_pages, req.metadata_buffer_index)
+        kv_mgr = self.kv_manager
+        uses_token_level_transfer = (
+            (getattr(kv_mgr, "dcp_size", 1) or 1) > 1
+            or self._uses_dsv4_token_level_transfer(req)
+        )
+        transfer_index_count = (
+            num_kv_indices_to_send if uses_token_level_transfer else num_pages
+        )
+        req.disagg_kv_sender.init(transfer_index_count, req.metadata_buffer_index)
         req.pending_bootstrap = False
         return True
 
@@ -329,6 +341,27 @@ class PrefillBootstrapQueue:
         Set max_new_tokens = 1, so PrefillAdder memory estimation is accurate
         """
         req.sampling_params.max_new_tokens = 1
+
+    def _uses_dsv4_token_level_transfer(self, req: Req) -> bool:
+        if not isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool):
+            return False
+
+        dcp_size_local = getattr(self.kv_manager, "dcp_size", 1) or 1
+        if dcp_size_local > 1 or envs.SGLANG_DSV4_ENABLE_DCP.get():
+            return True
+
+        transfer_infos = getattr(self.kv_manager, "transfer_infos", {}).get(
+            req.bootstrap_room, {}
+        )
+        decode_kv_args_table = getattr(self.kv_manager, "decode_kv_args_table", {})
+        for session_id in transfer_infos.keys():
+            target_info = decode_kv_args_table.get(session_id)
+            if (
+                target_info is not None
+                and (getattr(target_info, "dst_dcp_size", 1) or 1) > 1
+            ):
+                return True
+        return False
 
     def pop_bootstrapped(
         self,
@@ -1058,6 +1091,7 @@ class SchedulerDisaggregationPrefillMixin:
         Send a prefilled chunk to the decode server
         """
         page_size = self.token_to_kv_pool_allocator.page_size
+        token_to_kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
         start_idx = req.start_send_idx
         transfer_input_len = len(req.origin_input_ids)
         end_idx = (
@@ -1079,6 +1113,29 @@ class SchedulerDisaggregationPrefillMixin:
             )
             return
 
+        # DCP: req_to_token stores cluster-wide global token loc; the
+        # transfer layer addresses GPU buffers using per-rank physical
+        # offsets. Convert here before the kv_indices flow into both
+        # ``kv_to_page_indices`` below and the SWA/NSA state payloads.
+        # When dcp_size == 1 this is a no-op.
+        kv_mgr = self.disagg_prefill_bootstrap_queue.kv_manager
+        dcp_size_local = getattr(kv_mgr, "dcp_size", 1) or 1
+        dcp_rank_local = getattr(kv_mgr, "dcp_rank", 0) or 0
+        target_dcp_size = dcp_size_local
+        if isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool):
+            transfer_infos = getattr(kv_mgr, "transfer_infos", {}).get(
+                req.bootstrap_room, {}
+            )
+            decode_kv_args_table = getattr(kv_mgr, "decode_kv_args_table", {})
+            for session_id in transfer_infos.keys():
+                target_info = decode_kv_args_table.get(session_id)
+                if target_info is not None:
+                    target_dcp_size = max(
+                        target_dcp_size, getattr(target_info, "dst_dcp_size", 1) or 1
+                    )
+        dsv4_dcp_transfer = isinstance(
+            token_to_kv_pool, DeepSeekV4TokenToKVPool
+        ) and (target_dcp_size > 1 or envs.SGLANG_DSV4_ENABLE_DCP.get())
         state_indices: Optional[List] = None
         if last_chunk:
             self.disagg_metadata_buffers.set_buf(req)
@@ -1111,7 +1168,18 @@ class SchedulerDisaggregationPrefillMixin:
                         window_kv_indices_full
                     )
                 )
-                return kv_to_page_indices(window_kv_indices_swa, page_size)
+                window_kv_indices_swa_np = window_kv_indices_swa.cpu().numpy()
+                if dsv4_dcp_transfer:
+                    # DSV4 state_data is heterogeneous. Carry the full-token
+                    # locs and sequence offset so Mooncake can derive the
+                    # matching compressed-slot/state rows.
+                    return [
+                        window_kv_indices_swa_np,
+                        kv_to_page_indices(window_kv_indices_swa_np, page_size),
+                        window_kv_indices_full.cpu().numpy(),
+                        np.array([window_start], dtype=np.int32),
+                    ]
+                return kv_to_page_indices(window_kv_indices_swa_np, page_size)
 
             def _dsa_payload():
                 kv_indices_full = self.req_to_token_pool.req_to_token[
@@ -1174,9 +1242,24 @@ class SchedulerDisaggregationPrefillMixin:
             req.req_pool_idx, start_idx:end_idx
         ]
         page_indices = kv_to_page_indices(kv_indices, page_size)
+        if dcp_size_local > 1 or dsv4_dcp_transfer:
+            # DCP rerouting: page granularity does not divide cleanly under
+            # DCP (logical pages from the cluster-wide loc space scatter
+            # into partial local pages on each rank). Send the rank-local
+            # token-loc array unchanged and let the transfer backend issue
+            # token-level RDMA. The arg name stays ``page_indices`` to
+            # keep the MooncakeKVSender / NixlKVSender contract stable.
+            # DSV4 keeps the global token-loc array here because c4/c128
+            # buckets must derive their own compressed slot locs in the
+            # backend before applying DCP sharding.
+            page_indices = kv_indices
         if not req.disagg_kv_sender.should_send_kv_chunk(len(page_indices), last_chunk):
             return
-        req.disagg_kv_sender.send(page_indices, state_indices)
+        req.disagg_kv_sender.send(
+            page_indices,
+            state_indices,
+            token_position_offset=start_idx if dsv4_dcp_transfer else 0,
+        )
         req.start_send_idx = end_idx
 
     def optimistic_release_and_requeue(self: Scheduler, req: Req) -> None:

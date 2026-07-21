@@ -260,8 +260,11 @@ def run_eval(args):
     elif args.eval_name == "gpqa":
         from sglang.test.simple_eval_gpqa import GPQAEval
 
-        filename = (
-            "https://openaipublic.blob.core.windows.net/simple-evals/gpqa_diamond.csv"
+        filename = os.getenv(
+            "SGLANG_GPQA_CSV_PATH",
+            "/tmp/gpqa_diamond.csv"
+            if os.path.exists("/tmp/gpqa_diamond.csv")
+            else "https://openaipublic.blob.core.windows.net/simple-evals/gpqa_diamond.csv",
         )
         eval_obj = GPQAEval(filename, args.num_examples, args.num_threads)
     elif args.eval_name == "humaneval":

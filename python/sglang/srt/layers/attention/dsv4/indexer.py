@@ -9,6 +9,8 @@ import torch.nn.functional as F
 from sglang.jit_kernel.dsv4 import (
     fused_q_indexer_rope_hadamard_fp4_quant,
     fused_q_indexer_rope_hadamard_quant,
+    merge_dcp_topk_candidates_512,
+    topk_candidates_512,
     topk_transform_512,
     topk_transform_512_v2,
 )
@@ -42,9 +44,8 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
-
 FP8_DTYPE = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
-
+FP8_MAX = torch.finfo(FP8_DTYPE).max
 
 IndexerQuery: TypeAlias = Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
 
@@ -558,6 +559,217 @@ class C4IndexerBackendMixin:
             max_seqlen_k=plan.max_seqlen_k,
         )
 
+    def _try_forward_dcp_sharded_c4_indexer(
+        self,
+        *,
+        q: torch.Tensor,
+        q_indexer: torch.Tensor,
+        weights: torch.Tensor,
+        logits_fn: Any,
+        use_tilelang: bool,
+        use_aiter: bool,
+        c4_indexer: C4Indexer,
+        forward_batch: ForwardBatch,
+        token_to_kv_pool: DeepSeekV4TokenToKVPool,
+        indexer_metadata: PagedIndexerMetadata,
+        page_table: torch.Tensor,
+        c4_seq_lens: torch.Tensor,
+        local_page_table: Optional[torch.Tensor],
+        local_c4_seq_lens: Optional[torch.Tensor],
+        c4_sparse_page_indices: torch.Tensor,
+        raw_indices: Optional[torch.Tensor],
+    ) -> bool:
+        """Score interleaved logical C4-page shards and merge local top-k.
+
+        The P0 path keeps the indexer cache replicated, but each DCP rank sends
+        only logical pages ``rank, rank + world_size, ...`` to the existing
+        paged-MQA logits kernel. A C4 page contains 64 compressed items (256 raw
+        tokens), so shard boundaries preserve the compressor's 8-token window.
+        """
+
+        if not envs.SGLANG_DSV4_DCP_SHARD_C4_INDEXER.get():
+            return False
+        if c4_indexer.use_fp4_indexer:
+            return False
+        if is_hip():
+            return False
+        if self.hisparse_coordinator is not None:
+            return False
+        if not forward_batch.forward_mode.is_decode():
+            return False
+        if self.debug_use_external_c4_sparse_indices:
+            return False
+        if not isinstance(q_indexer, torch.Tensor):
+            return False
+        if q_indexer.dim() != 3 or q_indexer.shape[-1] != c4_indexer.head_dim:
+            return False
+        if local_page_table is None or local_c4_seq_lens is None:
+            return False
+
+        from sglang.srt.distributed.parallel_state import get_dcp_group_no_assert
+
+        dcp_group = get_dcp_group_no_assert()
+        if dcp_group is None or dcp_group.world_size <= 1:
+            return False
+        if (
+            indexer_metadata.dcp_world_size != dcp_group.world_size
+            or indexer_metadata.dcp_rank != dcp_group.rank_in_group
+        ):
+            return False
+
+        batch_size = q_indexer.shape[0]
+        if batch_size == 0:
+            c4_sparse_page_indices.fill_(-1)
+            if raw_indices is not None:
+                raw_indices.fill_(-1)
+            return True
+
+        c4_page_size = indexer_metadata.c4_page_size
+        topk = c4_sparse_page_indices.shape[1]
+        if topk == 0:
+            return True
+
+        device = q_indexer.device
+        world_size = dcp_group.world_size
+        rank = dcp_group.rank_in_group
+        max_global_seq_len = indexer_metadata.max_c4_seq_len
+        max_global_pages = (max_global_seq_len + c4_page_size - 1) // c4_page_size
+        max_local_pages = max(
+            0, (max_global_pages + world_size - 1 - rank) // world_size
+        )
+        local_page_table = local_page_table[:, :max_local_pages]
+        local_seq_lens = local_c4_seq_lens.view(-1).to(torch.int32).contiguous()
+
+        if local_page_table.shape[1] == 0:
+            # A short request can leave a high DCP rank with no logical page.
+            # Keep all ranks in the candidate collectives without invoking the
+            # paged-MQA kernel on an empty page table.
+            local_page_table = page_table[:, :1].contiguous()
+            local_logits = torch.full(
+                (batch_size, c4_page_size),
+                float("-inf"),
+                dtype=torch.float32,
+                device=device,
+            )
+        else:
+            c4_indexer_kv_cache = token_to_kv_pool.get_index_k_with_scale_buffer(
+                layer_id=c4_indexer.layer_id,
+            )
+            assert c4_indexer_kv_cache.dim() == 2
+            c4_indexer_kv_cache = c4_indexer_kv_cache.view(
+                c4_indexer_kv_cache.shape[0],
+                c4_page_size,
+                1,
+                c4_indexer.head_dim + 4,
+            )
+            local_seq_lens_for_kernel = local_seq_lens
+            if not use_tilelang and not use_aiter:
+                local_seq_lens_for_kernel = local_seq_lens_for_kernel.unsqueeze(-1)
+            local_logits = logits_fn(
+                q,
+                c4_indexer_kv_cache,
+                weights,
+                local_seq_lens_for_kernel,
+                local_page_table,
+                indexer_metadata.dcp_deep_gemm_metadata,
+                local_page_table.shape[1] * c4_page_size,
+                False,
+            )
+
+        if envs.SGLANG_DSV4_DCP_C4_PACKED_TOPK.get():
+            local_candidates = indexer_metadata.dcp_local_topk_candidates
+            gathered_candidates = indexer_metadata.dcp_gathered_topk_candidates
+            assert local_candidates is not None
+            assert gathered_candidates is not None
+            local_candidates = local_candidates[:batch_size]
+            gathered_candidates = gathered_candidates[: world_size * batch_size]
+            topk_candidates_512(
+                local_logits,
+                local_seq_lens,
+                local_candidates,
+                c4_page_size,
+                world_size,
+                rank,
+            )
+            dcp_group.all_gather_into_tensor(
+                gathered_candidates, local_candidates
+            )
+            merge_dcp_topk_candidates_512(
+                gathered_candidates,
+                c4_seq_lens.view(-1).to(torch.int32).contiguous(),
+                page_table,
+                c4_sparse_page_indices,
+                c4_page_size,
+                world_size,
+                raw_indices,
+            )
+            return True
+
+        local_raw = (
+            raw_indices
+            if raw_indices is not None
+            else torch.empty_like(c4_sparse_page_indices)
+        )
+        topk_transform_512(
+            local_logits,
+            local_seq_lens,
+            local_page_table,
+            c4_sparse_page_indices,
+            c4_page_size,
+            local_raw,
+        )
+
+        local_raw_i64 = local_raw.to(torch.int64)
+        local_scores = torch.gather(
+            local_logits, 1, local_raw_i64.clamp(min=0)
+        ).masked_fill(local_raw < 0, float("-inf"))
+
+        page_bits = (c4_page_size - 1).bit_length()
+        page_mask = c4_page_size - 1
+        global_raw = (
+            ((local_raw_i64 >> page_bits) * world_size + rank) << page_bits
+        ) | (local_raw_i64 & page_mask)
+        global_raw = global_raw.to(torch.int32).masked_fill(local_raw < 0, -1)
+
+        gathered_scores = dcp_group.all_gather(local_scores.contiguous(), dim=1)
+        gathered_raw = dcp_group.all_gather(global_raw.contiguous(), dim=1)
+        merged_scores, merged_pos = torch.topk(
+            gathered_scores, k=topk, dim=1, largest=True, sorted=False
+        )
+        merged_raw = torch.gather(gathered_raw, 1, merged_pos)
+        valid_merged = (merged_scores != float("-inf")) & (merged_raw >= 0)
+        merged_raw = merged_raw.masked_fill(~valid_merged, -1)
+
+        final_raw = merged_raw.to(torch.int32)
+        # Match topk_transform_512 semantics: when the compressed history is
+        # no longer than TOPK, return the complete raw range in order.
+        seq_lens = c4_seq_lens.view(-1).to(device=device, dtype=torch.int64)
+        needs_sequential = seq_lens <= topk
+        arange_key = f"dcp_c4_topk_{topk}_{device}"
+        if arange_key not in _arange_cache:
+            _arange_cache[arange_key] = torch.arange(
+                topk, device=device, dtype=torch.int32
+            )
+        topk_positions = _arange_cache[arange_key]
+        topk_positions = topk_positions.unsqueeze(0).expand(batch_size, -1)
+        sequential_valid = topk_positions.to(torch.int64) < seq_lens.unsqueeze(1)
+        sequential_raw = topk_positions.masked_fill(~sequential_valid, -1)
+        final_raw = torch.where(
+            needs_sequential.unsqueeze(1), sequential_raw, final_raw
+        )
+        if raw_indices is not None:
+            raw_indices.copy_(final_raw)
+
+        raw_for_gather = final_raw.clamp(min=0).to(torch.int64)
+        page_ids = raw_for_gather >> page_bits
+        page_offsets = raw_for_gather & page_mask
+        page_ids = torch.clamp(page_ids, max=page_table.shape[1] - 1)
+        final_pages = torch.gather(page_table, 1, page_ids)
+        final_slots = (final_pages << page_bits) | page_offsets.to(torch.int32)
+        final_slots = final_slots.masked_fill(final_raw < 0, -1)
+        c4_sparse_page_indices.copy_(final_slots)
+        return True
+
     def forward_c4_indexer(
         self,
         x: torch.Tensor,
@@ -667,12 +879,70 @@ class C4IndexerBackendMixin:
         c4_sparse_page_indices = match_num_queries(
             core_metadata.c4_sparse_page_indices, value=-1
         )
+
+        indexer_capturer = get_global_indexer_capturer()
+        capture_enabled = indexer_capturer is not None
+
+        hisparse_coordinator = self.hisparse_coordinator
+        hisparse_decode = (
+            hisparse_coordinator is not None and forward_batch.forward_mode.is_decode()
+        )
+
+        raw_indices = None
+        if capture_enabled:
+            raw_indices = torch.empty_like(c4_sparse_page_indices)
+        elif hisparse_decode:
+            raw_indices = hisparse_coordinator.raw_indices_buffer[
+                : c4_sparse_page_indices.size(0)
+            ]
+        elif core_metadata.c4_sparse_raw_indices is not None:
+            raw_indices = match_num_queries(
+                core_metadata.c4_sparse_raw_indices, value=-1
+            )
+
         _use_tilelang = (
             envs.SGLANG_OPT_USE_TILELANG_INDEXER.get() and not use_fp4_indexer
         )
         _use_aiter = envs.SGLANG_OPT_USE_AITER_INDEXER.get() and not use_fp4_indexer
         if _c4sl.dim() == 1 and not _use_tilelang and not _use_aiter:
             _c4sl = _c4sl.unsqueeze(-1)
+
+        local_page_table = indexer_metadata.dcp_local_page_table
+        if local_page_table is not None:
+            local_page_table = match_num_queries(local_page_table, value=0)
+        local_c4_seq_lens = indexer_metadata.dcp_local_c4_seq_lens
+        if local_c4_seq_lens is not None:
+            local_c4_seq_lens = match_num_queries(
+                local_c4_seq_lens,
+                value=1 if indexer_metadata.dcp_rank == 0 else 0,
+            )
+
+        if self._try_forward_dcp_sharded_c4_indexer(
+            q=q,
+            q_indexer=q_indexer,
+            weights=weights,
+            logits_fn=fn,
+            use_tilelang=_use_tilelang,
+            use_aiter=_use_aiter,
+            c4_indexer=c4_indexer,
+            forward_batch=forward_batch,
+            token_to_kv_pool=token_to_kv_pool,
+            indexer_metadata=indexer_metadata,
+            page_table=page_table,
+            c4_seq_lens=c4_seq_lens,
+            local_page_table=local_page_table,
+            local_c4_seq_lens=local_c4_seq_lens,
+            c4_sparse_page_indices=c4_sparse_page_indices,
+            raw_indices=raw_indices,
+        ):
+            assert indexer_metadata.page_table is core_metadata.page_table
+            if capture_enabled:
+                compress_layer_id = token_to_kv_pool.layer_mapping[
+                    c4_indexer.layer_id
+                ].compress_layer_id
+                indexer_capturer.capture(compress_layer_id, raw_indices)
+            return
+
         nonpaged_plan = self._get_nonpaged_indexer_plan(
             c4_indexer=c4_indexer,
             forward_batch=forward_batch,
@@ -713,24 +983,6 @@ class C4IndexerBackendMixin:
         assert indexer_metadata.page_table is core_metadata.page_table
         if self.debug_use_external_c4_sparse_indices:
             return
-
-        indexer_capturer = get_global_indexer_capturer()
-        capture_enabled = indexer_capturer is not None
-
-        hisparse_coordinator = self.hisparse_coordinator
-        hisparse_decode = (
-            hisparse_coordinator is not None and forward_batch.forward_mode.is_decode()
-        )
-
-        raw_indices = None
-        if capture_enabled:
-            raw_indices = torch.empty_like(c4_sparse_page_indices)
-        elif hisparse_decode:
-            raw_indices = hisparse_coordinator.raw_indices_buffer[
-                : c4_sparse_page_indices.size(0)
-            ]
-        elif core_metadata.c4_sparse_raw_indices is not None:
-            raw_indices = core_metadata.c4_sparse_raw_indices
 
         if envs.SGLANG_TOPK_TRANSFORM_512_TORCH.get():
             topk_transform_512_pytorch_vectorized(

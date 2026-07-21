@@ -50,6 +50,7 @@ from sglang.srt.disaggregation.utils import (
     ReqToMetadataIdxAllocator,
     TransferBackend,
     _is_fake_transfer,
+    filter_kv_indices_for_dcp_rank,
     get_dsv4_c128_state_indices,
     get_kv_class,
     is_dsv4_c128_online_enabled,
@@ -59,6 +60,7 @@ from sglang.srt.disaggregation.utils import (
     prepare_abort,
     setup_state_kv_args,
 )
+from sglang.srt.distributed.parallel_state import get_dcp_rank, get_dcp_world_size
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
@@ -413,6 +415,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         kv_args.pp_rank = self.pp_rank
         kv_args.system_dp_rank = self.scheduler.ps.dp_rank
+        kv_args.dcp_size = get_dcp_world_size()
+        kv_args.dcp_rank = get_dcp_rank()
         transfer_kv_pool = (
             self.scheduler.hisparse_coordinator.mem_pool_host
             if self.scheduler.enable_hisparse
@@ -454,6 +458,18 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if self.transfer_backend == TransferBackend.NIXL:
             kv_args.kv_data_mem_kinds = kv_data_mem_kinds
         kv_args.page_size = self.token_to_kv_pool.page_size
+        kv_args.swa_page_size = getattr(self.token_to_kv_pool, "swa_page_size", None)
+        kv_args.prefill_start_layer = getattr(self.token_to_kv_pool, "start_layer", 0)
+        kv_args.prefill_end_layer = getattr(
+            self.token_to_kv_pool,
+            "end_layer",
+            self.scheduler.model_config.num_hidden_layers,
+        )
+        kv_args.mla_compression_ratios = None
+        if isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool):
+            kv_args.mla_compression_ratios = list(
+                self.token_to_kv_pool.compression_ratios
+            )
 
         kv_args.aux_data_ptrs, kv_args.aux_data_lens, kv_args.aux_item_lens = (
             self.metadata_buffers.get_buf_infos()
@@ -1084,6 +1100,25 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     decode_req.req.req_pool_idx
                 ][total_prefix_len:origin_input_len]
 
+            # DCP: ``req_to_token`` (and the hisparse host pool too, when
+            # used as the RDMA destination) stores cluster-wide global
+            # token loc. The transfer layer addresses GPU buffers using
+            # per-rank physical offsets, so convert before
+            # ``kv_to_page_indices``. No-op when dcp_size == 1.
+            dcp_size_local = getattr(self.kv_manager, "dcp_size", 1) or 1
+            dcp_rank_local = getattr(self.kv_manager, "dcp_rank", 0) or 0
+            token_to_kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
+            dsv4_dcp_transfer = (
+                isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
+                or isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
+            ) and (
+                dcp_size_local > 1 or envs.SGLANG_DSV4_ENABLE_DCP.get()
+            )
+            if dcp_size_local > 1 and not dsv4_dcp_transfer:
+                kv_indices = filter_kv_indices_for_dcp_rank(
+                    kv_indices, dcp_size_local, dcp_rank_local
+                )
+
             seq_len = origin_input_len
 
             def _mamba_payload():
@@ -1107,7 +1142,20 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         window_kv_indices_full
                     )
                 )
-                return kv_to_page_indices(window_kv_indices_swa, page_size)
+                window_kv_indices_swa_np = window_kv_indices_swa.cpu().numpy()
+                if dsv4_dcp_transfer:
+                    # DSV4 state_data is heterogeneous. Carry the full-token
+                    # locs and sequence offset so Mooncake can derive the
+                    # matching compressed-slot/state rows.
+                    return [
+                        window_kv_indices_swa_np,
+                        kv_to_page_indices(window_kv_indices_swa_np, page_size),
+                        window_kv_indices_full.cpu().numpy(),
+                        np.array([window_start], dtype=np.int32),
+                    ]
+                return kv_to_page_indices(
+                    window_kv_indices_swa_np, page_size
+                )
 
             def _dsa_payload():
                 kv_indices_full = self.req_to_token_pool.req_to_token[
@@ -1163,19 +1211,45 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     state_indices.append(_c128_state_payload())
                 else:
                     state_indices.append(None)
+            metadata_state_indices = state_indices
+            if dsv4_dcp_transfer and state_indices and isinstance(
+                state_indices[0], (list, tuple)
+            ):
+                # DSV4 transfer carries an expanded SWA payload:
+                # [swa_locs, swa_pages, full_locs, position_offset].
+                # It describes all heterogeneous DSV4 state buffers, including
+                # c128 chunk positions. Online c128 state is request-scoped,
+                # so append its component row separately for the transfer
+                # backend.
+                metadata_state_indices = list(state_indices[0])
+                if StateType.SWA_RING in state_types:
+                    swa_ring_state_idx = state_types.index(StateType.SWA_RING)
+                    metadata_state_indices.append(state_indices[swa_ring_state_idx])
+                if StateType.C128_STATE in state_types:
+                    c128_state_idx = state_types.index(StateType.C128_STATE)
+                    metadata_state_indices.append(state_indices[c128_state_idx])
 
             decode_req.metadata_buffer_index = (
                 self.req_to_metadata_buffer_idx_allocator.alloc()
             )
             assert decode_req.metadata_buffer_index is not None
+            page_indices = kv_to_page_indices(kv_indices, kv_transfer_page_size)
+            if dsv4_dcp_transfer:
+                # DSV4+DCP transfer derives c4/c128 compressed slots from the
+                # original token locs on both prefill and decode. Page indices
+                # would collapse several prompt tokens into one entry and break
+                # the positional pairing in the transfer backend.
+                page_indices = (
+                    kv_indices.cpu().numpy()
+                    if isinstance(kv_indices, torch.Tensor)
+                    else kv_indices
+                )
             # int32 for ZMQ serialization -- from_zmq reads np.int32.
-            page_indices = kv_to_page_indices(kv_indices, kv_transfer_page_size).astype(
-                np.int32
-            )
+            page_indices = np.asarray(page_indices, dtype=np.int32)
             decode_req.kv_receiver.send_metadata(
                 page_indices,
                 decode_req.metadata_buffer_index,
-                state_indices,
+                metadata_state_indices,
                 decode_prefix_len=total_prefix_len,
             )
             if decode_req.is_rebootstrap:

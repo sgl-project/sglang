@@ -498,6 +498,153 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
             )
         )
 
+    def test_in_graph_init_registers_only_captured_full_metadata(self):
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            DeepseekV4AttnBackend,
+            DSV4Metadata,
+            _GraphBucket,
+        )
+
+        backend = object.__new__(DeepseekV4AttnBackend)
+        full_metadata = DSV4Metadata(self._make_core_metadata(0), indexer_metadata=None)
+        bucket = _GraphBucket.TARGET_VERIFY
+        backend.forward_metadata = full_metadata
+        backend._current_capture_bucket_bs = (bucket, 4)
+        backend._cuda_graph_captured_full_metadata = {
+            graph_bucket: {} for graph_bucket in _GraphBucket
+        }
+        forward_batch = SimpleNamespace(out_cache_loc=None)
+
+        with mock.patch.object(
+            torch.cuda, "is_current_stream_capturing", return_value=True
+        ):
+            backend.init_forward_metadata_in_graph(forward_batch)
+        self.assertIs(
+            backend._cuda_graph_captured_full_metadata[bucket][4], full_metadata
+        )
+
+        captured_metadata = object()
+        backend._cuda_graph_captured_full_metadata[bucket][4] = captured_metadata
+        with mock.patch.object(
+            torch.cuda, "is_current_stream_capturing", return_value=False
+        ):
+            backend.init_forward_metadata_in_graph(forward_batch)
+        self.assertIs(
+            backend._cuda_graph_captured_full_metadata[bucket][4], captured_metadata
+        )
+
+    def test_multistep_graph_metadata_uses_per_step_out_cache_loc(self):
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            DeepseekV4MultiStepBackend,
+        )
+
+        class RecordingBackend:
+            def __init__(self):
+                self.out_cache_locs = []
+
+            def init_forward_metadata_out_graph(self, forward_batch):
+                self.out_cache_locs.append(forward_batch.out_cache_loc.clone())
+
+        backend = object.__new__(DeepseekV4MultiStepBackend)
+        backend.topk = 1
+        backend.speculative_num_steps = 3
+        backend.attn_backends = [RecordingBackend() for _ in range(3)]
+        forward_batch = SimpleNamespace(
+            batch_size=4,
+            forward_mode=ForwardMode.DECODE,
+            req_pool_indices=torch.arange(4),
+            seq_lens=torch.ones(4, dtype=torch.int32),
+            seq_lens_sum=4,
+            seq_lens_cpu=torch.ones(4, dtype=torch.int32),
+            out_cache_loc=torch.arange(12),
+            spec_info=None,
+        )
+
+        backend.init_forward_metadata_out_graph(forward_batch)
+
+        self.assertEqual(
+            backend.attn_backends[0].out_cache_locs[0].tolist(), [0, 3, 6, 9]
+        )
+        self.assertEqual(
+            backend.attn_backends[1].out_cache_locs[0].tolist(), [1, 4, 7, 10]
+        )
+        self.assertEqual(backend.attn_backends[2].out_cache_locs, [])
+
+    def test_swa_slot_zero_uses_raw_loc_for_write_mask(self):
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+            DeepSeekV4TokenToKVPool,
+        )
+
+        calls = []
+        pool = object.__new__(DeepSeekV4TokenToKVPool)
+        pool._stage_start = 0
+        pool._dcp_write_context = lambda: (2, 0, True)
+        pool.swa_kv_pool = SimpleNamespace(
+            set_key_buffer=lambda *args, **kwargs: calls.append((args, kwargs))
+        )
+        swa_loc = torch.tensor([0, 5], dtype=torch.int32)
+        raw_loc = torch.tensor([7, 0], dtype=torch.int64)
+
+        pool.set_swa_key_buffer_radix(
+            layer_id=0,
+            swa_loc=swa_loc,
+            cache_nope_fp8_rope_bf16_pack=object(),
+            dcp_kv_mask=torch.ones(2, dtype=torch.bool),
+            raw_loc=raw_loc,
+        )
+
+        self.assertEqual(len(calls), 1)
+        self.assertIs(calls[0][0][1], swa_loc)
+        self.assertEqual(calls[0][1]["write_mask"].tolist(), [True, False])
+
+    def test_compressed_move_uses_logical_sequence_boundaries(self):
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+            DeepSeekV4TokenToKVPool,
+        )
+
+        tgt, src = DeepSeekV4TokenToKVPool._compressed_move_locs_from_boundary_mask(
+            tgt_loc=torch.tensor([10, 11, 12, 13]),
+            src_loc=torch.tensor([100, 101, 102, 103]),
+            accepted_seq_lens=torch.tensor([3, 4, 5, 8]),
+            compress_ratio=4,
+        )
+
+        self.assertEqual(tgt.tolist(), [2, 3])
+        self.assertEqual(src.tolist(), [25, 25])
+
+    def test_dcp_local_kv_mask_padding_marks_fake_rows_empty(self):
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            _expand_dcp_local_kv_mask,
+        )
+
+        mask = _expand_dcp_local_kv_mask(torch.tensor([True]), target_len=4)
+
+        self.assertEqual(mask.tolist(), [True, False, False, False])
+
+    def test_online_c128_cleanup_clears_all_mtp_rows(self):
+        from sglang.srt.mem_cache import deepseek_v4_memory_pool as pool_module
+
+        state = torch.ones((12, 6), dtype=torch.float32)
+        pool = object.__new__(pool_module.DeepSeekV4TokenToKVPool)
+        pool.compress_state_pools = [
+            SimpleNamespace(
+                ratio=128,
+                online_mtp_max_draft_tokens=2,
+                online_mtp_state_slot_offset=4,
+                kv_score_buffer=SimpleNamespace(kv_score=state),
+            )
+        ]
+        pool.online_c128_mtp_pending_seq_lens = torch.zeros(4, dtype=torch.int64)
+
+        with mock.patch.object(pool_module, "ONLINE_C128", True):
+            pool.clear_c128_req_state(1)
+
+        for row in (1, 5, 9):
+            self.assertTrue(torch.isneginf(state[row, :2]).all())
+            self.assertEqual(state[row, 2:].tolist(), [0.0, 0.0, 0.0, 0.0])
+        self.assertEqual(state[0].tolist(), [1.0] * 6)
+        self.assertEqual(pool.online_c128_mtp_pending_seq_lens.tolist(), [0, -1, 0, 0])
+
     def test_sparse_prefill_workspace_reuses_and_grows(self):
         from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
             SparsePrefillWorkspace,

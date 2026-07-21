@@ -995,6 +995,28 @@ class Envs:
     # Set False when using FP4-to-FP8 converted DeepSeek V4 checkpoint.
     SGLANG_DSV4_FP4_EXPERTS = EnvBool(True)
     SGLANG_DSV4_FP4_DEQUANT = EnvBool(False)
+    # Master gate for DeepSeek V4 Decode Context Parallel (DCP). When False
+    # (default), DSv4 hook rejects --dcp-size > 1 with a clear error so users
+    # cannot enable an unvalidated combination by accident. Flip to 1 once
+    # numerical-equivalence regression has been verified on the target cluster.
+    SGLANG_DSV4_ENABLE_DCP = EnvBool(False)
+    # Experimental P0 path for DeepSeek V4 DCP decode: each rank scores only
+    # the C4 indexer entries owned by its DCP shard, then gathers local top-k
+    # candidates and merges them into the global C4 sparse top-k.
+    SGLANG_DSV4_DCP_SHARD_C4_INDEXER = EnvBool(False)
+    # Temporary A/B gate for the one-collective packed candidate merge.
+    SGLANG_DSV4_DCP_C4_PACKED_TOPK = EnvBool(False)
+    # Experimental DSV4 DCP attention merge: gather LSEs, then reduce-scatter
+    # the corrected FP32 output along the head dimension.
+    SGLANG_DSV4_DCP_AG_RS = EnvBool(False)
+    # Experimental DSV4 DCP attention merge: exchange per-destination head
+    # chunks with all-to-all instead of gathering all LSEs and all-reducing all
+    # output heads.
+    SGLANG_DSV4_DCP_A2A_LSE = EnvBool(False)
+    # Debug-only validation for the A2A LSE merge. Run both the reference and
+    # A2A paths on the same real FlashMLA tensors and assert numerical parity.
+    # This mode requires decode CUDA graphs to be disabled.
+    SGLANG_DSV4_DCP_A2A_LSE_VERIFY = EnvBool(False)
     # Default reasoning_effort for dsv4 chat encoder when request doesn't set it.
     # Accepts "", "max", "high" (empty string means unset); other values filtered to None.
     SGLANG_DSV4_REASONING_EFFORT = EnvStr("")

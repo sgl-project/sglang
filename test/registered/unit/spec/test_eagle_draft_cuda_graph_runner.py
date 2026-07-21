@@ -54,6 +54,7 @@ class _RecordingDraftBackend:
                 batch_size=forward_batch.batch_size,
                 seq_lens_sum=forward_batch.seq_lens_sum,
                 seq_lens=None if seq_lens is None else seq_lens.clone(),
+                out_cache_loc=forward_batch.out_cache_loc.clone(),
             )
         )
 
@@ -75,6 +76,7 @@ class TestEagleDraftCudaGraphRunner(CustomTestCase):
             req_pool_indices=torch.empty(CAPTURE_BS, dtype=torch.int32),
             seq_lens_cpu=torch.empty(CAPTURE_BS, dtype=torch.int32),
             dsa_seed_topk=None,
+            dcp_kv_mask=None,
         )
         runner.capture_bs = [1, CAPTURE_BS]
         runner.captured_req_width = 1
@@ -167,6 +169,20 @@ class TestEagleDraftCudaGraphRunner(CustomTestCase):
         # The raw batch shape is restored once replay finishes.
         self.assertEqual(forward_batch.batch_size, len(raw_seq_lens))
         self.assertEqual(forward_batch.seq_lens_sum, sum(raw_seq_lens))
+        self.assertEqual(
+            forward_batch.out_cache_loc.tolist(),
+            list(range(len(raw_seq_lens) * NUM_STEPS)),
+        )
+
+        expected_static_out_cache_loc = list(range(len(raw_seq_lens) * NUM_STEPS)) + [
+            0
+        ] * (num_fake_rows * NUM_STEPS)
+        for observation in backend.observations:
+            self.assertEqual(
+                observation.out_cache_loc.tolist(),
+                expected_static_out_cache_loc,
+                msg=observation.phase,
+            )
 
     def test_unpadded_replay_leaves_seq_lens_sum_untouched(self):
         # raw_bs == CAPTURE_BS: no fake rows, so the padding branch is skipped

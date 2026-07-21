@@ -126,11 +126,16 @@ class KVArgsRegisterInfo:
     # for mamba state different tp slice transfer
     dst_state_item_lens: List[List[int]]
     dst_state_dim_per_tensor: List[List[int]]
+    enable_hisparse: bool = False
+    dst_dcp_size: int = 1
+    dst_dcp_rank: int = 0
     # Note: always put the staging field at the final (since the staging field is optional and contains multiple inputs)
     staging: Optional[StagingRegisterInfo] = None
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
+        has_dcp_fields = len(msg) > 14 and msg[12] in (b"0", b"1")
+        staging_offset = 15 if has_dcp_fields else 12
         return cls(
             room=str(msg[0].decode("ascii")),
             endpoint=msg[1].decode("ascii"),
@@ -148,8 +153,13 @@ class KVArgsRegisterInfo:
             dst_state_dim_per_tensor=(
                 unpack_int_lists(msg[11], "I") if len(msg) > 11 else []
             ),
+            enable_hisparse=(
+                msg[12].decode("ascii") == "1" if has_dcp_fields else False
+            ),
+            dst_dcp_size=int(msg[13].decode("ascii")) if has_dcp_fields else 1,
+            dst_dcp_rank=int(msg[14].decode("ascii")) if has_dcp_fields else 0,
             # Note: always put the staging field at the final
-            staging=StagingRegisterInfo.from_zmq_fields(msg, 12),
+            staging=StagingRegisterInfo.from_zmq_fields(msg, staging_offset),
         )
 
 
@@ -163,6 +173,20 @@ class MooncakeKVManager(CommonKVManager):
         server_args: ServerArgs,
         is_mla_backend: Optional[bool] = False,
     ):
+        # Mooncake's RDMA path (``_send_kvcache_generic``) addresses GPU
+        # buffers with ``ptr + index * item_len``. In DCP mode the transfer
+        # path passes rank-local token-loc arrays and switches ``item_len``
+        # from per-page to per-token (see ``send_kvcache``), so the
+        # backend supports DCP without protocol changes.
+        #
+        # Limit DCP support to Mooncake paths implemented here. Standard
+        # MLA/MHA single-pool DCP uses token-level item strides; DSV4 uses
+        # dedicated bucket-aware routines for c4/c128/state buffers. HiSparse's
+        # host-pool path still needs its own transfer routine and remains
+        # blocked.
+        dcp_size_init = getattr(args, "dcp_size", 1) or 1
+        is_hisparse = bool(getattr(server_args, "enable_hisparse", False))
+        self.supports_dcp_transfer = dcp_size_init <= 1 or not is_hisparse
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
         self.init_engine()
         self.register_buffer_to_engine()
@@ -694,6 +718,833 @@ class MooncakeKVManager(CommonKVManager):
             # compared to using multiple threads
             return process_layers(layers_params)
 
+    def _send_indexed_layers(
+        self,
+        mooncake_session_id: str,
+        src_data_ptrs: list[int],
+        dst_data_ptrs: list[int],
+        item_lens: list[int],
+        prefill_data_indices: npt.NDArray[np.int32],
+        dst_data_indices: npt.NDArray[np.int32],
+        executor: concurrent.futures.ThreadPoolExecutor,
+    ) -> int:
+        """Send already-aligned layer buffers with caller-provided indices.
+
+        This is the same transfer primitive as ``_send_kvcache_generic``, but
+        without MHA/MLA pointer slicing. DSV4+DCP needs to split the flat DSV4
+        layout into buckets first because c4/c128 buffers use different local
+        index spaces from the SWA/token buffer.
+        """
+        if len(src_data_ptrs) == 0 or len(prefill_data_indices) == 0:
+            return 0
+
+        prefill_blocks, dst_blocks = group_concurrent_contiguous(
+            prefill_data_indices, dst_data_indices
+        )
+        layers_params = list(zip(src_data_ptrs, dst_data_ptrs, item_lens))
+
+        def set_transfer_blocks(
+            src_ptr: int, dst_ptr: int, item_len: int
+        ) -> List[Tuple[int, int, int]]:
+            transfer_blocks = []
+            for prefill_index, decode_index in zip(prefill_blocks, dst_blocks):
+                src_addr = src_ptr + int(prefill_index[0]) * item_len
+                dst_addr = dst_ptr + int(decode_index[0]) * item_len
+                transfer_blocks.append(
+                    (src_addr, dst_addr, item_len * len(prefill_index))
+                )
+            return transfer_blocks
+
+        if self.enable_custom_mem_pool:
+            futures = [
+                executor.submit(
+                    self._transfer_data,
+                    mooncake_session_id,
+                    set_transfer_blocks(src_ptr, dst_ptr, item_len),
+                )
+                for (src_ptr, dst_ptr, item_len) in layers_params
+            ]
+            for future in concurrent.futures.as_completed(futures):
+                status = future.result()
+                if status != 0:
+                    for f in futures:
+                        f.cancel()
+                    return status
+            return 0
+
+        transfer_blocks = []
+        for src_ptr, dst_ptr, item_len in layers_params:
+            transfer_blocks.extend(set_transfer_blocks(src_ptr, dst_ptr, item_len))
+        return self._transfer_data(mooncake_session_id, transfer_blocks)
+
+    def _send_dsv4_packed_token_layers(
+        self,
+        mooncake_session_id: str,
+        src_data_ptrs: list[int],
+        dst_data_ptrs: list[int],
+        page_item_lens: list[int],
+        src_token_locs: npt.NDArray[np.int32],
+        dst_token_locs: npt.NDArray[np.int32],
+        page_size: int,
+        token_segments: List[Tuple[int, int]],
+        executor: concurrent.futures.ThreadPoolExecutor,
+    ) -> int:
+        """Send token-indexed slices from DSV4 packed page buffers.
+
+        DSV4 KV pages are not laid out as one contiguous record per token.
+        FlashMLA buffers store all tokens' nope/rope bytes first, followed by
+        all tokens' scale bytes; indexer buffers follow the same two-segment
+        page pattern. A token-level RDMA copy therefore has to copy each page
+        segment separately instead of using ``page_bytes / page_size`` as a
+        fake per-token stride.
+        """
+        if (
+            len(src_data_ptrs) == 0
+            or len(src_token_locs) == 0
+            or len(dst_token_locs) == 0
+        ):
+            return 0
+        if src_token_locs.size != dst_token_locs.size:
+            min_len = min(src_token_locs.size, dst_token_locs.size)
+            logger.warning(
+                "DSV4 packed token transfer loc count mismatch: src=%d dst=%d, clipping to %d",
+                src_token_locs.size,
+                dst_token_locs.size,
+                min_len,
+            )
+            src_token_locs = src_token_locs[:min_len]
+            dst_token_locs = dst_token_locs[:min_len]
+
+        src_blocks, dst_blocks = group_concurrent_contiguous(
+            src_token_locs, dst_token_locs
+        )
+        layers_params = list(zip(src_data_ptrs, dst_data_ptrs, page_item_lens))
+
+        def set_transfer_blocks(
+            src_ptr: int, dst_ptr: int, page_item_len: int
+        ) -> List[Tuple[int, int, int]]:
+            transfer_blocks = []
+            for src_group, dst_group in zip(src_blocks, dst_blocks):
+                src_start = int(src_group[0])
+                dst_start = int(dst_group[0])
+                count = len(src_group)
+                offset = 0
+                while offset < count:
+                    src_loc = src_start + offset
+                    dst_loc = dst_start + offset
+                    src_page = src_loc // page_size
+                    dst_page = dst_loc // page_size
+                    src_in_page = src_loc % page_size
+                    dst_in_page = dst_loc % page_size
+                    chunk = min(
+                        count - offset,
+                        page_size - src_in_page,
+                        page_size - dst_in_page,
+                    )
+                    for segment_page_offset, segment_len in token_segments:
+                        src_addr = (
+                            src_ptr
+                            + src_page * page_item_len
+                            + segment_page_offset
+                            + src_in_page * segment_len
+                        )
+                        dst_addr = (
+                            dst_ptr
+                            + dst_page * page_item_len
+                            + segment_page_offset
+                            + dst_in_page * segment_len
+                        )
+                        transfer_blocks.append(
+                            (src_addr, dst_addr, segment_len * chunk)
+                        )
+                    offset += chunk
+            return transfer_blocks
+
+        if self.enable_custom_mem_pool:
+            futures = [
+                executor.submit(
+                    self._transfer_data,
+                    mooncake_session_id,
+                    set_transfer_blocks(src_ptr, dst_ptr, page_item_len),
+                )
+                for (src_ptr, dst_ptr, page_item_len) in layers_params
+            ]
+            for future in concurrent.futures.as_completed(futures):
+                status = future.result()
+                if status != 0:
+                    for f in futures:
+                        f.cancel()
+                    return status
+            return 0
+
+        transfer_blocks = []
+        for src_ptr, dst_ptr, page_item_len in layers_params:
+            transfer_blocks.extend(set_transfer_blocks(src_ptr, dst_ptr, page_item_len))
+        return self._transfer_data(mooncake_session_id, transfer_blocks)
+
+    def _is_dsv4_pool(self) -> bool:
+        return bool(getattr(self.kv_args, "mla_compression_ratios", None))
+
+    def _dsv4_stage_bucket_counts(self) -> Tuple[int, int, int]:
+        ratios = getattr(self.kv_args, "mla_compression_ratios", None) or []
+        start_layer = self.kv_args.prefill_start_layer
+        end_layer = getattr(self.kv_args, "prefill_end_layer", None)
+        assert end_layer is not None
+        stage_ratios = ratios[start_layer:end_layer]
+        c4_count = sum(1 for r in stage_ratios if r == 4)
+        c128_count = sum(1 for r in stage_ratios if r == 128)
+        swa_count = end_layer - start_layer
+        return swa_count, c4_count, c128_count
+
+    def _dsv4_bucket_locs_from_token_locs(
+        self,
+        token_locs: npt.NDArray[np.int32],
+        compression_ratio: int,
+        position_offset: int = 0,
+    ) -> npt.NDArray[np.int32]:
+        """Map full-token locs to DSV4 c4/c128 global pool locs.
+
+        DSV4 writes compressed KV only at compression boundaries. The metadata
+        kernel stores those slots as ``raw_out_loc // ratio`` when
+        ``(seq_len % ratio) == 0``. The predicate is sequence-position based,
+        while ``raw_out_loc`` is allocator state and must only be used for the
+        compressed destination slot. DCP sharding is applied by the caller
+        because source and destination DCP topologies may differ.
+        """
+        if token_locs.size == 0:
+            return np.array([], dtype=np.int32)
+
+        positions = np.arange(
+            position_offset + 1,
+            position_offset + token_locs.size + 1,
+            dtype=np.int64,
+        )
+        mask = (positions % compression_ratio) == 0
+        return (token_locs[mask] // compression_ratio).astype(np.int32, copy=False)
+
+    def _dcp_transfer_index_pair(
+        self,
+        src_global_locs: npt.NDArray[np.int32],
+        dst_global_locs: npt.NDArray[np.int32],
+        src_dcp_size: int,
+        src_dcp_rank: int,
+        dst_dcp_size: int,
+        dst_dcp_rank: int,
+    ) -> Tuple[npt.NDArray[np.int32], npt.NDArray[np.int32]]:
+        """Build source/destination physical indices for a DCP transfer.
+
+        Source and destination engines allocate KV locs independently, so the
+        numeric loc value for the same sequence position can differ. Select by
+        destination ownership, apply the same position mask to the source locs,
+        and then map each side into its own local physical address space.
+        """
+        if src_global_locs.size == 0 or dst_global_locs.size == 0:
+            empty = np.array([], dtype=np.int32)
+            return empty, empty
+        if src_global_locs.size != dst_global_locs.size:
+            min_len = min(src_global_locs.size, dst_global_locs.size)
+            logger.warning(
+                "DCP transfer loc count mismatch: src=%d dst=%d, clipping to %d",
+                src_global_locs.size,
+                dst_global_locs.size,
+                min_len,
+            )
+            src_global_locs = src_global_locs[:min_len]
+            dst_global_locs = dst_global_locs[:min_len]
+
+        mask = np.ones(dst_global_locs.shape, dtype=bool)
+        if dst_dcp_size > 1:
+            mask &= (dst_global_locs % dst_dcp_size) == dst_dcp_rank
+        if src_dcp_size > 1:
+            mask &= (src_global_locs % src_dcp_size) == src_dcp_rank
+        selected_src = src_global_locs[mask].astype(np.int32, copy=False)
+        selected_dst = dst_global_locs[mask].astype(np.int32, copy=False)
+        if src_dcp_size > 1:
+            src_indices = (selected_src // src_dcp_size).astype(np.int32, copy=False)
+        else:
+            src_indices = selected_src
+        if dst_dcp_size > 1:
+            dst_indices = (selected_dst // dst_dcp_size).astype(np.int32, copy=False)
+        else:
+            dst_indices = selected_dst
+        return src_indices, dst_indices
+
+    def _send_dsv4_kvcache_dcp(
+        self,
+        mooncake_session_id: str,
+        prefill_kv_indices: npt.NDArray[np.int32],
+        dst_kv_ptrs: list[int],
+        dst_kv_indices: npt.NDArray[np.int32],
+        executor: concurrent.futures.ThreadPoolExecutor,
+        target_rank_registration_info: Optional[KVArgsRegisterInfo],
+        token_position_offset: int = 0,
+    ) -> int:
+        """DSV4 compressed KV transfer under DCP.
+
+        The DSV4 kv_data flat layout is [c4_kv, c4_indexer, c128_kv].
+        c4/c128 attention KV buffers use compressed-slot loc spaces and are
+        DCP-local. The c4 indexer is a scoring cache read with the global c4
+        page table, so it stays in global/replicated c4-index space.
+        """
+        _, c4_count, c128_count = self._dsv4_stage_bucket_counts()
+        src_ptrs, dst_ptrs, _ = self.get_mla_kv_ptrs_with_pp(
+            self.kv_args.kv_data_ptrs, dst_kv_ptrs
+        )
+        item_lens = self.kv_args.kv_item_lens
+        dst_dcp_size = (
+            target_rank_registration_info.dst_dcp_size
+            if target_rank_registration_info is not None
+            else self.dcp_size
+        )
+        dst_dcp_rank = (
+            target_rank_registration_info.dst_dcp_rank
+            if target_rank_registration_info is not None
+            else self.dcp_rank
+        )
+
+        c4_slots_per_page = max(self.kv_args.page_size // 4, 1)
+        c128_slots_per_page = max(self.kv_args.page_size // 128, 1)
+        dsv4_kv_segments = [
+            (0, 576),
+            (c4_slots_per_page * 576, 8),
+        ]
+
+        c4_src_global_locs = self._dsv4_bucket_locs_from_token_locs(
+            prefill_kv_indices, 4, token_position_offset
+        )
+        c4_dst_global_locs = self._dsv4_bucket_locs_from_token_locs(
+            dst_kv_indices, 4, token_position_offset
+        )
+        src_c4, dst_c4 = self._dcp_transfer_index_pair(
+            c4_src_global_locs,
+            c4_dst_global_locs,
+            self.dcp_size,
+            self.dcp_rank,
+            dst_dcp_size,
+            dst_dcp_rank,
+        )
+        c128_src_global_locs = self._dsv4_bucket_locs_from_token_locs(
+            prefill_kv_indices, 128, token_position_offset
+        )
+        c128_dst_global_locs = self._dsv4_bucket_locs_from_token_locs(
+            dst_kv_indices, 128, token_position_offset
+        )
+        src_c128, dst_c128 = self._dcp_transfer_index_pair(
+            c128_src_global_locs,
+            c128_dst_global_locs,
+            self.dcp_size,
+            self.dcp_rank,
+            dst_dcp_size,
+            dst_dcp_rank,
+        )
+        logger.info(
+            "DSV4 KV transfer: tokens=%d dst_tokens=%d offset=%d "
+            "c4=%d/%d c128=%d/%d dcp=%d:%d dst_dcp=%d:%d",
+            prefill_kv_indices.size,
+            dst_kv_indices.size,
+            token_position_offset,
+            src_c4.size,
+            c4_src_global_locs.size,
+            src_c128.size,
+            c128_src_global_locs.size,
+            self.dcp_size,
+            self.dcp_rank,
+            dst_dcp_size,
+            dst_dcp_rank,
+        )
+        rc = 0
+        if c4_count > 0:
+            c4_kv_src_ptrs = src_ptrs[:c4_count]
+            c4_kv_dst_ptrs = dst_ptrs[:c4_count]
+            c4_kv_item_lens = item_lens[:c4_count]
+            c4_indexer_src_ptrs = src_ptrs[c4_count : 2 * c4_count]
+            c4_indexer_dst_ptrs = dst_ptrs[c4_count : 2 * c4_count]
+            c4_indexer_item_lens = item_lens[c4_count : 2 * c4_count]
+            c4_indexer_segments = [
+                (0, 128),
+                (c4_slots_per_page * 128, 4),
+            ]
+            rc = (
+                self._send_dsv4_packed_token_layers(
+                    mooncake_session_id,
+                    c4_kv_src_ptrs,
+                    c4_kv_dst_ptrs,
+                    c4_kv_item_lens,
+                    src_c4,
+                    dst_c4,
+                    c4_slots_per_page,
+                    dsv4_kv_segments,
+                    executor,
+                )
+                or rc
+            )
+            rc = (
+                self._send_dsv4_packed_token_layers(
+                    mooncake_session_id,
+                    c4_indexer_src_ptrs,
+                    c4_indexer_dst_ptrs,
+                    c4_indexer_item_lens,
+                    c4_src_global_locs,
+                    c4_dst_global_locs,
+                    c4_slots_per_page,
+                    c4_indexer_segments,
+                    executor,
+                )
+                or rc
+            )
+        if c128_count > 0:
+            c128_start = 2 * c4_count
+            c128_src_ptrs = src_ptrs[c128_start : c128_start + c128_count]
+            c128_dst_ptrs = dst_ptrs[c128_start : c128_start + c128_count]
+            c128_item_lens = item_lens[c128_start : c128_start + c128_count]
+            c128_kv_segments = [
+                (0, 576),
+                (c128_slots_per_page * 576, 8),
+            ]
+            rc = (
+                self._send_dsv4_packed_token_layers(
+                    mooncake_session_id,
+                    c128_src_ptrs,
+                    c128_dst_ptrs,
+                    c128_item_lens,
+                    src_c128,
+                    dst_c128,
+                    c128_slots_per_page,
+                    c128_kv_segments,
+                    executor,
+                )
+                or rc
+            )
+        return rc
+
+    def _send_dsv4_state_dcp(
+        self,
+        req: TransferInfo,
+        prefill_state_indices: List,
+        executor: concurrent.futures.ThreadPoolExecutor,
+        target_rank_registration_info: Optional[KVArgsRegisterInfo],
+    ) -> int:
+        """Send DSV4 state_data for DeepSeek-V4 PD transfer.
+
+        Expanded DSV4 SWA payload layout:
+        - [0]: global SWA-token locs for the SWA KV buffer.
+        - [1]: SWA page indices for c4/indexer compress_state.
+        - [2]: global full-token locs for c128 compress_state.
+        - [3]: optional sequence-position offset for [0] and [2].
+        - extras: optional StateType.SWA_RING rows, then optional online
+          c128 request-scoped state rows.
+
+        State buffers are addressed by StateType. Non-unified CUDA keeps SWA KV
+        inside StateType.SWA before c4/indexer compressor states; unified KV
+        ships its SWA ring as a separate StateType.SWA_RING component.
+        """
+        if target_rank_registration_info is None:
+            return 0
+        if len(prefill_state_indices) < 2 or len(req.dst_state_indices) < 2:
+            raise RuntimeError(
+                "DSV4+DCP state transfer expects expanded state_indices "
+                "[swa_token_locs, state_page_indices, full_token_locs, "
+                "position_offset] on both prefill and decode."
+            )
+
+        state_types = getattr(self.kv_args, "state_types", []) or []
+        if StateType.SWA not in state_types:
+            raise RuntimeError("DSV4 state transfer requires StateType.SWA")
+        swa_state_idx = state_types.index(StateType.SWA)
+        swa_ring_state_idx = (
+            state_types.index(StateType.SWA_RING)
+            if StateType.SWA_RING in state_types
+            else None
+        )
+
+        src_state_data_ptrs = self.kv_args.state_data_ptrs[swa_state_idx]
+        src_state_item_lens = self.kv_args.state_item_lens[swa_state_idx]
+        dst_state_data_ptrs = target_rank_registration_info.dst_state_data_ptrs[
+            swa_state_idx
+        ]
+
+        src_state_ptrs, dst_state_ptrs, _ = self.get_mla_kv_ptrs_with_pp(
+            src_state_data_ptrs, dst_state_data_ptrs, StateType.SWA
+        )
+        swa_count, _, _ = self._dsv4_stage_bucket_counts()
+        kv_page_size = max(self.kv_args.page_size, 1)
+        swa_page_size = max(
+            getattr(self.kv_args, "swa_page_size", None) or kv_page_size, 1
+        )
+        dst_dcp_size = target_rank_registration_info.dst_dcp_size
+        dst_dcp_rank = target_rank_registration_info.dst_dcp_rank
+
+        src_swa_global_locs = np.array(prefill_state_indices[0], dtype=np.int32)
+        dst_swa_global_locs = np.array(req.dst_state_indices[0], dtype=np.int32)
+        src_full_global_locs = (
+            np.array(prefill_state_indices[2], dtype=np.int32)
+            if len(prefill_state_indices) > 2
+            else None
+        )
+        dst_full_global_locs = (
+            np.array(req.dst_state_indices[2], dtype=np.int32)
+            if len(req.dst_state_indices) > 2
+            else None
+        )
+        extra_index = 4
+        src_swa_ring_state_indices = None
+        dst_swa_ring_state_indices = None
+        if swa_ring_state_idx is not None:
+            if (
+                len(prefill_state_indices) <= extra_index
+                or len(req.dst_state_indices) <= extra_index
+            ):
+                raise RuntimeError(
+                    "DSV4 state transfer requires SWA_RING indices when "
+                    "StateType.SWA_RING is registered."
+                )
+            src_swa_ring_state_indices = np.array(
+                prefill_state_indices[extra_index], dtype=np.int32
+            )
+            dst_swa_ring_state_indices = np.array(
+                req.dst_state_indices[extra_index], dtype=np.int32
+            )
+            extra_index += 1
+
+        src_c128_state_indices = (
+            np.array(prefill_state_indices[extra_index], dtype=np.int32)
+            if StateType.C128_STATE in state_types
+            and len(prefill_state_indices) > extra_index
+            else None
+        )
+        dst_c128_state_indices = (
+            np.array(req.dst_state_indices[extra_index], dtype=np.int32)
+            if StateType.C128_STATE in state_types
+            and len(req.dst_state_indices) > extra_index
+            else None
+        )
+
+        def state_position_offset(state_indices: List) -> int:
+            if len(state_indices) <= 3 or state_indices[3] is None:
+                return 0
+            offset = np.array(state_indices[3], dtype=np.int64).reshape(-1)
+            return int(offset[0]) if offset.size > 0 else 0
+
+        src_state_position_offset = state_position_offset(prefill_state_indices)
+        dst_state_position_offset = state_position_offset(req.dst_state_indices)
+        src_swa_locs, dst_swa_locs = self._dcp_transfer_index_pair(
+            src_swa_global_locs,
+            dst_swa_global_locs,
+            self.dcp_size,
+            self.dcp_rank,
+            dst_dcp_size,
+            dst_dcp_rank,
+        )
+        logger.info(
+            "DSV4 state transfer: payload_lens=%s state_types=%s "
+            "src_state_ptrs=%d dst_state_ptrs=%d swa_count=%d "
+            "swa_locs=%d/%d offset=%d dst_offset=%d swa_ring=%s",
+            [len(x) if x is not None else None for x in prefill_state_indices],
+            [st.value for st in state_types],
+            len(src_state_ptrs),
+            len(dst_state_ptrs),
+            swa_count,
+            src_swa_locs.size,
+            src_swa_global_locs.size,
+            src_state_position_offset,
+            dst_state_position_offset,
+            swa_ring_state_idx is not None,
+        )
+
+        def paired_state_locs_from_swa_locs(
+            src_swa_locs: npt.NDArray[np.int32],
+            dst_swa_locs: npt.NDArray[np.int32],
+            compress_ratio: int,
+        ) -> Tuple[npt.NDArray[np.int32], npt.NDArray[np.int32], int]:
+            # Match dsv4.compressor.create_paged_compress_data:
+            #   state_loc = swa_page * ring_size + (swa_loc % ring_size)
+            # where ``swa_page`` is based on the SWA KV page size, not the
+            # full-KV page size used by c4/c128 compressed KV buffers.
+            from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+                get_compress_state_ring_size,
+            )
+
+            ring_size = get_compress_state_ring_size(
+                compress_ratio,
+                self.server_args.speculative_algorithm is not None,
+            )
+            if src_swa_locs.size == 0 or dst_swa_locs.size == 0:
+                empty = np.array([], dtype=np.int32)
+                return empty, empty, ring_size
+            if src_swa_locs.size != dst_swa_locs.size:
+                min_len = min(src_swa_locs.size, dst_swa_locs.size)
+                logger.warning(
+                    "DSV4 c%d state loc count mismatch: src=%d dst=%d, clipping to %d",
+                    compress_ratio,
+                    src_swa_locs.size,
+                    dst_swa_locs.size,
+                    min_len,
+                )
+                src_swa_locs = src_swa_locs[:min_len]
+                dst_swa_locs = dst_swa_locs[:min_len]
+
+            src_state_locs = (src_swa_locs // swa_page_size) * ring_size + (
+                src_swa_locs % ring_size
+            )
+            dst_state_locs = (dst_swa_locs // swa_page_size) * ring_size + (
+                dst_swa_locs % ring_size
+            )
+            # The CUDA planner addresses compress state by ratio-sized pages.
+            src_state_locs = src_state_locs // compress_ratio
+            dst_state_locs = dst_state_locs // compress_ratio
+            keep = []
+            seen = set()
+            for i, (src_loc, dst_loc) in enumerate(
+                zip(src_state_locs, dst_state_locs)
+            ):
+                key = (int(src_loc), int(dst_loc))
+                if key in seen:
+                    continue
+                seen.add(key)
+                keep.append(i)
+            if len(keep) != src_state_locs.size:
+                keep_arr = np.array(keep, dtype=np.int64)
+                src_state_locs = src_state_locs[keep_arr]
+                dst_state_locs = dst_state_locs[keep_arr]
+            return (
+                src_state_locs.astype(np.int32, copy=False),
+                dst_state_locs.astype(np.int32, copy=False),
+                ring_size,
+            )
+
+        def paired_c128_state_rows_from_full_locs() -> Tuple[
+            npt.NDArray[np.int32], npt.NDArray[np.int32], int
+        ]:
+            from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+                get_compress_state_ring_size,
+            )
+
+            ring_size = get_compress_state_ring_size(
+                128,
+                self.server_args.speculative_algorithm is not None,
+            )
+            if src_full_global_locs is None or dst_full_global_locs is None:
+                src_rows, dst_rows, _ = paired_state_locs_from_swa_locs(
+                    src_swa_global_locs, dst_swa_global_locs, 128
+                )
+                return src_rows, dst_rows, ring_size
+
+            src_full = src_full_global_locs
+            dst_full = dst_full_global_locs
+            if src_full.size == 0 or dst_full.size == 0:
+                empty = np.array([], dtype=np.int32)
+                return empty, empty, ring_size
+
+            if ring_size == 1:
+                # Online c128 keeps one running state per 128-token sequence
+                # chunk. The runtime planner keys that state by the full-token
+                # loc at the chunk start, not by every physical row touched by
+                # the window. This matters when prefix cache makes the window's
+                # physical locs non-contiguous.
+                common_start = max(
+                    src_state_position_offset, dst_state_position_offset
+                )
+                common_end = min(
+                    src_state_position_offset + src_full.size,
+                    dst_state_position_offset + dst_full.size,
+                )
+                first_chunk_start = ((common_start + 127) // 128) * 128
+                if first_chunk_start >= common_end:
+                    empty = np.array([], dtype=np.int32)
+                    return empty, empty, ring_size
+                chunk_positions = np.arange(
+                    first_chunk_start, common_end, 128, dtype=np.int64
+                )
+                src_full = src_full[
+                    (chunk_positions - src_state_position_offset).astype(np.int64)
+                ]
+                dst_full = dst_full[
+                    (chunk_positions - dst_state_position_offset).astype(np.int64)
+                ]
+            elif src_full.size != dst_full.size:
+                min_len = min(src_full.size, dst_full.size)
+                logger.warning(
+                    "DSV4 c128 state loc count mismatch: src=%d dst=%d, clipping to %d",
+                    src_full.size,
+                    dst_full.size,
+                    min_len,
+                )
+                src_full = src_full[:min_len]
+                dst_full = dst_full[:min_len]
+
+            src_rows = src_full.astype(np.int64, copy=False) // 128
+            dst_rows = dst_full.astype(np.int64, copy=False) // 128
+            mask = (src_full > 0) & (dst_full > 0)
+            selected_src = src_rows[mask]
+            selected_dst = dst_rows[mask]
+            selected_src = selected_src.astype(np.int32, copy=False)
+            selected_dst = selected_dst.astype(np.int32, copy=False)
+
+            keep = []
+            seen = set()
+            for i, (src_row, dst_row) in enumerate(zip(selected_src, selected_dst)):
+                key = (int(src_row), int(dst_row))
+                if key in seen:
+                    continue
+                seen.add(key)
+                keep.append(i)
+            if len(keep) != selected_src.size:
+                keep_arr = np.array(keep, dtype=np.int64)
+                selected_src = selected_src[keep_arr]
+                selected_dst = selected_dst[keep_arr]
+            return selected_src, selected_dst, ring_size
+
+        def state_rows_for_entry(
+            ratio: int, is_indexer_state: bool
+        ) -> Tuple[npt.NDArray[np.int32], npt.NDArray[np.int32], int]:
+            if ratio == 128 and not is_indexer_state:
+                return paired_c128_state_rows_from_full_locs()
+            # C4/indexer compressor states are replicated request-scoped state,
+            # unlike SWA KV, so every decode DCP rank receives the global rows.
+            return paired_state_locs_from_swa_locs(
+                src_swa_global_locs, dst_swa_global_locs, ratio
+            )
+
+        ratios = getattr(self.kv_args, "mla_compression_ratios", None) or []
+        start_layer = self.kv_args.prefill_start_layer
+        end_layer = getattr(self.kv_args, "prefill_end_layer", None)
+        assert end_layer is not None
+        stage_ratios = ratios[start_layer:end_layer]
+        c4_state_count = sum(1 for r in stage_ratios if r == 4)
+        state_entries = [(4, False)] * c4_state_count + [
+            (4, True)
+        ] * c4_state_count
+        rc = 0
+        state_buffer_offset = 0
+        if swa_ring_state_idx is not None:
+            assert src_swa_ring_state_indices is not None
+            assert dst_swa_ring_state_indices is not None
+            src_swa_ring_ptrs = self.kv_args.state_data_ptrs[swa_ring_state_idx]
+            src_swa_ring_item_lens = self.kv_args.state_item_lens[swa_ring_state_idx]
+            dst_swa_ring_ptrs = target_rank_registration_info.dst_state_data_ptrs[
+                swa_ring_state_idx
+            ]
+            src_swa_ring_ptrs, dst_swa_ring_ptrs, _ = self.get_mla_kv_ptrs_with_pp(
+                src_swa_ring_ptrs, dst_swa_ring_ptrs, StateType.SWA_RING
+            )
+            rc = (
+                self._send_indexed_layers(
+                    req.mooncake_session_id,
+                    src_swa_ring_ptrs,
+                    dst_swa_ring_ptrs,
+                    src_swa_ring_item_lens,
+                    src_swa_ring_state_indices,
+                    dst_swa_ring_state_indices,
+                    executor,
+                )
+                or rc
+            )
+        elif swa_count > 0:
+            swa_kv_segments = [
+                (0, 576),
+                (swa_page_size * 576, 8),
+            ]
+            rc = (
+                self._send_dsv4_packed_token_layers(
+                    req.mooncake_session_id,
+                    src_state_ptrs[:swa_count],
+                    dst_state_ptrs[:swa_count],
+                    src_state_item_lens[:swa_count],
+                    src_swa_locs,
+                    dst_swa_locs,
+                    swa_page_size,
+                    swa_kv_segments,
+                    executor,
+                )
+                or rc
+            )
+            state_buffer_offset = swa_count
+
+        state_src_ptrs = src_state_ptrs[state_buffer_offset:]
+        state_dst_ptrs = dst_state_ptrs[state_buffer_offset:]
+        state_item_lens = src_state_item_lens[state_buffer_offset:]
+        if state_src_ptrs:
+            if len(state_src_ptrs) != len(state_entries):
+                raise RuntimeError(
+                    "DSV4 state buffer/ratio count mismatch: "
+                    f"buffers={len(state_src_ptrs)} entries={len(state_entries)} "
+                    f"stage_ratios={stage_ratios}"
+                )
+            for src_ptr, dst_ptr, item_len, (ratio, is_indexer_state) in zip(
+                state_src_ptrs, state_dst_ptrs, state_item_lens, state_entries
+            ):
+                src_rows, dst_rows, ring_size = state_rows_for_entry(
+                    ratio, is_indexer_state
+                )
+                slot_item_len = item_len // ring_size
+                state_page_item_len = slot_item_len * ratio
+                rc = (
+                    self._send_indexed_layers(
+                        req.mooncake_session_id,
+                        [src_ptr],
+                        [dst_ptr],
+                        [state_page_item_len],
+                        src_rows,
+                        dst_rows,
+                        executor,
+                    )
+                    or rc
+                )
+
+        if StateType.C128_STATE in state_types:
+            c128_state_idx = state_types.index(StateType.C128_STATE)
+            src_c128_ptrs = self.kv_args.state_data_ptrs[c128_state_idx]
+            src_c128_item_lens = self.kv_args.state_item_lens[c128_state_idx]
+            dst_c128_ptrs = target_rank_registration_info.dst_state_data_ptrs[
+                c128_state_idx
+            ]
+            src_c128_ptrs, dst_c128_ptrs, _ = self.get_mla_kv_ptrs_with_pp(
+                src_c128_ptrs, dst_c128_ptrs, StateType.C128_STATE
+            )
+            if (
+                src_c128_state_indices is not None
+                and dst_c128_state_indices is not None
+            ):
+                c128_src_rows = src_c128_state_indices
+                c128_dst_rows = dst_c128_state_indices
+                for src_ptr, dst_ptr, item_len in zip(
+                    src_c128_ptrs, dst_c128_ptrs, src_c128_item_lens
+                ):
+                    rc = (
+                        self._send_indexed_layers(
+                            req.mooncake_session_id,
+                            [src_ptr],
+                            [dst_ptr],
+                            [item_len],
+                            c128_src_rows,
+                            c128_dst_rows,
+                            executor,
+                        )
+                        or rc
+                    )
+            else:
+                c128_src_rows, c128_dst_rows, c128_ring_size = (
+                    paired_c128_state_rows_from_full_locs()
+                )
+                for src_ptr, dst_ptr, item_len in zip(
+                    src_c128_ptrs, dst_c128_ptrs, src_c128_item_lens
+                ):
+                    slot_item_len = item_len // c128_ring_size
+                    row_item_len = slot_item_len * min(128, c128_ring_size)
+                    rc = (
+                        self._send_indexed_layers(
+                            req.mooncake_session_id,
+                            [src_ptr],
+                            [dst_ptr],
+                            [row_item_len],
+                            c128_src_rows,
+                            c128_dst_rows,
+                            executor,
+                        )
+                        or rc
+                    )
+        return rc
+
     def send_kvcache(
         self,
         mooncake_session_id: str,
@@ -701,12 +1552,49 @@ class MooncakeKVManager(CommonKVManager):
         dst_kv_ptrs: list[int],
         dst_kv_indices: npt.NDArray[np.int32],
         executor: concurrent.futures.ThreadPoolExecutor,
+        token_position_offset: int = 0,
     ):
+        target_rank_registration_info = self.decode_kv_args_table.get(
+            mooncake_session_id
+        )
+        dst_dcp_size = (
+            target_rank_registration_info.dst_dcp_size
+            if target_rank_registration_info is not None
+            else 1
+        )
+        if (
+            self._is_dsv4_pool()
+            and (
+                self.dcp_size > 1
+                or dst_dcp_size > 1
+                or envs.SGLANG_DSV4_ENABLE_DCP.get()
+            )
+        ):
+            return self._send_dsv4_kvcache_dcp(
+                mooncake_session_id,
+                prefill_kv_indices,
+                dst_kv_ptrs,
+                dst_kv_indices,
+                executor,
+                target_rank_registration_info,
+                token_position_offset,
+            )
+        item_lens = self.kv_args.kv_item_lens
+        if self.dcp_size > 1:
+            # DCP path: caller passes rank-local *token* loc arrays
+            # instead of page-level page-id arrays. Switch ``item_len``
+            # from per-page bytes to per-token bytes so ``ptr + idx *
+            # item_len`` lands on the right slot. ``kv_item_lens`` is
+            # populated as ``per_token_bytes * page_size`` (see
+            # MHATokenToKVPool.get_contiguous_buf_infos), so dividing by
+            # ``page_size`` recovers the per-token stride.
+            page_size = max(self.kv_args.page_size, 1)
+            item_lens = [il // page_size for il in item_lens]
         return self._send_kvcache_generic(
             mooncake_session_id=mooncake_session_id,
             src_data_ptrs=self.kv_args.kv_data_ptrs,
             dst_data_ptrs=dst_kv_ptrs,
-            item_lens=self.kv_args.kv_item_lens,
+            item_lens=item_lens,
             prefill_data_indices=prefill_kv_indices,
             dst_data_indices=dst_kv_indices,
             executor=executor,
@@ -964,6 +1852,42 @@ class MooncakeKVManager(CommonKVManager):
         executor: concurrent.futures.ThreadPoolExecutor,
         target_rank_registration_info: Optional[KVArgsRegisterInfo] = None,
     ):
+        dst_dcp_size = (
+            target_rank_registration_info.dst_dcp_size
+            if target_rank_registration_info is not None
+            else 1
+        )
+        if (
+            self._is_dsv4_pool()
+            and (
+                self.dcp_size > 1
+                or dst_dcp_size > 1
+                or envs.SGLANG_DSV4_ENABLE_DCP.get()
+            )
+        ):
+            if prefill_state_indices and isinstance(
+                prefill_state_indices[0], (list, tuple)
+            ):
+                expanded_indices = list(prefill_state_indices[0])
+                state_types = getattr(self.kv_args, "state_types", []) or []
+                if StateType.SWA_RING in state_types:
+                    swa_ring_state_idx = state_types.index(StateType.SWA_RING)
+                    if swa_ring_state_idx < len(prefill_state_indices):
+                        expanded_indices.append(
+                            prefill_state_indices[swa_ring_state_idx]
+                        )
+                if StateType.C128_STATE in state_types:
+                    c128_state_idx = state_types.index(StateType.C128_STATE)
+                    if c128_state_idx < len(prefill_state_indices):
+                        expanded_indices.append(prefill_state_indices[c128_state_idx])
+                prefill_state_indices = expanded_indices
+            return self._send_dsv4_state_dcp(
+                req,
+                prefill_state_indices,
+                executor,
+                target_rank_registration_info,
+            )
+
         rc = 0
         state_types = getattr(self.kv_args, "state_types", [])
         for i, st in enumerate(state_types):
@@ -1376,6 +2300,7 @@ class MooncakeKVManager(CommonKVManager):
                                 target_rank_registration_info.dst_kv_ptrs,
                                 chunked_dst_kv_indice,
                                 executor,
+                                token_position_offset=kv_chunk.token_position_offset,
                             )
                         elif (
                             self.enable_staging
@@ -1679,6 +2604,7 @@ class MooncakeKVManager(CommonKVManager):
         is_last_chunk: bool,
         aux_index: Optional[int] = None,
         state_indices: Optional[List] = None,
+        token_position_offset: int = 0,
         trace_ctx: Optional[Union[TraceReqContext, TraceNullContext]] = None,
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
@@ -1717,6 +2643,7 @@ class MooncakeKVManager(CommonKVManager):
                 is_last_chunk=is_last_chunk,
                 prefill_aux_index=aux_index,
                 state_indices=state_indices,
+                token_position_offset=token_position_offset,
                 trace_ctx=trace_ctx,
             )
         )
@@ -1797,6 +2724,7 @@ class MooncakeKVSender(CommonKVSender):
         self,
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List] = None,
+        token_position_offset: int = 0,
     ):
         kv_indices, index_slice, is_last_chunk, should_skip = (
             self._prepare_send_indices(kv_indices, state_indices)
@@ -1810,6 +2738,7 @@ class MooncakeKVSender(CommonKVSender):
                 kv_indices,
                 index_slice,
                 False,
+                token_position_offset=token_position_offset,
                 trace_ctx=self.trace_ctx.copy_for_thread(),
             )
         else:
@@ -1820,6 +2749,7 @@ class MooncakeKVSender(CommonKVSender):
                 True,
                 aux_index=self.aux_index,
                 state_indices=state_indices,
+                token_position_offset=token_position_offset,
                 trace_ctx=self.trace_ctx.copy_for_thread(),
             )
         self._record_transfer_indices(kv_indices, state_indices)
@@ -1910,6 +2840,9 @@ class MooncakeKVReceiver(CommonKVReceiver):
             dst_tp_rank = str(tp_rank).encode("ascii")
             dst_attn_tp_size = str(self.kv_mgr.attn_tp_size).encode("ascii")
             dst_kv_item_len = str(kv_item_len).encode("ascii")
+            enable_hisparse = b"1" if self.kv_mgr.server_args.enable_hisparse else b"0"
+            dst_dcp_size = str(self.kv_mgr.dcp_size).encode("ascii")
+            dst_dcp_rank = str(self.kv_mgr.dcp_rank).encode("ascii")
             if (
                 self.kv_mgr.enable_staging
                 and self.kv_mgr._staging_ctx.allocator is not None
@@ -1937,6 +2870,9 @@ class MooncakeKVReceiver(CommonKVReceiver):
                         dst_kv_item_len,
                         packed_state_item_lens,
                         packed_state_dim_per_tensor,
+                        enable_hisparse,
+                        dst_dcp_size,
+                        dst_dcp_rank,
                         packed_staging_base_ptr,
                         staging_total_size_str,
                     ]

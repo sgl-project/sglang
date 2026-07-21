@@ -48,6 +48,7 @@ from sglang.kernels.ops.kvcache.kv_indices import (
 from sglang.kernels.ops.kvcache.rope_cache import (
     fused_qk_rope_reshape_and_cache as fused_qk_rope_reshape_and_cache,
 )
+from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.utils import is_cuda
 
 _is_cuda = is_cuda()
@@ -183,6 +184,331 @@ def concat_mla_absorb_q_general(q_nope, q_rope):
     else:
         return torch.cat([q_nope, q_rope], dim=-1)
 
+
+# ---------------------------------------------------------------------------
+# Decode Context Parallel (DCP) helpers.
+#
+# Not part of upstream main (PR #26000 centralized the other Triton utility
+# kernels into triton_ops/*). These three live here because they are DCP-only:
+#   - create_triton_kv_indices_for_dcp_triton: per-rank local KV indices
+#   - get_dcp_lens: per-rank visible KV length
+#   - cp_lse_ag_out_rs: merge DCP partial attention via natural-log LSE
+# ---------------------------------------------------------------------------
+@triton.jit
+def create_triton_kv_indices_for_dcp_triton(
+    req_to_token_ptr,  # [max_batch, max_context_len]
+    req_pool_indices_ptr,
+    dcp_kernel_lens_ptr,
+    kv_indptr,
+    kv_start_idx,
+    kv_indices_ptr,
+    req_to_token_ptr_stride: tl.constexpr,
+    dcp_size: tl.constexpr,
+    dcp_rank: tl.constexpr,
+):
+    BLOCK_SIZE: tl.constexpr = 512
+    pid = tl.program_id(axis=0)
+    req_pool_index = tl.load(req_pool_indices_ptr + pid)
+    kv_indices_offset = tl.load(kv_indptr + pid)
+
+    kv_start = 0
+    if kv_start_idx:
+        kv_start = tl.load(kv_start_idx + pid).to(tl.int32)
+
+    # First absolute token position in this range owned by dcp_rank.
+    # Triton follows C-style remainder for negative values, so avoid
+    # computing the offset as a negative remainder when kv_start > dcp_rank.
+    kv_start_mod = kv_start % dcp_size
+    first = kv_start + ((dcp_rank + dcp_size - kv_start_mod) % dcp_size)
+    local_len = tl.load(dcp_kernel_lens_ptr + pid).to(tl.int32)
+
+    num_loop = tl.cdiv(local_len, BLOCK_SIZE)
+    for i in range(num_loop):
+        offset = tl.arange(0, BLOCK_SIZE).to(tl.int64) + i * BLOCK_SIZE
+        mask = offset < local_len
+        abs_pos = first + offset * dcp_size
+        data = tl.load(
+            req_to_token_ptr + req_pool_index * req_to_token_ptr_stride + abs_pos,
+            mask=mask,
+        )
+        tl.store(
+            kv_indices_ptr + kv_indices_offset + offset, data // dcp_size, mask=mask
+        )
+
+
+def get_dcp_lens(
+    lens: torch.Tensor,
+    dcp_size: int,
+    dcp_rank: int,
+    start: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if dcp_size == 1:
+        return lens
+    if start is None:
+        return lens // dcp_size + (dcp_rank < lens % dcp_size)
+
+    first = start + torch.remainder(dcp_rank - start, dcp_size)
+    remaining = start + lens - first
+    return torch.clamp((remaining + dcp_size - 1) // dcp_size, min=0)
+
+
+def cp_lse_ag_out_rs(
+    cp_attn_out: torch.Tensor,
+    cp_attn_lse: torch.Tensor,
+    cp_group: GroupCoordinator,
+    return_lse: bool = False,
+):
+    """Merge DCP partial attention outputs using natural-log LSE."""
+    if cp_group.world_size == 1:
+        return (cp_attn_out, cp_attn_lse) if return_lse else cp_attn_out
+
+    cp_attn_lse = cp_attn_lse.contiguous()
+    lses = cp_group.all_gather(cp_attn_lse, dim=0).view(
+        (cp_group.world_size,) + cp_attn_lse.shape
+    )
+    global_lse = torch.logsumexp(lses, dim=0)
+    scale = torch.exp(cp_attn_lse - global_lse).unsqueeze(-1)
+    scale = torch.nan_to_num(scale, nan=0.0, posinf=0.0, neginf=0.0)
+
+    out = torch.nan_to_num(cp_attn_out, nan=0.0, posinf=0.0, neginf=0.0) * scale
+    out = cp_group.all_reduce(out)
+
+    cp_num_heads = global_lse.shape[1] // cp_group.world_size
+    cp_rank = cp_group.rank_in_group
+    head_start = cp_num_heads * cp_rank
+    head_end = cp_num_heads * (cp_rank + 1)
+    out = out[:, head_start:head_end, :].contiguous()
+    if return_lse:
+        return out, global_lse[:, head_start:head_end].contiguous()
+    return out
+
+
+@triton.jit
+def _dcp_lse_pack_for_reduce_scatter_kernel(
+    out_ptr,
+    lses_ptr,
+    packed_ptr,
+    global_lse_ptr,
+    out_stride_B,
+    out_stride_H,
+    out_stride_D,
+    lses_stride_N,
+    lses_stride_B,
+    lses_stride_H,
+    packed_stride_B,
+    packed_stride_H,
+    packed_stride_D,
+    global_lse_stride_B,
+    global_lse_stride_H,
+    rank,
+    N: tl.constexpr,
+    N_ROUNDED: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    LOCAL_HEADS: tl.constexpr,
+):
+    batch_idx = tl.program_id(0).to(tl.int64)
+    head_idx = tl.program_id(1).to(tl.int64)
+    rank_offsets = tl.arange(0, N_ROUNDED)
+    lse_offsets = (
+        rank_offsets * lses_stride_N
+        + batch_idx * lses_stride_B
+        + head_idx * lses_stride_H
+    )
+    lses = tl.load(
+        lses_ptr + lse_offsets, mask=rank_offsets < N, other=-float("inf")
+    )
+    lses = tl.where(
+        (lses != lses) | (lses == float("inf")), -float("inf"), lses
+    )
+
+    lse_max = tl.max(lses, axis=0)
+    lse_max = tl.where(lse_max == -float("inf"), 0.0, lse_max)
+    global_lse = tl.log(tl.sum(tl.exp(lses - lse_max), axis=0)) + lse_max
+    tl.store(
+        global_lse_ptr
+        + batch_idx * global_lse_stride_B
+        + head_idx * global_lse_stride_H,
+        global_lse,
+    )
+
+    local_lse = tl.load(
+        lses_ptr
+        + rank * lses_stride_N
+        + batch_idx * lses_stride_B
+        + head_idx * lses_stride_H
+    )
+    lse_diff = local_lse - global_lse
+    lse_diff = tl.where(
+        (lse_diff != lse_diff) | (lse_diff == float("inf")),
+        -float("inf"),
+        lse_diff,
+    )
+    scale = tl.exp(lse_diff)
+
+    d_offsets = tl.arange(0, HEAD_DIM)
+    out_offsets = (
+        batch_idx * out_stride_B
+        + head_idx * out_stride_H
+        + d_offsets * out_stride_D
+    )
+    output = tl.load(out_ptr + out_offsets).to(tl.float32)
+    output = tl.where(
+        (output != output)
+        | (output == float("inf"))
+        | (output == -float("inf")),
+        0.0,
+        output,
+    )
+
+    destination = head_idx // LOCAL_HEADS
+    local_head = head_idx - destination * LOCAL_HEADS
+    packed_batch = destination * tl.num_programs(0) + batch_idx
+    packed_offsets = (
+        packed_batch * packed_stride_B
+        + local_head * packed_stride_H
+        + d_offsets * packed_stride_D
+    )
+    tl.store(packed_ptr + packed_offsets, output * scale)
+
+
+def cp_lse_ag_out_reduce_scatter(
+    cp_attn_out: torch.Tensor,
+    cp_attn_lse: torch.Tensor,
+    cp_group: GroupCoordinator,
+    return_lse: bool = False,
+):
+    """Merge DCP partial attention outputs with LSE AG and output RS."""
+    if cp_group.world_size == 1:
+        return (cp_attn_out, cp_attn_lse) if return_lse else cp_attn_out
+
+    if cp_attn_out.ndim != 3 or cp_attn_lse.ndim != 2:
+        raise ValueError(
+            "DCP reduce-scatter LSE merge expects output [T, H, D] and "
+            f"LSE [T, H], got {tuple(cp_attn_out.shape)=}, "
+            f"{tuple(cp_attn_lse.shape)=}"
+        )
+    if cp_attn_out.shape[:2] != cp_attn_lse.shape:
+        raise ValueError(
+            "DCP reduce-scatter LSE merge output/LSE shape mismatch: "
+            f"{tuple(cp_attn_out.shape)=}, {tuple(cp_attn_lse.shape)=}"
+        )
+
+    world_size = cp_group.world_size
+    num_tokens, total_heads, head_dim = cp_attn_out.shape
+    if total_heads % world_size != 0:
+        raise ValueError(
+            "DCP reduce-scatter LSE merge requires the full head dimension "
+            f"to be divisible by world size, got {total_heads=} and "
+            f"{world_size=}"
+        )
+
+    cp_attn_lse = cp_attn_lse.contiguous()
+    lses = cp_group.all_gather(cp_attn_lse, dim=0).view(
+        (world_size,) + cp_attn_lse.shape
+    )
+    local_heads = total_heads // world_size
+    packed_out = torch.empty(
+        (world_size * num_tokens, local_heads, head_dim),
+        dtype=torch.float32,
+        device=cp_attn_out.device,
+    )
+    global_lse = torch.empty_like(cp_attn_lse, dtype=torch.float32)
+    _dcp_lse_pack_for_reduce_scatter_kernel[(num_tokens, total_heads)](
+        cp_attn_out,
+        lses,
+        packed_out,
+        global_lse,
+        cp_attn_out.stride(0),
+        cp_attn_out.stride(1),
+        cp_attn_out.stride(2),
+        lses.stride(0),
+        lses.stride(1),
+        lses.stride(2),
+        packed_out.stride(0),
+        packed_out.stride(1),
+        packed_out.stride(2),
+        global_lse.stride(0),
+        global_lse.stride(1),
+        cp_group.rank_in_group,
+        N=world_size,
+        N_ROUNDED=triton.next_power_of_2(world_size),
+        HEAD_DIM=head_dim,
+        LOCAL_HEADS=local_heads,
+    )
+    out = cp_group.reduce_scatter_along_dim(packed_out, dim=0)
+    if return_lse:
+        head_start = local_heads * cp_group.rank_in_group
+        head_end = head_start + local_heads
+        return out, global_lse[:, head_start:head_end].contiguous()
+    return out
+
+
+def cp_lse_a2a_out_rs(
+    cp_attn_out: torch.Tensor,
+    cp_attn_lse: torch.Tensor,
+    cp_group: GroupCoordinator,
+    return_lse: bool = False,
+):
+    """Merge DCP partial attention with head-chunk all-to-all exchange.
+
+    Each rank computes all query heads over its local KV shard. Rank ``d`` only
+    needs head chunk ``d`` from every source rank, so exchange the per-rank
+    chunks first and merge them locally. This is equivalent to
+    ``cp_lse_ag_out_rs`` but avoids materializing and reducing all heads on
+    every rank.
+    """
+    if cp_group.world_size == 1:
+        return (cp_attn_out, cp_attn_lse) if return_lse else cp_attn_out
+
+    if cp_attn_out.ndim != 3 or cp_attn_lse.ndim != 2:
+        raise ValueError(
+            "DCP all-to-all LSE merge expects output [T, H, D] and "
+            f"LSE [T, H], got {tuple(cp_attn_out.shape)=}, "
+            f"{tuple(cp_attn_lse.shape)=}"
+        )
+    if cp_attn_out.shape[:2] != cp_attn_lse.shape:
+        raise ValueError(
+            "DCP all-to-all LSE merge output/LSE shape mismatch: "
+            f"{tuple(cp_attn_out.shape)=}, {tuple(cp_attn_lse.shape)=}"
+        )
+
+    world_size = cp_group.world_size
+    total_heads = cp_attn_out.shape[1]
+    if total_heads % world_size != 0:
+        raise ValueError(
+            "DCP all-to-all LSE merge requires the full head dimension to be "
+            f"divisible by world size, got {total_heads=} and {world_size=}"
+        )
+
+    local_heads = total_heads // world_size
+    # all_to_all_single splits the first dimension by destination rank. Move
+    # the logical [T, destination_head_chunk, ...] dimension to the front.
+    out_send = (
+        cp_attn_out.contiguous()
+        .view(cp_attn_out.shape[0], world_size, local_heads, cp_attn_out.shape[2])
+        .permute(1, 0, 2, 3)
+        .contiguous()
+    )
+    lse_send = (
+        cp_attn_lse.contiguous()
+        .view(cp_attn_lse.shape[0], world_size, local_heads)
+        .permute(1, 0, 2)
+        .contiguous()
+    )
+
+    out_recv = torch.empty_like(out_send)
+    lse_recv = torch.empty_like(lse_send)
+    cp_group.all_to_all_single(out_recv, out_send)
+    cp_group.all_to_all_single(lse_recv, lse_send)
+
+    global_lse = torch.logsumexp(lse_recv, dim=0)
+    scale = torch.exp(lse_recv - global_lse.unsqueeze(0)).unsqueeze(-1)
+    scale = torch.nan_to_num(scale, nan=0.0, posinf=0.0, neginf=0.0)
+    out = torch.nan_to_num(out_recv, nan=0.0, posinf=0.0, neginf=0.0)
+    out = (out * scale).sum(dim=0)
+    if return_lse:
+        return out, global_lse.contiguous()
+    return out
 
 @triton.jit
 def reshape_and_cache_flash(

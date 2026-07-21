@@ -66,10 +66,12 @@ def _jit_main_k_norm_rope_flashmla_module(
 
 @cache_once
 def _jit_main_q_indexer_rope_hadamard_quant_module(dtype: torch.dtype):
-    """C4 indexer Q kernel: RoPE + 128-pt Hadamard + fp8 act-quant"""
-    args = make_cpp_args(dtype, is_arch_support_pdl())
+    """C4 indexer Q kernel: RoPE + 128-pt Hadamard + fp8 act-quant."""
+    # This kernel runs in target-verify CUDA graph warmup for DSV4 MTP. PDL has
+    # shown illegal accesses there on H20, so keep this small Q path non-PDL.
+    args = make_cpp_args(dtype, False)
     return load_jit(
-        make_name("main_q_indexer_rope_hadamard_quant"),
+        make_name("main_q_indexer_rope_hadamard_quant_no_pdl"),
         *args,
         cuda_files=["deepseek_v4/main_norm_rope.cuh"],
         cuda_wrappers=[

@@ -1388,10 +1388,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         for tokenized_obj in tokenized_objs:
             tokenized_obj.wrap_pickle_fields()
 
+        rids = [tokenized_obj.rid for tokenized_obj in tokenized_objs]
         if isinstance(tokenized_objs[0], TokenizedGenerateReqInput):
-            batch_req = BatchTokenizedGenerateReqInput(batch=tokenized_objs)
+            batch_req = BatchTokenizedGenerateReqInput(batch=tokenized_objs, rids=rids)
         else:
-            batch_req = BatchTokenizedEmbeddingReqInput(batch=tokenized_objs)
+            batch_req = BatchTokenizedEmbeddingReqInput(batch=tokenized_objs, rids=rids)
 
         self._dispatch_to_scheduler(batch_req)
         for tokenized_obj, time_stat in zip(tokenized_objs, time_stats):
@@ -3293,3 +3294,5 @@ def stamp_http_worker_ipc(obj: Any, ipc_name: str) -> None:
             req.http_worker_ipc = ipc_name
     elif isinstance(obj, BaseBatchReq):
         obj.http_worker_ipcs = [ipc_name] * len(obj.rids)
+        for request in getattr(obj, "batch", ()):
+            request.http_worker_ipc = ipc_name

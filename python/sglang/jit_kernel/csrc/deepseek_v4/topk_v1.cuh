@@ -1,7 +1,7 @@
-#include <sgl_kernel/tensor.h>
-#include <sgl_kernel/utils.h>
+#include <sgl_kernel/tensor.h>  // For TensorMatcher and symbolic tensor metadata
+#include <sgl_kernel/utils.h>   // For RuntimeCheck
 
-#include <sgl_kernel/utils.cuh>
+#include <sgl_kernel/utils.cuh>  // For LaunchKernel, PDL helpers, and SGL_DEVICE
 
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
@@ -29,6 +29,42 @@ struct TopKParams {
   const int64_t page_table_stride;
   uint32_t page_bits;
 };
+
+struct DCPTopKCandidateParams {
+  const float* __restrict__ scores;
+  const int32_t* __restrict__ seq_lens;
+  int64_t* __restrict__ candidates;
+  int64_t score_stride;
+  uint32_t page_bits;
+  uint32_t dcp_size;
+  uint32_t dcp_rank;
+};
+
+struct DCPTopKMergeParams {
+  const int64_t* __restrict__ candidates;
+  const int32_t* __restrict__ seq_lens;
+  const int32_t* __restrict__ page_table;
+  int32_t* __restrict__ page_indices;
+  int32_t* __restrict__ raw_indices;
+  int64_t page_table_stride;
+  uint32_t batch_size;
+  uint32_t page_bits;
+  uint32_t dcp_size;
+};
+
+SGL_DEVICE int64_t pack_candidate(float score, int32_t raw_index) {
+  const uint64_t score_bits = static_cast<uint64_t>(__float_as_uint(score));
+  const uint64_t index_bits = static_cast<uint32_t>(raw_index);
+  return static_cast<int64_t>((score_bits << 32) | index_bits);
+}
+
+SGL_DEVICE float unpack_candidate_score(int64_t candidate) {
+  return __uint_as_float(static_cast<uint64_t>(candidate) >> 32);
+}
+
+SGL_DEVICE int32_t unpack_candidate_index(int64_t candidate) {
+  return static_cast<int32_t>(static_cast<uint32_t>(candidate));
+}
 
 SGL_DEVICE uint8_t convert_to_uint8(float x) {
   __half h = __float2half_rn(x);
@@ -262,6 +298,85 @@ __global__ void topk_transform_kernel(const __grid_constant__ TopKParams params)
   device::PDLTriggerSecondary<kUsePDL>();
 }
 
+template <bool kUsePDL>
+__global__ void dcp_topk_candidates_kernel(const __grid_constant__ DCPTopKCandidateParams params) {
+  const uint32_t work_id = blockIdx.x;
+  const uint32_t tx = threadIdx.x;
+  const uint32_t seq_len = params.seq_lens[work_id];
+  const auto score_ptr = params.scores + work_id * params.score_stride;
+  const auto candidate_ptr = params.candidates + work_id * kTopK;
+
+  device::PDLWaitPrimary<kUsePDL>();
+
+  uint32_t local_raw = tx;
+  bool valid = tx < seq_len;
+  if (seq_len > kTopK) {
+    __shared__ int32_t s_topk_indices[kTopK];
+    radix_topk(score_ptr, s_topk_indices, seq_len);
+    local_raw = s_topk_indices[tx];
+    valid = true;
+  }
+
+  if (tx < kTopK) {
+    int32_t global_raw = -1;
+    float score = __int_as_float(static_cast<int>(0xff800000u));
+    if (valid) {
+      const uint32_t page = local_raw >> params.page_bits;
+      const uint32_t offset = local_raw & ((1u << params.page_bits) - 1u);
+      global_raw = static_cast<int32_t>(
+          (((page * params.dcp_size) + params.dcp_rank) << params.page_bits) | offset);
+      score = score_ptr[local_raw];
+    }
+    candidate_ptr[tx] = pack_candidate(score, global_raw);
+  }
+
+  device::PDLTriggerSecondary<kUsePDL>();
+}
+
+template <bool kUsePDL, uint32_t kDCPSize>
+__global__ void dcp_topk_merge_kernel(const __grid_constant__ DCPTopKMergeParams params) {
+  static_assert(kDCPSize == 2 || kDCPSize == 4 || kDCPSize == 8);
+  constexpr uint32_t kCandidateCount = kDCPSize * kTopK;
+  const uint32_t work_id = blockIdx.x;
+  const uint32_t tx = threadIdx.x;
+  const uint32_t seq_len = params.seq_lens[work_id];
+  const auto page_ptr = params.page_table + work_id * params.page_table_stride;
+  const auto page_indices_ptr = params.page_indices + work_id * kTopK;
+  const auto raw_indices_ptr = params.raw_indices != nullptr ? params.raw_indices + work_id * kTopK : nullptr;
+
+  __shared__ float s_candidate_scores[kCandidateCount];
+  __shared__ int32_t s_candidate_raw[kCandidateCount];
+  __shared__ int32_t s_topk_indices[kTopK];
+
+  device::PDLWaitPrimary<kUsePDL>();
+
+  for (uint32_t candidate_id = tx; candidate_id < kCandidateCount; candidate_id += kTopKBlockSize) {
+    const uint32_t rank = candidate_id / kTopK;
+    const uint32_t local_id = candidate_id % kTopK;
+    const auto candidate = params.candidates[(rank * params.batch_size + work_id) * kTopK + local_id];
+    s_candidate_scores[candidate_id] = unpack_candidate_score(candidate);
+    s_candidate_raw[candidate_id] = unpack_candidate_index(candidate);
+  }
+  __syncthreads();
+
+  if (seq_len <= kTopK) {
+    if (tx < seq_len) {
+      page_indices_ptr[tx] = page_to_indices(page_ptr, tx, params.page_bits);
+      if (raw_indices_ptr != nullptr) raw_indices_ptr[tx] = tx;
+    } else {
+      page_indices_ptr[tx] = -1;
+      if (raw_indices_ptr != nullptr) raw_indices_ptr[tx] = -1;
+    }
+  } else {
+    radix_topk(s_candidate_scores, s_topk_indices, kCandidateCount);
+    const auto raw_index = s_candidate_raw[s_topk_indices[tx]];
+    page_indices_ptr[tx] = page_to_indices(page_ptr, raw_index, params.page_bits);
+    if (raw_indices_ptr != nullptr) raw_indices_ptr[tx] = raw_index;
+  }
+
+  device::PDLTriggerSecondary<kUsePDL>();
+}
+
 template <auto* f, size_t kMaxDynamicSMEM>
 void setup_kernel_smem_once(host::DebugInfo where = {}) {
   [[maybe_unused]]
@@ -275,6 +390,15 @@ void setup_kernel_smem_once(host::DebugInfo where = {}) {
 template <bool kUsePDL>
 struct TopKKernel {
   static constexpr auto kernel = topk_transform_kernel<kUsePDL>;
+  static constexpr auto candidate_kernel = dcp_topk_candidates_kernel<kUsePDL>;
+
+  template <uint32_t kDCPSize>
+  static void launch_merge_kernel(const DCPTopKMergeParams& params, uint32_t batch_size, DLDevice device) {
+    constexpr auto merge_kernel = dcp_topk_merge_kernel<kUsePDL, kDCPSize>;
+    constexpr auto kSMEM_ = kSMEM + sizeof(int32_t);
+    setup_kernel_smem_once<merge_kernel, kSMEM_>();
+    host::LaunchKernel(batch_size, kTopKBlockSize, device, kSMEM_).enable_pdl(kUsePDL)(merge_kernel, params);
+  }
 
   static void transform(
       const tvm::ffi::TensorView scores,
@@ -334,6 +458,127 @@ struct TopKKernel {
     constexpr auto kSMEM_ = kSMEM + sizeof(int32_t);  // align up a little
     setup_kernel_smem_once<kernel, kSMEM_>();
     LaunchKernel(batch_size, kTopKBlockSize, device.unwrap(), kSMEM_).enable_pdl(kUsePDL)(kernel, params);
+  }
+
+  static void candidates(
+      const tvm::ffi::TensorView scores,
+      const tvm::ffi::TensorView seq_lens,
+      const tvm::ffi::TensorView candidates,
+      const uint32_t page_size,
+      const uint32_t dcp_size,
+      const uint32_t dcp_rank) {
+    using namespace host;
+    auto B = SymbolicSize{"batch_size"};
+    auto S = SymbolicSize{"score_stride"};
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+
+    TensorMatcher({B, -1})  // strided scores
+        .with_strides({S, 1})
+        .with_dtype<float>()
+        .with_device(device)
+        .verify(scores);
+    TensorMatcher({B})  // contiguous local sequence lengths
+        .with_dtype<int32_t>()
+        .with_device(device)
+        .verify(seq_lens);
+    TensorMatcher({B, kTopK})  // packed score/index payload
+        .with_dtype<int64_t>()
+        .with_device(device)
+        .verify(candidates);
+
+    RuntimeCheck(std::has_single_bit(page_size), "page_size must be power of 2");
+    RuntimeCheck(
+        dcp_size == 2 || dcp_size == 4 || dcp_size == 8,
+        "DCP candidate path requires dcp_size in {2, 4, 8}");
+    RuntimeCheck(dcp_rank < dcp_size, "dcp_rank must be smaller than dcp_size");
+    const auto params = DCPTopKCandidateParams{
+        .scores = static_cast<const float*>(scores.data_ptr()),
+        .seq_lens = static_cast<const int32_t*>(seq_lens.data_ptr()),
+        .candidates = static_cast<int64_t*>(candidates.data_ptr()),
+        .score_stride = S.unwrap(),
+        .page_bits = static_cast<uint32_t>(std::countr_zero(page_size)),
+        .dcp_size = dcp_size,
+        .dcp_rank = dcp_rank,
+    };
+    constexpr auto kSMEM_ = kSMEM + sizeof(int32_t);
+    setup_kernel_smem_once<candidate_kernel, kSMEM_>();
+    LaunchKernel(B.unwrap(), kTopKBlockSize, device.unwrap(), kSMEM_)
+        .enable_pdl(kUsePDL)(candidate_kernel, params);
+  }
+
+  static void merge_dcp_candidates(
+      const tvm::ffi::TensorView candidates,
+      const tvm::ffi::TensorView seq_lens,
+      const tvm::ffi::TensorView page_table,
+      const tvm::ffi::TensorView page_indices,
+      const uint32_t page_size,
+      const uint32_t dcp_size,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> raw_indices) {
+    using namespace host;
+    auto B = SymbolicSize{"batch_size"};
+    auto P = SymbolicSize{"page_table_stride"};
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+
+    TensorMatcher({B})
+        .with_dtype<int32_t>()
+        .with_device(device)
+        .verify(seq_lens);
+    TensorMatcher({B, -1})
+        .with_strides({P, 1})
+        .with_dtype<int32_t>()
+        .with_device(device)
+        .verify(page_table);
+    TensorMatcher({B, kTopK})
+        .with_dtype<int32_t>()
+        .with_device(device)
+        .verify(page_indices);
+    TensorMatcher({-1, kTopK})
+        .with_dtype<int64_t>()
+        .with_device(device)
+        .verify(candidates);
+
+    int32_t* raw_indices_ptr = nullptr;
+    if (raw_indices.has_value()) {
+      TensorMatcher({B, kTopK})
+          .with_dtype<int32_t>()
+          .with_device(device)
+          .verify(raw_indices.value());
+      raw_indices_ptr = static_cast<int32_t*>(raw_indices.value().data_ptr());
+    }
+
+    RuntimeCheck(std::has_single_bit(page_size), "page_size must be power of 2");
+    RuntimeCheck(
+        dcp_size == 2 || dcp_size == 4 || dcp_size == 8,
+        "DCP candidate merge requires dcp_size in {2, 4, 8}");
+    RuntimeCheck(
+        candidates.size(0) == B.unwrap() * dcp_size,
+        "invalid gathered candidate shape");
+    const auto params = DCPTopKMergeParams{
+        .candidates = static_cast<const int64_t*>(candidates.data_ptr()),
+        .seq_lens = static_cast<const int32_t*>(seq_lens.data_ptr()),
+        .page_table = static_cast<const int32_t*>(page_table.data_ptr()),
+        .page_indices = static_cast<int32_t*>(page_indices.data_ptr()),
+        .raw_indices = raw_indices_ptr,
+        .page_table_stride = P.unwrap(),
+        .batch_size = static_cast<uint32_t>(B.unwrap()),
+        .page_bits = static_cast<uint32_t>(std::countr_zero(page_size)),
+        .dcp_size = dcp_size,
+    };
+    switch (dcp_size) {
+      case 2:
+        launch_merge_kernel<2>(params, B.unwrap(), device.unwrap());
+        break;
+      case 4:
+        launch_merge_kernel<4>(params, B.unwrap(), device.unwrap());
+        break;
+      case 8:
+        launch_merge_kernel<8>(params, B.unwrap(), device.unwrap());
+        break;
+      default:
+        Panic("unsupported dcp_size: ", dcp_size);
+    }
   }
 };
 

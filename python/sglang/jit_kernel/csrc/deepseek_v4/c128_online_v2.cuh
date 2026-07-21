@@ -732,6 +732,7 @@ struct OnlinePrefillStage1Params {
   const int32_t* __restrict__ req_to_token;      // (num_reqs, max_tokens)
   int64_t stride_r2t;
   int32_t state_slot_offset;
+  uint32_t active_bs;
   uint32_t num_c;
   uint32_t num_w;
 };
@@ -746,6 +747,10 @@ __global__ void plan_c128_online_prefill_kernel(const OnlinePrefillStage1Params 
   auto plan = *plan_ptr;
   if (plan.is_invalid()) return;
   const auto batch_id = plan.read_page_0;
+  if (batch_id >= params.active_bs) {
+    *plan_ptr = CompressPlan::invalid();
+    return;
+  }
   const auto rid = params.req_pool_indices[batch_id];
   const int32_t main_slot = static_cast<int32_t>(rid);
   plan.read_page_0 = main_slot + params.state_slot_offset;
@@ -765,7 +770,8 @@ inline OnlinePrefillPlan plan_online_prefill(
     const tvm::ffi::TensorView plan_c_dev_,
     const tvm::ffi::TensorView plan_w_dev_,
     const int32_t state_slot_offset,
-    const bool use_cuda_graph) {
+    const bool use_cuda_graph,
+    const int32_t active_bs) {
   auto B = SymbolicSize{"batch_size"};
   auto N = SymbolicSize{"num_q_tokens"};
   auto cpu = SymbolicDevice{};
@@ -797,6 +803,8 @@ inline OnlinePrefillPlan plan_online_prefill(
       .verify(plan_c_dev_)
       .verify(plan_w_dev_);
   RuntimeCheck(state_slot_offset >= 0);
+  RuntimeCheck(active_bs >= 0);
+  RuntimeCheck(active_bs <= B.unwrap());
 
   const auto stage0_params = OnlinePrefillStage0Params{
       .plan_c = static_cast<CompressPlan*>(plan_c_pin.data_ptr()),
@@ -913,6 +921,7 @@ inline OnlinePrefillPlan plan_online_prefill(
         .req_to_token = static_cast<const int32_t*>(req_to_token.data_ptr()),
         .stride_r2t = req_to_token.stride(0),
         .state_slot_offset = state_slot_offset,
+        .active_bs = static_cast<uint32_t>(active_bs),
         .num_c = num_c_padded,
         .num_w = num_w_padded,
     };
