@@ -25,9 +25,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
-_LITETOPK_OK = (
-    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 10
-)
+_LITETOPK_OK = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 10
 requires_sm100 = pytest.mark.skipif(
     not _LITETOPK_OK, reason="LiteTopk requires CUDA SM100 (Blackwell)."
 )
@@ -117,9 +115,9 @@ def _check_topk_indices(out_idx, scores, valid, topk, eps_rel=1e-3):
         sel = out_idx[r]
         sel_valid = sel[sel >= 0]
         # count: exactly min(topk, n_valid) selected, rest -1 padded
-        assert sel_valid.numel() == expect, (
-            f"row {r}: selected {sel_valid.numel()}, expected {expect}"
-        )
+        assert (
+            sel_valid.numel() == expect
+        ), f"row {r}: selected {sel_valid.numel()}, expected {expect}"
         assert (sel[expect:] == -1).all(), f"row {r}: padding must be -1"
         # no duplicates, all causally valid
         uniq = torch.unique(sel_valid)
@@ -139,9 +137,9 @@ def _check_topk_indices(out_idx, scores, valid, topk, eps_rel=1e-3):
         # every index strictly above kth + eps is selected
         must = torch.nonzero(row_scores > kth + eps).flatten()
         missing = ~torch.isin(must, sel_valid.long())
-        assert not missing.any(), (
-            f"row {r}: {int(missing.sum())} strictly-above-threshold indices missing"
-        )
+        assert (
+            not missing.any()
+        ), f"row {r}: {int(missing.sum())} strictly-above-threshold indices missing"
 
 
 @requires_sm100
@@ -152,6 +150,11 @@ def _check_topk_indices(out_idx, scores, valid, topk, eps_rel=1e-3):
         ([(16, 8192), (16, 24576), (8, 4096)], 2048),  # multi-request ragged
         ([(32, 32768)], 512),
         ([(8, 1024)], 2048),  # short rows: valid < topk -> -1 padding
+        # Alignment regression: kv_len < sample_len and not a multiple of 4
+        # gives the calibration sample logits an odd row stride, which the
+        # seed kernel's float4 row loads only tolerate via the -inf width
+        # padding; 9+5 rows also exercises the ragged final q-block padding.
+        ([(9, 4099), (5, 1023)], 512),
     ],
 )
 def test_litetopk_matches_reference(req_specs, topk):
