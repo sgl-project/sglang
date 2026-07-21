@@ -185,6 +185,14 @@ export const benchmarks = [
   },
   {
     match: { hw: "gb200", variant: "flash", quant: "fp4", strategy: "balanced", nodes: "single" },
+    sglang_version: "0.5.12.post1",
+    latencyPercentile: "Mean",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 64 },
+        ttft_ms: 2560, tpot_ms: 39.71, tokens_per_sec_per_gpu: 3078 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 256 },
+        ttft_ms: 3995, tpot_ms: 82.56, tokens_per_sec_per_gpu: 6462 },
+    ],
   },
   {
     match: { hw: "gb200", variant: "flash", quant: "fp4", strategy: "high-throughput", nodes: "single" },
