@@ -36,7 +36,7 @@ export const benchmarks = [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1024 },
         ttft_ms: 16199, tpot_ms: 293.2, tokens_per_sec_per_gpu: 5175 },
     ],
-    accuracy: { gsm8k_pct: 94.24, aime25_pct: null },
+    accuracy: { gsm8k_pct: 94.24, aime25_pct: 0.654 },
   },
   {
     match: { hw: "h200", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
@@ -58,7 +58,7 @@ export const benchmarks = [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1024 },
         ttft_ms: 19886, tpot_ms: 318.5, tokens_per_sec_per_gpu: 5055 },
     ],
-    accuracy: { gsm8k_pct: 95.00, aime25_pct: null },
+    accuracy: { gsm8k_pct: 95.00, aime25_pct: 0.690 },
   },
   {
     match: { hw: "h200", variant: "default", quant: "int4", strategy: "low-latency", nodes: "single" },
@@ -79,8 +79,6 @@ export const benchmarks = [
   // via enable_thinking-patched sgl-eval. 2026-07-21.
 
   {
-    // BF16 AIME25 at max_tokens 131072 (64000 truncates BF16 heavily); reasoning is
-    // ~2.7× longer than quantized variants and 7.7% of samples still truncate.
     match: { hw: "b300", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" },
     verified: true,
     sglang_version: "0.5.15.post1",
