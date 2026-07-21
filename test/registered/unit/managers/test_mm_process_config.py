@@ -1,3 +1,5 @@
+import os
+import threading
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -64,7 +66,12 @@ class TestMmProcessConfigValidation(unittest.TestCase):
 class TestBaseProcessorConfigExtraction(unittest.TestCase):
     """Verify BaseMultimodalProcessor.__init__ extracts configs from server_args."""
 
-    def _make_processor(self, mm_process_config):
+    def _make_processor(
+        self,
+        mm_process_config,
+        mm_processor_worker_num=0,
+        mm_io_worker_num=0,
+    ):
         """Create a BaseMultimodalProcessor via the real __init__ with mocked deps."""
         from sglang.srt.multimodal.processors.base_processor import (
             BaseMultimodalProcessor,
@@ -72,6 +79,8 @@ class TestBaseProcessorConfigExtraction(unittest.TestCase):
 
         server_args = MagicMock()
         server_args.mm_process_config = mm_process_config
+        server_args.mm_processor_worker_num = mm_processor_worker_num
+        server_args.mm_io_worker_num = mm_io_worker_num
 
         hf_config = MagicMock()
         mock_hf_processor = MagicMock()
@@ -103,6 +112,52 @@ class TestBaseProcessorConfigExtraction(unittest.TestCase):
         self.assertEqual(proc.video_config, {})
         self.assertEqual(proc.audio_config, {})
 
+    def test_model_specific_auto_worker_count_enables_executor(self):
+        from sglang.srt.multimodal.processors.base_processor import (
+            BaseMultimodalProcessor,
+        )
+
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("SGLANG_IO_WORKERS", None)
+            with patch.object(
+                BaseMultimodalProcessor, "auto_mm_processor_worker_num", 4
+            ), patch.object(
+                BaseMultimodalProcessor, "auto_mm_io_worker_num", 16
+            ), patch.object(
+                BaseMultimodalProcessor, "supports_mm_processor_concurrency", True
+            ):
+                proc = self._make_processor({})
+        try:
+            self.assertEqual(proc.mm_processor_worker_num, 4)
+            self.assertEqual(proc.mm_io_worker_num, 16)
+            self.assertIsNotNone(proc.mm_processor_executor)
+        finally:
+            proc.mm_processor_executor.shutdown()
+
+    def test_explicit_single_worker_disables_executor(self):
+        from sglang.srt.multimodal.processors.base_processor import (
+            BaseMultimodalProcessor,
+        )
+
+        with patch.object(BaseMultimodalProcessor, "auto_mm_processor_worker_num", 4):
+            proc = self._make_processor({}, mm_processor_worker_num=1)
+        self.assertEqual(proc.mm_processor_worker_num, 1)
+        self.assertIsNone(proc.mm_processor_executor)
+
+    def test_parallel_workers_require_processor_support(self):
+        proc = self._make_processor({}, mm_processor_worker_num=2)
+        self.assertEqual(proc.mm_processor_worker_num, 1)
+        self.assertIsNone(proc.mm_processor_executor)
+
+    def test_explicit_io_worker_count_overrides_auto(self):
+        from sglang.srt.multimodal.processors.base_processor import (
+            BaseMultimodalProcessor,
+        )
+
+        with patch.object(BaseMultimodalProcessor, "auto_mm_io_worker_num", 16):
+            proc = self._make_processor({}, mm_io_worker_num=6)
+        self.assertEqual(proc.mm_io_worker_num, 6)
+
 
 class TestMultimodalFeatureTransportRuntime(unittest.TestCase):
     @staticmethod
@@ -113,6 +168,8 @@ class TestMultimodalFeatureTransportRuntime(unittest.TestCase):
             disable_fast_image_processor=False,
             skip_tokenizer_init=False,
             mm_process_config={},
+            mm_processor_worker_num=0,
+            mm_io_worker_num=0,
             tokenizer_worker_num=1,
             base_gpu_id=2,
         )
@@ -158,6 +215,100 @@ class TestMultimodalFeatureTransportRuntime(unittest.TestCase):
         self.assertEqual(processor.mm_feature_transport, "cpu")
         self.assertFalse(processor.use_cuda_ipc)
         memory_pool.assert_not_called()
+
+
+class TestMultimodalProcessorConcurrency(unittest.IsolatedAsyncioTestCase):
+    async def test_dedicated_executor_runs_processor_off_event_loop(self):
+        from sglang.srt.multimodal.processors.base_processor import (
+            BaseMultimodalProcessor,
+        )
+        from sglang.srt.multimodal.processors.executor import (
+            MultimodalProcessorExecutor,
+        )
+
+        with patch.object(
+            BaseMultimodalProcessor, "__abstractmethods__", set()
+        ), patch.object(BaseMultimodalProcessor, "__init__", lambda self: None):
+            processor = BaseMultimodalProcessor()
+
+        processor.mm_processor_executor = MultimodalProcessorExecutor(
+            SimpleNamespace(tokenizer=object()), max_workers=2
+        )
+        processor.process_and_combine_mm_data = MagicMock(
+            side_effect=lambda *_args, **_kwargs: threading.current_thread().name
+        )
+        try:
+            thread_name = await processor.process_and_combine_mm_data_async(
+                MagicMock(), MagicMock(), marker=True
+            )
+        finally:
+            processor.mm_processor_executor.shutdown()
+
+        self.assertTrue(thread_name.startswith("sglang-mm-processor"))
+        processor.process_and_combine_mm_data.assert_called_once()
+        self.assertTrue(
+            processor.process_and_combine_mm_data.call_args.kwargs["marker"]
+        )
+
+    async def test_single_worker_preserves_synchronous_path(self):
+        from sglang.srt.multimodal.processors.base_processor import (
+            BaseMultimodalProcessor,
+        )
+
+        with patch.object(
+            BaseMultimodalProcessor, "__abstractmethods__", set()
+        ), patch.object(BaseMultimodalProcessor, "__init__", lambda self: None):
+            processor = BaseMultimodalProcessor()
+
+        processor.mm_processor_executor = None
+        processor.process_and_combine_mm_data = MagicMock(return_value="synchronous")
+
+        result = await processor.process_and_combine_mm_data_async(
+            MagicMock(), MagicMock()
+        )
+
+        self.assertEqual(result, "synchronous")
+        processor.process_and_combine_mm_data.assert_called_once()
+
+    async def test_worker_reuses_precreated_private_processor_clone(self):
+        from sglang.srt.multimodal.processors.executor import (
+            MultimodalProcessorExecutor,
+        )
+
+        executor = MultimodalProcessorExecutor(object(), max_workers=2)
+        return_processor = lambda *, processor: processor
+        try:
+            first = await executor.run(return_processor)
+            second = await executor.run(return_processor)
+        finally:
+            executor.shutdown()
+
+        self.assertIs(first, second)
+
+    async def test_replacement_worker_lazily_clones_processor(self):
+        from sglang.srt.multimodal.processors import executor as executor_module
+
+        source_processor = object()
+        replacement_clone = SimpleNamespace(tokenizer=object())
+        with patch.object(
+            executor_module.copy,
+            "deepcopy",
+            return_value=replacement_clone,
+        ) as deepcopy:
+            executor = executor_module.MultimodalProcessorExecutor(
+                source_processor, max_workers=2
+            )
+            executor._processor_clones.clear()
+            return_processor = lambda *, processor: processor
+            try:
+                first = await executor.run(return_processor)
+                second = await executor.run(return_processor)
+            finally:
+                executor.shutdown()
+
+        self.assertIs(first, replacement_clone)
+        self.assertIs(first, second)
+        self.assertEqual(deepcopy.call_count, 3)
 
 
 class TestProcessMmDataKwargs(unittest.TestCase):
@@ -440,6 +591,8 @@ class TestDoubleBosGuard(unittest.TestCase):
 
         server_args = MagicMock()
         server_args.mm_process_config = {}
+        server_args.mm_processor_worker_num = 0
+        server_args.mm_io_worker_num = 0
         server_args.mm_feature_transport = "cpu"
         server_args.disable_fast_image_processor = True
         server_args.keep_mm_feature_on_device = True
