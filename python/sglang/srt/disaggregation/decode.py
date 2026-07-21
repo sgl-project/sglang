@@ -47,6 +47,9 @@ from sglang.srt.disaggregation.decode_hicache_mixin import (
     HiCacheRestoreGatedKVReceiver,
     HiCacheRestoreResult,
 )
+from sglang.srt.disaggregation.scheduler_disaggregation_init import (
+    SchedulerDisaggregationInitMixin,
+)
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     KVClassType,
@@ -2474,7 +2477,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         pass
 
 
-class SchedulerDisaggregationDecodeMixin:
+class SchedulerDisaggregationDecodeMixin(SchedulerDisaggregationInitMixin):
     @torch.no_grad()
     def event_loop_normal_disagg_decode(self: Scheduler):
         """A normal scheduler loop for decode worker in disaggregation mode."""
