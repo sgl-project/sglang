@@ -1579,6 +1579,8 @@ class DeepseekSparseAttnBackend(
                 used_fused_metadata_generation = True
 
             if not used_fused_metadata_generation:
+                # See target-verify note: fill on-device to avoid the blocking
+                # pageable H2D from torch.tensor(list, device=cuda).
                 extend_seq_lens = torch.full(
                     (bs,),
                     self.speculative_num_draft_tokens,
