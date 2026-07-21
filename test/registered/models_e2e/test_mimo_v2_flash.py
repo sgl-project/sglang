@@ -1,6 +1,7 @@
 import unittest
 
 from sglang.srt.environ import envs
+from sglang.srt.utils import is_blackwell
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.kits.spec_decoding_kit import SpecDecodingMixin
@@ -23,7 +24,7 @@ class TestMiMoV2Flash(GSM8KMixin, SpecDecodingMixin, DefaultServerBase):
         "--enable-dp-attention",
         "--trust-remote-code",
         "--attention-backend",
-        "fa3",
+        "fa4" if is_blackwell() else "fa3",
         "--max-running-requests",
         "128",
         "--cuda-graph-max-bs-decode",
