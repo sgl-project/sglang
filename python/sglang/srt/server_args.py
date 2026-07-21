@@ -3516,7 +3516,12 @@ class ServerArgs:
             "max_bs",
         ) in self._cuda_graph_config_locked:
             return
-        clamped = [8, 32, 128, 256, 512]
+        # Powers of two: worst-case padding is bounded at 2x in every
+        # interval, and small buckets (where BCG replays concentrate) get
+        # the most resolution. All entries are multiples of 8 (see
+        # _align_prefill_buckets_for_deepep_bcg). Steady-state capture cost
+        # is ~0.8 s/bucket, so the finer ladder adds ~2 s of startup.
+        clamped = [8, 16, 32, 64, 128, 256, 512]
         self.cuda_graph_config.prefill.bs = clamped
         self.cuda_graph_config.prefill.max_bs = clamped[-1]
         logger.info(
