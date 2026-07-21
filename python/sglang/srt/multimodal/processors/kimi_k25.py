@@ -349,16 +349,11 @@ class KimiGPUProcessorWrapper:
 
     def _prepare_input_ids(self, input_text, resize_configs, original_input_ids):
         if original_input_ids is not None:
-            try:
-                return _expand_image_token_ids(
-                    original_input_ids,
-                    self._image_token_id,
-                    [config["num_tokens"] for config in resize_configs],
-                )
-            except ValueError:
-                # Preserve the existing processor behavior for malformed or
-                # model-specific placeholder layouts.
-                pass
+            return _expand_image_token_ids(
+                original_input_ids,
+                self._image_token_id,
+                [config["num_tokens"] for config in resize_configs],
+            )
 
         parts = input_text.split(self._image_token)
         result = [parts[0]]

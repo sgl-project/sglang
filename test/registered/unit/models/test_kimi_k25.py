@@ -99,6 +99,19 @@ def test_kimi_processors_precompute_hash_before_cpu_transfer():
     assert KimiK3ImageProcessor.precompute_hash_before_cpu_transfer
 
 
+def test_kimi_gpu_wrapper_rejects_placeholder_count_mismatch():
+    wrapper = object.__new__(KimiGPUProcessorWrapper)
+    wrapper._image_token = "<|media_pad|>"
+    wrapper._image_token_id = 42
+
+    with pytest.raises(ValueError, match="Expected 2 image placeholder token"):
+        wrapper._prepare_input_ids(
+            "<|media_pad|>",
+            [{"num_tokens": 4}, {"num_tokens": 4}],
+            [1, 42, 2],
+        )
+
+
 def test_kimi_k3_builds_grid_metadata_on_cpu_from_resize_config():
     config = {
         "new_height": 224,
