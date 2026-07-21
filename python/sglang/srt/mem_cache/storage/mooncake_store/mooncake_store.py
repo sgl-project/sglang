@@ -478,7 +478,20 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 if self.config.enable_ssd_offload:
                     setup_kwargs["enable_ssd_offload"] = True
                 if self.config.ssd_offload_path is not None:
-                    setup_kwargs["ssd_offload_path"] = self.config.ssd_offload_path
+                    # Each rank embeds its own Mooncake client. Sharing one
+                    # offload directory corrupts silently: bucket ids are
+                    # generated per process and resumed from the same startup
+                    # scan after a restart, and bucket files are opened with
+                    # O_CREAT|O_TRUNC, so a filename collision truncates
+                    # another rank's bucket. Give every rank a private subdir.
+                    ssd_offload_path = self.config.ssd_offload_path
+                    if storage_config is not None:
+                        ssd_offload_path = os.path.join(
+                            ssd_offload_path,
+                            f"rank_{storage_config.tp_rank}_{storage_config.pp_rank}",
+                        )
+                    os.makedirs(ssd_offload_path, exist_ok=True)
+                    setup_kwargs["ssd_offload_path"] = ssd_offload_path
 
                 while True:
                     try:
