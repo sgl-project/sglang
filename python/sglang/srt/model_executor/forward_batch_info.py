@@ -1452,7 +1452,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 spec_info.num_accept_tokens = self._pad_tensor_to_size(
                     spec_info.num_accept_tokens, bs
                 )
-            # STANDALONE uses independent draft, thereby having no hidden_states.
             if spec_info.hidden_states is not None:
                 spec_info.hidden_states = self._pad_tensor_to_size(
                     spec_info.hidden_states, num_tokens

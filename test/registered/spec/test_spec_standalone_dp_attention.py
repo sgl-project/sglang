@@ -2,7 +2,6 @@ import unittest
 from types import SimpleNamespace
 
 import requests
-import torch
 
 from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
@@ -25,18 +24,10 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=120, stage="extra-b", runner_config="4-gpu-h100")
 register_amd_ci(est_time=200, suite="stage-c-test-4-gpu-amd")
 
-# Measured 0.945 (dp) / 0.960 (non-dp) on Qwen3-30B-A3B.
+# Measured 0.950 (dp) / 0.945 (non-dp) on Qwen3-30B-A3B + Qwen3-0.6B.
 GSM8K_ACCURACY_FLOOR = 0.90
 # Measured ~3.93 on GSM8K (triton); margin for fa3 backend drift.
 SPEC_ACCEPT_LENGTH_FLOOR = 3.5
-
-
-def _select_attention_backend() -> str:
-    """Pick a backend the local GPU supports so the test runs both in CI and locally."""
-    if is_in_amd_ci():
-        return "triton"
-    major = torch.cuda.get_device_capability()[0]
-    return "fa3" if major in (8, 9) else "triton"
 
 
 class TestStandaloneSpecDPAttention(CustomTestCase):
@@ -62,7 +53,7 @@ class TestStandaloneSpecDPAttention(CustomTestCase):
             "4",
             "--enable-dp-attention",
             "--attention-backend",
-            _select_attention_backend(),
+            "triton" if is_in_amd_ci() else "fa3",
             "--mem-fraction-static",
             "0.75",
             "--cuda-graph-max-bs-decode",
@@ -110,7 +101,7 @@ class TestStandaloneSpecDPAttention(CustomTestCase):
         self.assertGreater(metrics["score"], GSM8K_ACCURACY_FLOOR)
         self.assertGreater(avg_spec_accept_length, SPEC_ACCEPT_LENGTH_FLOOR)
 
-    def test_b_bs1_no_hang(self):
+    def test_b_bs1_acc_length(self):
         args = BenchArgs(port=int(self.base_url.split(":")[-1]), max_new_tokens=256)
         acc_length, speed = send_one_prompt(args)
         print(f"{acc_length=:.2f} {speed=:.2f} token/s")
@@ -122,7 +113,7 @@ class TestStandaloneSpecDPAttention(CustomTestCase):
                 f"{speed=:.2f} token/s\n"
             )
         # Speed is printed for visibility, not asserted (hardware-dependent).
-        self.assertGreater(acc_length, 1.0)
+        self.assertGreater(acc_length, 3.0)
 
 
 if __name__ == "__main__":
