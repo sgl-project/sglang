@@ -162,19 +162,19 @@ export const benchmarks = [
     sglang_version: "0.5.15.post1",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
-        ttft_ms: 190, tpot_ms: 2.83, tokens_per_sec_per_gpu: 731 },
+        ttft_ms: 187, tpot_ms: 2.83, tokens_per_sec_per_gpu: 729 },
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 16 },
-        ttft_ms: 205, tpot_ms: 5.42, tokens_per_sec_per_gpu: 5173 },
+        ttft_ms: 410, tpot_ms: 7.68, tokens_per_sec_per_gpu: 3407 },
     ],
   },
   {
     match: { hw: "b300", variant: "pro", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
-    sglang_version: "0.5.15",
+    sglang_version: "0.5.15.post1",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
-        ttft_ms: 210, tpot_ms: 4.13, tokens_per_sec_per_gpu: 251 },
+        ttft_ms: 206, tpot_ms: 4.14, tokens_per_sec_per_gpu: 251 },
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 16 },
-        ttft_ms: 266, tpot_ms: 11.28, tokens_per_sec_per_gpu: 1289 },
+        ttft_ms: 425, tpot_ms: 10.51, tokens_per_sec_per_gpu: 1256 },
     ],
   },
   // ====================================================================
@@ -364,12 +364,12 @@ export const benchmarks = [
   },
   {
     match: { hw: "h200", variant: "pro", quant: "fp4", strategy: "high-throughput", nodes: "single" },
-    sglang_version: "0.5.15",
+    sglang_version: "0.5.15.post1",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1024 },
-        ttft_ms: 925656, tpot_ms: 69.39, tokens_per_sec_per_gpu: 572 },
+        ttft_ms: 889185, tpot_ms: 66.39, tokens_per_sec_per_gpu: 594 },
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 4096 },
-        ttft_ms: 1899200, tpot_ms: 68.99, tokens_per_sec_per_gpu: 570 },
+        ttft_ms: 1833386, tpot_ms: 65.86, tokens_per_sec_per_gpu: 601 },
     ],
   },
   // ====================================================================
