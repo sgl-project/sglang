@@ -1,7 +1,7 @@
 ---
 title: "GLM-5.2"
 metatags:
-  description: "Deploy GLM-5.2 model with SGLang on Ascend NPUs, including single-node and multi-node deployment modes."
+  description: "Deploy GLM-5.2 model with SGLang on Ascend NPUs, including single-node, multi-node, and PD disaggregation modes."
 ---
 
 ## Introduction
@@ -26,8 +26,8 @@ multi-node deployment, prefill-decode disaggregation, feature configuration, and
 | Expert Parallelism            | `--ep-size 16 \`<br/>`--moe-a2a-backend deepep \`<br/>`--deepep-mode auto`         |
 | PD Disaggregation             | `--disaggregation-mode prefill \`<br/>`--disaggregation-transfer-backend ascend`  |
 | Quantization                  | `--quantization modelslim`                                                        |
-| Chunked Prefill               | auto based on device memory, or set explicit value;<br/>disable with `--chunked-prefill-size -1`; e.g. `--chunked-prefill-size 16384` |
-| NPU Graph                     | enabled by default; disable with `--disable-cuda-graph`;<br/>control range via `--cuda-graph-bs` or `--cuda-graph-max-bs`; e.g. `--cuda-graph-bs 16` |
+| Chunked Prefill               | auto based on device memory, or set explicit value;<br/>disable with `--chunked-prefill-size -1`; e.g., `--chunked-prefill-size 16384` |
+| NPU Graph                     | enabled by default; disable with `--disable-cuda-graph`;<br/>control range via `--cuda-graph-bs` or `--cuda-graph-max-bs`; e.g., `--cuda-graph-bs 16` |
 | Speculative Decoding          | `--speculative-algorithm NEXTN \`<br/>`--speculative-num-steps 3 \`<br/>`--speculative-eagle-topk 1 \`<br/>`--speculative-num-draft-tokens 4 \`<br/>`--speculative-draft-model-quantization unquant` |
 | Overlap Schedule              | `export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`                                      |
 | DP LM Head                    | `--enable-dp-lm-head`                                                             |
@@ -52,24 +52,29 @@ Before following this tutorial, complete the environment setup in the documents 
   It walks you through launching the official container image, starting the SGLang server, and sending a test request.
   Recommended if you are new to SGLang on Ascend.
 - [SGLang Installation with NPU Support](/docs/hardware-platforms/ascend-npus/ascend_npu) — the full installation guide.
-  It covers the component version mapping (CANN, PyTorch adapter, Triton, kernels, etc.), building from source or from a
+  It covers the component version mapping (CANN, TorchNPU, Triton, kernels, etc.), building from source or from a
   Dockerfile, and recommended system settings (CPU power scheme, NUMA, swap). Use it when you need to install or customize
   the environment instead of using the official image.
 
 ### Model weights
 
-<Warning>
-If you need to download model weights, check the model size before downloading to reserve enough space.
-</Warning>
+Before downloading model weights, check the model size to reserve enough disk space.
+For multi-node deployment, download the weights to a shared directory accessible to all nodes.
 
-- [GLM-5.2](https://huggingface.co/collections/zai-org/glm-52) (BF16)
-- [GLM-5.2-w8a8](https://www.modelscope.cn/models/Eco-Tech/GLM-5.2-w8a8/) (Quantized version without MTP)
+- [GLM-5.2](https://www.modelscope.cn/models/ZhipuAI/GLM-5.2) (BF16, 1.51TB)
+- [GLM-5.2-w8a8](https://www.modelscope.cn/models/Eco-Tech/GLM-5.2-w8a8/) (Quantized version without MTP, 774.08GB)
 - You can use [msmodelslim](https://gitcode.com/Ascend/msmodelslim) to quantize the model naively.
 
-Ensure the available device memory exceeds the model weight size before deployment. For optimal throughput and latency,
-refer to the [best practice configurations](#best-practices) which may require additional nodes or cards.
+<Info>
+We recommend deploying the W8A8 variant for reduced resource usage and higher throughput.
+It (774.08GB) can be deployed on 16 × 64GB of device memory (`--tp-size 16`), which corresponds to one full A3 node (8 cards, 16 dies) or two A2 nodes.
+</Info>
 
-It is recommended to download the model weights to a shared directory across multiple nodes.
+This is the minimum recommended configuration. For optimized configurations,
+see [Best practices](#best-practices), which may require additional cards or nodes.
+
+For the hardware specifications (memory per die, dies per card, and the difference between A2 and A3),
+see [Ascend NPU Reference — Hardware](/docs/hardware-platforms/ascend-npus/ascend_npu_reference#hardware).
 
 ## Installation
 
@@ -168,10 +173,7 @@ swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.
 
 ### Single-node deployment
 
-Quantized model `GLM-5.2-w8a8` can be deployed on one Atlas 800I A3 node or one Atlas 800I A2 node.
-
-<Tabs>
-  <Tab title="Atlas 800I A3">
+Quantized model `GLM-5.2-w8a8` can be deployed on one Atlas 800I A3 node.
 
 Run the following script to execute online inference.
 
@@ -232,67 +234,6 @@ python3 -m sglang.launch_server \
         --speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4  \
         --moe-a2a-backend deepep --deepep-mode auto
 ```
-
-  </Tab>
-  <Tab title="Atlas 800I A2">
-
-Run the following script to execute online inference.
-
-```shell
-# ============================================================
-# Before running, update the following variables:
-#   MODEL_PATH: path to the model weights directory
-# ============================================================
-
-export SGLANG_SET_CPU_AFFINITY=1
-
-unset https_proxy
-unset http_proxy
-unset HTTPS_PROXY
-unset HTTP_PROXY
-unset ASCEND_LAUNCH_BLOCKING
-# cann
-source /usr/local/Ascend/ascend-toolkit/set_env.sh
-source /usr/local/Ascend/nnal/atb/set_env.sh
-
-export STREAMS_PER_DEVICE=32
-export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
-
-export HCCL_BUFFSIZE=1000
-export HCCL_SOCKET_IFNAME=lo
-export GLOO_SOCKET_IFNAME=lo
-export TRANSFORMERS_VERBOSITY=error
-
-#DEEPEP
-export DEEPEP_NORMAL_LONG_SEQ_ROUND=72
-export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=1024
-export DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ=1
-
-MODEL_PATH=/path/to/model-weights
-
-python3 -m sglang.launch_server \
-        --model-path $MODEL_PATH \
-        --attention-backend ascend \
-        --device npu \
-        --tp-size 8 \
-        --nnodes 1 \
-        --dp-size 1 \
-        --enable-dp-attention \
-        --chunked-prefill-size -1 \
-        --max-prefill-tokens 65536 \
-        --trust-remote-code \
-        --mem-fraction-static 0.9 \
-        --served-model-name glm-5 \
-        --cuda-graph-bs 8 \
-        --max-running-requests 102 \
-        --quantization modelslim \
-        --speculative-draft-model-quantization unquant \
-        --moe-a2a-backend deepep --deepep-mode auto \
-        --load-balance-method round_robin
-```
-
-  </Tab>
-</Tabs>
 
 ### Multi-node deployment
 

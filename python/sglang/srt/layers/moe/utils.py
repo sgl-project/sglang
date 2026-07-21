@@ -103,6 +103,7 @@ class MoeRunnerBackend(Enum):
     CUTLASS = "cutlass"
     MARLIN = "marlin"
     HUMMING = "humming"
+    EXPERIMENTAL_SGL_MARLIN = "experimental_sgl_marlin"
     AITER = "aiter"
 
     def is_auto(self):
@@ -147,7 +148,16 @@ class MoeRunnerBackend(Enum):
         return self == MoeRunnerBackend.CUTLASS
 
     def is_marlin(self):
-        return self == MoeRunnerBackend.MARLIN
+        # experimental_sgl_marlin shares the marlin weight repack, quant-method
+        # selection, and base fused path; divergent sites (the LoRA MoE dispatch)
+        # check is_experimental_sgl_marlin() first.
+        return self in (
+            MoeRunnerBackend.MARLIN,
+            MoeRunnerBackend.EXPERIMENTAL_SGL_MARLIN,
+        )
+
+    def is_experimental_sgl_marlin(self):
+        return self == MoeRunnerBackend.EXPERIMENTAL_SGL_MARLIN
 
     def is_humming(self):
         return self == MoeRunnerBackend.HUMMING
@@ -477,6 +487,8 @@ def should_skip_post_experts_all_reduce(*, is_tp_path: bool) -> bool:
     for the post-experts TP all-reduce, ``False`` for the EP all-reduce.
     """
     if should_skip_mlp_all_reduce():
+        return True
+    if get_server_args().dwdp_size > 1:
         return True
     if should_use_dp_reduce_scatterv():
         return True

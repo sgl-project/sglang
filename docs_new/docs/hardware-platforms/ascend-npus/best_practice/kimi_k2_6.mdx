@@ -535,7 +535,7 @@ python -m sglang_router.launch_router \
 
 We tested it based on the `generated-shared-prefix` dataset with 90% cache hit (`repeat_rate = 0.9`):
 `--gsp-system-prompt-len 115200` = `int(128000 * 0.9)` is the shared prefix portion.
-`--gsp-question-len 12799` = `int(128000 * (1 - 0.9))` is the unique per-request suffix.
+`--gsp-question-len 12800` = `int(128000 * (1 - 0.9))` is the unique per-request suffix.
 `--gsp-num-groups 1` keeps all requests in one prefix group for maximum cache reuse.
 
 ```bash Command
@@ -547,7 +547,7 @@ python -m sglang.bench_serving \
     --gsp-num-groups 1 \
     --gsp-prompts-per-group 4 \
     --gsp-system-prompt-len 115200 \
-    --gsp-question-len 12799 \
+    --gsp-question-len 12800 \
     --gsp-output-len 1000 \
     --max-concurrency 1 \
     --num-prompts 4 \
@@ -926,7 +926,7 @@ python -m sglang_router.launch_router \
 
 We tested it based on the `generated-shared-prefix` dataset with 90% cache hit (`repeat_rate = 0.9`):
 `--gsp-system-prompt-len 57600` = `int(64000 * 0.9)` is the shared prefix portion.
-`--gsp-question-len 6399` = `int(64000 * (1 - 0.9))` is the unique per-request suffix.
+`--gsp-question-len 6400` = `int(64000 * (1 - 0.9))` is the unique per-request suffix.
 `--gsp-num-groups 1` keeps all requests in one prefix group for maximum cache reuse.
 
 ```bash Command
@@ -938,7 +938,7 @@ python -m sglang.bench_serving \
     --gsp-num-groups 1 \
     --gsp-prompts-per-group 8 \
     --gsp-system-prompt-len 57600 \
-    --gsp-question-len 6399 \
+    --gsp-question-len 6400 \
     --gsp-output-len 1500 \
     --max-concurrency 2 \
     --num-prompts 8 \
