@@ -89,15 +89,13 @@ def _logits_topk(logits: torch.Tensor, k: int):
     radix select at LLM vocab sizes) but breaks value ties in
     implementation-defined order rather than lowest-index-first.
     """
-    if logits.is_cuda and is_flashinfer_available():
-        import flashinfer
+    if not logits.is_cuda:
+        return torch.topk(logits, k=k, dim=-1, sorted=True)
+    import flashinfer
 
-        values, indices = flashinfer.top_k(
-            logits, k=k, sorted=False, deterministic=True
-        )
-        order = values.argsort(dim=-1, descending=True)
-        return values.gather(-1, order), indices.gather(-1, order)
-    return torch.topk(logits, k=k, dim=-1, sorted=True)
+    values, indices = flashinfer.top_k(logits, k=k, sorted=False, deterministic=True)
+    order = values.argsort(dim=-1, descending=True)
+    return values.gather(-1, order), indices.gather(-1, order)
 
 
 def get_top_logprobs_raw(
@@ -440,6 +438,12 @@ class InputLogprobProcessor:
         # compute logprobs from logits + logsumexp, skipping the full-vocab
         # log-softmax materialization
         self.enable_fast_input_logprobs = envs.SGLANG_ENABLE_FAST_INPUT_LOGPROBS.get()
+        if self.enable_fast_input_logprobs and torch.cuda.is_available():
+            assert is_flashinfer_available(), (
+                "The fast input-logprob path requires flashinfer for top-k; "
+                "set SGLANG_ENABLE_FAST_INPUT_LOGPROBS=0 to use the "
+                "log-softmax path."
+            )
 
     def forward(
         self,
