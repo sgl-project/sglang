@@ -884,6 +884,8 @@ class FlashInferTrtllmFp4MoeQuantInfo(MoeQuantInfo):
     routing_method_type: int
     use_per_token_activation: bool = False
 
+    gemm1_alpha: Optional[torch.Tensor] = None
+    gemm1_beta: Optional[torch.Tensor] = None
     gemm1_clamp_limit: Optional[torch.Tensor] = None
 
 
@@ -1045,8 +1047,8 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             gemm1_weights=quant_info.w13_weight,
             gemm1_weights_scale=quant_info.w13_weight_scale.view(torch.float8_e4m3fn),
             gemm1_bias=None,
-            gemm1_alpha=None,
-            gemm1_beta=None,
+            gemm1_alpha=quant_info.gemm1_alpha,
+            gemm1_beta=quant_info.gemm1_beta,
             gemm1_clamp_limit=quant_info.gemm1_clamp_limit,
             gemm2_weights=quant_info.w2_weight,
             gemm2_weights_scale=quant_info.w2_weight_scale.view(torch.float8_e4m3fn),
@@ -1086,8 +1088,8 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             gemm1_weights=quant_info.w13_weight,
             gemm1_weights_scale=quant_info.w13_weight_scale.view(torch.float8_e4m3fn),
             gemm1_bias=None,
-            gemm1_alpha=None,
-            gemm1_beta=None,
+            gemm1_alpha=quant_info.gemm1_alpha,
+            gemm1_beta=quant_info.gemm1_beta,
             gemm1_clamp_limit=quant_info.gemm1_clamp_limit,
             gemm2_weights=quant_info.w2_weight,
             gemm2_weights_scale=quant_info.w2_weight_scale.view(torch.float8_e4m3fn),
