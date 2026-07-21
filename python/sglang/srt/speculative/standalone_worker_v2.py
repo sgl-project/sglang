@@ -64,8 +64,8 @@ class StandaloneDraftWorker(EagleDraftWorker):
         )
 
         # Load draft model weights only.
-        # Under DP attention, the draft is a dense model that runs in the attention
-        # TP group, instead of the global TP group.
+        # Under DP attention, the dense draft runs in the attention-TP group, with one
+        # replica per DP rank, rather than in the global TP group.
         ctx = (
             draft_tp_context(get_parallel().attn_tp_group)
             if server_args.enable_dp_attention
