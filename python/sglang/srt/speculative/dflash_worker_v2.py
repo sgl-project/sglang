@@ -640,6 +640,77 @@ class DFlashWorkerV2(BaseSpecWorker):
         lens = host_seq_lens.to(dtype=torch.int64, device="cpu")
         out.copy_(torch.clamp(lens, max=bound).to(torch.int32))
 
+    def _fill_compact_seq_lens_cpu_bound(
+        self,
+        *,
+        batch_seq_lens_cpu: Optional[torch.Tensor],
+        reserved_seq_lens_cpu: Optional[torch.Tensor],
+        draft_prefix_lens: torch.Tensor,
+        out: torch.Tensor,
+    ) -> None:
+        """Fill the seq_lens_cpu planning bound, sync-free when a host-side
+        length source is available; backends consume it as a safe upper bound
+        (same contract as the non-compact path in forward_batch_generation)."""
+        if batch_seq_lens_cpu is not None:
+            self._compute_compact_draft_seq_lens_host(batch_seq_lens_cpu, out=out)
+        elif reserved_seq_lens_cpu is not None:
+            self._compute_compact_draft_seq_lens_host(reserved_seq_lens_cpu, out=out)
+        else:
+            # Last resort: the legacy blocking D2H copy.
+            out.copy_(draft_prefix_lens)
+
+    def _rebuild_compact_draft_cache(
+        self,
+        *,
+        req_pool_indices: torch.Tensor,
+        prefix_lens: torch.Tensor,
+        draft_prefix_lens: torch.Tensor,
+        verify_out_cache_loc_2d: torch.Tensor,
+        bs: int,
+        block_size: int,
+    ) -> None:
+        """Write the draft-local compact req->token rows: the committed suffix
+        window at [0, draft_prefix_len) plus the verify block slots after it."""
+        suffix_start = prefix_lens.to(torch.int64) - draft_prefix_lens.to(torch.int64)
+        if self._use_triton_compact_rebuild:
+            rebuild_compact_draft_req_to_token_func(
+                draft_req_to_token=self.draft_model_runner.req_to_token_pool.req_to_token,
+                target_req_to_token=self.model_runner.req_to_token_pool.req_to_token,
+                req_pool_indices=req_pool_indices,
+                suffix_start=suffix_start,
+                draft_prefix_lens=draft_prefix_lens,
+                verify_out_cache_loc_2d=verify_out_cache_loc_2d,
+                batch_size=bs,
+                block_size=block_size,
+            )
+        else:
+            suffix_cache_loc = self._gather_req_to_token_segments(
+                req_to_token=self.model_runner.req_to_token_pool.req_to_token,
+                req_pool_indices=req_pool_indices,
+                start=suffix_start,
+                lengths=draft_prefix_lens,
+            )
+            assign_req_to_token_pool_func(
+                req_pool_indices,
+                self.draft_model_runner.req_to_token_pool.req_to_token,
+                torch.zeros_like(draft_prefix_lens),
+                draft_prefix_lens,
+                suffix_cache_loc,
+                bs,
+            )
+
+            assert self._draft_block_end_buf is not None
+            block_end = self._draft_block_end_buf[:bs]
+            torch.add(draft_prefix_lens, block_size, out=block_end)
+            assign_req_to_token_pool_func(
+                req_pool_indices,
+                self.draft_model_runner.req_to_token_pool.req_to_token,
+                draft_prefix_lens,
+                block_end,
+                verify_out_cache_loc_2d.reshape(-1),
+                bs,
+            )
+
     def _resolve_mask_token_id(
         self, *, mask_token: str, mask_token_id: Optional[int] = None
     ) -> int:
@@ -1488,63 +1559,20 @@ class DFlashWorkerV2(BaseSpecWorker):
         if self.use_compact_draft_cache:
             # Rebuild the draft-local sliding-window view from committed target state.
             draft_prefix_lens = self._compute_compact_draft_seq_lens(prefix_lens)
-
-            # Host planning bound without a device sync; backends consume
-            # seq_lens_cpu as a safe upper bound (same contract as below).
-            if batch.seq_lens_cpu is not None:
-                self._compute_compact_draft_seq_lens_host(
-                    batch.seq_lens_cpu, out=seq_lens_cpu
-                )
-            elif draft_input.reserved_seq_lens_cpu is not None:
-                self._compute_compact_draft_seq_lens_host(
-                    draft_input.reserved_seq_lens_cpu, out=seq_lens_cpu
-                )
-            else:
-                # Last resort: the legacy blocking D2H copy.
-                seq_lens_cpu.copy_(
-                    draft_prefix_lens.to(device="cpu", dtype=torch.int32)
-                )
-
-            suffix_start = prefix_lens.to(torch.int64) - draft_prefix_lens.to(
-                torch.int64
+            self._fill_compact_seq_lens_cpu_bound(
+                batch_seq_lens_cpu=batch.seq_lens_cpu,
+                reserved_seq_lens_cpu=draft_input.reserved_seq_lens_cpu,
+                draft_prefix_lens=draft_prefix_lens,
+                out=seq_lens_cpu,
             )
-            if self._use_triton_compact_rebuild:
-                rebuild_compact_draft_req_to_token_func(
-                    draft_req_to_token=self.draft_model_runner.req_to_token_pool.req_to_token,
-                    target_req_to_token=self.model_runner.req_to_token_pool.req_to_token,
-                    req_pool_indices=batch.req_pool_indices,
-                    suffix_start=suffix_start,
-                    draft_prefix_lens=draft_prefix_lens,
-                    verify_out_cache_loc_2d=verify_out_cache_loc_2d,
-                    batch_size=bs,
-                    block_size=block_size,
-                )
-            else:
-                suffix_cache_loc = self._gather_req_to_token_segments(
-                    req_to_token=self.model_runner.req_to_token_pool.req_to_token,
-                    req_pool_indices=batch.req_pool_indices,
-                    start=suffix_start,
-                    lengths=draft_prefix_lens,
-                )
-                assign_req_to_token_pool_func(
-                    batch.req_pool_indices,
-                    self.draft_model_runner.req_to_token_pool.req_to_token,
-                    torch.zeros_like(draft_prefix_lens),
-                    draft_prefix_lens,
-                    suffix_cache_loc,
-                    bs,
-                )
-
-                block_end = self._draft_block_end_buf[:bs]
-                torch.add(draft_prefix_lens, block_size, out=block_end)
-                assign_req_to_token_pool_func(
-                    batch.req_pool_indices,
-                    self.draft_model_runner.req_to_token_pool.req_to_token,
-                    draft_prefix_lens,
-                    block_end,
-                    verify_out_cache_loc,
-                    bs,
-                )
+            self._rebuild_compact_draft_cache(
+                req_pool_indices=batch.req_pool_indices,
+                prefix_lens=prefix_lens,
+                draft_prefix_lens=draft_prefix_lens,
+                verify_out_cache_loc_2d=verify_out_cache_loc_2d,
+                bs=bs,
+                block_size=block_size,
+            )
             draft_seq_lens = draft_prefix_lens
             draft_seq_lens_sum = int(seq_lens_cpu.sum().item())
         else:

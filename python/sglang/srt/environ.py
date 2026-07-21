@@ -834,9 +834,13 @@ class Envs:
     # Sparse Embeddings
     SGLANG_EMBEDDINGS_SPARSE_HEAD = EnvStr(None)
 
-    # Logits processor
-    SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK = EnvBool(True)
-    SGLANG_LOGITS_PROCESSER_CHUNK_SIZE = EnvInt(2048)
+    # Logprob processor
+    SGLANG_ENABLE_LOGPROB_CHUNK = EnvBoolWithAlias(
+        True, deprecated_name="SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK"
+    )
+    SGLANG_LOGPROB_CHUNK_SIZE = EnvIntWithAlias(
+        2048, deprecated_name="SGLANG_LOGITS_PROCESSER_CHUNK_SIZE"
+    )
 
     # Tool-Call behavior
     SGLANG_TOOL_STRICT_LEVEL = EnvInt(ToolStrictLevel.OFF)

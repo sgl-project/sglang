@@ -1119,7 +1119,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     ),
                 )
 
-    def forward_batch_generation(self, batch: ScheduleBatch, on_publish=None):
+    def forward_batch_generation(
+        self, batch: ScheduleBatch, on_publish=None, grammar_barrier=None
+    ):
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             # Target prefill
             target_capture_mode = (
@@ -1192,7 +1194,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     verify_input: EagleVerifyInput = self.draft_worker.draft(batch)
             assert verify_input.is_verify_input()
             batch.spec_info = verify_input
-            batch_output = self.verify(batch)
+            batch_output = self.verify(batch, grammar_barrier=grammar_barrier)
             # Publish before draft_extend so the fence is at verify-end.
             if on_publish is not None:
                 on_publish(batch_output.new_seq_lens)
@@ -1495,7 +1497,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             )
             dw._rebuild_topk1_chain_buffers()
 
-    def verify(self, batch: ScheduleBatch):
+    def verify(self, batch: ScheduleBatch, grammar_barrier=None):
         return run_eagle_verify(
             batch,
             target_worker=self.target_worker,
@@ -1509,6 +1511,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             device=self.device,
             metadata_ready_pre_pad=False,
             finalize_tree_path=True,
+            grammar_barrier=grammar_barrier,
         )
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
