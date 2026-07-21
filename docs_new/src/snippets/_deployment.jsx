@@ -835,11 +835,11 @@ export const Deployment = ({ config, benchmarks }) => {
   };
 
   const initialSelectionFromCells = () => {
-    const first = config.cells[0];
+    const first = config.defaultSelection ?? config.cells[0]?.match;
     if (!first) return Object.fromEntries(DIMENSIONS.map((d) => [d, ""]));
     return {
-      hw: first.match.hw, variant: first.match.variant, quant: first.match.quant,
-      strategy: first.match.strategy, nodes: first.match.nodes,
+      hw: first.hw, variant: first.variant, quant: first.quant,
+      strategy: first.strategy, nodes: first.nodes,
     };
   };
 

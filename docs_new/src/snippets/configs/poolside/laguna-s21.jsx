@@ -126,6 +126,8 @@ sgl-eval run aime25 \\
     },
   },
 
+  defaultSelection: { hw: "b300", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
+
   cells: [
 
     // ══════════════ H200 (8-GPU HGX, tp 8) ══════════════
