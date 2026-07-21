@@ -68,6 +68,18 @@ _NULL_CONTEXT = nullcontext()
 
 
 @contextmanager
+def _torch_nvtx_range(debug_name: str):
+    # Fallback nvtx emitter bundled with torch: used when the optional `nvtx`
+    # package is not installed (typical in serving containers) but a caller
+    # opted into nvtx via nvtx_enabled (e.g. SGLANG_NVTX_STEP_SPANS).
+    torch.cuda.nvtx.range_push(debug_name)
+    try:
+        yield
+    finally:
+        torch.cuda.nvtx.range_pop()
+
+
+@contextmanager
 def _profile_range_impl(
     debug_name: str, color: Optional[str], record: bool, nvtx_enabled: bool
 ):
@@ -75,9 +87,12 @@ def _profile_range_impl(
         if record:
             stack.enter_context(torch.profiler.record_function(debug_name))
         if nvtx_enabled:
-            if color is None:
-                color = _NVTX_COLOR_MAP.get(debug_name)
-            stack.enter_context(_nvtx_module.annotate(debug_name, color=color))
+            if _nvtx_module is not None:
+                if color is None:
+                    color = _NVTX_COLOR_MAP.get(debug_name)
+                stack.enter_context(_nvtx_module.annotate(debug_name, color=color))
+            else:
+                stack.enter_context(_torch_nvtx_range(debug_name))
         yield
 
 

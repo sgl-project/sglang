@@ -187,6 +187,7 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     enable_show_time_cost,
     get_available_gpu_memory,
+    get_bool_env_var,
     is_host_cpu_arm64,
     is_npu,
     numa_utils,
@@ -209,6 +210,9 @@ from sglang.srt.utils.weight_checker import WeightChecker
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu_arm64 = is_host_cpu_arm64()
+# Emit per-forward nvtx step spans (step[<MODE> bs=N], draft:step[...]) for
+# nsys phase attribution (draft vs verify vs extend). Off-profile default: no-op.
+_NVTX_STEP_SPANS = get_bool_env_var("SGLANG_NVTX_STEP_SPANS")
 
 if _is_npu:
     from sglang.srt.hardware_backend.npu.utils import init_npu_backend
@@ -257,8 +261,12 @@ class ModelRunner:
         self.memory_pool_config = memory_pool_config
         self.device = server_args.device
         self.gpu_id = gpu_id
-        self.dcp_size = server_args.dcp_size
-        self.dcp_rank = ps.tp_rank % self.dcp_size
+        # DCP shards only the TARGET's KV; the draft model (small, its own pool)
+        # must stay unsharded (dcp_size=1) so its KV pool is not scaled/strided.
+        # (Attention-level DCP keys off the global DCP group; the DFlash draft is
+        # non-MLA so it never enters the MLA DCP path.)
+        self.dcp_size = 1 if is_draft_worker else server_args.dcp_size
+        self.dcp_rank = 0 if is_draft_worker else (ps.tp_rank % self.dcp_size)
         self.ps = ps
         self.model_config = model_config
         self.dist_port = nccl_port
@@ -835,6 +843,106 @@ class ModelRunner:
         self.prefill_attention_backend_str = backends.prefill_attention_backend_str
         self.decode_attention_backend_str = backends.decode_attention_backend_str
 
+        # Initialize the FlashInfer MNNVL all-to-all workspace for the fi_a2a
+        # DCP comm backend here — BEFORE cuda-graph capture — because workspace
+        # init synchronizes the stream and issues a cross-rank barrier (neither
+        # is capturable). It also raises early if the platform lacks MNNVL.
+        if (
+            self.server_args.dcp_size > 1
+            and self.server_args.dcp_comm_backend == "fi_a2a"
+        ):
+            from sglang.srt.distributed.parallel_state import get_dcp_group
+            from sglang.srt.layers.dcp import init_fi_a2a_workspace
+
+            init_fi_a2a_workspace(get_dcp_group())
+
+        # Prepare full-head Q-projection weights for --dcp-replicate-q-proj: all
+        # DCP ranks hold only their attn_tp head-shard of q_b_proj / w_kc, so
+        # gather the shards once here (pre-capture) into full-head buffers used by
+        # the MLA decode replicate path (which then skips the per-layer Q
+        # all-gather). bf16/fp16 only; quantized q-proj falls back to all-gather.
+        if self.server_args.dcp_size > 1 and self.server_args.dcp_replicate_q_proj:
+            from sglang.srt.distributed.parallel_state import get_dcp_group
+
+            g = get_dcp_group()
+            if g.world_size > 1:
+                n_prepared = 0
+                for m in self.model.modules():
+                    w_kc = getattr(m, "w_kc", None)
+                    qp = getattr(m, "q_b_proj", None) or getattr(m, "q_proj", None)
+                    if w_kc is None or qp is None or not hasattr(qp, "weight"):
+                        continue
+                    if w_kc.dtype not in (
+                        torch.bfloat16,
+                        torch.float16,
+                    ) or qp.weight.dtype not in (torch.bfloat16, torch.float16):
+                        logger.warning(
+                            "dcp_replicate_q_proj: skipping quantized q-proj/w_kc "
+                            "(bf16/fp16 only); this layer keeps the Q all-gather."
+                        )
+                        continue
+                    # all-gather along the head dim across the DCP group
+                    m.w_kc_qrep = g.all_gather(w_kc.contiguous(), dim=0)
+                    m.q_b_proj_qrep_weight = g.all_gather(
+                        qp.weight.data.contiguous(), dim=0
+                    )
+                    n_prepared += 1
+                logger.info(
+                    "dcp_replicate_q_proj: prepared full-head Q weights for %d "
+                    "MLA layers",
+                    n_prepared,
+                )
+
+        # Initialize the FlashInfer MNNVL all-to-all workspace for the fi_a2a
+        # DCP comm backend here — BEFORE cuda-graph capture — because workspace
+        # init synchronizes the stream and issues a cross-rank barrier (neither
+        # is capturable). It also raises early if the platform lacks MNNVL.
+        if (
+            self.server_args.dcp_size > 1
+            and self.server_args.dcp_comm_backend == "fi_a2a"
+        ):
+            from sglang.srt.distributed.parallel_state import get_dcp_group
+            from sglang.srt.layers.dcp import init_fi_a2a_workspace
+
+            init_fi_a2a_workspace(get_dcp_group())
+
+        # Prepare full-head Q-projection weights for --dcp-replicate-q-proj: all
+        # DCP ranks hold only their attn_tp head-shard of q_b_proj / w_kc, so
+        # gather the shards once here (pre-capture) into full-head buffers used by
+        # the MLA decode replicate path (which then skips the per-layer Q
+        # all-gather). bf16/fp16 only; quantized q-proj falls back to all-gather.
+        if self.server_args.dcp_size > 1 and self.server_args.dcp_replicate_q_proj:
+            from sglang.srt.distributed.parallel_state import get_dcp_group
+
+            g = get_dcp_group()
+            if g.world_size > 1:
+                n_prepared = 0
+                for m in self.model.modules():
+                    w_kc = getattr(m, "w_kc", None)
+                    qp = getattr(m, "q_b_proj", None) or getattr(m, "q_proj", None)
+                    if w_kc is None or qp is None or not hasattr(qp, "weight"):
+                        continue
+                    if w_kc.dtype not in (
+                        torch.bfloat16,
+                        torch.float16,
+                    ) or qp.weight.dtype not in (torch.bfloat16, torch.float16):
+                        logger.warning(
+                            "dcp_replicate_q_proj: skipping quantized q-proj/w_kc "
+                            "(bf16/fp16 only); this layer keeps the Q all-gather."
+                        )
+                        continue
+                    # all-gather along the head dim across the DCP group
+                    m.w_kc_qrep = g.all_gather(w_kc.contiguous(), dim=0)
+                    m.q_b_proj_qrep_weight = g.all_gather(
+                        qp.weight.data.contiguous(), dim=0
+                    )
+                    n_prepared += 1
+                logger.info(
+                    "dcp_replicate_q_proj: prepared full-head Q weights for %d "
+                    "MLA layers",
+                    n_prepared,
+                )
+
     def init_cuda_graphs(self, capture_decode_cuda_graph: bool = True):
         capture = capture_cuda_graphs(
             model_runner=self, capture_decode_cuda_graph=capture_decode_cuda_graph
@@ -1242,6 +1350,8 @@ class ModelRunner:
 
         self.forward_pass_id += 1
 
+        from sglang.srt.layers.dcp import draft_forward_guard
+
         # Try msprob debugger
         if self.msprobe_debugger is not None:
             rank_id = (
@@ -1252,7 +1362,12 @@ class ModelRunner:
             self.msprobe_debugger.start(model=self.model, rank_id=rank_id)
 
         # Step span
-        step_span_ctx = profile_range(build_step_span_name(forward_batch))
+        step_span_name = build_step_span_name(forward_batch)
+        if self.is_draft_worker:
+            # Disambiguate draft-runner forwards (DFlash drafts also run in
+            # TARGET_VERIFY mode) for nsys phase attribution.
+            step_span_name = "draft:" + step_span_name
+        step_span_ctx = profile_range(step_span_name, nvtx_enabled=_NVTX_STEP_SPANS)
 
         canary_ctx = (
             context_tuple(
@@ -1269,6 +1384,9 @@ class ModelRunner:
         with (
             canary_ctx,
             step_span_ctx,
+            # Draft forwards run unsharded (dcp_size=1): disable DCP for their
+            # duration so the draft's (MLA) attention + KV write stay full.
+            draft_forward_guard(self.is_draft_worker),
             get_global_expert_distribution_recorder().with_forward_pass(
                 self.forward_pass_id,
                 forward_batch,

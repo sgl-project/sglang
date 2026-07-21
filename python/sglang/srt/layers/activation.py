@@ -57,12 +57,44 @@ _is_xpu = is_xpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _is_cuda:
-    from sglang.jit_kernel.activation import (
-        gelu_and_mul,
-        gelu_tanh_and_mul,
-        relu2,
-        silu_and_mul,
-    )
+    from sgl_kernel import gelu_and_mul as _sgl_gelu_and_mul
+    from sgl_kernel import gelu_tanh_and_mul as _sgl_gelu_tanh_and_mul
+    from sgl_kernel import silu_and_mul as _sgl_silu_and_mul
+
+    from sglang.jit_kernel.activation import gelu_and_mul as _jit_gelu_and_mul
+    from sglang.jit_kernel.activation import gelu_tanh_and_mul as _jit_gelu_tanh_and_mul
+    from sglang.jit_kernel.activation import relu2
+    from sglang.jit_kernel.activation import silu_and_mul as _jit_silu_and_mul
+
+    # The jit act-and-mul kernels vectorize by kMaxVecBytes (32B on SM100+, else
+    # 16B) and hard-assert that the per-rank hidden size is a multiple of the
+    # vector width. Route shapes that aren't aligned to the general sgl_kernel
+    # kernel (e.g. DeepSeek-V2-Lite dense 10944/8=1368 at tp8, 1368 % 16 != 0).
+    _jit_act_max_vec_bytes: Optional[int] = None
+
+    def _jit_act_supported(out: torch.Tensor) -> bool:
+        global _jit_act_max_vec_bytes
+        if _jit_act_max_vec_bytes is None:
+            from sglang.jit_kernel.utils import get_jit_cuda_arch
+
+            _jit_act_max_vec_bytes = 32 if get_jit_cuda_arch().major >= 10 else 16
+        return out.shape[-1] % (_jit_act_max_vec_bytes // out.dtype.itemsize) == 0
+
+    def _act_and_mul(jit_fn, sgl_fn, input: torch.Tensor, out=None) -> torch.Tensor:
+        if out is None:
+            out = input.new_empty(*input.shape[:-1], input.shape[-1] // 2)
+        (jit_fn if _jit_act_supported(out) else sgl_fn)(input, out)
+        return out
+
+    def silu_and_mul(input: torch.Tensor, out=None) -> torch.Tensor:
+        return _act_and_mul(_jit_silu_and_mul, _sgl_silu_and_mul, input, out)
+
+    def gelu_and_mul(input: torch.Tensor, out=None) -> torch.Tensor:
+        return _act_and_mul(_jit_gelu_and_mul, _sgl_gelu_and_mul, input, out)
+
+    def gelu_tanh_and_mul(input: torch.Tensor, out=None) -> torch.Tensor:
+        return _act_and_mul(_jit_gelu_tanh_and_mul, _sgl_gelu_tanh_and_mul, input, out)
+
 elif _is_xpu:
     from sgl_kernel import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
 elif _is_hip:

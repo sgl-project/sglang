@@ -336,6 +336,43 @@ class Envs:
     # size the KV pool after CUDA-graph capture
     SGLANG_ENABLE_POST_CAPTURE_KV_SIZING = EnvBool(False)
 
+    # DCP verify cascade: fuse the zero-owner mask + a2a-send pack into one
+    # Triton kernel (kernels.dcp_mask_pack_triton). Set to 0 to revert to the
+    # torch.where/.contiguous/pack-copy path for A/B (a2a comm backend only;
+    # fi_a2a always uses the old path).
+    SGLANG_DCP_FUSED_PACK = EnvBool(True)
+    # DCP verify cascade: run the pre-packed a2a on a dedicated side stream so
+    # the NCCL exchange overlaps with pass-2 (the local draft-chain fold). Set
+    # to 0 to serialize on the current stream for A/B. Only effective with
+    # SGLANG_DCP_FUSED_PACK=1.
+    SGLANG_DCP_A2A_OVERLAP = EnvBool(True)
+    # DCP verify cascade pass-1: call the tokenspeed decode kernel WITHOUT the
+    # cp_world/cp_rank/causal_seqs args. Pass-1 is non-causal (causal_mask=
+    # False) and in the tokenspeed fp8 kernel every cp_world / K_causal use
+    # sits inside a `const_expr(is_causal)` branch (the per-token causal
+    # k_bound arithmetic), so under causal_mask=False the cp path is dead code
+    # and the plain variant attends to the identical seq_lens[b]-token local
+    # slice. Set to 0 to revert to the cp_world>1 call for A/B.
+    SGLANG_DCP_PASS1_NO_CP = EnvBool(True)
+    # DCP verify cascade pass-2: fold the T-token draft chain with the tiny
+    # Triton causal-attention kernel (kernels.dcp_pass2_causal_attn_triton)
+    # instead of the full tokenspeed decode kernel, whose launch/tiling floor
+    # dwarfs the actual <=64-token workload. Also skips the per-layer draft
+    # page-pool build (cat + zeros + copy). Set to 0 to revert for A/B.
+    SGLANG_DCP_TRITON_PASS2 = EnvBool(True)
+
+    # DCP verify: SINGLE-CALL CP-causal fold (design candidate B2). One kernel
+    # call over the rank's ENTIRE local slice (owned draft latents included;
+    # the owner-rule KV write earlier in forward_extend is same-stream ordered),
+    # with per-(request, q_tok) causal bounds resolved in GLOBAL coordinates
+    # inside the kernel (causal_seqs = prefix + T). The a2a-combined result is
+    # final: pass-2 and the second combine are skipped. Contract validated
+    # bit-exact by the fp32-reference poison probe (q_len=8, cp_world=8).
+    # Default ON: measured faster than the 2-pass cascade at every point
+    # (DFlash 50K/cc4 8.07 vs 9.18 ms tpot; 128K/cc16 ratio 1.07 -> 1.15) with
+    # AL parity and GSM8K green; 0 reverts to the cascade for A/B.
+    SGLANG_DCP_SINGLE_CALL_VERIFY = EnvBool(True)
+
     # Scheduler: memory leak test
     SGLANG_TEST_RETRACT = EnvBool(False)
     SGLANG_TEST_RETRACT_INTERVAL = EnvInt(3)

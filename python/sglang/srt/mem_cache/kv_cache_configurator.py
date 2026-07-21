@@ -234,6 +234,34 @@ class KVCacheConfigurator:
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
         )
 
+        if (
+            self.is_draft_worker
+            and self.server_args.dcp_size > 1
+            and pools.token_to_kv_pool is not None
+            and pools.token_to_kv_pool_allocator is not None
+        ):
+            # The draft inherits the target's DCP-widened allocator (virtual ids up
+            # to alloc.size + alloc.page_size - 1) while its unsharded pool stays
+            # physical-size, so any slot id past the pool bound trips the
+            # store_kvcache device assert (kvcache.cuh) once the allocator
+            # high-water crosses the physical range (hot allocator: free-list
+            # prepending after long sweeps). Real fix = window-compacted draft slot
+            # mapping; until then, warn loudly at boot.
+            alloc = pools.token_to_kv_pool_allocator
+            alloc_max_id = alloc.size + getattr(alloc, "page_size", 1) - 1
+            pool_bound = pools.token_to_kv_pool.size + self.page_size
+            if alloc_max_id >= pool_bound:
+                logger.warning(
+                    "DCP x spec-decode: draft KV pool covers ids < %d but the "
+                    "shared DCP-widened allocator can issue ids up to %d. "
+                    "Long-running servers WILL hit the store_kvcache bound "
+                    "assert once allocation high-water passes the pool bound "
+                    "(see work-tracker sglang-dflash/docs/findings/"
+                    "dcp-draft-pool-idspace.md).",
+                    pool_bound,
+                    alloc_max_id,
+                )
+
         logger.info(
             f"Memory pool end. "
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
@@ -253,6 +281,30 @@ class KVCacheConfigurator:
 
     def _derive_pool_sizes(self, *, config: MemoryPoolConfig) -> _PoolSizes:
         max_total_num_tokens = config.max_total_num_tokens
+        if (
+            self.is_draft_worker
+            and self.server_args.dcp_size > 1
+            and self.token_to_kv_pool_allocator is not None
+        ):
+            # The draft shares the target's DCP-widened allocator (virtual slot
+            # ids up to alloc.size + alloc.page_size - 1) but stores UNSHARDED
+            # KV, so its pool must cover the full id range; a physical-size
+            # pool trips the store_kvcache bound assert (DFlash bf16 pool) or
+            # an unbounded-write IMA (MLA draft pools) once allocator ids pass
+            # the physical range. The memory is budgeted by the dcp-scaled
+            # draft term in PoolConfigurator, which shrinks the target pool
+            # correspondingly. Bound: pool.size + page_size must exceed the
+            # allocator's max id (alloc.size + alloc.page_size - 1).
+            alloc = self.token_to_kv_pool_allocator
+            widened = alloc.size + getattr(alloc, "page_size", 1) - self.page_size
+            if widened > max_total_num_tokens:
+                logger.info(
+                    "DCP draft worker: widening draft KV pool %d -> %d tokens "
+                    "to cover the shared DCP allocator id space.",
+                    max_total_num_tokens,
+                    widened,
+                )
+                max_total_num_tokens = widened
         max_running_requests = config.max_running_requests
         full_max_total_num_tokens = None
         swa_max_total_num_tokens = None

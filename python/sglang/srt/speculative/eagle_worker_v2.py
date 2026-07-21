@@ -400,9 +400,19 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 f"num_tokens_per_req={self.topk}, bs={capture_bs}, "
                 f"avail mem={before_mem:.2f} GB",
             )
-            self.cuda_graph_runner = Device2DraftCudaGraphRunner[
-                self.target_worker.device
-            ](self)
+            from sglang.srt.layers.dcp import draft_forward_guard
+
+            # Draft graphs must be CAPTURED under the same DCP-disabled state
+            # they will REPLAY under (draft forwards run inside
+            # draft_forward_guard): a capture with dcp_enabled()==True bakes
+            # DCP-branch metadata/block-tables into the graph while replay-prep
+            # takes the non-DCP branch -> capture/replay divergence -> IMA
+            # (graph x DCP x EAGLE-family only; DFlash's non-MLA draft has no
+            # DCP branches).
+            with draft_forward_guard(True):
+                self.cuda_graph_runner = Device2DraftCudaGraphRunner[
+                    self.target_worker.device
+                ](self)
             after_mem = get_available_gpu_memory(self.device, self.gpu_id)
             log_info_on_rank0(
                 logger,
@@ -483,9 +493,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 f"num_tokens_per_req={self.speculative_num_draft_tokens}, "
                 f"bs={capture_bs}, avail mem={before_mem:.2f} GB",
             )
-            self.cuda_graph_runner_for_draft_extend = Device2ExtendCudaGraphRunner[
-                self.target_worker.device
-            ](self)
+            from sglang.srt.layers.dcp import draft_forward_guard
+
+            # Same capture/replay DCP-state contract as the decode graph above.
+            with draft_forward_guard(True):
+                self.cuda_graph_runner_for_draft_extend = Device2ExtendCudaGraphRunner[
+                    self.target_worker.device
+                ](self)
             # draft_extend is the step's last shared-buffer-reading phase; its
             # read-done event is what the scheduler's WAR barrier waits on.
             after_mem = get_available_gpu_memory(self.device, self.gpu_id)
@@ -896,6 +910,18 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         next_token_ids = batch_result.next_token_ids.to(torch.int64)
 
         # Prepare for draft extend in a separate stream
+        if self.plan_stream:
+            # Sibling of the verify-prepare wait above: this plan work reads
+            # batch.seq_lens and predict from the fwd stream.
+            self.plan_stream.wait_stream(
+                torch.get_device_module(self.device).current_stream()
+            )
+        if self.plan_stream:
+            # Sibling of the verify-prepare wait in run_eagle_verify: this plan
+            # work reads batch.seq_lens and predict from the fwd stream.
+            self.plan_stream.wait_stream(
+                torch.get_device_module(self.device).current_stream()
+            )
         with self.plan_stream_ctx:
             forward_batch = prepare_for_draft_extend(
                 draft_extend_input,
