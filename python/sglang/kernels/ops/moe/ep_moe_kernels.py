@@ -1036,7 +1036,10 @@ def _fwd_kernel_ep_scatter_1(
     cumsum = tl.cumsum(tokens_per_expert) - tokens_per_expert
     tl.store(expert_start_loc + offset_cumsum, cumsum, mask=offset_cumsum < num_experts)
 
-    cur_expert_start = tl.load(expert_start_loc + cur_expert)
+    cur_expert_start = tl.sum(
+        tl.where(offset_cumsum < cur_expert, tokens_per_expert, 0),
+        axis=0,
+    )
     cur_expert_token_num = tl.load(num_recv_tokens_per_expert + cur_expert)
 
     m_indices_start_ptr = m_indices + cur_expert_start
