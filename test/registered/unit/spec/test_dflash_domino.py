@@ -203,7 +203,9 @@ class TestDFlashDominoRollout(CustomTestCase):
             dtype=self.dtype,
         )
 
-    def _oracle(self, draft_hidden, verified_ids, shift_label):
+    def _oracle(
+        self, draft_hidden, verified_ids, shift_label, candidate_pool_size=None
+    ):
         num_proposals = draft_hidden.shape[1] - 1
         start = 0 if shift_label else 1
         z = draft_hidden[:, start : start + num_proposals]
@@ -213,11 +215,45 @@ class TestDFlashDominoRollout(CustomTestCase):
         if num_proposals == 1:
             return first_ids[:, None]
 
+        candidate_ids = None
+        candidate_base = None
+        candidate_weight = None
+        if candidate_pool_size is not None:
+            candidate_pool_size = min(candidate_pool_size, self.vocab_size)
+            if 0 < candidate_pool_size < self.vocab_size:
+                feedback_logits = base_logits[:, 1:]
+                candidate_ids = torch.topk(
+                    feedback_logits.amax(dim=1),
+                    k=candidate_pool_size,
+                    dim=-1,
+                    sorted=False,
+                ).indices
+                candidate_base = torch.gather(
+                    feedback_logits,
+                    2,
+                    candidate_ids[:, None, :].expand(-1, num_proposals - 1, -1),
+                )
+                candidate_weight = F.embedding(candidate_ids, self.embed_proj[2].weight)
+
         prefix_ids = torch.cat((verified_ids[:, None], first_ids[:, None]), dim=1)
         _, state = self.prefix_gru(self.embedding(prefix_ids))
         for index in range(1, num_proposals):
-            bias = self.embed_proj(torch.cat((z[:, index], state[0]), dim=-1))
-            next_ids = torch.argmax(base_logits[:, index] + bias, dim=-1)
+            correction_hidden = self.embed_proj[1](
+                self.embed_proj[0](torch.cat((z[:, index], state[0]), dim=-1))
+            )
+            if candidate_ids is None:
+                bias = self.embed_proj[2](correction_hidden)
+                next_ids = torch.argmax(base_logits[:, index] + bias, dim=-1)
+            else:
+                bias = torch.bmm(
+                    candidate_weight, correction_hidden.unsqueeze(-1)
+                ).squeeze(-1)
+                candidate_position = torch.argmax(
+                    candidate_base[:, index - 1] + bias, dim=-1
+                )
+                next_ids = torch.gather(
+                    candidate_ids, 1, candidate_position[:, None]
+                ).squeeze(1)
             output.append(next_ids)
             if index + 1 < num_proposals:
                 _, state = self.prefix_gru(self.embedding(next_ids[:, None]), state)
@@ -259,38 +295,112 @@ class TestDFlashDominoRollout(CustomTestCase):
                         actual[:, 0], first_expected, rtol=0, atol=0
                     )
 
-    def test_batch_rollout_matches_each_individual_row(self):
+    def test_block_candidate_pool_matches_oracle(self):
+        block_size = 7
         draft_hidden = torch.randn(
-            3, 7, self.hidden_size, device=self.device, dtype=self.dtype
+            3,
+            block_size,
+            self.hidden_size,
+            device=self.device,
+            dtype=self.dtype,
         )
         verified_ids = torch.tensor([1, 4, 9], device=self.device)
-        batched = domino_greedy_rollout(
-            draft_hidden=draft_hidden,
-            verified_ids=verified_ids,
-            target_embedding=self.embedding,
-            lm_head_weight=self.lm_head_weight,
-            prefix_gru=self.prefix_gru,
-            embed_proj=self.embed_proj,
-            vocab_size=self.vocab_size,
-            shift_label=True,
+        for shift_label in (True, False):
+            with self.subTest(shift_label=shift_label):
+                actual = domino_greedy_rollout(
+                    draft_hidden=draft_hidden,
+                    verified_ids=verified_ids,
+                    target_embedding=self.embedding,
+                    lm_head_weight=self.lm_head_weight,
+                    prefix_gru=self.prefix_gru,
+                    embed_proj=self.embed_proj,
+                    vocab_size=self.vocab_size,
+                    shift_label=shift_label,
+                    candidate_pool_size=5,
+                )
+                expected = self._oracle(
+                    draft_hidden,
+                    verified_ids,
+                    shift_label=shift_label,
+                    candidate_pool_size=5,
+                )
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                first_hidden = draft_hidden[:, 0 if shift_label else 1]
+                first_expected = torch.argmax(
+                    F.linear(first_hidden, self.lm_head_weight), dim=-1
+                )
+                torch.testing.assert_close(actual[:, 0], first_expected, rtol=0, atol=0)
+
+    def test_candidate_pool_boundaries(self):
+        draft_hidden = torch.randn(
+            2, 7, self.hidden_size, device=self.device, dtype=self.dtype
         )
-        individual = torch.cat(
-            [
-                domino_greedy_rollout(
-                    draft_hidden=draft_hidden[index : index + 1],
-                    verified_ids=verified_ids[index : index + 1],
+        verified_ids = torch.tensor([2, 7], device=self.device)
+        expected = self._oracle(draft_hidden, verified_ids, shift_label=True)
+        for candidate_pool_size in (0, self.vocab_size, self.vocab_size + 1):
+            with self.subTest(candidate_pool_size=candidate_pool_size):
+                actual = domino_greedy_rollout(
+                    draft_hidden=draft_hidden,
+                    verified_ids=verified_ids,
                     target_embedding=self.embedding,
                     lm_head_weight=self.lm_head_weight,
                     prefix_gru=self.prefix_gru,
                     embed_proj=self.embed_proj,
                     vocab_size=self.vocab_size,
                     shift_label=True,
+                    candidate_pool_size=candidate_pool_size,
                 )
-                for index in range(3)
-            ],
-            dim=0,
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+        with self.assertRaisesRegex(ValueError, "non-negative"):
+            domino_greedy_rollout(
+                draft_hidden=draft_hidden,
+                verified_ids=verified_ids,
+                target_embedding=self.embedding,
+                lm_head_weight=self.lm_head_weight,
+                prefix_gru=self.prefix_gru,
+                embed_proj=self.embed_proj,
+                vocab_size=self.vocab_size,
+                shift_label=True,
+                candidate_pool_size=-1,
+            )
+
+    def test_batch_rollout_matches_each_individual_row(self):
+        draft_hidden = torch.randn(
+            3, 7, self.hidden_size, device=self.device, dtype=self.dtype
         )
-        torch.testing.assert_close(batched, individual, rtol=0, atol=0)
+        verified_ids = torch.tensor([1, 4, 9], device=self.device)
+        for candidate_pool_size in (0, 5):
+            with self.subTest(candidate_pool_size=candidate_pool_size):
+                batched = domino_greedy_rollout(
+                    draft_hidden=draft_hidden,
+                    verified_ids=verified_ids,
+                    target_embedding=self.embedding,
+                    lm_head_weight=self.lm_head_weight,
+                    prefix_gru=self.prefix_gru,
+                    embed_proj=self.embed_proj,
+                    vocab_size=self.vocab_size,
+                    shift_label=True,
+                    candidate_pool_size=candidate_pool_size,
+                )
+                individual = torch.cat(
+                    [
+                        domino_greedy_rollout(
+                            draft_hidden=draft_hidden[index : index + 1],
+                            verified_ids=verified_ids[index : index + 1],
+                            target_embedding=self.embedding,
+                            lm_head_weight=self.lm_head_weight,
+                            prefix_gru=self.prefix_gru,
+                            embed_proj=self.embed_proj,
+                            vocab_size=self.vocab_size,
+                            shift_label=True,
+                            candidate_pool_size=candidate_pool_size,
+                        )
+                        for index in range(3)
+                    ],
+                    dim=0,
+                )
+                torch.testing.assert_close(batched, individual, rtol=0, atol=0)
 
     def test_capture_sampler_matches_eager_rollout(self):
         from sglang.srt.speculative.dflash_worker_v2 import _DominoDraftSampler
@@ -323,6 +433,7 @@ class TestDFlashDominoRollout(CustomTestCase):
                     block_size=block_size,
                     shift_label=shift_label,
                     max_bs=batch_size,
+                    candidate_pool_size=5,
                 )
                 sampler(draft_hidden.reshape(-1, self.hidden_size), block_ids.flatten())
                 expected = domino_greedy_rollout(
@@ -334,11 +445,55 @@ class TestDFlashDominoRollout(CustomTestCase):
                     embed_proj=self.embed_proj,
                     vocab_size=self.vocab_size,
                     shift_label=shift_label,
+                    candidate_pool_size=5,
                 )
                 actual = sampler.out[: batch_size * (block_size - 1)].view(
                     batch_size, block_size - 1
                 )
                 torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_candidate_pool_cuda_graph_replay(self):
+        block_size = 7
+        batch_size = 3
+        static_hidden = torch.randn(
+            batch_size,
+            block_size,
+            self.hidden_size,
+            device=self.device,
+            dtype=self.dtype,
+        )
+        static_ids = torch.tensor([1, 4, 9], device=self.device)
+
+        def rollout():
+            return domino_greedy_rollout(
+                draft_hidden=static_hidden,
+                verified_ids=static_ids,
+                target_embedding=self.embedding,
+                lm_head_weight=self.lm_head_weight,
+                prefix_gru=self.prefix_gru,
+                embed_proj=self.embed_proj,
+                vocab_size=self.vocab_size,
+                shift_label=True,
+                candidate_pool_size=5,
+            )
+
+        rollout()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            actual = rollout()
+
+        static_hidden.copy_(torch.randn_like(static_hidden))
+        static_ids.copy_(torch.tensor([2, 7, 11], device=self.device))
+        expected = self._oracle(
+            static_hidden,
+            static_ids,
+            shift_label=True,
+            candidate_pool_size=5,
+        )
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
     def test_capture_sampler_replays_with_new_inputs(self):
@@ -355,6 +510,7 @@ class TestDFlashDominoRollout(CustomTestCase):
             block_size=block_size,
             shift_label=True,
             max_bs=batch_size,
+            candidate_pool_size=5,
         )
         static_hidden = torch.randn(
             batch_size * block_size,
@@ -395,6 +551,7 @@ class TestDFlashDominoRollout(CustomTestCase):
             embed_proj=self.embed_proj,
             vocab_size=self.vocab_size,
             shift_label=True,
+            candidate_pool_size=5,
         )
         graph.replay()
         torch.cuda.synchronize()
