@@ -562,8 +562,19 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                 if write_pos_buf is not None:
                     cache_len -= int(write_pos_buf[req.mamba_pool_idx].item())
                     write_pos_buf[req.mamba_pool_idx] = 0
-            if cache_len is None:
-                cache_len = 0
+            if cache_len is None or cache_len == 0:
+                # Nothing to cache: free KV and mamba slots without inserting
+                # a key_len=0 ghost node into the radix tree. Such empty nodes
+                # poison subsequent match_prefix calls by serving as a stale
+                # mamba COW source with best_value_len=0 (see cache_finished_req
+                # of a short request with no track boundary). Only free the unprotected
+                # part of kv_indices.
+                self.token_to_kv_pool_allocator.free(
+                    kv_indices[req.cache_protected_len :]
+                )
+                self.req_to_token_pool.free_mamba_cache(req)
+                self.dec_lock_ref(req.last_node)
+                return
             if cache_len != len(token_ids):
                 cache_end_idx = max(cache_len, req.cache_protected_len)
                 self.token_to_kv_pool_allocator.free(kv_indices[cache_end_idx:])
