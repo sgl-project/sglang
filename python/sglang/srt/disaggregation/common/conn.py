@@ -1102,6 +1102,11 @@ class CommonKVSender(BaseKVSender):
         return num_pages > 0 or last_chunk
 
     def get_transfer_metric(self) -> KVTransferMetric:
+        if self.kv_mgr.is_dummy_cp_rank:
+            # Dummy CP ranks transfer no KV, so leave the metric at its zero
+            # default. Skipping the estimate also avoids get_kv_replica_factor(),
+            # which never resolves on these ranks (they never bootstrap).
+            return self._transfer_metric
         record = self.kv_mgr._transfer_records.pop(self.bootstrap_room, None)
         if record is not None and record.total_elapsed_s > 0:
             self._transfer_metric.transfer_latency_s = record.total_elapsed_s
