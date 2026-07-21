@@ -6,9 +6,9 @@
 export const config = {
   modelName: "Inkling",
 
-  // Full platform list. Actively validated targets: B200 + H200 (verified end-to-end),
-  // GB300 and AMD (MI350X / MI355X) in progress. The other NVIDIA cells are same-arch
-  // extrapolations (Blackwell SM100 / Hopper SM90) and stay unverified until re-checked.
+  // Full platform list. Verified end-to-end: B200, B300, GB300, H200, and AMD
+  // (MI350X / MI355X). The remaining cells (GB200, B200 BF16 multi-node) are
+  // same-arch extrapolations and stay unverified until re-checked.
   supportedHardware: [
     "h200", "b200", "b300", "gb200", "gb300",
     "mi350x", "mi355x",
@@ -31,6 +31,20 @@ export const config = {
   nodesOptions: [
     { id: "single",  label: "Single Node" },
     { id: "multi-2", label: "Multi-Nodes" },
+  ],
+
+  // Eval set rendered in the benchmark card, keyed to per-cell `accuracy` in
+  // inkling-benchmarks.jsx. All measured at reasoning_effort `max` (0.99).
+  // AIME25 = pass@1 averaged over 8 repeats; NIAH = single-needle retrieval at
+  // that context length; HLE = self-judged on the text-only subset.
+  accuracyLabels: [
+    ["bfcl_pct",      "BFCL (EXACT)",    "%"],
+    ["mmau_pct",      "MMAU",            "%"],
+    ["mmmu_pro_pct",  "MMMU-Pro",        "%"],
+    ["aime25_pct",    "AIME25 (pass@1)", "%"],
+    ["niah_512k_pct", "NIAH @512K",      "%"],
+    ["niah_1m_pct",   "NIAH @1M",        "%"],
+    ["hle_pct",       "HLE",             "%"],
   ],
 
   // HF repos under the thinkingmachines org.
@@ -183,7 +197,7 @@ export const config = {
   cells: [
     // ====================================================================
     // NVIDIA Blackwell (SM100) + NVFP4 — FlashInfer TRT-LLM routed FP4 experts.
-    // B200 verified; B300 / GB200 / GB300 same-arch (GB300 in active validation).
+    // B200 / B300 / GB300 verified; GB200 same-arch extrapolation.
     // ====================================================================
     {
       match: { hw: "b200", variant: "default", quant: "nvfp4", strategy: "balanced", nodes: "single" },
@@ -214,6 +228,7 @@ export const config = {
     },
     {
       match: { hw: "b300", variant: "default", quant: "nvfp4", strategy: "balanced", nodes: "single" },
+      verified: true,
       env: [
         "SGLANG_ENABLE_UNIFIED_RADIX_TREE=1",
       ],
@@ -266,6 +281,7 @@ export const config = {
     },
     {
       match: { hw: "gb300", variant: "default", quant: "nvfp4", strategy: "balanced", nodes: "single" },
+      verified: true,
       env: [
         "SGLANG_ENABLE_UNIFIED_RADIX_TREE=1",
       ],
@@ -381,8 +397,8 @@ export const config = {
     // Long Context (MXFP8 KV) — block-scaled KV cache shrinks the per-token
     // KV footprint, raising how many tokens fit in the memory pool (longer
     // context / more concurrent sequences) vs the default BF16 KV. Same base
-    // command as Balanced + `--kv-cache-dtype mxfp8`. B200 verified
-    // end-to-end.
+    // command as Balanced + `--kv-cache-dtype mxfp8`. B200 / B300 / GB300
+    // verified end-to-end.
     // ====================================================================
     {
       match: { hw: "b200", variant: "default", quant: "nvfp4", strategy: "long_context", nodes: "single" },
@@ -414,6 +430,7 @@ export const config = {
     },
     {
       match: { hw: "b300", variant: "default", quant: "nvfp4", strategy: "long_context", nodes: "single" },
+      verified: true,
       env: [
         "SGLANG_ENABLE_UNIFIED_RADIX_TREE=1",
       ],
@@ -468,6 +485,7 @@ export const config = {
     },
     {
       match: { hw: "gb300", variant: "default", quant: "nvfp4", strategy: "long_context", nodes: "single" },
+      verified: true,
       env: [
         "SGLANG_ENABLE_UNIFIED_RADIX_TREE=1",
       ],
@@ -498,7 +516,7 @@ export const config = {
     // MTP (speculative decoding) — Inkling's multi-layer MTP draft head.
     // --enable-multi-layer-eagle is REQUIRED (without it the standard EAGLE
     // worker runs against the multi-layer draft and outputs garbage).
-    // B200 verified end-to-end; H200 from the same validated command set.
+    // B200 / B300 / GB300 / H200 verified end-to-end.
     // ====================================================================
     {
       match: { hw: "b200", variant: "default", quant: "nvfp4", strategy: "mtp", nodes: "single" },
@@ -535,6 +553,7 @@ export const config = {
     },
     {
       match: { hw: "b300", variant: "default", quant: "nvfp4", strategy: "mtp", nodes: "single" },
+      verified: true,
       env: [
         "SGLANG_ENABLE_UNIFIED_RADIX_TREE=1",
       ],
@@ -549,7 +568,7 @@ export const config = {
         "--moe-runner-backend flashinfer_trtllm_routed",
         "--enable-torch-symm-mem",
         "--mamba-radix-cache-strategy extra_buffer",
-        "--mem-fraction-static 0.75",
+        "--mem-fraction-static 0.70",
         "--swa-full-tokens-ratio 0.1",
         "--mamba-full-memory-ratio 0.1",
         "--enable-multimodal",
@@ -599,6 +618,7 @@ export const config = {
     },
     {
       match: { hw: "gb300", variant: "default", quant: "nvfp4", strategy: "mtp", nodes: "single" },
+      verified: true,
       env: [
         "SGLANG_ENABLE_UNIFIED_RADIX_TREE=1",
       ],
@@ -631,6 +651,7 @@ export const config = {
     },
     {
       match: { hw: "h200", variant: "default", quant: "nvfp4", strategy: "mtp", nodes: "single" },
+      verified: true,
       env: [
         "SGLANG_ENABLE_UNIFIED_RADIX_TREE=1",
       ],
@@ -669,6 +690,7 @@ export const config = {
     // ====================================================================
     {
       match: { hw: "gb300", variant: "default", quant: "bf16", strategy: "balanced", nodes: "multi-2" },
+      verified: true,
       env: [
         "NCCL_MNNVL_ENABLE=1",
         "NCCL_NVLS_ENABLE=1",
@@ -698,6 +720,7 @@ export const config = {
     },
     {
       match: { hw: "gb300", variant: "default", quant: "bf16", strategy: "mtp", nodes: "multi-2" },
+      verified: true,
       env: [
         "NCCL_MNNVL_ENABLE=1",
         "NCCL_NVLS_ENABLE=1",
@@ -733,6 +756,7 @@ export const config = {
     },
     {
       match: { hw: "b300", variant: "default", quant: "bf16", strategy: "balanced", nodes: "single" },
+      verified: true,
       env: [
         "SGLANG_ENABLE_UNIFIED_RADIX_TREE=1",
       ],
@@ -745,7 +769,9 @@ export const config = {
         "--moe-runner-backend flashinfer_trtllm_routed",
         "--enable-torch-symm-mem",
         "--mamba-radix-cache-strategy extra_buffer",
-        "--mem-fraction-static 0.85",
+        // BF16 weights are large on B300 — 0.85 caps the token pool near ~315k
+        // and rejects longer requests; 0.93 fits the full 1M context.
+        "--mem-fraction-static 0.93",
         "--swa-full-tokens-ratio 0.1",
         "--mamba-full-memory-ratio 0.1",
         "--enable-multimodal",
@@ -757,6 +783,7 @@ export const config = {
     },
     {
       match: { hw: "b300", variant: "default", quant: "bf16", strategy: "mtp", nodes: "single" },
+      verified: true,
       env: [
         "SGLANG_ENABLE_UNIFIED_RADIX_TREE=1",
       ],
@@ -769,7 +796,9 @@ export const config = {
         "--moe-runner-backend flashinfer_trtllm_routed",
         "--enable-torch-symm-mem",
         "--mamba-radix-cache-strategy extra_buffer",
-        "--mem-fraction-static 0.85",
+        // BF16 + MTP is tight on B300: 0.87 boots but caps the token pool near
+        // ~185k; 0.93 fits the full 1M context (matches the Balanced cell).
+        "--mem-fraction-static 0.93",
         "--swa-full-tokens-ratio 0.1",
         "--mamba-full-memory-ratio 0.1",
         "--enable-multimodal",
@@ -842,7 +871,7 @@ export const config = {
     // ====================================================================
     // LoRA serving. Prefill CUDA graphs auto-disable under --enable-lora.
     // Set MAX_LORAS to the number of distinct adapters served (1 is fastest
-    // for single-adapter serving). All three cells verified end-to-end
+    // for single-adapter serving). All cells except GB200 verified end-to-end
     // (coherence + trainer-logprob parity + throughput).
     // ====================================================================
     {
@@ -882,6 +911,7 @@ export const config = {
     },
     {
       match: { hw: "b300", variant: "lora", quant: "nvfp4", strategy: "balanced", nodes: "single" },
+      verified: true,
       env: [
         "SGLANG_ENABLE_UNIFIED_RADIX_TREE=1",
         "SGLANG_EXPERIMENTAL_LORA_OPTI=1",
@@ -950,6 +980,7 @@ export const config = {
     },
     {
       match: { hw: "gb300", variant: "lora", quant: "nvfp4", strategy: "balanced", nodes: "single" },
+      verified: true,
       env: [
         "SGLANG_ENABLE_UNIFIED_RADIX_TREE=1",
         "SGLANG_EXPERIMENTAL_LORA_OPTI=1",
