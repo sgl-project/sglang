@@ -269,6 +269,10 @@ class HostKVCache(abc.ABC):
             (allocator_size,), dtype=torch.uint8, device=self.device
         )
         self.free_slots = torch.arange(allocator_size, dtype=torch.int64)
+        # Keep freed chunks aside and consume them lazily from alloc() to avoid
+        # concatenating a large free-list on every host-pool free.
+        self.release_slots = []
+        self.num_release_slots = 0
         # Per-slot flag used to detect double-free.
         # slot_used[k] is true if slot k is allocated.
         self.slot_used = torch.zeros(allocator_size, dtype=torch.bool)
