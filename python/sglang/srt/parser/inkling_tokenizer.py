@@ -93,7 +93,10 @@ class InklingTokenizer:
 
     def encode_text(self, text: str) -> list[int]:
         if not isinstance(text, str):
-            raise TypeError(f"text must be str, got {type(text).__name__}")
+            # Non-string content (e.g. structured content parts, None, or numbers
+            # slipping through rendering) should not raise and fail the request;
+            # coerce defensively instead.
+            text = "" if text is None else str(text)
         return list(self.tokenizer.encode(text, add_special_tokens=False))
 
     def encode_special(self, token: str) -> int:
