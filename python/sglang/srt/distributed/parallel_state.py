@@ -50,6 +50,10 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     is_in_tc_piecewise_cuda_graph,
 )
 from sglang.srt.platforms.device_mixin import _DEVICE_TO_DISTRIBUTED_BACKEND
+from sglang.srt.runtime_context import (
+    get_global_dwdp_manager,
+    set_global_dwdp_manager,
+)
 from sglang.srt.utils import (
     get_current_device_stream_fast,
     get_int_env_var,
@@ -1059,21 +1063,6 @@ class GroupCoordinator:
             # directly causes Dynamo to rewrite it as _c10d_functional.all_gather_into_tensor
             # + wait_tensor, which invokes sycl_event.wait() and breaks XPU graph capture.
             reg_all_gather_into_tensor(output, input, group_name=self.unique_name)
-
-    def cp_all_gather_into_tensor_async(
-        self, output: torch.Tensor, input: torch.Tensor, stream: torch.cuda.Stream
-    ):
-        """
-        Implement an asynchronous `allgather` operation on a specified stream.
-        (the default `torch.distributed.all_gather_into_tensor` will trigger event synchronization),
-        eliminating the CPU-side launch-kernel blocking issue caused by synchronization problems.
-        The specific implementation uses the interface provided by pynccl to remove the synchronization logic of events.
-        """
-        pynccl_comm = self.pynccl_comm
-        if pynccl_comm is None or pynccl_comm.disabled:
-            self.all_gather_into_tensor(output, input)
-        else:
-            pynccl_comm.cp_all_gather_into_tensor(output, input, stream=stream)
 
     def all_gather(
         self,
@@ -2630,6 +2619,11 @@ def get_moe_tensor_parallel_rank():
 
 def destroy_model_parallel():
     """Set the groups to none and destroy them."""
+    dwdp_mgr = get_global_dwdp_manager()
+    if dwdp_mgr is not None:
+        dwdp_mgr.cleanup()
+        set_global_dwdp_manager(None)
+
     global _TP
     if _TP:
         _TP.destroy()

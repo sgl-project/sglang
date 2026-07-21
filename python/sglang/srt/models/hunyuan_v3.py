@@ -364,14 +364,14 @@ class HYV3Attention(nn.Module):
                 k_norm_weight=self._hpc_k_norm_w_fp32,
                 qk_norm_policy=2 if self.use_qk_norm else 0,
             )
+            # q is FP8; RadixAttention.forward sizes the output buffer as
+            # bf16 for fp8 queries.
             attn_output = self.attn(
                 q.view(-1, self.q_size),
                 None,
                 None,
                 forward_batch,
                 save_kv_cache=False,
-                # q is FP8 but the attention kernels emit bf16.
-                output_dtype=qkv.dtype,
             )
             output, _ = self.o_proj(attn_output)
             return output
