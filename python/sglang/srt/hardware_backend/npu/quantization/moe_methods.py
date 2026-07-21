@@ -333,11 +333,6 @@ class NPUW8A8Int8MoEMethod(_NPUMoEMethodBase):
         # Process weight
         weight: torch.Tensor = getattr(layer, f"{weight_prefix}_weight")
         weight.data = npu_format_cast(weight.data.transpose(1, 2))
-        setattr(
-            layer,
-            f"{weight_prefix}_weight",
-            torch.nn.Parameter(weight, requires_grad=False),
-        )
 
         # Set dispatcher output dtype
         if weight_prefix == "w13":
@@ -442,11 +437,6 @@ class NPUW4A8Int8MoEMethod(_NPUMoEMethodBase):
         weight = getattr(layer, f"{weight_prefix}_weight")
         weight.data = npu_format_cast(weight.data.transpose(1, 2))
         weight.data = self._pack_to_int32(weight.data)
-        setattr(
-            layer,
-            f"{weight_prefix}_weight",
-            torch.nn.Parameter(weight, requires_grad=False),
-        )
 
         # Set dispatcher output dtype
         if weight_prefix == "w13":
@@ -579,11 +569,6 @@ class NPUWNA16Int4MoEMethod(_NPUMoEMethodBase):
             .int()
         )
         weight.data = self._pack_to_int32(unpacked_weight)
-        setattr(
-            layer,
-            f"{weight_prefix}_weight",
-            torch.nn.Parameter(weight, requires_grad=False),
-        )
 
         # Set dispatcher output dtype
         if weight_prefix == "w13":
