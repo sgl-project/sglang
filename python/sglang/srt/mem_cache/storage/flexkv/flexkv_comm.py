@@ -527,6 +527,20 @@ class FlexKVLayerLoadingEvent:
         self._finished = True
         self.wait_remaining: List[int] = [1] * num_layers
 
+    def _drain(self) -> None:
+        """Consume all pending eventfd signals without blocking."""
+        import os
+
+        for fd in self.load_event_fds:
+            while True:
+                try:
+                    if not os.read(fd, 8):
+                        break
+                except BlockingIOError:
+                    break
+                except OSError:
+                    break
+
     def reset_for_new_transfer(self) -> None:
         """Drain any leftover signals from prior transfers, then arm.
 
@@ -538,19 +552,19 @@ class FlexKVLayerLoadingEvent:
         the FlexKV worker hasn't actually finished that layer's H2D
         yet — and forward proceeds with wrong KV data.
         """
-        import os
-
-        for fd in self.load_event_fds:
-            # The fd is NONBLOCK: read until EAGAIN. Each read is 8 bytes.
-            while True:
-                try:
-                    if not os.read(fd, 8):
-                        break
-                except BlockingIOError:
-                    break
-                except OSError:
-                    break
+        self._drain()
         self._finished = False
+        self.wait_remaining = [1] * self._num_layers
+
+    def mark_reusable(self) -> None:
+        """Return this slot to the producer ring after transfer quiescence.
+
+        The caller must first ensure that the FlexKV worker can no longer write
+        to this event set. This method is used by the connector's flush path
+        after it has completely waited for every launched layerwise task.
+        """
+        self._drain()
+        self._finished = True
         self.wait_remaining = [1] * self._num_layers
 
     def wait(self, layer_index: int) -> None:
@@ -649,6 +663,11 @@ class FlexKVLayerDoneCounter:
         event.wait(threshold)
 
     def reset(self) -> None:
+        # FlexKVConnector.reset() completely waits for every launched transfer
+        # before calling this method, so no worker can signal these eventfds
+        # after they are drained and returned to the producer ring.
+        for event in self.events:
+            event.mark_reusable()
         self.producer_index = -1
         self.consumer_index = -1
         self._task_to_producer.clear()

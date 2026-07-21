@@ -424,7 +424,7 @@ class FlexKVConnector:
             )
 
         if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
-            self.kv_manager.launch(
+            launched_task_ids = self.kv_manager.launch(
                 task_ids=[fkv_task_id],
                 slot_mappings=[slot_mapping_cpu],
                 swa_slot_mappings=[swa_slot_mapping],
@@ -432,7 +432,10 @@ class FlexKVConnector:
                 layerwise_transfer=True,
                 counter_id=producer_id,
             )
-            self._launched_load_tids.append(fkv_task_id)
+            # A layerwise launch is always merged into a batch task. Track the
+            # IDs returned by launch(), not the lookup task ID that the merge
+            # removes from FlexKV's task table.
+            self._launched_load_tids.extend(launched_task_ids)
 
         # Tell the layer hook which counter slot to wait on.
         self.layer_done_counter.set_consumer(fkv_task_id)
@@ -445,11 +448,20 @@ class FlexKVConnector:
             return
         if len(self._launched_load_tids) < threshold:
             return
+        task_ids = list(dict.fromkeys(self._launched_load_tids))
         try:
-            self.kv_manager.try_wait(task_ids=list(self._launched_load_tids))
+            responses = (
+                self.kv_manager.wait(task_ids, timeout=0.0, completely=True) or {}
+            )
         except Exception as exc:  # noqa: BLE001
-            logger.debug("[FlexKV] drain_launched_loads try_wait: %s", exc)
-        self._launched_load_tids.clear()
+            logger.debug("[FlexKV] drain_launched_loads wait: %s", exc)
+            return
+        self._launched_load_tids = [
+            task_id
+            for task_id in task_ids
+            if task_id not in responses
+            or responses[task_id].status != KVResponseStatus.SUCCESS
+        ]
 
     # ------------------------------------------------------------------
     # Public API — store
@@ -676,6 +688,44 @@ class FlexKVConnector:
     # ------------------------------------------------------------------
 
     def reset(self) -> None:
+        # Layerwise launch merges the lookup task into a new batch task. Wait
+        # for those returned batch task IDs before the scheduler clears GPU
+        # slot ownership or the eventfd producer ring is reused. ``completely``
+        # is required: an early task-end response is not sufficient to prove
+        # that the worker has stopped writing layer completion eventfds.
+        load_reset_status = {"ok": True, "error": ""}
+        if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
+            launched = list(dict.fromkeys(self._launched_load_tids))
+            if launched:
+                try:
+                    responses = self.kv_manager.wait(
+                        launched, timeout=30.0, completely=True
+                    )
+                    responses = responses or {}
+                    failed = [
+                        task_id
+                        for task_id in launched
+                        if task_id not in responses
+                        or responses[task_id].status != KVResponseStatus.SUCCESS
+                    ]
+                    if failed:
+                        load_reset_status = {
+                            "ok": False,
+                            "error": (
+                                "layerwise load tasks did not finish during reset: "
+                                f"{failed}"
+                            ),
+                        }
+                except Exception as exc:  # noqa: BLE001
+                    load_reset_status = {
+                        "ok": False,
+                        "error": f"waiting for layerwise loads during reset failed: {exc}",
+                    }
+        if self._sync_ctx.needs_sync:
+            load_reset_status = self._sync_ctx.scatter(load_reset_status, blocking=True)
+        if not load_reset_status["ok"]:
+            raise RuntimeError(f"[FlexKV] {load_reset_status['error']}")
+
         # Drop pending lookups (cancel their held tasks on the leader).
         if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
             pending = [tid for tid in self._pending_lookups.values() if tid >= 0]
