@@ -19,6 +19,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 )
 from sglang.srt.server_args import PortArgs, ServerArgs, prepare_server_args
 from sglang.srt.server_args_config_parser import ConfigArgumentMerger
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
@@ -988,6 +989,41 @@ class TestNgramExternalSamArgs(CustomTestCase):
         with self.assertRaises(ValueError) as context:
             handle_speculative_decoding(args)
         self.assertIn("external-corpus-max-tokens", str(context.exception))
+
+
+class TestSpeculativeAlgorithmNoneNormalization(CustomTestCase):
+    """`--speculative-algorithm NONE` must resolve to a real ``None``.
+
+    ``SpeculativeAlgorithm.from_string`` accepts ``"NONE"``, so the CLI flag is
+    a documented off-switch, but ~10 downstream gates test
+    ``speculative_algorithm is None``. A surviving ``"NONE"`` string leaves the
+    server half-enabled for speculative decoding. ``_handle_missing_default_values``
+    normalizes it (case-insensitively) before any of those gates run.
+    """
+
+    def _resolve(self, value):
+        args = ServerArgs(model_path="dummy")
+        args.speculative_algorithm = value
+        args._handle_missing_default_values()
+        return args.speculative_algorithm
+
+    def test_none_variants_normalize_to_none(self):
+        for value in ("NONE", "none", "None", "nOnE"):
+            with self.subTest(value=value):
+                self.assertIsNone(self._resolve(value))
+
+    def test_none_is_still_disabled_algorithm(self):
+        resolved = self._resolve("NONE")
+        self.assertEqual(
+            SpeculativeAlgorithm.from_string(resolved),
+            SpeculativeAlgorithm.NONE,
+        )
+
+    def test_real_algorithm_passthrough(self):
+        self.assertEqual(self._resolve("EAGLE"), "EAGLE")
+
+    def test_none_input_passthrough(self):
+        self.assertIsNone(self._resolve(None))
 
 
 class TestDecoupledSpecArgs(CustomTestCase):
