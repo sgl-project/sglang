@@ -127,10 +127,6 @@ The drafts are small BF16 models, each *calibrated against its quantized target*
 
 Leave `--attention-backend` unset for High-throughput cells — auto-select is correct (`fa3` on Hopper, `trtllm_mha` on Blackwell). With DFlash active, auto-select instead falls back to `flashinfer`, which breaks this hybrid-SWA model at `tp ≥ 4` on Blackwell (reproduced on Laguna-XS-2.1, greedy GSM8K 76% → 28%), so the Low-latency commands pin the target backend explicitly. Leave `--speculative-draft-attention-backend` unset. Other attention backend choices have not been fully validated on Laguna; keep the default.
 
-**Sampling defaults**
-
-`generation_config.json` ships with `top_k=0`. With the default `--sampling-defaults model`, sglang applies `top_k=0` at serving time and rejects any non-greedy sampling request (AIME25, chat sampling) with HTTP 400. All generated commands include `--sampling-defaults openai` to use OpenAI API defaults instead — greedy inference (GSM8K) is unaffected.
-
 **BF16 memory on H200**
 
 BF16 on H200 leaves less headroom for CUDA-graph capture and NCCL allocations than FP8/INT4. The High-throughput BF16 command carries `--mem-fraction-static 0.80`. FP8, INT4, and all B300/GB300 cells use the default heuristic.
