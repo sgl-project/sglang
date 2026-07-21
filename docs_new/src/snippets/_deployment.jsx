@@ -577,7 +577,7 @@ export const Deployment = ({ config, benchmarks }) => {
   const renderBenchmarkCard = (entry) => {
     // [key, label, unit, compute?]. Optional compute(measurement) supplies
     // derived metrics (preferred over measurement[key] when present).
-    const pct = config.latencyPercentile || "P50";
+    const pct = (entry && entry.latencyPercentile) || config.latencyPercentile || "P50";
     const SPEED_LABELS = [
       ["ttft_ms",                `TTFT (${pct})`,      "ms"],
       ["tpot_ms",                `TPOT (${pct})`,      "ms"],

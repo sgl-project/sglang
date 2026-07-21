@@ -178,6 +178,54 @@ export const benchmarks = [
     ],
   },
   // ====================================================================
+  // GB200 + FP4
+  // ====================================================================
+  {
+    match: { hw: "gb200", variant: "flash", quant: "fp4", strategy: "low-latency", nodes: "single" },
+  },
+  {
+    match: { hw: "gb200", variant: "flash", quant: "fp4", strategy: "balanced", nodes: "single" },
+  },
+  {
+    match: { hw: "gb200", variant: "flash", quant: "fp4", strategy: "high-throughput", nodes: "single" },
+  },
+  {
+    match: { hw: "gb200", variant: "pro", quant: "fp4", strategy: "low-latency", nodes: "multi-2" },
+  },
+  {
+    match: { hw: "gb200", variant: "pro", quant: "fp4", strategy: "balanced", nodes: "multi-2" },
+  },
+  {
+    match: { hw: "gb200", variant: "pro", quant: "fp4", strategy: "high-throughput", nodes: "multi-2" },
+  },
+  // ====================================================================
+  // GB200 + NVFP4
+  // ====================================================================
+  {
+    match: { hw: "gb200", variant: "flash", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
+    sglang_version: "PR #25820",
+    latencyPercentile: "Mean",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 323.85, tpot_ms: 3.62, tokens_per_sec_per_gpu: 496 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 16 },
+        ttft_ms: 397.31, tpot_ms: 8.11, tokens_per_sec_per_gpu: 3663 },
+    ],
+    accuracy: { gsm8k_pct: 96.66 },
+  },
+  {
+    match: { hw: "gb200", variant: "pro", quant: "nvfp4", strategy: "low-latency", nodes: "multi-2" },
+    sglang_version: "PR #25820",
+    latencyPercentile: "Mean",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 338.20, tpot_ms: 6.25, tokens_per_sec_per_gpu: 161 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 16 },
+        ttft_ms: 524.85, tpot_ms: 14.45, tokens_per_sec_per_gpu: 1015 },
+    ],
+    accuracy: { gsm8k_pct: 95.98 },
+  },
+  // ====================================================================
   // GB300 + FP4
   // ====================================================================
   {
