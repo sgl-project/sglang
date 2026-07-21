@@ -768,7 +768,8 @@ def launch_disagg_role(server_args: ServerArgs):
 
 def dispatch_launch(server_args: ServerArgs):
     """Route to the correct launch function based on --disagg-role."""
-    os.environ.setdefault("NCCL_NVLS_ENABLE", "0")
+    if "NCCL_NVLS_ENABLE" not in os.environ or server_args.enable_nccl_nvls:
+        os.environ["NCCL_NVLS_ENABLE"] = str(int(server_args.enable_nccl_nvls))
 
     role = server_args.disagg_role
     if role == RoleType.MONOLITHIC:

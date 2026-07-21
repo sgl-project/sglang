@@ -2053,5 +2053,23 @@ class TestDisaggTransferBackendArgs(unittest.TestCase):
         self.assertEqual(args.disagg_transfer_backend, "mock")
 
 
+class TestNcclNvlsArgs(unittest.TestCase):
+    def test_enable_nccl_nvls_cli_arg(self):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+
+        default_args, _ = parser.parse_known_args(["--model-path", "/fake"])
+        enabled_args, _ = parser.parse_known_args(
+            ["--model-path", "/fake", "--enable-nccl-nvls"]
+        )
+        disabled_args, _ = parser.parse_known_args(
+            ["--model-path", "/fake", "--enable-nccl-nvls", "false"]
+        )
+
+        self.assertFalse(default_args.enable_nccl_nvls)
+        self.assertTrue(enabled_args.enable_nccl_nvls)
+        self.assertFalse(disabled_args.enable_nccl_nvls)
+
+
 if __name__ == "__main__":
     unittest.main()
