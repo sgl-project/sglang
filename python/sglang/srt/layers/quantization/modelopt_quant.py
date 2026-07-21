@@ -596,6 +596,15 @@ class ModelOptFp8KVCacheMethod(BaseKVCacheMethod):
         super().__init__(quant_config)
 
 
+# Fused projections that may not be listed in packed_modules_mapping but whose
+# constituents appear separately in a modelopt quantized_layers map (e.g. GLM-5.2 /
+# DeepSeek dense-MLP and shared-expert gate_up_proj fuse gate_proj + up_proj).
+_MIXED_FUSED_SHARDS = {
+    "gate_up_proj": ["gate_proj", "up_proj"],
+    "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+}
+
+
 class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
     """Configuration for ModelOpt MIXED_PRECISION checkpoints."""
 
@@ -614,6 +623,10 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
         self.fp8_config = fp8_config
         self.nvfp4_config = nvfp4_config
         self.nvfp4a16_config = nvfp4a16_config
+        # block-FP8 (FP8_PB) sub-config exposing weight_block_size=[128, 128] so the deepseek
+        # post_load_weights kv_b_proj requant takes the block path (weight_scale_inv), not
+        # weight_scale, when a mixed checkpoint has block-FP8 attention/shared layers.
+        self.linear_fp8_config = self._get_fp8_block_config()
 
     @classmethod
     def override_quantization_method(cls, hf_quant_config, user_quant):
@@ -752,6 +765,27 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
                     "All shards must use the same quantization."
                 )
 
+        # Fallback for fused projections absent from packed_modules_mapping (e.g. GLM-5.2 /
+        # DeepSeek dense-MLP and shared-expert gate_up_proj = gate_proj + up_proj): resolve
+        # via the constituent shards so the fused layer inherits their shared quant_algo.
+        if proj_name in _MIXED_FUSED_SHARDS:
+            base = prefix.rsplit(".", 1)[0]
+            algos = set()
+            for base_candidate in self._quantized_layer_prefix_candidates(base):
+                for shard_name in _MIXED_FUSED_SHARDS[proj_name]:
+                    shard_prefix = f"{base_candidate}.{shard_name}"
+                    if shard_prefix in self.quantized_layers:
+                        algos.add(
+                            self.quantized_layers[shard_prefix]["quant_algo"].upper()
+                        )
+            if len(algos) == 1:
+                return algos.pop()
+            if len(algos) > 1:
+                raise ValueError(
+                    f"Mixed quant_algo within fused layer {prefix}: {algos}. "
+                    "All shards must use the same quantization."
+                )
+
         for candidate in self._quantized_layer_prefix_candidates(prefix):
             prefix_dot = candidate + "."
             for key, info in self.quantized_layers.items():
@@ -778,6 +812,21 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
 
         return tuple(dict.fromkeys(candidates))
 
+    def _get_fp8_block_config(self):
+        # Native DeepSeek-style block-128 FP8 (W8A8 dynamic, weight_scale_inv) used for
+        # FP8_PB layers in a mixed checkpoint (e.g. GLM-5.2 mixed FP8_PB + NVFP4 experts).
+        cfg = getattr(self, "_fp8_block_config_cached", None)
+        if cfg is None:
+            from sglang.srt.layers.quantization.fp8 import Fp8Config
+
+            cfg = Fp8Config(
+                is_checkpoint_fp8_serialized=True,
+                activation_scheme="dynamic",
+                weight_block_size=[128, 128],
+            )
+            self._fp8_block_config_cached = cfg
+        return cfg
+
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional[QuantizeMethodBase]:
@@ -794,6 +843,8 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
                 return UnquantizedLinearMethod()
             if quant_algo == "FP8":
                 return ModelOptFp8LinearMethod(self.fp8_config)
+            if quant_algo == "FP8_PB":
+                return self._get_fp8_block_config().get_quant_method(layer, prefix)
             if quant_algo == "NVFP4":
                 return ModelOptFp4LinearMethod(self.nvfp4_config)
             if quant_algo == "W4A16_NVFP4":
@@ -808,6 +859,8 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
                 return None
             if quant_algo == "FP8":
                 return ModelOptFp8MoEMethod(self.fp8_config)
+            if quant_algo == "FP8_PB":
+                return self._get_fp8_block_config().get_quant_method(layer, prefix)
             if quant_algo == "NVFP4":
                 return ModelOptNvFp4FusedMoEMethod(self.nvfp4_config)
             if quant_algo == "W4A16_NVFP4":
