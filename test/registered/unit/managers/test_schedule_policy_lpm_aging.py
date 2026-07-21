@@ -66,7 +66,9 @@ class TestLpmAgingSort(CustomTestCase):
         dep = _req("dep", matched=0, waiting_passes=10_000)
         hot = _req("hot", matched=10, waiting_passes=0)
         queue = [dep, hot]
-        SchedulePolicy._sort_by_longest_prefix(queue, set(), aging_tokens_per_pass=aging)
+        SchedulePolicy._sort_by_longest_prefix(
+            queue, set(), aging_tokens_per_pass=aging
+        )
         self.assertEqual([r.rid for r in queue], ["dep", "hot"])
         SchedulePolicy._sort_by_longest_prefix(queue, {"dep"}, aging)
         self.assertEqual([r.rid for r in queue], ["hot", "dep"])
