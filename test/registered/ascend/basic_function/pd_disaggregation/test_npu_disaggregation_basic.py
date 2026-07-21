@@ -15,9 +15,9 @@ import requests
 from transformers import AutoTokenizer
 
 from sglang.test.ascend.test_ascend_utils import (
-    LLAMA_3_1_8B_INSTRUCT_WEIGHTS_PATH,
     EAGLE3_LLAMA3_1_INSTRUCT_8B_WEIGHTS_PATH,
-    LLAMA_3_2_1B_INSTRUCT_WEIGHTS_PATH
+    LLAMA_3_1_8B_INSTRUCT_WEIGHTS_PATH,
+    LLAMA_3_2_1B_INSTRUCT_WEIGHTS_PATH,
 )
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.kits.json_constrained_kit import JSONConstrainedMixin
@@ -28,8 +28,8 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
 from sglang.test.test_utils import (
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     popen_launch_pd_server,
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
 )
 
 register_npu_ci(est_time=400, suite="full-16-npu-a3", nightly=True)
@@ -134,10 +134,10 @@ class TestDisaggregationAccuracy(PauseResumeInPlaceMixin, PDDisaggregationServer
         output_logprobs = j["meta_info"]["output_token_logprobs"]
 
         assert (
-                len(output_logprobs) == completion_tokens
+            len(output_logprobs) == completion_tokens
         ), f"output_logprobs and completion_tokens should have the same length, but got {len(output_logprobs)} and {completion_tokens}"
         assert (
-                len(input_logprobs) > 0
+            len(input_logprobs) > 0
         ), f"input_logprobs should have at least one token, but got {len(input_logprobs)}"
 
     def test_chat_completion_top_logprobs(self):
@@ -333,8 +333,8 @@ class TestDisaggregationMooncakeFailure(PDDisaggregationServerBase):
 
 
 class TestDisaggregationMooncakeSpec(
-        JSONConstrainedMixin, SpecGrammarKit, PDDisaggregationServerBase
-     ):
+    JSONConstrainedMixin, SpecGrammarKit, PDDisaggregationServerBase
+):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
@@ -595,8 +595,8 @@ class TestDisaggregationPauseResumeDecodeRetract(PDDisaggregationServerBase):
     async def _get_decode_num_running_reqs(self, session):
         """Query current decode running_batch size from /v1/loads."""
         async with session.get(
-                self.decode_url + "/v1/loads?include=core",
-                timeout=aiohttp.ClientTimeout(total=5),
+            self.decode_url + "/v1/loads?include=core",
+            timeout=aiohttp.ClientTimeout(total=5),
         ) as resp:
             resp.raise_for_status()
             body = await resp.json()
@@ -618,9 +618,9 @@ class TestDisaggregationPauseResumeDecodeRetract(PDDisaggregationServerBase):
 
         async def _post(session, url, json_data, timeout=30):
             async with session.post(
-                    url,
-                    json=json_data,
-                    timeout=aiohttp.ClientTimeout(total=timeout),
+                url,
+                json=json_data,
+                timeout=aiohttp.ClientTimeout(total=timeout),
             ) as resp:
                 resp.raise_for_status()
                 return await resp.json()
@@ -816,26 +816,26 @@ class TestDisaggregationPauseResumePrefillLeak(PDDisaggregationServerBase):
         """Pause/resume on an idle prefill node (no in-flight requests)."""
         async with aiohttp.ClientSession() as session:
             async with session.post(
-                    self.prefill_url + "/pause_generation",
-                    json={"mode": mode},
-                    timeout=aiohttp.ClientTimeout(total=10),
+                self.prefill_url + "/pause_generation",
+                json={"mode": mode},
+                timeout=aiohttp.ClientTimeout(total=10),
             ) as resp:
                 resp.raise_for_status()
             async with session.post(
-                    self.prefill_url + "/continue_generation",
-                    json={},
-                    timeout=aiohttp.ClientTimeout(total=10),
+                self.prefill_url + "/continue_generation",
+                json={},
+                timeout=aiohttp.ClientTimeout(total=10),
             ) as resp:
                 resp.raise_for_status()
 
             # Verify the engine still works after pause/resume
             async with session.post(
-                    self.lb_url + "/generate",
-                    json={
-                        "text": "What is 1+1?",
-                        "sampling_params": {"temperature": 0, "max_new_tokens": 1},
-                    },
-                    timeout=aiohttp.ClientTimeout(total=10),
+                self.lb_url + "/generate",
+                json={
+                    "text": "What is 1+1?",
+                    "sampling_params": {"temperature": 0, "max_new_tokens": 1},
+                },
+                timeout=aiohttp.ClientTimeout(total=10),
             ) as resp:
                 resp.raise_for_status()
                 body = await resp.json()
@@ -845,8 +845,8 @@ class TestDisaggregationPauseResumePrefillLeak(PDDisaggregationServerBase):
     async def _get_num_running_reqs(self, session):
         """Query sglang:num_running_reqs from prefill node's /metrics."""
         async with session.get(
-                self.prefill_url + "/metrics",
-                timeout=aiohttp.ClientTimeout(total=5),
+            self.prefill_url + "/metrics",
+            timeout=aiohttp.ClientTimeout(total=5),
         ) as resp:
             resp.raise_for_status()
             text = await resp.text()
@@ -854,8 +854,8 @@ class TestDisaggregationPauseResumePrefillLeak(PDDisaggregationServerBase):
                 # Match the gauge line, skip HELP/TYPE comments and
                 # per-priority breakdowns (which have priority="<int>")
                 if (
-                        line.startswith("sglang:num_running_reqs{")
-                        and "priority=" not in line
+                    line.startswith("sglang:num_running_reqs{")
+                    and "priority=" not in line
                 ):
                     return int(float(line.split()[-1]))
             return 0
@@ -872,15 +872,15 @@ class TestDisaggregationPauseResumePrefillLeak(PDDisaggregationServerBase):
             while not cancel_event.is_set():
                 try:
                     async with session.post(
-                            self.lb_url + "/generate",
-                            json={
-                                "text": f"[w{worker_id}-{seq}] {LONG_PROMPT}",
-                                "sampling_params": {
-                                    "temperature": 0,
-                                    "max_new_tokens": MAX_NEW_TOKENS,
-                                },
+                        self.lb_url + "/generate",
+                        json={
+                            "text": f"[w{worker_id}-{seq}] {LONG_PROMPT}",
+                            "sampling_params": {
+                                "temperature": 0,
+                                "max_new_tokens": MAX_NEW_TOKENS,
                             },
-                            timeout=aiohttp.ClientTimeout(total=30),
+                        },
+                        timeout=aiohttp.ClientTimeout(total=30),
                     ) as resp:
                         await resp.read()
                 except Exception:
@@ -889,9 +889,9 @@ class TestDisaggregationPauseResumePrefillLeak(PDDisaggregationServerBase):
 
         async def _post(session, url, json_data):
             async with session.post(
-                    url,
-                    json=json_data,
-                    timeout=aiohttp.ClientTimeout(total=30),
+                url,
+                json=json_data,
+                timeout=aiohttp.ClientTimeout(total=30),
             ) as resp:
                 resp.raise_for_status()
 
@@ -940,10 +940,10 @@ class TestDisaggregationPauseResumePrefillLeak(PDDisaggregationServerBase):
 
 
 _CHUNKED_ABORT_LONG_PROMPT = (
-                                 "The quick brown fox jumps over the lazy dog. "
-                                 "Pack my box with five dozen liquor jugs. "
-                                 "Sphinx of black quartz, judge my vow. "
-                             ) * 900
+    "The quick brown fox jumps over the lazy dog. "
+    "Pack my box with five dozen liquor jugs. "
+    "Sphinx of black quartz, judge my vow. "
+    ) * 900
 
 
 def _decode_response(response: requests.Response) -> Any:

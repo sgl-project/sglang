@@ -5,8 +5,8 @@ import requests
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ascend.test_ascend_utils import (
-    QWEN3_VL_8B_THINKING_MODEL_PATH,
     IMAGES_1_1_PATH,
+    QWEN3_VL_8B_THINKING_MODEL_PATH,
 )
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.run_eval import run_eval
@@ -84,7 +84,7 @@ class TestQwenVLPPAccuracy(unittest.TestCase):
             },
         )
         assert response.status_code == 200
-        self.assertIn("image", response.json()['choices'][0]['message']['content'])
+        self.assertIn("image", response.json()["choices"][0]["message"]["content"])
 
 
 if __name__ == "__main__":
