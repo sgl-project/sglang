@@ -237,11 +237,11 @@ sgl-eval run aime25 \\
       ],
     },
 
-    // ══════════════ B300 (8-GPU HGX, tp 8) — unverified ══════════════
+    // ══════════════ B300 (8-GPU HGX, tp 8) ══════════════
 
     {
       match: { hw: "b300", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" },
-      verified: false,
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -256,7 +256,7 @@ sgl-eval run aime25 \\
     },
     {
       match: { hw: "b300", variant: "default", quant: "bf16", strategy: "low-latency", nodes: "single" },
-      verified: false,
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -276,7 +276,7 @@ sgl-eval run aime25 \\
     },
     {
       match: { hw: "b300", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
-      verified: false,
+      verified: true,
       env: ["SGLANG_SHARED_EXPERT_TP1=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -291,7 +291,7 @@ sgl-eval run aime25 \\
     },
     {
       match: { hw: "b300", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
-      verified: false,
+      verified: true,
       env: ["SGLANG_SHARED_EXPERT_TP1=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -346,7 +346,7 @@ sgl-eval run aime25 \\
     },
     {
       match: { hw: "b300", variant: "default", quant: "int4", strategy: "high-throughput", nodes: "single" },
-      verified: false,
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -361,7 +361,7 @@ sgl-eval run aime25 \\
     },
     {
       match: { hw: "b300", variant: "default", quant: "int4", strategy: "low-latency", nodes: "single" },
-      verified: false,
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
