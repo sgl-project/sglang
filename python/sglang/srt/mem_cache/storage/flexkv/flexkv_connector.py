@@ -349,6 +349,7 @@ class FlexKVConnector:
 
         slot_mapping_cpu = self._to_cpu_int64(slot_mapping)
         swa_slot_mapping = self._build_swa_slot_mapping(slot_mapping)
+        swa_slots = 0 if swa_slot_mapping is None else int(swa_slot_mapping.numel())
 
         # Cross-node PP receivers must send their slot mapping back to
         # the TransferManagerOnRemote so the remote side knows where to
@@ -364,6 +365,14 @@ class FlexKVConnector:
                 swa_slot_mappings=[swa_slot_mapping],
                 as_batch=True,
                 layerwise_transfer=False,
+            )
+            logger.info(
+                "[FlexKV-IO] direction=H2D path=bulk phase=launch "
+                "task_id=%d slots=%d swa_slots=%d rid=%s",
+                fkv_task_id,
+                n,
+                swa_slots,
+                rid,
             )
             resp = self.kv_manager.wait([fkv_task_id], timeout=30.0)
             if not (
@@ -398,6 +407,7 @@ class FlexKVConnector:
 
         slot_mapping_cpu = self._to_cpu_int64(slot_mapping)
         swa_slot_mapping = self._build_swa_slot_mapping(slot_mapping)
+        swa_slots = 0 if swa_slot_mapping is None else int(swa_slot_mapping.numel())
         n = slot_mapping_cpu.numel()
 
         if self._sync_ctx.should_send_slot_mapping_to_remote:
@@ -441,6 +451,17 @@ class FlexKVConnector:
             # IDs returned by launch(), not the lookup task ID that the merge
             # removes from FlexKV's task table.
             self._launched_load_tids.extend(launched_task_ids)
+            logger.info(
+                "[FlexKV-IO] direction=H2D path=layerwise phase=launch "
+                "task_id=%d batch_task_ids=%s slots=%d swa_slots=%d "
+                "producer_id=%d rid=%s",
+                fkv_task_id,
+                launched_task_ids,
+                n,
+                swa_slots,
+                producer_id,
+                rid,
+            )
 
         # Tell the layer hook which counter slot to wait on.
         self.layer_done_counter.set_consumer(fkv_task_id)
@@ -526,12 +547,25 @@ class FlexKVConnector:
                 filtered = kv_indices[unmatched_mask]
                 slot_mapping_cpu = self._to_cpu_int64(filtered)
                 swa_slot_mapping = self._build_swa_slot_mapping(filtered)
+                swa_slots = (
+                    0 if swa_slot_mapping is None else int(swa_slot_mapping.numel())
+                )
                 self.kv_manager.launch(
                     task_ids=[fkv_task_id],
                     slot_mappings=[slot_mapping_cpu],
                     swa_slot_mappings=[swa_slot_mapping],
                     as_batch=False,
                     layerwise_transfer=False,
+                )
+                logger.info(
+                    "[FlexKV-IO] direction=D2H path=bulk phase=launch "
+                    "operation=store task_id=%d tokens=%d slots=%d "
+                    "swa_slots=%d rid=%s",
+                    fkv_task_id,
+                    int(unmatched_mask.sum()),
+                    int(slot_mapping_cpu.numel()),
+                    swa_slots,
+                    rid,
                 )
                 self._inflight_stores[rid] = fkv_task_id
                 return fkv_task_id
