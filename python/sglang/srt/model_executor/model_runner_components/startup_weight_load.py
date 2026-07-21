@@ -440,7 +440,7 @@ class StartupWeightLoadManager:
             raise
         self._state = StartupWeightLoadState.READY
         logger.info(
-            "Committed real weights after CUDA graph capture in %.2f s "
+            "Load weight end. Committed real weights after CUDA graph capture in %.2f s "
             "(capture overlap window %.2f s, startup overlap total %.2f s)",
             time.perf_counter() - commit_started_at,
             commit_started_at - self._capture_ready_at,
