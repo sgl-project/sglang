@@ -2615,6 +2615,15 @@ class ServerArgs:
     # -------------------------------------------------------------------------
     # Model weight update and weight loading
     # -------------------------------------------------------------------------
+    startup_weight_load_mode: A[
+        Literal["serial", "overlap"],
+        (
+            "Control startup weight loading relative to CUDA graph capture. "
+            "'serial' preserves the existing startup order; 'overlap' stages "
+            "checkpoint files while CUDA graphs are captured and commits the "
+            "real weights afterward."
+        ),
+    ] = "serial"
     custom_weight_loader: A[
         Optional[List[str]],
         Arg(

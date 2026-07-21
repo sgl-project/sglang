@@ -16,6 +16,7 @@ import os
 import re
 import struct
 import tempfile
+import threading
 from collections import defaultdict
 from pathlib import Path
 from typing import (
@@ -807,21 +808,56 @@ def np_cache_weights_iterator(
         yield name, torch.from_numpy(param)
 
 
-def _prefetch_checkpoint_file(file_path: str) -> None:
+def _prefetch_checkpoint_file(
+    file_path: str,
+    cancel_event: Optional[threading.Event] = None,
+) -> None:
     """Prefetch a checkpoint file into the OS page cache.
 
     Reads the file sequentially in 16 MB blocks so the kernel caches its pages
     before workers load the same file via mmap.
     """
     with open(file_path, "rb") as f:
-        while f.read(_get_prefetch_block_size()):
-            pass
+        while cancel_event is None or not cancel_event.is_set():
+            if not f.read(_get_prefetch_block_size()):
+                break
+
+
+class CheckpointFilePrefetchHandle:
+    """Lifecycle handle for background checkpoint page-cache prefetching."""
+
+    def __init__(
+        self,
+        *,
+        done_event: threading.Event,
+        cancel_event: threading.Event,
+        errors: List[Tuple[str, Exception]],
+    ) -> None:
+        self._done_event = done_event
+        self._cancel_event = cancel_event
+        self._errors = errors
+
+    def wait(self, timeout: Optional[float] = None) -> None:
+        if not self._done_event.wait(timeout):
+            raise TimeoutError("Timed out waiting for checkpoint prefetching")
+
+    def cancel(self) -> None:
+        """Stop scheduling shards and interrupt reads at the next block."""
+        self._cancel_event.set()
+
+    @property
+    def cancelled(self) -> bool:
+        return self._cancel_event.is_set()
+
+    @property
+    def errors(self) -> Tuple[Tuple[str, Exception], ...]:
+        return tuple(self._errors)
 
 
 def _prefetch_all_checkpoints(
     sorted_files: List[str],
     num_threads: int = 4,
-) -> None:
+) -> CheckpointFilePrefetchHandle:
     """Start prefetching checkpoint files into page cache in a background thread.
 
     When multiple ranks on the same node load the same checkpoint (e.g.
@@ -837,7 +873,6 @@ def _prefetch_all_checkpoints(
     naturally adapts to any RAM size — even if the full checkpoint does
     not fit in page cache, the prefetch thread stays ahead of the loader.
     """
-    import threading
     import time
 
     if num_threads < 1:
@@ -856,6 +891,14 @@ def _prefetch_all_checkpoints(
 
     my_files = sorted_files[local_rank::local_world_size]
     total_for_rank = len(my_files)
+    done_event = threading.Event()
+    cancel_event = threading.Event()
+    errors: List[Tuple[str, Exception]] = []
+    handle = CheckpointFilePrefetchHandle(
+        done_event=done_event,
+        cancel_event=cancel_event,
+        errors=errors,
+    )
 
     logger.info(
         "Rank %d: prefetching %d/%d checkpoint shards into page cache "
@@ -892,7 +935,11 @@ def _prefetch_all_checkpoints(
             pending: Dict[concurrent.futures.Future, str] = {}
 
             for path in itertools.islice(file_iter, num_threads):
-                pending[executor.submit(_prefetch_checkpoint_file, path)] = path
+                if cancel_event.is_set():
+                    break
+                pending[
+                    executor.submit(_prefetch_checkpoint_file, path, cancel_event)
+                ] = path
 
             while pending:
                 done, _ = concurrent.futures.wait(
@@ -903,7 +950,8 @@ def _prefetch_all_checkpoints(
                     path = pending.pop(future)
                     try:
                         future.result()
-                    except Exception:
+                    except Exception as exc:
+                        errors.append((path, exc))
                         logger.warning(
                             "Failed to prefetch checkpoint file %r.",
                             path,
@@ -912,24 +960,32 @@ def _prefetch_all_checkpoints(
                     finally:
                         record_complete()
 
-                    next_path = next(file_iter, None)
+                    next_path = None if cancel_event.is_set() else next(file_iter, None)
                     if next_path is not None:
                         pending[
-                            executor.submit(_prefetch_checkpoint_file, next_path)
+                            executor.submit(
+                                _prefetch_checkpoint_file,
+                                next_path,
+                                cancel_event,
+                            )
                         ] = next_path
 
     def _run_prefetch() -> None:
         start = time.perf_counter()
-        _prefetch_all()
-        elapsed = time.perf_counter() - start
-        logger.info(
-            "Rank %d: prefetching checkpoint files into page cache "
-            "finished in %.2fs",
-            local_rank,
-            elapsed,
-        )
+        try:
+            _prefetch_all()
+        finally:
+            elapsed = time.perf_counter() - start
+            logger.info(
+                "Rank %d: prefetching checkpoint files into page cache "
+                "finished in %.2fs",
+                local_rank,
+                elapsed,
+            )
+            done_event.set()
 
     threading.Thread(target=_run_prefetch, daemon=True).start()
+    return handle
 
 
 def _drop_file_cache_after_load(path: str) -> None:

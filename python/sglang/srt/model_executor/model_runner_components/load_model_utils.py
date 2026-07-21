@@ -44,6 +44,7 @@ class LoadedModel(msgspec.Struct, frozen=True, kw_only=True):
     loader: Any
     model: Any
     remote_instance_weight_info: Optional[Any]
+    startup_weight_load: Optional[Any] = None
 
 
 def maybe_downgrade_dtype_for_legacy_gpu(
@@ -219,32 +220,62 @@ def load_model_with_memory_saver(
         is_draft_worker and server_args.enable_draft_weights_cpu_backup
     )
     remote_instance_weight_info = None
-    with memory_saver_adapter.region(
-        GPU_MEMORY_TYPE_WEIGHTS,
-        enable_cpu_backup=enable_cpu_backup,
-    ):
-        loader = get_model_loader(
-            load_config=load_config,
-            model_config=model_config,
-        )
-        model = loader.load_model(
-            model_config=model_config,
-            device_config=DeviceConfig(device, gpu_id),
-        )
-        if hasattr(loader, "remote_instance_transfer_engine_weight_info"):
-            remote_instance_weight_info = (
-                loader.remote_instance_transfer_engine_weight_info
-            )
-    # Cache needs to be cleared after loading model weights (in the loader.load_model function).
-    # To avoid conflict with memory_saver_adapter.region, empty_cache operation is now moved here.
-    if _is_npu:
-        torch.npu.empty_cache()
-    monkey_patch_vllm_parallel_state(reverse=True)
+    startup_weight_load = None
+    try:
+        try:
+            with memory_saver_adapter.region(
+                GPU_MEMORY_TYPE_WEIGHTS,
+                enable_cpu_backup=enable_cpu_backup,
+            ):
+                loader = get_model_loader(
+                    load_config=load_config,
+                    model_config=model_config,
+                )
+                device_config = DeviceConfig(device, gpu_id)
+                if server_args.startup_weight_load_mode != "serial":
+                    from sglang.srt.model_executor.model_runner_components.startup_weight_load import (
+                        StartupWeightLoadManager,
+                        StartupWeightLoadOptions,
+                    )
+
+                    startup_weight_load = StartupWeightLoadManager.create_if_enabled(
+                        loader=loader,
+                        model_config=model_config,
+                        load_config=load_config,
+                        device_config=device_config,
+                        options=StartupWeightLoadOptions.from_server_args(
+                            server_args=server_args,
+                            is_draft_worker=is_draft_worker,
+                        ),
+                    )
+                if startup_weight_load is None:
+                    model = loader.load_model(
+                        model_config=model_config,
+                        device_config=device_config,
+                    )
+                else:
+                    model = startup_weight_load.prepare()
+                if hasattr(loader, "remote_instance_transfer_engine_weight_info"):
+                    remote_instance_weight_info = (
+                        loader.remote_instance_transfer_engine_weight_info
+                    )
+            # Cache needs to be cleared after loading model weights (in the
+            # loader.load_model function). To avoid conflict with the memory saver
+            # region, empty_cache is run after leaving it.
+            if _is_npu:
+                torch.npu.empty_cache()
+        finally:
+            monkey_patch_vllm_parallel_state(reverse=True)
+    except Exception:
+        if startup_weight_load is not None:
+            startup_weight_load.cancel()
+        raise
 
     return LoadedModel(
         loader=loader,
         model=model,
         remote_instance_weight_info=remote_instance_weight_info,
+        startup_weight_load=startup_weight_load,
     )
 
 

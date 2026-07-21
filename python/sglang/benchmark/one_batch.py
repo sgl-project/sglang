@@ -349,9 +349,14 @@ def load_model(server_args, port_args, gpu_id, tp_rank):
         model_runner = MlxModelRunnerStub(**runner_kwargs)
     else:
         model_runner = ModelRunner(**runner_kwargs)
-        model_runner.alloc_memory_pool()
-        model_runner.init_attention_backends()
-        model_runner.init_cuda_graphs()
+        try:
+            model_runner.alloc_memory_pool()
+            model_runner.init_attention_backends()
+            model_runner.init_cuda_graphs()
+            model_runner.finalize_startup_weight_load()
+        except Exception:
+            model_runner.cancel_startup_weight_load()
+            raise
     rank_print(f"max_total_num_tokens={model_runner.max_total_num_tokens}")
     tokenizer = get_tokenizer(
         server_args.tokenizer_path,

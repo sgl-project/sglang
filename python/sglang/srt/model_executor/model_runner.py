@@ -357,28 +357,37 @@ class ModelRunner:
         # For hisparse (must be set before initialize() so CUDA graph capture can see it)
         self.hisparse_coordinator = None
 
-        # Load model weights and configure
-        self.initialize()
-        self.check_quantized_moe_compatibility()
+        # The native overlap path replaces this during load_model(). Keep the
+        # no-pending-work invariant for lightweight backends that override the
+        # base initialization and weight-loading flow.
+        self.startup_weight_load = None
 
-        self._initialize_elastic_ep_joiner()
+        try:
+            # Load model weights and configure
+            self.initialize()
+            self.check_quantized_moe_compatibility()
 
-        if self.is_multimodal:
-            sanity_check_mm_pad_shift_value(self.model_config.vocab_size)
+            self._initialize_elastic_ep_joiner()
 
-        # Temporary cached values
-        self.support_pp = (
-            "pp_proxy_tensors" in inspect.signature(self.model.forward).parameters
-        )
+            if self.is_multimodal:
+                sanity_check_mm_pad_shift_value(self.model_config.vocab_size)
 
-        if self.ps.pp_size > 1:
-            assert (
-                self.support_pp
-            ), "Pipeline Parallel is not compatible with this model."
+            # Temporary cached values
+            self.support_pp = (
+                "pp_proxy_tensors" in inspect.signature(self.model.forward).parameters
+            )
 
-        # For weight updates
-        self.init_weight_updater()
-        self.init_weight_exporter()
+            if self.ps.pp_size > 1:
+                assert (
+                    self.support_pp
+                ), "Pipeline Parallel is not compatible with this model."
+
+            # For weight updates
+            self.init_weight_updater()
+            self.init_weight_exporter()
+        except Exception:
+            self.cancel_startup_weight_load()
+            raise
 
     def _initialize_elastic_ep_joiner(self) -> None:
         if not (
@@ -950,6 +959,7 @@ class ModelRunner:
         )
         self.loader = loaded.loader
         self.model = loaded.model
+        self.startup_weight_load = loaded.startup_weight_load
         if loaded.remote_instance_weight_info is not None:
             self.remote_instance_weight_transporter.weight_info = (
                 loaded.remote_instance_weight_info
@@ -982,14 +992,15 @@ class ModelRunner:
         # This handles both config.json (standard) and hf_quant_config.json (ModelOpt)
         quant_str = self.model_config.get_quantization_config_log_str()
 
-        logger.info(
-            f"Load weight end. "
-            f"elapsed={time.perf_counter() - tic_total:.2f} s, "
-            f"type={type(self.model).__name__}, "
-            f"{quant_str + ', ' if quant_str else ''}"
-            f"avail mem={after_avail_memory:.2f} GB, "
-            f"mem usage={self.weight_load_mem_usage:.2f} GB."
-        )
+        if self.startup_weight_load is None:
+            logger.info(
+                f"Load weight end. "
+                f"elapsed={time.perf_counter() - tic_total:.2f} s, "
+                f"type={type(self.model).__name__}, "
+                f"{quant_str + ', ' if quant_str else ''}"
+                f"avail mem={after_avail_memory:.2f} GB, "
+                f"mem usage={self.weight_load_mem_usage:.2f} GB."
+            )
 
         report_online_quantization(model=self.model, server_args=self.server_args)
 
@@ -1015,11 +1026,26 @@ class ModelRunner:
             logger,
         )
 
+        if self.startup_weight_load is None:
+            dist_barrier_after_load(
+                elastic_ep_backend=self.server_args.elastic_ep_backend,
+                tp_rank=self.ps.tp_rank,
+                is_ep_scale_joiner=self.server_args.is_ep_scale_joiner,
+            )
+
+    def finalize_startup_weight_load(self):
+        if self.startup_weight_load is None:
+            return
+        self.startup_weight_load.finalize()
         dist_barrier_after_load(
             elastic_ep_backend=self.server_args.elastic_ep_backend,
             tp_rank=self.ps.tp_rank,
             is_ep_scale_joiner=self.server_args.is_ep_scale_joiner,
         )
+
+    def cancel_startup_weight_load(self):
+        if self.startup_weight_load is not None:
+            self.startup_weight_load.cancel()
 
     def maybe_init_dwdp(self):
         if self.is_draft_worker:
