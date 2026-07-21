@@ -234,5 +234,65 @@ def test_mtp_single_step_decode(N: int):
     assert state_fail_rate < 0.01, f"State mismatch: fail_rate={state_fail_rate:.2f}%"
 
 
+@pytest.mark.skipif(not KERNELS_AVAILABLE, reason="Kernels not available")
+def test_large_state_pool_id_no_int32_overflow():
+    """A state-pool slot id whose flat offset exceeds 2**31 must not wrap.
+
+    The kernel computes the h0 read/write-back offset as ``idx * HV * K * V``.
+    With ``HV*K*V == 524288`` any slot id above ``2**31 / (HV*K*V) == 4096``
+    overflows int32, so the state row is read/written at a wrapped (often
+    negative) offset. Running identical physics at slot 0 and at such a high
+    slot must produce identical output and identical written-back state.
+    """
+    H, HV, K, V = 16, 32, 128, 128
+    row = HV * K * V  # 524288
+    big_id = (2**31) // row + 256  # 4352: big_id * row > 2**31
+    N, T = 1, 4
+
+    A_log, dt_bias, a, b, q, k, v, _state, _idx, cu_seqlens = _make_tensors(
+        N, T, H, HV, K, V
+    )
+
+    # Reference at slot 0 (offset always fits int32).
+    ref_src = torch.randn(1, HV, K, V, dtype=torch.float, device="cuda")
+    ref_idx = torch.zeros(N, dtype=torch.int32, device="cuda")
+
+    # Same initial state at a high slot id whose flat offset overflows int32.
+    big_src = torch.zeros(big_id + 1, HV, K, V, dtype=torch.float, device="cuda")
+    big_src[big_id].copy_(ref_src[0])
+    big_idx = torch.full((N,), big_id, dtype=torch.int32, device="cuda")
+
+    out_ref = run_reference(
+        A_log,
+        dt_bias,
+        q,
+        k,
+        v,
+        a,
+        b,
+        ref_src,
+        ref_idx,
+        cu_seqlens,
+        disable_state_update=False,
+    )
+    out_big = run_reference(
+        A_log,
+        dt_bias,
+        q,
+        k,
+        v,
+        a,
+        b,
+        big_src,
+        big_idx,
+        cu_seqlens,
+        disable_state_update=False,
+    )
+
+    torch.testing.assert_close(out_big, out_ref, rtol=1e-2, atol=1e-2)
+    # Written-back final state must land in the correct high-id row.
+    torch.testing.assert_close(big_src[big_id], ref_src[0], rtol=1e-2, atol=1e-2)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "-s"]))
