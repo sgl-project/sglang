@@ -35,7 +35,7 @@ from sglang.srt.utils import (
     next_power_of_2,
     support_triton,
 )
-from sglang.srt.utils.common import is_pin_memory_available
+from sglang.srt.utils.common import get_num_new_pages, is_pin_memory_available
 
 _is_hip = is_hip()
 _is_npu = is_npu()
@@ -198,9 +198,15 @@ def alloc_paged_token_slots_extend(
     dsv4_state_lens: Optional[DSV4StateLens] = None,
     batch=None,
 ):
-    # Over estimate the number of tokens: assume each request needs a new page.
     allocator = tree_cache.token_to_kv_pool_allocator
-    num_tokens = extend_num_tokens + len(seq_lens_cpu) * allocator.page_size
+    num_tokens = (
+        get_num_new_pages(
+            seq_lens=seq_lens_cpu,
+            page_size=allocator.page_size,
+            prefix_lens=prefix_lens_cpu,
+        )
+        * allocator.page_size
+    )
     evict_from_tree_cache(tree_cache, num_tokens)
 
     state = None
@@ -496,8 +502,24 @@ def alloc_paged_token_slots_decode(
 ) -> torch.Tensor:
     """Allocate paged KV cache for decode batch."""
     allocator = tree_cache.token_to_kv_pool_allocator
-    # Over estimate the number of tokens: assume each request needs a new page.
-    num_tokens = len(seq_lens) * allocator.page_size
+    if token_per_req == 1:
+        num_tokens = (
+            get_num_new_pages(
+                seq_lens=seq_lens_cpu,
+                page_size=allocator.page_size,
+                decode=True,
+            )
+            * allocator.page_size
+        )
+    else:
+        num_tokens = (
+            get_num_new_pages(
+                seq_lens=seq_lens_cpu,
+                page_size=allocator.page_size,
+                prefix_lens=seq_lens_cpu - token_per_req,
+            )
+            * allocator.page_size
+        )
     evict_from_tree_cache(tree_cache, num_tokens)
 
     # DSV4-NPU allocator also needs req_pool_indices + per-req state lens and
