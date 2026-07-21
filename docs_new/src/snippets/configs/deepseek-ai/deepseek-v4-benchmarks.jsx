@@ -99,7 +99,7 @@ export const benchmarks = [
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
         ttft_ms: 191, tpot_ms: 2.85, tokens_per_sec_per_gpu: 592 },
-      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 16 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 16, num_prompts: 64 },
         ttft_ms: 171, tpot_ms: 5.41, tokens_per_sec_per_gpu: 5032 },
     ],
   },
@@ -119,7 +119,7 @@ export const benchmarks = [
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1024 },
         ttft_ms: 89642, tpot_ms: 61.18, tokens_per_sec_per_gpu: 9274 },
-      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 4096 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 4096, num_prompts: 8192 },
         ttft_ms: 367286, tpot_ms: 60.31, tokens_per_sec_per_gpu: 10379 },
     ],
   },
@@ -129,7 +129,7 @@ export const benchmarks = [
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
         ttft_ms: 266, tpot_ms: 4.12, tokens_per_sec_per_gpu: 229 },
-      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 16 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 16, num_prompts: 64 },
         ttft_ms: 258, tpot_ms: 12.25, tokens_per_sec_per_gpu: 1256 },
     ],
   },
@@ -151,7 +151,7 @@ export const benchmarks = [
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1024 },
         ttft_ms: 100913, tpot_ms: 43.71, tokens_per_sec_per_gpu: 4011 },
-      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 4096 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 4096, num_prompts: 8192 },
         ttft_ms: 481157, tpot_ms: 42.66, tokens_per_sec_per_gpu: 4435 },
     ],
   },
@@ -164,7 +164,7 @@ export const benchmarks = [
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
         ttft_ms: 190, tpot_ms: 2.83, tokens_per_sec_per_gpu: 731 },
-      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 16 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 16, num_prompts: 64 },
         ttft_ms: 205, tpot_ms: 5.42, tokens_per_sec_per_gpu: 5173 },
     ],
   },
@@ -174,7 +174,7 @@ export const benchmarks = [
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
         ttft_ms: 210, tpot_ms: 4.13, tokens_per_sec_per_gpu: 251 },
-      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 16 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 16, num_prompts: 64 },
         ttft_ms: 266, tpot_ms: 11.28, tokens_per_sec_per_gpu: 1289 },
     ],
   },
