@@ -12,6 +12,11 @@ from sglang.srt.managers.cache_controller import CacheOperation as ManagerCacheO
 from sglang.srt.managers.cache_controller import (
     HiCacheController,
 )
+from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+    DeepSeekV4IndexerPool,
+    DeepSeekV4SingleKVPool,
+    DeepSeekV4TokenToKVPool,
+)
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.hybrid_cache import hybrid_cache_controller
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
@@ -177,6 +182,171 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
                 create=True,
             ),
         )
+
+    def test_hybrid_backup_routes_each_pool_by_rank_replication(self):
+        replicated_pool = object()
+        controller = HybridCacheController.__new__(HybridCacheController)
+        controller.storage_config = SimpleNamespace(tp_rank=1)
+        controller.mem_pool_device = replicated_pool
+        replicated_pool_names = [
+            PoolName.INDEXER,
+            PoolName.DEEPSEEK_V4_C4,
+            PoolName.DEEPSEEK_V4_C4_INDEXER,
+            PoolName.DEEPSEEK_V4_C128,
+            PoolName.DEEPSEEK_V4_C4_STATE,
+            PoolName.DEEPSEEK_V4_C4_INDEXER_STATE,
+            PoolName.DEEPSEEK_V4_C128_STATE,
+        ]
+        independent_pool_names = [PoolName.MAMBA, PoolName.SWA]
+        replicated_transfers = [
+            PoolTransfer(name=name, keys=["page-0"]) for name in replicated_pool_names
+        ]
+        independent_transfers = [
+            PoolTransfer(name=name, keys=["page-0"]) for name in independent_pool_names
+        ]
+        controller.mem_pool_host = SimpleNamespace(
+            entry_map={
+                **{
+                    name: SimpleNamespace(
+                        device_pool=(
+                            None
+                            if name
+                            in {
+                                PoolName.DEEPSEEK_V4_C4,
+                                PoolName.DEEPSEEK_V4_C128,
+                                PoolName.DEEPSEEK_V4_C4_STATE,
+                                PoolName.DEEPSEEK_V4_C4_INDEXER_STATE,
+                                PoolName.DEEPSEEK_V4_C128_STATE,
+                            }
+                            else replicated_pool
+                        ),
+                        host_pool=object(),
+                    )
+                    for name in replicated_pool_names
+                },
+                **{
+                    name: SimpleNamespace(device_pool=object(), host_pool=object())
+                    for name in independent_pool_names
+                },
+            },
+        )
+        controller.storage_backend = SimpleNamespace(
+            batch_set_v2=mock.Mock(
+                return_value={name: [True] for name in independent_pool_names}
+            )
+        )
+
+        with mock.patch.object(
+            hybrid_cache_controller,
+            "is_rank_replicated_pool",
+            side_effect=lambda device_pool: device_pool is replicated_pool,
+        ):
+            results = controller._extra_pool_backup(
+                [*replicated_transfers, *independent_transfers]
+            )
+
+        controller.storage_backend.batch_set_v2.assert_called_once_with(
+            independent_transfers
+        )
+        for pool_name in [*replicated_pool_names, *independent_pool_names]:
+            self.assertEqual(results[pool_name], [True])
+
+    def test_hybrid_backup_writes_rank_replicated_pool_on_tp0(self):
+        transfer = PoolTransfer(name=PoolName.INDEXER, keys=["page-0"])
+        controller = HybridCacheController.__new__(HybridCacheController)
+        controller.storage_config = SimpleNamespace(tp_rank=0)
+        controller.mem_pool_device = object()
+        controller.mem_pool_host = SimpleNamespace(
+            entry_map={
+                PoolName.INDEXER: SimpleNamespace(
+                    device_pool=object(), host_pool=object()
+                )
+            }
+        )
+        controller.storage_backend = SimpleNamespace(
+            batch_set_v2=mock.Mock(return_value={PoolName.INDEXER: [True]})
+        )
+
+        with mock.patch.object(
+            hybrid_cache_controller,
+            "is_rank_replicated_pool",
+            return_value=True,
+        ):
+            results = controller._extra_pool_backup([transfer])
+
+        controller.storage_backend.batch_set_v2.assert_called_once_with([transfer])
+        self.assertEqual(results[PoolName.INDEXER], [True])
+
+    def test_rank_replicated_pool_recognizes_deepseek_v4_subpools(self):
+        for pool_cls in (
+            DeepSeekV4TokenToKVPool,
+            DeepSeekV4SingleKVPool,
+            DeepSeekV4IndexerPool,
+        ):
+            with self.subTest(pool_cls=pool_cls.__name__):
+                pool = pool_cls.__new__(pool_cls)
+                self.assertTrue(manager_cache_controller.is_rank_replicated_pool(pool))
+
+    def test_hybrid_backup_thread_dispatches_when_primary_backup_is_skipped(self):
+        operation = object()
+        controller = HybridCacheController.__new__(HybridCacheController)
+        controller.storage_stop_event = mock.Mock()
+        controller.storage_stop_event.is_set.side_effect = [False, True]
+        controller.backup_queue = mock.Mock()
+        controller.backup_queue.get.return_value = operation
+        controller.ack_backup_queue = mock.Mock()
+        controller._page_backup = mock.Mock()
+
+        HybridCacheController.backup_thread_func(controller)
+
+        controller._page_backup.assert_called_once_with(operation)
+        controller.ack_backup_queue.put.assert_called_once_with(operation)
+
+    def test_hybrid_backup_skips_mla_but_writes_mamba(self):
+        mamba_transfer = PoolTransfer(
+            name=PoolName.MAMBA,
+            host_indices=_indices(0, 1),
+            keys=["page-0"],
+        )
+        operation = SimpleNamespace(
+            host_indices=_indices(0, 1),
+            hash_value=["page-0"],
+            completed_tokens=0,
+            pool_transfers=[mamba_transfer],
+            pool_storage_result=SimpleNamespace(
+                update_extra_pool_hit_pages=mock.Mock()
+            ),
+        )
+        controller = HybridCacheController.__new__(HybridCacheController)
+        controller.backup_skip = True
+        controller.storage_config = SimpleNamespace(tp_rank=1)
+        controller.page_size = 1
+        controller.mem_pool_host = SimpleNamespace(
+            entry_map={
+                PoolName.MAMBA: SimpleNamespace(
+                    device_pool=object(), host_pool=object()
+                )
+            },
+        )
+        controller.storage_backend = SimpleNamespace(
+            batch_set_v2=mock.Mock(return_value={PoolName.MAMBA: [True]})
+        )
+        controller.page_set_func = mock.Mock(
+            side_effect=AssertionError("primary MLA KV backup should be skipped")
+        )
+
+        with mock.patch.object(
+            hybrid_cache_controller,
+            "is_rank_replicated_pool",
+            return_value=False,
+        ):
+            controller._page_backup(operation)
+
+        controller.storage_backend.batch_set_v2.assert_called_once_with(
+            [mamba_transfer]
+        )
+        controller.page_set_func.assert_not_called()
+        self.assertEqual(operation.completed_tokens, 1)
 
     def test_mha_backup_then_load_roundtrip_uses_staged(self):
         layer_num = 2

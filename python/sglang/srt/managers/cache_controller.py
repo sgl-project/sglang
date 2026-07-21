@@ -67,6 +67,28 @@ def make_timing_event_pair():
     return device_module.Event(**kwargs), device_module.Event(**kwargs), timing_enabled
 
 
+def is_rank_replicated_pool(device_pool) -> bool:
+    """Whether a device cache pool contains the same data on every TP rank."""
+    # Currently, NPUMLATokenToKVPool is a subclass of MLATokenToKVPool.
+    # DeepSeek V4 splits its rank-replicated cache into multiple device pools.
+    # The NPU and HiSparse variants subclass these CUDA base pool classes.
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+        DeepSeekV4IndexerPool,
+        DeepSeekV4SingleKVPool,
+        DeepSeekV4TokenToKVPool,
+    )
+
+    return isinstance(
+        device_pool,
+        (
+            MLATokenToKVPool,
+            DeepSeekV4TokenToKVPool,
+            DeepSeekV4SingleKVPool,
+            DeepSeekV4IndexerPool,
+        ),
+    )
+
+
 class LayerLoadingEvent:
     def __init__(self, num_layers: int):
         self._num_layers = num_layers
@@ -597,16 +619,7 @@ class HiCacheController:
         self.pp_rank = get_parallel().pp_rank
         self.pp_size = get_parallel().pp_size
 
-        # Currently, NPUMLATokenToKVPool is the subclass of MLATokenToKVPool.
-        # DeepSeekV4TokenToKVPool has compressed MLA-style rank-replicated cache
-        # data. storage only needs rank 0 to write it back.
-        from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
-
-        is_mla_model = isinstance(self.mem_pool_device, MLATokenToKVPool)
-        is_compressed_mla_model = isinstance(
-            self.mem_pool_device, DeepSeekV4TokenToKVPool
-        )
-        is_rank_replicated = is_mla_model or is_compressed_mla_model
+        is_rank_replicated = is_rank_replicated_pool(self.mem_pool_device)
         # Least Common Multiple among heterogeneous tp size
         tp_lcm_size = storage_backend_extra_config.pop("tp_lcm_size", None)
         should_split_heads = False

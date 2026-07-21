@@ -5,7 +5,7 @@ import logging
 import os
 import threading
 import time
-from queue import Queue
+from queue import Empty, Queue
 from typing import TYPE_CHECKING, Any, Callable, List, Optional
 
 import torch
@@ -24,6 +24,7 @@ from sglang.srt.managers.cache_controller import (
     StorageOperation as BaseStorageOperation,
 )
 from sglang.srt.managers.cache_controller import (
+    is_rank_replicated_pool,
     make_timing_event_pair,
 )
 from sglang.srt.mem_cache.hicache_storage import (
@@ -667,11 +668,56 @@ class HybridCacheController(BaseHiCacheController):
         # Backup extra pools
         if operation.pool_transfers:
             self._resolve_sidecar_derived_pool_transfers(operation)
-            results = self.storage_backend.batch_set_v2(operation.pool_transfers)
+            results = self._extra_pool_backup(operation.pool_transfers)
             operation.pool_storage_result.update_extra_pool_hit_pages(results)
 
         # Backup kv pools
-        super()._page_backup(operation)
+        if not self.backup_skip:
+            super()._page_backup(operation)
+        else:
+            operation.completed_tokens = len(operation.hash_value) * self.page_size
+
+    def _extra_pool_backup(
+        self, pool_transfers: list[PoolTransfer]
+    ) -> dict[str, list[bool]]:
+        """Route each extra pool according to its TP replication."""
+        backup_pools: list[PoolTransfer] = []
+        results: dict[str, list[bool]] = {}
+
+        for transfer in pool_transfers:
+            entry = self.mem_pool_host.entry_map.get(transfer.name)
+            is_rank_replicated = False
+            if self.storage_config.tp_rank != 0 and entry is not None:
+                # Unified DeepSeek V4 compressed/state entries have no direct
+                # device pool; they inherit the anchor DSV4 pool's TP layout.
+                device_pool = (
+                    entry.device_pool
+                    if entry.device_pool is not None
+                    else self.mem_pool_device
+                )
+                is_rank_replicated = is_rank_replicated_pool(device_pool)
+            if is_rank_replicated:
+                results[transfer.name] = [True] * len(transfer.keys or [])
+            else:
+                backup_pools.append(transfer)
+
+        if backup_pools:
+            results.update(self.storage_backend.batch_set_v2(backup_pools))
+        return results
+
+    def backup_thread_func(self):
+        """Dispatch every hybrid operation; apply backup_skip per pool."""
+        while not self.storage_stop_event.is_set():
+            try:
+                operation = self.backup_queue.get(block=True, timeout=1)
+                if operation is None:
+                    continue
+
+                self._page_backup(operation)
+                self.ack_backup_queue.put(operation)
+
+            except Empty:
+                continue
 
     def _resolve_sidecar_derived_pool_transfers(self, operation):
         for transfer in operation.pool_transfers:
