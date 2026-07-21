@@ -373,6 +373,14 @@ class Envs:
     # AL parity and GSM8K green; 0 reverts to the cascade for A/B.
     SGLANG_DCP_SINGLE_CALL_VERIFY = EnvBool(True)
 
+    # DCP extend path: prefetch the NEXT layer's prefix KV all-gather on a side
+    # stream while the current layer computes (the gather source is the
+    # historical prefix in the pool, static within a forward). Measured tax of
+    # the inline gather: +3.55 ms/step at cc16 mix. Layer 0 of each chunk and
+    # the first chunk (registry warm-up) stay inline. Default OFF until the
+    # same-node A/B proves it (round-3 overlap lesson).
+    SGLANG_DCP_EXTEND_PREFETCH = EnvBool(False)
+
     # Scheduler: memory leak test
     SGLANG_TEST_RETRACT = EnvBool(False)
     SGLANG_TEST_RETRACT_INTERVAL = EnvInt(3)

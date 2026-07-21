@@ -36,6 +36,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.distributed.parallel_state import GroupCoordinator
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_parallel
 
 
@@ -275,6 +276,96 @@ def all_gather_q_for_mla_decode(
     return q_nope_out, q_pe
 
 
+# --- SGLANG_DCP_EXTEND_PREFETCH: pipeline the per-layer extend KV all-gather ---
+# The extend path re-gathers the sharded PREFIX per layer (measured +3.55 ms/step
+# at cc16 mix). The prefix pool content is historical — static within a forward —
+# so layer L+1's gather can run on a side stream while layer L computes. The
+# consumer copy into dcp_kv_buffer is unchanged (the inline path pays it too).
+# Layer registry warms on the first chunk (all layers inline once); afterwards
+# every layer except layer 0 of each chunk consumes a prefetched gather.
+# Same collective order on every rank (identical layer schedule) => NCCL-safe.
+class _DcpExtendPrefetcher:
+    def __init__(self):
+        self._stream = None
+        self._event = None
+        self._registry = {}  # layer_id -> attn_mqa (warm-up on first pass)
+        self._order = []  # ascending layer ids
+        self._pending = None  # (layer_id, sig, gathered, keepalive)
+
+    def _lazy_init(self):
+        if self._stream is None:
+            self._stream = torch.cuda.Stream()
+            self._event = torch.cuda.Event()
+
+    @staticmethod
+    def _sig(dcp_local_prefix_kv_indices, dcp_extend_prefix_lens_sum):
+        return (
+            dcp_local_prefix_kv_indices.data_ptr(),
+            int(dcp_extend_prefix_lens_sum),
+        )
+
+    def register(self, attn_mqa):
+        lid = attn_mqa.layer_id
+        if lid not in self._registry:
+            self._registry[lid] = attn_mqa
+            self._order = sorted(self._registry)
+
+    def consume(self, layer_id, sig):
+        """Return the prefetched gathered prefix for (layer_id, sig), or None."""
+        if self._pending is None:
+            return None
+        plid, psig, gathered, _keep = self._pending
+        self._pending = None
+        if plid != layer_id or psig != sig:
+            # batch/chunk changed or schedule skipped a layer — discard safely
+            # (the side stream finished or will finish into a dead buffer).
+            torch.cuda.current_stream().wait_event(self._event)
+            return None
+        torch.cuda.current_stream().wait_event(self._event)
+        return gathered
+
+    def issue_next(
+        self,
+        layer_id,
+        token_to_kv_pool,
+        extend_prefix_lens_cpu,
+        dcp_local_prefix_kv_indices,
+        dcp_extend_prefix_lens_sum,
+    ):
+        """Issue the NEXT registered layer's prefix gather on the side stream."""
+        if torch.cuda.is_current_stream_capturing():
+            return
+        try:
+            nxt = self._order[self._order.index(layer_id) + 1]
+        except (ValueError, IndexError):
+            return  # last layer (next chunk's layer 0 stays inline) or unwarmed
+        attn_next = self._registry[nxt]
+        self._lazy_init()
+        lens_cpu = torch.tensor(extend_prefix_lens_cpu)
+        self._stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(self._stream):
+            cache_k_nope, cache_k_rope = token_to_kv_pool.get_mla_kv_buffer(
+                attn_next,
+                dcp_local_prefix_kv_indices,
+            )
+            gathered = all_gather_kv_cache_for_dcp(
+                cache_k_nope,
+                cache_k_rope,
+                lens_cpu,
+                prefix_starts_cpu=torch.zeros_like(lens_cpu),
+            )
+            self._event.record(self._stream)
+        self._pending = (
+            nxt,
+            self._sig(dcp_local_prefix_kv_indices, dcp_extend_prefix_lens_sum),
+            gathered,
+            (cache_k_nope, cache_k_rope),
+        )
+
+
+_extend_prefetcher = _DcpExtendPrefetcher()
+
+
 def all_gather_kv_cache_for_mla_extend(
     token_to_kv_pool,
     attn_mqa,
@@ -286,19 +377,38 @@ def all_gather_kv_cache_for_mla_extend(
     k_nope,
     k_pe,
 ):
-    cache_k_nope, cache_k_rope = token_to_kv_pool.get_mla_kv_buffer(
-        attn_mqa,
-        dcp_local_prefix_kv_indices,
-    )
-    extend_prefix_lens_cpu = torch.tensor(extend_prefix_lens_cpu)
-    # all gather kv cache into forward_batch.attn_dcp_metadata.dcp_kv_buffer
-    gathered_kv = all_gather_kv_cache_for_dcp(
-        cache_k_nope,
-        cache_k_rope,
-        extend_prefix_lens_cpu,
-        prefix_starts_cpu=torch.zeros_like(extend_prefix_lens_cpu),
-    )
+    prefetch_on = envs.SGLANG_DCP_EXTEND_PREFETCH.get()
+    gathered_kv = None
+    if prefetch_on:
+        _extend_prefetcher.register(attn_mqa)
+        gathered_kv = _extend_prefetcher.consume(
+            attn_mqa.layer_id,
+            _DcpExtendPrefetcher._sig(
+                dcp_local_prefix_kv_indices, dcp_extend_prefix_lens_sum
+            ),
+        )
+    if gathered_kv is None:
+        cache_k_nope, cache_k_rope = token_to_kv_pool.get_mla_kv_buffer(
+            attn_mqa,
+            dcp_local_prefix_kv_indices,
+        )
+        lens_cpu = torch.tensor(extend_prefix_lens_cpu)
+        # all gather kv cache into forward_batch.attn_dcp_metadata.dcp_kv_buffer
+        gathered_kv = all_gather_kv_cache_for_dcp(
+            cache_k_nope,
+            cache_k_rope,
+            lens_cpu,
+            prefix_starts_cpu=torch.zeros_like(lens_cpu),
+        )
     dcp_kv_buffer[:dcp_extend_prefix_lens_sum] = gathered_kv
+    if prefetch_on:
+        _extend_prefetcher.issue_next(
+            attn_mqa.layer_id,
+            token_to_kv_pool,
+            extend_prefix_lens_cpu,
+            dcp_local_prefix_kv_indices,
+            dcp_extend_prefix_lens_sum,
+        )
 
     # copy local kv cache into forward_batch.attn_dcp_metadata.dcp_kv_buffer
     dcp_kv_buffer[
