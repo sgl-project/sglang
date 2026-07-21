@@ -57,6 +57,14 @@ class MambaComponent(TreeComponent):
         # HiCache state
         self._mamba_pool_host = None  # set to host mamba pool when HiCache enabled
 
+    def _inc_session_coverage(self, session_id: str, leaf: UnifiedTreeNode) -> None:
+        leaf.component_data[self.component_type].session_ref += 1
+
+    def _dec_session_coverage(self, session_id: str, leaf: UnifiedTreeNode) -> None:
+        cd = leaf.component_data[self.component_type]
+        assert cd.session_ref > 0
+        cd.session_ref -= 1
+
     def refresh_lru(
         self,
         phase: LRURefreshPhase,
@@ -184,6 +192,8 @@ class MambaComponent(TreeComponent):
         ct = self.component_type
         new_parent.component_data[ct].value = None
         new_parent.component_data[ct].lock_ref = 0
+        new_parent.component_data[ct].session_ref = 0
+        new_parent.component_data[ct].session_ids = None
         # HiCache: mamba host_value stays on child (mamba = leaf-only data)
         new_parent.component_data[ct].host_value = None
         new_parent.component_data[ct].host_lock_ref = 0
@@ -233,9 +243,7 @@ class MambaComponent(TreeComponent):
         if not self.cache.enable_session_radix_cache:
             self._walk_device_eviction(request, tracker, None)
             return
-        self._walk_device_eviction(
-            request, tracker, lambda n: n.component_data[ct].session_protect_ref > 0
-        )
+        self._walk_device_eviction(request, tracker, self.is_session_referenced)
         if tracker[ct] < request:
             self._walk_device_eviction(request, tracker, None)
 
@@ -658,7 +666,7 @@ class MambaComponent(TreeComponent):
         self._walk_host_eviction(
             num_tokens,
             tracker,
-            lambda n: n.component_data[self.component_type].session_protect_ref > 0,
+            self.is_session_referenced,
         )
         if tracker[self.component_type] < num_tokens:
             self._walk_host_eviction(num_tokens, tracker, None)

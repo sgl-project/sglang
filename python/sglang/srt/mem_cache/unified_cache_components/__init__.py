@@ -1,5 +1,8 @@
 from sglang.srt.mem_cache.unified_cache_components.full_component import FullComponent
 from sglang.srt.mem_cache.unified_cache_components.mamba_component import MambaComponent
+from sglang.srt.mem_cache.unified_cache_components.session_unified_radix_cache import (
+    SessionUnifiedRadixCacheMixin,
+)
 from sglang.srt.mem_cache.unified_cache_components.swa_component import SWAComponent
 from sglang.srt.mem_cache.unified_cache_components.tree_component import (
     _NUM_COMPONENT_TYPES,
@@ -23,6 +26,7 @@ __all__ = [
     "CacheTransferPhase",
     "LRURefreshPhase",
     "MambaComponent",
+    "SessionUnifiedRadixCacheMixin",
     "SWAComponent",
     "TreeComponent",
     "_NUM_COMPONENT_TYPES",

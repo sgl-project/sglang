@@ -8,12 +8,10 @@ from collections import OrderedDict, defaultdict
 from typing import TYPE_CHECKING, Dict, Optional, Set
 
 from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
-from sglang.srt.mem_cache.unified_cache_components.tree_component import ComponentType
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.radix_cache import TreeNode
-    from sglang.srt.mem_cache.unified_radix_cache import UnifiedTreeNode
 
 logger = logging.getLogger(__name__)
 
@@ -78,12 +76,6 @@ class SessionRadixCacheMixin:
         if not self.enable_session_radix_cache:
             return
         new_node.session_ref = child.session_ref
-
-    def _session_on_register(self, session_id: str, leaf: TreeNode) -> None:
-        pass
-
-    def _session_on_release(self, session_id: str) -> None:
-        pass
 
     def _session_forget_node(self, node: TreeNode) -> None:
         session_ids = getattr(node, "session_ids", None)
@@ -160,7 +152,6 @@ class SessionRadixCacheMixin:
             return
         if node in self._session_leaves[session_id]:
             return
-        leaf = node
         self._session_leaves[session_id].add(node)
         node_ids = getattr(node, "session_ids", None)
         if node_ids is None:
@@ -180,7 +171,6 @@ class SessionRadixCacheMixin:
                         del parent.session_ids
                 break
             node = parent
-        self._session_on_register(session_id, leaf)
 
     def _maybe_move_node_tier(self, node: TreeNode, old_tier: int) -> None:
         new_tier = _classify_node_tier(node)
@@ -212,7 +202,6 @@ class SessionRadixCacheMixin:
         self._ensure_session_radix_state()
         self._remember_closed_session(session_id)
         self._session_generations.pop(session_id, None)
-        self._session_on_release(session_id)
         indexed = self._session_leaves.pop(session_id, set())
         freed = 0
         for leaf in indexed:
@@ -251,106 +240,3 @@ class SessionRadixCacheMixin:
             f"referenced_evictable_size={self.referenced_evictable_size_}, "
             f"{protected_size=})\n"
         )
-
-
-class SessionUnifiedRadixCacheMixin(SessionRadixCacheMixin):
-    """SWA/Mamba-aware session tagging for UnifiedRadixCache. FULL eviction order
-    comes from SessionAwareEvictionStrategy; the register/release hooks here slide
-    a per-session SWA window segment and Mamba frontier for retirement demotion."""
-
-    def _reset_session_radix_state(self) -> None:
-        super()._reset_session_radix_state()
-        self._session_swa_window: Dict[str, tuple[UnifiedTreeNode, int]] = {}
-        self._session_mamba_frontier: Dict[str, UnifiedTreeNode] = {}
-
-    def register_session_ref(self, req: Req) -> None:
-        # Streaming sessions are kept alive by StreamingSession locks; their
-        # req.last_node is a slot sentinel, not a tree node.
-        if req.session is not None and req.session.streaming:
-            return
-        super().register_session_ref(req)
-
-    def _maybe_move_node_tier(self, node: UnifiedTreeNode, old_tier: int) -> None:
-        # Unified skips per-tier size accounting (and UnifiedTreeNode has no
-        # plain lock_ref); eviction order comes from SessionAwareEvictionStrategy.
-        pass
-
-    def _session_on_split(
-        self, new_node: UnifiedTreeNode, child: UnifiedTreeNode
-    ) -> None:
-        super()._session_on_split(new_node, child)
-        if self.enable_session_radix_cache:
-            # Window segment covers both halves; mamba state stays on child.
-            new_node.component_data[ComponentType.SWA].session_protect_ref = (
-                child.component_data[ComponentType.SWA].session_protect_ref
-            )
-
-    def _session_on_register(self, session_id: str, leaf: UnifiedTreeNode) -> None:
-        if ComponentType.SWA in self.components:
-            self._slide_swa_window(session_id, leaf)
-        if ComponentType.MAMBA in self.components:
-            self._slide_mamba_frontier(session_id, leaf)
-
-    def _session_on_release(self, session_id: str) -> None:
-        window = self._session_swa_window.pop(session_id, None)
-        if window is not None:
-            frontier, covered = window
-            self._walk_swa_window(
-                frontier, covered, self._dec_protect_ref, ComponentType.SWA
-            )
-        frontier = self._session_mamba_frontier.pop(session_id, None)
-        if frontier is not None:
-            self._dec_protect_ref(frontier, ComponentType.MAMBA)
-
-    def _walk_swa_window(
-        self, frontier: UnifiedTreeNode, span: int, fn, ct: ComponentType
-    ) -> int:
-        """Apply fn to the parent chain until `span` tokens are covered; return
-        the token length actually covered (short at root)."""
-        node, acc = frontier, 0
-        while node not in (None, self.root_node) and acc < span:
-            fn(node, ct)
-            acc += len(node.key)
-            node = node.parent
-        return acc
-
-    def _slide_swa_window(self, session_id: str, frontier: UnifiedTreeNode) -> None:
-        old = self._session_swa_window.get(session_id)
-        if old is not None and old[0] is frontier:
-            return
-        span = self.components[ComponentType.SWA].sliding_window_size + self.page_size
-        # Inc the new window before dec'ing the old one so overlap nodes never
-        # transiently hit zero. The dec walk replays the recorded covered length
-        # rather than recomputing from `span`: splits repartition key lengths,
-        # and a recomputed walk could stop before the split-off upper half.
-        covered = self._walk_swa_window(
-            frontier, span, self._inc_protect_ref, ComponentType.SWA
-        )
-        if old is not None:
-            self._walk_swa_window(
-                old[0], old[1], self._dec_protect_ref, ComponentType.SWA
-            )
-        self._session_swa_window[session_id] = (frontier, covered)
-
-    def _slide_mamba_frontier(
-        self, session_id: str, frontier: UnifiedTreeNode
-    ) -> None:
-        old = self._session_mamba_frontier.get(session_id)
-        if old is frontier:
-            return
-        self._inc_protect_ref(frontier, ComponentType.MAMBA)
-        if old is not None:
-            self._dec_protect_ref(old, ComponentType.MAMBA)
-        self._session_mamba_frontier[session_id] = frontier
-
-    def _inc_protect_ref(self, node: UnifiedTreeNode, ct: ComponentType) -> None:
-        node.component_data[ct].session_protect_ref += 1
-
-    def _dec_protect_ref(self, node: UnifiedTreeNode, ct: ComponentType) -> None:
-        cd = node.component_data[ct]
-        cd.session_protect_ref = max(0, cd.session_protect_ref - 1)
-        if cd.session_protect_ref == 0:
-            # Retired protection: sink to the LRU tail as the first victim.
-            lru = self.lru_lists.get(ct)
-            if lru is not None and lru.in_list(node):
-                lru.demote_to_lru(node)

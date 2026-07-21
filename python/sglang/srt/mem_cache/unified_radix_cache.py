@@ -37,9 +37,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
-from sglang.srt.mem_cache.evict_policy import SessionAwareEvictionStrategy
 from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.session_radix_cache import SessionUnifiedRadixCacheMixin
 from sglang.srt.mem_cache.unified_cache_components import (
     _NUM_COMPONENT_TYPES,
     BASE_COMPONENT_TYPE,
@@ -50,6 +48,7 @@ from sglang.srt.mem_cache.unified_cache_components import (
     FullComponent,
     LRURefreshPhase,
     MambaComponent,
+    SessionUnifiedRadixCacheMixin,
     SWAComponent,
     TreeComponent,
     get_and_increase_time_counter,
@@ -104,9 +103,6 @@ class UnifiedTreeNode:
         self.id = UnifiedTreeNode.counter
         UnifiedTreeNode.counter += 1
         self.write_through_pending_id: Optional[int] = None
-        # Used for RefAware session radix cache; per-component protection
-        # refs live in ComponentData.session_protect_ref.
-        self.session_ref = 0
 
     def component(self, component_type: ComponentType) -> ComponentData:
         return self.component_data[component_type]
@@ -188,11 +184,6 @@ class UnifiedLRUList:
         assert node.id in self.cache
         self._remove_node(node)
         self._add_node(node)
-
-    def demote_to_lru(self, node: UnifiedTreeNode):
-        assert node.id in self.cache
-        self._remove_node(node)
-        self._add_node_after(self.tail.lru_prev[self._pt], node)
 
     def reset_node_and_parents_mru(
         self,
@@ -329,10 +320,6 @@ class UnifiedRadixCache(
         self.eviction_policy = params.eviction_policy.lower()
         self.enable_session_radix_cache = params.enable_session_radix_cache
         self.eviction_strategy = get_eviction_strategy(self.eviction_policy)
-        if self.enable_session_radix_cache:
-            self.eviction_strategy = SessionAwareEvictionStrategy(
-                self.eviction_strategy
-            )
 
         if self.token_to_kv_pool_allocator:
             self.device = self.token_to_kv_pool_allocator.device
@@ -1077,7 +1064,6 @@ class UnifiedRadixCache(
         )
         child.last_access_time = get_and_increase_time_counter()
 
-        self._session_on_split(new_node, child)
         self._update_evictable_leaf_sets(new_node)
         self._update_evictable_leaf_sets(child)
         return new_node
@@ -1334,12 +1320,12 @@ class UnifiedRadixCache(
         self._update_evictable_leaf_sets(node)
 
     def _remove_leaf_from_parent(self, node: UnifiedTreeNode):
+        for component in self._components_tuple:
+            component.discard_deleted_session_leaf(node)
+
         key = node.key.child_key(self.page_size)
-        v = node.parent.children.pop(key, None)
-        assert v == node
-        # Keep node.parent/key intact: session SWA-window dec walks may still
-        # start from a removed frontier node and traverse its live ancestors.
-        self._session_forget_node(node)
+        removed = node.parent.children.pop(key, None)
+        assert removed == node
 
     def _evict_component_and_detach_lru(
         self,
@@ -2835,16 +2821,9 @@ class UnifiedRadixCache(
                 f"[Leaf] {len(overlap)} in both sets: {[n.id for n in list(overlap)[:5]]}"
             )
 
-        # Session ref invariants: component protection refs require a live session_ref.
         if self.enable_session_radix_cache:
-            for n in all_nodes:
-                if n is self.root_node:
-                    continue
-                for ct in self.tree_components:
-                    if ct == BASE_COMPONENT_TYPE:
-                        continue
-                    if n.component_data[ct].session_protect_ref > 0 and n.session_ref <= 0:
-                        E(f"node {n.id} {ct} session_protect_ref>0 but session_ref==0")
+            for component in self._components_tuple:
+                component.validate_session_state(all_node_set, E)
 
         # Stale nodes: leaf sets must only contain tree-reachable nodes
         stale = self.evictable_device_leaves - all_node_set
