@@ -209,16 +209,16 @@ def prepare_for_draft_extend(
         )
         with extend_metadata_guard:
             draft_model_runner.attn_backend.init_forward_metadata(forward_batch)
-        # Planned pre-pad; do NOT opt into post-pad re-plan. DSA's indexer
-        # cannot rebuild its deep_gemm schedule_meta on a DP-padded batch
-        # (the `_batch_size == batch_size` assertion, see #27091); the
-        # marked pre-pad metadata is used as-is, matching the proven
-        # skip_attn_backend_init=True behavior.
-        # On NPU with --disable-cuda-graph, block_table shape won't match
-        # after prepare_mlp_sync_batch padding; defer re-init to
-        # forward_extend (post-pad) instead.
-        if not is_npu() or can_cuda_graph:
-            forward_batch.mark_forward_metadata_ready()
+            # Planned pre-pad; do NOT opt into post-pad re-plan. DSA's indexer
+            # cannot rebuild its deep_gemm schedule_meta on a DP-padded batch
+            # (the `_batch_size == batch_size` assertion, see #27091); the
+            # marked pre-pad metadata is used as-is, matching the proven
+            # skip_attn_backend_init=True behavior.
+            # On NPU with --disable-cuda-graph, block_table shape won't match
+            # after prepare_mlp_sync_batch padding; defer re-init to
+            # forward_extend (post-pad) instead.
+            if not is_npu() or can_cuda_graph:
+                forward_batch.mark_forward_metadata_ready()
     return forward_batch
 
 
