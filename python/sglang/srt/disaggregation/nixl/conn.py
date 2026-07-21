@@ -768,11 +768,23 @@ class NixlKVManager(CommonKVManager):
         else:
             # One prefill rank feeds multiple decode ranks: interleave num_groups
             # head-groups in the src dlist so each decode rank picks its slice.
+            #
+            # Under GQA the decode side can have MORE attn-TP ranks than there are
+            # KV heads (decode_tp_size > total_kv_heads). In that case consecutive
+            # decode ranks replicate a shared KV head, exactly like QKVParallelLinear
+            # maps tp_rank -> tp_rank // num_kv_head_replicas. The src dlist must
+            # therefore interleave one group per UNIQUE source head-slice (i.e. per
+            # unique decode rank), not one group per decode rank -- otherwise it
+            # addresses past the registered KV region and prep_xfer_dlist raises
+            # NIXL_ERR_NOT_FOUND. This mirrors the replicated-KV head map that
+            # compute_head_slice_params (and the mooncake backend) already use.
             dst_tp_rank_in_group = decode_kv_args.decode_tp_rank % decode_tp_size
-            num_groups = decode_tp_size // prefill_tp_size
+            dst_replication = max(1, decode_tp_size // total_kv_heads)
+            num_groups = decode_tp_size // prefill_tp_size // dst_replication
             num_heads_to_send = dst_heads_per_rank
+            unique_dst_head_idx = dst_tp_rank_in_group // dst_replication
             src_head_start = (
-                dst_tp_rank_in_group * dst_heads_per_rank
+                unique_dst_head_idx * dst_heads_per_rank
             ) % src_heads_per_rank
             head_group_idx = src_head_start // dst_heads_per_rank
             dst_head_offset = 0
