@@ -585,6 +585,31 @@ class TestSRTEndpoint(CustomTestCase):
             f"Expected all tokens to be {target_token_id}, but got {sampled_tokens}",
         )
 
+    def test_invalid_logit_bias_does_not_crash_server(self):
+        """An invalid bias fails only its request and leaves the server healthy."""
+        response = requests.post(
+            self.base_url + "/generate",
+            json={
+                "text": "The capital of France is",
+                "sampling_params": {
+                    "max_new_tokens": 1,
+                    "logit_bias": {"0": -8.988465674311579e307},
+                },
+            },
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("logit_bias values", response.json()["error"]["message"])
+
+        healthy_response = requests.post(
+            self.base_url + "/generate",
+            json={
+                "text": "The capital of France is",
+                "sampling_params": {"max_new_tokens": 1},
+            },
+        )
+        self.assertEqual(healthy_response.status_code, 200)
+        self.assertIn("text", healthy_response.json())
+
     def test_forbidden_token(self):
         """Test that a forbidden token (very negative logit bias) doesn't appear in the output."""
         # Choose a token ID to forbid (using 10 as an example)

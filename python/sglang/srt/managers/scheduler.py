@@ -2213,6 +2213,18 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
+        # Tokenized requests normally pass SamplingParams.verify() in the
+        # tokenizer manager. Re-validate at the scheduler trust boundary so
+        # malformed requests from internal/RPC paths cannot reach GPU tensor
+        # construction and terminate the scheduler process.
+        try:
+            req.sampling_params.verify(self.model_config.vocab_size)
+        except (TypeError, ValueError, OverflowError) as exc:
+            req.set_finish_with_abort(f"Invalid sampling parameters: {exc}")
+            self.init_req_max_new_tokens(req)
+            self._add_request_to_queue(req)
+            return
+
         self._maybe_namespace_elastic_radix_cache(req)
 
         if self.spec_algorithm.is_dflash_family():

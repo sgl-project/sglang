@@ -37,6 +37,8 @@ CustomParamValue = Union[
 ]
 
 _SAMPLING_EPS = 1e-6
+_LOGIT_BIAS_MIN = -100.0
+_LOGIT_BIAS_MAX = 100.0
 TOP_K_ALL = 1 << 30
 
 logger = logging.getLogger(__name__)
@@ -215,11 +217,48 @@ class SamplingParams(msgspec.Struct, kw_only=True, omit_defaults=True):
                     f"{self.min_new_tokens}."
                 )
         if self.logit_bias is not None:
-            for token_id in self.logit_bias:
-                if not 0 <= int(token_id) < vocab_size:
+            for token_id, bias in self.logit_bias.items():
+                if isinstance(token_id, bool) or not isinstance(token_id, (str, int)):
                     raise ValueError(
-                        f"logit_bias must has keys in [0, {vocab_size - 1}], got "
+                        f"logit_bias token ids must be integers, got {token_id!r}."
+                    )
+                try:
+                    token_id_int = int(token_id)
+                except (TypeError, ValueError, OverflowError) as exc:
+                    raise ValueError(
+                        f"logit_bias token ids must be integers, got {token_id!r}."
+                    ) from exc
+                if not 0 <= token_id_int < vocab_size:
+                    raise ValueError(
+                        f"logit_bias must have keys in [0, {vocab_size - 1}], got "
                         f"{token_id}."
+                    )
+                if isinstance(bias, bool) or not isinstance(bias, (int, float)):
+                    raise ValueError(
+                        "logit_bias values must be numbers in "
+                        f"[{_LOGIT_BIAS_MIN:g}, {_LOGIT_BIAS_MAX:g}], got "
+                        f"{bias!r} for token id {token_id_int}."
+                    )
+                try:
+                    bias_value = float(bias)
+                except (TypeError, ValueError, OverflowError) as exc:
+                    raise ValueError(
+                        "logit_bias values must be numbers in "
+                        f"[{_LOGIT_BIAS_MIN:g}, {_LOGIT_BIAS_MAX:g}], got "
+                        f"{bias!r} for token id {token_id_int}."
+                    ) from exc
+                # Negative infinity is a safe and useful internal hard mask
+                # (for example, to suppress think-control tokens). Other
+                # non-finite values and finite values outside the public API
+                # range can poison sampling or overflow the float32 tensor.
+                if bias_value != -math.inf and (
+                    not math.isfinite(bias_value)
+                    or not (_LOGIT_BIAS_MIN <= bias_value <= _LOGIT_BIAS_MAX)
+                ):
+                    raise ValueError(
+                        "logit_bias values must be negative infinity or finite numbers in "
+                        f"[{_LOGIT_BIAS_MIN:g}, {_LOGIT_BIAS_MAX:g}], got "
+                        f"{bias!r} for token id {token_id_int}."
                     )
 
         grammars = [
