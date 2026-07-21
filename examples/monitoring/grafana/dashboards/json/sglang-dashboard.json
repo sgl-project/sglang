@@ -918,6 +918,235 @@
       ],
       "title": "Number Queued Requests",
       "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "default": true,
+        "type": "prometheus"
+      },
+      "description": "Per-tier cache hit rate. Total hit rate = (L1+L2+L3) / (L1+L2+L3+Miss). Each tier's share uses raw token counts without page alignment.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "max": 1,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green"
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 32
+      },
+      "id": 21,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "default": true,
+            "type": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "(sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l1_total{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval])) + sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l2_total{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval])) + sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l3_total{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval]))) / clamp_min((sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l1_total{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval])) + sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l2_total{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval])) + sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l3_total{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval])) + sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:uncached_prompt_tokens_histogram_sum{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval]))), 1e-9)",
+          "instant": false,
+          "legendFormat": "Total Hit Rate (L1+L2+L3)",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "default": true,
+            "type": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l1_total{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval])) / clamp_min((sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l1_total{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval])) + sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l2_total{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval])) + sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l3_total{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval])) + sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:uncached_prompt_tokens_histogram_sum{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval]))), 1e-9)",
+          "instant": false,
+          "legendFormat": "L1 Hit Rate (GPU)",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "default": true,
+            "type": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l2_total{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval])) / clamp_min((sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l1_total{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval])) + sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l2_total{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval])) + sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l3_total{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval])) + sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:uncached_prompt_tokens_histogram_sum{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval]))), 1e-9)",
+          "instant": false,
+          "legendFormat": "L2 Hit Rate (Host DRAM)",
+          "range": true,
+          "refId": "C"
+        },
+        {
+          "datasource": {
+            "default": true,
+            "type": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l3_total{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval])) / clamp_min((sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l1_total{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval])) + sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l2_total{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval])) + sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l3_total{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval])) + sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:uncached_prompt_tokens_histogram_sum{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval]))), 1e-9)",
+          "instant": false,
+          "legendFormat": "L3 Hit Rate (Storage)",
+          "range": true,
+          "refId": "D"
+        }
+      ],
+      "title": "Cache Hit Rate (Per-Tier)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "default": true,
+        "type": "prometheus"
+      },
+      "description": "Rate of tokens served from cache, tokens/s, including HiCache hits.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green"
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 57
+      },
+      "id": 22,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "default": true,
+            "type": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "rate(sglang:cached_tokens_total{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval])",
+          "instant": false,
+          "legendFormat": "\u547d\u4e2d tokens/s ({{cache_source}})",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Cached Tokens Rate (hit tokens/s)",
+      "type": "timeseries"
     }
   ],
   "preload": false,
