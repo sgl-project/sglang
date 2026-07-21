@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, List, Optional, Tuple
@@ -29,6 +30,7 @@ from sglang.srt.managers.io_struct import (
     InitWeightsUpdateGroupReqInput,
     LoadLoRAAdapterFromDistributedReqInput,
     LoadLoRAAdapterFromTensorsReqInput,
+    LoadLoRAAdapterFromTensorsReqOutput,
     LoadLoRAAdapterReqInput,
     SendWeightsToRemoteInstanceReqInput,
     UnloadLoRAAdapterReqInput,
@@ -188,6 +190,40 @@ class BaseTpWorker(ABC):
             tensors = dict(bucket.reconstruct_tensors())
         else:
             tensors = MultiprocessingSerializer.deserialize(serialized)
+        if recv_req.expected_checksums is not None:
+            exp = recv_req.expected_checksums
+            mismatch, missing = [], []
+            for name, want in exp.items():
+                if name not in tensors:
+                    missing.append(name)
+                    continue
+                got = hashlib.sha256(
+                    tensors[name]
+                    .detach()
+                    .cpu()
+                    .contiguous()
+                    .flatten()
+                    .view(torch.uint8)
+                    .numpy()
+                    .tobytes()
+                ).hexdigest()
+                if got != want:
+                    mismatch.append(name)
+            extra = [n for n in tensors if n not in exp]
+            if mismatch or missing or extra:
+                error_message = (
+                    f"[lora-check] rank{self.tp_rank} adapter sync MISMATCH of {len(exp)} expected: "
+                    f"{len(mismatch)} value-diff {mismatch[:5]}, {len(missing)} missing {missing[:5]}, "
+                    f"{len(extra)} extra {extra[:5]}"
+                )
+                logger.error(error_message)
+                return LoadLoRAAdapterFromTensorsReqOutput(
+                    success=False,
+                    error_message=error_message,
+                )
+            logger.info(
+                f"[lora-check] rank{self.tp_rank} adapter sync OK: {len(exp)}/{len(exp)} tensors match (sha256)"
+            )
         result = self.model_runner.load_lora_adapter_from_tensors(
             recv_req.to_ref(),
             tensors,
