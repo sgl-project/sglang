@@ -576,9 +576,7 @@ class TestPrefillAdder(CustomTestCase):
         root = object()
         self.mock_tree_cache.root_node = root
         req.last_node = root
-        req.best_match_node = SimpleNamespace(
-            key=range(window_size - 64), parent=root
-        )
+        req.best_match_node = SimpleNamespace(key=range(window_size - 64), parent=root)
         req.sampling_params.ignore_eos = False
         req.needs_host_load_back.return_value = True
         req.set_extend_range = MagicMock(

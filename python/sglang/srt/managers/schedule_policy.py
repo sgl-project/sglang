@@ -630,11 +630,14 @@ class PrefillAdder:
             alloc = min(extend_input_len, self.rem_chunk_tokens)
         else:
             alloc = extend_input_len
-        return max(
-            alloc + self.ceil_paged_tokens(swa_host_hit_length),
-            self.tree_cache.sliding_window_size
-            - self.ceil_paged_tokens(swa_device_hit_length),
-        ) + self.page_size
+        return (
+            max(
+                alloc + self.ceil_paged_tokens(swa_host_hit_length),
+                self.tree_cache.sliding_window_size
+                - self.ceil_paged_tokens(swa_device_hit_length),
+            )
+            + self.page_size
+        )
 
     def _swa_match_lengths(self, req: Req) -> tuple[int, int, int]:
         if req.best_match_node is None:
@@ -644,9 +647,7 @@ class PrefillAdder:
         while node is not self.tree_cache.root_node:
             matched_prefix_tokens += len(node.key)
             node = node.parent
-        matched = min(
-            matched_prefix_tokens, self.tree_cache.sliding_window_size
-        )
+        matched = min(matched_prefix_tokens, self.tree_cache.sliding_window_size)
         host = min(self.ceil_paged_tokens(req.swa_host_hit_length), matched)
         device = matched - host
         uncached = len(req.full_untruncated_fill_ids) - matched_prefix_tokens
@@ -659,9 +660,7 @@ class PrefillAdder:
         """Largest page-aligned extend chunk the SWA pool can admit."""
         _, host, device = self._swa_match_lengths(req)
         available = int(self.rem_swa_tokens) - self.page_size
-        if available <= max(
-            host, self.tree_cache.sliding_window_size - device
-        ):
+        if available <= max(host, self.tree_cache.sliding_window_size - device):
             return 0
         return (available - host) // self.page_size * self.page_size
 
