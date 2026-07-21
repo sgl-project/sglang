@@ -1622,7 +1622,10 @@ class ServerArgs:
     ] = False
     disable_custom_all_reduce: A[
         bool,
-        "Disable the custom all-reduce kernel and fall back to NCCL.",
+        Arg(
+            help="Disable the custom all-reduce kernel and fall back to NCCL.",
+            resolvable=True,
+        ),
     ] = False
     enable_mscclpp: A[
         bool,
@@ -1666,7 +1669,10 @@ class ServerArgs:
             resolvable=True,
         ),
     ] = None
-    enable_aiter_allreduce_fusion: A[bool, "Enable Aiter AllReduce Fusion."] = False
+    enable_aiter_allreduce_fusion: A[
+        bool,
+        Arg(help="Enable Aiter AllReduce Fusion.", resolvable=True),
+    ] = False
 
     # -------------------------------------------------------------------------
     # Torch compile and torchao
@@ -2164,6 +2170,16 @@ class ServerArgs:
         int,
         "Ring-buffer length L for ReplaySSM linear-attn decode. The full recurrent state is flushed to HBM every L decode steps.",
     ] = 16
+    # ReplaySSM spec-verify (Part B of RFC #28511): GDN linear-chain target-verify
+    # via a per-slot circular (d, k, g) ring + periodic flush instead of per-draft
+    # full-state snapshots. GDN only; linear-chain (topk <= 1) only. Reuses the
+    # `linear_replayssm` ring (replayssm_d/k/g + write_pos) and adds two per-slot
+    # cursors (cache_base, is_flush); the ring length reuses
+    # `linear_replayssm_cache_len`.
+    enable_gdn_replayssm_spec: A[
+        bool,
+        "Enable the ReplaySSM GDN spec-verify kernel (Part B of RFC #28511): a per-slot circular (d, k, g) ring + periodic flush replacing the recurrent verify's per-draft full-state snapshots. GDN only, linear-chain (--speculative-eagle-topk in {None, 1}) only. Reuses --linear-replayssm-cache-len for the ring length.",
+    ] = False
 
     # -------------------------------------------------------------------------
     # Hierarchical cache
@@ -2997,6 +3013,9 @@ class ServerArgs:
         from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
 
         handle_speculative_decoding(self)
+
+        # Needs the draft-token count derived just above.
+        self._validate_gdn_replayssm_spec_ring()
 
         # Validate the CuteDSL A2A token budget now that num_tokens_per_req is final.
         self._validate_cutedsl_a2a_token_budget()
@@ -5306,6 +5325,110 @@ class ServerArgs:
                     "--linear-replayssm-cache-len must be >= 1, got "
                     f"{self.linear_replayssm_cache_len}."
                 )
+
+        # ReplaySSM spec-verify (Part B of #28511): GDN-only, linear-chain target
+        # verify. Reuses the `linear_replayssm` ring (replayssm_d/k/g + write_pos)
+        # plus two extra per-slot cursors (cache_base, is_flush) and the chunked
+        # (I+A)^-1 reconstruction verify kernel. The intra-window interaction uses a
+        # strictly-lower causal mask, so it is valid ONLY for a linear draft chain
+        # (speculative_eagle_topk in {None, 1}, i.e. NEXTN / MTP); EAGLE tree verify
+        # (topk > 1) must fall back to the recurrent verify. GDN-only is enforced at
+        # runtime (KDA routes through kda_backend, which never enters this path; the
+        # pool gate also checks `not cache_params.is_kda`). The ring length reuses
+        # --linear-replayssm-cache-len (no separate flag).
+        if self.enable_gdn_replayssm_spec:
+            if self.speculative_eagle_topk not in (None, 1):
+                raise ValueError(
+                    "--enable-gdn-replayssm-spec requires a linear draft chain "
+                    "(--speculative-eagle-topk in {None, 1}); the chunked verify "
+                    "kernel uses a strictly-lower causal mask and is invalid for "
+                    "EAGLE tree verify. Got "
+                    f"--speculative-eagle-topk={self.speculative_eagle_topk!r}."
+                )
+            if decode != "triton":
+                raise ValueError(
+                    "--enable-gdn-replayssm-spec requires the Triton linear-attn "
+                    "decode backend, got "
+                    f"--linear-attn-decode-backend={decode!r}."
+                )
+            if self.enable_mamba_extra_buffer():
+                # The spec-verify path does not yet implement the device-side
+                # force-flush needed to keep `temporal` consistent with the ring at
+                # radix mamba-track boundaries, so it is incompatible with
+                # extra_buffer (radix prefix caching).
+                raise ValueError(
+                    "--enable-gdn-replayssm-spec is not yet compatible with mamba "
+                    "extra_buffer (radix prefix caching); use --disable-radix-cache "
+                    "or --mamba-radix-cache-strategy no_buffer."
+                )
+            if self.disaggregation_mode != "null":
+                raise ValueError(
+                    "--enable-gdn-replayssm-spec is not supported under PD "
+                    "disaggregation yet (follow-up). Got "
+                    f"--disaggregation-mode={self.disaggregation_mode!r}."
+                )
+            if self.linear_replayssm_cache_len < 1:
+                raise ValueError(
+                    "--linear-replayssm-cache-len must be >= 1, got "
+                    f"{self.linear_replayssm_cache_len}."
+                )
+            if self.enable_linear_replayssm:
+                raise ValueError(
+                    "--enable-gdn-replayssm-spec and --enable-linear-replayssm are "
+                    "mutually exclusive: they share the ring storage but drive it "
+                    "with incompatible cursor protocols (per-decode-forward vs "
+                    "per-verify-commit advance)."
+                )
+            ring_len = self.linear_replayssm_cache_len
+            if ring_len & (ring_len - 1) != 0:
+                raise ValueError(
+                    "--linear-replayssm-cache-len must be a power of two for the "
+                    f"circular spec-verify ring, got {ring_len}."
+                )
+            # ring_len >= 2 * max drafts is checked in
+            # _validate_gdn_replayssm_spec_ring() (draft tokens not derived yet).
+            # Closed-loop exact fold: the flush replays raw ring inputs through
+            # the recurrent update into the checkpoint, bit-identical to the
+            # recurrent baseline -- which keeps its state in fp32. A 16-bit
+            # checkpoint would re-quantize the exactly-folded state every flush
+            # and become the dominant residual error source, so require fp32.
+            if self.mamba_ssm_dtype is None:
+                logger.info(
+                    "--enable-gdn-replayssm-spec: setting --mamba-ssm-dtype "
+                    "float32 (the closed-loop exact fold requires the fp32 SSM "
+                    "checkpoint for recurrent-parity)."
+                )
+                self.mamba_ssm_dtype = "float32"
+            elif self.mamba_ssm_dtype != "float32":
+                raise ValueError(
+                    "--enable-gdn-replayssm-spec requires --mamba-ssm-dtype "
+                    f"float32, got {self.mamba_ssm_dtype!r}. The closed-loop "
+                    "exact fold keeps the committed state bit-identical to the "
+                    "recurrent baseline, which is only meaningful against the "
+                    "fp32 checkpoint; a 16-bit checkpoint would re-quantize it "
+                    "every flush."
+                )
+
+    def _validate_gdn_replayssm_spec_ring(self):
+        """Enforce ring_len >= 2 * max draft tokens for the spec-verify ring.
+
+        Early-flush margin: write_pos + spec_len <= ring_len must hold on every
+        verify step (see _advance_gdn_spec_cursors_kernel). Runs after
+        handle_speculative_decoding() so the (adaptive-aware) max is final;
+        MambaPool re-checks at ring allocation as a backstop.
+        """
+        if not self.enable_gdn_replayssm_spec:
+            return
+        max_drafts = self.max_speculative_num_draft_tokens
+        if max_drafts is None:
+            return
+        ring_len = self.linear_replayssm_cache_len
+        if ring_len < 2 * max_drafts:
+            raise ValueError(
+                "--linear-replayssm-cache-len must be >= 2 * the maximum "
+                "speculative draft-token count for the spec-verify ring "
+                f"(early-flush margin), got {ring_len} < {2 * max_drafts}."
+            )
 
     def _handle_legacy_cp_arguments(self):
         legacy_mode_to_strategy = {
