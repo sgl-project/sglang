@@ -781,47 +781,68 @@ def commit_mamba_states_after_verify(
     bs = accept_lens.shape[0]
     # `accept_lens` already includes the bonus token (drafts + 1 per req).
     if not batch.forward_mode.is_idle() and accept_index.numel() > 0:
-        accept_indices_offset = torch.arange(
-            0,
-            bs * draft_token_num,
-            step=draft_token_num,
-            dtype=accept_lens.dtype,
-            device=accept_lens.device,
-        )
-        req_idx = torch.arange(bs, dtype=torch.int64, device=accept_lens.device)
-        # Per-req tree step of the last accepted node, i.e. the step whose
-        # mamba state to commit; reduces to accept_lens - 1 for topk == 1.
-        last_correct_step_indices = (
-            accept_index[req_idx, (accept_lens - 1).to(torch.int64)]
-            - accept_indices_offset
-        )
+        if accept_index.is_cuda and accept_index.is_contiguous():
+            from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
+                fused_commit_track_indices,
+            )
 
-        if batch.mamba_track_indices is not None:
-            # If after verify, the request's seq_lens has crossed a mamba track interval,
-            # we need to update the mamba state for the request at the crossing point.
-            seq_lens_pre_verify = batch.seq_lens
-            seq_lens_post_verify = batch.seq_lens + accept_lens
-            mamba_track_interval = get_server_args().mamba_track_interval
-            to_track_mask = (
-                seq_lens_pre_verify // mamba_track_interval
-                != seq_lens_post_verify // mamba_track_interval
+            track_seq_lens = (
+                batch.seq_lens if batch.mamba_track_indices is not None else None
             )
-            tracking_point = (
-                seq_lens_post_verify // mamba_track_interval * mamba_track_interval
+            interval = (
+                get_server_args().mamba_track_interval
+                if track_seq_lens is not None
+                else 1
             )
-            to_track_ith = torch.clamp(
-                tracking_point - seq_lens_pre_verify - 1, min=0
-            ).to(torch.int64)
-            candidate_track_steps = (
-                accept_index[req_idx, to_track_ith] - accept_indices_offset
-            )
-            mamba_steps_to_track = torch.where(
-                to_track_mask,
-                candidate_track_steps,
-                torch.full_like(candidate_track_steps, -1),
+            last_correct_step_indices, mamba_steps_to_track = (
+                fused_commit_track_indices(
+                    accept_index,
+                    accept_lens,
+                    track_seq_lens,
+                    draft_token_num,
+                    interval,
+                )
             )
         else:
-            mamba_steps_to_track = None
+            accept_indices_offset = torch.arange(
+                0,
+                bs * draft_token_num,
+                step=draft_token_num,
+                dtype=accept_lens.dtype,
+                device=accept_lens.device,
+            )
+            req_idx = torch.arange(bs, dtype=torch.int64, device=accept_lens.device)
+            # Per-req tree step of the last accepted node, i.e. the step whose
+            # mamba state to commit; reduces to accept_lens - 1 for topk == 1.
+            last_correct_step_indices = (
+                accept_index[req_idx, (accept_lens - 1).to(torch.int64)]
+                - accept_indices_offset
+            )
+
+            if batch.mamba_track_indices is not None:
+                seq_lens_pre_verify = batch.seq_lens
+                seq_lens_post_verify = batch.seq_lens + accept_lens
+                mamba_track_interval = get_server_args().mamba_track_interval
+                to_track_mask = (
+                    seq_lens_pre_verify // mamba_track_interval
+                    != seq_lens_post_verify // mamba_track_interval
+                )
+                tracking_point = (
+                    seq_lens_post_verify // mamba_track_interval * mamba_track_interval
+                )
+                to_track_ith = torch.clamp(
+                    tracking_point - seq_lens_pre_verify - 1, min=0
+                ).to(torch.int64)
+                candidate_track_steps = (
+                    accept_index[req_idx, to_track_ith] - accept_indices_offset
+                )
+                mamba_steps_to_track = torch.where(
+                    to_track_mask,
+                    candidate_track_steps,
+                    torch.full_like(candidate_track_steps, -1),
+                )
+            else:
+                mamba_steps_to_track = None
 
         if hasattr(attn_backend, "update_mamba_state_after_mtp_verify"):
             attn_backend.update_mamba_state_after_mtp_verify(
