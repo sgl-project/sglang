@@ -1,6 +1,6 @@
 //! TokenizerManager egress thread — drains the egress ring (scheduler output
 //! pushed from Python) and routes each message to the detok shard that owns its
-//! `RequestId`. Routing is a pure function of the rid, so it matches the shard
+//! `RidHash`. Routing is a pure function of the rid, so it matches the shard
 //! the request registered with on ingress — no shared map, no lock.
 //!
 //! The ring carries a 1-byte frame tag: `BATCH` (a whole decode batch, fanned
@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 
-use crate::ids::RequestId;
+use crate::ids::RidHash;
 use crate::message::{
     ChunkEvent, EGRESS_TAG_BATCH, EGRESS_TAG_ERROR, EGRESS_TAG_RESULT, for_each_chunk,
 };
@@ -70,7 +70,7 @@ impl Runnable for Egress {
                         b.clear();
                     }
                     let ok = for_each_chunk(body, |ev| {
-                        buckets[RequestId(ev.rid).shard(shards)].push(ev);
+                        buckets[RidHash(ev.rid_hash).shard(shards)].push(ev);
                     });
                     if !ok {
                         tracing::warn!("egress: bad batch frame");
@@ -107,7 +107,7 @@ impl Egress {
     /// Route one message to the shard owning `rid`. HOL ceiling: a slow shard stalls
     /// this thread; the fix is a per-shard egress ring (see `threads::TM_CORES`).
     #[inline]
-    fn route(&self, rid: RequestId, msg: DetokMsg) {
+    fn route(&self, rid: RidHash, msg: DetokMsg) {
         if self.senders.detok_for(rid).send(msg).is_err() {
             tracing::error!("egress: detok shard closed");
         }
@@ -115,45 +115,47 @@ impl Egress {
 }
 
 /// Control result: `[rid, payload]` → single non-streamed delivery to the sink.
-fn decode_result(body: &[u8]) -> Option<(RequestId, DetokMsg)> {
+fn decode_result(body: &[u8]) -> Option<(RidHash, DetokMsg)> {
     let val = rmpv::decode::read_value(&mut &body[..]).ok()?;
     let rmpv::Value::Array(arr) = val else {
         return None;
     };
     let mut items = arr.into_iter();
-    let rid = parse_rid(items.next()?.as_str()?)?;
+    let rid = RidHash::from_rid(items.next()?.as_str()?);
     // The decode already owns the payload buffer — move it out.
     let payload = match items.next()? {
         rmpv::Value::Binary(b) => Bytes::from(b),
         rmpv::Value::String(s) => Bytes::from(s.into_bytes()),
         _ => return None,
     };
-    Some((rid, DetokMsg::Result { id: rid, payload }))
+    Some((
+        rid,
+        DetokMsg::Result {
+            rid_hash: rid,
+            payload,
+        },
+    ))
 }
 
 /// Per-request failure: `[rid, message]` → terminal `Error` to the sink (→ 400).
-fn decode_error(body: &[u8]) -> Option<(RequestId, DetokMsg)> {
+fn decode_error(body: &[u8]) -> Option<(RidHash, DetokMsg)> {
     let val = rmpv::decode::read_value(&mut &body[..]).ok()?;
     let rmpv::Value::Array(arr) = val else {
         return None;
     };
     let mut items = arr.into_iter();
-    let rid = parse_rid(items.next()?.as_str()?)?;
+    let rid = RidHash::from_rid(items.next()?.as_str()?);
     let message = match items.next()? {
         rmpv::Value::String(s) => s.into_str()?,
         _ => return None,
     };
-    Some((rid, DetokMsg::Fail { id: rid, message }))
-}
-
-fn parse_rid(rid: &str) -> Option<RequestId> {
-    match rid.parse::<u64>() {
-        Ok(v) => Some(RequestId(v)),
-        Err(_) => {
-            tracing::warn!(rid = %rid, "egress: unparsable rid");
-            None
-        }
-    }
+    Some((
+        rid,
+        DetokMsg::Fail {
+            rid_hash: rid,
+            message,
+        },
+    ))
 }
 
 #[cfg(test)]
@@ -169,10 +171,14 @@ mod tests {
         let framed = frame_egress_error("42", "invalid request: bad field");
         assert_eq!(framed[0], EGRESS_TAG_ERROR);
         let (rid, msg) = decode_error(&framed[1..]).expect("decodes");
-        assert_eq!(rid, RequestId(42));
+        let want = RidHash::from_rid("42");
+        assert_eq!(rid, want);
         match msg {
-            DetokMsg::Fail { id, message } => {
-                assert_eq!(id, RequestId(42));
+            DetokMsg::Fail {
+                rid_hash: id,
+                message,
+            } => {
+                assert_eq!(id, want);
                 assert_eq!(message, "invalid request: bad field");
             }
             _ => panic!("expected Fail"),

@@ -7,7 +7,7 @@ use tokio::sync::mpsc;
 
 use crate::error::Error;
 use crate::fsm::RequestState;
-use crate::ids::RequestId;
+use crate::ids::RidHash;
 
 /// Per-request back-channel the detok shard writes egress frames to and the API
 /// handler drains for SSE; bounded, and receiver-drop (disconnect) = stream end.
@@ -175,7 +175,11 @@ pub struct ControlRequest {
 /// mutated lock-free). Common fields here; variant data in [`RequestKind`].
 #[derive(Debug)]
 pub struct Request {
-    pub id: RequestId,
+    /// Routing key: `RidHash::from_rid(&rid)`.
+    pub rid_hash: RidHash,
+    /// Client-visible request id (uuid hex) — what the scheduler wire and
+    /// `meta_info.id` carry.
+    pub rid: String,
     pub state: RequestState,
     /// Back-channel to the client connection for egress frames.
     pub sink: EgressSink,
@@ -418,9 +422,10 @@ pub fn frame_egress_batch_cols(header: &[u8], data_cols: &[&[u8]]) -> Bytes {
 /// `#[serde(default)]`; the hot path (no extras) emits just the first four.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct BatchHeader {
-    /// Request ids, as the same strings Python holds (`Req.rid`) — parsed back to
-    /// the internal `u64` in `decode_one`, mirroring the control path
-    /// (`decode_result`/`parse_rid`).
+    /// Request ids, as the same strings Python holds (`Req.rid`, uuid hex) —
+    /// hashed back to the internal routing key in `decode_one`
+    /// (`RidHash::from_rid`), mirroring the control path. The wire has no
+    /// rid-shape coupling; any string is a valid rid.
     pub rids: Vec<String>,
     pub finish_reasons: Vec<Option<serde_json::Value>>,
     pub prompt_tokens: Vec<u32>,
@@ -651,15 +656,9 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> bool {
         };
 
         Some(ChunkEvent {
-            // Malformed rid → log it, then `None` → the whole frame is rejected,
-            // same as any other column that fails to decode.
-            rid: match h.rids[i].parse() {
-                Ok(v) => v,
-                Err(_) => {
-                    tracing::warn!(rid = %h.rids[i], "egress: unparsable rid in batch frame");
-                    return None;
-                }
-            },
+            // Any string is a valid rid; hash to the routing key. An unknown
+            // rid routes to a shard whose table has no entry → dropped there.
+            rid_hash: RidHash::from_rid(&h.rids[i]).0,
             token_ids,
             finish_reason: h.finish_reasons.get(i).cloned().flatten(),
             prompt_tokens: h.prompt_tokens.get(i).copied().unwrap_or(0),
@@ -709,8 +708,8 @@ pub fn frame_egress_error(rid: &str, message: &str) -> Bytes {
 /// frame and moved between stages in-process (never serialized), so no serde.
 #[derive(Debug, Clone, Default)]
 pub struct ChunkEvent {
-    /// Request id as raw `u64` — the shard routing key; no parse, no clone.
-    pub rid: u64,
+    /// `RidHash` digest of the rid — the shard routing key; `Copy`, no clone.
+    pub rid_hash: u64,
     /// New token ids for this step. Empty allowed (e.g. metadata-only frames).
     pub token_ids: Vec<i32>,
     /// `None` while streaming, the full finish-reason dict on the final chunk.
@@ -938,18 +937,18 @@ mod tests {
         let mut events = Vec::new();
         assert!(for_each_chunk(&framed[1..], |ev| events.push(ev)));
         assert_eq!(events.len(), 3);
-        assert_eq!(events[0].rid, 1);
+        assert_eq!(events[0].rid_hash, RidHash::from_rid("1").0);
         assert_eq!(events[0].token_ids, vec![10, 11]);
         assert_eq!(events[0].prompt_tokens, 4);
         assert!(events[0].finish_reason.is_none());
-        assert_eq!(events[1].rid, 2);
+        assert_eq!(events[1].rid_hash, RidHash::from_rid("2").0);
         assert!(events[1].token_ids.is_empty());
         // The whole dict survives (type + matched), not just the type.
         assert_eq!(
             events[1].finish_reason,
             Some(serde_json::json!({ "type": "stop", "matched": 5 }))
         );
-        assert_eq!(events[2].rid, 3);
+        assert_eq!(events[2].rid_hash, RidHash::from_rid("3").0);
         assert_eq!(events[2].token_ids, vec![12]);
         assert_eq!(events[2].prompt_tokens, 6);
         // A plain decode frame carries no extras columns at all, so the per-frame
@@ -988,27 +987,29 @@ mod tests {
         assert_eq!(routed, 0, "no request may be routed from a rejected frame");
     }
 
-    /// A non-numeric rid in the batch header (Python-mode uuid rid leaking into
-    /// the rust egress, or column drift) rejects the whole frame — routed
-    /// nothing, returned false, no panic.
+    /// Ingress/egress rid agreement: the routing key decoded from a uuid-rid
+    /// batch frame must equal `RidHash::from_rid` of the same string — the
+    /// invariant that lets shard routing work without any shared map. Guards a
+    /// rewrite that hashes differently on the two sides (e.g. a keyed hasher).
     #[test]
-    fn rejects_frame_with_unparsable_rid() {
+    fn uuid_rid_decodes_to_from_rid_key() {
         use rmpv::Value;
+        let rid = "9f86d081884c7d659a2feaa0c55ad015";
         let header_arr = Value::Array(vec![
-            Value::Array(vec![Value::from("not-a-u64")]), // rids
-            Value::Array(vec![Value::Nil]),               // finish_reasons
-            Value::Array(vec![Value::from(1u32)]),        // prompt_tokens
-            Value::Array(vec![Value::from(1u32)]),        // tok_lens
+            Value::Array(vec![Value::from(rid)]),  // rids
+            Value::Array(vec![Value::Nil]),        // finish_reasons
+            Value::Array(vec![Value::from(1u32)]), // prompt_tokens
+            Value::Array(vec![Value::from(1u32)]), // tok_lens
         ]);
         let mut header = Vec::new();
         rmpv::encode::write_value(&mut header, &header_arr).unwrap();
         let data: Vec<u8> = [0i32].iter().flat_map(|x| x.to_le_bytes()).collect();
 
         let framed = frame_egress_batch_cols(&header, &[&data]);
-        let mut routed = 0usize;
-        let ok = for_each_chunk(&framed[1..], |_| routed += 1);
-        assert!(!ok, "frame with unparsable rid must be rejected");
-        assert_eq!(routed, 0);
+        let mut events = Vec::new();
+        assert!(for_each_chunk(&framed[1..], |ev| events.push(ev)));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].rid_hash, RidHash::from_rid(rid).0);
     }
 
     /// A batch frame carrying the numeric columns (extras path): 2 requests,
