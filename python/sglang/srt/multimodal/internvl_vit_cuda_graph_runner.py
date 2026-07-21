@@ -22,7 +22,6 @@ import torch
 import torch.nn as nn
 
 from sglang.srt.layers.attention.vision import VisionAttention
-from sglang.srt.runtime_context import get_server_args
 
 
 class InternViTCudaGraphRunner:
@@ -51,6 +50,9 @@ class InternViTCudaGraphRunner:
         first_layer = encoder.layers[0]
         # InternAttention wraps VisionAttention as first_layer.attn.attn
         self._attn: VisionAttention = first_layer.attn.attn  # type: ignore
+        self._attn_backend: str | None = getattr(
+            self._attn, "qkv_backend_name", None
+        )
 
     @property
     def device(self) -> torch.device:
@@ -95,17 +97,19 @@ class InternViTCudaGraphRunner:
 
     def _warmup_once(self, key: Hashable) -> None:
         """Run a tiny eager warmup on the preallocated buffers to trigger lazy init."""
-        override_backend = get_server_args().mm_attention_backend
+        backend = self._attn_backend
         cu = self.cu[key]
         cu_kk = self.cu_kk[key]
         max_len = int(cu_kk.max().item()) if cu_kk.numel() else 0
 
-        if override_backend == "triton_attn":
+        if backend == "triton_attn":
             cu_ws = [cu, cu_kk, max_len]
-        elif override_backend == "fa3":
+        elif backend == "fa3":
             cu_ws = [cu, max_len]
         else:
-            raise RuntimeError("Not supported ViT attention backend for InternVL CG")
+            raise RuntimeError(
+                f"InternVL ViT CUDA graph does not support attention backend: {backend}"
+            )
 
         x = self.inp[key]
         y = x
@@ -115,18 +119,20 @@ class InternViTCudaGraphRunner:
 
     def _capture_graph(self, key: Hashable) -> None:
         g = torch.cuda.CUDAGraph()
-        override_backend = get_server_args().mm_attention_backend
+        backend = self._attn_backend
 
         cu = self.cu[key]
         cu_kk = self.cu_kk[key]
         max_len = int(cu_kk.max().item()) if cu_kk.numel() else 0
 
-        if override_backend == "triton_attn":
+        if backend == "triton_attn":
             cu_ws = [cu, cu_kk, max_len]
-        elif override_backend == "fa3":
+        elif backend == "fa3":
             cu_ws = [cu, max_len]
         else:
-            raise RuntimeError("Not supported ViT attention backend for InternVL CG")
+            raise RuntimeError(
+                f"InternVL ViT CUDA graph does not support attention backend: {backend}"
+            )
 
         torch.cuda.synchronize()
 

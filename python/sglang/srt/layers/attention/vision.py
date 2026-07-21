@@ -1049,6 +1049,12 @@ class VisionAttention(nn.Module):
             print_info_once(f"Multimodal attention backend not set. Use {qkv_backend}.")
         print_info_once(f"Using {qkv_backend} as multimodal attention backend.")
 
+        # Keep the resolved name alongside the implementation. Graph runners need
+        # the effective backend after applying CLI, model, and platform defaults;
+        # reading the raw server argument again loses that information when it is
+        # left unset.
+        self.qkv_backend_name: str = qkv_backend
+
         self.customized_position_embedding_applier = (
             customized_position_embedding_applier
         )
@@ -1150,7 +1156,8 @@ class VisionAttention(nn.Module):
         - CUDA (Hopper SM90): "fa3"
         - CUDA (Blackwell SM100): "fa4"
         - CUDA (other): "triton_attn"
-        - Non-CUDA: "sdpa"
+        - Ascend NPU: "ascend_attn"
+        - Other platforms: device-specific optimized backend or "sdpa"
         """
         override_backend = get_server_args().mm_attention_backend
         if override_backend is not None:
@@ -1165,6 +1172,8 @@ class VisionAttention(nn.Module):
                 backend = "fa4"
             else:
                 backend = "triton_attn"
+        elif _is_npu:
+            backend = "ascend_attn"
         elif _is_musa:
             if get_device_capability() >= (3, 1):
                 backend = "fa3"
