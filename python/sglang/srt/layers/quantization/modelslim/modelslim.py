@@ -175,6 +175,10 @@ class ModelSlimConfig(QuantizationConfig):
                 prefix_in_quant_config = prefix.replace(
                     proj_name, packed_modules_mapping_subset[proj_name][0]
                 )
+                # Verify the remapped prefix exists in quant_description.
+                # If not (e.g. json uses fused name as-is), fall back to original.
+                if prefix_in_quant_config + ".weight" not in self.quant_description:
+                    prefix_in_quant_config = prefix
             if self.is_layer_skipped(
                 prefix, packed_modules_mapping_subset
             ) or self.is_layer_skipped(prefix, self.packed_modules_mapping):
