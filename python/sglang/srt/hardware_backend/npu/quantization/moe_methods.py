@@ -173,16 +173,6 @@ class NPUW4A4MXFP4MoEMethod(_NPUMoEMethodBase):
         super().__init__(quant_config=None)
         self.matmul = GroupedMatmul()
 
-    @staticmethod
-    def _normalize_scale_layout(scale: torch.Tensor) -> torch.Tensor:
-        """Convert [..., K/32] UE8M0 scales to [..., K/64, 2]."""
-        if scale.shape[-1] % 2 != 0:
-            raise ValueError(
-                "MXFP4 scale's last dimension must be divisible by 2, "
-                f"got {scale.shape[-1]}"
-            )
-        return scale.reshape(*scale.shape[:-1], scale.shape[-1] // 2, 2)
-
     def process_weights_after_loading(
         self, layer: torch.nn.Module, weight_prefix: str
     ) -> None:
@@ -236,8 +226,10 @@ class NPUW4A4MXFP4MoEMethod(_NPUMoEMethodBase):
                 block_size=MXFP4_BLOCK_SIZE,
                 scale_alg=None,
             )
-        elif pertoken_scale.dim() == 2:
-            pertoken_scale = self._normalize_scale_layout(pertoken_scale)
+        elif pertoken_scale is not None:
+            pertoken_scale = pertoken_scale.reshape(
+                hidden_states.shape[0], hidden_states.shape[1] // 32, 2
+            )
 
         scale_args: Dict[str, Any] = {
             "scale": [getattr(quant_info, f"{weight_prefix}_weight_scale", None)],
