@@ -1312,8 +1312,24 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                         value=0.0,
                     )
             elif self.flashinfer_mxfp4_moe_precision == "default":
-                x_quant, x_scale = mxfp8_quantize(x, False, alignment=self.hidden_size)
-                x_scale = x_scale.view(torch.float8_e4m3fn).reshape(*x.shape[:-1], -1)
+                if x.shape[-1] == self.hidden_size:
+                    from sglang.jit_kernel.per_token_group_quant import (
+                        per_token_group_quant,
+                    )
+
+                    if x.dim() > 2:
+                        x = x.view(-1, x.shape[-1])
+                    x_quant, x_scale = per_token_group_quant(
+                        x, group_size=32, scale_ue8m0=True
+                    )
+                    x_scale = x_scale.view(torch.float8_e4m3fn)
+                else:
+                    x_quant, x_scale = mxfp8_quantize(
+                        x, False, alignment=self.hidden_size
+                    )
+                    x_scale = x_scale.view(torch.float8_e4m3fn).reshape(
+                        *x.shape[:-1], -1
+                    )
             else:
                 raise NotImplementedError()
 
