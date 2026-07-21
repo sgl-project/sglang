@@ -14,7 +14,7 @@ from sglang.jit_kernel.inkling_gate_topk_renorm import (
     inkling_gate_gemv,
     inkling_gate_gemv_fused,
 )
-from sglang.jit_kernel.utils import is_arch_support_pdl
+from sglang.kernels.jit import is_arch_support_pdl
 from sglang.srt.configs.inkling import InklingModelConfig
 from sglang.srt.distributed import (
     get_tensor_model_parallel_group,
