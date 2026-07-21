@@ -174,21 +174,22 @@ def resolve_num_resident_experts(
     mc, htc, moe_layers, per_el = _moe_geometry()
     layers = mc.num_hidden_layers
 
-    # KV headroom to reserve when sizing K. The K-slot pool is FIXED (it does not grow with concurrency);
-    # sglang sizes the real KV pool from the post-weights leftover and derives max_running_requests from
-    # THAT. So reserving the worst case (max_running_requests x full context) here double-counts and
-    # starves K — a footgun on the constrained cards Paged Experts targets (a high --max-running-requests
-    # silently floored K to top_k). Reserve a SINGLE-STREAM context by default; sglang's actual KV pool
-    # (the leftover) then supports real concurrency. --paged-experts-kv-reserve-gb overrides to reserve a
-    # larger guaranteed KV pool (smaller K). sizing.compute_num_resident_experts clamps it to physical.
+    # KV headroom to reserve when sizing K — the K-slot pool and the KV pool compete for the SAME VRAM,
+    # so the reserve is the KV/K split knob. Reserve for the ACTUALLY-declared concurrency
+    # (``max_running_requests`` x context): low concurrency (single-stream) reserves little -> K claims
+    # the surplus (fewer expert page-ins, the single-stream win); high concurrency reserves more -> the
+    # KV pool rightly stays large. ``compute_num_resident_experts`` clamps the reserve to what's left
+    # after a top_k pool, so a pathologically high max_running_requests floors K to top_k instead of
+    # going negative. --paged-experts-kv-reserve-gb overrides with an explicit total KV budget.
     kv_elt = 1 if "fp8" in (sa.kv_cache_dtype or "").lower() else 2
     ctx = sa.context_length or getattr(mc, "context_len", None) or 2048
+    mrr = max(1, int(getattr(sa, "max_running_requests", 1) or 1))
     kv_gb = getattr(sa, "paged_experts_kv_reserve_gb", -1.0)
     if kv_gb is not None and kv_gb >= 0:
         kv_reserve = kv_gb * 1e9
     elif getattr(mc, "kv_lora_rank", None):  # MLA
         cell = (mc.kv_lora_rank + mc.qk_rope_head_dim) * layers * kv_elt
-        kv_reserve = ctx * cell  # single-stream
+        kv_reserve = mrr * ctx * cell
     else:  # MHA / GQA — reuse the pure helper (get_num_kv_heads handles GQA + TP)
         tp = getattr(sa, "tp_size", 1) or 1
         kv_reserve = kv_reserve_bytes_mha(
@@ -196,7 +197,7 @@ def resolve_num_resident_experts(
             num_kv_heads=mc.get_num_kv_heads(tp),
             head_dim=(mc.head_dim + mc.v_head_dim) // 2,  # combined K+V per-head width
             kv_dtype_bytes=kv_elt,
-            max_running_requests=1,  # single-stream headroom, NOT worst-case concurrency
+            max_running_requests=mrr,  # size KV for the declared concurrency; single-stream -> small
             context_length=ctx,
         )
 
@@ -225,9 +226,10 @@ def resolve_num_resident_experts(
     # readable; both floored at the passed default so smaller models keep their K.
     exact = _nonexpert_weight_bytes_from_checkpoint(sa.model_path)
     if exact is not None:
-        nonexpert_bytes = max(
-            nonexpert_reserve_gb * 1e9, exact + _NONEXPERT_RUNTIME_RESERVE
-        )
+        # exact is summed from the checkpoint's real tensor sizes — trust it (+ runtime reserve) rather
+        # than flooring up to nonexpert_reserve_gb, which needlessly shrinks K on models whose non-expert
+        # weights are genuinely smaller than the floor. The floor still guards the estimate branch below.
+        nonexpert_bytes = exact + _NONEXPERT_RUNTIME_RESERVE
     else:
         # The fixed base underestimates big-vocab / VL checkpoints (a 248k untied vocab is ~2 GB of
         # embeddings + lm_head alone) — estimate the dominant variable term from config. The 2.0 GB
