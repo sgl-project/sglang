@@ -570,6 +570,7 @@ std::tuple<at::Tensor, at::Tensor> rotary_embedding_cpu(
   CHECK_DIM(1, positions);
   const auto input_dim = query.dim();
   const auto input_dtype = query.scalar_type();
+  TORCH_CHECK(input_dim >= 2 && input_dim <= 4, "Query/Key must be 2D/3D/4D, got ", input_dim, "D.");
 
   CHECK_DIM(2, cos_sin_cache);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(query);
@@ -580,6 +581,8 @@ std::tuple<at::Tensor, at::Tensor> rotary_embedding_cpu(
 
   int64_t rotary_dim = cos_sin_cache.size(1);
   const RopeParams p{query, key, head_size, rotary_dim};
+  TORCH_CHECK(p.rotary_dim <= p.head_size, "rotary_dim must be <= head_size");
+  TORCH_CHECK(p.rotary_dim % 2 == 0, "rotary_dim must be even");
   TORCH_CHECK(positions.numel() == p.rows(), "positions.numel() must equal batch * seqlen");
 
   if (input_dim == 2) {
@@ -597,8 +600,8 @@ std::tuple<at::Tensor, at::Tensor> rotary_embedding_cpu(
     CHECK_EQ(query.size(1), key.size(1));
   }
 
-  at::Tensor query_out = (input_dim != 3) ? query : at::empty_like(query);
-  at::Tensor key_out = (input_dim != 3) ? key : at::empty_like(key);
+  at::Tensor query_out = (input_dim != 3) ? query : at::empty(query.sizes(), query.options());
+  at::Tensor key_out = (input_dim != 3) ? key : at::empty(key.sizes(), key.options());
   AT_DISPATCH_REDUCED_FLOATING_TYPES(input_dtype, "rotary_embedding_cpu", [&] {
     AT_DISPATCH_BOOL(input_dim != 3, inplace, [&] {
       const scalar_t* cache_base = cos_sin_cache.data_ptr<scalar_t>();
@@ -717,7 +720,7 @@ std::tuple<at::Tensor, at::Tensor> multimodal_rotary_embedding_cpu(
   const RopeParams p{query, key, head_size, rotary_dim};
   TORCH_CHECK(p.rotary_dim <= p.head_size, "rotary_dim must be <= head_size");
   TORCH_CHECK(p.rotary_dim % 2 == 0, "rotary_dim must be even");
-  TORCH_CHECK(positions.size(-1) == p.rows(), "positions numel must equal batch*seqlen");
+  TORCH_CHECK(positions.size(-1) == p.rows(), "positions.size(-1) must equal batch * seqlen");
 
   int64_t num_heads = query.size(-1) / head_size;
   int64_t num_kv_heads = key.size(-1) / head_size;
