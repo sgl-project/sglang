@@ -687,6 +687,23 @@ class ToolChoice(BaseModel):
     type: Literal["function"] = Field(default="function", examples=["function"])
 
 
+# OpenAI-spec string tiers for reasoning effort (current Responses/Chat API):
+# none/minimal/low/medium/high/xhigh/max. Used as-is by /v1/responses.
+ReasoningEffortTier = Literal[
+    "none", "minimal", "low", "medium", "high", "xhigh", "max"
+]
+# Chat Completions and /v1/tokenize additionally accept a fine-grained float in
+# [0.0, 0.99] as an sglang extension (not part of the OpenAI schema, so the
+# /v1/responses surface deliberately keeps the string tiers only). Single-sourced
+# so these surfaces cannot drift apart.
+ReasoningEffortType = Optional[
+    Union[
+        ReasoningEffortTier,
+        Annotated[float, Field(ge=0.0, le=0.99, allow_inf_nan=False)],
+    ]
+]
+
+
 class ChatCompletionRequest(BaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/chat/create
@@ -730,16 +747,11 @@ class ChatCompletionRequest(BaseModel):
     return_cached_tokens_details: bool = False
     return_prompt_token_ids: bool = False
     return_meta_info: bool = False
-    reasoning_effort: Optional[
-        Union[
-            Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"],
-            Annotated[float, Field(ge=0.0, le=0.99, allow_inf_nan=False)],
-        ]
-    ] = Field(
+    reasoning_effort: ReasoningEffortType = Field(
         default=None,
         description="Constrains effort on reasoning for reasoning models. "
         "Accepts string levels ('none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max') or a "
-        "float in [0.0, 1.0] for fine-grained control. "
+        "float in [0.0, 0.99] for fine-grained control. "
         "'none' disables reasoning entirely, 'low' is the least effort, 'high' is the most effort. "
         "Reducing reasoning effort can result in faster responses and fewer tokens used on reasoning "
         "in a response. 'none' defaults thinking and enable_thinking to false in "
@@ -858,6 +870,7 @@ class ChatCompletionRequest(BaseModel):
                 effort = r.get("reasoning_effort")
             if isinstance(effort, str) and effort in {
                 "none",
+                "minimal",
                 "low",
                 "medium",
                 "high",
@@ -1301,9 +1314,7 @@ class TokenizeRequest(BaseModel):
     tool_choice: Optional[Union[ToolChoice, Literal["auto", "required", "none"]]] = (
         Field(default=None, examples=["auto"])
     )
-    reasoning_effort: Optional[Literal["none", "minimal", "low", "medium", "high"]] = (
-        None
-    )
+    reasoning_effort: ReasoningEffortType = None
     continue_final_message: bool = False
     chat_template_kwargs: Optional[Dict] = None
     add_special_tokens: bool = Field(
@@ -1369,9 +1380,11 @@ OpenAIServingRequest = Union[
 class ResponseReasoningParam(BaseModel):
     """Reasoning parameters for responses."""
 
-    effort: Optional[Literal["low", "medium", "high"]] = Field(
+    effort: Optional[ReasoningEffortTier] = Field(
         default="medium",
-        description="Constrains effort on reasoning for reasoning models.",
+        description="Constrains effort on reasoning for reasoning models. "
+        "Accepts the OpenAI string tiers "
+        "('none','minimal','low','medium','high','xhigh','max').",
     )
     summary: Optional[Literal["auto", "concise", "detailed"]] = Field(
         default=None,
