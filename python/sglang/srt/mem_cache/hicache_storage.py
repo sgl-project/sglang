@@ -168,6 +168,25 @@ def clamp_prefix_to_sidecar_coverage(
     return safe_tokens
 
 
+def hybrid_pools_fully_covered(
+    completed_tokens: int,
+    hash_value: List[str],
+    pool_transfers: List[PoolTransfer],
+    extra_pool_hit_pages: dict[str, int],
+    page_size: int,
+) -> bool:
+    """All-or-nothing check for sidecars that can't be safely truncated page by
+    page (TRAILING_PAGES, or any pool not KV-derived): KV must have completed
+    in full, and every pool's requested keys must have fully succeeded."""
+    if completed_tokens != len(hash_value) * page_size:
+        return False
+    return all(
+        transfer.keys is not None
+        and extra_pool_hit_pages.get(transfer.name, 0) == len(transfer.keys)
+        for transfer in pool_transfers
+    )
+
+
 class HiCacheStorage(ABC):
     """
     HiCacheStorage is a class that provides a generic key-value interface for storing and retrieving KV cache.

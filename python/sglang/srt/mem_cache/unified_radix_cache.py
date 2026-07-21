@@ -30,10 +30,12 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.events import KVCacheEventMixin
 from sglang.srt.mem_cache.hicache_storage import (
+    PoolHitPolicy,
     PoolName,
     PoolTransfer,
     SidecarPoolSpec,
     clamp_prefix_to_sidecar_coverage,
+    hybrid_pools_fully_covered,
 )
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
@@ -2030,10 +2032,38 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 hit_pages[p] = int(packed[1 + i].item())
                 hit_prefix[p] = int(packed[1 + n + i].item())
 
-        # Bound the prefix by ALL_PAGES sidecar coverage (e.g. INDEXER).
-        min_completed_tokens = clamp_prefix_to_sidecar_coverage(
-            min_completed_tokens, operation.pool_transfers, hit_prefix, self.page_size
+        pool_transfers = operation.pool_transfers or []
+        # KV-derived ALL_PAGES sidecars (e.g. the DSA/NSA indexer) are page-aligned
+        # with KV and required for every token, so a partial prefix can still be
+        # clamped and kept. Everything else (SWA/Mamba/mixed DeepSeekV4 stacks)
+        # only covers a window or tail and can't be truncated page by page — any
+        # shortfall there makes the whole prefetch result unusable.
+        clampable = bool(pool_transfers) and all(
+            t.hit_policy == PoolHitPolicy.ALL_PAGES and t.indices_from_pool == PoolName.KV
+            for t in pool_transfers
         )
+        if clampable:
+            min_completed_tokens = clamp_prefix_to_sidecar_coverage(
+                min_completed_tokens, pool_transfers, hit_prefix, self.page_size
+            )
+        elif pool_transfers and not hybrid_pools_fully_covered(
+            min_completed_tokens, hash_value, pool_transfers, hit_pages, self.page_size
+        ):
+            self.cache_controller.append_host_mem_release(
+                host_indices=host_indices[:completed_tokens],
+                extra_pools=pool_transfers,
+            )
+            self.dec_host_lock_ref(last_host_node, anchor_lock_params)
+            del self.ongoing_prefetch[req_id]
+            self.cache_controller.prefetch_tokens_occupied -= len(prefetch_key)
+            self.prefetch_loaded_tokens_by_reqid[req_id] = 0
+            logger.warning(
+                "HiCache hybrid prefetch discarded req=%s completed=%d requested=%d",
+                req_id,
+                completed_tokens,
+                len(hash_value) * self.page_size,
+            )
+            return True
 
         fetched_key = prefetch_key[:min_completed_tokens]
         insert_result = self._insert_helper_host(
