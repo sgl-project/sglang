@@ -70,6 +70,11 @@ class SchedulerStats:
     gen_throughput: float = 0.0
     cache_hit_rate: float = 0.0
     decode_sum_seq_lens: int = 0
+    # Per-tier cache hit token counts (incremental, reset after each log_stats call)
+    l1_hit_tokens: int = 0
+    l2_hit_tokens: int = 0
+    l3_hit_tokens: int = 0
+    cache_miss_tokens: int = 0
 
     # Memory pool usage ratios (0.0–1.0).
     # Each pool tracks: used = total - available - evictable, usage = used / total.
@@ -301,6 +306,27 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             documentation="The sum of all sequence lengths in decode.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
+        )
+        # Per-tier cache hit counters (L1=GPU radix, L2=Host DRAM, L3=Storage)
+        self.cache_hit_tokens_l1_total = Counter(
+            name="sglang:cache_hit_tokens_l1_total",
+            documentation="Total tokens matched from L1 GPU device cache (radix tree).",
+            labelnames=labels.keys(),
+        )
+        self.cache_hit_tokens_l2_total = Counter(
+            name="sglang:cache_hit_tokens_l2_total",
+            documentation="Total tokens loaded back from L2 Host DRAM cache (excluding L3 storage-promoted tokens).",
+            labelnames=labels.keys(),
+        )
+        self.cache_hit_tokens_l3_total = Counter(
+            name="sglang:cache_hit_tokens_l3_total",
+            documentation="Total tokens prefetched from L3 storage backend (promoted through Host to GPU).",
+            labelnames=labels.keys(),
+        )
+        self.cache_miss_tokens_total = Counter(
+            name="sglang:cache_miss_tokens_total",
+            documentation="Total tokens not found in any cache tier, requiring full prefill computation.",
+            labelnames=labels.keys(),
         )
 
         # =================================================================
@@ -1278,6 +1304,14 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self._log_gauge(self.num_grammar_queue_reqs, stats.num_grammar_queue_reqs)
         self._log_gauge(self.gen_throughput, stats.gen_throughput)
         self._log_gauge(self.cache_hit_rate, stats.cache_hit_rate)
+        self.cache_hit_tokens_l1_total.labels(**self.labels).inc(stats.l1_hit_tokens)
+        self.cache_hit_tokens_l2_total.labels(**self.labels).inc(stats.l2_hit_tokens)
+        self.cache_hit_tokens_l3_total.labels(**self.labels).inc(stats.l3_hit_tokens)
+        self.cache_miss_tokens_total.labels(**self.labels).inc(stats.cache_miss_tokens)
+        stats.l1_hit_tokens = 0
+        stats.l2_hit_tokens = 0
+        stats.l3_hit_tokens = 0
+        stats.cache_miss_tokens = 0
         self._log_gauge(self.decode_sum_seq_lens, stats.decode_sum_seq_lens)
 
         # Memory pool usage ratios
