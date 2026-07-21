@@ -300,6 +300,21 @@ _is_npu = is_npu()
 _is_hip = is_hip()
 
 
+def _abort_decode_kv_receiver(decode_req) -> None:
+    """Abort a queued decode request's kv_receiver, tolerating None.
+
+    DecodeTransferQueue clears ``kv_receiver`` after a successful KV
+    transfer commit or a metadata-corruption abort. Under an abort_all
+    wave (client-side cancels or upstream prefill bootstrap timeouts)
+    ``handle_abort_req`` can race with that cleanup and observe an
+    already-nulled receiver; guarding the .abort() call keeps the
+    scheduler thread alive.
+    """
+    receiver = decode_req.kv_receiver
+    if receiver is not None:
+        receiver.abort()
+
+
 class Scheduler(
     SchedulerDisaggregationDecodeMixin,
     SchedulerDisaggregationPrefillMixin,
@@ -4139,13 +4154,13 @@ class Scheduler(
             for decode_req in self.disagg_decode_prealloc_queue.queue:
                 if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort prealloc queue request. {decode_req.req.rid=}")
-                    decode_req.kv_receiver.abort()
+                    _abort_decode_kv_receiver(decode_req)
 
             # Abort requests waiting for kvcache to release tree cache
             for decode_req in self.disagg_decode_transfer_queue.queue:
                 if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort transfer queue request. {decode_req.req.rid=}")
-                    decode_req.kv_receiver.abort()
+                    _abort_decode_kv_receiver(decode_req)
 
             # Abort requests already retracted to CPU cache
             if self.disagg_decode_prealloc_queue.retracted_queue:
