@@ -227,6 +227,27 @@ class TestFastInputLogprobs(CustomTestCase):
             torch.testing.assert_close(ref, got, rtol=1e-3, atol=1e-3)
 
     @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+    def test_logits_topk_matches_torch(self):
+        from sglang.srt.layers.logprob_processor import _logits_topk
+
+        torch.manual_seed(0)
+        # fp32 randn is tie-free w.h.p., so indices must match torch exactly.
+        logits = torch.randn(64, 151936, device="cuda")
+        ref_v, ref_i = torch.topk(logits, k=5, dim=-1, sorted=True)
+        got_v, got_i = _logits_topk(logits, 5)
+        torch.testing.assert_close(ref_v, got_v.to(ref_v.dtype))
+        self.assertTrue(torch.equal(ref_i, got_i.to(ref_i.dtype)))
+        # bf16 has value ties; only the sorted values are contractual.
+        logits = torch.randn(64, 151936, device="cuda", dtype=torch.bfloat16)
+        ref_v, _ = torch.topk(logits, k=5, dim=-1, sorted=True)
+        got_v, got_i = _logits_topk(logits, 5)
+        self.assertTrue(torch.equal(ref_v, got_v.to(ref_v.dtype)))
+        # Returned indices must point at the returned values.
+        self.assertTrue(
+            torch.equal(logits.gather(-1, got_i.long()).to(got_v.dtype), got_v)
+        )
+
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
     def test_row_logsumexp_kernel_matches_reference(self):
         from sglang.srt.layers.logsumexp import row_logsumexp
 
