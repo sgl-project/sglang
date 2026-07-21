@@ -25,6 +25,7 @@ from sglang.srt.utils.common import (
     is_hip,
     is_musa,
     is_npu,
+    is_xpu,
 )
 
 if is_cuda():
@@ -73,6 +74,12 @@ class Sampler(nn.Module):
         self.tp_sync_group = get_tp_group().device_group
         if is_dp_attention_enabled():
             self.tp_sync_group = get_parallel().attn_tp_group.device_group
+
+        # Intel XPU lacks a working ReduceOp.MIN/MAX all_reduce, so broadcast the
+        # first rank's token ids for the grammar TP sync instead.
+        self.token_id_sync_via_broadcast = is_xpu()
+        if self.token_id_sync_via_broadcast:
+            self.token_id_sync_src_rank = dist.get_global_rank(self.tp_sync_group, 0)
 
         self.rl_on_policy_target = get_server_args().rl_on_policy_target
         # In RL on-policy mode, deterministic inference is automatically enabled.
@@ -484,11 +491,19 @@ class Sampler(nn.Module):
             # In such cases, enable this env variable to prevent hanging due to TP ranks becoming desynchronized.
             # When using xgrammar, this becomes more likely so we also do the sync when grammar is used.
 
-            torch.distributed.all_reduce(
-                batch_next_token_ids,
-                op=dist.ReduceOp.MIN,
-                group=self.tp_sync_group,
-            )
+            if self.token_id_sync_via_broadcast:
+                # Intel XPU: broadcast in place of the MIN all_reduce below.
+                torch.distributed.broadcast(
+                    batch_next_token_ids,
+                    src=self.token_id_sync_src_rank,
+                    group=self.tp_sync_group,
+                )
+            else:
+                torch.distributed.all_reduce(
+                    batch_next_token_ids,
+                    op=dist.ReduceOp.MIN,
+                    group=self.tp_sync_group,
+                )
 
     def compute_logprobs_only(
         self,
