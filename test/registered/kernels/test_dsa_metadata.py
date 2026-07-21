@@ -304,10 +304,22 @@ class TestDSAMetadataKernels(CustomTestCase):
         )
         expected_dsa = _dsa_seqlens(expected_expanded, dsa_index_topk)
 
+        # Columns at or past a request's kv length are undefined: the kernel
+        # skips whole page-table column blocks once they begin beyond kv_len
+        # (no consumer reads there -- attention and the indexer both stay
+        # within cache_seqlens). Only the live prefix [:kv_len] per request is
+        # part of the contract, so assert just that region. All expanded rows
+        # of a request share the request's kv length.
+        row_kv_lens = torch.repeat_interleave(seq_lens.to(torch.int32), extend_seq_lens)
+        cols = torch.arange(max_seqlen_k, dtype=torch.int32, device=self.device)
+        live_mask = cols.view(1, -1) < row_kv_lens.view(-1, 1)
+
         _assert_equal(cache_seqlens, expected_cache, "draft cache_seqlens")
         _assert_equal(cu_seqlens_k, _cu_seqlens(expected_cache), "draft cu_seqlens_k")
         _assert_equal(
-            page_table_1[:total_len], expected_page_table, "draft page_table_1"
+            page_table_1[:total_len][live_mask],
+            expected_page_table[live_mask],
+            "draft page_table_1 (live [:kv_len] prefix)",
         )
         _assert_equal(
             seqlens_expanded[:total_len], expected_expanded, "draft seqlens_expanded"
@@ -321,10 +333,18 @@ class TestDSAMetadataKernels(CustomTestCase):
             "draft dsa_cu_seqlens_k",
         )
         if real_page_size > 1:
+            # A real-page column maps to source column real_col * real_page_size;
+            # it is live iff that source column is within the request's kv_len.
+            real_width = real_page_table.shape[1]
+            real_cols = torch.arange(real_width, dtype=torch.int32, device=self.device)
+            real_live_mask = (
+                real_cols.view(1, -1) * real_page_size
+            ) < row_kv_lens.view(-1, 1)
+            expected_real = _real_page_table(expected_page_table, real_page_size)
             _assert_equal(
-                real_page_table[:total_len],
-                _real_page_table(expected_page_table, real_page_size),
-                "draft real_page_table",
+                real_page_table[:total_len][real_live_mask],
+                expected_real[real_live_mask],
+                "draft real_page_table (live [:kv_len] prefix)",
             )
 
     def test_decode_matches_eager_reference(self):
