@@ -38,7 +38,7 @@ fn response_data(
 }
 
 #[test]
-fn cumulative_and_incremental_chunks_are_normalized_to_deltas() {
+fn cumulative_and_incremental_token_chunks_are_normalized_to_deltas() {
     let mut cumulative = GenerationOffsets::default();
     let first = typed_generation_chunk(
         response_data(vec![1, 2], "hé", false, serde_json::json!({})),
@@ -53,9 +53,7 @@ fn cumulative_and_incremental_chunks_are_normalized_to_deltas() {
     )
     .unwrap();
     assert_eq!(first.delta_output_ids, vec![1, 2]);
-    assert_eq!(first.delta_text, "hé");
     assert_eq!(second.delta_output_ids, vec![3]);
-    assert_eq!(second.delta_text, "llo");
 
     let mut incremental = GenerationOffsets::default();
     let first = typed_generation_chunk(
@@ -72,7 +70,6 @@ fn cumulative_and_incremental_chunks_are_normalized_to_deltas() {
     .unwrap();
     assert_eq!(first.delta_output_ids, vec![1]);
     assert_eq!(second.delta_output_ids, vec![2]);
-    assert_eq!(second.delta_text, "llo");
 }
 
 #[test]
@@ -254,7 +251,8 @@ fn terminal_metadata_is_typed_and_not_duplicated_in_extensions() {
     )
     .unwrap();
     let usage = chunk.usage.unwrap();
-    assert_eq!(usage.total_tokens, 9);
+    assert_eq!(usage.prompt_tokens, 8);
+    assert_eq!(usage.completion_tokens, 1);
     assert_eq!(usage.cached_prompt_tokens, 3);
     assert!(matches!(chunk.terminal, Some(TypedTerminal::Finish(_))));
     let fields = chunk.engine_metadata.unwrap().fields;

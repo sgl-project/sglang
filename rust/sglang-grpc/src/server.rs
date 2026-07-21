@@ -355,7 +355,6 @@ fn logprob_entry(
 #[derive(Default)]
 struct GenerationOffsets {
     token: usize,
-    text: usize,
     output_logprob: usize,
     prompt_logprobs_sent: bool,
 }
@@ -583,7 +582,6 @@ fn generation_terminal(meta: &serde_json::Map<String, serde_json::Value>) -> Typ
 struct TypedGenerationChunk {
     choice_index: i32,
     delta_output_ids: Vec<i32>,
-    delta_text: String,
     logprobs: Option<proto::Logprobs>,
     usage: Option<proto::Usage>,
     routed_experts: Option<proto::RoutedExpertMetadata>,
@@ -599,24 +597,6 @@ impl TypedGenerationChunk {
         });
         proto::GenerateResponse {
             delta_output_ids: self.delta_output_ids,
-            choice_index: self.choice_index,
-            logprobs: self.logprobs,
-            usage: self.usage,
-            routed_experts: self.routed_experts,
-            engine_metadata: self.engine_metadata,
-            terminal,
-        }
-    }
-
-    fn into_text_generate_response(self) -> proto::TextGenerateResponse {
-        let terminal = self.terminal.map(|terminal| match terminal {
-            TypedTerminal::Finish(finish) => {
-                proto::text_generate_response::Terminal::Finish(finish)
-            }
-            TypedTerminal::Error(error) => proto::text_generate_response::Terminal::Error(error),
-        });
-        proto::TextGenerateResponse {
-            delta_text: self.delta_text,
             choice_index: self.choice_index,
             logprobs: self.logprobs,
             usage: self.usage,
@@ -645,18 +625,6 @@ fn typed_generation_chunk(
         offsets.token = output_ids.len();
         output_ids[start..].to_vec()
     };
-    let text = data.text.unwrap_or_default();
-    let delta_text = if data.incremental {
-        offsets.text = offsets.text.saturating_add(text.len());
-        text
-    } else {
-        let delta = text
-            .get(offsets.text..)
-            .map(str::to_owned)
-            .unwrap_or_else(|| text.clone());
-        offsets.text = text.len();
-        delta
-    };
     let logprobs = logprobs_from_meta(&data.meta_info, offsets, data.incremental)?;
     let usage = choice_terminal.then(|| {
         let prompt_tokens = meta_u64(&data.meta_info, &["prompt_tokens", "input_tokens"]);
@@ -664,7 +632,6 @@ fn typed_generation_chunk(
         proto::Usage {
             prompt_tokens,
             completion_tokens,
-            total_tokens: prompt_tokens.saturating_add(completion_tokens),
             cached_prompt_tokens: meta_u64(
                 &data.meta_info,
                 &["cached_tokens", "cached_prompt_tokens"],
@@ -674,7 +641,6 @@ fn typed_generation_chunk(
     Ok(TypedGenerationChunk {
         choice_index: data.choice_index,
         delta_output_ids,
-        delta_text,
         logprobs,
         usage,
         routed_experts: routed_experts(&data.meta_info)?,
@@ -699,12 +665,6 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
             .clone()
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let req_dict = build_text_generate_dict(&rid, &req).map_err(Status::invalid_argument)?;
-        let expected_choices = req
-            .sampling_params
-            .as_ref()
-            .and_then(|params| params.n)
-            .unwrap_or(1)
-            .max(1) as usize;
 
         let mut receiver = self
             .bridge
@@ -717,48 +677,23 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
 
         let stream = async_stream::stream! {
             let mut abort_guard = RequestAbortGuard::new(bridge.clone(), rid_clone.clone());
-            let mut offsets = HashMap::<i32, GenerationOffsets>::new();
-            let mut choices = ChoiceTracker::new(expected_choices);
             loop {
                 match recv_chunk_with_timeout(&mut receiver, response_timeout, || "Stream chunk timed out".to_string()).await {
-                    Ok(Some(chunk @ (ResponseChunk::Data(_) | ResponseChunk::Finished(_)))) => {
-                        let request_finished = matches!(&chunk, ResponseChunk::Finished(_));
-                        let data = match chunk {
-                            ResponseChunk::Data(data) | ResponseChunk::Finished(data) => data,
-                            ResponseChunk::Error(_) => unreachable!(),
-                        };
-                        let choice_index = data.choice_index;
-                        let choice_terminal = request_finished || has_finish_reason(&data.meta_info);
-                        let all_terminal = match choices.observe(
-                            choice_index,
-                            choice_terminal,
-                            request_finished,
-                            "TextGenerate",
-                        ) {
-                            Ok(all_terminal) => all_terminal,
-                            Err(error) => {
-                                abort_guard.abort_now();
-                                yield Err(Status::internal(error));
-                                break;
-                            }
-                        };
-                        let mapped = match typed_generation_chunk(
-                            data,
-                            choice_terminal,
-                            offsets.entry(choice_index).or_default(),
-                        ) {
-                            Ok(mapped) => mapped.into_text_generate_response(),
-                            Err(error) => {
-                                abort_guard.abort_now();
-                                yield Err(Status::internal(error));
-                                break;
-                            }
-                        };
-                        yield Ok(mapped);
-                        if all_terminal {
-                            abort_guard.disarm();
-                            break;
-                        }
+                    Ok(Some(ResponseChunk::Data(data))) => {
+                        yield Ok(proto::TextGenerateResponse {
+                            text: data.text.unwrap_or_default(),
+                            meta_info: meta_to_string_map(data.meta_info),
+                            finished: false,
+                        });
+                    }
+                    Ok(Some(ResponseChunk::Finished(data))) => {
+                        abort_guard.disarm();
+                        yield Ok(proto::TextGenerateResponse {
+                            text: data.text.unwrap_or_default(),
+                            meta_info: meta_to_string_map(data.meta_info),
+                            finished: true,
+                        });
+                        break;
                     }
                     Ok(Some(ResponseChunk::Error(msg))) => {
                         abort_guard.disarm();

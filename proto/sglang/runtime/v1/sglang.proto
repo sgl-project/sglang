@@ -104,22 +104,12 @@ message TextGenerateRequest {
   map<string, string> trace_headers = 12;
   optional string session_id = 13;
   optional DisaggregatedParams disaggregated_params = 14;
-  optional int32 priority = 15;
 }
 
 message TextGenerateResponse {
-  string delta_text = 1;
-  reserved 2, 3;
-  reserved "meta_info", "finished";
-  int32 choice_index = 4;
-  optional Logprobs logprobs = 5;
-  optional Usage usage = 6;
-  optional RoutedExpertMetadata routed_experts = 7;
-  google.protobuf.Struct engine_metadata = 8;
-  oneof terminal {
-    GenerationFinish finish = 9;
-    GenerationError error = 10;
-  }
+  string text = 1;
+  map<string, string> meta_info = 2;
+  bool finished = 3;
 }
 
 // ---- Tokenized generate (input_ids in, token_ids out) ----
@@ -178,8 +168,7 @@ message Logprobs {
 message Usage {
   uint64 prompt_tokens = 1;
   uint64 completion_tokens = 2;
-  uint64 total_tokens = 3;
-  uint64 cached_prompt_tokens = 4;
+  uint64 cached_prompt_tokens = 3;
 }
 
 message RoutedExpertMetadata {

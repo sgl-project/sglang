@@ -210,9 +210,6 @@ pub(crate) fn build_text_generate_dict(
     if let Some(ref session_id) = req.session_id {
         d.insert("session_id".into(), serde_json::json!(session_id));
     }
-    if let Some(priority) = req.priority {
-        d.insert("priority".into(), serde_json::json!(priority));
-    }
     if let Some(params) = req.sampling_params.as_ref() {
         d.insert(
             "require_reasoning".into(),
