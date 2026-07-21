@@ -250,6 +250,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         self._dcp_a2a_overlap = envs.SGLANG_DCP_A2A_OVERLAP.get()
         self._dcp_pass1_no_cp = envs.SGLANG_DCP_PASS1_NO_CP.get()
         self._dcp_triton_pass2 = envs.SGLANG_DCP_TRITON_PASS2.get()
+        self._dcp_single_call_verify = envs.SGLANG_DCP_SINGLE_CALL_VERIFY.get()
         # Dedicated side stream (+ fork/join events) for the overlapped verify
         # a2a; created lazily on first use, shared across CUDA graphs.
         self._dcp_comm_stream: Optional[torch.cuda.Stream] = None
@@ -358,7 +359,13 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             eff_page = self.page_size * get_attention_dcp_world_size()
             npb = get_num_page_per_block_flashmla(eff_page)
             dcp_blocks = (
-                triton.cdiv(triton.cdiv(self.max_context_len, eff_page), npb) * npb
+                triton.cdiv(
+                    triton.cdiv(
+                        self.max_context_len + (self.num_draft_tokens or 0), eff_page
+                    ),
+                    npb,
+                )
+                * npb
             )
             self.dcp_decode_cuda_graph_kv_indices = torch.full(
                 (max_bs, dcp_blocks), -1, dtype=torch.int32, device=self.device
@@ -486,7 +493,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 self.dcp_verify_prefix_cuda_graph_kv_indices[:bs]
             )
             metadata.dcp_prefix_local_max = max(
-                (self.max_context_len + dcp_world - 1) // dcp_world, 1
+                (self.max_context_len + (self.num_draft_tokens or 0) + dcp_world - 1)
+                // dcp_world,
+                1,
             )
             # Persistent per-step hoist buffers for the verify cascade. The
             # graph captures these tensors' ADDRESSES, so replay-prep must
@@ -561,9 +570,14 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             # rank's strided slice (page_size*dcp_world global pages). seq_lens is
             # prefix + num_draft_tokens here (line above), so prefix = seq_lens_k - T.
             eff_page = self.page_size * get_attention_dcp_world_size()
-            prefix_lens = (metadata.seq_lens_k[:bs] - self.num_draft_tokens).to(
-                torch.int32
-            )
+            if self._dcp_single_call_verify:
+                # B2 single-call: the dcp_prefix_* fields carry TOTAL (prefix+T)
+                # semantics — table over seq_lens_k, local lens = local(prefix+T).
+                prefix_lens = metadata.seq_lens_k[:bs].to(torch.int32)
+            else:
+                prefix_lens = (metadata.seq_lens_k[:bs] - self.num_draft_tokens).to(
+                    torch.int32
+                )
             create_flashmla_kv_indices_triton[
                 (
                     bs,
@@ -784,11 +798,18 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 dcp_world = get_attention_dcp_world_size()
                 eff_page = self.page_size * dcp_world
                 npb = get_num_page_per_block_flashmla(eff_page)
-                prefix_max = max(int(max_seq) - self.num_draft_tokens, 1)
+                if self._dcp_single_call_verify:
+                    # B2 single-call: TOTAL (prefix+T) table + lens semantics.
+                    prefix_max = max(int(max_seq), 1)
+                    prefix_lens = (forward_batch.seq_lens + self.num_draft_tokens).to(
+                        torch.int32
+                    )
+                else:
+                    prefix_max = max(int(max_seq) - self.num_draft_tokens, 1)
+                    prefix_lens = forward_batch.seq_lens.to(torch.int32)
                 max_prefix_blocks = (
                     triton.cdiv(triton.cdiv(prefix_max, eff_page), npb) * npb
                 )
-                prefix_lens = forward_batch.seq_lens.to(torch.int32)
                 dcp_prefix_bt = torch.full(
                     (bs, max_prefix_blocks),
                     -1,
@@ -1191,7 +1212,29 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         # LOCAL compacted slice; cp_world never touches KV indexing). Default
         # drops the cp args to compile the plain non-causal variant;
         # SGLANG_DCP_PASS1_NO_CP=0 restores the cp_world call for A/B.
-        if self._dcp_pass1_no_cp:
+        single_call = self._dcp_single_call_verify
+        if single_call:
+            # ---- B2 single-call CP-causal fold (SGLANG_DCP_SINGLE_CALL_VERIFY) ----
+            # One fold over the ENTIRE local slice (owned draft latents included:
+            # the owner-rule write at the top of forward_extend is same-stream
+            # ordered before this read). The kernel resolves each q_tok's causal
+            # bound in GLOBAL coordinates from causal_seqs = prefix + T, BEFORE
+            # the cp divide. local_prefix / the block table carry TOTAL semantics
+            # under this flag (see the gated metadata build sites).
+            o1, lse1 = self._run_decode_kernel(
+                query=q,
+                kv_cache=kv_cache,
+                block_tables=metadata.dcp_prefix_block_kv_indices,
+                seq_lens=local_prefix,
+                max_seq_len=max(local_prefix_max, 1),
+                layer=layer,
+                return_lse=True,
+                cp_world=dcp_world,
+                cp_rank=dcp_rank,
+                causal_seqs=global_prefix + self.num_draft_tokens,
+                causal_mask=True,
+            )
+        elif self._dcp_pass1_no_cp:
             pass1_cp_world, pass1_cp_rank, pass1_causal_seqs = 1, 0, None
         else:
             pass1_cp_world, pass1_cp_rank, pass1_causal_seqs = (
@@ -1199,19 +1242,20 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 dcp_rank,
                 global_prefix,
             )
-        o1, lse1 = self._run_decode_kernel(
-            query=q,
-            kv_cache=kv_cache,
-            block_tables=metadata.dcp_prefix_block_kv_indices,
-            seq_lens=local_prefix,
-            max_seq_len=max(local_prefix_max, 1),
-            layer=layer,
-            return_lse=True,
-            cp_world=pass1_cp_world,
-            cp_rank=pass1_cp_rank,
-            causal_seqs=pass1_causal_seqs,
-            causal_mask=False,
-        )
+        if not single_call:
+            o1, lse1 = self._run_decode_kernel(
+                query=q,
+                kv_cache=kv_cache,
+                block_tables=metadata.dcp_prefix_block_kv_indices,
+                seq_lens=local_prefix,
+                max_seq_len=max(local_prefix_max, 1),
+                layer=layer,
+                return_lse=True,
+                cp_world=pass1_cp_world,
+                cp_rank=pass1_cp_rank,
+                causal_seqs=pass1_causal_seqs,
+                causal_mask=False,
+            )
         # o1 [bs, T, H_full, vd], lse1 [bs, T, H_full]. Mask requests this rank
         # owns no prefix tokens for (local prefix len == 0).
         zero = (
@@ -1225,7 +1269,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         # replacing 2x torch.where + 2x .contiguous() + the pack copies. Only
         # the a2a backend consumes the packed layout (fi_a2a packs its own).
         use_fused_pack = self._dcp_fused_pack and comm_backend == "a2a"
-        overlap_a2a = use_fused_pack and self._dcp_a2a_overlap
+        overlap_a2a = use_fused_pack and self._dcp_a2a_overlap and not single_call
         recv_buf = None
         if use_fused_pack:
             send_buf = dcp_mask_pack_triton(o1, lse1, zero, dcp_world)
@@ -1268,6 +1312,11 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 comm_backend=comm_backend,
                 return_lse=True,
             )  # prefix_full [N, H_local, vd], prefix_lse [N, H_local]
+
+        if single_call:
+            # B2: the a2a-combined result IS the final output — the draft
+            # tokens were inside the fold; no pass-2, no second combine.
+            return prefix_full.reshape(N, H_local * vd)
 
         # ---- Pass-2: local causal-chain draft fold (drafts NOT sharded) ----
         q_local = q[

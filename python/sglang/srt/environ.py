@@ -361,6 +361,16 @@ class Envs:
     # page-pool build (cat + zeros + copy). Set to 0 to revert for A/B.
     SGLANG_DCP_TRITON_PASS2 = EnvBool(True)
 
+    # DCP verify: SINGLE-CALL CP-causal fold (design candidate B2). One kernel
+    # call over the rank's ENTIRE local slice (owned draft latents included;
+    # the owner-rule KV write earlier in forward_extend is same-stream ordered),
+    # with per-(request, q_tok) causal bounds resolved in GLOBAL coordinates
+    # inside the kernel (causal_seqs = prefix + T). The a2a-combined result is
+    # final: pass-2 and the second combine are skipped. Contract validated
+    # bit-exact by the fp32-reference poison probe (q_len=8, cp_world=8).
+    # Default OFF pending e2e gates; 1 enables for A/B.
+    SGLANG_DCP_SINGLE_CALL_VERIFY = EnvBool(False)
+
     # Scheduler: memory leak test
     SGLANG_TEST_RETRACT = EnvBool(False)
     SGLANG_TEST_RETRACT_INTERVAL = EnvInt(3)
