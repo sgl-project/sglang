@@ -4152,39 +4152,24 @@ class ServerArgs:
                 reserved_mem += len(prefill_cuda_graph_config.bs) * 8
             else:
                 # Breakable prefill pool: 1.63 GB measured on GLM-5.2-FP8
-                # tp8 with decode-first capture order, plus margin for capture
-                # warmup spikes.
-                reserved_mem += 2.0 * 1024
-                # Baseline-deficit repair, NOT a BCG cost: the auto
-                # derivation is broken for this model class even without BCG —
-                # verified: GLM-5.2-FP8 tp8 with --disable-prefill-cuda-graph
-                # OOMs in warmup at its own auto (0.897). The unmodeled items
-                # are the startup warmup spike (DeepGEMM workspace + DSA
-                # paged-logits) and decode capture (3.2 GB measured vs the
-                # 1 GB max_bs*2MB budget). Charged here because this branch is
-                # the only auto path anyone exercises for this class (all
-                # non-BCG launches pin the fraction); the honest upstream fix
-                # is a warmup-spike term + corrected decode term applied to
-                # the baseline, after which this drops to zero. Validated:
-                # 2.5 GB total-extra OOMs, +4.5 (auto 0.850) passes.
-                reserved_mem += 4.5 * 1024
+                # tp8 with decode-first capture order. Note the auto
+                # derivation for this model class under-budgets warmup even
+                # without BCG (plain --disable-prefill-cuda-graph OOMs at its
+                # own auto); that baseline deficit is a pre-existing bug and
+                # is deliberately not repaired here.
+                reserved_mem += 1.5 * 1024
             from sglang.srt.arg_groups.overrides import resolved_view
 
             if (
                 prefill_cuda_graph_config.backend == Backend.BREAKABLE
                 and resolved_view(self).moe_a2a_backend == "deepep"
             ):
-                # DeepEP under the BCG split node first-touches its buffer
-                # stack (LL rdma 1.53 GB at cap 128 + NVL ~0.5 GB) during
-                # prefill capture, where the margin check runs — the memory is
-                # paid by eager DeepEP configs too, just later, so reserve
-                # the concentration slack plus the full-ladder capture load.
-                # Measured for the 8..2048 ladder: prefill capture 10.8 GB +
-                # decode 4.8 GB out of ~18 GB headroom leaves ~2.3 GB, while
-                # post-capture warmup (DeepGEMM workspace + the first eager
-                # 8192-token forward) needs ~7 GB — 8 GB lands auto at ~0.78,
-                # matching the explicitly-validated value.
-                reserved_mem += 8 * 1024
+                # Only the prefill-BCG DeepEP delta: split-node bridge
+                # pool + NORMAL-mode NVL first-touch landing inside capture,
+                # measured +1.08 GB on GLM-5.2-FP8 tp8 (2.71 GB vs 1.63 GB
+                # plain). Decode-side DeepEP costs exist without BCG and
+                # belong to the baseline a2a term, not this add.
+                reserved_mem += 1 * 1024
 
         return reserved_mem
 
