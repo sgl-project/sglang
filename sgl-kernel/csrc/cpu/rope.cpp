@@ -296,8 +296,10 @@ std::tuple<at::Tensor, at::Tensor> rotary_embedding_cpu(
   if (input_dim <= 3) {
     CHECK_EQ(key.size(0), query.size(0));
   }
-
   if (input_dim == 2) {
+    CHECK_EQ(query.size(1), p.num_heads * p.head_size);
+    CHECK_EQ(key.size(1), p.num_heads_kv * p.head_size);
+  }
   if (input_dim == 3) {
     // out-of-place path: align with legacy behavior, no partial rotary
     CHECK_EQ(query.size(-1), rotary_dim);
