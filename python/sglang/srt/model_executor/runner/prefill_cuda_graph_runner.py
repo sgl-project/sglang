@@ -47,6 +47,9 @@ import torch
 import tqdm
 
 from sglang.srt.distributed.parallel_state import graph_capture
+from sglang.srt.hardware_backend.xpu.graph_runner.xpu_full_graph_backend import (
+    FullXPUGraphBackend,
+)
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     set_dp_buffer_len,
@@ -82,6 +85,14 @@ from sglang.srt.model_executor.runner_backend.full_cuda_graph_backend import (
 from sglang.srt.model_executor.runner_backend.utils import (
     resolve_prefill_backend,
 )
+
+# Backend classes that capture the entire prefill forward as one graph per
+# num_tokens bucket with a fixed request-slot count (as opposed to BCG's
+# bs=1 segmented capture or TC_PIECEWISE's torch.compile-driven approach).
+# FullXPUGraphBackend mirrors FullCudaGraphBackend one-for-one (same
+# capture-stable-buffer contract) but is a separate class since it captures
+# via torch.xpu.XPUGraph instead of torch.cuda.CUDAGraph.
+_FULL_BACKEND_TYPES = (FullCudaGraphBackend, FullXPUGraphBackend)
 from sglang.srt.model_executor.runner_backend_utils import (
     PREFILL_CUDA_GRAPH_CAPTURE_FAILED_MSG,
 )
@@ -273,13 +284,25 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 f"{prefill_failure_msg(self.prefill_backend_name)}"
             ) from e
 
-        self._is_full_backend = isinstance(self.backend, FullCudaGraphBackend)
+        self._is_full_backend = isinstance(self.backend, _FULL_BACKEND_TYPES)
+
         if self._is_full_backend:
             max_req = prefill_config.full_prefill_max_req
             if max_req is None:
                 # Auto: scale request slots with the chunked prefill size.
                 max_req = max(model_runner.server_args.chunked_prefill_size // 512, 1)
             self._capture_req_slots = min(max_req, self.max_bs)
+            # Full prefill capture reuses the backend's graph-state tables during
+            # metadata planning. Initialize them once with the request-slot count
+            # actually used by replay (padded_view.batch_size == capture_req_slots,
+            # not the full req-pool bs) before any capture/replay path can touch
+            # hybrid or linear sidecars. This backend instance is shared with the
+            # decode graph runner, whose later init_cuda_graph_state call only
+            # grows these tables in place (see MambaAttnBackendBase), so calling
+            # it here first is safe.
+            self.model_runner.attn_backend.init_cuda_graph_state(
+                self._capture_req_slots, self._capture_req_slots
+            )
             self._full_cg_seq_lens_cpu = torch.zeros(
                 (self._capture_req_slots,), dtype=torch.int64, device="cpu"
             )
@@ -333,7 +356,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # BCG and Full CG capture only the transformer body (layer_model.forward),
         # not the LM head + logits_processor — the eager tail keeps the captured
         # graph bs-invariant so req_slots is not bound by an (req_slots, vocab) buffer.
-        if isinstance(self.backend, (BreakableCudaGraphBackend, FullCudaGraphBackend)):
+        if isinstance(self.backend, (BreakableCudaGraphBackend,) + _FULL_BACKEND_TYPES):
             language_model = getattr(
                 self.model_runner.model, "language_model", self.model_runner.model
             )
@@ -644,6 +667,17 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             padded_view.req_pool_indices = s["req_pool_indices"][:r]
             padded_view.extend_seq_lens = s["extend_seq_lens"][:r]
             padded_view.extend_prefix_lens = s["extend_prefix_lens"][:r]
+            # The hybrid/mamba backend's EXTEND replay reads extend_start_loc
+            # (query_start_loc) sized to the full slot-padded bs (r), not the
+            # real request count -- swap in the static slot-padded view here
+            # too (mirrors extend_seq_lens/extend_prefix_lens above).
+            padded_view.extend_start_loc = s["extend_start_loc"][:r]
+            # req_slots beyond the real bs are zero-length sentinels; make
+            # that explicit instead of relying on the seq_len-fill-value
+            # heuristic (mamba's fill value is 1, but sentinel seq_lens are
+            # 0 here) so the backend poisons their mamba cache indices
+            # rather than reading req_pool slot 0's live state.
+            padded_view.num_padding = r - bs
             attn_backend.init_forward_metadata_out_graph(padded_view)
             return
         if not self.use_captured_attn_metadata:
