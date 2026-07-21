@@ -92,6 +92,9 @@ pub async fn serve(
         // TODO(auth): no API-key boundary yet. Python gates every route (except
         // /health*, /metrics*, OPTIONS) via `add_api_key_middleware`; until ported,
         // a configured `api_key` does NOT protect these routes.
+        //
+        // No body limit, matching the Python server.
+        .layer(axum::extract::DefaultBodyLimit::disable())
         .with_state(state);
     // Access log gated exactly like uvicorn's (`--log-level-http warning` turns
     // it off); when disabled the middleware isn't even installed — zero cost.
