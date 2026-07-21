@@ -3485,6 +3485,7 @@ class ServerArgs:
         self._parse_cuda_graph_config()
         self._apply_cuda_graph_compatibility()
         self._clamp_prefill_buckets_for_deepep_bcg()
+        self._align_prefill_buckets_for_deepep_bcg()
         self._apply_cuda_graph_disaggregation_roles()
         self._validate_cuda_graph_config()
         # Warn on the final resolved config (not inside the compat cascade —
@@ -3523,6 +3524,39 @@ class ServerArgs:
             "bucket list to %s (override with --cuda-graph-bs-prefill).",
             clamped,
         )
+
+    def _align_prefill_buckets_for_deepep_bcg(self):
+        """Capture of a prefill bucket whose num_tokens is not a multiple of
+        8 deterministically hangs the DeepEP a2a under BCG (reproduced on
+        GLM-5.2 tp8: bucket 16 captures, bucket 12 wedges in dispatch with
+        ample free memory; every larger repro died at the first non-multiple
+        in the list). Root cause not yet isolated — align user-supplied
+        bucket lists up to multiples of 8 rather than hang."""
+        from sglang.srt.arg_groups.overrides import resolved_view as _resolved_view
+
+        if (
+            self.cuda_graph_config.prefill.backend != Backend.BREAKABLE
+            or _resolved_view(self).moe_a2a_backend != "deepep"
+        ):
+            return
+        bs = self.cuda_graph_config.prefill.bs
+        if bs is None:
+            # The default bucket list is derived later from max_bs and
+            # contains non-multiples of 8 (range(4, 33, 4)); materialize it
+            # now so alignment can apply.
+            bs = self._generate_prefill_cuda_graph_batch_sizes(
+                self.cuda_graph_config.prefill.max_bs
+            )
+        aligned = sorted({((b + 7) // 8) * 8 for b in bs})
+        if aligned != sorted(bs):
+            logger.warning(
+                "Breakable prefill CUDA graph with DeepEP requires bucket "
+                "sizes divisible by 8; aligning %s -> %s.",
+                sorted(bs),
+                aligned,
+            )
+            self.cuda_graph_config.prefill.bs = aligned
+            self.cuda_graph_config.prefill.max_bs = aligned[-1]
 
     def _parse_cuda_graph_config(self):
         """Resolve cuda_graph_config from explicit JSON, per-phase
