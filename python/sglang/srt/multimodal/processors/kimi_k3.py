@@ -210,13 +210,41 @@ class KimiK3ImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
         if getattr(request_obj, "video_data", None) or kwargs.get("audio_data"):
             raise ValueError("Kimi-K3 supports image input only")
 
-        base_output = await self.load_mm_data(
-            prompt=input_text,
-            image_data=image_data,
-            multimodal_tokens=self.mm_tokens,
-            discard_alpha_channel=False,
-        )
         expected_image_count = len(image_data or [])
+        if isinstance(input_text, (list, torch.Tensor)):
+            input_ids = np.asarray(
+                input_text.detach().flatten().cpu()
+                if isinstance(input_text, torch.Tensor)
+                else input_text,
+                dtype=np.int64,
+            )
+            placeholder_count = int(
+                np.count_nonzero(input_ids == self.mm_tokens.image_token_id)
+            )
+            if placeholder_count != expected_image_count:
+                raise ValueError(
+                    "Kimi-K3 image placeholders must map one-to-one to image data: "
+                    f"expected {expected_image_count}, found {placeholder_count} token(s)"
+                )
+
+            # Keep structural media tokens distinct from user text that happens to
+            # spell ``<|media_pad|>``. Decoding the whole prompt and matching the
+            # resulting string would lose that distinction and could bind an image
+            # to user-provided text instead of the renderer-inserted token.
+            base_output = await self.fast_load_mm_data(
+                prompt=input_text,
+                image_data=image_data,
+                multimodal_tokens=self.mm_tokens,
+                discard_alpha_channel=False,
+            )
+        else:
+            base_output = await self.load_mm_data(
+                prompt=input_text,
+                image_data=image_data,
+                multimodal_tokens=self.mm_tokens,
+                discard_alpha_channel=False,
+            )
+
         if len(base_output.images) != expected_image_count:
             raise ValueError(
                 "Kimi-K3 image placeholders must map one-to-one to image data: "

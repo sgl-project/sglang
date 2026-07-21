@@ -296,6 +296,50 @@ def test_kimi_k3_rejects_silently_dropped_images():
         )
 
 
+def test_kimi_k3_uses_token_ids_to_preserve_media_boundaries():
+    processor = object.__new__(KimiK3ImageProcessor)
+    processor.mm_tokens = SimpleNamespace(image_token_id=99)
+    processor.fast_load_mm_data = AsyncMock(
+        return_value=SimpleNamespace(
+            images=[object(), object()], input_ids=[1, 99, 2, 99, 3]
+        )
+    )
+    processor.load_mm_data = AsyncMock()
+    processor.process_and_combine_mm_data_async = AsyncMock(
+        return_value=([], torch.tensor([[1, 2]]), None)
+    )
+
+    asyncio.run(
+        processor.process_mm_data_async(
+            image_data=["image-1", "image-2"],
+            input_text=[1, 99, 2, 99, 3],
+            request_obj=SimpleNamespace(video_data=None),
+        )
+    )
+
+    processor.fast_load_mm_data.assert_awaited_once()
+    processor.load_mm_data.assert_not_awaited()
+
+
+def test_kimi_k3_rejects_tokenized_placeholder_mismatch():
+    processor = object.__new__(KimiK3ImageProcessor)
+    processor.mm_tokens = SimpleNamespace(image_token_id=99)
+    processor.fast_load_mm_data = AsyncMock()
+    processor.load_mm_data = AsyncMock()
+
+    with pytest.raises(ValueError, match=r"expected 2, found 1 token\(s\)"):
+        asyncio.run(
+            processor.process_mm_data_async(
+                image_data=["image-1", "image-2"],
+                input_text=torch.tensor([[1, 99, 2]]),
+                request_obj=SimpleNamespace(video_data=None),
+            )
+        )
+
+    processor.fast_load_mm_data.assert_not_awaited()
+    processor.load_mm_data.assert_not_awaited()
+
+
 @pytest.mark.parametrize(
     ("request_obj", "extra_kwargs"),
     [
