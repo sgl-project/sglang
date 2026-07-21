@@ -813,9 +813,6 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # Whether to return hidden states
     return_hidden_states: bool = False
 
-    # Whether this is a health-check probe
-    is_health_check: bool = False
-
     # Whether to return captured routed experts
     return_routed_experts: bool = False
     # See GenerateReqInput.routed_experts_start_len.
@@ -1807,13 +1804,6 @@ class AbortReq(BaseReq, kw_only=True):
         # FIXME: This is a hack to keep the same with the old code
         if self.rid is None:
             self.rid = ""
-
-    def matches(self, rid: str, *, exact: bool = False) -> bool:
-        # Prefix match by default (Python batch `<uuid>_<idx>` rids); `exact` for the
-        # Rust server's exact-unique u64 rids, where a prefix would abort unrelated ids.
-        if self.abort_all:
-            return True
-        return rid == self.rid if exact else rid.startswith(self.rid)
 
 
 class ActiveRanksOutput(BaseReq, kw_only=True):

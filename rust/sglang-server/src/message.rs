@@ -71,6 +71,11 @@ pub enum RequestKind {
 /// client-supplied or filled by the Tokenizer stage.
 #[derive(Debug, Default)]
 pub struct GenerateRequest {
+    /// Client-requested rid for this item (`None` → the server mints a uuid).
+    /// Duplicate in-flight rids collide on the same `RidHash` slot, orphaning
+    /// the earlier request — same garbage-in behavior as the Python server's
+    /// `rid_to_state` overwrite.
+    pub rid: Option<String>,
     pub text: Option<String>,
     /// Client-supplied token ids, or filled by the Tokenizer stage.
     pub input_ids: Option<Vec<i32>>,
@@ -233,6 +238,10 @@ pub enum OneOrMany<T> {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GenerateBody {
+    /// Optional client-supplied request id(s): a single string (a batch fans it
+    /// out as `{rid}_{i}`, mirroring Python `_normalize_batch`) or one per item.
+    #[serde(default)]
+    pub rid: Option<OneOrMany<String>>,
     #[serde(default)]
     pub text: Option<OneOrMany<String>>,
     #[serde(default)]
@@ -280,6 +289,7 @@ impl GenerateBody {
     /// an invalid/inconsistent batch.
     pub fn split(self) -> Result<(Vec<GenerateRequest>, bool), String> {
         let GenerateBody {
+            rid,
             text,
             input_ids,
             stream,
@@ -333,10 +343,28 @@ impl GenerateBody {
             Some(sp) => vec![Some(sp); n],
         };
 
+        // rid: absent → mint per item at submit; a single string fans out as
+        // `{rid}_{i}` for a batch (Python `_normalize_batch`); a list is per-item.
+        let mut rids: Vec<Option<String>> = match rid {
+            None => vec![None; n],
+            Some(OneOrMany::One(r)) if !is_batch => vec![Some(r)],
+            Some(OneOrMany::One(r)) => (0..n).map(|i| Some(format!("{r}_{i}"))).collect(),
+            Some(OneOrMany::Many(v)) => {
+                if !is_batch || v.len() != n {
+                    return Err(format!(
+                        "rid list length {} does not match batch size {n}",
+                        v.len()
+                    ));
+                }
+                v.into_iter().map(Some).collect()
+            }
+        };
+
         // The scalar logprob/hidden opts broadcast to every item. `is_health_check`
         // is never client-set (only the internal `/health_generate` probe sets it).
         let requests = (0..n)
             .map(|i| GenerateRequest {
+                rid: rids[i].take(),
                 text: texts[i].take(),
                 input_ids: id_lists[i].take(),
                 sampling_params: sps[i].take(),
@@ -857,6 +885,36 @@ mod tests {
         assert!(
             serde_json::from_str::<GenerateBody>(r#"{"text": "hi", "bogus": 1}"#).is_err(),
             "GenerateBody must deny unknown fields"
+        );
+    }
+
+    /// Client-supplied rid semantics mirror Python's `_normalize_batch`: a
+    /// single string passes through for a single request, fans out as
+    /// `{rid}_{i}` for a batch, a list must match the batch length, and absent
+    /// rid leaves every slot `None` (server mints uuids at submit).
+    #[test]
+    fn split_rid_matches_python_normalize() {
+        let (ps, _) = split(r#"{"text": "a", "rid": "r"}"#).unwrap();
+        assert_eq!(ps[0].rid.as_deref(), Some("r"));
+
+        let (ps, _) = split(r#"{"text": ["a", "b"], "rid": "base"}"#).unwrap();
+        assert_eq!(ps[0].rid.as_deref(), Some("base_0"));
+        assert_eq!(ps[1].rid.as_deref(), Some("base_1"));
+
+        let (ps, _) = split(r#"{"text": ["a", "b"], "rid": ["x", "y"]}"#).unwrap();
+        assert_eq!(ps[0].rid.as_deref(), Some("x"));
+        assert_eq!(ps[1].rid.as_deref(), Some("y"));
+
+        let (ps, _) = split(r#"{"text": ["a", "b"]}"#).unwrap();
+        assert!(ps[0].rid.is_none() && ps[1].rid.is_none());
+
+        assert!(
+            split(r#"{"text": ["a", "b"], "rid": ["x"]}"#).is_err(),
+            "rid list length must match batch size"
+        );
+        assert!(
+            split(r#"{"text": "a", "rid": ["x"]}"#).is_err(),
+            "rid list with a single (non-batch) prompt is rejected"
         );
     }
 
