@@ -43,7 +43,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.test_utils import CustomTestCase
 
-register_xpu_ci(est_time=20, stage="suite-b-test-1-gpu-xpu")
+register_xpu_ci(est_time=20, suite="stage-b-test-1-gpu-xpu")
 
 # Configuration matching GLM5.1 index head dimensions on XPU
 DEFAULT_CONFIG = {
