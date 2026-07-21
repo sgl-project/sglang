@@ -1,4 +1,7 @@
+import os
+import threading
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from sglang.srt.server_args import ServerArgs
@@ -63,7 +66,12 @@ class TestMmProcessConfigValidation(unittest.TestCase):
 class TestBaseProcessorConfigExtraction(unittest.TestCase):
     """Verify BaseMultimodalProcessor.__init__ extracts configs from server_args."""
 
-    def _make_processor(self, mm_process_config):
+    def _make_processor(
+        self,
+        mm_process_config,
+        mm_processor_worker_num=0,
+        mm_io_worker_num=0,
+    ):
         """Create a BaseMultimodalProcessor via the real __init__ with mocked deps."""
         from sglang.srt.multimodal.processors.base_processor import (
             BaseMultimodalProcessor,
@@ -71,6 +79,8 @@ class TestBaseProcessorConfigExtraction(unittest.TestCase):
 
         server_args = MagicMock()
         server_args.mm_process_config = mm_process_config
+        server_args.mm_processor_worker_num = mm_processor_worker_num
+        server_args.mm_io_worker_num = mm_io_worker_num
 
         hf_config = MagicMock()
         mock_hf_processor = MagicMock()
@@ -102,6 +112,204 @@ class TestBaseProcessorConfigExtraction(unittest.TestCase):
         self.assertEqual(proc.video_config, {})
         self.assertEqual(proc.audio_config, {})
 
+    def test_model_specific_auto_worker_count_enables_executor(self):
+        from sglang.srt.multimodal.processors.base_processor import (
+            BaseMultimodalProcessor,
+        )
+
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("SGLANG_IO_WORKERS", None)
+            with patch.object(
+                BaseMultimodalProcessor, "auto_mm_processor_worker_num", 4
+            ), patch.object(
+                BaseMultimodalProcessor, "auto_mm_io_worker_num", 16
+            ), patch.object(
+                BaseMultimodalProcessor, "supports_mm_processor_concurrency", True
+            ):
+                proc = self._make_processor({})
+        try:
+            self.assertEqual(proc.mm_processor_worker_num, 4)
+            self.assertEqual(proc.mm_io_worker_num, 16)
+            self.assertIsNotNone(proc.mm_processor_executor)
+        finally:
+            proc.mm_processor_executor.shutdown()
+
+    def test_explicit_single_worker_disables_executor(self):
+        from sglang.srt.multimodal.processors.base_processor import (
+            BaseMultimodalProcessor,
+        )
+
+        with patch.object(BaseMultimodalProcessor, "auto_mm_processor_worker_num", 4):
+            proc = self._make_processor({}, mm_processor_worker_num=1)
+        self.assertEqual(proc.mm_processor_worker_num, 1)
+        self.assertIsNone(proc.mm_processor_executor)
+
+    def test_parallel_workers_require_processor_support(self):
+        proc = self._make_processor({}, mm_processor_worker_num=2)
+        self.assertEqual(proc.mm_processor_worker_num, 1)
+        self.assertIsNone(proc.mm_processor_executor)
+
+    def test_explicit_io_worker_count_overrides_auto(self):
+        from sglang.srt.multimodal.processors.base_processor import (
+            BaseMultimodalProcessor,
+        )
+
+        with patch.object(BaseMultimodalProcessor, "auto_mm_io_worker_num", 16):
+            proc = self._make_processor({}, mm_io_worker_num=6)
+        self.assertEqual(proc.mm_io_worker_num, 6)
+
+
+class TestMultimodalFeatureTransportRuntime(unittest.TestCase):
+    @staticmethod
+    def _server_args(mm_feature_transport):
+        return SimpleNamespace(
+            mm_feature_transport=mm_feature_transport,
+            keep_mm_feature_on_device=False,
+            disable_fast_image_processor=False,
+            skip_tokenizer_init=False,
+            mm_process_config={},
+            mm_processor_worker_num=0,
+            mm_io_worker_num=0,
+            tokenizer_worker_num=1,
+            base_gpu_id=2,
+        )
+
+    @staticmethod
+    def _processor():
+        processor = MagicMock()
+        processor.tokenizer.encode.return_value = []
+        return processor
+
+    def test_cuda_ipc_pool_uses_resolved_server_arg(self):
+        # The processor module can be imported before this instance is built;
+        # transport policy must still resolve from the instance's ServerArgs.
+        from sglang.srt.multimodal.processors import base_processor
+
+        with patch.object(
+            base_processor.BaseMultimodalProcessor, "__abstractmethods__", set()
+        ), patch.object(base_processor, "MmItemMemoryPool") as memory_pool:
+            processor = base_processor.BaseMultimodalProcessor(
+                hf_config=MagicMock(),
+                server_args=self._server_args("cuda_ipc"),
+                _processor=self._processor(),
+                transport_mode=None,
+            )
+
+        self.assertEqual(processor.mm_feature_transport, "cuda_ipc")
+        self.assertTrue(processor.use_cuda_ipc)
+        memory_pool.assert_called_once()
+
+    def test_cpu_transport_does_not_allocate_ipc_pool(self):
+        from sglang.srt.multimodal.processors import base_processor
+
+        with patch.object(
+            base_processor.BaseMultimodalProcessor, "__abstractmethods__", set()
+        ), patch.object(base_processor, "MmItemMemoryPool") as memory_pool:
+            processor = base_processor.BaseMultimodalProcessor(
+                hf_config=MagicMock(),
+                server_args=self._server_args("cpu"),
+                _processor=self._processor(),
+                transport_mode=None,
+            )
+
+        self.assertEqual(processor.mm_feature_transport, "cpu")
+        self.assertFalse(processor.use_cuda_ipc)
+        memory_pool.assert_not_called()
+
+
+class TestMultimodalProcessorConcurrency(unittest.IsolatedAsyncioTestCase):
+    async def test_dedicated_executor_runs_processor_off_event_loop(self):
+        from sglang.srt.multimodal.processors.base_processor import (
+            BaseMultimodalProcessor,
+        )
+        from sglang.srt.multimodal.processors.executor import (
+            MultimodalProcessorExecutor,
+        )
+
+        with patch.object(
+            BaseMultimodalProcessor, "__abstractmethods__", set()
+        ), patch.object(BaseMultimodalProcessor, "__init__", lambda self: None):
+            processor = BaseMultimodalProcessor()
+
+        processor.mm_processor_executor = MultimodalProcessorExecutor(
+            SimpleNamespace(tokenizer=object()), max_workers=2
+        )
+        processor.process_and_combine_mm_data = MagicMock(
+            side_effect=lambda *_args, **_kwargs: threading.current_thread().name
+        )
+        try:
+            thread_name = await processor.process_and_combine_mm_data_async(
+                MagicMock(), MagicMock(), marker=True
+            )
+        finally:
+            processor.mm_processor_executor.shutdown()
+
+        self.assertTrue(thread_name.startswith("sglang-mm-processor"))
+        processor.process_and_combine_mm_data.assert_called_once()
+        self.assertTrue(
+            processor.process_and_combine_mm_data.call_args.kwargs["marker"]
+        )
+
+    async def test_single_worker_preserves_synchronous_path(self):
+        from sglang.srt.multimodal.processors.base_processor import (
+            BaseMultimodalProcessor,
+        )
+
+        with patch.object(
+            BaseMultimodalProcessor, "__abstractmethods__", set()
+        ), patch.object(BaseMultimodalProcessor, "__init__", lambda self: None):
+            processor = BaseMultimodalProcessor()
+
+        processor.mm_processor_executor = None
+        processor.process_and_combine_mm_data = MagicMock(return_value="synchronous")
+
+        result = await processor.process_and_combine_mm_data_async(
+            MagicMock(), MagicMock()
+        )
+
+        self.assertEqual(result, "synchronous")
+        processor.process_and_combine_mm_data.assert_called_once()
+
+    async def test_worker_reuses_precreated_private_processor_clone(self):
+        from sglang.srt.multimodal.processors.executor import (
+            MultimodalProcessorExecutor,
+        )
+
+        executor = MultimodalProcessorExecutor(object(), max_workers=2)
+        return_processor = lambda *, processor: processor
+        try:
+            first = await executor.run(return_processor)
+            second = await executor.run(return_processor)
+        finally:
+            executor.shutdown()
+
+        self.assertIs(first, second)
+
+    async def test_replacement_worker_lazily_clones_processor(self):
+        from sglang.srt.multimodal.processors import executor as executor_module
+
+        source_processor = object()
+        replacement_clone = SimpleNamespace(tokenizer=object())
+        with patch.object(
+            executor_module.copy,
+            "deepcopy",
+            return_value=replacement_clone,
+        ) as deepcopy:
+            executor = executor_module.MultimodalProcessorExecutor(
+                source_processor, max_workers=2
+            )
+            executor._processor_clones.clear()
+            return_processor = lambda *, processor: processor
+            try:
+                first = await executor.run(return_processor)
+                second = await executor.run(return_processor)
+            finally:
+                executor.shutdown()
+
+        self.assertIs(first, replacement_clone)
+        self.assertIs(first, second)
+        self.assertEqual(deepcopy.call_count, 3)
+
 
 class TestProcessMmDataKwargs(unittest.TestCase):
     """Verify process_mm_data injects per-modality kwargs correctly."""
@@ -114,6 +322,7 @@ class TestProcessMmDataKwargs(unittest.TestCase):
 
         server_args = MagicMock()
         server_args.mm_process_config = mm_process_config
+        server_args.mm_feature_transport = "cpu"
         server_args.disable_fast_image_processor = True
         server_args.keep_mm_feature_on_device = True
         server_args.skip_tokenizer_init = False
@@ -135,9 +344,13 @@ class TestProcessMmDataKwargs(unittest.TestCase):
 
         proc.server_args = server_args
         proc.keep_mm_feature_on_device = server_args.keep_mm_feature_on_device
+        proc.mm_feature_transport = server_args.mm_feature_transport
+        proc.use_cuda_ipc = False
         proc.disable_fast_image_processor = server_args.disable_fast_image_processor
         proc.skip_tokenizer_init = server_args.skip_tokenizer_init
         proc._processor = mock_processor
+        proc._tokenizer = MagicMock()
+        proc._tokenizer_auto_adds_specials = False
         proc.image_config = mm_process_config.get("image", {})
         proc.video_config = mm_process_config.get("video", {})
         proc.audio_config = mm_process_config.get("audio", {})
@@ -215,6 +428,7 @@ class TestOverrideProcessorsConfigInjection(unittest.TestCase):
         """Create an override processor with mocked dependencies."""
         server_args = MagicMock()
         server_args.mm_process_config = mm_process_config
+        server_args.mm_feature_transport = "cpu"
         server_args.disable_fast_image_processor = True
         server_args.keep_mm_feature_on_device = False
         server_args.skip_tokenizer_init = False
@@ -230,6 +444,8 @@ class TestOverrideProcessorsConfigInjection(unittest.TestCase):
 
         proc.server_args = server_args
         proc.keep_mm_feature_on_device = server_args.keep_mm_feature_on_device
+        proc.mm_feature_transport = server_args.mm_feature_transport
+        proc.use_cuda_ipc = False
         proc.disable_fast_image_processor = server_args.disable_fast_image_processor
         proc.skip_tokenizer_init = server_args.skip_tokenizer_init
         proc._processor = mock_hf_processor
@@ -294,6 +510,52 @@ class TestOverrideProcessorsConfigInjection(unittest.TestCase):
         audio_kw = call_kwargs.kwargs.get("audio_kwargs", {})
         # User config can override truncation if they explicitly set it
         self.assertTrue(audio_kw.get("truncation"))
+
+
+class TestDoubleBosGuard(unittest.TestCase):
+    """Regression test for the multimodal double-BOS bug.
+
+    Repro condition (Cohere2 / Llama3-LLaVA-Next family):
+      - tokenizer.encode("") returns [bos_id]  (auto-adds specials), AND
+      - chat template renders the BOS string as a literal at the start.
+
+    Without the guard in BaseMultimodalProcessor, the inner processor.__call__
+    on the rendered prompt would auto-prepend a second BOS, producing 2 leading
+    BOS tokens vs the HF reference's 1.
+    """
+
+    def test_guard_passes_add_special_tokens_false_on_bug_condition(self):
+        from sglang.srt.multimodal.processors.base_processor import (
+            BaseMultimodalProcessor,
+        )
+
+        server_args = MagicMock()
+        server_args.mm_process_config = {}
+        server_args.mm_processor_worker_num = 0
+        server_args.mm_io_worker_num = 0
+        server_args.mm_feature_transport = "cpu"
+        server_args.disable_fast_image_processor = True
+        server_args.keep_mm_feature_on_device = True
+
+        mock_hf_processor = MagicMock()
+        mock_hf_processor.__class__.__name__ = "TestProcessor"
+        mock_hf_processor.__call__ = MagicMock(return_value={})
+        mock_hf_processor.tokenizer.encode = MagicMock(return_value=[2])
+        mock_hf_processor.tokenizer.bos_token = "<BOS>"
+
+        with patch.object(BaseMultimodalProcessor, "__abstractmethods__", set()):
+            proc = BaseMultimodalProcessor(
+                hf_config=MagicMock(),
+                server_args=server_args,
+                _processor=mock_hf_processor,
+                transport_mode=None,
+            )
+        proc.FEATURE_NAMES = []
+
+        proc.process_mm_data("<BOS>hello", images=["img1"])
+
+        call_kwargs = mock_hf_processor.__call__.call_args.kwargs
+        self.assertEqual(call_kwargs.get("add_special_tokens"), False)
 
 
 if __name__ == "__main__":
