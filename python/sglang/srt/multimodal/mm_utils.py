@@ -522,7 +522,6 @@ def get_dp_encoder_dispatch() -> DpEncoderDispatch:
     return _dp_encoder_dispatch
 
 
-# Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/vision.py
 def get_dp_encoder_lb_assignment(
     sizes: list[int],
     num_gpus: int = 2,
