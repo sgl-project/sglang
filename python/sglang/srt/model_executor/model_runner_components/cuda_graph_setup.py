@@ -93,13 +93,13 @@ def capture_cuda_graphs(
     # batch.
     eager_runner = EagerRunner(model_runner)
 
-    # cuda-graph capture: prefill before decode, so both coalesce onto the
-    # eager buffer allocated above. (capture_prefill_graph routes prefill
-    # to the eager runner when the prefill graph is disabled.)
-    prefill_runner = capture_prefill_graph(
-        model_runner=model_runner, eager_runner=eager_runner
-    )
-
+    # cuda-graph capture: decode before prefill (both after the eager
+    # runner, so both coalesce onto its buffer). Decode-first packs the 48
+    # monolithic decode graphs into a clean pool before breakable prefill
+    # fragments it with thousands of small segments — measured prefill-first
+    # inflated decode capture usage 3.18 -> 4.86 GB on GLM-5.2 tp8.
+    # (capture_prefill_graph routes prefill to the eager runner when the
+    # prefill graph is disabled.)
     decode = DecodeGraphCapture(runner=None, graph_mem_usage=0)
     if capture_decode_cuda_graph:
         if model_runner.device in ("cuda", "musa", "cpu", "npu", "xpu"):
@@ -110,6 +110,10 @@ def capture_cuda_graphs(
             decode = capture_decode_graph(model_runner=model_runner)
     else:
         decode = DecodeGraphCapture(runner=eager_runner, graph_mem_usage=0)
+
+    prefill_runner = capture_prefill_graph(
+        model_runner=model_runner, eager_runner=eager_runner
+    )
 
     # Register forward hooks AFTER cuda-graph capture so their tensor ops are
     # not traced into any captured graph — capture stays hook-free and hooks
