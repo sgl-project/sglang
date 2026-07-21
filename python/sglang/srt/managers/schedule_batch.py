@@ -63,7 +63,7 @@ import numpy as np
 import torch
 
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
-from sglang.srt.disaggregation.base import BaseKVSender
+from sglang.srt.disaggregation.base import BaseKVSender, KVTransferMetric
 from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
     ScheduleBatchDisaggregationDecodeMixin,
 )
@@ -1050,6 +1050,9 @@ class Req(ReqDllmMixin):
         self.pd_rebootstrap_forced_output_id: Optional[int] = None
         self.skip_radix_cache_insert = bootstrap_host == FAKE_BOOTSTRAP_HOST
         self.disagg_kv_sender: Optional[BaseKVSender] = None
+        # Snapshotted from the sender before clear() drains its transfer record,
+        # so the record-based KV transfer metric survives teardown.
+        self.transfer_metric: Optional[KVTransferMetric] = None
 
         self.routed_dp_rank: Optional[int] = routed_dp_rank
         self.disagg_prefill_dp_rank: Optional[int] = disagg_prefill_dp_rank

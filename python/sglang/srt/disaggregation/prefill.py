@@ -820,6 +820,9 @@ class SchedulerDisaggregationPrefillMixin:
                 release_kv_cache(req, self.tree_cache)  # unlock the tree
                 if not isinstance(req.finished_reason, FINISH_ABORT):
                     req.finished_reason = FINISH_LENGTH(length=0)
+                # Snapshot the transfer metric before clear() drains the record
+                # it reads (chunked prefill sums per-chunk send time there).
+                req.transfer_metric = req.disagg_kv_sender.get_transfer_metric()
                 # FIXME: clean up req's data in transfer engine
                 req.disagg_kv_sender.clear()
                 done_reqs.append(req)
@@ -844,7 +847,7 @@ class SchedulerDisaggregationPrefillMixin:
             if kv_mgr and getattr(kv_mgr, "is_dummy_cp_rank", False):
                 continue
             metrics = req.time_stats.compute_and_observe_kv_transfer_metrics(
-                req.disagg_kv_sender.get_transfer_metric()
+                req.transfer_metric
             )
             if metrics:
                 # Update last-value for REST API
