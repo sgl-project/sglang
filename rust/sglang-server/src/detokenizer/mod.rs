@@ -1,7 +1,7 @@
 //! Detokenizer shards — CPU-bound, one pinned thread per shard.
 //!
 //! Each shard owns a *local* `id -> DetokState` map. There is no lock: a given
-//! `RequestId` is routed to exactly one shard (by `RequestId::shard`) for both
+//! `RidHash` is routed to exactly one shard (by `RidHash::shard`) for both
 //! its `Register` and all its `Chunk`s, so the map has a single accessor.
 //!
 //! Real detokenization uses dynamo-tokenizers' `DecodeStream`, a stateful
@@ -19,7 +19,7 @@ use std::collections::HashMap;
 
 use crate::error::Error;
 use crate::fsm::{Event, RequestState};
-use crate::ids::RequestId;
+use crate::ids::RidHash;
 use crate::message::{ChunkEvent, EgressItem, EgressSink, SinkError};
 use crate::runtime::Runnable;
 use crate::runtime::channels::{DetokMsg, TmEvent};
@@ -104,6 +104,8 @@ impl DetokenizerBackend {
 }
 
 struct DetokState {
+    /// Client-visible rid string, needed to abort on the scheduler wire.
+    rid: String,
     sink: EgressSink,
     /// `return_text_in_logprobs`: whether to decode this request's logprob token
     /// ids to text (in this shard) for the `[logprob, token_id, text]` tuples.
@@ -126,7 +128,7 @@ struct DetokState {
 
 /// One detokenizer shard: owns a *local* `id -> DetokState` map (single
 /// accessor, no lock) and the egress backend. Spawned (pinned) per shard as a
-/// [`Runnable`]; a given `RequestId` is routed to exactly one shard.
+/// [`Runnable`]; a given `RidHash` is routed to exactly one shard.
 pub struct DetokenizerWorker {
     shard: usize,
     rx: flume::Receiver<DetokMsg>,
@@ -154,7 +156,7 @@ impl DetokenizerWorker {
 
 impl Runnable for DetokenizerWorker {
     fn run(self) {
-        let mut table: HashMap<RequestId, DetokState> = HashMap::new();
+        let mut table: HashMap<RidHash, DetokState> = HashMap::new();
         tracing::debug!(shard = self.shard, "detokenizer worker started");
 
         // Plain `recv`: exits when the `DetokMsg` channel closes (every `Senders`
@@ -164,14 +166,16 @@ impl Runnable for DetokenizerWorker {
         while let Ok(msg) = self.rx.recv() {
             match msg {
                 DetokMsg::Register {
-                    id,
+                    rid_hash,
+                    rid,
                     sink,
                     decode_logprob_text,
                     no_stop_trim,
                 } => {
                     table.insert(
-                        id,
+                        rid_hash,
                         DetokState {
+                            rid,
                             sink,
                             decode_logprob_text,
                             no_stop_trim,
@@ -187,10 +191,12 @@ impl Runnable for DetokenizerWorker {
                         handle_chunk(&mut table, ev, &self.backend, &self.tm);
                     }
                 }
-                DetokMsg::Result { id, payload } => handle_result(&mut table, id, payload),
-                DetokMsg::Fail { id, message } => handle_fail(&mut table, id, message),
-                DetokMsg::Deregister { id } => {
-                    table.remove(&id);
+                DetokMsg::Result { rid_hash, payload } => {
+                    handle_result(&mut table, rid_hash, payload)
+                }
+                DetokMsg::Fail { rid_hash, message } => handle_fail(&mut table, rid_hash, message),
+                DetokMsg::Deregister { rid_hash } => {
+                    table.remove(&rid_hash);
                 }
             }
         }
@@ -199,7 +205,7 @@ impl Runnable for DetokenizerWorker {
 
 /// Control-request result: deliver the JSON payload to the sink verbatim as a
 /// single `Done` frame — no detokenization, no streaming.
-fn handle_result(table: &mut HashMap<RequestId, DetokState>, id: RequestId, payload: bytes::Bytes) {
+fn handle_result(table: &mut HashMap<RidHash, DetokState>, id: RidHash, payload: bytes::Bytes) {
     if let Some(mut st) = table.remove(&id) {
         let _ = st.sink.try_send(EgressItem::Control(payload));
         // Egress FSM: a control request goes straight to Completed (no Streaming
@@ -210,7 +216,7 @@ fn handle_result(table: &mut HashMap<RequestId, DetokState>, id: RequestId, payl
 
 /// Terminal per-request failure (bad request header): send an `Error` to the sink
 /// (the api-server turns it into an HTTP 400) and drop the request.
-fn handle_fail(table: &mut HashMap<RequestId, DetokState>, id: RequestId, message: String) {
+fn handle_fail(table: &mut HashMap<RidHash, DetokState>, id: RidHash, message: String) {
     if let Some(mut st) = table.remove(&id) {
         let _ = st
             .sink
@@ -220,12 +226,12 @@ fn handle_fail(table: &mut HashMap<RequestId, DetokState>, id: RequestId, messag
 }
 
 fn handle_chunk(
-    table: &mut HashMap<RequestId, DetokState>,
+    table: &mut HashMap<RidHash, DetokState>,
     mut ev: ChunkEvent,
     backend: &DetokenizerBackend,
     tm: &flume::Sender<TmEvent>,
 ) {
-    let id = RequestId(ev.rid); // raw u64 from the wire — no parse
+    let id = RidHash(ev.rid_hash); // raw u64 from the wire — no parse
 
     let Some(st) = table.get_mut(&id) else {
         // Late chunk after completion/abort — drop.
@@ -326,10 +332,11 @@ fn handle_chunk(
                 }
             }
             let _ = st.fsm.apply(Event::Disconnect);
+            let rid = st.rid.clone();
             table.remove(&id);
             // Best-effort: stop the scheduler generating for a request no client
             // can receive. A full/closed tm inbox just drops it (shutdown).
-            let _ = tm.try_send(TmEvent::Abort(id));
+            let _ = tm.try_send(TmEvent::Abort(rid));
         }
     }
 }
@@ -374,8 +381,9 @@ mod tests {
 
         let mut table = HashMap::new();
         table.insert(
-            RequestId(1),
+            RidHash(1),
             DetokState {
+                rid: "1".to_string(),
                 sink: EgressSink::Local(tx),
                 decode_logprob_text: false,
                 no_stop_trim: false,
@@ -386,18 +394,18 @@ mod tests {
 
         let (tm_tx, tm_rx) = flume::unbounded::<TmEvent>();
         let ev = ChunkEvent {
-            rid: 1,
+            rid_hash: 1,
             token_ids: vec![5],
             ..Default::default() // finish_reason None → non-terminal
         };
         handle_chunk(&mut table, ev, &DetokenizerBackend::Skip, &tm_tx);
 
         // Request removed (no lingering state to be mistaken for success)...
-        assert!(table.get(&RequestId(1)).is_none());
+        assert!(table.get(&RidHash(1)).is_none());
         // ...and the scheduler was told to abort it.
         assert!(matches!(
             tm_rx.try_recv(),
-            Ok(TmEvent::Abort(id)) if id == RequestId(1)
+            Ok(TmEvent::Abort(rid)) if rid == "1"
         ));
     }
 
@@ -430,8 +438,9 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<EgressItem>(4);
         let mut table = HashMap::new();
         table.insert(
-            RequestId(1),
+            RidHash(1),
             DetokState {
+                rid: "1".to_string(),
                 sink: EgressSink::Local(tx),
                 decode_logprob_text: false,
                 no_stop_trim,
@@ -441,7 +450,7 @@ mod tests {
         );
         let (tm_tx, _tm_rx) = flume::unbounded::<TmEvent>();
         let ev = ChunkEvent {
-            rid: 1,
+            rid_hash: 1,
             token_ids: ids,
             finish_reason: Some(finish_reason),
             ..Default::default()

@@ -21,7 +21,7 @@ use std::convert::Infallible;
 use tokio::sync::mpsc;
 
 use crate::fsm::RequestState;
-use crate::ids::{RequestId, RequestIdGen};
+use crate::ids::RidHash;
 
 use crate::message::{
     ChunkEvent, ChunkExtras, ControlRequest, EgressItem, EgressSink, GenerateBody, GenerateRequest,
@@ -31,12 +31,11 @@ use crate::runtime::ServerArgs;
 use crate::runtime::channels::{Senders, TmEvent};
 use crate::tokenizer_manager::ActivityCounter;
 
-/// Shared handler state: the submit machinery (`senders`, `id_gen`, `egress_buf`)
+/// Shared handler state: the submit machinery (`senders`, `egress_buf`)
 /// + shared tokenizer. `Clone` is cheap refcount bumps (every field is `Arc`).
 #[derive(Clone)]
 struct AppState {
     senders: Senders,
-    id_gen: Arc<RequestIdGen>,
     egress_buf: usize,
     server_args: Arc<ServerArgs>,
     /// Egress heartbeat (bumped per drained ring frame). `/health_generate`
@@ -62,7 +61,6 @@ fn read_health_endpoint_generation() -> bool {
 pub async fn serve(
     listener: std::net::TcpListener,
     senders: Senders,
-    id_gen: Arc<RequestIdGen>,
     egress_buf: usize,
     server_args: Arc<ServerArgs>,
     egress_activity: ActivityCounter,
@@ -71,7 +69,6 @@ pub async fn serve(
     let access_log_enabled = server_args.http_access_log_enabled();
     let state = AppState {
         senders,
-        id_gen,
         egress_buf,
         server_args,
         egress_activity,
@@ -161,24 +158,28 @@ async fn access_log(
     res
 }
 
-/// Submit a request into the ingress pipeline; returns its egress receiver. `kind`
-/// carries the variant body (generate / control), so this is generic over both.
+/// Submit a request into the ingress pipeline; returns the client-visible rid
+/// (uuid hex, Python-parity), its hashed routing key, and the egress receiver.
+/// `kind` carries the variant body (generate / control), so this is generic over
+/// both.
 async fn submit(
     state: &AppState,
     kind: RequestKind,
-) -> Result<(RequestId, mpsc::Receiver<EgressItem>), ()> {
-    let id = state.id_gen.next();
+) -> Result<(RidHash, String, mpsc::Receiver<EgressItem>), ()> {
+    let rid = crate::ids::new_rid();
+    let id = RidHash::from_rid(&rid);
     // Async-aware send so a full TM inbox yields (backpressure) instead of parking
     // a thread; Err only when the inbox is closed (shutdown).
     let (tx, rx) = mpsc::channel::<EgressItem>(state.egress_buf);
     let req = Request {
-        id,
+        rid_hash: id,
+        rid: rid.clone(),
         state: RequestState::Received,
         sink: EgressSink::Local(tx),
         kind,
     };
     match state.senders.tm.send_async(TmEvent::Ingress(req)).await {
-        Ok(()) => Ok((id, rx)),
+        Ok(()) => Ok((id, rid, rx)),
         Err(_) => {
             tracing::error!("tm inbox closed; request dropped");
             Err(())
@@ -191,14 +192,17 @@ async fn submit(
 /// Each rid is disarmed on natural finish; whatever remains at drop is aborted.
 struct AbortGuard {
     senders: Senders,
-    rids: Vec<RequestId>,
+    /// `(routing key, rid string)` — the string is what `AbortReq` needs on the
+    /// scheduler wire (unrecoverable from the hashed key), the key is what
+    /// callers disarm by.
+    rids: Vec<(RidHash, String)>,
 }
 
 impl AbortGuard {
-    fn new(senders: Senders, rid: RequestId) -> Self {
+    fn new(senders: Senders, id: RidHash, rid: String) -> Self {
         Self {
             senders,
-            rids: vec![rid],
+            rids: vec![(id, rid)],
         }
     }
 
@@ -211,14 +215,14 @@ impl AbortGuard {
         }
     }
 
-    /// Track `rid` for abort-on-drop.
-    fn arm(&mut self, rid: RequestId) {
-        self.rids.push(rid);
+    /// Track a request for abort-on-drop.
+    fn arm(&mut self, id: RidHash, rid: String) {
+        self.rids.push((id, rid));
     }
 
-    /// Request `rid` finished naturally — don't abort it on drop.
-    fn disarm(&mut self, rid: RequestId) {
-        self.rids.retain(|r| *r != rid);
+    /// Request finished naturally — don't abort it on drop.
+    fn disarm(&mut self, id: RidHash) {
+        self.rids.retain(|(r, _)| *r != id);
     }
 }
 
@@ -226,7 +230,7 @@ impl Drop for AbortGuard {
     fn drop(&mut self) {
         // Best-effort non-blocking abort per rid; a full/closed channel just drops
         // it (the request then finishes at EOS, only later).
-        for &rid in &self.rids {
+        for (_, rid) in self.rids.drain(..) {
             let _ = self.senders.tm.try_send(TmEvent::Abort(rid));
         }
     }
@@ -239,7 +243,7 @@ async fn await_control_result(
     state: &AppState,
     tag: &'static str,
 ) -> Result<bytes::Bytes, Response> {
-    let (_id, mut rx) = submit(state, RequestKind::Control(ControlRequest { tag }))
+    let (_id, _rid, mut rx) = submit(state, RequestKind::Control(ControlRequest { tag }))
         .await
         .map_err(|()| (StatusCode::SERVICE_UNAVAILABLE, "service unavailable").into_response())?;
     match rx.recv().await {
@@ -576,14 +580,14 @@ async fn health_generate_inner(state: &AppState) -> Response {
         is_health_check: true,
         ..Default::default()
     });
-    let (rid, _keepalive) = match submit(state, kind).await {
+    let (id, rid, _keepalive) = match submit(state, kind).await {
         // Hold the receiver so the probe's sink stays open until it completes.
-        Ok((rid, rx)) => (rid, rx),
+        Ok((id, rid, rx)) => (id, rid, rx),
         Err(()) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
     // Deregister on drop (never disarmed): a busy-skipped probe has no terminal
     // frame, so without this abort it leaks one detok entry per call.
-    let _abort_guard = AbortGuard::new(state.senders.clone(), rid);
+    let _abort_guard = AbortGuard::new(state.senders.clone(), id, rid);
 
     // Watch the heartbeat advance. `SGLANG_HEALTH_CHECK_TIMEOUT` defaults to 20s.
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
@@ -739,7 +743,7 @@ impl OutputAccumulator {
         }
 
         let o = &mut self.out;
-        o.rid = d.rid; // constant across the request; keeps the accumulated view coherent
+        o.rid_hash = d.rid_hash; // constant across the request; keeps the accumulated view coherent
         o.text.push_str(&d.text);
         o.token_ids.extend_from_slice(&d.token_ids); // token_ids doubles as output_ids
         o.completion_tokens += d.completion_tokens;
@@ -827,7 +831,7 @@ async fn generate(State(state): State<AppState>, Json(body): Json<GenerateBody>)
 async fn generate_single(state: &AppState, req: GenerateRequest, stream: bool) -> Response {
     // `return_text_in_logprobs` is decoded on the detok shard into `*_txt`, so
     // `sglang_frame_value` just reads them — no tokenizer needed here.
-    let (rid, mut rx) = match submit(state, RequestKind::Generate(req)).await {
+    let (id, rid_str, mut rx) = match submit(state, RequestKind::Generate(req)).await {
         Ok(v) => v,
         Err(()) => {
             return (StatusCode::SERVICE_UNAVAILABLE, "service unavailable").into_response();
@@ -835,9 +839,8 @@ async fn generate_single(state: &AppState, req: GenerateRequest, stream: bool) -
     };
     // Abort on client disconnect: the guard fires when dropped before the request
     // finishes (axum drops the handler/SSE stream). Disarmed on a natural terminal.
-    let mut guard = AbortGuard::new(state.senders.clone(), rid);
-    // Response `meta_info.id`, stringified once and reused for every frame.
-    let rid_str = rid.0.to_string();
+    // `rid_str` is the response `meta_info.id`, reused for every frame.
+    let mut guard = AbortGuard::new(state.senders.clone(), id, rid_str.clone());
     // Cumulative frames (SGLang default) vs per-step deltas.
     let incremental = state.server_args.incremental_streaming_output();
 
@@ -845,7 +848,7 @@ async fn generate_single(state: &AppState, req: GenerateRequest, stream: bool) -
         // A single request is a 1-element batch without the `index` field — reuse
         // the same stream so the frame/abort/truncation logic lives in one place.
         use futures::StreamExt;
-        let s = generation_event_stream(vec![(rid, rx)], guard, incremental, false)
+        let s = generation_event_stream(vec![(id, rid_str, rx)], guard, incremental, false)
             .map(|data| Ok::<_, Infallible>(Event::default().data(data)));
         Sse::new(s).into_response()
     } else {
@@ -853,7 +856,7 @@ async fn generate_single(state: &AppState, req: GenerateRequest, stream: bool) -
         // (a truncation leaves the guard armed so the scheduler work is aborted).
         let (status, value, terminal) = drain_unary(&mut rx, &rid_str).await;
         if terminal {
-            guard.disarm(rid);
+            guard.disarm(id);
         }
         (status, Json(value)).into_response()
     }
@@ -915,9 +918,9 @@ async fn generate_batch(
     let mut receivers = Vec::with_capacity(requests.len());
     for req in requests {
         match submit(state, RequestKind::Generate(req)).await {
-            Ok((rid, rx)) => {
-                guard.arm(rid);
-                receivers.push((rid, rx));
+            Ok((id, rid, rx)) => {
+                guard.arm(id, rid.clone());
+                receivers.push((id, rid, rx));
             }
             Err(()) => {
                 return (StatusCode::SERVICE_UNAVAILABLE, "service unavailable").into_response();
@@ -936,11 +939,10 @@ async fn generate_batch(
     } else {
         // Unary: drain each in order (already all submitted, so they run together).
         let mut results = Vec::with_capacity(receivers.len());
-        for (rid, mut rx) in receivers {
-            let rid_str = rid.0.to_string();
+        for (id, rid_str, mut rx) in receivers {
             let (_status, value, terminal) = drain_unary(&mut rx, &rid_str).await;
             if terminal {
-                guard.disarm(rid);
+                guard.disarm(id);
             }
             results.push(value);
         }
@@ -970,7 +972,7 @@ async fn recv_indexed(
 /// `with_index` tags each frame (batch only), `incremental` = delta vs cumulative,
 /// `guard` aborts unfinished on drop.
 fn generation_event_stream(
-    receivers: Vec<(RequestId, mpsc::Receiver<EgressItem>)>,
+    receivers: Vec<(RidHash, String, mpsc::Receiver<EgressItem>)>,
     mut guard: AbortGuard,
     incremental: bool,
     with_index: bool,
@@ -979,8 +981,8 @@ fn generation_event_stream(
         use futures::StreamExt;
 
         let n = receivers.len();
-        let rids: Vec<RequestId> = receivers.iter().map(|(rid, _)| *rid).collect();
-        let rid_strs: Vec<String> = rids.iter().map(|r| r.0.to_string()).collect();
+        let rids: Vec<RidHash> = receivers.iter().map(|(id, _, _)| *id).collect();
+        let rid_strs: Vec<String> = receivers.iter().map(|(_, rid, _)| rid.clone()).collect();
         let mut accs: Vec<OutputAccumulator> =
             (0..n).map(|_| OutputAccumulator::default()).collect();
 
@@ -990,7 +992,7 @@ fn generation_event_stream(
         // Poll all receivers concurrently; re-arm a receiver's future after each
         // non-terminal frame so its stream keeps flowing.
         let mut futs = futures::stream::FuturesUnordered::new();
-        for (i, (_, rx)) in receivers.into_iter().enumerate() {
+        for (i, (_, _, rx)) in receivers.into_iter().enumerate() {
             futs.push(recv_indexed(i, rx));
         }
 
@@ -1278,9 +1280,13 @@ mod tests {
     #[test]
     fn armed_guard_aborts_on_drop() {
         let (tm_tx, tm_rx) = flume::unbounded();
-        drop(AbortGuard::new(senders_with_tm(tm_tx), RequestId(7)));
+        drop(AbortGuard::new(
+            senders_with_tm(tm_tx),
+            RidHash::from_rid("r7"),
+            "r7".to_string(),
+        ));
         assert!(
-            matches!(tm_rx.try_recv(), Ok(TmEvent::Abort(id)) if id == RequestId(7)),
+            matches!(tm_rx.try_recv(), Ok(TmEvent::Abort(rid)) if rid == "r7"),
             "armed guard must abort its rid on drop",
         );
         assert!(tm_rx.try_recv().is_err(), "exactly one abort");
@@ -1290,8 +1296,9 @@ mod tests {
     #[test]
     fn disarmed_guard_does_not_abort() {
         let (tm_tx, tm_rx) = flume::unbounded();
-        let mut guard = AbortGuard::new(senders_with_tm(tm_tx), RequestId(9));
-        guard.disarm(RequestId(9));
+        let id = RidHash::from_rid("r9");
+        let mut guard = AbortGuard::new(senders_with_tm(tm_tx), id, "r9".to_string());
+        guard.disarm(id);
         drop(guard);
         assert!(tm_rx.try_recv().is_err(), "disarmed rid must not abort");
     }
@@ -1306,7 +1313,7 @@ mod tests {
 
     fn frame(rid: u64, text: &str) -> EgressItem {
         EgressItem::Frame(ChunkEvent {
-            rid,
+            rid_hash: rid,
             text: text.into(),
             completion_tokens: 1,
             ..Default::default()
@@ -1314,7 +1321,7 @@ mod tests {
     }
     fn done(rid: u64, text: &str) -> EgressItem {
         EgressItem::Done(ChunkEvent {
-            rid,
+            rid_hash: rid,
             text: text.into(),
             completion_tokens: 1,
             finish_reason: Some(serde_json::json!({ "type": "length" })),
@@ -1332,7 +1339,10 @@ mod tests {
     async fn interleaves_indexes_and_accumulates() {
         let (tx0, rx0) = mpsc::channel(8);
         let (tx1, rx1) = mpsc::channel(8);
-        let receivers = vec![(RequestId(10), rx0), (RequestId(11), rx1)];
+        let receivers = vec![
+            (RidHash(10), "10".to_string(), rx0),
+            (RidHash(11), "11".to_string(), rx1),
+        ];
         let stream =
             generation_event_stream(receivers, AbortGuard::new_empty(senders()), false, true);
         futures::pin_mut!(stream);
@@ -1369,7 +1379,10 @@ mod tests {
     async fn per_item_error_carries_index() {
         let (tx0, rx0) = mpsc::channel(8);
         let (tx1, rx1) = mpsc::channel(8);
-        let receivers = vec![(RequestId(10), rx0), (RequestId(11), rx1)];
+        let receivers = vec![
+            (RidHash(10), "10".to_string(), rx0),
+            (RidHash(11), "11".to_string(), rx1),
+        ];
         let stream =
             generation_event_stream(receivers, AbortGuard::new_empty(senders()), false, true);
         futures::pin_mut!(stream);
@@ -1395,7 +1408,7 @@ mod tests {
     #[tokio::test]
     async fn incremental_emits_deltas_with_cumulative_count() {
         let (tx, rx) = mpsc::channel(8);
-        let receivers = vec![(RequestId(10), rx)];
+        let receivers = vec![(RidHash(10), "10".to_string(), rx)];
         let stream =
             generation_event_stream(receivers, AbortGuard::new_empty(senders()), true, true);
         futures::pin_mut!(stream);
@@ -1427,7 +1440,7 @@ mod tests {
     #[tokio::test]
     async fn single_shape_omits_index() {
         let (tx, rx) = mpsc::channel(8);
-        let receivers = vec![(RequestId(10), rx)];
+        let receivers = vec![(RidHash(10), "10".to_string(), rx)];
         let stream =
             generation_event_stream(receivers, AbortGuard::new_empty(senders()), false, false);
         futures::pin_mut!(stream);
@@ -1447,7 +1460,7 @@ mod tests {
     #[tokio::test]
     async fn cumulative_backlog_coalesces_to_latest() {
         let (tx, rx) = mpsc::channel(8);
-        let receivers = vec![(RequestId(10), rx)];
+        let receivers = vec![(RidHash(10), "10".to_string(), rx)];
         let stream =
             generation_event_stream(receivers, AbortGuard::new_empty(senders()), false, false);
         futures::pin_mut!(stream);
@@ -1474,7 +1487,7 @@ mod tests {
     #[tokio::test]
     async fn incremental_backlog_emits_every_delta() {
         let (tx, rx) = mpsc::channel(8);
-        let receivers = vec![(RequestId(10), rx)];
+        let receivers = vec![(RidHash(10), "10".to_string(), rx)];
         let stream =
             generation_event_stream(receivers, AbortGuard::new_empty(senders()), true, false);
         futures::pin_mut!(stream);
@@ -1502,7 +1515,7 @@ mod tests {
     fn cumulative_frame_json_matches_serde() {
         let deltas = [
             ChunkEvent {
-                rid: 7,
+                rid_hash: 7,
                 text: String::new(),
                 token_ids: vec![],
                 completion_tokens: 0,
@@ -1510,7 +1523,7 @@ mod tests {
                 ..Default::default()
             },
             ChunkEvent {
-                rid: 7,
+                rid_hash: 7,
                 text: "He\"llo\n\t".into(),
                 token_ids: vec![1000],
                 completion_tokens: 1,
@@ -1518,7 +1531,7 @@ mod tests {
                 ..Default::default()
             },
             ChunkEvent {
-                rid: 7,
+                rid_hash: 7,
                 text: " 世界 🌍 \\".into(),
                 token_ids: vec![-2, 3],
                 completion_tokens: 2,
@@ -1526,7 +1539,7 @@ mod tests {
                 ..Default::default()
             },
             ChunkEvent {
-                rid: 7,
+                rid_hash: 7,
                 text: "!".into(),
                 token_ids: vec![9],
                 completion_tokens: 1,
@@ -1553,7 +1566,7 @@ mod tests {
     fn cumulative_frame_json_defers_on_extras() {
         let mut acc = OutputAccumulator::default();
         acc.fold(&ChunkEvent {
-            rid: 1,
+            rid_hash: 1,
             token_ids: vec![5],
             text: "x".into(),
             extras: Some(Box::new(ChunkExtras {
