@@ -338,7 +338,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
                 if previous_part_was_image:
                     parts.append("\n")
-                parts.append("<|media_pad|>")
+                parts.append("<|kimi_image_placeholder|>")
                 previous_part_was_image = True
             elif chunk_type == "video_url":
                 video_data.append(chunk["video_url"]["url"])
@@ -619,6 +619,8 @@ class OpenAIServingChat(OpenAIServingBase):
 
         if request.input_ids is not None:
             prompt_kwargs = {"input_ids": processed_messages.prompt_ids}
+        elif is_multimodal and self.chat_encoding_spec == "kimi_k3":
+            prompt_kwargs = {"input_ids": processed_messages.prompt_ids}
         elif is_multimodal:
             prompt_kwargs = {"text": processed_messages.prompt}
         else:
@@ -835,6 +837,7 @@ class OpenAIServingChat(OpenAIServingBase):
             template_kwargs = dict(request.chat_template_kwargs or {})
             template_kwargs.pop("tokenize", None)
             template_kwargs.pop("return_dict", None)
+            template_kwargs["image_prompts"] = ["<|media_pad|>"] * len(image_data)
             # encoding_k3 accepts thinking_effort in {low, high, max} and
             # asserts on anything else; "none" is handled at the protocol
             # level by disabling thinking.

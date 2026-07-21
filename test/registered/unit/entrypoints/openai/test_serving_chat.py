@@ -214,9 +214,38 @@ class ServingChatTestCase(unittest.TestCase):
 
         self.assertEqual(
             flattened["content"],
-            "<|media_pad|>\n<|media_pad|>Compare them.",
+            "<|kimi_image_placeholder|>\n" "<|kimi_image_placeholder|>Compare them.",
         )
         self.assertEqual([item.url for item in image_data], ["image-1", "image-2"])
+
+    def test_kimi_k3_routes_structural_prompt_ids_without_decode_reencode(self):
+        self.tm.model_config.is_multimodal = True
+        self.chat.chat_encoding_spec = "kimi_k3"
+        self.template_manager.chat_template_name = None
+        self.tm.tokenizer.apply_chat_template.return_value = [7, 99, 8]
+        self.tm.tokenizer.decode.return_value = "decoded prompt"
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": "image-1"}},
+                        {"type": "text", "text": "<|media_pad|> Describe it."},
+                    ],
+                }
+            ],
+        )
+
+        adapted, _ = self.chat._convert_to_internal_request(
+            request, self.fastapi_request
+        )
+
+        self.assertEqual(adapted.input_ids, [7, 99, 8])
+        self.assertIsNone(adapted.text)
+        call = self.tm.tokenizer.apply_chat_template.call_args
+        self.assertEqual(call.kwargs["image_prompts"], ["<|media_pad|>"])
+        self.assertIn("<|kimi_image_placeholder|>", call.args[0][0]["content"])
 
     def test_kimi_tool_call_keeps_default_reasoning(self):
         self.template_manager.reasoning_config = ReasoningToggleConfig(
