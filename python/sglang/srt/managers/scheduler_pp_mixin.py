@@ -14,6 +14,10 @@ import torch.distributed
 from tqdm import tqdm
 
 from sglang.srt.disaggregation.base.conn import KVPoll
+from sglang.srt.disaggregation.hidden_state import (
+    get_pd_hidden_capture_layer_ids,
+    get_pd_hidden_req_state as pd_hidden_state,
+)
 from sglang.srt.disaggregation.utils import poll_and_all_reduce_attn_cp_tp_group
 from sglang.srt.distributed.parallel_state import P2PWork
 from sglang.srt.environ import envs
@@ -259,7 +263,6 @@ class SchedulerPPMixin:
                 batch = prefill_plan.batch_to_run
                 self.running_batch = prefill_plan.running_batch
                 batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(batch)
-                self._prepare_pd_hidden_capture_for_batch(batch)
                 self.mbs[mb_id] = batch
                 self.running_mbs[mb_id] = self.running_batch
 
@@ -1016,7 +1019,7 @@ class SchedulerPPMixin:
                 **logprob_dict,
             }
         if (
-            batch.pd_hidden_capture_layer_ids
+            get_pd_hidden_capture_layer_ids(batch.reqs)
             and not self._pp_should_owner_direct_pd_hidden(batch)
             and result.logits_output is not None
             and result.logits_output.hidden_states is not None
@@ -1029,23 +1032,19 @@ class SchedulerPPMixin:
     ) -> bool:
         if not hasattr(self, "disagg_prefill_bootstrap_queue"):
             return False
-        if not batch or not batch.pd_hidden_capture_layer_ids:
+        if not batch or not get_pd_hidden_capture_layer_ids(batch.reqs):
             return False
         capture_reqs = [
             req
             for req in batch.reqs
-            if getattr(req, "pd_hidden_capture_layer_ids", None)
+            if pd_hidden_state(req).capture_layer_ids
         ]
         if not capture_reqs:
             return False
         if any(req.pending_bootstrap for req in capture_reqs):
             return False
         return all(
-            bool(
-                (getattr(req, "pd_hidden_meta", None) or {}).get(
-                    "streaming_hidden", False
-                )
-            )
+            bool((pd_hidden_state(req).meta or {}).get("streaming_hidden", False))
             for req in capture_reqs
         )
 

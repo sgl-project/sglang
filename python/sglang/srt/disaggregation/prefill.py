@@ -33,6 +33,10 @@ import torch
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.common.conn import CommonKVManager
+from sglang.srt.disaggregation.hidden_state import (
+    get_pd_hidden_capture_layer_ids,
+    get_pd_hidden_req_state as pd_hidden_state,
+)
 from sglang.srt.disaggregation.utils import (
     FAKE_BOOTSTRAP_HOST,
     DisaggregationMode,
@@ -40,6 +44,7 @@ from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    get_dsa_seed_metadata_dim,
     get_dsv4_c128_state_indices,
     get_kv_class,
     is_aborted,
@@ -47,6 +52,7 @@ from sglang.srt.disaggregation.utils import (
     is_mla_backend,
     poll_and_all_reduce_attn_cp_tp_group,
     prepare_abort,
+    resolve_disagg_metadata_config,
     setup_state_kv_args,
 )
 from sglang.srt.environ import envs
@@ -57,7 +63,6 @@ from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
 )
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.mem_cache.common import (
     kv_to_page_indices,
     kv_to_page_num,
@@ -92,16 +97,16 @@ def should_force_retry(req: Req) -> bool:
 
 
 def clear_pd_hidden_request_state(req: Req) -> None:
-    req.pd_hidden_meta = None
-    req.pd_hidden_src_indices = None
-    req.pd_hidden_dst_indices = None
-    req.pd_hidden_written = None
-    req.pd_hidden_capture_layer_ids = None
-    req.pd_hidden_current_src_indices = None
-    req.pd_hidden_current_start = None
-    req.pd_hidden_current_row_len = 0
-    req.pd_hidden_current_is_last = False
-    req.pd_hidden_owner_direct_sent = False
+    pd_hidden_state(req).meta = None
+    pd_hidden_state(req).src_indices = None
+    pd_hidden_state(req).dst_indices = None
+    pd_hidden_state(req).written = None
+    pd_hidden_state(req).capture_layer_ids = None
+    pd_hidden_state(req).current_src_indices = None
+    pd_hidden_state(req).current_start = None
+    pd_hidden_state(req).current_row_len = 0
+    pd_hidden_state(req).current_is_last = False
+    pd_hidden_state(req).owner_direct_sent = False
 
 
 def maybe_release_metadata_buffer(
@@ -121,14 +126,16 @@ def maybe_release_metadata_buffer(
     if req.metadata_buffer_index >= 0:
         allocator.free(req.metadata_buffer_index)
         req.metadata_buffer_index = -1
-    indices = req.pd_hidden_src_indices
-    if indices and pd_hidden_pool is not None:
+    indices = pd_hidden_state(req).src_indices
+    if indices:
         sender = req.disagg_kv_sender
+        if pd_hidden_pool is None and sender is not None:
+            pd_hidden_pool = sender.kv_mgr.pd_hidden_pool
         worker_released = (
             sender is not None
             and sender.kv_mgr.pop_pd_hidden_request_done(sender.bootstrap_room)
         )
-        if not worker_released:
+        if not worker_released and pd_hidden_pool is not None:
             pd_hidden_pool.free(indices)
         clear_pd_hidden_request_state(req)
     elif not indices:
@@ -139,7 +146,7 @@ def maybe_release_pd_hidden_rows(req: Req, pd_hidden_pool) -> None:
     """Release source hidden rows once the local RDMA transfer is complete."""
     if pd_hidden_pool is None:
         return
-    indices = req.pd_hidden_src_indices
+    indices = pd_hidden_state(req).src_indices
     if indices:
         pd_hidden_pool.free(indices)
         clear_pd_hidden_request_state(req)
@@ -149,7 +156,7 @@ def maybe_release_pd_hidden_rows_on_hidden_done(
     req: Req, pd_hidden_pool
 ) -> bool:
     """Release source hidden rows after PD_HIDDEN finishes, before KV success."""
-    indices = req.pd_hidden_src_indices
+    indices = pd_hidden_state(req).src_indices
     if not indices or pd_hidden_pool is None:
         return False
     sender = req.disagg_kv_sender
@@ -448,7 +455,7 @@ class PrefillBootstrapQueue:
             return (metadata_cost, 0), None
 
         hidden_cost = 0 if plan.streaming_hidden else plan.source_window_rows
-        if req.pd_hidden_src_indices is not None:
+        if pd_hidden_state(req).src_indices is not None:
             hidden_cost = 0
         if hidden_cost > hidden_row_credits:
             now = time.monotonic()
@@ -490,7 +497,7 @@ class PrefillBootstrapQueue:
                 else [int(x) for x in dspark_meta.get("target_layer_ids", [])]
             )
         )
-        if not local_layer_ids or req.pd_hidden_src_indices:
+        if not local_layer_ids or pd_hidden_state(req).src_indices:
             return False
 
         pool = getattr(self.metadata_buffers, "pd_hidden_pool", None)
@@ -545,11 +552,11 @@ class PrefillBootstrapQueue:
 
         assert plan is not None
         if not plan.local_layer_ids:
-            req.pd_hidden_meta = dict(dspark_meta)
-            req.pd_hidden_src_indices = []
-            req.pd_hidden_dst_indices = []
-            req.pd_hidden_written = []
-            req.pd_hidden_owner_direct_sent = False
+            pd_hidden_state(req).meta = dict(dspark_meta)
+            pd_hidden_state(req).src_indices = []
+            pd_hidden_state(req).dst_indices = []
+            pd_hidden_state(req).written = []
+            pd_hidden_state(req).owner_direct_sent = False
             return True
 
         src_indices = (
@@ -569,14 +576,14 @@ class PrefillBootstrapQueue:
             self._abort_pd_hidden_bootstrap(req, message)
             return False
 
-        req.pd_hidden_capture_layer_ids = [int(x) for x in plan.local_layer_ids]
-        req.pd_hidden_meta = dict(dspark_meta)
-        req.pd_hidden_src_indices = src_indices
-        req.pd_hidden_dst_indices = plan.dst_indices
-        req.pd_hidden_written = (
+        pd_hidden_state(req).capture_layer_ids = [int(x) for x in plan.local_layer_ids]
+        pd_hidden_state(req).meta = dict(dspark_meta)
+        pd_hidden_state(req).src_indices = src_indices
+        pd_hidden_state(req).dst_indices = plan.dst_indices
+        pd_hidden_state(req).written = (
             None if plan.streaming_hidden else [False] * plan.hidden_len
         )
-        req.pd_hidden_owner_direct_sent = False
+        pd_hidden_state(req).owner_direct_sent = False
         return True
 
     def add(self, req: Req, num_kv_heads: int) -> None:
@@ -759,6 +766,176 @@ class SchedulerDisaggregationPrefillMixin:
     Mixin for Scheduler to handle disaggregation prefill
     """
 
+    def init_disaggregation(self: Scheduler) -> None:
+        from sglang.srt.configs.model_config import is_minimax_sparse
+        from sglang.srt.disaggregation.decode import (
+            DecodePreallocQueue,
+            DecodeTransferQueue,
+        )
+        from sglang.srt.disaggregation.encode_receiver import create_mm_receiver
+        from sglang.srt.mem_cache import kv_cache_builder
+        from sglang.srt.speculative.eagle_utils import (
+            get_draft_recurrent_hidden_state_spec,
+        )
+
+        self.mm_receiver = None
+        self.disagg_prefill_bootstrap_queue = None
+        self.disagg_prefill_inflight_queue = None
+        self.disagg_decode_prealloc_queue = None
+        self.disagg_decode_transfer_queue = None
+
+        self.disaggregation_mode = DisaggregationMode(
+            self.server_args.disaggregation_mode
+        )
+        self.transfer_backend = TransferBackend(
+            self.server_args.disaggregation_transfer_backend
+        )
+
+        # todo: should we fix this when enabling mtp or it doesn't matter since we only enable mtp in decode node thus we don't transfer draft kvs between P and D?
+        draft_token_to_kv_pool = kv_cache_builder.get_draft_kv_pool(
+            draft_worker=self.draft_worker,
+            spec_algorithm=self.spec_algorithm,
+            server_args=self.server_args,
+        )
+
+        if self.spec_algorithm.carries_draft_hidden_states():
+            # `draft_runner` aliases `draft_runner_list[0]` in the multi-layer
+            # worker, so a single accessor covers both shapes.
+            draft_runner = self.draft_worker.draft_worker.draft_runner
+            disagg_hidden_size, disagg_hidden_states_dtype = (
+                get_draft_recurrent_hidden_state_spec(draft_runner)
+            )
+        else:
+            disagg_hidden_size = 16  # minimal padding size for RDMA
+            disagg_hidden_states_dtype = torch.float32
+
+        disagg_metadata_config = resolve_disagg_metadata_config(
+            hidden_size=disagg_hidden_size,
+            hidden_states_dtype=disagg_hidden_states_dtype,
+            disaggregation_mode=self.disaggregation_mode,
+            transfer_backend=self.transfer_backend,
+            spec_algorithm=self.spec_algorithm,
+            model_config=self.model_config,
+            server_args=self.server_args,
+            model_runner=self.tp_worker.model_runner,
+            pp_rank=self.ps.pp_rank,
+            pp_size=self.ps.pp_size,
+            gpu_id=self.ps.gpu_id,
+            max_prefill_tokens=self.max_prefill_tokens,
+        )
+        disagg_hidden_size = disagg_metadata_config.hidden_size
+        disagg_hidden_states_dtype = disagg_metadata_config.hidden_states_dtype
+        metadata_buffer_kwargs = disagg_metadata_config.metadata_buffer_kwargs
+
+        # The PD metadata wire schema must match on P and D even when only D
+        # enables spec decoding; a seedless prefill writes the invalid sentinel.
+        output_dsa_topk_indices_dim = get_dsa_seed_metadata_dim(
+            self.model_config.hf_config
+        )
+
+        if (
+            self.disaggregation_mode == DisaggregationMode.DECODE
+        ):  # *8 headroom for MiniMax-M3; *2 for other models.
+            buffer_multiplier = (
+                8 if is_minimax_sparse(self.model_config.hf_config) else 2
+            )
+            buffer_size = (self.req_to_token_pool.size) * buffer_multiplier
+            self.req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
+                buffer_size
+            )
+            self.disagg_metadata_buffers = MetadataBuffers(
+                buffer_size,
+                hidden_size=disagg_hidden_size,
+                hidden_states_dtype=disagg_hidden_states_dtype,
+                custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
+                output_dsa_topk_indices_dim=output_dsa_topk_indices_dim,
+                **metadata_buffer_kwargs,
+            )
+
+            # The decode requests polling kv cache
+            self.disagg_decode_transfer_queue = DecodeTransferQueue(
+                gloo_group=self.attn_tp_cpu_group,
+                req_to_metadata_buffer_idx_allocator=self.req_to_metadata_buffer_idx_allocator,
+                tp_rank=self.ps.tp_rank,
+                metadata_buffers=self.disagg_metadata_buffers,
+                scheduler=self,
+                tree_cache=self.tree_cache,
+            )
+
+            # The decode requests pending for pre-allocation
+            self.disagg_decode_prealloc_queue = DecodePreallocQueue(
+                req_to_token_pool=self.req_to_token_pool,
+                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                draft_token_to_kv_pool=draft_token_to_kv_pool,
+                req_to_metadata_buffer_idx_allocator=self.req_to_metadata_buffer_idx_allocator,
+                metadata_buffers=self.disagg_metadata_buffers,
+                scheduler=self,
+                transfer_queue=self.disagg_decode_transfer_queue,
+                tree_cache=self.tree_cache,
+                gloo_group=self.attn_tp_cpu_group,
+                tp_rank=self.ps.tp_rank,
+                tp_size=self.ps.tp_size,
+                dp_size=self.server_args.dp_size,
+                gpu_id=self.ps.gpu_id,
+                bootstrap_port=self.server_args.disaggregation_bootstrap_port,
+                max_total_num_tokens=self.max_total_num_tokens,
+                pp_rank=self.ps.pp_rank,
+                num_reserved_decode_tokens=self.server_args.num_reserved_decode_tokens,
+                transfer_backend=self.transfer_backend,
+            )
+
+        elif self.disaggregation_mode == DisaggregationMode.PREFILL:
+            # *2 for the headroom.
+            buffer_size = self.max_running_requests * 2
+            self.req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
+                buffer_size
+            )
+            self.disagg_metadata_buffers = MetadataBuffers(
+                buffer_size,
+                hidden_size=disagg_hidden_size,
+                hidden_states_dtype=disagg_hidden_states_dtype,
+                custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
+                output_dsa_topk_indices_dim=output_dsa_topk_indices_dim,
+                **metadata_buffer_kwargs,
+            )
+
+            self.disagg_prefill_bootstrap_queue = PrefillBootstrapQueue(
+                token_to_kv_pool=self.token_to_kv_pool_allocator.get_kvcache(),
+                draft_token_to_kv_pool=draft_token_to_kv_pool,
+                req_to_metadata_buffer_idx_allocator=self.req_to_metadata_buffer_idx_allocator,
+                metadata_buffers=self.disagg_metadata_buffers,
+                tp_rank=self.ps.tp_rank,
+                tp_size=self.ps.tp_size,
+                gpu_id=self.ps.gpu_id,
+                bootstrap_port=self.server_args.disaggregation_bootstrap_port,
+                gloo_group=self.attn_tp_cpu_group,
+                max_total_num_tokens=self.max_total_num_tokens,
+                scheduler=self,
+                pp_rank=self.ps.pp_rank,
+                pp_size=self.ps.pp_size,
+                transfer_backend=self.transfer_backend,
+            )
+            # The prefill requests that are in the middle of kv sending
+            self.disagg_prefill_inflight_queue: List[Req] = []
+
+            self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+
+        # Init mm receiver for EPD disaggregation mode
+        if (
+            self.server_args.language_only
+            and self.server_args.encoder_transfer_backend
+            in ["zmq_to_scheduler", "mooncake"]
+        ):
+            self.mm_receiver = create_mm_receiver(
+                self.server_args,
+                dtype=self.model_config.dtype,
+                hf_config=self.model_config.hf_config,
+                pp_rank=self.ps.pp_rank,
+                tp_rank=self.ps.tp_rank,
+                tp_group=self.tp_group,
+                scheduler=self,
+            )
+
     def maybe_prefetch_staging_for_batch(self: Scheduler, batch: ScheduleBatch) -> None:
         """Pre-send STAGING_REQ so decode allocates staging during GPU forward."""
         kv_mgr = self.disagg_prefill_bootstrap_queue.kv_manager
@@ -831,29 +1008,11 @@ class SchedulerDisaggregationPrefillMixin:
         batch = prefill_plan.batch_to_run
         running_batch = prefill_plan.running_batch
         batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(batch)
-        self._prepare_pd_hidden_capture_for_batch(batch)
 
         if batch:
             set_schedule_time_batch(batch)
 
         return NextBatchPlan(batch_to_run=batch, running_batch=running_batch)
-
-    def _prepare_pd_hidden_capture_for_batch(
-        self: Scheduler, batch: Optional[ScheduleBatch]
-    ) -> None:
-        dspark_capture_layers = None
-        if batch:
-            for req in batch.reqs:
-                dspark_capture_layers = getattr(
-                    req, "pd_hidden_capture_layer_ids", None
-                )
-                if dspark_capture_layers:
-                    break
-        if dspark_capture_layers:
-            batch.pd_hidden_capture_layer_ids = [
-                int(x) for x in dspark_capture_layers
-            ]
-            batch.capture_hidden_mode = CaptureHiddenMode.FULL
 
     @torch.no_grad()
     def event_loop_normal_disagg_prefill(self: Scheduler) -> None:
@@ -970,7 +1129,7 @@ class SchedulerDisaggregationPrefillMixin:
     def _build_pd_hidden_only_state_indices(
         self: Scheduler, req: Req
     ) -> Optional[List]:
-        current_indices = req.pd_hidden_current_src_indices
+        current_indices = pd_hidden_state(req).current_src_indices
         if current_indices is None:
             return None
 
@@ -986,9 +1145,9 @@ class SchedulerDisaggregationPrefillMixin:
         return state_indices
 
     def _send_pd_hidden_only_chunk(self: Scheduler, req: Req) -> bool:
-        current_indices = req.pd_hidden_current_src_indices
-        current_start = req.pd_hidden_current_start
-        current_rows = int(req.pd_hidden_current_row_len or 0)
+        current_indices = pd_hidden_state(req).current_src_indices
+        current_start = pd_hidden_state(req).current_start
+        current_rows = int(pd_hidden_state(req).current_row_len or 0)
         if current_indices is None or current_start is None or current_rows <= 0:
             return False
 
@@ -997,7 +1156,7 @@ class SchedulerDisaggregationPrefillMixin:
             return False
 
         streaming_hidden = bool(
-            (req.pd_hidden_meta or {}).get("streaming_hidden", False)
+            (pd_hidden_state(req).meta or {}).get("streaming_hidden", False)
         )
         if req.disagg_kv_sender is not None:
             source_event = self.device_module.Event()
@@ -1006,18 +1165,18 @@ class SchedulerDisaggregationPrefillMixin:
             req.disagg_kv_sender.set_pd_hidden_chunk_meta(
                 int(current_start),
                 int(current_rows),
-                bool(req.pd_hidden_current_is_last),
-                current_indices if streaming_hidden else req.pd_hidden_src_indices,
+                bool(pd_hidden_state(req).current_is_last),
+                current_indices if streaming_hidden else pd_hidden_state(req).src_indices,
             )
 
         req.disagg_kv_sender.send(np.asarray([], dtype=np.int32), state_indices)
         if streaming_hidden:
-            req.pd_hidden_src_indices = None
-        req.pd_hidden_current_src_indices = None
-        req.pd_hidden_current_start = None
-        req.pd_hidden_current_row_len = 0
-        req.pd_hidden_current_is_last = False
-        req.pd_hidden_owner_direct_sent = True
+            pd_hidden_state(req).src_indices = None
+        pd_hidden_state(req).current_src_indices = None
+        pd_hidden_state(req).current_start = None
+        pd_hidden_state(req).current_row_len = 0
+        pd_hidden_state(req).current_is_last = False
+        pd_hidden_state(req).owner_direct_sent = True
         return True
 
     def _write_pd_hidden_rows_for_batch(
@@ -1034,12 +1193,12 @@ class SchedulerDisaggregationPrefillMixin:
             for req in batch.reqs
             if (
                 (
-                    req.pd_hidden_src_indices
-                    or req.pd_hidden_capture_layer_ids
+                    pd_hidden_state(req).src_indices
+                    or pd_hidden_state(req).capture_layer_ids
                 )
                 and (
                     send_owner_direct
-                    or not req.pd_hidden_owner_direct_sent
+                    or not pd_hidden_state(req).owner_direct_sent
                 )
             )
         ]
@@ -1047,14 +1206,15 @@ class SchedulerDisaggregationPrefillMixin:
             reqs = [
                 (
                     req.rid,
-                    req.pd_hidden_capture_layer_ids,
-                    bool(req.pd_hidden_src_indices),
+                    pd_hidden_state(req).capture_layer_ids,
+                    bool(pd_hidden_state(req).src_indices),
                 )
                 for req in needs_pd_hidden_reqs
             ]
             message = (
                 "PD hidden capture was required but forward output has no "
-                f"hidden states: batch_capture_layers={batch.pd_hidden_capture_layer_ids}, "
+                "hidden states: batch_capture_layers="
+                f"{get_pd_hidden_capture_layer_ids(batch.reqs)}, "
                 f"reqs={reqs}"
             )
             for req in needs_pd_hidden_reqs:
@@ -1082,11 +1242,11 @@ class SchedulerDisaggregationPrefillMixin:
             req_hidden = hidden_states[hidden_offset : hidden_offset + extend_len]
             hidden_offset += extend_len
 
-            meta = req.pd_hidden_meta or {}
+            meta = pd_hidden_state(req).meta or {}
             streaming_hidden = bool(meta.get("streaming_hidden", False))
-            if not send_owner_direct and req.pd_hidden_owner_direct_sent:
+            if not send_owner_direct and pd_hidden_state(req).owner_direct_sent:
                 continue
-            src_indices = req.pd_hidden_src_indices
+            src_indices = pd_hidden_state(req).src_indices
             if not src_indices and not streaming_hidden:
                 continue
 
@@ -1134,8 +1294,8 @@ class SchedulerDisaggregationPrefillMixin:
             else:
                 rows = local_end - local_start
                 write_indices = src_indices[local_start:local_end]
-            prev_current_start = req.pd_hidden_current_start
-            prev_current_row_len = int(req.pd_hidden_current_row_len or 0)
+            prev_current_start = pd_hidden_state(req).current_start
+            prev_current_row_len = int(pd_hidden_state(req).current_row_len or 0)
             if (
                 prev_current_start is not None
                 and prev_current_row_len > 0
@@ -1165,16 +1325,16 @@ class SchedulerDisaggregationPrefillMixin:
                         "only after the matching hidden chunk ACK.",
                     )
                     continue
-                req.pd_hidden_src_indices = write_indices
+                pd_hidden_state(req).src_indices = write_indices
             pool.write(
                 write_indices,
                 req_hidden_to_write[chunk_local_start:chunk_local_end],
             )
-            req.pd_hidden_current_start = write_start
-            req.pd_hidden_current_row_len = rows
-            req.pd_hidden_current_src_indices = write_indices
-            req.pd_hidden_current_is_last = write_end >= hidden_start + hidden_len
-            written = req.pd_hidden_written
+            pd_hidden_state(req).current_start = write_start
+            pd_hidden_state(req).current_row_len = rows
+            pd_hidden_state(req).current_src_indices = write_indices
+            pd_hidden_state(req).current_is_last = write_end >= hidden_start + hidden_len
+            written = pd_hidden_state(req).written
             if written is not None:
                 written[local_start:local_end] = [True] * rows
             if send_owner_direct:
@@ -1188,7 +1348,7 @@ class SchedulerDisaggregationPrefillMixin:
         capture_reqs = [
             req
             for req in batch.reqs
-            if req.pd_hidden_capture_layer_ids
+            if pd_hidden_state(req).capture_layer_ids
         ]
         if not capture_reqs:
             return False
@@ -1196,7 +1356,7 @@ class SchedulerDisaggregationPrefillMixin:
             return False
         if not all(
             bool(
-                (req.pd_hidden_meta or {}).get("streaming_hidden", False)
+                (pd_hidden_state(req).meta or {}).get("streaming_hidden", False)
             )
             for req in capture_reqs
         ):
@@ -1714,15 +1874,15 @@ class SchedulerDisaggregationPrefillMixin:
             )
             return True
 
-        current_pd_hidden_src_indices = req.pd_hidden_current_src_indices
-        current_pd_hidden_start = req.pd_hidden_current_start
-        current_pd_hidden_row_len = int(req.pd_hidden_current_row_len or 0)
+        current_pd_hidden_src_indices = pd_hidden_state(req).current_src_indices
+        current_pd_hidden_start = pd_hidden_state(req).current_start
+        current_pd_hidden_row_len = int(pd_hidden_state(req).current_row_len or 0)
         has_current_pd_hidden = (
             current_pd_hidden_src_indices is not None
             and current_pd_hidden_row_len > 0
         )
         streaming_pd_hidden = bool(
-            (req.pd_hidden_meta or {}).get("streaming_hidden", False)
+            (pd_hidden_state(req).meta or {}).get("streaming_hidden", False)
         )
 
         state_indices: Optional[List] = None
@@ -1796,10 +1956,10 @@ class SchedulerDisaggregationPrefillMixin:
                 )
 
             def _pd_hidden_payload():
-                if req.pd_hidden_owner_direct_sent:
+                if pd_hidden_state(req).owner_direct_sent:
                     return []
-                src_indices = req.pd_hidden_src_indices
-                if src_indices is None and req.pd_hidden_capture_layer_ids:
+                src_indices = pd_hidden_state(req).src_indices
+                if src_indices is None and pd_hidden_state(req).capture_layer_ids:
                     raise RuntimeError(
                         "PD hidden row pool was not materialized before transfer: "
                         f"rid={req.rid}"
@@ -1808,7 +1968,7 @@ class SchedulerDisaggregationPrefillMixin:
                     return np.asarray(current_pd_hidden_src_indices, dtype=np.int32)
                 if not src_indices:
                     return []
-                written = req.pd_hidden_written
+                written = pd_hidden_state(req).written
                 if written is not None and not all(written):
                     missing = [i for i, ok in enumerate(written) if not ok][:8]
                     raise RuntimeError(
@@ -1857,18 +2017,18 @@ class SchedulerDisaggregationPrefillMixin:
             req.disagg_kv_sender.set_pd_hidden_chunk_meta(
                 int(current_pd_hidden_start),
                 int(current_pd_hidden_row_len),
-                bool(req.pd_hidden_current_is_last),
+                bool(pd_hidden_state(req).current_is_last),
                 current_pd_hidden_src_indices
                 if streaming_pd_hidden
-                else req.pd_hidden_src_indices,
+                else pd_hidden_state(req).src_indices,
             )
         req.disagg_kv_sender.send(page_indices, state_indices)
         if has_current_pd_hidden and streaming_pd_hidden:
-            req.pd_hidden_src_indices = None
-        req.pd_hidden_current_src_indices = None
-        req.pd_hidden_current_start = None
-        req.pd_hidden_current_row_len = 0
-        req.pd_hidden_current_is_last = False
+            pd_hidden_state(req).src_indices = None
+        pd_hidden_state(req).current_src_indices = None
+        pd_hidden_state(req).current_start = None
+        pd_hidden_state(req).current_row_len = 0
+        pd_hidden_state(req).current_is_last = False
         req.start_send_idx = end_idx
         return True
 

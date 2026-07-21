@@ -1050,16 +1050,6 @@ class Req(ReqDllmMixin):
         self.pd_rebootstrap_forced_output_id: Optional[int] = None
         self.skip_radix_cache_insert = bootstrap_host == FAKE_BOOTSTRAP_HOST
         self.disagg_kv_sender: Optional[BaseKVSender] = None
-        self.pd_hidden_meta: Optional[dict] = None
-        self.pd_hidden_src_indices: Optional[List[int]] = None
-        self.pd_hidden_dst_indices: Optional[List[int]] = None
-        self.pd_hidden_written: Optional[List[bool]] = None
-        self.pd_hidden_capture_layer_ids: Optional[List[int]] = None
-        self.pd_hidden_current_src_indices: Optional[List[int]] = None
-        self.pd_hidden_current_start: Optional[int] = None
-        self.pd_hidden_current_row_len: int = 0
-        self.pd_hidden_current_is_last: bool = False
-        self.pd_hidden_owner_direct_sent: bool = False
 
         self.routed_dp_rank: Optional[int] = routed_dp_rank
         self.disagg_prefill_dp_rank: Optional[int] = disagg_prefill_dp_rank
@@ -1982,12 +1972,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Speculative decoding
     # spec_info: Optional[SpecInput] = None
     spec_info: Optional[SpecInput] = None
-
-    # === One-shot per-forward overrides; init_new consumes and resets ===
-    seq_lens_cpu_cache: torch.Tensor = None
-    capture_hidden_mode: Optional[CaptureHiddenMode] = None
-    return_hidden_states_before_norm: bool = False
-    pd_hidden_capture_layer_ids: Optional[List[int]] = None
 
     @classmethod
     def init_new(
@@ -3032,9 +3016,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             can_run_dp_breakable_cuda_graph=self.can_run_dp_breakable_cuda_graph,
             is_extend_in_batch=self.is_extend_in_batch,
             is_prefill_only=self.is_prefill_only,
-            seq_lens_cpu=(
-                self.seq_lens_cpu.clone() if self.seq_lens_cpu is not None else None
-            ),
+            seq_lens_cpu=self.seq_lens_cpu,
             enable_overlap=self.enable_overlap,
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,
@@ -3043,11 +3025,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             prefill_stats=self.prefill_stats,
             fpm_start_time=self.fpm_start_time,
             forward_iter=self.forward_iter,
-            pd_hidden_capture_layer_ids=(
-                self.pd_hidden_capture_layer_ids[:]
-                if self.pd_hidden_capture_layer_ids is not None
-                else None
-            ),
         )
 
     def maybe_evict_swa(self):

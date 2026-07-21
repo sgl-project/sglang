@@ -42,6 +42,7 @@ from sglang.srt.environ import envs
 from sglang.srt.kv_canary.req_to_expected_token_ids_manager import (
     compute_req_all_ids_info,
 )
+from sglang.srt.disaggregation.hidden_state import get_pd_hidden_capture_layer_ids
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     set_dp_buffer_len,
@@ -636,8 +637,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         # capture_hidden_mode=None means no override: derive from
         # SB.return_hidden_states / spec_info.capture_hidden_mode.
+        pd_hidden_capture_layer_ids = get_pd_hidden_capture_layer_ids(batch.reqs)
         if capture_hidden_mode is None:
-            if batch.return_hidden_states:
+            if batch.return_hidden_states or pd_hidden_capture_layer_ids:
                 capture_hidden_mode = CaptureHiddenMode.FULL
             elif batch.spec_info is not None:
                 capture_hidden_mode = getattr(
@@ -708,7 +710,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             spec_algorithm=batch.spec_algorithm,
             capture_hidden_mode=capture_hidden_mode,
             return_hidden_states_before_norm=return_hidden_states_before_norm,
-            pd_hidden_capture_layer_ids=batch.pd_hidden_capture_layer_ids,
+            pd_hidden_capture_layer_ids=pd_hidden_capture_layer_ids,
             tbo_split_seq_index=batch.tbo_split_seq_index,
             # Host-side metadata
             top_logprobs_nums=batch.top_logprobs_nums,
