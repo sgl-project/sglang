@@ -722,6 +722,18 @@ def get_buffer(name: str, factory: Any) -> Any:
     return _CONTEXT.get_buffer(name, factory)
 
 
+_GLOBAL_DWDP_MANAGER: Any = None
+
+
+def get_global_dwdp_manager() -> Any:
+    return _GLOBAL_DWDP_MANAGER
+
+
+def set_global_dwdp_manager(manager: Any) -> None:
+    global _GLOBAL_DWDP_MANAGER
+    _GLOBAL_DWDP_MANAGER = manager
+
+
 def reset_context() -> None:
     """Clear the context-owned store (unit-test teardown): drop the published
     ``server_args`` and install fresh ``Flags`` and ``Resources``.
@@ -732,3 +744,4 @@ def reset_context() -> None:
     _CONTEXT.flags = Flags()
     _CONTEXT.resources = Resources()
     _CONTEXT.forward = ForwardFlags()
+    set_global_dwdp_manager(None)
