@@ -3484,7 +3484,6 @@ class ServerArgs:
     def _handle_cuda_graph_config(self):
         self._parse_cuda_graph_config()
         self._apply_cuda_graph_compatibility()
-        self._clamp_prefill_buckets_for_deepep_bcg()
         self._align_prefill_buckets_for_deepep_bcg()
         self._apply_cuda_graph_disaggregation_roles()
         self._validate_cuda_graph_config()
@@ -3496,42 +3495,6 @@ class ServerArgs:
                 "cuda_graph_config[prefill].backend='full' is experimental. "
                 "Use breakable or tc_piecewise for production workloads."
             )
-
-    def _clamp_prefill_buckets_for_deepep_bcg(self):
-        """Breakable prefill under DeepEP runs the MoE as an eager split node
-        whose NORMAL-mode a2a rendezvouses across EP ranks *during capture*,
-        and whose per-break bridge buffers scale with sum(buckets) x layers.
-        A large fine-grained bucket list makes capture exceed DeepEP's CPU
-        recv timeout and blow the capture pool. Clamp to a small coarse list
-        unless the user explicitly chose buckets."""
-        from sglang.srt.arg_groups.overrides import resolved_view as _resolved_view
-
-        if (
-            self.cuda_graph_config.prefill.backend != Backend.BREAKABLE
-            or _resolved_view(self).moe_a2a_backend != "deepep"
-        ):
-            return
-        if (Phase.PREFILL, "bs") in self._cuda_graph_config_locked or (
-            Phase.PREFILL,
-            "max_bs",
-        ) in self._cuda_graph_config_locked:
-            return
-        # The full default ladder to 2048, restricted to multiples of 8
-        # (the sub-32 range(4,33,4) entries 4/12/20/28 are dropped: non
-        # multiples of 8 wedge the deepep a2a during capture, see
-        # _align_prefill_buckets_for_deepep_bcg). Steady-state capture cost
-        # is ~0.8 s/bucket after the seeded-dummy fix, so the full ladder
-        # is affordable.
-        clamped = [
-            b for b in self._generate_prefill_cuda_graph_batch_sizes(2048) if b % 8 == 0
-        ]
-        self.cuda_graph_config.prefill.bs = clamped
-        self.cuda_graph_config.prefill.max_bs = clamped[-1]
-        logger.info(
-            "Breakable prefill CUDA graph with DeepEP: clamping prefill "
-            "bucket list to %s (override with --cuda-graph-bs-prefill).",
-            clamped,
-        )
 
     def _align_prefill_buckets_for_deepep_bcg(self):
         """Capture of a prefill bucket whose num_tokens is not a multiple of
@@ -3552,12 +3515,13 @@ class ServerArgs:
             # The default bucket list is derived later from max_bs and
             # contains non-multiples of 8 (range(4, 33, 4)); materialize it
             # now so alignment can apply.
-            bs = self._generate_prefill_cuda_graph_batch_sizes(
-                self.cuda_graph_config.prefill.max_bs
-            )
+            # At cascade time both bs and max_bs can still be None on the
+            # pure-default path; 2048 is the documented prefill default.
+            max_bs = self.cuda_graph_config.prefill.max_bs or 2048
+            bs = self._generate_prefill_cuda_graph_batch_sizes(max_bs)
         aligned = sorted({((b + 7) // 8) * 8 for b in bs})
         if aligned != sorted(bs):
-            logger.warning(
+            logger.info(
                 "Breakable prefill CUDA graph with DeepEP requires bucket "
                 "sizes divisible by 8; aligning %s -> %s.",
                 sorted(bs),
@@ -3785,7 +3749,7 @@ class ServerArgs:
             # DeepEP is exempt: its MoE runs as an eager split node with
             # NORMAL-mode a2a between captured segments (see
             # bcg_deepep_moe_experts); the prefill bucket list is clamped in
-            # _clamp_prefill_buckets_for_deepep_bcg so in-capture rendezvous
+            # _align_prefill_buckets_for_deepep_bcg so in-capture rendezvous
             # and bridge-buffer memory stay bounded. Other a2a backends
             # (mooncake/nixl/moriep/flashinfer) are unvalidated under BCG.
             (
