@@ -18,12 +18,14 @@ import logging
 import math
 import os
 from enum import Enum, IntEnum, auto
+from functools import cached_property
 from pathlib import Path
 from typing import Any, List, Optional, Set, Union
 
 import torch
 from transformers import PretrainedConfig
 
+from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_config
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization import QUANTIZATION_METHODS
 from sglang.srt.server_args import ServerArgs
@@ -287,6 +289,14 @@ class ModelConfig:
             )
         )
         self.hf_text_config = get_hf_text_config(self.hf_config)
+
+        rope_scaling = getattr(self.hf_text_config, "rope_parameters", None) or getattr(
+            self.hf_text_config, "rope_scaling", {}
+        )
+        self.model_is_mrope = (
+            rope_scaling is not None and "mrope_section" in rope_scaling
+        )
+
         self.hf_generation_config = get_generation_config(
             self.model_path,
             trust_remote_code=trust_remote_code,
@@ -300,6 +310,7 @@ class ModelConfig:
                 "Gemma3ForConditionalGeneration",
                 "Llama4ForConditionalGeneration",
                 "Step3VLForConditionalGeneration",
+                "InklingForConditionalGeneration",
             ]
             if (
                 self.hf_config.architectures[0] in mm_disabled_models
@@ -600,6 +611,11 @@ class ModelConfig:
             self.hf_config.architectures[0] = "Step3p5MTP"
         if (
             is_draft_model
+            and self.hf_config.architectures[0] == "InklingForConditionalGeneration"
+        ):
+            self.hf_config.architectures[0] = "InklingForConditionalGenerationMTP"
+        if (
+            is_draft_model
             and self.hf_config.architectures[0] == "Step3p7ForConditionalGeneration"
         ):
             self.hf_config = self.hf_text_config
@@ -682,8 +698,14 @@ class ModelConfig:
             "MiMoV2MTP",
             "Gemma4ForCausalLM",
             "Gemma4ForConditionalGeneration",
+            "InklingForConditionalGeneration",
+            "InklingForConditionalGenerationMTP",
             "Gemma4UnifiedForConditionalGeneration",
         ]
+
+    @cached_property
+    def linear_attn_registry_result(self) -> Any:
+        return get_linear_attn_config(self.hf_config)
 
     def _detect_attention_sinks(self) -> bool:
         """Check whether the model uses learned attention sinks.
@@ -1315,7 +1337,6 @@ class ModelConfig:
             "fp8",
             "compressed_tensors",
             "compressed-tensors",
-            "fbgemm_fp8",
             "w8a8_fp8",
             "petit_nvfp4",
             "quark",
@@ -1336,14 +1357,12 @@ class ModelConfig:
             "gptq_marlin_24",
             "gptq_marlin",
             "awq_marlin",
-            "fbgemm_fp8",
             "compressed_tensors",
             "compressed-tensors",
             "experts_int8",
             "w8a8_int8",
             "w8a8_fp8",
             "moe_wna16",
-            "qoq",
             "w4afp8",
             "petit_nvfp4",
             "quark",
@@ -1901,6 +1920,9 @@ def is_hybrid_swa_model(
         "Gemma4ForConditionalGeneration",
         "Gemma4UnifiedForConditionalGeneration",
         "LagunaForCausalLM",
+        "MellumForCausalLM",
+        "InklingForConditionalGeneration",
+        "InklingForConditionalGenerationMTP",
         "UnlimitedOCRForCausalLM",
     }
     if any(arch in hybrid_swa_archs for arch in model_architectures):
@@ -1972,6 +1994,8 @@ def get_hybrid_layer_ids(
         "Gemma4ForCausalLM" in model_architectures
         or "Gemma4ForConditionalGeneration" in model_architectures
         or "Gemma4UnifiedForConditionalGeneration" in model_architectures
+        or "LagunaForCausalLM" in model_architectures
+        or "MellumForCausalLM" in model_architectures
     ):
         layer_types = getattr(hf_text_config, "layer_types", [])
         swa_attention_layer_ids = [
@@ -1980,13 +2004,36 @@ def get_hybrid_layer_ids(
         full_attention_layer_ids = [
             i for i, x in enumerate(layer_types) if x == "full_attention"
         ]
-    elif "LagunaForCausalLM" in model_architectures:
-        layer_types = getattr(hf_text_config, "layer_types", [])
+    elif "InklingForConditionalGenerationMTP" in model_architectures:
+        # One block per MTP depth; a banded head marks its sliding-window depths
+        # in mtp_local_layer_ids. The per-depth pool routing in the KV-cache
+        # mixin is authoritative; this keeps model_config's swa/full lists
+        # self-consistent for other consumers.
+        mtp_local_layer_ids = hf_text_config.mtp_local_layer_ids
+        if mtp_local_layer_ids:
+            num_depths = hf_text_config.num_nextn_predict_layers
+            local_set = set(mtp_local_layer_ids)
+            swa_attention_layer_ids = sorted(local_set)
+            full_attention_layer_ids = [
+                i for i in range(num_depths) if i not in local_set
+            ]
+        else:
+            swa_attention_layer_ids = []
+            full_attention_layer_ids = [0]
+    elif "InklingForConditionalGeneration" in model_architectures:
+        local_layer_ids = hf_text_config.local_layer_ids
+        local_layer_id_set = set(local_layer_ids)
+        assert len(local_layer_id_set) == len(
+            local_layer_ids
+        ), f"Inkling local_layer_ids must be unique: {local_layer_ids}"
+        assert all(
+            0 <= layer_id < num_hidden_layers for layer_id in local_layer_id_set
+        ), f"Inkling local_layer_ids must be in [0, {num_hidden_layers}): {local_layer_ids}"
         swa_attention_layer_ids = [
-            i for i, x in enumerate(layer_types) if x == "sliding_attention"
+            i for i in range(num_hidden_layers) if i in local_layer_id_set
         ]
         full_attention_layer_ids = [
-            i for i, x in enumerate(layer_types) if x == "full_attention"
+            i for i in range(num_hidden_layers) if i not in local_layer_id_set
         ]
     elif "UnlimitedOCRForCausalLM" in model_architectures:
         swa_attention_layer_ids = list(range(num_hidden_layers))

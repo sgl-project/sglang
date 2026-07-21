@@ -30,7 +30,11 @@ from transformers.models.glm4v.configuration_glm4v import Glm4vConfig, Glm4vVisi
 from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.attention import vision_utils
-from sglang.srt.layers.attention.vision import VisionAttention
+from sglang.srt.layers.attention.vision import (
+    VisionAttention,
+    VisionAttentionMetadata,
+    prepare_vision_attention_metadata,
+)
 from sglang.srt.layers.conv import Conv3dLayer
 from sglang.srt.layers.layernorm import LayerNorm, RMSNorm
 from sglang.srt.layers.linear import (
@@ -156,6 +160,7 @@ class Glm4vVisionBlock(nn.Module):
         cu_seqlens: torch.Tensor,
         rotary_pos_emb_cos: torch.Tensor,
         rotary_pos_emb_sin: torch.Tensor,
+        forward_metadata: Optional[VisionAttentionMetadata] = None,
     ) -> torch.Tensor:
         S, B, H = x.shape
         # norm1: flatten to 2D -> [S*B, H], then reshape back
@@ -169,6 +174,7 @@ class Glm4vVisionBlock(nn.Module):
             cu_seqlens=cu_seqlens,
             rotary_pos_emb_cos=rotary_pos_emb_cos,
             rotary_pos_emb_sin=rotary_pos_emb_sin,
+            forward_metadata=forward_metadata,
         )
         attn = rearrange(attn, "b s h -> s b h")
 
@@ -516,6 +522,10 @@ class Glm4vVisionModel(nn.Module):
         if is_npu():
             cu_seqlens = cu_seqlens.to("cpu")
 
+        forward_metadata = prepare_vision_attention_metadata(
+            cu_seqlens, device=self.device
+        )
+
         # x.shape: (s, b, d) where b=1 for vision processing
         # transformers
         x = x.unsqueeze(1)
@@ -525,6 +535,7 @@ class Glm4vVisionModel(nn.Module):
                 cu_seqlens=cu_seqlens,
                 rotary_pos_emb_cos=rotary_pos_emb_cos,
                 rotary_pos_emb_sin=rotary_pos_emb_sin,
+                forward_metadata=forward_metadata,
             )
 
         # adapter
