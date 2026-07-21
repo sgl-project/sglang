@@ -15,7 +15,12 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.managers.cache_controller import StorageOperation
 from sglang.srt.mem_cache.hi_mamba_radix_cache import HiMambaRadixCache
-from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+from sglang.srt.mem_cache.hicache_storage import (
+    PoolHitPolicy,
+    PoolName,
+    PoolTransfer,
+    PoolTransferResult,
+)
 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage_prefetch import (
@@ -26,6 +31,7 @@ from sglang.srt.mem_cache.storage_prefetch import (
     StorageCheckpointRegistry,
     StorageCheckpointRetryQueues,
     StorageCheckpointState,
+    StoragePrefetchOwnership,
     StoragePrefetchState,
     StoragePrefetchTracker,
     StorageWriteTracker,
@@ -871,6 +877,119 @@ class TestStoragePrefetchAdmissionPins(unittest.TestCase):
                 ("release", first_node),
                 ("release", second_node),
             ],
+        )
+
+
+class TestHybridPrefetchResultSync(unittest.TestCase):
+    def test_kv_derived_sidecar_clamps_to_shared_prefix(self):
+        transfer = PoolTransfer(
+            name=PoolName.INDEXER,
+            keys=["page-a", "page-b", "page-c"],
+            hit_policy=PoolHitPolicy.ALL_PAGES,
+            indices_from_pool=PoolName.KV,
+        )
+        operation = SimpleNamespace(
+            pool_transfers=[transfer],
+            pool_storage_result=PoolTransferResult(
+                kv_hit_pages=3, extra_pool_hit_pages={PoolName.INDEXER: 2}
+            ),
+        )
+        cache = SimpleNamespace(
+            page_size=1,
+            _all_reduce_attn_groups=lambda _values, _op: None,
+        )
+
+        usable_tokens = UnifiedRadixCache._sync_and_check_hybrid_prefetch_result(
+            cache,
+            "request-a",
+            operation,
+            3,
+            ["page-a", "page-b", "page-c"],
+            object(),
+            object(),
+            [1, 2, 3],
+        )
+
+        self.assertEqual(usable_tokens, 2)
+
+    def test_hybrid_failure_releases_scheduler_owned_memory(self):
+        base_frees = []
+        auxiliary_frees = []
+        anchor_entry = object()
+        auxiliary_pool = SimpleNamespace(
+            free=lambda indices: auxiliary_frees.append(indices.tolist())
+        )
+        auxiliary_entry = SimpleNamespace(
+            host_pool=auxiliary_pool,
+            is_primary_index_anchor=False,
+        )
+        mem_pool_host = SimpleNamespace(
+            anchor_entry=anchor_entry,
+            entry_map={PoolName.SWA: auxiliary_entry},
+            free=lambda indices: base_frees.append(indices.tolist()),
+        )
+        controller = SimpleNamespace(
+            mem_pool_host=mem_pool_host,
+            prefetch_tokens_occupied=2,
+        )
+        transfer = PoolTransfer(
+            name=PoolName.SWA,
+            keys=["page-a", "page-b"],
+            host_indices=torch.tensor([10, 11]),
+        )
+        operation = SimpleNamespace(
+            pool_transfers=[transfer],
+            pool_storage_result=PoolTransferResult(
+                kv_hit_pages=2, extra_pool_hit_pages={PoolName.SWA: 1}
+            ),
+        )
+        cache = SimpleNamespace(
+            page_size=1,
+            cache_controller=controller,
+            storage_prefetch_ownership={
+                "request-a": StoragePrefetchOwnership(
+                    operation_id=1,
+                    generation=1,
+                    host_indices=torch.tensor([0, 1]),
+                    owned_tokens=2,
+                )
+            },
+            ongoing_prefetch={"request-a": object()},
+            storage_state_change_resources=set(),
+            prefetch_loaded_tokens_by_reqid={},
+            storage_prefetch_tracker=StoragePrefetchTracker(),
+            _all_reduce_attn_groups=lambda _values, _op: None,
+            dec_host_lock_ref=lambda _node, _params: None,
+        )
+        cache._truncate_prefetch_ownership = lambda request_id, retained_tokens: (
+            UnifiedRadixCache._truncate_prefetch_ownership(
+                cache, request_id, retained_tokens
+            )
+        )
+        cache._release_prefetch_pool_allocations = lambda transfers: (
+            UnifiedRadixCache._release_prefetch_pool_allocations(cache, transfers)
+        )
+
+        usable_tokens = UnifiedRadixCache._sync_and_check_hybrid_prefetch_result(
+            cache,
+            "request-a",
+            operation,
+            2,
+            ["page-a", "page-b"],
+            object(),
+            object(),
+            [1, 2],
+        )
+
+        self.assertIsNone(usable_tokens)
+        self.assertEqual(base_frees, [[0, 1]])
+        self.assertEqual(auxiliary_frees, [[10, 11]])
+        self.assertFalse(cache.storage_prefetch_ownership)
+        self.assertFalse(cache.ongoing_prefetch)
+        self.assertEqual(controller.prefetch_tokens_occupied, 0)
+        self.assertEqual(
+            cache.storage_prefetch_tracker.get("request-a"),
+            StoragePrefetchState.MISS,
         )
 
 
