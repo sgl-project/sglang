@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
@@ -110,10 +111,16 @@ def _all_gather_dsa_trtllm_fp8_kv(
 
 
 _is_hip = is_hip()
+# ROCm gfx950 only: route the fp8-KV + prefill-CP DSA decode through a per-query
+# Triton sparse-MLA kernel. Off by default; opt in with SGLANG_DSA_TRITON_FP8_DECODE=1.
+_DSA_TRITON_FP8_DECODE = os.environ.get("SGLANG_DSA_TRITON_FP8_DECODE", "0") == "1"
 
 if _is_hip:
-    from sglang.kernels.ops.attention.dsa.triton_kernel import get_valid_kv_indices
-    from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
+    from sglang.srt.layers.attention.dsa.triton_kernel import get_valid_kv_indices
+    from sglang.srt.layers.attention.dsa.triton_sparse_mla_decode import (
+        triton_sparse_mla_decode_fp8,
+    )
+    from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
 
     try:
         from aiter import (  # noqa: F401
@@ -413,10 +420,14 @@ class DeepseekSparseAttnBackend(
                 device=self.device,
             )
             # Aiter mla_decode_fwd supports num_heads multiples of 16 in range [16, 128].
-            # For models with fewer heads per GPU (e.g. GLM-5 64 heads / TP8 = 8), need to pad the heads to 16.
-            self.need_pad_heads = self.num_q_heads < 16
+            # For GLM-5 (64 heads / TP8 = 8) it pads 8->16 (gqaratio16 kernels).
+            # V1 no-pad: gfx950 has native qh8/gqaratio8 v3 asm MLA
+            # (mla_a16w16_qh8_qseqlen1_gqaratio8_v3); SGLANG_DSA_NO_PAD_HEADS=1 routes
+            # the 8 heads straight through with no 8->16 repeat_interleave.
+            _no_pad = os.environ.get("SGLANG_DSA_NO_PAD_HEADS", "0") == "1"
+            self.need_pad_heads = (self.num_q_heads < 16) and not _no_pad
             self.head_repeat_factor = (
-                16 // self.num_q_heads if self.num_q_heads < 16 else 1
+                16 // self.num_q_heads if self.need_pad_heads else 1
             )
             self.num_head_padded = self.num_q_heads * self.head_repeat_factor
             self.aiter_dsa_max_split_per_batch = 64
@@ -1004,6 +1015,28 @@ class DeepseekSparseAttnBackend(
         dsa_cache_seqlens_int32 = pad_dsa_cache_seqlens(
             forward_batch, dsa_cache_seqlens_int32
         )
+        # CP+EAGLE: pad_dsa_cache_seqlens pads
+        # dsa_cache_seqlens_int32 up to the CP/DP padded token count, but
+        # seqlens_expanded stays at the real length. The PAGED draft topk
+        # (fast_topk_transform_fused asserts lengths.size(0) == B) then sees a short
+        # lengths under prefill context-parallel. Pad seqlens_expanded to match, but
+        # ONLY for the PAGED-consumer modes that _get_topk_paged handles
+        # (decode/target_verify/draft_extend_v2); the ragged context_parallel_extend
+        # path (_get_topk_ragged) requires the UNPADDED seqlens_expanded == logits.
+        if (
+            forward_batch.forward_mode.is_decode_or_idle()
+            or forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend_v2()
+        ) and seqlens_expanded.shape[0] < dsa_cache_seqlens_int32.shape[0]:
+            _cp_pad = dsa_cache_seqlens_int32.shape[0] - seqlens_expanded.shape[0]
+            seqlens_expanded = torch.cat(
+                [
+                    seqlens_expanded,
+                    seqlens_expanded.new_zeros(
+                        _cp_pad, *seqlens_expanded.shape[1:]
+                    ),
+                ]
+            )
         dsa_cu_seqlens_k = compute_cu_seqlens(dsa_cache_seqlens_int32)
         dsa_cu_seqlens_q = self.get_device_int32_arange(len(dsa_cu_seqlens_k))
 
@@ -1340,6 +1373,24 @@ class DeepseekSparseAttnBackend(
             else:
                 flashmla_metadata = None
 
+        # CP+EAGLE: keep seqlens_expanded aligned
+        # with dsa_cache_seqlens_int32 for the PAGED-consumer modes (no-op unless a
+        # CP/DP pad left it short); the ragged context_parallel_extend path stays
+        # unpadded.
+        if (
+            forward_mode.is_decode_or_idle()
+            or forward_mode.is_target_verify()
+            or forward_mode.is_draft_extend_v2()
+        ) and seqlens_expanded.shape[0] < dsa_cache_seqlens_int32.shape[0]:
+            _cp_pad = dsa_cache_seqlens_int32.shape[0] - seqlens_expanded.shape[0]
+            seqlens_expanded = torch.cat(
+                [
+                    seqlens_expanded,
+                    seqlens_expanded.new_zeros(
+                        _cp_pad, *seqlens_expanded.shape[1:]
+                    ),
+                ]
+            )
         dsa_cu_seqlens_k = compute_cu_seqlens(dsa_cache_seqlens_int32)
         dsa_cu_seqlens_q = self.get_device_int32_arange(len(dsa_cu_seqlens_k))
         if self.dsa_drop_wide_page_table:
@@ -2677,6 +2728,25 @@ class DeepseekSparseAttnBackend(
             q_kernel = q.view(-1, layer.tp_q_head_num, layer.head_dim)
             o_kernel = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
 
+        if (
+            # ROCm gfx950: fp8-KV + prefill-CP -> per-query Triton sparse-MLA kernel.
+            _DSA_TRITON_FP8_DECODE
+            and _is_hip
+            and kv_cache.dtype == fp8_dtype
+            and is_dsa_enable_prefill_cp()
+            and not self.need_pad_heads
+        ):
+            _d_v = layer.v_head_dim
+            triton_sparse_mla_decode_fp8(
+                q_kernel[..., :_d_v].contiguous(),
+                q_kernel[..., _d_v:].contiguous(),
+                kv_cache,
+                page_table_1,
+                layer.scaling,
+                out=o_kernel,
+            )
+            return o
+
         q_scale = None
         kv_scale = None
         aiter_persistent_kwargs = {}
@@ -2754,6 +2824,25 @@ class DeepseekSparseAttnBackend(
         else:
             q_kernel = q.view(-1, layer.tp_q_head_num, layer.head_dim)
             o_kernel = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+
+        if (
+            # ROCm gfx950: fp8-KV + prefill-CP -> per-query Triton sparse-MLA kernel.
+            _DSA_TRITON_FP8_DECODE
+            and _is_hip
+            and kv_cache.dtype == fp8_dtype
+            and is_dsa_enable_prefill_cp()
+            and not self.need_pad_heads
+        ):
+            _d_v = layer.v_head_dim
+            triton_sparse_mla_decode_fp8(
+                q_kernel[..., :_d_v].contiguous(),
+                q_kernel[..., _d_v:].contiguous(),
+                kv_cache,
+                page_table_1,
+                layer.scaling,
+                out=o_kernel,
+            )
+            return o
 
         q_scale = None
         kv_scale = None
