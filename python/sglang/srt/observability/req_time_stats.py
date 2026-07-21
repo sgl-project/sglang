@@ -922,6 +922,8 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
             result["speed_gb_s"] = speed_gb_s
 
             if self.enable_metrics:
+                # Note that latency notion differs by backend,
+                # so speeds aren't cross-comparable.
                 self.metrics_collector.observe_kv_transfer_metrics(
                     latency_ms=latency_ms,
                     total_mb=total_mb,

@@ -21,6 +21,7 @@ from sglang.srt.disaggregation.common.conn import (
     CommonKVReceiver,
     CommonKVSender,
     KVTransferError,
+    count_state_indices,
 )
 from sglang.srt.disaggregation.common.staging_handler import (
     DecodeStagingContext,
@@ -1446,6 +1447,25 @@ class MooncakeKVManager(CommonKVManager):
                                 kv_chunk.prefill_aux_index,
                                 target_rank_registration_info.dst_aux_ptrs,
                             )
+
+                        # Record before flipping to Success (scheduler pops on
+                        # Success). State is only on the wire in the last chunk.
+                        num_state_indices = (
+                            count_state_indices(kv_chunk.state_indices)
+                            if kv_chunk.is_last_chunk
+                            else 0
+                        )
+                        bytes_sent = self._transfer_bytes(
+                            len(kv_chunk.prefill_kv_indices),
+                            num_state_indices,
+                        )
+                        self._record_transfer(
+                            kv_chunk.room,
+                            bytes_sent,
+                            time.perf_counter() - start_ts,
+                        )
+
+                        if kv_chunk.is_last_chunk:
                             polls.append(True if ret == 0 else False)
                             dst_ranks_infos.append(
                                 (req.endpoint, req.dst_port, req.room)

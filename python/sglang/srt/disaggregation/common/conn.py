@@ -9,6 +9,7 @@ import time
 from collections import defaultdict
 from typing import Dict, List, Optional, Set, Tuple, Union
 
+import msgspec
 import numpy as np
 import numpy.typing as npt
 import requests
@@ -115,6 +116,22 @@ class PrefillRankInfo:
         self.rank_port = int(self.rank_port)
 
 
+class _TransferRecord(msgspec.Struct):
+    # Summed transfer time and bytes across all sends and dst ranks of a request.
+    total_elapsed_s: float = 0.0
+    total_bytes: int = 0
+
+
+def count_state_indices(state_indices: Optional[List]) -> int:
+    if not state_indices:
+        return 0
+    return sum(
+        len(component_indices)
+        for component_indices in state_indices
+        if component_indices is not None
+    )
+
+
 class CommonKVManager(BaseKVManager):
     def __init__(
         self,
@@ -176,6 +193,10 @@ class CommonKVManager(BaseKVManager):
         logger.debug(f"kv manager bind to {self.local_ip}:{self.rank_port}")
 
         self.request_status: Dict[int, KVPoll] = {}
+        self._transfer_records: Dict[int, _TransferRecord] = {}
+        # Serializes (status, _transfer_records) transitions so a late transfer
+        # cannot re-create a record that a concurrent teardown just drained.
+        self.status_record_lock = threading.Lock()
         self._socket_cache: Dict[str, zmq.Socket] = {}
         self._monitor_cache: Dict[str, zmq.Socket] = {}
         self._socket_lock = threading.Lock()
@@ -247,22 +268,48 @@ class CommonKVManager(BaseKVManager):
     def check_status(self, bootstrap_room: int) -> KVPoll:
         return self.request_status[bootstrap_room]
 
-    def update_status(self, bootstrap_room: int, status: KVPoll):
-        if bootstrap_room not in self.request_status:
-            # Do not resurrect a cleared entry with Failed: once clear() has
-            # popped the room from request_status, any late update_status(Failed)
-            # (e.g. from abort()) must be a no-op. Otherwise a Failed entry could
-            # pollute a future request that reuses the same bootstrap_room.
-            if status == KVPoll.Failed:
+    def _transfer_bytes(self, num_kv_indices: int, num_state_indices: int) -> int:
+        return (
+            num_kv_indices * self.kv_item_lens_sum
+            + num_state_indices * self.state_item_lens_sum
+        )
+
+    def _record_transfer(
+        self,
+        bootstrap_room: int,
+        nbytes: int,
+        elapsed_s: float,
+    ):
+        # Callers pass the bytes actually put on the wire for one send (a chunk
+        # to a single dst rank), so replication across dst ranks is summed here.
+        if elapsed_s <= 0 or nbytes <= 0:
+            return
+        with self.status_record_lock:
+            status = self.request_status.get(bootstrap_room)
+            if status is None or status == KVPoll.Failed:
+                # Room torn down: don't let a late transfer re-create a drained record.
                 return
-            self.request_status[bootstrap_room] = status
-        else:
+            record = self._transfer_records.setdefault(
+                bootstrap_room, _TransferRecord()
+            )
+            record.total_elapsed_s += elapsed_s
+            record.total_bytes += nbytes
+
+    def update_status(self, bootstrap_room: int, status: KVPoll):
+        with self.status_record_lock:
             if status == KVPoll.Failed:
-                self.request_status[bootstrap_room] = KVPoll.Failed
-            else:
+                # A late Failed (e.g. from abort()) must never resurrect a
+                # cleared room, and must drop any record so it can't pollute a
+                # future reuse of this room.
+                self._transfer_records.pop(bootstrap_room, None)
+                if bootstrap_room in self.request_status:
+                    self.request_status[bootstrap_room] = KVPoll.Failed
+            elif bootstrap_room in self.request_status:
                 self.request_status[bootstrap_room] = max(
                     self.request_status[bootstrap_room], status
                 )
+            else:
+                self.request_status[bootstrap_room] = status
 
     def record_failure(self, bootstrap_room: int, failure_reason: str):
         with self.failure_lock:
@@ -1055,13 +1102,18 @@ class CommonKVSender(BaseKVSender):
         return num_pages > 0 or last_chunk
 
     def get_transfer_metric(self) -> KVTransferMetric:
-        total_bytes = self._transfer_num_kv_indices * self.kv_mgr.kv_item_lens_sum
-        total_bytes += (
-            self._transfer_num_state_indices * self.kv_mgr.state_item_lens_sum
-        )
-        # Pinned to 1 for MHA (disjoint slices); only MLA replication makes it > 1.
-        total_bytes *= self.kv_mgr.get_kv_replica_factor()
-        self._transfer_metric.transfer_total_bytes = total_bytes
+        record = self.kv_mgr._transfer_records.pop(self.bootstrap_room, None)
+        if record is not None and record.total_elapsed_s > 0:
+            self._transfer_metric.transfer_latency_s = record.total_elapsed_s
+            self._transfer_metric.transfer_total_bytes = record.total_bytes
+        else:
+            self._transfer_metric.transfer_total_bytes = (
+                self.kv_mgr._transfer_bytes(
+                    self._transfer_num_kv_indices, self._transfer_num_state_indices
+                )
+                * self.kv_mgr.get_kv_replica_factor()
+            )
+
         return self._transfer_metric
 
     def _record_transfer_indices(
@@ -1070,10 +1122,7 @@ class CommonKVSender(BaseKVSender):
         state_indices: Optional[List],
     ):
         self._transfer_num_kv_indices += len(kv_indices)
-        if state_indices:
-            for component_indices in state_indices:
-                if component_indices is not None:
-                    self._transfer_num_state_indices += len(component_indices)
+        self._transfer_num_state_indices += count_state_indices(state_indices)
 
     def _prepare_send_indices(
         self,
@@ -1142,7 +1191,9 @@ class CommonKVSender(BaseKVSender):
         raise Exception("Fake KVReceiver Exception")
 
     def clear(self) -> None:
-        self.kv_mgr.request_status.pop(self.bootstrap_room, None)
+        with self.kv_mgr.status_record_lock:
+            self.kv_mgr.request_status.pop(self.bootstrap_room, None)
+            self.kv_mgr._transfer_records.pop(self.bootstrap_room, None)
         if hasattr(self.kv_mgr, "req_to_decode_prefix_len"):
             self.kv_mgr.req_to_decode_prefix_len.pop(self.bootstrap_room, None)
         if hasattr(self.kv_mgr, "transfer_infos"):
