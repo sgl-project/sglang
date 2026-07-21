@@ -250,16 +250,6 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 self.num_shared_experts > 0
                 and can_fuse_shared_expert(config, quant_config)
             )
-        # Qwen shared-expert fusion appends the shared expert at a single global
-        # slot (see _append_shared_to_topk_output, base id N == num_experts) and
-        # applies a per-token shared_expert_gate. That global-slot layout is
-        # incompatible with per-rank EP shared-slot backends (DeepEP / Mooncake /
-        # MoRI / MegaMoE) once moe_ep_size > 1: those backends tile the expert id
-        # space into contiguous per-rank blocks (num_experts == num_local_experts
-        # * ep_size), which requires per-rank shared slots. Mixing the two trips
-        # FusedMoE's (num_experts - num_shared_slots) % ep_size == 0 assertion at
-        # init (issue #31336) and, even past it, misroutes experts. Fall back to
-        # the separate shared-expert MLP (correct, slightly less fused) there.
         if (
             self.enable_shared_expert_fusion
             and uses_per_rank_fused_shared_slots()
