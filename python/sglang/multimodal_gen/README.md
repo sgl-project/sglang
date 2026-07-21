@@ -92,6 +92,20 @@ sglang generate \
 
 For more usage examples (e.g. OpenAI compatible API, server mode), check the [CLI reference](https://docs.sglang.io/docs/sglang-diffusion/api/cli).
 
+### Realtime TAEHV decode
+
+Realtime Wan/LingBot sessions can use a [TAEHV](https://github.com/madebyollin/taehv)
+checkpoint for lower-latency preview decode. This path is opt-in and requires
+the `taehv` package to be installed separately:
+
+```bash
+export SGLANG_REALTIME_TAEHV_CHECKPOINT_PATH=/path/to/taew2_1.pth
+sglang serve ...
+```
+
+When the environment variable is unset, realtime sessions use the model's
+regular VAE path.
+
 ## Contributing
 
 All contributions are welcome. The contribution guide is available [here](https://docs.sglang.io/docs/sglang-diffusion/contributing).

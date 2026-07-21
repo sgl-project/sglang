@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 
 import torch
 
@@ -19,6 +20,8 @@ def test_realtime_vae_decode_state_clears_model_cache_on_dispose():
 
     assert calls == ["reset"]
     assert state.reset_causal_decode_state is None
+    assert state.taehv_streaming_decoder is None
+    assert state.taehv_output_queue == []
 
 
 def test_causal_vae_decoding_stage_keeps_wan_decoder_cache(monkeypatch):
@@ -173,3 +176,86 @@ def test_causal_vae_decoding_stage_prefers_native_causal_decode(monkeypatch):
 
     assert tuple(frames.shape) == (1, 1, 1, 1, 1)
     assert vae.calls == ["causal_decode"]
+
+
+def test_causal_vae_decoding_stage_can_use_streaming_taehv(monkeypatch):
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.realtime import (
+        vae as realtime_vae,
+    )
+
+    class _TAEHV:
+        t_upscale = 4
+        frames_to_trim = 3
+
+        def __init__(self, checkpoint_path):
+            self.checkpoint_path = checkpoint_path
+
+        def to(self, device=None, dtype=None):
+            self.device = device
+            self.dtype = dtype
+            return self
+
+        def eval(self):
+            self.training = False
+
+    class _StreamingTAEHV:
+        def __init__(self, taehv):
+            self.taehv = taehv
+            self.reset_calls = 0
+
+        def reset(self):
+            self.reset_calls += 1
+
+        def decode(self, latent=None):
+            if latent is None:
+                return None
+            batch, _, channels, height, width = latent.shape
+            value = float(latent.flatten()[0].item())
+            return torch.full(
+                (batch, self.taehv.t_upscale, channels, height, width),
+                value,
+                dtype=latent.dtype,
+            )
+
+    fake_taehv = ModuleType("taehv")
+    fake_taehv.TAEHV = _TAEHV
+    fake_taehv.StreamingTAEHV = _StreamingTAEHV
+    monkeypatch.setitem(sys.modules, "taehv", fake_taehv)
+    monkeypatch.setattr(
+        realtime_vae,
+        "get_local_torch_device",
+        lambda: torch.device("cpu"),
+    )
+    monkeypatch.setenv(
+        CausalVaeDecodingStage.TAEHV_CHECKPOINT_ENV,
+        "/tmp/taehv-test.pth",
+    )
+
+    class _PipelineConfig:
+        vae_precision = "fp32"
+
+        def post_decoding(self, frames, server_args):
+            del server_args
+            return frames
+
+    stage = CausalVaeDecodingStage.__new__(CausalVaeDecodingStage)
+    state = RealtimeVAEDecodeState()
+    server_args = SimpleNamespace(pipeline_config=_PipelineConfig())
+
+    first = stage.decode_taehv_streaming(
+        torch.arange(6, dtype=torch.float32).reshape(1, 2, 3, 1, 1),
+        server_args,
+        state,
+        first_chunk=True,
+    )
+    second = stage.decode_taehv_streaming(
+        torch.arange(6, 12, dtype=torch.float32).reshape(1, 2, 3, 1, 1),
+        server_args,
+        state,
+        first_chunk=False,
+    )
+
+    assert tuple(first.shape) == (1, 2, 9, 1, 1)
+    assert tuple(second.shape) == (1, 2, 12, 1, 1)
+    assert state.taehv_streaming_decoder.reset_calls == 1
+    assert state.taehv_output_queue == []
