@@ -349,16 +349,11 @@ class KimiGPUProcessorWrapper:
 
     def _prepare_input_ids(self, input_text, resize_configs, original_input_ids):
         if original_input_ids is not None:
-            try:
-                return _expand_image_token_ids(
-                    original_input_ids,
-                    self._image_token_id,
-                    [config["num_tokens"] for config in resize_configs],
-                )
-            except ValueError:
-                # Preserve the existing processor behavior for malformed or
-                # model-specific placeholder layouts.
-                pass
+            return _expand_image_token_ids(
+                original_input_ids,
+                self._image_token_id,
+                [config["num_tokens"] for config in resize_configs],
+            )
 
         parts = input_text.split(self._image_token)
         result = [parts[0]]
@@ -499,11 +494,27 @@ class KimiK2_5VLImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
         *args,
         **kwargs,
     ):
-        base_output = await self.load_mm_data(
-            prompt=input_text,
-            image_data=image_data,
-            multimodal_tokens=self.mm_tokens,
-        )
+        expected_image_count = len(image_data or [])
+        if self.validate_tokenized_image_placeholders(
+            input_text, self.mm_tokens.image_token_id, expected_image_count
+        ):
+            base_output = await self.fast_load_mm_data(
+                prompt=input_text,
+                image_data=image_data,
+                multimodal_tokens=self.mm_tokens,
+            )
+        else:
+            base_output = await self.load_mm_data(
+                prompt=input_text,
+                image_data=image_data,
+                multimodal_tokens=self.mm_tokens,
+            )
+
+        if len(base_output.images) != expected_image_count:
+            raise ValueError(
+                "Kimi image placeholders must map one-to-one to image data: "
+                f"expected {expected_image_count}, loaded {len(base_output.images)}"
+            )
 
         mm_items, input_ids, _ = await self.process_and_combine_mm_data_async(
             base_output,

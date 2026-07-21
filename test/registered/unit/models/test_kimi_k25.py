@@ -99,6 +99,19 @@ def test_kimi_processors_precompute_hash_before_cpu_transfer():
     assert KimiK3ImageProcessor.precompute_hash_before_cpu_transfer
 
 
+def test_kimi_gpu_wrapper_rejects_placeholder_count_mismatch():
+    wrapper = object.__new__(KimiGPUProcessorWrapper)
+    wrapper._image_token = "<|media_pad|>"
+    wrapper._image_token_id = 42
+
+    with pytest.raises(ValueError, match="Expected 2 image placeholder token"):
+        wrapper._prepare_input_ids(
+            "<|media_pad|>",
+            [{"num_tokens": 4}, {"num_tokens": 4}],
+            [1, 42, 2],
+        )
+
+
 def test_kimi_k3_builds_grid_metadata_on_cpu_from_resize_config():
     config = {
         "new_height": 224,
@@ -282,18 +295,110 @@ def test_kimi_rejects_mismatched_pre_tokenized_image_placeholders():
 def test_kimi_k3_rejects_silently_dropped_images():
     processor = object.__new__(KimiK3ImageProcessor)
     processor.mm_tokens = Mock()
-    processor.load_mm_data = AsyncMock(
-        return_value=SimpleNamespace(images=[object()])
-    )
+    processor.load_mm_data = AsyncMock(return_value=SimpleNamespace(images=[object()]))
 
     with pytest.raises(ValueError, match="expected 2, loaded 1"):
         asyncio.run(
             processor.process_mm_data_async(
                 image_data=["image-1", "image-2"],
                 input_text="<|media_pad|><|media_pad|>",
-                request_obj=Mock(),
+                request_obj=SimpleNamespace(video_data=None),
             )
         )
+
+
+def test_kimi_k3_uses_token_ids_to_preserve_media_boundaries():
+    processor = object.__new__(KimiK3ImageProcessor)
+    processor.mm_tokens = SimpleNamespace(image_token_id=99)
+    processor.fast_load_mm_data = AsyncMock(
+        return_value=SimpleNamespace(
+            images=[object(), object()], input_ids=[1, 99, 2, 99, 3]
+        )
+    )
+    processor.load_mm_data = AsyncMock()
+    processor.process_and_combine_mm_data_async = AsyncMock(
+        return_value=([], torch.tensor([[1, 2]]), None)
+    )
+
+    asyncio.run(
+        processor.process_mm_data_async(
+            image_data=["image-1", "image-2"],
+            input_text=[1, 99, 2, 99, 3],
+            request_obj=SimpleNamespace(video_data=None),
+        )
+    )
+
+    processor.fast_load_mm_data.assert_awaited_once()
+    processor.load_mm_data.assert_not_awaited()
+
+
+def test_kimi_k3_rejects_tokenized_placeholder_mismatch():
+    processor = object.__new__(KimiK3ImageProcessor)
+    processor.mm_tokens = SimpleNamespace(image_token_id=99)
+    processor.fast_load_mm_data = AsyncMock()
+    processor.load_mm_data = AsyncMock()
+
+    with pytest.raises(ValueError, match=r"expected 2, found 1 token\(s\)"):
+        asyncio.run(
+            processor.process_mm_data_async(
+                image_data=["image-1", "image-2"],
+                input_text=torch.tensor([[1, 99, 2]]),
+                request_obj=SimpleNamespace(video_data=None),
+            )
+        )
+
+    processor.fast_load_mm_data.assert_not_awaited()
+    processor.load_mm_data.assert_not_awaited()
+
+
+def test_kimi_k25_uses_token_ids_to_preserve_media_boundaries():
+    processor = object.__new__(KimiK2_5VLImageProcessor)
+    processor.mm_tokens = SimpleNamespace(image_token_id=99)
+    processor.fast_load_mm_data = AsyncMock(
+        return_value=SimpleNamespace(
+            images=[object(), object()], input_ids=[1, 99, 2, 99, 3]
+        )
+    )
+    processor.load_mm_data = AsyncMock()
+    processor.process_and_combine_mm_data_async = AsyncMock(
+        return_value=([], torch.tensor([[1, 2]]), None)
+    )
+    processor.use_cuda_ipc = False
+
+    asyncio.run(
+        processor.process_mm_data_async(
+            image_data=["image-1", "image-2"],
+            input_text=[1, 99, 2, 99, 3],
+            request_obj=SimpleNamespace(),
+        )
+    )
+
+    processor.fast_load_mm_data.assert_awaited_once()
+    processor.load_mm_data.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("request_obj", "extra_kwargs"),
+    [
+        (SimpleNamespace(video_data=["video"]), {}),
+        (SimpleNamespace(video_data=None), {"audio_data": ["audio"]}),
+    ],
+)
+def test_kimi_k3_rejects_unsupported_modalities(request_obj, extra_kwargs):
+    processor = object.__new__(KimiK3ImageProcessor)
+    processor.mm_tokens = Mock()
+    processor.load_mm_data = AsyncMock()
+
+    with pytest.raises(ValueError, match="supports image input only"):
+        asyncio.run(
+            processor.process_mm_data_async(
+                image_data=[],
+                input_text="prompt",
+                request_obj=request_obj,
+                **extra_kwargs,
+            )
+        )
+    processor.load_mm_data.assert_not_awaited()
 
 
 def test_dp_helper_supports_moonvit3d_packed_embeddings_on_tp1():

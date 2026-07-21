@@ -207,16 +207,34 @@ class KimiK3ImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
         *args,
         **kwargs,
     ):
-        base_output = await self.load_mm_data(
-            prompt=input_text,
-            image_data=image_data,
-            multimodal_tokens=self.mm_tokens,
-            discard_alpha_channel=False,
-        )
+        if getattr(request_obj, "video_data", None) or kwargs.get("audio_data"):
+            raise ValueError("Kimi-K3 supports image input only")
+
         expected_image_count = len(image_data or [])
+        if self.validate_tokenized_image_placeholders(
+            input_text, self.mm_tokens.image_token_id, expected_image_count
+        ):
+            # Keep structural media tokens distinct from user text that happens to
+            # spell ``<|media_pad|>``. Decoding the whole prompt and matching the
+            # resulting string would lose that distinction and could bind an image
+            # to user-provided text instead of the renderer-inserted token.
+            base_output = await self.fast_load_mm_data(
+                prompt=input_text,
+                image_data=image_data,
+                multimodal_tokens=self.mm_tokens,
+                discard_alpha_channel=False,
+            )
+        else:
+            base_output = await self.load_mm_data(
+                prompt=input_text,
+                image_data=image_data,
+                multimodal_tokens=self.mm_tokens,
+                discard_alpha_channel=False,
+            )
+
         if len(base_output.images) != expected_image_count:
             raise ValueError(
-                "Kimi-K3 image placeholders must map one-to-one to image data: "
+                "Kimi image placeholders must map one-to-one to image data: "
                 f"expected {expected_image_count}, loaded {len(base_output.images)}"
             )
 
