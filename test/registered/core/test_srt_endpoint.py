@@ -38,8 +38,8 @@ SERVER_ENV = {"SGLANG_USE_PICKLE_IPC": "0"}
 
 
 class TestSRTEndpoint(CustomTestCase):
-    # Subclasses override to launch the same suite against a different server
-    # flavor (merged into SERVER_ENV in setUpClass).
+    # Extra server-launch env; subclasses override to run the same suite
+    # against a different server flavor (e.g. SGLANG_RUST_SERVER=1).
     env = {}
 
     @classmethod
