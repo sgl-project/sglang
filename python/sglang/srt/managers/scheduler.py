@@ -2213,10 +2213,7 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
-        # Tokenized requests normally pass SamplingParams.verify() in the
-        # tokenizer manager. Re-validate at the scheduler trust boundary so
-        # malformed requests from internal/RPC paths cannot reach GPU tensor
-        # construction and terminate the scheduler process.
+        # Re-validate requests that bypass the tokenizer manager.
         try:
             req.sampling_params.verify(self.model_config.vocab_size)
         except (TypeError, ValueError, OverflowError) as exc:
