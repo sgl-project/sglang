@@ -1800,7 +1800,10 @@ export const Playground = ({ config }) => {
   // 10. Derived values
   // ==========================================================================
   const s = makeStyles(isDark);
-  const baseCell = findCell(config.cells, base);
+  // PD-disaggregated cells (`roles`) have no single flat flag list to overlay
+  // playground deltas on — treat them as no-base (playground-only view).
+  const cellAtSel = findCell(config.cells, base);
+  const baseCell = cellAtSel && cellAtSel.roles ? null : cellAtSel;
   const modelName = resolveModelName(base);
 
   // Per-axis state recovered from the base cell's flags (deriveFromBase).
