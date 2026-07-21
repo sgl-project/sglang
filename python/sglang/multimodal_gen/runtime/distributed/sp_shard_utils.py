@@ -182,6 +182,9 @@ def should_shard_text(txt_len: int) -> bool:
     return get_sp_world_size() > 1 and plan_text_strategy(txt_len) == "shard"
 
 
+_TAIL_META_CACHE: dict = {}
+
+
 def tail_attn_meta(
     shard: SpShard,
     batch_size: int,
@@ -194,19 +197,33 @@ def tail_attn_meta(
     repacking. Built once per request, reused by every block."""
     if shard.sp_size <= 1 or shard.num_pad == 0:
         return None
+    key = (
+        shard.sp_size,
+        shard.local_len,
+        shard.num_pad,
+        shard.local_pad,
+        batch_size,
+        image_seq_len,
+        str(device),
+    )
+    cached = _TAIL_META_CACHE.get(key)
+    if cached is not None:
+        return cached
     seq = shard.sp_size * (shard.local_len + image_seq_len)
     valid = seq - shard.num_pad
     row = torch.tensor([valid, shard.num_pad], dtype=torch.int32, device=device)
     seglens = row.repeat(batch_size)
     cu_seqlens = torch.zeros(2 * batch_size + 1, dtype=torch.int32, device=device)
     cu_seqlens[1:] = torch.cumsum(seglens, dim=0)
-    return {
+    meta = {
         "pad_start": valid,
         "pad_end": seq,
         "local_pad": shard.local_pad,
         "cu_seqlens_tail": cu_seqlens,
         "max_seqlen_tail": max(valid, shard.num_pad),
     }
+    _TAIL_META_CACHE[key] = meta
+    return meta
 
 
 def plan_text_strategy(txt_len: int) -> str:
