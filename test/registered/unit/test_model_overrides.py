@@ -341,6 +341,30 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         self.assertTrue(flags.enable_tf32_matmul)
         self.assertFalse(flags.enable_multi_layer_eagle)  # pristine materialize
 
+    def test_minimax_m3_sm90_mxfp8_defaults_to_deep_gemm(self):
+        from sglang.srt.arg_groups.overrides import _minimax_m3_overrides
+
+        server_args = SimpleNamespace(
+            quantization="mxfp8",
+            _quantization_explicitly_unset=False,
+            attention_backend=None,
+            page_size=None,
+            moe_runner_backend="auto",
+            is_attention_backend_not_set=lambda: True,
+        )
+        hf_config = SimpleNamespace(quantization_config={"quant_method": "mxfp8"})
+
+        with (
+            patch.object(overrides_module, "is_hip", return_value=False),
+            patch.object(overrides_module, "is_sm100_supported", return_value=False),
+            patch.object(overrides_module, "is_sm90_supported", return_value=True),
+        ):
+            declarations = _minimax_m3_overrides(server_args, hf_config)
+
+        self.assertEqual(declarations["attention_backend"], "fa3")
+        self.assertEqual(declarations["page_size"], 128)
+        self.assertEqual(declarations["moe_runner_backend"], "deep_gemm")
+
     def test_mimo_v2_declarations(self):
         # Callable-level golden: MiMoV2 archs are hybrid (config-shape heavy),
         # so the declaration is pinned directly for both provider inputs.

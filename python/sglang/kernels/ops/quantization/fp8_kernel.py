@@ -40,6 +40,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_hip,
     is_musa,
+    is_sm90_supported,
     is_sm100_supported,
     is_sm120_supported,
     log_info_on_rank0,
@@ -51,6 +52,7 @@ _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_cpu = is_cpu()
 _is_musa = is_musa()
+_is_sm90_supported = is_sm90_supported()
 _is_sm100_supported = is_sm100_supported()
 _is_sm120_supported = is_sm120_supported()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
@@ -117,6 +119,31 @@ if _is_musa:
 
 
 logger = logging.getLogger(__name__)
+
+
+def _format_ue8m0_scale_for_deepgemm(
+    sf: torch.Tensor,
+    *,
+    num_groups: Optional[int],
+    mn: int,
+    k: int,
+    group_size: int,
+) -> torch.Tensor:
+    if _is_sm90_supported and not _is_sm100_supported:
+        import deep_gemm.utils.layout
+
+        return deep_gemm.utils.layout.get_mn_major_tma_aligned_packed_ue8m0_tensor(sf)
+
+    from deep_gemm import transform_sf_into_required_layout
+
+    return transform_sf_into_required_layout(
+        sf,
+        num_groups=num_groups,
+        mn=mn,
+        k=k,
+        recipe=(1, group_size, group_size),
+        is_sfa=True,
+    )
 
 
 @lru_cache()
@@ -344,15 +371,12 @@ def _per_token_group_quant_8bit_raw(
         )
 
     if scale_ue8m0:
-        from deep_gemm import transform_sf_into_required_layout
-
-        x_s = transform_sf_into_required_layout(
+        x_s = _format_ue8m0_scale_for_deepgemm(
             x_s,
             num_groups=None,
             mn=x_q.shape[0],
             k=x_q.shape[1],
-            recipe=(1, group_size, group_size),
-            is_sfa=True,
+            group_size=group_size,
         )
 
     return x_q, x_s
@@ -378,8 +402,6 @@ def _per_token_group_quant_8bit_fuse_silu_and_mul(
     #     scale_tma_aligned=scale_tma_aligned,
     #     scale_ue8m0=scale_ue8m0,
     # )
-
-    from deep_gemm import transform_sf_into_required_layout
 
     from sglang.kernels.ops.moe.ep_moe_kernels import silu_and_mul_masked_post_quant_fwd
 
@@ -415,13 +437,12 @@ def _per_token_group_quant_8bit_fuse_silu_and_mul(
         scale_ue8m0=scale_ue8m0,
     )
 
-    output_scale = transform_sf_into_required_layout(
+    output_scale = _format_ue8m0_scale_for_deepgemm(
         output_scale_for_kernel,
         num_groups=output.shape[0],
         mn=output.shape[-2],
         k=output.shape[-1],
-        recipe=(1, group_size, group_size),
-        is_sfa=True,
+        group_size=group_size,
     )
 
     if needs_unsqueeze:
