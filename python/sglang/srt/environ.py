@@ -381,6 +381,18 @@ class Envs:
     # same-node A/B proves it (round-3 overlap lesson).
     SGLANG_DCP_EXTEND_PREFETCH = EnvBool(False)
 
+    # DCP x spec draft chain: run the draft-side compute sites that live
+    # OUTSIDE ModelRunner.forward (multi-step chain metadata init, chain
+    # forwards, draft decode/extend graph replay) under draft_forward_guard,
+    # matching the guard ModelRunner.forward applies to draft forwards.
+    # Without it the TRTLLMMLA-family multi-step draft backend takes its
+    # decode-mode DCP branches (dcp-granular page size, rank-local lens)
+    # against the draft's UNSHARDED replicated pool: the chain consumes
+    # poisoned metadata and every chain token after the first degenerates
+    # (EAGLE3 accept-length drops under DCP; the 2nd chain token becomes a
+    # copy of the 1st and is always rejected). Set to 0 to revert for A/B.
+    SGLANG_DCP_DRAFT_CHAIN_GUARD = EnvBool(True)
+
     # Scheduler: memory leak test
     SGLANG_TEST_RETRACT = EnvBool(False)
     SGLANG_TEST_RETRACT_INTERVAL = EnvInt(3)

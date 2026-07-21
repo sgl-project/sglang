@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
@@ -194,7 +195,20 @@ def prepare_for_draft_extend(
         forward_batch
     )
     if not batch.forward_mode.is_idle() and not can_cuda_graph:
-        draft_model_runner.attn_backend.init_forward_metadata(forward_batch)
+        from sglang.srt.environ import envs
+        from sglang.srt.layers.dcp import draft_forward_guard
+
+        # Draft-side metadata must be built under the same DCP-disabled state
+        # as the guarded forward that consumes it. DRAFT_EXTEND_V2 metadata
+        # has no DCP branch today; this pins the contract so a future
+        # extend-mode DCP branch cannot recreate the chain-decode bug here.
+        extend_metadata_guard = (
+            draft_forward_guard(True)
+            if envs.SGLANG_DCP_DRAFT_CHAIN_GUARD.get()
+            else contextlib.nullcontext()
+        )
+        with extend_metadata_guard:
+            draft_model_runner.attn_backend.init_forward_metadata(forward_batch)
         # Planned pre-pad; do NOT opt into post-pad re-plan. DSA's indexer
         # cannot rebuild its deep_gemm schedule_meta on a DP-padded batch
         # (the `_batch_size == batch_size` assertion, see #27091); the

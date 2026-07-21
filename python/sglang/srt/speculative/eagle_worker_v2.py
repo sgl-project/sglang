@@ -540,7 +540,23 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             else contextlib.nullcontext()
         )
 
-        with canary_outside_ctx:
+        from sglang.srt.layers.dcp import draft_forward_guard
+
+        # The chain path runs OUTSIDE ModelRunner.forward, so it never saw the
+        # runner's draft_forward_guard: with DCP on, the multi-step backend's
+        # decode-mode DCP branches (metadata init here in eager; replay-prep
+        # inside execute() for graphs) built dcp-granular metadata against the
+        # draft's UNSHARDED replicated pool, and the guarded forward then
+        # consumed it — every chain token after the first degenerated (the
+        # EAGLE3 accept-length deficit under DCP). Guard the whole draft run;
+        # runner.forward nests the same override, which is save/restore and
+        # therefore a no-op inside this scope.
+        draft_guard_ctx = (
+            draft_forward_guard(True)
+            if envs.SGLANG_DCP_DRAFT_CHAIN_GUARD.get()
+            else contextlib.nullcontext()
+        )
+        with canary_outside_ctx, draft_guard_ctx:
             # Run draft
             if can_cuda_graph:
                 parent_list, top_scores_index, draft_tokens, draft_probs = (
@@ -962,7 +978,18 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             if (c := self.draft_runner.canary_manager) is not None
             else contextlib.nullcontext()
         )
-        with canary_ctx:
+        from sglang.srt.layers.dcp import draft_forward_guard
+
+        # Same out-of-runner contract as draft(): the extend-graph replay-prep
+        # must run under the DCP-disabled state it was captured under (the
+        # capture site is guarded). The eager branch's runner.forward nests
+        # the same override harmlessly.
+        extend_guard_ctx = (
+            draft_forward_guard(True)
+            if envs.SGLANG_DCP_DRAFT_CHAIN_GUARD.get()
+            else contextlib.nullcontext()
+        )
+        with canary_ctx, extend_guard_ctx:
             if can_cuda_graph:
                 draft_logits_output = self.cuda_graph_runner_for_draft_extend.execute(
                     forward_batch
