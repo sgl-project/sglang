@@ -293,10 +293,11 @@ std::tuple<at::Tensor, at::Tensor> rotary_embedding_cpu(
   TORCH_CHECK(p.rotary_dim % 2 == 0, "rotary_dim must be even");
   TORCH_CHECK(positions.numel() == p.rows(), "positions.numel() must equal batch * seqlen");
 
-  if (input_dim == 2) {
-    TORCH_CHECK(query.size(-1) % head_size == 0, "query last dim must be divisible by head_size");
-    TORCH_CHECK(key.size(-1) % head_size == 0, "key last dim must be divisible by head_size");
+  if (input_dim <= 3) {
+    CHECK_EQ(key.size(0), query.size(0));
   }
+
+  if (input_dim == 2) {
   if (input_dim == 3) {
     // out-of-place path: align with legacy behavior, no partial rotary
     CHECK_EQ(query.size(-1), rotary_dim);
