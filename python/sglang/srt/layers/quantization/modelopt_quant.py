@@ -499,7 +499,9 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
         super().__init__()
         self.quant_config = quant_config
         self.cutlass_fp8_supported = cutlass_fp8_supported()
-        self.enable_flashinfer_bmm = is_sm100_supported() and is_flashinfer_available()
+        self.enable_flashinfer_bmm = (
+            is_sm100_supported() or is_sm120_supported()
+        ) and is_flashinfer_available()
 
     def create_weights(
         self,
