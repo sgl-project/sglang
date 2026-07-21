@@ -1525,6 +1525,17 @@ class ModelRunner:
         Returns:
             A list of next_token_ids
         """
+        if forward_batch.is_beam_search:
+            logits = torch.nan_to_num(logits_output.next_token_logits)
+            logits_output.logprobs = torch.nn.functional.log_softmax(
+                logits, dim=-1
+            )
+            return torch.zeros(
+                logits.shape[0],
+                dtype=torch.int32,
+                device=logits.device,
+            )
+
         self._preprocess_logits(logits_output, forward_batch.sampling_info)
 
         # Sample the next tokens

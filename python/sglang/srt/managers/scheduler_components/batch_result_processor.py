@@ -33,6 +33,7 @@ from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 
 if TYPE_CHECKING:
+    from sglang.srt.beam_search.coordinator import BeamCoordinator
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
         DecodeKVCacheOffloadManager,
@@ -80,6 +81,7 @@ class SchedulerBatchResultProcessor:
     model_worker: BaseTpWorker
     logprob_result_processor: SchedulerLogprobResultProcessor
     output_streamer: SchedulerOutputStreamer
+    beam_coordinator: BeamCoordinator
     abort_request: Callable
 
     def process_batch_result_prebuilt(self, batch: ScheduleBatch):
@@ -230,12 +232,18 @@ class SchedulerBatchResultProcessor:
                 if req.inflight_middle_chunks <= 0:
                     req.time_stats.set_prefill_finished_time()
 
-                    # req output_ids are set here
-                    req.output_ids.append(next_token_id)
+                    if req.beam_group is not None:
+                        # Beam leader: joint selection over the top-2k channel
+                        # replaces the sampled-token append; the group owns all
+                        # finish semantics (the leader never self-finishes).
+                        self.beam_coordinator.on_leader_prefill(req, i, logits_output)
+                    else:
+                        # req output_ids are set here
+                        req.output_ids.append(next_token_id)
 
-                    self._maybe_update_reasoning_tokens(req, next_token_id)
+                        self._maybe_update_reasoning_tokens(req, next_token_id)
 
-                    req.update_finish_state()
+                        req.update_finish_state()
                     if req.finished():
                         self._maybe_collect_routed_experts(req)
                         self._maybe_collect_indexer_topk(req)
@@ -741,14 +749,21 @@ class SchedulerBatchResultProcessor:
             result.can_run_cuda_graph,
         )
 
-        next_token_ids, next_token_logprobs = self._normalize_decode_outputs(
-            batch=batch,
-            result=result,
-            logits_output=logits_output,
-            next_token_ids=next_token_ids,
-        )
+        is_beam_batch = batch.is_vectorized_beam_batch()
+        if is_beam_batch:
+            next_token_ids = []
+            next_token_logprobs = None
+        else:
+            next_token_ids, next_token_logprobs = self._normalize_decode_outputs(
+                batch=batch,
+                result=result,
+                logits_output=logits_output,
+                next_token_ids=next_token_ids,
+            )
 
-        self.metrics_reporter.num_generated_tokens += len(batch.reqs)
+        self.metrics_reporter.num_generated_tokens += (
+            len(batch.req_pool_indices) if is_beam_batch else len(batch.reqs)
+        )
         if not batch.spec_algorithm.is_none():
             self.metrics_reporter.update_spec_metrics(
                 batch.batch_size(),
@@ -763,6 +778,12 @@ class SchedulerBatchResultProcessor:
 
         self.token_to_kv_pool_allocator.free_group_begin()
 
+        # Beam groups joint-select before the per-req loop: it rewrites member
+        # histories / next tokens and sets group-atomic finish states that the
+        # loop below then observes. (Beam + spec is rejected at admission.)
+        if batch.spec_algorithm.is_none() and logits_output is not None:
+            self.beam_coordinator.process_decode(batch, logits_output)
+
         for i, req in enumerate(batch.reqs):
             req: Req
 
@@ -771,6 +792,15 @@ class SchedulerBatchResultProcessor:
             ):
                 # NOTE: This (req.finished() or req.is_retracted) should only happen when overlap scheduling is enabled.
                 # And all the over-allocated tokens will be freed in `release_kv_cache`.
+                continue
+
+            if req.beam_group is not None:
+                # Beam row: the pre-pass owns tokens and finish state; only the
+                # shared finish machinery (KV release, completion time) runs here.
+                req.time_stats.set_last_decode_finish_time()
+                self._handle_finish_state_updated_req(
+                    req, batch, result, i, logits_output
+                )
                 continue
 
             # next_token_id is a per-req list: 1 token for non-spec, the verified
@@ -859,10 +889,12 @@ class SchedulerBatchResultProcessor:
             next_token_logprobs = logits_output.next_token_logprobs.tolist()
             if logits_output.next_token_top_logprobs_val:
                 logits_output.next_token_top_logprobs_val = [
-                    v.tolist() for v in logits_output.next_token_top_logprobs_val
+                    value.tolist()
+                    for value in logits_output.next_token_top_logprobs_val
                 ]
                 logits_output.next_token_top_logprobs_idx = [
-                    x.tolist() for x in logits_output.next_token_top_logprobs_idx
+                    index.tolist()
+                    for index in logits_output.next_token_top_logprobs_idx
                 ]
 
             if logits_output.next_token_token_ids_logprobs_val:

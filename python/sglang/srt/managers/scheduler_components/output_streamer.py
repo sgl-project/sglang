@@ -12,6 +12,7 @@ from typing import (
 import torch
 import zmq
 
+from sglang.srt.beam_search.output import pack_beam_search_output
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
@@ -292,6 +293,7 @@ class _GenerationStreamAccumulator:
     routed_experts: Optional[list] = None
     indexer_topk: Optional[list] = None
     customized_info: dict = field(default_factory=dict)
+    beam_search_output: list = field(default_factory=list)
     time_stats: list = field(default_factory=list)
     input_token_logprobs_val: Optional[list] = None
     input_token_logprobs_idx: Optional[list] = None
@@ -333,7 +335,14 @@ class _GenerationStreamAccumulator:
             self.output_token_sampling_mask = []
             self.output_token_sampling_logprobs = []
 
+    def _beam_admits(self, *, req: Req) -> bool:
+        """Single beam emission gate: only the leader is ever streamed, and
+        exactly once, at group finish."""
+        return req.is_beam_leader and req.finished()
+
     def accept(self, *, req: Req) -> None:
+        if req.beam_group is not None and not self._beam_admits(req=req):
+            return
         if req.finished():
             assert not req.finished_output
             req.finished_output = True
@@ -341,6 +350,8 @@ class _GenerationStreamAccumulator:
                 req.finished_len = len(req.output_ids)
             should_output = True
         else:
+            # (Beam rows never reach here: the gate above admits only
+            # finished leaders.)
             if req.stream:
                 stream_interval = (
                     req.sampling_params.stream_interval or self.default_stream_interval
@@ -391,6 +402,16 @@ class _GenerationStreamAccumulator:
         self.prompt_tokens.append(len(req.origin_input_ids))
         self.reasoning_tokens.append(req.reasoning_tokens)
         self.completion_tokens.append(len(output_ids_))
+        # Index-aligned with the batch items so mixed batches resolve per-item
+        # on the tokenizer side; None for non-beam items and aborted groups.
+        beam_output = (
+            pack_beam_search_output(req) if req.beam_group is not None else None
+        )
+        if beam_output is not None:
+            self.completion_tokens[-1] = sum(
+                len(seq.tokens) for seq in beam_output.sequences
+            )
+        self.beam_search_output.append(beam_output)
         self.cached_tokens.append(req.cached_tokens)
 
         # Collect detailed cache breakdown if available
@@ -608,5 +629,12 @@ class _GenerationStreamAccumulator:
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
             retraction_counts=self.retraction_counts,
+            # All-None means no beam item in this batch; drop the list so
+            # non-beam traffic pays no carrier cost.
+            beam_search_output=(
+                self.beam_search_output
+                if any(x is not None for x in self.beam_search_output)
+                else None
+            ),
             dp_ranks=dp_ranks,
         )

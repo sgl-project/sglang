@@ -1074,6 +1074,9 @@ class Req(ReqDllmMixin):
         # For Matryoshka embeddings
         self.dimensions = dimensions
 
+        # Beam search overlay: one logical Req owns vectorized rows via BeamGroup.
+        self.beam_group = None
+
         # Whether to return pooled hidden states (pre-head transformer output)
         self.return_pooled_hidden_states = return_pooled_hidden_states
         self.pooled_hidden_state = None
@@ -1090,10 +1093,15 @@ class Req(ReqDllmMixin):
         return len(self.origin_input_ids) + len(self.output_ids)
 
     @property
+    def is_beam_leader(self) -> bool:
+        """The user-visible row of a beam group; the group's other rows are
+        scheduler-internal and never streamed to the user."""
+        return self.beam_group is not None and self.beam_group.leader is self
+
+    @property
     def is_prefill_only(self) -> bool:
         """Check if this request is prefill-only (no token generation needed)."""
         # NOTE: when spec is enabled, prefill_only optimizations are disabled
-
         spec_alg = get_server_args().speculative_algorithm
         return self.sampling_params.max_new_tokens == 0 and spec_alg is None
 
@@ -2035,6 +2043,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def batch_size(self):
         return len(self.reqs)
 
+    def is_vectorized_beam_batch(self):
+        return bool(self.reqs) and all(
+            req.beam_group is not None
+            and req.beam_group.beam_req_pool_indices is not None
+            for req in self.reqs
+        )
+
     def is_empty(self):
         return len(self.reqs) == 0
 
@@ -2630,7 +2645,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             ),
         )
 
+        # Prefer retracting normal requests first. A beam request owns one
+        # logical Req plus a vectorized row bundle that must be released whole.
+        if any(self.reqs[i].beam_group is not None for i in sorted_indices):
+            sorted_indices = [
+                i for i in sorted_indices if self.reqs[i].beam_group is not None
+            ] + [i for i in sorted_indices if self.reqs[i].beam_group is None]
+
         retracted_reqs = []
+        reqs_to_abort: List[Req] = []
         first_iter = True
         while first_iter or (
             not self.check_decode_mem(selected_indices=sorted_indices)
@@ -2642,11 +2665,30 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             first_iter = False
             idx = sorted_indices.pop()
             req = self.reqs[idx]
+            if req.beam_group is not None:
+                # Abort the logical request and its vectorized row bundle.
+                group = req.beam_group
+                group_indices = [idx] + [
+                    i for i in sorted_indices if self.reqs[i].beam_group is group
+                ]
+                sorted_indices = [
+                    i for i in sorted_indices if self.reqs[i].beam_group is not group
+                ]
+                abort_reason = FINISH_ABORT(
+                    "Beam search group aborted: KV cache pool is full.",
+                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
+                for i in group_indices:
+                    group_req = self.reqs[i]
+                    group_req.to_finish = abort_reason
+                    if group_req.is_beam_leader:
+                        reqs_to_abort.append(group_req)
+                    self.release_req(i, len(sorted_indices), server_args)
+                continue
             retracted_reqs.append(req)
             # release memory and don't insert into the tree because we need the space instantly
             self.release_req(idx, len(sorted_indices), server_args)
 
-        reqs_to_abort: List[Req] = []
         if len(sorted_indices) <= 1 and not self.check_decode_mem(
             selected_indices=sorted_indices
         ):
@@ -2721,8 +2763,22 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         return sorted_indices
 
     def release_req(self, idx: int, remaing_req_count: int, server_args: ServerArgs):
+        req = self.reqs[idx]
+        if (
+            req.beam_group is not None
+            and req.beam_group.beam_req_pool_indices is not None
+        ):
+            from sglang.srt.beam_search.coordinator import (
+                release_vectorized_beam_resources,
+            )
+
+            release_vectorized_beam_resources(
+                req.beam_group,
+                self.req_to_token_pool,
+                self.token_to_kv_pool_allocator,
+            )
         release_req(
-            req=self.reqs[idx],
+            req=req,
             remaing_req_count=remaing_req_count,
             server_args=server_args,
             req_to_token_pool=self.req_to_token_pool,
@@ -2855,6 +2911,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if hasattr(self, "attn_cp_metadata") and self.attn_cp_metadata is not None:
             self.attn_cp_metadata = None
 
+        if self.is_vectorized_beam_batch():
+            from sglang.srt.beam_search.coordinator import (
+                prepare_vectorized_beam_decode,
+            )
+
+            prepare_vectorized_beam_decode(self)
+            return
+
         if not self.spec_algorithm.is_none():
             # Spec decoding owns decode preparation (allocation, seq-lens bookkeeping).
             from sglang.srt.speculative.spec_utils import spec_prepare_for_decode
@@ -2921,6 +2985,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         chunked_req_to_exclude: Optional[Union[Req, List[Req]]] = None,
         keep_indices: Optional[List[int]] = None,
     ):
+        if self.is_vectorized_beam_batch():
+            self._filter_vectorized_beam_batch(
+                chunked_req_to_exclude=chunked_req_to_exclude,
+                keep_indices=keep_indices,
+            )
+            return
+
         if keep_indices is None:
             if isinstance(chunked_req_to_exclude, Req):
                 chunked_req_to_exclude = [chunked_req_to_exclude]
@@ -2994,6 +3065,67 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 has_been_filtered=False,
                 new_indices_cpu=keep_indices,
             )
+
+    def _filter_vectorized_beam_batch(
+        self,
+        chunked_req_to_exclude: Optional[Union[Req, List[Req]]] = None,
+        keep_indices: Optional[List[int]] = None,
+    ):
+        if keep_indices is None:
+            if isinstance(chunked_req_to_exclude, Req):
+                chunked_req_to_exclude = [chunked_req_to_exclude]
+            elif chunked_req_to_exclude is None:
+                chunked_req_to_exclude = []
+            keep_indices = [
+                i
+                for i, req in enumerate(self.reqs)
+                if not req.finished() and req not in chunked_req_to_exclude
+            ]
+
+        if not keep_indices:
+            self.reqs = []
+            return
+        if len(keep_indices) == len(self.reqs):
+            return
+
+        keep_set = set(keep_indices)
+        row_indices = []
+        offset = 0
+        for i, req in enumerate(self.reqs):
+            width = req.beam_group.beam_width
+            if i in keep_set:
+                row_indices.extend(range(offset, offset + width))
+            offset += width
+
+        row_indices_device = torch.tensor(
+            row_indices, dtype=torch.int64, device=self.device
+        )
+        logical_indices_device = torch.tensor(
+            keep_indices, dtype=torch.int64, device=self.device
+        )
+
+        self.reqs = [self.reqs[i] for i in keep_indices]
+        self.req_pool_indices = self.req_pool_indices[row_indices_device]
+        self.req_pool_indices_cpu = self.req_pool_indices_cpu[row_indices]
+        self.seq_lens = self.seq_lens[row_indices_device]
+        self.seq_lens_cpu = self.seq_lens_cpu[row_indices]
+        self.orig_seq_lens = self.orig_seq_lens[row_indices_device]
+        self.input_ids = None
+        self.out_cache_loc = None
+        self.seq_lens_sum = None
+        if self.multimodal_inputs is not None:
+            self.multimodal_inputs = [
+                self.multimodal_inputs[i] for i in keep_indices
+            ]
+        self.top_logprobs_nums = [
+            self.top_logprobs_nums[i] for i in keep_indices
+        ]
+        self.token_ids_logprobs = [
+            self.token_ids_logprobs[i] for i in keep_indices
+        ]
+        self.sampling_info.filter_batch(
+            keep_indices, logical_indices_device
+        )
 
     def merge_batch(self, other: ScheduleBatch):
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because

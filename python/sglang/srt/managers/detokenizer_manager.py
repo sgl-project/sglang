@@ -26,6 +26,10 @@ import setproctitle
 import torch
 import zmq
 
+from sglang.srt.beam_search.output import (
+    decode_beam_search_output,
+    is_beam_search_batch,
+)
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
@@ -428,6 +432,15 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         ]
 
     def handle_batch_token_id_out(self, recv_obj: BatchTokenIDOutput):
+        # Beam decoding is additive: a batch may mix beam leaders with normal
+        # requests, so every item still goes through the standard decode.
+        if is_beam_search_batch(recv_obj):
+            decode_beam_search_output(
+                recv_obj,
+                tokenizer=self.tokenizer,
+                disable_batch_decode=self.disable_tokenizer_batch_decode,
+                trim_matched_stop=self.trim_matched_stop,
+            )
         # If handling idle batch, set output_strs to [].
         output_strs = (
             self._decode_batch_token_id_output(recv_obj)
@@ -479,6 +492,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             placeholder_tokens_val=None,
             retraction_counts=recv_obj.retraction_counts,
             token_steps=recv_obj.token_steps,
+            beam_search_output=recv_obj.beam_search_output,
             dp_ranks=recv_obj.dp_ranks,
             time_stats=recv_obj.time_stats,
         )
