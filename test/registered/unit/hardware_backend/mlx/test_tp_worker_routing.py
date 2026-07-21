@@ -36,6 +36,7 @@ import torch
 
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci, register_mlx_ci
+from sglang.test.test_utils import CustomTestCase
 
 # CPU marker is AST-parsed "this test exists"; actual CPU-side execution is
 # gated by the @skipUnless guard below. MLX marker runs for real on the MLX
@@ -160,7 +161,7 @@ class _FakeBatch:
 
 
 @unittest.skipUnless(_IS_APPLE_SILICON and _HAS_MLX, _SKIP_REASON)
-class TestMlxExtendRouting(unittest.TestCase):
+class TestMlxExtendRouting(CustomTestCase):
     """Routing contract for MlxTpModelWorker: shared helper + sync + async."""
 
     @staticmethod
@@ -171,6 +172,20 @@ class TestMlxExtendRouting(unittest.TestCase):
         worker._mlx_runner = _FakeRunner(known_rids)
         worker._mlx_active_rids = set()
         return worker
+
+    def test_startup_weight_overlap_is_rejected_before_mlx_model_load(self):
+        from sglang.srt.hardware_backend.mlx.model_runner_stub import (
+            MlxModelRunnerStub,
+        )
+        from sglang.srt.hardware_backend.mlx.tp_worker import MlxTpModelWorker
+
+        worker = MlxTpModelWorker.__new__(MlxTpModelWorker)
+        worker.server_args = SimpleNamespace(startup_weight_load_mode="overlap")
+
+        with self.assertRaisesRegex(ValueError, "CUDA only"):
+            MlxModelRunnerStub.validate_startup_weight_load_mode(worker.server_args)
+        with self.assertRaisesRegex(ValueError, "CUDA only"):
+            worker._init_model_runner()
 
     # ---------- the shared decision helper ----------
     # The helper takes no seq_len: length cannot distinguish a 1-token
