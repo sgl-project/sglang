@@ -78,8 +78,6 @@ def fp8_matmul_npu(
     bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Run a [128, 128] block-FP8 linear layer on Ascend NPU."""
-    del input_scale, bias
-
     if block_size != [128, 128]:
         raise ValueError("fp8_matmul_npu only supports block_size == [128, 128]")
 
@@ -91,12 +89,18 @@ def fp8_matmul_npu(
             input_2d, weight, weight_scale, "bf16"
         )
     else:
-        input_fp8, input_scale = torch.ops.npu.npu_dynamic_block_quant(
-            input_2d,
-            dst_type=torch.float8_e4m3fn,
-            row_block_size=1,
-            col_block_size=128,
-        )
+        if input_scale is None:
+            input_fp8, input_scale = torch.ops.npu.npu_dynamic_block_quant(
+                input_2d,
+                dst_type=torch.float8_e4m3fn,
+                row_block_size=1,
+                col_block_size=128,
+            )
+        else:
+            input_fp8 = input_2d
+            input_scale = input_scale.reshape(
+                input_2d.shape[0], input_2d.shape[1] // 128
+            )
         output_2d = torch.ops.npu.npu_quant_matmul(
             input_fp8,
             weight,

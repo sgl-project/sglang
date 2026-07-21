@@ -170,16 +170,8 @@ class NPUW8A8BlockFP8MoEMethod(_NPUMoEMethodBase):
             processed_weight = weight.data.transpose(1, 2)
             processed_scale = scale.data.transpose(1, 2)
 
-        setattr(
-            layer,
-            f"{weight_prefix}_weight",
-            torch.nn.Parameter(processed_weight, requires_grad=False),
-        )
-        setattr(
-            layer,
-            f"{weight_prefix}_weight_scale_inv",
-            torch.nn.Parameter(processed_scale, requires_grad=False),
-        )
+        weight.data = processed_weight
+        scale.data = processed_scale
 
         if weight_prefix == "w13":
             self._set_dispatcher_output_dtype(layer, "bf16")
@@ -221,6 +213,10 @@ class NPUW8A8BlockFP8MoEMethod(_NPUMoEMethodBase):
                 dst_type=torch.float8_e4m3fn,
                 row_block_size=1,
                 col_block_size=128,
+            )
+        elif pertoken_scale is not None:
+            pertoken_scale = pertoken_scale.reshape(
+                hidden_states.shape[0], hidden_states.shape[1] // 128
             )
 
         return self.matmul.forward(
