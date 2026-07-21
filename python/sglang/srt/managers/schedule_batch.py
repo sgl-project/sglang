@@ -85,7 +85,6 @@ from sglang.srt.mem_cache.allocation_sizing import get_alloc_reserve_per_decode
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
-    EvictParams,
     MatchPrefixParams,
     zero_match_result,
 )
@@ -1489,11 +1488,6 @@ class Req(ReqDllmMixin):
             self.finished_len = self.sampling_params.max_new_tokens
             return
 
-        if self.grammar is not None:
-            if self.grammar.is_terminated():
-                self.finished_reason = FINISH_MATCHED_TOKEN(matched=self.output_ids[-1])
-                return
-
         new_accepted_tokens = self.output_ids[-new_accepted_len:]
 
         # Sanitize out-of-range / NaN token ids before any decode.
@@ -1507,6 +1501,10 @@ class Req(ReqDllmMixin):
             return
 
         if self._check_token_based_finish(new_accepted_tokens):
+            return
+
+        if self.grammar is not None and self.grammar.is_terminated():
+            self.finished_reason = FINISH_MATCHED_TOKEN(matched=self.output_ids[-1])
             return
 
     def reset_for_retract(self):
@@ -1685,21 +1683,42 @@ class _MambaRadixCacheV2TrackEntry(NamedTuple):
     track_seqlen: int
 
 
-def set_mamba_track_indices_from_reqs(batch):
-    """Build mamba_track_indices from req objects (authoritative source)."""
+def mamba_lazy_spec_in_window(
+    req, mamba_track_interval: int, max_draft_tokens: int
+) -> bool:
+    """Whether a track-interval crossing is reachable by an in-flight verify.
+
+    kv_committed_len lags device seq_lens by up to one verify under overlap;
+    the 2x window absorbs it.
+    """
+    seq_len = req.kv_committed_len
+    window = 2 * max_draft_tokens
+    return seq_len // mamba_track_interval != (seq_len + window) // mamba_track_interval
+
+
+def set_mamba_track_indices_from_reqs(
+    batch, track_positions: Optional[List[int]] = None
+):
+    """Build mamba_track_indices from req objects (authoritative source).
+
+    track_positions: optional per-req ping-pong position override (the lazy
+    spec track plan, see mamba_lazy_spec_prepare).
+    """
     req_to_token_pool = batch.req_to_token_pool
     all_buffers = req_to_token_pool.req_index_to_mamba_ping_pong_track_buffer_mapping[
         batch.req_pool_indices
     ]  # (bs, ping_pong_size), int64, on device
-    # Guard: mamba_next_track_idx may be None for requests that haven't
-    # gone through _alloc_ping_pong_buffer yet (e.g., spec v2 verify path).
-    # Default to 0 (first ping-pong slot) to avoid TypeError.
+    if track_positions is None:
+        # Guard: mamba_next_track_idx may be None for requests that haven't
+        # gone through _alloc_ping_pong_buffer yet (e.g., spec v2 verify path).
+        # Default to 0 (first ping-pong slot) to avoid TypeError.
+        track_positions = [
+            req.mamba_next_track_idx if req.mamba_next_track_idx is not None else 0
+            for req in batch.reqs
+        ]
     idx = (
         torch.tensor(
-            [
-                req.mamba_next_track_idx if req.mamba_next_track_idx is not None else 0
-                for req in batch.reqs
-            ],
+            track_positions,
             dtype=torch.int64,
             pin_memory=True,
         )
@@ -1893,6 +1912,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     mamba_track_indices: torch.Tensor = None  # shape: [b], int64
     mamba_track_mask: torch.Tensor = None  # shape: [b], bool
     mamba_track_seqlens: torch.Tensor = None  # shape: [b], int64
+    # Lazy + spec: this iteration's per-req scatter positions
+    # (see mamba_lazy_spec_prepare).
+    mamba_lazy_spec_track_positions_cpu: Optional[List[int]] = None  # shape: [b]
     # Deferred mamba init ops: COW pairs and clear indices (performed on forward stream)
     mamba_cow_src_indices: torch.Tensor = None
     mamba_cow_dst_indices: torch.Tensor = None
@@ -2753,13 +2775,53 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if envs.SGLANG_TEST_MAMBA_LAZY_ALLOC_FAIL.get():
                 new_slot = None
             else:
+                # No evict-retry: a transient slot is not worth evicting a
+                # cached checkpoint for; on failure tracking degrades in place.
                 new_slot = pool.mamba_allocator.alloc(1)
-                if new_slot is None:
-                    self.tree_cache.evict(EvictParams(num_tokens=0, mamba_num=1))
-                    new_slot = pool.mamba_allocator.alloc(1)
             if new_slot is not None:
                 pool.set_mamba_ping_pong_slot(req, other_idx, new_slot[0])
                 req.mamba_next_track_idx = other_idx
+
+    def mamba_lazy_spec_prepare(self, mamba_track_interval: int, max_draft_tokens: int):
+        """Lazy-mode spec counterpart of mamba_lazy_prealloc_at_boundary.
+
+        A crossing is only *possible* at prepare time (accept length is
+        unknown), so ensure the pending slot exists for reqs whose next
+        boundary is reachable, WITHOUT swapping mamba_next_track_idx; the
+        mask-gated commit writes it only on a real crossing, and
+        _mamba_lazy_spec_confirm_crossing promotes it afterwards. The per-req
+        scatter position is recorded on the batch and rides the result-queue
+        copy (forward isolation restores batch fields).
+        """
+        pool = self.req_to_token_pool
+        track_positions: List[int] = []
+        for req in self.reqs:
+            buf = req.mamba_ping_pong_track_buffer
+            assert buf is not None
+            if not mamba_lazy_spec_in_window(
+                req, mamba_track_interval, max_draft_tokens
+            ):
+                # No crossing reachable: the scatter mask stays -1, the
+                # position is never written.
+                track_positions.append(req.mamba_next_track_idx)
+                continue
+            other_idx = 1 - req.mamba_next_track_idx
+            has_pending = buf[other_idx].item() != -1
+            if not has_pending:
+                if envs.SGLANG_TEST_MAMBA_LAZY_ALLOC_FAIL.get():
+                    new_slot = None
+                else:
+                    # No evict-retry: a transient slot is not worth
+                    # evicting a cached checkpoint for.
+                    new_slot = pool.mamba_allocator.alloc(1)
+                if new_slot is not None:
+                    pool.set_mamba_ping_pong_slot(req, other_idx, new_slot[0])
+                    has_pending = True
+            # On failure the verify scatters in place into the keep slot.
+            track_positions.append(
+                other_idx if has_pending else req.mamba_next_track_idx
+            )
+        self.mamba_lazy_spec_track_positions_cpu = track_positions
 
     def cumulate_penalty_output_tokens(self):
         # Under overlap batch.input_ids is just a placeholder here -- the
@@ -2911,6 +2973,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.mamba_track_indices = None
         self.mamba_track_mask = None
         self.mamba_track_seqlens = None
+        self.mamba_lazy_spec_track_positions_cpu = None
         self.mamba_cow_src_indices = None
         self.mamba_cow_dst_indices = None
         self.mamba_clear_indices = None
@@ -2929,6 +2992,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.spec_info.filter_batch(
                 new_indices=keep_indices_device,
                 has_been_filtered=False,
+                new_indices_cpu=keep_indices,
             )
 
     def merge_batch(self, other: ScheduleBatch):
@@ -2968,6 +3032,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.mamba_track_indices = None
         self.mamba_track_mask = None
         self.mamba_track_seqlens = None
+        self.mamba_lazy_spec_track_positions_cpu = None
         if self.return_logprob and other.return_logprob:
             self.top_logprobs_nums = self.top_logprobs_nums + other.top_logprobs_nums
             self.token_ids_logprobs = self.token_ids_logprobs + other.token_ids_logprobs
@@ -3007,6 +3072,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             forward_mode=self.forward_mode,
             out_cache_loc=self.out_cache_loc,
             return_logprob=self.return_logprob,
+            has_grammar=self.has_grammar,
             decoding_reqs=self.decoding_reqs,
             spec_algorithm=self.spec_algorithm,
             spec_info=self.spec_info,
@@ -3021,6 +3087,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
+            mamba_lazy_spec_track_positions_cpu=self.mamba_lazy_spec_track_positions_cpu,
             dp_cooperation_info=self.dp_cooperation_info,
             prefill_stats=self.prefill_stats,
             fpm_start_time=self.fpm_start_time,

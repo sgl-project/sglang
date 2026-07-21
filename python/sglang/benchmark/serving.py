@@ -2187,7 +2187,6 @@ def cli_main():
         default="sharegpt",
         choices=[
             "agentic-trace",
-            "autobench",
             "sharegpt",
             "custom",
             "openai",
