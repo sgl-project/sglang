@@ -400,21 +400,17 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 self.config.global_segment_size // tp_scale_factor
             )
 
-            # Check if extra_backend_tag should be passed to MooncakeDistributedStore
-            self.extra_backend_tag = None
-            if extra_config and "extra_backend_tag" in extra_config:
-                self.extra_backend_tag = extra_config["extra_backend_tag"]
-                logger.info(f"Using extra_backend_tag: {self.extra_backend_tag}")
-
-            # Use the model name as a prefix to isolate models sharing one store.
+            # Use the backend tag and model name as a prefix to isolate tenants
+            # and models sharing one store.
+            self.config_prefix = None
             config_prefix_parts = []
-            if self.extra_backend_tag is not None:
-                config_prefix_parts.append(str(self.extra_backend_tag))
+            if extra_config and extra_config.get("extra_backend_tag") is not None:
+                config_prefix_parts.append(str(extra_config["extra_backend_tag"]))
             if storage_config is not None and storage_config.model_name:
                 model_name = "-".join(storage_config.model_name.split("/"))
                 config_prefix_parts.append(model_name)
-            self.config_prefix = "_".join(config_prefix_parts)
-            if self.config_prefix:
+            if config_prefix_parts:
+                self.config_prefix = "_".join(config_prefix_parts)
                 logger.info(f"Using Mooncake config prefix: {self.config_prefix}")
 
             # Check server status
@@ -692,7 +688,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             super().register_buffer(buf)
 
     def _tag_keys(self, keys: List[str]) -> List[str]:
-        if not self.config_prefix:
+        if self.config_prefix is None:
             return keys
         return [f"{self.config_prefix}_{key}" for key in keys]
 
