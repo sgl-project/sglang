@@ -1,10 +1,7 @@
 // DeepSeek-V4 per-cell benchmark numbers, keyed by the same `match` tuple as
 // deepseek-v4.jsx cells. See _deployment.jsx for the speed/accuracy schema.
-// Re-measured cache-cold on sglang v0.5.15 / v0.5.15.post1 (per-cell sglang_version;
-// b200 + h100 on 0.5.15, b300 + gb300 + h200 on 0.5.15.post1). b300 nvfp4 + h200 pro
-// high-throughput pending re-measure.
-// tokens_per_sec_per_gpu is total (input+output) tok/s/GPU: fp4/fp8 = measured
-// output/GPU × (isl+osl)/osl; nvfp4 was measured as total already.
+// Measured on sglang v0.5.15 / v0.5.15.post1 (per-cell sglang_version).
+// tokens_per_sec_per_gpu is total (input+output) tok/s/GPU = output/GPU × (isl+osl)/osl.
 export const benchmarks = [
   // ====================================================================
   // B200 + FP4
