@@ -21,8 +21,8 @@ from sglang.test.ascend.test_ascend_utils import (
 )
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.kits.json_constrained_kit import JSONConstrainedMixin
-from sglang.test.kits.spec_server_kits import SpecGrammarKit
 from sglang.test.kits.pause_generation_kit import PauseResumeInPlaceMixin
+from sglang.test.kits.spec_server_kits import SpecGrammarKit
 from sglang.test.run_eval import run_eval
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
@@ -943,7 +943,7 @@ _CHUNKED_ABORT_LONG_PROMPT = (
     "The quick brown fox jumps over the lazy dog. "
     "Pack my box with five dozen liquor jugs. "
     "Sphinx of black quartz, judge my vow. "
-    ) * 900
+) * 900
 
 
 def _decode_response(response: requests.Response) -> Any:
