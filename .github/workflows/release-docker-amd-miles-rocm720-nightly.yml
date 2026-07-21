@@ -27,7 +27,9 @@ jobs:
         run: echo "Building from miles main @ $(git rev-parse HEAD)"
 
       - name: Install docker/build.py dependencies
-        run: python3 -m pip install --quiet typer
+        run: |
+          apt-get update && apt-get install -y python3 python3-pip
+          pip3 install --break-system-packages --quiet typer
 
       - name: Build ROCm 7.2 MI35X image without pushing
         run: |
