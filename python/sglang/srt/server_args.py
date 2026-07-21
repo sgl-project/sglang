@@ -3776,8 +3776,6 @@ class ServerArgs:
                 "MoE A2A backend",
                 lambda: _resolved_view(self).moe_a2a_backend != "none",
             ),
-            # DP-attn × BCG capture/replay not yet validated.
-            ("DP attention", lambda: self._resolved().enable_dp_attention),
             # Multimodal prefill replay faults under BCG; allowlisted archs opt back in.
             (
                 "multimodal model",
