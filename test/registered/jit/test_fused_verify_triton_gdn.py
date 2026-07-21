@@ -238,11 +238,17 @@ def test_mtp_single_step_decode(N: int):
 def test_large_state_pool_id_no_int32_overflow():
     """A state-pool slot id whose flat offset exceeds 2**31 must not wrap.
 
-    The kernel computes the h0 read/write-back offset as ``idx * HV * K * V``.
-    With ``HV*K*V == 524288`` any slot id above ``2**31 / (HV*K*V) == 4096``
-    overflows int32, so the state row is read/written at a wrapped (often
-    negative) offset. Running identical physics at slot 0 and at such a high
-    slot must produce identical output and identical written-back state.
+    Both the plain ``fused_recurrent`` update kernel and the sibling
+    ``fused_sigmoid_gating`` update kernel compute the h0 read/write-back offset
+    as ``idx * HV * K * V``. With ``HV*K*V == 524288`` any slot id above
+    ``2**31 / (HV*K*V) == 4096`` overflows int32, so the state row is
+    read/written at a wrapped (often negative) offset. Running identical physics
+    at slot 0 and at such a high slot must produce identical output and identical
+    written-back state.
+
+    State is bf16 to keep the high-id buffer ~4.5 GB instead of ~9 GB; the
+    kernels accumulate in fp32 internally, so storage dtype does not affect the
+    overflow behaviour under test.
     """
     H, HV, K, V = 16, 32, 128, 128
     row = HV * K * V  # 524288
@@ -253,45 +259,55 @@ def test_large_state_pool_id_no_int32_overflow():
         N, T, H, HV, K, V
     )
 
-    # Reference at slot 0 (offset always fits int32).
-    ref_src = torch.randn(1, HV, K, V, dtype=torch.float, device="cuda")
     ref_idx = torch.zeros(N, dtype=torch.int32, device="cuda")
-
-    # Same initial state at a high slot id whose flat offset overflows int32.
-    big_src = torch.zeros(big_id + 1, HV, K, V, dtype=torch.float, device="cuda")
-    big_src[big_id].copy_(ref_src[0])
     big_idx = torch.full((N,), big_id, dtype=torch.int32, device="cuda")
 
-    out_ref = run_reference(
-        A_log,
-        dt_bias,
-        q,
-        k,
-        v,
-        a,
-        b,
-        ref_src,
-        ref_idx,
-        cu_seqlens,
-        disable_state_update=False,
-    )
-    out_big = run_reference(
-        A_log,
-        dt_bias,
-        q,
-        k,
-        v,
-        a,
-        b,
-        big_src,
-        big_idx,
-        cu_seqlens,
-        disable_state_update=False,
-    )
+    def _fresh_states():
+        # Reference at slot 0 (offset always fits int32); identical initial
+        # state at a high slot id whose flat offset overflows int32.
+        ref_src = torch.randn(1, HV, K, V, dtype=torch.bfloat16, device="cuda")
+        big_src = torch.zeros(big_id + 1, HV, K, V, dtype=torch.bfloat16, device="cuda")
+        big_src[big_id].copy_(ref_src[0])
+        return ref_src, big_src
 
-    torch.testing.assert_close(out_big, out_ref, rtol=1e-2, atol=1e-2)
-    # Written-back final state must land in the correct high-id row.
-    torch.testing.assert_close(big_src[big_id], ref_src[0], rtol=1e-2, atol=1e-2)
+    def _check(runner):
+        ref_src, big_src = _fresh_states()
+        out_ref = runner(
+            A_log,
+            dt_bias,
+            q,
+            k,
+            v,
+            a,
+            b,
+            ref_src,
+            ref_idx,
+            cu_seqlens,
+            disable_state_update=False,
+        )
+        out_big = runner(
+            A_log,
+            dt_bias,
+            q,
+            k,
+            v,
+            a,
+            b,
+            big_src,
+            big_idx,
+            cu_seqlens,
+            disable_state_update=False,
+        )
+        torch.testing.assert_close(out_big, out_ref, rtol=1e-2, atol=1e-2)
+        # Written-back final state must land in the correct high-id row.
+        torch.testing.assert_close(big_src[big_id], ref_src[0], rtol=1e-2, atol=1e-2)
+        del big_src
+        torch.cuda.empty_cache()
+
+    # fused_recurrent update path (idx read at load + write-back).
+    _check(run_reference)
+    # fused_sigmoid_gating update path (sibling kernel, same offset expressions).
+    _check(run_fused_mtp)
 
 
 if __name__ == "__main__":
