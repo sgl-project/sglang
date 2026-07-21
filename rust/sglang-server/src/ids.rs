@@ -46,3 +46,46 @@ impl Display for RidHash {
 pub fn new_rid() -> String {
     Uuid::new_v4().simple().to_string()
 }
+
+/// Health-probe rid prefix — MUST match the Python server's
+/// `sglang.srt.constants.HEALTH_CHECK_RID_PREFIX`, so scheduler logs / crash
+/// dumps and any prefix-gated logic recognize probes from either server.
+pub const HEALTH_CHECK_RID_PREFIX: &str = "HEALTH_CHECK";
+
+/// Mint a health-probe rid: `HEALTH_CHECK_<uuid4 hex>`, the Python server's
+/// `f"{HEALTH_CHECK_RID_PREFIX}_{uuid.uuid4().hex}"` format.
+pub fn new_health_check_rid() -> String {
+    format!("{HEALTH_CHECK_RID_PREFIX}_{}", new_rid())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Cross-language format guard: Python rids are `uuid.uuid4().hex` — 32
+    /// lowercase hex chars, no hyphens. `.simple()` is the matching uuid-crate
+    /// encoding; swapping it for the default `to_string()` (36 chars,
+    /// hyphenated) would silently break the parity.
+    #[test]
+    fn rid_matches_python_uuid4_hex_format() {
+        let rid = new_rid();
+        assert_eq!(rid.len(), 32);
+        assert!(
+            rid.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "rid must be lowercase hex: {rid}"
+        );
+    }
+
+    /// Cross-language literal guard: the prefix is dictated by Python's
+    /// `constants.HEALTH_CHECK_RID_PREFIX` ("HEALTH_CHECK"); drifting silently
+    /// would break prefix-gated handling (e.g. the disagg encode server).
+    #[test]
+    fn health_rid_matches_python_convention() {
+        assert_eq!(HEALTH_CHECK_RID_PREFIX, "HEALTH_CHECK");
+        let rid = new_health_check_rid();
+        // "HEALTH_CHECK_" + 32 hex chars
+        assert!(rid.starts_with("HEALTH_CHECK_"));
+        assert_eq!(rid.len(), "HEALTH_CHECK_".len() + 32);
+    }
+}
