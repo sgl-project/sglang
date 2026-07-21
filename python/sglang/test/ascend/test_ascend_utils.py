@@ -408,6 +408,7 @@ IMAGES_EXAMPLE_PATH = os.path.join(IMAGES_DIR, "example_image.png")
 IMAGES_023_PATH = os.path.join(IMAGES_DIR, "023.jpg")
 IMAGES_MAN_PATH = os.path.join(IMAGES_DIR, "man.png")
 IMAGES_LOGO_PATH = os.path.join(IMAGES_DIR, "logo.png")
+IMAGES_1_1_PATH = os.path.join(IMAGES_DIR, "1x1.png")
 VIDEO_JOBS_PATH = os.path.join(VIDEO_DIR, "jobs.mp4")
 INVOICE_WITH_BARCODE_LOGO_IMAGES_PATH = os.path.join(
     IMAGES_DIR, "invoice_with_barcode_logo.jpeg"
