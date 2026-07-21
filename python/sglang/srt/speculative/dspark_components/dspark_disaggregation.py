@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import logging
 import os
-from dataclasses import dataclass
 from typing import Any, List, Optional, Tuple
 
+import msgspec
 import torch
 
 from sglang.srt.distributed.utils import get_pp_indices
@@ -12,8 +12,7 @@ from sglang.srt.distributed.utils import get_pp_indices
 logger = logging.getLogger(__name__)
 
 
-@dataclass(frozen=True)
-class DSparkDisaggMetadataConfig:
+class DSparkDisaggMetadataConfig(msgspec.Struct, frozen=True):
     hidden_pool_size: int = 0
     hidden_size: int = 0
     hidden_device: str = "cpu"
@@ -32,8 +31,7 @@ class DSparkDisaggMetadataConfig:
         }
 
 
-@dataclass
-class PDHiddenBootstrapPlan:
+class PDHiddenBootstrapPlan(msgspec.Struct):
     hidden_start: int
     hidden_len: int
     streaming_hidden: bool

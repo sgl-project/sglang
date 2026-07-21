@@ -266,6 +266,11 @@ class CommonKVManager(BaseKVManager):
         del bootstrap_room
         return False
 
+    def _wake_pd_hidden_ack_waiters(self, bootstrap_room: int) -> None:
+        """Wake backend-specific PD hidden ACK waiters after request failure."""
+        del bootstrap_room
+        return None
+
     # Backward-compatible aliases for backend-specific implementations that have
     # not yet migrated to the request-level naming.
     def mark_pd_hidden_done(

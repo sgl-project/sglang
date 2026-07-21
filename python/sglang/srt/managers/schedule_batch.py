@@ -1050,6 +1050,16 @@ class Req(ReqDllmMixin):
         self.pd_rebootstrap_forced_output_id: Optional[int] = None
         self.skip_radix_cache_insert = bootstrap_host == FAKE_BOOTSTRAP_HOST
         self.disagg_kv_sender: Optional[BaseKVSender] = None
+        self.pd_hidden_meta: Optional[dict] = None
+        self.pd_hidden_src_indices: Optional[List[int]] = None
+        self.pd_hidden_dst_indices: Optional[List[int]] = None
+        self.pd_hidden_written: Optional[List[bool]] = None
+        self.pd_hidden_capture_layer_ids: Optional[List[int]] = None
+        self.pd_hidden_current_src_indices: Optional[List[int]] = None
+        self.pd_hidden_current_start: Optional[int] = None
+        self.pd_hidden_current_row_len: int = 0
+        self.pd_hidden_current_is_last: bool = False
+        self.pd_hidden_owner_direct_sent: bool = False
 
         self.routed_dp_rank: Optional[int] = routed_dp_rank
         self.disagg_prefill_dp_rank: Optional[int] = disagg_prefill_dp_rank

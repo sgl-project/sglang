@@ -121,13 +121,12 @@ def maybe_release_metadata_buffer(
     if req.metadata_buffer_index >= 0:
         allocator.free(req.metadata_buffer_index)
         req.metadata_buffer_index = -1
-    indices = getattr(req, "pd_hidden_src_indices", None)
+    indices = req.pd_hidden_src_indices
     if indices and pd_hidden_pool is not None:
-        sender = getattr(req, "disagg_kv_sender", None)
-        kv_mgr = getattr(sender, "kv_mgr", None)
-        pop_hidden_done = getattr(kv_mgr, "pop_pd_hidden_request_done", None)
-        worker_released = pop_hidden_done is not None and pop_hidden_done(
-            getattr(sender, "bootstrap_room", req.bootstrap_room)
+        sender = req.disagg_kv_sender
+        worker_released = (
+            sender is not None
+            and sender.kv_mgr.pop_pd_hidden_request_done(sender.bootstrap_room)
         )
         if not worker_released:
             pd_hidden_pool.free(indices)
@@ -140,7 +139,7 @@ def maybe_release_pd_hidden_rows(req: Req, pd_hidden_pool) -> None:
     """Release source hidden rows once the local RDMA transfer is complete."""
     if pd_hidden_pool is None:
         return
-    indices = getattr(req, "pd_hidden_src_indices", None)
+    indices = req.pd_hidden_src_indices
     if indices:
         pd_hidden_pool.free(indices)
         clear_pd_hidden_request_state(req)
@@ -150,14 +149,12 @@ def maybe_release_pd_hidden_rows_on_hidden_done(
     req: Req, pd_hidden_pool
 ) -> bool:
     """Release source hidden rows after PD_HIDDEN finishes, before KV success."""
-    indices = getattr(req, "pd_hidden_src_indices", None)
+    indices = req.pd_hidden_src_indices
     if not indices or pd_hidden_pool is None:
         return False
-    sender = getattr(req, "disagg_kv_sender", None)
-    kv_mgr = getattr(sender, "kv_mgr", None)
-    pop_hidden_done = getattr(kv_mgr, "pop_pd_hidden_request_done", None)
-    if pop_hidden_done is None or not pop_hidden_done(
-        getattr(sender, "bootstrap_room", req.bootstrap_room)
+    sender = req.disagg_kv_sender
+    if sender is None or not sender.kv_mgr.pop_pd_hidden_request_done(
+        sender.bootstrap_room
     ):
         return False
 
@@ -168,24 +165,20 @@ def maybe_release_pd_hidden_rows_on_hidden_done(
 def fail_pd_hidden_transfer(req: Req, message: str) -> None:
     """Route a PD hidden transfer failure through the standard KV failed path."""
     logger.warning(message)
-    sender = getattr(req, "disagg_kv_sender", None)
-    kv_mgr = getattr(sender, "kv_mgr", None)
-    room = getattr(sender, "bootstrap_room", req.bootstrap_room)
-    if kv_mgr is not None:
-        record_failure = getattr(kv_mgr, "record_failure", None)
-        if record_failure is not None:
-            record_failure(room, message)
-        kv_mgr.update_status(room, KVPoll.Failed)
-        wake_pd_hidden_waiters = getattr(kv_mgr, "_wake_pd_hidden_ack_waiters", None)
-        if wake_pd_hidden_waiters is not None:
-            wake_pd_hidden_waiters(room)
-    if sender is not None:
-        sender.conclude_state = KVPoll.Failed
+    sender = req.disagg_kv_sender
+    if sender is None:
+        return
+    kv_mgr = sender.kv_mgr
+    room = sender.bootstrap_room
+    kv_mgr.record_failure(room, message)
+    kv_mgr.update_status(room, KVPoll.Failed)
+    kv_mgr._wake_pd_hidden_ack_waiters(room)
+    sender.conclude_state = KVPoll.Failed
 
 
 def is_pd_hidden_transfer_failed(req: Req) -> bool:
-    sender = getattr(req, "disagg_kv_sender", None)
-    return getattr(sender, "conclude_state", None) == KVPoll.Failed
+    sender = req.disagg_kv_sender
+    return sender is not None and sender.conclude_state == KVPoll.Failed
 
 
 class PrefillBootstrapQueue:
@@ -455,7 +448,7 @@ class PrefillBootstrapQueue:
             return (metadata_cost, 0), None
 
         hidden_cost = 0 if plan.streaming_hidden else plan.source_window_rows
-        if getattr(req, "pd_hidden_src_indices", None) is not None:
+        if req.pd_hidden_src_indices is not None:
             hidden_cost = 0
         if hidden_cost > hidden_row_credits:
             now = time.monotonic()
@@ -497,7 +490,7 @@ class PrefillBootstrapQueue:
                 else [int(x) for x in dspark_meta.get("target_layer_ids", [])]
             )
         )
-        if not local_layer_ids or getattr(req, "pd_hidden_src_indices", None):
+        if not local_layer_ids or req.pd_hidden_src_indices:
             return False
 
         pool = getattr(self.metadata_buffers, "pd_hidden_pool", None)
@@ -525,13 +518,10 @@ class PrefillBootstrapQueue:
     def _abort_pd_hidden_bootstrap(self, req: Req, message: str) -> None:
         logger.error(message)
         prepare_abort(req, message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
-        sender = getattr(req, "disagg_kv_sender", None)
-        kv_mgr = getattr(sender, "kv_mgr", None)
-        if sender is not None and kv_mgr is not None:
-            kv_mgr.record_failure(getattr(sender, "bootstrap_room", req.bootstrap_room), message)
-            kv_mgr.update_status(
-                getattr(sender, "bootstrap_room", req.bootstrap_room), KVPoll.Failed
-            )
+        sender = req.disagg_kv_sender
+        if sender is not None:
+            sender.kv_mgr.record_failure(sender.bootstrap_room, message)
+            sender.kv_mgr.update_status(sender.bootstrap_room, KVPoll.Failed)
             sender.conclude_state = KVPoll.Failed
 
     def _finalize_pd_hidden_bootstrap(
@@ -980,7 +970,7 @@ class SchedulerDisaggregationPrefillMixin:
     def _build_pd_hidden_only_state_indices(
         self: Scheduler, req: Req
     ) -> Optional[List]:
-        current_indices = getattr(req, "pd_hidden_current_src_indices", None)
+        current_indices = req.pd_hidden_current_src_indices
         if current_indices is None:
             return None
 
@@ -996,9 +986,9 @@ class SchedulerDisaggregationPrefillMixin:
         return state_indices
 
     def _send_pd_hidden_only_chunk(self: Scheduler, req: Req) -> bool:
-        current_indices = getattr(req, "pd_hidden_current_src_indices", None)
-        current_start = getattr(req, "pd_hidden_current_start", None)
-        current_rows = int(getattr(req, "pd_hidden_current_row_len", 0) or 0)
+        current_indices = req.pd_hidden_current_src_indices
+        current_start = req.pd_hidden_current_start
+        current_rows = int(req.pd_hidden_current_row_len or 0)
         if current_indices is None or current_start is None or current_rows <= 0:
             return False
 
@@ -1007,26 +997,18 @@ class SchedulerDisaggregationPrefillMixin:
             return False
 
         streaming_hidden = bool(
-            (getattr(req, "pd_hidden_meta", None) or {}).get(
-                "streaming_hidden", False
-            )
+            (req.pd_hidden_meta or {}).get("streaming_hidden", False)
         )
-        if hasattr(req.disagg_kv_sender, "set_source_event"):
+        if req.disagg_kv_sender is not None:
             source_event = self.device_module.Event()
             source_event.record()
             req.disagg_kv_sender.set_source_event(source_event)
-            set_chunk_meta = getattr(
-                req.disagg_kv_sender, "set_pd_hidden_chunk_meta", None
+            req.disagg_kv_sender.set_pd_hidden_chunk_meta(
+                int(current_start),
+                int(current_rows),
+                bool(req.pd_hidden_current_is_last),
+                current_indices if streaming_hidden else req.pd_hidden_src_indices,
             )
-            if set_chunk_meta is not None:
-                set_chunk_meta(
-                    int(current_start),
-                    int(current_rows),
-                    bool(getattr(req, "pd_hidden_current_is_last", False)),
-                    current_indices
-                    if streaming_hidden
-                    else getattr(req, "pd_hidden_src_indices", None),
-                )
 
         req.disagg_kv_sender.send(np.asarray([], dtype=np.int32), state_indices)
         if streaming_hidden:
@@ -1052,12 +1034,12 @@ class SchedulerDisaggregationPrefillMixin:
             for req in batch.reqs
             if (
                 (
-                    getattr(req, "pd_hidden_src_indices", None)
-                    or getattr(req, "pd_hidden_capture_layer_ids", None)
+                    req.pd_hidden_src_indices
+                    or req.pd_hidden_capture_layer_ids
                 )
                 and (
                     send_owner_direct
-                    or not getattr(req, "pd_hidden_owner_direct_sent", False)
+                    or not req.pd_hidden_owner_direct_sent
                 )
             )
         ]
@@ -1065,8 +1047,8 @@ class SchedulerDisaggregationPrefillMixin:
             reqs = [
                 (
                     req.rid,
-                    getattr(req, "pd_hidden_capture_layer_ids", None),
-                    bool(getattr(req, "pd_hidden_src_indices", None)),
+                    req.pd_hidden_capture_layer_ids,
+                    bool(req.pd_hidden_src_indices),
                 )
                 for req in needs_pd_hidden_reqs
             ]
@@ -1100,14 +1082,11 @@ class SchedulerDisaggregationPrefillMixin:
             req_hidden = hidden_states[hidden_offset : hidden_offset + extend_len]
             hidden_offset += extend_len
 
-            meta = getattr(req, "pd_hidden_meta", None) or {}
+            meta = req.pd_hidden_meta or {}
             streaming_hidden = bool(meta.get("streaming_hidden", False))
-            if (
-                not send_owner_direct
-                and getattr(req, "pd_hidden_owner_direct_sent", False)
-            ):
+            if not send_owner_direct and req.pd_hidden_owner_direct_sent:
                 continue
-            src_indices = getattr(req, "pd_hidden_src_indices", None)
+            src_indices = req.pd_hidden_src_indices
             if not src_indices and not streaming_hidden:
                 continue
 
@@ -1155,10 +1134,8 @@ class SchedulerDisaggregationPrefillMixin:
             else:
                 rows = local_end - local_start
                 write_indices = src_indices[local_start:local_end]
-            prev_current_start = getattr(req, "pd_hidden_current_start", None)
-            prev_current_row_len = int(
-                getattr(req, "pd_hidden_current_row_len", 0) or 0
-            )
+            prev_current_start = req.pd_hidden_current_start
+            prev_current_row_len = int(req.pd_hidden_current_row_len or 0)
             if (
                 prev_current_start is not None
                 and prev_current_row_len > 0
@@ -1197,7 +1174,7 @@ class SchedulerDisaggregationPrefillMixin:
             req.pd_hidden_current_row_len = rows
             req.pd_hidden_current_src_indices = write_indices
             req.pd_hidden_current_is_last = write_end >= hidden_start + hidden_len
-            written = getattr(req, "pd_hidden_written", None)
+            written = req.pd_hidden_written
             if written is not None:
                 written[local_start:local_end] = [True] * rows
             if send_owner_direct:
@@ -1211,7 +1188,7 @@ class SchedulerDisaggregationPrefillMixin:
         capture_reqs = [
             req
             for req in batch.reqs
-            if getattr(req, "pd_hidden_capture_layer_ids", None)
+            if req.pd_hidden_capture_layer_ids
         ]
         if not capture_reqs:
             return False
@@ -1219,9 +1196,7 @@ class SchedulerDisaggregationPrefillMixin:
             return False
         if not all(
             bool(
-                (getattr(req, "pd_hidden_meta", None) or {}).get(
-                    "streaming_hidden", False
-                )
+                (req.pd_hidden_meta or {}).get("streaming_hidden", False)
             )
             for req in capture_reqs
         ):
@@ -1739,21 +1714,15 @@ class SchedulerDisaggregationPrefillMixin:
             )
             return True
 
-        current_pd_hidden_src_indices = getattr(
-            req, "pd_hidden_current_src_indices", None
-        )
-        current_pd_hidden_start = getattr(req, "pd_hidden_current_start", None)
-        current_pd_hidden_row_len = int(
-            getattr(req, "pd_hidden_current_row_len", 0) or 0
-        )
+        current_pd_hidden_src_indices = req.pd_hidden_current_src_indices
+        current_pd_hidden_start = req.pd_hidden_current_start
+        current_pd_hidden_row_len = int(req.pd_hidden_current_row_len or 0)
         has_current_pd_hidden = (
             current_pd_hidden_src_indices is not None
             and current_pd_hidden_row_len > 0
         )
         streaming_pd_hidden = bool(
-            (getattr(req, "pd_hidden_meta", None) or {}).get(
-                "streaming_hidden", False
-            )
+            (req.pd_hidden_meta or {}).get("streaming_hidden", False)
         )
 
         state_indices: Optional[List] = None
@@ -1827,13 +1796,10 @@ class SchedulerDisaggregationPrefillMixin:
                 )
 
             def _pd_hidden_payload():
-                if getattr(req, "pd_hidden_owner_direct_sent", False):
+                if req.pd_hidden_owner_direct_sent:
                     return []
-                src_indices = getattr(req, "pd_hidden_src_indices", None)
-                if (
-                    src_indices is None
-                    and getattr(req, "pd_hidden_capture_layer_ids", None)
-                ):
+                src_indices = req.pd_hidden_src_indices
+                if src_indices is None and req.pd_hidden_capture_layer_ids:
                     raise RuntimeError(
                         "PD hidden row pool was not materialized before transfer: "
                         f"rid={req.rid}"
@@ -1842,7 +1808,7 @@ class SchedulerDisaggregationPrefillMixin:
                     return np.asarray(current_pd_hidden_src_indices, dtype=np.int32)
                 if not src_indices:
                     return []
-                written = getattr(req, "pd_hidden_written", None)
+                written = req.pd_hidden_written
                 if written is not None and not all(written):
                     missing = [i for i, ok in enumerate(written) if not ok][:8]
                     raise RuntimeError(
@@ -1884,25 +1850,18 @@ class SchedulerDisaggregationPrefillMixin:
         )
         if not should_send_kv_chunk and not has_current_pd_hidden:
             return True
-        if (
-            has_current_pd_hidden
-            and hasattr(req.disagg_kv_sender, "set_source_event")
-        ):
+        if has_current_pd_hidden:
             source_event = self.device_module.Event()
             source_event.record()
             req.disagg_kv_sender.set_source_event(source_event)
-            set_chunk_meta = getattr(
-                req.disagg_kv_sender, "set_pd_hidden_chunk_meta", None
+            req.disagg_kv_sender.set_pd_hidden_chunk_meta(
+                int(current_pd_hidden_start),
+                int(current_pd_hidden_row_len),
+                bool(req.pd_hidden_current_is_last),
+                current_pd_hidden_src_indices
+                if streaming_pd_hidden
+                else req.pd_hidden_src_indices,
             )
-            if set_chunk_meta is not None:
-                set_chunk_meta(
-                    int(current_pd_hidden_start),
-                    int(current_pd_hidden_row_len),
-                    bool(getattr(req, "pd_hidden_current_is_last", False)),
-                    current_pd_hidden_src_indices
-                    if streaming_pd_hidden
-                    else getattr(req, "pd_hidden_src_indices", None),
-                )
         req.disagg_kv_sender.send(page_indices, state_indices)
         if has_current_pd_hidden and streaming_pd_hidden:
             req.pd_hidden_src_indices = None

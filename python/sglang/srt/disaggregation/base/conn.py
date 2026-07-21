@@ -145,6 +145,18 @@ class BaseKVSender(ABC):
     def should_send_kv_chunk(self, num_pages: int, last_chunk: bool) -> bool:
         return num_pages > 0
 
+    def set_source_event(self, source_event) -> None:
+        del source_event
+
+    def set_pd_hidden_chunk_meta(
+        self,
+        hidden_start: int,
+        row_len: int,
+        is_last_hidden_chunk: bool,
+        release_indices: Optional[List[int]] = None,
+    ) -> None:
+        del hidden_start, row_len, is_last_hidden_chunk, release_indices
+
     @abstractmethod
     def get_transfer_metric(self) -> KVTransferMetric:
         """Return backend-specific transfer metrics for this sender."""

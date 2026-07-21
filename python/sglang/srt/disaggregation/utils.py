@@ -6,7 +6,6 @@ import logging
 import threading
 from collections import deque
 from contextlib import nullcontext
-from dataclasses import dataclass
 from enum import Enum
 from typing import (
     TYPE_CHECKING,
@@ -21,6 +20,7 @@ from typing import (
 )
 
 import numpy as np
+import msgspec
 import torch
 import torch.distributed as dist
 
@@ -425,8 +425,7 @@ class PDHiddenRowPool:
         return [self.buffer.data_ptr()], [self.buffer.nbytes], [self.buffer[0].nbytes]
 
 
-@dataclass
-class PDHiddenTransferPlan:
+class PDHiddenTransferPlan(msgspec.Struct):
     row_count: int
     item_len: int
     row_chunks: List[Dict[str, Any]]
@@ -827,8 +826,7 @@ class TransferBackend(Enum):
     FAKE = "fake"
 
 
-@dataclass(frozen=True)
-class DisaggMetadataConfig:
+class DisaggMetadataConfig(msgspec.Struct, frozen=True):
     hidden_size: int
     hidden_states_dtype: torch.dtype
     metadata_buffer_kwargs: dict
