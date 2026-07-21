@@ -53,9 +53,86 @@ class Qwen3CoderDetector(BaseFormatDetector):
 
         # Initialize attributes that were missing in the original PR
         self.current_func_name: Optional[str] = None
+        self.current_param_name: Optional[str] = None
+        self.current_param_value_started: bool = False
+        self.current_param_pending_suffix: str = ""
 
     def has_tool_call(self, text: str) -> bool:
         return self.tool_call_start_token in text
+
+    def _get_param_type(
+        self, param_name: str, param_config: dict, func_name: Optional[str]
+    ) -> str:
+        if param_name not in param_config:
+            if param_config != {}:
+                logger.warning(
+                    f"Parsed parameter '{param_name}' is not defined in the tool "
+                    f"parameters for tool '{func_name}', directly returning the string value."
+                )
+            return "string"
+
+        param_schema = param_config[param_name]
+        if isinstance(param_schema, dict) and "type" in param_schema:
+            return str(param_schema["type"]).strip().lower()
+        return "string"
+
+    def _is_streamable_string_param(
+        self, param_name: str, param_config: dict, func_name: Optional[str]
+    ) -> bool:
+        param_type = self._get_param_type(param_name, param_config, func_name)
+        return param_type in ["string", "str", "text", "varchar", "char", "enum"]
+
+    def _json_string_fragment(self, value: str) -> str:
+        return json.dumps(value, ensure_ascii=False)[1:-1]
+
+    def _partial_tag_suffix_len(self, text: str) -> int:
+        possible_tags = [
+            self.parameter_end_token,
+            self.parameter_prefix,
+            self.function_end_token,
+        ]
+        max_len = 0
+        for tag in possible_tags:
+            for i in range(1, min(len(text), len(tag)) + 1):
+                if tag.startswith(text[-i:]):
+                    max_len = max(max_len, i)
+        return max_len
+
+    def _emit_string_value_piece(
+        self,
+        calls: List[ToolCallItem],
+        value_piece: str,
+        *,
+        is_final: bool,
+    ) -> None:
+        if (
+            not self.current_param_value_started
+            and value_piece.startswith("\n")
+        ):
+            value_piece = value_piece[1:]
+
+        if self.current_param_pending_suffix:
+            if is_final and not value_piece:
+                self.current_param_pending_suffix = ""
+            else:
+                value_piece = self.current_param_pending_suffix + value_piece
+                self.current_param_pending_suffix = ""
+
+        if is_final:
+            value_piece = value_piece.rstrip("\n")
+        else:
+            stripped_piece = value_piece.rstrip("\n")
+            self.current_param_pending_suffix = value_piece[len(stripped_piece) :]
+            value_piece = stripped_piece
+
+        if value_piece:
+            calls.append(
+                ToolCallItem(
+                    tool_index=self.current_tool_id,
+                    parameters=self._json_string_fragment(value_piece),
+                )
+            )
+            self.current_param_value_started = True
 
     def _get_arguments_config(
         self, func_name: str, tools: Optional[list[Tool]]
@@ -261,6 +338,54 @@ class Qwen3CoderDetector(BaseFormatDetector):
                 break
 
             # -------------------------------------------------------
+            # 0. Streaming parameter value: value chunks after <parameter=name>
+            # -------------------------------------------------------
+            if self.current_param_name is not None:
+                cand_end_param = current_slice.find(self.parameter_end_token)
+                cand_next_param = current_slice.find(self.parameter_prefix)
+                cand_end_func = current_slice.find(self.function_end_token)
+
+                candidates = []
+                if cand_end_param != -1:
+                    candidates.append((cand_end_param, len(self.parameter_end_token)))
+                if cand_next_param != -1:
+                    candidates.append((cand_next_param, 0))
+                if cand_end_func != -1:
+                    candidates.append((cand_end_func, 0))
+
+                if candidates:
+                    end_pos, end_token_len = min(candidates, key=lambda x: x[0])
+                    value_piece = current_slice[:end_pos]
+                    self._emit_string_value_piece(
+                        calls, value_piece, is_final=True
+                    )
+
+                    calls.append(
+                        ToolCallItem(
+                            tool_index=self.current_tool_id, parameters='"'
+                        )
+                    )
+                    self.current_tool_param_count += 1
+                    self.current_param_name = None
+                    self.current_param_value_started = False
+                    self.current_param_pending_suffix = ""
+                    self.parsed_pos += end_pos + end_token_len
+                    continue
+
+                keep_len = self._partial_tag_suffix_len(current_slice)
+                emit_len = len(current_slice) - keep_len
+                if emit_len <= 0:
+                    break
+
+                value_piece = current_slice[:emit_len]
+                self._emit_string_value_piece(
+                    calls, value_piece, is_final=False
+                )
+
+                self.parsed_pos += emit_len
+                continue
+
+            # -------------------------------------------------------
             # 1. Priority detection: check if it's the start of Tool Call
             # -------------------------------------------------------
             if current_slice.startswith(self.tool_call_start_token):
@@ -352,6 +477,40 @@ class Qwen3CoderDetector(BaseFormatDetector):
                         param_config = self._get_arguments_config(
                             self.current_func_name, tools
                         )
+                        if self._is_streamable_string_param(
+                            param_name, param_config, self.current_func_name
+                        ):
+                            json_key = json.dumps(param_name)
+                            prefix = (
+                                f", {json_key}: \""
+                                if self.current_tool_param_count > 0
+                                else f"{json_key}: \""
+                            )
+                            calls.append(
+                                ToolCallItem(
+                                    tool_index=self.current_tool_id,
+                                    parameters=prefix,
+                                )
+                            )
+                            if raw_value:
+                                calls.append(
+                                    ToolCallItem(
+                                        tool_index=self.current_tool_id,
+                                        parameters=self._json_string_fragment(raw_value),
+                                    )
+                                )
+                            calls.append(
+                                ToolCallItem(
+                                    tool_index=self.current_tool_id, parameters='"'
+                                )
+                            )
+                            self.current_tool_param_count += 1
+
+                            # Advance cursor
+                            total_len = (name_end + 1) + end_pos + end_token_len
+                            self.parsed_pos += total_len
+                            continue
+
                         converted_val = self._convert_param_value(
                             raw_value, param_name, param_config, self.current_func_name
                         )
@@ -376,6 +535,40 @@ class Qwen3CoderDetector(BaseFormatDetector):
                         total_len = (name_end + 1) + end_pos + end_token_len
                         self.parsed_pos += total_len
                         continue
+                    else:
+                        param_name = current_slice[
+                            len(self.parameter_prefix) : name_end
+                        ]
+                        param_config = self._get_arguments_config(
+                            self.current_func_name, tools
+                        )
+                        if self._is_streamable_string_param(
+                            param_name, param_config, self.current_func_name
+                        ):
+                            if not self.json_started:
+                                calls.append(
+                                    ToolCallItem(
+                                        tool_index=self.current_tool_id, parameters="{"
+                                    )
+                                )
+                                self.json_started = True
+
+                            json_key = json.dumps(param_name)
+                            prefix = (
+                                f", {json_key}: \""
+                                if self.current_tool_param_count > 0
+                                else f"{json_key}: \""
+                            )
+                            calls.append(
+                                ToolCallItem(
+                                    tool_index=self.current_tool_id,
+                                    parameters=prefix,
+                                )
+                            )
+                            self.current_param_name = param_name
+                            self.current_param_value_started = False
+                            self.parsed_pos += name_end + 1
+                            continue
 
                 # Incomplete parameter tag or value
                 break
@@ -395,6 +588,9 @@ class Qwen3CoderDetector(BaseFormatDetector):
                 )
                 self.parsed_pos += len(self.function_end_token)
                 self.current_func_name = None
+                self.current_param_name = None
+                self.current_param_value_started = False
+                self.current_param_pending_suffix = ""
                 continue
 
             # -------------------------------------------------------
