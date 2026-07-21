@@ -3593,7 +3593,7 @@ class Scheduler(
         # sleep until next event
         self.maybe_sleep_on_idle()
 
-    def is_fully_idle(self, for_health_check=False) -> bool:
+    def is_fully_idle(self, for_health_check=False, ignore_retracted=False) -> bool:
         # Health check piggybacks on running requests in process_output.
         # Only running_batch + waiting_queue guarantee active GPU processing;
         # disagg queues (bootstrap/prealloc/transfer) may have items without
@@ -3610,8 +3610,13 @@ class Scheduler(
             and self._pp_microbatches_drained()
         )
 
-        # Waiting queues: waiting + bootstrapping + preallocation + kv transfer (decode)
-        idle &= len(self.waiting_queue) == 0
+        # Waiting queues: waiting + bootstrapping + preallocation + kv transfer (decode).
+        # ignore_retracted excludes requests pause_generation(mode="retract") just moved
+        # here — they hold no KV/pool state, so they don't block a cache flush.
+        waiting_queue = self.waiting_queue
+        if ignore_retracted:
+            waiting_queue = [r for r in waiting_queue if not r.is_retracted]
+        idle &= len(waiting_queue) == 0
 
         if not for_health_check:
             # Grammar queue and prefill inflight queue may not produce batch
@@ -3750,7 +3755,10 @@ class Scheduler(
 
     def flush_cache(self, empty_cache: bool = True):
         """Flush memory pools (e.g., KV cache, Mamba cache) and optionally empty device allocator cache."""
-        if self.is_fully_idle():
+        # Only ignore retracted requests while genuinely paused (pause_generation already
+        # moved them into waiting_queue) — otherwise this would mask a caller bug that
+        # flushes without pausing first, e.g. during a memory-pressure retract_decode.
+        if self.is_fully_idle(ignore_retracted=self._engine_paused):
             self.cur_batch = None
             self.last_batch = None
             self.tree_cache.reset()

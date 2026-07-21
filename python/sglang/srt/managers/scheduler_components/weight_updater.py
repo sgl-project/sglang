@@ -325,8 +325,9 @@ class SchedulerWeightUpdaterManager:
         return EndWeightUpdateReqOutput(success=True, message="Success")
 
     def release_memory_occupation(self, recv_req: ReleaseMemoryOccupationReqInput):
-        assert (
-            self.is_fully_idle()
+        scheduler = self.scheduler
+        assert self.is_fully_idle(
+            ignore_retracted=scheduler is not None and scheduler._engine_paused
         ), "release_memory_occupation should be called only when server is idle."
 
         tags = recv_req.tags
@@ -338,7 +339,6 @@ class SchedulerWeightUpdaterManager:
             self.offload_tags.add(tag)
 
         if GPU_MEMORY_TYPE_KV_CACHE in tags:
-            scheduler = self.scheduler
             if scheduler is not None:
                 if scheduler.disaggregation_mode == DisaggregationMode.DECODE:
                     for queue_name in (
