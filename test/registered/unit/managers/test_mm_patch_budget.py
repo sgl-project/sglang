@@ -13,15 +13,11 @@ def test_compute_image_patch_tokens_for_mixed_grids():
     items = [
         MultimodalDataItem(
             modality=Modality.IMAGE,
-            model_specific_data={
-                "image_grid_thw": torch.tensor([[1, 64, 64]])
-            },
+            model_specific_data={"image_grid_thw": torch.tensor([[1, 64, 64]])},
         ),
         MultimodalDataItem(
             modality=Modality.IMAGE,
-            model_specific_data={
-                "image_grid_thw": np.array([[1, 8, 12], [1, 4, 4]])
-            },
+            model_specific_data={"image_grid_thw": np.array([[1, 8, 12], [1, 4, 4]])},
         ),
         MultimodalDataItem(modality=Modality.AUDIO),
     ]

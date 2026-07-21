@@ -936,7 +936,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 total_image_patch_tokens = sum(image_patch_tokens)
                 max_image_patch_tokens = max(image_patch_tokens, default=0)
                 request_limit = self.server_args.max_mm_patch_tokens_per_request
-                if request_limit is not None and total_image_patch_tokens > request_limit:
+                if (
+                    request_limit is not None
+                    and total_image_patch_tokens > request_limit
+                ):
                     raise ValueError(
                         "The multimodal input requires "
                         f"{total_image_patch_tokens} raw ViT patch tokens after "
