@@ -734,6 +734,28 @@ class ServerArgs:
         Optional[int],
         "The maximum number of requests in a prefill batch. If not specified, there is no limit.",
     ] = None
+    max_mm_patch_tokens_per_request: A[
+        Optional[int],
+        Arg(
+            help=(
+                "The maximum number of post-alignment raw ViT patch tokens in one "
+                "request. Unlike image-count limits, this allows arbitrary mixes "
+                "of large and small images within the same visual-work budget."
+            ),
+            type_parser=human_readable_int,
+        ),
+    ] = None
+    max_prefill_mm_patch_tokens: A[
+        Optional[int],
+        Arg(
+            help=(
+                "The maximum total number of post-alignment raw ViT patch tokens "
+                "admitted to one prefill batch. Requests that do not fit remain "
+                "queued for a later batch."
+            ),
+            type_parser=human_readable_int,
+        ),
+    ] = None
     schedule_policy: A[
         str,
         Arg(
@@ -2917,6 +2939,7 @@ class ServerArgs:
 
         # Validate mm_process_config.
         self._handle_multimodal()
+        self._validate_mm_patch_budgets()
         # Validate SSL arguments early.
         self._handle_ssl_validation()
         # Validate transcription/ASR-specific server args.
@@ -3259,6 +3282,15 @@ class ServerArgs:
                     "Granian does not support SSL certificate hot-reloading. "
                     "Use Uvicorn (the default) or handle certificate rotation externally."
                 )
+
+    def _validate_mm_patch_budgets(self):
+        for name in (
+            "max_mm_patch_tokens_per_request",
+            "max_prefill_mm_patch_tokens",
+        ):
+            value = getattr(self, name)
+            if value is not None and value <= 0:
+                raise ValueError(f"--{name.replace('_', '-')} must be positive")
 
     def _handle_multimodal(self):
         """Validate mm_process_config structure before model loading."""
