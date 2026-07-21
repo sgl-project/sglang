@@ -43,6 +43,7 @@ if TYPE_CHECKING:
 
 try:
     from aiter import (
+        flash_attn_varlen_fp8_pertensor_func,
         flash_attn_varlen_func,
         get_mla_metadata_info_v1,
         get_mla_metadata_v1,
@@ -82,6 +83,15 @@ _use_mla_ps_kernel = get_bool_env_var("SGLANG_AITER_MLA_PERSIST", "True")
 # Use fp8 prefill only on gfx95
 _use_fp8_prefill_attn = (
     get_bool_env_var("SGLANG_AITER_FP8_PREFILL_ATTN", "True") and is_gfx95_supported()
+)
+
+# Route pure-prefill head-dim-256 attention (e.g. Qwen3.5) through aiter's
+# FMHA fp8 hd256 asm kernel (ROCm/aiter PR #3732) instead of the slower
+# CK mha_batch_prefill path. Opt-in and only active on gfx950; the fast-path
+# in forward_extend additionally restricts it to head_dim==256 with no cached
+# prefix, falling back to mha_batch_prefill_func otherwise.
+_use_fmha_fp8_hd256 = (
+    get_bool_env_var("SGLANG_AITER_FMHA_FP8_HD256", "False") and is_gfx95_supported()
 )
 
 # Persist
@@ -2320,6 +2330,62 @@ class AiterAttnBackend(AttentionBackend):
             window_size = (-1, -1)
             if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
                 window_size = (layer.sliding_window_size, -1)
+
+            # FMHA fp8 hd256 fast-path (ROCm/aiter PR #3732).
+            # Qwen3.5 (head_dim 256) otherwise runs the slow Triton / CK
+            # batch-prefill path. When opted in on gfx950, route pure prefill
+            # (no cached prefix, no sliding window) through aiter's hand-written
+            # hd256 fp8 asm kernel. q/k/v are cast directly to fp8 with identity
+            # (1.0) descales, matching the mla_fp8_prefill_attn convention used
+            # elsewhere in this file. All other shapes fall through to the
+            # mha_batch_prefill_func path below.
+            use_hd256_fastpath = False
+            if _use_fmha_fp8_hd256:
+                use_hd256_fastpath = (
+                    layer.qk_head_dim == 256
+                    and layer.v_head_dim == 256
+                    and window_size == (-1, -1)
+                    and not forward_batch.forward_mode.is_draft_extend_v2()
+                    and not any(forward_batch.extend_prefix_lens_cpu)
+                )
+
+            if use_hd256_fastpath:
+                cu_seqlens_q = self.qo_indptr[:bs0]
+                max_q_len = self.forward_metadata.max_q_len
+                one_scale = torch.ones((1,), dtype=torch.float32, device=q.device)
+                q_f8 = (
+                    q.contiguous()
+                    .view(-1, layer.tp_q_head_num, layer.head_dim)
+                    .to(fp8_dtype)
+                )
+                k_f8 = (
+                    k.contiguous()
+                    .view(-1, layer.tp_k_head_num, layer.head_dim)
+                    .to(fp8_dtype)
+                )
+                v_f8 = (
+                    v.contiguous()
+                    .view(-1, layer.tp_v_head_num, layer.head_dim)
+                    .to(fp8_dtype)
+                )
+                o = flash_attn_varlen_fp8_pertensor_func(
+                    q_f8,
+                    k_f8,
+                    v_f8,
+                    one_scale,
+                    one_scale,
+                    one_scale,
+                    cu_seqlens_q,
+                    cu_seqlens_q,
+                    max_q_len,
+                    max_q_len,
+                    causal=True,
+                    softmax_scale=layer.scaling,
+                    logits_soft_cap=self.logits_soft_cap,
+                )
+                if o.dtype != self.input_dtype:
+                    o = o.to(self.input_dtype)
+                return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
             if self.kv_cache_is_vectorized_5d:
                 return forward_extend_vectorized_5d(
