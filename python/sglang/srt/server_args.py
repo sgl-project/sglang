@@ -8370,19 +8370,18 @@ class PortArgs:
             dist_init_host = na.host
             dist_init_port = na.port
 
-            # We need 5 consecutive ports from port_base for:
-            # port_base, detokenizer, rpc, metrics, scheduler.
-            # In multi-node, all nodes derive ports independently from
-            # dist_init_port, so the derivation must be deterministic
-            # (no availability-based search). If incrementing would
-            # overflow the valid TCP range, decrement instead.
-            NUM_DERIVED_PORTS = 5
+            # Reserve port_base+0..NUM_DERIVED_PORTS-1 (6 fixed ports + dp_size
+            # rust-path slots); derive from server_args only (never dp_rank) so
+            # every init_new call agrees, decrementing below dist_init_port on
+            # overflow.
+            is_rust_server = envs.SGLANG_RUST_SERVER.get()
+            NUM_DERIVED_PORTS = 6 if not is_rust_server else 6 + server_args.dp_size
             if server_args.is_ep_scale_joiner:
                 port_base = server_args.port + ZMQ_TCP_PORT_DELTA
-                if port_base + NUM_DERIVED_PORTS > 65535:
+                if port_base + NUM_DERIVED_PORTS - 1 > 65535:
                     port_base = server_args.port - ZMQ_TCP_PORT_DELTA
             elif dist_init_port + NUM_DERIVED_PORTS > 65535:
-                port_base = dist_init_port - NUM_DERIVED_PORTS - 1
+                port_base = dist_init_port - NUM_DERIVED_PORTS
             else:
                 port_base = dist_init_port + 1
 
@@ -8393,13 +8392,10 @@ class PortArgs:
             if dp_rank is None:
                 # TokenizerManager to DataParallelController
                 scheduler_input_port = port_base + 4
-            elif worker_ports is None:
-                # Rust server path (SGLANG_RUST_SERVER + dp attention): there is no
-                # DataParallelController allocating worker ports, and the scheduler
-                # receives requests via the in-process ring — its input ZMQ socket
-                # is never bound or read. Derive a deterministic, per-dp-rank port
-                # (distinct, clear of the 5 derived ports above) so all nodes agree
-                # without a broadcast; it is never actually used.
+            elif worker_ports is None and is_rust_server:
+                # Rust server + dp attention: no DataParallelController allocates
+                # worker ports; use the reserved per-rank slot (never bound — the
+                # scheduler ingests via the in-process ring).
                 scheduler_input_port = port_base + 6 + dp_rank
             else:
                 scheduler_input_port = worker_ports[dp_rank]
