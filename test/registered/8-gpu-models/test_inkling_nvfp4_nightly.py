@@ -32,7 +32,7 @@ NVFP4_ARGS = [
 
 # gsm8k measured ~0.98 (temp 0, 300 examples); floored with margin for the
 # temperature=1.0 nightly config and FP4-kernel variance.
-GSM8K_BASELINE = 0.93
+GSM8K_BASELINE = 0.95
 
 
 class TestInklingNVFP4Nightly(unittest.TestCase):
