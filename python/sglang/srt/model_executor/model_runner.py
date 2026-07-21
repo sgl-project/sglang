@@ -537,6 +537,7 @@ class ModelRunner:
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             memory_pool_config=self.memory_pool_config,
+            draft_model_idx=self.draft_model_idx,
         )
 
     def init_mindspore_runner(self):
@@ -1551,7 +1552,6 @@ class ModelRunner:
         self.sampler.compute_logprobs_only(
             logits_output,
             forward_batch.sampling_info,
-            forward_batch.return_logprob,
             forward_batch.top_logprobs_nums,
             forward_batch.token_ids_logprobs,
         )
