@@ -126,6 +126,72 @@ from sglang.multimodal_gen.utils import dict_to_3d_list
 logger = init_logger(__name__)
 
 
+class _FullGraphRunner:
+    """Replays the whole DiT forward (incl. SP collectives) as one CUDA graph;
+    any tensor-signature change falls back to eager permanently."""
+
+    def __init__(self, model):
+        self.model = model
+        self.graph = None
+        self.static_kwargs = None
+        self.static_out = None
+        self.eager_left = 1
+        self.sig = None
+        self.disabled = False
+
+    @staticmethod
+    def _signature(kwargs):
+        return tuple(
+            (k, tuple(v.shape), str(v.dtype))
+            for k, v in sorted(kwargs.items())
+            if isinstance(v, torch.Tensor)
+        )
+
+    def run(self, kwargs):
+        if self.disabled:
+            return self.model(**kwargs)
+        sig = self._signature(kwargs)
+        if self.sig is not None and sig != self.sig:
+            self.disabled = True
+            logger.warning(
+                "DiT full CUDA graph: tensor signature changed, eager fallback"
+            )
+            return self.model(**kwargs)
+        if self.eager_left > 0:
+            self.eager_left -= 1
+            self.sig = sig
+            return self.model(**kwargs)
+        if self.graph is None:
+            try:
+                self.static_kwargs = {
+                    k: (v.clone() if isinstance(v, torch.Tensor) else v)
+                    for k, v in kwargs.items()
+                }
+                torch.cuda.synchronize()
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    self.static_out = self.model(**self.static_kwargs)
+                self.graph = graph
+                # capture records without executing; replay to produce this
+                # step's real output
+                self.graph.replay()
+                torch.cuda.synchronize()
+                logger.info("DiT full CUDA graph captured")
+                return self.static_out
+            except Exception:
+                logger.exception("DiT full CUDA graph capture failed, eager fallback")
+                self.graph = None
+                self.disabled = True
+                torch.cuda.synchronize()
+                return self.model(**kwargs)
+        for k, v in kwargs.items():
+            sv = self.static_kwargs.get(k)
+            if isinstance(sv, torch.Tensor) and isinstance(v, torch.Tensor):
+                sv.copy_(v, non_blocking=True)
+        self.graph.replay()
+        return self.static_out
+
+
 def _ensure_tensor_model_output(model_output):
     sample = getattr(model_output, "sample", None)
     if isinstance(sample, torch.Tensor):
@@ -2010,6 +2076,12 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         runner = self._maybe_get_bcg_runner(current_model)
         if runner is not None:
             model_output = self._bcg_run(runner, call_kwargs, current_model)
+        elif envs.SGLANG_DIFFUSION_DIT_FULL_CUDA_GRAPH and not self._bcg_is_warmup():
+            fcg = getattr(current_model, "_full_graph_runner", None)
+            if fcg is None:
+                fcg = _FullGraphRunner(current_model)
+                current_model._full_graph_runner = fcg
+            model_output = fcg.run(call_kwargs)
         else:
             model_output = current_model(**call_kwargs)
         return _ensure_tensor_model_output(model_output)
