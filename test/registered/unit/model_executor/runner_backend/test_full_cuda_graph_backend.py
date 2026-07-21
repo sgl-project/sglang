@@ -7,14 +7,15 @@ runner's torch profiler into the capture loop:
     capture and never touches a profiler (behavior-identical to before the PR).
   * When the runner exposes an active ``_profiler`` (``--enable-profile-cuda-graph``),
     ``capture_one`` calls ``profiler.step()`` past the two warmups and once after
-    the capture (schedule ``wait=2, warmup=0, active=1``), and wraps the captured
-    forward in a ``record_function`` named ``capture_{num_tokens}_{mode}``.
+    the capture (schedule ``wait=2, warmup=0, active=1``). The captured forward is
+    NOT wrapped in a ``record_function``; per-bs trace naming is handled by the
+    profiler's ``on_trace_ready`` callback instead.
   * The ``getattr`` guards mean a runner that sets the flag but has no
     ``_profiler`` attribute degrades gracefully (no stepping, no crash).
 
 The real capture path needs CUDA (``torch.cuda.CUDAGraph`` + device graph
 context), so those are mocked; the logic under test (call counts, ordering,
-record_function naming, profiler stepping) is pure-Python and runs on CPU.
+profiler stepping) is pure-Python and runs on CPU.
 """
 
 import contextlib
@@ -149,17 +150,11 @@ class TestCaptureOneWithProfiling(CustomTestCase):
         self.assertEqual(profiler.step.call_count, 3)
         self.assertEqual(forward_fn.call_count, 3)
 
-    def test_capture_wrapped_in_record_function_with_token_count(self):
+    def test_capture_not_wrapped_in_record_function(self):
+        # The capture forward is no longer wrapped in a record_function; per-bs
+        # trace naming is handled by the profiler's on_trace_ready callback.
         _, _, rf_names = self._run(size=4, num_tokens_per_bs=1, mode_name="DECODE")
-        # num_tokens = size * num_tokens_per_bs = 4 * 1.
-        self.assertEqual(rf_names, ["capture_4_DECODE"])
-
-    def test_record_function_name_uses_num_tokens_per_bs_and_mode(self):
-        # Speculative decode: num_tokens_per_bs > 1 and TARGET_VERIFY mode.
-        _, _, rf_names = self._run(
-            size=4, num_tokens_per_bs=2, mode_name="TARGET_VERIFY"
-        )
-        self.assertEqual(rf_names, ["capture_8_TARGET_VERIFY"])
+        self.assertEqual(rf_names, [])
 
 
 if __name__ == "__main__":
