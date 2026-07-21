@@ -832,6 +832,14 @@ class KimiK3MoE(nn.Module):
         _a2a_backend = get_moe_a2a_backend()
         self._ep_a2a = _a2a_backend.is_megamoe() or _a2a_backend.is_deepep()
 
+        # The flashinfer_mxfp4 (trtllm-gen) runner quantizes routed_input with
+        # the strided-input JIT group quant (_use_jit_mxfp8_quant in mxfp4.py),
+        # so the fused-front split view can be consumed as is; other runners
+        # (e.g. marlin) require a dense buffer.
+        self._moe_front_needs_contiguous = (
+            not get_moe_runner_backend().is_flashinfer_mxfp4()
+        )
+
         # Shared experts (operate in original hidden_size space).
         # Replicate the shared-expert weights (tp1, DSv2 convention) under EP
         # a2a: the block runs on partial batches (shard / DP-local rows), and
@@ -1161,8 +1169,9 @@ class KimiK3MoE(nn.Module):
             out=shared_output,
         )
 
-        # NOTE: Marlin need contiguous input; bs = 1 is already contiguous
-        if num_tokens > 1:
+        # NOTE: Marlin need contiguous input; bs = 1 is already contiguous.
+        # flashinfer_mxfp4 keeps the strided view (its quant reads strides).
+        if num_tokens > 1 and self._moe_front_needs_contiguous:
             routed_input = routed_input.contiguous()
         with zero_copy_context.set_moe_output(latent):
             expert_output = self.experts(routed_input, topk_output)
