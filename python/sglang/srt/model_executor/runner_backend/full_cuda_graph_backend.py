@@ -82,7 +82,7 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         self,
         shape_key: ShapeKey,
         forward_fn: Callable[[], Any],
-        dummies: Optional[Any] = None,
+        capture_inputs: Optional[Any] = None,
         post_warmup_hook: Optional[Callable[[], None]] = None,
     ) -> None:
         # When --enable-profile-cuda-graph is set, the runner created a torch
