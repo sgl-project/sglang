@@ -171,6 +171,23 @@ class TestInklingDetector(unittest.TestCase):
         self.assertEqual(json.loads(args_by_index[0]), {"city": "SF"})
         self.assertEqual(json.loads(args_by_index[1]), {"city": "NY"})
 
+    def test_streaming_text_then_tool_call_in_one_delta_emits_both(self):
+        """Bug regression: a delta carrying visible text followed by a complete
+        tool call emitted only the text and stranded the call in the buffer
+        (the drain loop stopped after the leading-text run), so a final such
+        delta dropped the call. The drain must continue past leading text."""
+        detector = InklingDetector()
+        source = (
+            "Sure, let me check.<|message_model|>weather<|content_invoke_tool_json|>"
+            '{"name":"weather","args":{"city":"SF"}}<|end_message|>'
+        )
+        result = detector.parse_streaming_increment(source, self.tools)
+        self.assertIn("Sure, let me check.", result.normal_text)
+        names = [c.name for c in result.calls if c.name]
+        self.assertEqual(names, ["weather"])
+        args = "".join(c.parameters for c in result.calls)
+        self.assertEqual(json.loads(args), {"city": "SF"})
+
     def test_streaming_rejection_does_not_collide_tool_indices(self):
         """Bug regression: a rejected mid-stream call reset current_tool_id to
         -1, so the NEXT valid call re-announced as tool_index 0 — colliding

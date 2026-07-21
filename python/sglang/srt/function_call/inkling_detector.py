@@ -107,12 +107,12 @@ class InklingDetector(BaseFormatDetector):
         all_calls: list[ToolCallItem] = []
         normal_parts: list[str] = []
         while True:
-            result, consumed = self._parse_buffered_increment(tools)
+            result, made_progress = self._parse_buffered_increment(tools)
             if result.normal_text:
                 normal_parts.append(result.normal_text)
             if result.calls:
                 all_calls.extend(result.calls)
-            if not consumed:
+            if not made_progress:
                 break
         return StreamingParseResult(
             normal_text="".join(normal_parts),
@@ -122,10 +122,12 @@ class InklingDetector(BaseFormatDetector):
     def _parse_buffered_increment(
         self, tools: List[Tool]
     ) -> tuple[StreamingParseResult, bool]:
-        # Parse at most one complete tool call from self._buffer. Returns
-        # (result, consumed); consumed is True only when a complete call was
-        # emitted and its remainder re-buffered, signalling the caller to try
-        # draining another complete call from the same delta.
+        # Parse one step from self._buffer: emit a leading text run or at most
+        # one complete tool call, and report whether the buffer advanced. The
+        # caller loops while progress is made, so a single delta carrying text
+        # plus several complete calls is fully drained at arrival instead of
+        # stranding the trailing calls in the buffer (there is no stream-end
+        # flush on this detector).
         current_text = self._buffer
 
         if self.bot_token not in current_text:
@@ -165,7 +167,9 @@ class InklingDetector(BaseFormatDetector):
             self._buffer = current_text[bot_pos:]
             normal_text = self._clean_normal_text(normal_text)
             if normal_text:
-                return StreamingParseResult(normal_text=normal_text), False
+                # Buffer advanced (prefix removed, tool call now at head) —
+                # keep draining so a text+call delta emits both, not just text.
+                return StreamingParseResult(normal_text=normal_text), True
             current_text = self._buffer
 
         if not hasattr(self, "_tool_indices"):
