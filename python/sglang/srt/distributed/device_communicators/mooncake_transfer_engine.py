@@ -346,5 +346,11 @@ def maybe_init_shared_mooncake_transfer_engine(
         )
 
         if server_args.elastic_ep_backend == "mooncake":
-            from mooncake.pg import set_transfer_engine
+            try:
+                from mooncake.pg import set_transfer_engine
+            except ImportError as e:
+                raise ImportError(
+                    "Failed to import 'mooncake.pg'. Please upgrade your 'mooncake' "
+                    "installation to a version that supports the ProcessGroup backend."
+                ) from e
             set_transfer_engine(_mooncake_transfer_engine.engine)
