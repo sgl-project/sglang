@@ -50,9 +50,7 @@ class InternViTCudaGraphRunner:
         first_layer = encoder.layers[0]
         # InternAttention wraps VisionAttention as first_layer.attn.attn
         self._attn: VisionAttention = first_layer.attn.attn  # type: ignore
-        self._attn_backend: str | None = getattr(
-            self._attn, "qkv_backend_name", None
-        )
+        self._attn_backend: str | None = getattr(self._attn, "qkv_backend_name", None)
 
     @property
     def device(self) -> torch.device:
