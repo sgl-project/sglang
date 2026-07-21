@@ -33,6 +33,24 @@ class RemoteInstanceWeightTransporter:
         return self.get_model()
 
     def init_engine(self):
+        """Initialize the Mooncake ``TransferEngine`` for remote-instance P2P
+        weight loading.
+
+        ``MOONCAKE_DEVICE`` selects the RDMA NIC(s) for the transfer and accepts
+        either:
+
+        * a shared spec applied to every rank, e.g. ``"mlx5_0"`` or
+          ``"mlx5_0,mlx5_1"``; or
+        * a per-GPU mapping so each TP rank binds to its NUMA-local NIC, given
+          as inline JSON ``{"0": "mlx5_0", "1": "mlx5_1"}`` or a path to a
+          ``.json`` file with the same mapping.
+
+        The per-GPU device is resolved here and passed to
+        ``TransferEngine.initialize()``. Under the TENT runtime it reaches
+        ``topology/rdma_whitelist`` (deterministic per-rank NIC binding); with
+        the classic engine the device filter is honored directly. When
+        ``MOONCAKE_DEVICE`` is unset, the engine auto-selects NICs.
+        """
         try:
             from mooncake.engine import TransferEngine
         except ImportError:
@@ -42,11 +60,19 @@ class RemoteInstanceWeightTransporter:
             return
         self.engine = TransferEngine()
         local_ip = get_local_ip_auto()
+        from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
+            get_ib_devices_for_gpu,
+        )
+
+        ib_device = (
+            get_ib_devices_for_gpu(envs.MOONCAKE_DEVICE.get(), self.gpu_id)
+            or envs.MOONCAKE_DEVICE.get()
+        )
         self.engine.initialize(
             local_ip,
             "P2PHANDSHAKE",
             envs.MOONCAKE_PROTOCOL.get(),
-            envs.MOONCAKE_DEVICE.get(),
+            ib_device,
         )
         self.session_id = NetworkAddress(
             local_ip, self.engine.get_rpc_port()
