@@ -36,6 +36,22 @@ if _use_aiter:
     from aiter.ops.shuffle import shuffle_weight
     from aiter.utility.fp4_utils import e8m0_shuffle
 
+    try:
+        from aiter.ops.shuffle import (
+            shuffle_scale_a16w4_sep_fp4,
+            shuffle_weight_a16w4_sep_fp4,
+        )
+    except ImportError:
+        shuffle_scale_a16w4_sep_fp4 = shuffle_weight_a16w4_sep_fp4 = None
+
+    try:
+        from aiter.ops.shuffle import (
+            shuffle_scale_a16w4_gui_fp4,
+            shuffle_weight_a16w4_gui_fp4,
+        )
+    except ImportError:
+        shuffle_scale_a16w4_gui_fp4 = shuffle_weight_a16w4_gui_fp4 = None
+
 if _is_hip:
     from aiter.ops.triton.quant import dynamic_mxfp4_quant
 else:
@@ -218,6 +234,69 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
         return online_mxfp4_moe_weight_loader
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        from sglang.srt.environ import envs
+
+        _use_a16w4 = (
+            _use_aiter
+            and _is_shuffle_moe_mxfp4
+            and envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
+            and shuffle_weight_a16w4_sep_fp4 is not None
+        )
+
+        if _use_a16w4:
+            # a16w4 (bf16 activations + fp4 weights): the fp4_bf16 FlyDSL kernels use
+            # the klane-inner preshuffle layout. w13 is gate|up-concat (as loaded).
+            #   - SEPARATED (default): both stages use sep_fp4 klane-inner layout.
+            #   - INTERLEAVE (AITER_FP4BF16_USE_ITLV=1): w13 uses the gui_fp4 layout
+            #     (gate/up interleaved at 16-block + klane-inner) for the faster `_gui`
+            #     stage1 kernel; w2 (stage2) always stays sep_fp4 (stage2 is separated).
+            import os
+
+            _use_itlv = (
+                os.environ.get("AITER_FP4BF16_USE_ITLV", "0").lower()
+                in ("1", "true", "yes", "on")
+                and shuffle_weight_a16w4_gui_fp4 is not None
+            )
+            _w13_wshuf = (
+                shuffle_weight_a16w4_gui_fp4
+                if _use_itlv
+                else shuffle_weight_a16w4_sep_fp4
+            )
+            _w13_sshuf = (
+                shuffle_scale_a16w4_gui_fp4
+                if _use_itlv
+                else shuffle_scale_a16w4_sep_fp4
+            )
+            logger.info(
+                "[quark a16w4] w13 shuffle = %s (INTERLEAVE=%s), w2 = sep_fp4",
+                "gui_fp4" if _use_itlv else "sep_fp4",
+                bool(_use_itlv),
+            )
+            E = layer.w13_weight.shape[0]
+
+            s0, s1, _ = layer.w13_weight_scale.shape
+            layer.w13_weight_scale.data = _w13_sshuf(
+                layer.w13_weight_scale.view(s0 * s1, -1), E
+            ).view(s0, s1, -1)
+            s0, s1, _ = layer.w2_weight_scale.shape
+            layer.w2_weight_scale.data = shuffle_scale_a16w4_sep_fp4(
+                layer.w2_weight_scale.view(s0 * s1, -1), E
+            ).view(s0, s1, -1)
+
+            layer.w13_weight.data = _w13_wshuf(layer.w13_weight.contiguous())
+            layer.w2_weight.data = shuffle_weight_a16w4_sep_fp4(
+                layer.w2_weight.contiguous()
+            )
+            layer.w13_weight.is_shuffled = True
+            layer.w2_weight.is_shuffled = True
+            layer.w13_weight.is_guinterleave = True
+
+            if hasattr(layer, "dispatcher"):
+                layer.dispatcher.set_quant_config(
+                    {"weight_dtype": torch.float4_e2m1fn_x2}
+                )
+            return
+
         # Pre-shuffle weight scales
         s0, s1, _ = layer.w13_weight_scale.shape
         w13_weight_scale = layer.w13_weight_scale.view(s0 * s1, -1)
