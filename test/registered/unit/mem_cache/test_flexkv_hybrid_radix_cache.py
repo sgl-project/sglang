@@ -1,7 +1,7 @@
 import importlib.util
 import sys
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -53,3 +53,19 @@ def test_pool_accounting_delegates_to_inner_cache():
     assert cache.protected_size() == 640
     assert cache.full_protected_size() == 512
     assert cache.swa_protected_size() == 128
+
+
+def test_restored_swa_tail_marks_older_prefix_as_evicted_before_cache_insert():
+    inner = MagicMock()
+    cache = FlexKVHybridRadixCache.__new__(FlexKVHybridRadixCache)
+    cache._inner_cache = inner
+    req = SimpleNamespace(
+        kv=SimpleNamespace(swa_evicted_seqlen=0),
+        _flexkv_swa_evicted_seqlen=10240,
+    )
+
+    cache.cache_unfinished_req(req)
+
+    assert req.kv.swa_evicted_seqlen == 10240
+    assert not hasattr(req, "_flexkv_swa_evicted_seqlen")
+    inner.cache_unfinished_req.assert_called_once_with(req)

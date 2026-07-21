@@ -168,6 +168,16 @@ class FlexKVHybridRadixCache(BasePrefixCache):
             self.token_to_kv_pool_allocator.free(device_indices[loaded:])
             device_indices = device_indices[:loaded]
 
+        if (
+            self.supports_swa()
+            and self.page_size > 1
+            and hasattr(self.token_to_kv_pool_allocator, "alloc_extend_swa_tail")
+            and device_indices.numel() > 0
+        ):
+            restored_end = int(req.prefix_indices.numel() + device_indices.numel())
+            swa_tail_length = min(self.page_size, int(device_indices.numel()))
+            req._flexkv_swa_evicted_seqlen = restored_end - swa_tail_length
+
         # The restored tail is request-owned until the normal cache completion
         # path inserts it. Preserve the pre-restore protection boundary so the
         # inner cache can deduplicate or free every restored slot correctly.
@@ -275,6 +285,7 @@ class FlexKVHybridRadixCache(BasePrefixCache):
         )
 
     def cache_finished_req(self, req: Req, is_insert: bool = True, **kwargs) -> None:
+        self._apply_restore_swa_boundary(req)
         kv_length = int(kwargs.get("kv_len_to_handle", req.kv_committed_len))
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_length]
         self._inner_cache.cache_finished_req(req, is_insert=is_insert, **kwargs)
@@ -316,8 +327,17 @@ class FlexKVHybridRadixCache(BasePrefixCache):
             )
 
     def cache_unfinished_req(self, req: Req, **kwargs) -> None:
+        self._apply_restore_swa_boundary(req)
         self._inner_cache.cache_unfinished_req(req, **kwargs)
         req._flexkv_uncached_restore = False
+
+    @staticmethod
+    def _apply_restore_swa_boundary(req: Req) -> None:
+        boundary = getattr(req, "_flexkv_swa_evicted_seqlen", None)
+        if boundary is None or req.kv is None:
+            return
+        req.kv.swa_evicted_seqlen = max(req.kv.swa_evicted_seqlen, boundary)
+        del req._flexkv_swa_evicted_seqlen
 
     def evict(self, params: EvictParams) -> EvictResult:
         self._drain_completed_stores()
