@@ -61,6 +61,32 @@ class LogprobResult:
             )
 
 
+def compute_row_logsumexp(
+    logits: torch.Tensor, vocab_slice_size: int = 32768
+) -> torch.Tensor:
+    """Per-row logsumexp in fp32 without materializing a full-vocab fp32 copy.
+
+    CUDA uses a single-pass online kernel (one read of the logits). Elsewhere,
+    low-precision logits are upcast one vocab slice at a time, so the peak
+    transient is [rows, vocab_slice_size] fp32 rather than [rows, vocab].
+    """
+    if logits.is_cuda:
+        try:
+            from sglang.srt.layers.logsumexp import row_logsumexp
+
+            return row_logsumexp(logits)
+        except ImportError:
+            pass
+    vocab_size = logits.shape[-1]
+    if logits.dtype == torch.float32 or vocab_size <= vocab_slice_size:
+        return torch.logsumexp(logits.float(), dim=-1)
+    partials = [
+        torch.logsumexp(logits[:, s : s + vocab_slice_size].float(), dim=-1)
+        for s in range(0, vocab_size, vocab_slice_size)
+    ]
+    return torch.logsumexp(torch.stack(partials, dim=-1), dim=-1)
+
+
 def get_top_logprobs_raw(
     logprobs: torch.Tensor,
     top_logprobs_nums: List[int],
@@ -170,16 +196,20 @@ def get_top_logprobs_chunk(
     top_logprobs_val: List,
     top_logprobs_idx: List,
     split_pruned_len: int,
+    log_normalizer: Optional[torch.Tensor] = None,
 ) -> int:
     """Get top-k logprobs for each sequence in the chunk.
 
     Args:
-        logprobs: Log probabilities tensor of shape [seq_len, vocab_size]
+        logprobs: Log probabilities tensor of shape [seq_len, vocab_size].
+            With ``log_normalizer`` set, raw logits instead; top-k runs on the
+            logits (same order) and values are normalized by subtraction.
         top_k_nums: List of top-k numbers for each sequence
         pruned_lens: List of pruned lengths for each sequence
         top_logprobs_val: List to store top-k logprob values
         top_logprobs_idx: List to store top-k token indices
         split_pruned_len: Length of pruned tokens from previous chunk
+        log_normalizer: Per-row logsumexp of the logits, shape [seq_len]
 
     Returns:
         int: Number of remaining tokens to process in next chunk
@@ -187,7 +217,10 @@ def get_top_logprobs_chunk(
     # Empty chunks still walk the slice to emit placeholder entries.
     max_k = max(top_k_nums)
     ret = logprobs.topk(max_k, dim=1)
-    values = ret.values.tolist()
+    values_tensor = ret.values
+    if log_normalizer is not None:
+        values_tensor = values_tensor.float() - log_normalizer[:, None]
+    values = values_tensor.tolist()
     indices = ret.indices.tolist()
 
     pt = 0
@@ -240,16 +273,20 @@ def get_token_ids_logprobs_chunk(
     token_ids_logprobs_val: List,
     token_ids_logprobs_idx: List,
     split_pruned_len: int = 0,
+    log_normalizer: Optional[torch.Tensor] = None,
 ):
     """Get token_ids logprobs for each sequence in the chunk.
 
     Args:
-        logprobs: Log probabilities tensor of shape [seq_len, vocab_size]
+        logprobs: Log probabilities tensor of shape [seq_len, vocab_size].
+            With ``log_normalizer`` set, raw logits instead; gathered rows are
+            normalized by subtraction.
         token_ids_logprobs: List of token IDs for each sequence
         pruned_lens: List of pruned lengths for each sequence
         token_ids_logprobs_val: List to store token logprob values
         token_ids_logprobs_idx: List to store token indices
         split_pruned_len: Length of pruned tokens from previous chunk
+        log_normalizer: Per-row logsumexp of the logits, shape [seq_len]
 
     Returns:
         int: Number of remaining tokens to process in next chunk
@@ -285,7 +322,10 @@ def get_token_ids_logprobs_chunk(
                 next_split_pruned_len = split_pruned_len + j
                 break
             if token_ids is not None:
-                val.append(logprobs[pt + j, token_ids].tolist())
+                row = logprobs[pt + j, token_ids]
+                if log_normalizer is not None:
+                    row = row.float() - log_normalizer[pt + j]
+                val.append(row.tolist())
                 idx.append(token_ids)
 
         # Split-sequence continuations extend; everyone else owns a fresh
@@ -379,6 +419,9 @@ class InputLogprobProcessor:
         self.enable_logprobs_chunk = envs.SGLANG_ENABLE_LOGPROB_CHUNK.get()
         # chunk size for logprobs processing
         self.logprobs_chunk_size = envs.SGLANG_LOGPROB_CHUNK_SIZE.get()
+        # compute logprobs from logits + logsumexp, skipping the full-vocab
+        # log-softmax materialization
+        self.enable_fast_input_logprobs = envs.SGLANG_ENABLE_FAST_INPUT_LOGPROBS.get()
 
     def forward(
         self,
@@ -496,12 +539,19 @@ class InputLogprobProcessor:
                 sampled_logits[chunk_sample_mask] = chunk_logits[chunk_sample_indices]
 
             # Zero-logprob-row chunks still need the per-sequence bookkeeping below.
-            # Compute the logprobs of the chunk. Free the raw logits before the
-            # out-of-place log_softmax: keeping all three alive is a 3x peak,
-            # which OOMs when the single chunk covers a large batch.
             chunk_logprobs = chunk_logits[chunk_indices]
             del chunk_logits
-            chunk_logprobs = torch.nn.functional.log_softmax(chunk_logprobs, dim=-1)
+            if self.enable_fast_input_logprobs:
+                # Every consumer below needs only small gathers / top-k plus a
+                # per-row normalizer, so keep the raw logits and skip the
+                # full-vocab log-softmax materialization entirely.
+                chunk_log_normalizer = compute_row_logsumexp(chunk_logprobs)
+            else:
+                # Free the raw logits before the out-of-place log_softmax:
+                # keeping all three alive is a 3x peak, which OOMs when the
+                # single chunk covers a large batch.
+                chunk_log_normalizer = None
+                chunk_logprobs = torch.nn.functional.log_softmax(chunk_logprobs, dim=-1)
 
             # End at the last row inside the chunk; token_to_seq_idx[end_idx]
             # belongs to the next chunk and would emit its sequence twice.
@@ -522,6 +572,7 @@ class InputLogprobProcessor:
                     top_logprobs_val,
                     top_logprobs_idx,
                     split_len_topk,
+                    log_normalizer=chunk_log_normalizer,
                 )
 
             # Get the logprob of given token id
@@ -537,6 +588,7 @@ class InputLogprobProcessor:
                     token_ids_logprobs_val,
                     token_ids_logprobs_idx,
                     split_len_token_ids,
+                    log_normalizer=chunk_log_normalizer,
                 )
 
             # Get the logprob of the requested token ids
@@ -544,6 +596,10 @@ class InputLogprobProcessor:
                 torch.arange(chunk_logprobs.shape[0], device=chunk_logprobs.device),
                 logits_metadata.extend_input_logprob_token_ids_gpu[mask_indices],
             ]
+            if chunk_log_normalizer is not None:
+                chunk_token_logprobs = (
+                    chunk_token_logprobs.float() - chunk_log_normalizer
+                )
             token_logprobs.append(chunk_token_logprobs)
             # Free before the next chunk's logits (bf16 + fp32) materialize.
             del chunk_logprobs

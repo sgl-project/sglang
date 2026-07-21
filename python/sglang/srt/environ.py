@@ -841,6 +841,10 @@ class Envs:
     SGLANG_LOGPROB_CHUNK_SIZE = EnvIntWithAlias(
         2048, deprecated_name="SGLANG_LOGITS_PROCESSER_CHUNK_SIZE"
     )
+    # Compute input logprobs from logits via per-row logsumexp instead of
+    # materializing the full-vocab log-softmax. Escape hatch only; the two
+    # paths are mathematically identical.
+    SGLANG_ENABLE_FAST_INPUT_LOGPROBS = EnvBool(True)
 
     # Tool-Call behavior
     SGLANG_TOOL_STRICT_LEVEL = EnvInt(ToolStrictLevel.OFF)
