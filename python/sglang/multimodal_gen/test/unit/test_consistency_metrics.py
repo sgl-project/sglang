@@ -62,9 +62,9 @@ def test_remote_video_gt_candidates_survive_inconclusive_probe(monkeypatch):
     )
 
     assert [filename for filename, _ in files] == [
-        "unit_video_1gpu_frame_0.png",
-        "unit_video_1gpu_frame_mid.png",
-        "unit_video_1gpu_frame_last.png",
+        "h100/unit_video_1gpu_frame_0.png",
+        "h100/unit_video_1gpu_frame_mid.png",
+        "h100/unit_video_1gpu_frame_last.png",
     ]
 
 
@@ -87,10 +87,10 @@ def test_remote_image_gt_prefers_official_when_present(monkeypatch):
 
     assert files == [
         (
-            expected_filename,
+            f"h100/{expected_filename}",
             (
                 f"{test_utils.SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_BASE}"
-                f"/{expected_filename}"
+                f"/h100/{expected_filename}"
             ),
         )
     ]
@@ -116,10 +116,10 @@ def test_remote_image_gt_ignores_unmapped_official_file(monkeypatch):
 
     assert files == [
         (
-            expected_filename,
+            f"h100/{expected_filename}",
             (
                 f"{test_utils.SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE}"
-                f"/{expected_filename}"
+                f"/h100/{expected_filename}"
             ),
         )
     ]
@@ -141,24 +141,24 @@ def test_remote_video_gt_ignores_unmapped_official_files(monkeypatch):
 
     assert files == [
         (
-            f"{case_id}_2gpu_frame_0.png",
+            f"h100/{case_id}_2gpu_frame_0.png",
             (
                 f"{test_utils.SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE}"
-                f"/{case_id}_2gpu_frame_0.png"
+                f"/h100/{case_id}_2gpu_frame_0.png"
             ),
         ),
         (
-            f"{case_id}_2gpu_frame_mid.png",
+            f"h100/{case_id}_2gpu_frame_mid.png",
             (
                 f"{test_utils.SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE}"
-                f"/{case_id}_2gpu_frame_mid.png"
+                f"/h100/{case_id}_2gpu_frame_mid.png"
             ),
         ),
         (
-            f"{case_id}_2gpu_frame_last.png",
+            f"h100/{case_id}_2gpu_frame_last.png",
             (
                 f"{test_utils.SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE}"
-                f"/{case_id}_2gpu_frame_last.png"
+                f"/h100/{case_id}_2gpu_frame_last.png"
             ),
         ),
     ]
@@ -178,7 +178,10 @@ def test_ltx_hq_remote_gt_uses_sglang_generated_when_official_declared(monkeypat
     files = test_utils._find_remote_consistency_gt_files(case_id, 1, is_video=True)
 
     assert files == [
-        (filename, f"{test_utils.SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE}/{filename}")
+        (
+            f"h100/{filename}",
+            f"{test_utils.SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE}/h100/{filename}",
+        )
         for filename in filenames
     ]
 
@@ -201,10 +204,10 @@ def test_remote_image_gt_falls_back_to_sglang_when_official_missing(monkeypatch)
 
     assert files == [
         (
-            expected_filename,
+            f"h100/{expected_filename}",
             (
                 f"{test_utils.SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE}"
-                f"/{expected_filename}"
+                f"/h100/{expected_filename}"
             ),
         )
     ]
@@ -230,10 +233,10 @@ def test_remote_image_gt_skips_official_for_quarantined_case(monkeypatch):
 
     assert files == [
         (
-            expected_filename,
+            f"h100/{expected_filename}",
             (
                 f"{test_utils.SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE}"
-                f"/{expected_filename}"
+                f"/h100/{expected_filename}"
             ),
         )
     ]
@@ -306,24 +309,24 @@ def test_remote_video_gt_skips_official_for_quarantined_case(monkeypatch):
 
     assert files == [
         (
-            f"{case_id}_2gpu_frame_0.png",
+            f"h100/{case_id}_2gpu_frame_0.png",
             (
                 f"{test_utils.SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE}"
-                f"/{case_id}_2gpu_frame_0.png"
+                f"/h100/{case_id}_2gpu_frame_0.png"
             ),
         ),
         (
-            f"{case_id}_2gpu_frame_mid.png",
+            f"h100/{case_id}_2gpu_frame_mid.png",
             (
                 f"{test_utils.SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE}"
-                f"/{case_id}_2gpu_frame_mid.png"
+                f"/h100/{case_id}_2gpu_frame_mid.png"
             ),
         ),
         (
-            f"{case_id}_2gpu_frame_last.png",
+            f"h100/{case_id}_2gpu_frame_last.png",
             (
                 f"{test_utils.SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE}"
-                f"/{case_id}_2gpu_frame_last.png"
+                f"/h100/{case_id}_2gpu_frame_last.png"
             ),
         ),
     ]
@@ -374,6 +377,70 @@ def test_platform_gt_candidates_prefer_platform_then_default(monkeypatch):
         "unit_image_1gpu.png",
         "unit_image_1gpu.jpg",
         "unit_image_1gpu.webp",
+    ]
+
+
+def test_h100_gt_candidates_prefer_platform_then_default(monkeypatch):
+    monkeypatch.setenv(test_utils.CONSISTENCY_PLATFORM_ENV, "h100")
+
+    assert test_utils.get_consistency_gt_candidates(
+        "unit_image",
+        1,
+        is_video=False,
+        output_format="png",
+    ) == [
+        "h100/unit_image_1gpu.png",
+        "h100/unit_image_1gpu.jpg",
+        "h100/unit_image_1gpu.webp",
+        "unit_image_1gpu.png",
+        "unit_image_1gpu.jpg",
+        "unit_image_1gpu.webp",
+    ]
+
+
+def test_consistency_gt_case_alias_reuses_canonical_filename(monkeypatch):
+    monkeypatch.setenv(test_utils.CONSISTENCY_PLATFORM_ENV, "h100")
+
+    assert test_utils.get_consistency_gt_candidates(
+        "fsdp-inference",
+        2,
+        is_video=False,
+        output_format=None,
+    )[:3] == [
+        "h100/zimage_image_t2i_2_gpus_2gpu.jpg",
+        "h100/zimage_image_t2i_2_gpus_2gpu.png",
+        "h100/zimage_image_t2i_2_gpus_2gpu.webp",
+    ]
+
+
+def test_action_gt_candidates_prefer_platform_then_default(monkeypatch):
+    monkeypatch.setenv(test_utils.CONSISTENCY_PLATFORM_ENV, "h100")
+
+    assert test_utils.get_action_consistency_gt_candidates("unit_action", 1) == [
+        "h100/unit_action_1gpu.json",
+        "unit_action_1gpu.json",
+    ]
+
+
+def test_remote_action_gt_uses_sglang_generated(monkeypatch):
+    monkeypatch.setenv(test_utils.CONSISTENCY_PLATFORM_ENV, "h100")
+    sglang_prefix = test_utils.SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE + "/"
+    monkeypatch.setattr(
+        test_utils,
+        "_remote_file_exists",
+        lambda url: url.startswith(sglang_prefix),
+    )
+
+    files = test_utils._find_remote_action_consistency_gt_files("unit_action", 1)
+
+    assert files == [
+        (
+            "h100/unit_action_1gpu.json",
+            (
+                f"{test_utils.SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE}"
+                "/h100/unit_action_1gpu.json"
+            ),
+        )
     ]
 
 
