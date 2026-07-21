@@ -1853,9 +1853,6 @@ class DeepseekV4AttnBackend(
         )
         kv = workspace
 
-        # The XPU op only returns (out, max_logits, lse) when
-        # ``return_softmax_lse`` is set; CUDA returns the 3-tuple by default.
-        extra_kwargs = {"return_softmax_lse": True} if _is_xpu else {}
         o, _, _ = flash_mla_sparse_fwd(
             q=q_flat,
             kv=kv,
@@ -1864,7 +1861,6 @@ class DeepseekV4AttnBackend(
             d_v=self.head_dim_v,
             attn_sink=attn_sink,
             topk_length=combined_lens,
-            **extra_kwargs,
         )
         return o
 
