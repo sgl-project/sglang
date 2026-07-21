@@ -498,14 +498,16 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
     if (
         server_args.speculative_algorithm == "STANDALONE"
         and resolved_view(server_args).enable_dp_attention
-        and server_args.speculative_eagle_topk is not None
-        and int(server_args.speculative_eagle_topk) > 1
     ):
-        raise ValueError(
-            "STANDALONE speculative decoding with DP attention currently supports "
-            "only chain draft (--speculative-eagle-topk 1); tree draft (topk > 1) "
-            "under DP attention is not validated yet."
-        )
+        if (
+            server_args.speculative_eagle_topk is not None
+            and int(server_args.speculative_eagle_topk) > 1
+        ):
+            raise ValueError("STANDALONE with DP attention requires topk=1.")
+        if server_args.dp_size != server_args.tp_size:
+            raise ValueError(
+                "STANDALONE with DP attention requires dp_size == tp_size (attn_tp_size=1)."
+            )
 
     if server_args.max_running_requests is None:
         server_args.max_running_requests = 48
