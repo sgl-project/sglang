@@ -132,7 +132,7 @@ The following system-level tuning steps reduce OS interference and improve CPU s
     </tr>
     <tr>
       <td>`DEEP_NORMAL_MODE_USE_INT8_QUANT`</td>
-      <td>When set to `1`, quantizes intermediate activations to INT8 in the DeepEP dispatch operator, reducing communication volume during MoE dispatch. This is most beneficial for large-scale multi-node prefill with many tokens. The trade-off is a small accuracy impact from quantization and additional compute for the quantize/dequantize operations.</td>
+      <td>**DEPRECATED**; When set to `1`, quantizes intermediate activations to INT8 in the DeepEP dispatch operator, reducing communication volume during MoE dispatch. This is most beneficial for large-scale multi-node prefill with many tokens. The trade-off is a small accuracy impact from quantization and additional compute for the quantize/dequantize operations.</td>
       <td>Prefill: `1`</td>
     </tr>
     <tr>

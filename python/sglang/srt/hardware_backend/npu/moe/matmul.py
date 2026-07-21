@@ -22,17 +22,16 @@ class BaseMatmul(ABC):
 class GroupedMatmul(BaseMatmul):
     def forward(
         self,
-        layer: torch.nn.Module,
+        quant_info_or_layer,
         weight_prefix: str,
         hidden_states: torch.Tensor,
         expert_tokens: torch.Tensor,
         output_dtype: torch.dtype,
         group_list_type: int,
-        transposed: bool,
+        transposed: bool = True,
         **scale_args,
     ) -> torch.Tensor:
-        # Access the weight attribute directly from the layer
-        weight = getattr(layer, f"{weight_prefix}_weight", None)
+        weight = getattr(quant_info_or_layer, f"{weight_prefix}_weight", None)
         if weight is None:
             raise AttributeError(
                 f"Weight attribute '{weight_prefix}_weight' not found in layer"

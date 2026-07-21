@@ -21,9 +21,12 @@ from sglang.srt.layers.quantization.modelslim.schemes import (
     ModelSlimMXFP8Scheme,
     ModelSlimW4A4Int4,
     ModelSlimW4A4Int4MoE,
+    ModelSlimW4A4Mxfp4MoE,
     ModelSlimW4A8Int8MoE,
+    ModelSlimW4A8Mxfp4MoE,
     ModelSlimW8A8Int8,
     ModelSlimW8A8Int8MoE,
+    ModelSlimW8A8Mxfp8MoE,
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.utils import apply_module_patch
@@ -237,7 +240,10 @@ class ModelSlimConfig(QuantizationConfig):
         moe_quant_schemes = [
             ("W4A4_DYNAMIC", ModelSlimW4A4Int4MoE),
             ("W4A8_DYNAMIC", ModelSlimW4A8Int8MoE),
+            ("W4A8_MXFP", ModelSlimW4A8Mxfp4MoE),
             ("W8A8_DYNAMIC", ModelSlimW8A8Int8MoE),
+            ("W4A4_MXFP4", ModelSlimW4A4Mxfp4MoE),
+            ("W8A8_MXFP8", ModelSlimW8A8Mxfp8MoE),
         ]
 
         # Try multiple naming conventions:
@@ -479,8 +485,8 @@ class ModelSlimFusedMoEMethod(FusedMoEMethodBase):
             w2_weight=layer.w2_weight,
             w13_weight_scale=layer.w13_weight_scale,
             w2_weight_scale=layer.w2_weight_scale,
-            w13_weight_offset=layer.w13_weight_offset,
-            w2_weight_offset=layer.w2_weight_offset,
+            w13_weight_offset=getattr(layer, "w13_weight_offset", None),
+            w2_weight_offset=getattr(layer, "w2_weight_offset", None),
             w13_scale_bias=getattr(layer, "w13_scale_bias", None),
             w2_scale_bias=getattr(layer, "w2_scale_bias", None),
             w13_weight_bias=getattr(layer, "w13_weight_bias", None),

@@ -188,6 +188,14 @@ QUANTIZATION_CHOICES = [
     "humming",
 ]
 
+# Online quantization methods supported by Ascend MoE.
+ONLINE_QUANTIZATION_CHOICES = [
+    "w8a8_int8",
+    "w8a8_mxfp8",
+    "w4a8_mxfp4",
+    "w4a4_mxfp4",
+]
+
 
 SPECULATIVE_DRAFT_MODEL_QUANTIZATION_CHOICES = QUANTIZATION_CHOICES
 
@@ -358,6 +366,10 @@ def add_load_format_choices(choices):
 
 def add_quantization_method_choices(choices):
     QUANTIZATION_CHOICES.extend(choices)
+
+
+def add_online_quantization_method_choices(choices):
+    ONLINE_QUANTIZATION_CHOICES.extend(choices)
 
 
 def add_attention_backend_choices(choices):
@@ -586,6 +598,14 @@ class ServerArgs:
         Arg(
             help="The quantization method.",
             choices=QUANTIZATION_CHOICES,
+            resolvable=True,
+        ),
+    ] = None
+    online_quantization: A[
+        Optional[str],
+        Arg(
+            help="The online quantization method.",
+            choices=ONLINE_QUANTIZATION_CHOICES,
             resolvable=True,
         ),
     ] = None
@@ -1964,7 +1984,16 @@ class ServerArgs:
         "Select the mode when enable Ascend FuseEP MoE, 1 -> dispatch_gmm_combine_decode is executed；2 -> dispatch_ffn_combine is executed (support hybrid deployment when 2).",
     ] = 2
     deepep_dispatcher_output_dtype: A[
-        Literal["auto", "bf16", "fp8", "int8", "nvfp4"],
+        Literal[
+            "auto",
+            "bf16",
+            "int8",
+            "fp8",
+            "mxfp8_e4m3fn",
+            "mxfp8_e5m2",
+            "mxfp4_e2m1fn_x2",
+            "nvfp4",
+        ],
         "Select DeepEP dispatcher output dtype",
     ] = "auto"
     ep_num_redundant_experts: A[

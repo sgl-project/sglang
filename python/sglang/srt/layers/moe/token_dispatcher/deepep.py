@@ -418,42 +418,81 @@ class _DeepEPDispatcherImplBase:
         self.set_deepep_dispatcher_dtype()
 
     def set_deepep_dispatcher_dtype(self) -> None:
+        # 1. Resolve the initial desired output dtype
         self.deepep_output_dtype = get_deepep_output_dtype(self)
 
-        # Configuration mapping for each dtype
-        config_map = {
-            DispatcherOutputDtype.BF16: {
-                "use_fp8": False,
-                "use_nvfp4": False,
-            },
-            DispatcherOutputDtype.FP8: {
-                "use_fp8": True,
-                "use_nvfp4": False,
-            },
-            # Needed for Ascend A2/A3 NPU case,
-            # despite the use_fp8 flag,
-            # quantization will be performed in int8
-            DispatcherOutputDtype.INT8: {
-                "use_fp8": True,
-                "use_nvfp4": False,
-            },
-            DispatcherOutputDtype.NVFP4: {
-                "use_fp8": False,
-                "use_nvfp4": True,
-            },
-        }
-
-        # Validate and apply hardware-specific adjustments
+        # 2. Validate and adjust dtype according to hardware capabilities
         self._validate_and_adjust_dtype()
 
-        # Apply configuration
-        config = config_map[self.deepep_output_dtype]
-        self.use_fp8 = config["use_fp8"]
-        self.use_nvfp4 = config["use_nvfp4"]
+        # 3. Always set use_fp8 / use_nvfp4 / fp8_configs
+        self._apply_low_latency_quantization_flags()
 
-        # Handle environment variables
-        if _is_npu:
-            self._update_int8_quant_env()
+        # 4. NPU quant tensor for normal dispatch (only on Ascend)
+        if _is_npu and (self.deepep_mode.enable_normal()):
+            self.npu_quant_tensor = self._get_npu_normal_quant_tensor()
+        else:
+            self.npu_quant_tensor = None
+
+    def _apply_low_latency_quantization_flags(self) -> None:
+        """Set use_fp8, use_nvfp4, and fp8_configs from the resolved output dtype."""
+        dtype = self.deepep_output_dtype
+        self.fp8_configs = dict()
+
+        if dtype == DispatcherOutputDtype.BF16:
+            self.use_fp8 = False
+            self.use_nvfp4 = False
+        elif dtype == DispatcherOutputDtype.FP8:
+            self.use_fp8 = True
+            self.use_nvfp4 = False
+            self.fp8_configs = dict(
+                round_scale=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+                and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
+                use_ue8m0=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+                and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
+            )
+        elif dtype == DispatcherOutputDtype.INT8:
+            self.use_fp8 = True
+            self.use_nvfp4 = False
+            self.fp8_configs = dict(round_scale=False, use_ue8m0=False)
+        elif dtype == DispatcherOutputDtype.NVFP4:
+            self.use_fp8 = False
+            self.use_nvfp4 = True
+        elif dtype in (
+            DispatcherOutputDtype.MXFP8_e4m3fn,
+            DispatcherOutputDtype.MXFP8_e5m2,
+        ):
+            self.use_fp8 = True
+            self.use_nvfp4 = False
+            self.fp8_configs = dict(round_scale=True, use_ue8m0=True)
+        elif dtype == DispatcherOutputDtype.MXFP4_e2m1fn_x2:
+            # Ascend NPU supports MXFP4 only in normal dispatch mode
+            if isinstance(self, _DeepEPDispatcherImplLowLatency):
+                raise ValueError(
+                    "Ascend does not support MXFP4_e2m1fn_x2 quantization in low_latency mode"
+                )
+            self.use_fp8 = False
+            self.use_nvfp4 = False
+        else:
+            raise ValueError(f"Unsupported DeepEP output dtype: {dtype}")
+
+    def _get_npu_normal_quant_tensor(self):
+        """
+        Build a reference tensor of the quantisation data type used on NPU.
+        Returns None if no quantisation is required (e.g., bf16).
+        """
+        dtype = self.deepep_output_dtype
+        if dtype == DispatcherOutputDtype.BF16:
+            return None
+        elif dtype == DispatcherOutputDtype.INT8:
+            return torch.tensor([], dtype=torch.int8, device="npu")
+        elif dtype == DispatcherOutputDtype.MXFP8_e4m3fn:
+            return torch.tensor([], dtype=torch.float8_e4m3fn, device="npu")
+        elif dtype == DispatcherOutputDtype.MXFP8_e5m2:
+            return torch.tensor([], dtype=torch.float8_e5m2, device="npu")
+        elif dtype == DispatcherOutputDtype.MXFP4_e2m1fn_x2:
+            return torch.tensor([], dtype=torch.float4_e2m1fn_x2, device="npu")
+        else:
+            raise RuntimeError(f"Unexpected output dtype for NPU quant tensor: {dtype}")
 
     def _validate_and_adjust_dtype(self) -> None:
         """Validate dtype against hardware and adjust if necessary."""
@@ -476,10 +515,6 @@ class _DeepEPDispatcherImplBase:
                 )
                 self.deepep_output_dtype = DispatcherOutputDtype.FP8
             # NVFP4 is supported on GPU, no adjustment needed
-
-    def _update_int8_quant_env(self) -> None:
-        """TODO adapt different quantization schemes for base model and draft model on NPU"""
-        pass
 
     def set_overlap_args(
         self, combine_overlap_args: CombineOverlapArgs, meta_overlap_args: dict
@@ -566,6 +601,9 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         # FIXME: `handle` should be transmitted with tokens from dispatch to combine.
         # However, doing this would incur an unknown synchronization error, but keeping
         # `handle` as a member variable works.
+
+        # Wrap x for NPU quantisation if a quant reference tensor exists
+        x = (x, self.npu_quant_tensor) if self.npu_quant_tensor is not None else x
 
         _deepep_precompile_tp_barrier()
         (
@@ -669,11 +707,10 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
     ):
-        buffer = self._get_buffer()
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
         topk_ids = topk_ids.to(torch.int64)
         expected_m = (
-            hidden_states.shape[0] * buffer.group_size * topk_ids.shape[1]
+            hidden_states.shape[0] * self._get_buffer().group_size * topk_ids.shape[1]
             + self.num_experts
         ) // self.num_experts
         hidden_states, masked_m, event, hook = self._dispatch_core(
@@ -730,39 +767,31 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
     ):
         input_global_scale = self.quant_config.get("input_global_scale", None)
 
-        # round_scale / use_ue8m0 are FP8-DeepGEMM specific; they cause DeepEP
-        # to return int32-packed UE8M0 scales that don't feed the flashinfer
-        # cutedsl kernel.
-        fp8_deepgemm_scale_opts = (
-            dict(
-                round_scale=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-                and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
-                use_ue8m0=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-                and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
-            )
-            if self.use_fp8
-            else dict()
-        )
-
         buffer = self._get_buffer()
         _deepep_precompile_tp_barrier()
+
+        # Build dispatch kwargs common to GPU and NPU
+        dispatch_kwargs = dict(
+            use_fp8=self.use_fp8,
+            async_finish=not self.return_recv_hook,
+            return_recv_hook=self.return_recv_hook,
+            **self.fp8_configs,
+        )
+        if self.use_nvfp4:
+            dispatch_kwargs["use_nvfp4"] = True
+        if input_global_scale is not None:
+            dispatch_kwargs["x_global_scale"] = input_global_scale
+
+        # NPU requires topk_weights during dispatch
+        if _is_npu and topk_weights is not None:
+            dispatch_kwargs["topk_weights"] = topk_weights
         packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (
             buffer.low_latency_dispatch(
                 hidden_states,
                 topk_ids,
                 self.num_max_dispatch_tokens_per_rank,
                 self.num_experts,
-                use_fp8=self.use_fp8,
-                **(dict(topk_weights=topk_weights) if _is_npu else dict()),
-                **(dict(use_nvfp4=True) if self.use_nvfp4 else dict()),
-                **(
-                    dict(x_global_scale=input_global_scale)
-                    if input_global_scale is not None
-                    else dict()
-                ),
-                async_finish=not self.return_recv_hook,
-                return_recv_hook=self.return_recv_hook,
-                **fp8_deepgemm_scale_opts,
+                **dispatch_kwargs,
             )
         )
         return packed_recv_hidden, self.packed_recv_count, event, hook

@@ -2,10 +2,12 @@ from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import numpy as np
 import torch
+import torch_npu
 
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.npu.utils import npu_format_cast
+from sglang.srt.hardware_backend.npu.utils import NPUACLFormat, npu_format_cast
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
+from sglang.srt.runtime_context import get_server_args
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -249,9 +251,7 @@ class NPUW4A4Int4MoEMethod(_NPUMoEMethodBase):
     ) -> torch.Tensor:
         scale = getattr(quant_info, f"{weight_prefix}_weight_scale", None)
         if pertoken_scale is None:
-            hidden_states, pertoken_scale = self.hidden_states_quantizer.__call__(
-                hidden_states
-            )
+            hidden_states, pertoken_scale = self.hidden_states_quantizer(hidden_states)
         scale_args: Dict[str, Any] = {
             "scale": [scale],
             "per_token_scale": [pertoken_scale],
@@ -264,113 +264,93 @@ class NPUW4A4Int4MoEMethod(_NPUMoEMethodBase):
             expert_tokens,
             output_dtype,
             group_list_type=group_list_type,
-            transposed=True,
             **scale_args,
         )
 
 
 # ---------------------------------------------------------------------------
-#  NPUW8A8Int8MoEMethod
+#  NPUW4A4Mxfp4MoEMethod
 # ---------------------------------------------------------------------------
-class NPUW8A8Int8MoEMethod(_NPUMoEMethodBase):
-    """W8A8 MoE – weights are int8, activations in int8."""
+class NPUW4A4Mxfp4MoEMethod(_NPUMoEMethodBase):
+    """W4A4 MXFP4 MoE – weights & activations float4_e2m1fn_x2, scales float8_e8m0fnu."""
 
-    def __init__(self):
+    def __init__(self, group_size: int = 32):
         super().__init__(quant_config=None)
+        self.group_size = group_size
         self.matmul = GroupedMatmul()
-        self.hidden_states_quantizer = HiddenStatesDynamicQuant(quant_dtype=torch.int8)
-
-    @staticmethod
-    def maybe_process_fuseep_weights(layer: torch.nn.Module) -> bool:
-        """Apply the FuseEP weight layout if --moe-a2a-backend is ascend_fuseep.
-
-        Returns True when the FuseEP layout was (or has already been) applied,
-        so that the caller can skip its own ``process_weights_after_loading`` body.
-        """
-        from sglang.srt.layers.moe import get_moe_a2a_backend
-
-        if not get_moe_a2a_backend().is_ascend_fuseep():
-            return False
-
-        # Guard against double processing when called for multiple prefixes.
-        if getattr(layer, "_fuseep_weights_processed", False):
-            return True
-
-        from sglang.srt.hardware_backend.npu.moe.fuseep import process_fuseep_weights
-
-        for prefix in ("w13", "w2"):
-            process_fuseep_weights(layer, prefix)
-        layer._fuseep_weights_processed = True
-        return True
+        # Activation quantizer for float4
+        self.hidden_states_quantizer = HiddenStatesDynamicQuant(
+            quant_dtype=torch_npu.float4_e2m1fn_x2
+        )
 
     def process_weights_after_loading(
         self, layer: torch.nn.Module, weight_prefix: str
     ) -> None:
-        # If the FuseEP weight layout is used, process weights via
-        # maybe_apply_fuseep_weights and skip the rest of this method.
-        if self.maybe_process_fuseep_weights(layer):
-            return
-
         self._validate_weight_prefix(layer, weight_prefix)
 
-        # Process scale
-        scale: torch.Tensor = getattr(layer, f"{weight_prefix}_weight_scale")
-        processed_scale = torch.nn.Parameter(
-            scale.data.squeeze(-1).to(dtype=torch.bfloat16), requires_grad=False
-        )
-        setattr(layer, f"{weight_prefix}_weight_scale", processed_scale)
+        weight = getattr(layer, f"{weight_prefix}_weight")  # [E, N, K_packed] uint8
+        scale = getattr(
+            layer, f"{weight_prefix}_weight_scale"
+        )  # [E, N, K_groups] uint8
 
-        # Process offset
-        offset: Optional[torch.Tensor] = getattr(
-            layer, f"{weight_prefix}_weight_offset", None
-        )
-        if offset is not None:
-            processed_offset = torch.nn.Parameter(
-                offset.data.squeeze(-1), requires_grad=False
-            )
-            setattr(layer, f"{weight_prefix}_weight_offset", processed_offset)
+        # 1) Weight: transpose to [E, K_packed, N] – no npu_format_cast needed
+        weight.data = weight.data.transpose(1, 2)
 
-        # Process weight
-        weight: torch.Tensor = getattr(layer, f"{weight_prefix}_weight")
-        weight.data = npu_format_cast(weight.data.transpose(1, 2))
+        # 2) Scale: pack into [E, K_groups//2, N, 2]
+        g, n, k = scale.shape  # k = hidden_size // group_size
+        scale.data = scale.data.reshape(g, n, k // 2, 2).transpose(1, 2)
+
+        # 3) Store on layer and on self (for matmul lookup)
         setattr(
             layer,
             f"{weight_prefix}_weight",
-            torch.nn.Parameter(weight, requires_grad=False),
+            torch.nn.Parameter(weight.data, requires_grad=False),
+        )
+        setattr(
+            layer,
+            f"{weight_prefix}_weight_scale",
+            torch.nn.Parameter(scale.data, requires_grad=False),
         )
 
-        # Set dispatcher output dtype
+        setattr(self, f"{weight_prefix}_weight", weight.data)
+        setattr(self, f"{weight_prefix}_weight_scale", scale.data)
+
+        # 4) Output dtype – reuse bf16 for now
         if weight_prefix == "w13":
-            self._set_dispatcher_output_dtype(layer, "int8")
+            self._set_dispatcher_output_dtype(layer, "bf16")
 
     def apply(
         self,
         quant_info: "AscendQuantInfo",
         hidden_states: torch.Tensor,
         expert_tokens: torch.Tensor,
-        pertoken_scale: torch.Tensor,
+        pertoken_scale: Optional[torch.Tensor],
         output_dtype: torch.dtype,
         weight_prefix: str,
         group_list_type,
     ) -> torch.Tensor:
-        scale = getattr(quant_info, f"{weight_prefix}_weight_scale", None)
+        weight_scale = getattr(self, f"{weight_prefix}_weight_scale", None)
+
         if pertoken_scale is None:
-            hidden_states, pertoken_scale = self.hidden_states_quantizer.__call__(
-                hidden_states
-            )
+            hidden_states, pertoken_scale = self.hidden_states_quantizer(hidden_states)
+
         scale_args: Dict[str, Any] = {
-            "scale": [scale],
+            "scale": [weight_scale],
             "per_token_scale": [pertoken_scale],
+            "scale_dtype": torch.float8_e8m0fnu,
+            "per_token_scale_dtype": torch.float8_e8m0fnu,
+            "x_dtype": torch_npu.float4_e2m1fn_x2,
+            "weight_dtype": torch_npu.float4_e2m1fn_x2,
         }
         scale_args.update(self._get_bias_args(quant_info, weight_prefix))
+
         return self.matmul.forward(
             quant_info,
             weight_prefix,
-            hidden_states,
+            hidden_states,  # float4_e2m1fn_x2
             expert_tokens,
             output_dtype,
             group_list_type=group_list_type,
-            transposed=True,
             **scale_args,
         )
 
@@ -515,14 +495,19 @@ class NPUW4A8Int8MoEMethod(_NPUMoEMethodBase):
     ) -> torch.Tensor:
         scale = getattr(quant_info, f"{weight_prefix}_weight_scale", None)
         if pertoken_scale is None:
-            hidden_states, pertoken_scale = self.hidden_states_quantizer.__call__(
-                hidden_states
-            )
+            hidden_states, pertoken_scale = self.hidden_states_quantizer(hidden_states)
         scale_args: Dict[str, Any] = {
             "scale": [scale],
             "per_token_scale": [pertoken_scale],
         }
-        scale_args.update(self._get_bias_args(quant_info, weight_prefix))
+
+        bias = None
+        if self.activation_use_clip:
+            bias = getattr(quant_info, f"{weight_prefix}_scale_bias", None)
+        if bias is not None:
+            scale_args["bias"] = [bias]
+        else:
+            scale_args.update(self._get_bias_args(quant_info, weight_prefix))
 
         return self.matmul.forward(
             quant_info,
@@ -531,7 +516,299 @@ class NPUW4A8Int8MoEMethod(_NPUMoEMethodBase):
             expert_tokens,
             output_dtype,
             group_list_type=group_list_type,
-            transposed=True,
+            **scale_args,
+        )
+
+
+# ---------------------------------------------------------------------------
+#  NPUW4A8Mxfp8MoEMethod
+# ---------------------------------------------------------------------------
+class NPUW4A8Mxfp4MoEMethod(_NPUMoEMethodBase):
+    """W4A8 MXFP4 MoE – weights float4_e2m1fn_x2 (packed), activations float8_e4m3fn."""
+
+    def __init__(self, group_size: int = 32):
+        super().__init__(quant_config=None)
+        self.group_size = group_size
+        self.matmul = GroupedMatmul()
+        # Activation quantizer stays the same – we still quantize to float8_e4m3fn
+        self.hidden_states_quantizer = HiddenStatesDynamicQuant(
+            quant_dtype=torch.float8_e4m3fn
+        )
+
+    def process_weights_after_loading(
+        self, layer: torch.nn.Module, weight_prefix: str
+    ) -> None:
+        self._validate_weight_prefix(layer, weight_prefix)
+
+        # 1) Fetch the packed weight and scale
+        weight = getattr(
+            layer, f"{weight_prefix}_weight"
+        )  # shape: [E, N, K_packed] uint8
+        scale = getattr(
+            layer, f"{weight_prefix}_weight_scale"
+        )  # shape: [E, N, K_groups] uint8
+
+        # 2) Cast weight to a hardware format that treats each byte as
+        #    two float4_e2m1fn values, but presents as float8_e4m3fn.
+        #    Format 29 is the Ascend ND format for this packed layout.
+        weight.data = torch.ops.npu.npu_format_cast(
+            weight.data,
+            29,
+            customize_dtype=torch.float8_e4m3fn,
+            input_dtype=torch_npu.float4_e2m1fn_x2,
+        )
+
+        # 3) Transpose weight: [E, N, K_packed] -> [E, K_packed, N]
+        weight.data = weight.data.transpose(1, 2)
+
+        # 4) Pack scale groups and transpose:
+        #    Original scale shape: [E, N, K_groups] where K_groups = K_orig // group_size
+        #    Two groups are packed per byte -> reshape to [E, N, K_groups//2, 2]
+        #    Then transpose to [E, K_groups//2, N, 2]
+        g, n, k = scale.shape
+        scale.data = scale.data.reshape(g, n, k // 2, 2).transpose(1, 2)
+
+        # 5) Store on the layer (and also on self for the matmul)
+        setattr(
+            layer,
+            f"{weight_prefix}_weight",
+            torch.nn.Parameter(weight.data, requires_grad=False),
+        )
+        setattr(
+            layer,
+            f"{weight_prefix}_weight_scale",
+            torch.nn.Parameter(scale.data, requires_grad=False),
+        )
+
+        # Crucial: also store on self (quant_info) so that GroupedMatmul can find them
+        setattr(self, f"{weight_prefix}_weight", weight.data)
+        setattr(self, f"{weight_prefix}_weight_scale", scale.data)
+
+        # 6) Dispatcher output dtype (unchanged)
+        if weight_prefix == "w13":
+            self._set_dispatcher_output_dtype(layer, "bf16")
+
+    def apply(
+        self,
+        quant_info: "AscendQuantInfo",
+        hidden_states: torch.Tensor,
+        expert_tokens: torch.Tensor,
+        pertoken_scale: Optional[torch.Tensor],
+        output_dtype: torch.dtype,
+        weight_prefix: str,
+        group_list_type,
+    ) -> torch.Tensor:
+        weight_scale = getattr(self, f"{weight_prefix}_weight_scale", None)
+
+        # Dynamic MXFP8 activation quantisation
+        if pertoken_scale is None:
+            hidden_states, pertoken_scale = self.hidden_states_quantizer(hidden_states)
+
+        scale_args: Dict[str, Any] = {
+            "scale": [weight_scale],
+            "per_token_scale": [pertoken_scale],
+            "scale_dtype": torch.float8_e8m0fnu,
+            "per_token_scale_dtype": torch.float8_e8m0fnu,
+            "weight_dtype": torch_npu.float4_e2m1fn_x2,
+        }
+        scale_args.update(self._get_bias_args(quant_info, weight_prefix))
+
+        return self.matmul.forward(
+            quant_info,
+            weight_prefix,
+            hidden_states,  # float8_e4m3fn
+            expert_tokens,
+            output_dtype,
+            group_list_type=group_list_type,
+            **scale_args,
+        )
+
+
+# ---------------------------------------------------------------------------
+#  NPUW8A8Int8MoEMethod
+# ---------------------------------------------------------------------------
+class NPUW8A8Int8MoEMethod(_NPUMoEMethodBase):
+    """W8A8 MoE – weights are int8, activations in int8."""
+
+    def __init__(self):
+        super().__init__(quant_config=None)
+        self.matmul = GroupedMatmul()
+        self.hidden_states_quantizer = HiddenStatesDynamicQuant(quant_dtype=torch.int8)
+
+    @staticmethod
+    def maybe_apply_fuseep_weights(layer: torch.nn.Module) -> bool:
+        """Apply the FuseEP weight layout if --moe-a2a-backend is ascend_fuseep.
+
+        Returns True when the FuseEP layout was (or has already been) applied,
+        so that the caller can skip its own ``process_weights_after_loading`` body.
+        """
+        from sglang.srt.layers.moe import get_moe_a2a_backend
+
+        if not get_moe_a2a_backend().is_ascend_fuseep():
+            return False
+
+        # Guard against double processing when called for multiple prefixes.
+        if getattr(layer, "_fuseep_weights_processed", False):
+            return True
+
+        from sglang.srt.hardware_backend.npu.moe.fuseep import process_fuseep_weights
+
+        for prefix in ("w13", "w2"):
+            process_fuseep_weights(layer, prefix)
+        layer._fuseep_weights_processed = True
+        return True
+
+    def process_weights_after_loading(
+        self, layer: torch.nn.Module, weight_prefix: str
+    ) -> None:
+        # If the FuseEP weight layout is used, process weights via
+        # maybe_apply_fuseep_weights and skip the rest of this method.
+        if self.maybe_apply_fuseep_weights(layer):
+            return
+
+        self._validate_weight_prefix(layer, weight_prefix)
+
+        # Process scale
+        scale: torch.Tensor = getattr(layer, f"{weight_prefix}_weight_scale")
+        processed_scale = torch.nn.Parameter(
+            scale.data.squeeze(-1).to(dtype=torch.bfloat16), requires_grad=False
+        )
+        setattr(layer, f"{weight_prefix}_weight_scale", processed_scale)
+
+        # Process offset
+        offset: Optional[torch.Tensor] = getattr(
+            layer, f"{weight_prefix}_weight_offset", None
+        )
+        if offset is not None:
+            processed_offset = torch.nn.Parameter(
+                offset.data.squeeze(-1), requires_grad=False
+            )
+            setattr(layer, f"{weight_prefix}_weight_offset", processed_offset)
+
+        # Process weight
+        weight: torch.Tensor = getattr(layer, f"{weight_prefix}_weight")
+        weight.data = npu_format_cast(weight.data.transpose(1, 2))
+        setattr(
+            layer,
+            f"{weight_prefix}_weight",
+            torch.nn.Parameter(weight, requires_grad=False),
+        )
+
+        # Set dispatcher output dtype
+        if weight_prefix == "w13":
+            self._set_dispatcher_output_dtype(layer, "int8")
+
+    def apply(
+        self,
+        quant_info: "AscendQuantInfo",
+        hidden_states: torch.Tensor,
+        expert_tokens: torch.Tensor,
+        pertoken_scale: torch.Tensor,
+        output_dtype: torch.dtype,
+        weight_prefix: str,
+        group_list_type,
+    ) -> torch.Tensor:
+        scale = getattr(quant_info, f"{weight_prefix}_weight_scale", None)
+        if pertoken_scale is None:
+            hidden_states, pertoken_scale = self.hidden_states_quantizer(hidden_states)
+        scale_args: Dict[str, Any] = {
+            "scale": [scale],
+            "per_token_scale": [pertoken_scale],
+        }
+        scale_args.update(self._get_bias_args(quant_info, weight_prefix))
+        return self.matmul.forward(
+            quant_info,
+            weight_prefix,
+            hidden_states,
+            expert_tokens,
+            output_dtype,
+            group_list_type=group_list_type,
+            **scale_args,
+        )
+
+
+# ---------------------------------------------------------------------------
+#  NPUW8A8Mxfp8MoEMethod
+# ---------------------------------------------------------------------------
+class NPUW8A8Mxfp8MoEMethod(_NPUMoEMethodBase):
+    """W8A8 MXFP8 MoE – weights float8_e4m3fn, scales uint8 (per‑group)."""
+
+    def __init__(self, group_size: int = 32):
+        super().__init__(quant_config=None)
+        self.group_size = group_size
+        self.matmul = GroupedMatmul()
+        self.hidden_states_quantizer = HiddenStatesDynamicQuant(
+            quant_dtype=torch.float8_e4m3fn
+        )
+
+    def process_weights_after_loading(
+        self, layer: torch.nn.Module, weight_prefix: str
+    ) -> None:
+        self._validate_weight_prefix(layer, weight_prefix)
+
+        weight: torch.Tensor = getattr(layer, f"{weight_prefix}_weight")  # [E, N, K]
+        scale: torch.Tensor = getattr(
+            layer, f"{weight_prefix}_weight_scale"
+        )  # [E, N, num_groups ]
+
+        # 1) Weight: transpose to [E, K, N]
+        weight.data = weight.data.transpose(1, 2).contiguous()
+
+        # 2) Scale: pad if number of num_groups is odd, then pack into [E, num_groups //2, N, 2]
+        num_groups = scale.shape[-1]
+        scale.data = scale.data.reshape(
+            scale.shape[0], scale.shape[1], num_groups // 2, 2
+        )
+        # transpose: [E, N, num_groups //2, 2] -> [E, num_groups //2, N, 2]
+        scale.data = scale.data.transpose(1, 2).contiguous()
+
+        setattr(
+            layer,
+            f"{weight_prefix}_weight",
+            torch.nn.Parameter(weight.data, requires_grad=False),
+        )
+        setattr(
+            layer,
+            f"{weight_prefix}_weight_scale",
+            torch.nn.Parameter(scale.data, requires_grad=False),
+        )
+
+        # Set dispatcher output dtype – mxfp8_e4m3fn
+        if weight_prefix == "w13":
+            self._set_dispatcher_output_dtype(
+                layer, "bf16"
+            )  # add "mxfp8_e4m3fn" in future
+
+    def apply(
+        self,
+        quant_info: "AscendQuantInfo",
+        hidden_states: torch.Tensor,
+        expert_tokens: torch.Tensor,
+        pertoken_scale: Optional[torch.Tensor],
+        output_dtype: torch.dtype,
+        weight_prefix: str,
+        group_list_type,
+    ) -> torch.Tensor:
+        weight_scale = getattr(quant_info, f"{weight_prefix}_weight_scale", None)
+
+        if pertoken_scale is None:
+            hidden_states, pertoken_scale = self.hidden_states_quantizer(hidden_states)
+
+        scale_args: Dict[str, Any] = {
+            "scale": [weight_scale],
+            "per_token_scale": [pertoken_scale],
+            "scale_dtype": torch.float8_e8m0fnu,
+            "per_token_scale_dtype": torch.float8_e8m0fnu,
+        }
+        scale_args.update(self._get_bias_args(quant_info, weight_prefix))
+
+        return self.matmul.forward(
+            quant_info,
+            weight_prefix,
+            hidden_states,  # float8_e4m3fn
+            expert_tokens,
+            output_dtype,
+            group_list_type=group_list_type,
             **scale_args,
         )
 
@@ -682,47 +959,252 @@ class NPUWNA16Int4MoEMethod(_NPUMoEMethodBase):
             expert_tokens,
             output_dtype,
             group_list_type=group_list_type,
-            transposed=True,
             **scale_args,
         )
 
 
 # ---------------------------------------------------------------------------
-#  NPUWUnquantMoEMethod
+# NPUUnquantMoEMethod (FP4 fixes – no nz cast for W4A4)
 # ---------------------------------------------------------------------------
 class NPUUnquantMoEMethod(_NPUMoEMethodBase):
-    """Unquant MoE – all computations in BF16, no quantization."""
-
     def __init__(self):
         super().__init__(quant_config=None)
         self.matmul = GroupedMatmul()
+        self.hidden_states_quantizer = None
+        self._quant_mode = None
 
-    def process_weights_after_loading(
-        self, layer: torch.nn.Module, weight_prefix: str
-    ) -> None:
+    def process_weights_after_loading(self, layer, weight_prefix):
         self._validate_weight_prefix(layer, weight_prefix)
+        weight_name = f"{weight_prefix}_weight"
+        server_args = get_server_args()
+        online_quant = getattr(server_args, "online_quantization", None)
 
-        weight: torch.Tensor = getattr(layer, f"{weight_prefix}_weight")
-        weight.data = npu_format_cast(weight)
-        setattr(
+        if online_quant == "w8a8_int8":
+            self._apply_online_w8a8(layer, weight_prefix, weight_name)
+            self._quant_mode = "w8a8_int8"
+        elif online_quant == "w8a8_mxfp8":
+            self._apply_online_mxfp8(layer, weight_prefix, weight_name)
+            self._quant_mode = "w8a8_mxfp8"
+        elif online_quant == "w4a8_mxfp4":
+            self._apply_online_mxfp4_w4a8(layer, weight_prefix, weight_name)
+            self._quant_mode = "w4a8_mxfp4"
+        elif online_quant == "w4a4_mxfp4":
+            self._apply_online_mxfp4_w4a4(layer, weight_prefix, weight_name)
+            self._quant_mode = "w4a4_mxfp4"
+        else:
+            # Pure BF16
+            weight = getattr(layer, weight_name)
+            formatted = npu_format_cast(weight.data.transpose(1, 2))
+            layer.__setattr__(
+                weight_name, torch.nn.Parameter(formatted, requires_grad=False)
+            )
+            setattr(self, weight_name, formatted)
+            self._quant_mode = "bf16"
+            if weight_prefix == "w13":
+                self._set_dispatcher_output_dtype(layer, "bf16")
+
+    # --------------- W8A8 int8 (unchanged) ---------------
+    def _apply_online_w8a8(self, layer, weight_prefix, weight_name):
+        weight_fp = getattr(layer, weight_name)
+        qw, weight_scale = torch.ops.npu.npu_dynamic_quant(weight_fp)
+        qw_npu = npu_format_cast(qw.transpose(-2, -1))
+
+        setattr(layer, weight_name, torch.nn.Parameter(qw_npu, requires_grad=False))
+        layer.register_parameter(
+            f"{weight_name}_scale",
+            torch.nn.Parameter(weight_scale, requires_grad=False),
+        )
+        setattr(self, weight_name, qw_npu)
+        setattr(self, f"{weight_name}_scale", weight_scale)
+        torch.npu.empty_cache()
+
+        if weight_prefix == "w13":
+            self._set_dispatcher_output_dtype(layer, "int8")
+        self.hidden_states_quantizer = HiddenStatesDynamicQuant(quant_dtype=torch.int8)
+
+    # --------------- MXFP8 (unchanged) ---------------
+    def _apply_online_mxfp8(self, layer, weight_prefix, weight_name):
+        weight_fp = getattr(layer, weight_name)
+
+        qw, w_scale = torch.ops.npu.npu_dynamic_mx_quant(
+            weight_fp, dst_type=torch.float8_e4m3fn
+        )
+        qw_t = qw.transpose(1, 2).contiguous()
+        w_scale_t = w_scale.transpose(1, 2).contiguous()
+
+        setattr(layer, weight_name, torch.nn.Parameter(qw_t, requires_grad=False))
+        layer.register_parameter(
+            f"{weight_name}_scale", torch.nn.Parameter(w_scale_t, requires_grad=False)
+        )
+        setattr(self, weight_name, qw_t)
+        setattr(self, f"{weight_name}_scale", w_scale_t)
+        torch.npu.empty_cache()
+
+        self.hidden_states_quantizer = HiddenStatesDynamicQuant(
+            quant_dtype=torch.float8_e4m3fn
+        )
+        if weight_prefix == "w13":
+            self._set_dispatcher_output_dtype(layer, "mxfp8_e4m3fn")
+
+    # --------------- W4A8 MXFP4 ---------------
+    def _apply_online_mxfp4_w4a8(self, layer, weight_prefix, weight_name):
+        weight_fp = getattr(layer, weight_name)
+        if weight_fp.dtype not in (torch.float16, torch.bfloat16):
+            weight_fp = weight_fp.to(torch.bfloat16)
+        if not weight_fp.is_npu:
+            weight_fp = weight_fp.to(f"npu:{torch.npu.current_device()}")
+
+        fp4_dtype = torch_npu.float4_e2m1fn_x2
+        quant_weight, weight_scale = torch.ops.npu.npu_dynamic_mx_quant(
+            weight_fp, dst_type=fp4_dtype, round_mode="round"
+        )
+
+        quant_weight = npu_format_cast(
+            quant_weight.view(torch.uint8),
+            NPUACLFormat.ACL_FORMAT_FRACTAL_NZ,
+            customize_dtype=torch.float8_e4m3fn,
+            input_dtype=fp4_dtype,
+        )
+        quant_weight = quant_weight.transpose(-1, -2)
+
+        # torch_npu versions may return either one scale value per group or
+        # pairs in the trailing dimension. Normalize both to [..., groups, N, 2].
+        if weight_scale.dim() == 3:
+            num_experts, output_size, num_groups = weight_scale.shape
+            weight_scale = weight_scale.reshape(
+                num_experts, output_size, num_groups // 2, 2
+            )
+        weight_scale = weight_scale.transpose(-3, -2)
+
+        quant_weight = torch.nn.Parameter(quant_weight, requires_grad=False)
+        weight_scale = torch.nn.Parameter(weight_scale, requires_grad=False)
+        setattr(layer, weight_name, quant_weight)
+        layer.register_parameter(f"{weight_name}_scale", weight_scale)
+        setattr(self, weight_name, quant_weight)
+        setattr(self, f"{weight_name}_scale", weight_scale)
+
+        torch.npu.empty_cache()
+        self.hidden_states_quantizer = HiddenStatesDynamicQuant(
+            quant_dtype=torch.float8_e4m3fn
+        )
+        if weight_prefix == "w13":
+            self._set_dispatcher_output_dtype(layer, "bf16")
+
+    # --------------- W4A4 MXFP4 ---------------
+    def _apply_online_mxfp4_w4a4(self, layer, weight_prefix, weight_name):
+        self._apply_online_mxfp4_common(
             layer,
-            f"{weight_prefix}_weight",
-            torch.nn.Parameter(weight, requires_grad=False),
+            weight_prefix,
+            weight_name,
+            act_quant_dtype=torch_npu.float4_e2m1fn_x2,
+            use_nz_cast=False,  # W4A4 uses plain ND format (no cast)
+        )
+
+    # --------------- Shared MXFP4 weight processing ---------------
+    def _apply_online_mxfp4_common(
+        self, layer, weight_prefix, weight_name, act_quant_dtype, use_nz_cast
+    ):
+        weight_fp = getattr(layer, weight_name)  # [E, N, K]
+        if weight_fp.dtype not in (torch.float16, torch.bfloat16):
+            weight_fp = weight_fp.to(torch.bfloat16)
+        if not weight_fp.is_npu:
+            weight_fp = weight_fp.to(f"npu:{torch.npu.current_device()}")
+
+        fp4_dtype = torch_npu.float4_e2m1fn_x2
+        qw, w_scale = torch.ops.npu.npu_dynamic_mx_quant(
+            weight_fp, dst_type=fp4_dtype, round_mode="round"
+        )
+        # qw:      uint8 [E, N, K//2]    (packed FP4)
+        # w_scale: uint8 [E, N, ceil(K/64), 2]
+
+        if use_nz_cast:
+            # W4A8: cast to FRACTAL_NZ after contiguous transpose (unchanged)
+            qw_t = qw.transpose(1, 2).contiguous()
+            qw_final = torch_npu.npu_format_cast(
+                qw_t,
+                29,
+                customize_dtype=torch.float8_e4m3fn,
+                input_dtype=torch_npu.float4_e2m1fn_x2,
+            )
+            # Scale: contiguous transpose for FRACTAL_NZ compatibility
+            w_scale_final = w_scale.transpose(1, 2).contiguous()
+        else:
+            # W4A4: no format cast, non‑contiguous transpose
+            # Weight: create Parameter, then transpose in‑place (NO .contiguous())
+            weight_param = torch.nn.Parameter(qw, requires_grad=False)
+            weight_param.data = weight_param.data.transpose(1, 2)  # [E, K//2, N]
+            qw_final = weight_param
+
+            # Scale: same approach
+            scale_param = torch.nn.Parameter(w_scale, requires_grad=False)
+            scale_param.data = scale_param.data.transpose(1, 2)  # [E, ceil(K/64), N, 2]
+            w_scale_final = scale_param
+
+        # Store on layer and self (use the Parameter objects for W4A4, tensors for W4A8)
+        setattr(layer, weight_name, qw_final if use_nz_cast else weight_param)
+        layer.register_parameter(
+            f"{weight_name}_scale", w_scale_final if use_nz_cast else scale_param
+        )
+        setattr(self, weight_name, qw_final if use_nz_cast else weight_param)
+        setattr(
+            self, f"{weight_name}_scale", w_scale_final if use_nz_cast else scale_param
+        )
+
+        torch.npu.empty_cache()
+
+        self.hidden_states_quantizer = HiddenStatesDynamicQuant(
+            quant_dtype=act_quant_dtype
         )
 
         if weight_prefix == "w13":
             self._set_dispatcher_output_dtype(layer, "bf16")
 
+    # ------------------------------------------------------------------
+    # Forward pass (unchanged)
+    # ------------------------------------------------------------------
     def apply(
         self,
-        quant_info: "AscendQuantInfo",
-        hidden_states: torch.Tensor,
-        expert_tokens: torch.Tensor,
-        pertoken_scale: torch.Tensor,  # ignored
-        output_dtype: torch.dtype,
-        weight_prefix: str,
+        quant_info,
+        hidden_states,
+        expert_tokens,
+        pertoken_scale,
+        output_dtype,
+        weight_prefix,
         group_list_type,
-    ) -> torch.Tensor:
+    ):
+        weight_scale = getattr(self, f"{weight_prefix}_weight_scale", None)
+        if weight_scale is None:
+            return self.matmul.forward(
+                quant_info,
+                weight_prefix,
+                hidden_states,
+                expert_tokens,
+                output_dtype,
+                group_list_type=group_list_type,
+                **self._get_bias_args(quant_info, weight_prefix),
+            )
+
+        if self.hidden_states_quantizer is not None and pertoken_scale is None:
+            hidden_states, pertoken_scale = self.hidden_states_quantizer(hidden_states)
+
+        scale_args = {"scale": [weight_scale]}
+        if pertoken_scale is not None:
+            scale_args["per_token_scale"] = [pertoken_scale]
+
+        if self._quant_mode == "w8a8_mxfp8":
+            scale_args["scale_dtype"] = torch_npu.float8_e8m0fnu
+            scale_args["per_token_scale_dtype"] = torch_npu.float8_e8m0fnu
+        elif self._quant_mode == "w4a8_mxfp4":
+            scale_args["weight_dtype"] = torch_npu.float4_e2m1fn_x2
+            scale_args["scale_dtype"] = torch_npu.float8_e8m0fnu
+            scale_args["per_token_scale_dtype"] = torch_npu.float8_e8m0fnu
+        elif self._quant_mode == "w4a4_mxfp4":
+            scale_args["x_dtype"] = torch_npu.float4_e2m1fn_x2
+            scale_args["weight_dtype"] = torch_npu.float4_e2m1fn_x2
+            scale_args["scale_dtype"] = torch_npu.float8_e8m0fnu
+            scale_args["per_token_scale_dtype"] = torch_npu.float8_e8m0fnu
+        scale_args.update(self._get_bias_args(quant_info, weight_prefix))
+
         return self.matmul.forward(
             quant_info,
             weight_prefix,
@@ -730,6 +1212,5 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
             expert_tokens,
             output_dtype,
             group_list_type=group_list_type,
-            transposed=False,
-            **self._get_bias_args(quant_info, weight_prefix),
+            **scale_args,
         )
