@@ -32,6 +32,28 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _unsupported_derived_weight_cache_error() -> Optional[str]:
+    """Reject online weight updates that derived-weight caches cannot survive.
+
+    The HPC-Ops bf16xfp32 router GEMM caches the fp32 weight split into
+    persistent buffers whose addresses captured CUDA graphs replay; in-place
+    loader writes (``param.data.copy_()``) are invisible to that cache, so
+    an update would silently keep serving the old router weights. Returns an
+    error message when such a cache is active, None otherwise.
+    """
+    from sglang.jit_kernel.dsv4.gemm import bf16xfp32_weight_split_cache_active
+
+    if bf16xfp32_weight_split_cache_active():
+        return (
+            "Online weight updates are not supported while the HPC-Ops "
+            "bf16xfp32 router GEMM optimization is active (the cached "
+            "weight split would keep serving the old weights). Restart the "
+            "server, or launch with the optimization disabled to use "
+            "online weight updates."
+        )
+    return None
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class WeightUpdater:
     tp_rank: int
@@ -112,6 +134,10 @@ class WeightUpdater:
         recapture_cuda_graph: bool = False,
     ) -> tuple[bool, str]:
         """Update engine weights in-place from the disk."""
+        error = _unsupported_derived_weight_cache_error()
+        if error is not None:
+            return False, error
+
         logger.info(
             f"Update engine weights online from disk begin. "
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id, empty_cache=False):.2f} GB"
@@ -197,6 +223,9 @@ class WeightUpdater:
             dtype: the data type of the parameter to be updated.
             shape: the shape of the parameter to be updated.
         """
+        error = _unsupported_derived_weight_cache_error()
+        if error is not None:
+            return False, error
 
         assert group_name in self._model_update_group, (
             f"Group {group_name} not in {list(self._model_update_group.keys())}. "
@@ -278,6 +307,10 @@ class WeightUpdater:
         named_tensors: List[Tuple[str, Union[torch.Tensor, LocalSerializedTensor]]],
         load_format: Optional[str] = None,
     ):
+        error = _unsupported_derived_weight_cache_error()
+        if error is not None:
+            return False, error
+
         monkey_patch_torch_reductions()
         if load_format == "flattened_bucket":
             # Handle flattened bucket format
@@ -338,6 +371,10 @@ class WeightUpdater:
 
     def update_weights_from_ipc(self: WeightUpdater, recv_req):
         """Update weights from IPC for checkpoint-engine integration."""
+        error = _unsupported_derived_weight_cache_error()
+        if error is not None:
+            return False, error
+
         try:
             from sglang.srt.checkpoint_engine.checkpoint_engine_worker import (
                 SGLangCheckpointEngineWorkerExtensionImpl,

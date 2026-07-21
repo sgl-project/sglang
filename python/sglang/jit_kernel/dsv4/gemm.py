@@ -19,6 +19,9 @@ _HPC_GEMM_WEIGHT_CACHE_ATTR = "_sglang_bf16xfp32_weight_cache"
 # bf16 halves: w_high = w.bf16 and w_low = ((w - w_high) / scale).bf16 with
 # scale = 1/256, so that w ~= w_high + scale * w_low.
 _HPC_GEMM_WEIGHT_SCALE = 1.0 / 256.0
+# Set once the first weight split is cached; never reset. Online weight
+# updates are rejected while True (see bf16xfp32_weight_split_cache_active).
+_split_cache_created = False
 
 
 @functools.cache
@@ -55,12 +58,22 @@ def _get_bf16xfp32_weight_split(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Split the fp32 weight for the HPC-Ops kernel and cache the result
     (plus the split-K flag workspace, which the kernel leaves zeroed) on the
-    weight tensor."""
+    weight tensor.
+
+    The cache key covers the weight's layout identity only, NOT its content
+    or ``_version``: weight content changes cannot be tracked reliably (the
+    SGLang loaders write in place via ``param.data.copy_()``, which bumps
+    nothing), and captured CUDA graphs hold the split buffers' addresses, so
+    reallocating on a key change would silently break replay. Instead, the
+    split is computed once and online weight updates are rejected while a
+    cache is active (see bf16xfp32_weight_split_cache_active()).
+    """
     import hpc
+
+    global _split_cache_created
 
     cache_key = (
         y.data_ptr(),
-        y._version,
         tuple(y.shape),
         tuple(y.stride()),
         y.device.index,
@@ -75,7 +88,21 @@ def _get_bf16xfp32_weight_split(
         w_low = ((y - w_high.float()) / _HPC_GEMM_WEIGHT_SCALE).to(torch.bfloat16)
     split_flag = hpc.get_gemm_bf16xfp32_workspace(y.shape[0])
     setattr(y, _HPC_GEMM_WEIGHT_CACHE_ATTR, (cache_key, w_high, w_low, split_flag))
+    _split_cache_created = True
     return w_high, w_low, split_flag
+
+
+def bf16xfp32_weight_split_cache_active() -> bool:
+    """Whether a bf16xfp32 weight split has been cached in this process.
+
+    The online weight-update APIs must reject updates while this is true:
+    the split would keep serving the old weights (in-place loader writes are
+    invisible to the cache, and captured CUDA graphs replay the split
+    buffers by address). Deliberately sticky (never reset): weights live for
+    the server's lifetime, and a stale True only rejects an update that the
+    optimization does not support anyway.
+    """
+    return _split_cache_created
 
 
 def _linear_bf16_fp32_cublas(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
