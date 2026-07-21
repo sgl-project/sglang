@@ -4,6 +4,7 @@ import asyncio
 import concurrent.futures
 import dataclasses
 import logging
+import resource
 import threading
 import time
 from collections import defaultdict
@@ -45,6 +46,16 @@ from sglang.srt.utils.network import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# Each cached TCP endpoint owns one PUSH socket and one monitor PAIR socket.
+# Once connected, those normally account for three process FDs in total: the
+# two ZMQ sockets plus the TCP transport. Keep three quarters of both the OS FD
+# limit and libzmq's socket ceiling available to the rest of the server.
+_ZMQ_SOCKETS_PER_CACHE_ENTRY = 2
+_ESTIMATED_FDS_PER_CACHE_ENTRY = 3
+_OUTBOUND_CACHE_RESOURCE_DIVISOR = 4
+_RESERVED_MANAGER_CONTEXT_SOCKETS = 1
 
 
 class KVTransferError(Exception):
@@ -115,6 +126,36 @@ class PrefillRankInfo:
         self.rank_port = int(self.rank_port)
 
 
+class SocketCacheCapacityError(RuntimeError):
+    """Raised before opening a new FD when no cached endpoint is safe to retire."""
+
+
+class _SocketCacheEntry:
+    def __init__(self, socket: zmq.Socket, monitor: zmq.Socket):
+        self.socket = socket
+        self.monitor = monitor
+        self.owner_thread_id = threading.get_ident()
+
+    def close(self):
+        assert threading.get_ident() == self.owner_thread_id
+        try:
+            if not self.socket.closed:
+                self.socket.disable_monitor()
+        except Exception:
+            logger.exception("Failed to disable cached ZMQ monitor")
+        try:
+            if not self.monitor.closed:
+                self.monitor.close(linger=0)
+        except Exception:
+            logger.exception("Failed to close cached ZMQ monitor")
+        try:
+            if not self.socket.closed:
+                self.socket.close(linger=0)
+        except Exception:
+            logger.exception("Failed to close cached ZMQ PUSH socket")
+        return self.monitor.closed and self.socket.closed
+
+
 class CommonKVManager(BaseKVManager):
     def __init__(
         self,
@@ -176,9 +217,7 @@ class CommonKVManager(BaseKVManager):
         logger.debug(f"kv manager bind to {self.local_ip}:{self.rank_port}")
 
         self.request_status: Dict[int, KVPoll] = {}
-        self._socket_cache: Dict[str, zmq.Socket] = {}
-        self._monitor_cache: Dict[str, zmq.Socket] = {}
-        self._socket_lock = threading.Lock()
+        self._init_socket_cache()
         self.failure_records: Dict[int, str] = {}
         self.failure_lock = threading.Lock()
 
@@ -665,44 +704,219 @@ class CommonKVManager(BaseKVManager):
             f"Prefill instance failed to register to bootstrap server after {max_retries} retries"
         )
 
-    def _connect(self, endpoint: str, is_ipv6: bool = False):
-        with self._socket_lock:
-            sock = self._socket_cache.get(endpoint)
-            if sock is not None:
-                monitor = self._monitor_cache.get(endpoint)
-                disconnected = False
-                if monitor is not None:
-                    try:
-                        monitor.recv_multipart(zmq.NOBLOCK)
-                        disconnected = True
-                    except zmq.Again:
-                        pass
-                    except zmq.ZMQError:
-                        disconnected = True
-                if not disconnected:
-                    return sock
-                sock.close(linger=0)
-                if monitor is not None:
-                    monitor.close()
-                self._socket_cache.pop(endpoint, None)
-                self._monitor_cache.pop(endpoint, None)
-
-            sock = self._zmq_ctx.socket(zmq.PUSH)
-            if is_ipv6:
-                sock.setsockopt(zmq.IPV6, 1)
-            sock.setsockopt(zmq.RECONNECT_IVL, -1)
-            sock.setsockopt(zmq.SNDTIMEO, 30000)
-            sock.setsockopt(zmq.LINGER, 0)
-            sock.setsockopt(zmq.TCP_KEEPALIVE, 1)
-            sock.setsockopt(zmq.TCP_KEEPALIVE_IDLE, 30)
-            sock.setsockopt(zmq.TCP_KEEPALIVE_INTVL, 5)
-            sock.setsockopt(zmq.TCP_KEEPALIVE_CNT, 3)
-            sock.connect(endpoint)
-            self._socket_cache[endpoint] = sock
-            self._monitor_cache[endpoint] = sock.get_monitor_socket(
-                zmq.EVENT_DISCONNECTED
+    def _init_socket_cache(self, capacity: Optional[int] = None):
+        if capacity is None:
+            capacity = envs.SGLANG_DISAGGREGATION_MAX_CACHED_ZMQ_ENDPOINTS.get()
+        if capacity is None:
+            capacity = self._automatic_socket_cache_capacity()
+        if capacity <= 0:
+            raise ValueError(
+                "SGLANG_DISAGGREGATION_MAX_CACHED_ZMQ_ENDPOINTS must be positive; "
+                f"got {capacity}"
             )
-            return sock
+        self._configure_context_socket_limit(capacity)
+        self._socket_cache_capacity = capacity
+        self._socket_local = threading.local()
+        self._socket_lock = threading.Lock()
+        self._socket_cache_size = 0
+        self._socket_monitor_sequence = 0
+
+    def _automatic_socket_cache_capacity(self) -> int:
+        soft_fd_limit, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+        zmq_socket_limit = self._get_zmq_socket_limit()
+        zmq_capacity = (zmq_socket_limit - _RESERVED_MANAGER_CONTEXT_SOCKETS) // (
+            _OUTBOUND_CACHE_RESOURCE_DIVISOR * _ZMQ_SOCKETS_PER_CACHE_ENTRY
+        )
+        fd_capacity = (
+            zmq_capacity
+            if soft_fd_limit == resource.RLIM_INFINITY
+            else soft_fd_limit
+            // (_OUTBOUND_CACHE_RESOURCE_DIVISOR * _ESTIMATED_FDS_PER_CACHE_ENTRY)
+        )
+        capacity = min(fd_capacity, zmq_capacity)
+        if capacity <= 0:
+            raise ValueError(
+                "Cannot reserve capacity for the outbound ZMQ endpoint cache: "
+                f"RLIMIT_NOFILE={soft_fd_limit}, "
+                f"zmq_socket_limit={zmq_socket_limit}. Raise the process FD limit "
+                "before starting disaggregated prefill."
+            )
+        logger.info(
+            "Auto-sized outbound ZMQ endpoint cache: limit=%d, "
+            "RLIMIT_NOFILE=%s, zmq_socket_limit=%d",
+            capacity,
+            soft_fd_limit,
+            zmq_socket_limit,
+        )
+        return capacity
+
+    def _get_zmq_socket_limit(self) -> int:
+        try:
+            return self._zmq_ctx.get(zmq.SOCKET_LIMIT)
+        except (AttributeError, zmq.ZMQError):
+            # Older libzmq versions may not expose ZMQ_SOCKET_LIMIT. In that
+            # case, the current context maximum is the only safe ceiling.
+            return self._zmq_ctx.get(zmq.MAX_SOCKETS)
+
+    def _configure_context_socket_limit(self, capacity: int) -> None:
+        required = (
+            capacity * _ZMQ_SOCKETS_PER_CACHE_ENTRY + _RESERVED_MANAGER_CONTEXT_SOCKETS
+        )
+        supported = self._get_zmq_socket_limit()
+        if required > supported:
+            max_capacity = (
+                supported - _RESERVED_MANAGER_CONTEXT_SOCKETS
+            ) // _ZMQ_SOCKETS_PER_CACHE_ENTRY
+            raise ValueError(
+                "SGLANG_DISAGGREGATION_MAX_CACHED_ZMQ_ENDPOINTS exceeds this "
+                f"libzmq build's socket limit: got {capacity}, maximum "
+                f"supported cache capacity={max_capacity}"
+            )
+        if self._zmq_ctx.get(zmq.MAX_SOCKETS) < required:
+            self._zmq_ctx.set(zmq.MAX_SOCKETS, required)
+
+    def _connect(self, endpoint: str, is_ipv6: bool = False):
+        """Return a PUSH socket owned by, and only usable from, this thread."""
+        cache = self._get_thread_socket_cache()
+        entry = cache.get(endpoint)
+        if entry is not None:
+            if not self._is_socket_terminal(entry):
+                return entry.socket
+            self._retire_socket_entry(cache, endpoint, entry)
+
+        # A cache miss is the only point where capacity can grow. Reap this
+        # thread's terminal entries before reserving a slot; entries owned by
+        # other threads must never be inspected or closed here.
+        self._reap_terminal_socket_entries(cache)
+        monitor_sequence = self._reserve_socket_slot(endpoint)
+        entry = self._create_socket_entry(endpoint, is_ipv6, monitor_sequence)
+        cache[endpoint] = entry
+        return entry.socket
+
+    def _get_thread_socket_cache(self) -> Dict[str, _SocketCacheEntry]:
+        # The mapping belongs to threading.local(), not a process-wide mapping
+        # keyed by get_ident(). A replacement thread therefore cannot retrieve a
+        # previous owner's sockets even if Python recycles the integer thread ID.
+        cache = getattr(self._socket_local, "cache", None)
+        if cache is None:
+            cache = {}
+            self._socket_local.cache = cache
+        return cache
+
+    def _reserve_socket_slot(self, endpoint: str) -> int:
+        # Reserve before opening either the PUSH or PAIR FD so concurrent cache
+        # misses cannot overshoot the manager-wide hard limit.
+        with self._socket_lock:
+            current = self._socket_cache_size
+            if current >= self._socket_cache_capacity:
+                raise SocketCacheCapacityError(
+                    "Outbound ZMQ endpoint cache is full: "
+                    f"endpoint={endpoint}, limit={self._socket_cache_capacity}, "
+                    f"cached={current}. Increase "
+                    "SGLANG_DISAGGREGATION_MAX_CACHED_ZMQ_ENDPOINTS to cover "
+                    "concurrent sender-thread/decode-rank connections. Non-terminal "
+                    "connect attempts are not evicted: restore the endpoint to deliver "
+                    "queued messages, or drain and restart this prefill to clear them."
+                )
+            self._socket_cache_size += 1
+            self._socket_monitor_sequence += 1
+            return self._socket_monitor_sequence
+
+    def _release_socket_slot(self) -> None:
+        with self._socket_lock:
+            assert self._socket_cache_size > 0
+            self._socket_cache_size -= 1
+
+    def _create_socket_entry(
+        self, endpoint: str, is_ipv6: bool, monitor_sequence: int
+    ) -> _SocketCacheEntry:
+        socket = None
+        monitor = None
+        try:
+            socket = self._zmq_ctx.socket(zmq.PUSH)
+            if is_ipv6:
+                socket.setsockopt(zmq.IPV6, 1)
+            socket.setsockopt(zmq.RECONNECT_IVL, -1)
+            socket.setsockopt(zmq.SNDTIMEO, 30000)
+            socket.setsockopt(zmq.LINGER, 0)
+            socket.setsockopt(zmq.TCP_KEEPALIVE, 1)
+            socket.setsockopt(zmq.TCP_KEEPALIVE_IDLE, 30)
+            socket.setsockopt(zmq.TCP_KEEPALIVE_INTVL, 5)
+            socket.setsockopt(zmq.TCP_KEEPALIVE_CNT, 3)
+
+            monitor_endpoint = (
+                f"inproc://sglang-kv-monitor-{id(self)}-{monitor_sequence}"
+            )
+            terminal_events = zmq.EVENT_DISCONNECTED | zmq.EVENT_CLOSED
+            socket.monitor(monitor_endpoint, terminal_events)
+            monitor = self._zmq_ctx.socket(zmq.PAIR)
+            monitor.setsockopt(zmq.LINGER, 0)
+            monitor.connect(monitor_endpoint)
+            socket.connect(endpoint)
+            return _SocketCacheEntry(socket, monitor)
+        except Exception:
+            if socket is not None:
+                try:
+                    socket.disable_monitor()
+                except Exception:
+                    logger.exception("Failed to disable incomplete ZMQ monitor")
+            if monitor is not None:
+                try:
+                    monitor.close(linger=0)
+                except Exception:
+                    logger.exception("Failed to close incomplete ZMQ monitor")
+            if socket is not None:
+                try:
+                    socket.close(linger=0)
+                except Exception:
+                    logger.exception("Failed to close incomplete ZMQ PUSH socket")
+            if (monitor is None or monitor.closed) and (
+                socket is None or socket.closed
+            ):
+                self._release_socket_slot()
+            else:
+                logger.error(
+                    "Incomplete ZMQ socket cleanup retained one capacity slot; "
+                    "drain and restart this prefill before increasing the limit"
+                )
+            raise
+
+    @staticmethod
+    def _is_socket_terminal(entry: _SocketCacheEntry) -> bool:
+        assert threading.get_ident() == entry.owner_thread_id
+        try:
+            entry.monitor.recv_multipart(zmq.NOBLOCK)
+            return True
+        except zmq.Again:
+            return False
+        except zmq.ZMQError:
+            return True
+
+    def _retire_socket_entry(
+        self,
+        cache: Dict[str, _SocketCacheEntry],
+        endpoint: str,
+        entry: _SocketCacheEntry,
+    ) -> None:
+        if cache.get(endpoint) is not entry:
+            return
+        if entry.close():
+            cache.pop(endpoint)
+            self._release_socket_slot()
+
+    def _reap_terminal_socket_entries(
+        self, cache: Dict[str, _SocketCacheEntry]
+    ) -> None:
+        """Retire terminal sockets owned by this thread only.
+
+        A connection attempt that never produces EVENT_DISCONNECTED or
+        EVENT_CLOSED remains admitted. Evicting it on a TTL with LINGER=0 could
+        discard queued control messages, so operators must restore the endpoint,
+        raise the configured limit, or restart the prefill process.
+        """
+        for endpoint, entry in list(cache.items()):
+            if self._is_socket_terminal(entry):
+                self._retire_socket_entry(cache, endpoint, entry)
 
     def get_mha_kv_ptrs_with_pp(
         self, src_kv_ptrs: List[int], dst_kv_ptrs: List[int]
@@ -809,9 +1023,9 @@ class CommonKVManager(BaseKVManager):
         """
         start_layer = self.kv_args.prefill_start_layer
         end_layer = getattr(self.kv_args, "prefill_end_layer", None)
-        assert (
-            end_layer is not None
-        ), "KVArgs.prefill_end_layer must be set when using compressed-MLA PD with PP"
+        assert end_layer is not None, (
+            "KVArgs.prefill_end_layer must be set when using compressed-MLA PD with PP"
+        )
 
         c4_full = sum(1 for r in mla_ratios if r == 4)
         c128_full = sum(1 for r in mla_ratios if r == 128)
@@ -865,8 +1079,7 @@ class CommonKVManager(BaseKVManager):
             list(dst_kv_ptrs[swa_s:swa_e])
             + list(
                 dst_kv_ptrs[
-                    compress_section_start
-                    + c4_off_s : compress_section_start
+                    compress_section_start + c4_off_s : compress_section_start
                     + c4_off_e
                 ]
             )

@@ -211,7 +211,6 @@ class ToolStrictLevel(IntEnum):
 
 
 class Envs:
-
     # Raise on bare server_args field assignments after resolution; mutation
     # must go through ServerArgs.override() (enabled by the test harness).
     SGLANG_STRICT_CONFIG_MUTATION = EnvBool(False)
@@ -370,6 +369,10 @@ class Envs:
     # NOTE: For SGLANG_DISAGGREGATION_THREAD_POOL_SIZE, the effective default is
     # computed dynamically at runtime based on cpu_count; see disaggregation backends.
     SGLANG_DISAGGREGATION_THREAD_POOL_SIZE = EnvInt(None)
+    # Manager-wide hard limit for outbound (sender thread, decode rank endpoint)
+    # socket entries. None auto-sizes from RLIMIT_NOFILE and the libzmq context
+    # socket ceiling while retaining headroom for the rest of the server.
+    SGLANG_DISAGGREGATION_MAX_CACHED_ZMQ_ENDPOINTS = EnvInt(None)
     SGLANG_DISAGGREGATION_QUEUE_SIZE = EnvInt(4)
     SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT = EnvInt(300)
     SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL = EnvFloat(5.0)
