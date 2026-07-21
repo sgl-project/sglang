@@ -2,8 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/2c58742dff8613a3bd7496f2008ce927e18d38d1/tests/kernels/mamba/test_mamba_mixer2.py
 
-import os
-
 import pytest
 import torch
 
@@ -96,8 +94,6 @@ def mixer2_gated_norm_tensor_parallel(
             "MASTER_PORT": "12345",
         }
     )
-    os.environ.setdefault("NCCL_NVLS_ENABLE", "0")
-
     # initialize distributed
     init_distributed_environment(
         world_size=world_size, rank=local_rank, local_rank=local_rank

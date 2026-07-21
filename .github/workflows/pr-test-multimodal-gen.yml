@@ -40,6 +40,7 @@ on:
 # The github context (including github.event_name) IS inherited from the caller.
 env:
   SGLANG_IS_IN_CI: true
+  NCCL_NVLS_ENABLE: "0"
   SGLANG_CUDA_COREDUMP: "1"
   PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
   SKIP_PR_TEST_HEALTH_CHECK: ${{ inputs.skip_pr_test_health_check == 'true' }}

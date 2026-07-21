@@ -60,6 +60,7 @@ on:
 # defines must be redeclared here for the called job to see the same context.
 env:
   SGLANG_IS_IN_CI: true
+  NCCL_NVLS_ENABLE: "0"
   # base-a runs the fwd-occupancy sanity kit; async-assert probes add GPU work
   # and skew the occupancy measurement, so keep them off in that stage.
   SGLANG_ENABLE_ASYNC_ASSERT: ${{ startsWith(inputs.self_name, 'base-a') && 'false' || 'true' }}

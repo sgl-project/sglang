@@ -13,7 +13,6 @@ is set.
 import inspect
 import json
 import logging
-import os
 import time
 
 from aiohttp import web
@@ -156,15 +155,6 @@ def _add_admin_routes(app, request_manager):
 
 async def serve_grpc(server_args, model_info=None):
     """Start the standalone gRPC server with integrated scheduler."""
-    if (
-        "NCCL_NVLS_ENABLE" not in os.environ
-        or server_args.enable_nccl_nvls
-        or server_args.enable_symm_mem
-    ):
-        os.environ["NCCL_NVLS_ENABLE"] = str(
-            int(server_args.enable_nccl_nvls or server_args.enable_symm_mem)
-        )
-
     try:
         from smg_grpc_servicer.sglang.server import serve_grpc as _serve_grpc
     except ImportError as e:

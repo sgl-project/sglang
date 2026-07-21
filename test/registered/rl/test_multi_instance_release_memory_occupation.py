@@ -169,7 +169,6 @@ def _run_sglang_subprocess(
     try:
         os.environ["MASTER_ADDR"] = "localhost"
         os.environ["MASTER_PORT"] = str(master_port)
-        os.environ.setdefault("NCCL_NVLS_ENABLE", "0")
         dist.init_process_group(
             rank=rank,
             device_id=torch.device(f"cuda:{rank}"),

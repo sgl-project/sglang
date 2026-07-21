@@ -27,8 +27,6 @@ Pattern follows `test/registered/layers/mamba/test_mamba2_mixer.py` —
 plays poorly with arbitrary subprocess launchers.
 """
 
-import os
-
 import pytest
 import torch
 
@@ -203,8 +201,6 @@ def test_lplb_distributed_two_rank():
 
 def _worker_main(local_rank: int, world_size: int):
     """Per-rank entry point under torch.multiprocessing.spawn."""
-    os.environ.setdefault("NCCL_NVLS_ENABLE", "0")
-
     # Inject minimal ServerArgs before any LPLB module reads the global state.
     # Silent fallbacks no longer exist — the fused CUDA path is the only LP
     # path, so this test relies on hard failures, not gating flags.
