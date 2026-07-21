@@ -781,24 +781,26 @@ class FlexKVConnector:
                     }
                 )
 
-        c4_pool = kvcache.c4_kv_pool
-        c128_pool = kvcache.c128_kv_pool
-        add_kv_group(
-            "c4",
-            4,
-            c4_layer_ids,
-            c4_pool.kv_buffer,
-            c4_pool.page_size,
-            c4_pool.get_bytes_per_token(),
-        )
-        add_kv_group(
-            "c128",
-            128,
-            c128_layer_ids,
-            c128_pool.kv_buffer,
-            c128_pool.page_size,
-            c128_pool.get_bytes_per_token(),
-        )
+        c4_pool = getattr(kvcache, "c4_kv_pool", None)
+        c128_pool = getattr(kvcache, "c128_kv_pool", None)
+        if c4_pool is not None:
+            add_kv_group(
+                "c4",
+                4,
+                c4_layer_ids,
+                c4_pool.kv_buffer,
+                c4_pool.page_size,
+                c4_pool.get_bytes_per_token(),
+            )
+        if c128_pool is not None:
+            add_kv_group(
+                "c128",
+                128,
+                c128_layer_ids,
+                c128_pool.kv_buffer,
+                c128_pool.page_size,
+                c128_pool.get_bytes_per_token(),
+            )
 
         indexer_pool = getattr(kvcache, "c4_indexer_kv_pool", None)
         dsv4_indexer_buffers = (
@@ -1013,6 +1015,8 @@ class FlexKVConnector:
         unmapped = (~mapped).nonzero(as_tuple=False)
         if unmapped.numel() > 0:
             swa_indices = swa_indices[int(unmapped[-1].item()) + 1 :]
+        if swa_indices.numel() == 0:
+            return None
         if not bool((swa_indices > 0).all()):
             raise RuntimeError("SWA slot mapping contains the reserved slot 0")
         return swa_indices

@@ -376,6 +376,8 @@ class FlexKVHybridRadixCache(BasePrefixCache):
         return torch.empty((0,), dtype=torch.int64, device=self.device)
 
     def __getattr__(self, name: str) -> Any:
+        if name.startswith("__"):
+            raise AttributeError(name)
         inner = self.__dict__.get("_inner_cache")
         if inner is None:
             raise AttributeError(name)
