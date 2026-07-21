@@ -403,10 +403,37 @@ class TestPrefetchDispatch(CustomTestCase):
             p_warn as mock_warning,
         ):
             self._run(loader)
-        mock_fast.assert_called_once()
+        mock_fast.assert_called_once_with(["f.safetensors"], enable_gds=True)
         mock_buffered.assert_not_called()
         mock_single.assert_not_called()
         mock_warning.assert_not_called()
+
+    def test_fastsafetensors_gds_can_be_disabled(self):
+        loader = self._make_loader(
+            {"enable_gds": False}, load_format=LoadFormat.FASTSAFETENSORS
+        )
+        p_prep, p_args, p_buffered, p_single, p_warn = self._patch_dispatch(
+            prefetch=False
+        )
+        with (
+            patch(
+                "sglang.srt.model_loader.loader.fastsafetensors_weights_iterator",
+                return_value=iter([]),
+            ) as mock_fast,
+            p_prep,
+            p_args,
+            p_buffered,
+            p_single,
+            p_warn,
+        ):
+            self._run(loader)
+        mock_fast.assert_called_once_with(["f.safetensors"], enable_gds=False)
+
+    def test_fastsafetensors_enable_gds_requires_boolean(self):
+        with self.assertRaisesRegex(ValueError, "enable_gds.*must be a boolean"):
+            self._make_loader(
+                {"enable_gds": "false"}, load_format=LoadFormat.FASTSAFETENSORS
+            )
 
 
 if __name__ == "__main__":

@@ -146,6 +146,12 @@ python -m sglang.launch_server \
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>model-rank-&#123;rank&#125;-part-&#123;part&#125;.safetensors</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>fastsafetensors</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>enable_gds</code> (bool)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Use GPU Direct Storage. Set to <code>false</code> when the host does not provide the NVIDIA GPUDirect Storage kernel driver, such as in a gVisor sandbox.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>true</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>bitsandbytes</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>qlora_adapter_name_or_path</code> (str)</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>QLoRA adapter to apply on top of the bitsandbytes-quantized base weights.</td>

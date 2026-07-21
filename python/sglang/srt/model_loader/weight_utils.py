@@ -983,6 +983,7 @@ def safetensors_weights_iterator(
 
 def fastsafetensors_weights_iterator(
     hf_weights_files: List[str],
+    enable_gds: bool = True,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """
     Iterate over the weights in the model safetensor files
@@ -1020,7 +1021,7 @@ def fastsafetensors_weights_iterator(
         disable=False,
         bar_format=_BAR_FORMAT,
     ):
-        loader = SafeTensorsFileLoader(pg, device)
+        loader = SafeTensorsFileLoader(pg, device, nogds=not enable_gds)
         rank_file_map = {i: [f] for i, f in enumerate(f_list)}
         loader.add_filenames(rank_file_map)
         try:
