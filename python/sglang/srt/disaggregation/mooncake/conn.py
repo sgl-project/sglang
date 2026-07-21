@@ -21,7 +21,7 @@ from sglang.srt.disaggregation.common.conn import (
     CommonKVReceiver,
     CommonKVSender,
     KVTransferError,
-    SocketCacheCapacityError,
+    SocketCacheError,
 )
 from sglang.srt.disaggregation.common.staging_handler import (
     DecodeStagingContext,
@@ -384,7 +384,7 @@ class MooncakeKVManager(CommonKVManager):
                     str(prefill_unique_rank).encode("ascii"),
                 ]
             )
-        except SocketCacheCapacityError:
+        except SocketCacheError:
             raise
         except Exception:
             pass
@@ -1497,11 +1497,11 @@ class MooncakeKVManager(CommonKVManager):
                         self.transfer_infos.pop(kv_chunk.room)
                     self.req_to_decode_prefix_len.pop(kv_chunk.room, None)
 
-            except SocketCacheCapacityError as e:
+            except SocketCacheError as e:
                 room = kv_chunk.room
                 reason = (
-                    f"Outbound ZMQ endpoint capacity reached while processing "
-                    f"room {room}: {e}"
+                    f"Outbound ZMQ socket cache failure while processing room "
+                    f"{room}: {e}"
                 )
                 self.record_failure(room, reason)
                 self.update_status(room, KVPoll.Failed)
@@ -1571,7 +1571,7 @@ class MooncakeKVManager(CommonKVManager):
                             f"Sent ABORT_ACK for room {room_to_be_aborted} to "
                             f"{decode_ip}:{decode_port}"
                         )
-                    except SocketCacheCapacityError as e:
+                    except SocketCacheError as e:
                         logger.warning(
                             "Failed to send ABORT_ACK for room %s: %s",
                             room_to_be_aborted,

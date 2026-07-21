@@ -126,34 +126,60 @@ class PrefillRankInfo:
         self.rank_port = int(self.rank_port)
 
 
-class SocketCacheCapacityError(RuntimeError):
+class SocketCacheError(RuntimeError):
+    """Base class for recoverable outbound socket-cache failures."""
+
+
+class SocketCacheCapacityError(SocketCacheError):
     """Raised before opening a new FD when no cached endpoint is safe to retire."""
 
 
+class SocketCacheCleanupError(SocketCacheError):
+    """Raised while owner-thread socket cleanup is still pending."""
+
+
 class _SocketCacheEntry:
-    def __init__(self, socket: zmq.Socket, monitor: zmq.Socket):
+    def __init__(
+        self,
+        socket: Optional[zmq.Socket],
+        monitor: Optional[zmq.Socket],
+        endpoint: Optional[str] = None,
+    ):
         self.socket = socket
         self.monitor = monitor
+        self.endpoint = endpoint
         self.owner_thread_id = threading.get_ident()
+        self.retiring = False
+        self.cleanup_pending = False
+        self.slot_released = False
+
+    def mark_retiring(self) -> None:
+        assert threading.get_ident() == self.owner_thread_id
+        self.retiring = True
 
     def close(self):
         assert threading.get_ident() == self.owner_thread_id
+        self.mark_retiring()
         try:
-            if not self.socket.closed:
+            if self.socket is not None and not self.socket.closed:
                 self.socket.disable_monitor()
         except Exception:
             logger.exception("Failed to disable cached ZMQ monitor")
         try:
-            if not self.monitor.closed:
+            if self.monitor is not None and not self.monitor.closed:
                 self.monitor.close(linger=0)
         except Exception:
             logger.exception("Failed to close cached ZMQ monitor")
         try:
-            if not self.socket.closed:
+            if self.socket is not None and not self.socket.closed:
                 self.socket.close(linger=0)
         except Exception:
             logger.exception("Failed to close cached ZMQ PUSH socket")
-        return self.monitor.closed and self.socket.closed
+        self.cleanup_pending = not (
+            (self.monitor is None or self.monitor.closed)
+            and (self.socket is None or self.socket.closed)
+        )
+        return not self.cleanup_pending
 
 
 class CommonKVManager(BaseKVManager):
@@ -211,13 +237,13 @@ class CommonKVManager(BaseKVManager):
 
         # bind zmq socket
         self._zmq_ctx = zmq.Context()
+        self._init_socket_cache()
         self.rank_port, self.server_socket = get_zmq_socket_on_host(
             self._zmq_ctx, zmq.PULL, host=self.local_ip
         )
         logger.debug(f"kv manager bind to {self.local_ip}:{self.rank_port}")
 
         self.request_status: Dict[int, KVPoll] = {}
-        self._init_socket_cache()
         self.failure_records: Dict[int, str] = {}
         self.failure_lock = threading.Lock()
 
@@ -778,6 +804,7 @@ class CommonKVManager(BaseKVManager):
     def _connect(self, endpoint: str, is_ipv6: bool = False):
         """Return a PUSH socket owned by, and only usable from, this thread."""
         cache = self._get_thread_socket_cache()
+        self._retry_pending_socket_cleanup(cache)
         entry = cache.get(endpoint)
         if entry is not None:
             if not self._is_socket_terminal(entry):
@@ -803,6 +830,13 @@ class CommonKVManager(BaseKVManager):
             self._socket_local.cache = cache
         return cache
 
+    def _get_thread_pending_socket_cleanup(self) -> List[_SocketCacheEntry]:
+        pending = getattr(self._socket_local, "pending_cleanup", None)
+        if pending is None:
+            pending = []
+            self._socket_local.pending_cleanup = pending
+        return pending
+
     def _reserve_socket_slot(self, endpoint: str) -> int:
         # Reserve before opening either the PUSH or PAIR FD so concurrent cache
         # misses cannot overshoot the manager-wide hard limit.
@@ -826,6 +860,23 @@ class CommonKVManager(BaseKVManager):
         with self._socket_lock:
             assert self._socket_cache_size > 0
             self._socket_cache_size -= 1
+
+    def _release_socket_entry_slot(self, entry: _SocketCacheEntry) -> None:
+        if entry.slot_released:
+            return
+        self._release_socket_slot()
+        entry.slot_released = True
+
+    @staticmethod
+    def _socket_cleanup_error(entry: _SocketCacheEntry) -> SocketCacheCleanupError:
+        socket_closed = entry.socket is None or entry.socket.closed
+        monitor_closed = entry.monitor is None or entry.monitor.closed
+        return SocketCacheCleanupError(
+            "Outbound ZMQ socket cache cleanup is still pending on its owner "
+            f"thread: endpoint={entry.endpoint}, PUSH closed={socket_closed}, "
+            f"PAIR closed={monitor_closed}. The capacity slot remains reserved; "
+            "drain and restart this prefill if cleanup continues to fail."
+        )
 
     def _create_socket_entry(
         self, endpoint: str, is_ipv6: bool, monitor_sequence: int
@@ -853,43 +904,34 @@ class CommonKVManager(BaseKVManager):
             monitor.setsockopt(zmq.LINGER, 0)
             monitor.connect(monitor_endpoint)
             socket.connect(endpoint)
-            return _SocketCacheEntry(socket, monitor)
-        except Exception:
-            if socket is not None:
-                try:
-                    socket.disable_monitor()
-                except Exception:
-                    logger.exception("Failed to disable incomplete ZMQ monitor")
-            if monitor is not None:
-                try:
-                    monitor.close(linger=0)
-                except Exception:
-                    logger.exception("Failed to close incomplete ZMQ monitor")
-            if socket is not None:
-                try:
-                    socket.close(linger=0)
-                except Exception:
-                    logger.exception("Failed to close incomplete ZMQ PUSH socket")
-            if (monitor is None or monitor.closed) and (
-                socket is None or socket.closed
-            ):
-                self._release_socket_slot()
-            else:
-                logger.error(
-                    "Incomplete ZMQ socket cleanup retained one capacity slot; "
-                    "drain and restart this prefill before increasing the limit"
-                )
-            raise
+            return _SocketCacheEntry(socket, monitor, endpoint)
+        except Exception as creation_error:
+            entry = _SocketCacheEntry(socket, monitor, endpoint)
+            if entry.close():
+                self._release_socket_entry_slot(entry)
+                raise
+            self._get_thread_pending_socket_cleanup().append(entry)
+            raise self._socket_cleanup_error(entry) from creation_error
 
     @staticmethod
     def _is_socket_terminal(entry: _SocketCacheEntry) -> bool:
         assert threading.get_ident() == entry.owner_thread_id
+        if entry.retiring or entry.cleanup_pending:
+            return True
+        if entry.socket is None or entry.socket.closed:
+            entry.mark_retiring()
+            return True
+        if entry.monitor is None or entry.monitor.closed:
+            entry.mark_retiring()
+            return True
         try:
             entry.monitor.recv_multipart(zmq.NOBLOCK)
+            entry.mark_retiring()
             return True
         except zmq.Again:
             return False
         except zmq.ZMQError:
+            entry.mark_retiring()
             return True
 
     def _retire_socket_entry(
@@ -900,9 +942,34 @@ class CommonKVManager(BaseKVManager):
     ) -> None:
         if cache.get(endpoint) is not entry:
             return
-        if entry.close():
-            cache.pop(endpoint)
-            self._release_socket_slot()
+        entry.mark_retiring()
+        if not entry.close():
+            raise self._socket_cleanup_error(entry)
+        cache.pop(endpoint)
+        self._release_socket_entry_slot(entry)
+
+    def _retry_pending_socket_cleanup(
+        self, cache: Dict[str, _SocketCacheEntry]
+    ) -> None:
+        failed = []
+        for endpoint, entry in list(cache.items()):
+            if not entry.retiring and not entry.cleanup_pending:
+                continue
+            try:
+                self._retire_socket_entry(cache, endpoint, entry)
+            except SocketCacheCleanupError:
+                failed.append(entry)
+
+        pending = self._get_thread_pending_socket_cleanup()
+        for entry in list(pending):
+            if not entry.close():
+                failed.append(entry)
+                continue
+            pending.remove(entry)
+            self._release_socket_entry_slot(entry)
+
+        if failed:
+            raise self._socket_cleanup_error(failed[0])
 
     def _reap_terminal_socket_entries(
         self, cache: Dict[str, _SocketCacheEntry]

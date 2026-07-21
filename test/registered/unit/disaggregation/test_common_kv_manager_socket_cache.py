@@ -257,6 +257,34 @@ class _CountingContext:
         self.context.term()
 
 
+class _StopAfterServerSocket(Exception):
+    pass
+
+
+class _InitOrderContext:
+    def __init__(self, events):
+        self.events = events
+        self.events.append("context created")
+
+    def get(self, option):
+        if option == zmq.SOCKET_LIMIT:
+            return 100
+        if option == zmq.MAX_SOCKETS:
+            return 1
+        raise AssertionError(f"unexpected context option: {option}")
+
+    def set(self, option, value):
+        if option != zmq.MAX_SOCKETS or value != 5:
+            raise AssertionError(f"unexpected context configuration: {option}={value}")
+        self.events.append("cache capacity/MAX_SOCKETS configured")
+
+    def socket(self, socket_type):
+        if socket_type != zmq.PULL:
+            raise AssertionError(f"unexpected first socket type: {socket_type}")
+        self.events.append("first server socket created")
+        raise _StopAfterServerSocket()
+
+
 class _FailingPairContext(_CountingContext):
     def __init__(self):
         super().__init__()
@@ -300,13 +328,127 @@ class _TerminalMonitor:
 
 
 class _NoopSocket:
-    closed = False
+    def __init__(self):
+        self.closed = False
 
     def disable_monitor(self):
         pass
 
     def close(self, linger=0):
         self.closed = True
+
+
+class _FailOncePush(_NoopSocket):
+    def __init__(self, events, fail_close_once):
+        super().__init__()
+        self.events = events
+        self.fail_close_once = fail_close_once
+        self.close_calls = 0
+
+    def disable_monitor(self):
+        self.events.append("disable_monitor")
+
+    def close(self, linger=0):
+        self.events.append("close_PUSH")
+        self.close_calls += 1
+        if self.fail_close_once and self.close_calls == 1:
+            raise RuntimeError("injected PUSH close failure")
+        self.closed = True
+
+
+class _FailOnceTerminalMonitor(_TerminalMonitor):
+    def __init__(self, event, events, fail_close_once):
+        super().__init__(event)
+        self.events = events
+        self.fail_close_once = fail_close_once
+        self.close_calls = 0
+
+    def close(self, linger=0):
+        self.events.append("close_PAIR")
+        self.close_calls += 1
+        if self.fail_close_once and self.close_calls == 1:
+            raise RuntimeError("injected PAIR close failure")
+        self.closed = True
+
+
+class _CreationSocket:
+    def __init__(
+        self,
+        socket_type,
+        events,
+        fail_connect=False,
+        fail_close_once=False,
+    ):
+        self.socket_type = socket_type
+        self.events = events
+        self.fail_connect = fail_connect
+        self.fail_close_once = fail_close_once
+        self.close_calls = 0
+        self.closed = False
+
+    def setsockopt(self, *args):
+        pass
+
+    def monitor(self, *args):
+        self.events.append("monitor_enabled")
+
+    def disable_monitor(self):
+        self.events.append("disable_monitor")
+
+    def connect(self, endpoint):
+        if self.socket_type == zmq.PUSH and self.fail_connect:
+            self.events.append("endpoint_connect_failed")
+            raise zmq.ZMQError("injected endpoint connect failure")
+
+    def recv_multipart(self, _flags):
+        raise zmq.Again()
+
+    def close(self, linger=0):
+        socket_name = "PUSH" if self.socket_type == zmq.PUSH else "PAIR"
+        self.events.append(f"close_{socket_name}")
+        self.close_calls += 1
+        if self.fail_close_once and self.close_calls == 1:
+            raise RuntimeError(f"injected {socket_name} close failure")
+        self.closed = True
+
+
+class _RollbackContext:
+    def __init__(self):
+        self.events = []
+        self.fail_next_creation = True
+        self.current_creation_fails = False
+        self.sockets = []
+
+    def get(self, option):
+        if option == zmq.SOCKET_LIMIT:
+            return 100
+        if option == zmq.MAX_SOCKETS:
+            return 100
+        raise AssertionError(f"unexpected context option: {option}")
+
+    def set(self, option, value):
+        raise AssertionError("the fake context already has sufficient capacity")
+
+    def socket(self, socket_type):
+        if socket_type == zmq.PUSH:
+            self.current_creation_fails = self.fail_next_creation
+            self.fail_next_creation = False
+            socket = _CreationSocket(
+                socket_type,
+                self.events,
+                fail_connect=self.current_creation_fails,
+            )
+        else:
+            socket = _CreationSocket(
+                socket_type,
+                self.events,
+                fail_close_once=self.current_creation_fails,
+            )
+        self.sockets.append(socket)
+        return socket
+
+    def term(self):
+        pass
 
 
 class _SequenceQueue:
@@ -383,6 +525,113 @@ class TestCommonKVManagerSocketCache(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.common_conn = _load_common_conn()
+
+    def test_socket_limit_is_configured_before_first_server_socket(self):
+        events = []
+        context = _InitOrderContext(events)
+        args = SimpleNamespace(
+            kv_item_lens=[],
+            state_item_lens=[],
+            is_hybrid_mla_backend=False,
+            system_dp_rank=0,
+            pp_rank=0,
+        )
+        server_args = SimpleNamespace(
+            host="127.0.0.1",
+            disaggregation_bootstrap_port=8999,
+            dist_init_addr="127.0.0.1:8998",
+            enable_dp_attention=False,
+            dp_size=1,
+            pp_size=1,
+            enable_dsa_cache_layer_split=False,
+        )
+        parallel = SimpleNamespace(
+            attn_tp_size=1,
+            attn_tp_rank=0,
+            attn_cp_size=1,
+            attn_cp_rank=0,
+        )
+
+        def create_first_server_socket(zmq_context, socket_type, host):
+            self.assertIs(zmq_context, context)
+            self.assertEqual(host, "127.0.0.1")
+            zmq_context.socket(socket_type)
+
+        with (
+            patch.object(self.common_conn.zmq, "Context", return_value=context),
+            patch.object(self.common_conn, "get_parallel", return_value=parallel),
+            patch.object(
+                self.common_conn,
+                "get_zmq_socket_on_host",
+                side_effect=create_first_server_socket,
+            ),
+            patch.object(
+                self.common_conn.envs,
+                "SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER",
+                SimpleNamespace(get=lambda: False),
+                create=True,
+            ),
+            patch.object(
+                self.common_conn.envs,
+                "SGLANG_DISAGGREGATION_MAX_CACHED_ZMQ_ENDPOINTS",
+                SimpleNamespace(get=lambda: 2),
+                create=True,
+            ),
+            self.assertRaises(_StopAfterServerSocket),
+        ):
+            self.common_conn.CommonKVManager(
+                args,
+                _DisaggregationMode.DECODE,
+                server_args,
+            )
+
+        self.assertEqual(
+            events,
+            [
+                "context created",
+                "cache capacity/MAX_SOCKETS configured",
+                "first server socket created",
+            ],
+        )
+
+    def test_real_context_honors_raised_pre_socket_limit(self):
+        context = zmq.Context()
+        sockets = []
+        try:
+            if context.get(zmq.SOCKET_LIMIT) < 4:
+                self.skipTest("libzmq socket limit is too low for the probe")
+            try:
+                context.set(zmq.MAX_SOCKETS, 1)
+                context.set(zmq.MAX_SOCKETS, 4)
+            except zmq.ZMQError as error:
+                self.skipTest(f"libzmq does not allow the controlled probe: {error}")
+            sockets = [context.socket(zmq.PAIR) for _ in range(4)]
+            self.assertEqual(len(sockets), 4)
+        finally:
+            for socket in sockets:
+                socket.close(linger=0)
+            context.term()
+
+    def test_real_pyzmq_disable_monitor_api_and_cleanup(self):
+        initial_fds = len(os.listdir("/proc/self/fd"))
+        initial_threads = len(threading.enumerate())
+        context = zmq.Context()
+        push = context.socket(zmq.PUSH)
+        pair = context.socket(zmq.PAIR)
+        monitor_endpoint = f"inproc://disable-monitor-{id(push)}"
+        push.monitor(monitor_endpoint, zmq.EVENT_ALL)
+        pair.connect(monitor_endpoint)
+
+        # Socket.disable_monitor() is documented in PyZMQ >= 14.4.
+        push.disable_monitor()
+        pair.close(linger=0)
+        push.close(linger=0)
+        self.assertTrue(pair.closed)
+        self.assertTrue(push.closed)
+        context.term()
+
+        self.assertLessEqual(len(os.listdir("/proc/self/fd")), initial_fds)
+        self.assertEqual(len(threading.enumerate()), initial_threads)
 
     def test_unique_endpoint_churn_keeps_real_fds_bounded(self):
         process = subprocess.run(
@@ -528,6 +777,135 @@ class TestCommonKVManagerSocketCache(unittest.TestCase):
         self.assertTrue(context.push_socket.closed)
         manager._zmq_ctx.term()
 
+    def _assert_terminal_cleanup_retries(self, fail_target):
+        manager = _new_manager(self.common_conn, capacity=1)
+        cache = _thread_cache(manager)
+        endpoint = "tcp://127.0.0.1:20001"
+        events = []
+        push = _FailOncePush(events, fail_close_once=fail_target == "PUSH")
+        monitor = _FailOnceTerminalMonitor(
+            zmq.EVENT_CLOSED,
+            events,
+            fail_close_once=fail_target == "PAIR",
+        )
+        old_entry = self.common_conn._SocketCacheEntry(push, monitor, endpoint)
+        replacement = self.common_conn._SocketCacheEntry(
+            _NoopSocket(),
+            _NeverTerminalMonitor(),
+            endpoint,
+        )
+        cache[endpoint] = old_entry
+        manager._socket_cache_size = 1
+
+        try:
+            with (
+                patch.object(
+                    manager,
+                    "_release_socket_slot",
+                    wraps=manager._release_socket_slot,
+                ) as release_slot,
+                patch.object(
+                    manager,
+                    "_create_socket_entry",
+                    return_value=replacement,
+                ) as create_entry,
+            ):
+                with self.assertRaises(
+                    self.common_conn.SocketCacheCleanupError
+                ) as caught:
+                    manager._connect(endpoint)
+
+                self.assertIn("capacity slot remains reserved", str(caught.exception))
+                self.assertIn("drain and restart", str(caught.exception))
+                self.assertTrue(old_entry.retiring)
+                self.assertTrue(old_entry.cleanup_pending)
+                self.assertIs(cache[endpoint], old_entry)
+                self.assertEqual(manager._socket_cache_size, 1)
+                self.assertEqual(release_slot.call_count, 0)
+                self.assertEqual(create_entry.call_count, 0)
+                self.assertEqual(
+                    events[:3],
+                    ["disable_monitor", "close_PAIR", "close_PUSH"],
+                )
+
+                returned = manager._connect(endpoint)
+                self.assertIs(returned, replacement.socket)
+                self.assertIs(cache[endpoint], replacement)
+                self.assertIsNot(cache[endpoint], old_entry)
+                self.assertTrue(old_entry.socket.closed)
+                self.assertTrue(old_entry.monitor.closed)
+                self.assertTrue(old_entry.slot_released)
+                self.assertEqual(release_slot.call_count, 1)
+                self.assertEqual(create_entry.call_count, 1)
+                self.assertEqual(manager._socket_cache_size, 1)
+
+                manager._retry_pending_socket_cleanup(cache)
+                manager._retry_pending_socket_cleanup(cache)
+                self.assertEqual(release_slot.call_count, 1)
+                self.assertEqual(manager._socket_cache_size, 1)
+
+                manager._retire_socket_entry(cache, endpoint, replacement)
+                manager._retire_socket_entry(cache, endpoint, replacement)
+                self.assertEqual(release_slot.call_count, 2)
+                self.assertEqual(manager._socket_cache_size, 0)
+        finally:
+            manager._zmq_ctx.term()
+
+    def test_monitor_cleanup_failure_retries_without_reusing_closed_socket(self):
+        self._assert_terminal_cleanup_retries("PAIR")
+
+    def test_push_cleanup_failure_retries_without_reusing_closed_socket(self):
+        self._assert_terminal_cleanup_retries("PUSH")
+
+    def test_creation_rollback_cleanup_retries_and_releases_once(self):
+        context = _RollbackContext()
+        manager = _new_manager(self.common_conn, capacity=1, context=context)
+        first_endpoint = "tcp://127.0.0.1:20002"
+        second_endpoint = "tcp://127.0.0.1:20003"
+        cache = _thread_cache(manager)
+
+        with patch.object(
+            manager,
+            "_release_socket_slot",
+            wraps=manager._release_socket_slot,
+        ) as release_slot:
+            with self.assertRaises(self.common_conn.SocketCacheCleanupError) as caught:
+                manager._connect(first_endpoint)
+
+            pending = manager._get_thread_pending_socket_cleanup()
+            self.assertEqual(len(pending), 1)
+            partial_entry = pending[0]
+            self.assertTrue(partial_entry.retiring)
+            self.assertTrue(partial_entry.cleanup_pending)
+            self.assertTrue(partial_entry.socket.closed)
+            self.assertFalse(partial_entry.monitor.closed)
+            self.assertEqual(manager._socket_cache_size, 1)
+            self.assertEqual(release_slot.call_count, 0)
+            self.assertEqual(cache, {})
+            self.assertIn("capacity slot remains reserved", str(caught.exception))
+
+            replacement_socket = manager._connect(second_endpoint)
+            self.assertIs(replacement_socket, cache[second_endpoint].socket)
+            self.assertEqual(pending, [])
+            self.assertTrue(partial_entry.monitor.closed)
+            self.assertTrue(partial_entry.slot_released)
+            self.assertEqual(release_slot.call_count, 1)
+            self.assertEqual(manager._socket_cache_size, 1)
+
+            manager._retry_pending_socket_cleanup(cache)
+            manager._retry_pending_socket_cleanup(cache)
+            self.assertEqual(release_slot.call_count, 1)
+            self.assertEqual(manager._socket_cache_size, 1)
+
+            manager._retire_socket_entry(
+                cache,
+                second_endpoint,
+                cache[second_endpoint],
+            )
+            self.assertEqual(release_slot.call_count, 2)
+            self.assertEqual(manager._socket_cache_size, 0)
+        manager._zmq_ctx.term()
+
     def test_each_sender_thread_owns_socket_and_multipart_stays_intact(self):
         manager = _new_manager(self.common_conn, capacity=8)
         receiver = manager._zmq_ctx.socket(zmq.PULL)
@@ -659,7 +1037,7 @@ class TestMooncakeCapacityRecovery(unittest.TestCase):
         cls.common_conn = _load_common_conn()
         cls.mooncake = _load_mooncake_conn(cls.common_conn)
 
-    def test_capacity_failure_cleans_only_room_and_worker_processes_next_item(self):
+    def _assert_socket_cache_failure_recovers(self, error_type):
         manager = self.mooncake.MooncakeKVManager.__new__(
             self.mooncake.MooncakeKVManager
         )
@@ -708,7 +1086,7 @@ class TestMooncakeCapacityRecovery(unittest.TestCase):
 
         def connect(endpoint, is_ipv6=False):
             if endpoint.endswith(":9001"):
-                raise self.common_conn.SocketCacheCapacityError(
+                raise error_type(
                     "endpoint=tcp://127.0.0.1:9001, limit=1, cached=1; increase limit"
                 )
             return _RecordingSocket(messages)
@@ -738,6 +1116,16 @@ class TestMooncakeCapacityRecovery(unittest.TestCase):
         self.assertNotIn(2, manager.req_to_decode_prefix_len)
         self.assertEqual(len(messages), 1)
         self.assertEqual(messages[0][0][0], b"2")
+
+    def test_capacity_failure_cleans_only_room_and_worker_processes_next_item(self):
+        self._assert_socket_cache_failure_recovers(
+            self.common_conn.SocketCacheCapacityError
+        )
+
+    def test_cleanup_failure_cleans_only_room_and_worker_processes_next_item(self):
+        self._assert_socket_cache_failure_recovers(
+            self.common_conn.SocketCacheCleanupError
+        )
 
 
 if __name__ == "__main__":
