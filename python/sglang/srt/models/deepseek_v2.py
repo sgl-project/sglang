@@ -2225,6 +2225,20 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states, topk_indices = hidden_states
         else:
             topk_indices = None
+        # [AMD/HIP] DSA prefill-CP NaN fix: on gfx950 the DSA sparse-attention output
+        # contains NaN rows for a subset of tokens under prefill context-parallel
+        # (round-robin split leaves padding / degenerate empty-sparse-KV query rows;
+        # softmax over an all-masked KV row -> NaN). Left unsanitized the NaN
+        # propagates through the residual stream to every token by the final layer,
+        # yielding all-NaN logits -> all-token-0 garbage. Sanitizing here (HIP + CP
+        # prefill only) stops the propagation; real tokens are unaffected. Additive:
+        # V1/non-CP never enters this branch (dsa/mla_enable_prefill_cp are False).
+        if (
+            _is_hip
+            and (self.dsa_enable_prefill_cp or self.mla_enable_prefill_cp)
+            and forward_batch.forward_mode.is_extend()
+        ):
+            hidden_states = torch.nan_to_num(hidden_states)
         get_attn_tp_context().clear_attn_inputs()
 
         maybe_prefetch_next_full_attention_kv(

@@ -368,6 +368,24 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
             self.cp_size = None
 
         nextn_quant_config = self._resolve_nextn_quant_config(config, quant_config)
+        # For quark, if the MTP layer is listed in exclude_layers, set quant_config to None.
+        if nextn_quant_config is not None and nextn_quant_config.get_name() == "quark":
+            from sglang.srt.layers.quantization.quark.utils import (
+                should_ignore_layer,
+            )
+
+            # GLM-5.2-safe: the MTP/NextN layer (model.layers.{N}) is exported
+            # fully unquantized (bf16) in some Quark exports (e.g. GLM-5.2-MXFP4),
+            # signalled by its eh_proj being listed in `exclude`. The bare layer
+            # prefix is never an exclude entry, so check the eh_proj weight name
+            # (mapped HF->sglang, matching how exclude_layers were mapped). When
+            # excluded, drop the NextN quant config so eh_proj and the rest of the
+            # MTP layer load as bf16. GLM-5.1 (MXFP4 MTP, eh_proj not excluded) is
+            # unaffected: the check is False and the quant config is retained.
+            ckpt_prefix = f"model.layers.{config.num_hidden_layers}.eh_proj"
+            mapped_prefix = self.hf_to_sglang_mapper._map_name(ckpt_prefix)
+            if should_ignore_layer(mapped_prefix, nextn_quant_config.exclude_layers):
+                nextn_quant_config = None
 
         self.model = DeepseekModelNextN(
             config, nextn_quant_config, prefix=add_prefix("model", prefix)
