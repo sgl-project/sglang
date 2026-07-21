@@ -80,7 +80,7 @@ export const config = {
   --dataset-name {{DATASET}} \\
   --random-input-len {{ISL}} --random-output-len {{OSL}} \\
   --num-prompts {{NUM_PROMPTS}} --max-concurrency {{MAX_CONCURRENCY}} \\
-  --warmup-requests 64`,
+  --warmup-requests 64 --flush-cache`,
     accuracy: {
       gsm8k_pct:
 `# To install sgl-eval: pip install git+https://github.com/sgl-project/sgl-eval
