@@ -699,6 +699,11 @@ class ServerArgs:
                 "nvfp4",
                 "fp4_mx_block16",
                 "fp4_e2m1",
+                # KVarN presets (see KVARN_PRESETS in kvarn/config.py)
+                "kvarn_k4v2_g128",
+                "kvarn_k4v4_g128",
+                "kvarn_k4v2_g64",
+                "kvarn_k4v4_g64",
             ],
             resolvable=True,
         ),
@@ -2172,7 +2177,8 @@ class ServerArgs:
             "DFLASH draft costs 10240 bytes/token in bf16. Setting fp8_e4m3 halves the draft "
             "pool; the saving shows up as free device memory, so raise "
             "--mem-fraction-static to convert it into KV capacity. Default follows "
-            "--kv-cache-dtype.",
+            "--kv-cache-dtype (KVarN targets fall back to the draft model dtype: "
+            "KVarN has no real KV pool for the draft to reuse).",
             choices=["auto", "fp8_e5m2", "fp8_e4m3", "bf16", "bfloat16"],
         ),
         NS("spec"),
@@ -4620,6 +4626,12 @@ class ServerArgs:
                 "decode context parallel (dcp_size > 1)",
                 lambda: self.dcp_size > 1,
             ),
+            # KVarN: the Triton backend (inner) doesn't support EXTEND mode
+            # for piecewise CUDA graph replay. Disable prefill CUDA graph.
+            (
+                "KVarN attention backend",
+                lambda: self._resolved().kv_cache_dtype.startswith("kvarn_"),
+            ),
         ]
         for _name, predicate in rules:
             if predicate():
@@ -4666,6 +4678,12 @@ class ServerArgs:
                 "multimodal model",
                 lambda: self.get_model_config().is_multimodal
                 and not self.get_model_config().is_multimodal_breakable_cuda_graph_supported,
+            ),
+            # KVarN: the Triton backend (inner) doesn't support EXTEND mode
+            # for piecewise/breakable CUDA graph replay. Disable prefill CUDA graph.
+            (
+                "KVarN attention backend",
+                lambda: self._resolved().kv_cache_dtype.startswith("kvarn_"),
             ),
         ]
         for name, predicate in rules:

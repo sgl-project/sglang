@@ -241,6 +241,11 @@ class BaseSpecWorker(ABC):
         draft_runners = self._draft_model_runners()
         if not draft_runners:
             return HiCacheDraftPlan()
+        # DFLASH keeps a compact sliding-window draft KV (window_size tokens per
+        # request) that is never radix-evicted, so offloading it to host buys
+        # nothing and wastes RAM. Skip host-pool creation for the draft.
+        if spec_algorithm.is_dflash():
+            return HiCacheDraftPlan()
         draft_pools = tuple(runner.token_to_kv_pool for runner in draft_runners)
         if (
             "InklingForConditionalGenerationMTP"

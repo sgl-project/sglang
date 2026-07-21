@@ -969,6 +969,11 @@ class HybridLinearAttnBackend(AttentionBackend):
         self.extend_dummy_seqs_capped_by_req_pool = getattr(
             full_attn_backend, "extend_dummy_seqs_capped_by_req_pool", False
         ) or getattr(linear_attn_backend, "extend_dummy_seqs_capped_by_req_pool", False)
+        # The full-attn backend drives TARGET_VERIFY; inherit its graph-capture
+        # capability (e.g. KVarN's fused verify path is eager-only).
+        self.supports_target_verify_cuda_graph = getattr(
+            full_attn_backend, "supports_target_verify_cuda_graph", True
+        )
 
     @property
     def data_type(self):
