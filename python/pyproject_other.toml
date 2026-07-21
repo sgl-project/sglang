@@ -76,6 +76,7 @@ diffusion_common = [
   "imageio==2.36.0",
   "imageio-ffmpeg==0.5.1",
   "moviepy>=2.0.0",
+  "msgpack",
   "opencv-python-headless==4.10.0.84",
   "PyYAML==6.0.1",
   "remote-pdb",
