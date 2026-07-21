@@ -1233,6 +1233,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 result.inserted_host_node = node
             return result
 
+        # Parent not backed up: drop this best-effort prefetch refill (free its host pages).
+        if node is not self.root_node and not node.backuped:
+            self.cache_controller.mem_pool_host.free(host_value)
+            return result
+
         new_node = UnifiedTreeNode(self.tree_components, priority=node.priority)
         new_node.parent = node
         new_node.key = key
