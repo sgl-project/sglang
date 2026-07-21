@@ -229,6 +229,7 @@ class BaseTpWorker(ABC):
             tensors,
             recv_req.config_dict,
             recv_req.added_tokens_config,
+            upsert=recv_req.upsert,
         )
         return result
 
@@ -243,6 +244,7 @@ class BaseTpWorker(ABC):
             recv_req.config_dict,
             recv_req.group_name,
             recv_req.added_tokens_config,
+            upsert=recv_req.upsert,
         )
         return result
 

@@ -2012,6 +2012,8 @@ class LoadLoRAAdapterFromTensorsReqInput(BaseReq, kw_only=True):
     added_tokens_config: Optional[Dict[str, Any]] = None
     lora_id: Optional[str] = None
     load_format: Optional[str] = None
+    # If already loaded, refresh weights in place instead of failing.
+    upsert: bool = False
     expected_checksums: Optional[Dict[str, str]] = None
 
     def to_ref(self) -> LoRARef:
@@ -2033,6 +2035,8 @@ class LoadLoRAAdapterFromDistributedReqInput(BaseReq, kw_only=True):
     pinned: bool = False
     added_tokens_config: Optional[Dict[str, Any]] = None
     lora_id: Optional[str] = None
+    # If already loaded, refresh weights in place instead of failing.
+    upsert: bool = False
 
     def to_ref(self) -> LoRARef:
         return LoRARef(

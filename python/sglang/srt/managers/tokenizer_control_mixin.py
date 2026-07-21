@@ -663,6 +663,24 @@ class TokenizerControlMixin:
                 error_message=str(e),
             )
 
+    def _validate_lora_upsert_supported(
+        self: TokenizerManager,
+        obj: LoadLoRAAdapterFromDistributedReqInput,
+    ) -> None:
+        """Upsert resolves lora_name -> lora_id through this process's registry.
+
+        With multiple tokenizer workers each HTTP worker process holds its own
+        registry, so the resolution depends on which worker the router picks:
+        a worker that never served the original load would mint a fresh id and
+        die on the backend duplicate check. Fail loudly instead.
+        """
+        if obj.upsert and self.server_args.tokenizer_worker_num > 1:
+            raise ValueError(
+                "LoRA upsert is not supported with tokenizer_worker_num > 1: "
+                "each HTTP worker resolves lora_name against its own registry, "
+                "making upsert nondeterministic across workers."
+            )
+
     async def load_lora_adapter_from_tensors(
         self: TokenizerManager,
         obj: LoadLoRAAdapterFromTensorsReqInput,
@@ -679,6 +697,15 @@ class TokenizerControlMixin:
             assert (
                 self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
             ), "dp_size must be 1 or dp attention must be enabled for dynamic lora loading"
+            if obj.upsert:
+                # In-place refresh is only wired up on the from_distributed
+                # route (the disaggregated RL weight-sync path). Reject
+                # explicitly instead of dying later on the duplicate check
+                # with a fresh uuid.
+                raise ValueError(
+                    "upsert is not supported on the from_tensors route; use "
+                    "/load_lora_adapter_from_distributed to refresh an adapter in place."
+                )
             logger.info(
                 "Start load Lora adapter from tensors. Lora name=%s",
                 obj.lora_name,
@@ -756,16 +783,26 @@ class TokenizerControlMixin:
             )
 
             async with self.lora_update_lock:
-                new_adapter = LoRARef(
-                    lora_name=obj.lora_name,
-                    lora_path="__distributed__",
-                    pinned=obj.pinned,
+                self._validate_lora_upsert_supported(obj)
+                # With upsert, a same-name adapter keeps its lora_id so the
+                # backend refreshes it in place instead of failing the
+                # duplicate check; otherwise this resolves to a fresh ref.
+                new_adapter, reused = await self.lora_registry.register_or_reuse(
+                    LoRARef(
+                        lora_name=obj.lora_name,
+                        lora_path="__distributed__",
+                        pinned=obj.pinned,
+                    ),
+                    upsert=obj.upsert,
                 )
                 obj.lora_id = new_adapter.lora_id
                 result = (await self.update_lora_adapter_communicator(obj))[0]
 
                 if result.success:
-                    await self.lora_registry.register(new_adapter)
+                    if reused:
+                        await self.lora_registry.refresh(new_adapter)
+                    else:
+                        await self.lora_registry.register(new_adapter)
                     self.lora_ref_cache[obj.lora_name] = new_adapter
                 if self.server_args.max_loaded_loras is not None:
                     while (
