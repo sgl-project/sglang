@@ -78,6 +78,7 @@ from sglang.srt.layers.cp.utils import (
     get_cp_strategy,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.moe.dwdp import DwdpManager
 from sglang.srt.layers.sampler import create_sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
@@ -160,7 +161,11 @@ from sglang.srt.model_executor.runner import (
     get_batch_sizes_to_capture,
 )
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import (
+    get_global_dwdp_manager,
+    get_server_args,
+    set_global_dwdp_manager,
+)
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import (  # noqa: F401  (re-export)
     CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS,
@@ -521,6 +526,7 @@ class ModelRunner:
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             memory_pool_config=self.memory_pool_config,
+            draft_model_idx=self.draft_model_idx,
         )
 
     def init_mindspore_runner(self):
@@ -555,6 +561,9 @@ class ModelRunner:
             moe_ep_size=self.ps.moe_ep_size,
             moe_ep_rank=self.ps.moe_ep_rank,
         )
+
+        self.maybe_init_dwdp()
+
         # Must run before backend/graph init so no draft graph records a
         # routed-experts capture-write kernel.
         if self.is_draft_worker:
@@ -1018,6 +1027,15 @@ class ModelRunner:
             is_ep_joiner=self.server_args.is_ep_joiner,
         )
 
+    def maybe_init_dwdp(self):
+        if self.is_draft_worker:
+            return
+        if self.server_args.dwdp_size <= 1:
+            return
+        manager = DwdpManager(self.server_args)
+        set_global_dwdp_manager(manager)
+        manager.setup(self.model)
+
     def init_lora_manager(self):
         self.lora_manager = LoRAManager(
             base_model=self.model,
@@ -1428,6 +1446,10 @@ class ModelRunner:
             # dispatch below reads the pool.
             self._maybe_execute_deferred_mamba_cow_and_clear(forward_batch)
 
+            dwdp_mgr = get_global_dwdp_manager()
+            if dwdp_mgr is not None:
+                dwdp_mgr.prefetch_first_layers()
+
             if forward_batch.forward_mode.is_split_prefill():
                 # Layer-split mode; stays on ModelRunner, not the eager runner.
                 ret = self.forward_split_prefill(
@@ -1556,7 +1578,6 @@ class ModelRunner:
         self.sampler.compute_logprobs_only(
             logits_output,
             forward_batch.sampling_info,
-            forward_batch.return_logprob,
             forward_batch.top_logprobs_nums,
             forward_batch.token_ids_logprobs,
         )
