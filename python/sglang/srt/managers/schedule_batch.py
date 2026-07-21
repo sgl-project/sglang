@@ -1489,11 +1489,6 @@ class Req(ReqDllmMixin):
             self.finished_len = self.sampling_params.max_new_tokens
             return
 
-        if self.grammar is not None:
-            if self.grammar.is_terminated():
-                self.finished_reason = FINISH_MATCHED_TOKEN(matched=self.output_ids[-1])
-                return
-
         new_accepted_tokens = self.output_ids[-new_accepted_len:]
 
         # Sanitize out-of-range / NaN token ids before any decode.
@@ -1507,6 +1502,10 @@ class Req(ReqDllmMixin):
             return
 
         if self._check_token_based_finish(new_accepted_tokens):
+            return
+
+        if self.grammar is not None and self.grammar.is_terminated():
+            self.finished_reason = FINISH_MATCHED_TOKEN(matched=self.output_ids[-1])
             return
 
     def reset_for_retract(self):
@@ -3008,6 +3007,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             forward_mode=self.forward_mode,
             out_cache_loc=self.out_cache_loc,
             return_logprob=self.return_logprob,
+            has_grammar=self.has_grammar,
             decoding_reqs=self.decoding_reqs,
             spec_algorithm=self.spec_algorithm,
             spec_info=self.spec_info,

@@ -1622,7 +1622,10 @@ class ServerArgs:
     ] = False
     disable_custom_all_reduce: A[
         bool,
-        "Disable the custom all-reduce kernel and fall back to NCCL.",
+        Arg(
+            help="Disable the custom all-reduce kernel and fall back to NCCL.",
+            resolvable=True,
+        ),
     ] = False
     enable_mscclpp: A[
         bool,
@@ -1666,7 +1669,10 @@ class ServerArgs:
             resolvable=True,
         ),
     ] = None
-    enable_aiter_allreduce_fusion: A[bool, "Enable Aiter AllReduce Fusion."] = False
+    enable_aiter_allreduce_fusion: A[
+        bool,
+        Arg(help="Enable Aiter AllReduce Fusion.", resolvable=True),
+    ] = False
 
     # -------------------------------------------------------------------------
     # Torch compile and torchao
@@ -2277,6 +2283,18 @@ class ServerArgs:
             type_parser=json.loads,
         ),
     ] = None
+    mm_processor_worker_num: A[
+        int,
+        "Number of threads for multimodal processor calls. 0 selects the "
+        "model-specific default. Only processors with isolated-worker support "
+        "can use more than one thread.",
+    ] = 0
+    mm_io_worker_num: A[
+        int,
+        "Number of threads for multimodal data loading and decoding. 0 selects "
+        "the model-specific default. SGLANG_IO_WORKERS remains supported as an "
+        "environment override when this argument is 0.",
+    ] = 0
     limit_mm_data_per_request: A[
         Optional[Union[str, Dict[str, int]]],
         Arg(
@@ -3497,16 +3515,6 @@ class ServerArgs:
                     self.cuda_graph_config.decode.backend,
                 )
                 self.cuda_graph_config.decode.backend = Backend.DISABLED
-
-            if self.cuda_graph_config.prefill.backend not in (
-                Backend.DISABLED,
-                Backend.TC_PIECEWISE,
-            ):
-                logger.warning(
-                    "XPU platform currently only supports prefill tc_piecewise CUDA graph; "
-                    "disabling unsupported prefill backend."
-                )
-                self.cuda_graph_config.prefill.backend = Backend.DISABLED
 
     # ------------------------------------------------------------------
     # CUDA graph configuration resolution
@@ -7624,6 +7632,10 @@ class ServerArgs:
 
         assert self.tokenizer_worker_num > 0, "Tokenizer worker num must >= 1"
         assert self.detokenizer_worker_num > 0, "Detokenizer worker num must >= 1"
+        assert (
+            self.mm_processor_worker_num >= 0
+        ), "Multimodal processor worker num must >= 0"
+        assert self.mm_io_worker_num >= 0, "Multimodal I/O worker num must >= 0"
         self.validate_buckets_rule(
             "--prompt-tokens-buckets", self.prompt_tokens_buckets
         )
