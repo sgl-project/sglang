@@ -4871,7 +4871,7 @@ class ServerArgs:
         1. Models with MHA Architecture (e.g: Llama, QWen)
             1.1 We will turn on FA3 on hopper unless user use spec decode with topk > 1 or page_size > 1.
             1.2 Use trtllm_mha for SM100/SM103 (Blackwell B200/GB200/B300) excluding spec with topk > 1.
-               Note: trtllm_mha does not support SM120, which will fall back to flashinfer.
+               SM120 supports explicitly selected trtllm_mha through FlashInfer FMHAv2.
             1.3 In other cases, we will use flashinfer if available, otherwise use triton.
         2. Models with MLA Architecture and using FA3
             2.1 We will use FA3 backend on hopper.
@@ -5008,10 +5008,16 @@ class ServerArgs:
 
         prefill_backend, decode_backend = self._resolved_attention_backends()
         if "trtllm_mha" in (prefill_backend, decode_backend):
-            if prefill_backend == "trtllm_mha" and not is_sm100_supported():
+            if prefill_backend == "trtllm_mha" and not (
+                is_sm100_supported() or is_sm120_supported()
+            ):
                 raise ValueError(
-                    "TRTLLM MHA backend for prefill is only supported on Blackwell GPUs (SM100). Please use a different prefill backend."
+                    "TRTLLM MHA backend for prefill is only supported on "
+                    "Blackwell GPUs (SM100 or SM120). Please use a different "
+                    "prefill backend."
                 )
+            if prefill_backend == "trtllm_mha" and is_sm120_supported():
+                envs.SGLANG_USE_HND_KVCACHE.set(True)
             if decode_backend == "trtllm_mha" and not (
                 is_sm90_supported() or is_sm100_supported() or is_sm120_supported()
             ):

@@ -1986,8 +1986,27 @@ class MHATokenToKVPool(KVCache):
                 if self.enable_custom_mem_pool
                 else nullcontext()
             ):
+                # FMHAv2 on SM120 consumes a combined [page, 2, H, P, D]
+                # cache.
+                if self.use_hnd and self.head_dim == self.v_head_dim:
+                    self.combined_kv_buffer = [
+                        torch.zeros(
+                            (
+                                self.num_pages,
+                                2,
+                                self.head_num,
+                                self.page_size,
+                                self.head_dim,
+                            ),
+                            dtype=self.store_dtype,
+                            device=self.device,
+                        )
+                        for _ in range(self.layer_num)
+                    ]
+                    self.k_buffer = [x[:, 0] for x in self.combined_kv_buffer]
+                    self.v_buffer = [x[:, 1] for x in self.combined_kv_buffer]
                 # The padded page (slot 0's page) absorbs dummy padded-token writes.
-                if self.kv_cache_layout == "vectorized_5d":
+                elif self.kv_cache_layout == "vectorized_5d":
                     total_slots = self.size + self.page_size
                     num_blocks = total_slots // self.page_size
                     x = self._kv_vector_x
@@ -2021,6 +2040,7 @@ class MHATokenToKVPool(KVCache):
                         )
                         for _ in range(self.layer_num)
                     ]
+
                 else:
                     k_shape, v_shape = self._kv_buffer_shapes()
                     self.k_buffer = [
@@ -2031,6 +2051,12 @@ class MHATokenToKVPool(KVCache):
                         torch.zeros(v_shape, dtype=self.store_dtype, device=self.device)
                         for _ in range(self.layer_num)
                     ]
+
+    def get_combined_kv_buffer(self, layer_id: int) -> Optional[torch.Tensor]:
+        buffers = getattr(self, "combined_kv_buffer", None)
+        if buffers is None:
+            return None
+        return buffers[layer_id - self.start_layer]
 
     # -- post-capture VA backing (opt-in; overridable per layout) --------------
 
@@ -3670,6 +3696,11 @@ class HybridLinearKVPool(KVCache):
         self._wait_for_layer(layer_id)
         layer_id = self._transfer_full_attention_id(layer_id)
         return self.full_kv_pool.get_kv_buffer(layer_id)
+
+    def get_combined_kv_buffer(self, layer_id: int) -> Optional[torch.Tensor]:
+        self._wait_for_layer(layer_id)
+        layer_id = self._transfer_full_attention_id(layer_id)
+        return self.full_kv_pool.get_combined_kv_buffer(layer_id)
 
     def get_raw_kv_buffer(
         self, layer_id: int

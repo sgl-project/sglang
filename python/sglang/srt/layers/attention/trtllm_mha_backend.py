@@ -1,9 +1,6 @@
 from __future__ import annotations
 
-"""
-Support attention backend for TRTLLM MHA kernels from flashinfer.
-The kernel supports sm100 only, with sliding window and attention sink features.
-"""
+"""Support attention backend for TRTLLM MHA kernels from FlashInfer."""
 
 import logging
 from dataclasses import dataclass
@@ -1086,12 +1083,16 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
         # [num_pages, page_size, num_kv_heads, head_dim] -> [num_pages, num_kv_heads, page_size, head_dim]
         k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-        k_cache = k_cache.view(
-            -1, self.page_size, layer.tp_k_head_num, layer.head_dim
-        ).permute(0, 2, 1, 3)
-        v_cache = v_cache.view(
-            -1, self.page_size, layer.tp_v_head_num, layer.head_dim
-        ).permute(0, 2, 1, 3)
+        if k_cache.dim() == 4:
+            # HND cache is already [page, head, token, dim].
+            assert v_cache.dim() == 4
+        else:
+            k_cache = k_cache.view(
+                -1, self.page_size, layer.tp_k_head_num, layer.head_dim
+            ).permute(0, 2, 1, 3)
+            v_cache = v_cache.view(
+                -1, self.page_size, layer.tp_v_head_num, layer.head_dim
+            ).permute(0, 2, 1, 3)
 
         if layer.tp_k_head_num == 1:
             k_cache = canonicalize_stride(k_cache)
@@ -1153,6 +1154,42 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 max_seqlen_q,
                 cu_seqlens_kv,
             ):
+                if is_sm120_supported():
+                    window_left = layer.sliding_window_size
+                    combined_kv_cache = (
+                        self.token_to_kv_pool.get_combined_kv_buffer(layer.layer_id)
+                    )
+                    if combined_kv_cache is None:
+                        raise RuntimeError(
+                            "TRTLLM FMHAv2 prefill on SM120 requires the combined "
+                            "HND KV-cache layout."
+                        )
+                    return flashinfer.prefill.trtllm_fmha_v2_prefill(
+                        qkv=(q_chunk, combined_kv_cache),
+                        input_layout="Q_PAGED_KV_HND",
+                        workspace_buffer=self.workspace_buffer,
+                        block_tables=page_table,
+                        seq_lens=cache_seqlens,
+                        max_q_len=max_seqlen_q,
+                        max_kv_len=self.max_context_len,
+                        bmm1_scale=bmm1_scale,
+                        bmm2_scale=bmm2_scale,
+                        batch_size=cu_seqlens_q.shape[0] - 1,
+                        cum_seq_lens_q=cu_seqlens_q,
+                        cum_seq_lens_kv=cu_seqlens_kv,
+                        mask_mode=(
+                            "sliding_window"
+                            if window_left is not None and window_left >= 0
+                            else "causal"
+                        ),
+                        window_left=window_left if window_left is not None else -1,
+                        sinks=attention_sink,
+                        skip_softmax_threshold_scale_factor=(
+                            envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get()
+                            or 0.0
+                        ),
+                        out_dtype=self.q_data_type,
+                    )
                 return flashinfer.prefill.trtllm_batch_context_with_kv_cache(
                     query=q_chunk,
                     kv_cache=kv_cache,
