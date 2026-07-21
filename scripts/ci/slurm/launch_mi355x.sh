@@ -315,10 +315,16 @@ if (( PN_PER > 1 || DN_PER > 1 )); then
 -e MORI_SHMEM_MODE=ISOLATION -e MORI_EP_LAUNCH_CONFIG_MODE=AUTO -e MORI_APP_LOG_LEVEL=INFO \
 -e MORI_RDMA_SL=3 -e MORI_RDMA_TC=104 -e MORI_IO_SL=3 -e MORI_IO_TC=104 -e MORI_IO_TC_DISABLE=0 \
 -e SGLANG_MORI_DISPATCH_INTER_KERNEL_SWITCH_THRESHOLD=4096 \
--e SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1 \
 -e SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=3600 -e SGLANG_DISAGGREGATION_WAITING_TIMEOUT=3600 \
 -e SGLANG_DISAGGREGATION_NUM_PRE_ALLOCATE_REQS=32 -e SGLANG_EAGER_INPUT_NO_COPY=true \
 -e MORI_BOOTSTRAP_TIMEOUT=300"
+    # The overlap plan stream is a wide-EP perf knob, but it makes
+    # EAGLEWorkerV2.verify call attn_backend.update_verify_buffers_to_fill_after_draft,
+    # which the DSV4 MLA backend does not implement (NotImplementedError). Only
+    # enable it for non-MTP wide-EP; MTP wide-EP uses the plain verify path (as EP8 does).
+    if [[ "$MTP_ENABLED" != "1" ]]; then
+        MORI_ENV="$MORI_ENV -e SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1"
+    fi
     if [[ -n "$DIST_SOCK" ]]; then
         MORI_ENV="$MORI_ENV -e GLOO_SOCKET_IFNAME=$DIST_SOCK -e NCCL_SOCKET_IFNAME=$DIST_SOCK -e MORI_SOCKET_IFNAME=$DIST_SOCK"
     fi
