@@ -1,5 +1,6 @@
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 import torch.nn.functional as F
@@ -295,6 +296,146 @@ class TestDFlashDominoRollout(CustomTestCase):
                         actual[:, 0], first_expected, rtol=0, atol=0
                     )
 
+    def test_tp2_gathered_base_matches_full_vocab_rollout(self):
+        class FakeTpGroup:
+            world_size = 2
+
+            def __init__(self, remote_logits):
+                self.remote_logits = remote_logits
+                self.candidate_ids = None
+                self.local_top_scores = None
+                self.remote_top_scores = None
+
+            def all_gather_into_tensor(self, output, local):
+                output[: local.shape[0]].copy_(local)
+                if local.ndim == 1:
+                    remote_max, remote_pos = self.remote_logits[0, :, :15].max(-1)
+                    remote = (
+                        remote_pos + 16 if local.dtype == torch.long else remote_max
+                    )
+                elif local.shape[0] == local_vocab_size:
+                    remote = self.remote_logits.reshape(-1, local_vocab_size).T
+                else:
+                    k = local.shape[1]
+                    remote_scores, remote_pos = torch.topk(
+                        self.remote_logits[1:, :, :15].amax(0),
+                        k=k,
+                        dim=-1,
+                        sorted=False,
+                    )
+                    if local.dtype == torch.long:
+                        remote = remote_pos + 16
+                        all_scores = (
+                            torch.stack(
+                                (self.local_top_scores, self.remote_top_scores), dim=0
+                            )
+                            .permute(1, 0, 2)
+                            .reshape(local.shape[0], -1)
+                        )
+                        all_ids = (
+                            torch.stack((local, remote), dim=0)
+                            .permute(1, 0, 2)
+                            .reshape(local.shape[0], -1)
+                        )
+                        global_pos = torch.topk(
+                            all_scores, k=k, dim=-1, sorted=False
+                        ).indices
+                        self.candidate_ids = torch.gather(all_ids, 1, global_pos)
+                    else:
+                        remote = remote_scores
+                        self.local_top_scores = local.clone()
+                        self.remote_top_scores = remote_scores
+                output[local.shape[0] :].copy_(remote)
+
+            def all_reduce(self, local):
+                remote_owned = (self.candidate_ids >= 16) & (self.candidate_ids < 31)
+                remote_pos = (self.candidate_ids - 16).clamp(0, 14)
+                remote = torch.gather(
+                    self.remote_logits[1:].transpose(0, 1),
+                    2,
+                    remote_pos[:, None, :].expand(
+                        -1, self.remote_logits.shape[0] - 1, -1
+                    ),
+                )
+                remote.masked_fill_(~remote_owned[:, None, :], 0)
+                local.add_(remote)
+                return local
+
+        block_size = 7
+        batch_size = 3
+        local_vocab_size = 16
+        padded_weight = torch.cat(
+            (
+                self.lm_head_weight,
+                torch.zeros(
+                    1,
+                    self.hidden_size,
+                    device=self.device,
+                    dtype=self.dtype,
+                ).fill_(1000),
+            )
+        )
+        local_weight = padded_weight[:local_vocab_size]
+        remote_weight = padded_weight[local_vocab_size:]
+        verified_ids = torch.tensor([1, 4, 9], device=self.device)
+
+        for shift_label in (True, False):
+            draft_hidden = torch.randn(
+                batch_size,
+                block_size,
+                self.hidden_size,
+                device=self.device,
+                dtype=self.dtype,
+            )
+            start = 0 if shift_label else 1
+            z = draft_hidden[:, start : start + block_size - 1]
+            logits_input = (
+                z.transpose(0, 1)
+                .contiguous()
+                .view((block_size - 1) * batch_size, self.hidden_size)
+            )
+            remote_logits = F.linear(logits_input, remote_weight).view(
+                block_size - 1, batch_size, local_vocab_size
+            )
+
+            cases = ((0, False), (5, False), (5, True))
+            for candidate_pool_size, force_compact in cases:
+                with self.subTest(
+                    shift_label=shift_label,
+                    candidate_pool_size=candidate_pool_size,
+                    force_compact=force_compact,
+                ):
+                    rollout_kwargs = dict(
+                        draft_hidden=draft_hidden,
+                        verified_ids=verified_ids,
+                        target_embedding=self.embedding,
+                        lm_head_weight=local_weight,
+                        prefix_gru=self.prefix_gru,
+                        embed_proj=self.embed_proj,
+                        vocab_size=self.vocab_size,
+                        shift_label=shift_label,
+                        candidate_pool_size=candidate_pool_size,
+                        tp_group=FakeTpGroup(remote_logits),
+                        lm_head_num_org=local_vocab_size,
+                        lm_head_num_org_padded=local_vocab_size,
+                    )
+                    if force_compact:
+                        with mock.patch(
+                            "sglang.srt.speculative.domino_utils."
+                            "_DOMINO_TP_FULL_BASE_LOGITS_MAX_BYTES",
+                            0,
+                        ):
+                            actual = domino_greedy_rollout(**rollout_kwargs)
+                    else:
+                        actual = domino_greedy_rollout(**rollout_kwargs)
+                    expected = self._oracle(
+                        draft_hidden,
+                        verified_ids,
+                        shift_label=shift_label,
+                        candidate_pool_size=candidate_pool_size,
+                    )
+                    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
     def test_block_candidate_pool_matches_oracle(self):
         block_size = 7
         draft_hidden = torch.randn(
@@ -574,6 +715,24 @@ class TestDFlashDominoRuntimeValidation(CustomTestCase):
         )
         return embedding, lm_head, prefix_gru, embed_proj
 
+    def _tp2_modules(self):
+        embedding, lm_head, prefix_gru, embed_proj = self._modules()
+        embedding = nn.Embedding(16, 8, dtype=torch.bfloat16)
+        lm_head = nn.Linear(8, 16, bias=False, dtype=torch.bfloat16)
+        shard = SimpleNamespace(
+            num_added_elements=0,
+            org_vocab_start_index=0,
+            org_vocab_end_index=16,
+            num_org_elements=16,
+            num_org_elements_padded=16,
+        )
+        for module in (embedding, lm_head):
+            module.shard_indices = shard
+            module.org_vocab_size = 31
+            module.tp_size = 2
+            module.num_added_embeddings = 0
+        return embedding, lm_head, prefix_gru, embed_proj
+
     def _validate(self, **overrides):
         embedding, lm_head, prefix_gru, embed_proj = overrides.pop(
             "modules", self._modules()
@@ -581,6 +740,7 @@ class TestDFlashDominoRuntimeValidation(CustomTestCase):
         args = {
             "device": torch.device("cuda"),
             "tp_size": 1,
+            "tp_rank": 0,
             "target_vocab_size": 31,
             "draft_vocab_size": 31,
             "hidden_size": 8,
@@ -595,9 +755,45 @@ class TestDFlashDominoRuntimeValidation(CustomTestCase):
     def test_supported_runtime(self):
         self._validate()
 
-    def test_tp_and_vocab_mismatches_fail(self):
-        with self.assertRaisesRegex(ValueError, "TP=1"):
+    def test_tp_requires_vocab_shard_metadata(self):
+        with self.assertRaisesRegex(ValueError, "lm_head shard metadata"):
             self._validate(tp_size=2)
+
+    def test_tp2_vocab_shards_supported(self):
+        self._validate(tp_size=2, modules=self._tp2_modules())
+
+    def test_tp2_incomplete_lm_head_shard_fails(self):
+        modules = self._tp2_modules()
+        modules[1].shard_indices = SimpleNamespace(
+            num_added_elements=0,
+            num_org_elements_padded=16,
+        )
+        with self.assertRaisesRegex(ValueError, "shard metadata is missing"):
+            self._validate(tp_size=2, modules=modules)
+
+    def test_tp_vocab_shard_must_match_rank(self):
+        modules = self._tp2_modules()
+        modules[1].shard_indices.org_vocab_start_index = 1
+        modules[1].shard_indices.org_vocab_end_index = 17
+        with self.assertRaisesRegex(ValueError, "does not match its TP rank"):
+            self._validate(tp_size=2, modules=modules)
+
+    def test_tp1_requires_complete_vocab_shard(self):
+        modules = self._modules()
+        modules[1].shard_indices = SimpleNamespace(
+            num_added_elements=0,
+            org_vocab_start_index=0,
+            org_vocab_end_index=30,
+            num_org_elements=30,
+            num_org_elements_padded=31,
+        )
+        modules[1].org_vocab_size = 31
+        modules[1].tp_size = 1
+        modules[1].num_added_embeddings = 0
+        with self.assertRaisesRegex(ValueError, "does not match its TP rank"):
+            self._validate(modules=modules)
+
+    def test_vocab_mismatch_fails(self):
         with self.assertRaisesRegex(ValueError, "identical target and draft"):
             self._validate(draft_vocab_size=30)
 
