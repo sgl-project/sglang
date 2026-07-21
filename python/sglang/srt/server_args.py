@@ -69,6 +69,7 @@ from sglang.srt.utils.common import (
     get_int_env_var,
     get_quantization_config,
     human_readable_int,
+    is_blackwell_supported,
     is_cpu,
     is_cuda,
     is_flashinfer_available,
@@ -262,6 +263,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "aiter",
     "marlin",
     "humming",
+    "experimental_sgl_marlin",
 ]
 
 MOE_A2A_BACKEND_CHOICES = [
@@ -605,7 +607,8 @@ class ServerArgs:
             help=(
                 'Data type for kv cache storage. "auto" will use model data type. '
                 '"bf16" or "bfloat16" for BF16 KV cache. "fp8_e5m2" and '
-                '"fp8_e4m3" are supported for CUDA 11.8+. "nvfp4" selects '
+                '"fp8_e4m3" are supported for CUDA 11.8+. "mxfp8" is supported '
+                'by the FA4 backend. "nvfp4" selects '
                 'the NVFP4 FP4 E2M1 KV cache recipe; "fp4_mx_block16" '
                 "selects the MX-style block-size-16 FP4 E2M1 KV cache "
                 "recipe. Both require CUDA 12.8+ and PyTorch 2.8.0+"
@@ -614,6 +617,7 @@ class ServerArgs:
                 "auto",
                 "fp8_e5m2",
                 "fp8_e4m3",
+                "mxfp8",
                 "bf16",
                 "bfloat16",
                 "nvfp4",
@@ -1618,7 +1622,10 @@ class ServerArgs:
     ] = False
     disable_custom_all_reduce: A[
         bool,
-        "Disable the custom all-reduce kernel and fall back to NCCL.",
+        Arg(
+            help="Disable the custom all-reduce kernel and fall back to NCCL.",
+            resolvable=True,
+        ),
     ] = False
     enable_mscclpp: A[
         bool,
@@ -1627,6 +1634,10 @@ class ServerArgs:
     enable_torch_symm_mem: A[
         bool,
         "Enable using torch symm mem for all-reduce kernel and fall back to NCCL. Only supports CUDA device SM90 and above. SM90 supports world size 4, 6, 8. SM100 supports world size 6, 8.",
+    ] = False
+    enable_scattered_sconv: A[
+        bool,
+        "Inkling: replace the attention/MLP output all-reduce with a hidden-dimension reduce-scatter, run the channelwise output short convolution on the [T, H/P] shard, then all-gather before the residual add. This shards the convolution cache across tensor-parallel ranks without changing communication volume.",
     ] = False
     pre_warm_nccl: A[
         bool,
@@ -1658,7 +1669,10 @@ class ServerArgs:
             resolvable=True,
         ),
     ] = None
-    enable_aiter_allreduce_fusion: A[bool, "Enable Aiter AllReduce Fusion."] = False
+    enable_aiter_allreduce_fusion: A[
+        bool,
+        Arg(help="Enable Aiter AllReduce Fusion.", resolvable=True),
+    ] = False
 
     # -------------------------------------------------------------------------
     # Torch compile and torchao
@@ -2083,7 +2097,10 @@ class ServerArgs:
     ] = 0
     mamba_full_memory_ratio: A[
         float,
-        "The ratio of mamba state memory to full kv cache memory.",
+        Arg(
+            help="The ratio of mamba state memory to full kv cache memory.",
+            resolvable=True,
+        ),
     ] = 0.9
     mamba_radix_cache_strategy: A[
         str,
@@ -2153,6 +2170,16 @@ class ServerArgs:
         int,
         "Ring-buffer length L for ReplaySSM linear-attn decode. The full recurrent state is flushed to HBM every L decode steps.",
     ] = 16
+    # ReplaySSM spec-verify (Part B of RFC #28511): GDN linear-chain target-verify
+    # via a per-slot circular (d, k, g) ring + periodic flush instead of per-draft
+    # full-state snapshots. GDN only; linear-chain (topk <= 1) only. Reuses the
+    # `linear_replayssm` ring (replayssm_d/k/g + write_pos) and adds two per-slot
+    # cursors (cache_base, is_flush); the ring length reuses
+    # `linear_replayssm_cache_len`.
+    enable_gdn_replayssm_spec: A[
+        bool,
+        "Enable the ReplaySSM GDN spec-verify kernel (Part B of RFC #28511): a per-slot circular (d, k, g) ring + periodic flush replacing the recurrent verify's per-draft full-state snapshots. GDN only, linear-chain (--speculative-eagle-topk in {None, 1}) only. Reuses --linear-replayssm-cache-len for the ring length.",
+    ] = False
 
     # -------------------------------------------------------------------------
     # Hierarchical cache
@@ -2900,6 +2927,10 @@ class ServerArgs:
         self._validate_prefill_only_disable_kv_cache_args()
         self._handle_dcp_validation()
 
+        # Model-arch prefill CUDA-graph default must land before cuda-graph
+        # resolution (the declarative registry materializes too late to affect
+        # it). Inkling opts into full-graph prefill capture here.
+        self._apply_inkling_prefill_cuda_graph_default()
         self._handle_cuda_graph_config()
 
         # Handle device-specific backends.
@@ -2934,6 +2965,7 @@ class ServerArgs:
         self._handle_int8_mamba_checkpoint()
         self._handle_linear_attn_backend()
         self._handle_kv4_compatibility()
+        self._handle_mxfp8_kv_cache_compatibility()
         self._handle_page_size()
         self._handle_amd_specifics()
         self._handle_nccl_pre_warm()
@@ -2972,6 +3004,7 @@ class ServerArgs:
         self._handle_eplb_and_dispatch()
         self._handle_expert_distribution_metrics()
         self._handle_elastic_ep()
+        self._validate_experimental_sgl_marlin()
 
         # Handle pipeline parallelism.
         self._handle_pipeline_parallelism()
@@ -2980,6 +3013,9 @@ class ServerArgs:
         from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
 
         handle_speculative_decoding(self)
+
+        # Needs the draft-token count derived just above.
+        self._validate_gdn_replayssm_spec_ring()
 
         # Validate the CuteDSL A2A token budget now that num_tokens_per_req is final.
         self._validate_cutedsl_a2a_token_budget()
@@ -3481,6 +3517,25 @@ class ServerArgs:
     # ------------------------------------------------------------------
     # CUDA graph configuration resolution
     # ------------------------------------------------------------------
+    def _apply_inkling_prefill_cuda_graph_default(self):
+        """Inkling opts into full-graph prefill CUDA-graph capture. Must run
+        before _handle_cuda_graph_config: the generic breakable default is
+        auto-disabled for this multimodal arch, and declarative model overrides
+        materialize too late to steer cuda-graph resolution. Honors an explicit
+        --cuda-graph-backend-prefill / --disable-prefill-cuda-graph."""
+        if (
+            self.cuda_graph_backend_prefill is not None
+            or self.disable_prefill_cuda_graph
+            or parse_connector_type(self.model_path) == ConnectorType.INSTANCE
+        ):
+            return
+        arch = self.get_model_config().hf_config.architectures[0]
+        if arch in (
+            "InklingForConditionalGeneration",
+            "InklingForConditionalGenerationMTP",
+        ):
+            self.cuda_graph_backend_prefill = Backend.FULL
+
     def _handle_cuda_graph_config(self):
         self._parse_cuda_graph_config()
         self._apply_cuda_graph_compatibility()
@@ -4973,6 +5028,16 @@ class ServerArgs:
             self.enable_mixed_chunk = False
             self.disable_radix_cache = True
 
+    def _handle_mxfp8_kv_cache_compatibility(self):
+        """MXFP8 KV cache uses operands available only on SM100+ (Blackwell)."""
+        if self.kv_cache_dtype != "mxfp8":
+            return
+        if not is_blackwell_supported():
+            raise ValueError(
+                "--kv-cache-dtype mxfp8 requires an SM100+ (Blackwell) GPU for the "
+                "block-scaled operands used by the FA4 MXFP8 attention path."
+            )
+
     def _handle_kv4_compatibility(self):
         """Check FP4 KV cache compatibility with the attention backend"""
         from sglang.srt.arg_groups.overrides import resolved_view
@@ -5260,6 +5325,110 @@ class ServerArgs:
                     "--linear-replayssm-cache-len must be >= 1, got "
                     f"{self.linear_replayssm_cache_len}."
                 )
+
+        # ReplaySSM spec-verify (Part B of #28511): GDN-only, linear-chain target
+        # verify. Reuses the `linear_replayssm` ring (replayssm_d/k/g + write_pos)
+        # plus two extra per-slot cursors (cache_base, is_flush) and the chunked
+        # (I+A)^-1 reconstruction verify kernel. The intra-window interaction uses a
+        # strictly-lower causal mask, so it is valid ONLY for a linear draft chain
+        # (speculative_eagle_topk in {None, 1}, i.e. NEXTN / MTP); EAGLE tree verify
+        # (topk > 1) must fall back to the recurrent verify. GDN-only is enforced at
+        # runtime (KDA routes through kda_backend, which never enters this path; the
+        # pool gate also checks `not cache_params.is_kda`). The ring length reuses
+        # --linear-replayssm-cache-len (no separate flag).
+        if self.enable_gdn_replayssm_spec:
+            if self.speculative_eagle_topk not in (None, 1):
+                raise ValueError(
+                    "--enable-gdn-replayssm-spec requires a linear draft chain "
+                    "(--speculative-eagle-topk in {None, 1}); the chunked verify "
+                    "kernel uses a strictly-lower causal mask and is invalid for "
+                    "EAGLE tree verify. Got "
+                    f"--speculative-eagle-topk={self.speculative_eagle_topk!r}."
+                )
+            if decode != "triton":
+                raise ValueError(
+                    "--enable-gdn-replayssm-spec requires the Triton linear-attn "
+                    "decode backend, got "
+                    f"--linear-attn-decode-backend={decode!r}."
+                )
+            if self.enable_mamba_extra_buffer():
+                # The spec-verify path does not yet implement the device-side
+                # force-flush needed to keep `temporal` consistent with the ring at
+                # radix mamba-track boundaries, so it is incompatible with
+                # extra_buffer (radix prefix caching).
+                raise ValueError(
+                    "--enable-gdn-replayssm-spec is not yet compatible with mamba "
+                    "extra_buffer (radix prefix caching); use --disable-radix-cache "
+                    "or --mamba-radix-cache-strategy no_buffer."
+                )
+            if self.disaggregation_mode != "null":
+                raise ValueError(
+                    "--enable-gdn-replayssm-spec is not supported under PD "
+                    "disaggregation yet (follow-up). Got "
+                    f"--disaggregation-mode={self.disaggregation_mode!r}."
+                )
+            if self.linear_replayssm_cache_len < 1:
+                raise ValueError(
+                    "--linear-replayssm-cache-len must be >= 1, got "
+                    f"{self.linear_replayssm_cache_len}."
+                )
+            if self.enable_linear_replayssm:
+                raise ValueError(
+                    "--enable-gdn-replayssm-spec and --enable-linear-replayssm are "
+                    "mutually exclusive: they share the ring storage but drive it "
+                    "with incompatible cursor protocols (per-decode-forward vs "
+                    "per-verify-commit advance)."
+                )
+            ring_len = self.linear_replayssm_cache_len
+            if ring_len & (ring_len - 1) != 0:
+                raise ValueError(
+                    "--linear-replayssm-cache-len must be a power of two for the "
+                    f"circular spec-verify ring, got {ring_len}."
+                )
+            # ring_len >= 2 * max drafts is checked in
+            # _validate_gdn_replayssm_spec_ring() (draft tokens not derived yet).
+            # Closed-loop exact fold: the flush replays raw ring inputs through
+            # the recurrent update into the checkpoint, bit-identical to the
+            # recurrent baseline -- which keeps its state in fp32. A 16-bit
+            # checkpoint would re-quantize the exactly-folded state every flush
+            # and become the dominant residual error source, so require fp32.
+            if self.mamba_ssm_dtype is None:
+                logger.info(
+                    "--enable-gdn-replayssm-spec: setting --mamba-ssm-dtype "
+                    "float32 (the closed-loop exact fold requires the fp32 SSM "
+                    "checkpoint for recurrent-parity)."
+                )
+                self.mamba_ssm_dtype = "float32"
+            elif self.mamba_ssm_dtype != "float32":
+                raise ValueError(
+                    "--enable-gdn-replayssm-spec requires --mamba-ssm-dtype "
+                    f"float32, got {self.mamba_ssm_dtype!r}. The closed-loop "
+                    "exact fold keeps the committed state bit-identical to the "
+                    "recurrent baseline, which is only meaningful against the "
+                    "fp32 checkpoint; a 16-bit checkpoint would re-quantize it "
+                    "every flush."
+                )
+
+    def _validate_gdn_replayssm_spec_ring(self):
+        """Enforce ring_len >= 2 * max draft tokens for the spec-verify ring.
+
+        Early-flush margin: write_pos + spec_len <= ring_len must hold on every
+        verify step (see _advance_gdn_spec_cursors_kernel). Runs after
+        handle_speculative_decoding() so the (adaptive-aware) max is final;
+        MambaPool re-checks at ring allocation as a backstop.
+        """
+        if not self.enable_gdn_replayssm_spec:
+            return
+        max_drafts = self.max_speculative_num_draft_tokens
+        if max_drafts is None:
+            return
+        ring_len = self.linear_replayssm_cache_len
+        if ring_len < 2 * max_drafts:
+            raise ValueError(
+                "--linear-replayssm-cache-len must be >= 2 * the maximum "
+                "speculative draft-token count for the spec-verify ring "
+                f"(early-flush margin), got {ring_len} < {2 * max_drafts}."
+            )
 
     def _handle_legacy_cp_arguments(self):
         legacy_mode_to_strategy = {
@@ -5888,6 +6057,19 @@ class ServerArgs:
                 f"(got moe_a2a_backend={resolved.moe_a2a_backend})."
             )
 
+    def _validate_experimental_sgl_marlin(self):
+        view = self._resolved()
+        if view.moe_runner_backend != "experimental_sgl_marlin":
+            return
+
+        # ===== TO BE REFACTORED ====
+        from sglang.srt.lora.marlin_lora_temp.policy import (
+            validate_experimental_sgl_marlin_server_args,
+        )
+
+        validate_experimental_sgl_marlin_server_args(self, view)
+        # ===== END TO BE REFACTORED ====
+
     def _handle_expert_distribution_metrics(self):
         if self.enable_expert_distribution_metrics and (
             self.expert_distribution_recorder_mode is None
@@ -5934,6 +6116,12 @@ class ServerArgs:
                 "--prefill-only-disable-kv-cache does not currently support "
                 "--kv-cache-dtype=nvfp4 or --kv-cache-dtype=fp4_mx_block16 because "
                 "the FP4 pool uses a separate allocation path."
+            )
+        if self.kv_cache_dtype == "mxfp8":
+            raise ValueError(
+                "--prefill-only-disable-kv-cache does not currently support "
+                "--kv-cache-dtype=mxfp8 because the MXFP8 pool stores separate "
+                "scale-factor buffers."
             )
 
         # Structural preconditions for the FA backend's fa_skip_kv_cache path,
