@@ -81,12 +81,13 @@ def _fake_host_pool_modules():
     }
 
 
-def _make_config(*, tp_rank, pp_rank, ssd_offload_path):
+def _make_config(*, tp_rank, pp_rank, ssd_offload_path, dp_rank=0):
     return HiCacheStorageConfig(
         tp_rank=tp_rank,
         tp_size=8,
         pp_rank=pp_rank,
         pp_size=1,
+        dp_rank=dp_rank,
         attn_cp_rank=0,
         attn_cp_size=1,
         is_mla_model=False,
@@ -103,10 +104,13 @@ def _make_config(*, tp_rank, pp_rank, ssd_offload_path):
     )
 
 
-def _make_store(*, tp_rank, pp_rank, ssd_offload_path):
+def _make_store(*, tp_rank, pp_rank, ssd_offload_path, dp_rank=0):
     fake_store_cls = _fake_store_class()
     cfg = _make_config(
-        tp_rank=tp_rank, pp_rank=pp_rank, ssd_offload_path=ssd_offload_path
+        tp_rank=tp_rank,
+        pp_rank=pp_rank,
+        ssd_offload_path=ssd_offload_path,
+        dp_rank=dp_rank,
     )
     with patch.dict(
         "sys.modules",
@@ -128,7 +132,7 @@ class TestMooncakeSsdOffloadPath(CustomTestCase):
         with tempfile.TemporaryDirectory() as base:
             for tp_rank in (0, 3):
                 client = _make_store(tp_rank=tp_rank, pp_rank=0, ssd_offload_path=base)
-                expected = os.path.join(base, f"rank_{tp_rank}_0")
+                expected = os.path.join(base, f"rank_0_{tp_rank}_0")
                 self.assertEqual(client.setup_kwargs.get("ssd_offload_path"), expected)
                 self.assertTrue(os.path.isdir(expected))
 
@@ -141,6 +145,18 @@ class TestMooncakeSsdOffloadPath(CustomTestCase):
                 for tp_rank in range(4)
             }
             self.assertEqual(len(paths), 4)
+
+    def test_dp_ranks_are_distinct_when_attn_tp_rank_is_zero(self):
+        # dp-attention with attn_tp_size 1: every DP rank reports tp_rank 0
+        with tempfile.TemporaryDirectory() as base:
+            paths = {
+                _make_store(
+                    tp_rank=0, pp_rank=0, ssd_offload_path=base, dp_rank=dp_rank
+                ).setup_kwargs["ssd_offload_path"]
+                for dp_rank in range(8)
+            }
+            self.assertEqual(len(paths), 8)
+            self.assertIn(os.path.join(base, "rank_5_0_0"), paths)
 
 
 if __name__ == "__main__":

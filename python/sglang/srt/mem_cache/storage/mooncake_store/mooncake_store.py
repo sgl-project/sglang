@@ -488,7 +488,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     if storage_config is not None:
                         ssd_offload_path = os.path.join(
                             ssd_offload_path,
-                            f"rank_{storage_config.tp_rank}_{storage_config.pp_rank}",
+                            f"rank_{storage_config.dp_rank}"
+                            f"_{storage_config.tp_rank}_{storage_config.pp_rank}",
                         )
                     os.makedirs(ssd_offload_path, exist_ok=True)
                     setup_kwargs["ssd_offload_path"] = ssd_offload_path
