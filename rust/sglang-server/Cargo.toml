@@ -48,7 +48,3 @@ tracing-appender = "0.2"
 
 # tokenizer
 dynamo-tokenizers = "1.5.1"
-
-# Offline HF Hub cache lookup only (no `tokio`/`ureq`/TLS features) — resolves a
-# repo id to its already-downloaded local tokenizer.json without network/openssl.
-hf-hub = { version = "0.5.0", default-features = false }

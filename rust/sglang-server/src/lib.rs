@@ -103,10 +103,10 @@ impl Server {
 
         // Empty only in minimal standalone blobs (the Python dump always resolves
         // it); empty → no tokenizer, which `runtime::start` allows only under
-        // `skip_tokenizer_init`.
+        // `skip_tokenizer_init`. Repo ids are resolved to a local path in
+        // `RustServer._build_server_args` before this blob is parsed.
         let tokenizer_path =
             (!server_args.tokenizer_path.is_empty()).then(|| server_args.tokenizer_path.clone());
-        let revision = server_args.revision.clone();
 
         let server_args = std::sync::Arc::new(server_args);
 
@@ -120,7 +120,6 @@ impl Server {
             channel_cap,
             cores,
             tokenizer_path,
-            revision,
             server_args,
         };
         let rt = runtime::start(cfg).map_err(|e| {

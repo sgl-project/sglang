@@ -575,7 +575,7 @@ checksum = "8728655e193e0d08d7a95d63cf1fdb9b768d282cab0a112ecb006615bae9f067"
 dependencies = [
  "daachorse",
  "fancy-regex 0.17.0",
- "hf-hub 0.4.3",
+ "hf-hub",
  "icu_normalizer",
  "memchr",
  "pcre2",
@@ -797,16 +797,6 @@ dependencies = [
  "thiserror",
  "ureq",
  "windows-sys 0.60.2",
-]
-
-[[package]]
-name = "hf-hub"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aef3982638978efa195ff11b305f51f1f22f4f0a6cabee7af79b383ebee6a213"
-dependencies = [
- "dirs",
- "log",
 ]
 
 [[package]]
@@ -1937,7 +1927,6 @@ dependencies = [
  "dynamo-tokenizers",
  "flume",
  "futures",
- "hf-hub 0.5.0",
  "pyo3",
  "regex-syntax",
  "rmp-serde",
@@ -2243,7 +2232,7 @@ dependencies = [
  "derive_builder",
  "esaxx-rs",
  "getrandom 0.3.4",
- "hf-hub 0.4.3",
+ "hf-hub",
  "itertools",
  "log",
  "macro_rules_attribute",
