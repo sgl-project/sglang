@@ -188,34 +188,22 @@ class NPUW4A4MXFP4MoEMethod(_NPUMoEMethodBase):
     ) -> None:
         self._validate_weight_prefix(layer, weight_prefix)
 
-        fp4_dtype = _get_float4_e2m1fn_x2_dtype()
-        if fp4_dtype is None:
-            raise RuntimeError("NPU W4A4 MXFP4 MoE requires float4 support.")
+        weight = getattr(layer, f"{weight_prefix}_weight")
+        weight.data = npu_format_cast(weight.data).transpose(-1, -2)
 
-        # ModelSlim stores one FP4 value per float8_e4m3fn byte. Repack the
-        # container to float4_e2m1fn_x2, cast it to FRACTAL_NZ for grouped
-        # matmul, and expose the pre-transposed [E, K/2, N] layout.
-        weight = getattr(layer, f"{weight_prefix}_weight").data
-        if not weight.is_npu:
-            weight = weight.to(f"npu:{torch.npu.current_device()}")
-        weight = torch.ops.npu.npu_dtype_cast(weight, fp4_dtype)
-        weight = npu_format_cast(weight).transpose(-1, -2)
-        setattr(
-            layer,
-            f"{weight_prefix}_weight",
-            torch.nn.Parameter(weight, requires_grad=False),
+        weight_scale = getattr(layer, f"{weight_prefix}_weight_scale")
+        scale = weight_scale.data.transpose(1, 2)
+        scale = (
+            scale.transpose(-1, -2)
+            .reshape(
+                scale.shape[0],
+                scale.shape[2],
+                scale.shape[1] // 2,
+                2,
+            )
+            .transpose(1, 2)
         )
-
-        # [E, N, K/32] -> [E, K/64, N, 2].
-        scale = getattr(layer, f"{weight_prefix}_weight_scale").data
-        if not scale.is_npu:
-            scale = scale.to(f"npu:{torch.npu.current_device()}")
-        scale = self._normalize_scale_layout(scale).transpose(1, 2)
-        setattr(
-            layer,
-            f"{weight_prefix}_weight_scale",
-            torch.nn.Parameter(scale, requires_grad=False),
-        )
+        weight_scale.data = scale
 
         # The refactored Ascend dispatchers currently support BF16 and INT8.
         # Keep dispatch in BF16 and quantize immediately before each GMM.
@@ -243,7 +231,7 @@ class NPUW4A4MXFP4MoEMethod(_NPUMoEMethodBase):
             hidden_states, pertoken_scale = torch.ops.npu.npu_dynamic_mx_quant(
                 hidden_states,
                 axis=1,
-                round_mode="round",
+                round_mode="rint",
                 dst_type=fp4_dtype,
                 block_size=MXFP4_BLOCK_SIZE,
                 scale_alg=None,

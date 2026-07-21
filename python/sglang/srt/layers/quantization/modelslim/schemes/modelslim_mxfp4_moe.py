@@ -54,20 +54,12 @@ class ModelSlimMXFP4MoE(ModelSlimMoEScheme):
             output_size = hidden_size
             input_size = intermediate_size_per_partition
 
-        scale_pair_size = 2 * MXFP4_BLOCK_SIZE
-        if input_size % scale_pair_size != 0:
-            raise ValueError(
-                f"MXFP4 input size must be divisible by {scale_pair_size}, "
-                f"got {input_size} for {self.weight_prefix}"
-            )
-
-        # ModelSlim stores one FP4 value in each float8_e4m3fn container byte.
         weight = torch.nn.Parameter(
             torch.empty(
                 num_experts,
                 output_size,
-                input_size,
-                dtype=torch.float8_e4m3fn,
+                input_size // 2,
+                dtype=torch.uint8,
             ),
             requires_grad=False,
         )
@@ -75,10 +67,10 @@ class ModelSlimMXFP4MoE(ModelSlimMoEScheme):
         set_weight_attrs(weight, extra_weight_attrs)
 
         weight_scale = torch.nn.Parameter(
-            torch.empty(
+            torch.zeros(
                 num_experts,
                 output_size,
-                input_size // MXFP4_BLOCK_SIZE,
+                (input_size + MXFP4_BLOCK_SIZE - 1) // MXFP4_BLOCK_SIZE,
                 dtype=torch.uint8,
             ),
             requires_grad=False,
