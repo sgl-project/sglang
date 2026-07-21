@@ -1725,11 +1725,16 @@ def release_req(
     if hisparse_coordinator is not None and not req.finished():
         hisparse_coordinator.retract_req(req)
 
-    # In decode disaggregation the retracted KV is offloaded to host so it can be
-    # restored later without recompute (see resume_retracted_reqs/load_kv_cache).
-    # Callers that will recompute the KV instead (PD true-retraction rebootstrap)
-    # pass offload_kv=False to skip the wasteful device->host copy.
-    if server_args.disaggregation_mode == "decode" and offload_kv:
+    # In decode disaggregation with KV offload enabled, the retracted KV is
+    # offloaded to host so it can be restored later without recompute (see
+    # resume_retracted_reqs/load_kv_cache). Callers that will recompute the KV
+    # instead (PD true-retraction rebootstrap) pass offload_kv=False to skip
+    # the wasteful device->host copy.
+    if (
+        server_args.disaggregation_mode == "decode"
+        and server_args.disaggregation_decode_enable_offload_kvcache
+        and offload_kv
+    ):
         req.offload_kv_cache(req_to_token_pool, token_to_kv_pool_allocator)
     # TODO (csy): for preempted requests, we may want to insert into the tree
     release_kv_cache(req, tree_cache, is_insert=False)
@@ -2608,7 +2613,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             ),
         )
 
+        # In decode disaggregation without KV offload, retracted requests cannot
+        # be restored (kv_cache_cpu is never populated), so they must be aborted
+        # rather than re-queued. Determine this once before the retraction loop.
+        decode_retract_must_abort = (
+            server_args.disaggregation_mode == "decode"
+            and not server_args.disaggregation_decode_enable_offload_kvcache
+        )
+
         retracted_reqs = []
+        reqs_to_abort: List[Req] = []
         first_iter = True
         while first_iter or (
             not self.check_decode_mem(selected_indices=sorted_indices)
@@ -2620,11 +2634,22 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             first_iter = False
             idx = sorted_indices.pop()
             req = self.reqs[idx]
-            retracted_reqs.append(req)
             # release memory and don't insert into the tree because we need the space instantly
             self.release_req(idx, len(sorted_indices), server_args)
-
-        reqs_to_abort: List[Req] = []
+            if decode_retract_must_abort:
+                # KV was discarded and cannot be restored; abort immediately.
+                req.to_finish = FINISH_ABORT(
+                    "Request was retracted due to out-of-memory and cannot be "
+                    "resumed because decode KV cache offload is not enabled.",
+                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
+                reqs_to_abort.append(req)
+                logger.warning(
+                    "retract_decode: aborted request %s (no KV restore path)",
+                    req.rid,
+                )
+            else:
+                retracted_reqs.append(req)
         if len(sorted_indices) <= 1 and not self.check_decode_mem(
             selected_indices=sorted_indices
         ):
