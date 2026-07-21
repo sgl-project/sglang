@@ -127,6 +127,10 @@ class DecodeHiCachePreallocMixin:
             prefix_match.prefetch_registered = (
                 req.rid in self.tree_cache.ongoing_prefetch
             )
+            if not prefix_match.prefetch_registered:
+                # prefetch_from_storage returned without registering (e.g.below prefetch_threshold, rate limited, or insufficient host memory). 
+                # Clear l3 so _try_hicache_queue_load_back does not attempt load_back from non-existent host data.
+                prefix_match.l3_storage_hit_length = 0
         except Exception as e:
             logger.warning(
                 "HiCache L3 prefetch failed for rid=%s: %s; falling back to L2-only LoadingBack",
@@ -192,7 +196,13 @@ class DecodeHiCacheTransferMixin:
         if pm.l3_storage_hit_length > 0:
             if not self.tree_cache.check_prefetch_progress(dr.req.rid):
                 return False
-            self.tree_cache.pop_prefetch_loaded_tokens(dr.req.rid)
+            loaded_from_storage = self.tree_cache.pop_prefetch_loaded_tokens(
+                dr.req.rid
+            )
+            if loaded_from_storage == 0:
+                # Prefetch completed but loaded 0 tokens (e.g., hash mismatch or data evicted from storage between query and prefetch).
+                # Clear l3 so the coverage check uses the actual prefix length.
+                pm.l3_storage_hit_length = 0
 
         # Re-match: req.last_node / prefix_indices updated to current device state.
         rematch = match_prefix_for_req(

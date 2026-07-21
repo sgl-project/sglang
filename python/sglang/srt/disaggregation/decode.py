@@ -1041,15 +1041,24 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         self.tree_cache.dec_lock_ref(decode_req.req.last_node)
                     break
 
+            decode_req.prefix_match = prefix_match
+            if self.scheduler.enable_decode_hicache:
+                self._start_hicache_prefetch(decode_req.req, prefix_match)
+                # _start_hicache_prefetch may clear l3_storage_hit_length when the prefetch could not be registered (e.g., below threshold, rate limited, or insufficient host memory). 
+                # Recompute total_prefix_len so _pre_alloc and the PD protocol use the actual prefix length, not the stale L3-inflated value.
+                if (
+                    prefix_match is not None
+                    and prefix_match.l3_storage_hit_length == 0
+                    and total_prefix_len > prefix_len
+                ):
+                    total_prefix_len = prefix_match.decode_prefix_len
+
             dst_kv_indices = self._pre_alloc(
                 decode_req.req,
                 prefix_indices,
                 prefix_len,
                 total_prefix_len,
             )
-            decode_req.prefix_match = prefix_match
-            if self.scheduler.enable_decode_hicache:
-                self._start_hicache_prefetch(decode_req.req, prefix_match)
             hisparse_req_budget -= 1
             # Recompute from actual pool state for the next queue entry.
             # This accounts for page rounding and newly locked evictable cache.
