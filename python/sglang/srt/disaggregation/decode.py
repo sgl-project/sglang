@@ -1044,7 +1044,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             decode_req.prefix_match = prefix_match
             if self.scheduler.enable_decode_hicache:
                 self._start_hicache_prefetch(decode_req.req, prefix_match)
-                # _start_hicache_prefetch may clear l3_storage_hit_length when the prefetch could not be registered (e.g., below threshold, rate limited, or insufficient host memory). 
+                # _start_hicache_prefetch may clear l3_storage_hit_length when the prefetch could not be registered (e.g., below threshold, rate limited, or insufficient host memory).
                 # Recompute total_prefix_len so _pre_alloc and the PD protocol use the actual prefix length, not the stale L3-inflated value.
                 if (
                     prefix_match is not None
