@@ -372,6 +372,83 @@ class FlexKVHybridRadixCache(BasePrefixCache):
     def supports_fast_match_prefix(self) -> bool:
         return self._inner_cache.supports_fast_match_prefix()
 
+    # BasePrefixCache provides default implementations for these methods, so
+    # __getattr__ cannot forward them. Delegate them explicitly; otherwise the
+    # scheduler sees zero evictable/protected tokens and reports the inner
+    # UnifiedRadixCache's live pages as a pool leak.
+    def evictable_size(self) -> int:
+        return self._inner_cache.evictable_size()
+
+    def full_evictable_size(self) -> int:
+        return self._inner_cache.full_evictable_size()
+
+    def swa_evictable_size(self) -> int:
+        return self._inner_cache.swa_evictable_size()
+
+    def protected_size(self) -> int:
+        return self._inner_cache.protected_size()
+
+    def full_protected_size(self) -> int:
+        return self._inner_cache.full_protected_size()
+
+    def swa_protected_size(self) -> int:
+        return self._inner_cache.swa_protected_size()
+
+    def total_size(self) -> int:
+        return self._inner_cache.total_size()
+
+    def pretty_print(self) -> None:
+        return self._inner_cache.pretty_print()
+
+    def ready_to_load_host_cache(self) -> Any:
+        return self._inner_cache.ready_to_load_host_cache()
+
+    def flush_write_through_acks(self) -> None:
+        self._drain_completed_stores()
+        self._inner_cache.flush_write_through_acks()
+
+    def take_events(self) -> list[Any]:
+        return self._inner_cache.take_events()
+
+    def swa_reprefill_tail_tokens(self) -> int:
+        return self._inner_cache.swa_reprefill_tail_tokens()
+
+    def supports_streaming_session(self) -> bool:
+        return self._inner_cache.supports_streaming_session()
+
+    def release_session(self, session_id: str) -> None:
+        self._inner_cache.release_session(session_id)
+
+    def release_radix_session(self, session_id: str) -> None:
+        self._inner_cache.release_radix_session(session_id)
+
+    def session_held_tokens(self, active_pool_idxs: Optional[set] = None) -> int:
+        return self._inner_cache.session_held_tokens(active_pool_idxs)
+
+    def session_held_full_tokens(self, active_pool_idxs: Optional[set] = None) -> int:
+        return self._inner_cache.session_held_full_tokens(active_pool_idxs)
+
+    def session_held_swa_tokens(self, active_pool_idxs: Optional[set] = None) -> int:
+        return self._inner_cache.session_held_swa_tokens(active_pool_idxs)
+
+    def session_held_req_count(self, active_pool_idxs: Optional[set] = None) -> int:
+        return self._inner_cache.session_held_req_count(active_pool_idxs)
+
+    def session_held_mamba_slots(self, active_pool_idxs: Optional[set] = None) -> int:
+        return self._inner_cache.session_held_mamba_slots(active_pool_idxs)
+
+    def is_chunk_cache(self) -> bool:
+        return self._inner_cache.is_chunk_cache()
+
+    def is_tree_cache(self) -> bool:
+        return self._inner_cache.is_tree_cache()
+
+    def available_and_evictable_str(self) -> str:
+        return self._inner_cache.available_and_evictable_str()
+
+    def init_metrics_collector(self) -> None:
+        self._inner_cache.init_metrics_collector()
+
     def _empty_indices(self) -> torch.Tensor:
         return torch.empty((0,), dtype=torch.int64, device=self.device)
 
