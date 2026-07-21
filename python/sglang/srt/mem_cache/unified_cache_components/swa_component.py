@@ -170,10 +170,10 @@ class SWAComponent(TreeComponent):
             if value is None:
                 break
             remaining = window_size - covered
-            if cd.value is None and len(value) > remaining:
+            if len(value) > remaining:
                 self.cache._split_node(cur.key, cur, len(cur.key) - remaining)
                 cd = cur.component_data[ct]
-                value = cd.host_value
+                value = cd.value if cd.value is not None else cd.host_value
             covered += len(value)
             if cd.value is None:
                 host_tokens += len(value)

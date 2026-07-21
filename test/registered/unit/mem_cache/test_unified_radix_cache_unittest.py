@@ -3458,6 +3458,30 @@ class UnifiedRadixCacheSuite:
         self.assertGreaterEqual(int(xfer.host_indices.numel()), sw)
         self.assertEqual(xfer.nodes_to_load, chain[-expected_pages:])
 
+    def test_hicache_swa_splits_oversized_device_segment_before_load_back(self):
+        if not self.cfg.has_swa or self.cfg.has_mamba:
+            self.skipTest("requires Full+SWA")
+
+        cache, allocator, _ = self._build_hicache_fixture()
+        ps = self.cfg.page_size
+        window = (self.cfg.sliding_window_size + ps - 1) // ps * ps
+        tokens = self._make_seq(1, 2 * window // ps)
+        full = self._alloc(allocator, len(tokens))
+        self.assertIsNotNone(full)
+        leaf = cache._add_new_node(cache.root_node, RadixKey(array("q", tokens)), full)
+        swa = allocator.translate_loc_from_full_to_swa(full)
+        leaf.component_data[ComponentType.SWA].value = swa.clone()
+        cache.lru_lists[ComponentType.SWA].insert_mru(leaf)
+        cache.component_evictable_size_[ComponentType.SWA] += len(swa)
+        cache._update_evictable_leaf_sets(leaf)
+
+        swa_comp = cache.components[ComponentType.SWA]
+        self.assertEqual(swa_comp.prepare_load_back(leaf), 0)
+        prefix = leaf.parent
+        self.assertIsNot(prefix, cache.root_node)
+        self.assertEqual(len(prefix.component_data[ComponentType.SWA].value), window)
+        self.assertEqual(len(leaf.component_data[ComponentType.SWA].value), window)
+
     def test_hicache_swa_splits_oversized_host_tombstone_before_load_back(self):
         if not self.cfg.has_swa or self.cfg.has_mamba:
             self.skipTest("requires Full+SWA")

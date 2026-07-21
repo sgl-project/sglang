@@ -6295,6 +6295,7 @@ class ServerArgs:
             "KimiVLForConditionalGeneration",
             "KimiK25ForConditionalGeneration",
             "MiMoV2ForCausalLM",
+            "Gemma4ForConditionalGeneration",
         ]:
             raise ValueError(
                 f"Model type {model_arch} is not supported for encoder disaggregation. "
