@@ -523,11 +523,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
             # otherwise the Triton recover kernel with a flat k/v stash. Decided
             # here so the verify conv can write out= for the FI path (and the
             # stash below matches the recovery kernel's layout).
-            _dk = self.kernel_dispatcher.decode_kernel
-            _use_fi_recovery = (
-                _dk.__class__.__name__ == "FlashInferGDNKernel"
-                and getattr(_dk, "use_state_pool", False)
+            from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
+                fi_recovery_kernel,
             )
+
+            _use_fi_recovery = fi_recovery_kernel(self) is not None
             mixed_qkv_reshaped = mixed_qkv.view(
                 batch_size, draft_token_num, -1
             ).transpose(1, 2)

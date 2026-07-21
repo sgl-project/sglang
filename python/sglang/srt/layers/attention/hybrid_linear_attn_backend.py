@@ -1196,13 +1196,11 @@ class HybridLinearAttnBackend(AttentionBackend):
         Padded rows (bucket - B) point at reserved SSM slot 0 (never allocated to
         a real request; free_slots starts at 1), so their output is harmless.
         """
-        dispatcher = getattr(self.linear_attn_backend, "kernel_dispatcher", None)
-        decode_kernel = getattr(dispatcher, "decode_kernel", None)
-        use_fi_recovery = (
-            decode_kernel is not None
-            and decode_kernel.__class__.__name__ == "FlashInferGDNKernel"
-            and getattr(decode_kernel, "use_state_pool", False)
+        from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
+            fi_recovery_kernel,
         )
+
+        use_fi_recovery = fi_recovery_kernel(self.linear_attn_backend) is not None
         if not use_fi_recovery:
             # Triton recovery or non-FI backend: no recovery graphs to capture;
             # recovery runs eager on the side stream.
@@ -1317,13 +1315,11 @@ class HybridLinearAttnBackend(AttentionBackend):
         # (PR #3502) — the cuda-graph path, reading k/v as strided views of the
         # persistent conv-out buffer. A non-FI / non-state-pool decode kernel uses
         # the Triton recurrence recover kernel with a flat k/v stash instead.
-        dispatcher = getattr(self.linear_attn_backend, "kernel_dispatcher", None)
-        decode_kernel = getattr(dispatcher, "decode_kernel", None)
-        use_fi_recovery = (
-            decode_kernel is not None
-            and decode_kernel.__class__.__name__ == "FlashInferGDNKernel"
-            and getattr(decode_kernel, "use_state_pool", False)
+        from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
+            fi_recovery_kernel,
         )
+
+        use_fi_recovery = fi_recovery_kernel(self.linear_attn_backend) is not None
 
         # One launch per GDN layer. Factored into a closure so it can run either
         # inline (CUDA graph capture) or on the side stream (eager overlap).

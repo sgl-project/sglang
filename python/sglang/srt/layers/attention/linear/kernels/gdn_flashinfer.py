@@ -416,3 +416,20 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         )
 
         return output_fi.view(1, seq_len, num_v_heads, head_v_dim)
+
+
+def fi_recovery_kernel(linear_backend):
+    """Return the FlashInfer GDN decode kernel iff it drives none-mode
+    accepted-state recovery (state-pool recovery), else None.
+
+    Single source of truth for the ``use_fi_recovery`` decision, checked at verify
+    (gdn_backend.forward_extend), accepted-state recovery
+    (HybridLinearAttnBackend._no_cache_mtp_recompute), and recovery-graph capture
+    (HybridLinearAttnBackend.capture_recovery_graphs). Callers that only need the
+    boolean use ``fi_recovery_kernel(...) is not None``.
+    """
+    dispatcher = getattr(linear_backend, "kernel_dispatcher", None)
+    decode_kernel = getattr(dispatcher, "decode_kernel", None)
+    if isinstance(decode_kernel, FlashInferGDNKernel) and decode_kernel.use_state_pool:
+        return decode_kernel
+    return None
