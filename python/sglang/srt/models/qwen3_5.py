@@ -546,7 +546,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         )
 
         core_attn_out = z = None
-        if _xpu_fused_gdn and self.attn_tp_size == 1:
+        if _xpu_fused_gdn:
             from sglang.srt.model_executor.forward_context import get_attn_backend
 
             backend = get_attn_backend()
