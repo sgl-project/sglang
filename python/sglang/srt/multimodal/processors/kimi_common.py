@@ -47,9 +47,11 @@ class KimiGridMMDataMixin:
             return False
 
         token_ids = np.asarray(
-            input_ids.detach().flatten().cpu()
-            if isinstance(input_ids, torch.Tensor)
-            else input_ids,
+            (
+                input_ids.detach().flatten().cpu()
+                if isinstance(input_ids, torch.Tensor)
+                else input_ids
+            ),
             dtype=np.int64,
         )
         placeholder_count = int(np.count_nonzero(token_ids == image_token_id))

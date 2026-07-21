@@ -295,9 +295,7 @@ def test_kimi_rejects_mismatched_pre_tokenized_image_placeholders():
 def test_kimi_k3_rejects_silently_dropped_images():
     processor = object.__new__(KimiK3ImageProcessor)
     processor.mm_tokens = Mock()
-    processor.load_mm_data = AsyncMock(
-        return_value=SimpleNamespace(images=[object()])
-    )
+    processor.load_mm_data = AsyncMock(return_value=SimpleNamespace(images=[object()]))
 
     with pytest.raises(ValueError, match="expected 2, loaded 1"):
         asyncio.run(
