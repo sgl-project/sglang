@@ -479,7 +479,7 @@ def gather_dequant_requant_fp8_paged_legacy(
 
     Kept as the bit-exactness / performance reference for
     ``gather_dequant_requant_fp8_paged`` (see
-    ``scripts/pr3_gather_microbench.py``).  Allocates and zero-fills the
+    ``benchmark/kernels/deepseek/benchmark_q8kv8_kv_gather.py``).  Allocates and zero-fills the
     full destination each call, then launches one program per
     (token, 128-elem slice).
     """

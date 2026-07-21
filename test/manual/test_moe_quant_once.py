@@ -1,9 +1,8 @@
 """Standalone GPU test for SGLANG_OPT_MOE_QUANT_ONCE (quantize the MoE input
 once, feed both the fused shared-expert GEMM and the routed triton runner).
 
-DO NOT run while benchmarks occupy the GPUs. Usage:
 
-    CUDA_VISIBLE_DEVICES=0 python test/manual/moe/test_moe_quant_once.py
+    CUDA_VISIBLE_DEVICES=0 python test/manual/test_moe_quant_once.py
 
 Verifies, against the double-quant baseline:
   (1) quant equivalence: the row-padded quantize-once kernel produces the
@@ -12,7 +11,7 @@ Verifies, against the double-quant baseline:
   (2) shared consumer: cutlass_w8a8_block_fp8_linear_with_fallback with a
       pre-quantized (q, s) tuple vs its own internal quant -- expected BITWISE
       (baseline uses the identical row-padded quant + identical GEMM);
-  (2b) shared consumer under SGLANG_ENABLE_JIT_DEEPGEMM=1 (the SOTA config):
+  (2b) shared consumer under SGLANG_ENABLE_JIT_DEEPGEMM=1 (the recommended JIT-DeepGEMM config):
       deepgemm_w8a8_block_fp8_linear_with_fallback with the same (q, s) tuple
       -- expected BITWISE (DG's own quant layout, column-major TMA-aligned
       fp32 scales, is byte-identical to the row-padded quantize-once layout);
@@ -24,7 +23,7 @@ Verifies, against the double-quant baseline:
 
 If (1) is not bitwise (AOT v2 vs JIT v2 quant kernels round differently),
 (3) falls back to an allclose check at atol=1e-2 and the discrepancy is
-reported -- document that in the PR.
+reported --.
 """
 
 import sys
@@ -106,7 +105,7 @@ def test_shared_consumer(T, K, N, device):
 
 
 def test_shared_consumer_deepgemm(T, K, N, device):
-    """DG branch (SGLANG_ENABLE_JIT_DEEPGEMM=1 SOTA config): the shared-expert
+    """DG branch (SGLANG_ENABLE_JIT_DEEPGEMM=1 recommended JIT-DeepGEMM config): the shared-expert
     linear resolves to deepgemm_w8a8_block_fp8_linear_with_fallback. Its own
     quant (column-major + TMA-aligned fp32 scales) has the same buffer layout
     as the row-padded quantize-once kernel, so this is expected BITWISE."""
@@ -236,7 +235,9 @@ def main():
         for K in (6144, 7168):
             test_shared_consumer(T, K, 512, device)
 
-    print("== (2b) shared consumer (deepgemm w8a8 linear, JIT DG SOTA config) ==")
+    print(
+        "== (2b) shared consumer (deepgemm w8a8 linear, JIT DG recommended JIT-DeepGEMM config) =="
+    )
     from sglang.srt.layers import deep_gemm_wrapper
 
     if not deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
