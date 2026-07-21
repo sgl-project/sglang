@@ -834,9 +834,13 @@ class Envs:
     # Sparse Embeddings
     SGLANG_EMBEDDINGS_SPARSE_HEAD = EnvStr(None)
 
-    # Logits processor
-    SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK = EnvBool(True)
-    SGLANG_LOGITS_PROCESSER_CHUNK_SIZE = EnvInt(2048)
+    # Logprob processor
+    SGLANG_ENABLE_LOGPROB_CHUNK = EnvBoolWithAlias(
+        True, deprecated_name="SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK"
+    )
+    SGLANG_LOGPROB_CHUNK_SIZE = EnvIntWithAlias(
+        2048, deprecated_name="SGLANG_LOGITS_PROCESSER_CHUNK_SIZE"
+    )
 
     # Tool-Call behavior
     SGLANG_TOOL_STRICT_LEVEL = EnvInt(ToolStrictLevel.OFF)
@@ -1119,6 +1123,8 @@ class Envs:
     # EncoderBootstrapServer health-check tuning.  Interval == 0 disables it.
     SGLANG_ENCODER_BOOTSTRAP_HEALTH_CHECK_INTERVAL = EnvFloat(10.0)
     SGLANG_ENCODER_BOOTSTRAP_HEALTH_CHECK_TIMEOUT = EnvFloat(2.0)
+    # Seconds before permanently dropping an unhealthy encoder (0 = keep probing).
+    SGLANG_ENCODER_BOOTSTRAP_EVICTED_TTL = EnvFloat(600.0)
     # Persistent receiver-side GPU embedding pool size for mooncake EPD transport.
     # 0 disables (per-request register/deregister). 4096 = 4GB default per TP
     SGLANG_EMBEDDING_POOL_SIZE_MB = EnvInt(4096)
