@@ -350,7 +350,8 @@ def maybe_init_shared_mooncake_transfer_engine(
                 from mooncake.pg import set_transfer_engine
             except ImportError as e:
                 raise ImportError(
-                    "Failed to import 'mooncake.pg'. Please upgrade your 'mooncake' "
-                    "installation to a version that supports the ProcessGroup backend."
+                    "Failed to import 'set_transfer_engine' from 'mooncake.pg'. "
+                    "Please upgrade your 'mooncake-transfer-engine' "
+                    "installation to 0.3.11 or above."
                 ) from e
             set_transfer_engine(_mooncake_transfer_engine.engine)
