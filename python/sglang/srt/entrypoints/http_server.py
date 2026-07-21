@@ -37,7 +37,6 @@ from typing import (
     Dict,
     List,
     Optional,
-    Tuple,
     Union,
 )
 
@@ -2105,30 +2104,52 @@ async def _send_disaggregation_warmup_requests(
         )
 
 
-def _warmup_connection(server_args: ServerArgs):
-    """URL, auth headers, and TLS-verify flag shared by the warmup requests."""
+def _execute_server_warmup(server_args: ServerArgs):
     headers = {}
+    url = server_args.url()
     if server_args.api_key:
         headers["Authorization"] = f"Bearer {server_args.api_key}"
-    return server_args.url(), headers, server_args.ssl_verify()
 
+    ssl_verify = server_args.ssl_verify()
 
-def _build_warmup_json(
-    server_args: ServerArgs, model_info: Dict[str, Any]
-) -> Tuple[str, dict]:
-    """Build warmup request JSON payload."""
-    # MLX: text warmup for VLM-advertising models; TODO: enable image warmup.
-    is_vlm = bool(model_info.get("has_image_understanding", False)) and not is_mps()
-    is_generation = model_info["is_generation"]
-    if is_generation:
+    # Wait until the server is launched
+    success = False
+    for _ in range(120):
+        time.sleep(1)
+        try:
+            res = requests.get(
+                url + "/model_info", timeout=5, headers=headers, verify=ssl_verify
+            )
+            assert res.status_code == 200, f"{res=}, {res.text=}"
+            success = True
+            break
+        except (AssertionError, requests.exceptions.RequestException):
+            last_traceback = get_exception_traceback()
+            pass
+
+    if not success:
+        logger.error(f"Initialization failed. warmup error: {last_traceback}")
+        kill_process_tree(os.getpid())
+        return success
+
+    model_info = res.json()
+
+    # Construct a warmup request (MLX: text warmup for VLM-advertising models; TODO: enable image warmup).
+    # A language-only worker may advertise VLM capability for encoder
+    # disaggregation, but its local warmup must stay on the text path.
+    is_vlm = (
+        bool(model_info.get("has_image_understanding", False))
+        and not server_args.language_only
+        and not is_mps()
+    )
+    if model_info["is_generation"]:
         if is_vlm and not server_args.skip_tokenizer_init:
             request_name = "/v1/chat/completions"
         else:
             request_name = "/generate"
     else:
         request_name = "/encode"
-    max_new_tokens = 8 if is_generation else 1
-
+    max_new_tokens = 8 if model_info["is_generation"] else 1
     json_data = {
         "sampling_params": {
             "temperature": 0,
@@ -2140,8 +2161,11 @@ def _build_warmup_json(
         # TODO Workaround the bug that embedding errors for list of size 1
         if server_args.dp_size == 1:
             json_data["input_ids"] = json_data["input_ids"][0]
-
-    elif is_vlm and server_args.disaggregation_mode == "null" and is_generation:
+    elif (
+        is_vlm
+        and server_args.disaggregation_mode == "null"
+        and model_info["is_generation"]
+    ):
         served_model_name = ""
         if not envs.SGLANG_RUST_SERVER.get():
             served_model_name = _global_state.tokenizer_manager.served_model_name
@@ -2152,7 +2176,6 @@ def _build_warmup_json(
                 "model_path", server_args.served_model_name
             )
             served_model_name = served_model_name or server_args.model_path
-
         # TODO: ChatCompletionRequest does not have bootstrap info required by disaggregation mode, disable image-warmup for now
         # Only use chat completions format for generation models, not embedding models
         json_data = {
@@ -2184,50 +2207,6 @@ def _build_warmup_json(
         # TODO Workaround the bug that embedding errors for list of size 1
         if server_args.dp_size == 1:
             json_data["text"] = json_data["text"][0]
-    return request_name, json_data
-
-
-def _fetch_model_info(
-    url: str, headers: dict, ssl_verify, attempts: int
-) -> Optional[dict]:
-    """GET ``/model_info``, retrying up to `attempts` times (1s apart)."""
-    last_traceback = None
-    for i in range(attempts):
-        if i:
-            time.sleep(1)
-        try:
-            res = requests.get(
-                url + "/model_info", timeout=5, headers=headers, verify=ssl_verify
-            )
-            assert res.status_code == 200, f"{res=}, {res.text=}"
-            return res.json()
-        except (AssertionError, requests.exceptions.RequestException):
-            last_traceback = get_exception_traceback()
-    logger.error(f"Initialization failed. warmup error: {last_traceback}")
-    return None
-
-
-def _prepare_warmup(
-    server_args: ServerArgs, attempts: int
-) -> Optional[Tuple[str, dict, Any, str, dict]]:
-    """Parepare the server warmup request."""
-    url, headers, ssl_verify = _warmup_connection(server_args)
-    model_info = _fetch_model_info(
-        url, headers=headers, ssl_verify=ssl_verify, attempts=attempts
-    )
-    if model_info is None:
-        return None
-
-    request_name, json_data = _build_warmup_json(server_args, model_info)
-    return url, headers, ssl_verify, request_name, json_data
-
-
-def _execute_server_warmup(server_args: ServerArgs):
-    prepared = _prepare_warmup(server_args, attempts=120)
-    if prepared is None:
-        kill_process_tree(os.getpid())
-        return False
-    url, headers, ssl_verify, request_name, json_data = prepared
 
     # Config debug dumping
     if server_args.debug_tensor_dump_input_file:
@@ -2249,9 +2228,15 @@ def _execute_server_warmup(server_args: ServerArgs):
                 verify=ssl_verify,
             )
             assert res.status_code == 200, f"{res.text}"
-            _global_state.tokenizer_manager.server_status = ServerStatus.Up
+            # Skip server_status update for Rust server
+            if not envs.SGLANG_RUST_SERVER.get():
+                _global_state.tokenizer_manager.server_status = ServerStatus.Up
 
         else:
+            # TODO: @rainj-me fix this when Rust server supports disaggregation
+            assert (
+                not envs.SGLANG_RUST_SERVER.get()
+            ), "Rust server is not supported for disaggregation warmup for now"
             logger.info(f"Start of pd disaggregation warmup ...")
             status_codes = asyncio.run(
                 _send_disaggregation_warmup_requests(
@@ -2284,48 +2269,7 @@ def _execute_server_warmup(server_args: ServerArgs):
         kill_process_tree(os.getpid())
         return False
 
-    return True
-
-
-def _execute_rust_server_warmup(server_args: ServerArgs) -> bool:
-    """Warm up the embedded Rust server before advertising readiness.
-
-    ``_launch_subprocesses`` has already called ``wait_for_ready()`` for the Rust
-    branch, so the scheduler is initialized and the Rust HTTP server is listening
-    by the time this runs.
-    """
-    if server_args.disaggregation_mode != "null":
-        # PD-disaggregation warmup is unsupported on the rust server for now.
-        logger.warning(
-            "PD disaggregation warmup is not supported with SGLANG_RUST_SERVER "
-            "yet; skipping warmup (the first request pays the cold-start cost)."
-        )
-        return False
-
-    prepared = _prepare_warmup(server_args, attempts=120)
-    if prepared is None:
-        kill_process_tree(os.getpid())
-        return False
-    url, headers, ssl_verify, request_name, json_data = prepared
-
-    warmup_timeout = envs.SGLANG_WARMUP_TIMEOUT.get()
-    try:
-        res = requests.post(
-            url + request_name,
-            json=json_data,
-            headers=headers,
-            timeout=warmup_timeout if warmup_timeout > 0 else 600,
-            verify=ssl_verify,
-        )
-        assert res.status_code == 200, f"{res.status_code=}, {res.text=}"
-    except Exception:
-        logger.error(
-            f"Rust server warmup failed: {get_exception_traceback()}",
-        )
-        kill_process_tree(os.getpid())
-        return False
-
-    return True
+    return success
 
 
 def _wait_and_warmup(
@@ -2752,20 +2696,19 @@ def launch_server(
         # binds, before any forward pass), so without this the first real request
         # pays the cold-start cost (observed as a >60s first generation).
         if not server_args.skip_server_warmup:
-            _execute_rust_server_warmup(server_args)
+            _execute_server_warmup(server_args)
         logger.info("The server is fired up and ready to roll!")
         if launch_callback is not None:
             launch_callback()
         scheduler_init_result.block_until_scheduler_exits()
-        return
-
-    _setup_and_run_http_server(
-        server_args,
-        tokenizer_manager,
-        template_manager,
-        port_args,
-        scheduler_init_result.scheduler_infos,
-        subprocess_watchdog,
-        execute_warmup_func=execute_warmup_func,
-        launch_callback=launch_callback,
-    )
+    else:
+        _setup_and_run_http_server(
+            server_args,
+            tokenizer_manager,
+            template_manager,
+            port_args,
+            scheduler_init_result.scheduler_infos,
+            subprocess_watchdog,
+            execute_warmup_func=execute_warmup_func,
+            launch_callback=launch_callback,
+        )
