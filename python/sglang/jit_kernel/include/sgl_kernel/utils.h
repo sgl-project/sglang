@@ -1,14 +1,5 @@
 /// \file utils.h
 /// \brief Host-side C++ utilities used by JIT kernel wrappers.
-///
-/// Provides:
-/// - `DebugInfo` - wraps `std::source_location` for error reporting.
-/// - `RuntimeCheck` - runtime assertion with formatted error messages.
-/// - `Panic` - unconditional abort with formatted error messages.
-/// - `pointer::offset` - safe void-pointer arithmetic (host side).
-/// - `div_ceil` - integer ceiling division.
-/// - `dtype_bytes` - byte width of a `DLDataType`.
-/// - `irange` - Python-style integer range for range-for loops.
 
 #pragma once
 
@@ -83,7 +74,7 @@ template <typename... Args>
 [[noreturn]]
 inline auto panic(DebugInfo location, Args&&... args) -> void {
   std::ostringstream os;
-  os << "Runtime check failed at " << location.file_name() << ":" << location.line();
+  os << "Failed at " << location.file_name() << ":" << location.line();
   if constexpr (sizeof...(args) > 0) {
     os << ": ";
     (os << ... << std::forward<Args>(args));
@@ -182,5 +173,39 @@ template <std::integral T>
 inline auto irange(T start, T end) {
   return stdv::iota(start, end);
 }
+
+/** \brief Error class for stream-style error logging. */
+struct Error {
+  Error(DebugInfo location = {}) {
+    m_oss << "Failed at " << location.file_name() << ":" << location.line() << ": ";
+  }
+
+  template <typename T>
+  Error& operator<<(T&& arg) {
+    m_oss << std::forward<T>(arg);
+    return *this;
+  }
+
+  [[noreturn]]
+  ~Error() noexcept(false) {
+    throw PanicError(std::move(m_oss).str());
+  }
+
+ private:
+  std::ostringstream m_oss;
+};
+
+/**
+ * \brief 0-overhead CHECK macro for host code. This can avoid unnecessary
+ * instantiation of error messages when the condition is true.
+ *
+ * Usage: CHECK_HOST(ptr != nullptr) << "Pointer must not be null";
+ */
+// The empty-true-branch if/else form keeps a trailing `else` in user code
+// bound to the user's `if`, not to the macro's.
+#define CHECK_HOST(COND) \
+  if (COND) [[likely]] { \
+  } else                 \
+    ::host::Error()
 
 }  // namespace host
