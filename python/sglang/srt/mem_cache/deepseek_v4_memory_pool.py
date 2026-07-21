@@ -516,9 +516,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         # configurator sizes this request-scoped, on the non-unified path the
         # swa-scaled value it passes is already larger, so max() keeps it.
         c4_ring_size = self.get_ring_size(4)
-        c4_state_pool_size = max(
-            c4_state_pool_size, self.num_req_slots * c4_ring_size
-        )
+        c4_state_pool_size = max(c4_state_pool_size, self.num_req_slots * c4_ring_size)
         self.c4_state_pool_size = c4_state_pool_size
         c128_ring_size = self.get_ring_size(128)
         if ONLINE_C128:

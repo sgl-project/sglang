@@ -647,7 +647,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.attn_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         # Mirror DeepSeekV4TokenToKVPool: swa_ring_size = sliding_window +
         # (speculative_num_draft_tokens - 1).
-        spec_num_draft = mr.server_args.speculative_num_draft_tokens or 1
+        spec_num_draft = kvc.server_args.speculative_num_draft_tokens or 1
         self._swa_ring_size = self.swa_page_size + (
             (spec_num_draft - 1) if self.is_speculative else 0
         )
@@ -823,9 +823,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         ``num_req_slots * c4_ring_size`` -- exactly the c128 pattern.)
         """
         num_req_slots = self._get_num_req_slots(max_running_requests)
-        swa_pages = ceil_div(
-            num_req_slots * self._swa_ring_size, self.swa_page_size
-        )
+        swa_pages = ceil_div(num_req_slots * self._swa_ring_size, self.swa_page_size)
         return swa_pages * self.c4_ring_size
 
     def _fixed_c4_state_bytes(self, max_running_requests: int) -> int:
