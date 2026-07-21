@@ -29,6 +29,7 @@ from sglang.srt.configs.lfm2_moe import Lfm2MoeConfig
 from sglang.srt.configs.lfm2_vl import Lfm2VlConfig
 from sglang.srt.configs.locate_anything import LocateAnythingConfig
 from sglang.srt.configs.longcat_flash import LongcatFlashConfig
+from sglang.srt.configs.minicpm import MiniCPMHybridConfig
 from sglang.srt.configs.minicpmv4_6 import MiniCPMV4_6Config, MiniCPMV4_6VisionConfig
 from sglang.srt.configs.minimax_vl import MiniMaxM3VLConfig
 from sglang.srt.configs.nano_nemotron_vl import (
@@ -88,6 +89,7 @@ __all__ = [
     "NemotronH_Nano_Omni_Reasoning_V3_Config",
     "JetNemotronConfig",
     "JetVLMConfig",
+    "MiniCPMHybridConfig",
     "Step3p5Config",
     "MiniMaxM3VLConfig",
     "Step3p7Config",

@@ -36,6 +36,7 @@ class LinearAttnModelSpec:
     support_mamba_cache: bool = True
     support_mamba_cache_extra_buffer: bool = False
     unwrap_text_config: bool = False  # call get_text_config() before isinstance check
+    req_to_token_pool_factory_name: Optional[str] = None
 
 
 _LINEAR_ATTN_MODEL_REGISTRY: list[LinearAttnModelSpec] = []

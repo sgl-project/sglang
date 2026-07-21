@@ -211,6 +211,8 @@ ATTENTION_BACKEND_CHOICES = [
     "tokenspeed_mla",
     "trtllm_mha",
     "dual_chunk_flash_attn",
+    "minicpm_flashattn",
+    "minicpm_flashinfer",
     # AMD specific
     "aiter",
     "wave",
@@ -824,7 +826,13 @@ class ServerArgs:
         bool,
         "Skip the physical KV cache allocation for embedding-mode prefill-only workloads. Currently only valid with --is-embedding, --chunked-prefill-size=-1, --disable-radix-cache, an FA prefill backend, and non-FP4 KV cache so the fa_skip_kv_cache path is active (no layer reads or writes the cache). Other prefill-only workloads such as scoring/MIS may benefit from this later once their attention paths stop using paged KV. Scheduler admission accounting is unchanged; per-layer K/V tensors are sized to (page_size, head_num, head_dim) placeholders so GPU memory is not wasted.",
     ] = False
-    disable_radix_cache: A[bool, "Disable RadixAttention for prefix caching."] = False
+    disable_radix_cache: A[
+        bool,
+        Arg(
+            help="Disable RadixAttention for prefix caching.",
+            resolvable=True,
+        ),
+    ] = False
     enable_page_major_kv_layout: A[
         bool,
         "Enable the page-major KV layout: lay out the Mamba state and full/SWA "
@@ -1567,6 +1575,22 @@ class ServerArgs:
     disable_cuda_graph_padding: A[
         bool,
         "Disable cuda graph when padding is needed. Still uses cuda graph when padding is not needed.",
+    ] = False
+    minicpm_fuse_topk: A[
+        bool,
+        "Fuse stage1, maxpool, and top-k in MiniCPM into a single kernel.",
+    ] = False
+    minicpm_split_stage1: A[
+        bool,
+        "Split MiniCPM stage1 into bmm, softmax, and reduce_sum.",
+    ] = False
+    minicpm_dense_as_sparse: A[
+        bool,
+        "Treat dense batches as sparse in MiniCPM.",
+    ] = False
+    minicpm_force_dense: A[
+        bool,
+        "Force dense attention in MiniCPM.",
     ] = False
     enable_profile_cuda_graph: A[bool, "Enable profiling of cuda graph capture."] = (
         False
