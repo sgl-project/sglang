@@ -2631,8 +2631,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             unified = getattr(allocator.get_kvcache(), "unified_kv_pool", None)
             if unified is not None:
                 num_slots = unified.num_slots
-                ring_util = active_slots * unified.swa_ring_size / max(
-                    unified.swa_pages, 1
+                ring_util = (
+                    active_slots * unified.swa_ring_size / max(unified.swa_pages, 1)
                 )
             else:
                 num_slots, ring_util = -1, -1.0

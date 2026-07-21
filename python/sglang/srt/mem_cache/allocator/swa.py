@@ -219,8 +219,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             # SWA ring rows are pre-allocated per slot; no per-token SWA paging.
             return full_ok
         return full_ok and (
-            num_swa_pages
-            <= self.swa_attn_allocator.available_size() // self.page_size
+            num_swa_pages <= self.swa_attn_allocator.available_size() // self.page_size
         )
 
     def alloc_extend(
