@@ -15,7 +15,7 @@ import torch
 def test_kda_target_verify_equivalence():
     """Verify target_verify with linear chain (retrieve_parent_token=None)
     produces the same output as N sequential decode calls."""
-    from sglang.srt.layers.attention.fla.fused_sigmoid_gating_recurrent import (
+    from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (
         fused_sigmoid_gating_delta_rule_update,
     )
 
@@ -149,7 +149,7 @@ def test_kda_target_verify_equivalence():
 
 def test_kda_target_verify_bf16():
     """Same test with bfloat16 to verify acceptable numerical tolerance."""
-    from sglang.srt.layers.attention.fla.fused_sigmoid_gating_recurrent import (
+    from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (
         fused_sigmoid_gating_delta_rule_update,
     )
 
