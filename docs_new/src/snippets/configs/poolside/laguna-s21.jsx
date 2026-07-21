@@ -126,9 +126,30 @@ sgl-eval run aime25 \\
     },
   },
 
-  defaultSelection: { hw: "b300", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
-
   cells: [
+
+    // ══════════════ B300 FP8 low-latency — default (cells[0]) ══════════════
+
+    {
+      match: { hw: "b300", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
+      verified: true,
+      env: ["SGLANG_SHARED_EXPERT_TP1=1"],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--trust-remote-code",
+        "--reasoning-parser poolside_v1",
+        "--tool-call-parser poolside_v1",
+        "--tp 8",
+        "--attention-backend trtllm_mha",
+        "--speculative-algorithm DFLASH",
+        "--speculative-draft-model-path poolside/Laguna-S-2.1-DFlash-FP8",
+        "--page-size 1",
+        "--mem-fraction-static 0.7",
+        "--sampling-defaults openai",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
 
     // ══════════════ H200 (8-GPU HGX, tp 8) ══════════════
 
@@ -286,26 +307,6 @@ sgl-eval run aime25 \\
         "--reasoning-parser poolside_v1",
         "--tool-call-parser poolside_v1",
         "--tp 8",
-        "--sampling-defaults openai",
-        "--host {{HOST_IP}}",
-        "--port {{PORT}}",
-      ],
-    },
-    {
-      match: { hw: "b300", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
-      verified: true,
-      env: ["SGLANG_SHARED_EXPERT_TP1=1"],
-      flags: [
-        "--model-path {{MODEL_NAME}}",
-        "--trust-remote-code",
-        "--reasoning-parser poolside_v1",
-        "--tool-call-parser poolside_v1",
-        "--tp 8",
-        "--attention-backend trtllm_mha",
-        "--speculative-algorithm DFLASH",
-        "--speculative-draft-model-path poolside/Laguna-S-2.1-DFlash-FP8",
-        "--page-size 1",
-        "--mem-fraction-static 0.7",
         "--sampling-defaults openai",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
