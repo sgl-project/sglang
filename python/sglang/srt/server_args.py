@@ -4822,14 +4822,12 @@ class ServerArgs:
                 "extra_buffer_lazy unsupported under PD disaggregation; use "
                 "--mamba-radix-cache-strategy extra_buffer."
             )
+            algo = (view.speculative_algorithm or "").upper()
+            assert algo not in ("DFLASH", "DSPARK"), (
+                f"extra_buffer_lazy unsupported with {view.speculative_algorithm}; "
+                "use --mamba-radix-cache-strategy extra_buffer."
+            )
         if view.speculative_num_draft_tokens is not None:
-            if view.mamba_radix_cache_strategy == "extra_buffer_lazy":
-                # The dflash family's verify bypasses prepare_mamba_track_for_verify.
-                assert view.speculative_algorithm not in ("DFLASH", "DSPARK"), (
-                    f"extra_buffer_lazy unsupported with "
-                    f"{view.speculative_algorithm}; use "
-                    "--mamba-radix-cache-strategy extra_buffer."
-                )
             assert view.mamba_track_interval >= view.speculative_num_draft_tokens
         if view.page_size is not None:
             assert view.mamba_track_interval % view.page_size == 0
