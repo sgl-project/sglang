@@ -99,12 +99,10 @@ checkpoint for lower-latency preview decode. This path is opt-in and requires
 the `taehv` package to be installed separately:
 
 ```bash
-export SGLANG_REALTIME_TAEHV_CHECKPOINT_PATH=/path/to/taew2_1.pth
-sglang serve ...
+sglang serve ... --vae-config.taehv-checkpoint-path /path/to/taew2_1.pth
 ```
 
-When the environment variable is unset, realtime sessions use the model's
-regular VAE path.
+When this option is unset, realtime sessions use the model's regular VAE path.
 
 ## Contributing
 

@@ -1,7 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 
-import os
-
 import torch
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
@@ -82,15 +80,12 @@ class RealtimeImageVAEEncodingStage(ImageVAEEncodingStage):
 class CausalVaeDecodingStage(DecodingStage):
     """Decode realtime chunks with a persistent causal VAE cache when available."""
 
-    TAEHV_CHECKPOINT_ENV = "SGLANG_REALTIME_TAEHV_CHECKPOINT_PATH"
-
-    def _taehv_checkpoint_path(self) -> str | None:
-        if not hasattr(self, "_cached_taehv_checkpoint_path"):
-            value = os.environ.get(self.TAEHV_CHECKPOINT_ENV)
-            self._cached_taehv_checkpoint_path = (
-                value.strip() if value and value.strip() else None
-            )
-        return self._cached_taehv_checkpoint_path
+    @staticmethod
+    def _taehv_checkpoint_path(server_args: ServerArgs) -> str | None:
+        value = getattr(
+            server_args.pipeline_config.vae_config, "taehv_checkpoint_path", None
+        )
+        return value.strip() if isinstance(value, str) and value.strip() else None
 
     @staticmethod
     def _supports_wan_decoder_cache(vae) -> bool:
@@ -194,16 +189,19 @@ class CausalVaeDecodingStage(DecodingStage):
             return decode_state.taehv_streaming_decoder
 
         if not hasattr(self, "_taehv_model"):
-            checkpoint_path = self._taehv_checkpoint_path()
+            checkpoint_path = self._taehv_checkpoint_path(server_args)
             if checkpoint_path is None:
-                raise RuntimeError("TAEHV checkpoint path is not configured")
+                raise RuntimeError(
+                    "TAEHV realtime decode requires "
+                    "--vae-config.taehv-checkpoint-path"
+                )
 
             try:
                 from taehv import TAEHV
             except ImportError as exc:
                 raise RuntimeError(
                     "TAEHV realtime decode requires the `taehv` package. "
-                    "Install it and set SGLANG_REALTIME_TAEHV_CHECKPOINT_PATH "
+                    "Install it and set --vae-config.taehv-checkpoint-path "
                     "to a TAEHV checkpoint."
                 ) from exc
 
@@ -218,7 +216,7 @@ class CausalVaeDecodingStage(DecodingStage):
         except ImportError as exc:
             raise RuntimeError(
                 "TAEHV realtime decode requires the `taehv` package. "
-                "Install it and set SGLANG_REALTIME_TAEHV_CHECKPOINT_PATH "
+                "Install it and set --vae-config.taehv-checkpoint-path "
                 "to a TAEHV checkpoint."
             ) from exc
 
@@ -294,7 +292,7 @@ class CausalVaeDecodingStage(DecodingStage):
         if batch.block_idx == 0 and callable(reset_causal_state):
             reset_causal_state()
 
-        if self._taehv_checkpoint_path() is not None:
+        if self._taehv_checkpoint_path(server_args) is not None:
             frames = self.decode_taehv_streaming(
                 batch.latents,
                 server_args,

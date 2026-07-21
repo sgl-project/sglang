@@ -228,13 +228,10 @@ def test_causal_vae_decoding_stage_can_use_streaming_taehv(monkeypatch):
         "get_local_torch_device",
         lambda: torch.device("cpu"),
     )
-    monkeypatch.setenv(
-        CausalVaeDecodingStage.TAEHV_CHECKPOINT_ENV,
-        "/tmp/taehv-test.pth",
-    )
 
     class _PipelineConfig:
         vae_precision = "fp32"
+        vae_config = SimpleNamespace(taehv_checkpoint_path="/tmp/taehv-test.pth")
 
         def post_decoding(self, frames, server_args):
             del server_args

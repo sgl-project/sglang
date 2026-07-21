@@ -93,6 +93,7 @@ class VAEConfig(ModelConfig):
     use_parallel_decode: bool = True
     parallel_decode_mode: str = AUTO_PARALLEL_DECODE_MODE
     auto_parallel_decode_min_latent_elements_per_rank: int = 4096
+    taehv_checkpoint_path: str | None = None
 
     def __post_init__(self):
         self.blend_num_frames = (
@@ -214,6 +215,13 @@ class VAEConfig(ModelConfig):
             dest=f"{prefix.replace('-', '_')}.parallel_decode_mode",
             default=None,
             help="Parallel decode mode for VAE",
+        )
+        parser.add_argument(
+            f"--{prefix}.taehv-checkpoint-path",
+            type=str,
+            dest=f"{prefix.replace('-', '_')}.taehv_checkpoint_path",
+            default=None,
+            help="Path to a TAEHV checkpoint for realtime preview decode",
         )
 
         return parser
