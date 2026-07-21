@@ -16,7 +16,9 @@
 //   fp8_ht result (13.54%) is therefore invalid and omitted.
 //   GB300 NVFP4: quality broken (degenerate loop) — no accuracy numbers.
 //
-// B300 cells: PENDING (bare match stubs — benchmark card renders "pending").
+// B300 cells: REAL measured values (sglang 0.5.15.post1, lmsysorg/sglang:v0.5.15.post1-cu130,
+//   8×B300 TP=8, 2026-07-21). GSM8K = sgl-eval run gsm8k, full 1319 questions, greedy.
+//   AIME25 not measured on B300.
 
 export const benchmarks = [
   // ===== H200 (8-GPU HGX, tp 8) — ✅ REAL, full GSM8K =====
@@ -69,15 +71,68 @@ export const benchmarks = [
     accuracy: { gsm8k_pct: 94.24, aime25_pct: null },
   },
 
-  // ===== B300 (8-GPU HGX, tp 8) — PENDING =====
-  { match: { hw: "b300", variant: "default", quant: "bf16",  strategy: "high-throughput", nodes: "single" } },
-  { match: { hw: "b300", variant: "default", quant: "bf16",  strategy: "low-latency",     nodes: "single" } },
-  { match: { hw: "b300", variant: "default", quant: "fp8",   strategy: "high-throughput", nodes: "single" } },
-  { match: { hw: "b300", variant: "default", quant: "fp8",   strategy: "low-latency",     nodes: "single" } },
-  { match: { hw: "b300", variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "single" } },
-  { match: { hw: "b300", variant: "default", quant: "nvfp4", strategy: "low-latency",     nodes: "single" } },
-  { match: { hw: "b300", variant: "default", quant: "int4",  strategy: "high-throughput", nodes: "single" } },
-  { match: { hw: "b300", variant: "default", quant: "int4",  strategy: "low-latency",     nodes: "single" } },
+  // ===== B300 (8-GPU HGX, tp 8) — ✅ REAL, full GSM8K =====
+  {
+    // ✅ REAL — 8×B300, BF16 dense, tp8, trtllm_mha (auto-select). GSM8K 93.71%.
+    match: { hw: "b300", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+    verified: true,
+    sglang_version: "0.5.15.post1",
+    accuracy: { gsm8k_pct: 93.71, aime25_pct: null },
+  },
+  {
+    // ✅ REAL — 8×B300, BF16 + DFlash (matched bf16 draft), tp8, trtllm_mha, mem-frac 0.7.
+    // GSM8K 93.63%.
+    match: { hw: "b300", variant: "default", quant: "bf16", strategy: "low-latency", nodes: "single" },
+    verified: true,
+    sglang_version: "0.5.15.post1",
+    accuracy: { gsm8k_pct: 93.63, aime25_pct: null },
+  },
+  {
+    // ✅ REAL — 8×B300, FP8 dense, tp8 ep8, trtllm_mha, SGLANG_SHARED_EXPERT_TP1=1.
+    // GSM8K 94.39%.
+    match: { hw: "b300", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+    verified: true,
+    sglang_version: "0.5.15.post1",
+    accuracy: { gsm8k_pct: 94.39, aime25_pct: null },
+  },
+  {
+    // ✅ REAL — 8×B300, FP8 + DFlash (fp8-calibrated draft, patched rope_theta), tp8 ep8,
+    // trtllm_mha, mem-frac 0.7. GSM8K 94.69%.
+    match: { hw: "b300", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
+    verified: true,
+    sglang_version: "0.5.15.post1",
+    accuracy: { gsm8k_pct: 94.69, aime25_pct: null },
+  },
+  {
+    // ✅ REAL — 8×B300, NVFP4 dense, tp8, trtllm_mha (auto-select). GSM8K 94.54%.
+    match: { hw: "b300", variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "single" },
+    verified: true,
+    sglang_version: "0.5.15.post1",
+    accuracy: { gsm8k_pct: 94.54, aime25_pct: null },
+  },
+  {
+    // ✅ REAL — 8×B300, NVFP4 + DFlash (nvfp4-calibrated draft, patched rope_theta), tp8,
+    // trtllm_mha, mem-frac 0.7. GSM8K 95.30%.
+    match: { hw: "b300", variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
+    verified: true,
+    sglang_version: "0.5.15.post1",
+    accuracy: { gsm8k_pct: 95.30, aime25_pct: null },
+  },
+  {
+    // ✅ REAL — 8×B300, INT4 dense, tp8 ep8, trtllm_mha. GSM8K 94.62%.
+    match: { hw: "b300", variant: "default", quant: "int4", strategy: "high-throughput", nodes: "single" },
+    verified: true,
+    sglang_version: "0.5.15.post1",
+    accuracy: { gsm8k_pct: 94.62, aime25_pct: null },
+  },
+  {
+    // ✅ REAL — 8×B300, INT4 + DFlash (int4-calibrated draft), tp8 ep8, trtllm_mha,
+    // mem-frac 0.7. GSM8K 94.69%.
+    match: { hw: "b300", variant: "default", quant: "int4", strategy: "low-latency", nodes: "single" },
+    verified: true,
+    sglang_version: "0.5.15.post1",
+    accuracy: { gsm8k_pct: 94.69, aime25_pct: null },
+  },
 
   // ===== GB300 (4-GPU single node, tp 4) =====
   {
