@@ -166,7 +166,14 @@ async fn submit(
     state: &AppState,
     kind: RequestKind,
 ) -> Result<(RidHash, String, mpsc::Receiver<EgressItem>), ()> {
-    let rid = crate::ids::new_rid();
+    // Health probes get the Python server's `HEALTH_CHECK_<uuid>` rid form so
+    // scheduler logs and prefix-gated handling recognize them; a client-supplied
+    // rid (already fanned out per item by `split`) wins over minting.
+    let rid = match &kind {
+        RequestKind::Generate(g) if g.is_health_check => crate::ids::new_health_check_rid(),
+        RequestKind::Generate(g) => g.rid.clone().unwrap_or_else(crate::ids::new_rid),
+        RequestKind::Control(_) => crate::ids::new_rid(),
+    };
     let id = RidHash::from_rid(&rid);
     // Async-aware send so a full TM inbox yields (backpressure) instead of parking
     // a thread; Err only when the inbox is closed (shutdown).
