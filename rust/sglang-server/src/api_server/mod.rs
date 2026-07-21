@@ -636,7 +636,7 @@ async fn model_info(State(state): State<AppState>) -> Response {
 /// curated [`ServerArgs`] accessors), never the raw server-args dump (embeds
 /// `api_key`/`admin_api_key`; see [`shape_server_info`]).
 ///
-/// TODO(server_info): Python also includes `version` + `kv_events`; add once plumbed.
+/// TODO(server_info): Python also includes `kv_events`; add once plumbed.
 async fn server_info(State(state): State<AppState>) -> Response {
     let bytes = match await_control_result(&state, "GetInternalStateReq").await {
         Ok(b) => b,
@@ -694,6 +694,8 @@ fn shape_server_info(msgpack: &[u8], server_args: &ServerArgs) -> Result<Vec<u8>
         "served_model_name": server_args.served_model_name(),
         "tokenizer_path": server_args.tokenizer_path(),
         "max_context_length": server_args.context_len(),
+        "max_total_num_tokens": server_args.max_total_num_tokens(),
+        "version": server_args.version(),
         "internal_states": [serde_json::Value::Object(state_out)],
     });
     serde_json::to_vec(&response).map_err(|e| e.to_string())
