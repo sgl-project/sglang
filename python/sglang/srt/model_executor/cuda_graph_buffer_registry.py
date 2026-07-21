@@ -789,6 +789,8 @@ def build_prefill_registry(
     embed_dtype: Optional[torch.dtype] = None,
     enable_mamba_track: bool = False,
     enable_num_token_non_padded: bool = False,
+    require_gathered_buffer: bool = False,
+    enable_prefill_cp: bool = False,
     register_input_embeds: bool = True,
     share_pool: bool = True,
     source: Optional[Any] = None,
@@ -878,12 +880,40 @@ def build_prefill_registry(
         slots.append(GraphSlot("mamba_track_mask", _bs, torch.bool, axis="bs"))
         slots.append(GraphSlot("mamba_track_seqlens", _bs, torch.int32, axis="bs"))
     if enable_num_token_non_padded:
+
+        def _prefill_num_token_non_padded_post_fill(buf, fb, ctx):
+            # Replay pads raw tokens up to the capture bucket, which moves the
+            # attn-TP shard boundary (tokens_per_rank = bucket/attn_tp, not
+            # raw/attn_tp). The FB tensor was localized against the RAW length
+            # on the eager prep path, so for raw < bucket it undercounts rank
+            # 0's real rows and the in-graph pad mask would blank real tokens
+            # (global rows [raw/attn_tp, bucket/attn_tp)). Recompute the local
+            # count against the padded bucket from the batch's UN-adjusted
+            # global count (num_token_non_padded_cpu). Mirrors the decode
+            # registry's post_fill, which uses ctx.padded_num_tokens the same
+            # way.
+            if require_gathered_buffer and not enable_prefill_cp:
+                from sglang.srt.runtime_context import get_parallel
+
+                parallel = get_parallel()
+                tokens_per_rank = ctx.padded_num_tokens // parallel.attn_tp_size
+                local = min(
+                    max(
+                        fb.num_token_non_padded_cpu
+                        - tokens_per_rank * parallel.attn_tp_rank,
+                        0,
+                    ),
+                    tokens_per_rank,
+                )
+                buf.fill_(local)
+
         slots.append(
             GraphSlot(
                 "num_token_non_padded",
                 lambda _bs2, _mt: (1,),
                 torch.int32,
                 axis="none",
+                post_fill=_prefill_num_token_non_padded_post_fill,
             )
         )
 
