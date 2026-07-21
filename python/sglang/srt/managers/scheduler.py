@@ -957,21 +957,15 @@ class Scheduler(
             )
 
     def init_session_radix_cache_guard(self) -> None:
-        # TODO (zhangmj): need to remove if support UnifiedRadixCache
         if not self.server_args.enable_session_radix_cache:
             return
 
-        from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
-        from sglang.srt.mem_cache.radix_cache import RadixCache
-
-        if type(self.tree_cache) not in (RadixCache, HiRadixCache):
+        if not getattr(self.tree_cache, "enable_session_radix_cache", False):
             logger.warning(
                 "enable_session_radix_cache is set but tree_cache is %s, "
-                "disabling session radix cache.",
+                "session radix cache remains disabled.",
                 type(self.tree_cache).__name__,
             )
-            if isinstance(self.tree_cache, RadixCache):
-                self.tree_cache.enable_session_radix_cache = False
 
     def init_hisparse_coordinator(self) -> None:
         self.hisparse_coordinator: Optional[HiSparseCoordinator] = None
