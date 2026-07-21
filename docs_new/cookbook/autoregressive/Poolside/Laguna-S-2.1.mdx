@@ -139,10 +139,6 @@ BF16 on H200 leaves less headroom for CUDA-graph capture and NCCL allocations th
 
 The HF checkpoints `poolside/Laguna-S-2.1-DFlash-FP8` and `poolside/Laguna-S-2.1-DFlash-NVFP4` (as of 2026-07-20) are missing `rope_theta` in `rope_parameters`. If the server crashes at draft-model load with a `KeyError: 'rope_theta'`, patch the draft config locally: add `"rope_theta": 500000.0` to the `rope_parameters` block. The BF16 and INT4 draft models are unaffected.
 
-**NVFP4 on GB300**
-
-NVFP4 is not yet verified on GB300 or B300; pending resolution upstream.
-
 **DFlash memory**
 
 Low-latency cells carry `--mem-fraction-static 0.7` (sufficient even for BF16 on H200). Dense cells use the default heuristic (except BF16 on H200 — see above).

@@ -14,7 +14,6 @@
 // expert; required at both TP=4 (GB300) and TP=8 (H200/B300). INT4 shared expert stays
 // bf16 — no flag needed. Differs from Laguna-XS-2.1 where TP=4 works without this flag.
 //
-// NVFP4 on GB300: unverified.
 // NVFP4 is Blackwell-only → no h200×nvfp4 cells.
 // DFlash cells carry --mem-fraction-static 0.7.
 
@@ -304,7 +303,7 @@ sgl-eval run aime25 \\
     },
     {
       match: { hw: "b300", variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "single" },
-      verified: false,
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -318,7 +317,7 @@ sgl-eval run aime25 \\
     },
     {
       match: { hw: "b300", variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
-      verified: false,
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -370,7 +369,6 @@ sgl-eval run aime25 \\
     },
 
     // ══════════════ GB300 (4-GPU single node, tp 4) ══════════════
-    // NVFP4 cells: unverified — degenerate output observed on GB300.
 
     {
       match: { hw: "gb300", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" },
@@ -440,7 +438,7 @@ sgl-eval run aime25 \\
     },
     {
       match: { hw: "gb300", variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "single" },
-      verified: false,
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -454,7 +452,7 @@ sgl-eval run aime25 \\
     },
     {
       match: { hw: "gb300", variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
-      verified: false,
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
