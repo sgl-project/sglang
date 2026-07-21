@@ -134,71 +134,6 @@ struct RotaryEmbedInternal<scalar_t, RotaryMode::Neox> {
   }
 };
 
-template <typename scalar_t>
-void rotary_embedding_3D_kernel_impl(
-    scalar_t* __restrict__ query_out,
-    scalar_t* __restrict__ key_out,
-    int64_t* __restrict__ positions,
-    scalar_t* __restrict__ query,
-    scalar_t* __restrict__ key,
-    scalar_t* __restrict__ cos_sin_cache,
-    int64_t num_tokens,
-    int64_t num_heads,
-    int64_t num_kv_heads,
-    int64_t head_size,
-    int64_t rotary_dim,
-    int64_t query_stride_s,
-    int64_t query_out_stride_s,
-    int64_t key_out_stride_s,
-    int64_t key_stride_s,
-    int64_t query_stride_h,
-    int64_t query_out_stride_h) {
-  int64_t HR = rotary_dim;
-  int64_t HK = rotary_dim;
-  int64_t COFF = HR / 2;
-  at::parallel_for(0, num_tokens * num_heads, GRAIN_SIZE / rotary_dim, [&](int64_t begin, int64_t end) {
-    int64_t seq{0}, head_id{0};
-    data_index_init(begin, seq, num_tokens, head_id, num_heads);
-    for (int64_t i = begin; i < end; ++i) {
-      int64_t in_offset_q = seq * query_stride_s + head_id * query_stride_h;
-      int64_t out_offset_q = seq * query_out_stride_s + head_id * query_out_stride_h;
-      int64_t out_offset_k = seq * key_out_stride_s;
-      int64_t p = 0;
-      scalar_t* sin_start = nullptr;
-      scalar_t* cos_start = nullptr;
-      // step 0) get the rotary position embedding for the current position
-      p = positions[seq];
-      sin_start = cos_sin_cache + p * HR + COFF;
-      cos_start = cos_sin_cache + p * HR;
-      // step 1) apply_rotary_pos_emb for the rotary_dim elements in every
-      // head of query/key
-      for (int64_t h = 0; h < rotary_dim; h += 2) {
-        scalar_t cos = cos_start[h >> 1];
-        scalar_t sin = sin_start[h >> 1];
-        scalar_t in1 = query[in_offset_q + h];
-        scalar_t in2 = query[in_offset_q + h + 1];
-        scalar_t out1 = in1 * cos - in2 * sin;
-        scalar_t out2 = in2 * cos + in1 * sin;
-        query_out[out_offset_q + h] = out1;
-        query_out[out_offset_q + h + 1] = out2;
-      }
-      for (int64_t h = 0; h < HK; h += 2) {
-        scalar_t cos = cos_start[h >> 1];
-        scalar_t sin = sin_start[h >> 1];
-        int64_t k_pe_offset = seq * key_stride_s;
-        scalar_t in1_k = key[k_pe_offset + h];
-        scalar_t in2_k = key[k_pe_offset + h + 1];
-        scalar_t out1_k = in1_k * cos - in2_k * sin;
-        scalar_t out2_k = in2_k * cos + in1_k * sin;
-        key_out[out_offset_k + h] = out1_k;
-        key_out[out_offset_k + h + 1] = out2_k;
-      }
-      // move to the next index
-      data_index_step(seq, num_tokens, head_id, num_heads);
-    }
-  });
-}
-
 template <typename scalar_t, RotaryMode mode, bool inplace, typename CachePos>
 void rotary_embedding_kernel_impl(
     scalar_t* __restrict__ query_out,
@@ -540,85 +475,6 @@ void multimodal_rotary_embedding_neox_2D_kernel_impl(
 }
 
 template <typename scalar_t>
-void rotary_embedding_4D_kernel_impl(
-    int64_t* __restrict__ positions,
-    scalar_t* __restrict__ query,
-    scalar_t* __restrict__ key,
-    scalar_t* __restrict__ cos_sin_cache,
-    int64_t rotary_dim,
-    int64_t query_stride_b,
-    int64_t query_stride_s,
-    int64_t query_stride_h,
-    int64_t key_stride_b,
-    int64_t key_stride_s,
-    int64_t key_stride_h,
-    int64_t num_heads,
-    int64_t num_kv_heads,
-    int64_t head_size,
-    int64_t batch_size,
-    int64_t seq_len) {
-  int64_t embed_dim = rotary_dim / 2;
-
-  at::parallel_for(0, batch_size * seq_len * num_heads, GRAIN_SIZE / rotary_dim, [&](int64_t begin, int64_t end) {
-    int64_t bs = {0}, seq = {0}, i = {0};
-    data_index_init(begin, bs, batch_size, seq, seq_len, i, num_heads);
-    for ([[maybe_unused]] auto z : c10::irange(begin, end)) {
-      int64_t pos = positions[bs * seq_len + seq];
-      scalar_t* cache_ptr = cos_sin_cache + pos * rotary_dim;
-      scalar_t* cos_cache_ptr = cache_ptr;
-      scalar_t* sin_cache_ptr = cache_ptr + embed_dim;
-      int64_t head_idx = i;
-      int64_t token_head = bs * query_stride_b + seq * query_stride_s + head_idx * query_stride_h;
-      scalar_t* head_query = token_head + query;
-      for (int64_t j = 0; j < embed_dim; j += 1) {
-        int64_t rot_offset = j;
-        int64_t x_index = 2 * rot_offset;
-        int64_t y_index = 2 * rot_offset + 1;
-
-        float cos = cos_cache_ptr[rot_offset];
-        float sin = sin_cache_ptr[rot_offset];
-
-        float x = head_query[x_index];
-        float y = head_query[y_index];
-
-        head_query[x_index] = x * cos - y * sin;
-        head_query[y_index] = y * cos + x * sin;
-      }
-      data_index_step(bs, batch_size, seq, seq_len, i, num_heads);
-    }
-  });
-
-  at::parallel_for(0, batch_size * seq_len * num_kv_heads, GRAIN_SIZE / rotary_dim, [&](int64_t begin, int64_t end) {
-    int64_t bs = {0}, seq = {0}, i = {0};
-    data_index_init(begin, bs, batch_size, seq, seq_len, i, num_kv_heads);
-    for ([[maybe_unused]] auto z : c10::irange(begin, end)) {
-      int64_t pos = positions[bs * seq_len + seq];
-      scalar_t* cache_ptr = cos_sin_cache + pos * rotary_dim;
-      scalar_t* cos_cache_ptr = cache_ptr;
-      scalar_t* sin_cache_ptr = cache_ptr + embed_dim;
-      int64_t head_idx = i;
-      int64_t token_head = bs * key_stride_b + seq * key_stride_s + head_idx * head_size;
-      scalar_t* head_key = key + token_head;
-      for (int64_t j = 0; j < embed_dim; j += 1) {
-        int64_t rot_offset = j;
-        int64_t x_index = 2 * rot_offset;
-        int64_t y_index = 2 * rot_offset + 1;
-
-        float cos = cos_cache_ptr[rot_offset];
-        float sin = sin_cache_ptr[rot_offset];
-
-        float x = head_key[x_index];
-        float y = head_key[y_index];
-
-        head_key[x_index] = x * cos - y * sin;
-        head_key[y_index] = y * cos + x * sin;
-      }
-      data_index_step(bs, batch_size, seq, seq_len, i, num_kv_heads);
-    }
-  });
-}
-
-template <typename scalar_t>
 void multimodal_rotary_embedding_2D_kernel_impl(
     int64_t* __restrict__ positions,
     scalar_t* __restrict__ query,
@@ -861,7 +717,7 @@ std::tuple<at::Tensor, at::Tensor> multimodal_rotary_embedding_cpu(
   const RopeParams p{query, key, head_size, rotary_dim};
   TORCH_CHECK(p.rotary_dim <= p.head_size, "rotary_dim must be <= head_size");
   TORCH_CHECK(p.rotary_dim % 2 == 0, "rotary_dim must be even");
-  TORCH_CHECK(positions.numel() == p.rows(), "positions numel must equal batch*seqlen");
+  TORCH_CHECK(positions.size(-1) == p.rows(), "positions numel must equal batch*seqlen");
 
   int64_t num_heads = query.size(-1) / head_size;
   int64_t num_kv_heads = key.size(-1) / head_size;
