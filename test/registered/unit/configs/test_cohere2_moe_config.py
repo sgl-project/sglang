@@ -43,6 +43,18 @@ class TestCohere2MoeConfig(CustomTestCase):
         self.assertEqual(cfg_dict["model_type"], "cohere2_moe")
         self.assertEqual(cfg_dict["foo"], "bar")
 
+    def test_use_cache_false_preserved(self):
+        """``use_cache=False`` must survive ``super().__init__``.
+
+        ``PreTrainedConfig.__init__`` re-assigns ``self.use_cache`` from its
+        own keyword; if the subclass does not forward the caller's value,
+        ``use_cache=False`` silently reverts to the base default ``True``.
+        """
+        from sglang.srt.configs.cohere2_moe import Cohere2MoeConfig
+
+        cfg = Cohere2MoeConfig(use_cache=False)
+        self.assertFalse(cfg.use_cache)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -105,6 +105,7 @@ class Cohere2MoeConfig(PreTrainedConfig):
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,
             tie_word_embeddings=tie_word_embeddings,
+            use_cache=use_cache,
             **kwargs,
         )
 
