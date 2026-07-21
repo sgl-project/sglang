@@ -38,6 +38,13 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.storage_prefetch import (
+    StorageCheckpointRegistry,
+    StorageCheckpointState,
+    StoragePrefetchState,
+    StoragePrefetchTracker,
+    make_storage_checkpoint_handle,
+)
 from sglang.srt.mem_cache.unified_cache_components import (
     _NUM_COMPONENT_TYPES,
     BASE_COMPONENT_TYPE,
@@ -398,6 +405,16 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if not waited and self.tp_world_size > 1:
             torch.distributed.barrier(group=self.tp_group)
 
+    def synchronize_storage_prefetch_flag(self, flag: bool) -> bool:
+        flag_tensor = torch.tensor(int(flag), dtype=torch.int)
+        self._all_reduce_attn_groups(flag_tensor, torch.distributed.ReduceOp.MAX)
+        return flag_tensor.item() != 0
+
+    def synchronize_storage_prefetch_min(self, value: int) -> int:
+        value_tensor = torch.tensor(value, dtype=torch.int)
+        self._all_reduce_attn_groups(value_tensor, torch.distributed.ReduceOp.MIN)
+        return int(value_tensor.item())
+
     def _drain_async_work(self):
         """
         Block until all outstanding async sends are consumed, then clear.
@@ -476,6 +493,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.ongoing_load_back: dict[int, _OngoingLoadBack] = {}
         self.enable_storage = False
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
+        self.storage_prefetch_tracker = StoragePrefetchTracker()
+        self.storage_checkpoint_registry = StorageCheckpointRegistry()
         self.ongoing_prefetch: dict[str, _OngoingPrefetch] = {}
         self.ongoing_backup: dict[int, tuple[UnifiedTreeNode, DecLockRefParams]] = {}
 
@@ -716,6 +735,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int, **kwargs
     ) -> None:
         if self.session.try_cache_finished_req(req, is_insert=is_insert, **kwargs):
+            if req.storage_checkpoint_handle is not None:
+                self.storage_checkpoint_registry.fail(req.storage_checkpoint_handle)
             return
 
         if self.disable:
@@ -725,6 +746,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             self.token_to_kv_pool_allocator.free(kv_indices)
             for comp in self._components_tuple:
                 comp.cleanup_after_caching_req(req, is_finished=True)
+            if req.storage_checkpoint_handle is not None:
+                self.storage_checkpoint_registry.fail(req.storage_checkpoint_handle)
             return
 
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_len_to_handle]
@@ -734,6 +757,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         result = None
         insert_params = None
+        radix_key = None
 
         if is_insert:
             insert_params = InsertParams(
@@ -786,6 +810,120 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             comp.cleanup_after_caching_req(
                 req, is_finished=True, insert_result=result, insert_params=insert_params
             )
+        if req.storage_checkpoint_handle is not None:
+            from sglang.srt.managers.schedule_batch import FINISH_ABORT
+
+            if isinstance(req.finished_reason, FINISH_ABORT):
+                self.storage_checkpoint_registry.fail(req.storage_checkpoint_handle)
+            else:
+                self._create_storage_checkpoint(
+                    req.storage_checkpoint_handle, radix_key
+                )
+
+    def reserve_storage_checkpoint(self, handle: str) -> None:
+        self.storage_checkpoint_registry.reserve(handle)
+
+    def _create_storage_checkpoint(
+        self, handle: str, radix_key: Optional[RadixKey]
+    ) -> None:
+        if (
+            radix_key is None
+            or not self.enable_storage
+            or self.cache_controller is None
+        ):
+            self.storage_checkpoint_registry.fail(handle)
+            return
+
+        target_node = self.match_prefix(
+            MatchPrefixParams(key=radix_key)
+        ).last_device_node
+        path = []
+        node = target_node
+        while node is not self.root_node:
+            path.append(node)
+            node = node.parent
+        path.reverse()
+        if not path or any(node.hash_value is None for node in path):
+            self.storage_checkpoint_registry.fail(handle)
+            return
+
+        page_hashes = []
+        for node in path:
+            assert node.hash_value is not None
+            page_hashes.extend(node.hash_value)
+        write_tracker = self.cache_controller.storage_write_tracker
+        checkpoint = self.storage_checkpoint_registry.create(
+            handle,
+            page_hashes,
+            durable_hashes=write_tracker.get_durable_hashes(page_hashes),
+            has_pending=write_tracker.has_pending,
+        )
+        if checkpoint.state is StorageCheckpointState.READY:
+            return
+
+        for node in path:
+            node_hashes = node.hash_value
+            assert node_hashes is not None
+            if write_tracker.has_pending(node_hashes):
+                continue
+            if node.write_through_pending_id is not None:
+                continue
+            if not node.backuped:
+                if self.write_backup(node) <= 0:
+                    self.storage_checkpoint_registry.fail(handle)
+                    return
+                continue
+            aux_backup_started = self._write_missing_aux_backup(node)
+            if aux_backup_started is False:
+                self.storage_checkpoint_registry.fail(handle)
+                return
+            if aux_backup_started is True:
+                continue
+            if self.write_backup_storage(node) is None:
+                self.storage_checkpoint_registry.fail(handle)
+                return
+
+    def _write_missing_aux_backup(self, node: UnifiedTreeNode) -> Optional[bool]:
+        if self.cache_controller is None:
+            return False
+
+        comp_xfers: dict[ComponentType, list[PoolTransfer]] = {}
+        for comp in self._components_tuple:
+            if comp.component_type == BASE_COMPONENT_TYPE:
+                continue
+            component_data = node.component_data[comp.component_type]
+            if component_data.value is None or component_data.host_value is not None:
+                continue
+            transfers = comp.build_hicache_transfers(
+                node, CacheTransferPhase.BACKUP_HOST
+            )
+            if transfers:
+                comp_xfers[comp.component_type] = transfers
+
+        if not comp_xfers:
+            return None
+
+        device_value = node.component_data[BASE_COMPONENT_TYPE].value
+        if device_value is None:
+            return False
+        aux_xfers = [transfer for xfers in comp_xfers.values() for transfer in xfers]
+        host_indices = self.cache_controller.write(
+            device_value[:0], node_id=node.id, extra_pools=aux_xfers
+        )
+        if host_indices is None:
+            return False
+        assert host_indices.numel() == 0
+
+        for component_type, transfers in comp_xfers.items():
+            self.components[component_type].commit_hicache_transfer(
+                node,
+                CacheTransferPhase.BACKUP_HOST,
+                transfers=transfers,
+            )
+
+        lock_params = self.inc_lock_ref(node).to_dec_params()
+        self._track_write_through_node(node, lock_params)
+        return True
 
     def cache_unfinished_req(self, req: Req, chunked: bool = False, **kwargs) -> None:
         if self.session.try_cache_unfinished_req(req, chunked=chunked, **kwargs):
@@ -1824,13 +1962,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         ):
             self.write_backup(node)
 
-    def write_backup_storage(self, node: UnifiedTreeNode) -> None:
+    def write_backup_storage(self, node: UnifiedTreeNode) -> Optional[int]:
         if (
             not self.enable_storage
             or self.cache_controller is None
             or not node.backuped
         ):
-            return
+            return None
 
         prefix_keys = None
         if self.hicache_storage_pass_prefix_keys:
@@ -1869,6 +2007,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             node,
             self.inc_host_lock_ref(node).to_dec_params(),
         )
+        return operation_id
 
     def prefetch_from_storage(
         self,
@@ -1877,9 +2016,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         new_input_tokens: list[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[list[str]] = None,
-    ) -> None:
+        checkpoint_dependency: Optional[str] = None,
+    ) -> StoragePrefetchState:
         if not self.enable_storage or self.cache_controller is None:
-            return
+            state = StoragePrefetchState.MISS
+            self.storage_prefetch_tracker.set(req_id, state)
+            return state
 
         extra_key = last_host_node.key.extra_key if last_host_node.key else None
         prefetch_key = RadixKey(
@@ -1888,11 +2030,49 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             is_bigram=self.is_eagle,
         ).page_aligned(self.page_size)
         prefetch_length = len(prefetch_key)
-        if (
-            prefetch_length < self.prefetch_threshold
-            or self.cache_controller.prefetch_rate_limited()
+        if prefetch_length < self.prefetch_threshold:
+            state = StoragePrefetchState.MISS
+            self.storage_prefetch_tracker.set(req_id, state)
+            return state
+        if checkpoint_dependency is not None:
+            checkpoint_state = self.storage_checkpoint_registry.get_state(
+                checkpoint_dependency
+            )
+            checkpoint_flags = torch.tensor(
+                [
+                    int(checkpoint_state is StorageCheckpointState.FAILED),
+                    int(checkpoint_state is not StorageCheckpointState.READY),
+                ],
+                dtype=torch.int,
+            )
+            self._all_reduce_attn_groups(
+                checkpoint_flags, torch.distributed.ReduceOp.MAX
+            )
+            if checkpoint_flags[0].item() != 0:
+                state = StoragePrefetchState.FAILED
+                self.storage_prefetch_tracker.set(req_id, state)
+                return state
+            if checkpoint_flags[1].item() != 0:
+                state = StoragePrefetchState.DEFERRED
+                self.storage_prefetch_tracker.set(req_id, state)
+                return state
+        pending_write = torch.tensor(
+            int(
+                self.cache_controller.has_pending_storage_write(prefetch_key, last_hash)
+            ),
+            dtype=torch.int,
+        )
+        self._all_reduce_attn_groups(pending_write, torch.distributed.ReduceOp.MAX)
+        if pending_write.item() != 0:
+            state = StoragePrefetchState.DEFERRED
+            self.storage_prefetch_tracker.set(req_id, state)
+            return state
+        if self.synchronize_storage_prefetch_flag(
+            self.cache_controller.prefetch_rate_limited()
         ):
-            return
+            state = StoragePrefetchState.DEFERRED
+            self.storage_prefetch_tracker.set(req_id, state)
+            return state
 
         anchor_lock_params = self.inc_host_lock_ref(last_host_node).to_dec_params()
         comp_xfers: dict[ComponentType, list[PoolTransfer]] = {}
@@ -1916,12 +2096,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         sidecar_xfers = self._build_sidecar_transfers(
             CacheTransferPhase.PREFETCH, kv_xfer, comp_xfers
         )
+        alloc_failed = self.synchronize_storage_prefetch_flag(alloc_failed)
         if alloc_failed:
             self.cache_controller.append_host_mem_release(
                 extra_pools=[x for xfers in comp_xfers.values() for x in xfers],
             )
             self.dec_host_lock_ref(last_host_node, anchor_lock_params)
-            return
+            state = StoragePrefetchState.DEFERRED
+            self.storage_prefetch_tracker.set(req_id, state)
+            return state
 
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
         aux_xfers.extend(sidecar_xfers)
@@ -1941,6 +2124,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             comp_xfers,
         )
         self.cache_controller.prefetch_tokens_occupied += len(prefetch_key)
+        state = StoragePrefetchState.QUERYING
+        self.storage_prefetch_tracker.set(req_id, state)
+        return state
 
     def _prefetch_timeout_check_linear_func(self, operation: PrefetchOperation) -> bool:
         return (
@@ -1948,6 +2134,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             > self.prefetch_timeout_base
             + len(operation.hash_value) * self.prefetch_timeout_per_page
         )
+
+    def storage_prefetch_timeout(self, num_tokens: int) -> float:
+        num_pages = (num_tokens + self.page_size - 1) // self.page_size
+        return self.prefetch_timeout_base + num_pages * self.prefetch_timeout_per_page
 
     def can_terminate_prefetch(self, operation: PrefetchOperation) -> bool:
         if self.prefetch_stop_policy == "best_effort":
@@ -1998,10 +2188,16 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             comp_xfers,
         ) = self.ongoing_prefetch[req_id]
         if not self.can_terminate_prefetch(operation):
+            state = (
+                StoragePrefetchState.READING
+                if operation.host_indices is not None
+                else StoragePrefetchState.QUERYING
+            )
+            self.storage_prefetch_tracker.set(req_id, state)
             return False
         if operation.host_indices is None:
             self.cache_controller.terminate_prefetch(operation)
-            self._revoke_pending_prefetch(req_id)
+            self._revoke_pending_prefetch(req_id, StoragePrefetchState.FAILED)
             return True
 
         completed_tokens, hash_value = self.cache_controller.terminate_prefetch(
@@ -2051,6 +2247,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         loaded_from_storage = min_completed_tokens - insert_result.prefix_len
         self.prefetch_loaded_tokens_by_reqid[req_id] = loaded_from_storage
+        self.storage_prefetch_tracker.set(
+            req_id,
+            (
+                StoragePrefetchState.READY
+                if loaded_from_storage > 0
+                else StoragePrefetchState.MISS
+            ),
+        )
         logger.info(
             "HiCache prefetch success req=%s completed_local=%d completed_synced=%d matched=%d loaded=%d tail_release=%d occupied=%d",
             req_id,
@@ -2072,11 +2276,16 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         operation.mark_terminate()
 
     def pop_prefetch_loaded_tokens(self, req_id: str) -> int:
+        self.storage_prefetch_tracker.forget(req_id)
         return self.prefetch_loaded_tokens_by_reqid.pop(req_id, 0)
 
     def release_aborted_request(self, rid: str) -> None:
+        self.storage_checkpoint_registry.fail_if_present(
+            make_storage_checkpoint_handle(rid)
+        )
         self.prefetch_loaded_tokens_by_reqid.pop(rid, None)
         if rid not in self.ongoing_prefetch:
+            self.storage_prefetch_tracker.forget(rid)
             return
 
         (
@@ -2090,6 +2299,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if operation.host_indices is None:
             self.cache_controller.terminate_prefetch(operation)
             self._revoke_pending_prefetch(rid)
+            self.storage_prefetch_tracker.forget(rid)
             return
 
         completed_tokens, _ = self.cache_controller.terminate_prefetch(operation)
@@ -2101,8 +2311,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             extra_pools=[x for xfers in comp_xfers.values() for x in xfers],
         )
         self.cache_controller.prefetch_tokens_occupied -= len(prefetch_key)
+        self.storage_prefetch_tracker.forget(rid)
 
-    def _revoke_pending_prefetch(self, req_id: str) -> None:
+    def _revoke_pending_prefetch(
+        self,
+        req_id: str,
+        state: StoragePrefetchState = StoragePrefetchState.MISS,
+    ) -> None:
         info = self.ongoing_prefetch.pop(req_id, None)
         if info is None:
             return
@@ -2122,6 +2337,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         cc.prefetch_tokens_occupied = max(
             0, cc.prefetch_tokens_occupied - len(prefetch_key)
         )
+        self.storage_prefetch_tracker.set(req_id, state)
 
     def _drain_storage_control_queues_impl(
         self,
@@ -2145,8 +2361,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 yield item
 
         def _drain_revoke():
-            for req_id in _drain_queue(cc.prefetch_revoke_queue, n_revoke):
-                self._revoke_pending_prefetch(req_id)
+            for revoke in _drain_queue(cc.prefetch_revoke_queue, n_revoke):
+                self._revoke_pending_prefetch(revoke.request_id, revoke.state)
 
         def _drain_and_alloc_storage_hit():
             for operation in _drain_queue(cc.prefetch_hit_queue, n_storage_hit):
@@ -2157,7 +2373,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     continue
                 if operation.is_terminated():
                     # request was aborted while the storage query was in flight
-                    self._revoke_pending_prefetch(req_id)
+                    self._revoke_pending_prefetch(req_id, StoragePrefetchState.FAILED)
                     continue
 
                 alloc_len = operation.storage_hit_count
@@ -2174,9 +2390,20 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     )
                     if alloc_len >= self.prefetch_threshold:
                         host_indices = cc.mem_pool_host.alloc(alloc_len)
-                if host_indices is None:
-                    self._revoke_pending_prefetch(req_id)
+                synchronized_alloc_len = self.synchronize_storage_prefetch_min(
+                    len(host_indices) if host_indices is not None else 0
+                )
+                if synchronized_alloc_len < self.prefetch_threshold:
+                    if host_indices is not None:
+                        cc.mem_pool_host.free(host_indices)
+                    self._revoke_pending_prefetch(req_id, StoragePrefetchState.DEFERRED)
                     continue
+
+                assert host_indices is not None
+                if len(host_indices) > synchronized_alloc_len:
+                    cc.mem_pool_host.free(host_indices[synchronized_alloc_len:])
+                    host_indices = host_indices[:synchronized_alloc_len]
+                alloc_len = synchronized_alloc_len
 
                 operation.storage_hit_count = alloc_len
                 operation.hash_value = operation.hash_value[
@@ -2184,12 +2411,33 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 ]
                 operation.host_indices = host_indices
                 self.ongoing_prefetch[req_id] = info._replace(host_indices=host_indices)
+                self.storage_prefetch_tracker.set(req_id, StoragePrefetchState.READING)
                 cc.prefetch_buffer.put(operation)
 
         def _drain_backup():
-            drained = 0
-            for operation in _drain_queue(cc.ack_backup_queue, n_backup):
-                drained += 1
+            operations = list(_drain_queue(cc.ack_backup_queue, n_backup))
+            if not operations:
+                return 0
+            durable_pages = torch.tensor(
+                [
+                    operation.durable_page_count(
+                        self.page_size, backup_skip=cc.backup_skip
+                    )
+                    for operation in operations
+                ],
+                dtype=torch.int,
+            )
+            self._all_reduce_attn_groups(durable_pages, torch.distributed.ReduceOp.MIN)
+            for operation, durable_page_count in zip(
+                operations, durable_pages.tolist()
+            ):
+                completion = cc.storage_write_tracker.complete(
+                    operation.id, int(durable_page_count)
+                )
+                if completion is not None:
+                    self.storage_checkpoint_registry.record_write_completion(
+                        completion, cc.storage_write_tracker.has_pending
+                    )
                 entry = self.ongoing_backup.pop(operation.id, None)
                 if entry is not None:
                     node, lock_params = entry
@@ -2202,7 +2450,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     self.storage_metrics_collector.log_backuped_tokens(
                         operation.completed_tokens
                     )
-            return drained
+            return len(operations)
 
         def _drain_release():
             host_indices_list = []
@@ -2359,6 +2607,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             logger.error("Failed to clear hierarchical cache storage backend: %s", e)
             return False
         if ok:
+            self.cache_controller.storage_write_tracker.clear()
+            self.storage_checkpoint_registry.clear()
             logger.info("Hierarchical cache storage backend cleared successfully!")
         return ok
 

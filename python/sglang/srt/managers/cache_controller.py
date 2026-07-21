@@ -29,6 +29,10 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
 )
+from sglang.srt.mem_cache.storage_prefetch import (
+    StoragePrefetchState,
+    StorageWriteTracker,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -165,6 +169,11 @@ class HiCacheAck(NamedTuple):
     timing_enabled: bool = False
 
 
+class PrefetchRevoke(NamedTuple):
+    request_id: str
+    state: StoragePrefetchState
+
+
 class StorageOperation:
     counter = 0
 
@@ -188,6 +197,11 @@ class StorageOperation:
 
     def __lt__(self, other: StorageOperation):
         return self.id < other.id
+
+    def durable_page_count(self, page_size: int, backup_skip: bool) -> int:
+        if backup_skip:
+            return len(self.hash_value)
+        return self.completed_tokens // page_size
 
 
 class PrefetchOperation(StorageOperation):
@@ -262,6 +276,7 @@ class HiCacheController:
         self.storage_backend = None
         self.storage_backend_type = None
         self.enable_storage_metrics = enable_storage_metrics
+        self.storage_write_tracker = StorageWriteTracker()
 
         # Draft KV pool support (best-effort piggyback on target L2/L3 ops).
         self.has_draft = False
@@ -375,7 +390,7 @@ class HiCacheController:
         self.backup_queue = Queue()
 
         self.prefetch_hit_queue: Queue[StorageOperation] = Queue()
-        self.prefetch_revoke_queue: Queue[str] = Queue()
+        self.prefetch_revoke_queue: Queue[PrefetchRevoke] = Queue()
         self.ack_backup_queue: Queue[StorageOperation] = Queue()
         self.host_mem_release_queue: Queue[torch.Tensor] = Queue()
 
@@ -574,6 +589,7 @@ class HiCacheController:
         self.page_set_func = self._generic_page_set
         self.draft_page_get_func = None
         self.draft_page_set_func = None
+        self.storage_write_tracker.clear()
         # Now it's safe to clear the stop event for future re-attach.
         self.storage_stop_event.clear()
 
@@ -657,6 +673,7 @@ class HiCacheController:
             self.ack_backup_queue.queue.clear()
             self.host_mem_release_queue.queue.clear()
             self.prefetch_tokens_occupied = 0
+        self.storage_write_tracker.clear()
 
         self.storage_stop_event.clear()
 
@@ -1033,8 +1050,19 @@ class HiCacheController:
 
         for start in range(0, len(page_hashes), STORAGE_BATCH_SIZE):
             batch_hashes = page_hashes[start : start + STORAGE_BATCH_SIZE]
-            extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
-            hit_page_num = self.storage_backend.batch_exists(batch_hashes, extra_info)
+            while True:
+                if not self.storage_write_tracker.wait_until_clear(
+                    batch_hashes,
+                    lambda: operation.is_terminated()
+                    or self.storage_stop_event.is_set(),
+                ):
+                    return hash_value, len(hash_value) * self.page_size
+                extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
+                hit_page_num = self.storage_backend.batch_exists(
+                    batch_hashes, extra_info
+                )
+                if not self.storage_write_tracker.has_pending(batch_hashes):
+                    break
             hash_value.extend(batch_hashes[:hit_page_num])
             storage_query_count += hit_page_num * self.page_size
             if hit_page_num < len(batch_hashes):
@@ -1059,20 +1087,39 @@ class HiCacheController:
                 if operation is None:
                     continue
                 if operation.is_terminated():
-                    hash_value, storage_hit_count = [], 0
+                    hash_value, storage_hit_count, query_failed = [], 0, False
                 else:
-                    hash_value, storage_hit_count = self._storage_hit_query(operation)
-                storage_hit_count_tensor = torch.tensor(
-                    storage_hit_count, dtype=torch.int
+                    try:
+                        hash_value, storage_hit_count = self._storage_hit_query(
+                            operation
+                        )
+                        query_failed = False
+                    except Exception:
+                        logger.exception(
+                            "Storage query for request %s failed.", operation.request_id
+                        )
+                        hash_value, storage_hit_count, query_failed = [], 0, True
+                query_result = torch.tensor(
+                    [storage_hit_count, -int(query_failed)], dtype=torch.int
                 )
                 self._all_reduce_prefetch_groups(
-                    storage_hit_count_tensor, torch.distributed.ReduceOp.MIN
+                    query_result, torch.distributed.ReduceOp.MIN
                 )
-                storage_hit_count = storage_hit_count_tensor.item()
+                storage_hit_count = int(query_result[0].item())
+                query_failed = query_result[1].item() < 0
 
-                if storage_hit_count < self.prefetch_threshold:
+                if query_failed:
+                    operation.mark_terminate()
+                    self.prefetch_revoke_queue.put(
+                        PrefetchRevoke(
+                            operation.request_id, StoragePrefetchState.FAILED
+                        )
+                    )
+                elif storage_hit_count < self.prefetch_threshold:
                     # not to prefetch if not enough benefits
-                    self.prefetch_revoke_queue.put(operation.request_id)
+                    self.prefetch_revoke_queue.put(
+                        PrefetchRevoke(operation.request_id, StoragePrefetchState.MISS)
+                    )
                     logger.debug(
                         f"Revoking prefetch for request {operation.request_id} due to insufficient hits ({storage_hit_count})."
                     )
@@ -1100,8 +1147,15 @@ class HiCacheController:
         operation = StorageOperation(
             host_indices, token_ids, hash_value=hash_value, prefix_keys=prefix_keys
         )
+        self.storage_write_tracker.register(operation.id, operation.hash_value)
         self.backup_queue.put(operation)
         return operation.id
+
+    def has_pending_storage_write(
+        self, token_ids: List[int], last_hash: Optional[str]
+    ) -> bool:
+        page_hashes = self.get_hash_str(token_ids, last_hash, page_size=self.page_size)
+        return self.storage_write_tracker.has_pending(page_hashes)
 
     # todo: deprecate
     def _generic_page_set(self, hash_values, host_indices, extra_info=None) -> bool:
@@ -1219,8 +1273,13 @@ class HiCacheController:
                 if operation is None:
                     continue
 
-                if not self.backup_skip:
-                    self._page_backup(operation)
+                try:
+                    if not self.backup_skip:
+                        self._page_backup(operation)
+                except Exception:
+                    logger.exception(
+                        "Storage backup operation %s failed.", operation.id
+                    )
                 self.ack_backup_queue.put(operation)
 
             except Empty:

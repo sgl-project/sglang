@@ -312,6 +312,8 @@ class Session:
             priority=req.priority,
             routing_key=req.routing_key,
             extra_key=req.extra_key,
+            storage_checkpoint=req.storage_checkpoint,
+            storage_checkpoint_dependency=req.storage_checkpoint_dependency,
             http_worker_ipc=req.http_worker_ipc,
             time_stats=req.time_stats,
         )

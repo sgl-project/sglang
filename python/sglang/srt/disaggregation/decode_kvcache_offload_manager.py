@@ -293,8 +293,32 @@ class DecodeKVCacheOffloadManager:
 
     def _check_backup_progress(self, finish_count):
         """Check the progress of backup from host to storage."""
-        for _ in range(finish_count):
-            storage_operation = self.cache_controller.ack_backup_queue.get()
+        storage_operations = [
+            self.cache_controller.ack_backup_queue.get() for _ in range(finish_count)
+        ]
+        if not storage_operations:
+            return
+        durable_pages = torch.tensor(
+            [
+                storage_operation.durable_page_count(
+                    self.page_size, backup_skip=self.cache_controller.backup_skip
+                )
+                for storage_operation in storage_operations
+            ],
+            dtype=torch.int,
+        )
+        if self.tp_world_size > 1:
+            torch.distributed.all_reduce(
+                durable_pages,
+                op=torch.distributed.ReduceOp.MIN,
+                group=self.tp_group,
+            )
+        for storage_operation, durable_page_count in zip(
+            storage_operations, durable_pages.tolist()
+        ):
+            self.cache_controller.storage_write_tracker.complete(
+                storage_operation.id, int(durable_page_count)
+            )
             ack_id = storage_operation.id
             req_id, host_indices, start_time = self.ongoing_backup.pop(ack_id)
 

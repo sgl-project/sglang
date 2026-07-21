@@ -17,6 +17,10 @@ import torch
 
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.storage_prefetch import (
+    StoragePrefetchState,
+    StoragePrefetchTracker,
+)
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_RADIX_CACHE,
     RadixCacheMetricsCollector,
@@ -37,6 +41,7 @@ class PrefixCacheTrait(Protocol):
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
     page_size: int
     disable: bool
+    storage_prefetch_tracker: StoragePrefetchTracker
 
 
 @dataclasses.dataclass
@@ -214,6 +219,21 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     metrics_collector: Optional[RadixCacheMetricsCollector] = (
         None  # metrics collector for the cache
     )
+
+    def get_storage_prefetch_state(self, request_id: str) -> StoragePrefetchState:
+        return self.storage_prefetch_tracker.get(request_id)
+
+    def storage_prefetch_timeout(self, num_tokens: int) -> float:
+        raise NotImplementedError
+
+    def synchronize_storage_prefetch_flag(self, flag: bool) -> bool:
+        return flag
+
+    def synchronize_storage_prefetch_min(self, value: int) -> int:
+        return value
+
+    def reserve_storage_checkpoint(self, handle: str) -> None:
+        raise NotImplementedError
 
     def init_metrics_collector(self):
         from sglang.srt.runtime_context import get_server_args

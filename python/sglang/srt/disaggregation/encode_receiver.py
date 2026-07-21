@@ -1884,6 +1884,10 @@ class MMReceiverBase(ABC):
             disagg_prefill_dp_rank=recv_req.disagg_prefill_dp_rank,
             vocab_size=self.scheduler.model_config.vocab_size,
             priority=recv_req.priority,
+            routing_key=recv_req.routing_key,
+            extra_key=recv_req.extra_key,
+            storage_checkpoint=recv_req.storage_checkpoint,
+            storage_checkpoint_dependency=recv_req.storage_checkpoint_dependency,
             metrics_collector=(
                 self.scheduler.metrics_collector
                 if self.scheduler.metrics_reporter.enable_metrics

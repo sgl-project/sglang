@@ -8,7 +8,7 @@ import os
 import threading
 import time
 from queue import Empty
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, NamedTuple, Optional, Tuple
 
 import torch
 
@@ -45,6 +45,13 @@ from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToToke
 from sglang.srt.mem_cache.radix_cache import (
     RadixKey,
 )
+from sglang.srt.mem_cache.storage_prefetch import (
+    StorageCheckpointRegistry,
+    StorageCheckpointState,
+    StoragePrefetchState,
+    StoragePrefetchTracker,
+    make_storage_checkpoint_handle,
+)
 from sglang.srt.mem_cache.utils import compute_node_hash_values, split_node_hash_value
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_STORAGE,
@@ -53,10 +60,18 @@ from sglang.srt.observability.metrics_collector import (
 )
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
+
+
+class _OngoingWriteThrough(NamedTuple):
+    lock_node: TreeNode
+    publish_nodes: list[TreeNode]
+    release_lock: bool
+    includes_full_kv: bool
 
 
 class HostLRUList(LRUList):
@@ -173,6 +188,8 @@ class HiMambaRadixCache(MambaRadixCache):
         # track per-request tokens loaded from storage (L3 hits)
         # key: request_id, value: number of tokens actually loaded from storage
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
+        self.storage_prefetch_tracker = StoragePrefetchTracker()
+        self.storage_checkpoint_registry = StorageCheckpointRegistry()
 
         self.write_through_threshold = (
             1 if server_args.hicache_write_policy == "write_through" else 2
@@ -199,6 +216,8 @@ class HiMambaRadixCache(MambaRadixCache):
         self.ongoing_prefetch = {}
         self.ongoing_backup = {}
         self.prefetch_loaded_tokens_by_reqid.clear()
+        self.storage_prefetch_tracker.clear()
+        self.storage_checkpoint_registry.clear()
         self.evictable_full_device_leaves.clear()
         self.evictable_full_host_leaves.clear()
         self.mamba_host_lru_list = HostLRUList()
@@ -208,6 +227,141 @@ class HiMambaRadixCache(MambaRadixCache):
             self.mamba_pool_host.available_size(),
         )
         super().reset()
+
+    def synchronize_storage_prefetch_flag(self, flag: bool) -> bool:
+        flag_tensor = torch.tensor(int(flag), dtype=torch.int)
+        if self.tp_world_size > 1:
+            torch.distributed.all_reduce(
+                flag_tensor,
+                op=torch.distributed.ReduceOp.MAX,
+                group=self.tp_group,
+            )
+        return flag_tensor.item() != 0
+
+    def synchronize_storage_prefetch_min(self, value: int) -> int:
+        value_tensor = torch.tensor(value, dtype=torch.int)
+        if self.tp_world_size > 1:
+            torch.distributed.all_reduce(
+                value_tensor,
+                op=torch.distributed.ReduceOp.MIN,
+                group=self.tp_group,
+            )
+        return int(value_tensor.item())
+
+    def cache_finished_req(
+        self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int
+    ) -> None:
+        radix_key = super().cache_finished_req(
+            req, is_insert=is_insert, kv_len_to_handle=kv_len_to_handle
+        )
+        if req.storage_checkpoint_handle is not None:
+            from sglang.srt.managers.schedule_batch import FINISH_ABORT
+
+            if isinstance(req.finished_reason, FINISH_ABORT):
+                self.storage_checkpoint_registry.fail(req.storage_checkpoint_handle)
+            else:
+                self._create_storage_checkpoint(
+                    req.storage_checkpoint_handle, radix_key
+                )
+
+    def reserve_storage_checkpoint(self, handle: str) -> None:
+        self.storage_checkpoint_registry.reserve(handle)
+
+    def _create_storage_checkpoint(
+        self, handle: str, radix_key: Optional[RadixKey]
+    ) -> None:
+        if (
+            radix_key is None
+            or not self.enable_storage
+            or self.cache_controller is None
+        ):
+            self.storage_checkpoint_registry.fail(handle)
+            return
+
+        target_node = self.match_prefix(
+            MatchPrefixParams(key=radix_key)
+        ).last_device_node
+        path = []
+        node = target_node
+        while node is not self.root_node:
+            path.append(node)
+            node = node.parent
+        path.reverse()
+        if (
+            not path
+            or any(node.hash_value is None for node in path)
+            or (
+                target_node.mamba_value is None and target_node.mamba_host_value is None
+            )
+        ):
+            self.storage_checkpoint_registry.fail(handle)
+            return
+
+        page_hashes = []
+        for node in path:
+            assert node.hash_value is not None
+            page_hashes.extend(node.hash_value)
+        write_tracker = self.cache_controller.storage_write_tracker
+        checkpoint = self.storage_checkpoint_registry.create(
+            handle,
+            page_hashes,
+            durable_hashes=write_tracker.get_durable_hashes(page_hashes),
+            has_pending=write_tracker.has_pending,
+        )
+        if checkpoint.state is StorageCheckpointState.READY:
+            return
+
+        for node in path:
+            node_hashes = node.hash_value
+            assert node_hashes is not None
+            if write_tracker.has_pending(node_hashes):
+                continue
+            if node.write_through_pending_id is not None:
+                continue
+            if not node.backuped:
+                if self.write_backup(node) <= 0:
+                    self.storage_checkpoint_registry.fail(handle)
+                    return
+                continue
+            if node is target_node and not node.mamba_backuped:
+                if not self._write_mamba_backup(node):
+                    self.storage_checkpoint_registry.fail(handle)
+                    return
+                continue
+            if self.write_backup_storage(node) is None:
+                self.storage_checkpoint_registry.fail(handle)
+                return
+
+    def _write_mamba_backup(self, node: TreeNode) -> bool:
+        if node.mamba_value is None or node.value is None:
+            return False
+
+        extra_pools = self.mamba_backup_transfers(node)
+        host_indices = self.cache_controller.write(
+            device_indices=node.value[:0],
+            node_id=node.id,
+            extra_pools=extra_pools,
+        )
+        if host_indices is None:
+            self.evict_mamba_host(1)
+            extra_pools = self.mamba_backup_transfers(node)
+            host_indices = self.cache_controller.write(
+                device_indices=node.value[:0],
+                node_id=node.id,
+                extra_pools=extra_pools,
+            )
+        if host_indices is None or extra_pools is None:
+            return False
+
+        assert host_indices.numel() == 0
+        self.mamba_backup_commit(node, extra_pools)
+        self._track_write_through_node(
+            node,
+            release_lock=True,
+            includes_full_kv=False,
+        )
+        self.inc_lock_ref(node)
+        return True
 
     def write_backup(self, node: TreeNode, write_back=False) -> int:
         # Backup invariant (for write-through mode): backed-up nodes must form a
@@ -241,14 +395,73 @@ class HiMambaRadixCache(MambaRadixCache):
             if extra_pools is not None:
                 self.mamba_backup_commit(node, extra_pools)
             assert len(node.host_value) > 0
-            self.ongoing_write_through[node.id] = node
-            if not write_back:
+            release_lock = not write_back
+            self._track_write_through_node(
+                node,
+                release_lock=release_lock,
+                includes_full_kv=True,
+            )
+            if release_lock:
                 # no need to lock nodes if write back
                 self.inc_lock_ref(node)
         else:
             return 0
 
         return len(host_indices)
+
+    def _track_write_through_node(
+        self,
+        node: TreeNode,
+        *,
+        release_lock: bool,
+        includes_full_kv: bool,
+    ) -> None:
+        node.write_through_pending_id = node.id
+        self.ongoing_write_through[node.id] = _OngoingWriteThrough(
+            lock_node=node,
+            publish_nodes=[node],
+            release_lock=release_lock,
+            includes_full_kv=includes_full_kv,
+        )
+
+    def _replace_pending_write_through_node(
+        self, old_node: TreeNode, new_nodes: list[TreeNode]
+    ) -> None:
+        ack_id = old_node.write_through_pending_id
+        if ack_id is None:
+            return
+        pending = self.ongoing_write_through.get(ack_id)
+        if pending is None or not pending.includes_full_kv:
+            return
+
+        publish_nodes = []
+        replaced = False
+        for node in pending.publish_nodes:
+            if node is old_node:
+                publish_nodes.extend(new_nodes)
+                replaced = True
+            else:
+                publish_nodes.append(node)
+        if not replaced:
+            return
+
+        for node in new_nodes:
+            node.write_through_pending_id = ack_id
+        self.ongoing_write_through[ack_id] = pending._replace(
+            publish_nodes=publish_nodes
+        )
+
+    def _finish_write_through_ack(self, ack_id: int) -> None:
+        pending = self.ongoing_write_through.pop(ack_id)
+        for node in pending.publish_nodes:
+            if node.write_through_pending_id == ack_id:
+                node.write_through_pending_id = None
+            self._record_store_event(node, medium=StorageMedium.CPU)
+        if pending.release_lock:
+            self.dec_lock_ref(pending.lock_node)
+        if self.enable_storage:
+            for node in pending.publish_nodes:
+                self.write_backup_storage(node)
 
     def load_back(
         self, node: TreeNode, mem_quota: Optional[int] = None, req=None
@@ -388,12 +601,8 @@ class HiMambaRadixCache(MambaRadixCache):
                 for ack in self.cache_controller.ack_write_queue:
                     ack.finish_event.synchronize()
                     for ack_id in ack.node_ids:
-                        backuped_node = self.ongoing_write_through.pop(ack_id)
-                        self._record_store_event(
-                            backuped_node, medium=StorageMedium.CPU
-                        )
-                        if self.enable_storage:
-                            self.write_backup_storage(backuped_node)
+                        if ack_id in self.ongoing_write_through:
+                            self._finish_write_through_ack(ack_id)
                 self.cache_controller.ack_write_queue.clear()
                 assert len(self.ongoing_write_through) == 0
             return
@@ -421,11 +630,7 @@ class HiMambaRadixCache(MambaRadixCache):
             ack = self.cache_controller.ack_write_queue.pop(0)
             ack.finish_event.synchronize()
             for ack_id in ack.node_ids:
-                backuped_node = self.ongoing_write_through.pop(ack_id)
-                self._record_store_event(backuped_node, medium=StorageMedium.CPU)
-                self.dec_lock_ref(backuped_node)
-                if self.enable_storage:
-                    self.write_backup_storage(backuped_node)
+                self._finish_write_through_ack(ack_id)
             finish_count -= 1
 
     def loading_check(self):
@@ -1109,6 +1314,8 @@ class HiMambaRadixCache(MambaRadixCache):
             new_node.host_value = child.host_value[:split_len].clone()
             child.host_value = child.host_value[split_len:].clone()
 
+        self._replace_pending_write_through_node(child, [new_node, child])
+
         self._update_leaf_status(new_node)
         self._update_leaf_status(child)
 
@@ -1409,6 +1616,9 @@ class HiMambaRadixCache(MambaRadixCache):
 
         self.enable_storage = False
         self.enable_storage_metrics = False
+        self.prefetch_loaded_tokens_by_reqid.clear()
+        self.storage_prefetch_tracker.clear()
+        self.storage_checkpoint_registry.clear()
         if hasattr(self, "storage_metrics_collector"):
             self.storage_metrics_collector = None
         return True, "Detached HiCache storage backend successfully."
@@ -1480,9 +1690,14 @@ class HiMambaRadixCache(MambaRadixCache):
             n_backup=None,
             n_release=None,
             log_metrics=False,
+            synchronize_durability=False,
         )
 
-    def _revoke_pending_prefetch(self, req_id: str):
+    def _revoke_pending_prefetch(
+        self,
+        req_id: str,
+        state: StoragePrefetchState = StoragePrefetchState.MISS,
+    ):
         info = self.ongoing_prefetch.pop(req_id, None)
         if info is None:
             return
@@ -1493,6 +1708,7 @@ class HiMambaRadixCache(MambaRadixCache):
         cc.prefetch_tokens_occupied = max(
             0, cc.prefetch_tokens_occupied - len(token_ids)
         )
+        self.storage_prefetch_tracker.set(req_id, state)
 
     def _drain_storage_control_queues_impl(
         self,
@@ -1501,6 +1717,7 @@ class HiMambaRadixCache(MambaRadixCache):
         n_backup: Optional[int],
         n_release: Optional[int],
         log_metrics: bool,
+        synchronize_durability: bool,
     ):
         cc = self.cache_controller
 
@@ -1515,16 +1732,13 @@ class HiMambaRadixCache(MambaRadixCache):
                 yield item
 
         def _drain_revoke():
-            for req_id in _drain_queue(cc.prefetch_revoke_queue, n_revoke):
-                self._revoke_pending_prefetch(req_id)
+            for revoke in _drain_queue(cc.prefetch_revoke_queue, n_revoke):
+                self._revoke_pending_prefetch(revoke.request_id, revoke.state)
 
         def _drain_and_alloc_storage_hit():
             # The L3 hit count is now known, so reserve exactly that much host
-            # KV memory. NOTE: alloc/evict here is rank-local but deterministic
-            # across TP ranks without extra synchronization: host pool
-            # mutations only happen on the scheduler thread at lockstep points
-            # (releases are page-granular and drained by the TP-min count), so
-            # every rank reaches the same success / fallback / revoke decision.
+            # KV memory. Use the minimum successful allocation across TP ranks
+            # so every rank reads and admits the same page-aligned prefix.
             for operation in _drain_queue(cc.prefetch_hit_queue, n_storage_hit):
                 req_id = operation.request_id
                 info = self.ongoing_prefetch.get(req_id)
@@ -1533,7 +1747,7 @@ class HiMambaRadixCache(MambaRadixCache):
                     continue
                 if operation.is_terminated():
                     # request was aborted while the storage query was in flight
-                    self._revoke_pending_prefetch(req_id)
+                    self._revoke_pending_prefetch(req_id, StoragePrefetchState.FAILED)
                     continue
 
                 alloc_len = operation.storage_hit_count
@@ -1550,9 +1764,20 @@ class HiMambaRadixCache(MambaRadixCache):
                     )
                     if alloc_len >= self.prefetch_threshold:
                         host_indices = cc.mem_pool_host.alloc(alloc_len)
-                if host_indices is None:
-                    self._revoke_pending_prefetch(req_id)
+                synchronized_alloc_len = self.synchronize_storage_prefetch_min(
+                    len(host_indices) if host_indices is not None else 0
+                )
+                if synchronized_alloc_len < self.prefetch_threshold:
+                    if host_indices is not None:
+                        cc.mem_pool_host.free(host_indices)
+                    self._revoke_pending_prefetch(req_id, StoragePrefetchState.DEFERRED)
                     continue
+
+                assert host_indices is not None
+                if len(host_indices) > synchronized_alloc_len:
+                    cc.mem_pool_host.free(host_indices[synchronized_alloc_len:])
+                    host_indices = host_indices[:synchronized_alloc_len]
+                alloc_len = synchronized_alloc_len
 
                 operation.storage_hit_count = alloc_len
                 operation.hash_value = operation.hash_value[
@@ -1566,10 +1791,38 @@ class HiMambaRadixCache(MambaRadixCache):
                     host_indices,
                     op,
                 )
+                self.storage_prefetch_tracker.set(req_id, StoragePrefetchState.READING)
                 cc.prefetch_buffer.put(operation)
 
         def _drain_backup():
-            for operation in _drain_queue(cc.ack_backup_queue, n_backup):
+            operations = list(_drain_queue(cc.ack_backup_queue, n_backup))
+            if not operations:
+                return
+            durable_pages = torch.tensor(
+                [
+                    operation.durable_page_count(
+                        self.page_size, backup_skip=cc.backup_skip
+                    )
+                    for operation in operations
+                ],
+                dtype=torch.int,
+            )
+            if synchronize_durability and self.tp_world_size > 1:
+                torch.distributed.all_reduce(
+                    durable_pages,
+                    op=torch.distributed.ReduceOp.MIN,
+                    group=self.tp_group,
+                )
+            for operation, durable_page_count in zip(
+                operations, durable_pages.tolist()
+            ):
+                completion = cc.storage_write_tracker.complete(
+                    operation.id, int(durable_page_count)
+                )
+                if completion is not None:
+                    self.storage_checkpoint_registry.record_write_completion(
+                        completion, cc.storage_write_tracker.has_pending
+                    )
                 ack_id = operation.id
                 entry = self.ongoing_backup.pop(ack_id, None)
                 if entry is not None:
@@ -1676,6 +1929,8 @@ class HiMambaRadixCache(MambaRadixCache):
             try:
                 if hasattr(self.cache_controller.storage_backend, "clear"):
                     self.cache_controller.storage_backend.clear()
+                    self.cache_controller.storage_write_tracker.clear()
+                    self.storage_checkpoint_registry.clear()
                     logger.info(
                         "Hierarchical cache storage backend cleared successfully!"
                     )
@@ -1718,6 +1973,7 @@ class HiMambaRadixCache(MambaRadixCache):
             n_backup=n_backup,
             n_release=n_release,
             log_metrics=True,
+            synchronize_durability=True,
         )
 
     def _prefetch_timeout_check_linear_func(self, operation: PrefetchOperation):
@@ -1725,6 +1981,10 @@ class HiMambaRadixCache(MambaRadixCache):
         num_tokens = len(operation.hash_value) * self.page_size
         timeout = min(cfg.max, cfg.base + cfg.per_ki_token * num_tokens / 1024)
         return time.monotonic() - operation.start_time > timeout
+
+    def storage_prefetch_timeout(self, num_tokens: int) -> float:
+        cfg = self.prefetch_timeout_config
+        return min(cfg.max, cfg.base + cfg.per_ki_token * num_tokens / 1024)
 
     def can_terminate_prefetch(self, operation: PrefetchOperation):
         can_terminate = True
@@ -1773,9 +2033,19 @@ class HiMambaRadixCache(MambaRadixCache):
         operation.mark_terminate()
 
     def pop_prefetch_loaded_tokens(self, req_id: str) -> int:
+        self.storage_prefetch_tracker.forget(req_id)
         return self.prefetch_loaded_tokens_by_reqid.pop(req_id, 0)
 
-    def write_backup_storage(self, node: TreeNode):
+    def write_backup_storage(self, node: TreeNode) -> Optional[int]:
+        if (
+            not self.enable_storage
+            or self.cache_controller is None
+            or not node.backuped
+            or node.hash_value is None
+            or (node.mamba_value is not None and not node.mamba_backuped)
+        ):
+            return None
+
         prefix_keys = (
             node.get_prefix_hash_values(node.parent)
             if self.hicache_storage_pass_prefix_keys
@@ -1792,6 +2062,7 @@ class HiMambaRadixCache(MambaRadixCache):
         mamba_host_protected = extra_pools is not None
         self.ongoing_backup[operation_id] = (node, mamba_host_protected)
         self._protect_host_node(node, protect_mamba=mamba_host_protected)
+        return operation_id
 
     def prefetch_from_storage(
         self,
@@ -1800,25 +2071,77 @@ class HiMambaRadixCache(MambaRadixCache):
         new_input_tokens: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
-    ):
+        checkpoint_dependency: Optional[str] = None,
+    ) -> StoragePrefetchState:
         prefetch_length = len(new_input_tokens) - (
             len(new_input_tokens) % self.page_size
         )
         new_input_tokens = new_input_tokens[:prefetch_length]
-        if (
-            not self.enable_storage
-            or prefetch_length < self.prefetch_threshold
-            or self.cache_controller.prefetch_rate_limited()
+        if not self.enable_storage or prefetch_length < self.prefetch_threshold:
+            state = StoragePrefetchState.MISS
+            self.storage_prefetch_tracker.set(req_id, state)
+            return state
+        if checkpoint_dependency is not None:
+            checkpoint_state = self.storage_checkpoint_registry.get_state(
+                checkpoint_dependency
+            )
+            checkpoint_flags = torch.tensor(
+                [
+                    int(checkpoint_state is StorageCheckpointState.FAILED),
+                    int(checkpoint_state is not StorageCheckpointState.READY),
+                ],
+                dtype=torch.int,
+            )
+            if self.tp_world_size > 1:
+                torch.distributed.all_reduce(
+                    checkpoint_flags,
+                    op=torch.distributed.ReduceOp.MAX,
+                    group=self.tp_group,
+                )
+            if checkpoint_flags[0].item() != 0:
+                state = StoragePrefetchState.FAILED
+                self.storage_prefetch_tracker.set(req_id, state)
+                return state
+            if checkpoint_flags[1].item() != 0:
+                state = StoragePrefetchState.DEFERRED
+                self.storage_prefetch_tracker.set(req_id, state)
+                return state
+        pending_write = torch.tensor(
+            int(
+                self.cache_controller.has_pending_storage_write(
+                    new_input_tokens, last_hash
+                )
+            ),
+            dtype=torch.int,
+        )
+        if self.tp_world_size > 1:
+            torch.distributed.all_reduce(
+                pending_write,
+                op=torch.distributed.ReduceOp.MAX,
+                group=self.tp_group,
+            )
+        if pending_write.item() != 0:
+            state = StoragePrefetchState.DEFERRED
+            self.storage_prefetch_tracker.set(req_id, state)
+            return state
+        if self.synchronize_storage_prefetch_flag(
+            self.cache_controller.prefetch_rate_limited()
         ):
-            return
+            state = StoragePrefetchState.DEFERRED
+            self.storage_prefetch_tracker.set(req_id, state)
+            return state
 
         self._protect_host_node(last_host_node, protect_mamba=False)
 
         # Allocate host mamba slot
         extra_pools = self.mamba_prefetch_alloc(new_input_tokens, last_hash)
-        if extra_pools is None:
+        alloc_failed = self.synchronize_storage_prefetch_flag(extra_pools is None)
+        if alloc_failed:
+            self.prefetch_abort(extra_pools)
             self._release_host_node(last_host_node, release_mamba=False)
-            return
+            state = StoragePrefetchState.DEFERRED
+            self.storage_prefetch_tracker.set(req_id, state)
+            return state
 
         # mamba is also being loaded, protect host mamba as well
         last_host_node.protect_host_mamba()
@@ -1839,6 +2162,9 @@ class HiMambaRadixCache(MambaRadixCache):
             operation,
         )
         self.cache_controller.prefetch_tokens_occupied += len(new_input_tokens)
+        state = StoragePrefetchState.QUERYING
+        self.storage_prefetch_tracker.set(req_id, state)
+        return state
 
     def check_prefetch_progress(self, req_id: str) -> bool:
         if req_id not in self.ongoing_prefetch:
@@ -1849,13 +2175,19 @@ class HiMambaRadixCache(MambaRadixCache):
         ]
 
         if not self.can_terminate_prefetch(operation):
+            state = (
+                StoragePrefetchState.READING
+                if operation.host_indices is not None
+                else StoragePrefetchState.QUERYING
+            )
+            self.storage_prefetch_tracker.set(req_id, state)
             return False
 
         if operation.host_indices is None:
             # Stopping before host memory was committed (best_effort, timeout,
             # or still mid-query): signal the worker to stop, then release the request.
             self.cache_controller.terminate_prefetch(operation)
-            self._revoke_pending_prefetch(req_id)
+            self._revoke_pending_prefetch(req_id, StoragePrefetchState.FAILED)
             return True
 
         host_indices = operation.host_indices
@@ -1920,6 +2252,14 @@ class HiMambaRadixCache(MambaRadixCache):
 
         loaded_from_storage = min_completed_tokens - matched_length
         self.prefetch_loaded_tokens_by_reqid[req_id] = loaded_from_storage
+        self.storage_prefetch_tracker.set(
+            req_id,
+            (
+                StoragePrefetchState.READY
+                if loaded_from_storage > 0
+                else StoragePrefetchState.MISS
+            ),
+        )
 
         if self.enable_storage_metrics:
             self.storage_metrics_collector.log_prefetched_tokens(loaded_from_storage)
@@ -1991,15 +2331,20 @@ class HiMambaRadixCache(MambaRadixCache):
         return matched_length
 
     def release_aborted_request(self, rid: str):
+        self.storage_checkpoint_registry.fail_if_present(
+            make_storage_checkpoint_handle(rid)
+        )
         self.prefetch_loaded_tokens_by_reqid.pop(rid, None)
 
         if rid not in self.ongoing_prefetch:
+            self.storage_prefetch_tracker.forget(rid)
             return
 
         last_host_node, token_ids, host_indices, operation = self.ongoing_prefetch[rid]
         if operation.host_indices is None:
             self.cache_controller.terminate_prefetch(operation)
             self._revoke_pending_prefetch(rid)
+            self.storage_prefetch_tracker.forget(rid)
             return
 
         completed_tokens, _ = self.cache_controller.terminate_prefetch(operation)
@@ -2010,6 +2355,7 @@ class HiMambaRadixCache(MambaRadixCache):
         self.cache_controller.append_host_mem_release(host_indices[:completed_tokens])
         self.prefetch_abort(operation.pool_transfers)
         self.cache_controller.prefetch_tokens_occupied -= len(token_ids)
+        self.storage_prefetch_tracker.forget(rid)
 
     def _flush_pending_storage_backups_before_reset(self) -> None:
         if not self.enable_storage:

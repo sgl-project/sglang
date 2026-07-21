@@ -23,6 +23,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.io_struct import AbortReq, BatchStrOutput, GenerateReqInput
 from sglang.srt.managers.tokenizer_manager import ReqState, TokenizerManager
 from sglang.srt.observability.req_time_stats import APIServerReqTimeStats
@@ -107,7 +108,7 @@ def _make_tokenizer_manager() -> TokenizerManager:
     tm.server_args.weight_version = "1"
     tm.server_args.crash_dump_folder = ""
     tm.server_args.dp_size = 1
-    tm.disaggregation_mode = "none"
+    tm.disaggregation_mode = DisaggregationMode.NULL
     tm.rid_to_state = {}
     tm.enable_metrics = False
     tm.enable_trace = False
@@ -298,6 +299,38 @@ class TestRidToStateCleanupOnBatchOutput(CustomTestCase):
         asyncio.run(tm._handle_batch_output(batch_output))
 
         self.assertIn(rid, tm.rid_to_state)
+
+    def test_finished_checkpoint_returns_handle_and_replica(self):
+        tm = _make_tokenizer_manager()
+        rid = "checkpoint_finish_rid"
+        state = _make_req_state(rid)
+        state.obj.storage_checkpoint = True
+        tm.rid_to_state[rid] = state
+        batch_output = _make_batch_str_output(rid)
+        batch_output.dp_ranks = [3]
+
+        asyncio.run(tm._handle_batch_output(batch_output))
+
+        self.assertEqual(
+            state.out_list[0]["meta_info"]["storage_checkpoint_handle"],
+            f"hicache:{rid}",
+        )
+        self.assertEqual(state.out_list[0]["meta_info"]["dp_rank"], 3)
+
+    def test_aborted_checkpoint_does_not_return_handle(self):
+        tm = _make_tokenizer_manager()
+        rid = "checkpoint_abort_rid"
+        state = _make_req_state(rid)
+        state.obj.storage_checkpoint = True
+        tm.rid_to_state[rid] = state
+        batch_output = _make_batch_str_output(
+            rid,
+            finished_reason={"type": "abort", "message": "Aborted"},
+        )
+
+        asyncio.run(tm._handle_batch_output(batch_output))
+
+        self.assertNotIn("storage_checkpoint_handle", state.out_list[0]["meta_info"])
 
 
 class TestInitReqStateDuplicateDetection(CustomTestCase):

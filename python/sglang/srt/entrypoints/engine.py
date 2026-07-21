@@ -358,6 +358,8 @@ class Engine(EngineScoreMixin, EngineBase):
         session_params: Optional[Dict] = None,
         priority: Optional[int] = None,
         session_id: Optional[str] = None,
+        storage_checkpoint: Union[List[bool], bool] = False,
+        storage_checkpoint_dependency: Optional[Union[List[Optional[str]], str]] = None,
     ) -> Union[Dict, Iterator[Dict]]:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
@@ -396,6 +398,8 @@ class Engine(EngineScoreMixin, EngineBase):
             session_id=session_id,
             session_params=session_params,
             priority=priority,
+            storage_checkpoint=storage_checkpoint,
+            storage_checkpoint_dependency=storage_checkpoint_dependency,
         )
         generator = self.tokenizer_manager.generate_request(obj, None)
 
@@ -462,6 +466,8 @@ class Engine(EngineScoreMixin, EngineBase):
         session_params: Optional[Dict] = None,
         priority: Optional[int] = None,
         session_id: Optional[str] = None,
+        storage_checkpoint: Union[List[bool], bool] = False,
+        storage_checkpoint_dependency: Optional[Union[List[Optional[str]], str]] = None,
     ) -> Union[Dict, AsyncIterator[Dict]]:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
@@ -500,6 +506,8 @@ class Engine(EngineScoreMixin, EngineBase):
             session_id=session_id,
             session_params=session_params,
             priority=priority,
+            storage_checkpoint=storage_checkpoint,
+            storage_checkpoint_dependency=storage_checkpoint_dependency,
         )
         generator = self.tokenizer_manager.generate_request(obj, None)
 

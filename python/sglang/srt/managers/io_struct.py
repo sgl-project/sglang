@@ -269,6 +269,10 @@ class GenerateReqInput:
     priority: Optional[int] = None
     # Extra cache key for classifying the request (e.g. cache_salt)
     extra_key: Optional[Union[List[str], str]] = None
+    # Persist the finished request's page-aligned KV prefix to L3.
+    storage_checkpoint: Union[List[bool], bool] = False
+    # Wait for a prior storage checkpoint before attempting L3 prefetch.
+    storage_checkpoint_dependency: Optional[Union[List[Optional[str]], str]] = None
 
     # Whether to disallow logging for this request (e.g. due to ZDR)
     no_logs: bool = False
@@ -440,6 +444,14 @@ class GenerateReqInput:
             self.token_ids_logprob = None
         if self.return_sampling_mask is None:
             self.return_sampling_mask = False
+        if not isinstance(self.storage_checkpoint, bool):
+            raise ValueError("storage_checkpoint should be a bool for one request.")
+        if self.storage_checkpoint_dependency is not None and not isinstance(
+            self.storage_checkpoint_dependency, str
+        ):
+            raise ValueError(
+                "storage_checkpoint_dependency should be a string for one request."
+            )
 
     def _normalize_batch_inputs(self):
         """Normalize inputs for a batch of examples, including parallel sampling expansion."""
@@ -461,6 +473,7 @@ class GenerateReqInput:
         self._normalize_logprob_params(num)
         self._normalize_custom_logit_processor(num)
         self._normalize_extra_key(num)
+        self._normalize_storage_checkpoint_params(num)
         self._normalize_bootstrap_params(num)
 
     def _expand_inputs(self, num):
@@ -648,6 +661,39 @@ class GenerateReqInput:
         else:
             raise ValueError("extra_key should be a list or a string.")
 
+    def _normalize_storage_checkpoint_params(self, num):
+        if isinstance(self.storage_checkpoint, bool):
+            self.storage_checkpoint = [self.storage_checkpoint] * num
+        elif isinstance(self.storage_checkpoint, list):
+            if len(self.storage_checkpoint) != self.batch_size:
+                raise ValueError(
+                    "The length of storage_checkpoint should equal the batch size."
+                )
+            if not all(isinstance(value, bool) for value in self.storage_checkpoint):
+                raise ValueError("storage_checkpoint should contain only bools.")
+            self.storage_checkpoint = self.storage_checkpoint * self.parallel_sample_num
+        else:
+            raise ValueError("storage_checkpoint should be a bool or list of bools.")
+
+        dependency = self.storage_checkpoint_dependency
+        if dependency is None or isinstance(dependency, str):
+            self.storage_checkpoint_dependency = [dependency] * num
+        elif isinstance(dependency, list):
+            if len(dependency) != self.batch_size:
+                raise ValueError(
+                    "The length of storage_checkpoint_dependency should equal "
+                    "the batch size."
+                )
+            if not all(value is None or isinstance(value, str) for value in dependency):
+                raise ValueError(
+                    "storage_checkpoint_dependency should contain only strings or None."
+                )
+            self.storage_checkpoint_dependency = dependency * self.parallel_sample_num
+        else:
+            raise ValueError(
+                "storage_checkpoint_dependency should be a string or list of strings."
+            )
+
     def _normalize_bootstrap_params(self, num):
         """Normalize bootstrap parameters for batch processing."""
         # Normalize bootstrap_host
@@ -768,6 +814,16 @@ class GenerateReqInput:
             http_worker_ipc=self.http_worker_ipc,
             priority=self.priority,
             extra_key=self.extra_key[i] if self.extra_key is not None else None,
+            storage_checkpoint=(
+                self.storage_checkpoint[i]
+                if isinstance(self.storage_checkpoint, list)
+                else self.storage_checkpoint
+            ),
+            storage_checkpoint_dependency=(
+                self.storage_checkpoint_dependency[i]
+                if isinstance(self.storage_checkpoint_dependency, list)
+                else self.storage_checkpoint_dependency
+            ),
             no_logs=self.no_logs,
             custom_labels=self.custom_labels,
             return_bytes=self.return_bytes,
@@ -854,6 +910,9 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
 
     # Extra cache key for classifying the request (e.g. cache_salt)
     extra_key: Optional[str] = None
+
+    storage_checkpoint: bool = False
+    storage_checkpoint_dependency: Optional[str] = None
 
     # Whether to disallow logging for this request (e.g. due to ZDR)
     no_logs: bool = False
