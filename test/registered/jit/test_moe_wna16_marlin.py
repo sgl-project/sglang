@@ -6,13 +6,19 @@ import pytest
 import torch
 from sgl_kernel.scalar_type import scalar_types
 
+from sglang.jit_kernel.gptq_marlin_repack import gptq_marlin_repack
 from sglang.jit_kernel.moe_wna16_marlin import moe_wna16_marlin_gemm
 from sglang.srt.layers.moe.fused_moe_triton import moe_align_block_size
 from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import fused_marlin_moe
 from sglang.srt.layers.quantization.marlin_utils_fp4 import (
+    prepare_moe_mxfp4_layer_for_marlin,
     prepare_moe_nvfp4_layer_for_marlin,
 )
-from sglang.srt.utils.common import is_sm80_supported, is_sm90_supported
+from sglang.srt.utils.common import (
+    is_sm80_supported,
+    is_sm90_supported,
+    is_sm120_supported,
+)
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_marlin_utils import (
     awq_marlin_quantize,
@@ -30,6 +36,92 @@ def _has_aot_moe_wna16_marlin_gemm() -> bool:
 
 
 AOT_AVAILABLE = _has_aot_moe_wna16_marlin_gemm()
+
+
+@pytest.mark.skipif(
+    not (is_sm90_supported() or is_sm120_supported()),
+    reason="MXFP4 Marlin repack requires CUDA SM90 or SM120",
+)
+def test_prepare_moe_mxfp4_drops_source_scale_parameters():
+    num_experts = 2
+    hidden_size = 256
+    intermediate_size = 128
+    group_size = 32
+
+    layer = torch.nn.Module()
+    layer.orig_dtype = torch.bfloat16
+    layer.w13_weight = torch.nn.Parameter(
+        torch.randint(
+            -128,
+            128,
+            (num_experts, 2 * intermediate_size, hidden_size // 2),
+            device="cuda",
+            dtype=torch.int8,
+        ),
+        requires_grad=False,
+    )
+    layer.w2_weight = torch.nn.Parameter(
+        torch.randint(
+            -128,
+            128,
+            (num_experts, hidden_size, intermediate_size // 2),
+            device="cuda",
+            dtype=torch.int8,
+        ),
+        requires_grad=False,
+    )
+    layer.w13_weight_scale_inv = torch.nn.Parameter(
+        torch.ones(
+            (num_experts, 2 * intermediate_size, hidden_size // group_size),
+            device="cuda",
+            dtype=torch.float32,
+        ),
+        requires_grad=False,
+    )
+    layer.w2_weight_scale_inv = torch.nn.Parameter(
+        torch.ones(
+            (num_experts, hidden_size, intermediate_size // group_size),
+            device="cuda",
+            dtype=torch.float32,
+        ),
+        requires_grad=False,
+    )
+
+    perm = torch.empty(0, dtype=torch.int, device="cuda")
+    expected_w13 = torch.stack(
+        [
+            gptq_marlin_repack(
+                layer.w13_weight[i].view(torch.int32).T.contiguous(),
+                perm=perm,
+                size_k=hidden_size,
+                size_n=2 * intermediate_size,
+                num_bits=4,
+            )
+            for i in range(num_experts)
+        ]
+    )
+    expected_w2 = torch.stack(
+        [
+            gptq_marlin_repack(
+                layer.w2_weight[i].view(torch.int32).T.contiguous(),
+                perm=perm,
+                size_k=intermediate_size,
+                size_n=hidden_size,
+                num_bits=4,
+            )
+            for i in range(num_experts)
+        ]
+    )
+
+    prepare_moe_mxfp4_layer_for_marlin(layer)
+
+    parameter_names = dict(layer.named_parameters())
+    assert "w13_weight_scale_inv" not in parameter_names
+    assert "w2_weight_scale_inv" not in parameter_names
+    torch.testing.assert_close(layer.w13_weight, expected_w13, rtol=0, atol=0)
+    torch.testing.assert_close(layer.w2_weight, expected_w2, rtol=0, atol=0)
+    assert layer.w13_weight_scale.dtype == torch.float8_e8m0fnu
+    assert layer.w2_weight_scale.dtype == torch.float8_e8m0fnu
 
 
 def stack_and_dev(tensors: list[torch.Tensor]):
