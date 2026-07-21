@@ -45,12 +45,16 @@ from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.elastic_ep.elastic_ep import (
     ElasticEPStateManager,
+    _pre_nixl_retire,
     get_healthy_expert_location_src_rank,
     get_scale_cohort_target,
     join_process_groups,
     join_scale_process_group,
     maybe_rebalance_after_rank_fault,
     maybe_recover_ep_ranks,
+    nixl_retire_barrier_check,
+    nixl_retire_barrier_consume,
+    nixl_retire_barrier_post,
     register_scale_cohort,
     retire_barrier_check,
     retire_barrier_consume,
@@ -463,26 +467,50 @@ class ModelRunner:
                     "elastic_ep.scale_join", ep_size=join_effective_ep_size
                 )
             elif is_recover_offset_join:
-                # Grow-back caps at the launch cohort size. The primary
-                # launched with ``elastic_ep_initial_size`` (or its
-                # default = launch tp_size), which is the target WORLD
-                # size after a full grow-back into a previously-retired
-                # slot.
+                # Post-grow cohort size = the highest rank this joiner
+                # slots into, plus one (``rank_offset + tp_size``). For
+                # a *full* grow-back (e.g. launch=4, offset=3, tp=1)
+                # this equals ``elastic_ep_initial_size``, but a partial
+                # grow-back that only recovers a prefix of the retired
+                # slots (e.g. launch=8, effective=4, target=6,
+                # offset=4, tp=2) has ``rank_offset + tp_size = 6 <
+                # elastic_ep_initial_size = 8``. Using
+                # ``elastic_ep_initial_size`` here would fold the
+                # still-retired trailing ranks (6, 7 in that example)
+                # into the joiner's ``active_ranks`` mask and its
+                # DP-attention world, deadlocking on any collective
+                # that expects them to be alive. Assumes recovery
+                # brings back a contiguous prefix of retired slots
+                # starting at ``ep_join_rank_offset``, which matches
+                # ``ElasticEPStateManager.get_pending_recover_ranks``'s
+                # ``list(range(effective, target))``.
                 join_effective_ep_size = (
-                    self.server_args.elastic_ep_initial_size
-                    or self.server_args.tp_size
+                    self.server_args.ep_join_rank_offset
+                    + self.server_args.tp_size
                 )
 
+            # Both scale-join (append-tail) and recover-mode (refill
+            # a trailing retired slot) grow paths broadcast EPLB
+            # metadata from global rank 0. Rank 0 is a permanent
+            # incumbent under the current shrink/recover contract
+            # (shrinks retire trailing ranks; recovers refill trailing
+            # slots), so it is a valid ``src`` on both the survivor
+            # cohort and any joiner subprocess. Previously the
+            # recover-mode joiner elected itself here -- its
+            # ``active_ranks_cpu`` at this point has only its own bit
+            # flipped (the mask flip runs later in this init block),
+            # so ``_get_healthy_expert_location_src_rank`` short-
+            # circuited to its own global rank while the survivor
+            # cohort's call to the same helper (with fresh
+            # ``active_ranks_cpu`` + ``rejoining_ranks``) elected rank 0.
+            # The resulting ``torch.distributed.broadcast`` calls had
+            # different ``src`` on different ranks -- semantically
+            # illegal; worked only because Mooncake tolerates
+            # mismatched src.
             broadcast_global_expert_location_metadata(
                 model_config=self.model_config,
                 moe_ep_rank=self.ps.tp_rank + self.server_args.ep_join_rank_offset,
-                src_rank=(
-                    0
-                    if is_scale_join
-                    else self._get_healthy_expert_location_src_rank(
-                        is_rejoining_rank=True
-                    )
-                ),
+                src_rank=0,
             )
             set_global_expert_distribution_recorder(
                 ExpertDistributionRecorder.init_new(
@@ -2686,6 +2714,18 @@ class _ScaleDownDriver(ScaleDownStateMachineDriver):
 
     def consume_drain_barrier(self, handle) -> None:
         retire_barrier_consume(handle)
+
+    def on_nixl_retire_pre(self, sm: ScaleDownStateMachine) -> None:
+        _pre_nixl_retire(sm.ranks_to_retire)
+
+    def post_nixl_retire_barrier(self, sm: ScaleDownStateMachine):
+        return nixl_retire_barrier_post(sm.ranks_to_retire)
+
+    def check_nixl_retire_barrier(self, handle) -> bool:
+        return nixl_retire_barrier_check(handle)
+
+    def consume_nixl_retire_barrier(self, handle) -> None:
+        nixl_retire_barrier_consume(handle)
 
     def on_flip_mask(self, sm: ScaleDownStateMachine) -> None:
         ElasticEPStateManager.mark_retiring()

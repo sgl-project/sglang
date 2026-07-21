@@ -2926,19 +2926,29 @@ class Scheduler(
         self, running_batch: ScheduleBatch, last_batch: Optional[ScheduleBatch]
     ) -> NextBatchPlan:
         # Elastic EP scale-down admission gate: while the FSM is between
-        # DRAIN and RECONFIG/EXIT, refuse to hand a new batch to
-        # ``run_batch``. Otherwise, one batch can slip in between the
+        # FLIP_MASK and RECONFIG/EXIT, refuse to hand a new batch to
+        # ``run_batch``. Otherwise, a batch can slip in between the
         # per-tick FSM stages -- e.g. between the survivor's FLIP_MASK
-        # (which flips ``active_ranks[retiree]=0`` and updates NIXL peer
-        # bookkeeping to the new ``dispatch_ep=K``) and the survivor's
-        # RECONFIG (which updates the model's ``num_physical_experts``
-        # to ``K * num_local_experts``). That mid-transition batch then
-        # runs with the model's stale ``num_physical_experts`` (from
-        # the old N-rank layout) fed into a NIXL kernel sized for the
-        # new K-rank layout, tripping the device-side kernel assertion
+        # (which flips ``active_ranks[retiree]=0`` and marks phase
+        # ``retiring``) and the survivor's RECONFIG (which updates the
+        # model's ``num_physical_experts`` to ``K * num_local_experts``).
+        # That mid-transition batch then runs with the model's stale
+        # ``num_physical_experts`` (from the old N-rank layout) fed
+        # into a NIXL kernel sized for the new K-rank layout, tripping
+        # the device-side kernel assertion
         # ``dst_expert_idx < active_expert_bound`` at
         # ``nixl_ep_ll.cu:178`` and taking down the whole cohort with
-        # ``cudaErrorLaunchFailure``.
+        # ``cudaErrorLaunchFailure``. The race between the
+        # ``_dispatch_ep_size`` N->K flip in ``_pre_nixl_retire`` and
+        # the ``mark_retiring`` gate close is closed by folding
+        # ``mark_retiring`` into the same FSM tick body as the NIXL
+        # retire barrier consume + ``_pre_nixl_retire`` (see
+        # :meth:`ScaleDownStateMachine._tick_survivor`), so no
+        # scheduler event-loop iter runs between the flip and the
+        # gate close. This ``retiring`` / ``reconfiguring`` gate is
+        # deliberately narrow -- the ``draining`` phase stays
+        # ungated so the cohort-wide ``mlp_sync`` all-gather is
+        # never starved.
         #
         # Returning a plan with ``batch_to_run=None`` drops the
         # scheduler into ``on_idle``, which is exactly where
@@ -3955,8 +3965,16 @@ class Scheduler(
 
         * ``retiring`` is set by :func:`_ScaleDownDriver.on_flip_mask`
           after ``try_retire_ranks`` has flipped ``active_ranks`` and
-          updated NIXL to ``dispatch_ep=K``. Model config still reports
-          the pre-shrink ``num_physical_experts`` at this point.
+          NIXL is settled on ``dispatch_ep=K``. Model config still
+          reports the pre-shrink ``num_physical_experts`` at this
+          point. The race between the ``_dispatch_ep_size`` N->K
+          flip in ``_pre_nixl_retire`` and the ``mark_retiring``
+          gate close is closed by folding FLIP_MASK's body into the
+          same FSM tick as the NIXL retire barrier consume +
+          ``_pre_nixl_retire`` (see
+          :meth:`ScaleDownStateMachine._tick_survivor`), so a raced
+          ``get_next_batch_to_run`` cannot admit a batch with
+          N-rank ``topk_ids`` while NIXL is already K-rank.
         * ``reconfiguring`` is set by :func:`_ScaleDownDriver.on_reconfig`
           just before it kicks the global broadcast + on_scale that
           rewrites ``num_physical_experts`` to ``K * num_local_experts``.
@@ -3965,14 +3983,18 @@ class Scheduler(
         transient (``_is_scale_down_drained`` returns True
         unconditionally, so the FSM leaves DRAIN on the very next tick
         after posting the retire barrier); more importantly, during
-        DRAIN the ``active_ranks`` mask has not flipped yet, so a batch
-        that runs here executes with the pre-shrink layout consistently
-        across NIXL and the model config -- safe. Gating DRAIN starves
-        the tp_cpu_group ``mlp_sync`` all-gather that lagging ranks
-        (which received the scale request one event-loop iteration
-        late) are still waiting on, wedging the whole cohort behind an
-        unpaired collective. See MC02A + NIXL a2a stress hangs
-        (~14072948 20260716 111014 / 110223).
+        DRAIN the ``active_ranks`` mask has not flipped yet AND NIXL's
+        ``_dispatch_ep_size`` is still ``N``, so a batch that runs here
+        executes with the pre-shrink layout consistently across NIXL
+        and the model config -- safe. Gating DRAIN starves the
+        tp_cpu_group ``mlp_sync`` all-gather that lagging ranks (which
+        received the scale request one event-loop iteration late) are
+        still waiting on, wedging the whole cohort behind an unpaired
+        collective. See MC02A + NIXL a2a stress hangs (~14072948
+        20260716 111014 / 110223). A wider ``"nixl_retiring"`` gate
+        would trigger the same shape (closing on a subset of ranks
+        ahead of the others, starving ``mlp_sync``); folding
+        FLIP_MASK into NIXL_RETIRE consume avoids the wider gate.
 
         ``idle`` / ``pending`` / ``serving_shrunk`` / ``failed`` and
         every grow-side phase are safe for ``run_batch``.
@@ -5140,6 +5162,31 @@ def run_scheduler_process(
 
         # Send initialization info back to the parent process
         pipe_writer.send(scheduler.get_init_info())
+
+        # Recover-mode joiners have finished every boot-time step that
+        # requires ``is_ep_offset_joiner=True`` (per-cohort pg_world_size
+        # in :meth:`ModelRunner.initialize`, launch-cohort EPLB layout in
+        # :meth:`ExpertLocationMetadata._init_common`, distributed=False
+        # KV-cache profile in :meth:`ModelRunnerKVCacheMixin._profile_
+        # available_bytes`, tokenizer/detokenizer IPC wiring in
+        # :meth:`DataParallelController.launch_dp_attention_schedulers`,
+        # skip-warmup in the HTTP server, etc.). Clear ``ep_join_mode``
+        # now so the ex-joiner is treated as a normal cohort member on
+        # every subsequent scale operation. Without this, a second
+        # shrink that keeps some recovered ranks alive (e.g.
+        # ``8 -> 4 -> 8 -> 6``, where ex-joiner ranks 4 and 5 survive
+        # the second shrink) trips the ``num_local_physical_experts``
+        # divisibility assert in ``_init_common``: it clamps
+        # ``ep_size = max(effective, elastic_ep_initial_size)
+        # = max(6, 8) = 8``, but the survivor-only
+        # ``physical_to_logical_map`` has already been truncated to
+        # ``num_local * 6`` columns. The ``ep_join_rank_offset`` stays
+        # set because ``_elastic_global_rank`` still uses it to
+        # compute the ex-joiner's global rank as ``tp_rank + offset``.
+        if scheduler.server_args.ep_join_mode == "recover":
+            scheduler.server_args.override(
+                "elastic_ep.recover_joined", ep_join_mode=None
+            )
 
         # Run the event loop (blocks until a ShutdownReq sets gracefully_exit)
         scheduler.run_event_loop()

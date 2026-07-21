@@ -192,6 +192,9 @@ class TestElasticEPStateManagerShrinkFsm(unittest.TestCase):
         ElasticEPStateManager.begin_scale(3)
         ElasticEPStateManager.mark_draining()
         self.assertEqual(ElasticEPStateManager.get_scale_phase(), "draining")
+        # ``retiring`` closes the scheduler admission gate; see
+        # :meth:`ScaleDownStateMachine._tick_survivor` in
+        # ``scale_down_state.py`` for the invariant.
         ElasticEPStateManager.mark_retiring()
         self.assertEqual(ElasticEPStateManager.get_scale_phase(), "retiring")
         ElasticEPStateManager.mark_reconfiguring()

@@ -86,6 +86,31 @@ REDUCE_OP_SUM = int(torch.distributed.ReduceOp.SUM)
 _MODEL_PARALLEL_GROUP_TIMEOUT: Optional[timedelta] = None
 
 
+# Python-side handle to the mask tensor that Mooncake C++ reads on every
+# collective enqueued on ``torch.distributed.group.WORLD``. Sub-groups
+# stash their own copy on the wrapping GroupCoordinator; WORLD has no
+# wrapper, so we stash it here and let elastic-EP flip retiree/joiner
+# slots symmetrically with sub-groups.
+_WORLD_BACKEND_ACTIVE_RANKS: Optional[torch.Tensor] = None
+_WORLD_BACKEND_RANKS: List[int] = []
+
+
+def _register_world_backend_active_ranks(
+    active_ranks: torch.Tensor, ranks: List[int]
+) -> None:
+    global _WORLD_BACKEND_ACTIVE_RANKS, _WORLD_BACKEND_RANKS
+    _WORLD_BACKEND_ACTIVE_RANKS = active_ranks
+    _WORLD_BACKEND_RANKS = list(ranks)
+
+
+def get_world_backend_active_ranks() -> Optional[torch.Tensor]:
+    return _WORLD_BACKEND_ACTIVE_RANKS
+
+
+def get_world_backend_ranks() -> List[int]:
+    return list(_WORLD_BACKEND_RANKS)
+
+
 def get_torch_distributed_pg_options(group_name=None):
     if not _is_npu:
         return None
@@ -2177,6 +2202,23 @@ def init_distributed_environment(
             timeout=timeout,
             pg_options=pg_options,
         )
+
+        # Publish the WORLD-backend active_ranks tensor so elastic-EP
+        # can flip retiree/joiner slots when this PG is used directly.
+        # Sub-groups created via GroupCoordinator stash their own
+        # tensor on the coordinator; WORLD has no wrapper, so the
+        # reference lives only inside Mooncake C++ once
+        # init_process_group returns. Collectives that target
+        # ``torch.distributed.group.WORLD`` (mlp_sync in DP-attention,
+        # dist.barrier(dist.group.WORLD)) read that tensor at
+        # enqueue time; without a python-side handle, ``try_retire_
+        # ranks`` / ``try_recover_ranks`` cannot re-mask them after a
+        # shrink or grow-back, and the joiner cohort drifts out of
+        # sync with the survivor cohort under load.
+        if backend == "mooncake":
+            _register_world_backend_active_ranks(
+                active_ranks, list(range(ar_size))
+            )
 
         # Create a global TCPStore for coordination (used by NIXL)
         if moe_a2a_backend == "nixl":
