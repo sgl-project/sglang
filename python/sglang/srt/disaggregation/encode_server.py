@@ -168,17 +168,17 @@ _mm_feature_attrs = {
 
 
 def _get_mm_grid_dim(mm_inputs, modality, model_type: Optional[str] = None):
-    # Kimi K2.5 vision processor only emits `grid_thws`; prefer it over generic keys
-    # so we never pick a mis-typed or stale `image_grid_hws` field from kwargs.
     attrs = _mm_grid_attrs[modality]
-    if (model_type or "").lower() in [
-        "kimi_k25",
-        "kimi_vl",
-    ] and modality == Modality.IMAGE:
-        attrs = ("grid_thws", "image_grid_thw", "image_grid_hws")
+    model_type = (model_type or "").lower()
+    if modality == Modality.IMAGE:
+        # Kimi K2.5 emits grid_thws, while Kimi-VL emits image_grid_hws.
+        if model_type == "kimi_k25":
+            attrs = ("grid_thws", "image_grid_thw", "image_grid_hws")
+        elif model_type == "kimi_vl":
+            attrs = ("image_grid_hws", "image_grid_thw", "grid_thws")
     for attr in attrs:
         if attr in mm_inputs and mm_inputs[attr] is not None:
-            return mm_inputs[attr]
+            return _convert(mm_inputs[attr])
     raise ValueError(f"Grid dim ({_mm_grid_attrs[modality]}) not found in {mm_inputs}")
 
 
@@ -718,16 +718,33 @@ class MMEncoder:
         """Calculate number of raw patches (before merge/sampling). Used for pixel_values slicing."""
         if modality == Modality.AUDIO:
             return int(grid.item())
+        if self.model_type == "kimi_vl" and modality == Modality.IMAGE:
+            h, w = self._kimi_hw_from_patch_grid(grid)
+            return h * w
+        return int(grid[0] * grid[1] * grid[2])
+
+    @staticmethod
+    def _kimi_hw_from_patch_grid(
+        grid: Union[torch.Tensor, np.ndarray, List[int], Tuple[int, ...]],
+    ) -> Tuple[int, int]:
+        """Extract (height, width) from Kimi 2D or 3D patch-grid metadata."""
+        if isinstance(grid, torch.Tensor):
+            values = grid.flatten().tolist()
+        elif isinstance(grid, np.ndarray):
+            values = grid.reshape(-1).tolist()
         else:
-            return int(grid[0] * grid[1] * grid[2])
+            values = np.asarray(grid).reshape(-1).tolist()
+
+        if len(values) not in (2, 3):
+            raise ValueError(
+                f"Invalid Kimi image grid metadata: {values}; "
+                "expected [h, w] or [t, h, w]"
+            )
+        return int(values[-2]), int(values[-1])
 
     def _kimi_tokens_from_patch_grid(self, grid: Union[torch.Tensor, List[int]]) -> int:
         """MoonViT + tpool: output len is (h//mh)*(w//mw); temporal dim is pooled (not t*h*w/merge^2)."""
-        if isinstance(grid, torch.Tensor):
-            flat = grid.flatten()
-            _t, h, w = (int(x) for x in flat[:3].tolist())
-        else:
-            _t, h, w = int(grid[0]), int(grid[1]), int(grid[2])
+        h, w = self._kimi_hw_from_patch_grid(grid)
         merge_h, merge_w = self.model_config.hf_config.vision_config.merge_kernel_size
         return (h * w) // (merge_h * merge_w)
 
