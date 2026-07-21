@@ -333,7 +333,10 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
             "Use trtllm_mla as the default decode attention backend for "
             "Kimi-K3 on SM100/SM103."
         )
-        return {"decode_attention_backend": "trtllm_mla"}
+        return {
+            "decode_attention_backend": "trtllm_mla",
+            "prefill_attention_backend": "trtllm_mla",
+        }
     # DSPARK: verify runs on the decode backend (mode=decode), so this picks the
     # verify kernel. cutedsl rejects verify q_len > 4, mode=prefill flashinfer
     # verify is slow, and plain decode is cold under dspark. tokenspeed verify is
@@ -354,6 +357,7 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
     )
     return {
         "decode_attention_backend": backend,
+        "prefill_attention_backend": "trtllm_mla",
         "speculative_attention_mode": "decode",
     }
 
