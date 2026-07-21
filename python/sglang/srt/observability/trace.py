@@ -33,7 +33,6 @@ opentelemetry_initialized = False
 _trace_context_propagator = None
 tracer: Optional[trace.Tracer] = None
 
-global_trace_level = get_int_env_var("SGLANG_TRACE_LEVEL", 3)
 
 # Modules allowed to emit spans (from --trace-modules); None means no filtering.
 global_trace_modules: Optional[List[str]] = None
@@ -75,9 +74,19 @@ def extract_trace_headers(headers: Mapping[str, str]) -> Optional[Dict]:
     return {h: headers[h] for h in TRACE_HEADERS if h in headers}
 
 
+def get_global_trace_level() -> int:
+    from sglang.srt.runtime_context import get_resources
+
+    resources = get_resources()
+    if resources.trace_level is None:
+        resources.trace_level = get_int_env_var("SGLANG_TRACE_LEVEL", 3)
+    return resources.trace_level
+
+
 def set_global_trace_level(level: int):
-    global global_trace_level
-    global_trace_level = level
+    from sglang.srt.runtime_context import get_resources
+
+    get_resources().trace_level = level
 
 
 @dataclass
@@ -313,7 +322,7 @@ class TraceReqContext:
     ):
         self.rid: str = str(rid)
         self.trace_level = (
-            trace_level if trace_level is not None else global_trace_level
+            trace_level if trace_level is not None else get_global_trace_level()
         )
         self.tracing_enable: bool = opentelemetry_initialized and self.trace_level > 0
 

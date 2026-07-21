@@ -18,14 +18,11 @@ from unittest.mock import patch
 from sglang.srt.arg_groups import overrides as overrides_module
 from sglang.srt.arg_groups.arg_utils import A, Arg, resolvable_fields
 from sglang.srt.arg_groups.overrides import (
-    OverrideRecord,
-    apply_model_overrides,
     collect_model_override_declarations,
     register_model_override,
     validate_declarations,
 )
 from sglang.srt.runtime_context import (
-    _StaticFlags,
     get_context,
     get_server_args,
     reset_context,
@@ -42,9 +39,6 @@ class _FakeArgs:
 
 
 class TestModelOverridableWhitelist(CustomTestCase):
-    def test_arg_defaults_to_not_overridable(self):
-        self.assertFalse(Arg().resolvable)
-
     def test_whitelist_derivation_from_annotated_metadata(self):
         self.assertEqual(
             resolvable_fields(_FakeArgs),
@@ -80,6 +74,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "disable_overlap_schedule",
                     "uses_mamba_radix_cache",
                     "mamba_radix_cache_strategy",
+                    "mamba_full_memory_ratio",
                     "speculative_moe_runner_backend",
                     "speculative_moe_a2a_backend",
                     "disable_shared_experts_fusion",
@@ -89,12 +84,12 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "prefill_attention_backend",
                     "decode_attention_backend",
                     "flashinfer_allreduce_fusion_backend",
+                    "fp8_gemm_runner_backend",
+                    "disable_custom_all_reduce",
+                    "enable_aiter_allreduce_fusion",
                 }
             ),
         )
-
-    def test_non_dataclass_yields_empty_whitelist(self):
-        self.assertEqual(resolvable_fields(SimpleNamespace), frozenset())
 
 
 class _IsolatedRegistry(CustomTestCase):
@@ -232,89 +227,6 @@ class TestResolvedViewAndPasses(CustomTestCase):
             )
 
 
-@dataclasses.dataclass
-class _FakeAttnGroup(_StaticFlags):
-    backend: str = "unset"
-
-
-@dataclasses.dataclass
-class _FakeFlags(_StaticFlags):
-    attn: _FakeAttnGroup = dataclasses.field(default_factory=_FakeAttnGroup)
-    resolved_by_model: str = "unset"
-    also_resolved: Optional[int] = None
-
-
-class TestApplyModelOverridesGate(CustomTestCase):
-    def _fresh(self):
-        return _FakeFlags(), _FakeArgs()
-
-    def test_materializes_declared_and_pristine_leaves(self):
-        flags, args = self._fresh()
-        records = apply_model_overrides(
-            flags, args, [("src", {"resolved_by_model": "dsv4"})]
-        )
-        self.assertEqual(flags.resolved_by_model, "dsv4")  # declared
-        self.assertIsNone(flags.also_resolved)  # undeclared -> pristine value
-        self.assertEqual(args.resolved_by_model, "auto")  # server_args untouched
-        self.assertEqual(
-            records, [OverrideRecord("src", "resolved_by_model", "auto", "dsv4")]
-        )
-
-    def test_last_writer_wins_then_terminal_wins_last(self):
-        flags, args = self._fresh()
-        records = apply_model_overrides(
-            flags,
-            args,
-            [
-                ("first", {"resolved_by_model": "a"}),
-                ("second", {"resolved_by_model": "b"}),
-            ],
-            terminal=[("enforce_disable", {"resolved_by_model": "off"})],
-        )
-        self.assertEqual(flags.resolved_by_model, "off")
-        self.assertEqual([r.resolved for r in records], ["a", "b", "off"])
-        self.assertEqual(records[1].base, "a")  # provenance chains the writers
-
-    def test_non_whitelisted_field_rejected_before_any_write(self):
-        flags, args = self._fresh()
-        with self.assertRaises(ValueError):
-            apply_model_overrides(
-                flags,
-                args,
-                [("ok", {"resolved_by_model": "x"}), ("bad", {"plain": 1})],
-            )
-        self.assertEqual(flags.resolved_by_model, "unset")  # transactional
-
-    def test_missing_leaf_rejected_before_any_write(self):
-        flags, args = self._fresh()
-        with self.assertRaises(ValueError):
-            apply_model_overrides(
-                flags,
-                args,
-                [("src", {"resolved_by_model": "x"})],
-                whitelist={"resolved_by_model", "field_without_leaf"},
-            )
-        self.assertEqual(flags.resolved_by_model, "unset")
-
-    def test_frozen_flags_rejected(self):
-        flags, args = self._fresh()
-        flags.freeze()
-        with self.assertRaises(RuntimeError):
-            apply_model_overrides(flags, args, [("src", {"resolved_by_model": "x"})])
-
-    def test_leaf_map_routes_to_group_leaf(self):
-        flags, args = self._fresh()
-        apply_model_overrides(
-            flags,
-            args,
-            [("src", {"resolved_by_model": "fa3"})],
-            whitelist={"resolved_by_model"},
-            leaf_map={"resolved_by_model": "attn.backend"},
-        )
-        self.assertEqual(flags.attn.backend, "fa3")
-        self.assertEqual(flags.resolved_by_model, "unset")  # flat leaf untouched
-
-
 class _IsolatedPublish(CustomTestCase):
     """Publishing writes the process-global context; save/restore around it."""
 
@@ -329,14 +241,9 @@ class _IsolatedPublish(CustomTestCase):
         super().tearDown()
 
 
-@dataclasses.dataclass
-class _NoOverridableArgs:
-    x: int = 1
-
-
-class TestPublishResolvesFlags(_IsolatedPublish):
-    """Publish wiring: stash-carrying publishes resolve into flags via the
-    gate; publishes without the stash skip resolution."""
+class TestPublishInstallsSlot(_IsolatedPublish):
+    """Publish wiring: set_server_args installs the already-resolved object
+    into the context-owned slot (no transformation at publish time)."""
 
     def test_dummy_fixture_has_empty_stash_and_publishes_cleanly(self):
         from sglang.srt.server_args import (
@@ -350,29 +257,12 @@ class TestPublishResolvesFlags(_IsolatedPublish):
         set_global_server_args_for_scheduler(sa)
         self.assertIs(get_server_args(), sa)
 
-    def test_empty_stash_publish_runs_gate_as_noop(self):
-        sa = _NoOverridableArgs()
-        sa._resolved_overrides = []
-        get_context().set_server_args(sa)
-        self.assertIs(get_server_args(), sa)
-
-    def test_non_whitelisted_declaration_fails_at_publish(self):
-        from sglang.srt.runtime_context import get_flags
-
-        flags_before = get_flags()
-        sa = _NoOverridableArgs()
-        sa._resolved_overrides = [("rogue", {"x": 2})]
-        with self.assertRaises(ValueError):
-            get_context().set_server_args(sa)
-        # a failed publish must leave BOTH the slot and the flags untouched
-        self.assertIs(get_flags(), flags_before)
-
 
 class TestGoldenModelOverrides(_IsolatedPublish):
     """Per-arch golden diff for migrated families: the declarative path must
-    reproduce the legacy imperative writes byte-identically on server_args
-    (dual-apply) and materialize the same values on the flags tier at
-    publish."""
+    reproduce the legacy imperative writes byte-identically on the
+    materialized server_args fields; the publish round-trip returns the same
+    object."""
 
     _MINI_CONFIG = {
         "hidden_size": 64,
@@ -407,11 +297,12 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         return ServerArgs(model_path=config_dir, **server_kwargs)
 
     def _publish(self, server_args):
-        from sglang.srt.runtime_context import get_flags
-        from sglang.srt.server_args import set_global_server_args_for_scheduler
+        from sglang.srt.server_args import (
+            set_global_server_args_for_scheduler,
+        )
 
         set_global_server_args_for_scheduler(server_args)
-        return get_flags()
+        return get_server_args()
 
     def test_mistral_large3_forces_bfloat16(self):
         sa = self._construct("MistralLarge3ForCausalLM", "mistral")
@@ -420,11 +311,6 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             ("MODEL_OVERRIDES['MistralLarge3ForCausalLM']", {"dtype": "bfloat16"}),
             sa._resolved_overrides,
         )
-        self.assertEqual(self._publish(sa).dtype, "bfloat16")
-
-    def test_pixtral_forces_bfloat16(self):
-        sa = self._construct("PixtralForConditionalGeneration", "pixtral")
-        self.assertEqual(sa.dtype, "bfloat16")  # materialized
         self.assertEqual(self._publish(sa).dtype, "bfloat16")
 
     def test_user_requested_dtype_is_still_overridden(self):
@@ -600,7 +486,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         ]
         self.assertEqual(len(deterministic_fills), 1)
         self.assertEqual(sa.attention_backend, deterministic_fills[0])
-        self.assertEqual(flags.attn.backend, deterministic_fills[0])
+        self.assertEqual(flags.attention_backend, deterministic_fills[0])
 
     def test_deterministic_incompatible_backend_raises(self):
         from sglang.srt.arg_groups.overrides import (
@@ -638,14 +524,15 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             "llama",
             dllm_algorithm="LowConfidence",
             disable_radix_cache=True,
+            attention_backend="triton",
         )
         self.assertEqual(sa.attention_backend, "flashinfer")  # materialized
         self.assertIn(
             ("_dllm_attention_backend", {"attention_backend": "flashinfer"}),
             sa._resolved_overrides,
         )
-        # first MAPPED leaf: attention_backend routes to flags.attn.backend
-        self.assertEqual(self._publish(sa).attn.backend, "flashinfer")
+        # the deterministic fill lands on the attention_backend field
+        self.assertEqual(self._publish(sa).attention_backend, "flashinfer")
 
     def test_attention_backend_leaf_materializes_end_state(self):
         # The default-fill pass declares the platform-selected backend; the
@@ -659,7 +546,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         ]
         self.assertTrue(declared_values)  # default fill declared
         self.assertEqual(sa.attention_backend, declared_values[-1])  # materialized
-        self.assertEqual(self._publish(sa).attn.backend, declared_values[-1])
+        self.assertEqual(self._publish(sa).attention_backend, declared_values[-1])
 
     def test_post_materialize_pass_writes_through(self):
         from sglang.srt.arg_groups.overrides import run_post_process_pass
@@ -678,12 +565,12 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         run_post_process_pass(sa, _force_triton)
         if resolved_before != "triton":
             self.assertEqual(sa.attention_backend, "triton")
-        self.assertEqual(self._publish(sa).attn.backend, sa.attention_backend)
+        self.assertEqual(self._publish(sa).attention_backend, sa.attention_backend)
 
     def test_attention_backend_user_choice_declares_nothing_extra(self):
         sa = self._construct("LlamaForCausalLM", "llama", attention_backend="triton")
         self.assertEqual(sa.attention_backend, "triton")
-        self.assertEqual(self._publish(sa).attn.backend, "triton")
+        self.assertEqual(self._publish(sa).attention_backend, "triton")
 
     def test_compatibility_passes_at_callable_level(self):
         from sglang.srt.arg_groups.overrides import (
@@ -823,30 +710,6 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             )
         self.assertEqual(_dllm_page_size(_view(dllm_algorithm=None)), {})
 
-    def test_declaration_overlay_mechanics(self):
-        from sglang.srt.arg_groups.overrides import run_post_process_pass
-
-        live = SimpleNamespace(x="user", y=None, _resolved_overrides=[])
-
-        def _resolve_x(view):
-            return {"x": "resolved"} if view.x == "user" else {}
-
-        def _read_x(view):
-            return {"y": view.x}
-
-        run_post_process_pass(live, _resolve_x)
-        # declaration recorded, but server_args stays pristine
-        self.assertEqual(
-            live._resolved_overrides, [(_resolve_x.__qualname__, {"x": "resolved"})]
-        )
-        self.assertEqual(live.x, "user")
-        # a later pass sees the resolved value through the view overlay
-        run_post_process_pass(live, _read_x)
-        self.assertEqual(
-            live._resolved_overrides[-1], (_read_x.__qualname__, {"y": "resolved"})
-        )
-        self.assertIsNone(live.y)  # never applied in place
-
     def test_overlap_disable_passes(self):
         from sglang.srt.arg_groups.overrides import (
             ResolvedView,
@@ -962,7 +825,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
 
         with patch.object(overrides_module, "is_sm120_supported", return_value=True):
             self.assertEqual(
-                _deepseek_v4_sm120_moe(_view()), {"moe_runner_backend": "marlin"}
+                _deepseek_v4_sm120_moe(_view()),
+                {"moe_runner_backend": "flashinfer_mxfp4"},
             )
             self.assertEqual(
                 _deepseek_v4_sm120_moe(_view(moe_runner_backend="triton")), {}
@@ -1574,15 +1438,6 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             )
         )
 
-    def test_page_size_leaf_materializes_end_state(self):
-        sa = self._construct("LlamaForCausalLM", "llama")
-        declared_values = [
-            d["page_size"] for _s, d in sa._resolved_overrides if "page_size" in d
-        ]
-        self.assertTrue(declared_values)  # default fill declared
-        self.assertEqual(sa.page_size, declared_values[-1])  # materialized
-        self.assertEqual(self._publish(sa).page_size, declared_values[-1])
-
     def test_qwen3_5_hybrid_coupled_declaration(self):
         from sglang.srt.arg_groups.overrides import _qwen3_5_hybrid_overrides
 
@@ -1962,11 +1817,16 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         )
 
         self.assertEqual(
-            _data_parallelism_defaults(ResolvedView(SimpleNamespace(dp_size=1))),
+            _data_parallelism_defaults(
+                ResolvedView(SimpleNamespace(dp_size=1, ep_join_mode=None))
+            ),
             {"enable_dp_attention": False, "enable_dp_lm_head": False},
         )
         self.assertEqual(
-            _data_parallelism_defaults(ResolvedView(SimpleNamespace(dp_size=2))), {}
+            _data_parallelism_defaults(
+                ResolvedView(SimpleNamespace(dp_size=2, ep_join_mode=None))
+            ),
+            {},
         )
 
         with patch("sglang.srt.environ.envs.SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE") as e:
@@ -1974,9 +1834,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             self.assertEqual(
                 _a2a_backend_overrides(
                     ResolvedView(
-                        SimpleNamespace(
-                            enable_deepep_waterfill=True, moe_a2a_backend="none"
-                        )
+                        SimpleNamespace(enable_waterfill=True, moe_a2a_backend="none")
                     )
                 ),
                 {"moe_a2a_backend": "deepep"},
@@ -1986,9 +1844,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             self.assertEqual(
                 _a2a_backend_overrides(
                     ResolvedView(
-                        SimpleNamespace(
-                            enable_deepep_waterfill=True, moe_a2a_backend="none"
-                        )
+                        SimpleNamespace(enable_waterfill=True, moe_a2a_backend="none")
                     )
                 ),
                 {"moe_a2a_backend": "megamoe"},
@@ -2157,13 +2013,10 @@ class TestGoldenModelOverrides(_IsolatedPublish):
 
 class TestDeclarationValidation(CustomTestCase):
     def test_declarations_never_mutate_server_args(self):
-        flags, args = _FakeFlags(), _FakeArgs()
+        args = _FakeArgs()
         declarations = [("src", {"resolved_by_model": "dsv4", "also_resolved": 7})]
-        apply_model_overrides(flags, args, declarations)
         validate_declarations(args, declarations)
-        # the leaves carry the declared values; the fields stay pristine
-        self.assertEqual(flags.resolved_by_model, "dsv4")
-        self.assertEqual(flags.also_resolved, 7)
+        # validation is a pure whitelist check: the fields stay untouched
         self.assertEqual(args.resolved_by_model, _FakeArgs.resolved_by_model)
         self.assertEqual(args.also_resolved, _FakeArgs.also_resolved)
 

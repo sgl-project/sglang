@@ -16,8 +16,9 @@ import torch
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.managers.schedule_batch import (
+    FINISH_ABORT,
+    FINISH_MATCHED_TOKEN,
     Req,
     ScheduleBatch,
 )
@@ -25,7 +26,8 @@ from sglang.srt.mem_cache.common import (
     maybe_cache_unfinished_req,
     release_kv_cache,
 )
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_server_args
+from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 
@@ -256,6 +258,9 @@ class SchedulerBatchResultProcessor:
                             logprob_pt=logprob_pt,
                         )
 
+                    if req.return_sampling_mask:
+                        self.add_sampling_mask_return_values(i, req, logits_output)
+
                     if (
                         req.return_hidden_states
                         and logits_output.hidden_states is not None
@@ -268,7 +273,9 @@ class SchedulerBatchResultProcessor:
 
                     if req.grammar is not None:
                         self._apply_prefill_grammar(
-                            req=req, next_token_id=next_token_id
+                            req=req,
+                            next_token_id=next_token_id,
+                            already_advanced=result.grammar_advanced,
                         )
 
                 else:
@@ -482,17 +489,24 @@ class SchedulerBatchResultProcessor:
         )
         return hidden_state_offset
 
-    def _apply_prefill_grammar(self, *, req: Req, next_token_id: int) -> None:
-        # FIXME: this try-except block is for handling unexpected xgrammar issue.
-        try:
-            req.grammar.accept_token(next_token_id)
-        except ValueError as e:
-            # Grammar accept_token can raise ValueError if the token is not in the grammar.
-            # This can happen if the grammar is not set correctly or the token is invalid.
-            logger.error(
-                f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
-            )
-            self.abort_request(AbortReq(rid=req.rid))
+    def _apply_prefill_grammar(
+        self, *, req: Req, next_token_id: int, already_advanced: bool = False
+    ) -> None:
+        # The grammar barrier may have already advanced the FSM over this prefilled
+        # token (spec overlap path); only advance if not, but always sync
+        # grammar.finished.
+        if not already_advanced:
+            # FIXME: this try-except block is for handling unexpected xgrammar issue.
+            try:
+                req.grammar.accept_token(next_token_id)
+            except ValueError as e:
+                # Grammar accept_token can raise ValueError if the token is not in the
+                # grammar. This can happen if the grammar is not set correctly or the
+                # token is invalid.
+                logger.error(
+                    f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
+                )
+                req.to_finish = FINISH_ABORT()
         req.grammar.finished = req.finished()
 
     def _apply_chunked_prefill_logprobs(
@@ -542,12 +556,30 @@ class SchedulerBatchResultProcessor:
         result.num_correct_drafts = sum(accept_lens) - len(batch.reqs)
         result.num_correct_drafts_per_req_cpu = [x - 1 for x in accept_lens]
 
+        block_accept_lens = (
+            result.block_accept_lens.tolist()
+            if result.block_accept_lens is not None
+            else None
+        )
+        result.num_block_accept_tokens = (
+            sum(block_accept_lens) if block_accept_lens else 0
+        )
+        cap_lens = result.cap_lens.tolist() if result.cap_lens is not None else None
+        result.num_cap_tokens = sum(cap_lens) if cap_lens else 0
+
         # Feed the adaptive controller now that accept_lens is on CPU,
         # instead of doing a synchronous GPU→CPU copy in the worker hot path.
         # BaseSpecWorker provides a no-op default for non-adaptive workers.
         self.model_worker.on_verify_complete_cpu(
             result.num_correct_drafts_per_req_cpu, batch_size=len(batch.reqs)
         )
+
+        # Advance the grammar FSM over this batch's committed tokens (idempotent):
+        # the EAGLE overlap path already did this inside verify() via the grammar
+        # barrier; otherwise advance now. advance_grammar_fsm self-gates on per-req
+        # grammar (the queued batch.copy() does not carry has_grammar) and consumes
+        # result.grammar_retained_tokens below instead of re-advancing.
+        self.advance_grammar_fsm(result, batch)
 
         predict_tokens = []
         # In adaptive spec-v2, the worker state may already have switched when this
@@ -564,11 +596,9 @@ class SchedulerBatchResultProcessor:
                 pass
             else:
                 if req.grammar is not None:
-                    # Stop accepting once the grammar terminates, so the
-                    # over-drafted suffix is never committed to KV nor emitted.
-                    # This advances the grammar FSM; the result loop only syncs
-                    # grammar.finished.
-                    accept_tokens = self._accept_grammar_tokens(req, accept_tokens)
+                    # FSM already advanced + truncated by advance_grammar_fsm; reuse
+                    # the retained (grammar-legal) run instead of advancing again.
+                    accept_tokens = result.grammar_retained_tokens[i]
 
                 # Commit the full accepted run (drafts + bonus).
                 num_accept_tokens = len(accept_tokens)
@@ -578,6 +608,12 @@ class SchedulerBatchResultProcessor:
                 num_correct_drafts = result.num_correct_drafts_per_req_cpu[i]
                 req.spec_num_correct_drafts += num_correct_drafts
                 req.update_spec_correct_drafts_histogram(num_correct_drafts)
+
+                if block_accept_lens is not None:
+                    req.spec_num_block_accept_tokens += block_accept_lens[i]
+                if cap_lens is not None:
+                    req.spec_num_cap_tokens += cap_lens[i]
+                    req.update_spec_cap_lens_histogram(cap_lens[i])
 
             predict_tokens.append(accept_tokens)
 
@@ -611,8 +647,66 @@ class SchedulerBatchResultProcessor:
                 f"Grammar accept_token failed for req {req.rid} with token "
                 f"{tokens}: {e}"
             )
-            self.abort_request(AbortReq(rid=req.rid))
+            req.to_finish = FINISH_ABORT()
         return retained
+
+    def advance_grammar_fsm(
+        self, result: GenerationBatchResult, batch: ScheduleBatch
+    ) -> None:
+        """Advance each req's grammar FSM over the tokens THIS batch committed, and
+        (for decode) memoize the grammar-truncated run on ``result``.
+
+        This is the single place the spec-v2 FSM advances. It is idempotent
+        (``result.grammar_advanced``) so it runs either eagerly — inside ``verify(N)``
+        via the scheduler's grammar barrier, so the advance overlaps the target-verify
+        forward — or lazily from the result processors on the non-overlap / non-EAGLE
+        paths. It handles both decode (the accepted spec run) and extend (the single
+        prefilled token) results, so the barrier can resolve whatever the previous
+        batch was — e.g. the extend->decode boundary.
+        """
+        if result.grammar_advanced or not batch.has_grammar:
+            return
+        is_decode = batch.forward_mode.is_decode()
+        if not (is_decode or batch.forward_mode.is_extend()):
+            return
+        if result.copy_done is not None:
+            result.copy_done.synchronize()
+        next_token_ids = result.next_token_ids.tolist()
+
+        if not is_decode:
+            # Extend: advance over the single token each completed-prefill req emitted
+            # (mirrors process_batch_result_prefill's per-req token indexing).
+            for i, req in enumerate(batch.reqs):
+                if (
+                    req.grammar is None
+                    or req.is_retracted
+                    or req.finished()
+                    or req.inflight_middle_chunks > 0
+                ):
+                    continue
+                self._accept_grammar_tokens(req, next_token_ids[i])
+            result.grammar_advanced = True
+            return
+
+        # Decode: only the spec-v2 path reaches here (the grammar barrier for
+        # spec-overlap workers and _resolve_spec_v2_tokens). Non-spec grammar decode
+        # advances its FSM in process_batch_result_decode and has no accept_lens, so
+        # bail out defensively.
+        if result.accept_lens is None:
+            return
+        accept_lens = result.accept_lens.tolist()
+        stride = result.speculative_num_draft_tokens
+        assert stride is not None, "spec-v2 result missing speculative_num_draft_tokens"
+        retained = [None] * len(batch.reqs)
+        for i, req in enumerate(batch.reqs):
+            if req.grammar is None or req.is_retracted or req.finished():
+                continue
+            accept_tokens = next_token_ids[i * stride : i * stride + accept_lens[i]]
+            # Stop accepting once the grammar terminates so the over-drafted suffix
+            # is never committed to KV nor emitted; this advances the FSM.
+            retained[i] = self._accept_grammar_tokens(req, accept_tokens)
+        result.grammar_retained_tokens = retained
+        result.grammar_advanced = True
 
     def process_batch_result_idle(
         self,
@@ -656,7 +750,10 @@ class SchedulerBatchResultProcessor:
         self.metrics_reporter.num_generated_tokens += len(batch.reqs)
         if not batch.spec_algorithm.is_none():
             self.metrics_reporter.update_spec_metrics(
-                batch.batch_size(), result.num_correct_drafts
+                batch.batch_size(),
+                result.num_correct_drafts,
+                num_block_accept_tokens=result.num_block_accept_tokens,
+                num_cap_tokens=result.num_cap_tokens,
             )
         if self.server_args.enable_metrics:
             self.metrics_collector.increment_decode_cuda_graph_pass(
@@ -698,6 +795,11 @@ class SchedulerBatchResultProcessor:
                     next_token_logprobs=next_token_logprobs,
                     logits_output=logits_output,
                 )
+
+            if req.return_sampling_mask:
+                # return_sampling_mask + speculative decoding is rejected at
+                # request entry, so this remains one support mask per token.
+                self.add_sampling_mask_return_values(i, req, logits_output)
 
             if req.return_hidden_states and logits_output.hidden_states is not None:
                 # hidden_states is [bs * stride, hidden_dim], one row per emitted
@@ -809,6 +911,20 @@ class SchedulerBatchResultProcessor:
                     logits_output.next_token_token_ids_logprobs_idx[flat_idx]
                 )
 
+    def add_sampling_mask_return_values(
+        self,
+        i: int,
+        req: Req,
+        output: LogitsProcessorOutput,
+    ) -> None:
+        """Attach sparse sampling support metadata to the return values."""
+        mask = output.next_token_sampling_mask_idx
+        logprobs = output.next_token_sampling_logprobs
+        req.output_token_sampling_mask.append(None if mask is None else mask[i])
+        req.output_token_sampling_logprobs.append(
+            None if logprobs is None else logprobs[i]
+        )
+
     def _handle_finish_state_updated_req(
         self,
         req: Req,
@@ -828,6 +944,14 @@ class SchedulerBatchResultProcessor:
             self.decode_offload_manager.offload_kv_cache(req)
 
         if req.finished():
+            # isinstance narrowing: create_worker may also return plain
+            # TpModelWorker-based drafts, which carry no spec-worker hooks.
+            if isinstance(self.draft_worker, BaseSpecWorker):
+                self.draft_worker.note_request_finished(
+                    rid=req.rid,
+                    natural_stop=isinstance(req.finished_reason, FINISH_MATCHED_TOKEN),
+                )
+
             # delete feature to save memory
             if req.multimodal_inputs is not None and req.session is None:
                 req.multimodal_inputs.release_features()
@@ -848,7 +972,7 @@ class SchedulerBatchResultProcessor:
                     prepare_release(req)
                 is_insert = (
                     req.mamba_lazy_is_insert
-                    if get_global_server_args().enable_mamba_extra_buffer_lazy()
+                    if get_server_args().enable_mamba_extra_buffer_lazy()
                     else True
                 )
                 release_kv_cache(req, self.tree_cache, is_insert=is_insert)
@@ -883,7 +1007,7 @@ class SchedulerBatchResultProcessor:
         if req.mamba_ping_pong_track_buffer is None:
             return
 
-        lazy = get_global_server_args().enable_mamba_extra_buffer_lazy()
+        lazy = get_server_args().enable_mamba_extra_buffer_lazy()
         at_boundary, track_seqlen = self._mamba_check_track_boundary(
             req, batch, result, i
         )
@@ -915,7 +1039,7 @@ class SchedulerBatchResultProcessor:
         For spec decode, the boundary is detected by comparing the
         accepted seq_len range against interval boundaries.
         """
-        interval = get_global_server_args().mamba_track_interval
+        interval = get_server_args().mamba_track_interval
 
         if batch.spec_algorithm.is_none():
             if req.kv_committed_len % interval == 0:
