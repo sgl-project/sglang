@@ -3380,6 +3380,19 @@ class ServerArgs:
             self.prefill_delayer_token_usage_low_watermark = x
 
     def _handle_missing_default_values(self):
+        # Normalize the explicit speculative-decoding off-switch before any
+        # consumer reads the field: downstream gates test
+        # `speculative_algorithm is None`, so a "NONE" string surviving past
+        # this point half-enables speculative decoding (wrong decode
+        # CUDA-graph batch sizes, spurious dcp validation, skipped attention
+        # backend defaults) with no worker behind it. Case-insensitive
+        # because the value is only uppercased later, in the speculative
+        # hook. SpeculativeAlgorithm.from_string already accepts "NONE".
+        if (
+            self.speculative_algorithm is not None
+            and self.speculative_algorithm.upper() == "NONE"
+        ):
+            self.speculative_algorithm = None
         if self.tokenizer_path is None:
             self.tokenizer_path = self.model_path
         if self.served_model_name is None:
