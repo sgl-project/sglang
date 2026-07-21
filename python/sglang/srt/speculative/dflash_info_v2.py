@@ -1,6 +1,7 @@
 """DFLASH spec-v2 overlap scheduling data structures."""
 
 import contextlib
+from dataclasses import dataclass
 from typing import Optional
 
 import torch
@@ -30,50 +31,37 @@ def _get_overlap_plan_stream(
     return stream, torch.get_device_module(device_str).stream(stream)
 
 
+@dataclass
 class DFlashDraftInputV2(SpecInput):
     """Draft-side state carried across overlap iterations (spec-v2)."""
 
-    def __init__(
-        self,
-        *,
-        topk_p: torch.Tensor,
-        topk_index: torch.Tensor,
-        bonus_tokens: torch.Tensor,
-        new_seq_lens: torch.Tensor,
-        hidden_states: torch.Tensor,
-        max_top_k: int = 1,
-        uniform_top_k_value: Optional[int] = None,
-        prefill_tail_hidden_states: Optional[torch.Tensor] = None,
-        prefill_tail_valid_mask: Optional[torch.Tensor] = None,
-        prefill_tail_start_positions: Optional[torch.Tensor] = None,
-        prefill_tail_hidden_projected: bool = True,
-        reserved_seq_lens_cpu: Optional[torch.Tensor] = None,
-        reserved_seq_lens_sum: Optional[int] = None,
-        future_indices: Optional[torch.Tensor] = None,
-        verify_token_budget: Optional[int] = None,
-    ):
+    # Legacy Eagle-shaped fields; DFLASH relays via FutureMap so these are unused.
+    topk_p: torch.Tensor
+    topk_index: torch.Tensor
+    bonus_tokens: torch.Tensor
+    new_seq_lens: torch.Tensor
+    hidden_states: torch.Tensor
+    max_top_k: int = 1
+    uniform_top_k_value: Optional[int] = None
+    prefill_tail_hidden_states: Optional[torch.Tensor] = None
+    prefill_tail_valid_mask: Optional[torch.Tensor] = None
+    prefill_tail_start_positions: Optional[torch.Tensor] = None
+    prefill_tail_hidden_projected: bool = True
+    reserved_seq_lens_cpu: Optional[torch.Tensor] = None
+    reserved_seq_lens_sum: Optional[int] = None
+    _prepare_batch_seq_lens_cpu_buf: Optional[torch.Tensor] = None
+    _prepare_cur_kv_lens_cpu_buf: Optional[torch.Tensor] = None
+    _prepare_nxt_kv_lens_cpu_buf: Optional[torch.Tensor] = None
+    _prepare_cur_kv_lens_gpu_buf: Optional[torch.Tensor] = None
+    _prepare_nxt_kv_lens_gpu_buf: Optional[torch.Tensor] = None
+
+    # Filled by scheduler after dispatch.
+    future_indices: Optional[torch.Tensor] = None
+
+    verify_token_budget: Optional[int] = None
+
+    def __post_init__(self):
         super().__init__(spec_input_type=SpecInputType.DFLASH_DRAFT)
-        # Legacy Eagle-shaped fields; DFLASH relays via FutureMap so these are unused.
-        self.topk_p = topk_p
-        self.topk_index = topk_index
-        self.bonus_tokens = bonus_tokens
-        self.new_seq_lens = new_seq_lens
-        self.hidden_states = hidden_states
-        self.max_top_k = max_top_k
-        self.uniform_top_k_value = uniform_top_k_value
-        self.prefill_tail_hidden_states = prefill_tail_hidden_states
-        self.prefill_tail_valid_mask = prefill_tail_valid_mask
-        self.prefill_tail_start_positions = prefill_tail_start_positions
-        self.prefill_tail_hidden_projected = prefill_tail_hidden_projected
-        self.reserved_seq_lens_cpu = reserved_seq_lens_cpu
-        self.reserved_seq_lens_sum = reserved_seq_lens_sum
-        self._prepare_batch_seq_lens_cpu_buf = None
-        self._prepare_cur_kv_lens_cpu_buf = None
-        self._prepare_nxt_kv_lens_cpu_buf = None
-        self._prepare_cur_kv_lens_gpu_buf = None
-        self._prepare_nxt_kv_lens_gpu_buf = None
-        self.future_indices = future_indices
-        self.verify_token_budget = verify_token_budget
         # Spec v2 draft state itself does not change token accounting.
         self.num_tokens_per_req = 1
         self.num_tokens_for_logprob_per_req = 1
