@@ -183,7 +183,6 @@ from sglang.srt.models.deepseek_common.utils import (
     is_wint4afp8_or_wint4a16_config,
 )
 from sglang.srt.runtime_context import (
-    get_flags,
     get_forward,
     get_parallel,
     get_server_args,
@@ -894,12 +893,6 @@ class DeepseekV2MoE(nn.Module):
                 and self.num_fused_shared_experts == 0
                 and hidden_states.shape[0] > 0
                 and get_is_capture_mode()
-                and not (
-                    get_flags().capture.enable_torch_compile
-                    and hidden_states.shape[0]
-                    <= server_args.torch_compile_max_bs
-                    * (server_args.speculative_num_draft_tokens or 1)
-                )
             ):
                 return self.forward_normal_dual_stream(
                     hidden_states,
