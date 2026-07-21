@@ -229,9 +229,30 @@ def eager_on_graph(enable: bool):
             # End the segment that captured up to this break point.
             capture._end_current_segment()
 
+            # Segment teardown (capture_end + instantiate, worst case an
+            # allocator stall under memory pressure) is the slow, per-rank
+            # variable step of a capture. Re-sync ranks here — in a patient
+            # distributed barrier — before eager break fns that may contain
+            # rank-coupled collectives with short hard timeouts (DeepEP
+            # NORMAL dispatch spins at most LEGACY_NUM_CPU_TIMEOUT_SECS=100s,
+            # a compile-time constant). Capture-only by construction: replay
+            # bypasses this wrapper via replay_fn.
+            if capture._barrier_fn is not None:
+                capture._barrier_fn()
+
             # Run the eager function once so it allocates its outputs and
-            # writes real data into them.
-            output = inner(*args, **kwargs)
+            # writes real data into them. A break may declare a capture stub
+            # (fn._capture_stub): the capture pass only needs the output
+            # buffer's address recorded — its contents are never consumed
+            # (real values flow at warmup and at every replay via replay_fn,
+            # which always calls the real inner). Stubbing lets breaks whose
+            # bodies are expensive or rank-coupled (e.g. DeepEP NORMAL a2a)
+            # skip that work during capture entirely.
+            capture_stub = getattr(inner, "_capture_stub", None)
+            if capture_stub is not None:
+                output = capture_stub(*args, **kwargs)
+            else:
+                output = inner(*args, **kwargs)
 
             # Weak-ref captured inputs produced by graph segments. Their storage
             # is pinned by the segment CUDAGraphs' mempool use-count, so Python
@@ -308,6 +329,7 @@ class BreakableCUDAGraphCapture:
         pool=None,
         stream: torch.cuda.Stream | None = None,
         capture_error_mode: str = "global",
+        barrier_fn: Callable[[], None] | None = None,
     ):
         assert isinstance(
             cuda_graph, BreakableCUDAGraph
@@ -316,6 +338,7 @@ class BreakableCUDAGraphCapture:
         self._pool = pool if pool is not None else (0, 0)
         self._stream = stream
         self._capture_error_mode = capture_error_mode
+        self._barrier_fn = barrier_fn
         self._stream_ctx = None
         self._capture_token = None
         self._stream_token = None

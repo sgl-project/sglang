@@ -93,6 +93,23 @@ def _a2a_moe_forward_eager(
         set_is_extend_in_batch(saved_is_extend_in_batch)
 
 
+def _a2a_moe_forward_capture_stub(
+    moe_layer,
+    hidden_states: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    router_logits: torch.Tensor,
+    output: torch.Tensor,
+) -> None:
+    # Capture-pass stand-in: zero the bridge buffer instead of running the
+    # real dispatch -> experts -> combine. The capture pass discards break
+    # outputs (only the buffer address is recorded), while the real body
+    # performs a rank-coupled NORMAL a2a whose per-break rendezvous during
+    # capture amplifies rank jitter and risks DeepEP's 100s CPU timeout.
+    output.zero_()
+
+
+_a2a_moe_forward_eager._capture_stub = _a2a_moe_forward_capture_stub
 bcg_a2a_moe_forward = eager_on_graph(True)(_a2a_moe_forward_eager)
 
 
