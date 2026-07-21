@@ -1202,16 +1202,14 @@ class DeepseekV4AscendAttnBackend(
             dst[:, c:].fill_(val)
 
     @staticmethod
-    def _copy_1d_with_zero_tail(
-        dst: torch.Tensor, src: Optional[torch.Tensor]
-    ) -> None:
+    def _copy_1d_with_zero_tail(dst: torch.Tensor, src: Optional[torch.Tensor]) -> None:
         if src is None:
             dst.zero_()
             return
         n = src.numel()
-        assert n <= dst.shape[0], (
-            f"graph replay 1D metadata overflow: src={n} > dst={dst.shape[0]}"
-        )
+        assert (
+            n <= dst.shape[0]
+        ), f"graph replay 1D metadata overflow: src={n} > dst={dst.shape[0]}"
         if n > 0:
             if src.dtype != dst.dtype:
                 src = src.to(dst.dtype)

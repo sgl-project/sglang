@@ -434,11 +434,17 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
 
         # KV pools (4D PA_ND).
         if self.swa_kv_pool is not None:
-            components.append((AscendStateType.DSV4_SWA, *kv_entry(self.swa_kv_pool.kv_buffer)))
+            components.append(
+                (AscendStateType.DSV4_SWA, *kv_entry(self.swa_kv_pool.kv_buffer))
+            )
         if self.c4_kv_pool is not None:
-            components.append((AscendStateType.DSV4_C4, *kv_entry(self.c4_kv_pool.kv_buffer)))
+            components.append(
+                (AscendStateType.DSV4_C4, *kv_entry(self.c4_kv_pool.kv_buffer))
+            )
         if self.c128_kv_pool is not None:
-            components.append((AscendStateType.DSV4_C128, *kv_entry(self.c128_kv_pool.kv_buffer)))
+            components.append(
+                (AscendStateType.DSV4_C128, *kv_entry(self.c128_kv_pool.kv_buffer))
+            )
         if self.c4_indexer_kv_pool is not None:
             idx_bufs = list(self.c4_indexer_kv_pool.index_k_buffer) + list(
                 self.c4_indexer_kv_pool.index_scale_buffer
@@ -447,7 +453,9 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
 
         # Compress-state pools (paged, flat 2D). c4_state bundles attn-c4-state +
         # indexer-c4-state (same req_to_token_c4_state slot space).
-        components.append((AscendStateType.DSV4_C4_STATE, *state_entry(4, include_indexer=True)))
+        components.append(
+            (AscendStateType.DSV4_C4_STATE, *state_entry(4, include_indexer=True))
+        )
         components.append(
             (AscendStateType.DSV4_C128_STATE, *state_entry(128, include_indexer=False))
         )

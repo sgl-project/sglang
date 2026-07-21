@@ -2095,13 +2095,17 @@ class DeepseekV4Model(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
         self.rms_norm_eps = config.rms_norm_eps
-        use_stream_pool = _is_cuda or (
-            _is_hip
-            and (
-                envs.SGLANG_ROCM_USE_MULTI_STREAM.get()
-                or envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
+        use_stream_pool = (
+            _is_cuda
+            or (
+                _is_hip
+                and (
+                    envs.SGLANG_ROCM_USE_MULTI_STREAM.get()
+                    or envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
+                )
             )
-        ) or (_is_npu and envs.SGLANG_NPU_USE_MULTI_STREAM.get())
+            or (_is_npu and envs.SGLANG_NPU_USE_MULTI_STREAM.get())
+        )
         device_module = torch.get_device_module()
         num_alt_streams = 5 if _is_cuda else 2
         self.alt_streams = (

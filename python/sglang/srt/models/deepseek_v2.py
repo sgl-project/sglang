@@ -1207,13 +1207,10 @@ class DeepseekV2MoE(nn.Module):
     ) -> torch.Tensor:
         shared_output = None
         is_dsv4_npu_multistream = (
-            self.is_deepseek_v4
-            and _is_npu
-            and envs.SGLANG_NPU_USE_MULTI_STREAM.get()
+            self.is_deepseek_v4 and _is_npu and envs.SGLANG_NPU_USE_MULTI_STREAM.get()
         )
         use_alt_stream = self.alt_stream is not None and (
-            not is_dsv4_npu_multistream
-            or forward_batch.forward_mode.is_cuda_graph()
+            not is_dsv4_npu_multistream or forward_batch.forward_mode.is_cuda_graph()
         )
         sbo_enabled_flag = self._fuse_shared_experts_inside_sbo and not self.is_nextn
         sbo_overlap_dispatch_flag = (
