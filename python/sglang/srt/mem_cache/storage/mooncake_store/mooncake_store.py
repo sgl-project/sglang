@@ -406,6 +406,17 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 self.extra_backend_tag = extra_config["extra_backend_tag"]
                 logger.info(f"Using extra_backend_tag: {self.extra_backend_tag}")
 
+            # Use the model name as a prefix to isolate models sharing one store.
+            config_prefix_parts = []
+            if self.extra_backend_tag is not None:
+                config_prefix_parts.append(str(self.extra_backend_tag))
+            if storage_config is not None and storage_config.model_name:
+                model_name = "-".join(storage_config.model_name.split("/"))
+                config_prefix_parts.append(model_name)
+            self.config_prefix = "_".join(config_prefix_parts)
+            if self.config_prefix:
+                logger.info(f"Using Mooncake config prefix: {self.config_prefix}")
+
             # Check server status
             if self.config.check_server:
                 self.check_server()
@@ -681,9 +692,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             super().register_buffer(buf)
 
     def _tag_keys(self, keys: List[str]) -> List[str]:
-        if self.extra_backend_tag is None:
+        if not self.config_prefix:
             return keys
-        return [f"{self.extra_backend_tag}_{key}" for key in keys]
+        return [f"{self.config_prefix}_{key}" for key in keys]
 
     def _can_use_group_semantics(self) -> bool:
         return self._use_group_semantics
@@ -1005,7 +1016,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             # DeepSeek V4's KV anchor is logical only; v2 side pools carry data.
             return [True] * len(keys)
 
-        # Apply extra_backend_tag prefix if available
+        # Apply config prefix if available.
         keys = self._tag_keys(keys)
 
         key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(keys, host_indices)
@@ -1034,7 +1045,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             # DeepSeek V4's KV anchor is logical only; v2 side pools carry data.
             return [True] * len(keys)
 
-        # Apply extra_backend_tag prefix if available
+        # Apply config prefix if available.
         keys = self._tag_keys(keys)
 
         key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(keys, host_indices)
@@ -1208,7 +1219,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
     def batch_exists(
         self, keys, extra_info: Optional[HiCacheStorageExtraInfo] = None
     ) -> int:
-        # Apply extra_backend_tag prefix if available
+        # Apply config prefix if available.
         keys = self._tag_keys(keys)
 
         if self.is_mla_backend:
