@@ -107,6 +107,7 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
     get_compiler_backend,
+    get_device_capability,
     is_cpu,
     is_cuda,
     is_hip,
@@ -174,6 +175,14 @@ if _is_cuda:
 
     except ImportError:
         fused_topk_deepseek = None
+
+    # On unsupported archs (e.g. sm80/A100) the symbol imports
+    # fine but the kernel raises BackendSupportedError at call time, so disable it
+    # and let the selection logic fall back to the native topk path.
+    if fused_topk_deepseek is not None:
+        major, minor = get_device_capability()
+        if not _fused_topk_deepseek.is_compute_capability_supported(major * 10 + minor):
+            fused_topk_deepseek = None
 
 if _is_cuda or _is_hip or _is_xpu:
     if _is_xpu:
