@@ -123,6 +123,22 @@ def ragged_verify_compact_graphs_enabled(spec_algorithm: SpeculativeAlgorithm) -
     return ragged_verify_compact_enabled()
 
 
+def _pad_extend_lens(
+    extend_seq_lens: Optional[torch.Tensor],
+    bs: int,
+    device: torch.device,
+) -> Optional[torch.Tensor]:
+    """Pad extend_seq_lens to bs entries (padding reqs get 0)."""
+    if extend_seq_lens is None:
+        return None
+    raw_bs = extend_seq_lens.shape[0]
+    if raw_bs >= bs:
+        return extend_seq_lens[:bs]
+    padded = torch.zeros(bs, dtype=extend_seq_lens.dtype, device=device)
+    padded[:raw_bs] = extend_seq_lens
+    return padded
+
+
 def build_replay_fb_view(
     forward_batch: ForwardBatch,
     buffers: DecodeInputBuffers,
@@ -177,6 +193,14 @@ def build_replay_fb_view(
         # when mamba-track is disabled.
         mamba_track_indices=getattr(buffers, "mamba_track_indices", None),
         spec_info=forward_batch.spec_info,
+        # Propagate extend_seq_lens for backends that need it at replay
+        # (KVarN's fused verify path fills CG buffers from this). Pad to the
+        # captured bs with zeros so padding requests contribute no queries.
+        extend_seq_lens=_pad_extend_lens(
+            getattr(forward_batch, "extend_seq_lens", None),
+            bs,
+            buffers.seq_lens.device,
+        ),
     )
 
 
@@ -819,6 +843,26 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         if buffers.ngram_embedding_info is not None:
             forward_batch.ngram_embedding_info = buffers.ngram_embedding_info.slice(bs)
+
+        # For TARGET_VERIFY capture, populate extend_seq_lens /
+        # extend_prefix_lens so backends that key on them (KVarN's fused
+        # verify path) can build their metadata. Also bump seq_lens to at
+        # least draft_token_num so committed = seq_len - extend_len >= 0
+        # (the seq_len_fill_value is 1 for KVarN, which would give negative
+        # committed). The values are synthetic — only shapes/dtypes matter
+        # for capture, and the real values are loaded at replay time.
+        if self.capture_forward_mode == ForwardMode.TARGET_VERIFY:
+            draft_token_num = self.captured_req_width
+            forward_batch.extend_seq_lens = torch.full(
+                (bs,), draft_token_num, dtype=torch.int32, device=input_ids.device
+            )
+            forward_batch.extend_prefix_lens = torch.full(
+                (bs,), draft_token_num, dtype=torch.int32, device=input_ids.device
+            )
+            # seq_lens = committed + draft_token_num = 2 * draft_token_num
+            forward_batch.seq_lens.fill_(2 * draft_token_num)
+            forward_batch.seq_lens_cpu.fill_(2 * draft_token_num)
+            forward_batch.seq_lens_sum = int(forward_batch.seq_lens.sum().item())
 
         return forward_batch, attn_backend, pp_proxy_tensors
 

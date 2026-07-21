@@ -52,7 +52,7 @@ logger = logging.getLogger(__name__)
 from sglang.srt.mem_cache.pool_host import HostKVCache
 from sglang.srt.mem_cache.pool_host.base import (
     _WRITE_BACK_STAGING_PAGE_CHUNK,
-    HICACHE_HOST_MEMORY_RESERVE_BYTES,
+    hicache_host_memory_reserve_bytes,
     sync_fixed_hicache_size,
     synchronized,
 )
@@ -123,7 +123,7 @@ class MambaPoolHost(HostKVCache):
 
         host_mem = psutil.virtual_memory()
         requested_bytes = self.size * self.size_per_token
-        available_bytes = host_mem.available - HICACHE_HOST_MEMORY_RESERVE_BYTES
+        available_bytes = host_mem.available - hicache_host_memory_reserve_bytes()
         if requested_bytes > available_bytes:
             raise ValueError(
                 f"Not enough host memory available. Requesting "
@@ -759,7 +759,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
 
         requested_bytes = self.layer_num * num_host_pages * self.item_bytes
         host_mem = psutil.virtual_memory()
-        available_bytes = host_mem.available - HICACHE_HOST_MEMORY_RESERVE_BYTES
+        available_bytes = host_mem.available - hicache_host_memory_reserve_bytes()
         if requested_bytes > available_bytes:
             raise ValueError(
                 f"Not enough host memory for V4 paged pool {pool_name}. "
@@ -1156,7 +1156,7 @@ class DeepSeekV4StateHostPool(HostKVCache):
 
         requested_bytes = self.layer_num * num_host_pages * self.state_page_bytes
         host_mem = psutil.virtual_memory()
-        available_bytes = host_mem.available - HICACHE_HOST_MEMORY_RESERVE_BYTES
+        available_bytes = host_mem.available - hicache_host_memory_reserve_bytes()
         if requested_bytes > available_bytes:
             raise ValueError(
                 f"Not enough host memory for V4 state pool {pool_name}. "
@@ -1703,7 +1703,7 @@ class DSAIndexerPoolHost(HostKVCache):
         buf_elem_size = self.page_num * self.layer_num * self.indexer_page_stride_size
         requested_bytes = buf_elem_size * self.indexer_dtype.itemsize
         host_mem = psutil.virtual_memory()
-        available_bytes = host_mem.available - HICACHE_HOST_MEMORY_RESERVE_BYTES
+        available_bytes = host_mem.available - hicache_host_memory_reserve_bytes()
         if requested_bytes > available_bytes:
             raise ValueError(
                 f"Not enough host memory for DSA indexer hierarchical cache. "

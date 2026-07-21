@@ -21,6 +21,17 @@ class SpecAuxHiddenStateConfig(msgspec.Struct, kw_only=True):
     dflash_use_aux_hidden_state: bool = False
     dflash_draft_num_layers: Optional[int] = None
     dflash_target_layer_ids: Any = None
+    # Actual bytes/token of the DFLASH draft KV pool, used by the target's
+    # pool configurator to reserve draft-pool memory accurately. None falls
+    # back to the layer-ratio heuristic (fine when draft and target share
+    # per-layer KV cost, e.g. EAGLE-style drafters). The raw KV-shape fields
+    # below feed the lazy computation (the parallel state is not initialized
+    # when this config is built, so the tp-dependent cell size is computed
+    # later in the pool configurator).
+    dflash_draft_total_num_kv_heads: Optional[int] = None
+    dflash_draft_head_dim: Optional[int] = None
+    dflash_draft_v_head_dim: Optional[int] = None
+    dflash_draft_kv_element_size: Optional[int] = None
 
 
 def resolve_spec_aux_hidden_state_config(
@@ -163,3 +174,47 @@ def _resolve_dflash_aux_hidden_state(
         config.dflash_use_aux_hidden_state = True
         config.dflash_draft_num_layers = int(draft_num_layers)
         config.dflash_target_layer_ids = target_layer_ids
+        _populate_dflash_draft_kv_shape(
+            config=config,
+            server_args=server_args,
+            draft_model_config=draft_model_config,
+        )
+
+
+def _populate_dflash_draft_kv_shape(
+    *,
+    config: SpecAuxHiddenStateConfig,
+    server_args: ServerArgs,
+    draft_model_config: ModelConfig,
+) -> None:
+    """Store the draft's raw KV shape so the pool configurator can compute the
+    draft-pool bytes/token lazily (once the parallel state is initialized).
+
+    None on any field falls back to the layer-ratio heuristic.
+    """
+    try:
+        from sglang.srt.speculative.dflash_utils import (
+            resolve_dflash_draft_kv_element_size,
+        )
+
+        config.dflash_draft_total_num_kv_heads = int(
+            draft_model_config.get_total_num_kv_heads()
+        )
+        config.dflash_draft_head_dim = int(draft_model_config.head_dim)
+        config.dflash_draft_v_head_dim = int(draft_model_config.v_head_dim)
+        config.dflash_draft_kv_element_size = resolve_dflash_draft_kv_element_size(
+            draft_model_dtype=draft_model_config.dtype,
+            server_args_kv_cache_dtype=server_args.kv_cache_dtype,
+            speculative_draft_attention_backend=(
+                server_args.speculative_draft_attention_backend
+            ),
+            speculative_draft_kv_cache_dtype=(
+                server_args.speculative_draft_kv_cache_dtype
+            ),
+        )
+    except Exception:
+        logger.warning(
+            "Could not resolve DFLASH draft KV shape; falling back to the "
+            "layer-ratio draft-pool memory reservation.",
+            exc_info=True,
+        )

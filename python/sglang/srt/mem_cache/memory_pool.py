@@ -2869,6 +2869,17 @@ class NoOpMHATokenToKVPool(MHATokenToKVPool):
             "preconditions are met."
         )
 
+    # ── HiCache support (KVarN) ───────────────────────────────────────────
+    # A reference to the KVarNAttnBackend is set via `set_kvarn_backend()`
+    # after the backend is created. The actual HiCache transfer is handled
+    # by KVarNHostKVCache (in pool_host/), which reads int4 tiles directly
+    # from the backend's kv_cache_int4 buffers. The NoOp pool just needs to
+    # expose the backend reference so the host pool can find it.
+    _kvarn_backend = None
+
+    def set_kvarn_backend(self, backend):
+        self._kvarn_backend = backend
+
     def get_key_buffer(self, layer_id: int):
         # Return the placeholder. The FA backend reads this before taking the
         # fa_skip_kv_cache branch (which does not use it); the placeholder shape

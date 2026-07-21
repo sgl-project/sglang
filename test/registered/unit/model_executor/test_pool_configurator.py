@@ -63,6 +63,7 @@ def _make_model_runner(
     disaggregation_mode="null",
     max_running_requests=None,
     disaggregation_decode_extra_slots=0,
+    hidden_size=0,
 ):
     """Create a mock ModelRunner with the fields configurators need."""
     mr = MagicMock()
@@ -94,6 +95,8 @@ def _make_model_runner(
     mc.swa_v_head_dim = swa_v_head_dim or v_head_dim
     mc.get_num_kv_heads = lambda tp_size: num_kv_heads
     mc.get_swa_num_kv_heads = lambda tp_size: swa_num_kv_heads or num_kv_heads
+    mc.hidden_size = hidden_size
+    mc.dtype = "fake_bf16"  # torch._utils._element_size is patched in mock_cpu_env
     mc.hf_config = SimpleNamespace(architectures=["LlamaForCausalLM"])
     mc.hf_config.get_text_config = lambda: mc.hf_config
     mc.linear_attn_registry_result = None
@@ -102,10 +105,12 @@ def _make_model_runner(
     mr.kv_cache_dtype = "fake_bf16"
 
     sa = SimpleNamespace()
+    sa.kv_cache_dtype = "fake_bf16"
     sa.swa_full_tokens_ratio = swa_full_tokens_ratio
     sa.page_size = page_size
     sa.disable_radix_cache = disable_radix_cache
     sa.chunked_prefill_size = chunked_prefill_size
+    sa.max_prefill_tokens = 16384
     sa.disable_overlap_schedule = disable_overlap_schedule
     sa.speculative_num_draft_tokens = speculative_num_draft_tokens
     sa.max_speculative_num_draft_tokens = (
@@ -135,7 +140,12 @@ def _make_model_runner(
     mr.ps = ParallelState.trivial()
     mr.pp_group = SimpleNamespace(rank_in_group=0)
     mr.spec_aux_config = SimpleNamespace(
-        eagle_draft_num_layers=None, dflash_draft_num_layers=None
+        eagle_draft_num_layers=None,
+        dflash_draft_num_layers=None,
+        dflash_draft_total_num_kv_heads=None,
+        dflash_draft_head_dim=None,
+        dflash_draft_v_head_dim=None,
+        dflash_draft_kv_element_size=None,
     )
 
     return mr
@@ -214,6 +224,84 @@ class TestDefaultConfigurator(unittest.TestCase):
         _, _, config = self._run(10_000_000)
         self.assertIsNone(config.full_max_total_num_tokens)
         self.assertIsNone(config.swa_max_total_num_tokens)
+
+
+class TestPrefillRuntimeWorkspaceReserve(unittest.TestCase):
+    """KVCacheConfigurator._profile_available_bytes reserves transient prefill
+    workspace for the target worker (chunk x hidden x dtype x 20), never for
+    the draft worker. Built via __new__ to isolate the slack arithmetic from
+    the dataclass's unrelated construction machinery.
+    """
+
+    def _profile(
+        self,
+        *,
+        hidden_size,
+        is_draft_worker,
+        chunked_prefill_size=8192,
+        kv_cache_dtype="auto",
+    ):
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+
+        mr = _make_model_runner(
+            hidden_size=hidden_size, chunked_prefill_size=chunked_prefill_size
+        )
+        mr.server_args.mem_fraction_static = 0.875
+        mr.server_args.kv_cache_dtype = kv_cache_dtype
+        cfg = KVCacheConfigurator.__new__(KVCacheConfigurator)
+        cfg.device = "cpu"
+        cfg.gpu_id = 0
+        cfg.server_args = mr.server_args
+        cfg.model_config = mr.model_config
+        cfg.is_draft_worker = is_draft_worker
+        cfg.mambaish_config = None
+        with (
+            mock_cpu_env(),
+            patch(
+                "sglang.srt.mem_cache.kv_cache_configurator.get_available_gpu_memory",
+                return_value=20.0,
+            ),
+            patch(
+                "sglang.srt.mem_cache.kv_cache_configurator.get_world_group",
+                return_value=SimpleNamespace(world_size=1, cpu_group=None),
+            ),
+        ):
+            return cfg._profile_available_bytes(pre_model_load_memory=24.0)
+
+    def test_reserve_scales_with_chunk_and_hidden(self):
+        # slack = 24 * (1 - 0.875) = 3.0; reserve = 8192*4096*2*20 / 2^30 = 1.25
+        # (_profile_available_bytes returns bytes: GiB x 2^30)
+        self.assertEqual(self._profile(hidden_size=0, is_draft_worker=False), 17 << 30)
+        self.assertEqual(
+            self._profile(hidden_size=4096, is_draft_worker=False),
+            int(15.75 * (1 << 30)),
+        )
+
+    def test_chunk_fallback_to_max_prefill_tokens(self):
+        # chunked_prefill_size=-1 -> max_prefill_tokens (16384): reserve = 2.5
+        self.assertEqual(
+            self._profile(
+                hidden_size=4096, is_draft_worker=False, chunked_prefill_size=-1
+            ),
+            int(14.5 * (1 << 30)),
+        )
+
+    def test_draft_worker_not_reserved(self):
+        self.assertEqual(
+            self._profile(hidden_size=4096, is_draft_worker=True), 17 << 30
+        )
+
+    def test_kvarn_uses_reduced_multiplier(self):
+        # KVarN: multiplier=3 -> reserve = 8192*4096*2*3 / 2^30 = 0.1875
+        # slack=3.0, reserve=0.1875 -> available = 24 - 3.1875 = 20.8125
+        self.assertEqual(
+            self._profile(
+                hidden_size=4096,
+                is_draft_worker=False,
+                kv_cache_dtype="kvarn_k4v2_g128",
+            ),
+            int(20.8125 * (1 << 30)),
+        )
 
 
 class TestHybridSWAConfigurator(unittest.TestCase):
@@ -543,6 +631,181 @@ class TestEagleConfigurator(unittest.TestCase):
         total_layers = num_layers + eagle_draft_num_layers
         used = config.max_total_num_tokens * full_pt * total_layers
         self.assertLessEqual(used, available)
+
+
+class TestDflashConfigurator(unittest.TestCase):
+    """DFLASH: draft KV pool spans the full shared token-index space, so the
+    target's token budget must cover target pool + draft pool together."""
+
+    def _run(self, mr, available):
+        with mock_cpu_env():
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            cfg = create_memory_pool_configurator(mr)
+            config = cfg.calculate_pool_sizes(available, 1)
+        return config
+
+    def _make_dflash_runner(self, num_layers, draft_num_layers):
+        mr = _make_model_runner(num_layers=num_layers)
+        mr.spec_algorithm.is_none.return_value = False
+        mr.spec_algorithm.is_dflash_family.return_value = True
+        mr.spec_aux_config.dflash_draft_num_layers = draft_num_layers
+        return mr
+
+    def test_explicit_draft_cell_size_respects_budget(self):
+        """Dense bf16 draft behind a cheap (e.g. compressed) target: reserving
+        only the layer-ratio share of the target cell under-reserves the draft
+        pool and OOMs. The explicit per-token sum must hold target+draft within
+        budget."""
+        available = 10_000_000
+        num_layers = 32
+        draft_num_layers = 6
+
+        mr = self._make_dflash_runner(num_layers, draft_num_layers)
+        # Draft pool costs ~3x the target pool per token (e.g. dense bf16
+        # draft behind a KVarN-compressed target). Raw shape fields feed the
+        # lazy cell-size computation in the configurator.
+        mr.spec_aux_config.dflash_draft_total_num_kv_heads = 16
+        mr.spec_aux_config.dflash_draft_head_dim = 128
+        mr.spec_aux_config.dflash_draft_v_head_dim = 128
+        mr.spec_aux_config.dflash_draft_kv_element_size = 2  # bf16
+
+        config = self._run(mr, available)
+
+        target_cell = _full_per_token(mr) * num_layers
+        draft_cell = 16 * (128 + 128) * draft_num_layers * 2
+        used = config.max_total_num_tokens * (target_cell + draft_cell)
+        self.assertLessEqual(used, available)
+        # Should still utilize most of the budget.
+        self.assertGreater(used, available * 0.99)
+
+    def test_layer_ratio_fallback_when_cell_size_unknown(self):
+        """Without the raw draft KV shape, keep the layer-ratio heuristic
+        (correct when draft and target share per-layer KV cost)."""
+        available = 10_000_000
+        num_layers = 32
+        draft_num_layers = 4
+
+        mr = self._make_dflash_runner(num_layers, draft_num_layers)
+        assert mr.spec_aux_config.dflash_draft_total_num_kv_heads is None
+
+        config = self._run(mr, available)
+
+        full_pt = _full_per_token(mr)
+        used = config.max_total_num_tokens * full_pt * (num_layers + draft_num_layers)
+        self.assertLessEqual(used, available)
+
+
+class TestDflashDraftCellSize(unittest.TestCase):
+    """Draft KV cell-size helpers: dtype mirroring and the tp-aware formula."""
+
+    def test_resolve_element_size_kvarn_target(self):
+        # KVarN targets fall back to the draft model dtype (bf16 = 2 bytes)
+        # when no explicit draft KV dtype is requested.
+        import torch
+
+        from sglang.srt.speculative.dflash_utils import (
+            resolve_dflash_draft_kv_element_size,
+        )
+
+        self.assertEqual(
+            resolve_dflash_draft_kv_element_size(
+                draft_model_dtype=torch.bfloat16,
+                server_args_kv_cache_dtype="kvarn_k4v2_g128",
+                speculative_draft_attention_backend=None,
+            ),
+            2,
+        )
+
+    def test_resolve_element_size_explicit_draft_dtype_wins(self):
+        # --speculative-draft-kv-cache-dtype fp8_e4m3 overrides the KVarN
+        # fallback: 1 byte/element.
+        import torch
+
+        from sglang.srt.speculative.dflash_utils import (
+            resolve_dflash_draft_kv_element_size,
+        )
+
+        self.assertEqual(
+            resolve_dflash_draft_kv_element_size(
+                draft_model_dtype=torch.bfloat16,
+                server_args_kv_cache_dtype="kvarn_k4v2_g128",
+                speculative_draft_attention_backend=None,
+                speculative_draft_kv_cache_dtype="fp8_e4m3",
+            ),
+            1,
+        )
+
+    def test_resolve_element_size_fp8(self):
+        import torch
+
+        from sglang.srt.speculative.dflash_utils import (
+            resolve_dflash_draft_kv_element_size,
+        )
+
+        self.assertEqual(
+            resolve_dflash_draft_kv_element_size(
+                draft_model_dtype=torch.bfloat16,
+                server_args_kv_cache_dtype="fp8_e4m3",
+                speculative_draft_attention_backend=None,
+            ),
+            1,
+        )
+
+    def test_resolve_element_size_fa4_forces_model_dtype(self):
+        # fa4 draft attention needs K.dtype == Q.dtype; fp8 request ignored.
+        import torch
+
+        from sglang.srt.speculative.dflash_utils import (
+            resolve_dflash_draft_kv_element_size,
+        )
+
+        self.assertEqual(
+            resolve_dflash_draft_kv_element_size(
+                draft_model_dtype=torch.bfloat16,
+                server_args_kv_cache_dtype="fp8_e4m3",
+                speculative_draft_attention_backend="fa4",
+            ),
+            2,
+        )
+
+    def test_compute_cell_size(self):
+        # 8 kv heads (tp=1) * (128+128) * 6 layers * 2 bytes = 24576
+        from sglang.srt.speculative.dflash_utils import (
+            compute_dflash_draft_kv_cell_size_per_token,
+        )
+
+        self.assertEqual(
+            compute_dflash_draft_kv_cell_size_per_token(
+                draft_total_num_kv_heads=8,
+                draft_head_dim=128,
+                draft_v_head_dim=128,
+                draft_num_layers=6,
+                draft_kv_element_size=2,
+                attn_tp_size=1,
+            ),
+            24576,
+        )
+
+    def test_compute_cell_size_tp_division(self):
+        # 16 total heads, tp=2 -> 8 per rank.
+        from sglang.srt.speculative.dflash_utils import (
+            compute_dflash_draft_kv_cell_size_per_token,
+        )
+
+        self.assertEqual(
+            compute_dflash_draft_kv_cell_size_per_token(
+                draft_total_num_kv_heads=16,
+                draft_head_dim=128,
+                draft_v_head_dim=128,
+                draft_num_layers=6,
+                draft_kv_element_size=2,
+                attn_tp_size=2,
+            ),
+            24576,
+        )
 
 
 class TestFactory(unittest.TestCase):

@@ -623,6 +623,11 @@ class ServerArgs:
                 "nvfp4",
                 "fp4_mx_block16",
                 "fp4_e2m1",
+                # KVarN presets (see KVARN_PRESETS in kvarn/config.py)
+                "kvarn_k4v2_g128",
+                "kvarn_k4v4_g128",
+                "kvarn_k4v2_g64",
+                "kvarn_k4v4_g64",
             ],
             resolvable=True,
         ),
@@ -1804,6 +1809,21 @@ class ServerArgs:
         Optional[int],
         "Sliding window size for the draft model. Honored by Llama EAGLE-3 (`LlamaForCausalLMEagle3`) and DFLASH only; other EAGLE-3 backends (e.g. MLA-based drafters) silently ignore it. For Llama EAGLE-3, the drafter only attends to the most recent N keys (verifier hidden states + its own outputs); the verifier is unaffected. For DFLASH, the draft worker keeps a recent target-token window in its local KV cache (paged backends may retain up to one extra page on the left for alignment). Default is full attention/context.",
     ] = None
+    speculative_draft_kv_cache_dtype: A[
+        str,
+        Arg(
+            help=(
+                "KV cache dtype for the draft model in speculative decoding. "
+                '"auto" inherits the target\'s --kv-cache-dtype (KVarN targets '
+                "fall back to the draft model dtype: KVarN has no real KV "
+                "pool for the draft to reuse). An explicit value quantizes "
+                'the draft KV cache — e.g. "fp8_e4m3" halves the DFLASH '
+                "draft pool, which spans the full token-index space — at the "
+                "cost of a possible drop in speculative acceptance length."
+            ),
+            choices=["auto", "fp8_e5m2", "fp8_e4m3", "bf16", "bfloat16"],
+        ),
+    ] = "auto"
     speculative_moe_runner_backend: A[
         Optional[str],
         Arg(
@@ -3736,6 +3756,12 @@ class ServerArgs:
                 "decode context parallel (dcp_size > 1)",
                 lambda: self.dcp_size > 1,
             ),
+            # KVarN: the Triton backend (inner) doesn't support EXTEND mode
+            # for piecewise CUDA graph replay. Disable prefill CUDA graph.
+            (
+                "KVarN attention backend",
+                lambda: self._resolved().kv_cache_dtype.startswith("kvarn_"),
+            ),
         ]
         for _name, predicate in rules:
             if predicate():
@@ -3781,6 +3807,12 @@ class ServerArgs:
                 "multimodal model",
                 lambda: self.get_model_config().is_multimodal
                 and not self.get_model_config().is_multimodal_breakable_cuda_graph_supported,
+            ),
+            # KVarN: the Triton backend (inner) doesn't support EXTEND mode
+            # for piecewise/breakable CUDA graph replay. Disable prefill CUDA graph.
+            (
+                "KVarN attention backend",
+                lambda: self._resolved().kv_cache_dtype.startswith("kvarn_"),
             ),
         ]
         for name, predicate in rules:

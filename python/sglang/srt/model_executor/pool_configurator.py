@@ -150,9 +150,13 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     * (1 + int(eagle_draft_num_layers) / int(num_layers))
                 )
 
-        # DFLASH/DSPARK: scale cell_size to account for draft model KV cache
+        # DFLASH/DSPARK: account for the draft model KV pool, which spans the
+        # full shared token-index space. Prefer the draft's actual per-token
+        # cost (a dense bf16 draft behind a compressed/KVarN target costs far
+        # more per layer than the layer-ratio heuristic assumes).
         if kvc.spec_algorithm.is_dflash_family() and not kvc.is_draft_worker:
             from sglang.srt.speculative.dflash_utils import (
+                compute_dflash_draft_kv_cell_size_per_token,
                 scale_kv_cell_size_per_token_for_dflash,
             )
 
@@ -162,10 +166,33 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 and int(draft_num_layers) > 0
                 and int(num_layers) > 0
             ):
+                sa = kvc.spec_aux_config
+                draft_cell = None
+                # The raw KV-shape fields are populated target-side without the
+                # parallel state; resolve the tp-dependent cell size here,
+                # where attn_tp_size is available.
+                if all(
+                    getattr(sa, f, None) is not None
+                    for f in (
+                        "dflash_draft_total_num_kv_heads",
+                        "dflash_draft_head_dim",
+                        "dflash_draft_v_head_dim",
+                        "dflash_draft_kv_element_size",
+                    )
+                ):
+                    draft_cell = compute_dflash_draft_kv_cell_size_per_token(
+                        draft_total_num_kv_heads=sa.dflash_draft_total_num_kv_heads,
+                        draft_head_dim=sa.dflash_draft_head_dim,
+                        draft_v_head_dim=sa.dflash_draft_v_head_dim,
+                        draft_num_layers=int(draft_num_layers),
+                        draft_kv_element_size=sa.dflash_draft_kv_element_size,
+                        attn_tp_size=get_parallel().attn_tp_size,
+                    )
                 self._cell_size = scale_kv_cell_size_per_token_for_dflash(
                     target_cell_size_per_token=self._cell_size,
                     target_num_layers=int(num_layers),
                     draft_num_layers=int(draft_num_layers),
+                    draft_cell_size_per_token=draft_cell,
                 )
 
     def _compute_cell_size(self, kvc: KVCacheConfigurator, num_layers: int) -> int:
@@ -281,6 +308,30 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 cell_size += (
                     n * (model_config.head_dim + model_config.v_head_dim) * num_layers
                 ) // scale_block_size
+            elif kvc.server_args.kv_cache_dtype.startswith("kvarn_"):
+                # KVarN dual-pool: the NoOp pool has a large logical size for
+                # the scheduler, but actual GPU memory = tail pool (small fp16)
+                # + int4 compressed cache. The cell_size should reflect the
+                # compressed cost per token to size the compressed cache capacity.
+                from sglang.srt.layers.quantization.kvarn.config import (
+                    KVarNConfig,
+                )
+
+                kvarn_cfg = KVarNConfig.from_cache_dtype(
+                    kvc.server_args.kv_cache_dtype, head_dim=model_config.head_dim
+                )
+                n = model_config.get_num_kv_heads(tp_size)
+                G = kvarn_cfg.group
+                # Compressed bytes per token (K+V) per layer:
+                # tile_bytes covers group tokens for one head and already
+                # includes both K and V (packed + scales). Divide by group for
+                # per-token, multiply by n heads.
+                compressed_per_token = kvarn_cfg.tile_bytes_aligned * n // G
+                # Tail pool overhead: small constant, ~2*max_num_seqs blocks.
+                # Per-token cost is dominated by the compressed cache.
+                # Add ~30% overhead for the tail pool + runtime allocations.
+                overhead = 0.30
+                cell_size = int(compressed_per_token * num_layers * (1 + overhead))
 
         return cell_size
 

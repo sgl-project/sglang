@@ -1668,6 +1668,13 @@ def _attention_backend_default(view: Any) -> dict:
     ):  # override the default attention backend
         return {"attention_backend": view.prefill_attention_backend}
     if view.attention_backend is None:
+        # KVarN KV cache dtype requires the kvarn attention backend.
+        if view.kv_cache_dtype.startswith("kvarn_"):
+            logger.info(
+                f"KVarN KV cache dtype ({view.kv_cache_dtype}) detected. "
+                f"Using kvarn attention backend."
+            )
+            return {"attention_backend": "kvarn"}
         backend = view._get_default_attn_backend(
             view.use_mla_backend(), view.get_model_config()
         )
@@ -1915,6 +1922,28 @@ def _attention_backend_dual_chunk(view: Any) -> dict:
 
 @register_post_process
 def _page_size_default(view: Any) -> dict:
+    # KVarN requires page_size to match the tile group size, regardless
+    # of whether another subsystem (e.g. DSA) already set it.
+    if view.kv_cache_dtype.startswith("kvarn_"):
+        from sglang.srt.layers.quantization.kvarn.config import (
+            KVARN_PRESETS,
+        )
+
+        preset = KVARN_PRESETS.get(view.kv_cache_dtype, {})
+        kvarn_group = preset.get("group", 128)
+        if view.page_size != kvarn_group:
+            logger.info(
+                f"Overriding page_size={view.page_size} -> {kvarn_group} "
+                f"for KVarN (kv_cache_dtype={view.kv_cache_dtype})."
+            )
+            return {"page_size": kvarn_group}
+        else:
+            logger.info(
+                f"Setting page_size={view.page_size} for KVarN "
+                f"(kv_cache_dtype={view.kv_cache_dtype})."
+            )
+        return {}
+
     if view.page_size is not None:
         return {}
 

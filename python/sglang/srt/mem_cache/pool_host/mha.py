@@ -28,8 +28,8 @@ from sglang.jit_kernel.hicache import (
 from sglang.srt.mem_cache.memory_pool import MHATokenToKOnlyPool, MHATokenToKVPool
 from sglang.srt.mem_cache.pool_host.base import (
     _WRITE_BACK_STAGING_PAGE_CHUNK,
-    HICACHE_HOST_MEMORY_RESERVE_BYTES,
     HostKVCache,
+    hicache_host_memory_reserve_bytes,
 )
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
@@ -656,7 +656,7 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
 
         host_mem = psutil.virtual_memory()
         requested_bytes = self.size * self.size_per_token
-        available_bytes = host_mem.available - HICACHE_HOST_MEMORY_RESERVE_BYTES
+        available_bytes = host_mem.available - hicache_host_memory_reserve_bytes()
         if requested_bytes > available_bytes:
             raise ValueError(
                 f"Not enough host memory for MiniMax index-K hierarchical cache. "
@@ -1230,12 +1230,208 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
         )
 
 
-def get_mha_host_pool_cls(device_pool: MHATokenToKVPool) -> type:
-    """Pick the right MHA host-pool class based on the device pool's K/V dims.
+class KVarNHostKVCache(HostKVCache):
+    """Host KV cache for KVarN that stores raw int4 tiles instead of fp16.
 
-    Returns ``AsymmetricMHATokenToKVPoolHost`` when ``head_dim != v_head_dim``
+    The standard MHATokenToKVPoolHost allocates fp16 K/V buffers and copies
+    dequantized data. For KVarN, this wastes 4x memory (fp16 is 4x larger
+    than int4 tiles) and requires dequant->requant on every eviction/restore.
+
+    This class stores raw uint8 tiles (same layout as the GPU int4 cache):
+    [page_num, layer_num, Hk, tile_bytes] uint8. Backup flushes blocks from
+    the GPU tail pool to int4, then copies tiles. Restore writes tiles
+    directly back to the GPU int4 cache. No dequantization needed.
+    """
+
+    def __init__(
+        self,
+        device_pool,
+        host_to_device_ratio,
+        host_size,
+        page_size,
+        layout,
+        pin_memory=True,
+        device="cpu",
+        allocator_type="default",
+    ):
+        # Read KVarN config from the device pool's backend reference.
+        # set_kvarn_backend() is called during attention backend init,
+        # which happens before HiCache pool construction.
+        kvarn_backend = getattr(device_pool, "_kvarn_backend", None)
+        assert kvarn_backend is not None, (
+            "KVarNHostKVCache requires the NoOp pool to have a KVarN backend "
+            "reference. Call set_kvarn_backend() first."
+        )
+        self._kvarn_backend = kvarn_backend
+        self._tile_bytes = kvarn_backend.cfg.tile_bytes_aligned
+        self._hk = kvarn_backend.num_kv_heads
+        self._num_compressed_layers = kvarn_backend.num_layers
+
+        super().__init__(
+            device_pool,
+            host_to_device_ratio,
+            host_size,
+            page_size,
+            layout,  # pass through; we ignore it for tile storage
+            pin_memory,
+            device,
+            allocator_type,
+        )
+
+    def get_size_per_token(self):
+        """Bytes per token across all compressed layers.
+
+        Each block (page_size tokens) stores Hk * tile_bytes per layer.
+        With L layers: per_token = Hk * tile_bytes * L / page_size
+        """
+        return (
+            self._hk * self._tile_bytes * self._num_compressed_layers // self.page_size
+        )
+
+    def init_kv_buffer(self):
+        """Allocate uint8 tile storage: [page_num, layer_num, Hk, tile_bytes]."""
+        dims = (self.page_num, self._num_compressed_layers, self._hk, self._tile_bytes)
+        alloc_func = ALLOC_MEMORY_FUNCS[self.device]
+        buffer = alloc_func(
+            dims,
+            dtype=torch.uint8,
+            device=self.device,
+            pin_memory=self.pin_memory,
+            allocator=self.allocator,
+        )
+        return buffer
+
+    def backup_from_device_all_layer(
+        self, device_pool, host_indices, device_indices, io_backend
+    ):
+        """Flush blocks to int4 on GPU, then copy tiles to host for all layers.
+
+        host_indices and device_indices are token-level and positionally aligned:
+        host_indices[i] receives data from device_indices[i]. Both are page-aligned
+        (HiCache operates in full pages). We derive the block<->host-page mapping
+        from this positional correspondence.
+        """
+        from sglang.srt.platforms import current_platform
+
+        current_platform.synchronize()
+        backend = self._kvarn_backend
+
+        # Build block_id -> host_page_id mapping from positional correspondence
+        device_blocks = device_indices // self.page_size
+        host_pages = host_indices // self.page_size
+        # Each token in a page maps to the same host page, so any representative works
+        block_to_host_page = {}
+        for db, hp in zip(device_blocks.tolist(), host_pages.tolist()):
+            block_to_host_page[db] = hp
+
+        unique_block_ids = torch.tensor(
+            sorted(block_to_host_page.keys()),
+            dtype=torch.long,
+            device=device_indices.device,
+        )
+        host_page_ids = torch.tensor(
+            [block_to_host_page[b] for b in unique_block_ids.tolist()],
+            dtype=torch.long,
+            device=device_indices.device,
+        )
+
+        # Flush any blocks still in the tail pool to int4 so we copy compact tiles
+        for bid in unique_block_ids.tolist():
+            backend.flush_block_for_hicache(int(bid))
+
+        # Copy int4 tiles from GPU to host for all layers
+        for li in range(self._num_compressed_layers):
+            gpu_tiles = backend.kv_cache_int4[li][
+                unique_block_ids
+            ]  # [n_blocks, Hk, tile_bytes]
+            self.kv_buffer[host_page_ids, li] = gpu_tiles.to(
+                self.device, non_blocking=True
+            )
+
+        current_platform.synchronize()
+
+    def load_to_device_per_layer(
+        self, device_pool, host_indices, device_indices, layer_id, io_backend
+    ):
+        """Copy int4 tiles from host to GPU int4 cache for one layer.
+
+        host_indices and device_indices are positionally aligned token-level
+        tensors. layer_id is 0-based into the compressed layer range (0..15).
+        """
+        backend = self._kvarn_backend
+
+        if layer_id < 0 or layer_id >= self._num_compressed_layers:
+            return
+
+        # Build block_id -> host_page_id mapping
+        device_blocks = device_indices // self.page_size
+        host_pages = host_indices // self.page_size
+        block_to_host_page = {}
+        for db, hp in zip(device_blocks.tolist(), host_pages.tolist()):
+            block_to_host_page[db] = hp
+
+        unique_block_ids = torch.tensor(
+            sorted(block_to_host_page.keys()),
+            dtype=torch.long,
+            device=device_indices.device,
+        )
+        host_page_ids = torch.tensor(
+            [block_to_host_page[b] for b in unique_block_ids.tolist()],
+            dtype=torch.long,
+            device=device_indices.device,
+        )
+
+        # Copy tiles from host to GPU
+        host_tiles = self.kv_buffer[
+            host_page_ids, layer_id
+        ]  # [n_blocks, Hk, tile_bytes] uint8
+        gpu_tiles = host_tiles.to(backend.device, non_blocking=True)
+        backend.kv_cache_int4[layer_id][unique_block_ids] = gpu_tiles
+
+    def get_data_page(self, index, flat: bool = True):
+        """Get a page of tiles from the host buffer (for storage backend)."""
+        page_idx = index // self.page_size
+        data_page = self.kv_buffer[page_idx]  # [layer_num, Hk, tile_bytes] uint8
+        if flat:
+            data_page = data_page.flatten()
+        return data_page
+
+    def get_dummy_flat_data_page(self):
+        """Dummy page for prefetching (all zeros)."""
+        return torch.zeros(
+            (self._num_compressed_layers, self._hk, self._tile_bytes),
+            dtype=torch.uint8,
+            device=self.device,
+            pin_memory=self.pin_memory,
+        ).flatten()
+
+    def set_from_flat_data_page(self, index: int, data_page: torch.Tensor):
+        """Set a page of tiles in the host buffer (for storage backend)."""
+        page_idx = index // self.page_size
+        self.kv_buffer[page_idx] = data_page.reshape(
+            self._num_compressed_layers, self._hk, self._tile_bytes
+        )
+
+    def is_stride_page_aligned(self, page_size_bytes: int = 4096) -> bool:
+        """Check if per-page tile stride is OS-page-aligned."""
+        stride = self._hk * self._tile_bytes * self._num_compressed_layers
+        return stride % page_size_bytes == 0
+
+
+def get_mha_host_pool_cls(device_pool: MHATokenToKVPool) -> type:
+    """Pick the right MHA host-pool class based on the device pool.
+
+    Returns ``KVarNHostKVCache`` for NoOp pools with a KVarN backend,
+    ``AsymmetricMHATokenToKVPoolHost`` when ``head_dim != v_head_dim``
     (e.g. MiMo-V2), else the default ``MHATokenToKVPoolHost``.
     """
+    from sglang.srt.mem_cache.memory_pool import NoOpMHATokenToKVPool
+
+    if (
+        isinstance(device_pool, NoOpMHATokenToKVPool)
+        and getattr(device_pool, "_kvarn_backend", None) is not None
+    ):
+        return KVarNHostKVCache
     if device_pool.head_dim != device_pool.v_head_dim:
         return AsymmetricMHATokenToKVPoolHost
     return MHATokenToKVPoolHost

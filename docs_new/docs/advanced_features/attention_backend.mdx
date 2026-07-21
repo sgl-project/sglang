@@ -394,6 +394,60 @@ GDN models are hybrid: the full-attention layers still require a standard `--att
 - **Other CUDA (Hopper, Ampere, etc.)**: auto-selection works; no special constraints.
 </Warning>
 
+### KVarN: KV-cache compression for hybrid linear-attention models
+
+KVarN (KV-compressed Attention) compresses the full-attention KV cache in hybrid GDN/linear-attention models (e.g. Qwen 3.5, Kimi-Linear) to **int4** with Hadamard preprocessing and Sinkhorn balancing. This enables long-context inference within bounded GPU memory by reducing the per-token KV cost by ~8x compared to BF16.
+
+<Note>
+KVarN applies to the **full-attention layers** of hybrid models. The linear-attention (GDN/Mamba) layers use their own recurrent state and are not affected by KVarN compression.
+</Note>
+
+Select KVarN by setting `--kv-cache-dtype` to one of the supported presets and `--attention-backend kvarn`:
+
+```bash
+python -m sglang.launch_server \
+    --model-path Qwen/Qwen3.5-9B \
+    --kv-cache-dtype kvarn_k4v4_g128 \
+    --attention-backend kvarn \
+    --context-length 131072
+```
+
+Available presets:
+
+| Preset | Key bits | Value bits | Group size | Compression vs BF16 |
+|--------|----------|------------|------------|---------------------|
+| `kvarn_k4v4_g128` | 4 | 4 | 128 | ~8x |
+| `kvarn_k4v4_g64` | 4 | 4 | 64 | ~8x |
+| `kvarn_k4v2_g128` | 4 | 2 | 128 | ~10x |
+| `kvarn_k4v2_g64` | 4 | 2 | 64 | ~10x |
+
+#### How it works
+
+KVarN uses a dual-pool architecture for the full-attention layers:
+
+- **Compressed int4 pool**: the long-term cache. Each tile of `group` tokens per head is processed through Hadamard rotation, Sinkhorn variance normalization, and 4-bit packing with per-group scales. Dequant is fused into the attention kernel, avoiding a separate dequant pass.
+- **Tail fp16 pool**: a small sliding window of recent tokens kept at full precision. Tokens are flushed from the tail pool to the compressed pool when the window slides.
+
+KVarN integrates with [HiCache](/docs/advanced_features/hicache) (host memory offloading). Compressed int4 tiles are stored in the host memory pool (~2.7 KB/token) without dequant/requant, enabling transparent offloading of long conversation history.
+
+<Tip>
+If HiCache fails to allocate on hosts with limited free RAM, set `SGLANG_HICACHE_HOST_MEMORY_RESERVE_GB` to lower the reserve (default: 10 GB). For example, `SGLANG_HICACHE_HOST_MEMORY_RESERVE_GB=2` reserves only 2 GB for the OS and other processes.
+</Tip>
+
+#### Speculative decoding
+
+KVarN targets are compatible with DFlash/EAGLE speculative decoding. Use `--speculative-draft-kv-cache-dtype` to control the draft model's KV cache dtype separately from the target (default: `"auto"`). For example, to use an FP8 draft behind a KVarN target:
+
+```bash
+python -m sglang.launch_server \
+    --model-path Qwen/Qwen3.5-9B \
+    --kv-cache-dtype kvarn_k4v4_g128 \
+    --attention-backend kvarn \
+    --speculative-algorithm DFLASH \
+    --speculative-draft-model-path /path/to/draft \
+    --speculative-draft-kv-cache-dtype fp8_e4m3
+```
+
 ### DSA Attention Backend
 
 DSA (DeepSeek Sparse Attention) is a native sparse attention mechanism used by [DeepSeek V3.2](https://lmsys.org/blog/2025-09-29-deepseek-V32/). It is activated automatically when the model architecture requires it and is selected via `--attention-backend dsa` (deprecated alias: `nsa`).
