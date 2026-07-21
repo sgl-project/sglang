@@ -322,7 +322,11 @@ class OpenAIServingChat(OpenAIServingBase):
             chunk_type = chunk.get("type")
             if chunk_type in ("text", "input_text"):
                 text = chunk["text"]
-                parts.append(text)
+                if "<|kimi_image_placeholder|>" in text:
+                    raise ValueError(
+                        "<|kimi_image_placeholder|> is reserved for Kimi-K3 image input"
+                    )
+                parts.append({"type": "text", "text": text})
                 if text:
                     previous_part_was_image = False
             elif chunk_type in ("image_url", "input_image"):
@@ -337,8 +341,8 @@ class OpenAIServingChat(OpenAIServingBase):
                     )
                 )
                 if previous_part_was_image:
-                    parts.append("\n")
-                parts.append("<|kimi_image_placeholder|>")
+                    parts.append({"type": "text", "text": "\n"})
+                parts.append({"type": "image_url", "image_url": image_obj})
                 previous_part_was_image = True
             elif chunk_type == "video_url":
                 video_data.append(chunk["video_url"]["url"])
@@ -347,7 +351,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 audio_data.append(chunk["audio_url"]["url"])
                 previous_part_was_image = False
         new_msg = {k: v for k, v in msg.items() if v is not None and k != "content"}
-        new_msg["content"] = "".join(parts)
+        new_msg["content"] = parts
         return new_msg
 
     def _request_id_prefix(self) -> str:

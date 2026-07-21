@@ -214,7 +214,12 @@ class ServingChatTestCase(unittest.TestCase):
 
         self.assertEqual(
             flattened["content"],
-            "<|kimi_image_placeholder|>\n" "<|kimi_image_placeholder|>Compare them.",
+            [
+                {"type": "image_url", "image_url": {"url": "image-1"}},
+                {"type": "text", "text": "\n"},
+                {"type": "image_url", "image_url": {"url": "image-2"}},
+                {"type": "text", "text": "Compare them."},
+            ],
         )
         self.assertEqual([item.url for item in image_data], ["image-1", "image-2"])
 
@@ -231,7 +236,10 @@ class ServingChatTestCase(unittest.TestCase):
                     "role": "user",
                     "content": [
                         {"type": "image_url", "image_url": {"url": "image-1"}},
-                        {"type": "text", "text": "<|media_pad|> Describe it."},
+                        {
+                            "type": "text",
+                            "text": "<|media_pad|> Describe it.",
+                        },
                     ],
                 }
             ],
@@ -245,7 +253,30 @@ class ServingChatTestCase(unittest.TestCase):
         self.assertIsNone(adapted.text)
         call = self.tm.tokenizer.apply_chat_template.call_args
         self.assertEqual(call.kwargs["image_prompts"], ["<|media_pad|>"])
-        self.assertIn("<|kimi_image_placeholder|>", call.args[0][0]["content"])
+        content = call.args[0][0]["content"]
+        self.assertEqual(content[0]["type"], "image_url")
+        self.assertEqual(content[0]["image_url"]["url"], "image-1")
+        self.assertEqual(
+            content[1],
+            {
+                "type": "text",
+                "text": "<|media_pad|> Describe it.",
+            },
+        )
+
+    def test_kimi_k3_rejects_internal_placeholder_in_user_text(self):
+        message = {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "<|kimi_image_placeholder|> Describe it.",
+                }
+            ],
+        }
+
+        with self.assertRaisesRegex(ValueError, "reserved for Kimi-K3 image input"):
+            self.chat._flatten_kimi_k3_content(message, [], [], [])
 
     def test_kimi_tool_call_keeps_default_reasoning(self):
         self.template_manager.reasoning_config = ReasoningToggleConfig(
