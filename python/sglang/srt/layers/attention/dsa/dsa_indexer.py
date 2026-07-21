@@ -560,7 +560,7 @@ class Indexer(MultiPlatformOp):
 
         # Prefill/extend: original per-step gate (host sync on seq_lens_cpu is fine).
         if fb.forward_mode.is_extend_without_speculative():
-            if fb.seq_lens_cpu is None:
+            if fb.seq_lens_cpu is None or fb.seq_lens_cpu.numel() == 0:
                 return False
             return int(fb.seq_lens_cpu.max().item()) <= self.index_topk
 
@@ -592,9 +592,9 @@ class Indexer(MultiPlatformOp):
                 return envs.SGLANG_DSA_DECODE_DENSE_GRAPH.get()
             # Eager decode: safe to check per-step (host sync OK); correct for both
             # kv_len<=index_topk (k-only) and kv_len>index_topk (falls through).
-            if fb.seq_lens_cpu is not None:
+            if fb.seq_lens_cpu is not None and fb.seq_lens_cpu.numel() > 0:
                 max_kv_len = int(fb.seq_lens_cpu.max().item())
-            elif fb.seq_lens is not None:
+            elif fb.seq_lens is not None and fb.seq_lens.numel() > 0:
                 max_kv_len = int(fb.seq_lens.max().item())
             else:
                 return False
