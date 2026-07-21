@@ -67,6 +67,26 @@ class SWAComponent(TreeComponent):
         super().reset_session_state()
         self._session_leaf_covered_len = {}
 
+    def _find_reusable_session_leaf(
+        self, node: Optional[UnifiedTreeNode]
+    ) -> Optional[UnifiedTreeNode]:
+        root_node = self.cache.root_node
+        if node is None or node is root_node:
+            return None
+
+        path = []
+        cur = node
+        while cur is not None and cur is not root_node:
+            path.append(cur)
+            cur = cur.parent
+
+        validator = self.create_match_validator(match_device_only=False)
+        deepest = None
+        for cur in reversed(path):
+            if validator(cur):
+                deepest = cur
+        return deepest
+
     def _walk_session_coverage(
         self,
         leaf: UnifiedTreeNode,

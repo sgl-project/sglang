@@ -126,26 +126,17 @@ class TreeComponent(ABC):
     def _find_reusable_session_leaf(
         self, node: Optional[UnifiedTreeNode]
     ) -> Optional[UnifiedTreeNode]:
-        from sglang.srt.mem_cache.unified_radix_cache import UnifiedTreeNode
-
-        root = self.cache.root_node
-        if node is None or node is root or not isinstance(node, UnifiedTreeNode):
-            return None
-
-        path = []
-        cur = node
-        while cur is not None and cur is not root:
-            path.append(cur)
-            cur = cur.parent
-        if cur is not root:
+        root_node = self.cache.root_node
+        if node is None or node is root_node:
             return None
 
         validator = self.create_match_validator(match_device_only=False)
-        deepest = None
-        for cur in reversed(path):
+        cur = node
+        while cur is not None and cur is not root_node:
             if validator(cur):
-                deepest = cur
-        return deepest
+                return cur
+            cur = cur.parent
+        return None
 
     def resolve_session_leaf(
         self, req: Req, last_node: Optional[UnifiedTreeNode]
