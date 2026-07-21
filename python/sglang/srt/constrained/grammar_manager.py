@@ -106,9 +106,9 @@ class GrammarManager:
             )
         return data
 
-    def abort_requests(self, recv_req: AbortReq, exact: bool = False):
+    def abort_requests(self, recv_req: AbortReq):
         for req in self.grammar_queue:
-            if recv_req.matches(req.rid, exact=exact):
+            if recv_req.abort_all or req.rid.startswith(recv_req.rid):
                 logger.debug(f"Abort grammar queue request. {req.rid=}")
                 if isinstance(req.grammar, futures.Future) and req.grammar:
                     req.grammar.cancel()
