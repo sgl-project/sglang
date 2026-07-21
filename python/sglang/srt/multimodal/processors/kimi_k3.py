@@ -211,22 +211,9 @@ class KimiK3ImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
             raise ValueError("Kimi-K3 supports image input only")
 
         expected_image_count = len(image_data or [])
-        if isinstance(input_text, (list, torch.Tensor)):
-            input_ids = np.asarray(
-                input_text.detach().flatten().cpu()
-                if isinstance(input_text, torch.Tensor)
-                else input_text,
-                dtype=np.int64,
-            )
-            placeholder_count = int(
-                np.count_nonzero(input_ids == self.mm_tokens.image_token_id)
-            )
-            if placeholder_count != expected_image_count:
-                raise ValueError(
-                    "Kimi-K3 image placeholders must map one-to-one to image data: "
-                    f"expected {expected_image_count}, found {placeholder_count} token(s)"
-                )
-
+        if self.validate_tokenized_image_placeholders(
+            input_text, self.mm_tokens.image_token_id, expected_image_count
+        ):
             # Keep structural media tokens distinct from user text that happens to
             # spell ``<|media_pad|>``. Decoding the whole prompt and matching the
             # resulting string would lose that distinction and could bind an image
@@ -247,7 +234,7 @@ class KimiK3ImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
 
         if len(base_output.images) != expected_image_count:
             raise ValueError(
-                "Kimi-K3 image placeholders must map one-to-one to image data: "
+                "Kimi image placeholders must map one-to-one to image data: "
                 f"expected {expected_image_count}, loaded {len(base_output.images)}"
             )
 

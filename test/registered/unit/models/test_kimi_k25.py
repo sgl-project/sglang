@@ -340,6 +340,32 @@ def test_kimi_k3_rejects_tokenized_placeholder_mismatch():
     processor.load_mm_data.assert_not_awaited()
 
 
+def test_kimi_k25_uses_token_ids_to_preserve_media_boundaries():
+    processor = object.__new__(KimiK2_5VLImageProcessor)
+    processor.mm_tokens = SimpleNamespace(image_token_id=99)
+    processor.fast_load_mm_data = AsyncMock(
+        return_value=SimpleNamespace(
+            images=[object(), object()], input_ids=[1, 99, 2, 99, 3]
+        )
+    )
+    processor.load_mm_data = AsyncMock()
+    processor.process_and_combine_mm_data_async = AsyncMock(
+        return_value=([], torch.tensor([[1, 2]]), None)
+    )
+    processor.use_cuda_ipc = False
+
+    asyncio.run(
+        processor.process_mm_data_async(
+            image_data=["image-1", "image-2"],
+            input_text=[1, 99, 2, 99, 3],
+            request_obj=SimpleNamespace(),
+        )
+    )
+
+    processor.fast_load_mm_data.assert_awaited_once()
+    processor.load_mm_data.assert_not_awaited()
+
+
 @pytest.mark.parametrize(
     ("request_obj", "extra_kwargs"),
     [
