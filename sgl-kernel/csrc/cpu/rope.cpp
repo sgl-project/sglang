@@ -391,7 +391,12 @@ std::tuple<at::Tensor, at::Tensor> multimodal_rotary_embedding_cpu(
   int64_t num_tokens = positions.size(-1);
 
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(query);
-  CHECK_INPUT_SHAPE_DTYPE<true>(key, {num_tokens, query.size(1), head_size}, input_dtype);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(key);
+  CHECK_EQ(query.size(0), num_tokens);
+  CHECK_EQ(key.size(0), num_tokens);
+  CHECK_EQ(query.size(-1) % head_size, 0);
+  CHECK_EQ(key.size(-1) % head_size, 0);
+  CHECK_EQ(input_dtype, key.scalar_type());
   CHECK_INPUT_SHAPE_DTYPE<false>(cos_sin_cache, {cos_sin_cache.size(0), rotary_dim}, input_dtype);
 
   const RopeParams p{query, key, head_size, rotary_dim};
@@ -399,18 +404,21 @@ std::tuple<at::Tensor, at::Tensor> multimodal_rotary_embedding_cpu(
   TORCH_CHECK(p.rotary_dim % 2 == 0, "rotary_dim must be even");
   TORCH_CHECK(positions.size(-1) == p.rows(), "positions.size(-1) must equal batch * seqlen");
 
-  if (positions.dim() == 2) {
-    TORCH_CHECK(mrope_section.has_value(), "mrope_section must be provided when positions is 2D");
-    auto mrope_section_val = mrope_section.value();
-    CHECK_EQ(mrope_section_val.size(), 3);
-    CHECK_EQ(positions.size(0), 3);
-    const int64_t section_t = mrope_section_val[0];
-    const int64_t section_h = mrope_section_val[1];
-    const int64_t section_w = mrope_section_val[2];
-    const int64_t p_stride0 = positions.stride(0);
-    AT_DISPATCH_REDUCED_FLOATING_TYPES(input_dtype, "multimodal_rotary_embedding_cpu", [&] {
-      const scalar_t* cache_base = cos_sin_cache.data_ptr<scalar_t>();
-      const int64_t* pos_ptr = positions.data_ptr<int64_t>();
+  AT_DISPATCH_REDUCED_FLOATING_TYPES(input_dtype, "multimodal_rotary_embedding_cpu", [&] {
+    const scalar_t* cache_base = cos_sin_cache.data_ptr<scalar_t>();
+    const int64_t* pos_ptr = positions.data_ptr<int64_t>();
+    scalar_t* q_ptr = query.data_ptr<scalar_t>();
+    scalar_t* k_ptr = key.data_ptr<scalar_t>();
+
+    if (positions.dim() == 2) {
+      TORCH_CHECK(mrope_section.has_value(), "mrope_section must be provided when positions is 2D");
+      auto mrope_section_val = mrope_section.value();
+      CHECK_EQ(mrope_section_val.size(), 3);
+      CHECK_EQ(positions.size(0), 3);
+      const int64_t section_t = mrope_section_val[0];
+      const int64_t section_h = mrope_section_val[1];
+      const int64_t section_w = mrope_section_val[2];
+      const int64_t p_stride0 = positions.stride(0);
       auto cache_pos = [=](int64_t token) -> MropeCosSinRow<scalar_t> {
         return {
             cache_base + pos_ptr[0 * p_stride0 + token] * rotary_dim,
@@ -421,32 +429,22 @@ std::tuple<at::Tensor, at::Tensor> multimodal_rotary_embedding_cpu(
             section_w,
             mrope_interleaved};
       };
-
-      scalar_t* q_ptr = query.data_ptr<scalar_t>();
-      scalar_t* k_ptr = key.data_ptr<scalar_t>();
       if (is_neox) {
         rotary_embedding_kernel_impl<scalar_t, RotaryMode::Neox, true>(q_ptr, k_ptr, q_ptr, k_ptr, p, cache_pos);
       } else {
         rotary_embedding_kernel_impl<scalar_t, RotaryMode::Interleaved, true>(q_ptr, k_ptr, q_ptr, k_ptr, p, cache_pos);
       }
-    });
-  } else {  // positions.dim() == 1
-    AT_DISPATCH_REDUCED_FLOATING_TYPES(input_dtype, "multimodal_rotary_embedding_cpu", [&] {
-      const scalar_t* cache_base = cos_sin_cache.data_ptr<scalar_t>();
-      const int64_t* pos_ptr = positions.data_ptr<int64_t>();
+    } else {  // positions.dim() == 1
       auto cache_pos = [cache_base, pos_ptr, rotary_dim](int64_t token) -> const scalar_t* {
         return cache_base + pos_ptr[token] * rotary_dim;
       };
 
-      scalar_t* q_ptr = query.data_ptr<scalar_t>();
-      scalar_t* k_ptr = key.data_ptr<scalar_t>();
-
       if (is_neox) {
         rotary_embedding_kernel_impl<scalar_t, RotaryMode::Neox, true>(q_ptr, k_ptr, q_ptr, k_ptr, p, cache_pos);
       } else {
         rotary_embedding_kernel_impl<scalar_t, RotaryMode::Interleaved, true>(q_ptr, k_ptr, q_ptr, k_ptr, p, cache_pos);
       }
-    });
-  }
+    }
+  });
   return std::make_tuple(query, key);
 }
