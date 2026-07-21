@@ -1298,7 +1298,7 @@ class CommonKVReceiver(BaseKVReceiver):
                 # Bound send so a dead peer cannot block the scheduler forever.
                 sock.setsockopt(
                     zmq.SNDTIMEO,
-                    envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT.get() * 1000,
+                    envs.SGLANG_DISAGGREGATION_ZMQ_SEND_TIMEOUT.get() * 1000,
                 )
                 sock.setsockopt(zmq.TCP_KEEPALIVE, 1)
                 sock.setsockopt(zmq.TCP_KEEPALIVE_IDLE, 30)
@@ -1392,8 +1392,9 @@ class CommonKVReceiver(BaseKVReceiver):
 
     def _send_abort_notification(self):
         for bootstrap_info in self.bootstrap_infos:
-            # Best-effort abort notify. Use DONTWAIT so a dead peer cannot hold
-            # the scheduler main loop (and the endpoint lock heartbeat needs).
+            # Best-effort abort notify. Bounded by the socket-level SNDTIMEO
+            # (SGLANG_DISAGGREGATION_ZMQ_SEND_TIMEOUT) so a dead peer cannot hold
+            # the scheduler main loop or the endpoint lock heartbeat needs to reach.
             peer = f"{bootstrap_info.get('rank_ip', 'unknown')}:{bootstrap_info.get('rank_port', 'unknown')}"
             try:
                 sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
@@ -1404,16 +1405,16 @@ class CommonKVReceiver(BaseKVReceiver):
                             str(self.bootstrap_room).encode("ascii"),
                             self.kv_mgr.local_ip.encode("ascii"),
                             str(self.kv_mgr.rank_port).encode("ascii"),
-                        ],
-                        flags=zmq.DONTWAIT,
+                        ]
                     )
                 logger.debug(
                     f"Sent abort notification for room {self.bootstrap_room} to {peer}"
                 )
             except zmq.error.Again:
+                timeout_s = envs.SGLANG_DISAGGREGATION_ZMQ_SEND_TIMEOUT.get()
                 logger.warning_once(
-                    f"Dropping abort notification to {peer}: send buffer full "
-                    "(peer likely dead)."
+                    f"Dropping abort notification to {peer}: send timed out "
+                    f"after {timeout_s}s (peer likely dead)."
                 )
             except Exception as e:
                 logger.debug(
@@ -1442,11 +1443,11 @@ class CommonKVReceiver(BaseKVReceiver):
                 peer = (
                     f"{bootstrap_info.get('rank_ip')}:{bootstrap_info.get('rank_port')}"
                 )
-                timeout_s = envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT.get()
+                timeout_s = envs.SGLANG_DISAGGREGATION_ZMQ_SEND_TIMEOUT.get()
                 logger.warning_once(
                     f"{op_name} to prefill {peer} timed out after {timeout_s}s "
                     "(peer likely dead). Failing affected requests. "
-                    "Tune SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT to change this bound."
+                    "Tune SGLANG_DISAGGREGATION_ZMQ_SEND_TIMEOUT to change this bound."
                 )
                 self.kv_mgr.record_failure(
                     self.bootstrap_room,
