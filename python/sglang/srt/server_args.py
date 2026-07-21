@@ -4151,13 +4151,19 @@ class ServerArgs:
                 # Only non-torch memory is counted; torch memory is reused by cuda graph capture.
                 reserved_mem += len(prefill_cuda_graph_config.bs) * 8
             else:
-                # Measured on GLM-5.2-FP8 tp8 (cuda_graph_mem_viz + capture
-                # logs): breakable prefill pool ~1.95 GB at the default bucket
-                # list, plus decode-graph usage (4.9 GB measured vs 1 GB
-                # budgeted above) and capture warmup spikes that surface once
-                # the BCG stack is active. Validated: 4 GB OOMs at auto 0.868,
-                # 6.5 GB leaves ~1.3 GB spare.
-                reserved_mem += 6.5 * 1024
+                # Breakable prefill pool: 1.95 GB measured on GLM-5.2-FP8
+                # tp8 (cuda_graph_mem_viz + capture logs), plus margin for
+                # capture warmup spikes.
+                reserved_mem += 2.5 * 1024
+                # Decode-graph shortfall surfaced by BCG: decode capture uses
+                # 4.9 GB measured vs the 1 GB (max_bs * 2 MB) budgeted above.
+                # The deficit predates BCG and is silently absorbed by
+                # activation headroom in eager-prefill configs; charging it
+                # here (not in the decode term) avoids shifting auto memory
+                # for every non-BCG deployment — arguably it belongs in the
+                # decode term, see PR discussion. Validated together: 4 GB
+                # total OOMs at auto 0.868, 6.5 GB leaves ~1.3 GB spare.
+                reserved_mem += 4 * 1024
             from sglang.srt.arg_groups.overrides import resolved_view
 
             if (
