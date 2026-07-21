@@ -78,7 +78,6 @@ from sglang.srt.layers.cp.utils import (
     get_cp_strategy,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.moe.dwdp import DwdpManager
 from sglang.srt.layers.sampler import create_sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
@@ -1027,6 +1026,10 @@ class ModelRunner:
             return
         if self.server_args.dwdp_size <= 1:
             return
+        # Lazy import: DWDP uses NVLink-specific cuda-python bindings that are
+        # only available (and only needed) on CUDA platforms with dwdp_size > 1.
+        from sglang.srt.layers.moe.dwdp import DwdpManager
+
         manager = DwdpManager(self.server_args)
         set_global_dwdp_manager(manager)
         manager.setup(self.model)
