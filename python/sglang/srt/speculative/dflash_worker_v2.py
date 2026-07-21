@@ -165,6 +165,7 @@ class _DominoDraftSampler:
         block_size,
         shift_label,
         max_bs,
+        candidate_pool_size=2048,
     ):
         self.target_embedding = target_embedding
         self.lm_head_weight = lm_head_weight
@@ -173,6 +174,7 @@ class _DominoDraftSampler:
         self.vocab_size = int(vocab_size)
         self.block_size = int(block_size)
         self.shift_label = bool(shift_label)
+        self.candidate_pool_size = int(candidate_pool_size)
         max_tokens = int(max_bs) * (self.block_size - 1)
         self.out = torch.empty(
             (max_tokens,), dtype=torch.int64, device=lm_head_weight.device
@@ -193,6 +195,7 @@ class _DominoDraftSampler:
             embed_proj=self.embed_proj,
             vocab_size=self.vocab_size,
             shift_label=self.shift_label,
+            candidate_pool_size=self.candidate_pool_size,
         )
         self.out[: bs * (self.block_size - 1)].copy_(proposals.reshape(-1))
 
@@ -246,7 +249,15 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_hf_config=self.draft_model_runner.model_config.hf_config
         )
         self._is_domino = draft_config.is_domino
+        self.domino_candidate_pool_size = int(
+            server_args.speculative_domino_candidate_pool_size
+        )
         if self._is_domino:
+            if self.domino_candidate_pool_size < 0:
+                raise ValueError(
+                    "--speculative-domino-candidate-pool-size must be non-negative, "
+                    f"got {self.domino_candidate_pool_size}."
+                )
             target_model = self.target_worker.model_runner.model
             target_embedding = target_model.get_input_embeddings()
             lm_head = getattr(target_model, "lm_head", None)
@@ -307,7 +318,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
             if self._is_domino:
                 logger.info(
-                    "DFLASH Domino rollout enabled (eager BF16, TP=1, full-vocabulary greedy)."
+                    "DFLASH Domino rollout enabled (eager BF16, TP=1, block-shared candidate pool size=%s).",
+                    self.domino_candidate_pool_size,
                 )
             logger.info(
                 "DFLASH draft runner ready. mask_token=%s, mask_token_id=%s, mask_token_id_override=%s",
@@ -470,6 +482,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 block_size=self.block_size,
                 shift_label=self.draft_model.shift_label,
                 max_bs=max(self.server_args.cuda_graph_config.decode.bs),
+                candidate_pool_size=self.domino_candidate_pool_size,
             )
         if not hasattr(lm_head, "shard_indices"):
             if tp_group.world_size != 1:
@@ -1741,6 +1754,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 embed_proj=embed_proj,
                 vocab_size=int(self.model_runner.model_config.vocab_size),
                 shift_label=bool(self.draft_model.shift_label),
+                candidate_pool_size=self.domino_candidate_pool_size,
             )
         elif self._draft_sampler is not None and draft_out.can_run_graph:
             draft_next = self._draft_sampler.out[

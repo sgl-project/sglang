@@ -4,6 +4,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+_DOMINO_CANDIDATE_POOL_SIZE = 2048
+
 
 def _domino_gru_cell(
     prefix_gru: nn.GRU, input: torch.Tensor, hidden: torch.Tensor
@@ -118,8 +120,9 @@ def domino_greedy_rollout(
     embed_proj: nn.Sequential,
     vocab_size: int,
     shift_label: bool,
+    candidate_pool_size: int = _DOMINO_CANDIDATE_POOL_SIZE,
 ) -> torch.Tensor:
-    """Generate a Domino chain with native GRU and full-vocabulary greedy logits."""
+    """Generate a Domino chain using one block-shared base-logit candidate pool."""
     if draft_hidden.ndim != 3:
         raise ValueError(
             f"draft_hidden must have shape [batch, block, hidden], got {tuple(draft_hidden.shape)}."
@@ -133,6 +136,13 @@ def domino_greedy_rollout(
     num_proposals = int(block_size) - 1
     if num_proposals < 1:
         raise ValueError(f"Domino requires block_size > 1, got {block_size}.")
+    candidate_pool_size = int(candidate_pool_size)
+    if candidate_pool_size < 0:
+        raise ValueError(
+            "Domino candidate_pool_size must be non-negative, "
+            f"got {candidate_pool_size}."
+        )
+    candidate_pool_size = min(candidate_pool_size, int(vocab_size))
     start = 0 if shift_label else 1
     z = draft_hidden[:, start : start + num_proposals, :]
     if int(z.shape[1]) != num_proposals:
@@ -154,13 +164,47 @@ def domino_greedy_rollout(
     if num_proposals == 1:
         return first_ids[:, None]
 
+    candidate_ids = None
+    candidate_base = None
+    candidate_weight = None
+    if 0 < candidate_pool_size < int(vocab_size):
+        feedback_logits = base_logits[1:]
+        candidate_ids = torch.topk(
+            feedback_logits.amax(dim=0),
+            k=candidate_pool_size,
+            dim=-1,
+            sorted=False,
+        ).indices.contiguous()
+        candidate_base = torch.gather(
+            feedback_logits.transpose(0, 1),
+            2,
+            candidate_ids[:, None, :].expand(-1, num_proposals - 1, -1),
+        ).transpose(0, 1)
+        candidate_weight = F.embedding(candidate_ids, embed_proj[2].weight)
+
     prefix_ids = torch.stack((verified_ids, first_ids), dim=1)
     _, gru_hidden = prefix_gru(target_embedding(prefix_ids))
 
     for index in range(1, num_proposals):
         step_hidden = z[:, index, :]
-        correction = embed_proj(torch.cat((step_hidden, gru_hidden[0]), dim=-1))
-        next_ids = torch.argmax(base_logits[index] + correction, dim=-1).to(torch.long)
+        correction_hidden = embed_proj[1](
+            embed_proj[0](torch.cat((step_hidden, gru_hidden[0]), dim=-1))
+        )
+        if candidate_ids is None:
+            correction = embed_proj[2](correction_hidden)
+            next_ids = torch.argmax(base_logits[index] + correction, dim=-1).to(
+                torch.long
+            )
+        else:
+            correction = torch.bmm(
+                candidate_weight, correction_hidden.unsqueeze(-1)
+            ).squeeze(-1)
+            candidate_position = torch.argmax(
+                candidate_base[index - 1] + correction, dim=-1
+            )
+            next_ids = torch.gather(
+                candidate_ids, 1, candidate_position[:, None]
+            ).squeeze(1)
         proposals.append(next_ids)
         if index + 1 < num_proposals:
             gru_hidden = _domino_gru_cell(
