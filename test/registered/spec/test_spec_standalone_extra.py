@@ -7,7 +7,7 @@ from sglang.test.test_utils import CustomTestCase
 
 # Non-V2 standalone speculative decoding tests (FA3, Triton, FlashInfer
 # backends). Sibling V2 classes stay per-commit in test_spec_standalone.py.
-register_cuda_ci(est_time=406, stage="extra-a", runner_config="1-gpu-large")
+register_cuda_ci(est_time=222, stage="extra-a", runner_config="1-gpu-large")
 # AMD: fa3 / flashinfer attention backends are not built in the ROCm
 # sgl_kernel, so only the triton-backend class runs on ROCm (the fa3 and
 # flashinfer classes are skipped on ROCm below).

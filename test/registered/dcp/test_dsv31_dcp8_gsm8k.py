@@ -55,7 +55,7 @@ from sglang.test.test_utils import (
 # ---------------------------------------------------------------------------
 # CI registration — only TestDSV31DCP8TP8GSM8K runs in CI
 # ---------------------------------------------------------------------------
-register_cuda_ci(est_time=600, stage="extra-b", runner_config="8-gpu-h200")
+register_cuda_ci(est_time=217, stage="extra-b", runner_config="8-gpu-h200")
 
 DEEPSEEK_V31_MODEL_PATH = "deepseek-ai/DeepSeek-V3.1"
 

@@ -12,7 +12,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=500, stage="base-c", runner_config="4-gpu-gb300")
+register_cuda_ci(est_time=618, stage="base-c", runner_config="4-gpu-gb300")
 
 DEEPSEEK_V3_FP4_MODEL = "nvidia/DeepSeek-V3-0324-FP4"
 GLM52_NVFP4_MODEL = "nvidia/GLM-5.2-NVFP4"

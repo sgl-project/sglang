@@ -16,7 +16,7 @@ from sglang.srt.layers.logprob_processor import InputLogprobProcessor
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=30, suite="base-a-test-cpu")
+register_cpu_ci(est_time=33, suite="base-a-test-cpu")
 
 VOCAB = 11
 # Heterogeneous per-sequence parameters; uniform ones hide misalignment.

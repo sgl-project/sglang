@@ -41,7 +41,7 @@ from sglang.test.kits.attention_unittest.attention_methods.dense_attention impor
     build_dense_attention_fixture,
 )
 
-register_cuda_ci(est_time=10, stage="base-a", runner_config="1-gpu-small")
+register_cuda_ci(est_time=11, stage="base-a", runner_config="1-gpu-small")
 
 _EXTEND_CASE = DenseAttentionCase(
     name="extend_no_prefix_smoke",

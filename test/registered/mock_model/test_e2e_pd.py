@@ -19,7 +19,7 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
 
-register_cuda_ci(est_time=600, stage="extra-a", runner_config="2-gpu-large")
+register_cuda_ci(est_time=171, stage="extra-a", runner_config="2-gpu-large")
 register_amd_ci(est_time=165, stage="extra-a", runner_config="2-gpu-large-amd")
 
 # DO NOT pass --disable-cuda-graph in canary e2e tests.  The canary kernel

@@ -11,7 +11,7 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-register_cuda_ci(est_time=300, stage="base-c", runner_config="8-gpu-h200")
+register_cuda_ci(est_time=289, stage="base-c", runner_config="8-gpu-h200")
 
 FULL_DEEPSEEK_V3_MODEL_PATH = "deepseek-ai/DeepSeek-V3-0324"
 

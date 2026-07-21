@@ -15,7 +15,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=600, stage="base-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=167, stage="base-b", runner_config="2-gpu-large")
 
 KIMI_LINEAR_MODEL = "moonshotai/Kimi-Linear-48B-A3B-Instruct"
 

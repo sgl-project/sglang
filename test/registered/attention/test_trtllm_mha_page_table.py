@@ -25,7 +25,7 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 # Triton kernel unit test for the trtllm_mha device-side page-table build.
-register_cuda_ci(est_time=14, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=14, stage="stage-b", runner_config="1-gpu-small-amd")
 
 

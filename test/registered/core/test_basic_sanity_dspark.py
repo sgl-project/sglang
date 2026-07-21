@@ -14,7 +14,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=120, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=88, stage="base-b", runner_config="1-gpu-large")
 
 TARGET_MODEL = "Qwen/Qwen3-14B"
 DRAFT_MODEL = "deepseek-ai/dspark_qwen3_14b_block7"
