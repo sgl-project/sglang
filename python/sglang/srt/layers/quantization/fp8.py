@@ -65,6 +65,8 @@ from sglang.srt.layers.quantization.fp8_utils import (
     mxfp8_group_quantize,
     normalize_e4m3fn_to_e4m3fnuz,
     requant_block_scale_ue8m0_for_deepgemm,
+    restore_scale_checkpoint_state,
+    snapshot_scale_checkpoint_state,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.layers.quantization.marlin_utils_fp8 import prepare_fp8_layer_for_marlin
@@ -600,6 +602,10 @@ class Fp8LinearMethod(LinearMethodBase):
             else:
                 layer.register_parameter("input_scale", None)
 
+    def restore_weights_before_loading(self, layer: Module) -> None:
+        if self.block_quant:
+            restore_scale_checkpoint_state(getattr(layer, "weight_scale_inv", None))
+
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
         if self.convert_mxfp8_to_block:
             from sglang.srt.layers.quantization.mxfp8_block_convert import (
@@ -626,6 +632,9 @@ class Fp8LinearMethod(LinearMethodBase):
             layer.weight_scale_inv.format_ue8m0 = True
             self._process_mxfp8_linear_weight_scale(layer)
             return
+
+        # MXFP8 paths manage their own scale layouts above.
+        snapshot_scale_checkpoint_state(getattr(layer, "weight_scale_inv", None))
         # If ROCm, normalize the weights and scales to e4m3fnuz
         if _is_fp8_fnuz:
             # activation_scheme: dynamic
@@ -1314,7 +1323,14 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.w13_input_scale = None
             layer.w2_input_scale = None
 
+    def restore_weights_before_loading(self, layer: Module) -> None:
+        if self.block_quant:
+            restore_scale_checkpoint_state(getattr(layer, "w13_weight_scale_inv", None))
+            restore_scale_checkpoint_state(getattr(layer, "w2_weight_scale_inv", None))
+
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
+        snapshot_scale_checkpoint_state(getattr(layer, "w13_weight_scale_inv", None))
+        snapshot_scale_checkpoint_state(getattr(layer, "w2_weight_scale_inv", None))
         # AMD FP4 experts: use aiter's native MXFP4 MoE path
         if _use_aiter and self.is_fp4_expert:
             gu_intv = envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()

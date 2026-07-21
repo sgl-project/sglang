@@ -849,6 +849,19 @@ class DefaultModelLoader(BaseModelLoader):
                     quant_method.process_weights_after_loading(module)
 
 
+def restore_weights_before_loading(
+    model: nn.Module, target_device: torch.device
+) -> None:
+    """Restore quantized modules to their checkpoint-loading state."""
+    for _, module in model.named_modules():
+        quant_method = getattr(module, "quant_method", None)
+        if quant_method is not None and hasattr(
+            quant_method, "restore_weights_before_loading"
+        ):
+            with device_loading_context(module, target_device):
+                quant_method.restore_weights_before_loading(module)
+
+
 class LayeredModelLoader(DefaultModelLoader):
     """Model loader that loads weights layer by layer so that one can quantize a
     layer before loading another to make the peak memory envelope smaller."""
