@@ -282,13 +282,18 @@ class TreeNode:
 
 
 class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
+    def _supports_session_radix_cache(self) -> bool:
+        return type(self) is RadixCache
+
     def __init__(self, params: CacheInitParams):
         self.disable = params.disable
         self.req_to_token_pool = params.req_to_token_pool
         self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
         self.page_size = params.page_size
         self.enable_kv_cache_events = params.enable_kv_cache_events
-        self.enable_session_radix_cache = params.enable_session_radix_cache
+        self.enable_session_radix_cache = (
+            params.enable_session_radix_cache and self._supports_session_radix_cache()
+        )
         self.is_eagle = params.is_eagle
         self.disable_finished_insert = params.disable_finished_insert
         self.eviction_policy = params.eviction_policy.lower()

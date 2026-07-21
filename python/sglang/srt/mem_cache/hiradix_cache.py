@@ -74,6 +74,9 @@ logger = logging.getLogger(__name__)
 
 class HiRadixCache(RadixCache):
 
+    def _supports_session_radix_cache(self) -> bool:
+        return type(self) is HiRadixCache
+
     def __init__(self, params: CacheInitParams, server_args: ServerArgs):
         self._enable_metrics_flag = params.enable_metrics
 
