@@ -152,7 +152,7 @@ class _DflashDraftSampler:
 
 
 class _DominoDraftSampler:
-    """Capture-safe TP=1 Domino rollout over a fixed-size draft block."""
+    """Capture-safe Domino rollout over a fixed-size draft block."""
 
     def __init__(
         self,
@@ -166,6 +166,10 @@ class _DominoDraftSampler:
         shift_label,
         max_bs,
         candidate_pool_size=2048,
+        tp_group=None,
+        lm_head_org_vocab_start=0,
+        lm_head_num_org=None,
+        lm_head_num_org_padded=None,
     ):
         self.target_embedding = target_embedding
         self.lm_head_weight = lm_head_weight
@@ -175,6 +179,10 @@ class _DominoDraftSampler:
         self.block_size = int(block_size)
         self.shift_label = bool(shift_label)
         self.candidate_pool_size = int(candidate_pool_size)
+        self.tp_group = tp_group
+        self.lm_head_org_vocab_start = int(lm_head_org_vocab_start)
+        self.lm_head_num_org = lm_head_num_org
+        self.lm_head_num_org_padded = lm_head_num_org_padded
         max_tokens = int(max_bs) * (self.block_size - 1)
         self.out = torch.empty(
             (max_tokens,), dtype=torch.int64, device=lm_head_weight.device
@@ -196,6 +204,10 @@ class _DominoDraftSampler:
             vocab_size=self.vocab_size,
             shift_label=self.shift_label,
             candidate_pool_size=self.candidate_pool_size,
+            tp_group=self.tp_group,
+            lm_head_org_vocab_start=self.lm_head_org_vocab_start,
+            lm_head_num_org=self.lm_head_num_org,
+            lm_head_num_org_padded=self.lm_head_num_org_padded,
         )
         self.out[: bs * (self.block_size - 1)].copy_(proposals.reshape(-1))
 
@@ -270,6 +282,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             validate_domino_runtime(
                 device=torch.device(self.device),
                 tp_size=int(get_tp_group().world_size),
+                tp_rank=int(self.ps.tp_rank),
                 target_vocab_size=int(self.model_runner.model_config.vocab_size),
                 draft_vocab_size=int(self.draft_model_runner.model_config.vocab_size),
                 hidden_size=int(self.draft_model.config.hidden_size),
@@ -318,7 +331,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
             if self._is_domino:
                 logger.info(
-                    "DFLASH Domino rollout enabled (eager BF16, TP=1, block-shared candidate pool size=%s).",
+                    "DFLASH Domino rollout enabled (eager BF16, TP=%s, block-shared candidate pool size=%s).",
+                    int(get_tp_group().world_size),
                     self.domino_candidate_pool_size,
                 )
             logger.info(
@@ -463,16 +477,16 @@ class DFlashWorkerV2(BaseSpecWorker):
             return _eager("quantized lm_head")
         tp_group = get_tp_group()
         if self._is_domino:
-            if tp_group.world_size != 1:
-                return _eager("Domino cuda graph currently requires tp=1")
             prefix_gru = self.draft_model.prefix_gru
             embed_proj = self.draft_model.embed_proj
             if prefix_gru is None or embed_proj is None:
                 return _eager("Domino projector modules are unavailable")
             if self.ps.tp_rank == 0:
                 logger.info(
-                    "DFLASH Domino rollout folded into the draft cuda graph (tp=1)."
+                    "DFLASH Domino rollout folded into the draft cuda graph (tp=%s).",
+                    int(tp_group.world_size),
                 )
+            shard = getattr(lm_head, "shard_indices", None)
             return _DominoDraftSampler(
                 target_embedding=target_model.get_input_embeddings(),
                 lm_head_weight=lm_head.weight,
@@ -483,6 +497,16 @@ class DFlashWorkerV2(BaseSpecWorker):
                 shift_label=self.draft_model.shift_label,
                 max_bs=max(self.server_args.cuda_graph_config.decode.bs),
                 candidate_pool_size=self.domino_candidate_pool_size,
+                tp_group=tp_group,
+                lm_head_org_vocab_start=(
+                    int(shard.org_vocab_start_index) if shard is not None else 0
+                ),
+                lm_head_num_org=(
+                    int(shard.num_org_elements) if shard is not None else None
+                ),
+                lm_head_num_org_padded=(
+                    int(shard.num_org_elements_padded) if shard is not None else None
+                ),
             )
         if not hasattr(lm_head, "shard_indices"):
             if tp_group.world_size != 1:
@@ -1745,6 +1769,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             embed_proj = self.draft_model.embed_proj
             if prefix_gru is None or embed_proj is None:
                 raise RuntimeError("DFLASH Domino projector modules are unavailable.")
+            tp_group = get_tp_group()
+            shard = getattr(lm_head, "shard_indices", None)
             draft_next = domino_greedy_rollout(
                 draft_hidden=draft_hidden,
                 verified_ids=block_ids[:, 0],
@@ -1755,6 +1781,16 @@ class DFlashWorkerV2(BaseSpecWorker):
                 vocab_size=int(self.model_runner.model_config.vocab_size),
                 shift_label=bool(self.draft_model.shift_label),
                 candidate_pool_size=self.domino_candidate_pool_size,
+                tp_group=tp_group,
+                lm_head_org_vocab_start=(
+                    int(shard.org_vocab_start_index) if shard is not None else 0
+                ),
+                lm_head_num_org=(
+                    int(shard.num_org_elements) if shard is not None else None
+                ),
+                lm_head_num_org_padded=(
+                    int(shard.num_org_elements_padded) if shard is not None else None
+                ),
             )
         elif self._draft_sampler is not None and draft_out.can_run_graph:
             draft_next = self._draft_sampler.out[
