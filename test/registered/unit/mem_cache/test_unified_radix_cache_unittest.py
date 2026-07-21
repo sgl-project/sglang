@@ -373,6 +373,7 @@ class TestUnifiedRadixCacheEagleHiCacheStorageKey(CustomTestCase):
                 self.mem_pool_host = FakeHostPool()
                 self.prefetch_tokens_occupied = 0
                 self.prefetch_args = None
+                self.write_policy = "write_through"
 
             def prefetch_rate_limited(self):
                 return False
