@@ -31,7 +31,7 @@ from sglang.srt.speculative.spec_utils import (
     record_stream_each,
     record_stream_for_v2_verify,
 )
-from sglang.srt.utils import is_cpu
+from sglang.srt.utils import is_cpu, is_cuda
 from sglang.srt.utils.async_probe import (
     maybe_detect_inf,
     maybe_detect_nan,
@@ -40,6 +40,7 @@ from sglang.srt.utils.async_probe import (
 from sglang.srt.utils.common import is_npu
 
 _is_cpu = is_cpu()
+_is_cuda = is_cuda()
 _is_npu = is_npu()
 
 if _is_cpu:
@@ -157,7 +158,7 @@ def prepare_for_draft_extend(
     # init_new requires both list or both Tensor. Fuse the uniform-width GPU
     # metadata construction so draft-extend pays one launch instead of six.
     prolog_output = None
-    if gpu_only and batch.seq_lens.is_cuda:
+    if gpu_only and _is_cuda and batch.seq_lens.is_cuda:
         prolog_output = fused_draft_extend_prolog(
             batch.seq_lens,
             num_draft_tokens,

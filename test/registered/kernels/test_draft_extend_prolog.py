@@ -7,14 +7,14 @@ from sglang.kernels.ops.speculative.draft_extend import fused_draft_extend_prolo
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
 from sglang.srt.speculative.eagle_worker_common import prepare_for_draft_extend
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.srt.utils import is_cuda
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=5, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=5, suite="jit-kernel-unit-test-amd")
 
 
-@unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for this test.")
+@unittest.skipUnless(is_cuda(), "NVIDIA CUDA is required for this test.")
 class TestDraftExtendProlog(CustomTestCase):
     def test_matches_eager_metadata_construction(self):
         cases = [
