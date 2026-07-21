@@ -260,6 +260,7 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
                     output_partition_sizes=output_partition_sizes,
                     weight_loader=fp8_to_mxfp4_weight_loader,
                     is_checkpoint_fp8_serialized=True,
+                    weight_scale_name="weight_scale_inv",
                     params_dtype=params_dtype,
                     skip_block_quant_check=False,
                     input_size=kwargs.get("input_size", input_size_per_partition),
