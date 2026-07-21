@@ -528,6 +528,7 @@ class Fp8LinearMethod(LinearMethodBase):
         params_dtype: torch.dtype,
         weight_loader,
         is_checkpoint_fp8_serialized: bool,
+        weight_scale_name: str,
         skip_block_quant_check: bool = False,
         **extra_weight_attrs,
     ):
@@ -590,7 +591,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 scale.format_ue8m0 = use_mxfp8
                 if scale_dtype != torch.uint8:
                     scale[:] = torch.finfo(torch.float32).min
-                layer.register_parameter(self.weight_scale_name, scale)
+                layer.register_parameter(weight_scale_name, scale)
             else:
                 scale = PerTensorScaleParameter(
                     data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
@@ -645,6 +646,7 @@ class Fp8LinearMethod(LinearMethodBase):
             input_size=input_size,
             output_size=output_size,
             is_checkpoint_fp8_serialized=self.is_checkpoint_fp8_serialized,
+            weight_scale_name=self.weight_scale_name,
             params_dtype=params_dtype,
         )
 
