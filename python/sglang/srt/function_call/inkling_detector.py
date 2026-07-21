@@ -97,12 +97,8 @@ class InklingDetector(BaseFormatDetector):
     def parse_streaming_increment(
         self, new_text: str, tools: List[Tool]
     ) -> StreamingParseResult:
-        # A single delta can carry several complete tool calls, but each pass
-        # parses at most one call and re-buffers the remainder. Without draining
-        # here the trailing calls would sit in self._buffer with no stream-end
-        # flush on this detector and be lost (e.g. two complete calls in the
-        # final delta -> only the first emitted). Loop until a pass stops making
-        # progress: a partial/re-buffered call or plain text ends the drain.
+        # Drain every complete call in the delta: this detector has no
+        # stream-end flush, so anything left in self._buffer is lost.
         self._buffer += new_text
         all_calls: list[ToolCallItem] = []
         normal_parts: list[str] = []
@@ -122,12 +118,8 @@ class InklingDetector(BaseFormatDetector):
     def _parse_buffered_increment(
         self, tools: List[Tool]
     ) -> tuple[StreamingParseResult, bool]:
-        # Parse one step from self._buffer: emit a leading text run or at most
-        # one complete tool call, and report whether the buffer advanced. The
-        # caller loops while progress is made, so a single delta carrying text
-        # plus several complete calls is fully drained at arrival instead of
-        # stranding the trailing calls in the buffer (there is no stream-end
-        # flush on this detector).
+        # One drain step: emit a text run or one complete call; the bool is
+        # whether the buffer advanced (the caller loops while it does).
         current_text = self._buffer
 
         if self.bot_token not in current_text:
@@ -167,8 +159,7 @@ class InklingDetector(BaseFormatDetector):
             self._buffer = current_text[bot_pos:]
             normal_text = self._clean_normal_text(normal_text)
             if normal_text:
-                # Buffer advanced (prefix removed, tool call now at head) —
-                # keep draining so a text+call delta emits both, not just text.
+                # prefix stripped, call now at buffer head -> keep draining
                 return StreamingParseResult(normal_text=normal_text), True
             current_text = self._buffer
 
@@ -219,9 +210,12 @@ class InklingDetector(BaseFormatDetector):
             header_name=self._current_header_name,
         )
         if call is None:
+            # Drop only the rejected call's span, not the whole buffer, or a
+            # trailing valid call dies; clear the header so it can't leak.
             self._abandon_current_tool()
-            self._buffer = ""
-            return StreamingParseResult(calls=calls), False
+            self._buffer = self._remaining_after_call(current_text, start_idx + end_idx)
+            self._current_header_name = None
+            return StreamingParseResult(calls=calls), True
 
         if self.current_tool_id == -1:
             self._ensure_current_tool()

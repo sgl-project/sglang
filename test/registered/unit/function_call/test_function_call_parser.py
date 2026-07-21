@@ -188,6 +188,29 @@ class TestInklingDetector(unittest.TestCase):
         args = "".join(c.parameters for c in result.calls)
         self.assertEqual(json.loads(args), {"city": "SF"})
 
+    def test_streaming_rejected_middle_call_keeps_later_valid_call(self):
+        """Bug regression: a rejected call (header/name mismatch) cleared the
+        whole buffer, discarding a later valid call that arrived in the same
+        delta. Only the rejected call's span may be dropped; the drain must
+        continue so the trailing valid call still streams."""
+        detector = InklingDetector()
+        source = (
+            "<|message_model|>weather<|content_invoke_tool_json|>"
+            '{"name":"weather","args":{"city":"SF"}}<|end_message|>'
+            "<|message_model|>other<|content_invoke_tool_json|>"
+            '{"name":"weather","args":{"city":"XX"}}<|end_message|>'
+            "<|message_model|>weather<|content_invoke_tool_json|>"
+            '{"name":"weather","args":{"city":"NY"}}<|end_message|>'
+        )
+        args_by_index: dict = {}
+        for call in detector.parse_streaming_increment(source, self.tools).calls:
+            args_by_index[call.tool_index] = (
+                args_by_index.get(call.tool_index, "") + call.parameters
+            )
+        self.assertEqual(sorted(args_by_index), [0, 1])
+        self.assertEqual(json.loads(args_by_index[0]), {"city": "SF"})
+        self.assertEqual(json.loads(args_by_index[1]), {"city": "NY"})
+
     def test_streaming_rejection_does_not_collide_tool_indices(self):
         """Bug regression: a rejected mid-stream call reset current_tool_id to
         -1, so the NEXT valid call re-announced as tool_index 0 — colliding
