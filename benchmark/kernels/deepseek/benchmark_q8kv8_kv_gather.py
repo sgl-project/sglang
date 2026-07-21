@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Microbenchmark: Q8KV8 sparse-prefill KV gather overhaul (PR3 lever).
+"""Microbenchmark: Q8KV8 sparse-prefill KV gather overhaul.
 
 Compares the legacy gather (``gather_dequant_requant_fp8_paged_legacy``:
 fresh ``torch.zeros`` destination + one program per (token, 128-elem
@@ -8,8 +8,8 @@ no pre-zeroing needed, fused pad-row zero-fill, TOKENS_PER_PROG tokens
 per program with 16B-vectorized access), in three flavors:
 
     legacy      torch.zeros alloc + legacy kernel          (baseline)
-    new_alloc   torch.empty alloc + vectorized kernel      (lever 2 only)
-    new_cached  persistent grow-only buffer + vec kernel   (levers 1 + 2,
+    new_alloc   torch.empty alloc + vectorized kernel      (vectorized copy only)
+    new_cached  persistent grow-only buffer + vec kernel   (changes 1 + 2,
                                                             = production path)
 
 For each scenario it checks BIT-EXACT equality of the fp8 output bytes
@@ -28,7 +28,7 @@ chunk that a scenario represents.  The GLM-5.2 il=64k profile point
 (s_q=4096, kv_len=65536) row.
 
 Usage (single GPU, < 2 min):
-    python scripts/pr3_gather_microbench.py [--device cuda:0]
+    python benchmark/kernels/deepseek/benchmark_q8kv8_kv_gather.py [--device cuda:0]
         [--iters 200] [--warmup 20]
 
 Also runs correctness-only edge cases: ragged tail (kv_len % 4 != 0),
@@ -44,7 +44,7 @@ from pathlib import Path
 
 import torch
 
-_REPO_ROOT = Path(__file__).resolve().parent.parent
+_REPO_ROOT = Path(__file__).resolve().parents[3]
 _MOD_PATH = _REPO_ROOT / "python/sglang/kernels/ops/attention/dsa/dequant_k_cache.py"
 
 # Import the module straight from its file so the benchmark stays

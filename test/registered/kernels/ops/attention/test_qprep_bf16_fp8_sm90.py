@@ -1,6 +1,6 @@
 """Tests for the SM90 Q8KV8 born-fp8 q-prep JIT kernel.
 
-Gates (mirroring scripts/pr3_qprep_microbench.py conventions):
+Gates (mirroring benchmark/kernels/deepseek/benchmark_q8kv8_q_prep.py conventions):
   (a) vs the Triton absorbed_bmm_concat_cast_q_fp8 "two_dot" variant with
       atol/rtol=2e-2 on the fp32 view (the accumulation order matches, so the
       output is empirically bitwise identical on SM90, but only the tolerance

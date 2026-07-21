@@ -30,7 +30,7 @@ K = qk_nope_head_dim differs per model):
              per-rank full heads; K=192 exercises the kernel's split-K path)
     DS-V3.2: heads = 128, K = 128  (power-of-2 K, preload-once fast path)
 
-Metric conventions (per repo rule):
+Metric conventions:
     * time is reported in microseconds per call (us/call) — LOWER = FASTER.
     * bandwidth is analytic-bytes / time in GB/s — HIGHER = BETTER.
     * "speedup x" = old_time / new_time — >1.0 means the NEW path is faster.
@@ -43,11 +43,11 @@ Correctness:
       dequantized |diff|, and which path lands closer to an fp64 reference.
 
 Usage (single GPU):
-    python scripts/pr3_qprep_microbench.py                # both model shapes
-    python scripts/pr3_qprep_microbench.py --tokens 8192 --iters 300
-    python scripts/pr3_qprep_microbench.py --variants two_dot,pad
-    python scripts/pr3_qprep_microbench.py --sweep        # + tile/warp sweep
-    python scripts/pr3_qprep_microbench.py --rounding-study
+    python benchmark/kernels/deepseek/benchmark_q8kv8_q_prep.py                # both model shapes
+    python benchmark/kernels/deepseek/benchmark_q8kv8_q_prep.py --tokens 8192 --iters 300
+    python benchmark/kernels/deepseek/benchmark_q8kv8_q_prep.py --variants two_dot,pad
+    python benchmark/kernels/deepseek/benchmark_q8kv8_q_prep.py --sweep        # + tile/warp sweep
+    python benchmark/kernels/deepseek/benchmark_q8kv8_q_prep.py --rounding-study
 """
 
 import argparse
@@ -234,7 +234,7 @@ def check_variant(ctx, **new_kwargs):
 
 
 def rounding_study(device, seed):
-    """Task-2a quantification: fp8(bf16(x)) double round vs fp8(x) single round.
+    """sweep summary: fp8(bf16(x)) double round vs fp8(x) single round.
 
     (Informational only — the born-fp8 kernel deliberately keeps the
     fp32->bf16->fp8 double round to match the default path's rounding stages.)
