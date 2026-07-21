@@ -43,6 +43,7 @@ if TYPE_CHECKING:
 
 try:
     from aiter import (
+        flash_attn_varlen_fp8_pertensor_func,
         flash_attn_varlen_func,
         get_mla_metadata_info_v1,
         get_mla_metadata_v1,
@@ -2333,6 +2334,55 @@ class AiterAttnBackend(AttentionBackend):
                     window_size,
                     sinks,
                 )
+
+            if (
+                get_bool_env_var("SGLANG_AITER_FP8_CONTIG_PREFILL", "false")
+                and forward_batch.forward_mode.is_extend()
+                and not forward_batch.forward_mode.is_draft_extend_v2()
+                and forward_batch.extend_prefix_lens_cpu is not None
+                and not any(forward_batch.extend_prefix_lens_cpu)
+                and window_size == (-1, -1)
+                and sinks is None
+                and self.logits_soft_cap == 0.0
+                and layer.head_dim == 256
+                and layer.v_head_dim == 256
+            ):
+                q_c = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+                k_c = k.contiguous().view(-1, layer.tp_k_head_num, layer.head_dim)
+                v_c = v.contiguous().view(-1, layer.tp_v_head_num, layer.v_head_dim)
+                if self.kv_cache_dtype == fp8_dtype:
+                    fp8_q_descale = (
+                        layer.k_scale if layer.k_scale is not None else self.k_scale
+                    )
+                    o = flash_attn_varlen_fp8_pertensor_func(
+                        q_c.to(fp8_dtype),
+                        k_c.to(fp8_dtype),
+                        v_c.to(fp8_dtype),
+                        fp8_q_descale,
+                        k_descale,
+                        v_descale,
+                        self.qo_indptr[:bs0],
+                        self.qo_indptr[:bs0],
+                        self.forward_metadata.max_q_len,
+                        self.forward_metadata.max_q_len,
+                        softmax_scale=layer.scaling,
+                        causal=True,
+                    )
+                else:
+                    o = flash_attn_varlen_func(
+                        q_c,
+                        k_c,
+                        v_c,
+                        self.qo_indptr[:bs0],
+                        self.qo_indptr[:bs0],
+                        self.forward_metadata.max_q_len,
+                        self.forward_metadata.max_q_len,
+                        softmax_scale=layer.scaling,
+                        causal=True,
+                    )
+                if o.dtype != self.input_dtype:
+                    o = o.to(self.input_dtype)
+                return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
             # NHD path — original aiter paged batch_prefill.
             # TODO kkhuang-amd need to remove it when mha_batch_prefill_func support fp8-kv
