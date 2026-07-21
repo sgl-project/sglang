@@ -254,6 +254,10 @@ export const config = {
       ],
     },
     {
+      // GB200 4x192GB: the 1M-token SWA+sconv pools do not fit at TP=4 (weights are
+      // ~148 GB/GPU); without a context cap the pools starve and high-concurrency
+      // throughput plateaus from retraction (measured: interactivity flat cc64->cc128).
+      // Verified e2e on 4xGB200 (GSM8K 5-shot 0.925, 8k/1k sweep cc1-128).
       match: { hw: "gb200", variant: "default", quant: "nvfp4", strategy: "balanced", nodes: "single" },
       env: [
         "SGLANG_ENABLE_UNIFIED_RADIX_TREE=1",
@@ -272,6 +276,7 @@ export const config = {
         "--mem-fraction-static 0.85",
         "--swa-full-tokens-ratio 0.1",
         "--mamba-full-memory-ratio 0.1",
+        "--context-length 131072",
         "--enable-multimodal",
         "--reasoning-parser inkling",
         "--tool-call-parser inkling",
@@ -585,6 +590,12 @@ export const config = {
       ],
     },
     {
+      // GB200 4x192GB MTP: mem-fraction 0.75 cannot boot — the 592 GB checkpoint
+      // (~148 GB/GPU) must fit inside the static budget, and 0.75 x 184 GB leaves the
+      // hybrid (mamba/sconv) cache with a negative allocation
+      // ("Not enough GPU memory for hybrid state cache", max_mamba_cache_size < 0 at
+      // 0.70/0.75). 0.85 + a context cap boots and serves (GSM8K 5-shot 0.940,
+      // 8k/1k sweep cc1-128 verified on 4xGB200).
       match: { hw: "gb200", variant: "default", quant: "nvfp4", strategy: "mtp", nodes: "single" },
       env: [
         "SGLANG_ENABLE_UNIFIED_RADIX_TREE=1",
@@ -600,9 +611,10 @@ export const config = {
         "--moe-runner-backend flashinfer_trtllm_routed",
         "--enable-torch-symm-mem",
         "--mamba-radix-cache-strategy extra_buffer",
-        "--mem-fraction-static 0.75",
+        "--mem-fraction-static 0.85",
         "--swa-full-tokens-ratio 0.1",
         "--mamba-full-memory-ratio 0.1",
+        "--context-length 65536",
         "--enable-multimodal",
         "--reasoning-parser inkling",
         "--tool-call-parser inkling",
