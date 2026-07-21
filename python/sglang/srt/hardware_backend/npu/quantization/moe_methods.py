@@ -173,16 +173,6 @@ class NPUMXFP4W4A8MoEMethod(_NPUMoEMethodBase):
         super().__init__(quant_config=None)
         self.matmul = GroupedMatmul()
 
-    @staticmethod
-    def _normalize_scale_layout(scale: torch.Tensor) -> torch.Tensor:
-        """Convert [..., K/32] UE8M0 scales to [..., K/64, 2]."""
-        if scale.shape[-1] % 2 != 0:
-            raise ValueError(
-                "W4A8 MXFP scale's last dimension must be divisible by 2, "
-                f"got {scale.shape[-1]}"
-            )
-        return scale.reshape(*scale.shape[:-1], scale.shape[-1] // 2, 2)
-
     def process_weights_after_loading(
         self, layer: torch.nn.Module, weight_prefix: str
     ) -> None:
@@ -192,33 +182,26 @@ class NPUMXFP4W4A8MoEMethod(_NPUMoEMethodBase):
         if fp4_dtype is None:
             raise RuntimeError("NPU W4A8 MXFP MoE requires float4 support.")
 
-        # ModelSlim stores two FP4 values per uint8 along the reduction
-        # dimension. Cast the packed tensor to FRACTAL_NZ and expose the
-        # pre-transposed [E, K/2, N] layout expected by grouped matmul.
-        weight = getattr(layer, f"{weight_prefix}_weight").data
-        if not weight.is_npu:
-            weight = weight.to(f"npu:{torch.npu.current_device()}")
-        weight = npu_format_cast(
-            weight,
+        weight = getattr(layer, f"{weight_prefix}_weight")
+        weight.data = npu_format_cast(
+            weight.data,
             customize_dtype=torch.float8_e4m3fn,
             input_dtype=fp4_dtype,
         ).transpose(-1, -2)
-        setattr(
-            layer,
-            f"{weight_prefix}_weight",
-            torch.nn.Parameter(weight, requires_grad=False),
-        )
 
-        # [E, N, K/32] -> [E, K/64, N, 2].
-        scale = getattr(layer, f"{weight_prefix}_weight_scale").data
-        if not scale.is_npu:
-            scale = scale.to(f"npu:{torch.npu.current_device()}")
-        scale = self._normalize_scale_layout(scale).transpose(1, 2)
-        setattr(
-            layer,
-            f"{weight_prefix}_weight_scale",
-            torch.nn.Parameter(scale, requires_grad=False),
+        weight_scale = getattr(layer, f"{weight_prefix}_weight_scale")
+        scale = weight_scale.data.transpose(1, 2)
+        scale = (
+            scale.transpose(-1, -2)
+            .reshape(
+                scale.shape[0],
+                scale.shape[2],
+                scale.shape[1] // 2,
+                2,
+            )
+            .transpose(1, 2)
         )
+        weight_scale.data = scale
 
         # The refactored Ascend dispatchers currently support BF16 and INT8.
         # Keep dispatch in BF16 and quantize to MXFP8 immediately before GMM.
@@ -245,10 +228,16 @@ class NPUMXFP4W4A8MoEMethod(_NPUMoEMethodBase):
         if pertoken_scale is None:
             hidden_states, pertoken_scale = torch.ops.npu.npu_dynamic_mx_quant(
                 hidden_states,
+                axis=1,
+                round_mode="rint",
                 dst_type=torch.float8_e4m3fn,
+                block_size=32,
+                scale_alg=None,
             )
-        elif pertoken_scale.dim() == 2:
-            pertoken_scale = self._normalize_scale_layout(pertoken_scale)
+        elif pertoken_scale is not None:
+            pertoken_scale = pertoken_scale.reshape(
+                hidden_states.shape[0], hidden_states.shape[1] // 64, 2
+            )
 
         return self.matmul.forward(
             quant_info,
