@@ -467,27 +467,17 @@ std::tuple<at::Tensor, at::Tensor> rotary_embedding_cpu(
 // sin: [num_tokens, head_size]
 std::tuple<at::Tensor, at::Tensor>
 apply_rotary_pos_emb_cpu(at::Tensor& query, at::Tensor& key, at::Tensor& cos, at::Tensor& sin) {
-  CHECK_LAST_DIM_CONTIGUOUS_INPUT(query);
-  CHECK_LAST_DIM_CONTIGUOUS_INPUT(key);
-  CHECK_INPUT(cos);
-  CHECK_INPUT(sin);
   CHECK_DIM(3, query);
-  CHECK_DIM(3, key);
-  CHECK_DIM(2, cos);
-  CHECK_DIM(2, sin);
   const auto input_dtype = query.scalar_type();
   int64_t num_tokens = query.size(0);
-  CHECK_EQ(num_tokens, key.size(0));
-  CHECK_EQ(num_tokens, cos.size(0));
-  CHECK_EQ(num_tokens, sin.size(0));
   int64_t num_heads = query.size(1);
-  CHECK_EQ(num_heads, key.size(1));
   int64_t head_size = query.size(2);
-  CHECK_EQ(head_size, key.size(2));
-  CHECK_EQ(head_size, cos.size(1));
-  CHECK_EQ(head_size, sin.size(1));
-  TORCH_CHECK(input_dtype == key.scalar_type(), "query and key must have the same data type");
-  TORCH_CHECK(cos.scalar_type() == sin.scalar_type(), "cos and sin must have the same data type");
+
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(query);
+  CHECK_INPUT_SHAPE_DTYPE<true>(key, {num_tokens, num_heads, head_size}, input_dtype);
+  CHECK_INPUT_SHAPE_DTYPE<false>(cos, {num_tokens, head_size}, cos.scalar_type());
+  CHECK_INPUT_SHAPE_DTYPE<false>(sin, {num_tokens, head_size}, sin.scalar_type());
+  CHECK_EQ(cos.scalar_type(), sin.scalar_type());
   TORCH_CHECK(head_size % 2 == 0, "head_size must be even");
 
   const RopeParams p{query, key, head_size, head_size};
