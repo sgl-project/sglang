@@ -2021,6 +2021,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             min_completed_tokens = int(packed[0].item())
             for i, p in enumerate(sidecar_pools, start=1):
                 hit_pages[p] = int(packed[i].item())
+        logger.debug("!! check_prefetch_progress hit_pages: %s, min_completed_tokens: %d, sidecar_pools: %s, completed_tokens: %d",
+            hit_pages, min_completed_tokens, sidecar_pools, completed_tokens)
 
         fetched_key = prefetch_key[:min_completed_tokens]
         insert_result = self._insert_helper_host(
