@@ -15,7 +15,8 @@ import torch
 
 from sglang.srt.layers.logprob_processor import (
     InputLogprobProcessor,
-    compute_row_logsumexp,
+    _logits_topk,
+    compute_row_log_normalizer,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -216,20 +217,33 @@ class TestFastInputLogprobs(CustomTestCase):
                         )
             pt += pruned_len
 
-    def test_row_logsumexp_sliced_matches_reference(self):
+    def test_shift_invariant_large_offset(self):
+        # Regression: a large common fp32 offset must not round the log-sum
+        # term away. Uniform logits at 1e8 have true logprob -log(vocab).
+        for device in ("cpu", "cuda") if torch.cuda.is_available() else ("cpu",):
+            logits = torch.full((4, 1000), 1e8, dtype=torch.float32, device=device)
+            row_max, row_log_sum = compute_row_log_normalizer(logits)
+            logprob = (logits[:, 0].float() - row_max) - row_log_sum
+            expected = -torch.log(torch.tensor(1000.0))
+            torch.testing.assert_close(
+                logprob.cpu(), expected.expand(4), rtol=1e-5, atol=1e-5
+            )
+
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+    def test_fast_path_run_to_run_deterministic(self):
+        from sglang.srt.layers.logsumexp import row_logsumexp
+
         torch.manual_seed(0)
-        for rows in (0, 1, 7):
-            # Vocab deliberately not a multiple of the slice size.
-            logits = torch.randn(rows, 1000, dtype=torch.bfloat16) * 8
-            ref = torch.logsumexp(logits.double(), dim=-1).float()
-            got = compute_row_logsumexp(logits, vocab_slice_size=64)
-            self.assertEqual(got.dtype, torch.float32)
-            torch.testing.assert_close(ref, got, rtol=1e-3, atol=1e-3)
+        logits = torch.randn(512, 151936, dtype=torch.bfloat16, device="cuda")
+        m1, l1 = row_logsumexp(logits)
+        m2, l2 = row_logsumexp(logits)
+        self.assertTrue(torch.equal(m1, m2) and torch.equal(l1, l2))
+        v1, i1 = _logits_topk(logits, 5)
+        v2, i2 = _logits_topk(logits, 5)
+        self.assertTrue(torch.equal(v1, v2) and torch.equal(i1, i2))
 
     @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
     def test_logits_topk_matches_torch(self):
-        from sglang.srt.layers.logprob_processor import _logits_topk
-
         torch.manual_seed(0)
         # fp32 randn is tie-free w.h.p., so indices must match torch exactly.
         logits = torch.randn(64, 151936, device="cuda")
@@ -255,26 +269,39 @@ class TestFastInputLogprobs(CustomTestCase):
         for rows, cols in ((0, 128), (3, 0), (1, 1), (7, 1000), (64, 151936)):
             for dtype in (torch.bfloat16, torch.float32):
                 logits = torch.randn(rows, cols, dtype=dtype, device="cuda") * 8
-                ref = torch.logsumexp(logits.double(), dim=-1).float()
-                got = row_logsumexp(logits)
-                self.assertEqual(got.dtype, torch.float32)
+                got_max, got_log_sum = row_logsumexp(logits)
+                self.assertEqual(got_max.dtype, torch.float32)
+                self.assertEqual(got_log_sum.dtype, torch.float32)
+                if not cols:
+                    self.assertTrue((got_max == float("-inf")).all())
+                    self.assertTrue((got_log_sum == 0).all())
+                    continue
+                self.assertTrue(torch.equal(got_max, logits.float().amax(-1)))
+                ref_log_sum = torch.logsumexp(
+                    logits.double() - got_max.double()[:, None], dim=-1
+                ).float()
                 torch.testing.assert_close(
-                    ref, got, rtol=1e-4, atol=1e-4, msg=f"{rows}x{cols} {dtype}"
+                    ref_log_sum,
+                    got_log_sum,
+                    rtol=1e-4,
+                    atol=1e-4,
+                    msg=f"{rows}x{cols} {dtype}",
                 )
         # Rows dominated by -inf (masked-vocab shapes) must stay nan-free.
         logits = torch.full((4, 1000), float("-inf"), device="cuda")
         logits[1, 3] = 2.5
         logits[2, :] = torch.randn(1000, device="cuda")
-        got = row_logsumexp(logits.bfloat16())
-        self.assertEqual(got[0].item(), float("-inf"))
-        self.assertAlmostEqual(got[1].item(), 2.5, delta=1e-2)
-        self.assertFalse(got.isnan().any().item())
+        got_max, got_log_sum = row_logsumexp(logits.bfloat16())
+        self.assertEqual(got_max[0].item(), float("-inf"))
+        self.assertAlmostEqual((got_max[1] + got_log_sum[1]).item(), 2.5, delta=1e-2)
+        self.assertFalse(got_max.isnan().any() or got_log_sum.isnan().any())
         # Non-contiguous input (sliced rows) exercises the stride args.
         base = torch.randn(8, 512, device="cuda", dtype=torch.bfloat16)
         view = base[::2]
+        got_max, got_log_sum = row_logsumexp(view)
         torch.testing.assert_close(
             torch.logsumexp(view.double(), dim=-1).float(),
-            row_logsumexp(view),
+            got_max + got_log_sum,
             rtol=1e-4,
             atol=1e-4,
         )
