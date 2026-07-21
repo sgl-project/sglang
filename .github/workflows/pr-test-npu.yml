@@ -423,8 +423,8 @@ jobs:
             test_case: test/registered/ascend/performance/qwen3_6_27b/test_npu_qwen3_6_27b_w8a8_1p_in64k_out1k_50ms.py
             test_type: 'perf'
           # deepseek_v4_flash performance tests
-          - name: deepseek_v4_flash_w8a8_1p_in64k_out1k_50ms
-            runner: linux-aarch64-a3-8
+          - name: deepseek_v4_flash_w8a8_8p_in8k_out1k_50ms
+            runner: linux-aarch64-a3-16
             test_case: test/registered/ascend/performance/deepseek_v4_flash/test_npu_deepseek_v4_flash_w8a8_8p_in8k_out1k_50ms.py
             test_type: 'perf'
     uses: ./.github/workflows/nightly-test-npu-e2e-single-node.yml
