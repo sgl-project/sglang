@@ -235,9 +235,7 @@ class CausalVaeDecodingStage(DecodingStage):
         *,
         first_chunk: bool,
     ) -> torch.Tensor:
-        decoder = self._get_or_create_taehv_streaming_decoder(
-            decode_state, server_args
-        )
+        decoder = self._get_or_create_taehv_streaming_decoder(decode_state, server_args)
         vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
         latents = latents.to(get_local_torch_device(), dtype=vae_dtype)
 
@@ -276,9 +274,7 @@ class CausalVaeDecodingStage(DecodingStage):
 
         frames_ntchw = all_frames[:, :take].contiguous()
         remaining = all_frames[:, take:].contiguous()
-        decode_state.taehv_output_queue = (
-            [remaining] if remaining.shape[1] > 0 else []
-        )
+        decode_state.taehv_output_queue = [remaining] if remaining.shape[1] > 0 else []
         return frames_ntchw.permute(0, 2, 1, 3, 4).contiguous()
 
     @torch.no_grad()
