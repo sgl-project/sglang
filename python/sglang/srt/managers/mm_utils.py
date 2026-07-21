@@ -664,6 +664,8 @@ def build_local_pixel_values_for_dp_encoder(
         torch.empty((0, 0), dtype=dtype, device=fallback_device),
         owner_ranks,
     )
+
+
 def _acknowledge_deferred_cuda_ipc_cache_hits(
     items: List[MultimodalDataItem],
 ) -> None:
