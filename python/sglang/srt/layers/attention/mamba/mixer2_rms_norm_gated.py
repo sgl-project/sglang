@@ -2,24 +2,18 @@ from typing import Union
 
 import torch
 
+from sglang.kernels.ops.attention.fla.layernorm_gated import rms_norm_gated
 from sglang.srt.distributed.communication_op import (
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
-from sglang.srt.distributed.parallel_state import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-)
-from sglang.srt.layers.attention.fla.layernorm_gated import rms_norm_gated
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_reduce,
-    get_attention_tp_group,
-    get_attention_tp_rank,
-    get_attention_tp_size,
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.model_loader.weight_utils import sharded_weight_loader
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.common import set_weight_attrs
 
 
@@ -34,11 +28,11 @@ class Mixer2RMSNormGated(MultiPlatformOp):
         super().__init__()
         self.use_attn_tp_group = is_dp_attention_enabled()
         if self.use_attn_tp_group:
-            self.tp_size = get_attention_tp_size()
-            self.tp_rank = get_attention_tp_rank()
+            self.tp_size = get_parallel().attn_tp_size
+            self.tp_rank = get_parallel().attn_tp_rank
         else:
-            self.tp_size = get_tensor_model_parallel_world_size()
-            self.tp_rank = get_tensor_model_parallel_rank()
+            self.tp_size = get_parallel().tp_size
+            self.tp_rank = get_parallel().tp_rank
         self.full_hidden_size = full_hidden_size
         self.group_size = full_hidden_size // full_n_groups
         self.per_rank_hidden_size = full_hidden_size // self.tp_size
@@ -97,7 +91,7 @@ class Mixer2RMSNormGated(MultiPlatformOp):
                 # To handle the general case, redundantly apply the variance
                 if self.use_attn_tp_group:
                     parts = [torch.empty_like(x) for _ in range(self.tp_size)]
-                    get_attention_tp_group().all_gather(x, output_tensor_list=parts)
+                    get_parallel().attn_tp_group.all_gather(x, output_tensor_list=parts)
                     x = torch.cat(parts, dim=-1)
                 else:
                     x = tensor_model_parallel_all_gather(x, -1)

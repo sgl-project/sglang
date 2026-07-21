@@ -24,17 +24,15 @@ from transformers import (
     PreTrainedModel,
 )
 
-from sglang.srt.distributed import (
-    get_pp_group,
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-)
-from sglang.srt.layers.gemma4_fused_ops import (
+from sglang.kernels.ops.layernorm.gemma4_fused_ops import (
     gemma4_fused_routing,
     gemma_dual_rmsnorm_residual_scalar,
     gemma_qkv_rmsnorm,
     gemma_rmsnorm_residual_scalar,
     gemma_routing_post_topk,
+)
+from sglang.srt.distributed import (
+    get_pp_group,
 )
 from sglang.srt.layers.layernorm import Gemma4RMSNorm, RMSNorm
 from sglang.srt.layers.linear import (
@@ -60,7 +58,7 @@ from sglang.srt.models.gemma3_causal import Gemma3MLP, Gemma3TextScaledWordEmbed
 from sglang.srt.models.utils import (
     create_fused_set_kv_buffer_arg,
 )
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import add_prefix, make_layers
 
 logger = logging.getLogger(__name__)
@@ -210,7 +208,7 @@ class Gemma4MoE(nn.Module):
         self.layer_id = layer_id
         self.hidden_size = hidden_size
         self.num_experts = config.num_experts
-        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_size = get_parallel().tp_size
 
         # Per-expert output scale folded into routing weights so that
         # MoE's fused kernel computes: Σ_e (expert_e * w_e * scale_e)
@@ -256,8 +254,7 @@ class Gemma4MoE(nn.Module):
         experts_type = get_moe_impl_class(quant_config)
 
         self.experts = experts_type(
-            num_experts=config.num_experts
-            + get_global_server_args().ep_num_redundant_experts,
+            num_experts=config.num_experts + get_server_args().ep_num_redundant_experts,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
             layer_id=layer_id,
@@ -291,7 +288,7 @@ class Gemma4Attention(nn.Module):
 
         self.layer_id = layer_id
         self.config = config
-        tp_size = get_tensor_model_parallel_world_size()
+        tp_size = get_parallel().tp_size
 
         layer_type = config.layer_types[layer_id]
         self.sliding_window = (
@@ -790,7 +787,7 @@ class Gemma4TextModel(PreTrainedModel):
         # combination until the runner becomes schema-aware; users can run
         # PP + PLE eagerly with --disable-cuda-graph.
         if self.pp_group.world_size > 1 and self.hidden_size_per_layer_input > 0:
-            sa = get_global_server_args()
+            sa = get_server_args()
             if sa is not None and not sa.disable_cuda_graph:
                 raise ValueError(
                     "Pipeline parallelism is currently incompatible with "
@@ -1127,6 +1124,14 @@ class Gemma4ForCausalLM(PreTrainedModel):
     def dtype(self) -> torch.dtype:
         return next(self.parameters()).dtype
 
+    def set_dflash_layers_to_capture(self, layer_ids: list[int]):
+        if layer_ids is None:
+            raise ValueError(
+                "DFLASH requires explicit layer_ids for aux hidden capture."
+            )
+        self.capture_aux_hidden_states = True
+        self.model.layers_to_capture = [val + 1 for val in layer_ids]
+
     @torch.no_grad()
     def forward(
         self,
@@ -1371,10 +1376,10 @@ class Gemma4ForCausalLM(PreTrainedModel):
         VocabParallelEmbedding (sharded). This method extracts the correct
         shard so the weights can be shared.
         """
-        tp_size = get_tensor_model_parallel_world_size()
+        tp_size = get_parallel().tp_size
         if tp_size <= 1:
             return weight
-        tp_rank = get_tensor_model_parallel_rank()
+        tp_rank = get_parallel().tp_rank
         shard_size = (weight.shape[0] + tp_size - 1) // tp_size
         return weight[tp_rank * shard_size : (tp_rank + 1) * shard_size]
 

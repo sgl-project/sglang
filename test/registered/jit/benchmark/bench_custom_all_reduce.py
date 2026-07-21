@@ -1,18 +1,3 @@
-"""Benchmark JIT custom all-reduce (v2) vs NCCL, AOT custom-AR (v1), and
-FlashInfer trtllm allreduce_fusion.
-
-Usage::
-
-    # Benchmark on every supported world size (2..8 GPUs):
-    python benchmark/bench_custom_all_reduce.py
-    # Pick a specific world size (or comma-separated list):
-    python benchmark/bench_custom_all_reduce.py --num-gpu 4
-    python benchmark/bench_custom_all_reduce.py --num-gpu 2,4,8
-
-The script self-relaunches under ``torchrun --nproc_per_node=N`` for each N in
-``num_gpus``; results are printed on rank 0 of every run.
-"""
-
 from __future__ import annotations
 
 import atexit
@@ -29,13 +14,15 @@ from sglang.jit_kernel.benchmark import marker
 from sglang.jit_kernel.benchmark.utils import get_benchmark_range, multigpu_bench_main
 from sglang.jit_kernel.mp import register_comm_cleanup
 from sglang.jit_kernel.utils import cache_once, is_arch_support_pdl
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(
     est_time=120,
-    suite="base-b-kernel-benchmark-1-gpu-large",
+    stage="base-b-kernel-benchmark",
+    runner_config="1-gpu-large",
     disabled="requires multi-GPU, self-skips in CI",
 )
+register_amd_ci(est_time=120, stage="jit-kernel-benchmark", runner_config="amd")
 
 
 # ---------------------------------------------------------------------------
@@ -43,35 +30,19 @@ register_cuda_ci(
 # ---------------------------------------------------------------------------
 
 DTYPE = torch.bfloat16
-# torch.dtype.itemsize exists only on newer torch; element_size() is portable.
-DTYPE_ITEMSIZE = torch.tensor([], dtype=DTYPE).element_size()
-MESSAGE_SIZES_BYTES = [
-    4 * 1024,  # 4K
-    16 * 1024,  # 16K
-    64 * 1024,  # 64K
-    128 * 1024,  # 128K
-    3 * 64 * 1024,  # 192K
-    4 * 64 * 1024,  # 256K
-    3 * 128 * 1024,  # 384K
-    4 * 128 * 1024,  # 512K
-    5 * 128 * 1024,  # 640K
-    6 * 128 * 1024,  # 768K
-    7 * 128 * 1024,  # 896K
-    1 * 1024 * 1024,  # 1M
-    2 * 1024 * 1024,  # 2M
-    3 * 1024 * 1024,  # 3M
-    4 * 1024 * 1024,  # 4M
-    8 * 1024 * 1024,  # 8M
-    16 * 1024 * 1024,  # 16M
-    32 * 1024 * 1024,  # 32M
-]
+DTYPE_ITEMSIZE = DTYPE.itemsize
+MESSAGE_SIZES_KB = [2**x for x in range(2, 17)]
+MESSAGE_SIZES_KB += [192, 384, 640, 768, 896, 1536, 3072]
+MESSAGE_SIZES_KB.sort()
 WORLD_SIZES = list(range(2, 9))
-MAX_BYTES = max(MESSAGE_SIZES_BYTES)
+MAX_BYTES = max(MESSAGE_SIZES_KB) * 1024
 # trtllm allreduce_fusion only supports these world sizes.
 FI_SUPPORTED_WORLD_SIZES = (2, 4, 8)
 # AOT custom_all_reduce (v1) only supports these world sizes.
 AOT_SUPPORTED_WORLD_SIZES = (2, 4, 6, 8)
-PROVIDERS = ["nccl", "aot", "jit", "fi"]
+# jit-eager times the naive-loop dispatch (eager heuristics); jit-graph
+# captures the calls in a CUDA graph (graph heuristics + pointer table).
+PROVIDERS = ["nccl", "aot", "jit-eager", "jit-graph", "fi"]
 WORLD_SIZES = get_benchmark_range(WORLD_SIZES, [2, 4, 8])
 
 # ---------------------------------------------------------------------------
@@ -91,8 +62,6 @@ def _init_cpu_group() -> dist.ProcessGroup:
         backend="nccl",
     )
     atexit.register(dist.destroy_process_group)
-    # Quieter benchmark output.
-    logging.disable(logging.INFO)
     torch.cuda.set_stream(torch.cuda.Stream())
     return coord.cpu_group
 
@@ -100,9 +69,13 @@ def _init_cpu_group() -> dist.ProcessGroup:
 @cache_once
 def _init_nccl_group() -> dist.ProcessGroup:
     _init_cpu_group()
-    coord = ps._WORLD
-    assert coord is not None and coord.device_group is not None
-    return coord.device_group
+    local_rank = int(os.environ["LOCAL_RANK"])
+    device_group = torch.distributed.new_group(
+        backend="nccl",
+        device_id=torch.device(f"cuda:{local_rank}"),
+    )
+    assert isinstance(device_group, dist.ProcessGroup)
+    return device_group
 
 
 # ---------------------------------------------------------------------------
@@ -132,11 +105,13 @@ class JITAllReduceBackend:
         )
 
         device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
-        self.comm = CustomAllReduceV2(
-            _init_cpu_group(), device, max_pull_size=MAX_BYTES
-        )
+        # tuned workspace sizes, capped at the sweep maximum
+        self.comm = CustomAllReduceV2(_init_cpu_group(), device, max_size=MAX_BYTES)
         if self.comm.disabled:
             raise RuntimeError("JIT CustomAllReduceV2 is disabled on this system")
+        # keep the whole sweep on the custom-AR path: the tuned config would
+        # otherwise send the largest sizes back to NCCL
+        self.comm.uncap_pull_thresholds()
         register_comm_cleanup(self.comm)
 
     def graph_context(self):
@@ -176,7 +151,7 @@ class FlashInferAllReduceBackend:
         world_size = dist.get_world_size(group=group)
         # Use the smallest message size as the inner hidden dim, so any
         # message in the sweep is an integer multiple of it.
-        hidden_dim = min(MESSAGE_SIZES_BYTES) // DTYPE_ITEMSIZE
+        hidden_dim = 1024 * min(MESSAGE_SIZES_KB) // DTYPE_ITEMSIZE
         num_tokens = MAX_BYTES // (hidden_dim * DTYPE_ITEMSIZE)
         self._comm = comm
         self._hidden_dim = hidden_dim
@@ -224,7 +199,8 @@ def _init_fi_backend() -> FlashInferAllReduceBackend:
 
 BACKEND_FACTORY = {
     "nccl": _init_nccl_backend,
-    "jit": _init_jit_backend,
+    "jit-eager": _init_jit_backend,
+    "jit-graph": _init_jit_backend,
     "aot": _init_aot_backend,
     "fi": _init_fi_backend,
 }
@@ -235,6 +211,10 @@ def _init_all_backends() -> None:
     """Pre-build every supported backend before any timed iteration so JIT
     compilation / IPC setup don't bleed into the first measured size.
     """
+    local_rank = int(os.environ["LOCAL_RANK"])
+    if local_rank == 0:  # NOTE: log some verbose info on initialization
+        logging.basicConfig(level=logging.INFO)
+
     world_size = dist.get_world_size(_init_cpu_group())
     factories = dict(BACKEND_FACTORY)
     if world_size not in AOT_SUPPORTED_WORLD_SIZES:
@@ -244,15 +224,18 @@ def _init_all_backends() -> None:
     for fn in factories.values():
         fn()
 
+    # reset level to warning
+    logging.getLogger().setLevel(logging.WARNING)
+
 
 # ---------------------------------------------------------------------------
 # Benchmark
 # ---------------------------------------------------------------------------
 
 
-@marker.parametrize("message_bytes", MESSAGE_SIZES_BYTES)
+@marker.parametrize("message_KB", MESSAGE_SIZES_KB)
 @marker.benchmark("provider", PROVIDERS)
-def benchmark(message_bytes: int, provider: str):
+def benchmark(message_KB: int, provider: str):
     cpu_group = _init_cpu_group()
     gpu_group = _init_nccl_group()
     world_size = dist.get_world_size(cpu_group)
@@ -267,15 +250,18 @@ def benchmark(message_bytes: int, provider: str):
         )
     _init_all_backends()
     backend = BACKEND_FACTORY[provider]()
+    message_bytes = message_KB * 1024
     numel = message_bytes // DTYPE_ITEMSIZE
-    device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
+    device_id = int(os.environ["LOCAL_RANK"])
+    device = torch.device(f"cuda:{device_id}")
     x = torch.randn(numel, dtype=DTYPE, device=device)
+    ctx_fn = backend.graph_context if not provider.endswith("eager") else None
     # Bandwidth-equivalent bytes moved by a ring all-reduce per rank.
     effective_bytes = int(x.nbytes * 2 * (world_size - 1) / world_size)
     return marker.do_bench(
         backend.all_reduce,
         input_args=(x,),
-        graph_context_fn=backend.graph_context,
+        graph_context_fn=ctx_fn,
         sync_multigpu_fn=lambda: dist.barrier(gpu_group),
         # all-reduce is in-place w.r.t. its argument; explicit footprint
         # captures the cross-GPU traffic instead.

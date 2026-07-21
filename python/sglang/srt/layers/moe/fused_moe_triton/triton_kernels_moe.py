@@ -17,10 +17,17 @@ from triton_kernels.matmul_ogs import (
     ScatterIndx,
     matmul_ogs,
 )
+from triton_kernels.matmul_ogs_details.opt_flags import update_opt_flags_constraints
 from triton_kernels.numerics import InFlexData
 from triton_kernels.swiglu import swiglu_fn
+from triton_kernels.tensor import FP4
 
 from sglang.srt.utils import is_cuda
+from sglang.srt.utils.common import is_sm120_supported
+
+if is_sm120_supported():
+    # use the regular gather/scatter implementation for unsupported devices.
+    update_opt_flags_constraints({"is_persistent": False})
 
 if is_cuda():
     from sglang.jit_kernel.activation import gelu_and_mul, silu_and_mul
@@ -30,6 +37,26 @@ else:
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
     from sglang.srt.layers.moe.topk import TopKOutput
+
+
+def _assert_unsupported_quant_args(
+    use_fp8_w8a8: bool,
+    per_channel_quant: bool,
+    expert_map: Optional[torch.Tensor],
+    w1_scale: Optional[torch.Tensor],
+    w2_scale: Optional[torch.Tensor],
+    a1_scale: Optional[torch.Tensor],
+    a2_scale: Optional[torch.Tensor],
+    block_shape: Optional[list[int]],
+) -> None:
+    assert use_fp8_w8a8 is False, "use_fp8_w8a8 is not supported"
+    assert per_channel_quant is False, "per_channel_quant is not supported"
+    assert expert_map is None, "expert_map is not supported"
+    assert w1_scale is None, "w1_scale is not supported"
+    assert w2_scale is None, "w2_scale is not supported"
+    assert a1_scale is None, "a1_scale is not supported"
+    assert a2_scale is None, "a2_scale is not supported"
+    assert block_shape is None, "block_shape is not supported"
 
 
 def quantize(w, dtype, dev, **opt):
@@ -105,14 +132,16 @@ def triton_kernel_fused_experts(
     block_shape: Optional[list[int]] = None,
 ) -> torch.Tensor:
 
-    assert use_fp8_w8a8 is False, "use_fp8_w8a8 is not supported"
-    assert per_channel_quant is False, "per_channel_quant is not supported"
-    assert expert_map is None, "expert_map is not supported"
-    assert w1_scale is None, "w1_scale is not supported"
-    assert w2_scale is None, "w2_scale is not supported"
-    assert a1_scale is None, "a1_scale is not supported"
-    assert a2_scale is None, "a2_scale is not supported"
-    assert block_shape is None, "block_shape is not supported"
+    _assert_unsupported_quant_args(
+        use_fp8_w8a8,
+        per_channel_quant,
+        expert_map,
+        w1_scale,
+        w2_scale,
+        a1_scale,
+        a2_scale,
+        block_shape,
+    )
 
     # type check
     assert hidden_states.dtype == torch.bfloat16, "hidden_states must be bfloat16"
@@ -253,21 +282,24 @@ def triton_kernel_fused_experts_with_bias(
     gemm1_alpha: Optional[float] = None,
     gemm1_clamp_limit: Optional[float] = None,
 ) -> torch.Tensor:
-    assert use_fp8_w8a8 is False, "use_fp8_w8a8 is not supported"
-    assert per_channel_quant is False, "per_channel_quant is not supported"
-    assert expert_map is None, "expert_map is not supported"
-    assert w1_scale is None, "w1_scale is not supported"
-    assert w2_scale is None, "w2_scale is not supported"
-    assert a1_scale is None, "a1_scale is not supported"
-    assert a2_scale is None, "a2_scale is not supported"
-    assert block_shape is None, "block_shape is not supported"
+    _assert_unsupported_quant_args(
+        use_fp8_w8a8,
+        per_channel_quant,
+        expert_map,
+        w1_scale,
+        w2_scale,
+        a1_scale,
+        a2_scale,
+        block_shape,
+    )
 
     # type check
     assert hidden_states.dtype == torch.bfloat16, "hidden_states must be bfloat16"
     for w in (w1, w2):
-        # TODO assert bf16 or mxfp4
-        # assert (w.dtype == torch.bfloat16) or check-is-mxfp4, f"w must be bfloat16 or mxfp4 {w1.dtype=}"
-        pass
+        assert w.dtype in (
+            torch.bfloat16,
+            FP4,
+        ), f"w must be bfloat16 or mxfp4 (FP4), got {w.dtype}"
 
     # Shape check
     assert hidden_states.ndim == 2, "hidden_states must be 2D"
