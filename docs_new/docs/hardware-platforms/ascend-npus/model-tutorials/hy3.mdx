@@ -16,8 +16,8 @@ improvements in agentic workflows, long-context tasks, and production reliabilit
 This document demonstrates the deployment of Hy3 on Ascend NPUs using SGLang, including single-node PD mixed
 mode and speculative decoding.
 
-This document is validated and written based on **SGLang v0.5.13**. To use the latest features (e.g., speculative
-decoding), it is recommended to use v0.5.13 or a later version.
+> Hy3 currently uses a daily build image. The deployment commands and image tags in this document will be updated to a
+> stable release once the required support lands in a stable SGLang release.
 
 ## Supported features
 
@@ -25,7 +25,7 @@ decoding), it is recommended to use v0.5.13 or a later version.
 |--------------------------|----------------------------------------------------------------------------------------------------------------------------------------|
 | Tensor Parallelism       | `--tp-size 16`                                                                                                                         |
 | NPU Graph                | enabled by default; disable with `--disable-cuda-graph`;<br/>control range via `--cuda-graph-bs`; e.g. `--cuda-graph-bs 4 8 16 20 24 28 32 36 40` |
-| Speculative Decoding     | `--speculative-algorithm EAGLE \`<br/>`--speculative-num-steps 1 \`<br/>`--speculative-eagle-topk 1 \`<br/>`--speculative-num-draft-tokens 2` |
+| Speculative Decoding     | `--speculative-algorithm EAGLE \`<br/>`--speculative-num-steps 2 \`<br/>`--speculative-eagle-topk 1 \`<br/>`--speculative-num-draft-tokens 3` |
 | Overlap Schedule         | `export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`                                                                                           |
 | Reasoning Mode           | `extra_body={"chat_template_kwargs": {"reasoning_effort": "high"}}` — deep chain-of-thought;<br/>`"reasoning_effort": "low"` — short thinking chain;<br/>`"reasoning_effort": "no_think"` — direct response, no thinking |
 | Tool Calling             | `--tool-call-parser auto --reasoning-parser auto`                                                                                      |
@@ -59,9 +59,17 @@ Before following this tutorial, complete the environment setup in the documents 
 Hy3 has 295B total parameters. If you need to download model weights, check the model size before downloading to reserve enough space.
 </Warning>
 
-- [Hy3](https://modelscope.cn/models/Tencent-Hunyuan/Hy3) (Instruct model, BF16)
+- [Hy3](https://www.modelscope.cn/models/Tencent-Hunyuan/Hy3) (BF16, 597.60GB)
+
+<Tip>
+The BF16 variant (597.60GB) can be deployed on 16 × 64GB of device memory (`--tp-size 16`), which corresponds to one full
+Atlas 800I A3 node (8 cards × 2 dies).
+</Tip>
 
 It is recommended to download the model weights to a shared directory accessible from within the container.
+
+For the hardware specifications (memory per die, dies per card, and the difference between A2 and A3),
+see [Ascend NPU Reference — Hardware](/docs/hardware-platforms/ascend-npus/ascend_npu_reference#hardware).
 
 ## Installation
 
@@ -72,11 +80,14 @@ Ensure sufficient disk space before pulling images. The Docker image requires at
 The dependencies required for the NPU runtime environment have been integrated into a Docker image and uploaded to the
 online platform. You can directly pull it.
 
-Both **stable releases** and **daily builds** are available. The following command is based on the stable release tag.
-For details, see [Docker image versions](/docs/hardware-platforms/ascend-npus/ascend_npu_faq#8-docker-image-versions-stable-release-vs-daily-build).
+<Note>
+The following command uses a daily build tag. These tags will be switched to a stable release image after the support
+lands in a stable release. For details, see
+[Docker image versions](/docs/hardware-platforms/ascend-npus/ascend_npu_faq#8-docker-image-versions-stable-release-vs-daily-build).
+</Note>
 
 ```bash Command
-docker pull quay.io/ascend/sglang:v0.5.13.post1-cann9.0.0-a3
+docker pull quay.io/ascend/sglang:main-cann9.0.0-a3
 
 docker run -itd --shm-size=64g --name ${NAME} \
 --privileged=true --net=host \
@@ -104,7 +115,7 @@ docker run -itd --shm-size=64g --name ${NAME} \
 --device=/dev/davinci_manager:/dev/davinci_manager \
 --device=/dev/hisi_hdc:/dev/hisi_hdc \
 --entrypoint=bash \
-quay.io/ascend/sglang:v0.5.13.post1-cann9.0.0-a3
+quay.io/ascend/sglang:main-cann9.0.0-a3
 ```
 
 <Tip>
@@ -177,16 +188,15 @@ python3 -m sglang.launch_server \
 
 ## Functional verification
 
-After the server prints `The server is fired up and ready to roll!`, send a test request:
+After the service is started, you can invoke the model by sending a prompt:
 
-```bash
+```shell
 # ============================================================
 # Before running, update the following variables:
 #   HOST: the server host address (e.g., localhost)
 #   PORT: the server port number (e.g., 9999)
 # ============================================================
 
-# Text generation (no thinking)
 curl http://${HOST}:${PORT}/v1/chat/completions \
     -H "Content-Type: application/json" \
     -d '{
@@ -202,7 +212,7 @@ Expected result: an HTTP 200 response with `"Paris"` in the content field.
 
 To enable chain-of-thought reasoning for math or coding tasks, set `reasoning_effort` to `"high"`:
 
-```bash
+```shell
 curl http://${HOST}:${PORT}/v1/chat/completions \
     -H "Content-Type: application/json" \
     -d '{
@@ -217,8 +227,7 @@ curl http://${HOST}:${PORT}/v1/chat/completions \
 The response will contain a `reasoning_content` field with the thinking process and a `content` field with the final
 answer.
 
-For more testing examples (Health Check, Generate, Chat Completions, and port usage guidance),
-see [Testing the Service](/docs/hardware-platforms/ascend-npus/ascend_npu#testing-the-service).
+Once the server prints `The server is fired up and ready to roll!` in the logs, it is ready to accept requests. For more testing examples (Health Check, Generate, Chat Completions, and port usage guidance), see [Testing the Service](/docs/hardware-platforms/ascend-npus/ascend_npu#testing-the-service).
 
 ## Accuracy evaluation
 
