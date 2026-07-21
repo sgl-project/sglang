@@ -897,7 +897,10 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
 
     b_h = tl.zeros([BV, BK], dtype=tl.float32)
     if USE_INITIAL_STATE:
-        idx = tl.load(h0_indices + i_n)
+        # Cast to int64 at the load: the row offset below multiplies this
+        # index by HV*K*V, which overflows int32 for large state-pool ids.
+        # (Same convention as the ssm_state_indices loads in this file.)
+        idx = tl.load(h0_indices + i_n).to(tl.int64)
         # Add bounds checking for idx
         if idx >= 0:  # Assuming negative indices are invalid
             p_h0 = (
@@ -912,7 +915,10 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
     # Prepare intermediate state cache variables if enabled
     cache_idx = -1
     if CACHE_INTERMEDIATE_STATES:
-        cache_idx = tl.load(intermediate_state_indices + i_n)
+        # Cast to int64 at the load: the store offset below multiplies this
+        # index by cache_steps*HV*K*V, which overflows int32 for large
+        # state-pool ids.
+        cache_idx = tl.load(intermediate_state_indices + i_n).to(tl.int64)
 
     step_idx = 0
     for _ in range(0, T):
@@ -987,7 +993,12 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
     # Store final state back to h0_source with bounds checking
     # ssm states
     if not DISABLE_STATE_UPDATE:
-        idx = tl.load(h0_indices + i_n)
+        # Cast to int64 at the load: the write-back offset below multiplies
+        # this index by HV*K*V (same expression as the initial-state read),
+        # which overflows int32 for large state-pool ids. This is a store, so
+        # an overflow here corrupts the wrong state row rather than just
+        # reading it.
+        idx = tl.load(h0_indices + i_n).to(tl.int64)
         if idx >= 0:  # Add bounds checking
             p_h0 = (
                 h0_source
