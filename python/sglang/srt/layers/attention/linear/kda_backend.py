@@ -95,14 +95,14 @@ class KDAKernelDispatcher:
 
             cutedsl_kernel = CuteDSLKDAKernel()
             if getattr(cutedsl_kernel, "supports_prefill", False):
-                # SM100 chunk prefill pipeline.
+                # SM100/SM103 chunk prefill pipeline.
                 self.extend_kernel = cutedsl_kernel
             else:
-                # CuTe DSL prefill kernels need SM100 (Blackwell); on older GPUs
-                # fall back to the Triton chunk kernel.
+                # CuTe DSL prefill kernels need SM100/SM103; on other GPUs fall
+                # back to the Triton chunk kernel.
                 self.extend_kernel = triton_kernel
                 rank0_log(
-                    "KDA cutedsl prefill needs SM100; falling back to Triton extend."
+                    "KDA cutedsl prefill needs SM100/SM103; falling back to Triton extend."
                 )
         else:
             raise ValueError(
