@@ -6,9 +6,6 @@
 // on Blackwell — Low-Latency cells pin the target backend explicitly.
 // Never use --attention-backend triton on Laguna (broken SWA handling).
 //
-// --sampling-defaults openai (all cells): generation_config.json ships top_k=0;
-// default --sampling-defaults model rejects non-greedy requests with HTTP 400.
-//
 // BF16 on H200 HT: --mem-fraction-static 0.80 required — BF16 leaves less headroom
 // for CUDA-graph capture and NCCL allocs than FP8/INT4 on 141 GB/GPU.
 // B300/GB300 (288 GB/GPU) unaffected.
@@ -17,11 +14,7 @@
 // expert; required at both TP=4 (GB300) and TP=8 (H200/B300). INT4 shared expert stays
 // bf16 — no flag needed. Differs from Laguna-XS-2.1 where TP=4 works without this flag.
 //
-// FP8/NVFP4 DFlash drafts: missing rope_theta in rope_parameters as of 2026-07-20.
-// If draft load crashes with KeyError: 'rope_theta', add "rope_theta": 500000.0 to
-// the draft's rope_parameters block. BF16/INT4 drafts unaffected.
-//
-// NVFP4 on GB300: unverified — degenerate output observed; pending upstream fix.
+// NVFP4 on GB300: unverified.
 // NVFP4 is Blackwell-only → no h200×nvfp4 cells.
 // DFlash cells carry --mem-fraction-static 0.7.
 
