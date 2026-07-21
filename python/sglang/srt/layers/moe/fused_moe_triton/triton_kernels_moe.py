@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import inspect
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -37,6 +38,17 @@ else:
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
     from sglang.srt.layers.moe.topk import TopKOutput
+
+
+_MATMUL_OGS_USES_RAGGED_METADATA = (
+    "x_ragged_metadata" in inspect.signature(matmul_ogs).parameters
+)
+
+
+def _routing_kwargs(routing_data: RoutingData) -> dict:
+    if _MATMUL_OGS_USES_RAGGED_METADATA:
+        return {"x_ragged_metadata": routing_data.expt_data}
+    return {"routing_data": routing_data}
 
 
 def _assert_unsupported_quant_args(
@@ -177,9 +189,9 @@ def triton_kernel_fused_experts(
         hidden_states,
         w1,
         None,
-        x_ragged_metadata=routing_data.expt_data,
         gather_indx=gather_indx,
         gammas=routing_data.gate_scal if apply_router_weight_on_input else None,
+        **_routing_kwargs(routing_data),
     )
 
     if activation == "silu":
@@ -193,12 +205,12 @@ def triton_kernel_fused_experts(
         intermediate_cache2,
         w2,
         None,
-        x_ragged_metadata=routing_data.expt_data,
         scatter_indx=scatter_indx,
         gammas=None if apply_router_weight_on_input else routing_data.gate_scal,
+        **_routing_kwargs(routing_data),
     )
 
-    if scatter_indx is None:
+    if scatter_indx is None or not _MATMUL_OGS_USES_RAGGED_METADATA:
         return intermediate_cache3
     return intermediate_cache3.view(M, n_expts_act, K).sum(dim=1)
 
@@ -346,23 +358,31 @@ def triton_kernel_fused_experts_with_bias(
         hidden_states,
         w1,
         b1,
-        x_ragged_metadata=routing_data.expt_data,
         gather_indx=gather_indx,
         precision_config=w1_pcg,
         gammas=routing_data.gate_scal if apply_router_weight_on_input else None,
         fused_activation=act,
         y=intermediate_cache,
+        **_routing_kwargs(routing_data),
     )
 
+    output_buffer = None
+    if not _MATMUL_OGS_USES_RAGGED_METADATA:
+        output_buffer = torch.empty(
+            (1, M, K), device=hidden_states.device, dtype=hidden_states.dtype
+        )
     output = matmul_ogs(
         intermediate_cache.view(M * n_expts_act, N // 2),
         w2,
         b2,
-        x_ragged_metadata=routing_data.expt_data,
         scatter_indx=scatter_indx,
         precision_config=w2_pcg,
         gammas=None if apply_router_weight_on_input else routing_data.gate_scal,
+        y=output_buffer,
+        **_routing_kwargs(routing_data),
     )
+    if output_buffer is not None:
+        return output_buffer.view(M, K)
     if scatter_indx is None:
         return output
     return output.view(M, n_expts_act, K).sum(dim=1)

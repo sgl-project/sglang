@@ -71,17 +71,20 @@ rocm_arch_config = {
     "gfx942": {
         "fp8_macro": "-DHIP_FP8_TYPE_FNUZ",
         "topk_dynamic_smem_bytes": 48 * 1024,
+        "wavefront_size": 64,
     },
     # MI350 uses the OCP E4M3 encoding and has enough LDS for the full budget.
     "gfx950": {
         "fp8_macro": "-DHIP_FP8_TYPE_E4M3",
         "topk_dynamic_smem_bytes": 128 * 1024,
+        "wavefront_size": 64,
     },
     # RDNA4 supports 32/64-lane wavefronts and OCP E4M3. Keep the TopK budget
     # conservative so the kernel leaves room within its 128 KiB LDS limit.
     "gfx1201": {
         "fp8_macro": "-DHIP_FP8_TYPE_E4M3",
         "topk_dynamic_smem_bytes": 48 * 1024,
+        "wavefront_size": 32,
     },
 }
 
@@ -103,6 +106,7 @@ if amdgpu_target not in rocm_arch_config:
 arch_config = rocm_arch_config[amdgpu_target]
 fp8_macro = arch_config["fp8_macro"]
 topk_dynamic_smem_bytes = arch_config["topk_dynamic_smem_bytes"]
+wavefront_size = arch_config["wavefront_size"]
 
 hipcc_flags = [
     "-DNDEBUG",
@@ -116,6 +120,7 @@ hipcc_flags = [
     "-DENABLE_FP8",
     fp8_macro,
     f"-DSGL_TOPK_DYNAMIC_SMEM_BYTES={topk_dynamic_smem_bytes}",
+    f"-DSGLANG_WAVEFRONT_SIZE={wavefront_size}",
 ]
 
 ext_modules = [

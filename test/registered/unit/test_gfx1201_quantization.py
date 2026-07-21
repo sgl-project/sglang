@@ -26,14 +26,18 @@ class TestGfx1201QuantizationSupport(unittest.TestCase):
         props = SimpleNamespace(gcnArchName="gfx1201")
         with (
             patch.object(common.torch.version, "hip", "7.2"),
-            patch.object(common.torch.cuda, "get_device_properties", return_value=props),
+            patch.object(
+                common.torch.cuda, "get_device_properties", return_value=props
+            ),
             patch.object(common, "is_triton_kernels_available", return_value=False),
         ):
             self.assertFalse(common.mxfp_supported())
 
         with (
             patch.object(common.torch.version, "hip", "7.2"),
-            patch.object(common.torch.cuda, "get_device_properties", return_value=props),
+            patch.object(
+                common.torch.cuda, "get_device_properties", return_value=props
+            ),
             patch.object(common, "is_triton_kernels_available", return_value=True),
         ):
             self.assertTrue(common.mxfp_supported())

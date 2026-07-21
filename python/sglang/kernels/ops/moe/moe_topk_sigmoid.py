@@ -11,6 +11,19 @@ if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
 
+def _cuda_flags() -> list[str]:
+    if not torch.version.hip:
+        return ["--use_fast_math"]
+
+    props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    gcn_arch = props.gcnArchName.split(":", 1)[0]
+    wavefront_size = 64 if gcn_arch.startswith("gfx9") else 32
+    return [
+        "-ffast-math",
+        f"-DMOE_TOPK_SIGMOID_WARP_SIZE={wavefront_size}",
+    ]
+
+
 @cache_once
 def _jit_moe_topk_sigmoid_module(dtype: torch.dtype) -> Module:
     args = make_cpp_args(dtype)
@@ -19,7 +32,7 @@ def _jit_moe_topk_sigmoid_module(dtype: torch.dtype) -> Module:
         *args,
         cuda_files=["moe/moe_topk_sigmoid.cuh"],
         cuda_wrappers=[("topk_sigmoid", f"topk_sigmoid<{args}>")],
-        extra_cuda_cflags=["--use_fast_math"],
+        extra_cuda_cflags=_cuda_flags(),
     )
 
 
