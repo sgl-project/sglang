@@ -20,6 +20,8 @@
 //!     not decode-only. Health is asserted true so the 503 is attributable to
 //!     the breaker alone; a decode-only regression would instead return 200.
 
+use std::time::Duration;
+
 use axum::{
     body::Body,
     extract::Request,
@@ -42,12 +44,13 @@ mod pd_circuit_breaker_tests {
     use super::*;
 
     /// Build a 1-prefill / 1-decode PD config with a low breaker `failure_threshold`
-    /// (so a few real failures open it) and bounded, fast retries.
+    /// (so a few real failures open it) and a caller-specified `max_retries`.
     fn pd_config(
         port: u16,
         prefill_url: &str,
         decode_url: &str,
         failure_threshold: u32,
+        max_retries: u32,
     ) -> RouterConfig {
         RouterConfig::builder()
             .prefill_decode_mode(
@@ -64,7 +67,7 @@ mod pd_circuit_breaker_tests {
             .max_concurrent_requests(64)
             .queue_timeout_secs(60)
             .retry_config(RetryConfig {
-                max_retries: 2,
+                max_retries,
                 initial_backoff_ms: 10,
                 max_backoff_ms: 50,
                 ..Default::default()
@@ -77,6 +80,10 @@ mod pd_circuit_breaker_tests {
     }
 
     /// Send one non-streaming /generate request and return its status.
+    ///
+    /// Wrapped in a short client-side timeout so a future hang regression
+    /// (decode-only, waiting on a KV transfer that never arrives) fails fast here
+    /// instead of stalling CI up to the server-side request timeout.
     async fn generate_status(app: &axum::Router) -> StatusCode {
         let payload = json!({ "text": "hello", "stream": false });
         let req = Request::builder()
@@ -85,7 +92,11 @@ mod pd_circuit_breaker_tests {
             .header(CONTENT_TYPE, "application/json")
             .body(Body::from(serde_json::to_string(&payload).unwrap()))
             .unwrap();
-        app.clone().oneshot(req).await.unwrap().status()
+        tokio::time::timeout(Duration::from_secs(5), app.clone().oneshot(req))
+            .await
+            .expect("request should complete well within the client timeout")
+            .unwrap()
+            .status()
     }
 
     /// Grab the single prefill worker registered for this context.
@@ -103,7 +114,13 @@ mod pd_circuit_breaker_tests {
     /// to a mis-wired harness.
     #[tokio::test]
     async fn healthy_pd_pair_serves_requests() {
-        let config = pd_config(3810, "http://127.0.0.1:19840", "http://127.0.0.1:19841", 3);
+        let config = pd_config(
+            3810,
+            "http://127.0.0.1:19840",
+            "http://127.0.0.1:19841",
+            3,
+            2,
+        );
         let ctx = AppTestContext::new_with_config(
             config,
             vec![
@@ -135,6 +152,7 @@ mod pd_circuit_breaker_tests {
             "http://127.0.0.1:19842",
             "http://127.0.0.1:19843",
             FAILURE_THRESHOLD,
+            0,
         );
         let ctx = AppTestContext::new_with_config(
             config,
@@ -193,7 +211,13 @@ mod pd_circuit_breaker_tests {
     /// decode-only rather than 503 -- which this assertion catches.
     #[tokio::test]
     async fn open_prefill_breaker_fails_whole_request_not_decode_only() {
-        let config = pd_config(3812, "http://127.0.0.1:19844", "http://127.0.0.1:19845", 3);
+        let config = pd_config(
+            3812,
+            "http://127.0.0.1:19844",
+            "http://127.0.0.1:19845",
+            3,
+            2,
+        );
         let ctx = AppTestContext::new_with_config(
             config,
             vec![
