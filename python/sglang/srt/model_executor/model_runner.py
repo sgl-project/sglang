@@ -516,6 +516,7 @@ class ModelRunner:
             gpu_id=self.gpu_id,
             ps=self.ps,
             pp_group=self.pp_group,
+            model=self.model,
             model_config=self.model_config,
             server_args=self.server_args,
             kv_cache_dtype=self.kv_cache_dtype,
@@ -536,6 +537,7 @@ class ModelRunner:
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             memory_pool_config=self.memory_pool_config,
+            draft_model_idx=self.draft_model_idx,
         )
 
     def init_mindspore_runner(self):
@@ -744,6 +746,11 @@ class ModelRunner:
         # Keep a reference so the shared byte buffer is not GC'd.
         self._unified_memory_pool = result.unified_memory_pool
 
+        self._init_post_memory_pool_components()
+
+    def _init_post_memory_pool_components(self):
+        """Post-pool component wiring, split out of alloc_memory_pool so forks
+        that build bespoke memory pools can reuse it after allocating them."""
         # Must be called AFTER init_memory_pool so the pool object exists for
         # canary to monkey-patch, and BEFORE init_decode_cuda_graph so warmup
         # forwards captured into the graph see the patched pool methods.
@@ -1073,14 +1080,19 @@ class ModelRunner:
             )
 
     def configure_kv_cache_dtype(self):
+        spec_algorithm = getattr(self, "spec_algorithm", None)
         resolved_kv_cache_dtype, self.kv_cache_dtype = (
             kv_cache_dtype.configure_kv_cache_dtype(
                 server_args_kv_cache_dtype=self.server_args.kv_cache_dtype,
-                model=self.model,
-                model_dtype=self.dtype,
-                is_draft_worker=self.is_draft_worker,
-                is_dflash=self.spec_algorithm.is_dflash(),
-                speculative_draft_attention_backend=self.server_args.speculative_draft_attention_backend,
+                model=getattr(self, "model", None),
+                model_dtype=getattr(self, "dtype", torch.bfloat16),
+                is_draft_worker=getattr(self, "is_draft_worker", False),
+                is_dflash=(
+                    spec_algorithm.is_dflash() if spec_algorithm is not None else False
+                ),
+                speculative_draft_attention_backend=getattr(
+                    self.server_args, "speculative_draft_attention_backend", None
+                ),
             )
         )
         if resolved_kv_cache_dtype is not None:
@@ -1540,7 +1552,6 @@ class ModelRunner:
         self.sampler.compute_logprobs_only(
             logits_output,
             forward_batch.sampling_info,
-            forward_batch.return_logprob,
             forward_batch.top_logprobs_nums,
             forward_batch.token_ids_logprobs,
         )
