@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Union
 
 import torch
 import torch.nn.functional as F
@@ -56,14 +56,8 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from sglang.srt.layers.quantization.fp8_rmsnorm import (
-    PackedUe8m0LinearInput,
-    PackedUe8m0LinearOp,
-    PreparedFp8RMSNormInput,
-    has_fused_rmsnorm_tensor_contract,
-    has_packed_ue8m0_linear_contract,
-)
 from sglang.srt.layers.quantization.fp8_utils import (
+    PackedUe8m0LinearInput,
     _use_aiter_bpreshuffle_gfx95,
     apply_fp8_linear,
     can_auto_enable_marlin_fp8,
@@ -460,7 +454,7 @@ class Fp8LinearMethod(LinearMethodBase):
         self.convert_mxfp8_to_block = self.use_mxfp8 and _mxfp8_to_block_fp8_required
         self.weight_block_size = self.quant_config.weight_block_size
         self.w8a8_block_fp8_linear = None
-        self.w8a8_block_fp8_prequantized_linear: Optional[PackedUe8m0LinearOp] = None
+        self.w8a8_block_fp8_prequantized_linear: Optional[Callable] = None
         self.w8a8_mxfp8_linear = None
         if self.use_mxfp8 and not self.convert_mxfp8_to_block:
             self.w8a8_mxfp8_linear = dispatch_w8a8_mxfp8_linear()
@@ -900,21 +894,53 @@ class Fp8LinearMethod(LinearMethodBase):
             # Activations not quantized for marlin.
             del layer.input_scale
 
+        layer._fused_rmsnorm_fp8_enabled = self._is_fused_rmsnorm_fp8_layer(layer)
+
+    def _is_fused_rmsnorm_fp8_layer(self, layer: Module) -> bool:
+        """Whether this loaded layer can consume packed-UE8M0 fused-RMSNorm input.
+
+        Evaluated once after weight loading, when every input below is frozen;
+        the per-forward gate only re-checks DeepGEMM's UE8M0 scale mode, which
+        callers such as LongCat toggle after construction.
+        """
+        if (
+            self.w8a8_block_fp8_prequantized_linear is None
+            or not self.block_quant
+            or self.use_marlin
+            or self.use_mxfp8
+            or self.weight_block_size != [128, 128]
+        ):
+            return False
+        weight = layer.weight
+        weight_scale = layer.weight_scale_inv
+        if (
+            not isinstance(weight, torch.Tensor)
+            or not isinstance(weight_scale, torch.Tensor)
+            or weight.dim() != 2
+            or weight.shape[0] % 64 != 0
+            or weight.shape[1] % 128 != 0
+        ):
+            return False
+        packed_scale_cols = (weight.shape[1] // 128 + 3) // 4
+        return bool(
+            getattr(layer, "orig_dtype", None) == torch.bfloat16
+            and getattr(layer, "input_scale", None) is None
+            and weight.dtype == fp8_dtype
+            and weight_scale.dim() == 2
+            and tuple(weight_scale.shape) == (weight.shape[0], packed_scale_cols)
+            and weight_scale.dtype == torch.int32
+            and weight_scale.device == weight.device
+            and weight_scale.stride(0) == 1
+            and getattr(weight_scale, "format_ue8m0", False)
+        )
+
     def _can_apply_packed_ue8m0_input(self, layer: torch.nn.Module) -> bool:
-        """Check the live, post-load DeepGEMM consumer contract."""
+        """Live per-forward gate: cached layer eligibility plus DeepGEMM's UE8M0
+        scale mode, which callers can toggle after construction."""
         from sglang.srt.layers import deep_gemm_wrapper
 
         return bool(
-            deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
-            and self.w8a8_block_fp8_prequantized_linear is not None
-            and has_packed_ue8m0_linear_contract(
-                layer,
-                block_quant=self.block_quant,
-                use_marlin=self.use_marlin,
-                use_mxfp8=self.use_mxfp8,
-                weight_block_size=self.weight_block_size,
-                weight_dtype=fp8_dtype,
-            )
+            layer._fused_rmsnorm_fp8_enabled and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
         )
 
     def maybe_prepare_fused_rmsnorm_input(
@@ -923,21 +949,38 @@ class Fp8LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         norm_weight: torch.Tensor,
         eps: float,
-    ) -> Optional[PreparedFp8RMSNormInput]:
-        """Fuse RMSNorm with this method's packed DeepGEMM input format."""
-        if not self._can_apply_packed_ue8m0_input(layer):
+    ) -> Optional[tuple[PackedUe8m0LinearInput, torch.Tensor]]:
+        """Fuse RMSNorm with this layer's packed-UE8M0 DeepGEMM input.
+
+        Returns the pre-quantized linear input paired with the BF16 normalized
+        tensor, or None to tell the caller to run its ordinary RMSNorm. The
+        fused kernel is never entered under torch.compile.
+        """
+        if torch.compiler.is_compiling() or not self._can_apply_packed_ue8m0_input(
+            layer
+        ):
             return None
 
-        hidden_size = x.shape[-1] if x.dim() == 2 else 0
+        hidden_size = layer.weight.shape[1]
+        contiguous_bf16_rows = (
+            x.is_cuda
+            and x.dim() == 2
+            and x.dtype == torch.bfloat16
+            and x.shape[1] == hidden_size
+            and x.stride(1) == 1
+            and x.stride(0) % 16 == 0
+        )
+        matching_weight = (
+            tuple(norm_weight.shape) == (hidden_size,)
+            and norm_weight.dtype == torch.bfloat16
+            and norm_weight.device == x.device
+            and norm_weight.stride(0) == 1
+        )
         if not (
-            has_fused_rmsnorm_tensor_contract(
-                x,
-                norm_weight,
-                hidden_size=layer.weight.shape[1],
-            )
+            contiguous_bf16_rows
+            and matching_weight
             and can_use_rmsnorm_per_token_group_quant_fp8(
-                input_dtype=x.dtype,
-                hidden_size=hidden_size,
+                input_dtype=x.dtype, hidden_size=hidden_size
             )
         ):
             return None
@@ -945,10 +988,7 @@ class Fp8LinearMethod(LinearMethodBase):
         q_fp8, q_scale, normalized = rmsnorm_per_token_group_quant_fp8(
             x, norm_weight, eps
         )
-        return PreparedFp8RMSNormInput(
-            linear_input=PackedUe8m0LinearInput(q_fp8, q_scale),
-            normalized_input=normalized,
-        )
+        return PackedUe8m0LinearInput(q_fp8, q_scale), normalized
 
     def apply(
         self,
@@ -957,11 +997,6 @@ class Fp8LinearMethod(LinearMethodBase):
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if isinstance(x, PackedUe8m0LinearInput):
-            if not self._can_apply_packed_ue8m0_input(layer):
-                raise ValueError(
-                    "packed UE8M0 input requires the live DeepGEMM block-FP8 "
-                    "consumer contract"
-                )
             prequantized_linear = self.w8a8_block_fp8_prequantized_linear
             assert prequantized_linear is not None
             return prequantized_linear(

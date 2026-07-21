@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 import sys
-from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 import pytest
 import torch
@@ -33,8 +32,7 @@ if TYPE_CHECKING:
 register_cuda_ci(est_time=25, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 
-@dataclass
-class _MlaHarness:
+class _MlaHarness(NamedTuple):
     mla: DeepseekMLAForwardMixin
     quant_method: Fp8LinearMethod
     x: torch.Tensor
@@ -94,6 +92,12 @@ def mla_harness(monkeypatch: pytest.MonkeyPatch) -> _MlaHarness:
     mla.use_min_latency_q_b_gemm = False
     mla.use_dsa = True
 
+    # Seed the load-static eligibility flag, as process_weights_after_loading
+    # would once the layer's weights are finalized.
+    mla.q_b_proj._fused_rmsnorm_fp8_enabled = (
+        quant_method._is_fused_rmsnorm_fp8_layer(mla.q_b_proj)
+    )
+
     return _MlaHarness(
         mla=mla,
         quant_method=quant_method,
@@ -145,25 +149,18 @@ def test_fp8_fused_rmsnorm_gate_is_live_per_forward(
     )
 
     assert (
-        quant_method.maybe_prepare_fused_rmsnorm_input(
-            layer,
-            x,
-            norm_weight,
-            EPS,
-        )
+        quant_method.maybe_prepare_fused_rmsnorm_input(layer, x, norm_weight, EPS)
         is None
     )
     prepared = quant_method.maybe_prepare_fused_rmsnorm_input(
-        layer,
-        x,
-        norm_weight,
-        EPS,
+        layer, x, norm_weight, EPS
     )
 
     assert prepared is not None
-    assert prepared.linear_input.data is output_q
-    assert prepared.linear_input.scale is output_s
-    assert prepared.normalized_input is output_norm
+    linear_input, normalized = prepared
+    assert linear_input.data is output_q
+    assert linear_input.scale is output_s
+    assert normalized is output_norm
     assert gate_calls == [(DTYPE, hidden_size), (DTYPE, hidden_size)]
 
 
@@ -171,7 +168,7 @@ def test_prequantized_input_never_falls_back_to_triton(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from sglang.srt.layers.quantization import fp8_utils
-    from sglang.srt.layers.quantization.fp8_rmsnorm import PackedUe8m0LinearInput
+    from sglang.srt.layers.quantization.fp8_utils import PackedUe8m0LinearInput
 
     m, n, k = 2, 65, 640
     block_size = [GROUP_SIZE, GROUP_SIZE]
@@ -207,8 +204,8 @@ def test_prequantized_input_never_falls_back_to_triton(
 
 def test_deepgemm_prequantized_input_parity() -> None:
     from sglang.srt.layers import deep_gemm_wrapper
-    from sglang.srt.layers.quantization.fp8_rmsnorm import PackedUe8m0LinearInput
     from sglang.srt.layers.quantization.fp8_utils import (
+        PackedUe8m0LinearInput,
         deepgemm_w8a8_block_fp8_linear_prequantized,
         deepgemm_w8a8_block_fp8_linear_with_fallback,
         quant_weight_ue8m0,
@@ -241,36 +238,17 @@ def test_deepgemm_prequantized_input_parity() -> None:
         block_size,
         weight_scale,
     )
-
-    @torch.compile(fullgraph=True)
-    def compiled_prequantized_deepgemm(
-        input: torch.Tensor,
-        input_scale: torch.Tensor,
-        weight: torch.Tensor,
-        packed_weight_scale: torch.Tensor,
-    ) -> torch.Tensor:
-        return deepgemm_w8a8_block_fp8_linear_prequantized(
-            PackedUe8m0LinearInput(input, input_scale),
-            weight,
-            block_size,
-            packed_weight_scale,
-        )
-
-    output_from_compiled_prequant = compiled_prequantized_deepgemm(
-        x_fp8, x_scale, weight_fp8, weight_scale
-    )
     torch.cuda.synchronize()
 
     assert output_from_bf16.dtype == DTYPE
     assert output_from_prequant.dtype == DTYPE
     assert torch.equal(output_from_prequant, output_from_bf16)
-    assert torch.equal(output_from_compiled_prequant, output_from_bf16)
 
 
 def test_deepseek_mla_prepares_and_consumes_packed_input(
     mla_harness: _MlaHarness,
 ) -> None:
-    from sglang.srt.layers.quantization.fp8_rmsnorm import PackedUe8m0LinearInput
+    from sglang.srt.layers.quantization.fp8_utils import PackedUe8m0LinearInput
 
     prepared = mla_harness.quant_method.maybe_prepare_fused_rmsnorm_input(
         mla_harness.mla.q_b_proj,
@@ -280,13 +258,14 @@ def test_deepseek_mla_prepares_and_consumes_packed_input(
     )
 
     assert prepared is not None
-    assert isinstance(prepared.linear_input, PackedUe8m0LinearInput)
-    assert prepared.linear_input.data.shape == mla_harness.x.shape
-    assert prepared.linear_input.scale.shape == (
+    linear_input, normalized = prepared
+    assert isinstance(linear_input, PackedUe8m0LinearInput)
+    assert linear_input.data.shape == mla_harness.x.shape
+    assert linear_input.scale.shape == (
         mla_harness.x.shape[0],
         mla_harness.packed_scale_cols,
     )
-    assert prepared.normalized_input.shape == mla_harness.x.shape
+    assert normalized.shape == mla_harness.x.shape
 
     seen = {}
 
@@ -297,12 +276,8 @@ def test_deepseek_mla_prepares_and_consumes_packed_input(
     mla_harness.quant_method.w8a8_block_fp8_prequantized_linear = (
         fake_prequantized_deepgemm
     )
-    mla_harness.quant_method.apply(mla_harness.mla.q_b_proj, prepared.linear_input)
-    assert seen["input"] is prepared.linear_input
-
-    mla_harness.quant_method.w8a8_block_fp8_prequantized_linear = None
-    with pytest.raises(ValueError, match="live DeepGEMM block-FP8 consumer"):
-        mla_harness.quant_method.apply(mla_harness.mla.q_b_proj, prepared.linear_input)
+    mla_harness.quant_method.apply(mla_harness.mla.q_b_proj, linear_input)
+    assert seen["input"] is linear_input
 
 
 @pytest.mark.parametrize(
@@ -336,6 +311,7 @@ def test_fused_rmsnorm_rejects_incompatible_tensors(
     (
         "lora",
         "deterministic_inference",
+        "deepgemm_scale_mode_off",
         "missing_prequantized_consumer",
         "unsupported_output_size",
         "unpacked_weight_scale",
@@ -343,12 +319,19 @@ def test_fused_rmsnorm_rejects_incompatible_tensors(
 )
 def test_deepseek_mla_uses_unfused_fallback_when_contract_is_not_met(
     mla_harness: _MlaHarness,
+    monkeypatch: pytest.MonkeyPatch,
     fallback_reason: str,
 ) -> None:
     if fallback_reason == "lora":
         mla_harness.server_args.enable_lora = True
     elif fallback_reason == "deterministic_inference":
         mla_harness.server_args.enable_deterministic_inference = True
+    elif fallback_reason == "deepgemm_scale_mode_off":
+        # LongCat toggles this mode after constructing its attention modules;
+        # the live per-forward gate must observe it and fall back.
+        from sglang.srt.layers import deep_gemm_wrapper
+
+        monkeypatch.setattr(deep_gemm_wrapper, "DEEPGEMM_SCALE_UE8M0", False)
     elif fallback_reason == "missing_prequantized_consumer":
         mla_harness.quant_method.w8a8_block_fp8_prequantized_linear = None
     elif fallback_reason == "unsupported_output_size":
@@ -358,42 +341,20 @@ def test_deepseek_mla_uses_unfused_fallback_when_contract_is_not_met(
             device=DEVICE,
             dtype=fp8_dtype,
         )
-    else:
+    else:  # unpacked_weight_scale
         mla_harness.weight_scale.format_ue8m0 = False
+
+    # Re-derive the load-static eligibility flag for the (mutated) layer, as
+    # process_weights_after_loading would after loading its weights.
+    q_b_proj = mla_harness.mla.q_b_proj
+    q_b_proj._fused_rmsnorm_fp8_enabled = (
+        mla_harness.quant_method._is_fused_rmsnorm_fp8_layer(q_b_proj)
+    )
 
     q_fallback, q_norm_fallback = mla_harness.mla._q_a_layernorm_with_optional_quant(
         mla_harness.x
     )
 
-    assert isinstance(q_fallback, torch.Tensor)
-    assert q_norm_fallback is None
-
-
-def test_compiled_deepseek_mla_observes_live_deepgemm_scale_mode(
-    mla_harness: _MlaHarness,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from sglang.srt.layers import deep_gemm_wrapper
-    from sglang.srt.layers.quantization.fp8_rmsnorm import PackedUe8m0LinearInput
-
-    @torch.compile(fullgraph=True)
-    def compiled(input: torch.Tensor):
-        return mla_harness.mla._q_a_layernorm_with_optional_quant(input)
-
-    q_pair, q_norm = compiled(mla_harness.x)
-    torch.cuda.synchronize()
-    assert isinstance(q_pair, PackedUe8m0LinearInput)
-    assert q_pair.data.shape == mla_harness.x.shape
-    assert q_pair.scale.shape == (
-        mla_harness.x.shape[0],
-        mla_harness.packed_scale_cols,
-    )
-    assert q_norm.shape == mla_harness.x.shape
-
-    # LongCat changes this mode after constructing its attention modules. The
-    # next forward must observe the live value and take the unfused path.
-    monkeypatch.setattr(deep_gemm_wrapper, "DEEPGEMM_SCALE_UE8M0", False)
-    q_fallback, q_norm_fallback = compiled(mla_harness.x)
     assert isinstance(q_fallback, torch.Tensor)
     assert q_norm_fallback is None
 

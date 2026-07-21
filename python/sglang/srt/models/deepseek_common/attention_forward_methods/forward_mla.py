@@ -25,9 +25,7 @@ from sglang.srt.layers.dcp import (
     all_gather_q_for_mla_decode,
     cp_lse_ag_out_rs_mla,
 )
-from sglang.srt.layers.quantization.fp8_rmsnorm import (
-    SupportsFusedFp8RMSNormInput,
-)
+from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
 from sglang.srt.layers.quantization.fp8_utils import (
     materialize_bpreshuffle_fp8_scale_tuple,
 )
@@ -196,7 +194,7 @@ class DeepseekMLAForwardMixin:
             return self.q_a_layernorm(q), None
 
         quant_method = self.q_b_proj.quant_method
-        if not isinstance(quant_method, SupportsFusedFp8RMSNormInput):
+        if not isinstance(quant_method, Fp8LinearMethod):
             return self.q_a_layernorm(q), None
 
         prepared = quant_method.maybe_prepare_fused_rmsnorm_input(
@@ -207,8 +205,9 @@ class DeepseekMLAForwardMixin:
         )
         if prepared is None:
             return self.q_a_layernorm(q), None
-        normalized_input = prepared.normalized_input if self.use_dsa else None
-        return prepared.linear_input, normalized_input
+        linear_input, normalized = prepared
+        normalized_input = normalized if self.use_dsa else None
+        return linear_input, normalized_input
 
     def should_run_indexer(
         self: DeepseekV2AttentionMLA,

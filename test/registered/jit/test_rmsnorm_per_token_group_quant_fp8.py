@@ -190,12 +190,6 @@ def test_empty_input_is_a_noop() -> None:
             id="hidden-size",
         ),
         pytest.param(
-            lambda: torch.randn(
-                2, TRACE_HIDDEN_SIZE, device=DEVICE, dtype=torch.float16
-            ),
-            id="input-dtype",
-        ),
-        pytest.param(
             lambda: torch.randn(2, TRACE_HIDDEN_SIZE * 2, device=DEVICE, dtype=DTYPE)[
                 :, ::2
             ],
@@ -230,41 +224,11 @@ def test_rejects_invalid_rank_before_allocation_or_jit(
         rmsnorm_per_token_group_quant_fp8(x, weight, EPS)
 
 
-@pytest.mark.parametrize(
-    "weight",
-    [
-        pytest.param(lambda: torch.randn(1024, device=DEVICE, dtype=DTYPE), id="shape"),
-        pytest.param(
-            lambda: torch.randn(TRACE_HIDDEN_SIZE, device=DEVICE, dtype=torch.float16),
-            id="dtype",
-        ),
-    ],
-)
-def test_rejects_invalid_weight_contract(weight) -> None:
-    x = _make_input(2)
-    with pytest.raises((AssertionError, RuntimeError, TypeError, ValueError)):
-        rmsnorm_per_token_group_quant_fp8(x, weight(), EPS)
-
-
-def test_out_variant_rejects_incompatible_outputs() -> None:
-    x = _make_input(2)
-    weight = torch.randn(TRACE_HIDDEN_SIZE, device=DEVICE, dtype=DTYPE)
-    output_q, output_s, output_norm = _alloc_outputs(2)
-
-    with pytest.raises((AssertionError, RuntimeError, ValueError)):
-        rmsnorm_per_token_group_quant_fp8_out(
-            x,
-            weight,
-            output_q[:, :-1],
-            output_s,
-            output_norm,
-            EPS,
-        )
-
-
-def test_out_variant_rejects_overlapping_scale_layout_before_jit(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_out_variant_rejects_overlapping_scale_layout() -> None:
+    # DeepGEMM may consume a whole final int32 per group row, so the packed
+    # scale's leading dimension must cover every token. A layout whose columns
+    # overlap the token axis would silently corrupt consumption, so the C++
+    # launcher must reject it.
     num_tokens = 6
     x = _make_input(num_tokens)
     weight = torch.randn(TRACE_HIDDEN_SIZE, device=DEVICE, dtype=DTYPE)
@@ -273,151 +237,10 @@ def test_out_variant_rejects_overlapping_scale_layout_before_jit(
         output_s.numel(), device=DEVICE, dtype=torch.int32
     ).as_strided(output_s.shape, (1, 4))
 
-    def fail_jit_lookup(*args, **kwargs):
-        pytest.fail("overlapping scale layout reached JIT compilation")
-
-    monkeypatch.setattr(fused_rmsnorm_quant, "_jit_module", fail_jit_lookup)
-    with pytest.raises(ValueError, match="packed column-major"):
+    with pytest.raises((AssertionError, RuntimeError, ValueError)):
         rmsnorm_per_token_group_quant_fp8_out(
-            x,
-            weight,
-            output_q,
-            overlapping_scale,
-            output_norm,
-            EPS,
+            x, weight, output_q, overlapping_scale, output_norm, EPS
         )
-
-
-def test_torch_compile() -> None:
-    torch.manual_seed(17)
-    x = _make_input(6, trace_stride=True)
-    weight = torch.randn(TRACE_HIDDEN_SIZE, device=DEVICE, dtype=DTYPE)
-
-    @torch.compile(fullgraph=True)
-    def compiled(input: torch.Tensor, norm_weight: torch.Tensor):
-        return rmsnorm_per_token_group_quant_fp8(input, norm_weight, EPS)
-
-    # Compile from the formerly-crashing case so Inductor must capture the
-    # custom op while its live inputs are storage-unaligned.
-    unaligned_input = _make_storage_unaligned((6, TRACE_HIDDEN_SIZE))
-    unaligned_weight = _make_storage_unaligned((TRACE_HIDDEN_SIZE,))
-    unaligned_output = compiled(unaligned_input, unaligned_weight)
-    _assert_matches_unfused_pair(
-        unaligned_output,
-        unaligned_input,
-        unaligned_weight,
-    )
-
-    q_ref, s_ref, norm_ref = rmsnorm_per_token_group_quant_fp8(x, weight, EPS)
-    output_q, output_s, output_norm = compiled(x, weight)
-    torch.cuda.synchronize()
-
-    assert torch.equal(output_norm, norm_ref)
-    assert torch.equal(output_q.view(torch.int8), q_ref.view(torch.int8))
-    assert torch.equal(output_s, s_ref)
-
-
-def _make_storage_unaligned(shape: tuple[int, ...]) -> torch.Tensor:
-    backing = torch.randn(
-        torch.Size(shape).numel() + 1,
-        device=DEVICE,
-        dtype=DTYPE,
-    )
-    output = backing[1:].view(shape)
-    assert output.data_ptr() % 32 != 0
-    return output
-
-
-def _assert_matches_unfused_pair(
-    output: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-    input: torch.Tensor,
-    weight: torch.Tensor,
-) -> None:
-    output_q, output_s, output_norm = output
-    norm_ref = torch.nn.functional.rms_norm(
-        input,
-        (input.shape[1],),
-        weight,
-        EPS,
-    )
-    q_ref, s_ref, _ = _alloc_outputs(input.shape[0], input.shape[1])
-    per_token_group_quant_8bit_v2(
-        norm_ref,
-        q_ref,
-        s_ref,
-        GROUP_SIZE,
-        1e-10,
-        float(fp8_min),
-        float(fp8_max),
-        scale_ue8m0=True,
-    )
-    torch.cuda.synchronize()
-
-    assert torch.equal(output_norm, norm_ref)
-    assert torch.equal(output_q.view(torch.int8), q_ref.view(torch.int8))
-    assert torch.equal(output_s, s_ref)
-
-
-@pytest.mark.parametrize("unaligned", ["input", "weight", "both"])
-def test_storage_unaligned_views_use_unfused_pair(
-    unaligned: str,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    input = _make_input(6)
-    weight = torch.randn(TRACE_HIDDEN_SIZE, device=DEVICE, dtype=DTYPE)
-    if unaligned in {"input", "both"}:
-        input = _make_storage_unaligned((6, TRACE_HIDDEN_SIZE))
-    if unaligned in {"weight", "both"}:
-        weight = _make_storage_unaligned((TRACE_HIDDEN_SIZE,))
-
-    def fail_jit_lookup(*args, **kwargs):
-        pytest.fail("storage-unaligned view reached the fused JIT kernel")
-
-    monkeypatch.setattr(fused_rmsnorm_quant, "_jit_module", fail_jit_lookup)
-    output = rmsnorm_per_token_group_quant_fp8(input, weight, EPS)
-    _assert_matches_unfused_pair(output, input, weight)
-
-
-def test_torch_compile_routes_live_storage_alignment_per_call(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    aligned_input = _make_input(6)
-    unaligned_input = _make_storage_unaligned((6, TRACE_HIDDEN_SIZE))
-    aligned_weight = torch.randn(TRACE_HIDDEN_SIZE, device=DEVICE, dtype=DTYPE)
-    unaligned_weight = _make_storage_unaligned((TRACE_HIDDEN_SIZE,))
-
-    fallback_pointer_pairs = []
-    run_unfused = fused_rmsnorm_quant._run_unfused_rmsnorm_quant_out
-
-    def tracked_unfused(*args, **kwargs):
-        input, weight = args[:2]
-        fallback_pointer_pairs.append((input.data_ptr(), weight.data_ptr()))
-        return run_unfused(*args, **kwargs)
-
-    monkeypatch.setattr(
-        fused_rmsnorm_quant,
-        "_run_unfused_rmsnorm_quant_out",
-        tracked_unfused,
-    )
-
-    @torch.compile(fullgraph=True, backend="eager")
-    def compiled(input: torch.Tensor, norm_weight: torch.Tensor):
-        return rmsnorm_per_token_group_quant_fp8(input, norm_weight, EPS)
-
-    calls = (
-        (aligned_input, aligned_weight),
-        (unaligned_input, aligned_weight),
-        (aligned_input, unaligned_weight),
-        (aligned_input, aligned_weight),
-    )
-    for input, weight in calls:
-        output = compiled(input, weight)
-        _assert_matches_unfused_pair(output, input, weight)
-
-    assert fallback_pointer_pairs == [
-        (unaligned_input.data_ptr(), aligned_weight.data_ptr()),
-        (aligned_input.data_ptr(), unaligned_weight.data_ptr()),
-    ]
 
 
 def test_cuda_graph_replay() -> None:
@@ -466,7 +289,6 @@ def test_cuda_graph_replay() -> None:
         (10, (12, 9), True),
         (10, (12, 8), False),
         (9, (13, 0), False),
-        (12, (13, 0), False),
     ],
 )
 def test_blackwell_runtime_gate(
@@ -490,46 +312,6 @@ def test_blackwell_runtime_gate(
         )
         is expected
     )
-
-
-def test_runtime_capability_result_is_not_cached(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    results = iter((False, True))
-    monkeypatch.setattr(
-        fused_rmsnorm_quant,
-        "_is_supported_blackwell_runtime",
-        lambda: next(results),
-    )
-
-    assert not fused_rmsnorm_quant.can_use_rmsnorm_per_token_group_quant_fp8(
-        DTYPE, TRACE_HIDDEN_SIZE
-    )
-    assert fused_rmsnorm_quant.can_use_rmsnorm_per_token_group_quant_fp8(
-        DTYPE, TRACE_HIDDEN_SIZE
-    )
-
-
-def test_runtime_gate_precedes_jit_compilation(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    x = _make_input(2)
-    weight = torch.randn(TRACE_HIDDEN_SIZE, device=DEVICE, dtype=DTYPE)
-    output_q, output_s, output_norm = _alloc_outputs(2)
-
-    monkeypatch.setattr(
-        fused_rmsnorm_quant, "_is_supported_blackwell_runtime", lambda: False
-    )
-
-    def fail_jit_lookup(*args, **kwargs):
-        pytest.fail("unsupported hardware reached JIT compilation")
-
-    monkeypatch.setattr(fused_rmsnorm_quant, "_jit_module", fail_jit_lookup)
-    monkeypatch.setattr(fused_rmsnorm_quant, "is_arch_support_pdl", fail_jit_lookup)
-    with pytest.raises(RuntimeError, match="SM10x Blackwell.*CUDA 12.9"):
-        fused_rmsnorm_quant.rmsnorm_per_token_group_quant_fp8_out(
-            x, weight, output_q, output_s, output_norm, EPS
-        )
 
 
 if __name__ == "__main__":

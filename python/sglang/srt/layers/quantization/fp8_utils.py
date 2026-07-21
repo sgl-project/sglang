@@ -12,10 +12,6 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
     sglang_per_token_group_quant_fp8_row_padded,
 )
 from sglang.srt.layers import deep_gemm_wrapper
-from sglang.srt.layers.quantization.fp8_rmsnorm import (
-    PackedUe8m0LinearInput,
-    PackedUe8m0LinearOp,
-)
 from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.common import torch_release
@@ -272,9 +268,16 @@ class Fp8GemmRunnerBackend(Enum):
         return self == Fp8GemmRunnerBackend.AITER
 
 
+class PackedUe8m0LinearInput(NamedTuple):
+    """FP8 activations and packed UE8M0 scales consumed by DeepGEMM."""
+
+    data: torch.Tensor
+    scale: torch.Tensor
+
+
 class BlockFp8LinearDispatch(NamedTuple):
     op: Callable
-    prequantized_op: Optional[PackedUe8m0LinearOp]
+    prequantized_op: Optional[Callable]
 
 
 FP8_GEMM_RUNNER_BACKEND: Fp8GemmRunnerBackend | None = None

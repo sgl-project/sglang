@@ -134,7 +134,7 @@ __global__ __launch_bounds__(kDim / 16) void rmsnorm_cta_wide(const RMSNormParam
 
   const auto& [input, weight_ptr, output, input_stride, output_stride, num_tokens, eps] = params;
   const auto gmem = tile::Memory<Storage>::cta(kNumThreads);
-  __shared__ float smem[kNumWarps];
+  __shared__ float smem[32];
 
   PDLWaitPrimary<kUsePDL>();
 
@@ -143,7 +143,39 @@ __global__ __launch_bounds__(kDim / 16) void rmsnorm_cta_wide(const RMSNormParam
 
   const auto input_vec = gmem.load(input_ptr);
   const auto weight_vec = gmem.load(weight_ptr);
-  const auto output_vec = norm::apply_norm_cta_static<kDim, kNumWarps>(input_vec, weight_vec, eps, smem);
+
+  float sum_of_squares = 0.0f;
+#pragma unroll
+  for (auto j = 0u; j < 8u; ++j) {
+    const auto [x, y] = cast<fp32x2_t>(input_vec[j]);
+    sum_of_squares += x * x + y * y;
+  }
+
+  sum_of_squares = warp::reduce_sum(sum_of_squares);
+  float norm_factor;
+  if constexpr (kNumWarps == 1) {
+    norm_factor = math::rsqrt(sum_of_squares / kDim + eps);
+  } else {
+    const auto warp_id = threadIdx.x / kWarpThreads;
+    smem[warp_id] = sum_of_squares;
+    __syncthreads();
+    if (warp_id == 0) {
+      const auto tx = threadIdx.x;
+      const auto local_sum = tx < kNumWarps ? smem[tx] : 0.0f;
+      sum_of_squares = warp::reduce_sum(local_sum);
+      smem[tx] = math::rsqrt(sum_of_squares / kDim + eps);
+    }
+    __syncthreads();
+    norm_factor = smem[warp_id];
+  }
+
+  Storage output_vec;
+#pragma unroll
+  for (auto j = 0u; j < 8u; ++j) {
+    const auto [ix, iy] = cast<fp32x2_t>(input_vec[j]);
+    const auto [wx, wy] = cast<fp32x2_t>(weight_vec[j]);
+    output_vec[j] = cast<Float2>(fp32x2_t{ix * norm_factor * wx, iy * norm_factor * wy});
+  }
 
   gmem.store(output_ptr, output_vec);
 

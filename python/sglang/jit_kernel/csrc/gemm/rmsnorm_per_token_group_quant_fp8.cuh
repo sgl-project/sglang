@@ -7,14 +7,15 @@
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
+#include <sgl_kernel/math.cuh>
+#include <sgl_kernel/type.cuh>
 #include <sgl_kernel/utils.cuh>
 #include <sgl_kernel/vec.cuh>
 #include <sgl_kernel/warp.cuh>
 
-#include <sgl_kernel/impl/norm.cuh>
-
 #include <tvm/ffi/container/tensor.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <cuda_fp8.h>
 
@@ -89,6 +90,53 @@ struct RMSNormPerTokenGroupQuantFP8Params {
   float eps;
 };
 
+// Self-contained SM100 CTA RMSNorm. Each active thread retains its 32-byte input
+// vector in registers across the reduction, so the fused kernel owns its norm
+// dataflow rather than depending on the shared standalone-RMSNorm helper (which
+// is tuned for a different launch topology). warp_sums needs kWarps floats.
+template <int kHidden, int kWarps, std::size_t kVecItems>
+SGL_DEVICE device::AlignedVector<packed_t<bf16_t>, kVecItems> apply_rmsnorm(
+    const device::AlignedVector<packed_t<bf16_t>, kVecItems>& input,
+    const device::AlignedVector<packed_t<bf16_t>, kVecItems>& weight,
+    float eps,
+    float* warp_sums) {
+  using namespace device;
+
+  float sum_of_squares = 0.0f;
+#pragma unroll
+  for (std::size_t i = 0; i < kVecItems; ++i) {
+    const auto v = cast<fp32x2_t>(input[i]);
+    sum_of_squares += v.x * v.x + v.y * v.y;
+  }
+  sum_of_squares = warp::reduce_sum(sum_of_squares);
+
+  float norm_factor;
+  if constexpr (kWarps == 1) {
+    norm_factor = math::rsqrt(sum_of_squares / kHidden + eps);
+  } else {
+    const auto warp_id = threadIdx.x / kWarpThreads;
+    const auto lane_id = threadIdx.x % kWarpThreads;
+    warp_sums[warp_id] = sum_of_squares;
+    __syncthreads();
+    if (warp_id == 0) {
+      const float local_sum = lane_id < kWarps ? warp_sums[lane_id] : 0.0f;
+      const float total_sum = warp::reduce_sum(local_sum);
+      if (lane_id == 0) warp_sums[0] = total_sum;
+    }
+    __syncthreads();
+    norm_factor = math::rsqrt(warp_sums[0] / kHidden + eps);
+  }
+
+  AlignedVector<packed_t<bf16_t>, kVecItems> output;
+#pragma unroll
+  for (std::size_t i = 0; i < kVecItems; ++i) {
+    const auto vi = cast<fp32x2_t>(input[i]);
+    const auto vw = cast<fp32x2_t>(weight[i]);
+    output[i] = cast<packed_t<bf16_t>, fp32x2_t>({vi.x * norm_factor * vw.x, vi.y * norm_factor * vw.y});
+  }
+  return output;
+}
+
 template <int kHidden, bool kUsePDL>
 __global__
 __launch_bounds__(((kHidden / kItemsPerThread + 31) / 32) * 32) void rmsnorm_per_token_group_quant_fp8_kernel(
@@ -134,8 +182,7 @@ __launch_bounds__(((kHidden / kItemsPerThread + 31) / 32) * 32) void rmsnorm_per
   if (is_active) input_vec.load(input_row + elem_offset);
   if (is_active) weight_vec.load(params.weight + elem_offset);
   __shared__ float warp_sums[kWarps];
-  const auto norm_vec =
-      device::norm::apply_norm_cta_static<kHidden, kWarps>(input_vec, weight_vec, params.eps, warp_sums);
+  const auto norm_vec = apply_rmsnorm<kHidden, kWarps>(input_vec, weight_vec, params.eps, warp_sums);
 
   if (is_active) {
     norm_vec.store(norm_row + elem_offset);
@@ -156,8 +203,6 @@ __launch_bounds__(((kHidden / kItemsPerThread + 31) / 32) * 32) void rmsnorm_per
 
 template <int kHidden, bool kUsePDL>
 struct RMSNormPerTokenGroupQuantFP8Kernel {
-  static_assert(kHidden >= kGroupSize && kHidden % kGroupSize == 0);
-  static_assert(kHidden <= 16384);
   static constexpr int kActiveThreads = kHidden / kItemsPerThread;
   static constexpr int kThreads = ((kActiveThreads + 31) / 32) * 32;
   static constexpr int kGroupsPerToken = kHidden / kGroupSize;
