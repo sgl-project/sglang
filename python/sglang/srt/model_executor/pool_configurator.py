@@ -991,9 +991,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         ``num_req_slots * c4_ring_size`` -- exactly the c128 pattern.)
         """
         num_req_slots = self._get_num_req_slots(max_running_requests)
-        swa_pages = ceil_div(
-            num_req_slots * self._swa_ring_size, self.swa_page_size
-        )
+        swa_pages = ceil_div(num_req_slots * self._swa_ring_size, self.swa_page_size)
         return swa_pages * self.c4_ring_size
 
     def _fixed_c4_state_bytes(self, max_running_requests: int) -> int:
