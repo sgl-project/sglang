@@ -78,7 +78,7 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         self,
         shape_key: ShapeKey,
         forward_fn: Callable[[], Any],
-        dummies: Optional[Any] = None,
+        capture_inputs: Optional[Any] = None,
         post_warmup_hook: Optional[Callable[[], None]] = None,
     ) -> None:
         import torch_npu  # noqa: F401  (verifies NPU availability)
@@ -111,11 +111,14 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         else:
             graph_ctx = torch.npu.graph
 
-        with skip_guard_context, graph_ctx(
-            graph,
-            pool=self._pool,
-            stream=self._capture_stream,
-            auto_dispatch_capture=True,
+        with (
+            skip_guard_context,
+            graph_ctx(
+                graph,
+                pool=self._pool,
+                stream=self._capture_stream,
+                auto_dispatch_capture=True,
+            ),
         ):
             out = forward_fn()
 

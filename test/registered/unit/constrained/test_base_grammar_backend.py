@@ -396,5 +396,45 @@ class TestCreateGrammarBackend(unittest.TestCase):
         self.assertIsNone(kwargs["model_eos_token_ids"])
 
 
+class TestLlguidanceStructuralTagTriggerPairing(unittest.TestCase):
+    """Bug regression: dispatch_structural_tag paired EVERY structure with
+    triggers[0]. Detectors with per-tool triggers (Inkling emits
+    <|message_model|>{name}<|content_invoke_tool_json|> per tool) produce
+    multiple distinct triggers, and llguidance's StructTag asserts
+    begin.startswith(trigger) — so any multi-tool constrained request
+    compiled to InvalidGrammarObject."""
+
+    def test_each_structure_pairs_with_its_own_trigger(self):
+        import json
+
+        from sglang.srt.constrained.llguidance_backend import GuidanceBackend
+
+        backend = object.__new__(GuidanceBackend)
+        backend._from_serialized = lambda serialized: serialized
+        begins = [
+            '<|message_model|>alpha<|content_invoke_tool_json|>{"name":"alpha","args":',
+            '<|message_model|>beta<|content_invoke_tool_json|>{"name":"beta","args":',
+        ]
+        key = json.dumps(
+            {
+                "type": "structural_tag",
+                "structures": [
+                    {
+                        "begin": begin,
+                        "schema": {"type": "object"},
+                        "end": "<|end_message|>",
+                    }
+                    for begin in begins
+                ],
+                "triggers": [
+                    "<|message_model|>alpha<|content_invoke_tool_json|>",
+                    "<|message_model|>beta<|content_invoke_tool_json|>",
+                ],
+            }
+        )
+        result = backend.dispatch_structural_tag(key)
+        self.assertNotIsInstance(result, InvalidGrammarObject)
+
+
 if __name__ == "__main__":
     unittest.main()

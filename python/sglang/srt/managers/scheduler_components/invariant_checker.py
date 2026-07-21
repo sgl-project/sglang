@@ -160,11 +160,14 @@ class SchedulerInvariantChecker:
             self.req_to_token_pool.mamba_pool.size,
         )
         if leak:
-            # Page-level leak diagnosis for mamba
-            free_full_pages = set(
-                self.token_to_kv_pool_allocator.free_pages.tolist()
-                + self.token_to_kv_pool_allocator.release_pages.tolist()
-            )
+            # Page-level leak diagnosis for mamba. Allocator flavors without
+            # page free-lists (free_pages is None) skip the page census — the
+            # dump must never crash the watchdog thread that calls it.
+            free_pages = self.token_to_kv_pool_allocator.free_pages
+            release_pages = self.token_to_kv_pool_allocator.release_pages
+            if free_pages is None or release_pages is None:
+                return leak, msg
+            free_full_pages = set(free_pages.tolist() + release_pages.tolist())
             cached_full_pages = set(self.tree_cache.all_values_flatten().tolist())
             expected_full_pages = set(
                 range(1, self.token_to_kv_pool_allocator.size + 1)

@@ -81,7 +81,7 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         self,
         shape_key: ShapeKey,
         forward_fn: Callable[[], Any],
-        dummies: Optional[Any] = None,
+        capture_inputs: Optional[Any] = None,
         post_warmup_hook: Optional[Callable[[], None]] = None,
     ) -> None:
         # Two warmups so kernels are loaded and one-time setup is paid before capture.

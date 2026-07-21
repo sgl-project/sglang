@@ -19,6 +19,7 @@ import threading
 import time
 from typing import TYPE_CHECKING, Any
 
+import numpy as np
 import torch
 import zmq
 
@@ -137,13 +138,17 @@ def _is_tensor_like(value) -> bool:
 
 
 def _to_json_serializable(value):
-    if isinstance(value, torch.Tensor):
+    if isinstance(value, (torch.Tensor, np.ndarray)):
         return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
     if isinstance(value, (list, tuple)):
         converted = []
         for item in value:
-            if isinstance(item, torch.Tensor):
+            if isinstance(item, (torch.Tensor, np.ndarray)):
                 converted.append(item.tolist())
+            elif isinstance(item, np.generic):
+                converted.append(item.item())
             else:
                 converted.append(item)
         return converted
@@ -152,7 +157,17 @@ def _to_json_serializable(value):
 
 def _is_default(value, field_info) -> bool:
     if field_info.default is not dataclasses.MISSING:
-        return value == field_info.default
+        # ``value == default`` may be element-wise for array/tensor-valued
+        # fields (numpy ndarray, torch.Tensor) or even raise for list-of-array
+        # values. Only treat the field as default when the comparison reduces
+        # to a real boolean; otherwise it is not equal to a scalar default.
+        try:
+            eq = value == field_info.default
+            if isinstance(eq, (bool, np.bool_)):
+                return bool(eq)
+        except (ValueError, RuntimeError):
+            pass
+        return False
     if field_info.default_factory is not dataclasses.MISSING:
         if isinstance(value, (list, dict)) and len(value) == 0:
             return True

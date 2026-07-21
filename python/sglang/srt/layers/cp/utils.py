@@ -40,6 +40,7 @@ if TYPE_CHECKING:
 
 CP_V2_DEFAULT_MODEL_CLASSES = frozenset(
     {
+        "GptOssForCausalLM",
         "MiMoV2FlashForCausalLM",
         "MiMoV2ForCausalLM",
         "Qwen3MoeForCausalLM",

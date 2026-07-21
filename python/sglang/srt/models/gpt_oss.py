@@ -68,11 +68,14 @@ from sglang.srt.models.utils import (
     create_fused_set_kv_buffer_arg,
     enable_fused_set_kv_buffer,
 )
-from sglang.srt.runtime_context import get_forward, get_parallel, get_server_args
+from sglang.srt.runtime_context import (
+    get_forward,
+    get_parallel,
+    get_server_args,
+)
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
-    get_cuda_version,
     is_blackwell_supported,
     is_cpu,
     is_cuda,
@@ -94,7 +97,7 @@ _is_tinygemm_supported = (
     and (is_sm90_supported() or is_blackwell_supported())
 )
 
-if _is_tinygemm_supported and get_cuda_version()[0] < 13:
+if _is_tinygemm_supported:
     try:
         from flashinfer.gemm import tinygemm_bf16
     except ImportError:
@@ -255,10 +258,40 @@ class GptOssSparseMoeBlock(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: Optional[ForwardBatch] = None,
     ) -> torch.Tensor:
+        if get_server_args().dwdp_size > 1:
+            return self.forward_dwdp(hidden_states)
+
         if not get_moe_a2a_backend().is_deepep():
             return self.forward_normal(hidden_states)
         else:
-            raise Exception("forward_deepep branch not implemented yet")
+            raise NotImplementedError("forward_deepep branch not implemented yet")
+
+    def forward_dwdp(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        num_tokens = hidden_states.shape[0]
+        hidden_dim_unpadded = self.hidden_size
+        is_prepadded = hidden_states.shape[-1] != hidden_dim_unpadded
+
+        if num_tokens > 0:
+            router_input = (
+                hidden_states[..., :hidden_dim_unpadded]
+                if is_prepadded
+                else hidden_states
+            )
+            router_logits, _ = self.router(router_input)
+            topk_output = self.topk(router_input, router_logits)
+            final_hidden_states = self.experts(hidden_states, topk_output)
+        else:
+            final_hidden_states = hidden_states
+
+        if is_prepadded:
+            ans = final_hidden_states[..., :hidden_dim_unpadded].contiguous()
+            ans = ans.view(num_tokens, hidden_dim_unpadded)
+        else:
+            ans = final_hidden_states.view(num_tokens, hidden_dim_unpadded)
+        return ans
 
     def get_moe_weights(self):
         return [
