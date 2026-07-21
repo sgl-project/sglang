@@ -6,10 +6,16 @@ FP8 quantized weights. Skipped when HPC-Ops (https://github.com/Tencent/hpc-ops)
 is not installed or the GPU is older than sm90.
 """
 
+import os
 import unittest
 
 import torch
 
+from sglang.srt.distributed.parallel_state import (
+    init_distributed_environment,
+    initialize_model_parallel,
+    model_parallel_is_initialized,
+)
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.hpc_ops import (
     HpcOpsMoeQuantInfo,
@@ -36,6 +42,29 @@ def _sm90_or_newer() -> bool:
     return major >= 9
 
 
+def _ensure_dist_initialized() -> None:
+    """Single-rank gloo distributed + model-parallel groups (TP=1, EP=1).
+
+    The triton fused_experts reference allocates its output under
+    ``use_symmetric_memory(get_tp_group(), ...)``, which requires the TP
+    group even when symmetric allocation is disabled.
+    """
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", "29633")
+    os.environ.setdefault("RANK", "0")
+    os.environ.setdefault("WORLD_SIZE", "1")
+    os.environ.setdefault("LOCAL_RANK", "0")
+    if not torch.distributed.is_initialized():
+        init_distributed_environment(world_size=1, rank=0, local_rank=0, backend="gloo")
+    if not model_parallel_is_initialized():
+        initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            expert_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            backend="gloo",
+        )
+
+
 def _quant_blockwise(w: torch.Tensor, block: int = 128):
     """Proper 128x128 blockwise fp8 quantization of a fp32 weight [E, N, K]."""
     num_experts, n, k = w.shape
@@ -55,6 +84,7 @@ class TestHpcOpsMoeBlockwise(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
+        _ensure_dist_initialized()
         torch.manual_seed(0)
 
     def _make_case(self, num_tokens: int):
