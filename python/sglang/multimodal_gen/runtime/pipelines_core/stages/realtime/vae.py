@@ -84,12 +84,13 @@ class CausalVaeDecodingStage(DecodingStage):
 
     TAEHV_CHECKPOINT_ENV = "SGLANG_REALTIME_TAEHV_CHECKPOINT_PATH"
 
-    @staticmethod
-    def _taehv_checkpoint_path() -> str | None:
-        value = os.environ.get(CausalVaeDecodingStage.TAEHV_CHECKPOINT_ENV)
-        if value is None or not value.strip():
-            return None
-        return value.strip()
+    def _taehv_checkpoint_path(self) -> str | None:
+        if not hasattr(self, "_cached_taehv_checkpoint_path"):
+            value = os.environ.get(self.TAEHV_CHECKPOINT_ENV)
+            self._cached_taehv_checkpoint_path = (
+                value.strip() if value and value.strip() else None
+            )
+        return self._cached_taehv_checkpoint_path
 
     @staticmethod
     def _supports_wan_decoder_cache(vae) -> bool:
@@ -192,12 +193,28 @@ class CausalVaeDecodingStage(DecodingStage):
         if decode_state.taehv_streaming_decoder is not None:
             return decode_state.taehv_streaming_decoder
 
-        checkpoint_path = self._taehv_checkpoint_path()
-        if checkpoint_path is None:
-            raise RuntimeError("TAEHV checkpoint path is not configured")
+        if not hasattr(self, "_taehv_model"):
+            checkpoint_path = self._taehv_checkpoint_path()
+            if checkpoint_path is None:
+                raise RuntimeError("TAEHV checkpoint path is not configured")
+
+            try:
+                from taehv import TAEHV
+            except ImportError as exc:
+                raise RuntimeError(
+                    "TAEHV realtime decode requires the `taehv` package. "
+                    "Install it and set SGLANG_REALTIME_TAEHV_CHECKPOINT_PATH "
+                    "to a TAEHV checkpoint."
+                ) from exc
+
+            vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
+            self._taehv_model = TAEHV(checkpoint_path=checkpoint_path).to(
+                get_local_torch_device(), vae_dtype
+            )
+            self._taehv_model.eval()
 
         try:
-            from taehv import StreamingTAEHV, TAEHV
+            from taehv import StreamingTAEHV
         except ImportError as exc:
             raise RuntimeError(
                 "TAEHV realtime decode requires the `taehv` package. "
@@ -205,12 +222,7 @@ class CausalVaeDecodingStage(DecodingStage):
                 "to a TAEHV checkpoint."
             ) from exc
 
-        vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
-        tiny_vae = TAEHV(checkpoint_path=checkpoint_path).to(
-            get_local_torch_device(), vae_dtype
-        )
-        tiny_vae.eval()
-        decoder = StreamingTAEHV(tiny_vae)
+        decoder = StreamingTAEHV(self._taehv_model)
         decode_state.taehv_streaming_decoder = decoder
         return decoder
 
@@ -254,15 +266,19 @@ class CausalVaeDecodingStage(DecodingStage):
                 produced.append(frame)
 
         decode_state.taehv_output_queue.extend(produced)
-        take = min(target_frames, len(decode_state.taehv_output_queue))
-        frames = decode_state.taehv_output_queue[:take]
-        decode_state.taehv_output_queue = decode_state.taehv_output_queue[take:]
-        if not frames:
+        if not decode_state.taehv_output_queue:
             raise RuntimeError("TAEHV produced no frames for realtime chunk")
 
-        frames_ntchw = torch.cat(frames, dim=1)
-        if frames_ntchw.shape[1] > target_frames:
-            frames_ntchw = frames_ntchw[:, :target_frames].contiguous()
+        all_frames = torch.cat(decode_state.taehv_output_queue, dim=1)
+        take = min(target_frames, all_frames.shape[1])
+        if take == 0:
+            raise RuntimeError("TAEHV produced no frames for realtime chunk")
+
+        frames_ntchw = all_frames[:, :take].contiguous()
+        remaining = all_frames[:, take:].contiguous()
+        decode_state.taehv_output_queue = (
+            [remaining] if remaining.shape[1] > 0 else []
+        )
         return frames_ntchw.permute(0, 2, 1, 3, 4).contiguous()
 
     @torch.no_grad()

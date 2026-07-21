@@ -186,8 +186,10 @@ def test_causal_vae_decoding_stage_can_use_streaming_taehv(monkeypatch):
     class _TAEHV:
         t_upscale = 4
         frames_to_trim = 3
+        init_count = 0
 
         def __init__(self, checkpoint_path):
+            type(self).init_count += 1
             self.checkpoint_path = checkpoint_path
 
         def to(self, device=None, dtype=None):
@@ -258,4 +260,6 @@ def test_causal_vae_decoding_stage_can_use_streaming_taehv(monkeypatch):
     assert tuple(first.shape) == (1, 2, 9, 1, 1)
     assert tuple(second.shape) == (1, 2, 12, 1, 1)
     assert state.taehv_streaming_decoder.reset_calls == 1
-    assert state.taehv_output_queue == []
+    assert _TAEHV.init_count == 1
+    assert len(state.taehv_output_queue) == 1
+    assert tuple(state.taehv_output_queue[0].shape) == (1, 3, 2, 1, 1)
