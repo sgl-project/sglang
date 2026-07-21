@@ -4,9 +4,11 @@ from typing import Tuple
 import torch
 import triton
 
+from sglang.srt.environ import envs
 from sglang.srt.utils import ceil_div, is_cuda, is_musa
 
 logger = logging.getLogger(__name__)
+
 
 _is_cuda = is_cuda()
 _is_musa = is_musa()
@@ -1541,6 +1543,25 @@ def moe_ep_deepgemm_preprocess(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     # For masked grouped GEMM, shape M should be multiple of the block M (current block M: {block_m}) https://github.com/deepseek-ai/DeepGEMM/blob/main/deep_gemm/jit_kernels/m_grouped_gemm.py#L165
     m_max = (hidden_states.size(0) // 256 + 1) * 256
+    if (
+        envs.SGLANG_OPT_DG_MASKED_M_CAP.get()
+        and not torch.cuda.is_current_stream_capturing()
+    ):
+        # (capture guard: decode CUDA-graph capture also routes through this
+        # preprocess; the D2H sync is illegal mid-capture, and decode batches
+        # are small enough that the uncapped m_max is harmless there.)
+        # m_max reserves capacity for ALL rank tokens in EVERY local expert:
+        # the [num_local_experts, m_max, *] masked-GEMM intermediates reach
+        # 7+ GiB per 32k-token chunk and OOM saturated serving.  The hottest
+        # expert only ever holds max(masked_m) rows, so cap the padded
+        # capacity there (rounded up to the DeepGEMM block-M).  Costs one
+        # probe dispatch-index launch + one D2H sync per MoE layer;
+        # correctness is unconditional (m_cap >= max(masked_m) by
+        # construction, and the final src2dst below is built with the same
+        # capped stride).
+        masked_m_probe, _ = fused_moe_dispatch_index(topk_ids, num_local_experts, m_max)
+        m_cap = (int(masked_m_probe.max().item()) + 255) // 256 * 256
+        m_max = min(m_max, max(m_cap, 256))
     expected_m = (topk_ids.numel() - 1) // num_local_experts + 1
 
     masked_m, src2dst = fused_moe_dispatch_index(topk_ids, num_local_experts, m_max)

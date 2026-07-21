@@ -539,6 +539,14 @@ class Envs:
     # symmetric-memory kernel), OFF elsewhere (would fall back to RCCL); override
     # explicitly to force on/off on any platform.
     SGLANG_DP_USE_REDUCE_SCATTER = EnvBool(_default_hip)
+    # Quantize the variable-length DP-MoE gather payload (SGLANG_DP_USE_GATHERV
+    # path, prefill/extend only) to fp8-e4m3 with per-token-group-128 scales:
+    # halves the gathered hidden-state bytes over NCCL; the combine
+    # (reduce_scatterv) leg stays bf16 (NCCL SUM cannot run on fp8).  Lossy on
+    # the wire — same group quantization the MoE expert GEMMs apply to their
+    # input anyway, but router/shared-expert reads see rounded values, so this
+    # stays accuracy-gated and default OFF.
+    SGLANG_ENABLE_DP_GATHER_FP8 = EnvBool(False)
     SGLANG_USE_AITER_UNIFIED_ATTN = EnvBool(False)
     # Select the gate/up tile layout for AITER MoE: True -> interleave
     # (matches FlyDSL `gate_mode="interleave"` kernels), False -> separated
@@ -668,6 +676,18 @@ class Envs:
 
     # DeepGemm
     SGLANG_ENABLE_JIT_DEEPGEMM = EnvBool(True)
+    # Cap the DeepGEMM masked grouped-GEMM per-expert padded capacity at
+    # round_up(max(masked_m), 256) instead of round_up(rank_tokens, 256):
+    # shrinks the [num_local_experts, m, *] MoE intermediates ~4x under
+    # load imbalance (they otherwise OOM saturated --moe-runner-backend
+    # deep_gemm serving).  Costs one D2H sync per MoE layer.
+    SGLANG_OPT_DG_MASKED_M_CAP = EnvBool(False)
+    # Drop dp-attention MAX_LEN pad rows from MoE dispatch (StandardDispatcher
+    # post-translation topk_ids -> -1): pad rows otherwise run the router on
+    # stale hidden values and burn expert compute whose outputs are discarded;
+    # colliding pad top-ks also inflate the DeepGEMM masked-GEMM workspace to
+    # OOM at saturation.  Capture-safe (reads only global_num_tokens_gpu).
+    SGLANG_OPT_MASK_DP_PAD_MOE = EnvBool(False)
     SGLANG_JIT_DEEPGEMM_PRECOMPILE = EnvBool(True)
     SGLANG_JIT_DEEPGEMM_FAST_WARMUP = EnvBool(False)
     SGLANG_JIT_DEEPGEMM_COMPILE_WORKERS = EnvInt(4)
@@ -712,6 +732,35 @@ class Envs:
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
     SGLANG_DISABLE_DSA_INDEXER_FUSION = EnvBool(False)
+    # Opt-in perf path for --dsa-prefill-backend flashmla_sparse_q8: fuse the
+    # absorbed q bmm with the nope/rope concat + fp8 cast so q is written
+    # directly in fp8 ("born fp8") and the standalone concat-cast kernel
+    # disappears.  Not bit-exact vs the default path (same rounding stages,
+    # different GEMM accumulation order), hence default OFF until accuracy-
+    # gated (oracle + full-set gsm8k).
+    SGLANG_ENABLE_DSA_Q8KV8_BORN_FP8_Q = EnvBool(False)
+    # Opt-in perf path for --dsa-prefill-backend flashmla_sparse_q8: pass a
+    # per-row valid-topk count (derived from the trailing -1 pad run of the
+    # topk indices) so the kernel skips whole pad-only topk blocks instead of
+    # computing masked zero contributions.  Bit-exact by construction: skipped
+    # blocks contain only -1 pads, and -1 entries inside the consumed range
+    # still take the in-kernel clamp+mask path.
+    SGLANG_ENABLE_DSA_Q8KV8_TOPK_LENGTH = EnvBool(False)
+    # Opt-in: run the born-fp8 q-prep (absorbed bmm + concat + fp8 cast,
+    # ~173us/layer-call) on alt_stream underneath the DSA indexer — the two
+    # chains fork independently from the q_a_layernorm output.  Requires
+    # SGLANG_ENABLE_DSA_Q8KV8_BORN_FP8_Q; eager-prefill-only via the born
+    # predicate.  Coarse per-layer join keeps the single-slot born-q buffer
+    # WAR-safe.
+    SGLANG_ENABLE_DSA_Q8KV8_QPREP_OVERLAP = EnvBool(False)
+    # Opt-in: fuse the Q8KV8 non-prefix KV prep — cast-concat k/k_rope
+    # directly into the persistent fp8 kv buffer and zero the pad band in one
+    # Triton kernel (replaces bf16 _cat + copy_ cast + zero_ tail).
+    SGLANG_ENABLE_DSA_Q8KV8_KV_CAT_FUSION = EnvBool(False)
+    # Q8KV8 born-fp8 q-prep codegen: "auto" = per-K Triton dispatch (default);
+    # "cuda" = the hand-written SM90 WGMMA kernel (bitwise identical to the
+    # Triton two_dot variant, 1.16-1.38x faster across GLM/DS shapes).
+    SGLANG_OPT_Q8KV8_QPREP_VARIANT = EnvStr("auto")
 
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)
@@ -1081,6 +1130,14 @@ class Envs:
     SGLANG_OPT_USE_JIT_EP_ACTIVATION = EnvBool(True)
     SGLANG_OPT_FUSE_WQA_WKV = EnvBool(True)
     SGLANG_OPT_SWIGLU_CLAMP_FUSION = EnvBool(True)
+    # DeepSeek/GLM MoE (deepseek_v2.py): quantize the (dp-gathered) MoE input
+    # to per-token-group-128 fp8 ONCE and feed both the fused shared-expert
+    # GEMM (cutlass w8a8 linear) and the routed experts' triton fused runner,
+    # instead of quantizing the same [T, hidden] tensor twice with different
+    # scale layouts. Only engages on CUDA with fp8 block-128 weights, the
+    # standard dispatcher, and the triton MoE runner; falls back silently
+    # otherwise.
+    SGLANG_OPT_MOE_QUANT_ONCE = EnvBool(False)
 
     # Cache / overlap
     SGLANG_OPT_USE_FUSED_STORE_CACHE = EnvBool(True)

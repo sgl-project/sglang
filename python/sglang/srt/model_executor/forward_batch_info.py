@@ -1241,6 +1241,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             num_tokens,
             dp_padding_mode.is_max_len(),
             global_num_tokens,
+            self.global_num_tokens_gpu,
         )
         set_is_extend_in_batch(self.is_extend_in_batch)
 
