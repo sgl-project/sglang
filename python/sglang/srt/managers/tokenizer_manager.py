@@ -1033,6 +1033,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Validate generation-specific fields
         if isinstance(obj, GenerateReqInput):
+            # Only user-supplied token ids can be out of range; ids produced by
+            # the tokenizer are always valid, so skip the scan for text requests.
+            if obj.input_ids is not None:
+                self._validate_input_ids_in_vocab(
+                    input_ids, self.model_config.vocab_size
+                )
             self._validate_token_ids_logprob(obj)
             if (
                 obj.return_hidden_states
@@ -1117,20 +1123,20 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def _validate_input_ids_in_vocab(
         self, input_ids: Union[List[int], List[List[int]]], vocab_size: int
     ) -> None:
-        # Handle both single sequence and batch of sequences
-        if isinstance(input_ids[0], list):
-            # Batch of sequences
-            for seq in input_ids:
-                if any(id >= vocab_size for id in seq):
+        # Out-of-range ids index the model's embedding out of bounds (on CUDA a
+        # device-side assert that crashes the whole server); an id < 0 wraps to
+        # the end of the embedding table (silently wrong). Both are checked.
+        if not input_ids:
+            return
+        # Handle both a single sequence and a batch of sequences.
+        seqs = input_ids if isinstance(input_ids[0], list) else [input_ids]
+        for seq in seqs:
+            for token_id in seq:
+                if not 0 <= token_id < vocab_size:
                     raise ValueError(
-                        f"The input_ids {seq} contains values greater than the vocab size ({vocab_size})."
+                        f"input_ids contains an out-of-vocabulary token id "
+                        f"{token_id}; valid range is [0, {vocab_size})."
                     )
-        else:
-            # Single sequence
-            if any(id >= vocab_size for id in input_ids):
-                raise ValueError(
-                    f"The input_ids {input_ids} contains values greater than the vocab size ({vocab_size})."
-                )
 
     def _create_tokenized_object(
         self,
