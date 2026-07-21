@@ -37,6 +37,9 @@ pub struct Ingress {
     senders: Senders,
     ingress: IngressProducer,
     skip_tokenizer_init: bool,
+    /// `model_config.vocab_size`; bounds client-supplied token ids in
+    /// `validate` (`None` → unknown, checks skipped).
+    vocab_size: Option<u64>,
     shutdown: flume::Receiver<()>,
 }
 
@@ -46,6 +49,7 @@ impl Ingress {
         senders: Senders,
         ingress: IngressProducer,
         skip_tokenizer_init: bool,
+        vocab_size: Option<u64>,
         shutdown: flume::Receiver<()>,
     ) -> Self {
         Self {
@@ -53,6 +57,7 @@ impl Ingress {
             senders,
             ingress,
             skip_tokenizer_init,
+            vocab_size,
             shutdown,
         }
     }
@@ -98,7 +103,7 @@ impl Ingress {
                 // Validate, then register the sink before the request leaves Rust.
                 // Failures move to `Failed` and fall through to the reject arm.
                 RequestState::Received => {
-                    if let Err(e) = validate(&mut req, self.skip_tokenizer_init) {
+                    if let Err(e) = validate(&mut req, self.skip_tokenizer_init, self.vocab_size) {
                         let _ = req.state.apply(Event::Error(e)); // → Failed
                         continue;
                     }
@@ -307,7 +312,11 @@ fn sampling_flag(sampling_params: &Option<rmpv::Value>, key: &str) -> bool {
 /// `Received → Validating` + admissibility check. Under `skip_tokenizer_init` a
 /// generate request must already carry token ids (no tokenizer to byte-encode
 /// text); control requests carry none and are exempt.
-fn validate(req: &mut Request, skip_tokenizer_init: bool) -> Result<(), Error> {
+fn validate(
+    req: &mut Request,
+    skip_tokenizer_init: bool,
+    vocab_size: Option<u64>,
+) -> Result<(), Error> {
     let _ = req
         .state
         .apply(Event::Validated(ValidationOutcome::NeedsTokenize));
@@ -317,6 +326,33 @@ fn validate(req: &mut Request, skip_tokenizer_init: bool) -> Result<(), Error> {
         return Err(Error::Tokenize(
             "skip_tokenizer_init is set: request must provide input_ids".into(),
         ));
+    }
+
+    // Client-supplied token ids must be in-vocabulary: an out-of-range id
+    // reaches the embedding lookup and kills the scheduler process, so 400
+    // here instead — mirroring the Python `TokenizerManager` validation.
+    if let (Some(vs), RequestKind::Generate(g)) = (vocab_size, &req.kind) {
+        if let Some(ids) = &g.input_ids {
+            for &id in ids {
+                if id < 0 || id as u64 >= vs {
+                    return Err(Error::Validation(format!(
+                        "input_ids contains out-of-vocabulary token id {id}; \
+                         valid range is [0, {vs})"
+                    )));
+                }
+            }
+        }
+        if let Some(rmpv::Value::Array(ids)) = &g.token_ids_logprob {
+            for v in ids {
+                let id = v.as_i64().unwrap_or(-1);
+                if id < 0 || id as u64 >= vs {
+                    return Err(Error::Validation(format!(
+                        "token_ids_logprob contains out-of-vocabulary token id \
+                         {v}; valid range is [0, {vs})"
+                    )));
+                }
+            }
+        }
     }
 
     Ok(())
@@ -351,7 +387,7 @@ mod tests {
         // end `run` by dropping `tm_tx`, not by shutdown.
         let (sd_tx, sd_rx) = flume::unbounded::<()>();
         std::mem::forget(sd_tx);
-        let ingress = Ingress::new(tm_rx, senders, ingress_producer, false, sd_rx);
+        let ingress = Ingress::new(tm_rx, senders, ingress_producer, false, Some(1000), sd_rx);
         (ingress, detok_rx, consumer, tm_tx)
     }
 
@@ -391,6 +427,52 @@ mod tests {
             detok_rx.try_recv().is_err(),
             "no further shard messages — registration fully cleaned up",
         );
+    }
+
+    /// Regression: an out-of-vocabulary client token id must be rejected at
+    /// ingress with a 400 — passed through, it reaches the embedding lookup
+    /// and kills the scheduler process (`make_ingress` bounds vocab at 1000).
+    #[test]
+    fn out_of_vocab_input_ids_rejected() {
+        let (ingress, detok_rx, _consumer, _tm_tx) = make_ingress();
+        let mut req = generate_req(21, rmpv::Value::Map(vec![]));
+        if let RequestKind::Generate(g) = &mut req.kind {
+            g.input_ids = Some(vec![1, 2_000_000_000]);
+        }
+        ingress.drive(req);
+        // Rejected before registration: the only shard message is nothing at
+        // all, or a Deregister if registration happened first — never a push.
+        match detok_rx.try_recv() {
+            Err(_) => {}
+            Ok(DetokMsg::Deregister { .. }) => {}
+            Ok(_) => panic!("out-of-vocab request must not be admitted"),
+        }
+    }
+
+    /// Same guard for negative ids and for `token_ids_logprob` entries.
+    #[test]
+    fn negative_and_logprob_token_ids_rejected() {
+        let (ingress, detok_rx, _consumer, _tm_tx) = make_ingress();
+        let mut req = generate_req(22, rmpv::Value::Map(vec![]));
+        if let RequestKind::Generate(g) = &mut req.kind {
+            g.input_ids = Some(vec![-1]);
+        }
+        ingress.drive(req);
+        match detok_rx.try_recv() {
+            Err(_) | Ok(DetokMsg::Deregister { .. }) => {}
+            Ok(_) => panic!("negative token id must not be admitted"),
+        }
+
+        let (ingress, detok_rx, _consumer, _tm_tx) = make_ingress();
+        let mut req = generate_req(23, rmpv::Value::Map(vec![]));
+        if let RequestKind::Generate(g) = &mut req.kind {
+            g.token_ids_logprob = Some(rmpv::Value::Array(vec![rmpv::Value::from(999_999)]));
+        }
+        ingress.drive(req);
+        match detok_rx.try_recv() {
+            Err(_) | Ok(DetokMsg::Deregister { .. }) => {}
+            Ok(_) => panic!("out-of-vocab token_ids_logprob must not be admitted"),
+        }
     }
 
     /// A valid request is registered and handed onward — never deregistered.
