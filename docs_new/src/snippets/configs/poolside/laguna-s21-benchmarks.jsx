@@ -74,12 +74,17 @@ export const benchmarks = [
   },
 
   // ── B300 (8×B300, tp 8, sglang 0.5.15.post1) ──
+  // AIME25 (high-throughput cells): sgl-eval run aime25, 30 problems × 16 repeats,
+  // temp 1.0, top_p 0.95, max_tokens 64000 (BF16: 131072), 128 threads, thinking ON
+  // via enable_thinking-patched sgl-eval. 2026-07-21.
 
   {
+    // BF16 AIME25 at max_tokens 131072 (64000 truncates BF16 heavily); reasoning is
+    // ~2.7× longer than quantized variants and 7.7% of samples still truncate.
     match: { hw: "b300", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" },
     verified: true,
     sglang_version: "0.5.15.post1",
-    accuracy: { gsm8k_pct: 93.71, aime25_pct: null },
+    accuracy: { gsm8k_pct: 93.71, aime25_pct: 44.58 },
   },
   {
     match: { hw: "b300", variant: "default", quant: "bf16", strategy: "low-latency", nodes: "single" },
@@ -91,7 +96,7 @@ export const benchmarks = [
     match: { hw: "b300", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
     verified: true,
     sglang_version: "0.5.15.post1",
-    accuracy: { gsm8k_pct: 94.39, aime25_pct: null },
+    accuracy: { gsm8k_pct: 94.39, aime25_pct: 66.88 },
   },
   {
     match: { hw: "b300", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
@@ -103,7 +108,7 @@ export const benchmarks = [
     match: { hw: "b300", variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "single" },
     verified: true,
     sglang_version: "0.5.15.post1",
-    accuracy: { gsm8k_pct: 94.54, aime25_pct: null },
+    accuracy: { gsm8k_pct: 94.54, aime25_pct: 66.46 },
   },
   {
     match: { hw: "b300", variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
@@ -115,7 +120,7 @@ export const benchmarks = [
     match: { hw: "b300", variant: "default", quant: "int4", strategy: "high-throughput", nodes: "single" },
     verified: true,
     sglang_version: "0.5.15.post1",
-    accuracy: { gsm8k_pct: 94.62, aime25_pct: null },
+    accuracy: { gsm8k_pct: 94.62, aime25_pct: 68.33 },
   },
   {
     match: { hw: "b300", variant: "default", quant: "int4", strategy: "low-latency", nodes: "single" },
