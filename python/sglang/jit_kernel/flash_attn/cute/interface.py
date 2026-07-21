@@ -15,7 +15,7 @@ from quack.compile_utils import make_fake_tensor as fake_tensor
 
 from sglang.jit_kernel.flash_attn.cute.cache_utils import get_jit_cache
 from sglang.jit_kernel.flash_attn.cute.testing import is_fake_mode
-from sglang.jit_kernel.utils import is_arch_support_pdl
+from sglang.kernels.jit import is_arch_support_pdl
 
 if os.environ.get("CUTE_DSL_PTXAS_PATH", None) is not None:
     from sglang.jit_kernel.flash_attn.cute import cute_dsl_ptxas  # noqa: F401
