@@ -275,7 +275,13 @@ class FlexKVConnector:
             tids_np = np.asarray(token_ids, dtype=np.int64)
             mask_np = self._as_numpy_mask(token_mask)
             try:
-                res = self.kv_manager.get_match(token_ids=tids_np, token_mask=mask_np)
+                # A DSv4 prefix is reusable only when the same host node also
+                # owns its SWA window and compress-state sidecars.
+                res = self.kv_manager.get_match(
+                    token_ids=tids_np,
+                    token_mask=mask_np,
+                    swa_aware=self._swa_kv_pool is not None,
+                )
             except Exception as exc:  # noqa: BLE001
                 logger.warning("[FlexKV] get_match raised: %s", exc)
                 res = None

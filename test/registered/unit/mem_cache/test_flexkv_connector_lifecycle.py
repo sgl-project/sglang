@@ -147,3 +147,27 @@ def test_drain_launched_loads_preserves_unfinished_tasks():
         [91, 92], timeout=0.0, completely=True
     )
     assert connector._launched_load_tids == [92]
+
+
+def test_lookup_uses_swa_aware_match_when_swa_pool_is_registered():
+    connector = FlexKVConnector.__new__(FlexKVConnector)
+    connector._sync_ctx = _sync_context()
+    connector.kv_manager = MagicMock()
+    connector.kv_manager.get_match.return_value = (
+        17,
+        torch.tensor([True, True, False]).numpy(),
+    )
+    connector._swa_kv_pool = object()
+    connector._pending_lookups = {}
+    connector.page_size = 1
+
+    task_id, hit_length = connector.lookup_kv(
+        [11, 12, 13],
+        torch.tensor([True, True, True]),
+        rid="request",
+    )
+
+    assert (task_id, hit_length) == (17, 2)
+    connector.kv_manager.get_match.assert_called_once()
+    assert connector.kv_manager.get_match.call_args.kwargs["swa_aware"] is True
+    assert connector._pending_lookups == {"request": 17}
