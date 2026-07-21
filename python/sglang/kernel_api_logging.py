@@ -160,9 +160,7 @@ def _serialize_tensor(tensor: torch.Tensor) -> list[str]:
         if tensor.numel() == 0:
             _append_line(lines, 2, "statistics=[empty tensor]")
         elif tensor.device.type in ("cuda", "xpu") and _is_graph_capture_active():
-            _append_line(
-                lines, 2, "statistics=[skipped: graph capture in progress]"
-            )
+            _append_line(lines, 2, "statistics=[skipped: graph capture in progress]")
         else:
             try:
                 detached = tensor.detach()
