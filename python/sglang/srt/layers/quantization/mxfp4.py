@@ -320,23 +320,6 @@ class Mxfp4Config(QuantizationConfig):
         return []
 
 
-def _use_jit_mxfp8_quant(x: torch.Tensor, *, hidden_size: int) -> bool:
-    """True when the JIT per-token-group quant can replace flashinfer's
-    mxfp8_quantize: no column padding wanted, and the (possibly row-strided)
-    2D view keeps every row 32B-aligned for the kernel's vectorized loads.
-    Unlike flashinfer's kernel it accepts a row-strided view (the K3
-    fused-front split), saving the .contiguous() copy."""
-    return (
-        x.dim() == 2
-        and x.dtype in (torch.bfloat16, torch.float16)
-        and x.shape[-1] == hidden_size
-        and hidden_size % 32 == 0
-        and x.stride(-1) == 1
-        and x.stride(0) % 16 == 0
-        and x.data_ptr() % 32 == 0
-    )
-
-
 class Mxfp4MoEMethod(FusedMoEMethodBase):
 
     def __init__(
@@ -1334,23 +1317,20 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                         value=0.0,
                     )
             elif self.flashinfer_mxfp4_moe_precision == "default":
-                if _use_jit_mxfp8_quant(x, hidden_size=self.hidden_size):
+                if x.shape[-1] == self.hidden_size:
                     from sglang.jit_kernel.per_token_group_quant import (
                         per_token_group_quant,
                     )
 
-                    # Row-major packed-ue8m0 int32 scales: the byte stream is
-                    # exactly the linear SF layout trtllm-gen reads; same quant
-                    # semantics as mxfp8_quantize (pow2 round-up scale) in the
-                    # normal range, differing only on all-zero groups (both
-                    # dequant to 0).
-                    x_quant, x_scale_i32 = per_token_group_quant(
+                    if x.dim() > 2:
+                        x = x.view(-1, x.shape[-1])
+                    x_quant, x_scale = per_token_group_quant(
                         x, group_size=32, scale_ue8m0=True
                     )
-                    x_scale = x_scale_i32.view(torch.float8_e4m3fn)
+                    x_scale = x_scale.view(torch.float8_e4m3fn)
                 else:
                     x_quant, x_scale = mxfp8_quantize(
-                        x.contiguous(), False, alignment=self.hidden_size
+                        x, False, alignment=self.hidden_size
                     )
                     x_scale = x_scale.view(torch.float8_e4m3fn).reshape(
                         *x.shape[:-1], -1
