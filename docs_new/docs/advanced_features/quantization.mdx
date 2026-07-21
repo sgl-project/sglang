@@ -46,8 +46,8 @@ The following table summarizes quantization method support across NVIDIA and AMD
       <td><code>mxfp4</code></td>
       <td>Yes</td>
       <td>Yes</td>
-      <td>WIP</td>
-      <td>Requires CDNA3/CDNA4 with MXFP support; uses Aiter</td>
+      <td>Yes (A5)</td>
+      <td>On GPU: requires CDNA3/CDNA4 with MXFP support (uses Aiter). On Ascend NPU (A5): W4A4 MXFP4 for Qwen3 dense LLM (MXFP4 weights + activations) — online uses dual-level MXFP4, offline <code>W4A4_MXFP4</code> checkpoints (single-level) are auto-detected via <code>modelslim</code></td>
     </tr>
     <tr>
       <td><code>mxfp8</code></td>
@@ -248,7 +248,7 @@ Backend selection applies to **blockwise FP8**, **MXFP8** (dense linear), and **
     </tr>
     <tr>
       <td><code>cutlass</code></td>
-      <td>SM90, SM100/120</td>
+      <td>SM120</td>
       <td>sgl-kernel CUTLASS</td>
     </tr>
     <tr>
@@ -264,7 +264,7 @@ Backend selection applies to **blockwise FP8**, **MXFP8** (dense linear), and **
   </tbody>
 </table>
 
-**`auto` selection order:** 1) DeepGEMM (SM90/SM100, installed); 2) FlashInfer TRTLLM (SM100, FlashInfer available); 3) CUTLASS (SM90/SM100/120); 4) AITER (AMD); 5) Triton. **Exception:** SM120 always resolves to Triton.
+**`auto` selection order:** 1) DeepGEMM (SM90/SM100, installed); 2) FlashInfer TRTLLM (SM100, FlashInfer available); 3) CUTLASS (SM120); 4) AITER (AMD); 5) Triton (fallback).
 
 **MXFP8 dense linear:** `auto` uses `flashinfer_cutlass` on SM100 (else `triton`). `flashinfer_cutlass` is fastest on most shapes; `flashinfer_trtllm` is faster only at small M.
 

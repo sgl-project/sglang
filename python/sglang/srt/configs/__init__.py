@@ -9,6 +9,12 @@ from sglang.srt.configs.dots_vlm import DotsVLMConfig
 from sglang.srt.configs.exaone import ExaoneConfig
 from sglang.srt.configs.falcon_h1 import FalconH1Config
 from sglang.srt.configs.granitemoehybrid import GraniteMoeHybridConfig
+from sglang.srt.configs.inkling import (
+    InklingAudioConfig,
+    InklingMMConfig,
+    InklingModelConfig,
+    InklingVisionConfig,
+)
 from sglang.srt.configs.interns2preview import InternS2PreviewConfig
 from sglang.srt.configs.janus_pro import MultiModalityConfig
 from sglang.srt.configs.jet_nemotron import JetNemotronConfig
@@ -86,6 +92,10 @@ __all__ = [
     "MiniMaxM3VLConfig",
     "Step3p7Config",
     "Qwen3ASRConfig",
+    "InklingAudioConfig",
+    "InklingMMConfig",
+    "InklingModelConfig",
+    "InklingVisionConfig",
     "UnlimitedVLConfig",
     "ZayaConfig",
 ]
