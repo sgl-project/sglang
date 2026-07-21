@@ -360,12 +360,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
         b: torch.Tensor,
         **kwargs,
     ):
+        assert isinstance(mixed_qkv, torch.Tensor)
+
         # Empty batch (idle DP-attention rank): the GatedDeltaNet update kernels
         # would launch with a zero-sized grid, which HIP rejects with `invalid
         # configuration argument` (surfacing asynchronously later in the Mamba
         # allocator). Linear attention is purely local (no cross-rank
         # collective), so returning an empty output here is safe. See #31594.
-        if isinstance(mixed_qkv, torch.Tensor) and mixed_qkv.shape[0] == 0:
+        if mixed_qkv.shape[0] == 0:
             return mixed_qkv.new_zeros((1, 0, layer.num_v_heads, layer.head_v_dim))
 
         layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
@@ -385,7 +387,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
         replayssm_k = layer_cache.replayssm_k
         replayssm_g = layer_cache.replayssm_g
 
-        assert isinstance(mixed_qkv, torch.Tensor)
         mixed_qkv = causal_conv1d_update(
             mixed_qkv,
             conv_states,
