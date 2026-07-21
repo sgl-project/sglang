@@ -30,6 +30,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.events import KVCacheEventMixin
 from sglang.srt.mem_cache.hicache_storage import (
+    PoolHitPolicy,
     PoolName,
     PoolTransfer,
     SidecarPoolSpec,
@@ -2005,20 +2006,20 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         completed_tokens, hash_value = self.cache_controller.terminate_prefetch(
             operation
         )
-        min_completed_tokens = completed_tokens
-        hit_pages = operation.pool_storage_result.extra_pool_hit_pages
-        if self.tp_world_size > 1:
-            # Reduce full completed tokens together with the sidecar pools that
-            # this prefetch actually transferred, in one all_reduce.
-            sidecar_pools = [t.name for xfers in comp_xfers.values() for t in xfers]
-            packed = torch.tensor(
-                [completed_tokens] + [hit_pages.get(p, 0) for p in sidecar_pools],
-                dtype=torch.int,
-            )
-            self._all_reduce_attn_groups(packed, torch.distributed.ReduceOp.MIN)
-            min_completed_tokens = int(packed[0].item())
-            for i, p in enumerate(sidecar_pools, start=1):
-                hit_pages[p] = int(packed[i].item())
+
+        min_completed_tokens = self._sync_and_check_hybrid_prefetch_result(
+            req_id,
+            operation,
+            completed_tokens,
+            hash_value,
+            host_indices,
+            last_host_node,
+            anchor_lock_params,
+            prefetch_key,
+        )
+        if min_completed_tokens is None:
+            # Hybrid all-or-nothing check failed; result already discarded.
+            return True
 
         fetched_key = prefetch_key[:min_completed_tokens]
         insert_result = self._insert_helper_host(
@@ -2062,6 +2063,87 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if self.enable_storage_metrics and self.storage_metrics_collector is not None:
             self.storage_metrics_collector.log_prefetched_tokens(loaded_from_storage)
         return True
+
+    def _sync_and_check_hybrid_prefetch_result(
+        self,
+        req_id: str,
+        operation: PrefetchOperation,
+        completed_tokens: int,
+        hash_value: list[str],
+        host_indices: torch.Tensor,
+        last_host_node: UnifiedTreeNode,
+        anchor_lock_params: DecLockRefParams,
+        prefetch_key: RadixKey,
+    ) -> Optional[int]:
+        """Sync prefetch results across ATTN groups and decide the usable prefix.
+
+        Two strategies depending on the hybrid layout:
+
+        * DSA-style (Full attention + KV-derived ALL_PAGES sidecar such as the
+          DSA / MiniMax indexer): *clamp* to the minimum fetched prefix shared by
+          the Full KV pool and every sidecar. A partial prefix is still usable
+          because the sidecar is page-aligned with KV and required for every page.
+        * Everything else (SWA / Mamba components, mixed DeepSeekV4 stacks):
+          *all-or-nothing*. Their pools only cover a window / tail and cannot be
+          truncated page by page, so any shortfall discards the whole prefetch.
+
+        Returns the synced usable token count (possibly clamped, possibly 0), or
+        ``None`` when an all-or-nothing prefetch was discarded (the caller should
+        then treat the prefetch as finished).
+        """
+        # Sync completed tokens and per-pool hit pages across ATTN groups, taking
+        # the minimum so every rank agrees on the same usable prefix length.
+        pool_transfers = operation.pool_transfers or []
+        hit_pages = (
+            operation.pool_storage_result.extra_pool_hit_pages if pool_transfers else {}
+        )
+        pool_hit_pages = [hit_pages.get(t.name, 0) for t in pool_transfers]
+        packed = torch.tensor([completed_tokens, *pool_hit_pages], dtype=torch.int)
+        self._all_reduce_attn_groups(packed, torch.distributed.ReduceOp.MIN)
+        min_completed_tokens = int(packed[0].item())
+        pool_hit_pages = list(map(int, packed[1:].tolist()))
+        for transfer, count in zip(pool_transfers, pool_hit_pages):
+            hit_pages[transfer.name] = count
+
+        # DSA-style clamp: every sidecar is KV-derived and required for the whole
+        # prefix (ALL_PAGES), so the usable length is simply the shared minimum of
+        # the Full KV completion and each sidecar hit.
+        clampable = bool(pool_transfers) and all(
+            t.hit_policy == PoolHitPolicy.ALL_PAGES
+            and t.indices_from_pool == PoolName.KV
+            for t in pool_transfers
+        )
+        if clampable:
+            usable_pages = min(min_completed_tokens // self.page_size, *pool_hit_pages)
+            return usable_pages * self.page_size
+
+        # Hybrid cache state is all-or-nothing: every extra pool (SWA / Mamba / ...)
+        # must cover the same fetched prefix. If any pool falls short the whole
+        # prefetch result is unusable, so discard it and release everything.
+        expected_tokens = len(hash_value) * self.page_size
+        all_succeeded = min_completed_tokens == expected_tokens and all(
+            transfer.keys is not None and count == len(transfer.keys)
+            for transfer, count in zip(pool_transfers, pool_hit_pages)
+        )
+        if pool_transfers and not all_succeeded:
+            # The controller's prefetch IO thread already releases the untransferred
+            # tail (host_indices[completed_tokens:])
+            self.cache_controller.append_host_mem_release(
+                host_indices=host_indices[:completed_tokens],
+                extra_pools=pool_transfers,
+            )
+            self.dec_host_lock_ref(last_host_node, anchor_lock_params)
+            del self.ongoing_prefetch[req_id]
+            self.cache_controller.prefetch_tokens_occupied -= len(prefetch_key)
+            self.prefetch_loaded_tokens_by_reqid[req_id] = 0
+            logger.warning(
+                "HiCache hybrid prefetch discarded req=%s completed=%d requested=%d",
+                req_id,
+                completed_tokens,
+                expected_tokens,
+            )
+            return None
+        return min_completed_tokens
 
     def terminate_prefetch(self, req_id: str) -> None:
         if req_id not in self.ongoing_prefetch:
