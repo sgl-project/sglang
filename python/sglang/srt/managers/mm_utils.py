@@ -732,6 +732,22 @@ def _adjust_embedding_length(
     return embedding
 
 
+def _check_mm_embedding_hidden_size(dest: torch.Tensor, src: torch.Tensor) -> None:
+    """Guard the masked_scatter of multimodal embeddings into the token stream.
+
+    ``_adjust_embedding_length`` reconciles only the row count, not the hidden
+    dimension. A user-supplied ``precomputed_embedding`` with a wrong hidden size
+    would otherwise reach ``masked_scatter_`` and either crash the scheduler
+    (src smaller than the number of masked positions) or, worse, be silently
+    misaligned row-major (src larger), producing wrong embeddings with no error.
+    """
+    if src.shape[-1] != dest.shape[-1]:
+        raise ValueError(
+            f"Multimodal embedding hidden size {src.shape[-1]} does not match the "
+            f"model hidden size {dest.shape[-1]}."
+        )
+
+
 def get_embedding_and_mask(
     data_embedding_func: DataEmbeddingFunc,
     embedding_items: List[MultimodalDataItem],
@@ -909,6 +925,7 @@ def embed_mm_inputs(
     # 4. scatter embeddings into input embedding
     # masked_scatter_ avoids the cudaStreamSynchronize that torch.where triggers.
     def _scatter(dest, mask, src):
+        _check_mm_embedding_hidden_size(dest, src)
         dest.masked_scatter_(mask.expand_as(dest), src.to(dest.device, dest.dtype))
 
     for i, modality, embedding, mask in zip(
