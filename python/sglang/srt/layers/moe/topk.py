@@ -1934,14 +1934,18 @@ def _post_process_topk_ids(
             num_local_routed,
         )
     elif _aiter_append:
-        # Must mirror biased_grouped_topk_gpu's _shared_fuse condition EXACTLY
-        # (incl. the token<=MAX buffer bound): when the fast path fell back to the
-        # plain buffer (e.g. token > MAX during a large prefill), the shared experts
-        # were NOT pre-populated, so we must append them here.
+        # Detect whether the shared experts were already fused/appended in
+        # biased_grouped_topk_gpu via the persistent pre-populated topk buffer.
+        # When fused, topk_ids already has the full width (routed + shared), i.e.
+        # topk_ids.shape[1] == topk_config.top_k; when the fast path fell back to
+        # the plain buffer (e.g. token > MAX during a large prefill), only the
+        # routed columns are present and we must append the shared experts here.
+        # Checking the tensor shape is robust to the exact fast-path conditions
+        # (no fragile mirroring of biased_grouped_topk_gpu's _shared_fuse check).
         _shared_fused_in_topk = (
             num_fused_shared_experts > 0
             and get_parallel().moe_ep_size == 1
-            and router_logits.shape[0] <= _get_aiter_topk_fuse_shared_max_tokens()
+            and topk_ids.shape[1] == topk_config.top_k
         )
         if _shared_fused_in_topk:
             # Shared experts were already appended in biased_grouped_topk_gpu via
