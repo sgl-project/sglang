@@ -45,11 +45,10 @@ impl Server {
     /// Boot the frontend (spawns all threads) and return immediately.
     #[new]
     #[pyo3(signature = (
-        bind = None,
+        http_addr = None,
         ingress_ring_cap = 8192,
         egress_ring_cap = 8192,
         channel_cap = 8192,
-        pin_cores = true,
         cores = None,
 
         server_args_json = "{}",
@@ -58,11 +57,10 @@ impl Server {
     // surface (all optional overrides), not a call-site ergonomics problem.
     #[allow(clippy::too_many_arguments)]
     fn start(
-        bind: Option<String>,
+        http_addr: Option<String>,
         ingress_ring_cap: usize,
         egress_ring_cap: usize,
         channel_cap: usize,
-        pin_cores: bool,
         cores: Option<Vec<usize>>,
         server_args_json: &str,
     ) -> PyResult<Self> {
@@ -78,16 +76,16 @@ impl Server {
         server_args.validate_mandatory().map_err(|e| {
             PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("server_args: {e}"))
         })?;
-        // The bind address, tokenizer source/threads/shards all live in the
+        // The HTTP listen address, tokenizer source/threads/shards all live in the
         // `server_args` blob; resolve them from there so the scheduler doesn't
         // re-pass them. The explicit params stay as optional overrides for
         // standalone callers (tests) that construct a `Server` without a full
         // `server_args`.
-        let bind: SocketAddr = bind
+        let http_addr: SocketAddr = http_addr
             .unwrap_or_else(|| server_args.bind())
             .parse()
             .map_err(|e| {
-                PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("bad bind: {e}"))
+                PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("bad http_addr: {e}"))
             })?;
 
         let tokenizer_worker_num = server_args.tokenizer_worker_num();
@@ -100,14 +98,13 @@ impl Server {
         let server_args = std::sync::Arc::new(server_args);
 
         let cfg = RuntimeConfig {
-            bind,
+            http_addr,
             api_worker_num,
             tokenizer_worker_num,
             detokenizer_worker_num,
             ingress_ring_cap,
             egress_ring_cap,
             channel_cap,
-            pin_cores,
             cores,
             tokenizer_path,
             revision,
