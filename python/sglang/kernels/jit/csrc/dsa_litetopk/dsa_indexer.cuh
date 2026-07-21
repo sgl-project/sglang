@@ -1,20 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 #ifndef FLASHINFER_DSA_INDEXER_CUH_
 #define FLASHINFER_DSA_INDEXER_CUH_
+#include "dsa_indexer_kernels.cuh"
+#include <cstdio>
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <dlfcn.h>
-#include <cstdio>
-#include <stdexcept>
 #include <limits>
 #include <optional>
+#include <stdexcept>
 #include <tuple>
-#include "dsa_indexer_kernels.cuh"
 #ifndef DSA_CHECK
-  #define DSA_CHECK(cond, ...)                                      \
-    do {                                                            \
-      if (!(cond)) throw std::runtime_error("dsa_indexer: " #cond); \
-    } while (0)
+#define DSA_CHECK(cond, ...)                                      \
+  do {                                                            \
+    if (!(cond)) throw std::runtime_error("dsa_indexer: " #cond); \
+  } while (0)
 #endif
 namespace {
 
@@ -27,17 +27,32 @@ static void* driver_handle() {
   return h;
 }
 
-static CUresult enc_tiled(CUtensorMap* tm, CUtensorMapDataType dt,
-                          cuuint32_t rank, void* addr, const cuuint64_t* dims,
-                          const cuuint64_t* strides, const cuuint32_t* box,
-                          const cuuint32_t* estrides, CUtensorMapInterleave il,
-                          CUtensorMapSwizzle sw, CUtensorMapL2promotion l2,
-                          CUtensorMapFloatOOBfill oob) {
-  using FT =
-      CUresult (*)(CUtensorMap*, CUtensorMapDataType, cuuint32_t, void*,
-                   const cuuint64_t*, const cuuint64_t*, const cuuint32_t*,
-                   const cuuint32_t*, CUtensorMapInterleave, CUtensorMapSwizzle,
-                   CUtensorMapL2promotion, CUtensorMapFloatOOBfill);
+static CUresult enc_tiled(
+    CUtensorMap* tm,
+    CUtensorMapDataType dt,
+    cuuint32_t rank,
+    void* addr,
+    const cuuint64_t* dims,
+    const cuuint64_t* strides,
+    const cuuint32_t* box,
+    const cuuint32_t* estrides,
+    CUtensorMapInterleave il,
+    CUtensorMapSwizzle sw,
+    CUtensorMapL2promotion l2,
+    CUtensorMapFloatOOBfill oob) {
+  using FT = CUresult (*)(
+      CUtensorMap*,
+      CUtensorMapDataType,
+      cuuint32_t,
+      void*,
+      const cuuint64_t*,
+      const cuuint64_t*,
+      const cuuint32_t*,
+      const cuuint32_t*,
+      CUtensorMapInterleave,
+      CUtensorMapSwizzle,
+      CUtensorMapL2promotion,
+      CUtensorMapFloatOOBfill);
   static FT f = nullptr;
   if (!f) {
     f = reinterpret_cast<FT>(dlsym(driver_handle(), "cuTensorMapEncodeTiled"));
@@ -46,10 +61,16 @@ static CUresult enc_tiled(CUtensorMap* tm, CUtensorMapDataType dt,
   return f(tm, dt, rank, addr, dims, strides, box, estrides, il, sw, l2, oob);
 }
 
-static CUtensorMap make_2d(void* ptr, CUtensorMapDataType dt, int elem_size,
-                           int gmem_inner, int gmem_outer, int smem_inner,
-                           int smem_outer, long gmem_outer_stride,
-                           int swizzle_mode) {
+static CUtensorMap make_2d(
+    void* ptr,
+    CUtensorMapDataType dt,
+    int elem_size,
+    int gmem_inner,
+    int gmem_outer,
+    int smem_inner,
+    int smem_outer,
+    long gmem_outer_stride,
+    int swizzle_mode) {
   if (swizzle_mode != 0) smem_inner = swizzle_mode / elem_size;
   CUtensorMap tm;
   const cuuint64_t gdims[2] = {(cuuint64_t)gmem_inner, (cuuint64_t)gmem_outer};
@@ -58,18 +79,28 @@ static CUtensorMap make_2d(void* ptr, CUtensorMapDataType dt, int elem_size,
   const cuuint32_t estrides[2] = {1, 1};
   CUtensorMapSwizzle swizzle = swizzle_mode == 128  ? CU_TENSOR_MAP_SWIZZLE_128B
                                : swizzle_mode == 64 ? CU_TENSOR_MAP_SWIZZLE_64B
-                               : swizzle_mode == 32
-                                   ? CU_TENSOR_MAP_SWIZZLE_32B
-                                   : CU_TENSOR_MAP_SWIZZLE_NONE;
-  CUresult r = enc_tiled(&tm, dt, 2, ptr, gdims, gstrides, sdims, estrides,
-                         CU_TENSOR_MAP_INTERLEAVE_NONE, swizzle,
-                         CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
-                         CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+                               : swizzle_mode == 32 ? CU_TENSOR_MAP_SWIZZLE_32B
+                                                    : CU_TENSOR_MAP_SWIZZLE_NONE;
+  CUresult r = enc_tiled(
+      &tm,
+      dt,
+      2,
+      ptr,
+      gdims,
+      gstrides,
+      sdims,
+      estrides,
+      CU_TENSOR_MAP_INTERLEAVE_NONE,
+      swizzle,
+      CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
+      CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
   DSA_CHECK(r == CUDA_SUCCESS, "cuTensorMapEncodeTiled failed: ", (int)r);
   return tm;
 }
 
-static inline int align_up(int x, int a) { return (x + a - 1) / a * a; }
+static inline int align_up(int x, int a) {
+  return (x + a - 1) / a * a;
+}
 
 constexpr int NUM_HEADS = 32;
 constexpr int HEAD_DIM = 128;
@@ -82,8 +113,7 @@ constexpr int MATH_THREADS = 256;  // 2 math warpgroups on SM100
 constexpr int NUM_SMS = 148;       // B200
 
 __global__ void refresh_threshold_from_bcount_kernel(
-    int32_t* __restrict__ th_bucket, const int32_t* __restrict__ bcount, int R,
-    int NB, int K) {
+    int32_t* __restrict__ th_bucket, const int32_t* __restrict__ bcount, int R, int NB, int K) {
   int row = blockIdx.x * blockDim.x + threadIdx.x;
   if (row >= R) return;
   int old_th = th_bucket[row];
@@ -112,10 +142,14 @@ __global__ void refresh_threshold_from_bcount_kernel(
 // neg/contiguous copies + host seed copies + seed_bcount_kernel (~6 passes,
 // ~10 launches) with 3 passes in 1 launch.
 __global__ void seed_prep_kernel(
-    const float* __restrict__ slog, const int64_t slog_stride, const int head,
-    const int NB, const int K, const int cap,
-    const int emit_limit,  // only columns j < emit_limit may emit seeds;
-                           // probe columns beyond it are histogram/scale-only
+    const float* __restrict__ slog,
+    const int64_t slog_stride,
+    const int head,
+    const int NB,
+    const int K,
+    const int cap,
+    const int emit_limit,        // only columns j < emit_limit may emit seeds;
+                                 // probe columns beyond it are histogram/scale-only
     const int probe_stride_tok,  // >0: sample columns are strided probe pages;
                                  // emitted seed index j maps to original
                                  // position (j/64)*probe_stride_tok + (j%64)
@@ -123,14 +157,17 @@ __global__ void seed_prep_kernel(
                                  // passes (threshold estimation only; the
                                  // emit pass still reads everything). Caller
                                  // scales K to the subsample quantile.
-    const float headroom,  // extend the bucket scale ABOVE the sample max by
-                           // headroom*span (absolute, resolution-preserving
-                           // when NB is scaled up with it): drifted scores
-                           // land in real buckets instead of clamping to
-                           // bucket 0 where refresh can never resolve them
-    float* __restrict__ origin, float* __restrict__ inv_delta,
-    int32_t* __restrict__ th_bucket, int32_t* __restrict__ bcount,
-    float* __restrict__ cand_val, int32_t* __restrict__ cand_idx,
+    const float headroom,        // extend the bucket scale ABOVE the sample max by
+                                 // headroom*span (absolute, resolution-preserving
+                                 // when NB is scaled up with it): drifted scores
+                                 // land in real buckets instead of clamping to
+                                 // bucket 0 where refresh can never resolve them
+    float* __restrict__ origin,
+    float* __restrict__ inv_delta,
+    int32_t* __restrict__ th_bucket,
+    int32_t* __restrict__ bcount,
+    float* __restrict__ cand_val,
+    int32_t* __restrict__ cand_idx,
     int32_t* __restrict__ cand_cnt) {
   constexpr int BT = 1024;
   constexpr int NSUB = 4;  // sub-histograms to spread smem atomic conflicts
@@ -160,7 +197,8 @@ __global__ void seed_prep_kernel(
     acc(s4.w);
   }
   if (hist_stride == 1)
-    for (int j = head4 + tid; j < head; j += BT) acc(srow[j]);
+    for (int j = head4 + tid; j < head; j += BT)
+      acc(srow[j]);
 #pragma unroll
   for (int off = 16; off > 0; off >>= 1) {
     mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, off));
@@ -198,7 +236,8 @@ __global__ void seed_prep_kernel(
   // pass 2: histogram in [o, inv] bucket space, NSUB sub-histograms to cut
   // smem atomic conflicts, vectorized loads.
   extern __shared__ int s_hist[];  // NSUB * NB ints
-  for (int b = tid; b < NSUB * NB; b += BT) s_hist[b] = 0;
+  for (int b = tid; b < NSUB * NB; b += BT)
+    s_hist[b] = 0;
   __syncthreads();
   int* my_hist = s_hist + (tid / (BT / NSUB)) * NB;
   const auto bucket_of = [&](const float s) -> int {
@@ -223,7 +262,8 @@ __global__ void seed_prep_kernel(
   for (int b = tid; b < NB; b += BT) {
     int c = s_hist[b];
 #pragma unroll
-    for (int g = 1; g < NSUB; ++g) c += s_hist[g * NB + b];
+    for (int g = 1; g < NSUB; ++g)
+      c += s_hist[g * NB + b];
     s_hist[b] = c;
   }
   __syncthreads();
@@ -265,7 +305,7 @@ __global__ void seed_prep_kernel(
   __syncthreads();
   const int th_emit = s_th;
 
-  if (emit_limit == 0) {  // threshold-probe mode: no seeds wanted; skip the
+  if (emit_limit == 0) {              // threshold-probe mode: no seeds wanted; skip the
     if (tid == 0) cand_cnt[row] = 0;  // whole pass-3 read of the sample
     return;
   }
@@ -286,15 +326,13 @@ __global__ void seed_prep_kernel(
       if (lane == 0) base = atomicAdd(&s_cnt, __popc(m));
       base = __shfl_sync(0xffffffffu, base, 0);
       if (g) {
-        const int pos =
-            base + __popc(m & ((lane == 0) ? 0u : ((1u << lane) - 1u)));
+        const int pos = base + __popc(m & ((lane == 0) ? 0u : ((1u << lane) - 1u)));
         if (pos < cap) {
           // GATE4 build: candidate values live in BUCKET SPACE
           // build-wide (the scan writes bq; select is rebased).
           // Seeds must match: (x - o)*inv, same affine as the scan.
           vrow[pos] = (-s - o) * inv;
-          irow[pos] =
-              probe_stride_tok > 0 ? (j >> 6) * probe_stride_tok + (j & 63) : j;
+          irow[pos] = probe_stride_tok > 0 ? (j >> 6) * probe_stride_tok + (j & 63) : j;
         }
       }
     }
@@ -324,16 +362,25 @@ __device__ __forceinline__ uint32_t compact_enc_float(float v) {
 }
 
 __global__ void compact_topk_min_thr_litetopk_kernel(
-    const float* __restrict__ val, const int32_t* __restrict__ idx,
-    const int32_t* __restrict__ cnt, const float* __restrict__ origin,
-    const float* __restrict__ inv_delta, const int32_t* __restrict__ th_in,
-    int R, int CAP, int K, int NB, float* __restrict__ out_val,
+    const float* __restrict__ val,
+    const int32_t* __restrict__ idx,
+    const int32_t* __restrict__ cnt,
+    const float* __restrict__ origin,
+    const float* __restrict__ inv_delta,
+    const int32_t* __restrict__ th_in,
+    int R,
+    int CAP,
+    int K,
+    int NB,
+    float* __restrict__ out_val,
     int32_t* __restrict__ out_idx,
     // bulk-drain mode: scan-emitted indices (slot >= seed_base[row]) are in
     // COMPACTED space; map them back to original positions at output time
     // (only winners pay, K per row). Seeds (< seed_base) are already mapped.
-    const uint32_t probe_group, const uint64_t probe_magic,
-    const uint32_t probe_add_max, const int32_t* __restrict__ seed_base) {
+    const uint32_t probe_group,
+    const uint64_t probe_magic,
+    const uint32_t probe_add_max,
+    const int32_t* __restrict__ seed_base) {
   constexpr int BT = 256;
   constexpr int RADIX = 256;
   int row = blockIdx.x;
@@ -346,8 +393,7 @@ __global__ void compact_topk_min_thr_litetopk_kernel(
   int n = cnt[row];
   if (n > CAP) n = CAP;
   if (n < 0) n = 0;
-  const int sbase =
-      (probe_group != 0 && seed_base != nullptr) ? seed_base[row] : 0x7fffffff;
+  const int sbase = (probe_group != 0 && seed_base != nullptr) ? seed_base[row] : 0x7fffffff;
   const auto out_map = [&](const int32_t raw, const int j) -> int32_t {
     if (j < sbase) return raw;
     const uint32_t kvo = static_cast<uint32_t>(raw);
@@ -415,14 +461,14 @@ __global__ void compact_topk_min_thr_litetopk_kernel(
   }
   __syncthreads();
 
-#define DSA_IN_SELECT_SET(b) \
-  (s_use_boundary ? ((b) == th) : (s_select_all ? true : ((b) <= th)))
+#define DSA_IN_SELECT_SET(b) (s_use_boundary ? ((b) == th) : (s_select_all ? true : ((b) <= th)))
 
   uint32_t mask = 0u;
 #pragma unroll
   for (int pass = 0; pass < 4; ++pass) {
     int shift = 24 - pass * 8;
-    for (int b = tid; b < RADIX; b += BT) hist[b] = 0;
+    for (int b = tid; b < RADIX; b += BT)
+      hist[b] = 0;
     __syncthreads();
     uint32_t d = desired;
     for (int j = tid; j < n; j += BT) {
@@ -524,22 +570,16 @@ static int compute_smem_bytes() {
   const int smem_w = BLOCK_Q * NUM_HEADS * esz_f32;
   const int smem_kv = BLOCK_KV * HEAD_DIM * esz_fp8;
   const int smem_ks = align_up(BLOCK_KV * esz_f32, 512);
-  const int num_barriers =
-      NUM_Q_STAGES * 2 + NUM_KV_STAGES * 2 + (MATH_THREADS / 128) * 2;
+  const int num_barriers = NUM_Q_STAGES * 2 + NUM_KV_STAGES * 2 + (MATH_THREADS / 128) * 2;
   const int smem_barriers = num_barriers * 8;
-  const int smem_slots =
-      4 * (int)sizeof(uint32_t);  // tmem ptr + daemon mailboxes
-  const int smem_warpq =
-      (MATH_THREADS / 32) * BLOCK_Q *
-      ((int)sizeof(int32_t) +
-       DSA_WARP_QUEUE_CAP * ((int)sizeof(float) + (int)sizeof(int32_t)));
-  const int smem_hist =
-      BLOCK_Q * 256 * (int)sizeof(int32_t);  // per-CTA refresh
-                                             // histogram (NB<=256)
+  const int smem_slots = 4 * (int)sizeof(uint32_t);  // tmem ptr + daemon mailboxes
+  const int smem_warpq = (MATH_THREADS / 32) * BLOCK_Q *
+                         ((int)sizeof(int32_t) + DSA_WARP_QUEUE_CAP * ((int)sizeof(float) + (int)sizeof(int32_t)));
+  const int smem_hist = BLOCK_Q * 256 * (int)sizeof(int32_t);  // per-CTA refresh
+                                                               // histogram (NB<=256)
   const int smem_safe = 0;
-  return NUM_Q_STAGES * smem_q + NUM_Q_STAGES * smem_w +
-         NUM_KV_STAGES * smem_kv + NUM_KV_STAGES * smem_ks + smem_barriers +
-         smem_slots + smem_warpq + smem_hist + smem_safe;
+  return NUM_Q_STAGES * smem_q + NUM_Q_STAGES * smem_w + NUM_KV_STAGES * smem_kv + NUM_KV_STAGES * smem_ks +
+         smem_barriers + smem_slots + smem_warpq + smem_hist + smem_safe;
 }
 
 }  // anonymous namespace

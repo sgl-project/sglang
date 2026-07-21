@@ -80,6 +80,18 @@ def _pad_scales_for_tma(kv_scales: torch.Tensor) -> torch.Tensor:
     return torch.nn.functional.pad(kv_scales, (0, 4 - rem))
 
 
+def _pad_sample_logits_for_vec4(slog: torch.Tensor) -> torch.Tensor:
+    """seed_prep reads each row with 16B float4 loads, so the row stride must
+    be a multiple of 4 floats or every odd row is misaligned (CUDA fault). The
+    per-request sample width min(sample_len, kv_len) is arbitrary; pad with
+    -inf, which every seed_prep pass already skips via its isfinite guard
+    (the same fill clean_logits uses for the out-of-causal-range tail)."""
+    rem = slog.shape[1] % 4
+    if rem == 0:
+        return slog
+    return torch.nn.functional.pad(slog, (0, 4 - rem), value=float("-inf"))
+
+
 def dsa_litetopk_indexer(
     q_fp8: torch.Tensor,
     kv_fp8: torch.Tensor,
@@ -149,14 +161,19 @@ def dsa_litetopk_indexer(
         rows = slice(row_start, row_end)
         ks0 = torch.zeros(row_end - row_start, dtype=torch.int32, device=dev)
         ke_s = (ke[rows].to(torch.int32) - kv_start).clamp_(min=0, max=sl)
-        sample_logits = deep_gemm.fp8_mqa_logits(
-            q_fp8[rows],
-            (kv_fp8[kv_start : kv_start + sl], kv_scales[kv_start : kv_start + sl]),
-            weights[rows],
-            ks0,
-            ke_s,
-            clean_logits=True,
-        ).contiguous()
+        sample_logits = _pad_sample_logits_for_vec4(
+            deep_gemm.fp8_mqa_logits(
+                q_fp8[rows],
+                (
+                    kv_fp8[kv_start : kv_start + sl],
+                    kv_scales[kv_start : kv_start + sl],
+                ),
+                weights[rows],
+                ks0,
+                ke_s,
+                clean_logits=True,
+            ).contiguous()
+        )
         module.seed_prep(
             sample_logits,
             num_buckets,

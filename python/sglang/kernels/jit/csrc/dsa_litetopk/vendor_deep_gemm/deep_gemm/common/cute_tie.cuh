@@ -19,8 +19,7 @@ inline constexpr ignore_t ignore{};
 #define CUTE_TIE_CONCAT(A, B) CUTE_TIE_CONCAT_IMPL(A, B)
 
 #define CUTE_TIE_GET_NTH_ARG(_1, _2, _3, _4, _5, _6, _7, _8, _9, _10, N, ...) N
-#define CUTE_TIE_COUNT_ARGS(...) \
-  CUTE_TIE_GET_NTH_ARG(__VA_ARGS__, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0)
+#define CUTE_TIE_COUNT_ARGS(...) CUTE_TIE_GET_NTH_ARG(__VA_ARGS__, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0)
 
 #define CUTE_TIE_OP_DECL(I, TUPLE, VAR) auto VAR = ::cute::get<I>(TUPLE)
 #define CUTE_TIE_OP_ASSIGN(I, TUPLE, VAR) VAR = ::cute::get<I>(TUPLE)
@@ -48,13 +47,11 @@ inline constexpr ignore_t ignore{};
 #define CUTE_TIE_DECL(TUPLE_EXPR, ...)                                    \
   auto&& CUTE_TIE_CONCAT(cute_tie__temp_tuple_, __LINE__) = (TUPLE_EXPR); \
   CUTE_TIE_CONCAT(CUTE_TIE_APPLY_OP_, CUTE_TIE_COUNT_ARGS(__VA_ARGS__))(  \
-      CUTE_TIE_OP_DECL, CUTE_TIE_CONCAT(cute_tie__temp_tuple_, __LINE__), \
-      __VA_ARGS__)
+      CUTE_TIE_OP_DECL, CUTE_TIE_CONCAT(cute_tie__temp_tuple_, __LINE__), __VA_ARGS__)
 
-#define CUTE_TIE(TUPLE_EXPR, ...)                                             \
-  do {                                                                        \
-    auto&& CUTE_TIE_CONCAT(cute_tie__temp_tuple_, __LINE__) = (TUPLE_EXPR);   \
-    CUTE_TIE_CONCAT(CUTE_TIE_APPLY_OP_, CUTE_TIE_COUNT_ARGS(__VA_ARGS__))(    \
-        CUTE_TIE_OP_ASSIGN, CUTE_TIE_CONCAT(cute_tie__temp_tuple_, __LINE__), \
-        __VA_ARGS__);                                                         \
+#define CUTE_TIE(TUPLE_EXPR, ...)                                                           \
+  do {                                                                                      \
+    auto&& CUTE_TIE_CONCAT(cute_tie__temp_tuple_, __LINE__) = (TUPLE_EXPR);                 \
+    CUTE_TIE_CONCAT(CUTE_TIE_APPLY_OP_, CUTE_TIE_COUNT_ARGS(__VA_ARGS__))(                  \
+        CUTE_TIE_OP_ASSIGN, CUTE_TIE_CONCAT(cute_tie__temp_tuple_, __LINE__), __VA_ARGS__); \
   } while (0)

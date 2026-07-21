@@ -16,12 +16,10 @@
 
 #pragma once
 
-#include <cutlass/arch/barrier.h>
-#include <cutlass/arch/reg_reconfig.h>
-
 #include <cute/arch/cluster_sm90.hpp>
 #include <cute/arch/copy_sm90_desc.hpp>
-
+#include <cutlass/arch/barrier.h>
+#include <cutlass/arch/reg_reconfig.h>
 #include <deep_gemm/common/cute_tie.cuh>
 #include <deep_gemm/common/math.cuh>
 #include <deep_gemm/common/tma_copy.cuh>
@@ -42,48 +40,47 @@ using namespace deep_gemm;
 #define DSA_ST_CAND_VAL(dst, v) __stcs(&(dst), (v))
 #define DSA_ST_CAND_IDX(dst, v) __stcs(&(dst), (v))
 
-template <uint32_t kNumHeads, uint32_t kHeadDim, uint32_t BLOCK_Q,
-          uint32_t BLOCK_KV, uint32_t kNumQStages, uint32_t kNumKVStages,
-          uint32_t kNumSMs, uint32_t kNumSpecializedThreads,
-          uint32_t kNumMathThreads,
-          uint32_t kNumMathWarpGroups = kNumMathThreads / 128>
-CUTLASS_GLOBAL __launch_bounds__(
-    kNumSpecializedThreads + kNumMathThreads,
-    1) void sm100_dsa_litetopk(const uint32_t seq_len,
-                               const uint32_t seq_len_kv,
-                               uint32_t* cu_seq_len_k_start,
-                               uint32_t* cu_seq_len_k_end,
-                               const float* __restrict__ origin,  // [seq_len]
-                               const float* __restrict__ inv_delta,  // [seq_len]
-                               int32_t* __restrict__ th_bucket,  // [seq_len]
-                               int32_t* __restrict__ bcount,     // [seq_len,
-                                                                 // num_buckets]
-                               const uint32_t num_buckets, const uint32_t topk,
-                               const uint32_t refresh_every,
-                               const uint32_t num_kv_splits,
-                               const uint32_t
-                                   probe_group,  // compacted-space group size
-                                                 // (pstp-1)*64; 0 = no probe
-                                                 // compaction (identity map)
-                               const uint64_t
-                                   probe_magic,  // ceil(2^42/probe_group):
-                                                 // exact div via mul-shift
-                               const uint32_t
-                                   probe_add_max,  // npage*64 cap for the map
-                               float* __restrict__ cand_val,    // [seq_len,
-                                                                // cand_cap]
-                               int32_t* __restrict__ cand_idx,  // [seq_len,
-                                                                // cand_cap]
-                               int32_t* __restrict__ cand_cnt,  // [seq_len]
-                               const uint32_t cand_cap,
-                               const __grid_constant__ cute::TmaDescriptor
-                                   tensor_map_q,
-                               const __grid_constant__ cute::TmaDescriptor
-                                   tensor_map_kv,
-                               const __grid_constant__ cute::TmaDescriptor
-                                   tensor_map_kv_scales,
-                               const __grid_constant__ cute::TmaDescriptor
-                                   tensor_map_weights) {
+template <
+    uint32_t kNumHeads,
+    uint32_t kHeadDim,
+    uint32_t BLOCK_Q,
+    uint32_t BLOCK_KV,
+    uint32_t kNumQStages,
+    uint32_t kNumKVStages,
+    uint32_t kNumSMs,
+    uint32_t kNumSpecializedThreads,
+    uint32_t kNumMathThreads,
+    uint32_t kNumMathWarpGroups = kNumMathThreads / 128>
+CUTLASS_GLOBAL __launch_bounds__(kNumSpecializedThreads + kNumMathThreads, 1) void sm100_dsa_litetopk(
+    const uint32_t seq_len,
+    const uint32_t seq_len_kv,
+    uint32_t* cu_seq_len_k_start,
+    uint32_t* cu_seq_len_k_end,
+    const float* __restrict__ origin,     // [seq_len]
+    const float* __restrict__ inv_delta,  // [seq_len]
+    int32_t* __restrict__ th_bucket,      // [seq_len]
+    int32_t* __restrict__ bcount,         // [seq_len,
+                                          // num_buckets]
+    const uint32_t num_buckets,
+    const uint32_t topk,
+    const uint32_t refresh_every,
+    const uint32_t num_kv_splits,
+    const uint32_t probe_group,      // compacted-space group size
+                                     // (pstp-1)*64; 0 = no probe
+                                     // compaction (identity map)
+    const uint64_t probe_magic,      // ceil(2^42/probe_group):
+                                     // exact div via mul-shift
+    const uint32_t probe_add_max,    // npage*64 cap for the map
+    float* __restrict__ cand_val,    // [seq_len,
+                                     // cand_cap]
+    int32_t* __restrict__ cand_idx,  // [seq_len,
+                                     // cand_cap]
+    int32_t* __restrict__ cand_cnt,  // [seq_len]
+    const uint32_t cand_cap,
+    const __grid_constant__ cute::TmaDescriptor tensor_map_q,
+    const __grid_constant__ cute::TmaDescriptor tensor_map_kv,
+    const __grid_constant__ cute::TmaDescriptor tensor_map_kv_scales,
+    const __grid_constant__ cute::TmaDescriptor tensor_map_weights) {
   const auto num_q_blocks = math::ceil_div(seq_len, BLOCK_Q);
 
   using Barrier = cutlass::arch::ClusterTransactionBarrier;
@@ -94,8 +91,7 @@ CUTLASS_GLOBAL __launch_bounds__(
   constexpr uint32_t kSpecWarpStart = kNumMathWarpGroups * 4;
   constexpr uint32_t kNumMathWarps = kNumMathThreads / 32;
 
-  DG_STATIC_ASSERT(kNumSpecializedThreads == 128 and kNumMathThreads % 128 == 0,
-                   "Invalid threads");
+  DG_STATIC_ASSERT(kNumSpecializedThreads == 128 and kNumMathThreads % 128 == 0, "Invalid threads");
 
   if (warp_idx == kSpecWarpStart) {
     cute::prefetch_tma_descriptor(&tensor_map_q);
@@ -104,78 +100,55 @@ CUTLASS_GLOBAL __launch_bounds__(
     cute::prefetch_tma_descriptor(&tensor_map_weights);
   }
 
-  static constexpr uint32_t SMEM_Q_SIZE_PER_STAGE =
-      BLOCK_Q * kNumHeads * kHeadDim * sizeof(__nv_fp8_e4m3);
-  static constexpr uint32_t SMEM_WEIGHT_SIZE_PER_STAGE =
-      BLOCK_Q * kNumHeads * sizeof(float);
-  static constexpr uint32_t SMEM_KV_SIZE_PER_STAGE =
-      BLOCK_KV * kHeadDim * sizeof(__nv_fp8_e4m3);
-  static constexpr uint32_t SMEM_KV_SCALE_SIZE_PER_STAGE =
-      BLOCK_KV * sizeof(float);
+  static constexpr uint32_t SMEM_Q_SIZE_PER_STAGE = BLOCK_Q * kNumHeads * kHeadDim * sizeof(__nv_fp8_e4m3);
+  static constexpr uint32_t SMEM_WEIGHT_SIZE_PER_STAGE = BLOCK_Q * kNumHeads * sizeof(float);
+  static constexpr uint32_t SMEM_KV_SIZE_PER_STAGE = BLOCK_KV * kHeadDim * sizeof(__nv_fp8_e4m3);
+  static constexpr uint32_t SMEM_KV_SCALE_SIZE_PER_STAGE = BLOCK_KV * sizeof(float);
   static constexpr uint32_t ALIGNED_SMEM_KV_SCALE_SIZE_PER_STAGE =
       math::constexpr_align(SMEM_KV_SCALE_SIZE_PER_STAGE, 512u);
 
   extern __shared__ __align__(512) uint8_t smem_buffer[];
   DG_STATIC_ASSERT(SMEM_Q_SIZE_PER_STAGE % 512 == 0, "Unaligned TMA swizzling");
-  DG_STATIC_ASSERT(SMEM_WEIGHT_SIZE_PER_STAGE % 512 == 0,
-                   "Unaligned TMA swizzling");
-  DG_STATIC_ASSERT(SMEM_KV_SIZE_PER_STAGE % 512 == 0,
-                   "Unaligned TMA swizzling");
+  DG_STATIC_ASSERT(SMEM_WEIGHT_SIZE_PER_STAGE % 512 == 0, "Unaligned TMA swizzling");
+  DG_STATIC_ASSERT(SMEM_KV_SIZE_PER_STAGE % 512 == 0, "Unaligned TMA swizzling");
 
   constexpr uint32_t kNumTmemCols = BLOCK_Q * kNumHeads * kNumMathWarpGroups;
   DG_STATIC_ASSERT(kNumTmemCols <= 512, "Too many tensor memory");
 
-  auto smem_q = utils::PatternVisitor([&](const uint32_t& i) {
-    return reinterpret_cast<__nv_fp8_e4m3*>(smem_buffer +
-                                            SMEM_Q_SIZE_PER_STAGE * i);
-  });
+  auto smem_q = utils::PatternVisitor(
+      [&](const uint32_t& i) { return reinterpret_cast<__nv_fp8_e4m3*>(smem_buffer + SMEM_Q_SIZE_PER_STAGE * i); });
   auto smem_weights = utils::PatternVisitor([&](const uint32_t& i) {
-    return reinterpret_cast<float*>(smem_buffer +
-                                    SMEM_Q_SIZE_PER_STAGE * kNumQStages +
-                                    SMEM_WEIGHT_SIZE_PER_STAGE * i);
+    return reinterpret_cast<float*>(smem_buffer + SMEM_Q_SIZE_PER_STAGE * kNumQStages + SMEM_WEIGHT_SIZE_PER_STAGE * i);
   });
   auto smem_kv = utils::PatternVisitor([&](const uint32_t& i) {
     return reinterpret_cast<__nv_fp8_e4m3*>(
-        smem_buffer + (SMEM_Q_SIZE_PER_STAGE * kNumQStages +
-                       SMEM_WEIGHT_SIZE_PER_STAGE * kNumQStages +
-                       SMEM_KV_SIZE_PER_STAGE * i));
+        smem_buffer +
+        (SMEM_Q_SIZE_PER_STAGE * kNumQStages + SMEM_WEIGHT_SIZE_PER_STAGE * kNumQStages + SMEM_KV_SIZE_PER_STAGE * i));
   });
   auto smem_kv_scales = utils::PatternVisitor([&](const uint32_t& i) {
-    return reinterpret_cast<float*>(smem_buffer +
-                                    SMEM_Q_SIZE_PER_STAGE * kNumQStages +
-                                    SMEM_WEIGHT_SIZE_PER_STAGE * kNumQStages +
-                                    SMEM_KV_SIZE_PER_STAGE * kNumKVStages +
-                                    ALIGNED_SMEM_KV_SCALE_SIZE_PER_STAGE * i);
+    return reinterpret_cast<float*>(
+        smem_buffer + SMEM_Q_SIZE_PER_STAGE * kNumQStages + SMEM_WEIGHT_SIZE_PER_STAGE * kNumQStages +
+        SMEM_KV_SIZE_PER_STAGE * kNumKVStages + ALIGNED_SMEM_KV_SCALE_SIZE_PER_STAGE * i);
   });
 
   auto barrier_ptr = reinterpret_cast<Barrier*>(smem_kv_scales[kNumKVStages]);
-  auto full_q_barriers =
-      utils::PatternVisitor([&](const uint32_t& i) { return barrier_ptr + i; });
-  auto empty_q_barriers = utils::PatternVisitor(
-      [&](const uint32_t& i) { return barrier_ptr + (kNumQStages + i); });
-  auto full_kv_barriers = utils::PatternVisitor(
-      [&](const uint32_t& i) { return barrier_ptr + (kNumQStages * 2 + i); });
-  auto empty_kv_barriers = utils::PatternVisitor([&](const uint32_t& i) {
-    return barrier_ptr + (kNumQStages * 2 + kNumKVStages + i);
-  });
-  auto full_umma_barriers = utils::PatternVisitor([&](const uint32_t& i) {
-    return barrier_ptr + (kNumQStages * 2 + kNumKVStages * 2 + i);
-  });
-  auto empty_umma_barriers = utils::PatternVisitor([&](const uint32_t& i) {
-    return barrier_ptr +
-           (kNumQStages * 2 + kNumKVStages * 2 + kNumMathWarpGroups + i);
-  });
+  auto full_q_barriers = utils::PatternVisitor([&](const uint32_t& i) { return barrier_ptr + i; });
+  auto empty_q_barriers = utils::PatternVisitor([&](const uint32_t& i) { return barrier_ptr + (kNumQStages + i); });
+  auto full_kv_barriers = utils::PatternVisitor([&](const uint32_t& i) { return barrier_ptr + (kNumQStages * 2 + i); });
+  auto empty_kv_barriers =
+      utils::PatternVisitor([&](const uint32_t& i) { return barrier_ptr + (kNumQStages * 2 + kNumKVStages + i); });
+  auto full_umma_barriers =
+      utils::PatternVisitor([&](const uint32_t& i) { return barrier_ptr + (kNumQStages * 2 + kNumKVStages * 2 + i); });
+  auto empty_umma_barriers = utils::PatternVisitor(
+      [&](const uint32_t& i) { return barrier_ptr + (kNumQStages * 2 + kNumKVStages * 2 + kNumMathWarpGroups + i); });
 
   auto tmem_ptr_in_smem =
-      reinterpret_cast<uint32_t*>(barrier_ptr + kNumQStages * 2 +
-                                  kNumKVStages * 2 + kNumMathWarpGroups * 2);
+      reinterpret_cast<uint32_t*>(barrier_ptr + kNumQStages * 2 + kNumKVStages * 2 + kNumMathWarpGroups * 2);
   auto scan_done_flag = reinterpret_cast<volatile int*>(tmem_ptr_in_smem + 1);
   auto kv_progress_ptr = reinterpret_cast<volatile int*>(tmem_ptr_in_smem + 2);
   auto warpq_count = reinterpret_cast<int32_t*>(tmem_ptr_in_smem + 4);
-  auto warpq_val =
-      reinterpret_cast<float*>(warpq_count + kNumMathWarps * BLOCK_Q);
-  auto warpq_idx = reinterpret_cast<int32_t*>(
-      warpq_val + kNumMathWarps * BLOCK_Q * DSA_WARP_QUEUE_CAP);
+  auto warpq_val = reinterpret_cast<float*>(warpq_count + kNumMathWarps * BLOCK_Q);
+  auto warpq_idx = reinterpret_cast<int32_t*>(warpq_val + kNumMathWarps * BLOCK_Q * DSA_WARP_QUEUE_CAP);
   // Per-CTA refresh histogram (BLOCK_Q x num_buckets). When this CTA is the
   // ONLY scanner of its rows (num_kv_splits == 1, i.e. all large-Q shapes),
   // the per-candidate histogram feed goes to smem instead of RED.GLOBAL:
@@ -183,12 +156,9 @@ CUTLASS_GLOBAL __launch_bounds__(
   // reads global bcount (seed counts) + this smem part. Counts and totals
   // are identical to the global path, so thresholds and recall are
   // unchanged; a racing read can only UNDERcount -> looser gate -> safe.
-  auto smem_hist = reinterpret_cast<int32_t*>(
-      warpq_idx + kNumMathWarps * BLOCK_Q * DSA_WARP_QUEUE_CAP);
+  auto smem_hist = reinterpret_cast<int32_t*>(warpq_idx + kNumMathWarps * BLOCK_Q * DSA_WARP_QUEUE_CAP);
 
-  DG_STATIC_ASSERT(
-      kNumSpecializedThreads % 128 == 0 and kNumSpecializedThreads >= 64,
-      "Invalid threads");
+  DG_STATIC_ASSERT(kNumSpecializedThreads % 128 == 0 and kNumSpecializedThreads >= 64, "Invalid threads");
   if (warp_idx == kSpecWarpStart and cute::elect_one_sync()) {
 #pragma unroll
     for (uint32_t i = 0; i < kNumQStages; ++i) {
@@ -215,11 +185,9 @@ CUTLASS_GLOBAL __launch_bounds__(
     }
     cute::TMEM::Allocator1Sm().allocate(kNumTmemCols, tmem_ptr_in_smem);
   }
-  const bool hist_in_smem = (num_kv_splits == 1) && (refresh_every > 0) &&
-                            (refresh_every != 0x7fffffff);
+  const bool hist_in_smem = (num_kv_splits == 1) && (refresh_every > 0) && (refresh_every != 0x7fffffff);
   if (hist_in_smem) {
-    for (uint32_t idx = threadIdx.x; idx < BLOCK_Q * num_buckets;
-         idx += blockDim.x)
+    for (uint32_t idx = threadIdx.x; idx < BLOCK_Q * num_buckets; idx += blockDim.x)
       smem_hist[idx] = 0;
   }
   __syncthreads();
@@ -232,8 +200,7 @@ CUTLASS_GLOBAL __launch_bounds__(
   const uint32_t block_q_idx = blockIdx.x;
   const uint32_t kv_split = blockIdx.y;
   uint32_t seq_k_start[BLOCK_Q], seq_k_end[BLOCK_Q];
-  const auto load_schedule =
-      [&](const uint32_t block_q_idx) -> cute::tuple<uint32_t, uint32_t> {
+  const auto load_schedule = [&](const uint32_t block_q_idx) -> cute::tuple<uint32_t, uint32_t> {
     uint32_t start = cute::numeric_limits<uint32_t>::max();
     uint32_t end = cute::numeric_limits<uint32_t>::min();
 
@@ -251,21 +218,17 @@ CUTLASS_GLOBAL __launch_bounds__(
       end = max(end, min(seq_k_end[i], seq_len_kv));
     }
     const uint32_t total_blocks = math::ceil_div(seq_len_kv, BLOCK_KV);
-    const uint32_t blocks_per_split =
-        math::ceil_div(total_blocks, num_kv_splits);
+    const uint32_t blocks_per_split = math::ceil_div(total_blocks, num_kv_splits);
     const uint32_t split_lo = kv_split * blocks_per_split * BLOCK_KV;
-    const uint32_t split_hi =
-        min((kv_split + 1) * blocks_per_split * BLOCK_KV, seq_len_kv);
+    const uint32_t split_hi = min((kv_split + 1) * blocks_per_split * BLOCK_KV, seq_len_kv);
     start = start / 4 * 4;  // TMA alignment for SF KV
     if (start < split_lo) start = split_lo;
     if (end > split_hi) end = split_hi;
-    const uint32_t nkv =
-        (end > start) ? math::ceil_div(end - start, BLOCK_KV) : 0;
+    const uint32_t nkv = (end > start) ? math::ceil_div(end - start, BLOCK_KV) : 0;
     return {start, nkv};
   };
 
-  const auto get_kv_pipeline =
-      [&](const uint32_t& kv_block_idx) -> cute::tuple<uint32_t, uint32_t> {
+  const auto get_kv_pipeline = [&](const uint32_t& kv_block_idx) -> cute::tuple<uint32_t, uint32_t> {
     return {kv_block_idx % kNumKVStages, (kv_block_idx / kNumKVStages) & 1};
   };
 
@@ -280,29 +243,29 @@ CUTLASS_GLOBAL __launch_bounds__(
       if (block_q_idx < num_q_blocks) {
         // Q + weights once for this q-block.
         tma::copy<kHeadDim, BLOCK_Q * kNumHeads, kHeadDim>(
-            &tensor_map_q, full_q_barriers[0], smem_q[0], 0,
-            block_q_idx * BLOCK_Q * kNumHeads);
-        tma::copy<kNumHeads, BLOCK_Q, 0>(&tensor_map_weights,
-                                         full_q_barriers[0], smem_weights[0], 0,
-                                         block_q_idx * BLOCK_Q);
-        full_q_barriers[0]->arrive_and_expect_tx(SMEM_Q_SIZE_PER_STAGE +
-                                                 SMEM_WEIGHT_SIZE_PER_STAGE);
+            &tensor_map_q, full_q_barriers[0], smem_q[0], 0, block_q_idx * BLOCK_Q * kNumHeads);
+        tma::copy<kNumHeads, BLOCK_Q, 0>(
+            &tensor_map_weights, full_q_barriers[0], smem_weights[0], 0, block_q_idx * BLOCK_Q);
+        full_q_barriers[0]->arrive_and_expect_tx(SMEM_Q_SIZE_PER_STAGE + SMEM_WEIGHT_SIZE_PER_STAGE);
 
         CUTE_TIE_DECL(load_schedule(block_q_idx), kv_start, num_kv_blocks);
-        for (uint32_t kv_block_idx = 0; kv_block_idx < num_kv_blocks;
-             ++kv_block_idx) {
+        for (uint32_t kv_block_idx = 0; kv_block_idx < num_kv_blocks; ++kv_block_idx) {
           CUTE_TIE_DECL(get_kv_pipeline(kv_block_idx), kv_stage_idx, kv_phase);
           empty_kv_barriers[kv_stage_idx]->wait(kv_phase ^ 1);
 
           tma::copy<kHeadDim, BLOCK_KV, kHeadDim>(
-              &tensor_map_kv, full_kv_barriers[kv_stage_idx],
-              smem_kv[kv_stage_idx], 0, kv_start + kv_block_idx * BLOCK_KV);
-          tma::copy<BLOCK_KV, 1, 0>(&tensor_map_kv_scales,
-                                    full_kv_barriers[kv_stage_idx],
-                                    smem_kv_scales[kv_stage_idx],
-                                    kv_start + kv_block_idx * BLOCK_KV, 0);
-          full_kv_barriers[kv_stage_idx]->arrive_and_expect_tx(
-              SMEM_KV_SIZE_PER_STAGE + SMEM_KV_SCALE_SIZE_PER_STAGE);
+              &tensor_map_kv,
+              full_kv_barriers[kv_stage_idx],
+              smem_kv[kv_stage_idx],
+              0,
+              kv_start + kv_block_idx * BLOCK_KV);
+          tma::copy<BLOCK_KV, 1, 0>(
+              &tensor_map_kv_scales,
+              full_kv_barriers[kv_stage_idx],
+              smem_kv_scales[kv_stage_idx],
+              kv_start + kv_block_idx * BLOCK_KV,
+              0);
+          full_kv_barriers[kv_stage_idx]->arrive_and_expect_tx(SMEM_KV_SIZE_PER_STAGE + SMEM_KV_SCALE_SIZE_PER_STAGE);
         }
       }
     }
@@ -312,16 +275,20 @@ CUTLASS_GLOBAL __launch_bounds__(
     DG_TRAP_ONLY_DEVICE_ASSERT(ptx::ld_shared(tmem_ptr_in_smem) == 0);
 
     auto instr_desc = cute::UMMA::make_instr_desc<
-        cutlass::float_e4m3_t, cutlass::float_e4m3_t, float, UMMA_M, UMMA_N,
-        cute::UMMA::Major::K, cute::UMMA::Major::K>();
+        cutlass::float_e4m3_t,
+        cutlass::float_e4m3_t,
+        float,
+        UMMA_M,
+        UMMA_N,
+        cute::UMMA::Major::K,
+        cute::UMMA::Major::K>();
     auto runtime_instr_desc = cute::UMMA::make_runtime_instr_desc(instr_desc);
 
     if (block_q_idx < num_q_blocks) {
       CUTE_TIE_DECL(load_schedule(block_q_idx), kv_start, num_kv_blocks);
       full_q_barriers[0]->wait(0);
 
-      for (uint32_t kv_block_idx = 0; kv_block_idx < num_kv_blocks;
-           ++kv_block_idx) {
+      for (uint32_t kv_block_idx = 0; kv_block_idx < num_kv_blocks; ++kv_block_idx) {
         const uint32_t kvg = kv_block_idx;
         CUTE_TIE_DECL(get_kv_pipeline(kvg), kv_stage_idx, kv_phase);
         full_kv_barriers[kv_stage_idx]->wait(kv_phase);
@@ -334,17 +301,13 @@ CUTLASS_GLOBAL __launch_bounds__(
           ptx::tcgen05_after_thread_sync();
 #pragma unroll
           for (uint32_t k = 0; k < kHeadDim / UMMA_K; ++k) {
-            auto a_desc = mma::sm100::make_umma_desc<cute::UMMA::Major::K, 0,
-                                                     kHeadDim, kHeadDim>(
+            auto a_desc = mma::sm100::make_umma_desc<cute::UMMA::Major::K, 0, kHeadDim, kHeadDim>(
                 smem_kv[kv_stage_idx], i * UMMA_M, k * UMMA_K);
             auto b_desc =
-                mma::sm100::make_umma_desc<cute::UMMA::Major::K, 0, kHeadDim,
-                                           kHeadDim>(smem_q[0], 0, k * UMMA_K);
-            cute::SM100_MMA_F8F6F4_SS::fma(a_desc, b_desc, i * UMMA_N, k,
-                                           runtime_instr_desc);
+                mma::sm100::make_umma_desc<cute::UMMA::Major::K, 0, kHeadDim, kHeadDim>(smem_q[0], 0, k * UMMA_K);
+            cute::SM100_MMA_F8F6F4_SS::fma(a_desc, b_desc, i * UMMA_N, k, runtime_instr_desc);
           }
-          cutlass::arch::umma_arrive(
-              reinterpret_cast<uint64_t*>(full_umma_barriers[i]));
+          cutlass::arch::umma_arrive(reinterpret_cast<uint64_t*>(full_umma_barriers[i]));
         }
       }
       empty_q_barriers[0]->arrive();
@@ -359,15 +322,13 @@ CUTLASS_GLOBAL __launch_bounds__(
     // critical path (a warpgroup hiccup every GATE_STRIDE blocks).
     cutlass::arch::warpgroup_reg_dealloc<kNumSpecializedRegisters>();
 
-    const bool in_scan_refresh =
-        (refresh_every > 0 && refresh_every != 0x7fffffff);
+    const bool in_scan_refresh = (refresh_every > 0 && refresh_every != 0x7fffffff);
     if (in_scan_refresh && block_q_idx < num_q_blocks) {
       const uint32_t spare_id = warp_idx - (kSpecWarpStart + 2);  // 0 or 1
       const auto refresh_row = [&](const uint32_t row) {
         if (row >= seq_len) return;
         const int32_t* brow = bcount + static_cast<uint64_t>(row) * num_buckets;
-        const int32_t* srow =
-            smem_hist + (row - block_q_idx * BLOCK_Q) * num_buckets;
+        const int32_t* srow = smem_hist + (row - block_q_idx * BLOCK_Q) * num_buckets;
         int carry = 0;
         int found = static_cast<int>(num_buckets) - 1;
         bool done = false;
@@ -382,8 +343,7 @@ CUTLASS_GLOBAL __launch_bounds__(
             if (static_cast<int>(lane_idx) >= off) prefix += nsh;
           }
           int incl = carry + prefix;
-          bool hit = (b < num_buckets) && (incl >= static_cast<int>(topk)) &&
-                     (incl - v < static_cast<int>(topk));
+          bool hit = (b < num_buckets) && (incl >= static_cast<int>(topk)) && (incl - v < static_cast<int>(topk));
           unsigned hm = __ballot_sync(0xffffffffu, hit);
           if (hm) {
             found = static_cast<int>(base) + (__ffs(hm) - 1);
@@ -419,13 +379,10 @@ CUTLASS_GLOBAL __launch_bounds__(
     const auto tmem_start = warpgroup_idx * UMMA_N;
     const auto math_thread_idx = warp_idx * 32 + lane_idx;
 
-    auto tmem_load = [](auto num_elems_c, const uint32_t& tmem_addr,
-                        float* accum) {
+    auto tmem_load = [](auto num_elems_c, const uint32_t& tmem_addr, float* accum) {
       constexpr int N = decltype(num_elems_c)::value;
       DG_STATIC_ASSERT(N == 32 or N == 64, "Unsupported TMEM load size");
-      using Loader =
-          cute::conditional_t<N == 32, cute::SM100_TMEM_LOAD_32dp32b32x,
-                              cute::SM100_TMEM_LOAD_32dp32b64x>;
+      using Loader = cute::conditional_t<N == 32, cute::SM100_TMEM_LOAD_32dp32b32x, cute::SM100_TMEM_LOAD_32dp32b64x>;
       [&]<size_t... Is>(cute::index_sequence<Is...>) {
         Loader::copy(tmem_addr, reinterpret_cast<uint32_t*>(accum)[Is]...);
       }(cute::make_index_sequence<N>{});
@@ -485,8 +442,7 @@ CUTLASS_GLOBAL __launch_bounds__(
         gate_reg[i] = cute::numeric_limits<int32_t>::max();
         qn_reg[i] = 0;
         kstart_reg[i] = seq_k_start[i];
-        kspan_reg[i] =
-            seq_k_end[i] > seq_k_start[i] ? seq_k_end[i] - seq_k_start[i] : 0;
+        kspan_reg[i] = seq_k_end[i] > seq_k_start[i] ? seq_k_end[i] - seq_k_start[i] : 0;
       }
 // Fold -inv into the register weights: the whole ReLU-weighted
 // chain then accumulates directly in bucket units. 128 FMULs
@@ -494,7 +450,8 @@ CUTLASS_GLOBAL __launch_bounds__(
 #pragma unroll
       for (uint32_t i = 0; i < BLOCK_Q; ++i) {
 #pragma unroll
-        for (uint32_t j = 0; j < kNumHeads; ++j) weights[i][j] *= -inv_reg[i];
+        for (uint32_t j = 0; j < kNumHeads; ++j)
+          weights[i][j] *= -inv_reg[i];
       }
       // Interior-block bounds (warp-uniform): a kv block fully inside
       // every row's [ks, ke) needs no per-element range checks.
@@ -516,8 +473,7 @@ CUTLASS_GLOBAL __launch_bounds__(
       int th_pf[BLOCK_Q];
 #pragma unroll
       for (uint32_t i = 0; i < BLOCK_Q; ++i)
-        th_pf[i] =
-            __ldcg(th_bucket + min(block_q_idx * BLOCK_Q + i, seq_len - 1));
+        th_pf[i] = __ldcg(th_bucket + min(block_q_idx * BLOCK_Q + i, seq_len - 1));
 
       // Drain a (warp,row) queue segment to the global candidate
       // buffer. The probe index mapping lives HERE, not on the insert
@@ -525,31 +481,28 @@ CUTLASS_GLOBAL __launch_bounds__(
       // instructions dragged by a single hit); at drain time 32 lanes
       // retire DSA_WARP_QUEUE_CAP entries in parallel, so it costs
       // ~1/30th in issue slots and is semantically identical.
-      const auto drain_queue = [&](const uint32_t i, const uint32_t row_q,
-                                   const uint32_t queue_base, const int qn,
-                                   const int base) {
-        const uint64_t out_base = static_cast<uint64_t>(row_q) * cand_cap;
-        for (int t = static_cast<int>(lane_idx); t < qn; t += 32) {
-          const float x = warpq_val[queue_base + t];
-          uint32_t kvo = static_cast<uint32_t>(warpq_idx[queue_base + t]);
-          if (probe_group != 0) {
-            // compacted -> original position (probe pages were
-            // excluded from the workspace; the probe itself
-            // seeds them); exact c/probe_group via magic mul-shift
-            const uint32_t sup =
-                (uint32_t)(((uint64_t)kvo * probe_magic) >> 42);
-            kvo += min((sup + 1) * 64u, probe_add_max);
-          }
-          const int w = base + t;
-          if (w < static_cast<int>(cand_cap)) {
-            DSA_ST_CAND_VAL(cand_val[out_base + w], x);
-            DSA_ST_CAND_IDX(cand_idx[out_base + w], static_cast<int32_t>(kvo));
-          }
-        }
-      };
+      const auto drain_queue =
+          [&](const uint32_t i, const uint32_t row_q, const uint32_t queue_base, const int qn, const int base) {
+            const uint64_t out_base = static_cast<uint64_t>(row_q) * cand_cap;
+            for (int t = static_cast<int>(lane_idx); t < qn; t += 32) {
+              const float x = warpq_val[queue_base + t];
+              uint32_t kvo = static_cast<uint32_t>(warpq_idx[queue_base + t]);
+              if (probe_group != 0) {
+                // compacted -> original position (probe pages were
+                // excluded from the workspace; the probe itself
+                // seeds them); exact c/probe_group via magic mul-shift
+                const uint32_t sup = (uint32_t)(((uint64_t)kvo * probe_magic) >> 42);
+                kvo += min((sup + 1) * 64u, probe_add_max);
+              }
+              const int w = base + t;
+              if (w < static_cast<int>(cand_cap)) {
+                DSA_ST_CAND_VAL(cand_val[out_base + w], x);
+                DSA_ST_CAND_IDX(cand_idx[out_base + w], static_cast<int32_t>(kvo));
+              }
+            }
+          };
 
-      for (uint32_t kv_block_idx = 0; kv_block_idx < num_kv_blocks;
-           ++kv_block_idx) {
+      for (uint32_t kv_block_idx = 0; kv_block_idx < num_kv_blocks; ++kv_block_idx) {
         const uint32_t kvg = kv_block_idx;
         CUTE_TIE_DECL(get_kv_pipeline(kvg), kv_stage_idx, kv_phase);
         full_kv_barriers[kv_stage_idx]->wait(kv_phase);
@@ -567,20 +520,17 @@ CUTLASS_GLOBAL __launch_bounds__(
           }
 #pragma unroll
           for (uint32_t i = 0; i < BLOCK_Q; ++i)
-            th_pf[i] =
-                __ldcg(th_bucket + min(block_q_idx * BLOCK_Q + i, seq_len - 1));
+            th_pf[i] = __ldcg(th_bucket + min(block_q_idx * BLOCK_Q + i, seq_len - 1));
         }
 
-        float scale_kv =
-            ptx::ld_shared(smem_kv_scales[kv_stage_idx] + math_thread_idx);
+        float scale_kv = ptx::ld_shared(smem_kv_scales[kv_stage_idx] + math_thread_idx);
 
         full_umma_barriers[warpgroup_idx]->wait(kvg & 1);
         ptx::tcgen05_after_thread_sync();
 
         empty_kv_barriers[kv_stage_idx]->arrive();
 
-        const auto kv_offset =
-            kv_start + kv_block_idx * BLOCK_KV + math_thread_idx;
+        const auto kv_offset = kv_start + kv_block_idx * BLOCK_KV + math_thread_idx;
         DG_STATIC_ASSERT(kNumHeads % 8 == 0, "Invalid head");
 
         uint32_t pass_bits = 0;
@@ -605,34 +555,32 @@ CUTLASS_GLOBAL __launch_bounds__(
   if constexpr (RC) g = g and ((kv_offset - kstart_reg[i]) < kspan_reg[i]); \
   pass_bits |= g ? (1u << i) : 0u;
         const uint32_t kv_base = kv_start + kv_block_idx * BLOCK_KV;
-        const bool interior =
-            (kv_base >= rs_max) && (kv_base + BLOCK_KV <= re_min);
-#define DSA_SCORE_ROWS(RANGE_CHECK)                                        \
-  _Pragma("unroll") for (uint32_t pr = 0; pr < BLOCK_Q / 2; ++pr) {        \
-    float accum2[kNumHeads * 2];                                           \
-    tmem_load(cute::Int<kNumHeads * 2>{}, tmem_start + pr * 2 * kNumHeads, \
-              accum2);                                                     \
-    if (pr == BLOCK_Q / 2 - 1) {                                           \
-      ptx::tcgen05_before_thread_sync();                                   \
-      empty_umma_barriers[warpgroup_idx]->arrive();                        \
-    }                                                                      \
-    _Pragma("unroll") for (uint32_t k = 0; k < 2; ++k) {                   \
-      const uint32_t i = pr * 2 + k;                                       \
-      const float* accum = accum2 + k * kNumHeads;                         \
-      auto sum_0 = make_float2(0, 0);                                      \
-      auto sum_1 = make_float2(0, 0);                                      \
-      const auto transform = [&](const uint32_t& j, const float2& sum) {   \
-        auto a = make_float2(fmaxf(accum[j], 0), fmaxf(accum[j + 1], 0));  \
-        auto b = make_float2(weights[i][j], weights[i][j + 1]);            \
-        return __ffma2_rn(a, b, sum);                                      \
-      };                                                                   \
-      _Pragma("unroll") for (uint32_t j = 0; j < kNumHeads; j += 4) {      \
-        sum_0 = transform(j, sum_0);                                       \
-        sum_1 = transform(j + 2, sum_1);                                   \
-      }                                                                    \
-      auto sum = __fadd2_rn(sum_0, sum_1);                                 \
-      DSA_SCORE_GATE(i, RANGE_CHECK)                                       \
-    }                                                                      \
+        const bool interior = (kv_base >= rs_max) && (kv_base + BLOCK_KV <= re_min);
+#define DSA_SCORE_ROWS(RANGE_CHECK)                                                 \
+  _Pragma("unroll") for (uint32_t pr = 0; pr < BLOCK_Q / 2; ++pr) {                 \
+    float accum2[kNumHeads * 2];                                                    \
+    tmem_load(cute::Int<kNumHeads * 2>{}, tmem_start + pr * 2 * kNumHeads, accum2); \
+    if (pr == BLOCK_Q / 2 - 1) {                                                    \
+      ptx::tcgen05_before_thread_sync();                                            \
+      empty_umma_barriers[warpgroup_idx]->arrive();                                 \
+    }                                                                               \
+    _Pragma("unroll") for (uint32_t k = 0; k < 2; ++k) {                            \
+      const uint32_t i = pr * 2 + k;                                                \
+      const float* accum = accum2 + k * kNumHeads;                                  \
+      auto sum_0 = make_float2(0, 0);                                               \
+      auto sum_1 = make_float2(0, 0);                                               \
+      const auto transform = [&](const uint32_t& j, const float2& sum) {            \
+        auto a = make_float2(fmaxf(accum[j], 0), fmaxf(accum[j + 1], 0));           \
+        auto b = make_float2(weights[i][j], weights[i][j + 1]);                     \
+        return __ffma2_rn(a, b, sum);                                               \
+      };                                                                            \
+      _Pragma("unroll") for (uint32_t j = 0; j < kNumHeads; j += 4) {               \
+        sum_0 = transform(j, sum_0);                                                \
+        sum_1 = transform(j + 2, sum_1);                                            \
+      }                                                                             \
+      auto sum = __fadd2_rn(sum_0, sum_1);                                          \
+      DSA_SCORE_GATE(i, RANGE_CHECK)                                                \
+    }                                                                               \
   }
         if (interior) {
           DSA_SCORE_ROWS(false)
@@ -669,8 +617,7 @@ CUTLASS_GLOBAL __launch_bounds__(
               // branch stalls starving the UMMA pipe.)
               const uint32_t row_q = block_q_idx * BLOCK_Q + i;
               const int cnt = __popc(m);
-              const uint32_t queue_base =
-                  (warp_idx * BLOCK_Q + i) * DSA_WARP_QUEUE_CAP;
+              const uint32_t queue_base = (warp_idx * BLOCK_Q + i) * DSA_WARP_QUEUE_CAP;
               int qn = qn_reg[i];
               if (qn + cnt > static_cast<int>(DSA_WARP_QUEUE_CAP)) {
                 int base = 0;
@@ -697,18 +644,15 @@ CUTLASS_GLOBAL __launch_bounds__(
                   // one F2I off the stored bucket float --
                   // bucket-identical to the gate.
                   int braw = static_cast<int>(v_row[i]);
-                  int b = braw < 0 ? 0
-                                   : (braw > static_cast<int>(num_buckets) - 1
-                                          ? static_cast<int>(num_buckets) - 1
-                                          : braw);
+                  int b = braw < 0
+                              ? 0
+                              : (braw > static_cast<int>(num_buckets) - 1 ? static_cast<int>(num_buckets) - 1 : braw);
                   if (hist_in_smem) {
                     atomicAdd(smem_hist + i * num_buckets + b, 1);
                     // (DEFER: daemon batch-feeds from the
                     // cand buffer; b's chain dead-codes.)
                   } else {
-                    atomicAdd(
-                        &bcount[static_cast<uint64_t>(row_q) * num_buckets + b],
-                        1);
+                    atomicAdd(&bcount[static_cast<uint64_t>(row_q) * num_buckets + b], 1);
                   }
                 }
               }
@@ -717,8 +661,7 @@ CUTLASS_GLOBAL __launch_bounds__(
           }
         }
 
-        if (threadIdx.x == 0 &&
-            ((kv_block_idx + 1) % DSA_REFRESH_STRIDE) == 0) {
+        if (threadIdx.x == 0 && ((kv_block_idx + 1) % DSA_REFRESH_STRIDE) == 0) {
           __threadfence_block();
           *kv_progress_ptr = static_cast<int>(kvg + 1);
         }
@@ -730,8 +673,7 @@ CUTLASS_GLOBAL __launch_bounds__(
         const uint32_t row_q = block_q_idx * BLOCK_Q + i;
         const int qn = qn_reg[i];
         if (row_q < seq_len && qn > 0) {
-          const uint32_t queue_base =
-              (warp_idx * BLOCK_Q + i) * DSA_WARP_QUEUE_CAP;
+          const uint32_t queue_base = (warp_idx * BLOCK_Q + i) * DSA_WARP_QUEUE_CAP;
           int base = 0;
           if (lane_idx == 0) base = atomicAdd(cand_cnt + row_q, qn);
           base = __shfl_sync(FULL, base, 0);

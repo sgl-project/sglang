@@ -15,9 +15,10 @@
 // vendored files (-1 index padding) and below (real SM count for the KV-split
 // heuristic instead of the hardcoded 148).
 
+#include <sgl_kernel/tensor.h>  // For TensorMatcher, SymbolicSize, SymbolicDevice
+#include <sgl_kernel/utils.h>   // For CHECK_HOST
+
 #include <sgl_kernel/runtime.cuh>  // For get_sm_count, get_cc_major
-#include <sgl_kernel/tensor.h>     // For TensorMatcher, SymbolicSize, SymbolicDevice
-#include <sgl_kernel/utils.h>      // For CHECK_HOST
 #include <sgl_kernel/utils.cuh>    // For LaunchKernel, CHECK_CUDA, fp8_e4m3_t aliases
 
 #include <dlpack/dlpack.h>
@@ -60,16 +61,20 @@ void dsa_litetopk_seed_prep(
   device_.set_options<kDLCUDA>();
 
   TensorMatcher({Q, HEAD}).with_dtype<fp32_t>().with_device(device_).verify(slog);
-  TensorMatcher({Q}).with_dtype<fp32_t>().with_device(device_).verify(origin).verify(
-      inv_delta);
-  TensorMatcher({Q}).with_dtype<int32_t>().with_device(device_).verify(th_bucket).verify(
-      cand_cnt);
+  TensorMatcher({Q}).with_dtype<fp32_t>().with_device(device_).verify(origin).verify(inv_delta);
+  TensorMatcher({Q}).with_dtype<int32_t>().with_device(device_).verify(th_bucket).verify(cand_cnt);
   TensorMatcher({Q, NB}).with_dtype<int32_t>().with_device(device_).verify(bcount);
   TensorMatcher({Q, CAP}).with_dtype<fp32_t>().with_device(device_).verify(cand_val);
   TensorMatcher({Q, CAP}).with_dtype<int32_t>().with_device(device_).verify(cand_idx);
 
   const int q_rows = static_cast<int>(Q.unwrap());
   const int head = static_cast<int>(HEAD.unwrap());
+  // The kernel reads each row with 16B float4 loads whenever head >= 4, so
+  // with more than one row the row stride (== head for contiguous slog) must
+  // keep every row base 16B-aligned; a misaligned base is a device-side
+  // fault, so fail loudly here instead (callers pad the width with -inf).
+  CHECK_HOST(q_rows <= 1 || head < 4 || head % 4 == 0)
+      << "sample width " << head << " misaligns float4 row loads; pad sample logits to a multiple of 4";
   const int nb = static_cast<int>(num_buckets);
   const int cap = static_cast<int>(cand_cap);
   CHECK_HOST(nb >= 2 && nb <= 4096) << "num_buckets out of range: " << nb;
@@ -89,8 +94,7 @@ void dsa_litetopk_seed_prep(
       attr_set = true;
     }
   }
-  const int emit_lim =
-      emit_limit == 0 ? 0 : (emit_limit > 0 ? static_cast<int>(emit_limit) : head);
+  const int emit_lim = emit_limit == 0 ? 0 : (emit_limit > 0 ? static_cast<int>(emit_limit) : head);
   const int pst = static_cast<int>(probe_stride_tok);
   const int hst = hist_stride > 1 ? static_cast<int>(hist_stride) : 1;
 
@@ -155,10 +159,7 @@ void dsa_litetopk_scan(
   device_.set_options<kDLCUDA>();
 
   auto SPAD = SymbolicSize{"kv_scales_padded_len"};
-  TensorMatcher({Q, NUM_HEADS, HEAD_DIM})
-      .with_dtype<fp8_e4m3_t>()
-      .with_device(device_)
-      .verify(q);
+  TensorMatcher({Q, NUM_HEADS, HEAD_DIM}).with_dtype<fp8_e4m3_t>().with_device(device_).verify(q);
   TensorMatcher({SKV, HEAD_DIM}).with_dtype<fp8_e4m3_t>().with_device(device_).verify(kv);
   TensorMatcher({SPAD}).with_dtype<fp32_t>().with_device(device_).verify(kv_scales);
   TensorMatcher({Q, NUM_HEADS}).with_dtype<fp32_t>().with_device(device_).verify(weights);
@@ -169,8 +170,7 @@ void dsa_litetopk_scan(
       .verify(cu_end)
       .verify(th_bucket)
       .verify(cand_cnt);
-  TensorMatcher({Q}).with_dtype<fp32_t>().with_device(device_).verify(origin).verify(
-      inv_delta);
+  TensorMatcher({Q}).with_dtype<fp32_t>().with_device(device_).verify(origin).verify(inv_delta);
   TensorMatcher({Q, CAP}).with_dtype<fp32_t>().with_device(device_).verify(cand_val);
   TensorMatcher({Q, CAP}).with_dtype<int32_t>().with_device(device_).verify(cand_idx);
   TensorMatcher({Q, NB}).with_dtype<int32_t>().with_device(device_).verify(bcount);
@@ -181,18 +181,15 @@ void dsa_litetopk_scan(
   const int nb = static_cast<int>(num_buckets);
   const DLDevice device = device_.unwrap();
   CHECK_HOST(static_cast<int64_t>(NB.unwrap()) == nb) << "bcount width != num_buckets";
-  CHECK_HOST(runtime::get_cc_major(device.device_id) == 10)
-      << "dsa_litetopk_scan requires SM100 (Blackwell)";
+  CHECK_HOST(runtime::get_cc_major(device.device_id) == 10) << "dsa_litetopk_scan requires SM100 (Blackwell)";
   // The TMA descriptor for kv_scales rounds the global inner dim up to 16B;
   // the tail elements must be readable, so require a padded allocation.
   const int64_t scales_len = static_cast<int64_t>(SPAD.unwrap());
-  CHECK_HOST(scales_len % 4 == 0)
-      << "kv_scales must be padded to a multiple of 4 floats, got " << scales_len;
+  CHECK_HOST(scales_len % 4 == 0) << "kv_scales must be padded to a multiple of 4 floats, got " << scales_len;
   CHECK_HOST(scales_len >= seq_len_kv) << "kv_scales shorter than kv";
 
   const bool external_refresh = (refresh_every < 0);
-  const int refresh_every_i =
-      external_refresh ? 0x7fffffff : static_cast<int>(refresh_every);
+  const int refresh_every_i = external_refresh ? 0x7fffffff : static_cast<int>(refresh_every);
 
   const int esz_f32 = 4;
   const int ks_aligned = align_up(seq_len_kv, 16 / esz_f32);
@@ -250,8 +247,7 @@ void dsa_litetopk_scan(
       MATH_THREADS>;
   static bool scan_attr_set = false;
   if (!scan_attr_set) {
-    CHECK_CUDA(cudaFuncSetAttribute(
-        (const void*)kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+    CHECK_CUDA(cudaFuncSetAttribute((const void*)kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
     scan_attr_set = true;
   }
 
@@ -271,14 +267,12 @@ void dsa_litetopk_scan(
     if (num_kv_splits > max_useful_splits) num_kv_splits = max_useful_splits;
   }
   if (num_kv_splits < 1) num_kv_splits = 1;
-  if (num_kv_splits > total_kv_blocks)
-    num_kv_splits = total_kv_blocks > 0 ? total_kv_blocks : 1;
+  if (num_kv_splits > total_kv_blocks) num_kv_splits = total_kv_blocks > 0 ? total_kv_blocks : 1;
 
   const dim3 grid(static_cast<unsigned>(num_q_blocks), static_cast<unsigned>(num_kv_splits), 1);
-  const uint64_t probe_magic = probe_group > 0
-      ? (((1ULL << 42) + static_cast<uint64_t>(probe_group) - 1) /
-         static_cast<uint64_t>(probe_group))
-      : 0ULL;
+  const uint64_t probe_magic =
+      probe_group > 0 ? (((1ULL << 42) + static_cast<uint64_t>(probe_group) - 1) / static_cast<uint64_t>(probe_group))
+                      : 0ULL;
   LaunchKernel(grid, SPEC_THREADS + MATH_THREADS, device, smem)(
       kernel,
       static_cast<uint32_t>(seq_len),
@@ -344,13 +338,8 @@ void dsa_litetopk_select(
 
   TensorMatcher({R, CAP}).with_dtype<fp32_t>().with_device(device_).verify(cand_val);
   TensorMatcher({R, CAP}).with_dtype<int32_t>().with_device(device_).verify(cand_idx);
-  TensorMatcher({R})
-      .with_dtype<int32_t>()
-      .with_device(device_)
-      .verify(cand_cnt)
-      .verify(th_bucket);
-  TensorMatcher({R}).with_dtype<fp32_t>().with_device(device_).verify(origin).verify(
-      inv_delta);
+  TensorMatcher({R}).with_dtype<int32_t>().with_device(device_).verify(cand_cnt).verify(th_bucket);
+  TensorMatcher({R}).with_dtype<fp32_t>().with_device(device_).verify(origin).verify(inv_delta);
   TensorMatcher({R, K}).with_dtype<fp32_t>().with_device(device_).verify(out_val);
   TensorMatcher({R, K}).with_dtype<int32_t>().with_device(device_).verify(out_idx);
 
