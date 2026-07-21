@@ -322,9 +322,9 @@ class MooncakeKVManager(CommonKVManager):
         room = int(msg[1].decode("ascii"))
         session_id = msg[4].decode("ascii")
         handler = self._staging_handler
-        assert handler is not None, (
-            "STAGING_REQ received before staging handler initialized"
-        )
+        assert (
+            handler is not None
+        ), "STAGING_REQ received before staging handler initialized"
         decode_req = handler._room_to_decode_req.get(room)
         if decode_req is None:
             logger.warning(
@@ -1636,9 +1636,9 @@ class MooncakeKVManager(CommonKVManager):
                     num_pages = int(msg[4].decode("ascii"))
                     session_id = msg[5].decode("ascii")
                     handler = self._staging_handler
-                    assert handler is not None, (
-                        "CHUNK_READY received before staging handler initialized"
-                    )
+                    assert (
+                        handler is not None
+                    ), "CHUNK_READY received before staging handler initialized"
                     handler.handle_chunk_arrived(
                         room,
                         chunk_idx,

@@ -1090,9 +1090,9 @@ class CommonKVManager(BaseKVManager):
         """
         start_layer = self.kv_args.prefill_start_layer
         end_layer = getattr(self.kv_args, "prefill_end_layer", None)
-        assert end_layer is not None, (
-            "KVArgs.prefill_end_layer must be set when using compressed-MLA PD with PP"
-        )
+        assert (
+            end_layer is not None
+        ), "KVArgs.prefill_end_layer must be set when using compressed-MLA PD with PP"
 
         c4_full = sum(1 for r in mla_ratios if r == 4)
         c128_full = sum(1 for r in mla_ratios if r == 128)
@@ -1146,7 +1146,8 @@ class CommonKVManager(BaseKVManager):
             list(dst_kv_ptrs[swa_s:swa_e])
             + list(
                 dst_kv_ptrs[
-                    compress_section_start + c4_off_s : compress_section_start
+                    compress_section_start
+                    + c4_off_s : compress_section_start
                     + c4_off_e
                 ]
             )
