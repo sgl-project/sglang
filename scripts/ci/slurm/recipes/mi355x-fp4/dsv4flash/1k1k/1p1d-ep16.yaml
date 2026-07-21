@@ -1,8 +1,14 @@
-# MI355X DeepSeek-V4-Flash FP4 4-node 1P1D disaggregation recipe — wide EP16.
+# MI355X DeepSeek-V4-Flash FP4 4-node 2P1D disaggregation recipe — narrow-prefill EP8
+# + wide-decode EP16 (Oren's config: wide EP only helps decode).
 #
-# One prefill engine spans 2 nodes + one decode engine spans 2 nodes (still 1P1D,
-# 4 nodes total). TP/EP/DP=16 => nodes-per-engine = ceil(16/8) = 2, so the launcher
-# emits cross-node --nnodes/--node-rank/--dist-init-addr for each engine.
+# Two prefill engines (EP8, one node each; the router fans requests across both) +
+# one decode engine (EP16) spanning 2 nodes. Still one logical P/D pair per role
+# group, 4 nodes total. nodes-per-engine = ceil(TP/8): prefill 8->1, decode 16->2,
+# so the launcher emits cross-node --nnodes/--node-rank/--dist-init-addr for the
+# decode engine only. Prefill EP8 keeps MoE all-to-all INTRA-node (XGMI, known
+# good); decode gets wide EP16 across nodes. Mismatched-TP KV (prefill TP8 ->
+# decode TP16) is layout-compatible for DeepSeek MLA (KV is a replicated per-token
+# latent, not head-sharded), and is carried over mori.
 #
 # Consumed by:
 #   * scripts/ci/slurm/process_result.py reads `resources` and
@@ -10,42 +16,64 @@
 #   * scripts/ci/slurm/launch_mi355x.sh reads `runtime`, `bench`, and `mtp`.
 
 resources:
-  prefill_workers: 1
+  prefill_workers: 2
   decode_workers: 1
 
 backend:
   sglang_config:
     prefill:
-      tensor-parallel-size: 16
-      expert-parallel-size: 16
-      data-parallel-size: 16
+      tensor-parallel-size: 8
+      expert-parallel-size: 8
+      data-parallel-size: 8
     decode:
       tensor-parallel-size: 16
       expert-parallel-size: 16
       data-parallel-size: 16
 
 runtime:
-  image: lmsysorg/sglang-rocm:v0.5.15-rocm720-mi35x-20260713
+  image: lmsysorg/sglang-rocm:v0.5.15.post1-rocm720-mi35x-20260715
   attention_backend: dsv4
-  # spur ionic RoCE HCAs (8/node).
-  ib_devices: ionic_0,ionic_1,ionic_2,ionic_3,ionic_4,ionic_5,ionic_6,ionic_7
+  # RoCE HCAs (8/node) for mori MoE all-to-all AND the P->D KV transfer.
+  ib_devices: rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
   # Wide-EP MoE all-to-all backend (cross-node expert dispatch/combine).
   moe_a2a_backend: mori
-  # KV P->D transfer backend.
-  kv_transfer_backend: mooncake
-  # Cross-node torch-distributed NIC (spur internal 10.128 network).
-  dist_socket_ifname: eth1
+  # KV P->D transfer backend (mori for both a2a and KV on this cluster).
+  kv_transfer_backend: mori
+  # Cross-node torch-distributed NIC for the wide decode engine's dist init.
+  dist_socket_ifname: eno0
+  # rocm720 0715 image needs the ROCm-7.0.0-alpha path OFF (validated).
+  rocm700a: 0
   prefill_port: 30025
   decode_port: 30026
   prefill_bootstrap_port: 8998
   decode_bootstrap_port: 9001
   lb_port: 8000
+  # Base defaults; the wide_ep block overrides mem-fraction / max-req per role.
   mem_fraction_static: 0.90
   page_size: 256
   max_running_requests: 256
-  max_total_tokens: 8551168
-  chunked_prefill_size: 8192
+  chunked_prefill_size: 131072
   swa_full_tokens_ratio: 0.1
+  # Per-role wide-EP tuning (validated 2P1D run, job 13196). Prefill and decode
+  # differ, so these split what the single-node EP<=8 recipes leave symmetric.
+  wide_ep:
+    kv_cache_dtype: fp8_e4m3
+    prefill_mem_fraction_static: 0.8
+    decode_mem_fraction_static: 0.85
+    prefill_chunked_prefill_size: 131072
+    prefill_max_running_requests: 1024
+    decode_max_running_requests: 1024
+    common_extra_flags: "--moe-dense-tp-size 1 --enable-dp-lm-head --decode-log-interval 100 --watchdog-timeout 3600 --load-balance-method round_robin"
+    prefill_extra_flags: "--context-length 9217 --max-total-tokens 262144"
+    decode_extra_flags: "--cuda-graph-bs 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71 72 73 74 75 76 77 78 79 80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95 96 97 98 99 100 101 102 103 104 105 106 107 108 109 110 111 112 113 114 115 116 117 118 119 120 121 122 123 124 125 126 127 128 --prefill-round-robin-balance"
+    prefill_extra_env:
+      MORI_MAX_DISPATCH_TOKENS_PREFILL: 8192
+      MORI_MAX_DISPATCH_TOKENS_DECODE: 256
+      SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK: 16384
+    decode_extra_env:
+      MORI_MAX_DISPATCH_TOKENS_DECODE: 64
+      MORI_MOE_MAX_INPUT_TOKENS_DECODE: 332
+      SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK: 128
 
 bench:
   # bench_serving --max-concurrency sweep; one result JSON per concurrency.
