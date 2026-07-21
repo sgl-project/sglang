@@ -127,13 +127,29 @@ The drafts are small BF16 models, each *calibrated against its quantized target*
 
 Leave `--attention-backend` unset for High-throughput cells — auto-select is correct (`fa3` on Hopper, `trtllm_mha` on Blackwell). With DFlash active, auto-select instead falls back to `flashinfer`, which breaks this hybrid-SWA model at `tp ≥ 4` on Blackwell (reproduced on Laguna-XS-2.1, greedy GSM8K 76% → 28%), so the Low-latency commands pin the target backend explicitly. Leave `--speculative-draft-attention-backend` unset. Other attention backend choices have not been fully validated on Laguna; keep the default.
 
+**Sampling defaults**
+
+`generation_config.json` ships with `top_k=0`. With the default `--sampling-defaults model`, sglang applies `top_k=0` at serving time and rejects any non-greedy sampling request (AIME25, chat sampling) with HTTP 400. All generated commands include `--sampling-defaults openai` to use OpenAI API defaults instead — greedy inference (GSM8K) is unaffected.
+
+**BF16 memory on H200**
+
+BF16 weights consume ~29.5 GB/GPU on H200 (about 2× FP8), leaving less headroom for CUDA-graph capture and NCCL allocations at high concurrency. The default `mem-fraction-static 0.893` OOMs at cuda-graph capture; `0.88` crashes under NCCL at `conc ≥ 1024`. The High-throughput BF16 command carries `--mem-fraction-static 0.80`. FP8 and INT4 use the default heuristic. On B300 and GB300 (288 GB/GPU) BF16 has ample headroom and no adjustment is needed.
+
 **FP8 shared expert**
 
-The generated FP8 commands include `SGLANG_SHARED_EXPERT_TP1=1` as a precaution. The Laguna family's FP8 checkpoint block-quantizes the shared expert; this env var replicates it instead of TP-sharding it (consistent with the Laguna-XS-2.1 verified recipe). Remove it only after confirming shared-expert sharding works on this model.
+`SGLANG_SHARED_EXPERT_TP1=1` is required for FP8 cells: the FP8 checkpoint block-quantizes the shared expert (128×128 scales), which cannot TP-shard cleanly. This env var replicates the shared expert instead of sharding it. INT4 keeps the shared expert in BF16 (no flag needed); BF16 is unquantized.
+
+**FP8 DFlash draft**
+
+The HF checkpoint `poolside/Laguna-S-2.1-DFlash-FP8` (as of 2026-07-20) is missing `rope_theta` in `rope_parameters`. If the server crashes at draft-model load, patch the draft config locally by adding `"rope_theta"` to that block. The BF16 and INT4 draft models are unaffected.
 
 **DFlash memory**
 
-Low-latency cells carry `--mem-fraction-static 0.7`: at larger TP degrees the default fraction may OOM in the draft vocab all-gather. Dense cells use the default heuristic.
+Low-latency cells carry `--mem-fraction-static 0.7` (sufficient even for BF16 on H200). Dense cells use the default heuristic (except BF16 on H200 — see above).
+
+**BF16 reasoning length**
+
+BF16 reasons approximately 2× longer than FP8/INT4 on AIME25 (median 34.8 k vs 16.9 k tokens), consistently truncating at `max_tokens=64000`. FP8/INT4 truncate at ≈ 2%. For a valid BF16 AIME25 score, serve with `max_tokens ≥ 131072` (the model supports a 1 M context window).
 
 **Chat template**
 
