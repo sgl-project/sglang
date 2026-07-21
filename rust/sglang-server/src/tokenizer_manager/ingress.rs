@@ -20,7 +20,7 @@ use bytes::Bytes;
 
 use crate::error::Error;
 use crate::fsm::{Event, RequestState, ValidationOutcome};
-use crate::ids::RequestId;
+use crate::ids::RidHash;
 use crate::message::{
     EgressItem, IngressMsg, Request, RequestKind, abort_req_msgpack, control_req_msgpack,
 };
@@ -64,7 +64,7 @@ impl Runnable for Ingress {
             match ev {
                 // A fresh request and one returning from the tokenizer pool.
                 TmEvent::Ingress(req) | TmEvent::Tokenized(req) => self.drive(req),
-                TmEvent::Abort(id) => self.on_abort(id),
+                TmEvent::Abort(rid) => self.on_abort(rid),
             }
         }
     }
@@ -74,14 +74,17 @@ impl Ingress {
     /// Reject a request: → `Failed`, notify the client, deregister (unconditional
     /// — a no-op when nothing was registered).
     fn fail(&self, req: &mut Request, err: Error) {
-        let id = req.id;
+        let id = req.rid_hash;
         // Log only server faults (500); 4xx/499/503 are expected and would spam.
         if err.http_status() == 500 {
             tracing::error!(rid = id.0, error = %err, "ingress rejected request");
         }
         let _ = req.state.apply(Event::Error(err.clone()));
         let _ = req.sink.try_send(EgressItem::Error(err)); // client may be gone
-        let _ = self.senders.detok_for(id).send(DetokMsg::Deregister { id });
+        let _ = self
+            .senders
+            .detok_for(id)
+            .send(DetokMsg::Deregister { rid_hash: id });
     }
 
     /// Drive a request through its ingress states until it terminates (failed or
@@ -203,9 +206,10 @@ impl Ingress {
             RequestKind::Control(_) => (false, false),
         };
         self.senders
-            .detok_for(req.id)
+            .detok_for(req.rid_hash)
             .send(DetokMsg::Register {
-                id: req.id,
+                rid_hash: req.rid_hash,
+                rid: req.rid.clone(),
                 sink: req.sink.clone(),
                 decode_logprob_text,
                 no_stop_trim,
@@ -217,7 +221,7 @@ impl Ingress {
     /// scheduler dispatches it (e.g. `GetInternalStateReq`) and replies via the
     /// egress ring as a single `Result`.
     fn push_control_to_ring(&self, mut req: Request, tag: &str) {
-        let header = match control_req_msgpack(tag, &req.id.0.to_string()) {
+        let header = match control_req_msgpack(tag, &req.rid) {
             Ok(b) => b,
             Err(e) => {
                 self.fail(&mut req, e);
@@ -236,19 +240,23 @@ impl Ingress {
     /// Client disconnected: deregister, then push an `AbortReq(rid)` so the
     /// scheduler stops generating. Fire-and-forget (a full ring drops the abort;
     /// the request then finishes at EOS).
-    fn on_abort(&self, id: RequestId) {
-        let _ = self.senders.detok_for(id).send(DetokMsg::Deregister { id });
+    fn on_abort(&self, rid: String) {
+        let id = RidHash::from_rid(&rid);
+        let _ = self
+            .senders
+            .detok_for(id)
+            .send(DetokMsg::Deregister { rid_hash: id });
 
-        match abort_req_msgpack(&id.0.to_string()) {
+        match abort_req_msgpack(&rid) {
             Ok(header) => {
                 if !self.ingress.try_push(IngressMsg {
                     header,
                     ids: Bytes::new(),
                 }) {
-                    tracing::warn!(rid = id.0, "abort dropped: ingress ring full");
+                    tracing::warn!(rid = %rid, "abort dropped: ingress ring full");
                 }
             }
-            Err(e) => tracing::warn!(rid = id.0, error = %e, "abort encode failed"),
+            Err(e) => tracing::warn!(rid = %rid, error = %e, "abort encode failed"),
         }
     }
 
@@ -260,7 +268,7 @@ impl Ingress {
         // own their data, so the borrow ends before any `fail(&mut req)`.
         let serialized = match &req.kind {
             RequestKind::Generate(g) if g.already_tokenized() => g
-                .to_header_msgpack(&req.id.0.to_string())
+                .to_header_msgpack(&req.rid)
                 .map(|header| (header, g.input_ids_i64_le())),
             RequestKind::Generate(_) => Err(Error::Tokenize("empty input_ids".into())),
             RequestKind::Control(_) => Err(Error::Internal(
@@ -350,7 +358,8 @@ mod tests {
     fn generate_req(id: u64, sampling_params: rmpv::Value) -> Request {
         let (tx, _rx) = mpsc::channel(8);
         Request {
-            id: RequestId(id),
+            rid_hash: RidHash(id),
+            rid: id.to_string(),
             state: RequestState::Received,
             sink: EgressSink::Local(tx),
             kind: RequestKind::Generate(GenerateRequest {
@@ -371,11 +380,11 @@ mod tests {
         ingress.drive(generate_req(7, bad));
 
         assert!(
-            matches!(detok_rx.try_recv(), Ok(DetokMsg::Register { id, .. }) if id == RequestId(7)),
+            matches!(detok_rx.try_recv(), Ok(DetokMsg::Register { rid_hash, .. }) if rid_hash == RidHash(7)),
             "expected Register for rid 7",
         );
         assert!(
-            matches!(detok_rx.try_recv(), Ok(DetokMsg::Deregister { id }) if id == RequestId(7)),
+            matches!(detok_rx.try_recv(), Ok(DetokMsg::Deregister { rid_hash }) if rid_hash == RidHash(7)),
             "expected Deregister for rid 7 (leak fix)",
         );
         assert!(
@@ -392,7 +401,7 @@ mod tests {
         ingress.drive(generate_req(9, rmpv::Value::Map(vec![])));
 
         assert!(
-            matches!(detok_rx.try_recv(), Ok(DetokMsg::Register { id, .. }) if id == RequestId(9)),
+            matches!(detok_rx.try_recv(), Ok(DetokMsg::Register { rid_hash, .. }) if rid_hash == RidHash(9)),
             "expected Register for rid 9",
         );
         assert!(
@@ -417,24 +426,25 @@ mod tests {
         ingress.run();
 
         assert!(
-            matches!(detok_rx.try_recv(), Ok(DetokMsg::Deregister { id }) if id == RequestId(11)),
+            matches!(detok_rx.try_recv(), Ok(DetokMsg::Deregister { rid_hash }) if rid_hash == RidHash(11)),
             "tokenize failure must deregister rid 11",
         );
         assert!(detok_rx.try_recv().is_err(), "no further shard messages");
     }
 
-    /// An abort deregisters, so a request aborted before any terminal chunk
-    /// can't leak.
+    /// An abort deregisters (by the id hashed from the rid string), so a request
+    /// aborted before any terminal chunk can't leak.
     #[test]
     fn abort_deregisters_from_shard() {
         let (ingress, detok_rx, _consumer, tm_tx) = make_ingress();
-        tm_tx.send(TmEvent::Abort(RequestId(13))).unwrap();
+        tm_tx.send(TmEvent::Abort("rid-13".to_string())).unwrap();
         drop(tm_tx);
         ingress.run();
 
+        let want = RidHash::from_rid("rid-13");
         assert!(
-            matches!(detok_rx.try_recv(), Ok(DetokMsg::Deregister { id }) if id == RequestId(13)),
-            "abort must deregister rid 13",
+            matches!(detok_rx.try_recv(), Ok(DetokMsg::Deregister { rid_hash }) if rid_hash == want),
+            "abort must deregister the hashed rid",
         );
         assert!(detok_rx.try_recv().is_err(), "no further shard messages");
     }
@@ -475,11 +485,11 @@ mod tests {
         ingress.drive(req);
 
         assert!(
-            matches!(detok_rx.try_recv(), Ok(DetokMsg::Register { id, .. }) if id == RequestId(21)),
+            matches!(detok_rx.try_recv(), Ok(DetokMsg::Register { rid_hash, .. }) if rid_hash == RidHash(21)),
             "expected Register for rid 21",
         );
         assert!(
-            matches!(detok_rx.try_recv(), Ok(DetokMsg::Deregister { id }) if id == RequestId(21)),
+            matches!(detok_rx.try_recv(), Ok(DetokMsg::Deregister { rid_hash }) if rid_hash == RidHash(21)),
             "pool-gone hand-off must deregister rid 21",
         );
         assert!(detok_rx.try_recv().is_err(), "no further shard messages");
