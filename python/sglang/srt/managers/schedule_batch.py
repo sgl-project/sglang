@@ -111,7 +111,10 @@ from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import flatten_nested_list
-from sglang.srt.utils.cuda_ipc_transport_utils import CudaIpcTensorTransportProxy
+from sglang.srt.utils.cuda_ipc_transport_utils import (
+    DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
+    CudaIpcTensorTransportProxy,
+)
 
 if TYPE_CHECKING:
     from typing import Any, Dict
@@ -359,10 +362,15 @@ class MultimodalDataItem:
             )
         )
 
-    def reconstruct(self, target_device: int):
+    def reconstruct(self, target_device: int, ipc_consumer_count: int = 1):
         """materialize cuda ipc proxy tensors in-place on target_device"""
         if isinstance(self.feature, CudaIpcTensorTransportProxy):
-            self.feature = self.feature.reconstruct_on_target_device(target_device)
+            if ipc_consumer_count == 1:
+                self.feature = self.feature.reconstruct_on_target_device(target_device)
+            else:
+                self.feature = self.feature.reconstruct_on_target_device(
+                    target_device, consumer_count=ipc_consumer_count
+                )
         if isinstance(self.precomputed_embeddings, CudaIpcTensorTransportProxy):
             self.precomputed_embeddings = (
                 self.precomputed_embeddings.reconstruct_on_target_device(target_device)
@@ -375,6 +383,32 @@ class MultimodalDataItem:
                     extra_key
                 ].reconstruct_on_target_device(target_device)
                 self.model_specific_data[extra_key] = extra_data
+
+    def can_defer_cuda_ipc_feature_reconstruction(self) -> bool:
+        """Whether a DP-aware model will materialize this feature lazily.
+
+        Hashing and pad-value generation must already have completed on the
+        tokenizer worker.  Any additional IPC proxy would still need eager
+        reconstruction, so keep the narrow fast path feature-only.
+        """
+        return (
+            self.model_specific_data.get(
+                DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY, False
+            )
+            and self.hash is not None
+            and self.pad_value is not None
+            and isinstance(self.feature, CudaIpcTensorTransportProxy)
+            and not isinstance(self.precomputed_embeddings, CudaIpcTensorTransportProxy)
+            and not any(
+                isinstance(value, CudaIpcTensorTransportProxy)
+                for value in self.model_specific_data.values()
+            )
+        )
+
+    def acknowledge_deferred_cuda_ipc_feature(self, consumer_count: int = 1):
+        """Release a lazy IPC feature when an embedding-cache hit skips ViT."""
+        if isinstance(self.feature, CudaIpcTensorTransportProxy):
+            self.feature.acknowledge_consumption(consumer_count)
 
 
 @dataclasses.dataclass
@@ -510,7 +544,10 @@ class MultimodalInputs:
         # try reconstructing from cuda-ipc
         reconstruct_device = None
         for mm_item in mm_items:
-            if mm_item.has_cuda_ipc_proxy():
+            if (
+                mm_item.has_cuda_ipc_proxy()
+                and not mm_item.can_defer_cuda_ipc_feature_reconstruction()
+            ):
                 if reconstruct_device is None:
                     reconstruct_device = torch.cuda.current_device()
                 mm_item.reconstruct(reconstruct_device)
@@ -1452,11 +1489,6 @@ class Req(ReqDllmMixin):
             self.finished_len = self.sampling_params.max_new_tokens
             return
 
-        if self.grammar is not None:
-            if self.grammar.is_terminated():
-                self.finished_reason = FINISH_MATCHED_TOKEN(matched=self.output_ids[-1])
-                return
-
         new_accepted_tokens = self.output_ids[-new_accepted_len:]
 
         # Sanitize out-of-range / NaN token ids before any decode.
@@ -1470,6 +1502,10 @@ class Req(ReqDllmMixin):
             return
 
         if self._check_token_based_finish(new_accepted_tokens):
+            return
+
+        if self.grammar is not None and self.grammar.is_terminated():
+            self.finished_reason = FINISH_MATCHED_TOKEN(matched=self.output_ids[-1])
             return
 
     def reset_for_retract(self):
@@ -2892,6 +2928,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.spec_info.filter_batch(
                 new_indices=keep_indices_device,
                 has_been_filtered=False,
+                new_indices_cpu=keep_indices,
             )
 
     def merge_batch(self, other: ScheduleBatch):
@@ -2970,6 +3007,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             forward_mode=self.forward_mode,
             out_cache_loc=self.out_cache_loc,
             return_logprob=self.return_logprob,
+            has_grammar=self.has_grammar,
             decoding_reqs=self.decoding_reqs,
             spec_algorithm=self.spec_algorithm,
             spec_info=self.spec_info,

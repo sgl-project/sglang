@@ -1,9 +1,19 @@
 import inspect
+import re
 from typing import Dict, List, Optional, Tuple, Type
 
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 from sglang.srt.function_call.hunyuan_detector import resolve_hunyuan_tokens
 from sglang.srt.parser.harmony_parser import HarmonyParser
+from sglang.srt.parser.inkling_tokenizer import (
+    CONTENT_INVOKE_TOOL_JSON,
+    CONTENT_MODEL_END_SAMPLING,
+    CONTENT_TEXT,
+    CONTENT_THINKING,
+    END_MESSAGE,
+    INKLING_CONTROL_TOKENS,
+    MESSAGE_MODEL,
+)
 
 
 class StreamingParseResult:
@@ -702,6 +712,183 @@ class Gemma4Detector(BaseReasoningFormatDetector):
         self.think_start_self_label = "thought\n"
 
 
+_INKLING_CONTENT_KINDS = {
+    CONTENT_THINKING: "reasoning",
+    CONTENT_TEXT: "content",
+}
+_INKLING_END_TOKENS = {
+    CONTENT_MODEL_END_SAMPLING,
+    END_MESSAGE,
+}
+_INKLING_CONTROL_TOKENS = INKLING_CONTROL_TOKENS
+_INKLING_CONTROL_RE = re.compile(
+    "|".join(re.escape(t) for t in sorted(_INKLING_CONTROL_TOKENS))
+)
+
+
+class InklingDetector(BaseReasoningFormatDetector):
+    """Detector for Inkling typed content blocks."""
+
+    # Parse the model's sequence of typed content blocks, for example:
+    #   <|message_model|><|content_thinking|>reasoning<|end_message|>
+    #   <|message_model|><|content_text|>visible answer<|end_message|>
+    #   <|content_model_end_sampling|>
+    # Special tokens must decode literally so thinking and visible text can be
+    # routed to their respective response fields.
+    def __init__(
+        self,
+        stream_reasoning: bool = True,
+        force_reasoning: bool = False,
+        continue_final_message: bool = False,
+        previous_content: str = "",
+        force_nonempty_content: bool = False,
+    ):
+        del force_nonempty_content
+        super().__init__(
+            CONTENT_THINKING,
+            END_MESSAGE,
+            force_reasoning=force_reasoning,
+            stream_reasoning=stream_reasoning,
+            continue_final_message=continue_final_message,
+            previous_content=previous_content,
+            thinks_internally=False,
+            reasoning_default="always",
+        )
+
+        self._kind: str | None = None
+        self._pending_header = ""
+        self._pending_reasoning = ""
+
+    def detect_and_parse(self, text: str) -> StreamingParseResult:
+        self._buffer = ""
+        self._kind = None
+        self._pending_header = ""
+        self._pending_reasoning = ""
+        ret = self._parse_blocks(text)
+        if self._kind == "reasoning" and not self.stream_reasoning:
+            ret.reasoning_text += self._pending_reasoning
+        self._kind = None
+        self._pending_header = ""
+        self._pending_reasoning = ""
+        return ret
+
+    def parse_streaming_increment(self, new_text: str) -> StreamingParseResult:
+        text = self._buffer + new_text
+        partial_len = self._partial_control_length(text)
+        if partial_len:
+            self._buffer = text[-partial_len:]
+            text = text[:-partial_len]
+        else:
+            self._buffer = ""
+        return self._parse_blocks(text)
+
+    def finish(self) -> StreamingParseResult:
+        # Flush reasoning buffered under stream_reasoning=False when the stream
+        # ends before a control/end token closes the block (e.g. max_tokens cut
+        # a thinking block short). Mirrors the non-streaming flush in
+        # detect_and_parse; without it the trailing reasoning trace is dropped.
+        reasoning_text = ""
+        if self._kind == "reasoning" and not self.stream_reasoning:
+            reasoning_text = self._pending_reasoning
+        self._buffer = ""
+        self._pending_reasoning = ""
+        self._pending_header = ""
+        self._kind = None
+        return StreamingParseResult(reasoning_text=reasoning_text)
+
+    @staticmethod
+    def _partial_control_length(text: str) -> int:
+        max_token_len = max(map(len, _INKLING_CONTROL_TOKENS))
+        for length in range(min(len(text), max_token_len - 1), 0, -1):
+            suffix = text[-length:]
+            if any(
+                len(suffix) < len(token) and token.startswith(suffix)
+                for token in _INKLING_CONTROL_TOKENS
+            ):
+                return length
+        return 0
+
+    def _parse_blocks(self, text: str) -> StreamingParseResult:
+        reasoning: list[str] = []
+        content: list[str] = []
+        saw_control = False
+        pos = 0
+
+        def emit(text: str) -> None:
+            if self._kind == "reasoning":
+                if self.stream_reasoning:
+                    reasoning.append(text)
+                else:
+                    self._pending_reasoning += text
+            elif self._kind == "content":
+                content.append(text)
+            elif self._kind == "tool":
+                content.append(text)
+            elif self._kind == "header":
+                self._pending_header += text
+            elif text:
+                # No open block — e.g. a continue_final_message stream resuming
+                # mid text block. Route to visible content, matching the
+                # no-control-token path below.
+                content.append(text)
+
+        def flush_reasoning() -> None:
+            if self._kind == "reasoning" and not self.stream_reasoning:
+                reasoning.append(self._pending_reasoning)
+                self._pending_reasoning = ""
+
+        for match in _INKLING_CONTROL_RE.finditer(text):
+            saw_control = True
+            emit(text[pos : match.start()])
+
+            token = match.group(0)
+            pos = match.end()
+            if token == MESSAGE_MODEL:
+                if self._kind in (None, "header"):
+                    flush_reasoning()
+                    self._pending_header = ""
+                    self._kind = "header"
+                else:
+                    # Inside an open block a decoded <|message_model|> string
+                    # is payload the model wrote (e.g. quoting the protocol) —
+                    # a real header can only follow an end token. Preserve it
+                    # instead of rerouting the rest of the block into a header.
+                    emit(token)
+            elif token == CONTENT_INVOKE_TOOL_JSON:
+                flush_reasoning()
+                if self._kind == "header":
+                    content.extend(
+                        (MESSAGE_MODEL, self._pending_header, CONTENT_INVOKE_TOOL_JSON)
+                    )
+                    self._pending_header = ""
+                else:
+                    content.append(token)
+                self._kind = "tool"
+            elif self._kind == "tool":
+                content.append(token)
+                if token in _INKLING_END_TOKENS:
+                    self._kind = None
+            elif token in _INKLING_CONTENT_KINDS:
+                flush_reasoning()
+                self._pending_header = ""
+                self._kind = _INKLING_CONTENT_KINDS[token]
+            elif token in _INKLING_END_TOKENS:
+                flush_reasoning()
+                self._pending_header = ""
+                self._kind = None
+
+        tail = text[pos:]
+        if saw_control or self._kind is not None:
+            emit(tail)
+        else:
+            content.append(text)
+
+        return StreamingParseResult(
+            normal_text="".join(content),
+            reasoning_text="".join(reasoning),
+        )
+
+
 class _DeepSeekV3Detector(Qwen3Detector):
     """DeepSeek-V3 reuses Qwen3 tokens but requires explicit thinking=True to enable."""
 
@@ -1217,6 +1404,7 @@ class ReasoningParser:
         "nemotron_3": Nemotron3Detector,
         "interns1": Qwen3Detector,
         "gemma4": Gemma4Detector,
+        "inkling": InklingDetector,
         "cohere_command4": CohereCommand4Detector,
     }
 
