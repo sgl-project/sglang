@@ -32,10 +32,14 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     StorageOperation as HybridStorageOperation,
 )
 from sglang.srt.mem_cache.storage_prefetch import (
+    PrefetchOwnershipTransition,
+    StorageCheckpointState,
+    StoragePrefetchOwnership,
     StoragePrefetchState,
     StoragePrefetchTracker,
     StorageWriteTracker,
 )
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.sampling.sampling_params import SamplingParams
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
@@ -60,9 +64,12 @@ class _FakeTreeCache:
         self.progress_checks = 0
         self.released_requests: list[str] = []
         self.synchronized_flag: bool | None = None
+        self.prefetch_threshold = 256
+        self.dependency_state = StorageCheckpointState.PENDING
+        self.device_pins: list[tuple[str, object]] = []
+        self.host_pins: list[tuple[str, object, int]] = []
 
     def storage_prefetch_timeout(self, num_tokens: int) -> float:
-        assert num_tokens == 256
         return 5.0
 
     def synchronize_storage_prefetch_flag(self, flag: bool) -> bool:
@@ -97,6 +104,20 @@ class _FakeTreeCache:
     def release_aborted_request(self, request_id: str) -> None:
         self.released_requests.append(request_id)
         self.state = StoragePrefetchState.NOT_ATTEMPTED
+
+    def get_storage_checkpoint_dependency_state(
+        self, _request_id: str, _checkpoint_dependency: str
+    ) -> StorageCheckpointState:
+        return self.dependency_state
+
+    def _require_storage_prefetch_rank_agreement(self, _phase, _values) -> None:
+        return None
+
+    def pin_storage_prefetch_device_admission(self, request_id, node) -> None:
+        self.device_pins.append((request_id, node))
+
+    def pin_storage_prefetch_admission(self, request_id, node, occupied_tokens) -> None:
+        self.host_pins.append((request_id, node, occupied_tokens))
 
 
 def _make_request(tree_cache: _FakeTreeCache):
@@ -214,6 +235,25 @@ class TestSchedulerStoragePrefetch(unittest.TestCase):
         self.assertTrue(scheduler._storage_prefetch_ready_for_admission(request))
         self.assertEqual(request.storage_hit_length, 256)
 
+    def test_pending_checkpoint_admits_complete_local_device_match(self):
+        tree_cache = _FakeTreeCache([])
+        scheduler = self._make_scheduler(tree_cache)
+        device_node = _FakeNode()
+        request = _make_request(tree_cache)
+        request.storage_checkpoint_dependency = "hicache:prior-request"
+        request.prefix_indices = torch.arange(256)
+        request.last_node = device_node
+        request.last_host_node = device_node
+        request.swa_host_hit_length = 0
+        request.mamba_host_hit_length = 0
+
+        scheduler._prefetch_kvcache(request)
+
+        self.assertEqual(request.storage_prefetch_state, StoragePrefetchState.MISS)
+        self.assertTrue(request.storage_prefetch_local_match)
+        self.assertEqual(tree_cache.prefetch_attempts, 0)
+        self.assertEqual(tree_cache.device_pins, [("request-a", device_node)])
+
 
 class TestStorageCheckpointRequestNormalization(unittest.TestCase):
     def test_batch_checkpoint_fields_follow_each_request(self):
@@ -278,7 +318,7 @@ class TestStorageCheckpointDisaggregation(unittest.IsolatedAsyncioTestCase):
                 request = GenerateReqInput(input_ids=[1, 2], **request_kwargs)
 
                 with self.assertRaisesRegex(ValueError, "not supported with P/D"):
-                    await anext(manager.generate_request(request))
+                    await manager.generate_request(request).__anext__()
 
 
 class TestStorageCheckpointSchedulerValidation(unittest.TestCase):
@@ -336,6 +376,123 @@ class TestHybridStorageDurability(unittest.TestCase):
 
 
 class TestStorageQuerySynchronization(unittest.TestCase):
+    def test_query_worker_publishes_immutable_ownership_transition(self):
+        controller = HiCacheController.__new__(HiCacheController)
+        controller.prefetch_queue = Queue()
+        controller.prefetch_hit_queue = Queue()
+        controller.prefetch_revoke_queue = Queue()
+        controller.storage_stop_event = threading.Event()
+        controller.prefetch_threshold = 1
+        controller.page_size = 1
+        controller.scheduler_managed_prefetch = True
+        controller._all_reduce_prefetch_groups = lambda _value, _op: None
+        controller._storage_hit_query = lambda _operation: (["page-a"], 1)
+        operation = PrefetchOperation("request-a", [1], host_indices=torch.tensor([7]))
+        controller.prefetch_queue.put(operation)
+        worker = threading.Thread(target=controller.prefetch_thread_func)
+        worker.start()
+
+        transition = controller.prefetch_revoke_queue.get(timeout=1)
+        controller.storage_stop_event.set()
+        controller.prefetch_queue.put(None)
+        controller.prefetch_buffer.put(None)
+        worker.join(timeout=1)
+        controller.prefetch_io_aux_thread.join(timeout=1)
+
+        self.assertIsInstance(transition, PrefetchOwnershipTransition)
+        self.assertEqual(transition.request_id, "request-a")
+        self.assertEqual(transition.generation, operation.id)
+        self.assertEqual(transition.state, StoragePrefetchState.READING)
+        self.assertEqual(transition.retained_tokens, 1)
+        self.assertEqual(transition.hash_values, ("page-a",))
+        self.assertEqual(operation.hash_value, [])
+        self.assertEqual(operation.storage_hit_count, 0)
+
+    def test_scheduler_applies_ownership_transition_atomically(self):
+        operation = PrefetchOperation(
+            "request-a", [1, 2, 3, 4], host_indices=torch.arange(4)
+        )
+        released = []
+        controller = SimpleNamespace(
+            mem_pool_host=SimpleNamespace(
+                free=lambda indices: released.extend(indices.tolist())
+            ),
+            prefetch_buffer=Queue(),
+        )
+        cache = SimpleNamespace(
+            page_size=1,
+            prefetch_threshold=2,
+            cache_controller=controller,
+            ongoing_prefetch={"request-a": SimpleNamespace(operation=operation)},
+            storage_prefetch_ownership={
+                "request-a": StoragePrefetchOwnership(
+                    operation_id=operation.id,
+                    generation=operation.id,
+                    host_indices=torch.arange(4),
+                    owned_tokens=4,
+                )
+            },
+            storage_prefetch_aborted_requests=set(),
+            storage_prefetch_tracker=StoragePrefetchTracker(),
+            storage_state_change_resources=set(),
+        )
+        cache._require_storage_prefetch_rank_agreement = lambda _phase, _values: None
+        cache._prefetch_transition_fingerprint = (
+            UnifiedRadixCache._prefetch_transition_fingerprint
+        )
+        cache._truncate_prefetch_ownership = lambda request_id, retained: (
+            UnifiedRadixCache._truncate_prefetch_ownership(cache, request_id, retained)
+        )
+
+        UnifiedRadixCache._apply_prefetch_ownership_transition(
+            cache,
+            PrefetchOwnershipTransition(
+                request_id="request-a",
+                generation=operation.id,
+                state=StoragePrefetchState.READING,
+                retained_tokens=2,
+                hash_values=("page-a", "page-b"),
+            ),
+        )
+
+        self.assertEqual(released, [2, 3])
+        self.assertEqual(operation.hash_value, ["page-a", "page-b"])
+        self.assertTrue(torch.equal(operation.host_indices, torch.tensor([0, 1])))
+        self.assertIs(controller.prefetch_buffer.get_nowait(), operation)
+
+    def test_aborted_prefetch_waits_for_worker_quiescence(self):
+        operation = PrefetchOperation("request-a", [1, 2], host_indices=torch.arange(2))
+        cache = SimpleNamespace(
+            storage_checkpoint_registry=SimpleNamespace(
+                fail_if_present=lambda _handle: None
+            ),
+            prefetch_loaded_tokens_by_reqid={},
+            storage_checkpoint_dependency_results={},
+            ongoing_prefetch={"request-a": SimpleNamespace(operation=operation)},
+            storage_prefetch_tracker=StoragePrefetchTracker(),
+            storage_prefetch_aborted_requests=set(),
+        )
+        cache._release_storage_checkpoint = lambda *_args, **_kwargs: None
+        cache.release_storage_prefetch_admission = lambda _request_id: None
+        cache._require_storage_prefetch_rank_agreement = lambda _phase, _values: None
+        cache.synchronize_storage_prefetch_flag = lambda value: value
+        revoked = []
+        cache._revoke_pending_prefetch = lambda request_id, state: revoked.append(
+            (request_id, state)
+        )
+
+        UnifiedRadixCache.release_aborted_request(cache, "request-a")
+        UnifiedRadixCache._cleanup_aborted_prefetches(cache)
+
+        self.assertTrue(operation.is_terminated())
+        self.assertEqual(revoked, [])
+
+        operation.storage_prefetch_state = StoragePrefetchState.READING
+        operation.worker_done.set()
+        UnifiedRadixCache._cleanup_aborted_prefetches(cache)
+
+        self.assertEqual(revoked, [("request-a", StoragePrefetchState.FAILED)])
+
     def test_query_retries_when_write_starts_during_lookup(self):
         controller = HiCacheController.__new__(HiCacheController)
         controller.page_size = 1

@@ -34,6 +34,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransferResult,
 )
 from sglang.srt.mem_cache.memory_pool_host import PoolEntry
+from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchState
 from sglang.srt.utils import get_device_module
 
 if TYPE_CHECKING:
@@ -144,14 +145,17 @@ class PrefetchOperation(StorageOperation):
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
         pool_transfers: Optional[list[PoolTransfer]] = None,
+        host_indices: Optional[torch.Tensor] = None,
     ):
         self.request_id = request_id
         self._lock = threading.Lock()
         self._terminated_flag = False
         self.storage_hit_count = 0
         self.start_time = time.monotonic()
+        self.storage_prefetch_state = StoragePrefetchState.QUERYING
+        self.worker_done = threading.Event()
         super().__init__(
-            None,
+            host_indices,
             token_ids,
             last_hash,
             prefix_keys=prefix_keys,
@@ -581,6 +585,7 @@ class HybridCacheController(BaseHiCacheController):
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
         extra_pools: Optional[list[PoolTransfer]] = None,
+        host_indices: Optional[torch.Tensor] = None,
     ) -> PrefetchOperation:
         operation = PrefetchOperation(
             request_id,
@@ -588,6 +593,7 @@ class HybridCacheController(BaseHiCacheController):
             last_hash,
             prefix_keys=prefix_keys,
             pool_transfers=extra_pools,
+            host_indices=host_indices,
         )
         self.prefetch_queue.put(operation)
         return operation

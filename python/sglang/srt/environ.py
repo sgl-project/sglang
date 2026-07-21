@@ -211,7 +211,6 @@ class ToolStrictLevel(IntEnum):
 
 
 class Envs:
-
     # Raise on bare server_args field assignments after resolution; mutation
     # must go through ServerArgs.override() (enabled by the test harness).
     SGLANG_STRICT_CONFIG_MUTATION = EnvBool(False)
@@ -473,6 +472,7 @@ class Envs:
     # Disable with SGLANG_HICACHE_NIXL_USE_DIRECT_IO=0 or via the
     # "use_direct_io": false key in --hicache-storage-backend-extra-config.
     SGLANG_HICACHE_NIXL_USE_DIRECT_IO = EnvBool(True)
+    SGLANG_HICACHE_L3_STAGING_RESERVE_RATIO = EnvFloat(0.0)
     SGLANG_HUGEPAGE_SIZE = EnvStr("")
     # Staging buffer for heterogeneous TP KV transfer
     SGLANG_DISAGG_STAGING_BUFFER = EnvBool(False)

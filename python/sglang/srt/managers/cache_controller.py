@@ -30,6 +30,8 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
 )
 from sglang.srt.mem_cache.storage_prefetch import (
+    L3StagingManager,
+    PrefetchOwnershipTransition,
     StoragePrefetchState,
     StorageWriteTracker,
 )
@@ -121,7 +123,6 @@ class LayerDoneCounter:
 
 
 class CacheOperation:
-
     counter = 0
 
     def __init__(
@@ -211,6 +212,7 @@ class PrefetchOperation(StorageOperation):
         token_ids: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
+        host_indices: Optional[torch.Tensor] = None,
     ):
         self.request_id = request_id
 
@@ -218,8 +220,10 @@ class PrefetchOperation(StorageOperation):
         self._terminated_flag = False
         self.storage_hit_count = 0
         self.start_time = time.monotonic()
+        self.storage_prefetch_state = StoragePrefetchState.QUERYING
+        self.worker_done = threading.Event()
 
-        super().__init__(None, token_ids, last_hash, prefix_keys=prefix_keys)
+        super().__init__(host_indices, token_ids, last_hash, prefix_keys=prefix_keys)
 
     def increment(self, num_tokens: int):
         with self._lock:
@@ -237,7 +241,6 @@ class PrefetchOperation(StorageOperation):
 
 
 class HiCacheController:
-
     def __init__(
         self,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
@@ -277,6 +280,8 @@ class HiCacheController:
         self.storage_backend_type = None
         self.enable_storage_metrics = enable_storage_metrics
         self.storage_write_tracker = StorageWriteTracker()
+        self.l3_staging = L3StagingManager()
+        self.scheduler_managed_prefetch = False
 
         # Draft KV pool support (best-effort piggyback on target L2/L3 ops).
         self.has_draft = False
@@ -372,6 +377,11 @@ class HiCacheController:
         for group in self.prefetch_sync_groups:
             torch.distributed.all_reduce(tensor, op=op, group=group)
 
+    def _synchronize_staging_values(self, values: list[int]) -> list[int]:
+        tensor = torch.tensor(values, dtype=torch.int64)
+        self._all_reduce_prefetch_groups(tensor, torch.distributed.ReduceOp.MIN)
+        return [int(value) for value in tensor.tolist()]
+
     def _start_storage_threads(self):
         """Start storage prefetch/backup threads and their queues.
 
@@ -390,7 +400,9 @@ class HiCacheController:
         self.backup_queue = Queue()
 
         self.prefetch_hit_queue: Queue[StorageOperation] = Queue()
-        self.prefetch_revoke_queue: Queue[PrefetchRevoke] = Queue()
+        self.prefetch_revoke_queue: Queue[
+            PrefetchRevoke | PrefetchOwnershipTransition
+        ] = Queue()
         self.ack_backup_queue: Queue[StorageOperation] = Queue()
         self.host_mem_release_queue: Queue[torch.Tensor] = Queue()
 
@@ -525,6 +537,7 @@ class HiCacheController:
             self._start_storage_threads()
         except Exception:
             # Best-effort cleanup for partial init.
+            self.l3_staging.uninstall()
             try:
                 self._stop_storage_threads()
             except Exception:
@@ -569,6 +582,12 @@ class HiCacheController:
             raise RuntimeError("Stop storage threads failed; detach aborted.") from e
 
         # Best-effort destroy process groups created for storage ops.
+        reclassified_tokens = self.l3_staging.uninstall()
+        if reclassified_tokens:
+            logger.info(
+                "HiCache L3 staging teardown reclassified live host tokens=%d",
+                reclassified_tokens,
+            )
         self._destroy_prefetch_sync_groups()
 
         # Best-effort close (some backends rely on GC/destructor).
@@ -657,15 +676,13 @@ class HiCacheController:
         )
 
     def reset(self):
-        self.storage_stop_event.set()
-
+        if self.enable_storage:
+            self._stop_storage_threads()
         self.write_queue.clear()
         self.load_queue.clear()
         self.ack_write_queue.clear()
         self.ack_load_queue.clear()
         if self.enable_storage:
-            self.prefetch_thread.join()
-            self.backup_thread.join()
             self.prefetch_queue.queue.clear()
             self.backup_queue.queue.clear()
             self.prefetch_revoke_queue.queue.clear()
@@ -678,14 +695,7 @@ class HiCacheController:
         self.storage_stop_event.clear()
 
         if self.enable_storage:
-            self.prefetch_thread = threading.Thread(
-                target=self.prefetch_thread_func, daemon=True
-            )
-            self.backup_thread = threading.Thread(
-                target=self.backup_thread_func, daemon=True
-            )
-            self.prefetch_thread.start()
-            self.backup_thread.start()
+            self._start_storage_threads()
 
     def write(
         self,
@@ -920,12 +930,17 @@ class HiCacheController:
         new_input_tokens: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
+        host_indices: Optional[torch.Tensor] = None,
     ) -> PrefetchOperation:
         """
         Prefetch KV caches from storage backend to host memory.
         """
         operation = PrefetchOperation(
-            request_id, new_input_tokens, last_hash, prefix_keys
+            request_id,
+            new_input_tokens,
+            last_hash,
+            prefix_keys,
+            host_indices=host_indices,
         )
         self.prefetch_queue.put(operation)
         return operation
@@ -1019,11 +1034,22 @@ class HiCacheController:
                 operation = self.prefetch_buffer.get(block=True, timeout=1)
                 if operation is None:
                     continue
-                self._page_transfer(operation)
-                # operation terminated by controller, release pre-allocated memory
-                self.append_host_mem_release(
-                    operation.host_indices[operation.completed_tokens :]
-                )
+                try:
+                    self._page_transfer(operation)
+                except Exception:
+                    logger.exception(
+                        "Storage read for request %s failed.", operation.request_id
+                    )
+                    operation.mark_terminate()
+                finally:
+                    operation.worker_done.set()
+                if not getattr(self, "scheduler_managed_prefetch", False):
+                    # Legacy caches transfer ownership of the unread tail back
+                    # to the controller worker. Unified serving keeps all host
+                    # ownership on the scheduler thread.
+                    self.append_host_mem_release(
+                        operation.host_indices[operation.completed_tokens :]
+                    )
             except Empty:
                 continue
 
@@ -1053,8 +1079,9 @@ class HiCacheController:
             while True:
                 if not self.storage_write_tracker.wait_until_clear(
                     batch_hashes,
-                    lambda: operation.is_terminated()
-                    or self.storage_stop_event.is_set(),
+                    lambda: (
+                        operation.is_terminated() or self.storage_stop_event.is_set()
+                    ),
                 ):
                     return hash_value, len(hash_value) * self.page_size
                 extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
@@ -1099,6 +1126,7 @@ class HiCacheController:
                             "Storage query for request %s failed.", operation.request_id
                         )
                         hash_value, storage_hit_count, query_failed = [], 0, True
+                query_failed = query_failed or operation.is_terminated()
                 query_result = torch.tensor(
                     [storage_hit_count, -int(query_failed)], dtype=torch.int
                 )
@@ -1108,7 +1136,35 @@ class HiCacheController:
                 storage_hit_count = int(query_result[0].item())
                 query_failed = query_result[1].item() < 0
 
-                if query_failed:
+                if getattr(self, "scheduler_managed_prefetch", False):
+                    state = (
+                        StoragePrefetchState.FAILED
+                        if query_failed
+                        else StoragePrefetchState.MISS
+                    )
+                    retained_tokens = 0
+                    retained_hashes = ()
+                    if (
+                        not query_failed
+                        and storage_hit_count >= self.prefetch_threshold
+                    ):
+                        state = StoragePrefetchState.READING
+                        retained_tokens = storage_hit_count
+                        retained_hashes = tuple(
+                            hash_value[: storage_hit_count // self.page_size]
+                        )
+                    if query_failed:
+                        operation.mark_terminate()
+                    self.prefetch_revoke_queue.put(
+                        PrefetchOwnershipTransition(
+                            request_id=operation.request_id,
+                            generation=operation.id,
+                            state=state,
+                            retained_tokens=retained_tokens,
+                            hash_values=retained_hashes,
+                        )
+                    )
+                elif query_failed:
                     operation.mark_terminate()
                     self.prefetch_revoke_queue.put(
                         PrefetchRevoke(

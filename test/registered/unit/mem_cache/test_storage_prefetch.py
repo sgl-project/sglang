@@ -1,15 +1,139 @@
 import threading
 import unittest
 
+import torch
+
 from sglang.srt.mem_cache.storage_prefetch import (
+    L3StagingManager,
     StorageCheckpointRegistry,
     StorageCheckpointState,
     StorageWriteCompletion,
     StorageWriteTracker,
+    l3_staging_allocation,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+
+
+class _FakeHostPool:
+    def __init__(self, size: int = 20, page_size: int = 2) -> None:
+        self.size = size
+        self.page_size = page_size
+        self.free_slots = torch.arange(size, dtype=torch.int64)
+        self.allocated: set[int] = set()
+
+    def available_size(self) -> int:
+        return len(self.free_slots)
+
+    def alloc(self, need_size: int) -> torch.Tensor | None:
+        if need_size > len(self.free_slots):
+            return None
+        indices = self.free_slots[:need_size]
+        self.free_slots = self.free_slots[need_size:]
+        values = set(indices.tolist())
+        assert not values.intersection(self.allocated)
+        self.allocated.update(values)
+        return indices
+
+    def free(self, indices: torch.Tensor) -> int:
+        values = set(indices.tolist())
+        assert values.issubset(self.allocated)
+        self.allocated.difference_update(values)
+        self.free_slots = torch.cat([self.free_slots, indices])
+        return len(indices)
+
+
+class TestL3StagingManager(unittest.TestCase):
+    def test_quota_physically_isolates_ordinary_l2(self):
+        pool = _FakeHostPool()
+        manager = L3StagingManager()
+        manager.install(pool, 0.2, lambda values: values)
+
+        ordinary = pool.alloc(16)
+        self.assertIsNotNone(ordinary)
+        self.assertIsNone(pool.alloc(2))
+        with l3_staging_allocation():
+            staging = pool.alloc(4)
+
+        self.assertIsNotNone(staging)
+        assert ordinary is not None and staging is not None
+        self.assertTrue(set(ordinary.tolist()).isdisjoint(staging.tolist()))
+        self.assertEqual(manager.usage(), {"KV": "4/4"})
+        pool.free(staging)
+        with l3_staging_allocation():
+            self.assertEqual(pool.available_size(), 4)
+
+    def test_promotion_refills_reserve_without_copying(self):
+        pool = _FakeHostPool()
+        manager = L3StagingManager()
+        manager.install(pool, 0.2, lambda values: values)
+        quota = next(iter(manager.quotas.values()))
+        with l3_staging_allocation():
+            staging = pool.alloc(4)
+        assert staging is not None
+
+        promoted = quota.promote(staging)
+
+        self.assertEqual(promoted, 4)
+        self.assertEqual(quota.available_tokens, 4)
+        self.assertTrue(set(staging.tolist()).issubset(pool.allocated))
+        self.assertFalse(set(staging.tolist()).intersection(quota.staging_indices))
+
+    def test_install_rejects_rank_divergence_before_mutation(self):
+        pool = _FakeHostPool()
+        manager = L3StagingManager()
+
+        def diverge(values: list[int]) -> list[int]:
+            reduced = values.copy()
+            reduced[-1] -= 1
+            return reduced
+
+        with self.assertRaisesRegex(RuntimeError, "plan diverged"):
+            manager.install(pool, 0.2, diverge)
+
+        self.assertEqual(pool.available_size(), pool.size)
+
+    def test_install_rolls_back_when_peer_rank_fails(self):
+        pool = _FakeHostPool()
+        manager = L3StagingManager()
+        synchronization_count = 0
+
+        def fail_peer_install(values: list[int]) -> list[int]:
+            nonlocal synchronization_count
+            synchronization_count += 1
+            return [0] if synchronization_count == 2 else values
+
+        with self.assertRaisesRegex(RuntimeError, "peer rank failed"):
+            manager.install(pool, 0.2, fail_peer_install)
+
+        self.assertFalse(manager.quotas)
+        self.assertEqual(pool.available_size(), pool.size)
+
+    def test_invalid_ratio_is_rejected(self):
+        for ratio in (float("nan"), -0.1, 1.0):
+            with self.subTest(ratio=ratio):
+                manager = L3StagingManager()
+                with self.assertRaisesRegex(ValueError, r"\[0, 1\)"):
+                    manager.install(_FakeHostPool(), ratio, lambda values: values)
+
+    def test_uninstall_restores_allocator_and_reclassifies_live_tokens(self):
+        pool = _FakeHostPool()
+        manager = L3StagingManager()
+        manager.install(pool, 0.2, lambda values: values)
+        quota = next(iter(manager.quotas.values()))
+        with l3_staging_allocation():
+            staging = pool.alloc(2)
+        assert staging is not None
+
+        reclassified = manager.uninstall()
+
+        self.assertEqual(reclassified, 2)
+        self.assertEqual(pool.alloc, quota.original_alloc)
+        self.assertEqual(pool.free, quota.original_free)
+        self.assertEqual(pool.available_size(), 18)
+        pool.free(staging)
+        self.assertEqual(pool.available_size(), 20)
 
 
 class TestStorageWriteTracker(unittest.TestCase):

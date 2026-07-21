@@ -917,6 +917,8 @@ class Req(ReqDllmMixin):
         self.storage_hit_length = 0
         self.storage_prefetch_state = StoragePrefetchState.NOT_ATTEMPTED
         self.storage_prefetch_deadline: Optional[float] = None
+        self.storage_prefetch_local_match = False
+        self.storage_checkpoint_reserved = False
         # The node to lock until for swa radix tree lock ref
         self.swa_uuid_for_lock: Optional[int] = None
         # Whether the prefill-time SWA tree lock has been released early

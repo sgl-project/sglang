@@ -18,6 +18,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     PoolTransferResult,
 )
+from sglang.srt.mem_cache.storage_prefetch import get_host_eviction_scan_budget
 from sglang.srt.mem_cache.unified_cache_components.tree_component import (
     CacheTransferPhase,
     ComponentType,
@@ -51,8 +52,8 @@ class FullComponent(TreeComponent):
         self, match_device_only: bool = False
     ) -> Callable[[UnifiedTreeNode], bool]:
         if match_device_only:
-            return (
-                lambda node: node.component_data[self.component_type].value is not None
+            return lambda node: (
+                node.component_data[self.component_type].value is not None
             )
 
         # HiCache: evicted + backuped nodes are valid match boundaries.
@@ -154,6 +155,29 @@ class FullComponent(TreeComponent):
         self, num_tokens: int, tracker: dict[ComponentType, int]
     ) -> None:
         """Evict host leaves to free KV host pool space."""
+        budget = get_host_eviction_scan_budget()
+        if budget is not None:
+            scan_queue = self.cache.evictable_host_scan_queue
+            candidates = []
+            while scan_queue and budget.remaining_nodes > 0:
+                node = next(iter(scan_queue))
+                del scan_queue[node]
+                budget.remaining_nodes -= 1
+                if node in self.cache.evictable_host_leaves:
+                    candidates.append(node)
+            candidates.sort(key=self.cache.eviction_strategy.get_priority)
+            component_type = self.component_type
+            for index, node in enumerate(candidates):
+                if tracker[component_type] >= num_tokens:
+                    for candidate in candidates[index:]:
+                        if candidate in self.cache.evictable_host_leaves:
+                            scan_queue.setdefault(candidate, None)
+                    return
+                if node not in self.cache.evictable_host_leaves:
+                    continue
+                self.cache._evict_host_leaf(node, tracker)
+            return
+
         heap = [
             (self.cache.eviction_strategy.get_priority(n), n)
             for n in self.cache.evictable_host_leaves

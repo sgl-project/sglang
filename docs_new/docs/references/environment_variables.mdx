@@ -1133,6 +1133,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_HICACHE_L3_STAGING_RESERVE_RATIO</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Fraction of each participating HiCache host pool physically reserved for L3 checkpoint and prefetch staging in unified serving. Must be in <code>[0, 1)</code>.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>0</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_HUGEPAGE_SIZE</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use huge pages for host KV cache allocations (HiCache / disaggregation offload). Valid values: <code>2MB</code> (2 MiB pages via <code>MAP_HUGE_2MB</code>) or <code>1GB</code> (1 GiB pages via <code>MAP_HUGE_1GB</code>). Requires huge pages to be pre-allocated on the host OS (<code>/proc/sys/vm/nr_hugepages</code> or <code>/sys/kernel/mm/hugepages</code>). If the allocation fails, the allocator logs a warning and falls back to regular page-size mmap automatically.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Not set (uses OS default page size)</td>
