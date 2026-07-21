@@ -348,7 +348,13 @@ MAMBA_RADIX_CACHE_STRATEGY_CHOICES = [
 
 MAMBA_BACKEND_CHOICES = ["triton", "flashinfer"]
 
-LINEAR_ATTN_KERNEL_BACKEND_CHOICES = ["triton", "cutedsl", "flashinfer", "flashkda"]
+LINEAR_ATTN_KERNEL_BACKEND_CHOICES = [
+    "triton",
+    "cutedsl",
+    "flashinfer",
+    "flashkda",
+    "nv",
+]
 
 
 # Allow external code to add more choices

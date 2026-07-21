@@ -129,11 +129,24 @@ class KDAKernelDispatcher:
                 rank0_log(
                     "KDA cutedsl prefill needs SM100; falling back to Triton extend."
                 )
+        elif prefill_backend.is_nv():
+            if not is_cuda():
+                raise ValueError("KDA NV prefill backend requires CUDA")
+            from sglang.srt.layers.attention.linear.kernels.kda_nv import (
+                NVKDAKernel,
+            )
+
+            nv_kernel = NVKDAKernel()
+            if nv_kernel.supports_prefill:
+                self.extend_kernel = nv_kernel
+            else:
+                self.extend_kernel = triton_kernel
+                rank0_log("KDA NV prefill needs SM100; falling back to Triton extend.")
         else:
             raise ValueError(
                 f"Unsupported KDA prefill backend: {prefill_backend}. "
-                "KDA supports 'triton', 'flashkda', or 'cutedsl' "
-                "(cutedsl prefill needs SM100)."
+                "KDA supports 'triton', 'flashkda', 'cutedsl', or 'nv' "
+                "(cutedsl/nv prefill need SM100)."
             )
 
         self.supports_packed_decode = getattr(
@@ -617,6 +630,12 @@ class KDAAttnBackend(MambaAttnBackendBase):
             # in place (e.g. FlashKDA) must not run for it.
             is_spec_decode=forward_batch.forward_mode.is_draft_extend_v2(),
             return_intermediate_states=track_ssm,
+            # Which global chunk rows of h the track snapshot will read; lets
+            # kernels that cannot materialize per-chunk states (NV) take the
+            # fast path when the snapshot only needs the final state.
+            track_ssm_h_src=(
+                self.forward_metadata.track_ssm_h_src if track_ssm else None
+            ),
         )
         if track_ssm:
             # Snapshot the SSM state at the last track-aligned chunk boundary

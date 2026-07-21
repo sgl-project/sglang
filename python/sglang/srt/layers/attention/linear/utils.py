@@ -17,6 +17,7 @@ class LinearAttnKernelBackend(Enum):
     CUTEDSL = "cutedsl"
     FLASHINFER = "flashinfer"
     FLASHKDA = "flashkda"
+    NV = "nv"
     CUSTOM = "custom"
 
     @classmethod
@@ -34,6 +35,9 @@ class LinearAttnKernelBackend(Enum):
 
     def is_flashkda(self):
         return self == LinearAttnKernelBackend.FLASHKDA
+
+    def is_nv(self):
+        return self == LinearAttnKernelBackend.NV
 
     def is_custom(self):
         return self == LinearAttnKernelBackend.CUSTOM
