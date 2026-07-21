@@ -1,5 +1,6 @@
 import os
 import shutil
+import subprocess
 import tempfile
 import unittest
 
@@ -125,6 +126,11 @@ class TestUnifiedMambaHiCache(UnifiedRadixTreeTestMixin, CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
+        cls.process.terminate()
+        try:
+            cls.process.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            pass
         kill_process_tree(cls.process.pid)
 
 
