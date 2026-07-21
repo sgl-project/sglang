@@ -487,9 +487,8 @@ class AscendAttnBackend(AttentionBackend):
             seq_lens_list_cumsum = np.cumsum(forward_batch.extend_seq_lens_cpu)
             self.forward_metadata.seq_lens_list_cumsum = seq_lens_list_cumsum
 
-        if (
-            forward_batch.forward_mode.is_target_verify()
-            and not _is_dflash_verify(forward_batch.spec_info)
+        if (forward_batch.forward_mode.is_target_verify() and not _is_dflash_verify(
+            forward_batch.spec_info)
         ):
             self.forward_metadata.seq_lens_cpu_int += self.speculative_num_draft_tokens
         elif (
