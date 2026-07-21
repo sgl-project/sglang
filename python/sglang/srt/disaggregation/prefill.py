@@ -165,6 +165,29 @@ def maybe_release_pd_hidden_rows_on_hidden_done(
     return True
 
 
+def fail_pd_hidden_transfer(req: Req, message: str) -> None:
+    """Route a PD hidden transfer failure through the standard KV failed path."""
+    logger.warning(message)
+    sender = getattr(req, "disagg_kv_sender", None)
+    kv_mgr = getattr(sender, "kv_mgr", None)
+    room = getattr(sender, "bootstrap_room", req.bootstrap_room)
+    if kv_mgr is not None:
+        record_failure = getattr(kv_mgr, "record_failure", None)
+        if record_failure is not None:
+            record_failure(room, message)
+        kv_mgr.update_status(room, KVPoll.Failed)
+        wake_pd_hidden_waiters = getattr(kv_mgr, "_wake_pd_hidden_ack_waiters", None)
+        if wake_pd_hidden_waiters is not None:
+            wake_pd_hidden_waiters(room)
+    if sender is not None:
+        sender.conclude_state = KVPoll.Failed
+
+
+def is_pd_hidden_transfer_failed(req: Req) -> bool:
+    sender = getattr(req, "disagg_kv_sender", None)
+    return getattr(sender, "conclude_state", None) == KVPoll.Failed
+
+
 class PrefillBootstrapQueue:
     """
     Store the requests in bootstrapping
@@ -1024,31 +1047,37 @@ class SchedulerDisaggregationPrefillMixin:
     ) -> None:
         pool = getattr(self.disagg_metadata_buffers, "pd_hidden_pool", None)
         hidden_states = self._extract_pd_hidden_states_from_result(result)
-        needs_pd_hidden = any(
-            (
-                getattr(req, "pd_hidden_src_indices", None)
-                or getattr(req, "pd_hidden_capture_layer_ids", None)
-            )
-            and (
-                send_owner_direct
-                or not getattr(req, "pd_hidden_owner_direct_sent", False)
-            )
+        needs_pd_hidden_reqs = [
+            req
             for req in batch.reqs
-        )
-        if pool is not None and needs_pd_hidden and hidden_states is None:
+            if (
+                (
+                    getattr(req, "pd_hidden_src_indices", None)
+                    or getattr(req, "pd_hidden_capture_layer_ids", None)
+                )
+                and (
+                    send_owner_direct
+                    or not getattr(req, "pd_hidden_owner_direct_sent", False)
+                )
+            )
+        ]
+        if pool is not None and needs_pd_hidden_reqs and hidden_states is None:
             reqs = [
                 (
                     req.rid,
                     getattr(req, "pd_hidden_capture_layer_ids", None),
                     bool(getattr(req, "pd_hidden_src_indices", None)),
                 )
-                for req in batch.reqs
+                for req in needs_pd_hidden_reqs
             ]
-            raise RuntimeError(
+            message = (
                 "PD hidden capture was required but forward output has no "
                 f"hidden states: batch_capture_layers={batch.pd_hidden_capture_layer_ids}, "
                 f"reqs={reqs}"
             )
+            for req in needs_pd_hidden_reqs:
+                fail_pd_hidden_transfer(req, message)
+            return
         if pool is None or hidden_states is None or batch.extend_lens is None:
             return
 
@@ -1151,12 +1180,14 @@ class SchedulerDisaggregationPrefillMixin:
             if streaming_hidden:
                 write_indices = pool.alloc(rows)
                 if write_indices is None:
-                    raise RuntimeError(
+                    fail_pd_hidden_transfer(
+                        req,
                         "PD streaming hidden source chunk allocation failed: "
                         f"rid={req.rid}, rows={rows}, free_rows={pool.available_size()}, "
                         f"pool_rows={pool.size}. Streaming source rows are released "
-                        "only after the matching hidden chunk ACK."
+                        "only after the matching hidden chunk ACK.",
                     )
+                    continue
                 req.pd_hidden_src_indices = write_indices
             pool.write(
                 write_indices,
@@ -1261,6 +1292,12 @@ class SchedulerDisaggregationPrefillMixin:
                 # Test hook: exercise the release/requeue retry path.
                 if req.pending_bootstrap and should_force_retry(req):
                     self.optimistic_release_and_requeue(req)
+                    advance_logprob_pt(i, req)
+                    continue
+
+                if is_aborted(req) or is_pd_hidden_transfer_failed(req):
+                    self.disagg_prefill_inflight_queue.append(req)
+                    req.time_stats.set_prefill_transfer_queue_entry_time()
                     advance_logprob_pt(i, req)
                     continue
 

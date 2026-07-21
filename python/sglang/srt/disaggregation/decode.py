@@ -2344,8 +2344,24 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         for i, (decode_req, poll) in enumerate(zip(self.queue, polls)):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
-            self._consume_pd_hidden_acked_chunks(decode_req)
-            self._drain_pd_hidden_ready_chunks(decode_req)
+            try:
+                self._consume_pd_hidden_acked_chunks(decode_req)
+                self._drain_pd_hidden_ready_chunks(decode_req)
+            except Exception as e:
+                error_message = (
+                    "PD hidden decode transfer failed while draining chunks: "
+                    f"rid={decode_req.req.rid}, room={decode_req.req.bootstrap_room}, "
+                    f"error={e}"
+                )
+                self.kv_manager.record_failure(
+                    decode_req.req.bootstrap_room,
+                    error_message,
+                )
+                self.kv_manager.update_status(
+                    decode_req.req.bootstrap_room,
+                    KVPoll.Failed,
+                )
+                poll = KVPoll.Failed
 
             hicache_restore_status = decode_req.hicache_restore_status
             if (
