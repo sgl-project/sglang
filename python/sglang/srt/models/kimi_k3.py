@@ -84,6 +84,7 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputs,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
@@ -98,7 +99,7 @@ from sglang.srt.models.transformers import maybe_prefix
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.multimodal.mm_utils import materialize_multimodal_features
 from sglang.srt.runtime_context import get_parallel, get_server_args
-from sglang.srt.utils import make_layers
+from sglang.srt.utils import is_blackwell_supported, make_layers
 from sglang.srt.utils.common import (
     BumpAllocator,
     add_prefix,
@@ -205,6 +206,12 @@ _K3_FUSE_O_GATE = envs.SGLANG_K3_FUSE_O_GATE.get()
 # to the KDA backend via an attempt-and-verify stash on the attention layer;
 # unconsumed stashes fall back to the unfused chain + o_norm here.
 _K3_KDA_FUSED_DECODE = envs.SGLANG_KDA_FUSED_DECODE.get()
+
+# Multi-stream overlap (deepseek_v4-style alt-stream pool, capture mode only):
+# work that is independent of the attention core — the MLA output-gate GEMM
+# and the attn-res bank write — is issued on alt streams so it runs while
+# attention occupies the main stream.
+_K3_MULTI_STREAM = envs.SGLANG_K3_MULTI_STREAM.get()
 
 
 def _merge_weights_as_views(
@@ -1724,6 +1731,8 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
         quant_config: Optional[QuantizationConfig] = None,
         all_reduce_fusion: bool = False,
         prefix: str = "",
+        alt_stream: Optional[torch.cuda.Stream] = None,
+        gate_alt_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
         self.all_reduce_fusion = all_reduce_fusion
         self.use_output_gate = getattr(config, "mla_use_output_gate", False)
@@ -1741,6 +1750,7 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             kv_lora_rank=config.kv_lora_rank,
             skip_rope=True,
             reduce_results=not self.all_reduce_fusion,
+            alt_stream=alt_stream,
         )
         if self.all_reduce_fusion:
             # reduce_results=False was passed through super().__init__ above;
@@ -1789,13 +1799,36 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             # cores, so wrap its forward at the instance level; the module
             # itself (weights, reduce_results, loading path) is untouched.
             self._gate_hidden_states = None
+            # (gate, ready event) issued on the alt stream by forward();
+            # None when the lazy path computes the gate here instead.
+            self._gate_precomputed = None
+            self._gate_alt_stream = gate_alt_stream if _K3_MULTI_STREAM else None
+            # Above this token count the attention-core kernels fill the SMs
+            # on their own and the overlap only adds sync overhead (same
+            # bound as deepseek_v4).
+            self._gate_bs_limit = (
+                (128 if is_blackwell_supported() else 64)
+                if self._gate_alt_stream is not None
+                else 0
+            )
             _orig_o_proj_forward = self.o_proj.forward
 
             def _gated_o_proj_forward(x, *args, **kwargs):
                 gate_input = self._gate_hidden_states
                 self._gate_hidden_states = None
+                precomputed = self._gate_precomputed
+                self._gate_precomputed = None
+                if precomputed is not None:
+                    # Join the alt-stream GEMM unconditionally: graph capture
+                    # requires every side stream to rejoin the main stream,
+                    # even if the gate goes unused on this call.
+                    torch.cuda.current_stream().wait_event(precomputed[1])
                 if gate_input is not None and not isinstance(x, tuple):
-                    gate, _ = self.g_proj(gate_input)
+                    gate = (
+                        precomputed[0]
+                        if precomputed is not None
+                        else self.g_proj(gate_input)[0]
+                    )
                     from sglang.jit_kernel.kimi_k3 import mla_output_gate
 
                     if _K3_FUSE_O_GATE and mla_output_gate.covered(x, gate):
@@ -1808,6 +1841,24 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
 
             self.o_proj.forward = _gated_o_proj_forward
 
+    def _precompute_output_gate(self, hidden_states: torch.Tensor) -> None:
+        """Issue the output-gate GEMM on the alt stream so it overlaps the
+        attention core; the lazy path in the o_proj wrap otherwise computes
+        it on the critical path right before the gate multiply. The gate
+        tensor stays referenced via _gate_precomputed until the wrap joins,
+        so its memory cannot be reused while the alt stream still writes."""
+        self._gate_precomputed = None
+        if (
+            self._gate_alt_stream is not None
+            and get_is_capture_mode()
+            and (0 < hidden_states.shape[0] <= self._gate_bs_limit)
+        ):
+            alt = self._gate_alt_stream
+            alt.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(alt):
+                gate, _ = self.g_proj(hidden_states)
+            self._gate_precomputed = (gate, alt.record_event())
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -1818,6 +1869,7 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
     ):
         if self.use_output_gate:
             self._gate_hidden_states = hidden_states
+            self._precompute_output_gate(hidden_states)
         return super().forward(
             positions, hidden_states, forward_batch, zero_allocator, **kwargs
         )
@@ -1835,7 +1887,7 @@ class KimiK3DecoderLayer(nn.Module):
         layer_idx: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
-        alt_stream: Optional[torch.cuda.Stream] = None,
+        alt_streams: Optional[List[torch.cuda.Stream]] = None,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -1914,6 +1966,8 @@ class KimiK3DecoderLayer(nn.Module):
                 quant_config=quant_config,
                 prefix=f"{prefix}.self_attn",
                 all_reduce_fusion=self.all_reduce_fusion,
+                alt_stream=alt_streams[1] if alt_streams is not None else None,
+                gate_alt_stream=alt_streams[3] if alt_streams is not None else None,
             )
 
         # MLP / MoE
@@ -1923,7 +1977,7 @@ class KimiK3DecoderLayer(nn.Module):
                 quant_config=quant_config,
                 layer_idx=layer_idx,
                 prefix=f"{prefix}.mlp",
-                alt_stream=alt_stream,
+                alt_stream=alt_streams[0] if alt_streams is not None else None,
             )
         else:
             self.mlp = KimiK3MLP(
@@ -1966,6 +2020,21 @@ class KimiK3DecoderLayer(nn.Module):
                 prefix=f"{prefix}.mlp_res_proj",
             )
 
+        # Bank-write overlap (clean path only): the [T, H] snapshot copy is
+        # independent of attention, so write layers issue it on an alt stream
+        # and join before agg2 reads the bank. Legacy stays byte-identical.
+        self._res_write_alt_stream = (
+            alt_streams[2]
+            if (
+                _K3_MULTI_STREAM
+                and alt_streams is not None
+                and self.use_attn_residuals
+                and self.is_block_write_layer
+                and _K3_ATTN_RES_MODE != "legacy"
+            )
+            else None
+        )
+
         # dispatch to impl
         self._forward_attn_residual = (
             self._forward_attn_residual_legacy
@@ -1979,6 +2048,26 @@ class KimiK3DecoderLayer(nn.Module):
             o_proj = getattr(self.self_attn, "o_proj", None)
             assert o_proj is not None, "SP-MoE requires attention exposing o_proj"
             o_proj.reduce_results = False
+
+    def _write_bank(
+        self, attn_res: BaseAttnResidual, prefix_sum: torch.Tensor
+    ) -> Optional[tuple[torch.Tensor, torch.cuda.Event]]:
+        """Snapshot prefix_sum into the bank, on the alt stream when eligible
+        so the [T, H] copy overlaps the attention core.
+
+        Returns None when written synchronously; otherwise (prefix_sum ref,
+        join event) — the caller must wait on the event before anything reads
+        the bank, and the returned ref keeps prefix_sum alive until that join
+        (a freed tensor's memory could be reused by main-stream kernels while
+        the alt stream still reads it)."""
+        alt = self._res_write_alt_stream
+        if alt is None or prefix_sum.shape[0] == 0:
+            attn_res.write(prefix_sum)
+            return None
+        alt.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(alt):
+            attn_res.write(prefix_sum)
+        return (prefix_sum, alt.record_event())
 
     def _finish_attn_reduce(
         self, attn_out: torch.Tensor, allow_scatter: bool
@@ -2136,8 +2225,9 @@ class KimiK3DecoderLayer(nn.Module):
         )
 
         # ---- Write snapshot (before attention, using pre-update prefix) ----
+        bank_write_join = None
         if self.is_block_write_layer:
-            attn_res.write(prefix_sum)
+            bank_write_join = self._write_bank(attn_res, prefix_sum)
             prefix_sum = None
 
         # ---- Attention ----
@@ -2168,6 +2258,10 @@ class KimiK3DecoderLayer(nn.Module):
             prefix_sum = None
 
         # ---- Aggregation 2: MLP side (on the shard under SP-MoE) ----
+        if bank_write_join is not None:
+            # agg2 is the first bank reader after the alt-stream write.
+            torch.cuda.current_stream().wait_event(bank_write_join[1])
+            bank_write_join = None
         hidden_states, prefix_sum = attn_res.forward(
             hidden_states,
             prefix_sum,
@@ -2328,7 +2422,13 @@ class KimiK3LinearModel(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
-        self.alt_stream = torch.cuda.Stream()
+        # Multi-stream pool (deepseek_v4 pattern): every alt stream is
+        # constructed here and threaded down to the layers. Slots:
+        #   [0] MoE (reserved, currently unused; this is written by HUMAN!!!)
+        #   [1] DeepseekV2AttentionMLA base internals (forwarded; unused by K3)
+        #   [2] attn-res bank write, overlaps the attention core
+        #   [3] MLA output-gate GEMM, overlaps the attention core
+        self.alt_streams = [torch.cuda.Stream() for _ in range(4)]
 
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
@@ -2337,7 +2437,7 @@ class KimiK3LinearModel(nn.Module):
                 config=config,
                 quant_config=quant_config,
                 prefix=prefix,
-                alt_stream=self.alt_stream,
+                alt_streams=self.alt_streams,
             ),
             pp_rank=self.pp_group.rank_in_group,
             pp_size=self.pp_group.world_size,

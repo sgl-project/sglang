@@ -758,6 +758,10 @@ class Envs:
     )
     # MLA output gate x * sigmoid(g) fused into one kernel.
     SGLANG_K3_FUSE_O_GATE = EnvBool(True)
+    # Multi-stream overlap of off-critical-path work with the attention core
+    # (capture mode only, deepseek_v4-style alt-stream pool): the MLA
+    # output-gate GEMM and the attn-res bank write.
+    SGLANG_K3_MULTI_STREAM = EnvBool(True)
     # MNNVL fused all-reduce (bf16, TP8): zero-copy 1shot multicast-push for
     # small messages and in-place NVLS 2shot on symmetric-memory tensors for
     # large ones, with an optional fused residual add. Covers the KDA o_proj
