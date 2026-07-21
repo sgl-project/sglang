@@ -252,11 +252,16 @@ class TopKOutputChecker:
     def format_is_bypassed(topk_output: TopKOutput) -> TypeGuard[BypassedTopKOutput]:
         return isinstance(topk_output, BypassedTopKOutput)
 
+    @staticmethod
+    def format_is_packed(topk_output: TopKOutput) -> TypeGuard[PackedTopKOutput]:
+        return isinstance(topk_output, PackedTopKOutput)
+
 
 class TopKOutputFormat(IntEnum):
     STANDARD = auto()
     TRITON_KERNEL = auto()
     BYPASSED = auto()
+    PACKED = auto()
 
 
 @runtime_checkable
@@ -336,6 +341,22 @@ class BypassedTopKOutput(NamedTuple):
             num_token_non_padded=self.num_token_non_padded,
             expert_location_dispatch_info=self.expert_location_dispatch_info,
         )
+
+
+class PackedTopKOutput(NamedTuple):
+    """Packed top-k output format used by FlashInfer TRT-LLM routed MoE.
+
+    ``packed_topk_ids`` is an int32 tensor of shape (num_tokens, top_k) where each
+    element encodes the expert id in the upper 16 bits and the bf16 routing
+    weight bits in the lower 16 bits, matching FlashInfer's packed layout.
+    """
+
+    packed_topk_ids: torch.Tensor
+    router_logits: torch.Tensor
+
+    @property
+    def format(self) -> TopKOutputFormat:
+        return TopKOutputFormat.PACKED
 
 
 def _make_round_robin_expert_ids(
@@ -2131,9 +2152,10 @@ def select_experts(
                 **_fused_topk_kwargs,
             )
     else:
-        assert (
-            num_token_non_padded is None
-        ), "num_token_non_padded is not yet supported in custom_routing_function"
+        # custom_routing_function itself is padding-unaware; its output on
+        # padded rows is garbage. That is fine because _post_process_topk_ids
+        # below masks rows >= num_token_non_padded (-1 on CUDA, 0 + zeroed
+        # weights on HIP) after the logical->physical remap.
         assert not apply_routed_scaling_factor_on_output, "Not implemented"
         topk_weights, topk_ids = custom_routing_function(
             hidden_states=hidden_states,
