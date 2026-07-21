@@ -304,12 +304,9 @@ class TestDSAMetadataKernels(CustomTestCase):
         )
         expected_dsa = _dsa_seqlens(expected_expanded, dsa_index_topk)
 
-        # Columns at or past a request's kv length are undefined: the kernel
-        # skips whole page-table column blocks once they begin beyond kv_len
-        # (no consumer reads there -- attention and the indexer both stay
-        # within cache_seqlens). Only the live prefix [:kv_len] per request is
-        # part of the contract, so assert just that region. All expanded rows
-        # of a request share the request's kv length.
+        # Only the live prefix [:kv_len] per request is defined; the kernel
+        # leaves columns past kv_len untouched. All expanded rows of a request
+        # share its kv length.
         row_kv_lens = torch.repeat_interleave(seq_lens.to(torch.int32), extend_seq_lens)
         cols = torch.arange(max_seqlen_k, dtype=torch.int32, device=self.device)
         live_mask = cols.view(1, -1) < row_kv_lens.view(-1, 1)
@@ -333,8 +330,7 @@ class TestDSAMetadataKernels(CustomTestCase):
             "draft dsa_cu_seqlens_k",
         )
         if real_page_size > 1:
-            # A real-page column maps to source column real_col * real_page_size;
-            # it is live iff that source column is within the request's kv_len.
+            # Real-page column real_col maps to source column real_col*real_page_size.
             real_width = real_page_table.shape[1]
             real_cols = torch.arange(real_width, dtype=torch.int32, device=self.device)
             real_live_mask = (
