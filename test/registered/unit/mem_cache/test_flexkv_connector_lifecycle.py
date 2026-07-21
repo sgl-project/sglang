@@ -85,6 +85,66 @@ def _load_connector_class():
 FlexKVConnector = _load_connector_class()
 
 
+def _load_layer_done_counter_class():
+    module_name = "_flexkv_comm_lifecycle_under_test"
+    parallel_state_name = "sglang.srt.distributed.parallel_state"
+    parallel_state_stub = _module(
+        parallel_state_name,
+        get_world_group=lambda: None,
+    )
+    module_path = (
+        Path(__file__).resolve().parents[4]
+        / "python/sglang/srt/mem_cache/storage/flexkv/flexkv_comm.py"
+    )
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        with patch.dict(
+            sys.modules, {parallel_state_name: parallel_state_stub}
+        ), patch("ctypes.CDLL", return_value=MagicMock()):
+            spec.loader.exec_module(module)
+    finally:
+        sys.modules.pop(module_name, None)
+    return module.FlexKVLayerDoneCounter
+
+
+FlexKVLayerDoneCounter = _load_layer_done_counter_class()
+
+
+class _FakeLayerLoadingEvent:
+    def __init__(self, num_layers):
+        self._num_layers = num_layers
+        self._finished = True
+        self._wait_started = False
+        self.wait_remaining = [0] * num_layers
+        self.wait_calls = []
+
+    def reset_for_new_transfer(self):
+        self._finished = False
+        self._wait_started = False
+        self.wait_remaining = [0] * self._num_layers
+
+    def add_transfer(self):
+        assert not self._finished and not self._wait_started
+        self.wait_remaining = [count + 1 for count in self.wait_remaining]
+
+    def wait(self, layer_index, count=1):
+        self._wait_started = True
+        self.wait_calls.append((layer_index, count))
+        if layer_index == self._num_layers - 1:
+            self._finished = True
+
+    def mark_reusable(self):
+        self._finished = True
+        self._wait_started = False
+        self.wait_remaining = [0] * self._num_layers
+
+    def close(self):
+        pass
+
+
 def _sync_context():
     return SimpleNamespace(
         is_pp_receiver=False,
@@ -171,3 +231,29 @@ def test_lookup_uses_swa_aware_match_when_swa_pool_is_registered():
     connector.kv_manager.get_match.assert_called_once()
     assert connector.kv_manager.get_match.call_args.kwargs["swa_aware"] is True
     assert connector._pending_lookups == {"request": 17}
+
+
+def test_layerwise_counter_groups_restore_requests_in_one_prefill_batch():
+    counter = FlexKVLayerDoneCounter.__new__(FlexKVLayerDoneCounter)
+    counter.num_layers = 2
+    counter.num_counters = 3
+    counter.events = [_FakeLayerLoadingEvent(2) for _ in range(3)]
+    counter.producer_index = -1
+    counter.consumer_index = -1
+    counter._task_to_producer = {}
+
+    producer_ids = []
+    for task_id in (11, 12, 13):
+        producer_id = counter.update_producer()
+        producer_ids.append(producer_id)
+        counter.register_task(task_id, producer_id)
+        counter.set_consumer(task_id)
+
+    assert producer_ids == [0, 0, 0]
+    counter.wait_until(0)
+    counter.wait_until(1)
+    assert counter.events[0].wait_calls == [(0, 3), (1, 3)]
+    assert counter.events[0]._finished
+    assert counter.consumer_index == -1
+
+    assert counter.update_producer() == 1

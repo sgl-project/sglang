@@ -417,7 +417,6 @@ class FlexKVConnector:
             )
         else:
             producer_id = self.layer_done_counter.update_producer()
-            self.layer_done_counter.events[producer_id].reset_for_new_transfer()
             self.layer_done_counter.register_task(fkv_task_id, producer_id)
 
         if self._sync_ctx.is_pp_sender:
