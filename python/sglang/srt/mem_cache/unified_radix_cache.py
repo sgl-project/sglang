@@ -2665,6 +2665,7 @@ class UnifiedRadixCache(
         return self._all_component_values_flatten(ComponentType.MAMBA)
 
     def available_and_evictable_str(self) -> str:
+        # TODO(zhangmj): need more detailed log info for session reference.
         if self.supports_swa():
             full_available_size = self.token_to_kv_pool_allocator.full_available_size()
         else:

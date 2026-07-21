@@ -243,6 +243,8 @@ class MambaComponent(TreeComponent):
         if not self.cache.enable_session_radix_cache:
             self._walk_device_eviction(request, tracker, None)
             return
+        # TODO(zhangmj): current only evict non-ref node first then ref node, need
+        # to consider ref counter like Full Component later.
         self._walk_device_eviction(request, tracker, self.is_session_referenced)
         if tracker[ct] < request:
             self._walk_device_eviction(request, tracker, None)
@@ -663,6 +665,8 @@ class MambaComponent(TreeComponent):
         if not self.cache.enable_session_radix_cache:
             self._walk_host_eviction(num_tokens, tracker, None)
             return
+        # TODO(zhangmj): current only evict non-ref node first then ref node, need
+        # to consider ref counter like Full Component later.
         self._walk_host_eviction(
             num_tokens,
             tracker,

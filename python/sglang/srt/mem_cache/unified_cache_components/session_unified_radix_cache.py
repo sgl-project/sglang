@@ -1,4 +1,6 @@
-"""Cache-level session lifecycle for the unified radix cache."""
+"""Session Unified radix cache (``--enable-session-radix-cache``): tag each request's KV
+by session_id for each tree component; ``release_session`` (close) frees a session's tagged KV.
+"""
 
 from __future__ import annotations
 
@@ -13,11 +15,16 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Bounded guard against a request finishing after close. If a session id falls
+# out of this LRU after 8192 later closes, an extremely late finish can tag
+# again; explicit register_session clears the tombstone for intentional id reuse.
 _CLOSED_SESSION_TOMBSTONE_LIMIT = 8192
 
 
 class SessionUnifiedRadixCacheMixin:
-    """Coordinate session lifecycle across unified cache components."""
+    """Tags radix KV by session id; ``release_session`` (close) releases a session's
+    tagged reference. Each component maintains its own session_ids, session_ref and so
+    on. Used for UnifiedRadixCache."""
 
     def _reset_session_radix_state(self) -> None:
         self._closed_session_ids: OrderedDict[str, None] = OrderedDict()
