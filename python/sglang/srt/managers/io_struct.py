@@ -1795,6 +1795,13 @@ class AbortReq(BaseReq, kw_only=True):
     # The finished reason data (from BaseFinishReason.to_json())
     finished_reason: Optional[FinishReasonDict] = None
     abort_message: Optional[str] = None
+    # Treat ``rid`` as a namespace prefix. Note this only relaxes the
+    # tokenizer-side gate (which otherwise requires an exact live rid, with a
+    # single tokenizer worker): once the request reaches the scheduler,
+    # matching is prefix-based (``rid.startswith``) regardless of this flag,
+    # because batch requests derive child rids as ``f"{rid}_{i}"`` and an
+    # abort for the parent rid must cover them.
+    prefix: bool = False
 
     def __post_init__(self):
         # FIXME: This is a hack to keep the same with the old code
