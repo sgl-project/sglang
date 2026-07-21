@@ -36,7 +36,7 @@ export const benchmarks = [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1024 },
         ttft_ms: 16199, tpot_ms: 293.2, tokens_per_sec_per_gpu: 5175 },
     ],
-    accuracy: { gsm8k_pct: 94.24, aime25_pct: 67.29 },
+    accuracy: { gsm8k_pct: 94.24, aime25_pct: null },
   },
   {
     match: { hw: "h200", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
@@ -58,7 +58,7 @@ export const benchmarks = [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1024 },
         ttft_ms: 19886, tpot_ms: 318.5, tokens_per_sec_per_gpu: 5055 },
     ],
-    accuracy: { gsm8k_pct: 95.00, aime25_pct: 67.71 },
+    accuracy: { gsm8k_pct: 95.00, aime25_pct: null },
   },
   {
     match: { hw: "h200", variant: "default", quant: "int4", strategy: "low-latency", nodes: "single" },
