@@ -5,7 +5,7 @@
 import logging
 from enum import Enum
 from functools import cached_property
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 from torch.nn.parameter import UninitializedParameter
@@ -34,6 +34,9 @@ from sglang.srt.layers.moe.kt_ep_wrapper import (
     create_kt_config_from_server_args,
 )
 from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
+from sglang.srt.layers.moe.token_dispatcher.ascend_tp import (
+    AscendTPDispatcher,
+)
 from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
 from sglang.srt.layers.moe.token_dispatcher.flashinfer import FlashinferDispatcher
 from sglang.srt.layers.moe.token_dispatcher.standard import (
@@ -67,7 +70,11 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     is_in_tc_piecewise_cuda_graph,
 )
 from sglang.srt.model_loader.weight_utils import narrow_padded_param_and_loaded_weight
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import (
+    get_global_dwdp_manager,
+    get_parallel,
+    get_server_args,
+)
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -100,7 +107,9 @@ def _get_deepep_comm_group(a2a_backend):
 
 def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
     a2a_backend = get_moe_a2a_backend()
-    if (
+    if a2a_backend.is_none() and is_npu():
+        return AscendTPDispatcher(moe_runner_config)
+    elif (
         a2a_backend.is_none()
         or a2a_backend.is_megamoe()
         or a2a_backend.is_ascend_fuseep()
@@ -167,6 +176,12 @@ class FusedMoE(torch.nn.Module):
         inplace: suggestion to compute inplace (modify input activation).
     """
 
+    # True on shared-expert FusedMoE subclasses (e.g. Inkling's sink); lets
+    # backend resolution distinguish them from routed experts.
+    is_shared_fused_moe = False
+
+    _skip_aiter_moe_shuffle: bool = False
+
     def __init__(
         self,
         num_experts: int,
@@ -224,9 +239,19 @@ class FusedMoE(torch.nn.Module):
         else:
             num_shared_slots = num_fused_shared_experts
 
-        assert (num_experts - num_shared_slots) % self.moe_ep_size == 0
         self._num_global_routed = num_experts - num_shared_slots
-        self._num_local_routed = self._num_global_routed // self.moe_ep_size
+        server_args = get_server_args()
+        if server_args.ep_join_mode == "scale":
+            storage_ep_size = server_args.elastic_ep_initial_size
+            assert storage_ep_size is not None
+            self._expert_storage_rank = (
+                server_args.ep_join_rank_offset + self.moe_ep_rank
+            )
+        else:
+            storage_ep_size = self.moe_ep_size
+            self._expert_storage_rank = self.moe_ep_rank
+        assert self._num_global_routed % storage_ep_size == 0
+        self._num_local_routed = self._num_global_routed // storage_ep_size
         self.num_local_experts = self._num_local_routed + num_fused_shared_experts
         self._has_fused_shared = num_fused_shared_experts > 0
         self._pending_fp8_shared_weights: dict[tuple[int, str], torch.Tensor] = {}
@@ -368,8 +393,70 @@ class FusedMoE(torch.nn.Module):
         self.down_gemm_overlap_args: Optional[DownGemmOverlapArgs] = None
         self.meta_overlap_args: Optional[dict] = None
 
+        self._dwdp_bound = False
+
         if self.quant_method is not None and hasattr(self.quant_method, "runner"):
             self.runner = self.quant_method.runner
+
+    @property
+    def num_global_routed_experts(self) -> int:
+        return self._num_global_routed
+
+    def bind_full_expert_weights(self, weights: Dict[str, torch.Tensor]) -> None:
+        """Rebind this layer's expert weight tensors to externally provided
+        full [num_experts, ...] tensors and collapse its EP view to a single
+        rank that owns every routed expert (ep_size=1, no expert remapping).
+
+        Callers are weight-replication schemes that materialize all expert
+        weights locally after load time (e.g. DWDP's composite-VA prefetch).
+        """
+        self.moe_ep_size = 1
+        self.moe_ep_rank = 0
+        self._num_local_routed = self._num_global_routed
+        self.num_local_experts = self.num_experts
+        self.moe_runner_config.num_local_experts = self.num_local_experts
+
+        self.dispatcher.moe_ep_size = 1
+        self.dispatcher.moe_ep_rank = 0
+        self.dispatcher.num_local_experts = self.num_local_experts
+        self.dispatcher.num_local_routed_experts = self._num_local_routed
+        self.dispatcher.local_expert_mapping = None
+        self.dispatcher.expert_mask_gpu = None
+
+        for name, tensor in weights.items():
+            self.replace_expert_tensor(name, tensor)
+
+        self._dwdp_bound = True
+
+    def named_per_expert_tensors(
+        self, num_local_experts: int
+    ) -> List[Tuple[str, torch.Tensor]]:
+        """Expert-sharded side tensors (dim0 == num_local_experts): quant
+        scales, alphas, biases. Excludes the main w13/w2 expert weights."""
+        found: Dict[str, torch.Tensor] = {}
+        for name, param in self._parameters.items():
+            if param is not None:
+                found[name] = param.data
+        for name, buf in self._buffers.items():
+            if buf is not None and name not in found:
+                found[name] = buf
+        for name, value in vars(self).items():
+            if isinstance(value, torch.Tensor) and name not in found:
+                found[name] = value
+        return [
+            (name, tensor)
+            for name, tensor in sorted(found.items())
+            if name not in ("w13_weight", "w2_weight")
+            and tensor.ndim > 0
+            and tensor.shape[0] == num_local_experts
+        ]
+
+    def replace_expert_tensor(self, name: str, tensor: torch.Tensor) -> None:
+        param = self._parameters.get(name)
+        if param is not None:
+            param.data = tensor
+        else:
+            setattr(self, name, tensor)
 
     @cached_property
     def use_padded_loading(self) -> bool:
@@ -707,7 +794,7 @@ class FusedMoE(torch.nn.Module):
             expert_data.copy_(loaded_weight)
 
     def _map_global_expert_id_to_local_expert_id(self, expert_id: int) -> int:
-        start_idx = self.moe_ep_rank * self._num_local_routed
+        start_idx = self._expert_storage_rank * self._num_local_routed
         end_idx = start_idx + self._num_local_routed
         if start_idx <= expert_id < end_idx:
             return expert_id - start_idx
@@ -1123,6 +1210,18 @@ class FusedMoE(torch.nn.Module):
     ) -> None:
         tp_rank = self.moe_tp_rank
 
+        # Mirror _weight_loader_impl: the trtllm bf16 prep reshapes expert weights
+        # into block layout; hot weight updates must restore canonical shapes first.
+        method = self.quant_method
+        if isinstance(method, KTEPWrapperMethod):
+            method = method.gpu_method
+        if isinstance(method, UnquantizedFusedMoEMethod):
+            method.maybe_restore_flashinfer_trtllm_bf16_weight_shape_for_load(
+                layer=self,
+                param=param,
+                weight_name=weight_name,
+            )
+
         if (
             self.quant_config is not None
             and self.quant_config.get_name() == "mxfp4"
@@ -1245,6 +1344,10 @@ class FusedMoE(torch.nn.Module):
         origin_hidden_states_dim = hidden_states.shape[-1]
         assert self.quant_method is not None
 
+        if self._dwdp_bound:
+            dwdp_mgr = get_global_dwdp_manager()
+            dwdp_mgr.wait_prefetch(self.layer_id)
+
         dispatch_output = self.dispatcher.dispatch(
             hidden_states=hidden_states, topk_output=topk_output
         )
@@ -1252,6 +1355,9 @@ class FusedMoE(torch.nn.Module):
         combine_input = self.run_moe_core(
             dispatch_output=dispatch_output,
         )
+
+        if self._dwdp_bound:
+            dwdp_mgr.record_compute_and_prefetch_next(self.layer_id)
 
         with use_symmetric_memory(
             get_tp_group(), disabled=not is_allocation_symmetric()

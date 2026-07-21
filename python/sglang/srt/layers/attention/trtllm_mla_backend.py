@@ -19,6 +19,10 @@ from sglang.kernels.ops.attention.pad import (
 from sglang.kernels.ops.attention.pad import (
     unpad_draft_extend_output as unpad_draft_extend_output_triton,
 )
+from sglang.kernels.ops.attention.utils import (
+    concat_mla_absorb_q_general,
+    mla_quantize_and_rope_for_fp8,
+)
 from sglang.kernels.ops.kvcache.kv_indices import (
     create_flashmla_kv_indices_triton,
     get_num_kv_index_blocks_flashmla,
@@ -29,10 +33,6 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.flashinfer_mla_backend import (
     FlashInferMLAAttnBackend,
     FlashInferMLAMultiStepDraftBackend,
-)
-from sglang.srt.layers.attention.utils import (
-    concat_mla_absorb_q_general,
-    mla_quantize_and_rope_for_fp8,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
@@ -203,6 +203,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
         self.cuda_graph_custom_mask = None
+        # Tree-mask scratch is fetched from the target backend only.
+        self.is_draft_runner = model_runner.is_draft_worker
 
     def _calc_padded_blocks(self, max_seq_len: int) -> int:
         """
@@ -315,7 +317,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 device=self.device,
             )
 
-        if self.num_draft_tokens and not self.skip_prefill:
+        if self.num_draft_tokens and not self.skip_prefill and not self.is_draft_runner:
             # Worst-case FULL_MASK tree-mask scratch (bool); build_tree writes it
             # in-place so the gpu_only path needs no seq_lens_sum.
             self.cuda_graph_custom_mask = torch.zeros(
@@ -382,8 +384,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         metadata = self.decode_cuda_graph_metadata[bs]
 
         if forward_mode.is_target_verify():
-            seq_lens = seq_lens[:bs] + self.num_draft_tokens
-            metadata.seq_lens_k.copy_(seq_lens)
+            # Intentional int64 -> int32 same-kind out= downcast.
+            torch.add(seq_lens[:bs], self.num_draft_tokens, out=metadata.seq_lens_k)
+            seq_lens = metadata.seq_lens_k
         elif forward_mode.is_draft_extend_v2():
             num_tokens_per_req = self.num_draft_tokens
             metadata.max_seq_len_q = num_tokens_per_req
@@ -414,7 +417,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         """Get the fill value for sequence lengths in CUDA graph."""
         return 1
 
-    def init_mha_chunk_metadata(self, forward_batch: ForwardBatch) -> None:
+    def init_mha_chunk_metadata(
+        self, forward_batch: ForwardBatch, disable_flashinfer_ragged: bool = False
+    ) -> None:
         has_prefix = any(forward_batch.extend_prefix_lens_cpu)
         fallback_to_flashinfer_impl = (
             self.disable_chunked_prefix_cache and has_prefix
@@ -512,11 +517,13 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 or forward_batch.forward_mode.is_draft_extend_v2()
             ):
                 self.forward_prefill_metadata = None
-            # Get maximum sequence length.
+            # Never read max_seq from the GPU tensor (.max().item() blocks the
+            # host on the stream backlog); max_seq only sizes the block table /
+            # scheduling hint, so the static context bound is a safe fallback.
             if getattr(forward_batch, "seq_lens_cpu", None) is not None:
                 max_seq = forward_batch.seq_lens_cpu.max().item()
             else:
-                max_seq = forward_batch.seq_lens.max().item()
+                max_seq = self.max_context_len
 
             seq_lens = forward_batch.seq_lens
 
