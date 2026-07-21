@@ -22,6 +22,7 @@ from sglang.jit_kernel.utils import (
 )
 from sglang.kernels.ops.quantization.fp8_kernel import (
     create_per_token_group_quant_fp8_output_scale,
+    sglang_per_token_group_quant_fp8,
 )
 from sglang.srt.utils.common import get_cuda_version
 from sglang.srt.utils.custom_op import register_custom_op
@@ -81,7 +82,7 @@ def _validate_inputs(input: torch.Tensor, weight: torch.Tensor) -> None:
         )
     if input.stride(1) != 1:
         raise ValueError("input must have a contiguous hidden dimension")
-    if input.stride(0) % 16 != 0 or input.data_ptr() % 32 != 0:
+    if input.stride(0) % 16 != 0:
         raise ValueError("input rows must preserve 32-byte alignment")
 
     if tuple(weight.shape) != (hidden_size,):
@@ -92,8 +93,42 @@ def _validate_inputs(input: torch.Tensor, weight: torch.Tensor) -> None:
         raise TypeError(f"weight must be bfloat16, got {weight.dtype}")
     if weight.device != input.device:
         raise ValueError("input and weight must be on the same CUDA device")
-    if weight.stride(0) != 1 or weight.data_ptr() % 32 != 0:
-        raise ValueError("weight must be contiguous and 32-byte aligned")
+    if weight.stride(0) != 1:
+        raise ValueError("weight must be contiguous")
+
+
+def _is_fused_kernel_pointer_aligned(input: torch.Tensor, weight: torch.Tensor) -> bool:
+    """Whether the live pointers satisfy the fused kernel's vector ABI."""
+    return input.data_ptr() % 32 == 0 and weight.data_ptr() % 32 == 0
+
+
+def _run_unfused_rmsnorm_quant_out(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    output_q: torch.Tensor,
+    output_s: torch.Tensor,
+    output_norm: torch.Tensor,
+    eps: float,
+) -> None:
+    """Run the ordinary RMSNorm + CUDA UE8M0 quant pair for unaligned views."""
+    # sgl_kernel.rmsnorm itself requires 128-byte-aligned input and weight
+    # pointers, so it cannot implement the fallback for the views routed here.
+    normalized = torch.nn.functional.rms_norm(
+        input,
+        (input.shape[1],),
+        weight,
+        eps,
+    )
+    output_norm.copy_(normalized)
+    quantized, scale = sglang_per_token_group_quant_fp8(
+        normalized,
+        _GROUP_SIZE,
+        column_major_scales=True,
+        scale_tma_aligned=True,
+        scale_ue8m0=True,
+    )
+    output_q.copy_(quantized)
+    output_s.copy_(scale)
 
 
 def _validate_outputs(
@@ -186,11 +221,21 @@ def rmsnorm_per_token_group_quant_fp8_out(
     output_norm: torch.Tensor,
     eps: float = 1e-5,
 ) -> None:
-    """Allocation-free custom-op boundary for the fused JIT kernel."""
+    """Custom-op boundary selecting fused or ordinary CUDA kernels per call."""
     _require_supported_blackwell_runtime()
     _validate_inputs(input, weight)
     _validate_outputs(input, output_q, output_s, output_norm)
     if input.shape[0] == 0:
+        return
+    if not _is_fused_kernel_pointer_aligned(input, weight):
+        _run_unfused_rmsnorm_quant_out(
+            input,
+            weight,
+            output_q,
+            output_s,
+            output_norm,
+            eps,
+        )
         return
     module = _jit_module(input.shape[1], is_arch_support_pdl())
     module.rmsnorm_per_token_group_quant_fp8(
@@ -203,11 +248,14 @@ def rmsnorm_per_token_group_quant_fp8(
     weight: torch.Tensor,
     eps: float = 1e-5,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Return fused outputs under the caller-owned BF16/packed-UE8M0 contract.
+    """Return RMSNorm and packed-UE8M0 outputs under the BF16 contract.
 
-    This is a strict kernel API, not a fallback selector. The Python boundary
-    rejects unsupported hardware and malformed inputs before JIT compilation;
-    the C++ launcher independently retains the same ABI checks.
+    Aligned inputs use the fused JIT kernel. Unaligned storage views use the
+    ordinary RMSNorm plus CUDA group-quantization pair. This decision remains
+    inside the opaque custom op so every eager or compiled invocation observes
+    its live tensor pointers. Unsupported hardware and malformed tensor
+    metadata are rejected before JIT compilation; the C++ launcher retains the
+    fused path's ABI checks independently.
     """
     if not torch.compiler.is_compiling():
         _require_supported_blackwell_runtime()

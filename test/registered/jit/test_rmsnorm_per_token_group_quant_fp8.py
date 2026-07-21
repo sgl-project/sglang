@@ -207,12 +207,6 @@ def test_empty_input_is_a_noop() -> None:
             ],
             id="row-alignment",
         ),
-        pytest.param(
-            lambda: torch.randn(
-                2, TRACE_HIDDEN_SIZE + 17, device=DEVICE, dtype=DTYPE
-            ).as_strided((2, TRACE_HIDDEN_SIZE), (TRACE_HIDDEN_SIZE + 16, 1), 1),
-            id="storage-alignment",
-        ),
     ],
 )
 def test_rejects_invalid_input_contract(make_invalid) -> None:
@@ -243,10 +237,6 @@ def test_rejects_invalid_rank_before_allocation_or_jit(
         pytest.param(
             lambda: torch.randn(TRACE_HIDDEN_SIZE, device=DEVICE, dtype=torch.float16),
             id="dtype",
-        ),
-        pytest.param(
-            lambda: torch.randn(TRACE_HIDDEN_SIZE + 1, device=DEVICE, dtype=DTYPE)[1:],
-            id="storage-alignment",
         ),
     ],
 )
@@ -307,6 +297,17 @@ def test_torch_compile() -> None:
     def compiled(input: torch.Tensor, norm_weight: torch.Tensor):
         return rmsnorm_per_token_group_quant_fp8(input, norm_weight, EPS)
 
+    # Compile from the formerly-crashing case so Inductor must capture the
+    # custom op while its live inputs are storage-unaligned.
+    unaligned_input = _make_storage_unaligned((6, TRACE_HIDDEN_SIZE))
+    unaligned_weight = _make_storage_unaligned((TRACE_HIDDEN_SIZE,))
+    unaligned_output = compiled(unaligned_input, unaligned_weight)
+    _assert_matches_unfused_pair(
+        unaligned_output,
+        unaligned_input,
+        unaligned_weight,
+    )
+
     q_ref, s_ref, norm_ref = rmsnorm_per_token_group_quant_fp8(x, weight, EPS)
     output_q, output_s, output_norm = compiled(x, weight)
     torch.cuda.synchronize()
@@ -314,6 +315,109 @@ def test_torch_compile() -> None:
     assert torch.equal(output_norm, norm_ref)
     assert torch.equal(output_q.view(torch.int8), q_ref.view(torch.int8))
     assert torch.equal(output_s, s_ref)
+
+
+def _make_storage_unaligned(shape: tuple[int, ...]) -> torch.Tensor:
+    backing = torch.randn(
+        torch.Size(shape).numel() + 1,
+        device=DEVICE,
+        dtype=DTYPE,
+    )
+    output = backing[1:].view(shape)
+    assert output.data_ptr() % 32 != 0
+    return output
+
+
+def _assert_matches_unfused_pair(
+    output: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    input: torch.Tensor,
+    weight: torch.Tensor,
+) -> None:
+    output_q, output_s, output_norm = output
+    norm_ref = torch.nn.functional.rms_norm(
+        input,
+        (input.shape[1],),
+        weight,
+        EPS,
+    )
+    q_ref, s_ref, _ = _alloc_outputs(input.shape[0], input.shape[1])
+    per_token_group_quant_8bit_v2(
+        norm_ref,
+        q_ref,
+        s_ref,
+        GROUP_SIZE,
+        1e-10,
+        float(fp8_min),
+        float(fp8_max),
+        scale_ue8m0=True,
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(output_norm, norm_ref)
+    assert torch.equal(output_q.view(torch.int8), q_ref.view(torch.int8))
+    assert torch.equal(output_s, s_ref)
+
+
+@pytest.mark.parametrize("unaligned", ["input", "weight", "both"])
+def test_storage_unaligned_views_use_unfused_pair(
+    unaligned: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input = _make_input(6)
+    weight = torch.randn(TRACE_HIDDEN_SIZE, device=DEVICE, dtype=DTYPE)
+    if unaligned in {"input", "both"}:
+        input = _make_storage_unaligned((6, TRACE_HIDDEN_SIZE))
+    if unaligned in {"weight", "both"}:
+        weight = _make_storage_unaligned((TRACE_HIDDEN_SIZE,))
+
+    def fail_jit_lookup(*args, **kwargs):
+        pytest.fail("storage-unaligned view reached the fused JIT kernel")
+
+    monkeypatch.setattr(fused_rmsnorm_quant, "_jit_module", fail_jit_lookup)
+    output = rmsnorm_per_token_group_quant_fp8(input, weight, EPS)
+    _assert_matches_unfused_pair(output, input, weight)
+
+
+def test_torch_compile_routes_live_storage_alignment_per_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    aligned_input = _make_input(6)
+    unaligned_input = _make_storage_unaligned((6, TRACE_HIDDEN_SIZE))
+    aligned_weight = torch.randn(TRACE_HIDDEN_SIZE, device=DEVICE, dtype=DTYPE)
+    unaligned_weight = _make_storage_unaligned((TRACE_HIDDEN_SIZE,))
+
+    fallback_pointer_pairs = []
+    run_unfused = fused_rmsnorm_quant._run_unfused_rmsnorm_quant_out
+
+    def tracked_unfused(*args, **kwargs):
+        input, weight = args[:2]
+        fallback_pointer_pairs.append((input.data_ptr(), weight.data_ptr()))
+        return run_unfused(*args, **kwargs)
+
+    monkeypatch.setattr(
+        fused_rmsnorm_quant,
+        "_run_unfused_rmsnorm_quant_out",
+        tracked_unfused,
+    )
+
+    @torch.compile(fullgraph=True, backend="eager")
+    def compiled(input: torch.Tensor, norm_weight: torch.Tensor):
+        return rmsnorm_per_token_group_quant_fp8(input, norm_weight, EPS)
+
+    calls = (
+        (aligned_input, aligned_weight),
+        (unaligned_input, aligned_weight),
+        (aligned_input, unaligned_weight),
+        (aligned_input, aligned_weight),
+    )
+    for input, weight in calls:
+        output = compiled(input, weight)
+        _assert_matches_unfused_pair(output, input, weight)
+
+    assert fallback_pointer_pairs == [
+        (unaligned_input.data_ptr(), aligned_weight.data_ptr()),
+        (aligned_input.data_ptr(), unaligned_weight.data_ptr()),
+    ]
 
 
 def test_cuda_graph_replay() -> None:

@@ -25,6 +25,9 @@ from sglang.srt.layers.dcp import (
     all_gather_q_for_mla_decode,
     cp_lse_ag_out_rs_mla,
 )
+from sglang.srt.layers.quantization.fp8_rmsnorm import (
+    SupportsFusedFp8RMSNormInput,
+)
 from sglang.srt.layers.quantization.fp8_utils import (
     materialize_bpreshuffle_fp8_scale_tuple,
 )
@@ -193,16 +196,19 @@ class DeepseekMLAForwardMixin:
             return self.q_a_layernorm(q), None
 
         quant_method = self.q_b_proj.quant_method
+        if not isinstance(quant_method, SupportsFusedFp8RMSNormInput):
+            return self.q_a_layernorm(q), None
+
         prepared = quant_method.maybe_prepare_fused_rmsnorm_input(
             layer=self.q_b_proj,
             x=q,
             norm_weight=self.q_a_layernorm.weight,
             eps=self.q_a_layernorm.variance_epsilon,
-            need_normalized_output=self.use_dsa,
         )
         if prepared is None:
             return self.q_a_layernorm(q), None
-        return prepared.linear_input, prepared.normalized_input
+        normalized_input = prepared.normalized_input if self.use_dsa else None
+        return prepared.linear_input, normalized_input
 
     def should_run_indexer(
         self: DeepseekV2AttentionMLA,
