@@ -986,11 +986,7 @@ class HiRadixCache(RadixCache):
             ack = self.cache_controller.ack_load_queue.pop(0)
             ack.finish_event.synchronize()
             for ack_id in ack.node_ids:
-                load_back_entry = self.ongoing_load_back.pop(ack_id)
-                if isinstance(load_back_entry, tuple):
-                    end_node, protected_host_nodes = load_back_entry
-                else:
-                    end_node, protected_host_nodes = load_back_entry, []
+                end_node, protected_host_nodes = self.ongoing_load_back.pop(ack_id)
                 self.dec_lock_ref(end_node)
                 for host_node in protected_host_nodes:
                     host_node.release_host()
