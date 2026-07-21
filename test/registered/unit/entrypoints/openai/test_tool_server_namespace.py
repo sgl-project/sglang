@@ -30,6 +30,12 @@ def _server_response(namespace: str, instructions: str, tool_name: str):
 
 
 class TestMCPToolServerNamespaceRouting(CustomTestCase):
+    def test_initializes_empty_namespace_registries(self):
+        server = MCPToolServer()
+
+        self.assertEqual(server.harmony_tool_descriptions, {})
+        self.assertEqual(server.urls, {})
+
     def test_duplicate_namespace_keeps_description_and_url_from_same_server(self):
         responses = {
             "http://first:8001/sse": _server_response(

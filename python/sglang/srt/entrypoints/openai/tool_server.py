@@ -87,6 +87,7 @@ class ToolServer(ABC):
 class MCPToolServer(ToolServer):
     def __init__(self):
         self.harmony_tool_descriptions = {}
+        self.urls: dict[str, str] = {}
 
     async def add_tool_server(self, server_url: str):
         tool_urls = server_url.split(",")
