@@ -4,17 +4,17 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.srt.layers.attention.minimax_sparse_backend import (
+    MiniMaxSparseAttnBackend,
+)
 from sglang.srt.layers.attention.minimax_sparse_ops.npu_triton import (
     flash_block_score_decode as score_decode,
 )
 from sglang.srt.layers.attention.minimax_sparse_ops.npu_triton import (
-    topk_sparse_decode as sparse_decode,
-)
-from sglang.srt.layers.attention.minimax_sparse_ops.npu_triton import (
     prefill_block_score,
 )
-from sglang.srt.layers.attention.minimax_sparse_backend import (
-    MiniMaxSparseAttnBackend,
+from sglang.srt.layers.attention.minimax_sparse_ops.npu_triton import (
+    topk_sparse_decode as sparse_decode,
 )
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -52,9 +52,7 @@ def _build_inputs(seq_lens: list[int]) -> tuple[torch.Tensor, ...]:
         dtype=torch.bfloat16,
         device=_DEVICE,
     )
-    block_table = torch.zeros(
-        batch_size, max_blocks, dtype=torch.int32, device=_DEVICE
-    )
+    block_table = torch.zeros(batch_size, max_blocks, dtype=torch.int32, device=_DEVICE)
 
     page_offset = 0
     for batch_idx, num_blocks in enumerate(blocks_per_request):
@@ -63,8 +61,11 @@ def _build_inputs(seq_lens: list[int]) -> tuple[torch.Tensor, ...]:
         )
         page_offset += num_blocks
 
-    return q, k_cache, block_table, torch.tensor(
-        seq_lens, dtype=torch.int32, device=_DEVICE
+    return (
+        q,
+        k_cache,
+        block_table,
+        torch.tensor(seq_lens, dtype=torch.int32, device=_DEVICE),
     )
 
 
@@ -88,9 +89,7 @@ def _reference_topk(
         seq_len = int(seq_lens[batch_idx].item())
         num_blocks = (seq_len + _BLOCK_SIZE - 1) // _BLOCK_SIZE
         pages = block_table[batch_idx, :num_blocks].to(torch.long)
-        keys = k_cache[pages, :, 0, :].reshape(
-            num_blocks * _BLOCK_SIZE, _HEAD_DIM
-        )
+        keys = k_cache[pages, :, 0, :].reshape(num_blocks * _BLOCK_SIZE, _HEAD_DIM)
         qk = q[batch_idx].float() @ keys.float().transpose(0, 1)
         qk *= _HEAD_DIM**-0.5
 
@@ -150,8 +149,10 @@ def _reference_append_local_block(
     """Reference for the MiniMax decode init=0/local=1 fast path."""
     num_kv_heads, batch_size, topk = topk_idx.shape
     query_positions = (seq_lens.to(torch.long) - 1).clamp(min=0)
-    local = (query_positions // block_size).clamp(min=0, max=num_blocks - 1).to(
-        topk_idx.dtype
+    local = (
+        (query_positions // block_size)
+        .clamp(min=0, max=num_blocks - 1)
+        .to(topk_idx.dtype)
     )
     out = torch.full(
         (num_kv_heads, batch_size, topk + 1),
@@ -205,6 +206,81 @@ def _direct_page_map_from_block_table(
 
 
 class TestMiniMaxSparseDecodeTopKTriton(CustomTestCase):
+<<<<<<< HEAD
+=======
+    def test_deepep_target_verify_overlaps_shared_expert_on_npu(self):
+        hidden_states = torch.randn(2, 8, dtype=torch.bfloat16, device=_DEVICE)
+        shared_output = torch.randn_like(hidden_states)
+        routed_output = torch.randn_like(hidden_states)
+        router_logits = torch.randn(2, 4, dtype=torch.float32, device=_DEVICE)
+        topk_output = object()
+        moe = MagicMock()
+        moe.layer_id = 7
+        moe._compute_router_logits.return_value = router_logits
+        moe.topk.return_value = topk_output
+        moe.experts.return_value = routed_output
+        forward_batch = SimpleNamespace(
+            num_token_non_padded=2,
+            forward_mode=SimpleNamespace(
+                is_extend=lambda: False,
+                is_target_verify=lambda: True,
+            ),
+        )
+
+        with patch.object(minimax_m3, "_is_npu", True), patch.object(
+            minimax_m3.envs.SGLANG_NPU_USE_MULTI_STREAM,
+            "get",
+            return_value=True,
+        ), patch.object(
+            minimax_m3.ExpertLocationDispatchInfo,
+            "init_new",
+            return_value=None,
+        ), patch.object(
+            minimax_m3,
+            "process_shared_expert",
+            return_value=shared_output,
+        ) as process_shared_expert, patch.object(
+            minimax_m3,
+            "wait_share_stream",
+        ) as wait_share_stream:
+            actual = minimax_m3.MiniMaxM3MoE.forward_deepep(
+                moe, hidden_states, forward_batch
+            )
+
+        process_shared_expert.assert_called_once_with(
+            hidden_states, moe._forward_shared_experts
+        )
+        wait_share_stream.assert_called_once()
+        torch.testing.assert_close(actual, routed_output + shared_output)
+
+    def test_chunk_selection_uses_single_chunk_for_minimax_c1_shape(self):
+        self.assertEqual(
+            MiniMaxSparseAttnBackend._choose_decode_score_max_chunks(1), 16
+        )
+        for batch_size in (2, 4, 8, 16, 32, 64):
+            self.assertEqual(
+                MiniMaxSparseAttnBackend._choose_decode_score_max_chunks(batch_size),
+                32,
+            )
+        with patch.object(sparse_decode, "_get_vectorcore_num_safe", return_value=32):
+            self.assertEqual(
+                sparse_decode._choose_num_topk_chunks(
+                    batch_size=4,
+                    num_kv_heads=1,
+                    max_topk=17,
+                ),
+                1,
+            )
+            self.assertEqual(
+                sparse_decode._choose_num_topk_chunks(
+                    batch_size=8,
+                    num_kv_heads=1,
+                    max_topk=17,
+                ),
+                4,
+            )
+
+>>>>>>> 6534d977f1 (Optimize adaptive scoring and merging for short sequences)
     def test_prefill_metadata_keeps_direct_request_map_without_block_table(self):
         backend = object.__new__(MiniMaxSparseAttnBackend)
         backend._max_seqlen_k = 384
@@ -255,9 +331,7 @@ class TestMiniMaxSparseDecodeTopKTriton(CustomTestCase):
         backend.block_size_k = _BLOCK_SIZE
         topk_idx = torch.zeros((1, 2, _TOPK), dtype=torch.int32, device=_DEVICE)
         seq_lens = torch.tensor([512, 513], dtype=torch.int32, device=_DEVICE)
-        fused = torch.full(
-            (1, 2, _TOPK + 1), -1, dtype=torch.int32, device=_DEVICE
-        )
+        fused = torch.full((1, 2, _TOPK + 1), -1, dtype=torch.int32, device=_DEVICE)
 
         backend.init_blocks = 0
         backend.local_blocks = 1
@@ -286,9 +360,7 @@ class TestMiniMaxSparseDecodeTopKTriton(CustomTestCase):
         torch.testing.assert_close(fallback, topk_idx)
 
     def test_append_local_block_fused_matches_reference(self):
-        topk_idx = torch.full(
-            (2, 2, _TOPK), -1, dtype=torch.int32, device=_DEVICE
-        )
+        topk_idx = torch.full((2, 2, _TOPK), -1, dtype=torch.int32, device=_DEVICE)
         topk_idx[0, 0, :5] = torch.tensor(
             [1, 3, 4, -1, 0], dtype=torch.int32, device=_DEVICE
         )
@@ -347,6 +419,111 @@ class TestMiniMaxSparseDecodeTopKTriton(CustomTestCase):
                         q, k_cache, block_table, seq_lens, score_type
                     )
                     _assert_topk_sets_equal(self, actual, expected, seq_lens)
+
+    def test_runtime_fill_only_matches_captured_static_route(self):
+        torch.manual_seed(20260721)
+        lengths = [16385, 16257]
+        q, k_cache, block_table, seq_lens = _build_inputs(lengths)
+        common_kwargs = dict(
+            q=q,
+            sink=None,
+            k_cache_bnsd=k_cache,
+            v_cache_bnsd=None,
+            block_table=block_table,
+            seq_lens=seq_lens,
+            # Decode graphs are captured at the full bound, even when replaying
+            # a 16K request. This is the shape that enables runtime direct-fill.
+            max_seqlen=1048576,
+            block_size=_BLOCK_SIZE,
+            topk=_TOPK,
+            init_blocks=0,
+            local_blocks=0,
+            score_type="max",
+            disable_index_value=True,
+        )
+
+        _, expected = score_decode.flash_decode_bnsd_with_topk_idx(
+            **common_kwargs, runtime_fill_only=False
+        )
+        _, actual = score_decode.flash_decode_bnsd_with_topk_idx(
+            **common_kwargs, runtime_fill_only=True
+        )
+
+        self.assertTrue(torch.equal(actual, expected))
+        _, sixteen_chunks = score_decode.flash_decode_bnsd_with_topk_idx(
+            **common_kwargs,
+            runtime_fill_only=True,
+            score_max_chunks=16,
+        )
+        self.assertTrue(torch.equal(sixteen_chunks, actual))
+        packed_seq_lens = torch.tensor(
+            [16381, 16382, 16383, 16384, 16254, 16255, 16256, 16257],
+            dtype=torch.int32,
+            device=_DEVICE,
+        )
+        packed_kwargs = {
+            **common_kwargs,
+            "seq_lens": packed_seq_lens,
+            "score_blocks_per_chunk": 8,
+            "score_max_chunks": 64,
+            "packed_seq_lens": True,
+        }
+        _, expected_packed = score_decode.flash_decode_bnsd_with_topk_idx(
+            **packed_kwargs, runtime_fill_only=False
+        )
+        _, actual_packed = score_decode.flash_decode_bnsd_with_topk_idx(
+            **packed_kwargs, runtime_fill_only=True
+        )
+
+        self.assertTrue(torch.equal(actual_packed, expected_packed))
+        _, adaptive_packed = score_decode.flash_decode_bnsd_with_topk_idx(
+            **packed_kwargs,
+            runtime_fill_only=True,
+            runtime_score_short_max_blocks=256,
+            runtime_score_short_chunks=16,
+        )
+        self.assertTrue(torch.equal(adaptive_packed, expected_packed))
+
+    def test_adaptive_candidate_merge_matches_static_merge(self):
+        torch.manual_seed(20260721)
+        candidate_scores = torch.full(
+            (64, 4, 2, _TOPK),
+            float("-inf"),
+            dtype=torch.float32,
+            device=_DEVICE,
+        )
+        candidate_indices = torch.full(
+            (64, 4, 2, _TOPK),
+            -1,
+            dtype=torch.int32,
+            device=_DEVICE,
+        )
+        candidate_scores[:16].normal_()
+        candidate_indices[:16] = torch.arange(
+            16 * _TOPK, dtype=torch.int32, device=_DEVICE
+        ).view(16, 1, 1, _TOPK)
+        seq_lens = torch.tensor(
+            [16381, 16382, 16383, 16384, 16254, 16255, 16256, 16257],
+            dtype=torch.int32,
+            device=_DEVICE,
+        )
+
+        expected = score_decode._merge_bnsd_score_topk_candidates(
+            candidate_scores, candidate_indices, _TOPK
+        )
+        actual = score_decode._merge_bnsd_score_topk_candidates_adaptive(
+            candidate_scores,
+            candidate_indices,
+            seq_lens,
+            block_size=_BLOCK_SIZE,
+            topk=_TOPK,
+            stride_sl_b=4,
+            stride_sl_h=1,
+            short_max_blocks=256,
+            short_chunks=16,
+        )
+
+        self.assertTrue(torch.equal(actual, expected))
 
     def test_unified_triton_topk_for_index_value_path(self):
         torch.manual_seed(20260715)
@@ -488,6 +665,8 @@ class TestMiniMaxSparseDecodeTopKTriton(CustomTestCase):
         backend._max_seqlen_k = 512
         backend.topk_blocks = _TOPK
         backend.score_type = "max"
+        backend._decode_seq_lens_i32_cg = {}
+        backend._verify_meta_cg = {}
         backend.req_to_token = torch.arange(
             3 * 512, dtype=torch.int32, device=_DEVICE
         ).view(3, 512)
@@ -495,13 +674,21 @@ class TestMiniMaxSparseDecodeTopKTriton(CustomTestCase):
             side_effect=lambda topk_idx, *_: topk_idx
         )
 
-        q = torch.randn(1, _NUM_Q_HEADS, _HEAD_DIM, dtype=torch.bfloat16, device=_DEVICE)
+        q = torch.randn(
+            1, _NUM_Q_HEADS, _HEAD_DIM, dtype=torch.bfloat16, device=_DEVICE
+        )
         k_cache = torch.randn(
-            4, _BLOCK_SIZE, _NUM_KV_HEADS, _HEAD_DIM,
-            dtype=torch.bfloat16, device=_DEVICE,
+            4,
+            _BLOCK_SIZE,
+            _NUM_KV_HEADS,
+            _HEAD_DIM,
+            dtype=torch.bfloat16,
+            device=_DEVICE,
         )
         v_cache = torch.randn_like(k_cache)
-        idx_q = torch.randn_like(q)
+        idx_q = torch.randn(
+            1, _NUM_KV_HEADS, _HEAD_DIM, dtype=torch.bfloat16, device=_DEVICE
+        )
         idx_k_cache = torch.randn_like(k_cache)
         forward_batch = SimpleNamespace(
             seq_lens=torch.tensor([512], dtype=torch.int32, device=_DEVICE),
@@ -510,7 +697,9 @@ class TestMiniMaxSparseDecodeTopKTriton(CustomTestCase):
         topk_decode = torch.zeros((1, 1, _TOPK), dtype=torch.int32, device=_DEVICE)
 
         with patch.object(
-            score_decode, "flash_decode_bnsd_with_topk_idx", return_value=(None, topk_decode)
+            score_decode,
+            "flash_decode_bnsd_with_topk_idx",
+            return_value=(None, topk_decode),
         ) as score_call, patch.object(
             sparse_decode, "flash_decode_bnsd_with_gqa_share_sparse", return_value=q
         ) as gqa_call:
@@ -528,15 +717,20 @@ class TestMiniMaxSparseDecodeTopKTriton(CustomTestCase):
             self.assertEqual(kwargs["max_num_blocks"], 4)
             self.assertEqual(kwargs["num_pages"], 4)
             self.assertFalse(kwargs["sanitize_page_ids"])
-
+        self.assertTrue(score_call.call_args.kwargs["runtime_fill_only"])
+        self.assertEqual(score_call.call_args.kwargs["score_max_chunks"], 16)
         verify_q = torch.randn(
             2, _NUM_Q_HEADS, _HEAD_DIM, dtype=torch.bfloat16, device=_DEVICE
         )
-        verify_idx_q = torch.randn_like(verify_q)
-        topk_verify = torch.zeros((1, 2, _TOPK), dtype=torch.int32, device=_DEVICE)
+        verify_idx_q = torch.randn(
+            2, _NUM_KV_HEADS, _HEAD_DIM, dtype=torch.bfloat16, device=_DEVICE
+        )
+        topk_verify = torch.zeros((2, 1, _TOPK), dtype=torch.int32, device=_DEVICE)
         backend._prepare_npu_triton_topk_idx.reset_mock()
         with patch.object(
-            score_decode, "flash_decode_bnsd_with_topk_idx", return_value=(None, topk_verify)
+            score_decode,
+            "flash_decode_bnsd_with_topk_idx",
+            return_value=(None, topk_verify),
         ) as score_call, patch.object(
             sparse_decode,
             "flash_decode_bnsd_with_gqa_share_sparse",
@@ -558,10 +752,22 @@ class TestMiniMaxSparseDecodeTopKTriton(CustomTestCase):
             kwargs = call.call_args.kwargs
             self.assertIsNone(kwargs["block_table"])
             self.assertIs(kwargs["req_to_token"], backend.req_to_token)
-            torch.testing.assert_close(kwargs["req_pool_indices"], expected_verify_rows)
             self.assertEqual(kwargs["max_num_blocks"], 4)
             self.assertEqual(kwargs["num_pages"], 4)
             self.assertTrue(kwargs["sanitize_page_ids"])
+        verify_score_kwargs = score_call.call_args.kwargs
+        torch.testing.assert_close(
+            verify_score_kwargs["req_pool_indices"], forward_batch.req_pool_indices
+        )
+        self.assertTrue(verify_score_kwargs["packed_seq_lens"])
+        self.assertEqual(verify_score_kwargs["score_blocks_per_chunk"], 8)
+        self.assertEqual(verify_score_kwargs["score_max_chunks"], 64)
+        self.assertTrue(verify_score_kwargs["runtime_fill_only"])
+        self.assertEqual(verify_score_kwargs["runtime_score_short_max_blocks"], 256)
+        self.assertEqual(verify_score_kwargs["runtime_score_short_chunks"], 16)
+        torch.testing.assert_close(
+            gqa_call.call_args.kwargs["req_pool_indices"], expected_verify_rows
+        )
 
 
 if __name__ == "__main__":

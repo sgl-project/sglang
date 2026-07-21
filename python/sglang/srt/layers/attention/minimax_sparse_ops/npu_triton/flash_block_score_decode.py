@@ -6,6 +6,7 @@ import torch
 import triton
 import triton.language as tl
 
+
 def _next_power_of_2(x: int) -> int:
     return 1 << (int(x) - 1).bit_length()
 
@@ -472,6 +473,206 @@ def _merge_bnsd_score_topk_candidates(
     return topk_indices
 
 
+@triton.jit
+def _merge_bnsd_score_topk_candidates_impl(
+    candidate_scores_ptr,
+    candidate_indices_ptr,
+    topk_indices_ptr,
+    pid_b,
+    pid_h,
+    stride_cs_c,
+    stride_cs_h,
+    stride_cs_b,
+    stride_cs_t,
+    stride_ci_c,
+    stride_ci_h,
+    stride_ci_b,
+    stride_ci_t,
+    stride_ti_h,
+    stride_ti_b,
+    stride_ti_t,
+    NUM_SCORE_CHUNKS: tl.constexpr,
+    topk: tl.constexpr,
+    BLOCK_SIZE_CANDIDATES: tl.constexpr,
+):
+    off_candidates = tl.arange(0, BLOCK_SIZE_CANDIDATES)
+    candidate_chunk = off_candidates // topk
+    candidate_rank = off_candidates - candidate_chunk * topk
+    valid_candidate = off_candidates < NUM_SCORE_CHUNKS * topk
+    candidate_scores = tl.load(
+        candidate_scores_ptr
+        + candidate_chunk * stride_cs_c
+        + pid_h * stride_cs_h
+        + pid_b * stride_cs_b
+        + candidate_rank * stride_cs_t,
+        mask=valid_candidate,
+        other=float("-inf"),
+    ).to(tl.float32)
+    candidate_indices = tl.load(
+        candidate_indices_ptr
+        + candidate_chunk * stride_ci_c
+        + pid_h * stride_ci_h
+        + pid_b * stride_ci_b
+        + candidate_rank * stride_ci_t,
+        mask=valid_candidate,
+        other=-1,
+    ).to(tl.int32)
+    candidate_scores = tl.where(
+        candidate_indices >= 0,
+        candidate_scores,
+        float("-inf"),
+    )
+
+    for rank in tl.static_range(0, topk):
+        best_score = tl.max(candidate_scores, axis=0)
+        best_positions = tl.where(
+            candidate_scores == best_score,
+            off_candidates,
+            tl.full((BLOCK_SIZE_CANDIDATES,), BLOCK_SIZE_CANDIDATES, tl.int32),
+        )
+        best_position = tl.min(best_positions, axis=0)
+        selected_index = tl.max(
+            tl.where(
+                off_candidates == best_position,
+                candidate_indices,
+                tl.full((BLOCK_SIZE_CANDIDATES,), -1, tl.int32),
+            ),
+            axis=0,
+        )
+        tl.store(
+            topk_indices_ptr
+            + pid_h * stride_ti_h
+            + pid_b * stride_ti_b
+            + rank * stride_ti_t,
+            selected_index,
+        )
+        candidate_scores = tl.where(
+            off_candidates == best_position,
+            float("-inf"),
+            candidate_scores,
+        )
+
+
+@triton.jit
+def _merge_bnsd_score_topk_candidates_guarded_kernel(
+    candidate_scores_ptr,
+    candidate_indices_ptr,
+    topk_indices_ptr,
+    seq_lens,
+    stride_sl_b,
+    stride_sl_h,
+    block_size: tl.constexpr,
+    short_max_blocks: tl.constexpr,
+    stride_cs_c,
+    stride_cs_h,
+    stride_cs_b,
+    stride_cs_t,
+    stride_ci_c,
+    stride_ci_h,
+    stride_ci_b,
+    stride_ci_t,
+    stride_ti_h,
+    stride_ti_b,
+    stride_ti_t,
+    NUM_SCORE_CHUNKS: tl.constexpr,
+    topk: tl.constexpr,
+    BLOCK_SIZE_CANDIDATES: tl.constexpr,
+    RUN_SHORT: tl.constexpr,
+):
+    pid_b = tl.program_id(0)
+    pid_h = tl.program_id(1)
+    seq_len = tl.load(seq_lens + pid_b * stride_sl_b + pid_h * stride_sl_h)
+    num_blocks = tl.cdiv(seq_len, block_size)
+    if RUN_SHORT:
+        if num_blocks > short_max_blocks:
+            return
+    else:
+        if num_blocks <= short_max_blocks:
+            return
+    _merge_bnsd_score_topk_candidates_impl(
+        candidate_scores_ptr,
+        candidate_indices_ptr,
+        topk_indices_ptr,
+        pid_b,
+        pid_h,
+        stride_cs_c,
+        stride_cs_h,
+        stride_cs_b,
+        stride_cs_t,
+        stride_ci_c,
+        stride_ci_h,
+        stride_ci_b,
+        stride_ci_t,
+        stride_ti_h,
+        stride_ti_b,
+        stride_ti_t,
+        NUM_SCORE_CHUNKS=NUM_SCORE_CHUNKS,
+        topk=topk,
+        BLOCK_SIZE_CANDIDATES=BLOCK_SIZE_CANDIDATES,
+    )
+
+
+def _merge_bnsd_score_topk_candidates_adaptive(
+    candidate_scores: torch.Tensor,
+    candidate_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    block_size: int,
+    topk: int,
+    stride_sl_b: int,
+    stride_sl_h: int,
+    short_max_blocks: int,
+    short_chunks: int,
+) -> torch.Tensor:
+    num_score_chunks, num_q_heads, batch_size, _ = candidate_scores.shape
+    assert 0 < short_chunks <= num_score_chunks
+    topk_indices = torch.empty(
+        (num_q_heads, batch_size, topk),
+        dtype=torch.int32,
+        device=candidate_scores.device,
+    )
+    common_args = (
+        candidate_scores,
+        candidate_indices,
+        topk_indices,
+        seq_lens,
+        stride_sl_b,
+        stride_sl_h,
+        block_size,
+        short_max_blocks,
+        candidate_scores.stride(0),
+        candidate_scores.stride(1),
+        candidate_scores.stride(2),
+        candidate_scores.stride(3),
+        candidate_indices.stride(0),
+        candidate_indices.stride(1),
+        candidate_indices.stride(2),
+        candidate_indices.stride(3),
+        topk_indices.stride(0),
+        topk_indices.stride(1),
+        topk_indices.stride(2),
+    )
+    grid = (batch_size, num_q_heads)
+    _merge_bnsd_score_topk_candidates_guarded_kernel[grid](
+        *common_args,
+        NUM_SCORE_CHUNKS=short_chunks,
+        topk=topk,
+        BLOCK_SIZE_CANDIDATES=_next_power_of_2(short_chunks * topk),
+        RUN_SHORT=True,
+        num_warps=1,
+        num_stages=1,
+    )
+    _merge_bnsd_score_topk_candidates_guarded_kernel[grid](
+        *common_args,
+        NUM_SCORE_CHUNKS=num_score_chunks,
+        topk=topk,
+        BLOCK_SIZE_CANDIDATES=_next_power_of_2(num_score_chunks * topk),
+        RUN_SHORT=False,
+        num_warps=1,
+        num_stages=1,
+    )
+    return topk_indices
+
+
 # =============================================================================
 # BNSD Decode Score Kernel
 # =============================================================================
@@ -841,6 +1042,10 @@ def _decode_bnsd_score_topk_chunk_kernel(
     USE_DIRECT_PAGE_LOOKUP: tl.constexpr,
     SANITIZE_PAGE_IDS: tl.constexpr,
     FILL_ONLY: tl.constexpr,
+    RUNTIME_FILL_ONLY: tl.constexpr,
+    RUNTIME_ADAPTIVE_SCORE_CHUNKS: tl.constexpr,
+    RUNTIME_SCORE_SHORT_MAX_BLOCKS: tl.constexpr,
+    RUNTIME_SCORE_SHORT_CHUNKS: tl.constexpr,
 ):
     """Fuse block score computation with one register-resident TopK per chunk."""
     tl.static_assert(SCORE_TYPE == "max" or SCORE_TYPE == "lse")
@@ -884,7 +1089,9 @@ def _decode_bnsd_score_topk_chunk_kernel(
             tl.zeros((BLOCK_SIZE_H, BLOCK_SIZE_T), tl.float32),
             top_scores,
         )
-        tl.store(candidate_scores_ptr + candidate_offsets, top_scores, mask=candidate_mask)
+        tl.store(
+            candidate_scores_ptr + candidate_offsets, top_scores, mask=candidate_mask
+        )
         tl.store(
             candidate_indices_ptr + candidate_index_offsets,
             top_indices,
@@ -892,11 +1099,20 @@ def _decode_bnsd_score_topk_chunk_kernel(
         )
         return
 
-    chunk_size_blocks = tl.maximum(1, tl.cdiv(num_blocks, num_score_chunks))
+    active_num_score_chunks = num_score_chunks
+    if RUNTIME_ADAPTIVE_SCORE_CHUNKS:
+        active_num_score_chunks = tl.where(
+            num_blocks <= RUNTIME_SCORE_SHORT_MAX_BLOCKS,
+            RUNTIME_SCORE_SHORT_CHUNKS,
+            num_score_chunks,
+        )
+    chunk_size_blocks = tl.maximum(1, tl.cdiv(num_blocks, active_num_score_chunks))
     chunk_start_block = pid_c * chunk_size_blocks
     chunk_end_block = tl.minimum(chunk_start_block + chunk_size_blocks, num_blocks)
     if chunk_start_block >= chunk_end_block:
-        tl.store(candidate_scores_ptr + candidate_offsets, top_scores, mask=candidate_mask)
+        tl.store(
+            candidate_scores_ptr + candidate_offsets, top_scores, mask=candidate_mask
+        )
         tl.store(
             candidate_indices_ptr + candidate_index_offsets,
             top_indices,
@@ -928,9 +1144,7 @@ def _decode_bnsd_score_topk_chunk_kernel(
                 logical_block * block_size, max_req_to_token_cols - 1
             )
             token_slot = tl.load(
-                req_to_token_ptr
-                + req_idx * stride_rtt_r
-                + token_col * stride_rtt_t
+                req_to_token_ptr + req_idx * stride_rtt_r + token_col * stride_rtt_t
             ).to(tl.int64)
             physical_block = token_slot // block_size
             if SANITIZE_PAGE_IDS:
@@ -962,10 +1176,18 @@ def _decode_bnsd_score_topk_chunk_kernel(
         else:
             score = sub_max + tl.log2(tl.sum(tl.exp2(qk - sub_max[:, None]), axis=1))
             score = tl.where(score != score, float("-inf"), score)
-        is_init = logical_block < init_blocks
-        is_local = (logical_block >= local_start) & (logical_block < num_blocks)
-        score = tl.where(is_init, 1e30, score)
-        score = tl.where(is_local, 1e29, score)
+        # EXP1 result: per-step [H]-vector init/local guards slow the FILL_ONLY
+        # loop body several x on Ascend; constexpr-folding them away (0/0 in
+        # production) restores full speed. For nonzero values keep the
+        # row-vector guards (exact for shorter packed rows).
+        if init_blocks > 0:
+            is_init = (logical_block < init_blocks) & (logical_block < num_blocks_rows)
+            score = tl.where(is_init, 1e30, score)
+        if local_blocks > 0:
+            is_local = (logical_block >= local_start_rows) & (
+                logical_block < num_blocks_rows
+            )
+            score = tl.where(is_local, 1e29, score)
 
         if FILL_ONLY:
             # Store this block's score/index DIRECTLY to the candidate output at slot=step.
@@ -974,7 +1196,13 @@ def _decode_bnsd_score_topk_chunk_kernel(
             # "Unsupported copy from cbuf to cbuf" in this (reduction-free) loop body. Using
             # `step` as a store *offset* (address arithmetic) sidesteps that. Unused slots
             # (step >= num_steps, only in a partial last chunk) stay at the wrapper's -inf/-1
-            # pre-init, so the cross-chunk merge skips them correctly.
+            # pre-init, so the cross-chunk merge skips them correctly. Blocks past a packed
+            # row's own length store their computed -inf score (pos_mask is all-false for
+            # them): with the packed_seq_lens precondition (rows differ by <=1 block) every
+            # row reaches the loop with >= topk real finite-scored blocks whenever
+            # num_blocks > topk, so those -inf candidates never make the final topk --
+            # identical output to masking them, without a per-step vector mask that
+            # slows this fragile reduction-free loop body down several x on Ascend.
             head_mask = off_h < gqa_group_size
             cs_off = (
                 pid_c * stride_cs_c
@@ -991,31 +1219,59 @@ def _decode_bnsd_score_topk_chunk_kernel(
             tl.store(candidate_scores_ptr + cs_off, score, mask=head_mask)
             tl.store(candidate_indices_ptr + ci_off, logical_block, mask=head_mask)
         else:
-            valid_topk_lane = off_t[None, :] < topk
-            current_min = tl.min(top_scores, axis=1)
-            min_positions = tl.where(
-                (top_scores == current_min[:, None]) & valid_topk_lane,
-                off_t[None, :],
-                tl.full((BLOCK_SIZE_H, BLOCK_SIZE_T), BLOCK_SIZE_T, tl.int32),
-            )
-            min_position = tl.min(min_positions, axis=1)
-            replace = (
-                (off_t[None, :] == min_position[:, None])
-                & valid_topk_lane
-                & (score[:, None] > current_min[:, None])
-            )
-            top_scores = tl.where(replace, score[:, None], top_scores)
-            top_indices = tl.where(replace, logical_block, top_indices)
+            if RUNTIME_FILL_ONLY and chunk_size_blocks <= topk:
+                # Graph capture specializes this kernel with max_context_len,
+                # while replay can carry a much shorter sequence. For example,
+                # the 128K capture bound selects 32 chunks, but a 16K replay has
+                # only 4--5 blocks per chunk. In that case every score is already
+                # a valid chunk-local TopK candidate, so bypass the loop-carried
+                # min/replacement reductions and fill the candidate row directly.
+                head_mask = off_h < gqa_group_size
+                cs_off = (
+                    pid_c * stride_cs_c
+                    + (pid_h + off_h) * stride_cs_h
+                    + pid_b * stride_cs_b
+                    + step * stride_cs_t
+                )
+                ci_off = (
+                    pid_c * stride_ci_c
+                    + (pid_h + off_h) * stride_ci_h
+                    + pid_b * stride_ci_b
+                    + step * stride_ci_t
+                )
+                tl.store(candidate_scores_ptr + cs_off, score, mask=head_mask)
+                tl.store(candidate_indices_ptr + ci_off, logical_block, mask=head_mask)
+            else:
+                valid_topk_lane = off_t[None, :] < topk
+                current_min = tl.min(top_scores, axis=1)
+                min_positions = tl.where(
+                    (top_scores == current_min[:, None]) & valid_topk_lane,
+                    off_t[None, :],
+                    tl.full((BLOCK_SIZE_H, BLOCK_SIZE_T), BLOCK_SIZE_T, tl.int32),
+                )
+                min_position = tl.min(min_positions, axis=1)
+                replace = (
+                    (off_t[None, :] == min_position[:, None])
+                    & valid_topk_lane
+                    & (score[:, None] > current_min[:, None])
+                )
+                top_scores = tl.where(replace, score[:, None], top_scores)
+                top_indices = tl.where(replace, logical_block, top_indices)
 
     # FILL_ONLY wrote each block straight to the candidate output inside the loop
     # (store-per-block); the register tiles are stale, so skip this end-store for it.
     if not FILL_ONLY:
-        tl.store(candidate_scores_ptr + candidate_offsets, top_scores, mask=candidate_mask)
-        tl.store(
-            candidate_indices_ptr + candidate_index_offsets,
-            top_indices,
-            mask=candidate_mask,
-        )
+        if not RUNTIME_FILL_ONLY or chunk_size_blocks > topk:
+            tl.store(
+                candidate_scores_ptr + candidate_offsets,
+                top_scores,
+                mask=candidate_mask,
+            )
+            tl.store(
+                candidate_indices_ptr + candidate_index_offsets,
+                top_indices,
+                mask=candidate_mask,
+            )
 
 
 # =============================================================================
@@ -1141,7 +1397,9 @@ def _decode_bnsd_score_attn_chunk_kernel(
     chunk_end_block = tl.minimum(chunk_start_block + chunk_size_blocks, num_blocks)
 
     if chunk_start_block >= chunk_end_block:
-        tl.store(candidate_scores_ptr + candidate_offsets, top_scores, mask=candidate_mask)
+        tl.store(
+            candidate_scores_ptr + candidate_offsets, top_scores, mask=candidate_mask
+        )
         tl.store(
             candidate_indices_ptr + candidate_index_offsets,
             top_indices,
@@ -1422,6 +1680,25 @@ def flash_decode_bnsd_with_topk_idx(
     max_num_blocks: Optional[int] = None,
     num_pages: Optional[int] = None,
     sanitize_page_ids: bool = False,
+    # Pack the gqa row dim with PER-ROW seq_lens (draft-token verify: q viewed
+    # as [bs, ndt*idx_heads, D], one causal length per row). One K pass then
+    # scores all packed rows via the existing [BLOCK_SIZE_H, BLOCK_SIZE_N] dot
+    # instead of one launch row per query -- 4x less idx-K HBM traffic at ndt=4.
+    # Requires every packed row to be a valid causal prefix of the row-max
+    # length (draft rows differ by <=1 block); only the score-only path
+    # (disable_index_value=True) supports it.
+    packed_seq_lens: bool = False,
+    # Decode graphs are compiled against max_context_len, but replay often uses
+    # much shorter live sequences. Let the score kernel select its direct-fill
+    # candidate path from the runtime chunk length while keeping the original
+    # TopK maintenance path for chunks longer than ``topk``.
+    runtime_fill_only: bool = False,
+    # Keep a long-context graph's static score grid while activating fewer,
+    # wider chunks for short runtime sequences. Inactive grid programs leave
+    # their preinitialized candidates invalid; long sequences retain the full
+    # static chunk count. Both values must be specified together.
+    runtime_score_short_max_blocks: int = 0,
+    runtime_score_short_chunks: int = 0,
 ) -> tuple[Optional[torch.Tensor], torch.Tensor]:
     """Decode attention with BNSD KV cache and block-level topk indices.
 
@@ -1503,6 +1780,14 @@ def flash_decode_bnsd_with_topk_idx(
             all_seqblock_q=batch_size,
             num_kv_heads=num_kv_heads,
         )
+        use_runtime_adaptive_score_chunks = bool(
+            runtime_score_short_max_blocks or runtime_score_short_chunks
+        )
+        if use_runtime_adaptive_score_chunks:
+            assert runtime_score_short_max_blocks > 0
+            assert runtime_score_short_chunks > 0
+            assert runtime_score_short_chunks <= num_score_chunks
+            assert (runtime_score_short_chunks & (runtime_score_short_chunks - 1)) == 0
         candidate_scores = torch.full(
             (num_score_chunks, num_q_heads, batch_size, topk),
             float("-inf"),
@@ -1560,13 +1845,33 @@ def flash_decode_bnsd_with_topk_idx(
             topk=topk,
             USE_DIRECT_PAGE_LOOKUP=use_direct_page_lookup,
             SANITIZE_PAGE_IDS=sanitize_page_ids,
-            FILL_ONLY=(((max_seqblock + num_score_chunks - 1) // num_score_chunks) <= topk),
+            FILL_ONLY=(
+                ((max_seqblock + num_score_chunks - 1) // num_score_chunks) <= topk
+            ),
+            RUNTIME_FILL_ONLY=runtime_fill_only,
+            RUNTIME_ADAPTIVE_SCORE_CHUNKS=use_runtime_adaptive_score_chunks,
+            RUNTIME_SCORE_SHORT_MAX_BLOCKS=runtime_score_short_max_blocks,
+            RUNTIME_SCORE_SHORT_CHUNKS=runtime_score_short_chunks,
             num_warps=_SCORE_CHUNK_NW,
             num_stages=_SCORE_CHUNK_NS,
         )
-        return None, _merge_bnsd_score_topk_candidates(
-            candidate_scores, candidate_indices, topk
-        )
+        if use_runtime_adaptive_score_chunks:
+            topk_indices = _merge_bnsd_score_topk_candidates_adaptive(
+                candidate_scores,
+                candidate_indices,
+                seq_lens,
+                block_size,
+                topk,
+                stride_sl_b,
+                stride_sl_h,
+                runtime_score_short_max_blocks,
+                runtime_score_short_chunks,
+            )
+        else:
+            topk_indices = _merge_bnsd_score_topk_candidates(
+                candidate_scores, candidate_indices, topk
+            )
+        return None, topk_indices
 
     if num_kv_chunks is None:
         num_kv_chunks = _choose_num_kv_chunks(
