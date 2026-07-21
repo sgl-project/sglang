@@ -101,11 +101,15 @@ python3 -c 'import yaml' 2>/dev/null || pip install pyyaml -q 2>/dev/null \
 # Emit KEY=value lines and eval them (robust single-level command substitution;
 # avoids a nested read<<EOF/$(<<PY) heredoc that misparses on some shells).
 RECIPE_VARS="$(python3 - "$CONFIG_FILE" <<'PY'
-import sys, yaml
+import sys, yaml, shlex
 r = yaml.safe_load(open(sys.argv[1]))
 rt = r["runtime"]; b = r["backend"]["sglang_config"]; bn = r["bench"]
 res = r.get("resources", {})
 def emit(k, v): print(f"{k}={v}")
+# Quoted emit for values that may contain spaces (per-role wide-EP flag/env
+# strings). eval treats the RHS as a single shell word. Existing emits stay
+# space-free so the EP<=8 recipes are byte-identical.
+def emitq(k, v): print(f"{k}={shlex.quote(str(v))}")
 emit("IMAGE", rt["image"])
 # Attention backend: single (`attention_backend`) or split
 # (`prefill_attention_backend`/`decode_attention_backend`). Empty when absent so
@@ -124,6 +128,10 @@ emit("DIST_SOCK", rt.get("dist_socket_ifname", ""))
 # hardcoded value) so EP<=8 recipes stay byte-identical; wide-EP spur recipes
 # set mooncake, which is the validated cross-node KV path there.
 emit("XFER", rt.get("kv_transfer_backend", "mori"))
+# SGLANG_USE_ROCM700A toggles the ROCm-7.0.0-alpha codepath. Default 1 (the
+# pre-wide hardcoded value) keeps EP<=8 recipes byte-identical; the validated
+# wide-EP run on the rocm720 0715 image needs 0, set via runtime.rocm700a.
+emit("ROCM700A", rt.get("rocm700a", 1))
 emit("PPORT", rt["prefill_port"])
 emit("DPORT", rt["decode_port"])
 emit("PBOOT", rt["prefill_bootstrap_port"])
@@ -143,6 +151,29 @@ emit("PTP", b["prefill"]["tensor-parallel-size"])
 emit("DTP", b["decode"]["tensor-parallel-size"])
 emit("PEP", b["prefill"].get("expert-parallel-size", 1))
 emit("PDP", b["prefill"].get("data-parallel-size", 1))
+# Decode-side EP/DP: default to the prefill values so a recipe that omits them
+# (every EP<=8 recipe today, where both roles are identical) is byte-identical.
+# Oren's wide-EP recipes set decode EP/DP=16 while prefill stays EP8.
+emit("DEP", b["decode"].get("expert-parallel-size", b["prefill"].get("expert-parallel-size", 1)))
+emit("DDP", b["decode"].get("data-parallel-size", b["prefill"].get("data-parallel-size", 1)))
+# Wide-EP per-role overrides (optional `runtime.wide_ep` block). Absent for
+# EP<=8 recipes -> all defaults collapse to the existing single-value knobs, so
+# the generated prefill/decode argv is unchanged. Present only in the asymmetric
+# narrow-prefill/wide-decode (Oren) EP16 recipes.
+we = rt.get("wide_ep", {}) or {}
+emit("KVDTYPE", we.get("kv_cache_dtype", ""))
+emit("PMEMFRAC", we.get("prefill_mem_fraction_static", rt["mem_fraction_static"]))
+emit("DMEMFRAC", we.get("decode_mem_fraction_static", rt["mem_fraction_static"]))
+emit("PCHUNK", we.get("prefill_chunked_prefill_size", rt["chunked_prefill_size"]))
+emit("PMAXREQ", we.get("prefill_max_running_requests", rt["max_running_requests"]))
+emit("DMAXREQ", we.get("decode_max_running_requests", rt["max_running_requests"]))
+emitq("PEXTRA", we.get("prefill_extra_flags", ""))
+emitq("DEXTRA", we.get("decode_extra_flags", ""))
+emitq("WECOMMON", we.get("common_extra_flags", ""))
+def render_env(d):
+    return " ".join(f"-e {k}={v}" for k, v in (d or {}).items())
+emitq("PENV", render_env(we.get("prefill_extra_env")))
+emitq("DENV", render_env(we.get("decode_extra_env")))
 m = r.get("mtp", {}) or {}
 emit("MTP_ENABLED", 1 if m.get("enabled") else 0)
 emit("MTP_ALGO", m.get("algorithm", "EAGLE"))
@@ -186,10 +217,13 @@ DN_PER=$(( (DTP + GPUS_PER_NODE - 1) / GPUS_PER_NODE ))
 # conventional MASTER_PORT); avoids :5000, which a node-local daemon holds on
 # some clusters (spur). Overridable per environment.
 DIST_PORT="${DIST_PORT:-29500}"
-# Wide engines are only wired for 1P1D (router + bench target one P and one D);
-# multi-P/D fan-out of a wide engine is not supported.
-if (( (PN_PER > 1 || DN_PER > 1) && (PW > 1 || DW > 1) )); then
-    echo "ERROR: wide engine (nodes/engine>1) requires PW=DW=1 (got PW=$PW DW=$DW)" >&2
+# A role may have multiple single-node engines (PW>1, each PN_PER=1: the router
+# fans out over them) OR one multi-node wide engine (PN_PER>1, workers==1). What
+# is NOT wired is *multiple copies of a multi-node engine* (a wide engine with
+# workers>1), because the drive split assumes one contiguous node block per wide
+# engine and the router only knows one endpoint per wide engine.
+if (( (PN_PER > 1 && PW > 1) || (DN_PER > 1 && DW > 1) )); then
+    echo "ERROR: a wide engine (nodes/engine>1) cannot have >1 worker of that role (got PW=$PW PN_PER=$PN_PER DW=$DW DN_PER=$DN_PER)" >&2
     exit 1
 fi
 echo "recipe: image=$IMAGE attn=${ATTN:-$PATTN/$DATTN} ib=$IB ptp=$PTP dtp=$DTP pn_per=$PN_PER dn_per=$DN_PER a2a=${A2A:-<none>} concs=$CONCS isl=$ISL osl=$OSL"
@@ -246,7 +280,7 @@ fi
 DSV4_ENV=(
   -e SGLANG_DEFAULT_THINKING=1 -e SGLANG_DSV4_REASONING_EFFORT=max
   -e SGLANG_OPT_DEEPGEMM_HC_PRENORM=false -e SGLANG_USE_AITER=1
-  -e SGLANG_USE_ROCM700A=1 -e SGLANG_OPT_USE_FUSED_COMPRESS=true
+  -e SGLANG_USE_ROCM700A=$ROCM700A -e SGLANG_OPT_USE_FUSED_COMPRESS=true
   -e SGLANG_OPT_USE_FUSED_COMPRESS_TRITON=true
   -e SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton
   -e SGLANG_OPT_FP8_WO_A_GEMM=false -e SGLANG_OPT_USE_JIT_INDEXER_METADATA=false
@@ -264,20 +298,29 @@ MORI_ENV="-e MORI_DISABLE_AUTO_XGMI=1 -e NCCL_IB_HCA=ionic -e NCCL_IB_GID_INDEX=
 # Wide-EP (engine spans >1 node) adds mori all-to-all MoE tuning + the cross-node
 # torch-dist socket NIC. Gated on nodes-per-engine>1 so EP<=8 recipes are untouched.
 if (( PN_PER > 1 || DN_PER > 1 )); then
+    # TC=104 (SL=3) = the ionic lossless RoCE queue (DSCP26/pri3); TC=96 is the
+    # lossy pri0 queue (~1% BW) and wedges cross-node a2a under load. bf16
+    # dispatch/combine matches the validated wide-EP run (job 13196).
+    # The base MORI_ENV sets NCCL_IB_HCA=ionic (a spur-ism); on this fabric the
+    # IB device names are the recipe's $IB (rdma0..7), and a wide engine's
+    # cross-node TP/attention collectives ride NCCL, so point NCCL at the real
+    # HCAs. Docker last-wins => this overrides the base value for wide recipes.
     MORI_ENV="$MORI_ENV \
+-e NCCL_IB_HCA=$IB \
 -e MORI_IB_GID_INDEX=1 \
--e SGLANG_MORI_DISPATCH_DTYPE=auto -e SGLANG_MORI_COMBINE_DTYPE=auto \
+-e SGLANG_MORI_DISPATCH_DTYPE=bf16 -e SGLANG_MORI_COMBINE_DTYPE=bf16 \
 -e SGLANG_MORI_QP_PER_TRANSFER=4 -e SGLANG_MORI_NUM_WORKERS=4 \
 -e MORI_IO_SQ_BACKOFF_TIMEOUT_US=50000 -e MORI_IO_QP_MAX_SEND_WR=16384 \
 -e MORI_IO_QP_MAX_CQE=32768 -e MORI_IO_QP_MAX_SGE=4 \
 -e MORI_SHMEM_MODE=ISOLATION -e MORI_EP_LAUNCH_CONFIG_MODE=AUTO -e MORI_APP_LOG_LEVEL=INFO \
--e MORI_RDMA_SL=3 -e MORI_RDMA_TC=96 -e MORI_IO_SL=3 -e MORI_IO_TC=96 -e MORI_IO_TC_DISABLE=0 \
+-e MORI_RDMA_SL=3 -e MORI_RDMA_TC=104 -e MORI_IO_SL=3 -e MORI_IO_TC=104 -e MORI_IO_TC_DISABLE=0 \
 -e SGLANG_MORI_DISPATCH_INTER_KERNEL_SWITCH_THRESHOLD=4096 \
 -e SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1 \
 -e SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=3600 -e SGLANG_DISAGGREGATION_WAITING_TIMEOUT=3600 \
--e SGLANG_DISAGGREGATION_NUM_PRE_ALLOCATE_REQS=32 -e SGLANG_EAGER_INPUT_NO_COPY=true"
+-e SGLANG_DISAGGREGATION_NUM_PRE_ALLOCATE_REQS=32 -e SGLANG_EAGER_INPUT_NO_COPY=true \
+-e MORI_BOOTSTRAP_TIMEOUT=300"
     if [[ -n "$DIST_SOCK" ]]; then
-        MORI_ENV="$MORI_ENV -e GLOO_SOCKET_IFNAME=$DIST_SOCK -e NCCL_SOCKET_IFNAME=$DIST_SOCK"
+        MORI_ENV="$MORI_ENV -e GLOO_SOCKET_IFNAME=$DIST_SOCK -e NCCL_SOCKET_IFNAME=$DIST_SOCK -e MORI_SOCKET_IFNAME=$DIST_SOCK"
     fi
 fi
 
@@ -310,25 +353,47 @@ with open(sys.argv[2], "w") as f:
 PY
 
 # Optional topology / speculative-decode flags driven by the recipe. Base recipes
-# (EP1/DP1, no mtp) leave EXTRA_FLAGS empty, preserving prior behavior exactly.
-EXTRA_FLAGS=""
-(( PDP > 1 )) && EXTRA_FLAGS="$EXTRA_FLAGS --enable-dp-attention --dp-size $PDP"
-(( PEP > 1 )) && EXTRA_FLAGS="$EXTRA_FLAGS --ep-size $PEP"
-# Wide-EP MoE all-to-all backend (mori on AMD); only set by wide-EP recipes.
-[[ -n "$A2A" ]] && EXTRA_FLAGS="$EXTRA_FLAGS --moe-a2a-backend $A2A --deepep-mode normal"
-[[ -n "$MAXTOK" ]] && EXTRA_FLAGS="$EXTRA_FLAGS --max-total-tokens $MAXTOK"
+# (EP1/DP1, no mtp) leave the extra strings empty, preserving prior behavior.
+#
+# EP/DP are now PER ROLE: the DP-attention + ep-size flags come from PDP/PEP for
+# prefill and DDP/DEP for decode. For every EP<=8 recipe DDP==PDP and DEP==PEP
+# (decode inherits prefill), so both role strings equal the old single EXTRA_FLAGS
+# and the generated argv is byte-identical. Oren's wide-EP recipes set decode
+# EP/DP=16 while prefill stays EP8.
+PREFILL_DPEP=""
+(( PDP > 1 )) && PREFILL_DPEP="$PREFILL_DPEP --enable-dp-attention --dp-size $PDP"
+(( PEP > 1 )) && PREFILL_DPEP="$PREFILL_DPEP --ep-size $PEP"
+DECODE_DPEP=""
+(( DDP > 1 )) && DECODE_DPEP="$DECODE_DPEP --enable-dp-attention --dp-size $DDP"
+(( DEP > 1 )) && DECODE_DPEP="$DECODE_DPEP --ep-size $DEP"
+# Flags shared by both roles (a2a backend, mtp). --max-total-tokens stays here for
+# non-wide recipes; wide recipes carry a per-role prefill_max_total via wide_ep.
+EXTRA_COMMON=""
+[[ -n "$A2A" ]] && EXTRA_COMMON="$EXTRA_COMMON --moe-a2a-backend $A2A --deepep-mode normal"
+[[ -n "$MAXTOK" ]] && EXTRA_COMMON="$EXTRA_COMMON --max-total-tokens $MAXTOK"
 if [[ "$MTP_ENABLED" == "1" ]]; then
-    EXTRA_FLAGS="$EXTRA_FLAGS --speculative-algorithm $MTP_ALGO \
+    EXTRA_COMMON="$EXTRA_COMMON --speculative-algorithm $MTP_ALGO \
 --speculative-num-steps $MTP_STEPS --speculative-eagle-topk $MTP_TOPK \
 --speculative-num-draft-tokens $MTP_DRAFT"
     # EAGLE3 (and other draft-model algos) need an external draft checkpoint;
     # built-in EAGLE (DSV4) omits draft_model_path and this stays unset.
     if [[ -n "$MTP_DRAFT_PATH" ]]; then
         DRAFT_RESOLVED="$(resolve_snapshot "$MTP_DRAFT_PATH")" || exit 1
-        EXTRA_FLAGS="$EXTRA_FLAGS --speculative-draft-model-path $DRAFT_RESOLVED"
+        EXTRA_COMMON="$EXTRA_COMMON --speculative-draft-model-path $DRAFT_RESOLVED"
     fi
 fi
-echo "extra flags: ${EXTRA_FLAGS:-<none>} (pep=$PEP pdp=$PDP mtp=$MTP_ENABLED algo=$MTP_ALGO)"
+# Prefix a leading space only when the arg is non-empty (keeps EP<=8 argv byte-
+# identical: the wide-only strings are empty and contribute nothing).
+sp() { [[ -n "$1" ]] && printf ' %s' "$1"; return 0; }
+# --kv-cache-dtype is emitted only when the recipe sets wide_ep.kv_cache_dtype;
+# the pre-wide DSV4 path had no such flag, so EP<=8 recipes omit it.
+KV_FLAG=""
+[[ -n "$KVDTYPE" ]] && KV_FLAG=" --kv-cache-dtype $KVDTYPE"
+# Assemble the per-role tail: role DP/EP + shared + wide common + role-specific
+# wide extras. All wide pieces (WECOMMON/PEXTRA/DEXTRA) are empty for EP<=8.
+PREFILL_TAIL="$PREFILL_DPEP$EXTRA_COMMON$(sp "$WECOMMON")$(sp "$PEXTRA")"
+DECODE_TAIL="$DECODE_DPEP$EXTRA_COMMON$(sp "$WECOMMON")$(sp "$DEXTRA")"
+echo "prefill tail:${PREFILL_TAIL:-<none>} | decode tail:${DECODE_TAIL:-<none>} (pep=$PEP pdp=$PDP dep=$DEP ddp=$DDP mtp=$MTP_ENABLED)"
 
 if [[ "$HAS_MODEL" == "1" ]]; then
     # Generic path (e.g. Kimi): attention + swa from the recipe, model parsers /
@@ -341,25 +406,46 @@ if [[ "$HAS_MODEL" == "1" ]]; then
     [[ -n "$DATTN" ]] && ATTN_FLAGS="$ATTN_FLAGS --decode-attention-backend $DATTN"
     SWA_FLAG=""
     [[ -n "$SWA" ]] && SWA_FLAG=" --swa-full-tokens-ratio $SWA"
-    COMMON_FLAGS="--trust-remote-code --tp $PTP --disable-radix-cache \
-$ATTN_FLAGS --max-running-requests $MAXREQ --page-size $PAGE \
---mem-fraction-static $MEMFRAC$SWA_FLAG \
+    PREFILL_COMMON_FLAGS="--trust-remote-code --tp $PTP --disable-radix-cache \
+$ATTN_FLAGS --max-running-requests $PMAXREQ --page-size $PAGE \
+--mem-fraction-static $PMEMFRAC$SWA_FLAG \
+--chunked-prefill-size $PCHUNK \
+--disaggregation-transfer-backend $XFER --disaggregation-ib-device $IB$KV_FLAG$PREFILL_TAIL"
+    DECODE_COMMON_FLAGS="--trust-remote-code --tp $DTP --disable-radix-cache \
+$ATTN_FLAGS --max-running-requests $DMAXREQ --page-size $PAGE \
+--mem-fraction-static $DMEMFRAC$SWA_FLAG \
 --chunked-prefill-size $CHUNK \
---disaggregation-transfer-backend $XFER --disaggregation-ib-device $IB$EXTRA_FLAGS"
+--disaggregation-transfer-backend $XFER --disaggregation-ib-device $IB$KV_FLAG$DECODE_TAIL"
 else
-    # DSV4 path: byte-identical to the pre-Kimi launcher.
-    COMMON_FLAGS="--trust-remote-code --tp $PTP --disable-radix-cache \
---attention-backend $ATTN --max-running-requests $MAXREQ --page-size $PAGE \
---mem-fraction-static $MEMFRAC --swa-full-tokens-ratio $SWA \
+    # DSV4 path: for EP<=8 recipes (PTP==DTP, no wide_ep) both role strings equal
+    # the pre-Kimi launcher's COMMON_FLAGS exactly.
+    PREFILL_COMMON_FLAGS="--trust-remote-code --tp $PTP --disable-radix-cache \
+--attention-backend $ATTN --max-running-requests $PMAXREQ --page-size $PAGE \
+--mem-fraction-static $PMEMFRAC --swa-full-tokens-ratio $SWA \
+--chunked-prefill-size $PCHUNK --disable-shared-experts-fusion \
+--tool-call-parser deepseekv4 --reasoning-parser deepseek-v4 \
+--disaggregation-transfer-backend $XFER --disaggregation-ib-device $IB$KV_FLAG$PREFILL_TAIL"
+    DECODE_COMMON_FLAGS="--trust-remote-code --tp $DTP --disable-radix-cache \
+--attention-backend $ATTN --max-running-requests $DMAXREQ --page-size $PAGE \
+--mem-fraction-static $DMEMFRAC --swa-full-tokens-ratio $SWA \
 --chunked-prefill-size $CHUNK --disable-shared-experts-fusion \
 --tool-call-parser deepseekv4 --reasoning-parser deepseek-v4 \
---disaggregation-transfer-backend $XFER --disaggregation-ib-device $IB$EXTRA_FLAGS"
+--disaggregation-transfer-backend $XFER --disaggregation-ib-device $IB$KV_FLAG$DECODE_TAIL"
 fi
 
 DOCKER_COMMON="--rm --network host --ipc host --shm-size 32g --privileged \
 --security-opt seccomp=unconfined \
 --device /dev/kfd --device /dev/dri --device /dev/infiniband \
 -v /it-share:/it-share:ro -v $HOME:/host_home $CHECKOUT_DOCKER_ARGS"
+# Optional extra docker args (e.g. bind-mounting a locally-built lib for
+# validation). Empty by default so the docker argv is byte-identical otherwise.
+[[ -n "${EXTRA_DOCKER_ARGS:-}" ]] && DOCKER_COMMON="$DOCKER_COMMON ${EXTRA_DOCKER_ARGS}"
+
+# Per-role wide-EP docker env (MORI dispatch-token tuning etc.). Empty for EP<=8
+# recipes; carries its own leading space so an empty value leaves the docker argv
+# byte-identical (no stray double space).
+PENV_ARG=""; [[ -n "$PENV" ]] && PENV_ARG=" $PENV"
+DENV_ARG=""; [[ -n "$DENV" ]] && DENV_ARG=" $DENV"
 
 # ---------------------------------------------------------------------------
 # Write per-role scripts that srun dispatches to each compute node.
@@ -530,7 +616,7 @@ if [[ "\${NNODES:-1}" != "1" ]]; then
 fi
 exec python3 -m sglang.launch_server \
   --model-path $MODEL_PATH --host 0.0.0.0 --port $PPORT \
-  $COMMON_FLAGS "\${MODEL_SERVER_ARGS[@]}" \$DIST_ARGS \
+  $PREFILL_COMMON_FLAGS "\${MODEL_SERVER_ARGS[@]}" \$DIST_ARGS \
   --disaggregation-mode prefill --disaggregation-bootstrap-port $PBOOT
 EOF
 
@@ -549,7 +635,7 @@ if [[ "\${NNODES:-1}" != "1" ]]; then
 fi
 exec python3 -m sglang.launch_server \
   --model-path $MODEL_PATH --host 0.0.0.0 --port $DPORT \
-  $COMMON_FLAGS "\${MODEL_SERVER_ARGS[@]}" \$DIST_ARGS \
+  $DECODE_COMMON_FLAGS "\${MODEL_SERVER_ARGS[@]}" \$DIST_ARGS \
   --disaggregation-mode decode --disaggregation-bootstrap-port $DBOOT
 EOF
 
@@ -573,7 +659,7 @@ docker run $DOCKER_COMMON --name mi355x_prefill \
   -e HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
   -e NODE_RANK="\$NODE_RANK" -e NNODES="\$NNODES" -e DIST_ADDR="\$DIST_ADDR" -e DIST_PORT=${DIST_PORT} \
   "\${IONIC_MOUNTS[@]}" \
-  $MORI_ENV $DSV4_ENV_STR "\${MODEL_ENV_ARGS[@]}" \
+  $MORI_ENV$PENV_ARG $DSV4_ENV_STR "\${MODEL_ENV_ARGS[@]}" \
   $IMAGE bash /host_home/.mi355x_ci/${MATRIX_CONFIG_NAME}/prefill_entry.sh
 EOF
 
@@ -587,7 +673,7 @@ docker run $DOCKER_COMMON --name mi355x_decode \
   -e HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
   -e NODE_RANK="\$NODE_RANK" -e NNODES="\$NNODES" -e DIST_ADDR="\$DIST_ADDR" -e DIST_PORT=${DIST_PORT} \
   "\${IONIC_MOUNTS[@]}" \
-  $MORI_ENV $DSV4_ENV_STR "\${MODEL_ENV_ARGS[@]}" \
+  $MORI_ENV$DENV_ARG $DSV4_ENV_STR "\${MODEL_ENV_ARGS[@]}" \
   $IMAGE bash /host_home/.mi355x_ci/${MATRIX_CONFIG_NAME}/decode_entry.sh
 EOF
 
@@ -605,7 +691,7 @@ if [[ "\${SGLANG_USE_CHECKOUT_RUNTIME:-1}" != "0" ]]; then
 fi
 exec python3 -m sglang.launch_server \
   --model-path $MODEL_PATH --host 0.0.0.0 --port $PPORT \
-  $COMMON_FLAGS "\${MODEL_SERVER_ARGS[@]}" \
+  $PREFILL_COMMON_FLAGS "\${MODEL_SERVER_ARGS[@]}" \
   --disaggregation-mode prefill --disaggregation-bootstrap-port $PBOOT
 EOF
 
@@ -620,7 +706,7 @@ if [[ "\${SGLANG_USE_CHECKOUT_RUNTIME:-1}" != "0" ]]; then
 fi
 exec python3 -m sglang.launch_server \
   --model-path $MODEL_PATH --host 0.0.0.0 --port $DPORT \
-  $COMMON_FLAGS "\${MODEL_SERVER_ARGS[@]}" \
+  $DECODE_COMMON_FLAGS "\${MODEL_SERVER_ARGS[@]}" \
   --disaggregation-mode decode --disaggregation-bootstrap-port $DBOOT
 EOF
 
@@ -629,7 +715,7 @@ EOF
 source "$WORKDIR/model_flags.sh"
 docker rm -f mi355x_prefill 2>/dev/null || true
 docker run $DOCKER_COMMON --name mi355x_prefill \
-  -e HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 $MORI_ENV $DSV4_ENV_STR "\${MODEL_ENV_ARGS[@]}" \
+  -e HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 $MORI_ENV$PENV_ARG $DSV4_ENV_STR "\${MODEL_ENV_ARGS[@]}" \
   $IMAGE bash /host_home/.mi355x_ci/${MATRIX_CONFIG_NAME}/prefill_entry.sh
 EOF
 
@@ -638,7 +724,7 @@ EOF
 source "$WORKDIR/model_flags.sh"
 docker rm -f mi355x_decode 2>/dev/null || true
 docker run $DOCKER_COMMON --name mi355x_decode \
-  -e HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 $MORI_ENV $DSV4_ENV_STR "\${MODEL_ENV_ARGS[@]}" \
+  -e HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 $MORI_ENV$DENV_ARG $DSV4_ENV_STR "\${MODEL_ENV_ARGS[@]}" \
   $IMAGE bash /host_home/.mi355x_ci/${MATRIX_CONFIG_NAME}/decode_entry.sh
 EOF
 fi
@@ -659,14 +745,38 @@ if not (t and t.strip()):
 print("[probe] ok:", t[:80].replace("\n", " "))
 PY
 
+# Prefill health-wait + router --prefill args. For PW=1 this is a single endpoint
+# (byte-identical to the pre-fan-out launcher); for PW>1 it iterates the comma-
+# separated engine node0 IPs in PCSV ($3), health-waits each, and passes one
+# --prefill per engine so the router fans requests across all prefill engines.
+if (( PW > 1 )); then
+  PREFILL_WAIT_ROUTER="    IFS=',' read -ra PIPS <<< \"\${PCSV:-\$PIP}\"
+    PREFILL_ARGS=\"\"
+    for pip in \"\${PIPS[@]}\"; do
+      echo \"[wait] prefill \$pip\"; for i in \$(seq 1 600); do curl -sf http://\$pip:$PPORT/health >/dev/null && break; sleep 5; done
+      PREFILL_ARGS=\"\$PREFILL_ARGS --prefill http://\$pip:$PPORT $PBOOT\"
+    done
+    echo \"[wait] decode\";  for i in \$(seq 1 600); do curl -sf http://\$DIP:$DPORT/health >/dev/null && break; sleep 5; done
+    python3 -m sglang_router.launch_router \\
+      --pd-disaggregation \\
+      \$PREFILL_ARGS \\
+      --decode http://\$DIP:$DPORT \\
+      --host 0.0.0.0 --port $LBPORT \\
+      --disable-circuit-breaker &"
+else
+  PREFILL_WAIT_ROUTER="    echo \"[wait] prefill\"; for i in \$(seq 1 600); do curl -sf http://\$PIP:$PPORT/health >/dev/null && break; sleep 5; done
+    echo \"[wait] decode\";  for i in \$(seq 1 600); do curl -sf http://\$DIP:$DPORT/health >/dev/null && break; sleep 5; done
+    python3 -m sglang_router.launch_router       --pd-disaggregation       --prefill http://\$PIP:$PPORT $PBOOT       --decode http://\$DIP:$DPORT       --host 0.0.0.0 --port $LBPORT       --disable-circuit-breaker &"
+fi
+
 # Bench script runs on the prefill node; \$PIP/\$DIP injected at srun time.
 cat > "$WORKDIR/bench.sh" <<EOF
 #!/bin/bash
 set -e
-PIP=\$1; DIP=\$2
+PIP=\$1; DIP=\$2; PCSV=\${3:-\$PIP}
 docker rm -f mi355x_bench 2>/dev/null || true
 docker run $DOCKER_COMMON --name mi355x_bench \
-  -e PIP=\$PIP -e DIP=\$DIP \
+  -e PIP=\$PIP -e DIP=\$DIP -e PCSV=\$PCSV \
   $IMAGE bash -lc '
     CIDIR=/host_home/.mi355x_ci/${MATRIX_CONFIG_NAME}
     bash \$CIDIR/install_checkout_sglang.sh
@@ -676,14 +786,7 @@ docker run $DOCKER_COMMON --name mi355x_bench \
       export PYTHONPATH=/sgl-workspace/sglang/python:\${PYTHONPATH:-}
     fi
     bash \$CIDIR/install_checkout_router.sh
-    echo "[wait] prefill"; for i in \$(seq 1 600); do curl -sf http://\$PIP:$PPORT/health >/dev/null && break; sleep 5; done
-    echo "[wait] decode";  for i in \$(seq 1 600); do curl -sf http://\$DIP:$DPORT/health >/dev/null && break; sleep 5; done
-    python3 -m sglang_router.launch_router \
-      --pd-disaggregation \
-      --prefill http://\$PIP:$PPORT $PBOOT \
-      --decode http://\$DIP:$DPORT \
-      --host 0.0.0.0 --port $LBPORT \
-      --disable-circuit-breaker &
+$PREFILL_WAIT_ROUTER
     for i in \$(seq 1 30); do curl -sf http://127.0.0.1:$LBPORT/health >/dev/null && break; sleep 2; done
     echo "[probe] PD end-to-end check via LB"
     curl -sf -X POST http://127.0.0.1:$LBPORT/generate \
@@ -734,21 +837,56 @@ chmod +x "$WORKDIR"/*.sh
 cat > "$WORKDIR/drive.sh" <<'DRIVE'
 #!/bin/bash
 set -x
-WORKDIR="$1"; PW="${2:-1}"; DW="${3:-1}"; PN_PER="${4:-1}"; DN_PER="${5:-1}"
+WORKDIR="$1"; PW="${2:-1}"; DW="${3:-1}"; PN_PER="${4:-1}"; DN_PER="${5:-1}"; DIST_NIC="${6:-}"
 mapfile -t NODES < <(scontrol show hostnames "$SLURM_JOB_NODELIST")
+# Resolve a node's IP. When a cross-node dist NIC is named (wide engines set
+# $DIST_NIC to the recipe's dist_socket_ifname), read the address off that
+# interface on the node itself -- the multi-node dist-init-addr must be a
+# LOCALLY-BINDABLE IP (torch-dist + tokenizer ZMQ bind to it), and a node's
+# forward DNS can be stale/point at a non-local mgmt alias (observed: a decode
+# root whose hostname resolved to an unpingable IP, ZMQ bind => "Cannot assign
+# requested address"). Fall back to getent if the interface lookup is empty.
+# $DIST_NIC empty (every EP<=8 recipe) => getent path only => unchanged behavior.
+resolve_ip() {
+  local n="$1" ip=""
+  if [[ -n "$DIST_NIC" ]]; then
+    ip=$(srun --overlap -N1 --nodelist="$n" ip -4 -o addr show "$DIST_NIC" 2>/dev/null \
+           | awk '{print $4}' | cut -d/ -f1 | head -1)
+  fi
+  [[ -z "$ip" ]] && ip=$(getent ahostsv4 "$n" | head -1 | awk '{print $1}')
+  echo "$ip"
+}
+# SLURM canonicalizes (sorts) SLURM_JOB_NODELIST, so the requested --nodelist
+# order is already lost here. To keep a "slow-root" node out of any engine's
+# rank0 slot -- e.g. mia1-p01-g20, whose MORI EP bootstrap reaches the connect
+# stage ~16s late and loses the hardcoded 10s worker-connect race whenever it is
+# rank0 -- push every node named in SLURM_DIST_TAIL to the END of the list. It
+# then lands in a trailing decode-worker position, where its late ranks connect
+# into the decode root's 30s accept window (harmless). Comma-separated; unmatched
+# names ignored; empty (every EP<=8 recipe) => no-op, order unchanged.
+if [[ -n "${SLURM_DIST_TAIL:-}" ]]; then
+  IFS=',' read -ra _TAIL <<< "$SLURM_DIST_TAIL"
+  _HEAD=(); _TL=()
+  for n in "${NODES[@]}"; do
+    _skip=0; for t in "${_TAIL[@]}"; do [[ "$n" == "$t" ]] && { _skip=1; break; }; done
+    if (( _skip )); then _TL+=("$n"); else _HEAD+=("$n"); fi
+  done
+  NODES=("${_HEAD[@]}" "${_TL[@]}")
+  echo "[drive] SLURM_DIST_TAIL=$SLURM_DIST_TAIL -> node order: ${NODES[*]}"
+fi
 # Each engine may span PN_PER/DN_PER nodes (ceil(TP/GPUs-per-node)); PN_PER=1 for
 # EP<=8 so this reduces to the original one-node-per-worker split.
 PN_TOTAL=$((PW * PN_PER)); DN_TOTAL=$((DW * DN_PER))
 PNODES=("${NODES[@]:0:PN_TOTAL}")
 DNODES=("${NODES[@]:PN_TOTAL:DN_TOTAL}")
 PNODE="${PNODES[0]}"; DNODE="${DNODES[0]}"
-PIP=$(getent ahostsv4 "$PNODE" | head -1 | awk '{print $1}')
-DIP=$(getent ahostsv4 "$DNODE" | head -1 | awk '{print $1}')
+PIP=$(resolve_ip "$PNODE")
+DIP=$(resolve_ip "$DNODE")
 echo "[drive] prefill nodes: ${PNODES[*]} ; decode nodes: ${DNODES[*]}"
 echo "[drive] bench targets prefill=$PNODE($PIP) decode=$DNODE($DIP)"
-if (( PW > 1 || DW > 1 )); then
-  echo "[drive] NOTE: router + bench use the first prefill and first decode only;"
-  echo "[drive]       multi-prefill/multi-decode fan-out is not wired yet (LB work)."
+if (( DW > 1 )); then
+  echo "[drive] NOTE: router + bench use the first decode engine only;"
+  echo "[drive]       multi-decode fan-out is not wired yet (LB work)."
 fi
 # Each server's srun runs here on the login node and returns exactly when its
 # compute-node container exits. Wrap it so the return code lands in a marker
@@ -757,23 +895,37 @@ fi
 # died and with what code. (A hung-but-alive server is NOT caught here; that is
 # bounded by bench.sh's health-wait timeout.)
 rm -f "$WORKDIR"/server_exit_* "$WORKDIR/bench_exit"
-i=0
-for n in "${PNODES[@]}"; do
-  ( srun --overlap -N1 --nodelist="$n" bash "$WORKDIR/prefill.sh" "$i" "$PN_PER" "$PIP" > "$WORKDIR/prefill_$n.log" 2>&1
-    echo "prefill@$n rc=$?" > "$WORKDIR/server_exit_prefill_$n" ) &
-  i=$((i+1))
+# Launch PW prefill engines; each spans PN_PER nodes as its own torch-dist group
+# (engine node0 = dist-init addr; node_rank = position WITHIN the engine, so an
+# engine's ranks are 0..PN_PER-1, not a global index). PN_PER=1 => NNODES=1 in
+# the entry script => dist args dropped => byte-identical single-node launch.
+# Collect each engine's node0 IP into PCSV for the router's prefill fan-out.
+PCSV=""
+for ((k=0; k<PW; k++)); do
+  e0="${PNODES[k*PN_PER]}"
+  eip=$(resolve_ip "$e0")
+  PCSV="${PCSV:+$PCSV,}$eip"
+  for ((j=0; j<PN_PER; j++)); do
+    n="${PNODES[k*PN_PER + j]}"
+    ( srun --overlap -N1 --nodelist="$n" bash "$WORKDIR/prefill.sh" "$j" "$PN_PER" "$eip" > "$WORKDIR/prefill_$n.log" 2>&1
+      echo "prefill@$n rc=$?" > "$WORKDIR/server_exit_prefill_$n" ) &
+  done
 done
-i=0
-for n in "${DNODES[@]}"; do
-  ( srun --overlap -N1 --nodelist="$n" bash "$WORKDIR/decode.sh" "$i" "$DN_PER" "$DIP" > "$WORKDIR/decode_$n.log" 2>&1
-    echo "decode@$n rc=$?" > "$WORKDIR/server_exit_decode_$n" ) &
-  i=$((i+1))
+for ((k=0; k<DW; k++)); do
+  e0="${DNODES[k*DN_PER]}"
+  eip=$(resolve_ip "$e0")
+  for ((j=0; j<DN_PER; j++)); do
+    n="${DNODES[k*DN_PER + j]}"
+    ( srun --overlap -N1 --nodelist="$n" bash "$WORKDIR/decode.sh" "$j" "$DN_PER" "$eip" > "$WORKDIR/decode_$n.log" 2>&1
+      echo "decode@$n rc=$?" > "$WORKDIR/server_exit_decode_$n" ) &
+  done
 done
+echo "[drive] prefill engine endpoints (fan-out): $PCSV"
 sleep 5
 # Bench in the background with its own marker, so the wait loop is purely file
 # based: finish when bench writes its marker, abort if any server marker shows up
 # first (a server died before the sweep completed).
-( srun --overlap -N1 --nodelist="$PNODE" bash "$WORKDIR/bench.sh" "$PIP" "$DIP" > "$WORKDIR/bench.log" 2>&1
+( srun --overlap -N1 --nodelist="$PNODE" bash "$WORKDIR/bench.sh" "$PIP" "$DIP" "$PCSV" > "$WORKDIR/bench.log" 2>&1
   echo $? > "$WORKDIR/bench_exit" ) &
 BENCH_BG=$!
 # Stream bench output live and poll the markers with xtrace OFF, so the console
@@ -832,7 +984,7 @@ JOB_NAME="mi355x-ci-${RUNNER_NAME:-norunner}-${GITHUB_RUN_ID:-0}-${MATRIX_CONFIG
 set +e
 salloc -p "$SLURM_PARTITION" -N"$TOTAL_NODES" "${NODELIST_ARG[@]}" "${EXCLUDE_ARG[@]}" "${EXCLUSIVE_ARG[@]}" \
     --job-name "$JOB_NAME" -t "$TIME_LIMIT" \
-    bash "$WORKDIR/drive.sh" "$WORKDIR" "$PW" "$DW" "$PN_PER" "$DN_PER"
+    bash "$WORKDIR/drive.sh" "$WORKDIR" "$PW" "$DW" "$PN_PER" "$DN_PER" "$DIST_SOCK"
 SALLOC_RC=$?
 set -e
 
@@ -879,12 +1031,18 @@ fi
 #   median_e2e_latency_ms      ->  median_e2el_ms              (E2E latency; /1000 -> s)
 #   (none; injected here)      ->  model_id                    (served model, from $MODEL_PATH)
 # ---------------------------------------------------------------------------
-TOTAL_GPUS=$((PTP + DTP))
+# GPU counts are per-ROLE totals across all engines: PW prefill engines of PTP
+# GPUs each, DW decode engines of DTP each. For EP<=8 (PW=DW=1) this is PTP/DTP
+# exactly, so the filename fields are unchanged. process_result.py reads the
+# _ctx_/_gen_ fields as PREFILL_GPUS/DECODE_GPUS for its per-GPU throughput math,
+# so they must be the role totals (Oren EP16: ctx=2*8=16, gen=1*16=16, gpus=32).
+PREFILL_GPUS_TOTAL=$((PW * PTP)); DECODE_GPUS_TOTAL=$((DW * DTP))
+TOTAL_GPUS=$((PREFILL_GPUS_TOTAL + DECODE_GPUS_TOTAL))
 PROCESSED=0
 for C in ${CONCS//,/ }; do
     RAW="$WORKDIR/raw_conc${C}.json"
     [[ -f "$RAW" ]] || { echo "WARN: missing $RAW"; continue; }
-    DEST="$GITHUB_WORKSPACE/${RESULT_FILENAME}_${MATRIX_CONFIG_NAME}_conc${C}_gpus_${TOTAL_GPUS}_ctx_${PTP}_gen_${DTP}.json"
+    DEST="$GITHUB_WORKSPACE/${RESULT_FILENAME}_${MATRIX_CONFIG_NAME}_conc${C}_gpus_${TOTAL_GPUS}_ctx_${PREFILL_GPUS_TOTAL}_gen_${DECODE_GPUS_TOTAL}.json"
     MODEL_ID="$MODEL_PATH" python3 - "$RAW" "$DEST" "$C" <<'PY'
 import json, os, sys
 raw_path, dest, conc = sys.argv[1], sys.argv[2], int(sys.argv[3])
