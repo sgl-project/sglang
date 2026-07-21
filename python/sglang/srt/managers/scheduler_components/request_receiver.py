@@ -14,8 +14,8 @@ from typing import (
 import zmq
 from torch.distributed import barrier
 
-import sglang.srt.environ as envs
 from sglang.srt.disaggregation.utils import prepare_abort
+from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
