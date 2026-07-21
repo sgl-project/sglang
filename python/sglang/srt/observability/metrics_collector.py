@@ -1052,7 +1052,11 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         enable_hierarchical_cache: bool,
     ) -> SchedulerMetricsCollectorContext:
         enable_metrics = server_args.enable_metrics
-        is_stats_logging_rank = ps.attn_tp_rank == 0
+        # Only one rank per attention replica should export request-level
+        # gauges. Context-parallel ranks each hold a shard of the same
+        # global request, so counting on every CP rank multiplies
+        # num_running_reqs (and similar) by attn_cp_size (issue #31896).
+        is_stats_logging_rank = ps.attn_tp_rank == 0 and ps.attn_cp_rank == 0
         current_scheduler_metrics_enabled = enable_metrics and (
             is_stats_logging_rank or server_args.enable_metrics_for_all_schedulers
         )
