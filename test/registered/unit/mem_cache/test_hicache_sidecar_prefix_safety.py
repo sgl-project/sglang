@@ -37,44 +37,43 @@ NUM_PAGES = 8
 
 
 class TestUpdateExtraPoolHitPages(CustomTestCase):
-    def test_all_pages_pool_uses_leading_contiguous_count(self):
-        result = PoolTransferResult.empty()
-        transfer = PoolTransfer(
-            name=PoolName.INDEXER,
-            hit_policy=PoolHitPolicy.ALL_PAGES,
-            indices_from_pool=PoolName.KV,
-        )
-        # gap in the middle truncates to the leading run, not summed
-        result.update_extra_pool_hit_pages(
-            {PoolName.INDEXER: [True, False, True, True]}, [transfer]
-        )
-        self.assertEqual(result.extra_pool_hit_pages[PoolName.INDEXER], 1)
+    """update_extra_pool_hit_pages records both stats unconditionally: sum for
+    TRAILING_PAGES consumers, contiguous prefix for ALL_PAGES consumers."""
 
-    def test_all_pages_pool_all_true_counts_full_length(self):
+    def test_mid_hole_sum_and_prefix_diverge(self):
         result = PoolTransferResult.empty()
-        transfer = PoolTransfer(
-            name=PoolName.INDEXER, hit_policy=PoolHitPolicy.ALL_PAGES
-        )
         result.update_extra_pool_hit_pages(
-            {PoolName.INDEXER: [True, True, True]}, [transfer]
+            {PoolName.INDEXER: [True, False, True, True]}
         )
         self.assertEqual(result.extra_pool_hit_pages[PoolName.INDEXER], 3)
+        self.assertEqual(result.extra_pool_hit_prefix[PoolName.INDEXER], 1)
 
-    def test_trailing_pages_pool_keeps_sum_semantics(self):
+    def test_all_true_sum_and_prefix_equal_full_length(self):
         result = PoolTransferResult.empty()
-        transfer = PoolTransfer(
-            name=PoolName.SWA, hit_policy=PoolHitPolicy.TRAILING_PAGES
-        )
+        result.update_extra_pool_hit_pages({PoolName.INDEXER: [True, True, True]})
+        self.assertEqual(result.extra_pool_hit_pages[PoolName.INDEXER], 3)
+        self.assertEqual(result.extra_pool_hit_prefix[PoolName.INDEXER], 3)
+
+    def test_leading_miss_prefix_zero_sum_nonzero(self):
+        result = PoolTransferResult.empty()
         result.update_extra_pool_hit_pages(
-            {PoolName.SWA: [True, False, True, True]}, [transfer]
+            {PoolName.INDEXER: [False, True, True, True]}
         )
-        # TRAILING_PAGES keeps sum semantics (unchanged)
-        self.assertEqual(result.extra_pool_hit_pages[PoolName.SWA], 3)
+        self.assertEqual(result.extra_pool_hit_pages[PoolName.INDEXER], 3)
+        self.assertEqual(result.extra_pool_hit_prefix[PoolName.INDEXER], 0)
 
-    def test_missing_pool_transfers_falls_back_to_sum(self):
+    def test_multiple_pools_tracked_independently(self):
         result = PoolTransferResult.empty()
-        result.update_extra_pool_hit_pages({PoolName.INDEXER: [True, False, True]})
+        result.update_extra_pool_hit_pages(
+            {
+                PoolName.INDEXER: [True, False, True],
+                PoolName.SWA: [True, True, True],
+            }
+        )
+        self.assertEqual(result.extra_pool_hit_prefix[PoolName.INDEXER], 1)
+        self.assertEqual(result.extra_pool_hit_prefix[PoolName.SWA], 3)
         self.assertEqual(result.extra_pool_hit_pages[PoolName.INDEXER], 2)
+        self.assertEqual(result.extra_pool_hit_pages[PoolName.SWA], 3)
 
 
 class TestClampPrefixToSidecarCoverage(CustomTestCase):
@@ -113,10 +112,10 @@ class TestClampPrefixToSidecarCoverage(CustomTestCase):
         self.assertEqual(safe, 8)
 
 
-class TestPageTransferFetchesSidecarForPartialCompletion(CustomTestCase):
-    """Sidecar fetch must run even when the KV batch completes partially."""
+class TestPageTransferSkipsSidecarOnPartialCompletion(CustomTestCase):
+    """Sidecar fetch is skipped when the KV batch completes partially."""
 
-    def test_partial_kv_completion_still_fetches_sidecar(self):
+    def test_partial_kv_completion_skips_sidecar_fetch(self):
         controller = object.__new__(HybridCacheController)
         controller.page_size = PAGE_SIZE
 
@@ -154,16 +153,12 @@ class TestPageTransferFetchesSidecarForPartialCompletion(CustomTestCase):
         ):
             HybridCacheController._page_transfer(controller, op)
 
-        self.assertEqual(len(backend.calls), 1)
-        self.assertEqual(backend.calls[0], [(PoolName.INDEXER, completed_pages)])
+        self.assertEqual(backend.calls, [])
         self.assertTrue(op.pool_transfers_done)
-        self.assertEqual(
-            op.pool_storage_result.extra_pool_hit_pages[PoolName.INDEXER],
-            completed_pages,
-        )
+        self.assertEqual(op.pool_storage_result.extra_pool_hit_pages, {})
 
 
-def _make_indexer_operation(completed_pages, extra_pool_hit_pages):
+def _make_indexer_operation(completed_pages, extra_pool_hit_prefix):
     indexer_transfer = PoolTransfer(
         name=PoolName.INDEXER,
         hit_policy=PoolHitPolicy.ALL_PAGES,
@@ -176,11 +171,12 @@ def _make_indexer_operation(completed_pages, extra_pool_hit_pages):
         pool_transfers=[indexer_transfer],
     )
     operation.completed_tokens = completed_pages * PAGE_SIZE
-    operation.pool_storage_result.extra_pool_hit_pages.update(extra_pool_hit_pages)
+    operation.pool_storage_result.extra_pool_hit_prefix.update(extra_pool_hit_prefix)
     return operation
 
 
-class _FakePrefetchCacheController:
+class _FakePrefetchCacheController(HybridCacheController):
+    # subclassed so isinstance(_, HybridCacheController) gates the clamp path
     def __init__(self):
         self.mem_pool_host = SimpleNamespace(free=lambda idx: None)
         self.prefetch_tokens_occupied = 100
@@ -195,10 +191,10 @@ class _FakePrefetchCacheController:
 class TestUnifiedRadixCacheCheckPrefetchProgressClamp(CustomTestCase):
     """check_prefetch_progress must clamp the published length by sidecar coverage."""
 
-    def _run(self, extra_pool_hit_pages):
+    def _run(self, extra_pool_hit_prefix):
         req_id = "req-0"
         operation = _make_indexer_operation(
-            completed_pages=2, extra_pool_hit_pages=extra_pool_hit_pages
+            completed_pages=2, extra_pool_hit_prefix=extra_pool_hit_prefix
         )
         completed_tokens = operation.completed_tokens
 
@@ -256,10 +252,10 @@ class TestUnifiedRadixCacheCheckPrefetchProgressClamp(CustomTestCase):
 class TestHiRadixCacheCheckPrefetchProgressClamp(CustomTestCase):
     """Same clamp invariant as UnifiedRadixCache, on the HiRadixCache DSA path."""
 
-    def _run(self, extra_pool_hit_pages):
+    def _run(self, extra_pool_hit_prefix):
         req_id = "req-0"
         operation = _make_indexer_operation(
-            completed_pages=2, extra_pool_hit_pages=extra_pool_hit_pages
+            completed_pages=2, extra_pool_hit_prefix=extra_pool_hit_prefix
         )
         completed_tokens = operation.completed_tokens
 

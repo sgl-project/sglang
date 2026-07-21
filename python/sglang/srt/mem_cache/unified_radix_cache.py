@@ -2023,22 +2023,29 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         )
         min_completed_tokens = completed_tokens
         hit_pages = operation.pool_storage_result.extra_pool_hit_pages
+        hit_prefix = operation.pool_storage_result.extra_pool_hit_prefix
         if self.tp_world_size > 1:
             # pool_transfers is a superset of comp_xfers (includes raw
-            # sidecars like INDEXER not attached to a TreeComponent).
+            # sidecars like INDEXER not attached to a TreeComponent). Reduce
+            # both the sum (TRAILING_PAGES consumers) and the contiguous
+            # prefix (ALL_PAGES consumers) together with completed_tokens.
             sidecar_pools = [t.name for t in operation.pool_transfers or []]
             packed = torch.tensor(
-                [completed_tokens] + [hit_pages.get(p, 0) for p in sidecar_pools],
+                [completed_tokens]
+                + [hit_pages.get(p, 0) for p in sidecar_pools]
+                + [hit_prefix.get(p, 0) for p in sidecar_pools],
                 dtype=torch.int,
             )
             self._all_reduce_attn_groups(packed, torch.distributed.ReduceOp.MIN)
             min_completed_tokens = int(packed[0].item())
-            for i, p in enumerate(sidecar_pools, start=1):
-                hit_pages[p] = int(packed[i].item())
+            n = len(sidecar_pools)
+            for i, p in enumerate(sidecar_pools):
+                hit_pages[p] = int(packed[1 + i].item())
+                hit_prefix[p] = int(packed[1 + n + i].item())
 
         # Bound the prefix by ALL_PAGES sidecar coverage (e.g. INDEXER).
         min_completed_tokens = clamp_prefix_to_sidecar_coverage(
-            min_completed_tokens, operation.pool_transfers, hit_pages, self.page_size
+            min_completed_tokens, operation.pool_transfers, hit_prefix, self.page_size
         )
 
         fetched_key = prefetch_key[:min_completed_tokens]
