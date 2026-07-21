@@ -676,14 +676,21 @@ class SchedulerBatchResultProcessor:
             result.can_run_cuda_graph,
         )
 
-        next_token_ids, next_token_logprobs = self._normalize_decode_outputs(
-            batch=batch,
-            result=result,
-            logits_output=logits_output,
-            next_token_ids=next_token_ids,
-        )
+        is_beam_batch = batch.is_vectorized_beam_batch()
+        if is_beam_batch:
+            next_token_ids = []
+            next_token_logprobs = None
+        else:
+            next_token_ids, next_token_logprobs = self._normalize_decode_outputs(
+                batch=batch,
+                result=result,
+                logits_output=logits_output,
+                next_token_ids=next_token_ids,
+            )
 
-        self.metrics_reporter.num_generated_tokens += len(batch.reqs)
+        self.metrics_reporter.num_generated_tokens += (
+            len(batch.req_pool_indices) if is_beam_batch else len(batch.reqs)
+        )
         if not batch.spec_algorithm.is_none():
             self.metrics_reporter.update_spec_metrics(
                 batch.batch_size(),
@@ -808,21 +815,13 @@ class SchedulerBatchResultProcessor:
         if batch.return_logprob:
             next_token_logprobs = logits_output.next_token_logprobs.tolist()
             if logits_output.next_token_top_logprobs_val:
-                # Beam-member rows keep their top-2k on device: they feed the
-                # GPU joint_select and a wholesale tolist would move
-                # O(beam_width * 2k) elements to the host every step.
-                keep_on_device = [req.beam_group is not None for req in batch.reqs]
                 logits_output.next_token_top_logprobs_val = [
-                    v if keep else v.tolist()
-                    for v, keep in zip(
-                        logits_output.next_token_top_logprobs_val, keep_on_device
-                    )
+                    value.tolist()
+                    for value in logits_output.next_token_top_logprobs_val
                 ]
                 logits_output.next_token_top_logprobs_idx = [
-                    x if keep else x.tolist()
-                    for x, keep in zip(
-                        logits_output.next_token_top_logprobs_idx, keep_on_device
-                    )
+                    index.tolist()
+                    for index in logits_output.next_token_top_logprobs_idx
                 ]
 
             if logits_output.next_token_token_ids_logprobs_val:

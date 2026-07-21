@@ -1,7 +1,7 @@
-"""Per-request beam search state: frontier, completed pool, lifecycle.
+"""Per-request beam search state: frontier, vectorized rows, and lifecycle.
 
-BeamGroup owns no batch rows and no KV -- members are plain requests; it
-only holds search state and consumes joint_select results.
+BeamGroup is attached to one logical Req and owns the tensorized beam-row
+handles plus search state consumed by joint_select.
 
 Sync discipline: advance()/advance_final() are the designated sync points
 (they read the small fixed-shape result tensors to CPU); the frontier tensor
@@ -78,13 +78,13 @@ class BeamGroup:
         self.completed: List[CompletedBeam] = []
         self.state = BeamGroupState.DECODING
 
-        # Scheduler wiring (set by BeamCoordinator, not by the search
-        # core): the leader request, the member requests in frontier-row order
-        # (member_reqs[0] is the leader), and the first tokens staged between
-        # the prefill selection and the member-spawn tick.
+        # Scheduler wiring (set by BeamCoordinator, not by the search core).
         self.leader = None
-        self.member_reqs: List = []
-        self.pending_first_tokens: Optional[List[int]] = None
+        self.prompt_len = 0
+        self.next_tokens: Optional[torch.Tensor] = None
+        self.beam_req_pool_indices: Optional[torch.Tensor] = None
+        self.beam_seq_len = 0
+        self.resources_released = False
 
     # ==================== step consumption (sync points) ====================
 

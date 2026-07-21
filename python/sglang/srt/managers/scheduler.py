@@ -1852,7 +1852,6 @@ class Scheduler(
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             tree_cache=self.tree_cache,
-            future_map=self.future_map,
         )
 
     def init_batch_result_processor(self) -> None:
@@ -2093,8 +2092,8 @@ class Scheduler(
                 # Use default bootstrap port
                 recv_req.bootstrap_port = self.server_args.disaggregation_bootstrap_port
 
-            # Beam request (sampling_params.beam_width > 1): the leader rides
-            # the standard per-row top-2k logprob channel internally.
+            # Beam requests remain one logical Req; BeamGroup owns vectorized
+            # model rows after prefill.
             beam_width = BeamCoordinator.request_beam_width(recv_req)
             is_beam = beam_width > 1
             req = Req(
@@ -2102,10 +2101,8 @@ class Scheduler(
                 recv_req.input_text,
                 recv_req.input_ids,
                 recv_req.sampling_params,
-                return_logprob=True if is_beam else recv_req.return_logprob,
-                top_logprobs_num=(
-                    2 * beam_width if is_beam else recv_req.top_logprobs_num
-                ),
+                return_logprob=recv_req.return_logprob,
+                top_logprobs_num=recv_req.top_logprobs_num,
                 token_ids_logprob=recv_req.token_ids_logprob,
                 return_sampling_mask=recv_req.return_sampling_mask,
                 stream=recv_req.stream,
@@ -2775,14 +2772,10 @@ class Scheduler(
                     # Merge running_batch with prefill batch
                     running_batch.merge_batch(last_batch)
 
-        # Spawn pending beam members as decode-ready rows (their leader merged
-        # just above, so the whole group enters decode in the same tick).
-        member_batch = self.beam_coordinator.build_pending_member_batch()
-        if member_batch is not None:
-            if running_batch.is_empty():
-                running_batch = member_batch
-            else:
-                running_batch.merge_batch(member_batch)
+        # Replace each logical beam request's prefill row with vectorized decode
+        # rows while keeping batch.reqs one-to-one with user requests.
+        if not running_batch.is_empty():
+            self.beam_coordinator.expand_pending_beams(running_batch)
 
         # For prefill-only batch, filter out finished requests since they
         # won't go through the decode step. This keeps running_batch accurate
@@ -2851,22 +2844,20 @@ class Scheduler(
         pp_budget = get_server_args().pp_max_micro_batch_size - running_bs
         available = self.req_to_token_pool.available_size()
 
-        # New-path beam groups: reserve the member rows that admitted-but-not-
-        # yet-spawned groups will claim (beam_width - 1 each, leader included
-        # in its own row), so admission never over-commits the req slot pool.
+        # A logical beam request retains its prefill row and claims beam_width
+        # additional vectorized rows before decode.
         active_batch = running_batch or self.running_batch
-        pending_member_rows = sum(
-            r.beam_group.beam_width - 1
+        pending_beam_rows = sum(
+            r.beam_group.beam_width
             for r in active_batch.reqs
             if r.beam_group is not None
-            and len(r.beam_group.member_reqs) < r.beam_group.beam_width
+            and r.beam_group.beam_req_pool_indices is None
             and not r.finished()
         )
-        available = max(available - pending_member_rows, 0)
+        available = max(available - pending_beam_rows, 0)
         res = min(pp_budget, available)
         if beam_width is not None:
-            # A beam candidate owns beam_width rows once decoding.
-            res = min(res, available // beam_width)
+            res = min(res, available // (beam_width + 1))
 
         return res
 
@@ -2997,8 +2988,15 @@ class Scheduler(
         mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
+        beam_batch_kind = None
+        existing_reqs = list(running_batch.reqs) + list(adder.can_run_list)
+        if existing_reqs:
+            beam_batch_kind = existing_reqs[0].beam_group is not None
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
+            req_is_beam = req.beam_group is not None
+            if beam_batch_kind is not None and req_is_beam != beam_batch_kind:
+                continue
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
                 continue
 
@@ -3041,6 +3039,12 @@ class Scheduler(
                 has_chunked_req=(self.chunked_req is not None),
                 truncation_align_size=self.truncation_align_size,
             )
+            if (
+                beam_batch_kind is None
+                and adder.can_run_list
+                and req is adder.can_run_list[-1]
+            ):
+                beam_batch_kind = req_is_beam
 
             if self.enable_lora:
                 running_loras.add(req.lora_id)
