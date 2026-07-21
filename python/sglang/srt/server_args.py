@@ -4151,12 +4151,7 @@ class ServerArgs:
                 # Only non-torch memory is counted; torch memory is reused by cuda graph capture.
                 reserved_mem += len(prefill_cuda_graph_config.bs) * 8
             else:
-                # Breakable prefill pool: 1.63 GB measured on GLM-5.2-FP8
-                # tp8 with decode-first capture order. Note the auto
-                # derivation for this model class under-budgets warmup even
-                # without BCG (plain --disable-prefill-cuda-graph OOMs at its
-                # own auto); that baseline deficit is a pre-existing bug and
-                # is deliberately not repaired here.
+                # Breakable prefill pool: ~1.6 GB measured on GLM-5.2-FP8 tp8.
                 reserved_mem += 1.5 * 1024
             from sglang.srt.arg_groups.overrides import resolved_view
 
@@ -4164,11 +4159,8 @@ class ServerArgs:
                 prefill_cuda_graph_config.backend == Backend.BREAKABLE
                 and resolved_view(self).moe_a2a_backend == "deepep"
             ):
-                # Only the prefill-BCG DeepEP delta: split-node bridge
-                # pool + NORMAL-mode NVL first-touch landing inside capture,
-                # measured +1.08 GB on GLM-5.2-FP8 tp8 (2.71 GB vs 1.63 GB
-                # plain). Decode-side DeepEP costs exist without BCG and
-                # belong to the baseline a2a term, not this add.
+                # Prefill-BCG DeepEP delta (bridge pool + NVL first-touch
+                # during capture); decode-side DeepEP is a baseline cost.
                 reserved_mem += 1 * 1024
 
         return reserved_mem
