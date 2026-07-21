@@ -1324,8 +1324,8 @@ class UnifiedRadixCache(
             component.discard_deleted_session_leaf(node)
 
         key = node.key.child_key(self.page_size)
-        removed = node.parent.children.pop(key, None)
-        assert removed == node
+        v = node.parent.children.pop(key, None)
+        assert v == node
 
     def _evict_component_and_detach_lru(
         self,
