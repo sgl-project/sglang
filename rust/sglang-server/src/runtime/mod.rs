@@ -165,6 +165,19 @@ impl ServerArgs {
             .map(str::to_owned)
     }
 
+    /// sglang package version, stamped into the blob by `_build_server_args`.
+    pub fn version(&self) -> Option<&str> {
+        self.str_field("version").filter(|s| !s.is_empty())
+    }
+
+    /// Scheduler-derived KV token capacity, stamped at launch (the Python
+    /// `/server_info` reports it from `scheduler_info` the same way).
+    pub fn max_total_num_tokens(&self) -> Option<u64> {
+        self.data
+            .get("max_total_num_tokens")
+            .and_then(|v| v.as_u64())
+    }
+
     /// HF `revision`, used only when `tokenizer_path` is a repo id. `None` → main.
     pub fn revision(&self) -> Option<String> {
         self.str_field("revision")

@@ -299,10 +299,17 @@ class RustServer:
         """JSON blob of the scheduler's ``server_args`` for its embedded Rust
         server (carries the already-resolved ``model_config``)."""
 
+        from sglang.version import __version__
+
         server_args = dict(vars(scheduler.server_args))
         model_config = dict(vars(scheduler.model_config))
         model_config["hf_config"] = None  # HF config is not JSON-serializable
         server_args["model_config"] = model_config
+        # Launch-time facts Python's /server_info reports from scheduler_info /
+        # the package — stamped here so the rust endpoint can serve them
+        # statically (no scheduler round-trip).
+        server_args["version"] = __version__
+        server_args["max_total_num_tokens"] = scheduler.max_total_num_tokens
 
         return msgspec.json.encode(server_args, enc_hook=str).decode("utf-8")
 

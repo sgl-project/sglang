@@ -265,6 +265,10 @@ pub struct GenerateBody {
     pub return_hidden_states: Option<bool>,
     #[serde(default)]
     pub return_text_in_logprobs: Option<bool>,
+    /// Parallel sampling factor (`GenerateReqInput.n`). Only `n == 1` is
+    /// supported; a larger value is a 400 (not a silent single sample).
+    #[serde(default)]
+    pub n: Option<i64>,
 
     // Accepted for wire-compat with the native `bench_serving` payload (a full
     // `GenerateReqInput`) but NOT yet wired into the scheduler — parsed and
@@ -289,6 +293,7 @@ impl GenerateBody {
     /// an invalid/inconsistent batch.
     pub fn split(self) -> Result<(Vec<GenerateRequest>, bool), String> {
         let GenerateBody {
+            n: parallel_n,
             rid,
             text,
             input_ids,
@@ -303,6 +308,10 @@ impl GenerateBody {
             // Accepted for bench_serving compat, not wired through — see the struct.
             ..
         } = self;
+
+        if parallel_n.unwrap_or(1) != 1 {
+            return Err("parallel sampling (n > 1) is not supported".into());
+        }
 
         // Per-item (text, input_ids) columns + whether the input used list form.
         type Columns = (Vec<Option<String>>, Vec<Option<Vec<i32>>>, bool);
@@ -886,6 +895,9 @@ mod tests {
             serde_json::from_str::<GenerateBody>(r#"{"text": "hi", "bogus": 1}"#).is_err(),
             "GenerateBody must deny unknown fields"
         );
+        // `n` is accepted for wire-compat but only n == 1 is supported.
+        assert!(split(r#"{"text": "a", "n": 1}"#).is_ok());
+        assert!(split(r#"{"text": "a", "n": 2}"#).is_err());
     }
 
     /// Client-supplied rid semantics mirror Python's `_normalize_batch`: a
