@@ -27,6 +27,7 @@ import copy
 import dataclasses
 import logging
 import math
+import os
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, fields
 from functools import cached_property
@@ -88,6 +89,12 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+# Debug-only invariant in the Mamba slot-donation path calls tensor.item(), which
+# forces a per-request cudaStreamSynchronize on the scheduler thread and can stall
+# the scheduler under load. Off by default; set SGLANG_MAMBA_DEBUG_ASSERTS=1 to
+# re-enable for debugging.
+_MAMBA_DEBUG_ASSERTS = os.environ.get("SGLANG_MAMBA_DEBUG_ASSERTS", "0") == "1"
 
 GB = 1024 * 1024 * 1024
 _is_cuda = is_cuda()
@@ -1167,12 +1174,14 @@ class HybridReqToTokenPool(ReqToTokenPool):
         mamba_value_donated = (
             req.mamba_ping_pong_track_buffer[donate_idx].unsqueeze(-1).clone()
         )
-        assert mamba_value_donated.item() != -1, (
-            f"Donated mamba slot is -1: donate_idx={donate_idx}, "
-            f"buf={req.mamba_ping_pong_track_buffer.tolist()}, "
-            f"next_track_idx={req.mamba_next_track_idx}, "
-            f"rid={req.rid}"
-        )
+        if _MAMBA_DEBUG_ASSERTS:
+            # .item() forces a cudaStreamSynchronize; only pay it when debugging.
+            assert mamba_value_donated.item() != -1, (
+                f"Donated mamba slot is -1: donate_idx={donate_idx}, "
+                f"buf={req.mamba_ping_pong_track_buffer.tolist()}, "
+                f"next_track_idx={req.mamba_next_track_idx}, "
+                f"rid={req.rid}"
+            )
         self.set_mamba_ping_pong_slot(req, donate_idx, new_slot[0])
         return mamba_value_donated
 
