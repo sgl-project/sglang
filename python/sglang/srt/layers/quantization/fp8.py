@@ -5,13 +5,17 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, NamedTuple, Optional, Union
 
 import torch
 import torch.nn.functional as F
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
+from sglang.jit_kernel.rmsnorm_per_token_group_quant_fp8 import (
+    can_use_rmsnorm_per_token_group_quant_fp8,
+    rmsnorm_per_token_group_quant_fp8,
+)
 from sglang.kernels.ops.quantization.fp8_kernel import (
     fp8_dtype,
     is_fp8_fnuz,
@@ -49,6 +53,7 @@ from sglang.srt.layers.parameter import (
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     LinearMethodBase,
+    PreparedLinearInput,
     QuantizationConfig,
     QuantizeMethodBase,
 )
@@ -58,7 +63,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     can_auto_enable_marlin_fp8,
     cutlass_fp8_supported,
     deepgemm_w8a8_block_fp8_linear_with_fallback,
-    dispatch_w8a8_block_fp8_linear,
+    dispatch_w8a8_block_fp8_linear_config,
     dispatch_w8a8_mxfp8_linear,
     get_fp8_gemm_runner_backend,
     input_to_float8,
@@ -411,6 +416,11 @@ class Fp8Config(QuantizationConfig):
             )
 
 
+class DeepGemmUe8m0Input(NamedTuple):
+    data: torch.Tensor
+    scale: torch.Tensor
+
+
 class Fp8LinearMethod(LinearMethodBase):
     """Linear method for FP8.
 
@@ -451,10 +461,13 @@ class Fp8LinearMethod(LinearMethodBase):
         self.weight_block_size = self.quant_config.weight_block_size
         self.w8a8_block_fp8_linear = None
         self.w8a8_mxfp8_linear = None
+        self._accepts_packed_ue8m0_input = False
         if self.use_mxfp8 and not self.convert_mxfp8_to_block:
             self.w8a8_mxfp8_linear = dispatch_w8a8_mxfp8_linear()
         else:
-            self.w8a8_block_fp8_linear = dispatch_w8a8_block_fp8_linear()
+            dispatch = dispatch_w8a8_block_fp8_linear_config()
+            self.w8a8_block_fp8_linear = dispatch.op
+            self._accepts_packed_ue8m0_input = dispatch.accepts_packed_ue8m0_input
         self.is_checkpoint_fp8_serialized = (
             self.quant_config.is_checkpoint_fp8_serialized
         )
@@ -890,12 +903,98 @@ class Fp8LinearMethod(LinearMethodBase):
             # Activations not quantized for marlin.
             del layer.input_scale
 
-    def apply(
+    def _can_apply_packed_ue8m0_input(self, layer: torch.nn.Module) -> bool:
+        """Check the live, post-load DeepGEMM consumer contract."""
+        from sglang.srt.layers import deep_gemm_wrapper
+
+        weight = getattr(layer, "weight", None)
+        weight_scale = getattr(layer, "weight_scale_inv", None)
+        if (
+            not isinstance(weight, torch.Tensor)
+            or weight.dim() != 2
+            or not isinstance(weight_scale, torch.Tensor)
+        ):
+            return False
+
+        packed_scale_cols = (weight.shape[1] // 128 + 3) // 4
+        return bool(
+            deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+            and self._accepts_packed_ue8m0_input
+            and self.block_quant
+            and not self.use_marlin
+            and not self.use_mxfp8
+            and self.weight_block_size == [128, 128]
+            and getattr(layer, "orig_dtype", None) == torch.bfloat16
+            and getattr(layer, "input_scale", None) is None
+            and weight.dtype == fp8_dtype
+            and weight.shape[0] % 64 == 0
+            and weight.shape[1] % 128 == 0
+            and weight_scale.dim() == 2
+            and tuple(weight_scale.shape) == (weight.shape[0], packed_scale_cols)
+            and weight_scale.dtype == torch.int32
+            and weight_scale.device == weight.device
+            and weight_scale.stride(0) == 1
+            and getattr(weight_scale, "format_ue8m0", False)
+        )
+
+    def maybe_prepare_fused_rmsnorm_input(
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
+        norm_weight: torch.Tensor,
+        eps: float,
+        *,
+        need_normalized_output: bool,
+    ) -> Optional[PreparedLinearInput]:
+        """Fuse RMSNorm with this method's packed DeepGEMM input format."""
+        if not self._can_apply_packed_ue8m0_input(layer):
+            return None
+
+        hidden_size = x.shape[-1] if x.dim() == 2 else 0
+        if not (
+            x.is_cuda
+            and x.dim() == 2
+            and x.dtype == torch.bfloat16
+            and x.stride(1) == 1
+            and x.stride(0) % 16 == 0
+            and (torch.compiler.is_compiling() or x.storage_offset() % 16 == 0)
+            and hidden_size == layer.weight.shape[1]
+            and tuple(norm_weight.shape) == (hidden_size,)
+            and norm_weight.dtype == torch.bfloat16
+            and norm_weight.device == x.device
+            and norm_weight.stride(0) == 1
+            and (
+                torch.compiler.is_compiling() or norm_weight.storage_offset() % 16 == 0
+            )
+            and can_use_rmsnorm_per_token_group_quant_fp8(
+                input_dtype=x.dtype,
+                hidden_size=hidden_size,
+            )
+        ):
+            return None
+
+        q_fp8, q_scale, normalized = rmsnorm_per_token_group_quant_fp8(
+            x, norm_weight, eps
+        )
+        return PreparedLinearInput(
+            linear_input=DeepGemmUe8m0Input(q_fp8, q_scale),
+            normalized_input=normalized if need_normalized_output else None,
+        )
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: Union[torch.Tensor, DeepGemmUe8m0Input],
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if isinstance(x, DeepGemmUe8m0Input):
+            if not self._can_apply_packed_ue8m0_input(layer):
+                raise ValueError(
+                    "packed UE8M0 input requires the live DeepGEMM block-FP8 "
+                    "consumer contract"
+                )
+            x = (x.data, x.scale)
+
         if self.use_marlin:
             return torch.ops.sglang.apply_fp8_marlin_linear(
                 input=x,

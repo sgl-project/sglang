@@ -179,6 +179,31 @@ class DeepseekMLAForwardMixin:
             get_server_args().flashinfer_mla_disable_ragged
         )
 
+    def _q_a_layernorm_with_optional_quant(
+        self: DeepseekV2AttentionMLA,
+        q: torch.Tensor,
+    ):
+        """Let the live q-projection method prepare its native normalized input."""
+        server_args = get_server_args()
+        if (
+            server_args.enable_lora
+            or server_args.enable_deterministic_inference
+            or self.use_min_latency_q_b_gemm
+        ):
+            return self.q_a_layernorm(q), None
+
+        quant_method = self.q_b_proj.quant_method
+        prepared = quant_method.maybe_prepare_fused_rmsnorm_input(
+            layer=self.q_b_proj,
+            x=q,
+            norm_weight=self.q_a_layernorm.weight,
+            eps=self.q_a_layernorm.variance_epsilon,
+            need_normalized_output=self.use_dsa,
+        )
+        if prepared is None:
+            return self.q_a_layernorm(q), None
+        return prepared.linear_input, prepared.normalized_input
+
     def should_run_indexer(
         self: DeepseekV2AttentionMLA,
         prev_topk_indices: Optional[torch.Tensor] = None,
@@ -290,10 +315,11 @@ class DeepseekMLAForwardMixin:
             k_nope = latent_cache[..., : self.kv_lora_rank]
 
             # overlap qk norm
-            if self.alt_stream is not None and get_is_capture_mode():
+            is_capture_mode = get_is_capture_mode()
+            if self.alt_stream is not None and is_capture_mode:
                 current_stream = torch.cuda.current_stream()
                 self.alt_stream.wait_stream(current_stream)
-                q = self.q_a_layernorm(q)
+                q, q_lora = self._q_a_layernorm_with_optional_quant(q)
                 with torch.cuda.stream(self.alt_stream):
                     k_nope = self.kv_a_layernorm(k_nope)
                 current_stream.wait_stream(self.alt_stream)
@@ -359,7 +385,7 @@ class DeepseekMLAForwardMixin:
                             self.kv_a_layernorm.variance_epsilon,
                         )
                     else:
-                        q = self.q_a_layernorm(q)
+                        q, q_lora = self._q_a_layernorm_with_optional_quant(q)
                         k_nope = self.kv_a_layernorm(k_nope)
 
             # q_lora needed by indexer

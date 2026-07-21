@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import inspect
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Type
+from typing import TYPE_CHECKING, Any, Dict, List, NamedTuple, Optional, Type
 
 import torch
 from torch import nn
@@ -41,6 +41,13 @@ class QuantizeMethodBase(ABC):
         This can be used for example, to transpose weights for computation.
         """
         return
+
+
+class PreparedLinearInput(NamedTuple):
+    """Optional quant-method-owned preprocessing result for a linear layer."""
+
+    linear_input: Any
+    normalized_input: Optional[torch.Tensor]
 
 
 class LinearMethodBase(QuantizeMethodBase):
@@ -81,6 +88,18 @@ class LinearMethodBase(QuantizeMethodBase):
         """Apply the weights in layer to the input tensor.
         Expects create_weights to have been called before on the layer."""
         raise NotImplementedError()
+
+    def maybe_prepare_fused_rmsnorm_input(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        norm_weight: torch.Tensor,
+        eps: float,
+        *,
+        need_normalized_output: bool,
+    ) -> Optional[PreparedLinearInput]:
+        """Optionally prepare an RMS-normalized input in the method's native format."""
+        return None
 
 
 class FusedMoEMethodBase(QuantizeMethodBase):

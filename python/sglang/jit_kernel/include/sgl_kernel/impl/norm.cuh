@@ -5,6 +5,7 @@
 #include <sgl_kernel/vec.cuh>
 #include <sgl_kernel/warp.cuh>
 
+#include <cstddef>
 #include <cstdint>
 #include <type_traits>
 
@@ -57,6 +58,66 @@ namespace device::norm {
 
 namespace details {
 
+template <typename PackedFloat, std::size_t N>
+SGL_DEVICE float compute_sum_of_squares(const AlignedVector<PackedFloat, N>& input) {
+  float sum_of_squares = 0.0f;
+
+#pragma unroll
+  for (auto i = 0u; i < N; ++i) {
+    const auto fp32_input = cast<fp32x2_t>(input[i]);
+    sum_of_squares += fp32_input.x * fp32_input.x;
+    sum_of_squares += fp32_input.y * fp32_input.y;
+  }
+  return sum_of_squares;
+}
+
+template <typename PackedFloat, std::size_t N>
+SGL_DEVICE AlignedVector<PackedFloat, N> apply_norm_factor(
+    const AlignedVector<PackedFloat, N>& input, const AlignedVector<PackedFloat, N>& weight, const float norm_factor) {
+  AlignedVector<PackedFloat, N> output;
+
+#pragma unroll
+  for (auto i = 0u; i < N; ++i) {
+    const auto fp32_input = cast<fp32x2_t>(input[i]);
+    const auto fp32_weight = cast<fp32x2_t>(weight[i]);
+    output[i] = cast<PackedFloat, fp32x2_t>({
+        fp32_input.x * norm_factor * fp32_weight.x,
+        fp32_input.y * norm_factor * fp32_weight.y,
+    });
+  }
+  return output;
+}
+
+template <int64_t kDim, uint32_t kNumWarps>
+SGL_DEVICE float compute_norm_factor_cta_static(float sum_of_squares, const float eps, float* smem_buffer) {
+  static_assert(kNumWarps >= 1 && kNumWarps <= kWarpThreads);
+
+  sum_of_squares = warp::reduce_sum(sum_of_squares);
+  if constexpr (kNumWarps == 1) {
+    return math::rsqrt(sum_of_squares / kDim + eps);
+  } else {
+    const auto warp_id = threadIdx.x / kWarpThreads;
+    const auto lane_id = threadIdx.x % kWarpThreads;
+    if (lane_id == 0) smem_buffer[warp_id] = sum_of_squares;
+    __syncthreads();
+
+    if constexpr (kNumWarps == 4) {
+      // Four warps can combine their partials directly. This avoids a second
+      // CTA barrier on the common 2048-wide, 32-byte-per-thread path.
+      const auto total_sum = ((smem_buffer[0] + smem_buffer[1]) + smem_buffer[2]) + smem_buffer[3];
+      return math::rsqrt(total_sum / kDim + eps);
+    } else {
+      if (warp_id == 0) {
+        const auto local_sum = lane_id < kNumWarps ? smem_buffer[lane_id] : 0.0f;
+        const auto total_sum = warp::reduce_sum(local_sum);
+        if (lane_id == 0) smem_buffer[0] = total_sum;
+      }
+      __syncthreads();
+      return math::rsqrt(smem_buffer[0] / kDim + eps);
+    }
+  }
+}
+
 template <int64_t kDim, bool kUseCTA, typename PackedFloat, std::size_t N>
 SGL_DEVICE AlignedVector<PackedFloat, N> apply_norm_impl(
     const AlignedVector<PackedFloat, N> input,
@@ -64,6 +125,9 @@ SGL_DEVICE AlignedVector<PackedFloat, N> apply_norm_impl(
     const float eps,
     [[maybe_unused]] float* smem_buffer,
     [[maybe_unused]] uint32_t num_warps) {
+  // Keep the legacy dynamic-topology implementation textually stable. Some
+  // callers compare BF16 results at a tight boundary; the static fused path
+  // below owns the factored implementation.
   float sum_of_squares = 0.0f;
 
 #pragma unroll
@@ -141,6 +205,29 @@ SGL_DEVICE T apply_norm_cta(
     const T& input, const T& weight, float eps, float* smem, uint32_t num_warps = blockDim.x / kWarpThreads) {
   static_assert(kDim > 256, "CTA norm only supports dim > 256");
   return details::apply_norm_impl<kDim, true>(input, weight, eps, smem, num_warps);
+}
+
+/**
+ * \brief Apply norm with a compile-time CTA reduction topology.
+ *
+ * This variant is intended for static kernels that retain one input vector in
+ * registers across the reduction. A one-warp launch needs no CTA barrier, and
+ * a four-warp launch uses a single-barrier direct reduction.
+ *
+ * \tparam kDim Dimension size
+ * \tparam kNumWarps Number of warps in the CTA
+ * \tparam T Packed aligned-vector type
+ * \param input Input vector retained by this thread
+ * \param weight Weight vector retained by this thread
+ * \param eps Epsilon value for numerical stability
+ * \param smem Shared buffer with at least kNumWarps floats
+ * \return Normalized output vector
+ */
+template <int64_t kDim, uint32_t kNumWarps, typename T>
+SGL_DEVICE T apply_norm_cta_static(const T& input, const T& weight, float eps, float* smem) {
+  const auto sum_of_squares = details::compute_sum_of_squares(input);
+  const auto norm_factor = details::compute_norm_factor_cta_static<kDim, kNumWarps>(sum_of_squares, eps, smem);
+  return details::apply_norm_factor(input, weight, norm_factor);
 }
 
 /**
