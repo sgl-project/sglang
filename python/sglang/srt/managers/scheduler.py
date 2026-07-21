@@ -971,24 +971,38 @@ class Scheduler(
         if self.draft_worker is not None:
             self.draft_worker.init_cuda_graphs()
 
+    def finalize_startup_weight_load(self):
+        """Commit any weights deferred until after CUDA graph capture."""
+        self.tp_worker.finalize_startup_weight_load()
+
+    def cancel_startup_weight_load(self):
+        """Cancel any weight loading still deferred during worker startup."""
+        self.tp_worker.cancel_startup_weight_load()
+
     def init_model_worker(self):
         # Load model weights.
         self.init_tp_model_worker()
-        self.maybe_init_draft_worker()
+        try:
+            self.maybe_init_draft_worker()
 
-        # Prepare KV cache pools for all workers
-        tic = time.perf_counter()
-        self.init_memory_pools()
-        self.kv_cache_allocation_time = time.perf_counter() - tic
-
-        self.init_all_attention_backends()
-        self.init_all_cuda_graphs()
-
-        model_runner = self.tp_worker.model_runner
-        if model_runner.token_to_kv_pool.post_capture_active:
+            # Prepare KV cache pools for all workers
             tic = time.perf_counter()
-            model_runner.post_capture_resize_kv_pool()
-            self.kv_cache_allocation_time += time.perf_counter() - tic
+            self.init_memory_pools()
+            self.kv_cache_allocation_time = time.perf_counter() - tic
+
+            self.init_all_attention_backends()
+            self.init_all_cuda_graphs()
+
+            model_runner = self.tp_worker.model_runner
+            if model_runner.token_to_kv_pool.post_capture_active:
+                tic = time.perf_counter()
+                model_runner.post_capture_resize_kv_pool()
+                self.kv_cache_allocation_time += time.perf_counter() - tic
+
+            self.finalize_startup_weight_load()
+        except Exception:
+            self.cancel_startup_weight_load()
+            raise
 
         if (
             get_exec().moe.elastic_ep_backend is not None
