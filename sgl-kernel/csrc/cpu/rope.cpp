@@ -71,8 +71,16 @@ struct RopeParams {
 };
 
 enum class RotaryMode {
-  Interleaved,  // GPT-J
-  Neox,
+  Interleaved,  // GPT-J / packed [cos|sin]
+  Neox,         // packed [cos|sin]
+  NeoxFull,     // split cos/sin each of length head_size (HF rotate_half)
+};
+
+// Already-indexed cos/sin rows for apply_rotary_pos_emb style.
+template <typename param_t>
+struct SplitCosSinRow {
+  const param_t* cos;
+  const param_t* sin;
 };
 
 template <typename scalar_t, RotaryMode rotary_mode>
@@ -134,6 +142,40 @@ struct RotaryEmbedInternal<scalar_t, RotaryMode::Neox> {
   }
 };
 
+template <typename scalar_t>
+struct RotaryEmbedInternal<scalar_t, RotaryMode::NeoxFull> {
+  template <typename CosT>
+  static inline void
+  apply(scalar_t* __restrict__ out, const scalar_t* __restrict__ input, SplitCosSinRow<CosT> cache, int size) {
+    constexpr int kVecSize = at::vec::Vectorized<scalar_t>::size();
+    const int half_size = size / 2;
+    int d = 0;
+    for (; d <= half_size - kVecSize; d += kVecSize) {
+      auto [x0, x1] = load_float_vec2(input + d);
+      auto [y0, y1] = load_float_vec2(input + half_size + d);
+      auto [cos_x0, cos_x1] = load_float_vec2(cache.cos + d);
+      auto [sin_x0, sin_x1] = load_float_vec2(cache.sin + d);
+      auto [cos_y0, cos_y1] = load_float_vec2(cache.cos + half_size + d);
+      auto [sin_y0, sin_y1] = load_float_vec2(cache.sin + half_size + d);
+      auto out0 = x0 * cos_x0 - y0 * sin_x0;
+      auto out1 = x1 * cos_x1 - y1 * sin_x1;
+      auto out2 = y0 * cos_y0 + x0 * sin_y0;
+      auto out3 = y1 * cos_y1 + x1 * sin_y1;
+      convert_from_float_ext<scalar_t>(out0, out1).store(out + d);
+      convert_from_float_ext<scalar_t>(out2, out3).store(out + half_size + d);
+    }
+    for (; d < half_size; ++d) {
+      float x = input[d], y = input[d + half_size];
+      float cos_x = static_cast<float>(cache.cos[d]);
+      float sin_x = static_cast<float>(cache.sin[d]);
+      float cos_y = static_cast<float>(cache.cos[d + half_size]);
+      float sin_y = static_cast<float>(cache.sin[d + half_size]);
+      out[d] = static_cast<scalar_t>(x * cos_x - y * sin_x);
+      out[d + half_size] = static_cast<scalar_t>(y * cos_y + x * sin_y);
+    }
+  }
+};
+
 template <typename scalar_t, RotaryMode mode, bool inplace, typename CachePos>
 void rotary_embedding_kernel_impl(
     scalar_t* __restrict__ query_out,
@@ -146,7 +188,7 @@ void rotary_embedding_kernel_impl(
     int64_t bs = 0, seq = 0;
     data_index_init(begin, bs, p.batches, seq, p.seqlen);
     for (int64_t i = begin; i < end; ++i) {
-      const scalar_t* cache = cache_pos(bs * p.seqlen + seq);
+      auto cache = cache_pos(bs * p.seqlen + seq);
       for (int64_t h = 0; h < p.num_heads; ++h) {
         scalar_t* q_in = query + p.q_offset(bs, seq, h);
         scalar_t* q_out;
@@ -168,214 +210,6 @@ void rotary_embedding_kernel_impl(
         RotaryEmbedInternal<scalar_t, mode>::apply(k_out, k_in, cache, p.rotary_dim);
       }
       data_index_step(bs, p.batches, seq, p.seqlen);
-    }
-  });
-}
-
-template <typename scalar_t>
-void apply_rotary_pos_emb_kernel_impl(
-    scalar_t* __restrict__ query,
-    scalar_t* __restrict__ key,
-    float* __restrict__ cos,
-    float* __restrict__ sin,
-    int64_t query_stride_s,
-    int64_t key_stride_s,
-    int64_t num_heads,
-    int64_t num_kv_heads,
-    int64_t head_size,
-    int64_t num_tokens) {
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
-  constexpr int64_t bVecSize = bVec::size();
-  constexpr int64_t fVecSize = fVec::size();
-
-  int64_t embed_dim = head_size / 2;
-  bool flag = (embed_dim % bVecSize == 0);
-  int64_t loop_upper = flag ? embed_dim : embed_dim - bVecSize;
-
-  auto compute_loop = [&](int64_t token_head, float* cos_ptr, float* sin_ptr, scalar_t* qk) {
-    int64_t j = 0;
-    for (; j < loop_upper; j += bVecSize) {
-      int64_t rot_offset = j;
-      int64_t x_index = rot_offset;
-      int64_t y_index = embed_dim + rot_offset;
-
-      int64_t out_x = token_head + x_index;
-      int64_t out_y = token_head + y_index;
-
-      fVec _cos_x_0 = fVec::loadu(cos_ptr + x_index);
-      fVec _sin_x_0 = fVec::loadu(sin_ptr + x_index);
-      fVec _cos_x_1 = fVec::loadu(cos_ptr + x_index + fVecSize);
-      fVec _sin_x_1 = fVec::loadu(sin_ptr + x_index + fVecSize);
-
-      fVec _cos_y_0 = fVec::loadu(cos_ptr + y_index);
-      fVec _sin_y_0 = fVec::loadu(sin_ptr + y_index);
-      fVec _cos_y_1 = fVec::loadu(cos_ptr + y_index + fVecSize);
-      fVec _sin_y_1 = fVec::loadu(sin_ptr + y_index + fVecSize);
-
-      bVec _q_x = bVec::loadu(qk + out_x);
-      bVec _q_y = bVec::loadu(qk + out_y);
-      fVec _q_x_0, _q_x_1;
-      std::tie(_q_x_0, _q_x_1) = at::vec::convert_to_float(_q_x);
-      fVec _q_y_0, _q_y_1;
-      std::tie(_q_y_0, _q_y_1) = at::vec::convert_to_float(_q_y);
-
-      auto out1_0 = _q_x_0 * _cos_x_0 - _q_y_0 * _sin_x_0;
-      auto out1_1 = _q_x_1 * _cos_x_1 - _q_y_1 * _sin_x_1;
-      auto out1 = convert_from_float_ext<scalar_t>(out1_0, out1_1);
-      out1.store(qk + out_x);
-
-      auto out2_0 = _q_y_0 * _cos_y_0 + _q_x_0 * _sin_y_0;
-      auto out2_1 = _q_y_1 * _cos_y_1 + _q_x_1 * _sin_y_1;
-      auto out2 = convert_from_float_ext<scalar_t>(out2_0, out2_1);
-      out2.store(qk + out_y);
-    }
-    if (!flag) {
-      for (; j < embed_dim; ++j) {
-        int64_t x_index = j;
-        int64_t y_index = embed_dim + j;
-
-        int64_t out_x = token_head + x_index;
-        int64_t out_y = token_head + y_index;
-
-        float _cos_x = cos_ptr[x_index];
-        float _sin_x = sin_ptr[x_index];
-        float _cos_y = cos_ptr[y_index];
-        float _sin_y = sin_ptr[y_index];
-
-        float _q_x = qk[out_x];
-        float _q_y = qk[out_y];
-
-        qk[out_x] = _q_x * _cos_x - _q_y * _sin_x;
-        qk[out_y] = _q_y * _cos_y + _q_x * _sin_y;
-      }
-    }
-  };
-
-  at::parallel_for(0, num_tokens, 0, [&](int64_t begin, int64_t end) {
-    int64_t token_idx = {0};
-    data_index_init(begin, token_idx, num_tokens);
-    for (int i = begin; i < end; ++i) {
-      float* cos_ptr = cos + token_idx * head_size;
-      float* sin_ptr = sin + token_idx * head_size;
-
-      for (int64_t i = 0; i < num_heads; ++i) {
-        int64_t head_idx = i;
-        int64_t token_head = token_idx * query_stride_s + head_idx * head_size;
-        compute_loop(token_head, cos_ptr, sin_ptr, query);
-      }
-
-      for (int64_t i = 0; i < num_kv_heads; ++i) {
-        int64_t head_idx = i;
-        int64_t token_head = token_idx * key_stride_s + head_idx * head_size;
-        compute_loop(token_head, cos_ptr, sin_ptr, key);
-      }
-      data_index_step(token_idx, num_tokens);
-    }
-  });
-}
-
-template <typename scalar_t>
-void apply_rotary_pos_emb_kernel_impl(
-    scalar_t* __restrict__ query,
-    scalar_t* __restrict__ key,
-    scalar_t* __restrict__ cos,
-    scalar_t* __restrict__ sin,
-    int64_t query_stride_s,
-    int64_t key_stride_s,
-    int64_t num_heads,
-    int64_t num_kv_heads,
-    int64_t head_size,
-    int64_t num_tokens) {
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
-  constexpr int64_t bVecSize = bVec::size();
-
-  int64_t embed_dim = head_size / 2;
-  bool flag = (embed_dim % bVecSize == 0);
-  int64_t loop_upper = flag ? embed_dim : embed_dim - bVecSize;
-
-  auto compute_loop = [&](int64_t token_head, scalar_t* cos_ptr, scalar_t* sin_ptr, scalar_t* qk) {
-    int64_t j = 0;
-    for (; j < loop_upper; j += bVecSize) {
-      int64_t rot_offset = j;
-      int64_t x_index = rot_offset;
-      int64_t y_index = embed_dim + rot_offset;
-
-      int64_t out_x = token_head + x_index;
-      int64_t out_y = token_head + y_index;
-
-      bVec _cos_x = bVec::loadu(cos_ptr + x_index);
-      bVec _sin_x = bVec::loadu(sin_ptr + x_index);
-      bVec _cos_y = bVec::loadu(cos_ptr + y_index);
-      bVec _sin_y = bVec::loadu(sin_ptr + y_index);
-      fVec _cos_x_0, _cos_x_1;
-      std::tie(_cos_x_0, _cos_x_1) = at::vec::convert_to_float(_cos_x);
-      fVec _sin_x_0, _sin_x_1;
-      std::tie(_sin_x_0, _sin_x_1) = at::vec::convert_to_float(_sin_x);
-      fVec _cos_y_0, _cos_y_1;
-      std::tie(_cos_y_0, _cos_y_1) = at::vec::convert_to_float(_cos_y);
-      fVec _sin_y_0, _sin_y_1;
-      std::tie(_sin_y_0, _sin_y_1) = at::vec::convert_to_float(_sin_y);
-
-      bVec _q_x = bVec::loadu(qk + out_x);
-      bVec _q_y = bVec::loadu(qk + out_y);
-      fVec _q_x_0, _q_x_1;
-      std::tie(_q_x_0, _q_x_1) = at::vec::convert_to_float(_q_x);
-      fVec _q_y_0, _q_y_1;
-      std::tie(_q_y_0, _q_y_1) = at::vec::convert_to_float(_q_y);
-
-      auto out1_0 = _q_x_0 * _cos_x_0 - _q_y_0 * _sin_x_0;
-      auto out1_1 = _q_x_1 * _cos_x_1 - _q_y_1 * _sin_x_1;
-      auto out1 = convert_from_float_ext<scalar_t>(out1_0, out1_1);
-      out1.store(qk + out_x);
-
-      auto out2_0 = _q_y_0 * _cos_y_0 + _q_x_0 * _sin_y_0;
-      auto out2_1 = _q_y_1 * _cos_y_1 + _q_x_1 * _sin_y_1;
-      auto out2 = convert_from_float_ext<scalar_t>(out2_0, out2_1);
-      out2.store(qk + out_y);
-    }
-    if (!flag) {
-      for (; j < embed_dim; ++j) {
-        int64_t x_index = j;
-        int64_t y_index = embed_dim + j;
-
-        int64_t out_x = token_head + x_index;
-        int64_t out_y = token_head + y_index;
-
-        float _cos_x = cos_ptr[x_index];
-        float _sin_x = sin_ptr[x_index];
-        float _cos_y = cos_ptr[y_index];
-        float _sin_y = sin_ptr[y_index];
-
-        float _q_x = qk[out_x];
-        float _q_y = qk[out_y];
-
-        qk[out_x] = _q_x * _cos_x - _q_y * _sin_x;
-        qk[out_y] = _q_y * _cos_y + _q_x * _sin_y;
-      }
-    }
-  };
-
-  at::parallel_for(0, num_tokens, 0, [&](int64_t begin, int64_t end) {
-    int64_t token_idx = {0};
-    data_index_init(begin, token_idx, num_tokens);
-    for (int i = begin; i < end; ++i) {
-      scalar_t* cos_ptr = cos + token_idx * head_size;
-      scalar_t* sin_ptr = sin + token_idx * head_size;
-
-      for (int64_t i = 0; i < num_heads; ++i) {
-        int64_t head_idx = i;
-        int64_t token_head = token_idx * query_stride_s + head_idx * head_size;
-        compute_loop(token_head, cos_ptr, sin_ptr, query);
-      }
-
-      for (int64_t i = 0; i < num_kv_heads; ++i) {
-        int64_t head_idx = i;
-        int64_t token_head = token_idx * key_stride_s + head_idx * head_size;
-        compute_loop(token_head, cos_ptr, sin_ptr, key);
-      }
-      data_index_step(token_idx, num_tokens);
     }
   });
 }
@@ -652,38 +486,20 @@ apply_rotary_pos_emb_cpu(at::Tensor& query, at::Tensor& key, at::Tensor& cos, at
   CHECK_EQ(head_size, key.size(2));
   CHECK_EQ(head_size, cos.size(1));
   CHECK_EQ(head_size, sin.size(1));
-  int64_t q_stride_s = query.stride(0);
-  int64_t k_stride_s = key.stride(0);
   TORCH_CHECK(input_dtype == key.scalar_type(), "query and key must have the same data type");
-  AT_DISPATCH_REDUCED_FLOATING_TYPES(query.scalar_type(), "apply_rotary_pos_emb_cpu", [&] {
-    if (cos.scalar_type() == at::kFloat && sin.scalar_type() == at::kFloat) {
-      apply_rotary_pos_emb_kernel_impl<scalar_t>(
-          query.data_ptr<scalar_t>(),
-          key.data_ptr<scalar_t>(),
-          cos.data_ptr<float>(),
-          sin.data_ptr<float>(),
-          q_stride_s,
-          k_stride_s,
-          num_heads,
-          num_heads,
-          head_size,
-          num_tokens);
-    } else if (cos.scalar_type() == input_dtype && sin.scalar_type() == input_dtype) {
-      apply_rotary_pos_emb_kernel_impl<scalar_t>(
-          query.data_ptr<scalar_t>(),
-          key.data_ptr<scalar_t>(),
-          cos.data_ptr<scalar_t>(),
-          sin.data_ptr<scalar_t>(),
-          q_stride_s,
-          k_stride_s,
-          num_heads,
-          num_heads,
-          head_size,
-          num_tokens);
-    } else {
-      TORCH_CHECK(
-          false, "cos and sin must have the same data type, and must be either float or the same type as query/key");
-    }
+  TORCH_CHECK(cos.scalar_type() == sin.scalar_type(), "cos and sin must have the same data type");
+  TORCH_CHECK(head_size % 2 == 0, "head_size must be even");
+
+  const RopeParams p{query, key, head_size, head_size};
+  CPU_DISPATCH_REDUCED_FLOATING_TYPES_EXT(input_dtype, cos.scalar_type(), [&] {
+    scalar_t* q_ptr = query.data_ptr<scalar_t>();
+    scalar_t* k_ptr = key.data_ptr<scalar_t>();
+    const param_t* cos_ptr = cos.data_ptr<param_t>();
+    const param_t* sin_ptr = sin.data_ptr<param_t>();
+    auto cache_pos = [cos_ptr, sin_ptr, head_size](int64_t token) -> SplitCosSinRow<param_t> {
+      return {cos_ptr + token * head_size, sin_ptr + token * head_size};
+    };
+    rotary_embedding_kernel_impl<scalar_t, RotaryMode::NeoxFull, true>(q_ptr, k_ptr, q_ptr, k_ptr, p, cache_pos);
   });
   return std::make_tuple(query, key);
 }
