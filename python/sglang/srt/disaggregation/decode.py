@@ -1172,11 +1172,37 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             page_indices = kv_to_page_indices(kv_indices, kv_transfer_page_size).astype(
                 np.int32
             )
+            device_page_indices = None
+            if (
+                self.scheduler.enable_hisparse
+                and isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
+                and not _is_fake_transfer(decode_req.req, self.scheduler.server_args)
+            ):
+                # alloc_logical_only() already allocated the shared logical pages
+                # used by C4 indexer and C128 KV. These device buffers do not use
+                # the C4 sparse physical-slot mapping; carry their logical page IDs
+                # alongside the independently allocated C4 host page IDs.
+                full_kv_indices = self.req_to_token_pool.req_to_token[
+                    decode_req.req.req_pool_idx,
+                    prefix_len:origin_input_len,
+                ]
+                device_page_indices = kv_to_page_indices(
+                    full_kv_indices.cpu().numpy().astype(np.int32),
+                    page_size,
+                )
+                if self.transfer_backend != TransferBackend.MOONCAKE:
+                    raise NotImplementedError(
+                        "DSV4 HiSparse direct PD transfer currently requires "
+                        "the Mooncake backend"
+                    )
+            metadata_kwargs = {"decode_prefix_len": total_prefix_len}
+            if device_page_indices is not None:
+                metadata_kwargs["device_kv_indices"] = device_page_indices
             decode_req.kv_receiver.send_metadata(
                 page_indices,
                 decode_req.metadata_buffer_index,
                 state_indices,
-                decode_prefix_len=total_prefix_len,
+                **metadata_kwargs,
             )
             if decode_req.is_rebootstrap:
                 self.kv_manager.submit_prefill_recompute(
