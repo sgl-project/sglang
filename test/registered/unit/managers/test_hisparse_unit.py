@@ -15,6 +15,7 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
+from sglang.srt.utils.common import Range
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
@@ -49,7 +50,7 @@ def _make_req(rid="test-req-0", origin_input_ids=None, output_ids=None):
         fill_ids=origin_input_ids + output_ids,
         seqlen=len(origin_input_ids) + len(output_ids),
         req_pool_idx=None,
-        kv_allocated_len=0,
+        kv=SimpleNamespace(kv_allocated_len=0),
         kv_committed_len=0,
         finished_reason=None,
         hisparse_staging=False,
@@ -57,8 +58,8 @@ def _make_req(rid="test-req-0", origin_input_ids=None, output_ids=None):
         inflight_middle_chunks=0,
     )
     req.finished = lambda: req.finished_reason is not None
-    req.set_extend_input_len = lambda extend_input_len: setattr(
-        req, "extend_input_len", extend_input_len
+    req.set_extend_range = lambda start, end: setattr(
+        req, "extend_range", Range(start, end)
     )
     return req
 
@@ -217,10 +218,10 @@ class TestHiSparseUnit(unittest.TestCase):
         )
         self.assertIsNotNone(kv_loc, "KV alloc failed")
         self.req_to_token_pool.write((req.req_pool_idx, slice(0, len(kv_loc))), kv_loc)
-        req.kv_allocated_len = fill_len
+        req.kv.kv_allocated_len = fill_len
         req.kv_committed_len = fill_len
         req.full_untruncated_fill_ids = array("q", range(fill_len))
-        req.fill_len = fill_len
+        req.extend_range = Range(0, fill_len)
         return kv_loc
 
     # ==================================================================
@@ -577,7 +578,7 @@ class TestHiSparseUnit(unittest.TestCase):
 
         seq_len = fill_len + 1
         self.req_to_token_pool.write((req.req_pool_idx, fill_len), out_loc)
-        req.kv_allocated_len = seq_len
+        req.kv.kv_allocated_len = seq_len
         req.kv_committed_len = seq_len
 
         self.coordinator.map_last_loc_to_buffer(
@@ -748,6 +749,7 @@ class TestHiSparseUnit(unittest.TestCase):
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
         queue.req_to_token_pool = self.req_to_token_pool
         queue.token_to_kv_pool_allocator = self.allocator
+        queue.token_to_kv_pool = self.allocator.get_kvcache()
         queue.tree_cache = SimpleNamespace(
             evictable_size=lambda: 0,
             protected_size=lambda: 0,
@@ -767,9 +769,9 @@ class TestHiSparseUnit(unittest.TestCase):
                 self.coordinator.req_to_host_pool[req.req_pool_idx, :fill_len],
             )
         )
-        self.assertEqual(req.kv_allocated_len, fill_len)
+        self.assertEqual(req.kv.kv_allocated_len, fill_len)
         self.assertEqual(req.kv_committed_len, fill_len)
-        self.assertEqual(req.extend_input_len, fill_len)
+        self.assertEqual(req.extend_range.length, fill_len)
 
         rounded_len = (fill_len + self.page_size - 1) // self.page_size * self.page_size
         self.assertEqual(
@@ -784,7 +786,7 @@ class TestHiSparseUnit(unittest.TestCase):
         self.assertEqual(allocated_host_indices.numel(), rounded_len)
 
         kv_loc = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : req.kv_allocated_len
+            req.req_pool_idx, : req.kv.kv_allocated_len
         ].clone()
         self._cleanup_req(req, kv_loc, logical_only=True)
         self._assert_sizes_restored(initial, "pd_decode_prealloc_hisparse")

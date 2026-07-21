@@ -7,7 +7,7 @@ metatags:
 ## Introduction
 
 Qwen3-8B is a compact dense model in the Qwen3 series developed by Alibaba, featuring 8B parameters with
-Grouped-Query Attention (GQA) and up to 128K context length. It delivers significant improvements in instruction
+Grouped-Query Attention (GQA) and up to 128k context length. It delivers significant improvements in instruction
 following, logical reasoning, text comprehension, mathematics, science, coding, and tool usage. The model supports
 EAGLE3 speculative decoding for accelerated inference and is available in both standard and thinking/reasoning-enhanced
 editions.
@@ -25,8 +25,8 @@ version.
 |-------------------------------|-----------------------------------------------------------------------------------------------|
 | Tensor Parallelism            | `--tp-size 2`                                                                                 |
 | Quantization                  | `--quantization modelslim`                                                                    |
-| Chunked Prefill               | auto based on device memory, or set explicit value;<br/>disable with `--chunked-prefill-size -1`; e.g. `--chunked-prefill-size 8192` |
-| NPU Graph                     | enabled by default; disable with `--disable-cuda-graph`;<br/>control range via `--cuda-graph-bs` or `--cuda-graph-max-bs`; e.g. `--cuda-graph-bs 1 2 4 6 9 10 15 16` |
+| Chunked Prefill               | auto based on device memory, or set explicit value;<br/>disable with `--chunked-prefill-size -1`; e.g., `--chunked-prefill-size 8192` |
+| NPU Graph                     | enabled by default; disable with `--disable-cuda-graph`;<br/>control range via `--cuda-graph-bs` or `--cuda-graph-max-bs-decode`; e.g., `--cuda-graph-bs 1 2 4 6 9 10 15 16` |
 | Speculative Decoding          | `--speculative-algorithm EAGLE3 \`<br/>`--speculative-draft-model-path /path/to/draft-model-weights \`<br/>`--speculative-num-steps 3 \`<br/>`--speculative-eagle-topk 1 \`<br/>`--speculative-num-draft-tokens 4 \`<br/>`--speculative-draft-model-quantization unquant` |
 | Overlap Schedule              | `export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`                                                  |
 
@@ -42,25 +42,42 @@ see [Feature Compatibility](/docs/hardware-platforms/ascend-npus/ascend_npu_opti
 
 ## Prerequisites
 
+### Environment
+
+Before following this tutorial, complete the environment setup in the documents below:
+
+- [Ascend NPU Quickstart](/docs/hardware-platforms/ascend-npus/ascend_npu_quick_start) — the fastest way to get started.
+  It walks you through launching the official container image, starting the SGLang server, and sending a test request.
+  Recommended if you are new to SGLang on Ascend.
+- [SGLang Installation with NPU Support](/docs/hardware-platforms/ascend-npus/ascend_npu) — the full installation guide.
+  It covers the component version mapping (CANN, TorchNPU, Triton, kernels, etc.), building from source or from a
+  Dockerfile, and recommended system settings (CPU power scheme, NUMA, swap). Use it when you need to install or customize
+  the environment instead of using the official image.
+
 ### Model weights
 
-<Warning>
-If you need to download model weights, check the model size before downloading to reserve enough space.
-</Warning>
+Before downloading model weights, check the model size to reserve enough disk space.
+For multi-node deployment, download the weights to a shared directory accessible to all nodes.
 
-- [Qwen3-8B](https://www.modelscope.cn/models/Qwen/Qwen3-8B) (BF16)
-- [Qwen3-8B-W8A8](https://www.modelscope.cn/models/vllm-ascend/Qwen3-8B-w8a8) (W8A8 quantized version)
+- [Qwen3-8B](https://www.modelscope.cn/models/Qwen/Qwen3-8B) (BF16, 16.40GB)
+- [Qwen3-8B-W8A8](https://www.modelscope.cn/models/vllm-ascend/Qwen3-8B-w8a8) (W8A8 quantized version, 11.27GB)
 - [Eagle3-Qwen3-8B-zh](https://www.modelscope.cn/models/Zjcxy-SmartAI/Eagle3-Qwen3-8B-zh) (EAGLE3 draft model for speculative decoding)
 
-Ensure the available device memory exceeds the model weight size before deployment. For optimal throughput and latency,
-refer to the [best practice configurations](#best-practices) which may require additional cards.
+<Info>
+We recommend deploying the W8A8 variant for reduced resource usage and higher throughput.
+It (11.27GB) fits within a single 64GB die, so `--tp-size 1` is sufficient on either A2 or A3.
+</Info>
 
-It is recommended to download the model weights to a shared directory across multiple nodes.
+This is the minimum recommended configuration. For optimized configurations,
+see [Best practices](#best-practices), which may require additional cards or nodes.
+
+For the hardware specifications (memory per die, dies per card, and the difference between A2 and A3),
+see [Ascend NPU Reference — Hardware](/docs/hardware-platforms/ascend-npus/ascend_npu_reference#hardware).
 
 ## Installation
 
 <Warning>
-Ensure sufficient disk space before pulling images. The Docker image requires at least **30 GB** of free space.
+Ensure sufficient disk space before pulling images. The Docker image requires at least **30GB** of free space.
 </Warning>
 
 The dependencies required for the NPU runtime environment have been integrated into a Docker image and uploaded to the
@@ -147,7 +164,7 @@ quay.io/ascend/sglang:v0.5.13.post1-cann9.0.0-910b
 Single-node deployment completes both prefill and decode within the same node (PD mixed mode), suitable for scenarios
 with limited hardware resources. This scenario is already covered in the best practice. For the complete, optimized
 deployment commands and benchmark data, see
-[Qwen3-8B Best Practice — PD Mixed On A3](/docs/hardware-platforms/ascend-npus/best_practice/qwen3-8b#single-node).
+[Qwen3-8B Best Practice — PD Mixed On A3](/docs/hardware-platforms/ascend-npus/best_practice/qwen3-8b#single-node-pd-mixed).
 
 ## Functional verification
 
@@ -200,4 +217,3 @@ guidance, see [Optimization on Ascend NPU](/docs/hardware-platforms/ascend-npus/
 ## FAQ
 
 For common environment, installation, and general parameter issues, please refer to the [Ascend NPU FAQ](/docs/hardware-platforms/ascend-npus/ascend_npu_faq).
-This section only covers model-specific issues.

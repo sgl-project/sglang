@@ -1365,5 +1365,55 @@ def test_flash_attn_varlen_output(
         ).abs().max().item() + dv_atol
 
 
+@pytest.mark.skipif(
+    not is_fa3_supported(),
+    reason="flash_attn at sgl-kernel is only supported on sm90 or sm80",
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+def test_flash_attn_varlen_many_short_segments_num_splits(dtype):
+    # Regression for the varlen get_num_splits heuristic (sgl-attn #46). A batch of
+    # many short-Q segments (NSA-style cu_seqlens_q = arange(N+1)) over long K made the
+    # old "pretend batch=1" upper bound under-count total_mblocks and over-split, blowing
+    # up the fp32 out_accum workspace (OOM). seqlen_k is large enough that num_n_blocks > 4
+    # so the heuristic's split loop actually runs; with num_splits=0 the output must still
+    # match a per-segment reference.
+    from sgl_kernel.flash_attn import flash_attn_varlen_func
+
+    torch.manual_seed(0)
+    device = "cuda"
+    n_seg, seqlen_k = 64, 2048
+    nheads, nheads_kv, d = 8, 1, 128
+    scale = d**-0.5
+
+    q = torch.randn(n_seg, nheads, d, device=device, dtype=dtype)
+    k = torch.randn(n_seg * seqlen_k, nheads_kv, d, device=device, dtype=dtype)
+    v = torch.randn(n_seg * seqlen_k, nheads_kv, d, device=device, dtype=dtype)
+    cu_seqlens_q = torch.arange(n_seg + 1, device=device, dtype=torch.int32)
+    cu_seqlens_k = torch.arange(
+        0, n_seg * seqlen_k + 1, seqlen_k, device=device, dtype=torch.int32
+    )
+
+    out, lse, *rest = flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q=1,
+        max_seqlen_k=seqlen_k,
+        causal=False,
+        softmax_scale=scale,
+        num_splits=0,  # exercise the get_num_splits heuristic
+        return_softmax_lse=True,
+    )
+
+    qf = q.float()
+    kf = k.float().view(n_seg, seqlen_k, nheads_kv, d)[:, :, 0]
+    vf = v.float().view(n_seg, seqlen_k, nheads_kv, d)[:, :, 0]
+    probs = (torch.einsum("nhd,nkd->nhk", qf, kf) * scale).softmax(dim=-1)
+    ref = torch.einsum("nhk,nkd->nhd", probs, vf)
+    torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))
