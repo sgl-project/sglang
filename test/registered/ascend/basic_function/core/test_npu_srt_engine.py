@@ -1,6 +1,5 @@
 import asyncio
 import json
-import multiprocessing as mp
 import unittest
 
 import torch
@@ -149,8 +148,4 @@ class TestNPUSRTEngine(CustomTestCase):
 
 
 if __name__ == "__main__":
-    try:
-        mp.set_start_method("spawn")
-    except RuntimeError:
-        pass
-    unittest.main(warnings="ignore")
+    unittest.main()
