@@ -1,9 +1,11 @@
 """Single-pass online row logsumexp.
 
-Reads the input exactly once with fp32 accumulation and writes one fp32 value
-per row. This is the memory-optimal normalizer for computing logprobs
-directly from logits (``logprob[i] = logit[i] - logsumexp(logits)``) without
-materializing a full-vocab log-softmax.
+Reads the input exactly once with fp32 accumulation and writes per-row
+``(max, log_sum_exp - max)`` fp32 pairs. Keeping the two terms separate lets
+callers compute ``logprob[i] = (logit[i] - max) - log_sum`` the same
+shift-invariant way log-softmax does: folding them into one absolute
+normalizer would round the small log-sum term away whenever rows carry a
+large common offset.
 """
 
 import torch
@@ -28,7 +30,8 @@ def _combine_lse(m_a, l_a, m_b, l_b):
 @triton.jit(do_not_specialize=["num_rows"])
 def _row_logsumexp_kernel(
     x_ptr,
-    out_ptr,
+    out_max_ptr,
+    out_log_sum_ptr,
     row_stride,
     col_stride,
     num_rows,
@@ -57,25 +60,28 @@ def _row_logsumexp_kernel(
         l_blk = tl.where((m_blk == float("inf")) | (m_blk == float("-inf")), 1.0, l_blk)
         m_i, l_i = _combine_lse(m_i, l_i, m_blk, l_blk)
 
-    tl.store(out_ptr + row, m_i + tl.log(l_i))
+    tl.store(out_max_ptr + row, m_i)
+    tl.store(out_log_sum_ptr + row, tl.log(l_i))
 
 
-def row_logsumexp(x: torch.Tensor) -> torch.Tensor:
-    """Per-row logsumexp of a 2D tensor, returned as fp32."""
+def row_logsumexp(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-row ``(max, logsumexp - max)`` of a 2D tensor, as fp32."""
     assert x.ndim == 2
     assert x.dtype in (torch.float16, torch.bfloat16, torch.float32)
 
     num_rows, num_cols = x.shape
-    out = torch.empty(num_rows, device=x.device, dtype=torch.float32)
+    out_max = torch.empty(num_rows, device=x.device, dtype=torch.float32)
+    out_log_sum = torch.empty(num_rows, device=x.device, dtype=torch.float32)
     if num_rows == 0:
-        return out
+        return out_max, out_log_sum
     if num_cols == 0:
-        return out.fill_(float("-inf"))
+        return out_max.fill_(float("-inf")), out_log_sum.zero_()
 
     BLOCK_N = triton.next_power_of_2(min(num_cols, 16384))
     _row_logsumexp_kernel[(num_rows,)](
         x,
-        out,
+        out_max,
+        out_log_sum,
         x.stride(0),
         x.stride(1),
         num_rows,
@@ -83,4 +89,4 @@ def row_logsumexp(x: torch.Tensor) -> torch.Tensor:
         BLOCK_N=BLOCK_N,
         num_warps=8,
     )
-    return out
+    return out_max, out_log_sum
