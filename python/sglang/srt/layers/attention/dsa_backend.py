@@ -486,6 +486,16 @@ class DeepseekSparseAttnBackend(
             assert self.hisparse_coordinator is None, (
                 "DSA decode context parallelism does not support hisparse."
             )
+            assert not model_runner.server_args.enable_prefill_cp, (
+                "DSA decode context parallelism does not compose with "
+                "prefill context parallelism yet: the DCP extend recipe "
+                "all-gathers q across the DCP group assuming every rank "
+                "holds the same extend rows, and prefill-CP row-splitting "
+                "violates that (DCP-group peers hold different tokens). "
+                "The fix is an MLA-style position-ordered KV gather for "
+                "CP-split extends; until then launch with either "
+                "--dcp-size or --enable-prefill-cp, not both."
+            )
             if model_runner.server_args.enable_dp_attention:
                 # A DCP group must nest inside one attention-DP shard: ranks
                 # in a group share the same requests, so the replicated
