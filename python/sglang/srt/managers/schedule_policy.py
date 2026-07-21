@@ -453,6 +453,7 @@ class PrefillAdder:
         max_prefill_bs: int = 0,
         max_running_requests: Optional[int] = None,
         prefill_max_requests: Optional[int] = None,
+        max_prefill_mm_patch_tokens: Optional[int] = None,
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor] = None,
         dllm_config: Optional[DllmConfig] = None,
         waiting_queue_len: int = 0,
@@ -541,6 +542,7 @@ class PrefillAdder:
         self.max_running_requests = max_running_requests
         self.prefill_context_parallel_enabled = is_prefill_context_parallel_enabled()
         self.prefill_max_requests = prefill_max_requests
+        self.max_prefill_mm_patch_tokens = max_prefill_mm_patch_tokens
         self.prefill_delayer_single_pass = prefill_delayer_single_pass
         self.max_prefill_bs = max_prefill_bs
         # Snapshot of scheduler waiting_queue length at the start of this
@@ -1019,6 +1021,23 @@ class PrefillAdder:
 
         if (x := self.prefill_max_requests) is not None and len(self.can_run_list) >= x:
             return AddReqResult.OTHER
+
+        if self.max_prefill_mm_patch_tokens is not None and self.can_run_list:
+            request_mm_patch_tokens = (
+                req.multimodal_inputs.total_image_patch_tokens()
+                if req.multimodal_inputs is not None
+                else 0
+            )
+            admitted_mm_patch_tokens = sum(
+                admitted_req.multimodal_inputs.total_image_patch_tokens()
+                for admitted_req in self.can_run_list
+                if admitted_req.multimodal_inputs is not None
+            )
+            if (
+                admitted_mm_patch_tokens + request_mm_patch_tokens
+                > self.max_prefill_mm_patch_tokens
+            ):
+                return AddReqResult.OTHER
 
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
             return self.add_one_req_ignore_eos(req)
