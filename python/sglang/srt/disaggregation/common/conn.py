@@ -947,9 +947,6 @@ class CommonKVManager(BaseKVManager):
                             self.heartbeat_failures[bootstrap_addr] = (
                                 self.heartbeat_failures.get(bootstrap_addr, 0) + 1
                             )
-                            with self.session_pool_lock:
-                                if bootstrap_addr in self.session_pool:
-                                    del self.session_pool[bootstrap_addr]
                     except Exception:
                         logger.info(f"Attempting to reconnect to {bootstrap_addr}...")
                         self.heartbeat_failures[bootstrap_addr] = (
@@ -1368,7 +1365,6 @@ class CommonKVReceiver(BaseKVReceiver):
                 sock = cls._ctx.socket(zmq.PUSH)
                 if is_ipv6:
                     sock.setsockopt(zmq.IPV6, 1)
-                sock.setsockopt(zmq.RECONNECT_IVL, -1)
                 sock.setsockopt(zmq.LINGER, 0)
                 sock.connect(endpoint)
                 cls._socket_cache[endpoint] = sock
