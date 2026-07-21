@@ -768,11 +768,6 @@ def launch_disagg_role(server_args: ServerArgs):
 
 def dispatch_launch(server_args: ServerArgs):
     """Route to the correct launch function based on --disagg-role."""
-    # FIXME: Torch 2.13 bundles NCCL 2.29, which hard-fails NVLS multicast
-    # bind errors that NCCL 2.28 used to handle by disabling NVLS and
-    # continuing. Keep NVLS disabled by default until the runtime/CI setup can
-    # rely on the new NCCL behavior.
-    # CI failure: https://github.com/sgl-project/sglang/actions/runs/26239210518/job/77224480316?pr=25984
     os.environ.setdefault("NCCL_NVLS_ENABLE", "0")
 
     role = server_args.disagg_role

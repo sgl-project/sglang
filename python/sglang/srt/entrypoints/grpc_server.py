@@ -156,10 +156,6 @@ def _add_admin_routes(app, request_manager):
 
 async def serve_grpc(server_args, model_info=None):
     """Start the standalone gRPC server with integrated scheduler."""
-    # Torch 2.13 bundles NCCL 2.29, which hard-fails NVLS multicast bind
-    # errors that NCCL 2.28 used to handle by disabling NVLS and continuing.
-    # The legacy gRPC entrypoint delegates scheduler launch to smg-grpc-servicer
-    # before the normal SRT engine environment defaults apply.
     if (
         "NCCL_NVLS_ENABLE" not in os.environ
         or server_args.enable_nccl_nvls

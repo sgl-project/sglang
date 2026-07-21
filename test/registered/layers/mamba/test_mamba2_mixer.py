@@ -96,8 +96,6 @@ def mixer2_gated_norm_tensor_parallel(
             "MASTER_PORT": "12345",
         }
     )
-    # Torch 2.13 bundles NCCL 2.29, which hard-fails NVLS multicast bind
-    # errors that NCCL 2.28 used to handle by disabling NVLS and continuing.
     os.environ.setdefault("NCCL_NVLS_ENABLE", "0")
 
     # initialize distributed

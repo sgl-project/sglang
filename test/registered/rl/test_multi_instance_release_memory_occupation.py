@@ -169,8 +169,6 @@ def _run_sglang_subprocess(
     try:
         os.environ["MASTER_ADDR"] = "localhost"
         os.environ["MASTER_PORT"] = str(master_port)
-        # Torch 2.13 bundles NCCL 2.29, which hard-fails NVLS multicast bind
-        # errors that NCCL 2.28 used to handle by disabling NVLS and continuing.
         os.environ.setdefault("NCCL_NVLS_ENABLE", "0")
         dist.init_process_group(
             rank=rank,

@@ -166,8 +166,6 @@ def multigpu_launch(
                 )
     os.environ[env_key] = "1"
     os.environ[pid_key] = str(os.getpid())
-    # Torch 2.13 bundles NCCL 2.29, which hard-fails NVLS multicast bind
-    # errors that NCCL 2.28 used to handle by disabling NVLS and continuing.
     os.environ.setdefault("NCCL_NVLS_ENABLE", "0")
     os.environ.setdefault("OMP_NUM_THREADS", "1")
     os.environ.setdefault("GLOO_SOCKET_IFNAME", "lo")  # single-machine setup

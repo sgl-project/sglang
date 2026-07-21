@@ -203,8 +203,6 @@ def test_lplb_distributed_two_rank():
 
 def _worker_main(local_rank: int, world_size: int):
     """Per-rank entry point under torch.multiprocessing.spawn."""
-    # Torch 2.13 bundles NCCL 2.29, which hard-fails NVLS multicast bind
-    # errors that NCCL 2.28 used to handle by disabling NVLS and continuing.
     os.environ.setdefault("NCCL_NVLS_ENABLE", "0")
 
     # Inject minimal ServerArgs before any LPLB module reads the global state.
