@@ -1027,7 +1027,7 @@ class ModelRunner:
         if self.server_args.dwdp_size <= 1:
             return
         from sglang.srt.layers.moe.dwdp import DwdpManager
-        
+
         manager = DwdpManager(self.server_args)
         set_global_dwdp_manager(manager)
         manager.setup(self.model)
