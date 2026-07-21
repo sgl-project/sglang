@@ -45,6 +45,10 @@ def prepare_decode_context_parallel_metadata(
     parallel = get_parallel()
     if not parallel.dcp_enabled:
         return None
+    if extend_prefix_lens is None:
+        # Extend-class forwards without chunked-prefix metadata (e.g. eager
+        # target-verify) build their DCP metadata in the attention backend.
+        return None
     # dcp_kv_buffer tokens' layout
     # [ rank0_r1.prefix_tokens, rank1_r1.prefix_tokens, ..., rank7_r1.prefix_tokens,
     #   ...,

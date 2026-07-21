@@ -156,5 +156,36 @@ class TestGetDcpLensPageBoundary(unittest.TestCase):
                 )
 
 
+class TestPlannerNoneExtendPrefixLens(unittest.TestCase):
+    """Extend-class forwards without chunked-prefix metadata (eager
+    target-verify) must get None from the planner, not a cumsum(None) crash."""
+
+    def test_none_extend_prefix_lens_returns_none(self):
+        from types import SimpleNamespace
+        from unittest import mock
+
+        from sglang.srt.layers.dcp import planner
+
+        with mock.patch.object(
+            planner,
+            "get_parallel",
+            return_value=SimpleNamespace(dcp_enabled=True, dcp_size=8, dcp_rank=0),
+        ):
+            got = planner.prepare_decode_context_parallel_metadata(
+                seq_lens=torch.tensor([7, 12], dtype=torch.int32),
+                extend_prefix_lens=None,
+                extend_prefix_lens_cpu=None,
+                extend_seq_lens=None,
+                req_pool_indices=torch.tensor([0, 1], dtype=torch.int32),
+                req_to_token=torch.zeros((2, 32), dtype=torch.int32),
+                seq_lens_sum=19,
+                kv_buffer_shape=torch.Size([1024, 1, 576]),
+                kv_cache_dtype=torch.float8_e4m3fn,
+                kv_cache_device="cpu",
+                create_chunked_prefix_cache_kv_indices_fn=None,
+            )
+        self.assertIsNone(got)
+
+
 if __name__ == "__main__":
     unittest.main()
