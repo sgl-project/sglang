@@ -22,6 +22,7 @@ _compiled_fn reused for every shape.
 
 from __future__ import annotations
 
+import warnings
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
@@ -63,6 +64,10 @@ if TYPE_CHECKING:
 _VALID_COMPILERS = ("eager", "inductor")
 
 
+def _suppress_lru_cache_dynamo_warning() -> None:
+    warnings.filterwarnings("ignore", message=".*lru_cache.*", module="torch._dynamo")
+
+
 def _toggle_multi_platform_ops(
     model: torch.nn.Module, *, reverse: bool, num_tokens: int
 ) -> None:
@@ -95,6 +100,7 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
         self._language_model: torch.nn.Module = getattr(
             model_runner.model, "language_model", model_runner.model
         )
+        _suppress_lru_cache_dynamo_warning()
         self._run_compile_pass(cuda_graph_runner)
         # model_runner.model.forward is the wrapper that builds LogitsProcessorOutput.
         # The compiled trampoline is dispatched internally by it.
@@ -200,6 +206,14 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
                                     f"Compiling num tokens ({num_tokens=})"
                                 )
                             cuda_graph_runner._run_dummy_forward(num_tokens=num_tokens)
+
+                # Qwen3-VL deepstack embeddings are produced only after
+                # visual encoding. First trace the tensor branch above, then
+                # execute it once outside the compile-warmup marker so its
+                # regular kernel/JIT warmup also happens during startup.
+                cuda_graph_runner.run_dummy_multimodal_deepstack_forward(
+                    inner_model, cuda_graph_runner.capture_num_tokens[-1]
+                )
             finally:
                 _toggle_multi_platform_ops(inner_model, reverse=True, num_tokens=16)
 

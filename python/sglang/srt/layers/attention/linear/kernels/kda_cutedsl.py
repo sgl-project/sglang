@@ -105,6 +105,13 @@ class CuteDSLKDAKernel(LinearAttnKernelBase):
         lower_bound: Optional[float] = None,
         **kwargs,
     ) -> torch.Tensor:
+        if kwargs.get("return_intermediate_states"):
+            raise NotImplementedError(
+                "CuteDSLKDAKernel.extend cannot return intermediate chunk "
+                "states required by mamba_radix_cache_strategy=extra_buffer; "
+                "use --linear-attn-prefill-backend triton or "
+                "--mamba-radix-cache-strategy no_buffer."
+            )
         head_k_dim = k.shape[-1]
         self._ensure_extend_loaded(head_k_dim)
 
@@ -120,27 +127,29 @@ class CuteDSLKDAKernel(LinearAttnKernelBase):
         beta_in = beta[0][:num_tokens].to(torch.float32)
         cu_seqlens = query_start_loc.to(torch.int32)
 
-        # Pool gather: remap padding (-1) to the last (sentinel) slot. State is
+        # Pool state I/O is fused into the h kernel's TMA load/store: pass the
+        # pool + per-seq slots and the kernel reads h0/writes ht in place at
+        # those rows (no gather/scatter kernels, no [N, HV, V, K] intermediates).
+        # Remap padding (-1) to the last (sentinel) slot. State is
         # [slots, HV, V, K] == cutedsl [V,K] layout, no transpose needed.
         ssm_cache_indices = torch.where(
             cache_indices >= 0, cache_indices, ssm_states.shape[0] - 1
-        ).to(torch.long)
-        initial_state = ssm_states[ssm_cache_indices].contiguous()
+        ).to(torch.int32)
 
-        o, final_state = self._extend_fn(
+        o, _ = self._extend_fn(
             q_n,
             k_n,
             v_in,
             g_in,
             beta_in,
-            initial_state,
+            ssm_states,
             cu_seqlens,
             A_log=A_log,
             dt_bias=dt_bias,
             lower_bound=lower_bound,
+            h0_indices=ssm_cache_indices,
         )
 
-        ssm_states.index_copy_(0, ssm_cache_indices, final_state.to(ssm_states.dtype))
         # Match chunk_kda's output layout [1, T, HV, V].
         return o.unsqueeze(0)
 
