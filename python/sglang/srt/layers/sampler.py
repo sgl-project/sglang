@@ -116,6 +116,9 @@ class Sampler(nn.Module):
         """
         logits = logits_output.next_token_logits
 
+        if logits.shape[0] == 0:
+            return torch.empty((0,), dtype=torch.int64, device=logits.device)
+
         # Preprocess logits (custom processors and NaN handling)
         logits = self._preprocess_logits(logits, sampling_info)
         return_sampling_mask = any(sampling_info.return_sampling_masks or [])
