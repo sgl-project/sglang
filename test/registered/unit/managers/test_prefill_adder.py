@@ -6,6 +6,7 @@ import torch
 
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
+from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefResult,
     IncLockRefResult,
@@ -472,6 +473,7 @@ class TestPrefillAdder(CustomTestCase):
 
         req = self.create_mock_req("chunked", priority=0, max_new_tokens=128)
         req.prefix_indices = []
+        req.kv_committed_len = 0
         req.full_untruncated_fill_ids = list(range(extend_input_len))
         # set_extend_range is the only writer of extend_range; the production
         # path reads req.extend_range.length right after calling it, so the mock
@@ -713,6 +715,70 @@ class TestPrefillAdder(CustomTestCase):
         self.assertIsNone(result)
         req.set_extend_range.assert_called_once_with(0, 200)
         self.assertIn(req, adder.can_run_list)
+
+    def test_exact_context_budget_counts_no_kv_for_final_sample(self):
+        self.mock_token_allocator.available_size.return_value = 262144
+        adder = self.create_adder(
+            self.create_running_batch(), page_size=64, rem_chunk_tokens=1024
+        )
+
+        adder._update_prefill_budget(
+            prefix_len=0,
+            extend_input_len=262136,
+            max_new_tokens=8,
+            retracted_stain=False,
+        )
+
+        self.assertEqual(adder.rem_total_token_offset, 262144)
+
+    def test_full_kv_page_boundary_admission(self):
+        capacity = 262144
+        self.mock_token_allocator.available_size.return_value = capacity
+        self.mock_token_allocator.full_available_size.return_value = capacity
+
+        def result(input_len, max_new_tokens=8):
+            adder = self.create_adder(
+                self.create_running_batch(), page_size=64, rem_chunk_tokens=1024
+            )
+            req = self.create_mock_req(
+                f"boundary-{input_len}", priority=0, max_new_tokens=max_new_tokens
+            )
+            req.prefix_indices = torch.empty(0, dtype=torch.int64)
+            req.full_untruncated_fill_ids = range(input_len)
+            req.host_hit_length = 0
+            req.mamba_host_hit_length = 0
+            req.last_node = self.mock_tree_cache.root_node
+            req.best_match_node = None
+            req.sampling_params.ignore_eos = False
+            req.set_extend_range = MagicMock(
+                side_effect=lambda start, end: setattr(
+                    req, "extend_range", Range(start, end)
+                )
+            )
+            return adder.add_one_req(
+                req, has_chunked_req=False, truncation_align_size=None
+            )
+
+        self.assertNotEqual(result(262073), AddReqResult.NO_TOKEN)
+        self.assertNotEqual(result(262137), AddReqResult.NO_TOKEN)
+        self.assertEqual(result(262138), AddReqResult.NO_TOKEN)
+
+    def test_max_new_tokens_clamped_at_exact_context_boundary(self):
+        scheduler = object.__new__(Scheduler)
+        scheduler.max_req_len = 262143
+        scheduler.max_total_num_tokens = 262144
+        scheduler.max_new_tokens_limit = None
+
+        for input_len, expected in ((262135, 9), (262136, 8), (262137, 7)):
+            with self.subTest(input_len=input_len):
+                req = SimpleNamespace(
+                    origin_input_ids=range(input_len),
+                    sampling_params=SimpleNamespace(
+                        max_new_tokens=10, min_new_tokens=0
+                    ),
+                )
+                scheduler.init_req_max_new_tokens(req)
+                self.assertEqual(req.sampling_params.max_new_tokens, expected)
 
 
 if __name__ == "__main__":
