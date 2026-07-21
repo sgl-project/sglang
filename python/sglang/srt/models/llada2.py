@@ -83,6 +83,7 @@ from sglang.srt.runtime_context import (
     get_stream,
 )
 from sglang.srt.utils import (
+    LazyValue,
     add_prefix,
     is_cuda,
     is_non_idle_and_non_empty,
@@ -966,12 +967,17 @@ class LLaDA2MoeModelLM(nn.Module):
                     )
                     weight_loader(param, loaded_weight)
 
-        self.routed_experts_weights_of_layer = {
-            layer_id: layer.mlp.get_moe_weights()
-            for layer_id, layer in enumerate(self.model.layers)
-            if not isinstance(layer, PPMissingLayer)
-            and isinstance(layer.mlp, LLaDA2MoeSparseMoeBlock)
-        }
+        # Lazy: get_moe_weights() snapshots x.data, and building the map here would
+        # pin every expert weight's pre-process_weights_after_loading storage.
+        if not hasattr(self, "routed_experts_weights_of_layer"):
+            self.routed_experts_weights_of_layer = LazyValue(
+                lambda: {
+                    layer_id: layer.mlp.get_moe_weights()
+                    for layer_id, layer in enumerate(self.model.layers)
+                    if not isinstance(layer, PPMissingLayer)
+                    and isinstance(layer.mlp, LLaDA2MoeSparseMoeBlock)
+                }
+            )
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
