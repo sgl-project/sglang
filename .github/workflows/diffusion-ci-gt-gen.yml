@@ -19,7 +19,7 @@ on:
         default: ''
         type: string
       publish_target_dir:
-        description: 'Remote target directory in sgl-project/ci-data. Leave empty to use sglang_generated, or official_generated when run_official_cases is true.'
+        description: 'Remote target directory in sgl-project/ci-data-diffusion. Leave empty to use sglang_generated, or official_generated when run_official_cases is true.'
         required: false
         default: ''
         type: string
@@ -44,7 +44,7 @@ on:
         default: ''
         type: string
       ci_data_ref:
-        description: 'ci-data ref to use for repro scripts when running official GT cases.'
+        description: 'ci-data-diffusion ref to use for repro scripts when running official GT cases.'
         required: false
         default: 'main'
         type: string
@@ -163,10 +163,10 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
 
-      - name: Checkout ci-data repro scripts
+      - name: Checkout ci-data-diffusion repro scripts
         uses: actions/checkout@v4
         with:
-          repository: sgl-project/ci-data
+          repository: sgl-project/ci-data-diffusion
           ref: ${{ inputs.ci_data_ref || 'main' }}
           path: ci-data
           token: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
@@ -303,7 +303,7 @@ jobs:
             --target-dir "${{ env.PUBLISH_TARGET_DIR }}" \
             --check-only
 
-      - name: Publish official GT images to sgl-project/ci-data
+      - name: Publish official GT images to sgl-project/ci-data-diffusion
         env:
           GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
         run: |
@@ -412,7 +412,7 @@ jobs:
             --target-dir "${{ env.PUBLISH_TARGET_DIR }}" \
             --check-only
 
-      - name: Publish GT images to sgl-project/ci-data
+      - name: Publish GT images to sgl-project/ci-data-diffusion
         env:
           GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
         run: |
@@ -487,7 +487,7 @@ jobs:
             --target-dir "${{ env.PUBLISH_TARGET_DIR }}" \
             --check-only
 
-      - name: Publish GT images to sgl-project/ci-data
+      - name: Publish GT images to sgl-project/ci-data-diffusion
         env:
           GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
         run: |
@@ -562,7 +562,7 @@ jobs:
             --target-dir "${{ env.PUBLISH_TARGET_DIR }}" \
             --check-only
 
-      - name: Publish GT images to sgl-project/ci-data
+      - name: Publish GT images to sgl-project/ci-data-diffusion
         env:
           GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
         run: |
