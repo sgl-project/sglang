@@ -137,7 +137,7 @@ BF16 on H200 leaves less headroom for CUDA-graph capture and NCCL allocations th
 
 **FP8 and NVFP4 DFlash drafts**
 
-The HF checkpoints `poolside/Laguna-S-2.1-DFlash-FP8` and `poolside/Laguna-S-2.1-DFlash-NVFP4` (as of 2026-07-20) are missing `rope_theta` in `rope_parameters`. If the server crashes at draft-model load with a `KeyError: 'rope_theta'`, patch the draft config locally: add `"rope_theta": 500000.0` to the `rope_parameters` block. The BF16 and INT4 draft models are unaffected.
+Fixed upstream on 2026-07-21: all DFlash draft configs now use a flat top-level `rope_theta` (the `rope_parameters` block was removed). If a server crashes at draft-model load with `KeyError: 'rope_theta'`, you are serving a draft checkpoint cached before 2026-07-21 — re-download it (e.g. `hf download poolside/Laguna-S-2.1-DFlash-FP8`) to pick up the corrected config.
 
 **DFlash memory**
 
