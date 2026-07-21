@@ -74,6 +74,7 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     commit_mamba_states_after_verify,
     draft_tp_context,
+    generate_token_bitmask,
     record_stream_each,
     record_stream_for_v2_verify,
     sample_draft_proposal,
@@ -1135,11 +1136,36 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         # Sample
         maybe_detect_nan(logits_output.next_token_logits, "verify: target model logits")
         maybe_detect_inf(logits_output.next_token_logits, "verify: target model logits")
+
+        # Generate the grammar vocab mask for constrained/structured output.
+        # Without this, multi-layer eagle verify accepts draft tokens
+        # unconstrained and the grammar only rejects at commit -> FINISH_ABORT
+        # for every structured-output request. Mirrors EAGLEWorkerV2.verify.
+        vocab_mask = None
+        if batch.has_grammar:
+            retrieve_next_token_cpu = verify_input.retrieve_next_token.cpu()
+            retrieve_next_sibling_cpu = verify_input.retrieve_next_sibling.cpu()
+            draft_tokens_cpu = verify_input.draft_token.view(
+                verify_input.retrieve_next_token.shape
+            ).cpu()
+            vocab_mask = generate_token_bitmask(
+                batch.reqs,
+                verify_input,
+                retrieve_next_token_cpu,
+                retrieve_next_sibling_cpu,
+                draft_tokens_cpu,
+                batch.sampling_info.vocab_size,
+            )
+            if vocab_mask is not None:
+                assert verify_input.grammar is not None
+                vocab_mask = vocab_mask.to(verify_input.retrieve_next_token.device)
+                batch.sampling_info.vocab_mask = None
+
         (
             predict,
             accept_lens,
             accept_index,
-        ) = eagle_sample(verify_input, batch, logits_output)
+        ) = eagle_sample(verify_input, batch, logits_output, vocab_mask)
         new_seq_lens = batch.seq_lens + accept_lens
 
         commit_mamba_states_after_verify(
