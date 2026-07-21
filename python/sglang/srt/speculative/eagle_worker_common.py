@@ -539,7 +539,7 @@ def run_eagle_verify(
         retrieve_next_token_cpu = _async_d2h(verify_input.retrieve_next_token)
         retrieve_next_sibling_cpu = _async_d2h(verify_input.retrieve_next_sibling)
         draft_tokens_cpu = _async_d2h(
-            verify_input.draft_token.view(verify_input.retrieve_next_token.shape)
+            verify_input.draft_token.reshape(verify_input.retrieve_next_token.shape)
         )
         grammar_copy_done = torch.get_device_module(device).Event()
         grammar_copy_done.record()
