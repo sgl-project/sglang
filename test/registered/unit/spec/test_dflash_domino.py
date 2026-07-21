@@ -292,6 +292,118 @@ class TestDFlashDominoRollout(CustomTestCase):
         )
         torch.testing.assert_close(batched, individual, rtol=0, atol=0)
 
+    def test_capture_sampler_matches_eager_rollout(self):
+        from sglang.srt.speculative.dflash_worker_v2 import _DominoDraftSampler
+
+        block_size = 7
+        batch_size = 3
+        for shift_label in (True, False):
+            with self.subTest(shift_label=shift_label):
+                draft_hidden = torch.randn(
+                    batch_size,
+                    block_size,
+                    self.hidden_size,
+                    device=self.device,
+                    dtype=self.dtype,
+                )
+                verified_ids = torch.tensor([1, 4, 9], device=self.device)
+                block_ids = torch.zeros(
+                    batch_size,
+                    block_size,
+                    device=self.device,
+                    dtype=torch.long,
+                )
+                block_ids[:, 0].copy_(verified_ids)
+                sampler = _DominoDraftSampler(
+                    target_embedding=self.embedding,
+                    lm_head_weight=self.lm_head_weight,
+                    prefix_gru=self.prefix_gru,
+                    embed_proj=self.embed_proj,
+                    vocab_size=self.vocab_size,
+                    block_size=block_size,
+                    shift_label=shift_label,
+                    max_bs=batch_size,
+                )
+                sampler(draft_hidden.reshape(-1, self.hidden_size), block_ids.flatten())
+                expected = domino_greedy_rollout(
+                    draft_hidden=draft_hidden,
+                    verified_ids=verified_ids,
+                    target_embedding=self.embedding,
+                    lm_head_weight=self.lm_head_weight,
+                    prefix_gru=self.prefix_gru,
+                    embed_proj=self.embed_proj,
+                    vocab_size=self.vocab_size,
+                    shift_label=shift_label,
+                )
+                actual = sampler.out[: batch_size * (block_size - 1)].view(
+                    batch_size, block_size - 1
+                )
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_capture_sampler_replays_with_new_inputs(self):
+        from sglang.srt.speculative.dflash_worker_v2 import _DominoDraftSampler
+
+        block_size = 4
+        batch_size = 2
+        sampler = _DominoDraftSampler(
+            target_embedding=self.embedding,
+            lm_head_weight=self.lm_head_weight,
+            prefix_gru=self.prefix_gru,
+            embed_proj=self.embed_proj,
+            vocab_size=self.vocab_size,
+            block_size=block_size,
+            shift_label=True,
+            max_bs=batch_size,
+        )
+        static_hidden = torch.randn(
+            batch_size * block_size,
+            self.hidden_size,
+            device=self.device,
+            dtype=self.dtype,
+        )
+        static_ids = torch.zeros(
+            batch_size * block_size, device=self.device, dtype=torch.long
+        )
+        static_ids.view(batch_size, block_size)[:, 0].copy_(
+            torch.tensor([2, 7], device=self.device)
+        )
+
+        warmup_stream = torch.cuda.Stream()
+        warmup_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(warmup_stream):
+            sampler(static_hidden, static_ids)
+        torch.cuda.current_stream().wait_stream(warmup_stream)
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            sampler(static_hidden, static_ids)
+
+        new_hidden = torch.randn_like(static_hidden)
+        new_ids = torch.zeros_like(static_ids)
+        new_ids.view(batch_size, block_size)[:, 0].copy_(
+            torch.tensor([3, 11], device=self.device)
+        )
+        static_hidden.copy_(new_hidden)
+        static_ids.copy_(new_ids)
+        expected = domino_greedy_rollout(
+            draft_hidden=new_hidden.view(batch_size, block_size, self.hidden_size),
+            verified_ids=new_ids.view(batch_size, block_size)[:, 0],
+            target_embedding=self.embedding,
+            lm_head_weight=self.lm_head_weight,
+            prefix_gru=self.prefix_gru,
+            embed_proj=self.embed_proj,
+            vocab_size=self.vocab_size,
+            shift_label=True,
+        )
+        graph.replay()
+        torch.cuda.synchronize()
+
+        actual = sampler.out[: batch_size * (block_size - 1)].view(
+            batch_size, block_size - 1
+        )
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
 
 class TestDFlashDominoRuntimeValidation(CustomTestCase):
     def _modules(self, dtype=torch.bfloat16):
