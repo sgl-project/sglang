@@ -1587,7 +1587,7 @@ async def abort_request(obj: Annotated[AbortReq, Body()], request: Request):
     """Abort a request."""
     try:
         _global_state.tokenizer_manager.abort_request(
-            rid=obj.rid, abort_all=obj.abort_all
+            rid=obj.rid, abort_all=obj.abort_all, prefix=obj.prefix
         )
         return Response(status_code=200)
     except Exception as e:

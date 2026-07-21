@@ -163,6 +163,12 @@ class ReqState:
     last_completion_tokens: int = 1
     ttft_observed: bool = False
 
+    # An abort matched this rid while the request was still tokenizer-held
+    # (parked at the pause gate / model-update lock / tokenization). The
+    # scheduler never saw the rid, so the dispatch path must resolve the
+    # request as aborted instead of sending it.
+    abort_before_dispatch: bool = False
+
     # For streaming output
     last_output_offset: int = 0
 
@@ -1328,10 +1334,35 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
         )
 
+    def _abort_instead_of_dispatch(
+        self,
+        tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
+    ) -> bool:
+        """Resolve a request whose rid an abort matched while it was still
+        tokenizer-held (see abort_request): the scheduler never saw the rid, so
+        it must be finished here instead of dispatched. Returns True if the
+        request was aborted."""
+        state = self.rid_to_state.get(tokenized_obj.rid)
+        if (
+            state is None
+            or not state.abort_before_dispatch
+            or is_health_check_generate_req(tokenized_obj)
+        ):
+            return False
+        self._handle_abort_req(
+            AbortReq(
+                rid=tokenized_obj.rid,
+                abort_message="Aborted by AbortReq before dispatch to scheduler",
+            )
+        )
+        return True
+
     def _send_one_request(
         self,
         tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
     ):
+        if self._abort_instead_of_dispatch(tokenized_obj):
+            return
         tokenized_obj.time_stats.set_api_server_dispatch_time()
         tokenized_obj = wrap_shm_features(tokenized_obj)
         time_stats = tokenized_obj.time_stats
@@ -1347,6 +1378,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         ],
     ):
         """Send a batch of tokenized requests as a single batched request to the scheduler."""
+        tokenized_objs = [
+            tokenized_obj
+            for tokenized_obj in tokenized_objs
+            if not self._abort_instead_of_dispatch(tokenized_obj)
+        ]
+        if not tokenized_objs:
+            return
         set_time_batch(tokenized_objs, "set_api_server_dispatch_time")
         time_stats = [tokenized_obj.time_stats for tokenized_obj in tokenized_objs]
         for tokenized_obj in tokenized_objs:
@@ -1674,18 +1712,32 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     except StopAsyncIteration:
                         pass
 
-    def abort_request(self, rid: str = "", abort_all: bool = False):
+    def abort_request(
+        self, rid: str = "", abort_all: bool = False, prefix: bool = False
+    ):
         # Empty rid would startswith-match every request on the scheduler.
         if not abort_all and not rid:
             logger.warning("Ignore abort_request with empty rid and abort_all=False")
             return
-        if (
-            not abort_all
-            and self.server_args.tokenizer_worker_num == 1
-            and rid not in self.rid_to_state
-        ):
-            return
-        req = AbortReq(rid=rid, abort_all=abort_all)
+        if not abort_all and self.server_args.tokenizer_worker_num == 1:
+            if prefix:
+                if not any(r.startswith(rid) for r in self.rid_to_state):
+                    return
+            elif rid not in self.rid_to_state:
+                return
+        # A matching request can still be tokenizer-held: rid_to_state is
+        # populated in _init_req_state, several awaits (pause gate,
+        # model_update_lock, tokenization) before the scheduler learns the rid
+        # in _send_one_request. The scheduler-side abort cannot match those, so
+        # flag them here; the dispatch path resolves flagged requests as
+        # aborted instead of sending them. Already-dispatched requests are
+        # unaffected (the flag is only read at dispatch).
+        for tracked_rid, state in self.rid_to_state.items():
+            if abort_all or (
+                tracked_rid.startswith(rid) if prefix else tracked_rid == rid
+            ):
+                state.abort_before_dispatch = True
+        req = AbortReq(rid=rid, abort_all=abort_all, prefix=prefix)
         self._dispatch_to_scheduler(req)
         if self.enable_metrics:
             # TODO: also use custom_labels from the request
