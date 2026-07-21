@@ -4,10 +4,15 @@ import torch
 
 from sglang.kernels.ops.speculative.cache_locs import assign_extend_cache_locs_func
 from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.speculative.dspark_components.kernels.dspark_verify_window import (
     BuildCommitInjectLayout,
 )
-from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
+from sglang.srt.speculative.ragged_verify import (
+    RaggedVerifyLayout,
+    RaggedVerifyMode,
+    read_ragged_verify_mode,
+)
 
 
 class TargetHiddenKvInjector:
@@ -27,6 +32,12 @@ class TargetHiddenKvInjector:
         self.device = device
         self.verify_num_draft_tokens = verify_num_draft_tokens
         self._block_pos_offsets = block_pos_offsets
+        # Static staging buffers for the draft-graph inject prologue
+        # (allocated at first graph capture, sized to the max capture bs).
+        self._inject_bufs: Optional[dict] = None
+        self._inject_max_bs = 0
+        self._inject_pending = False
+        self._inject_staged_bs = 0
 
     def inject_target_hidden(
         self,
@@ -101,6 +112,127 @@ class TargetHiddenKvInjector:
                 positions=positions,
                 pool=pool,
             )
+
+    def _dense_pool(self):
+        pool = self.draft_model_runner.token_to_kv_pool
+        if hasattr(pool, "set_swa_key_buffer_radix_fused_norm_rope"):
+            return None
+        return pool
+
+    def capture_prologue_hook(self, runner, forward_batch, num_tokens) -> None:
+        """Recorded at the head of the draft TARGET_VERIFY graph: commit the
+        staged target-hidden KV before the block-draft layers read it.
+        Un-staged replays (idle participation / static verify) see zeroed
+        commit_lens rows, which make every KV write a no-op."""
+        if read_ragged_verify_mode() is not RaggedVerifyMode.COMPACT:
+            return
+        if self._dense_pool() is None:
+            return
+        if runner.capture_forward_mode != ForwardMode.TARGET_VERIFY:
+            return
+        if self._inject_bufs is None:
+            max_bs = int(runner.capture_bs[-1])
+            # The staged hidden is the concatenated multi-layer context
+            # features, not a single hidden vector.
+            hidden_size = (
+                self.draft_model.num_context_features
+                * self.model_runner.model_config.hidden_size
+            )
+            dev = self.device
+            self._inject_max_bs = max_bs
+            self._inject_bufs = {
+                "seq_lens": torch.zeros(max_bs, dtype=torch.int64, device=dev),
+                "req_pool_indices": torch.zeros(max_bs, dtype=torch.int64, device=dev),
+                "hidden": torch.zeros(
+                    max_bs * self.verify_num_draft_tokens,
+                    hidden_size,
+                    dtype=self.model_runner.dtype,
+                    device=dev,
+                ),
+                "commit_lens": torch.zeros(max_bs, dtype=torch.int32, device=dev),
+            }
+        bs = min(int(forward_batch.batch_size), self._inject_max_bs)
+        self._inject_prologue_body(bs)
+
+    def _inject_prologue_body(self, bs: int) -> None:
+        stride = self.verify_num_draft_tokens
+        bufs = self._inject_bufs
+        prefix_lens = bufs["seq_lens"][:bs]
+        positions_2d = prefix_lens.unsqueeze(1) + self._block_pos_offsets
+        verify_cache_loc = assign_extend_cache_locs_func(
+            req_pool_indices=bufs["req_pool_indices"][:bs],
+            req_to_token=self.model_runner.req_to_token_pool.req_to_token,
+            start_offset=prefix_lens,
+            end_offset=prefix_lens + stride,
+            batch_size=bs,
+            draft_token_num=stride,
+            device=self.device,
+        )
+        self.inject_target_hidden(
+            target_hidden=bufs["hidden"][: bs * stride],
+            cache_loc=verify_cache_loc,
+            cache_loc_2d=verify_cache_loc.view(bs, stride),
+            positions=positions_2d.reshape(-1),
+            commit_lens=bufs["commit_lens"][:bs],
+        )
+
+    def stage_ragged(
+        self,
+        *,
+        batch: ScheduleBatch,
+        hidden_strided: Optional[torch.Tensor],
+        commit_lens: torch.Tensor,
+        bs: int,
+    ) -> bool:
+        """Stage the ragged inject inputs for the draft-graph prologue.
+        Returns False when the caller must run the eager inject instead."""
+        if self._inject_bufs is None or self._dense_pool() is None:
+            return False
+        if hidden_strided is None or hidden_strided.numel() == 0:
+            return True
+        if bs > self._inject_max_bs:
+            return False
+        stride = self.verify_num_draft_tokens
+        bufs = self._inject_bufs
+        torch._foreach_zero_(
+            [
+                bufs["seq_lens"][bs:],
+                bufs["req_pool_indices"][bs:],
+                bufs["commit_lens"][bs:],
+            ]
+        )
+        torch._foreach_copy_(
+            [
+                bufs["seq_lens"][:bs],
+                bufs["req_pool_indices"][:bs],
+                bufs["hidden"][: bs * stride],
+                bufs["commit_lens"][:bs],
+            ],
+            [
+                batch.seq_lens[:bs],
+                batch.req_pool_indices[:bs],
+                hidden_strided.view(bs * stride, -1),
+                commit_lens[:bs].to(torch.int32),
+            ],
+        )
+        self._inject_pending = True
+        self._inject_staged_bs = bs
+        return True
+
+    def pre_draft_forward(self, forward_batch) -> None:
+        """Called right before the draft block forward. Flushes the staged
+        inject eagerly when the forward will not replay a graph, and clears
+        stale commit_lens before un-staged graph replays (idle batches)."""
+        if self._inject_bufs is None:
+            return
+        runner = getattr(self.draft_model_runner, "decode_cuda_graph_runner", None)
+        will_graph = runner is not None and runner.can_run_graph(forward_batch)
+        if self._inject_pending:
+            self._inject_pending = False
+            if not will_graph:
+                self._inject_prologue_body(self._inject_staged_bs)
+        elif will_graph:
+            self._inject_bufs["commit_lens"].zero_()
 
     def inject_ragged(
         self,

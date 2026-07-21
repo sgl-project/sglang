@@ -10,7 +10,10 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
-from sglang.srt.speculative.dflash_utils import apply_dflash_verify_logits_adjustments
+from sglang.srt.speculative.dflash_utils import (
+    _get_or_create_chain_verify_buffers,
+    apply_dflash_verify_logits_adjustments,
+)
 from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockResult
 from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
     TargetHiddenKvInjector,
@@ -22,11 +25,13 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
 from sglang.srt.speculative.dspark_components.kernels.dspark_accept import (
     AcceptGreedy,
     AcceptSampling,
+    CapCorrectLen,
     FinalizeAcceptLens,
     SelectMixedAccept,
     SoftmaxTemp,
     accept_greedy_triton,
     finalize_accept_lens_triton,
+    gather_two_level_bonus_triton,
 )
 from sglang.srt.speculative.dspark_components.kernels.dspark_verify_window import (
     BuildCommitInjectLayout,
@@ -37,6 +42,7 @@ from sglang.srt.speculative.dspark_components.kernels.dspark_verify_window impor
     scatter_compact_to_strided_into,
 )
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
+from sglang.srt.speculative.reject_sampling import chain_speculative_sampling_triton
 
 
 def verify_logits_adjustments_are_noop(sampling_info) -> bool:
@@ -292,6 +298,14 @@ class TargetVerifyExecutor:
         run_compact: bool,
     ) -> None:
         if run_compact:
+            if self.kv_injector.stage_ragged(
+                batch=batch,
+                hidden_strided=hidden_strided,
+                commit_lens=commit_lens,
+                bs=bs,
+            ):
+                # Written inside the draft graph's inject prologue.
+                return
             self.kv_injector.inject_ragged(
                 batch=batch,
                 layout=layout,
@@ -382,12 +396,21 @@ class TargetVerifyExecutor:
         logits_output = target_verify.logits_output
 
         stride = self.verify_num_draft_tokens
-        if self.verify_epilogue is not None and target_verify.can_run_cuda_graph:
+        # strided_logits stays None for the process lifetime when no captured
+        # graph recorded the epilogue (capture_hook early-returns for runners
+        # whose attention backend lacks ragged-verify graph support and thus
+        # capture fixed-width geometry) -- fall through to the compact readout
+        # below instead of asserting.
+        if (
+            self.verify_epilogue is not None
+            and target_verify.can_run_cuda_graph
+            and self.verify_epilogue.strided_logits is not None
+        ):
             strided_logits = self.verify_epilogue.strided_logits
             hidden_strided = self.verify_epilogue.strided_hidden
-            assert strided_logits is not None and hidden_strided is not None, (
-                "verify epilogue buffers unwritten after a graph replay -- the "
-                "replayed graph was captured without the epilogue"
+            assert hidden_strided is not None, (
+                "verify epilogue hidden buffer unwritten while logits buffer "
+                "is written -- inconsistent epilogue capture"
             )
             strided_logits = strided_logits[: bs * stride]
             hidden_strided = hidden_strided[: bs * stride]
@@ -484,9 +507,26 @@ class DsparkVerifyEpilogue:
         )
         self.strided_logits: Optional[torch.Tensor] = None
         self.strided_hidden: Optional[torch.Tensor] = None
+        # Sampling-accept fold: staged per-step inputs. temps default to 1.0
+        # so an un-armed replay's in-graph softmax stays finite (its result is
+        # discarded by the all-greedy mask anyway).
+        self.temps_buf = torch.ones(
+            (self.max_bs, 1), dtype=torch.float32, device=device
+        )
+        self.greedy_mask_buf = torch.ones(
+            (self.max_bs,), dtype=torch.bool, device=device
+        )
+        self.draft_probs_buf: Optional[torch.Tensor] = None
 
     def capture_hook(self, runner, out, forward_batch, num_tokens) -> None:
-        if runner.model_runner.is_draft_worker or not runner.ragged_verify_mode:
+        # Record the epilogue into every target-verify graph of the main
+        # worker: ragged-geometry captures AND the fixed-width fallback used
+        # when the attention backend lacks ragged-verify graph support
+        # (fixed width is the all-full-widths special case; the in-graph
+        # scatter/accept reads verify_lens_buf, so replay stays correct).
+        if runner.model_runner.is_draft_worker:
+            return
+        if runner.capture_forward_mode != ForwardMode.TARGET_VERIFY:
             return
         if (
             not isinstance(out, LogitsProcessorOutput)
@@ -562,6 +602,7 @@ class DsparkVerifyEpilogue:
     ) -> None:
         self.strided_logits = self._ensure_out(self.strided_logits, compact_logits)
         self.strided_hidden = self._ensure_out(self.strided_hidden, compact_hidden)
+        self.ensure_draft_probs_buf(compact_logits.shape[1], compact_logits.device)
         verify_lens = self.verify_lens_buf[:bs]
         self._scatter(compact_logits, compact_hidden, verify_lens, bs)
         commit_lens = self._accept(input_ids, seq_lens, verify_lens, bs)
@@ -603,6 +644,24 @@ class DsparkVerifyEpilogue:
             verify_num_draft_tokens=self.stride,
             cutoff_verify_lens=verify_lens,
         )
+        # Sampling accept runs unconditionally in-graph; per-row selection by
+        # the staged greedy mask discards whichever side is inactive (all
+        # inputs are staged buffers, so un-armed replays are finite no-ops).
+        s_len, s_bonus, s_trim = self._accept_sampling_in_graph(
+            candidates.view(bs, self.stride), verify_lens, bs
+        )
+        selected = SelectMixedAccept.execute(
+            greedy_mask=self.greedy_mask_buf[:bs],
+            greedy_len=correct_len,
+            greedy_bonus=bonus,
+            greedy_trim=cap_trim_lens,
+            sampling_len=s_len,
+            sampling_bonus=s_bonus,
+            sampling_trim=s_trim,
+        )
+        correct_len = selected.correct_len
+        bonus = selected.bonus
+        cap_trim_lens = selected.cap_trim_lens
         finalized = finalize_accept_lens_triton(
             correct_len=correct_len,
             cap_trim_lens=cap_trim_lens,
@@ -622,6 +681,94 @@ class DsparkVerifyEpilogue:
         self.new_seq_lens_buf[:bs].copy_(finalized.new_seq_lens)
         self.out_tokens_buf[:bs].copy_(out_tokens.view(bs, self.stride))
         return finalized.commit_lens
+
+    def _accept_sampling_in_graph(self, candidates_2d, verify_lens, bs: int):
+        device = candidates_2d.device
+        target_probs = SoftmaxTemp.execute(
+            logits=self.strided_logits[: bs * self.stride],
+            temperatures=self.temps_buf[:bs],
+            rows_per_request=self.stride,
+        ).view(bs, self.stride, -1)
+        (
+            retrieve_index,
+            retrieve_next_token,
+            retrieve_next_sibling,
+            predicts,
+            accept_index,
+            accept_token_num,
+        ) = _get_or_create_chain_verify_buffers(
+            bs=bs, draft_token_num=self.stride, device=device
+        )
+        uniform_samples = torch.rand(
+            (bs, self.gamma), dtype=torch.float32, device=device
+        )
+        uniform_samples_final = torch.rand((bs,), dtype=torch.float32, device=device)
+        chain_speculative_sampling_triton(
+            predicts=predicts,
+            accept_index=accept_index,
+            accept_token_num=accept_token_num,
+            candidates=candidates_2d,
+            retrive_index=retrieve_index,
+            retrive_next_token=retrieve_next_token,
+            retrive_next_sibling=retrieve_next_sibling,
+            uniform_samples=uniform_samples,
+            uniform_samples_for_final_sampling=uniform_samples_final,
+            target_probs=target_probs,
+            draft_probs=self.draft_probs_buf[: bs * self.gamma].view(
+                bs, self.gamma, -1
+            ),
+            threshold_single=1.0,
+            threshold_acc=1.0,
+            deterministic=True,
+        )
+        s_len, s_trim = CapCorrectLen.execute(
+            correct_len=accept_token_num, verify_lens=verify_lens
+        )
+        s_bonus = gather_two_level_bonus_triton(
+            accept_index=accept_index, predicts=predicts, correct_len=s_len
+        )
+        return s_len, s_bonus, s_trim
+
+    def ensure_draft_probs_buf(self, vocab_size: int, device=None) -> torch.Tensor:
+        if self.draft_probs_buf is None:
+            assert not torch.cuda.is_current_stream_capturing(), (
+                "draft_probs_buf must be allocated during warmup, not inside "
+                "graph capture"
+            )
+            self.draft_probs_buf = torch.zeros(
+                (self.max_bs * self.gamma, vocab_size),
+                dtype=torch.float32,
+                device=device if device is not None else self.temps_buf.device,
+            )
+        return self.draft_probs_buf
+
+    def arm_sampling(
+        self,
+        *,
+        bs: int,
+        greedy_mask=None,
+        temperatures=None,
+        draft_probs=None,
+        draft_tokens=None,
+    ) -> bool:
+        """Stage the sampling-accept inputs for the next verify replay.
+        Returns False when the fold cannot serve this step (buffers not yet
+        allocated by warmup)."""
+        if self.draft_probs_buf is None:
+            return False
+        if greedy_mask is None:
+            self.greedy_mask_buf[:bs].fill_(True)
+        else:
+            self.greedy_mask_buf[:bs].copy_(greedy_mask)
+        if temperatures is not None:
+            self.temps_buf[:bs].copy_(temperatures.view(bs, 1))
+        if draft_probs is not None:
+            self.draft_probs_buf[: bs * self.gamma].copy_(
+                draft_probs.reshape(bs * self.gamma, -1)
+            )
+        if draft_tokens is not None:
+            self.draft_tokens_buf[: bs * self.gamma].copy_(draft_tokens.reshape(-1))
+        return True
 
     def _commit_inject(
         self, commit_lens, verify_lens, seq_lens, req_pool_indices, bs: int

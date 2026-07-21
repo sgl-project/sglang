@@ -125,6 +125,7 @@ class DSparkVerifyPlanner:
         self._dp_tier_gather_enabled = False
         self._is_verify_all = True
         self._uniform_layout_cache: dict = {}
+        self._fixed_width_graphs: Optional[bool] = None
         if self._ragged_verify_mode is not RaggedVerifyMode.STATIC:
             if self._confidence_head is None:
                 raise ValueError(
@@ -405,6 +406,22 @@ class DSparkVerifyPlanner:
             )
         )
 
+    def _fixed_width_verify_graphs(self) -> bool:
+        # Resolved lazily on first schedule: the attention backend does not
+        # exist yet when the planner is constructed.
+        if self._fixed_width_graphs is None:
+            graphs_on = not (
+                self.server_args.disable_cuda_graph
+                or self.server_args.disable_decode_cuda_graph
+            )
+            backend = getattr(self.model_runner, "attn_backend", None)
+            self._fixed_width_graphs = (
+                graphs_on
+                and backend is not None
+                and not getattr(backend, "supports_ragged_verify_graph", False)
+            )
+        return self._fixed_width_graphs
+
     def schedule_layout(
         self,
         *,
@@ -418,6 +435,21 @@ class DSparkVerifyPlanner:
     ) -> Optional[RaggedVerifyLayout]:
         if self._ragged_verify_mode is RaggedVerifyMode.STATIC:
             return None
+        if (
+            self._ragged_verify_mode is RaggedVerifyMode.COMPACT
+            and not self._is_verify_all
+            and self._fixed_width_verify_graphs()
+        ):
+            # Fixed-width verify graphs cannot replay a trimmed (ragged)
+            # batch (load_batch copies it into full-width buffers and dies
+            # on the size mismatch), and with the graph width fixed a trim
+            # saves no compute anyway: ignore the SPS table.
+            logger.warning(
+                "DSpark compact verify: decode cuda graphs are fixed-width "
+                "(attention backend lacks ragged-verify graph support); "
+                "ignoring the SPS table and running verify-all."
+            )
+            self._is_verify_all = True
         if self._is_verify_all and self._ragged_verify_mode is RaggedVerifyMode.COMPACT:
             # Verify-all: the uniform layout (or None, past the captured grid)
             # is constant per (bs, tier); serve it from cache instead of paying

@@ -18,6 +18,9 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.draft_worker_common import make_draft_input_v2
 from sglang.srt.speculative.dspark_components.dspark_planner import VerifyWindow
+from sglang.srt.speculative.dspark_components.kernels.dspark_accept import (
+    SoftmaxTemp,
+)
 from sglang.srt.speculative.dspark_components.kernels.dspark_draft_model import (
     SampleStepTokens,
 )
@@ -60,7 +63,17 @@ def greedy_step_sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tenso
 
 class DsparkDraftSampler:
 
-    def __init__(self, *, model, gamma, max_bs, device, confidence_fn=None, out=None):
+    def __init__(
+        self,
+        *,
+        model,
+        gamma,
+        max_bs,
+        device,
+        confidence_fn=None,
+        out=None,
+        draft_probs_out=None,
+    ):
         self.model = model
         self.markov_head = model.markov_head
         self.gamma = int(gamma)
@@ -77,19 +90,60 @@ class DsparkDraftSampler:
             if confidence_fn is not None
             else None
         )
+        # Staged sampling state: temps default 1.0 / mask default greedy, so
+        # un-staged replays reduce to the original greedy sampler.
+        self.temps_buf = torch.ones((int(max_bs),), dtype=torch.float32, device=device)
+        self.greedy_mask_buf = torch.ones(
+            (int(max_bs),), dtype=torch.bool, device=device
+        )
+        # Getter for the verify epilogue's draft_probs buffer (resolved at
+        # warmup/capture time, after the target-side warmup allocated it).
+        self.draft_probs_out = draft_probs_out
+
+    def stage_sampling(self, *, bs, temperatures=None, greedy_mask=None) -> None:
+        if temperatures is None:
+            self.temps_buf[:bs].fill_(1.0)
+        else:
+            self.temps_buf[:bs].copy_(temperatures.view(-1))
+        if greedy_mask is None:
+            self.greedy_mask_buf[:bs].fill_(True)
+        else:
+            self.greedy_mask_buf[:bs].copy_(greedy_mask)
 
     def __call__(self, hidden_states, input_ids):
         bs = hidden_states.shape[0] // self.gamma
         base_logits, confidence_tap = self.model.compute_base_logits(hidden_states)
         base_logits = base_logits.view(bs, self.gamma, -1)
         anchor = input_ids.view(bs, self.gamma)[:, 0]
-        draft_tokens, _ = self.markov_head.sample_block(
+        temps = self.temps_buf[:bs]
+        gmask = self.greedy_mask_buf[:bs]
+
+        def step_sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tensor:
+            exp_noise = torch.empty(
+                step_logits.shape, dtype=torch.float32, device=step_logits.device
+            ).exponential_(1)
+            return SampleStepTokens.execute(
+                step_logits=step_logits,
+                temperatures=temps,
+                greedy_mask=gmask,
+                exp_noise=exp_noise,
+            )
+
+        draft_tokens, corrected_logits = self.markov_head.sample_block(
             base_logits,
             first_prev_tokens=anchor,
             hidden_states=hidden_states.view(bs, self.gamma, -1),
-            sampler=greedy_step_sampler,
+            sampler=step_sampler,
         )
         self.out[: draft_tokens.numel()].copy_(draft_tokens.reshape(-1))
+        if self.draft_probs_out is not None:
+            probs = SoftmaxTemp.execute(
+                logits=corrected_logits.reshape(bs * self.gamma, -1),
+                temperatures=temps.view(bs, 1),
+                rows_per_request=self.gamma,
+            )
+            probs_buf = self.draft_probs_out(probs.shape[-1])
+            probs_buf[: bs * self.gamma].copy_(probs.reshape(bs * self.gamma, -1))
         if self.confidence_out is not None:
             confidence = self.confidence_fn(
                 draft_hidden=hidden_states.view(bs, self.gamma, -1),
@@ -109,6 +163,7 @@ def maybe_build_draft_sampler(
     tp_rank: int,
     confidence_fn=None,
     out=None,
+    draft_probs_out=None,
 ) -> Optional[DsparkDraftSampler]:
     """Build the graph-folded greedy draft sampler, or return None (with the
     reason logged) when the draft model cannot support folding and the
@@ -134,6 +189,7 @@ def maybe_build_draft_sampler(
         device=device,
         confidence_fn=confidence_fn,
         out=out,
+        draft_probs_out=draft_probs_out,
     )
 
 
@@ -235,9 +291,17 @@ class DraftBlockProposer:
         self._draft_block_spec_info = draft_block_spec_info
         self._draft_sampler = None
         self._dp_moe_sync = dp_moe_sync
+        self._kv_injector = None
 
     def attach_draft_sampler(self, draft_sampler) -> None:
         self._draft_sampler = draft_sampler
+
+    def attach_kv_injector(self, kv_injector) -> None:
+        self._kv_injector = kv_injector
+
+    def _pre_draft_forward(self, forward_batch) -> None:
+        if self._kv_injector is not None:
+            self._kv_injector.pre_draft_forward(forward_batch)
 
     def _base_logits_context(self):
         if self._dp_moe_sync:
@@ -254,8 +318,28 @@ class DraftBlockProposer:
         device: str,
         target_model,
         sampling_info,
+        allow_sampling_fold: bool = False,
     ) -> DraftProposal:
         embed_module = target_model.get_input_embeddings()
+        if self._draft_sampler is not None:
+            stage_all_greedy = sampling_info is None or sampling_info.is_all_greedy
+            self._draft_sampler.stage_sampling(
+                bs=bs,
+                temperatures=(
+                    None
+                    if sampling_info is None
+                    else sampling_info.temperatures.view(-1)
+                    .to(torch.float32)
+                    .clamp_min(1e-5)
+                ),
+                greedy_mask=(
+                    None
+                    if stage_all_greedy
+                    else resolve_greedy_mask(
+                        bs=bs, sampling_info=sampling_info, device=device
+                    )
+                ),
+            )
         fwd = self._run_forward(
             batch=batch,
             draft_input=draft_input,
@@ -271,7 +355,11 @@ class DraftBlockProposer:
         folded_confidence = None
         confidence_tap = None
         folded = False
-        if draft_sampler is not None and fwd.can_run_graph and all_greedy:
+        if (
+            draft_sampler is not None
+            and fwd.can_run_graph
+            and (all_greedy or allow_sampling_fold)
+        ):
             folded = True
             if sampling_info is None:
                 temperatures = torch.ones(bs, dtype=torch.float32, device=device)
@@ -334,6 +422,7 @@ class DraftBlockProposer:
             capture_hidden_mode=CaptureHiddenMode.NULL,
         )
         self._fill_dp_moe_sync_metadata(idle_batch, batch)
+        self._pre_draft_forward(idle_batch)
         with torch.inference_mode():
             self.draft_model_runner.forward(idle_batch)
 
@@ -390,6 +479,7 @@ class DraftBlockProposer:
             capture_hidden_mode=CaptureHiddenMode.NULL,
         )
         self._fill_dp_moe_sync_metadata(draft_forward_batch, batch)
+        self._pre_draft_forward(draft_forward_batch)
         with torch.inference_mode():
             draft_out = self.draft_model_runner.forward(draft_forward_batch)
         logits_output = draft_out.logits_output

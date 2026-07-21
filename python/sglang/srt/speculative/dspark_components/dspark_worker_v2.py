@@ -53,6 +53,9 @@ from sglang.srt.speculative.dspark_components.dspark_verify import (
     TargetVerifyExecutor,
     verify_logits_adjustments_are_noop,
 )
+from sglang.srt.speculative.dspark_components.kernels.dspark_accept import (
+    SoftmaxTemp,
+)
 from sglang.srt.speculative.spec_utils import draft_tp_context
 from sglang.srt.utils import get_available_gpu_memory, is_cuda
 
@@ -312,6 +315,10 @@ class DSparkWorkerV2(BaseSpecWorker):
                         make_draft_sampler_capture_hook(self._draft_sampler)
                     )
                 self._proposer.attach_draft_sampler(self._draft_sampler)
+                self.draft_model_runner.capture_head_hooks.append(
+                    self._kv_injector.capture_prologue_hook
+                )
+                self._proposer.attach_kv_injector(self._kv_injector)
             self._draft_worker.init_cuda_graphs(
                 capture_decode_cuda_graph=capture_decode_cuda_graph
             )
@@ -330,6 +337,11 @@ class DSparkWorkerV2(BaseSpecWorker):
             ),
             out=(
                 self._verify_epilogue.draft_tokens_buf
+                if self._verify_epilogue is not None
+                else None
+            ),
+            draft_probs_out=(
+                self._verify_epilogue.ensure_draft_probs_buf
                 if self._verify_epilogue is not None
                 else None
             ),
@@ -474,6 +486,48 @@ class DSparkWorkerV2(BaseSpecWorker):
             new_seq_lens=next_draft_input.new_seq_lens,
         )
 
+    def _arm_accept_fold(
+        self, *, proposal, draft_block, draft_tokens, sampling_info, bs: int
+    ) -> bool:
+        """Stage the in-graph accept inputs. Greedy folds as before; sampling
+        folds when the draft's corrected logits exist (un-folded proposal) and
+        the target-probs path is the fused softmax (no top-k/top-p)."""
+        epilogue = self._verify_executor.verify_epilogue
+        all_greedy = sampling_info is None or sampling_info.is_all_greedy
+        if all_greedy:
+            return epilogue.arm_sampling(
+                bs=bs,
+                draft_tokens=None if proposal.folded else draft_tokens,
+            )
+        if proposal.folded:
+            # Non-greedy folded proposal: the draft graph already wrote the
+            # draft tokens and draft probs into the shared buffers; stage
+            # only the mask and temperatures.
+            if sampling_info.need_top_k_sampling or sampling_info.need_top_p_sampling:
+                return False
+            return epilogue.arm_sampling(
+                bs=bs,
+                greedy_mask=draft_block.greedy_mask,
+                temperatures=sampling_info.temperatures,
+            )
+        if draft_block.corrected_logits is None:
+            return False
+        if sampling_info.need_top_k_sampling or sampling_info.need_top_p_sampling:
+            return False
+        bs_c, gamma_rows, vocab = draft_block.corrected_logits.shape
+        draft_probs = SoftmaxTemp.execute(
+            logits=draft_block.corrected_logits.reshape(bs_c * gamma_rows, vocab),
+            temperatures=draft_block.temperatures,
+            rows_per_request=gamma_rows,
+        )
+        return epilogue.arm_sampling(
+            bs=bs,
+            greedy_mask=draft_block.greedy_mask,
+            temperatures=sampling_info.temperatures,
+            draft_probs=draft_probs,
+            draft_tokens=draft_tokens,
+        )
+
     def _forward_decode(
         self, batch: ScheduleBatch, on_publish
     ) -> GenerationBatchResult:
@@ -517,7 +571,16 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         sampling_info = batch.sampling_info
         with self._draft_context(), self._observers.segment(InfoSegment.DRAFT):
+            accept_fold_ok = (
+                self._verify_executor.verify_epilogue is not None
+                and verify_logits_adjustments_are_noop(sampling_info)
+                and self._simulate_acc_len <= 0
+                and sampling_info is not None
+                and not sampling_info.need_top_k_sampling
+                and not sampling_info.need_top_p_sampling
+            )
             proposal = self._proposer.propose(
+                allow_sampling_fold=accept_fold_ok,
                 batch=batch,
                 draft_input=draft_input,
                 verify_window=verify_window,
@@ -570,10 +633,17 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         fold_eligible = (
             self._verify_executor.verify_epilogue is not None
-            and proposal.folded
             and verify_logits_adjustments_are_noop(sampling_info)
             and self._simulate_acc_len <= 0
         )
+        if fold_eligible:
+            fold_eligible = self._arm_accept_fold(
+                proposal=proposal,
+                draft_block=draft_block,
+                draft_tokens=draft_tokens,
+                sampling_info=sampling_info,
+                bs=bs,
+            )
         with self._observers.segment(InfoSegment.TARGET_VERIFY):
             if run_compact:
                 target_verify, hidden_strided = self._verify_executor.run_compact(
