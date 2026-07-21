@@ -267,6 +267,14 @@ def _handle_output_by_index(output, i):
             cached_tokens=_extract_field_by_index(output, "cached_tokens", i),
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
+            retraction_counts=_extract_field_by_index(output, "retraction_counts", i),
+            cached_tokens_details=_extract_field_by_index(
+                output, "cached_tokens_details", i
+            ),
+            time_stats=_extract_field_by_index(output, "time_stats", i),
+            pooled_hidden_states=_extract_field_by_index(
+                output, "pooled_hidden_states", i, check_length=False
+            ),
         )
     elif isinstance(output, BatchStrOutput):
         new_output = BatchStrOutput(
