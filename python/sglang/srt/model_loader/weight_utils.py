@@ -1003,7 +1003,19 @@ def fastsafetensors_weights_iterator(
     except Exception:
         rank = 0
 
-    device = torch.device(f"cuda:{rank}")
+    # Use the current device on this process, not the global TP rank. With
+    # one GPU per node (e.g. multi-node TP=2 over single-GPU hosts), the
+    # global rank can exceed the local GPU count and `cuda:{rank}` resolves
+    # to a nonexistent device on non-rank-0 nodes.
+    device = torch.device(f"cuda:{torch.cuda.current_device()}")
+
+    # Allow disabling GPU Direct Storage. fastsafetensors defaults to GDS,
+    # which requires cuFile support in the underlying storage. NFS, SMB,
+    # FUSE, and similar shared filesystems often lack cuFile and fail at
+    # loader.copy_files_to_device() time.
+    from sglang.srt.environ import envs
+
+    nogds = envs.SGLANG_FASTSAFETENSORS_NOGDS.get()
 
     weight_files_sub_lists = [
         hf_weights_files[i : i + pg.size()]
@@ -1020,7 +1032,7 @@ def fastsafetensors_weights_iterator(
         disable=False,
         bar_format=_BAR_FORMAT,
     ):
-        loader = SafeTensorsFileLoader(pg, device)
+        loader = SafeTensorsFileLoader(pg, device, nogds=nogds)
         rank_file_map = {i: [f] for i, f in enumerate(f_list)}
         loader.add_filenames(rank_file_map)
         try:

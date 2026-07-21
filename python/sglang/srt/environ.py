@@ -229,6 +229,10 @@ class Envs:
     SGLANG_DISABLED_MODEL_ARCHS = EnvTuple(tuple())
     SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
     SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION = EnvBool(False)
+    # Force fastsafetensors to skip GPU Direct Storage (cuFile) and use
+    # the CPU-staged fallback. Required when models live on storage
+    # backends without cuFile support (NFS, SMB, FUSE).
+    SGLANG_FASTSAFETENSORS_NOGDS = EnvBool(False)
 
     # HTTP server
     # Decompress request bodies tagged with `x-body-compressed`.
