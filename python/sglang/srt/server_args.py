@@ -3516,12 +3516,15 @@ class ServerArgs:
             "max_bs",
         ) in self._cuda_graph_config_locked:
             return
-        # Powers of two: worst-case padding is bounded at 2x in every
-        # interval, and small buckets (where BCG replays concentrate) get
-        # the most resolution. All entries are multiples of 8 (see
+        # The full default ladder to 2048, restricted to multiples of 8
+        # (the sub-32 range(4,33,4) entries 4/12/20/28 are dropped: non
+        # multiples of 8 wedge the deepep a2a during capture, see
         # _align_prefill_buckets_for_deepep_bcg). Steady-state capture cost
-        # is ~0.8 s/bucket, so the finer ladder adds ~2 s of startup.
-        clamped = [8, 16, 32, 64, 128, 256, 512]
+        # is ~0.8 s/bucket after the seeded-dummy fix, so the full ladder
+        # is affordable.
+        clamped = [
+            b for b in self._generate_prefill_cuda_graph_batch_sizes(2048) if b % 8 == 0
+        ]
         self.cuda_graph_config.prefill.bs = clamped
         self.cuda_graph_config.prefill.max_bs = clamped[-1]
         logger.info(
@@ -4200,9 +4203,14 @@ class ServerArgs:
                 # DeepEP under the BCG split node first-touches its buffer
                 # stack (LL rdma 1.53 GB at cap 128 + NVL ~0.5 GB) during
                 # prefill capture, where the margin check runs — the memory is
-                # paid by eager DeepEP configs too, just later, so reserve only
-                # the concentration slack, not the full stack.
-                reserved_mem += 2 * 1024
+                # paid by eager DeepEP configs too, just later, so reserve
+                # the concentration slack plus the full-ladder capture load.
+                # Measured for the 8..2048 ladder: prefill capture 10.8 GB +
+                # decode 4.8 GB out of ~18 GB headroom leaves ~2.3 GB, while
+                # post-capture warmup (DeepGEMM workspace + the first eager
+                # 8192-token forward) needs ~7 GB — 8 GB lands auto at ~0.78,
+                # matching the explicitly-validated value.
+                reserved_mem += 8 * 1024
 
         return reserved_mem
 
