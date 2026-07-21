@@ -880,32 +880,24 @@ def build_prefill_registry(
         slots.append(GraphSlot("mamba_track_mask", _bs, torch.bool, axis="bs"))
         slots.append(GraphSlot("mamba_track_seqlens", _bs, torch.int32, axis="bs"))
     if enable_num_token_non_padded:
+        from sglang.srt.model_executor.forward_batch_info import (
+            compute_local_num_token_non_padded_cpu,
+        )
 
         def _prefill_num_token_non_padded_post_fill(buf, fb, ctx):
-            # Replay pads raw tokens up to the capture bucket, which moves the
-            # attn-TP shard boundary (tokens_per_rank = bucket/attn_tp, not
-            # raw/attn_tp). The FB tensor was localized against the RAW length
-            # on the eager prep path, so for raw < bucket it undercounts rank
-            # 0's real rows and the in-graph pad mask would blank real tokens
-            # (global rows [raw/attn_tp, bucket/attn_tp)). Recompute the local
-            # count against the padded bucket from the batch's UN-adjusted
-            # global count (num_token_non_padded_cpu). Mirrors the decode
-            # registry's post_fill, which uses ctx.padded_num_tokens the same
-            # way.
+            # The FB tensor was attn-TP-localized against the RAW length, but
+            # replay pads rows up to the capture bucket, moving the shard
+            # boundary — copying it verbatim would make the in-graph pad mask
+            # blank real tokens whenever raw < bucket. Recompute the local
+            # count against the padded bucket from the batch's un-adjusted
+            # global count, mirroring the decode registry's post_fill.
             if require_gathered_buffer and not enable_prefill_cp:
-                from sglang.srt.runtime_context import get_parallel
-
-                parallel = get_parallel()
-                tokens_per_rank = ctx.padded_num_tokens // parallel.attn_tp_size
-                local = min(
-                    max(
-                        fb.num_token_non_padded_cpu
-                        - tokens_per_rank * parallel.attn_tp_rank,
-                        0,
-                    ),
-                    tokens_per_rank,
+                buf.fill_(
+                    compute_local_num_token_non_padded_cpu(
+                        global_num_token_non_padded=fb.num_token_non_padded_cpu,
+                        num_tokens_per_dp=ctx.padded_num_tokens,
+                    )
                 )
-                buf.fill_(local)
 
         slots.append(
             GraphSlot(
