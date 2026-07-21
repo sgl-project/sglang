@@ -1036,10 +1036,15 @@ class ModelRunner:
         return self.lora_manager.load_lora_adapter(lora_ref)
 
     def load_lora_adapter_from_tensors(
-        self, lora_ref: LoRARef, tensors, config_dict, added_tokens_config=None
+        self,
+        lora_ref: LoRARef,
+        tensors,
+        config_dict,
+        added_tokens_config=None,
+        upsert: bool = False,
     ):
         return self.lora_manager.load_lora_adapter_from_tensors(
-            lora_ref, tensors, config_dict, added_tokens_config
+            lora_ref, tensors, config_dict, added_tokens_config, upsert=upsert
         )
 
     def load_lora_adapter_from_distributed(
@@ -1051,6 +1056,7 @@ class ModelRunner:
         config_dict,
         group_name,
         added_tokens_config=None,
+        upsert: bool = False,
     ):
         """Load a new lora adapter whose weights are broadcast over the
         weight-update process group (no CUDA IPC)."""
@@ -1064,7 +1070,7 @@ class ModelRunner:
             return LoRAUpdateOutput(success=False, error_message=error_msg)
 
         return self.lora_manager.load_lora_adapter_from_tensors(
-            lora_ref, tensors, config_dict, added_tokens_config
+            lora_ref, tensors, config_dict, added_tokens_config, upsert=upsert
         )
 
     def unload_lora_adapter(self, lora_ref: LoRARef):
