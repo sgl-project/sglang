@@ -1362,7 +1362,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     def _pad_inputs_to_size(self, model_runner: ModelRunner, num_tokens, bs):
         # padding
-        self.num_tokens_before_dp_padding = self.input_ids.shape[0]
+        # Keep the first pre-pad length: split prefill re-enters this on the same
+        # ForwardBatch per layer chunk, and later calls see the already-padded shape.
+        if self.num_tokens_before_dp_padding is None:
+            self.num_tokens_before_dp_padding = self.input_ids.shape[0]
         self.input_ids = self._pad_tensor_to_size(self.input_ids, num_tokens)
         self.req_pool_indices = self._pad_tensor_to_size(self.req_pool_indices, bs)
         if self.lora_ids is not None:
