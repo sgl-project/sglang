@@ -140,8 +140,6 @@ class HiRadixCache(RadixCache):
                 prefetch_threshold=prefetch_threshold,
                 enable_storage_metrics=self.enable_storage_metrics,
                 load_cache_event=self.load_cache_event,
-                attn_cp_group=self.attn_cp_group,
-                attn_tp_group=self.attn_tp_group,
             )
         elif isinstance(self.kv_cache, MiniMaxSparseKVPool):
             from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
@@ -156,8 +154,6 @@ class HiRadixCache(RadixCache):
                 prefetch_threshold=prefetch_threshold,
                 enable_storage_metrics=self.enable_storage_metrics,
                 load_cache_event=self.load_cache_event,
-                attn_cp_group=self.attn_cp_group,
-                attn_tp_group=self.attn_tp_group,
             )
         else:
             self.cache_controller = HiCacheController(
