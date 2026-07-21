@@ -340,6 +340,14 @@ def _silu_and_mul_post_quant_kernel(
             gate_up = gate * tl.sigmoid(gate * GEMM1_ALPHA) * (up + 1)
         else:
             gate = gate / (1 + tl.exp(-gate))
+            if GEMM1_CLAMP_LIMIT > 0:
+                # gemm1_clamp_limit without gemm1_alpha must not be dropped:
+                # mirror _swiglu_silu_clamp_mul — clamp after silu on gate
+                # (max only), symmetric clamp on up.
+                gate = tl.minimum(gate, GEMM1_CLAMP_LIMIT)
+                up = tl.clamp(up, -GEMM1_CLAMP_LIMIT, GEMM1_CLAMP_LIMIT).to(
+                    input_ptr.dtype.element_ty
+                )
             gate = gate.to(input_ptr.dtype.element_ty)
             gate_up = up * gate
 
@@ -507,6 +515,14 @@ def _silu_and_mul_post_quant_packed_kernel(
         gate_up = gate * tl.sigmoid(gate * GEMM1_ALPHA) * (up + 1)
     else:
         gate = gate / (1 + tl.exp(-gate))
+        if GEMM1_CLAMP_LIMIT > 0:
+            # gemm1_clamp_limit without gemm1_alpha must not be dropped:
+            # mirror _swiglu_silu_clamp_mul — clamp after silu on gate
+            # (max only), symmetric clamp on up.
+            gate = tl.minimum(gate, GEMM1_CLAMP_LIMIT)
+            up = tl.clamp(up, -GEMM1_CLAMP_LIMIT, GEMM1_CLAMP_LIMIT).to(
+                input_ptr.dtype.element_ty
+            )
         gate = gate.to(input_ptr.dtype.element_ty)
         gate_up = up * gate
 
