@@ -532,14 +532,35 @@ def _run_per_token_group_quant_8bit_kernel(
 ) -> None:
     """Quantize into caller-owned ``x_q`` / ``x_s``.
 
-    CUDA routes to the JIT per_token_group_quant kernel unconditionally; MUSA
-    stays on the AOT v2 op (the JIT kernel is CUDA-only). The kernel bakes the
-    quant constants in at compile time, so
+    CUDA routes to the JIT per_token_group_quant kernel; MUSA stays on the AOT
+    v2 op (the JIT kernel is CUDA-only), and the fp32-pow-2 storage flavor of
+    row-major UE8M0 (float32 ``x_s``, deep_gemm ``ceil_to_ue8m0`` convention)
+    stays on the JIT v2 baseline — per_token_group_quant only packs UE8M0 as
+    int32. The kernel bakes the quant constants in at compile time, so
     drifted constants are rejected loudly here instead of silently quantizing
     with different ones; unsupported shapes/layouts error inside its host
     checks. Whole-row (per-token) quantization is a different op:
     ``sglang_per_token_quant_fp8``.
     """
+    if scale_ue8m0 and x_s.dtype == torch.float32 and not _is_musa:
+        from sglang.jit_kernel.per_token_group_quant_8bit_v2 import (
+            per_token_group_quant_8bit_v2,
+        )
+
+        per_token_group_quant_8bit_v2(
+            input=x,
+            output_q=x_q,
+            output_s=x_s,
+            group_size=group_size,
+            eps=eps,
+            min_8bit=fp8_min,
+            max_8bit=fp8_max,
+            scale_ue8m0=scale_ue8m0,
+            fuse_silu_and_mul=fuse_silu_and_mul,
+            masked_m=masked_m,
+        )
+        return
+
     if _is_musa:
         sgl_per_token_group_quant_8bit(
             x,
