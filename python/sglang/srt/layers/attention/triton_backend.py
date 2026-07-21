@@ -155,10 +155,13 @@ class TritonAttnBackend(AttentionBackend):
         # byte-identical to the slot-based envelope.
         self.page_size = getattr(model_runner, "page_size", 1) or 1
         # Unified pool v2p hook (None = no-op): req_to_token holds VIRTUAL ids but
-        # kernels need PHYSICAL. Applied eagerly so the captured graph has no translate.
+        # kernels need the kernel-facing id space — PHYSICAL for MHA, DENSE for the
+        # dense-view MLA pool (translate_kv_loc_dense falls back to the physical
+        # translate when kernel_page_multiplier == 1, so preferring it is exact for
+        # both). Applied eagerly so the captured graph has no translate.
         self._translate_kv_loc = getattr(
-            self.token_to_kv_pool_allocator, "translate_kv_loc", None
-        )
+            self.token_to_kv_pool_allocator, "translate_kv_loc_dense", None
+        ) or getattr(self.token_to_kv_pool_allocator, "translate_kv_loc", None)
         self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
         self.speculative_num_steps = model_runner.server_args.speculative_num_steps
         self.topk = model_runner.server_args.speculative_eagle_topk or 0
@@ -1230,6 +1233,9 @@ class TritonAttnBackend(AttentionBackend):
             cache_loc = forward_batch.out_cache_loc
             if isinstance(pool, SWAKVPool) and pool.layers_mapping[layer.layer_id][1]:
                 cache_loc = pool.translate_loc_from_full_to_swa(cache_loc)
+            elif self._translate_kv_loc is not None:
+                # Unified pool: buffers are indexed in the kernel-facing id space.
+                cache_loc = self._translate_kv_loc(cache_loc)
             k_buffer, v_buffer = pool.get_kv_buffer(layer.layer_id)
             k = k_buffer[cache_loc]
             v = v_buffer[cache_loc]
@@ -1697,7 +1703,15 @@ class TritonAttnBackend(AttentionBackend):
                     k.div_(layer.k_scale)
                 self.token_to_kv_pool.set_kv_buffer(
                     layer,
-                    forward_batch.out_cache_loc,
+                    # `full_loc` carries the pre-translated loc under the unified
+                    # pool, refreshed into a capture-stable buffer before replay —
+                    # translating inside set_kv_buffer would be captured and replay
+                    # a stale v2p. None (-> raw loc) for static pools.
+                    KVWriteLoc(
+                        forward_batch.out_cache_loc,
+                        self.forward_metadata.swa_out_cache_loc,
+                        full_loc=self.forward_metadata.out_cache_loc_full_physical,
+                    ),
                     k,
                     v,
                 )

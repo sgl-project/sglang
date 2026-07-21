@@ -857,6 +857,12 @@ class KimiLinearForCausalLM(nn.Module):
                     weight_loader(param, loaded_weight, **kwargs)
             loaded_params.add(name)
 
+        self.post_load_weights()
+
+    def post_load_weights(self):
+        # Derive the absorbed MLA weights. Also called by the dummy loader
+        # (`_post_load_weights`), which never runs `load_weights` — keeping the
+        # derivation only there left `w_kc` None under --load-format dummy.
         for layer_id in self.config.full_attention_layer_ids:
             self_attn = self.model.layers[layer_id].self_attn
             w_kc, w_vc = self_attn.kv_b_proj.weight.unflatten(

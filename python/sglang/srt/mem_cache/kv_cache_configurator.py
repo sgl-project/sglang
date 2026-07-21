@@ -438,9 +438,6 @@ class KVCacheConfigurator:
 
         config = self.mambaish_config
         assert config is not None
-        assert (
-            not self.use_mla_backend
-        ), "unified memory pool does not support MLA-hybrid-Mamba yet"
         # The full sub-pool is page-aware (via `MultiEndedAllocator(page_size=...)`);
         # the mamba sub-pool stays page=1.
         assert self.page_size >= 1, f"page_size must be >= 1, got {self.page_size}"
@@ -470,6 +467,12 @@ class KVCacheConfigurator:
             end_layer=self.layer_info.end_layer,
             is_draft_worker=self.is_draft_worker,
             use_mla_backend=self.use_mla_backend,
+            kv_lora_rank=(
+                self.model_config.kv_lora_rank if self.use_mla_backend else None
+            ),
+            qk_rope_head_dim=(
+                self.model_config.qk_rope_head_dim if self.use_mla_backend else None
+            ),
             mamba_layer_ids=mamba_layer_ids,
             full_attention_layer_ids=full_attention_layer_ids,
             mamba2_cache_params=config.mamba2_cache_params,

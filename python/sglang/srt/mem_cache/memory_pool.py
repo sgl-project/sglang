@@ -3522,6 +3522,10 @@ class HybridLinearKVPool(KVCache):
         # virtual->physical mamba-slot translate for the HiCache offload path;
         # identity for a static pool, the allocator's `translate` for the unified pool.
         self._mamba_translate = lambda ids: ids
+        # virtual->dense full-KV translate for the model-level MLA entry points
+        # (`set_mla_kv_buffer` / `get_mla_kv_buffer` receive VIRTUAL locs);
+        # identity for a static pool, `translate_kv_loc_dense` for the unified pool.
+        self._full_translate = lambda ids: ids
         self.use_mla = use_mla
         if full_kv_pool is not None:
             # Shared-KV-pool path: the caller built a UnifiedMHATokenToKVPool
@@ -3749,10 +3753,13 @@ class HybridLinearKVPool(KVCache):
                 dcp_kv_mask=dcp_kv_mask,
             )
         else:
+            # Mirror the MHA branch: `full_loc` is the unified pool's
+            # pre-translated (dense) loc; None for a static pool.
+            write_loc = full_loc if full_loc is not None else loc
             with self._transfer_id_context(layer):
                 self.full_kv_pool.set_kv_buffer(
                     layer,
-                    loc,
+                    write_loc,
                     cache_k,
                     cache_v,
                 )
@@ -3789,6 +3796,7 @@ class HybridLinearKVPool(KVCache):
         cache_k_rope: torch.Tensor,
     ):
         assert self.use_mla, "set_mla_kv_buffer called when use_mla is False"
+        loc = self._full_translate(loc)
         with self._transfer_id_context(layer):
             self.full_kv_pool.set_mla_kv_buffer(layer, loc, cache_k_nope, cache_k_rope)
 
@@ -3799,6 +3807,7 @@ class HybridLinearKVPool(KVCache):
         dst_dtype: Optional[torch.dtype] = None,
     ):
         assert self.use_mla, "get_mla_kv_buffer called when use_mla is False"
+        loc = self._full_translate(loc)
         with self._transfer_id_context(layer):
             return self.full_kv_pool.get_mla_kv_buffer(layer, loc, dst_dtype)
 

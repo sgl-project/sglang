@@ -5318,6 +5318,10 @@ class ServerArgs:
             self.linear_attn_decode_backend is None
             and is_sm100_supported()
             and self.mamba_ssm_dtype == "bfloat16"
+            # The unified pool implies the page-major layout, whose strided mamba
+            # state only the Triton linear-attn kernels read — defaulting to
+            # flashinfer here would trip the page-major backend assert.
+            and not self.enable_unified_memory
         ):
             self.linear_attn_decode_backend = "flashinfer"
             logger.info(
