@@ -50,8 +50,14 @@ class _MockTokenizerForNormalize:
         return list(range(len(s)))  # One "token" per character
 
 
-def _make_req(output_ids, stop=None, stop_regex=None, eos_token_ids=frozenset()):
-    sp = SamplingParams(max_new_tokens=1000, stop=stop, stop_regex=stop_regex)
+def _make_req(
+    output_ids,
+    stop=None,
+    stop_regex=None,
+    eos_token_ids=frozenset(),
+    max_new_tokens=1000,
+):
+    sp = SamplingParams(max_new_tokens=max_new_tokens, stop=stop, stop_regex=stop_regex)
     sp.normalize(tokenizer=_MockTokenizerForNormalize())  # char-based stop_str_max_len
     req = Req(
         rid="t",
@@ -80,6 +86,33 @@ class TestStopStrSpeculative(unittest.TestCase):
         req.update_finish_state(new_accepted_len=6)
         self.assertTrue(req.finished())
         self.assertEqual(req.finished_reason.matched, "STOP")
+        self.assertEqual(req.finished_len, 4)
+
+    # --- max_new_tokens interaction (a spec chunk can overshoot the cap) ---
+    def test_stop_inside_budget_beats_length_cap(self):
+        # Chunk accepts 6 tokens, overshooting max_new_tokens=5, but "STOP" (index
+        # 2) lands inside the budget. The stop must win: finishing as FINISH_LENGTH
+        # here mislabels the reason and leaks the tokens after the stop.
+        req = _make_req([10, 11, STOP_ID, 20, 21, 22], stop=["STOP"], max_new_tokens=5)
+        req.update_finish_state(new_accepted_len=6)
+        self.assertTrue(req.finished())
+        self.assertEqual(req.finished_reason.matched, "STOP")
+        self.assertEqual(req.finished_len, 3)
+
+    def test_stop_beyond_budget_yields_length(self):
+        # "STOP" (index 3) lands at/after max_new_tokens=3, so the length cap is
+        # earlier and must win.
+        req = _make_req([10, 11, 20, STOP_ID, 21], stop=["STOP"], max_new_tokens=3)
+        req.update_finish_state(new_accepted_len=5)
+        self.assertTrue(req.finished())
+        self.assertEqual(type(req.finished_reason).__name__, "FINISH_LENGTH")
+        self.assertEqual(req.finished_len, 3)
+
+    def test_length_cap_only_when_no_stop(self):
+        req = _make_req([10, 11, 12, 13, 14, 15], stop=["STOP"], max_new_tokens=4)
+        req.update_finish_state(new_accepted_len=6)
+        self.assertTrue(req.finished())
+        self.assertEqual(type(req.finished_reason).__name__, "FINISH_LENGTH")
         self.assertEqual(req.finished_len, 4)
 
     def test_stop_str_wins_over_eos_in_same_step(self):

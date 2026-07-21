@@ -1481,31 +1481,40 @@ class Req(ReqDllmMixin):
             self.to_finish = None
             return
 
-        if len(self.output_ids) >= self.sampling_params.max_new_tokens:
-            self.finished_reason = FINISH_LENGTH(
-                length=self.sampling_params.max_new_tokens
-            )
-            self.finished_len = self.sampling_params.max_new_tokens
-            return
-
+        # Evaluate the definitive finishes (invalid token, stop string, stop
+        # token, grammar completion) on the accepted tokens BEFORE the
+        # max_new_tokens cap. Speculative decoding accepts >1 token per step, so a
+        # single chunk can push len(output_ids) past the cap while a stop landed
+        # earlier inside the budget; checking the cap first would mask that stop,
+        # mislabel the finish as FINISH_LENGTH, and leak the tokens after it.
         new_accepted_tokens = self.output_ids[-new_accepted_len:]
-
         # Sanitize out-of-range / NaN token ids before any decode.
-        if self._check_vocab_boundary_finish(new_accepted_tokens):
-            return
-
-        # Stop string beats EOS/stop-token matched in the same step (speculative
-        # decoding can accept >1 token): token-based would trim only the last
-        # token and leak the stop string.
-        if self._check_str_based_finish(new_accepted_len):
-            return
-
-        if self._check_token_based_finish(new_accepted_tokens):
-            return
-
-        if self.grammar is not None and self.grammar.is_terminated():
+        if not self._check_vocab_boundary_finish(new_accepted_tokens):
+            # Stop string beats EOS/stop-token matched in the same step: token
+            # based would trim only the last token and leak the stop string.
+            if not self._check_str_based_finish(new_accepted_len):
+                self._check_token_based_finish(new_accepted_tokens)
+        if (
+            not self.finished()
+            and self.grammar is not None
+            and self.grammar.is_terminated()
+        ):
             self.finished_reason = FINISH_MATCHED_TOKEN(matched=self.output_ids[-1])
-            return
+
+        # The length cap wins only when it lands at or before the finish above (a
+        # stop past the cap, i.e. a spec chunk overshooting the budget, still
+        # finishes at the cap). Some finishes emit the full output with
+        # finished_len left None (grammar completion, or a stop matched only in
+        # decoded_text); the cap still applies to those when over budget,
+        # preserving the prior behavior.
+        max_new_tokens = self.sampling_params.max_new_tokens
+        if len(self.output_ids) >= max_new_tokens and (
+            not self.finished()
+            or self.finished_len is None
+            or max_new_tokens < self.finished_len
+        ):
+            self.finished_reason = FINISH_LENGTH(length=max_new_tokens)
+            self.finished_len = max_new_tokens
 
     def reset_for_retract(self):
         # Increment retraction count before resetting other state. We should not reset this
