@@ -1763,7 +1763,6 @@ class Indexer(MultiPlatformOp):
         enable_dual_stream = (
             self.alt_stream is not None
             and get_is_capture_mode()
-            and not torch.compiler.is_compiling()
             and q_lora.shape[0] > 0
             and q_lora.shape[0] <= DUAL_STREAM_TOKEN_THRESHOLD
         )

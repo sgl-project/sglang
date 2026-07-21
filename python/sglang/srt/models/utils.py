@@ -499,11 +499,7 @@ def apply_qk_norm(
         )
         return q, k
 
-    if (
-        alt_stream is not None
-        and get_is_capture_mode()
-        and not torch.compiler.is_compiling()
-    ):
+    if alt_stream is not None and get_is_capture_mode():
         current_stream = get_current_device_stream_fast()
         alt_stream.wait_stream(current_stream)
         q_by_head = _reshape_for_qk_norm(q, head_dim)

@@ -137,7 +137,6 @@ class KimiMoE(nn.Module):
             and self.num_shared_experts is not None
             and hidden_states.shape[0] > 0
             and get_is_capture_mode()
-            and not torch.compiler.is_compiling()
         ):
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)

@@ -325,7 +325,6 @@ class SarvamMoESparseMoeBlock(nn.Module):
             and self.alt_stream is not None
             and hidden_states.shape[0] > 0
             and get_is_capture_mode()
-            and not torch.compiler.is_compiling()
         ):
             return self.forward_normal_dual_stream(hidden_states)
         else:
@@ -779,11 +778,7 @@ class SarvamMoEMLAAttention(nn.Module):
                 forward_batch=forward_batch,
             )
 
-        if (
-            self.alt_stream is not None
-            and get_is_capture_mode()
-            and not torch.compiler.is_compiling()
-        ):
+        if self.alt_stream is not None and get_is_capture_mode():
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
 
@@ -848,11 +843,7 @@ class SarvamMoEMLAAttention(nn.Module):
 
         if self.q_lora_rank is None:
             # Dual-stream parallel Q and KV projections
-            if (
-                self.alt_stream is not None
-                and get_is_capture_mode()
-                and not torch.compiler.is_compiling()
-            ):
+            if self.alt_stream is not None and get_is_capture_mode():
                 current_stream = torch.cuda.current_stream()
                 self.alt_stream.wait_stream(current_stream)
                 with torch.cuda.stream(self.alt_stream):
@@ -866,11 +857,7 @@ class SarvamMoEMLAAttention(nn.Module):
             k_nope = self.kv_a_layernorm(k_nope).unsqueeze(1)
         else:
             # For q_lora_rank path, overlap q_a_proj with kv_a_proj
-            if (
-                self.alt_stream is not None
-                and get_is_capture_mode()
-                and not torch.compiler.is_compiling()
-            ):
+            if self.alt_stream is not None and get_is_capture_mode():
                 current_stream = torch.cuda.current_stream()
                 self.alt_stream.wait_stream(current_stream)
                 with torch.cuda.stream(self.alt_stream):
@@ -908,11 +895,7 @@ class SarvamMoEMLAAttention(nn.Module):
         # Parallel Absorption + RoPE on separate streams
         # - Stream 1 (main): Absorption (q_nope @ w_kc)
         # - Stream 2 (alt): RoPE (q_pe, k_pe)
-        if (
-            self.alt_stream is not None
-            and get_is_capture_mode()
-            and not torch.compiler.is_compiling()
-        ):
+        if self.alt_stream is not None and get_is_capture_mode():
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
 

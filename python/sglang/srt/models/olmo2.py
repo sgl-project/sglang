@@ -169,11 +169,7 @@ class Olmo2Attention(nn.Module):
             q = tensor_model_parallel_all_gather(q.contiguous())
             k = tensor_model_parallel_all_gather(k.contiguous())
 
-        if (
-            self.alt_stream is not None
-            and get_is_capture_mode()
-            and not torch.compiler.is_compiling()
-        ):
+        if self.alt_stream is not None and get_is_capture_mode():
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
 

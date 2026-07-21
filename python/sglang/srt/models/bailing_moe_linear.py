@@ -341,7 +341,6 @@ class BailingMoE(nn.Module):
             and self.num_shared_experts > 0
             and hidden_states.shape[0] > 0
             and get_is_capture_mode()
-            and not torch.compiler.is_compiling()
         ):
             with torch.no_grad():
                 current_stream = torch.cuda.current_stream()
@@ -560,11 +559,7 @@ class BailingMoELinearAttention(nn.Module):
         if self.use_qk_norm:
             q = q.reshape(-1, self.tp_heads, self.head_dim)
             k = k.reshape(-1, self.tp_kv_heads, self.head_dim)
-            if (
-                self.alt_stream is not None
-                and get_is_capture_mode()
-                and not torch.compiler.is_compiling()
-            ):
+            if self.alt_stream is not None and get_is_capture_mode():
                 current_stream = torch.cuda.current_stream()
                 self.alt_stream.wait_stream(current_stream)
                 q = layernorm_fn(
