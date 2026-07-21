@@ -207,6 +207,9 @@ class KimiK3ImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
         *args,
         **kwargs,
     ):
+        if getattr(request_obj, "video_data", None) or kwargs.get("audio_data"):
+            raise ValueError("Kimi-K3 supports image input only")
+
         base_output = await self.load_mm_data(
             prompt=input_text,
             image_data=image_data,

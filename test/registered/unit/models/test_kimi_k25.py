@@ -291,9 +291,33 @@ def test_kimi_k3_rejects_silently_dropped_images():
             processor.process_mm_data_async(
                 image_data=["image-1", "image-2"],
                 input_text="<|media_pad|><|media_pad|>",
-                request_obj=Mock(),
+                request_obj=SimpleNamespace(video_data=None),
             )
         )
+
+
+@pytest.mark.parametrize(
+    ("request_obj", "extra_kwargs"),
+    [
+        (SimpleNamespace(video_data=["video"]), {}),
+        (SimpleNamespace(video_data=None), {"audio_data": ["audio"]}),
+    ],
+)
+def test_kimi_k3_rejects_unsupported_modalities(request_obj, extra_kwargs):
+    processor = object.__new__(KimiK3ImageProcessor)
+    processor.mm_tokens = Mock()
+    processor.load_mm_data = AsyncMock()
+
+    with pytest.raises(ValueError, match="supports image input only"):
+        asyncio.run(
+            processor.process_mm_data_async(
+                image_data=[],
+                input_text="prompt",
+                request_obj=request_obj,
+                **extra_kwargs,
+            )
+        )
+    processor.load_mm_data.assert_not_awaited()
 
 
 def test_dp_helper_supports_moonvit3d_packed_embeddings_on_tp1():
