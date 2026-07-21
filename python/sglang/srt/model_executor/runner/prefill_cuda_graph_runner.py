@@ -51,6 +51,7 @@ from sglang.kernels.ops.kvcache.kv_indices import (
     create_chunked_prefix_cache_kv_indices,
 )
 from sglang.srt.distributed.parallel_state import graph_capture
+from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     set_dp_buffer_len,
@@ -58,6 +59,7 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput
+from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
 from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     CudaGraphBufferRegistry,
     build_prefill_registry,
@@ -263,6 +265,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             embed_dtype=self.model_runner.dtype,
             enable_mamba_track=self.mamba_track_enabled,
             enable_num_token_non_padded=enable_num_token_non_padded(),
+            require_gathered_buffer=require_gathered_buffer(model_runner.server_args),
+            enable_prefill_cp=(
+                is_dsa_enable_prefill_cp() or is_mla_prefill_cp_enabled()
+            ),
             source=self.buffers,
         )
 
@@ -1205,7 +1211,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self.backend.capture_one(
             shape_key,
             run_once,
-            dummies=None,
+            # DP padding can install capture-only tensors on this dummy batch;
+            # BCG retains it so their recorded addresses remain valid.
+            capture_inputs=forward_batch,
             post_warmup_hook=post_warmup_hook,
         )
 
