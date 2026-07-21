@@ -300,7 +300,12 @@ class SchedulerPoolStatsObserver:
         if self.enable_hisparse:
             full_num_used = max(0, full_num_used)
             swa_num_used = max(0, swa_num_used)
-        full_token_usage = full_num_used / self.full_tokens_per_layer
+        if not self.full_tokens_per_layer:
+            full_num_used = 0
+            full_available_size = 0
+            full_token_usage = 0.0
+        else:
+            full_token_usage = full_num_used / self.full_tokens_per_layer
         swa_token_usage = swa_num_used / self.swa_tokens_per_layer
 
         return PoolStats(

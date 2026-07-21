@@ -13,8 +13,9 @@ class ZImageTurboSamplingParams(SamplingParams):
 
     num_frames: int = 1
     negative_prompt: str = None
-    # height: int = 720
-    # width: int = 1280
+    # Z-Image officially recommends starting at 1024x1024
+    height: int = 1024
+    width: int = 1024
     # fps: int = 24
 
     guidance_scale: float = 0.0

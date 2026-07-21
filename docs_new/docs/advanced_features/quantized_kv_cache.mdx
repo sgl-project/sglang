@@ -51,10 +51,15 @@ python3 -m sglang.launch_server \
     --model-path deepseek-ai/DeepSeek-R1-0528 \
     --kv-cache-dtype fp8_e4m3 \
 
-# Enable FP4 E2M1 KV cache
+# Enable NVFP4 FP4 E2M1 KV cache
 python3 -m sglang.launch_server \
     --model-path nvidia/DeepSeek-R1-0528-NVFP4 \
-    --kv-cache-dtype fp4_e2m1 \
+    --kv-cache-dtype nvfp4 \
+
+# Enable block-size-16 FP4 E2M1 KV cache
+python3 -m sglang.launch_server \
+    --model-path deepseek-ai/DeepSeek-R1-0528 \
+    --kv-cache-dtype fp4_mx_block16 \
 ```
 
 ### Scaling Factors
@@ -245,7 +250,7 @@ Evaluate FP4 accuracy on your specific model and workload. Large models on simpl
 ## Best Practices
 
 - **Use pre-quantized models**: Prefer models quantized offline with scaling factors included in the checkpoint.
-- **Choose the right format**: Use `fp8_e4m3` for better accuracy (recommended), `fp8_e5m2` for larger dynamic range, or `fp4_e2m1` for maximum memory savings (experimental)
+- **Choose the right format**: Use `fp8_e4m3` for better accuracy (recommended), `fp8_e5m2` for larger dynamic range, or `nvfp4` / `fp4_mx_block16` for maximum memory savings (experimental)
 - **Check backend compatibility**: Verify that your chosen attention backend supports quantized KV cache
 
 <Note>

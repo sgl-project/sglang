@@ -22,6 +22,7 @@ FRAMEWORK_LABELS = {
     "sglang": "SGLang",
     "vllm": "vLLM",
     "trtllm": "TensorRT-LLM",
+    "tokenspeed": "TokenSpeed",
 }
 TRACE_FILE_PATTERNS = (
     "*.trace.json",
@@ -89,6 +90,9 @@ def canonicalize_framework(value: object) -> str:
         "trtllm": "trtllm",
         "tensorrt-llm": "trtllm",
         "tensorrtllm": "trtllm",
+        "tokenspeed": "tokenspeed",
+        "token-speed": "tokenspeed",
+        "ts": "tokenspeed",
     }
     return aliases.get(lowered, "auto")
 
@@ -105,6 +109,8 @@ def _normalize_repo_relative_path_cached(text: str) -> str:
         ("python/sglang/", "python/sglang/"),
         ("sgl_kernel/", "sgl_kernel/"),
         ("vllm/", "vllm/"),
+        ("python/tokenspeed/", "python/tokenspeed/"),
+        ("tokenspeed/", "tokenspeed/"),
         ("tensorrt_llm/", "tensorrt_llm/"),
         ("tensorrt-llm/", "tensorrt_llm/"),
     ):
@@ -312,6 +318,8 @@ def detect_framework_from_text(text: object) -> Optional[str]:
     lowered = normalize_text(text).lower()
     if not lowered:
         return None
+    if any(token in lowered for token in ("tokenspeed", "token-speed", "/ts/")):
+        return "tokenspeed"
     if any(
         token in lowered
         for token in (
@@ -333,6 +341,22 @@ def detect_framework_from_server_args(server_args: Optional[dict]) -> Optional[s
     if not isinstance(server_args, dict) or not server_args:
         return None
     lowered_keys = {normalize_text(key).lower() for key in server_args}
+    text = json.dumps(server_args, sort_keys=True)
+    if any(token in text.lower() for token in ("tokenspeed", "token-speed")):
+        return "tokenspeed"
+    if lowered_keys & {
+        "attn_tp_size",
+        "dense_tp_size",
+        "moe_tp_size",
+        "enable_mla_l1_5_cache",
+        "mla_chunk_multiplier",
+        "comm_fusion_max_num_tokens",
+        "enable_allreduce_fusion",
+    }:
+        return "tokenspeed"
+    text_hint = detect_framework_from_text(text)
+    if text_hint:
+        return text_hint
     if lowered_keys & {
         "attention_backend",
         "sampling_backend",
@@ -342,7 +366,7 @@ def detect_framework_from_server_args(server_args: Optional[dict]) -> Optional[s
         "schedule_policy",
     }:
         return "sglang"
-    return detect_framework_from_text(json.dumps(server_args, sort_keys=True))
+    return None
 
 
 def detect_framework_from_trace(trace: object) -> Optional[str]:
@@ -402,6 +426,9 @@ def detect_framework_from_url(
         or "decode" in server_info
     ):
         return "sglang"
+    readiness = try_get_json(url.rstrip("/") + "/readiness", timeout=5.0)
+    if readiness is not None:
+        return "tokenspeed"
     models = try_get_json(url.rstrip("/") + "/v1/models")
     if isinstance(models, dict) and isinstance(models.get("data"), list):
         return "vllm"
@@ -794,9 +821,11 @@ def wait_for_profiler_artifact(path: Path, timeout_s: float = 60.0) -> Path:
     return path
 
 
-def start_remote_profiler(url: str, framework: str) -> None:
+def start_remote_profiler(
+    url: str, framework: str, payload: Optional[dict] = None
+) -> None:
     try:
-        post_json(url.rstrip("/") + "/start_profile", timeout=60.0)
+        post_json(url.rstrip("/") + "/start_profile", payload=payload, timeout=60.0)
     except Exception as exc:
         if framework == "vllm":
             raise RuntimeError(
@@ -808,9 +837,38 @@ def start_remote_profiler(url: str, framework: str) -> None:
             raise RuntimeError(
                 "TensorRT-LLM live torch profiling requires "
                 "a server build that exposes POST /start_profile plus the env vars "
-                "TLLM_PROFILE_START_STOP=1 and TLLM_TORCH_PROFILE_TRACE=/shared/path."
+                "TLLM_PROFILE_START_STOP=<start>-<stop> and "
+                "TLLM_TORCH_PROFILE_TRACE=/shared/path."
+            ) from exc
+        if framework == "tokenspeed":
+            raise RuntimeError(
+                "TokenSpeed live torch profiling requires a server build that "
+                "exposes POST /start_profile and POST /stop_profile. The helper "
+                "passes output_dir, activities, and profile_id in the start payload."
             ) from exc
         raise
+
+
+def build_remote_profiler_start_payload(
+    framework: str,
+    output_path: Path,
+    profile_prefix: Optional[str],
+    stage: Optional[str],
+) -> Optional[dict]:
+    if framework != "tokenspeed":
+        return None
+
+    profile_id = profile_prefix or "triage-trace"
+    if stage:
+        profile_id = f"{profile_id}-{stage}"
+
+    return {
+        "output_dir": str(output_path),
+        "activities": ["CPU", "GPU"],
+        "with_stack": True,
+        "record_shapes": False,
+        "profile_id": profile_id,
+    }
 
 
 def stop_remote_profiler(url: str, framework: str) -> None:
@@ -829,6 +887,7 @@ def run_remote_profiler(
     framework: str,
     probe_plan: ProbePlan,
     probe_delay: float,
+    profile_prefix: Optional[str] = None,
     stage: Optional[str] = None,
 ) -> Path:
     framework = canonicalize_framework(framework)
@@ -843,7 +902,11 @@ def run_remote_profiler(
         if output_path.exists()
         else set()
     )
-    model = discover_openai_model(url) if framework in {"vllm", "trtllm"} else None
+    model = (
+        discover_openai_model(url)
+        if framework in {"vllm", "trtllm", "tokenspeed"}
+        else None
+    )
     if probe_plan.warmup_requests > 0:
         send_probe_requests(
             url=url,
@@ -854,13 +917,18 @@ def run_remote_profiler(
             model=model,
         )
 
-    start_remote_profiler(url, framework)
+    start_payload = build_remote_profiler_start_payload(
+        framework=framework,
+        output_path=output_path,
+        profile_prefix=profile_prefix,
+        stage=stage,
+    )
+    start_remote_profiler(url, framework, payload=start_payload)
     stop_error: Optional[BaseException] = None
     try:
         if probe_plan.capture_requests > 0:
-            # `sglang.profiler` performs its own startup work before it reaches
-            # POST /start_profile. A very short delay can send probes too early
-            # and miss the profiling window entirely.
+            # Server-side profilers may do setup work after POST /start_profile.
+            # A very short delay can send probes too early and miss the window.
             time.sleep(max(5.0, probe_delay))
             send_probe_requests(
                 url=url,
@@ -1064,14 +1132,14 @@ def run_profiler(
     if profile_by_stage:
         raise ValueError(
             "--profile-by-stage is only supported for SGLang live capture. "
-            "Disable it when profiling vLLM or TensorRT-LLM."
+            "Disable it when profiling vLLM, TensorRT-LLM, or TokenSpeed."
         )
     if merge_profiles:
         raise ValueError(
             "--merge-profiles is only supported for SGLang live capture. "
-            "Disable it when profiling vLLM or TensorRT-LLM."
+            "Disable it when profiling vLLM, TensorRT-LLM, or TokenSpeed."
         )
-    if profile_prefix:
+    if profile_prefix and resolved_framework in {"vllm", "trtllm"}:
         print(
             f"Note: {framework_display_name(resolved_framework)} ignores "
             "--profile-prefix on the HTTP profiler control path.",
@@ -1093,6 +1161,7 @@ def run_profiler(
                 warmup_steps=warmup_steps,
             ),
             probe_delay=probe_delay,
+            profile_prefix=profile_prefix,
         )
     output_root = ensure_remote_profiler_output_path(output_dir, resolved_framework)
     for stage in stages:
@@ -1116,6 +1185,7 @@ def run_profiler(
                 warmup_steps=warmup_steps,
             ),
             probe_delay=probe_delay,
+            profile_prefix=profile_prefix,
             stage=stage,
         )
     return output_root

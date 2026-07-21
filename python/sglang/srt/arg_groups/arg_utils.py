@@ -40,6 +40,7 @@ annotation is equivalent to ``Arg(help=that_string)``.
 from __future__ import annotations
 
 import dataclasses
+import functools
 import types
 from typing import (
     Annotated,
@@ -74,6 +75,29 @@ class Arg:
     # When True, this field is skipped by add_cli_args_from_dataclass.
     # Use for fields that have no CLI surface (e.g. injected via Python only).
     no_cli: bool = False
+    # When True, this field may be written by config resolution (model
+    # overrides and post-process passes): it is part of the whitelist accepted
+    # by the declaration stash, and its resolved value materializes onto the
+    # field at the end of __post_init__.
+    resolvable: bool = False
+
+
+@functools.lru_cache(maxsize=None)
+def resolvable_fields(cls) -> frozenset:
+    """Names of ``cls`` dataclass fields whose ``Arg`` metadata declares
+    ``resolvable=True`` — the whitelist for config resolution.
+
+    Non-dataclass types (e.g. mock config objects in tests) have no Arg
+    metadata and yield an empty whitelist."""
+    if not dataclasses.is_dataclass(cls):
+        return frozenset()
+    hints = get_type_hints(cls, include_extras=True)
+    names = set()
+    for field in dataclasses.fields(cls):
+        _, arg = _unwrap_annotated(hints.get(field.name, field.type))
+        if arg is not None and arg.resolvable:
+            names.add(field.name)
+    return frozenset(names)
 
 
 # ---------------------------------------------------------------------------

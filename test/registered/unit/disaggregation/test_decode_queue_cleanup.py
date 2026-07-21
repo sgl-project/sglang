@@ -9,6 +9,7 @@ from sglang.srt.disaggregation.decode import (
     HiCacheRestoreResult,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.managers.schedule_batch import FINISH_ABORT
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -65,6 +66,70 @@ class TestDecodeQueueCleanup(CustomTestCase):
         scheduler.output_streamer.stream_output.assert_called_once_with(
             [req], req.return_logprob
         )
+
+    def test_prealloc_abort_also_drops_from_pending_reqs(self):
+        # Same DecodeRequest lives in both queue and pending_reqs (add() slow
+        # path). Aborting must drop it from both, and compare by identity since
+        # DecodeRequest's dataclass __eq__ would compare the tensor receiver.
+        class BadEqReceiver(FakeReceiver):
+            def __eq__(self, other):
+                raise TypeError("use identity comparison, not value equality")
+
+            __hash__ = object.__hash__
+
+        receiver = BadEqReceiver()
+        req = SimpleNamespace(
+            rid="abort-shared",
+            finished_reason=FINISH_ABORT("aborted"),
+            return_logprob=False,
+        )
+        decode_req = SimpleNamespace(req=req, kv_receiver=receiver)
+
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.queue = [decode_req]
+        queue.pending_reqs = [decode_req]  # same object, dual ownership
+        queue.retracted_queue = []
+        queue._resolve_pending_reqs = MagicMock()
+        queue._update_handshake_waiters = MagicMock()
+        queue._uses_swa_tail_prealloc = MagicMock(return_value=False)
+        queue._allocatable_token_budgets = MagicMock(return_value=0)
+        queue._hicache_pending_restore_tokens = MagicMock(return_value=0)
+
+        scheduler = MagicMock()
+        scheduler.running_batch.reqs = []
+        scheduler.enable_priority_scheduling = False
+        scheduler.enable_hisparse = False
+        scheduler.output_streamer = MagicMock()
+        queue.scheduler = scheduler
+
+        # Must not raise on the receiver __eq__ above.
+        preallocated, failed = queue.pop_preallocated()
+
+        self.assertEqual(preallocated, [])
+        self.assertEqual(failed, [decode_req])
+        self.assertEqual(queue.queue, [])
+        self.assertTrue(all(r is not decode_req for r in queue.pending_reqs))
+        self.assertIsNone(decode_req.kv_receiver)
+
+    def test_ensure_prefill_info_tolerates_cleared_receiver(self):
+        # A req whose kv_receiver was already cleared must not crash on .abort().
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue._max_ensure_retries = 1
+        queue._ensure_retry_interval = 0
+        queue._ensure_retry_count = {"127.0.0.1:11500": 0}
+        queue._ensure_last_attempt_time = {}
+        queue.kv_manager = MagicMock()
+        queue.kv_manager.try_ensure_parallel_info.return_value = False
+
+        cleared_req = SimpleNamespace(
+            req=SimpleNamespace(rid="cleared"), kv_receiver=None
+        )
+        addr_to_reqs = {"127.0.0.1:11500": [cleared_req]}
+
+        ready, remaining = queue._ensure_prefill_info(addr_to_reqs)
+
+        self.assertEqual(ready, {})
+        self.assertEqual(remaining, [])
 
     @patch("sglang.srt.disaggregation.decode.release_kv_cache")
     @patch("sglang.srt.disaggregation.decode.prepare_abort")
@@ -129,9 +194,9 @@ class TestDecodeQueueCleanup(CustomTestCase):
         scheduler.dllm_manager = MagicMock()
         scheduler.dllm_manager.any_staging_reqs.return_value = False
         scheduler.last_batch = None
-        scheduler.cur_batch = None
+        scheduler.cur_batch_for_debug = None
         scheduler.enable_overlap = False
-        scheduler.ps = SimpleNamespace(pp_size=1)
+        scheduler.ps = ParallelState.trivial()
         scheduler.running_mbs = []
         scheduler.waiting_queue = []
         scheduler.grammar_manager = SimpleNamespace(grammar_queue=[])

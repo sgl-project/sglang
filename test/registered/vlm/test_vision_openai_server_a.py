@@ -33,13 +33,13 @@ class TestLfm2VlServer(ImageOpenAITestMixin):
 class TestQwen25VLServer(ImageOpenAITestMixin, VideoOpenAITestMixin):
     model = "Qwen/Qwen2.5-VL-7B-Instruct"
     extra_args = [
-        "--cuda-graph-max-bs=4",
+        "--cuda-graph-max-bs-decode=4",
     ]
 
 
 class TestQwen3VLServer(ImageOpenAITestMixin, VideoOpenAITestMixin):
     model = "Qwen/Qwen3-VL-30B-A3B-Instruct"
-    extra_args = ["--cuda-graph-max-bs=4"]
+    extra_args = ["--cuda-graph-max-bs-decode=4"]
 
 
 class TestQwen3OmniServer(OmniOpenAITestMixin):
@@ -66,7 +66,7 @@ class TestQwen2VLContextLengthServer(CustomTestCase):
             other_args=[
                 "--context-length",
                 "300",
-                "--cuda-graph-max-bs",
+                "--cuda-graph-max-bs-decode",
                 "4",
             ],
         )
@@ -116,7 +116,7 @@ class TestQwen2VLContextLengthServer(CustomTestCase):
 class TestInternVL25Server(ImageOpenAITestMixin):
     model = "OpenGVLab/InternVL2_5-2B"
     extra_args = [
-        "--cuda-graph-max-bs=4",
+        "--cuda-graph-max-bs-decode=4",
     ]
 
 
@@ -124,7 +124,7 @@ class TestInternVL25Server(ImageOpenAITestMixin):
 class TestMiniCPMV4Server(ImageOpenAITestMixin):
     model = "openbmb/MiniCPM-V-4"
     extra_args = [
-        "--cuda-graph-max-bs=4",
+        "--cuda-graph-max-bs-decode=4",
     ]
 
 
@@ -132,14 +132,14 @@ class TestMiniCPMV4Server(ImageOpenAITestMixin):
 class TestMiniCPMo26Server(ImageOpenAITestMixin, AudioOpenAITestMixin):
     model = "openbmb/MiniCPM-o-2_6"
     extra_args = [
-        "--cuda-graph-max-bs=4",
+        "--cuda-graph-max-bs-decode=4",
     ]
 
 
 class TestGemma3itServer(ImageOpenAITestMixin):
     model = "google/gemma-3-4b-it"
     extra_args = [
-        "--cuda-graph-max-bs=4",
+        "--cuda-graph-max-bs-decode=4",
     ]
 
 
@@ -175,7 +175,7 @@ class TestDeepseekOCRServer(TestOpenAIMLLMServerBase):
     trust_remote_code = False
     extra_args = [
         "--mem-fraction-static=0.70",
-        "--cuda-graph-max-bs=4",
+        "--cuda-graph-max-bs-decode=4",
     ]
 
     def verify_single_image_response_for_ocr(self, response):

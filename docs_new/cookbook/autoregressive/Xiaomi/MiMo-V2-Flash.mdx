@@ -23,14 +23,14 @@ MiMo-V2-Flash is currently available in SGLang via Docker image and pip install.
 
 ```bash Command
 # Pull the docker image
-docker pull lmsysorg/sglang:dev-pr-15207
+docker pull lmsysorg/sglang:latest
 
 # Launch the container
 docker run -it --gpus all \
   --shm-size=32g \
   --ipc=host \
   --network=host \
-  lmsysorg/sglang:dev-pr-15207 bash
+  lmsysorg/sglang:latest bash
 ```
 
 ### Pip Installation
@@ -42,7 +42,7 @@ docker run -it --gpus all \
   --shm-size=32g \
   --ipc=host \
   --network=host \
-  lmsysorg/sglang:nightly-dev-20251215-4449c170 bash
+  lmsysorg/sglang:latest bash
 
 # If you already have SGLang installed, uninstall the current SGLang version
 pip uninstall sglang -y

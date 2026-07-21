@@ -22,6 +22,12 @@ on Ascend hardware.
 
 ## Directory Structure
 
+<Note>
+The identifiers `sgl_kenel_npu_ops.h`, `KernalHelloworld`, and `retrive_*` (e.g., `retrive_index`,
+`retrive_next_token`, `retrive_next_sibling`) in this guide match the spelling used in the
+upstream [sgl-kernel-npu](https://github.com/sgl-project/sgl-kernel-npu) repository and are kept verbatim for consistency.
+</Note>
+
 ```text
 sgl-kernel-npu/
 ├── csrc/                          # Ascend C operator C++ sources
@@ -148,6 +154,7 @@ extern "C" __global__ __aicore__ void helloworld(
 ```
 
 **Key points:**
+
 - Class methods must be marked with `__aicore__`, indicating they run on AICore.
 - Use `AscendC::TPipe` + `AscendC::TQue` to build a pipeline that overlaps data
   movement and computation.
@@ -201,6 +208,7 @@ HOST_API at::Tensor helloworld(const at::Tensor &x, const at::Tensor &y)
 ```
 
 **Key points:**
+
 - The namespace must be `sglang::npu_kernel`.
 - Function signatures follow the pattern
   `at::Tensor <op_name>(const at::Tensor &input, ...)`.
@@ -249,6 +257,7 @@ TORCH_LIBRARY_IMPL(npu, PrivateUse1, m)
 ```
 
 **Schema conventions:**
+
 - The namespace is fixed to `npu`. In SGLang, operators are called via
   `torch.ops.npu.<op_name>()`.
 - Output tensor parameters use the `Tensor(a!)` mutating annotation.
@@ -258,6 +267,7 @@ TORCH_LIBRARY_IMPL(npu, PrivateUse1, m)
   [PyTorch Schema Reference](https://github.com/pytorch/pytorch/blob/main/aten/src/ATen/native/README.md#func).
 
 **Implementation binding rules:**
+
 - The device name is fixed to `PrivateUse1` (PyTorch NPU backend identifier).
 - Use the `TORCH_FN` macro to bind to the implementation function.
 - For complex operators with optional parameters, use lambda expressions to
@@ -436,6 +446,7 @@ python tests/python/sgl_kernel_npu/test_helloworld.py
 ```
 
 **Testing checklist:**
+
 - Cover typical input shapes (power-of-2 sizes and non-standard sizes).
 - Cover different data types (bf16 / fp16, etc.).
 - For operators with in-place behavior, verify correctness of output tensors.
@@ -493,11 +504,13 @@ submitting a PR.
    steps above. Ensure all tests pass.
 4. **Run pre-commit**: Ensure code formatting compliance.
 5. **Commit and push**:
+
    ```bash
    git add .
    git commit -m "feat: add <op_name> operator"
    git push origin feature/add-my-op
    ```
+
 6. **Create a PR**: Open a Pull Request on GitHub from your branch to
    `sgl-project/sgl-kernel-npu:main`.
 7. **Wait for CI and review**: CI checks include linting, compilation, and

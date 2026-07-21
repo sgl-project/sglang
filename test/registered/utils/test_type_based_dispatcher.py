@@ -34,7 +34,6 @@ class TestTypeBasedDispatcher(unittest.TestCase):
             FlushCacheReqInput,
             FreezeGCReq,
             GetInternalStateReq,
-            GetLoadsReqInput,
             GetWeightsByNameReqInput,
             InitWeightsSendGroupForRemoteInstanceReqInput,
             InitWeightsUpdateGroupReqInput,
@@ -114,7 +113,6 @@ class TestTypeBasedDispatcher(unittest.TestCase):
             (ExpertDistributionReq, lambda req: "expert_distribution_handled"),
             (LoadLoRAAdapterReqInput, lambda req: "load_lora_adapter_handled"),
             (UnloadLoRAAdapterReqInput, lambda req: "unload_lora_adapter_handled"),
-            (GetLoadsReqInput, lambda req: "get_loads_handled"),
         ]
 
         # Create requests that conforms to the real distribution
@@ -124,7 +122,9 @@ class TestTypeBasedDispatcher(unittest.TestCase):
             TokenizedGenerateReqInput(
                 input_text="",
                 input_ids=[1, 2],
+                input_embeds=None,
                 mm_inputs=dict(),
+                token_type_ids=None,
                 sampling_params=SamplingParams(),
                 return_logprob=False,
                 logprob_start_len=0,
@@ -138,7 +138,7 @@ class TestTypeBasedDispatcher(unittest.TestCase):
             TokenizedEmbeddingReqInput(
                 input_text="",
                 input_ids=[1, 2],
-                image_inputs=dict(),
+                mm_inputs=dict(),
                 token_type_ids=[1, 2],
                 sampling_params=SamplingParams(),
             )
@@ -150,7 +150,9 @@ class TestTypeBasedDispatcher(unittest.TestCase):
                     TokenizedGenerateReqInput(
                         input_text="",
                         input_ids=[1, 2],
+                        input_embeds=None,
                         mm_inputs=dict(),
+                        token_type_ids=None,
                         sampling_params=SamplingParams(),
                         return_logprob=False,
                         logprob_start_len=0,
@@ -167,7 +169,7 @@ class TestTypeBasedDispatcher(unittest.TestCase):
                     TokenizedEmbeddingReqInput(
                         input_text="",
                         input_ids=[1, 2],
-                        image_inputs=dict(),
+                        mm_inputs=dict(),
                         token_type_ids=[1, 2],
                         sampling_params=SamplingParams(),
                     )
@@ -205,7 +207,6 @@ class TestTypeBasedDispatcher(unittest.TestCase):
         test_requests.append(GetWeightsByNameReqInput(name=""))
         test_requests.append(ReleaseMemoryOccupationReqInput())
         test_requests.append(RpcReqInput(method=""))
-        test_requests.append(GetLoadsReqInput())
 
         dispatcher = TypeBasedDispatcher(mapping)
 

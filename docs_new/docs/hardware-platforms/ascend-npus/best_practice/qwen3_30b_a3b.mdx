@@ -4,21 +4,25 @@ metatags:
   description: "Best Practice for Qwen3-30B-A3B on Ascend NPU"
 ---
 
-This guide describes the best practice data for Qwen3-30B-A3B on the Ascend NPU.
+<Note>
+This page focuses on optimal configuration and benchmark results for Qwen3-30B-A3B on the Ascend NPU. For environment setup, model weight download, feature configuration, and deployment instructions, etc., see the [Qwen3-30B-A3B Model Tutorial](/docs/hardware-platforms/ascend-npus/model-tutorials/qwen3_30b_a3b).
+
+On A3 each card has 2 dies, so `--tp-size` is twice the card count; see [Ascend NPU Reference](/docs/hardware-platforms/ascend-npus/ascend_npu_reference#hardware) for details.
+</Note>
 
 ### Low Latency
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Qwen3-30B-A3B | Atlas 800I A3 | 1 | PD Mixed | 3.5K+1.5K | 10ms | W8A8 INT8 | [Optimal Configuration](#qwen3-30b-a3b-w8a8-1p-in3k5-out1k5-10ms) |
-| Qwen3-30B-A3B | Atlas 800I A3 | 1 | PD Mixed | 6K+1.5K | 10.25ms | W8A8 INT8 | [Optimal Configuration](#qwen3-30b-a3b-w8a8-1p-in6k-out1k5-bs16) |
+| Qwen3-30B-A3B | Atlas 800I A3 | 1 | PD Mixed | 3.5k+1.5k | 10ms | W8A8 INT8 | [Optimal Configuration](#qwen3-30b-a3b-w8a8-1p-in3k5-out1k5-10ms) |
+| Qwen3-30B-A3B | Atlas 800I A3 | 1 | PD Mixed | 6k+1.5k | 10.25ms | W8A8 INT8 | [Optimal Configuration](#qwen3-30b-a3b-w8a8-1p-in6k-out1k5-bs16) |
 
 ### High Throughput
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Qwen3-30B-A3B | Atlas 800I A3 | 1 | PD Mixed | 1K+100 | 10000ms | BF16 | [Optimal Configuration](#qwen3-30b-a3b-bf16-1p-in1k-out100) |
-| Qwen3-30B-A3B | Atlas 800I A3 | 1 | PD Mixed | 3.5K+1.5K | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-30b-a3b-w8a8-1p-in3k5-out1k5-50ms) |
+| Qwen3-30B-A3B | Atlas 800I A3 | 1 | PD Mixed | 1k+100 | 10000ms | BF16 | [Optimal Configuration](#qwen3-30b-a3b-bf16-1p-in1k-out100) |
+| Qwen3-30B-A3B | Atlas 800I A3 | 1 | PD Mixed | 3.5k+1.5k | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-30b-a3b-w8a8-1p-in3k5-out1k5-50ms) |
 
 ## Optimal Configuration
 
@@ -36,7 +40,7 @@ This guide describes the best practice data for Qwen3-30B-A3B on the Ascend NPU.
 
 **Quantization**: BF16
 
-**Dataset**: 1K+100
+**Dataset**: 1k+100
 
 **TPOT**: 10000ms
 
@@ -71,13 +75,12 @@ source /usr/local/Ascend/nnal/atb/set_env.sh
 export ASCEND_LAUNCH_BLOCKING=0
 export DP_ROUND_ROBIN=1
 export GLOO_SOCKET_IFNAME=<network-interface>
-export HCCL_ALGO=level0:NA;level1:ring
+export HCCL_ALGO="level0:NA;level1:ring"
 export HCCL_SOCKET_IFNAME=<network-interface>
 export INF_NAN_MODE_FORCE_DISABLE=1
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:False
 export SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=200
 export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1
 export SGLANG_USE_MAX_DP_ATT=1
@@ -106,14 +109,16 @@ python3 -m sglang.launch_server \
     --dp-size 2 \
     --mem-fraction-static 0.85 \
     --cuda-graph-bs 1 2 4 8 16 20 24 28 32 36 40 44 48 52 56 60 64 68 72 76 80 84 \
-    --dtype bfloat16
+    --dtype bfloat16 \
+    --reasoning-parser qwen3 \
+    --tool-call-parser qwen
 ```
 
 #### Benchmark
 
 We tested it based on the `RANDOM` dataset.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name random \
     --backend sglang \
@@ -138,7 +143,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W8A8 INT8
 
-**Dataset**: 3.5K+1.5K
+**Dataset**: 3.5k+1.5k
 
 **TPOT**: 10ms
 
@@ -178,7 +183,6 @@ export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=200
 export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1
 
@@ -204,14 +208,16 @@ python3 -m sglang.launch_server \
     --tp-size 2 \
     --mem-fraction-static 0.87 \
     --cuda-graph-bs 1 5 15 40 70 100 120 130 140 146 150 154 156 158 160 162 \
-    --dtype bfloat16
+    --dtype bfloat16 \
+    --reasoning-parser qwen3 \
+    --tool-call-parser qwen
 ```
 
 #### Benchmark
 
 We tested it based on the `RANDOM` dataset.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name random \
     --backend sglang \
@@ -236,7 +242,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W8A8 INT8
 
-**Dataset**: 3.5K+1.5K
+**Dataset**: 3.5k+1.5k
 
 **TPOT**: 50ms
 
@@ -276,7 +282,6 @@ export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=200
 export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1
 
@@ -302,14 +307,16 @@ python3 -m sglang.launch_server \
     --tp-size 2 \
     --mem-fraction-static 0.87 \
     --cuda-graph-bs 1 5 15 40 70 100 120 130 140 146 150 154 156 158 160 162 \
-    --dtype bfloat16
+    --dtype bfloat16 \
+    --reasoning-parser qwen3 \
+    --tool-call-parser qwen
 ```
 
 #### Benchmark
 
 We tested it based on the `RANDOM` dataset.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name random \
     --backend sglang \
@@ -334,7 +341,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W8A8 INT8
 
-**Dataset**: 6K+1.5K
+**Dataset**: 6k+1.5k
 
 **TPOT**: 10.25ms
 
@@ -373,7 +380,6 @@ export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_SET_CPU_AFFINITY=1
 export TRANSFORMERS_VERBOSITY=error
 
@@ -399,14 +405,16 @@ python3 -m sglang.launch_server \
     --tp-size 2 \
     --mem-fraction-static 0.6 \
     --cuda-graph-bs 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 \
-    --dtype bfloat16
+    --dtype bfloat16 \
+    --reasoning-parser qwen3 \
+    --tool-call-parser qwen
 ```
 
 #### Benchmark
 
 We tested it based on the `RANDOM` dataset.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name random \
     --backend sglang \

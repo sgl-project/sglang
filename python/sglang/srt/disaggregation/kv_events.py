@@ -36,6 +36,28 @@ from pydantic import BaseModel
 logger = logging.getLogger(__name__)
 
 
+def select_kv_publisher_dp_rank(
+    attn_dp_size: int, attn_dp_rank: int, dp_rank: Optional[int]
+) -> int:
+    """Index used to offset this scheduler's KV-event publisher port.
+
+    Each independent KV cache must publish on its own port so a consumer can
+    subscribe per replica. There are always ``dp_size`` such publishers; which
+    rank distinguishes them depends on the parallelism mode:
+
+    - DP-attention (``attn_dp_size > 1``): each attention-DP rank owns a KV
+      cache shard, so distinguish by ``attn_dp_rank``.
+    - Pure DP (``attn_dp_size == 1``): every worker has ``attn_dp_rank == 0``,
+      so distinguish by ``dp_rank`` (the data-parallel replica index).
+
+    Both span ``0..dp_size-1``, matching the ``dp_size`` advertised in
+    ``/server_info`` and the per-rank ports the router subscribes to.
+    """
+    if attn_dp_size > 1:
+        return attn_dp_rank
+    return dp_rank or 0
+
+
 class EventBatch(
     msgspec.Struct,
     array_like=True,  # type: ignore[call-arg]

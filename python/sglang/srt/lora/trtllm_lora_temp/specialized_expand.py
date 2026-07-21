@@ -1,15 +1,13 @@
 """Rank-specialized LoRA-B expand for virtual-expert LoRA.
 
 The kernel here was originally a chunk in ``lora/triton_ops/virtual_experts.py``.
-It is rank-specialized: the ``R`` dimension (LoRA rank) is a triton
+It is rank-specialized: the ``R`` dimension (LoRA rank) is a Triton
 ``constexpr``, so each rank value used at runtime gets its own JIT-compiled
-specialization (R=16, R=32, R=64 are all supported up to the ``R <= 64`` assert,
-with no perf interaction between them — each gets its own kernel).
+specialization.
 
-Called from :mod:`sglang.srt.lora.triton_ops.virtual_experts` when
-``use_direct_expand_add=True`` (the trtllm-lora path uses this when
-``max_lora_rank <= 64``); the generic ``invoke_fused_moe_kernel`` is used
-when that flag is False (incl. ranks above 64).
+Called from :mod:`sglang.kernels.ops.moe.virtual_experts` when
+``use_direct_expand_add=True``. Ranks above 64 are accumulated in multiple
+rank tiles.
 """
 
 from typing import Any
@@ -17,8 +15,6 @@ from typing import Any
 import torch
 import triton
 import triton.language as tl
-
-from sglang.srt.lora.trtllm_lora_temp.environ import lora_envs
 
 
 @triton.jit
@@ -52,6 +48,7 @@ def _moe_lora_expand_add_kernel(
     BLOCK_SIZE_R: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
     GATED_A_HALF: tl.constexpr,
+    BROADCAST_A: tl.constexpr,
 ):
     """Rank-specialized LoRA-B expand for virtual-expert LoRA.
 
@@ -96,29 +93,32 @@ def _moe_lora_expand_add_kernel(
 
     offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)
     offs_r = tl.arange(0, BLOCK_SIZE_R).to(tl.int64)
-    rank_mask = offs_r < R
 
     # Gated gate_up split: the up-half output tiles read up-shrink (A columns [R:2R]); gate-half
     # tiles read gate-shrink (A columns [0:R]). GATED_A_HALF == 0 -> always read [0:R] (non-gated).
-    a_col = offs_r
-    if GATED_A_HALF > 0:
-        a_col = offs_r + tl.where(pid_n * BLOCK_SIZE_N >= GATED_A_HALF, R, 0)
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    a_token = offs_token // router_topk if BROADCAST_A else offs_token
+    for rank_start in range(0, R, BLOCK_SIZE_R):
+        rank_offsets = rank_start + offs_r
+        rank_mask = rank_offsets < R
+        a_col = rank_offsets
+        if GATED_A_HALF > 0:
+            a_col += tl.where(pid_n * BLOCK_SIZE_N >= GATED_A_HALF, R, 0)
 
-    a = tl.load(
-        a_ptr + offs_token[:, None] * stride_am + a_col[None, :] * stride_ar,
-        mask=token_mask[:, None] & rank_mask[None, :],
-        other=0.0,
-    )
-    b = tl.load(
-        b_ptr
-        + off_expert * stride_be
-        + offs_n[None, :] * stride_bn
-        + offs_r[:, None] * stride_br,
-        mask=(offs_n[None, :] < N) & rank_mask[:, None],
-        other=0.0,
-    )
-
-    accumulator = tl.dot(a, b, out_dtype=tl.float32)
+        a = tl.load(
+            a_ptr + a_token[:, None] * stride_am + a_col[None, :] * stride_ar,
+            mask=token_mask[:, None] & rank_mask[None, :],
+            other=0.0,
+        )
+        b = tl.load(
+            b_ptr
+            + off_expert * stride_be
+            + offs_n[None, :] * stride_bn
+            + rank_offsets[:, None] * stride_br,
+            mask=(offs_n[None, :] < N) & rank_mask[:, None],
+            other=0.0,
+        )
+        accumulator += tl.dot(a, b, out_dtype=tl.float32)
     if MUL_ROUTED_WEIGHT:
         moe_weight = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0.0)
         accumulator *= moe_weight[:, None]
@@ -135,6 +135,22 @@ def _moe_lora_expand_add_kernel(
         tl.store(c_ptrs, accumulator.to(c_ptr.dtype.element_ty), mask=c_mask)
 
 
+def _get_gated_a_half(intermediate_width: int, rank: int, output_width: int) -> int:
+    """Return the gate/up boundary for the direct expand kernel.
+
+    A gated gate-up adapter always needs the split. This is adapter math, not a
+    performance option, so it must not depend on the experimental optimization
+    master switch.
+    """
+
+    if intermediate_width not in (rank, 2 * rank):
+        raise ValueError(
+            f"LoRA expand intermediate width must be R ({rank}, non-gated) or "
+            f"2*R ({2 * rank}, gated gate_up), got {intermediate_width}"
+        )
+    return output_width // 2 if intermediate_width == 2 * rank else 0
+
+
 def _invoke_moe_lora_expand_add(
     intermediate: torch.Tensor,
     weight: torch.Tensor,
@@ -148,18 +164,15 @@ def _invoke_moe_lora_expand_add(
     mul_routed_weight: bool,
     fuse_sum_all_reduce: bool,
     force_block_size_n: "int | None" = None,
+    broadcast_intermediate: bool = False,
 ) -> None:
     """Launch the rank-specialized LoRA-B expand kernel.
 
-    ``R`` (= ``weight.shape[2]``) up to 64 is supported. ``BLOCK_SIZE_R`` is
-    set to ``next_power_of_2(R)`` so each rank value pairs with the smallest
-    tile that covers it (R=16 → BSR=16, R=32 → BSR=32, R=64 → BSR=64).
-    Triton compiles a separate specialization per (R, BLOCK_SIZE_R) combo
-    so different ranks don't interfere with each other's perf.
+    Ranks through 64 use one rank tile. Larger ranks use the same kernel with
+    multiple 64-wide tiles.
     """
     N = weight.shape[1]
     R = weight.shape[2]
-    assert R <= 64, f"direct LoRA expand/add expects rank <= 64, got {R}"
 
     block_size_m = config["BLOCK_SIZE_M"]
     # BLOCK_SIZE_N defaults to 128 when N % 128 == 0 (a good N-divisible tile that also keeps
@@ -170,7 +183,9 @@ def _invoke_moe_lora_expand_add(
     else:
         block_size_n = 128 if N % 128 == 0 else config["BLOCK_SIZE_N"]
     group_size_m = config.get("GROUP_SIZE_M", 1)
-    block_size_r = triton.next_power_of_2(R)
+    # Pad the rank tile to >=16 for Triton's MMA K>=16 tl.dot constraint; the
+    # offs_r < R mask zeroes the padded rows, so the result is unchanged.
+    block_size_r = min(64, max(16, triton.next_power_of_2(R)))
 
     # gate_up LoRA: the shrink stacks gate_A and up_A, so the intermediate has 2*R columns
     # ([0:R] = gate-shrink x@gate_A^T, [R:2R] = up-shrink x@up_A^T). The up output half
@@ -180,19 +195,10 @@ def _invoke_moe_lora_expand_add(
     # verified >100% rel error vs a PEFT reference on the real Qwen3.5 adapter). The earlier
     # "vs cutlass" justification for reading [0:R] was unreliable (the cutlass reference shared
     # the same bug). Detect the gated layout from the intermediate width and split in-kernel.
-    inter_width = intermediate.shape[1]
-    assert inter_width in (R, 2 * R), (
-        f"LoRA expand intermediate width must be R ({R}, non-gated) or 2*R "
-        f"({2 * R}, gated gate_up), got {inter_width}"
-    )
-    # Lazy import to avoid the trtllm_moe <-> triton_ops package import cycle at load time.
-
-    gated = inter_width == 2 * R
-    use_gated_split = (
-        gated and lora_envs.SGLANG_ENABLE_LORA_MOE_GATEUP_GATED_SPLIT.get()
-    )
-    gated_a_half = (N // 2) if use_gated_split else 0
-    if use_gated_split:
+    gated_a_half = _get_gated_a_half(intermediate.shape[1], R, N)
+    if gated_a_half:
+        while block_size_n > 16 and gated_a_half % block_size_n:
+            block_size_n //= 2
         assert N % 2 == 0 and (N // 2) % block_size_n == 0, (
             f"gated gate_up split needs N/2 ({N // 2}) divisible by BLOCK_SIZE_N "
             f"({block_size_n})"
@@ -229,6 +235,7 @@ def _invoke_moe_lora_expand_add(
         BLOCK_SIZE_R=block_size_r,
         GROUP_SIZE_M=group_size_m,
         GATED_A_HALF=gated_a_half,
+        BROADCAST_A=broadcast_intermediate,
         num_warps=config.get("num_warps", 4),
         num_stages=1,
     )

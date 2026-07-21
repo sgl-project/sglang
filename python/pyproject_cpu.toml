@@ -30,8 +30,8 @@ dependencies = [
   "intel-openmp; platform_machine == 'x86_64'",
   "interegular",
   "IPython",
-  "llguidance>=0.7.11,<0.8.0",
-  "mistral_common>=1.11.0",
+  "llguidance>=1.7.6,<2.0.0",
+  "mistral_common>=1.11.5",
   "modelscope",
   "msgspec",
   "ninja",
@@ -49,6 +49,7 @@ dependencies = [
   "pybase64",
   "pydantic",
   "python-multipart",
+  "pytest",
   "pyzmq>=25.1.2",
   "requests",
   "scipy",
@@ -64,11 +65,12 @@ dependencies = [
   "torchaudio==2.11.0",
   "torchvision==0.27.0",
   "tqdm",
-  "transformers==5.8.1",
+  "transformers==5.12.1",
   "triton==3.7.0",
   "uvicorn",
   "uvloop",
   "xgrammar==0.2.1",
+  "zstandard",
 ]
 
 [project.optional-dependencies]
@@ -100,12 +102,12 @@ tracing = [
 ]
 test = [
   "accelerate",
+  "pymupdf",
   "expecttest",
   "jsonlines",
   "matplotlib",
   "pandas",
   "peft>=0.18.0",
-  "pytest",
   "sentence_transformers",
 ]
 all = []

@@ -190,15 +190,11 @@ class TestFlashAttentionMLABackend(CustomTestCase):
                 extend_prefix_lens=torch.tensor(
                     [prefix_len] * self.batch_size, device=self.device
                 ),
-                extend_prefix_lens_cpu=torch.tensor(
-                    [prefix_len] * self.batch_size, device="cpu"
-                ),
+                extend_prefix_lens_cpu=[prefix_len] * self.batch_size,
                 extend_seq_lens=torch.tensor(
                     [q_len] * self.batch_size, device=self.device
                 ),
-                extend_seq_lens_cpu=torch.tensor(
-                    [q_len] * self.batch_size, device="cpu"
-                ),
+                extend_seq_lens_cpu=[q_len] * self.batch_size,
             )
 
         else:  # ForwardMode.DECODE

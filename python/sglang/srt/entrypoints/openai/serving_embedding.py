@@ -21,8 +21,8 @@ from sglang.srt.parser.conversation import generate_embedding_convs
 from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.template_manager import TemplateManager
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
+    from sglang.srt.parser.template_manager import TemplateManager
 
 
 class OpenAIServingEmbedding(OpenAIServingBase):

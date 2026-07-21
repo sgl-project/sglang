@@ -32,7 +32,7 @@ For how to launch the image, see [Install → Method 3: Using Docker](../../../d
 
 **NVIDIA GPUs**
 
-A single image — `lmsysorg/sglang:latest` — covers the **datacenter GPUs** in this cookbook (B200 / B300 / GB200 / GB300 / H100 / H200). For **RTX PRO 6000 (SM120)**, use the nightly `lmsysorg/sglang:dev` instead — SM120 support isn't in `:latest` yet (see the RTX PRO 6000 note below).
+A single image — `lmsysorg/sglang:latest` — covers the **datacenter GPUs** in this cookbook (B200 / B300 / GB200 / GB300 / H100 / H200 / RTX PRO 6000).
 
 ```bash Command
 docker pull lmsysorg/sglang:latest
@@ -52,11 +52,11 @@ docker run --gpus all \
 AMD uses the daily-updated `lmsysorg/sglang-rocm` images. You can find the latest images on [Docker Hub](https://hub.docker.com/r/lmsysorg/sglang-rocm/tags). We recommend the ROCm 7.2 version.
 
 For example:
-- **MI355X** → `lmsysorg/sglang-rocm:v0.5.13.post1-rocm720-mi35x-20260623`
+- **MI355X** → `lmsysorg/sglang-rocm:v0.5.14-rocm720-mi35x-20260710`
 - **MI300X** → `lmsysorg/sglang-rocm:v0.5.13.post1-rocm720-mi30x-20260623`
 
 ```bash Command
-docker pull lmsysorg/sglang-rocm:v0.5.13.post1-rocm720-mi35x-20260623
+docker pull lmsysorg/sglang-rocm:v0.5.14-rocm720-mi35x-20260710
 
 docker run \
     --device=/dev/kfd --device=/dev/dri \
@@ -66,7 +66,7 @@ docker run \
     -p 30000:30000 \
     -v ~/.cache/huggingface:/root/.cache/huggingface \
     --env "HF_TOKEN=<your-hf-token>" \
-    lmsysorg/sglang-rocm:v0.5.13.post1-rocm720-mi35x-20260623 \
+    lmsysorg/sglang-rocm:v0.5.14-rocm720-mi35x-20260710 \
     sglang serve <use args below>
 ```
 
@@ -87,6 +87,10 @@ import { config }     from "/src/snippets/configs/deepseek-ai/deepseek-v4.jsx";
 import { benchmarks } from "/src/snippets/configs/deepseek-ai/deepseek-v4-benchmarks.jsx";
 
 <Deployment config={config} benchmarks={benchmarks} />
+
+<Note>
+  For a runnable end-to-end example, see the [DeepSeek-V4-Flash demo notebook](https://github.com/sgl-project/sglang/blob/main/docs_new/demo/deepseek_v4_flash.ipynb).
+</Note>
 
 <div style={{fontSize: "0.85em", lineHeight: "1.55", color: "#6b7280", margin: "0.5rem 0 1rem 0"}}>
   <p style={{margin: "0 0 0.3rem 0"}}><strong>Panel controls</strong> (top of the command box):</p>
@@ -145,7 +149,7 @@ import { Playground } from "/src/snippets/_playground.jsx";
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong><a href="https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash">DeepSeek-V4-Flash</a></strong></td>
       <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.05)"}}><strong>284B</strong></td>
       <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.02)"}}>13B</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>single-node serving on B200 / B300 / GB200 / GB300 / H200 (TP=4); H100 (TP=8)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>single-node serving on B200 / B300 / GB200 / GB300 / H200 (TP=4); RTX PRO 6000 (TP=2); H100 (TP=8)</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong><a href="https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro">DeepSeek-V4-Pro</a></strong></td>
@@ -170,7 +174,7 @@ Both Instruct repos ship as **FP4 MoE experts + FP8 attention / dense** (one mix
 
 **Concurrency & DeepEP dispatch buffer**
 
-Must hold: `max-running-requests × MTP_draft_tokens ≤ SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK`. Violating it blows DeepEP's dispatch buffer at steady-state load (`deep_ep.cpp:1105`). When tuning, move `--cuda-graph-max-bs`, `--max-running-requests`, and the env together.
+Must hold: `max-running-requests × MTP_draft_tokens ≤ SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK`. Violating it blows DeepEP's dispatch buffer at steady-state load (`deep_ep.cpp:1105`). When tuning, move `--cuda-graph-max-bs-decode`, `--max-running-requests`, and the env together.
 
 The generator currently picks values on the **conservative** side (mirroring an internal stress-test matrix). They run safely out of the box but likely leave throughput on the table — please tune them up toward your actual workload's peak concurrency and report findings back so the defaults can be revised.
 
@@ -194,7 +198,7 @@ sglang serve \
 
 This BF16 setting applies only to the compressed attention state pools and reduces the GPU memory footprint of each compressed-state slot. It does not change model weight precision or the main KV cache dtype. With automatic pool sizing and no explicit capacity cap, the same memory budget holds more slots, and the startup log shows larger `c4_state` and `c128_state` pool sizes. Keep the default `float32` setting for the most conservative behavior.
 
-**EPLB + DeepEP Waterfill (Experimental)**
+**EPLB + Waterfill (Experimental)**
 
 For recorded/static EPLB reproduction, first record an expert-distribution file by following
 [Capture expert selection distribution in MoE models](../../../docs/basic_usage/native_api.mdx#capture-expert-selection-distribution-in-moe-models).
@@ -207,7 +211,7 @@ For non-PD reproduction, use:
 --moe-a2a-backend deepep \
 --deepep-mode auto \
 --init-expert-location /path/to/expert_distribution_recorder_*.pt \
---enable-deepep-waterfill
+--enable-waterfill
 ```
 
 For PD-Disagg reproduction, use `normal` mode on the prefill server and
@@ -219,21 +223,21 @@ flag to both commands:
 --moe-a2a-backend deepep \
 --deepep-mode normal \
 --init-expert-location /path/to/expert_distribution_recorder_*.pt \
---enable-deepep-waterfill
+--enable-waterfill
 
 # decode
 --moe-a2a-backend deepep \
 --deepep-mode low_latency \
 --init-expert-location /path/to/expert_distribution_recorder_*.pt \
---enable-deepep-waterfill
+--enable-waterfill
 ```
 
 You can also add `--ep-num-redundant-experts` and `--eplb-algorithm` to customize
 EPLB placement.
 
-MegaMoE is not supported with this DeepEP Waterfill recipe yet. Waterfill routes
-the shared expert through DeepEP for load balancing, so `--enable-deepep-waterfill`
-requires `--moe-a2a-backend deepep`.
+Waterfill also supports MegaMOE. Use `--moe-a2a-backend megamoe
+--enable-waterfill` to keep the MegaMOE backend while applying Waterfill to the
+fused shared expert slot.
 
 **FP4 Indexer (Experimental)**
 
@@ -289,10 +293,9 @@ TCP, which can lead to garbled KV transfer on large checkpoints.
 
 **RTX PRO 6000 (SM120 / Blackwell Desktop) note**
 
-RTX PRO 6000 (96 GB) runs **Flash only** — V4-Pro doesn't fit on 8× 96 GB. It uses the
-**low-latency / TP-only** recipe (TP=4, single node) with the **Marlin** W4A16 MoE runner and
-`--mem-fraction-static 0.70`; the Deploy panel greys out the other recipes for this card.
-HiCache and MegaMoE are **not** supported on RTX PRO 6000. For Docker, use the nightly `lmsysorg/sglang:dev` image — SM120 support isn't in `lmsysorg/sglang:latest` yet (the Deploy panel's Docker mode already points this card at `:dev`).
+RTX PRO 6000 (96 GB) runs **Flash only** with the FlashInfer MXFP4 MoE runner.
+V4-Pro doesn't fit on 8× 96 GB; the Deploy panel greys out unsupported recipes.
+HiCache and MegaMoE are **not** supported on RTX PRO 6000.
 
 **AMD (MI300X / MI355X) note**
 
@@ -509,6 +512,10 @@ To enable HiCache, open the **HiCache** card in the [Playground above](#playgrou
 
 - **L2 (GPU + CPU)** — leave Storage on `auto` (default). Cold KV pages spill to CPU pinned memory only.
 - **L3 (GPU + CPU + Storage)** — pick a Storage backend (`file` / `mooncake` / `hf3fs` / `nixl`); the Playground emits the canonical `page_first_direct` mem-layout + `direct` IO backend + `wait_complete` prefetch policy, matching the [HiCache best-practices recipe](../../../docs/advanced_features/hicache_best_practices).
+
+For AMD devices,
+- **L2 (GPU + CPU)** — leave Storage on `auto` (default). Cold KV pages spill to CPU pinned memory only. Use `direct` IO backend + `page_first_direct` or `layer-first` mem-layout.
+- **L3 (GPU + CPU + Storage)** — pick a Storage backend (`file`); the Playground emits the canonical `page_first_direct` mem-layout + `direct` IO backend + `wait_complete` prefetch policy, matching the [HiCache best-practices recipe](../../../docs/advanced_features/hicache_best_practices).
 
 The Write policy knob defaults to `write_through` (the upstream default); switch to `write_back` / `write_through_selective` to trade durability for write speed when the storage tier is slow.
 

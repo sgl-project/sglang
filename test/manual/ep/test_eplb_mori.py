@@ -69,7 +69,7 @@ common_args = [
     "12288",
     "--attention-backend",
     "aiter",
-    "--cuda-graph-max-bs",
+    "--cuda-graph-max-bs-decode",
     "32",
 ]
 

@@ -29,6 +29,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     init_logger,
 )
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
+from sglang.multimodal_gen.test.server.common.slack import upload_file_to_slack
 from sglang.multimodal_gen.test.server.realtime_consistency import (
     build_realtime_init_payload,
     collect_realtime_output,
@@ -44,7 +45,6 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     ScenarioConfig,
     ToleranceConfig,
 )
-from sglang.multimodal_gen.test.slack_utils import upload_file_to_slack
 from sglang.multimodal_gen.test.test_utils import (
     get_expected_image_format,
     get_video_frame_count,
@@ -854,6 +854,7 @@ VALIDATOR_REGISTRY = {
     "default": PerformanceValidator,
     "video": VideoPerformanceValidator,
     "mesh": MeshValidator,
+    "action": PerformanceValidator,
 }
 
 
@@ -1501,8 +1502,109 @@ def get_generate_fn(
 
         pytest.fail(f"{case_id}: mesh generation timed out after {max_wait}s")
 
+    def generate_action(case_id, client) -> tuple[str, bytes]:
+        """VLA action generation using /v1/actions/generations."""
+        import numpy as np
+        import requests as http_requests
+
+        extra = dict(sampling_params.extras)
+        action_horizon = int(extra.get("action_horizon", 50))
+        action_dim = int(extra.get("action_dim", 32))
+        state_dim = int(extra.get("state_dim", action_dim))
+        image_size = int(extra.get("image_size", 64))
+        camera_order = tuple(
+            extra.get(
+                "camera_order",
+                ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb"),
+            )
+        )
+
+        def tensor_payload(array):
+            return {
+                "dtype": str(array.dtype),
+                "shape": list(array.shape),
+                "values": array.tolist(),
+            }
+
+        def image_payload(camera_index: int):
+            y = np.arange(image_size, dtype=np.uint16)[:, None]
+            x = np.arange(image_size, dtype=np.uint16)[None, :]
+            image = np.stack(
+                (
+                    (x + camera_index * 17) % 256 + np.zeros_like(y),
+                    (y + camera_index * 29) % 256 + np.zeros_like(x),
+                    (x + y + camera_index * 41) % 256,
+                ),
+                axis=-1,
+            )
+            return tensor_payload(image.astype(np.uint8))
+
+        rng = np.random.default_rng(int(extra.get("seed", 0)))
+        request_id = f"{case_id}-{int(time.time() * 1000)}"
+        payload = {
+            "request_id": request_id,
+            "model": model_path,
+            "input": {
+                "task": sampling_params.prompt or "pick up the blue block",
+                "observation": {
+                    "images": {
+                        camera: image_payload(index)
+                        for index, camera in enumerate(camera_order)
+                    },
+                    "camera_order": list(camera_order),
+                    "state": tensor_payload(
+                        np.linspace(-0.5, 0.5, state_dim, dtype=np.float32)
+                    ),
+                    "noise": tensor_payload(
+                        rng.standard_normal((action_horizon, action_dim)).astype(
+                            np.float32
+                        )
+                    ),
+                },
+            },
+            "parameters": {
+                "action_horizon": action_horizon,
+                "action_dim": action_dim,
+                "num_inference_steps": int(extra.get("num_inference_steps", 2)),
+            },
+            "runtime": {
+                "return_timing": True,
+                "prefix_cache": bool(extra.get("enable_prefix_cache", False)),
+                "cuda_graph": bool(extra.get("enable_cuda_graph", True)),
+                "output_format": "list",
+            },
+        }
+
+        base_url = str(client.base_url).rstrip("/")
+        endpoint = (
+            f"{base_url}/actions/generations"
+            if base_url.endswith("/v1")
+            else f"{base_url}/v1/actions/generations"
+        )
+        response = http_requests.post(endpoint, json=payload, timeout=600)
+        if response.status_code != 200:
+            pytest.fail(f"{case_id}: action generation failed: {response.text}")
+
+        body = response.json()
+        action = body["data"][0]["action"]
+        if action["shape"] != [action_horizon, action_dim]:
+            pytest.fail(
+                f"{case_id}: action shape mismatch: {action['shape']} "
+                f"!= {[action_horizon, action_dim]}"
+            )
+        values = action["values"]
+        if not all(
+            isinstance(value, (int, float)) and np.isfinite(value)
+            for row in values
+            for value in row
+        ):
+            pytest.fail(f"{case_id}: action response contains non-finite values")
+        return body["id"], response.content
+
     if modality == "3d":
         fn = generate_mesh
+    elif modality == "action":
+        fn = generate_action
     elif modality == "video":
         if sampling_params.realtime_num_chunks is not None:
             fn = generate_realtime_video

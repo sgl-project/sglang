@@ -272,7 +272,7 @@ def create_grammar_backend(
                 "Falling back to grammar_backend='none'. "
                 "Structured outputs (JSON schema, regex, EBNF) will not be available."
             )
-            server_args.grammar_backend = "none"
+            server_args.override("grammar.import_fallback", grammar_backend="none")
             return None
     elif name == "llguidance":
         from sglang.srt.constrained.llguidance_backend import GuidanceBackend
@@ -281,6 +281,8 @@ def create_grammar_backend(
             tokenizer=tokenizer,
             any_whitespace=not server_args.constrained_json_disable_any_whitespace,
             whitespace_pattern=server_args.constrained_json_whitespace_pattern,
+            n_vocab=vocab_size,
+            eos_token_ids=eos_token_ids,
         )
     elif name == "none":
         if server_args.enable_strict_thinking:
@@ -300,7 +302,9 @@ def create_grammar_backend(
         )
 
         reasoning_parser = ReasoningParser(
-            model_type=server_args.reasoning_parser, stream_reasoning=False
+            model_type=server_args.reasoning_parser,
+            stream_reasoning=False,
+            tokenizer=tokenizer,
         )
 
         grammar_backend = ReasonerGrammarBackend(

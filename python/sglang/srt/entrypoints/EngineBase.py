@@ -33,6 +33,7 @@ class EngineBase(ABC):
         data_parallel_rank: Optional[int] = None,
         rid: Optional[Union[List[str], str]] = None,
         priority: Optional[int] = None,
+        session_id: Optional[str] = None,
     ) -> Union[Dict, Iterator[Dict]]:
         """Generate outputs based on given inputs."""
         pass

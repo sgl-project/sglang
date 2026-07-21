@@ -92,5 +92,20 @@ def test_accuracy_sm90_swap_ab(shape_mn, K, with_bias, out_dtype):
     _test_accuracy_once(M, N, K, with_bias, out_dtype, "cuda")
 
 
+PRODUCTION_LIKE_FP8_GEMM_CASES = [
+    (189, 4608, 8192, False, torch.bfloat16),
+    (3330, 256, 8192, False, torch.bfloat16),
+    (17, 9216, 2048, False, torch.bfloat16),
+]
+
+
+@pytest.mark.parametrize(
+    "M,N,K,with_bias,out_dtype",
+    PRODUCTION_LIKE_FP8_GEMM_CASES,
+)
+def test_accuracy_production_like_shapes(M, N, K, with_bias, out_dtype):
+    _test_accuracy_once(M, N, K, with_bias, out_dtype, "cuda")
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))

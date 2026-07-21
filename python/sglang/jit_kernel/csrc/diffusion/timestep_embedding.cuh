@@ -1,9 +1,12 @@
+#pragma once
+
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
 #include <sgl_kernel/math.cuh>
 #include <sgl_kernel/type.cuh>
 #include <sgl_kernel/utils.cuh>
+#include <sgl_kernel/vec.cuh>  // For device::AlignedVector
 
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
@@ -14,7 +17,11 @@
 #include <cuda_runtime.h>
 #include <type_traits>
 
+namespace sglang_timestep_embedding {
+
 namespace {
+
+constexpr int kVec = 4;  // 16B float vector store
 
 template <bool kFlipSinToCos, typename TIn>
 __global__ void timestep_embedding_kernel(
@@ -24,6 +31,8 @@ __global__ void timestep_embedding_kernel(
     float neg_log_max_period,
     float scale,
     int batch_size) {
+  using Vec = device::AlignedVector<float, kVec>;
+
   int row_idx = static_cast<int>(blockIdx.x * blockDim.y + threadIdx.y);
   if (row_idx >= batch_size) {
     return;
@@ -34,36 +43,29 @@ __global__ void timestep_embedding_kernel(
 
   int half_dim = dim / 2;
   int thread_offset = static_cast<int>(threadIdx.x);
-  while (thread_offset * 4 < half_dim) {
-    float4* top_half;
-    float4* bottom_half;
+  while (thread_offset * kVec < half_dim) {
+    // !flip: output is [sin | cos]; flip: output is [cos | sin].
+    float* cos_dst;
+    float* sin_dst;
     if constexpr (!kFlipSinToCos) {
-      bottom_half = reinterpret_cast<float4*>(output_batch_base_ptr + thread_offset * 4);
-      top_half = reinterpret_cast<float4*>(output_batch_base_ptr + half_dim + thread_offset * 4);
+      sin_dst = output_batch_base_ptr + thread_offset * kVec;
+      cos_dst = output_batch_base_ptr + half_dim + thread_offset * kVec;
     } else {
-      top_half = reinterpret_cast<float4*>(output_batch_base_ptr + thread_offset * 4);
-      bottom_half = reinterpret_cast<float4*>(output_batch_base_ptr + half_dim + thread_offset * 4);
+      cos_dst = output_batch_base_ptr + thread_offset * kVec;
+      sin_dst = output_batch_base_ptr + half_dim + thread_offset * kVec;
     }
 
-    float4 vals;
-    vals.x = scale * t_val * device::math::exp(neg_log_max_period * __int2float_rn(thread_offset * 4 + 0));
-    vals.y = scale * t_val * device::math::exp(neg_log_max_period * __int2float_rn(thread_offset * 4 + 1));
-    vals.z = scale * t_val * device::math::exp(neg_log_max_period * __int2float_rn(thread_offset * 4 + 2));
-    vals.w = scale * t_val * device::math::exp(neg_log_max_period * __int2float_rn(thread_offset * 4 + 3));
-
-    float4 cos_vals;
-    cos_vals.x = device::math::cos(vals.x);
-    cos_vals.y = device::math::cos(vals.y);
-    cos_vals.z = device::math::cos(vals.z);
-    cos_vals.w = device::math::cos(vals.w);
-    *top_half = cos_vals;
-
-    float4 sin_vals;
-    sin_vals.x = device::math::sin(vals.x);
-    sin_vals.y = device::math::sin(vals.y);
-    sin_vals.z = device::math::sin(vals.z);
-    sin_vals.w = device::math::sin(vals.w);
-    *bottom_half = sin_vals;
+    Vec cos_vec;
+    Vec sin_vec;
+#pragma unroll
+    for (int i = 0; i < kVec; ++i) {
+      const float angle =
+          scale * t_val * device::math::exp(neg_log_max_period * __int2float_rn(thread_offset * kVec + i));
+      cos_vec[i] = device::math::cos(angle);
+      sin_vec[i] = device::math::sin(angle);
+    }
+    cos_vec.store(cos_dst);
+    sin_vec.store(sin_dst);
 
     thread_offset += static_cast<int>(blockDim.x);
   }
@@ -118,6 +120,8 @@ inline void launch_timestep_embedding(
   }
 }
 
+}  // namespace
+
 template <typename TIn>
 void timestep_embedding(
     tvm::ffi::TensorView input,
@@ -147,4 +151,4 @@ void timestep_embedding(
   launch_timestep_embedding<TIn>(input, output, dim, flip_sin_to_cos, downscale_freq_shift, scale, max_period);
 }
 
-}  // namespace
+}  // namespace sglang_timestep_embedding

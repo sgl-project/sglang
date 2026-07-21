@@ -12,14 +12,13 @@ from sglang.jit_kernel.dsv4.compress_old import (
     compress_forward,
     compress_fused_norm_rope_inplace,
 )
-from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
-from sglang.srt.environ import envs
-from sglang.srt.layers.attention.dsa.triton_kernel import act_quant
-from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
-from sglang.srt.layers.attention.dsv4.quant_k_cache import (
+from sglang.kernels.ops.attention.dsa.triton_kernel import act_quant
+from sglang.kernels.ops.attention.dsv4.quant_k_cache import (
     quant_to_nope_fp8_rope_bf16_pack_triton,
 )
-from sglang.srt.layers.dp_attention import get_attention_cp_size
+from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
+from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_output
@@ -31,15 +30,9 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.models.deepseek_v2 import _is_hip
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix, get_bool_env_var, is_npu, set_weight_attrs
+from sglang.srt.utils import add_prefix, is_npu, set_weight_attrs
 
 _is_npu = is_npu()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
-_tgemm = None
-if _use_aiter:
-    from aiter.tuned_gemm import tgemm
-
-    _tgemm = tgemm
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -106,7 +99,7 @@ class CompressorBackendMixin:
             if not is_paged:
                 raise NotImplementedError("HIP fused compressor expects paged metadata")
 
-            from sglang.srt.layers.attention.dsv4.fused_compress_triton import (
+            from sglang.kernels.ops.attention.dsv4.fused_compress_triton import (
                 hip_compress_forward,
                 hip_compress_fused_norm_rope_hadamard_inplace,
                 hip_compress_fused_norm_rope_inplace,
@@ -287,10 +280,13 @@ def create_paged_compressor_data(
 
     def get_raw_loc(positions: torch.Tensor) -> torch.Tensor:
         positions = positions.masked_fill(positions < 0, 0)
-        loc = req_to_token[req_pool_indices, positions]
-        swa_loc = token_to_kv_pool.translate_loc_from_full_to_swa(loc)
-        swa_pages = swa_loc // swa_page_size
-        state_loc = swa_pages * ring_size + swa_loc % ring_size
+        if compress_ratio == 128:
+            state_loc = req_pool_indices * ring_size + positions % ring_size
+        else:
+            loc = req_to_token[req_pool_indices, positions]
+            swa_loc = token_to_kv_pool.translate_loc_from_full_to_swa(loc)
+            swa_pages = swa_loc // swa_page_size
+            state_loc = swa_pages * ring_size + swa_loc % ring_size
         return (state_loc // compress_ratio).to(torch.int32)
 
     is_overlap = is_overlap_compress(compress_ratio)
@@ -423,12 +419,7 @@ class Compressor(MultiPlatformOp):
         return ret
 
     def compute_kv_score(self, x: torch.Tensor, forward_batch: ForwardBatch):
-        if _tgemm is not None and not envs.SGLANG_OPT_USE_COMPRESSOR_V2.get():
-            # v1 compress goes through fused_compress_triton, which promotes
-            # bf16->fp32 internally, so skip the .float() cast.
-            kv_score = _tgemm.mm(x, self.wkv_gate.weight, otype=x.dtype)
-        else:
-            kv_score = linear_bf16_fp32(x, self.wkv_gate.weight)
+        kv_score = linear_bf16_fp32(x, self.wkv_gate.weight)
 
         # CUDA path: delegate to backend
         if dsa_use_prefill_cp(forward_batch):
@@ -481,15 +472,9 @@ class Compressor(MultiPlatformOp):
         if dsa_use_prefill_cp(forward_batch):
             x = cp_all_gather_rerange_output(
                 x,
-                get_attention_cp_size(),
+                get_parallel().attn_cp_size,
                 forward_batch,
                 torch.cuda.current_stream(),
             )
 
         return get_attn_backend().forward_compress(self, x, forward_batch)
-
-
-if _is_hip and not envs.SGLANG_OPT_USE_COMPRESSOR_V2.get():
-    from sglang.srt.layers.attention.dsv4.compress_hip import (  # noqa: F811
-        CompressorHip as Compressor,
-    )

@@ -101,7 +101,9 @@ class HiMambaRadixCache(MambaRadixCache):
         self._enable_metrics_flag = params.enable_metrics
         if server_args.hicache_io_backend == "direct":
             if server_args.hicache_mem_layout == "page_first":
-                server_args.hicache_mem_layout = "page_first_direct"
+                server_args.override(
+                    "hicache.mem_layout_force", hicache_mem_layout="page_first_direct"
+                )
                 logger.warning(
                     "Page first layout is not supported with direct IO backend, "
                     "switching to page first direct layout"
@@ -151,8 +153,6 @@ class HiMambaRadixCache(MambaRadixCache):
             prefetch_threshold=prefetch_threshold,
             load_cache_event=self.load_cache_event,
             enable_storage_metrics=self.enable_storage_metrics,
-            attn_cp_group=params.attn_cp_cache_group,
-            attn_tp_group=params.attn_tp_cache_group,
         )
         self._apply_storage_runtime_config(
             storage_backend=server_args.hicache_storage_backend,
@@ -383,9 +383,9 @@ class HiMambaRadixCache(MambaRadixCache):
         if write_back:
             # blocking till all write back complete
             while len(self.ongoing_write_through) > 0:
-                for _, finish_event, ack_list in self.cache_controller.ack_write_queue:
-                    finish_event.synchronize()
-                    for ack_id in ack_list:
+                for ack in self.cache_controller.ack_write_queue:
+                    ack.finish_event.synchronize()
+                    for ack_id in ack.node_ids:
                         backuped_node = self.ongoing_write_through.pop(ack_id)
                         self._record_store_event(
                             backuped_node, medium=StorageMedium.CPU
@@ -401,8 +401,8 @@ class HiMambaRadixCache(MambaRadixCache):
         # independently (no cross-rank sync).
         finish_count = 0
         if len(self.ongoing_write_through) > 0:
-            for _, finish_event, ack_list in self.cache_controller.ack_write_queue:
-                if not finish_event.query():
+            for ack in self.cache_controller.ack_write_queue:
+                if not ack.finish_event.query():
                     break
                 finish_count += 1
 
@@ -416,9 +416,9 @@ class HiMambaRadixCache(MambaRadixCache):
         finish_count = int(queue_size.item())
 
         while finish_count > 0:
-            _, finish_event, ack_list = self.cache_controller.ack_write_queue.pop(0)
-            finish_event.synchronize()
-            for ack_id in ack_list:
+            ack = self.cache_controller.ack_write_queue.pop(0)
+            ack.finish_event.synchronize()
+            for ack_id in ack.node_ids:
                 backuped_node = self.ongoing_write_through.pop(ack_id)
                 self._record_store_event(backuped_node, medium=StorageMedium.CPU)
                 self.dec_lock_ref(backuped_node)
@@ -430,8 +430,8 @@ class HiMambaRadixCache(MambaRadixCache):
         # Every rank must enter the all_reduce below; ongoing_load_back can
         # diverge across ranks.
         finish_count = 0
-        for _, finish_event, ack_list in self.cache_controller.ack_load_queue:
-            if not finish_event.query():
+        for ack in self.cache_controller.ack_load_queue:
+            if not ack.finish_event.query():
                 break
             finish_count += 1
 
@@ -445,11 +445,19 @@ class HiMambaRadixCache(MambaRadixCache):
         finish_count = int(queue_size.item())
 
         while finish_count > 0:
-            _, finish_event, ack_list = self.cache_controller.ack_load_queue.pop(0)
-            finish_event.synchronize()
-            for ack_id in ack_list:
+            ack = self.cache_controller.ack_load_queue.pop(0)
+            ack.finish_event.synchronize()
+            for ack_id in ack.node_ids:
                 end_node = self.ongoing_load_back.pop(ack_id)
                 self.dec_lock_ref(end_node)
+
+            if self.metrics_collector is not None:
+                self.metrics_collector.increment_load_back_num_tokens(ack.num_tokens)
+                if ack.timing_enabled:
+                    duration_ms = ack.start_event.elapsed_time(ack.finish_event)
+                    self.metrics_collector.observe_load_back_duration(
+                        duration_ms / 1000.0
+                    )
             finish_count -= 1
 
     def ready_to_load_host_cache(self) -> int:
@@ -1028,9 +1036,9 @@ class HiMambaRadixCache(MambaRadixCache):
             node_update = node_update.parent
 
         if len(value) > best_value_len:
-            from sglang.srt.server_args import get_global_server_args
+            from sglang.srt.runtime_context import get_server_args
 
-            mamba_cache_chunk_size = get_global_server_args().mamba_cache_chunk_size
+            mamba_cache_chunk_size = get_server_args().mamba_cache_chunk_size
             mamba_cache_chunk_aligned_seqlen = (
                 sum(len(v) for v in value) // mamba_cache_chunk_size
             ) * mamba_cache_chunk_size
@@ -1270,10 +1278,10 @@ class HiMambaRadixCache(MambaRadixCache):
             }
             if extra_metric_labels:
                 labels.update(extra_metric_labels)
-            from sglang.srt.server_args import get_global_server_args
+            from sglang.srt.runtime_context import get_server_args
 
             storage_cls = resolve_collector_class(
-                get_global_server_args(),
+                get_server_args(),
                 STAT_LOGGER_ROLE_STORAGE,
                 StorageMetricsCollector,
             )
@@ -1466,14 +1474,28 @@ class HiMambaRadixCache(MambaRadixCache):
     def _drain_storage_control_queues_local(self):
         self._drain_storage_control_queues_impl(
             n_revoke=None,
+            n_storage_hit=0,
             n_backup=None,
             n_release=None,
             log_metrics=False,
         )
 
+    def _revoke_pending_prefetch(self, req_id: str):
+        info = self.ongoing_prefetch.pop(req_id, None)
+        if info is None:
+            return
+        last_host_node, token_ids, _host_indices, operation = info
+        self.prefetch_abort(operation.pool_transfers)
+        self._release_host_node(last_host_node)
+        cc = self.cache_controller
+        cc.prefetch_tokens_occupied = max(
+            0, cc.prefetch_tokens_occupied - len(token_ids)
+        )
+
     def _drain_storage_control_queues_impl(
         self,
         n_revoke: Optional[int],
+        n_storage_hit: Optional[int],
         n_backup: Optional[int],
         n_release: Optional[int],
         log_metrics: bool,
@@ -1492,14 +1514,57 @@ class HiMambaRadixCache(MambaRadixCache):
 
         def _drain_revoke():
             for req_id in _drain_queue(cc.prefetch_revoke_queue, n_revoke):
-                info = self.ongoing_prefetch.pop(req_id, None)
-                if info is not None:
-                    last_host_node, token_ids, _, operation = info
-                    self.prefetch_abort(operation.pool_transfers)
-                    self._release_host_node(last_host_node)
-                    cc.prefetch_tokens_occupied -= len(token_ids)
-                    if cc.prefetch_tokens_occupied < 0:
-                        cc.prefetch_tokens_occupied = 0
+                self._revoke_pending_prefetch(req_id)
+
+        def _drain_and_alloc_storage_hit():
+            # The L3 hit count is now known, so reserve exactly that much host
+            # KV memory. NOTE: alloc/evict here is rank-local but deterministic
+            # across TP ranks without extra synchronization: host pool
+            # mutations only happen on the scheduler thread at lockstep points
+            # (releases are page-granular and drained by the TP-min count), so
+            # every rank reaches the same success / fallback / revoke decision.
+            for operation in _drain_queue(cc.prefetch_hit_queue, n_storage_hit):
+                req_id = operation.request_id
+                info = self.ongoing_prefetch.get(req_id)
+                if info is None:
+                    # request already aborted/cleaned up, skip
+                    continue
+                if operation.is_terminated():
+                    # request was aborted while the storage query was in flight
+                    self._revoke_pending_prefetch(req_id)
+                    continue
+
+                alloc_len = operation.storage_hit_count
+                host_indices = cc.mem_pool_host.alloc(alloc_len)
+                if host_indices is None:
+                    self.evict_host(alloc_len)
+                    host_indices = cc.mem_pool_host.alloc(alloc_len)
+                if host_indices is None:
+                    # Memory-pressure fallback: a shorter page-aligned prefix.
+                    available_size = cc.mem_pool_host.available_size()
+                    alloc_len = min(
+                        operation.storage_hit_count,
+                        available_size - (available_size % self.page_size),
+                    )
+                    if alloc_len >= self.prefetch_threshold:
+                        host_indices = cc.mem_pool_host.alloc(alloc_len)
+                if host_indices is None:
+                    self._revoke_pending_prefetch(req_id)
+                    continue
+
+                operation.storage_hit_count = alloc_len
+                operation.hash_value = operation.hash_value[
+                    : alloc_len // self.page_size
+                ]
+                operation.host_indices = host_indices
+                last_host_node, token_ids, _, op = info
+                self.ongoing_prefetch[req_id] = (
+                    last_host_node,
+                    token_ids,
+                    host_indices,
+                    op,
+                )
+                cc.prefetch_buffer.put(operation)
 
         def _drain_backup():
             for operation in _drain_queue(cc.ack_backup_queue, n_backup):
@@ -1522,6 +1587,7 @@ class HiMambaRadixCache(MambaRadixCache):
                 cc.mem_pool_host.free(host_indices)
 
         _drain_revoke()
+        _drain_and_alloc_storage_hit()
         _drain_backup()
         _drain_release()
 
@@ -1632,6 +1698,7 @@ class HiMambaRadixCache(MambaRadixCache):
         qsizes = torch.tensor(
             [
                 cc.prefetch_revoke_queue.qsize(),
+                cc.prefetch_hit_queue.qsize(),
                 cc.ack_backup_queue.qsize(),
                 cc.host_mem_release_queue.qsize(),
             ],
@@ -1642,9 +1709,10 @@ class HiMambaRadixCache(MambaRadixCache):
                 qsizes, op=torch.distributed.ReduceOp.MIN, group=self.tp_group
             )
 
-        n_revoke, n_backup, n_release = map(int, qsizes.tolist())
+        n_revoke, n_storage_hit, n_backup, n_release = map(int, qsizes.tolist())
         self._drain_storage_control_queues_impl(
             n_revoke=n_revoke,
+            n_storage_hit=n_storage_hit,
             n_backup=n_backup,
             n_release=n_release,
             log_metrics=True,
@@ -1700,8 +1768,6 @@ class HiMambaRadixCache(MambaRadixCache):
             return
 
         _, _, _, operation = self.ongoing_prefetch[req_id]
-        if operation.host_indices is None:
-            return
         operation.mark_terminate()
 
     def pop_prefetch_loaded_tokens(self, req_id: str) -> int:
@@ -1746,30 +1812,9 @@ class HiMambaRadixCache(MambaRadixCache):
 
         self._protect_host_node(last_host_node, protect_mamba=False)
 
-        # Allocate host KV memory
-        host_indices = self._alloc_with_evict(
-            self.cache_controller.mem_pool_host,
-            prefetch_length,
-            self.evict_host,
-        )
-        if host_indices is None:
-            # truncate the prefetch length to the page-aligned available host size
-            available_size = self.cache_controller.mem_pool_host.available_size()
-            prefetch_length = available_size - (available_size % self.page_size)
-            if prefetch_length < self.prefetch_threshold:
-                self._release_host_node(last_host_node, release_mamba=False)
-                return
-            new_input_tokens = new_input_tokens[:prefetch_length]
-            host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
-
-        if host_indices is None:
-            self._release_host_node(last_host_node, release_mamba=False)
-            return
-
         # Allocate host mamba slot
         extra_pools = self.mamba_prefetch_alloc(new_input_tokens, last_hash)
         if extra_pools is None:
-            self.cache_controller.mem_pool_host.free(host_indices)
             self._release_host_node(last_host_node, release_mamba=False)
             return
 
@@ -1780,7 +1825,6 @@ class HiMambaRadixCache(MambaRadixCache):
 
         operation = self.cache_controller.prefetch(
             req_id,
-            host_indices,
             new_input_tokens,
             last_hash,
             prefix_keys,
@@ -1789,7 +1833,7 @@ class HiMambaRadixCache(MambaRadixCache):
         self.ongoing_prefetch[req_id] = (
             last_host_node,
             new_input_tokens,
-            host_indices,
+            None,
             operation,
         )
         self.cache_controller.prefetch_tokens_occupied += len(new_input_tokens)
@@ -1802,12 +1846,17 @@ class HiMambaRadixCache(MambaRadixCache):
             req_id
         ]
 
-        if operation.host_indices is None:
-            return True
-
         if not self.can_terminate_prefetch(operation):
             return False
 
+        if operation.host_indices is None:
+            # Stopping before host memory was committed (best_effort, timeout,
+            # or still mid-query): signal the worker to stop, then release the request.
+            self.cache_controller.terminate_prefetch(operation)
+            self._revoke_pending_prefetch(req_id)
+            return True
+
+        host_indices = operation.host_indices
         completed_tokens, hash_value = self.cache_controller.terminate_prefetch(
             operation
         )
@@ -1947,6 +1996,8 @@ class HiMambaRadixCache(MambaRadixCache):
 
         last_host_node, token_ids, host_indices, operation = self.ongoing_prefetch[rid]
         if operation.host_indices is None:
+            self.cache_controller.terminate_prefetch(operation)
+            self._revoke_pending_prefetch(rid)
             return
 
         completed_tokens, _ = self.cache_controller.terminate_prefetch(operation)

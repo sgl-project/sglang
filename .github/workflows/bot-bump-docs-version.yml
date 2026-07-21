@@ -1,0 +1,88 @@
+name: Bot Bump Docs Version
+#
+# Bumps the "install from source" release-branch version pinned in the docs
+# (the `git clone -b v<version> ...sglang.git` line in
+# docs_new/docs/get-started/install.mdx "Method 2: From source" and
+# docs_new/docs/hardware-platforms/amd_gpu.mdx) whenever a release tag is
+# pushed, and opens a PR with the change.
+#
+# Triggers mirror release-docker.yml: a pushed `v*` tag (the release), or a
+# manual run with an explicit version.
+on:
+  push:
+    tags:
+      - "v[0-9]+.*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to set (without v prefix, e.g., 0.5.13)"
+        required: true
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  resolve-version:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Get version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            VERSION="${GITHUB_REF_NAME#v}"
+          fi
+          if [ -z "$VERSION" ] || ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+'; then
+            echo "::error::Invalid version: $VERSION (expected: X.Y.Z)"
+            exit 1
+          fi
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+
+  bump-docs-version:
+    needs: resolve-version
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          # Branch off main so the PR targets the docs on the default branch,
+          # not the (detached) tag commit that triggered this run.
+          ref: main
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Python dependencies
+        run: |
+          pip install tomli
+
+      - name: Configure Git and branch
+        run: |
+          git config user.name "sglang-bot"
+          git config user.email "sglang-bot@users.noreply.github.com"
+          # github.run_id is unique per run repo-wide; run_attempt disambiguates re-runs.
+          BRANCH_NAME="bot/bump-docs-version-${{ needs.resolve-version.outputs.version }}-${{ github.run_id }}-${{ github.run_attempt }}"
+          git checkout -b "$BRANCH_NAME"
+          echo "BRANCH_NAME=$BRANCH_NAME" >> $GITHUB_ENV
+
+      - name: Run docs version bump script
+        run: |
+          python scripts/release/bump_docs_install_version.py "${{ needs.resolve-version.outputs.version }}"
+
+      - name: Commit and create PR
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_PULL_REQUEST }}
+        run: |
+          if git diff --quiet; then
+            echo "Docs already pin this version; no PR needed."
+            exit 0
+          fi
+          bash scripts/release/commit_and_pr.sh "docs install" "${{ needs.resolve-version.outputs.version }}" "$BRANCH_NAME"

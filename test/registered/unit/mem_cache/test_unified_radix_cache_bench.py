@@ -19,9 +19,9 @@ from typing import Callable
 
 import torch
 
+from sglang.kernels.ops.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
@@ -191,7 +191,6 @@ def create_bench_cache(
             head_dim=_HEAD_DIM,
             swa_attention_layer_ids=_non_full_layer_ids(),
             full_attention_layer_ids=_full_attention_layer_ids(),
-            enable_kvcache_transpose=False,
             device=device,
         )
         allocator = SWATokenToKVPoolAllocator(
@@ -211,7 +210,6 @@ def create_bench_cache(
             head_num=_HEAD_NUM,
             head_dim=_HEAD_DIM,
             full_attention_layer_ids=_full_attention_layer_ids(),
-            enable_kvcache_transpose=False,
             device=device,
             enable_memory_saver=False,
             mamba_pool=req_to_token_pool.mamba_pool if has_mamba else None,
@@ -639,11 +637,12 @@ def bench_cache_finished(
         req.origin_input_ids = array("q", seq)
         req.output_ids = array("q")
         req.full_untruncated_fill_ids = array("q", seq)
-        req.fill_len = len(req.full_untruncated_fill_ids)
+        req.set_extend_range(
+            len(req.prefix_indices), len(req.full_untruncated_fill_ids)
+        )
         req.last_node = node
         req.cache_protected_len = matched_len
         req.kv_committed_len = len(seq)
-        req.kv_committed_freed = False
         if hasattr(lr, "swa_uuid_for_lock"):
             req.swa_uuid_for_lock = lr.swa_uuid_for_lock
         env.rtp.req_to_token[req.req_pool_idx, : len(kv_indices)] = kv_indices
@@ -656,7 +655,9 @@ def bench_cache_finished(
     return bench_api(
         "cache_finished",
         lambda: req_items,
-        lambda req: env.tree.cache_finished_req(req, is_insert=True),
+        lambda req: env.tree.cache_finished_req(
+            req, is_insert=True, kv_len_to_handle=req.kv_committed_len
+        ),
         len(req_items) - warmup,
         env.avg_tokens,
         warmup,
@@ -739,27 +740,6 @@ _CI_BENCH_CONFIGS = [
         page_size=1,
         num_seqs=5000,
         kv_size=500_000,
-    ),
-    dict(
-        label="FULL_SWA_ps1",
-        components=(ComponentType.FULL, ComponentType.SWA),
-        page_size=1,
-        num_seqs=1000,
-        kv_size=100_000,
-    ),
-    dict(
-        label="FULL_ps16",
-        components=(ComponentType.FULL,),
-        page_size=16,
-        num_seqs=1000,
-        kv_size=100_000,
-    ),
-    dict(
-        label="FULL_SWA_ps16",
-        components=(ComponentType.FULL, ComponentType.SWA),
-        page_size=16,
-        num_seqs=1000,
-        kv_size=100_000,
     ),
     dict(
         label="FULL_ps128",

@@ -68,16 +68,38 @@ class ParallelExecutor(PipelineExecutor):
                     torch.distributed.barrier()
 
                 elif paradigm == StageParallelismType.CFG_PARALLEL:
-                    obj_list = [batch] if rank == 0 else []
-                    # `dist.broadcast(src=...)` expects a global rank for process groups.
-                    broadcasted_list = broadcast_pyobj(
-                        obj_list,
-                        rank=get_world_rank(),
-                        dist_group=cfg_group.cpu_group,
-                        src=cfg_group.ranks[0],
+                    local_batch = batch
+                    local_batch_fields = stage.cfg_parallel_local_batch_fields(
+                        batch, server_args
                     )
+                    # filter local batch fields from batch
+                    if rank == 0 and local_batch_fields:
+                        local_field_values = {
+                            name: getattr(batch, name) for name in local_batch_fields
+                        }
+                        for name in local_batch_fields:
+                            setattr(batch, name, None)
+                    else:
+                        local_field_values = {}
+
+                    obj_list = [batch] if rank == 0 else []
+                    try:
+                        # `dist.broadcast(src=...)` expects a global rank for process groups.
+                        broadcasted_list = broadcast_pyobj(
+                            obj_list,
+                            rank=get_world_rank(),
+                            dist_group=cfg_group.cpu_group,
+                            src=cfg_group.ranks[0],
+                        )
+                    finally:
+                        if rank == 0:
+                            # resume local batch fields on rank 0
+                            for name, value in local_field_values.items():
+                                setattr(batch, name, value)
                     if rank != 0:
                         batch = broadcasted_list[0]
+                        for name in local_batch_fields:
+                            setattr(batch, name, getattr(local_batch, name))
                     batch = self._run_stage_with_executor_hooks(
                         stage,
                         stage_index,
@@ -99,25 +121,34 @@ class ParallelExecutor(PipelineExecutor):
                         use_nvtx,
                     )
                 elif paradigm == StageParallelismType.MAIN_RANK_ONLY_AND_SEND_TO_OTHERS:
+                    obj_list = []
                     if rank == 0:
                         # Only main rank executes, others just wait
-                        batch = self._run_stage_with_executor_hooks(
-                            stage,
-                            stage_index,
-                            batch,
-                            server_args,
-                            run_stage,
-                            use_nvtx,
-                        )
-                    torch.distributed.barrier()
+                        try:
+                            batch = self._run_stage_with_executor_hooks(
+                                stage,
+                                stage_index,
+                                batch,
+                                server_args,
+                                run_stage,
+                                use_nvtx,
+                            )
+                            obj_list = [True, batch]
+                        except Exception as e:
+                            obj_list = [False, e]
 
                     # Send batch to other ranks
-                    obj_list = [batch] if rank == 0 else []
                     broadcasted_list = broadcast_pyobj(
                         obj_list, rank=rank, dist_group=group.cpu_group, src=0
                     )
                     if rank != 0:
-                        batch = broadcasted_list[0]
+                        success, batch = broadcasted_list[0], broadcasted_list[1]
+                    else:
+                        success = obj_list[0]
+
+                    if not success:
+                        raise RuntimeError(f"Error on rank 0") from batch
+
                     torch.distributed.barrier()
         return batch
 

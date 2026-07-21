@@ -41,6 +41,9 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     configure_layerwise_offload_modules,
 )
+from sglang.multimodal_gen.runtime.managers.memory_managers.memory_occupation_controller import (
+    MemoryOccupationController,
+)
 from sglang.multimodal_gen.runtime.pipelines_core import (
     ComposedPipelineBase,
     LoRAPipeline,
@@ -75,6 +78,7 @@ from sglang.multimodal_gen.runtime.utils.trace_wrapper import (
     init_diffusion_tracing,
     trace_slice,
 )
+from sglang.multimodal_gen.utils import kill_itself_when_parent_died
 from sglang.srt.utils.network import NetworkAddress
 
 logger = init_logger(__name__)
@@ -128,6 +132,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         self.cfg_group = get_cfg_group()
         self.cfg_cpu_group = self.cfg_group.cpu_group
         self._realtime_sessions = RealtimeSessionCache(max_sessions=1)
+        self.memory_occupation: MemoryOccupationController | None = None
 
     def release_realtime_session(self, session_id: str) -> OutputBatch:
         """release the session of a realtime connection"""
@@ -174,6 +179,18 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             os.environ.get("TORCHINDUCTOR_CACHE_DIR"),
             os.environ.get("TRITON_CACHE_DIR"),
         )
+
+    def is_sleeping(self) -> bool:
+        return self.memory_occupation.is_sleeping() if self.memory_occupation else False
+
+    def _get_memory_occupation(self) -> MemoryOccupationController:
+        if self.memory_occupation is None:
+            self.memory_occupation = MemoryOccupationController(
+                pipeline=self.pipeline,
+                rank=self.rank,
+                use_fsdp_inference=self.server_args.use_fsdp_inference,
+            )
+        return self.memory_occupation
 
     def init_device_and_model(self) -> None:
         """Initialize the device and load the model."""
@@ -463,7 +480,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             self._materialize_raw_frame_transport(output_batch, req)
         elif req.save_output and req.return_file_paths_only:
             self._materialize_file_path_transport(output_batch, save_output_paths)
-        elif req.return_frames:
+        elif getattr(req, "return_frames", False):
             self._materialize_frame_outputs_for_return(output_batch, req)
 
     def _materialize_raw_frame_transport(
@@ -501,7 +518,11 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         self, output_batch: OutputBatch, req: Req
     ) -> None:
         """materialize the output from tensor to numpy frames for faster serialization"""
-        if self.rank != 0 or output_batch.output is None or not req.return_frames:
+        if (
+            self.rank != 0
+            or output_batch.output is None
+            or not getattr(req, "return_frames", False)
+        ):
             return
 
         if (
@@ -675,7 +696,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             mismatched = [
                 field
                 for field in shared_output_fields
-                if getattr(req, field) != getattr(first_req, field)
+                if getattr(req, field, None) != getattr(first_req, field, None)
             ]
             if mismatched:
                 raise ValueError(
@@ -922,6 +943,18 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         status = self.pipeline.get_lora_status()
         return OutputBatch(output=status)
 
+    def release_memory_occupation(self) -> dict:
+        return self._get_memory_occupation().release_memory_occupation()
+
+    def resume_memory_occupation(self) -> dict:
+        if self.memory_occupation is None:
+            return {
+                "success": True,
+                "sleeping": False,
+                "message": "already awake",
+            }
+        return self.memory_occupation.resume_memory_occupation()
+
 
 OOM_MSG = """
 OOM detected. Possible solutions:
@@ -971,6 +1004,7 @@ def run_scheduler_process(
     Rank 0 acts as the master, handling ZMQ requests and coordinating slaves.
     Ranks > 0 act as slaves, waiting for tasks from the master.
     """
+    kill_itself_when_parent_died()
     configure_logger(server_args)
     globally_suppress_loggers()
     if current_platform.is_cuda():

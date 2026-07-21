@@ -5,7 +5,8 @@ import numpy as np
 import pybase64
 import torch
 
-from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.configs.model_config import ModelConfig, get_num_indexer_layers
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.state_capturer.base import BaseTopkCapturer
 
 logger = logging.getLogger(__name__)
@@ -20,17 +21,17 @@ class IndexerTopkCapturer(BaseTopkCapturer):
         max_running_requests: int,
         device: str,
     ):
-        from sglang.srt.server_args import get_global_server_args
+        from sglang.srt.runtime_context import get_server_args
 
         self.num_indexer_layers = num_indexer_layers
         self.index_topk = index_topk
 
-        attn_tp_size = get_attention_tp_size()
+        attn_tp_size = get_parallel().attn_tp_size
         assert attn_tp_size == 1, "IndexerTopkCapturer now only supports DP attention"
 
         # DP-attention capture is per-rank-local: each rank writes [:local_batch, ...]
         # to its own device_cache, so the buffer only needs to fit one rank's batch.
-        server_args = get_global_server_args()
+        server_args = get_server_args()
         max_batch_size = max(server_args.chunked_prefill_size, max_running_requests)
 
         super().__init__(
@@ -43,16 +44,16 @@ class IndexerTopkCapturer(BaseTopkCapturer):
         )
 
 
-_global_indexer_capturer: Optional[IndexerTopkCapturer] = None
-
-
 def get_global_indexer_capturer() -> Optional[IndexerTopkCapturer]:
-    return _global_indexer_capturer
+    from sglang.srt.runtime_context import get_resources
+
+    return get_resources().indexer_capturer
 
 
 def set_global_indexer_capturer(capturer: Optional[IndexerTopkCapturer]):
-    global _global_indexer_capturer
-    _global_indexer_capturer = capturer
+    from sglang.srt.runtime_context import get_resources
+
+    get_resources().indexer_capturer = capturer
 
 
 def maybe_capture_indexer_topk(
@@ -82,6 +83,39 @@ def extract_indexer_topk_from_meta_info(data):
 
 
 def create_indexer_capturer(
+    *,
+    model_config: ModelConfig,
+    num_tokens: int,
+    max_running_requests: int,
+    device: str,
+) -> Optional[IndexerTopkCapturer]:
+    from sglang.srt.runtime_context import get_server_args
+
+    enable = get_server_args().enable_return_indexer_topk
+    # Producer wiring is CUDA-only (Indexer.forward_cuda + MLA skip_topk
+    # path); other backends would create a capturer but never feed it.
+    if enable and device != "cuda":
+        logger.warning(
+            "indexer-topk capture is CUDA-only; %s backend not yet wired. "
+            "Disabling capturer.",
+            device,
+        )
+        return None
+
+    hf_text_config = model_config.hf_text_config
+    num_indexer_layers = get_num_indexer_layers(hf_text_config)
+    index_topk = getattr(hf_text_config, "index_topk", 0)
+    return _create_indexer_capturer_raw(
+        enable=enable,
+        num_indexer_layers=num_indexer_layers,
+        index_topk=index_topk,
+        num_tokens=num_tokens,
+        max_running_requests=max_running_requests,
+        device=device,
+    )
+
+
+def _create_indexer_capturer_raw(
     enable: bool,
     num_indexer_layers: int,
     index_topk: int,

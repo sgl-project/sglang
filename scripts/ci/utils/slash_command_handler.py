@@ -4,6 +4,7 @@ import os
 import re
 import sys
 import time
+import unicodedata
 from datetime import datetime, timezone
 
 import requests
@@ -245,6 +246,18 @@ def get_env_var(name):
         print(f"Error: Environment variable {name} not set.")
         sys.exit(1)
     return val
+
+
+def _strip_format_chars(s):
+    """Remove Unicode format characters (category Cf: LRM/RLM U+200E/200F,
+    zero-width space/joiners U+200B-200D, word joiner U+2060, BOM U+FEFF).
+
+    GitHub's copy-path button and rich-text copy inject these invisibly;
+    a pasted `/rerun-test foo.py<U+200E>` then never matches any test file
+    (see PR #31059). They are display hints and never legitimate in a
+    command or path, so dropping them is always safe.
+    """
+    return "".join(c for c in s if unicodedata.category(c) != "Cf")
 
 
 def load_permissions(user_login):
@@ -725,7 +738,7 @@ _LEGACY_SUITE_TO_RUNNER_CONFIG = {
     "nightly-perf-vlm-2-gpu": "2-gpu-large",
     "nightly-4-gpu": "4-gpu-h100",
     "nightly-4-gpu-b200": "4-gpu-b200",
-    "nightly-8-gpu-common": "8-gpu-h200",
+    "nightly-8-gpu-common": ["8-gpu-h200", "8-gpu-b200"],
     "nightly-8-gpu-h200": "8-gpu-h200",
     "nightly-kernel-8-gpu-h200": "8-gpu-h200",
     "nightly-precision-8-gpu-h200": "8-gpu-h200",
@@ -830,10 +843,14 @@ def detect_suite(file_path_from_test):
     legacy_suites = _extract_legacy_suites(content)
     mappable = [s for s in legacy_suites if s in _LEGACY_SUITE_TO_RUNNER_CONFIG]
     if mappable:
-        return [
-            _resolve_runner_config(_LEGACY_SUITE_TO_RUNNER_CONFIG[s], full_path, s)
-            for s in mappable
-        ]
+        results = []
+        for s in mappable:
+            rcs = _LEGACY_SUITE_TO_RUNNER_CONFIG[s]
+            if isinstance(rcs, str):
+                rcs = [rcs]
+            for rc in rcs:
+                results.append(_resolve_runner_config(rc, full_path, s))
+        return results
 
     if re.search(r"^[^#\n]*register_cpu_ci\s*\(", content, re.MULTILINE):
         return [
@@ -1344,7 +1361,7 @@ def main():
     repo_name = get_env_var("REPO_FULL_NAME")
     pr_number = int(get_env_var("PR_NUMBER"))
     comment_id = int(get_env_var("COMMENT_ID"))
-    comment_body = get_env_var("COMMENT_BODY").strip()
+    comment_body = _strip_format_chars(get_env_var("COMMENT_BODY")).strip()
     user_login = get_env_var("USER_LOGIN")
 
     # 2. Load Permissions (local file check first to avoid unnecessary API calls)

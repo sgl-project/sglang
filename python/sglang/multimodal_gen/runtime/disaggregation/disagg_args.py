@@ -6,7 +6,7 @@ from __future__ import annotations
 import argparse
 
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
-from sglang.multimodal_gen.runtime.server_args_disagg import DisaggServerArgsMixin
+from sglang.multimodal_gen.runtime.server_args.disagg import DisaggServerArgsMixin
 
 # Keep the historical disagg_args import path working.
 DISAGG_RESULT_PORT_OFFSETS = DisaggServerArgsMixin.DISAGG_RESULT_PORT_OFFSETS

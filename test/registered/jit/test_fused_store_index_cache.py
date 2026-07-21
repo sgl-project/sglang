@@ -22,7 +22,7 @@ from typing import Optional, Tuple
 import pytest
 import torch
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 try:
     from sglang.jit_kernel.fused_store_index_cache import (
@@ -42,14 +42,14 @@ except ImportError:
     _is_hip = False
 
 try:
-    from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
+    from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 
     _is_fp8_fnuz = is_fp8_fnuz()
 except ImportError:
     _is_fp8_fnuz = False
 
-register_cuda_ci(est_time=24, suite="base-b-kernel-unit-1-gpu-large")
-register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
+register_cuda_ci(est_time=24, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_amd_ci(est_time=24, suite="nightly-amd-kernel-1-gpu", nightly=True)
 
 PAGE_SIZE = 64
 HEAD_DIM = 128
@@ -187,7 +187,7 @@ def _reference_quantize_and_store(
 
 def _import_act_quant():
     try:
-        from sglang.srt.layers.attention.dsa.triton_kernel import act_quant
+        from sglang.kernels.ops.attention.dsa.triton_kernel import act_quant
 
         return act_quant
     except Exception:

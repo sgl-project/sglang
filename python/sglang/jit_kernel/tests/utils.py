@@ -14,7 +14,7 @@ def multigpu_pytest_main(
     pre_launch_fn: Optional[Callable[[List[int]], None]] = None,
     timeout: Optional[int] = 600,
 ) -> None:
-    """cudalib-style multi-GPU pytest entry point.
+    """Torchrun-based multi-GPU pytest entry point.
 
     Drop this at the bottom of a test file::
 
@@ -43,7 +43,14 @@ def multigpu_pytest_main(
         # CI's run_unittest_files invokes `python3 <file> -f` (legacy
         # unittest failfast). Translate to pytest's `-x` so it survives.
         pytest_args = ["-x" if a == "-f" else a for a in sys.argv[1:]]
-        return pytest.main([file] + pytest_args)
+        # Dump all thread stacks (every rank; stderr is not redirected) if a
+        # single test exceeds half the harness budget, so a hung collective
+        # is attributable from the CI log before the outer timeout kills the
+        # process group. Non-fatal: the test keeps running after the dump.
+        dump_after = (timeout // 2) if timeout else 300
+        return pytest.main(
+            [file, "-o", f"faulthandler_timeout={dump_after}"] + pytest_args
+        )
 
     return multigpu_launch(
         name,

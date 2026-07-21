@@ -12,6 +12,7 @@ from sglang.multimodal_gen.configs.models.vaes.ernie_image import ErnieImageVAEC
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ImagePipelineConfig,
     ModelTaskType,
+    pad_text_embeddings_with_mask,
     shard_rotary_emb_for_sp,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -20,8 +21,19 @@ logger = init_logger(__name__)
 
 
 def ernie_image_postprocess_text(outputs, _text_inputs, hidden_layer_index=-2):
+    """Return Ernie-Image text embeddings, re-padded from real token spans.
+
+    Batched requests can have different real caption lengths after
+    tokenization; extract each request's real (unpadded) span via the
+    tokenizer's attention mask and re-pad, so TextConditioningOutput carries
+    the true per-request lengths instead of the tokenizer's padded length.
+    """
     hidden_states = outputs.hidden_states[hidden_layer_index]
-    return hidden_states
+    prompt_mask = _text_inputs.attention_mask.to(hidden_states.device).bool()
+    split_hidden_states = [
+        hidden_states[idx][prompt_mask[idx]] for idx in range(hidden_states.shape[0])
+    ]
+    return pad_text_embeddings_with_mask(split_hidden_states)
 
 
 def _patchify_latents(latents: torch.Tensor) -> torch.Tensor:
@@ -72,7 +84,12 @@ class ErnieImagePipelineConfig(ImagePipelineConfig):
     text_encoder_extra_args: list[dict] = field(
         default_factory=lambda: [
             dict(
-                padding=False,
+                # "longest" (not False): dynamic batches can merge requests with
+                # different real caption lengths into one tokenize() call, and a
+                # ragged, un-padded batch can't be stacked into a tensor. The real
+                # per-request lengths are recovered from the attention mask in
+                # ernie_image_postprocess_text.
+                padding="longest",
                 truncation=True,
                 max_length=None,
                 add_special_tokens=True,
@@ -143,8 +160,33 @@ class ErnieImagePipelineConfig(ImagePipelineConfig):
         sin = freqs.imag.to(dtype=torch.float32).contiguous()
         return torch.cat([cos, sin], dim=-1)
 
-    def _prepare_cond_kwargs(self, batch, prompt_embeds, rotary_emb, device, dtype):
+    def _prepare_encoder_hidden_states_mask(
+        self,
+        batch,
+        txt_seq_lens: list[int],
+        text_seq_len: int,
+        device,
+    ):
+        """Return a `[batch, text_seq_len]` mask over real (non-padded) text tokens.
+
+        Dynamic batches can merge requests whose captions have different real
+        lengths after tokenization; the DiT still sees one padded
+        `encoder_hidden_states` tensor of shape `[batch, text_seq_len, dim]`, so
+        we need a mask to keep attention off the padding. Returns None when every
+        request already fills the full padded length (no mask needed).
+        """
+        if all(seq_len == text_seq_len for seq_len in txt_seq_lens):
+            return None
+
+        positions = torch.arange(text_seq_len, device=device)
+        seq_lens = torch.tensor(txt_seq_lens, device=device, dtype=torch.long)
+        return positions.unsqueeze(0) < seq_lens.unsqueeze(1)
+
+    def _prepare_cond_kwargs(
+        self, batch, prompt_embeds, rotary_emb, device, dtype, *, negative: bool = False
+    ):
         batch_size = prompt_embeds[0].shape[0]
+        text_seq_len = prompt_embeds[0].shape[1]
         height = batch.height
         width = batch.width
         vae_scale_factor = self.get_vae_scale_factor()
@@ -158,13 +200,19 @@ class ErnieImagePipelineConfig(ImagePipelineConfig):
                 )
             ]
         ] * batch_size
-        txt_seq_lens = [prompt_embeds[0].shape[1]]
+        txt_seq_lens = self.require_text_seq_lens(
+            batch, 0, negative=negative, expected_batch_size=batch_size
+        )
+        encoder_hidden_states_mask = self._prepare_encoder_hidden_states_mask(
+            batch, txt_seq_lens, text_seq_len, device
+        )
 
         if rotary_emb is None:
             return {
                 "img_shapes": img_shapes,
                 "txt_seq_lens": txt_seq_lens,
                 "freqs_cis": None,
+                "encoder_hidden_states_mask": encoder_hidden_states_mask,
             }
 
         freqs_cis = self.get_freqs_cis(
@@ -180,16 +228,22 @@ class ErnieImagePipelineConfig(ImagePipelineConfig):
             "txt_seq_lens": txt_seq_lens,
             "freqs_cis": freqs_cis,
             "img_shapes": img_shapes,
+            "encoder_hidden_states_mask": encoder_hidden_states_mask,
         }
 
     def prepare_pos_cond_kwargs(self, batch, device, rotary_emb, dtype):
         return self._prepare_cond_kwargs(
-            batch, batch.prompt_embeds, rotary_emb, device, dtype
+            batch, batch.prompt_embeds, rotary_emb, device, dtype, negative=False
         )
 
     def prepare_neg_cond_kwargs(self, batch, device, rotary_emb, dtype):
         return self._prepare_cond_kwargs(
-            batch, batch.negative_prompt_embeds, rotary_emb, device, dtype
+            batch,
+            batch.negative_prompt_embeds,
+            rotary_emb,
+            device,
+            dtype,
+            negative=True,
         )
 
     def _check_vae_has_bn(self, vae):

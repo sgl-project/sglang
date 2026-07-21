@@ -42,7 +42,7 @@ def _all_cases() -> list[DiffusionTestCase]:
 def _baseline_path() -> Path:
     import sglang.multimodal_gen.test.server.testcase_configs as cfg
 
-    return Path(cfg.__file__).with_name("perf_baselines.json")
+    return cfg.get_perf_baseline_path()
 
 
 def _openai_client(port: int) -> OpenAI:
@@ -112,7 +112,6 @@ def _run_case(case: DiffusionTestCase) -> dict:
     ctx = mgr.start()
     try:
         sp = case.sampling_params
-        output_size = os.environ.get("SGLANG_TEST_OUTPUT_SIZE", sp.output_size)
         client = _openai_client(ctx.port)
         gen = get_generate_fn(
             model_path=case.server_args.model_path,

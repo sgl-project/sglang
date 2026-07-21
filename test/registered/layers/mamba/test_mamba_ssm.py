@@ -13,9 +13,9 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange, repeat
 
-from sglang.srt.layers.attention.mamba.causal_conv1d_triton import PAD_SLOT_ID
-from sglang.srt.layers.attention.mamba.ops import selective_state_update
-from sglang.srt.utils import get_device
+from sglang.kernels.ops.mamba.causal_conv1d_triton import PAD_SLOT_ID
+from sglang.kernels.ops.mamba.triton_ops.mamba_ssm import selective_state_update
+from sglang.srt.utils import get_device, is_sm100_supported
 
 
 def selective_state_update_ref(
@@ -295,6 +295,67 @@ def test_selective_state_update_with_heads_with_batch_indices(
     print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
     assert torch.allclose(state[state_indices, :], state_ref, rtol=rtol, atol=atol)
     assert torch.allclose(out, out_ref, rtol=rtol, atol=atol)
+
+
+@pytest.mark.skipif(
+    not is_sm100_supported(),
+    reason=(
+        "Triton stochastic rounding uses cvt.rs.f16x2.f32 and requires "
+        "SM100-family Blackwell with CUDA >= 12.8"
+    ),
+)
+@pytest.mark.parametrize("philox_rounds", [0, 4])
+@pytest.mark.parametrize("has_z", [False, True])
+@pytest.mark.parametrize("dstate", [16, 64])
+@pytest.mark.parametrize("dim", [2048, 4096])
+def test_selective_state_update_stochastic_rounding(dim, dstate, has_z, philox_rounds):
+    device = "cuda"
+    torch.manual_seed(0)
+
+    batch_size = 2
+    state = torch.randn(batch_size, dim, dstate, dtype=torch.float16, device=device)
+    x = torch.randn(batch_size, dim, device=device, dtype=torch.bfloat16)
+    out = torch.empty_like(x)
+    dt = torch.randn(batch_size, dim, device=device, dtype=torch.bfloat16)
+    dt_bias = torch.rand(dim, device=device) - 4.0
+    A = -torch.rand(dim, dstate, device=device) - 1.0
+    B = torch.randn(batch_size, dstate, device=device)
+    C = torch.randn(batch_size, dstate, device=device)
+    D = torch.randn(dim, device=device)
+    z = torch.randn_like(x) if has_z else None
+    state_ref = state.float()
+
+    selective_state_update(
+        state,
+        x,
+        dt,
+        A,
+        B,
+        C,
+        D=D,
+        z=z,
+        dt_bias=dt_bias,
+        dt_softplus=True,
+        out=out,
+        enable_stochastic_rounding=True,
+        cache_philox_rounds=philox_rounds,
+    )
+    out_ref = selective_state_update_ref(
+        state_ref,
+        x,
+        dt,
+        A,
+        B,
+        C,
+        D=D,
+        z=z,
+        dt_bias=dt_bias,
+        dt_softplus=True,
+    )
+
+    assert state.dtype == torch.float16
+    assert torch.allclose(state, state_ref.to(torch.float16), rtol=5e-3, atol=1e-1)
+    assert torch.allclose(out, out_ref, rtol=5e-3, atol=1e-1)
 
 
 if __name__ == "__main__":

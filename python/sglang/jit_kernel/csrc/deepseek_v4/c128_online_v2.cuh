@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <type_traits>
 
 namespace {
 
@@ -40,7 +41,7 @@ struct Compress128OnlineDecodeParams {
   uint32_t batch_size;
 };
 
-template <int64_t kHeadDim, bool kUsePDL>
+template <int64_t kHeadDim, typename BufferFloat, bool kUsePDL>
 __global__ void flash_c128_online_decode_v2(const __grid_constant__ Compress128OnlineDecodeParams params) {
   using namespace device;
   constexpr uint32_t kVecSize = 4;
@@ -59,7 +60,7 @@ __global__ void flash_c128_online_decode_v2(const __grid_constant__ Compress128O
   const auto plan = params.plan_d[batch_id];
   const auto pos_in_chunk = (plan.seq_len - 1) % 128;
 
-  const auto kv_score_buffer = static_cast<float*>(params.kv_score_buffer);
+  const auto kv_score_buffer = static_cast<BufferFloat*>(params.kv_score_buffer);
   const auto kv_score_input = static_cast<const float*>(params.kv_score_input);
   const auto kv_load_buf = kv_score_buffer + plan.read_page_0 * (kHeadDim * 3);
   const auto kv_store_buf = kv_score_buffer + plan.write_loc * (kHeadDim * 3);
@@ -75,9 +76,24 @@ __global__ void flash_c128_online_decode_v2(const __grid_constant__ Compress128O
   Vec out_sum_vec;
   if (pos_in_chunk != 0) {
     // Mid-chunk: combine prior partial state with the new token.
-    const auto max_score_vec = gmem.load(kv_load_buf, 0);
-    const auto sum_score_vec = gmem.load(kv_load_buf, 1);
-    const auto old_kv_vec = gmem.load(kv_load_buf, 2);
+    Vec max_score_vec, sum_score_vec, old_kv_vec;
+    if constexpr (std::is_same_v<BufferFloat, float>) {
+      max_score_vec = gmem.load(kv_load_buf, 0);
+      sum_score_vec = gmem.load(kv_load_buf, 1);
+      old_kv_vec = gmem.load(kv_load_buf, 2);
+    } else {
+      using BufferVec = AlignedVector<BufferFloat, kVecSize>;
+      const auto gmem_buffer = tile::Memory<BufferVec>::cta(kBlockSize);
+      const auto max_score_tmp = gmem_buffer.load(kv_load_buf, 0);
+      const auto sum_score_tmp = gmem_buffer.load(kv_load_buf, 1);
+      const auto old_kv_tmp = gmem_buffer.load(kv_load_buf, 2);
+#pragma unroll
+      for (uint32_t i = 0; i < kVecSize; ++i) {
+        max_score_vec[i] = cast<float>(max_score_tmp[i]);
+        sum_score_vec[i] = cast<float>(sum_score_tmp[i]);
+        old_kv_vec[i] = cast<float>(old_kv_tmp[i]);
+      }
+    }
 #pragma unroll
     for (uint32_t i = 0; i < kVecSize; ++i) {
       const auto old_max = max_score_vec[i];
@@ -107,9 +123,24 @@ __global__ void flash_c128_online_decode_v2(const __grid_constant__ Compress128O
     const auto kv_out = static_cast<float*>(params.kv_compressed_output) + batch_id * kHeadDim;
     gmem.store(kv_out, out_kv_vec);
   } else {
-    gmem.store(kv_store_buf, out_max_vec, 0);
-    gmem.store(kv_store_buf, out_sum_vec, 1);
-    gmem.store(kv_store_buf, out_kv_vec, 2);
+    if constexpr (std::is_same_v<BufferFloat, float>) {
+      gmem.store(kv_store_buf, out_max_vec, 0);
+      gmem.store(kv_store_buf, out_sum_vec, 1);
+      gmem.store(kv_store_buf, out_kv_vec, 2);
+    } else {
+      using BufferVec = AlignedVector<BufferFloat, kVecSize>;
+      const auto gmem_buffer = tile::Memory<BufferVec>::cta(kBlockSize);
+      BufferVec out_max_tmp, out_sum_tmp, out_kv_tmp;
+#pragma unroll
+      for (uint32_t i = 0; i < kVecSize; ++i) {
+        out_max_tmp[i] = cast<BufferFloat>(out_max_vec[i]);
+        out_sum_tmp[i] = cast<BufferFloat>(out_sum_vec[i]);
+        out_kv_tmp[i] = cast<BufferFloat>(out_kv_vec[i]);
+      }
+      gmem_buffer.store(kv_store_buf, out_max_tmp, 0);
+      gmem_buffer.store(kv_store_buf, out_sum_tmp, 1);
+      gmem_buffer.store(kv_store_buf, out_kv_tmp, 2);
+    }
   }
 }
 
@@ -150,8 +181,7 @@ struct Compress128SharedBuffer {
 /// \brief Sentinel score for padded positions in a 128-segment.
 constexpr float kPadScore = -FLT_MAX;
 
-[[maybe_unused]]
-SGL_DEVICE void c128_prefill_segment_softmax(
+[[maybe_unused]] SGL_DEVICE void c128_prefill_segment_softmax(
     const PrefillStorage (&kv)[kElementsPerWarp],
     const PrefillStorage (&score)[kElementsPerWarp],
     float* seg_kv,
@@ -239,7 +269,7 @@ SGL_DEVICE void c128_prefill_segment_softmax(
 /// `kWrite=true`  (write pass)   : handles trailing partial segments.
 ///   Reads optional prior state from `read_page_1` (-1 = fallback to
 ///   `read_page_0`), writes new running state to `read_page_0`.
-template <int64_t kHeadDim, bool kWrite, bool kUsePDL>
+template <int64_t kHeadDim, typename BufferFloat, bool kWrite, bool kUsePDL>
 __global__ __launch_bounds__(kPrefillBlockSize, 2)  //
     void flash_c128_online_prefill_v2(const __grid_constant__ Compress128OnlinePrefillParams params) {
   using namespace device;
@@ -272,7 +302,7 @@ __global__ __launch_bounds__(kPrefillBlockSize, 2)  //
   if (plan.is_invalid()) [[unlikely]]
     return;
 
-  const auto kv_score_buffer = static_cast<float*>(params.kv_score_buffer);
+  const auto kv_score_buffer = static_cast<BufferFloat*>(params.kv_score_buffer);
   const auto kv_score_input = static_cast<const float*>(params.kv_score_input);
   const auto kv_compressed_output = static_cast<float*>(params.kv_compressed_output);
   const auto score_bias_base = static_cast<const float*>(params.score_bias);
@@ -340,9 +370,23 @@ __global__ __launch_bounds__(kPrefillBlockSize, 2)  //
       // Combine with prior partial state for this slot.
       const auto buf_load = kv_score_buffer + read_page * (kHeadDim * 3) + split_offset;
       PrefillStorage buf_max_vec, buf_sum_vec, buf_kv_vec;
-      buf_max_vec.load(buf_load + 0 * kHeadDim, lane_id);
-      buf_sum_vec.load(buf_load + 1 * kHeadDim, lane_id);
-      buf_kv_vec.load(buf_load + 2 * kHeadDim, lane_id);
+      if constexpr (std::is_same_v<BufferFloat, float>) {
+        buf_max_vec.load(buf_load + 0 * kHeadDim, lane_id);
+        buf_sum_vec.load(buf_load + 1 * kHeadDim, lane_id);
+        buf_kv_vec.load(buf_load + 2 * kHeadDim, lane_id);
+      } else {
+        using BufferPrefillStorage = AlignedVector<BufferFloat, kTileElements>;
+        BufferPrefillStorage buf_max_tmp, buf_sum_tmp, buf_kv_tmp;
+        buf_max_tmp.load(buf_load + 0 * kHeadDim, lane_id);
+        buf_sum_tmp.load(buf_load + 1 * kHeadDim, lane_id);
+        buf_kv_tmp.load(buf_load + 2 * kHeadDim, lane_id);
+#pragma unroll
+        for (uint32_t ii = 0; ii < kTileElements; ++ii) {
+          buf_max_vec[ii] = cast<float>(buf_max_tmp[ii]);
+          buf_sum_vec[ii] = cast<float>(buf_sum_tmp[ii]);
+          buf_kv_vec[ii] = cast<float>(buf_kv_tmp[ii]);
+        }
+      }
 #pragma unroll
       for (uint32_t ii = 0; ii < kTileElements; ++ii) {
         const float m1 = buf_max_vec[ii];
@@ -367,9 +411,23 @@ __global__ __launch_bounds__(kPrefillBlockSize, 2)  //
       // segment's own chunk slot (the request keeps a single in-progress
       // chunk's running state at any time), so we reuse `read_page_0`.
       const auto buf_store = kv_score_buffer + plan.read_page_0 * (kHeadDim * 3) + split_offset;
-      reinterpret_cast<PrefillStorage*>(buf_store + 0 * kHeadDim)[lane_id] = out_max_vec;
-      reinterpret_cast<PrefillStorage*>(buf_store + 1 * kHeadDim)[lane_id] = out_sum_vec;
-      reinterpret_cast<PrefillStorage*>(buf_store + 2 * kHeadDim)[lane_id] = out_kv_vec;
+      if constexpr (std::is_same_v<BufferFloat, float>) {
+        reinterpret_cast<PrefillStorage*>(buf_store + 0 * kHeadDim)[lane_id] = out_max_vec;
+        reinterpret_cast<PrefillStorage*>(buf_store + 1 * kHeadDim)[lane_id] = out_sum_vec;
+        reinterpret_cast<PrefillStorage*>(buf_store + 2 * kHeadDim)[lane_id] = out_kv_vec;
+      } else {
+        using BufferPrefillStorage = AlignedVector<BufferFloat, kTileElements>;
+        BufferPrefillStorage out_max_tmp, out_sum_tmp, out_kv_tmp;
+#pragma unroll
+        for (uint32_t ii = 0; ii < kTileElements; ++ii) {
+          out_max_tmp[ii] = cast<BufferFloat>(out_max_vec[ii]);
+          out_sum_tmp[ii] = cast<BufferFloat>(out_sum_vec[ii]);
+          out_kv_tmp[ii] = cast<BufferFloat>(out_kv_vec[ii]);
+        }
+        reinterpret_cast<BufferPrefillStorage*>(buf_store + 0 * kHeadDim)[lane_id] = out_max_tmp;
+        reinterpret_cast<BufferPrefillStorage*>(buf_store + 1 * kHeadDim)[lane_id] = out_sum_tmp;
+        reinterpret_cast<BufferPrefillStorage*>(buf_store + 2 * kHeadDim)[lane_id] = out_kv_tmp;
+      }
     } else {
       // Compact output: one row per compress plan, indexed by `global_pid`.
       const auto out_ptr = kv_compressed_output + global_pid * kHeadDim + split_offset;
@@ -381,14 +439,15 @@ __global__ __launch_bounds__(kPrefillBlockSize, 2)  //
 // ---------------------------------------------------------------------------
 // Host wrapper: matches the c128_v2 / c4_v2 host API style (run_decode /
 // run_prefill methods on a kernel-class template). We only expose `kHeadDim`
-// + `kUsePDL`; the dtype is fixed to fp32 for the online state pool.
+// + state-buffer dtype + `kUsePDL`. Inputs, outputs, and APE remain fp32; only
+// the online C128 running state buffer can be fp32/bf16.
 // ---------------------------------------------------------------------------
 
-template <int64_t kHeadDim, bool kUsePDL>
+template <int64_t kHeadDim, typename BufferFloat, bool kUsePDL>
 struct FlashCompress128OnlineKernel {
-  static constexpr auto decode_kernel = flash_c128_online_decode_v2<kHeadDim, kUsePDL>;
+  static constexpr auto decode_kernel = flash_c128_online_decode_v2<kHeadDim, BufferFloat, kUsePDL>;
   template <bool kWrite>
-  static constexpr auto prefill_kernel = flash_c128_online_prefill_v2<kHeadDim, kWrite, kUsePDL>;
+  static constexpr auto prefill_kernel = flash_c128_online_prefill_v2<kHeadDim, BufferFloat, kWrite, kUsePDL>;
   static constexpr int64_t kTileDim = kTileElements * device::kWarpThreads;  // 64
   static constexpr uint32_t kNumSplit = kHeadDim / kTileDim;
   static constexpr uint32_t kDecodeBlockSize = kHeadDim / 4;
@@ -406,7 +465,7 @@ struct FlashCompress128OnlineKernel {
     device_.set_options<kDLCUDA>();
 
     TensorMatcher({-1, 1, kHeadDim * 3})  // kv score buffer (max, sum, kv)
-        .with_dtype<float>()
+        .with_dtype<BufferFloat>()
         .with_device(device_)
         .verify(kv_score_buffer);
     TensorMatcher({B, kHeadDim * 2})  // kv score input
@@ -453,7 +512,7 @@ struct FlashCompress128OnlineKernel {
     device_.set_options<kDLCUDA>();
 
     TensorMatcher({-1, 1, kHeadDim * 3})  // kv score buffer
-        .with_dtype<float>()
+        .with_dtype<BufferFloat>()
         .with_device(device_)
         .verify(kv_score_buffer);
     TensorMatcher({N, kHeadDim * 2})  // kv score input (ragged)
@@ -533,9 +592,7 @@ struct OnlineDecodePlanParams {
   const int64_t* __restrict__ seq_lens;
   const int64_t* __restrict__ req_pool_indices;
   const int32_t* __restrict__ req_to_token;
-  const int64_t* __restrict__ full_to_swa;  // (full_cache_size,) int64
   int64_t stride_r2t;
-  int32_t swa_page_size;
   int32_t state_slot_offset;
   uint32_t batch_size;
 };
@@ -545,10 +602,7 @@ __global__ void plan_c128_online_decode_kernel(const OnlineDecodePlanParams para
   if (idx >= params.batch_size) return;
   const auto seq_len = static_cast<uint32_t>(params.seq_lens[idx]);
   const auto rid = params.req_pool_indices[idx];
-  const int32_t chunk_start = static_cast<int32_t>((seq_len - 1u) / 128u * 128u);
-  const int32_t full_loc = params.req_to_token[rid * params.stride_r2t + chunk_start];
-  const int32_t swa_loc = static_cast<int32_t>(params.full_to_swa[full_loc]);
-  const int32_t slot = swa_loc / params.swa_page_size + params.state_slot_offset;
+  const int32_t slot = static_cast<int32_t>(rid) + params.state_slot_offset;
   params.plan_d[idx] = DecodePlan{
       .seq_len = seq_len,
       .write_loc = slot,
@@ -566,9 +620,7 @@ inline void plan_online_decode(
     const tvm::ffi::TensorView seq_lens,
     const tvm::ffi::TensorView req_pool_indices,
     const tvm::ffi::TensorView req_to_token,
-    const tvm::ffi::TensorView full_to_swa,
     const tvm::ffi::TensorView plan_d_dev_,
-    const int32_t swa_page_size,
     const int32_t state_slot_offset) {
   auto B = SymbolicSize{"batch_size"};
   auto device_ = SymbolicDevice{};
@@ -587,15 +639,10 @@ inline void plan_online_decode(
       .with_dtype<int32_t>()
       .with_device(device_)
       .verify(req_to_token);
-  TensorMatcher({-1})  //
-      .with_dtype<int64_t>()
-      .with_device(device_)
-      .verify(full_to_swa);
   TensorMatcher({B, sizeof(DecodePlan)})  //
       .with_dtype<uint8_t>()
       .with_device(device_)
       .verify(plan_d_dev_);
-  RuntimeCheck(swa_page_size > 0);
   RuntimeCheck(state_slot_offset >= 0);
 
   const auto batch_size = static_cast<uint32_t>(B.unwrap());
@@ -610,9 +657,7 @@ inline void plan_online_decode(
       .seq_lens = static_cast<const int64_t*>(seq_lens.data_ptr()),
       .req_pool_indices = static_cast<const int64_t*>(req_pool_indices.data_ptr()),
       .req_to_token = static_cast<const int32_t*>(req_to_token.data_ptr()),
-      .full_to_swa = static_cast<const int64_t*>(full_to_swa.data_ptr()),
       .stride_r2t = stride_r2t,
-      .swa_page_size = swa_page_size,
       .state_slot_offset = state_slot_offset,
       .batch_size = batch_size,
   };
@@ -685,9 +730,7 @@ struct OnlinePrefillStage1Params {
   CompressPlan* __restrict__ plan_w;
   const int64_t* __restrict__ req_pool_indices;  // (batch_size,)
   const int32_t* __restrict__ req_to_token;      // (num_reqs, max_tokens)
-  const int64_t* __restrict__ full_to_swa;       // (full_cache_size,)
   int64_t stride_r2t;
-  int32_t swa_page_size;
   int32_t state_slot_offset;
   uint32_t num_c;
   uint32_t num_w;
@@ -704,11 +747,7 @@ __global__ void plan_c128_online_prefill_kernel(const OnlinePrefillStage1Params 
   if (plan.is_invalid()) return;
   const auto batch_id = plan.read_page_0;
   const auto rid = params.req_pool_indices[batch_id];
-  const int32_t position = static_cast<int32_t>(plan.seq_len - 1u);
-  const int32_t chunk_start = (position / 128) * 128;
-  const int32_t full_loc = params.req_to_token[rid * params.stride_r2t + chunk_start];
-  const int32_t swa_loc = static_cast<int32_t>(params.full_to_swa[full_loc]);
-  const int32_t main_slot = swa_loc / params.swa_page_size;
+  const int32_t main_slot = static_cast<int32_t>(rid);
   plan.read_page_0 = main_slot + params.state_slot_offset;
   plan.read_page_1 = main_slot;
   *plan_ptr = plan;
@@ -721,12 +760,10 @@ inline OnlinePrefillPlan plan_online_prefill(
     const tvm::ffi::TensorView extend_lens,
     const tvm::ffi::TensorView req_pool_indices,
     const tvm::ffi::TensorView req_to_token,
-    const tvm::ffi::TensorView full_to_swa,
     const tvm::ffi::TensorView plan_c_pin,
     const tvm::ffi::TensorView plan_w_pin,
     const tvm::ffi::TensorView plan_c_dev_,
     const tvm::ffi::TensorView plan_w_dev_,
-    const int32_t swa_page_size,
     const int32_t state_slot_offset,
     const bool use_cuda_graph) {
   auto B = SymbolicSize{"batch_size"};
@@ -749,10 +786,6 @@ inline OnlinePrefillPlan plan_online_prefill(
       .with_dtype<int32_t>()
       .with_device(device_)
       .verify(req_to_token);
-  TensorMatcher({-1})  //
-      .with_dtype<int64_t>()
-      .with_device(device_)
-      .verify(full_to_swa);
   TensorMatcher({N, sizeof(CompressPlan)})  //
       .with_dtype<uint8_t>()
       .with_device(cpu)
@@ -878,9 +911,7 @@ inline OnlinePrefillPlan plan_online_prefill(
         .plan_w = plan_w_dev_ptr,
         .req_pool_indices = static_cast<const int64_t*>(req_pool_indices.data_ptr()),
         .req_to_token = static_cast<const int32_t*>(req_to_token.data_ptr()),
-        .full_to_swa = static_cast<const int64_t*>(full_to_swa.data_ptr()),
         .stride_r2t = req_to_token.stride(0),
-        .swa_page_size = swa_page_size,
         .state_slot_offset = state_slot_offset,
         .num_c = num_c_padded,
         .num_w = num_w_padded,
@@ -896,9 +927,7 @@ inline OnlinePrefillPlan plan_online_prefill(
 
 namespace {
 
-[[maybe_unused]]
-constexpr auto& plan_compress_128_online_decode = host::compress::plan_online_decode;
-[[maybe_unused]]
-constexpr auto& plan_compress_128_online_prefill = host::compress::plan_online_prefill;
+[[maybe_unused]] constexpr auto& plan_compress_128_online_decode = host::compress::plan_online_decode;
+[[maybe_unused]] constexpr auto& plan_compress_128_online_prefill = host::compress::plan_online_prefill;
 
 }  // namespace

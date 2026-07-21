@@ -1,7 +1,5 @@
 """Tests for DeepSeek-V4 fused norm + RoPE kernels."""
 
-import math
-
 import pytest
 import sgl_kernel
 import torch
@@ -93,7 +91,7 @@ def test_fused_q_norm_rope_preallocated_output():
 
 @pytest.mark.parametrize("batch_size", [1, 8])
 def test_fused_q_indexer_rope_hadamard_quant_runs(batch_size):
-    """Smoke test: kernel runs without errors and produces finite results."""
+    """Basic launch coverage with finite output checks."""
     torch.manual_seed(42)
     num_heads = 4
     head_dim = 128

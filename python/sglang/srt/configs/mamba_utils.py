@@ -124,11 +124,22 @@ class BaseLinearStateParams(ABC):
             + ssm_numel * self.dtype.temporal.itemsize
         ) * len(self.layers)
 
+    @property
+    def is_kda(self) -> bool:
+        """KDA per-K-channel gate vs GDN/Mamba2 per-head scalar gate. Selects
+        the ReplaySSM ring ``g_cache`` layout ([.., L] scalar vs [.., L, K]
+        per-K) and the gate-generic decode kernel's ``IS_KDA`` path."""
+        return False
+
 
 @dataclass(kw_only=True, frozen=True)
 class Mamba2StateShape:
     conv: list[tuple[int, int]]
     temporal: tuple[int, int, int]
+
+    # Conv tuples read (dim, K-1) — the window axis is last, which the
+    # deduplicated conv-intermediate layout requires.
+    disable_conv_window_dedup: bool = False
 
     intermediate_size: int
     conv_dim: int
@@ -137,6 +148,16 @@ class Mamba2StateShape:
     head_dim: int
     state_size: int
     conv_kernel: int
+    # Number of key/group heads after TP sharding (== runtime `H` the packed
+    # GDN kernels infer from `mixed_qkv`). Used by the GDN ReplaySSM ring
+    # buffer (k_cache) to size/stride exactly like the kernel expects.
+    num_k_heads_per_tp: int = 1
+    # Full (unsharded) conv sub-block dims, e.g. GDN's [key_dim, key_dim,
+    # value_dim] for conv_state == cat([query, key, value]). Each sub-block is
+    # head-sharded INDEPENDENTLY across attn-TP, so PD transfer across different
+    # attn_tp_size must slice per sub-block. None when the single contiguous
+    # slice already matches the layout (e.g. standard Mamba2 conv order differs).
+    conv_shard_groups: Optional[List[int]] = None
 
     @staticmethod
     def create(
@@ -148,7 +169,18 @@ class Mamba2StateShape:
         head_dim: int,
         state_size: int,
         conv_kernel: int,
+        conv_shard_groups: Optional[List[int]] = None,
     ) -> "Mamba2StateShape":
+        # The q/k projections are sharded by `num_k_heads // tp` heads (the
+        # ORIGINAL n_groups, before the conv head-shard extension below), so the
+        # runtime `H` the packed kernels see equals divide(n_groups, tp). Only
+        # meaningful (and only consumed) for the GDN ReplaySSM path, which
+        # requires evenly divisible heads; fall back to ceil-div otherwise.
+        num_k_heads_per_tp = (
+            divide(n_groups, tp_world_size)
+            if n_groups % tp_world_size == 0
+            else -(-n_groups // tp_world_size)
+        )
         # if n_groups is not divisible by world_size, need to extend the shards
         # to ensure all groups needed by a head is sharded along with it
         if n_groups % tp_world_size != 0:
@@ -174,6 +206,8 @@ class Mamba2StateShape:
             head_dim=head_dim,
             state_size=state_size,
             conv_kernel=conv_kernel,
+            num_k_heads_per_tp=num_k_heads_per_tp,
+            conv_shard_groups=conv_shard_groups,
         )
 
 
@@ -187,12 +221,20 @@ class KimiLinearStateShape:
     conv: List[tuple[int, int]]
     temporal: tuple[int, int, int]
 
+    # Conv tuples read (K-1, dim) — the overlapping dedup view would alias
+    # along the dim axis, so the dedup conv-intermediate layout must stay off.
+    disable_conv_window_dedup: bool = True
+
     num_heads: int
     head_dim: int
     num_k_heads: int
     head_k_dim: int
     conv_kernel: int
     num_spec: int
+    # Number of key heads after TP sharding (== runtime ``H`` the KDA packed
+    # kernels infer from ``mixed_qkv``). Mirrors Mamba2StateShape; consumed by
+    # the ReplaySSM ring (k_cache) to size/stride exactly like the kernel.
+    num_k_heads_per_tp: int = 1
 
     @staticmethod
     def create(
@@ -209,6 +251,11 @@ class KimiLinearStateShape:
             num_k_heads = num_heads
         if head_k_dim is None:
             head_k_dim = head_dim
+        num_k_heads_per_tp = (
+            divide(num_k_heads, tp_world_size)
+            if num_k_heads % tp_world_size == 0
+            else -(-num_k_heads // tp_world_size)
+        )
 
         proj_size = num_heads * head_dim
         proj_k_size = num_k_heads * head_k_dim
@@ -231,9 +278,14 @@ class KimiLinearStateShape:
             head_k_dim=head_k_dim,
             conv_kernel=conv_kernel_size,
             num_spec=num_spec,
+            num_k_heads_per_tp=num_k_heads_per_tp,
         )
 
 
 @dataclass(kw_only=True, frozen=True)
 class KimiLinearCacheParams(BaseLinearStateParams):
     shape: KimiLinearStateShape
+
+    @property
+    def is_kda(self) -> bool:
+        return True

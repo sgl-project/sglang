@@ -12,6 +12,13 @@ class _FakeDBCacheConfig:
         return kwargs
 
 
+class _FakeForwardPattern:
+    # A class (not a SimpleNamespace instance) so it is a valid type in
+    # annotations like List[ForwardPattern], matching the real Enum.
+    Pattern_2 = "Pattern_2"
+    Pattern_3 = "Pattern_3"
+
+
 def _install_cache_dit_stub():
     cache_dit = types.ModuleType("cache_dit")
     cache_dit.refresh_calls = []
@@ -36,7 +43,7 @@ def _install_cache_dit_stub():
     cache_dit.steps_mask = steps_mask
     cache_dit.BlockAdapter = types.SimpleNamespace
     cache_dit.DBCacheConfig = _FakeDBCacheConfig
-    cache_dit.ForwardPattern = types.SimpleNamespace(Pattern_3="Pattern_3")
+    cache_dit.ForwardPattern = _FakeForwardPattern
     cache_dit.ParamsModifier = object
     cache_dit.TaylorSeerCalibratorConfig = object
 
@@ -230,7 +237,7 @@ class TestBuildCustomBlockAdapter(unittest.TestCase):
         blocks = ["block_0", "block_1"]
         transformer = _make_transformer("ErnieImageTransformer2DModel", blocks)
 
-        adapter = module._build_custom_block_adapter(transformer)
+        adapter = module._build_custom_block_adapter(transformer, has_separate_cfg=True)
 
         self.assertIsNotNone(adapter)
         self.assertEqual(adapter.blocks, blocks)
@@ -249,6 +256,28 @@ class TestBuildCustomBlockAdapter(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             module._build_custom_block_adapter(transformer)
+
+    def test_has_separate_cfg_follows_runtime(self):
+        # No model pins the mode; has_separate_cfg always follows the run's CFG mode
+        # (Krea-2 Raw -> True, Krea-2 Turbo -> False).
+        module = _import_module_with_stub()
+        blocks = ["block_0", "block_1"]
+
+        transformer_raw = _make_transformer("Krea2Transformer2DModel")
+        transformer_raw.transformer_blocks = blocks
+        adapter_raw = module._build_custom_block_adapter(
+            transformer_raw, has_separate_cfg=True
+        )
+        self.assertEqual(adapter_raw.blocks, blocks)
+        self.assertEqual(adapter_raw.forward_pattern, "Pattern_3")
+        self.assertTrue(adapter_raw.has_separate_cfg)
+
+        transformer_turbo = _make_transformer("Krea2Transformer2DModel")
+        transformer_turbo.transformer_blocks = blocks
+        adapter_turbo = module._build_custom_block_adapter(
+            transformer_turbo, has_separate_cfg=False
+        )
+        self.assertFalse(adapter_turbo.has_separate_cfg)
 
 
 if __name__ == "__main__":

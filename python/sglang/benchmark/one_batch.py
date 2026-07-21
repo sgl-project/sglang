@@ -69,8 +69,9 @@ from sglang.srt.distributed.parallel_state import (
     destroy_distributed_environment,
     destroy_model_parallel,
 )
+from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.entrypoints.engine import _set_envs_and_config
-from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
@@ -80,6 +81,7 @@ from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.srt.model_executor.cuda_graph_config import Phase
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -300,16 +302,40 @@ def load_model(server_args, port_args, gpu_id, tp_rank):
     moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
 
     model_config = ModelConfig.from_server_args(server_args)
+    attn_tp_rank, attn_tp_size, attn_dp_rank, attn_dp_size = (
+        compute_dp_attention_world_info(
+            server_args.enable_dp_attention,
+            tp_rank,
+            server_args.tp_size,
+            server_args.dp_size,
+            server_args.attn_cp_size,
+        )
+    )
+    ps = ParallelState(
+        tp_rank=tp_rank,
+        tp_size=server_args.tp_size,
+        pp_rank=0,
+        pp_size=1,
+        dp_rank=None,
+        dp_size=server_args.dp_size,
+        attn_tp_rank=attn_tp_rank,
+        attn_tp_size=attn_tp_size,
+        attn_cp_rank=0,
+        attn_cp_size=server_args.attn_cp_size,
+        attn_dp_rank=attn_dp_rank,
+        attn_dp_size=attn_dp_size,
+        moe_ep_rank=moe_ep_rank,
+        moe_ep_size=server_args.ep_size,
+        moe_dp_rank=None,
+        moe_dp_size=server_args.moe_dp_size,
+        dcp_size=server_args.dcp_size,
+        gpu_id=gpu_id,
+    )
     runner_kwargs = dict(
         model_config=model_config,
         mem_fraction_static=server_args.mem_fraction_static,
         gpu_id=gpu_id,
-        tp_rank=tp_rank,
-        tp_size=server_args.tp_size,
-        moe_ep_rank=moe_ep_rank,
-        moe_ep_size=server_args.ep_size,
-        pp_rank=0,
-        pp_size=1,
+        ps=ps,
         nccl_port=port_args.nccl_port,
         server_args=server_args,
     )
@@ -381,9 +407,8 @@ def prepare_inputs_for_correctness_test(bench_args, tokenizer, custom_prompts):
             sampling_params=sampling_params,
         )
         req.full_untruncated_fill_ids = req.origin_input_ids
-        req.fill_len = len(req.full_untruncated_fill_ids)
         req.logprob_start_len = -1
-        req.set_extend_input_len(req.fill_len - len(req.prefix_indices))
+        req.set_extend_range(len(req.prefix_indices), len(req.origin_input_ids))
         reqs.append(req)
 
     return input_ids, reqs
@@ -395,14 +420,15 @@ def prepare_extend_inputs_for_correctness_test(
     for i in range(len(reqs)):
         req: Req = reqs[i]
         req.full_untruncated_fill_ids.extend(input_ids[i][bench_args.cut_len :])
-        req.fill_len = len(req.full_untruncated_fill_ids)
         if model_runner is not None:
             # Use req.req_pool_idx instead of i to handle slot 0 padding correctly
             req.prefix_indices = model_runner.req_to_token_pool.req_to_token[
                 req.req_pool_idx, : bench_args.cut_len
             ].to(req.prefix_indices.dtype)
             req.logprob_start_len = -1
-            req.set_extend_input_len(req.fill_len - len(req.prefix_indices))
+        req.set_extend_range(
+            len(req.prefix_indices), len(req.full_untruncated_fill_ids)
+        )
     return reqs
 
 
@@ -428,9 +454,8 @@ def prepare_synthetic_inputs_for_latency_test(
             sampling_params=sampling_params,
         )
         req.full_untruncated_fill_ids = req.origin_input_ids
-        req.fill_len = len(req.full_untruncated_fill_ids)
         req.logprob_start_len = -1
-        req.set_extend_input_len(req.fill_len - len(req.prefix_indices))
+        req.set_extend_range(len(req.prefix_indices), len(req.origin_input_ids))
         reqs.append(req)
 
     return reqs
@@ -482,7 +507,11 @@ def extend(reqs, model_runner):
         )
         batch.prefill_input_ids_cpu = None
 
-    forward_batch = ForwardBatch.init_new(batch, model_runner)
+    forward_batch = ForwardBatch.init_new(
+        batch,
+        model_runner,
+        return_hidden_states_before_norm=False,
+    )
     logits_output = model_runner.forward(forward_batch).logits_output
     next_token_ids = model_runner.sample(logits_output, forward_batch)
     return next_token_ids, logits_output.next_token_logits, batch
@@ -493,7 +522,11 @@ def decode(input_token_ids, batch, model_runner):
     batch.input_ids = input_token_ids.to(torch.int64)
     batch.prepare_for_decode()
     _maybe_prepare_mlp_sync_batch(batch, model_runner)
-    forward_batch = ForwardBatch.init_new(batch, model_runner)
+    forward_batch = ForwardBatch.init_new(
+        batch,
+        model_runner,
+        return_hidden_states_before_norm=False,
+    )
     logits_output = model_runner.forward(forward_batch).logits_output
     next_token_ids = model_runner.sample(logits_output, forward_batch)
     return next_token_ids, logits_output.next_token_logits
@@ -504,8 +537,8 @@ def _maybe_prepare_mlp_sync_batch(batch: ScheduleBatch, model_runner):
         prepare_mlp_sync_batch_raw(
             batch,
             dp_size=model_runner.server_args.dp_size,
-            attn_tp_size=get_attention_tp_size(),
-            attn_cp_size=model_runner.attn_cp_size,
+            attn_tp_size=get_parallel().attn_tp_size,
+            attn_cp_size=model_runner.ps.attn_cp_size,
             tp_group=model_runner.tp_group,
             get_idle_batch=None,
             disable_cuda_graph=model_runner.server_args.disable_cuda_graph,

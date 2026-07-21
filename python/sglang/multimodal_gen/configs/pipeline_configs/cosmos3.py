@@ -40,7 +40,11 @@ class Cosmos3Config(PipelineConfig):
     vae_tiling: bool = False
     vae_sp: bool = False
 
-    # Sourced from scheduler_config.json in the checkpoint.
+    # Cosmos3 reference inference uses FlowUniPC even when the checkpoint
+    # scheduler_config.json advertises a different scheduler class.
+    scheduler_class_override: str | None = "FlowUniPCMultistepScheduler"
+
+    # Per-request mode defaults are applied in Cosmos3TimestepPreparationStage.
     flow_shift: float | None = None
 
     precision: str = "bf16"
@@ -50,6 +54,11 @@ class Cosmos3Config(PipelineConfig):
     max_sequence_length: int = 512
     use_duration_template: bool = True
     use_system_prompt: bool = False
+
+    # Filesystem path to dataset-derived action stats (JSON) for action
+    # (de)normalization. Set at server launch rather than per request, since it
+    # names a server-side file. ``None`` disables normalization.
+    action_stats_path: str | None = None
 
     def __post_init__(self):
         self.vae_config.arch_config.z_dim = 48

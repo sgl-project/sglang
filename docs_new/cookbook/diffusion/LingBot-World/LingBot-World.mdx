@@ -5,35 +5,15 @@ metatags:
 tag: REALTIME
 ---
 
+<div className="not-prose" style={{display: "flex", flexWrap: "wrap", gap: "6px", margin: "8px 0 30px"}}>
+  <span style={{display: "inline-block", padding: "4px 9px", borderRadius: "999px", background: "#ecfeff", color: "#155e75", fontSize: "12px", fontWeight: 750}}>realtime</span>
+  <span style={{display: "inline-block", padding: "4px 9px", borderRadius: "999px", background: "#ecfeff", color: "#155e75", fontSize: "12px", fontWeight: 750}}>world model</span>
+  <span style={{display: "inline-block", padding: "4px 9px", borderRadius: "999px", background: "#ecfeff", color: "#155e75", fontSize: "12px", fontWeight: 750}}>causal DiT</span>
+</div>
+
 ## 1. Model Introduction
 
 [LingBot World](https://huggingface.co/robbyant/lingbot-world-fast-diffusers) is a realtime camera-controlled video world model. In SGLang-diffusion, it belongs to the realtime causal path: the server keeps a live session, samples control signals per chunk, reuses causal DiT state, and decodes video frames incrementally.
-
-<div style={{border: "1px solid #dbe3ef", borderRadius: "16px", overflow: "hidden", background: "linear-gradient(135deg, #ffffff 0%, #f8fafc 48%, #ecfeff 100%)", boxShadow: "0 14px 36px rgba(15, 23, 42, 0.08)", margin: "22px 0 28px 0"}}>
-  <div style={{display: "flex", alignItems: "center", justifyContent: "space-between", gap: "16px", padding: "18px 22px", borderBottom: "1px solid #e2e8f0"}}>
-    <div>
-      <div style={{fontSize: "20px", fontWeight: 750, color: "#0f172a", lineHeight: 1.2}}>LingBot World</div>
-      <div style={{fontSize: "13px", color: "#64748b", marginTop: "5px"}}>Realtime diffusion world model in SGLang-diffusion</div>
-    </div>
-    <div style={{display: "inline-flex", alignItems: "center", whiteSpace: "nowrap", border: "1px solid #bae6fd", background: "#e0f2fe", color: "#0369a1", borderRadius: "999px", padding: "8px 12px", fontSize: "13px", fontWeight: 800}}>
-      prompt + image + control &rarr; streaming video
-    </div>
-  </div>
-  <div style={{display: "grid", gridTemplateColumns: "170px 1fr"}}>
-    <div style={{padding: "12px 22px", borderBottom: "1px solid #edf2f7", color: "#64748b", fontWeight: 700, background: "rgba(248, 250, 252, 0.72)"}}>Category</div>
-    <div style={{padding: "12px 22px", borderBottom: "1px solid #edf2f7", color: "#1e293b"}}>
-      <span style={{display: "inline-block", marginRight: "6px", padding: "4px 9px", borderRadius: "999px", background: "#ecfeff", color: "#155e75", fontSize: "12px", fontWeight: 750}}>realtime</span>
-      <span style={{display: "inline-block", marginRight: "6px", padding: "4px 9px", borderRadius: "999px", background: "#ecfeff", color: "#155e75", fontSize: "12px", fontWeight: 750}}>world model</span>
-      <span style={{display: "inline-block", marginRight: "6px", padding: "4px 9px", borderRadius: "999px", background: "#ecfeff", color: "#155e75", fontSize: "12px", fontWeight: 750}}>causal DiT</span>
-    </div>
-    <div style={{padding: "12px 22px", borderBottom: "1px solid #edf2f7", color: "#64748b", fontWeight: 700, background: "rgba(248, 250, 252, 0.72)"}}>Inputs</div>
-    <div style={{padding: "12px 22px", borderBottom: "1px solid #edf2f7", color: "#1e293b"}}>Prompt, first frame, and per-chunk camera control signals</div>
-    <div style={{padding: "12px 22px", borderBottom: "1px solid #edf2f7", color: "#64748b", fontWeight: 700, background: "rgba(248, 250, 252, 0.72)"}}>Outputs</div>
-    <div style={{padding: "12px 22px", borderBottom: "1px solid #edf2f7", color: "#1e293b"}}>Streaming video frame chunks over <code>/v1/realtime_video/generate</code></div>
-    <div style={{padding: "12px 22px", color: "#64748b", fontWeight: 700, background: "rgba(248, 250, 252, 0.72)"}}>Core runtime</div>
-    <div style={{padding: "12px 22px", color: "#1e293b"}}>Condition queue, causal DiT KV cache, causal VAE decode cache, and realtime session state</div>
-  </div>
-</div>
 
 This is different from offline diffusion video models such as Wan or LTX. Offline models denoise a bounded latent sequence for one request. Realtime world models generate a continuing stream, so the runtime must manage session state, control events, causal attention cache, and VAE decode cache.
 

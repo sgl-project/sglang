@@ -65,8 +65,7 @@ from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInp
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.utils import AutoWeightsLoader, WeightsMapper
-from sglang.srt.runtime_context import get_parallel
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import get_device
 from sglang.srt.utils.common import direct_register_custom_op
 from sglang.srt.utils.hf_transformers_utils import get_hf_text_config
@@ -353,7 +352,7 @@ class TransformersFusedMoE(nn.Module):
         expert_mapping: list,
     ) -> None:
         super().__init__()
-        num_redundant = get_global_server_args().ep_num_redundant_experts
+        num_redundant = get_server_args().ep_num_redundant_experts
         experts_cls = get_moe_impl_class(quant_config)
         self.experts = experts_cls(
             num_experts=num_experts + num_redundant,
@@ -1232,7 +1231,7 @@ class MoEMixin:
         expert_mapping = self._get_expert_mapping(num_experts)
 
         # EPLB / EP tracking
-        num_redundant = get_global_server_args().ep_num_redundant_experts
+        num_redundant = get_server_args().ep_num_redundant_experts
         ep_size = get_parallel().moe_ep_size
 
         self.mlp_moe_layers: list[nn.Module] = []

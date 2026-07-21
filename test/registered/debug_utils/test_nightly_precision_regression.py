@@ -2,7 +2,7 @@
 compare day-over-day against a rolling baseline.
 
 Env knobs:
-  SGLANG_PRECISION_MODELS         comma-separated model ids (default GLM-5.1-FP8)
+  SGLANG_PRECISION_MODELS         comma-separated model ids (default GLM-5.2-FP8)
   SGLANG_PRECISION_BASELINE_DIR   local baseline dir
   SGLANG_PRECISION_DIFF_THRESHOLD per-tensor rel_diff cutoff (default 1e-3)
   SGLANG_PRECISION_FORCE_UPDATE=1 skip comparison, refresh baseline
@@ -49,7 +49,7 @@ except Exception:  # pragma: no cover
 
 register_cuda_ci(est_time=3600, suite="nightly-precision-8-gpu-h200", nightly=True)
 
-DEFAULT_MODELS_FOR_NIGHTLY_PRECISION = "zai-org/GLM-5.1-FP8"
+DEFAULT_MODELS_FOR_NIGHTLY_PRECISION = "zai-org/GLM-5.2-FP8"
 DEFAULT_DIFF_THRESHOLD = 1e-3
 # Fallback when the layer count can't be resolved: never silently shrink coverage.
 DUMPER_FILTER_ALL_LAYERS = (
@@ -61,6 +61,9 @@ SCHEMA_VERSION = 3
 EXP_NAME = "nightly_precision"
 PROMPT = "The capital of France is"
 NIGHTLY_PRECISION_SERVER_TIMEOUT = 3600
+# Pin fusion ON: captured inputs.1 must be TP-partial (the comparator's tp:partial
+# contract), and SM90 auto-enable was dropped in #23402.
+PRECISION_FUSION_BACKEND = "trtllm"
 
 
 def _sanitize_model_name(model: str) -> str:
@@ -147,6 +150,7 @@ def _capture_signature(dump_cfg: dict[str, Any], tp_size: int) -> str:
             dump_cfg["ignore_eos"],
             tp_size,
             dump_cfg["dumper_filter"],
+            dump_cfg["fusion_backend"],
         )
     )
     return hashlib.sha1(raw.encode()).hexdigest()[:12]
@@ -381,6 +385,7 @@ def _test_one_model(
         "dumper_filter": _build_dumper_filter(capture_layers),
         "num_hidden_layers": num_layers,
         "capture_layers": capture_layers,
+        "fusion_backend": PRECISION_FUSION_BACKEND,
     }
     dump_cfg["capture_signature"] = _capture_signature(dump_cfg, model_setup.tp_size)
 
@@ -530,6 +535,7 @@ def _maybe_hf_push(
             "num_hidden_layers": dump_cfg.get("num_hidden_layers"),
             "capture_layers": dump_cfg.get("capture_layers"),
             "capture_signature": dump_cfg.get("capture_signature"),
+            "fusion_backend": dump_cfg.get("fusion_backend"),
             "num_tensor_files": len(pt_files),
             "pass_label": pass_label,
             "source": "test_nightly_precision_regression.py",
@@ -585,6 +591,9 @@ def _run_server_and_dump(
         "--disable-cuda-graph",
         "--disable-piecewise-cuda-graph",
         "--disable-radix-cache",
+        # Explicit `trtllm`, not `auto` (which resolves to mnnvl on SM90).
+        "--flashinfer-allreduce-fusion-backend",
+        PRECISION_FUSION_BACKEND,
     ]
 
     proc = popen_launch_server(

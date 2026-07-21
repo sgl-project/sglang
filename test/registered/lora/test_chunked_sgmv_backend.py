@@ -5,19 +5,25 @@ from typing import List, Optional, Tuple
 
 import torch
 
-from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
-from sglang.srt.lora.backend.chunked_backend import ChunkedSgmvLoRABackend
-from sglang.srt.lora.triton_ops import (
+from sglang.kernels.ops.gemm.chunked_embedding_lora_a import (
     chunked_embedding_lora_a_forward,
+)
+from sglang.kernels.ops.gemm.chunked_sgmv_expand import (
+    _chunked_lora_expand_kernel,
     chunked_sgmv_lora_expand_forward,
+)
+from sglang.kernels.ops.gemm.chunked_sgmv_shrink import (
+    _chunked_lora_shrink_kernel,
     chunked_sgmv_lora_shrink_forward,
+)
+from sglang.kernels.ops.gemm.kv_b_lora_absorbed import (
     step_a_q_fwd,
     step_a_v_fwd,
     step_b_q_fwd,
     step_b_v_fwd,
 )
-from sglang.srt.lora.triton_ops.chunked_sgmv_expand import _chunked_lora_expand_kernel
-from sglang.srt.lora.triton_ops.chunked_sgmv_shrink import _chunked_lora_shrink_kernel
+from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
+from sglang.srt.lora.backend.chunked_backend import ChunkedSgmvLoRABackend
 from sglang.srt.lora.utils import LoRABatchInfo, get_lm_head_pruned_lens
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -1026,7 +1032,7 @@ class TestChunkedSGMV(unittest.TestCase):
         backend = ChunkedSgmvLoRABackend(
             max_loras_per_batch=5, device=self.device, server_args=mock_server_args
         )
-        backend.init_cuda_graph_batch_info(max_bs_in_cuda_graph=8, num_tokens_per_bs=1)
+        backend.init_cuda_graph_batch_info(max_bs_in_cuda_graph=8, num_tokens_per_req=1)
 
         lora_ranks = [8] * 5
         scalings = [1.0] * 5

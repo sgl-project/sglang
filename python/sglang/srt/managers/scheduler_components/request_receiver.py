@@ -61,7 +61,7 @@ class SchedulerRequestReceiver:
     model_config: ModelConfig
     max_recv_per_poll: int
     stream_output: Callable[..., None]
-    get_last_forward_mode: Callable[[], Any]
+    get_last_batch: Callable[[], Any]
     scripted_scheduler_hook: Optional[ScriptedSchedulerHook] = None
 
     def recv_limit_reached(self, num_recv_reqs: int) -> bool:
@@ -79,7 +79,7 @@ class SchedulerRequestReceiver:
             self.scripted_scheduler_hook.step()
 
         if self.recv_skipper is not None:
-            if not self.recv_skipper.handle(self.get_last_forward_mode()):
+            if not self.recv_skipper.handle(self.get_last_batch()):
                 return []
 
         recv_reqs = self._pull_raw_reqs()
@@ -88,6 +88,9 @@ class SchedulerRequestReceiver:
             recv_reqs = self.input_blocker.handle(recv_reqs)
 
         recv_reqs = self._broadcast_reqs_across_ranks(recv_reqs)
+
+        if self.ps.pp_rank == 0:
+            self.unwrap_pickle_wrapper(recv_reqs)
 
         recv_reqs = self._apply_mm_receiver(recv_reqs)
 
@@ -121,7 +124,9 @@ class SchedulerRequestReceiver:
                 recv_reqs = None
         else:
             if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
-                dp_offset = self.ps.attn_dp_rank * self.ps.attn_tp_size
+                dp_offset = (
+                    self.ps.attn_dp_rank * self.ps.attn_cp_size * self.ps.attn_tp_size
+                )
                 recv_reqs = point_to_point_pyobj(
                     [],
                     self.ps.pp_rank * self.ps.tp_size + dp_offset,
@@ -162,7 +167,10 @@ class SchedulerRequestReceiver:
             # controller, so we broadcast within attn_tp_group + attn_cp_group
             # instead of the full tp_group.  This avoids an expensive
             # all-ranks gloo sync.
-            _local_ctrl = self.server_args.enable_dp_attention_local_control_broadcast
+            _local_ctrl = (
+                self.server_args.enable_dp_attention_local_control_broadcast
+                or self.server_args.is_ep_scale_joiner
+            )
             if _local_ctrl:
                 if self.ps.attn_tp_size != 1:
                     control_reqs = broadcast_pyobj(
@@ -195,6 +203,19 @@ class SchedulerRequestReceiver:
             )
         return recv_reqs
 
+    def unwrap_pickle_wrapper(self, recv_reqs: Optional[List]) -> None:
+        if not recv_reqs:
+            return
+
+        for req in recv_reqs:
+            if isinstance(req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)):
+                req.unwrap_pickle_fields()
+            elif isinstance(
+                req, (BatchTokenizedGenerateReqInput, BatchTokenizedEmbeddingReqInput)
+            ):
+                for sub_req in req:
+                    sub_req.unwrap_pickle_fields()
+
     def _apply_mm_receiver(self, recv_reqs: List) -> List:
         # Process MM requests under EPD-disaggregation mode
         if (
@@ -219,27 +240,18 @@ class SchedulerRequestReceiver:
         # so that ShmPointerMMData metadata (not full tensor data) is what
         # gets serialized during broadcast_pyobj.
         if recv_reqs:
-            # Barrier for the non-DP-attention path only: there is a single
-            # broadcast_pyobj on tp_cpu_group where the source rank returns
-            # the original objects immediately while other ranks are still in
-            # pickle.loads (-> __setstate__ -> shm_open).  Without a barrier
-            # the source can call materialize() / shm_unlink before others
-            # open the segment.  recv_reqs is consistent across all ranks
-            # here (same broadcast), so the guard is deadlock-free.
-            #
-            # Under DP-attention no barrier is needed: the control_reqs
-            # broadcast on tp_cpu_group (step 3) is a collective that forces
-            # every rank to complete the earlier attn_tp / attn_cp work_reqs
-            # deserializations (steps 1-2, which call shm_open) before any
-            # rank returns from step 3.  POSIX guarantees shm_unlink only
-            # removes the name; already-open handles stay valid.
-            if (
-                not self.server_args.enable_dp_attention
-                and self.ps.tp_size > 1
-                and self.model_config.is_multimodal
-                and has_shm_features(recv_reqs)
-            ):
-                barrier(group=self.tp_cpu_group)
+            if self.model_config.is_multimodal and has_shm_features(recv_reqs):
+                # The broadcast source returns with its original objects while
+                # peer ranks may still be unpickling ShmPointerMMData
+                # (-> shm_open).  Synchronize the same CPU groups that carried
+                # SHM-backed work requests before materialize() unlinks them.
+                if self.server_args.enable_dp_attention:
+                    if self.ps.attn_tp_size > 1:
+                        barrier(group=self.attn_tp_cpu_group)
+                    if self.ps.attn_cp_size > 1:
+                        barrier(group=self.attn_cp_cpu_group)
+                elif self.ps.tp_size > 1:
+                    barrier(group=self.tp_cpu_group)
             for req in recv_reqs:
                 unwrap_shm_features(req)
 

@@ -390,7 +390,7 @@ class Runtime:
         for port in range(self.server_args.port, 40000):
             if is_port_available(port):
                 break
-        self.server_args.port = port
+        self.server_args.override("runtime_endpoint.port_alloc", port=port)
 
         self.url = self.server_args.url()
         self.generate_url = self.url + "/generate"
@@ -463,18 +463,21 @@ class Runtime:
         self,
         prompt: str,
         sampling_params: Optional[Dict] = None,
+        session_id: Optional[str] = None,
     ):
         if self.server_args.skip_tokenizer_init:
             json_data = {
                 "input_ids": prompt,
                 "sampling_params": sampling_params,
                 "stream": True,
+                "session_id": session_id,
             }
         else:
             json_data = {
                 "text": prompt,
                 "sampling_params": sampling_params,
                 "stream": True,
+                "session_id": session_id,
             }
         pos = 0
 
@@ -505,6 +508,7 @@ class Runtime:
         logprob_start_len: Optional[Union[List[int], int]] = None,
         top_logprobs_num: Optional[Union[List[int], int]] = None,
         lora_path: Optional[List[Optional[str]]] = None,
+        session_id: Optional[str] = None,
     ):
         json_data = {
             "text": prompt,
@@ -513,6 +517,7 @@ class Runtime:
             "logprob_start_len": logprob_start_len,
             "top_logprobs_num": top_logprobs_num,
             "lora_path": lora_path,
+            "session_id": session_id,
         }
         assert not isinstance(lora_path, list) or len(lora_path) == len(prompt)
         response = requests.post(

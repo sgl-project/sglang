@@ -15,7 +15,7 @@ from torch.cuda.memory import (
 
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.environ import envs
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils.common import torch_release
 
 after_2_8_0 = torch_release >= (2, 8)
@@ -159,7 +159,7 @@ _register_func = None
 
 def is_symmetric_memory_enabled():
     try:
-        return get_global_server_args().enable_symm_mem
+        return get_server_args().enable_symm_mem
     except ValueError:
         return False
 
@@ -334,6 +334,7 @@ def use_symmetric_memory(group_coordinator: GroupCoordinator, disabled: bool = F
 # --- Debug mode for symmetric memory validation ---
 
 _symm_mem_logger = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
 _debug_seen_traces: set = set()
 
 
@@ -403,4 +404,34 @@ def debug_check_symmetric_mempool(
                 len(bad_names),
                 "\n".join(bad_details),
                 stack,
+            )
+
+
+def prealloc_symmetric_memory_pool(
+    *,
+    is_draft_worker: bool,
+    enable_symm_mem: bool,
+    device: str,
+    forward_stream: torch.cuda.Stream,
+):
+    # PyTorch mempools never de-fragment memory in OOM scenarios, so we need to pre-allocate a large chunk of memory to limit fragmentation.
+    if (
+        is_draft_worker
+        or not enable_symm_mem
+        or envs.SGLANG_SYMM_MEM_PREALLOC_GB_SIZE.get() <= 0
+    ):
+        return
+
+    from sglang.srt.distributed import get_tp_group
+
+    # Memory allocation is tied to a cuda stream, use the forward stream
+    with torch.get_device_module(device).stream(forward_stream):
+        logger.info(
+            f"Pre-allocating symmetric memory pool with {envs.SGLANG_SYMM_MEM_PREALLOC_GB_SIZE.get()} GiB"
+        )
+        with use_symmetric_memory(get_tp_group()):
+            torch.empty(
+                (envs.SGLANG_SYMM_MEM_PREALLOC_GB_SIZE.get() * 1024 * 1024 * 1024,),
+                dtype=torch.uint8,
+                device=device,
             )

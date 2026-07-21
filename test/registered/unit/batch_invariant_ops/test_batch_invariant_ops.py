@@ -158,21 +158,6 @@ class TestBatchInvariantOps(CustomTestCase):
                             )
                             self._assert_batch_invariant_results(difflist, dtype, name)
 
-    def test_without_batch_invariant_mode(self):
-        """
-        Test that without batch-invariant mode, results may differ.
-        This test demonstrates the difference batch-invariant mode makes.
-        """
-        M, K, N = 32, 128, 1024
-        dtype = torch.float32
-
-        # Run without batch-invariant mode
-        with set_batch_invariant_mode(False):
-            difflist = self._run_multiple_iterations(
-                iters=5, M=M, K=K, N=N, dtype=dtype
-            )
-            print(f"Without batch-invariant mode, we get diffs: {difflist}")
-
     def _test_bmm_batch_invariance(self, B, M, K, N, dtype):
         """
         Test that BMM operations produce identical results for:

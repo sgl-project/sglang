@@ -493,7 +493,6 @@ export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=3584
 export ASCEND_MF_STORE_URL="tcp://127.0.0.1:24669"
 export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=3600
 export SGLANG_DISAGGREGATION_WAITING_TIMEOUT=3600
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=0
 export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 export SGLANG_DEEPEP_BF16_DISPATCH=0
@@ -553,13 +552,10 @@ export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=3584
 export ASCEND_MF_STORE_URL="tcp://127.0.0.1:24669"
 export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=3600
 export SGLANG_DISAGGREGATION_WAITING_TIMEOUT=3600
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=0
 export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 export SGLANG_DEEPEP_BF16_DISPATCH=0
 export ASCEND_USE_FIA=1
-
-export SGLANG_NPU_FUSED_MOE_MODE=2
 
 python3 -m sglang.launch_server \
         --model-path  /path/to/MiMo-V2-Flash-w8a8-all-0512 \
@@ -574,7 +570,6 @@ python3 -m sglang.launch_server \
         --base-gpu-id 8 \
         --disable-radix-cache \
         --cuda-graph-bs 1 2 4 8 10 12 14 16 \
-        --quantization modelslim \
         --speculative-draft-model-quantization unquant \
         --speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
         --enable-multi-layer-eagle \
@@ -678,7 +673,6 @@ do
     then
         echo "${D_IP[$i]}"
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-        export SGLANG_ENABLE_SPEC_V2=1
         export HCCL_BUFFSIZE=900
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=112
         export TASK_QUEUE_ENABLE=1

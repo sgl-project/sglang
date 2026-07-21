@@ -15,9 +15,10 @@ logger = logging.getLogger(__name__)
 
 
 def get_open_port() -> int:
-    port = os.getenv("SGLANG_PORT")
+    from sglang.srt.environ import envs
+
+    port = envs.SGLANG_PORT.get()
     if port is not None:
-        port = int(port)
         while True:
             if is_port_available(port):
                 return port
@@ -53,8 +54,17 @@ MAX_VALID_PORT = 65535
 
 
 def wait_port_available(
-    port: int, port_name: str, timeout_s: int = 30, raise_exception: bool = True
+    port: int,
+    port_name: str,
+    timeout_s: Optional[int] = None,
+    raise_exception: bool = True,
 ) -> bool:
+    if timeout_s is None:
+        # A killed server can hold its ports well past kill_process_tree()'s
+        # return while GPU teardown completes (>30s observed on GB300), so CI
+        # raises this via SGLANG_WAIT_PORT_TIMEOUT before relaunching a server
+        # on the same port plan.
+        timeout_s = int(os.environ.get("SGLANG_WAIT_PORT_TIMEOUT", "30"))
     if port < 0 or port > MAX_VALID_PORT:
         raise ValueError(
             f"{port_name} has invalid port number {port}. "
@@ -221,9 +231,15 @@ def get_zmq_socket_on_host(
 
 
 def config_socket(socket, socket_type: zmq.SocketType):
-    mem = psutil.virtual_memory()
-    total_mem = mem.total / 1024**3
-    available_mem = mem.available / 1024**3
+    try:
+        mem = psutil.virtual_memory()
+        total_mem = mem.total / 1024**3
+        available_mem = mem.available / 1024**3
+    except Exception as e:
+        logger.warning(
+            "psutil.virtual_memory() failed (%s); using default ZMQ buffer size", e
+        )
+        total_mem = available_mem = 0
     if total_mem > 32 and available_mem > 16:
         buf_size = int(0.5 * 1024**3)
     else:

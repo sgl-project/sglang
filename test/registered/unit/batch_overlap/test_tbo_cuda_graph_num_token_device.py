@@ -4,7 +4,7 @@
 ``ForwardBatch.num_token_non_padded`` is a scalar tensor on the model device
 (see ``ForwardBatch.compute``, which does ``.to(device, ...)``). The eager TBO
 split path already honors this -- ``compute_tbo_children_num_token_non_padded_raw``
-moves the tensor to ``get_global_server_args().device`` -- but
+moves the tensor to ``get_server_args().device`` -- but
 ``TboCudaGraphRunnerPlugin`` preallocated its persistent buffer with a bare
 ``torch.zeros((2,), dtype=torch.int32)``, leaving it on CPU.
 
@@ -39,7 +39,7 @@ class TestTboCudaGraphNumTokenDevice(CustomTestCase):
         # Use 'meta' so the configured device differs from the implicit CPU
         # default; a bare torch.zeros() would leave the buffer on CPU and fail.
         fake_args = SimpleNamespace(device="meta")
-        with patch.object(tbo, "get_global_server_args", lambda: fake_args):
+        with patch.object(tbo, "get_server_args", lambda: fake_args):
             plugin = TboCudaGraphRunnerPlugin()
 
         buf = plugin._tbo_children_num_token_non_padded
@@ -51,7 +51,7 @@ class TestTboCudaGraphNumTokenDevice(CustomTestCase):
         # Both the preallocated cuda-graph buffer and the eager split tensor must
         # land on the same (model) device, matching ForwardBatch's contract.
         fake_args = SimpleNamespace(device="meta")
-        with patch.object(tbo, "get_global_server_args", lambda: fake_args):
+        with patch.object(tbo, "get_server_args", lambda: fake_args):
             eager = (
                 TboForwardBatchPreparer.compute_tbo_children_num_token_non_padded_raw(
                     tbo_split_token_index=3, num_token_non_padded=8
@@ -68,7 +68,7 @@ class TestTboCudaGraphNumTokenDevice(CustomTestCase):
         # value_a = min(split, n); value_b = max(0, n - split). Computed on CPU
         # so the values are materializable.
         fake_args = SimpleNamespace(device="cpu")
-        with patch.object(tbo, "get_global_server_args", lambda: fake_args):
+        with patch.object(tbo, "get_server_args", lambda: fake_args):
             eager = (
                 TboForwardBatchPreparer.compute_tbo_children_num_token_non_padded_raw(
                     tbo_split_token_index=3, num_token_non_padded=8

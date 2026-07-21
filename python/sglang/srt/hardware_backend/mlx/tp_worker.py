@@ -26,7 +26,11 @@ from sglang.srt.hardware_backend.mlx.model_runner import (
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.utils import GenerationBatchResult
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    PPProxyTensors,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -63,14 +67,8 @@ class MlxTpModelWorker(TpModelWorker):
             model_config=self.model_config,
             mem_fraction_static=self.server_args.mem_fraction_static,
             gpu_id=self.gpu_id,
-            tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
-            moe_ep_rank=self.moe_ep_rank,
-            moe_ep_size=self.ep_size,
-            pp_rank=self.pp_rank,
-            pp_size=self.pp_size,
+            ps=self.ps,
             nccl_port=self.nccl_port,
-            dp_rank=self.dp_rank,
             server_args=self.server_args,
             is_draft_worker=self.is_draft_worker,
             req_to_token_pool=self.req_to_token_pool,
@@ -99,6 +97,8 @@ class MlxTpModelWorker(TpModelWorker):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
         is_verify: bool = False,
         skip_attn_backend_init: Optional[bool] = None,  # deprecated
+        *,
+        capture_hidden_mode: Optional[CaptureHiddenMode] = None,
     ) -> GenerationBatchResult:
         """Override to route through MLX model runner."""
         if batch is not None:
@@ -112,6 +112,7 @@ class MlxTpModelWorker(TpModelWorker):
             pp_proxy_tensors,
             is_verify,
             skip_attn_backend_init,
+            capture_hidden_mode=capture_hidden_mode,
         )
 
     def _cleanup_stale_rids(self, forward_mode, current_rids: set[str]) -> None:
@@ -131,6 +132,29 @@ class MlxTpModelWorker(TpModelWorker):
             # Prefer the just-snapshotted live auxiliary state for the final
             # insert. Any older tracked slot is released during component cleanup.
             req.mamba_last_track_seqlen = None
+
+    def _route_extend_request(self, rid: str, decoding_rids: set[str]) -> str:
+        """Classify a request within an extend / mixed batch.
+
+        Shared by the sync (:meth:`_forward_batch_generation_mlx`) and async
+        (:meth:`_async_extend_batch`) paths so both route identically.
+
+        Returns one of:
+
+        * ``"prefill"``      -- not seen before; start a fresh prefill.
+        * ``"decode"``       -- a genuine single-token decode step mixed into
+          this batch (present in ``batch.decoding_reqs``).
+        * ``"continuation"`` -- a chunked-prefill continuation.  Routing keys on
+          request state, **not** ``seq_len``: a final continuation chunk can be
+          exactly one token, which must still extend.  Routing it as a decode
+          would drop the real token and feed the model its own previous-chunk
+          prediction, silently corrupting the output.
+        """
+        if not self._mlx_runner.has_request(rid):
+            return "prefill"
+        if rid in decoding_rids:
+            return "decode"
+        return "continuation"
 
     def _forward_batch_generation_mlx(
         self, batch: ScheduleBatch
@@ -164,6 +188,9 @@ class MlxTpModelWorker(TpModelWorker):
             prefill_rids: list[tuple[str, int]] = []
             extend_rids: list[tuple[str, int]] = []
             decode_rids: list[str] = []
+            # Genuine decode steps mixed into this extend batch; see
+            # _route_extend_request.
+            decoding_rids = {r.rid for r in (batch.decoding_reqs or [])}
 
             for i, req in enumerate(reqs):
                 seq_len = extend_seq_lens[i]
@@ -172,18 +199,15 @@ class MlxTpModelWorker(TpModelWorker):
                 offset += seq_len
                 slot_offset += seq_len
 
-                if self._mlx_runner.has_request(req.rid):
-                    if seq_len > 1:
-                        # Chunked prefill continuation
-                        next_token = self._mlx_runner.extend(
-                            req.rid, req_token_ids, req_new_slots
-                        )
-                        extend_rids.append((req.rid, next_token))
-                    else:
-                        # MIXED mode: single-token decode
-                        decode_rids.append(req.rid)
-                else:
-                    # New prefill
+                route = self._route_extend_request(req.rid, decoding_rids)
+                if route == "continuation":
+                    next_token = self._mlx_runner.extend(
+                        req.rid, req_token_ids, req_new_slots
+                    )
+                    extend_rids.append((req.rid, next_token))
+                elif route == "decode":
+                    decode_rids.append(req.rid)
+                else:  # "prefill"
                     prefix_slot_ids = req.prefix_indices.tolist()
                     full_token_ids = list(req.get_fill_ids())
                     next_token = self._mlx_runner.prefill(
@@ -306,6 +330,9 @@ class MlxTpModelWorker(TpModelWorker):
         pending_prefills: list[MlxPendingPrefill] = []
         pending_extends: list[MlxPendingExtend] = []
         mixed_decode_rids: list[str] = []
+        # Genuine decode steps mixed into this extend batch; see
+        # _route_extend_request.
+        decoding_rids = {r.rid for r in (batch.decoding_reqs or [])}
 
         for i, req in enumerate(reqs):
             seq_len = extend_seq_lens[i]
@@ -314,21 +341,18 @@ class MlxTpModelWorker(TpModelWorker):
             offset += seq_len
             slot_offset += seq_len
 
-            if self._mlx_runner.has_request(req.rid):
-                if seq_len > 1:
-                    # Chunked prefill continuation
-                    pending_extends.append(
-                        self._mlx_runner.extend_start(
-                            req_id=req.rid,
-                            new_token_ids=req_token_ids,
-                            new_slot_ids=req_new_slots,
-                        )
+            route = self._route_extend_request(req.rid, decoding_rids)
+            if route == "continuation":
+                pending_extends.append(
+                    self._mlx_runner.extend_start(
+                        req_id=req.rid,
+                        new_token_ids=req_token_ids,
+                        new_slot_ids=req_new_slots,
                     )
-                else:
-                    # MIXED mode: single-token decode
-                    mixed_decode_rids.append(req.rid)
-            else:
-                # New prefill
+                )
+            elif route == "decode":
+                mixed_decode_rids.append(req.rid)
+            else:  # "prefill"
                 prefix_slot_ids = req.prefix_indices.tolist()
                 full_token_ids = list(req.get_fill_ids())
                 pending_prefills.append(

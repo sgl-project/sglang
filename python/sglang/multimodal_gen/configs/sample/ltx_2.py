@@ -69,6 +69,9 @@ class LTX23SamplingParams(LTX2SamplingParams):
 
     def build_request_extra(self) -> dict[str, Any]:
         extra = super().build_request_extra()
+        # RL rollout uses the official CFG path (guidance_scale=1, no guider).
+        if self.rollout:
+            return extra
         extra["ltx2_stage1_guider_params"] = {
             "video_cfg_scale": self.video_cfg_scale,
             "video_stg_scale": self.video_stg_scale,

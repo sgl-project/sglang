@@ -58,7 +58,7 @@ class TestBackup(CustomTestCase):
                     "50",
                     "--chunked-prefill-size",
                     "512",
-                    "--cuda-graph-max-bs",
+                    "--cuda-graph-max-bs-decode",
                     "128",
                     "--max-running-requests",
                     "512",

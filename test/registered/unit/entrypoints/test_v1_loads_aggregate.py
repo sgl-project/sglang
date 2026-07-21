@@ -15,7 +15,9 @@ from sglang.srt.managers.load_snapshot import (
     SLOT_LEN_STRUCT,
     SLOT_SIZE,
     VERSION,
+    DisaggregationMetrics,
     LoadSnapshot,
+    QueueMetrics,
     ShmLoadSnapshotReader,
     ShmLoadSnapshotWriter,
     slot_offset,
@@ -40,6 +42,7 @@ def _temp_path() -> str:
 class _FakeTokenizerManager(TokenizerControlMixin):
     def __init__(self, reader, dp_size: int):
         self.load_snapshot_reader = reader
+        self.elastic_worker_count = dp_size
         self.server_args = SimpleNamespace(
             dp_size=dp_size,
             enable_dp_attention=False,
@@ -150,14 +153,10 @@ class TestGetLoads(CustomTestCase):
                     cache_hit_rate=0.75,
                     utilization=0.5,
                     max_running_requests=128,
-                    has_disaggregation=1,
-                    disagg_mode=2,
-                    decode_transfer_queue_reqs=4,
-                    has_queues=1,
-                    queue_waiting=2,
-                    queue_grammar=1,
-                    queue_paused=0,
-                    queue_retracted=3,
+                    disaggregation=DisaggregationMetrics(
+                        mode="decode", decode_transfer_queue_reqs=4
+                    ),
+                    queues=QueueMetrics(waiting=2, grammar=1, paused=0, retracted=3),
                 )
             )
 

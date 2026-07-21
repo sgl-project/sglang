@@ -2,10 +2,11 @@
 """Unit tests for Cosmos3 config, weight mapping, and sampling params."""
 
 import importlib.util
+import types
 import unittest
 from unittest import mock
 
-from fastapi import HTTPException
+import torch
 
 from sglang.multimodal_gen.configs.models.dits.cosmos3video import (
     _build_cosmos3_param_names_mapping,
@@ -22,9 +23,29 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     VideoGenerationsRequest,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.video_api import (
-    _reject_unsupported_cosmos3_modes,
+    _cosmos3_sampling_param_kwargs,
+    _resolve_sound_duration,
+    _resolve_video_path,
+)
+from sglang.multimodal_gen.runtime.loader.component_loaders import scheduler_loader
+from sglang.multimodal_gen.runtime.loader.component_loaders.scheduler_loader import (
+    SchedulerLoader,
 )
 from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
+from sglang.multimodal_gen.runtime.models.dits.cosmos3video import (
+    DomainAwareLinear,
+    compute_mrope_position_ids_action,
+    compute_mrope_position_ids_sound,
+    compute_mrope_position_ids_vision,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3 import (
+    Cosmos3ImagePreprocessStage,
+    Cosmos3LatentPreparationStage,
+    Cosmos3TimestepPreparationStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_action import (
+    EMBODIMENT_TO_DOMAIN_ID,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_guardrails import (
     is_cosmos_guardrail_available,
 )
@@ -54,15 +75,15 @@ class TestCosmos3ParamNamesMapping(unittest.TestCase):
         key, idx, total = _apply(self.fn, "norm.weight")
         self.assertEqual(key, "")
 
-    def test_audio_proj_in_dropped(self):
-        key, *_ = _apply(self.fn, "audio_proj_in.weight")
-        self.assertEqual(key, "")
-
-    def test_action_proj_in_dropped(self):
-        key, *_ = _apply(self.fn, "action_proj_in.weight")
-        self.assertEqual(key, "")
-
     # --- top-level pass-through ---
+
+    def test_audio_proj_in_passthrough(self):
+        key, *_ = _apply(self.fn, "audio_proj_in.weight")
+        self.assertEqual(key, "audio_proj_in.weight")
+
+    def test_action_proj_in_passthrough(self):
+        key, *_ = _apply(self.fn, "action_proj_in.fc.weight")
+        self.assertEqual(key, "action_proj_in.fc.weight")
 
     def test_embed_tokens(self):
         key, *_ = _apply(self.fn, "embed_tokens.weight")
@@ -204,6 +225,87 @@ class TestCosmos3AdjustNumFrames(unittest.TestCase):
         self.assertEqual(self.cfg.adjust_num_frames(2), 1)
 
 
+class TestCosmos3SchedulerConfig(unittest.TestCase):
+    """Verify Cosmos3 scheduler class and flow-shift defaults."""
+
+    def test_config_overrides_checkpoint_scheduler_class(self):
+        cfg = Cosmos3Config()
+        self.assertEqual(cfg.scheduler_class_override, "FlowUniPCMultistepScheduler")
+        self.assertIsNone(cfg.flow_shift)
+
+    def test_scheduler_loader_uses_configured_class_override(self):
+        class FakeScheduler:
+            def __init__(self, **config):
+                self.config = config
+
+        server_args = types.SimpleNamespace(
+            pipeline_config=types.SimpleNamespace(
+                scheduler_class_override="FlowUniPCMultistepScheduler",
+                flow_shift=None,
+            )
+        )
+        with (
+            mock.patch.object(
+                scheduler_loader,
+                "get_diffusers_component_config",
+                return_value={"_class_name": "CheckpointScheduler", "foo": "bar"},
+            ),
+            mock.patch.object(
+                scheduler_loader.ModelRegistry,
+                "resolve_model_cls",
+                return_value=(FakeScheduler, None),
+            ) as resolve,
+        ):
+            scheduler = SchedulerLoader().load_customized("unused", server_args)
+
+        resolve.assert_called_once_with("FlowUniPCMultistepScheduler")
+        self.assertEqual(scheduler.config["foo"], "bar")
+
+    @staticmethod
+    def _stage():
+        stage = Cosmos3TimestepPreparationStage.__new__(Cosmos3TimestepPreparationStage)
+        stage.scheduler = types.SimpleNamespace(
+            config=types.SimpleNamespace(flow_shift=1.0)
+        )
+        return stage
+
+    @staticmethod
+    def _batch(**kwargs):
+        sp_kwargs = kwargs.pop("sp_kwargs", {})
+        return types.SimpleNamespace(
+            sampling_params=Cosmos3SamplingParams(prompt="t", **sp_kwargs),
+            data_type=kwargs.pop("data_type", DataType.VIDEO),
+            preprocessed_image=kwargs.pop("preprocessed_image", None),
+            preprocessed_video=kwargs.pop("preprocessed_video", None),
+        )
+
+    def test_per_mode_flow_shift_defaults(self):
+        stage = self._stage()
+        self.assertEqual(
+            stage._default_flow_shift_for_mode(self._batch(data_type=DataType.IMAGE)),
+            3.0,
+        )
+        self.assertEqual(
+            stage._default_flow_shift_for_mode(
+                self._batch(preprocessed_image=torch.empty(1))
+            ),
+            10.0,
+        )
+        self.assertEqual(
+            stage._default_flow_shift_for_mode(
+                self._batch(preprocessed_video=torch.empty(1))
+            ),
+            10.0,
+        )
+        self.assertEqual(stage._default_flow_shift_for_mode(self._batch()), 10.0)
+        self.assertEqual(
+            stage._default_flow_shift_for_mode(
+                self._batch(sp_kwargs={"action_mode": "policy"})
+            ),
+            10.0,
+        )
+
+
 class TestCosmos3SamplingParamsDataType(unittest.TestCase):
     """Verify num_frames==1 flips data_type to IMAGE before file name derivation."""
 
@@ -246,9 +348,9 @@ class TestCosmos3ModelResolution(unittest.TestCase):
 
 
 class TestCosmos3OpenAIProtocol(unittest.TestCase):
-    """Verify Cosmos3-only knobs stay out of the stable request schema."""
+    """Verify Cosmos3 modality knobs are exposed by the video HTTP schema."""
 
-    def test_cosmos3_private_fields_are_extra_fields(self):
+    def test_cosmos3_template_fields_remain_extra_fields(self):
         for request_cls in (ImageGenerationsRequest, VideoGenerationsRequest):
             with self.subTest(request_cls=request_cls.__name__):
                 self.assertIn("max_sequence_length", request_cls.model_fields)
@@ -258,22 +360,66 @@ class TestCosmos3OpenAIProtocol(unittest.TestCase):
                 self.assertNotIn("use_system_prompt", request_cls.model_fields)
                 self.assertNotIn("use_guardrails", request_cls.model_fields)
 
-        self.assertNotIn("generate_sound", VideoGenerationsRequest.model_fields)
-        self.assertNotIn("sound_duration", VideoGenerationsRequest.model_fields)
+    def test_cosmos3_modal_fields_pass_through_as_extras(self):
+        for field_name in ("video_path", "video_url"):
+            with self.subTest(field_name=field_name):
+                self.assertIn(field_name, VideoGenerationsRequest.model_fields)
 
-    def test_unsupported_cosmos3_modes_allow_falsy_extra_fields(self):
+        modal_values = {
+            "generate_sound": True,
+            "sound_duration": 3.0,
+            "condition_frame_indexes": [0, 2],
+            "condition_frame_indexes_vision": [0, 2],
+            "condition_video_keep": "last",
+            "action_mode": "policy",
+            "domain_id": 1,
+            "domain_name": "umi",
+            "raw_action_dim": 9,
+            "action_fps": 30.0,
+            "action": [0.0, 1.0],
+            "action_view_point": "ego_view",
+            "action_normalization": "mean_std",
+        }
+        req = VideoGenerationsRequest(prompt="test", **modal_values)
+        for field_name, value in modal_values.items():
+            with self.subTest(field_name=field_name):
+                self.assertNotIn(field_name, VideoGenerationsRequest.model_fields)
+                self.assertEqual(getattr(req, field_name), value)
+
+    def test_cosmos3_http_aliases_map_to_sampling_params(self):
         req = VideoGenerationsRequest(
             prompt="test",
-            generate_sound=False,
-            action_mode="",
-            condition_frame_indexes_vision=[],
-            condition_video_keep={},
+            video_url="https://example.com/input.mp4",
+            generate_sound=True,
+            condition_frame_indexes_vision=[0, 2],
+            condition_video_keep="last",
+            action_mode="policy",
+            domain_name="umi",
+            raw_action_dim=9,
+            action_fps=30.0,
+            action_view_point="ego_view",
         )
-        _reject_unsupported_cosmos3_modes(req, "nvidia/Cosmos3-Nano")
 
-        req = VideoGenerationsRequest(prompt="test", generate_sound=True)
-        with self.assertRaises(HTTPException):
-            _reject_unsupported_cosmos3_modes(req, "nvidia/Cosmos3-Nano")
+        self.assertEqual(_resolve_video_path(req), "https://example.com/input.mp4")
+
+        kwargs = _cosmos3_sampling_param_kwargs(req, num_frames=48, fps=24)
+        self.assertEqual(kwargs["sound_duration"], 2.0)
+        self.assertEqual(kwargs["condition_frame_indexes"], [0, 2])
+        self.assertEqual(kwargs["condition_video_keep"], "last")
+        self.assertEqual(kwargs["action_mode"], "policy")
+        self.assertEqual(kwargs["domain_name"], "umi")
+        self.assertEqual(kwargs["raw_action_dim"], 9)
+        self.assertEqual(kwargs["action_fps"], 30.0)
+        self.assertEqual(kwargs["action_view_point"], "ego_view")
+
+    def test_generate_sound_false_disables_sound_duration(self):
+        req = VideoGenerationsRequest(
+            prompt="test", generate_sound=False, sound_duration=3.0
+        )
+        self.assertEqual(
+            _resolve_sound_duration(req, num_frames=48, fps=24),
+            0.0,
+        )
 
 
 class TestCosmos3Guardrails(unittest.TestCase):
@@ -294,6 +440,307 @@ class TestCosmos3Guardrails(unittest.TestCase):
     @mock.patch("importlib.util.find_spec", return_value=None)
     def test_missing_guardrail_package_reports_unavailable(self, _):
         self.assertFalse(is_cosmos_guardrail_available())
+
+
+class TestCosmos3MRoPE(unittest.TestCase):
+    """mRoPE position-ID computation for vision / sound / action token grids."""
+
+    DEVICE = torch.device("cpu")
+
+    def test_vision_default_args_unchanged(self):
+        # With base_temporal_compression_factor=None and start_frame_offset=0
+        # the token and base rates cancel, so t-index == frame index.
+        pos, _ = compute_mrope_position_ids_vision(
+            grid_t=21,
+            grid_h=1,
+            grid_w=1,
+            temporal_offset=0,
+            device=self.DEVICE,
+            fps=24.0,
+            base_fps=24.0,
+            temporal_compression_factor=4,
+        )
+        self.assertEqual(tuple(pos.shape), (3, 21))
+        self.assertAlmostEqual(float(pos[0, 0]), 0.0, places=5)
+        self.assertAlmostEqual(float(pos[0, 20]), 20.0, places=5)
+
+    def test_sound_grid_shape_and_scaling(self):
+        pos, _ = compute_mrope_position_ids_sound(
+            grid_t=10,
+            temporal_offset=0,
+            sound_latent_fps=25.0,
+            device=self.DEVICE,
+            base_fps=24.0,
+            temporal_compression_factor_sound=1,
+        )
+        # (T, 1, 1) grid -> spatial axes are all zero.
+        self.assertEqual(tuple(pos.shape), (3, 10))
+        self.assertTrue(torch.all(pos[1] == 0))
+        self.assertTrue(torch.all(pos[2] == 0))
+        # t-index = i / sound_fps * base_fps = i / 25 * 24.
+        self.assertAlmostEqual(float(pos[0, 5]), 5 / 25 * 24, places=4)
+
+    def test_action_uses_video_base_compression_and_offset(self):
+        # Action runs at frame rate (tcf=1) but is scaled by the video's
+        # base_temporal_compression_factor=4, and shifted by start_frame_offset.
+        pos, _ = compute_mrope_position_ids_action(
+            grid_t=16,
+            temporal_offset=0,
+            action_fps=10.0,
+            device=self.DEVICE,
+            base_fps=24.0,
+            base_temporal_compression_factor=4,
+            start_frame_offset=1,
+        )
+        self.assertEqual(tuple(pos.shape), (3, 16))
+        self.assertTrue(torch.all(pos[1] == 0))
+        self.assertTrue(torch.all(pos[2] == 0))
+        # t-index[i] = (i + start_frame_offset) / action_fps * (base_fps / base_tcf)
+        #            = (i + 1) / 10 * (24 / 4) = (i + 1) * 0.6
+        self.assertAlmostEqual(float(pos[0, 0]), 0.6, places=4)
+        self.assertAlmostEqual(float(pos[0, 15]), 16 * 0.6, places=4)
+
+    def test_action_offset_zero(self):
+        pos, _ = compute_mrope_position_ids_action(
+            grid_t=8,
+            temporal_offset=0,
+            action_fps=10.0,
+            device=self.DEVICE,
+            base_fps=24.0,
+            base_temporal_compression_factor=4,
+            start_frame_offset=0,
+        )
+        self.assertAlmostEqual(float(pos[0, 0]), 0.0, places=5)
+
+    def test_action_aligns_with_video_positions(self):
+        # Action frames at frame rate should share the video's temporal frame:
+        # every 4th action token lands on the next video latent-frame position.
+        media_offset = 100
+        vid, _ = compute_mrope_position_ids_vision(
+            grid_t=5,
+            grid_h=1,
+            grid_w=1,
+            temporal_offset=media_offset,
+            device=self.DEVICE,
+            fps=24.0,
+            base_fps=24.0,
+            temporal_compression_factor=4,
+        )
+        act, _ = compute_mrope_position_ids_action(
+            grid_t=16,
+            temporal_offset=media_offset,
+            action_fps=24.0,
+            device=self.DEVICE,
+            base_fps=24.0,
+            base_temporal_compression_factor=4,
+            start_frame_offset=0,
+        )
+        # video latent frame 1 sits at media_offset+1; action frame 4 (4 frames
+        # per latent at tcf=4) lands at the same temporal position.
+        self.assertAlmostEqual(float(vid[0, 1]), float(act[0, 4]), places=4)
+
+
+class TestCosmos3DomainAwareLinear(unittest.TestCase):
+    """Per-domain action projection."""
+
+    def test_rank3_and_rank2_shapes(self):
+        layer = DomainAwareLinear(input_size=7, output_size=64, num_domains=32)
+        x3 = torch.randn(2, 16, 7)
+        out3 = layer(x3, torch.tensor([1, 5]))
+        self.assertEqual(tuple(out3.shape), (2, 16, 64))
+        x2 = torch.randn(3, 7)
+        out2 = layer(x2, torch.tensor([0, 1, 2]))
+        self.assertEqual(tuple(out2.shape), (3, 64))
+
+    def test_distinct_domains_give_distinct_outputs(self):
+        torch.manual_seed(0)
+        layer = DomainAwareLinear(input_size=4, output_size=8, num_domains=4)
+        x = torch.randn(1, 3, 4)
+        out_a = layer(x, torch.tensor([0]))
+        out_b = layer(x, torch.tensor([2]))
+        self.assertFalse(torch.allclose(out_a, out_b))
+
+    def test_scalar_domain_id_promoted(self):
+        layer = DomainAwareLinear(input_size=4, output_size=8, num_domains=4)
+        out = layer(torch.randn(1, 2, 4), torch.tensor(3))
+        self.assertEqual(tuple(out.shape), (1, 2, 8))
+
+
+class TestCosmos3ConditionIndexes(unittest.TestCase):
+    """Vision condition-frame resolution across V2V and action modes."""
+
+    @staticmethod
+    def _batch(num_frames=61, **sp_kwargs):
+        sp = Cosmos3SamplingParams(prompt="t", num_frames=num_frames, **sp_kwargs)
+        return types.SimpleNamespace(sampling_params=sp, num_frames=num_frames)
+
+    def test_v2v_default(self):
+        idx = Cosmos3ImagePreprocessStage._resolve_condition_indexes(self._batch())
+        self.assertEqual(idx, [0, 1])
+
+    def test_v2v_explicit_sorted_unique(self):
+        idx = Cosmos3ImagePreprocessStage._resolve_condition_indexes(
+            self._batch(condition_frame_indexes=[2, 0, 2])
+        )
+        self.assertEqual(idx, [0, 2])
+
+    def test_inverse_dynamics_conditions_all_latent_frames(self):
+        # 61 frames -> (61-1)//4 + 1 = 16 latent frames, all locked.
+        idx = Cosmos3ImagePreprocessStage._resolve_condition_indexes(
+            self._batch(num_frames=61, action_mode="inverse_dynamics")
+        )
+        self.assertEqual(idx, list(range(16)))
+
+
+class TestCosmos3DomainResolution(unittest.TestCase):
+    """Embodiment domain-id resolution for action generation."""
+
+    @staticmethod
+    def _batch(**sp_kwargs):
+        sp = Cosmos3SamplingParams(prompt="t", **sp_kwargs)
+        return types.SimpleNamespace(sampling_params=sp)
+
+    def test_explicit_domain_id(self):
+        self.assertEqual(
+            Cosmos3LatentPreparationStage._resolve_domain_id(self._batch(domain_id=7)),
+            7,
+        )
+
+    def test_domain_name_lookup(self):
+        self.assertEqual(
+            Cosmos3LatentPreparationStage._resolve_domain_id(
+                self._batch(domain_name="av")
+            ),
+            EMBODIMENT_TO_DOMAIN_ID["av"],
+        )
+        self.assertEqual(
+            Cosmos3LatentPreparationStage._resolve_domain_id(
+                self._batch(domain_name="umi")
+            ),
+            EMBODIMENT_TO_DOMAIN_ID["umi"],
+        )
+
+    def test_missing_domain_raises(self):
+        with self.assertRaises(ValueError):
+            Cosmos3LatentPreparationStage._resolve_domain_id(self._batch())
+
+    def test_unknown_domain_name_raises(self):
+        with self.assertRaises(ValueError):
+            Cosmos3LatentPreparationStage._resolve_domain_id(
+                self._batch(domain_name="not_a_robot")
+            )
+
+
+class TestCosmos3ActionLatentPrep(unittest.TestCase):
+    """Action latent / mask preparation per action mode."""
+
+    @classmethod
+    def setUpClass(cls):
+        # Bypass PipelineStage.__init__ (needs global server args); only the
+        # transformer's action_dim and log_info are used by _prepare_action_latents.
+        cls.stage = Cosmos3LatentPreparationStage.__new__(Cosmos3LatentPreparationStage)
+        cls.stage.transformer = types.SimpleNamespace(action_dim=64)
+        cls.stage.log_info = lambda *a, **k: None
+        cls.device = torch.device("cpu")
+        cls.dtype = torch.float32
+
+    def _run(self, num_frames=17, **sp_kwargs):
+        sp = Cosmos3SamplingParams(prompt="t", num_frames=num_frames, **sp_kwargs)
+        batch = types.SimpleNamespace(
+            sampling_params=sp, num_frames=num_frames, extra={}
+        )
+        gen = torch.Generator(device=self.device).manual_seed(0)
+        self.stage._prepare_action_latents(batch, gen, self.device, self.dtype)
+        return batch
+
+    def test_forward_dynamics_clean_conditioning(self):
+        batch = self._run(
+            action_mode="forward_dynamics",
+            domain_name="agibotworld",
+            action=[[0.1] * 29 for _ in range(16)],
+        )
+        # action_chunk_size = num_frames - 1 = 16; padded to action_dim 64.
+        self.assertEqual(tuple(batch.action_latents.shape), (1, 16, 64))
+        # raw_action_dim is derived from the embodiment (agibotworld -> 29).
+        self.assertEqual(batch.extra["raw_action_dim"], 29)
+        self.assertEqual(batch.extra["action_start_frame_offset"], 1)
+        self.assertEqual(
+            int(batch.extra["action_domain_ids"][0]),
+            EMBODIMENT_TO_DOMAIN_ID["agibotworld"],
+        )
+        # forward_dynamics: action is clean conditioning -> velocity mask all zero.
+        self.assertTrue(torch.all(batch.extra["action_velocity_mask"] == 0))
+
+    def test_policy_denoises_from_noise(self):
+        batch = self._run(
+            action_mode="policy", domain_name="droid_lerobot", raw_action_dim=10
+        )
+        self.assertEqual(tuple(batch.action_latents.shape), (1, 16, 64))
+        self.assertEqual(batch.extra["raw_action_dim"], 10)
+        # policy: action fully denoised -> velocity mask all one.
+        self.assertTrue(torch.all(batch.extra["action_velocity_mask"] == 1))
+        # padding dims beyond raw_action_dim start at zero.
+        self.assertTrue(torch.all(batch.action_latents[:, :, 10:] == 0))
+
+    def test_inverse_dynamics_denoises_from_noise(self):
+        batch = self._run(
+            num_frames=61,
+            action_mode="inverse_dynamics",
+            domain_name="av",
+            raw_action_dim=9,
+        )
+        self.assertEqual(tuple(batch.action_latents.shape), (1, 60, 64))
+        self.assertTrue(torch.all(batch.extra["action_velocity_mask"] == 1))
+
+    def test_forward_dynamics_requires_action(self):
+        with self.assertRaises(ValueError):
+            self._run(action_mode="forward_dynamics", domain_name="agibotworld")
+
+    def test_policy_requires_raw_action_dim(self):
+        # policy has no input action to infer from, so it needs raw_action_dim
+        # from either the embodiment or an explicit value. With only a numeric
+        # domain_id (no embodiment name) and no raw_action_dim, it must raise.
+        with self.assertRaises(ValueError):
+            self._run(action_mode="policy", domain_id=0)
+
+    def test_policy_raw_action_dim_from_embodiment(self):
+        # droid_lerobot -> 10, so policy no longer needs an explicit raw dim.
+        batch = self._run(action_mode="policy", domain_name="droid_lerobot")
+        self.assertEqual(batch.extra["raw_action_dim"], 10)
+
+    def test_unknown_action_mode_raises(self):
+        with self.assertRaises(ValueError):
+            self._run(action_mode="teleport", domain_id=0)
+
+
+class TestCosmos3ModalitySamplingParams(unittest.TestCase):
+    """Sound / V2V / action sampling-param fields and defaults."""
+
+    def test_sound_duration_default_and_set(self):
+        self.assertEqual(Cosmos3SamplingParams(prompt="t").sound_duration, 0.0)
+        self.assertEqual(
+            Cosmos3SamplingParams(prompt="t", sound_duration=3.0).sound_duration, 3.0
+        )
+
+    def test_v2v_fields(self):
+        sp = Cosmos3SamplingParams(
+            prompt="t", video_path="in.mp4", condition_frame_indexes=[0, 1]
+        )
+        self.assertEqual(sp.video_path, "in.mp4")
+        self.assertEqual(sp.condition_frame_indexes, [0, 1])
+        self.assertEqual(sp.condition_video_keep, "first")
+
+    def test_action_fields_default_none(self):
+        sp = Cosmos3SamplingParams(prompt="t")
+        for field in (
+            "action_mode",
+            "domain_id",
+            "domain_name",
+            "raw_action_dim",
+            "action_fps",
+            "action",
+        ):
+            self.assertIsNone(getattr(sp, field))
 
 
 if __name__ == "__main__":

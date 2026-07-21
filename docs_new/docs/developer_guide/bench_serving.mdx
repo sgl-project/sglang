@@ -66,6 +66,7 @@ Select with `--dataset-name`:
 - `generated-shared-prefix`: synthetic dataset with shared long system prompts and short questions
 - `mmmu`: samples from MMMU (Math split) and includes images
 - `speed-bench`: [SPEED-Bench](https://huggingface.co/datasets/nvidia/SPEED-Bench) (**SPEculative Evaluation Dataset**) — a unified benchmark for evaluating [Speculative Decoding (SD)](https://arxiv.org/abs/2604.09557) algorithms. Uses the Throughput split, which provides fixed-length input sequences (1K–32K tokens) grouped into three output-entropy categories (`low_entropy`, `mixed`, `high_entropy`). Requires a pre-downloaded JSONL file passed via `--dataset-path`.
+- `agentic-trace`: replays pre-built multi-turn agentic traces (e.g. OpenHands / SWE-smith). Each conversation is replayed round by round, feeding the server's real assistant reply back into the next round's history. Requires a chat backend (`--backend sglang-oai-chat`) and a trace JSON passed via `--dataset-path`.
 
 Common dataset flags:
 
@@ -92,6 +93,13 @@ Image dataset flags (for `image`):
 - `--image-resolution`: Image resolution; supports presets (4k, 1080p, 720p, 360p) or custom 'heightxwidth' format (e.g., 1080x1920, 512x768)
 - `--image-format`: Image format (jpeg or png)
 - `--image-content`: Image content type (random or blank)
+
+Agentic trace flags (for `agentic-trace`):
+
+- `--dataset-path`: path to the pre-built trace JSON
+- `--sharegpt-output-len`: per-turn output length (default: 220)
+- `--dataset-offset`: rotate the conversation list by this many entries before sampling, so successive sweep steps start on fresh conversations
+- `--agentic-max-turns`: cap each conversation to at most this many turns (useful for small, fast profiling runs)
 
 SPEED-Bench flags (for `speed-bench`):
 

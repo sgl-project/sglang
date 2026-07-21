@@ -4,26 +4,30 @@ metatags:
   description: "Best Practice for Kimi-K2.6 on Ascend NPU"
 ---
 
-This guide describes the best practice data for Kimi-K2.6 on the Ascend NPU.
+<Note>
+This page focuses on optimal configuration and benchmark results for Kimi-K2.6 on the Ascend NPU. For environment setup, model weight download, feature configuration, and deployment instructions, etc., see the [Kimi-K2.6 Model Tutorial](/docs/hardware-platforms/ascend-npus/model-tutorials/kimi_k2_6).
+
+On A3 each card has 2 dies, so `--tp-size` is twice the card count; see [Ascend NPU Reference](/docs/hardware-platforms/ascend-npus/ascend_npu_reference#hardware) for details.
+</Note>
 
 ### Low Latency
 
-| Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| Kimi-K2.6 | Atlas 800I A3 | 8 | PD Mixed | 3.5K+1.5K | 20ms | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-8p-in3k5-out1k5-20ms) |
+| Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | TTFT | Quantization | Configuration |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Kimi-K2.6 | Atlas 800I A3 | 8 | PD Mixed | 3.5k+1.5k | 20ms | - | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-8p-in3k5-out1k5-20ms) |
 
 ### High Throughput
 
-| Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| Kimi-K2.6 | Atlas 800I A3 | 16 | PD Mixed | 64K+1K | 100ms | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-16p-in64k-out1k-100ms) |
-| Kimi-K2.6 | Atlas 800I A3 | 16 | PD Disaggregation | 128K+1K | 100ms | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-1p1d-16p-in128k-out1k-100ms) |
-| Kimi-K2.6 | Atlas 800I A3 | 16 | PD Disaggregation | 128K+1K (90% prefix cache hit rate) | 100ms | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-1p1d-16p-in128k-out1k-prefix90-100ms) |
-| Kimi-K2.6 | Atlas 800I A3 | 16 | PD Disaggregation | 64K+1.5K | 100ms | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-1p1d-16p-in64k-out1k5-100ms) |
-| Kimi-K2.6 | Atlas 800I A3 | 16 | PD Disaggregation | 64K+1.5K (90% prefix cache hit rate) | 100ms | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-1p1d-16p-in64k-out1k5-prefix90-100ms) |
-| Kimi-K2.6 | Atlas 800I A3 | 8 | PD Mixed | 1024x1024 (30)+1024 | 50ms | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-8p-in1024x1024-30-out1024-50ms) |
-| Kimi-K2.6 | Atlas 800I A3 | 8 | PD Mixed | 1080p_30+256 | 50ms | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-8p-in1080p-30-out256-50ms) |
-| Kimi-K2.6 | Atlas 800I A3 | 8 | PD Mixed | 3.5K+1.5K | 50ms | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-8p-in3k5-out1k5-50ms) |
+| Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | TTFT | Quantization | Configuration |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Kimi-K2.6 | Atlas 800I A3 | 16 | PD Mixed | 64k+1k | 100ms | - | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-16p-in64k-out1k-100ms) |
+| Kimi-K2.6 | Atlas 800I A3 | 16 | PD Disaggregation | 128k+1k | 100ms | - | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-1p1d-16p-in128k-out1k-100ms) |
+| Kimi-K2.6 | Atlas 800I A3 | 16 | PD Disaggregation | 128k+1k (90% prefix cache hit rate) | 100ms | 5s | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-1p1d-16p-in128k-out1k-prefix90-100ms) |
+| Kimi-K2.6 | Atlas 800I A3 | 16 | PD Disaggregation | 64k+1.5k | 100ms | - | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-1p1d-16p-in64k-out1k5-100ms) |
+| Kimi-K2.6 | Atlas 800I A3 | 16 | PD Disaggregation | 64k+1.5k (90% prefix cache hit rate) | 100ms | 3s | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-1p1d-16p-in64k-out1k5-prefix90-100ms) |
+| Kimi-K2.6 | Atlas 800I A3 | 8 | PD Mixed | 1024x1024 (30)+1024 | 50ms | - | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-8p-in1024x1024-30-out1024-50ms) |
+| Kimi-K2.6 | Atlas 800I A3 | 8 | PD Mixed | 1080p_30+256 | 50ms | - | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-8p-in1080p-30-out256-50ms) |
+| Kimi-K2.6 | Atlas 800I A3 | 8 | PD Mixed | 3.5k+1.5k | 50ms | - | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-8p-in3k5-out1k5-50ms) |
 
 ## Optimal Configuration
 
@@ -41,7 +45,7 @@ This guide describes the best practice data for Kimi-K2.6 on the Ascend NPU.
 
 **Quantization**: W4A8 INT8
 
-**Dataset**: 64K+1K
+**Dataset**: 64k+1k
 
 **TPOT**: 100ms
 
@@ -83,7 +87,6 @@ export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=64
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
 
@@ -109,7 +112,7 @@ do
         --quantization modelslim \
         --dtype bfloat16 \
         --tp-size 32 \
-        --mem-fraction-static 0.55 \
+        --mem-fraction-static 0.662 \
         --max-running-requests 32 \
         --chunked-prefill-size 262144 \
         --context-length 75000 \
@@ -127,7 +130,9 @@ do
         --speculative-num-steps 3 \
         --speculative-eagle-topk 1 \
         --speculative-num-draft-tokens 4 \
-        --speculative-draft-model-quantization unquant
+        --speculative-draft-model-quantization unquant \
+        --reasoning-parser kimi_k2 \
+        --tool-call-parser kimi_k2
         break
     fi
 done
@@ -137,7 +142,7 @@ done
 
 We tested it based on the `RANDOM` dataset.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name random \
     --backend sglang \
@@ -164,7 +169,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W4A8 INT8
 
-**Dataset**: 128K+1K
+**Dataset**: 128k+1k
 
 **TPOT**: 100ms
 
@@ -246,14 +251,13 @@ do
         --device npu \
         --tp-size 16 \
         --disable-radix-cache \
-        --disable-cuda-graph \
         --mem-fraction-static 0.78 \
-        --max-running-requests 1 \
+        --max-running-requests 2 \
         --moe-a2a-backend deepep \
         --deepep-mode auto \
         --chunked-prefill-size 16384 \
-        --prefill-max-requests 1 \
-        --max-prefill-tokens 131072 \
+        --prefill-max-requests 2 \
+        --max-prefill-tokens 65536 \
         --enable-multimodal \
         --mm-attention-backend ascend_attn \
         --sampling-backend ascend
@@ -273,7 +277,6 @@ do
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=64
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-        export SGLANG_ENABLE_SPEC_V2=1
         export SGLANG_NPU_USE_MLAPO=1
         export SGLANG_NPU_USE_MULTI_STREAM=1
 
@@ -290,8 +293,8 @@ do
         --attention-backend ascend \
         --device npu \
         --tp-size 16 \
-        --mem-fraction-static 0.73 \
-        --max-running-requests 1 \
+        --mem-fraction-static 0.82 \
+        --max-running-requests 2 \
         --enable-dp-attention \
         --dp-size 1 \
         --enable-dp-lm-head \
@@ -307,14 +310,16 @@ do
         --speculative-num-steps 3 \
         --speculative-eagle-topk 1 \
         --speculative-num-draft-tokens 4 \
-        --speculative-draft-model-quantization unquant
+        --speculative-draft-model-quantization unquant \
+        --reasoning-parser kimi_k2 \
+        --tool-call-parser kimi_k2
         NODE_RANK=$i
         break
     fi
 done
 ```
 
-```shell Command
+```bash Command
 # ============================================================
 # Before running, replace the following placeholders:
 #   <your prefill ip>: prefill node IP address
@@ -334,7 +339,7 @@ python -m sglang_router.launch_router \
 
 We tested it based on the `RANDOM` dataset.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name random \
     --backend sglang \
@@ -360,9 +365,11 @@ python -m sglang.bench_serving \
 
 **Quantization**: W4A8 INT8
 
-**Dataset**: 128K+1K (90% prefix cache hit rate)
+**Dataset**: 128k+1k (90% prefix cache hit rate)
 
 **TPOT**: 100ms
+
+**TTFT**: 5s
 
 #### Model Deployment
 
@@ -450,7 +457,9 @@ do
         --max-prefill-tokens 65536 \
         --enable-multimodal \
         --mm-attention-backend ascend_attn \
-        --sampling-backend ascend
+        --sampling-backend ascend \
+        --reasoning-parser kimi_k2 \
+        --tool-call-parser kimi_k2
         NODE_RANK=$i
         break
     fi
@@ -467,7 +476,6 @@ do
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=64
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-        export SGLANG_ENABLE_SPEC_V2=1
         export SGLANG_NPU_USE_MLAPO=1
         export SGLANG_NPU_USE_MULTI_STREAM=1
 
@@ -484,7 +492,7 @@ do
         --attention-backend ascend \
         --device npu \
         --tp-size 16 \
-        --mem-fraction-static 0.73 \
+        --mem-fraction-static 0.82 \
         --max-running-requests 2 \
         --enable-dp-attention \
         --dp-size 1 \
@@ -501,14 +509,16 @@ do
         --speculative-num-steps 3 \
         --speculative-eagle-topk 1 \
         --speculative-num-draft-tokens 4 \
-        --speculative-draft-model-quantization unquant
+        --speculative-draft-model-quantization unquant \
+        --reasoning-parser kimi_k2 \
+        --tool-call-parser kimi_k2
         NODE_RANK=$i
         break
     fi
 done
 ```
 
-```shell Command
+```bash Command
 # ============================================================
 # Before running, replace the following placeholders:
 #   <your prefill ip>: prefill node IP address
@@ -528,10 +538,10 @@ python -m sglang_router.launch_router \
 
 We tested it based on the `generated-shared-prefix` dataset with 90% cache hit (`repeat_rate = 0.9`):
 `--gsp-system-prompt-len 115200` = `int(128000 * 0.9)` is the shared prefix portion.
-`--gsp-question-len 12799` = `int(128000 * (1 - 0.9))` is the unique per-request suffix.
+`--gsp-question-len 12800` = `int(128000 * (1 - 0.9))` is the unique per-request suffix.
 `--gsp-num-groups 1` keeps all requests in one prefix group for maximum cache reuse.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name generated-shared-prefix \
     --backend sglang \
@@ -540,7 +550,7 @@ python -m sglang.bench_serving \
     --gsp-num-groups 1 \
     --gsp-prompts-per-group 4 \
     --gsp-system-prompt-len 115200 \
-    --gsp-question-len 12799 \
+    --gsp-question-len 12800 \
     --gsp-output-len 1000 \
     --max-concurrency 1 \
     --num-prompts 4 \
@@ -559,7 +569,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W4A8 INT8
 
-**Dataset**: 64K+1.5K
+**Dataset**: 64k+1.5k
 
 **TPOT**: 100ms
 
@@ -617,13 +627,8 @@ do
     then
         echo "${P_IP[$i]}"
         export GLOO_SOCKET_IFNAME=<network-interface>
-        export HCCL_BUFFSIZE=8
+        export HCCL_BUFFSIZE=1800
         export HCCL_SOCKET_IFNAME=<network-interface>
-        export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
-        export SGLANG_ZBAL_BOOTSTRAP_URL=tcp://127.0.0.1:24699
-        export SGLANG_ZBAL_LOCAL_MEM_SIZE=61184
-        export ZBAL_ENABLE_GRAPH=1
-        export ZBAL_NPU_ALLOC_CONF=use_vmm_for_static_memory:True
 
         python3 -m sglang.launch_server \
         --model-path ${MODEL_PATH} \
@@ -651,7 +656,9 @@ do
         --max-prefill-tokens 65536 \
         --enable-multimodal \
         --mm-attention-backend ascend_attn \
-        --sampling-backend ascend
+        --sampling-backend ascend \
+        --reasoning-parser kimi_k2 \
+        --tool-call-parser kimi_k2
         NODE_RANK=$i
         break
     fi
@@ -668,7 +675,6 @@ do
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=64
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-        export SGLANG_ENABLE_SPEC_V2=1
         export SGLANG_NPU_USE_MLAPO=1
         export SGLANG_NPU_USE_MULTI_STREAM=1
 
@@ -686,7 +692,7 @@ do
         --device npu \
         --tp-size 16 \
         --mem-fraction-static 0.82 \
-        --max-running-requests 1 \
+        --max-running-requests 16 \
         --enable-dp-attention \
         --dp-size 1 \
         --enable-dp-lm-head \
@@ -697,6 +703,8 @@ do
         --moe-a2a-backend deepep \
         --deepep-mode auto \
         --cuda-graph-bs 16 \
+        --reasoning-parser kimi_k2 \
+        --tool-call-parser kimi_k2 \
         --speculative-algorithm EAGLE3 \
         --speculative-draft-model-path $DRAFT_MODEL_PATH \
         --speculative-num-steps 4 \
@@ -709,7 +717,7 @@ do
 done
 ```
 
-```shell Command
+```bash Command
 # ============================================================
 # Before running, replace the following placeholders:
 #   <your prefill ip>: prefill node IP address
@@ -729,7 +737,7 @@ python -m sglang_router.launch_router \
 
 We tested it based on the `RANDOM` dataset.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name random \
     --backend sglang \
@@ -755,9 +763,11 @@ python -m sglang.bench_serving \
 
 **Quantization**: W4A8 INT8
 
-**Dataset**: 64K+1.5K (90% prefix cache hit rate)
+**Dataset**: 64k+1.5k (90% prefix cache hit rate)
 
 **TPOT**: 100ms
+
+**TTFT**: 3s
 
 #### Model Deployment
 
@@ -813,13 +823,8 @@ do
     then
         echo "${P_IP[$i]}"
         export GLOO_SOCKET_IFNAME=<network-interface>
-        export HCCL_BUFFSIZE=8
+        export HCCL_BUFFSIZE=1800
         export HCCL_SOCKET_IFNAME=<network-interface>
-        export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
-        export SGLANG_ZBAL_BOOTSTRAP_URL=tcp://127.0.0.1:24699
-        export SGLANG_ZBAL_LOCAL_MEM_SIZE=61184
-        export ZBAL_ENABLE_GRAPH=1
-        export ZBAL_NPU_ALLOC_CONF=use_vmm_for_static_memory:True
 
         python3 -m sglang.launch_server \
         --model-path ${MODEL_PATH} \
@@ -845,7 +850,9 @@ do
         --max-prefill-tokens 65536 \
         --enable-multimodal \
         --mm-attention-backend ascend_attn \
-        --sampling-backend ascend
+        --sampling-backend ascend \
+        --reasoning-parser kimi_k2 \
+        --tool-call-parser kimi_k2
         NODE_RANK=$i
         break
     fi
@@ -862,7 +869,6 @@ do
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=64
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-        export SGLANG_ENABLE_SPEC_V2=1
         export SGLANG_NPU_USE_MLAPO=1
         export SGLANG_NPU_USE_MULTI_STREAM=1
 
@@ -891,6 +897,8 @@ do
         --moe-a2a-backend deepep \
         --deepep-mode auto \
         --cuda-graph-bs 1 2 4 6 8 \
+        --reasoning-parser kimi_k2 \
+        --tool-call-parser kimi_k2 \
         --speculative-algorithm EAGLE3 \
         --speculative-draft-model-path $DRAFT_MODEL_PATH \
         --speculative-num-steps 4 \
@@ -903,7 +911,7 @@ do
 done
 ```
 
-```shell Command
+```bash Command
 # ============================================================
 # Before running, replace the following placeholders:
 #   <your prefill ip>: prefill node IP address
@@ -923,10 +931,10 @@ python -m sglang_router.launch_router \
 
 We tested it based on the `generated-shared-prefix` dataset with 90% cache hit (`repeat_rate = 0.9`):
 `--gsp-system-prompt-len 57600` = `int(64000 * 0.9)` is the shared prefix portion.
-`--gsp-question-len 6399` = `int(64000 * (1 - 0.9))` is the unique per-request suffix.
+`--gsp-question-len 6400` = `int(64000 * (1 - 0.9))` is the unique per-request suffix.
 `--gsp-num-groups 1` keeps all requests in one prefix group for maximum cache reuse.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name generated-shared-prefix \
     --backend sglang \
@@ -935,7 +943,7 @@ python -m sglang.bench_serving \
     --gsp-num-groups 1 \
     --gsp-prompts-per-group 8 \
     --gsp-system-prompt-len 57600 \
-    --gsp-question-len 6399 \
+    --gsp-question-len 6400 \
     --gsp-output-len 1500 \
     --max-concurrency 2 \
     --num-prompts 8 \
@@ -996,7 +1004,6 @@ export HCCL_OP_EXPANSION_MODE=AIV
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=112
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_NPU_USE_MULTI_STREAM=1
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
@@ -1006,12 +1013,12 @@ python3 -m sglang.launch_server \
     --host 127.0.0.1 --port 6688 \
     --quantization modelslim \
     --dtype bfloat16 \
-    --model-loader-extra-config {"enable_multithread_load": true} \
+    --model-loader-extra-config '{"enable_multithread_load": true}' \
     --trust-remote-code \
     --device npu \
     --attention-backend ascend \
     --tp-size 16 \
-    --mem-fraction-static 0.76 \
+    --mem-fraction-static 0.872 \
     --max-running-requests 176 \
     --chunked-prefill-size 32768 \
     --context-length 8192 \
@@ -1023,7 +1030,7 @@ python3 -m sglang.launch_server \
     --dp-size 16 \
     --moe-a2a-backend deepep \
     --deepep-mode auto \
-    --cuda-graph-bs 1 2 4 8 9 10 11 \
+    --cuda-graph-bs-decode 1 2 4 8 9 10 11 \
     --disable-radix-cache \
     --speculative-algorithm EAGLE3 \
     --speculative-draft-model-path $DRAFT_MODEL_PATH \
@@ -1032,14 +1039,16 @@ python3 -m sglang.launch_server \
     --speculative-num-draft-tokens 3 \
     --speculative-draft-model-quantization unquant \
     --prefill-delayer-max-delay-passes 200 \
-    --enable-prefill-delayer
+    --enable-prefill-delayer \
+    --reasoning-parser kimi_k2 \
+    --tool-call-parser kimi_k2
 ```
 
 #### Benchmark
 
 We tested it based on the `IMAGE` dataset with 1024x1024 resolution.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name image \
     --backend sglang-oai-chat \
@@ -1106,7 +1115,6 @@ export HCCL_OP_EXPANSION_MODE=AIV
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=32
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_NPU_USE_MULTI_STREAM=1
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
@@ -1116,13 +1124,13 @@ python3 -m sglang.launch_server \
     --host 127.0.0.1 --port 6688 \
     --quantization modelslim \
     --dtype bfloat16 \
-    --model-loader-extra-config {"enable_multithread_load": true} \
+    --model-loader-extra-config '{"enable_multithread_load": true}' \
     --trust-remote-code \
     --device npu \
     --attention-backend ascend \
     --tp-size 16 \
     --base-gpu-id 0 \
-    --mem-fraction-static 0.74 \
+    --mem-fraction-static 0.852 \
     --max-running-requests 64 \
     --chunked-prefill-size 16384 \
     --context-length 8192 \
@@ -1143,14 +1151,16 @@ python3 -m sglang.launch_server \
     --speculative-num-draft-tokens 3 \
     --speculative-draft-model-quantization unquant \
     --prefill-delayer-max-delay-passes 200 \
-    --enable-prefill-delayer
+    --enable-prefill-delayer \
+    --reasoning-parser kimi_k2 \
+    --tool-call-parser kimi_k2
 ```
 
 #### Benchmark
 
 We tested it based on the `IMAGE` dataset with 1920x1080 resolution.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name image \
     --backend sglang-oai-chat \
@@ -1179,7 +1189,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W4A8 INT8
 
-**Dataset**: 3.5K+1.5K
+**Dataset**: 3.5k+1.5k
 
 **TPOT**: 20ms
 
@@ -1220,7 +1230,6 @@ export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=96
 export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_NPU_USE_MLAPO=1
 export SGLANG_NPU_USE_MULTI_STREAM=1
 export SGLANG_SET_CPU_AFFINITY=1
@@ -1235,7 +1244,7 @@ python3 -m sglang.launch_server \
     --quantization modelslim \
     --dtype bfloat16 \
     --tp-size 16 \
-    --mem-fraction-static 0.753 \
+    --mem-fraction-static 0.865 \
     --max-running-requests 80 \
     --chunked-prefill-size 32768 \
     --context-length 6144 \
@@ -1247,9 +1256,9 @@ python3 -m sglang.launch_server \
     --dp-size 16 \
     --moe-a2a-backend deepep \
     --deepep-mode auto \
-    --cuda-graph-bs 1 2 3 4 5 \
+    --cuda-graph-bs-decode 1 2 3 4 5 \
     --disable-radix-cache \
-    --model-loader-extra-config {"enable_multithread_load": true} \
+    --model-loader-extra-config '{"enable_multithread_load": true}' \
     --speculative-algorithm EAGLE3 \
     --speculative-draft-model-path $DRAFT_MODEL_PATH \
     --speculative-num-steps 4 \
@@ -1257,14 +1266,16 @@ python3 -m sglang.launch_server \
     --speculative-num-draft-tokens 5 \
     --speculative-draft-model-quantization unquant \
     --prefill-delayer-max-delay-passes 200 \
-    --enable-prefill-delayer
+    --enable-prefill-delayer \
+    --reasoning-parser kimi_k2 \
+    --tool-call-parser kimi_k2
 ```
 
 #### Benchmark
 
 We tested it based on the `RANDOM` dataset.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name random \
     --backend sglang \
@@ -1290,7 +1301,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W4A8 INT8
 
-**Dataset**: 3.5K+1.5K
+**Dataset**: 3.5k+1.5k
 
 **TPOT**: 50ms
 
@@ -1331,7 +1342,6 @@ export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=96
 export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
 
@@ -1344,7 +1354,7 @@ python3 -m sglang.launch_server \
     --quantization modelslim \
     --dtype bfloat16 \
     --tp-size 16 \
-    --mem-fraction-static 0.783 \
+    --mem-fraction-static 0.895 \
     --max-running-requests 208 \
     --chunked-prefill-size 32768 \
     --context-length 6144 \
@@ -1356,9 +1366,9 @@ python3 -m sglang.launch_server \
     --dp-size 16 \
     --moe-a2a-backend deepep \
     --deepep-mode auto \
-    --cuda-graph-bs 1 2 4 8 12 13 \
+    --cuda-graph-bs-decode 1 2 4 8 12 13 \
     --disable-radix-cache \
-    --model-loader-extra-config {"enable_multithread_load": true} \
+    --model-loader-extra-config '{"enable_multithread_load": true}' \
     --speculative-algorithm EAGLE3 \
     --speculative-draft-model-path $DRAFT_MODEL_PATH \
     --speculative-num-steps 4 \
@@ -1366,14 +1376,16 @@ python3 -m sglang.launch_server \
     --speculative-num-draft-tokens 5 \
     --speculative-draft-model-quantization unquant \
     --prefill-delayer-max-delay-passes 200 \
-    --enable-prefill-delayer
+    --enable-prefill-delayer \
+    --reasoning-parser kimi_k2 \
+    --tool-call-parser kimi_k2
 ```
 
 #### Benchmark
 
 We tested it based on the `RANDOM` dataset.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name random \
     --backend sglang \

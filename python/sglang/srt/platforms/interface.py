@@ -103,10 +103,6 @@ class SRTPlatform(DeviceMixin):
         """Whether this platform supports FP8 quantization."""
         return False
 
-    def is_pin_memory_available(self) -> bool:
-        """Whether pinned memory is available on this platform."""
-        return True
-
     def support_cuda_graph(self) -> bool:
         """Whether this platform supports device graph capture and replay.
         Controls CUDA graph (CudaGraphRunner) for the decode path.

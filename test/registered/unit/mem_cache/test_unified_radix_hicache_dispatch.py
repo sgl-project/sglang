@@ -1,5 +1,5 @@
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from sglang.srt.mem_cache.hicache_storage import PoolName, SidecarPoolSpec
 from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler
@@ -11,6 +11,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     _DeepSeekV4Strategy,
     _DsaStrategy,
     _MambaStrategy,
+    _MiniMaxSparseStrategy,
     _PlainKvStrategy,
     _select_strategy,
     _SwaStrategy,
@@ -36,6 +37,9 @@ class TestUnifiedRadixHiCacheDispatch(unittest.TestCase):
         order = [type(s) for s in _STRATEGIES]
         # DeepSeekV4 inherits from SWAKVPool, so it must resolve before _SwaStrategy.
         self.assertLess(order.index(_DeepSeekV4Strategy), order.index(_SwaStrategy))
+        self.assertLess(
+            order.index(_MiniMaxSparseStrategy), order.index(_PlainKvStrategy)
+        )
         self.assertEqual(order[-1], _PlainKvStrategy)
 
     def test_deepseek_v4_full_swa(self):
@@ -67,6 +71,53 @@ class TestUnifiedRadixHiCacheDispatch(unittest.TestCase):
         kvcache = _mock_kvcache(DSATokenToKVPool)
         strategy = _select_strategy(kvcache, {FULL})
         self.assertIsInstance(strategy, _DsaStrategy)
+
+    def test_minimax_sparse(self):
+        from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
+
+        kvcache = _mock_kvcache(MiniMaxSparseKVPool)
+        strategy = _select_strategy(kvcache, {FULL})
+        self.assertIsInstance(strategy, _MiniMaxSparseStrategy)
+
+    def test_minimax_sparse_build_registers_indexer_sidecar(self):
+        strategy = _MiniMaxSparseStrategy()
+        host_pool_group = MagicMock()
+        kv_host_pool = object()
+        host_pool_group.get_pool.return_value = kv_host_pool
+        cache_controller = MagicMock()
+        cache = MagicMock(page_size=4)
+        kvcache = MagicMock()
+        kvcache.index_k_pool = object()
+        kvcache.main_pool.layer_num = 8
+        params = MagicMock()
+        params.tp_cache_group = None
+        params.pp_rank = 0
+        params.pp_size = 1
+        server_args = MagicMock()
+
+        with patch.object(
+            hybrid_pool_assembler,
+            "build_minimax_sparse_hicache_stack",
+            return_value=(host_pool_group, cache_controller),
+        ) as build_stack:
+            result = strategy.build(
+                cache=cache,
+                kvcache=kvcache,
+                params=params,
+                server_args=server_args,
+                load_cache_event=object(),
+            )
+
+        build_stack.assert_called_once()
+        self.assertIs(build_stack.call_args.kwargs["sparse_pool"], kvcache)
+        self.assertIs(result.host_pool_group, host_pool_group)
+        self.assertIs(result.cache_controller, cache_controller)
+        self.assertIs(result.component_host_pools[FULL], kv_host_pool)
+        self.assertEqual(result.pools_desc, "KV + INDEXER(k-only)")
+        self.assertEqual(result.transfer_layer_num, 8)
+        self.assertEqual(len(result.sidecars), 1)
+        self.assertEqual(result.sidecars[0].pool_name, PoolName.INDEXER)
+        self.assertEqual(result.sidecars[0].indices_from_pool, PoolName.KV)
 
     def test_plain_kv_fallback(self):
         from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool

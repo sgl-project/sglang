@@ -74,7 +74,7 @@ PREFIX_Y = (_PREFIX_Y_BODY * 8).strip()
 
 
 _REQ_TOTAL_RE = re.compile(
-    r"^sgl_router_requests_total\{([^}]*)\}\s+(\d+(?:\.\d+)?)\s*$"
+    r"^sgl_router_worker_requests_total\{([^}]*)\}\s+(\d+(?:\.\d+)?)\s*$"
 )
 _LABEL_RE = re.compile(r'(\w+)="([^"]*)"')
 

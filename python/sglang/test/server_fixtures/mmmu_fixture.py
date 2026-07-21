@@ -44,7 +44,7 @@ class MMMUServerBase(CustomTestCase):
         # Build server args with MMMU-specific settings
         server_args = [
             "--trust-remote-code",
-            "--cuda-graph-max-bs",
+            "--cuda-graph-max-bs-decode",
             "64",
             "--enable-multimodal",
             "--mem-fraction-static",

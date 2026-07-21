@@ -280,7 +280,7 @@ class FullResponseUsageTestCase(unittest.TestCase):
         metadata = RequestResponseMetadata(request_id=request.request_id)
 
         async def empty_generator():
-            if False:
+            for _ in ():
                 yield None
 
         response = asyncio.run(

@@ -14,7 +14,7 @@
 
 """Public import facade and runtime helpers for context parallel strategies."""
 
-from typing import Any, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Optional, Tuple
 
 from sglang.srt.layers.cp.base import (
     BaseContextParallelMetadata,
@@ -27,17 +27,102 @@ from sglang.srt.layers.cp.interleave import (
     InterleaveContextParallelMetadata,
     InterleaveCPStrategy,
 )
+from sglang.srt.layers.cp.padding import pad_logical_token_to_physical
 from sglang.srt.layers.cp.zigzag import (
     ContextParallelMetadata,
     ZigzagContextParallelMetadata,
     ZigzagCPStrategy,
 )
+from sglang.srt.runtime_context import get_parallel
+
+if TYPE_CHECKING:
+    from sglang.srt.model_executor.model_runner import ModelRunner
 
 CP_V2_DEFAULT_MODEL_CLASSES = frozenset(
     {
+        "GptOssForCausalLM",
+        "MiMoV2FlashForCausalLM",
+        "MiMoV2ForCausalLM",
         "Qwen3MoeForCausalLM",
+        "DeepseekV3ForCausalLM",
     }
 )
+
+
+def is_glm_dsa_cache_layer_split_enabled(model_runner: "ModelRunner") -> bool:
+    """Whether DSA GPU KV/indexer cache layers are sharded across CP ranks.
+
+    Layer split is a prefill-CP-only optimization for DSA (DeepSeek Sparse
+    Attention) MLA models (e.g. GLM-5.2). Draft workers keep the full cache.
+    """
+    from sglang.srt.configs.model_config import is_deepseek_dsa
+
+    return (
+        not model_runner.is_draft_worker
+        and model_runner.server_args.enable_dsa_cache_layer_split
+        and model_runner.use_mla_backend
+        and is_deepseek_dsa(model_runner.model_config.hf_config)
+    )
+
+
+def get_glm_dsa_cp_layer_shard_info(
+    model_runner: "ModelRunner",
+) -> Tuple[Optional[int], int]:
+    """Return ``(layer_shard_rank, layer_shard_size)`` for the DSA KV pool.
+
+    ``(None, 1)`` disables sharding (feature off or only one CP rank).
+    """
+    if not is_glm_dsa_cache_layer_split_enabled(model_runner):
+        return None, 1
+    shard_size = get_parallel().attn_cp_size
+    if shard_size <= 1:
+        return None, 1
+    return get_parallel().attn_cp_rank, shard_size
+
+
+def get_glm_dsa_layer_split_effective_num_layers(
+    model_runner: "ModelRunner", num_layers: int
+) -> int:
+    """Per-rank owned layer count used when sizing the DSA KV cell.
+
+    Under layer split each CP rank only stores ``ceil(num_layers / shard_size)``
+    layers, plus one extra layer for the remote scratch buffer used when reading
+    a layer owned by another CP rank.
+    """
+    if not is_glm_dsa_cache_layer_split_enabled(model_runner):
+        return num_layers
+    shard_size = get_parallel().attn_cp_size
+    if shard_size <= 1:
+        return num_layers
+    owned_layers_upper_bound = (num_layers + shard_size - 1) // shard_size
+    return max(1, owned_layers_upper_bound + 1)
+
+
+def get_layer_shard_range(
+    rank: int, shard_size: int, total_layers: int
+) -> Tuple[int, int]:
+    """Contiguous ``[start, end)`` local-layer range owned by ``rank``.
+
+    Layers are split as evenly as possible; the first ``total_layers %
+    shard_size`` ranks own one extra layer.
+    """
+    base = total_layers // shard_size
+    rem = total_layers % shard_size
+    start = rank * base + min(rank, rem)
+    end = start + base + (1 if rank < rem else 0)
+    return start, end
+
+
+def get_layer_owner(local_layer_idx: int, shard_size: int, total_layers: int) -> int:
+    """CP rank that owns ``local_layer_idx`` under the contiguous split."""
+    for rank in range(shard_size):
+        start, end = get_layer_shard_range(rank, shard_size, total_layers)
+        if start <= local_layer_idx < end:
+            return rank
+    raise ValueError(
+        f"Invalid local_layer_idx={local_layer_idx} for "
+        f"shard_size={shard_size}, total_layers={total_layers}"
+    )
 
 
 def enable_cp_v2() -> bool:
@@ -71,15 +156,33 @@ def prepare_cp_forward(forward_batch) -> None:
     assert is_cp_v2_active(forward_batch)
     strategy = get_cp_strategy()
     assert strategy is not None
-    num_tokens = len(forward_batch.input_ids)
 
     seq_lens_cpu = _to_int_list(getattr(forward_batch, "seq_lens_cpu", None))
     extend_lens_cpu = _to_int_list(getattr(forward_batch, "extend_seq_lens_cpu", None))
-    forward_batch.attn_cp_metadata = strategy.build_metadata(
-        num_tokens=num_tokens,
-        seqs_len=seq_lens_cpu,
-        extend_seqs_len=extend_lens_cpu,
+    num_tokens = (
+        sum(extend_lens_cpu)
+        if extend_lens_cpu is not None
+        else len(forward_batch.input_ids)
     )
+    if forward_batch.attn_cp_metadata is None:
+        forward_batch.attn_cp_metadata = strategy.build_metadata(
+            num_tokens=num_tokens,
+            seqs_len=seq_lens_cpu,
+            extend_seqs_len=extend_lens_cpu,
+        )
+        pad_logical_token_to_physical(forward_batch.attn_cp_metadata)
+
+    if getattr(forward_batch, "global_num_tokens_cpu", None) is not None:
+        from sglang.srt.layers.dp_attention import set_local_dp_buffer_len
+
+        set_local_dp_buffer_len(
+            forward_batch.attn_cp_metadata.per_rank_actual_token[
+                get_parallel().attn_cp_rank
+            ]
+        )
+
+    if getattr(forward_batch, "out_cache_loc", None) is not None:
+        forward_batch.out_cache_loc = forward_batch.out_cache_loc[:num_tokens]
 
 
 def cp_split_before_forward(
@@ -110,6 +213,9 @@ def cp_gather_after_forward(x: Any, forward_batch, stream: Optional[Any] = None)
         hidden_states = strategy.gather_hidden_states(
             hidden_states, forward_batch, stream
         )
+        # MiMo's text-only body returns (hidden_states, None); logits expects a tensor.
+        if len(rest) == 1 and rest[0] is None:
+            return hidden_states
         return (hidden_states, *rest)
 
     return strategy.gather_hidden_states(x, forward_batch, stream)
@@ -140,4 +246,9 @@ __all__ = [
     "cp_gather_after_forward",
     "cp_split_before_forward",
     "prepare_cp_forward",
+    "is_glm_dsa_cache_layer_split_enabled",
+    "get_glm_dsa_cp_layer_shard_info",
+    "get_glm_dsa_layer_split_effective_num_layers",
+    "get_layer_shard_range",
+    "get_layer_owner",
 ]
