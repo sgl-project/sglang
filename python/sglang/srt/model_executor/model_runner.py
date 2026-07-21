@@ -1552,7 +1552,6 @@ class ModelRunner:
         self.sampler.compute_logprobs_only(
             logits_output,
             forward_batch.sampling_info,
-            forward_batch.return_logprob,
             forward_batch.top_logprobs_nums,
             forward_batch.token_ids_logprobs,
         )
