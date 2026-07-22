@@ -1420,14 +1420,15 @@ class ServingChatTestCase(unittest.TestCase):
         self.assertEqual(len(chunks), 2)
         self.assertIn("error", chunks[0])
 
-    def test_streaming_abort_with_output_ids_enabled(self):
-        """Test that a terminal abort with output ids enabled yields an error and [DONE]."""
+    def test_streaming_abort_with_ids_enabled(self):
+        """Test that a terminal abort with input/output ids enabled yields only an error and [DONE]."""
         err_msg = "Aborted by scheduler"
         err_code = HTTPStatus.INTERNAL_SERVER_ERROR
 
         async def _mock_generate_abort():
             yield {
                 "text": "Partial ",
+                "prompt_token_ids": [4, 5, 6],
                 "output_ids": [1, 2, 3],
                 "meta_info": {
                     "id": "chatcmpl-test",
@@ -1453,6 +1454,7 @@ class ServingChatTestCase(unittest.TestCase):
             temperature=0.7,
             max_tokens=100,
             stream=True,
+            return_input_ids=True,
             return_output_ids=True,
         )
 
@@ -1481,13 +1483,13 @@ class ServingChatTestCase(unittest.TestCase):
         loop = get_or_create_event_loop()
         chunks = loop.run_until_complete(run_stream())
 
-        # Exactly one error chunk followed by [DONE]; no sglext.output_ids.
+        # Exactly one error chunk followed by [DONE]; no sglext ids leak.
         self.assertEqual(len(chunks), 2)
         self.assertIn("error", chunks[0])
         self.assertEqual(chunks[1], "data: [DONE]\n\n")
         self.assertFalse(
-            any("output_ids" in c for c in chunks),
-            "sglext.output_ids event leaked after abort error",
+            any("input_ids" in c or "output_ids" in c for c in chunks),
+            "sglext ids event leaked after abort error",
         )
 
         error_chunk_data = json.loads(chunks[0][len("data: ") :])
