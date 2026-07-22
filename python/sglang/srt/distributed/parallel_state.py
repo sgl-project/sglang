@@ -55,6 +55,7 @@ from sglang.srt.runtime_context import (
     set_global_dwdp_manager,
 )
 from sglang.srt.utils import (
+    get_bool_env_var,
     get_current_device_stream_fast,
     get_int_env_var,
     is_cpu,
@@ -75,6 +76,8 @@ _is_npu = is_npu()
 _is_cpu = is_cpu()
 _is_xpu = is_xpu()
 _is_musa = is_musa()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
+_use_aiter_new_ca = get_bool_env_var("SGLANG_USE_AITER_NEW_CA", True)
 
 TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 
@@ -867,7 +870,9 @@ class GroupCoordinator:
         assert any([qr_comm, ca_comm, pymscclpp_comm, torch_symm_mem_comm, pynccl_comm])
         if outplace_all_reduce_method == "ca":
             assert not ca_comm.disabled
-            out = ca_comm.custom_all_reduce(input_)
+            out = ca_comm.custom_all_reduce(
+                input_, use_new=_use_aiter_new_ca
+            ) if _use_aiter else ca_comm.custom_all_reduce(input_)
         elif outplace_all_reduce_method == "qr":
             assert not qr_comm.disabled
             out = qr_comm.quick_all_reduce(input_)
