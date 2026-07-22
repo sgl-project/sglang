@@ -182,7 +182,7 @@ async fn generate_single(state: &AppState, req: GenerateRequest, stream: bool) -
     // `rid_str` is the response `meta_info.id`, reused for every frame.
     let mut guard = AbortGuard::new(state.senders.clone(), id, rid_str.clone());
     // Cumulative frames (SGLang default) vs per-step deltas.
-    let incremental = state.server_args.incremental_streaming_output();
+    let incremental = state.server_args.incremental_streaming_output;
 
     if stream {
         // A single request is a 1-element batch without the `index` field — reuse
@@ -272,7 +272,7 @@ async fn generate_batch(
         // Multiplex the N streams (mirrors the Python `_handle_batch_request` path);
         // `guard` moves into the stream so a disconnect aborts what's unfinished.
         use futures::StreamExt;
-        let incremental = state.server_args.incremental_streaming_output();
+        let incremental = state.server_args.incremental_streaming_output;
         let s = generation_event_stream(receivers, guard, incremental, true)
             .map(|data| Ok::<_, Infallible>(Event::default().data(data)));
         Sse::new(s).into_response()
