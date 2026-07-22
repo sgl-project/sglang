@@ -1886,17 +1886,14 @@ class Scheduler(
         # into the waiting queue but can never be scheduled, blocking the queue
         # and eventually making health checks fail.
         paged_input_len = -(-input_len // self.page_size) * self.page_size
-        if os.environ.get("SGLANG_KV_WINDOW"):
-            # KV-streaming: the device pool is windowed (see alloc_for_decode), so the sequence can
-            # grow to context_len even though it exceeds the device pool. Bound max_new_tokens by
-            # context_len, NOT by the device pool size (max_req_len / max_total_num_tokens).
-            upper = self.model_config.context_len - input_len - 1
-        else:
-            upper = min(
+        req.sampling_params.max_new_tokens = max(
+            0,
+            min(
+                max_new_tokens,
                 self.max_req_len - input_len - 1,
                 self.max_total_num_tokens - paged_input_len - self.page_size - 1,
-            )
-        req.sampling_params.max_new_tokens = max(0, min(max_new_tokens, upper))
+            ),
+        )
         # Clipping above can push max_new_tokens below min_new_tokens, which
         # would suppress EOS for the whole generation. Restore the invariant.
         if req.sampling_params.min_new_tokens > req.sampling_params.max_new_tokens:
