@@ -574,6 +574,8 @@ def test_kimi_k3_encoder_dp_defers_feature_materialization(monkeypatch):
     assert pixel_values is None
     assert grid_thws == [[1, 2, 2], [1, 2, 2]]
     assert run_dp.call_args.kwargs["rope_type"] == "rope_2d"
+    assert run_dp.call_args.kwargs["pass_grid_thw_list"] is True
+    assert run_dp.call_args.kwargs["pool_temporal_dimension"] is True
     loader = run_dp.call_args.kwargs["load_local_pixel_values"]
     assert callable(loader)
 
