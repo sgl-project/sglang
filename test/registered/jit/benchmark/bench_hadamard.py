@@ -13,7 +13,7 @@ from sglang.jit_kernel.benchmark.utils import (
     get_benchmark_range,
     run_benchmark,
 )
-from sglang.jit_kernel.hadamard import hadamard_transform
+from sglang.kernels.ops.attention.hadamard import hadamard_transform
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(

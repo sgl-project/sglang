@@ -19,7 +19,7 @@ limitations under the License.
 The radix tree data structure for managing the hybrid (full and Mamba) KV cache.
 """
 
-import heapq
+import os
 from array import array
 from collections import defaultdict
 from typing import TYPE_CHECKING, List, Optional, Tuple
@@ -62,6 +62,12 @@ from sglang.srt.runtime_context import get_parallel
 
 logger = logging.getLogger(__name__)
 
+# Debug-only invariant checks in the Mamba slot-donation path call tensor.item(),
+# which forces a per-request cudaStreamSynchronize on the scheduler thread. Under
+# load this can serialize/stall the scheduler. Gate them off by default; set
+# SGLANG_MAMBA_DEBUG_ASSERTS=1 to re-enable for debugging.
+_MAMBA_DEBUG_ASSERTS = os.environ.get("SGLANG_MAMBA_DEBUG_ASSERTS", "0") == "1"
+
 
 class TreeNode:
 
@@ -83,7 +89,11 @@ class TreeNode:
         self.full_lock_ref = 0
         self.mamba_lock_ref = 0
         # last access time is only used for sanity check. LRU is maintained by the lru list.
+        # `last_access_time` tracks the full LRU (whole matched path is reused as prefix);
+        # `mamba_last_access_time` tracks the mamba LRU, which only touches the single state
+        # actually consumed per access, so the two orders diverge and need separate stamps.
         self.last_access_time = get_last_access_time()
+        self.mamba_last_access_time = self.last_access_time
 
         self.hit_count = 0
         self.host_ref_counter = 0
@@ -172,10 +182,12 @@ class LRUList:
             self.prv = "mamba_prev"
             self.nxt = "mamba_next"
             self.lock_ref = "mamba_lock_ref"
+            self.time_attr = "mamba_last_access_time"
         else:
             self.prv = "prev"
             self.nxt = "next"
             self.lock_ref = "full_lock_ref"
+            self.time_attr = "last_access_time"
         # Initialize dummy head and tail nodes
         self.head = TreeNode()  # Most recently used side
         self.tail = TreeNode()  # Least recently used side
@@ -226,6 +238,8 @@ class LRUList:
         assert (
             not self.mamba or node.mamba_value is not None
         ), f"Resetting mamba tombstone node in mamba lru list: {node.id=}"
+        if self.mamba:
+            node.mamba_last_access_time = get_last_access_time()
         self._remove_node(node)
         self._add_node(node)
 
@@ -255,6 +269,8 @@ class LRUList:
         assert (
             node.id not in self.cache
         ), f"Inserting node {node.id=} already in lru list, existing node: {self.cache[node.id].id=}"
+        if self.mamba:
+            node.mamba_last_access_time = get_last_access_time()
         self.cache[node.id] = node
         self._add_node(node)
 
@@ -330,21 +346,20 @@ class LRUList:
         msg = f"{self.mamba=} LRU list: "
         x_lru = self._get_lru()
         while x_lru is not None and x_lru.id in self.cache:
-            msg += f"[{x_lru.id}] {x_lru.last_access_time:f} -> "
+            msg += f"[{x_lru.id}] {getattr(x_lru, self.time_attr):f} -> "
             x_lru = getattr(x_lru, self.prv)
         print(msg)
 
         if not tree_cache:
             return
-        msg = f"{self.mamba=} Nodes (sorted by last_access_time): "
+        msg = f"{self.mamba=} Nodes (sorted by {self.time_attr}): "
         if self.mamba:
             nodes = tree_cache._collect_nontombstone_nodes()
         else:
             nodes = tree_cache._collect_all_nodes()
-        heapq.heapify(nodes)
-        while len(nodes):
-            x = heapq.heappop(nodes)
-            msg += f"[{x.id}] {x.last_access_time:f} -> "
+        nodes.sort(key=lambda n: getattr(n, self.time_attr))
+        for x in nodes:
+            msg += f"[{x.id}] {getattr(x, self.time_attr):f} -> "
         print(msg)
 
     # Note: this is expensive, only use for debug
@@ -364,8 +379,8 @@ class LRUList:
     # Note: this is expensive, only use for debug or idle check
     def sanity_check(self, tree_cache: MambaRadixCache):
         """
-        Check if the lru list is valid by rebuilding the lru list from the tree, heapifying it, and
-        checking if the lru list is valid.
+        Check the lru list is valid by rebuilding it from the tree, sorting by this list's
+        access-time stamp, and checking the order matches the linked list.
         """
         try:
             if self.mamba:
@@ -374,16 +389,16 @@ class LRUList:
                 nodes = tree_cache._collect_all_nodes()
             total_nodes = len(nodes)
             total_lru = len(self.cache)
-            # heapify based on last_access_time
-            heapq.heapify(nodes)
+            # rebuild expected order from this list's own access-time stamp (full and mamba
+            # lists have independent recency, so they use different stamps)
+            nodes.sort(key=lambda n: getattr(n, self.time_attr))
             # the root node is not in the lru list
             assert len(nodes) == (
                 total_lru + (0 if self.mamba else 1)
             ), f"len(nodes): {len(nodes)}, total_lru: {total_lru}"
 
             x_lru = self._get_lru()
-            while len(nodes):
-                x = heapq.heappop(nodes)
+            for x in nodes:
                 if x == tree_cache.root_node:
                     # root node is not in the lru list
                     continue
@@ -393,7 +408,7 @@ class LRUList:
 
                 assert (
                     x == x_lru
-                ), f"Incorrect LRU list, {self.mamba=}, x: {x.id=} != x_lru: {x_lru.id=}, {x.last_access_time=}, {x_lru.last_access_time=}"
+                ), f"Incorrect LRU list, {self.mamba=}, x: {x.id=} != x_lru: {x_lru.id=}, {getattr(x, self.time_attr)=}, {getattr(x_lru, self.time_attr)=}"
                 assert (
                     x_lru.full_lock_ref == 0
                 ), f"x_lru should not be locked when idle, {x_lru.full_lock_ref=}, {x_lru.id=}"
@@ -523,20 +538,21 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         )
         return InsertResult(prefix_len=prefix_len, mamba_exist=mamba_exist)
 
-    def cache_finished_req(self, req: Req, is_insert: bool = True) -> None:
+    def cache_finished_req(
+        self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int
+    ) -> None:
         """Cache request when it finishes."""
-        kv_committed_len = req.pop_committed_kv_cache()
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, :kv_committed_len
+                req.req_pool_idx, :kv_len_to_handle
             ]
             self.token_to_kv_pool_allocator.free(kv_indices)
             self.req_to_token_pool.free_mamba_cache(req)
             return
 
-        token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
+        token_ids = (req.origin_input_ids + req.output_ids)[:kv_len_to_handle]
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, :kv_committed_len
+            req.req_pool_idx, :kv_len_to_handle
         ]
 
         if is_insert:
@@ -572,7 +588,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
 
             assert (
                 cache_len == page_aligned_len
-            ), f"It is required {cache_len=}, {page_aligned_len=}, {kv_committed_len=}, {len(req.origin_input_ids)=}, {len(req.output_ids)=} ping @yizhang2077 if you see this"
+            ), f"It is required {cache_len=}, {page_aligned_len=}, {kv_len_to_handle=}, {len(req.origin_input_ids)=}, {len(req.output_ids)=} ping @yizhang2077 if you see this"
 
             # Radix Cache takes one ref in memory pool
             # insert the token_ids and kv_indices into the radix tree
@@ -583,13 +599,15 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                 src_active = req.mamba_ping_pong_track_buffer[
                     mamba_ping_pong_track_buffer_to_keep
                 ].unsqueeze(-1)
-                assert src_active.item() != -1, (
-                    f"Cached mamba slot is -1: keep_idx={mamba_ping_pong_track_buffer_to_keep}, "
-                    f"buf={req.mamba_ping_pong_track_buffer.tolist()}, "
-                    f"next_track_idx={req.mamba_next_track_idx}, "
-                    f"last_track_seqlen={req.mamba_last_track_seqlen}, "
-                    f"rid={req.rid}"
-                )
+                if _MAMBA_DEBUG_ASSERTS:
+                    # .item() forces a cudaStreamSynchronize; only pay it when debugging.
+                    assert src_active.item() != -1, (
+                        f"Cached mamba slot is -1: keep_idx={mamba_ping_pong_track_buffer_to_keep}, "
+                        f"buf={req.mamba_ping_pong_track_buffer.tolist()}, "
+                        f"next_track_idx={req.mamba_next_track_idx}, "
+                        f"last_track_seqlen={req.mamba_last_track_seqlen}, "
+                        f"rid={req.rid}"
+                    )
                 if self.int8_ckpt_pool is not None:
                     mamba_value = self._commit_int8_checkpoint(src_active)
                     # quantized -> no ping-pong slot needs keeping
@@ -1103,11 +1121,16 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         cow_mamba = params.cow_mamba
         req = params.req
 
-        # update time for matched nodes, and make nodes closer to root to be least recently used
-        # this allows mamba to evict nodes closer to root first
+        # Full KV of the whole matched path is reused as prefix, so refresh the entire
+        # chain (nodes closer to root end up least recently used, evicted first).
         node_update = last_node
         self.full_lru_list.reset_node_and_parents_mru(node_update, self.root_node)
-        self.mamba_lru_list.reset_node_and_parents_mru(node_update, self.root_node)
+        # Mamba only consumes last_node's state (cf. inc_lock_ref, which locks just this
+        # node's mamba_value). Refreshing ancestors would keep a whole session's states
+        # adjacent in the mamba LRU and evict cold sessions wholesale; touch only the used
+        # state so older leaves survive.
+        if last_node is not self.root_node and last_node.mamba_value is not None:
+            self.mamba_lru_list.reset_node_mru(last_node)
 
         # This last_access_time is for sanity check, can be deleted after validation in production
         cur_time = get_last_access_time()
@@ -1169,12 +1192,13 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         new_node.key = child.key[:split_len]
         new_node.value = child.value[:split_len].clone()
 
-        # child time should be later than parent's time for mamba tombstone
+        # child time should be later than the new parent's time in the full LRU
         child.last_access_time = get_last_access_time()
 
+        # A split does not change the set of live mamba states (child keeps its value,
+        # new_node is a mamba tombstone), so the mamba LRU is left untouched — only the
+        # full LRU reorders around the new intermediate node.
         self.full_lru_list.remove_node(child)
-        if child.mamba_value is not None:
-            self.mamba_lru_list.remove_node(child)
         child.parent = new_node
         child.key = child.key[split_len:]
         child.value = child.value[split_len:].clone()
@@ -1183,12 +1207,10 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             child.hash_value, split_len, self.page_size
         )
 
-        # insert the new node and child into the lru lists, insert
+        # insert the new node and child into the full lru list, insert
         # parent first so that parent is after child in the lru list
         self.full_lru_list.insert_mru(new_node)
         self.full_lru_list.insert_mru(child)
-        if child.mamba_value is not None:
-            self.mamba_lru_list.insert_mru(child)
         return new_node
 
     def _insert_helper(
@@ -1200,14 +1222,14 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         chunked: bool = False,
         prev_prefix_len: int = 0,
     ) -> Tuple[int, bool]:
-        # Update the last access time from root to leaf, so that
-        # mamba will tombstone the node closer to root first
+        # Refresh the full LRU from root to leaf (the whole path is reused as prefix).
+        # The mamba states of these existing nodes were not recomputed this insert, so
+        # the mamba LRU is left untouched here; only genuinely new mamba states (the new
+        # leaf / a revived tombstone below) are inserted.
         assert mamba_value is not None, "Mamba value should not be None here."
         node.last_access_time = get_last_access_time()
         if node != self.root_node:
             self.full_lru_list.reset_node_mru(node)
-            if node.mamba_value is not None:
-                self.mamba_lru_list.reset_node_mru(node)
         if len(key) == 0:
             return 0, True
 
@@ -1218,8 +1240,6 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             node = node.children[child_key]
             node.last_access_time = get_last_access_time()
             self.full_lru_list.reset_node_mru(node)
-            if node.mamba_value is not None:
-                self.mamba_lru_list.reset_node_mru(node)
             prefix_len = node.key.match(key, page_size=self.page_size)
 
             if prev_prefix_len < total_prefix_length + prefix_len:
@@ -1259,7 +1279,6 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         else:  # mamba value already exists
             mamba_value_exist = True
             self.full_lru_list.reset_node_mru(node)
-            self.mamba_lru_list.reset_node_mru(node)
             node.last_access_time = get_last_access_time()
 
         return total_prefix_length, mamba_value_exist

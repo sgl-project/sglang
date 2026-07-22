@@ -17,10 +17,10 @@ from typing import Optional
 
 import torch
 
+from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.fused_moe_triton.layer import get_moe_runner_backend
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -85,14 +85,14 @@ def awq_dequantize_func():
         return awq_dequantize
     elif _is_hip:
         from sglang.kernel_api_logging import debug_kernel_api
-        from sglang.srt.layers.quantization.awq.awq_triton import (
+        from sglang.kernels.ops.quantization.awq_triton import (
             awq_dequantize_triton as awq_dequantize,
         )
 
         return debug_kernel_api(awq_dequantize, op_name="DeepseekCommon.awq_dequantize")
     elif _is_npu:
         from sglang.kernel_api_logging import debug_kernel_api
-        from sglang.srt.layers.quantization.awq.awq_triton import (
+        from sglang.kernels.ops.quantization.awq_triton import (
             awq_dequantize_decomposition as awq_dequantize,
         )
 
@@ -110,6 +110,28 @@ def enable_nextn_moe_bf16_cast_to_fp8(
         and quant_config.get_name() == "modelopt_fp4"
         and get_moe_runner_backend().is_deep_gemm()
     )
+
+
+def is_wint4afp8_or_wint4a16_config(
+    quant_config: Optional[QuantizationConfig],
+) -> bool:
+    if quant_config is None:
+        return False
+    if quant_config.get_name() == "w4afp8":
+        return True
+
+    from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+        CompressedTensorsConfig,
+    )
+
+    if not isinstance(quant_config, CompressedTensorsConfig):
+        return False
+    linear_scheme = quant_config.target_scheme_map.get("Linear", {})
+    weight_quant = linear_scheme.get("weights")
+    input_quant = linear_scheme.get("input_activations")
+    return quant_config._is_wint4afp8(
+        weight_quant, input_quant
+    ) or quant_config._is_wint4abf16(weight_quant, input_quant)
 
 
 def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:

@@ -626,13 +626,13 @@ class DiffusionServerBase:
 --- MISSING GROUND TRUTH DETECTED ---
 GT image(s) not found for '{case.id}'.
 
-Add the expected file(s) to sgl-project/ci-data in diffusion-ci/consistency_gt/sglang_generated/ with naming (n=num_gpus).
+Add the expected file(s) to sgl-project/ci-data-diffusion in diffusion-ci/consistency_gt/sglang_generated/ with naming (n=num_gpus).
   Image: {case.id}_{{n}}gpu.<ext> (ext from output_format: png, jpg, webp)
   Video: {case.id}_{{n}}gpu_frame_0.png, {case.id}_{{n}}gpu_frame_mid.png, {case.id}_{{n}}gpu_frame_last.png
 
 For this case, expected file(s): {names}
 
-Repository: https://github.com/sgl-project/ci-data (path: diffusion-ci/consistency_gt/sglang_generated/, with optional platform subdirectories such as 5090/)
+Repository: https://github.com/sgl-project/ci-data-diffusion (path: diffusion-ci/consistency_gt/sglang_generated/, with optional platform subdirectories such as 5090/)
 Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
 
 (Optional) Per-case override in {get_consistency_threshold_path()}:
@@ -768,12 +768,12 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
 --- MISSING ACTION GROUND TRUTH DETECTED ---
 GT action JSON not found for '{case.id}'.
 
-Add the expected file to sgl-project/ci-data in diffusion-ci/consistency_gt/sglang_generated/ with naming:
+Add the expected file to sgl-project/ci-data-diffusion in diffusion-ci/consistency_gt/sglang_generated/ with naming:
   Action: {case.id}_{{n}}gpu.json
 
 For this case, expected file(s): {names}
 
-Repository: https://github.com/sgl-project/ci-data (path: diffusion-ci/consistency_gt/sglang_generated/, with optional platform subdirectories such as 5090/)
+Repository: https://github.com/sgl-project/ci-data-diffusion (path: diffusion-ci/consistency_gt/sglang_generated/, with optional platform subdirectories such as 5090/)
 Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
 """)
             pytest.fail(

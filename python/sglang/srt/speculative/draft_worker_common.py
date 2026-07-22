@@ -10,13 +10,14 @@ import torch
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
-from sglang.srt.runtime_context import get_context, get_server_args
+from sglang.srt.runtime_context import get_context
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.distributed.parallel_state_wrapper import ParallelState
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
@@ -57,11 +58,7 @@ def build_draft_tp_worker(
     *,
     server_args: ServerArgs,
     gpu_id: int,
-    tp_rank: int,
-    dp_rank: Optional[int],
-    moe_ep_rank: int,
-    attn_cp_rank: int,
-    moe_dp_rank: int,
+    ps: ParallelState,
     nccl_port: int,
     target_model_config: ModelConfig,
     algo_label: str,
@@ -93,22 +90,24 @@ def build_draft_tp_worker(
         context_length=target_model_config.context_len,
     )
 
-    saved_server_args = get_server_args()
-    try:
+    # Publish the draft copy for the duration of the build so the draft's model
+    # layers resolve config (e.g. kv_cache_dtype) from the draft's own bags, not
+    # the target's -- an independently configured draft can resolve a different
+    # KV-cache dtype than the target, and reading the target-global bag would
+    # make draft attention record the wrong dtype. ``preserve_config`` snapshots
+    # the target's resolved config on entry and reinstates it verbatim on exit
+    # (post-publish overrides intact), so the target is undisturbed afterwards --
+    # unlike a plain ``set_server_args(saved)`` restore, which re-projects the
+    # bags from the pristine record and drops those overrides.
+    with get_context().preserve_config():
+        get_context().set_server_args(draft_server_args)
         draft_worker = TpModelWorker(
             server_args=draft_server_args,
             gpu_id=gpu_id,
-            tp_rank=tp_rank,
-            moe_ep_rank=moe_ep_rank,
-            pp_rank=0,
-            attn_cp_rank=attn_cp_rank,
-            moe_dp_rank=moe_dp_rank,
-            dp_rank=dp_rank,
+            ps=ps,
             nccl_port=nccl_port,
             is_draft_worker=True,
         )
-    finally:
-        get_context().set_server_args(saved_server_args)
 
     draft_model_runner = draft_worker.model_runner
     draft_worker.draft_runner = draft_model_runner

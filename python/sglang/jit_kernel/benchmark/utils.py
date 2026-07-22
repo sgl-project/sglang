@@ -5,7 +5,7 @@ from typing import Callable, List, Optional, Sequence, Tuple
 import torch
 import triton.testing
 
-from sglang.jit_kernel.mp import multigpu_launch
+from sglang.kernels.ops.communication.mp import multigpu_launch
 from sglang.utils import is_in_ci
 
 
@@ -18,7 +18,7 @@ def multigpu_bench_main(
     pre_launch_fn: Optional[Callable[[List[int]], None]] = None,
     timeout: Optional[int] = None,
 ) -> None:
-    """cudalib-style multi-GPU benchmark entry point.
+    """Torchrun-based multi-GPU benchmark entry point.
 
     Drop this at the bottom of a benchmark file::
 

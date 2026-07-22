@@ -890,6 +890,7 @@ def run_dsv4_eagle_verify_cuda_graph_case(
     dtype: torch.dtype = torch.bfloat16,
     device: str = "cuda",
     cuda_graph_capture_batch_size: int = 2,
+    force_gpu_only_seq_lens: bool = False,
 ):
     """DSV4 EAGLE target_verify CUDA-graph capture/replay. Chain only —
     `DeepseekV4AttnBackend.__init__` asserts `self.topk in [0, 1]` at
@@ -936,6 +937,11 @@ def run_dsv4_eagle_verify_cuda_graph_case(
         batch.spec_info = _make_eagle_verify_input(
             spec_case, batch, topk=topk, device=device
         )
+        if force_gpu_only_seq_lens:
+            batch.seq_lens_cpu = None
+            batch.seq_lens_sum = None
+            batch.spec_info.seq_lens_cpu = None
+            batch.spec_info.seq_lens_sum = None
 
     def _make_capture_case(base, name, capture_prefix_len: int, bs: int):
         # Capture uses uniform prefixes per request; each request still

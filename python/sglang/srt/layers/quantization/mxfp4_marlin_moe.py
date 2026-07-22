@@ -71,21 +71,23 @@ class Mxfp4MarlinMoEMethod:
         layer.register_parameter("w2_weight", w2_weight)
         set_weight_attrs(w2_weight, extra_weight_attrs)
 
+        # Store loader scales in E8M0; uint8 127 encodes 1.0.
+        def _e8m0_ones(*shape: int) -> torch.Tensor:
+            return torch.full(shape, 127, dtype=torch.uint8).view(torch.float8_e8m0fnu)
+
         w13_weight_scale = torch.nn.Parameter(
-            torch.ones(
+            _e8m0_ones(
                 num_experts,
                 2 * intermediate_size_per_partition,
                 hidden_size // fp4_block_k,
-                dtype=torch.float32,
             ),
             requires_grad=False,
         )
         w2_weight_scale = torch.nn.Parameter(
-            torch.ones(
+            _e8m0_ones(
                 num_experts,
                 hidden_size,
                 intermediate_size_per_partition // fp4_block_k,
-                dtype=torch.float32,
             ),
             requires_grad=False,
         )

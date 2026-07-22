@@ -8,7 +8,7 @@ import unittest
 import torch
 
 try:
-    from sglang.srt.layers.attention.mamba.mamba_state_scatter_triton import (
+    from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
         fused_mamba_state_scatter_with_mask,
     )
 

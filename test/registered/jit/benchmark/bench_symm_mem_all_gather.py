@@ -28,12 +28,12 @@ import torch.distributed as dist
 import sglang.srt.distributed.parallel_state as ps
 from sglang.jit_kernel.benchmark import marker
 from sglang.jit_kernel.benchmark.utils import get_benchmark_range, multigpu_bench_main
-from sglang.jit_kernel.utils import cache_once
+from sglang.kernels.jit.utils import cache_once
 from sglang.srt.distributed.device_communicators.triton_symm_mem_ag import (
     all_gather_inner,
     create_state,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(
     est_time=120,
@@ -41,6 +41,7 @@ register_cuda_ci(
     runner_config="1-gpu-large",
     disabled="requires multi-GPU, self-skips in CI",
 )
+register_amd_ci(est_time=120, stage="jit-kernel-benchmark", runner_config="amd")
 
 # ---------------------------------------------------------------------------
 # Sweep parameters

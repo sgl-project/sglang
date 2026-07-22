@@ -252,6 +252,14 @@ class TestDiffusionBCGPadding(unittest.TestCase):
             BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS,
         )
         self.assertIn(
+            "fal/ideogram-v4-fast",
+            BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS,
+        )
+        self.assertIn(
+            "fal/ideogram-v4-instant",
+            BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS,
+        )
+        self.assertIn(
             "Ideogram4PipelineConfig",
             BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS,
         )

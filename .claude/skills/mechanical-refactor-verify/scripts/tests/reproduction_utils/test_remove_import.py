@@ -118,6 +118,21 @@ def test_remove_import_leaves_other_statements_on_a_semicolon_line(
     assert "import sys" in out and "print(sys.path)" in out
 
 
+def test_remove_import_trailing_on_a_semicolon_line_leaves_no_dangling_separator(
+    tmp_path: Path,
+) -> None:
+    """Removing the trailing import on a semicolon-joined line drops the dangling ';' too
+    (a trailing space may remain for the formatter to strip, but the separator is gone).
+    """
+    (tmp_path / "m.py").write_text("import sys; import os\nprint(sys.path)\n")
+    r = Repro("b", "t").remove_import("m.py", "import os")
+    _apply(r, tmp_path)
+    out = (tmp_path / "m.py").read_text()
+    assert ";" not in out
+    assert "import os" not in out
+    assert "import sys" in out and "print(sys.path)" in out
+
+
 def test_remove_import_does_not_overmatch_a_submodule_import(tmp_path: Path) -> None:
     """Removing 'import os' must not also remove 'import os.path'."""
     (tmp_path / "m.py").write_text("import os\nimport os.path\nprint(os.path.sep)\n")

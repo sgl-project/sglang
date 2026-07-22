@@ -93,7 +93,9 @@ def _walk_radix_subtree(
 
     if unlocked_only:
         emit_slots = not is_root and _node_is_unlocked_for_canary(
-            node=node, radix_cache=radix_cache
+            node=node,
+            radix_cache=radix_cache,
+            swa_resident_only=swa_resident_only,
         )
     else:
         emit_slots = not is_root
@@ -168,6 +170,7 @@ def _node_is_unlocked_for_canary(
     *,
     node: TreeNode | UnifiedTreeNode,
     radix_cache: BasePrefixCache,
+    swa_resident_only: bool,
 ) -> bool:
     if type(radix_cache) is RadixCache:
         return node.lock_ref == 0
@@ -176,6 +179,10 @@ def _node_is_unlocked_for_canary(
         return node.full_lock_ref == 0
 
     if type(radix_cache) is UnifiedRadixCache:
+        if swa_resident_only and radix_cache.supports_swa():
+            # Unified SWA owns an independent component lock. A node can still
+            # hold Full KV for a running request while its SWA slots are unused.
+            return node.component_data[ComponentType.SWA].lock_ref == 0
         return node.component_data[BASE_COMPONENT_TYPE].lock_ref == 0
 
     raise NotImplementedError(

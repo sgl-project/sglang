@@ -43,6 +43,7 @@ class TreeCacheBuildContext:
     tp_rank: int
     tp_group: Any
     full_tokens_per_layer: Optional[int] = None
+    is_dsa: bool = False
 
 
 RadixCacheFactory = Callable[[TreeCacheBuildContext], BasePrefixCache]
@@ -103,9 +104,20 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
     if envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.get() or use_mlx():
         return _create_unified_radix_cache(ctx, server_args, params)
 
+    if ctx.is_hybrid_swa:
+        if ctx.full_tokens_per_layer == 0:
+            from sglang.srt.mem_cache.pure_swa_radix_cache import PureSWARadixCache
+
+            return PureSWARadixCache(params=params)
+        return _create_unified_radix_cache(ctx, server_args, params)
+
+    if ctx.is_hybrid_ssm:
+        return _create_unified_radix_cache(ctx, server_args, params)
+
     if ctx.enable_hierarchical_cache:
-        if ctx.is_hybrid_ssm or ctx.is_hybrid_swa:
-            # HybridModel launches HiCache via UnifiedRadixCache by default.
+        if ctx.is_hybrid_ssm or ctx.is_hybrid_swa or ctx.is_dsa:
+            # HybridModel and DSA (e.g. DeepSeek V3.2 / GLM-5.1) launch
+            # HiCache via UnifiedRadixCache by default.
             return _create_unified_radix_cache(ctx, server_args, params)
         else:
             from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
@@ -115,20 +127,6 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
             cache.cache_controller.layer_done_counter
         )
         return cache
-
-    if ctx.is_hybrid_swa:
-        if ctx.full_tokens_per_layer == 0:
-            from sglang.srt.mem_cache.pure_swa_radix_cache import PureSWARadixCache
-
-            return PureSWARadixCache(params=params)
-        from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
-
-        return SWARadixCache(params=params)
-
-    if ctx.is_hybrid_ssm:
-        from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
-
-        return MambaRadixCache(params)
 
     if server_args.enable_lmcache:
         from sglang.srt.mem_cache.storage.lmcache.lmc_radix_cache import (

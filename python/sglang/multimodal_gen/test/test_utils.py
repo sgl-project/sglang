@@ -34,14 +34,22 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-SGL_TEST_FILES_CI_DATA_REVISION = "9a64abec5a7517a9f2b04ac1b4eab4173adb2d38"
+# GT is read from <repo>@<revision>. A given SHA only exists in the repo it was
+# committed to, so REPO and REVISION must be bumped together. New GT now
+# publishes to sgl-project/ci-data-diffusion; the pins below still resolve
+# against sgl-project/ci-data (readable but frozen). When you bump REVISION to a
+# freshly generated commit, switch REPO to sgl-project/ci-data-diffusion too
+# (and update the URL assertion in the consistency-metrics unit test).
+SGL_TEST_FILES_CI_DATA_REPO = "sgl-project/ci-data"
+
+SGL_TEST_FILES_CI_DATA_REVISION = "320949ecc2587474a2f535229ffc8f47ed16ee51"
 
 if current_platform.is_npu():
     SGL_TEST_FILES_CI_DATA_REVISION = "6b62f4b6825c76a25fd2ba28248df68f2b400e65"
 
 SGL_TEST_FILES_CONSISTENCY_GT_ROOT = (
     "https://raw.githubusercontent.com/"
-    f"sgl-project/ci-data/{SGL_TEST_FILES_CI_DATA_REVISION}/"
+    f"{SGL_TEST_FILES_CI_DATA_REPO}/{SGL_TEST_FILES_CI_DATA_REVISION}/"
     "diffusion-ci/consistency_gt"
 )
 SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_BASE = (

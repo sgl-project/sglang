@@ -109,6 +109,9 @@ class RequestFuncOutput:
     cached_tokens: int = 0
     cached_tokens_details: Optional[Dict[str, Any]] = None
     spec_accept_length: float = 0.0
+    spec_cap_length: float = 0.0
+    spec_block_accept_length: float = 0.0
+    spec_cap_lens_histogram: List[int] = field(default_factory=list)
 
     @staticmethod
     def init_new(request_func_input: RequestFuncInput):
@@ -482,6 +485,15 @@ async def async_request_openai_chat_completions(
                         _meta_info = response_json["choices"][0].get("meta_info") or {}
                         output.spec_accept_length = (
                             _meta_info.get("spec_accept_length", 0.0) or 0.0
+                        )
+                        output.spec_cap_length = (
+                            _meta_info.get("spec_cap_length", 0.0) or 0.0
+                        )
+                        output.spec_block_accept_length = (
+                            _meta_info.get("spec_block_accept_length", 0.0) or 0.0
+                        )
+                        output.spec_cap_lens_histogram = (
+                            _meta_info.get("spec_cap_lens_histogram", []) or []
                         )
                         if getattr(args, "cache_report", False):
                             _extract_cache_from_sglext(response_json, output)
@@ -2175,7 +2187,6 @@ def cli_main():
         default="sharegpt",
         choices=[
             "agentic-trace",
-            "autobench",
             "sharegpt",
             "custom",
             "openai",

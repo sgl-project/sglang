@@ -53,11 +53,11 @@ This section provides deployment configurations verified on AMD MI300X, MI325X, 
 * **NVFP4 Quantization**: Requires `--quantization modelopt_fp4` and uses a different model path (`nvidia/Qwen3-Coder-...`).
 * **DP Attention**: NVFP4 configuration supports `--enable-dp-attention` for improved throughput.
 
+**Intel Xeon CPU:**
+* Please refer to the `Notes` part in the serving engine launching section in [the SGLang CPU server document](../../../docs/hardware-platforms/cpu_server#launch-of-the-serving-engine) to better understand how to configure the arguments, especially for TP (tensor parallel) and NUMA binding settings.
+
 **General:**
 * **Tool Use**: To enable tool calling capabilities, add `--tool-call-parser qwen3_coder` to the launch command.
-
-**Intel Xeon CPU:**
-* For configuring CPU service, please refer to the `Notes` part in the serving engine launching section in [the SGLang CPU server document](../../../docs/hardware-platforms/cpu_server#launch-of-the-serving-engine) to better understand how to configure the arguments, especially for TP (tensor parallel) and NUMA binding settings.
 
 ## 4. Model Invocation
 
@@ -769,7 +769,7 @@ python3 -m sglang.test.few_shot_gsm8k --num-questions 200
 
 ##### NVIDIA (B200/GB200)
 
-For deployment commands, see [Section 3.1](#31-configuration).
+For deployment commands, see [Section 3.1](#3-1-configuration).
 
   - Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8
     ```

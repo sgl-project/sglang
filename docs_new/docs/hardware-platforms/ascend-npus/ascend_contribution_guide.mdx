@@ -83,7 +83,7 @@ For detailed instructions, refer to [test/README.md](https://github.com/sgl-proj
 If you need to use model which is not in `python/sglang/test/ascend/test_ascend_utils.py` list. Follow these steps:
 
 1. Register account and upload your model to [modelscope](https://modelscope.cn/models).
-2. Make sure your model is pre-cached on the CI server and is on the way "/data/ascend-ci-share-pkking-sglang/modelscope/hub/models/{your_model_repo}/{your_model}".
+2. Make sure your model is pre-cached on the CI server and is at the path "/data/ascend-ci-share-pkking-sglang/modelscope/hub/models/{your_model_repo}/{your_model}".
   If this is not the case, use following command on CI server:
 
     ```bash
@@ -184,7 +184,7 @@ Users listed in [CI_PERMISSIONS.json](https://github.com/sgl-project/sglang/blob
 - In a file, put core data structures at the top of the file. Put utility functions at the bottom of the file.
 - Keep tests run fast.
   - If a single test file run longer than 500 seconds, split it into multiple smaller files (e.g., `test_eagle_infer_a.py`, `test_eagle_infer_b.py`).
-  - If a single job in a github workflow runs longer than 30 mins, split it into smaller jobs/steps.
+  - If a single job in a github workflow runs longer than 30 min, split it into smaller jobs/steps.
   - Reuse server launches in your unit tests to make tests run faster.
 - Never use `pickle.loads()`, `pickle.load()`, or `recv_pyobj()` to deserialize untrusted or network-received data. Python’s [pickle module is not secure](https://docs.python.org/3/library/pickle.html) — it can execute arbitrary code during deserialization. Use safe serialization formats such as [msgpack](https://github.com/jcrist/msgspec) or JSON instead.
 - When supporting new hardware or features, follow these guidelines:

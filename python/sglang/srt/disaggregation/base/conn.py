@@ -50,6 +50,10 @@ class KVArgs:
     # Per-tensor TP slice dim, used when prefill/decode attn_tp_size differ.
     state_dim_per_tensor: List[List[int]]
     is_hybrid_mla_backend: bool
+    # Per-tensor conv sub-block dims (GDN: [key_dim, key_dim, value_dim]) so the
+    # scatter transfer can slice each independently head-sharded sub-block; None
+    # per tensor when the single contiguous slice already matches the layout.
+    state_conv_shard_groups: List[List[Optional[List[int]]]]
     ib_device: str
     ib_traffic_class: str
     gpu_id: int
@@ -157,6 +161,18 @@ class BaseKVSender(ABC):
         Raise an exception if the kv cache transfer fails.
         """
         ...
+
+    def clear(self):
+        """
+        Clear any internal states.
+        """
+        pass
+
+    def abort(self):
+        """
+        Abort the current transfer.
+        """
+        pass
 
 
 class BaseKVReceiver(ABC):

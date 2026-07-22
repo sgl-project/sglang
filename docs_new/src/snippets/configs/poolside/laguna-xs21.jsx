@@ -142,11 +142,11 @@ sgl-eval run aime25 \\
     ["aime25_pct", "AIME25", "%"],
   ],
 
-  // Dedicated image built for this cookbook page (PR #29446 + #29761 preinstalled on cu13).
+  // lmsysorg/sglang:latest (cu13) carries the Laguna-XS.2.1 build (PR #29446 + #29761).
   dockerImages: {
-    h200:  "lmsysorg/sglang:dev-cu13-laguna-xs-2-1",
-    b300:  "lmsysorg/sglang:dev-cu13-laguna-xs-2-1",
-    gb300: "lmsysorg/sglang:dev-cu13-laguna-xs-2-1",
+    h200:  "lmsysorg/sglang:latest",
+    b300:  "lmsysorg/sglang:latest",
+    gb300: "lmsysorg/sglang:latest",
   },
 
   github: {

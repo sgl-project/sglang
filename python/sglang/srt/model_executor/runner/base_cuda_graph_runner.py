@@ -56,7 +56,7 @@ def freeze_gc(enable_cudagraph_gc: bool):
 
 
 def get_batch_sizes_to_capture(
-    model_runner: ModelRunner, num_tokens_per_bs: int = 1
+    model_runner: ModelRunner, captured_req_width: int = 1
 ) -> Tuple[List[int], List[int]]:
     """Build the (capture_bs, compile_bs) lists for the decode runner.
 
@@ -69,9 +69,12 @@ def get_batch_sizes_to_capture(
     num_max_requests = model_runner.req_to_token_pool.size
 
     mul_base = 1
+    # TBO splits each request's rows across two micro-batches, so the
+    # alignment constraint applies per request rather than per token row.
+    alignment_width = captured_req_width
     if server_args.enable_two_batch_overlap:
         mul_base *= 2
-        num_tokens_per_bs = 1
+        alignment_width = 1
 
     if require_gathered_buffer(server_args):
         mul_base *= get_parallel().attn_tp_size
@@ -86,8 +89,8 @@ def get_batch_sizes_to_capture(
         # is very small. We add more values here to make sure we capture the maximum bs.
         capture_bs += [num_max_requests]
 
-    # Model input token count = bs * num_tokens_per_bs; must be a multiple of attn_tp_size.
-    capture_bs = [bs for bs in capture_bs if bs * num_tokens_per_bs % mul_base == 0]
+    # Model input token count = bs * alignment_width; must be a multiple of attn_tp_size.
+    capture_bs = [bs for bs in capture_bs if bs * alignment_width % mul_base == 0]
     capture_bs = [bs for bs in capture_bs if bs <= num_max_requests]
     capture_bs = list(sorted(set(capture_bs)))
 

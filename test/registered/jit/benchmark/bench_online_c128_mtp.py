@@ -15,7 +15,9 @@ from sglang.jit_kernel.benchmark.utils import (
     run_benchmark,
     run_benchmark_no_cudagraph,
 )
-from sglang.jit_kernel.dsv4.online_c128_mtp import _jit_online_c128_mtp_module
+from sglang.kernels.ops.attention.dsv4.online_c128_mtp import (
+    _jit_online_c128_mtp_module,
+)
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(
@@ -148,7 +150,7 @@ def benchmark(
 ) -> tuple[float, float, float]:
     case = make_case(batch_size, num_verify_tokens)
     module = _jit_online_c128_mtp_module(
-        HEAD_DIM, case.seq_lens.dtype, case.req_pool_indices.dtype
+        HEAD_DIM, case.seq_lens.dtype, case.req_pool_indices.dtype, case.state.dtype
     )
     fn = lambda: call_write_prefix(module, case)
 

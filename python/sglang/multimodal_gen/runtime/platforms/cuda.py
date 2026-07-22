@@ -327,13 +327,6 @@ class CudaPlatformBase(Platform):
 
             return fp4_quantize
         except ImportError:
-            pass
-
-        try:
-            from sgl_kernel import scaled_fp4_quant as fp4_quantize
-
-            return fp4_quantize
-        except ImportError:
             return None
 
     @classmethod
@@ -375,16 +368,9 @@ class CudaPlatformBase(Platform):
         except ImportError:
             logger.warning(
                 "Requested SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND=%r "
-                "but flashinfer.mm_fp4 is unavailable. Falling back to "
-                "cutlass.",
+                "but flashinfer.mm_fp4 is unavailable.",
                 requested_backend or "flashinfer_trtllm (default)",
             )
-
-        try:
-            from sgl_kernel import cutlass_scaled_fp4_mm as cutlass_fp4_gemm
-
-            return cutlass_fp4_gemm, None
-        except ImportError:
             return None, None
 
     @classmethod

@@ -54,7 +54,7 @@ import { InternS2PreviewDeployment } from "/src/snippets/autoregressive/intern-s
 - Use `tp>=2` for the NVIDIA deployment commands.
 - Use `--reasoning-parser qwen3` to separate reasoning content from final content in streaming responses.
 - Use `--tool-call-parser qwen3_coder` when serving tool-calling workloads.
-- Add `--mamba-scheduler-strategy extra_buffer` with `--speculative-algo 'NEXTN'` to enable MTP.
+- Add `--mamba-radix-cache-strategy extra_buffer` with `--speculative-algo 'NEXTN'` to enable MTP.
 - If weight loading is slow, add `--model-loader-extra-config='{"enable_multithread_load": "true", "num_threads": 64}'`.
 
 ## 4. Model Invocation

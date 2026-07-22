@@ -335,7 +335,7 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
 
         bidirectional_attn_masks_list = []
         bidirectional_attn_mask_indptr = torch.zeros(
-            forward_batch.batch_size + 1, dtype=torch.int32, device=input_ids.device
+            forward_batch.batch_size + 1, dtype=torch.int64, device=input_ids.device
         )
 
         split_images = []

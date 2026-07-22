@@ -5,7 +5,7 @@ import pytest
 import torch
 from sgl_kernel.scalar_type import scalar_types
 
-from sglang.jit_kernel.awq_marlin_repack import (
+from sglang.kernels.ops.quantization.awq_marlin_repack import (
     awq_marlin_repack as jit_awq_marlin_repack,
 )
 from sglang.srt.layers.quantization.utils import pack_cols, quantize_weights
@@ -13,7 +13,6 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_marlin_utils import get_weight_perm, marlin_weights
 
 register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-large")
-register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
 
 
 def _has_aot_awq_marlin_repack() -> bool:

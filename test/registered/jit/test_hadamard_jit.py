@@ -7,7 +7,7 @@ import torch
 import torch.nn.functional as F
 from scipy.linalg import hadamard
 
-from sglang.jit_kernel.hadamard import (
+from sglang.kernels.ops.attention.hadamard import (
     hadamard_transform,
     hadamard_transform_12n,
     hadamard_transform_20n,
@@ -17,7 +17,6 @@ from sglang.jit_kernel.hadamard import (
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=128, stage="base-b-kernel-unit", runner_config="1-gpu-large")
-register_cuda_ci(est_time=512, suite="nightly-kernel-1-gpu", nightly=True)
 
 # Exact M×N Hadamard matrices (±1 entries) copied from
 # python/sglang/jit_kernel/csrc/fast-hadamard-transform/code_gen.py.

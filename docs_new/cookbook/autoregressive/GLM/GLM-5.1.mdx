@@ -30,6 +30,10 @@ import { GLM51Deployment } from '/src/snippets/autoregressive/glm-51-deployment.
 
 <GLM51Deployment />
 
+<Warning>
+  All recipes here run the DSA indexer top-k on the default `--dsa-topk-backend sgl-kernel`. Other top-k backend choices have not been fully validated on GLM-5.1.
+</Warning>
+
 ### 3.2 Configuration Tips
 
 - Speculative decoding (MTP) can significantly reduce latency for interactive use cases.

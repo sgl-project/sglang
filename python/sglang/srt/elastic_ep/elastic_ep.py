@@ -3,15 +3,39 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
-from typing import Iterator, List, Optional
+from typing import TYPE_CHECKING, Callable, Iterator, List, Optional
 
 import torch
 
-from sglang.srt.distributed import parallel_state
+from sglang.srt.distributed import get_world_group, parallel_state
+from sglang.srt.distributed.utils import get_global_tcp_store
+from sglang.srt.eplb.expert_location import broadcast_global_expert_location_metadata
 from sglang.srt.managers.schedule_batch import ServerArgs
-from sglang.srt.utils import is_cpu, is_cuda
+from sglang.srt.utils import broadcast_pyobj, is_cpu, is_cuda
+
+if TYPE_CHECKING:
+    from sglang.srt.eplb.eplb_manager import EPLBManager
 
 logger = logging.getLogger(__name__)
+
+_SCALE_COHORT_KEY_PREFIX = "elastic_ep/scale_cohort"
+
+
+def register_scale_cohort(rank_offset: int, target_ep_size: int) -> None:
+    store = get_global_tcp_store()
+    if store is None:
+        raise RuntimeError("Elastic EP scale-up requires the global TCPStore.")
+    store.set(f"{_SCALE_COHORT_KEY_PREFIX}/{rank_offset}", str(target_ep_size).encode())
+
+
+def get_scale_cohort_target(rank_offset: int) -> Optional[int]:
+    store = get_global_tcp_store()
+    if store is None:
+        return None
+    key = f"{_SCALE_COHORT_KEY_PREFIX}/{rank_offset}"
+    if not store.check([key]):
+        return None
+    return int(store.get(key).decode())
 
 
 @dataclass
@@ -19,6 +43,14 @@ class ElasticEPState:
     active_ranks: Optional[torch.Tensor]
     last_active_ranks: Optional[torch.Tensor]
     active_ranks_cpu: Optional[torch.Tensor]
+    effective_ep_size: int = 0
+    pending_ep_size: Optional[int] = None
+    scale_phase: str = "idle"
+    last_error: Optional[str] = None
+    pending_since: Optional[float] = None
+    original_ep_size: int = 0
+    has_scaled: bool = False
+    ep_join_rank_offset: int = 0
 
     def is_active_equal_last(self) -> bool:
         return torch.equal(self.active_ranks, self.last_active_ranks)
@@ -33,13 +65,16 @@ class ElasticEPState:
 
     def reset(self):
         if self.active_ranks is not None:
-            self.active_ranks.fill_(1)
+            # Reserved slots stay inactive until their ranks join.
+            self.active_ranks.zero_()
+            self.active_ranks[: self.effective_ep_size] = 1
             self.snapshot_active_to_last()
             self.sync_active_to_cpu()
 
 
 class ElasticEPStateManager:
     _instance: Optional[ElasticEPState] = None
+    _on_scale: Optional[Callable[[int, int], None]] = None
 
     @classmethod
     def instance(cls) -> ElasticEPState:
@@ -51,15 +86,52 @@ class ElasticEPStateManager:
             return cls._instance
 
         if server_args.elastic_ep_backend is not None:
-            cls._instance = cls._build_state(ep_size=None, device=None)
-            if server_args.elastic_ep_rejoin:
-                # Mask out peer ranks to perform cuda graph capture on its own
-                cls._instance.active_ranks.zero_()
-                cls._instance.active_ranks[torch.distributed.get_rank()] = 1
-                cls._instance.snapshot_active_to_last()
-                cls._instance.sync_active_to_cpu()
+            world_size = torch.distributed.get_world_size()
+            active_rank_capacity = server_args.max_ep_size or world_size
+            assert active_rank_capacity >= world_size, (
+                f"--max-ep-size ({active_rank_capacity}) must be >= "
+                f"world_size ({world_size})."
+            )
+
+            inst = cls._build_state(ep_size=active_rank_capacity, device=None)
+            inst.effective_ep_size = world_size
+            inst.original_ep_size = world_size
+            if active_rank_capacity > world_size:
+                inst.active_ranks[world_size:].zero_()
+                inst.snapshot_active_to_last()
+                inst.sync_active_to_cpu()
+
+            if server_args.moe_a2a_backend == "nixl":
+                cls._on_scale = cls._on_scale_nixl
+
+            inst.ep_join_rank_offset = server_args.ep_join_rank_offset
+            if server_args.is_ep_joiner:
+                cls._init_joiner_state(inst, server_args)
+
+            cls._instance = inst
 
         return cls._instance
+
+    @classmethod
+    def _init_joiner_state(cls, inst: ElasticEPState, server_args: ServerArgs) -> None:
+        global_rank = torch.distributed.get_rank()
+        inst.active_ranks.zero_()
+        inst.active_ranks[global_rank] = 1
+        inst.snapshot_active_to_last()
+        inst.sync_active_to_cpu()
+
+        if server_args.ep_join_mode == "scale":
+            inst.effective_ep_size = (
+                server_args.ep_join_rank_offset + server_args.tp_size
+            )
+            inst.original_ep_size = (
+                server_args.elastic_ep_initial_size or server_args.ep_join_rank_offset
+            )
+            inst.has_scaled = True
+        else:
+            world_size = torch.distributed.get_world_size()
+            inst.effective_ep_size = world_size
+            inst.original_ep_size = world_size
 
     @staticmethod
     def _select_device() -> torch.device:
@@ -90,17 +162,178 @@ class ElasticEPStateManager:
 
         return torch.ones(size, dtype=torch.int32, device=dev)
 
+    @classmethod
+    def request_scale(cls, n: int) -> bool:
+        inst = cls._instance
+        if inst is None:
+            return False
+        if (
+            inst.pending_ep_size is not None
+            or inst.scale_phase == "recovery_unsupported"
+        ):
+            return False
+        inst.pending_ep_size = n
+        inst.scale_phase = "waiting_for_cohort"
+        inst.last_error = None
+        inst.pending_since = time.monotonic()
+        return True
 
-# ---------------------------------------------------------------------------
-# Helpers for elastic EP recovery
-# ---------------------------------------------------------------------------
+    @classmethod
+    def begin_scale(cls) -> bool:
+        inst = cls._instance
+        if (
+            inst is None
+            or inst.pending_ep_size is None
+            or inst.scale_phase != "waiting_for_cohort"
+        ):
+            return False
+        inst.scale_phase = "pending"
+        return True
+
+    @classmethod
+    def mark_joining(cls) -> None:
+        cls._mark_phase("joining")
+
+    @classmethod
+    def mark_configuring_data_plane(cls) -> None:
+        cls._mark_phase("configuring_data_plane")
+
+    @classmethod
+    def mark_syncing_new_world(cls) -> None:
+        cls._mark_phase("syncing_new_world")
+
+    @classmethod
+    def _mark_phase(cls, phase: str) -> None:
+        inst = cls._instance
+        if inst is not None and inst.pending_ep_size is not None:
+            inst.scale_phase = phase
+
+    @classmethod
+    def commit_scale(cls) -> None:
+        inst = cls._instance
+        if inst is None or inst.pending_ep_size is None:
+            return
+        inst.effective_ep_size = inst.pending_ep_size
+        inst.pending_ep_size = None
+        inst.has_scaled = True
+        inst.scale_phase = "serving_expanded"
+        inst.last_error = None
+        inst.pending_since = None
+        inst.reset()
+
+    @classmethod
+    def fail_scale(cls, error: str) -> None:
+        inst = cls._instance
+        if inst is None:
+            return
+        inst.pending_ep_size = None
+        inst.scale_phase = "failed"
+        inst.last_error = error
+        inst.pending_since = None
+        inst.reset()
+
+    @classmethod
+    def fail_recovery(cls, error: str) -> None:
+        inst = cls._instance
+        if inst is None:
+            return
+        inst.scale_phase = "recovery_unsupported"
+        inst.last_error = error
+
+    @classmethod
+    def get_effective_ep_size(cls) -> int:
+        inst = cls._instance
+        assert inst is not None, "Elastic EP state is not initialized."
+        return inst.effective_ep_size
+
+    @classmethod
+    def get_pending_ep_size(cls) -> Optional[int]:
+        inst = cls._instance
+        if inst is None:
+            return None
+        return inst.pending_ep_size
+
+    @classmethod
+    def get_scale_phase(cls) -> str:
+        inst = cls._instance
+        if inst is None:
+            return "disabled"
+        return inst.scale_phase
+
+    @classmethod
+    def get_last_error(cls) -> Optional[str]:
+        inst = cls._instance
+        if inst is None:
+            return None
+        return inst.last_error
+
+    @classmethod
+    def get_ep_join_rank_offset(cls) -> int:
+        inst = cls._instance
+        if inst is None:
+            return 0
+        return inst.ep_join_rank_offset
+
+    @classmethod
+    def on_scale(cls, from_ep_size: int, to_ep_size: int) -> None:
+        if cls._on_scale is not None:
+            cls._on_scale(from_ep_size, to_ep_size)
+
+    @staticmethod
+    def _on_scale_nixl(from_ep_size: int, to_ep_size: int) -> None:
+        from sglang.srt.layers.moe.token_dispatcher.nixl import NixlEPBuffer
+
+        NixlEPBuffer.on_scale(from_ep_size, to_ep_size)
+
+    @classmethod
+    def is_scaling(cls) -> bool:
+        """Return whether a scale or recovery operation is pending.
+
+        The CPU snapshot is authoritative because rank polling uses it too.
+        """
+        inst = cls._instance
+        if inst is None or inst.active_ranks_cpu is None:
+            return False
+        if inst.scale_phase == "recovery_unsupported":
+            return False
+        if inst.pending_ep_size is not None:
+            return True
+        active_count = int(inst.active_ranks_cpu[: inst.effective_ep_size].sum().item())
+        return active_count < inst.effective_ep_size
+
+
+def elastic_expanded_world_enabled() -> bool:
+    """Return whether execution uses ranks admitted after server launch.
+
+    Launch-time TP groups exclude ranks admitted during scale-up.
+    """
+    from sglang.srt.runtime_context import get_server_args
+
+    inst = ElasticEPStateManager.instance()
+    if inst is None:
+        return False
+    sa = get_server_args()
+    if sa.max_ep_size is None:
+        return False
+    active_target_size = inst.effective_ep_size
+    if inst.pending_ep_size is not None and inst.scale_phase in (
+        "configuring_data_plane",
+        "syncing_new_world",
+    ):
+        active_target_size = inst.pending_ep_size
+
+    return active_target_size > inst.original_ep_size
+
+
+def _refresh_ep_members() -> None:
+    from sglang.srt.layers.moe.token_dispatcher.mooncake import EPBuffer
+
+    buffer = EPBuffer.get_existing_buffer()
+    if buffer is not None:
+        buffer.update_ep_member()
 
 
 _PEER_STATE_POLL_INTERVAL_SEC = 0.01
-
-
-def _get_process_group_backend(process_group, device: str):
-    return process_group
 
 
 def _iter_live_parallel_groups() -> Iterator[parallel_state.GroupCoordinator]:
@@ -109,20 +342,17 @@ def _iter_live_parallel_groups() -> Iterator[parallel_state.GroupCoordinator]:
         group = group_ref()
         if group is not None:
             groups.append(group)
-    for group in sorted(groups, key=lambda x: x.unique_name):
-        yield group
+    yield from sorted(groups, key=lambda group: group.unique_name)
 
 
 def _map_global_to_group_local_ranks(
     group_ranks: List[int], global_ranks: List[int]
 ) -> List[int]:
-    rank_to_local = {rank: idx for idx, rank in enumerate(group_ranks)}
+    rank_to_local = {rank: index for index, rank in enumerate(group_ranks)}
     return [rank_to_local[rank] for rank in global_ranks if rank in rank_to_local]
 
 
 def _wait_for_peer_state(mooncake_ep, backend, ranks: List[int]) -> None:
-    # Relaunched ranks become recoverable asynchronously, so we poll until the
-    # target backend reports all requested peers as ready.
     while not all(mooncake_ep.get_peer_state(backend, ranks)):
         time.sleep(_PEER_STATE_POLL_INTERVAL_SEC)
 
@@ -138,66 +368,155 @@ def _maybe_create_message_queue(group) -> None:
     )
 
 
-def _refresh_ep_members() -> None:
-    from sglang.srt.layers.moe.token_dispatcher.mooncake import EPBuffer
+def _try_recover_world(global_ranks: List[int]) -> bool:
+    from mooncake import ep as mooncake_ep
 
-    EPBuffer.get_existing_buffer().update_ep_member()
+    world_backend = torch.distributed.group.WORLD
+    if not all(mooncake_ep.get_peer_state(world_backend, global_ranks)):
+        return False
+
+    mooncake_ep.recover_ranks(world_backend, global_ranks)
+    logger.debug("[Elastic EP][recover] WORLD recover_ranks(%s) done", global_ranks)
+    return True
+
+
+def try_admit_scale_ranks(global_ranks: List[int]) -> bool:
+    """Admit append-only ranks into the expandable WORLD group."""
+    if not _try_recover_world(global_ranks):
+        return False
+
+    _refresh_ep_members()
+    return True
 
 
 def try_recover_ranks(global_ranks: List[int]) -> bool:
-    from mooncake import ep as mooncake_ep
-
-    world_backend = _get_process_group_backend(torch.distributed.group.WORLD, "cuda")
-    if not all(mooncake_ep.get_peer_state(world_backend, global_ranks)):
-        # The relaunched ranks have not finished initializing yet.
+    """Recover ranks in WORLD and every launch-time parallel group."""
+    if not _try_recover_world(global_ranks):
         return False
 
-    # Recover the world backend first, then recover each derived process group
-    # using ranks mapped into that group's local rank space.
-    mooncake_ep.recover_ranks(world_backend, global_ranks)
+    from mooncake import ep as mooncake_ep
 
     for group in _iter_live_parallel_groups():
-        group_local_ranks = _map_global_to_group_local_ranks(group.ranks, global_ranks)
-        if not group_local_ranks:
+        local_ranks = _map_global_to_group_local_ranks(group.ranks, global_ranks)
+        if not local_ranks:
             continue
 
-        device_backend = _get_process_group_backend(group.device_group, "cuda")
-        _wait_for_peer_state(mooncake_ep, device_backend, group_local_ranks)
-        mooncake_ep.recover_ranks(device_backend, group_local_ranks)
-
-        cpu_backend = _get_process_group_backend(group.cpu_group, "cpu")
-        _wait_for_peer_state(mooncake_ep, cpu_backend, group_local_ranks)
-        mooncake_ep.recover_ranks(cpu_backend, group_local_ranks)
+        _wait_for_peer_state(mooncake_ep, group.device_group, local_ranks)
+        mooncake_ep.recover_ranks(group.device_group, local_ranks)
+        _wait_for_peer_state(mooncake_ep, group.cpu_group, local_ranks)
+        mooncake_ep.recover_ranks(group.cpu_group, local_ranks)
         _maybe_create_message_queue(group)
 
     _refresh_ep_members()
     return True
 
 
-def join_process_groups():
+def _join_world_group() -> None:
     from mooncake import ep as mooncake_ep
 
-    def join_backend(label: str, backend) -> None:
-        logger.info("Recovered rank joining Mooncake backend %s", label)
-        mooncake_ep.join_group(backend)
+    mooncake_ep.join_group(torch.distributed.group.WORLD)
 
-    join_backend(
-        "default_world",
-        _get_process_group_backend(torch.distributed.group.WORLD, "cuda"),
-    )
 
+def join_scale_process_group() -> None:
+    """Join the expandable WORLD group for an append-only scale operation."""
+    _join_world_group()
+    _refresh_ep_members()
+
+
+def join_process_groups() -> None:
+    """Rejoin WORLD and every launch-time parallel group after recovery."""
+    from mooncake import ep as mooncake_ep
+
+    _join_world_group()
     for group in _iter_live_parallel_groups():
         if group.world_size <= 1:
             continue
-
-        join_backend(
-            f"{group.unique_name}:device",
-            _get_process_group_backend(group.device_group, "cuda"),
-        )
-        join_backend(
-            f"{group.unique_name}:cpu",
-            _get_process_group_backend(group.cpu_group, "cpu"),
-        )
+        mooncake_ep.join_group(group.device_group)
+        mooncake_ep.join_group(group.cpu_group)
         _maybe_create_message_queue(group)
 
     _refresh_ep_members()
+
+
+def get_healthy_expert_location_src_rank(
+    *, invoked_in_elastic_ep_rejoin_path: bool
+) -> int:
+    world_group = get_world_group()
+    # NOTE: do not key off `get_exec().moe.elastic_ep_rejoin` here.
+    # A rank that was started as a rejoin rank may later act as a healthy
+    # rank in a subsequent recovery cycle.
+    local_rejoin_flag = bool(invoked_in_elastic_ep_rejoin_path)
+    gathered_rejoin_flags = world_group.all_gather_object(local_rejoin_flag)
+
+    for rank_in_group, is_rejoin_rank in enumerate(gathered_rejoin_flags):
+        if not is_rejoin_rank:
+            return world_group.ranks[rank_in_group]
+
+    raise RuntimeError(
+        "No healthy rank found for broadcasting expert location metadata. "
+        "All ranks are marked as elastic_ep_rejoin."
+    )
+
+
+def maybe_recover_ep_ranks(
+    *,
+    tp_group: parallel_state.GroupCoordinator,
+    eplb_manager: EPLBManager,
+    random_seed: int,
+) -> bool:
+    # TODO(perf): `active_ranks.all()` on a CUDA tensor triggers host-device
+    # synchronization, and this function is on the forward-path.
+    # This check only runs when `--elastic-ep-backend` is enabled, so the
+    # synchronization overhead does not propagate to other configs.
+    # Leave for future optimization of the elastic EP path.
+    if tp_group.active_ranks.all() and tp_group.active_ranks_cpu.all():
+        return False
+
+    tp_active_ranks = tp_group.active_ranks.detach().cpu().numpy()
+    tp_active_ranks_cpu = tp_group.active_ranks_cpu.detach().numpy()
+    tp_active_ranks &= tp_active_ranks_cpu
+    # NOTE: `ranks_to_recover` uses indices in `tp_group`. For the current
+    # Mooncake elastic EP implementation we assume `--pp-size=1`, so the
+    # tp-group index is the same as the global rank index.
+    ranks_to_recover = [
+        i for i in range(len(tp_active_ranks)) if not tp_active_ranks[i]
+    ]
+
+    # try_recover_ranks polls peer state via Mooncake EP backend.
+    # Mooncake's internal semantics guarantee that all ranks observe
+    # consistent peer readiness state, so collective operations below
+    # are safe even though polling appears local.
+    if ranks_to_recover and try_recover_ranks(ranks_to_recover):
+        eplb_manager.reset_generator()
+        broadcast_global_expert_location_metadata(
+            src_rank=get_healthy_expert_location_src_rank(
+                invoked_in_elastic_ep_rejoin_path=False
+            )
+        )
+        ElasticEPStateManager.instance().reset()
+        broadcast_pyobj(
+            [random_seed],
+            parallel_state.get_world_group().rank,
+            parallel_state.get_world_group().cpu_group,
+            src=parallel_state.get_world_group().ranks[0],
+        )
+        logger.info(f"recover ranks {ranks_to_recover} done")
+        return True
+
+    return False
+
+
+def maybe_rebalance_after_rank_fault(*, eplb_manager: EPLBManager) -> bool:
+    elastic_ep_state = ElasticEPStateManager.instance()
+    if elastic_ep_state is None or elastic_ep_state.is_active_equal_last():
+        return False
+    elastic_ep_state.snapshot_active_to_last()
+    elastic_ep_state.sync_active_to_cpu()
+    logger.info("EPLB due to rank faults")
+    gen = eplb_manager.rebalance()
+    while True:
+        try:
+            next(gen)
+        except StopIteration:
+            break
+    return True

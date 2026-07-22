@@ -24,11 +24,6 @@ class NPUACLFormat(IntEnum):
     ACL_FORMAT_FRACTAL_NZ = 29
 
 
-class FusedMoEMode(IntEnum):
-    FUSED_DEEP_MOE = 1
-    DISPATCH_FFN_COMBINE = 2
-
-
 def _call_once(fn: Callable):
 
     @functools.wraps(fn)

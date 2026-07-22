@@ -5,24 +5,29 @@ import sys
 import pytest
 import torch
 
-from sglang.jit_kernel.dsv4 import (
+from sglang.kernels.ops.attention.deepseek_v4_rope import (
+    apply_rotary_emb_triton,
+    precompute_freqs_cis,
+)
+from sglang.kernels.ops.attention.dsv4 import (
     CompressorDecodePlan,
     compress_norm_rope_store,
     fused_q_indexer_rope_hadamard_fp4_quant,
 )
-from sglang.jit_kernel.hadamard import hadamard_transform
-from sglang.srt.layers.attention.dsv4.fp4_indexer import (
+from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
     quantize_fp4_indexer_tensor,
     store_fp4_index_k_cache,
 )
-from sglang.srt.layers.deepseek_v4_rope import (
-    apply_rotary_emb_triton,
-    precompute_freqs_cis,
-)
+from sglang.srt.utils import get_device, is_xpu
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-large")
-register_cuda_ci(est_time=60, suite="nightly-kernel-1-gpu", nightly=True)
+
+_is_xpu = is_xpu()
+if _is_xpu:
+    from sgl_kernel import hadamard_transform
+else:
+    from sglang.kernels.ops.attention.hadamard import hadamard_transform
 
 HEAD_DIM = 128
 FP4_DIM = HEAD_DIM // 2
@@ -97,10 +102,10 @@ def _ref_store_fp4_index_cache(
 @pytest.mark.parametrize("num_tokens", [1, 7, 96])
 def test_quantize_fp4_indexer_tensor(num_tokens: int) -> None:
     torch.manual_seed(num_tokens)
-    x = torch.randn(num_tokens, HEAD_DIM, device="cuda", dtype=torch.bfloat16)
+    x = torch.randn(num_tokens, HEAD_DIM, device=get_device(), dtype=torch.bfloat16)
     x[0, :8] = torch.tensor(
         [-8.0, -6.0, -3.0, -1.5, 0.0, 0.5, 2.0, 8.0],
-        device="cuda",
+        device=get_device(),
         dtype=torch.bfloat16,
     )
 
@@ -115,14 +120,14 @@ def test_quantize_fp4_indexer_tensor(num_tokens: int) -> None:
 def test_fp4_index_cache_store_layout(num_tokens: int) -> None:
     torch.manual_seed(num_tokens)
     num_pages = max(1, (num_tokens + PAGE_SIZE - 1) // PAGE_SIZE)
-    x = torch.randn(num_tokens, HEAD_DIM, device="cuda", dtype=torch.bfloat16)
-    loc = torch.randperm(num_pages * PAGE_SIZE, device="cuda")[:num_tokens].to(
+    x = torch.randn(num_tokens, HEAD_DIM, device=get_device(), dtype=torch.bfloat16)
+    loc = torch.randperm(num_pages * PAGE_SIZE, device=get_device())[:num_tokens].to(
         torch.int64
     )
     cache = torch.zeros(
         num_pages,
         PAGE_SIZE * (FP4_DIM + SCALE_BYTES),
-        device="cuda",
+        device=get_device(),
         dtype=torch.uint8,
     )
 
@@ -138,24 +143,24 @@ def test_fp4_fused_norm_rope_store_layout(num_tokens: int) -> None:
     torch.manual_seed(num_tokens + 100)
     num_pages = max(1, (num_tokens + PAGE_SIZE - 1) // PAGE_SIZE)
     compress_ratio = 4
-    kv = torch.randn(num_tokens, HEAD_DIM, device="cuda", dtype=torch.bfloat16)
-    norm_weight = torch.randn(HEAD_DIM, device="cuda", dtype=torch.bfloat16)
+    kv = torch.randn(num_tokens, HEAD_DIM, device=get_device(), dtype=torch.bfloat16)
+    norm_weight = torch.randn(HEAD_DIM, device=get_device(), dtype=torch.bfloat16)
     seq_lens = (
-        torch.arange(1, num_tokens + 1, device="cuda", dtype=torch.int64)
+        torch.arange(1, num_tokens + 1, device=get_device(), dtype=torch.int64)
         * compress_ratio
     )
-    req_pool_indices = torch.arange(num_tokens, device="cuda", dtype=torch.int64)
+    req_pool_indices = torch.arange(num_tokens, device=get_device(), dtype=torch.int64)
     plan = CompressorDecodePlan.generate_legacy(
         compress_ratio, req_pool_indices, seq_lens
     )
-    loc = torch.arange(num_tokens, device="cuda", dtype=torch.int64)
+    loc = torch.arange(num_tokens, device=get_device(), dtype=torch.int64)
     freqs_cis = precompute_freqs_cis(
         64, int(seq_lens.max().item()) + 1, 0, 10000, 1, 32, 1
-    ).to("cuda")
+    ).to(get_device())
     cache = torch.zeros(
         num_pages,
         PAGE_SIZE * (FP4_DIM + SCALE_BYTES),
-        device="cuda",
+        device=get_device(),
         dtype=torch.uint8,
     )
 
@@ -195,6 +200,10 @@ def test_fp4_fused_norm_rope_store_layout(num_tokens: int) -> None:
     torch.testing.assert_close(cache, expected)
 
 
+@pytest.mark.skipif(
+    _is_xpu,
+    reason="fused_q_indexer_rope_hadamard_fp4_quant is not supported by Intel GPU",
+)
 @pytest.mark.parametrize("batch_size", [1, 5, 17])
 def test_fp4_fused_q_indexer_rope_hadamard_quant(batch_size: int) -> None:
     torch.manual_seed(batch_size + 200)
@@ -202,11 +211,15 @@ def test_fp4_fused_q_indexer_rope_hadamard_quant(batch_size: int) -> None:
     rope_dim = 64
     weight_scale = HEAD_DIM**-0.5 * num_heads**-0.5
     q = torch.randn(
-        batch_size, num_heads, HEAD_DIM, device="cuda", dtype=torch.bfloat16
+        batch_size, num_heads, HEAD_DIM, device=get_device(), dtype=torch.bfloat16
     )
-    weight = torch.randn(batch_size, num_heads, device="cuda", dtype=torch.bfloat16)
-    positions = (torch.arange(batch_size, device="cuda", dtype=torch.int32) * 7) % 63
-    freqs_cis = precompute_freqs_cis(rope_dim, 64, 0, 10000, 1, 32, 1).to("cuda")
+    weight = torch.randn(
+        batch_size, num_heads, device=get_device(), dtype=torch.bfloat16
+    )
+    positions = (
+        torch.arange(batch_size, device=get_device(), dtype=torch.int32) * 7
+    ) % 63
+    freqs_cis = precompute_freqs_cis(rope_dim, 64, 0, 10000, 1, 32, 1).to(get_device())
 
     (q_fp4, q_sf), weights_out = fused_q_indexer_rope_hadamard_fp4_quant(
         q, weight, weight_scale, freqs_cis, positions

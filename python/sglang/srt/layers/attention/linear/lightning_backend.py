@@ -3,15 +3,15 @@ import math
 
 import torch
 
-from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
-from sglang.srt.layers.attention.linear.lightning_attn import (
+from sglang.kernels.ops.attention.linear.lightning_attn import (
     BailingLinearKernel,
     linear_decode_forward_triton,
 )
+from sglang.kernels.ops.attention.linear.seg_la import SegLaMeta, seg_la_fwd
+from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
 from sglang.srt.layers.attention.linear.linear_metadata import (
     BailingLinearMetadata,
 )
-from sglang.srt.layers.attention.linear.seg_la import SegLaMeta, seg_la_fwd
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
@@ -64,7 +64,12 @@ class LightningAttentionBackend(MambaAttnBackendBase):
         self.device = model_runner.device
         self.decode_cuda_graph_metadata = {}
         self.kv_cache_dtype = model_runner.kv_cache_dtype
-        self.kv_cache_dtype_str = model_runner.server_args.kv_cache_dtype
+
+        self.kv_cache_dtype_str = getattr(
+            model_runner,
+            "kv_cache_dtype_str",
+            model_runner.server_args.kv_cache_dtype,
+        )
         self.BLOCK = (
             model_runner.model_config.block
             if hasattr(model_runner.model_config, "block")

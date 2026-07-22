@@ -6,7 +6,7 @@ import sys
 import pytest
 import torch
 
-from sglang.jit_kernel.dsa import cutedsl_paged_mqa_logits, pick_dsl_expand
+from sglang.kernels.ops.attention.dsa import cutedsl_paged_mqa_logits, pick_dsl_expand
 from sglang.srt.layers.attention.dsa.utils import (
     fp8_mqa_logits_ceil_to_ue8m0,
     fp8_mqa_logits_make_fused_kv,

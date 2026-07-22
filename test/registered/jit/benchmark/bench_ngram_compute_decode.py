@@ -7,7 +7,7 @@ from sglang.jit_kernel.benchmark.utils import (
     get_benchmark_range,
     run_benchmark_no_cudagraph,
 )
-from sglang.jit_kernel.ngram_embedding import (
+from sglang.kernels.ops.speculative.ngram_embedding import (
     compute_n_gram_ids,
     compute_n_gram_ids_decode,
 )

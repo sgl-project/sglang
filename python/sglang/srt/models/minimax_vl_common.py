@@ -14,18 +14,17 @@ from sglang.srt.layers.attention.vision import (
     FLASHINFER_MAX_SEQLEN_BUCKETS,
     FLASHINFER_WORKSPACE_SIZE_BYTES,
     VisionAttention,
+    VisionAttentionMetadata,
+    prepare_vision_attention_metadata,
 )
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
-from sglang.srt.layers.linear import (
-    ColumnParallelLinear,
-    RowParallelLinear,
-)
+from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.rotary_embedding.utils import rotate_half
 from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import get_mm, get_parallel
 from sglang.srt.utils import add_prefix, get_compiler_backend, round_up
 
 logger = logging.getLogger(__name__)
@@ -305,6 +304,7 @@ class CLIPEncoderLayer(nn.Module):
         rotary_pos_emb: torch.Tensor,
         max_seqlen: Optional[int] = None,
         sequence_lengths: Optional[torch.Tensor] = None,
+        forward_metadata: Optional[VisionAttentionMetadata] = None,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.layer_norm1(hidden_states)
@@ -314,6 +314,7 @@ class CLIPEncoderLayer(nn.Module):
             position_embeddings=rotary_pos_emb,
             max_seqlen=max_seqlen,
             sequence_lengths=sequence_lengths,
+            forward_metadata=forward_metadata,
         )
         hidden_states = residual + hidden_states
 
@@ -361,6 +362,7 @@ class CLIPEncoder(nn.Module):
         rotary_pos_emb: torch.Tensor,
         max_seqlen: Optional[int] = None,
         sequence_lengths: Optional[torch.Tensor] = None,
+        forward_metadata: Optional[VisionAttentionMetadata] = None,
     ) -> torch.Tensor:
         hidden_states = inputs_embeds
         cos_sin = _prepare_rotary_cos_sin(rotary_pos_emb)
@@ -372,6 +374,7 @@ class CLIPEncoder(nn.Module):
                 cos_sin,
                 max_seqlen=max_seqlen,
                 sequence_lengths=sequence_lengths,
+                forward_metadata=forward_metadata,
             )
 
         return hidden_states
@@ -407,7 +410,7 @@ class MiniMaxVLVisionTransformer(nn.Module):
 
         workspace_buffer: Optional[torch.Tensor] = None
         if (
-            get_server_args().mm_attention_backend == "flashinfer_cudnn"
+            get_mm().mm_attention_backend == "flashinfer_cudnn"
             and torch.cuda.is_available()
         ):
             workspace_buffer = torch.empty(
@@ -673,12 +676,24 @@ class MiniMaxVLVisionTransformer(nn.Module):
         max_seqlen: Optional[int] = None
         sequence_lengths: Optional[torch.Tensor] = None
         encoder_cu_seq_len = cu_seq_len
-        if get_server_args().mm_attention_backend == "flashinfer_cudnn":
+        if get_mm().mm_attention_backend == "flashinfer_cudnn":
             (
                 encoder_cu_seq_len,
                 sequence_lengths,
                 max_seqlen,
             ) = self._build_flashinfer_cudnn_inputs(cu_seq_len)
+
+        forward_metadata = prepare_vision_attention_metadata(
+            cu_seq_len,
+            device=hidden_states.device,
+            packed_indptrs=(
+                encoder_cu_seq_len
+                if get_mm().mm_attention_backend == "flashinfer_cudnn"
+                else None
+            ),
+            sequence_lengths=sequence_lengths,
+            flashinfer_max_seqlen=max_seqlen,
+        )
 
         return self.encoder(
             inputs_embeds=hidden_states,
@@ -686,6 +701,7 @@ class MiniMaxVLVisionTransformer(nn.Module):
             rotary_pos_emb=rotary_pos_emb,
             max_seqlen=max_seqlen,
             sequence_lengths=sequence_lengths,
+            forward_metadata=forward_metadata,
         )
 
 
@@ -704,7 +720,7 @@ class MiniMaxVLVisionModel(nn.Module):
         self.config = config
         self.quant_config = quant_config
 
-        self.use_data_parallel = get_server_args().mm_enable_dp_encoder
+        self.use_data_parallel = get_mm().mm_enable_dp_encoder
         self.vision_config = config
 
         self.vision_model = MiniMaxVLVisionTransformer(

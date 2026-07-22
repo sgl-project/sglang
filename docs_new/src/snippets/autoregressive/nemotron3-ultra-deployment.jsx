@@ -251,7 +251,7 @@ export const Nemotron3UltraDeployment = () => {
       }
     }
 
-    cmd += `  --mamba-scheduler-strategy extra_buffer \\\n`;
+    cmd += `  --mamba-radix-cache-strategy extra_buffer \\\n`;
     if (['b200', 'gb200', 'b300', 'gb300'].includes(hardware)) {
       cmd += `  --attention-backend trtllm_mha \\\n`;
     }

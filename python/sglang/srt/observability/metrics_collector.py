@@ -109,6 +109,8 @@ class SchedulerStats:
     # Speculative decoding
     spec_accept_length: float = 0.0
     spec_accept_rate: float = 0.0
+    spec_cap_length: float = 0.0
+    spec_block_accept_length: float = 0.0
     # Adaptive speculative decoding (currently active tier).
     spec_num_steps: int = 0
     spec_num_draft_tokens: int = 0
@@ -420,6 +422,18 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self.spec_accept_rate = Gauge(
             name="sglang:spec_accept_rate",
             documentation="Speculative acceptance rate (`accepted drafts / proposed drafts` in batch).",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.spec_cap_length = Gauge(
+            name="sglang:spec_cap_length",
+            documentation="Mean DSpark confidence-scheduled verify window per verify step, incl the bonus slot (0 when no cap is scheduled).",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.spec_block_accept_length = Gauge(
+            name="sglang:spec_block_accept_length",
+            documentation="Mean uncapped full-block accept length per verify step (accept + cap-trimmed drafts; exact only in DSpark cap-accept mode).",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -1287,6 +1301,8 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         # Speculative decoding
         self._log_gauge(self.spec_accept_length, stats.spec_accept_length)
         self._log_gauge(self.spec_accept_rate, stats.spec_accept_rate)
+        self._log_gauge(self.spec_cap_length, stats.spec_cap_length)
+        self._log_gauge(self.spec_block_accept_length, stats.spec_block_accept_length)
         self._log_gauge(self.spec_num_steps, stats.spec_num_steps)
         self._log_gauge(self.spec_num_draft_tokens, stats.spec_num_draft_tokens)
 
@@ -1918,7 +1934,7 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
 
         self.load_back_duration_seconds = Histogram(
             name="sglang:load_back_duration_seconds",
-            documentation="Time taken to load memory from CPU to GPU in seconds.",
+            documentation="Time taken to load KV cache from CPU back to GPU in seconds.",
             labelnames=labels.keys(),
             buckets=bucket_load_back_duration,
         )

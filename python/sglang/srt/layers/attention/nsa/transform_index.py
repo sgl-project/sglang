@@ -3,8 +3,8 @@ import warnings
 
 warnings.warn(
     "sglang.srt.layers.attention.nsa.transform_index is deprecated; "
-    "use sglang.srt.layers.attention.dsa.transform_index instead.",
+    "use sglang.kernels.ops.attention.dsa.transform_index instead.",
     DeprecationWarning,
     stacklevel=2,
 )
-from sglang.srt.layers.attention.dsa.transform_index import *  # noqa: F401, F403
+from sglang.kernels.ops.attention.dsa.transform_index import *  # noqa: F401, F403

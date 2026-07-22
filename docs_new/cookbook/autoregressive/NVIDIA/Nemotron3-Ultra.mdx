@@ -34,14 +34,10 @@ Available model variants on HuggingFace:
 
 ## 2. SGLang Installation
 
-Nemotron3-Ultra support has not yet propagated to `lmsysorg/sglang:latest` or any stable release. Pull one of the two dedicated images below — matching your CUDA version — to get a runtime with Nemotron3-Ultra support.
+Nemotron3-Ultra support is included in the latest stable release.
 
 ```bash Command
-# CUDA 13
-docker pull lmsysorg/sglang:dev-nemotron3-ultra
-
-# CUDA 12
-docker pull lmsysorg/sglang:dev-cu12-nemotron3-ultra
+docker pull lmsysorg/sglang:latest
 ```
 ## 3. Model Deployment
 
@@ -64,7 +60,7 @@ The generator only emits a runnable command for combinations that NVIDIA / SGLan
 
 - **Mamba scheduler strategy**:
 
-    Always launch with `--mamba-scheduler-strategy extra_buffer`. This hybrid Transformer-Mamba model requires the `extra_buffer` strategy for correct scheduling of its Mamba state.
+    Always launch with `--mamba-radix-cache-strategy extra_buffer`. This hybrid Transformer-Mamba model requires the `extra_buffer` strategy for correct scheduling of its Mamba state.
 
 - **Mamba backend**:
 
@@ -119,7 +115,7 @@ python3 -m sglang.launch_server \
   --model-path nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16 \
   --trust-remote-code \
   --tp 8 \
-  --mamba-scheduler-strategy extra_buffer \
+  --mamba-radix-cache-strategy extra_buffer \
   --attention-backend trtllm_mha \
   --tool-call-parser qwen3_coder \
   --reasoning-parser nemotron_3
@@ -449,7 +445,7 @@ python3 -m sglang.launch_server \
   --model-path nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4 \
   --trust-remote-code \
   --tp 4 \
-  --mamba-scheduler-strategy extra_buffer \
+  --mamba-radix-cache-strategy extra_buffer \
   --attention-backend trtllm_mha \
   --max-running-requests 1024
 ```
@@ -525,7 +521,7 @@ python3 -m sglang.launch_server \
   --model-path nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4 \
   --trust-remote-code \
   --tp 4 \
-  --mamba-scheduler-strategy extra_buffer \
+  --mamba-radix-cache-strategy extra_buffer \
   --attention-backend trtllm_mha \
   --reasoning-parser nemotron_3
 ```

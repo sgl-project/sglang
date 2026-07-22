@@ -42,15 +42,15 @@ if is_xpu():
         pass
 elif is_hip():
     try:
-        from sglang.srt.layers.quantization.awq.awq_triton import (
+        from sglang.kernels.ops.quantization.awq_triton import (
             awq_dequantize_triton as awq_dequantize,
         )
     except ImportError:
         pass
 else:
     try:
-        from sglang.jit_kernel.awq_dequantize import awq_dequantize
-        from sglang.jit_kernel.awq_marlin_repack import (
+        from sglang.kernels.ops.quantization.awq_dequantize import awq_dequantize
+        from sglang.kernels.ops.quantization.awq_marlin_repack import (
             awq_marlin_moe_repack,
             awq_marlin_repack,
         )
@@ -64,7 +64,7 @@ else:
         )
     except ImportError:
         try:
-            from sglang.srt.layers.quantization.awq.awq_triton import (
+            from sglang.kernels.ops.quantization.awq_triton import (
                 awq_dequantize_triton as awq_dequantize,
             )
         except ImportError:

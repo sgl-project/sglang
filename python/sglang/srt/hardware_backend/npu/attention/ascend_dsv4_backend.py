@@ -12,7 +12,7 @@ from sglang.srt.layers.attention.dsv4.compressor import CompressorBackendMixin
 from sglang.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
 from sglang.srt.model_executor.forward_batch_info import DSV4OutCacheLoc, ForwardMode
 from sglang.srt.model_executor.forward_context import get_attn_backend
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_spec
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -312,7 +312,7 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
         ):
             return self._forward_compress_native(compressor, x, forward_batch)
 
-        from sglang.srt.layers.deepseek_v4_rope import (
+        from sglang.kernels.ops.attention.deepseek_v4_rope import (
             get_fused_compressor_rope_cos_sin,
         )
 
@@ -649,7 +649,7 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
             # Use the same contig cache as the outer rope path; .real/.imag on a
             # complex tensor are strided views and aclnnIndex over them triggers
             # StridedSlice (see _get_contig_freqs_real_imag in deepseek_v4_rope.py).
-            from sglang.srt.layers.deepseek_v4_rope import (
+            from sglang.kernels.ops.attention.deepseek_v4_rope import (
                 _get_contig_freqs_real_imag,
             )
 
@@ -890,7 +890,7 @@ class C4IndexerAscendBackendMixin(C4IndexerBackendMixin):
     def _compute_q_npu(
         self, c4_indexer, q_lora: torch.Tensor, positions: torch.Tensor
     ) -> torch.Tensor:
-        from sglang.srt.layers.deepseek_v4_rope import v4_rope_inplace_npu
+        from sglang.kernels.ops.attention.deepseek_v4_rope import v4_rope_inplace_npu
 
         bs = q_lora.shape[0]
         q, _ = c4_indexer.wq_b(q_lora)
@@ -1052,14 +1052,14 @@ class DeepseekV4AscendAttnBackend(
         device = self.device
 
         if forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2():
-            tokens_per_bs = self.speculative_num_draft_tokens
+            tokens_per_req = self.speculative_num_draft_tokens
         else:
-            tokens_per_bs = 1
+            tokens_per_req = 1
 
         metadata.actual_seq_lengths_q_pa = torch.arange(
             0,
-            bs * tokens_per_bs + tokens_per_bs,
-            tokens_per_bs,
+            bs * tokens_per_req + tokens_per_req,
+            tokens_per_req,
             dtype=torch.int32,
             device=device,
         )
@@ -1081,7 +1081,7 @@ class DeepseekV4AscendAttnBackend(
             :bs, :
         ]
 
-        n_tok = bs * tokens_per_bs
+        n_tok = bs * tokens_per_req
         c4_pad = min(n_tok, n_tok // 4 + bs)
         c128_pad = min(n_tok, n_tok // 128 + bs)
         metadata.swa_loc = torch.zeros(n_tok, dtype=torch.int64, device=device)
@@ -1106,7 +1106,7 @@ class DeepseekV4AscendAttnBackend(
             "li_quant_metadata": self.graph_metadata["kernel_metadata_li_quant"],
         }
 
-        T = bs * tokens_per_bs
+        T = bs * tokens_per_req
         metadata.c4_topk_indices = self.graph_metadata["c4_topk_indices"][:T, :]
 
         self.forward_metadata = metadata
@@ -1126,16 +1126,16 @@ class DeepseekV4AscendAttnBackend(
         device = seq_lens.device
 
         if forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2():
-            tokens_per_bs = self.speculative_num_draft_tokens
+            tokens_per_req = self.speculative_num_draft_tokens
         else:
-            tokens_per_bs = 1
+            tokens_per_req = 1
 
         seq_lens_cpu = forward_batch.seq_lens_cpu
         assert seq_lens_cpu is not None, "V4 graph replay requires seq_lens_cpu."
         if forward_mode.is_target_verify():
             # In graph replay, buffers.seq_lens already contains the attention KV
             # length (live length + draft tokens). Padded rows therefore show up as
-            # tokens_per_bs instead of 0. Use the CPU live lengths as the source of
+            # tokens_per_req instead of 0. Use the CPU live lengths as the source of
             # truth so padded rows stay masked out.
             live_seq_lens = seq_lens_cpu[:bs].to(device=device, dtype=torch.int32)
         elif seq_lens is not None and seq_lens.device.type != "cpu":
@@ -1145,9 +1145,9 @@ class DeepseekV4AscendAttnBackend(
         attn_seq_lens = live_seq_lens
         if forward_mode.is_target_verify():
             valid_verify_rows = live_seq_lens > 0
-            attn_seq_lens = live_seq_lens + int(tokens_per_bs)
+            attn_seq_lens = live_seq_lens + int(tokens_per_req)
             attn_seq_lens = torch.where(valid_verify_rows, attn_seq_lens, live_seq_lens)
-            fm.seq_lens_cpu_int = (seq_lens_cpu[:bs] + int(tokens_per_bs)).int()
+            fm.seq_lens_cpu_int = (seq_lens_cpu[:bs] + int(tokens_per_req)).int()
             fm.seq_lens_cpu_int = torch.where(
                 seq_lens_cpu[:bs] > 0,
                 fm.seq_lens_cpu_int,
@@ -1166,8 +1166,8 @@ class DeepseekV4AscendAttnBackend(
         _compress_seq_lens = live_seq_lens
         _compress_seq_lens_max = int(seq_lens_cpu[:bs].max()) if bs > 0 else 0
         if _verify_compress:
-            _compress_seq_lens = live_seq_lens + int(tokens_per_bs)
-            _compress_seq_lens_max += int(tokens_per_bs)
+            _compress_seq_lens = live_seq_lens + int(tokens_per_req)
+            _compress_seq_lens_max += int(tokens_per_req)
 
         result = self._compute_compress_locs(
             pool=pool,
@@ -1218,7 +1218,7 @@ class DeepseekV4AscendAttnBackend(
                 _copy_1d(getattr(fm, key), result[key])
 
         if _verify_compress:
-            verify_seq_lens_cpu = seq_lens_cpu[:bs] + int(tokens_per_bs)
+            verify_seq_lens_cpu = seq_lens_cpu[:bs] + int(tokens_per_req)
             verify_seq_lens_cpu = torch.where(
                 seq_lens_cpu[:bs] > 0,
                 verify_seq_lens_cpu,
@@ -1229,19 +1229,19 @@ class DeepseekV4AscendAttnBackend(
                 fm.positions_cmp_padding_c4,
                 4,
                 verify_seq_lens_cpu,
-                n_draft=tokens_per_bs,
+                n_draft=tokens_per_req,
             )
             self._fill_verify_positions_cmp_padding_one(
                 forward_batch.positions,
                 fm.positions_cmp_padding_c128,
                 128,
                 verify_seq_lens_cpu,
-                n_draft=tokens_per_bs,
+                n_draft=tokens_per_req,
             )
             fm.start_pos.copy_(live_seq_lens.to(torch.int32))
             valid = live_seq_lens[:bs] > 0
             fm.seqused.copy_(
-                (valid.to(torch.int32) * int(tokens_per_bs)).to(device=device)
+                (valid.to(torch.int32) * int(tokens_per_req)).to(device=device)
             )
             _bundle = getattr(forward_batch, "out_cache_loc_dsv4", None)
             if _bundle is not None:
@@ -1302,7 +1302,7 @@ class DeepseekV4AscendAttnBackend(
             actual_seq_lengths_q_pa=fm.actual_seq_lengths_q_pa,
             actual_seq_lengths_kv=fm.actual_seq_lengths_kv,
             block_tables=fm.block_tables,
-            max_seqlen_q=tokens_per_bs,
+            max_seqlen_q=tokens_per_req,
             is_nextn=False,
         )
         for key in (
@@ -1362,9 +1362,8 @@ class DeepseekV4AscendAttnBackend(
             or forward_batch.forward_mode.is_draft_extend_v2()
         ):
             B = forward_batch.batch_size
-            from sglang.srt.runtime_context import get_server_args
 
-            n_draft = get_server_args().speculative_num_draft_tokens or 1
+            n_draft = get_spec().speculative_num_draft_tokens or 1
             actual_q = torch.arange(
                 n_draft, B * n_draft + 1, n_draft, dtype=torch.int32, device=device
             )
@@ -1409,9 +1408,8 @@ class DeepseekV4AscendAttnBackend(
             forward_batch.forward_mode.is_target_verify()
             or forward_batch.forward_mode.is_draft_extend_v2()
         ):
-            from sglang.srt.runtime_context import get_server_args
 
-            max_seqlen_q = get_server_args().speculative_num_draft_tokens or 1
+            max_seqlen_q = get_spec().speculative_num_draft_tokens or 1
         else:
             max_seqlen_q = 1
         return self._kernel_metadata_from_parts(

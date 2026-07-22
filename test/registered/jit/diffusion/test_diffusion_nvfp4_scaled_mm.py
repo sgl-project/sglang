@@ -4,7 +4,6 @@ import flashinfer
 import pytest
 import torch
 
-from sglang.jit_kernel.nvfp4 import cutlass_scaled_fp4_mm, scaled_fp4_quant
 from sglang.multimodal_gen.runtime.layers.quantization import (
     modelopt_quant as diffusion_modelopt_quant,
 )
@@ -241,8 +240,6 @@ def _build_layer(
 
 
 def _resolve_mode(mode: str):
-    if mode == "jit_cutlass":
-        return scaled_fp4_quant, cutlass_scaled_fp4_mm, None
     if mode == "flashinfer2":
         return flashinfer.fp4_quantize, flashinfer.mm_fp4, "cudnn"
     if mode == "flashinfer_trtllm":
@@ -281,7 +278,7 @@ def test_checkpoint_processing(
     not _nvfp4_supported(),
     reason="Diffusion NVFP4 scaled mm correctness requires Blackwell GPUs",
 )
-@pytest.mark.parametrize("mode", ["jit_cutlass", "flashinfer2"])
+@pytest.mark.parametrize("mode", ["flashinfer2"])
 def test_flux2_shape_correctness(mode: str) -> None:
     m, n, k = FLUX2_PROJECTION_SHAPE
     quantize_op, gemm_op, gemm_backend = _resolve_mode(mode)
@@ -306,25 +303,15 @@ def test_flux2_shape_correctness(mode: str) -> None:
         _dequantize_nvfp4(weight_fp4, weight_scale_swizzled, weight_global_scale).t(),
     )
 
-    if gemm_backend is None:
-        actual = gemm_op(
-            x_fp4,
-            weight_fp4,
-            x_scale_swizzled,
-            weight_scale_swizzled,
-            alpha,
-            DTYPE,
-        )
-    else:
-        actual = gemm_op(
-            x_fp4,
-            weight_fp4.t(),
-            x_scale_swizzled,
-            weight_scale_swizzled.t(),
-            alpha,
-            DTYPE,
-            backend=gemm_backend,
-        )
+    actual = gemm_op(
+        x_fp4,
+        weight_fp4.t(),
+        x_scale_swizzled,
+        weight_scale_swizzled.t(),
+        alpha,
+        DTYPE,
+        backend=gemm_backend,
+    )
 
     diff = _calc_diff(actual, expected.to(dtype=DTYPE))
     assert diff < DEEPGEMM_FP4_MAX_DIFF, f"{mode=}, {m=}, {n=}, {k=}, {diff=:.6f}"

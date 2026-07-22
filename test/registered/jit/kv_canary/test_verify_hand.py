@@ -8,22 +8,6 @@ from typing import Callable
 import pytest
 import torch
 
-from sglang.jit_kernel.kv_canary import consts
-from sglang.jit_kernel.kv_canary.consts import splitmix64, splitmix64_mix3
-from sglang.jit_kernel.kv_canary.verify import (
-    CanaryLaunchTag,
-    RealKvSource,
-    VerifyOrWriteContext,
-    VerifyPlan,
-    launch_canary_verify_kernel,
-)
-from sglang.jit_kernel.kv_canary.verify_ref import (
-    _compute_real_kv_hash_scalar,
-    launch_canary_verify_kernel_torch_reference,
-)
-from sglang.jit_kernel.kv_canary.write_ref import (
-    launch_canary_write_kernel_torch_reference,
-)
 from sglang.jit_kernel.tests.kv_canary._canary_helpers import (
     FakeViolationLog,
     assert_only_bits_set,
@@ -50,6 +34,22 @@ from sglang.jit_kernel.tests.kv_canary._fixtures import clone_real_kv_sources
 from sglang.jit_kernel.tests.kv_canary._hand_oracle import (
     _hand_fold_all,
     _hand_fold_partial,
+)
+from sglang.kernels.ops.kv_canary import consts
+from sglang.kernels.ops.kv_canary.consts import splitmix64, splitmix64_mix3
+from sglang.kernels.ops.kv_canary.verify import (
+    CanaryLaunchTag,
+    RealKvSource,
+    VerifyOrWriteContext,
+    VerifyPlan,
+    launch_canary_verify_kernel,
+)
+from sglang.kernels.ops.kv_canary.verify_ref import (
+    _compute_real_kv_hash_scalar,
+    launch_canary_verify_kernel_torch_reference,
+)
+from sglang.kernels.ops.kv_canary.write_ref import (
+    launch_canary_write_kernel_torch_reference,
 )
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 

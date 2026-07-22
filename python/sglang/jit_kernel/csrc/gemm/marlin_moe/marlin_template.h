@@ -375,14 +375,11 @@ __global__ void Marlin(
       is_zp_float ? prob_n * prob_k / group_size / 8 : prob_n * prob_k / group_size / (pack_factor * 4);
   const int b_bias_expert_stride = prob_n / 8;
 
-  // parallel: num valid moe blocks
   int num_tokens_past_padded = num_tokens_past_padded_ptr[0];
   int parallel = num_tokens_past_padded / moe_block_size;
   int num_valid_blocks = parallel;
-  if (is_ep) {
-    for (int i = 0; i < parallel; i++) {
-      if (expert_ids_ptr[i] == -1) num_valid_blocks--;
-    }
+  for (int i = 0; i < parallel; i++) {
+    if (expert_ids_ptr[i] == -1) num_valid_blocks--;
   }
   int num_invalid_blocks = parallel - num_valid_blocks;
   parallel = num_valid_blocks;

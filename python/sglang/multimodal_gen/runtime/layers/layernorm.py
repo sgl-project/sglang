@@ -11,13 +11,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from sglang.jit_kernel.diffusion.qknorm_rope import (
+from sglang.jit_kernel.norm import can_use_fused_inplace_qknorm, fused_inplace_qknorm
+from sglang.kernels.ops.diffusion.qknorm_rope import (
     can_use_fused_inplace_qknorm_rope,
     fused_inplace_qknorm_rope,
 )
-from sglang.jit_kernel.diffusion.triton.rmsnorm_onepass import triton_one_pass_rms_norm
-from sglang.jit_kernel.diffusion.triton.scale_shift import fuse_scale_shift_kernel
-from sglang.jit_kernel.norm import can_use_fused_inplace_qknorm, fused_inplace_qknorm
+from sglang.kernels.ops.diffusion.triton.rmsnorm_onepass import triton_one_pass_rms_norm
+from sglang.kernels.ops.diffusion.triton.scale_shift import fuse_scale_shift_kernel
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -52,7 +52,7 @@ if USE_AITER:
     from aiter import rmsnorm2d_fwd_with_add as fused_add_rms_norm
 
 if not _is_cpu:
-    from sglang.jit_kernel.diffusion.triton.norm import norm_infer, rms_norm_fn
+    from sglang.kernels.ops.diffusion.triton.norm import norm_infer, rms_norm_fn
 
 
 # Copied and adapted from sglang
@@ -452,6 +452,35 @@ def _ensure_contiguous(tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]
     return tensor.contiguous() if tensor is not None else None
 
 
+def _is_scalar_or_hidden_modulation(tensor: torch.Tensor, hidden_size: int) -> bool:
+    return tensor.numel() in (1, hidden_size)
+
+
+def _can_use_npu_fused_scale_shift(
+    x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor
+) -> bool:
+    hidden_size = x.shape[-1]
+    return _is_scalar_or_hidden_modulation(scale, hidden_size) and (
+        _is_scalar_or_hidden_modulation(shift, hidden_size)
+        or tuple(shift.shape) == tuple(x.shape)
+    )
+
+
+def _try_npu_fused_scale_shift(
+    x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor
+) -> torch.Tensor | None:
+    if not _can_use_npu_fused_scale_shift(x, shift, scale):
+        return None
+
+    from sgl_kernel_npu.norm.scale_shift import fused_scale_shift
+
+    scale = scale.reshape(-1)
+    if tuple(shift.shape) != tuple(x.shape):
+        shift = shift.reshape(-1)
+
+    return fused_scale_shift(x, scale.contiguous(), shift.contiguous())
+
+
 class _ScaleResidualNormScaleShift(CustomOp):
     """
     Fused kernel that combines:
@@ -503,7 +532,7 @@ class _ScaleResidualNormScaleShift(CustomOp):
             )
             return self.forward_native(residual, x, gate, shift, scale)
 
-        from sglang.jit_kernel.diffusion.cutedsl.scale_residual_norm_scale_shift import (
+        from sglang.kernels.ops.diffusion.cutedsl.scale_residual_norm_scale_shift import (
             fused_scale_residual_norm_scale_shift,
         )
 
@@ -536,7 +565,7 @@ class _ScaleResidualNormScaleShift(CustomOp):
             return self.forward_native(residual, x, gate, shift, scale)
 
         try:
-            from sglang.jit_kernel.diffusion.flydsl.fused_residual_norm import (
+            from sglang.kernels.ops.diffusion.flydsl.fused_residual_norm import (
                 FLYDSL_NORM_MIN_ALIGNED_DIM,
                 flydsl_fused_residual_norm_scale_shift,
             )
@@ -607,8 +636,6 @@ class _ScaleResidualNormScaleShift(CustomOp):
         shift: torch.Tensor,
         scale: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        from sgl_kernel_npu.norm.scale_shift import fused_scale_shift
-
         # x.shape: [batch_size, seq_len, inner_dim]
         if isinstance(gate, int):
             # used by cross-attention, should be 1
@@ -628,7 +655,9 @@ class _ScaleResidualNormScaleShift(CustomOp):
         else:
             raise ValueError(f"Gate type {type(gate)} not supported")
         normalized = self.norm(residual_output)
-        modulated = fused_scale_shift(normalized, scale, shift)
+        modulated = _try_npu_fused_scale_shift(normalized, shift, scale)
+        if modulated is None:
+            modulated = normalized * (1 + scale) + shift
         return modulated, residual_output
 
 
@@ -681,7 +710,7 @@ class _NormScaleShift(CustomOp):
             )
             return self.forward_native(x, shift, scale)
 
-        from sglang.jit_kernel.diffusion.cutedsl.scale_residual_norm_scale_shift import (
+        from sglang.kernels.ops.diffusion.cutedsl.scale_residual_norm_scale_shift import (
             fused_norm_scale_shift,
         )
 
@@ -705,7 +734,7 @@ class _NormScaleShift(CustomOp):
             return self.forward_native(x, shift, scale)
 
         try:
-            from sglang.jit_kernel.diffusion.flydsl.fused_residual_norm import (
+            from sglang.kernels.ops.diffusion.flydsl.fused_residual_norm import (
                 FLYDSL_NORM_MIN_ALIGNED_DIM,
                 flydsl_norm_scale_shift,
             )
@@ -747,23 +776,12 @@ class _NormScaleShift(CustomOp):
     def forward_npu(
         self, x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor
     ) -> torch.Tensor:
-        hidden_size = x.shape[-1]
-        x_numel = x.numel()
-
-        if scale.numel() in (1, hidden_size) and shift.numel() in (
-            1,
-            hidden_size,
-            x_numel,
-        ):
-            from sgl_kernel_npu.norm.scale_shift import fused_scale_shift
-
-            normalized = self.norm(x)
-            modulated = fused_scale_shift(
-                normalized, scale.contiguous(), shift.contiguous()
-            )
+        normalized = self.norm(x)
+        modulated = _try_npu_fused_scale_shift(normalized, shift, scale)
+        if modulated is not None:
             return modulated.to(x.dtype)
 
-        return self.forward_native(x, shift, scale)
+        return (normalized * (1 + scale) + shift).to(x.dtype)
 
 
 class LayerNormScaleShift(_NormScaleShift):
@@ -812,7 +830,7 @@ class _NormTanhMulAdd(CustomOp):
             )
             return self.forward_native(x, scale, shift)
 
-        from sglang.jit_kernel.diffusion.cutedsl.norm_tanh_mul_add_norm_scale import (
+        from sglang.kernels.ops.diffusion.cutedsl.norm_tanh_mul_add_norm_scale import (
             fused_norm_tanh_mul_add,
         )
 
@@ -1052,7 +1070,7 @@ def apply_rmsnorm_tanh_mul_add(
         return residual + torch.tanh(gate) * norm(x)
 
     if _is_cuda and x.is_cuda and x.shape[-1] % 256 == 0 and x.shape[-1] <= 8192:
-        from sglang.jit_kernel.diffusion.cutedsl.norm_tanh_mul_add_norm_scale import (
+        from sglang.kernels.ops.diffusion.cutedsl.norm_tanh_mul_add_norm_scale import (
             fused_norm_tanh_mul_add,
         )
 

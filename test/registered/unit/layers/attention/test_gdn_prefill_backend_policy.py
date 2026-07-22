@@ -35,8 +35,17 @@ def make_runner(
     for name, value in arg_overrides.items():
         setattr(args, name, value)
 
+    # The policy routes its load-time default through the audited mutation entry
+    # (server_args.override); mirror that on the stub so the write lands.
+    def _override(source, **fields):
+        for _field, _value in fields.items():
+            setattr(args, _field, _value)
+
+    args.override = _override
+
     return SimpleNamespace(
         server_args=args,
+        model_config=SimpleNamespace(),
         hybrid_gdn_config=SimpleNamespace(
             linear_key_head_dim=key_dim,
             linear_value_head_dim=value_dim,
@@ -60,6 +69,11 @@ class TestFlashInferGDNPrefillBackendPolicy(unittest.TestCase):
         flashinfer_available=True,
     ):
         with (
+            patch.object(
+                gdn_backend,
+                "hybrid_gdn_config",
+                return_value=runner.hybrid_gdn_config,
+            ),
             patch.object(gdn_backend, "is_cuda", return_value=cuda),
             patch.object(torch.cuda, "get_device_capability", return_value=capability),
             patch.object(torch.version, "cuda", cuda_version),

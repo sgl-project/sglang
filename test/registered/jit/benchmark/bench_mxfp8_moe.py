@@ -7,7 +7,7 @@ import torch
 import triton
 
 from sglang.jit_kernel.benchmark.utils import get_benchmark_range, run_benchmark
-from sglang.jit_kernel.mxfp8 import (
+from sglang.kernels.ops.quantization.mxfp8 import (
     es_sm100_mxfp8_blockscaled_grouped_quant,
     es_sm100_mxfp8_blockscaled_moe_grouped_gemm,
 )

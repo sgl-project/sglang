@@ -27,7 +27,7 @@ if not is_hip():
 if not torch.cuda.is_available():
     pytest.skip("Requires a GPU.", allow_module_level=True)
 
-from sglang.srt.layers.quantization.mxfp8_amd_gfx95 import (  # noqa: E402
+from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (  # noqa: E402
     _mxfp8_dot_scaled_linear,
     _mxfp8_e4m3_quantize_torch,
     _mxfp8_e4m3_quantize_triton,
@@ -86,11 +86,11 @@ def test_minimax_swiglu_mxfp8_quant_matches_unfused_fp32(m, inter):
     # the reference is the unfused fp32 swiglu followed by MXFP8 quant. Not
     # bit-identical because the reference quant runs in torch vs the fused triton
     # path, but numerically equivalent (tight relerr, scales agree within 1 ulp).
-    from sglang.jit_kernel.minimax_m3 import (
+    from sglang.kernels.ops.moe.minimax_m3_swiglu import (
         swiglu_oai_mxfp8_quant,
         swiglu_oai_split,
     )
-    from sglang.srt.layers.quantization.mxfp8_amd_gfx95 import mxfp8_e4m3_quantize
+    from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import mxfp8_e4m3_quantize
 
     torch.manual_seed(0)
     alpha, beta, limit = 1.702, 1.0, 7.0
@@ -163,7 +163,7 @@ def _ref_moe(x, w13, w2, topk_weights, topk_ids, alpha, beta, limit):
 )
 @torch.inference_mode()
 def test_mxfp8_native_moe(T, H, inter, E, top_k):
-    from sglang.srt.layers.moe.moe_runner.triton_utils.mxfp8_moe_amd_gfx95 import (
+    from sglang.kernels.ops.moe.mxfp8_moe_amd_gfx95 import (
         fused_moe_mxfp8_native,
     )
 
@@ -203,7 +203,7 @@ def test_mxfp8_native_moe(T, H, inter, E, top_k):
 @requires_gfx950
 @torch.inference_mode()
 def test_mxfp8_native_moe_ep_expert_map_filters_non_local_routes():
-    from sglang.srt.layers.moe.moe_runner.triton_utils.mxfp8_moe_amd_gfx95 import (
+    from sglang.kernels.ops.moe.mxfp8_moe_amd_gfx95 import (
         fused_moe_mxfp8_native,
     )
 
