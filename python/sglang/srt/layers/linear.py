@@ -1571,7 +1571,18 @@ class RowParallelLinear(LinearBase):
                 get_tp_group(), disabled=not is_allocation_symmetric()
             )
         with symm_ctx:
-            if should_use_tp_invariant_row_linear(input_parallel.shape[-1]):
+            from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+
+            is_tuple = isinstance(input_parallel, tuple)
+            is_fp8 = isinstance(self.quant_method, Fp8LinearMethod)
+            k_size = (
+                input_parallel[0].shape[-1] if is_tuple else input_parallel.shape[-1]
+            )
+            if should_use_tp_invariant_row_linear(k_size):
+                if is_fp8:
+                    raise NotImplementedError(
+                        "FP8 tp-invariant row-linear not yet supported"
+                    )
                 output_parallel = torch.ops.tp_inv_ops.matmul_tp_inv(
                     input_parallel, self.weight.t(), bias_
                 )
