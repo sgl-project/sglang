@@ -113,7 +113,7 @@ class AttnForwardMethod(IntEnum):
 
 
 SEPARATE_ROPE_BACKENDS = frozenset(
-    ["fa3", "flashinfer", "dsa", "nsa", "cutlass_mla", "trtllm_mla"]
+    ["fa3", "flashinfer", "dsa", "nsa", "trtllm_mla"]
     # "nsa" is a deprecated alias for "dsa"
 )
 CONCAT_ROPE_BACKENDS = frozenset(["flashmla", "triton"])

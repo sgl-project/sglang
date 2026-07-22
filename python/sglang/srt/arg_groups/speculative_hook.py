@@ -633,7 +633,7 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
 
     # topk > 1 + page_size > 1 needs the two-pass cascade draft-decode (shared prefix
     # pass + per-branch expand pass with prefix-tail dup). Only these backends implement
-    # it; flashmla / trtllm_mla / cutlass_mla can't express the per-branch tree, so reject.
+    # it; flashmla / trtllm_mla can't express the per-branch tree, so reject.
     _PAGE_TREE_SPEC_BACKENDS = ("flashinfer", "fa3", "triton")
     view = resolved_view(server_args)
     if (
