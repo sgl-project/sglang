@@ -10,9 +10,12 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import torch
+
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -214,6 +217,43 @@ class TestDefaultConfigurator(unittest.TestCase):
         _, _, config = self._run(10_000_000)
         self.assertIsNone(config.full_max_total_num_tokens)
         self.assertIsNone(config.swa_max_total_num_tokens)
+
+
+class TestHiSparseDSAConfigurator(CustomTestCase):
+    def test_cell_size_matches_allocated_kv_layout(self):
+        for kv_cache_dtype, expected_cell_size in (
+            (torch.bfloat16, 3360),
+            (torch.float8_e4m3fn, 2368),
+        ):
+            with self.subTest(kv_cache_dtype=kv_cache_dtype):
+                kvc = _make_model_runner(
+                    num_layers=2,
+                    use_mla_backend=True,
+                    page_size=64,
+                )
+                kvc.kv_cache_dtype = kv_cache_dtype
+                kvc.model_config.kv_lora_rank = 512
+                kvc.model_config.qk_rope_head_dim = 64
+                hf_config = SimpleNamespace(
+                    architectures=["GlmMoeDsaForCausalLM"],
+                    index_topk=2048,
+                    index_head_dim=128,
+                )
+                hf_config.get_text_config = lambda: hf_config
+                kvc.model_config.hf_config = hf_config
+                kvc.server_args.enable_hisparse = True
+                kvc.server_args.hisparse_config = '{"host_to_device_ratio": 4}'
+                kvc.server_args.dsa_prefill_backend = "flashmla_sparse"
+                kvc.server_args.dsa_decode_backend = "flashmla_sparse"
+
+                with get_parallel().override(attn_tp_size=1):
+                    from sglang.srt.model_executor.pool_configurator import (
+                        create_memory_pool_configurator,
+                    )
+
+                    configurator = create_memory_pool_configurator(kvc)
+
+                self.assertEqual(configurator._cell_size, expected_cell_size)
 
 
 class TestHybridSWAConfigurator(unittest.TestCase):
