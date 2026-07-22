@@ -18,6 +18,9 @@ xcode-select --install
 
 If you have the full Xcode app installed, the Command Line Tools are already
 available. You can verify with `xcode-select -p && xcrun --find metal`.
+If `xcrun --find metal` fails, install the full Xcode app before compiling
+`sgl-kernel`. You can still run basic MLX serving and benchmarks without this
+optional native kernel build.
 
 ## Install SGLang
 
@@ -39,7 +42,7 @@ uv pip install --upgrade pip
 uv run sgl-kernel/setup_metal.py install
 
 # Install sglang python package along with diffusion support
-rm -f python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml
+cp python/pyproject_other.toml python/pyproject.toml
 uv pip install -e "python[all_mps]"
 ```
 
