@@ -39,10 +39,6 @@ class MoeRunner:
 
         if runner_backend.is_triton():
             self.runner_core = TritonRunnerCore(config)
-        elif runner_backend.is_ascend():
-            from sglang.srt.layers.moe.moe_runner.ascend import AscendRunnerCore
-
-            self.runner_core = AscendRunnerCore(config)
         elif runner_backend.is_triton_kernels():
             self.runner_core = TritonKernelsRunnerCore(config)
         elif runner_backend.is_deep_gemm():
