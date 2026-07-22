@@ -50,6 +50,23 @@ class Llama32Detector(BaseFormatDetector):
         # prefix the output with the <|python_tag|> token
         return "<|python_tag|>" in text or text.startswith("{")
 
+    def _skip_tool_call_separator(self, text: str, idx: int) -> int:
+        """Advance ``idx`` past a ``tool_call_separator`` if one immediately
+        follows (after optional whitespace); otherwise leave ``idx`` untouched.
+
+        Between two tool calls the model emits ``};{`` and the separator must be
+        consumed. But when plain prose follows the final tool call there is no
+        separator, and unconditionally adding ``len(tool_call_separator)`` would
+        skip into the trailing text and drop its first character
+        (``"{...}Some note"`` -> ``"ome note"``).
+        """
+        rest = text[idx:]
+        stripped = rest.lstrip()
+        if stripped.startswith(self.tool_call_separator):
+            leading_ws = len(rest) - len(stripped)
+            return idx + leading_ws + len(self.tool_call_separator)
+        return idx
+
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         """Parse function calls from text, handling multiple JSON objects."""
         if "<|python_tag|>" not in text and not text.startswith("{"):
@@ -69,7 +86,7 @@ class Llama32Detector(BaseFormatDetector):
             try:
                 obj, end = decoder.raw_decode(action_text[idx:])
                 all_actions.append(obj)
-                idx += end + len(self.tool_call_separator)
+                idx = self._skip_tool_call_separator(action_text, idx + end)
                 safe_idx = idx
             except json.JSONDecodeError:
                 # Try Python dict conversion as fallback
@@ -91,7 +108,7 @@ class Llama32Detector(BaseFormatDetector):
                         if json_version != potential_dict:
                             obj, _ = decoder.raw_decode(json_version)
                             all_actions.append(obj)
-                            idx = dict_end + len(self.tool_call_separator)
+                            idx = self._skip_tool_call_separator(action_text, dict_end)
                             safe_idx = idx
                             continue
                 except:
