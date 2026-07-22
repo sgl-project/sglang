@@ -4,7 +4,7 @@ import sys
 import pytest
 import torch
 
-from sglang.jit_kernel.mxfp8 import (
+from sglang.kernels.ops.quantization.mxfp8 import (
     es_sm100_mxfp8_blockscaled_grouped_quant,
     es_sm100_mxfp8_blockscaled_moe_grouped_gemm,
 )

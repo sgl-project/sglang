@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.jit_kernel.kv_canary.verify import RealKvSource
+from sglang.kernels.ops.kv_canary.verify import RealKvSource
 from sglang.srt.kv_canary.buffer_group import PoolKind
 from sglang.srt.kv_canary.perturb import (
     real_kv_post_forward,
