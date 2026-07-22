@@ -233,6 +233,28 @@ class PrefillBootstrapQueue:
             self.scheduler.server_args,
             self.is_mla_backend,
         )
+        if getattr(self.scheduler.server_args, "enable_dsa_shared_kv_cache", False):
+            main_buffers = self.token_to_kv_pool.get_owner_sharded_kv_transfer_buffers()
+            aggregated_main_buffers = (
+                self.token_to_kv_pool.get_rank_aggregated_kv_transfer_buffers()
+            )
+            state_buffers = []
+            for state_type in kv_args.state_types:
+                if state_type == StateType.SWA:
+                    state_buffers.append(
+                        self.token_to_kv_pool.get_owner_sharded_state_transfer_buffers()
+                    )
+                elif state_type == StateType.C128_STATE:
+                    state_buffers.append(
+                        self.token_to_kv_pool.get_owner_sharded_c128_state_transfer_buffers()
+                    )
+                else:
+                    state_buffers.append([])
+            kv_manager.set_owner_sharded_transfer_buffers(
+                main_buffers,
+                state_buffers,
+                aggregated_main_buffers,
+            )
         # Pass KV pool tensor refs to the manager for GPU gather (staging mode)
         if (
             envs.SGLANG_DISAGG_STAGING_BUFFER.get()

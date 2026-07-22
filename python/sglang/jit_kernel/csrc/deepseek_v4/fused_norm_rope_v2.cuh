@@ -49,6 +49,8 @@ struct FusedNormRopeStoreParams {
   float eps;
   uint32_t compress_ratio;
   uint32_t num_tokens;
+  uint32_t owner_rank;
+  uint32_t owner_size;
 };
 
 enum class ForwardMode : bool {
@@ -103,6 +105,12 @@ INDEXER_KERNEL void fused_norm_rope_indexer(const __grid_constant__ FusedNormRop
     out_loc = params.out_loc[work_id];
   } else {
     static_assert(host::dependent_false_v<DType>, "Unsupported Mode");
+  }
+  if (out_loc < 0) return;
+  if (params.owner_size > 1) {
+    const int64_t page = out_loc >> kPageBits;
+    if (static_cast<uint32_t>(page) % params.owner_size != params.owner_rank) return;
+    out_loc = (page / params.owner_size) * (1 << kPageBits) + (out_loc & ((1 << kPageBits) - 1));
   }
   const auto freqs_cis = params.freqs_cis + position * kRopeDim;
 
@@ -258,6 +266,12 @@ INDEXER_KERNEL void fused_norm_rope_indexer_fp4(const __grid_constant__ FusedNor
   } else {
     static_assert(host::dependent_false_v<DType>, "Unsupported Mode");
   }
+  if (out_loc < 0) return;
+  if (params.owner_size > 1) {
+    const int64_t page = out_loc >> kPageBits;
+    if (static_cast<uint32_t>(page) % params.owner_size != params.owner_rank) return;
+    out_loc = (page / params.owner_size) * (1 << kPageBits) + (out_loc & ((1 << kPageBits) - 1));
+  }
   const auto freqs_cis = params.freqs_cis + position * kRopeDim;
 
   PDLWaitPrimary<kUsePDL>();
@@ -412,6 +426,12 @@ FLASHMLA_KERNEL void fused_norm_rope_flashmla(const __grid_constant__ FusedNormR
   } else {
     static_assert(host::dependent_false_v<DType>, "Unsupported Mode");
   }
+  if (out_loc < 0) return;
+  if (params.owner_size > 1) {
+    const int64_t page = out_loc >> kPageBits;
+    if (static_cast<uint32_t>(page) % params.owner_size != params.owner_rank) return;
+    out_loc = (page / params.owner_size) * (1 << kPageBits) + (out_loc & ((1 << kPageBits) - 1));
+  }
   const auto freqs_cis = params.freqs_cis + position * kRopeDim;
 
   PDLWaitPrimary<kUsePDL>();
@@ -537,7 +557,9 @@ struct FusedNormRopeKernel {
       const tvm::ffi::TensorView out_loc,
       const tvm::ffi::TensorView kvcache,
       const bool is_decode,
-      const uint32_t compress_ratio) {
+      const uint32_t compress_ratio,
+      const int64_t owner_rank,
+      const int64_t owner_size) {
     using namespace host;
     using enum ForwardMode;
 
@@ -582,6 +604,8 @@ struct FusedNormRopeKernel {
 
     const auto num_tokens = static_cast<uint32_t>(N.unwrap());
     if (num_tokens == 0) return;
+    RuntimeCheck(owner_size > 0);
+    RuntimeCheck(owner_rank >= 0 && owner_rank < owner_size);
     const auto params = FusedNormRopeStoreParams{
         .input = input.data_ptr(),
         .handle = plan.data_ptr(),
@@ -592,6 +616,8 @@ struct FusedNormRopeKernel {
         .eps = eps,
         .compress_ratio = compress_ratio,
         .num_tokens = num_tokens,
+        .owner_rank = static_cast<uint32_t>(owner_rank),
+        .owner_size = static_cast<uint32_t>(owner_size),
     };
     // Indexer packs `kNumWarps` tokens per block (warp-major); FlashMLA uses
     // a whole block per token (cta-major sum-reduce over head_dim=512).
@@ -610,7 +636,9 @@ struct FusedNormRopeKernel {
       const tvm::ffi::TensorView out_loc,
       const tvm::ffi::TensorView kvcache,
       const bool is_decode,
-      const uint32_t compress_ratio) {
+      const uint32_t compress_ratio,
+      const int64_t owner_rank,
+      const int64_t owner_size) {
     using namespace host;
     using enum ForwardMode;
 
@@ -641,6 +669,8 @@ struct FusedNormRopeKernel {
 
     const auto num_tokens = static_cast<uint32_t>(N.unwrap());
     if (num_tokens == 0) return;
+    RuntimeCheck(owner_size > 0);
+    RuntimeCheck(owner_rank >= 0 && owner_rank < owner_size);
     const auto params = FusedNormRopeStoreParams{
         .input = input.data_ptr(),
         .handle = plan.data_ptr(),
@@ -651,6 +681,8 @@ struct FusedNormRopeKernel {
         .eps = eps,
         .compress_ratio = compress_ratio,
         .num_tokens = num_tokens,
+        .owner_rank = static_cast<uint32_t>(owner_rank),
+        .owner_size = static_cast<uint32_t>(owner_size),
     };
     const uint32_t num_blocks = div_ceil(num_tokens, kNumWarps);
     const auto device = device_.unwrap();

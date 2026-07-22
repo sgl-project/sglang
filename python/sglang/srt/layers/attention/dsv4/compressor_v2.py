@@ -12,6 +12,9 @@ from sglang.jit_kernel.dsv4 import (
 )
 from sglang.kernels.jit.utils import is_hip_runtime
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsv4.shared_cache_access import (
+    get_dsv4_shared_cache_access,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.deepseek_v4_backend import DSV4Metadata
@@ -156,6 +159,9 @@ class CompressorBackendMixin:
         out_loc: torch.Tensor,
         use_fp4_indexer: bool = False,
         bf16_store: bool = False,
+        owner_rank: int = 0,
+        owner_size: int = 1,
+        shared_state_layout: tuple[int, int, int] = (0, 1, 0),
     ) -> None:
         assert compress_ratio == 4 or compress_ratio == 128
         assert rotate == is_indexer == (head_dim == 128)
@@ -183,6 +189,7 @@ class CompressorBackendMixin:
             compress_ratio=compress_ratio,
             head_dim=head_dim,
             is_online=is_online,
+            shared_state_layout=shared_state_layout,
         )
 
         # Step 2: norm + rope + store
@@ -197,6 +204,8 @@ class CompressorBackendMixin:
             page_size=page_size,
             use_fp4=use_fp4_indexer,
             bf16_store=bf16_store,
+            owner_rank=owner_rank,
+            owner_size=owner_size,
         )
 
     def forward_unified(
@@ -211,6 +220,7 @@ class CompressorBackendMixin:
 
         token_to_kv_pool = self.token_to_kv_pool
         token_to_kv_pool = cast("DeepSeekV4TokenToKVPool", token_to_kv_pool)
+        shared_access = get_dsv4_shared_cache_access(token_to_kv_pool)
         kv_score_input = compressor.compute_kv_score(x, forward_batch)
 
         state_pool = compressor.get_state_pool(self)
@@ -228,11 +238,21 @@ class CompressorBackendMixin:
             )
         else:
             out_loc = self._get_out_loc(compressor.ratio)
+            owner_rank, owner_size = 0, 1
             use_fp4_indexer = (
                 compressor.is_in_indexer and self.enable_deepseek_v4_fp4_indexer
             )
             bf16_store = False
-            if compressor.is_in_indexer:
+            if shared_access is not None:
+                kv_cache, owner_rank, owner_size = shared_access.kv_owner_write_target(
+                    layer_id, is_indexer=compressor.is_in_indexer
+                )
+                page_size = (
+                    token_to_kv_pool.get_index_k_page_size()
+                    if compressor.is_in_indexer
+                    else token_to_kv_pool.get_extra_key_page_size(layer_id)
+                )
+            elif compressor.is_in_indexer:
                 kv_cache = token_to_kv_pool.get_index_k_with_scale_buffer(layer_id)
                 page_size = token_to_kv_pool.get_index_k_page_size()
             elif is_unified_kv_triton():
@@ -267,6 +287,13 @@ class CompressorBackendMixin:
                 out_loc=out_loc,
                 use_fp4_indexer=use_fp4_indexer,
                 bf16_store=bf16_store,
+                owner_rank=owner_rank,
+                owner_size=owner_size,
+                shared_state_layout=(
+                    shared_access.compressor_state_layout(state_pool)
+                    if shared_access is not None
+                    else (0, 1, 0)
+                ),
             )
         online_c128_mtp = getattr(self, "online_c128_mtp", None)
         if online_c128_mtp is not None:

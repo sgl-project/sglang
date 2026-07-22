@@ -1,5 +1,6 @@
 from .attn import (
     fused_store_cache,
+    fused_store_cache_shared,
     get_paged_mqa_logits_metadata,
     triton_create_paged_compress_data,
 )
@@ -40,6 +41,7 @@ __all__ = [
     "clear_unaccepted_c128_draft_states",
     "fused_norm_rope_inplace",
     "fused_store_cache",
+    "fused_store_cache_shared",
     "fused_rope_inplace",
     "fused_q_norm_rope",
     "fused_q_indexer_rope_first_quant",

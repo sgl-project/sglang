@@ -48,7 +48,9 @@ def _combine_topk_swa_indices_kernel(
     gather_lens_ptr,
     compressed_base_ptr,
     swa_base_ptr,
+    query_positions_ptr,
     top_k,
+    USE_QUERY_POSITIONS: tl.constexpr,
     COMPRESS_RATIO: tl.constexpr,
     WINDOW_SIZE: tl.constexpr,
     PADDED_TOP_K: tl.constexpr,
@@ -74,8 +76,11 @@ def _combine_topk_swa_indices_kernel(
     gather_start = seq_len - gather_len
 
     for token_idx in range(query_start + worker_id, query_end, num_workers):
-        token_idx_in_query = token_idx - query_start
-        pos = start_pos + token_idx_in_query
+        if USE_QUERY_POSITIONS:
+            pos = tl.load(query_positions_ptr + token_idx)
+        else:
+            token_idx_in_query = token_idx - query_start
+            pos = start_pos + token_idx_in_query
         # Both the C4 indexer and the C128 metadata builder emit
         # min((pos+1)//compress_ratio, topk_tokens) valid entries. Caller
         # passes top_k=0 for SWA-only layers to zero this out.

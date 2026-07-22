@@ -186,6 +186,10 @@ class PagedIndexerMetadata:
             assign_fields=assign_fields,
         )
         self.nonpaged_plan = None
+        # A reused graph metadata object may receive a different page table.
+        # Rebuild any eager shared-cache staging plan after copying live data.
+        if hasattr(self, "_dsv4_shared_indexer_stage_plan"):
+            del self._dsv4_shared_indexer_stage_plan
 
 
 def maybe_copy_inplace(dst, *, src) -> None:

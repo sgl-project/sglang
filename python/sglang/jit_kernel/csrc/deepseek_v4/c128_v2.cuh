@@ -36,6 +36,7 @@ namespace {
 using PlanD = device::compress::DecodePlan;
 using PlanC = device::compress::CompressPlan;
 using PlanW = device::compress::WritePlan;
+using SharedStateLayout = device::compress::SharedStateLayout;
 
 /// \brief Each thread will handle this many elements (split along head_dim)
 constexpr int32_t kTileElements = 2;
@@ -56,6 +57,7 @@ struct Compress128DecodeParams {
   const void* __restrict__ score_bias;
   const PlanD* __restrict__ plan_d;
   uint32_t batch_size;
+  SharedStateLayout state_layout;
 };
 
 struct Compress128PrefillParams {
@@ -67,6 +69,7 @@ struct Compress128PrefillParams {
   const PlanW* __restrict__ plan_w;
   uint32_t num_compress;
   uint32_t num_write;
+  SharedStateLayout state_layout;
 };
 
 struct Compress128SharedBuffer {
@@ -296,12 +299,12 @@ C128_KERNEL void flash_c128_decode(const __grid_constant__ Compress128DecodePara
 
   const auto kv_src = kv_input + global_bid * Trait::kElementSize;
   const auto kv_out = kv_output + global_bid * Trait::kHeadDim;
-  const auto kv_buf = kv_buffer + plan.read_page_1 * Trait::kPageElementSize;
-  const auto kv_dst = kv_buffer + plan.write_loc * Trait::kElementSize;
+  const auto kv_buf = kv_buffer + params.state_layout.translate_page(plan.read_page_1) * Trait::kPageElementSize;
+  const auto kv_dst = kv_buffer + params.state_layout.translate_loc<128>(plan.write_loc) * Trait::kElementSize;
 
   PDLWaitPrimary<kUsePDL>();
   // the write warp must match the load warp in the following `c128_forward`
-  if (warp_id == kNumWarps - 1) {
+  if (warp_id == kNumWarps - 1 && params.state_layout.owns_loc<128>(plan.write_loc)) {
     c128_write_decode<Trait, BufferFloat, InputFloat>(kv_dst, kv_src);
   }
   if (plan.write_loc % 128 == 127) {
@@ -330,7 +333,7 @@ C128_KERNEL void flash_c128_prefill(const __grid_constant__ Compress128PrefillPa
   const auto kv_src = kv_input + plan.ragged_id * Trait::kElementSize;
   // Compact output: one row per compress plan, indexed by `global_pid`.
   const auto kv_out = kv_output + global_pid * Trait::kHeadDim;
-  const auto kv_buf = kv_buffer + plan.read_page_1 * Trait::kPageElementSize;
+  const auto kv_buf = kv_buffer + params.state_layout.translate_page(plan.read_page_1) * Trait::kPageElementSize;
   PDLWaitPrimary<kUsePDL>();
   c128_forward<Trait, kUsePDL, BufferFloat, InputFloat, OutFloat>(kv_buf, kv_src, kv_out, score_bias, plan.buffer_len);
 }
@@ -354,10 +357,11 @@ WRITE_KERNEL void write_c128_prefill(const __grid_constant__ Compress128PrefillP
   const auto kv_input = static_cast<const InputFloat*>(params.kv_input) + split_offset;
   const auto kv_buffer = static_cast<BufferFloat*>(params.kv_buffer) + split_offset;
   if (plan.is_invalid()) return;
+  if (!params.state_layout.owns_loc<128>(plan.write_loc)) return;
 
   // each warp will handle a contiguous region
   const auto kv_src = kv_input + plan.ragged_id * Trait::kElementSize;
-  const auto kv_buf = kv_buffer + plan.write_loc * Trait::kElementSize;
+  const auto kv_buf = kv_buffer + params.state_layout.translate_loc<128>(plan.write_loc) * Trait::kElementSize;
   const auto gmem_input = tile::Memory<StorageInput>::warp();
 
   PDLWaitPrimary<kUsePDL>();
@@ -407,7 +411,10 @@ struct FlashCompress128Kernel {
       const tvm::ffi::TensorView kv_input,
       const tvm::ffi::TensorView kv_output,
       const tvm::ffi::TensorView ape,
-      const tvm::ffi::TensorView plan_d_) {
+      const tvm::ffi::TensorView plan_d_,
+      int64_t shared_rank,
+      int64_t shared_size,
+      int64_t pages_per_rank) {
     using namespace host;
 
     auto N = SymbolicSize{"batch_size"};
@@ -440,6 +447,10 @@ struct FlashCompress128Kernel {
         .score_bias = ape.data_ptr(),
         .plan_d = plan_d,
         .batch_size = batch_size,
+        .state_layout =
+            {static_cast<int32_t>(shared_rank),
+             static_cast<int32_t>(shared_size),
+             static_cast<int32_t>(pages_per_rank)},
     };
     const uint32_t num_blocks = batch_size * kNumSplit;
     LaunchKernel(num_blocks, kBlockSize, device_.unwrap())  //
@@ -452,7 +463,10 @@ struct FlashCompress128Kernel {
       const tvm::ffi::TensorView kv_output,
       const tvm::ffi::TensorView ape,
       const tvm::ffi::TensorView plan_c_,
-      const tvm::ffi::TensorView plan_w_) {
+      const tvm::ffi::TensorView plan_w_,
+      int64_t shared_rank,
+      int64_t shared_size,
+      int64_t pages_per_rank) {
     using namespace host;
 
     auto N = SymbolicSize{"num_q_tokens"};
@@ -493,6 +507,10 @@ struct FlashCompress128Kernel {
         .plan_w = plan_w,
         .num_compress = num_c,
         .num_write = num_w,
+        .state_layout =
+            {static_cast<int32_t>(shared_rank),
+             static_cast<int32_t>(shared_size),
+             static_cast<int32_t>(pages_per_rank)},
     };
     RuntimeCheck(num_q_tokens >= num_w, "invalid prefill plan: num_q < num_w");
     if (const auto num_c_blocks = num_c * kNumSplit) {
