@@ -101,6 +101,8 @@ if _use_aiter:
     if is_gfx1250_supported():
         from aiter.ops.triton.normalization.rmsnorm import (
             rms_norm,
+        )
+        from aiter.ops.triton.normalization.rmsnorm import (
             rmsnorm2d_fwd_with_add as fused_add_rms_norm,
         )
     else:
