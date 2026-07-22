@@ -59,6 +59,20 @@ def _init_nccl_group():
     return dist.new_group(backend="nccl", device_id=torch.device(f"cuda:{local_rank}"))
 
 
+def _symm_alloc_mc(shape, dtype):
+    import torch.distributed._symmetric_memory as torch_symm_mem
+
+    cpu_group = _init_world()
+    rank = dist.get_rank()
+    device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
+    pool = torch_symm_mem.get_mem_pool(device)
+    with torch.cuda.use_mem_pool(pool):
+        buf = torch.empty(shape, dtype=dtype, device=device)
+    hdl = torch_symm_mem.rendezvous(buf, cpu_group.group_name)
+    mc = hdl.multicast_ptr + (buf.data_ptr() - hdl.buffer_ptrs[rank])
+    return buf, mc
+
+
 @cache_once
 def _init_comm() -> CustomAllReduceV2:
     cpu_group = _init_world()
@@ -68,24 +82,14 @@ def _init_comm() -> CustomAllReduceV2:
     )
     if comm.disabled or comm.mc_base_ptr == 0:
         marker.skip("ar_fusion requires CustomAllReduceV2 with multicast")
-    all_reduce.register_comm(comm.obj)
+    all_reduce.register_comm(comm.obj, pull_sem_mc_ptr=comm.pull_sem_mc_ptr)
     register_comm_cleanup(comm)
     return comm
 
 
 @cache_once
 def _init_pool_buf():
-    import torch.distributed._symmetric_memory as torch_symm_mem
-
-    cpu_group = _init_world()
-    rank = dist.get_rank()
-    device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
-    pool = torch_symm_mem.get_mem_pool(device)
-    with torch.cuda.use_mem_pool(pool):
-        buf = torch.empty(max(BATCH_SIZES) * H, dtype=torch.bfloat16, device=device)
-    hdl = torch_symm_mem.rendezvous(buf, cpu_group.group_name)
-    mc = hdl.multicast_ptr + (buf.data_ptr() - hdl.buffer_ptrs[rank])
-    return buf, mc
+    return _symm_alloc_mc((max(BATCH_SIZES) * H,), torch.bfloat16)
 
 
 # push covers <= 0.5 MB (bs<=32 at H=7168); larger sizes go through the
