@@ -11,6 +11,7 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
     register_memory_region,
 )
+from sglang.srt.runtime_context import get_model, get_parallel
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
 
@@ -58,7 +59,7 @@ class RemoteInstanceWeightTransporter:
             # ModelExpress owns TransferEngine memory registration and metadata
             # publishing for backend=modelexpress. Re-registering here would
             # overlap the same weight buffers.
-            and self.server_args.remote_instance_weight_loader_backend
+            and get_model().remote_instance_weight_loader_backend
             != RemoteInstanceWeightLoaderBackend.MODELEXPRESS
             and self.engine is not None
             and self.weight_info is None
@@ -75,16 +76,16 @@ class RemoteInstanceWeightTransporter:
         """
         import requests as http_requests
 
-        if self.server_args.dist_init_addr:
+        if get_parallel().dist_init_addr:
             # Multi-node: bootstrap server is on the head node (node_rank==0).
             # Derive host from dist_init_addr (shared across all nodes).
             bootstrap_host = (
-                NetworkAddress.parse(self.server_args.dist_init_addr).resolved().host
+                NetworkAddress.parse(get_parallel().dist_init_addr).resolved().host
             )
         else:
             bootstrap_host = "127.0.0.1"
 
-        bootstrap_port = self.server_args.engine_info_bootstrap_port
+        bootstrap_port = get_model().engine_info_bootstrap_port
         bootstrap_na = NetworkAddress(bootstrap_host, bootstrap_port)
         url = f"{bootstrap_na.to_url()}/register_transfer_engine_info"
 
