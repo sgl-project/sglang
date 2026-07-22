@@ -66,7 +66,6 @@ class TestNVKDAAllPrefillWrapper(CustomTestCase):
                     "beta": beta.clone(),
                     "initial_state": kwargs["initial_state"].clone(),
                     "cu_seqlens": kwargs["cu_seqlens"],
-                    "use_fused_k1234": kwargs["use_fused_k1234"],
                 }
             )
             return v.clone(), kwargs["initial_state"] + 1.0
@@ -141,7 +140,6 @@ class TestNVKDAAllPrefillWrapper(CustomTestCase):
         call = calls[0]
         self.assertEqual(tuple(call["q"].shape), (3, 2048, 1, 128))
         self.assertIsNone(call["cu_seqlens"])
-        self.assertFalse(call["use_fused_k1234"])
         self.assertTrue(torch.equal(output, x["v"]))
 
         start = 0

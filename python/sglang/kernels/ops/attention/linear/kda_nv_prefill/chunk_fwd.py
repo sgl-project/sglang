@@ -42,21 +42,13 @@ try:
     from .fuse_k4_only_persistent import BYTES_PER_TENSORMAP as _K4P_BTM
     from .fuse_k4_only_persistent import NUM_TENSORMAPS as _K4P_NTM
     from .fuse_k4_only_persistent import make_host_fn as _k4p_make_host
-    from .fuse_k1234_smem import make_host_fn as _fused_k1234_make_host
     from .fuse_kernel123_persistent import make_host_function as _fused_make_host
-    from .intra_parellel_cute import BC, run_kda_Akk
 except ImportError:
     from Akk_inverse_lower_triangle_bf16 import akk_inv_host as _akk_inv_host
     from fuse_k4_only_persistent import BYTES_PER_TENSORMAP as _K4P_BTM
     from fuse_k4_only_persistent import NUM_TENSORMAPS as _K4P_NTM
     from fuse_k4_only_persistent import make_host_fn as _k4p_make_host
-    from fuse_k1234_smem import make_host_fn as _fused_k1234_make_host
     from fuse_kernel123_persistent import make_host_function as _fused_make_host
-    from intra_parellel_cute import run_kda_Akk
-
-
-# ========== K2 compilation cache ==========
-_k2_cache = {}
 
 
 def _ct(t, etype):
@@ -90,109 +82,6 @@ def _cute_int_type(dtype):
         return cutlass.Int64
     else:
         raise ValueError(f"Unsupported integer dtype: {dtype}")
-
-
-# Pre-allocated dummy tensors for K2 eqlen (avoids GPU fill kernels per call)
-_k2_dummy = {}
-
-
-def _get_k2_dummy(device, idx_dtype):
-    """Get or create cached dummy tensors for K2 eqlen (no GPU kernel on reuse)."""
-    key = (device.index if device.index is not None else 0, idx_dtype)
-    if key not in _k2_dummy:
-        _k2_dummy[key] = (
-            _ct(
-                torch.empty(2, dtype=idx_dtype, device=device),
-                _cute_int_type(idx_dtype),
-            ),
-            _ct(
-                torch.empty(1, 2, dtype=idx_dtype, device=device),
-                _cute_int_type(idx_dtype),
-            ),
-        )
-    return _k2_dummy[key]
-
-
-def _launch_k2_eqlen(q, k, g_cumsum, beta, A_qk, A_kkd, scale, idx_dtype):
-    """Launch K2 (CuTe) in equal-length mode."""
-    B, T, H, K = q.shape
-    dev = q.device.index or 0
-    g_ct = _ct(g_cumsum.contiguous(), cutlass.Float32)
-    q_ct = _ct(q.contiguous(), cutlass.BFloat16)
-    k_ct = _ct(k.contiguous(), cutlass.BFloat16)
-    b_ct = _ct(beta.contiguous(), cutlass.BFloat16)
-    ak_ct = _ct(A_kkd, cutlass.Float32)
-    aq_ct = _ct(A_qk, cutlass.BFloat16)
-    du, di = _get_k2_dummy(q.device, idx_dtype)
-    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    key = (B, T, H, K, dev, "eqlen", idx_dtype)
-    if key not in _k2_cache:
-        _k2_cache[key] = cute.compile(
-            run_kda_Akk,
-            g_ct,
-            q_ct,
-            k_ct,
-            b_ct,
-            ak_ct,
-            aq_ct,
-            float(scale),
-            stream,
-            du,
-            di,
-            0,
-            cutlass.Int32(0),
-        )
-    _k2_cache[key](
-        g_ct, q_ct, k_ct, b_ct, ak_ct, aq_ct, float(scale), stream, du, di, 0
-    )
-
-
-def _launch_k2_varlen(
-    q, k, g_cumsum, beta, A_qk, A_kkd, scale, cu_seqlens, chunk_indices, NT_total, H
-):
-    """Launch K2 (CuTe) in varlen mode."""
-    B, T, K = q.shape[0], q.shape[1], q.shape[3]
-    dev = q.device.index or 0
-    idx_etype = _cute_int_type(cu_seqlens.dtype)
-    g_ct = _ct(g_cumsum.contiguous(), cutlass.Float32)
-    q_ct = _ct(q.contiguous(), cutlass.BFloat16)
-    k_ct = _ct(k.contiguous(), cutlass.BFloat16)
-    b_ct = _ct(beta.contiguous(), cutlass.BFloat16)
-    ak_ct = _ct(A_kkd, cutlass.Float32)
-    aq_ct = _ct(A_qk, cutlass.BFloat16)
-    cu_ct = _ct(cu_seqlens, idx_etype)
-    ci_ct = _ct(chunk_indices, idx_etype)
-    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    key = (B, T, H, K, dev, "varlen", cu_seqlens.dtype)
-    if key not in _k2_cache:
-        _k2_cache[key] = cute.compile(
-            run_kda_Akk,
-            g_ct,
-            q_ct,
-            k_ct,
-            b_ct,
-            ak_ct,
-            aq_ct,
-            float(scale),
-            stream,
-            cu_ct,
-            ci_ct,
-            NT_total,
-            cutlass.Int32(1),
-        )
-    _k2_cache[key](
-        g_ct,
-        q_ct,
-        k_ct,
-        b_ct,
-        ak_ct,
-        aq_ct,
-        float(scale),
-        stream,
-        cu_ct,
-        ci_ct,
-        NT_total,
-    )
 
 
 # ========== Fused K1+K2+K3 compilation cache ==========
@@ -982,93 +871,6 @@ def _launch_fused_k123_inv(
         )
 
 
-# ========== Fused K1234 compilation cache ==========
-_fused_k1234_cache = {}
-_fused_k1234_buffers = {}
-_BT = 64
-
-
-def _launch_fused_k1234(
-    q,
-    k,
-    v,
-    g,
-    A_log,
-    beta,
-    scale,
-    initial_state,
-    output_final_state,
-    dt_bias=None,
-    safe_gate=False,
-    lower_bound=None,
-):
-    """Launch single fused K1+K2+K3+K4 SMEM-direct kernel (eqlen only)."""
-    B, T, H, K = q.shape
-    V_dim = v.shape[-1]
-    device = q.device
-    dev = device.index or 0
-    NC = T // _BT
-    has_bias = dt_bias is not None
-
-    # Dynamic shapes: cache only on mode flags, not B/NC/H
-    cache_key = (dev, has_bias, safe_gate)
-
-    # Buffers. Serving repeatedly revisits the same bounded (B, T) buckets;
-    # retain O/clocks so the fused path does not allocate on every layer.
-    BH = B * H
-    N_seqs = B
-    S_fp32 = (
-        initial_state.reshape(BH, K, V_dim).contiguous()
-        if initial_state is not None
-        else torch.zeros(BH, K, V_dim, dtype=torch.float32, device=device)
-    )
-    buffer_key = (dev, B, T, H, K, V_dim, q.dtype)
-    buffers = _fused_k1234_buffers.get(buffer_key)
-    if buffers is None:
-        buffers = (
-            torch.empty(B, T, H, V_dim, dtype=q.dtype, device=device),
-            torch.empty(2, BH, dtype=torch.int64, device=device),
-        )
-        _fused_k1234_buffers[buffer_key] = buffers
-    O_out, clocks = buffers
-
-    bf16 = cutlass.BFloat16
-    fp32 = cutlass.Float32
-    if has_bias:
-        bias_ct = _ct(dt_bias.float().contiguous().view(H, K), fp32)
-    else:
-        bias_ct = _ct(torch.empty(1, 1, dtype=torch.float32, device=device), fp32)
-    lb_val = float(lower_bound) if lower_bound is not None else 0.0
-
-    ct_args = (
-        _ct(q.contiguous(), bf16),
-        _ct(k.contiguous(), bf16),
-        _ct(g.contiguous(), bf16),
-        _ct(A_log.float().contiguous(), fp32),
-        _ct(beta.contiguous(), fp32),
-        float(scale),
-        _ct(v.contiguous(), bf16),
-        _ct(O_out, bf16),
-        _ct(S_fp32, fp32),
-        bias_ct,
-        lb_val,
-        _ct(clocks, cutlass.Int64),
-        NC,
-        H,
-        B,
-        cuda.CUstream(torch.cuda.current_stream(device).cuda_stream),
-    )
-
-    if cache_key not in _fused_k1234_cache:
-        host_fn = _fused_k1234_make_host(has_bias=has_bias, use_safe_gate=safe_gate)
-        _fused_k1234_cache[cache_key] = cute.compile(host_fn, *ct_args)
-    _fused_k1234_cache[cache_key](*ct_args)
-
-    S_out = S_fp32.reshape(N_seqs, H, K, V_dim)
-    final_state = S_out if output_final_state else None
-    return O_out, final_state
-
-
 def chunk_kda_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1089,7 +891,6 @@ def chunk_kda_fwd(
     disable_recompute: bool = False,
     return_intermediate_states: bool = False,
     cp_context=None,
-    use_fused_k1234: bool = False,
     varlen_single_real_T: int | None = None,
     varlen_pure: bool | None = None,
 ):
@@ -1098,37 +899,6 @@ def chunk_kda_fwd(
         lower_bound = -5.0
 
     is_varlen = cu_seqlens is not None
-
-    # ===== Fused K1234 path (eqlen only, single kernel launch) =====
-    if use_fused_k1234 and not is_varlen:
-        o, final_state = _launch_fused_k1234(
-            q,
-            k,
-            v,
-            g,
-            A_log,
-            beta,
-            scale,
-            initial_state,
-            output_final_state,
-            dt_bias=dt_bias,
-            safe_gate=safe_gate,
-            lower_bound=lower_bound,
-        )
-        return (
-            o,
-            final_state,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            initial_state,
-        )
 
     B, T, H, K = q.shape
     V_dim = v.shape[-1]

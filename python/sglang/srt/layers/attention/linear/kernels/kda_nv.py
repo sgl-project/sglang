@@ -435,7 +435,6 @@ class NVKDAKernel(LinearAttnKernelBase):
                     use_gate_in_kernel=True,
                     A_log=alog_flat,
                     dt_bias=dtb_flat,
-                    use_fused_k1234=False,
                 )
                 group_output, final_state = res[0], res[1]
 
