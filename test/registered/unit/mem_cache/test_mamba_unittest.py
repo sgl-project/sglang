@@ -537,6 +537,58 @@ class TestMamba(unittest.TestCase):
         self.assertEqual(list(second_insert_events[0].token_ids), [5])
         self.assertEqual(second_insert_events[0].parent_block_hash, split_parent_hash)
 
+    def test_mamba_radix_cache_limited_partial_page_match_does_not_split(self):
+        page_size = 64
+        tree = self._setup_minimal_mamba_radix_cache(page_size)
+        token_ids = array("q", range(page_size))
+
+        tree.insert(
+            InsertParams(
+                key=RadixKey(token_ids, None),
+                value=torch.arange(page_size),
+                mamba_value=torch.tensor([0]),
+            )
+        )
+
+        match = tree.match_prefix(
+            MatchPrefixParams(key=RadixKey(token_ids, None, limit=page_size - 1))
+        )
+
+        self.assertEqual(len(match.device_indices), 0)
+        self.assertEqual(self._non_root_key_lengths(tree), [page_size])
+
+    def _setup_minimal_mamba_radix_cache(self, page_size: int) -> MambaRadixCache:
+        tree = MambaRadixCache.__new__(MambaRadixCache)
+        tree.page_size = page_size
+        tree.mamba_cache_chunk_size = page_size
+        tree.disable = False
+        tree.device = torch.device("cpu")
+        tree.enable_kv_cache_events = False
+        tree.kv_event_queue = []
+        tree.full_evictable_size_ = 0
+        tree.mamba_evictable_size_ = 0
+        tree.full_protected_size_ = 0
+        tree.mamba_protected_size_ = 0
+
+        tree.root_node = TreeNode()
+        tree.root_node.key = RadixKey(array("q"), None)
+        tree.root_node.value = []
+        tree.root_node.hash_value = []
+        tree.root_node.full_lock_ref = 1
+        tree.root_node.mamba_lock_ref = 1
+        tree.full_lru_list = LRUList(mamba=False)
+        tree.mamba_lru_list = LRUList(mamba=True)
+        return tree
+
+    def _non_root_key_lengths(self, tree: MambaRadixCache) -> list[int]:
+        lengths = []
+        stack = list(tree.root_node.children.values())
+        while stack:
+            node = stack.pop()
+            lengths.append(len(node.key))
+            stack.extend(node.children.values())
+        return lengths
+
     def _setup_tree_and_allocator(self, enable_kv_cache_events=False):
         """Helper to create a MambaRadixCache with allocator for testing."""
         server_args = ServerArgs(model_path="dummy", page_size=1)
