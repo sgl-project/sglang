@@ -30,8 +30,16 @@ class HostTensorAllocator:
 class ShmHostTensorAllocator(HostTensorAllocator):
     def __init__(self):
         super().__init__()
-        self.fd = None
-        self.mm = None
+        self.fds = []
+        self.mms = []
+
+    @property
+    def fd(self):
+        return self.fds[0] if self.fds else None
+
+    @property
+    def mm(self):
+        return self.mms[0] if self.mms else None
 
     def allocate(self, dims: tuple, dtype: torch.dtype, device: str) -> torch.Tensor:
         assert (
@@ -42,17 +50,18 @@ class ShmHostTensorAllocator(HostTensorAllocator):
         from sglang.srt.mem_cache.storage.mmap import alloc_shm
 
         tensor, fd, mm = alloc_shm(dims, dtype)
-        self.fd = fd
-        self.mm = mm
+        self.fds.append(fd)
+        self.mms.append(mm)
         return tensor
 
     def __del__(self):
-        if hasattr(self, "fd") and self.fd is not None:
-            try:
-                os.close(self.fd)
-            except OSError:
-                pass
-            self.fd = None
+        for fd in getattr(self, "fds", []):
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+        self.fds = []
 
 
 def get_allocator_from_storage(allocator_type):
