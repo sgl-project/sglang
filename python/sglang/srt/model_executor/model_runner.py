@@ -26,7 +26,11 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.configs.load_config import LoadConfig
-from sglang.srt.configs.model_config import AttentionArch, ModelConfig, ModelImpl
+from sglang.srt.configs.model_config import (
+    AttentionArch,
+    ModelConfig,
+    ModelImpl,
+)
 from sglang.srt.configs.update_config import adjust_config_with_unaligned_cpu_tp
 from sglang.srt.debug_utils.dumper import dumper
 from sglang.srt.distributed import bootstrap
@@ -70,7 +74,9 @@ from sglang.srt.kv_canary.runner.canary_manager import context_tuple
 from sglang.srt.kv_canary.token_oracle.install import install_token_oracle_from_env
 from sglang.srt.layers import deep_gemm_wrapper, model_parallel
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
-from sglang.srt.layers.cp.utils import get_cp_strategy
+from sglang.srt.layers.cp.utils import (
+    get_cp_strategy,
+)
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import create_sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
@@ -80,10 +86,17 @@ from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import sanity_check_mm_pad_shift_value
 from sglang.srt.mem_cache import kv_cache_dtype
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+from sglang.srt.mem_cache.kv_cache_configurator import (
+    KVCacheConfigurator,
+)
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
-from sglang.srt.model_executor.cuda_graph_config import cuda_graph_fully_disabled
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.cuda_graph_config import (
+    cuda_graph_fully_disabled,
+)
+from sglang.srt.model_executor.forward_batch_info import (
+    ForwardBatch,
+    PPProxyTensors,
+)
 from sglang.srt.model_executor.forward_context import (
     ForwardContext,
     forward_context,
@@ -142,15 +155,14 @@ from sglang.srt.model_executor.model_runner_components.weight_updater import (
     WeightUpdater,
 )
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
-from sglang.srt.model_executor.runner import EagerRunner, get_batch_sizes_to_capture
+from sglang.srt.model_executor.runner import (
+    EagerRunner,
+    get_batch_sizes_to_capture,
+)
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
-    get_device,
-    get_exec,
     get_global_dwdp_manager,
-    get_lora,
-    get_model,
-    get_schedule,
+    get_server_args,
     set_global_dwdp_manager,
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
@@ -307,7 +319,7 @@ class ModelRunner:
             self.init_threads_binding()
 
         # Set float32 matmul precision
-        if get_exec().features.enable_tf32_matmul:
+        if get_server_args().enable_tf32_matmul:
             torch.set_float32_matmul_precision("high")
 
         # Set device early so that TransferEngine init (e.g. Ascend NPU)
@@ -384,12 +396,12 @@ class ModelRunner:
 
     def _initialize_elastic_ep_joiner(self) -> None:
         if not (
-            get_exec().moe.elastic_ep_backend is not None
+            self.server_args.elastic_ep_backend is not None
             and self.server_args.is_ep_joiner
         ):
             return
 
-        is_scale_join = get_exec().moe.ep_join_mode == "scale"
+        is_scale_join = self.server_args.ep_join_mode == "scale"
         if is_scale_join:
             join_effective_ep_size = (
                 self.server_args.ep_join_rank_offset + self.ps.tp_size
@@ -472,7 +484,7 @@ class ModelRunner:
             device=self.device,
             gpu_id=self.gpu_id,
             model_config=self.model_config,
-            custom_weight_loaders=get_model().custom_weight_loader,
+            custom_weight_loaders=self.server_args.custom_weight_loader,
             get_model=lambda: self.model,
             update_model_fields=self.update_model_fields,
             recapture_cuda_graph=self.init_decode_cuda_graph,
@@ -549,7 +561,7 @@ class ModelRunner:
     def init_mindspore_runner(self):
         # Init the mindspore runner
         # for now, there is only some communication initialization work
-        if get_model().model_impl.lower() == ModelImpl.MINDSPORE and _is_npu:
+        if self.server_args.model_impl.lower() == ModelImpl.MINDSPORE and _is_npu:
             from sglang.srt.model_executor.mindspore_runner import init_ms_distributed
 
             init_ms_distributed(
@@ -606,7 +618,7 @@ class ModelRunner:
 
     def init_memory_saver_adapter(self):
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
-            enable=get_exec().features.enable_memory_saver
+            enable=self.server_args.enable_memory_saver
         )
 
     def maybe_init_remote_instance_transfer_engine(self):
@@ -642,7 +654,7 @@ class ModelRunner:
         )
 
     def maybe_init_lplb_solvers(self):
-        if get_exec().moe.ep_dispatch_algorithm == "lp" and not self.is_draft_worker:
+        if self.server_args.ep_dispatch_algorithm == "lp" and not self.is_draft_worker:
             init_lplb_solvers(model_config=self.model_config)
 
     def maybe_init_eplb_manager(self):
@@ -656,12 +668,12 @@ class ModelRunner:
                 get_expert_backup_client=lambda: self.expert_backup_client,
                 get_weight_updater=lambda: self.weight_updater,
             )
-            if get_exec().moe.enable_eplb and (not self.is_draft_worker)
+            if self.server_args.enable_eplb and (not self.is_draft_worker)
             else None
         )
 
     def maybe_init_elastic_ep(self):
-        if get_exec().moe.elastic_ep_backend:
+        if self.server_args.elastic_ep_backend:
             ElasticEPStateManager.init(self.server_args)
 
     def init_token_oracle(self):
@@ -680,8 +692,8 @@ class ModelRunner:
                 get_model=lambda: self.model,
             )
             if (
-                get_exec().moe.enable_elastic_expert_backup
-                and get_exec().moe.elastic_ep_backend is not None
+                self.server_args.enable_elastic_expert_backup
+                and self.server_args.elastic_ep_backend is not None
             )
             else None
         )
@@ -690,17 +702,17 @@ class ModelRunner:
         # In layered loading, torchao may have been applied
         torchao_applied = getattr(self.model, "torchao_applied", False)
         if not torchao_applied:
-            apply_torchao_config_to_model(self.model, get_exec().graph.torchao_config)
+            apply_torchao_config_to_model(self.model, get_server_args().torchao_config)
         supports_torch_tp = getattr(self.model, "supports_torch_tp", False)
         if self.ps.tp_size > 1 and supports_torch_tp:
             self.apply_torch_tp()
 
     def maybe_init_lora_manager(self):
-        if get_lora().enable_lora:
+        if self.server_args.enable_lora:
             self.init_lora_manager()
 
     def maybe_enable_batch_invariant_mode(self):
-        if get_exec().deterministic.enable_deterministic_inference:
+        if self.server_args.enable_deterministic_inference:
             from sglang.srt.batch_invariant_ops import enable_batch_invariant_mode
 
             enable_batch_invariant_mode()
@@ -961,7 +973,7 @@ class ModelRunner:
             get_offloader().post_init()
 
         # Register model for layerwise NVTX profiling if enabled
-        if get_exec().comm.enable_layerwise_nvtx_marker:
+        if self.server_args.enable_layerwise_nvtx_marker:
             pyt_hooks = PytHooks()
             pyt_hooks.register_hooks(self.model, module_prefix="model")
 
@@ -1018,7 +1030,7 @@ class ModelRunner:
         )
 
         dist_barrier_after_load(
-            elastic_ep_backend=get_exec().moe.elastic_ep_backend,
+            elastic_ep_backend=self.server_args.elastic_ep_backend,
             tp_rank=self.ps.tp_rank,
             is_ep_scale_joiner=self.server_args.is_ep_scale_joiner,
         )
@@ -1038,16 +1050,16 @@ class ModelRunner:
         self.lora_manager = LoRAManager(
             base_model=self.model,
             base_hf_config=self.model_config.hf_config,
-            max_loras_per_batch=get_lora().max_loras_per_batch,
+            max_loras_per_batch=self.server_args.max_loras_per_batch,
             load_config=self.load_config,
             dtype=self.dtype,
             server_args=self.server_args,
-            lora_backend=get_lora().lora_backend,
+            lora_backend=self.server_args.lora_backend,
             tp_size=self.ps.tp_size,
             tp_rank=self.ps.tp_rank,
-            max_lora_rank=get_lora().max_lora_rank,
-            target_modules=get_lora().lora_target_modules,
-            lora_paths=get_lora().lora_paths,
+            max_lora_rank=self.server_args.max_lora_rank,
+            target_modules=self.server_args.lora_target_modules,
+            lora_paths=self.server_args.lora_paths,
         )
         if not cuda_graph_fully_disabled():
             init_lora_cuda_graph_moe_buffers(
@@ -1319,7 +1331,7 @@ class ModelRunner:
                 )
         output.expert_distribution_metrics = recorder_outputs.get("metrics")
 
-        no_copy_to_cpu = not get_schedule().disable_overlap_schedule
+        no_copy_to_cpu = not self.server_args.disable_overlap_schedule
         if (
             not self.is_draft_worker
             and (experts_capturer := get_global_experts_capturer()) is not None
@@ -1349,7 +1361,7 @@ class ModelRunner:
             self.msprobe_debugger.stop()
             self.msprobe_debugger.step()
 
-        if get_exec().moe.elastic_ep_backend is not None:
+        if self.server_args.elastic_ep_backend is not None:
             self.maybe_join_ep_ranks()
 
         return output
@@ -1753,7 +1765,7 @@ class ModelRunner:
             recovered = maybe_recover_ep_ranks(
                 tp_group=self.tp_group,
                 eplb_manager=self.eplb_manager,
-                random_seed=get_device().random_seed,
+                random_seed=self.server_args.random_seed,
             )
             if recovered:
                 self.forward_pass_id = 0
@@ -1762,7 +1774,7 @@ class ModelRunner:
         local_timeout = (
             state.pending_since is not None
             and time.monotonic() - state.pending_since
-            > get_exec().moe.elastic_ep_scale_timeout
+            > self.server_args.elastic_ep_scale_timeout
         )
         timeout = state.active_ranks.new_tensor(int(local_timeout))
         dist.all_reduce(timeout, op=dist.ReduceOp.MAX, group=dist.group.WORLD)
@@ -1830,9 +1842,7 @@ class ModelRunner:
         load_config: LoadConfig,
     ) -> None:
         self.model = new_model
-        from sglang.srt.runtime_context import get_context
-
-        get_context().override(
+        self.server_args.override(
             "model_runner.update_model_fields",
             model_path=model_path,
             load_format=load_format,

@@ -33,7 +33,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.glm4 import Glm4DecoderLayer
 from sglang.srt.models.glm_ocr import GlmOcrForConditionalGeneration
-from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
@@ -139,7 +139,7 @@ class GlmOcrForConditionalGenerationNextN(GlmOcrForConditionalGeneration):
         self.logits_processor = LogitsProcessor(config)
 
         self.num_fused_shared_experts = (
-            0 if get_exec().moe.disable_shared_experts_fusion else 1
+            0 if get_server_args().disable_shared_experts_fusion else 1
         )
 
     @torch.no_grad()

@@ -877,14 +877,7 @@ class Engine(EngineScoreMixin, EngineBase):
                 server_args, port_args
             )
         else:
-            # Launch multi-tokenizer router. Unlike TokenizerManager, the router
-            # does not publish; but it runs in this parent process and reads
-            # resolved config through the namespace accessors (e.g. get_parallel()
-            # for routed_dp_rank), so publish here. The child TokenizerWorkers
-            # publish independently in their own processes.
-            from sglang.srt.runtime_context import publish
-
-            publish(server_args, role="tokenizer")
+            # Launch multi-tokenizer router
             tokenizer_manager = MultiTokenizerRouter(server_args, port_args)
             template_manager = None
 
@@ -1004,18 +997,12 @@ class Engine(EngineScoreMixin, EngineBase):
         )
 
     def get_server_info(self):
-        from sglang.srt.runtime_context import get_context
-
         internal_states = self.loop.run_until_complete(
             self.tokenizer_manager.get_internal_state()
         )
         return msgspec_to_builtins(
             {
-                # Overlay post-publish overrides so the report reflects current
-                # config (weight version, model path, runtime tunables).
-                **get_context().resolved_server_args_dict(
-                    base=dataclasses.asdict(self.tokenizer_manager.server_args)
-                ),
+                **dataclasses.asdict(self.tokenizer_manager.server_args),
                 **self._scheduler_init_result.scheduler_infos[0],
                 "internal_states": internal_states,
                 "version": __version__,

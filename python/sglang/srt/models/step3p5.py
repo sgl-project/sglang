@@ -4,13 +4,18 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from sglang.srt.distributed import get_pp_group, tensor_model_parallel_all_reduce
+from sglang.srt.distributed import (
+    get_pp_group,
+    tensor_model_parallel_all_reduce,
+)
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
-from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+from sglang.srt.layers.dp_attention import (
+    is_dp_attention_enabled,
+)
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -42,7 +47,6 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import (
-    get_exec,
     get_forward,
     get_parallel,
     get_server_args,
@@ -149,7 +153,7 @@ class Step3p5MoEMLP(nn.Module):
 
         self.experts = get_moe_impl_class(quant_config)(
             num_experts=config.moe_num_experts
-            + get_exec().moe.ep_num_redundant_experts,
+            + get_server_args().ep_num_redundant_experts,
             top_k=config.moe_top_k,
             layer_id=layer_id,
             hidden_size=config.hidden_size,
@@ -172,7 +176,7 @@ class Step3p5MoEMLP(nn.Module):
             # TODO: we will support tp < ep in the future
             self.ep_size = get_parallel().moe_ep_size
             self.moe_num_experts = (
-                config.moe_num_experts + get_exec().moe.ep_num_redundant_experts
+                config.moe_num_experts + get_server_args().ep_num_redundant_experts
             )
             self.top_k = config.moe_top_k
 
@@ -672,7 +676,7 @@ class Step3p5Model(nn.Module):
                 prefix=add_prefix("embed_tokens", prefix),
                 params_dtype=(
                     torch.float32
-                    if get_exec().deterministic.rl_on_policy_target is not None
+                    if get_server_args().rl_on_policy_target is not None
                     else None
                 ),
             )

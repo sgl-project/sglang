@@ -32,12 +32,7 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.qwen3_next import Qwen3NextForCausalLM, Qwen3NextModel
-from sglang.srt.runtime_context import (
-    get_model,
-    get_parallel,
-    get_server_args,
-    get_spec,
-)
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import add_prefix, is_npu
 
 logger = logging.getLogger(__name__)
@@ -56,7 +51,7 @@ class Qwen3NextForCausalLMMTP(Qwen3NextForCausalLM):
         config = copy.deepcopy(config)
         self.config = config
         self.tp_size = get_parallel().tp_size
-        if is_npu() and get_spec().speculative_draft_model_quantization is None:
+        if is_npu() and get_server_args().speculative_draft_model_quantization is None:
             quant_config = None
         self.quant_config = quant_config
         # if not set, model load will be broken in Qwen3NextForCausalLM load_weights()
@@ -115,7 +110,7 @@ class Qwen3NextForCausalLMMTP(Qwen3NextForCausalLM):
         if (
             is_npu()
             and self.quant_config is None
-            and get_model().quantization is not None
+            and get_server_args().quantization is not None
         ):
             # ascend mtp unquant
             exit_stack.enter_context(envs.SGLANG_DEEPEP_BF16_DISPATCH.override(True))
