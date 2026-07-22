@@ -4,11 +4,13 @@ import pytest
 import torch
 
 from sglang.kernels.ops.layernorm.elementwise import fused_sigmoid_mul
+from sglang.srt.utils import get_device
 
 DTYPES = [torch.float16, torch.bfloat16]
 TOKEN_COUNTS = [1, 2, 4, 8, 16, 64, 512, 1024, 2048, 4096, 8192]
 HIDDEN_DIMS = [2048, 3072, 4096, 6144]
 NUM_HEADS = [1, 28]
+DEVICE = get_device()
 
 
 def _reference(attn_output, gate):
@@ -27,8 +29,8 @@ def seed():
 def test_correctness(num_tokens, hidden_dim, dtype):
     rtol, atol = (2e-2, 2e-2) if dtype == torch.bfloat16 else (1e-2, 1e-2)
 
-    attn_output = torch.randn(num_tokens, hidden_dim, dtype=dtype, device="cuda")
-    gate = torch.randn(num_tokens, hidden_dim, dtype=dtype, device="cuda")
+    attn_output = torch.randn(num_tokens, hidden_dim, dtype=dtype, device=DEVICE)
+    gate = torch.randn(num_tokens, hidden_dim, dtype=dtype, device=DEVICE)
 
     ref = _reference(attn_output, gate)
     out = fused_sigmoid_mul(attn_output, gate)
@@ -46,9 +48,9 @@ def test_3d_shape(num_tokens, num_heads, dtype):
     head_dim = 128
 
     attn_output = torch.randn(
-        num_tokens, num_heads, head_dim, dtype=dtype, device="cuda"
+        num_tokens, num_heads, head_dim, dtype=dtype, device=DEVICE
     )
-    gate = torch.randn(num_tokens, num_heads, head_dim, dtype=dtype, device="cuda")
+    gate = torch.randn(num_tokens, num_heads, head_dim, dtype=dtype, device=DEVICE)
 
     ref = _reference(attn_output, gate)
     out = fused_sigmoid_mul(attn_output, gate)
@@ -68,12 +70,12 @@ def test_strided_gate(num_tokens, num_heads, dtype):
 
     # Simulate the real pattern: chunk produces non-contiguous views
     q_gate = torch.randn(
-        num_tokens, num_heads, 2 * head_dim, dtype=dtype, device="cuda"
+        num_tokens, num_heads, 2 * head_dim, dtype=dtype, device=DEVICE
     )
     _, gate = torch.chunk(q_gate, 2, dim=-1)
     # gate is non-contiguous when num_tokens > 1 or num_heads > 1
 
-    attn_output = torch.randn(num_tokens, hidden_dim, dtype=dtype, device="cuda")
+    attn_output = torch.randn(num_tokens, hidden_dim, dtype=dtype, device=DEVICE)
     gate_flat = gate.reshape(num_tokens, hidden_dim)
 
     ref = _reference(attn_output, gate_flat)
@@ -92,10 +94,10 @@ def test_qwen3_5_moe_target_strided_gate(num_tokens, dtype):
     hidden_dim = num_heads * head_dim
 
     q_gate = torch.randn(
-        num_tokens, num_heads, 2 * head_dim, dtype=dtype, device="cuda"
+        num_tokens, num_heads, 2 * head_dim, dtype=dtype, device=DEVICE
     )
     _, gate = torch.chunk(q_gate, 2, dim=-1)
-    attn_output = torch.randn(num_tokens, hidden_dim, dtype=dtype, device="cuda")
+    attn_output = torch.randn(num_tokens, hidden_dim, dtype=dtype, device=DEVICE)
 
     ref = _reference(attn_output, gate.reshape(num_tokens, hidden_dim))
     out = fused_sigmoid_mul(attn_output, gate, inplace=False)
@@ -106,8 +108,8 @@ def test_qwen3_5_moe_target_strided_gate(num_tokens, dtype):
 @pytest.mark.parametrize("dtype", DTYPES)
 def test_gate_near_zero(dtype):
     num_tokens, hidden_dim = 16, 2048
-    attn_output = torch.randn(num_tokens, hidden_dim, dtype=dtype, device="cuda")
-    gate = torch.zeros(num_tokens, hidden_dim, dtype=dtype, device="cuda")
+    attn_output = torch.randn(num_tokens, hidden_dim, dtype=dtype, device=DEVICE)
+    gate = torch.zeros(num_tokens, hidden_dim, dtype=dtype, device=DEVICE)
 
     ref = _reference(attn_output, gate)
     out = fused_sigmoid_mul(attn_output, gate)
@@ -118,9 +120,9 @@ def test_gate_near_zero(dtype):
 def test_returns_new_tensor():
     num_tokens, hidden_dim = 32, 2048
     attn_output = torch.randn(
-        num_tokens, hidden_dim, dtype=torch.float16, device="cuda"
+        num_tokens, hidden_dim, dtype=torch.float16, device=DEVICE
     )
-    gate = torch.randn(num_tokens, hidden_dim, dtype=torch.float16, device="cuda")
+    gate = torch.randn(num_tokens, hidden_dim, dtype=torch.float16, device=DEVICE)
 
     out = fused_sigmoid_mul(attn_output, gate)
 
