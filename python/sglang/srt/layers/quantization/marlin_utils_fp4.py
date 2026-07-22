@@ -554,9 +554,7 @@ def prepare_moe_nvfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
     layer.w2_weight = torch.nn.Parameter(_repack_weight(w2, False), requires_grad=False)
     w13_scale_marlin, w13_scale_factor = _permute_scales(w13_scale, True)
     w2_scale_marlin, w2_scale_factor = _permute_scales(w2_scale, False)
-    layer.w13_weight_scale = torch.nn.Parameter(
-        w13_scale_marlin, requires_grad=False
-    )
+    layer.w13_weight_scale = torch.nn.Parameter(w13_scale_marlin, requires_grad=False)
     layer.w2_weight_scale = torch.nn.Parameter(w2_scale_marlin, requires_grad=False)
     layer.w13_weight_scale_2 = torch.nn.Parameter(
         _process_global_scale(w13_global_scale, w13_scale_factor),

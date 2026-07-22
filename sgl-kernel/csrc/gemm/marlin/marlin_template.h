@@ -285,25 +285,25 @@ template <
     const bool is_zp_float                 // is zero point of float16 type?
     >
 __global__ void Marlin(
-    const int4* __restrict__ A,               // fp16 input matrix of shape mxk
-    const int4* __restrict__ B,               // 4bit quantized weight matrix of shape kxn
-    int4* __restrict__ C,                     // fp16 output buffer of shape mxn
-    int4* __restrict__ C_tmp,                 // fp32 tmp output buffer (for reduce)
-    const int4* __restrict__ scales_ptr,      // fp16 quantization scales of shape
-                                              // (k/groupsize)xn
-    const float* __restrict__ scale2_ptr,     // fp32 global scale (for nvfp4
-                                              // only)
-    const int4* __restrict__ zp_ptr,          // 4bit packed zero-points of shape
-                                              // (k/groupsize)x(n/pack_factor)
-    const int* __restrict__ g_idx,            // int32 group indices of shape k
-    int num_groups,                           // number of scale groups per output channel
-    int prob_m,                               // batch dimension m
-    int prob_n,                               // output dimension n
-    int prob_k,                               // reduction dimension k
-    int lda,                                  // A.stride(0), equal to prob_k is A is contiguous
-    int* locks,                               // extra global storage for barrier synchronization
-    bool use_atomic_add,                      // whether to use atomic add to reduce
-    bool use_fp32_reduce,                     // whether to use fp32 global reduce
+    const int4* __restrict__ A,            // fp16 input matrix of shape mxk
+    const int4* __restrict__ B,            // 4bit quantized weight matrix of shape kxn
+    int4* __restrict__ C,                  // fp16 output buffer of shape mxn
+    int4* __restrict__ C_tmp,              // fp32 tmp output buffer (for reduce)
+    const int4* __restrict__ scales_ptr,   // fp16 quantization scales of shape
+                                           // (k/groupsize)xn
+    const float* __restrict__ scale2_ptr,  // fp32 global scale (for nvfp4
+                                           // only)
+    const int4* __restrict__ zp_ptr,       // 4bit packed zero-points of shape
+                                           // (k/groupsize)x(n/pack_factor)
+    const int* __restrict__ g_idx,         // int32 group indices of shape k
+    int num_groups,                        // number of scale groups per output channel
+    int prob_m,                            // batch dimension m
+    int prob_n,                            // output dimension n
+    int prob_k,                            // reduction dimension k
+    int lda,                               // A.stride(0), equal to prob_k is A is contiguous
+    int* locks,                            // extra global storage for barrier synchronization
+    bool use_atomic_add,                   // whether to use atomic add to reduce
+    bool use_fp32_reduce,                  // whether to use fp32 global reduce
     int max_shared_mem) {
   // Each threadblock processes one "stripe" of the B matrix with (roughly) the
   // same size, which might involve multiple column "slices" (of width 16 *
