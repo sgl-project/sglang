@@ -53,6 +53,32 @@ class DecodeKVCacheOffloadManager:
             self.offload_stride = max(
                 self.page_size, (env_stride // self.page_size) * self.page_size
             )
+
+        # Parse extra config early to check standalone_storage before creating
+        # the host pool. Only standalone mode requires MooncakeHostTensorAllocator.
+        hicache_storage_backend_extra_config = {}
+        standalone_storage = False
+        if server_args.hicache_storage_backend_extra_config:
+            try:
+                hicache_storage_backend_extra_config = json.loads(
+                    server_args.hicache_storage_backend_extra_config
+                )
+                standalone_storage = str(
+                    hicache_storage_backend_extra_config.get(
+                        "standalone_storage", False
+                    )
+                ).lower() in ("true", "1")
+            except json.JSONDecodeError as e:
+                raise ValueError(
+                    f"Invalid hicache storage backend extra config JSON: {e}"
+                )
+
+        allocator_type = (
+            server_args.hicache_storage_backend
+            if standalone_storage and server_args.hicache_storage_backend == "mooncake"
+            else "default"
+        )
+
         kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
         if isinstance(kv_cache, MHATokenToKVPool):
             self.decode_host_mem_pool = get_mha_host_pool_cls(kv_cache)(
@@ -61,6 +87,7 @@ class DecodeKVCacheOffloadManager:
                 server_args.hicache_size,
                 self.page_size,
                 server_args.hicache_mem_layout,
+                allocator_type=allocator_type,
             )
         elif isinstance(kv_cache, MLATokenToKVPool):
             self.decode_host_mem_pool = MLATokenToKVPoolHost(
@@ -69,23 +96,13 @@ class DecodeKVCacheOffloadManager:
                 server_args.hicache_size,
                 self.page_size,
                 server_args.hicache_mem_layout,
+                allocator_type=allocator_type,
             )
         else:
             raise ValueError("Unsupported KV cache type for decode offload")
 
         self.tp_group = tp_group
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
-
-        hicache_storage_backend_extra_config = {}
-        if server_args.hicache_storage_backend_extra_config:
-            try:
-                hicache_storage_backend_extra_config = json.loads(
-                    server_args.hicache_storage_backend_extra_config
-                )
-            except json.JSONDecodeError as e:
-                raise ValueError(
-                    f"Invalid hicache storage backend extra config JSON: {e}"
-                )
 
         self.cache_controller = HiCacheController(
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
