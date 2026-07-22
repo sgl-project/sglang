@@ -1,18 +1,15 @@
 /* MXFP4 fused decode attention for DeepSeek V4 on Hopper (SM90).
 
-   Reads packed MXFP4 K-cache rows (E2M1 noPE + E8M0 block-32 scales + BF16
-   RoPE), dequantizes on the fly into per-warp shared memory, and computes
-   QK^T + softmax + V-weighted sum in a single kernel.
+   Reads packed MXFP4 K-cache rows, dequantizes E2M1+E8M0 entirely in
+   registers, and computes QK^T + softmax + V-weighted sum in a single
+   kernel.  No shared memory per token — the warp uses warp shuffle to
+   align the strided dequant with Q.
 
-   Grid: ceil(num_queries / kNumWarps)  — multiple heads per block.
-   Each of the kNumWarps (4) warps handles one (batch, head) independently,
-   using its own shared-memory partition.
+   Grid: ceil(num_queries / kNumWarps)
+   Each warp handles one (batch, head).
 
-   MXFP4 row layout — 368 bytes per token, row-major contiguous:
-     [224 B packed E2M1 noPE | 14 B E8M0 scales + 2 B pad | 128 B BF16 RoPE]
-
-   E8M0:  value = 2^(byte - 127).  No global scale needed.
-   E2M1:  sign[3] | exp[2:1] | mant[0] → 16 discrete values.                */
+   MXFP4 row layout (368 bytes/tok):
+     [224 B packed E2M1 | 14 B E8M0 + 2 B pad | 128 B BF16 RoPE]    */
 
 #pragma once
 
@@ -22,7 +19,6 @@
 #include <sgl_kernel/math.cuh>
 #include <sgl_kernel/type.cuh>
 #include <sgl_kernel/utils.cuh>
-#include <sgl_kernel/vec.cuh>
 #include <sgl_kernel/warp.cuh>
 
 #include <tvm/ffi/container/tensor.h>
@@ -34,43 +30,40 @@ namespace {
 using DType = bf16_t;
 
 static constexpr uint32_t kBlockSize = 128;
-static constexpr uint32_t kNumWarps = kBlockSize / device::kWarpThreads;  // 4
+static constexpr uint32_t kNumWarps = kBlockSize / device::kWarpThreads;
+static constexpr uint32_t kLanes = device::kWarpThreads;  // 32
 
 static constexpr int64_t kHeadDim = 512;
 static constexpr int64_t kNopeDim = 448;
 static constexpr int64_t kRopeDim = 64;
 static constexpr int64_t kGroupSize = 32;
-static constexpr int64_t kNumGroups = kNopeDim / kGroupSize;  // 14
-static constexpr int64_t kBytesPerGroup = kGroupSize / 2;     // 16
-static constexpr int64_t kBytesPerToken =                     // 368
-    (kNopeDim / 2) + kNumGroups + 2 + (kRopeDim * 2);
+static constexpr int64_t kNumGroups = kNopeDim / kGroupSize;                                 // 14
+static constexpr int64_t kBytesPerGroup = kGroupSize / 2;                                    // 16
+static constexpr int64_t kBytesPerToken = (kNopeDim / 2) + kNumGroups + 2 + (kRopeDim * 2);  // 368
 
-// byte offsets within a token row
 static constexpr int64_t kOffNope = 0;
 static constexpr int64_t kOffScale = kNopeDim / 2;               // 224
 static constexpr int64_t kOffRope = kOffScale + kNumGroups + 2;  // 240
+static constexpr int64_t kValsPerLane = kHeadDim / kLanes;       // 16
 
 static_assert(kOffRope + kRopeDim * 2 == kBytesPerToken);
 static_assert(kBytesPerToken == 368);
+static_assert(kHeadDim % kLanes == 0);
+static_assert(kNopeDim % kGroupSize == 0);
 
-// --- E2M1 / E8M0 -------------------------------------------------------------
+// --- fast helpers -----------------------------------------------------------
 
-__device__ __forceinline__ float e2m1_positive(uint32_t code) {
+__device__ __forceinline__ float e2m1_val(uint32_t code) {
   constexpr float lut[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
   return lut[code & 0x07u];
 }
 
-// Fast E8M0 → float: 2^(bits-127) as an integer shift of the IEEE 754
-// exponent field.  Subnormals (bits == 0 → 2^-127 ≈ 5.88e-39) are clamped
-// to zero, which is safe for scale factors.
 __device__ __forceinline__ float e8m0_to_float(uint8_t bits) {
-  if (bits == 0) return 0.0f;  // 2^-127 is practically zero
-  const int k = static_cast<int>(bits) - 127;
-  const uint32_t u = static_cast<uint32_t>(k + 127) << 23;
-  return __int_as_float(u);
+  if (bits == 0) return 0.0f;
+  return __int_as_float(static_cast<uint32_t>(static_cast<int>(bits) - 127 + 127) << 23);
 }
 
-// --- parameter struct --------------------------------------------------------
+// --- parameter struct -------------------------------------------------------
 
 struct Mxfp4DecodeParams {
   const void* __restrict__ q;
@@ -84,110 +77,105 @@ struct Mxfp4DecodeParams {
 };
 
 // --- kernel -----------------------------------------------------------------
-// Each warp handles one (batch, head) independently.
-// Shared memory is partitioned per warp: s_k[warp_id][kHeadDim].
+
+// Q and K are distributed across warp lanes with the same strided layout:
+//   lane i holds values at positions [i, 32+i, 64+i, ..., head_dim-32+i]
+// This lets the dot product be a local reduction per lane followed by a
+// warp-level sum — no shared memory needed.
 
 template <bool kUsePDL>
 __global__ void mxfp4_decode_kernel(const __grid_constant__ Mxfp4DecodeParams params) {
   using namespace device;
 
-  const auto& [q, k_cache, indices, o, sm_scale, page_stride_bytes, page_size, nq] = params;
-  (void)nq;
-
-  const uint32_t warp_id = threadIdx.x / kWarpThreads;
-  const uint32_t lane_id = threadIdx.x % kWarpThreads;
-  const uint32_t gid = blockIdx.x * kNumWarps + warp_id;  // global query id
-
-  if (gid >= params.num_queries) return;  // tail block padding
-
-  // per-warp shared memory partition
-  __shared__ DType s_k[kNumWarps][kHeadDim];  // 4 × 1024 = 4096 bytes
-  DType* my_s_k = s_k[warp_id];               // this warp's partition
+  const uint32_t lane_id = threadIdx.x % kLanes;
+  const uint32_t warp_id = threadIdx.x / kLanes;
+  const uint32_t gid = blockIdx.x * kNumWarps + warp_id;
+  if (gid >= params.num_queries) return;
 
   PDLWaitPrimary<kUsePDL>();
 
-  // ---- load Q (16 contiguous values per lane) --------------------------------
-  float q_val[16];
+  // ---- load Q in strided order (matching K dequant layout) ----------------
+  float q_val[kValsPerLane];  // 16 floats / lane
   {
-    const auto* q_bf16 = static_cast<const bf16_t*>(q) + gid * kHeadDim;
+    const auto* q_bf16 = static_cast<const bf16_t*>(params.q) + gid * kHeadDim;
+    // Lane i loads Q at [i, 32+i, 64+i, ..., 480+i]
 #pragma unroll
-    for (int i = 0; i < 16; ++i)
-      q_val[i] = cast<float>(q_bf16[lane_id * 16 + i]);
+    for (int g = 0; g < kNumGroups; ++g)
+      q_val[g] = cast<float>(q_bf16[g * kGroupSize + lane_id]);
+
+    // rope positions: 448 + lane_id, 448 + 32 + lane_id
+#pragma unroll
+    for (int j = 0; j < kRopeDim / kLanes; ++j)
+      q_val[kNumGroups + j] = cast<float>(q_bf16[kNopeDim + j * kLanes + lane_id]);
   }
 
-  // ---- locate K page --------------------------------------------------------
-  const int32_t page_idx = indices[gid];
-  const auto* page_base = k_cache + static_cast<size_t>(page_idx) * page_stride_bytes;
+  // ---- locate page ---------------------------------------------------------
+  const int32_t page_idx = params.indices[gid];
+  const auto* page_base = params.k_cache + static_cast<size_t>(page_idx) * params.page_stride_bytes;
 
-  // ---- online softmax state -------------------------------------------------
-  float m = -1e30f;
-  float s = 0.0f;
-  float o_val[16] = {};
+  // ---- state ---------------------------------------------------------------
+  float m = -1e30f, s_val = 0.0f;
+  float o_val[kValsPerLane] = {};
 
-  // ---- scan tokens -----------------------------------------------------------
-  for (uint32_t tk = 0; tk < page_size; ++tk) {
+  // ---- scan tokens ----------------------------------------------------------
+  for (uint32_t tk = 0; tk < params.page_size; ++tk) {
     const auto* row = page_base + static_cast<size_t>(tk) * kBytesPerToken;
+    float k_val[kValsPerLane];
 
-    // 1) dequant noPE → shared memory (all lanes collaborate)
+    // dequant noPE (same strided layout as Q)
 #pragma unroll
     for (int g = 0; g < kNumGroups; ++g) {
       const uint32_t byte_off = g * kBytesPerGroup + (lane_id / 2);
-      const uint8_t packed_byte = row[byte_off];
-      const uint8_t nibble = (lane_id & 1u) ? (packed_byte >> 4) : (packed_byte & 0x0Fu);
-      const float val = e2m1_positive(nibble & 0x07u);
-      const float scale = e8m0_to_float(row[kOffScale + g]);
-      const bool neg = (nibble & 0x08u) != 0;
-      my_s_k[g * kGroupSize + lane_id] = cast<DType>(neg ? -val * scale : val * scale);
+      const uint8_t raw = row[byte_off];
+      const uint8_t nib = (lane_id & 1u) ? (raw >> 4) : (raw & 0x0Fu);
+      const float v = e2m1_val(nib);
+      const float scl = e8m0_to_float(row[kOffScale + g]);
+      k_val[g] = (nib & 0x08u) ? -v * scl : v * scl;
     }
 
-    // 2) load RoPE → shared memory
-    {
-      const auto* rope_src = reinterpret_cast<const DType*>(row + kOffRope);
+    // rope
 #pragma unroll
-      for (int j = 0; j < kRopeDim / kWarpThreads; ++j) {
-        const int idx = lane_id + j * kWarpThreads;
-        my_s_k[kNopeDim + idx] = rope_src[idx];
-      }
+    for (int j = 0; j < kRopeDim / kLanes; ++j) {
+      const auto* rope_ptr = reinterpret_cast<const bf16_t*>(row + kOffRope);
+      k_val[kNumGroups + j] = cast<float>(rope_ptr[j * kLanes + lane_id]);
     }
 
-    __syncwarp();
-
-    // 3) dot product Q · K (contiguous from shared memory)
+    // dot product
     float dot = 0.0f;
 #pragma unroll
-    for (int i = 0; i < 16; ++i) {
-      const int pos = lane_id * 16 + i;
-      dot += q_val[i] * cast<float>(my_s_k[pos]);
-    }
+    for (int i = 0; i < kValsPerLane; ++i)
+      dot += q_val[i] * k_val[i];
     dot = warp::reduce_sum(dot);
-    dot *= sm_scale;
+    dot *= params.sm_scale;
 
-    // 4) online softmax
+    // online softmax
     const float m_new = max(m, dot);
-    const float e = expf(dot - m_new);
+    const float e_val = expf(dot - m_new);
     const float rc = expf(m - m_new);
-    s = s * rc + e;
+    s_val = s_val * rc + e_val;
     m = m_new;
 
-    // 5) V-weighted sum (K = V)
+    // V-weighted sum
 #pragma unroll
-    for (int i = 0; i < 16; ++i) {
-      const int pos = lane_id * 16 + i;
-      o_val[i] = o_val[i] * rc + cast<float>(my_s_k[pos]) * e;
-    }
+    for (int i = 0; i < kValsPerLane; ++i)
+      o_val[i] = o_val[i] * rc + k_val[i] * e_val;
   }
 
-  // ---- finalize: o /= s, store ----------------------------------------------
-  const float inv_s = (s > 0.0f) ? (1.0f / s) : 0.0f;
-  auto* o_bf16 = static_cast<bf16_t*>(o) + gid * kHeadDim;
+  // ---- finalize & store -----------------------------------------------------
+  const float inv_s = (s_val > 0.0f) ? (1.0f / s_val) : 0.0f;
+  auto* o_bf16 = static_cast<bf16_t*>(params.o) + gid * kHeadDim;
+  // Store in strided layout (same as Q/K)
 #pragma unroll
-  for (int i = 0; i < 16; ++i)
-    o_bf16[lane_id * 16 + i] = cast<bf16_t>(o_val[i] * inv_s);
+  for (int g = 0; g < kNumGroups; ++g)
+    o_bf16[g * kGroupSize + lane_id] = cast<bf16_t>(o_val[g] * inv_s);
+#pragma unroll
+  for (int j = 0; j < kRopeDim / kLanes; ++j)
+    o_bf16[kNopeDim + j * kLanes + lane_id] = cast<bf16_t>(o_val[kNumGroups + j] * inv_s);
 
   PDLTriggerSecondary<kUsePDL>();
 }
 
-// --- host-side wrapper (TVM entry point) ------------------------------------
+// --- TVM entry --------------------------------------------------------------
 
 template <bool kUsePDL>
 struct Mxfp4DecodeKernel {
@@ -199,19 +187,18 @@ struct Mxfp4DecodeKernel {
       float sm_scale,
       int64_t page_size) {
     using namespace host;
-
     auto B = SymbolicSize{"num_queries"};
-    auto device_ = SymbolicDevice{};
-    device_.set_options<kDLCUDA>();
+    auto D = SymbolicDevice{};
+    D.set_options<kDLCUDA>();
 
-    TensorMatcher({B, kHeadDim}).with_dtype<bf16_t>().with_device(device_).verify(q);
-    TensorMatcher({-1, kBytesPerToken}).with_dtype<uint8_t>().with_device(device_).verify(k_cache);
-    TensorMatcher({B}).with_dtype<int32_t>().with_device(device_).verify(indices);
-    TensorMatcher({B, kHeadDim}).with_dtype<bf16_t>().with_device(device_).verify(o);
+    TensorMatcher({B, kHeadDim}).with_dtype<bf16_t>().with_device(D).verify(q);
+    TensorMatcher({-1, kBytesPerToken}).with_dtype<uint8_t>().with_device(D).verify(k_cache);
+    TensorMatcher({B}).with_dtype<int32_t>().with_device(D).verify(indices);
+    TensorMatcher({B, kHeadDim}).with_dtype<bf16_t>().with_device(D).verify(o);
     RuntimeCheck(page_size > 0);
 
-    const uint32_t num_queries = static_cast<uint32_t>(B.unwrap());
-    if (num_queries == 0) return;
+    const uint32_t nq = static_cast<uint32_t>(B.unwrap());
+    if (nq == 0) return;
 
     const auto params = Mxfp4DecodeParams{
         .q = q.data_ptr(),
@@ -221,11 +208,10 @@ struct Mxfp4DecodeKernel {
         .sm_scale = sm_scale,
         .page_stride_bytes = static_cast<uint32_t>(static_cast<uint32_t>(page_size) * kBytesPerToken),
         .page_size = static_cast<uint32_t>(page_size),
-        .num_queries = num_queries,
+        .num_queries = nq,
     };
-
-    const uint32_t num_blocks = div_ceil(num_queries, kNumWarps);
-    LaunchKernel(num_blocks, kBlockSize, device_.unwrap()).enable_pdl(kUsePDL)(mxfp4_decode_kernel<kUsePDL>, params);
+    LaunchKernel(div_ceil(nq, kNumWarps), kBlockSize, D.unwrap())
+        .enable_pdl(kUsePDL)(mxfp4_decode_kernel<kUsePDL>, params);
   }
 };
 
