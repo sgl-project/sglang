@@ -126,6 +126,10 @@ class ForwardMetadata:
 _AITER_PARTITION_SIZE_ROCM = 256
 
 
+def _get_aiter_max_batch_size(req_to_token: torch.Tensor, topk: int) -> int:
+    return req_to_token.shape[0] * topk
+
+
 class AiterAttnBackend(AttentionBackend):
     def __init__(
         self,
@@ -181,13 +185,21 @@ class AiterAttnBackend(AttentionBackend):
         self.max_context_len = model_runner.model_config.context_len
         self.skip_prefill = skip_prefill
 
-        max_bs = model_runner.req_to_token_pool.size
+        # req_to_token includes the padding row at index 0. Overlap scheduling
+        # can temporarily include that row as an extra decode entry, so eager
+        # metadata must cover the tensor's full row capacity rather than only
+        # the number of allocatable request slots.
+        max_bs = _get_aiter_max_batch_size(self.req_to_token, self.topk)
 
         if kv_indptr_buf is None:
             self.kv_indptr = torch.zeros(
                 (max_bs + 1,), dtype=torch.int32, device=model_runner.device
             )
         else:
+            assert kv_indptr_buf.shape[0] >= max_bs + 1, (
+                f"kv_indptr_buf has {kv_indptr_buf.shape[0]} entries, but AITER "
+                f"requires at least {max_bs + 1} for {max_bs} request rows."
+            )
             self.kv_indptr = kv_indptr_buf
 
         self.kv_last_page_len = torch.ones(
@@ -2801,7 +2813,9 @@ class AiterMultiStepDraftBackend:
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
         self.generate_draft_decode_kv_indices = generate_draft_decode_kv_indices
-        max_bs = model_runner.req_to_token_pool.size * self.topk
+        max_bs = _get_aiter_max_batch_size(
+            model_runner.req_to_token_pool.req_to_token, self.topk
+        )
         self.kv_indptr = torch.zeros(
             (
                 self.speculative_num_steps,

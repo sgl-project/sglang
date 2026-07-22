@@ -16,6 +16,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     CudaGraphConfig,
     Phase,
     PhaseConfig,
+    default_cuda_graph_config,
 )
 from sglang.srt.server_args import PortArgs, ServerArgs, prepare_server_args
 from sglang.srt.server_args_config_parser import ConfigArgumentMerger
@@ -1125,6 +1126,35 @@ class TestWaterfillArgs(CustomTestCase):
         self.assertEqual(server_args.deepep_mode, "low_latency")
         self.assertFalse(server_args.disable_cuda_graph)
         self.assertTrue(server_args.enforce_shared_experts_fusion)
+
+
+class TestMoriArgs(CustomTestCase):
+    def test_mori_auto_mode_disables_decode_cuda_graph(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            moe_a2a_backend="mori",
+            deepep_mode="auto",
+            cuda_graph_config=default_cuda_graph_config(),
+            chunked_prefill_size=-1,
+        )
+
+        server_args._handle_a2a_moe()
+
+        self.assertEqual(server_args.deepep_mode, "normal")
+        self.assertEqual(server_args.cuda_graph_config.decode.backend, Backend.DISABLED)
+
+    def test_mori_normal_mode_disables_decode_cuda_graph(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            moe_a2a_backend="mori",
+            deepep_mode="normal",
+            cuda_graph_config=default_cuda_graph_config(),
+            chunked_prefill_size=-1,
+        )
+
+        server_args._handle_a2a_moe()
+
+        self.assertEqual(server_args.cuda_graph_config.decode.backend, Backend.DISABLED)
 
 
 class TestPrefillOnlyDisableKvCache(unittest.TestCase):

@@ -5687,6 +5687,15 @@ class ServerArgs:
             if self.deepep_mode == "auto":
                 self.deepep_mode = "normal"
                 logger.warning("auto set deepep_mode=`normal` for MORI EP")
+            if (
+                self.deepep_mode == "normal"
+                and self.cuda_graph_config.decode.backend != Backend.DISABLED
+            ):
+                logger.warning(
+                    "Decode CUDA graph is disabled because MORI normal mode "
+                    "requires eager replay for correct dispatch/combine inputs."
+                )
+                self.cuda_graph_config.decode.backend = Backend.DISABLED
             logger.warning(
                 f"MoRI MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
