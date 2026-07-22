@@ -8,6 +8,7 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST,
     CustomTestCase,
+    is_in_amd_ci,
     is_in_ci,
     run_bench_serving,
     write_github_step_summary,
@@ -30,7 +31,13 @@ class TestVLMPerf5090(CustomTestCase):
             dataset_name="mmmu",
         )
 
-        if is_in_ci():
+        if is_in_amd_ci():
+            write_github_step_summary(
+                f"### test_vlm_offline_throughput\n"
+                f"Output throughput: {res['output_throughput']:.2f} token/s\n"
+            )
+            self.assertGreater(res["output_throughput"], 800)
+        elif is_in_ci():
             write_github_step_summary(
                 f"### test_vlm_offline_throughput (5090)\n"
                 f"Output throughput: {res['output_throughput']:.2f} token/s\n"
@@ -49,7 +56,15 @@ class TestVLMPerf5090(CustomTestCase):
             dataset_name="mmmu",
         )
 
-        if is_in_ci():
+        if is_in_amd_ci():
+            write_github_step_summary(
+                f"### test_vlm_online_latency\n"
+                f"median_e2e_latency_ms: {res['median_e2e_latency_ms']:.2f} ms\n"
+            )
+            self.assertLess(res["median_e2e_latency_ms"], 500000)
+            self.assertLess(res["median_ttft_ms"], 300000)
+            self.assertLess(res["median_itl_ms"], 8)
+        elif is_in_ci():
             write_github_step_summary(
                 f"### test_vlm_online_latency (5090)\n"
                 f"median_e2e_latency_ms: {res['median_e2e_latency_ms']:.2f} ms\n"
