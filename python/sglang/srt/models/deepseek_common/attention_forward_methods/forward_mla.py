@@ -68,7 +68,7 @@ from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.state_capturer.indexer_topk import (
     maybe_capture_indexer_topk,
 )
-from sglang.srt.utils import BumpAllocator
+from sglang.srt.utils import BumpAllocator, get_bool_env_var
 from sglang.srt.utils.custom_op import register_custom_op
 
 logger = logging.getLogger(__name__)
@@ -114,38 +114,54 @@ if _is_cuda:
 
 
 if _use_aiter:
-    # aiter ROCm/aiter#2958 renamed the public `fused_qk_rmsnorm` in
-    # `aiter.ops.fused_qk_norm_rope_cache_quant` to a private `_fused_qk_rmsnorm`
-    # and introduced a unified entry point in `aiter.ops.fused_qk_rmsnorm_group_quant`
-    # with a different (in-place, kwarg-only, no-return) signature. Probe for the
-    # new symbol first so SGLang works with both pre- and post-#2958 aiter without
-    # requiring the docker pin to be bumped atomically.
-    try:
-        from aiter.ops.enum import QuantType as _AiterQuantType
-        from aiter.ops.fused_qk_rmsnorm_group_quant import (
-            fused_qk_rmsnorm as _aiter_fused_qk_rmsnorm_unified,
-        )
-
-        def fused_qk_rmsnorm_bf16(q, q_weight, q_eps, k, k_weight, k_eps):
-            q_out = torch.empty_like(q)
-            k_out = torch.empty_like(k)
-            _aiter_fused_qk_rmsnorm_unified(
-                q_out_quantized=q_out,
-                k_out=k_out,
-                q=q,
-                q_weight=q_weight,
-                q_epsilon=q_eps,
-                k=k,
-                k_weight=k_weight,
-                k_epsilon=k_eps,
-                quant_type=_AiterQuantType.No,
+    # On gfx1250 the aiter `module_fused_qk_norm_rope_cache_quant_shuffle` kernel
+    # fails to JIT-build (its `rope_common.h` / `ck_tile/vec_convert.h` are
+    # incompatible with this image's composable_kernel), which crashes the very
+    # first MLA forward. This path is a pure RMSNorm (quant_type=No), so under the
+    # gfx1250 workaround flag (AITER_FORCE_A8W4) substitute a self-contained Triton
+    # RMSNorm that never touches the aiter fp4 kernel build.
+    if get_bool_env_var("AITER_FORCE_A8W4", "false"):
+        if get_bool_env_var("SGLANG_QK_RMSNORM_TORCH", "false"):
+            from sglang.srt.models.deepseek_common.attention_forward_methods.triton_qk_rmsnorm import (
+                fused_qk_rmsnorm_torch as fused_qk_rmsnorm_bf16,
             )
-            return q_out, k_out
+        else:
+            from sglang.srt.models.deepseek_common.attention_forward_methods.triton_qk_rmsnorm import (
+                fused_qk_rmsnorm_triton as fused_qk_rmsnorm_bf16,
+            )
+    else:
+        # aiter ROCm/aiter#2958 renamed the public `fused_qk_rmsnorm` in
+        # `aiter.ops.fused_qk_norm_rope_cache_quant` to a private `_fused_qk_rmsnorm`
+        # and introduced a unified entry point in `aiter.ops.fused_qk_rmsnorm_group_quant`
+        # with a different (in-place, kwarg-only, no-return) signature. Probe for the
+        # new symbol first so SGLang works with both pre- and post-#2958 aiter without
+        # requiring the docker pin to be bumped atomically.
+        try:
+            from aiter.ops.enum import QuantType as _AiterQuantType
+            from aiter.ops.fused_qk_rmsnorm_group_quant import (
+                fused_qk_rmsnorm as _aiter_fused_qk_rmsnorm_unified,
+            )
 
-    except ImportError:
-        from aiter.ops.fused_qk_norm_rope_cache_quant import (
-            fused_qk_rmsnorm as fused_qk_rmsnorm_bf16,
-        )
+            def fused_qk_rmsnorm_bf16(q, q_weight, q_eps, k, k_weight, k_eps):
+                q_out = torch.empty_like(q)
+                k_out = torch.empty_like(k)
+                _aiter_fused_qk_rmsnorm_unified(
+                    q_out_quantized=q_out,
+                    k_out=k_out,
+                    q=q,
+                    q_weight=q_weight,
+                    q_epsilon=q_eps,
+                    k=k,
+                    k_weight=k_weight,
+                    k_epsilon=k_eps,
+                    quant_type=_AiterQuantType.No,
+                )
+                return q_out, k_out
+
+        except ImportError:
+            from aiter.ops.fused_qk_norm_rope_cache_quant import (
+                fused_qk_rmsnorm as fused_qk_rmsnorm_bf16,
+            )
 
     from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
         batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant,
@@ -552,7 +568,20 @@ class DeepseekMLAForwardMixin:
             and (not fuse_rope_for_trtllm_mla)
             and (not skip_rope_for_dsa_tilelang_fused)
             and (not skip_rope_for_aiter_fused_mla)
-            and (not _use_aiter or not _is_gfx95_supported or self.use_dsa)
+            and (
+                not _use_aiter
+                or not _is_gfx95_supported
+                or self.use_dsa
+                # Non-fused, non-specialized attention backends (e.g. Triton) run
+                # the cat path in forward_absorb_core and need RoPE applied here;
+                # only the aiter fused MLA path and the specialized MLA backends
+                # defer RoPE to their own kernels.
+                or (
+                    self.current_attention_backend
+                    not in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS
+                    and self.current_attention_backend != "aiter"
+                )
+            )
         ):
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
@@ -758,7 +787,14 @@ class DeepseekMLAForwardMixin:
                         ),
                     )
         else:
-            if _use_aiter_gfx95:
+            # The fused rope+cache kernel writes K/V straight into the paged KV
+            # buffer and returns an *empty* k tensor, relying on the attention
+            # backend to read all K/V from that buffer. Only the aiter attention
+            # backend does so; backends like Triton use a 2-stage extend kernel
+            # that reads the current chunk's K from the returned k, so feeding
+            # them an empty k causes an out-of-bounds GPU memory access. Restrict
+            # the fused path to the aiter backend accordingly.
+            if _use_aiter_gfx95 and self.current_attention_backend == "aiter":
                 cos = self.rotary_emb.cos_cache
                 sin = self.rotary_emb.sin_cache
 
@@ -1037,12 +1073,14 @@ class DeepseekMLAForwardMixin:
         Skip rope in prepare and let the fused kernel in forward_absorb_core handle it,
         when running aiter-backend MLA on gfx95 (i.e., the `else` branch in forward_absorb_core
         that calls fused_qk_rope_cat_and_cache_mla).
+
+        This is only valid for the aiter attention backend, whose attention kernel reads
+        all K/V (prefix + current) from the paged KV buffer that the fused kernel writes
+        into. Other non-fused backends (e.g. Triton) run the cat path in
+        forward_absorb_core and still need an explicit, RoPE-applied K, so they must NOT
+        skip RoPE here.
         """
-        return (
-            _use_aiter_gfx95
-            and self.current_attention_backend
-            not in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS
-        )
+        return _use_aiter_gfx95 and self.current_attention_backend == "aiter"
 
 
 # Fuses the absorb BMM (`q_nope @ w_kc`) with `unified_attention_with_output`
