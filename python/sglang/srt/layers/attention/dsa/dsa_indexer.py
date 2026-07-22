@@ -920,8 +920,26 @@ class Indexer(MultiPlatformOp):
         # attn_tp_size > 1 or MAX_LEN padding mode can leave padding in the
         # hidden states; q_offset is the real (unpadded) q length.
         q_offset = sum(metadata.get_dsa_extend_len_cpu())
+        if not 0 <= q_offset <= q_fp8.shape[0]:
+            raise ValueError(
+                f"DSA q_offset={q_offset} is outside query rows={q_fp8.shape[0]}"
+            )
+        if weights.shape[0] < q_offset:
+            raise ValueError(
+                f"DSA weights rows={weights.shape[0]} are smaller than "
+                f"q_offset={q_offset}"
+            )
 
         B = metadata.get_seqlens_int32().shape[0]
+        if B == 0:
+            assert q_offset == 0, "empty DSA metadata cannot describe query rows"
+        elif (
+            forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend_v2()
+        ):
+            assert (
+                q_offset % B == 0
+            ), f"speculative DSA q_offset={q_offset} must be divisible by batch={B}"
         next_n = q_offset // B if B > 0 else 0
         use_cute_dsl = (
             self.paged_mqa_logits_backend.is_cutedsl()
@@ -982,6 +1000,7 @@ class Indexer(MultiPlatformOp):
                 seqlens_32,
                 block_tables,
                 max_seq_len,
+                q_offset=q_offset,
                 preshuffle=_use_aiter_preshuffle,
                 kv_block_size=block_kv,
             )
@@ -1035,7 +1054,7 @@ class Indexer(MultiPlatformOp):
         self._mask_init_and_local_tokens(logits, seqlens_32)
         topk_result = metadata.topk_transform(logits, self.index_topk)
         # Restore possible padding exist in the hidden states.
-        if not _is_hip and q_offset < q_fp8.shape[0]:
+        if q_offset < q_fp8.shape[0]:
             pad_len = q_fp8.shape[0] - q_offset
             padding = torch.full(
                 (pad_len, topk_result.shape[1]),
@@ -1973,12 +1992,12 @@ class Indexer(MultiPlatformOp):
             # creates a Dynamo shape guard. These graph modes never have empty
             # batches.
             if not in_piecewise_or_breakable_cuda_graph:
-                if forward_batch.seq_lens.numel() == 0:
-                    # this seems b/c max-pad, no worries?
-                    # if x.shape[0] != 0:
-                    #     print(
-                    #         "HACK: seq_lens empty but x not empty, hackily return all-invalid topk_result"
-                    #     )
+                if (
+                    forward_batch.forward_mode.is_idle()
+                    or forward_batch.seq_lens.numel() == 0
+                ):
+                    # Idle DP-attention replicas can carry MLP-sync padding,
+                    # but no request consumes their DSA indices.
                     topk_result = torch.full(
                         (x_meta.shape[0], self.index_topk),
                         -1,

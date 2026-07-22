@@ -283,7 +283,7 @@ class CustomAllReduceV2:
 
     def should_custom_ar(self, inp: torch.Tensor) -> bool:
         """Check if the input tensor is suitable for custom all-reduce."""
-        if self.disabled:
+        if self.disabled or inp.numel() == 0:
             return False
         inp_size = inp.numel() * inp.element_size()
         # custom allreduce requires input byte size to be multiples of 16

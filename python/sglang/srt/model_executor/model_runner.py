@@ -1525,6 +1525,13 @@ class ModelRunner:
         Returns:
             A list of next_token_ids
         """
+        next_token_logits = logits_output.next_token_logits
+        if next_token_logits.shape[0] == 0:
+            assert (
+                forward_batch.forward_mode.is_idle()
+            ), "empty next-token logits are only valid for an idle DP rank"
+            return torch.empty((0,), dtype=torch.int64, device=next_token_logits.device)
+
         self._preprocess_logits(logits_output, forward_batch.sampling_info)
 
         # Sample the next tokens

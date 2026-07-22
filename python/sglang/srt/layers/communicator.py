@@ -906,6 +906,9 @@ class CommunicateSimpleFn:
         if isinstance(hidden_states, tuple):
             gathered_hidden_states = []
             for local_hidden_states in hidden_states:
+                if local_hidden_states.numel() == 0:
+                    gathered_hidden_states.append(local_hidden_states)
+                    continue
                 with use_symmetric_memory(
                     get_tp_group(),
                     disabled=not is_allocation_symmetric(),
@@ -924,6 +927,9 @@ class CommunicateSimpleFn:
                 )
                 gathered_hidden_states.append(output)
             return tuple(gathered_hidden_states)
+
+        if hidden_states.numel() == 0:
+            return hidden_states
 
         hidden_states, local_hidden_states = (
             get_local_dp_buffer(get_parallel().attn_tp_group),
@@ -1149,7 +1155,8 @@ class CommunicateWithAllReduceAndLayerNormFn:
         hidden_states = hidden_states.tensor_split(context.attn_tp_size)[
             context.attn_tp_rank
         ]
-        attn_tp_reduce_scatter_tensor(hidden_states, input_hidden_states)
+        if input_hidden_states.numel() != 0:
+            attn_tp_reduce_scatter_tensor(hidden_states, input_hidden_states)
         if residual_input_mode == ScatterMode.TP_ATTN_FULL:
             residual = residual.tensor_split(context.attn_tp_size)[context.attn_tp_rank]
         if hidden_states.shape[0] != 0:

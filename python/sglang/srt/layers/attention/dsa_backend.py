@@ -45,6 +45,11 @@ from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
     DSATopKBackend,
     TopkTransformMethod,
 )
+from sglang.srt.layers.attention.dsa.graph_metadata import (
+    get_dsa_cuda_graph_metadata_key,
+    load_dsa_cuda_graph_metadata,
+    store_dsa_cuda_graph_metadata,
+)
 from sglang.srt.layers.attention.dsa.utils import (
     can_dsa_prefill_cp_round_robin_split,
     compute_dsa_seqlens,
@@ -729,6 +734,10 @@ class DeepseekSparseAttnBackend(
             return metadata.page_table_1.shape[1]
         return self.req_to_token.shape[1]
 
+    @staticmethod
+    def _cuda_graph_metadata_key(bs: int, forward_mode: ForwardMode):
+        return get_dsa_cuda_graph_metadata_key(bs, forward_mode)
+
     def _transform_table_1_to_real(self, page_table: torch.Tensor) -> torch.Tensor:
         page_size = self.real_page_size
         if page_size == 1:
@@ -1372,7 +1381,9 @@ class DeepseekSparseAttnBackend(
             dsa_extend_seq_lens_list=dsa_extend_seq_lens_list,
             topk_v2_plan=self._build_topk_v2_plan(seqlens_expanded),
         )
-        self.decode_cuda_graph_metadata[bs] = metadata
+        store_dsa_cuda_graph_metadata(
+            self.decode_cuda_graph_metadata, bs, forward_mode, metadata
+        )
         self.forward_metadata = metadata
 
     def _apply_cuda_graph_metadata(
@@ -1392,7 +1403,8 @@ class DeepseekSparseAttnBackend(
         also call this directly via _apply_cuda_graph_metadata when they
         need to pass out_cache_loc / actual_forward_mode explicitly.
         """
-        if bs not in self.decode_cuda_graph_metadata:
+        metadata_key = self._cuda_graph_metadata_key(bs, forward_mode)
+        if metadata_key not in self.decode_cuda_graph_metadata:
             self._build_forward_metadata_cuda_graph(
                 bs,
                 None,
@@ -1412,7 +1424,9 @@ class DeepseekSparseAttnBackend(
         req_pool_indices = req_pool_indices[:bs]
 
         # Normal Decode
-        metadata: DSAMetadata = self.decode_cuda_graph_metadata[bs]
+        metadata: DSAMetadata = load_dsa_cuda_graph_metadata(
+            self.decode_cuda_graph_metadata, bs, forward_mode
+        )
         used_fused_metadata_generation = False
         target_verify_ctx_lens_written = False
         if forward_mode.is_decode_or_idle():

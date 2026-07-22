@@ -141,6 +141,22 @@ elif _is_hip:
     ) -> int:
         return _custom_ar.init_custom_qr(world_size, rank, qr_max_size)
 
+    def init_custom_qr_vmm(
+        rank: int,
+        world_size: int,
+        device_index: int,
+        qr_max_size: Optional[int] = None,
+        uncached: bool = True,
+    ) -> Tuple[int, int, int]:
+        return _custom_ar.init_custom_qr_vmm(
+            rank, world_size, device_index, qr_max_size, uncached
+        )
+
+    def qr_open_vmm_handles(
+        fa: int, peer_fds: List[int], peer_sizes: List[int]
+    ) -> None:
+        _custom_ar.qr_open_vmm_handles(fa, peer_fds, peer_sizes)
+
     def qr_get_handle(fa: int) -> torch.Tensor:
         return _custom_ar.qr_get_handle(fa)
 

@@ -546,6 +546,9 @@ struct AllReduceTwoshot {
       codec.send(send_buffer, &tA[r * Codec::kRankAtoms]);
     }
 
+    // Publish peer-VMM writes before releasing the corresponding ready flag.
+    // A block barrier alone does not make writes visible to another GPU.
+    __threadfence_system();
     __syncthreads();
     if (thread < kWorldSize) {
       int r = thread;
@@ -583,6 +586,7 @@ struct AllReduceTwoshot {
       codec.send(send_buffer, tR);
     }
 
+    __threadfence_system();
     __syncthreads();
     if (thread < kWorldSize) {
       int r = thread;

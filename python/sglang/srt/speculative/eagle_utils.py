@@ -745,20 +745,6 @@ def eagle_sample(
             deterministic=True,
         )
 
-        # Sync sampling results across TP ranks: different GPUs may
-        # produce slightly different target_probs due to floating-point
-        # non-determinism in softmax/top_k/top_p, causing different
-        # sampled tokens. Broadcast from rank 0 to ensure consistency.
-        tp_group = (
-            get_parallel().attn_tp_group
-            if is_dp_attention_enabled()
-            else get_tp_group()
-        )
-        if tp_group.world_size > 1:
-            tp_group.broadcast(predict, src=0)
-            tp_group.broadcast(accept_index, src=0)
-            tp_group.broadcast(num_correct_drafts, src=0)
-
     if SIMULATE_ACC_LEN > 0:
         # Do simulation. The helper builds (and returns) a replacement
         # accept_index of width spec_steps + 1, so pass max_tree_depth - 1
@@ -793,6 +779,23 @@ def eagle_sample(
             bs=bs,
             spec_steps=verify_input.max_tree_depth - 1,
         )
+
+    # Sync the finalized verify decision across TP ranks. Both the greedy path
+    # (per-rank argmax) and the sampling path (softmax/top_k/top_p) can pick
+    # different tokens on different ranks when per-rank logits differ from
+    # non-deterministic reductions (e.g. --enable-aiter-allreduce-fusion). If
+    # ranks accept a different number of drafts, committed seq_lens/batch shapes
+    # diverge and the next TP collective deadlocks. Broadcasting here — after the
+    # accept decision is finalized (including SIMULATE_ACC_LEN, which re-derives
+    # from per-rank argmax) and before the worker consumes it — keeps every path
+    # consistent.
+    tp_group = (
+        get_parallel().attn_tp_group if is_dp_attention_enabled() else get_tp_group()
+    )
+    if tp_group.world_size > 1:
+        tp_group.broadcast(predict, src=0)
+        tp_group.broadcast(accept_index, src=0)
+        tp_group.broadcast(num_correct_drafts, src=0)
 
     # `num_correct_drafts` stays drafts-only inside this function; the returned
     # tensor includes the trailing/bonus token via out-of-place +1 so the

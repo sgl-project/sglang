@@ -228,7 +228,7 @@ class LogitsMetadata:
     dp_local_num_tokens: Optional[torch.Tensor] = None
     global_dp_buffer_len: Optional[int] = None
     # Number of tokens to sample per DP rank
-    global_num_tokens_for_logprob_cpu: Optional[torch.Tensor] = None
+    global_num_tokens_for_logprob_cpu: Optional[List[int]] = None
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor] = None
     # The gather mode for DP attention
     dp_padding_mode: Optional[DpPaddingMode] = None
@@ -301,17 +301,27 @@ class LogitsMetadata:
         )
 
     def compute_dp_attention_metadata(self):
-        cumtokens = torch.cumsum(self.global_num_tokens_for_logprob_gpu, dim=0)
         dp_rank = get_parallel().attn_dp_rank
-        if dp_rank == 0:
-            dp_local_start_pos = torch.zeros_like(
-                self.global_num_tokens_for_logprob_gpu[0]
+        if self.global_num_tokens_for_logprob_cpu is not None:
+            global_num_tokens = [
+                int(num_tokens) for num_tokens in self.global_num_tokens_for_logprob_cpu
+            ]
+            local_info = self.global_num_tokens_for_logprob_gpu.new_tensor(
+                [sum(global_num_tokens[:dp_rank]), global_num_tokens[dp_rank]]
             )
+            dp_local_start_pos, dp_local_num_tokens = local_info.unbind()
         else:
-            dp_local_start_pos = cumtokens[dp_rank - 1]
+            cumtokens = torch.cumsum(self.global_num_tokens_for_logprob_gpu, dim=0)
+            if dp_rank == 0:
+                dp_local_start_pos = torch.zeros_like(
+                    self.global_num_tokens_for_logprob_gpu[0]
+                )
+            else:
+                dp_local_start_pos = cumtokens[dp_rank - 1]
+            dp_local_num_tokens = self.global_num_tokens_for_logprob_gpu[dp_rank]
 
         self.dp_local_start_pos = dp_local_start_pos
-        self.dp_local_num_tokens = self.global_num_tokens_for_logprob_gpu[dp_rank]
+        self.dp_local_num_tokens = dp_local_num_tokens
 
         hidden_size = get_dp_hidden_size()
         dtype = get_dp_dtype()
@@ -319,7 +329,7 @@ class LogitsMetadata:
 
         if self.global_num_tokens_for_logprob_cpu is not None:
             # create a smaller buffer to reduce peak memory usage
-            self.global_dp_buffer_len = sum(self.global_num_tokens_for_logprob_cpu)
+            self.global_dp_buffer_len = sum(global_num_tokens)
         else:
             self.global_dp_buffer_len = self.global_dp_buffer_len
 
@@ -782,7 +792,20 @@ class LogitsProcessor(nn.Module):
             logits_metadata.compute_dp_attention_metadata()
             local_hidden_states = hidden_states
             hidden_states = logits_metadata.gathered_buffer
-            dp_gather_replicate(hidden_states, local_hidden_states, logits_metadata)
+            global_token_counts = logits_metadata.global_num_tokens_for_logprob_cpu
+            # CUDA-graph batches intentionally omit the CPU list, so the idle
+            # pattern can change at replay time. Use the graph-safe standard
+            # collective in that case; eager batches retain QuickReduce when
+            # every rank has work.
+            force_standard_all_reduce = global_token_counts is None or any(
+                int(count) == 0 for count in global_token_counts
+            )
+            dp_gather_replicate(
+                hidden_states,
+                local_hidden_states,
+                logits_metadata,
+                force_standard_all_reduce=force_standard_all_reduce,
+            )
             return hidden_states, local_hidden_states
         return hidden_states, hidden_states
 
