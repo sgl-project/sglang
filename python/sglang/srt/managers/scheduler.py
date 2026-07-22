@@ -25,7 +25,18 @@ from collections import deque
 from contextlib import contextmanager, nullcontext
 from functools import partial
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional, Set, Tuple, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Deque,
+    Dict,
+    List,
+    Optional,
+    Set,
+    Tuple,
+    Union,
+)
 
 from sglang.srt.runtime_context import (
     get_device,
@@ -208,6 +219,9 @@ from sglang.srt.managers.scheduler_components.batch_result_processor import (
 )
 from sglang.srt.managers.scheduler_components.dp_attn import SchedulerDPAttnAdapter
 from sglang.srt.managers.scheduler_components.flush_wrapper import SchedulerFlushWrapper
+from sglang.srt.managers.scheduler_components.forward_resource_lease import (
+    ForwardResourceLease,
+)
 from sglang.srt.managers.scheduler_components.idle_sleeper import (
     IdleSleeper,
     RustServerIdleSleeper,
@@ -3475,7 +3489,12 @@ class Scheduler(
                 new_lora_set
             )
 
-    def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
+    def update_running_batch(
+        self,
+        batch: ScheduleBatch,
+        *,
+        before_decode_retract: Optional[Callable[[], None]] = None,
+    ) -> Optional[ScheduleBatch]:
         """Update the current running decoding batch."""
         initial_bs = batch.batch_size()
 
@@ -3484,10 +3503,17 @@ class Scheduler(
             batch.batch_is_full = False
             return batch
 
-        # Check if decode out of memory
-        if (kv_full_retract_flag := not batch.check_decode_mem()) or (
-            TEST_RETRACT and self.forward_ct % TEST_RETRACT_INTERVAL == 0
-        ):
+        # Check if decode is out of memory. PD decode can have completed-request
+        # resources quarantined behind an in-flight forward event; quiesce that
+        # epoch before retracting a live request, then re-check the pool.
+        kv_full_retract_flag = not batch.check_decode_mem()
+        test_retract = TEST_RETRACT and self.forward_ct % TEST_RETRACT_INTERVAL == 0
+        if (kv_full_retract_flag or test_retract) and before_decode_retract is not None:
+            before_decode_retract()
+            if kv_full_retract_flag:
+                kv_full_retract_flag = not batch.check_decode_mem()
+
+        if kv_full_retract_flag or test_retract:
             old_available_tokens = self.token_to_kv_pool_allocator.available_size()
             old_ratio = self.new_token_ratio_tracker.current
             mamba_allocator = getattr(
@@ -3918,14 +3944,30 @@ class Scheduler(
         self,
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
+        *,
+        resource_lease: Optional[ForwardResourceLease] = None,
     ):
         # Flush async trace ops here: in overlap mode this CPU work runs while
         # the next batch's GPU forward is in flight, giving free overlap.
         flush_trace_batch(batch.reqs)
         self.publish_load_snapshot(force=batch.forward_mode.is_extend())
 
+        # Only decode result retirement is resource-lease aware. A previous
+        # prebuilt/extend batch can own the same request row and KV pages as the
+        # decode forward that is now in flight, so fully quiesce that forward
+        # before those handlers mutate or release resources. An IDLE result has
+        # no request resources to release and must not serialize DP idle ranks.
+        if resource_lease is not None and (
+            batch.forward_mode.is_extend() or batch.forward_mode.is_prebuilt()
+        ):
+            resource_lease.synchronize_all_and_drain()
+
         if batch.forward_mode.is_decode():
-            self.batch_result_processor.process_batch_result_decode(batch, result)
+            self.batch_result_processor.process_batch_result_decode(
+                batch,
+                result,
+                resource_lease=resource_lease,
+            )
         elif batch.forward_mode.is_extend():
             if batch.is_dllm():
                 self.process_batch_result_dllm(batch, result)
