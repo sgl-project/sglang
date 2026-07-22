@@ -114,10 +114,24 @@ impl RouterManager {
 
             info!("PD disaggregation auto-enabled for IGW mode, creating PD routers");
 
+            // Extract PD-specific policies from routing mode config.
+            // RoutingMode::PrefillDecode carries optional per-pool policies
+            // parsed from --prefill-policy / --decode-policy CLI args.
+            // When present they override the top-level --policy for the
+            // respective worker pool.
+            let (prefill_policy_cfg, decode_policy_cfg) = match &config.router_config.mode {
+                RoutingMode::PrefillDecode {
+                    prefill_policy,
+                    decode_policy,
+                    ..
+                } => (prefill_policy.clone(), decode_policy.clone()),
+                _ => (None, None),
+            };
+
             // Create HTTP PD router
             match RouterFactory::create_pd_router(
-                None,
-                None,
+                prefill_policy_cfg.as_ref(),
+                decode_policy_cfg.as_ref(),
                 &config.router_config.policy,
                 app_context,
             )
@@ -134,8 +148,8 @@ impl RouterManager {
 
             // Create gRPC PD router
             match RouterFactory::create_grpc_pd_router(
-                None,
-                None,
+                prefill_policy_cfg.as_ref(),
+                decode_policy_cfg.as_ref(),
                 &config.router_config.policy,
                 app_context,
             )
