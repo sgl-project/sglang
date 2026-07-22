@@ -73,6 +73,15 @@ else
     find "$REPO_ROOT" -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null || true
 
     rm -f "${REPO_ROOT}/python/pyproject.toml" && mv "${REPO_ROOT}/python/pyproject_other.toml" "${REPO_ROOT}/python/pyproject.toml"
+
+    # setuptools-rust builds the sglang-mm extension (sglang.srt.multimodal._core)
+    # declared in pyproject_other.toml, so a Rust toolchain must be present like
+    # on the CUDA/AMD CI paths. Idempotent; installs per-user under $HOME/.cargo.
+    # Export PATH here because the pip install below runs in this same shell
+    # (install_rustup.sh's own export/GITHUB_PATH only reach subsequent steps).
+    bash "${REPO_ROOT}/scripts/ci/utils/install_rustup.sh"
+    export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:${PATH}"
+
     cd "${REPO_ROOT}" && ${PIP_INSTALL} -v -e "python[dev_musa]" --user
 
     cd "${REPO_ROOT}/sgl-kernel"
