@@ -83,6 +83,10 @@ The write-back mechanism is responsible for moving frequently accessed KV caches
 
 **Cross-instance Sharing**: When data is written back from L2 to L3, only data not already present in L3 is transferred. KV caches stored in L3 can then be shared across all SGLang instances in the cluster (depending on the L3 backend implementation), significantly improving cache hit rates within the same memory budget.
 
+### KV Cache Events
+
+When `--kv-events-config` is enabled, SGLang publishes KV cache events for cache-aware routing and external observers. HiCache uses the event `medium` field to identify the tier that accepted the KV block: `GPU` for L1 device cache, `CPU` for L2 host cache, and `EXTERNAL` for L3 storage backends. `BlockStored` events with `medium=EXTERNAL` are emitted only after the L3 backup operation is acknowledged by the storage backend, such as file, Mooncake, HF3FS, NIXL, or AIBrix.
+
 ### Multi-Rank Synchronization
 
 During multi-GPU parallel computation, such as tensor parallelism (TP), HiCache must ensure consistent states across different ranks. Therefore, critical computation steps require the use of `all_reduce` for state synchronization.

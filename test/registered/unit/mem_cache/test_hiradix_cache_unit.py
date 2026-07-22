@@ -3,6 +3,8 @@
 import os
 import unittest
 from array import array
+from queue import Queue
+from types import SimpleNamespace
 
 import torch
 
@@ -13,6 +15,7 @@ from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.utils import compute_node_hash_values
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -96,6 +99,28 @@ class TestHiRadixCacheKVEvents(CustomTestCase):
             if isinstance(e, BlockStored) and e.medium == StorageMedium.CPU
         ]
 
+    def _stored_external_events(self, cache):
+        return [
+            e
+            for e in cache.take_events()
+            if isinstance(e, BlockStored) and e.medium == StorageMedium.EXTERNAL
+        ]
+
+    def _drain_backup_ack(self, cache, ack):
+        ack_backup_queue = Queue()
+        ack_backup_queue.put(ack)
+        cache.cache_controller = SimpleNamespace(
+            prefetch_revoke_queue=Queue(),
+            ack_backup_queue=ack_backup_queue,
+            host_mem_release_queue=Queue(),
+        )
+        cache._drain_storage_control_queues_impl(
+            n_revoke=0,
+            n_backup=1,
+            n_release=0,
+            log_metrics=False,
+        )
+
     def test_split_pending_write_through_publishes_fragments(self):
         cache, allocator = self._build_cache()
         cache.take_events()
@@ -119,6 +144,106 @@ class TestHiRadixCacheKVEvents(CustomTestCase):
         )
         self.assertIsNone(stored_cpu[0].parent_block_hash)
         self.assertEqual(stored_cpu[1].parent_block_hash, stored_cpu[0].block_hashes[0])
+
+    def test_storage_backup_ack_publishes_external_event(self):
+        cache, allocator = self._build_cache()
+        cache.take_events()
+
+        tokens = [1, 2, 3, 4]
+        self._insert(cache, allocator, tokens)
+        node = self._leaf_for(cache, tokens)
+        cache.take_events()
+
+        ack_id = 7
+        node.protect_host()
+        node.backup_pending_id = ack_id
+        cache.ongoing_backup[ack_id] = (node, [node])
+        self._drain_backup_ack(
+            cache,
+            SimpleNamespace(id=ack_id, completed_tokens=len(tokens), token_ids=tokens),
+        )
+
+        stored_external = self._stored_external_events(cache)
+        self.assertEqual(
+            [list(e.token_ids) for e in stored_external],
+            [[1, 2], [3, 4]],
+        )
+        self.assertIsNone(stored_external[0].parent_block_hash)
+        self.assertEqual(
+            stored_external[1].parent_block_hash,
+            stored_external[0].block_hashes[0],
+        )
+        self.assertNotIn(ack_id, cache.ongoing_backup)
+        self.assertIsNone(node.backup_pending_id)
+
+    def test_storage_backup_ack_after_split_publishes_all_fragments(self):
+        cache, allocator = self._build_cache()
+        cache.take_events()
+
+        tokens = [1, 2, 3, 4]
+        self._insert(cache, allocator, tokens)
+        node = self._leaf_for(cache, tokens)
+        # L3 backup only starts after write-through: host data and page
+        # hashes are in place by then.
+        node.host_value = torch.arange(len(tokens))
+        node.hash_value = compute_node_hash_values(node, PAGE_SIZE)
+        cache.take_events()
+
+        ack_id = 7
+        node.protect_host()
+        node.backup_pending_id = ack_id
+        cache.ongoing_backup[ack_id] = (node, [node])
+
+        # Split the node while its L3 backup is still in flight.
+        self._insert(cache, allocator, [1, 2, 5, 6])
+        prefix_node = self._leaf_for(cache, [1, 2])
+        self.assertIsNot(prefix_node, node)
+        cache.take_events()
+
+        self._drain_backup_ack(
+            cache,
+            SimpleNamespace(id=ack_id, completed_tokens=len(tokens), token_ids=tokens),
+        )
+
+        # Both split fragments must be published, with intact parentage.
+        stored_external = self._stored_external_events(cache)
+        self.assertEqual(
+            [list(e.token_ids) for e in stored_external],
+            [[1, 2], [3, 4]],
+        )
+        self.assertIsNone(stored_external[0].parent_block_hash)
+        self.assertEqual(
+            stored_external[1].parent_block_hash,
+            stored_external[0].block_hashes[0],
+        )
+        self.assertNotIn(ack_id, cache.ongoing_backup)
+        self.assertIsNone(prefix_node.backup_pending_id)
+        self.assertIsNone(node.backup_pending_id)
+        self.assertEqual(node.host_ref_counter, 0)
+
+    def test_storage_backup_partial_ack_skips_external_event(self):
+        cache, allocator = self._build_cache()
+        cache.take_events()
+
+        tokens = [1, 2, 3, 4]
+        self._insert(cache, allocator, tokens)
+        node = self._leaf_for(cache, tokens)
+        cache.take_events()
+
+        ack_id = 7
+        node.protect_host()
+        node.backup_pending_id = ack_id
+        cache.ongoing_backup[ack_id] = (node, [node])
+
+        # Only half the tokens made it to storage before the backend failed.
+        self._drain_backup_ack(
+            cache, SimpleNamespace(id=ack_id, completed_tokens=2, token_ids=tokens)
+        )
+
+        self.assertEqual(self._stored_external_events(cache), [])
+        self.assertNotIn(ack_id, cache.ongoing_backup)
+        self.assertIsNone(node.backup_pending_id)
+        self.assertEqual(node.host_ref_counter, 0)
 
 
 if __name__ == "__main__":
