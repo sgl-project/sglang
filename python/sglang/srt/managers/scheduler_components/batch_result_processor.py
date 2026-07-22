@@ -261,6 +261,17 @@ class SchedulerBatchResultProcessor:
                             logits_output=logits_output,
                             hidden_state_offset=hidden_state_offset,
                         )
+                    elif logits_output.hidden_states is not None:
+                        # FULL hidden-state capture is enabled whenever ANY
+                        # request in the batch asks for hidden states, so the
+                        # buffer holds a row for every request's prefill tokens,
+                        # not just the requesting ones. Advance past this
+                        # (non-requesting) request's rows so that a later
+                        # requesting request slices its own rows rather than this
+                        # request's -> avoids wrong output and a cross-request
+                        # hidden-state leak. Mirrors how logprob_pt advances for
+                        # every contributing request in _apply_prefill_logprobs.
+                        hidden_state_offset += len(req.origin_input_ids)
 
                     if req.grammar is not None:
                         self._apply_prefill_grammar(
