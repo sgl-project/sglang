@@ -23,17 +23,24 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import sglang.srt.models.deepseek_v2 as deepseek_v2
-from sglang.kernels.ops.attention.deepseek_v4_rope import v4_rope_inplace_npu
+from sglang.kernels.ops.attention.deepseek_v4_rope import (
+    v4_rope_inplace_npu,
+)
 from sglang.kernels.ops.attention.dsv4 import (
     fused_norm_rope_inplace,
     fused_q_norm_rope,
     fused_rope_inplace,
     sglang_per_token_group_quant_fp8_dsv4_wo_a,
 )
-from sglang.kernels.ops.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
+from sglang.kernels.ops.quantization.fp8_kernel import (
+    sglang_per_token_group_quant_fp8,
+)
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
-from sglang.srt.distributed import get_pp_group, get_tp_group
+from sglang.srt.distributed import (
+    get_pp_group,
+    get_tp_group,
+)
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -130,12 +137,7 @@ from sglang.srt.models.deepseek_v2 import (
     _is_xpu,
 )
 from sglang.srt.models.utils import WeightsMapper
-from sglang.srt.runtime_context import (
-    get_device,
-    get_exec,
-    get_forward,
-    get_parallel,
-)
+from sglang.srt.runtime_context import get_forward, get_parallel, get_server_args
 
 if not _is_hip:
     from sglang.srt.layers.utils.cp_utils import (
@@ -310,7 +312,9 @@ def _freqs_cis_to_cos_sin(
 
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttnBackend
+    from sglang.srt.layers.attention.deepseek_v4_backend import (
+        DeepseekV4AttnBackend,
+    )
     from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
         DeepseekV4HipRadixBackend,
     )
@@ -572,7 +576,7 @@ class MQALayer(MqaAttentionBase):
             base=self.rope_base,
             rope_scaling=self.rope_scaling,
             is_neox_style=False,
-            device=get_device().device,
+            device=get_server_args().device,
         )
 
         if _is_hip:
@@ -2425,7 +2429,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                     config.hidden_size,
                     quant_config=quant_config,
                     prefix=add_prefix("lm_head", prefix),
-                    use_attn_tp_group=get_parallel().enable_dp_lm_head,
+                    use_attn_tp_group=get_server_args().enable_dp_lm_head,
                 )
         else:
             self.lm_head = PPMissingLayer()
@@ -2476,7 +2480,7 @@ class DeepseekV4ForCausalLM(nn.Module):
 
     def determine_num_fused_shared_experts(self, is_nextn: bool = False):
         self.num_fused_shared_experts = 0
-        if get_exec().moe.disable_shared_experts_fusion:
+        if get_server_args().disable_shared_experts_fusion:
             return
 
         # Quark MXFP4 checkpoints that quantize routed and shared experts with
@@ -2489,7 +2493,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         )
 
         disable_reason = None
-        if get_exec().moe.enforce_shared_experts_fusion or quark_can_fuse:
+        if get_server_args().enforce_shared_experts_fusion or quark_can_fuse:
             if self.config.n_shared_experts != 1:
                 raise ValueError(
                     "DeepSeek V4 shared-experts fusion expects exactly one shared "
