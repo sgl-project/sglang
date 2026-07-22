@@ -107,12 +107,37 @@ _PARALLEL_FIELDS = frozenset(
 
 
 class ParallelContext:
-    """Parallel-topology namespace; the only instance state is ``_overrides``."""
+    """Parallel-topology namespace.
 
-    __slots__ = ("_overrides",)
+    Live topology (size / rank / group) is read-through via ``@property`` (the
+    canonical getters). Parallel **config** leaves (``nccl_port``,
+    ``pp_max_micro_batch_size``, ``enable_dp_attention``, …) come from the
+    published ``parallel`` config bag via ``__getattr__``. Where a config leaf
+    shares a name with a live property (``tp_size`` …), the property (the live
+    fact) wins; the same-name==same-value invariant holds once dist is up.
+    """
+
+    __slots__ = ("_overrides", "_config")
 
     def __init__(self):
         self._overrides = {}
+        self._config = None  # parallel config bag, wired at publish
+
+    def __getattr__(self, name):
+        # Reached only for names that are neither a live @property nor a slot:
+        # serve parallel config leaves from the published bag.
+        try:
+            config = object.__getattribute__(self, "_config")
+        except AttributeError:
+            config = None
+        if config is not None and name in config:
+            return getattr(config, name)
+        detail = (
+            "not a published parallel config leaf"
+            if config is not None
+            else "config not published"
+        )
+        raise AttributeError(f"ParallelContext has no {name!r} ({detail})")
 
     def _v(self, name, getter):
         overrides = self._overrides
@@ -727,6 +752,10 @@ class RuntimeContext:
         # truth for config reads). Driven by NS(...) metadata; a mock/partial
         # config with no NS markers yields an empty tree (no bags projected).
         self._config_bags = _build_config_bags(server_args)
+        # Wire the parallel config leaves onto the live wrapper (config-only
+        # leaves like pp_max_micro_batch_size are served via ParallelContext
+        # __getattr__; live topology properties still win by name).
+        self.parallel._config = self._config_bags.get("parallel")
         # Fresh config lifecycle: prior override provenance no longer applies.
         self._overrides_log = []
 
@@ -788,6 +817,27 @@ class RuntimeContext:
     def overrides_log(self) -> list:
         """Provenance of post-publish ``override`` calls: ``[(source, {field: value})]``."""
         return list(self._overrides_log)
+
+    def resolved_server_args_dict(self, base: dict | None = None) -> dict:
+        """Serialize the *resolved* config: the pristine ``server_args`` fields
+        with every post-publish ``override`` overlaid.
+
+        Reporting endpoints (``/server_info``, ``get_internal_state``) surface
+        the config the process is *currently* running, not the startup record,
+        so they read this rather than serializing ``server_args`` directly —
+        otherwise runtime updates (weight version, model path, tunables set via
+        ``/set_internal_state``) never show up in the readback.
+
+        ``base`` defaults to ``dict(vars(server_args))`` (matching the legacy
+        ``vars`` dump); pass ``dataclasses.asdict(server_args)`` when nested
+        dataclass fields must be expanded first (``/server_info``). Override
+        leaves are flat ``ServerArgs`` field names, so overlaying them onto the
+        top level of either base is exact.
+        """
+        d = dict(vars(self.server_args)) if base is None else dict(base)
+        for _source, fields in self._overrides_log:
+            d.update(fields)
+        return d
 
     def override_server_args(self, **fields) -> _ServerArgsOverride:
         """Test-only scoped override for the config tier — the sibling of
@@ -981,6 +1031,7 @@ def reset_context() -> None:
     _CONTEXT._server_args = None
     _CONTEXT._config_bags = None
     _CONTEXT._overrides_log = []
+    _CONTEXT.parallel._config = None
     _CONTEXT.flags = Flags()
     _CONTEXT.resources = Resources()
     _CONTEXT.forward = ForwardFlags()

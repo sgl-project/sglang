@@ -75,6 +75,32 @@ class TestContextOverride(CustomTestCase):
         self._publish()
         self.assertEqual(rc.get_context().overrides_log(), [])
 
+    def test_set_internal_state_fields_reach_parallel_and_spec(self):
+        # The fields /set_internal_state overrides must reach the accessors the
+        # (1e) flipped readers now use: pp via get_parallel(), thresholds via
+        # get_spec().
+        self._publish()
+        rc.get_context().override(
+            "update_server_args",
+            pp_max_micro_batch_size=8,
+            speculative_accept_threshold_single=0.5,
+            speculative_accept_threshold_acc=0.9,
+        )
+        self.assertEqual(rc.get_parallel().pp_max_micro_batch_size, 8)
+        self.assertEqual(rc.get_spec().speculative_accept_threshold_single, 0.5)
+        self.assertEqual(rc.get_spec().speculative_accept_threshold_acc, 0.9)
+
+    def test_kv_cache_dtype_override_reaches_get_model_not_server_args(self):
+        # Load-time resolution: the resolved kv-cache dtype is written
+        # to the model bag; server_args stays the RAW resolver input.
+        sa = self._publish()
+        raw = sa.kv_cache_dtype
+        rc.get_context().override(
+            "ModelRunner.configure_kv_cache_dtype", kv_cache_dtype="fp8_e4m3"
+        )
+        self.assertEqual(rc.get_model().kv_cache_dtype, "fp8_e4m3")
+        self.assertEqual(sa.kv_cache_dtype, raw)
+
     def test_bare_server_args_write_raises_after_resolution(self):
         # server_args is read-only after resolution regardless of the
         # SGLANG_STRICT_CONFIG_MUTATION env; write via override instead.

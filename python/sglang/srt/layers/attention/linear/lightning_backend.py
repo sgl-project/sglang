@@ -64,7 +64,12 @@ class LightningAttentionBackend(MambaAttnBackendBase):
         self.device = model_runner.device
         self.decode_cuda_graph_metadata = {}
         self.kv_cache_dtype = model_runner.kv_cache_dtype
-        self.kv_cache_dtype_str = model_runner.server_args.kv_cache_dtype
+
+        self.kv_cache_dtype_str = getattr(
+            model_runner,
+            "kv_cache_dtype_str",
+            model_runner.server_args.kv_cache_dtype,
+        )
         self.BLOCK = (
             model_runner.model_config.block
             if hasattr(model_runner.model_config, "block")

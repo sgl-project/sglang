@@ -62,6 +62,7 @@ from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mha imp
 )
 from sglang.srt.runtime_context import (
     get_forward,
+    get_model,
     get_parallel,
     get_server_args,
     get_stream,
@@ -450,7 +451,7 @@ class SarvamMoEMLAAttention(nn.Module):
         self.scaling = self.qk_head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
-        self.kv_cache_dtype = get_server_args().kv_cache_dtype
+        self.kv_cache_dtype = get_model().kv_cache_dtype
 
         self._server_args = None
         self.current_attention_backend = None
