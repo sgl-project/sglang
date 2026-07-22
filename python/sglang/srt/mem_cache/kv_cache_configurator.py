@@ -216,20 +216,6 @@ class KVCacheConfigurator:
         quant_method.load_scales_from_model(self.model)
         return quant_method
 
-    def _build_fp4_quant_method(self, *, num_layers: int):
-        if not is_float4_e2m1fn_x2(self.kv_cache_dtype):
-            return None
-        quant_name = resolve_kv_cache_quant(self.server_args.kv_cache_dtype)
-        if quant_name is None:
-            return None
-        quant_method = get_kv_cache_quant_method(
-            quant_name,
-            num_layers=num_layers,
-            device=self.device,
-        )
-        quant_method.load_scales_from_model(self.model)
-        return quant_method
-
     def configure(self, *, pre_model_load_memory: int) -> KVCacheConfigResult:
         """Apply a resolved MemoryPoolConfig and initialize pools."""
         if not self.spec_algorithm.is_none() and self.is_draft_worker:

@@ -959,8 +959,22 @@ class OpenAIServingChat(OpenAIServingBase):
         )
 
         if prompt_ids is not None:
-            # Custom encoding handled it - no further processing needed
-            pass
+            # Custom encoding produced prompt_ids. Text-only encoders (dsv4/dsv32) need
+            # nothing more; Inkling is the only multimodal custom encoder and still needs the
+            # image/audio media harvested from the messages for the MM processor.
+            if self.chat_encoding_spec == "inkling":
+                for message in request.messages:
+                    msg_dict = message.model_dump()
+                    if msg_dict.get("content") is None:
+                        msg_dict["content"] = ""
+                    process_content_for_template_format(
+                        msg_dict,
+                        "openai",
+                        image_data,
+                        video_data,
+                        audio_data,
+                        modalities,
+                    )
         elif self.chat_encoding_spec == "kimi_k3":
             # K3 ships no Jinja chat template; its tokenizer renders messages
             # through the Python XTML encoding. Tokenize eagerly so structural

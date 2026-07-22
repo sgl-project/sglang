@@ -41,6 +41,12 @@ def resolve_chat_encoding_spec(
     if "InklingForConditionalGeneration" in arch:
         return "inkling"
 
+    # Inkling has no Jinja chat_template and uses a tiktoken base + a special-token
+    # overlay + negative MM placeholders, so it can't go through apply_chat_template;
+    # render input_ids directly via the Inkling renderer (serving_chat._encode_messages).
+    if "InklingForConditionalGeneration" in arch:
+        return "inkling"
+
     has_chat_template = tokenizer is not None and tokenizer.chat_template is not None
     if "DeepseekV3" in arch and not has_chat_template:
         return "dsv32"

@@ -462,6 +462,7 @@ MULTIMODAL_TEST_DIR = "python/sglang/multimodal_gen/test"
 MULTIMODAL_PATH_TO_RUNNER = {
     "2_gpu": "2-gpu-h100",
     "2-gpu": "2-gpu-h100",
+    "b200": _B200_DEFAULT_RUNNER,
 }
 MULTIMODAL_DEFAULT_RUNNER = "1-gpu-h100"
 
