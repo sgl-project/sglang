@@ -1747,6 +1747,34 @@ def apply_fp8_linear_bmm_flashinfer(
     return output.view(*output_shape)
 
 
+def apply_fp8_linear_aiter_prequant(
+    qinput: torch.Tensor,
+    x_scale: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """AITER a8w8 GEMM for an activation a fused producer already fp8-quantized.
+
+    Mirrors the AITER per-token branch of ``apply_fp8_linear`` (same ``weight.T``
+    layout and per-channel ``weight_scale``); just skips the activation quant.
+    """
+    output_shape = [*qinput.shape[:-1], weight.shape[1]]
+    qinput = qinput.view(-1, qinput.shape[-1])
+    if x_scale.dim() == 1:
+        x_scale = x_scale.view(-1, 1)
+    output = gemm_a8w8_bpreshuffle(
+        XQ=qinput,
+        WQ=weight.T,
+        x_scale=x_scale,
+        w_scale=weight_scale,
+        dtype=torch.bfloat16,
+    )
+    if bias is not None:
+        output += bias
+    return _process_scaled_mm_output(output, qinput.shape, output_shape)
+
+
 def apply_fp8_linear(
     input: torch.Tensor,
     weight: torch.Tensor,

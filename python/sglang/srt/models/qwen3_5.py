@@ -15,7 +15,7 @@
 """Inference-only Qwen3.5 model and Qwen3.5 MoE model compatible with HuggingFace weights."""
 
 import logging
-from functools import lru_cache
+from functools import cached_property, lru_cache
 from typing import Iterable, Optional, Set, Tuple, Union
 
 import torch
@@ -125,6 +125,19 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _hip_use_alt_stream = get_bool_env_var("SGLANG_ALT_STREAM") and _is_hip
 _gdn_use_alt_stream = _is_cuda or (
     get_bool_env_var("SGLANG_GDN_QKVZ_BA_ALT_STREAM", "False") and _hip_use_alt_stream
+)
+_gated_rmsnorm_fp8_per_token_quant = None
+if _use_aiter:
+    try:
+        from aiter.ops.gated_rmsnorm_fp8_per_token_quant import (
+            gated_rmsnorm_fp8_per_token_quant as _gated_rmsnorm_fp8_per_token_quant,
+        )
+    except Exception:
+        _gated_rmsnorm_fp8_per_token_quant = None
+
+_fuse_gdn_oproj = (
+    _gated_rmsnorm_fp8_per_token_quant is not None
+    and not get_bool_env_var("SGLANG_DISABLE_GDN_OUT_PROJ_FUSION", "False")
 )
 _qknorm_use_alt_stream = _is_cuda or (
     get_bool_env_var("SGLANG_QK_NORM_ALT_STREAM", "False") and _hip_use_alt_stream
@@ -524,6 +537,69 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             projected_states_ba, _ = self.in_proj_ba(hidden_states)
         return projected_states_qkvz, projected_states_ba
 
+    @cached_property
+    def _can_fuse_oproj(self) -> bool:
+        """Whether the gated-RMSNorm + FP8 per-token quant -> out_proj fusion applies.
+
+        True only for AttnFP8 out_proj (per-token-act x per-channel-weight a8w8, SiLU
+        gate, shape constraints), and only when the per-token-a8w8 prep flag
+        (Fp8LinearMethod.use_per_token_if_dynamic or Quark scheme.per_token) is set --
+        it guarantees the pre-shuffled weight gemm_a8w8_bpreshuffle needs. Cached on
+        first forward()."""
+        ok = False
+        if _fuse_gdn_oproj:
+            weight = getattr(self.out_proj, "weight", None)
+            weight_scale = getattr(self.out_proj, "weight_scale", None)
+            quant_method = getattr(self.out_proj, "quant_method", None)
+            scheme = getattr(self.out_proj, "scheme", None)
+            uses_per_token_a8w8 = bool(
+                getattr(quant_method, "use_per_token_if_dynamic", False)
+                or getattr(scheme, "per_token", False)
+            )
+            ok = (
+                weight is not None
+                and weight_scale is not None
+                # AttnFP8 weights are always e4m3fn; fused kernels don't handle fnuz.
+                and weight.dtype == torch.float8_e4m3fn
+                and uses_per_token_a8w8
+                and self.head_v_dim == 128
+                and (self.num_v_heads // self.attn_tp_size) <= 128
+                and self.output_gate_type in (None, "silu")
+            )
+        return ok
+
+    def _fused_norm_quant_out_proj(
+        self,
+        core_attn_out: torch.Tensor,
+        z: torch.Tensor,
+        z_shape_og: torch.Size,
+    ) -> torch.Tensor:
+        """Fused gated RMSNorm + FP8 per-token quant, then the out_proj a8w8 GEMM."""
+        from sglang.srt.layers.quantization.fp8_utils import (
+            apply_fp8_linear_aiter_prequant,
+        )
+
+        num_tokens, num_heads, head_dim = z_shape_og
+        x3 = core_attn_out.reshape(z_shape_og)
+        z3 = z.reshape(z_shape_og)
+
+        q_fp8 = torch.empty(
+            (num_tokens, num_heads * head_dim),
+            dtype=self.out_proj.weight.dtype,
+            device=x3.device,
+        )
+        q_scale = torch.empty((num_tokens,), dtype=torch.float32, device=x3.device)
+        _gated_rmsnorm_fp8_per_token_quant(
+            q_fp8, q_scale, x3, z3, self.norm.weight, self.layer_norm_epsilon
+        )
+        return apply_fp8_linear_aiter_prequant(
+            q_fp8,
+            q_scale.view(-1, 1),
+            self.out_proj.weight,
+            self.out_proj.weight_scale,
+            bias=None,
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -584,11 +660,14 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             core_attn_out_pad[: core_attn_out.shape[0], :] = core_attn_out
             core_attn_out = core_attn_out_pad
 
-        core_attn_out = self.norm(core_attn_out, z)
-        core_attn_out = core_attn_out.reshape(z_shape_og)
-        core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
+        if self._can_fuse_oproj:
+            output = self._fused_norm_quant_out_proj(core_attn_out, z, z_shape_og)
+        else:
+            core_attn_out = self.norm(core_attn_out, z)
+            core_attn_out = core_attn_out.reshape(z_shape_og)
+            core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
 
-        output, _ = self.out_proj(core_attn_out)
+            output, _ = self.out_proj(core_attn_out)
         return output
 
 
