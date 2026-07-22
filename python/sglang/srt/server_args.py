@@ -8610,19 +8610,14 @@ class ServerArgs:
 # (decrease-only) by test/registered/unit/test_legacy_global_ratchet.py.
 # Imports are in-function so the two modules stay cycle-free at import time.
 def set_global_server_args_for_scheduler(server_args: ServerArgs):
-    """Legacy publish shim (role=scheduler) — prefer
-    ``runtime_context.publish(server_args, role=...)`` in new code."""
-    from sglang.srt.runtime_context import publish
+    """Legacy publish shim — prefer ``get_context().set_server_args()`` from
+    ``sglang.srt.runtime_context`` in new code."""
+    from sglang.srt.runtime_context import get_context
 
-    publish(server_args, role="scheduler")
+    get_context().set_server_args(server_args)
 
 
-def set_global_server_args_for_tokenizer(server_args: ServerArgs):
-    """Legacy publish shim (role=tokenizer). Not aliased to the scheduler shim:
-    the process role differs."""
-    from sglang.srt.runtime_context import publish
-
-    publish(server_args, role="tokenizer")
+set_global_server_args_for_tokenizer = set_global_server_args_for_scheduler
 
 
 def get_global_server_args() -> ServerArgs:
