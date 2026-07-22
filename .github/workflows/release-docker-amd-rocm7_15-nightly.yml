@@ -10,8 +10,8 @@ on:
         options:
           - 'all'
           - publish
-  schedule:
-    - cron: '0 12 * * *'
+  # schedule:
+  #   - cron: '0 12 * * *'
 
 concurrency:
   # A PR number if a pull request and otherwise the commit hash. This cancels
