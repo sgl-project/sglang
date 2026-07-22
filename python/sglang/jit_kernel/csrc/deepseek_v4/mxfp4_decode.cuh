@@ -85,7 +85,8 @@ template <bool kUsePDL>
 __global__ void mxfp4_decode_kernel(const __grid_constant__ Mxfp4DecodeParams params) {
   using namespace device;
 
-  const auto& [q, k_cache, indices, o, sm_scale, page_stride_bytes, page_size] = params;
+  const auto& [q, k_cache, indices, o, sm_scale, page_stride_bytes, page_size, nq] = params;
+  (void)nq;
 
   const uint32_t warp_id = threadIdx.x / kWarpThreads;
   const uint32_t lane_id = threadIdx.x % kWarpThreads;
