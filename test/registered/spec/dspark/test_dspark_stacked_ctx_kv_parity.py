@@ -120,20 +120,21 @@ class TestDSparkStackedCtxKvParity(CustomTestCase):
             ctx_hidden=ctx_hidden, positions=positions, stacked=stacked
         )
 
-        # fp32 tol covers only fused-vs-manual RMSNorm rounding; bf16 is looser.
-        rtol, atol = (2e-4, 2e-4) if dtype == torch.float32 else (2e-2, 2e-2)
+        # Tol covers the fused-kernel-vs-manual-fp32 RMSNorm rounding; O(1)
+        # wiring errors fail either way. (Fused rmsnorm has no fp32 dispatch.)
+        rtol, atol = {torch.float16: (5e-3, 5e-3), torch.bfloat16: (2e-2, 2e-2)}[dtype]
         for i in range(num_layers):
             torch.testing.assert_close(k_all[i], ref_k[i], rtol=rtol, atol=atol)
             torch.testing.assert_close(v_all[i], ref_v[i], rtol=rtol, atol=atol)
 
-    def test_parity_fp32(self):
-        self._check_parity(dtype=torch.float32)
+    def test_parity_fp16(self):
+        self._check_parity(dtype=torch.float16)
 
     def test_parity_bf16(self):
         self._check_parity(dtype=torch.bfloat16)
 
     def test_parity_with_bias(self):
-        self._check_parity(dtype=torch.float32, has_bias=True)
+        self._check_parity(dtype=torch.float16, has_bias=True)
 
     def test_fallback_quantized_layer(self):
         g = torch.Generator(device=DEVICE).manual_seed(0)
