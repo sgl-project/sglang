@@ -97,6 +97,21 @@ pub struct GenerateRequest {
     /// Decode logprob token ids to text in each `[logprob, token_id, text]` tuple
     /// (the api-server does this at frame time; default leaves text null).
     pub return_text_in_logprobs: Option<bool>,
+    /// Multimodal inputs, carried opaquely (URL / base64 / path / nested lists —
+    /// any JSON shape the Python `GenerateReqInput` accepts). Consumed by the
+    /// Encoding stage, which ships them to the Python MM bridge; never read by
+    /// the tokenizer or serialized onto the scheduler header. Boxed: absent on
+    /// the common text-only request, so it shouldn't grow every `Request` moved
+    /// between stages.
+    pub mm: Option<Box<MmData>>,
+}
+
+/// The three opaque multimodal fields of one request (see [`GenerateRequest::mm`]).
+#[derive(Debug, Default)]
+pub struct MmData {
+    pub image_data: Option<rmpv::Value>,
+    pub video_data: Option<rmpv::Value>,
+    pub audio_data: Option<rmpv::Value>,
 }
 
 impl GenerateRequest {
@@ -105,11 +120,48 @@ impl GenerateRequest {
         self.input_ids.as_ref().is_some_and(|v| !v.is_empty())
     }
 
-    /// Multimodal detection hook. Deferred (Encoder stubbed): always false until mm
-    /// fields are wired in.
-    #[allow(dead_code)]
+    /// True when the request carries any usable multimodal payload — the Rust
+    /// mirror of Python `GenerateReqInput.contains_mm_input()` /
+    /// `has_valid_data`: `null` and (recursively) empty lists don't count.
     pub fn has_multimodal(&self) -> bool {
-        false
+        self.mm.as_ref().is_some_and(|mm| {
+            mm_value_present(&mm.image_data)
+                || mm_value_present(&mm.video_data)
+                || mm_value_present(&mm.audio_data)
+        })
+    }
+
+    /// Serialize the fields the Python MM bridge needs to run the model's
+    /// `mm_processor` for this request: a msgpack array
+    /// `[text, input_ids, image_data, video_data, audio_data]`. The bridge
+    /// reconstructs a `GenerateReqInput` from it and returns the final
+    /// (placeholder-expanded) `input_ids` via `push_mm_result`.
+    pub fn to_mm_payload_msgpack(&self) -> Result<Bytes, Error> {
+        use rmpv::Value;
+        let text_val = match &self.text {
+            Some(t) => Value::from(t.as_str()),
+            None => Value::Nil,
+        };
+        let input_ids_val = match &self.input_ids {
+            Some(ids) => Value::Array(ids.iter().map(|&i| Value::from(i)).collect()),
+            None => Value::Nil,
+        };
+        let mm_field = |f: fn(&MmData) -> &Option<Value>| -> Value {
+            self.mm
+                .as_deref()
+                .and_then(|m| f(m).clone())
+                .unwrap_or(Value::Nil)
+        };
+        let arr = Value::Array(vec![
+            text_val,
+            input_ids_val,
+            mm_field(|m| &m.image_data),
+            mm_field(|m| &m.video_data),
+            mm_field(|m| &m.audio_data),
+        ]);
+        let mut buf = Vec::new();
+        rmpv::encode::write_value(&mut buf, &arr).map_err(|e| Error::Codec(e.to_string()))?;
+        Ok(Bytes::from(buf))
     }
 
     /// `input_ids` widened to raw little-endian int64 bytes (the scheduler's
@@ -270,6 +322,17 @@ pub struct GenerateBody {
     #[serde(default)]
     pub n: Option<i64>,
 
+    // Multimodal inputs. Permissive `Value` types: any JSON shape the Python
+    // `GenerateReqInput` accepts (URL / base64 str / list / list-of-lists)
+    // parses; `split` fans them out per item mirroring the Python
+    // `_normalize_{image,video,audio}_data` batch rules.
+    #[serde(default)]
+    pub image_data: Option<rmpv::Value>,
+    #[serde(default)]
+    pub video_data: Option<rmpv::Value>,
+    #[serde(default)]
+    pub audio_data: Option<rmpv::Value>,
+
     // Accepted for wire-compat with the native `bench_serving` payload (a full
     // `GenerateReqInput`) but NOT yet wired into the scheduler — parsed and
     // dropped in `split`. Declaring them keeps `deny_unknown_fields` (typos still
@@ -282,9 +345,6 @@ pub struct GenerateBody {
     #[serde(default)]
     #[allow(dead_code)]
     pub return_routed_experts: Option<bool>,
-    #[serde(default)]
-    #[allow(dead_code)]
-    pub image_data: Option<rmpv::Value>,
 }
 
 impl GenerateBody {
@@ -305,6 +365,9 @@ impl GenerateBody {
             token_ids_logprob,
             return_hidden_states,
             return_text_in_logprobs,
+            image_data,
+            video_data,
+            audio_data,
             // Accepted for bench_serving compat, not wired through — see the struct.
             ..
         } = self;
@@ -369,6 +432,15 @@ impl GenerateBody {
             }
         };
 
+        // Multimodal columns, mirroring the Python batch-normalize rules
+        // (`_normalize_image_data` / `_normalize_video_data` / `_normalize_audio_data`).
+        let mut images = split_mm_column(image_data, n, is_batch, MmBroadcast::WrapInList)
+            .map_err(|e| format!("image_data: {e}"))?;
+        let mut videos = split_mm_column(video_data, n, is_batch, MmBroadcast::AsIs)
+            .map_err(|e| format!("video_data: {e}"))?;
+        let mut audios = split_mm_column(audio_data, n, is_batch, MmBroadcast::AsIs)
+            .map_err(|e| format!("audio_data: {e}"))?;
+
         // The scalar logprob/hidden opts broadcast to every item. `is_health_check`
         // is never client-set (only the internal `/health_generate` probe sets it).
         let requests = (0..n)
@@ -385,10 +457,99 @@ impl GenerateBody {
                 token_ids_logprob: token_ids_logprob.clone(),
                 return_hidden_states,
                 return_text_in_logprobs,
+                mm: pack_mm(images[i].take(), videos[i].take(), audios[i].take()),
             })
             .collect();
         Ok((requests, is_batch))
     }
+}
+
+/// Box the per-item mm values, or `None` when the item has none (the common
+/// text-only case keeps `GenerateRequest` slim).
+fn pack_mm(
+    image_data: Option<rmpv::Value>,
+    video_data: Option<rmpv::Value>,
+    audio_data: Option<rmpv::Value>,
+) -> Option<Box<MmData>> {
+    if image_data.is_none() && video_data.is_none() && audio_data.is_none() {
+        return None;
+    }
+    Some(Box::new(MmData {
+        image_data,
+        video_data,
+        audio_data,
+    }))
+}
+
+/// How a scalar (non-list) mm value broadcasts across a batch: images become a
+/// single-image list per item (`[[img]] * num` in Python `_normalize_image_data`),
+/// video/audio broadcast the bare value (`[v] * num` in `_normalize_video_data`).
+#[derive(Clone, Copy)]
+enum MmBroadcast {
+    WrapInList,
+    AsIs,
+}
+
+/// Fan one mm field (`image_data` / `video_data` / `audio_data`) into per-item
+/// values, mirroring the Python batch-normalize semantics:
+///   * `None` / empty list → `None` for every item;
+///   * single request → the raw value passes through (the processor-side
+///     normalize wraps a non-list into a one-element list);
+///   * batch + non-list → broadcast to every item (per `MmBroadcast`);
+///   * batch + list → per item; length must equal the batch size.
+fn split_mm_column(
+    v: Option<rmpv::Value>,
+    n: usize,
+    is_batch: bool,
+    broadcast: MmBroadcast,
+) -> Result<Vec<Option<rmpv::Value>>, String> {
+    let Some(v) = v else {
+        return Ok(vec![None; n]);
+    };
+    if v.is_nil() {
+        return Ok(vec![None; n]);
+    }
+    if !is_batch {
+        return Ok(vec![Some(v)]);
+    }
+    match v {
+        rmpv::Value::Array(items) if items.is_empty() => Ok(vec![None; n]),
+        rmpv::Value::Array(items) => {
+            if items.len() != n {
+                return Err(format!(
+                    "list length {} does not match batch size {n}",
+                    items.len()
+                ));
+            }
+            Ok(items.into_iter().map(Some).collect())
+        }
+        scalar => Ok(match broadcast {
+            MmBroadcast::WrapInList => vec![Some(rmpv::Value::Array(vec![scalar])); n],
+            MmBroadcast::AsIs => vec![Some(scalar); n],
+        }),
+    }
+}
+
+/// One request handed to the Python MM bridge (via `Server.recv_mm_requests`):
+/// the rid to correlate the result plus the msgpack payload from
+/// [`GenerateRequest::to_mm_payload_msgpack`].
+#[derive(Debug)]
+pub struct MmRequest {
+    pub rid: String,
+    pub payload: Bytes,
+}
+
+/// Rust mirror of Python `has_valid_data` for an opaque mm field: `null` and
+/// (recursively) empty / all-null lists don't count as multimodal input.
+fn mm_value_present(v: &Option<rmpv::Value>) -> bool {
+    fn valid(v: &rmpv::Value) -> bool {
+        match v {
+            rmpv::Value::Nil => false,
+            rmpv::Value::Array(items) => items.iter().any(valid),
+            _ => true,
+        }
+    }
+    v.as_ref().is_some_and(valid)
 }
 
 /// One ingress-ring entry, split columnar: the scalar `header` (msgpack, `input_ids`
@@ -930,9 +1091,69 @@ mod tests {
         );
     }
 
+    /// Multimodal fan-out mirrors Python's batch-normalize rules:
+    /// single request passes the raw value through; a batch broadcasts a scalar
+    /// image as `[img]` per item (`[[img]]*n`), maps a list per item, requires
+    /// matching lengths, and treats `null`/`[]` as absent.
+    #[test]
+    fn split_mm_fanout_matches_python_normalize() {
+        let image_of = |p: &GenerateRequest| p.mm.as_ref().unwrap().image_data.clone().unwrap();
+
+        // Single request: raw value passes through untouched.
+        let (ps, _) = split(r#"{"text": "a", "image_data": "http://x/i.jpg"}"#).unwrap();
+        assert_eq!(image_of(&ps[0]).as_str(), Some("http://x/i.jpg"));
+        assert!(ps[0].has_multimodal());
+
+        // Batch + scalar image: broadcast, wrapped as a one-image list per item.
+        let (ps, _) = split(r#"{"text": ["a", "b"], "image_data": "u"}"#).unwrap();
+        for p in &ps {
+            assert_eq!(image_of(p).as_array().unwrap().len(), 1);
+            assert!(p.has_multimodal());
+        }
+
+        // Batch + per-item list: element i goes to item i.
+        let (ps, _) = split(r#"{"text": ["a", "b"], "image_data": ["u1", "u2"]}"#).unwrap();
+        assert_eq!(image_of(&ps[0]).as_str(), Some("u1"));
+        assert_eq!(image_of(&ps[1]).as_str(), Some("u2"));
+
+        // Batch + wrong-length list is a 400.
+        assert!(split(r#"{"text": ["a", "b"], "image_data": ["u1"]}"#).is_err());
+
+        // null / [] mean "no multimodal input".
+        let (ps, _) = split(r#"{"text": "a", "image_data": null}"#).unwrap();
+        assert!(!ps[0].has_multimodal());
+        let (ps, _) = split(r#"{"text": "a", "image_data": []}"#).unwrap();
+        assert!(!ps[0].has_multimodal());
+
+        // Batch + scalar video: broadcast bare (not wrapped), per Python
+        // `_normalize_video_data`.
+        let (ps, _) = split(r#"{"text": ["a", "b"], "video_data": "v"}"#).unwrap();
+        let video = ps[1].mm.as_ref().unwrap().video_data.clone().unwrap();
+        assert_eq!(video.as_str(), Some("v"));
+        assert!(ps[1].has_multimodal());
+    }
+
+    /// The mm payload for the Python bridge is a positional msgpack array
+    /// `[text, input_ids, image_data, video_data, audio_data]`.
+    #[test]
+    fn mm_payload_shape() {
+        let (ps, _) =
+            split(r#"{"text": "hi", "image_data": ["u1", "u2"], "audio_data": "a"}"#).unwrap();
+        let payload = ps[0].to_mm_payload_msgpack().unwrap();
+        let val = rmpv::decode::read_value(&mut &payload[..]).unwrap();
+        let arr = val.as_array().unwrap();
+        assert_eq!(arr.len(), 5);
+        assert_eq!(arr[0].as_str(), Some("hi"));
+        assert!(arr[1].is_nil());
+        assert_eq!(arr[2].as_array().unwrap().len(), 2);
+        assert!(arr[3].is_nil());
+        assert_eq!(arr[4].as_str(), Some("a"));
+    }
+
     /// The native `bench_serving` payload (a `GenerateReqInput` superset) parses:
-    /// its `lora_path`/`return_routed_experts`/`image_data` are accepted-but-ignored,
-    /// so `split` succeeds and drops them while the real fields survive.
+    /// its `lora_path`/`return_routed_experts` are accepted-but-ignored and a
+    /// `null` `image_data` means "no multimodal input", so `split` succeeds
+    /// while the real fields survive.
     #[test]
     fn accepts_bench_serving_payload() {
         let (ps, is_batch) = split(

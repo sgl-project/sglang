@@ -10,14 +10,17 @@ scheduler holds an `Optional[RustServer]` and delegates to it.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
+import threading
 from array import array
 from itertools import chain
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import msgspec
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.utils import (
     MsgpackDecodeError,
     msgpack_decode_explained,
@@ -39,6 +42,187 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+class MmBridge:
+    """In-process multimodal bridge for the embedded Rust server.
+
+    The Rust ingress parks multimodal requests in its ``Encoding`` stage and
+    queues ``(rid, payload)`` work items; this bridge drains them
+    (``Server.recv_mm_requests``), runs the *same* model-specific
+    ``mm_processor`` + shared helper the Python TokenizerManager uses
+    (``mm_request_processing.run_mm_processor_for_request``), then
+
+      1. stores the processed ``(mm_inputs, token_type_ids)`` in the rid-keyed
+         ``results`` table (consumed by :meth:`RustServer.drain`, which attaches
+         it to the decoded ``TokenizedGenerateReqInput`` — by reference, no
+         pickle hop), and
+      2. resumes the parked Rust request via ``Server.push_mm_result`` with the
+         final placeholder-expanded ``input_ids`` (or ``push_mm_error`` → 400).
+
+    The store happens strictly *before* the resume, and the scheduler can only
+    drain the request after the resume, so a drained mm request always finds
+    its table entry.
+
+    Threading: one daemon thread runs a private asyncio loop (the processors'
+    native interface is ``async``), one daemon thread blocks on
+    ``recv_mm_requests`` (GIL released while parked) and submits coroutines to
+    the loop. Heavy work (media decode, HF processor tensor ops) runs in the
+    processor's own executors / GIL-releasing C code; a semaphore bounds
+    in-flight requests so MM preprocessing can't starve the scheduler loop.
+    """
+
+    # Max concurrently-processed mm requests (GIL-contention bound).
+    MAX_INFLIGHT = 8
+
+    def __init__(self, server: Server, scheduler: Scheduler):
+        # Lazy imports: this class is only instantiated for multimodal models
+        # under SGLANG_RUST_SERVER.
+        from sglang.srt.managers.multimodal_processor import (
+            get_mm_processor,
+            import_processors,
+        )
+        from sglang.srt.managers.tokenizer_manager import (
+            _determine_tensor_transport_mode,
+            _get_processor_wrapper,
+        )
+        from sglang.srt.utils.hf_transformers_utils import (
+            get_tokenizer_from_processor,
+        )
+
+        self.server = server
+        self.server_args = scheduler.server_args
+        self.model_config = scheduler.model_config
+        self.max_req_input_len = getattr(scheduler, "max_req_input_len", None)
+
+        # rid -> (mm_inputs, token_type_ids); popped by RustServer.drain.
+        self.results: Dict[str, Tuple[Any, Optional[List[int]]]] = {}
+
+        # Same processor stack the Python TokenizerManager builds
+        # (init_tokenizer_and_processor, multimodal branch). The HF
+        # AutoProcessor is reused from the scheduler's init_tokenizer (already
+        # loaded, identical construction args) when available; under
+        # skip_tokenizer_init the scheduler has none, so load one — the mm
+        # processor still needs it to encode images.
+        import_processors("sglang.srt.multimodal.processors")
+        if mm_process_pkg := envs.SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE.get():
+            import_processors(mm_process_pkg, overwrite=True)
+        _processor = getattr(scheduler, "processor", None) or _get_processor_wrapper(
+            self.server_args
+        )
+        transport_mode = _determine_tensor_transport_mode(self.server_args)
+        self.mm_processor = get_mm_processor(
+            self.model_config.hf_config,
+            self.server_args,
+            _processor,
+            transport_mode,
+            model_config=self.model_config,
+        )
+        if self.server_args.skip_tokenizer_init:
+            self.tokenizer = None
+        else:
+            self.tokenizer = get_tokenizer_from_processor(_processor)
+
+        self._sem = asyncio.Semaphore(self.MAX_INFLIGHT)
+        self.loop = asyncio.new_event_loop()
+        threading.Thread(
+            target=self.loop.run_forever, name="rust-mm-bridge-loop", daemon=True
+        ).start()
+        threading.Thread(
+            target=self._dispatch_loop, name="rust-mm-bridge-recv", daemon=True
+        ).start()
+        logger.info(
+            "rust server: MM bridge started (processor=%s)",
+            type(self.mm_processor).__name__,
+        )
+
+    def _dispatch_loop(self) -> None:
+        """Drain the Rust Encoding queue and fan each request out as a coroutine
+        on the bridge loop. The blocking wait releases the GIL."""
+        while True:
+            try:
+                reqs = self.server.recv_mm_requests(
+                    max=self.MAX_INFLIGHT, timeout_ms=1000
+                )
+            except Exception:
+                logger.exception("rust mm bridge: recv_mm_requests failed; exiting")
+                return
+            for rid, payload in reqs:
+                asyncio.run_coroutine_threadsafe(self._handle(rid, payload), self.loop)
+
+    async def _handle(self, rid: str, payload: bytes) -> None:
+        """Process one mm request end-to-end; never raises (errors reject the
+        parked Rust request as a 400, matching the Python path)."""
+        try:
+            async with self._sem:
+                input_ids, mm_inputs, token_type_ids = await self._process(
+                    rid, payload
+                )
+            # Store BEFORE resuming the Rust request — drain() consumes strictly
+            # after the resume, so the entry is always there.
+            self.results[rid] = (mm_inputs, token_type_ids)
+            if hasattr(input_ids, "tolist"):  # tensor-shaped processor output
+                input_ids = input_ids.tolist()
+            ids_bytes = array("q", input_ids or []).tobytes()
+            self.server.push_mm_result(rid, ids_bytes)
+        except Exception as e:
+            logger.warning("rust mm bridge: request %s failed: %s", rid, e)
+            self.results.pop(rid, None)
+            try:
+                self.server.push_mm_error(rid, str(e) or type(e).__name__)
+            except Exception:
+                logger.exception("rust mm bridge: push_mm_error failed for %s", rid)
+
+    async def _process(self, rid: str, payload: bytes):
+        """The tokenize-then-mm-process sequence of
+        ``TokenizerManager._tokenize_one_request``, for one Rust-parked request."""
+        from sglang.srt.managers.io_struct import GenerateReqInput
+        from sglang.srt.managers.mm_request_processing import (
+            run_mm_processor_for_request,
+        )
+
+        text, input_ids, image_data, video_data, audio_data = msgspec.msgpack.decode(
+            payload
+        )
+        obj = GenerateReqInput(
+            rid=rid,
+            text=text,
+            input_ids=input_ids,
+            image_data=image_data,
+            video_data=video_data,
+            audio_data=audio_data,
+        )
+
+        # Mirror _tokenize_one_request's pre-mm tokenize (the mm processor's
+        # output overrides these ids with the placeholder-expanded prompt).
+        input_text = obj.text
+        if obj.input_ids is None:
+            if self.tokenizer is None:
+                raise ValueError(
+                    "skip_tokenizer_init is set: multimodal text prompts require "
+                    "input_ids"
+                )
+            if not input_text and obj.contains_mm_input():
+                # Audio-only (e.g. Whisper): the mm processor provides input_ids.
+                input_ids = []
+            elif not getattr(self.tokenizer, "is_fast", False):
+                input_ids = self.tokenizer.encode(input_text)
+            else:
+                input_ids = self.tokenizer(input_text)["input_ids"]
+        else:
+            input_ids = obj.input_ids
+
+        return await run_mm_processor_for_request(
+            obj=obj,
+            input_text=input_text,
+            input_ids=input_ids,
+            token_type_ids=None,
+            mm_processor=self.mm_processor,
+            hf_architectures=self.model_config.hf_config.architectures,
+            server_args=self.server_args,
+            max_req_input_len=self.max_req_input_len,
+            mm_receiver=None,
+        )
+
+
 class RustServer:
     """Owns the embedded multi-threaded Rust server (``sglang_server.Server``).
 
@@ -46,8 +230,14 @@ class RustServer:
     all implemented as Rust threads in scheduler process.
     """
 
-    def __init__(self, server: Server, max_per_poll: int = 256):
+    def __init__(
+        self,
+        server: Server,
+        mm_bridge: Optional[MmBridge] = None,
+        max_per_poll: int = 256,
+    ):
         self.server = server
+        self.mm_bridge = mm_bridge
         self._max_per_poll = max_per_poll
 
     @classmethod
@@ -75,6 +265,12 @@ class RustServer:
             server_args_json=cls._build_server_args(scheduler),
         )
 
+        # Multimodal models get the in-process MM bridge (drives the same
+        # Python mm_processor the Python TokenizerManager would).
+        mm_bridge = (
+            MmBridge(server, scheduler) if scheduler.model_config.is_multimodal else None
+        )
+
         # Narrow the scheduler thread only after the server threads are launched.
         if launch_cores is not None:
             try:
@@ -88,7 +284,7 @@ class RustServer:
             http_addr,
         )
 
-        return cls(server)
+        return cls(server, mm_bridge=mm_bridge)
 
     def wait_ingress(self, timeout_ms: int) -> None:
         """Block until a request is pushed into the in-process ring or the timeout
@@ -139,6 +335,15 @@ class RustServer:
                 ids.frombytes(ids_view[pos : pos + nbytes])
                 obj.input_ids = ids
                 pos += nbytes
+            if self.mm_bridge is not None:
+                # A multimodal request's processed mm_inputs travel by reference
+                # through the bridge's rid-keyed table (populated strictly
+                # before the request was pushed to this ring) — no pickle hop.
+                entry = self.mm_bridge.results.pop(getattr(obj, "rid", None), None)
+                if entry is not None:
+                    obj.mm_inputs, token_type_ids = entry
+                    if token_type_ids is not None:
+                        obj.token_type_ids = token_type_ids
             out.append(obj)
         return out
 

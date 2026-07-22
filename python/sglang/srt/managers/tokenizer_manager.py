@@ -87,9 +87,9 @@ from sglang.srt.managers.io_struct import (
     unwrap_from_pickle,
 )
 from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
+from sglang.srt.managers.mm_request_processing import run_mm_processor_for_request
 from sglang.srt.managers.mm_utils import TensorTransportMode, wrap_shm_features
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
-from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
 from sglang.srt.managers.tokenizer_control_mixin import TokenizerControlMixin
 from sglang.srt.managers.tokenizer_manager_score_mixin import TokenizerManagerScoreMixin
@@ -866,114 +866,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     input_text, is_cross_encoder_request
                 )
 
-        contains_mm_input = obj.contains_mm_input()
-        is_mossvl = (
-            "MossVLForConditionalGeneration"
-            in self.model_config.hf_config.architectures
+        # Multimodal processing lives in a shared helper so the embedded Rust
+        # server's MM bridge (rust_server.MmBridge) runs the exact same code.
+        input_ids, mm_inputs, token_type_ids = await run_mm_processor_for_request(
+            obj=obj,
+            input_text=input_text,
+            input_ids=input_ids,
+            token_type_ids=token_type_ids,
+            mm_processor=self.mm_processor,
+            hf_architectures=self.model_config.hf_config.architectures,
+            server_args=self.server_args,
+            max_req_input_len=self.max_req_input_len,
+            mm_receiver=getattr(self, "mm_receiver", None),
         )
-        should_run_mm_processor = self.mm_processor is not None and (
-            contains_mm_input or is_mossvl
-        )
-
-        if should_run_mm_processor:
-            if obj.image_data is not None and not isinstance(obj.image_data, list):
-                obj.image_data = [obj.image_data]
-            if obj.video_data is not None and not isinstance(obj.video_data, list):
-                obj.video_data = [obj.video_data]
-            if obj.audio_data is not None and not isinstance(obj.audio_data, list):
-                obj.audio_data = [obj.audio_data]
-            if contains_mm_input:
-                self._validate_mm_limits(obj)
-
-            mm_inputs = None
-
-            if (
-                not self.server_args.language_only
-                or self.server_args.encoder_transfer_backend == "zmq_to_tokenizer"
-            ):
-                if self.server_args.language_only:
-                    mm_inputs = await self.mm_receiver.recv_mm_data(
-                        request_obj=obj,
-                        mm_processor=self.mm_processor,
-                        prompt=(input_text or input_ids),
-                        need_wait_for_mm_inputs=obj.need_wait_for_mm_inputs,
-                    )
-                if mm_inputs is None:
-                    if self.server_args.language_only:
-                        logger.warning(
-                            "Encoder embedding not available, "
-                            "falling back to local mm processing"
-                        )
-                    mm_inputs = await self.mm_processor.process_mm_data_async(
-                        image_data=obj.image_data,
-                        audio_data=obj.audio_data,
-                        input_text=(input_text or input_ids),
-                        request_obj=obj,
-                        max_req_input_len=self.max_req_input_len,
-                    )
-            elif (
-                self.server_args.language_only
-                and self.server_args.encoder_transfer_backend
-                in ["zmq_to_scheduler", "mooncake"]
-                and not obj.need_wait_for_mm_inputs
-            ):
-                # In language_only mode with zmq_to_scheduler/mooncake, if we didn't dispatch
-                # to encoder (e.g., only one image), process locally like non-language_only mode
-                mm_inputs = await self.mm_processor.process_mm_data_async(
-                    image_data=obj.image_data,
-                    audio_data=obj.audio_data,
-                    input_text=(input_text or input_ids),
-                    request_obj=obj,
-                    max_req_input_len=self.max_req_input_len,
-                )
-
-            if mm_inputs and mm_inputs.input_ids is not None:
-                input_ids = mm_inputs.input_ids
-            if mm_inputs and mm_inputs.token_type_ids is not None:
-                token_type_ids = mm_inputs.token_type_ids
-                if not isinstance(token_type_ids, list):
-                    token_type_ids = token_type_ids.flatten().tolist()
-            # Caller-supplied per-image hashes (external KV routers, e.g.
-            # routing-aware orchestrators that compute a content-addressed
-            # hash before dispatch). Setting MultimodalDataItem.hash here
-            # short-circuits the internal hash_feature() recompute inside
-            # set_pad_value(), making the derived pad_value deterministic
-            # from the caller's hash. That alignment lets the router's
-            # routing decision agree with sglang's prefix-cache key for
-            # the same image. On any per-item parse error or list-length
-            # mismatch we fall back to the internal recompute so a
-            # malformed mm_hashes never blocks a request.
-            caller_mm_hashes = getattr(obj, "mm_hashes", None)
-            if caller_mm_hashes and mm_inputs and mm_inputs.mm_items:
-                if len(caller_mm_hashes) != len(mm_inputs.mm_items):
-                    logger.warning(
-                        "mm_hashes length (%d) != mm_items length (%d); "
-                        "ignoring caller hashes for this request.",
-                        len(caller_mm_hashes),
-                        len(mm_inputs.mm_items),
-                    )
-                else:
-                    for item, hex_hash in zip(mm_inputs.mm_items, caller_mm_hashes):
-                        if not isinstance(item, MultimodalDataItem):
-                            continue
-                        try:
-                            item.hash = int(hex_hash, 16)
-                        except (TypeError, ValueError):
-                            logger.warning(
-                                "Ignoring malformed mm_hashes entry %r; "
-                                "this item will fall back to hash_feature().",
-                                hex_hash,
-                            )
-            if (
-                envs.SGLANG_MM_PRECOMPUTE_HASH.get()
-                and mm_inputs
-                and mm_inputs.mm_items
-            ):
-                for item in mm_inputs.mm_items:
-                    if isinstance(item, MultimodalDataItem):
-                        item.set_pad_value()
-        else:
-            mm_inputs = None
 
         self._validate_one_request(obj, input_ids)
         return self._create_tokenized_object(
@@ -1062,21 +967,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     "The server is not configured to enable custom logit processor. "
                     "Please set `--enable-custom-logit-processor` to enable this feature."
                 )
-
-    def _validate_mm_limits(
-        self, obj: Union[GenerateReqInput, EmbeddingReqInput]
-    ) -> None:
-        if not self.server_args.limit_mm_data_per_request:
-            return
-
-        for modality, limit in self.server_args.limit_mm_data_per_request.items():
-            data = getattr(obj, f"{modality}_data", None)
-            if data:
-                count = len(data) if isinstance(data, list) else 1
-                if count > limit:
-                    raise ValueError(
-                        f"{modality.capitalize()} count {count} exceeds limit {limit} per request."
-                    )
 
     def _validate_for_matryoshka_dim(self, obj: EmbeddingReqInput) -> None:
         """Validate the request for Matryoshka dim if it has the field set."""

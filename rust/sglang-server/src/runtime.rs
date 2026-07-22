@@ -134,6 +134,10 @@ pub struct ModelConfig {
     /// they crash the scheduler's embedding lookup. `None` → unvalidated.
     #[serde(default)]
     pub vocab_size: Option<u64>,
+    /// Whether the model accepts multimodal inputs. Gates the MM Encoding
+    /// branch in tm-ingress (`false` → mm fields silently ignored).
+    #[serde(default)]
+    pub is_multimodal: bool,
 }
 
 fn default_host() -> String {
@@ -193,6 +197,14 @@ impl ServerArgs {
         4.max(self.tokenizer_worker_num)
             .max(self.detokenizer_worker_num)
     }
+
+    /// Whether the served model is multimodal (`model_config.is_multimodal`
+    /// from the scheduler's dump). Gates the MM Encoding branch: when false,
+    /// mm fields on a request are silently ignored, mirroring the Python
+    /// `TokenizerManager` (`mm_processor is None`).
+    pub fn model_is_multimodal(&self) -> bool {
+        self.model_config.is_multimodal
+    }
 }
 
 /// Live runtime. Held by the pyo3 bridge; the Python boundary reads `ingress`
@@ -200,6 +212,13 @@ impl ServerArgs {
 pub struct Runtime {
     pub ingress: IngressConsumer,
     pub egress: EgressProducer,
+    /// Requests parked in `Encoding`, drained by the Python MM bridge
+    /// (`Server.recv_mm_requests`). Empty channel when the model is not
+    /// multimodal (the ingress never routes to it).
+    pub mm: flume::Receiver<crate::message::MmRequest>,
+    /// Back-channel for the MM bridge's results (`Server.push_mm_result` /
+    /// `push_mm_error`) into the tm-ingress loop.
+    pub tm: flume::Sender<TmEvent>,
     /// Worker join handles, joined by `request_shutdown` / `Drop`.
     threads: Mutex<Vec<JoinHandle<()>>>,
     /// The single shutdown sender.
@@ -275,6 +294,9 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
     // --- inter-stage channels ---
     let (tm_tx, tm_rx) = flume::bounded::<TmEvent>(cfg.channel_cap);
     let (tok_tx, tok_rx) = flume::bounded::<crate::message::Request>(cfg.channel_cap);
+    // Encoding → Python MM bridge. Bounded like the other stage edges so a slow
+    // bridge back-pressures new MM requests instead of buffering unboundedly.
+    let (mm_tx, mm_rx) = flume::bounded::<crate::message::MmRequest>(cfg.channel_cap);
     let mut detok_tx = Vec::with_capacity(cfg.detokenizer_worker_num);
     let mut detok_rx = Vec::with_capacity(cfg.detokenizer_worker_num);
     for _ in 0..cfg.detokenizer_worker_num {
@@ -375,16 +397,19 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
             .as_ref()
             .and_then(|p| p.tm.get(1).or_else(|| p.tm.first()).copied())
             .map(|c| vec![c]);
-        let mut parts = Some((tm_rx, ingress_tx)); // moved into the single worker
+        let mm_enabled = cfg.server_args.model_is_multimodal();
+        let mut parts = Some((tm_rx, ingress_tx, mm_tx)); // moved into the single worker
         let shutdown_rx = shutdown_rx.clone();
         spawn_pool("tm-ingress", cores, 1, &mut threads, |_| {
-            let (tm_rx, ingress_tx) = parts.take().unwrap();
+            let (tm_rx, ingress_tx, mm_tx) = parts.take().unwrap();
             tokenizer_manager::Ingress::new(
                 tm_rx,
                 senders.clone(),
                 ingress_tx,
                 skip_tokenizer_init,
                 cfg.server_args.model_config.vocab_size,
+                mm_enabled,
+                mm_tx,
                 shutdown_rx.clone(),
             )
         });
@@ -429,6 +454,8 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
     Ok(Runtime {
         ingress: ingress_rx,
         egress: egress_tx,
+        mm: mm_rx,
+        tm: tm_tx,
         threads: Mutex::new(threads),
         shutdown_tx: Mutex::new(Some(shutdown_tx)),
     })
