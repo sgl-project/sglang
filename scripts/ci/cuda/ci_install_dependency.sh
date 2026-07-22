@@ -483,24 +483,40 @@ install_extra_deps() {
         EXTRA_NVIDIA_SPECS="nvidia-cuda-nvrtc-cu12"
     fi
 
-    # >>> TEMP — DO NOT MERGE: validate custom Mooncake arm64 wheel ------------
-    # Pull the `wheel-arm64-py312` artifact from the kvcache-ai/Mooncake CI run
-    # 28088854345 (auth-free permalink via nightly.link) and install it on the
-    # GB300 aarch64 runner, so test_disaggregation_aarch64 exercises this build
-    # instead of the pinned PyPI package. Gated on aarch64 so x86 runners are
-    # untouched. Revert this whole block before merging.
-    if [ "$(uname -m)" = "aarch64" ]; then
-        MOONCAKE_WHEEL_ZIP_URL="https://nightly.link/kvcache-ai/Mooncake/actions/artifacts/8499866108.zip"
+    # >>> TEMP — DO NOT MERGE: validate custom Mooncake wheels -----------------
+    # Pull a custom Mooncake wheel from the kvcache-ai/Mooncake CI run
+    # 28088854345 (auth-free permalinks via nightly.link) and install it on the
+    # matching runner, so the disaggregation tests exercise this build instead
+    # of the pinned PyPI package. Selected per (arch, CUDA major) so the wheel's
+    # package name matches whatever MOONCAKE_PKG/MOONCAKE_STALE_PKG were set to
+    # above:
+    #   - aarch64      -> wheel-arm64-py312                 (mooncake-transfer-engine; GB300 is CU12)
+    #   - x86_64, CU12 -> mooncake-wheel-ubuntu-py312       (mooncake-transfer-engine)
+    #   - x86_64, CU13 -> mooncake-wheel-cu130-ubuntu-py312 (mooncake-transfer-engine-cuda13)
+    # MOONCAKE_STALE_PKG is left as computed above (the *other* variant) so the
+    # force-reinstall/uninstall dance below stays correct. Revert this whole
+    # block before merging.
+    MOONCAKE_WHEEL_ZIP_URL=""
+    case "$(uname -m)" in
+        aarch64)
+            MOONCAKE_WHEEL_ZIP_URL="https://nightly.link/kvcache-ai/Mooncake/actions/runs/28088854345/wheel-arm64-py312.zip"
+            ;;
+        x86_64)
+            if [ "$CU_MAJOR" = "13" ]; then
+                MOONCAKE_WHEEL_ZIP_URL="https://nightly.link/kvcache-ai/Mooncake/actions/runs/28088854345/mooncake-wheel-cu130-ubuntu-py312.zip"
+            else
+                MOONCAKE_WHEEL_ZIP_URL="https://nightly.link/kvcache-ai/Mooncake/actions/runs/28088854345/mooncake-wheel-ubuntu-py312.zip"
+            fi
+            ;;
+    esac
+    if [ -n "$MOONCAKE_WHEEL_ZIP_URL" ]; then
         MOONCAKE_WHEEL_DIR="$(mktemp -d)"
         curl -fSL --retry 3 --retry-delay 2 \
             -o "${MOONCAKE_WHEEL_DIR}/wheel.zip" "${MOONCAKE_WHEEL_ZIP_URL}"
         python3 -c "import zipfile,sys; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])" \
             "${MOONCAKE_WHEEL_DIR}/wheel.zip" "${MOONCAKE_WHEEL_DIR}"
         MOONCAKE_PKG="$(ls "${MOONCAKE_WHEEL_DIR}"/*.whl)"
-        # The custom wheel is the base `mooncake-transfer-engine` package, so the
-        # `-cuda13` variant from the runner image is the stale one to remove.
-        MOONCAKE_STALE_PKG="mooncake-transfer-engine-cuda13"
-        echo "TEMP: overriding mooncake with custom arm64 wheel: ${MOONCAKE_PKG}"
+        echo "TEMP: overriding mooncake with custom wheel for $(uname -m)/CU${CU_MAJOR}: ${MOONCAKE_PKG}"
     fi
     # <<< TEMP ------------------------------------------------------------------
 
