@@ -6,7 +6,7 @@ from sglang.jit_kernel.benchmark.utils import (
     create_empty,
     create_random,
 )
-from sglang.jit_kernel.kvcache import store_cache
+from sglang.kernels.ops.kvcache.kvcache import store_cache
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(
