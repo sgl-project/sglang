@@ -864,7 +864,7 @@ mod tests {
 
         let messages = serde_json::json!([{"role":"user","content":"hello world hello world"}]);
         // Engine-side blocks are keyed on tokenize(render(messages)).
-        let templated_tokens = registry.encode_chat("tiny", &messages).unwrap();
+        let templated_tokens = registry.encode_chat("tiny", &messages, None).unwrap();
         let block_size = 4u32;
         let templated_hashes = compute_block_hashes(&templated_tokens, block_size as usize);
         assert!(
@@ -921,7 +921,7 @@ mod tests {
         let content = "hello world hello world";
         let messages = serde_json::json!([{"role":"user","content":content}]);
 
-        let templated = registry.encode_chat("tiny", &messages).unwrap();
+        let templated = registry.encode_chat("tiny", &messages, None).unwrap();
         let raw = adapter::encode(&registry.get("tiny").unwrap(), content).unwrap();
         assert_ne!(
             compute_block_hashes(&templated, 4),
@@ -944,7 +944,7 @@ mod tests {
 
         let messages =
             serde_json::json!([{"role":"user","content":"hello world hello world hello world"}]);
-        let encoded = registry.encode_chat("tiny", &messages).unwrap();
+        let encoded = registry.encode_chat("tiny", &messages, None).unwrap();
         let block_size = 4u32;
         let hashes = compute_block_hashes(&encoded, block_size as usize);
         assert!(!hashes.is_empty());
@@ -1629,7 +1629,7 @@ mod tests {
             }),
         );
         let messages = serde_json::json!([{"role":"user","content":"hello world"}]);
-        let expected = registry.encode_chat("tiny", &messages).unwrap();
+        let expected = registry.encode_chat("tiny", &messages, None).unwrap();
 
         let model = ModelId("tiny".into());
         let value = serde_json::json!({ "model": "tiny", "messages": messages });

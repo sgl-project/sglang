@@ -1644,7 +1644,10 @@ mod tests {
                 AbortReason::UpstreamTimeout,
             ),
             (
-                ApiError::StaleRequestExpired { model: "m".into(), worker: reqwest::Url::parse("http://test-worker/").unwrap() },
+                ApiError::StaleRequestExpired {
+                    model: "m".into(),
+                    worker: reqwest::Url::parse("http://test-worker/").unwrap(),
+                },
                 AbortReason::StaleRequestExpired,
             ),
             (

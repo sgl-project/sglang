@@ -61,7 +61,11 @@ pub fn request_tokens_for(
 ) -> Option<RequestTokens> {
     if tokenizers.has_chat_encoder(&model_id.0) {
         if let Some(messages) = value.get("messages").filter(|m| m.is_array()) {
-            if let Some(ids) = tokenizers.encode_chat(&model_id.0, messages) {
+            // Pass the request's top-level `tools` so the chat encoder renders
+            // them into the prefix the way the engine does — otherwise tool
+            // traffic routes on a tools-omitted tokenization that never matches
+            // the engine's cached blocks (see `dsv4::render_messages`).
+            if let Some(ids) = tokenizers.encode_chat(&model_id.0, messages, value.get("tools")) {
                 return Some(RequestTokens {
                     ids,
                     engine_equivalent: true,

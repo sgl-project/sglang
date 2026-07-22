@@ -166,10 +166,7 @@ pub enum ApiError {
     /// engine.worker` so a fronting gateway can attribute the stale-cancel to
     /// a specific downstream worker.
     #[error("stale request expired for model {model} on worker {worker}")]
-    StaleRequestExpired {
-        model: String,
-        worker: reqwest::Url,
-    },
+    StaleRequestExpired { model: String, worker: reqwest::Url },
 
     /// A single dispatch attempt exceeded the per-attempt response deadline
     /// (`retry.attempt_deadline_ms`) before the worker produced a response — a
@@ -604,9 +601,8 @@ impl ApiError {
             _ => return None,
         };
         Some(
-            HeaderValue::from_str(&format!("engine.worker;desc={worker}")).unwrap_or_else(
-                |_| HeaderValue::from_static("engine.worker;desc=unknown"),
-            ),
+            HeaderValue::from_str(&format!("engine.worker;desc={worker}"))
+                .unwrap_or_else(|_| HeaderValue::from_static("engine.worker;desc=unknown")),
         )
     }
 }
@@ -686,7 +682,11 @@ mod tests {
         .is_retryable_upstream());
         assert!(!ApiError::ServiceOverloaded { model: "m".into() }.is_retryable_upstream());
         assert!(!ApiError::NoHealthyWorkers { model: "m".into() }.is_retryable_upstream());
-        assert!(!ApiError::StaleRequestExpired { model: "m".into(), worker: reqwest::Url::parse("http://test-worker/").unwrap() }.is_retryable_upstream());
+        assert!(!ApiError::StaleRequestExpired {
+            model: "m".into(),
+            worker: reqwest::Url::parse("http://test-worker/").unwrap()
+        }
+        .is_retryable_upstream());
         assert!(!ApiError::BadRequest("x".into()).is_retryable_upstream());
         assert!(!ApiError::ModelNotFound("x".into()).is_retryable_upstream());
         assert!(!ApiError::Internal(anyhow::anyhow!("boom")).is_retryable_upstream());
@@ -937,7 +937,10 @@ mod tests {
             ),
             (
                 "stale-deadline cancel",
-                ApiError::StaleRequestExpired { model: "m".into(), worker: worker.clone() },
+                ApiError::StaleRequestExpired {
+                    model: "m".into(),
+                    worker: worker.clone(),
+                },
                 StatusCode::GATEWAY_TIMEOUT,
                 "stale_request_expired",
                 None,
@@ -1073,9 +1076,7 @@ mod tests {
             .filter_map(|v| v.to_str().ok().map(str::to_owned))
             .collect();
         assert!(
-            values
-                .iter()
-                .any(|v| v == "router.stage;desc=dispatch"),
+            values.iter().any(|v| v == "router.stage;desc=dispatch"),
             "router.stage;desc=dispatch missing from Server-Timing values: {values:?}",
         );
         assert!(
