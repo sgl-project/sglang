@@ -7,7 +7,7 @@ import time
 from array import array
 from collections import defaultdict
 from functools import partial
-from queue import Empty, Queue
+from queue import Queue
 from typing import TYPE_CHECKING, Any, Iterator, NamedTuple, Optional, TypeVar
 
 import torch
@@ -1951,67 +1951,62 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     def can_terminate_prefetch(self, operation: PrefetchOperation) -> bool:
         if self.prefetch_stop_policy == "best_effort":
             return True
-
-        if len(operation.hash_value) == 0:
-            completed = False
-        else:
-            completed = (
-                operation.completed_tokens == len(operation.hash_value) * self.page_size
-            )
-
         if self.prefetch_stop_policy == "wait_complete":
-            can_terminate = completed
+            return False
         elif self.prefetch_stop_policy == "timeout":
-            can_terminate = completed or self._prefetch_timeout_check_linear_func(
-                operation
-            )
+            return self._prefetch_timeout_check_linear_func(operation)
         else:
             return True
-        if (
-            completed
-            and getattr(operation, "pool_transfers", None)
-            and not getattr(operation, "pool_transfers_done", True)
-        ):
-            can_terminate = False
-
-        operation_terminated = operation.is_terminated()
-        states = torch.tensor(
-            [1 - int(can_terminate), int(operation_terminated)],
-            dtype=torch.int,
-        )
-        self._all_reduce_attn_groups(states, torch.distributed.ReduceOp.MAX)
-        can_terminate = states[0].item() == 0
-        operation_terminated = states[1].item() == 1
-        return can_terminate or operation_terminated
 
     def check_prefetch_progress(self, req_id: str) -> bool:
         if req_id not in self.ongoing_prefetch:
             return True
 
+        _, _, _, operation, _, _ = self.ongoing_prefetch[req_id]
+
+        # Determine whether or not we should terminate this prefetch request.  Make all
+        # ranks agree on the decision.  When running with PP, PPn will follow PP0's decision.
+        should_terminate = False
+        if self.pp_rank == 0:
+            should_terminate = operation.is_terminated() or self.can_terminate_prefetch(
+                operation
+            )
+        should_terminate_tensor = torch.tensor(
+            int(should_terminate), dtype=torch.int, device="cpu"
+        )
+        self._all_reduce(should_terminate_tensor, torch.distributed.ReduceOp.MAX)
+        should_terminate = should_terminate_tensor.item() == 1
+
+        if not should_terminate:
+            return False
+
+        self.cache_controller.terminate_prefetch(operation)
+        if operation.host_indices is None:
+            self._revoke_pending_prefetch(req_id)
+        else:
+            self._handle_prefetch_result(operation)
+        return True
+
+    def _handle_prefetch_result(self, operation: PrefetchOperation) -> None:
+        req_id = operation.request_id
+        completed_tokens = operation.completed_tokens
+
         (
             last_host_node,
             prefetch_key,
             host_indices,
-            operation,
+            _,
             anchor_lock_params,
             comp_xfers,
-        ) = self.ongoing_prefetch[req_id]
-        if not self.can_terminate_prefetch(operation):
-            return False
-        if operation.host_indices is None:
-            self.cache_controller.terminate_prefetch(operation)
-            self._revoke_pending_prefetch(req_id)
-            return True
+        ) = self.ongoing_prefetch.pop(req_id)
 
-        completed_tokens, hash_value = self.cache_controller.terminate_prefetch(
-            operation
-        )
-
-        min_completed_tokens = self._sync_and_check_hybrid_prefetch_result(
+        # All PP/TP ranks will get the same `min_completed_tokens`, because `completed_tokens`
+        # and `hool_hits` in their operations are same.  No need to sync cross-rank here.
+        min_completed_tokens = self._check_hybrid_prefetch_result(
             req_id,
             operation,
             completed_tokens,
-            hash_value,
+            operation.hash_value,
             host_indices,
             last_host_node,
             anchor_lock_params,
@@ -2019,14 +2014,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         )
         if min_completed_tokens is None:
             # Hybrid all-or-nothing check failed; result already discarded.
-            return True
+            return
 
         fetched_key = prefetch_key[:min_completed_tokens]
         insert_result = self._insert_helper_host(
             last_host_node,
             fetched_key,
-            host_indices[:min_completed_tokens],
-            hash_value[: min_completed_tokens // self.page_size],
+            host_indices[:completed_tokens],
+            operation.hash_value[: completed_tokens // self.page_size],
         )
 
         for ct, xfers in comp_xfers.items():
@@ -2041,30 +2036,24 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.cache_controller.mem_pool_host.free(
             host_indices[: insert_result.prefix_len]
         )
-        self.cache_controller.append_host_mem_release(
-            host_indices[min_completed_tokens:completed_tokens]
-        )
         self.dec_host_lock_ref(last_host_node, anchor_lock_params)
-        del self.ongoing_prefetch[req_id]
         self.cache_controller.prefetch_tokens_occupied -= len(prefetch_key)
 
-        loaded_from_storage = min_completed_tokens - insert_result.prefix_len
+        loaded_from_storage = completed_tokens - insert_result.prefix_len
         self.prefetch_loaded_tokens_by_reqid[req_id] = loaded_from_storage
         logger.info(
-            "HiCache prefetch success req=%s completed_local=%d completed_synced=%d matched=%d loaded=%d tail_release=%d occupied=%d",
+            "HiCache prefetch success req=%s completed=%d matched=%d loaded=%d occupied=%d",
             req_id,
             completed_tokens,
-            min_completed_tokens,
             insert_result.prefix_len,
             loaded_from_storage,
-            completed_tokens - min_completed_tokens,
             self.cache_controller.prefetch_tokens_occupied,
         )
         if self.enable_storage_metrics and self.storage_metrics_collector is not None:
             self.storage_metrics_collector.log_prefetched_tokens(loaded_from_storage)
-        return True
+        return
 
-    def _sync_and_check_hybrid_prefetch_result(
+    def _check_hybrid_prefetch_result(
         self,
         req_id: str,
         operation: PrefetchOperation,
@@ -2075,7 +2064,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         anchor_lock_params: DecLockRefParams,
         prefetch_key: RadixKey,
     ) -> Optional[int]:
-        """Sync prefetch results across ATTN groups and decide the usable prefix.
+        """Decide the length of usable prefix.
 
         Two strategies depending on the hybrid layout:
 
@@ -2087,7 +2076,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
           *all-or-nothing*. Their pools only cover a window / tail and cannot be
           truncated page by page, so any shortfall discards the whole prefetch.
 
-        Returns the synced usable token count (possibly clamped, possibly 0), or
+        Returns the usable token count (possibly clamped, possibly 0), or
         ``None`` when an all-or-nothing prefetch was discarded (the caller should
         then treat the prefetch as finished).
         """
@@ -2098,12 +2087,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             operation.pool_storage_result.extra_pool_hit_pages if pool_transfers else {}
         )
         pool_hit_pages = [hit_pages.get(t.name, 0) for t in pool_transfers]
-        packed = torch.tensor([completed_tokens, *pool_hit_pages], dtype=torch.int)
-        self._all_reduce_attn_groups(packed, torch.distributed.ReduceOp.MIN)
-        min_completed_tokens = int(packed[0].item())
-        pool_hit_pages = list(map(int, packed[1:].tolist()))
-        for transfer, count in zip(pool_transfers, pool_hit_pages):
-            hit_pages[transfer.name] = count
+        completed_tokens = operation.completed_tokens
 
         # DSA-style clamp: every sidecar is KV-derived and required for the whole
         # prefix (ALL_PAGES), so the usable length is simply the shared minimum of
@@ -2114,14 +2098,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             for t in pool_transfers
         )
         if clampable:
-            usable_pages = min(min_completed_tokens // self.page_size, *pool_hit_pages)
+            usable_pages = min(completed_tokens // self.page_size, *pool_hit_pages)
             return usable_pages * self.page_size
 
         # Hybrid cache state is all-or-nothing: every extra pool (SWA / Mamba / ...)
         # must cover the same fetched prefix. If any pool falls short the whole
         # prefetch result is unusable, so discard it and release everything.
         expected_tokens = len(hash_value) * self.page_size
-        all_succeeded = min_completed_tokens == expected_tokens and all(
+        all_succeeded = completed_tokens == expected_tokens and all(
             transfer.keys is not None and count == len(transfer.keys)
             for transfer, count in zip(pool_transfers, pool_hit_pages)
         )
@@ -2133,7 +2117,6 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 extra_pools=pool_transfers,
             )
             self.dec_host_lock_ref(last_host_node, anchor_lock_params)
-            del self.ongoing_prefetch[req_id]
             self.cache_controller.prefetch_tokens_occupied -= len(prefetch_key)
             self.prefetch_loaded_tokens_by_reqid[req_id] = 0
             logger.warning(
@@ -2143,13 +2126,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 expected_tokens,
             )
             return None
-        return min_completed_tokens
-
-    def terminate_prefetch(self, req_id: str) -> None:
-        if req_id not in self.ongoing_prefetch:
-            return
-        operation = self.ongoing_prefetch[req_id].operation
-        operation.mark_terminate()
+        return completed_tokens
 
     def pop_prefetch_loaded_tokens(self, req_id: str) -> int:
         return self.prefetch_loaded_tokens_by_reqid.pop(req_id, 0)
@@ -2173,7 +2150,6 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return
 
         completed_tokens, _ = self.cache_controller.terminate_prefetch(operation)
-        self._barrier_attn_groups()
         self.dec_host_lock_ref(last_host_node, anchor_lock_params)
         del self.ongoing_prefetch[rid]
         self.cache_controller.append_host_mem_release(
@@ -2207,6 +2183,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self,
         n_revoke: Optional[int],
         n_storage_hit: Optional[int],
+        n_ack_prefetch: Optional[int],
         n_backup: Optional[int],
         n_release: Optional[int],
         extra_release_counts: Optional[dict[PoolName, int]],
@@ -2214,15 +2191,20 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     ) -> None:
         cc = self.cache_controller
 
-        def _drain_queue(q: Queue[T], limit: Optional[int]) -> Iterator[T]:
-            drained = 0
-            while limit is None or drained < limit:
-                try:
-                    item = q.get_nowait()
-                except Empty:
-                    break
-                drained += 1
-                yield item
+        def _drain_queue(q: Queue[T], n: Optional[int]) -> Iterator[T]:
+            """If n is None, consume all items from the queue.
+            Otherwise, consume n items from the queue.
+            """
+            if n is None:
+                while not q.empty():
+                    item = q.get()
+                    yield item
+            else:
+                for _ in range(n):
+                    # Block when there are not enough elements.
+                    # All TP/PP ranks must consume the same number of elements.
+                    item = q.get()
+                    yield item
 
         def _drain_revoke():
             for req_id in _drain_queue(cc.prefetch_revoke_queue, n_revoke):
@@ -2265,6 +2247,25 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 operation.host_indices = host_indices
                 self.ongoing_prefetch[req_id] = info._replace(host_indices=host_indices)
                 cc.prefetch_buffer.put(operation)
+
+        def _drain_ack_prefetch():
+            for ack in _drain_queue(cc.ack_prefetch_queue, n_ack_prefetch):
+                operation = ack.operation
+                if ack.completed_tokens is not None:
+                    if operation.request_id in self.ongoing_prefetch:
+                        assert operation.completed_tokens <= ack.completed_tokens
+                        operation.completed_tokens = ack.completed_tokens
+                if ack.pool_hits is not None:
+                    if operation.request_id in self.ongoing_prefetch:
+                        operation.pool_storage_result.update_extra_pool_hit_pages(
+                            ack.pool_hits
+                        )
+                        operation.pool_transfers_done = True
+                if ack.completed_req:
+                    if operation.request_id in self.ongoing_prefetch:
+                        self._handle_prefetch_result(operation)
+                    tail = operation.host_indices[operation.completed_tokens :]
+                    cc.mem_pool_host.free(tail)
 
         def _drain_backup():
             drained = 0
@@ -2316,6 +2317,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         _drain_revoke()
         _drain_and_alloc_storage_hit()
+        _drain_ack_prefetch()
         _drain_backup()
         _drain_release()
         _drain_extra_release()
@@ -2327,6 +2329,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         local_qsize_list = [
             cc.prefetch_revoke_queue.qsize(),
             cc.prefetch_hit_queue.qsize(),
+            cc.ack_prefetch_queue.qsize(),
             cc.ack_backup_queue.qsize(),
             cc.host_mem_release_queue.qsize(),
             *[
@@ -2338,16 +2341,17 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             local_qsize_list,
             dtype=torch.int,
         )
-        self._all_reduce_attn_groups(qsizes, torch.distributed.ReduceOp.MIN)
+        self._all_reduce(qsizes, torch.distributed.ReduceOp.MIN)
         qsize_list = list(map(int, qsizes.tolist()))
-        n_revoke, n_storage_hit, n_backup, n_release = qsize_list[:4]
+        n_revoke, n_storage_hit, n_ack_prefetch, n_backup, n_release = qsize_list[:5]
         extra_release_counts = {
             pool_name: count
-            for pool_name, count in zip(extra_pool_names, qsize_list[4:])
+            for pool_name, count in zip(extra_pool_names, qsize_list[5:])
         }
         self._drain_storage_control_queues_impl(
             n_revoke=n_revoke,
             n_storage_hit=n_storage_hit,
+            n_ack_prefetch=n_ack_prefetch,
             n_backup=n_backup,
             n_release=n_release,
             extra_release_counts=extra_release_counts,

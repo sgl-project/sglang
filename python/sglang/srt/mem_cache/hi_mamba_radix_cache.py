@@ -1763,13 +1763,6 @@ class HiMambaRadixCache(MambaRadixCache):
         can_terminate = can_terminate or operation_terminated
         return can_terminate
 
-    def terminate_prefetch(self, req_id: str):
-        if req_id not in self.ongoing_prefetch:
-            return
-
-        _, _, _, operation = self.ongoing_prefetch[req_id]
-        operation.mark_terminate()
-
     def pop_prefetch_loaded_tokens(self, req_id: str) -> int:
         return self.prefetch_loaded_tokens_by_reqid.pop(req_id, 0)
 

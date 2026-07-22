@@ -394,10 +394,14 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     "Mooncake package does not support ReplicateConfig.group_ids. "
                     "Falling back to the existing batch_put_from path."
                 )
-            tp_scale_factor = 1 if storage_config is None else storage_config.tp_size
+            rank_scale_factor = (
+                1
+                if storage_config is None
+                else (storage_config.tp_size * storage_config.pp_size)
+            )
 
-            per_tp_global_segment_size = (
-                self.config.global_segment_size // tp_scale_factor
+            per_rank_global_segment_size = (
+                self.config.global_segment_size // rank_scale_factor
             )
 
             # Check if extra_backend_tag should be passed to MooncakeDistributedStore
@@ -485,7 +489,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                         ret_code = self.store.setup(
                             client_hostname,
                             self.config.metadata_server,
-                            per_tp_global_segment_size,
+                            per_rank_global_segment_size,
                             DEFAULT_LOCAL_BUFFER_SIZE,  # Zero copy interface does not need local buffer
                             self.config.protocol,
                             device_name,

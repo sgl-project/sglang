@@ -2354,7 +2354,6 @@ class UnifiedRadixCacheSuite:
         req_id = "l3-prefetch-req"
         cons.prefetch_from_storage(req_id, cons.root_node, array("q", seq), None, None)
         self._run_prefetch_to_completion(cons, req_id)
-        cons.drain_storage_control_queues()
 
         # The full prefix must now be a host hit (loaded from L3).
         mc = cons.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
@@ -2376,35 +2375,28 @@ class UnifiedRadixCacheSuite:
 
     # ---------- TP consistency for SWA prefetch (all-or-nothing) ----------
 
-    def _patch_tp_all_reduce(self, cache, drop_swa: bool):
-        """Fake all_reduce so check_prefetch_progress runs the tp>1 path."""
+    def _patch_tp_prefetch_sync(self, cache, drop_swa: bool):
+        """Fake all_reduce so _reduce_prefetch_ack runs the tp>1 path."""
         import torch.distributed as dist
 
-        min_sizes = []
+        cc = cache.cache_controller
 
-        def swa_packed_index():
-            # Packed tensor is [completed_tokens, *sidecar_hits]; sidecar order
-            # matches comp_xfers stored in ongoing_prefetch (one live entry).
-            for info in cache.ongoing_prefetch.values():
-                comp_xfers = info[-1]
-                names = [t.name for xfers in comp_xfers.values() for t in xfers]
-                if PoolName.SWA in names:
-                    return 1 + names.index(PoolName.SWA), 1 + len(names)
-            return None, None
+        # Fake _reduce_prefetch_ack to drop SWA pool_hits when drop_swa is True.
+        def fake_reduce(ack):
+            if drop_swa and ack.pool_hits is not None:
+                if PoolName.SWA.value in ack.pool_hits:
+                    ack.pool_hits[PoolName.SWA.value] = 0
 
-        def fake(tensor, op=None, group=None):
-            if op == dist.ReduceOp.MIN:
-                min_sizes.append(tensor.numel())
-                if drop_swa:
-                    idx, packed_numel = swa_packed_index()
-                    if idx is not None and tensor.numel() == packed_numel:
-                        tensor[idx] = 0
-            return None
+        p_reduce = mock.patch.object(
+            cc, "_reduce_prefetch_ack", side_effect=fake_reduce
+        )
+        p_reduce.start()
+        self.addCleanup(p_reduce.stop)
 
-        p = mock.patch.object(dist, "all_reduce", side_effect=fake)
-        p.start()
-        self.addCleanup(p.stop)
-        return min_sizes
+        # Make all_reduce no-op.  The real all_reduce fails in unit tests with tp_world_size=2.
+        p_dist = mock.patch.object(dist, "all_reduce", return_value=None)
+        p_dist.start()
+        self.addCleanup(p_dist.stop)
 
     def _swa_host_on_path(self, cache, seq):
         m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
@@ -2438,7 +2430,6 @@ class UnifiedRadixCacheSuite:
     def _consume_prefetch(self, cons, seq, req_id):
         cons.prefetch_from_storage(req_id, cons.root_node, array("q", seq), None, None)
         self._run_prefetch_to_completion(cons, req_id)
-        cons.drain_storage_control_queues()
 
     def _setup_swa_tp_prefetch(self):
         """Skip non-SWA fixtures; produce one full SWA window+1 page to L3.
@@ -2477,7 +2468,7 @@ class UnifiedRadixCacheSuite:
 
         cons = self._l3_consumer(storage_dir)
         cons.tp_world_size = 2
-        min_sizes = self._patch_tp_all_reduce(cons, drop_swa=True)
+        self._patch_tp_prefetch_sync(cons, drop_swa=True)
         self._consume_prefetch(cons, seq, "drop")
 
         m = cons.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
@@ -2485,10 +2476,6 @@ class UnifiedRadixCacheSuite:
         self.assertFalse(
             self._swa_host_on_path(cons, seq), "SWA must be dropped when a peer misses"
         )
-        # Full + sidecars must be synced through a packed MIN all_reduce. The
-        # poll loop may observe more than one completed check, so do not pin the
-        # exact number of reductions.
-        self.assertIn(2, min_sizes)
         cons.sanity_check()
 
     def test_tp_swa_prefetch_adopted_when_peer_present(self):
@@ -2501,7 +2488,7 @@ class UnifiedRadixCacheSuite:
 
         cons = self._l3_consumer(storage_dir)
         cons.tp_world_size = 2
-        min_sizes = self._patch_tp_all_reduce(cons, drop_swa=False)  # peer == local
+        self._patch_tp_prefetch_sync(cons, drop_swa=False)  # peer == local
         self._consume_prefetch(cons, seq, "keep")
 
         m = cons.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
@@ -2510,7 +2497,6 @@ class UnifiedRadixCacheSuite:
             self._swa_host_on_path(cons, seq),
             "SWA must be adopted when all ranks have it",
         )
-        self.assertIn(2, min_sizes)
         cons.sanity_check()
 
     def _skip_unsupported_hicache_test(self):
