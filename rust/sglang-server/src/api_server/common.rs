@@ -1,6 +1,6 @@
 //! Common control-plane endpoints — `/server_info`, `/get_model_info`
 //! (+ `/model_info` alias), plus the control-request submission path
-//! (`submit` / `await_control_result`). Data-plane endpoints (incl. `/health*`,
+//! (`await_control_result`, on the shared `submit`). Data-plane endpoints (incl. `/health*`,
 //! which round-trips a generate probe) live in the sibling `native_api` and
 //! `openai` modules; the shared `AppState` lives in the parent
 //! `api_server` module.
@@ -12,14 +12,11 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
-use tokio::sync::mpsc;
 
 use super::AppState;
-use crate::fsm::RequestState;
-use crate::ids::RidHash;
-use crate::message::{ControlRequest, EgressItem, EgressSink, Request, RequestKind};
+use super::submit::submit;
+use crate::message::{ControlRequest, EgressItem, RequestKind};
 use crate::runtime::ServerArgs;
-use crate::runtime::channels::TmEvent;
 
 /// The routes this module owns, mounted by `api_server::serve`.
 pub(super) fn routes() -> Router<AppState> {
@@ -33,34 +30,6 @@ pub(super) fn routes() -> Router<AppState> {
         .route("/model_info", get(model_info))
 }
 
-/// Submit one control request into the ingress pipeline (always a rust-minted
-/// rid — control responses are routed by it, so no client-supplied form
-/// exists); returns the rid, its hashed routing key, and the egress receiver.
-async fn submit(
-    state: &AppState,
-    tag: &'static str,
-) -> Result<(RidHash, String, mpsc::Receiver<EgressItem>), ()> {
-    let rid = crate::ids::new_rid();
-    let id = RidHash::from_rid(&rid);
-    // Async-aware send so a full TM inbox yields (backpressure) instead of parking
-    // a thread; Err only when the inbox is closed (shutdown).
-    let (tx, rx) = mpsc::channel::<EgressItem>(state.egress_buf);
-    let request = Request {
-        rid_hash: id,
-        rid: rid.clone(),
-        state: RequestState::Received,
-        sink: EgressSink::Local(tx),
-        kind: RequestKind::Control(ControlRequest { tag }),
-    };
-    match state.senders.tm.send_async(TmEvent::Ingress(request)).await {
-        Ok(()) => Ok((id, rid, rx)),
-        Err(_) => {
-            tracing::error!("tm inbox closed; request dropped");
-            Err(())
-        }
-    }
-}
-
 /// Submit a `Control(tag)` through the ingress FSM (no tokenization) and await the
 /// scheduler's single msgpack result (a `structs.asdict` named map). Returns the
 /// raw bytes, or an error `Response` to return as-is.
@@ -68,9 +37,7 @@ async fn await_control_result(
     state: &AppState,
     tag: &'static str,
 ) -> Result<bytes::Bytes, Response> {
-    let (_id, _rid, mut rx) = submit(state, tag)
-        .await
-        .map_err(|()| (StatusCode::SERVICE_UNAVAILABLE, "service unavailable").into_response())?;
+    let (_id, _rid, mut rx) = submit(state, RequestKind::Control(ControlRequest { tag })).await?;
     match rx.recv().await {
         Some(EgressItem::Control(bytes)) => Ok(bytes),
         Some(EgressItem::Error(e)) => {
