@@ -27,6 +27,7 @@ from sglang.srt.utils.flatten import (
     NestedRowColumns,
     RaggedPairColumns,
 )
+from sglang.version import __version__
 
 if TYPE_CHECKING:
     from sglang_server import Server
@@ -150,6 +151,11 @@ class RustServer:
         scheduler's GIL.
         """
 
+        # Invariant: control requests always carry a rust-minted rid; without
+        # one the response is unroutable, so fail loudly rather than drop it.
+        assert (
+            recv_req.rid is not None
+        ), f"control response without rid: {type(output).__name__}"
         # No local try/except: a failed push propagates to run_scheduler_process's
         # outer handler, which logs the full traceback (scheduler-fatal either way).
         payload = (
@@ -160,10 +166,8 @@ class RustServer:
         # enc_hook stringifies non-native types (paths, enums); JSON
         # rendering happens in Rust.
         encoded = msgspec.msgpack.encode(payload, enc_hook=str)
-        # Every control request is a BaseReq, so `rid` always exists; only its
-        # value may be None (unrouted control paths) — then fall back to "0".
-        rid = recv_req.rid or "0"
-        self.server.push_result(rid, encoded)
+
+        self.server.push_result(recv_req.rid, encoded)
 
     def push_generation(self, payload: BatchTokenIDOutput) -> None:
         """Egress redirect for generation output (replaces the zmq detokenizer).
@@ -298,8 +302,6 @@ class RustServer:
     def _build_server_args(scheduler: Scheduler) -> str:
         """JSON blob of the scheduler's ``server_args`` for its embedded Rust
         server (carries the already-resolved ``model_config``)."""
-
-        from sglang.version import __version__
 
         server_args = dict(vars(scheduler.server_args))
         model_config = dict(vars(scheduler.model_config))
