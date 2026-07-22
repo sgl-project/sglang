@@ -25,7 +25,7 @@ import torch
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 try:
-    from sglang.jit_kernel.fused_store_index_cache import (
+    from sglang.kernels.ops.attention.fused_store_index_cache import (
         can_use_dsa_fused_store,
         fused_store_index_k_cache,
     )
@@ -49,7 +49,6 @@ except ImportError:
     _is_fp8_fnuz = False
 
 register_cuda_ci(est_time=24, stage="base-b-kernel-unit", runner_config="1-gpu-large")
-register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
 register_amd_ci(est_time=24, suite="nightly-amd-kernel-1-gpu", nightly=True)
 
 PAGE_SIZE = 64

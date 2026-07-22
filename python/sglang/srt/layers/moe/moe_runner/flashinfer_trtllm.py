@@ -25,8 +25,8 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe.flashinfer_trtllm_moe import (
-    trtllm_fp8_block_scale_moe_wrapper,
-    trtllm_fp8_block_scale_routed_moe_wrapper,
+    trtllm_fp8_block_scale_moe_out_wrapper,
+    trtllm_fp8_block_scale_routed_moe_out_wrapper,
     trtllm_fp8_per_tensor_scale_moe_wrapper,
 )
 from sglang.srt.layers.moe.moe_runner.base import (
@@ -47,6 +47,8 @@ logger = __import__("logging").getLogger(__name__)
 _deferred_finalize_enabled: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "flashinfer_trtllm_deferred_finalize_enabled", default=False
 )
+
+_TRTLLM_MOE_PDL_MAX_TOKENS = envs.SGLANG_TRTLLM_MOE_PDL_MAX_TOKENS.get()
 
 
 @dataclass
@@ -72,8 +74,8 @@ def finalize_flashinfer_trtllm_deferred_output(
     deferred_output: FlashInferTrtllmDeferredFinalizeOutput,
     shared_output: torch.Tensor,
 ) -> torch.Tensor:
-    from sglang.jit_kernel.moe_finalize_fuse_shared import moe_finalize_fuse_shared
-    from sglang.jit_kernel.utils import is_arch_support_pdl
+    from sglang.kernels.jit.utils import is_arch_support_pdl
+    from sglang.kernels.ops.moe.moe_finalize_fuse_shared import moe_finalize_fuse_shared
 
     return moe_finalize_fuse_shared(
         deferred_output.gemm2_out,
@@ -124,6 +126,20 @@ def _is_gated(layer: Module) -> bool:
         getattr(layer, "moe_runner_config", None) and layer.moe_runner_config.is_gated
     )
     return True if is_gated is None else is_gated
+
+
+def _get_packed_topk_ids_for_flashinfer_routed(topk_output) -> torch.Tensor:
+    """Return FlashInfer routed packed top-k ids, using prepacked output if present."""
+    packed_topk_ids = getattr(topk_output, "packed_topk_ids", None)
+    if packed_topk_ids is not None:
+        return packed_topk_ids
+
+    from sglang.srt.layers.moe.topk import TopKOutputChecker
+
+    assert TopKOutputChecker.format_is_standard(topk_output)
+    return PackTopkIds.execute(
+        topk_output.topk_ids.contiguous(), topk_output.topk_weights.contiguous()
+    )
 
 
 def _align_fp8_moe_weights(
@@ -717,12 +733,9 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
             assert (
                 runner_config.top_k is not None
             ), "runner_config.top_k is required for flashinfer_trtllm_routed."
-            assert TopKOutputChecker.format_is_standard(topk_output)
-            packed_topk_ids = PackTopkIds.execute(
-                topk_output.topk_ids, topk_output.topk_weights
-            )
+            packed_topk_ids = _get_packed_topk_ids_for_flashinfer_routed(topk_output)
 
-            output = trtllm_fp8_block_scale_routed_moe_wrapper(
+            trtllm_fp8_block_scale_routed_moe_out_wrapper(
                 topk_ids=packed_topk_ids,
                 routing_bias=None,
                 hidden_states=a_q,
@@ -749,6 +762,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
                     else routing_method_type
                 ),
                 use_shuffled_weight=use_shuffled_weight,
+                output=symm_output,
                 tune_max_num_tokens=next_power_of_2(a_q.shape[0]),
                 fp8_quantization_type=int(fp8_quantization_type),
                 activation_type=quant_info.activation_type,
@@ -756,7 +770,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
         else:
             assert TopKOutputChecker.format_is_bypassed(topk_output)
 
-            output = trtllm_fp8_block_scale_moe_wrapper(
+            trtllm_fp8_block_scale_moe_out_wrapper(
                 routing_logits=router_logits,
                 routing_bias=correction_bias,
                 hidden_states=a_q,
@@ -765,6 +779,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
                 gemm1_weights_scale=quant_info.w13_weight_scale_inv,
                 gemm2_weights=quant_info.w2_weight,
                 gemm2_weights_scale=quant_info.w2_weight_scale_inv,
+                output=symm_output,
                 num_experts=quant_info.global_num_experts,
                 top_k=topk_config.top_k,
                 n_group=topk_config.num_expert_group,
@@ -783,8 +798,6 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
                 fp8_quantization_type=int(fp8_quantization_type),
                 activation_type=quant_info.activation_type,
             )
-        # TODO: Once https://github.com/flashinfer-ai/flashinfer/issues/2703 is fixed, pass output to moe kernel and remove this copy.
-        symm_output.copy_(output)
         output = symm_output
     else:
         assert TopKOutputChecker.format_is_bypassed(topk_output)
@@ -935,18 +948,14 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
     topk_output = dispatch_output.topk_output
 
     # Quantize hidden states to FP4
-    hidden_states_scale = (
-        dispatch_output.hidden_states_scale
-        if hasattr(dispatch_output, "hidden_states_scale")
-        else None
-    )
+    hidden_states_scale = dispatch_output.hidden_states_scale
     per_token_scale = None
     if hidden_states_scale is not None:
-        # NVFP4 dispatch, inputs are already quantized.
+        # NVFP4 dispatch (flashinfer a2a): inputs are already FP4-quantized by
+        # the dispatcher, so pass them through unchanged.
         hs_fp4 = hidden_states
         hs_scale_linear = hidden_states_scale
     elif quant_info.use_per_token_activation:
-        #  Enable FlashInfer TRTLLM per-token NVFP4 activation scaling; ignores checkpoint activation FP32 scale by treating it as
         from flashinfer import SfLayout, nvfp4_quantize
 
         e4m3_max = 448.0
@@ -996,6 +1005,8 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
         hidden_size = (
             hs_fp4.shape[-1] * 2 if hs_fp4.dtype == torch.uint8 else hs_fp4.shape[-1]
         )
+        # When the dispatcher delivered pre-quantized FP4 (hidden_states is uint8),
+        # the MoE output is bf16 rather than the input dtype.
         output_dtype = (
             hidden_states.dtype if hidden_states_scale is None else torch.bfloat16
         )
@@ -1018,18 +1029,14 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
         else:
             with use_symmetric_memory(get_tp_group(), disabled=not _symm_required):
                 symm_output = torch.empty(
-                    hs_fp4.shape[0],
+                    num_tokens,
                     hidden_size,
                     dtype=output_dtype,
                     device=hs_fp4.device,
                 )
 
     if use_routed_topk:
-        assert TopKOutputChecker.format_is_standard(topk_output)
-
-        packed_topk_ids = PackTopkIds.execute(
-            topk_output.topk_ids, topk_output.topk_weights
-        )
+        packed_topk_ids = _get_packed_topk_ids_for_flashinfer_routed(topk_output)
         result = trtllm_fp4_block_scale_routed_moe(
             topk_ids=packed_topk_ids,
             routing_bias=None,
@@ -1049,7 +1056,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             output2_scale_scalar=quant_info.g2_alphas,
             per_token_scale=per_token_scale,
             num_experts=quant_info.global_num_experts,
-            top_k=topk_output.topk_ids.shape[1],
+            top_k=packed_topk_ids.shape[1],
             n_group=0,
             topk_group=0,
             intermediate_size=quant_info.intermediate_size_per_partition,
@@ -1061,6 +1068,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             activation_type=activation_type,
             tune_max_num_tokens=next_power_of_2(hs_fp4.shape[0]),
             output=symm_output,
+            enable_pdl=hs_fp4.shape[0] <= _TRTLLM_MOE_PDL_MAX_TOKENS,
         )[0]
     else:
         assert TopKOutputChecker.format_is_bypassed(topk_output)
@@ -1104,6 +1112,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             do_finalize=not defer_finalize,
             activation_type=activation_type,
             tune_max_num_tokens=next_power_of_2(hs_fp4.shape[0]),
+            enable_pdl=hs_fp4.shape[0] <= _TRTLLM_MOE_PDL_MAX_TOKENS,
         )
         if not defer_finalize:
             moe_kwargs["output"] = symm_output
@@ -1196,16 +1205,13 @@ def fused_experts_none_to_flashinfer_trtllm_bf16(
             assert (
                 runner_config.top_k is not None
             ), "runner_config.top_k is required for flashinfer_trtllm_routed."
-            assert TopKOutputChecker.format_is_standard(topk_output)
             routing_method_type = runner_config.routing_method_type
             if routing_method_type is None:
                 routing_method_type = RoutingMethodType.Default
             elif routing_method_type == RoutingMethodType.DeepSeekV3:
                 routing_method_type = RoutingMethodType.TopK
 
-            packed_topk_ids = PackTopkIds.execute(
-                topk_output.topk_ids, topk_output.topk_weights
-            )
+            packed_topk_ids = _get_packed_topk_ids_for_flashinfer_routed(topk_output)
             final_hidden_states = trtllm_bf16_routed_moe(
                 topk_ids=packed_topk_ids,
                 hidden_states=hidden_states,

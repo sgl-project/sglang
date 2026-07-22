@@ -3531,8 +3531,9 @@ async def run_dp_worker(
     # 0 when CVD is pinned to one GPU, else the absolute id. rank=0, so
     # MMEncoder runs set_device(base_gpu_id).
     args = copy.deepcopy(server_args)
-    args.base_gpu_id = gpu_id
-    args.tp_size = 1
+    # The copy is already resolved (read-only); route the per-worker
+    # specialization through the audited mutation entry.
+    args.override("encode_server.dp_worker", base_gpu_id=gpu_id, tp_size=1)
     enc = MMEncoder(args, dist_init_method=f"tcp://127.0.0.1:{get_free_port()}", rank=0)
 
     global encoder_metrics_collector

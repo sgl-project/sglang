@@ -10,7 +10,7 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 
 _is_cuda = current_platform.is_cuda()
 if _is_cuda:
-    from sglang.jit_kernel.diffusion.triton.scale_shift import (
+    from sglang.kernels.ops.diffusion.triton.scale_shift import (
         fuse_layernorm_scale_shift_gate_select01_kernel,
         fuse_residual_layernorm_scale_shift_gate_select01_kernel,
     )
