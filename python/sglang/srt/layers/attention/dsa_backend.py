@@ -78,10 +78,6 @@ from sglang.srt.utils import (
 # concat). Enable with SGLANG_DSA_TRITON_PREFILL=1. Decode stays on TileLang.
 _DSA_TRITON_PREFILL = get_bool_env_var("SGLANG_DSA_TRITON_PREFILL")
 _IS_GFX95 = is_gfx95_supported()
-# Row-slice cap for the head-padded flash_mla_sparse call under DCP; bounds
-# the padded q/out transients (rows * 128 * 576 * 2B per buffer). Tunable for
-# perf/memory trade-off studies.
-
 if is_cuda():
     import deep_gemm
 
@@ -456,14 +452,8 @@ class DeepseekSparseAttnBackend(
         self.device_sm_major = self.device_capability[0]
         self.kv_cache_dtype = model_runner.kv_cache_dtype
 
-        # Decode context parallelism (DCP): the latent KV is interleaved
-        # across DCP ranks (global slot g -> rank g % dcp at local row
-        # g // dcp; the masked/divided write already happens inside
-        # set_mla_kv_buffer's triton kernel). The indexer K cache stays
-        # replicated (global slots), so every rank scores the full sequence
-        # and produces identical top-k; each rank then keeps only its owned
-        # selections (filtered/divided in the index transforms) and the
-        # partial attention outputs are LSE-combined across the DCP group.
+        # DCP: latent KV interleaved across ranks (slot % dcp); indexer K
+        # cache replicated so all ranks compute identical top-k.
         parallel = get_parallel()
         self.dcp_enabled = parallel.dcp_enabled
         self.dcp_size = parallel.attn_dcp_size if self.dcp_enabled else 1
@@ -555,34 +545,25 @@ class DeepseekSparseAttnBackend(
                 "dsa_trtllm_workspace",
                 lambda: torch.empty(
                     envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get()
-                    # Requesting the LSE under DCP adds a softmax-stats
-                    # workspace that scales with the dcp-widened head count
-                    # (measured ~537MB per 32 widened heads); only the trtllm
-                    # kernels ever ask for it.
-                    * (
-                        1
-                        + (
-                            (
-                                model_runner.model_config.num_attention_heads
-                                // get_parallel().attn_tp_size
-                            )
-                            * get_parallel().attn_dcp_size
-                            + 15
-                        )
-                        // 16
-                        if get_parallel().dcp_enabled
-                        and (
-                            self.dsa_decode_impl == "trtllm"
-                            or self.dsa_prefill_impl == "trtllm"
-                        )
-                        else 1
-                    ),
+                    * self._dcp_workspace_multiplier(model_runner),
                     dtype=torch.uint8,
                     device=model_runner.device,
                 ),
             )
         else:
             self.workspace_buffer = None
+
+    def _dcp_workspace_multiplier(self, model_runner) -> int:
+        # The trtllm LSE request under DCP adds softmax-stats workspace that
+        # scales with the dcp-widened head count.
+        if not get_parallel().dcp_enabled:
+            return 1
+        widened_heads = (
+            model_runner.model_config.num_attention_heads
+            // get_parallel().attn_tp_size
+            * get_parallel().attn_dcp_size
+        )
+        return 1 + (widened_heads + 15) // 16
 
     def _make_aiter_dsa_decode_metadata_buffer(
         self,
@@ -794,20 +775,16 @@ class DeepseekSparseAttnBackend(
             or self.dsa_topk_backend.is_flashinfer()
         ):
             if self.dcp_enabled:
-                return self._apply_dcp_owner_filter(topk_indices)
+                return self._dcp_global_slots_to_local_rows(topk_indices)
             return topk_indices
         raise RuntimeError(
             f"Unsupported {self.dsa_topk_backend = } for SGLANG_DSA_FUSE_TOPK."
         )
 
-    def _apply_dcp_owner_filter(self, page_table_1: torch.Tensor) -> torch.Tensor:
-        """Map fused-top-k output (final GLOBAL KV slots) to this DCP rank's
-        local rows: slots owned by this rank (slot % dcp == rank) become
-        slot // dcp, everything else -1 (skipped by the sparse kernels).
+    def _dcp_global_slots_to_local_rows(self, page_table_1: torch.Tensor) -> torch.Tensor:
+        """Global KV slots -> this rank's local rows (unowned become -1).
 
-        Must return a NEW tensor: the input is the indexer's top-k buffer,
-        shared across layers via IndexShare — an in-place divide would
-        corrupt the reusing layers.
+        Returns a new tensor: the input is shared across layers (IndexShare).
         """
         owned = (page_table_1 >= 0) & (
             page_table_1 % self.dcp_size == self.dcp_rank

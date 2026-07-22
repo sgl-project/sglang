@@ -63,10 +63,7 @@ def transform_index_page_table_decode_kernel(
     mask = loaded_topk_indices >= 0
     loaded_kv_indices = tl.load(page_table_ptr + loaded_topk_indices, mask=mask)
     if dcp_size > 1:
-        # Under decode context parallelism the KV cache is interleaved across
-        # ranks: global slot g lives on rank g % dcp_size at local row
-        # g // dcp_size. Keep only locally-owned selections; the sparse
-        # kernels skip -1 entries.
+        # Keep slots owned by this rank as local rows; others become -1.
         mask = mask & (loaded_kv_indices % dcp_size == dcp_rank)
         loaded_kv_indices = loaded_kv_indices // dcp_size
     tl.store(result_ptr + offset, loaded_kv_indices, mask=mask)

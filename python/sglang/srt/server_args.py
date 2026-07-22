@@ -3142,11 +3142,9 @@ class ServerArgs:
             if self.speculative_algorithm is not None:
                 logger.warning(
                     "Decode context parallel (--dcp-size > 1) with "
-                    "speculative decoding on CUDA is experimental: validated "
-                    "for DSA models (GLM-5.x EAGLE/nextn) on the default "
-                    "kernel stack with flashinfer >= 0.6.15 (older releases "
-                    "lack the flashinfer#3238 draft-MoE fix); the dense-MLA "
-                    "draft path is not implemented."
+                    "speculative decoding is experimental: validated for DSA "
+                    "models (GLM-5.x EAGLE/nextn) on the default kernel "
+                    "stack; the dense-MLA draft path is not implemented."
                 )
         else:
             raise ValueError(
