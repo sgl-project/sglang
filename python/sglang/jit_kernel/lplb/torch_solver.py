@@ -26,12 +26,14 @@ _FUSED_AVAILABLE = False
 _FUSED_SOLVE_IPM = None  # type: ignore[assignment]
 _FUSED_WARMUP = None  # type: ignore[assignment]
 _FUSED_ASSERT_FITS = None  # type: ignore[assignment]
+_FUSED_BUDGET_BYTES_FOR_DEVICE = None  # type: ignore[assignment]
 
 
 def _init_fused_backend() -> None:
     """Resolve the fused backend once. Records WHY it's disabled when it is."""
     global _BACKEND_CHECKED, _FUSED_AVAILABLE
     global _FUSED_SOLVE_IPM, _FUSED_WARMUP, _FUSED_ASSERT_FITS
+    global _FUSED_BUDGET_BYTES_FOR_DEVICE
 
     if _BACKEND_CHECKED:
         return
@@ -52,7 +54,10 @@ def _init_fused_backend() -> None:
     try:
         from sglang.jit_kernel.lplb.cuda_solver import solve_ipm as fused_solve_ipm
         from sglang.jit_kernel.lplb.cuda_solver import warmup as fused_warmup
-        from sglang.jit_kernel.lplb.shmem_budget import assert_fits
+        from sglang.jit_kernel.lplb.shmem_budget import (
+            assert_fits,
+            budget_bytes_for_device,
+        )
     except ImportError as e:
         logger.info(
             f"LPLB fused solver disabled: {e}. "
@@ -64,6 +69,7 @@ def _init_fused_backend() -> None:
     _FUSED_SOLVE_IPM = fused_solve_ipm
     _FUSED_WARMUP = fused_warmup
     _FUSED_ASSERT_FITS = assert_fits
+    _FUSED_BUDGET_BYTES_FOR_DEVICE = budget_bytes_for_device
     _FUSED_AVAILABLE = True
     logger.info("LPLB fused solver enabled (CUDA C++ via load_jit, cuBLASDx)")
 
@@ -91,7 +97,7 @@ def warmup(nc: int, nv: int, num_iters: int = 5, device: str = "cuda") -> None:
     _init_fused_backend()
     if not _FUSED_AVAILABLE:
         raise RuntimeError(f"LPLB fused solver unavailable: {_unavailable_reason()}")
-    _FUSED_ASSERT_FITS(nc, nv, gpu="h100")
+    _FUSED_ASSERT_FITS(nc, nv, budget_bytes=_FUSED_BUDGET_BYTES_FOR_DEVICE(device))
     _FUSED_WARMUP(nc, nv, num_iters=num_iters, device=device)
 
 

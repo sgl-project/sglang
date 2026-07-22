@@ -27,6 +27,9 @@ Pattern follows `test/registered/layers/mamba/test_mamba2_mixer.py` —
 plays poorly with arbitrary subprocess launchers.
 """
 
+import contextlib
+import logging
+
 import pytest
 import torch
 
@@ -183,6 +186,100 @@ def test_solve_ipm_matches_torch_reference():
     assert torch.allclose(
         cuda_x, torch_x, atol=1e-2, rtol=1e-2
     ), f"fused IPM diverges from torch reference: max abs diff {max_diff:.3e}"
+
+
+def test_resolve_gpu_key_mapping(monkeypatch, caplog):
+    """CPU-only: `budget_bytes_for_device` reads the shmem budget straight off
+    `torch.cuda.get_device_properties(...).shared_memory_per_block_optin`
+    (the fix for SM120, which has no entry in the static `GPU_BUDGETS_BYTES`
+    table and was silently mis-budgeted to h100's 223 KiB against a real 99
+    KiB cap), respects the `device` argument the same way the superseded
+    `resolve_gpu_key` did, and falls back to the static table (via
+    `_gpu_key_for_device`, with its unrecognized-SM-major warning) when a
+    torch build predates the opt-in property."""
+    from sglang.jit_kernel.lplb import shmem_budget
+
+    class _Props:
+        def __init__(self, optin_bytes):
+            self.shared_memory_per_block_optin = optin_bytes
+
+    # device 0: 227 KiB optin (H100-class) -> 223 KiB practical budget,
+    # matching GPU_BUDGETS_BYTES["h100"] byte-for-byte.
+    # device 1: 99 KiB optin (SM120) -> ~95 KiB practical budget; this arch
+    # has no GPU_BUDGETS_BYTES entry at all, which is exactly the bug.
+    props = {0: _Props(227 * 1024), 1: _Props(99 * 1024)}
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda d: props[d])
+    shmem_budget._budget_bytes_for_device.cache_clear()
+
+    assert shmem_budget.budget_bytes_for_device(0) == 223 * 1024
+    assert (
+        shmem_budget.budget_bytes_for_device(0)
+        == shmem_budget.GPU_BUDGETS_BYTES["h100"]
+    )
+    assert shmem_budget.budget_bytes_for_device(1) == 99 * 1024 - 4096 == 95 * 1024
+
+    # Generic "cuda" / index-less device canonicalizes to the current device,
+    # so a later set_device change cannot serve a stale cached value.
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 1)
+    assert shmem_budget.budget_bytes_for_device("cuda") == 99 * 1024 - 4096
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    assert shmem_budget.budget_bytes_for_device("cuda") == 223 * 1024
+
+    # Old torch build without `shared_memory_per_block_optin`: fall back to
+    # the static per-GPU table via `_gpu_key_for_device` (unrecognized SM
+    # major also falls back further, to "h100", with its own warning).
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda d: object())
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda d: (7, 5))
+    shmem_budget._budget_bytes_for_device.cache_clear()
+    shmem_budget._gpu_key_for_device.cache_clear()
+    with caplog.at_level(logging.WARNING, logger="sglang.jit_kernel.lplb.shmem_budget"):
+        assert (
+            shmem_budget.budget_bytes_for_device(2)
+            == shmem_budget.GPU_BUDGETS_BYTES["h100"]
+        )
+    assert any(
+        "shared_memory_per_block_optin" in m and "falling back" in m
+        for m in caplog.messages
+    )
+    assert any("unrecognized SM major 7" in m for m in caplog.messages)
+
+    shmem_budget._budget_bytes_for_device.cache_clear()
+    shmem_budget._gpu_key_for_device.cache_clear()
+
+
+@pytest.mark.parametrize(
+    "major, minor, cuda_version, expected",
+    [
+        (10, 0, (13, 0), (10, 0, "a", 1000)),  # a-gated
+        (10, 1, (13, 0), (10, 1, "a", 1010)),  # a-gated
+        (12, 0, (13, 0), (12, 0, "a", 1200)),  # a-gated
+        (10, 3, (13, 0), (10, 0, "f", 1000)),  # SM103/B300: family fallback
+        (10, 3, (12, 4), None),  # pre-12.9 nvcc: no fallback, untouched
+        (9, 0, (13, 0), None),  # Hopper: untouched regardless of nvcc
+    ],
+)
+def test_ipm_arch_env_decision_table(monkeypatch, major, minor, cuda_version, expected):
+    """CPU-only: `_ipm_arch_env` picks "a" first for the cuBLASDx-gated
+    archs, falls back to the family target for other 10.x archs on
+    nvcc>=12.9 (SM103/B300), else leaves the arch untouched. SM_VER must
+    stay in lockstep with the compile target (family baseline for "f")."""
+    from sglang.jit_kernel.lplb import cuda_solver
+    from sglang.jit_kernel.utils import ArchInfo
+    from sglang.jit_kernel.utils import get_jit_cuda_arch as real_get_jit_cuda_arch
+
+    monkeypatch.setattr(
+        cuda_solver, "get_jit_cuda_arch", lambda: ArchInfo(major, minor, "")
+    )
+    monkeypatch.setattr(cuda_solver, "get_cuda_version", lambda: cuda_version)
+
+    ctx, sm_ver = cuda_solver._ipm_arch_env()
+    if expected is None:
+        assert isinstance(ctx, contextlib.nullcontext)
+        assert sm_ver == major * 100 + minor * 10
+        return
+    with ctx:
+        got = real_get_jit_cuda_arch()
+    assert (got.major, got.minor, got.suffix, sm_ver) == expected
 
 
 @pytest.mark.skipif(
