@@ -57,6 +57,8 @@ class ImageGenerationsRequest(BaseModel):
     upscaling_model_path: Optional[str] = None
     upscaling_scale: Optional[int] = 4
     diffusers_kwargs: Optional[Dict[str, Any]] = None  # kwargs for diffusers backend
+    stream: Optional[bool] = False
+    partial_images: Optional[int] = Field(default=0, ge=0, le=3)
     # Performance profiling
     perf_dump_path: Optional[str] = None
     # Progressive resolution generation
@@ -151,7 +153,7 @@ class RealtimeVideoGenerationsRequest(VideoGenerationsRequest):
     first_frame: Optional[bytes | str] = None
     condition_inputs: Optional[Dict[str, Any]] = None
     max_chunks: Optional[int] = Field(default=None, ge=1)
-    seed: Optional[int] = 42
+    seed: Optional[Union[int, List[int]]] = 42
     guidance_scale: Optional[float] = 1.0
     size: Optional[str] = "832x480"
     profile: Optional[bool] = False
