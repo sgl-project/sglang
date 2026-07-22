@@ -125,8 +125,6 @@ if _is_hip:
     try:
         from aiter import (  # noqa: F401
             flash_attn_varlen_func,
-            get_mla_metadata_info_v1,
-            get_mla_metadata_v1,
             mha_batch_prefill_func,
             paged_attention_ragged,
         )
@@ -140,6 +138,91 @@ else:
         flash_attn_varlen_func,
         flash_attn_with_kvcache,
     )
+
+
+_DSA_A8W8 = get_bool_env_var("SGLANG_DSA_A8W8")
+
+
+def _dsa_a8w8_ok(max_seqlen_q) -> bool:
+    # a8w8 qh16 asm supports qseqlen in {1,2}; DSA extend is per-token (qseqlen=1).
+    return _DSA_A8W8 and max_seqlen_q is not None and int(max_seqlen_q) <= 2
+
+
+def _quant_q_fp8(q_bf16):
+    # per-tensor symmetric fp8 quant of the absorbed latent query.
+    _fmax = torch.finfo(fp8_dtype).max
+    q_scale = (q_bf16.detach().abs().amax() / _fmax).clamp_min(1e-6).to(torch.float32)
+    q_fp8 = (q_bf16 / q_scale).clamp(-_fmax, _fmax).to(fp8_dtype)
+    return q_fp8, q_scale
+
+
+def _mla_decode_fwd_grouped(
+    q,
+    kv_buffer,
+    o,
+    qo_indptr,
+    kv_indptr,
+    kv_indices,
+    kv_last_page_lens,
+    max_seqlen_q,
+    **kwargs,
+):
+    # gfx942 aiter ships asm MLA decode kernels only for a limited set of gqa
+    # head counts (nhead in {16, 32}). Under DSA prefill context-parallel
+    # attn_tp_size is forced to 1, so each rank holds all 64 heads and the asm
+    # kernel aborts: "get_heuristic_kernel_mla: cannot get heuristic kernel!
+    # gqa:64". MLA shares a single latent KV across all heads, so attention is
+    # independent per head. Splitting the 64-head call into 4 groups of 16 is
+    # mathematically exact and reuses the known-good gqa:16 kernel. Only triggers
+    # for a matching q/kv dtype with nhead a multiple of 16 and > 32.
+    nhead = q.shape[1]
+    GROUP = 16
+    can_split = (
+        nhead > 32
+        and nhead % GROUP == 0
+        and q.dtype == kv_buffer.dtype
+        and q.dtype in (torch.bfloat16, fp8_dtype)
+    )
+    if not can_split:
+        return mla_decode_fwd(
+            q,
+            kv_buffer,
+            o,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_lens,
+            max_seqlen_q,
+            **kwargs,
+        )
+    for g in range(nhead // GROUP):
+        sl = slice(g * GROUP, (g + 1) * GROUP)
+        q_g = q[:, sl, :].contiguous()
+        o_g = torch.empty(
+            (o.shape[0], GROUP, o.shape[2]), dtype=o.dtype, device=o.device
+        )
+        mla_decode_fwd(
+            q_g,
+            kv_buffer,
+            o_g,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_lens,
+            max_seqlen_q,
+            **kwargs,
+        )
+        o[:, sl, :] = o_g
+    return o
+
+
+def _gather_upcast_fp8_kv(kv_cache, kv_indices, count, arange, head_dim):
+    # gfx942 fp8-KV dequant-on-read: gather the first `count` selected fp8 KV
+    # rows, upcast to bf16 (raw store scale 1.0), and return the contiguous
+    # [N, 1, 1, head_dim] buffer plus the matching sequential indices
+    # (`arange[:count]`) that address it.
+    gathered = kv_cache.view(-1, head_dim)[kv_indices[:count]].to(torch.bfloat16)
+    return gathered.view(-1, 1, 1, head_dim), arange[:count]
 
 
 def _to_2d_context_lens(seqlens_32: torch.Tensor, batch_size: int) -> torch.Tensor:
@@ -419,6 +502,13 @@ class DeepseekSparseAttnBackend(
                 dtype=torch.int32,
                 device=self.device,
             )
+            # Sequential indices into the gathered+upcast bf16 KV buffer used by
+            # the gfx942 fp8-KV dequant-on-read decode path (see _forward_aiter_*).
+            self._fp8_dequant_arange = torch.arange(
+                max_bs * self.dsa_index_topk,
+                dtype=torch.int32,
+                device=self.device,
+            )
             # Aiter mla_decode_fwd supports num_heads multiples of 16 in range [16, 128].
             # For GLM-5 (64 heads / TP8 = 8) it pads 8->16 (gqaratio16 kernels).
             # V1 no-pad: gfx950 has native qh8/gqaratio8 v3 asm MLA
@@ -429,24 +519,6 @@ class DeepseekSparseAttnBackend(
             self.head_repeat_factor = (
                 16 // self.num_q_heads if self.need_pad_heads else 1
             )
-            self.num_head_padded = self.num_q_heads * self.head_repeat_factor
-            self.aiter_dsa_max_split_per_batch = 64
-            self.aiter_dsa_metadata_capacity = 0
-            self.aiter_dsa_metadata_max_seqlen_q = 0
-            self.aiter_dsa_metadata_q_dtype = None
-            self.aiter_dsa_metadata_kv_dtype = None
-            self.aiter_dsa_kv_last_page_lens = None
-            self.aiter_dsa_work_metadata = None
-
-            if (
-                self.dsa_prefill_impl == "aiter" or self.dsa_decode_impl == "aiter"
-            ) and model_runner.kv_cache_dtype == fp8_dtype:
-                self._ensure_aiter_dsa_decode_metadata_buffer(
-                    max_seqlen_q=1,
-                    batch_size=max_bs,
-                    q_dtype=torch.bfloat16,
-                    kv_dtype=fp8_dtype,
-                )
 
         # Speculative decoding
         self.topk = model_runner.server_args.speculative_eagle_topk or 0
@@ -522,145 +594,6 @@ class DeepseekSparseAttnBackend(
             self.workspace_buffer = None
             self._multi_ctas_kv_counter_buffer = None
 
-    def _make_aiter_dsa_decode_metadata_buffer(
-        self,
-        max_seqlen_q: int,
-        batch_size: int,
-        q_dtype: torch.dtype,
-        kv_dtype: torch.dtype,
-    ):
-        (
-            (work_metadata_size, work_metadata_type),
-            (work_indptr_size, work_indptr_type),
-            (work_info_set_size, work_info_set_type),
-            (reduce_indptr_size, reduce_indptr_type),
-            (reduce_final_map_size, reduce_final_map_type),
-            (reduce_partial_map_size, reduce_partial_map_type),
-        ) = get_mla_metadata_info_v1(
-            batch_size,
-            max_seqlen_q,
-            self.num_head_padded,
-            q_dtype,
-            kv_dtype,
-            is_sparse=True,
-            fast_mode=False,
-            num_kv_splits=self.aiter_dsa_max_split_per_batch,
-            intra_batch_mode=True,
-        )
-
-        return (
-            torch.empty(
-                work_metadata_size, dtype=work_metadata_type, device=self.device
-            ),
-            torch.empty(work_indptr_size, dtype=work_indptr_type, device=self.device),
-            torch.empty(
-                work_info_set_size, dtype=work_info_set_type, device=self.device
-            ),
-            torch.empty(
-                reduce_indptr_size, dtype=reduce_indptr_type, device=self.device
-            ),
-            torch.empty(
-                reduce_final_map_size, dtype=reduce_final_map_type, device=self.device
-            ),
-            torch.empty(
-                reduce_partial_map_size,
-                dtype=reduce_partial_map_type,
-                device=self.device,
-            ),
-        )
-
-    def _ensure_aiter_dsa_decode_metadata_buffer(
-        self,
-        max_seqlen_q: int,
-        batch_size: int,
-        q_dtype: torch.dtype,
-        kv_dtype: torch.dtype,
-    ) -> None:
-        if (
-            self.aiter_dsa_work_metadata is not None
-            and self.aiter_dsa_metadata_capacity >= batch_size
-            and self.aiter_dsa_metadata_max_seqlen_q == max_seqlen_q
-            and self.aiter_dsa_metadata_q_dtype == q_dtype
-            and self.aiter_dsa_metadata_kv_dtype == kv_dtype
-        ):
-            return
-
-        (
-            self.aiter_dsa_work_metadata,
-            self.aiter_dsa_work_indptr,
-            self.aiter_dsa_work_info_set,
-            self.aiter_dsa_reduce_indptr,
-            self.aiter_dsa_reduce_final_map,
-            self.aiter_dsa_reduce_partial_map,
-        ) = self._make_aiter_dsa_decode_metadata_buffer(
-            max_seqlen_q=max_seqlen_q,
-            batch_size=batch_size,
-            q_dtype=q_dtype,
-            kv_dtype=kv_dtype,
-        )
-        self.aiter_dsa_kv_last_page_lens = torch.ones(
-            (batch_size,), dtype=torch.int32, device=self.device
-        )
-        self.aiter_dsa_metadata_capacity = batch_size
-        self.aiter_dsa_metadata_max_seqlen_q = max_seqlen_q
-        self.aiter_dsa_metadata_q_dtype = q_dtype
-        self.aiter_dsa_metadata_kv_dtype = kv_dtype
-
-    def _prepare_aiter_dsa_decode_metadata(
-        self,
-        qo_indptr: torch.Tensor,
-        kv_indptr: torch.Tensor,
-        bs: int,
-        max_seqlen_q: int,
-        q_dtype: torch.dtype,
-        kv_dtype: torch.dtype,
-    ) -> dict:
-        self._ensure_aiter_dsa_decode_metadata_buffer(
-            max_seqlen_q=max_seqlen_q,
-            batch_size=bs,
-            q_dtype=q_dtype,
-            kv_dtype=kv_dtype,
-        )
-        self.aiter_dsa_kv_last_page_lens[:bs].fill_(1)
-        kv_last_page_lens = self.aiter_dsa_kv_last_page_lens[:bs]
-
-        get_mla_metadata_v1(
-            qo_indptr,
-            kv_indptr,
-            kv_last_page_lens,
-            self.num_head_padded,
-            1,
-            False,
-            self.aiter_dsa_work_metadata,
-            self.aiter_dsa_work_info_set,
-            self.aiter_dsa_work_indptr,
-            self.aiter_dsa_reduce_indptr,
-            self.aiter_dsa_reduce_final_map,
-            self.aiter_dsa_reduce_partial_map,
-            page_size=1,
-            kv_granularity=16,
-            max_seqlen_qo=max_seqlen_q,
-            uni_seqlen_qo=max_seqlen_q,
-            fast_mode=False,
-            topk=self.dsa_index_topk,
-            max_split_per_batch=self.aiter_dsa_max_split_per_batch,
-            intra_batch_mode=True,
-            dtype_q=q_dtype,
-            dtype_kv=kv_dtype,
-        )
-
-        return {
-            "kv_last_page_lens": kv_last_page_lens,
-            "work_meta_data": self.aiter_dsa_work_metadata,
-            "work_indptr": self.aiter_dsa_work_indptr,
-            "work_info_set": self.aiter_dsa_work_info_set,
-            "reduce_indptr": self.aiter_dsa_reduce_indptr,
-            "reduce_final_map": self.aiter_dsa_reduce_final_map,
-            "reduce_partial_map": self.aiter_dsa_reduce_partial_map,
-            "intra_batch_mode": True,
-            "num_kv_splits": self.aiter_dsa_max_split_per_batch,
-        }
-
     def _build_paged_mqa_schedule_2d_ctx_lens(
         self,
         forward_mode: ForwardMode,
@@ -707,7 +640,13 @@ class DeepseekSparseAttnBackend(
         # target-verify / draft-extend, whose expanded row count is exactly what v2
         # sees -- otherwise the helper's plan-present assertion fires. None only
         # when the fold is disabled; such metadata is never dispatched to v2.
-        if not envs.SGLANG_OPT_USE_TOPK_V2.get():
+        #
+        # The v2 top-k kernel uses Hopper thread-block clusters
+        # (cg::this_cluster()) and only JIT-compiles under CUDA; on ROCm/HIP the
+        # build fails ('cooperative_groups.h' not found) and every v2 consumer
+        # (transform dispatch, dsa_drop_wide_page_table) is already HIP-excluded,
+        # so skip the plan entirely on HIP.
+        if _is_hip or not envs.SGLANG_OPT_USE_TOPK_V2.get():
             return None
         from sglang.kernels.ops.attention.dsv4.topk import plan_topk_v2
 
@@ -2749,9 +2688,6 @@ class DeepseekSparseAttnBackend(
 
         q_scale = None
         kv_scale = None
-        aiter_persistent_kwargs = {}
-        if kv_cache.dtype == fp8_dtype:
-            kv_scale = torch.ones((), dtype=torch.float32, device=q_kernel.device)
 
         kv_indptr = self.kv_indptr
 
@@ -2763,31 +2699,40 @@ class DeepseekSparseAttnBackend(
         get_valid_kv_indices(page_table_1, kv_indptr, kv_indices, bs)
 
         kv_last_page_lens = metadata.cu_seqlens_q
-        if kv_cache.dtype == fp8_dtype:
-            aiter_persistent_kwargs = self._prepare_aiter_dsa_decode_metadata(
-                metadata.cu_seqlens_q,
-                kv_indptr,
-                bs,
-                metadata.max_seq_len_q,
-                q_kernel.dtype,
-                kv_cache.dtype,
-            )
-            kv_last_page_lens = aiter_persistent_kwargs.pop("kv_last_page_lens")
 
-        mla_decode_fwd(
+        # gfx942 has no working asm fp8 MLA kernel. For fp8 KV either take the
+        # a8w8 asm path (fp8 Q + fp8 KV, qseqlen<=2) when SGLANG_DSA_A8W8=1, or
+        # dequant-on-read: gather only the top-k keys (bs*index_topk, fixed ->
+        # cuda-graph safe), upcast fp8->bf16, and run the validated bf16
+        # mla_decode_fwd with sequential indices.
+        kv_buffer_for_kernel = kv_cache.view(-1, 1, 1, layer.head_dim)
+        kv_indices_for_kernel = kv_indices
+        if kv_cache.dtype == fp8_dtype and _dsa_a8w8_ok(metadata.max_seq_len_q):
+            q_kernel, q_scale = _quant_q_fp8(q_kernel)
+            kv_scale = torch.ones((), dtype=torch.float32, device=q_kernel.device)
+        elif kv_cache.dtype == fp8_dtype:
+            q_kernel = q_kernel.to(torch.bfloat16)
+            kv_buffer_for_kernel, kv_indices_for_kernel = _gather_upcast_fp8_kv(
+                kv_cache,
+                kv_indices,
+                bs * self.dsa_index_topk,
+                self._fp8_dequant_arange,
+                layer.head_dim,
+            )
+
+        _mla_decode_fwd_grouped(
             q_kernel,
-            kv_cache.view(-1, 1, 1, layer.head_dim),
+            kv_buffer_for_kernel,
             o_kernel,
             metadata.cu_seqlens_q,
             kv_indptr,
-            kv_indices,
+            kv_indices_for_kernel,
             kv_last_page_lens,
             metadata.max_seq_len_q,
             sm_scale=layer.scaling,
             logit_cap=layer.logit_cap,
             q_scale=q_scale,
             kv_scale=kv_scale,
-            **aiter_persistent_kwargs,
         )
 
         if self.need_pad_heads:
@@ -2846,9 +2791,6 @@ class DeepseekSparseAttnBackend(
 
         q_scale = None
         kv_scale = None
-        aiter_persistent_kwargs = {}
-        if kv_cache.dtype == fp8_dtype:
-            kv_scale = torch.ones((), dtype=torch.float32, device=q_kernel.device)
 
         non_minus1_mask = page_table_1 != -1
         non_minus1_counts = non_minus1_mask.sum(dim=1)
@@ -2870,32 +2812,50 @@ class DeepseekSparseAttnBackend(
             0, num_tokens + 1, dtype=torch.int32, device=self.device
         )
         kv_last_page_lens = cu_seqlens_q
-        if kv_cache.dtype == fp8_dtype:
-            aiter_persistent_kwargs = self._prepare_aiter_dsa_decode_metadata(
-                cu_seqlens_q,
-                kv_indptr,
-                num_tokens,
-                1,
-                q_kernel.dtype,
-                kv_cache.dtype,
-            )
-            kv_last_page_lens = aiter_persistent_kwargs.pop("kv_last_page_lens")
+
+        # gfx942 fp8-KV dequant-on-read (extend). EAGLE target-verify / draft-
+        # extend runs every decode step over all layers with small num_tokens, so
+        # gather only the top-k keys (num_tokens*topk fixed -> graph safe) and
+        # upcast fp8->bf16 instead of dequanting the full pool (that was the ~15x
+        # EAGLE decode slowdown). Real prefill chunks have large num_tokens
+        # (gather > pool) -> full-pool upcast.
+        kv_buffer_for_kernel = kv_cache.view(-1, 1, 1, layer.head_dim)
+        kv_indices_for_kernel = kv_indices
+        if kv_cache.dtype == fp8_dtype and _dsa_a8w8_ok(1):
+            q_kernel, q_scale = _quant_q_fp8(q_kernel)
+            kv_scale = torch.ones((), dtype=torch.float32, device=q_kernel.device)
+        elif kv_cache.dtype == fp8_dtype:
+            q_kernel = q_kernel.to(torch.bfloat16)
+            _pool = kv_cache.view(-1, layer.head_dim).shape[0]
+            if num_tokens * topk <= _pool:
+                kv_buffer_for_kernel, kv_indices_for_kernel = _gather_upcast_fp8_kv(
+                    kv_cache,
+                    kv_indices,
+                    num_tokens * topk,
+                    torch.arange(
+                        num_tokens * topk, dtype=torch.int32, device=self.device
+                    ),
+                    layer.head_dim,
+                )
+            else:
+                kv_buffer_for_kernel = kv_cache.to(torch.bfloat16).view(
+                    -1, 1, 1, layer.head_dim
+                )
 
         # TODO support more forward_mode
-        mla_decode_fwd(
+        _mla_decode_fwd_grouped(
             q_kernel,
-            kv_cache.view(-1, 1, 1, layer.head_dim),
+            kv_buffer_for_kernel,
             o_kernel,
             cu_seqlens_q,
             kv_indptr,
-            kv_indices,
+            kv_indices_for_kernel,
             kv_last_page_lens,
             1,  # max_seq_len_q = 1 for per-token attention
             sm_scale=layer.scaling,
             logit_cap=layer.logit_cap,
             q_scale=q_scale,
             kv_scale=kv_scale,
-            **aiter_persistent_kwargs,
         )
 
         if self.need_pad_heads:
