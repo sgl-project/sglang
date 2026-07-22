@@ -53,12 +53,6 @@ from transformers.activations import ACT2FN
 from transformers.modeling_utils import PreTrainedModel
 
 from sglang.kernel_api_logging import debug_kernel_api
-
-try:
-    from flash_attn.flash_attn_interface import flash_attn_varlen_func
-except ImportError:
-    flash_attn_varlen_func = None
-
 from sglang.srt.configs import MoonViTConfig
 from sglang.srt.layers.conv import Conv2dLayer
 from sglang.srt.layers.linear import (
@@ -70,7 +64,12 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix, get_device
+from sglang.srt.utils import add_prefix, get_device, is_cuda
+
+if is_cuda():
+    from sglang.kernels.ops.attention.flash_attention import flash_attn_varlen_func
+else:
+    flash_attn_varlen_func = None
 
 _MAX_INFERENCE_POS_EMB_CACHE_ENTRIES = 256
 
@@ -99,7 +98,7 @@ def multihead_attention(
     """
     if flash_attn_varlen_func is None:
         raise ImportError(
-            "flash_attn is not installed, this function needs flash_attn_varlen_func from flash_attn"
+            "flash_attention_2 is only available on CUDA; use attn_implementation='sdpa' on this platform"
         )
     # Unified format legal check
     assert q.dim() == k.dim() == v.dim() == 3, "q, k, v must have 3 dims"
