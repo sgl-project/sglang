@@ -8,14 +8,10 @@ from torch import nn
 
 from sglang.kernels.ops.sampling.murmur_hash import murmur_hash32
 from sglang.srt.distributed import get_tp_group
-from sglang.srt.layers.dp_attention import (
-    is_dp_attention_enabled,
-)
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.logprob_processor import (
-    OutputLogprobProcessor,
-)
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.layers.logprob_processor import OutputLogprobProcessor
+from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.utils.async_probe import sanitize_nan_logits
@@ -33,10 +29,7 @@ if is_cuda():
         min_p_sampling_from_probs,
         top_k_top_p_sampling_from_probs,
     )
-    from sgl_kernel import (
-        top_k_renorm_prob,
-        top_p_renorm_prob,
-    )
+    from sgl_kernel import top_k_renorm_prob, top_p_renorm_prob
 
 if is_musa():
     from sgl_kernel import (
@@ -81,12 +74,14 @@ class Sampler(nn.Module):
         if self.token_id_sync_via_broadcast:
             self.token_id_sync_src_rank = dist.get_global_rank(self.tp_sync_group, 0)
 
-        self.rl_on_policy_target = get_server_args().rl_on_policy_target
+        self.rl_on_policy_target = get_exec().deterministic.rl_on_policy_target
         # In RL on-policy mode, deterministic inference is automatically enabled.
-        self.enable_deterministic = get_server_args().enable_deterministic_inference
+        self.enable_deterministic = (
+            get_exec().deterministic.enable_deterministic_inference
+        )
         # In RL on-policy mode, we use log_softmax to compute logprobs to match the trainer.
         self.use_log_softmax_logprob = self.rl_on_policy_target is not None
-        self.use_ascend_backend = get_server_args().sampling_backend == "ascend"
+        self.use_ascend_backend = get_exec().kernel.sampling_backend == "ascend"
 
         self.output_logprob_processor = OutputLogprobProcessor()
 
@@ -252,7 +247,7 @@ class Sampler(nn.Module):
                 positions=positions,
             )
         else:
-            backend = get_server_args().sampling_backend
+            backend = get_exec().kernel.sampling_backend
             if backend == "flashinfer":
                 assert (
                     sampling_info.sampling_seed is None

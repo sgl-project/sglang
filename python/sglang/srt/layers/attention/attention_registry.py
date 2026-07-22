@@ -244,6 +244,23 @@ def create_trtllm_mha_backend(runner):
     return TRTLLMHAAttnBackend(runner)
 
 
+@register_attention_backend("hpc_ops")
+def create_hpc_ops_backend(runner):
+    if runner.use_mla_backend:
+        raise ValueError("hpc_ops backend can only be used with non-MLA models.")
+    if runner.model_config.is_encoder_decoder:
+        raise ValueError(
+            "Cross attention is not supported in the hpc_ops attention backend."
+        )
+    if runner.server_args.speculative_algorithm is not None:
+        raise ValueError(
+            "hpc_ops backend does not support speculative decoding for now."
+        )
+    from sglang.srt.layers.attention.hpc_ops_backend import HPCOpsAttnBackend
+
+    return HPCOpsAttnBackend(runner)
+
+
 @register_attention_backend("intel_amx")
 def create_intel_amx_backend(runner):
     from sglang.srt.layers.attention.intel_amx_backend import IntelAMXAttnBackend

@@ -14,7 +14,7 @@ if not is_hip():
 if not torch.cuda.is_available():
     pytest.skip("Requires a GPU.", allow_module_level=True)
 
-from sglang.jit_kernel.minimax_m3.qk_norm_rope import (  # noqa: E402
+from sglang.kernels.ops.attention.minimax_m3_qk_norm_rope import (  # noqa: E402
     qk_gemma_rmsnorm_rope,
     sparse_qk_index_gemma_rmsnorm_rope,
     sparse_qk_index_gemma_rmsnorm_rope_cache,

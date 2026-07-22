@@ -13,9 +13,7 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
 )
 from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
-from sglang.srt.layers.dp_attention import (
-    is_dp_attention_enabled,
-)
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -36,7 +34,6 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import (
     get_forward,
     get_parallel,
-    get_server_args,
     get_stream,
 )
 from sglang.srt.utils import add_prefix, is_cuda, make_layers
@@ -477,7 +474,7 @@ class FalconH1ForCausalLM(nn.Module):
                 quant_config=quant_config,
                 org_num_embeddings=config.vocab_size,
                 prefix=add_prefix("lm_head", prefix),
-                use_attn_tp_group=get_server_args().enable_dp_lm_head,
+                use_attn_tp_group=get_parallel().enable_dp_lm_head,
             )
         self.lm_head = self.lm_head.float()
         self.lm_head_multiplier = config.lm_head_multiplier

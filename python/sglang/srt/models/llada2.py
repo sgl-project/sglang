@@ -41,9 +41,7 @@ from sglang.srt.layers.communicator import (
     LayerScatterModes,
     enable_moe_dense_fully_dp,
 )
-from sglang.srt.layers.dp_attention import (
-    is_dp_attention_enabled,
-)
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -77,12 +75,13 @@ from sglang.srt.models.utils import (
     enable_fused_set_kv_buffer,
 )
 from sglang.srt.runtime_context import (
+    get_exec,
     get_forward,
     get_parallel,
-    get_server_args,
     get_stream,
 )
 from sglang.srt.utils import (
+    LazyValue,
     add_prefix,
     is_cuda,
     is_non_idle_and_non_empty,
@@ -230,7 +229,7 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
             self.router_dtype = torch.bfloat16
 
         # TODO global_server_args.ep_num_redundant_experts is used for eplb, not supported now
-        assert get_server_args().ep_num_redundant_experts == 0
+        assert get_exec().moe.ep_num_redundant_experts == 0
         # check group topk
         self.num_expert_group = getattr(config, "n_group", 0)
         self.topk_group = getattr(config, "topk_group", 0)
@@ -244,9 +243,7 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
             self.num_expert_group = self.topk_group = None
             self.use_grouped_topk = False
 
-        self.num_experts = (
-            config.num_experts + get_server_args().ep_num_redundant_experts
-        )
+        self.num_experts = config.num_experts + get_exec().moe.ep_num_redundant_experts
 
         self.gate = LLaDA2MoeGate(
             config=config,
@@ -830,7 +827,7 @@ class LLaDA2MoeModelLM(nn.Module):
                 config.hidden_size,
                 quant_config=quant_config,
                 prefix=add_prefix("lm_head", prefix),
-                use_attn_tp_group=get_server_args().enable_dp_lm_head,
+                use_attn_tp_group=get_parallel().enable_dp_lm_head,
             )
         self.logits_processor = LogitsProcessor(config, return_full_logits=True)
 
@@ -965,12 +962,17 @@ class LLaDA2MoeModelLM(nn.Module):
                     )
                     weight_loader(param, loaded_weight)
 
-        self.routed_experts_weights_of_layer = {
-            layer_id: layer.mlp.get_moe_weights()
-            for layer_id, layer in enumerate(self.model.layers)
-            if not isinstance(layer, PPMissingLayer)
-            and isinstance(layer.mlp, LLaDA2MoeSparseMoeBlock)
-        }
+        # Lazy: get_moe_weights() snapshots x.data, and building the map here would
+        # pin every expert weight's pre-process_weights_after_loading storage.
+        if not hasattr(self, "routed_experts_weights_of_layer"):
+            self.routed_experts_weights_of_layer = LazyValue(
+                lambda: {
+                    layer_id: layer.mlp.get_moe_weights()
+                    for layer_id, layer in enumerate(self.model.layers)
+                    if not isinstance(layer, PPMissingLayer)
+                    and isinstance(layer.mlp, LLaDA2MoeSparseMoeBlock)
+                }
+            )
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
