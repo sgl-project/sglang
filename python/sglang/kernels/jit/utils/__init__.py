@@ -1,11 +1,11 @@
-"""Public interface of sglang.jit_kernel.utils."""
+"""Public interface of sglang.kernels.jit.utils."""
 
-from sglang.jit_kernel.utils.arch import (
+from sglang.kernels.jit.utils.arch import (
     get_jit_cuda_arch,
     is_arch_support_pdl,
     override_jit_cuda_arch,
 )
-from sglang.jit_kernel.utils.common import (
+from sglang.kernels.jit.utils.common import (
     cache_once,
     empty_sentinel,
     get_ci_test_range,
@@ -14,7 +14,7 @@ from sglang.jit_kernel.utils.common import (
     lazy_register_class,
     should_run_full_tests,
 )
-from sglang.jit_kernel.utils.compile import KERNEL_PATH, load_jit, make_cpp_args
+from sglang.kernels.jit.utils.compile import KERNEL_PATH, load_jit, make_cpp_args
 
 __all__ = [
     "empty_sentinel",

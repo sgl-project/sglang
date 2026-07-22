@@ -4,7 +4,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.jit_kernel.utils import (
+from sglang.kernels.jit.utils import (
     cache_once,
     is_arch_support_pdl,
     is_hip_runtime,

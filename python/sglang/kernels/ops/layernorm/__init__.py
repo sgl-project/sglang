@@ -113,7 +113,7 @@ class RMSNormOp(BaseFusedOp):
     ) -> torch.Tensor:
         import torch
 
-        from sglang.jit_kernel.norm import rmsnorm as jit_rmsnorm
+        from sglang.kernels.ops.layernorm._jit_norm import rmsnorm as jit_rmsnorm
 
         if out is None:
             out = torch.empty_like(input)
@@ -227,7 +227,9 @@ class FusedAddRMSNormOp(BaseFusedOp):
         eps: float = 1e-6,
         enable_pdl: Optional[bool] = None,
     ) -> None:
-        from sglang.jit_kernel.norm import fused_add_rmsnorm as jit_fused_add_rmsnorm
+        from sglang.kernels.ops.layernorm._jit_norm import (
+            fused_add_rmsnorm as jit_fused_add_rmsnorm,
+        )
 
         return jit_fused_add_rmsnorm(input, residual, weight, eps)
 

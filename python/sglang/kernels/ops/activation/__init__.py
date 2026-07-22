@@ -31,7 +31,7 @@ _HIP = frozenset({CapabilityRequirement.HIP})
 # — the canonical OR-semantics case that a device-baked backend name couldn't.
 _CUDA_HIP = frozenset({CapabilityRequirement.CUDA, CapabilityRequirement.HIP})
 # JIT before AOT to match the production path (srt/layers/activation.py imports
-# from sglang.jit_kernel.activation on CUDA); auto-selection must not invert it.
+# from sglang.kernels.ops.activation._jit_activation on CUDA); auto-selection must not invert it.
 _ACT_PRIORITY = (
     KernelBackend.JIT,
     KernelBackend.AOT,
@@ -82,7 +82,7 @@ class _GatedActivationOp(BaseFusedOp):
         expert_ids: Optional[torch.Tensor] = None,
         expert_step: int = 1,
     ) -> torch.Tensor:
-        import sglang.jit_kernel.activation as jit_activation
+        import sglang.kernels.ops.activation._jit_activation as jit_activation
 
         return getattr(jit_activation, self.kernel_attr)(
             input, out, expert_ids, expert_step
@@ -183,7 +183,7 @@ class GeluTanhAndMulOp(_GatedActivationOp):
 class ReLU2Op(BaseFusedOp):
     """``out = relu(input) ** 2`` (single-input, not gated).
 
-    The real kernel is the CUDA JIT path (``sglang.jit_kernel.activation.relu2``,
+    The real kernel is the CUDA JIT path (``sglang.kernels.ops.activation._jit_activation.relu2``,
     used in production on CUDA); elsewhere the torch reference runs.
     """
 
@@ -214,7 +214,7 @@ class ReLU2Op(BaseFusedOp):
     def forward_jit(
         self, input: torch.Tensor, out: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-        from sglang.jit_kernel.activation import relu2
+        from sglang.kernels.ops.activation._jit_activation import relu2
 
         result = relu2(input)
         if out is None:
