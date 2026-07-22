@@ -37,7 +37,6 @@ from http import HTTPStatus
 from typing import Any, Awaitable, Dict, Iterable, List, Optional, Tuple, Union
 
 import fastapi
-import numpy as np
 import pybase64
 import torch
 import uvloop
@@ -264,16 +263,14 @@ def _build_flat_input_top_logprobs_fields(
     input_top_logprobs_val: List[Optional[List[float]]],
     input_top_logprobs_idx: List[Optional[List[int]]],
     top_logprobs_num: int,
-    return_b64: bool,
 ) -> Dict[str, Any]:
     """Build the flat raw prompt top logprob response fields.
 
-    `input_top_logprobs_shape` is [num_positions, k] over the whole covered
-    range; the leading null positions (counted by
-    `input_top_logprobs_null_prefix`) are excluded from the flat arrays, so
-    position i, entry j lives at flat[(i - null_prefix) * k + j]. b64 arrays
-    are little-endian binary with dtype markers so widths can change without
-    a wire break.
+    `input_top_logprobs_shape` is the literal [rows, k] shape of the flat
+    arrays. The leading null positions (counted by
+    `input_top_logprobs_null_prefix`) precede the arrays, so covered position
+    i, entry j lives at flat[(i - null_prefix) * k + j] and the covered range
+    spans null_prefix + rows positions.
     """
     num_rows = len(input_top_logprobs_val)
     null_prefix = 0
@@ -292,21 +289,9 @@ def _build_flat_input_top_logprobs_fields(
             )
 
     fields: Dict[str, Any] = {}
-    if return_b64:
-        val_arr = np.asarray(val_rows, dtype=np.float32)
-        idx_arr = np.asarray(idx_rows, dtype=np.int32)
-        fields["input_top_logprobs_val_flat_b64"] = pybase64.b64encode(
-            val_arr.tobytes()
-        ).decode("utf-8")
-        fields["input_top_logprobs_idx_flat_b64"] = pybase64.b64encode(
-            idx_arr.tobytes()
-        ).decode("utf-8")
-        fields["input_top_logprobs_val_flat_b64_dtype"] = "float32"
-        fields["input_top_logprobs_idx_flat_b64_dtype"] = "int32"
-    else:
-        fields["input_top_logprobs_val_flat"] = [v for row in val_rows for v in row]
-        fields["input_top_logprobs_idx_flat"] = [i for row in idx_rows for i in row]
-    fields["input_top_logprobs_shape"] = [num_rows, k]
+    fields["input_top_logprobs_val_flat"] = [v for row in val_rows for v in row]
+    fields["input_top_logprobs_idx_flat"] = [i for row in idx_rows for i in row]
+    fields["input_top_logprobs_shape"] = [len(val_rows), k]
     fields["input_top_logprobs_null_prefix"] = null_prefix
     return fields
 
@@ -2293,7 +2278,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                                 state.input_top_logprobs_val,
                                 state.input_top_logprobs_idx,
                                 top_logprobs_num,
-                                state.obj.return_flat_raw_top_logprobs_b64,
                             )
                         )
                     except ValueError as e:

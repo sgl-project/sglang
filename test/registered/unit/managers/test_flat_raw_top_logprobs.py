@@ -1,9 +1,8 @@
 """Unit tests for the flat raw prompt top logprob response format
-(`return_flat_raw_top_logprobs` / `return_flat_raw_top_logprobs_b64`).
+(`return_flat_raw_top_logprobs`).
 """
 
 import asyncio
-import base64
 import json
 import os
 import time
@@ -65,41 +64,30 @@ def _add_logprob_meta_info(state: ReqState, top_logprobs_num: int = 2) -> dict:
 
 
 class TestFlatRawTopLogprobsValidation(CustomTestCase):
-    def test_b64_requires_flat_flag(self):
-        req = GenerateReqInput(text="hello", return_flat_raw_top_logprobs_b64=True)
-        with self.assertRaisesRegex(ValueError, "return_flat_raw_top_logprobs"):
-            req.normalize_batch_and_arguments()
-
-    def test_flags_default_off_and_valid_combinations(self):
+    def test_flag_defaults_off_and_valid(self):
         for kwargs in (
             {},
             {"return_flat_raw_top_logprobs": True},
-            {
-                "return_flat_raw_top_logprobs": True,
-                "return_flat_raw_top_logprobs_b64": True,
-            },
         ):
             req = GenerateReqInput(text="hello", **kwargs)
             req.normalize_batch_and_arguments()
 
-    def test_flags_propagate_to_batch_items(self):
+    def test_flag_propagates_to_batch_items(self):
         req = GenerateReqInput(
             text=["a", "b"],
             return_flat_raw_top_logprobs=True,
-            return_flat_raw_top_logprobs_b64=True,
         )
         req.normalize_batch_and_arguments()
         for i in range(2):
             self.assertTrue(req[i].return_flat_raw_top_logprobs)
-            self.assertTrue(req[i].return_flat_raw_top_logprobs_b64)
 
 
 class TestFlatAssembly(CustomTestCase):
     def test_flat_matches_nested_rows(self):
         fields = _build_flat_input_top_logprobs_fields(
-            _VAL_ROWS, _IDX_ROWS, top_logprobs_num=2, return_b64=False
+            _VAL_ROWS, _IDX_ROWS, top_logprobs_num=2
         )
-        self.assertEqual(fields["input_top_logprobs_shape"], [4, 2])
+        self.assertEqual(fields["input_top_logprobs_shape"], [3, 2])
         self.assertEqual(fields["input_top_logprobs_null_prefix"], 1)
         self.assertEqual(
             fields["input_top_logprobs_val_flat"],
@@ -114,37 +102,16 @@ class TestFlatAssembly(CustomTestCase):
         rows, k = fields["input_top_logprobs_shape"]
         null_prefix = fields["input_top_logprobs_null_prefix"]
         flat_val = fields["input_top_logprobs_val_flat"]
-        self.assertEqual(len(flat_val), (rows - null_prefix) * k)
-        for i in range(null_prefix, rows):
+        self.assertEqual(len(flat_val), rows * k)
+        for i in range(null_prefix, null_prefix + rows):
             start = (i - null_prefix) * k
             self.assertEqual(flat_val[start : start + k], _VAL_ROWS[i])
 
-    def test_b64_roundtrip(self):
-        fields = _build_flat_input_top_logprobs_fields(
-            _VAL_ROWS, _IDX_ROWS, top_logprobs_num=2, return_b64=True
-        )
-        self.assertEqual(fields["input_top_logprobs_shape"], [4, 2])
-        self.assertEqual(fields["input_top_logprobs_null_prefix"], 1)
-        self.assertEqual(fields["input_top_logprobs_val_flat_b64_dtype"], "float32")
-        self.assertEqual(fields["input_top_logprobs_idx_flat_b64_dtype"], "int32")
-        rows, k = fields["input_top_logprobs_shape"]
-        null_prefix = fields["input_top_logprobs_null_prefix"]
-        val = np.frombuffer(
-            base64.b64decode(fields["input_top_logprobs_val_flat_b64"]),
-            dtype=np.dtype(fields["input_top_logprobs_val_flat_b64_dtype"]),
-        ).reshape(rows - null_prefix, k)
-        idx = np.frombuffer(
-            base64.b64decode(fields["input_top_logprobs_idx_flat_b64"]),
-            dtype=np.dtype(fields["input_top_logprobs_idx_flat_b64_dtype"]),
-        ).reshape(rows - null_prefix, k)
-        np.testing.assert_array_equal(val, np.asarray(_VAL_ROWS[1:], dtype=np.float32))
-        np.testing.assert_array_equal(idx, np.asarray(_IDX_ROWS[1:], dtype=np.int32))
-
     def test_all_null_rows(self):
         fields = _build_flat_input_top_logprobs_fields(
-            [None], [None], top_logprobs_num=2, return_b64=False
+            [None], [None], top_logprobs_num=2
         )
-        self.assertEqual(fields["input_top_logprobs_shape"], [1, 2])
+        self.assertEqual(fields["input_top_logprobs_shape"], [0, 2])
         self.assertEqual(fields["input_top_logprobs_null_prefix"], 1)
         self.assertEqual(fields["input_top_logprobs_val_flat"], [])
         self.assertEqual(fields["input_top_logprobs_idx_flat"], [])
@@ -155,7 +122,6 @@ class TestFlatAssembly(CustomTestCase):
                 [None, [-0.1, -2.5], None, [-0.3, -1.5]],
                 [None, [11, 22], None, [33, 44]],
                 top_logprobs_num=2,
-                return_b64=False,
             )
 
     def test_rejects_ragged_rows(self):
@@ -164,7 +130,6 @@ class TestFlatAssembly(CustomTestCase):
                 [None, [-0.1, -2.5], [-0.3]],
                 [None, [11, 22], [33]],
                 top_logprobs_num=2,
-                return_b64=False,
             )
 
 
@@ -200,7 +165,7 @@ class TestAddLogprobToMetaInfo(CustomTestCase):
         meta_info = _add_logprob_meta_info(state)
         self.assertNotIn("input_top_logprobs", meta_info)
         self.assertIn("output_top_logprobs", meta_info)
-        self.assertEqual(meta_info["input_top_logprobs_shape"], [4, 2])
+        self.assertEqual(meta_info["input_top_logprobs_shape"], [3, 2])
         self.assertEqual(meta_info["input_top_logprobs_null_prefix"], 1)
         self.assertEqual(
             meta_info["input_top_logprobs_val_flat"],
@@ -230,7 +195,6 @@ class TestAddLogprobToMetaInfo(CustomTestCase):
             return_logprob=True,
             top_logprobs_num=2,
             return_flat_raw_top_logprobs=True,
-            return_flat_raw_top_logprobs_b64=True,
         )
         self._extend_input_top(one_shot, _VAL_ROWS, _IDX_ROWS)
         expected = _add_logprob_meta_info(one_shot)
@@ -241,7 +205,6 @@ class TestAddLogprobToMetaInfo(CustomTestCase):
             return_logprob=True,
             top_logprobs_num=2,
             return_flat_raw_top_logprobs=True,
-            return_flat_raw_top_logprobs_b64=True,
         )
         self._extend_input_top(chunked, _VAL_ROWS[:2], _IDX_ROWS[:2])
         _add_logprob_meta_info(chunked)
@@ -249,10 +212,8 @@ class TestAddLogprobToMetaInfo(CustomTestCase):
         got = _add_logprob_meta_info(chunked)
 
         flat_keys = [
-            "input_top_logprobs_val_flat_b64",
-            "input_top_logprobs_idx_flat_b64",
-            "input_top_logprobs_val_flat_b64_dtype",
-            "input_top_logprobs_idx_flat_b64_dtype",
+            "input_top_logprobs_val_flat",
+            "input_top_logprobs_idx_flat",
             "input_top_logprobs_shape",
             "input_top_logprobs_null_prefix",
         ]
@@ -262,8 +223,8 @@ class TestAddLogprobToMetaInfo(CustomTestCase):
         # No new rows -> the encoded payload is reused, not rebuilt.
         again = _add_logprob_meta_info(chunked)
         self.assertIs(
-            again["input_top_logprobs_val_flat_b64"],
-            got["input_top_logprobs_val_flat_b64"],
+            again["input_top_logprobs_val_flat"],
+            got["input_top_logprobs_val_flat"],
         )
 
 
@@ -272,7 +233,8 @@ class TestAddLogprobToMetaInfo(CustomTestCase):
     "Serialization microbenchmark; set SGLANG_BENCH_FLAT_RAW_TOP_LOGPROBS=1 to run.",
 )
 class BenchFlatRawTopLogprobsSerialization(CustomTestCase):
-    """Compares JSON-encode time and payload size of the three formats."""
+    """Round-trip cost of the formats: server assembly + json.dumps, then
+    client json.loads + reconstruction into [rows, k] arrays."""
 
     def test_bench(self):
         num_positions, k = 32768, 2
@@ -282,11 +244,37 @@ class BenchFlatRawTopLogprobsSerialization(CustomTestCase):
         val_rows = [None] + vals[1:].tolist()
         idx_rows = [None] + idxs[1:].tolist()
 
-        def bench(name, build):
-            start = time.perf_counter()
-            payload = json.dumps(build())
-            elapsed = time.perf_counter() - start
-            print(f"{name}: {elapsed * 1e3:.1f} ms, {len(payload)} bytes")
+        def best_of(fn, iters=5):
+            result = fn()
+            elapsed = min(
+                (lambda s=time.perf_counter(): (fn(), time.perf_counter() - s)[1])()
+                for _ in range(iters)
+            )
+            return elapsed * 1e3, result
+
+        def bench(name, build, decode):
+            encode_ms, payload = best_of(lambda: json.dumps(build()))
+            decode_ms, arrays = best_of(lambda: decode(payload))
+            self.assertEqual(arrays[0].shape, (num_positions - 1, k))
+            print(
+                f"{name}: encode {encode_ms:.1f} ms, decode {decode_ms:.1f} ms, "
+                f"{len(payload)} bytes"
+            )
+
+        def decode_nested(payload):
+            rows = [r for r in json.loads(payload) if r is not None]
+            return (
+                np.array([[e[0] for e in r] for r in rows], dtype=np.float32),
+                np.array([[e[1] for e in r] for r in rows], dtype=np.int32),
+            )
+
+        def decode_flat(payload):
+            d = json.loads(payload)
+            shape = d["input_top_logprobs_shape"]
+            return (
+                np.asarray(d["input_top_logprobs_val_flat"], np.float32).reshape(shape),
+                np.asarray(d["input_top_logprobs_idx_flat"], np.int32).reshape(shape),
+            )
 
         bench(
             "nested triples",
@@ -294,18 +282,14 @@ class BenchFlatRawTopLogprobsSerialization(CustomTestCase):
                 (None if row is None else [(v, i, None) for v, i in zip(row, idx_row)])
                 for row, idx_row in zip(val_rows, idx_rows)
             ],
+            decode_nested,
         )
         bench(
             "flat lists",
             lambda: _build_flat_input_top_logprobs_fields(
-                val_rows, idx_rows, top_logprobs_num=k, return_b64=False
+                val_rows, idx_rows, top_logprobs_num=k
             ),
-        )
-        bench(
-            "flat b64",
-            lambda: _build_flat_input_top_logprobs_fields(
-                val_rows, idx_rows, top_logprobs_num=k, return_b64=True
-            ),
+            decode_flat,
         )
 
 

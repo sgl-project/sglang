@@ -211,8 +211,6 @@ class GenerateReqInput:
     # Return prompt top logprobs as flat arrays plus shape metadata instead of
     # the nested per-position [logprob, token_id, text] lists.
     return_flat_raw_top_logprobs: bool = False
-    # Base64-encode the flat arrays. Requires return_flat_raw_top_logprobs.
-    return_flat_raw_top_logprobs_b64: bool = False
     # Whether to stream output.
     stream: bool = False
     # Whether to log metrics for this request (e.g. health_generate calls do not log metrics)
@@ -373,13 +371,6 @@ class GenerateReqInput:
         ):
             raise ValueError(
                 "Either text, input_ids or input_embeds should be provided."
-            )
-        if (
-            self.return_flat_raw_top_logprobs_b64
-            and not self.return_flat_raw_top_logprobs
-        ):
-            raise ValueError(
-                "return_flat_raw_top_logprobs_b64 requires return_flat_raw_top_logprobs."
             )
 
     def _determine_batch_size(self):
@@ -737,7 +728,6 @@ class GenerateReqInput:
             return_sampling_mask=self.return_sampling_mask[i],
             return_text_in_logprobs=self.return_text_in_logprobs,
             return_flat_raw_top_logprobs=self.return_flat_raw_top_logprobs,
-            return_flat_raw_top_logprobs_b64=self.return_flat_raw_top_logprobs_b64,
             stream=self.stream,
             log_metrics=self.log_metrics,
             return_hidden_states=(
