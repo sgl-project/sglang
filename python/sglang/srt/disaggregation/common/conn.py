@@ -32,11 +32,8 @@ from sglang.srt.disaggregation.utils import (
 )
 from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.environ import envs
-from sglang.srt.layers.dp_attention import (
-    get_attention_dp_rank,
-    get_attention_dp_size,
-)
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.layers.dp_attention import get_attention_dp_rank, get_attention_dp_size
+from sglang.srt.runtime_context import get_model, get_parallel, get_serving
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.network import (
     NetworkAddress,
@@ -469,11 +466,11 @@ class CommonKVManager(BaseKVManager):
 
         if (
             info.kv_cache_dtype is not None
-            and info.kv_cache_dtype != self.server_args.kv_cache_dtype
+            and info.kv_cache_dtype != get_model().kv_cache_dtype
         ):
             raise RuntimeError(
                 f"KV cache dtype mismatch: prefill server has kv_cache_dtype={info.kv_cache_dtype}, "
-                f"but decode server has kv_cache_dtype={self.server_args.kv_cache_dtype}. "
+                f"but decode server has kv_cache_dtype={get_model().kv_cache_dtype}. "
                 f"Both servers must use the same --kv-cache-dtype value."
             )
 
@@ -575,7 +572,7 @@ class CommonKVManager(BaseKVManager):
         `Connection refused`, and the leader's `prefill_port_table` ends
         up missing rows.
         """
-        if not self.dist_init_addr or self.server_args.nnodes == 1:
+        if not self.dist_init_addr or get_parallel().nnodes == 1:
             return local_port
 
         if not (dist.is_available() and dist.is_initialized()):
@@ -626,15 +623,15 @@ class CommonKVManager(BaseKVManager):
             "rank_ip": self.local_ip,
             "rank_port": self.rank_port,
             "page_size": self.kv_args.page_size,
-            "kv_cache_dtype": self.server_args.kv_cache_dtype,
-            "load_balance_method": self.server_args.load_balance_method,
+            "kv_cache_dtype": get_model().kv_cache_dtype,
+            "load_balance_method": get_parallel().load_balance_method,
             "enable_dsa_cache_layer_split": getattr(
                 self.server_args, "enable_dsa_cache_layer_split", False
             ),
             # Self-register the HTTP API port so the decode can derive the PD
             # retract rebootstrap /generate URL from bootstrap info instead of a
             # router-injected pd_rebootstrap_prefill_url.
-            "prefill_http_port": self.server_args.port,
+            "prefill_http_port": get_serving().port,
         }
 
         max_retries, initial_delay, max_delay = 5, 1.0, 30.0

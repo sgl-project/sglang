@@ -664,7 +664,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor | None:
-        from sglang.jit_kernel.fused_fp8_qkv_kv_cache import fused_fp8_qkv_kv_cache
+        from sglang.kernels.ops.kvcache.fused_fp8_qkv_kv_cache import (
+            fused_fp8_qkv_kv_cache,
+        )
 
         cache_loc = self._get_layer_cache_loc(layer, forward_batch)
         k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)

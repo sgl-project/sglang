@@ -37,21 +37,17 @@ from typing import Iterable, List, Optional, Tuple
 import torch
 from torch import nn
 
-from sglang.jit_kernel.dsv4 import linear_bf16_fp32
+from sglang.kernels.ops.attention.dsv4 import linear_bf16_fp32
 from sglang.kernels.ops.moe.ep_moe_kernels import zero_experts_compute_triton
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.configs import LongcatFlashConfig
-from sglang.srt.distributed import (
-    tensor_model_parallel_all_reduce,
-)
+from sglang.srt.distributed import tensor_model_parallel_all_reduce
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
-from sglang.srt.layers.dp_attention import (
-    is_dp_attention_enabled,
-)
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -87,7 +83,7 @@ from sglang.srt.model_loader.utils import (
 )
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
-from sglang.srt.runtime_context import get_parallel, get_server_args, get_stream
+from sglang.srt.runtime_context import get_parallel, get_stream
 from sglang.srt.utils import (
     BumpAllocator,
     add_prefix,
@@ -714,7 +710,7 @@ class LongcatFlashForCausalLM(nn.Module):
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("lm_head", prefix),
-            use_attn_tp_group=get_server_args().enable_dp_lm_head,
+            use_attn_tp_group=get_parallel().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
         self.capture_aux_hidden_states = False
