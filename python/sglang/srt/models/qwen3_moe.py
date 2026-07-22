@@ -532,6 +532,10 @@ class Qwen3MoeAttention(nn.Module):
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
+            # KV-streaming: force a per-layer sliding window when the config carries one (injected via
+            # --json-model-override-args). Inert (-1 = full attention) otherwise. Enables the SWA device
+            # ring; the host tail recovers the evicted older tokens for full-attention correctness.
+            sliding_window_size=(getattr(config, "sliding_window", None) or -1),
             prefix=add_prefix("attn", prefix),
         )
 

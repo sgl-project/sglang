@@ -79,9 +79,12 @@ class ChunkCache(BasePrefixCache):
     def cache_finished_req(
         self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int
     ):
+        # KV-streaming: a windowed request's low range [0, _kvwin_freed_upto) was already freed
+        # per-step by the device-slot ring hook (alloc_for_decode); skip it to avoid a double-free.
+        start = getattr(req, "_kvwin_freed_upto", 0)
         # For decode server: if req.output_ids is empty, we want to free all req.origin_input_ids
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, :kv_len_to_handle
+            req.req_pool_idx, start:kv_len_to_handle
         ]
         self.token_to_kv_pool_allocator.free(kv_indices)
 

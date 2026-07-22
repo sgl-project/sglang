@@ -27,6 +27,7 @@ from sglang.srt.layers.moe.paged_experts.placement import make_placement
 from sglang.srt.layers.moe.paged_experts.sizing import (
     compute_num_resident_experts,
     compute_window_experts,
+    compute_window_size,
     kv_reserve_bytes_mha,
 )
 
@@ -63,6 +64,16 @@ _PRE_LOAD_HOST_AVAIL = _host_available_bytes()
 # exact, so this covers only the runtime. Sized ~2x the runtime need actually observed: configs whose
 # estimated reserve happened to sit ~0.2 GB above their true non-expert weights booted reliably.
 _NONEXPERT_RUNTIME_RESERVE = 0.5e9
+
+# Aggressive single-stream auto-K (SGLANG_PAGED_AGGRESSIVE_K=1, gated to max_running_requests==1). At bs=1
+# the two concurrency-scaled safety margins — the mem_fraction activation headroom (~10% of VRAM) and the
+# non-expert runtime padding above — are over-provisioned by ~a GB, capping K well below the physical
+# ceiling. Aggressive mode reclaims them: a FIXED activation reserve (below, overridable) replaces the
+# percentage, and the non-expert padding shrinks to a small real-workspace slack. Safe because it is gated
+# to bs=1 and the KV reserve still floors the pool to one prefill chunk (+ window). Defaults chosen from the
+# measured bs=1 footprint (capture pool ~0.1 GB + prefill activation + fragmentation slack).
+_AGGRESSIVE_ACT_RESERVE = 0.5e9  # fixed activations + cuda-graph + fragmentation reserve at bs=1
+_AGGRESSIVE_WORKSPACE_SLACK = 0.2e9  # real loader/quant workspace kept on top of the EXACT non-expert bytes
 
 
 def _nonexpert_weight_bytes_from_checkpoint(model_path: str) -> Optional[int]:
@@ -183,6 +194,93 @@ def resolve_num_resident_experts(
     # going negative. --paged-experts-kv-reserve-gb overrides with an explicit total KV budget.
     kv_elt = 1 if "fp8" in (sa.kv_cache_dtype or "").lower() else 2
     ctx = sa.context_length or getattr(mc, "context_len", None) or 2048
+
+    # --- Effective K/KV budget, computed ONCE up front so the window fits-check and the K sizing agree.
+    # (A budget mismatch flips the fits decision at the boundary — measured: it windowed at 32K when full-KV
+    # was the better layout.) free VRAM, non-expert weights, and the aggressive-vs-conservative reserve all
+    # feed both. ``k_budget`` is what the expert pool + KV/window share; it mirrors what
+    # ``compute_num_resident_experts`` derives internally from the same inputs.
+    free = _PRE_LOAD_FREE_BYTES or torch.cuda.mem_get_info()[0]
+    top_k = getattr(htc, "num_experts_per_tok", 8) or 8
+    mem_frac = sa.mem_fraction_static or 0.85
+    mrr = max(1, int(getattr(sa, "max_running_requests", 1) or 1))
+
+    # Non-expert weights: exact from the checkpoint safetensors headers when available (+ runtime reserve),
+    # else a config estimate floored at the default. (Moved ahead of the window decision so the budget is
+    # exact there too — the fits boundary is budget-sensitive.)
+    exact = _nonexpert_weight_bytes_from_checkpoint(sa.model_path)
+    if exact is not None:
+        nonexpert_bytes = exact + _NONEXPERT_RUNTIME_RESERVE
+    else:
+        vocab = getattr(htc, "vocab_size", 0) or 0
+        tied = bool(getattr(htc, "tie_word_embeddings", False))
+        embed_bytes = vocab * htc.hidden_size * 2 * (1 if tied else 2)
+        _NONEXPERT_BASE = 2.0e9
+        if getattr(mc.hf_config, "vision_config", None) is not None:
+            embed_bytes += int(1.0e9)  # VL checkpoints load a vision tower + projector
+        nonexpert_bytes = max(nonexpert_reserve_gb * 1e9, _NONEXPERT_BASE + embed_bytes)
+
+    # Aggressive single-stream reclaim (opt-in, bs==1): replace the mem_fraction activation headroom with a
+    # fixed reserve and shrink the non-expert padding to a small workspace slack (see _AGGRESSIVE_* above).
+    aggressive = bool(os.environ.get("SGLANG_PAGED_AGGRESSIVE_K")) and mrr == 1
+    act_reserve = None
+    if aggressive:
+        if exact is not None:
+            nonexpert_bytes = exact + _AGGRESSIVE_WORKSPACE_SLACK
+        _act_gb = os.environ.get("SGLANG_PAGED_ACT_RESERVE_GB")
+        act_reserve = (float(_act_gb) * 1e9) if _act_gb else _AGGRESSIVE_ACT_RESERVE
+
+    # The budget the expert pool + KV/window share (before any window ring is charged).
+    k_budget = (
+        (free - act_reserve - nonexpert_bytes)
+        if act_reserve is not None
+        else (free * mem_frac - nonexpert_bytes)
+    )
+
+    # Auto-window (SGLANG_KV_WINDOW=auto): fits/doesn't-fit policy (see compute_window_size). Whenever the
+    # full-context KV fits VRAM alongside a minimal expert pool, full-KV beats windowing at EVERY decode
+    # position (resident HBM KV vs re-streamed PCIe tail — measured), so W=0 and aggressive-K takes the VRAM.
+    # Window only when full-KV is infeasible (context too large to hold resident): capacity fallback. No
+    # fitted thresholds, no bandwidth constant — machine-independent. Resolves to a concrete int written back
+    # into the env so every downstream consumer (attention, allocator, admission) reads the SAME W.
+    if os.environ.get("SGLANG_KV_WINDOW") == "auto":
+        _tp = getattr(sa, "tp_size", 1) or 1
+        if getattr(mc, "kv_lora_rank", None):
+            _pt = (mc.kv_lora_rank + mc.qk_rope_head_dim) * layers * kv_elt
+        else:
+            _pt = 2 * layers * mc.get_num_kv_heads(_tp) * ((mc.head_dim + mc.v_head_dim) // 2) * kv_elt
+        _W = compute_window_size(
+            context_length=ctx,
+            per_token_bytes=_pt,
+            per_expert_pool_bytes=moe_layers * per_el,
+            top_k=top_k,
+            budget_bytes=k_budget,  # SAME budget K sizing uses -> consistent fits decision
+            page_size=int(getattr(sa, "page_size", 1) or 1),
+        )
+        if _W > 0:
+            os.environ["SGLANG_KV_WINDOW"] = str(_W)
+            logger.info(
+                "[paged-experts] auto window: full-KV infeasible at context=%d -> W=%d (capacity fallback)",
+                ctx,
+                _W,
+            )
+        else:
+            os.environ.pop("SGLANG_KV_WINDOW", None)  # full-KV fits: no windowing, aggressive-K takes VRAM
+            logger.info(
+                "[paged-experts] auto window: full-KV fits at context=%d -> W=0 (no windowing)", ctx
+            )
+
+    # KV-streaming (SGLANG_KV_WINDOW=W): the windowed device KV pool holds only ~W live tokens + one prefill
+    # chunk, regardless of context_length (the cold tail lives in host RAM). So the K/KV split must reserve
+    # for THAT device footprint, not the full context — else long context reserves the full-context KV (e.g.
+    # ~3.2GB @32K) and starves K to top_k. Capping the reserve length at W + chunked_prefill_size lets auto-K
+    # claim the VRAM the window frees, so K need NOT be pinned; sglang then sizes the real KV pool from the
+    # matching leftover (~W + chunk), so max-total-tokens need not be pinned either. No effect when
+    # W + chunk >= context (short context already reserves little — matches the measured no-gain regime).
+    _kvwin = os.environ.get("SGLANG_KV_WINDOW")
+    if _kvwin:
+        _cps = int(getattr(sa, "chunked_prefill_size", 0) or 2048)
+        ctx = min(ctx, int(_kvwin) + _cps)
     mrr = max(1, int(getattr(sa, "max_running_requests", 1) or 1))
     kv_gb = getattr(sa, "paged_experts_kv_reserve_gb", -1.0)
     if kv_gb is not None and kv_gb >= 0:
@@ -200,6 +298,37 @@ def resolve_num_resident_experts(
             max_running_requests=mrr,  # size KV for the declared concurrency; single-stream -> small
             context_length=ctx,
         )
+
+    # Pool floor: a tiny leftover KV pool can't hold a prefill chunk — the extend allocator grabs the whole
+    # chunk before the windowed ring frees, so a pool below one chunk silently fails prompts longer than it.
+    # Reserve at least one chunk (+ window) of KV. Derive per-token from the reserve just computed
+    # (branch-agnostic: covers both the MHA per-token and the MLA cell). Skipped when the reserve is pinned.
+    min_kv_pool = 0.0
+    if not (kv_gb is not None and kv_gb >= 0) and mrr * ctx > 0:
+        _per_token = kv_reserve / (mrr * ctx)
+        _chunk = int(getattr(sa, "chunked_prefill_size", 0) or 2048)
+        _wfloor = int(_kvwin) if _kvwin else 0
+        min_kv_pool = (_chunk + _wfloor) * _per_token
+
+    # Pool-floor guarantee: force the device KV pool to hold >= W + chunk regardless of how K is set (pinned
+    # or auto). The windowed admission charges each request ~W + chunk; if the pool is smaller the request
+    # can never be admitted, head-of-lines the FCFS queue, and the scheduler wedges (measured: a hand-set
+    # max-total-tokens=3072 with W=8192 hangs). Raise max_total_tokens to the floor so it boots-loud on a
+    # genuine VRAM shortfall instead of silently wedging. Only when windowing.
+    if _kvwin:
+        _need = (
+            int(_kvwin)
+            + int(getattr(sa, "chunked_prefill_size", 0) or 2048)
+            + int(getattr(sa, "page_size", 1) or 1)
+        )
+        _cur = getattr(sa, "max_total_tokens", None)
+        if _cur is None or int(_cur) < _need:
+            sa.max_total_tokens = _need
+            logger.info(
+                "[paged-experts] windowed pool floor: max_total_tokens -> %d (W=%s + chunk)",
+                _need,
+                _kvwin,
+            )
 
     # Hybrid (mamba / linear-attention) models keep a per-request STATE cache outside the token-KV
     # pool; sglang sizes it from what is left after weights — which auto-K would otherwise consume
@@ -219,34 +348,15 @@ def resolve_num_resident_experts(
         # (the documented knob for hybrid concurrency) — don't stack the automatic reserve on top.
         kv_reserve += mamba_per_req * _HYBRID_STATE_SLOTS
 
-    # Non-expert weights: read EXACTLY from the checkpoint's safetensors headers when available —
-    # embeddings, lm_head, attention/dense/shared-expert weights, vision towers, at their true
-    # (possibly quantized) sizes — plus a runtime reserve for the serving process's own allocations
-    # (workspaces, capture pools). Falls back to a config estimate when the checkpoint isn't locally
-    # readable; both floored at the passed default so smaller models keep their K.
-    exact = _nonexpert_weight_bytes_from_checkpoint(sa.model_path)
-    if exact is not None:
-        # exact is summed from the checkpoint's real tensor sizes — trust it (+ runtime reserve) rather
-        # than flooring up to nonexpert_reserve_gb, which needlessly shrinks K on models whose non-expert
-        # weights are genuinely smaller than the floor. The floor still guards the estimate branch below.
-        nonexpert_bytes = exact + _NONEXPERT_RUNTIME_RESERVE
-    else:
-        # The fixed base underestimates big-vocab / VL checkpoints (a 248k untied vocab is ~2 GB of
-        # embeddings + lm_head alone) — estimate the dominant variable term from config. The 2.0 GB
-        # base covers attention/dense weights + the runtime reserve.
-        vocab = getattr(htc, "vocab_size", 0) or 0
-        tied = bool(getattr(htc, "tie_word_embeddings", False))
-        embed_bytes = vocab * htc.hidden_size * 2 * (1 if tied else 2)
-        _NONEXPERT_BASE = 2.0e9
-        if getattr(mc.hf_config, "vision_config", None) is not None:
-            embed_bytes += int(
-                1.0e9
-            )  # VL checkpoints load a vision tower + projector alongside the text model
-        nonexpert_bytes = max(nonexpert_reserve_gb * 1e9, _NONEXPERT_BASE + embed_bytes)
+    # (non-expert weights, free/top_k/mem_frac, and the aggressive reserve were resolved up front, before
+    # the window decision, so the budget is consistent across both.)
 
-    free = _PRE_LOAD_FREE_BYTES or torch.cuda.mem_get_info()[0]
-    top_k = getattr(htc, "num_experts_per_tok", 8) or 8
-    mem_frac = sa.mem_fraction_static or 0.85
+    # Window-ring VRAM: the backend store keeps a W-slot device ring (rk/rv) SEPARATE from the KV pool — a
+    # fixed device allocation K sizing must subtract, or a big window overshoots K and OOMs at load.
+    # Negligible at small W (0.05 GB at W=512); ~1 GB at W=10k. Charge it as non-expert device memory.
+    if _kvwin and mrr * ctx > 0:
+        nonexpert_bytes += int(_kvwin) * (kv_reserve / (mrr * ctx))
+
     k = compute_num_resident_experts(
         free_vram_bytes=free,
         mem_fraction=mem_frac,
@@ -256,10 +366,12 @@ def resolve_num_resident_experts(
         per_expert_layer_bytes=per_el,
         top_k=top_k,
         num_experts=num_experts_E,
+        activation_reserve_bytes=act_reserve,
+        min_kv_pool_bytes=min_kv_pool,
     )
     logger.info(
         "[paged-experts] resident K=%d/%d (%d%%): free=%.2fGB mem_fraction=%.3f "
-        "nonexpert=%.2fGB(%s) KV_reserve=%.2fGB per_expert=%.2fMB moe_layers=%d",
+        "nonexpert=%.2fGB(%s) KV_reserve=%.2fGB(floor=%.2fGB) per_expert=%.2fMB moe_layers=%d%s",
         k,
         num_experts_E,
         k * 100 // num_experts_E,
@@ -268,8 +380,10 @@ def resolve_num_resident_experts(
         nonexpert_bytes / 1e9,
         "exact+reserve" if exact is not None else "estimated",
         kv_reserve / 1e9,
+        min_kv_pool / 1e9,
         per_el / 1e6,
         moe_layers,
+        (f" AGGRESSIVE act_reserve={act_reserve / 1e9:.2f}GB" if aggressive else ""),
     )
     return k
 

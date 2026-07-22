@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
@@ -448,10 +449,16 @@ class TpModelWorker(BaseTpWorker):
         self.model_runner.hisparse_coordinator = coordinator
 
     def get_worker_info(self):
-        max_req_len = min(
-            self.model_config.context_len - 1,
-            self.model_runner.effective_max_total_num_tokens - 1,
-        )
+        if os.environ.get("SGLANG_KV_WINDOW"):
+            # KV-streaming: admit prompts LONGER than the device pool — the pool is windowed (see
+            # alloc_for_extend / alloc_for_decode) so it holds only ~W + chunk_size while the logical context
+            # (req_to_token width) grows to context_len. Bound by context_len, NOT the device pool size.
+            max_req_len = self.model_config.context_len - 1
+        else:
+            max_req_len = min(
+                self.model_config.context_len - 1,
+                self.model_runner.effective_max_total_num_tokens - 1,
+            )
         return (
             self.model_runner.max_total_num_tokens,
             self.server_args.max_prefill_tokens,

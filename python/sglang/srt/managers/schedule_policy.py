@@ -867,6 +867,15 @@ class PrefillAdder:
         # Shared Mamba pool: fold the new mamba state's shared-gap cost into the
         # budget gate so admission can't over-commit (0 for baseline / non-Mamba).
         paged_input += self._mamba_gap_budget_for_req(req)
+        # KV-streaming: a windowed request rings the device pool (alloc_for_extend) so it never holds
+        # more than ~W + chunk_size, regardless of prompt length. Charge THIS gate against that bound, not the
+        # full prompt — else a prompt longer than the small device pool is rejected here (before the chunk
+        # branch below), the FCFS queue head-of-lines, and the server wedges. (ignore_eos + ChunkCache routes
+        # here, so the add_one_req cap does not apply.)
+        if os.environ.get("SGLANG_KV_WINDOW"):
+            _cps = get_server_args().chunked_prefill_size
+            if _cps:
+                paged_input = min(paged_input, int(os.environ["SGLANG_KV_WINDOW"]) + _cps)
         if paged_input > min(self.cur_rem_tokens, self.rem_total_tokens):
             return AddReqResult.NO_TOKEN
         if self.is_hybrid_swa:
@@ -906,9 +915,12 @@ class PrefillAdder:
         else:
             add_req_state(req, insert_sort=True)
 
-        if not self.is_hybrid_swa:
+        if not self.is_hybrid_swa and not os.environ.get("SGLANG_KV_WINDOW"):
             # Skip this logic for swa. The SWA has different memory management, and
             # this mechanism is underestimating the memory usage.
+            # KV-streaming: also skip for a windowed device pool — a windowed request only ever
+            # occupies ~W device slots (alloc_for_decode ring), so reserving the full max_new_tokens
+            # here would wrongly reject long generations that exceed the small device pool.
             cur_rem_tokens = self.cur_rem_tokens - self.ceil_paged_tokens(
                 cand_extend_input_len
             )
@@ -1012,6 +1024,17 @@ class PrefillAdder:
         # Shared Mamba pool: fold the new mamba state's shared-gap cost into
         # `total_tokens` so both `rem_total_tokens` gates reflect the joint budget.
         total_tokens += self._mamba_gap_budget_for_req(req)
+
+        # KV-streaming: for a WINDOWED request the device pool is ringed (alloc_for_extend /
+        # alloc_for_decode) so it never holds more than ~W + one chunk, regardless of prompt length or
+        # max_new. Charge admission against that bound, not the full prompt — else a prompt longer than the
+        # small device pool is falsely rejected (the standard budget assumes the whole prefix stays resident).
+        if os.environ.get("SGLANG_KV_WINDOW"):
+            _w = int(os.environ["SGLANG_KV_WINDOW"])
+            # windowed device footprint = W + one chunk (NOT the full prompt — don't fall back to it when
+            # chunked_prefill_size is unset; use a sane default so the cap stays below the pool).
+            _cps = get_server_args().chunked_prefill_size or 2048
+            total_tokens = min(total_tokens, _w + _cps + self.page_size)
 
         # adjusting the input_tokens based on host_hit_length and page_size
         real_input_tokens = cand_extend_input_len - req.host_hit_length
