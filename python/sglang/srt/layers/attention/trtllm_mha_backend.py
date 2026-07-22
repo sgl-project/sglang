@@ -193,6 +193,53 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         #   KV fp8: q_type = fp8, out_type=model_runner.dtype
         self.is_xqa_impl = is_sm90_supported() or is_sm120_supported()
 
+        # The XQA impl requires an explicit bit-packed causal mask for
+        # speculative-decode verify (q_len_per_req > 1); trtllm-gen does not.
+        # Preallocate at init so CUDA-graph capture never allocates.
+        self._xqa_spec_dec_masks = {}
+        if (
+            self.is_xqa_impl
+            and model_runner.server_args.speculative_algorithm is not None
+            and model_runner.server_args.speculative_num_draft_tokens is not None
+        ):
+            draft_len = model_runner.server_args.speculative_num_draft_tokens
+            self._xqa_spec_dec_masks[draft_len] = self._build_xqa_spec_dec_causal_mask(
+                max_bs=model_runner.req_to_token_pool.size,
+                q_len=draft_len,
+                device=model_runner.device,
+            )
+
+    @staticmethod
+    def _build_xqa_spec_dec_causal_mask(
+        max_bs: int, q_len: int, device
+    ) -> torch.Tensor:
+        """Bit-packed causal mask for XQA spec-dec verify.
+
+        Shape [max_bs, q_len, ceil(q_len/32)*2] uint16 (32-bit aligned rows);
+        bit j of row i is set iff draft token i attends draft position j
+        (j <= i). Chain speculation (eagle-topk 1) is exactly causal, so the
+        mask is constant and shared across batch entries.
+        """
+        assert q_len <= 63, "spec-dec draft length > 63 not supported by mask build"
+        words_per_row = (q_len + 31) // 32 * 2
+        row_bits = (1 << (torch.arange(q_len, dtype=torch.int64) + 1)) - 1
+        u16 = torch.empty(q_len, words_per_row, dtype=torch.int32)
+        for w in range(words_per_row):
+            u16[:, w] = (row_bits >> (16 * w)) & 0xFFFF
+        mask = u16.to(torch.uint16).unsqueeze(0).expand(max_bs, -1, -1).contiguous()
+        return mask.to(device)
+
+    def _get_xqa_spec_dec_mask(self, bs: int, q_len: int) -> torch.Tensor:
+        mask = self._xqa_spec_dec_masks.get(q_len)
+        if mask is None:
+            # Every spec path reaching this backend uses exactly
+            # speculative_num_draft_tokens per request, preallocated at init.
+            raise RuntimeError(
+                f"XQA spec-dec mask for q_len={q_len} was not preallocated "
+                f"at init (have {sorted(self._xqa_spec_dec_masks)})."
+            )
+        return mask[:bs]
+
     def _check_decode_kv_access(self) -> None:
         supported_kinds = {
             KVCacheAttentionAccessKind.PLAIN,
@@ -1145,6 +1192,14 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
                     out_dtype=self.q_data_type,
                     q_len_per_req=self.forward_metadata.max_seq_len_q,
+                    mask=(
+                        self._get_xqa_spec_dec_mask(
+                            bs=forward_batch.batch_size,
+                            q_len=self.forward_metadata.max_seq_len_q,
+                        )
+                        if self.is_xqa_impl and self.forward_metadata.max_seq_len_q > 1
+                        else None
+                    ),
                 )
         else:
 
