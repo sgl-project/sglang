@@ -293,6 +293,9 @@ class TestKDAChunkExponentDomain(CustomTestCase):
         cases = (
             ([129], False, False),
             ([15, 16, 17, 63, 65], True, True),
+            # 129 chunks x 2 heads = 258 CTAs > 256 -> _small_grid=False: exercises
+            # the standalone (non-fused) diagonal and recompute kernels.
+            ([2] * 129, True, False),
         )
         for lengths, use_varlen, fuse_gate in cases:
             with self.subTest(
