@@ -734,7 +734,7 @@ class Cosmos3TimestepPreparationStage(PipelineStage):
             return COSMOS3_I2V_FLOW_SHIFT
         if batch.preprocessed_video is not None:
             return COSMOS3_V2V_FLOW_SHIFT
-        return COSMOS3_EDGE_T2V_FLOW_SHIFT if is_edge else COSMOS3_T2V_FLOW_SHIFT
+        return COSMOS3_T2V_FLOW_SHIFT
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         """Prepare scheduler timesteps."""
