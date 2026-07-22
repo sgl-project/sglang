@@ -1,5 +1,5 @@
 import logging
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 import triton
@@ -376,13 +376,25 @@ def silu_and_mul_masked_post_quant_fwd(
     scale_ue8m0: bool = False,
     gemm1_alpha: float = 0.0,
     gemm1_clamp_limit: float = 0.0,
+    num_real_tokens: Optional[int] = None,
+    topk: Optional[int] = None,
 ):
-    """
-    input shape [expert_num, token_num_padded, hidden_dim]
-    output shape [expert_num, token_num_padded, hidden_dim // 2], dtype fp8
-    output_scale [expert_num token_num_paddded, hidden_dim // 2 // 128] dtype float32
-    quant_group_size  int,
-    masked_m shape [expert_num],
+    """Masked (EP-MoE) fused silu_and_mul + per-token-group fp8 quant.
+
+    input  [expert_num, token_num_padded, hidden_dim * 2]
+    output [expert_num, token_num_padded, hidden_dim], dtype fp8
+    masked_m [expert_num]
+
+    ``output_scale``'s dtype selects the scale format and kernel schedule:
+      float32 [E, token_num_padded, G]: row-major scales (rounded to powers of
+        two when ``scale_ue8m0``); token axis grid-strides over the padded dim.
+      int32 [E, G // 4, token_num_padded]: packed UE8M0, 4 exponent bytes per
+        int32 (deep_gemm's MN-major packed layout, no separate transform
+        needed). Requires ``scale_ue8m0``, ``G % 4 == 0``, and
+        ``num_real_tokens``/``topk`` to size the dense flat-work grid.
+
+    ``gemm1_alpha > 0`` switches the activation to the gpt-oss swiglu
+    ``min(gate, limit) * sigmoid(alpha * gate) * (clamp(up, +-limit) + 1)``.
     """
 
     assert input.is_contiguous()
@@ -394,6 +406,49 @@ def silu_and_mul_masked_post_quant_fwd(
 
     size_n = input.shape[-1] // 2
     assert size_n % quant_group_size == 0
+
+    finfo = torch.finfo(torch.float8_e4m3fn)
+    fp8_max = finfo.max
+    fp8_min = -fp8_max
+    gemm1_alpha = gemm1_alpha if gemm1_alpha is not None else 0.0
+    gemm1_clamp_limit = gemm1_clamp_limit if gemm1_clamp_limit is not None else 0.0
+
+    if output_scale.dtype == torch.int32:
+        assert scale_ue8m0, "packed int32 scales are UE8M0 by definition"
+        assert (
+            num_real_tokens is not None and topk is not None
+        ), "the packed schedule sizes its grid from num_real_tokens * topk"
+        E, m_max, _ = input.shape
+        G = size_n // quant_group_size
+        assert G % 4 == 0, "packed UE8M0 path requires num_groups % 4 == 0"
+        BLOCK_N = quant_group_size * 4
+        assert (
+            size_n % BLOCK_N == 0
+        ), "packed UE8M0 path requires size_n % (4*group) == 0"
+        hidden_dim_split = size_n // BLOCK_N
+        assert tuple(output_scale.shape) == (E, hidden_dim_split, m_max)
+
+        grid = (num_real_tokens * topk, hidden_dim_split)
+        _silu_and_mul_post_quant_packed_kernel[grid](
+            input,
+            *input.stride(),
+            output,
+            *output.stride(),
+            output_scale,
+            *output_scale.stride(),
+            masked_m,
+            E,
+            size_n,
+            fp8_max,
+            fp8_min,
+            QUANT_GROUP_SIZE=quant_group_size,
+            BLOCK_N=BLOCK_N,
+            GEMM1_ALPHA=gemm1_alpha,
+            GEMM1_CLAMP_LIMIT=gemm1_clamp_limit,
+            E_PADDED=triton.next_power_of_2(E),
+            num_warps=1,
+        )
+        return
 
     expert_num = len(masked_m)
 
@@ -421,10 +476,6 @@ def silu_and_mul_masked_post_quant_fwd(
         expert_num,
     )
 
-    finfo = torch.finfo(torch.float8_e4m3fn)
-    fp8_max = finfo.max
-    fp8_min = -fp8_max
-
     _silu_and_mul_post_quant_kernel[grid](
         input,
         *input.stride(),
@@ -441,8 +492,8 @@ def silu_and_mul_masked_post_quant_fwd(
         NUM_STAGE=NUM_STAGES,
         num_warps=num_warps,
         SCALE_UE8M0=scale_ue8m0,
-        GEMM1_ALPHA=gemm1_alpha if gemm1_alpha is not None else 0.0,
-        GEMM1_CLAMP_LIMIT=gemm1_clamp_limit if gemm1_clamp_limit is not None else 0.0,
+        GEMM1_ALPHA=gemm1_alpha,
+        GEMM1_CLAMP_LIMIT=gemm1_clamp_limit,
     )
     return
 
@@ -534,59 +585,6 @@ def _silu_and_mul_post_quant_packed_kernel(
         + token_index * stride_scale_m
     )
     tl.store(scale_ptr + scale_off, packed)
-
-
-def silu_and_mul_masked_post_quant_packed_fwd(
-    input: torch.Tensor,
-    output: torch.Tensor,
-    output_scale_packed: torch.Tensor,
-    quant_group_size: int,
-    masked_m: torch.Tensor,
-    num_real_tokens: int,
-    topk: int,
-    gemm1_alpha: float = 0.0,
-    gemm1_clamp_limit: float = 0.0,
-):
-    assert input.is_contiguous()
-    assert output.dtype == torch.float8_e4m3fn
-    assert output.is_contiguous()
-    assert input.dim() == 3 and input.shape[-1] % 2 == 0
-
-    E, m_max, _ = input.shape
-    size_n = input.shape[-1] // 2
-    assert size_n % quant_group_size == 0
-    G = size_n // quant_group_size
-    assert G % 4 == 0, "packed UE8M0 path requires num_groups % 4 == 0"
-    BLOCK_N = quant_group_size * 4
-    assert size_n % BLOCK_N == 0, "packed UE8M0 path requires size_n % (4*group) == 0"
-    hidden_dim_split = size_n // BLOCK_N
-    assert tuple(output_scale_packed.shape) == (E, hidden_dim_split, m_max)
-    assert output_scale_packed.dtype == torch.int32
-
-    finfo = torch.finfo(torch.float8_e4m3fn)
-    fp8_max = finfo.max
-
-    grid = (num_real_tokens * topk, hidden_dim_split)
-    _silu_and_mul_post_quant_packed_kernel[grid](
-        input,
-        *input.stride(),
-        output,
-        *output.stride(),
-        output_scale_packed,
-        *output_scale_packed.stride(),
-        masked_m,
-        E,
-        size_n,
-        fp8_max,
-        -fp8_max,
-        QUANT_GROUP_SIZE=quant_group_size,
-        BLOCK_N=BLOCK_N,
-        GEMM1_ALPHA=gemm1_alpha if gemm1_alpha is not None else 0.0,
-        GEMM1_CLAMP_LIMIT=gemm1_clamp_limit if gemm1_clamp_limit is not None else 0.0,
-        E_PADDED=triton.next_power_of_2(E),
-        num_warps=1,
-    )
-    return
 
 
 @triton.jit
