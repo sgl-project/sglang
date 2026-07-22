@@ -336,7 +336,7 @@ def prepare_moe_mxfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
             size_n, size_k = hidden_size, padded_intermediate_size
         assert weight.shape == (num_experts, size_n, size_k // 2)
 
-        tensor_list = []
+        output: torch.Tensor | None = None
         for i in range(num_experts):
             qweight = weight[i].view(torch.int32).T.contiguous()
             marlin_qweight = gptq_marlin_repack(
@@ -346,8 +346,15 @@ def prepare_moe_mxfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
                 size_n=size_n,
                 num_bits=4,
             )
-            tensor_list.append(marlin_qweight)
-        return torch.stack(tensor_list)
+            if output is None:
+                output = torch.empty(
+                    (num_experts, *marlin_qweight.shape),
+                    dtype=marlin_qweight.dtype,
+                    device=marlin_qweight.device,
+                )
+            output[i].copy_(marlin_qweight)
+        assert output is not None
+        return output
 
     def _permute_scales(scales: torch.Tensor, is_w13: bool) -> torch.Tensor:
         if is_w13:
