@@ -2140,13 +2140,16 @@ class NixlKVManager(CommonKVManager):
         if self.enable_staging:
             self._prefetch_staging_reqs(bootstrap_room)
 
-        # Transfer is async: just enqueue the chunk; the per-queue worker
-        # (transfer_worker) does the actual gather + RDMA. Routing by
-        # ``room % N`` keeps every chunk of a given room on the same
-        # worker -- and therefore on the same private staging buffer --
-        # which is required for the staging ring's offset/watermark
-        # state machine to advance correctly.
-        shard_idx = bootstrap_room % len(self.transfer_queues)
+        if bootstrap_room not in self.transfer_infos:
+            # Dummy rank or already cleared; nothing to enqueue.
+            return None
+
+        # Shard by destination (mirror mooncake): same dst endpoint(s) -> same
+        # worker, keeping a room's chunks on one private staging buffer.
+        session_port_sum = sum(
+            info.dst_port for info in self.transfer_infos[bootstrap_room].values()
+        )
+        shard_idx = session_port_sum % len(self.transfer_queues)
         self.transfer_queues[shard_idx].put(
             TransferKVChunk(
                 room=bootstrap_room,
