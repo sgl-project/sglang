@@ -1809,16 +1809,18 @@ class MMEncoder:
                 f"(shape={mm_data.shape}, element_size={self._element_size})"
             )
 
-            # MR was registered once in _run_forward and is shared across all
-            # sibling-TP /send calls;
-            mr_already_registered = (
-                self._forward_results.get(req_id, {}).get("mr_ptr")
-                == embedding.data_ptr()
-            )
-            if not mr_already_registered:
+            # Cache so sibling-TP /send calls reuse the same tensor and MR.
+            mm_data.cached_embedding = embedding
+
+            # Request-level shared MR, registered lazily on the first /send;
+            # deregistration is deferred to _cleanup_inflight_encode_state.
+            fwd_state = self._forward_results.setdefault(req_id, {})
+            mr_shared = fwd_state.get("mr_ptr") == embedding.data_ptr()
+            if not mr_shared:
                 self.engine.register(embedding.data_ptr(), embedding.nbytes)
+                fwd_state["mr_ptr"] = embedding.data_ptr()
             _t_xfer_start = time.monotonic()
-            await asyncio.to_thread(
+            xfer_ret = await asyncio.to_thread(
                 self.engine.transfer_sync,
                 session_id,
                 embedding.data_ptr(),
@@ -1830,14 +1832,18 @@ class MMEncoder:
                 encoder_metrics_collector.observe_transfer(
                     xfer_ms / 1000.0, backend="mooncake"
                 )
-            if not mr_already_registered:
-                self.engine.deregister(embedding.data_ptr())
-            # Only emit at INFO when transfer is slow or fell back
-            # to per-/send register;
-            if xfer_ms > 200.0 or not mr_already_registered:
+            if xfer_ret < 0:
+                raise InternalError(
+                    f"Mooncake transfer_sync failed for {req_id} "
+                    f"(session={session_id}, nbytes={embedding.nbytes}, "
+                    f"ret={xfer_ret})"
+                )
+            # Only emit at INFO when transfer is slow or the MR was
+            # registered lazily by this /send;
+            if xfer_ms > 200.0 or not mr_shared:
                 logger.info(
                     f"[{req_id}] mooncake transfer_sync={xfer_ms:.1f}ms "
-                    f"nbytes={embedding.nbytes} shared_mr={mr_already_registered}"
+                    f"nbytes={embedding.nbytes} shared_mr={mr_shared}"
                 )
 
             mm_data.embedding = None
