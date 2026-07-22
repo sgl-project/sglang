@@ -2,7 +2,7 @@
 
 import torch
 
-from sglang.jit_kernel.utils import (
+from sglang.kernels.jit.utils import (
     cache_once,
     is_arch_support_pdl,
     load_jit,
@@ -43,11 +43,10 @@ def fused_k_indexer_norm_rope(
     weight: torch.Tensor,
     bias: torch.Tensor,
     eps: float,
-    freqs_cis: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
     positions: torch.Tensor,
 ) -> torch.Tensor:
     """V3.2 indexer K: LayerNorm + RoPE on leading dims -> bf16. CUDA only."""
-    freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
     # k_input may be a non-contiguous wk slice; output is always contiguous.
     k_out = torch.empty(k_input.shape, dtype=k_input.dtype, device=k_input.device)
     module = _jit_k_indexer_norm_rope_module(k_input.dtype)
@@ -56,7 +55,7 @@ def fused_k_indexer_norm_rope(
         k_out,
         weight,
         bias,
-        freqs_real,
+        cos_sin_cache,
         positions,
         float(eps),
     )
@@ -70,13 +69,12 @@ def fused_k_indexer_norm_rope_store(
     weight: torch.Tensor,
     bias: torch.Tensor,
     eps: float,
-    freqs_cis: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
     positions: torch.Tensor,
     page_size: int,
 ) -> None:
     """V3.2 indexer K + fused store: LayerNorm + RoPE on leading dims + fp8
     act-quant + paged index-k cache write, in one launch. CUDA only."""
-    freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
     if not out_cache_loc.is_contiguous():
         out_cache_loc = out_cache_loc.contiguous()
     module = _jit_k_indexer_norm_rope_store_module(k_input.dtype, page_size)
@@ -86,7 +84,7 @@ def fused_k_indexer_norm_rope_store(
         out_cache_loc,
         weight,
         bias,
-        freqs_real,
+        cos_sin_cache,
         positions,
         float(eps),
     )

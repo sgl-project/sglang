@@ -6,6 +6,7 @@ export const config = {
 
   supportedHardware: [
     "h200", "b200", "gb300", "b300",
+    "mi355x", "mi325x", "mi300x",
   ],
 
   // Single released checkpoint — no size/mode split.
@@ -93,9 +94,9 @@ sgl-eval run aime25 \\
     b200:  "lmsysorg/sglang:latest",
     gb300: "lmsysorg/sglang:latest",
     b300:  "lmsysorg/sglang:latest",
-    // NVFP4 needs the dev image with modelopt_fp4 support (per-quant override).
-    "b300|nvfp4":  "lmsysorg/sglang:dev-glm52-nvfp4",
-    "gb300|nvfp4": "lmsysorg/sglang:dev-glm52-nvfp4",
+    mi355x: "lmsysorg/sglang-rocm:v0.5.13.post1-rocm720-mi35x-20260618",
+    mi325x: "lmsysorg/sglang-rocm:v0.5.13.post1-rocm700-mi30x-20260616",
+    mi300x: "lmsysorg/sglang-rocm:v0.5.13.post1-rocm700-mi30x-20260616",
   },
 
   github: {
@@ -106,14 +107,39 @@ sgl-eval run aime25 \\
 
     // ----- Card 1: "Attention Parallelism" -----
     // DSA prefill Context Parallelism (CP) splits the long-prefill attention across
-    // `cp` ranks — verified on Hopper (H200). On Blackwell the DSA-CP FP8 rope kernel
-    // is not yet adapted, so keep CP off there for now.
+    // `cp` ranks — runs on Hopper (H200) and Blackwell (B200/GB300/B300).
+    // CP sizes auto-gate in the engine to the runtime derivation
+    // attn_cp_size = tp/dp (a user-passed --attn-cp-size is overridden).
+    // CP is single-machine only (tp_size <= 8). Interleave CP + DP-Attention
+    // currently fails the runtime's dp_size == 1 assert but is allowed here
+    // with a warning (combined support is planned upstream).
+    // Strategy knob: interleave (ex round-robin-split) is the layout verified
+    // here and the default; zigzag (ex in-seq-split) is exposed as an
+    // experiment — the runtime auto-configures deepep + ep=tp for it and
+    // restricts it to batch_size=1 (long-context single-request runs).
     attention: {
       knobs: [
         { id: "tp", label: "TP", values: [null, 4, 8] },
-        { id: "cp", label: "CP (DSA prefill)", values: [null, 1, 2, 4, 8],
-          disable: { hw: ["b200", "gb300", "b300"] },
-          disableReason: "DSA prefill Context Parallel is verified on Hopper (H200); the Blackwell sm100 DSA-CP FP8 rope kernel is not yet adapted." },
+        { id: "cp", label: "CP (DSA prefill)",
+          values: [null, { value: 1, label: "Off" }, 4, 8],
+          disable: [
+            { when: { hw: ["mi355x", "mi325x", "mi300x"] },
+              reason: "The ROCm DSA-CP path is not yet validated on AMD (MI300X/MI325X/MI355X) — keep CP off there for now." },
+            { when: { nodes: ["multi-2"] },
+              reason: "Prefill Context Parallel is single-machine only (SGLang asserts tp_size <= 8; cross-machine CP has precision issues)." },
+          ] },
+        { id: "cpStrategy", label: "CP Strategy",
+          values: [
+            null,
+            "interleave",
+            { value: "zigzag", label: "zigzag (experimental)" },
+          ],
+          disable: [
+            { when: { hw: ["mi355x", "mi325x", "mi300x"] },
+              reason: "The ROCm DSA-CP path is not yet validated on AMD (MI300X/MI325X/MI355X) — keep CP off there for now." },
+            { when: { nodes: ["multi-2"] },
+              reason: "Prefill Context Parallel is single-machine only (SGLang asserts tp_size <= 8; cross-machine CP has precision issues)." },
+          ] },
         { id: "dpAttn", label: "DP-Attention",
           values: [null, false, 4, 8],
           labels: { "auto": "Auto", "false": "Off" } },
@@ -148,14 +174,59 @@ sgl-eval run aime25 \\
         { id: "off",     label: "Off (greedy)" },
         { id: "mtp-516", label: "EAGLE / MTP 5-1-6 (low-latency)",
           flags: ["--speculative-algorithm EAGLE", "--speculative-num-steps 5",
-                  "--speculative-eagle-topk 1", "--speculative-num-draft-tokens 6"] },
+                  "--speculative-eagle-topk 1", "--speculative-num-draft-tokens 6"],
+          disable: { hw: ["mi355x", "mi325x", "mi300x"] },
+          disableReason: "MTP/EAGLE speculative decoding is not yet validated on AMD ROCm (MI300X/MI325X/MI355X): the gfx950 spec-decode draft kernel is not yet validated and at --speculative-num-steps > 3 hits a separate build issue; the DSA nextn draft path is CUDA-only." },
         { id: "mtp-112", label: "EAGLE / MTP 1-1-2 (balanced)",
           flags: ["--speculative-algorithm EAGLE", "--speculative-num-steps 1",
-                  "--speculative-eagle-topk 1", "--speculative-num-draft-tokens 2"] },
+                  "--speculative-eagle-topk 1", "--speculative-num-draft-tokens 2"],
+          disable: { hw: ["mi355x", "mi325x", "mi300x"] },
+          disableReason: "MTP/EAGLE speculative decoding is not yet validated on AMD ROCm (MI300X/MI325X/MI355X): the gfx950 spec-decode draft kernel is not yet validated and at --speculative-num-steps > 3 hits a separate build issue; the DSA nextn draft path is CUDA-only." },
       ],
     },
 
-    // ----- Card 5: "Hierarchical KV Cache" -----
+    // ----- Card 5: "PD Disaggregation" -----
+    // GLM-5.2 is a DSA model (same family as DeepSeek-V3.2/V4) and supports
+    // prefill/decode disaggregation. Owns the `--disaggregation-*` flags; the
+    // engine also pins role-specific serving ports (spaced apart) so prefill +
+    // decode don't collide on one host.
+    pdDisagg: {
+      modes: [
+        { id: "off",     label: "Off" },
+        { id: "prefill", label: "Prefill role" },
+        { id: "decode",  label: "Decode role" },
+      ],
+      transferBackends: [
+        // Mooncake (recommended). The NCCL/MNNVL env is only needed on the
+        // NVLink-multinode Grace-Blackwell platform (GB300 here).
+        { id: "mooncake", label: "Mooncake",
+          env: [
+            "NCCL_MNNVL_ENABLE=1",
+            "NCCL_CUMEM_ENABLE=1",
+            "SGLANG_MOONCAKE_CUSTOM_MEM_POOL=True",
+            "MC_FORCE_MNNVL=1",
+          ],
+          envWhen: { hw: ["gb300"] } },
+        { id: "nixl",     label: "NiXL" },
+      ],
+      // No IB-device knob: mooncake auto-detects the HCA. Pass
+      // --disaggregation-ib-device only if discovery picks the wrong NIC
+      // (see Configuration Tips).
+      // Router fronting the prefill + decode roles; substitute <prefill-host>/<decode-host>.
+      router: {
+        port: 8000,
+        command:
+`python3 -m sglang_router.launch_router \\
+  --pd-disaggregation \\
+  --prefill http://<prefill-host>:{{PREFILL_PORT}} \\
+  --decode http://<decode-host>:{{DECODE_PORT}} \\
+  --host 0.0.0.0 --port {{ROUTER_PORT}} \\
+  --disable-circuit-breaker \\
+  --health-check-interval-secs 999999`,
+      },
+    },
+
+    // ----- Card 6: "Hierarchical KV Cache" -----
     hicache: {
       backends: [
         { id: null,       label: "Auto" },
@@ -613,25 +684,90 @@ sgl-eval run aime25 \\
     },
 
     // ====================================================================
-    // NVFP4 (Blackwell Ultra) — nvidia/GLM-5.2-NVFP4 (Model Optimizer). TP4.
-    // B300: low-latency + balanced (the 4-GPU GB300 node fits the ~381 GB build).
-    // GB300: low-latency / balanced / high-throughput measured on a single 4xGB300
-    // node — balanced & high-throughput add DP-Attention (dp4); low-latency uses MTP 5-1-6.
+    // NVFP4 — nvidia/GLM-5.2-NVFP4 (Model Optimizer). TP8 on B200/B300, TP4 on GB300.
+    // B200/B300: 8-GPU single node, TP8 (low-latency / balanced / high-throughput); balanced &
+    // high-throughput add DP-Attention (dp8). low-latency uses MTP 5-1-6, balanced MTP 2-1-3.
+    // GB300: 4-GPU single node, TP4 (the node fits the ~381 GB build); GB300 adds dp4 on
+    // balanced & high-throughput; low-latency uses MTP 5-1-6.
     // ====================================================================
     {
-      match: { hw: "b300", variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
+      match: { hw: "b200", variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
       verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--tp 4",
+        "--tp 8",
         "--quantization modelopt_fp4",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 5",
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 6",
         "--chunked-prefill-size 8192",
-        "--mem-fraction-static 0.8",
+        "--mem-fraction-static 0.85",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b200", variant: "default", quant: "nvfp4", strategy: "balanced", nodes: "single" },
+      verified: true,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
+        "--quantization modelopt_fp4",
+        "--dp 8",
+        "--enable-dp-attention",
+        // Shorter draft (MTP 2-1-3) than low-latency's 5-1-6: at this concurrency the
+        // verify overhead of a long draft outweighs the accept-length gain.
+        "--speculative-algorithm EAGLE",
+        "--speculative-num-steps 2",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 3",
+        // Larger chunked-prefill (32768 → ~4096/rank under dp8) is the dominant balanced lever.
+        "--chunked-prefill-size 32768",
+        "--mem-fraction-static 0.92",
+        "--max-running-requests 256",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b200", variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "single" },
+      verified: true,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
+        "--quantization modelopt_fp4",
+        "--dp 8",
+        "--enable-dp-attention",
+        "--chunked-prefill-size 32768",
+        "--mem-fraction-static 0.92",
+        "--max-running-requests 512",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b300", variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
+      verified: true,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
+        "--quantization modelopt_fp4",
+        "--speculative-algorithm EAGLE",
+        "--speculative-num-steps 5",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 6",
+        "--chunked-prefill-size 8192",
+        "--mem-fraction-static 0.85",
+        "--kv-cache-dtype fp8_e4m3",
+        "--bf16-gemm-backend cutedsl",
+        "--max-running-requests 16",
+        "--cuda-graph-max-bs 16",
+        "--max-prefill-tokens 8192",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -642,10 +778,40 @@ sgl-eval run aime25 \\
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--tp 4",
+        "--tp 8",
+        "--dp 8",
+        "--enable-dp-attention",
         "--quantization modelopt_fp4",
+        // Shorter draft (MTP 2-1-3) than low-latency's 5-1-6: at this concurrency the
+        // verify overhead of a long draft outweighs the accept-length gain.
+        "--speculative-algorithm EAGLE",
+        "--speculative-num-steps 2",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 3",
+        // Two required flags for DP-Attention + MTP here: `decode`-mode spec attention
+        // avoids a CUDA-graph capture deadlock, and max-running 256 lifts the default
+        // ~48-request throttle so DP-Attention can fill all 8 ranks.
+        "--speculative-attention-mode decode",
+        "--max-running-requests 256",
         "--chunked-prefill-size 8192",
-        "--mem-fraction-static 0.8",
+        "--mem-fraction-static 0.85",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b300", variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "single" },
+      verified: true,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
+        "--dp 8",
+        "--enable-dp-attention",
+        "--quantization modelopt_fp4",
+        "--max-running-requests 1024",
+        "--chunked-prefill-size 8192",
+        "--mem-fraction-static 0.85",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -664,6 +830,11 @@ sgl-eval run aime25 \\
         "--speculative-num-draft-tokens 6",
         "--chunked-prefill-size 8192",
         "--mem-fraction-static 0.85",
+        "--kv-cache-dtype fp8_e4m3",
+        "--bf16-gemm-backend cutedsl",
+        "--max-running-requests 16",
+        "--cuda-graph-max-bs 16",
+        "--max-prefill-tokens 8192",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -704,6 +875,278 @@ sgl-eval run aime25 \\
         "--chunked-prefill-size 8192",
         "--mem-fraction-static 0.92",
         "--max-running-requests 512",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    // ====================================================================
+    // AMD MI300X / MI325X / MI355X (ROCm) — TP8, DSA tilelang backend.
+    // No MTP: disabled in the Speculative card for AMD (the gfx950 spec-decode
+    // draft kernel is not yet validated, and num-steps>3 hits a separate build
+    // issue). Strategies differ only by batch-shaping levers
+    // (cuda-graph-max-bs / max-running-requests / chunked-prefill):
+    //   low-latency      — large chunked-prefill, default bs.
+    //   balanced         — chunked-prefill 32768 + bs128, max-running 80.
+    //   high-throughput  — bs256, max-running 256.
+    // ACCURACY: the earlier gfx950 block-FP8 bpreshuffle miscompile (GSM8K ~0) is
+    // fixed as of the pinned mi355x image (...-20260618); MI355X FP8 was re-validated
+    // (GSM8K ~0.96, NIAH 15/15 to ~118K) and all three FP8 strategies are benchmarked
+    // + marked verified:true (see glm-5.2-benchmarks.jsx). All BF16 and all gfx942
+    // (MI325X/MI300X) cells stay verified:false (not yet benchmarked, but correct).
+    // BF16 (~1.51 TB) only fits single-node on MI325X (2 TB) / MI355X (2.3 TB);
+    // MI300X (1.5 TB) needs multi-node, so its BF16 cells are omitted.
+    // ====================================================================
+    {
+      match: { hw: "mi355x", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
+      verified: true,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
+        "--dsa-prefill-backend tilelang",
+        "--dsa-decode-backend tilelang",
+        "--chunked-prefill-size 131072",
+        "--mem-fraction-static 0.80",
+        "--watchdog-timeout 1200",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "mi355x", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" },
+      verified: true,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
+        "--dsa-prefill-backend tilelang",
+        "--dsa-decode-backend tilelang",
+        "--chunked-prefill-size 32768",
+        "--mem-fraction-static 0.85",
+        "--cuda-graph-max-bs 128",
+        "--max-running-requests 80",
+        "--watchdog-timeout 1200",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "mi355x", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+      verified: true,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
+        "--dsa-prefill-backend tilelang",
+        "--dsa-decode-backend tilelang",
+        "--mem-fraction-static 0.85",
+        "--cuda-graph-max-bs 256",
+        "--max-running-requests 256",
+        "--watchdog-timeout 1200",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "mi355x", variant: "default", quant: "bf16", strategy: "low-latency", nodes: "single" },
+      verified: false,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
+        "--dsa-prefill-backend tilelang",
+        "--dsa-decode-backend tilelang",
+        "--chunked-prefill-size 131072",
+        "--mem-fraction-static 0.80",
+        "--watchdog-timeout 1200",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "mi355x", variant: "default", quant: "bf16", strategy: "balanced", nodes: "single" },
+      verified: false,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
+        "--dsa-prefill-backend tilelang",
+        "--dsa-decode-backend tilelang",
+        "--chunked-prefill-size 32768",
+        "--mem-fraction-static 0.85",
+        "--cuda-graph-max-bs 128",
+        "--max-running-requests 80",
+        "--watchdog-timeout 1200",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "mi355x", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      verified: false,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
+        "--dsa-prefill-backend tilelang",
+        "--dsa-decode-backend tilelang",
+        "--mem-fraction-static 0.85",
+        "--cuda-graph-max-bs 256",
+        "--max-running-requests 256",
+        "--watchdog-timeout 1200",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "mi325x", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
+      verified: false,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
+        "--dsa-prefill-backend tilelang",
+        "--dsa-decode-backend tilelang",
+        "--chunked-prefill-size 131072",
+        "--mem-fraction-static 0.80",
+        "--watchdog-timeout 1200",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "mi325x", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" },
+      verified: false,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
+        "--dsa-prefill-backend tilelang",
+        "--dsa-decode-backend tilelang",
+        "--chunked-prefill-size 32768",
+        "--mem-fraction-static 0.85",
+        "--cuda-graph-max-bs 128",
+        "--max-running-requests 80",
+        "--watchdog-timeout 1200",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "mi325x", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+      verified: false,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
+        "--dsa-prefill-backend tilelang",
+        "--dsa-decode-backend tilelang",
+        "--mem-fraction-static 0.85",
+        "--cuda-graph-max-bs 256",
+        "--max-running-requests 256",
+        "--watchdog-timeout 1200",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "mi325x", variant: "default", quant: "bf16", strategy: "low-latency", nodes: "single" },
+      verified: false,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
+        "--dsa-prefill-backend tilelang",
+        "--dsa-decode-backend tilelang",
+        "--chunked-prefill-size 131072",
+        "--mem-fraction-static 0.80",
+        "--watchdog-timeout 1200",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "mi325x", variant: "default", quant: "bf16", strategy: "balanced", nodes: "single" },
+      verified: false,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
+        "--dsa-prefill-backend tilelang",
+        "--dsa-decode-backend tilelang",
+        "--chunked-prefill-size 32768",
+        "--mem-fraction-static 0.85",
+        "--cuda-graph-max-bs 128",
+        "--max-running-requests 80",
+        "--watchdog-timeout 1200",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "mi325x", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      verified: false,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
+        "--dsa-prefill-backend tilelang",
+        "--dsa-decode-backend tilelang",
+        "--mem-fraction-static 0.85",
+        "--cuda-graph-max-bs 256",
+        "--max-running-requests 256",
+        "--watchdog-timeout 1200",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "mi300x", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
+      verified: false,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
+        "--dsa-prefill-backend tilelang",
+        "--dsa-decode-backend tilelang",
+        "--chunked-prefill-size 131072",
+        "--mem-fraction-static 0.80",
+        "--watchdog-timeout 1200",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "mi300x", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" },
+      verified: false,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
+        "--dsa-prefill-backend tilelang",
+        "--dsa-decode-backend tilelang",
+        "--chunked-prefill-size 32768",
+        "--mem-fraction-static 0.85",
+        "--cuda-graph-max-bs 128",
+        "--max-running-requests 80",
+        "--watchdog-timeout 1200",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "mi300x", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+      verified: false,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
+        "--dsa-prefill-backend tilelang",
+        "--dsa-decode-backend tilelang",
+        "--mem-fraction-static 0.85",
+        "--cuda-graph-max-bs 256",
+        "--max-running-requests 256",
+        "--watchdog-timeout 1200",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],

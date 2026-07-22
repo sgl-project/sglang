@@ -4,8 +4,8 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.jit_kernel.utils import cache_once, load_jit, make_cpp_args
 from sglang.kernel_api_logging import debug_kernel_api
+from sglang.kernels.jit.utils import cache_once, load_jit, make_cpp_args
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -18,7 +18,12 @@ def _jit_timestep_embedding_module(dtype: torch.dtype) -> Module:
         "timestep_embedding",
         *args,
         cuda_files=["diffusion/timestep_embedding.cuh"],
-        cuda_wrappers=[("timestep_embedding", f"timestep_embedding<{args}>")],
+        cuda_wrappers=[
+            (
+                "timestep_embedding",
+                f"sglang_timestep_embedding::timestep_embedding<{args}>",
+            )
+        ],
     )
 
 

@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.jit_kernel.utils import cache_once, load_jit, make_cpp_args
+from sglang.kernels.jit.utils import cache_once, load_jit, make_cpp_args
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -21,15 +21,6 @@ def _jit_module(dtype: torch.dtype) -> Module:
             ("moe_lora_merged_align", f"MoeLoraMergedAlignKernel<{args}>::run"),
         ],
     )
-
-
-def supports_merged_align(virtual_num_experts: int) -> bool:
-    """Commit-1 kernel only implements the (64, 1024] bucket-count branch.
-
-    The bucket count is virtual_num_experts + 1 (the +1 sentinel bucket). Other
-    regimes (small-batch <=64, v2 >1024) keep the old path."""
-    num_buckets = virtual_num_experts + 1
-    return 64 < num_buckets <= 1024
 
 
 def moe_lora_merged_align(

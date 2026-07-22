@@ -4,16 +4,18 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.kernels.ops.attention.dsa.dequant_k_cache import dequantize_k_cache_paged
+from sglang.kernels.ops.attention.utils import concat_and_cast_mha_k_triton
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.dsa.dequant_k_cache import dequantize_k_cache_paged
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
-from sglang.srt.layers.attention.utils import concat_and_cast_mha_k_triton
 from sglang.srt.layers.communicator import get_attn_tp_context
-from sglang.srt.layers.utils.dcp_utils import (
+from sglang.srt.layers.dcp import (
     all_gather_kv_cache_for_mha_chunk_extend,
     all_gather_kv_cache_for_mha_extend,
-    dcp_enabled,
     filter_dcp_local_kv_indices,
+)
+from sglang.srt.layers.quantization.fp8_utils import (
+    materialize_bpreshuffle_fp8_scale_tuple,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
@@ -28,7 +30,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _use_aiter_bpreshuffle_gfx95,
     _use_aiter_gfx95,
 )
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import BumpAllocator, get_bool_env_var, next_power_of_2
 
 _use_fp8_prefill_attn = (
@@ -48,7 +50,7 @@ elif _is_musa:
 if _use_aiter_gfx95:
     from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
 
-    from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
+    from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
     from sglang.srt.layers.quantization.rocm_mxfp4_utils import fused_rms_mxfp4_quant
 
 
@@ -57,6 +59,36 @@ def _resolve_attn_backend(forward_batch: ForwardBatch):
     if isinstance(backend, TboAttnBackend):
         backend = backend.primary
     return backend
+
+
+def _forward_dsa_indexer_for_mha(
+    indexer,
+    *,
+    hidden_states: torch.Tensor,
+    q_lora: torch.Tensor,
+    positions: torch.Tensor,
+    forward_batch: ForwardBatch,
+    layer_id: int,
+) -> None:
+    """Fill the indexer K cache and publish an MTP seed when requested."""
+    spec_info = forward_batch.spec_info
+    seed_buf = spec_info.dsa_seed_topk_capture if spec_info is not None else None
+    topk_indices = indexer(
+        x=hidden_states,
+        q_lora=q_lora,
+        positions=positions,
+        forward_batch=forward_batch,
+        layer_id=layer_id,
+        return_indices=seed_buf is not None,
+    )
+    if seed_buf is None:
+        return
+    if topk_indices is None:
+        raise RuntimeError("DSA MHA indexer did not produce the requested MTP seed")
+
+    select = spec_info.dsa_seed_topk_select
+    src = topk_indices if select is None else topk_indices[select]
+    seed_buf[: src.shape[0]].copy_(src)
 
 
 # Configs for DeepSeek-V3:
@@ -109,10 +141,9 @@ def _resolve_attn_backend(forward_batch: ForwardBatch):
 
 
 class DeepseekMHAForwardMixin:
-
     def init_mha_forward(self: DeepseekV2AttentionMLA):
         self.disable_chunked_prefix_cache = (
-            get_global_server_args().disable_chunked_prefix_cache
+            get_server_args().disable_chunked_prefix_cache
         )
 
         # TODO: Design a finer way to determine the threshold
@@ -159,8 +190,10 @@ class DeepseekMHAForwardMixin:
                         dtype_quant=torch.float8_e4m3fn,
                         res1=None,
                         output_unquantized_inp1=True,
-                        transpose_scale=_use_aiter_bpreshuffle_gfx95,
+                        transpose_scale=False,
                     )
+                    if _use_aiter_bpreshuffle_gfx95:
+                        q_quanted = materialize_bpreshuffle_fp8_scale_tuple(q_quanted)
                     q = self.q_b_proj(q_quanted)[0].view(
                         -1, self.num_local_heads, self.qk_head_dim
                     )
@@ -169,14 +202,15 @@ class DeepseekMHAForwardMixin:
                     q = self.q_b_proj(q_lora)[0].view(
                         -1, self.num_local_heads, self.qk_head_dim
                     )
-                _ = self.indexer(
-                    x=hidden_states,
-                    q_lora=q_lora,
-                    positions=positions,
-                    forward_batch=forward_batch,
-                    layer_id=self.layer_id,
-                    return_indices=False,
-                )
+                if self.should_run_indexer():
+                    _forward_dsa_indexer_for_mha(
+                        self.indexer,
+                        hidden_states=hidden_states,
+                        q_lora=q_lora,
+                        positions=positions,
+                        forward_batch=forward_batch,
+                        layer_id=self.layer_id,
+                    )
             elif _use_aiter_gfx95 and self.q_b_proj.weight.dtype == torch.uint8:
                 # MXFP4: fused RMSNorm + quant
                 q, _, _, _ = fused_rms_mxfp4_quant(
@@ -189,7 +223,6 @@ class DeepseekMHAForwardMixin:
                 )
                 q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
             elif _use_aiter_gfx95 and self.q_b_proj.weight.dtype == torch.float8_e4m3fn:
-
                 q, _, _, _ = fused_rms_fp8_group_quant(
                     q,
                     self.q_a_layernorm.weight,
@@ -201,8 +234,10 @@ class DeepseekMHAForwardMixin:
                     dtype_quant=torch.float8_e4m3fn,
                     res1=None,
                     output_unquantized_inp1=False,
-                    transpose_scale=_use_aiter_bpreshuffle_gfx95,
+                    transpose_scale=False,
                 )
+                if _use_aiter_bpreshuffle_gfx95:
+                    q = materialize_bpreshuffle_fp8_scale_tuple(q)
                 q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
             else:
                 q = self.q_a_layernorm(q)
@@ -219,7 +254,6 @@ class DeepseekMHAForwardMixin:
         latent_cache = latent_cache.unsqueeze(1)
 
         if _use_aiter_gfx95 and self.kv_b_proj.weight.dtype == torch.float8_e4m3fn:
-
             kv_a_quanted, kv_a, _, _ = fused_rms_fp8_group_quant(
                 kv_a,
                 self.kv_a_layernorm.weight,
@@ -231,8 +265,10 @@ class DeepseekMHAForwardMixin:
                 dtype_quant=torch.float8_e4m3fn,
                 res1=None,
                 output_unquantized_inp1=True,  # return unqaunt kv_a
-                transpose_scale=_use_aiter_bpreshuffle_gfx95,
+                transpose_scale=False,
             )
+            if _use_aiter_bpreshuffle_gfx95:
+                kv_a_quanted = materialize_bpreshuffle_fp8_scale_tuple(kv_a_quanted)
 
         else:
             kv_a = self.kv_a_layernorm(kv_a)
@@ -269,15 +305,15 @@ class DeepseekMHAForwardMixin:
                 self.use_dsa
                 and self.kv_cache_dtype == "fp8_e4m3"
                 and (
-                    not get_global_server_args().dsa_decode_backend == "trtllm"
-                    or not get_global_server_args().dsa_prefill_backend == "trtllm"
+                    not get_server_args().dsa_decode_backend == "trtllm"
+                    or not get_server_args().dsa_prefill_backend == "trtllm"
                 )
             ):
                 # FP8 path: dequantize DSA-specific FP8 format to BF16
                 kv_a, k_pe = self._get_mla_kv_buffer_from_fp8_for_dsa(forward_batch)
             else:
                 # BF16/FP16 path: directly fetch from cache
-                if dcp_enabled():
+                if get_parallel().dcp_enabled:
                     kv_a, k_pe = all_gather_kv_cache_for_mha_extend(
                         get_token_to_kv_pool(),
                         self.attn_mha,
@@ -425,7 +461,6 @@ class DeepseekMHAForwardMixin:
         accum_lse: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-
         # kv_b_proj needs BF16 input, but legacy q.dtype was BF16 by accident.
         backend = _resolve_attn_backend(forward_batch)
         pack_fn = getattr(backend, "pack_prefix_chunk_kv", None)
@@ -468,7 +503,17 @@ class DeepseekMHAForwardMixin:
                 k[..., : self.qk_nope_head_dim] = k_nope
                 k[..., self.qk_nope_head_dim :] = k_pe
 
-            output, lse = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
+            output, lse = self.attn_mha(
+                q,
+                k,
+                v,
+                forward_batch,
+                save_kv_cache=False,
+                # Prefix K/V is independent of the suffix query length. Under
+                # FullCG this is the fixed captured chunk extent; per-request
+                # active lengths remain encoded in the backend metadata.
+                key_value_num_tokens=k.shape[0],
+            )
             tmp_output = torch.empty_like(accum_output)
             tmp_lse = torch.empty_like(accum_lse)
             merge_state_v2(output, lse, accum_output, accum_lse, tmp_output, tmp_lse)

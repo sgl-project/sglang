@@ -11,8 +11,6 @@ Usage::
     # odd / non-power-of-two counts that the default sweep skips:
     python tests/test_custom_all_reduce.py --num-gpu 3
     python tests/test_custom_all_reduce.py --num-gpu 2,4,6,8
-    # Extra pytest args (forwarded to each torchrun worker):
-    python tests/test_custom_all_reduce.py -k bfloat16
 """
 
 from __future__ import annotations
@@ -28,17 +26,12 @@ from typing import List
 import pytest
 import torch
 import torch.distributed as dist
-import triton
 
 import sglang.srt.distributed.parallel_state as ps
-from sglang.jit_kernel.all_reduce import (
-    AllReduceAlgo,
-    _jit_custom_all_reduce_pull_module,
-    _jit_custom_all_reduce_push_module,
-)
+from sglang.jit_kernel.all_reduce import AllReduceAlgo, get_all_reduce_module
 from sglang.jit_kernel.mp import register_comm_cleanup
 from sglang.jit_kernel.tests.utils import multigpu_pytest_main
-from sglang.jit_kernel.utils import cache_once, get_ci_test_range
+from sglang.kernels.jit.utils import cache_once, get_ci_test_range
 from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
     CustomAllReduceV2,
 )
@@ -46,8 +39,10 @@ from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
     est_time=300,
-    suite="base-b-kernel-unit-8-gpu-h200",
+    stage="extra-b",
+    runner_config="8-gpu-h200",
 )
+# Nightly is not redundant here: it sets SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1 to expand get_ci_test_range sweeps.
 register_cuda_ci(
     est_time=300,
     suite="nightly-kernel-8-gpu-h200",
@@ -89,13 +84,12 @@ TEST_DTYPES = get_ci_test_range(TEST_DTYPES, [torch.bfloat16])
 
 
 def _compile_one(dtype: torch.dtype, world_size: int) -> None:
-    """Compile both (push, pull) variants for a single (dtype, world_size).
+    """Compile the all-reduce module for a single (dtype, world_size).
 
     Top-level so it survives ``spawn`` pickling. Compiled artifacts are
     cached on disk by ``tvm_ffi``; torchrun children will reuse them.
     """
-    _jit_custom_all_reduce_pull_module(dtype, world_size)
-    _jit_custom_all_reduce_push_module(dtype, world_size)
+    get_all_reduce_module(dtype, world_size)
 
 
 def _precompile_kernels(num_gpus: List[int]) -> None:
@@ -148,10 +142,16 @@ def _init_cpu_group_once() -> dist.ProcessGroup:
 
 @cache_once
 def _init_nccl_group_once() -> dist.ProcessGroup:
+    # Reference NCCL group allocated independently of the parallel_state
+    # world group, so the test does not couple to framework internals.
     _init_cpu_group_once()
-    coord = ps._WORLD
-    assert coord is not None and coord.device_group is not None
-    return coord.device_group
+    local_rank = int(os.environ["LOCAL_RANK"])
+    device_group = dist.new_group(
+        backend="nccl",
+        device_id=torch.device(f"cuda:{local_rank}"),
+    )
+    assert isinstance(device_group, dist.ProcessGroup)
+    return device_group
 
 
 @cache_once
@@ -161,7 +161,9 @@ def _init_comm_once() -> CustomAllReduceV2:
     max_size = max(TEST_SIZES) * max(
         torch.tensor([], dtype=d).element_size() for d in TEST_DTYPES
     )
-    comm = CustomAllReduceV2(cpu_group, device, max_size, max_size)
+    comm = CustomAllReduceV2(
+        cpu_group, device, max_pull_size=max_size, max_push_size=max_size
+    )
     if comm.disabled:
         raise RuntimeError("JIT CustomAllReduceV2 is disabled on this system")
     register_comm_cleanup(comm)
@@ -223,7 +225,10 @@ def test_custom_all_reduce(
         dist.all_reduce(out_ref, group=nccl_group)
         out_jit = run(inp)
         # Exact equality, since values are small integers within bf16 precision.
-        triton.testing.assert_close(out_ref, out_jit, atol=0, rtol=0)
+        # NOTE: use torch's assert_close: it compares on device (~2 ms here),
+        # while triton's converts to numpy on the host (~0.6 s per 32 MB
+        # tensor) and would dominate the test wall time.
+        torch.testing.assert_close(out_ref, out_jit, atol=0, rtol=0)
 
 
 if __name__ == "__main__":

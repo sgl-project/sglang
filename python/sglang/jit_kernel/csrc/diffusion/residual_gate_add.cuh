@@ -15,8 +15,9 @@
 #include <sgl_kernel/tensor.h>  // For host dtype helpers and TensorView metadata
 #include <sgl_kernel/utils.h>   // For RuntimeCheck and div_ceil
 
-#include <sgl_kernel/type.cuh>   // For dtype_trait conversions
+#include <sgl_kernel/type.cuh>   // For DTypeTrait conversions
 #include <sgl_kernel/utils.cuh>  // For LaunchKernel and CUDA dtype aliases
+#include <sgl_kernel/vec.cuh>    // For device::AlignedVector
 
 #include <cstdint>
 
@@ -98,16 +99,9 @@ __device__ __forceinline__ float to_float<bf16_t>(bf16_t v) {
 
 template <typename T>
 __device__ __forceinline__ T residual_gate_value(T residual, T update, T gate) {
-  const T product = dtype_trait<T>::from(to_float(update) * to_float(gate));
-  return dtype_trait<T>::from(to_float(residual) + to_float(product));
+  const T product = DTypeTrait<T>::from(to_float(update) * to_float(gate));
+  return DTypeTrait<T>::from(to_float(residual) + to_float(product));
 }
-
-template <typename T>
-union Vec16 {
-  static constexpr int kElems = 16 / sizeof(T);
-  uint4 raw;
-  T elems[kElems];
-};
 
 template <typename T, int kVec>
 __global__ void residual_gate_add_vec_kernel(
@@ -116,18 +110,18 @@ __global__ void residual_gate_add_vec_kernel(
     const T* __restrict__ gate,
     T* __restrict__ out,
     int64_t n_vec) {
+  using Vec = device::AlignedVector<T, kVec>;
   const int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
   for (int64_t v = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; v < n_vec; v += stride) {
-    const Vec16<T> r{.raw = reinterpret_cast<const uint4*>(residual)[v]};
-    const Vec16<T> u{.raw = reinterpret_cast<const uint4*>(update)[v]};
-    const Vec16<T> g{.raw = reinterpret_cast<const uint4*>(gate)[v]};
-
-    Vec16<T> o;
+    Vec r, u, g, o;
+    r.load(residual, v);
+    u.load(update, v);
+    g.load(gate, v);
 #pragma unroll
     for (int i = 0; i < kVec; ++i) {
-      o.elems[i] = residual_gate_value(r.elems[i], u.elems[i], g.elems[i]);
+      o[i] = residual_gate_value(r[i], u[i], g[i]);
     }
-    reinterpret_cast<uint4*>(out)[v] = o.raw;
+    o.store(out, v);
   }
 }
 
@@ -139,12 +133,14 @@ __global__ void residual_gate_add_bcast_row_tile_kernel(
     T* __restrict__ out,
     int64_t rows,
     int64_t row_vec) {
+  using Vec = device::AlignedVector<T, kVec>;
   const int64_t col_vec = static_cast<int64_t>(blockIdx.x) * kBcastColsVecPerBlock + threadIdx.x;
   if (col_vec >= row_vec) {
     return;
   }
 
-  const Vec16<T> g{.raw = SGLANG_LDG(reinterpret_cast<const uint4*>(gate) + col_vec)};
+  Vec g;
+  g.load(gate, col_vec);
 
   // Grid-stride over row tiles so the launch stays valid even when the number
   // of row tiles exceeds the gridDim.y hardware limit.
@@ -156,15 +152,14 @@ __global__ void residual_gate_add_bcast_row_tile_kernel(
       const int64_t row = row_base + row_offset;
       if (row < rows) {
         const int64_t v = row * row_vec + col_vec;
-        const Vec16<T> r{.raw = reinterpret_cast<const uint4*>(residual)[v]};
-        const Vec16<T> u{.raw = reinterpret_cast<const uint4*>(update)[v]};
-
-        Vec16<T> o;
+        Vec r, u, o;
+        r.load(residual, v);
+        u.load(update, v);
 #pragma unroll
         for (int i = 0; i < kVec; ++i) {
-          o.elems[i] = residual_gate_value(r.elems[i], u.elems[i], g.elems[i]);
+          o[i] = residual_gate_value(r[i], u[i], g[i]);
         }
-        reinterpret_cast<uint4*>(out)[v] = o.raw;
+        o.store(out, v);
       }
     }
   }

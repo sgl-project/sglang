@@ -22,6 +22,7 @@ _compiled_fn reused for every shape.
 
 from __future__ import annotations
 
+import warnings
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
@@ -34,7 +35,6 @@ from sglang.srt.compilation.compile_phase import (
     enable_torch_compile_warmup,
     set_pcg_capture_stream,
 )
-from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
@@ -49,6 +49,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 from sglang.srt.model_executor.runner_utils.pool import (
     get_or_create_global_graph_memory_pool,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_hip
 
 if TYPE_CHECKING:
@@ -61,6 +62,10 @@ if TYPE_CHECKING:
 
 
 _VALID_COMPILERS = ("eager", "inductor")
+
+
+def _suppress_lru_cache_dynamo_warning() -> None:
+    warnings.filterwarnings("ignore", message=".*lru_cache.*", module="torch._dynamo")
 
 
 def _toggle_multi_platform_ops(
@@ -95,6 +100,7 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
         self._language_model: torch.nn.Module = getattr(
             model_runner.model, "language_model", model_runner.model
         )
+        _suppress_lru_cache_dynamo_warning()
         self._run_compile_pass(cuda_graph_runner)
         # model_runner.model.forward is the wrapper that builds LogitsProcessorOutput.
         # The compiled trampoline is dispatched internally by it.
@@ -148,12 +154,17 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
         enable_torch_compile_warmup to drive FX / inductor through
         every shape without capturing cuda graphs yet."""
         language_model = self._language_model
+        # Some multimodal models (e.g. Gemma4) store the inner transformer
+        # directly as `language_model` rather than wrapping it in a
+        # ForCausalLM that has a `.model` child.  Fall back to the module
+        # itself when `.model` is absent.
+        inner_model = getattr(language_model, "model", language_model)
         compiler = self._compile_config.compiler
         with enable_tc_piecewise_cuda_graph():
             try:
                 if compiler != "eager":
                     _toggle_multi_platform_ops(
-                        language_model.model, reverse=False, num_tokens=16
+                        inner_model, reverse=False, num_tokens=16
                     )
 
                 cuda_graph_runner._run_dummy_forward(
@@ -167,7 +178,7 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
                 set_graph_pool_id(self._pool)
 
                 self.install_compile(
-                    language_model.model,
+                    inner_model,
                     compile_config=self._compile_config,
                     graph_pool=self._pool,
                 )
@@ -186,19 +197,25 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
                             tqdm.tqdm(
                                 list(reversed(cuda_graph_runner.capture_num_tokens))
                             )
-                            if get_tensor_model_parallel_rank() == 0
+                            if get_parallel().tp_rank == 0
                             else reversed(cuda_graph_runner.capture_num_tokens)
                         )
                         for num_tokens in compile_range:
-                            if get_tensor_model_parallel_rank() == 0:
+                            if get_parallel().tp_rank == 0:
                                 compile_range.set_description(
                                     f"Compiling num tokens ({num_tokens=})"
                                 )
                             cuda_graph_runner._run_dummy_forward(num_tokens=num_tokens)
-            finally:
-                _toggle_multi_platform_ops(
-                    language_model.model, reverse=True, num_tokens=16
+
+                # Qwen3-VL deepstack embeddings are produced only after
+                # visual encoding. First trace the tensor branch above, then
+                # execute it once outside the compile-warmup marker so its
+                # regular kernel/JIT warmup also happens during startup.
+                cuda_graph_runner.run_dummy_multimodal_deepstack_forward(
+                    inner_model, cuda_graph_runner.capture_num_tokens[-1]
                 )
+            finally:
+                _toggle_multi_platform_ops(inner_model, reverse=True, num_tokens=16)
 
     @contextmanager
     def capture_session(self, stream: torch.cuda.Stream):
@@ -214,7 +231,7 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
         self,
         shape_key: ShapeKey,
         forward_fn: Callable[[], Any],
-        dummies: Optional[Any] = None,
+        capture_inputs: Optional[Any] = None,
         post_warmup_hook: Optional[Callable[[], None]] = None,
     ) -> None:
         # Call 1 warms FX state; call 2 captures the cuda graph inside capture_session.
