@@ -226,6 +226,7 @@ jobs:
     uses: ./.github/workflows/pr-test-amd-extra.yml
     with:
       ref: ${{ inputs.pr_head_sha || inputs.ref || '' }}
+      runner_arch: mi300
       rocm_version: rocm720
       aiter_ref: ${{ inputs.aiter_ref }}
       continue_on_error: true
