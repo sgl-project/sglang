@@ -650,37 +650,59 @@ class GenerateReqInput:
 
     def _normalize_bootstrap_params(self, num):
         """Normalize bootstrap parameters for batch processing."""
+
+        def expand_bootstrap_list(values):
+            if len(values) == self.batch_size:
+                # Some routers only attach one value per original batch item.
+                return values * self.parallel_sample_num
+
+            # Some routers already expand bootstrap metadata for parallel samples.
+            return values
+
+        def expand_bootstrap_room_list(values):
+            if len(values) == self.batch_size:
+                # Expand per-original-request rooms to per-parallel-sample rooms.
+                # Rooms must differ across expanded requests to avoid PD transfer collisions.
+                return [
+                    room + sample_idx * self.batch_size if room is not None else None
+                    for sample_idx in range(self.parallel_sample_num)
+                    for room in values
+                ]
+
+            # Upstream already provided one room per expanded request.
+            return values
+
         # Normalize bootstrap_host
         if self.bootstrap_host is None:
             self.bootstrap_host = [None] * num
         elif not isinstance(self.bootstrap_host, list):
             self.bootstrap_host = [self.bootstrap_host] * num
-        elif isinstance(self.bootstrap_host, list):
-            self.bootstrap_host = self.bootstrap_host * self.parallel_sample_num
+        else:
+            self.bootstrap_host = expand_bootstrap_list(self.bootstrap_host)
 
         # Normalize bootstrap_port
         if self.bootstrap_port is None:
             self.bootstrap_port = [None] * num
         elif not isinstance(self.bootstrap_port, list):
             self.bootstrap_port = [self.bootstrap_port] * num
-        elif isinstance(self.bootstrap_port, list):
-            self.bootstrap_port = self.bootstrap_port * self.parallel_sample_num
+        else:
+            self.bootstrap_port = expand_bootstrap_list(self.bootstrap_port)
 
         # Normalize bootstrap_room
         if self.bootstrap_room is None:
             self.bootstrap_room = [None] * num
         elif not isinstance(self.bootstrap_room, list):
             self.bootstrap_room = [self.bootstrap_room + i for i in range(num)]
-        elif isinstance(self.bootstrap_room, list):
-            self.bootstrap_room = self.bootstrap_room * self.parallel_sample_num
+        else:
+            self.bootstrap_room = expand_bootstrap_room_list(self.bootstrap_room)
 
         # Normalize bootstrap_pair_key
         if self.bootstrap_pair_key is None:
             self.bootstrap_pair_key = [None] * num
         elif not isinstance(self.bootstrap_pair_key, list):
             self.bootstrap_pair_key = [self.bootstrap_pair_key] * num
-        elif isinstance(self.bootstrap_pair_key, list):
-            self.bootstrap_pair_key = self.bootstrap_pair_key * self.parallel_sample_num
+        else:
+            self.bootstrap_pair_key = expand_bootstrap_list(self.bootstrap_pair_key)
 
         # Normalize decode_tp_size
         if self.decode_tp_size is None:
