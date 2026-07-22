@@ -89,14 +89,14 @@ The following table summarizes quantization method support across NVIDIA and AMD
       <td>Yes</td>
       <td>Yes</td>
       <td>Yes</td>
-      <td>Uses Triton dequantize on AMD (vs. optimized CUDA kernels on NVIDIA). Uses CANN kernels on Ascend</td>
+      <td>Uses a JIT-compiled CUDA kernel on NVIDIA, Triton dequantize on AMD. Uses CANN kernels on Ascend</td>
     </tr>
     <tr>
       <td><code>gptq</code></td>
+      <td>No</td>
       <td>Yes</td>
       <td>Yes</td>
-      <td>Yes</td>
-      <td>Uses Triton or vLLM kernels on AMD. Uses CANN kernels on Ascend</td>
+      <td>Removed on NVIDIA GPUs — use <code>gptq_marlin</code> instead. Uses Triton or vLLM kernels on AMD. Uses CANN kernels on Ascend</td>
     </tr>
     <tr>
       <td><code>compressed-tensors</code></td>

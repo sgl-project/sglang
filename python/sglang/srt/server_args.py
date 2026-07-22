@@ -136,7 +136,6 @@ CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS = [
     "fa4",
     "flashmla",
     "cutedsl_mla",
-    "cutlass_mla",
     "trtllm_mla",
     "tokenspeed_mla",
 ]
@@ -201,7 +200,6 @@ ATTENTION_BACKEND_CHOICES = [
     "dsv4",
     "compressed",  # Deprecated alias for "dsv4"
     # NVIDIA specific
-    "cutlass_mla",
     "fa3",
     "fa4",
     "flashinfer",
@@ -210,7 +208,6 @@ ATTENTION_BACKEND_CHOICES = [
     "cutedsl_mla",
     "tokenspeed_mla",
     "trtllm_mha",
-    "dual_chunk_flash_attn",
     "hpc_ops",  # HPC-Ops (https://github.com/Tencent/hpc-ops), Hopper+, requires --page-size 64
     # AMD specific
     "aiter",
@@ -5360,7 +5357,6 @@ class ServerArgs:
         # its legacy slot; the interleaved non-attention adjustments stay.
         from sglang.srt.arg_groups.overrides import (
             _attention_backend_default,
-            _attention_backend_dual_chunk,
             _attention_backend_fa3_fp8_fallback,
             _attention_backend_platform_fallbacks,
             _fa4_page_constraint,
@@ -5456,15 +5452,6 @@ class ServerArgs:
 
         run_post_process_pass(self, _intel_xpu_page_constraint)
 
-        # Dual chunk flash attention backend
-        run_post_process_pass(self, _attention_backend_dual_chunk)
-        if resolved_view(self).attention_backend == "dual_chunk_flash_attn":
-            logger.warning(
-                "Mixed chunk and radix cache are disabled when using dual-chunk flash attention backend"
-            )
-            self.enable_mixed_chunk = False
-            self.disable_radix_cache = True
-
     def _handle_mxfp8_kv_cache_compatibility(self):
         """MXFP8 KV cache uses operands available only on SM100+ (Blackwell)."""
         if self.kv_cache_dtype != "mxfp8":
@@ -5506,7 +5493,6 @@ class ServerArgs:
                 if prefill_backend == "fa4":
                     if use_mla_backend:  # FA4 + MLA
                         KV4_FA4_MLA_BACKEND_CHOICES = [
-                            "cutlass_mla",
                             "flashinfer",
                             "trtllm_mla",
                         ]
@@ -5527,7 +5513,6 @@ class ServerArgs:
                 else:
                     if use_mla_backend:  # !FA4 + MLA
                         KV4_ATTENTION_MLA_BACKEND_CHOICES = [
-                            "cutlass_mla",
                             "flashinfer",
                             "trtllm_mla",
                         ]

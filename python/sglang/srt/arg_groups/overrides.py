@@ -1694,14 +1694,6 @@ def _mla_backend_page_constraints(view: Any) -> dict:
         )
         page_size = 64
     if (
-        view.attention_backend == "cutlass_mla"
-        or view.decode_attention_backend == "cutlass_mla"
-    ):
-        logger.warning(
-            "Cutlass MLA only supports a page_size of 128, change page_size to 128."
-        )
-        page_size = 128
-    if (
         view.attention_backend == "trtllm_mla"
         or view.decode_attention_backend == "trtllm_mla"
     ):
@@ -1903,23 +1895,6 @@ def _intel_xpu_page_constraint(view: Any) -> dict:
                 f"{msg} only supports page_sizes of {supported_page_sizes}, changing page_size from {view.page_size} to 128."
             )
             return {"page_size": 128}
-    return {}
-
-
-@register_post_process
-def _attention_backend_dual_chunk(view: Any) -> dict:
-    if (
-        getattr(view.get_model_config().hf_config, "dual_chunk_attention_config", None)
-        is not None
-    ):
-        if view.attention_backend is None:
-            logger.info("Dual chunk attention is turned on by default.")
-            return {"attention_backend": "dual_chunk_flash_attn"}
-        elif view.attention_backend != "dual_chunk_flash_attn":
-            raise ValueError(
-                "Dual chunk attention is enabled, but attention backend is set to "
-                f"{view.attention_backend}. Please set it to 'dual_chunk_flash_attn'."
-            )
     return {}
 
 

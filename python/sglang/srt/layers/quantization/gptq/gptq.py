@@ -632,18 +632,8 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
 
 # Register fake implementations for torch.compile support. The decorator is a
 # no-op when the custom op is unavailable on the current platform.
-@register_fake_if_exists("sgl_kernel::gptq_gemm")
-def _(a, b_q_weight, b_gptq_qzeros, b_gptq_scales, b_g_idx, use_shuffle, bit):
-    return a.new_empty((a.shape[0], b_q_weight.shape[-1]), dtype=a.dtype)
-
-
 @register_fake_if_exists("sgl_kernel::gptq_marlin_repack")
 def _(b_q_weight, perm, size_k, size_n, num_bits):
     return b_q_weight.new_empty(
         (size_k // 16, size_n * (num_bits // 2)), dtype=b_q_weight.dtype
     )
-
-
-@register_fake_if_exists("sgl_kernel::gptq_shuffle")
-def _(q_weight, q_perm, bit):
-    return

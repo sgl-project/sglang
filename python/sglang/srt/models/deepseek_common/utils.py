@@ -62,7 +62,6 @@ FORWARD_ABSORB_CORE_ATTENTION_BACKENDS = [
     "dsa",
     "nsa",  # Deprecated alias for "dsa"
     "flashinfer",
-    "cutlass_mla",
     "trtllm_mla",
     "cutedsl_mla",
     "tokenspeed_mla",
@@ -80,9 +79,10 @@ def awq_dequantize_func():
         - None if the current device is not supported.
     """
     if _is_cuda:
-        from sgl_kernel import awq_dequantize
+        from sglang.kernel_api_logging import debug_kernel_api
+        from sglang.kernels.ops.quantization.awq_dequantize import awq_dequantize
 
-        return awq_dequantize
+        return debug_kernel_api(awq_dequantize, op_name="DeepseekCommon.awq_dequantize")
     elif _is_hip:
         from sglang.kernel_api_logging import debug_kernel_api
         from sglang.kernels.ops.quantization.awq_triton import (
