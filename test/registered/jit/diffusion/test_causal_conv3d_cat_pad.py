@@ -3,13 +3,13 @@ import sys
 import pytest
 import torch
 
-from sglang.jit_kernel.diffusion.causal_conv3d_cat_pad import (
+from sglang.kernels.jit.utils import get_ci_test_range
+from sglang.kernels.ops.diffusion.causal_conv3d_cat_pad import (
     fused_causal_conv3d_cat_pad_cuda,
 )
-from sglang.jit_kernel.diffusion.triton.causal_conv3d_pad import (
+from sglang.kernels.ops.diffusion.triton.causal_conv3d_pad import (
     fused_causal_conv3d_cat_pad as fused_causal_conv3d_cat_pad_triton,
 )
-from sglang.jit_kernel.utils import get_ci_test_range
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=45, stage="base-b-kernel-unit", runner_config="1-gpu-large")

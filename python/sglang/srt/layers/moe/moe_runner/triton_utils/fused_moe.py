@@ -28,7 +28,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
 from sglang.srt.layers.moe.utils import get_moe_padding_size
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -473,6 +473,12 @@ def _fused_moe_kernel_sequence(
     topk = topk_ids.shape[1]
     compute_type = tl.bfloat16 if hidden_states.dtype == torch.bfloat16 else tl.float16
 
+    # LoRA hooks consume and update route-major intermediate buffers. The TMA
+    # down path keeps those buffers in expert-sorted, block-padded order, which
+    # is incompatible with the hook contract.
+    if hooks and (hooks.after_gate_up is not None or hooks.after_down is not None):
+        down_moe_use_tma = False
+
     padded_tokens = (
         min(num_tokens * topk, E + 1) * (config["BLOCK_SIZE_M"] - 1)
         if down_moe_use_tma
@@ -500,7 +506,7 @@ def _fused_moe_kernel_sequence(
             out_hidden_states = torch.empty_like(hidden_states)
 
     use_fused_moe_sum_all_reduce = (
-        get_server_args().enable_fused_moe_sum_all_reduce
+        get_exec().moe.enable_fused_moe_sum_all_reduce
         and (not no_combine)
         and (topk > 2)
         and (not use_int8_w8a16)
@@ -610,7 +616,7 @@ def _fused_moe_kernel_sequence(
 
             if not filter_expert:
                 if swiglu_limit_for_silu_and_mul_clamp is not None:
-                    from sglang.jit_kernel.dsv4 import silu_and_mul_clamp
+                    from sglang.kernels.ops.attention.dsv4 import silu_and_mul_clamp
 
                     silu_and_mul_clamp(
                         intermediate_cache1.view(-1, N),

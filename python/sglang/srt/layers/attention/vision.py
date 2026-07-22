@@ -15,7 +15,7 @@ from einops import rearrange
 from sglang.jit_kernel.norm import can_use_fused_inplace_qknorm as can_use_jit_qk_norm
 from sglang.srt.environ import envs
 from sglang.srt.models.utils import apply_qk_norm
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_exec, get_mm, get_parallel
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -46,11 +46,11 @@ _is_xpu = is_xpu()
 if _is_cuda:
     from flashinfer.prefill import cudnn_batch_prefill_with_kv_cache
 
-    from sglang.jit_kernel.flash_attention import flash_attn_varlen_func
+    from sglang.kernels.ops.attention.flash_attention import flash_attn_varlen_func
 
     def flash_attn_func(*args, ver: int = 3, **kwargs):
         if ver == 4:
-            from sglang.jit_kernel.flash_attention_v4 import (
+            from sglang.kernels.ops.attention.flash_attention_v4 import (
                 flash_attn_varlen_func as flash_attn_varlen_func_fa4,
             )
 
@@ -69,9 +69,7 @@ if _is_npu:
 if _is_xpu:
     from sgl_kernel.flash_attn import flash_attn_varlen_func
 
-from sglang.kernels.ops.attention.prefill_attention import (
-    context_attention_fwd,
-)
+from sglang.kernels.ops.attention.prefill_attention import context_attention_fwd
 from sglang.srt.distributed import (
     split_tensor_along_last_dim,
     tensor_model_parallel_all_gather,
@@ -86,7 +84,6 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.layers.rotary_embedding import apply_rotary_pos_emb
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_pos_emb_native_eager
-from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import add_prefix
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
@@ -803,11 +800,11 @@ class VisionAscendAttention(nn.Module):
              [b * s, h, head_size]
         """
         if forward_metadata is not None:
-            seq_lens = forward_metadata.seq_lens
-            if seq_lens.is_npu:
-                seq_lens = seq_lens.to("cpu")
+            # TND fused attention expects cumulative seqlens (cu_seqlens[1:]),
+            # not per-sequence lengths in forward_metadata.seq_lens.
+            cu = forward_metadata.cu_seqlens.to("cpu")
             output = torch.empty_like(q)
-            seq_len_arg = seq_lens.to(torch.int32)
+            seq_len_arg = cu[1:].to(torch.int32)
         elif envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get():
             if "output_ws" not in kwargs:
                 raise RuntimeError("output_ws should be prepared for npu-graph mode")
@@ -1045,7 +1042,7 @@ class VisionAttention(nn.Module):
         # Select attention backend via a unified method
         _passed_backend = qkv_backend
         qkv_backend = self._determine_attention_backend(_passed_backend)
-        if get_server_args().mm_attention_backend is None and _passed_backend is None:
+        if get_mm().mm_attention_backend is None and _passed_backend is None:
             print_info_once(f"Multimodal attention backend not set. Use {qkv_backend}.")
         print_info_once(f"Using {qkv_backend} as multimodal attention backend.")
 
@@ -1130,7 +1127,7 @@ class VisionAttention(nn.Module):
                 weight_dtype=torch.float32,
                 cast_x_before_out_mul=True,
             )
-            if get_server_args().rl_on_policy_target is not None
+            if get_exec().deterministic.rl_on_policy_target is not None
             else {}
         )
         q_norm = RMSNorm(
@@ -1159,7 +1156,7 @@ class VisionAttention(nn.Module):
         - Ascend NPU: "ascend_attn"
         - Other platforms: device-specific optimized backend or "sdpa"
         """
-        override_backend = get_server_args().mm_attention_backend
+        override_backend = get_mm().mm_attention_backend
         if override_backend is not None:
             backend = override_backend
         elif passed_backend is not None:
@@ -1266,7 +1263,7 @@ class VisionAttention(nn.Module):
             x = x.unsqueeze(0)
         assert x.dim() == 3, x.shape
         if (
-            get_server_args().rl_on_policy_target is not None
+            get_exec().deterministic.rl_on_policy_target is not None
             and position_embeddings is not None
         ):
             assert isinstance(position_embeddings, tuple), (

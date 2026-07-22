@@ -136,9 +136,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("sgl_per_token_quant_fp8(Tensor input, Tensor! output_q, Tensor! output_s) -> ()");
   m.impl("sgl_per_token_quant_fp8", torch::kCUDA, &sgl_per_token_quant_fp8);
 
-  m.def("dsv3_fused_a_gemm(Tensor! output, Tensor mat_a, Tensor mat_b) -> ()");
-  m.impl("dsv3_fused_a_gemm", torch::kCUDA, &dsv3_fused_a_gemm);
-
   /*
    * From csrc/gemm/gptq
    */
@@ -344,12 +341,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   /*
    * From FlashInfer
    */
-  m.def(
-      "bmm_fp8(Tensor A, Tensor B, Tensor! D, Tensor A_scale, Tensor B_scale, Tensor workspace_buffer, "
-      "int cublas_handle) -> ()",
-      {at::Tag::needs_fixed_stride_order});
-  m.impl("bmm_fp8", torch::kCUDA, &bmm_fp8);
-
   m.def("top_k_renorm_probs(Tensor probs, Tensor! renorm_probs, Tensor? maybe_top_k_arr, int top_k_val) -> ()");
   m.impl("top_k_renorm_probs", torch::kCUDA, &top_k_renorm_probs);
 
