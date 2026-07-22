@@ -97,14 +97,21 @@ def _fused_clear_c128_draft_states_kernel(
 
 
 class C128DraftCleanup:
-    """Validated fused cleanup for a pool-stable list of C128 states.
+    """Fused single-launch cleanup for a pool-stable list of C128 states.
 
-    The object strongly owns every state tensor and keeps its raw pointer table
-    private so their lifetime, dtype, count, and addresses cannot diverge through
-    the public API. Rebuild the object if any state tensor is reallocated.
+    Holds a strong reference to every state tensor so the raw ``data_ptr`` table
+    it caches cannot dangle (use-after-free). The addresses themselves are
+    assumed stable: rebuild the object if any state tensor is reallocated.
     """
 
-    __slots__ = ("_states", "_state_ptrs", "_ring_size", "_half")
+    __slots__ = (
+        "_states",
+        "_state_ptrs",
+        "_ring_size",
+        "_half",
+        "_grid_z",
+        "_triton_dtype",
+    )
 
     def __init__(self, states: Iterable[torch.Tensor], *, ring_size: int) -> None:
         states = tuple(states)
@@ -137,32 +144,28 @@ class C128DraftCleanup:
             )
 
         expected_shape = first_state.shape
-        expected_stride = first_state.stride()
         expected_dtype = first_state.dtype
         expected_device = first_state.device
-        for layer_id, state in enumerate(states):
-            if not state.is_cuda or state.device != expected_device:
+        # The kernel reinterprets each state's raw pointer with one shared
+        # dtype/width, so a divergent sibling would corrupt device memory
+        # silently rather than raise. Contiguity plus an equal shape pins the
+        # stride, so no separate stride check is needed.
+        for layer_id, state in enumerate(states[1:], start=1):
+            if (
+                not state.is_cuda
+                or state.device != expected_device
+                or state.dtype != expected_dtype
+                or state.shape != expected_shape
+                or not state.is_contiguous()
+            ):
                 raise ValueError(
-                    "C128 draft cleanup states must share one CUDA device, "
-                    f"layer {layer_id} is on {state.device}, "
-                    f"expected {expected_device}"
-                )
-            if state.dtype != expected_dtype:
-                raise ValueError(
-                    "C128 draft cleanup states must share one dtype, "
-                    f"layer {layer_id} uses {state.dtype}, expected {expected_dtype}"
-                )
-            if state.shape != expected_shape or state.stride() != expected_stride:
-                raise ValueError(
-                    "C128 draft cleanup states must share shape and stride, "
-                    f"layer {layer_id} has shape={tuple(state.shape)}, "
-                    f"stride={state.stride()}, "
-                    f"expected shape={tuple(expected_shape)}, "
-                    f"stride={expected_stride}"
-                )
-            if not state.is_contiguous():
-                raise ValueError(
-                    f"C128 draft cleanup state at layer {layer_id} is not contiguous"
+                    "C128 draft cleanup states must share one CUDA device, dtype "
+                    "and shape and be contiguous; "
+                    f"layer {layer_id} has device={state.device}, "
+                    f"dtype={state.dtype}, shape={tuple(state.shape)}, "
+                    f"contiguous={state.is_contiguous()}; expected "
+                    f"device={expected_device}, dtype={expected_dtype}, "
+                    f"shape={tuple(expected_shape)}"
                 )
 
         half = first_state.shape[1] // 2
@@ -174,6 +177,8 @@ class C128DraftCleanup:
                 f"{len(states)} states * {num_dim_blocks} blocks = {grid_z}"
             )
 
+        # _states is held only to keep the cached data_ptr table alive; nothing
+        # on the hot path reads it. Everything the launch needs is frozen here.
         self._states = states
         self._state_ptrs = torch.tensor(
             [state.data_ptr() for state in states],
@@ -182,6 +187,11 @@ class C128DraftCleanup:
         )
         self._ring_size = ring_size
         self._half = half
+        self._grid_z = grid_z
+        self._triton_dtype = {
+            torch.float32: tl.float32,
+            torch.bfloat16: tl.bfloat16,
+        }[expected_dtype]
 
     def clear(
         self,
@@ -195,12 +205,7 @@ class C128DraftCleanup:
         if num_draft_tokens <= 1 or req_pool_indices.numel() == 0:
             return
 
-        num_dim_blocks = triton.cdiv(self._half, _BLOCK_D)
-        grid = (
-            req_pool_indices.numel(),
-            num_draft_tokens,
-            len(self._states) * num_dim_blocks,
-        )
+        grid = (req_pool_indices.numel(), num_draft_tokens, self._grid_z)
         _fused_clear_c128_draft_states_kernel[grid](
             self._state_ptrs,
             req_pool_indices,
@@ -208,9 +213,7 @@ class C128DraftCleanup:
             accept_lens,
             ring_size=self._ring_size,
             half=self._half,
-            STATE_DTYPE=(
-                tl.float32 if self._states[0].dtype == torch.float32 else tl.bfloat16
-            ),
+            STATE_DTYPE=self._triton_dtype,
             BLOCK_D=_BLOCK_D,
             num_warps=4,
         )
