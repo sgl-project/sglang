@@ -46,9 +46,7 @@ from sglang.srt.layers.communicator import (
     ScatterMode,
 )
 from sglang.srt.layers.cp.utils import is_cp_v2_active
-from sglang.srt.layers.dp_attention import (
-    is_dp_attention_enabled,
-)
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -91,7 +89,11 @@ from sglang.srt.model_executor.cuda_graph_config import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.runtime_context import get_forward, get_parallel, get_server_args
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_forward,
+    get_parallel,
+)
 from sglang.srt.utils import (
     add_prefix,
     cpu_has_amx_support,
@@ -146,7 +148,7 @@ def can_fuse_shared_expert(
     Caller must still gate on the model/backend support flag.
     """
     if (
-        get_server_args().disable_shared_experts_fusion is True
+        get_exec().moe.disable_shared_experts_fusion is True
         or getattr(config, "shared_expert_intermediate_size", 0) <= 0
         or config.shared_expert_intermediate_size != config.moe_intermediate_size
         or get_moe_a2a_backend().is_deepep()
@@ -271,10 +273,10 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 else config.num_experts_per_tok + self.num_fused_shared_experts
             ),
             num_experts=(
-                config.num_experts + get_server_args().ep_num_redundant_experts
+                config.num_experts + get_exec().moe.ep_num_redundant_experts
                 if not self.enable_shared_expert_fusion
                 else config.num_experts
-                + get_server_args().ep_num_redundant_experts
+                + get_exec().moe.ep_num_redundant_experts
                 + self.num_fused_shared_experts
             ),
             hidden_size=config.hidden_size,
@@ -333,7 +335,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             # TODO: we will support tp < ep in the future
             self.ep_size = get_parallel().moe_ep_size
             self.num_experts = (
-                config.num_experts + get_server_args().ep_num_redundant_experts
+                config.num_experts + get_exec().moe.ep_num_redundant_experts
             )
             self.top_k = config.num_experts_per_tok
         self.is_nextn = is_nextn
@@ -429,7 +431,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                         shared_output,
                     )
                 elif _is_hip:
-                    from sglang.jit_kernel.triton.sigmoid_gate_mul import (
+                    from sglang.kernels.ops.moe.triton_sigmoid_gate_mul import (
                         sigmoid_gate_mul_broadcast,
                     )
 
@@ -1008,7 +1010,7 @@ class Qwen2MoeForCausalLM(nn.Module):
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("lm_head", prefix),
-            use_attn_tp_group=get_server_args().enable_dp_lm_head,
+            use_attn_tp_group=get_parallel().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
         # For EAGLE3 support

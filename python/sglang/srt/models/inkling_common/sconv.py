@@ -26,7 +26,7 @@ from sglang.srt.models.inkling_common.kernels.sconv import (
     save_intermediate_conv_windows,
     update_sconv_cache,
 )
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
 from sglang.srt.utils import is_cuda, set_weight_attrs
 
@@ -482,7 +482,7 @@ class ShortConvolution(nn.Module):
 
         crossed = track_step = None
         if do_tracking:
-            mamba_track_interval = get_server_args().mamba_track_interval
+            mamba_track_interval = get_exec().mamba.mamba_track_interval
             pre_seqlen = forward_batch.seq_lens[:batch_size] - draft_token_num
             post_seqlen = pre_seqlen + num_accept_tokens
             crossed = (pre_seqlen // mamba_track_interval) != (
@@ -814,7 +814,7 @@ def fused_gather_scatter_to_sconv_cache(
         and hidden_states.stride(-1) == 1
         and sconv_cache.stride(2) == 1
     ):
-        from sglang.jit_kernel.inkling_sconv import (
+        from sglang.kernels.ops.mamba.inkling_sconv import (
             fused_gather_scatter_to_sconv_cache as _cuda_gs,
         )
 
@@ -988,7 +988,7 @@ def fused_draft_extend_sconv_cache(
         and hidden_states.stride(-1) == 1
         and sconv_cache.stride(2) == 1
     ):
-        from sglang.jit_kernel.inkling_sconv import (
+        from sglang.kernels.ops.mamba.inkling_sconv import (
             fused_draft_extend_sconv_cache as _cuda_de,
         )
 

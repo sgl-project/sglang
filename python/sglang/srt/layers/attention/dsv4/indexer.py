@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from sglang.jit_kernel.dsv4 import (
+from sglang.kernels.ops.attention.dsv4 import (
     fused_q_indexer_rope_hadamard_fp4_quant,
     fused_q_indexer_rope_hadamard_quant,
     topk_transform_512,
@@ -28,16 +28,14 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.utils import add_prefix, is_cuda, is_hip, is_xpu
 from sglang.srt.utils.common import is_sm120_supported
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-    from sglang.srt.layers.attention.dsv4.compressor import (
-        CompressorBackendMixin,
-    )
+    from sglang.srt.layers.attention.dsv4.compressor import CompressorBackendMixin
     from sglang.srt.layers.quantization import QuantizationConfig
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -129,9 +127,7 @@ def _aiter_fp8_paged_mqa_logits(
     clean_logits: bool = False,
 ) -> torch.Tensor:
     """Wrapper adapting aiter's deepgemm_fp8_paged_mqa_logits to SGLang's interface."""
-    from aiter.ops.triton.attention.pa_mqa_logits import (
-        deepgemm_fp8_paged_mqa_logits,
-    )
+    from aiter.ops.triton.attention.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
 
     batch_size = q_fp8.shape[0]
     next_n = q_fp8.shape[1]
@@ -838,9 +834,8 @@ class C4Indexer(nn.Module):
         self.rotary_emb = rotary_emb
         self.freqs_cis = freqs_cis
         self.weight_scale: float = self.softmax_scale * self.n_heads**-0.5
-        from sglang.srt.runtime_context import get_server_args
 
-        self.use_fp4_indexer = get_server_args().enable_deepseek_v4_fp4_indexer
+        self.use_fp4_indexer = get_exec().kernel.enable_deepseek_v4_fp4_indexer
         self.alt_streams = alt_streams
 
     def compute_q(

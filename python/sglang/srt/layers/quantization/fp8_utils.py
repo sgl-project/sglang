@@ -13,7 +13,7 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
 )
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils.common import torch_release
 
 if TYPE_CHECKING:
@@ -34,7 +34,6 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
     w8a8_block_fp8_matmul_deepgemm,
     w8a8_block_fp8_matmul_triton,
 )
-from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import (
     ceil_align,
     ceil_div,
@@ -163,7 +162,7 @@ if _use_aiter:
 if _is_cuda:
     from sgl_kernel import fp8_scaled_mm
 
-    from sglang.jit_kernel.fp8_blockwise_gemm import fp8_blockwise_scaled_mm
+    from sglang.kernels.ops.gemm.fp8_blockwise_gemm import fp8_blockwise_scaled_mm
     from sglang.srt.utils.patch_torch import register_fake_if_exists
 
     @register_fake_if_exists("sgl_kernel::fp8_scaled_mm")
@@ -172,6 +171,36 @@ if _is_cuda:
         M = mat_a.shape[-2]
         N = mat_b.shape[-1]
         return mat_a.new_empty((M, N), dtype=out_dtype)
+
+    from flashinfer import bmm_fp8 as _raw_bmm_fp8_batched
+
+    @register_custom_op(op_name="flashinfer_bmm_fp8_batched", mutates_args=["out"])
+    def _bmm_fp8_batched_op(
+        A: torch.Tensor,
+        B: torch.Tensor,
+        out: torch.Tensor,
+        A_scale: torch.Tensor,
+        B_scale: torch.Tensor,
+    ) -> None:
+        _raw_bmm_fp8_batched(A, B, A_scale, B_scale, out.dtype, out)
+
+    def bmm_fp8(
+        A: torch.Tensor,
+        B: torch.Tensor,
+        A_scale: torch.Tensor,
+        B_scale: torch.Tensor,
+        dtype: torch.dtype,
+        out: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Batched (3D) per-tensor-scale FP8 matmul, via flashinfer's cuBLAS backend."""
+        if out is None:
+            out = torch.empty(
+                (A.shape[0], A.shape[1], B.shape[2]),
+                device=A.device,
+                dtype=dtype,
+            )
+        _bmm_fp8_batched_op(A, B, out, A_scale, B_scale)
+        return out
 
 
 use_triton_w8a8_fp8_kernel = get_bool_env_var("USE_TRITON_W8A8_FP8_KERNEL")
@@ -1440,9 +1469,7 @@ def requant_block_scale_ue8m0_for_deepgemm(
     scales are not already UE8M0, and DeepGEMM can run the layer (bf16 output,
     aligned shape). Returns True when it requantizes.
     """
-    from sglang.srt.model_loader.utils import (
-        should_deepgemm_weight_requant_ue8m0,
-    )
+    from sglang.srt.model_loader.utils import should_deepgemm_weight_requant_ue8m0
 
     if (
         not use_deepgemm_runner
@@ -1764,7 +1791,7 @@ def apply_fp8_linear(
         if (
             input_scale is not None
             and input_scale.numel() == 1
-            and get_server_args().cuda_graph_config.prefill.tc_compiler == "inductor"
+            and get_exec().graph.cuda_graph_config.prefill.tc_compiler == "inductor"
         ):
             qinput = (
                 (input_2d * input_scale.reciprocal())
