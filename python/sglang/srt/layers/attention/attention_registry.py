@@ -244,6 +244,23 @@ def create_trtllm_mha_backend(runner):
     return TRTLLMHAAttnBackend(runner)
 
 
+@register_attention_backend("hpc_ops")
+def create_hpc_ops_backend(runner):
+    if runner.use_mla_backend:
+        raise ValueError("hpc_ops backend can only be used with non-MLA models.")
+    if runner.model_config.is_encoder_decoder:
+        raise ValueError(
+            "Cross attention is not supported in the hpc_ops attention backend."
+        )
+    if runner.server_args.speculative_algorithm is not None:
+        raise ValueError(
+            "hpc_ops backend does not support speculative decoding for now."
+        )
+    from sglang.srt.layers.attention.hpc_ops_backend import HPCOpsAttnBackend
+
+    return HPCOpsAttnBackend(runner)
+
+
 @register_attention_backend("intel_amx")
 def create_intel_amx_backend(runner):
     from sglang.srt.layers.attention.intel_amx_backend import IntelAMXAttnBackend
@@ -283,6 +300,13 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         )
 
     if cfg := mambaish_config(runner.model_config):
+        from sglang.srt.configs.inkling import InklingMMConfig, InklingModelConfig
+
+        if isinstance(
+            runner.model_config.hf_config, (InklingModelConfig, InklingMMConfig)
+        ):
+            return full_attn_backend
+
         from sglang.kernels.ops.attention.fla.utils import check_environments
         from sglang.srt.layers.attention.linear.kda_backend import KDAAttnBackend
         from sglang.srt.layers.attention.linear.lightning_backend import (
@@ -291,7 +315,11 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         from sglang.srt.layers.attention.linear.utils import (
             initialize_linear_attn_config,
         )
-        from sglang.srt.utils import is_blackwell, is_npu
+        from sglang.srt.utils import (
+            is_blackwell,
+            is_npu,
+            is_sm120_supported,
+        )
 
         if not is_npu():
             from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
@@ -320,13 +348,25 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         hybrid_backend_cls = HybridLinearAttnBackend
         if hybrid_gdn_config(runner.model_config) is not None:
             if is_blackwell():
-                assert (
-                    runner.server_args.attention_backend == "triton"
-                    or runner.server_args.attention_backend == "trtllm_mha"
-                    or runner.server_args.attention_backend == "fa4"
-                    or runner.server_args.attention_backend == "flashinfer"
-                ), "triton, trtllm_mha, fa4, or flashinfer backend are the only supported backends on Blackwell GPUs for hybrid GDN models, use --attention-backend to specify the backend."
-            if is_npu():
+                if is_sm120_supported():
+                    allowed = {"triton", "trtllm_mha", "flashinfer"}
+                else:
+                    allowed = {"triton", "trtllm_mha", "fa4"}
+                attn_be = runner.server_args.attention_backend
+                prefill_be = runner.server_args.prefill_attention_backend
+                decode_be = runner.server_args.decode_attention_backend
+                # When using split prefill/decode backends, check each individually
+                if prefill_be and decode_be:
+                    assert prefill_be in allowed and decode_be in allowed, (
+                        f"Only {allowed} backends are supported on Blackwell GPUs for hybrid GDN models. "
+                        f"Got prefill={prefill_be}, decode={decode_be}."
+                    )
+                else:
+                    assert attn_be in allowed, (
+                        f"Only {allowed} backends are supported on Blackwell GPUs for hybrid GDN models. "
+                        f"Got attention_backend={attn_be}."
+                    )
+            elif is_npu():
                 assert (
                     runner.server_args.attention_backend == "ascend"
                 ), "ascend backend is the only supported backend on NPU for hybrid GDN models, use --attention-backend ascend to specify the backend."

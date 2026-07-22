@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Optional, Union
 import torch
 import triton
 
-from sglang.jit_kernel.fixup_zero_kv import fixup_zero_kv_rows
+from sglang.kernels.ops.attention.fixup_zero_kv import fixup_zero_kv_rows
 from sglang.kernels.ops.attention.pad import (
     pad_draft_extend_query as pad_draft_extend_query_triton,
 )
@@ -60,6 +60,35 @@ DEFAULT_WORKSPACE_SIZE_MB = 150  # Memory workspace size in MB
 # (128 / block_size). We capture the 128 constant here so we can
 # compute the LCM with other padding constraints.
 TRTLLM_BLOCK_CONSTRAINT = 128
+
+TRTLLM_MLA_MAX_BATCH_SIZE = 8192
+
+
+def _multi_ctas_kv_counter_bytes(
+    device: torch.device, num_q_heads: int, batch_size: int
+) -> int:
+    sm_count = flashinfer.utils.get_device_sm_count(device)
+    return flashinfer.utils.get_trtllm_gen_multi_ctas_kv_counter_bytes(
+        batch_size, num_q_heads, sm_count
+    )
+
+
+def make_persistent_multi_ctas_kv_counter_buffer(
+    device: torch.device, num_q_heads: int, max_batch_size: int
+) -> torch.Tensor:
+    num_bytes = _multi_ctas_kv_counter_bytes(
+        device, num_q_heads, max(TRTLLM_MLA_MAX_BATCH_SIZE, max_batch_size)
+    )
+    return torch.zeros(num_bytes, dtype=torch.uint8, device=device)
+
+
+def grow_multi_ctas_kv_counter_buffer_if_needed(
+    buffer: torch.Tensor, device: torch.device, num_q_heads: int, batch_size: int
+) -> torch.Tensor:
+    required_bytes = _multi_ctas_kv_counter_bytes(device, num_q_heads, batch_size)
+    if buffer.numel() >= required_bytes:
+        return buffer
+    return torch.zeros(required_bytes, dtype=torch.uint8, device=device)
 
 
 def _quantize_fp8_qkv(q, k, v, layer):
@@ -188,6 +217,14 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                     device=model_runner.device,
                 ),
             )
+
+        self._multi_ctas_kv_counter_buffer = (
+            make_persistent_multi_ctas_kv_counter_buffer(
+                torch.device(self.device),
+                self.num_q_heads,
+                max_batch_size=model_runner.max_running_requests,
+            )
+        )
 
         # CUDA graph state
         self.decode_cuda_graph_metadata = {}
@@ -384,8 +421,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         metadata = self.decode_cuda_graph_metadata[bs]
 
         if forward_mode.is_target_verify():
-            seq_lens = seq_lens[:bs] + self.num_draft_tokens
-            metadata.seq_lens_k.copy_(seq_lens)
+            # Intentional int64 -> int32 same-kind out= downcast.
+            torch.add(seq_lens[:bs], self.num_draft_tokens, out=metadata.seq_lens_k)
+            seq_lens = metadata.seq_lens_k
         elif forward_mode.is_draft_extend_v2():
             num_tokens_per_req = self.num_draft_tokens
             metadata.max_seq_len_q = num_tokens_per_req
@@ -416,7 +454,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         """Get the fill value for sequence lengths in CUDA graph."""
         return 1
 
-    def init_mha_chunk_metadata(self, forward_batch: ForwardBatch) -> None:
+    def init_mha_chunk_metadata(
+        self, forward_batch: ForwardBatch, disable_flashinfer_ragged: bool = False
+    ) -> None:
         has_prefix = any(forward_batch.extend_prefix_lens_cpu)
         fallback_to_flashinfer_impl = (
             self.disable_chunked_prefix_cache and has_prefix
@@ -514,11 +554,13 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 or forward_batch.forward_mode.is_draft_extend_v2()
             ):
                 self.forward_prefill_metadata = None
-            # Get maximum sequence length.
+            # Never read max_seq from the GPU tensor (.max().item() blocks the
+            # host on the stream backlog); max_seq only sizes the block table /
+            # scheduling hint, so the static context bound is a safe fallback.
             if getattr(forward_batch, "seq_lens_cpu", None) is not None:
                 max_seq = forward_batch.seq_lens_cpu.max().item()
             else:
-                max_seq = forward_batch.seq_lens.max().item()
+                max_seq = self.max_context_len
 
             seq_lens = forward_batch.seq_lens
 
@@ -637,6 +679,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             seq_lens if seq_lens.dtype == torch.int32 else seq_lens.to(torch.int32)
         )
         extra_kwargs = {"backend": self.backend} if self.backend != "trtllm-gen" else {}
+        if self.backend == "trtllm-gen":
+            extra_kwargs["multi_ctas_kv_counter_buffer"] = (
+                self._multi_ctas_kv_counter_buffer
+            )
         return flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
             query=query,
             kv_cache=kv_cache,

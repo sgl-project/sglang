@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from sglang.jit_kernel.dsv4 import (
+from sglang.kernels.ops.attention.dsv4 import (
     fused_q_indexer_rope_hadamard_fp4_quant,
     fused_q_indexer_rope_hadamard_quant,
     topk_transform_512,
@@ -173,6 +173,25 @@ def fp8_paged_mqa_logits_torch_sm120(
     batch_size, _, num_heads, head_dim = q_fp8.shape
     block_size = kvcache_fp8.shape[1]
     device = q_fp8.device
+
+    _QUERY_CHUNK = 1024
+    if batch_size > _QUERY_CHUNK:
+        return torch.cat(
+            [
+                fp8_paged_mqa_logits_torch_sm120(
+                    q_fp8[start : start + _QUERY_CHUNK],
+                    kvcache_fp8,
+                    weight[start : start + _QUERY_CHUNK],
+                    seq_lens[start : start + _QUERY_CHUNK],
+                    page_table[start : start + _QUERY_CHUNK],
+                    deep_gemm_metadata,
+                    max_seq_len,
+                    clean_logits=clean_logits,
+                )
+                for start in range(0, batch_size, _QUERY_CHUNK)
+            ],
+            dim=0,
+        )
 
     assert head_dim == 128, "Vectorized torch impl hardcodes DSV4 indexer head_dim=128"
     assert (

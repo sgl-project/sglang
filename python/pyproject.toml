@@ -30,20 +30,22 @@ dependencies = [
   "easydict",  # Required by remote model code (e.g. DeepSeek-OCR) loaded via trust_remote_code; validated by transformers 5.4+ check_imports
   "einops",
   "fastapi",
-  "flash-attn-4==4.0.0b15",
-  "flashinfer_python[cu13]==0.6.15", # keep it aligned with jit-cache version in Dockerfile
+  "flash-attn-4>=4.0.0b18",
+  "flashinfer_python[cu13]==0.6.15.post1", # keep it aligned with jit-cache version in Dockerfile
   "gguf",
+  "helion==0.2.6",
   "humming-kernels[cu13]==0.1.10",
   "interegular",
   "IPython",
   "kernels>=0.14.1,<0.15",
-  "llguidance>=0.7.11,<0.8.0",
+  "llguidance>=1.7.6,<2.0.0",
   "mistral_common>=1.11.5",
   "modelscope",
   "msgspec",
   "ninja",
+  "numba==0.65.1",
   "numpy",
-  "nvidia-cutlass-dsl[cu13]==4.5.2",
+  "nvidia-cutlass-dsl[cu13]==4.6.0",
   "nvidia-mathdx==25.6.0",
   "nvidia-ml-py",
   "openai==2.6.1",
@@ -60,13 +62,13 @@ dependencies = [
   "pydantic",
   "python-multipart",
   "pyzmq>=25.1.2",
-  "quack-kernels>=0.4.1",
+  "quack-kernels>=0.6.1",
   "requests",
   "scipy",
   "sentencepiece",
   "setproctitle",
   "sgl-deep-gemm==0.1.4.post1",
-  "sglang-kernel==0.4.4",
+  "sglang-kernel==0.4.5",
   "smg-grpc-servicer>=0.5.0",
   "soundfile==0.13.1",
   "tiktoken",
@@ -227,6 +229,12 @@ fallback_version = "0.0.0.dev0"
 target = "sglang.srt.grpc._core"
 path = "../rust/sglang-grpc/Cargo.toml"
 binding = "PyO3"
+
+[[tool.setuptools-rust.ext-modules]]
+target = "sglang.srt.multimodal._core"
+path = "../rust/sglang-mm/Cargo.toml"
+binding = "PyO3"
+debug = false
 
 [tool.kernels.dependencies]
 "kernels-community/sgl-flash-attn3" = 1

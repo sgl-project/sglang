@@ -8,11 +8,12 @@ from sglang.kernels.ops.embeddings.vocab_parallel_embedding import (
     vocab_parallel_embedding,
 )
 from sglang.srt.layers.vocab_parallel_embedding import get_masked_input_and_mask
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(
     est_time=10, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
 )
+register_amd_ci(est_time=10, stage="jit-kernel-benchmark", runner_config="amd")
 
 # Key order must match the perf_report x_names.
 DEFAULTS = dict(
