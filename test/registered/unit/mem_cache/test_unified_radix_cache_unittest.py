@@ -3422,6 +3422,45 @@ class UnifiedRadixCacheSuite:
         self._finish_pending_loads(cache)
         self._release_ongoing_load_back_locks(cache)
 
+    def test_load_back_success_copies_mamba_state_into_request_slot(self):
+        if not self.cfg.has_mamba or self.cfg.has_swa or self.cfg.page_size != 1:
+            self.skipTest("requires page_size=1 Full+Mamba")
+        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
+        chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 3)
+        if len(chain) < 3:
+            self.skipTest("chain too short")
+        leaf = chain[-1]
+
+        # Stamp the node's mamba state so the host backup carries it.
+        node_mamba_indices = leaf.component_data[ComponentType.MAMBA].value.clone()
+        self._fill_mamba_state(req_to_token_pool, node_mamba_indices, marker=11)
+        expected_temporal, expected_conv = self._snapshot_mamba_state(
+            req_to_token_pool, node_mamba_indices
+        )
+
+        self._backup_node(cache, leaf)
+        cache.evict(EvictParams(num_tokens=len(leaf.key)))
+        self.assertTrue(leaf.evicted)
+
+        req = self._make_req(req_to_token_pool)
+        req_to_token_pool.mamba_allocator.free(req.mamba_pool_idx.unsqueeze(0))
+        req.mamba_pool_idx = None
+
+        loaded = cache.load_back(leaf, req=req)
+        self.assertTrue(loaded)
+        self.assertIsNotNone(req.mamba_pool_idx)
+        self._finish_pending_loads(cache)
+
+        # The CoW slot must actually hold the backed-up mamba state, not merely exist.
+        actual_temporal, actual_conv = self._snapshot_mamba_state(
+            req_to_token_pool, req.mamba_pool_idx.unsqueeze(0)
+        )
+        self.assertTrue(torch.equal(actual_temporal, expected_temporal))
+        self.assertEqual(len(actual_conv), len(expected_conv))
+        for actual, expected in zip(actual_conv, expected_conv):
+            self.assertTrue(torch.equal(actual, expected))
+        self._release_ongoing_load_back_locks(cache)
+
     def test_prepare_load_back_mamba(self):
         if not self.cfg.has_mamba or self.cfg.has_swa or self.cfg.page_size != 1:
             self.skipTest("requires page_size=1 Full+Mamba")
@@ -3458,6 +3497,33 @@ class UnifiedRadixCacheSuite:
         self.assertIsNone(root.component_data[ComponentType.MAMBA].host_value)
         self.assertIsNone(comp.prepare_load_back(root, req=req2).allocated_mamba_slot)
         self.assertIsNone(req2.mamba_pool_idx)
+
+    def test_prepare_load_back_skips_device_present_node(self):
+        if not self.cfg.has_mamba or self.cfg.has_swa or self.cfg.page_size != 1:
+            self.skipTest("requires page_size=1 Full+Mamba")
+        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
+        chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 3)
+        if len(chain) < 3:
+            self.skipTest("chain too short")
+        leaf = chain[-1]
+        comp = cache.components[ComponentType.MAMBA]
+
+        # Back up without evicting: device value stays and a host copy is added, so build_hicache_transfers no-ops and prepare must not allocate a dead slot.
+        self._backup_node(cache, leaf)
+        cd = leaf.component_data[ComponentType.MAMBA]
+        self.assertIsNotNone(cd.value)
+        self.assertIsNotNone(cd.host_value)
+
+        req = self._make_req(req_to_token_pool)
+        req_to_token_pool.mamba_allocator.free(req.mamba_pool_idx.unsqueeze(0))
+        req.mamba_pool_idx = None
+        mamba_avail = req_to_token_pool.mamba_allocator.available_size()
+
+        self.assertIsNone(comp.prepare_load_back(leaf, req=req).allocated_mamba_slot)
+        self.assertIsNone(req.mamba_pool_idx)
+        self.assertEqual(
+            req_to_token_pool.mamba_allocator.available_size(), mamba_avail
+        )
 
     def test_prepare_load_back_mamba_pool_exhausted(self):
         if not self.cfg.has_mamba or self.cfg.has_swa or self.cfg.page_size != 1:
