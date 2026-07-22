@@ -1823,10 +1823,16 @@ class HiMambaRadixCache(MambaRadixCache):
         if self.mamba_host_lru_list.in_list(last_host_node):
             self.mamba_host_lru_list.remove_node(last_host_node)
 
+        last_hash_for_prefetch = (
+            last_host_node.hash_value[-1]
+            if last_host_node is not self.root_node
+            and last_host_node.hash_value
+            else last_hash
+        )
         operation = self.cache_controller.prefetch(
             req_id,
             new_input_tokens,
-            last_hash,
+            last_hash_for_prefetch,
             prefix_keys,
             extra_pools=extra_pools,
         )

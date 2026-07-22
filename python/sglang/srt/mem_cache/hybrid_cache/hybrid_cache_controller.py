@@ -610,7 +610,7 @@ class HybridCacheController(BaseHiCacheController):
                 kv_hit_pages=kv_hit_count, extra_pool_hit_pages={}
             )
 
-        kv_hit_pages = hit_result.kv_hit_pages
+        kv_hit_pages = hit_result.extra_pool_hit_pages.get(PoolName.KV, hit_result.kv_hit_pages)
         operation.pool_storage_result.update_kv_hit_pages(kv_hit_pages)
 
         return (
