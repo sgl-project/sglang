@@ -171,6 +171,9 @@ def apply_flashinfer_allreduce_fusion(batch_size: int):
         and batch_size <= FUSE_ALLREDUCE_MAX_BATCH_SIZE
         and not is_dp_attention_enabled()
         and get_server_args().flashinfer_allreduce_fusion_backend is not None
+        # The fused op can reduce over either the EP or MoE-TP group, not both.
+        # Hybrid EP+MoE-TP therefore needs the normal pair of all-reduces.
+        and not (get_parallel().moe_ep_size > 1 and get_parallel().moe_tp_size > 1)
         and not is_flashinfer_allreduce_unavailable()
     )
 
