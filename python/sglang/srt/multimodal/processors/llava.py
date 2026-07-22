@@ -90,6 +90,9 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
                     pixel_values = pixel_values.astype(np.float16)
 
                 return pixel_values, image_hash, image.size
+        except ValueError:
+            logger.error("Exception in TokenizerManager:\n" + get_exception_traceback())
+            raise
         except Exception:
             logger.error("Exception in TokenizerManager:\n" + get_exception_traceback())
 
