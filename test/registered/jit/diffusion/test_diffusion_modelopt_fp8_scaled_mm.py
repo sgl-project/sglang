@@ -17,7 +17,6 @@ from sglang.srt.layers.quantization.fp8_utils import (
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-large")
-register_cuda_ci(est_time=80, suite="nightly-kernel-1-gpu", nightly=True)
 
 DEVICE = "cuda"
 DTYPE = torch.bfloat16

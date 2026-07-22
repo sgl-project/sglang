@@ -105,6 +105,9 @@ class DecodeKVCacheOffloadManager:
         self.offload_inflight = {}
         logger.info("Enable offload kv cache for decode side")
 
+    def release_host_resources(self) -> None:
+        self.decode_host_mem_pool.destroy()
+
     def _mark_offload_started(self, rid):
         self.offload_inflight[rid] = self.offload_inflight.get(rid, 0) + 1
 
@@ -217,9 +220,9 @@ class DecodeKVCacheOffloadManager:
     def _check_offload_progress(self, finish_count):
         """Check the progress of offload from device to host."""
         while finish_count > 0:
-            _, finish_event, ack_list = self.cache_controller.ack_write_queue.pop(0)
-            finish_event.synchronize()
-            for ack_id in ack_list:
+            ack = self.cache_controller.ack_write_queue.pop(0)
+            ack.finish_event.synchronize()
+            for ack_id in ack.node_ids:
                 (
                     req,
                     host_indices,
@@ -255,7 +258,7 @@ class DecodeKVCacheOffloadManager:
         if req.req_pool_idx is None or req.req_pool_idx == -1:
             return
 
-        kv_committed_len = req.pop_committed_kv_cache()
+        kv_committed_len = req.effective_kv_committed_len()
 
         # Free the prefill-aligned slots. Previously this was done
         # eagerly in offload_kv_cache (mid-decode), which raced with
@@ -276,7 +279,7 @@ class DecodeKVCacheOffloadManager:
 
         # Free over-allocated KV cache slots (e.g. from speculative decoding v2).
         # Without spec v2, start_p == end_p so this is a no-op.
-        start_p, end_p = req.pop_overallocated_kv_cache()
+        start_p, end_p = kv_committed_len, req.kv.kv_allocated_len
         if self.page_size > 1:
             start_p = ceil_align(start_p, self.page_size)
         if start_p < end_p:
@@ -286,6 +289,7 @@ class DecodeKVCacheOffloadManager:
             self.token_to_kv_pool_allocator.free(overalloc_indices)
 
         self.req_to_token_pool.free(req)
+        req.kv = None
         self.tree_cache.protected_size_ -= len(req.prefix_indices)
         if req.rid in self.offloaded_state:
             del self.offloaded_state[req.rid]

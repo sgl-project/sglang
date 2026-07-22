@@ -643,7 +643,7 @@ class TestDSAIndexer(CustomTestCase):
         # preprocessed alongside the metadata (it asserts rather than silently
         # recomputing it) -- mirror what init_forward_metadata /
         # _build_forward_metadata_cuda_graph do.
-        from sglang.jit_kernel.dsv4.topk import plan_topk_v2
+        from sglang.kernels.ops.attention.dsv4.topk import plan_topk_v2
 
         attn_metadata = DSAMetadata(
             page_size=1,
@@ -720,7 +720,7 @@ class TestDSAIndexer(CustomTestCase):
         self.assertEqual(indexer.layer_id, self.config["layer_id"])
 
     @patch("sglang.srt.layers.attention.dsa.dsa_indexer.deep_gemm")
-    @patch("sglang.srt.layers.attention.dsa.triton_kernel.act_quant")
+    @patch("sglang.kernels.ops.attention.dsa.triton_kernel.act_quant")
     def test_forward_extend_mode(self, mock_act_quant, mock_deep_gemm):
         """Test indexer forward pass in extend mode."""
         if not self.supports_fp8:
@@ -802,7 +802,7 @@ class TestDSAIndexer(CustomTestCase):
         )
 
     @patch("sglang.srt.layers.attention.dsa.dsa_indexer.deep_gemm")
-    @patch("sglang.srt.layers.attention.dsa.triton_kernel.act_quant")
+    @patch("sglang.kernels.ops.attention.dsa.triton_kernel.act_quant")
     def test_forward_decode_mode(self, mock_act_quant, mock_deep_gemm):
         """Test indexer forward pass in decode mode."""
         if not self.supports_fp8:

@@ -111,8 +111,7 @@ inline void copy_stub(scalar_t* __restrict__ out, const float* __restrict__ inpu
   int64_t d;
 #pragma GCC unroll 4
   for (d = 0; d <= size - kVecSize; d += kVecSize) {
-    fVec data0 = fVec::loadu(input + d);
-    fVec data1 = fVec::loadu(input + d + fVec::size());
+    auto [data0, data1] = load_float_vec2(input + d);
     bVec out_vec = convert_from_float_ext<scalar_t>(data0, data1);
     out_vec.store(out + d);
   }
@@ -130,9 +129,7 @@ inline void copy_stub(float* __restrict__ out, const scalar_t* __restrict__ inpu
   int64_t d;
 #pragma GCC unroll 4
   for (d = 0; d <= size - kVecSize; d += kVecSize) {
-    fVec data0, data1;
-    bVec b_vec = bVec::loadu(input + d);
-    std::tie(data0, data1) = at::vec::convert_to_float(b_vec);
+    auto [data0, data1] = load_float_vec2(input + d);
     data0.store(out + d);
     data1.store(out + d + fVec::size());
   }
@@ -151,9 +148,9 @@ inline void copy_add_stub(
   int64_t d;
 #pragma GCC unroll 4
   for (d = 0; d <= size - kVecSize; d += kVecSize) {
-    fVec data0 = fVec::loadu(input + d) + fVec::loadu(bias + d);
-    fVec data1 = fVec::loadu(input + d + fVec::size()) + fVec::loadu(bias + d + fVec::size());
-    bVec out_vec = convert_from_float_ext<scalar_t>(data0, data1);
+    auto [data0, data1] = load_float_vec2(input + d);
+    auto [bias0, bias1] = load_float_vec2(bias + d);
+    bVec out_vec = convert_from_float_ext<scalar_t>(data0 + bias0, data1 + bias1);
     out_vec.store(out + d);
   }
   for (; d < size; ++d) {
@@ -171,7 +168,6 @@ inline void scalar_sigmoid_and_mul(
   using bVec = at::vec::Vectorized<scalar_t>;
   using fVec = at::vec::Vectorized<float>;
   // scalar sigmoid
-  const fVec one = fVec(1.f);
   fVec X;
   if constexpr (has_bias) {
     assert(bias != nullptr);
@@ -179,18 +175,13 @@ inline void scalar_sigmoid_and_mul(
   } else {
     X = fVec(input[0]);
   }
-  X = one / (one + X.neg().exp_u20());
+  X = fast_sigmoid(X);
 
   // vec mul
   constexpr int kVecSize = bVec::size();
   for (int d = 0; d < SIZE; d += kVecSize) {
-    bVec m_bvec = bVec::loadu(mul + d);
-    fVec m_fvec0, m_fvec1;
-    std::tie(m_fvec0, m_fvec1) = at::vec::convert_to_float(m_bvec);
-    m_fvec0 = m_fvec0 * X;
-    m_fvec1 = m_fvec1 * X;
-
-    bVec out_vec = convert_from_float_ext<scalar_t>(m_fvec0, m_fvec1);
+    auto [m_fvec0, m_fvec1] = load_float_vec2(mul + d);
+    bVec out_vec = convert_from_float_ext<scalar_t>(m_fvec0 * X, m_fvec1 * X);
     out_vec.store(out + d);
   }
 }

@@ -72,13 +72,16 @@ _use_aiter_gfx95 = _use_aiter and _is_gfx95_supported
 _use_aiter_bpreshuffle_gfx95 = _use_aiter_gfx95 and get_hip_version() >= (7, 2, 0)
 # gfx95 + ROCm < 7.2: bpreshuffle CK is disabled (above), and the non-bpreshuffle
 # fallback ck_gemm_a8w8_blockscale returns NaN above a per-shape M for some shapes
-# (measured NaN onset: (2560,4096)@M>=4096, (4096,1024)@M>=8192), corrupting prefill.
+# (measured NaN onset: (2560,4096)@M>=4096, (4096,1024)@M>=8192 at TP8; at TP4 the
+# attn proj (4608,4096)@M>=2048 and o_proj (4096,2048)@M>=4096), corrupting prefill.
 # Map each affected (n, k) to the largest M for which CK is confirmed correct
 # (conservative = last verified-safe M). Keep the faster CK path at/below that M and
 # fall back to the numerically-correct Triton FP8 GEMM above it. Fixed in ROCm 7.2.
 _AITER_GFX95_CK_W8A8_MAX_SAFE_M = {
     (2560, 4096): 2048,
     (4096, 1024): 4096,
+    (4096, 2048): 2048,  # TP4 o_proj (TP8 shape was (4096, 1024))
+    (4608, 4096): 512,  # TP4 attn qkv/gate proj: CK NaN at M>=2048 on ROCm 7.0
 }
 
 
@@ -161,7 +164,7 @@ if _use_aiter:
 if _is_cuda:
     from sgl_kernel import fp8_scaled_mm
 
-    from sglang.jit_kernel.fp8_blockwise_gemm import fp8_blockwise_scaled_mm
+    from sglang.kernels.ops.gemm.fp8_blockwise_gemm import fp8_blockwise_scaled_mm
     from sglang.srt.utils.patch_torch import register_fake_if_exists
 
     @register_fake_if_exists("sgl_kernel::fp8_scaled_mm")
@@ -170,6 +173,36 @@ if _is_cuda:
         M = mat_a.shape[-2]
         N = mat_b.shape[-1]
         return mat_a.new_empty((M, N), dtype=out_dtype)
+
+    from flashinfer import bmm_fp8 as _raw_bmm_fp8_batched
+
+    @register_custom_op(op_name="flashinfer_bmm_fp8_batched", mutates_args=["out"])
+    def _bmm_fp8_batched_op(
+        A: torch.Tensor,
+        B: torch.Tensor,
+        out: torch.Tensor,
+        A_scale: torch.Tensor,
+        B_scale: torch.Tensor,
+    ) -> None:
+        _raw_bmm_fp8_batched(A, B, A_scale, B_scale, out.dtype, out)
+
+    def bmm_fp8(
+        A: torch.Tensor,
+        B: torch.Tensor,
+        A_scale: torch.Tensor,
+        B_scale: torch.Tensor,
+        dtype: torch.dtype,
+        out: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Batched (3D) per-tensor-scale FP8 matmul, via flashinfer's cuBLAS backend."""
+        if out is None:
+            out = torch.empty(
+                (A.shape[0], A.shape[1], B.shape[2]),
+                device=A.device,
+                dtype=dtype,
+            )
+        _bmm_fp8_batched_op(A, B, out, A_scale, B_scale)
+        return out
 
 
 # Input scaling factors are no longer optional in _scaled_mm starting
@@ -275,7 +308,7 @@ _FP8_RUNNER_TO_KERNEL_BACKEND: dict = {
     Fp8GemmRunnerBackend.FLASHINFER_TRTLLM: KernelBackend.FLASHINFER_TRTLLM,
     Fp8GemmRunnerBackend.FLASHINFER_CUTLASS: KernelBackend.FLASHINFER_CUTLASS,
     Fp8GemmRunnerBackend.FLASHINFER_DEEPGEMM: KernelBackend.FLASHINFER_DEEPGEMM,
-    Fp8GemmRunnerBackend.CUTLASS: KernelBackend.CUDA_AOT,
+    Fp8GemmRunnerBackend.CUTLASS: KernelBackend.AOT,
     Fp8GemmRunnerBackend.AITER: KernelBackend.AITER,
     Fp8GemmRunnerBackend.TRITON: KernelBackend.TRITON,
 }
@@ -290,7 +323,7 @@ class Fp8BlockwiseGemmOp(BaseFusedOp):
     priority = (
         KernelBackend.DEEPGEMM,
         KernelBackend.FLASHINFER_TRTLLM,
-        KernelBackend.CUDA_AOT,
+        KernelBackend.AOT,
         KernelBackend.AITER,
         KernelBackend.TRITON,
     )
@@ -299,7 +332,7 @@ class Fp8BlockwiseGemmOp(BaseFusedOp):
         KernelBackend.FLASHINFER_TRTLLM: "FlashInfer TRTLLM blockwise FP8 GEMM (SM100/SM103).",
         KernelBackend.FLASHINFER_CUTLASS: "FlashInfer CUTLASS blockwise FP8 GEMM (SM120).",
         KernelBackend.FLASHINFER_DEEPGEMM: "FlashInfer DeepGEMM swapAB blockwise FP8 GEMM (SM90).",
-        KernelBackend.CUDA_AOT: "CUTLASS blockwise FP8 GEMM (sgl_kernel wheel, SM120 only; "
+        KernelBackend.AOT: "CUTLASS blockwise FP8 GEMM (sgl_kernel wheel, SM120 only; "
         "deprecated elsewhere in favor of DeepGEMM/FlashInfer TRTLLM).",
         KernelBackend.AITER: "AITER (CK / aiter-triton) blockwise FP8 GEMM (ROCm).",
         KernelBackend.TRITON: "Triton blockwise FP8 GEMM (fallback, widely compatible).",
@@ -314,7 +347,7 @@ class Fp8BlockwiseGemmOp(BaseFusedOp):
             return is_blackwell_supported() and is_flashinfer_available()
         if backend == KernelBackend.FLASHINFER_DEEPGEMM:
             return is_sm90_supported() and is_flashinfer_available()
-        if backend == KernelBackend.CUDA_AOT:
+        if backend == KernelBackend.AOT:
             # CUTLASS blockwise FP8 is deprecated on SM90/SM100 in favor of
             # DeepGEMM/FlashInfer TRTLLM; only SM120 still uses it.
             return is_sm120_supported()
@@ -355,7 +388,7 @@ class Fp8BlockwiseGemmOp(BaseFusedOp):
     def forward_flashinfer_deepgemm(self, *args, **kwargs) -> torch.Tensor:
         return flashinfer_deepgemm_w8a8_block_fp8_linear_with_fallback(*args, **kwargs)
 
-    def forward_cuda_aot(self, *args, **kwargs) -> torch.Tensor:
+    def forward_aot(self, *args, **kwargs) -> torch.Tensor:
         return cutlass_w8a8_block_fp8_linear_with_fallback(*args, **kwargs)
 
     def forward_aiter(self, *args, **kwargs) -> torch.Tensor:
@@ -1482,6 +1515,8 @@ def block_quant_dequant(
     block_n, block_k = block_size[0], block_size[1]
     *_, n, k = x_q_block.shape
 
+    # NOTE: This is very memory inefficient, results in *16384 memory requirement for scales
+    # with block_size = [128, 128].
     # ... n_scale k_scale -> ... (n_scale block_n) (k_scale block_k)
     x_scale_repeat = x_s.repeat_interleave(block_n, dim=-2).repeat_interleave(
         block_k, dim=-1
@@ -1818,9 +1853,9 @@ class Fp8PerTensorGemmOp(BaseFusedOp):
     """
 
     op = "gemm.fp8_pertensor"
-    priority = (KernelBackend.CUDA_AOT, KernelBackend.TRITON)
+    priority = (KernelBackend.AOT, KernelBackend.TRITON)
     descriptions = {
-        KernelBackend.CUDA_AOT: "CUTLASS per-tensor/per-channel FP8 GEMM (sgl_kernel fp8_scaled_mm).",
+        KernelBackend.AOT: "CUTLASS per-tensor/per-channel FP8 GEMM (sgl_kernel fp8_scaled_mm).",
         KernelBackend.TRITON: "Triton per-tensor/per-channel FP8 GEMM.",
     }
 
@@ -1843,7 +1878,7 @@ class Fp8PerTensorGemmOp(BaseFusedOp):
             output = output + bias
         return output.to(out_dtype)
 
-    def forward_cuda_aot(
+    def forward_aot(
         self,
         qinput: torch.Tensor,
         weight: torch.Tensor,
@@ -1887,7 +1922,7 @@ def apply_fp8_linear_flashinfer(
     input_scale: torch.Tensor,
     bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Per-tensor static fp8 linear via flashinfer bmm_fp8 (SM10X only)."""
+    """Per-tensor static fp8 linear via flashinfer bmm_fp8 (SM100/SM120 Blackwell)."""
     output_shape = [*input.shape[:-1], weight.shape[1]]
     input_2d = input.view(-1, input.shape[-1])
     qinput, x_scale = static_quant_fp8(input_2d, input_scale, repeat_scale=False)
@@ -2007,7 +2042,7 @@ def apply_fp8_linear(
         pertensor_backend = (
             KernelBackend.TRITON
             if (not cutlass_compatible_b or gemm_backend.is_triton())
-            else KernelBackend.CUDA_AOT
+            else KernelBackend.AOT
         )
         output = _FP8_PERTENSOR_GEMM.forward(
             qinput,

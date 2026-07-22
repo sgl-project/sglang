@@ -1,12 +1,13 @@
 """Layer-normalization kernels.
 
 Each operator is a :class:`~sglang.kernels.fused_op.BaseFusedOp` with a
-pure-``torch`` reference (``forward_native``) plus optimized CUDA backends,
+pure-``torch`` reference (``forward_native``) plus optimized per-device backends,
 all behind one signature. The public module-level functions are thin wrappers
-over module-level instances; auto-selection prefers the AOT ``sgl_kernel``
-implementation on CUDA and falls back to the native reference elsewhere.
+over module-level instances; auto-selection follows the production default for
+the live device: AOT ``sgl_kernel`` on CUDA, ``aiter`` (or rocm-triton for
+gemma) on ROCm, ``torch_npu`` on Ascend, native reference otherwise.
 Pick a specific backend with e.g.
-``_RMSNORM.forward(x, w, backend=KernelBackend.CUDA_JIT)`` or globally via
+``_RMSNORM.forward(x, w, backend=KernelBackend.JIT)`` or globally via
 ``SGLANG_FORCE_FUSED_OP_BACKEND``.
 """
 
@@ -25,10 +26,22 @@ if TYPE_CHECKING:
     import torch
 
 _NORM_DTYPES = ("float16", "bfloat16")
-_CUDA = CapabilityRequirement(requires_cuda=True)
+_CUDA = frozenset({CapabilityRequirement.CUDA})
+_HIP = frozenset({CapabilityRequirement.HIP})
+_NPU = frozenset({CapabilityRequirement.NPU})
+# Unlike the gated-activation ops, sgl_kernel does *not* build the rmsnorm ops
+# for ROCm (production: ``if _is_cuda or _is_xpu or _is_musa: from sgl_kernel
+# import rmsnorm`` — HIP is absent), so AOT here is CUDA-only. ROCm instead has
+# an ``aiter`` path, and Ascend a ``torch_npu`` path — a clean illustration that
+# the same ``AOT`` provenance covers different devices per op.
+# Priority (best -> fallback) is device-agnostic; per-op CapabilityRequirement
+# decides eligibility, so on CUDA this resolves to AOT, on HIP to AITER, on NPU
+# to TORCH_NPU, each matching the production default for that device.
 _NORM_PRIORITY = (
-    KernelBackend.CUDA_AOT,
-    KernelBackend.CUDA_JIT,
+    KernelBackend.AOT,
+    KernelBackend.JIT,
+    KernelBackend.AITER,
+    KernelBackend.TORCH_NPU,
     KernelBackend.TORCH,
 )
 
@@ -42,16 +55,20 @@ class RMSNormOp(BaseFusedOp):
     op = "layernorm.rmsnorm"
     priority = _NORM_PRIORITY
     capabilities = {
-        KernelBackend.CUDA_AOT: _CUDA,
-        KernelBackend.CUDA_JIT: _CUDA,
+        KernelBackend.AOT: _CUDA,
+        KernelBackend.JIT: _CUDA,
+        KernelBackend.AITER: _HIP,
+        KernelBackend.TORCH_NPU: _NPU,
     }
     format_signature = FormatSignature(
         supported_dtypes=_NORM_DTYPES,
         description="out = (x / RMS(x)) * weight; returns tensor",
     )
     descriptions = {
-        KernelBackend.CUDA_AOT: "RMS normalization (sgl_kernel wheel).",
-        KernelBackend.CUDA_JIT: "RMS normalization (sglang.jit_kernel).",
+        KernelBackend.AOT: "RMS normalization (sgl_kernel wheel).",
+        KernelBackend.JIT: "RMS normalization (sglang.jit_kernel).",
+        KernelBackend.AITER: "RMS normalization (aiter rmsnorm2d_fwd, ROCm).",
+        KernelBackend.TORCH_NPU: "RMS normalization (torch_npu, Ascend).",
         KernelBackend.TORCH: "RMS normalization (pure-torch reference).",
     }
 
@@ -74,7 +91,7 @@ class RMSNormOp(BaseFusedOp):
         out.copy_(result)
         return out
 
-    def forward_cuda_aot(
+    def forward_aot(
         self,
         input: torch.Tensor,
         weight: torch.Tensor,
@@ -86,7 +103,7 @@ class RMSNormOp(BaseFusedOp):
 
         return sgl_kernel.rmsnorm(input, weight, eps, out, enable_pdl)
 
-    def forward_cuda_jit(
+    def forward_jit(
         self,
         input: torch.Tensor,
         weight: torch.Tensor,
@@ -96,11 +113,45 @@ class RMSNormOp(BaseFusedOp):
     ) -> torch.Tensor:
         import torch
 
-        from sglang.jit_kernel.norm import rmsnorm as jit_rmsnorm
+        from sglang.kernels.ops.layernorm._jit_norm import rmsnorm as jit_rmsnorm
 
         if out is None:
             out = torch.empty_like(input)
         jit_rmsnorm(input, weight, out, eps)
+        return out
+
+    def forward_aiter(
+        self,
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float = 1e-6,
+        out: Optional[torch.Tensor] = None,
+        enable_pdl: Optional[bool] = None,
+    ) -> torch.Tensor:
+        import torch
+        from aiter import rmsnorm2d_fwd
+
+        # Mirrors production srt/layers/layernorm.py: rmsnorm2d_fwd(out, x, w, eps)
+        # writes the normalized result in-place into ``out`` (ROCm path).
+        if out is None:
+            out = torch.empty_like(input)
+        rmsnorm2d_fwd(out, input, weight, eps)
+        return out
+
+    def forward_npu(
+        self,
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float = 1e-6,
+        out: Optional[torch.Tensor] = None,
+        enable_pdl: Optional[bool] = None,
+    ) -> torch.Tensor:
+        import torch_npu
+
+        result = torch_npu.npu_rms_norm(input, weight, eps)[0]
+        if out is None:
+            return result
+        out.copy_(result)
         return out
 
 
@@ -114,8 +165,10 @@ class FusedAddRMSNormOp(BaseFusedOp):
     op = "layernorm.fused_add_rmsnorm"
     priority = _NORM_PRIORITY
     capabilities = {
-        KernelBackend.CUDA_AOT: _CUDA,
-        KernelBackend.CUDA_JIT: _CUDA,
+        KernelBackend.AOT: _CUDA,
+        KernelBackend.JIT: _CUDA,
+        KernelBackend.AITER: _HIP,
+        KernelBackend.TORCH_NPU: _NPU,
     }
     format_signature = FormatSignature(
         supported_dtypes=_NORM_DTYPES,
@@ -123,11 +176,15 @@ class FusedAddRMSNormOp(BaseFusedOp):
         description="residual += x; x = RMSNorm(residual) * weight",
     )
     descriptions = {
-        KernelBackend.CUDA_AOT: (
+        KernelBackend.AOT: (
             "Fused residual-add + RMS normalization (sgl_kernel wheel)."
         ),
-        KernelBackend.CUDA_JIT: (
+        KernelBackend.JIT: (
             "Fused residual-add + RMS normalization (sglang.jit_kernel)."
+        ),
+        KernelBackend.AITER: ("Fused residual-add + RMS normalization (aiter, ROCm)."),
+        KernelBackend.TORCH_NPU: (
+            "Fused residual-add + RMS normalization (torch_npu, Ascend)."
         ),
         KernelBackend.TORCH: (
             "Fused residual-add + RMS normalization (pure-torch reference)."
@@ -150,7 +207,7 @@ class FusedAddRMSNormOp(BaseFusedOp):
         normed = acc * torch.rsqrt(variance + eps)
         input.copy_((normed * weight).to(input.dtype))
 
-    def forward_cuda_aot(
+    def forward_aot(
         self,
         input: torch.Tensor,
         residual: torch.Tensor,
@@ -162,7 +219,7 @@ class FusedAddRMSNormOp(BaseFusedOp):
 
         return sgl_kernel.fused_add_rmsnorm(input, residual, weight, eps, enable_pdl)
 
-    def forward_cuda_jit(
+    def forward_jit(
         self,
         input: torch.Tensor,
         residual: torch.Tensor,
@@ -170,9 +227,46 @@ class FusedAddRMSNormOp(BaseFusedOp):
         eps: float = 1e-6,
         enable_pdl: Optional[bool] = None,
     ) -> None:
-        from sglang.jit_kernel.norm import fused_add_rmsnorm as jit_fused_add_rmsnorm
+        from sglang.kernels.ops.layernorm._jit_norm import (
+            fused_add_rmsnorm as jit_fused_add_rmsnorm,
+        )
 
         return jit_fused_add_rmsnorm(input, residual, weight, eps)
+
+    def forward_aiter(
+        self,
+        input: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float = 1e-6,
+        enable_pdl: Optional[bool] = None,
+    ) -> None:
+        import torch
+        from aiter import rmsnorm2d_fwd_with_add
+
+        # aiter writes the normalized value and the new residual into separate
+        # out buffers (production call order: out, x, residual_out, residual, w,
+        # eps); copy them back to honor this op's in-place contract.
+        out = torch.empty_like(input)
+        residual_out = torch.empty_like(residual)
+        rmsnorm2d_fwd_with_add(out, input, residual_out, residual, weight, eps)
+        input.copy_(out)
+        residual.copy_(residual_out)
+
+    def forward_npu(
+        self,
+        input: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float = 1e-6,
+        enable_pdl: Optional[bool] = None,
+    ) -> None:
+        import torch_npu
+
+        # torch_npu.npu_add_rms_norm(residual, x, w, eps) -> (normed, _, new_sum)
+        out, _, residual_out = torch_npu.npu_add_rms_norm(residual, input, weight, eps)
+        input.copy_(out)
+        residual.copy_(residual_out)
 
 
 class GemmaRMSNormOp(BaseFusedOp):
@@ -180,13 +274,24 @@ class GemmaRMSNormOp(BaseFusedOp):
 
     op = "layernorm.gemma_rmsnorm"
     priority = _NORM_PRIORITY
-    capabilities = {KernelBackend.CUDA_AOT: _CUDA}
+    # AOT (sgl_kernel) on CUDA; JIT is the ROCm rocm-triton path
+    # (sglang.kernels.ops.moe.minimax_m3_swiglu) — a JIT provenance pinned to HIP, distinct
+    # from the CUDA-only JIT on the plain rmsnorm ops; torch_npu on Ascend.
+    capabilities = {
+        KernelBackend.AOT: _CUDA,
+        KernelBackend.JIT: _HIP,
+        KernelBackend.TORCH_NPU: _NPU,
+    }
     format_signature = FormatSignature(
         supported_dtypes=_NORM_DTYPES,
         description="out = (x / RMS(x)) * (weight + 1); returns tensor",
     )
     descriptions = {
-        KernelBackend.CUDA_AOT: "Gemma-style RMS normalization (sgl_kernel wheel).",
+        KernelBackend.AOT: "Gemma-style RMS normalization (sgl_kernel wheel).",
+        KernelBackend.JIT: (
+            "Gemma-style RMS normalization (rocm-triton, sglang.jit_kernel)."
+        ),
+        KernelBackend.TORCH_NPU: ("Gemma-style RMS normalization (torch_npu, Ascend)."),
         KernelBackend.TORCH: "Gemma-style RMS normalization (pure-torch reference).",
     }
 
@@ -209,7 +314,7 @@ class GemmaRMSNormOp(BaseFusedOp):
         out.copy_(result)
         return out
 
-    def forward_cuda_aot(
+    def forward_aot(
         self,
         input: torch.Tensor,
         weight: torch.Tensor,
@@ -221,20 +326,64 @@ class GemmaRMSNormOp(BaseFusedOp):
 
         return sgl_kernel.gemma_rmsnorm(input, weight, eps, out, enable_pdl)
 
+    def forward_jit(
+        self,
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float = 1e-6,
+        out: Optional[torch.Tensor] = None,
+        enable_pdl: Optional[bool] = None,
+    ) -> torch.Tensor:
+        from sglang.kernels.ops.layernorm.minimax_m3_rmsnorm import (
+            gemma_rmsnorm as rocm_triton_gemma_rmsnorm,
+        )
+
+        result = rocm_triton_gemma_rmsnorm(input, weight, eps)
+        if out is None:
+            return result
+        out.copy_(result)
+        return out
+
+    def forward_npu(
+        self,
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float = 1e-6,
+        out: Optional[torch.Tensor] = None,
+        enable_pdl: Optional[bool] = None,
+    ) -> torch.Tensor:
+        import torch_npu
+
+        result = torch_npu.npu_gemma_rms_norm(input, weight, eps)[0]
+        if out is None:
+            return result
+        out.copy_(result)
+        return out
+
 
 class GemmaFusedAddRMSNormOp(BaseFusedOp):
     """In-place ``residual += input; input = GemmaRMSNorm(residual) * (weight + 1)``."""
 
     op = "layernorm.gemma_fused_add_rmsnorm"
     priority = _NORM_PRIORITY
-    capabilities = {KernelBackend.CUDA_AOT: _CUDA}
+    # AOT (sgl_kernel) on CUDA; JIT is the ROCm rocm-triton path on HIP.
+    # NPU here would use ``sgl_kernel_npu.add_gemma_rms_norm`` (a distinct AOT-npu
+    # wheel provenance, not torch_npu) — deferred until that provenance lands.
+    capabilities = {
+        KernelBackend.AOT: _CUDA,
+        KernelBackend.JIT: _HIP,
+    }
     format_signature = FormatSignature(
         supported_dtypes=_NORM_DTYPES,
         in_place=True,
         description="residual += x; x = GemmaRMSNorm(residual) * (weight + 1)",
     )
     descriptions = {
-        KernelBackend.CUDA_AOT: ("Gemma-style fused residual-add + RMS normalization."),
+        KernelBackend.AOT: ("Gemma-style fused residual-add + RMS normalization."),
+        KernelBackend.JIT: (
+            "Gemma-style fused residual-add + RMS normalization "
+            "(rocm-triton, sglang.jit_kernel)."
+        ),
         KernelBackend.TORCH: (
             "Gemma-style fused residual-add + RMS normalization "
             "(pure-torch reference)."
@@ -257,7 +406,7 @@ class GemmaFusedAddRMSNormOp(BaseFusedOp):
         normed = acc * torch.rsqrt(variance + eps)
         input.copy_((normed * (1.0 + weight.to(torch.float32))).to(input.dtype))
 
-    def forward_cuda_aot(
+    def forward_aot(
         self,
         input: torch.Tensor,
         residual: torch.Tensor,
@@ -270,6 +419,25 @@ class GemmaFusedAddRMSNormOp(BaseFusedOp):
         return sgl_kernel.gemma_fused_add_rmsnorm(
             input, residual, weight, eps, enable_pdl
         )
+
+    def forward_jit(
+        self,
+        input: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float = 1e-6,
+        enable_pdl: Optional[bool] = None,
+    ) -> None:
+        from sglang.kernels.ops.layernorm.minimax_m3_rmsnorm import (
+            gemma_fused_add_rmsnorm as rocm_triton_gemma_fused_add_rmsnorm,
+        )
+
+        # rocm-triton returns (normed, new_residual); honor the in-place contract.
+        norm_out, residual_out = rocm_triton_gemma_fused_add_rmsnorm(
+            input, residual, weight, eps
+        )
+        input.copy_(norm_out)
+        residual.copy_(residual_out)
 
 
 _RMSNORM = register_fused_op(RMSNormOp(), __name__, "_RMSNORM")

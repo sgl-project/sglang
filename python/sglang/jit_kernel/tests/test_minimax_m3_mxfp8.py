@@ -86,7 +86,7 @@ def test_minimax_swiglu_mxfp8_quant_matches_unfused_fp32(m, inter):
     # the reference is the unfused fp32 swiglu followed by MXFP8 quant. Not
     # bit-identical because the reference quant runs in torch vs the fused triton
     # path, but numerically equivalent (tight relerr, scales agree within 1 ulp).
-    from sglang.jit_kernel.minimax_m3 import (
+    from sglang.kernels.ops.moe.minimax_m3_swiglu import (
         swiglu_oai_mxfp8_quant,
         swiglu_oai_split,
     )

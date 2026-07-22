@@ -35,7 +35,8 @@ Add a new operation that scales each element of a tensor by a scalar factor:
 #include <sgl_kernel/utils.h>
 ```
 
-- **`host::RuntimeCheck(cond, args...)`** — Assert a condition at runtime; throws `PanicError` with file/line info on failure. Prefer this over bare `assert`.
+- **`CHECK_HOST(cond) << "msg " << value`** — **Preferred** runtime check: stream-style, throws `PanicError` with file/line info on failure. Zero overhead on the true path — the message expressions are only evaluated when the check fails.
+- **`host::RuntimeCheck(cond, args...)`** — Function-style alternative to `CHECK_HOST`. Note its message args are always evaluated (even when the check passes), so prefer `CHECK_HOST` — especially on hot paths.
 - **`host::Panic(args...)`** — Unconditionally throw a `PanicError` with a descriptive message.
 - **`host::div_ceil(a, b)`** — Integer ceiling division `(a + b - 1) / b`.
 - **`host::irange(n)`** / **`host::irange(start, end)`** — Range views for cleaner loops.
@@ -57,6 +58,7 @@ Add a new operation that scales each element of a tensor by a scalar factor:
   - Checks the CUDA error with file/line info after launch via `operator()(kernel, args...)`.
   - Supports `.enable_pdl(bool)` for PDL (Programmatic Dependent Launch, SM90+).
 - **`host::RuntimeDeviceCheck(cudaError_t)`** — Check a CUDA error; throw on failure.
+- **`CHECK_CUDA(expr) << "context"`** — Stream-style CUDA error check; evaluates `expr` once and throws `PanicError` with `cudaGetErrorString` + file/line info if it is not `cudaSuccess`. Extra streamed context is optional.
 
 ### `tensor.h` — Tensor validation (`TensorMatcher`, Symbolic types)
 
@@ -90,18 +92,21 @@ const size_t n = N.unwrap();
 const DLDevice dev = device.unwrap();
 ```
 
-### `type.cuh` — `dtype_trait<T>` and `packed_t<T>`
+### `type.cuh` — `DTypeTrait<T>`, `packed_t<T>`, and reduction traits
 
 ```cpp
 #include <sgl_kernel/type.cuh>
 ```
 
-- **`dtype_trait<T>`** — Static trait struct for each scalar type. Provides:
-  - `dtype_trait<T>::from(value)` — convert from another type (e.g. `fp32_t` → `fp16_t`)
-  - `dtype_trait<T>::abs/sqrt/rsqrt/exp/sin/cos(x)` — type-dispatched unary math (primarily for `fp32_t`)
-  - `dtype_trait<T>::max/min(x, y)` — type-dispatched binary math (primarily for `fp32_t`)
+- **`DTypeTrait<T>`** — Static trait struct, specialized for integral types, `fp32_t`, `fp16_t`, `bf16_t`, `fp8_e4m3_t`, and their packed x2/x4 variants. Provides:
+  - `DTypeTrait<T>::from(value)` — convert from another type via the right CUDA intrinsic (e.g. `fp32_t` → `fp16_t`)
+  - `DTypeTrait<T>::abs/max/min` — type-dispatched math (fp32, fp16/bf16 scalar and x2, integrals)
+  - `DTypeTrait<T>::sqrt/rsqrt/exp/sin/cos(x)` — `fp32_t` only
+  - Metadata: `packed_t` / `unpacked_t` / `kVecSize` (packed layout), `kFloatMax` (dtype max as float, e.g. 448.0f for fp8-e4m3), `kZeroBits`
 - **`packed_t<T>`** — Two-element packed alias: `packed_t<fp16_t>` = `fp16x2_t`, `packed_t<bf16_t>` = `bf16x2_t`, `packed_t<fp32_t>` = `fp32x2_t`. Use for vectorized loads/stores.
-- **`device::cast<To, From>(value)`** — Type-safe cast using `dtype_trait`, e.g. `cast<fp32x2_t, fp16x2_t>(v)`.
+- **`device::cast<To, From>(value)`** — Type-safe cast using `DTypeTrait`, e.g. `cast<fp32x2_t, fp16x2_t>(v)`.
+- **`device::unpack(value)`** — View a packed value as an `unpacked_t[kVecSize]` array reference (e.g. `fp32x2_t` → `fp32_t[2]`); element writes propagate back to the packed value.
+- **`device::ReductionOp` (`SUM`/`MAX`/`MIN`) and `device::ReductionTrait<Op, T>::reduce(x, y)`** — One binary reduction step, dispatched through `DTypeTrait` (packed types reduce elementwise). This is the engine behind `warp::reduce`; use it directly when writing custom reductions.
 
 ### `vec.cuh` — Vectorized memory access (`AlignedVector`)
 
@@ -135,8 +140,8 @@ For a **2D tile**, either flatten `(row, col)` into a linear tile index first, o
 #include <sgl_kernel/math.cuh>
 ```
 
-- `device::math::max/min<T>(a, b)` — type-dispatched binary math via `dtype_trait`
-- `device::math::abs/sqrt/rsqrt/exp/sin/cos<T>(x)` — type-dispatched unary math via `dtype_trait`
+- `device::math::max/min<T>(a, b)` — type-dispatched binary math via `DTypeTrait`
+- `device::math::abs/sqrt/rsqrt/exp/sin/cos<T>(x)` — type-dispatched unary math via `DTypeTrait`
 
 ### `warp.cuh` — Warp-level primitives
 
@@ -144,8 +149,8 @@ For a **2D tile**, either flatten `(row, col)` into a linear tile index first, o
 #include <sgl_kernel/warp.cuh>
 ```
 
-- `device::warp::reduce_sum<T>(value)` — warp-level sum reduction via `__shfl_xor_sync`
-- `device::warp::reduce_max<T>(value)` — warp-level max reduction
+- `device::warp::reduce<Op, kNumThreads, kInner>(value, active_mask)` — generic warp reduction via `__shfl_xor_sync`. `Op` is a `device::ReductionOp` (`SUM`/`MAX`/`MIN`); `kNumThreads` is a power-of-two group size (default 32 = full warp); `kInner=true` (default) reduces within each `kNumThreads`-sized group, `kInner=false` reduces across groups (lanes at the same offset in different groups).
+- `device::warp::reduce_sum/reduce_max/reduce_min<kNumThreads, kInner>(value)` — convenience wrappers over `reduce`. Work for any type with a `ReductionTrait`: floats, integers, and packed x2 types.
 
 ### `cta.cuh` — CTA-level primitives
 
@@ -203,8 +208,8 @@ The implementation fully uses the project abstractions described above:
 // NOTE: Comments for headers are not common in practice.
 // It is only shown here for tutorial purposes to highlight the key abstractions.
 #include <sgl_kernel/tensor.h>   // For TensorMatcher, SymbolicSize, SymbolicDevice
-#include <sgl_kernel/type.cuh>   // For dtype_trait, fp16_t, bf16_t, fp32_t
-#include <sgl_kernel/utils.h>    // For RuntimeCheck, div_ceil
+#include <sgl_kernel/type.cuh>   // For DTypeTrait, fp16_t, bf16_t, fp32_t
+#include <sgl_kernel/utils.h>    // For CHECK_HOST, div_ceil
 #include <sgl_kernel/utils.cuh>  // For LaunchKernel, SGL_DEVICE
 #include <sgl_kernel/vec.cuh>    // For AlignedVector
 
@@ -280,7 +285,7 @@ void scale(tvm::ffi::TensorView dst, tvm::ffi::TensorView src, float factor) {
   const uint32_t n = static_cast<uint32_t>(N.unwrap());
   const DLDevice device = device_.unwrap();
 
-  RuntimeCheck(n > 0, "scale: num_elements must be > 0, got ", n);
+  CHECK_HOST(n > 0) << "scale: num_elements must be > 0, got " << n;
 
   // 2. Choose vector width for 128-bit loads (16 bytes)
   //    fp16/bf16: 8 elements x 2 bytes = 16 bytes
@@ -316,10 +321,10 @@ void scale(tvm::ffi::TensorView dst, tvm::ffi::TensorView src, float factor) {
 - Use `TensorMatcher` for all tensor validation; never manually check shape/dtype/device
 - Use `AlignedVector` for vectorised 128-bit loads/stores — significant bandwidth win
 - Use `LaunchKernel` — it resolves the stream and checks errors automatically
-- Use `RuntimeCheck` for runtime assertions with useful error messages
+- Use `CHECK_HOST(cond) << ...` for runtime assertions with useful error messages (zero overhead when the check passes)
 - Prefer passing runtime scalars like `factor` directly unless compile-time specialisation is genuinely required
 - `fp16_t` / `bf16_t` / `fp32_t` are the project's type aliases (from `utils.cuh`)
-- `device::cast<To, From>` or `dtype_trait<T>::from(val)` for cross-type conversions
+- `device::cast<To, From>` or `DTypeTrait<T>::from(val)` for cross-type conversions
 - `device::math::` functions for device math instead of bare `__` intrinsics if possible.
 - Try to use `PDL` feature. In some cases, this will benefit the performance.
 
@@ -626,9 +631,9 @@ cd test && python3 run_suite.py --hw cuda --suite base-b-kernel-benchmark-test-1
 - `python/sglang/jit_kernel/include/sgl_kernel/utils.cuh` — type aliases, `LaunchKernel`, `SGL_DEVICE`
 - `python/sglang/jit_kernel/include/sgl_kernel/vec.cuh` — `AlignedVector`
 - `python/sglang/jit_kernel/include/sgl_kernel/tile.cuh` — `tile::Memory`
-- `python/sglang/jit_kernel/include/sgl_kernel/type.cuh` — `dtype_trait`, `packed_t`, `device::cast`
+- `python/sglang/jit_kernel/include/sgl_kernel/type.cuh` — `DTypeTrait`, `packed_t`, `device::cast`, `device::unpack`, `ReductionTrait`
 - `python/sglang/jit_kernel/include/sgl_kernel/math.cuh` — `device::math::`
-- `python/sglang/jit_kernel/include/sgl_kernel/warp.cuh` — `warp::reduce_sum/max`
+- `python/sglang/jit_kernel/include/sgl_kernel/warp.cuh` — `warp::reduce<Op>` and `reduce_sum/max/min` wrappers
 - `python/sglang/jit_kernel/include/sgl_kernel/cta.cuh` — `cta::reduce_max`
 - `python/sglang/jit_kernel/include/sgl_kernel/atomic.cuh` — `atomic::max`
 - `python/sglang/jit_kernel/include/sgl_kernel/runtime.cuh` — occupancy / SM count helpers
