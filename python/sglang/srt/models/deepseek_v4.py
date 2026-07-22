@@ -140,6 +140,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_gfx95_supported,
     is_gfx942_supported,
+    is_gfx1250_supported,
     log_info_on_rank0,
     make_layers,
 )
@@ -163,6 +164,12 @@ DEEPSEEK_V4_STACKED_PARAMS_MAPPING: List[Tuple[str, str, int]] = [
 
 
 def _is_fused_mhc_post_pre_enabled() -> bool:
+    # gfx1250: TileLang doesn't compile, but the fused cross-layer path can run
+    # entirely on the aiter Triton mhc_post_pre (try_fused_hc_post_pre). Gate only
+    # on SGLANG_OPT_FUSE_MHC_POST_PRE (default off) — every boundary routes to
+    # Triton below, so the TileLang switches don't apply here.
+    if is_gfx1250_supported():
+        return envs.SGLANG_OPT_FUSE_MHC_POST_PRE.get()
     # The fused path directly reuses TileLang mhc_post/mhc_pre kernels and their
     # tensor layout assumptions, so keep it disabled when either dependency is off.
     return (
@@ -179,9 +186,10 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _SHARED_EXPERT_LOCAL = get_bool_env_var("SGLANG_DP_SHARED_EXPERT_LOCAL")
 _is_gfx95_supported = is_gfx95_supported()
 _is_gfx942_supported = is_gfx942_supported()
+_is_gfx1250_supported = is_gfx1250_supported()
 
 if _use_aiter:
-    if _is_gfx95_supported:
+    if _is_gfx95_supported or _is_gfx1250_supported:
         from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
 
 
@@ -784,7 +792,7 @@ class MQALayer(MqaAttentionBase):
             qkv_a = None
 
         if self.use_fused_qk_norm_rope:
-            if _is_gfx95_supported:
+            if _is_gfx95_supported or _is_gfx1250_supported:
                 q_for_wqb, q_lora = _fused_rmsnorm_fp8_quant(
                     q_lora,
                     self.q_norm.weight,
@@ -883,7 +891,7 @@ class MQALayer(MqaAttentionBase):
         )
 
         if do_fused_store:
-            if _is_gfx95_supported:
+            if _is_gfx95_supported or _is_gfx1250_supported:
                 q_for_wqb, q_lora = _fused_rmsnorm_fp8_quant(
                     q_lora,
                     self.q_norm.weight,
@@ -1493,26 +1501,51 @@ class DeepseekV4DecoderLayer(nn.Module):
         use_fused = self.use_fused_mhc_post_pre
 
         if prev_residual is not None and use_fused:
-            residual, post, comb, hidden_states = mhc_fused_post_pre(
-                hidden_states,
-                prev_residual,
-                prev_post,
-                prev_comb,
-                self.hc_attn_fn,
-                self.hc_attn_scale,
-                self.hc_attn_base,
-                self.rms_norm_eps,
-                self.hc_eps,
-                self.hc_eps,
-                _MHC_POST_MULT_VALUE,
-                self.hc_sinkhorn_iters,
-                norm_weight=(
-                    self._input_layernorm_weight_bf16
-                    if self._input_layernorm_weight_bf16 is not None
-                    else self.input_layernorm.weight.data
-                ),
-                norm_eps=self.input_layernorm.variance_epsilon,
+            fused_mhc = (
+                try_fused_hc_post_pre(
+                    hidden_states,
+                    prev_residual,
+                    prev_post,
+                    prev_comb,
+                    self.hc_attn_fn.T,
+                    self.hc_attn_scale,
+                    self.hc_attn_base,
+                    self.hc_mult,
+                    self.rms_norm_eps,
+                    self.hc_eps,
+                    _MHC_POST_MULT_VALUE,
+                    self.hc_sinkhorn_iters,
+                    _is_gfx1250_supported,
+                )
+                if _is_gfx1250_supported
+                else None
             )
+            if fused_mhc is not None:
+                # aiter mhc_post_pre does NOT fold the transformer input_layernorm
+                # (norm_fused=False), so apply it here; TileLang folds it internally.
+                residual, hidden_states, post, comb, _nf = fused_mhc
+                hidden_states = self.input_layernorm(hidden_states)
+            else:
+                residual, post, comb, hidden_states = mhc_fused_post_pre(
+                    hidden_states,
+                    prev_residual,
+                    prev_post,
+                    prev_comb,
+                    self.hc_attn_fn,
+                    self.hc_attn_scale,
+                    self.hc_attn_base,
+                    self.rms_norm_eps,
+                    self.hc_eps,
+                    self.hc_eps,
+                    _MHC_POST_MULT_VALUE,
+                    self.hc_sinkhorn_iters,
+                    norm_weight=(
+                        self._input_layernorm_weight_bf16
+                        if self._input_layernorm_weight_bf16 is not None
+                        else self.input_layernorm.weight.data
+                    ),
+                    norm_eps=self.input_layernorm.variance_epsilon,
+                )
             x_quant = None
         else:
             residual = hidden_states
@@ -1525,7 +1558,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 forward_batch=forward_batch,
             )
             if not norm_fused:
-                if _use_aiter and _is_gfx95_supported:
+                if _use_aiter and (_is_gfx95_supported or _is_gfx1250_supported):
                     x_quant, hidden_states = _fused_rmsnorm_fp8_quant(
                         hidden_states,
                         self.input_layernorm.weight,
@@ -1562,6 +1595,10 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
             if fused_mhc is not None:
                 residual, hidden_states, post, comb, norm_fused = fused_mhc
+                if _is_gfx1250_supported and not norm_fused:
+                    # aiter mhc_post_pre doesn't fold post_attention_layernorm.
+                    hidden_states = self.post_attention_layernorm(hidden_states)
+                    norm_fused = True
             else:
                 residual, post, comb, hidden_states = mhc_fused_post_pre(
                     hidden_states,
@@ -1788,7 +1825,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             forward_batch=forward_batch,
         )
         if not norm_fused:
-            if _use_aiter and _is_gfx95_supported:
+            if _use_aiter and (_is_gfx95_supported or _is_gfx1250_supported):
                 x_quant, hidden_states = _fused_rmsnorm_fp8_quant(
                     hidden_states,
                     self.input_layernorm.weight,
