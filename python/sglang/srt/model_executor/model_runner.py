@@ -400,32 +400,28 @@ class ModelRunner:
         # base initialization and weight-loading flow.
         self.startup_weight_load = None
 
-        try:
-            # Load model weights and configure
-            self.initialize()
-            self.check_quantized_moe_compatibility()
+        # Load model weights and configure
+        self.initialize()
+        self.check_quantized_moe_compatibility()
 
-            self._initialize_elastic_ep_joiner()
+        self._initialize_elastic_ep_joiner()
 
-            if self.is_multimodal:
-                sanity_check_mm_pad_shift_value(self.model_config.vocab_size)
+        if self.is_multimodal:
+            sanity_check_mm_pad_shift_value(self.model_config.vocab_size)
 
-            # Temporary cached values
-            self.support_pp = (
-                "pp_proxy_tensors" in inspect.signature(self.model.forward).parameters
-            )
+        # Temporary cached values
+        self.support_pp = (
+            "pp_proxy_tensors" in inspect.signature(self.model.forward).parameters
+        )
 
-            if self.ps.pp_size > 1:
-                assert (
-                    self.support_pp
-                ), "Pipeline Parallel is not compatible with this model."
+        if self.ps.pp_size > 1:
+            assert (
+                self.support_pp
+            ), "Pipeline Parallel is not compatible with this model."
 
-            # For weight updates
-            self.init_weight_updater()
-            self.init_weight_exporter()
-        except Exception:
-            self.cancel_startup_weight_load()
-            raise
+        # For weight updates
+        self.init_weight_updater()
+        self.init_weight_exporter()
 
     def init_startup_observability(self) -> None:
         self.weight_load_time = 0.0
@@ -1147,7 +1143,11 @@ class ModelRunner:
                 is_ep_scale_joiner=self.server_args.is_ep_scale_joiner,
             )
 
-    def finalize_startup_weight_load(self):
+    def start_startup_weight_load(self) -> None:
+        if self.startup_weight_load is not None:
+            self.startup_weight_load.start_prefetch()
+
+    def finalize_startup_weight_load(self) -> None:
         if self.startup_weight_load is None:
             return
         self.startup_weight_load.finalize()
@@ -1156,10 +1156,13 @@ class ModelRunner:
             tp_rank=self.ps.tp_rank,
             is_ep_joiner=self.server_args.is_ep_joiner,
         )
+        self.startup_weight_load = None
 
-    def cancel_startup_weight_load(self):
-        if self.startup_weight_load is not None:
-            self.startup_weight_load.cancel()
+    def cancel_startup_weight_load(self) -> None:
+        if self.startup_weight_load is None:
+            return
+        self.startup_weight_load.cancel()
+        self.startup_weight_load = None
 
     def maybe_precompile_model_kernels_after_loading(self) -> None:
         maybe_precompile_model_kernels_after_loading(self.model, self.device)

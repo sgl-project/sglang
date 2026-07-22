@@ -971,11 +971,15 @@ class Scheduler(
         if self.draft_worker is not None:
             self.draft_worker.init_cuda_graphs()
 
-    def finalize_startup_weight_load(self):
+    def start_startup_weight_load(self) -> None:
+        """Start any checkpoint prefetch deferred until worker init completes."""
+        self.tp_worker.start_startup_weight_load()
+
+    def finalize_startup_weight_load(self) -> None:
         """Commit any weights deferred until after CUDA graph capture."""
         self.tp_worker.finalize_startup_weight_load()
 
-    def cancel_startup_weight_load(self):
+    def cancel_startup_weight_load(self) -> None:
         """Cancel any weight loading still deferred during worker startup."""
         self.tp_worker.cancel_startup_weight_load()
 
@@ -983,6 +987,7 @@ class Scheduler(
         # Load model weights.
         self.init_tp_model_worker()
         try:
+            self.start_startup_weight_load()
             self.maybe_init_draft_worker()
 
             # Prepare KV cache pools for all workers
@@ -1000,9 +1005,8 @@ class Scheduler(
                 self.kv_cache_allocation_time += time.perf_counter() - tic
 
             self.finalize_startup_weight_load()
-        except Exception:
+        finally:
             self.cancel_startup_weight_load()
-            raise
 
         if (
             get_exec().moe.elastic_ep_backend is not None

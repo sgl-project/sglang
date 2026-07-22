@@ -17,8 +17,10 @@ maybe_stub_sgl_kernel()
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.configs.model_config import ModelImpl
+from sglang.srt.distributed.parallel_state import patched_vllm_parallel_state
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.cuda_graph_config import Backend
+from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.model_executor.model_runner_components.startup_weight_load import (
     ModelStorageManifest,
     StartupWeightLoadManager,
@@ -99,6 +101,10 @@ class _RecordingPrefetchHandle:
     def wait(self, timeout=None):
         self._trace.append("wait_prefetch")
 
+    def stop(self):
+        self.cancel()
+        self.wait()
+
 
 class _RecordingLoader:
     def __init__(
@@ -107,12 +113,14 @@ class _RecordingLoader:
         trace,
         *,
         prepare_error=None,
+        prefetch_error=None,
         commit_error=None,
         rebind_on_commit=False,
     ):
         self._model = model
         self._trace = trace
         self._prepare_error = prepare_error
+        self._prefetch_error = prefetch_error
         self._commit_error = commit_error
         self._rebind_on_commit = rebind_on_commit
         self.prefetch_handle = _RecordingPrefetchHandle(trace)
@@ -127,6 +135,8 @@ class _RecordingLoader:
 
     def start_checkpoint_prefetch(self, resolved_sources, *, num_threads):
         self._trace.append("start_prefetch")
+        if self._prefetch_error is not None:
+            raise self._prefetch_error
         return self.prefetch_handle
 
     def prepare_model_for_capture(self, *, model, model_config):
@@ -241,6 +251,26 @@ class TestStartupWeightLoadSelector(CustomTestCase):
                 "load format must be auto or safetensors",
             ),
             (
+                "draft_worker",
+                dict(options=_make_options(is_draft_worker=True)),
+                "draft workers are not supported",
+            ),
+            (
+                "draft_model_checkpoint",
+                dict(
+                    load_config=LoadConfig(
+                        load_format=LoadFormat.SAFETENSORS,
+                        draft_model_idx=0,
+                    )
+                ),
+                "draft model loading is unsupported",
+            ),
+            (
+                "speculative_decoding",
+                dict(options=_make_options(speculative_algorithm="EAGLE")),
+                "speculative decoding is not supported",
+            ),
+            (
                 "tp3",
                 dict(options=_make_options(tp_size=3)),
                 "only TP1 and TP2 are supported",
@@ -319,11 +349,13 @@ class TestStartupWeightLoadManager(CustomTestCase):
         self.assertEqual(manager.state, StartupWeightLoadState.CREATED)
         self.assertIs(manager.prepare(), model)
         self.assertEqual(manager.state, StartupWeightLoadState.CAPTURE_READY)
+        manager.start_prefetch()
+        self.assertEqual(manager.state, StartupWeightLoadState.PREFETCHING)
 
         # CUDA graph capture is owned by Scheduler and occurs between these calls.
         trace.append("capture")
         with (
-            patch(f"{_STARTUP_MODULE}.monkey_patch_vllm_parallel_state"),
+            patch(f"{_STARTUP_MODULE}.patched_vllm_parallel_state"),
             patch(f"{_STARTUP_MODULE}.torch.cuda.synchronize"),
             patch(f"{_STARTUP_MODULE}.logger.info") as log_info,
         ):
@@ -335,8 +367,8 @@ class TestStartupWeightLoadManager(CustomTestCase):
             [
                 "initialize",
                 "resolve",
-                "start_prefetch",
                 "prepare_capture",
+                "start_prefetch",
                 "capture",
                 "commit",
                 "cancel_prefetch",
@@ -361,9 +393,10 @@ class TestStartupWeightLoadManager(CustomTestCase):
             )
         )
         manager.prepare()
+        manager.start_prefetch()
 
         with (
-            patch(f"{_STARTUP_MODULE}.monkey_patch_vllm_parallel_state"),
+            patch(f"{_STARTUP_MODULE}.patched_vllm_parallel_state"),
             patch(f"{_STARTUP_MODULE}.torch.cuda.synchronize"),
             self.assertRaisesRegex(RuntimeError, "commit failed"),
         ):
@@ -371,8 +404,11 @@ class TestStartupWeightLoadManager(CustomTestCase):
 
         self.assertEqual(manager.state, StartupWeightLoadState.FAILED)
         self.assertEqual(trace[-2:], ["cancel_prefetch", "wait_prefetch"])
+        manager.cancel()
+        self.assertEqual(manager.state, StartupWeightLoadState.FAILED)
+        self.assertEqual(trace.count("cancel_prefetch"), 1)
 
-    def test_prepare_failure_is_fail_closed_and_cleans_up_prefetch(self):
+    def test_prepare_failure_has_no_active_prefetch_to_clean_up(self):
         trace = []
         manager = self._manager(
             _RecordingLoader(
@@ -386,12 +422,48 @@ class TestStartupWeightLoadManager(CustomTestCase):
             manager.prepare()
 
         self.assertEqual(manager.state, StartupWeightLoadState.FAILED)
-        self.assertEqual(trace[-2:], ["cancel_prefetch", "wait_prefetch"])
+        self.assertEqual(trace, ["initialize", "resolve", "prepare_capture"])
+
+    def test_start_prefetch_requires_capture_ready_and_starts_once(self):
+        trace = []
+        manager = self._manager(_RecordingLoader(nn.Linear(2, 2), trace))
+
+        with self.assertRaisesRegex(RuntimeError, "from state"):
+            manager.start_prefetch()
+
+        manager.prepare()
+        manager.start_prefetch()
+        self.assertEqual(manager.state, StartupWeightLoadState.PREFETCHING)
+
+        with self.assertRaisesRegex(RuntimeError, "from state"):
+            manager.start_prefetch()
+        self.assertEqual(trace.count("start_prefetch"), 1)
+
+    def test_start_prefetch_failure_is_fail_closed(self):
+        trace = []
+        manager = self._manager(
+            _RecordingLoader(
+                nn.Linear(2, 2),
+                trace,
+                prefetch_error=RuntimeError("prefetch failed"),
+            )
+        )
+        manager.prepare()
+
+        with self.assertRaisesRegex(RuntimeError, "prefetch failed"):
+            manager.start_prefetch()
+
+        self.assertEqual(manager.state, StartupWeightLoadState.FAILED)
+        self.assertEqual(trace.count("start_prefetch"), 1)
+        self.assertNotIn("cancel_prefetch", trace)
+        manager.cancel()
+        self.assertEqual(manager.state, StartupWeightLoadState.FAILED)
 
     def test_capture_failure_can_cancel_pending_prefetch(self):
         trace = []
         manager = self._manager(_RecordingLoader(nn.Linear(2, 2, bias=False), trace))
         manager.prepare()
+        manager.start_prefetch()
 
         manager.cancel()
         manager.cancel()
@@ -410,9 +482,10 @@ class TestStartupWeightLoadManager(CustomTestCase):
             )
         )
         manager.prepare()
+        manager.start_prefetch()
 
         with (
-            patch(f"{_STARTUP_MODULE}.monkey_patch_vllm_parallel_state"),
+            patch(f"{_STARTUP_MODULE}.patched_vllm_parallel_state"),
             patch(f"{_STARTUP_MODULE}.torch.cuda.synchronize"),
             self.assertRaisesRegex(
                 RuntimeError, "changed graph-visible tensor storage"
@@ -422,6 +495,58 @@ class TestStartupWeightLoadManager(CustomTestCase):
 
         self.assertEqual(manager.state, StartupWeightLoadState.FAILED)
         self.assertEqual(trace[-2:], ["cancel_prefetch", "wait_prefetch"])
+
+
+class TestPatchedVllmParallelState(CustomTestCase):
+    @staticmethod
+    def _accessors(parallel_state):
+        return (
+            parallel_state.get_pp_group,
+            parallel_state.get_tp_group,
+            parallel_state.get_world_group,
+        )
+
+    def test_restores_parallel_state_when_the_body_fails(self):
+        originals = (object(), object(), object())
+        vllm_parallel_state = SimpleNamespace(
+            get_pp_group=originals[0],
+            get_tp_group=originals[1],
+            get_world_group=originals[2],
+        )
+        with (
+            patch(
+                "sglang.srt.distributed.parallel_state._get_vllm_parallel_state",
+                return_value=vllm_parallel_state,
+            ),
+            self.assertRaisesRegex(RuntimeError, "body failed"),
+        ):
+            with patched_vllm_parallel_state():
+                self.assertNotEqual(self._accessors(vllm_parallel_state), originals)
+                raise RuntimeError("body failed")
+
+        self.assertEqual(self._accessors(vllm_parallel_state), originals)
+
+    def test_nested_context_restores_the_outer_patch(self):
+        originals = (object(), object(), object())
+        vllm_parallel_state = SimpleNamespace(
+            get_pp_group=originals[0],
+            get_tp_group=originals[1],
+            get_world_group=originals[2],
+        )
+        with patch(
+            "sglang.srt.distributed.parallel_state._get_vllm_parallel_state",
+            return_value=vllm_parallel_state,
+        ):
+            with patched_vllm_parallel_state():
+                outer_patch = self._accessors(vllm_parallel_state)
+                with patched_vllm_parallel_state():
+                    self.assertEqual(
+                        self._accessors(vllm_parallel_state),
+                        outer_patch,
+                    )
+                self.assertEqual(self._accessors(vllm_parallel_state), outer_patch)
+
+        self.assertEqual(self._accessors(vllm_parallel_state), originals)
 
 
 class TestModelStorageManifest(CustomTestCase):
@@ -452,6 +577,9 @@ class _LifecycleRunner:
         self._name = name
         self._trace = trace
 
+    def start_startup_weight_load(self):
+        self._trace.append(f"start:{self._name}")
+
     def finalize_startup_weight_load(self):
         self._trace.append(f"finalize:{self._name}")
 
@@ -460,6 +588,22 @@ class _LifecycleRunner:
 
 
 class TestStartupWeightLoadFanout(CustomTestCase):
+    def test_primary_and_multi_runner_extras_are_started_once(self):
+        trace = []
+        primary = _LifecycleRunner("primary", trace)
+        extra_1 = _LifecycleRunner("extra_1", trace)
+        extra_2 = _LifecycleRunner("extra_2", trace)
+        worker = TpModelWorker.__new__(TpModelWorker)
+        worker._model_runner = primary
+        worker.model_runner_list = [primary, extra_1, extra_2]
+
+        worker.start_startup_weight_load()
+
+        self.assertEqual(
+            trace,
+            ["start:primary", "start:extra_1", "start:extra_2"],
+        )
+
     def test_primary_and_multi_runner_extras_are_finalized_once(self):
         for multi_runner in (False, True):
             with self.subTest(multi_runner=multi_runner):
@@ -501,59 +645,127 @@ class TestStartupWeightLoadFanout(CustomTestCase):
         )
 
 
+class _RunnerStartupManager:
+    def __init__(self, trace, *, fail_finalize=False):
+        self._trace = trace
+        self._fail_finalize = fail_finalize
+
+    def finalize(self):
+        self._trace.append("finalize")
+        if self._fail_finalize:
+            raise RuntimeError("finalize failed")
+
+    def cancel(self):
+        self._trace.append("cancel")
+
+
+class TestModelRunnerStartupWeightLoadOwnership(CustomTestCase):
+    @staticmethod
+    def _runner(manager):
+        runner = ModelRunner.__new__(ModelRunner)
+        runner.startup_weight_load = manager
+        runner.server_args = SimpleNamespace(
+            elastic_ep_backend=None,
+            is_ep_scale_joiner=False,
+        )
+        runner.ps = SimpleNamespace(tp_rank=0)
+        return runner
+
+    def test_success_releases_ownership_after_the_barrier(self):
+        trace = []
+        manager = _RunnerStartupManager(trace)
+        runner = self._runner(manager)
+
+        def barrier(**kwargs):
+            self.assertIs(runner.startup_weight_load, manager)
+            trace.append("barrier")
+
+        with patch(
+            "sglang.srt.model_executor.model_runner.dist_barrier_after_load",
+            side_effect=barrier,
+        ):
+            runner.finalize_startup_weight_load()
+
+        self.assertEqual(trace, ["finalize", "barrier"])
+        self.assertIsNone(runner.startup_weight_load)
+
+    def test_barrier_failure_retains_ownership_for_cleanup(self):
+        trace = []
+        manager = _RunnerStartupManager(trace)
+        runner = self._runner(manager)
+
+        def fail_barrier(**kwargs):
+            trace.append("barrier")
+            raise RuntimeError("barrier failed")
+
+        with (
+            patch(
+                "sglang.srt.model_executor.model_runner.dist_barrier_after_load",
+                side_effect=fail_barrier,
+            ),
+            self.assertRaisesRegex(RuntimeError, "barrier failed"),
+        ):
+            runner.finalize_startup_weight_load()
+
+        self.assertIs(runner.startup_weight_load, manager)
+        runner.cancel_startup_weight_load()
+        self.assertEqual(trace, ["finalize", "barrier", "cancel"])
+        self.assertIsNone(runner.startup_weight_load)
+
+    def test_finalize_failure_skips_the_barrier_and_retains_ownership(self):
+        trace = []
+        manager = _RunnerStartupManager(trace, fail_finalize=True)
+        runner = self._runner(manager)
+
+        with (
+            patch(
+                "sglang.srt.model_executor.model_runner.dist_barrier_after_load"
+            ) as barrier,
+            self.assertRaisesRegex(RuntimeError, "finalize failed"),
+        ):
+            runner.finalize_startup_weight_load()
+
+        barrier.assert_not_called()
+        self.assertIs(runner.startup_weight_load, manager)
+        runner.cancel_startup_weight_load()
+        self.assertEqual(trace, ["finalize", "cancel"])
+        self.assertIsNone(runner.startup_weight_load)
+
+
 class _SchedulerWorker:
     def __init__(
         self,
         trace,
         *,
+        fail_start=False,
         fail_finalize=False,
         post_capture_active=False,
     ):
         self._trace = trace
+        self._fail_start = fail_start
         self._fail_finalize = fail_finalize
+        self._prefetch_active = False
         self.model_runner = SimpleNamespace(
             token_to_kv_pool=SimpleNamespace(post_capture_active=post_capture_active),
             post_capture_resize_kv_pool=lambda: trace.append("resize"),
         )
 
+    def start_startup_weight_load(self):
+        self._trace.append("start")
+        self._prefetch_active = True
+        if self._fail_start:
+            raise RuntimeError("start failed")
+
     def finalize_startup_weight_load(self):
         self._trace.append("finalize")
         if self._fail_finalize:
             raise RuntimeError("finalize failed")
+        self._prefetch_active = False
 
     def cancel_startup_weight_load(self):
-        self._trace.append("cancel")
-
-
-class _FailingPostRunnerInitWorker(TpModelWorker):
-    def __init__(self, runner):
-        self._test_runner = runner
-        super().__init__(
-            server_args=SimpleNamespace(),
-            gpu_id=0,
-            ps=SimpleNamespace(),
-            nccl_port=0,
-        )
-
-    def _init_model_config(self):
-        self.model_config = SimpleNamespace()
-
-    def _init_model_runner(self):
-        self._model_runner = self._test_runner
-
-    def _init_dllm_algorithm(self):
-        raise RuntimeError("post-runner init failed")
-
-
-class TestStartupWeightLoadWorkerCleanup(CustomTestCase):
-    def test_worker_constructor_failure_cancels_owned_runner(self):
-        trace = []
-        runner = _LifecycleRunner("primary", trace)
-
-        with self.assertRaisesRegex(RuntimeError, "post-runner init failed"):
-            _FailingPostRunnerInitWorker(runner)
-
-        self.assertEqual(trace, ["cancel:primary"])
+        if self._prefetch_active:
+            self._trace.append("cancel")
+            self._prefetch_active = False
 
 
 class TestStartupWeightLoadSchedulerCleanup(CustomTestCase):
@@ -586,7 +798,7 @@ class TestStartupWeightLoadSchedulerCleanup(CustomTestCase):
 
         self.assertEqual(
             trace,
-            ["memory_pool", "attention", "capture", "resize", "finalize"],
+            ["start", "memory_pool", "attention", "capture", "resize", "finalize"],
         )
 
     def test_finalize_failure_cancels_deferred_loading(self):
@@ -599,8 +811,18 @@ class TestStartupWeightLoadSchedulerCleanup(CustomTestCase):
 
         self.assertEqual(
             trace,
-            ["memory_pool", "attention", "capture", "finalize", "cancel"],
+            ["start", "memory_pool", "attention", "capture", "finalize", "cancel"],
         )
+
+    def test_start_failure_cancels_before_runtime_initialization(self):
+        trace = []
+        worker = _SchedulerWorker(trace, fail_start=True)
+        scheduler = self._scheduler(worker, trace)
+
+        with self.assertRaisesRegex(RuntimeError, "start failed"):
+            scheduler.init_model_worker()
+
+        self.assertEqual(trace, ["start", "cancel"])
 
     def test_cuda_graph_capture_failure_cancels_deferred_loading(self):
         trace = []
@@ -618,7 +840,7 @@ class TestStartupWeightLoadSchedulerCleanup(CustomTestCase):
 
         self.assertEqual(
             trace,
-            ["memory_pool", "attention", "capture", "cancel"],
+            ["start", "memory_pool", "attention", "capture", "cancel"],
         )
 
 
