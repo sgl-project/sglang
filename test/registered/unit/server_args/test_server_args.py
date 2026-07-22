@@ -176,6 +176,40 @@ class TestMambaCacheStochasticRounding(unittest.TestCase):
             server_args._handle_mamba_backend()
 
 
+class TestLogLevelNormalization(unittest.TestCase):
+    """#30353: log levels must be normalized to a value uvicorn also accepts."""
+
+    def test_warn_alias_maps_to_warning(self):
+        self.assertEqual(
+            ServerArgs(model_path="dummy", log_level="WARN").log_level, "warning"
+        )
+        self.assertEqual(
+            ServerArgs(model_path="dummy", log_level="warn").log_level, "warning"
+        )
+
+    def test_fatal_alias_maps_to_critical(self):
+        self.assertEqual(
+            ServerArgs(model_path="dummy", log_level="FATAL").log_level, "critical"
+        )
+
+    def test_uppercase_is_lowercased(self):
+        for raw, expected in [("INFO", "info"), ("Debug", "debug"), ("ERROR", "error")]:
+            self.assertEqual(
+                ServerArgs(model_path="dummy", log_level=raw).log_level, expected
+            )
+
+    def test_log_level_http_normalized_independently(self):
+        args = ServerArgs(model_path="dummy", log_level="info", log_level_http="WARN")
+        self.assertEqual(args.log_level, "info")
+        self.assertEqual(args.log_level_http, "warning")
+
+    def test_log_level_http_none_preserved(self):
+        args = ServerArgs(model_path="dummy", log_level="WARN", log_level_http=None)
+        self.assertIsNone(args.log_level_http)
+        # This is exactly what http_server.py forwards to uvicorn.
+        self.assertEqual(args.log_level_http or args.log_level, "warning")
+
+
 class TestLoadBalanceMethod(unittest.TestCase):
     def _load_balance_args(self, **kwargs):
         server_args = ServerArgs(model_path="dummy", **kwargs)
