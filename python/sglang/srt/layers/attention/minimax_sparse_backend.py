@@ -118,6 +118,61 @@ def _npu_triton_prefill_auto(seq_lens: torch.Tensor) -> bool:
     )
 
 
+# Ascend grid program cap above which launches hang (aicore timeout 507014) --
+# see flash_block_score_decode.py:77. The blockq main-attention grid is
+# num_pack_groups * num_kv_heads; the adaptive policy below keeps it under cap.
+_MINIMAX_BLOCKQ_PROGRAM_CAP = 32768
+
+
+def _choose_prefill_pack_q(
+    total_q: int,
+    max_seqlen_k: int,
+    num_kv_heads: int,
+    block_size_q: int,
+    vectorcore_num: int = 32,
+) -> int:
+    """Pick PACK_Q for the prefill blockq main-attention kernel.
+
+    Fully input-size-driven (no user-facing on/off flag). Returns 1 to select
+    the validated per-query ``_decode_main`` path, or 2/4 to engage the per-
+    query-block shared-topk kernel. Selection rules:
+      * env ``SGLANG_MINIMAX_NPU_PREFILL_PACKQ`` (expert A/B / kill-switch)
+        forces 1/2/4 and bypasses the policy (1 = disable blockq).
+      * PACK_Q must divide BSQ (``block_size_q``) so pack groups sub-divide the
+        score query-blocks cheaply.
+      * the grid ``num_pack_groups * num_kv_heads`` must (a) saturate the vector
+        cores and (b) stay under the Ascend program cap.
+      * longer KV -> larger PACK_Q (K/V HBM traffic is the dominant cost; PACK_Q
+        cuts it PACK_Q-fold). Microbench @ total_q=3072/KV=16K: pack_q=2 1.6x,
+        pack_q=4 2.3x faster than per-query.
+
+    UB caps PACK_Q at 4 (gqa=16, D=128, bf16); the wrapper hard-asserts this.
+    The blockq kernel stores via a scalar-base scratch buffer + a spill-free
+    scatter (vector store would spill registers -- see topk_sparse_blockq.py).
+    """
+    from sglang.srt.environ import envs
+
+    forced = envs.SGLANG_MINIMAX_NPU_PREFILL_PACKQ.get()
+    if forced is not None:
+        return max(1, min(4, int(forced)))
+    if total_q <= 1 or block_size_q <= 1:
+        return 1
+    sat = [
+        p
+        for p in (4, 2, 1)
+        if block_size_q % p == 0
+        and (total_q // p) * num_kv_heads >= vectorcore_num
+        and (total_q // p) * num_kv_heads <= _MINIMAX_BLOCKQ_PROGRAM_CAP
+    ]
+    if not sat:
+        return 1
+    if max_seqlen_k >= 32768 and 4 in sat:
+        return 4
+    if 2 in sat:
+        return 2
+    return 1
+
+
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
@@ -1577,6 +1632,68 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             qblock_mappings=qblock_mappings,
         )
 
+    def _build_pack_group_meta(self, meta, pack_q: int, device):
+        """Build per-pack-group metadata for the blockq main-attention kernel.
+
+        Sub-divides the score path's BSQ query-blocks (``meta.qblock_mappings``)
+        into ``BSQ // pack_q`` pack groups each (PACK_Q | BSQ is guaranteed by
+        ``_choose_prefill_pack_q``). Built once per (forward, pack_q) and cached
+        on ``meta`` so the ~57 sparse layers of one forward reuse it.
+
+        Returns a SimpleNamespace of [num_pack_groups] int32 tensors:
+          q_start/q_end : absolute token bounds of each pack group
+                          (q_end == cu_seqlens[r+1]; masks partial-tail groups)
+          req           : owning request (for the direct req_to_token page lookup)
+          pack_last     : latest-in-pack token index (causal-window superset;
+                          the per-pack-group topk is gathered from this token)
+        """
+        cached = getattr(meta, "pack_group_meta", None)
+        if cached is not None and getattr(meta, "pack_q", None) == pack_q:
+            return cached
+
+        (
+            qb_to_qstart,
+            qb_to_qblock,
+            _qb_seq_lens,
+            qb_qend,
+            _block_table,
+            all_seqblock_q,
+        ) = meta.qblock_mappings
+        bsq = meta.block_size_q
+        assert bsq % pack_q == 0, f"PACK_Q {pack_q} must divide BSQ {bsq}"
+        pg_per_qb = bsq // pack_q
+
+        qb_to_qstart_l = qb_to_qstart.to(torch.long)
+        qb_to_qblock_l = qb_to_qblock.to(torch.long)
+        qb_qend_l = qb_qend.to(torch.long)
+        # A query-block's absolute first token = request q_start + block index *
+        # BSQ (the score kernel's q_start + q_block_local * BLOCK_SIZE_Q). Each
+        # BSQ query-block then expands to pg_per_qb pack groups at offsets
+        # k*PACK_Q, k in [0, pg_per_qb).
+        rep = torch.repeat_interleave(
+            torch.arange(all_seqblock_q, device=device, dtype=torch.long), pg_per_qb
+        )
+        local_k = (
+            torch.arange(pg_per_qb, device=device, dtype=torch.long) * pack_q
+        ).repeat(all_seqblock_q)
+        q_start_pg = qb_to_qstart_l[rep] + qb_to_qblock_l[rep] * bsq + local_k
+        q_end_pg = qb_qend_l[rep]  # per-request upper bound
+        total_q = meta.per_query_req.shape[0]
+        q_start_clamped = torch.clamp(q_start_pg, max=total_q - 1)
+        req_pg = meta.per_query_req[q_start_clamped].to(torch.int32)
+        pack_last = torch.clamp(q_start_pg + pack_q - 1, max=q_end_pg - 1).to(torch.int32)
+
+        pg = SimpleNamespace(
+            q_start=q_start_pg.to(torch.int32).contiguous(),
+            q_end=q_end_pg.to(torch.int32).contiguous(),
+            req=req_pg.contiguous(),
+            pack_last=pack_last.contiguous(),
+            all_pack_groups=q_start_pg.shape[0],
+        )
+        meta.pack_q = pack_q
+        meta.pack_group_meta = pg
+        return pg
+
     def _forward_npu_triton_prefill(
         self,
         q: torch.Tensor,  # [total_extend_tokens, num_q_heads, head_dim]
@@ -1747,9 +1864,29 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         # int32 on both paths, and the direct-page-map main kernel masks
         # logical_block < 0 and sanitizes physical ids to [0, num_pages-1].
 
-        # 4) main sparse attention over the selected blocks: per-query decode-main
-        # (flatten total_q extend tokens into total_q batch rows). The union-tile
-        # kernel was an A/B-verified 1.71x deopt at 64K and has been removed.
+        # 4) main sparse attention over the selected blocks.
+        # Two paths, auto-selected by the input-size-driven `_choose_prefill_pack_q`:
+        #   * pack_q >= 2 -> blockq shared-topk kernel: PACK_Q consecutive tokens
+        #     share one topk block list, so each selected K/V block is loaded once
+        #     per pack group (amortises the paged-gather scalar/address cost that
+        #     leaves the per-query path at 15.88ms/call, 43% of prefill).
+        #   * pack_q == 1 -> per-query decode-main (flatten total_q tokens into
+        #     total_q batch rows). The union-tile kernel was an A/B-verified 1.71x
+        #     deopt at 64K and has been removed.
+        # BPS>1 (decode path only) fuses several selected blocks per loop step;
+        # the larger K/V tiles pressure the UB, so cap num_stages at 1 there.
+        # Env override for A/B: SGLANG_MINIMAX_NPU_PREFILL_MAIN_BPS in {1,2,4}.
+        import os
+
+        main_bps = int(
+            os.environ.get(
+                "SGLANG_MINIMAX_NPU_PREFILL_MAIN_BPS", str(main_blocks_per_step)
+            )
+        )
+        main_ns = main_num_stages if main_bps == 1 else min(main_num_stages, 1)
+
+        pack_q = _choose_prefill_pack_q(total_q, max_seqlen, num_kv_heads, block_size_q)
+
         def _decode_main():
             # Use the request-token map directly in the decode-main kernel.  This
             # avoids materializing a [total_q, max_blocks] page table for every
@@ -1773,7 +1910,40 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 num_stages=main_num_stages,
             )
 
-        o = _decode_main()
+        def _blockq_main():
+            from sglang.srt.layers.attention.minimax_sparse_ops.npu_triton.topk_sparse_blockq import (
+                flash_prefill_bnsd_blockq_sparse,
+            )
+
+            pg = self._build_pack_group_meta(meta, pack_q, q.device)
+            # Per-pack-group topk = the latest-in-pack token's per-query topk
+            # (its causal window is a superset of the earlier tokens'; earlier
+            # rows mask the few extra near-tail blocks via per-row causal). The
+            # +1 is the appended causal local block from _prepare_npu_triton_topk_idx.
+            topk_blockq = topk_idx[:, pg.pack_last, :].contiguous()
+            # PACK_Q=4 needs the larger Q tile single-buffered (UB).
+            blockq_ns = main_num_stages if pack_q <= 2 else min(main_num_stages, 1)
+            return flash_prefill_bnsd_blockq_sparse(
+                q=q,
+                k_cache_bnsd=k_bnsd,
+                v_cache_bnsd=v_bnsd,
+                topk_idx_blockq=topk_blockq,
+                seq_lens=per_query_seq_lens,
+                q_start=pg.q_start,
+                q_end=pg.q_end,
+                req_pool_indices=pg.req,
+                block_size=page_size,
+                sm_scale=head_dim**-0.5,
+                pack_q=pack_q,
+                req_to_token=self.req_to_token,
+                max_num_blocks=max_blocks,
+                num_pages=num_pages,
+                sanitize_page_ids=True,
+                num_warps=main_num_warps,
+                num_stages=blockq_ns,
+            )
+
+        o = _blockq_main() if pack_q > 1 else _decode_main()
 
         return idx_o, o
 

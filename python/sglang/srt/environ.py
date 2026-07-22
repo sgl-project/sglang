@@ -391,8 +391,15 @@ class Envs:
     # (1.45x @16K, >7x @24K), loses <=8K -- hence the adaptive default.
     SGLANG_MINIMAX_NPU_TRITON_PREFILL = EnvBool(False)
 
-    # size the KV pool after CUDA-graph capture
-    SGLANG_ENABLE_POST_CAPTURE_KV_SIZING = EnvBool(False)
+    # MiniMax M3 NPU prefill MAIN-attention PACK_Q shared-topk kernel
+    # (`_gqa_share_sparse_prefill_blockq_kernel`). The blockq path is engaged
+    # AUTOMATICALLY by the size-based `_choose_prefill_pack_q` policy whenever
+    # the triton prefill path is active and the input size warrants PACK_Q>1
+    # (PACK_Q=1 falls back to the validated per-query `_decode_main`). This is an
+    # EXPERT A/B / kill-switch only -- force PACK_Q=1 to disable blockq and use
+    # the per-query path; 2/4 to override the adaptive pick. None = adaptive.
+    # UB cap is PACK_Q=4 (gqa=16, D=128, bf16); larger overflows the 192KB UB.
+    SGLANG_MINIMAX_NPU_PREFILL_PACKQ = EnvInt(None)
 
     # Scheduler: memory leak test
     SGLANG_TEST_RETRACT = EnvBool(False)
