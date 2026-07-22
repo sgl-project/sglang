@@ -125,7 +125,12 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.kv_cache_dtype = model_runner.kv_cache_dtype
-        self.kv_cache_dtype_str = model_runner.server_args.kv_cache_dtype
+
+        self.kv_cache_dtype_str = getattr(
+            model_runner,
+            "kv_cache_dtype_str",
+            model_runner.server_args.kv_cache_dtype,
+        )
         self.page_size = model_runner.page_size
 
         assert self.num_heads % self.num_kv_heads == 0
