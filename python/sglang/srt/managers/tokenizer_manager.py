@@ -1550,15 +1550,29 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     out["meta_info"][
                         "response_sent_to_client_ts"
                     ] = state.time_stats.get_response_sent_to_client_realtime()
+                # In incremental streaming, `out` carries only the final
+                # delta (text and/or output_ids); restore the full accumulated
+                # values so the finish log and metrics match non-streaming
+                # behavior instead of showing the last chunk only. Token-only
+                # outputs (e.g. --skip-tokenizer-init) carry output_ids but no
+                # text, so handle each field independently.
+                if incremental_stream:
+                    log_out = dict(out)
+                    if out.get("text") is not None:
+                        log_out["text"] = state.get_text()
+                    if out.get("output_ids") is not None:
+                        log_out["output_ids"] = state.output_ids.copy()
+                else:
+                    log_out = out
                 self.request_logger.log_finished_request(
                     obj,
-                    out,
+                    log_out,
                     request=request,
                 )
 
                 if self.request_metrics_exporter_manager.exporter_enabled():
                     asyncio.create_task(
-                        self.request_metrics_exporter_manager.write_record(obj, out)
+                        self.request_metrics_exporter_manager.write_record(obj, log_out)
                     )
 
                 # Check if this was an abort/error created by scheduler
