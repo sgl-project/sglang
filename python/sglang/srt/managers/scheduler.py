@@ -3779,14 +3779,8 @@ class Scheduler(
         if self.is_fully_idle():
             self.cur_batch_for_debug = None
             self.last_batch = None
-            self.tree_cache.reset()
-            self.req_to_token_pool.clear()
-            self.token_to_kv_pool_allocator.clear()
-            self.grammar_manager.clear()
+            self._reset_memory_pools()
             self.metrics_reporter.reset_metrics()
-
-            if self.draft_worker:
-                self.draft_worker.clear_cache_pool()
 
             if empty_cache:
                 current_platform.empty_cache()
@@ -3803,6 +3797,22 @@ class Scheduler(
             )
             success = False
         return success
+
+    def _reset_memory_pools(self) -> None:
+        """Clear every memory pool (KV cache, req pool, grammar, draft) to empty.
+
+        Single source of truth for which pools exist and how they are cleared,
+        shared by flush_cache (idle path) and _abort_all_and_reset (debug-mode
+        recovery path) so a newly-added pool is never cleared by one but forgotten
+        by the other. Callers own their surrounding state (batch/queue resets,
+        metrics, device cache); this only touches the pools.
+        """
+        self.tree_cache.reset()
+        self.req_to_token_pool.clear()
+        self.token_to_kv_pool_allocator.clear()
+        self.grammar_manager.clear()
+        if self.draft_worker:
+            self.draft_worker.clear_cache_pool()
 
     def _recover_from_iteration_error(self, exc: Exception) -> None:
         """Debug-mode best-effort recovery from a serving-time exception.
@@ -3878,12 +3888,7 @@ class Scheduler(
             )
 
         # Wipe all memory pools wholesale so no KV is leaked across the reset.
-        self.tree_cache.reset()
-        self.req_to_token_pool.clear()
-        self.token_to_kv_pool_allocator.clear()
-        self.grammar_manager.clear()
-        if self.draft_worker:
-            self.draft_worker.clear_cache_pool()
+        self._reset_memory_pools()
 
         # Reset loop-carried state to its __init__ values.
         self.waiting_queue = []
