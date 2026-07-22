@@ -10,7 +10,6 @@ from typing import (
     Optional,
     Tuple,
     TypeAlias,
-    Union,
 )
 
 import torch
@@ -460,8 +459,7 @@ class DeepseekSparseAttnBackend(
         self.dcp_rank = parallel.attn_dcp_rank if self.dcp_enabled else 0
         if self.dcp_enabled:
             assert (
-                self.dsa_decode_impl == "trtllm"
-                and self.dsa_prefill_impl == "trtllm"
+                self.dsa_decode_impl == "trtllm" and self.dsa_prefill_impl == "trtllm"
             ), (
                 "DCP requires the trtllm DSA backends (the sm100 defaults); "
                 f"got decode={self.dsa_decode_impl}, "
@@ -472,9 +470,7 @@ class DeepseekSparseAttnBackend(
                 "recipe assumes every rank in a DCP group holds the same "
                 "extend rows, and prefill CP splits rows across ranks."
             )
-            assert self.hisparse_coordinator is None, (
-                "DCP does not support hisparse."
-            )
+            assert self.hisparse_coordinator is None, "DCP does not support hisparse."
             if model_runner.server_args.enable_dp_attention:
                 # Keep each DCP group inside one attention-DP shard so the
                 # replicated indexer sees identical requests group-wide.
@@ -767,14 +763,14 @@ class DeepseekSparseAttnBackend(
             f"Unsupported {self.dsa_topk_backend = } for SGLANG_DSA_FUSE_TOPK."
         )
 
-    def _dcp_global_slots_to_local_rows(self, page_table_1: torch.Tensor) -> torch.Tensor:
+    def _dcp_global_slots_to_local_rows(
+        self, page_table_1: torch.Tensor
+    ) -> torch.Tensor:
         """Global KV slots -> this rank's local rows (unowned become -1).
 
         Returns a new tensor: the input is shared across layers (IndexShare).
         """
-        owned = (page_table_1 >= 0) & (
-            page_table_1 % self.dcp_size == self.dcp_rank
-        )
+        owned = (page_table_1 >= 0) & (page_table_1 % self.dcp_size == self.dcp_rank)
         return torch.where(owned, page_table_1 // self.dcp_size, -1)
 
     def get_device_int32_arange(self, length: int) -> torch.Tensor:
@@ -3044,9 +3040,7 @@ class DeepseekSparseAttnBackend(
             # output for count-0 rows is undefined).
             zero_rows = (dcp_local_counts == 0).view(batch_size, 1)
             lse = torch.where(zero_rows, torch.full_like(lse, float("-inf")), lse)
-            out = torch.where(
-                zero_rows.unsqueeze(-1), torch.zeros_like(out), out
-            )
+            out = torch.where(zero_rows.unsqueeze(-1), torch.zeros_like(out), out)
             # q rows are tokens for both decode (bs) and the decode-ized
             # extend; the combine wants out [T, H, D] and lse [T, H] fp32.
             return (out, lse)

@@ -391,9 +391,7 @@ class DeepseekMLAForwardMixin:
                         )
                     # skip_topk reuses prev layer's indices; mirror into this
                     # layer's slot so the captured buffer matches what's used.
-                    return maybe_capture_indexer_topk(
-                        self.layer_id, prev_topk_indices
-                    )
+                    return maybe_capture_indexer_topk(self.layer_id, prev_topk_indices)
 
                 if get_parallel().dcp_enabled and self.use_dsa:
                     # The indexer goes on the side stream so it also overlaps
@@ -859,11 +857,9 @@ class DeepseekMLAForwardMixin:
         if get_parallel().dcp_enabled and (
             forward_batch.forward_mode.is_decode()
             or (
-                        self.use_dsa
-                        and forward_batch.forward_mode.is_extend(
-                            include_draft_extend_v2=True
-                        )
-                    )
+                self.use_dsa
+                and forward_batch.forward_mode.is_extend(include_draft_extend_v2=True)
+            )
         ):
             assert lse is not None, (
                 "DCP LSE combine reached without an LSE — the attention call "

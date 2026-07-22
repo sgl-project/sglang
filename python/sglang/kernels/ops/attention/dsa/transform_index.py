@@ -121,9 +121,7 @@ def transform_index_page_table_prefill_kernel(
     if dcp_size > 1:
         # DCP owner filter: keep slots on this rank, map global -> local row.
         owned_mask = valid_topk_mask & (loaded_kv_indices % dcp_size == dcp_rank)
-        loaded_kv_indices = tl.where(
-            owned_mask, loaded_kv_indices // dcp_size, -1
-        )
+        loaded_kv_indices = tl.where(owned_mask, loaded_kv_indices // dcp_size, -1)
     tl.store(
         result_ptr
         + token_indices[:, None] * result_stride_0
