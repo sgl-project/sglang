@@ -6,7 +6,11 @@ import torch
 
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.utils import is_flashinfer_available
-from sglang.srt.utils.common import is_sm90_supported, is_sm120_supported
+from sglang.srt.utils.common import (
+    is_sm90_supported,
+    is_sm100_supported,
+    is_sm120_supported,
+)
 from sglang.test.test_utils import CustomTestCase
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -14,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.attention_unittest.attention_methods.dense_attention import (
     DenseAttentionCase,
+    build_dense_attention_fixture,
     run_dense_attention_case,
 )
 from sglang.test.kits.attention_unittest.runner_modes.cuda_graph_decode_runner import (
@@ -199,6 +204,148 @@ class TestTRTLLMMHADenseAttentionBackendCorrectness(CustomTestCase):
                     head_dim=self.HEAD_DIM,
                     hidden_size=self.HIDDEN_SIZE,
                 )
+
+    # XQA has native page-128 kernels (any head layout). max_context_len must
+    # be a page multiple so the kit's per-request slot ranges stay page-aligned.
+    def test_page128_decode(self):
+        case = DenseAttentionCase(
+            name="trtllm_mha_xqa_decode_page128_boundary",
+            backend="trtllm_mha",
+            forward_mode=ForwardMode.DECODE,
+            num_heads=4,
+            num_kv_heads=2,
+            page_size=128,
+            prefix_lens=(127, 128, 200),
+        )
+        run_dense_attention_case(
+            self,
+            case,
+            head_dim=self.HEAD_DIM,
+            hidden_size=self.HIDDEN_SIZE,
+            max_context_len=512,
+        )
+
+
+@unittest.skipIf(
+    not torch.cuda.is_available()
+    or not is_flashinfer_available()
+    or not is_sm100_supported(),
+    "CUDA + FlashInfer TRT-LLM-GEN (SM100) are required",
+)
+class TestTRTLLMMHAPage128TrtllmGen(CustomTestCase):
+    """page_size=128 on trtllm-gen (SM100) via dynamic tokens-per-page kernels.
+
+    Those kernels only exist for GQA (q heads per kv head > 1) with equal QK/V
+    head dims, so every positive case here is GQA; the MHA layout must fail at
+    backend construction (see test_page128_mha_rejected_at_init). All cases
+    pass max_context_len=512: the kit's per-request slot ranges start at
+    ``page_size + req_idx * max_context_len``, so it must be a page multiple.
+    """
+
+    HEAD_DIM = 64
+    HIDDEN_SIZE = 256
+    MAX_CONTEXT_LEN = 512
+
+    DECODE_CASES = (
+        DenseAttentionCase(
+            name="trtllm_gen_gqa_decode_page128_boundary",
+            backend="trtllm_mha",
+            forward_mode=ForwardMode.DECODE,
+            num_heads=4,
+            num_kv_heads=2,
+            page_size=128,
+            prefix_lens=(127, 128, 200),
+        ),
+        DenseAttentionCase(
+            name="trtllm_gen_gqa4_decode_page128_bsz1",
+            backend="trtllm_mha",
+            forward_mode=ForwardMode.DECODE,
+            num_heads=8,
+            num_kv_heads=2,
+            page_size=128,
+            prefix_lens=(300,),
+        ),
+    )
+
+    EXTEND_CASES = (
+        DenseAttentionCase(
+            name="trtllm_gen_gqa_extend_page128",
+            backend="trtllm_mha",
+            forward_mode=ForwardMode.EXTEND,
+            num_heads=4,
+            num_kv_heads=2,
+            page_size=128,
+            prefix_lens=(0, 128),
+            extend_lens=(130, 5),
+        ),
+    )
+
+    CUDA_GRAPH_DECODE_CASES = (
+        DenseAttentionCase(
+            name="runner_cuda_graph_trtllm_gen_gqa_decode_page128",
+            backend="trtllm_mha",
+            forward_mode=ForwardMode.DECODE,
+            num_heads=4,
+            num_kv_heads=2,
+            page_size=128,
+            prefix_lens=(127, 128, 200),
+        ),
+    )
+
+    def test_page128_decode_cases(self):
+        for case in self.DECODE_CASES:
+            with self.subTest(case=case.name):
+                run_dense_attention_case(
+                    self,
+                    case,
+                    head_dim=self.HEAD_DIM,
+                    hidden_size=self.HIDDEN_SIZE,
+                    max_context_len=self.MAX_CONTEXT_LEN,
+                )
+
+    def test_page128_extend_cases(self):
+        for case in self.EXTEND_CASES:
+            with self.subTest(case=case.name):
+                run_dense_attention_case(
+                    self,
+                    case,
+                    head_dim=self.HEAD_DIM,
+                    hidden_size=self.HIDDEN_SIZE,
+                    max_context_len=self.MAX_CONTEXT_LEN,
+                )
+
+    def test_page128_cuda_graph_decode_cases(self):
+        for case in self.CUDA_GRAPH_DECODE_CASES:
+            with self.subTest(case=case.name):
+                run_dense_cuda_graph_decode_case(
+                    self,
+                    case,
+                    head_dim=self.HEAD_DIM,
+                    hidden_size=self.HIDDEN_SIZE,
+                    max_context_len=self.MAX_CONTEXT_LEN,
+                )
+
+    def test_page128_mha_rejected_at_init(self):
+        # heads_per_kv == 1 has no page-128 trtllm-gen kernel; the backend must
+        # refuse at construction (not fail mid-capture with a missing-kernel
+        # RuntimeError from flashinfer).
+        case = DenseAttentionCase(
+            name="trtllm_gen_mha_decode_page128_rejected",
+            backend="trtllm_mha",
+            forward_mode=ForwardMode.DECODE,
+            num_heads=4,
+            num_kv_heads=4,
+            page_size=128,
+            prefix_lens=(7,),
+        )
+        with self.assertRaisesRegex(ValueError, "dynamic tokens-per-page"):
+            build_dense_attention_fixture(
+                self,
+                case,
+                head_dim=self.HEAD_DIM,
+                hidden_size=self.HIDDEN_SIZE,
+                max_context_len=self.MAX_CONTEXT_LEN,
+            )
 
 
 if __name__ == "__main__":

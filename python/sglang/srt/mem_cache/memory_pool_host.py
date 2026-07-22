@@ -1528,10 +1528,12 @@ class HostPoolGroup:
         self.page_size = self.anchor_entry.host_pool.page_size
         self.device = self.anchor_entry.host_pool.device
         self.size = self.anchor_entry.host_pool.size
-        self.can_use_write_back_jit = all(
+        child_write_back_jit = [
             getattr(entry.host_pool, "can_use_write_back_jit", False)
             for entry in entries
-        )
+        ]
+        self.can_use_write_back_jit = all(child_write_back_jit)
+        self.supports_per_pool_backup_indices = any(child_write_back_jit)
 
     @property
     def kv_buffer(self):
@@ -1628,6 +1630,39 @@ class HostPoolGroup:
                 io_backend,
             )
 
+    def _backup_uses_cpu_host_indices(self, host_pool, io_backend) -> bool:
+        return (
+            io_backend == "kernel"
+            and getattr(host_pool, "layout", None) == "page_first"
+            and getattr(host_pool, "can_use_write_back_jit", False)
+        )
+
+    def _kernel_index_device(self, entry, device_indices):
+        if device_indices is not None and device_indices.is_cuda:
+            return device_indices.device
+        return getattr(entry.device_pool, "device", None)
+
+    def _normalize_backup_indices(
+        self, entry, host_indices, device_indices, io_backend
+    ):
+        if io_backend != "kernel":
+            return host_indices, device_indices
+
+        if self._backup_uses_cpu_host_indices(entry.host_pool, io_backend):
+            if host_indices.is_cuda:
+                host_indices = host_indices.cpu()
+            return host_indices, device_indices
+
+        if not host_indices.is_cuda:
+            target_device = self._kernel_index_device(entry, device_indices)
+            if target_device is not None:
+                host_indices = host_indices.to(target_device, non_blocking=True)
+                if host_indices.is_cuda:
+                    host_indices.record_stream(
+                        torch.cuda.current_stream(host_indices.device)
+                    )
+        return host_indices, device_indices
+
     def backup_from_device_all_layer(
         self,
         device_pool,
@@ -1637,10 +1672,13 @@ class HostPoolGroup:
         pool_transfers: Optional[list] = None,
     ) -> None:
         # 1. Anchor (KV) backup
+        anchor_host_indices, anchor_device_indices = self._normalize_backup_indices(
+            self.anchor_entry, host_indices, device_indices, io_backend
+        )
         self.anchor_entry.host_pool.backup_from_device_all_layer(
             self.anchor_entry.device_pool,
-            host_indices,
-            device_indices,
+            anchor_host_indices,
+            anchor_device_indices,
             io_backend,
         )
         # 2. Extra pool backup
@@ -1648,10 +1686,18 @@ class HostPoolGroup:
             entry = self.entry_map.get(transfer.name)
             if entry is None or transfer.host_indices is None:
                 continue
+            transfer_host_indices, transfer_device_indices = (
+                self._normalize_backup_indices(
+                    entry,
+                    transfer.host_indices,
+                    transfer.device_indices,
+                    io_backend,
+                )
+            )
             entry.host_pool.backup_from_device_all_layer(
                 entry.device_pool,
-                transfer.host_indices,
-                transfer.device_indices,
+                transfer_host_indices,
+                transfer_device_indices,
                 io_backend,
             )
 

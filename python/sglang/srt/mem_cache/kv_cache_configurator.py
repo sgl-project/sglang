@@ -1236,6 +1236,8 @@ class KVCacheConfigurator:
         return token_to_kv_pool
 
     def _build_minimax_sparse_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
+        from sglang.srt.server_args import m3_fp8_attn_gemm_enabled
+
         _hf_config = self.model_config.hf_config
         sparse_cfg = get_minimax_sparse_attention_config(_hf_config)
         dense_layer_ids, sparse_layer_ids = get_minimax_sparse_layer_ids(sparse_cfg)
@@ -1246,7 +1248,15 @@ class KVCacheConfigurator:
             size=max_total_num_tokens,
             page_size=self.server_args.page_size,
             dtype=self.kv_cache_dtype,
-            index_dtype=self.model_dtype,
+            # fp8 attn-GEMM mode opts the lightning-indexer cache into
+            # fp8 too (fp8 indexer GEMMs); fp8 KV without the mode
+            # (e5m2 or non-trtllm_mha backend) keeps the indexer bf16
+            # with the widening-dequant contract.
+            index_dtype=(
+                self.kv_cache_dtype
+                if m3_fp8_attn_gemm_enabled(self.server_args)
+                else self.model_dtype
+            ),
             head_num=self.model_config.get_num_kv_heads(get_parallel().attn_tp_size),
             head_dim=self.model_config.head_dim,
             idx_head_dim=sparse_cfg["sparse_index_dim"],

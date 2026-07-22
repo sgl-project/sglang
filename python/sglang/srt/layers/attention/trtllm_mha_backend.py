@@ -193,6 +193,32 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         #   KV fp8: q_type = fp8, out_type=model_runner.dtype
         self.is_xqa_impl = is_sm90_supported() or is_sm120_supported()
 
+        # trtllm-gen serves page_size >= 128 only through its dynamic
+        # tokens-per-page kernels, which exist solely for GQA with equal QK/V
+        # head dims (power-of-2 pages). Mirror that precondition here so an
+        # unsupported combo fails at construction instead of as a
+        # "Missing TRTLLM-GEN kernel" error during CUDA-graph capture.
+        # XQA (SM90/SM120 decode) has native page-128 kernels; no check needed.
+        if self.page_size >= 128 and not self.is_xqa_impl:
+            from sglang.srt.runtime_context import get_parallel
+
+            attn_tp_size = get_parallel().attn_tp_size
+            num_q_heads = config.num_attention_heads // attn_tp_size
+            num_kv_heads = config.get_num_kv_heads(attn_tp_size)
+            if (
+                num_q_heads // num_kv_heads <= 1
+                or config.head_dim != config.v_head_dim
+                or self.page_size & (self.page_size - 1) != 0
+            ):
+                raise ValueError(
+                    f"trtllm_mha with page_size={self.page_size} requires "
+                    f"trtllm-gen's dynamic tokens-per-page kernels, which only "
+                    f"support GQA (q heads per kv head > 1, got "
+                    f"{num_q_heads}/{num_kv_heads}) with equal QK/V head dims "
+                    f"(got {config.head_dim}/{config.v_head_dim}) and a "
+                    f"power-of-2 page size. Use --page-size 64 instead."
+                )
+
     def _check_decode_kv_access(self) -> None:
         supported_kinds = {
             KVCacheAttentionAccessKind.PLAIN,

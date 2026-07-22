@@ -128,6 +128,13 @@ class RadixAttention(nn.Module):
         self.v_scale = None
         self.k_scale_float = None
         self.v_scale_float = None
+        # MiniMax-M3 fp8 attention-GEMM scales (fp8 attn-GEMM mode): main q and
+        # lightning-indexer q/k/v. No checkpoint loader populates them yet;
+        # None means unit scale.
+        self.q_scale_float = None
+        self.idx_q_scale_float = None
+        self.idx_k_scale_float = None
+        self.idx_v_scale_float = None
         self.quant_method = None
 
         if quant_config is not None:

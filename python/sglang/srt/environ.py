@@ -1061,6 +1061,10 @@ class Envs:
     SGLANG_OPT_USE_MINIMAX_DENSE_SPARSE_DECODE = EnvBool(False)
     SGLANG_DISABLE_MSA = EnvBool(False)
     SGLANG_OPT_USE_MSA_DECODE_UNDER_GRAPH = EnvBool(False)
+    # Kill switch for the derived fp8 attention-GEMM mode (m3_fp8_attn_gemm_enabled):
+    # forces the pre-fp8 behavior (bf16 indexer + widening sparse path, bf16 q)
+    # even when kv_cache_dtype fp8_e4m3 + trtllm_mha + SM100 would activate it.
+    SGLANG_DISABLE_M3_FP8_ATTN_GEMM = EnvBool(False)
 
     # MiniMax-M3 sparse decode indexer: single JIT radix-select kernel replaces the 2-stage split-K Triton topk.
     SGLANG_OPT_USE_MINIMAX_DECODE_TOPK_RADIX = EnvBool(True)

@@ -30,7 +30,9 @@ namespace {
 // The trivial case num_blocks <= topk (every block selected) is handled by the
 // kernels below, outside the Trait.
 struct TopKTrait {
-  static constexpr uint32_t kMaxTopK = 32;
+  // Also sizes the kernels' smem staging for the ascending-order emit; the
+  // block-id path's test contract goes up to topk == 64.
+  static constexpr uint32_t kMaxTopK = 64;
   static constexpr uint32_t kCTASize = 512;
   static constexpr uint32_t kNumWarps = kCTASize / device::kWarpThreads;
   static constexpr uint32_t kMaxNumBlocks = 4096;  // block topk
@@ -264,8 +266,10 @@ struct TopKTrait {
 // Trait; otherwise the Trait selects the top-k block ids.
 // -------------------------------------------------------------------------
 
-// Block-id output: topk_idx[h, b, 0:k_eff) = selected block ids (front-packed,
-// unordered), [k_eff:topk) = -1.
+// Block-id output: topk_idx[h, b, 0:k_eff) = selected block ids (sorted
+// ascending), [k_eff:topk) = -1. Ascending order is a hard requirement of the
+// MSA fmha_sm100 consumer (kv_block_indexes must be strictly ascending; its
+// sorted-order early-exit otherwise mis-masks the partial last block).
 template <typename SeqLenT, bool kUsePDL>
 __global__ void minimax_decode_topk_block_kernel(
     const float* __restrict__ score,
@@ -297,7 +301,43 @@ __global__ void minimax_decode_topk_block_kernel(
 
   const float* __restrict__ row = score + (static_cast<int64_t>(h) * batch + b) * max_seqblock;
   __shared__ TopKTrait::Smem smem;
-  TopKTrait::forward(row, static_cast<uint32_t>(num_blocks), out, static_cast<uint32_t>(topk), &smem);
+  __shared__ int32_t s_topk[TopKTrait::kMaxTopK];
+  TopKTrait::forward(row, static_cast<uint32_t>(num_blocks), s_topk, static_cast<uint32_t>(topk), &smem);
+  __syncthreads();  // s_topk fully written before the sort reads it
+
+  // Emit ascending: num_blocks > topk here, so all topk slots hold distinct
+  // ids and rank(v) = |{x : x < v}| is a permutation. deepseek_v4
+  // topk_impl.cuh warp sort (32x32 / 64x64 branches; topk <= kMaxTopK = 64):
+  // lanes hold the elements in registers (INT32_MAX sentinel past topk), warp
+  // w ranks targets {w, w + kNumWarps, ...} via ballot+popc, lane 0 emits.
+  static_assert(TopKTrait::kMaxTopK <= 2 * device::kWarpThreads);
+  const auto warp_id = tx / device::kWarpThreads;
+  const auto lane_id = tx % device::kWarpThreads;
+#if defined(__HIP_PLATFORM_AMD__)
+  // wave64: __ballot spans the full 64-lane wave (would count the sibling
+  // 32-lane logical warp too); use the file's width-32 shuffle reduction.
+  const auto count_lt = [](int32_t x, int32_t v) { return device::warp::reduce_sum(static_cast<int>(x < v)); };
+#else
+  const auto count_lt = [](int32_t x, int32_t v) { return __popc(__ballot_sync(kWarpSyncMask, x < v)); };
+#endif
+  if (topk <= static_cast<int>(device::kWarpThreads)) {  // 32 x 32
+    const int32_t tie = (lane_id < static_cast<uint32_t>(topk)) ? s_topk[lane_id] : INT32_MAX;
+    for (uint32_t t = warp_id; t < static_cast<uint32_t>(topk); t += TopKTrait::kNumWarps) {
+      const int32_t target = s_topk[t];
+      const auto rank = count_lt(tie, target);
+      if (lane_id == 0) out[rank] = target;
+    }
+  } else {  // 64 x 64: each lane takes 2 elements
+    const int32_t tie_0 = s_topk[lane_id];
+    const int32_t tie_1 = (lane_id + device::kWarpThreads < static_cast<uint32_t>(topk))
+                              ? s_topk[lane_id + device::kWarpThreads]
+                              : INT32_MAX;
+    for (uint32_t t = warp_id; t < static_cast<uint32_t>(topk); t += TopKTrait::kNumWarps) {
+      const int32_t target = s_topk[t];
+      const auto rank = count_lt(tie_0, target) + count_lt(tie_1, target);
+      if (lane_id == 0) out[rank] = target;
+    }
+  }
 }
 
 // Page-table output: for each (batch b, kv-head h) pseudo-request emit the
@@ -436,6 +476,7 @@ void minimax_decode_topk(
       topk_i,
       ")");
   RuntimeCheck(block_size > 0, "block_size must be > 0, got ", block_size);
+  RuntimeCheck(topk <= static_cast<int64_t>(TopKTrait::kMaxTopK), "topk exceeds kMaxTopK (ascending-sort smem buffer)");
   if (batch == 0 || num_heads == 0) return;
 
   const dim3 grid(static_cast<unsigned>(batch), static_cast<unsigned>(num_heads));
