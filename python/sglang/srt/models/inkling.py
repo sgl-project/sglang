@@ -628,7 +628,9 @@ class InklingCausalLLM(nn.Module):
             and sconv0 is not None
             and world in (4, 8)  # symm-mem multimem worlds, power-of-two
         ):
-            from sglang.jit_kernel.inkling_ar_fused import compile_inkling_ar_sconv_norm
+            from sglang.kernels.ops.model.inkling.inkling_ar_fused import (
+                compile_inkling_ar_sconv_norm,
+            )
 
             for do_track in (False, True):
                 compile_inkling_ar_sconv_norm(
@@ -647,7 +649,7 @@ class InklingCausalLLM(nn.Module):
         # local/SWA layer (head_dim != 128) that never uses the prologue while
         # later full-attention layers do.
         if is_cuda() and envs.SGLANG_OPT_USE_INKLING_FUSED_ATTN_PROLOGUE.get():
-            from sglang.jit_kernel.inkling_attn_prologue import (
+            from sglang.kernels.ops.model.inkling.inkling_attn_prologue import (
                 compile_inkling_attn_prologue,
             )
 
