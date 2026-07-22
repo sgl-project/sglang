@@ -1095,15 +1095,10 @@ class SchedulerBatchResultProcessor:
     def _mamba_check_track_boundary(self, req, batch, result, i):
         """Check if this decode step crosses a mamba track interval boundary.
 
-        Returns (at_boundary, track_seqlen).  The boundary condition must
-        match what this batch's forward used for its tracking mask, so it
-        reads ``batch.seq_lens_cpu[i]`` — the same per-batch snapshot
-        ``prepare_for_decode`` built the mask from.  It must NOT read
-        ``req.kv_committed_len``: that is shared mutable state which, under
-        overlap scheduling, the next batch's ``prepare_for_decode`` has
-        already advanced by the time this result is processed — firing the
-        boundary bookkeeping one batch early.  The returned track_seqlen is
-        always a multiple of ``interval`` (hence page-aligned).
+        Returns (at_boundary, track_seqlen).  For non-spec decode, this stays
+        in the live req state domain used by lazy ping-pong cleanup; mixing a
+        per-batch seq_len snapshot with live slot pointers can run the
+        alloc-fail insert/skip gate on the wrong boundary.
 
         For spec decode, the boundary is detected by comparing the
         accepted seq_len range against interval boundaries.
@@ -1111,9 +1106,8 @@ class SchedulerBatchResultProcessor:
         interval = get_server_args().mamba_track_interval
 
         if batch.spec_algorithm.is_none():
-            committed_len = int(batch.seq_lens_cpu[i].item())
-            if committed_len % interval == 0:
-                return True, committed_len
+            if req.kv_committed_len % interval == 0:
+                return True, req.kv_committed_len
         elif result.num_correct_drafts_per_req_cpu is not None:
             cur = req.seqlen - 1
             prev = cur - result.num_correct_drafts_per_req_cpu[i] - 1
