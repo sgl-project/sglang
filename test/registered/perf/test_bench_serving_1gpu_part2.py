@@ -122,8 +122,10 @@ class TestBenchServing1GPUPart2(CustomTestCase):
             self.assertEqual(res["successful_requests"], res["total_requests"])
             # relax for mi300x
             if is_in_amd_ci():
-                bounds = {10: (60, 65), 25: (70, 80), 50: (80, 90)}
-                default_bounds = (90, 90)
+                # MI325 runners need slightly more p95 headroom at batch_size=50
+                # than MI300X (bounds were originally tuned for MI300X).
+                bounds = {10: (60, 65), 25: (70, 80), 50: (80, 95)}
+                default_bounds = (90, 95)
             else:
                 bounds = {10: (45, 50), 25: (50, 60), 50: (60, 65)}
                 default_bounds = (60, 65)

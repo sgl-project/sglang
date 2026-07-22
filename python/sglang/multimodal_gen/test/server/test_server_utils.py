@@ -23,7 +23,10 @@ from openai import Client
 
 from sglang.multimodal_gen.benchmarks.compare_perf import calculate_upper_bound
 from sglang.multimodal_gen.runtime.platforms import current_platform
-from sglang.multimodal_gen.runtime.utils.common import kill_process_tree
+from sglang.multimodal_gen.runtime.utils.common import (
+    is_port_available,
+    kill_process_tree,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     globally_suppress_loggers,
     init_logger,
@@ -195,6 +198,14 @@ class ServerContext:
         except Exception:
             pass
 
+        # Wait for ports to be released so the next test can bind them under
+        # --strict-ports. kill_process_tree sends SIGKILL and returns
+        # immediately; the scheduler child may still be in the middle of
+        # tearing down its ZMQ socket on port 5555 when the next test starts,
+        # causing "Scheduler port 5555 is unavailable" failures.
+        self._wait_for_port_release(self.port, timeout=30.0)
+        self._wait_for_port_release(5555, timeout=30.0)
+
         # ROCm/AMD: Extra cleanup to ensure GPU memory is released between tests
         # This is needed because ROCm memory release can be slower than CUDA
         if current_platform.is_hip():
@@ -205,6 +216,20 @@ class ServerContext:
         else:
             # Give the runtime a brief cooldown after server shutdown.
             time.sleep(2)
+
+    def _wait_for_port_release(self, port: int, timeout: float = 30.0) -> None:
+        """Poll until *port* is bindable again, or give up after *timeout*."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if is_port_available(port):
+                return
+            time.sleep(0.5)
+        logger.warning(
+            "[server-test] Port %d still in use after %.1fs; "
+            "next test may fail under --strict-ports.",
+            port,
+            timeout,
+        )
 
     def _cleanup_hf_cache_if_not_persistent(self) -> None:
         """Clean up HF cache if it's not on a persistent volume.
