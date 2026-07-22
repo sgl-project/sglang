@@ -253,15 +253,17 @@ class ExpertLocationMetadata:
         if initial_ep_size is not None:
             # Offset joiners (scale-append OR recover-into-retired-slot) boot
             # with local ep_size = tp_size but must size EPLB metadata against
-            # the WIDER post-join deployment. Scale joiners target
-            # offset + tp_size; recover joiners target elastic_ep_initial_size.
-            if get_exec().moe.ep_join_mode == "scale":
+            # the WIDER post-join deployment. Both modes target the ACTUAL
+            # post-join cohort size (rank_offset + tp_size); for full regrow
+            # this equals initial_ep_size, for partial regrow (e.g. launch=8,
+            # effective=4, target=6, offset=4, tp=2) it is 6 < 8. Using
+            # initial_ep_size here would produce a shape mismatch against
+            # the survivors' map built in _expand_eplb_metadata_for_scale.
+            if server_args.is_ep_offset_joiner:
                 ep_size = max(
                     ep_size,
                     get_parallel().ep_join_rank_offset + server_args.tp_size,
                 )
-            elif server_args.is_ep_offset_joiner:
-                ep_size = max(ep_size, initial_ep_size)
             num_physical_experts, num_local_physical_experts = (
                 _compute_elastic_expert_layout(
                     base_num_physical_experts,
@@ -540,10 +542,34 @@ def broadcast_global_expert_location_metadata(
     metadata = get_global_expert_location_metadata()
     assert metadata is not None
 
+    # ``.contiguous()`` is a no-op when the map is already contiguous
+    # (pytorch returns ``self`` without allocation) but required for
+    # correctness on the rare non-contiguous slice case: NCCL/Mooncake
+    # broadcast on a non-contiguous tensor is unsafe.
     metadata.physical_to_logical_map = metadata.physical_to_logical_map.contiguous()
     torch.distributed.broadcast(
         metadata.physical_to_logical_map, src=src_rank, group=group
     )
+
+    # Skip the rebuild on the src rank: its metadata was already
+    # rebuilt for the new cohort size before this broadcast (see
+    # ``_expand_eplb_metadata_for_scale`` on the survivor caller), the
+    # broadcast is send-only for src, and ``init_by_mapping`` is
+    # deterministic given the same map + ``moe_ep_rank`` -- so a
+    # rebuild here would produce a byte-identical result at the cost
+    # of a nested O(layers * experts * ep_size) recomputation.
+    # Non-src ranks (joiners) always rebuild because their map was
+    # just overwritten by the broadcast.
+    #
+    # Uses group-relative rank so the check works for both the
+    # default WORLD group and elastic-EP sub-groups.
+    try:
+        local_rank = torch.distributed.get_rank(group=group)
+    except Exception:
+        local_rank = None
+    if local_rank == src_rank:
+        return metadata
+
     metadata = ExpertLocationMetadata.init_by_mapping(
         server_args,
         model_config,

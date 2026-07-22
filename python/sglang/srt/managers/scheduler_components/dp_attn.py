@@ -185,6 +185,23 @@ class MLPSyncBatchInfo:
         cpu_data = tp0_info[:, :2].cpu()
         self.global_num_tokens = cpu_data[:, 0].tolist()
         self.global_num_tokens_for_logprob = cpu_data[:, 1].tolist()
+        # Defensive sanitization for the elastic-EP WORLD all-reduce path:
+        # during the mask-flip race window Mooncake's WORLD all-reduce can
+        # leak uninitialised memory from a retiree's tp0 slot (observed as
+        # num_tokens in the 2^62 range that then overflows
+        # _pad_tensor_to_size). Values outside [0, 1<<30] are not
+        # legitimate token counts, so treat them as retiree-slot garbage
+        # and replace with 0. TODO(mooncake): drop once upstream Mooncake
+        # returns a zero sentinel for inactive slots.
+        _MAX_REASONABLE_NUM_TOKENS = 1 << 30
+        self.global_num_tokens = [
+            0 if (t < 0 or t > _MAX_REASONABLE_NUM_TOKENS) else t
+            for t in self.global_num_tokens
+        ]
+        self.global_num_tokens_for_logprob = [
+            0 if (t < 0 or t > _MAX_REASONABLE_NUM_TOKENS) else t
+            for t in self.global_num_tokens_for_logprob
+        ]
         self.can_run_decode_cuda_graph = bool(tp0_info[:, 2].min().item())
         self.is_extend_in_batch = bool(tp0_info[:, 3].max().item())
         self.can_run_prefill_cuda_graph = bool(tp0_info[:, 6].min().item())

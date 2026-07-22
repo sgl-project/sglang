@@ -2269,6 +2269,22 @@ class ServerArgs:
     ep_size: A[
         int,
         Arg(
+            # Runtime-mutable via ``server_args.override("elastic_ep.scale",
+            # ep_size=...)``. Because elastic-EP mutates this in place on
+            # every shrink/grow, treat it as the *current effective*
+            # EP size rather than the launch-time size -- callers that
+            # need the launch-time layout should read
+            # ``elastic_ep_initial_size`` (or ``max_ep_size`` for the
+            # storage upper bound). All ``override(...)`` mutations are
+            # audited via the ``_runtime_mutations`` / ``_resolved_
+            # overrides`` provenance stashes, so post-mortem attribution
+            # is preserved.
+            #
+            # TODO: split into a separate runtime-state class
+            # (``ElasticEPState.current_ep_size``) so ``ServerArgs``
+            # remains immutable post-resolution and callers of
+            # ``server_args.ep_size`` don't silently observe a moving
+            # target across scale events.
             help="The expert parallelism size.",
             aliases=["--expert-parallel-size", "--ep"],
             resolvable=True,
@@ -2420,6 +2436,23 @@ class ServerArgs:
     ] = 0
     elastic_ep_initial_size: A[
         Optional[int],
+        # Naming note: this is the *storage-layout* EP size, not the
+        # *initial serving* size. It fixes per-rank expert storage
+        # allocation once at launch so that later scale operations
+        # simply flip ``active_ranks`` bits inside the pre-sized layout
+        # (Mooncake C++ peer arrays cannot grow at runtime).
+        #
+        # Scale joiners must pass the primary deployment's launch-time
+        # storage-layout EP size here, regardless of the size to which
+        # they are being admitted. Recover-mode joiners (filling a
+        # retired slot with ``0 <= rank < elastic_ep_initial_size``)
+        # rely on this to allocate a matching storage layout so the
+        # broadcast physical_to_logical_map fits without a rebuild.
+        #
+        # TODO: the name reads as "initial serving size" but is used
+        # as "storage-layout size" -- rename to
+        # ``ep_storage_layout_size`` (or similar) and add a
+        # deprecation shim.
         "EP size used to define the immutable per-rank expert storage layout. "
         "Scale joiners must use the primary deployment's launch-time EP size.",
         NS("parallel"),

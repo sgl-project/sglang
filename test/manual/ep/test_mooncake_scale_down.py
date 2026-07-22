@@ -2729,6 +2729,132 @@ class TestMooncakeScaleDown4To3To2Nixl(TestMooncakeScaleDown4To3To2):
     MOE_A2A_BACKEND = "nixl"
 
 
+MC12_LAUNCH_EP = 6
+
+
+@unittest.skipUnless(
+    _count_visible_gpus() >= MC12_LAUNCH_EP,
+    f"MC12 3-step chained shrink E2E needs {MC12_LAUNCH_EP} GPUs.",
+)
+class TestMooncakeScaleDown6To5To4To3(_MooncakeShrinkEndToEndBase):
+    """MC12: 6 -> 5 -> 4 -> 3 3-step chained shrink.
+
+    Runs three consecutive shrinks in a single cohort to exercise the
+    NIXL retire barrier's epoch derivation across a cycle-3 bucket
+    boundary. Under the legacy cumulative-arrival formula
+    ``epoch = (arrival - 1) // world_size + 1``, cycle-3 arrivals
+    straddle ``world_size = launch_ep = 6``:
+
+      * Cycle 1 (6 posters): arrivals 1..6 -> all epoch 1. ✓
+      * Cycle 2 (5 posters): arrivals 7..11 -> all epoch 2. ✓
+      * Cycle 3 (4 posters): arrivals 12..15 -> arrival 12 lands
+        in bucket ``(12-1)//6+1 = 2``; arrivals 13..15 land in
+        bucket ``(13-1)//6+1 = 3``. **Split.**
+
+    A split at cycle 3 causes cohort ranks to write to different
+    ``ready_key`` s, so one subgroup's key hits ``count ==
+    world_size`` on a stale count carried over from cycle 2, races
+    alone into ``on_flip_mask``, and closes the admission gate
+    while its peers stall waiting on the higher-epoch ready_key
+    -- the survivor cohort splits until the 300s outer timeout
+    fires. MC01-MC10 do not cover this: MC04 stops at cycle 2
+    (safe per the arithmetic above); MC10 chains a full-regrow
+    in the middle, resetting the cumulative arrival counter to a
+    world-size boundary before its second shrink.
+
+    Uses ``MOE_A2A_BACKEND = "nixl"`` because the NIXL retire
+    barrier is the one Bug A affects; Mooncake a2a does not post
+    to it. Ends at ``final_ep = 3`` (not 1) because DP-attention
+    requires ``dp_size > 1``; the 3-cycle bucket-boundary crossing
+    is what exposes Bug A, and any target size that keeps
+    ``dp_size >= 2`` on the third shrink is sufficient.
+
+    Uses ``LAUNCH_EP = 6`` (not 8) because NIXL EP asserts
+    ``num_ranks < NUM_MAX_NVL_PEERS (8) or num_ranks % 8 == 0``
+    on every cohort size at rank-init time; an 8-launch would need
+    ``max_ep_size == 16`` for headroom, more than the single-node
+    physical GPU count.
+
+    Expected pass criteria after Bug A fix:
+
+      * Cycle 1 (6 -> 5): post-shrink GSM8K within
+        ``GSM8K_REL_TOL`` of pre-shrink baseline.
+      * Cycle 2 (5 -> 4): post-shrink GSM8K within
+        ``STAGE2_REL_TOL`` (wider, per MC04's rationale).
+      * Cycle 3 (4 -> 3): ``/generate`` must return 200 -- if
+        Bug A regresses, the ``/scale_elastic_ep`` HTTP call times
+        out before we can even probe.
+    """
+
+    LAUNCH_EP = MC12_LAUNCH_EP
+    # ``MAX_EP > LAUNCH_EP`` forces ServerArgs to enable the elastic-EP
+    # code path so ``elastic_ep_initial_size`` is auto-populated to
+    # ``tp_size``. Without this, ``_init_common`` falls back to the
+    # non-elastic branch and enforces ``num_physical_experts % ep_size``
+    # ``== 0``, which blows up when a cycle's target size does not
+    # divide the fixed ``num_physical_experts`` count. Using
+    # ``LAUNCH_EP + 1`` matches the MC02A / MC03A ``+1 headroom``
+    # pattern; no rank actually joins into that reserved slot in this
+    # pure-shrink test.
+    MAX_EP = MC12_LAUNCH_EP + 1
+    EP_NUM_REDUNDANT_EXPERTS = 72
+    STAGE2_REL_TOL = 0.15
+
+    def test_three_consecutive_shrinks(self):
+        self._generate_ok("pre-shrink")
+        pre_score = self._run_gsm8k("pre-shrink 6-rank")
+
+        self._scale_to(old_ep_size=6, target_ep_size=5)
+        self._generate_ok("after-first-shrink")
+        mid_score = self._run_gsm8k("post-first-shrink 5-rank")
+        rel_mid = (pre_score - mid_score) / max(pre_score, 1e-9)
+        print(
+            f"[TEST] MC12 stage1 parity: pre={pre_score:.2%} "
+            f"mid={mid_score:.2%} rel_delta={rel_mid:.2%} "
+            f"tol={GSM8K_REL_TOL:.2%}"
+        )
+        self.assertLess(
+            rel_mid,
+            GSM8K_REL_TOL,
+            f"MC12 5-rank stage regressed more than {GSM8K_REL_TOL:.0%}: "
+            f"pre={pre_score:.2%} mid={mid_score:.2%}",
+        )
+
+        self._scale_to(old_ep_size=5, target_ep_size=4)
+        self._generate_ok("after-second-shrink")
+        stage2_score = self._run_gsm8k("post-second-shrink 4-rank")
+        rel_stage2 = (pre_score - stage2_score) / max(pre_score, 1e-9)
+        print(
+            f"[TEST] MC12 stage2 parity: pre={pre_score:.2%} "
+            f"post={stage2_score:.2%} rel_delta={rel_stage2:.2%} "
+            f"tol={self.STAGE2_REL_TOL:.2%}"
+        )
+        self.assertLess(
+            rel_stage2,
+            self.STAGE2_REL_TOL,
+            f"MC12 4-rank stage regressed more than "
+            f"{self.STAGE2_REL_TOL:.0%}: pre={pre_score:.2%} "
+            f"post={stage2_score:.2%}",
+        )
+
+        self._scale_to(old_ep_size=4, target_ep_size=3)
+        self._generate_ok("after-third-shrink (Bug-A cycle)")
+        # If Bug A regresses, the ``_scale_to`` HTTP call above
+        # times out before we reach this line; if it landed and
+        # ``/generate`` is answering, the cohort is intact.
+        print("[TEST] MC12 stage3 survived cycle-3 chained shrink (Bug A path)")
+
+
+@unittest.skipUnless(
+    _count_visible_gpus() >= MC12_LAUNCH_EP,
+    f"MC12 (NIXL a2a) 3-step chained shrink E2E needs {MC12_LAUNCH_EP} GPUs.",
+)
+class TestMooncakeScaleDown6To5To4To3Nixl(TestMooncakeScaleDown6To5To4To3):
+    """MC12 (NIXL a2a): 6 -> 5 -> 4 -> 3 3-step chained shrink."""
+
+    MOE_A2A_BACKEND = "nixl"
+
+
 @unittest.skipUnless(
     _count_visible_gpus() >= LAUNCH_EP_SIZE,
     f"MC06 (NIXL a2a) post-shrink soak needs {LAUNCH_EP_SIZE} GPUs.",

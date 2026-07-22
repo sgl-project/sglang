@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, field
+from datetime import timedelta
 from typing import TYPE_CHECKING, Callable, Iterator, List, Optional
 
 import torch
@@ -453,8 +454,43 @@ _NIXL_RETIRE_STORE_BARRIER_POLL_INTERVAL_S = 0.05
 _NIXL_RETIRE_STORE_BARRIER_TIMEOUT_S = 300.0
 # Bounded catch-up busy-poll inside ``nixl_retire_barrier_check`` --
 # see that function's docstring for the fold rationale.
-_NIXL_RETIRE_STORE_BARRIER_CATCH_UP_S = 5.0
+#
+# Two windows: ``_FIRST`` bounds the fold check (called in the same tick
+# as ``post``) where peer ranks are typically <100ms behind and we
+# must not surrender the tick to the event loop. ``_FALLBACK`` bounds
+# subsequent NIXL_RETIRE fallback checks -- the FSM re-ticks quickly,
+# so a shorter poll is enough to catch racing counter updates without
+# starving the scheduler for seconds at a time on stuck cohorts. The
+# 200ms fallback matches the typical FSM tick cadence, so a counter
+# update in-flight during a fallback check is observed within one tick.
+_NIXL_RETIRE_STORE_BARRIER_CATCH_UP_FIRST_S = 5.0
+_NIXL_RETIRE_STORE_BARRIER_CATCH_UP_FALLBACK_S = 0.2
+# Bounded busy-poll for the cycle-id inside ``nixl_retire_barrier_post``.
+# A non-first-arriver waits up to this long for the elected cycle
+# leader to publish the cycle id before falling back to a legacy
+# derivation.
+_NIXL_RETIRE_CYCLE_ID_CATCH_UP_S = 5.0
 _NIXL_RETIRE_ARRIVAL_COUNTER_KEY = "sglang_nixl_retire_arrival_counter"
+# Cohort-wide monotonic cycle counter maintained on the shared
+# TCPStore. Bumped exactly once per retire boundary by the elected
+# first-arriver; consumed by every other rank in the same boundary
+# to derive a cohort-consistent ``epoch``. Replaces the previous
+# ``epoch = (arrival - 1) // world_size + 1`` derivation, which
+# silently split cohort ranks into different epoch buckets on any
+# retire boundary whose poster count did not equal ``world_size``
+# (e.g. a 3-step chained shrink like ``4 -> 3 -> 2 -> 1``, where
+# cycle 3's two arrivals land at counter 8/9 and straddle the
+# ``world_size = 4`` bucket boundary).
+_NIXL_RETIRE_CYCLE_KEY = "sglang_nixl_retire_cycle_counter"
+
+# Per-process record of the most recent NIXL retire cycle id this
+# rank has consumed. Non-first arrivers busy-poll the shared
+# ``_NIXL_RETIRE_CYCLE_KEY`` on the TCPStore until they observe a
+# value strictly greater than this. Rank-local because it survives
+# retiree exits: a joiner subprocess spawned mid-flight starts at
+# 0, which is correct (its first observed cycle is whatever the
+# incumbents advertise).
+_last_local_nixl_retire_cycle_id: int = 0
 
 
 @dataclass
@@ -467,10 +503,11 @@ class _NixlRetireBarrierState:
     as a dataclass (not a bare tuple) so the FSM tick has a
     consistent ``rank`` / ``epoch`` / ``ready_key`` view for logging.
 
-    ``arrival`` is the globally-unique sequence number this rank got
-    from the shared counter; ``epoch`` is the retire-boundary bucket
-    ``(arrival - 1) // world_size + 1``. See :func:`nixl_retire_barrier_post`
-    for the shared-epoch derivation.
+    ``arrival`` is this rank's within-cycle sequence number (1 for
+    the elected cycle leader, 2..N for the others); ``epoch`` is the
+    cohort-wide cycle id read from the shared TCPStore counter. See
+    :func:`nixl_retire_barrier_post` for the elected-leader
+    derivation.
     """
 
     epoch: int
@@ -479,6 +516,11 @@ class _NixlRetireBarrierState:
     rank: int
     arrival: int
     posted_at: float
+    # False once ``nixl_retire_barrier_check`` has run at least once for
+    # this state (i.e. the fold-tick check has completed). Subsequent
+    # fallback ticks use the shorter ``_CATCH_UP_FALLBACK_S`` window --
+    # see ``nixl_retire_barrier_check`` docstring.
+    first_check: bool = True
 
 
 def _pre_nixl_retire(retiree_global_ranks: List[int]) -> None:
@@ -558,26 +600,33 @@ def nixl_retire_barrier_post(
     (:func:`retire_barrier_post` / :func:`retire_barrier_check` /
     :func:`retire_barrier_consume`).
 
-    Global-epoch derivation (why not a per-process counter): a naive
-    module-level ``_RETIRE_BARRIER_EPOCH`` fails whenever cycle-N
-    retirees are joiner subprocesses spawned during the cycle-(N-1)
-    recover -- their local counter is at 0 while the survivors' is
-    at N-1, so per-rank keys diverge and no rendezvous happens. We
-    instead derive the epoch from a SHARED atomic counter on the
+    Cohort-wide epoch derivation (why not a per-process counter): a
+    naive module-level ``_EPOCH`` fails whenever cycle-N retirees are
+    joiner subprocesses spawned during the cycle-(N-1) recover --
+    their local counter is at 0 while the survivors' is at N-1, so
+    per-rank keys diverge and no rendezvous happens. We instead
+    derive the epoch from an ELECTED-LEADER pattern on the shared
     TCPStore:
 
-      * Every rank calls ``store.add(ARRIVAL_COUNTER_KEY, 1)`` on entry
-        and gets a globally-unique arrival number.
-      * ``epoch = (arrival - 1) // world_size + 1``. All ``world_size``
-        ranks arriving during the *same* retire boundary end up in the
-        same epoch bucket, so their per-epoch barrier keys match and
-        they rendezvous.
+      * Every rank calls ``store.add(ARRIVAL_COUNTER_KEY, 1)`` on
+        entry and gets its within-cycle arrival number.
+      * The rank whose add returned 1 is the elected cycle leader.
+        It bumps a second cohort-wide counter
+        ``_NIXL_RETIRE_CYCLE_KEY`` via a fresh ``store.add`` and
+        uses that return value as the epoch. Every non-leader
+        busy-polls the same key until it observes a value strictly
+        greater than the last epoch this rank consumed.
+      * :func:`nixl_retire_barrier_consume` resets
+        ``ARRIVAL_COUNTER_KEY`` to ``0`` (idempotent under racing
+        consumes) so the NEXT cycle's ``store.add`` starts at 1
+        again and re-elects a leader.
       * Invariant that makes this correct: retire boundaries are
         strictly sequential (the outer retire barrier + FSM ensures
         cycle N completes before cycle N+1 starts on any rank), so
-        cycle-1 arrivals occupy [1..world_size] and cycle-2 arrivals
-        occupy [world_size+1..2*world_size], etc. No cross-cycle
-        interleaving.
+        the reset happens between cycles with no concurrent arrivals.
+        The elected-leader pattern is robust to variable cohort
+        sizes (chained shrinks like 4 -> 3 -> 2 -> 1) which the old
+        divisor-based derivation was not.
 
     Returns ``None`` when:
 
@@ -653,6 +702,8 @@ def nixl_retire_barrier_post(
         )
         return None
 
+    global _last_local_nixl_retire_cycle_id
+
     try:
         arrival = int(store.add(_NIXL_RETIRE_ARRIVAL_COUNTER_KEY, 1))
     except Exception as exc:
@@ -664,18 +715,67 @@ def nixl_retire_barrier_post(
         )
         return None
 
-    # Epoch divisor: use ``world_size`` (launch_ep) so the counter's
-    # slot allocation is constant across cycles. Even when the cycle-N
-    # cohort is smaller than launch_ep (chained shrink -- 3 posters
-    # vs. launch_ep=4), the divisor stays 4, so cycle-1 arrivals
-    # occupy [1..4] and cycle-2 arrivals occupy [5..8] -- the three
-    # cycle-2 posts land at 5/6/7 with 8 still unclaimed, and all
-    # three compute epoch 2 = (5..7 - 1)//4 + 1. Next retire cycle
-    # would land at arrival >= 8 and derive epoch >= 3, so no cross-
-    # cycle rendezvous collision as long as retire boundaries stay
-    # strictly sequential (which the outer retire barrier + FSM
-    # guarantees).
-    epoch = (arrival - 1) // world_size + 1
+    # Cohort-wide cycle id via elected first-arriver. The arrival
+    # counter is reset to 0 in :func:`nixl_retire_barrier_consume`
+    # (idempotent on all ranks) so cycle N+1's post starts at
+    # arrival=1 again. The rank whose ``store.add`` returned 1 is
+    # therefore the elected leader for this cycle: it bumps the
+    # shared cycle counter; every other rank busy-polls it. This
+    # replaces the previous ``(arrival - 1) // world_size + 1``
+    # derivation, which straddled bucket boundaries whenever a
+    # cycle's poster count did not equal ``world_size``.
+    epoch: Optional[int] = None
+    if arrival == 1:
+        try:
+            epoch = int(store.add(_NIXL_RETIRE_CYCLE_KEY, 1))
+        except Exception as exc:
+            logger.warning(
+                "[Elastic EP][retire] rank=%d TCPStore add on cycle counter "
+                "failed (%s); falling back to legacy epoch derivation",
+                my_rank,
+                exc,
+            )
+    else:
+        cycle_deadline = time.monotonic() + _NIXL_RETIRE_CYCLE_ID_CATCH_UP_S
+        while time.monotonic() < cycle_deadline:
+            try:
+                raw = store.get(_NIXL_RETIRE_CYCLE_KEY)
+                candidate = int(raw.decode() if isinstance(raw, bytes) else raw)
+            except Exception as exc:
+                logger.debug(
+                    "[Elastic EP][retire] rank=%d TCPStore get on cycle "
+                    "counter transient error (%s); reusing local cycle id",
+                    my_rank,
+                    exc,
+                )
+                candidate = _last_local_nixl_retire_cycle_id
+            if candidate > _last_local_nixl_retire_cycle_id:
+                epoch = candidate
+                break
+            time.sleep(_NIXL_RETIRE_STORE_BARRIER_POLL_INTERVAL_S)
+
+    if epoch is None:
+        # TCPStore ``cycle_id`` unavailable or leader's write failed.
+        # We cannot safely derive an epoch that every rank in this
+        # cohort will agree on -- any local heuristic (e.g. bumping
+        # ``_last_local_nixl_retire_cycle_id + 1`` per-rank) risks
+        # split epochs across ranks and a cohort-wide FSM stall.
+        # Skip the barrier entirely; the FSM treats a ``None``
+        # return as "no barrier to wait on" and advances via its
+        # outer timeout mechanism (600 s ``elastic_ep_scale_timeout``
+        # in ``maybe_retire_ep_ranks``). This is a strict degradation,
+        # but a bounded-latency failure beats an indefinite split.
+        logger.warning(
+            "[Elastic EP][retire] rank=%d arrival=%d could not observe "
+            "cycle id within %.1fs; skipping NIXL retire barrier for "
+            "this cycle (outer scale timeout will catch a real hang)",
+            my_rank,
+            arrival,
+            _NIXL_RETIRE_CYCLE_ID_CATCH_UP_S,
+        )
+        return None
+
+    _last_local_nixl_retire_cycle_id = epoch
     ready_key = f"sglang_nixl_retire_barrier_e{epoch}_posted"
 
     try:
@@ -731,11 +831,31 @@ def nixl_retire_barrier_check(
     would surrender the tick to the event loop, where a peer that HAS
     reached ``count == world_size`` could fold FLIP_MASK, close the
     admission gate, and wedge this rank's next ``mlp_sync`` all-gather
-    on WORLD. We spin for up to ``_NIXL_RETIRE_STORE_BARRIER_CATCH_UP_S``
-    seconds re-reading the counter to close that gap without changing
-    FSM semantics -- if the catch-up window elapses, we still return
-    ``False`` and the surviving NIXL_RETIRE fallback branch of the FSM
-    picks the check up in a later tick.
+    on WORLD.
+
+    Two-tier catch-up window:
+      * First check (fold-tick, ``state.first_check``): spin up to
+        ``_CATCH_UP_FIRST_S`` (5s) to close the sub-100ms post race.
+        The 5s bound is loose because in the healthy case the poll
+        returns early -- once every peer's ``store.add`` completes,
+        the very next 50ms read observes ``count == world_size`` and
+        returns ``True``.
+      * Subsequent checks (NIXL_RETIRE fallback ticks): spin up to
+        ``_CATCH_UP_FALLBACK_S`` (200ms). Sufficient to catch a
+        counter update that lands during the tick (typical FSM tick
+        cadence is 10-50ms), but never burns 5s of scheduler thread
+        on a stuck cohort. The prior single-tick 5s spin on every
+        fallback risked starving unrelated work (KV admission, DPC
+        control) for seconds at a time when the actual counter
+        update was already visible microseconds later.
+
+    Always re-runs the poll on every check (no one-shot flag): the
+    previous ``catch_up_used`` design skipped the poll on subsequent
+    calls, which deadlocked MC09 cycle 2 when the fold's 5s spin
+    ended exactly as the remaining ranks completed their
+    ``store.add`` -- the very next non-blocking read raced the
+    counter update and returned ``False``, leaving the FSM pinned in
+    NIXL_RETIRE with no re-poll path.
 
     Also enforces the 300s deadline so a stuck cohort (e.g. a joiner
     caught in a torch.distributed collective without a timeout) fails
@@ -750,15 +870,25 @@ def nixl_retire_barrier_check(
 
     try:
         store = get_global_tcp_store()
-    except Exception:
+    except Exception as exc:
+        logger.debug(
+            "[Elastic EP][retire] rank=%d get_global_tcp_store() raised (%s) "
+            "in NIXL retire barrier check; treating as ready",
+            state.rank,
+            exc,
+        )
         store = None
     if store is None:
         # Store went away since post; treat as ready so we don't wedge.
         return True
 
-    catch_up_deadline = (
-        time.monotonic() + _NIXL_RETIRE_STORE_BARRIER_CATCH_UP_S
+    catch_up_window_s = (
+        _NIXL_RETIRE_STORE_BARRIER_CATCH_UP_FIRST_S
+        if state.first_check
+        else _NIXL_RETIRE_STORE_BARRIER_CATCH_UP_FALLBACK_S
     )
+    state.first_check = False
+    catch_up_deadline = time.monotonic() + catch_up_window_s
     last_seen_count: Optional[int] = None
     while True:
         try:
@@ -797,11 +927,41 @@ def nixl_retire_barrier_consume(
     Called after :func:`nixl_retire_barrier_check` has returned
     ``True``. There is no ``torch.distributed.Work`` handle to
     ``wait()`` on for a store barrier -- the check already verified
-    every rank has posted -- so this is a pure log record for the
-    FSM trace.
+    every rank has posted -- so the only remaining work is to reset
+    the arrival counter (so the NEXT cycle's post starts at
+    ``arrival=1`` and re-elects a fresh leader; see
+    :func:`nixl_retire_barrier_post`).
+
+    Reset invariant: ONLY the elected leader for this cycle
+    (``state.arrival == 1``) writes ``ARRIVAL_KEY = 0``. If every
+    rank did the reset, a fast rank that already completed cycle N's
+    fold and posted cycle (N+1)'s ``store.add(ARRIVAL_KEY, 1)`` would
+    have its ``arrival = 1`` clobbered back to 0 by a slow rank
+    still finishing cycle N's consume, letting a THIRD rank get
+    ``arrival = 1`` again for cycle N+1 -- two leaders, two
+    ``store.add`` calls on ``CYCLE_KEY``, cohort splits across two
+    epochs. Restricting the reset to the leader (which is
+    monotonically first-in / first-out for its own cycle) avoids
+    this race.
     """
     if state is None:
         return
+    if state.arrival == 1:
+        try:
+            from sglang.srt.distributed.utils import get_global_tcp_store
+
+            store = get_global_tcp_store()
+            if store is not None:
+                store.set(_NIXL_RETIRE_ARRIVAL_COUNTER_KEY, "0")
+        except Exception as exc:
+            logger.debug(
+                "[Elastic EP][retire] rank=%d (leader) TCPStore reset "
+                "failed for e=%d (%s); next cycle's arrival counter "
+                "may be stale",
+                state.rank,
+                state.epoch,
+                exc,
+            )
     logger.info(
         "[Elastic EP][retire] rank=%d NIXL retire barrier consumed "
         "e=%d (arrival=%d, wait=%.3fs)",
@@ -975,6 +1135,21 @@ def try_recover_ranks(global_ranks: List[int]) -> bool:
 
     This matches :func:`try_retire_ranks` which also only writes the
     mask on sub-groups.
+
+    TODO: there is no cohort-scope barrier around this call today.
+    Every incumbent survivor drives its own ``try_recover_ranks``
+    from :meth:`ModelRunner.maybe_join_ep_ranks` based on its local
+    per-request state, so a slow survivor can still be advertising
+    the pre-grow ``active_ranks`` mask on WORLD when a fast survivor
+    has already flipped and re-broadcast the expanded expert-
+    location map. A naive cohort barrier here would deadlock the
+    survivor cohort against in-flight ``mlp_sync`` all-gather
+    (survivors call ``try_recover_ranks`` outside the FSM's
+    admission gate, so ``mlp_sync`` is still live on WORLD when
+    this runs). A proper fix requires either (a) moving the recover
+    path inside the elastic FSM's admission gate (like scale-down)
+    or (b) using a dedicated grow-side FSM with its own drain
+    barrier.
     """
     # ``include_subgroups=True``: recover-mode joiners rebuild the
     # launch-time ``parallel_state._WORLD.device_group`` and
@@ -1270,6 +1445,19 @@ class _RetireBarrierState:
     others (see :func:`retire_barrier_check` docstring). The store
     counter is polled every tick as a reliable readiness signal so no
     rank races ahead of the cohort into ``try_retire_ranks``.
+
+    ``arrival`` is 1 for the elected cycle leader (see
+    :func:`retire_barrier_post`) and ``>=2`` for followers. Used by
+    :func:`retire_barrier_consume` to gate the arrival-counter reset:
+    a non-leader reset would race a fast rank that already entered
+    the next cycle's ``store.add`` and let a THIRD rank get
+    ``arrival=1`` again, splitting the cohort across two epochs.
+    ``0`` marks a cycle whose epoch fell back to the per-process
+    counter (store unavailable), in which case the leader-only
+    reset is a no-op and the arrival counter simply grows unbounded
+    -- correctness is still preserved because followers under the
+    fallback path never consult the arrival counter for epoch
+    derivation.
     """
 
     handle: Optional["torch.distributed.Work"]
@@ -1277,13 +1465,109 @@ class _RetireBarrierState:
     world_size: int
     ready_key: str
     rank: int
+    arrival: int = 0
 
 
+# Per-process fallback epoch counter for the outer retire barrier.
+# Used only when the shared TCPStore-based elected-leader derivation
+# (see below) is unreachable -- the WORLD ``async_op`` handle in
+# :class:`_RetireBarrierState` is the true synchronization primitive,
+# so a per-process epoch is still correctness-safe for a single
+# cohort. It becomes incorrect ONLY when a cohort contains ex-joiners
+# whose fresh subprocesses started with a local counter of 0 while
+# incumbent ranks have already advanced their local counter; a
+# TCPStore-shared epoch fixes that fast-path (see below).
 _RETIRE_BARRIER_EPOCH = 0
+
+# Shared TCPStore keys for the elected-leader epoch derivation. See
+# :func:`nixl_retire_barrier_post` for the same pattern applied to
+# the NIXL retire barrier.
+_RETIRE_BARRIER_ARRIVAL_COUNTER_KEY = "sglang_retire_barrier_arrival_counter"
+_RETIRE_BARRIER_CYCLE_KEY = "sglang_retire_barrier_cycle_counter"
+_RETIRE_BARRIER_CYCLE_ID_CATCH_UP_S = 5.0
+_last_local_retire_cycle_id: int = 0
 
 
 def _retire_barrier_ready_key(epoch: int) -> str:
     return f"sglang_retire_barrier_e{epoch}_posted"
+
+
+def _derive_shared_retire_barrier_epoch(
+    store, rank: int
+) -> tuple[Optional[int], int]:
+    """Elected-leader epoch derivation over the shared TCPStore.
+
+    Returns ``(epoch, arrival)``. ``epoch is None`` signals the caller
+    to fall back to the per-process counter (store atomically-increment
+    unavailable, or leader window elapsed without a follower observing
+    the leader's bump). ``arrival`` is 1 for the elected leader and
+    ``>=2`` for followers of a given cycle.
+
+    Why not just keep the per-process counter: for a cohort that
+    contains an ex-joiner whose subprocess only started AFTER the
+    survivor's first shrink, the ex-joiner's per-process counter is
+    lagging by that first shrink's worth of increments. Rank 0
+    computes ``e2``; the ex-joiner computes ``e1``; the two write to
+    different ``ready_key`` s and the atomic-counter fast-path in
+    :func:`retire_barrier_check` never observes ``count >=
+    world_size``. The WORLD async barrier still completes and the
+    fallback branch in ``retire_barrier_check`` catches it, but the
+    fast-path (which was added precisely to guard against Mooncake
+    ``is_completed()`` flakes) is silently disabled for exactly the
+    cohort configuration that most needs it.
+    """
+    global _last_local_retire_cycle_id
+    try:
+        arrival = int(store.add(_RETIRE_BARRIER_ARRIVAL_COUNTER_KEY, 1))
+    except Exception as exc:
+        logger.debug(
+            "[Elastic EP][retire_barrier] rank=%d store.add arrival failed "
+            "(%s); falling back to per-process epoch",
+            rank,
+            exc,
+        )
+        return None, 0
+
+    if arrival == 1:
+        try:
+            epoch = int(store.add(_RETIRE_BARRIER_CYCLE_KEY, 1))
+            _last_local_retire_cycle_id = epoch
+            return epoch, arrival
+        except Exception as exc:
+            logger.debug(
+                "[Elastic EP][retire_barrier] rank=%d (leader) store.add "
+                "cycle_id failed (%s); falling back to per-process epoch",
+                rank,
+                exc,
+            )
+            return None, arrival
+
+    deadline = time.monotonic() + _RETIRE_BARRIER_CYCLE_ID_CATCH_UP_S
+    while time.monotonic() < deadline:
+        try:
+            raw = store.get(_RETIRE_BARRIER_CYCLE_KEY)
+            candidate = int(raw.decode() if isinstance(raw, bytes) else raw)
+        except Exception as exc:
+            logger.debug(
+                "[Elastic EP][retire] rank=%d TCPStore get on outer retire "
+                "cycle counter transient error (%s); reusing local cycle id",
+                rank,
+                exc,
+            )
+            candidate = _last_local_retire_cycle_id
+        if candidate > _last_local_retire_cycle_id:
+            _last_local_retire_cycle_id = candidate
+            return candidate, arrival
+        time.sleep(0.05)
+
+    logger.warning(
+        "[Elastic EP][retire_barrier] rank=%d arrival=%d could not "
+        "observe cycle id within %.1fs; falling back to per-process epoch",
+        rank,
+        arrival,
+        _RETIRE_BARRIER_CYCLE_ID_CATCH_UP_S,
+    )
+    return None, arrival
 
 
 def retire_barrier_post() -> Optional[_RetireBarrierState]:
@@ -1310,13 +1594,24 @@ def retire_barrier_post() -> Optional[_RetireBarrierState]:
     that is reliable across the Mooncake WORLD backend's flaky
     ``is_completed()``. The counter reaching ``world_size`` means every
     rank has entered this function, which is what the FSM cares about
-    (all ranks have paused new work and posted the barrier). See MC02A
-    flake analysis: without this, rank 1's ``is_completed()`` may
-    return ``True`` while rank 0's returns ``False`` forever; rank 1
-    then advances to FLIP_MASK and blocks on the inner WORLD barrier
-    inside ``_refresh_nixl_ep_members``, which in turn blocks rank
-    0/2/3's next-tick ``mlp_sync`` (rank 1 is no longer participating),
-    and the FSM polling loop stalls -- the whole cohort deadlocks.
+    (all ranks have paused new work and posted the barrier). Without
+    this store fast-path, ``is_completed()`` may return ``True`` on
+    one rank while others still poll ``False`` forever; the racing
+    rank then advances to FLIP_MASK and blocks on the inner WORLD
+    barrier inside ``_refresh_nixl_ep_members``, which in turn blocks
+    peer ranks' next-tick ``mlp_sync``, and the FSM stalls -- the
+    whole cohort deadlocks.
+
+    Epoch derivation uses an elected-leader pattern over the shared
+    TCPStore so every rank in the cohort agrees on the same
+    ``ready_key`` even when the cohort contains ex-joiners whose
+    subprocess-local ``_RETIRE_BARRIER_EPOCH`` counter is lagging
+    (mixed launch generations). If the store is unreachable or the
+    leader's cycle-id write fails, each rank falls back to its own
+    per-process counter; correctness is still guaranteed by the
+    WORLD async barrier ``handle.wait()`` and the fallback branch in
+    :func:`retire_barrier_check`, but the atomic-counter fast-path
+    is disabled for that cycle.
 
     Two invariants preserved from the original blocking barrier:
 
@@ -1330,42 +1625,91 @@ def retire_barrier_post() -> Optional[_RetireBarrierState]:
     global _RETIRE_BARRIER_EPOCH
     if not torch.distributed.is_initialized():
         return None
-    _RETIRE_BARRIER_EPOCH += 1
-    epoch = _RETIRE_BARRIER_EPOCH
     world_size = torch.distributed.get_world_size()
     rank = torch.distributed.get_rank()
 
+    # Barrier target: the count of ranks that will actually post at
+    # THIS retire boundary -- the pre-shrink cohort's ``effective_ep_size``,
+    # NOT the launch ``world_size``. On chained shrinks (e.g. 4 -> 3 -> 2)
+    # only ``effective`` ranks call ``post``; waiting for ``world_size``
+    # arrivals caps the store counter below the target and falls through
+    # to the unreliable ``handle.is_completed()`` path in
+    # :func:`retire_barrier_check` (Mooncake WORLD is_completed has been
+    # observed to return False forever after wait() has returned on the
+    # peer). Mirrors the sibling :func:`nixl_retire_barrier_post` fix.
+    # ``effective_ep_size`` is the pre-shrink cohort here because
+    # :meth:`ElasticEPStateManager.commit_scale` runs strictly AFTER
+    # this barrier releases.
+    barrier_target = world_size
+    try:
+        effective = ElasticEPStateManager.get_effective_ep_size()
+        if effective > 0:
+            barrier_target = effective
+    except Exception as exc:
+        logger.debug(
+            "[Elastic EP][retire_barrier] rank=%d get_effective_ep_size "
+            "failed (%s); falling back to launch world_size=%d for outer "
+            "retire barrier target",
+            rank,
+            exc,
+            world_size,
+        )
+
+    from sglang.srt.distributed.utils import get_global_tcp_store
+
+    store = None
+    try:
+        store = get_global_tcp_store()
+    except Exception as exc:
+        logger.debug(
+            "[Elastic EP][retire] rank=%d get_global_tcp_store() raised (%s) "
+            "in outer retire barrier post; using per-process epoch fallback",
+            rank,
+            exc,
+        )
+        store = None
+
+    epoch: Optional[int] = None
+    arrival = 0
+    if store is not None:
+        epoch, arrival = _derive_shared_retire_barrier_epoch(store, rank)
+
+    if epoch is None:
+        _RETIRE_BARRIER_EPOCH += 1
+        epoch = _RETIRE_BARRIER_EPOCH
+
     logger.info(
-        "[Elastic EP][retire_barrier] rank=%d posting async barrier e=%d",
+        "[Elastic EP][retire_barrier] rank=%d posting async barrier "
+        "e=%d (arrival=%d)",
         rank,
         epoch,
+        arrival,
     )
     handle = torch.distributed.barrier(
         group=torch.distributed.group.WORLD, async_op=True
     )
 
     ready_key = _retire_barrier_ready_key(epoch)
-    try:
-        from sglang.srt.distributed.utils import get_global_tcp_store
-
-        store = get_global_tcp_store()
-        if store is not None:
+    if store is not None:
+        try:
             store.add(ready_key, 1)
-    except Exception as exc:
-        logger.warning(
-            "[Elastic EP][retire_barrier] rank=%d TCP store add failed "
-            "for e=%d (%s); falling back to is_completed polling",
-            rank,
-            epoch,
-            exc,
-        )
+        except Exception as exc:
+            logger.warning(
+                "[Elastic EP][retire_barrier] rank=%d TCP store ready-key "
+                "add failed for e=%d (%s); falling back to is_completed "
+                "polling",
+                rank,
+                epoch,
+                exc,
+            )
 
     return _RetireBarrierState(
         handle=handle,
         epoch=epoch,
-        world_size=world_size,
+        world_size=barrier_target,
         ready_key=ready_key,
         rank=rank,
+        arrival=arrival,
     )
 
 
@@ -1411,12 +1755,21 @@ def retire_barrier_check(
             count = int(raw.decode() if isinstance(raw, bytes) else raw)
             if count >= state.world_size:
                 return True
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug(
+            "[Elastic EP][retire] rank=%d outer retire drain-barrier "
+            "TCPStore probe transient error (%s); falling back to "
+            "handle.is_completed()",
+            state.rank,
+            exc,
+        )
 
     if state.handle is None:
         return True
     return state.handle.is_completed()
+
+
+_RETIRE_BARRIER_CONSUME_TIMEOUT_S = 30.0
 
 
 def retire_barrier_consume(
@@ -1428,13 +1781,73 @@ def retire_barrier_consume(
     returned ``True`` so the caller can safely proceed to the mask flip.
     ``wait()`` is expected to return immediately since every rank has
     posted the barrier (either the store counter or is_completed said
-    so).
+    so). We nevertheless enforce a bounded ``timeout`` on ``wait()``
+    so a rank whose peer entered ``sys.exit`` (retiree local cleanup)
+    between the check and the consume cannot wedge the caller
+    indefinitely: the ``Work`` handle is on WORLD, and Mooncake's
+    WORLD backend has been observed to hang ``wait()`` forever if a
+    peer disappeared mid-flight. A ``TimeoutError`` here is
+    converted to a warning + best-effort proceed; the store counter
+    already confirmed every rank posted, so the invariant the
+    caller cares about (all ranks reached the barrier) is
+    preserved.
     """
     if state is None:
         return
     t0 = time.monotonic()
     if state.handle is not None:
-        state.handle.wait()
+        try:
+            # ``Work.wait`` accepts a ``timedelta`` on modern
+            # torch.distributed; guard against older backends that
+            # ignore the arg by wrapping in a wall-clock check.
+            state.handle.wait(
+                timeout=timedelta(seconds=_RETIRE_BARRIER_CONSUME_TIMEOUT_S)
+            )
+        except TypeError:
+            # Backend does not accept the ``timeout`` kwarg. Fall
+            # back to a blocking wait -- the store counter already
+            # confirmed the barrier so this SHOULD return promptly.
+            state.handle.wait()
+        except Exception as exc:
+            elapsed = time.monotonic() - t0
+            logger.warning(
+                "[Elastic EP][retire_barrier] rank=%d handle.wait(e=%d) "
+                "raised after %.1fs (%s); store counter already "
+                "confirmed all posts -- proceeding",
+                state.rank,
+                state.epoch,
+                elapsed,
+                exc,
+            )
+    # Leader-only reset of the shared arrival counter for the elected-
+    # leader epoch derivation. Same rationale as
+    # :func:`nixl_retire_barrier_consume`: allowing any rank to reset
+    # the counter races with a fast peer that already entered the next
+    # cycle's ``store.add``, so a slow rank finishing the previous
+    # cycle can clobber the peer's fresh ``arrival=1`` back to 0 and
+    # let a third rank re-elect itself leader on top of the peer's
+    # cycle. We restrict the reset to the rank whose ``arrival == 1``
+    # for THIS cycle -- that rank is monotonically first-in / first-out
+    # for its own cycle, so no other rank has yet moved on. Cycles
+    # whose epoch fell back to the per-process counter (``arrival ==
+    # 0``) do not touch the counter; they never advertised on the
+    # shared TCPStore.
+    if state.arrival == 1:
+        try:
+            from sglang.srt.distributed.utils import get_global_tcp_store
+
+            store = get_global_tcp_store()
+            if store is not None:
+                store.set(_RETIRE_BARRIER_ARRIVAL_COUNTER_KEY, "0")
+        except Exception as exc:
+            logger.debug(
+                "[Elastic EP][retire_barrier] rank=%d (leader) TCPStore "
+                "reset failed for e=%d (%s); next cycle's arrival counter "
+                "may be stale",
+                state.rank,
+                state.epoch,
+                exc,
+            )
     logger.info(
         "[Elastic EP][retire_barrier] rank=%d barrier consumed e=%d "
         "(wait=%.3fs)",
@@ -1471,15 +1884,42 @@ def retiree_local_cleanup() -> None:
       OS promptly.
 
     We deliberately do NOT call ``torch.distributed.destroy_process_
-    group()``. The launch-time process groups (both torch default WORLD
-    and every sglang parallel group) stay at their launch-time
-    membership; destroying them here would trigger the well-known
-    "destroy blocks on live NCCL/Mooncake comms" hang (see the
-    ``# Why`` note at ``parallel_state.py:2775-2784``). Process exit
-    reclaims all Mooncake / NCCL / CUDA state for this process; the
-    survivors' Mooncake internal peer state moves the retiree slot to
-    inactive via the mask, and the reserved-but-inactive slot stays
-    available for a later ``recover_ranks`` reactivation.
+    group()``, and we do NOT explicitly tear down NIXL / Mooncake
+    RDMA endpoints on the retiree side. The launch-time process
+    groups (both torch default WORLD and every sglang parallel group)
+    stay at their launch-time membership; destroying them here would
+    trigger the well-known "destroy blocks on live NCCL/Mooncake
+    comms" hang (see the ``# Why`` note at
+    ``parallel_state.py:2775-2784``).
+
+    RDMA endpoint teardown is deferred to kernel-driven process
+    cleanup for two reasons:
+
+    1. The survivor already dropped its RDMA QP state to this
+       retiree via
+       :meth:`layers.moe.token_dispatcher.nixl.EPBuffer.on_retire`
+       (called inside :func:`try_retire_ranks` under the retire
+       barrier). The survivor no longer waits for
+       ``FINISHED_SUM_TAG`` contributions from the retiree, so an
+       abrupt retiree exit cannot wedge a survivor collective.
+    2. Explicit ``ep_buffer.destroy()`` on the retiree could hang
+       if the Mooncake backend's WORLD-scope teardown races the
+       survivors' post-shrink Mooncake state, since Mooncake C++
+       peer arrays are fixed-size and expect every launch-time
+       slot to still be reachable during destroy. Waiting for a
+       destroy timeout on the retiree would delay process exit
+       and leave the survivor-side ``ElasticScaleUpdateReq``
+       ``direction=shrink`` reporting a longer end-to-end shrink
+       time.
+
+    Process exit reclaims all Mooncake / NCCL / CUDA / NIXL state
+    for this process at the kernel level (page tables, GPU BAR
+    mappings, RDMA verbs QPs, TCPStore file descriptors). The
+    reserved-but-inactive slot stays available for a later
+    ``recover_ranks`` reactivation because the survivors keep the
+    slot's rank id in their peer arrays with ``active_ranks[slot] =
+    0`` -- Mooncake's mask read protocol skips inactive slots
+    without probing the (now-dead) endpoint.
     """
     if torch.cuda.is_available():
         t0 = time.monotonic()

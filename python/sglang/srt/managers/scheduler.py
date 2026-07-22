@@ -5163,12 +5163,14 @@ def run_scheduler_process(
         # Send initialization info back to the parent process
         pipe_writer.send(scheduler.get_init_info())
 
-        # Recover-mode joiners have finished every boot-time step that
-        # requires ``is_ep_offset_joiner=True`` (per-cohort pg_world_size
-        # in :meth:`ModelRunner.initialize`, launch-cohort EPLB layout in
+        # Both recover-mode and scale-mode joiners have finished every
+        # boot-time step that requires the joiner-specific flag view
+        # (per-cohort pg_world_size in :meth:`ModelRunner.initialize`,
+        # launch-cohort EPLB layout in
         # :meth:`ExpertLocationMetadata._init_common`, distributed=False
-        # KV-cache profile in :meth:`ModelRunnerKVCacheMixin._profile_
-        # available_bytes`, tokenizer/detokenizer IPC wiring in
+        # KV-cache profile in
+        # :meth:`ModelRunnerKVCacheMixin._profile_available_bytes`,
+        # tokenizer/detokenizer IPC wiring in
         # :meth:`DataParallelController.launch_dp_attention_schedulers`,
         # skip-warmup in the HTTP server, etc.). Clear ``ep_join_mode``
         # now so the ex-joiner is treated as a normal cohort member on
@@ -5180,12 +5182,18 @@ def run_scheduler_process(
         # ``ep_size = max(effective, elastic_ep_initial_size)
         # = max(6, 8) = 8``, but the survivor-only
         # ``physical_to_logical_map`` has already been truncated to
-        # ``num_local * 6`` columns. The ``ep_join_rank_offset`` stays
-        # set because ``_elastic_global_rank`` still uses it to
-        # compute the ex-joiner's global rank as ``tp_rank + offset``.
-        if scheduler.server_args.ep_join_mode == "recover":
+        # ``num_local * 6`` columns. Scale-mode joiners share the same
+        # invariant (all post-boot control-flow paths that special-case
+        # them do so via ``is_ep_offset_joiner`` -- which pattern-matches
+        # both modes -- or via the boot-time-only
+        # ``_init_joiner_state`` / ``join_scale_process_group``, both of
+        # which have already run by the time we get here). The
+        # ``ep_join_rank_offset`` stays set because
+        # ``_elastic_global_rank`` still uses it to compute the
+        # ex-joiner's global rank as ``tp_rank + offset``.
+        if scheduler.server_args.ep_join_mode in ("recover", "scale"):
             scheduler.server_args.override(
-                "elastic_ep.recover_joined", ep_join_mode=None
+                "elastic_ep.joined", ep_join_mode=None
             )
 
         # Run the event loop (blocks until a ShutdownReq sets gracefully_exit)
