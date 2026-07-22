@@ -12,6 +12,11 @@ from sglang.srt.environ import envs
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
+    from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
+
+
+ONLINE_C128_MAX_VERIFY_TOKENS = 8
+
 
 @cache_once
 def _jit_online_c128_mtp_module(
@@ -46,6 +51,8 @@ class _OnlineC128LayerRuntime:
 class _OnlineC128VerifyContext:
     req_pool_indices: torch.Tensor
     seq_lens: torch.Tensor
+    verify_lens: torch.Tensor
+    extend_start_loc: torch.Tensor
 
 
 class OnlineC128MTPController:
@@ -53,11 +60,21 @@ class OnlineC128MTPController:
         self.backend = backend
         self._verify_ctx: Optional[_OnlineC128VerifyContext] = None
         self._layer_runtimes: Optional[List[_OnlineC128LayerRuntime]] = None
+        self._empty_i32 = torch.empty(
+            (0,), dtype=torch.int32, device=self.backend.device
+        )
 
     def enabled(self) -> bool:
+        if not envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get():
+            return False
+        if self.backend.model_runner.is_draft_worker:
+            return False
+        spec_alg = self.backend.model_runner.spec_algorithm
+        if spec_alg.is_dspark():
+            return True
         return (
-            envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
-            and envs.SGLANG_EXPERIMENTAL_ONLINE_C128_MTP.get()
+            envs.SGLANG_EXPERIMENTAL_ONLINE_C128_MTP.get()
+            and spec_alg.is_eagle()
             and self.backend.mtp_enabled
         )
 
@@ -70,14 +87,26 @@ class OnlineC128MTPController:
         self,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
+        ragged_layout: Optional[RaggedVerifyLayout] = None,
     ) -> None:
         if not self.enabled():
             self.clear()
             return
 
+        verify_lens = self._empty_i32
+        extend_start_loc = self._empty_i32
+        if ragged_layout is not None:
+            bs = req_pool_indices.shape[0]
+            verify_lens = self.backend.extend_seq_lens_buffer[:bs]
+            extend_start_loc = self.backend.extend_start_loc_buffer[:bs]
+            verify_lens.copy_(ragged_layout.verify_lens[:bs])
+            extend_start_loc.copy_(ragged_layout.extend_start_loc[:bs])
+
         self._verify_ctx = _OnlineC128VerifyContext(
             req_pool_indices=req_pool_indices.detach(),
             seq_lens=seq_lens.detach(),
+            verify_lens=verify_lens,
+            extend_start_loc=extend_start_loc,
         )
         head_dim = self._head_dim()
         state_dtype = self._state_dtype()
@@ -104,6 +133,7 @@ class OnlineC128MTPController:
         seq_lens: torch.Tensor,
         *,
         verify_bs: Optional[int] = None,
+        ragged_layout: Optional[RaggedVerifyLayout] = None,
     ) -> int:
         if not self.enabled():
             self.clear()
@@ -133,6 +163,7 @@ class OnlineC128MTPController:
         self.begin_verify(
             req_pool_indices=active_req_pool_indices,
             seq_lens=active_seq_lens,
+            ragged_layout=ragged_layout,
         )
         return self.state_slot_offset()
 
@@ -162,7 +193,11 @@ class OnlineC128MTPController:
         head_dim = compressor.head_dim
         state_pool = token_to_kv_pool.get_attention_compress_states(layer_id)
         state = state_pool.kv_score_buffer.kv_score
-        total_bs = kv_score_input.numel() // (num_verify_tokens * head_dim * 2)
+        total_bs = (
+            ctx.seq_lens.shape[0]
+            if ctx.verify_lens.numel() > 0
+            else kv_score_input.numel() // (num_verify_tokens * head_dim * 2)
+        )
         layer_bs = min(ctx.seq_lens.shape[0], ctx.req_pool_indices.shape[0], total_bs)
         if layer_bs <= 0:
             return
@@ -173,6 +208,8 @@ class OnlineC128MTPController:
             kv_score_input,
             ctx.seq_lens,
             ctx.req_pool_indices,
+            ctx.verify_lens,
+            ctx.extend_start_loc,
             self.backend.req_to_token,
             compressor.ape.reshape(128, head_dim),
             state,
@@ -231,7 +268,13 @@ class OnlineC128MTPController:
         max_draft_tokens = (
             self.backend.token_to_kv_pool.get_online_c128_mtp_max_draft_tokens()
         )
-        return num_verify_tokens if 0 < num_verify_tokens <= max_draft_tokens else 0
+        return (
+            num_verify_tokens
+            if 0
+            < num_verify_tokens
+            <= min(max_draft_tokens, ONLINE_C128_MAX_VERIFY_TOKENS)
+            else 0
+        )
 
     def _active_ctx(self) -> Optional[_OnlineC128VerifyContext]:
         ctx = self._verify_ctx
