@@ -2355,33 +2355,62 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 (logprob, token_id, None)
                 for logprob, token_id in zip(token_logprobs_val, token_logprobs_idx)
             ]
-        else:
-            assert self.tokenizer is not None
-            # In transformers v5, batch_decode([1, 2, 3]) concatenates all tokens
-            # into one string. Wrap each ID in its own list so they decode separately.
-            token_texts = self.tokenizer.batch_decode(
-                [[idx] for idx in token_logprobs_idx]
+
+        assert self.tokenizer is not None
+        token_texts = self._batch_decode_token_ids(token_logprobs_idx)
+        return list(zip(token_logprobs_val, token_logprobs_idx, token_texts))
+
+    def _batch_decode_token_ids(self, token_ids: List[int]) -> List[str]:
+        assert self.tokenizer is not None
+        # In transformers v5, batch_decode([1, 2, 3]) concatenates all tokens
+        # into one string. Wrap each ID in its own list so they decode separately.
+        token_id_seqs = [[idx] for idx in token_ids]
+        backend_tokenizer = getattr(self.tokenizer, "backend_tokenizer", None)
+        if backend_tokenizer is not None and hasattr(backend_tokenizer, "decode_batch"):
+            return backend_tokenizer.decode_batch(
+                token_id_seqs, skip_special_tokens=False
             )
-            return list(zip(token_logprobs_val, token_logprobs_idx, token_texts))
+        return self.tokenizer.batch_decode(token_id_seqs)
 
     def detokenize_top_logprobs_tokens(
         self,
-        token_logprobs_val: List[float],
-        token_logprobs_idx: List[int],
+        token_logprobs_val: List[Optional[List[float]]],
+        token_logprobs_idx: List[Optional[List[int]]],
         decode_to_text: bool,
     ):
-        # TODO: The current implementation only batches the detokenization for top-k tokens per single position.
-        # We should batch all top-k tokens in all positions.
-        ret = []
-        for i in range(len(token_logprobs_val)):
-            if token_logprobs_val[i]:
-                ret.append(
-                    self.detokenize_logprob_tokens(
-                        token_logprobs_val[i], token_logprobs_idx[i], decode_to_text
-                    )
-                )
-            else:
-                ret.append(None)
+        ret: List[Optional[List]] = [None] * len(token_logprobs_val)
+
+        if not decode_to_text:
+            for i, vals in enumerate(token_logprobs_val):
+                if vals:
+                    idxs = token_logprobs_idx[i]
+                    assert idxs is not None
+                    ret[i] = self.detokenize_logprob_tokens(vals, idxs, decode_to_text)
+            return ret
+
+        assert self.tokenizer is not None
+        flat_ids: List[int] = []
+        nonempty_positions: List[int] = []
+        lengths: List[int] = []
+        for i, vals in enumerate(token_logprobs_val):
+            if vals:
+                idxs = token_logprobs_idx[i]
+                assert idxs is not None
+                flat_ids.extend(idxs)
+                lengths.append(len(idxs))
+                nonempty_positions.append(i)
+
+        if not flat_ids:
+            return ret
+
+        decoded = self._batch_decode_token_ids(flat_ids)
+        offset = 0
+        for pos, length in zip(nonempty_positions, lengths):
+            chunk_texts = decoded[offset : offset + length]
+            offset += length
+            ret[pos] = list(
+                zip(token_logprobs_val[pos], token_logprobs_idx[pos], chunk_texts)
+            )
         return ret
 
     def _calculate_spec_decoding_metrics(
