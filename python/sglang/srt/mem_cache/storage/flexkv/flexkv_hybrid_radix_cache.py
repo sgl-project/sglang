@@ -238,13 +238,14 @@ class FlexKVHybridRadixCache(BasePrefixCache):
 
         from sglang.srt.mem_cache.common import evict_from_tree_cache
 
-        evict_from_tree_cache(
-            self,
-            host_hit_length,
-            swa_num_tokens=(
-                min(self.page_size, host_hit_length) if self.supports_swa() else 0
-            ),
-        )
+        swa_need = None
+        if self.supports_swa():
+            swa_need = (
+                host_hit_length
+                if self.page_size == 1
+                else min(self.page_size, host_hit_length)
+            )
+        evict_from_tree_cache(self, host_hit_length, swa_num_tokens=swa_need)
         if self.page_size == 1:
             return allocator.alloc(host_hit_length)
         return self._alloc_restore_slots_once(req, host_hit_length)

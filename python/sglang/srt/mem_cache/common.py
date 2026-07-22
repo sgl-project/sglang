@@ -58,9 +58,9 @@ def free_swa_out_of_window_slots(
         return
 
     # For swa radix cache, we need to evict the tokens that are not in the tree cache and also not in the sliding window
-    assert (
-        req.cache_protected_len % page_size == 0
-    ), "cache_protected_len must be page aligned"
+    assert req.cache_protected_len % page_size == 0, (
+        "cache_protected_len must be page aligned"
+    )
     evict_floor = max(req.cache_protected_len, getattr(req, "swa_evict_floor", 0))
     if page_size > 1 and evict_floor > req.cache_protected_len:
         evict_floor = -(-evict_floor // page_size) * page_size
@@ -102,7 +102,19 @@ def maybe_cache_unfinished_req(req: Req, tree_cache: BasePrefixCache, **kwargs):
     tree_cache.cache_unfinished_req(req, **kwargs)
 
 
-def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
+def evict_from_tree_cache(
+    tree_cache: BasePrefixCache | None,
+    num_tokens: int,
+    *,
+    swa_num_tokens: int | None = None,
+):
+    """Evict enough radix-cache entries to satisfy an allocation.
+
+    For a hybrid SWA allocator, ``num_tokens`` is the full-attention demand and
+    ``swa_num_tokens`` is the independent SWA demand. The latter defaults to
+    ``num_tokens`` for existing callers that allocate both pools symmetrically.
+    Tail-only restore paths may request less SWA capacity than full capacity.
+    """
     if tree_cache is None:
         return
 
@@ -110,18 +122,35 @@ def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
         return
 
     allocator = tree_cache.token_to_kv_pool_allocator
+    swa_need = num_tokens if swa_num_tokens is None else swa_num_tokens
 
     if isinstance(allocator, SWATokenToKVPoolAllocator):
         # Hybrid allocator
-        full_available_size = allocator.full_available_size()
-        swa_available_size = allocator.swa_available_size()
+        while True:
+            full_available_size = allocator.full_available_size()
+            swa_available_size = allocator.swa_available_size()
+            if full_available_size >= num_tokens and swa_available_size >= swa_need:
+                break
 
-        if full_available_size < num_tokens or swa_available_size < num_tokens:
             full_num_tokens = max(0, num_tokens - full_available_size)
-            swa_num_tokens = max(0, num_tokens - swa_available_size)
+            swa_to_evict = max(0, swa_need - swa_available_size)
+            if full_num_tokens == 0 and swa_to_evict == 0:
+                break
+
             tree_cache.evict(
-                EvictParams(num_tokens=full_num_tokens, swa_num_tokens=swa_num_tokens)
+                EvictParams(
+                    num_tokens=full_num_tokens,
+                    swa_num_tokens=swa_to_evict,
+                )
             )
+
+            new_full_available_size = allocator.full_available_size()
+            new_swa_available_size = allocator.swa_available_size()
+            if (
+                new_full_available_size == full_available_size
+                and new_swa_available_size == swa_available_size
+            ):
+                break
     else:
         # Standard allocator
         if allocator.available_size() < num_tokens:
@@ -133,9 +162,9 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     assert (req.req_pool_idx is None) == (req.kv is None)
     # MambaRadixCache may alloc mamba state before alloc KV cache
     if req.req_pool_idx is None:
-        assert (
-            tree_cache.supports_mamba()
-        ), "Only MambaRadixCache allow freeing before alloc"
+        assert tree_cache.supports_mamba(), (
+            "Only MambaRadixCache allow freeing before alloc"
+        )
         # TODO (csy, hanming): clean up this early allocation logic
         if req.mamba_pool_idx is not None:
             tree_cache.req_to_token_pool.mamba_allocator.free(
@@ -164,9 +193,9 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     if isinstance(tree_cache.req_to_token_pool, HybridReqToTokenPool) and (
         not tree_cache.supports_mamba()
     ):
-        assert (
-            req.mamba_pool_idx is not None
-        ), "mamba state is freed while the tree cache does not manage mamba states"
+        assert req.mamba_pool_idx is not None, (
+            "mamba state is freed while the tree cache does not manage mamba states"
+        )
         tree_cache.req_to_token_pool.free_mamba_cache(req)
     # The DSV4-NPU ReqToTokenPool subclass's free() additionally releases the
     # c4/c128 state pages; other ReqToTokenPool subclasses are a no-op here.
@@ -184,9 +213,9 @@ def _release_overallocated_kv_indices(
     # strip_thinking_cache intentionally reports output tokens as overallocated
     # so they fall into the free path below (#22373).
     if spec_algo is None and not global_server_args.strip_thinking_cache:
-        assert (
-            start_p == end_p
-        ), f"Unexpected overallocated KV cache, {req.kv_committed_len=}, {req.kv.kv_allocated_len=}"
+        assert start_p == end_p, (
+            f"Unexpected overallocated KV cache, {req.kv_committed_len=}, {req.kv.kv_allocated_len=}"
+        )
 
     if page_size > 1:
         start_p = ceil_align(start_p, page_size)

@@ -140,3 +140,23 @@ def test_reset_drains_flexkv_before_releasing_inner_slots():
         call.connector.reset(),
         call.inner.reset(),
     ]
+
+
+def test_page_size_one_restore_requests_swa_for_the_full_hit():
+    allocator = MagicMock()
+    restored_slots = torch.arange(8, dtype=torch.int64)
+    allocator.alloc.side_effect = [None, restored_slots]
+
+    cache = FlexKVHybridRadixCache.__new__(FlexKVHybridRadixCache)
+    cache.page_size = 1
+    cache.token_to_kv_pool_allocator = allocator
+    cache.supports_swa = MagicMock(return_value=True)
+    req = SimpleNamespace()
+
+    with patch(
+        "sglang.srt.mem_cache.common.evict_from_tree_cache"
+    ) as evict_from_tree_cache:
+        result = cache._alloc_restore_slots(req, host_hit_length=8)
+
+    assert result is restored_slots
+    evict_from_tree_cache.assert_called_once_with(cache, 8, swa_num_tokens=8)
