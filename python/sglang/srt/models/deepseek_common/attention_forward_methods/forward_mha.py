@@ -139,7 +139,6 @@ def _forward_dsa_indexer_for_mha(
 
 
 class DeepseekMHAForwardMixin:
-
     def init_mha_forward(self: DeepseekV2AttentionMLA):
         self.disable_chunked_prefix_cache = (
             get_server_args().disable_chunked_prefix_cache
@@ -472,7 +471,6 @@ class DeepseekMHAForwardMixin:
         accum_lse: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-
         # kv_b_proj needs BF16 input, but legacy q.dtype was BF16 by accident.
         backend = _resolve_attn_backend(forward_batch)
         pack_fn = getattr(backend, "pack_prefix_chunk_kv", None)
@@ -515,7 +513,17 @@ class DeepseekMHAForwardMixin:
                 k[..., : self.qk_nope_head_dim] = k_nope
                 k[..., self.qk_nope_head_dim :] = k_pe
 
-            output, lse = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
+            output, lse = self.attn_mha(
+                q,
+                k,
+                v,
+                forward_batch,
+                save_kv_cache=False,
+                # Prefix K/V is independent of the suffix query length. Under
+                # FullCG this is the fixed captured chunk extent; per-request
+                # active lengths remain encoded in the backend metadata.
+                key_value_num_tokens=k.shape[0],
+            )
             tmp_output = torch.empty_like(accum_output)
             tmp_lse = torch.empty_like(accum_lse)
             merge_state_v2(output, lse, accum_output, accum_lse, tmp_output, tmp_lse)
