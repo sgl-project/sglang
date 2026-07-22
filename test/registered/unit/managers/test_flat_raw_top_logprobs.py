@@ -6,8 +6,11 @@ import asyncio
 import base64
 import json
 import os
+import pickle
 import time
 import unittest
+from array import array
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -16,13 +19,25 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.managers.io_struct import (
+    BatchTokenIDOutput,
+    GenerateReqInput,
+    build_flat_input_top_logprobs_arrays,
+    msgpack_decode,
+    msgpack_encode,
+)
+from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.scheduler_components.logprob_result_processor import (
+    SchedulerLogprobResultProcessor,
+)
 from sglang.srt.managers.tokenizer_manager import (
     ReqState,
     TokenizerManager,
     _build_flat_input_top_logprobs_fields,
+    _build_flat_input_top_logprobs_fields_from_arrays,
 )
 from sglang.srt.observability.req_time_stats import APIServerReqTimeStats
+from sglang.srt.sampling.sampling_params import SamplingParams
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -30,6 +45,12 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 # prompt position, which has no top logprobs.
 _VAL_ROWS = [None, [-0.1, -2.5], [-0.3, -1.5], [-0.05, -4.0]]
 _IDX_ROWS = [None, [11, 22], [33, 44], [55, 66]]
+
+# Float32-exact values for scheduler-flat equivalence tests: the scheduler
+# ships float32 arrays, so equality against the python-float rows needs values
+# that survive the float64 -> float32 round trip (production logprobs do, being
+# computed in float32).
+_EXACT_VAL_ROWS = [None, [-0.5, -2.5], [-0.25, -1.5], [-0.125, -4.0]]
 
 
 class _TokenizerManagerStub:
@@ -296,6 +317,316 @@ class TestB64MetaInfo(CustomTestCase):
         )
 
 
+def _make_logprob_processor() -> SchedulerLogprobResultProcessor:
+    # The processor only reads enable_mis and vocab_size from these.
+    return SchedulerLogprobResultProcessor(
+        server_args=SimpleNamespace(enable_mis=False),
+        model_config=SimpleNamespace(vocab_size=1_000_000),
+    )
+
+
+# Per-position rows as computed during prefill: one row per prompt position
+# from logprob_start_len on, the last row being the sampling position that
+# scheduler-side assembly pops.
+_SCHED_VAL_ROWS = [
+    [-0.5, -2.5],
+    [-0.25, -1.5],
+    [-0.125, -4.0],
+    [-1.0, -3.0],
+    [-2.0, -5.0],
+]
+_SCHED_IDX_ROWS = [[11, 22], [33, 44], [55, 66], [77, 88], [99, 100]]
+
+
+class TestSchedulerFlatAssembly(CustomTestCase):
+    """Scheduler-side flat assembly in the logprob result processor."""
+
+    def _make_req(self, flat: bool, num_tokens: int = 5) -> Req:
+        return Req(
+            "r0",
+            "",
+            array("q", range(1, num_tokens + 1)),
+            SamplingParams(),
+            return_logprob=True,
+            top_logprobs_num=2,
+            return_flat_raw_top_logprobs=flat,
+        )
+
+    def _run_prefill(self, req: Req, chunk_sizes) -> None:
+        processor = _make_logprob_processor()
+        token_logprobs = [row[0] for row in _SCHED_VAL_ROWS]
+        pt = 0
+        for chunk_idx, size in enumerate(chunk_sizes):
+            output = SimpleNamespace(
+                input_token_logprobs=tuple(token_logprobs[pt : pt + size]),
+                input_top_logprobs_val=[_SCHED_VAL_ROWS[pt : pt + size]],
+                input_top_logprobs_idx=[_SCHED_IDX_ROWS[pt : pt + size]],
+            )
+            processor.add_input_logprob_return_values(
+                0,
+                req,
+                output,
+                0,
+                size,
+                last_prefill_chunk=chunk_idx == len(chunk_sizes) - 1,
+            )
+            pt += size
+
+    def test_flat_arrays_replace_nested_rows(self):
+        flag_off = self._make_req(flat=False)
+        self._run_prefill(flag_off, [3, 2])
+        flag_on = self._make_req(flat=True)
+        self._run_prefill(flag_on, [3, 2])
+
+        # Flag off: nested rows as today, no arrays.
+        self.assertIsNone(flag_off.logprob.input_top_logprobs_val_flat)
+        self.assertIsNone(flag_off.logprob.input_top_logprobs_flat_null_prefix)
+        self.assertEqual(
+            flag_off.logprob.input_top_logprobs_val, [None] + _SCHED_VAL_ROWS[:-1]
+        )
+
+        # Flag on: arrays carrying the nested rows' content, nested emptied.
+        val_arr = flag_on.logprob.input_top_logprobs_val_flat
+        idx_arr = flag_on.logprob.input_top_logprobs_idx_flat
+        self.assertEqual(val_arr.dtype, np.float32)
+        self.assertEqual(idx_arr.dtype, np.int32)
+        self.assertEqual(flag_on.logprob.input_top_logprobs_flat_null_prefix, 1)
+        np.testing.assert_array_equal(
+            val_arr, np.asarray(_SCHED_VAL_ROWS[:-1], dtype=np.float32)
+        )
+        np.testing.assert_array_equal(
+            idx_arr, np.asarray(_SCHED_IDX_ROWS[:-1], dtype=np.int32)
+        )
+        self.assertEqual(flag_on.logprob.input_top_logprobs_val, [])
+        self.assertEqual(flag_on.logprob.input_top_logprobs_idx, [])
+        # The non-top logprob results are untouched.
+        self.assertEqual(
+            flag_on.logprob.input_token_logprobs_val,
+            flag_off.logprob.input_token_logprobs_val,
+        )
+        self.assertEqual(
+            flag_on.logprob.input_token_logprobs_idx,
+            flag_off.logprob.input_token_logprobs_idx,
+        )
+
+    def test_chunked_matches_one_shot(self):
+        one_shot = self._make_req(flat=True)
+        self._run_prefill(one_shot, [5])
+        chunked = self._make_req(flat=True)
+        self._run_prefill(chunked, [2, 2, 1])
+        np.testing.assert_array_equal(
+            one_shot.logprob.input_top_logprobs_val_flat,
+            chunked.logprob.input_top_logprobs_val_flat,
+        )
+        np.testing.assert_array_equal(
+            one_shot.logprob.input_top_logprobs_idx_flat,
+            chunked.logprob.input_top_logprobs_idx_flat,
+        )
+        self.assertEqual(
+            one_shot.logprob.input_top_logprobs_flat_null_prefix,
+            chunked.logprob.input_top_logprobs_flat_null_prefix,
+        )
+
+    def test_unrepresentable_rows_fall_back_to_nested(self):
+        req = self._make_req(flat=True, num_tokens=3)
+        processor = _make_logprob_processor()
+        val_rows = [[-0.5, -2.5], [-0.25], [-0.125, -4.0]]
+        idx_rows = [[11, 22], [33], [55, 66]]
+        output = SimpleNamespace(
+            input_token_logprobs=(-0.5, -0.25, -0.125),
+            input_top_logprobs_val=[val_rows],
+            input_top_logprobs_idx=[idx_rows],
+        )
+        with self.assertLogs(
+            "sglang.srt.managers.scheduler_components.logprob_result_processor",
+            level="WARNING",
+        ):
+            processor.add_input_logprob_return_values(
+                0, req, output, 0, 3, last_prefill_chunk=True
+            )
+        self.assertIsNone(req.logprob.input_top_logprobs_val_flat)
+        self.assertIsNone(req.logprob.input_top_logprobs_flat_null_prefix)
+        self.assertEqual(req.logprob.input_top_logprobs_val, [None] + val_rows[:-1])
+        self.assertEqual(req.logprob.input_top_logprobs_idx, [None] + idx_rows[:-1])
+
+
+class TestFromArraysMatchesFromRows(CustomTestCase):
+    """The tokenizer-manager from-arrays builder must produce the same
+    response fields as the rows-based builder."""
+
+    def _both(self, return_b64: bool):
+        from_rows = _build_flat_input_top_logprobs_fields(
+            _EXACT_VAL_ROWS, _IDX_ROWS, top_logprobs_num=2, return_b64=return_b64
+        )
+        val_arr, idx_arr, null_prefix = build_flat_input_top_logprobs_arrays(
+            _EXACT_VAL_ROWS, _IDX_ROWS, top_logprobs_num=2
+        )
+        from_arrays = _build_flat_input_top_logprobs_fields_from_arrays(
+            val_arr, idx_arr, null_prefix, return_b64=return_b64
+        )
+        return from_rows, from_arrays
+
+    def test_non_b64(self):
+        from_rows, from_arrays = self._both(return_b64=False)
+        self.assertEqual(from_rows, from_arrays)
+
+    def test_b64(self):
+        from_rows, from_arrays = self._both(return_b64=True)
+        self.assertEqual(from_rows, from_arrays)
+
+    def test_all_null_rows(self):
+        val_arr, idx_arr, null_prefix = build_flat_input_top_logprobs_arrays(
+            [None], [None], top_logprobs_num=2
+        )
+        self.assertEqual(val_arr.shape, (0, 2))
+        self.assertEqual(null_prefix, 1)
+        fields = _build_flat_input_top_logprobs_fields_from_arrays(
+            val_arr, idx_arr, null_prefix
+        )
+        self.assertEqual(
+            fields,
+            _build_flat_input_top_logprobs_fields([None], [None], top_logprobs_num=2),
+        )
+
+
+class TestMetaInfoFromSchedulerArrays(CustomTestCase):
+    """add_logprob_to_meta_info consumes scheduler-flat arrays directly."""
+
+    def _rows_meta(self, **state_kwargs) -> dict:
+        state = _make_state(
+            return_logprob=True,
+            top_logprobs_num=2,
+            return_flat_raw_top_logprobs=True,
+            **state_kwargs,
+        )
+        state.input_top_logprobs_val.extend(_EXACT_VAL_ROWS)
+        state.input_top_logprobs_idx.extend(_IDX_ROWS)
+        return _add_logprob_meta_info(state)
+
+    def _arrays_state(self, **state_kwargs) -> ReqState:
+        state = _make_state(
+            return_logprob=True,
+            top_logprobs_num=2,
+            return_flat_raw_top_logprobs=True,
+            **state_kwargs,
+        )
+        # Scheduler-flat requests arrive with empty nested rows and the arrays.
+        state.input_top_logprobs_scheduler_flat = build_flat_input_top_logprobs_arrays(
+            _EXACT_VAL_ROWS, _IDX_ROWS, top_logprobs_num=2
+        )
+        return state
+
+    def test_matches_rows_path_field_for_field(self):
+        got = _add_logprob_meta_info(self._arrays_state())
+        self.assertEqual(got, self._rows_meta())
+
+    def test_b64_matches_rows_path_field_for_field(self):
+        got = _add_logprob_meta_info(
+            self._arrays_state(return_flat_raw_top_logprobs_b64=True)
+        )
+        self.assertEqual(got, self._rows_meta(return_flat_raw_top_logprobs_b64=True))
+
+    def test_fields_cached_across_chunks(self):
+        state = self._arrays_state()
+        first = _add_logprob_meta_info(state)
+        again = _add_logprob_meta_info(state)
+        self.assertIs(
+            again["input_top_logprobs_val_flat"], first["input_top_logprobs_val_flat"]
+        )
+
+
+def _make_batch_token_id_output(**overrides) -> BatchTokenIDOutput:
+    """A two-request BatchTokenIDOutput with the required fields stubbed."""
+    n = 2
+    fields = dict(
+        rids=["r0", "r1"],
+        finished_reasons=[None] * n,
+        decoded_texts=["", ""],
+        decode_ids=[array("q", [1]), array("q", [2])],
+        read_offsets=[0] * n,
+        output_ids=None,
+        skip_special_tokens=[True] * n,
+        spaces_between_special_tokens=[True] * n,
+        no_stop_trim=[False] * n,
+        prompt_tokens=[5] * n,
+        reasoning_tokens=[0] * n,
+        completion_tokens=[1] * n,
+        cached_tokens=[0] * n,
+        input_token_logprobs_val=[[], []],
+        input_token_logprobs_idx=[[], []],
+        output_token_logprobs_val=[[], []],
+        output_token_logprobs_idx=[[], []],
+        input_top_logprobs_val=[[], []],
+        input_top_logprobs_idx=[[], []],
+        output_top_logprobs_val=[[], []],
+        output_top_logprobs_idx=[[], []],
+        input_token_ids_logprobs_val=[[], []],
+        input_token_ids_logprobs_idx=[[], []],
+        output_token_ids_logprobs_val=[[], []],
+        output_token_ids_logprobs_idx=[[], []],
+        output_token_entropy_val=None,
+        output_token_sampling_mask=None,
+        output_token_sampling_logprobs=None,
+        output_hidden_states=None,
+        routed_experts=None,
+        indexer_topk=None,
+        placeholder_tokens_idx=None,
+        placeholder_tokens_val=None,
+    )
+    fields.update(overrides)
+    return BatchTokenIDOutput(**fields)
+
+
+class TestBatchOutputTransport(CustomTestCase):
+    """The flat array fields must survive both IPC transports: pickle
+    (SGLANG_USE_PICKLE_IPC, the default) and msgpack (enc/dec hooks)."""
+
+    def _flat_output(self) -> BatchTokenIDOutput:
+        val_arr, idx_arr, null_prefix = build_flat_input_top_logprobs_arrays(
+            _EXACT_VAL_ROWS, _IDX_ROWS, top_logprobs_num=2
+        )
+        return _make_batch_token_id_output(
+            input_top_logprobs_val_flat=[None, val_arr],
+            input_top_logprobs_idx_flat=[None, idx_arr],
+            input_top_logprobs_flat_null_prefix=[None, null_prefix],
+        )
+
+    def _check_roundtrip(self, decoded, original):
+        self.assertIsNone(decoded.input_top_logprobs_val_flat[0])
+        self.assertIsNone(decoded.input_top_logprobs_idx_flat[0])
+        self.assertIsNone(decoded.input_top_logprobs_flat_null_prefix[0])
+        for got, sent in (
+            (
+                decoded.input_top_logprobs_val_flat[1],
+                original.input_top_logprobs_val_flat[1],
+            ),
+            (
+                decoded.input_top_logprobs_idx_flat[1],
+                original.input_top_logprobs_idx_flat[1],
+            ),
+        ):
+            self.assertIsInstance(got, np.ndarray)
+            self.assertEqual(got.dtype, sent.dtype)
+            np.testing.assert_array_equal(got, sent)
+        self.assertEqual(decoded.input_top_logprobs_flat_null_prefix[1], 1)
+
+    def test_pickle_roundtrip(self):
+        output = self._flat_output()
+        decoded = pickle.loads(pickle.dumps(output, protocol=pickle.HIGHEST_PROTOCOL))
+        self._check_roundtrip(decoded, output)
+
+    def test_msgpack_roundtrip(self):
+        output = self._flat_output()
+        decoded = msgpack_decode(msgpack_encode(output))
+        self._check_roundtrip(decoded, output)
+
+    def test_fields_default_none(self):
+        output = _make_batch_token_id_output()
+        self.assertIsNone(output.input_top_logprobs_val_flat)
+        self.assertIsNone(output.input_top_logprobs_idx_flat)
+        self.assertIsNone(output.input_top_logprobs_flat_null_prefix)
+
+
 @unittest.skipUnless(
     os.environ.get("SGLANG_BENCH_FLAT_RAW_TOP_LOGPROBS"),
     "Serialization microbenchmark; set SGLANG_BENCH_FLAT_RAW_TOP_LOGPROBS=1 to run.",
@@ -381,6 +712,41 @@ class BenchFlatRawTopLogprobsSerialization(CustomTestCase):
             ),
             decode_b64,
         )
+
+    def test_bench_ipc_pickle(self):
+        """Inter-process cost of BatchTokenIDOutput input-top fields: nested
+        per-position rows vs scheduler-flat arrays (two ZMQ pickle hops each
+        pay dumps + loads)."""
+        num_positions, k = 32768, 2
+        rng = np.random.default_rng(0)
+        vals = rng.standard_normal((num_positions, k)).astype(np.float32)
+        idxs = rng.integers(0, 150000, size=(num_positions, k), dtype=np.int32)
+
+        def best_of(fn, iters=10):
+            return min(
+                (lambda s=time.perf_counter(): (fn(), time.perf_counter() - s)[1])()
+                for _ in range(iters)
+            )
+
+        nested = _make_batch_token_id_output(
+            input_top_logprobs_val=[[None] + vals[1:].tolist(), []],
+            input_top_logprobs_idx=[[None] + idxs[1:].tolist(), []],
+        )
+        flat = _make_batch_token_id_output(
+            input_top_logprobs_val_flat=[vals[1:], None],
+            input_top_logprobs_idx_flat=[idxs[1:], None],
+            input_top_logprobs_flat_null_prefix=[1, None],
+        )
+        for name, obj in (("nested rows", nested), ("flat arrays", flat)):
+            payload = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
+            dumps_ms = best_of(
+                lambda o=obj: pickle.dumps(o, protocol=pickle.HIGHEST_PROTOCOL)
+            )
+            loads_ms = best_of(lambda p=payload: pickle.loads(p))
+            print(
+                f"{name}: pickle.dumps {dumps_ms * 1e3:.2f} ms, "
+                f"pickle.loads {loads_ms * 1e3:.2f} ms, {len(payload) / 1e6:.2f} MB"
+            )
 
 
 if __name__ == "__main__":

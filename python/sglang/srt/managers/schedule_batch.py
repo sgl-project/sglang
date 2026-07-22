@@ -686,6 +686,12 @@ class ReqLogprob:
     input_token_logprobs_idx: Optional[List[int]] = None
     input_top_logprobs_val: Optional[List[List[float]]] = None
     input_top_logprobs_idx: Optional[List[List[int]]] = None
+    # Flat replacements for the rows above (see
+    # build_flat_input_top_logprobs_arrays); when set, the nested rows are
+    # emptied and the arrays ship instead.
+    input_top_logprobs_val_flat: Optional[np.ndarray] = None
+    input_top_logprobs_idx_flat: Optional[np.ndarray] = None
+    input_top_logprobs_flat_null_prefix: Optional[int] = None
     input_token_ids_logprobs_val: Optional[List[List[float]]] = None
     input_token_ids_logprobs_idx: Optional[List[List[int]]] = None
     output_token_logprobs_val: Optional[list] = None
@@ -724,6 +730,7 @@ class Req(ReqDllmMixin):
         dllm_config: Optional[DllmConfig] = None,
         token_ids_logprob: List[int] = None,
         return_sampling_mask: bool = False,
+        return_flat_raw_top_logprobs: bool = False,
         stream: bool = False,
         origin_input_ids_unpadded: Optional[array[int]] = None,
         lora_id: Optional[str] = None,
@@ -939,6 +946,7 @@ class Req(ReqDllmMixin):
         self.temp_scaled_logprobs = False
         self.top_p_normalized_logprobs = False
         self.return_sampling_mask = return_sampling_mask
+        self.return_flat_raw_top_logprobs = return_flat_raw_top_logprobs
 
         # Logprobs (return values)
         # True means the input logprob has been already sent to detokenizer.

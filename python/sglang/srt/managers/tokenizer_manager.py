@@ -84,6 +84,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightFromDiskReqOutput,
     async_sock_recv,
     async_sock_send,
+    build_flat_input_top_logprobs_arrays,
     sock_send,
     unwrap_from_pickle,
 )
@@ -231,6 +232,12 @@ class ReqState:
     # prefill chunks arrive, so streaming decode chunks reuse the payload.
     input_top_logprobs_flat_fields: Optional[Dict[str, Any]] = None
     input_top_logprobs_flat_num_rows: int = -1
+    # Scheduler-assembled flat arrays (val float32 [rows, k], idx int32
+    # [rows, k], null_prefix), sent once at prefill completion. When present,
+    # the nested input_top_logprobs_val/idx above stay empty.
+    input_top_logprobs_scheduler_flat: Optional[Tuple[np.ndarray, np.ndarray, int]] = (
+        None
+    )
 
     # For detokenized logprobs
     input_token_logprobs: List[Any] = dataclasses.field(default_factory=list)
@@ -276,26 +283,38 @@ def _build_flat_input_top_logprobs_fields(
     base64 contiguous little-endian binary; the dtype marker fields let the
     widths change later without a wire break.
     """
-    num_rows = len(input_top_logprobs_val)
-    null_prefix = 0
-    while null_prefix < num_rows and not input_top_logprobs_val[null_prefix]:
-        null_prefix += 1
-    val_rows = input_top_logprobs_val[null_prefix:]
-    idx_rows = input_top_logprobs_idx[null_prefix:]
-    k = len(val_rows[0]) if val_rows else top_logprobs_num
-    for offset, row in enumerate(val_rows):
-        if row is None or len(row) != k:
-            # Not representable by (shape, null_prefix); e.g. multi-item scoring.
-            raise ValueError(
-                "return_flat_raw_top_logprobs requires rectangular top logprob "
-                f"rows with nulls only in the leading prefix; row {null_prefix + offset} "
-                f"has {None if row is None else len(row)} entries (expected {k})."
-            )
+    val_arr, idx_arr, null_prefix = build_flat_input_top_logprobs_arrays(
+        input_top_logprobs_val, input_top_logprobs_idx, top_logprobs_num
+    )
+    if return_b64:
+        return _build_flat_input_top_logprobs_fields_from_arrays(
+            val_arr, idx_arr, null_prefix, return_b64=True
+        )
+    # Flatten the original python rows so the JSON numbers keep their full
+    # (float64) precision, matching the pre-scheduler-flat output.
+    return {
+        "input_top_logprobs_val_flat": [
+            v for row in input_top_logprobs_val[null_prefix:] for v in row
+        ],
+        "input_top_logprobs_idx_flat": [
+            i for row in input_top_logprobs_idx[null_prefix:] for i in row
+        ],
+        "input_top_logprobs_shape": [val_arr.shape[0], val_arr.shape[1]],
+        "input_top_logprobs_null_prefix": null_prefix,
+    }
 
+
+def _build_flat_input_top_logprobs_fields_from_arrays(
+    val_arr: np.ndarray,
+    idx_arr: np.ndarray,
+    null_prefix: int,
+    return_b64: bool = False,
+) -> Dict[str, Any]:
+    """Build the flat response fields from scheduler-assembled [rows, k]
+    arrays (see `_build_flat_input_top_logprobs_fields` for the field
+    semantics)."""
     fields: Dict[str, Any] = {}
     if return_b64:
-        val_arr = np.asarray(val_rows, dtype=np.float32)
-        idx_arr = np.asarray(idx_rows, dtype=np.int32)
         fields["input_top_logprobs_val_flat_b64"] = pybase64.b64encode(
             val_arr.tobytes()
         ).decode("utf-8")
@@ -305,9 +324,9 @@ def _build_flat_input_top_logprobs_fields(
         fields["input_top_logprobs_val_flat_b64_dtype"] = "float32"
         fields["input_top_logprobs_idx_flat_b64_dtype"] = "int32"
     else:
-        fields["input_top_logprobs_val_flat"] = [v for row in val_rows for v in row]
-        fields["input_top_logprobs_idx_flat"] = [i for row in idx_rows for i in row]
-    fields["input_top_logprobs_shape"] = [len(val_rows), k]
+        fields["input_top_logprobs_val_flat"] = val_arr.reshape(-1).tolist()
+        fields["input_top_logprobs_idx_flat"] = idx_arr.reshape(-1).tolist()
+    fields["input_top_logprobs_shape"] = [val_arr.shape[0], val_arr.shape[1]]
     fields["input_top_logprobs_null_prefix"] = null_prefix
     return fields
 
@@ -1250,6 +1269,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 top_logprobs_num=obj.top_logprobs_num,
                 token_ids_logprob=obj.token_ids_logprob,
                 return_sampling_mask=obj.return_sampling_mask,
+                return_flat_raw_top_logprobs=obj.return_flat_raw_top_logprobs,
                 stream=obj.stream,
                 rid=obj.rid,
                 http_worker_ipc=obj.http_worker_ipc,
@@ -2283,7 +2303,23 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # Guarded by the caller's return_logprob check, so obj is a
             # GenerateReqInput here.
             use_flat = state.obj.return_flat_raw_top_logprobs
-            if use_flat:
+            if use_flat and state.input_top_logprobs_scheduler_flat is not None:
+                # The scheduler already assembled the flat arrays (sent once
+                # at prefill completion); encode them directly.
+                if state.input_top_logprobs_flat_fields is None:
+                    val_arr, idx_arr, null_prefix = (
+                        state.input_top_logprobs_scheduler_flat
+                    )
+                    state.input_top_logprobs_flat_fields = (
+                        _build_flat_input_top_logprobs_fields_from_arrays(
+                            val_arr,
+                            idx_arr,
+                            null_prefix,
+                            return_b64=state.obj.return_flat_raw_top_logprobs_b64,
+                        )
+                    )
+                meta_info.update(state.input_top_logprobs_flat_fields)
+            elif use_flat:
                 # Flat replaces nested for the input side only.
                 if state.input_top_logprobs_flat_num_rows != len(
                     state.input_top_logprobs_val
@@ -2409,6 +2445,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 )
                 state.input_top_logprobs_idx.extend(
                     recv_obj.input_top_logprobs_idx[recv_obj_index]
+                )
+            if (
+                recv_obj.input_top_logprobs_val_flat is not None
+                and recv_obj.input_top_logprobs_val_flat[recv_obj_index] is not None
+            ):
+                state.input_top_logprobs_scheduler_flat = (
+                    recv_obj.input_top_logprobs_val_flat[recv_obj_index],
+                    recv_obj.input_top_logprobs_idx_flat[recv_obj_index],
+                    recv_obj.input_top_logprobs_flat_null_prefix[recv_obj_index],
                 )
             state.output_top_logprobs_val.extend(
                 recv_obj.output_top_logprobs_val[recv_obj_index]
