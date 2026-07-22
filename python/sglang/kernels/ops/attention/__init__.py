@@ -29,6 +29,9 @@ _TRITON_KERNELS = [
     ("pad", "unpad_draft_extend_output"),
     ("pad", "seqlens_expand_triton"),
     ("position", "compute_position_triton"),
+    ("dsv4_attn_metadata_kernels", "expand_prefill_causally"),
+    ("dsv4_attn_metadata_kernels", "build_page_table_positions"),
+    ("dsv4_attn_metadata_kernels", "build_causal_swa_page_indices"),
 ]
 for _mod, _fn in _TRITON_KERNELS:
     register_kernel(
@@ -42,6 +45,22 @@ del _mod, _fn
 
 __all__ = []
 
+
+# Vendored linear-attention (flash-linear-attention port) kernels relocated
+# in Phase 2.5 (RFC #29630); representative entry points for inventory.
+for _mod, _fn in [
+    ("fla.chunk", "chunk_gated_delta_rule"),
+    ("fla.fused_recurrent", "fused_recurrent_gated_delta_rule"),
+    ("fla.kda", "fused_recurrent_kda_fwd"),
+]:
+    register_kernel(
+        KernelSpec(
+            op=f"attention.{_fn}",
+            backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.attention.{_mod}:{_fn}",
+        )
+    )
+del _mod, _fn
 
 # Linear-attention / MiniMax-sparse / diffusion kernels migrated in Phase 2.5
 # (RFC #29630); registered for inventory.
