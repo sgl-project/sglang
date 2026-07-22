@@ -415,18 +415,18 @@ class HummingRunnerCore(MoeRunnerCore):
         intermediate = two_i // 2
         w2_meta = self.layer.humming_metas["w2"]
         groups = intermediate // 128
-        use_jit = (
+        num_threads = intermediate // 8
+        use_fused_masked_act_quant = (
             envs.SGLANG_OPT_USE_JIT_EP_ACTIVATION.get()
             and w2_meta.a_dtype == dtypes.float8e4m3
             and w2_meta.input_scale_group_size == 128
             and self.activation == "silu"
             and gate_up.dtype == torch.bfloat16
-            and intermediate % 128 == 0
-            and max_tokens % 4 == 0
-            and groups % 4 == 0
-            and intermediate // 8 >= num_experts
+            and intermediate % 256 == 0
+            and num_threads <= 1024
+            and num_experts <= min(256, num_threads)
         )
-        if use_jit:
+        if use_fused_masked_act_quant:
             from sglang.jit_kernel.dsv4.moe import silu_and_mul_masked_post_quant
 
             down_input = torch.empty(

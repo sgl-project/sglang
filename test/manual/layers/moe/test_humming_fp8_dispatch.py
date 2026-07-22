@@ -60,9 +60,15 @@ def test_grouped_contiguous_permute_scale():
 
 
 @pytest.mark.parametrize("swiglu_limit", [None, 10.0])
-def test_grouped_masked_w2_quant(swiglu_limit):
+@pytest.mark.parametrize(
+    "num_experts,max_tokens,intermediate",
+    [
+        (8, 64, 3072),
+        (8, 63, 768),
+    ],
+)
+def test_grouped_masked_w2_quant(swiglu_limit, num_experts, max_tokens, intermediate):
     torch.manual_seed(0)
-    num_experts, max_tokens, intermediate = 8, 64, 3072
     gate_up = (
         torch.randn(
             num_experts,
