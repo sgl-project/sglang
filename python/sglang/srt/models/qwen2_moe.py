@@ -220,6 +220,7 @@ class Qwen2MoeMLP(nn.Module):
                 type(qm).__name__ == "Fp8LinearMethod"
                 and getattr(qm, "use_aiter_fp8_per_token", False)
                 and getattr(qcfg, "activation_scheme", None) == "dynamic"
+                and getattr(quant_config, "dequantization_config", None) is None
             )
 
     def forward(
