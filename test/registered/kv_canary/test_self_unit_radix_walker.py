@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from types import SimpleNamespace
 
 import torch
 
@@ -135,11 +136,12 @@ class TestSelfUnitRadixWalker(CustomTestCase):
         cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
         cache.tree_components = tree_components
         cache.components = {ct: None for ct in tree_components}
+        cache.is_swa_enabled = ComponentType.SWA in tree_components
         root = UnifiedTreeNode(tree_components)
         root.component_data[BASE_COMPONENT_TYPE].value = torch.tensor(
             [], dtype=torch.int32, device=self.device
         )
-        cache.root_node = root
+        cache.tree_core = SimpleNamespace(root_node=root)
         return cache
 
     def _add_unified_child(

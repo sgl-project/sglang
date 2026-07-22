@@ -9,6 +9,7 @@ from typing import (
     NamedTuple,
     Optional,
     Protocol,
+    Sequence,
     Tuple,
     runtime_checkable,
 )
@@ -26,6 +27,10 @@ from sglang.srt.observability.metrics_collector import (
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.radix_cache import RadixKey
+    from sglang.srt.mem_cache.unified_cache.cache_action import (
+        CacheAction,
+        ComponentAction,
+    )
     from sglang.srt.mem_cache.unified_cache_components.tree_component import (
         ComponentType,
     )
@@ -78,6 +83,10 @@ class InsertResult:
     last_device_node: Any = None
     mamba_exist: bool = False
     inserted_host_node: Any = None
+    # Actions the Controller applies: CacheActions itself, ComponentActions routed to the owning component.
+    cache_actions: list[CacheAction | ComponentAction] = dataclasses.field(
+        default_factory=list
+    )
 
 
 @dataclasses.dataclass
@@ -188,13 +197,15 @@ class MatchResult(NamedTuple):
     mamba_host_hit_length: int = 0
     mamba_branching_seqlen: Optional[int] = None
     cache_protected_len: Optional[int] = None
+    # Actions the Controller applies: CacheActions itself, ComponentActions routed to the owning component.
+    cache_actions: Sequence[CacheAction | ComponentAction] = ()
 
 
 def zero_match_result(tree_cache, match_result: MatchResult) -> MatchResult:
     if tree_cache.is_chunk_cache():
         # Chunk caches' match_prefix already returns a miss; no root_node to walk back to.
         return match_result
-    root = tree_cache.root_node
+    root = tree_cache.root_node_handle()
     return match_result._replace(
         # [:0] keeps dtype and device of the original tensor (e.g. CUDA int64)
         # without allocating a fresh empty tensor.
@@ -253,6 +264,20 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
 
     def supports_fast_match_prefix(self) -> bool:
         return False
+
+    def resolve_node_handle(self, node_handle: Any) -> Any:
+        """Map a node handle to its node -- e.g. UnifiedRadixCache looks up the
+        node object from its NodeId. Temporary API for the Unified Radix Cache
+        split migration.
+
+        TODO(Jialin): Remove after the Unified Radix Cache split.
+        """
+        return node_handle
+
+    def root_node_handle(self) -> Any:
+        """The root handle as match results carry it -- the raw node by default,
+        the root's NodeId for UnifiedRadixCache."""
+        return self.root_node
 
     @abstractmethod
     def cache_finished_req(self, req: Req, is_insert: bool = True, **kwargs):
