@@ -815,12 +815,6 @@ def run_data_parallel_controller_process(
     kill_itself_when_parent_died()
     parent_process = psutil.Process().parent()
 
-    # Publish the resolved config at DP-controller process entry: this process
-    # reads config namespaces (e.g. get_exec().moe.*) in its own address space
-    # before spawning schedulers.
-    from sglang.srt.runtime_context import publish
-
-    publish(server_args, role="scheduler")
     configure_logger(server_args)
     if server_args.enable_trace:
         process_tracing_init(
