@@ -363,6 +363,20 @@ python3 -m sglang.launch_server \
 > - Offline path: `ModelSlimMXFP8Scheme` loads `float8_e4m3fn` weights + `float8_e8m0fnu` block scales pre-exported by msmodelslim. Transpose is kept as a non-contiguous view (`.data` assignment) — calling `.contiguous()` would physically reorder the pre-quantized layout and break the block-scale mapping.
 > - MoE MXFP8 (FusedMoE/TP) for LLMs is tracked separately and not part of this PR.
 
+**DeepEP dispatcher output quantization:**
+
+DeepEP uses the same MXFP dispatcher names as the Ascend MoE path: `mxfp8` is FP8 E4M3 data with an E8M0 block scale, and `mxfp4` is packed FP4 E2M1 data with an E8M0 block scale. E5M2 is not part of the MXFP8 dispatcher API. Both formats are supported in `normal` and `low_latency` modes on compatible Ascend A5 kernels; low-latency MXFP4 requires [sgl-kernel-npu PR #566](https://github.com/sgl-project/sgl-kernel-npu/pull/566).
+
+This naming aligns with the `mxfp8` value introduced by [PR #30768](https://github.com/sgl-project/sglang/pull/30768). When both changes are present, its DeepEP path can select `mxfp8` instead of the temporary BF16 fallback. The CLI value takes precedence over automatic selection:
+
+```bash Command
+python3 -m sglang.launch_server \
+    --model-path /path/to/mxfp-model \
+    --device npu --attention-backend ascend \
+    --moe-a2a-backend deepep --deepep-mode auto \
+    --deepep-dispatcher-output-dtype mxfp8
+```
+
 **MXFP4 W4A8 for LLM dense models (e.g., Qwen3 / Qwen3.5):**
 
 LLM dense W4A8 (MXFP4 4-bit weights + MXFP8 8-bit activations) Linear support was added in [PR #23650](https://github.com/sgl-project/sglang/pull/23650). Requires Ascend 950 Products or newer.

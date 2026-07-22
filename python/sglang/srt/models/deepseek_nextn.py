@@ -16,7 +16,6 @@
 
 import logging
 import os
-from contextlib import ExitStack
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -59,11 +58,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.deepseek_common.utils import enable_nextn_moe_bf16_cast_to_fp8
 from sglang.srt.models.deepseek_v2 import DeepseekV2DecoderLayer, DeepseekV3ForCausalLM
 from sglang.srt.models.utils import WeightsMapper
-from sglang.srt.runtime_context import (
-    get_model,
-    get_parallel,
-    get_spec,
-)
+from sglang.srt.runtime_context import get_model, get_parallel, get_spec
 from sglang.srt.utils import BumpAllocator, add_prefix, is_cuda, is_npu
 
 
@@ -200,126 +195,111 @@ class DeepseekModelNextN(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
-        exit_stack = ExitStack()
-        if (
-            _is_npu
-            and self.quant_config is None
-            and get_model().quantization is not None
-        ):
-            # ascend mtp unquant
-            exit_stack.enter_context(envs.SGLANG_DEEPEP_BF16_DISPATCH.override(True))
-            exit_stack.enter_context(
-                envs.DEEP_NORMAL_MODE_USE_INT8_QUANT.override(False)
-            )
+        zero_allocator = BumpAllocator(
+            buffer_size=2,
+            dtype=torch.float32,
+            device=(
+                input_embeds.device if input_embeds is not None else input_ids.device
+            ),
+        )
 
-        try:
-            zero_allocator = BumpAllocator(
-                buffer_size=2,
-                dtype=torch.float32,
-                device=(
-                    input_embeds.device
-                    if input_embeds is not None
-                    else input_ids.device
+        if input_embeds is None:
+            hidden_states = self.embed_tokens(input_ids)
+        else:
+            hidden_states = input_embeds
+
+        if hidden_states.shape[0] > 0:
+            previous_hidden_states = forward_batch.spec_info.hidden_states
+            if self.rot_weight is not None:
+                previous_hidden_states = torch.matmul(
+                    previous_hidden_states, self.rot_weight
+                )
+            if _is_cuda:
+                eh_input = fused_eh_norm(
+                    hidden_states,
+                    previous_hidden_states,
+                    self.enorm.weight,
+                    self.hnorm.weight,
+                    self.enorm.variance_epsilon,
+                )
+            else:
+                eh_input = torch.cat(
+                    (
+                        self.enorm(hidden_states),
+                        self.hnorm(previous_hidden_states),
+                    ),
+                    dim=-1,
+                )
+            if isinstance(self.eh_proj, ReplicatedLinear):
+                hidden_states, _ = self.eh_proj(eh_input)
+            else:
+                hidden_states = self.eh_proj(eh_input)
+
+        # CP-v2 shards/gathers at the eager-runner boundary instead.
+        use_cp_v1 = (
+            dsa_use_prefill_cp(forward_batch, self.dsa_enable_prefill_cp)
+            or mla_use_prefill_cp(forward_batch, self.mla_enable_prefill_cp)
+        ) and not is_cp_v2_active(forward_batch)
+        if use_cp_v1:
+            hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
+            positions = cp_split_and_rebuild_position(forward_batch, positions)
+        residual = None
+        seed_buf = (
+            forward_batch.spec_info.dsa_seed_topk_capture
+            if forward_batch.forward_mode.is_extend(include_draft_extend_v2=True)
+            else None
+        )
+        should_update_dsa_topk_indices = (
+            forward_batch.reuse_dsa_topk_indices or seed_buf is not None
+        )
+        with get_global_expert_distribution_recorder().disable_this_region():
+            hidden_states, residual, topk_indices = self.decoder(
+                positions,
+                hidden_states,
+                forward_batch,
+                residual,
+                zero_allocator,
+                prev_topk_indices=(
+                    forward_batch.spec_info.dsa_topk_indices
+                    if forward_batch.reuse_dsa_topk_indices
+                    else None
                 ),
             )
 
-            if input_embeds is None:
-                hidden_states = self.embed_tokens(input_ids)
+        if not forward_batch.forward_mode.is_idle():
+            if residual is not None:
+                hidden_states, _ = self.shared_head.norm(hidden_states, residual)
             else:
-                hidden_states = input_embeds
+                hidden_states = self.shared_head.norm(hidden_states)
 
-            if hidden_states.shape[0] > 0:
-                previous_hidden_states = forward_batch.spec_info.hidden_states
-                if self.rot_weight is not None:
-                    previous_hidden_states = torch.matmul(
-                        previous_hidden_states, self.rot_weight
-                    )
-                if _is_cuda:
-                    eh_input = fused_eh_norm(
-                        hidden_states,
-                        previous_hidden_states,
-                        self.enorm.weight,
-                        self.hnorm.weight,
-                        self.enorm.variance_epsilon,
-                    )
-                else:
-                    eh_input = torch.cat(
-                        (
-                            self.enorm(hidden_states),
-                            self.hnorm(previous_hidden_states),
-                        ),
-                        dim=-1,
-                    )
-                if isinstance(self.eh_proj, ReplicatedLinear):
-                    hidden_states, _ = self.eh_proj(eh_input)
-                else:
-                    hidden_states = self.eh_proj(eh_input)
-
-            # CP-v2 shards/gathers at the eager-runner boundary instead.
-            use_cp_v1 = (
-                dsa_use_prefill_cp(forward_batch, self.dsa_enable_prefill_cp)
-                or mla_use_prefill_cp(forward_batch, self.mla_enable_prefill_cp)
-            ) and not is_cp_v2_active(forward_batch)
             if use_cp_v1:
-                hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
-                positions = cp_split_and_rebuild_position(forward_batch, positions)
-            residual = None
-            seed_buf = (
-                forward_batch.spec_info.dsa_seed_topk_capture
-                if forward_batch.forward_mode.is_extend(include_draft_extend_v2=True)
-                else None
-            )
-            should_update_dsa_topk_indices = (
-                forward_batch.reuse_dsa_topk_indices or seed_buf is not None
-            )
-            with get_global_expert_distribution_recorder().disable_this_region():
-                hidden_states, residual, topk_indices = self.decoder(
-                    positions,
+                local_num_tokens = hidden_states.shape[0]
+                hidden_states = cp_all_gather_rerange_output(
                     hidden_states,
+                    self.cp_size,
                     forward_batch,
-                    residual,
-                    zero_allocator,
-                    prev_topk_indices=(
-                        forward_batch.spec_info.dsa_topk_indices
-                        if forward_batch.reuse_dsa_topk_indices
-                        else None
-                    ),
+                    torch.cuda.current_stream(),
                 )
-            if not forward_batch.forward_mode.is_idle():
-                if residual is not None:
-                    hidden_states, _ = self.shared_head.norm(hidden_states, residual)
-                else:
-                    hidden_states = self.shared_head.norm(hidden_states)
-
-                if use_cp_v1:
-                    local_num_tokens = hidden_states.shape[0]
-                    hidden_states = cp_all_gather_rerange_output(
-                        hidden_states,
+                if should_update_dsa_topk_indices and topk_indices is not None:
+                    topk_indices = _gather_dsa_topk_indices_for_cp(
+                        topk_indices,
+                        local_num_tokens,
                         self.cp_size,
                         forward_batch,
                         torch.cuda.current_stream(),
                     )
-                    if should_update_dsa_topk_indices and topk_indices is not None:
-                        topk_indices = _gather_dsa_topk_indices_for_cp(
-                            topk_indices,
-                            local_num_tokens,
-                            self.cp_size,
-                            forward_batch,
-                            torch.cuda.current_stream(),
-                        )
-            if should_update_dsa_topk_indices and topk_indices is not None:
-                if forward_batch.reuse_dsa_topk_indices:
-                    forward_batch.spec_info.dsa_topk_indices = topk_indices
-                if seed_buf is not None:
-                    sel = forward_batch.spec_info.dsa_seed_topk_select
-                    src = (
-                        topk_indices[: seed_buf.shape[0]]
-                        if sel is None
-                        else topk_indices[sel]
-                    )
-                    seed_buf[: src.shape[0]].copy_(src)
-        finally:
-            exit_stack.close()
+
+        if should_update_dsa_topk_indices and topk_indices is not None:
+            if forward_batch.reuse_dsa_topk_indices:
+                forward_batch.spec_info.dsa_topk_indices = topk_indices
+            if seed_buf is not None:
+                sel = forward_batch.spec_info.dsa_seed_topk_select
+                src = (
+                    topk_indices[: seed_buf.shape[0]]
+                    if sel is None
+                    else topk_indices[sel]
+                )
+                seed_buf[: src.shape[0]].copy_(src)
 
         return hidden_states
 
