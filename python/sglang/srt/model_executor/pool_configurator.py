@@ -639,31 +639,50 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             target_layers = self.num_layers_total
             self.bytes_per_full_token *= (target_layers + draft_layers) / target_layers
 
-        # Online c128 keeps a single in-progress (max, sum, kv) state per index
-        # and assumes a strict forward-only schedule. Speculative decode (MTP)
-        # would need rollback / replay across draft and verify, which the
-        # online path doesn't support yet.
+        # Speculative online c128 writes each verified prefix into a separate
+        # request-scoped bank, then commits only the accepted prefix.
         if envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get():
+            from sglang.jit_kernel.dsv4.online_c128_mtp import (
+                ONLINE_C128_MAX_VERIFY_TOKENS,
+            )
+
             allow_experimental_online_c128_mtp = (
                 envs.SGLANG_EXPERIMENTAL_ONLINE_C128_MTP.get()
                 and kvc.spec_algorithm.is_eagle()
             )
-            assert kvc.spec_algorithm.is_none() or allow_experimental_online_c128_mtp, (
+            allow_dspark = kvc.spec_algorithm.is_dspark()
+            assert (
+                kvc.spec_algorithm.is_none()
+                or allow_experimental_online_c128_mtp
+                or allow_dspark
+            ), (
                 "SGLANG_OPT_USE_ONLINE_COMPRESS does not support speculative decode "
-                "(MTP) yet, except the experimental EAGLE topk=1 path gated by "
-                "SGLANG_EXPERIMENTAL_ONLINE_C128_MTP=1"
+                "except DSpark and the experimental EAGLE topk=1 path gated by "
+                "SGLANG_EXPERIMENTAL_ONLINE_C128_MTP=1."
             )
-            if allow_experimental_online_c128_mtp:
+            if allow_experimental_online_c128_mtp or allow_dspark:
                 assert self.online_c128_mtp_max_draft_tokens > 0, (
-                    "SGLANG_EXPERIMENTAL_ONLINE_C128_MTP requires "
+                    "Online c128 speculative decoding requires "
                     "speculative_num_draft_tokens to be set."
                 )
-                logger.warning(
-                    "DSV4 compressed attention: experimental online c128 + MTP enabled "
-                    f"(EAGLE topk=1 only, "
-                    f"draft_banks={self.online_c128_mtp_max_draft_tokens}). "
-                    "Validate correctness carefully."
+                assert (
+                    self.online_c128_mtp_max_draft_tokens
+                    <= ONLINE_C128_MAX_VERIFY_TOKENS
+                ), (
+                    "Online c128 speculative decoding supports at most "
+                    f"{ONLINE_C128_MAX_VERIFY_TOKENS} verify tokens, got "
+                    f"{self.online_c128_mtp_max_draft_tokens}. For DSpark, set "
+                    "--speculative-dspark-block-size <= 7."
                 )
+                message = (
+                    "DSV4 compressed attention: online c128 + speculative decode "
+                    f"enabled (algorithm={kvc.spec_algorithm.value}, "
+                    f"draft_banks={self.online_c128_mtp_max_draft_tokens})."
+                )
+                if allow_dspark:
+                    logger.info(message)
+                else:
+                    logger.warning("%s Validate correctness carefully.", message)
             else:
                 logger.info(
                     "DSV4 compressed attention: online c128 enabled (ring_size=1)"

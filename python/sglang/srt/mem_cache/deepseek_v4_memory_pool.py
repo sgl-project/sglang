@@ -529,7 +529,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self.online_mtp_max_draft_tokens = online_mtp_max_draft_tokens
         self.online_c128_state_num_req_slots = c128_state_pool_size
         self.online_c128_mtp_pending_seq_lens: Optional[torch.Tensor] = None
-        if ONLINE_C128 and envs.SGLANG_EXPERIMENTAL_ONLINE_C128_MTP.get():
+        if ONLINE_C128 and self.online_mtp_max_draft_tokens > 0:
             self.online_c128_mtp_pending_seq_lens = torch.empty(
                 self.online_c128_state_num_req_slots, dtype=torch.int64, device=device
             )

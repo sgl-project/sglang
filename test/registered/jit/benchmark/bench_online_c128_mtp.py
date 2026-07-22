@@ -1,4 +1,4 @@
-"""Benchmark online c128 MTP write-prefix kernel."""
+"""Benchmark online c128 speculative write-prefix kernel."""
 
 from __future__ import annotations
 
@@ -35,7 +35,10 @@ NUM_VERIFY_TOKENS_RANGE = get_benchmark_range(
     full_range=[1, 4, 8],
     ci_range=[8],
 )
-BENCHMARK_CONFIGS = list(itertools.product(BATCH_SIZE_RANGE, NUM_VERIFY_TOKENS_RANGE))
+LAYOUT_RANGE = ["uniform", "dspark-ragged"]
+BENCHMARK_CONFIGS = list(
+    itertools.product(BATCH_SIZE_RANGE, NUM_VERIFY_TOKENS_RANGE, LAYOUT_RANGE)
+)
 
 
 @dataclass
@@ -43,6 +46,8 @@ class BenchmarkCase:
     kv_score_input: torch.Tensor
     seq_lens: torch.Tensor
     req_pool_indices: torch.Tensor
+    verify_lens: torch.Tensor
+    extend_start_loc: torch.Tensor
     req_to_token: torch.Tensor
     ape: torch.Tensor
     state: torch.Tensor
@@ -75,7 +80,7 @@ def make_req_to_token(
     return req_to_token.contiguous().to(device=DEFAULT_DEVICE)
 
 
-def make_case(batch_size: int, num_verify_tokens: int) -> BenchmarkCase:
+def make_case(batch_size: int, num_verify_tokens: int, layout: str) -> BenchmarkCase:
     seq_lens = make_seq_lens(batch_size, num_verify_tokens)
     req_pool_indices = torch.arange(
         batch_size, dtype=torch.int64, device=DEFAULT_DEVICE
@@ -95,8 +100,24 @@ def make_case(batch_size: int, num_verify_tokens: int) -> BenchmarkCase:
     )
     state.normal_(mean=0.0, std=0.01)
 
+    if layout == "dspark-ragged":
+        verify_lens = (
+            torch.arange(batch_size, dtype=torch.int32, device=DEFAULT_DEVICE)
+            % num_verify_tokens
+            + 1
+        )
+        extend_start_loc = torch.nn.functional.pad(
+            torch.cumsum(verify_lens, dim=0)[:-1], (1, 0)
+        )
+        num_input_tokens = int(verify_lens.sum().item())
+    else:
+        assert layout == "uniform"
+        verify_lens = torch.empty((0,), dtype=torch.int32, device=DEFAULT_DEVICE)
+        extend_start_loc = torch.empty((0,), dtype=torch.int32, device=DEFAULT_DEVICE)
+        num_input_tokens = batch_size * num_verify_tokens
+
     kv_score_input = torch.randn(
-        batch_size * num_verify_tokens,
+        num_input_tokens,
         HEAD_DIM * 2,
         dtype=torch.float32,
         device=DEFAULT_DEVICE,
@@ -107,6 +128,8 @@ def make_case(batch_size: int, num_verify_tokens: int) -> BenchmarkCase:
         kv_score_input=kv_score_input,
         seq_lens=seq_lens,
         req_pool_indices=req_pool_indices,
+        verify_lens=verify_lens,
+        extend_start_loc=extend_start_loc,
         req_to_token=req_to_token,
         ape=ape,
         state=state,
@@ -121,6 +144,8 @@ def call_write_prefix(module, case: BenchmarkCase) -> None:
         case.kv_score_input,
         case.seq_lens,
         case.req_pool_indices,
+        case.verify_lens,
+        case.extend_start_loc,
         case.req_to_token,
         case.ape,
         case.state,
@@ -132,25 +157,27 @@ def call_write_prefix(module, case: BenchmarkCase) -> None:
 
 @triton.testing.perf_report(
     triton.testing.Benchmark(
-        x_names=["batch_size", "num_verify_tokens"],
+        x_names=["batch_size", "num_verify_tokens", "layout"],
         x_vals=BENCHMARK_CONFIGS,
         line_arg="launch_mode",
         line_vals=["cuda_graph", "eager"],
         line_names=["CUDA graph", "Eager launch"],
         styles=[("blue", "-"), ("orange", "--")],
         ylabel="us",
-        plot_name="online-c128-mtp-write-prefix-performance",
+        plot_name="online-c128-spec-write-prefix-performance",
         args={},
     )
 )
 def benchmark(
-    batch_size: int, num_verify_tokens: int, launch_mode: str
+    batch_size: int, num_verify_tokens: int, layout: str, launch_mode: str
 ) -> tuple[float, float, float]:
-    case = make_case(batch_size, num_verify_tokens)
+    case = make_case(batch_size, num_verify_tokens, layout)
     module = _jit_online_c128_mtp_module(
         HEAD_DIM, case.seq_lens.dtype, case.req_pool_indices.dtype, case.state.dtype
     )
-    fn = lambda: call_write_prefix(module, case)
+
+    def fn():
+        call_write_prefix(module, case)
 
     if launch_mode == "cuda_graph":
         return run_benchmark(fn)
