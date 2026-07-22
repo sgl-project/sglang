@@ -73,6 +73,7 @@ from sglang.srt.utils.common import (
     is_cpu,
     is_cuda,
     is_flashinfer_available,
+    is_gfx1201_supported,
     is_hip,
     is_hopper_with_cuda_12_3,
     is_host_cpu_arm64,
@@ -5338,6 +5339,8 @@ class ServerArgs:
                 )
             ):
                 return "trtllm_mha"
+            elif is_gfx1201_supported():
+                return "triton"
             elif is_hip():
                 return "aiter"
             elif is_mps():
@@ -5353,6 +5356,8 @@ class ServerArgs:
                 return "fa3"
             elif is_sm100_supported():
                 return "flashinfer"
+            elif is_gfx1201_supported():
+                return "triton"
             elif is_hip():
                 head_num = model_config.get_num_kv_heads(self.tp_size)
                 # TODO current aiter only support head number 16 or 128 head number

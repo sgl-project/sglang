@@ -339,7 +339,9 @@ inline bool getEnvEnablePDL() {
 
 #define CEILDIV(x, y) (((x) + (y) - 1) / (y))
 
-#ifndef USE_ROCM
+#ifdef SGLANG_WAVEFRONT_SIZE
+#define WARP_SIZE SGLANG_WAVEFRONT_SIZE
+#elif !defined(USE_ROCM)
 #define WARP_SIZE 32
 #else
 #if defined(__GFX9__) || !defined(__HIP_DEVICE_COMPILE__)

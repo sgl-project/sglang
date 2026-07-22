@@ -15,11 +15,12 @@ from sglang.srt.layers.quantization.dequantization import (
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
 from sglang.srt.layers.quantization.online_quantization import CopyNumelCounter
 from sglang.srt.layers.quantization.quark.schemes import QuarkLinearScheme
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import get_bool_env_var, is_hip
 from sglang.srt.utils.common import direct_register_custom_op, mxfp_supported
 
 _is_hip = is_hip()
-if _is_hip:
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+if _use_aiter:
     from aiter.ops.triton.gemm.fused.fused_gemm_afp4wfp4_split_cat import (
         fused_gemm_afp4wfp4_split_cat as _fused_gemm_afp4wfp4_split_cat_orig,
     )
@@ -172,6 +173,11 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
         is_checkpoint_mxfp4_serialized: bool = True,
         dequantization_config: QuantizationConfig | None = None,
     ):
+        if _is_hip and not _use_aiter:
+            raise RuntimeError(
+                "Quark W4A4 MXFP4 on ROCm requires AITER. Install AITER and set "
+                "SGLANG_USE_AITER=1, or use an unquantized BF16/FP16 model."
+            )
         self.out_dtype = torch.get_default_dtype()
         self.qscheme = "per_group"
         self.weight_quant_spec = weight_quant_spec

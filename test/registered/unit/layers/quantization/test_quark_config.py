@@ -1,14 +1,22 @@
 """Unit tests for QuarkConfig — CPU-only, no model loading."""
 
-from sglang.test.ci.ci_register import register_cpu_ci
-
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
-
 import unittest
 from unittest.mock import patch
 
 from sglang.srt.layers.quantization.quark.quark import QuarkConfig
+from sglang.srt.layers.quantization.quark.schemes.quark_w4a4_mxfp4 import (
+    QuarkW4A4MXFP4,
+)
+from sglang.srt.layers.quantization.quark.schemes.quark_w4a4_mxfp4_moe import (
+    QuarkW4A4MXFp4MoE,
+)
+from sglang.srt.layers.quantization.quark_int4fp8_moe import (
+    QuarkInt4Fp8MoEMethod,
+)
+from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 _GET_CAP = "sglang.srt.layers.quantization.quark.quark.get_device_capability"
 
@@ -81,6 +89,35 @@ class TestCheckSchemeSupportedError(CustomTestCase):
         with patch(_GET_CAP, return_value=None):
             ok = _bare_config()._check_scheme_supported(min_capability=70)
         self.assertFalse(ok)
+
+
+class TestOptionalAiterErrors(CustomTestCase):
+    def test_w4a4_mxfp4_requires_aiter_only_when_selected(self):
+        module = "sglang.srt.layers.quantization.quark.schemes.quark_w4a4_mxfp4"
+        with (
+            patch(f"{module}._is_hip", True),
+            patch(f"{module}._use_aiter", False),
+            self.assertRaisesRegex(RuntimeError, "requires AITER"),
+        ):
+            QuarkW4A4MXFP4({}, {})
+
+    def test_w4a4_mxfp4_moe_requires_aiter_only_when_selected(self):
+        module = "sglang.srt.layers.quantization.quark.schemes.quark_w4a4_mxfp4_moe"
+        with (
+            patch(f"{module}._is_hip", True),
+            patch(f"{module}._use_aiter", False),
+            self.assertRaisesRegex(RuntimeError, "requires AITER"),
+        ):
+            QuarkW4A4MXFp4MoE({}, {})
+
+    def test_int4fp8_moe_requires_aiter_only_when_selected(self):
+        module = "sglang.srt.layers.quantization.quark_int4fp8_moe"
+        with (
+            patch(f"{module}._is_hip", True),
+            patch(f"{module}._use_aiter", False),
+            self.assertRaisesRegex(RuntimeError, "requires AITER"),
+        ):
+            QuarkInt4Fp8MoEMethod(object())
 
 
 if __name__ == "__main__":

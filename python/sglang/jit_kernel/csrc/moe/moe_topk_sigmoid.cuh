@@ -8,8 +8,14 @@
 
 #include <sgl_kernel/utils.cuh>
 
+#ifdef USE_ROCM
+#include <hipcub/hipcub.hpp>
+#include <hipcub/util_type.hpp>
+namespace cub = hipcub;
+#else
 #include <cub/cub.cuh>
 #include <cub/util_type.cuh>
+#endif
 #include <tvm/ffi/container/tensor.h>
 #include <tvm/ffi/optional.h>
 
@@ -55,11 +61,20 @@ template <typename T>
 __device__ float convert_to_float(T x) {
   if constexpr (std::is_same_v<T, __half>) {
     return __half2float(x);
-  } else if constexpr (std::is_same_v<T, __nv_bfloat16>) {
+  } else if constexpr (std::is_same_v<T, bf16_t>) {
     return __bfloat162float(x);
   } else {
     return static_cast<float>(x);
   }
+}
+
+template <typename T>
+__device__ T shfl_xor(T value, int lane_mask, int width) {
+#ifdef USE_ROCM
+  return __shfl_xor(value, lane_mask, width);
+#else
+  return __shfl_xor_sync(0xffffffffu, value, lane_mask, width);
+#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -275,8 +290,8 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__ void topkGatingSigmoid(
 
 #pragma unroll
     for (int mask = THREADS_PER_ROW / 2; mask > 0; mask /= 2) {
-      float other_max = __shfl_xor_sync(0xffffffff, max_val, mask, THREADS_PER_ROW);
-      int other_expert = __shfl_xor_sync(0xffffffff, expert, mask, THREADS_PER_ROW);
+      float other_max = shfl_xor(max_val, mask, THREADS_PER_ROW);
+      int other_expert = shfl_xor(expert, mask, THREADS_PER_ROW);
       if (other_max > max_val || (other_max == max_val && other_expert < expert)) {
         max_val = other_max;
         expert = other_expert;

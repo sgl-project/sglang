@@ -437,6 +437,42 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         self.assertEqual(sa.dtype, "auto")
         self.assertEqual(self._publish(sa).dtype, "auto")
 
+    def test_gpt_oss_mxfp4_uses_triton_kernels_on_gfx1201(self):
+        from sglang.srt.arg_groups.overrides import _gpt_oss_overrides
+
+        server_args = SimpleNamespace(
+            dtype="auto",
+            ep_size=1,
+            tp_size=1,
+            moe_runner_backend="auto",
+            quantization=None,
+            is_attention_backend_not_set=lambda: True,
+        )
+        hf_config = SimpleNamespace(
+            architectures=["GptOssForCausalLM"],
+            quantization_config={"quant_method": "mxfp4"},
+        )
+        with (
+            patch.object(overrides_module, "is_gfx1201_supported", return_value=True),
+            patch.object(overrides_module, "is_sm100_supported", return_value=False),
+            patch.object(overrides_module, "is_sm120_supported", return_value=False),
+            patch.object(
+                overrides_module, "is_triton_kernels_available", return_value=True
+            ),
+        ):
+            server_args.tp_size = 2
+            server_args.moe_runner_backend = "triton_kernel"
+            with self.assertRaisesRegex(NotImplementedError, "single GPU"):
+                _gpt_oss_overrides(server_args, hf_config)
+
+            server_args.tp_size = 1
+            server_args.moe_runner_backend = "auto"
+            declarations = _gpt_oss_overrides(server_args, hf_config)
+
+        self.assertEqual(declarations["dtype"], "bfloat16")
+        self.assertEqual(declarations["attention_backend"], "triton")
+        self.assertEqual(declarations["moe_runner_backend"], "triton_kernel")
+
     def test_gpt_oss_xpu_dtype_validation_reads_pristine(self):
         from sglang.srt.arg_groups.overrides import _gpt_oss_overrides
 

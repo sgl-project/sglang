@@ -47,6 +47,7 @@ from sglang.srt.utils.common import (
     is_cuda,
     is_flashinfer_available,
     is_gfx95_supported,
+    is_gfx1201_supported,
     is_hip,
     is_musa,
     is_npu,
@@ -587,6 +588,8 @@ def _gpt_oss_overrides(server_args: Any, hf_config: Any) -> dict:
             overrides["attention_backend"] = "intel_amx"
         elif is_xpu():
             overrides["attention_backend"] = "intel_xpu"
+        elif is_gfx1201_supported():
+            overrides["attention_backend"] = "triton"
         elif is_hip():
             overrides["attention_backend"] = "aiter"
         else:
@@ -612,6 +615,16 @@ def _gpt_oss_overrides(server_args: Any, hf_config: Any) -> dict:
     if is_mxfp4_quant_format:
         # use bf16 for mxfp4 triton kernels
         overrides["dtype"] = "bfloat16"
+    if is_gfx1201_supported() and is_mxfp4_quant_format:
+        if server_args.tp_size != 1 or server_args.ep_size != 1:
+            raise NotImplementedError(
+                "MXFP4 on gfx1201 currently supports a single GPU only."
+            )
+        if not is_triton_kernels_available():
+            raise RuntimeError(
+                "MXFP4 on gfx1201 requires triton_kernels from the Triton "
+                "source tree."
+            )
     if server_args.moe_runner_backend == "auto":
 
         if is_sm100_supported() and is_mxfp4_quant_format:
@@ -624,6 +637,12 @@ def _gpt_oss_overrides(server_args: Any, hf_config: Any) -> dict:
             overrides["moe_runner_backend"] = "marlin"
             logger.warning(
                 "Detected SM120 and MXFP4 quantization format for GPT-OSS model, enabling Marlin MOE kernel."
+            )
+        elif is_gfx1201_supported() and is_mxfp4_quant_format:
+            overrides["moe_runner_backend"] = "triton_kernel"
+            logger.warning(
+                "Detected gfx1201 and MXFP4 quantization format for GPT-OSS, "
+                "enabling the triton_kernels MoE backend."
             )
         elif (is_hip() and envs.SGLANG_USE_AITER.get()) and is_mxfp4_quant_format:
             overrides["moe_runner_backend"] = "auto"

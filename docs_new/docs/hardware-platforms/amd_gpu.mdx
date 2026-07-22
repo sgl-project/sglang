@@ -3,6 +3,24 @@ title: "AMD GPUs"
 ---
 This document describes how to run SGLang on AMD GPUs. If you encounter issues or have questions, please [open an issue](https://github.com/sgl-project/sglang/issues).
 
+## Supported architectures
+
+SGLang supports AMD Instinct `gfx942` and `gfx950` GPUs. Experimental single-GPU
+support is also available for RDNA4 `gfx1201` GPUs such as Radeon AI PRO R9700
+and Radeon RX 9070 series cards.
+
+The initial `gfx1201` support includes BF16/FP16 dense models, FP8 online
+quantization for dense models, single-GPU BF16/FP8 Triton MoE, and single-GPU
+GPT-OSS inference with its native MXFP4 checkpoint. Use the Triton attention
+backend. Other quantization formats, custom all-reduce, and multi-GPU serving
+are not yet supported on this architecture. Keep AITER disabled on gfx1201.
+
+Use ROCm 7.2 or later. AMD's [Radeon PyTorch installation guide](https://rocm.docs.amd.com/projects/radeon-ryzen/en/latest/docs/install/installrad/native_linux/install-pytorch.html)
+lists the supported operating systems and official PyTorch containers. AMD's
+[GPU architecture specifications](https://rocm.docs.amd.com/en/latest/reference/gpu-arch-specs.html)
+identify `gfx1201` as an RDNA4 target with 32-or-64-lane wavefront support and
+128 KiB of LDS.
+
 ## System Configuration
 
 When using AMD GPUs (such as MI300X), certain system-level optimizations help ensure stable performance. Here we take MI300X as an example. AMD provides official documentation for MI300X optimization and system tuning:
@@ -58,6 +76,70 @@ cd ..
 rm -rf python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml
 pip install -e "python[all_hip]"
 ```
+
+For an experimental `gfx1201` source build, compile a single-architecture
+kernel and leave the full Aiter backend disabled:
+
+```bash Command
+export AMDGPU_TARGET=gfx1201
+export PYTORCH_ROCM_ARCH=gfx1201
+export GPU_ARCHS=gfx1201
+export SGLANG_USE_AITER=0
+
+cd sgl-kernel
+python setup_rocm.py install
+cd ..
+
+# SGLang currently uses the matmul_ogs API from this triton_kernels revision.
+python -m pip install --no-deps \
+    "git+https://github.com/triton-lang/triton.git@4a24bf0b19a027ec0833b31cbc9ac29add7b17af#subdirectory=python/triton_kernels"
+
+python3 -m sglang.launch_server \
+    --model-path Qwen/Qwen3-0.6B \
+    --dtype bfloat16 \
+    --attention-backend triton \
+    --model-loader-extra-config '{"enable_multithread_load": false}' \
+    --tp 1
+```
+
+The single-threaded loader avoids long host-to-device copy stalls observed with
+parallel checkpoint loading on RDNA4. It does not affect inference after the
+model is loaded. Large checkpoints can still spend several minutes registering
+host memory with ROCm before the load-complete message appears.
+
+FP8 online quantization uses PyTorch/hipBLASLt and does not require AITER:
+
+```bash Command
+python3 -m sglang.launch_server \
+    --model-path Qwen/Qwen3-0.6B \
+    --quantization fp8 \
+    --dtype bfloat16 \
+    --attention-backend triton \
+    --model-loader-extra-config '{"enable_multithread_load": false}' \
+    --tp 1
+```
+
+MXFP4 support on `gfx1201` is limited to the native MXFP4 GPT-OSS checkpoint,
+one GPU, and the `triton_kernel` MoE runner. SGLang selects that runner
+automatically when `--moe-runner-backend auto` is used:
+
+```bash Command
+SGLANG_USE_AITER=0 python3 -m sglang.launch_server \
+    --model-path openai/gpt-oss-20b \
+    --dtype bfloat16 \
+    --attention-backend triton \
+    --moe-runner-backend auto \
+    --model-loader-extra-config '{"enable_multithread_load": false}' \
+    --tp 1
+```
+
+The `gfx1201` path keeps the checkpoint's canonical MXFP4 value and scale
+layouts. It does not use the CDNA4 HBM swizzle. AITER/Quark MXFP4, expert
+parallelism, and tensor parallelism are not supported on this path.
+
+Do not combine `gfx1201` with CDNA targets in the same `sgl-kernel` build. CDNA
+and RDNA resolve warp-size-dependent code differently, and some host-side launch
+calculations are not yet safe in a mixed-architecture binary.
 
 ### Install Using Docker (Recommended)
 
