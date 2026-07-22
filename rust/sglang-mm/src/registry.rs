@@ -3,8 +3,8 @@
 //! Each model implements `ImageProcessorSpec` and registers itself. The Python
 //! layer looks up a processor by model name at init time.
 
-use pyo3::prelude::*;
 use pyo3::exceptions::PyValueError;
+use pyo3::prelude::*;
 
 /// Trait that each model's image processor must implement.
 pub trait ImageProcessorSpec: Send + Sync {
@@ -38,7 +38,10 @@ impl ProcessorRegistry {
     }
 
     pub fn lookup(&self, name: &str) -> Option<&dyn ImageProcessorSpec> {
-        self.specs.iter().find(|s| s.name() == name).map(|s| s.as_ref())
+        self.specs
+            .iter()
+            .find(|s| s.name() == name)
+            .map(|s| s.as_ref())
     }
 
     pub fn list_names(&self) -> Vec<&'static str> {

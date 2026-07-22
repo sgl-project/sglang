@@ -1,39 +1,116 @@
 """sglang build hooks.
 
-SGLANG_BUILD_RUST_EXTS controls which Rust extensions are built:
-  - unset or "all": build every declared Rust extension (the default).
-  - "none": build no Rust extensions.
-  - comma-separated names: build only extensions whose target matches one of the
-    given (case-insensitive) substrings, e.g. "grpc" matches
-    "sglang.srt.grpc._core".
+Rust extensions are auto-discovered from the cargo workspace in ../rust: every
+crate whose Cargo.toml declares
 
-This is a build-time environment variable, so it is read directly from
-os.environ instead of sglang.srt.environ, which is not available until after the
-package has been built.
+    [package.metadata.sglang]
+    python-module = "sglang.srt.<pkg>._core"   # import path inside the wheel
+    debug = false                              # optional RustExtension knob
+
+is built as a PyO3 extension module at that import path. Adding a new extension
+crate therefore needs no pyproject changes — declare the metadata in the crate.
+
+Two filters can narrow the discovered set:
+
+- [tool.sglang] rust-extensions in the active pyproject.toml: a list of
+  case-insensitive substrings of the target module. Platform pyprojects use
+  this to build a subset (e.g. pyproject_other.toml builds only "multimodal";
+  grpc needs proto/tonic and is intentionally CUDA-only).
+- SGLANG_BUILD_RUST_EXTS env var, applied at build time on top of the above:
+  unset or "all" builds everything, "none" builds nothing, and a
+  comma-separated list matches substrings, e.g. "grpc" matches
+  "sglang.srt.grpc._core". It is read directly from os.environ instead of
+  sglang.srt.environ, which is not importable until the package is built.
 """
 
 import os
+from pathlib import Path
 
+import tomli
 from setuptools import setup
 
 try:
-    from setuptools_rust import build_rust
+    from setuptools_rust import Binding, RustExtension, build_rust
 except ModuleNotFoundError as exc:
     if exc.name != "setuptools_rust":
         raise
-    # Alternate platform pyprojects do not declare Rust extensions.
+    # Alternate platform pyprojects that build no Rust extensions do not
+    # install setuptools-rust.
     build_rust = None
 
 _BUILD_RUST_EXTS_ENV = "SGLANG_BUILD_RUST_EXTS"
+_PYTHON_DIR = Path(__file__).resolve().parent
+_RUST_WORKSPACE_DIR = _PYTHON_DIR.parent / "rust"
+
+
+def _load_toml(path):
+    with open(path, "rb") as f:
+        return tomli.load(f)
+
+
+def _match_by_substring(declared, tokens, source):
+    """Match tokens as case-insensitive substrings of extension names."""
+    matched = set()
+    unmatched = []
+    for token in tokens:
+        hits = {ext.name for ext in declared if token in ext.name.lower()}
+        if hits:
+            matched |= hits
+        else:
+            unmatched.append(token)
+    if unmatched:
+        declared_names = sorted(ext.name for ext in declared)
+        raise ValueError(
+            f"{source} matched no discovered Rust extension for: {unmatched}; "
+            f"discovered extensions are {declared_names}"
+        )
+    return [ext for ext in declared if ext.name in matched]
+
+
+def _discovered_rust_extensions():
+    """One RustExtension per workspace crate declaring a python-module."""
+    extensions = []
+    for manifest_path in sorted(_RUST_WORKSPACE_DIR.glob("*/Cargo.toml")):
+        package = _load_toml(manifest_path).get("package")
+        if package is None:
+            continue
+        sglang_meta = package.get("metadata", {}).get("sglang", {})
+        if "python-module" not in sglang_meta:
+            continue
+        extensions.append(
+            RustExtension(
+                target=sglang_meta["python-module"],
+                path=str(manifest_path),
+                binding=Binding.PyO3,
+                debug=sglang_meta.get("debug"),
+            )
+        )
+    if not extensions:
+        raise RuntimeError(
+            f"no Rust extension crates found under {_RUST_WORKSPACE_DIR} "
+            "(building outside a repo checkout?); set "
+            f"{_BUILD_RUST_EXTS_ENV}=none to build without them"
+        )
+    return extensions
+
+
+def _pyproject_rust_extensions(declared):
+    """Apply the active pyproject's [tool.sglang] rust-extensions allowlist."""
+    sglang_tool = (
+        _load_toml(_PYTHON_DIR / "pyproject.toml").get("tool", {}).get("sglang", {})
+    )
+    tokens = sglang_tool.get("rust-extensions")
+    if tokens is None:
+        return declared
+    return _match_by_substring(
+        declared=declared,
+        tokens=[token.lower() for token in tokens],
+        source="[tool.sglang] rust-extensions",
+    )
 
 
 def _selected_rust_extensions(declared):
-    """Return the Rust extensions selected by SGLANG_BUILD_RUST_EXTS.
-
-    `ext.name` is the fully-qualified target (e.g. "sglang.srt.grpc._core") for
-    the string-target declarations in pyproject.toml, so comma-separated names
-    are matched as case-insensitive substrings of it.
-    """
+    """Apply the SGLANG_BUILD_RUST_EXTS build-time filter."""
     declared = list(declared)
     raw = os.environ.get(_BUILD_RUST_EXTS_ENV)
     if raw is None:
@@ -52,23 +129,17 @@ def _selected_rust_extensions(declared):
             f"{_BUILD_RUST_EXTS_ENV}={raw!r} has an empty item; unset it or use "
             "'all', 'none', or a comma-separated list of extension names"
         )
+    return _match_by_substring(
+        declared=declared, tokens=tokens, source=_BUILD_RUST_EXTS_ENV
+    )
 
-    matched = set()
-    unmatched = []
-    for token in tokens:
-        hits = {ext.name for ext in declared if token in ext.name.lower()}
-        if hits:
-            matched |= hits
-        else:
-            unmatched.append(token)
-    if unmatched:
-        declared_names = sorted(ext.name for ext in declared)
-        raise ValueError(
-            f"{_BUILD_RUST_EXTS_ENV} matched no declared Rust extension for: "
-            f"{unmatched}; declared extensions are {declared_names}"
-        )
 
-    return [ext for ext in declared if ext.name in matched]
+def _declared_rust_extensions():
+    # "none" short-circuits discovery so builds without a ../rust checkout
+    # (e.g. from an sdist) still work.
+    if (os.environ.get(_BUILD_RUST_EXTS_ENV) or "").strip().lower() == "none":
+        return []
+    return _pyproject_rust_extensions(_discovered_rust_extensions())
 
 
 if build_rust is not None:
@@ -84,9 +155,9 @@ if build_rust is not None:
                 return
             super().run()
 
-    _cmdclass = {"build_rust": BuildRust}
+    setup(
+        cmdclass={"build_rust": BuildRust},
+        rust_extensions=_declared_rust_extensions(),
+    )
 else:
-    _cmdclass = {}
-
-
-setup(cmdclass=_cmdclass)
+    setup()

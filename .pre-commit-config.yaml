@@ -117,6 +117,12 @@ repos:
         language: system
         files: ^experimental/sgl-router/.*\.rs$
         pass_filenames: false
+      - id: rustfmt-rust-workspace
+        name: rustfmt rust/ workspace
+        entry: bash -c 'cd rust && cargo fmt'
+        language: system
+        files: ^rust/.*\.rs$
+        pass_filenames: false
       - id: mint-broken-links
         name: check docs_new links (Mintlify; opt-in, requires `mint` on PATH)
         entry: bash -c 'cd docs_new && mint broken-links --check-anchors --check-redirects'

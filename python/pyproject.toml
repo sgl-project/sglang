@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61.0", "setuptools-rust>=1.10", "setuptools-scm>=8.0", "wheel"]
+requires = ["setuptools>=61.0", "setuptools-rust>=1.10", "setuptools-scm>=8.0", "wheel", "tomli>=1.1.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -225,16 +225,10 @@ git_describe_command = ["python3", "python/tools/get_version_tag.py"]
 # Allow editable installs even when .git metadata is not available.
 fallback_version = "0.0.0.dev0"
 
-[[tool.setuptools-rust.ext-modules]]
-target = "sglang.srt.grpc._core"
-path = "../rust/sglang-grpc/Cargo.toml"
-binding = "PyO3"
-
-[[tool.setuptools-rust.ext-modules]]
-target = "sglang.srt.multimodal._core"
-path = "../rust/sglang-mm/Cargo.toml"
-binding = "PyO3"
-debug = false
+# Rust extension modules are auto-discovered by setup.py from the cargo
+# workspace in ../rust ([package.metadata.sglang] python-module in each crate).
+# This CUDA pyproject builds all of them; platform variants restrict the set
+# via [tool.sglang] rust-extensions (see pyproject_other.toml).
 
 [tool.kernels.dependencies]
 "kernels-community/sgl-flash-attn3" = 1
