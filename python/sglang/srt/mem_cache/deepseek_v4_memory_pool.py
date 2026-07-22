@@ -7,6 +7,7 @@ from typing import List, Literal, NamedTuple, Optional, Tuple
 import torch
 
 from sglang.jit_kernel.dsv4 import (
+    C128DraftCleanup,
     clear_unaccepted_c128_draft_states,
     fused_k_norm_rope_flashmla,
     fused_store_cache,
@@ -22,10 +23,11 @@ from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.runtime_context import get_exec, get_server_args
-from sglang.srt.utils import ceil_div, is_hip
+from sglang.srt.utils import ceil_div, is_cuda, is_hip
 
 logger = logging.getLogger(__name__)
 
+_is_cuda = is_cuda()
 _is_hip = is_hip()
 
 ONLINE_C128 = not _is_hip and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
@@ -940,6 +942,23 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                     ratio, enable_memory_saver
                 )
 
+        self._c128_draft_cleanup: Optional[C128DraftCleanup] = None
+        if _is_cuda and not ONLINE_C128:
+            c128_pools = [
+                pool
+                for pool in self.compress_state_pools
+                if pool is not None and pool.ratio == 128
+            ]
+            if c128_pools:
+                ring_size = c128_pools[0].ring_size
+                assert all(
+                    pool.ring_size == ring_size for pool in c128_pools
+                ), "All C128 state pools must share one ring size for fused cleanup"
+                self._c128_draft_cleanup = C128DraftCleanup(
+                    [pool.kv_score_buffer.kv_score for pool in c128_pools],
+                    ring_size=ring_size,
+                )
+
     def _init_compressed_layer_mapping(self):
         c1_cnt = c4_cnt = c128_cnt = 0
         total_L = len(self.compression_ratios)
@@ -1031,7 +1050,15 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         if ONLINE_C128 or num_draft_tokens <= 1 or req_pool_indices.numel() == 0:
             return
 
-        bs = req_pool_indices.numel()
+        if self._c128_draft_cleanup is not None:
+            self._c128_draft_cleanup.clear(
+                req_pool_indices,
+                seq_lens,
+                accept_lens,
+                num_draft_tokens=num_draft_tokens,
+            )
+            return
+
         for pool in self.compress_state_pools:
             if pool is None or pool.ratio != 128:
                 continue

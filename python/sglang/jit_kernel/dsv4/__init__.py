@@ -3,7 +3,10 @@ from .attn import (
     get_paged_mqa_logits_metadata,
     triton_create_paged_compress_data,
 )
-from .c128_cleanup import clear_unaccepted_c128_draft_states
+from .c128_cleanup import (
+    C128DraftCleanup,
+    clear_unaccepted_c128_draft_states,
+)
 from .compress import (
     CompressorDecodePlan,
     CompressorPrefillPlan,
@@ -35,6 +38,7 @@ from .utils import make_name
 __all__ = [
     "CompressorDecodePlan",
     "CompressorPrefillPlan",
+    "C128DraftCleanup",
     "compress_forward",
     "compress_norm_rope_store",
     "clear_unaccepted_c128_draft_states",
