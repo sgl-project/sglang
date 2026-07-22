@@ -14,7 +14,7 @@ from sglang.jit_kernel.dsv4 import (
     CompressorDecodePlan,
     CompressorPrefillPlan,
 )
-from sglang.jit_kernel.utils import is_hip_runtime
+from sglang.kernels.jit.utils import is_hip_runtime
 
 _is_hip = is_hip_runtime()
 
