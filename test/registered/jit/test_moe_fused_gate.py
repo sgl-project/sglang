@@ -21,9 +21,8 @@ from typing import Tuple
 import pytest
 import torch
 
-from sglang.jit_kernel.moe_fused_gate import moe_fused_gate, moe_fused_gate_jit
-from sglang.jit_kernel.utils import get_ci_test_range
-from sglang.srt.layers.moe.topk import biased_grouped_topk_impl
+from sglang.kernels.jit.utils import get_ci_test_range
+from sglang.kernels.ops.moe.moe_fused_gate import moe_fused_gate, moe_fused_gate_jit
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=8, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -105,17 +104,33 @@ def _make_inputs(M: int, num_experts: int, seed: int):
     return scores, bias
 
 
-_NUM_EXPERTS = get_ci_test_range([128, 256, 384, 512], [128, 384, 512])
-_M = get_ci_test_range([1, 7, 64, 256, 1024], [1, 64, 1024])
+# Keep CI coverage representative without exploding into a large cartesian grid.
+_REFERENCE_CASES = get_ci_test_range(
+    [
+        (1, 128, 4, "sigmoid", 0, True, True),
+        (7, 256, 6, "sqrtsoftplus", 1, False, False),
+        (64, 384, 8, "sigmoid", 0, False, True),
+        (256, 384, 6, "sqrtsoftplus", 0, True, False),
+        (1024, 128, 4, "sigmoid", 1, False, False),
+        (1024, 512, 8, "sqrtsoftplus", 1, True, True),
+        (7, 512, 4, "sigmoid", 1, True, False),
+        (256, 256, 8, "sqrtsoftplus", 0, False, True),
+    ],
+    [
+        (1, 128, 4, "sigmoid", 0, True, True),
+        (7, 256, 6, "sqrtsoftplus", 1, False, False),
+        (64, 384, 8, "sigmoid", 0, False, True),
+        (256, 384, 6, "sqrtsoftplus", 0, True, False),
+        (1024, 128, 4, "sigmoid", 1, False, False),
+        (1024, 512, 8, "sqrtsoftplus", 1, True, True),
+    ],
+)
 
 
-@pytest.mark.parametrize("M", _M)
-@pytest.mark.parametrize("num_experts", _NUM_EXPERTS)
-@pytest.mark.parametrize("topk", [4, 6, 8])
-@pytest.mark.parametrize("scoring_func", ["sigmoid", "sqrtsoftplus"])
-@pytest.mark.parametrize("num_shared", [0, 1])
-@pytest.mark.parametrize("renormalize", [True, False])
-@pytest.mark.parametrize("apply_scale", [True, False])
+@pytest.mark.parametrize(
+    "M,num_experts,topk,scoring_func,num_shared,renormalize,apply_scale",
+    _REFERENCE_CASES,
+)
 def test_moe_fused_gate_matches_reference(
     M: int,
     num_experts: int,
@@ -200,6 +215,8 @@ def test_moe_fused_gate_matches_production_impl(
     path always renormalizes (the impl only applies the scaling factor when
     ``renormalize`` is set), so we compare on the renormalized path.
     """
+    from sglang.srt.layers.moe.topk import biased_grouped_topk_impl
+
     M = 128
     scores, bias = _make_inputs(M, num_experts, seed=7)
     scale = 2.5
@@ -277,10 +294,27 @@ def _reference_softmax(
     return wgt, idx
 
 
-@pytest.mark.parametrize("M", [1, 200, 1024])
-@pytest.mark.parametrize("num_experts,topk", [(128, 4), (256, 8), (512, 6)])
-@pytest.mark.parametrize("renormalize", [True, False])
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+_SOFTMAX_AOT_CASES = get_ci_test_range(
+    [
+        (1, 128, 4, True, torch.float32),
+        (1, 256, 8, False, torch.float32),
+        (200, 128, 4, False, torch.bfloat16),
+        (200, 256, 8, True, torch.bfloat16),
+        (1024, 512, 6, False, torch.float32),
+        (1024, 512, 6, True, torch.bfloat16),
+    ],
+    [
+        (1, 128, 4, True, torch.float32),
+        (200, 256, 8, False, torch.bfloat16),
+        (1024, 512, 6, False, torch.float32),
+    ],
+)
+
+
+@pytest.mark.parametrize(
+    "M,num_experts,topk,renormalize,dtype",
+    _SOFTMAX_AOT_CASES,
+)
 def test_moe_fused_gate_softmax_matches_aot(
     M: int, num_experts: int, topk: int, renormalize: bool, dtype: torch.dtype
 ) -> None:
@@ -309,11 +343,28 @@ def test_moe_fused_gate_softmax_matches_aot(
     )
 
 
-@pytest.mark.parametrize("M", [1, 200, 1024])
-@pytest.mark.parametrize("num_experts,topk", [(128, 4), (256, 8)])
-@pytest.mark.parametrize("renormalize", [True, False])
-@pytest.mark.parametrize("with_bias", [True, False])
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+_SIGMOID_AOT_CASES = get_ci_test_range(
+    [
+        (1, 128, 4, True, True, torch.float32),
+        (1, 256, 8, False, True, torch.float32),
+        (200, 128, 4, False, False, torch.bfloat16),
+        (200, 256, 8, True, False, torch.bfloat16),
+        (1024, 128, 4, True, False, torch.float32),
+        (1024, 256, 8, False, True, torch.bfloat16),
+    ],
+    [
+        (1, 128, 4, True, True, torch.float32),
+        (200, 128, 4, False, False, torch.bfloat16),
+        (200, 256, 8, True, False, torch.bfloat16),
+        (1024, 256, 8, False, True, torch.float32),
+    ],
+)
+
+
+@pytest.mark.parametrize(
+    "M,num_experts,topk,renormalize,with_bias,dtype",
+    _SIGMOID_AOT_CASES,
+)
 def test_moe_fused_gate_sigmoid_matches_aot(
     M: int,
     num_experts: int,
@@ -372,6 +423,8 @@ def test_moe_fused_gate_grouped_matches_production_impl(
     keep topk_group groups, then top-k within). biased_grouped_topk_impl is the
     eager reference the production grouped path is defined against.
     """
+    from sglang.srt.layers.moe.topk import biased_grouped_topk_impl
+
     M = 256
     torch.manual_seed(num_experts * 7 + num_expert_group * 13 + topk)
     gating = torch.randn(M, num_experts, dtype=dtype, device=DEVICE) * 2.0

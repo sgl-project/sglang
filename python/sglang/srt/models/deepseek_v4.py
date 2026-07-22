@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import concurrent.futures
+import functools
 import logging
 import time
 from contextlib import nullcontext
 from typing import (
     TYPE_CHECKING,
+    Any,
+    Callable,
     Iterable,
     List,
+    NamedTuple,
     Optional,
     Set,
     Tuple,
@@ -19,17 +23,26 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import sglang.srt.models.deepseek_v2 as deepseek_v2
-from sglang.jit_kernel.dsv4 import (
+from sglang.kernels.ops.attention.deepseek_v4_rope import (
+    v4_rope_inplace_npu,
+)
+from sglang.kernels.ops.attention.dsv4 import (
     fused_norm_rope_inplace,
     fused_q_norm_rope,
     fused_rope_inplace,
     sglang_per_token_group_quant_fp8_dsv4_wo_a,
+)
+from sglang.kernels.ops.quantization.fp8_kernel import (
+    sglang_per_token_group_quant_fp8,
 )
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.distributed import (
     get_pp_group,
     get_tp_group,
+)
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    use_symmetric_memory,
 )
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -47,9 +60,6 @@ from sglang.srt.layers.communicator_dsa_cp import (
     dsa_cp_gather_hidden_states,
     dsa_cp_reduce_scatter_hidden_states,
 )
-from sglang.srt.layers.deepseek_v4_rope import (
-    v4_rope_inplace_npu,
-)
 from sglang.srt.layers.dp_attention import (
     _tbo_event,
     attn_tp_all_gather,
@@ -66,6 +76,7 @@ from sglang.srt.layers.dp_attention import (
     get_local_dp_buffer,
     get_local_dp_buffer_len,
     get_tbo_persistent_buffer,
+    is_allocation_symmetric,
     is_dp_attention_enabled,
     is_dp_gatherv_active,
 )
@@ -114,7 +125,10 @@ from sglang.srt.models.dbrx import ReplicatedLinear
 from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
     try_fused_hc_post_pre,
 )
-from sglang.srt.models.deepseek_common.utils import _use_aiter_bpreshuffle_gfx95
+from sglang.srt.models.deepseek_common.utils import (
+    _use_aiter_bpreshuffle_gfx95,
+    is_wint4afp8_or_wint4a16_config,
+)
 from sglang.srt.models.deepseek_v2 import (
     ParallelLMHead,
     _is_cuda,
@@ -128,11 +142,6 @@ if not _is_hip:
     from sglang.srt.layers.utils.cp_utils import (
         prepare_context_parallel_metadata,
     )
-
-if _is_xpu:
-    from sgl_kernel import hc_split_sinkhorn
-else:
-    from sglang.srt.layers.mhc import hc_split_sinkhorn, mhc_fused_post_pre, npu_hc_pre
 
 from sglang.srt.utils import (
     LazyValue,
@@ -150,6 +159,37 @@ from sglang.srt.utils.hf_transformers_utils import get_rope_config
 # torch_npu.npu_rms_norm directly (imports elsewhere aren't visible in this module).
 if _is_npu:
     import torch_npu
+
+
+class MhcOps(NamedTuple):
+    hc_split_sinkhorn: Callable[..., Any]
+    mhc_fused_post_pre: Optional[Callable[..., Any]]
+    npu_hc_pre: Optional[Callable[..., Any]]
+
+
+@functools.cache
+def _get_mhc_ops() -> MhcOps:
+    """Load MHC kernels only when a DeepSeek-V4 layer needs them.
+
+    Model modules are imported eagerly by the registry.  Importing
+    ``sglang.kernels.ops.layernorm.mhc`` owns TileLang-backed MHC kernels.
+    Import it only when a DeepSeek-V4 layer executes so registry discovery
+    cannot initialize an optional CUDA runtime before unrelated models set up
+    their communication workspaces.  DeepSeek-V4 is the sole consumer here.
+    """
+    if _is_xpu:
+        from sgl_kernel import hc_split_sinkhorn
+
+        return MhcOps(hc_split_sinkhorn, None, None)
+
+    from sglang.kernels.ops.layernorm.mhc import (
+        hc_split_sinkhorn,
+        mhc_fused_post_pre,
+        npu_hc_pre,
+    )
+
+    return MhcOps(hc_split_sinkhorn, mhc_fused_post_pre, npu_hc_pre)
+
 
 logger = logging.getLogger(__name__)
 
@@ -461,10 +501,14 @@ class MqaAttentionBase(nn.Module):
             **({} if fp8 else {"params_dtype": torch.bfloat16}),
         )
         if fp8:
+            from sglang.srt.layers import deep_gemm_wrapper
+
             assert hasattr(
                 self.wo_a, "weight_scale_inv"
             ), "FP8 quant_config must create weight_scale_inv"
-            self.wo_a.weight_scale_inv.format_ue8m0 = True
+            self.wo_a.weight_scale_inv.format_ue8m0 = (
+                deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+            )
         self.wo_b = RowParallelLinear(
             self.n_groups * self.o_lora_rank,
             self.hidden_size,
@@ -476,7 +520,7 @@ class MqaAttentionBase(nn.Module):
             tp_size=self.attn_tp_size,
         )
 
-        from sglang.srt.layers.deepseek_v4_rope import precompute_freqs_cis
+        from sglang.kernels.ops.attention.deepseek_v4_rope import precompute_freqs_cis
 
         rope_theta, rope_scaling = get_rope_config(config)
         self.rope_scaling = rope_scaling
@@ -801,7 +845,7 @@ class MQALayer(MqaAttentionBase):
                 else self.wkv(x_linear)[0]
             )
 
-            from sglang.srt.layers.fused_qk_norm_rope_store import (
+            from sglang.kernels.ops.attention.fused_qk_norm_rope_store import (
                 fused_qk_norm_rope_swa_store,
             )
 
@@ -872,7 +916,7 @@ class MQALayer(MqaAttentionBase):
         use_cp = self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch)
         kv: Optional[torch.Tensor]
 
-        from sglang.srt.layers.attention.dsv4.unified_kv_kernels.env_gate import (
+        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
             is_unified_kv_triton,
         )
 
@@ -915,7 +959,7 @@ class MQALayer(MqaAttentionBase):
                     False,
                 )
 
-            from sglang.srt.layers.fused_qk_norm_rope_store import (
+            from sglang.kernels.ops.attention.fused_qk_norm_rope_store import (
                 fused_qk_norm_rope_swa_store,
             )
 
@@ -1126,7 +1170,7 @@ class MQALayer(MqaAttentionBase):
         # (no DSA-CP), pass `q` as a sentinel for the `k is v` assert; the
         # attention path doesn't read it once `save_kv_cache=False`.
         attn_k = kv if kv is not None else q
-        from sglang.srt.layers.attention.dsv4.unified_kv_kernels.env_gate import (
+        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
             is_unified_kv_triton,
         )
 
@@ -1191,16 +1235,31 @@ class MQALayer(MqaAttentionBase):
         if _FP8_WO_A_GEMM:
             import deep_gemm
 
+            from sglang.srt.layers import deep_gemm_wrapper
+
             T, G, D = o.shape
             R = self.o_lora_rank
-            o_fp8, o_s = sglang_per_token_group_quant_fp8_dsv4_wo_a(o)
+            if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+                # sm100 (Blackwell): ue8m0 scales via the dedicated JIT kernel.
+                o_fp8, o_s = sglang_per_token_group_quant_fp8_dsv4_wo_a(o)
+                recipe = (1, 1, 128)
+            else:
+                # sm90 (Hopper): fp32 scales.
+                o_fp8, o_s = sglang_per_token_group_quant_fp8(
+                    o.reshape(T * G, D).contiguous(),
+                    group_size=128,
+                    scale_ue8m0=False,
+                )
+                o_fp8 = o_fp8.view(T, G, D)
+                o_s = o_s.view(T, G, -1)
+                recipe = (1, 128, 128)
             output = torch.empty(T, G, R, device=o.device, dtype=torch.bfloat16)
             deep_gemm.fp8_einsum(
                 "bhr,hdr->bhd",
                 (o_fp8, o_s),
                 (self.wo_a.weight.view(G, R, D), self.wo_a.weight_scale_inv.data),
                 output,
-                recipe=(1, 1, 128),
+                recipe=recipe,
             )
             o = output
         else:
@@ -1345,7 +1404,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         shape, dtype = x.size(), x.dtype
 
         if _is_npu:
-            return npu_hc_pre(
+            return _get_mhc_ops().npu_hc_pre(
                 x,
                 hc_fn,
                 hc_scale,
@@ -1366,7 +1425,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             return y, post, comb, False
 
         if envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
-            from sglang.srt.layers.mhc import mhc_pre
+            from sglang.kernels.ops.layernorm.mhc import mhc_pre
 
             norm_kwargs = {}
             if norm is not None:
@@ -1422,7 +1481,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         else:
             x_flat, mixes = hc_pre_torch_impl(x, hc_fn)
 
-        pre, post, comb = hc_split_sinkhorn(
+        pre, post, comb = _get_mhc_ops().hc_split_sinkhorn(
             mixes,
             hc_scale,
             hc_base,
@@ -1430,8 +1489,17 @@ class DeepseekV4DecoderLayer(nn.Module):
             self.hc_sinkhorn_iters,
             self.hc_eps,
         )
-        y = (pre.squeeze(1).unsqueeze(-1) * x_flat.view(shape)).sum(dim=1)
-        return y.to(dtype), post.squeeze(1), comb.squeeze(1), False
+        # y is the post-norm activation fed into the MoE. Allocate it in the
+        # symmetric memory pool so the downstream all-reduce uses the low-latency
+        # NCCL symmetric path: the Triton inplace MoE runner writes the expert
+        # output back into this buffer, so a symmetric input yields a symmetric
+        # all-reduce input. Gated by is_allocation_symmetric() (mirrors the
+        # TileLang path in _mhc_pre_impl / mhc_fused_post_pre).
+        with use_symmetric_memory(
+            get_tp_group(), disabled=not is_allocation_symmetric()
+        ):
+            y = (pre.squeeze(1).unsqueeze(-1) * x_flat.view(shape)).sum(dim=1).to(dtype)
+        return y, post.squeeze(1), comb.squeeze(1), False
 
     def hc_post(
         self,
@@ -1450,7 +1518,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             return torch.ops.custom.npu_hc_post(x, residual, post, comb)
 
         if envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get():
-            from sglang.srt.layers.mhc import mhc_post
+            from sglang.kernels.ops.layernorm.mhc import mhc_post
 
             return mhc_post(x, residual, post, comb)
 
@@ -1493,7 +1561,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         use_fused = self.use_fused_mhc_post_pre
 
         if prev_residual is not None and use_fused:
-            residual, post, comb, hidden_states = mhc_fused_post_pre(
+            residual, post, comb, hidden_states = _get_mhc_ops().mhc_fused_post_pre(
                 hidden_states,
                 prev_residual,
                 prev_post,
@@ -1563,7 +1631,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             if fused_mhc is not None:
                 residual, hidden_states, post, comb, norm_fused = fused_mhc
             else:
-                residual, post, comb, hidden_states = mhc_fused_post_pre(
+                residual, post, comb, hidden_states = _get_mhc_ops().mhc_fused_post_pre(
                     hidden_states,
                     residual,
                     post.unsqueeze(-1) if post.ndim == 2 else post,
@@ -2035,6 +2103,8 @@ class DeepseekV4Model(nn.Module):
         if self.dsa_enable_prefill_cp:
             self.cp_size = get_parallel().attn_cp_size
 
+        self.dspark_layers_to_capture: Optional[List[int]] = None
+
     def get_input_embeddings(self) -> nn.Module:
         return self.embed_tokens
 
@@ -2046,7 +2116,7 @@ class DeepseekV4Model(nn.Module):
         hc_base: torch.Tensor,
     ):
         if x.numel() > 0:
-            from sglang.srt.layers.mhc_head import fused_hc_head
+            from sglang.kernels.ops.layernorm.mhc_head import fused_hc_head
 
             return fused_hc_head(
                 x.contiguous(),
@@ -2081,7 +2151,9 @@ class DeepseekV4Model(nn.Module):
             and forward_batch.can_run_tbo
             and forward_batch.tbo_children is not None
             and forward_batch.global_forward_mode is not None
-            and forward_batch.global_forward_mode.is_extend()
+            # MTP target-verify also reports is_extend(); only real prefill
+            # should enter the prefill TBO strategy.
+            and forward_batch.global_forward_mode.is_extend_without_speculative()
             and not dsa_use_prefill_cp(forward_batch)
             and self.pp_group.world_size == 1
         )
@@ -2220,7 +2292,18 @@ class DeepseekV4Model(nn.Module):
             if hasattr(forward_batch, _attr):
                 delattr(forward_batch, _attr)
 
-        if self._can_run_tbo(forward_batch):
+        capture_dspark = self.dspark_layers_to_capture is not None
+        if capture_dspark and dsa_use_prefill_cp(forward_batch):
+            raise NotImplementedError(
+                "DSpark aux hidden-state capture is not supported together with "
+                "DeepSeek-V4 prefill context parallelism (attn_cp_size > 1). Disable one "
+                "of them: DSpark static-verify is CP-off for v1."
+            )
+        dspark_aux_hidden_states: List[torch.Tensor] = []
+        # DSpark aux capture needs the per-layer eager loop (TBO's overlapped
+        # execution cannot expose per-layer completed hidden states), so skip
+        # TBO when capturing -- a perf-only downgrade, not a correctness one.
+        if self._can_run_tbo(forward_batch) and not capture_dspark:
             # Two-batch-overlap prefill (EP / mori). Cross-layer mHC fusion is
             # disabled here (each layer self-contained), so no trailing hc_post.
             hidden_states = self._forward_layers_tbo(
@@ -2251,6 +2334,14 @@ class DeepseekV4Model(nn.Module):
                         prev_post=prev_post,
                         prev_comb=prev_comb,
                     )
+                if capture_dspark and i in self.dspark_layers_to_capture:
+                    if use_fused:
+                        completed = layer.hc_post(
+                            hidden_states, prev_residual, prev_post, prev_comb
+                        )
+                    else:
+                        completed = hidden_states
+                    dspark_aux_hidden_states.append(completed.mean(dim=1))
             if use_fused and last_layer is not None:
                 hidden_states = last_layer.hc_post(
                     hidden_states, prev_residual, prev_post, prev_comb
@@ -2276,6 +2367,9 @@ class DeepseekV4Model(nn.Module):
         )
         hidden_states = self.norm(hidden_states)
 
+        if capture_dspark:
+            return (hidden_states, pre_hc_head), dspark_aux_hidden_states
+
         return hidden_states, pre_hc_head
 
 
@@ -2291,7 +2385,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         # batched/contiguous-load rope kernels (faster on gfx95; .
         # Module-level toggles default OFF; flipped True here for DSV4
         if _is_hip:
-            from sglang.srt.layers.deepseek_v4_rope import set_batched_rope
+            from sglang.kernels.ops.attention.deepseek_v4_rope import set_batched_rope
             from sglang.srt.layers.quantization.fp8_utils import set_force_ck_w8a8
 
             set_force_ck_w8a8(True)
@@ -2351,6 +2445,16 @@ class DeepseekV4ForCausalLM(nn.Module):
 
     def get_input_embeddings(self) -> nn.Module:
         return self.model.get_input_embeddings()
+
+    def set_dspark_layers_to_capture(self, layer_ids: List[int]) -> None:
+        if not self.pp_group.is_last_rank:
+            return
+        if layer_ids is None:
+            raise ValueError(
+                "DSPARK requires explicit layer_ids for aux hidden capture."
+            )
+        self.capture_aux_hidden_states = True
+        self.model.dspark_layers_to_capture = list(layer_ids)
 
     def determine_num_fused_shared_experts(self):
         self.num_fused_shared_experts = 0
@@ -2429,11 +2533,16 @@ class DeepseekV4ForCausalLM(nn.Module):
             self.lm_head,
             forward_batch,
             aux_hidden_states,
-            hidden_states_before_norm=pre_hc_head,
+            hidden_states_before_norm=(
+                None if aux_hidden_states is not None else pre_hc_head
+            ),
         )
 
     def _setup_fp8_wo_a_scales(self, is_nextn: bool) -> None:
-        from deep_gemm import transform_sf_into_required_layout
+        from sglang.srt.layers import deep_gemm_wrapper
+
+        if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+            from deep_gemm import transform_sf_into_required_layout
 
         if is_nextn:
             layers = [self.model.decoder]
@@ -2449,14 +2558,19 @@ class DeepseekV4ForCausalLM(nn.Module):
             D = attn.wo_a.weight.shape[1]
 
             raw_scale = attn.wo_a.weight_scale_inv.data.view(G, R // 128, D // 128)
-            attn.wo_a.weight_scale_inv.data = transform_sf_into_required_layout(
-                raw_scale,
-                mn=R,
-                k=D,
-                recipe=(1, 128, 128),
-                num_groups=G,
-                is_sfa=False,
-            )
+            if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+                attn.wo_a.weight_scale_inv.data = transform_sf_into_required_layout(
+                    raw_scale,
+                    mn=R,
+                    k=D,
+                    recipe=(1, 128, 128),
+                    num_groups=G,
+                    is_sfa=False,
+                )
+                attn.wo_a.weight_scale_inv.format_ue8m0 = True
+            else:
+                attn.wo_a.weight_scale_inv.data = raw_scale.contiguous()
+                attn.wo_a.weight_scale_inv.format_ue8m0 = False
 
     def post_load_weights(self, is_nextn=False, weight_names=None):
         if _FP8_WO_A_GEMM:
@@ -2564,7 +2678,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         if layer is None:
             return
 
-        from sglang.srt.layers.mhc import prewarm_mhc_pre
+        from sglang.kernels.ops.layernorm.mhc import prewarm_mhc_pre
 
         tic = time.perf_counter()
         prewarm_mhc_pre(
@@ -2632,7 +2746,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             num_experts=self.config.n_routed_experts + self.num_fused_shared_experts,
         )
 
-        if self.quant_config and self.quant_config.get_name() == "w4afp8":
+        if is_wint4afp8_or_wint4a16_config(self.quant_config):
             expert_params_mapping += FusedMoE.make_expert_input_scale_params_mapping(
                 num_experts=self.config.n_routed_experts
             )
@@ -2669,6 +2783,18 @@ class DeepseekV4ForCausalLM(nn.Module):
             futures = []
             weight_names = []
             for name, loaded_weight in weights:
+                if (
+                    _FP8_WO_A_GEMM
+                    and name.endswith(".wo_a.weight")
+                    and loaded_weight.dtype != torch.float8_e4m3fn
+                ):
+                    raise ValueError(
+                        f"SGLANG_OPT_FP8_WO_A_GEMM is enabled but {name} has "
+                        f"dtype {loaded_weight.dtype}, expected "
+                        "torch.float8_e4m3fn. This checkpoint does not provide "
+                        "a supported fp8-quantized wo_a; rerun with "
+                        "SGLANG_OPT_FP8_WO_A_GEMM=0."
+                    )
                 try:
                     use_async_loading = should_async_load(loaded_weight)
 
@@ -2756,16 +2882,18 @@ class DeepseekV4ForCausalLM(nn.Module):
                         loaded_params.add(name)
                         break
                     else:
+                        skip_unmaterialized_expert_param = False
                         for mapping in expert_params_mapping:
                             param_name, weight_name, expert_id, shard_id = mapping
                             if weight_name not in name:
                                 continue
                             if _is_npu:
                                 name = name.replace("weight_packed", "weight")
-                            name = name.replace(weight_name, param_name)
-                            if name not in params_dict:
+                            resolved_name = name.replace(weight_name, param_name)
+                            if resolved_name not in params_dict:
+                                skip_unmaterialized_expert_param = True
                                 continue
-                            param = params_dict[name]
+                            param = params_dict[resolved_name]
                             weight_loader = param.weight_loader
                             maybe_executor_submit(
                                 executor=executor,
@@ -2775,16 +2903,18 @@ class DeepseekV4ForCausalLM(nn.Module):
                                 func_args=(
                                     param,
                                     loaded_weight,
-                                    name,
+                                    resolved_name,
                                 ),
                                 func_kwargs={
                                     "shard_id": shard_id,
                                     "expert_id": expert_id,
                                 },
                             )
-                            loaded_params.add(name)
+                            loaded_params.add(resolved_name)
                             break
                         else:
+                            if skip_unmaterialized_expert_param:
+                                continue
                             if name.endswith(".bias") and name not in params_dict:
                                 continue
                             if (

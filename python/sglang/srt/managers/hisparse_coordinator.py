@@ -5,7 +5,7 @@ from typing import List, NamedTuple, Union
 
 import torch
 
-from sglang.jit_kernel.hisparse import (
+from sglang.kernels.ops.kvcache.hisparse import (
     load_cache_to_device_buffer_dsv4_mla,
     load_cache_to_device_buffer_mla,
 )
@@ -18,10 +18,8 @@ from sglang.srt.mem_cache.hisparse_memory_pool import (
     HiSparseDSATokenToKVPool,
 )
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.mem_cache.memory_pool_host import (
-    DeepSeekV4PagedHostPool,
-    MLATokenToKVPoolHost,
-)
+from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool
+from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.utils import get_device_module, is_hip
 
 device_module = get_device_module()
@@ -270,7 +268,7 @@ class HiSparseCoordinator:
         """
         self.alloc_device_buffer(req)
 
-        host_len = self.host_token_len(req.kv_allocated_len)
+        host_len = self.host_token_len(req.kv.kv_allocated_len)
         if host_len <= self.device_buffer_size:
             # Short sequences (seq_len <= device_buffer_size): the kernel fast path
             # returns device_buffer_locs directly without any host loading, so we
@@ -295,7 +293,7 @@ class HiSparseCoordinator:
 
     def _preload_to_device_buffer(self, req: Req) -> None:
         """Preload all tokens from host pool into the device buffer."""
-        n = self.host_token_len(req.kv_allocated_len)
+        n = self.host_token_len(req.kv.kv_allocated_len)
         host_indices = self.req_to_host_pool[req.req_pool_idx, :n]
         device_locs = self.req_to_device_buffer[req.req_pool_idx, :n]
 
@@ -313,7 +311,7 @@ class HiSparseCoordinator:
             allocated_len = req.extend_range.end
             alloc_size = self.padded_buffer_size
         else:
-            allocated_len = req.kv_allocated_len
+            allocated_len = req.kv.kv_allocated_len
             page_size = self.mem_pool_device.page_size
             # Allocate only enough for current tokens (page-aligned).
             # When prefill already fills device_buffer_size, include the reserved page.
@@ -768,7 +766,7 @@ class HiSparseCoordinator:
         # we just freed via free_hisparse_indices(all_hi). If left set, the
         # subsequent release_kv_cache -> allocator.free -> free_hisparse path
         # re-frees them (double-free into the page allocator's free list).
-        allocated_len = req.kv_allocated_len
+        allocated_len = req.kv.kv_allocated_len
 
         # release memory -- only free actually-allocated buffer indices
         current_cap = int(self.req_device_buffer_size[req.req_pool_idx])

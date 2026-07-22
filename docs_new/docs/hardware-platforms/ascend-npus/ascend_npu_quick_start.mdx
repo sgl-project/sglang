@@ -17,25 +17,43 @@ see [SGLang installation with NPUs support](/docs/hardware-platforms/ascend-npus
 - Atlas 800I A2 inference series (Atlas 800I A2)
 - Atlas 800I A3 inference series (Atlas 800I A3)
 
+To identify your device, run `npu-smi info -l`: A3 reports `Chip Count: 2` per NPU, while A2 reports `Chip Count: 1` per NPU.
+For hardware details, see the [Ascend NPU Reference](/docs/hardware-platforms/ascend-npus/ascend_npu_reference#hardware).
+
+### Docker
+
+Ensure Docker is installed and the Docker daemon is running on your host machine. Verify with:
+
+```bash
+docker --version && docker info
+```
+
+If Docker is not installed, follow the [official Docker installation guide](https://docs.docker.com/engine/install/) for
+your operating system.
+
 ## Setup environment using container
 
 <Warning>
-Ensure sufficient disk space before proceeding. The Docker image requires at least **30 GB** of free space. If you need to download model weights, check the model size at [ModelScope](https://www.modelscope.cn/models) to reserve enough space.
+Ensure sufficient disk space before proceeding. Run `df -h` to check the available disk space. The Docker image requires
+at least **30GB** of free space. If you need to download model weights, check the model size at
+[ModelScope](https://www.modelscope.cn/models) to reserve enough space.
 </Warning>
 
 <Tip>
-We publish both **stable releases** and **daily builds**. Choose a stable release tag (e.g., `v0.5.13.post1-cann9.0.0-a3`) if you prefer a validated version, or a daily build tag (e.g., `main-cann9.0.0-a3`) if you need the latest development changes.
+We publish both **stable releases** and **daily builds**. Choose a stable release tag (e.g., `v0.5.13.post1-cann9.0.0-a3`)
+if you prefer a validated version, or a daily build tag (e.g., `main-cann9.0.0-a3`) if you need the latest development changes.
 </Tip>
+
+If you have already downloaded model weights to a local path (e.g., `/path/to/model`), mount the path into the container by
+adding `--volume /path/to/model:/path/to/model` to the `docker run` command below.
 
 <Tabs>
   <Tab title="Atlas 800I A3">
 
 ```shell Command
-# Stable release
-export IMAGE=quay.io/ascend/sglang:v0.5.13.post1-cann9.0.0-a3
-
-# Daily build
-export IMAGE=quay.io/ascend/sglang:main-cann9.0.0-a3
+# Choose one (uncomment the line you want):
+export IMAGE=quay.io/ascend/sglang:v0.5.13.post1-cann9.0.0-a3       # Stable release
+# export IMAGE=quay.io/ascend/sglang:main-cann9.0.0-a3               # Daily build
 
 docker run -it --rm --privileged --network=host --ipc=host --shm-size=16g \
     --device=/dev/davinci0 --device=/dev/davinci1 --device=/dev/davinci2 --device=/dev/davinci3 \
@@ -58,11 +76,9 @@ docker run -it --rm --privileged --network=host --ipc=host --shm-size=16g \
   <Tab title="Atlas 800I A2">
 
 ```shell Command
-# Stable release
-export IMAGE=quay.io/ascend/sglang:v0.5.13.post1-cann9.0.0-910b
-
-# Daily build
-export IMAGE=quay.io/ascend/sglang:main-cann9.0.0-910b
+# Choose one (uncomment the line you want):
+export IMAGE=quay.io/ascend/sglang:v0.5.13.post1-cann9.0.0-910b       # Stable release
+# export IMAGE=quay.io/ascend/sglang:main-cann9.0.0-910b               # Daily build
 
 docker run -it --rm --privileged --network=host --ipc=host --shm-size=16g \
     --device=/dev/davinci0 --device=/dev/davinci1 --device=/dev/davinci2 --device=/dev/davinci3 \
@@ -88,7 +104,8 @@ The SGLang server is installed in the container by default. You can use `pip sho
 
 ### Start SGLang server
 
-SGLang will automatically download the model from Hugging Face.
+SGLang will automatically download the model from Hugging Face. If the model is already downloaded to a local path
+(and has been mounted into the container), use that path directly like `--model-path /path/to/model`.
 
 ```shell Command
 # Set HF_ENDPOINT to a mirror site if network is not available
@@ -102,7 +119,7 @@ export HF_TOKEN=<secret>
 sglang serve --model-path Qwen/Qwen2.5-7B-Instruct --attention-backend ascend &
 ```
 
-If you see output like the following, the server is running.
+Server startup may take several minutes. Once you see output like the following, the server is running.
 
 ```log Output
 INFO:     Waiting for application startup.
@@ -138,13 +155,14 @@ SGLANG_PID=$(pgrep -f "sglang serve")
 kill -SIGINT $SGLANG_PID
 ```
 
-The output should be like the following:
+Wait a moment for the server to shut down gracefully. The output should be like the following:
 
 ```log Output
 INFO:     Shutting down
 INFO:     Waiting for application shutdown.
 INFO:     Application shutdown complete.
-INFO:     Finished server process [25310]
+INFO:     Finished server process [<SGLANG_PID>]
 ```
 
-The server has now stopped. You can verify it with `ps -ef | grep sglang`, then exit the container by pressing `Ctrl+D`.
+The server has now stopped. You can verify it with `ps -ef | grep sglang` — the expected output is nothing (no matching process),
+then exit the container by pressing `Ctrl+D`.

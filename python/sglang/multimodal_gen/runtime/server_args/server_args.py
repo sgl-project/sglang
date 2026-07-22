@@ -129,10 +129,14 @@ DEFAULT_BCG_TEXT_BUCKETS = (64, 128, 256, 512, 1024)
 BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
     {
         "comfy-org/ideogram-4",
+        "fal/ideogram-v4-fast",
+        "fal/ideogram-v4-instant",
         "glm-image",
         "ideogram-4",
         "ideogram-4-fp8",
         "ideogram-4-nf4",
+        "ideogram-v4-fast",
+        "ideogram-v4-instant",
         "ideogram-ai/ideogram-4-fp8",
         "ideogram-ai/ideogram-4-nf4",
         "qwen/qwen-image",
@@ -421,6 +425,9 @@ class ServerArgs(DisaggServerArgsMixin):
     srt_encoder_url: str | None = None
     srt_encoder_connect_timeout: int = 3.05
     srt_encoder_timeout: int = 100
+
+    # SGLang server for PE model inference
+    pe_server_url: str | None = None
 
     @property
     def broker_port(self) -> int:
@@ -1932,6 +1939,14 @@ class ServerArgs(DisaggServerArgsMixin):
             default=ServerArgs.srt_encoder_timeout,
             help="Timeout (in seconds) for HTTP requests to the SGLang encoder server. "
             "Increase value if connection between diffusion server and AR model server is slow.",
+        )
+
+        # SGLang server for PE model inference
+        parser.add_argument(
+            "--pe-server-url",
+            type=str,
+            default=ServerArgs.pe_server_url,
+            help="URL of SGLang server for PE model",
         )
 
         return parser

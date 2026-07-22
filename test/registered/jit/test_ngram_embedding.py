@@ -3,7 +3,7 @@ import sys
 import pytest
 import torch
 
-from sglang.jit_kernel.ngram_embedding import (
+from sglang.kernels.ops.speculative.ngram_embedding import (
     compute_n_gram_ids,
     compute_n_gram_ids_decode,
     update_token_table,

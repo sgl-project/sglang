@@ -98,7 +98,7 @@ if _use_aiter:
     from aiter.ops.rmsnorm import add_rmsnorm_quant as _aiter_add_rmsnorm_quant
     from aiter.ops.rmsnorm import rmsnorm_quant as _aiter_rmsnorm_quant
 
-    from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype as _aiter_fp8_dtype
+    from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype as _aiter_fp8_dtype
 
     if _is_gfx95_supported:
         from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
@@ -385,6 +385,7 @@ class LayerScatterModes:
                 # Token dispatch/combine will be handled outside of LayerCommunicator for these modes.
                 not get_moe_a2a_backend().is_none()
                 or should_use_flashinfer_cutlass_moe_fp4_allgather()
+                or enable_dwdp()
             ):
                 return ScatterMode.SCATTERED
             # DSA CP and MLA CP both don't support MOE_FULL yet; fall back to FULL.
@@ -436,6 +437,10 @@ def enable_moe_dense_fully_dp():
     return get_server_args().moe_dense_tp_size == 1
 
 
+def enable_dwdp():
+    return get_server_args().dwdp_size > 1
+
+
 class LayerCommunicator:
     def __init__(
         self,
@@ -447,6 +452,8 @@ class LayerCommunicator:
         is_last_layer: bool = False,
         qkv_latent_func: Optional[Callable] = None,
         force_layernorm_before_dp_gather: bool = False,
+        enable_fused_ar_quant: bool = False,
+        fused_ar_quant_keep_bf16: bool = False,
     ):
         self.layer_scatter_modes = layer_scatter_modes
         self.input_layernorm = input_layernorm
@@ -455,6 +462,8 @@ class LayerCommunicator:
         self.is_last_layer = is_last_layer
         self.qkv_latent_func = qkv_latent_func
         self.force_layernorm_before_dp_gather = force_layernorm_before_dp_gather
+        self.enable_fused_ar_quant = enable_fused_ar_quant
+        self.fused_ar_quant_keep_bf16 = fused_ar_quant_keep_bf16
 
         self._context = CommunicateContext.init_new()
         self._context.force_layernorm_before_dp_gather = (
@@ -569,11 +578,32 @@ class LayerCommunicator:
                     apply_aiter_all_reduce_fusion(hidden_states)
                     or apply_flashinfer_allreduce_fusion(hidden_states.shape[0])
                 ) and hasattr(self.input_layernorm, "forward_with_allreduce_fusion"):
-                    hidden_states, residual = (
-                        self.input_layernorm.forward_with_allreduce_fusion(
-                            hidden_states, residual, use_attn_tp_group=False
+                    quant_result = None
+                    if (
+                        self.enable_fused_ar_quant
+                        and _use_aiter
+                        and hasattr(
+                            self.input_layernorm,
+                            "forward_with_allreduce_fusion_quant_per_group",
                         )
-                    )
+                    ):
+                        # Try fused AR+RMSNorm+per-group-quant. Internally
+                        # falls back to AR+RMSNorm + separate quant when the
+                        # fully-fused kernel cannot service the shape.
+                        quant_result = self.input_layernorm.forward_with_allreduce_fusion_quant_per_group(
+                            hidden_states,
+                            residual,
+                            use_attn_tp_group=False,
+                            keep_bf16=self.fused_ar_quant_keep_bf16,
+                        )
+                    if quant_result is not None:
+                        hidden_states, residual = quant_result
+                    else:
+                        hidden_states, residual = (
+                            self.input_layernorm.forward_with_allreduce_fusion(
+                                hidden_states, residual, use_attn_tp_group=False
+                            )
+                        )
                 else:
                     hidden_states = moe_tensor_model_parallel_all_reduce(hidden_states)
                     hidden_states, residual = self.input_layernorm(

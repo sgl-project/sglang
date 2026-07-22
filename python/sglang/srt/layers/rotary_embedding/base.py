@@ -25,7 +25,9 @@ from sglang.srt.utils import (
 )
 
 if TYPE_CHECKING:
-    from sglang.jit_kernel.rope import FusedSetKVBufferArg  # For type check-only
+    from sglang.kernels.ops.attention.rope import (
+        FusedSetKVBufferArg,  # For type check-only
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +42,7 @@ _is_musa = is_musa()
 _is_mps = is_mps()
 
 if _is_cuda:
-    from sglang.jit_kernel.rope import apply_rope_with_cos_sin_cache_inplace
+    from sglang.kernels.ops.attention.rope import apply_rope_with_cos_sin_cache_inplace
 
 if _is_npu:
     import torch_npu
@@ -65,7 +67,7 @@ if _is_npu:
         )
 
 if _is_hip:
-    from sglang.srt.layers.attention.utils import (
+    from sglang.kernels.ops.attention.utils import (
         fused_qk_rope_reshape_and_cache,
     )
 
@@ -95,7 +97,7 @@ class RotaryEmbedding(MultiPlatformOp):
 
         cache = self._compute_cos_sin_cache()
         # NOTE(ByronHsu): cache needs to be in FP32 for numerical stability.
-        if not (_is_cuda or envs.SGLANG_ROPE_CACHE_FP32.get()):
+        if not (_is_cuda or _is_xpu or envs.SGLANG_ROPE_CACHE_FP32.get()):
             cache = cache.to(dtype)
 
         if (
@@ -107,10 +109,10 @@ class RotaryEmbedding(MultiPlatformOp):
             and not (_is_mps)
             and not (current_platform.is_out_of_tree())
         ):
-            # rotary_embedding from sglang.jit_kernel.rope and vllm._custom_ops has the same implementation.
+            # rotary_embedding from sglang.kernels.ops.attention.rope and vllm._custom_ops has the same implementation.
             # TODO: Test on different devices and remove this conditional.
             if _is_cuda:
-                from sglang.jit_kernel.rope import rotary_embedding
+                from sglang.kernels.ops.attention.rope import rotary_embedding
             elif _is_hip:
                 from sgl_kernel import rotary_embedding
             else:
