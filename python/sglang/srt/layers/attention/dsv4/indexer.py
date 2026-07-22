@@ -404,6 +404,7 @@ class C4IndexerBackendMixin:
     def __init__(self):
         super().__init__()
         self.debug_use_external_c4_sparse_indices: bool = False
+        self.dsa_topk_backend: DSATopKBackend = DSATopKBackend.SGL_KERNEL
 
     def _forward_prepare_multi_stream(
         self,
@@ -802,11 +803,10 @@ class C4IndexerBackendMixin:
         elif core_metadata.c4_sparse_raw_indices is not None:
             raw_indices = core_metadata.c4_sparse_raw_indices
 
-        dsa_topk_backend = getattr(self, "dsa_topk_backend", DSATopKBackend.SGL_KERNEL)
-        if isinstance(dsa_topk_backend, str):
-            dsa_topk_backend = DSATopKBackend(dsa_topk_backend)
-
-        if envs.SGLANG_TOPK_TRANSFORM_512_TORCH.get() or dsa_topk_backend.is_torch():
+        if (
+            envs.SGLANG_TOPK_TRANSFORM_512_TORCH.get()
+            or self.dsa_topk_backend.is_torch()
+        ):
             topk_transform_512_pytorch_vectorized(
                 logits,
                 c4_seq_lens,
@@ -815,7 +815,7 @@ class C4IndexerBackendMixin:
                 indexer_metadata.c4_page_size,
                 raw_indices,
             )
-        elif dsa_topk_backend.is_flashinfer():
+        elif self.dsa_topk_backend.is_flashinfer():
             topk_transform_512_flashinfer_unfused(
                 logits,
                 c4_seq_lens,
