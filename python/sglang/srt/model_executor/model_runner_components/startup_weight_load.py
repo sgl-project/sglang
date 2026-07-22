@@ -4,14 +4,14 @@ import dataclasses
 import enum
 import logging
 import time
-from typing import TYPE_CHECKING, Literal, Optional, Tuple
+from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 from torch import nn
 
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
-from sglang.srt.distributed.parallel_state import patched_vllm_parallel_state
+from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase
 from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.model_loader.utils import get_model_architecture
@@ -58,13 +58,10 @@ class StartupWeightLoadState(str, enum.Enum):
     PREFETCHING = "prefetching"
     COMMITTING = "committing"
     READY = "ready"
-    FAILED = "failed"
-    CANCELLED = "cancelled"
 
 
 @dataclasses.dataclass(frozen=True, slots=True, kw_only=True)
 class StartupWeightLoadOptions:
-    requested_mode: Literal["serial", "overlap"]
     device: str
     is_cuda_platform: bool
     cuda_graph_enabled: bool
@@ -103,7 +100,6 @@ class StartupWeightLoadOptions:
             for phase in Phase.ALL
         )
         return cls(
-            requested_mode=server_args.startup_weight_load_mode,
             device=server_args.device,
             is_cuda_platform=current_platform.is_cuda(),
             cuda_graph_enabled=cuda_graph_enabled,
@@ -207,7 +203,7 @@ class StartupWeightLoadManager:
         self._prefetch_started_at: Optional[float] = None
 
     @classmethod
-    def create_if_enabled(
+    def create(
         cls,
         *,
         loader,
@@ -215,13 +211,7 @@ class StartupWeightLoadManager:
         load_config: LoadConfig,
         device_config: DeviceConfig,
         options: StartupWeightLoadOptions,
-    ) -> Optional[StartupWeightLoadManager]:
-        if options.requested_mode == "serial":
-            return None
-        if options.requested_mode != "overlap":
-            raise ValueError(
-                f"Unknown startup weight load mode: {options.requested_mode}"
-            )
+    ) -> StartupWeightLoadManager:
         unsupported_reason = cls._get_unsupported_reason(
             loader=loader,
             model_config=model_config,
@@ -362,37 +352,31 @@ class StartupWeightLoadManager:
                 f"Cannot prepare startup weights from state {self._state}"
             )
         self._state = StartupWeightLoadState.PREPARING
-        prepare_succeeded = False
-        try:
-            model = self._loader.initialize_model_for_startup(
-                model_config=self._model_config,
-                device_config=self._device_config,
+        model = self._loader.initialize_model_for_startup(
+            model_config=self._model_config,
+            device_config=self._device_config,
+        )
+        resolved_sources = self._loader.resolve_model_weights(
+            self._model_config,
+            model,
+        )
+        if len(resolved_sources) != 1:
+            raise ValueError(
+                "Startup weight-loading overlap does not support secondary weights"
             )
-            resolved_sources = self._loader.resolve_model_weights(
-                self._model_config,
-                model,
-            )
-            if len(resolved_sources) != 1:
-                raise ValueError(
-                    "Startup weight-loading overlap does not support secondary weights"
-                )
-            model = self._loader.prepare_model_for_capture(
-                model=model,
-                model_config=self._model_config,
-            )
-            self._model = model
-            self._resolved_sources = resolved_sources
-            self._capture_ready_at = time.perf_counter()
-            self._state = StartupWeightLoadState.CAPTURE_READY
-            prepare_succeeded = True
-            logger.info(
-                "Prepared capture-safe model in %.2f s",
-                self._capture_ready_at - self._created_at,
-            )
-            return model
-        finally:
-            if not prepare_succeeded:
-                self._state = StartupWeightLoadState.FAILED
+        model = self._loader.prepare_model_for_capture(
+            model=model,
+            model_config=self._model_config,
+        )
+        self._model = model
+        self._resolved_sources = resolved_sources
+        self._capture_ready_at = time.perf_counter()
+        self._state = StartupWeightLoadState.CAPTURE_READY
+        logger.info(
+            "Prepared capture-safe model in %.2f s",
+            self._capture_ready_at - self._created_at,
+        )
+        return model
 
     def start_prefetch(self) -> None:
         if self._state != StartupWeightLoadState.CAPTURE_READY:
@@ -400,23 +384,17 @@ class StartupWeightLoadManager:
                 f"Cannot prefetch startup weights from state {self._state}"
             )
         assert self._capture_ready_at is not None
-        prefetch_succeeded = False
-        try:
-            prefetch_started_at = time.perf_counter()
-            self._prefetch_handle = self._loader.start_checkpoint_prefetch(
-                self._resolved_sources,
-                num_threads=self._options.prefetch_num_threads,
-            )
-            self._prefetch_started_at = prefetch_started_at
-            self._state = StartupWeightLoadState.PREFETCHING
-            prefetch_succeeded = True
-            logger.info(
-                "Started checkpoint prefetching %.2f s after capture-safe model prep",
-                self._prefetch_started_at - self._capture_ready_at,
-            )
-        finally:
-            if not prefetch_succeeded:
-                self._state = StartupWeightLoadState.FAILED
+        prefetch_started_at = time.perf_counter()
+        self._prefetch_handle = self._loader.start_checkpoint_prefetch(
+            self._resolved_sources,
+            num_threads=self._options.prefetch_num_threads,
+        )
+        self._prefetch_started_at = prefetch_started_at
+        self._state = StartupWeightLoadState.PREFETCHING
+        logger.info(
+            "Started checkpoint prefetching %.2f s after capture-safe model prep",
+            self._prefetch_started_at - self._capture_ready_at,
+        )
 
     def finalize(self) -> None:
         if self._state == StartupWeightLoadState.READY:
@@ -429,37 +407,26 @@ class StartupWeightLoadManager:
         assert self._capture_ready_at is not None
         assert self._prefetch_started_at is not None
         self._state = StartupWeightLoadState.COMMITTING
-        commit_succeeded = False
-        try:
-            manifest = ModelStorageManifest.capture(self._model)
-            commit_started_at = time.perf_counter()
-            with patched_vllm_parallel_state():
-                self._loader.commit_model_weights(
-                    model=self._model,
-                    model_config=self._model_config,
-                    resolved_sources=self._resolved_sources,
-                    target_device=torch.device(self._device_config.device),
-                )
-                torch.cuda.synchronize()
-                changed_names = manifest.changed_names(self._model)
-                if changed_names:
-                    preview = ", ".join(changed_names[:8])
-                    raise RuntimeError(
-                        "Startup weight commit changed graph-visible tensor storage: "
-                        f"{preview}"
-                    )
-            commit_succeeded = True
-        finally:
-            cleanup_succeeded = False
-            try:
-                self._stop_prefetch()
-                cleanup_succeeded = True
-            finally:
-                self._state = (
-                    StartupWeightLoadState.READY
-                    if commit_succeeded and cleanup_succeeded
-                    else StartupWeightLoadState.FAILED
-                )
+        manifest = ModelStorageManifest.capture(self._model)
+        commit_started_at = time.perf_counter()
+        monkey_patch_vllm_parallel_state()
+        self._loader.commit_model_weights(
+            model=self._model,
+            model_config=self._model_config,
+            resolved_sources=self._resolved_sources,
+            target_device=torch.device(self._device_config.device),
+        )
+        torch.cuda.synchronize()
+        changed_names = manifest.changed_names(self._model)
+        if changed_names:
+            preview = ", ".join(changed_names[:8])
+            raise RuntimeError(
+                "Startup weight commit changed graph-visible tensor storage: "
+                f"{preview}"
+            )
+        monkey_patch_vllm_parallel_state(reverse=True)
+        self._stop_prefetch()
+        self._state = StartupWeightLoadState.READY
         logger.info(
             "Load weight end. Committed real weights after CUDA graph capture in %.2f s "
             "(capture overlap window %.2f s, startup overlap total %.2f s)",
@@ -467,22 +434,6 @@ class StartupWeightLoadManager:
             commit_started_at - self._prefetch_started_at,
             time.perf_counter() - self._created_at,
         )
-
-    def cancel(self) -> None:
-        if self._state in (
-            StartupWeightLoadState.READY,
-            StartupWeightLoadState.CANCELLED,
-        ):
-            return
-        failed = self._state == StartupWeightLoadState.FAILED
-        try:
-            self._stop_prefetch()
-        finally:
-            self._state = (
-                StartupWeightLoadState.FAILED
-                if failed
-                else StartupWeightLoadState.CANCELLED
-            )
 
     def _stop_prefetch(self) -> None:
         if self._prefetch_handle is None:

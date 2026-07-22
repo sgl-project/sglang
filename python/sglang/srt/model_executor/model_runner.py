@@ -1144,24 +1144,17 @@ class ModelRunner:
             )
 
     def start_startup_weight_load(self) -> None:
-        if self.startup_weight_load is not None:
-            self.startup_weight_load.start_prefetch()
+        assert self.startup_weight_load is not None
+        self.startup_weight_load.start_prefetch()
 
     def finalize_startup_weight_load(self) -> None:
-        if self.startup_weight_load is None:
-            return
+        assert self.startup_weight_load is not None
         self.startup_weight_load.finalize()
         dist_barrier_after_load(
             elastic_ep_backend=get_exec().moe.elastic_ep_backend,
             tp_rank=self.ps.tp_rank,
             is_ep_joiner=self.server_args.is_ep_joiner,
         )
-        self.startup_weight_load = None
-
-    def cancel_startup_weight_load(self) -> None:
-        if self.startup_weight_load is None:
-            return
-        self.startup_weight_load.cancel()
         self.startup_weight_load = None
 
     def maybe_precompile_model_kernels_after_loading(self) -> None:
