@@ -82,7 +82,7 @@ jobs:
           echo "Pretend version: ${pretend_version}"
 
           if [ "${{ matrix.gpu_arch }}" = "gfx1250-rocm7_15" ]; then
-            rocm_tag="rocm7_15-gfx1250"
+            rocm_tag="rocm7.15-mi45x"
           else
             echo "Unsupported gfx arch"
             exit 1
