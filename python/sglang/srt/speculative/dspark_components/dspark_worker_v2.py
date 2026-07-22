@@ -612,6 +612,12 @@ class DSparkWorkerV2(BaseSpecWorker):
             prefix_lens=prefix_lens,
             draft_tokens=draft_tokens,
         )
+        online_c128 = getattr(self.model_runner.attn_backend, "online_c128_mtp", None)
+        if online_c128 is not None and online_c128.enabled():
+            online_c128.commit_pending(
+                req_pool_indices=batch.req_pool_indices,
+                seq_lens=accept.new_seq_lens,
+            )
         if on_publish is not None:
             if confidence is not None:
                 on_publish(accept.new_seq_lens, confidence=confidence)

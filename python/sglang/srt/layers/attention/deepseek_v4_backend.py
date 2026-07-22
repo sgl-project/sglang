@@ -559,10 +559,9 @@ class DeepseekV4AttnBackend(
         self.online_c128_mtp = OnlineC128MTPController(self)
         self.sparse_prefill_workspace = SparsePrefillWorkspace(self.device)
         spec_alg = model_runner.spec_algorithm
-        self.needs_cpu_seq_lens = not spec_alg.is_dspark() and (
-            not _is_cuda
-            or not envs.SGLANG_PREP_IN_CUDA_GRAPH.get()
-            or self.online_c128_mtp.enabled()
+        self.needs_cpu_seq_lens = self.online_c128_mtp.enabled() or (
+            not spec_alg.is_dspark()
+            and (not _is_cuda or not envs.SGLANG_PREP_IN_CUDA_GRAPH.get())
         )
 
         self.is_dspark_draft = model_runner.is_draft_worker and spec_alg.is_dspark()
@@ -587,11 +586,6 @@ class DeepseekV4AttnBackend(
             raise NotImplementedError(
                 "DSV4 ragged verify does not support context parallel (CP); "
                 "set SGLANG_RAGGED_VERIFY_MODE off for CP runs."
-            )
-        if self.online_c128_mtp.enabled():
-            raise NotImplementedError(
-                "DSV4 ragged verify does not support online c128 MTP; "
-                "set SGLANG_RAGGED_VERIFY_MODE off or disable online compress."
             )
         # Layout invariants (verify_lens >= 1, total == sum) are enforced in
         # RaggedVerifyLayout.__post_init__; don't re-check the device tensor
@@ -618,21 +612,29 @@ class DeepseekV4AttnBackend(
         extend_seq_lens: torch.Tensor,
         use_prefill_cuda_graph: bool,
         online_c128_state_slot_offset: int,
+        ragged_layout: Optional[RaggedVerifyLayout] = None,
     ) -> Optional[FusedCompressMetadata]:
         if not self.online_c128_mtp.enabled():
             return None
 
         assert seq_lens_cpu is not None
-        num_draft_tokens = self.speculative_num_draft_tokens
-        seq_lens_cpu = [int(x) + num_draft_tokens for x in seq_lens_cpu]
-        extend_lens_cpu = [num_draft_tokens] * len(seq_lens_cpu)
+        if ragged_layout is None:
+            extend_lens_cpu = [self.speculative_num_draft_tokens] * len(seq_lens_cpu)
+        elif ragged_layout.verify_lens_cpu is not None:
+            extend_lens_cpu = ragged_layout.verify_lens_cpu
+        else:
+            extend_lens_cpu = ragged_layout.verify_lens.cpu().tolist()
+        seq_lens_cpu = [
+            int(seq_len) + int(extend_len)
+            for seq_len, extend_len in zip(seq_lens_cpu, extend_lens_cpu)
+        ]
         return create_paged_compressor_data(
             compress_ratio=128,
             is_prefill=True,
             token_to_kv_pool=self.token_to_kv_pool,
             req_to_token=self.req_to_token,
             req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens + self.speculative_num_draft_tokens,
+            seq_lens=seq_lens + extend_seq_lens,
             seq_lens_cpu=seq_lens_cpu,
             extend_lens=extend_seq_lens,
             extend_lens_cpu=extend_lens_cpu,
@@ -839,6 +841,7 @@ class DeepseekV4AttnBackend(
                     extend_seq_lens,
                     use_prefill_cuda_graph,
                     online_c128_state_slot_offset,
+                    ragged_layout,
                 ),
                 extend_start_loc=extend_start_loc,
                 verify_lens=verify_lens,
@@ -1287,6 +1290,7 @@ class DeepseekV4AttnBackend(
                 req_pool_indices,
                 seq_lens,
                 verify_bs=verify_bs,
+                ragged_layout=ragged_layout,
             )
             temp_metadata = self.init_forward_metadata_target_verify(
                 max_seq_len=chosen_max_seq_len,
@@ -1375,11 +1379,17 @@ class DeepseekV4AttnBackend(
         else:
             max_seq_len = self.MAX_SEQ_LEN_FOR_CAPTURE
         verify_bs = _get_target_verify_bs(forward_batch)
+        ragged_layout = (
+            self._resolve_verify_layout(forward_batch, bs=len(seq_lens))
+            if logical_forward_mode.is_target_verify()
+            else None
+        )
         online_c128_state_slot_offset = self.online_c128_mtp.prepare_forward(
             logical_forward_mode,
             req_pool_indices,
             seq_lens,
             verify_bs=verify_bs,
+            ragged_layout=ragged_layout,
         )
 
         if logical_forward_mode.is_decode_or_idle():
@@ -1410,7 +1420,6 @@ class DeepseekV4AttnBackend(
                 block_size=block_size,
             )
         elif logical_forward_mode.is_target_verify():
-            ragged_layout = self._resolve_verify_layout(forward_batch, bs=len(seq_lens))
             metadata = self.init_forward_metadata_target_verify(
                 max_seq_len=max_seq_len,
                 req_pool_indices=req_pool_indices,
