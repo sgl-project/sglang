@@ -452,12 +452,22 @@ def init_threads_binding(
             logger.warning(
                 f"Detected the current machine has {n_numa_node} numa nodes available, but the total number of ranks (dp_size * tp_size * pp_size) is {world_size}, so only {world_size} numa nodes are used."
             )
+        assert 0 <= numa_index < n_numa_node, (
+            f"NUMA index {numa_index} (derived from the worker's global device id / gpu_id) "
+            f"is out of range for {n_numa_node} numa nodes. This usually means dp_size * tp_size "
+            f"exceeds the number of numa nodes; reduce it, or set SGLANG_CPU_OMP_THREADS_BIND explicitly."
+        )
         local_omp_cpuid = cpu_ids_by_node[numa_index]
     else:
         threads_bind_list = omp_cpuids.split("|")
         assert world_size == len(threads_bind_list), (
             f"SGLANG_CPU_OMP_THREADS_BIND setting must be aligned with the total number of ranks (dp_size * tp_size * pp_size = {world_size}). "
             f"Please double check your settings."
+        )
+        assert 0 <= numa_index < len(threads_bind_list), (
+            f"NUMA index {numa_index} (derived from the worker's global device id / gpu_id) "
+            f"is out of range for the {len(threads_bind_list)} SGLANG_CPU_OMP_THREADS_BIND entries. "
+            f"Ensure the number of '|'-separated bind groups matches dp_size * tp_size * pp_size."
         )
         local_omp_cpuid = threads_bind_list[numa_index]
         if world_size > n_numa_node:
