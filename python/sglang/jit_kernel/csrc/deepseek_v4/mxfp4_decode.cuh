@@ -1,8 +1,9 @@
 /* MXFP4 fused decode attention for DeepSeek V4 on Hopper (SM90).
 
    Reads packed MXFP4 K-cache rows (E2M1 noPE + E8M0 block-32 scales + BF16
-   RoPE), dequantizes on the fly, and computes QK^T + softmax + V-weighted sum
-   in a single kernel.  One warp handles one (batch, head) pair.
+   RoPE), dequantizes on the fly into shared memory, and computes QK^T +
+   softmax + V-weighted sum in a single kernel.  One warp handles one
+   (batch, head) pair.
 
    MXFP4 row layout — 368 bytes per token, row-major contiguous:
      [224 B packed E2M1 noPE | 14 B E8M0 scales + 2 B pad | 128 B BF16 RoPE]
@@ -51,9 +52,12 @@ constexpr int64_t kOffRope = kOffScale + kNumGroups + 2;  // 240
 static_assert(kOffRope + kRopeDim * 2 == kBytesPerToken);
 static_assert(kBytesPerToken == 368);
 
+// shared memory layout: [kNopeDim BF16 | kRopeDim BF16] = [896 B | 128 B]
+constexpr int64_t kSmemNopeElems = kNopeDim;
+constexpr int64_t kSmemRopeElems = kRopeDim;
+
 // --- E2M1 LUT ----------------------------------------------------------------
 
-// Positive E2M1 values indexed by 3-bit magnitude code.
 __device__ __forceinline__ float e2m1_positive(uint32_t code) {
   constexpr float lut[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
   return lut[code & 0x07u];
@@ -70,7 +74,7 @@ __device__ __forceinline__ float e8m0_to_float(uint8_t bits) {
 struct Mxfp4DecodeParams {
   const void* __restrict__ q;           // [num_queries, 512] BF16
   const uint8_t* __restrict__ k_cache;  // [num_rows, 368] uint8, row-major
-  const int32_t* __restrict__ indices;  // [num_queries] page row indices
+  const int32_t* __restrict__ indices;  // [num_queries] page numbers
   void* __restrict__ o;                 // [num_queries, 512] BF16
   float sm_scale;
   uint32_t page_stride_bytes;  // page_size * 368
@@ -87,13 +91,16 @@ __global__ void mxfp4_decode_kernel(const __grid_constant__ Mxfp4DecodeParams pa
 
   const uint32_t warp_id = threadIdx.x / kWarpThreads;
   const uint32_t lane_id = threadIdx.x % kWarpThreads;
-  const uint32_t gid = blockIdx.x;  // global query id = batch*num_heads + head
-  const uint32_t num_warp_queries = gridDim.x;
+  const uint32_t gid = blockIdx.x;
+  (void)warp_id;
 
   PDLWaitPrimary<kUsePDL>();
 
-  // ---- load Q (16 floats per lane, two 8-element aligned vectors) -----------
-  float q_val[16];  // kHeadDim / kWarpThreads = 16
+  // -- shared memory: one K row (noPE + rope) --------------------------------
+  __shared__ DType s_k[kHeadDim];  // 512 × 2 = 1024 bytes
+
+  // ---- load Q (16 floats per lane, two 8-element aligned vectors) ----------
+  float q_val[16];
   {
     const auto* q_bf16 = static_cast<const bf16_t*>(q) + gid * kHeadDim;
     using VecQ = AlignedVector<bf16_t, 8>;
@@ -107,11 +114,11 @@ __global__ void mxfp4_decode_kernel(const __grid_constant__ Mxfp4DecodeParams pa
     }
   }
 
-  // ---- locate K page --------------------------------------------------------
+  // ---- locate K page -------------------------------------------------------
   const int32_t page_idx = indices[gid];
   const auto* page_base = k_cache + static_cast<size_t>(page_idx) * page_stride_bytes;
 
-  // ---- online softmax state (per-lane = 16 floats) -------------------------
+  // ---- online softmax state ------------------------------------------------
   float m = -1e30f;
   float s = 0.0f;
   float o_val[16] = {};
@@ -120,61 +127,61 @@ __global__ void mxfp4_decode_kernel(const __grid_constant__ Mxfp4DecodeParams pa
   for (uint32_t tk = 0; tk < page_size; ++tk) {
     const auto* row = page_base + static_cast<size_t>(tk) * kBytesPerToken;
 
-    // -- dequant noPE (14 groups × 32 values) --
-    // Thread i gets 14 values: one nibble from each group.
-    float k_val[16];  // 14 noPE + 2 rope = 16
-
+    // -- 1) dequant noPE → shared memory (collaborative, all 32 lanes) -----
+    // Each lane dequants one nibble per group.
+    // Lane i writes to s_k[g*32 + i] for group g.
 #pragma unroll
     for (int g = 0; g < kNumGroups; ++g) {
-      // byte offset within this group: lane_id / 2
       const uint32_t byte_off = g * kBytesPerGroup + (lane_id / 2);
       const uint8_t packed_byte = row[byte_off];
-
-      // extract nibble: even lane → lo nibble, odd lane → hi nibble
       const uint8_t nibble = (lane_id & 1u) ? (packed_byte >> 4) : (packed_byte & 0x0Fu);
       const uint32_t mag_code = nibble & 0x07u;
       const bool neg = (nibble & 0x08u) != 0;
-
       const float val = e2m1_positive(mag_code);
-
-      // E8M0 scale for this group
       const float scale = e8m0_to_float(row[kOffScale + g]);
-
-      k_val[g] = neg ? -val * scale : val * scale;
+      s_k[g * kGroupSize + lane_id] = cast<DType>(neg ? -val * scale : val * scale);
     }
 
-    // -- RoPE (2 values per lane, BF16 → float) ------------------------------
+    // -- 2) load RoPE → shared memory ---------------------------------------
+    //   64 values ÷ 32 lanes = 2 values per lane
     {
-      const auto* rope_ptr = reinterpret_cast<const bf16_t*>(row + kOffRope);
-      k_val[14] = cast<float>(rope_ptr[lane_id]);       // rope val 0..63
-      k_val[15] = cast<float>(rope_ptr[lane_id + 32]);  // rope val 32..95
-      static_assert(kRopeDim == 64);
+      const auto* rope_src = reinterpret_cast<const DType*>(row + kOffRope);
+#pragma unroll
+      for (int j = 0; j < kRopeDim / kWarpThreads; ++j) {
+        const int idx = lane_id + j * kWarpThreads;  // 0..31, 32..63
+        s_k[kNopeDim + idx] = rope_src[idx];
+      }
     }
 
-    // -- dot product Q · K ----------------------------------------------------
+    __syncwarp();
+
+    // -- 3) dot product Q · K (contiguous lanes from shared memory) --------
     float dot = 0.0f;
 #pragma unroll
     for (int i = 0; i < 16; ++i) {
-      dot += q_val[i] * k_val[i];
+      const int pos = lane_id * 16 + i;  // contiguous 0..511 per lane
+      dot += q_val[i] * cast<float>(s_k[pos]);
     }
     dot = warp::reduce_sum(dot);
     dot *= sm_scale;
 
-    // -- online softmax -------------------------------------------------------
+    // -- 4) online softmax -------------------------------------------------
     const float m_new = max(m, dot);
     const float e = expf(dot - m_new);
     const float rc = expf(m - m_new);
     s = s * rc + e;
     m = m_new;
 
-    // -- V-weighted sum (K = V) -----------------------------------------------
+    // -- 5) V-weighted sum (K = V) -----------------------------------------
 #pragma unroll
     for (int i = 0; i < 16; ++i) {
-      o_val[i] = o_val[i] * rc + k_val[i] * e;
+      const int pos = lane_id * 16 + i;
+      const float kv = cast<float>(s_k[pos]);
+      o_val[i] = o_val[i] * rc + kv * e;
     }
   }
 
-  // ---- finalize: o /= s, store ----------------------------------------------
+  // ---- finalize: o /= s, store ---------------------------------------------
   const float inv_s = (s > 0.0f) ? (1.0f / s) : 0.0f;
   auto* o_bf16 = static_cast<bf16_t*>(o) + gid * kHeadDim;
 
@@ -185,9 +192,8 @@ __global__ void mxfp4_decode_kernel(const __grid_constant__ Mxfp4DecodeParams pa
     for (int k = 0; k < 2; ++k) {
       VecO o_vec;
 #pragma unroll
-      for (int i = 0; i < 8; ++i) {
+      for (int i = 0; i < 8; ++i)
         o_vec[i] = cast<bf16_t>(o_val[k * 8 + i] * inv_s);
-      }
       gmem_o.store(o_bf16 + k * (kWarpThreads * 8), o_vec);
     }
   }
@@ -212,7 +218,6 @@ struct Mxfp4DecodeKernel {
     auto device_ = SymbolicDevice{};
     device_.set_options<kDLCUDA>();
 
-    // validate tensor shapes & dtypes
     TensorMatcher({B, kHeadDim}).with_dtype<bf16_t>().with_device(device_).verify(q);
     TensorMatcher({-1, kBytesPerToken}).with_dtype<uint8_t>().with_device(device_).verify(k_cache);
     TensorMatcher({B}).with_dtype<int32_t>().with_device(device_).verify(indices);
