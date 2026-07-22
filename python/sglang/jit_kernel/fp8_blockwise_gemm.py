@@ -1,5 +1,0 @@
-"""Compatibility shim (RFC #29630 Phase 4) -> sglang.kernels.ops.gemm.fp8_blockwise_gemm."""
-
-from sglang.kernels.ops.gemm import fp8_blockwise_gemm as _impl
-
-globals().update({k: getattr(_impl, k) for k in dir(_impl) if not k.startswith("__")})

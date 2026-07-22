@@ -227,7 +227,7 @@ elif _is_npu:
 else:
     pass
 
-from sglang.jit_kernel.fused_a_gemm import (
+from sglang.kernels.ops.gemm.fused_a_gemm import (
     fused_a_gemm_weight_eligible,
     linear_with_fused_a_gemm,
 )
