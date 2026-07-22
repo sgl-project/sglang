@@ -4627,6 +4627,13 @@ def run_scheduler_process(
         display_dp_rank=display_dp_rank,
         display_moe_ep_rank=display_moe_ep_rank,
     )
+    # Publish the resolved config at scheduler process entry so the config
+    # namespaces (get_serving()/get_device()/get_exec()/...) are available to
+    # Scheduler.__init__ and its init_* helpers, which read them before the
+    # model worker's own publish. ModelRunner re-publishes idempotently.
+    from sglang.srt.runtime_context import publish
+
+    publish(server_args, role="scheduler")
     parent_process = psutil.Process().parent()
 
     # Set up tracing

@@ -66,7 +66,6 @@ from sglang.srt.observability.trace import (
 from sglang.srt.server_args import (
     PortArgs,
     ServerArgs,
-    set_global_server_args_for_scheduler,
 )
 from sglang.srt.utils import (
     add_prometheus_middleware,
@@ -262,7 +261,9 @@ class MMEncoder:
     ):
         logger.info(f"init MMEncoder {rank}/{server_args.tp_size}")
         self.server_args = server_args
-        set_global_server_args_for_scheduler(server_args)
+        from sglang.srt.runtime_context import publish
+
+        publish(server_args, role="encoder")
         self.rank = rank
         # DP rank for metric labels; overridden by run_dp_worker in DP mode.
         # 0 in the single-instance (non-DP) path.
