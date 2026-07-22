@@ -767,10 +767,26 @@ class ModelConfig:
         # Unify the config keys for hf_text_config
         self.head_dim = getattr(self.hf_text_config, "head_dim", None)
         if self.head_dim is None:
-            self.head_dim = (
-                self.hf_text_config.hidden_size
-                // self.hf_text_config.num_attention_heads
-            )
+            # head_dim is read from an untrusted config. Deriving it as
+            # hidden_size // num_attention_heads panics with ZeroDivisionError
+            # when num_attention_heads is 0 (and head_dim: null is common in real
+            # configs, so this fallback fires on normal-looking files), and
+            # silently truncates when num_attention_heads does not divide
+            # hidden_size, surfacing much later as a confusing weight-shape
+            # mismatch. Validate both with a clear error.
+            num_heads = self.hf_text_config.num_attention_heads
+            hidden_size = self.hf_text_config.hidden_size
+            if num_heads <= 0:
+                raise ValueError(
+                    f"num_attention_heads must be positive to derive head_dim, "
+                    f"got {num_heads}."
+                )
+            if hidden_size % num_heads != 0:
+                raise ValueError(
+                    f"hidden_size ({hidden_size}) must be divisible by "
+                    f"num_attention_heads ({num_heads}) to derive head_dim."
+                )
+            self.head_dim = hidden_size // num_heads
             setattr(self.hf_text_config, "head_dim", self.head_dim)
 
         self.v_head_dim = getattr(self.hf_text_config, "v_head_dim", None)
