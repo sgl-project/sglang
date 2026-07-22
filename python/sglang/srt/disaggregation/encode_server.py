@@ -1809,16 +1809,13 @@ class MMEncoder:
                 f"(shape={mm_data.shape}, element_size={self._element_size})"
             )
 
-            # Cache so sibling-TP /send calls reuse the same tensor and MR.
-            mm_data.cached_embedding = embedding
-
             # Request-level shared MR, registered lazily on the first /send;
             # deregistration is deferred to _cleanup_inflight_encode_state.
             fwd_state = self._forward_results.setdefault(req_id, {})
-            mr_shared = fwd_state.get("mr_ptr") == embedding.data_ptr()
-            if not mr_shared:
+            mr_already_registered = fwd_state.get("mr_ptr") == embedding.data_ptr()
+            if not mr_already_registered:
                 self.engine.register(embedding.data_ptr(), embedding.nbytes)
-                fwd_state["mr_ptr"] = embedding.data_ptr()
+                self._forward_results[req_id]["mr_ptr"] = embedding.data_ptr()
             _t_xfer_start = time.monotonic()
             xfer_ret = await asyncio.to_thread(
                 self.engine.transfer_sync,
@@ -1840,10 +1837,10 @@ class MMEncoder:
                 )
             # Only emit at INFO when transfer is slow or the MR was
             # registered lazily by this /send;
-            if xfer_ms > 200.0 or not mr_shared:
+            if xfer_ms > 200.0 or not mr_already_registered:
                 logger.info(
                     f"[{req_id}] mooncake transfer_sync={xfer_ms:.1f}ms "
-                    f"nbytes={embedding.nbytes} shared_mr={mr_shared}"
+                    f"nbytes={embedding.nbytes} shared_mr={mr_already_registered}"
                 )
 
             mm_data.embedding = None
