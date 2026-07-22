@@ -1,7 +1,7 @@
 """
 JIT kernel for DeepSeek V3 fused QKV-A GEMM (min-latency).
 
-Replaces the AOT sgl_kernel.dsv3_fused_a_gemm for SM90+ (Hopper) GPUs.
+Runtime-compiled CUDA C++ kernel for SM90+ (Hopper) GPUs.
 Shapes: hd_in a multiple of 256, hd_out a multiple of 16, num_tokens 1-16, bfloat16.
 """
 

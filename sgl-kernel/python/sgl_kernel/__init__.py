@@ -55,8 +55,6 @@ else:
     )
     from sgl_kernel.gemm import (
         awq_dequantize,
-        bmm_fp8,
-        dsv3_fused_a_gemm,
         fp8_scaled_mm,
         gptq_gemm,
         gptq_shuffle,
@@ -153,7 +151,6 @@ else:
         "apply_shuffle_mul_sum",
         "apply_token_bitmask_inplace_cuda",
         "awq_dequantize",
-        "bmm_fp8",
         "build_tree_kernel_efficient",
         "causal_conv1d_fwd",
         "causal_conv1d_update",
@@ -162,8 +159,6 @@ else:
         "copy_to_gpu_no_ce",
         "cutlass_mla_decode",
         "cutlass_mla_get_workspace_size",
-        "dsv3_fused_a_gemm",
-        "dsv3_router_gemm",
         "dsv4_fused_k_norm_rope_flashmla",
         "dsv4_fused_q_indexer_rope_hadamard_quant",
         "dsv4_fused_q_norm_rope",
