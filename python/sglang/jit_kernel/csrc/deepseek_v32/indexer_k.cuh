@@ -47,6 +47,45 @@ load_rope_first_cos_sin(const float* __restrict__ cos_sin_cache, int32_t lane_id
   return freq;
 }
 
+// NeoX (non-interleaved) freq load. The cache row layout is the same halves
+// layout [cos_0..cos_31, sin_0..sin_31]; only the element pairing differs:
+// NeoX pairs element e with e ^ (kRopeDim/2), both using freq index
+// e & (kRopeDim/2 - 1). Lane L owns elements [4L, 4L+4), so it needs 4
+// contiguous cos and 4 contiguous sin values (one 16B load each).
+template <int64_t kRopeDim>
+SGL_DEVICE void load_rope_first_cos_sin_neox(
+    const float* __restrict__ cos_sin_cache,
+    int32_t lane_id,
+    device::AlignedVector<float, 4>& cos4,
+    device::AlignedVector<float, 4>& sin4) {
+  constexpr int64_t kHalfRopeDim = kRopeDim / 2;
+  const int32_t freq0 = (lane_id * 4) & (kHalfRopeDim - 1);
+  cos4.load(cos_sin_cache + freq0);
+  sin4.load(cos_sin_cache + kHalfRopeDim + freq0);
+}
+
+// NeoX rotation for the rope lanes of a warp where lane L holds the 4-elem
+// pack [4L, 4L+4) of a kRopeDim-wide rope region spanning lanes
+// [0, kRopeSize). Element e pairs with e ^ (kRopeDim/2), i.e. the partner
+// pack lives at lane L ^ (kRopeSize/2) with the same intra-pack index. Must
+// be called by ALL lanes [0, kRopeSize) (they converge on the shuffle).
+template <uint32_t kRopeSize>
+SGL_DEVICE void rope_rotate_neox(
+    device::AlignedVector<float, 4>& data,
+    const device::AlignedVector<float, 4>& cos4,
+    const device::AlignedVector<float, 4>& sin4,
+    int32_t lane_id) {
+  constexpr uint32_t kHalfLaneMask = kRopeSize / 2;
+  constexpr uint32_t kActiveMask = (1u << kRopeSize) - 1;
+  const bool is_first_half = lane_id < kHalfLaneMask;
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    float other = __shfl_xor_sync(kActiveMask, data[i], kHalfLaneMask);
+    other = is_first_half ? -other : other;
+    data[i] = data[i] * cos4[i] + other * sin4[i];
+  }
+}
+
 // Indexer K: LayerNorm + RoPE -> bf16.
 struct FusedKIndexerNormRopeParams {
   const void* __restrict__ k_input;         // (B, 128) DType
@@ -61,7 +100,7 @@ struct FusedKIndexerNormRopeParams {
   float eps;
 };
 
-template <typename DType, typename PosT, bool kUsePDL>
+template <typename DType, typename PosT, bool kUsePDL, bool kIsNeox>
 K_INDEXER_KERNEL void fused_k_indexer_norm_rope(const __grid_constant__ FusedKIndexerNormRopeParams params) {
   using namespace device;
 
@@ -88,7 +127,7 @@ K_INDEXER_KERNEL void fused_k_indexer_norm_rope(const __grid_constant__ FusedKIn
   const auto cos_sin_cache = params.cos_sin_cache + position * kRopeDim;
 
   PDLWaitPrimary<kUsePDL>();
-  Float4 data, freq, gamma, beta;
+  Float4 data, freq, freq2, gamma, beta;
 
   // part 1: LayerNorm
   {
@@ -96,7 +135,13 @@ K_INDEXER_KERNEL void fused_k_indexer_norm_rope(const __grid_constant__ FusedKIn
     input_vec.load(input_ptr, lane_id);
     gamma.load(params.weight, lane_id);
     beta.load(params.bias, lane_id);
-    if (is_rope_lane) freq = load_rope_first_cos_sin<kRopeDim>(cos_sin_cache, lane_id);
+    if (is_rope_lane) {
+      if constexpr (kIsNeox) {
+        load_rope_first_cos_sin_neox<kRopeDim>(cos_sin_cache, lane_id, freq, freq2);
+      } else {
+        freq = load_rope_first_cos_sin<kRopeDim>(cos_sin_cache, lane_id);
+      }
+    }
 
     float sum = 0.0f;
 #pragma unroll
@@ -122,18 +167,22 @@ K_INDEXER_KERNEL void fused_k_indexer_norm_rope(const __grid_constant__ FusedKIn
 
   // part 2: rope on rope lanes
   if (is_rope_lane) {
-    const auto x_real = data[0];
-    const auto x_imag = data[1];
-    const auto y_real = data[2];
-    const auto y_imag = data[3];
-    const auto fxr = freq[0];
-    const auto fxi = freq[1];
-    const auto fyr = freq[2];
-    const auto fyi = freq[3];
-    data[0] = x_real * fxr - x_imag * fxi;
-    data[1] = x_real * fxi + x_imag * fxr;
-    data[2] = y_real * fyr - y_imag * fyi;
-    data[3] = y_real * fyi + y_imag * fyr;
+    if constexpr (kIsNeox) {
+      rope_rotate_neox<kRopeSize>(data, freq, freq2, lane_id);
+    } else {
+      const auto x_real = data[0];
+      const auto x_imag = data[1];
+      const auto y_real = data[2];
+      const auto y_imag = data[3];
+      const auto fxr = freq[0];
+      const auto fxi = freq[1];
+      const auto fyr = freq[2];
+      const auto fyi = freq[3];
+      data[0] = x_real * fxr - x_imag * fxi;
+      data[1] = x_real * fxi + x_imag * fxr;
+      data[2] = y_real * fyr - y_imag * fyi;
+      data[3] = y_real * fyi + y_imag * fyr;
+    }
   }
 
   PDLTriggerSecondary<kUsePDL>();
@@ -148,10 +197,10 @@ K_INDEXER_KERNEL void fused_k_indexer_norm_rope(const __grid_constant__ FusedKIn
   }
 }
 
-template <typename DType, bool kUsePDL>
+template <typename DType, bool kUsePDL, bool kIsNeox>
 struct FusedKIndexerNormRopeKernel {
   template <typename PosT>
-  static constexpr auto kernel = fused_k_indexer_norm_rope<DType, PosT, kUsePDL>;
+  static constexpr auto kernel = fused_k_indexer_norm_rope<DType, PosT, kUsePDL, kIsNeox>;
 
   static void forward(
       const tvm::ffi::TensorView k_input,
@@ -237,7 +286,7 @@ struct FusedKIndexerNormRopeStoreParams {
   float eps;
 };
 
-template <typename DType, typename PosT, bool kUsePDL, int32_t kPageBits>
+template <typename DType, typename PosT, bool kUsePDL, int32_t kPageBits, bool kIsNeox>
 K_INDEXER_KERNEL void fused_k_indexer_norm_rope_store(const __grid_constant__ FusedKIndexerNormRopeStoreParams params) {
   using namespace device;
 
@@ -266,7 +315,7 @@ K_INDEXER_KERNEL void fused_k_indexer_norm_rope_store(const __grid_constant__ Fu
   const auto cos_sin_cache = params.cos_sin_cache + position * kRopeDim;
 
   PDLWaitPrimary<kUsePDL>();
-  Float4 data, freq, gamma, beta;
+  Float4 data, freq, freq2, gamma, beta;
 
   // part 1: LayerNorm
   {
@@ -274,7 +323,13 @@ K_INDEXER_KERNEL void fused_k_indexer_norm_rope_store(const __grid_constant__ Fu
     input_vec.load(input_ptr, lane_id);
     gamma.load(params.weight, lane_id);
     beta.load(params.bias, lane_id);
-    if (is_rope_lane) freq = load_rope_first_cos_sin<kRopeDim>(cos_sin_cache, lane_id);
+    if (is_rope_lane) {
+      if constexpr (kIsNeox) {
+        load_rope_first_cos_sin_neox<kRopeDim>(cos_sin_cache, lane_id, freq, freq2);
+      } else {
+        freq = load_rope_first_cos_sin<kRopeDim>(cos_sin_cache, lane_id);
+      }
+    }
 
     float sum = 0.0f;
 #pragma unroll
@@ -300,18 +355,22 @@ K_INDEXER_KERNEL void fused_k_indexer_norm_rope_store(const __grid_constant__ Fu
 
   // part 2: rope on rope lanes
   if (is_rope_lane) {
-    const auto x_real = data[0];
-    const auto x_imag = data[1];
-    const auto y_real = data[2];
-    const auto y_imag = data[3];
-    const auto fxr = freq[0];
-    const auto fxi = freq[1];
-    const auto fyr = freq[2];
-    const auto fyi = freq[3];
-    data[0] = x_real * fxr - x_imag * fxi;
-    data[1] = x_real * fxi + x_imag * fxr;
-    data[2] = y_real * fyr - y_imag * fyi;
-    data[3] = y_real * fyi + y_imag * fyr;
+    if constexpr (kIsNeox) {
+      rope_rotate_neox<kRopeSize>(data, freq, freq2, lane_id);
+    } else {
+      const auto x_real = data[0];
+      const auto x_imag = data[1];
+      const auto y_real = data[2];
+      const auto y_imag = data[3];
+      const auto fxr = freq[0];
+      const auto fxi = freq[1];
+      const auto fyr = freq[2];
+      const auto fyi = freq[3];
+      data[0] = x_real * fxr - x_imag * fxi;
+      data[1] = x_real * fxi + x_imag * fxr;
+      data[2] = y_real * fyr - y_imag * fyi;
+      data[3] = y_real * fyi + y_imag * fyr;
+    }
   }
 
   PDLTriggerSecondary<kUsePDL>();
@@ -344,14 +403,14 @@ K_INDEXER_KERNEL void fused_k_indexer_norm_rope_store(const __grid_constant__ Fu
   if (lane_id == 0) *reinterpret_cast<float*>(scale_ptr) = scale;
 }
 
-template <typename DType, bool kUsePDL, uint32_t kPageSize>
+template <typename DType, bool kUsePDL, uint32_t kPageSize, bool kIsNeox>
 struct FusedKIndexerNormRopeStoreKernel {
   static constexpr int32_t kPageBits = std::countr_zero(kPageSize);
   static constexpr int64_t kPageBytes = 132ll * kPageSize;
   static_assert(std::has_single_bit(kPageSize), "kPageSize must be a power of 2");
 
   template <typename PosT>
-  static constexpr auto kernel = fused_k_indexer_norm_rope_store<DType, PosT, kUsePDL, kPageBits>;
+  static constexpr auto kernel = fused_k_indexer_norm_rope_store<DType, PosT, kUsePDL, kPageBits, kIsNeox>;
 
   static void forward(
       const tvm::ffi::TensorView k_input,

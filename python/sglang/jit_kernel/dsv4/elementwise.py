@@ -79,12 +79,13 @@ def _jit_main_q_indexer_rope_hadamard_quant_module(dtype: torch.dtype):
 
 
 # V3.2 lays q out as [rope | nope] (V4 is [nope | rope]) -> kRopeFirst=true, and
-# drops the Hadamard rotation (kHadamard=false).
+# drops the Hadamard rotation (kHadamard=false). is_neox selects the RoPE
+# convention (kIsNeox): NeoX for DeepSeek-V3.2, interleave for GLM-5.x.
 @cache_once
-def _jit_main_q_indexer_rope_first_quant_module(dtype: torch.dtype):
-    args = make_cpp_args(dtype, is_arch_support_pdl(), True, False)
+def _jit_main_q_indexer_rope_first_quant_module(dtype: torch.dtype, is_neox: bool):
+    args = make_cpp_args(dtype, is_arch_support_pdl(), True, False, is_neox)
     return load_jit(
-        make_name("main_q_indexer_rope_first_quant"),
+        make_name(f"main_q_indexer_rope_first_quant{'_neox' if is_neox else ''}"),
         *args,
         cuda_files=["deepseek_v4/main_norm_rope.cuh"],
         cuda_wrappers=[
@@ -205,13 +206,20 @@ def fused_q_indexer_rope_first_quant(
     weight_scale: float,
     cos_sin_cache: torch.Tensor,
     positions: torch.Tensor,
+    *,
+    is_neox: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """DeepSeek-V3.2 only. Indexer Q: RoPE on the leading dims + fp8 act-quant. CUDA only."""
+    """DSA indexer Q: RoPE on the leading dims + fp8 act-quant. CUDA only.
+
+    is_neox selects the RoPE convention: True pairs dim i with i + rope_dim/2
+    (NeoX, DeepSeek-V3.2), False pairs (2i, 2i+1) (interleave/GPT-J, GLM-5.x).
+    The cos_sin_cache halves layout [cos..., sin...] is the same for both.
+    """
     q_fp8 = torch.empty(q_input.shape, dtype=torch.float8_e4m3fn, device=q_input.device)
     weights_out = torch.empty(
         (*q_input.shape[:-1], 1), dtype=torch.float32, device=q_input.device
     )
-    module = _jit_main_q_indexer_rope_first_quant_module(q_input.dtype)
+    module = _jit_main_q_indexer_rope_first_quant_module(q_input.dtype, is_neox)
     module.forward(
         q_input,
         q_fp8,
