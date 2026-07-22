@@ -910,6 +910,10 @@ class Req(ReqDllmMixin):
         self.swa_prefix_lock_released: bool = False
         # The prefix length that is inserted into the tree cache
         self.cache_protected_len: int = 0
+        # Experimental intra-turn prefix-cache staging. The scheduler can defer
+        # this request for one prefill pass while an earlier request materializes
+        # a shared uncached prefix.
+        self.defer_for_in_batch_prefix_cache: bool = False
 
         # Whether or not if it is chunked. It increments whenever
         # it is chunked, and decrement whenever chunked request is

@@ -1,5 +1,6 @@
 import unittest
 from array import array
+from unittest.mock import patch
 
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import (
@@ -90,6 +91,36 @@ class TestSchedulePolicy(CustomTestCase):
         self.assertEqual(waiting_queue[0].rid, 1)
         self.assertEqual(waiting_queue[1].rid, 3)
         self.assertEqual(waiting_queue[2].rid, 2)
+
+    def test_calc_priority_fcfs_cache_agnostic_in_batch_prefix_caching(self):
+        tree_cache = RadixCache.create_simulated()
+        shared_prefix = list(range(64))
+        waiting_queue = [
+            _make_req(1, "shared seed", shared_prefix + [1]),
+            _make_req(2, "shared duplicate", shared_prefix + [2]),
+            _make_req(3, "unrelated", [1000, 1001]),
+            _make_req(4, "shared duplicate 2", shared_prefix + [3]),
+        ]
+
+        policy = SchedulePolicy(
+            policy="fcfs",
+            tree_cache=tree_cache,
+            enable_hierarchical_cache=True,
+            enable_priority_scheduling=False,
+            schedule_low_priority_values_first=False,
+        )
+        with patch(
+            "sglang.srt.managers.schedule_policy."
+            "ENABLE_CACHE_AGNOSTIC_IN_BATCH_PREFIX_CACHING",
+            True,
+        ):
+            policy.calc_priority(waiting_queue)
+
+        self.assertEqual([req.rid for req in waiting_queue], [1, 3, 2, 4])
+        self.assertEqual(
+            [req.defer_for_in_batch_prefix_cache for req in waiting_queue],
+            [False, False, True, True],
+        )
 
     def test_calc_priority_priority_enabled_fcfs_scheduling(self):
         tree_cache = RadixCache.create_simulated()
