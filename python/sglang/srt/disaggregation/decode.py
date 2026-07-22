@@ -60,6 +60,11 @@ from sglang.srt.disaggregation.utils import (
     setup_state_kv_args,
 )
 from sglang.srt.environ import envs
+from sglang.srt.managers.io_struct import (
+    AbortReq,
+    BatchTokenizedGenerateReqInput,
+    TokenizedGenerateReqInput,
+)
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     NextBatchPlan,
@@ -67,9 +72,25 @@ from sglang.srt.managers.schedule_batch import (
     ScheduleBatch,
 )
 from sglang.srt.managers.schedule_policy import match_prefix_for_req
+from sglang.srt.managers.scheduler_components.forward_resource_lease import (
+    ForwardResourceLease,
+)
 from sglang.srt.managers.utils import GenerationBatchResult
-from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator import (
+    BaseTokenToKVPoolAllocator,
+    PagedTokenToKVPoolAllocator,
+    TokenToKVPoolAllocator,
+)
+from sglang.srt.mem_cache.allocator.swa import (
+    PureSWATokenToKVPoolAllocator,
+    SWATokenToKVPoolAllocator,
+)
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
+from sglang.srt.mem_cache.chunk_cache import (
+    ChunkCache,
+    PureSWAChunkCache,
+    SWAChunkCache,
+)
 from sglang.srt.mem_cache.common import (
     kv_to_page_indices,
     page_align_floor,
@@ -81,6 +102,7 @@ from sglang.srt.mem_cache.memory_pool import (
     KVCache,
     ReqToTokenPool,
 )
+from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
@@ -1983,6 +2005,65 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
 
 
 class SchedulerDisaggregationDecodeMixin:
+    def _has_audited_disjoint_decode_admission_resources(self: Scheduler) -> bool:
+        """Fail closed unless every resource owner has disjoint allocation."""
+
+        audited_cache_allocator_pairs = {
+            (ChunkCache, TokenToKVPoolAllocator),
+            (ChunkCache, PagedTokenToKVPoolAllocator),
+            (RadixCache, TokenToKVPoolAllocator),
+            (RadixCache, PagedTokenToKVPoolAllocator),
+            (SWAChunkCache, SWATokenToKVPoolAllocator),
+            (PureSWAChunkCache, PureSWATokenToKVPoolAllocator),
+        }
+        return (
+            type(self.req_to_token_pool) is DecodeReqToTokenPool
+            and (
+                type(self.tree_cache),
+                type(self.token_to_kv_pool_allocator),
+            )
+            in audited_cache_allocator_pairs
+        )
+
+    def _can_overlap_decode_queue_with_forward_resource_lease(
+        self: Scheduler,
+    ) -> bool:
+        """Whether decode admission is disjoint from leased running resources.
+
+        New requests allocate previously free request rows and KV pages. Active
+        request rows remain leased, and finished rows are not returned to either
+        free list until their protecting forward completes. Cache/offload modes
+        that can relocate or mutate active resources retain the immediate global
+        barrier.
+        """
+        return (
+            self._war_barrier_enabled
+            and self._has_audited_disjoint_decode_admission_resources()
+            and not self.tree_cache.supports_streaming_session()
+            and not self.tree_cache.supports_mamba()
+            and not self.enable_decode_hicache
+            and not self.enable_hisparse
+            and not self.enable_unified_memory
+            and not self.disagg_decode_prealloc_queue.enable_staging
+            and not self.server_args.disaggregation_decode_enable_offload_kvcache
+            and not self.model_config.is_multimodal
+        )
+
+    @staticmethod
+    def _can_dispatch_inputs_with_forward_resource_lease(recv_reqs: List) -> bool:
+        """Whether request dispatch cannot release an in-flight resource."""
+
+        def is_safe(req) -> bool:
+            if isinstance(req, AbortReq):
+                return True
+            if isinstance(req, TokenizedGenerateReqInput):
+                return req.session_id is None and req.session_params is None
+            if isinstance(req, BatchTokenizedGenerateReqInput):
+                return all(is_safe(item) for item in req)
+            return False
+
+        return all(is_safe(req) for req in recv_reqs)
+
     @torch.no_grad()
     def event_loop_normal_disagg_decode(self: Scheduler):
         """A normal scheduler loop for decode worker in disaggregation mode."""
@@ -2021,22 +2102,75 @@ class SchedulerDisaggregationDecodeMixin:
     def event_loop_overlap_disagg_decode(self: Scheduler):
         self.result_queue = deque()
         self.last_batch: Optional[ScheduleBatch] = None
+        use_resource_lease = (
+            self._can_overlap_decode_queue_with_forward_resource_lease()
+        )
+        resource_lease = (
+            ForwardResourceLease(
+                req_to_token_pool=self.req_to_token_pool,
+                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                wait_for_read_done=self._apply_war_barrier,
+                release_finished_req=(
+                    self.batch_result_processor.release_finished_req_resources
+                ),
+            )
+            if use_resource_lease
+            else None
+        )
+        if resource_lease is not None:
+            logger.info(
+                "Enabling forward resource leases for overlap-safe "
+                "disaggregated decode admission"
+            )
 
         def pop_and_process():
             tmp_batch, tmp_result = self.result_queue.popleft()
-            self.process_batch_result(tmp_batch, tmp_result)
+            tmp_epoch = (
+                getattr(tmp_result, "forward_resource_epoch", None)
+                if resource_lease is not None
+                else None
+            )
+            self.process_batch_result(
+                tmp_batch,
+                tmp_result,
+                resource_lease=resource_lease,
+            )
+            if resource_lease is not None and tmp_epoch is not None:
+                # Decode result processing synchronizes copy_done, which is
+                # ordered after this epoch's complete forward. Fall back to the
+                # scheduler marker if a future/non-decode result has no D2H event.
+                # Use this logical completion point on every TP rank instead of
+                # a timing-sensitive local event query.
+                if tmp_result.copy_done is None:
+                    tmp_epoch.full_done_event.synchronize()
+                resource_lease.mark_forward_completed(tmp_epoch)
+                tmp_result.forward_resource_epoch = None
 
         while True:
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
+            if (
+                resource_lease is not None
+                and not self._can_dispatch_inputs_with_forward_resource_lease(recv_reqs)
+            ):
+                resource_lease.synchronize_all_and_drain()
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
+                if resource_lease is not None:
+                    resource_lease.synchronize_all_and_drain()
                 continue
             self.process_decode_queue()
 
+            # Admission above only consumes rows/pages that were already free.
+            # Mapping writes for planning need the early read fence; physical
+            # rows/pages remain quarantined until logical forward completion.
+            if resource_lease is not None:
+                resource_lease.wait_mapping_read_done()
+
             # Get the next batch to run
             plan = self.get_next_disagg_decode_batch_to_run(
-                running_batch=self.running_batch
+                running_batch=self.running_batch,
+                resource_lease=resource_lease,
             )
             self.running_batch = plan.running_batch
             batch = plan.batch_to_run
@@ -2055,7 +2189,18 @@ class SchedulerDisaggregationDecodeMixin:
             # Launch the current batch
             if batch:
                 batch_result = self.run_batch(batch)
-                self._apply_war_barrier()
+                if resource_lease is not None:
+                    # Record this on forward_stream explicitly: the event-loop
+                    # body itself runs under schedule_stream's context.
+                    full_done_event = self.device_module.Event()
+                    full_done_event.record(stream=self.forward_stream)
+                    forward_epoch = resource_lease.arm_after_launch(
+                        batch.reqs,
+                        full_done_event=full_done_event,
+                    )
+                    batch_result.forward_resource_epoch = forward_epoch
+                else:
+                    self._apply_war_barrier()
                 self.result_queue.append((batch.copy(), batch_result))
             else:
                 batch_result = None
@@ -2065,6 +2210,10 @@ class SchedulerDisaggregationDecodeMixin:
                 if not disable_overlap_for_batch:
                     pop_and_process()
             elif batch is None:
+                if resource_lease is not None:
+                    # Idle housekeeping assumes no quarantined request/cache
+                    # ownership remains hidden from the allocator.
+                    resource_lease.synchronize_all_and_drain()
                 self.on_idle()
 
             # Run sample of the current batch
@@ -2087,7 +2236,9 @@ class SchedulerDisaggregationDecodeMixin:
 
     @scheduler_nvtx_method("scheduler.get_next_batch_to_run")
     def get_next_disagg_decode_batch_to_run(
-        self: Scheduler, running_batch: ScheduleBatch
+        self: Scheduler,
+        running_batch: ScheduleBatch,
+        resource_lease: Optional[ForwardResourceLease] = None,
     ) -> NextBatchPlan:
         """Process prebuilt batch and schedule the next decode batch."""
         # Process pending prebuilt batch: output processing + filter + merge
@@ -2110,7 +2261,14 @@ class SchedulerDisaggregationDecodeMixin:
         if running_batch.is_empty():
             ret = None
         else:
-            running_batch = self.update_running_batch(running_batch)
+            running_batch = self.update_running_batch(
+                running_batch,
+                before_decode_retract=(
+                    resource_lease.synchronize_all_and_drain
+                    if resource_lease is not None
+                    else None
+                ),
+            )
             ret = running_batch if not running_batch.is_empty() else None
 
         ret = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(ret)

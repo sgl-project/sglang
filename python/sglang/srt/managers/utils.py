@@ -65,6 +65,11 @@ class GenerationBatchResult:
     delay_sample_func: Optional[callable] = None
     future_indices: Optional[torch.Tensor] = None
     speculative_num_draft_tokens: Optional[int] = None
+    # Internal scheduler epoch guarding resources read by this forward. Keeping
+    # it on the result preserves the common ``(batch, result)`` queue contract
+    # used by pause/control paths while allowing specialized schedulers to bind
+    # resource retirement to result completion.
+    forward_resource_epoch: Optional[Any] = None
 
     # Grammar FSM advance memoization (spec-v2 overlap). advance_grammar_fsm sets
     # these once — eagerly via the scheduler's grammar barrier inside verify(), or

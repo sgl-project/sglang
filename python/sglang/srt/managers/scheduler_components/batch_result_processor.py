@@ -34,6 +34,9 @@ if TYPE_CHECKING:
         DecodeKVCacheOffloadManager,
     )
     from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+    from sglang.srt.managers.scheduler_components.forward_resource_lease import (
+        ForwardResourceLease,
+    )
     from sglang.srt.managers.scheduler_components.logprob_result_processor import (
         SchedulerLogprobResultProcessor,
     )
@@ -718,6 +721,8 @@ class SchedulerBatchResultProcessor:
         self,
         batch: ScheduleBatch,
         result: GenerationBatchResult,
+        *,
+        resource_lease: Optional[ForwardResourceLease] = None,
     ):
         if result.copy_done is not None:
             result.copy_done.synchronize()
@@ -778,7 +783,28 @@ class SchedulerBatchResultProcessor:
             req.time_stats.set_last_decode_finish_time()
             req.update_finish_state(new_accept_len)
 
-            self._handle_finish_state_updated_req(req, batch, result, i, logits_output)
+            can_defer_retirement = (
+                resource_lease is not None
+                and req.finished()
+                and req.mamba_ping_pong_track_buffer is None
+                and not self.server_args.disaggregation_decode_enable_offload_kvcache
+                and not self.server_args.enable_hisparse
+            )
+            if resource_lease is not None and (
+                req.mamba_ping_pong_track_buffer is not None
+                or self.server_args.disaggregation_decode_enable_offload_kvcache
+                or (req.finished() and not can_defer_retirement)
+            ):
+                resource_lease.wait_read_done()
+
+            self._handle_finish_state_updated_req(
+                req,
+                batch,
+                result,
+                i,
+                logits_output,
+                resource_lease=resource_lease if can_defer_retirement else None,
+            )
 
             if req.return_logprob:
                 self._apply_decode_logprobs(
@@ -926,6 +952,8 @@ class SchedulerBatchResultProcessor:
         result: GenerationBatchResult,
         i: int,
         logits_output: LogitsProcessorOutput,
+        *,
+        resource_lease: Optional[ForwardResourceLease] = None,
     ):
         # Called here (after update_finish_state) so req.finished() is valid
         # for mamba_lazy_post_decode_at_boundary inside.
@@ -959,21 +987,28 @@ class SchedulerBatchResultProcessor:
             else:
                 if get_memory().enable_hisparse:
                     self.hisparse_coordinator.request_finished(req)
-                prepare_release = getattr(
-                    self.model_worker, "prepare_for_kv_cache_release", None
-                )
-                if callable(prepare_release):
-                    prepare_release(req)
                 is_insert = (
                     req.mamba_lazy_is_insert
                     if get_server_args().enable_mamba_extra_buffer_lazy()
                     else True
                 )
-                release_kv_cache(req, self.tree_cache, is_insert=is_insert)
+                if resource_lease is None or not resource_lease.try_defer_finished_req(
+                    req, is_insert
+                ):
+                    self.release_finished_req_resources(req, is_insert=is_insert)
 
             req.time_stats.set_completion_time()
 
         self._maybe_collect_customized_info(i, req, logits_output)
+
+    def release_finished_req_resources(self, req: Req, *, is_insert: bool) -> None:
+        """Retire every worker/cache resource owned by a finished request."""
+        prepare_release = getattr(
+            self.model_worker, "prepare_for_kv_cache_release", None
+        )
+        if callable(prepare_release):
+            prepare_release(req)
+        release_kv_cache(req, self.tree_cache, is_insert=is_insert)
 
     def _maybe_update_reasoning_tokens(
         self,
