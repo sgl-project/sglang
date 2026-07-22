@@ -1252,7 +1252,16 @@ class SchedulerDisaggregationPrefillMixin:
             # DSV4 keeps the global token-loc array here because c4/c128
             # buckets must derive their own compressed slot locs in the
             # backend before applying DCP sharding.
-            page_indices = kv_indices
+            # Mooncake consumes these indices in background CPU threads and
+            # its DCP helpers expect NumPy semantics (notably ``.size`` as an
+            # integer). Do not let a CUDA ``Tensor.size`` method escape into
+            # the transfer worker.
+            page_indices = (
+                kv_indices.cpu().numpy()
+                if isinstance(kv_indices, torch.Tensor)
+                else kv_indices
+            )
+            page_indices = np.asarray(page_indices, dtype=np.int32)
         if not req.disagg_kv_sender.should_send_kv_chunk(len(page_indices), last_chunk):
             return
         req.disagg_kv_sender.send(

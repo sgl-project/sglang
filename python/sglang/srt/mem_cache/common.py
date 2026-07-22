@@ -32,8 +32,13 @@ MAMBA_STATE_PER_REQ_NO_CACHE = 1
 logger = logging.getLogger(__name__)
 
 
-def kv_to_page_indices(kv_indices: torch.Tensor, page_size: int) -> np.ndarray:
-    return (kv_indices[::page_size] // page_size).cpu().numpy()
+def kv_to_page_indices(
+    kv_indices: torch.Tensor | np.ndarray, page_size: int
+) -> np.ndarray:
+    page_indices = kv_indices[::page_size] // page_size
+    if isinstance(page_indices, torch.Tensor):
+        return page_indices.cpu().numpy()
+    return np.asarray(page_indices)
 
 
 def kv_to_page_num(num_kv_indices: int, page_size: int):

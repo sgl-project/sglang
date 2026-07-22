@@ -171,7 +171,7 @@ class DeepSeekV4SingleKVPool(KVCache):
         ``dcp_world_size``/``dcp_rank``. Used when ``dcp_size > 1`` because the
         fused C++ flashmla store kernel is not yet DCP-aware.
         """
-        from sglang.srt.layers.attention.dsv4.quant_k_cache import (
+        from sglang.kernels.ops.attention.dsv4.quant_k_cache import (
             quant_to_nope_fp8_rope_bf16_pack_triton,
         )
 

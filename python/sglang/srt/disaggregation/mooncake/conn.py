@@ -66,6 +66,70 @@ FAILED_SESSION_RECOVERIES = Counter(
 )
 
 
+class MooncakeDecodeSessionPool:
+    """Least-loaded assignment of decode rooms to Mooncake sessions.
+
+    ``rooms_per_session`` is deliberately a soft target. Rejecting or delaying
+    a request here would require cross-rank admission coordination; for this
+    experimental pool, overflow keeps serving on the least-loaded session.
+    """
+
+    def __init__(self, engines: list, rooms_per_session: int = 0):
+        if not engines:
+            raise ValueError(
+                "Mooncake decode session pool requires at least one engine"
+            )
+        if rooms_per_session < 0:
+            raise ValueError("rooms_per_session must be non-negative")
+        self.engines = engines
+        self.rooms_per_session = rooms_per_session
+        self._active_rooms = [0] * len(engines)
+        self._room_to_session: dict[int, int] = {}
+        self._lock = threading.Lock()
+        self._overflow_warned = False
+
+    def acquire(self, room: int) -> Tuple[int, str]:
+        with self._lock:
+            existing = self._room_to_session.get(room)
+            if existing is not None:
+                return existing, self.engines[existing].get_session_id()
+
+            candidates = range(len(self.engines))
+            if self.rooms_per_session > 0:
+                below_target = [
+                    i
+                    for i, count in enumerate(self._active_rooms)
+                    if count < self.rooms_per_session
+                ]
+                if below_target:
+                    candidates = below_target
+                elif not self._overflow_warned:
+                    logger.warning(
+                        "All %d Mooncake decode sessions reached the soft target "
+                        "of %d active rooms; continuing on the least-loaded session",
+                        len(self.engines),
+                        self.rooms_per_session,
+                    )
+                    self._overflow_warned = True
+
+            session_index = min(candidates, key=self._active_rooms.__getitem__)
+            self._room_to_session[room] = session_index
+            self._active_rooms[session_index] += 1
+            return session_index, self.engines[session_index].get_session_id()
+
+    def release(self, room: int) -> None:
+        with self._lock:
+            session_index = self._room_to_session.pop(room, None)
+            if session_index is None:
+                return
+            self._active_rooms[session_index] -= 1
+            assert self._active_rooms[session_index] >= 0
+
+    def active_room_counts(self) -> Tuple[int, ...]:
+        with self._lock:
+            return tuple(self._active_rooms)
+
+
 # decode
 @dataclasses.dataclass
 class TransferInfo:
@@ -208,6 +272,8 @@ class MooncakeKVManager(CommonKVManager):
             self.transfer_queues: List[FastQueue] = [
                 FastQueue() for _ in range(transfer_queue_size)
             ]
+            self._session_group_queue_shards: dict[Tuple[str, ...], int] = {}
+            self._session_group_queue_lock = threading.Lock()
             assert transfer_thread_pool_size >= transfer_queue_size, (
                 f"The environment variable SGLANG_DISAGGREGATION_THREAD_POOL_SIZE={transfer_thread_pool_size} must be "
                 f"greater than or equal to SGLANG_DISAGGREGATION_QUEUE_SIZE={transfer_queue_size}."
@@ -264,40 +330,111 @@ class MooncakeKVManager(CommonKVManager):
 
     def init_engine(self):
         self.engine = get_mooncake_transfer_engine()
+        self.engines = [self.engine]
+
+        pool_size = 1
+        rooms_per_session = 0
+        if self.disaggregation_mode == DisaggregationMode.DECODE:
+            pool_size = envs.SGLANG_DISAGGREGATION_DECODE_SESSION_POOL_SIZE.get()
+            rooms_per_session = (
+                envs.SGLANG_DISAGGREGATION_DECODE_ROOMS_PER_SESSION.get()
+            )
+        if pool_size < 1:
+            raise ValueError(
+                "SGLANG_DISAGGREGATION_DECODE_SESSION_POOL_SIZE must be >= 1"
+            )
+        if rooms_per_session < 0:
+            raise ValueError(
+                "SGLANG_DISAGGREGATION_DECODE_ROOMS_PER_SESSION must be >= 0"
+            )
+
+        if pool_size > 1:
+            from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
+                MooncakeTransferEngine,
+            )
+
+            logger.warning(
+                "Enabling experimental Mooncake decode session pool: "
+                "sessions=%d rooms_per_session=%d",
+                pool_size,
+                rooms_per_session,
+            )
+            for _ in range(1, pool_size):
+                self.engines.append(
+                    MooncakeTransferEngine(
+                        hostname=self.engine.hostname,
+                        gpu_id=self.engine.gpu_id,
+                        # The shared engine has already resolved a per-GPU HCA
+                        # string, which can be reused directly by each clone.
+                        ib_device=self.engine.ib_device,
+                    )
+                )
+
+        self.decode_session_pool = MooncakeDecodeSessionPool(
+            self.engines, rooms_per_session=rooms_per_session
+        )
+        self._session_registration_lock = threading.Lock()
+        self._session_route_registrations: dict[int, tuple[dict, set[str]]] = {}
+        if pool_size > 1:
+            logger.info(
+                "Mooncake decode session pool endpoints: %s",
+                [engine.get_session_id() for engine in self.engines],
+            )
+
+    def _batch_register_all_engines(self, ptrs: List[int], lens: List[int]) -> int:
+        for engine in self.engines:
+            ret = engine.batch_register(ptrs, lens)
+            if ret not in (None, 0):
+                return ret
+        return 0
+
+    def _batch_deregister_all_engines(self, ptrs: List[int]) -> None:
+        for engine in self.engines:
+            engine.batch_deregister(ptrs)
 
     def register_buffer_to_engine(self):
         # Batch register KV data buffers
         if self.kv_args.kv_data_ptrs and self.kv_args.kv_data_lens:
-            self.engine.batch_register(
+            ret = self._batch_register_all_engines(
                 self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens
             )
+            if ret != 0 and len(self.engines) > 1:
+                raise RuntimeError("Failed to register KV buffers to session pool")
 
         # Batch register auxiliary data buffers
         if self.kv_args.aux_data_ptrs and self.kv_args.aux_data_lens:
-            self.engine.batch_register(
+            ret = self._batch_register_all_engines(
                 self.kv_args.aux_data_ptrs, self.kv_args.aux_data_lens
             )
+            if ret != 0 and len(self.engines) > 1:
+                raise RuntimeError("Failed to register aux buffers to session pool")
 
         for ptrs, lens in zip(
             self.kv_args.state_data_ptrs, self.kv_args.state_data_lens
         ):
             if ptrs and lens:
-                self.engine.batch_register(ptrs, lens)
+                ret = self._batch_register_all_engines(ptrs, lens)
+                if ret != 0 and len(self.engines) > 1:
+                    raise RuntimeError(
+                        "Failed to register state buffers to session pool"
+                    )
 
     def deregister_buffer_to_engine(self):
         if self.kv_args.kv_data_ptrs:
-            self.engine.batch_deregister(self.kv_args.kv_data_ptrs)
+            self._batch_deregister_all_engines(self.kv_args.kv_data_ptrs)
 
         if self.kv_args.aux_data_ptrs:
-            self.engine.batch_deregister(self.kv_args.aux_data_ptrs)
+            self._batch_deregister_all_engines(self.kv_args.aux_data_ptrs)
 
         for ptrs in self.kv_args.state_data_ptrs or []:
             if ptrs:
-                self.engine.batch_deregister(ptrs)
+                self._batch_deregister_all_engines(ptrs)
 
         if hasattr(self, "connection_pool"):
             with self.connection_lock:
                 self.connection_pool.clear()
+        with self._session_registration_lock:
+            self._session_route_registrations.clear()
 
     # ------------------------------------------------------------------
     # Staging buffer methods (all delegate to staging_handler.py)
@@ -320,7 +457,7 @@ class MooncakeKVManager(CommonKVManager):
         )
 
         self._staging_ctx.buffers = init_staging_buffers(
-            lambda ptr, size: self.engine.batch_register([ptr], [size]),
+            lambda ptr, size: self._batch_register_all_engines([ptr], [size]),
             self.kv_args,
             count,
         )
@@ -332,7 +469,7 @@ class MooncakeKVManager(CommonKVManager):
         )
 
         self._staging_ctx.allocator = init_staging_allocator(
-            lambda ptr, size: self.engine.batch_register([ptr], [size]),
+            lambda ptr, size: self._batch_register_all_engines([ptr], [size]),
             self.kv_args,
         )
         self.kv_buffer_tensors = None
@@ -2583,6 +2720,17 @@ class MooncakeKVManager(CommonKVManager):
         threading.Thread(target=decode_thread).start()
         self._start_heartbeat_checker_thread()
 
+    def _get_transfer_queue_shard(self, dst_infos) -> int:
+        session_group = tuple(sorted(dst_infos))
+        with self._session_group_queue_lock:
+            shard_idx = self._session_group_queue_shards.get(session_group)
+            if shard_idx is None:
+                shard_idx = len(self._session_group_queue_shards) % len(
+                    self.transfer_queues
+                )
+                self._session_group_queue_shards[session_group] = shard_idx
+            return shard_idx
+
     def add_transfer_request(
         self,
         bootstrap_room: int,
@@ -2612,12 +2760,13 @@ class MooncakeKVManager(CommonKVManager):
             # add further chunks into the transfer queue.
             return
 
-        # NOTE(shangming): sharding according to the dst_infos to make sure
-        # requests with the same dst_sessions will be added into the same
-        # queue, which enables early abort with failed sessions.
+        # Keep requests with the same destination-session group on one queue,
+        # which enables early abort with failed sessions. Assign new groups
+        # round-robin instead of hashing the sum of RPC ports: when multiple
+        # ranks allocate consecutive ports, different session groups can have
+        # the same port sum modulo queue count and accidentally serialize.
         dst_infos = self.transfer_infos[bootstrap_room].keys()
-        session_port_sum = sum(int(session.rsplit(":", 1)[1]) for session in dst_infos)
-        shard_idx = session_port_sum % len(self.transfer_queues)
+        shard_idx = self._get_transfer_queue_shard(dst_infos)
 
         if trace_ctx is None:
             trace_ctx = TraceNullContext()
@@ -2637,6 +2786,44 @@ class MooncakeKVManager(CommonKVManager):
 
     def get_session_id(self):
         return self.engine.get_session_id()
+
+    def acquire_decode_session(self, bootstrap_room: int) -> Tuple[int, str]:
+        assert self.disaggregation_mode == DisaggregationMode.DECODE
+        return self.decode_session_pool.acquire(bootstrap_room)
+
+    def release_decode_session(self, bootstrap_room: int) -> None:
+        if self.disaggregation_mode == DisaggregationMode.DECODE:
+            self.decode_session_pool.release(bootstrap_room)
+
+    def claim_session_route_registration(
+        self, bootstrap_info: dict, session_id: str
+    ) -> bool:
+        """Claim one session/route registration, returning False if known.
+
+        Registrations are keyed by the identity of the cached bootstrap-info
+        object without mutating it. If heartbeat handling drops and later
+        recreates a route, the new object has a new identity and every session
+        is registered again with the restarted prefill process.
+        """
+        with self._session_registration_lock:
+            route_id = id(bootstrap_info)
+            entry = self._session_route_registrations.get(route_id)
+            if entry is None or entry[0] is not bootstrap_info:
+                entry = (bootstrap_info, set())
+                self._session_route_registrations[route_id] = entry
+            registered = entry[1]
+            if session_id in registered:
+                return False
+            registered.add(session_id)
+            return True
+
+    def unclaim_session_route_registration(
+        self, bootstrap_info: dict, session_id: str
+    ) -> None:
+        with self._session_registration_lock:
+            entry = self._session_route_registrations.get(id(bootstrap_info))
+            if entry is not None and entry[0] is bootstrap_info:
+                entry[1].discard(session_id)
 
     def _on_heartbeat_success(self, bootstrap_addr: str):
         current_rooms = self.addr_to_rooms_tracker[bootstrap_addr].copy()
@@ -2719,26 +2906,52 @@ class MooncakeKVSender(CommonKVSender):
         if should_skip:
             return
 
-        if not is_last_chunk:
-            self.kv_mgr.add_transfer_request(
-                self.bootstrap_room,
-                kv_indices,
-                index_slice,
-                False,
-                token_position_offset=token_position_offset,
-                trace_ctx=self.trace_ctx.copy_for_thread(),
-            )
+        transfer_chunk_size = (
+            envs.SGLANG_DISAGGREGATION_KV_TRANSFER_CHUNK_SIZE.get()
+        )
+        if transfer_chunk_size <= 0 or len(kv_indices) <= transfer_chunk_size:
+            chunks = [(0, len(kv_indices))]
         else:
-            self.kv_mgr.add_transfer_request(
-                self.bootstrap_room,
-                kv_indices,
-                index_slice,
-                True,
-                aux_index=self.aux_index,
-                state_indices=state_indices,
-                token_position_offset=token_position_offset,
-                trace_ctx=self.trace_ctx.copy_for_thread(),
+            chunks = [
+                (start, min(start + transfer_chunk_size, len(kv_indices)))
+                for start in range(0, len(kv_indices), transfer_chunk_size)
+            ]
+
+        # Preserve an empty final chunk: it carries aux/state completion even
+        # when decode already owns the full KV prefix.
+        if not chunks:
+            chunks = [(0, 0)]
+
+        index_start = index_slice.start if index_slice.start is not None else 0
+        for chunk_start, chunk_end in chunks:
+            chunk_is_last = is_last_chunk and chunk_end == len(kv_indices)
+            chunk_index_slice = slice(
+                index_start + chunk_start, index_start + chunk_end
             )
+            chunk_kv_indices = kv_indices[chunk_start:chunk_end]
+            chunk_position_offset = token_position_offset + chunk_start
+
+            if not chunk_is_last:
+                self.kv_mgr.add_transfer_request(
+                    self.bootstrap_room,
+                    chunk_kv_indices,
+                    chunk_index_slice,
+                    False,
+                    token_position_offset=chunk_position_offset,
+                    trace_ctx=self.trace_ctx.copy_for_thread(),
+                )
+            else:
+                self.kv_mgr.add_transfer_request(
+                    self.bootstrap_room,
+                    chunk_kv_indices,
+                    chunk_index_slice,
+                    True,
+                    aux_index=self.aux_index,
+                    state_indices=state_indices,
+                    token_position_offset=chunk_position_offset,
+                    trace_ctx=self.trace_ctx.copy_for_thread(),
+                )
+
         self._record_transfer_indices(kv_indices, state_indices)
 
     def poll(self) -> KVPoll:
@@ -2800,12 +3013,32 @@ class MooncakeKVReceiver(CommonKVReceiver):
         bootstrap_addr: str,
         bootstrap_room: Optional[int] = None,
     ):
-        self.session_id = mgr.get_session_id()
+        self.session_index, self.session_id = mgr.acquire_decode_session(
+            bootstrap_room
+        )
+        self._session_released = False
         self.init_time = None
-        super().__init__(mgr, bootstrap_addr, bootstrap_room)
+        try:
+            super().__init__(mgr, bootstrap_addr, bootstrap_room)
+        except Exception:
+            self._release_session()
+            raise
+
+    def _setup_bootstrap_infos(self):
+        super()._setup_bootstrap_infos()
+        # CommonKVReceiver registers only when a route is first cached. A
+        # later room may select another session while reusing that route, so
+        # ensure the selected session is registered as well. Per-route markers
+        # inside _register_kv_args make this idempotent.
+        if self.bootstrap_infos is not None and len(self.kv_mgr.engines) > 1:
+            self._register_kv_args()
 
     def _register_kv_args(self):
         for bootstrap_info in self.bootstrap_infos:
+            if not self.kv_mgr.claim_session_route_registration(
+                bootstrap_info, self.session_id
+            ):
+                continue
             packed_kv_data_ptrs = b"".join(
                 struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.kv_data_ptrs
             )
@@ -2841,29 +3074,35 @@ class MooncakeKVReceiver(CommonKVReceiver):
                 packed_staging_base_ptr = b""
                 staging_total_size_str = b""
 
-            sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
-            with lock:
-                sock.send_multipart(
-                    [
-                        "None".encode("ascii"),
-                        self.kv_mgr.local_ip.encode("ascii"),
-                        str(self.kv_mgr.rank_port).encode("ascii"),
-                        self.session_id.encode("ascii"),
-                        packed_kv_data_ptrs,
-                        packed_aux_data_ptrs,
-                        packed_state_data_ptrs,
-                        dst_tp_rank,
-                        dst_attn_tp_size,
-                        dst_kv_item_len,
-                        packed_state_item_lens,
-                        packed_state_dim_per_tensor,
-                        enable_hisparse,
-                        dst_dcp_size,
-                        dst_dcp_rank,
-                        packed_staging_base_ptr,
-                        staging_total_size_str,
-                    ]
+            try:
+                sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
+                with lock:
+                    sock.send_multipart(
+                        [
+                            "None".encode("ascii"),
+                            self.kv_mgr.local_ip.encode("ascii"),
+                            str(self.kv_mgr.rank_port).encode("ascii"),
+                            self.session_id.encode("ascii"),
+                            packed_kv_data_ptrs,
+                            packed_aux_data_ptrs,
+                            packed_state_data_ptrs,
+                            dst_tp_rank,
+                            dst_attn_tp_size,
+                            dst_kv_item_len,
+                            packed_state_item_lens,
+                            packed_state_dim_per_tensor,
+                            enable_hisparse,
+                            dst_dcp_size,
+                            dst_dcp_rank,
+                            packed_staging_base_ptr,
+                            staging_total_size_str,
+                        ]
+                    )
+            except Exception:
+                self.kv_mgr.unclaim_session_route_registration(
+                    bootstrap_info, self.session_id
                 )
+                raise
 
     def send_metadata(
         self,
@@ -2926,6 +3165,24 @@ class MooncakeKVReceiver(CommonKVReceiver):
                 return timeout_result
 
         return status
+
+    def _release_session(self) -> None:
+        if self._session_released:
+            return
+        self.kv_mgr.release_decode_session(self.bootstrap_room)
+        self._session_released = True
+
+    def clear(self) -> None:
+        try:
+            super().clear()
+        finally:
+            self._release_session()
+
+    def abort(self):
+        try:
+            super().abort()
+        finally:
+            self._release_session()
 
     def failure_exception(self):
         if self.conclude_state is None:
