@@ -1095,10 +1095,13 @@ class SchedulerBatchResultProcessor:
     def _mamba_check_track_boundary(self, req, batch, result, i):
         """Check if this decode step crosses a mamba track interval boundary.
 
-        Returns (at_boundary, track_seqlen).  For non-spec decode, this stays
-        in the live req state domain used by lazy ping-pong cleanup; mixing a
-        per-batch seq_len snapshot with live slot pointers can run the
-        alloc-fail insert/skip gate on the wrong boundary.
+        Returns (at_boundary, track_seqlen).  The boundary condition
+        matches what the forward's tracking mask used:
+        ``prepare_for_decode`` increments both ``seq_lens_cpu`` and
+        ``kv_committed_len`` by 1, then checks
+        ``seq_lens_cpu % interval == 0``.  Using ``kv_committed_len``
+        here reproduces that check exactly, and the value is always a
+        multiple of ``interval`` (hence page-aligned).
 
         For spec decode, the boundary is detected by comparing the
         accepted seq_len range against interval boundaries.
