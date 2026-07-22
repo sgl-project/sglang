@@ -102,9 +102,7 @@ class TestOptionalAiterErrors(CustomTestCase):
             QuarkW4A4MXFP4({}, {})
 
     def test_w4a4_mxfp4_moe_requires_aiter_only_when_selected(self):
-        module = (
-            "sglang.srt.layers.quantization.quark.schemes.quark_w4a4_mxfp4_moe"
-        )
+        module = "sglang.srt.layers.quantization.quark.schemes.quark_w4a4_mxfp4_moe"
         with (
             patch(f"{module}._is_hip", True),
             patch(f"{module}._use_aiter", False),
