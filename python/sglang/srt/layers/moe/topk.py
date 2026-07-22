@@ -2224,5 +2224,5 @@ def select_experts(
 
 # NOTE: the AOT sgl_kernel::moe_fused_gate and sgl_kernel::kimi_k2_moe_fused_gate
 # ops (and their torch.compile fake impls) were retired here — both CUDA gate
-# paths now route through the unified Triton router (jit_kernel/moe_fused_gate.py),
+# paths now route through the unified Triton router (kernels/ops/moe/moe_fused_gate.py),
 # whose Python impl is traceable directly, so no register_fake shim is needed.

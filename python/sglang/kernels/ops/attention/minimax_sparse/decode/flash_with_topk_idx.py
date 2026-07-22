@@ -959,7 +959,7 @@ def flash_decode_with_topk_idx(
         # Single-stage JIT radix-select: one kernel, no intermediate buffers.
         # Equivalent output to the 2-stage path (set of block ids, front-packed,
         # -1 padded); ~2-16x faster for long context. See
-        # sglang/jit_kernel/minimax_decode_topk.py.
+        # sglang/kernels/ops/attention/minimax_decode_topk.py.
         from sglang.kernels.ops.attention.minimax_decode_topk import minimax_decode_topk
 
         minimax_decode_topk(score, seq_lens, block_size, topk, out=topk_idx)

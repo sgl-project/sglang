@@ -26,7 +26,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = (
     Path(os.environ["SGLANG_NVFP4_REPO_ROOT"])
     if os.environ.get("SGLANG_NVFP4_REPO_ROOT")
-    # Anchor on the installed jit_kernel package (python/sglang/jit_kernel) so
+    # Anchor on the installed jit_kernel package (python/sglang/kernels/jit) so
     # this stays correct regardless of where the benchmark file lives.
     else KERNEL_PATH.parents[2]
 )
