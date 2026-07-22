@@ -33,8 +33,8 @@ namespace {
 using DType = bf16_t;
 
 // --- kernel constants -------------------------------------------------------
-constexpr uint32_t kBlockSize = 128;
-constexpr uint32_t kNumWarps = kBlockSize / device::kWarpThreads;  // 4
+constexpr uint32_t kBlockSize = 32;  // one warp per block
+constexpr uint32_t kNumWarps = 1;
 
 constexpr int64_t kHeadDim = 512;
 constexpr int64_t kNopeDim = 448;
@@ -52,9 +52,8 @@ constexpr int64_t kOffRope = kOffScale + kNumGroups + 2;  // 240
 static_assert(kOffRope + kRopeDim * 2 == kBytesPerToken);
 static_assert(kBytesPerToken == 368);
 
-// shared memory layout: [kNopeDim BF16 | kRopeDim BF16] = [896 B | 128 B]
-constexpr int64_t kSmemNopeElems = kNopeDim;
-constexpr int64_t kSmemRopeElems = kRopeDim;
+// shared memory: one K row (noPE + rope)
+constexpr int64_t kSmemBytes = kHeadDim * sizeof(DType);  // 1024
 
 // --- E2M1 LUT ----------------------------------------------------------------
 
@@ -89,29 +88,21 @@ __global__ void mxfp4_decode_kernel(const __grid_constant__ Mxfp4DecodeParams pa
 
   const auto& [q, k_cache, indices, o, sm_scale, page_stride_bytes, page_size] = params;
 
-  const uint32_t warp_id = threadIdx.x / kWarpThreads;
   const uint32_t lane_id = threadIdx.x % kWarpThreads;
   const uint32_t gid = blockIdx.x;
-  (void)warp_id;
 
   PDLWaitPrimary<kUsePDL>();
 
   // -- shared memory: one K row (noPE + rope) --------------------------------
   __shared__ DType s_k[kHeadDim];  // 512 × 2 = 1024 bytes
 
-  // ---- load Q (16 floats per lane, two 8-element aligned vectors) ----------
+  // ---- load Q (16 contiguous values per lane, matching K layout) ----------
   float q_val[16];
   {
     const auto* q_bf16 = static_cast<const bf16_t*>(q) + gid * kHeadDim;
-    using VecQ = AlignedVector<bf16_t, 8>;
-    const auto gmem_q = tile::Memory<VecQ>::warp();
 #pragma unroll
-    for (int k = 0; k < 2; ++k) {
-      VecQ q_vec = gmem_q.load(q_bf16 + k * (kWarpThreads * 8));
-#pragma unroll
-      for (int i = 0; i < 8; ++i)
-        q_val[k * 8 + i] = cast<float>(q_vec[i]);
-    }
+    for (int i = 0; i < 16; ++i)
+      q_val[i] = cast<float>(q_bf16[lane_id * 16 + i]);
   }
 
   // ---- locate K page -------------------------------------------------------
@@ -185,18 +176,9 @@ __global__ void mxfp4_decode_kernel(const __grid_constant__ Mxfp4DecodeParams pa
   const float inv_s = (s > 0.0f) ? (1.0f / s) : 0.0f;
   auto* o_bf16 = static_cast<bf16_t*>(o) + gid * kHeadDim;
 
-  {
-    using VecO = AlignedVector<bf16_t, 8>;
-    const auto gmem_o = tile::Memory<VecO>::warp();
 #pragma unroll
-    for (int k = 0; k < 2; ++k) {
-      VecO o_vec;
-#pragma unroll
-      for (int i = 0; i < 8; ++i)
-        o_vec[i] = cast<bf16_t>(o_val[k * 8 + i] * inv_s);
-      gmem_o.store(o_bf16 + k * (kWarpThreads * 8), o_vec);
-    }
-  }
+  for (int i = 0; i < 16; ++i)
+    o_bf16[lane_id * 16 + i] = cast<bf16_t>(o_val[i] * inv_s);
 
   PDLTriggerSecondary<kUsePDL>();
 }
