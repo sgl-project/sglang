@@ -1419,8 +1419,8 @@ class MoriKVSender(CommonKVSender):
         state_indices: Optional[List] = None,
         token_position_offset: int = 0,
     ):
-        kv_indices, index_slice, is_last_chunk, should_skip = (
-            self._prepare_send_indices(kv_indices, state_indices)
+        kv_indices, index_slice, is_last_chunk, should_skip, _ = (
+            self._prepare_send_indices(kv_indices, state_indices, token_position_offset)
         )
         if should_skip:
             return

@@ -1114,14 +1114,17 @@ class CommonKVSender(BaseKVSender):
         self,
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List] = None,
-    ) -> Tuple[npt.NDArray[np.int32], slice, bool, bool]:
+        token_position_offset: int = 0,
+    ) -> Tuple[npt.NDArray[np.int32], slice, bool, bool, int]:
         """Common pre-processing for send(): index tracking and CP-rank handling.
 
         Returns:
-            (kv_indices, index_slice, is_last_chunk, should_skip)
+            (kv_indices, index_slice, is_last_chunk, should_skip,
+            token_position_offset)
             If should_skip is True, the caller should return immediately.
         """
-        index_slice = slice(self.curr_idx, self.curr_idx + len(kv_indices))
+        chunk_start = self.curr_idx
+        index_slice = slice(chunk_start, chunk_start + len(kv_indices))
         self.curr_idx += len(kv_indices)
         is_last_chunk = self.curr_idx == self.num_kv_indices
 
@@ -1135,14 +1138,35 @@ class CommonKVSender(BaseKVSender):
                 index_slice,
                 total_pages=self.num_kv_indices,
             )
+            # ``token_position_offset`` describes the sequence position before
+            # the unfiltered chunk. CP filtering slices that chunk by
+            # request-local position, so advance the offset by the number of
+            # entries removed from its front. DSV4 uses this offset to select
+            # c4/c128 compression boundaries; keeping the old chunk offset can
+            # address a neighboring compressed slot when the CP split is not
+            # aligned to the compression ratio.
+            assert index_slice.start is not None
+            token_position_offset += index_slice.start - chunk_start
         elif self.kv_mgr.is_dummy_cp_rank:
             if not is_last_chunk:
-                return kv_indices, index_slice, is_last_chunk, True
+                return (
+                    kv_indices,
+                    index_slice,
+                    is_last_chunk,
+                    True,
+                    token_position_offset,
+                )
             else:
                 self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Success)
-                return kv_indices, index_slice, is_last_chunk, True
+                return (
+                    kv_indices,
+                    index_slice,
+                    is_last_chunk,
+                    True,
+                    token_position_offset,
+                )
 
-        return kv_indices, index_slice, is_last_chunk, False
+        return kv_indices, index_slice, is_last_chunk, False, token_position_offset
 
     def send(
         self,
