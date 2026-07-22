@@ -27,7 +27,7 @@ _is_xpu = is_xpu()
 if _is_xpu:
     from sgl_kernel import hadamard_transform
 else:
-    from sglang.jit_kernel.hadamard import hadamard_transform
+    from sglang.kernels.ops.attention.hadamard import hadamard_transform
 
 HEAD_DIM = 128
 FP4_DIM = HEAD_DIM // 2

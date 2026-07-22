@@ -100,7 +100,7 @@ def moe_align_block_size(
 
         use_jit_align = lora_envs.SGLANG_OPT_USE_JIT_KERNEL_MOE_ALIGN.get()
     if use_jit_align:
-        from sglang.jit_kernel.moe_align import (
+        from sglang.kernels.ops.moe.moe_align import (
             moe_align_block_size as jit_moe_align_block_size,
         )
 

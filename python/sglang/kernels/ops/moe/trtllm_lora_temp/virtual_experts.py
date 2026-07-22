@@ -9,9 +9,11 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.jit_kernel.moe_align import moe_align_block_size as jit_moe_align_block_size
 from sglang.kernels.ops.gemm.trtllm_lora_temp.kernel_utils import (
     get_pdl_launch_metadata,
+)
+from sglang.kernels.ops.moe.moe_align import (
+    moe_align_block_size as jit_moe_align_block_size,
 )
 from sglang.srt.lora.trtllm_lora_temp.environ import lora_envs
 

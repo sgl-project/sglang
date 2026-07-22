@@ -125,7 +125,7 @@ if _is_hip:
             "aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device."
         )
 else:
-    from sglang.jit_kernel.flash_attention import (
+    from sglang.kernels.ops.attention.flash_attention import (
         flash_attn_varlen_func,
         flash_attn_with_kvcache,
     )
@@ -1706,7 +1706,7 @@ class DeepseekSparseAttnBackend(
         # Use fused CUDA kernel for all copy operations
         if not _is_hip:
             try:
-                from sglang.jit_kernel.fused_metadata_copy import (
+                from sglang.kernels.ops.attention.fused_metadata_copy import (
                     fused_metadata_copy_cuda,
                 )
 
@@ -2396,7 +2396,7 @@ class DeepseekSparseAttnBackend(
             (``gather_dequant_requant_fp8_paged``) — no intermediate bf16
             materialization.
         """
-        from sglang.jit_kernel.sparse_mla_q8kv8_prefill_sm90 import (
+        from sglang.kernels.ops.attention.sparse_mla_q8kv8_prefill_sm90 import (
             sparse_mla_q8kv8_prefill_fwd,
         )
 
@@ -3165,7 +3165,7 @@ class DeepseekSparseAttnMultiStepBackend:
         # This is 3x faster than calling the single-backend copy 3 times
         if self.speculative_num_steps > 3:
             try:
-                from sglang.jit_kernel.fused_metadata_copy import (
+                from sglang.kernels.ops.attention.fused_metadata_copy import (
                     fused_metadata_copy_multi_cuda,
                 )
 

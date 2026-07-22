@@ -36,7 +36,7 @@ try:
     import cutlass.cute as cute
     from cutlass.cute import Float32
 
-    from sglang.jit_kernel.flash_attn.cute.seqlen_info import SeqlenInfoQK
+    from sglang.kernels.ops.attention.flash_attn.cute.seqlen_info import SeqlenInfoQK
 except Exception as _import_error:
     cute = None
     Float32 = None

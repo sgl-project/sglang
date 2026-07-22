@@ -16,7 +16,7 @@ from sglang.jit_kernel.diffusion.triton.varlen_pack_pad import (
     fused_pack_qkv,
     fused_scatter_to_padded,
 )
-from sglang.jit_kernel.flash_attention import flash_attn_varlen_func
+from sglang.kernels.ops.attention.flash_attention import flash_attn_varlen_func
 from sglang.multimodal_gen.runtime.breakable_cuda_graph.replay_token import (
     get_current_replay_token,
 )

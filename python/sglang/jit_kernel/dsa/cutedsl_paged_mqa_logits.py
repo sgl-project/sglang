@@ -17,7 +17,7 @@ import cutlass.cute as cute
 import torch
 from cutlass.utils import HardwareInfo
 
-from sglang.jit_kernel.cutedsl_fp8_paged_mqa_logits import FP8MQALogitsKernel
+from sglang.kernels.ops.attention.cutedsl_fp8_paged_mqa_logits import FP8MQALogitsKernel
 from sglang.srt.utils import is_sm100_supported
 
 logger = logging.getLogger(__name__)

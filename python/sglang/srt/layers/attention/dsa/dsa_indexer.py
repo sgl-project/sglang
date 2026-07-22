@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 import torch
 from einops import rearrange
 
-from sglang.jit_kernel.fused_store_index_cache import (
+from sglang.kernels.ops.attention.fused_store_index_cache import (
     can_use_dsa_fused_store,
     fused_store_index_k_cache,
 )
@@ -174,7 +174,7 @@ def _uses_dsa_attention_backend(forward_batch: ForwardBatch) -> bool:
 
 if _is_cuda:
     from sglang.jit_kernel.dsv4 import fused_q_indexer_rope_first_quant
-    from sglang.jit_kernel.dsv32 import (
+    from sglang.kernels.ops.quantization.dsv32 import (
         fused_k_indexer_norm_rope,
         fused_k_indexer_norm_rope_store,
     )
@@ -345,7 +345,7 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     elif _is_xpu:
         from sgl_kernel import hadamard_transform
     else:
-        from sglang.jit_kernel.hadamard import hadamard_transform
+        from sglang.kernels.ops.attention.hadamard import hadamard_transform
 
     hidden_size = x.size(-1)
     assert (
