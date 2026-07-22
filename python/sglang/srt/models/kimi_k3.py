@@ -2928,7 +2928,9 @@ class KimiK3ForConditionalGeneration(nn.Module):
             if grid_thw is None:
                 grid_thw = item.model_specific_data["grid_thws"]
             image_grid_thws.append(grid_thw)
-        grid_thws = torch.concat(image_grid_thws, dim=0).to(device)
+        grid_thws_host = torch.concat(image_grid_thws, dim=0)
+        grid_thw_list = grid_thws_host.tolist()
+        grid_thws = grid_thws_host.to(device)
 
         if self.use_data_parallel:
             from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
@@ -2936,8 +2938,9 @@ class KimiK3ForConditionalGeneration(nn.Module):
             image_embeds = run_dp_sharded_mrope_vision_model(
                 self.vision_tower,
                 pixel_values,
-                grid_thws.tolist(),
+                grid_thw_list,
                 rope_type="rope_2d",
+                pass_grid_thw_list=True,
             )
             return self.mm_projector(image_embeds)
 

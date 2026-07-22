@@ -554,6 +554,7 @@ def run_dp_sharded_mrope_vision_model(
     load_local_pixel_values: Optional[Callable[[list[int]], torch.Tensor]] = None,
     pixel_values_device: Optional[torch.device] = None,
     pixel_values_dtype: Optional[torch.dtype] = None,
+    pass_grid_thw_list: bool = False,
 ):
     """Run a vision model with data parallelism (DP) sharding.
     The function will shard the input image tensor on the
@@ -570,6 +571,8 @@ def run_dp_sharded_mrope_vision_model(
                    "rope_2d" for packed 2D rope outputs (e.g., Kimi-VL)
                    "rope_2d_packed" for packed 2D rope outputs that accept
                    ``grid_thws`` positionally (e.g., Kimi-K2.5/K2.7)
+        pass_grid_thw_list: Forward the existing host grid list to the vision
+            model so graph-aware towers do not materialize it from a CUDA tensor.
     Returns:
         torch.Tensor: Output image embeddings
 
@@ -608,11 +611,13 @@ def run_dp_sharded_mrope_vision_model(
             device=pixel_values.device if rope_type == "rope_2d" else None,
         )
         if rope_type == "rope_2d":
-            image_embeds = vision_model(
-                pixel_values,
-                grid_hw=grid_thw,
-                max_seqlen=max(math.prod(grid) for grid in grid_thw_list),
-            )
+            kwargs = {
+                "grid_hw": grid_thw,
+                "max_seqlen": max(math.prod(grid) for grid in grid_thw_list),
+            }
+            if pass_grid_thw_list:
+                kwargs["grid_thw_list"] = grid_thw_list
+            image_embeds = vision_model(pixel_values, **kwargs)
             # MoonViT returns one tensor per image. The multi-GPU path below
             # already concatenates these tensors before returning, so keep the
             # TP=1 DP-encoder path on the same projector-facing contract.
@@ -694,11 +699,15 @@ def run_dp_sharded_mrope_vision_model(
                 local_grid_thw_list, device=pixel_values_local.device
             )
             if rope_type == "rope_2d":
-                image_embeds_local = vision_model(
-                    pixel_values_local,
-                    grid_hw=local_grid_thw,
-                    max_seqlen=max(math.prod(grid) for grid in local_grid_thw_list),
-                )
+                kwargs = {
+                    "grid_hw": local_grid_thw,
+                    "max_seqlen": max(
+                        math.prod(grid) for grid in local_grid_thw_list
+                    ),
+                }
+                if pass_grid_thw_list:
+                    kwargs["grid_thw_list"] = local_grid_thw_list
+                image_embeds_local = vision_model(pixel_values_local, **kwargs)
             else:
                 image_embeds_local = vision_model(pixel_values_local, local_grid_thw)
             if isinstance(image_embeds_local, list):
