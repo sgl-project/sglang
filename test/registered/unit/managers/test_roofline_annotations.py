@@ -1,10 +1,11 @@
 """Unit tests for roofline profiling annotations (#24911) — no server, no model loading.
 
 The roofline aggregates are folded into SGLang's existing per-forward ``step[...]``
-span (see ``sglang.srt.model_executor.step_span_utils.build_step_span_name``): only
-the genuinely-new terms (``sqsq``/``sqsk``/``sk``, plus the context/generation split
-for MIXED) are appended, and ``bs``/``toks`` are left to the base label so nothing is
-duplicated. This also covers the ``roofline_annotations`` plumbing on ``ProfileReq``.
+span (see ``sglang.srt.model_executor.step_span_utils.build_step_span_name``): the
+per-phase ``sq``/``sqsq``/``sqsk``/``sk`` terms (with the context/generation split
+for MIXED) are appended and are self-contained, so ``sq`` is emitted even where it
+duplicates the base label's ``bs``/``toks``. This also covers the
+``roofline_annotations`` plumbing on ``ProfileReq``.
 """
 
 import json
@@ -41,7 +42,15 @@ def _fb(
     seq_lens_cpu=None,
     extend_seq_lens_cpu=None,
     extend_prefix_lens_cpu=None,
+    num_tokens_per_req=None,
 ):
+    # A spec input (EAGLE/MTP) only needs to expose ``num_tokens_per_req`` for
+    # the roofline suffix; None -> no spec_info (vanilla decode, N_Q == 1).
+    spec_info = (
+        None
+        if num_tokens_per_req is None
+        else SimpleNamespace(num_tokens_per_req=num_tokens_per_req)
+    )
     return SimpleNamespace(
         forward_mode=forward_mode,
         batch_size=batch_size,
@@ -49,6 +58,7 @@ def _fb(
         seq_lens_cpu=None if seq_lens_cpu is None else _CpuMirror(seq_lens_cpu),
         extend_seq_lens_cpu=extend_seq_lens_cpu,
         extend_prefix_lens_cpu=extend_prefix_lens_cpu,
+        spec_info=spec_info,
     )
 
 
@@ -60,7 +70,9 @@ class TestStepSpanRoofline(CustomTestCase):
         # Two decode reqs: each nq=1, nkv=seqlen.
         # sk=30, sqsq=1+1=2, sqsk=1*10+1*20=30.
         fb = _fb(ForwardMode.DECODE, batch_size=2, seq_lens_cpu=[10, 20])
-        self.assertEqual(self._name(fb), "step[DECODE bs=2 g_sqsq=2 g_sqsk=30 g_sk=30]")
+        self.assertEqual(
+            self._name(fb), "step[DECODE bs=2 g_sq=2 g_sqsq=2 g_sqsk=30 g_sk=30]"
+        )
 
     def test_pure_prefill_batch(self):
         # req a: nq=8, nkv=10 -> sqsq=64, sqsk=80
@@ -74,7 +86,8 @@ class TestStepSpanRoofline(CustomTestCase):
             extend_prefix_lens_cpu=[2, 6],
         )
         self.assertEqual(
-            self._name(fb), "step[EXTEND bs=2 toks=12 c_sqsq=80 c_sqsk=120 c_sk=20]"
+            self._name(fb),
+            "step[EXTEND bs=2 toks=12 c_sq=12 c_sqsq=80 c_sqsk=120 c_sk=20]",
         )
 
     def test_mixed_batch_splits_context_and_generation(self):
@@ -105,6 +118,47 @@ class TestStepSpanRoofline(CustomTestCase):
             "c_sq=3 c_sk=3 c_sqsq=9 c_sqsk=9 "
             "g_sq=0 g_sk=0 g_sqsq=0 g_sqsk=0]",
         )
+
+    def test_spec_draft_decode_uses_num_tokens_per_req(self):
+        # EAGLE draft-decode: N_Q per req = topk (num_tokens_per_req), not 1.
+        # topk=4, seqs=[10,20]: sq=4*2=8, sk=30, sqsq=16+16=32,
+        # sqsk=4*10+4*20=120. g_sq is emitted because it != bs.
+        fb = _fb(
+            ForwardMode.DECODE,
+            batch_size=2,
+            seq_lens_cpu=[10, 20],
+            num_tokens_per_req=4,
+        )
+        self.assertEqual(
+            self._name(fb),
+            "step[DECODE bs=2 g_sq=8 g_sqsq=32 g_sqsk=120 g_sk=30]",
+        )
+
+    def test_target_verify_uses_draft_token_width(self):
+        # MTP/EAGLE target-verify: N_Q per req = num_draft_tokens. Its query
+        # tokens are causally/tree masked (prefill-like), so it is emitted under
+        # the context (``c_``) group to receive the sqsq causal correction.
+        # ndt=3, seqs=[10,20]: sq=3*2=6, sk=30, sqsq=9+9=18,
+        # sqsk=3*10+3*20=90.
+        fb = _fb(
+            ForwardMode.TARGET_VERIFY,
+            batch_size=2,
+            seq_lens_cpu=[10, 20],
+            num_tokens_per_req=3,
+        )
+        self.assertEqual(
+            self._name(fb),
+            "step[TARGET_VERIFY bs=2 c_sq=6 c_sqsq=18 c_sqsk=90 c_sk=30]",
+        )
+
+    def test_target_verify_without_cpu_mirror_falls_back_to_base(self):
+        fb = _fb(
+            ForwardMode.TARGET_VERIFY,
+            batch_size=2,
+            seq_lens_cpu=None,
+            num_tokens_per_req=3,
+        )
+        self.assertEqual(self._name(fb), "step[TARGET_VERIFY bs=2]")
 
     def test_missing_cpu_mirror_falls_back_to_base(self):
         # No seq_lens_cpu (some overlap paths) -> emit the base label unchanged.

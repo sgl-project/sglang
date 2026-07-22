@@ -227,18 +227,25 @@ curl -X POST http://127.0.0.1:30000/start_profile
 
 Set `roofline_annotations` to `true` to fold per-iteration roofline aggregates into SGLang's existing per-forward `step[...]` span. For every execution step that runs while profiling is active, SGLang augments that step's marker on the GPU stream with the request and KV-length distribution of the step, so you can reconstruct roofline-style compute and memory bounds directly from the trace without per-request details.
 
-Only the genuinely-new quantities are appended: the base `step[...]` label already carries `bs` (batch size) and, for prefill, `toks`, so those are not duplicated. The added fields are prefixed by phase — `c_` for context (prefill) and `g_` for generation (decode):
+All four per-request aggregates are appended, prefixed by phase — `c_` for context (prefill) and `g_` for generation (decode). The per-phase `sq` is always emitted so each `step[...]` label is self-contained for roofline analysis, even where it duplicates the base label's `bs` (decode) or `toks` (prefill):
 
+- `sq`: total query tokens (`Σ N_Q`)
 - `sqsq`: sum of squared query tokens per request (`Σ N_Q²`)
 - `sqsk`: sum of query·KV tokens per request (`Σ N_Q·N_KV`)
 - `sk`: total KV tokens (`Σ N_KV`)
 
-A pure prefill (`EXTEND`) or decode (`DECODE`) forward emits a single group; a mixed forward emits both, with `c=`/`g=` request counts and per-phase `c_sq`/`g_sq` query-token totals. Example labels:
+A pure prefill (`EXTEND`) or decode (`DECODE`) forward emits a single group; a mixed forward emits both, with `c=`/`g=` request counts. Example labels:
 
 ```text
-step[EXTEND bs=1 toks=1025 c_sqsq=1050625 c_sqsk=1050625 c_sk=1025]
-step[DECODE bs=64 g_sqsq=64 g_sqsk=100032 g_sk=100032]
+step[EXTEND bs=1 toks=1025 c_sq=1025 c_sqsq=1050625 c_sqsk=1050625 c_sk=1025]
+step[DECODE bs=64 g_sq=64 g_sqsq=64 g_sqsk=100032 g_sk=100032]
 step[MIXED bs=66 c=2 g=64 c_sq=2048 c_sk=2048 c_sqsq=2097152 c_sqsk=2097152 g_sq=64 g_sk=65600 g_sqsq=64 g_sqsk=65600]
+```
+
+With speculative decoding (EAGLE/MTP) each request contributes multiple query tokens per step, so `sq` no longer equals `bs`. Draft-decode steps stay in the generation group (`g_sq = bs × num_tokens_per_req`); target-verify steps (`TARGET_VERIFY`) are emitted in the **context** group, because their query tokens are causally/tree masked against each other like a prefill — this keeps the `sqsq` causal correction in the roofline model. For example, a verify step with 3 draft tokens across 2 requests (`seq_lens=[10, 20]`):
+
+```text
+step[TARGET_VERIFY bs=2 c_sq=6 c_sqsq=18 c_sqsk=90 c_sk=30]
 ```
 
 ```bash Command

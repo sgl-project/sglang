@@ -38,13 +38,39 @@ def _agg(nqs: List[int], nkvs: List[int]) -> Tuple[int, int, int, int]:
     return sq, sk, sqsq, sqsk
 
 
+def _decode_query_width(forward_batch: ForwardBatch) -> int:
+    """Per-request query-token count (N_Q) for a decode-family forward.
+
+    Vanilla decode emits one token per request, but speculative decoding does
+    not: EAGLE/MTP draft-decode and target-verify process a uniform
+    ``num_tokens_per_req`` tokens per request (draft top-k for draft-decode,
+    the draft-token count for verify), so N_Q per request is that width, and
+    the step's total Σ N_Q is ``bs * num_tokens_per_req`` rather than ``bs``.
+
+    The width is read from ``forward_batch.spec_info.num_tokens_per_req`` and
+    falls back to 1 when there is no spec input or the width is unset (-1).
+    """
+    spec = getattr(forward_batch, "spec_info", None)
+    width = getattr(spec, "num_tokens_per_req", -1) if spec is not None else -1
+    return width if isinstance(width, int) and width > 0 else 1
+
+
 def build_roofline_suffix(forward_batch: ForwardBatch) -> str:
     """Compute the roofline aggregates from the batch's CPU-side length mirrors.
 
-    Only the terms SGLang's base ``step[...]`` label does *not* already carry
-    are emitted, always prefixed by phase: ``c_`` for context (EXTEND) and
-    ``g_`` for generation (DECODE), with MIXED emitting both groups. ``bs`` and
-    ``toks`` are intentionally left to the base label to avoid duplication.
+    All roofline aggregates are emitted, always prefixed by phase: ``c_`` for
+    context (EXTEND, TARGET_VERIFY) and ``g_`` for generation (DECODE), with
+    MIXED emitting both groups. The per-phase ``sq`` (Σ N_Q) is always emitted
+    so the suffix is self-contained, even where it duplicates the base label's
+    ``bs`` (vanilla decode) or ``toks`` (pure extend).
+
+    Speculative decoding (EAGLE/MTP) breaks the vanilla ``N_Q == 1`` decode
+    assumption: draft-decode and target-verify process ``num_tokens_per_req``
+    query tokens per request (see :func:`_decode_query_width`). Target-verify
+    is classified as context (``c_``) because those query tokens are
+    causally/tree masked against each other (prefill-like), so its ``sqsq``
+    causal correction is applied by the roofline model; spec draft-decode
+    stays generation (``g_``) with ``g_sq = bs * num_tokens_per_req``.
 
     Returns an empty string when the required host mirrors are unavailable
     (e.g. some overlap-schedule paths drop ``seq_lens_cpu``), so the base label
@@ -53,14 +79,26 @@ def build_roofline_suffix(forward_batch: ForwardBatch) -> str:
     mode = forward_batch.forward_mode
     seq_lens_cpu = forward_batch.seq_lens_cpu
 
-    if mode == ForwardMode.DECODE:
+    # DECODE (vanilla or spec draft-decode) and TARGET_VERIFY both key off
+    # ``seq_lens_cpu`` for N_KV and a uniform per-request query width N_Q, and
+    # differ only in phase:
+    #   * DECODE        -> generation (``g_``); N_Q is 1 (vanilla) or the spec
+    #                      draft-decode width.
+    #   * TARGET_VERIFY -> context (``c_``); its ``num_tokens_per_req`` query
+    #                      tokens are causally/tree masked against each other,
+    #                      so it is prefill-like and its ``sqsq`` causal
+    #                      correction must be applied by the roofline model.
+    if mode == ForwardMode.DECODE or mode == ForwardMode.TARGET_VERIFY:
         if seq_lens_cpu is None:
             return ""
+        nq = _decode_query_width(forward_batch)
         nkvs = [int(x) for x in seq_lens_cpu.tolist()]
-        nqs = [1] * len(nkvs)
-        _, sk, sqsq, sqsk = _agg(nqs, nkvs)
-        # Pure generation phase -> ``g_`` prefix, matching the MIXED split.
-        return f"g_sqsq={sqsq} g_sqsk={sqsk} g_sk={sk}"
+        nqs = [nq] * len(nkvs)
+        sq, sk, sqsq, sqsk = _agg(nqs, nkvs)
+        # ``sq`` is always emitted (self-contained suffix): for DECODE it equals
+        # ``bs`` (vanilla) or ``bs * num_tokens_per_req`` (spec draft-decode).
+        p = "c" if mode == ForwardMode.TARGET_VERIFY else "g"
+        return f"{p}_sq={sq} {p}_sqsq={sqsq} {p}_sqsk={sqsk} {p}_sk={sk}"
 
     ext_seq = forward_batch.extend_seq_lens_cpu
     ext_prefix = forward_batch.extend_prefix_lens_cpu
@@ -70,9 +108,11 @@ def build_roofline_suffix(forward_batch: ForwardBatch) -> str:
     if mode == ForwardMode.EXTEND:
         nqs = [int(q) for q in ext_seq]
         nkvs = [int(p) + int(q) for p, q in zip(ext_prefix, ext_seq)]
-        _, sk, sqsq, sqsk = _agg(nqs, nkvs)
+        sq, sk, sqsq, sqsk = _agg(nqs, nkvs)
         # Pure context phase -> ``c_`` prefix, matching the MIXED split.
-        return f"c_sqsq={sqsq} c_sqsk={sqsk} c_sk={sk}"
+        # ``c_sq`` is always emitted (self-contained suffix), even though it
+        # equals the base label's ``toks`` for a pure EXTEND.
+        return f"c_sq={sq} c_sqsq={sqsq} c_sqsk={sqsk} c_sk={sk}"
 
     if mode == ForwardMode.MIXED:
         # A running-decode request appears as a length-1 extend; everything

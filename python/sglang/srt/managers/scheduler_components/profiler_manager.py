@@ -52,7 +52,8 @@ class SchedulerProfilerManager:
     dp_tp_cpu_group: Any
     get_forward_ct: Callable[[], int]
     # Toggles model_runner.roofline_annotations so the step span folds in the
-    # sqsq/sqsk/sk aggregates while a roofline-annotated profile is active.
+    # per-phase sq/sqsq/sqsk/sk aggregates (context ``c_`` / generation ``g_``)
+    # while a roofline-annotated profile is active.
     set_roofline_annotations: Optional[Callable[[bool], None]] = None
 
     def __post_init__(self) -> None:

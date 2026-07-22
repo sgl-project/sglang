@@ -284,7 +284,8 @@ class ModelRunner:
         self.enable_elastic_ep = server_args.elastic_ep_backend is not None
         self.forward_pass_id = 0
         # Toggled by the scheduler's profiler manager while a roofline-annotated
-        # profile is active; folds sqsq/sqsk/sk aggregates into the step span.
+        # profile is active; folds the per-phase sq/sqsq/sqsk/sk aggregates
+        # (context ``c_`` / generation ``g_``) into the step span.
         self.roofline_annotations = False
         self._pending_elastic_scale_update = None
         self.init_new_workspace = False
