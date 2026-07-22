@@ -14,6 +14,7 @@
 """The baseclass of a backend for grammar-guided constrained decoding."""
 
 import logging
+import os
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -21,6 +22,7 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import ServerArgs
 
@@ -40,7 +42,6 @@ class GrammarStats:
 
 
 class BaseGrammarObject:
-
     def __init__(self):
         self._finished = False
         self.grammar_stats = None
@@ -128,11 +129,36 @@ class InvalidGrammarObject(BaseGrammarObject):
         return f"InvalidGrammarObject(error_message={self.error_message!r})"
 
 
+def get_grammar_compile_max_workers(cpu_count: Optional[int] = None) -> int:
+    """Number of workers for the grammar-compilation thread pool.
+
+    Grammar compilation is CPU-bound and runs inside the scheduler process,
+    so the pool is capped at 8 workers instead of using the
+    ThreadPoolExecutor default of min(32, cpu_count + 4): os.cpu_count() is
+    not cgroup-aware, so inside a container with a CFS quota (e.g. a
+    Kubernetes pod with a low cpu limit scheduled on a many-core host) a
+    large pool oversubscribes the quota, triggers CFS throttling, and stalls
+    the scheduler's decode loop. Each compile can additionally spawn the
+    grammar backend's internal threads (xgrammar defaults to max_threads=8
+    per compile), multiplying the oversubscription.
+
+    Set SGLANG_GRAMMAR_COMPILE_MAX_WORKERS to a positive value to override.
+    """
+    override = envs.SGLANG_GRAMMAR_COMPILE_MAX_WORKERS.get()
+    if override > 0:
+        return override
+    if cpu_count is None:
+        cpu_count = os.cpu_count() or 1
+    return max(1, min(cpu_count // 2, 8))
+
+
 class BaseGrammarBackend:
     _enable_strict_thinking: bool = False
 
     def __init__(self):
-        self.executor = ThreadPoolExecutor()
+        self.executor = ThreadPoolExecutor(
+            max_workers=get_grammar_compile_max_workers()
+        )
         self.cache: Dict[Tuple[str, str], BaseGrammarObject] = {}
 
     def _not_supported(self, key_type: str, key_string: str) -> BaseGrammarObject:
