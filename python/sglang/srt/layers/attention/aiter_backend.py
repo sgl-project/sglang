@@ -2350,7 +2350,7 @@ class AiterAttnBackend(AttentionBackend):
                 q_c = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
                 k_c = k.contiguous().view(-1, layer.tp_k_head_num, layer.head_dim)
                 v_c = v.contiguous().view(-1, layer.tp_v_head_num, layer.v_head_dim)
-                if self.kv_cache_dtype == fp8_dtype:
+                if self.kv_cache_dtype == fp8_dtype and is_gfx95_supported():
                     fp8_q_descale = (
                         layer.k_scale if layer.k_scale is not None else self.k_scale
                     )
