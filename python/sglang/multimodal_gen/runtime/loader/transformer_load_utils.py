@@ -6,6 +6,7 @@ such as Nunchaku validation, NVFP4 fallback adjustments, and post-load patching
 are handled here behind a small helper/adapter layer.
 """
 
+import inspect
 import json
 import os
 import re
@@ -599,9 +600,17 @@ def _resolve_quant_config(
         # Online-quant convention: for `fp8` and `mxfp4`, a no-arg
         # QuantizationConfig() selects the post-load path -- weights load
         # in source dtype and are quantized in
-        # process_weights_after_loading.
+        # process_weights_after_loading. Forward --quantization-ignored-layers
+        # only to configs whose constructor accepts it.
         quant_cls = get_quantization_config(server_args.quantization)
-        return quant_cls()
+        quant_kwargs = {}
+        ignored_layers = server_args.quantization_ignored_layers
+        if (
+            ignored_layers
+            and "ignored_layers" in inspect.signature(quant_cls).parameters
+        ):
+            quant_kwargs["ignored_layers"] = list(ignored_layers)
+        return quant_cls(**quant_kwargs)
 
     quant_config = get_quant_config(hf_config, component_model_path)
     if quant_config is None and server_args.transformer_weights_path:
