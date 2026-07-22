@@ -261,19 +261,17 @@ def mamba_extra_buffer_of(cfg: Any) -> bool:
 
 def declare_load_time_override(source: str, declared: Dict[str, Any]) -> None:
     """Declare a load-time resolved field (model-file config overrides,
-    weight-resolved dtypes) on the published ``server_args``: resolution has
-    already materialized, so the declaration writes through, joining the
-    declaration stash for provenance and republish consistency."""
+    weight-resolved dtypes) after publish. it is written to the config
+    bags via ``get_context().override`` (namespace readers see it); server_args
+    stays the pristine startup record. Validated against the resolvable
+    whitelist first."""
     from sglang.srt.runtime_context import get_context
 
-    server_args = get_context().server_args
-    validate_declarations(server_args, [(source, dict(declared))])
-    override = getattr(server_args, "override", None)
-    if override is not None:
-        override(source, **declared)
-    else:
-        # Config-shaped fixtures without the mutation entry point.
-        _apply_fields(server_args, declared)
+    context = get_context()
+    validate_declarations(context.server_args, [(source, dict(declared))])
+    # write the config bags (namespace readers see it); server_args
+    # stays the pristine startup record.
+    context.override(source, **declared)
 
 
 def collect_model_override_declarations(
@@ -821,6 +819,57 @@ def _deepseek_v4_overrides(server_args: Any, hf_config: Any) -> dict:
             "Use flashinfer_trtllm_routed as MoE runner backend for "
             f"{model_arch} hybrid FP8+NVFP4 checkpoint."
         )
+    return overrides
+
+
+@_register_for(
+    "InklingForConditionalGeneration",
+    "InklingForConditionalGenerationMTP",
+)
+def _inkling_overrides(server_args: Any, hf_config: Any) -> dict:
+    """Inkling architecture defaults: SWA / mamba KV-pool ratios tuned for the
+    hybrid-SWA layout, the extra-buffer mamba strategy, and the unified radix
+    tree (which Inkling requires — models/inkling.py asserts it). The full-graph
+    prefill default is set separately (inline, before cuda-graph resolution) —
+    see ServerArgs.__post_init__ / _apply_inkling_prefill_cuda_graph_default. The
+    server-arg defaults each yield to an explicit user value (compared against
+    the ServerArgs class default); the prefill declaration is materialized
+    before _parse_cuda_graph_config folds cuda_graph_backend_prefill into
+    prefill.backend, and an explicit --cuda-graph-backend-prefill /
+    --disable-prefill-cuda-graph still wins. The unified-radix env write follows
+    the MiniMax-M3 handler precedent (env is not a resolvable server-arg)."""
+    from sglang.srt.server_args import ServerArgs
+
+    overrides: Dict[str, Any] = {}
+    # NOTE: the full-graph prefill default is NOT set here. cuda-graph config is
+    # resolved in __post_init__ before declarations are materialized, so a
+    # cuda_graph_backend_prefill declared here lands too late (the breakable
+    # default would already have been auto-disabled for this multimodal arch).
+    # It is set inline before _handle_cuda_graph_config instead.
+    if server_args.swa_full_tokens_ratio == ServerArgs.swa_full_tokens_ratio:
+        overrides["swa_full_tokens_ratio"] = 0.1
+    if server_args.mamba_full_memory_ratio == ServerArgs.mamba_full_memory_ratio:
+        overrides["mamba_full_memory_ratio"] = 0.1
+    # Inkling requires the extra-buffer mamba strategy (inkling.py asserts
+    # enable_mamba_extra_buffer()); the generic "auto" resolution does not cover
+    # Inkling, so pin it here. Yields to an explicit --mamba-scheduler-strategy.
+    if server_args.mamba_radix_cache_strategy == ServerArgs.mamba_radix_cache_strategy:
+        overrides["mamba_radix_cache_strategy"] = "extra_buffer"
+    # Inkling attention runs only on the fa4 (Blackwell) or triton backends --
+    # models/inkling_common/attn.py asserts attention_backend in {fa4, triton}.
+    # The generic resolver would otherwise pick trtllm_mha (SM100) / fa3
+    # (Hopper), so a bare launch fails on the first attention forward. Pin a
+    # supported default when the user left every attention-backend flag unset
+    # (mirrors the MiniMax-M3 SM100 fa4-default above); an explicit
+    # --attention-backend / --prefill/decode-attention-backend still wins.
+    if server_args.is_attention_backend_not_set():
+        inkling_attn_backend = "fa4" if is_sm100_supported() else "triton"
+        overrides["attention_backend"] = inkling_attn_backend
+        logger.info(
+            f"Use {inkling_attn_backend} as the attention backend for Inkling "
+            "(requires fa4 or triton)."
+        )
+    envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.set(True)
     return overrides
 
 

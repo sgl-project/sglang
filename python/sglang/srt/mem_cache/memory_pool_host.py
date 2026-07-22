@@ -13,13 +13,13 @@ import numpy as np
 import psutil
 import torch
 
-from sglang.jit_kernel.hicache import (
+from sglang.kernels.ops.kvcache.hicache import (
     can_use_write_back_jit_kernel,
 )
-from sglang.jit_kernel.hicache import (
+from sglang.kernels.ops.kvcache.hicache import (
     transfer_hicache_all_layer_mla_staged_lf_pf as jit_transfer_hicache_all_layer_mla_staged_lf_pf,
 )
-from sglang.jit_kernel.hisparse import transfer_cache_dsv4_mla
+from sglang.kernels.ops.kvcache.hisparse import transfer_cache_dsv4_mla
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, MambaPool
 from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
 
@@ -39,7 +39,7 @@ if _is_cuda or _is_hip:
         transfer_kv_per_layer_mla_pf_lf,
     )
 if _is_cuda:
-    from sglang.jit_kernel.transfer_mamba import (
+    from sglang.kernels.ops.mamba.transfer_mamba import (
         transfer_kv_mamba_lf_pf,
         transfer_kv_mamba_pf_lf,
     )
@@ -160,7 +160,20 @@ class MambaPoolHost(HostKVCache):
         self.clear()
 
     def init_kv_buffer(self):
-        alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
+        _host_alloc = ALLOC_MEMORY_FUNCS[self.device_pool.device]
+
+        def alloc_func(dims, *, dtype, device, pin_memory, allocator):
+            # conv-only linear attention has no ssm state: mmap can't map the
+            # 0-element temporal buffer, so hand back a plain empty tensor.
+            if np.prod(dims) == 0:
+                return torch.empty(dims, dtype=dtype, device=device)
+            return _host_alloc(
+                dims,
+                dtype=dtype,
+                device=device,
+                pin_memory=pin_memory,
+                allocator=allocator,
+            )
 
         if self.layout in ["page_first", "page_first_direct"]:
             # page-first: (page_num, num_layers, 1, *shape) — per-page data is contiguous
@@ -421,15 +434,17 @@ class MambaPoolHost(HostKVCache):
         io_backend="kernel",
     ):
         if self.layout in ["page_first", "page_first_direct"]:
-            self._copy_tensor_pf_lf(
-                src=self.temporal_buffer,
-                dst=device_pool.mamba_cache.temporal[layer_id],
-                src_indices=host_indices,
-                dst_indices=device_indices,
-                layer_id=layer_id,
-                num_layers=self.num_mamba_layers,
-                io_backend=io_backend,
-            )
+            # no ssm state on conv-only models: nothing to transfer
+            if self.temporal_state_elem_size > 0:
+                self._copy_tensor_pf_lf(
+                    src=self.temporal_buffer,
+                    dst=device_pool.mamba_cache.temporal[layer_id],
+                    src_indices=host_indices,
+                    dst_indices=device_indices,
+                    layer_id=layer_id,
+                    num_layers=self.num_mamba_layers,
+                    io_backend=io_backend,
+                )
             for conv_idx in range(len(self.conv_state_shapes)):
                 self._copy_tensor_pf_lf(
                     src=self.conv_buffer[conv_idx],
@@ -461,17 +476,19 @@ class MambaPoolHost(HostKVCache):
         self, device_pool, host_indices, device_indices, io_backend="kernel"
     ):
         if self.layout in ["page_first", "page_first_direct"]:
-            self._copy_tensor_all_layers_lf_pf(
-                src_layers=device_pool.mamba_cache.temporal,
-                dst=self.temporal_buffer,
-                src_indices=device_indices,
-                dst_indices=host_indices,
-                num_layers=self.num_mamba_layers,
-                io_backend=io_backend,
-                staging=self.temporal_staging_buffer,
-                can_use_jit=self._temporal_can_use_jit,
-                src_ptrs=self.temporal_device_ptrs,
-            )
+            # no ssm state on conv-only models: a 0-size batched memcpy errors
+            if self.temporal_state_elem_size > 0:
+                self._copy_tensor_all_layers_lf_pf(
+                    src_layers=device_pool.mamba_cache.temporal,
+                    dst=self.temporal_buffer,
+                    src_indices=device_indices,
+                    dst_indices=host_indices,
+                    num_layers=self.num_mamba_layers,
+                    io_backend=io_backend,
+                    staging=self.temporal_staging_buffer,
+                    can_use_jit=self._temporal_can_use_jit,
+                    src_ptrs=self.temporal_device_ptrs,
+                )
             for conv_idx in range(len(self.conv_state_shapes)):
                 self._copy_tensor_all_layers_lf_pf(
                     src_layers=device_pool.mamba_cache.conv[conv_idx],
@@ -569,17 +586,20 @@ class MambaPoolHost(HostKVCache):
         ]
 
         for i in range(0, len(indices), self.page_size):
-            # Emit component pointers in stable order:
-            # temporal first, then conv_0..conv_n for this page.
-            temporal_ptr = (
-                temporal_base_ptr
-                + indices[i]
-                * self.num_mamba_layers
-                * self.temporal_state_elem_size
-                * self.temporal_dtype.itemsize
-            )
-            ptr_list.append(temporal_ptr)
-            element_size_list.append(temporal_element_size)
+            # Emit component pointers in stable order: temporal first (dropped
+            # for conv-only models with no ssm state), then conv_0..conv_n.
+            # _get_hybrid_page_component_keys drops the temporal key under the
+            # same condition, keeping keys and buffers aligned.
+            if self.temporal_state_elem_size > 0:
+                temporal_ptr = (
+                    temporal_base_ptr
+                    + indices[i]
+                    * self.num_mamba_layers
+                    * self.temporal_state_elem_size
+                    * self.temporal_dtype.itemsize
+                )
+                ptr_list.append(temporal_ptr)
+                element_size_list.append(temporal_element_size)
             for j in range(len(self.conv_buffer)):
                 conv_ptr = (
                     conv_base_ptrs[j]

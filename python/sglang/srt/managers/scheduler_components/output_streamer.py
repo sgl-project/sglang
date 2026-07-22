@@ -2,12 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import (
-    Any,
-    Callable,
-    List,
-    Optional,
-)
+from typing import Any, Callable, List, Optional
 
 import torch
 import zmq
@@ -21,11 +16,9 @@ from sglang.srt.managers.io_struct import (
     CachedTokensDetails,
     wrap_as_pickle,
 )
-from sglang.srt.managers.schedule_batch import (
-    BaseFinishReason,
-    Req,
-)
+from sglang.srt.managers.schedule_batch import BaseFinishReason, Req
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+from sglang.srt.runtime_context import get_observability, get_serving
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
@@ -144,7 +137,7 @@ class SchedulerOutputStreamer:
             return_sampling_mask=return_sampling_mask,
             spec_algorithm=self.spec_algorithm,
             disaggregation_mode=self.disaggregation_mode,
-            default_stream_interval=self.server_args.stream_interval,
+            default_stream_interval=get_serving().stream_interval,
             default_force_stream_interval=DEFAULT_FORCE_STREAM_INTERVAL,
             get_cached_tokens_details=self.get_cached_tokens_details,
         )
@@ -171,7 +164,7 @@ class SchedulerOutputStreamer:
         if (
             req.finished()
             and self.ps.attn_tp_rank == 0
-            and self.server_args.enable_request_time_stats_logging
+            and get_observability().enable_request_time_stats_logging
         ):
             req.log_time_stats()
 
