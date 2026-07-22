@@ -307,7 +307,7 @@ FP4_GEMM_RUNNER_BACKEND_CHOICES = [
     "marlin",
 ]
 
-BF16_GEMM_BACKEND_CHOICES = ["auto", "cutedsl"]
+BF16_GEMM_BACKEND_CHOICES = ["auto", "cutedsl", "torch"]
 
 RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru", "priority"]
 RETRACTION_POLICY_CHOICES = ["length", "priority"]
@@ -1663,7 +1663,7 @@ class ServerArgs:
     bf16_gemm_backend: A[
         str,
         Arg(
-            help="Choose the backend for unquantized BF16 GEMM operations. Options: 'auto' (default; uses cuBLAS via torch.nn.functional.linear), 'cutedsl' (SGLang JIT CuTe DSL TGV BF16 GEMM on SM10X; dispatches between the CuTe DSL kernel and cuBLAS).",
+            help="Choose the backend for unquantized BF16 GEMM operations. Options: 'auto' (default; selects 'cutedsl' on SM100/SM103 (Blackwell), otherwise uses cuBLAS via torch.nn.functional.linear), 'cutedsl' (SGLang JIT CuTe DSL TGV BF16 GEMM on SM10X; dispatches between the CuTe DSL kernel and cuBLAS), 'torch' (always uses cuBLAS via torch.nn.functional.linear, even on SM100/SM103).",
             cli_name="--bf16-gemm-backend",
             choices=BF16_GEMM_BACKEND_CHOICES,
         ),
@@ -5250,6 +5250,19 @@ class ServerArgs:
         if view.page_size is not None:
             assert view.mamba_track_interval % view.page_size == 0
             assert self.mamba_cache_chunk_size is not None
+
+            if (
+                view.chunked_prefill_size is not None
+                and 0 < view.chunked_prefill_size < self.mamba_cache_chunk_size
+            ):
+                logger.warning(
+                    "Mamba radix extra-buffer is enabled with chunked_prefill_size=%s "
+                    "smaller than mamba_cache_chunk_size=%s. This can make "
+                    "mamba_track_mask false for unfinished chunked-prefill handoff "
+                    "and skip Mamba state checkpoints.",
+                    view.chunked_prefill_size,
+                    self.mamba_cache_chunk_size,
+                )
 
     def _handle_mamba_radix_cache(self, model_arch: str):
         # Resolution moved to the resolution pipeline (arg_groups/overrides.py:
