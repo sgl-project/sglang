@@ -229,6 +229,7 @@ class Envs:
     SGLANG_DISABLED_MODEL_ARCHS = EnvTuple(tuple())
     SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
     SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION = EnvBool(False)
+    SGLANG_ENABLE_WEIGHT_LOADER_V2 = EnvBool(False)
 
     # HTTP server
     # Decompress request bodies tagged with `x-body-compressed`.
@@ -1058,9 +1059,6 @@ class Envs:
     SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK = EnvBool(False)
     SGLANG_OPT_USE_TOPK_V2 = EnvBool(True)
 
-    # Reroutes the generic fp8 per-token-group quant (every model, not just MiniMax)
-    # to the V1 JIT kernel. Off by default; V1 is byte-identical to V2.
-    SGLANG_OPT_USE_JIT_PER_TOKEN_GROUP_QUANT = EnvBool(False)
     SGLANG_OPT_USE_BF16_ROUTER_GEMM = EnvBool(True)
     SGLANG_OPT_USE_MINIMAX_DENSE_SPARSE_DECODE = EnvBool(False)
     SGLANG_DISABLE_MSA = EnvBool(False)
@@ -1125,6 +1123,8 @@ class Envs:
     # EncoderBootstrapServer health-check tuning.  Interval == 0 disables it.
     SGLANG_ENCODER_BOOTSTRAP_HEALTH_CHECK_INTERVAL = EnvFloat(10.0)
     SGLANG_ENCODER_BOOTSTRAP_HEALTH_CHECK_TIMEOUT = EnvFloat(2.0)
+    # Seconds before permanently dropping an unhealthy encoder (0 = keep probing).
+    SGLANG_ENCODER_BOOTSTRAP_EVICTED_TTL = EnvFloat(600.0)
     # Persistent receiver-side GPU embedding pool size for mooncake EPD transport.
     # 0 disables (per-request register/deregister). 4096 = 4GB default per TP
     SGLANG_EMBEDDING_POOL_SIZE_MB = EnvInt(4096)
@@ -1195,6 +1195,9 @@ def _convert_SGL_to_SGLANG():
         "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK",
     )
     _print_deprecated_env("SGLANG_PER_TOKEN_GROUP_QUANT_8BIT_V2")
+    # Superseded by the unified JIT per_token_group_quant, the default CUDA path.
+    _print_deprecated_env("SGLANG_OPT_USE_JIT_PER_TOKEN_GROUP_QUANT")
+    _print_deprecated_env("SGLANG_MASKED_GEMM_FAST_ACT")
     _print_deprecated_env("SGLANG_OPT_SWA_EVICT_DROP_PAGE_MARGIN")
     # sconv-family kernels always use the CUDA-JIT ports when supported; no toggle.
     _print_deprecated_env("SGLANG_OPT_USE_CUDA_SCONV")
