@@ -21,11 +21,7 @@ from grpc_health.v1 import health_pb2, health_pb2_grpc
 from grpc_reflection.v1alpha import reflection
 from smg_grpc_proto import sglang_encoder_pb2, sglang_encoder_pb2_grpc
 
-from sglang.srt.disaggregation.encode_server import (
-    MMEncoder,
-    handle_scheduler_receive_url_request,
-    launch_encoder,
-)
+from sglang.srt.disaggregation.encode_server import MMEncoder, launch_encoder
 from sglang.srt.managers.io_struct import async_sock_send, wrap_as_pickle
 from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.server_args import PortArgs, ServerArgs
@@ -91,6 +87,7 @@ class SGLangEncoderServer(SGLangEncoderServicer):
         try:
             request_dict = {
                 "mm_items": list(request.mm_items),
+                "modality": Modality.IMAGE.name,
                 "req_id": request.req_id,
                 "num_parts": request.num_parts,
                 "part_idx": request.part_idx,
@@ -98,20 +95,15 @@ class SGLangEncoderServer(SGLangEncoderServicer):
             for socket in self.send_sockets:
                 await async_sock_send(socket, wrap_as_pickle(request_dict))
 
-            # gRPC encode is image-only; encoder.encode() requires modality
+            # gRPC encode is image-only; the request follows the configured
+            # cache and transfer backend.
             (
                 nbytes,
                 embedding_len,
                 embedding_dim,
                 error_msg,
                 error_code,
-            ) = await self.encoder.encode(
-                mm_items=list(request.mm_items),
-                modality=Modality.IMAGE,
-                req_id=request.req_id,
-                num_parts=request.num_parts,
-                part_idx=request.part_idx,
-            )
+            ) = await self.encoder.encode_request(request_dict, Modality.IMAGE)
             if error_msg is not None:
                 context.set_code(grpc.StatusCode.INTERNAL)
                 context.set_details(error_msg)
@@ -139,7 +131,7 @@ class SGLangEncoderServer(SGLangEncoderServicer):
                             )
                         )
                     await asyncio.gather(*tasks)
-                    self.encoder.embedding_to_send.pop(request.req_id, None)
+                    self.encoder.discard_embedding(request.req_id)
                 return sglang_encoder_pb2.EncodeResponse()
             elif self.server_args.encoder_transfer_backend == "zmq_to_tokenizer":
                 embedding_port = (
@@ -150,7 +142,7 @@ class SGLangEncoderServer(SGLangEncoderServicer):
                     prefill_host=request.prefill_host,
                     embedding_port=embedding_port,
                 )
-                self.encoder.embedding_to_send.pop(request.req_id, None)
+                self.encoder.discard_embedding(request.req_id)
                 return sglang_encoder_pb2.EncodeResponse()
 
             return sglang_encoder_pb2.EncodeResponse()
@@ -175,7 +167,7 @@ class SGLangEncoderServer(SGLangEncoderServicer):
                     request.buffer_address if request.buffer_address else None
                 ),
             )
-            self.encoder.embedding_to_send.pop(request.req_id, None)
+            self.encoder.discard_embedding(request.req_id)
             return sglang_encoder_pb2.SendResponse()
 
         except Exception as e:
@@ -189,12 +181,10 @@ class SGLangEncoderServer(SGLangEncoderServicer):
         self, request: sglang_encoder_pb2.SchedulerReceiveUrlRequest, context
     ) -> sglang_encoder_pb2.SchedulerReceiveUrlResponse:
         try:
-            await handle_scheduler_receive_url_request(
-                {
-                    "req_id": request.req_id,
-                    "receive_count": request.receive_count,
-                    "receive_url": request.receive_url,
-                }
+            await self.encoder.register_embedding_destinations(
+                request.req_id,
+                request.receive_count,
+                [request.receive_url],
             )
             return sglang_encoder_pb2.SchedulerReceiveUrlResponse()
 
