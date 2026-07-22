@@ -3799,14 +3799,7 @@ class Scheduler(
         return success
 
     def _reset_memory_pools(self) -> None:
-        """Clear every memory pool (KV cache, req pool, grammar, draft) to empty.
-
-        Single source of truth for which pools exist and how they are cleared,
-        shared by flush_cache (idle path) and _abort_all_and_reset (debug-mode
-        recovery path) so a newly-added pool is never cleared by one but forgotten
-        by the other. Callers own their surrounding state (batch/queue resets,
-        metrics, device cache); this only touches the pools.
-        """
+        """Clear every memory pool (KV cache, req pool, grammar, draft) to empty."""
         self.tree_cache.reset()
         self.req_to_token_pool.clear()
         self.token_to_kv_pool_allocator.clear()
@@ -3835,10 +3828,7 @@ class Scheduler(
         try:
             self._abort_all_and_reset()
             # Verify the reset actually reached the scheduler's canonical idle
-            # state before trusting the loop to continue. is_fully_idle() checks
-            # every batch/queue plus collaborator staging (grammar, dllm, hicache),
-            # so a reset that left any of them non-empty is caught here and treated
-            # as unrecoverable rather than silently resuming on stale state.
+            # state before trusting the loop to continue.
             if not self.is_fully_idle():
                 raise RuntimeError(
                     "debug-mode reset did not return the scheduler to a fully-idle "
@@ -3870,13 +3860,11 @@ class Scheduler(
         Reuses the same pool-clearing primitives as flush_cache, minus its idle
         guard (we are recovering precisely because we are not idle).
         """
-        # abort_request notifies queued requests and marks running requests for
-        # abort, but it does not free the running requests' KV or notify their
-        # clients — the normal flow relies on a later forward pass for that. Since
-        # we discard the batch instead of running another forward, notify the
-        # in-flight clients explicitly (KV is freed wholesale by the reset below).
         inflight_reqs = self._all_inflight_reqs()
         self.abort_request(AbortReq(abort_all=True))
+        # abort_request doesn't notify in-flight clients or free their KV, so we do
+        # that explicitly since we're discarding the batch instead of running another
+        # forward pass.
         for req in inflight_reqs:
             self.ipc_channels.send_to_tokenizer.send_output(
                 AbortReq(
