@@ -105,7 +105,7 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__ void topkGatingSoftmaxPac
     return;
   }
 
-  const T* thread_row_ptr = input + thread_row * ELTS_PER_ROW;
+  const T* thread_row_ptr = input + static_cast<int64_t>(thread_row) * ELTS_PER_ROW;
   const int thread_group_idx = threadIdx.x % THREADS_PER_ROW;
   const int first_elt_read_by_thread = thread_group_idx * ELTS_PER_LDG;
   const T* thread_read_ptr = thread_row_ptr + first_elt_read_by_thread;
@@ -187,7 +187,7 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__ void topkGatingSoftmaxPac
     }
 
     if (thread_group_idx == 0) {
-      const int idx = k * thread_row + k_idx;
+      const int64_t idx = static_cast<int64_t>(k) * thread_row + k_idx;
       output[idx] = max_val;
       indices[idx] = expert;
       row_sum_for_renormalize += max_val;
@@ -209,7 +209,7 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__ void topkGatingSoftmaxPac
       float row_sum_for_renormalize_inv = 1.f / row_sum_for_renormalize;
 #pragma unroll
       for (int k_idx = 0; k_idx < k; ++k_idx) {
-        const int idx = k * thread_row + k_idx;
+        const int64_t idx = static_cast<int64_t>(k) * thread_row + k_idx;
         output[idx] = output[idx] * row_sum_for_renormalize_inv;
       }
     }
@@ -223,7 +223,7 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__ void topkGatingSoftmaxPac
     const bool row_padded = (num_token_non_padded != nullptr) && (thread_row >= *num_token_non_padded);
 #pragma unroll
     for (int k_idx = 0; k_idx < k; ++k_idx) {
-      const int idx = k * thread_row + k_idx;
+      const int64_t idx = static_cast<int64_t>(k) * thread_row + k_idx;
       const int32_t id = row_padded ? -1 : indices[idx];
       packed_output[idx] = pack_routed(id, output[idx]);
     }

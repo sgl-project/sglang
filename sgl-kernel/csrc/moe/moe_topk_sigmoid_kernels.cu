@@ -75,7 +75,7 @@ __device__ float convert_to_float(T x) {
 template <typename T, int TPB>
 __launch_bounds__(TPB) __global__ void moeSigmoid(
     const T* input, const bool* finished, float* output, const int num_cols, const float* correction_bias) {
-  const int thread_row_offset = blockIdx.x * num_cols;
+  const int64_t thread_row_offset = static_cast<int64_t>(blockIdx.x) * num_cols;
 
   // Don't touch finished rows.
   if ((finished != nullptr) && finished[blockIdx.x]) {
@@ -84,7 +84,7 @@ __launch_bounds__(TPB) __global__ void moeSigmoid(
 
   // First pass: Apply transformation, find max, and write transformed values to output
   for (int ii = threadIdx.x; ii < num_cols; ii += TPB) {
-    const int idx = thread_row_offset + ii;
+    const int64_t idx = thread_row_offset + ii;
     float val = convert_to_float<T>(input[idx]);
 
     val = 1.0f / (1.0f + expf(-val));
@@ -120,7 +120,7 @@ __launch_bounds__(TPB) __global__ void moeTopK(
   const int block_row = blockIdx.x;
 
   const bool row_is_active = finished ? !finished[block_row] : true;
-  const int thread_read_offset = blockIdx.x * num_experts;
+  const int64_t thread_read_offset = static_cast<int64_t>(blockIdx.x) * num_experts;
   float row_sum_for_renormalize = 0;
   for (int k_idx = 0; k_idx < k; ++k_idx) {
     thread_kvp.key = 0;
@@ -128,12 +128,12 @@ __launch_bounds__(TPB) __global__ void moeTopK(
 
     cub_kvp inp_kvp;
     for (int expert = threadIdx.x; expert < num_experts; expert += TPB) {
-      const int idx = thread_read_offset + expert;
+      const int64_t idx = thread_read_offset + expert;
       inp_kvp.key = expert;
       inp_kvp.value = inputs_after_sigmoid[idx];
 
       for (int prior_k = 0; prior_k < k_idx; ++prior_k) {
-        const int prior_winning_expert = indices[k * block_row + prior_k];
+        const int prior_winning_expert = indices[static_cast<int64_t>(k) * block_row + prior_k];
 
         if (prior_winning_expert == expert) {
           inp_kvp = thread_kvp;
@@ -150,7 +150,7 @@ __launch_bounds__(TPB) __global__ void moeTopK(
       const bool node_uses_expert = expert >= start_expert && expert < end_expert;
       const bool should_process_row = row_is_active && node_uses_expert;
 
-      const int idx = k * block_row + k_idx;
+      const int64_t idx = static_cast<int64_t>(k) * block_row + k_idx;
       float val = result_kvp.value;
       if (correction_bias != nullptr) {
         val -= correction_bias[expert];
@@ -166,7 +166,7 @@ __launch_bounds__(TPB) __global__ void moeTopK(
   if (renormalize && threadIdx.x == 0) {
     float row_sum_for_renormalize_inv = 1.f / row_sum_for_renormalize;
     for (int k_idx = 0; k_idx < k; ++k_idx) {
-      const int idx = k * block_row + k_idx;
+      const int64_t idx = static_cast<int64_t>(k) * block_row + k_idx;
       output[idx] = output[idx] * row_sum_for_renormalize_inv;
     }
   }
@@ -246,7 +246,7 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__ void topkGatingSigmoid(
 
   // We finally start setting up the read pointers for each thread. First, each thread jumps to the start of the
   // row it will read.
-  const T* thread_row_ptr = input + thread_row * ELTS_PER_ROW;
+  const T* thread_row_ptr = input + static_cast<int64_t>(thread_row) * ELTS_PER_ROW;
 
   // Now, we compute the group each thread belong to in order to determine the first column to start loads.
   const int thread_group_idx = threadIdx.x % THREADS_PER_ROW;
@@ -342,7 +342,7 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__ void topkGatingSigmoid(
 
       // The lead thread from each sub-group will write out the final results to global memory. (This will be a
       // single) thread per row of the input/output matrices.
-      const int idx = k * thread_row + k_idx;
+      const int64_t idx = static_cast<int64_t>(k) * thread_row + k_idx;
       if (correction_bias != nullptr) {
         max_val -= correction_bias[expert];
       }
@@ -370,7 +370,7 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__ void topkGatingSigmoid(
     float row_sum_for_renormalize_inv = 1.f / row_sum_for_renormalize;
 #pragma unroll
     for (int k_idx = 0; k_idx < k; ++k_idx) {
-      const int idx = k * thread_row + k_idx;
+      const int64_t idx = static_cast<int64_t>(k) * thread_row + k_idx;
       output[idx] = output[idx] * row_sum_for_renormalize_inv;
     }
   }
@@ -528,7 +528,7 @@ void topk_sigmoid(
 
   const bool is_pow_2 = (num_experts != 0) && ((num_experts & (num_experts - 1)) == 0);
   const bool needs_workspace = !is_pow_2 || num_experts > 256;
-  const int64_t workspace_size = needs_workspace ? num_tokens * num_experts : 0;
+  const int64_t workspace_size = needs_workspace ? static_cast<int64_t>(num_tokens) * num_experts : 0;
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(gating_output));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();

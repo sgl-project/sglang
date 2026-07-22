@@ -23,9 +23,15 @@ def _deterministic_seed():
             [4, 8, 16, 32, 64, 128, 256],  # num_experts
             [1, 2, 4],  # topk
         )
-    ),
+    )
+    # smallest (num_tokens, num_experts) where num_tokens * num_experts > INT_MAX
+    + [(2**31 // 256 + 1, 256, 1)],
 )
 def test_topk_sigmoid(num_tokens, num_experts, topk):
+    required_mem = num_tokens * num_experts * 4 * 2
+    if torch.cuda.mem_get_info()[0] < required_mem * 1.5:
+        pytest.skip("not enough GPU memory for this shape")
+
     gating_output = torch.randn(
         (num_tokens, num_experts), dtype=torch.float32, device="cuda"
     )

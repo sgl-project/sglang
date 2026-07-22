@@ -68,14 +68,14 @@ __device__ float convert_to_float(T x) {
 template <typename T, int TPB>
 __launch_bounds__(TPB) __global__
     void moeSigmoid(const T* input, const bool* finished, float* output, const int num_cols) {
-  const int thread_row_offset = blockIdx.x * num_cols;
+  const int64_t thread_row_offset = static_cast<int64_t>(blockIdx.x) * num_cols;
 
   if ((finished != nullptr) && finished[blockIdx.x]) {
     return;
   }
 
   for (int ii = threadIdx.x; ii < num_cols; ii += TPB) {
-    const int idx = thread_row_offset + ii;
+    const int64_t idx = thread_row_offset + ii;
     float val = convert_to_float<T>(input[idx]);
     val = 1.0f / (1.0f + expf(-val));
     output[idx] = val;
@@ -110,7 +110,7 @@ __launch_bounds__(TPB) __global__ void moeTopK(
   const int topk = k + num_fused_shared_experts;
 
   const bool row_is_active = finished ? !finished[block_row] : true;
-  const int thread_read_offset = blockIdx.x * num_experts;
+  const int64_t thread_read_offset = static_cast<int64_t>(blockIdx.x) * num_experts;
   float row_sum_for_renormalize = 0;
 
   for (int k_idx = 0; k_idx < k; ++k_idx) {
@@ -119,7 +119,7 @@ __launch_bounds__(TPB) __global__ void moeTopK(
 
     cub_kvp inp_kvp;
     for (int expert = threadIdx.x; expert < num_experts; expert += TPB) {
-      const int idx = thread_read_offset + expert;
+      const int64_t idx = thread_read_offset + expert;
       inp_kvp.key = expert;
       inp_kvp.value = inputs_after_sigmoid[idx];
       if (correction_bias != nullptr) {
@@ -127,7 +127,7 @@ __launch_bounds__(TPB) __global__ void moeTopK(
       }
 
       for (int prior_k = 0; prior_k < k_idx; ++prior_k) {
-        const int prior_winning_expert = indices[topk * block_row + prior_k];
+        const int prior_winning_expert = indices[static_cast<int64_t>(topk) * block_row + prior_k];
         if (prior_winning_expert == expert) {
           inp_kvp = thread_kvp;
         }
@@ -142,7 +142,7 @@ __launch_bounds__(TPB) __global__ void moeTopK(
       const bool node_uses_expert = expert >= start_expert && expert < end_expert;
       const bool should_process_row = row_is_active && node_uses_expert;
 
-      const int idx = topk * block_row + k_idx;
+      const int64_t idx = static_cast<int64_t>(topk) * block_row + k_idx;
       float val;
       if (correction_bias != nullptr) {
         val = inputs_after_sigmoid[thread_read_offset + expert];
@@ -158,7 +158,7 @@ __launch_bounds__(TPB) __global__ void moeTopK(
   }
 
   if (num_fused_shared_experts > 0 && threadIdx.x == 0) {
-    const int last_idx = topk * block_row + k;
+    const int64_t last_idx = static_cast<int64_t>(topk) * block_row + k;
     if (renormalize) {
       output[last_idx] = 1.0f;
     } else {
@@ -169,7 +169,7 @@ __launch_bounds__(TPB) __global__ void moeTopK(
   if (renormalize && threadIdx.x == 0) {
     float row_sum_for_renormalize_inv = routed_scaling_factor / (row_sum_for_renormalize + 1e-20f);
     for (int k_idx = 0; k_idx < k; ++k_idx) {
-      const int idx = topk * block_row + k_idx;
+      const int64_t idx = static_cast<int64_t>(topk) * block_row + k_idx;
       output[idx] = output[idx] * row_sum_for_renormalize_inv;
     }
   }
@@ -224,7 +224,7 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__ void topkGatingSigmoid(
   }
   const bool row_is_active = finished ? !finished[thread_row] : true;
 
-  const T* thread_row_ptr = input + thread_row * ELTS_PER_ROW;
+  const T* thread_row_ptr = input + static_cast<int64_t>(thread_row) * ELTS_PER_ROW;
   const int thread_group_idx = threadIdx.x % THREADS_PER_ROW;
   const int first_elt_read_by_thread = thread_group_idx * ELTS_PER_LDG;
   const T* thread_read_ptr = thread_row_ptr + first_elt_read_by_thread;
@@ -287,7 +287,7 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__ void topkGatingSigmoid(
       const bool node_uses_expert = expert >= start_expert && expert < end_expert;
       const bool should_process_row = row_is_active && node_uses_expert;
 
-      const int idx = topk * thread_row + k_idx;
+      const int64_t idx = static_cast<int64_t>(topk) * thread_row + k_idx;
       float out_val;
       if (correction_bias != nullptr) {
         out_val = convert_to_float<T>(thread_row_ptr[expert]);
@@ -311,7 +311,7 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__ void topkGatingSigmoid(
   }
 
   if (num_fused_shared_experts > 0 && thread_group_idx == 0) {
-    const int last_idx = topk * thread_row + k;
+    const int64_t last_idx = static_cast<int64_t>(topk) * thread_row + k;
     if (renormalize) {
       output[last_idx] = 1.0f;
     } else {
@@ -323,7 +323,7 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__ void topkGatingSigmoid(
     float row_sum_for_renormalize_inv = routed_scaling_factor / (row_sum_for_renormalize + 1e-20f);
 #pragma unroll
     for (int k_idx = 0; k_idx < k; ++k_idx) {
-      const int idx = topk * thread_row + k_idx;
+      const int64_t idx = static_cast<int64_t>(topk) * thread_row + k_idx;
       output[idx] = output[idx] * row_sum_for_renormalize_inv;
     }
   }
