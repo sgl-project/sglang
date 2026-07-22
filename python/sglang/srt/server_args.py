@@ -8370,18 +8370,19 @@ class PortArgs:
             dist_init_host = na.host
             dist_init_port = na.port
 
-            # Reserve port_base+0..NUM_DERIVED_PORTS-1 (6 fixed ports + dp_size
-            # rust-path slots); derive from server_args only (never dp_rank) so
-            # every init_new call agrees, decrementing below dist_init_port on
-            # overflow.
-            is_rust_server = envs.SGLANG_RUST_SERVER.get()
-            NUM_DERIVED_PORTS = 6 if not is_rust_server else 6 + server_args.dp_size
+            # We need 5 consecutive ports from port_base for:
+            # port_base, detokenizer, rpc, metrics, scheduler.
+            # In multi-node, all nodes derive ports independently from
+            # dist_init_port, so the derivation must be deterministic
+            # (no availability-based search). If incrementing would
+            # overflow the valid TCP range, decrement instead.
+            NUM_DERIVED_PORTS = 5
             if server_args.is_ep_scale_joiner:
                 port_base = server_args.port + ZMQ_TCP_PORT_DELTA
-                if port_base + NUM_DERIVED_PORTS - 1 > 65535:
+                if port_base + NUM_DERIVED_PORTS > 65535:
                     port_base = server_args.port - ZMQ_TCP_PORT_DELTA
             elif dist_init_port + NUM_DERIVED_PORTS > 65535:
-                port_base = dist_init_port - NUM_DERIVED_PORTS
+                port_base = dist_init_port - NUM_DERIVED_PORTS - 1
             else:
                 port_base = dist_init_port + 1
 
@@ -8392,12 +8393,8 @@ class PortArgs:
             if dp_rank is None:
                 # TokenizerManager to DataParallelController
                 scheduler_input_port = port_base + 4
-            elif worker_ports is None and is_rust_server:
-                # Rust server + dp attention: no DataParallelController allocates
-                # worker ports; use the reserved per-rank slot (never bound — the
-                # scheduler ingests via the in-process ring).
-                scheduler_input_port = port_base + 6 + dp_rank
             else:
+                assert worker_ports is not None
                 scheduler_input_port = worker_ports[dp_rank]
 
             is_joiner = server_args.is_ep_scale_joiner
@@ -8412,10 +8409,10 @@ class PortArgs:
                     wait_port_available(metrics_port, "metrics_port")
                     if server_args.nnodes > 1:
                         wait_port_available(load_collector_port, "load_collector_port")
+                # Check scheduler_input_port only for dp.
+                # Skip check when using worker_ports since the port is already bound by our ZMQ socket
+                if dp_rank is None or worker_ports is None:
                     wait_port_available(scheduler_input_port, "scheduler_input_port")
-                # For dp ranks the scheduler_input port is already bound by the DPC's
-                # ZMQ socket (worker_ports), or unused (rust, worker_ports is None) —
-                # either way, no availability check.
             except ValueError:
                 logger.exception(
                     f"Port is already in use. {dist_init_port=} {port_base=} {detokenizer_port=} {nccl_port=} {scheduler_input_port=}"
