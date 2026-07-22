@@ -69,11 +69,15 @@ from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.state_capturer.indexer_topk import (
     maybe_capture_indexer_topk,
 )
-from sglang.srt.utils import BumpAllocator
+from sglang.srt.utils import BumpAllocator, is_sm120_supported
 from sglang.srt.utils.custom_op import register_custom_op
 
 logger = logging.getLogger(__name__)
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
+# SM120/SM121 (consumer Blackwell) has no trtllm-gen kernel; the dsa "trtllm"
+# backend is routed to flashinfer's native sparse-MLA kernel instead, which
+# requires a BF16 query (see _fuse_rope_for_trtllm_mla below).
+_IS_SM120 = is_sm120_supported()
 
 if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
@@ -989,6 +993,15 @@ class DeepseekMLAForwardMixin:
         Check if we should skip rope and do fused rope+quantize for TRTLLM MLA decode in fp8_e4m3 path.
         """
         if self.current_attention_backend in ("dsa", "nsa"):
+            if _IS_SM120:
+                # On SM120/SM121 the dsa "trtllm" backend routes to
+                # flashinfer's native sparse-MLA kernel, which requires a
+                # BF16 query and dequantizes the KV cache itself via its
+                # inline per-block scales (rather than a fused rope+fp8-
+                # quantize of the query, which the datacenter trtllm-gen
+                # kernel expects). Keep rope in forward_absorb_prepare here
+                # so the query reaches _forward_trtllm in bf16.
+                return False
             return (
                 get_server_args().dsa_decode_backend == "trtllm"
                 or get_server_args().dsa_prefill_backend == "trtllm"

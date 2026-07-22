@@ -67,11 +67,13 @@ from sglang.srt.utils.common import (
     is_float4_e2m1fn_x2,
     is_hip,
     is_npu,
+    is_sm120_supported,
 )
 
 logger = logging.getLogger(__name__)
 
 _is_hip = is_hip()
+_is_sm120 = is_sm120_supported()
 
 
 def _get_dsv4_compress_state_dtypes() -> tuple[torch.dtype, torch.dtype]:
@@ -1837,7 +1839,19 @@ def calculate_mla_kv_cache_dim(
         server_args.dsa_prefill_backend == "trtllm"
         or server_args.dsa_decode_backend == "trtllm"
     ):
-        return kv_cache_dim
+        # On SM120/SM121 (consumer Blackwell) the "trtllm" dsa backend does
+        # NOT dispatch to the datacenter trtllm-gen kernel; DeepseekSparseAttn
+        # Backend._forward_trtllm instead routes it to flashinfer's native
+        # sparse-MLA kernel (backend="auto"), which consumes the 656-byte
+        # packed inline-scale layout (512 fp8 nope + 4x fp32 tile scales + 64
+        # bf16 rope) computed below -- the same layout quantize_k_cache
+        # already writes for the non-trtllm dsa backends. So do not early-
+        # return the plain layout on SM12x. Datacenter Blackwell (SM100/103)
+        # keeps the early return: trtllm-gen dequants via a scalar bmm1
+        # k_scale and expects the plain kv_lora_rank + qk_rope_head_dim
+        # layout.
+        if not _is_sm120:
+            return kv_cache_dim
 
     # On HIP, TileLang and AITER DSA kernels consume the raw MLA KV layout:
     # nope(512 fp8) + rope(64 fp8), without extra per-block scales.

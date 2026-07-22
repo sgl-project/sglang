@@ -68,6 +68,7 @@ from sglang.srt.utils import (
     is_gfx95_supported,
     is_hip,
     is_sm100_supported,
+    is_sm120_supported,
     print_warning_once,
 )
 
@@ -77,6 +78,10 @@ from sglang.srt.utils import (
 # concat). Enable with SGLANG_DSA_TRITON_PREFILL=1. Decode stays on TileLang.
 _DSA_TRITON_PREFILL = get_bool_env_var("SGLANG_DSA_TRITON_PREFILL")
 _IS_GFX95 = is_gfx95_supported()
+# SM120/SM121 (consumer Blackwell: DGX Spark GB10, RTX PRO/50-series) has no
+# trtllm-gen kernel; the "trtllm" dsa backend is routed to flashinfer's native
+# sparse-MLA kernel instead (see _forward_trtllm below).
+_IS_SM120 = is_sm120_supported()
 
 if is_cuda():
     import deep_gemm
@@ -2825,8 +2830,33 @@ class DeepseekSparseAttnBackend(
 
         metadata = self.forward_metadata
 
+        # Native SM120/SM121 sparse-MLA route: flashinfer's dispatcher picks
+        # its packed-KV "sparse" kernel (decode: warp-specialized kernels for
+        # <=64 tokens; more tokens: its prefill orchestrator) whenever
+        # backend="auto" is passed on cc==12 with sparse_mla_top_k>0.
+        # `dsa_kv_cache_store_fp8` is the precise gate: it is True exactly
+        # when the kv pool holds the 656-byte packed inline-scale layout that
+        # kernel consumes (see calculate_mla_kv_cache_dim's SM12x carve-out).
+        # A bf16 kv cache or a non-trtllm dsa backend keeps this False and
+        # the call below is byte-identical to upstream.
+        _sparse_sm120 = _IS_SM120 and self.dsa_kv_cache_store_fp8
+        if _sparse_sm120 and dsa_use_prefill_cp(forward_batch):
+            # DSA prefill context-parallelism (round-robin/in-seq split,
+            # cp_split_and_rebuild_position, the all-gather below) has only
+            # been exercised against the trtllm-gen fp8-quantize-fused-rope
+            # path, which _sparse_sm120 skips entirely (see the BF16 query
+            # note below). Rather than silently mis-route CP requests through
+            # an untested combination, fail loudly until CP support for the
+            # SM120 sparse kernel is implemented and validated.
+            raise NotImplementedError(
+                "DSA prefill context parallelism (enable_dsa_prefill_context_parallel) "
+                "is not supported together with the SM120/SM121 native sparse-MLA "
+                "route (dsa_prefill_backend/dsa_decode_backend='trtllm' on cc==12 "
+                "with an fp8 KV cache). Disable CP or use a non-trtllm dsa backend."
+            )
+
         merge_query = q_rope is not None
-        if self.kv_cache_dtype == torch.float8_e4m3fn:
+        if self.kv_cache_dtype == torch.float8_e4m3fn and not _sparse_sm120:
             # For FP8 path, we quantize the query and rope parts and merge them into a single tensor
             # Note: rope application in deepseek_v2.py:forward_absorb_prepare is skipped for FP8 decode path of this trtllm_mla backend
             assert q_rope is not None, "For FP8 path q_rope should not be None."
@@ -2933,7 +2963,10 @@ class DeepseekSparseAttnBackend(
 
         out = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
             query=q,
-            kv_cache=kv,
+            # The SM120 sparse kernel's checker requires a torch.uint8 KV
+            # buffer; the pool's storage dtype is an fp8 view of the same
+            # packed bytes, so this is a reinterpret, not a copy.
+            kv_cache=kv.view(torch.uint8) if _sparse_sm120 else kv,
             workspace_buffer=self.workspace_buffer,
             qk_nope_head_dim=self.qk_nope_head_dim,
             kv_lora_rank=self.kv_lora_rank,
@@ -2943,8 +2976,24 @@ class DeepseekSparseAttnBackend(
             max_seq_len=metadata.max_seq_len_k,
             sparse_mla_top_k=self.dsa_index_topk,
             bmm1_scale=bmm1_scale,
-            backend="trtllm-gen",
-            skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
+            # backend="auto" lets flashinfer's dispatcher route cc==12 +
+            # sparse_mla_top_k>0 to its native SM120/121 sparse-MLA kernel
+            # instead of "trtllm-gen" (datacenter Blackwell only, absent on
+            # cc==12: "TllmGenFmhaRunner ... Unsupported architecture").
+            backend="auto" if _sparse_sm120 else "trtllm-gen",
+            # sglang's quantize_k_cache writes amax/448 ARBITRARY fp32 tile
+            # scales into the packed layout (not power-of-two / ue8m0
+            # scales). "arbitrary_fp32" is exactly flashinfer's GLM_NSA scale
+            # semantics for this layout; the default "auto" would assume
+            # pow2/ue8m0 scales (DSv3.2 semantics) and misread them.
+            kv_scale_format="arbitrary_fp32" if _sparse_sm120 else "auto",
+            # The sparse backend does not support the skip-softmax threshold
+            # optimization; passing a non-None value raises.
+            skip_softmax_threshold_scale_factor=(
+                None
+                if _sparse_sm120
+                else envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get()
+            ),
         )
 
         return out
