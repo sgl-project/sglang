@@ -1911,8 +1911,13 @@ def compute_mla_mscale_scaling(rope_scaling: dict, base_scaling: float) -> float
     """Compute MLA attention scaling factor from rope_scaling with mscale.
 
     Used by DeepSeek, BailingMoe, SarvamMLA and similar MLA models.
-    Warns if 'factor' is missing from rope_scaling (common in v5 configs).
+    Transformers v5 also exposes the default RoPE parameters through
+    ``rope_scaling``. Those parameters do not request any scaling.
     """
+    rope_type = rope_scaling.get("rope_type") or rope_scaling.get("type")
+    if rope_type == "default":
+        return base_scaling
+
     if not rope_scaling.get("apply_yarn_scaling", True) or not rope_scaling.get(
         "apply_scale", True
     ):
