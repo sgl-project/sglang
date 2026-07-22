@@ -1,3 +1,4 @@
+import contextlib
 import inspect
 import itertools
 import math
@@ -5,6 +6,7 @@ import os
 from typing import (
     Any,
     Callable,
+    ContextManager,
     Dict,
     Generic,
     Iterable,
@@ -19,7 +21,7 @@ from typing import (
 
 import torch
 
-from sglang.jit_kernel.utils import cache_once
+from sglang.kernels.jit.utils import cache_once
 from sglang.utils import is_in_ci
 
 F = TypeVar("F", bound=Callable[..., "BenchResult"])
@@ -91,6 +93,60 @@ def _process_metrics(times: list[float], metrics: tuple[Metric, ...]) -> list[fl
             which = min(int(len(times) * metric), len(times) - 1)
             results.append(times[which])
     return results
+
+
+@cache_once
+def _get_l2_cache_size() -> int:
+    device = torch.cuda.current_device()
+    props = torch.cuda.get_device_properties(device)
+    return props.L2_cache_size
+
+
+_L2_SAFE_RATIO = 5
+
+
+def _get_flush_l2_buffer() -> torch.Tensor:
+    """Get a buffer sized to flush the L2 cache when accessed."""
+    device = torch.device(f"cuda:{torch.cuda.current_device()}")
+    l2_size = _get_l2_cache_size()
+    safe_size = int(l2_size * _L2_SAFE_RATIO)
+    return torch.empty(safe_size, device=device, dtype=torch.uint8)
+
+
+def _calculate_rotation_count(nbytes: int, min_rotations: int = 2) -> int:
+    """
+    Adapted from flashinfer benchmark utility:
+    https://github.com/flashinfer-ai/flashinfer/blob/c5a2b06edae4fa2bfd2ae25eed16eb565c70513f/flashinfer/testing/utils.py
+
+    Calculate the number of buffer copies needed to ensure cold L2 cache.
+
+    The function uses conservative thresholds to account for:
+    - LRU eviction being gradual (not all data evicted when capacity exceeded)
+    - Cache associativity effects (some data may persist in non-conflicting sets)
+    - Hardware prefetching behavior
+
+    Returns 1 (no rotation needed) only when tensor size substantially exceeds
+    L2 cache, ensuring cache effects are truly negligible.
+
+    Args:
+        tensors: List of tensors to consider for rotation (must be on GPU).
+        device: Device for L2 cache query (None for current device).
+        min_rotations: Minimum number of rotations when rotation is needed.
+
+    Returns:
+        Number of buffer copies needed (1 means no rotation needed).
+    """
+    l2_size = _get_l2_cache_size()
+    safe_cache_threshold = l2_size * _L2_SAFE_RATIO
+
+    if nbytes <= 0 or nbytes >= safe_cache_threshold:
+        return 1  # No tensors to rotate
+
+    # Conservative formula: ensure between any two uses of the same buffer,
+    # we've accessed enough data to fully flush L2 with margin
+    # Using safe_cache_threshold ensures we account for all cache effects
+    num_rotations = math.ceil(safe_cache_threshold / nbytes) + 1
+    return max(min_rotations, num_rotations)
 
 
 class BenchResult(NamedTuple):
@@ -223,6 +279,9 @@ class Benchmark(Generic[F]):
                     if not DISABLE_LOG_BANDWIDTH:
                         bandwidths.append(float("nan"))
                     continue
+                except BaseException:
+                    print(f"Benchmark failed at {system}, kwargs =", kwargs)
+                    raise
                 latencies.append(result.times[0] / self._unit_scale)
                 if not DISABLE_LOG_BANDWIDTH and result.memory_footprint is not None:
                     should_log_bandwidth = True
@@ -319,6 +378,67 @@ def parametrize(names: str, vals: List[Any], ci_vals: Optional[List[Any]] = None
     return decorator
 
 
+def _do_bench_internal_graph(
+    fn: Callable,
+    replay_iters: int,
+    input_args: Tuple[Any, ...],
+    input_kwargs: Dict[str, Any],
+    graph_clone_args: Iterable[int],
+    graph_clone_kwargs: Iterable[str],
+    graph_context: ContextManager,
+    sync_multigpu_fn: Callable[[], Any],
+) -> List[float]:
+    result: List[float] = []
+    stream = torch.cuda.current_stream()
+    empty_tensor = _get_flush_l2_buffer()
+    # only count the cloned tensors for rotation count
+    nbytes = sum(_get_nbytes_recursive(input_args[i]) for i in graph_clone_args)
+    nbytes += sum(_get_nbytes_recursive(input_kwargs[k]) for k in graph_clone_kwargs)
+    rotate_count = min(_calculate_rotation_count(nbytes), 100)
+    loop_count = math.ceil(100 / rotate_count) * rotate_count
+    input_args_list = [input_args] * rotate_count
+    input_kwargs_list = [input_kwargs] * rotate_count
+    graph_clone_args = set(graph_clone_args)
+    graph_clone_kwargs = set(graph_clone_kwargs)
+
+    graph = torch.cuda.CUDAGraph()
+    # NOTE: we rotate the buffer here to avoid L2 cache effect
+    for i in range(1, rotate_count):
+        input_args_list[i] = tuple(
+            (
+                _clone_recursive(input_args[j])
+                if j in graph_clone_args
+                else input_args[j]
+            )
+            for j in range(len(input_args))
+        )
+        input_kwargs_list[i] = dict(
+            (k, (_clone_recursive(v) if k in graph_clone_kwargs else v))
+            for k, v in input_kwargs.items()
+        )
+    with graph_context:
+        with torch.cuda.graph(graph, stream=stream):
+            for i in range(loop_count):
+                args = input_args_list[i % rotate_count]
+                kwargs = input_kwargs_list[i % rotate_count]
+                fn(*args, **kwargs)
+
+    # warm up the graph once
+    graph.replay()
+    # then replay the graph and measure the time
+    tic = torch.cuda.Event(enable_timing=True)
+    toc = torch.cuda.Event(enable_timing=True)
+    for _ in range(max(replay_iters // loop_count, 10)):
+        empty_tensor.zero_()  # cold the L2 cache
+        sync_multigpu_fn()  # sync GPU before each iteration for precise timing
+        tic.record(stream)
+        graph.replay()
+        toc.record(stream)
+        stream.synchronize()
+        result.append(tic.elapsed_time(toc) / loop_count)
+    return result
+
+
 def do_bench(
     fn: Callable,
     *,
@@ -338,9 +458,13 @@ def do_bench(
     memory_output: Iterable[Any] | Literal["out"] | None = "out",
     extra_memory_args: Iterable[Any] | None = None,
     extra_memory_footprint: int = 0,
+    graph_context_fn: Optional[Callable[[], ContextManager]] = None,
+    sync_multigpu_fn: Optional[Callable[[], Any]] = None,
 ) -> BenchResult:
     """
     Benchmark a function using CUDA graph or naive loop.
+    Adapted from flashinfer benchmark utility:
+    https://github.com/flashinfer-ai/flashinfer/blob/c5a2b06edae4fa2bfd2ae25eed16eb565c70513f/flashinfer/testing/utils.py
 
     :param fn: Function to benchmark
     :param input_args: Positional arguments to pass to the function
@@ -361,6 +485,10 @@ def do_bench(
     :param extra_memory_args: Additional arguments to consider for memory footprint calculation.
     :param extra_memory_footprint: Additional memory footprint to consider.
                                    This is typically used when the load/store bytes is dynamic.
+    :param graph_context_fn: A callable returning a context manager that wraps the cuda graph capture.
+    :param sync_multigpu_fn: A callable to synchronize multiple GPUs before each iteration. For precise
+                             benchmark number in multi-GPU benchmark, it should be some synchronization
+                             primitive on GPU side (not on CPU side).
     """
     # first warmup the function
     device_id = torch.cuda.current_device()
@@ -368,17 +496,14 @@ def do_bench(
         stream = _get_benchmark_stream(device_id)
     old_current_stream = torch.cuda.current_stream(device_id)
     result: List[float] = []
+    sync_multigpu_fn = sync_multigpu_fn or (lambda: None)
     with torch.cuda.device(device_id), torch.cuda.stream(stream):
         stream.wait_stream(old_current_stream)
+        sync_multigpu_fn()
         for _ in range(warmup_iters):
             fn(*input_args, **input_kwargs)
         if use_cuda_graph:
             # NOTE: by default, reduce all the CPU-side overhead
-            rep_count = 4
-            loop_iters = 100
-            graph = torch.cuda.CUDAGraph()
-            input_args_list = [input_args] * rep_count
-            input_kwargs_list = [input_kwargs] * rep_count
             if graph_clone_args == "all":
                 graph_clone_args = range(len(input_args))
             elif graph_clone_args is None:
@@ -387,44 +512,29 @@ def do_bench(
                 graph_clone_kwargs = input_kwargs.keys()
             elif graph_clone_kwargs is None:
                 graph_clone_kwargs = []
-            graph_clone_args = set(graph_clone_args)
-            graph_clone_kwargs = set(graph_clone_kwargs)
-            # NOTE: we rotate the buffer here to avoid L2 cache effect
-            for i in range(1, rep_count):
-                input_args_list[i] = tuple(
-                    (
-                        _clone_recursive(input_args[j])
-                        if j in graph_clone_args
-                        else input_args[j]
-                    )
-                    for j in range(len(input_args))
-                )
-                input_kwargs_list[i] = dict(
-                    (k, (_clone_recursive(v) if k in graph_clone_kwargs else v))
-                    for k, v in input_kwargs.items()
-                )
-            with torch.cuda.graph(graph, stream=stream):
-                for _ in range(loop_iters // rep_count):
-                    for args, kwargs in zip(input_args_list, input_kwargs_list):
-                        fn(*args, **kwargs)
-            # warm up the graph
-            graph.replay()
-            # then replay the graph and measure the time
-            tic = torch.cuda.Event(enable_timing=True)
-            toc = torch.cuda.Event(enable_timing=True)
-            for _ in range(max(replay_iters // loop_iters, 10)):
-                tic.record(stream)
-                graph.replay()
-                toc.record(stream)
-                stream.synchronize()
-                result.append(tic.elapsed_time(toc) / loop_iters)
+            graph_context = (
+                graph_context_fn()
+                if graph_context_fn is not None
+                else contextlib.nullcontext()
+            )
+            result = _do_bench_internal_graph(
+                fn,
+                replay_iters,
+                input_args,
+                input_kwargs,
+                graph_clone_args,
+                graph_clone_kwargs,
+                graph_context,
+                sync_multigpu_fn,
+            )
         else:
             # NOTE: no cuda graph, naive loop
-            empty_tensor = torch.empty(64 * 1024 * 1024, device=f"cuda:{device_id}")
             tic = torch.cuda.Event(enable_timing=True)
             toc = torch.cuda.Event(enable_timing=True)
+            empty_tensor = _get_flush_l2_buffer()
             for _ in range(max(replay_iters, 10)):
                 empty_tensor.zero_()  # cold the L2 cache
+                sync_multigpu_fn()
                 tic.record(stream)
                 fn(*input_args, **input_kwargs)
                 toc.record(stream)

@@ -99,6 +99,7 @@ jobs:
     if: |
       always() &&
       !cancelled() &&
+      needs.check-changes.result == 'success' &&
       github.event_name == 'pull_request' &&
       inputs.test_parallel_dispatch != true &&
       (needs.check-changes.outputs.main_package == 'true' || needs.check-changes.outputs.sgl_kernel == 'true') &&
@@ -127,6 +128,7 @@ jobs:
     if: |
       always() &&
       !cancelled() &&
+      needs.check-changes.result == 'success' &&
       github.event_name == 'pull_request' &&
       inputs.test_parallel_dispatch != true &&
       (needs.check-changes.outputs.main_package == 'true' || needs.check-changes.outputs.sgl_kernel == 'true') &&
@@ -225,18 +227,22 @@ jobs:
 
   call-jit-kernel-tests:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels]
+    # Run on scheduled/parallel-dispatch runs (same pattern as the base-* stages) so the
+    # jit_kernel suite is exercised on main 3x daily, not only on PRs that touch jit_kernel/**.
+    # check-changes already forces jit_kernel='true' on scheduled runs (run_all_tests).
     if: |
       always() &&
-      !failure() && !cancelled() &&
-      github.event_name != 'schedule' &&
-      inputs.test_parallel_dispatch != true &&
+      ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
       needs.check-changes.outputs.jit_kernel == 'true'
     uses: ./.github/workflows/pr-test-jit-kernel.yml
     with:
       runner_config: 4-gpu-b200
       runs_on_map: ${{ needs.check-changes.outputs.runs_on_map }}
       jit_kernel: ${{ needs.check-changes.outputs.jit_kernel }}
-      sgl_kernel: ${{ needs.check-changes.outputs.sgl_kernel }}
+      # On scheduled/parallel-dispatch runs sgl-kernel-build-wheels is skipped, so the wheel
+      # artifact does not exist. Force sgl_kernel='false' there so the jit-kernel jobs skip the
+      # wheel download and run against the released/pinned sgl-kernel instead of a fresh build.
+      sgl_kernel: ${{ (github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) && 'false' || needs.check-changes.outputs.sgl_kernel }}
       git_ref: ${{ inputs.git_ref || '' }}
       test_parallel_dispatch: ${{ inputs.test_parallel_dispatch == true && 'true' || 'false' }}
       skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check == true }}
@@ -262,6 +268,7 @@ jobs:
     needs: [check-changes, call-gate]
     if: |
       always() &&
+      needs.check-changes.result == 'success' &&
       ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
       (needs.check-changes.outputs.main_package == 'true')
     runs-on: ubuntu-latest
@@ -388,7 +395,6 @@ jobs:
       caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
       run_timeout_minutes: '40'
-      extra_pytest_path: 'python/sglang/jit_kernel/tests/test_flash_attention_4.py'
     secrets: inherit
 
   call-multimodal-gen-tests:
@@ -514,19 +520,20 @@ jobs:
       timeout_per_file: '1800'
     secrets: inherit
 
-  base-c-test-4-gpu-gb300:
-    needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels]
-    if: ${{ !failure() && !cancelled() }}
-    uses: ./.github/workflows/_pr-test-stage.yml
-    with:
-      self_name: base-c-test-4-gpu-gb300
-      runner_config: 4-gpu-gb300
-      check_changes: ${{ toJson(needs.check-changes.outputs) }}
-      caller_inputs: ${{ toJson(inputs) }}
-      partitions: ${{ needs.check-changes.outputs.partitions }}
-      run_timeout_minutes: '30'
-      timeout_per_file: '1800'
-    secrets: inherit
+  # temporarily disabled due to runner availability
+#   base-c-test-4-gpu-gb300:
+#     needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels]
+#     if: ${{ !failure() && !cancelled() }}
+#     uses: ./.github/workflows/_pr-test-stage.yml
+#     with:
+#       self_name: base-c-test-4-gpu-gb300
+#       runner_config: 4-gpu-gb300
+#       check_changes: ${{ toJson(needs.check-changes.outputs) }}
+#       caller_inputs: ${{ toJson(inputs) }}
+#       partitions: ${{ needs.check-changes.outputs.partitions }}
+#       run_timeout_minutes: '30'
+#       timeout_per_file: '1800'
+#     secrets: inherit
 
   pr-test-finish:
     needs:
@@ -558,7 +565,7 @@ jobs:
         base-c-test-deepep-4-gpu-b200,
         base-c-test-deepep-8-gpu-h200,
         base-c-test-4-gpu-b200,
-        base-c-test-4-gpu-gb300,
+#         base-c-test-4-gpu-gb300,  # temporarily disabled due to runner availability
       ]
     if: always()
     runs-on: ubuntu-latest

@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.jit_kernel.kv_canary.verify import VerifyPlan
+from sglang.kernels.ops.kv_canary.verify import VerifyPlan
 from sglang.srt.kv_canary.radix_cache_walker import walk_radix_cache_for_canary
 
 if TYPE_CHECKING:
@@ -13,7 +13,7 @@ if TYPE_CHECKING:
 
 def build_verify_plan_radix_sweep(
     *,
-    radix_cache: "BasePrefixCache",
+    radix_cache: BasePrefixCache,
     swa_window_size: int,
     full_to_swa_index_mapping: Optional[torch.Tensor],
     unlocked_only: bool = False,

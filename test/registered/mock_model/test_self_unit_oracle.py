@@ -5,15 +5,16 @@ import unittest
 
 import torch
 
-from sglang.jit_kernel.kv_canary.consts import splitmix64
+from sglang.kernels.ops.kv_canary.consts import splitmix64
 from sglang.srt.kv_canary.token_oracle.oracle import (
     HashOracle,
     _splitmix64_tensor,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=60, stage="extra-a", runner_config="1-gpu-small")
+register_amd_ci(est_time=60, suite="extra-a-test-1-gpu-small-amd")
 
 
 _U64_MASK: int = (1 << 64) - 1

@@ -7,12 +7,14 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup, ReduceOp
 
-from sglang.srt.compilation.piecewise_context_manager import (
+from sglang.srt.compilation.compile_phase import (
     get_pcg_capture_stream,
-    is_in_pcg_torch_compile,
-    is_in_piecewise_cuda_graph,
+    is_in_torch_compile_warmup,
 )
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+    is_in_tc_piecewise_cuda_graph,
+)
+from sglang.srt.runtime_context import get_server_args
 
 logger = logging.getLogger(__name__)
 
@@ -23,7 +25,7 @@ class PyMscclppCommunicator:
 
     def _is_symm_mem_enabled(self) -> bool:
         try:
-            return get_global_server_args().enable_symm_mem
+            return get_server_args().enable_symm_mem
         except ValueError:
             return False
 
@@ -343,8 +345,8 @@ class PyMscclppCommunicator:
         # (compile, capture, or replay) as it changes the allreduce dispatch
         # path and triggers recompilation.
         if (
-            is_in_piecewise_cuda_graph()
-            or is_in_pcg_torch_compile()
+            is_in_tc_piecewise_cuda_graph()
+            or is_in_torch_compile_warmup()
             or get_pcg_capture_stream() is not None
         ):
             return False
