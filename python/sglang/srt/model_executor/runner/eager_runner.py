@@ -357,12 +357,14 @@ class EagerRunner(BaseRunner):
         with cp_shard_model_inputs(
             input_embeds, forward_batch.positions, forward_batch
         ) as (sharded_input_embeds, sharded_positions):
+            model_kwargs = {"input_embeds": sharded_input_embeds}
+            if (pp_proxy_tensors := kwargs.get("pp_proxy_tensors")) is not None:
+                model_kwargs["pp_proxy_tensors"] = pp_proxy_tensors
             hidden_states = model.model(
                 forward_batch.input_ids,
                 sharded_positions,
                 forward_batch,
-                input_embeds=sharded_input_embeds,
-                pp_proxy_tensors=kwargs.get("pp_proxy_tensors"),
+                **model_kwargs,
             )
         capture_aux_hidden_states = getattr(model, "capture_aux_hidden_states", False)
         aux_hidden_states = None

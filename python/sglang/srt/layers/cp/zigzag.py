@@ -342,8 +342,14 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         return result
 
     def materialize_full_kv(
-        self, forward_batch, layer: Any, k: Any, v: Any, swa_loc: Optional[Any] = None
-    ) -> None:
+        self,
+        forward_batch,
+        layer: Any = None,
+        k: Any = None,
+        v: Any = None,
+        swa_loc: Optional[Any] = None,
+        **kwargs,
+    ) -> Any:
         cache_loc = (
             forward_batch.out_cache_loc
             if not layer.is_cross_attention

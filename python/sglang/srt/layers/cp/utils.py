@@ -42,6 +42,7 @@ if TYPE_CHECKING:
 CP_V2_DEFAULT_MODEL_CLASSES = frozenset(
     {
         "DeepseekV32ForCausalLM",
+        "GlmMoeDsaForCausalLM",
         "MiMoV2FlashForCausalLM",
         "MiMoV2ForCausalLM",
         "Qwen3MoeForCausalLM",
@@ -176,10 +177,9 @@ def prepare_cp_forward(forward_batch) -> None:
     if getattr(forward_batch, "global_num_tokens_cpu", None) is not None:
         from sglang.srt.layers.dp_attention import set_local_dp_buffer_len
 
+        # TODO: Check why this is needed
         set_local_dp_buffer_len(
-            forward_batch.attn_cp_metadata.per_rank_actual_token[
-                get_parallel().attn_cp_rank
-            ]
+            sum(forward_batch.attn_cp_metadata.per_rank_actual_token)
         )
 
     if getattr(forward_batch, "out_cache_loc", None) is not None:

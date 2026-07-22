@@ -19,7 +19,6 @@ from sglang.srt.layers.attention.dsa.utils import (
     is_graph_dsa_split_op_surface,
 )
 from sglang.srt.layers.communicator import get_attn_tp_context
-from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.dcp import (
     all_gather_kv_cache_for_mla_extend,
     all_gather_q_for_mla_decode,
@@ -567,22 +566,16 @@ class DeepseekMLAForwardMixin:
             fuse_rope_for_trtllm_mla=fuse_rope_for_trtllm_mla,
         )
         if (dsa_prefill_cp or mla_prefill_cp) and not defer_kv_gather_until_after_rope:
-            if is_cp_v2_active(forward_batch):
-                # CP-v2: AllGather latent KV via strategy.materialize_full_kv
-                from sglang.srt.layers.cp.base import get_cp_strategy
+            from sglang.srt.layers.attention.dsa_backend import materialize_full_kv_cp
 
-                k_nope, k_pe = get_cp_strategy().materialize_full_kv(
-                    forward_batch,
-                    latent_cache=latent_cache,
-                    k_nope=k_nope,
-                    k_pe=k_pe,
-                    kv_lora_rank=self.kv_lora_rank,
-                )
-            else:
-                # support allgather+rerrange
-                k_nope, k_pe = self.rebuild_cp_kv_cache(
-                    latent_cache, forward_batch, k_nope, k_pe
-                )
+            k_nope, k_pe = materialize_full_kv_cp(
+                self,
+                forward_batch,
+                latent_cache,
+                k_nope,
+                k_pe,
+                self.kv_lora_rank,
+            )
 
         # all_gather q_pe, q_nope_out,take tp8 as an example， q_pe [B, H, ROPE_DIM], q_nope_out [B, H, NOPE_DIM] gathered to [B, H * dcp_world_size, ROPE_DIM] [B, H * dcp_world_size, NOPE_DIM] for decode batch, and all gather k_pe, k_nope for extend batch.
         if get_parallel().dcp_enabled:

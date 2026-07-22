@@ -153,6 +153,34 @@ class ContextParallelStrategy(ABC):
             f"{self.name} strategy does not support per-request sharding"
         )
 
+    def shard_local_tokens(self, input_: Any) -> Any:
+        """Shard an arbitrary per-token tensor/list to this CP rank's local tokens."""
+        raise NotImplementedError(
+            f"{self.name} strategy does not support local-token sharding"
+        )
+
+    def materialize_full_indexer_k_cache(
+        self, key: Any, forward_batch: ForwardBatch
+    ) -> Any:
+        """Gather the rank-local DSA indexer key back to full token order.
+
+        Only DSA-capable strategies (interleave) override this; others reject it.
+        """
+        raise NotImplementedError(
+            f"{self.name} strategy does not support DSA indexer key gather"
+        )
+
+    def all_gather_dsa_trtllm_fp8_kv(
+        self, forward_batch: ForwardBatch, k: Any, k_rope: Any
+    ) -> Any:
+        """All-gather FP8 KV for the TRT-LLM MLA backend back to full token order.
+
+        Only DSA-capable strategies (interleave) override this; others reject it.
+        """
+        raise NotImplementedError(
+            f"{self.name} strategy does not support DSA trtllm FP8 KV gather"
+        )
+
     def split_before_forward(
         self,
         forward_batch: ForwardBatch,
@@ -185,11 +213,12 @@ class ContextParallelStrategy(ABC):
     def materialize_full_kv(
         self,
         forward_batch: ForwardBatch,
-        layer: Any,
-        k: Any,
-        v: Any,
+        layer: Any = None,
+        k: Any = None,
+        v: Any = None,
         swa_loc: Optional[Any] = None,
-    ) -> None:
+        **kwargs,
+    ) -> Any:
         """Write full-layout K/V to the backend cache if needed."""
 
     def reindex_attn_metadata(self, core_attn_metadata: Any) -> None:

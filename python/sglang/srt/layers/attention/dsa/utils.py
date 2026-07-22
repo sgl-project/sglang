@@ -76,7 +76,11 @@ def should_use_dsa_fused_topk(
 
 
 def is_dsa_enable_prefill_cp():
-    return get_server_args().enable_dsa_prefill_context_parallel
+    if get_parallel().attn_cp_size <= 1:
+        return False
+    from sglang.srt.configs.model_config import is_deepseek_dsa
+
+    return is_deepseek_dsa(get_server_args().get_model_config().hf_config)
 
 
 def is_dsa_prefill_cp_in_seq_split():
@@ -200,6 +204,15 @@ def pad_dsa_cache_seqlens(forward_batch: "ForwardBatch", dsa_cache_seqlens):
 
 
 def can_dsa_cp_split(seq_len: int, cp_size: int, use_dsa: bool, forward_batch):
+    if (
+        cp_size <= 1
+        or not use_dsa
+        or not forward_batch.forward_mode.is_context_parallel_extend()
+        or not is_dsa_enable_prefill_cp()
+        or sum(forward_batch.extend_seq_lens_cpu) < cp_size
+    ):
+        return False
+
     if is_dsa_prefill_cp_round_robin_split():
         cur_cp_seq_len = seq_len // cp_size
         assert (
@@ -210,17 +223,7 @@ def can_dsa_cp_split(seq_len: int, cp_size: int, use_dsa: bool, forward_batch):
         # Note: (self.cp_size * 2) To achieve load balancing for seq computation,
         # the seq data needs to be divided and recombined at twice the size of cp_size.
         cur_cp_seq_len = seq_len // (cp_size * 2)
-    if (
-        cur_cp_seq_len != 0
-        and cp_size > 1
-        and use_dsa
-        and forward_batch.forward_mode.is_context_parallel_extend()
-        and is_dsa_enable_prefill_cp()
-        and sum(forward_batch.extend_seq_lens_cpu) >= cp_size
-    ):
-        return True
-    else:
-        return False
+    return cur_cp_seq_len != 0
 
 
 from sglang.kernels.ops.attention.dsa.cp_split import (

@@ -632,28 +632,30 @@ class Indexer(MultiPlatformOp):
             self.alt_stream.wait_stream(current_stream)
             query = self._maybe_rotate(query)
 
-            if is_cp_v2_active(forward_batch):
-                current_stream.wait_stream(self.alt_stream)
-                return query, key, weights_raw
-
+            # Gather the full key on alt_stream so the CP all-gather overlaps
+            # with the query rotate above on the current stream.
             with torch.cuda.stream(self.alt_stream):
-                key = cp_all_gather_rerange_output(
-                    key.contiguous(),
-                    self.cp_size,
-                    forward_batch,
-                    torch.cuda.current_stream(),
-                )
+                if is_cp_v2_active(forward_batch):
+                    key = get_cp_strategy().materialize_full_indexer_k_cache(
+                        key, forward_batch
+                    )
+                else:
+                    key = cp_all_gather_rerange_output(
+                        key.contiguous(),
+                        self.cp_size,
+                        forward_batch,
+                        torch.cuda.current_stream(),
+                    )
             current_stream.wait_stream(self.alt_stream)
             return query, key, weights_raw
         else:
             query = self._maybe_rotate(query)
             key = self._maybe_rotate(key)
 
-        if is_cp_v2_active(forward_batch):
-            return query, key, weights_raw
-
         # allgather+rerrange
-        if forward_batch.attn_cp_metadata is not None and self.dsa_enable_prefill_cp:
+        if is_cp_v2_active(forward_batch):
+            key = get_cp_strategy().materialize_full_indexer_k_cache(key, forward_batch)
+        elif forward_batch.attn_cp_metadata is not None and self.dsa_enable_prefill_cp:
             key = cp_all_gather_rerange_output(
                 key.contiguous(),
                 self.cp_size,
@@ -1878,18 +1880,13 @@ class Indexer(MultiPlatformOp):
             else:
                 weights = self._apply_q_scale_and_softmax_scale(weights, q_scale)
         else:
-            if is_cp_v2_active(forward_batch):
-                query, key, weights_raw = get_cp_strategy().run_indexer(
-                    self, q_lora, x, positions, forward_batch
-                )
-            else:
-                query, key, weights_raw = self._get_q_k_bf16(
-                    q_lora,
-                    x,
-                    positions,
-                    enable_dual_stream,
-                    forward_batch=forward_batch,
-                )
+            query, key, weights_raw = self._get_q_k_bf16(
+                q_lora,
+                x,
+                positions,
+                enable_dual_stream,
+                forward_batch=forward_batch,
+            )
 
             if enable_dual_stream:
                 current_stream = torch.cuda.current_stream()

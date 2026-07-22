@@ -56,6 +56,8 @@ from sglang.srt.layers.attention.dsa.utils import (
     pad_dsa_cache_seqlens,
     should_use_dsa_fused_topk,
 )
+from sglang.srt.layers.cp.base import get_cp_strategy
+from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.utils.cp_utils import (
     cp_all_gather_rerange_output,
     cp_split_and_rebuild_position,
@@ -103,6 +105,26 @@ def _all_gather_dsa_trtllm_fp8_kv(
         torch.cuda.current_stream(),
     ).view(kv_dtype)
     return kv.split((kv_lora_rank, qk_rope_head_dim), dim=-1)
+
+
+def materialize_full_kv_cp(
+    attn_mla,
+    forward_batch: ForwardBatch,
+    latent_cache: torch.Tensor,
+    k_nope: torch.Tensor,
+    k_pe: torch.Tensor,
+    kv_lora_rank: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Switch CP-v1/v2 for the MLA latent-KV all-gather."""
+    if is_cp_v2_active(forward_batch):
+        return get_cp_strategy().materialize_full_kv(
+            forward_batch,
+            latent_cache=latent_cache,
+            k_nope=k_nope,
+            k_pe=k_pe,
+            kv_lora_rank=kv_lora_rank,
+        )
+    return attn_mla.rebuild_cp_kv_cache(latent_cache, forward_batch, k_nope, k_pe)
 
 
 _is_hip = is_hip()
@@ -911,12 +933,19 @@ class DeepseekSparseAttnBackend(
             )
 
             if can_dsa_prefill_cp_round_robin_split(forward_batch):
-                seqlens_expanded = dsa_cp_round_robin_split_data(seqlens_expanded)
-                extend_seq_lens_cpu, extend_seq_lens, bs_idx_cpu, bs_idx = (
-                    dsa_cp_round_robin_split_q_seqs(
-                        extend_seq_lens_cpu, extend_seq_lens
+                if is_cp_v2_active(forward_batch):
+                    strategy = get_cp_strategy()
+                    seqlens_expanded = strategy.shard_local_tokens(seqlens_expanded)
+                    extend_seq_lens_cpu, extend_seq_lens, bs_idx_cpu, bs_idx = (
+                        strategy.shard_per_request(extend_seq_lens_cpu, extend_seq_lens)
                     )
-                )
+                else:
+                    seqlens_expanded = dsa_cp_round_robin_split_data(seqlens_expanded)
+                    extend_seq_lens_cpu, extend_seq_lens, bs_idx_cpu, bs_idx = (
+                        dsa_cp_round_robin_split_q_seqs(
+                            extend_seq_lens_cpu, extend_seq_lens
+                        )
+                    )
                 indexer_seq_lens_cpu = indexer_seq_lens_cpu[bs_idx_cpu]
                 indexer_seq_lens = indexer_seq_lens[bs_idx]
                 cache_seqlens_int32 = cache_seqlens_int32[bs_idx]
@@ -1122,9 +1151,14 @@ class DeepseekSparseAttnBackend(
         token_to_batch_idx = torch.cat(token_to_batch_idx, dim=0)
         if bs_idx is not None:
             assert can_dsa_prefill_cp_round_robin_split(forward_batch)
-            ks = dsa_cp_round_robin_split_data(ks)
-            ke = dsa_cp_round_robin_split_data(ke)
-            token_to_batch_idx = dsa_cp_round_robin_split_data(token_to_batch_idx)
+            split_per_token = (
+                get_cp_strategy().shard_local_tokens
+                if is_cp_v2_active(forward_batch)
+                else dsa_cp_round_robin_split_data
+            )
+            ks = split_per_token(ks)
+            ke = split_per_token(ke)
+            token_to_batch_idx = split_per_token(token_to_batch_idx)
         return (ks, ke), token_to_batch_idx
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
@@ -2853,7 +2887,12 @@ class DeepseekSparseAttnBackend(
                 self.qk_rope_head_dim,
             )
             if save_kv_cache and dsa_use_prefill_cp(forward_batch):
-                k, k_rope = _all_gather_dsa_trtllm_fp8_kv(forward_batch, k, k_rope)
+                if is_cp_v2_active(forward_batch):
+                    k, k_rope = get_cp_strategy().all_gather_dsa_trtllm_fp8_kv(
+                        forward_batch, k, k_rope
+                    )
+                else:
+                    k, k_rope = _all_gather_dsa_trtllm_fp8_kv(forward_batch, k, k_rope)
             merge_query = False
 
             # Save KV cache if requested
