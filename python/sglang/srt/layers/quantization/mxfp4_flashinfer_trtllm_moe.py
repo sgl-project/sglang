@@ -20,7 +20,9 @@ from sglang.srt.utils import (
     log_info_on_rank0,
     set_weight_attrs,
 )
-from sglang.srt.utils.common import next_power_of_2
+from sglang.srt.utils.common import is_sm100_supported, next_power_of_2
+
+_MXFP8_QUANTIZE_BACKEND = "cute-dsl" if is_sm100_supported() else "cuda"
 
 if is_flashinfer_available():
     from flashinfer import shuffle_matrix_a, shuffle_matrix_sf_a
@@ -309,6 +311,7 @@ class Mxfp4FlashinferTrtllmMoEMethod:
                 hidden_states,
                 False,
                 alignment=hidden_size,
+                backend=_MXFP8_QUANTIZE_BACKEND,
             )
             x_scale = x_scale.view(torch.float8_e4m3fn).reshape(
                 *hidden_states.shape[:-1], -1
