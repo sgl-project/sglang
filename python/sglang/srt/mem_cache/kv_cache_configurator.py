@@ -260,6 +260,18 @@ class KVCacheConfigurator:
             full_max_total_num_tokens = config.full_max_total_num_tokens
             swa_max_total_num_tokens = config.swa_max_total_num_tokens
 
+        # Under DCP the shared allocator emits virtual locs in
+        # [0, max_total * dcp_size). Draft-worker pools are replicated (not
+        # DCP-sharded) and consume these locs untranslated, so every
+        # token-loc-indexed capacity must cover the full virtual space.
+        dcp_size = self.server_args.dcp_size
+        if self.is_draft_worker and dcp_size > 1:
+            max_total_num_tokens *= dcp_size
+            if full_max_total_num_tokens is not None:
+                full_max_total_num_tokens *= dcp_size
+            if swa_max_total_num_tokens is not None:
+                swa_max_total_num_tokens *= dcp_size
+
         # DSV4 compressed-attention pool sizes. Draft worker reuses target's
         # full/swa sizes but does NOT own c4/c128/state pools (those live on
         # the target rank only); zero them out regardless of what config holds.
