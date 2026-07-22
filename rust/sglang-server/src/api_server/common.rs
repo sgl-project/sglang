@@ -1,8 +1,8 @@
 //! Common control-plane endpoints — `/server_info`, `/get_model_info`
 //! (+ `/model_info` alias), plus the control-request submission path
 //! (`submit` / `await_control_result`). Data-plane endpoints (incl. `/health*`,
-//! which round-trips a generate probe) live in the sibling `sglang` (native
-//! protocol) and `openai` modules; the shared `AppState` lives in the parent
+//! which round-trips a generate probe) live in the sibling `native_api` and
+//! `openai` modules; the shared `AppState` lives in the parent
 //! `api_server` module.
 
 use axum::{
@@ -28,8 +28,7 @@ pub(super) fn routes() -> Router<AppState> {
         // non-streamed JSON result. Adding one = a route line + its struct tag.
         .route("/server_info", get(server_info))
         // Static config, no scheduler round-trip. `/get_model_info` (+ `/model_info`
-        // alias) is what the SGLang lang backend (`RuntimeEndpoint`, gsm8k/eval)
-        // calls at startup.
+        // alias).
         .route("/get_model_info", get(model_info))
         .route("/model_info", get(model_info))
 }

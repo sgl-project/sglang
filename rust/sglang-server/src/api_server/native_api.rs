@@ -145,6 +145,7 @@ async fn submit(
         }
     }
 }
+
 async fn generate(State(state): State<AppState>, Json(body): Json<GenerateBody>) -> Response {
     let stream = body.stream;
     // Fan `text`/`input_ids`/`sampling_params` (scalar or list) into per-request
