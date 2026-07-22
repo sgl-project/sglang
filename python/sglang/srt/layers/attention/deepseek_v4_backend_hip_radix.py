@@ -551,7 +551,7 @@ class DeepseekV4HipRadixBackend(
         extend_start_loc: Optional[torch.Tensor] = None,
     ) -> DSV4Metadata:
         if extend_start_loc is not None:
-            from sglang.srt.layers.attention.dsv4.attn_metadata_kernels import (
+            from sglang.kernels.ops.attention.dsv4_attn_metadata_kernels import (
                 ExpandPrefillCausally,
             )
 

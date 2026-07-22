@@ -1213,7 +1213,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         scatter it into ``unified_kv[swa_loc]``. Rows with swa_loc < 0
         (uncommitted verify tokens) are skipped by the scatter.
         """
-        from sglang.jit_kernel.dsv4 import fused_norm_rope_inplace
+        from sglang.kernels.ops.attention.dsv4 import fused_norm_rope_inplace
         from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import runtime
 
         fused_norm_rope_inplace(kv, kv_weight, eps, freqs_cis, positions)
