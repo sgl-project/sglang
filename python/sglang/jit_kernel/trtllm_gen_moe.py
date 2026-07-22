@@ -343,6 +343,8 @@ def trtllm_fp4_block_scale_moe(
     routing_method_type: int = ROUTING_DEEPSEEK_V3,
     activation_type: int = ACTIVATION_SITU,
     norm_topk_prob: bool = True,
+    local_expert_offset: int = 0,
+    local_num_experts: Optional[int] = None,
     tactic: Sequence[int] = (-1, -1),
     output: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
@@ -397,8 +399,8 @@ def trtllm_fp4_block_scale_moe(
         n_group,
         topk_group,
         intermediate_size,
-        0,  # local_expert_offset
-        num_experts,  # local_num_experts
+        local_expert_offset,
+        num_experts if local_num_experts is None else local_num_experts,
         routed_scaling_factor,
         routing_method_type,
         True,  # do_finalize
@@ -429,6 +431,8 @@ def trtllm_fp4_block_scale_routed_moe(
     top_k: int,
     intermediate_size: int,
     activation_type: int = ACTIVATION_SITU,
+    local_expert_offset: int = 0,
+    local_num_experts: Optional[int] = None,
     tactic: Sequence[int] = (-1, -1),
     output: Optional[torch.Tensor] = None,
     do_finalize: bool = True,
@@ -487,8 +491,8 @@ def trtllm_fp4_block_scale_routed_moe(
         None,  # n_group
         None,  # topk_group
         intermediate_size,
-        0,  # local_expert_offset
-        num_experts,  # local_num_experts
+        local_expert_offset,
+        num_experts if local_num_experts is None else local_num_experts,
         1.0,  # routed_scaling_factor (already applied by the router)
         _ROUTING_TOPK,  # routing_method_type (unused for precomputed)
         do_finalize,
