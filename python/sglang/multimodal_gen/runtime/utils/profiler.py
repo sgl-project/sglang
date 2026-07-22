@@ -73,15 +73,38 @@ class SGLDiffusionProfiler:
         if hasattr(torch, "xpu") and torch.xpu.is_available():
             activities.append(torch.profiler.ProfilerActivity.XPU)
 
+        # NPU: wrap tensorboard_trace_handler to tolerate the prof_if
+        # compatibility gap between the monkey-patched torch.profiler.profile
+        # and torch_npu.profiler.tensorboard_trace_handler on some CANN versions.
+        on_trace_ready = None
+        if current_platform.is_npu():
+            _npu_handler = torch_npu.profiler.tensorboard_trace_handler(self.log_dir)
+
+            def _safe_npu_handler(prof):
+                try:
+                    _npu_handler(prof)
+                except AttributeError as e:
+                    if "prof_if" in str(e):
+                        logger.warning(
+                            "torch_npu tensorboard_trace_handler raised %s. "
+                            "This is a known compatibility gap on this CANN version. "
+                            "Falling back to chrome-trace export.",
+                            e,
+                        )
+                        try:
+                            prof.export_chrome_trace(self._trace_path())
+                        except Exception:
+                            pass
+                    else:
+                        raise
+
+            on_trace_ready = _safe_npu_handler
+
         common_torch_profiler_args = dict(
             activities=activities,
             record_shapes=True,
             with_stack=True,
-            on_trace_ready=(
-                None
-                if not current_platform.is_npu()
-                else torch_npu.profiler.tensorboard_trace_handler(self.log_dir)
-            ),
+            on_trace_ready=on_trace_ready,
         )
         if self.full_profile:
             # profile all stages
@@ -146,7 +169,11 @@ class SGLDiffusionProfiler:
             torch.cuda.synchronize()
         if current_platform.is_npu():
             torch.npu.synchronize()
-            export_trace = False  # set to false because our internal torch_npu.profiler will generate trace file
+            # NPU profiler may export via on_trace_ready during stop().
+            # If that fails (prof_if gap), our safe handler falls back to
+            # chrome_trace.  In either case, skip an unconditional second
+            # export — but if the trace file is still missing, fall back.
+            export_trace = False
         self.profiler.stop()
 
         if export_trace:
@@ -154,20 +181,36 @@ class SGLDiffusionProfiler:
                 pass
             else:
                 self._export_trace()
+        elif current_platform.is_npu():
+            # Guard: if the NPU handler didn't produce a trace, fall back.
+            trace_path = self._trace_path()
+            if not os.path.exists(trace_path) or os.path.getsize(trace_path) == 0:
+                logger.warning(
+                    "NPU trace handler did not produce a trace; falling back to chrome_trace export."
+                )
+                self._export_trace()
+            else:
+                logger.info(
+                    "Saved profiler traces to: %s%s%s", CYAN, trace_path, RESET
+                )
 
         SGLDiffusionProfiler._instance = None
+
+    def _trace_path(self) -> str:
+        """Deterministic trace file path (matches ``_export_trace``)."""
+        sanitized_profile_mode_id = self.profile_mode_id.replace(" ", "_")
+        return os.path.abspath(
+            os.path.join(
+                self.log_dir,
+                f"{self.request_id}-{sanitized_profile_mode_id}-global-rank{self.rank}.trace.json.gz",
+            )
+        )
 
     def _export_trace(self):
 
         try:
             os.makedirs(self.log_dir, exist_ok=True)
-            sanitized_profile_mode_id = self.profile_mode_id.replace(" ", "_")
-            trace_path = os.path.abspath(
-                os.path.join(
-                    self.log_dir,
-                    f"{self.request_id}-{sanitized_profile_mode_id}-global-rank{self.rank}.trace.json.gz",
-                )
-            )
+            trace_path = self._trace_path()
             self.profiler.export_chrome_trace(trace_path)
 
             if self._check_trace_integrity(trace_path):
