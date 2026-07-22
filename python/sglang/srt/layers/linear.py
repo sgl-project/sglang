@@ -24,7 +24,6 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
-from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe.utils import should_skip_mlp_all_reduce
 from sglang.srt.layers.parameter import (
@@ -37,7 +36,7 @@ from sglang.srt.layers.parameter import (
     _ColumnvLLMParameter,
 )
 from sglang.srt.layers.utils import pad_or_narrow_weight
-from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import get_bool_env_var, is_cpu, is_hip, is_npu, set_weight_attrs
 
 if TYPE_CHECKING:
@@ -668,14 +667,6 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             if use_bitsandbytes_4bit:
                 shard_size = loaded_weight.shape[output_dim]
                 shard_offset = loaded_weight.shape[output_dim] * loaded_shard_id
-
-            # Needed for experimental ModelSlim W4A4 int4x2 packing support
-            # TODO: remove env variable once new packing is fully released
-            if envs.SGLANG_NPU_W4A4_NEW_PACKING.get():
-                pack_factor = getattr(param, "pack_factor", None)
-                if pack_factor is not None:
-                    shard_size = shard_size // pack_factor
-                    shard_offset = shard_offset // pack_factor
 
             param_data = param_data.narrow(output_dim, shard_offset, shard_size)
             start_idx = self.tp_rank * shard_size

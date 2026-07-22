@@ -27,7 +27,7 @@ from sglang.srt.configs import DbrxConfig
 from sglang.srt.distributed import (
     tensor_model_parallel_all_reduce,
 )
-from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
+from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
     fused_moe_npu,
 )
 from sglang.srt.layers.linear import (
