@@ -2,14 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import (
-    TYPE_CHECKING,
-    Callable,
-    List,
-    Optional,
-    Tuple,
-    Union,
-)
+from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Union
 
 import torch
 
@@ -21,12 +14,16 @@ from sglang.srt.managers.schedule_batch import (
     FINISH_MATCHED_TOKEN,
     Req,
     ScheduleBatch,
+    mamba_lazy_spec_in_window,
 )
-from sglang.srt.mem_cache.common import (
-    maybe_cache_unfinished_req,
-    release_kv_cache,
+from sglang.srt.mem_cache.common import maybe_cache_unfinished_req, release_kv_cache
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_exec,
+    get_memory,
+    get_observability,
+    get_server_args,
 )
-from sglang.srt.runtime_context import get_server_args
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
@@ -47,10 +44,7 @@ if TYPE_CHECKING:
         SchedulerOutputStreamer,
     )
     from sglang.srt.managers.tp_worker import BaseTpWorker
-    from sglang.srt.managers.utils import (
-        EmbeddingBatchResult,
-        GenerationBatchResult,
-    )
+    from sglang.srt.managers.utils import EmbeddingBatchResult, GenerationBatchResult
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -83,7 +77,7 @@ class SchedulerBatchResultProcessor:
 
     def process_batch_result_prebuilt(self, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
-        use_free_group = self.server_args.disaggregation_decode_enable_radix_cache
+        use_free_group = get_disagg().disaggregation_decode_enable_radix_cache
         if use_free_group:
             self.token_to_kv_pool_allocator.free_group_begin()
         for req in batch.reqs:
@@ -91,7 +85,7 @@ class SchedulerBatchResultProcessor:
             req.update_finish_state()
             if req.finished():
                 req.time_stats.set_quick_finish_time()
-                if self.server_args.enable_hisparse:
+                if get_memory().enable_hisparse:
                     self.hisparse_coordinator.request_finished(req)
                 release_kv_cache(req, self.tree_cache)
 
@@ -242,7 +236,7 @@ class SchedulerBatchResultProcessor:
                         req.time_stats.set_completion_time()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         maybe_cache_unfinished_req(req, self.tree_cache)
-                        if self.server_args.enable_hisparse:
+                        if get_memory().enable_hisparse:
                             self.hisparse_coordinator.admit_request_into_staging(req)
 
                     self._maybe_collect_customized_info(i, req, logits_output)
@@ -755,7 +749,7 @@ class SchedulerBatchResultProcessor:
                 num_block_accept_tokens=result.num_block_accept_tokens,
                 num_cap_tokens=result.num_cap_tokens,
             )
-        if self.server_args.enable_metrics:
+        if get_observability().enable_metrics:
             self.metrics_collector.increment_decode_cuda_graph_pass(
                 value=can_run_cuda_graph
             )
@@ -938,7 +932,7 @@ class SchedulerBatchResultProcessor:
         self._mamba_prefix_cache_update(req, batch, result, i)
 
         if (
-            self.server_args.disaggregation_decode_enable_offload_kvcache
+            get_disagg().disaggregation_decode_enable_offload_kvcache
             and not req.finished()
         ):
             self.decode_offload_manager.offload_kv_cache(req)
@@ -958,12 +952,12 @@ class SchedulerBatchResultProcessor:
             self._maybe_collect_routed_experts(req)
             self._maybe_collect_indexer_topk(req)
 
-            if self.server_args.disaggregation_decode_enable_offload_kvcache:
+            if get_disagg().disaggregation_decode_enable_offload_kvcache:
                 # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes
                 if not self.decode_offload_manager.offload_kv_cache(req):
                     self.decode_offload_manager.finalize_release_on_finish(req)
             else:
-                if self.server_args.enable_hisparse:
+                if get_memory().enable_hisparse:
                     self.hisparse_coordinator.request_finished(req)
                 prepare_release = getattr(
                     self.model_worker, "prepare_for_kv_cache_release", None
@@ -1012,6 +1006,11 @@ class SchedulerBatchResultProcessor:
             req, batch, result, i
         )
 
+        if lazy and not batch.spec_algorithm.is_none():
+            # For spec, at_boundary means this step actually crossed an interval.
+            self._mamba_lazy_spec_update(req, batch, i, at_boundary, track_seqlen)
+            return
+
         if not at_boundary:
             return
 
@@ -1024,6 +1023,63 @@ class SchedulerBatchResultProcessor:
                     req.mamba_next_track_idx
                 )
             )
+
+    def _mamba_lazy_spec_update(
+        self, req: Req, batch: ScheduleBatch, i: int, crossed: bool, track_seqlen: int
+    ) -> None:
+        """Lazy + spec post-processing.
+
+        Running req with a confirmed crossing: the commit scattered the
+        crossing state into the planned position; promote it to keep unless
+        the plan already pointed at the keep slot (in-place fallback, or
+        promoted by an earlier overlapped confirmation).
+        Finishing req: donate the keep slot only if no scatter wrote it
+        (this step) or may still write it (the in-flight next step).
+        """
+        positions = batch.mamba_lazy_spec_track_positions_cpu
+        planned_pos = (
+            positions[i]
+            if positions is not None and i < len(positions)
+            else None  # filtered/merged snapshot without a plan: be conservative
+        )
+
+        if req.finished():
+            # Skip the donation if a scatter wrote or may still write the keep slot.
+            keep_written_by_this_step = (
+                crossed and planned_pos == req.mamba_next_track_idx
+            )
+            server_args = get_server_args()
+            other_idx = 1 - req.mamba_next_track_idx
+            # Recompute the in-flight verify's plan (kv_committed_len is
+            # frozen since its prepare, so the recompute is exact).
+            keep_may_be_written_in_flight = req.mamba_ping_pong_track_buffer[
+                other_idx
+            ].item() == -1 and mamba_lazy_spec_in_window(
+                req,
+                server_args.mamba_track_interval,
+                server_args.max_speculative_num_draft_tokens,
+            )
+            if (
+                planned_pos is None
+                or keep_written_by_this_step
+                or keep_may_be_written_in_flight
+            ):
+                req.mamba_lazy_is_insert = False
+            return
+
+        if not crossed or planned_pos is None:
+            return
+        if planned_pos != req.mamba_next_track_idx:
+            # Promote pending -> keep: free the old checkpoint, repoint.
+            pool = batch.req_to_token_pool
+            keep_idx = req.mamba_next_track_idx
+            keep_val = req.mamba_ping_pong_track_buffer[keep_idx]
+            pool.mamba_allocator.free(keep_val.unsqueeze(0))
+            pool.set_mamba_ping_pong_slot(req, keep_idx, -1)
+            req.mamba_next_track_idx = planned_pos
+        # else: in-place fallback, or promoted by an earlier confirmation —
+        # keep holds the track_seqlen state either way.
+        req.mamba_last_track_seqlen = track_seqlen
 
     def _mamba_check_track_boundary(self, req, batch, result, i):
         """Check if this decode step crosses a mamba track interval boundary.
@@ -1039,7 +1095,7 @@ class SchedulerBatchResultProcessor:
         For spec decode, the boundary is detected by comparing the
         accepted seq_len range against interval boundaries.
         """
-        interval = get_server_args().mamba_track_interval
+        interval = get_exec().mamba.mamba_track_interval
 
         if batch.spec_algorithm.is_none():
             if req.kv_committed_len % interval == 0:
