@@ -6443,6 +6443,21 @@ class ServerArgs:
                 "that selects IPC loading automatically."
             )
 
+        # The weight cache serves a single main-model weight set over CUDA IPC.
+        # Speculative decoding loads an extra draft model whose weights the
+        # daemon does not export, so the draft worker would fall through the
+        # meta-init IPC path with no tensors to map (or silently disk-load onto
+        # the shared GPU). Supporting it needs a separate draft-model daemon and
+        # is out of scope; refuse the combination up front instead of failing
+        # deep inside draft-worker load.
+        if self.weight_cache_mode != "off" and self.speculative_algorithm is not None:
+            raise ValueError(
+                "--weight-cache-mode is not supported together with speculative "
+                "decoding (--speculative-algorithm): the weight cache daemon does "
+                "not export the draft model's weights. Disable one of them "
+                "(--weight-cache-mode off) for this configuration."
+            )
+
     def _is_mistral_native_format(self) -> bool:
         """True iff the checkpoint requires load_format=mistral.
 

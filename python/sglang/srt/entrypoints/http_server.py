@@ -2665,6 +2665,7 @@ def launch_server(
         port_args,
         scheduler_init_result,
         subprocess_watchdog,
+        _weight_cache_daemon_procs,
     ) = Engine._launch_subprocesses(
         server_args=server_args,
         init_tokenizer_manager_func=init_tokenizer_manager_func,

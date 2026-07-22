@@ -25,7 +25,7 @@ from typing import Optional, Union
 import torch
 import torch.distributed as dist
 
-from sglang.srt.configs.load_config import LoadConfig, LoadFormat
+from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import (
     AttentionArch,
     ModelConfig,
@@ -128,6 +128,7 @@ from sglang.srt.model_executor.model_runner_components.load_model_utils import (
     load_kv_cache_scales,
     load_model_with_memory_saver,
     maybe_downgrade_dtype_for_legacy_gpu,
+    maybe_enable_ipc_weight_cache,
     maybe_register_debug_tensor_dump_hook,
     maybe_trigger_remote_instance_nccl_send_group,
     report_online_quantization,
@@ -933,24 +934,15 @@ class ModelRunner:
             weight_cache_socket=self.server_args.weight_cache_socket,
         )
 
-        # If weight cache is enabled, override load format to IPC_CACHE
-        if self.server_args.weight_cache_mode != "off":
-            self.load_config.fallback_load_format = self.load_config.load_format
-            self.load_config.load_format = LoadFormat.IPC_CACHE
-            # Compute socket path using global rank (tp_size * pp_rank + tp_rank)
-            # so each daemon has a unique socket even across PP stages and nodes.
-            if self.load_config.weight_cache_socket is None:
-                from sglang.srt.weight_cache.protocol import (
-                    compute_global_rank,
-                    get_socket_path,
-                )
-
-                global_rank = compute_global_rank(
-                    self.ps.tp_size, self.ps.pp_rank, self.ps.tp_rank
-                )
-                self.load_config.weight_cache_socket = get_socket_path(
-                    global_rank=global_rank
-                )
+        # If the weight cache is enabled, override the load format to IPC_CACHE
+        # and derive the per-rank daemon socket. Idempotent across reloads.
+        maybe_enable_ipc_weight_cache(
+            load_config=self.load_config,
+            server_args=self.server_args,
+            tp_size=self.ps.tp_size,
+            pp_rank=self.ps.pp_rank,
+            tp_rank=self.ps.tp_rank,
+        )
         if self.device == "cpu":
             self.model_config = adjust_config_with_unaligned_cpu_tp(
                 self.model_config, self.load_config, self.ps.tp_size

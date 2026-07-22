@@ -29,6 +29,7 @@ from sglang.srt.weight_cache.protocol import (
     check_ipc_quant_support,
     cleanup_stale_daemon_files,
     compute_global_rank,
+    compute_local_gpu_id,
     get_quant_method_name,
     get_ready_path,
     get_socket_path,
@@ -189,6 +190,26 @@ class TestGlobalRankAndPaths(CustomTestCase):
         self.assertTrue(get_socket_path(3).endswith("rank3.sock"))
         self.assertTrue(get_ready_path(3).endswith("rank3.ready"))
 
+    def test_compute_local_gpu_id_honors_base_and_step(self):
+        # Single-node TP=4: identity mapping rank -> gpu.
+        self.assertEqual(
+            compute_local_gpu_id(0, 2, pp_size_per_node=1, tp_size_per_node=4),
+            2,
+        )
+        # base_gpu_id offsets every rank; gpu_id_step strides between them.
+        self.assertEqual(
+            compute_local_gpu_id(
+                0, 2, pp_size_per_node=1, tp_size_per_node=4, base_gpu_id=4
+            ),
+            6,
+        )
+        self.assertEqual(
+            compute_local_gpu_id(
+                0, 2, pp_size_per_node=1, tp_size_per_node=4, gpu_id_step=2
+            ),
+            4,
+        )
+
 
 class TestIpcQuantAllowlist(CustomTestCase):
     def test_unquantized_is_supported(self):
@@ -292,6 +313,53 @@ class TestCleanupStaleDaemonFiles(CustomTestCase):
             if child.poll() is None:
                 child.kill()
                 child.wait(timeout=5)
+
+
+class TestDaemonModeRefusesDiskLoad(CustomTestCase):
+    """In daemon mode the engine and daemon share a GPU, so a missing daemon
+    must be a hard error — NOT a silent disk-load that would OOM the shared
+    device. This exercises that contract without a GPU or a live daemon by
+    pointing the loader at a socket path that does not exist.
+    """
+
+    RANK = 987655
+
+    def _model_config(self):
+        from types import SimpleNamespace
+
+        # Minimal stand-in: the loader only reads hf_config.quantization_config,
+        # quantization, and (unreached here) hf_config.architectures.
+        hf_config = SimpleNamespace(
+            architectures=["LlamaForCausalLM"], quantization_config=None
+        )
+        return SimpleNamespace(
+            model_path="/models/demo",
+            hf_config=hf_config,
+            quantization=None,
+            revision=None,
+            dtype="torch.float16",
+        )
+
+    def test_daemon_mode_missing_daemon_raises_instead_of_disk_load(self):
+        from sglang.srt.configs.load_config import LoadConfig, LoadFormat
+        from sglang.srt.weight_cache.ipc_loader import IpcModelLoader
+
+        missing_socket = get_socket_path(self.RANK)
+        if os.path.exists(missing_socket):
+            os.unlink(missing_socket)
+
+        loader = IpcModelLoader(
+            load_config=LoadConfig(load_format=LoadFormat.IPC_CACHE),
+            socket_path=missing_socket,
+            weight_cache_mode="daemon",
+            fallback_load_format="auto",
+        )
+
+        with self.assertRaises(RuntimeError) as ctx:
+            loader.load_model(model_config=self._model_config(), device_config=None)
+        # The error must be about the missing daemon, proving we did not quietly
+        # fall through to a disk load.
+        self.assertIn("daemon", str(ctx.exception).lower())
 
 
 if __name__ == "__main__":

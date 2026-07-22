@@ -16,7 +16,10 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-DEFAULT_MODEL = "Qwen/Qwen3-8B"
+# A ~1B model keeps the daemon->client IPC handoff cheap to exercise on every
+# PR (fast download + load) while still covering the real block-load path; the
+# test asserts the IPC path ran, not any particular model's quality.
+DEFAULT_MODEL = "Qwen/Qwen3-0.6B"
 
 # This file runs in two suites. The TP=2 class needs the 2-GPU runner (extra-a);
 # the TP=1 smoke class is always-on (base-b / 1-gpu-small) so the daemon->client

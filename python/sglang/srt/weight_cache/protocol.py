@@ -211,7 +211,13 @@ def check_ipc_quant_support(
 # ---------------------------------------------------------------------------
 
 
-MAX_MSG_SIZE = 4 * 1024 * 1024 * 1024  # 4 GiB sanity cap
+# Sanity cap on a single socket message. IPC messages carry only metadata —
+# base64 CUDA IPC handles plus per-tensor shape/dtype — never the weight bytes
+# themselves (those stay in GPU memory and are shared zero-copy). Even a model
+# with hundreds of thousands of tensors serializes to a few MiB here, so a
+# generous 64 MiB cap still rejects a corrupt/hostile length prefix long before
+# it can drive a multi-GiB allocation in recv_msg.
+MAX_MSG_SIZE = 64 * 1024 * 1024  # 64 MiB
 
 
 def send_msg(sock, obj: Any) -> None:
@@ -283,6 +289,30 @@ def compute_global_rank(tp_size: int, pp_rank: int, tp_rank: int) -> int:
     loader, model_runner, daemon) must go through this so the copies can't drift.
     """
     return tp_size * pp_rank + tp_rank
+
+
+def compute_local_gpu_id(
+    pp_rank: int,
+    tp_rank: int,
+    pp_size_per_node: int,
+    tp_size_per_node: int,
+    base_gpu_id: int = 0,
+    gpu_id_step: int = 1,
+) -> int:
+    """Single source of truth for the local GPU id a daemon rank runs on.
+
+    Mirrors the engine's device assignment so a daemon and the engine rank it
+    serves always land on the same physical GPU (a prerequisite for CUDA IPC).
+    ``base_gpu_id``/``gpu_id_step`` default to the identity mapping used by the
+    standalone launcher; the engine passes its real ``--base-gpu-id`` /
+    ``--gpu-id-step`` so every call site computes the id the same way instead of
+    keeping three drifting copies of the formula.
+    """
+    return (
+        base_gpu_id
+        + (pp_rank % pp_size_per_node) * tp_size_per_node
+        + (tp_rank % tp_size_per_node) * gpu_id_step
+    )
 
 
 def get_socket_path(global_rank: int) -> str:

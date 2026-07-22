@@ -209,14 +209,12 @@ class IpcModelLoader(BaseModelLoader):
         """Return (quant_method, quant_config) matching the daemon's fingerprint.
 
         Shared by the IPC allowlist gate and the CacheConfig fingerprint so the
-        two can never drift apart.
+        two can never drift apart. ModelConfig always exposes
+        hf_config/quantization directly; quantization_config is the only
+        genuinely-optional attribute.
         """
-        quant_config = getattr(model_config, "hf_config", None)
-        if quant_config is not None:
-            quant_config = getattr(quant_config, "quantization_config", None)
-        quant_method = get_quant_method_name(
-            getattr(model_config, "quantization", None)
-        )
+        quant_config = getattr(model_config.hf_config, "quantization_config", None)
+        quant_method = get_quant_method_name(model_config.quantization)
         if not quant_method and quant_config is not None:
             quant_method = get_quant_method_name(quant_config)
         return quant_method, quant_config
@@ -321,7 +319,13 @@ class IpcModelLoader(BaseModelLoader):
         # NOT in the meta-device model — we must register them as new attrs.
         # Use dicts (not sets) so we can do O(1) shape/dtype validation
         # without re-traversing the model tree on every lookup.
-        existing_params = {name: param for name, param in model.named_parameters()}
+        # remove_duplicate=False mirrors the daemon's export (which keys tied
+        # weights under every name) so a tied parameter is recognized under all
+        # of its names here too.
+        existing_params = {
+            name: param
+            for name, param in model.named_parameters(remove_duplicate=False)
+        }
         existing_buffers = {name: buf for name, buf in model.named_buffers()}
         existing_names = set(existing_params) | set(existing_buffers)
 
@@ -440,6 +444,17 @@ class IpcModelLoader(BaseModelLoader):
         """
         import socket as socket_mod
 
+        # Harden the well-known /tmp socket path: refuse to connect through a
+        # symlink so a link planted at the path cannot silently redirect us to a
+        # rogue daemon. A genuine daemon socket is a real AF_UNIX node created by
+        # bind(); the CacheConfig fingerprint check below still guards against a
+        # stale/foreign daemon that happens to bind here.
+        if os.path.islink(self.socket_path):
+            raise RuntimeError(
+                f"[IpcModelLoader] Refusing to connect: weight cache socket path "
+                f"{self.socket_path} is a symlink, not a daemon socket."
+            )
+
         sock = socket_mod.socket(socket_mod.AF_UNIX, socket_mod.SOCK_STREAM)
         try:
             sock.settimeout(30)  # 30s timeout for large state dicts
@@ -500,7 +515,7 @@ class IpcModelLoader(BaseModelLoader):
                 quant_method=quant_method,
                 quant_config_hash=hash_quant_config(quant_config),
                 dtype=str(model_config.dtype),
-                revision=getattr(model_config, "revision", None) or "",
+                revision=model_config.revision or "",
                 **compute_env_stamp(),
             )
 

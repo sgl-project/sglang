@@ -51,8 +51,10 @@ from sglang.srt.utils import MultiprocessingSerializer
 from .protocol import (
     CacheConfig,
     check_ipc_quant_support,
+    cleanup_stale_daemon_files,
     compute_env_stamp,
     compute_global_rank,
+    compute_local_gpu_id,
     get_quant_method_name,
     get_ready_path,
     get_socket_path,
@@ -209,13 +211,18 @@ class WeightCacheDaemon:
         from sglang.srt.runtime_context import get_context
         from sglang.srt.server_args import ServerArgs
 
-        # Set up global server args (required by model __init__ and weight loading)
+        # Set up global server args (required by model __init__ and weight loading).
+        # Pass the real PP/DP dims (not the defaults) so any load-path code that
+        # reads get_server_args().pp_size / .dp_size sees the same values that
+        # initialize_model_parallel below is configured with.
         server_args = ServerArgs(
             model_path=self.model_path,
             dtype=self.dtype,
             quantization=self.quantization,
             trust_remote_code=self.trust_remote_code,
             tp_size=self.tp_size,
+            pp_size=self.pp_size,
+            dp_size=self.dp_size,
             ep_size=self.ep_size,
             load_format=self.load_format,
             model_loader_extra_config=self.model_loader_extra_config,
@@ -237,11 +244,11 @@ class WeightCacheDaemon:
         # Loading may mutate hf_config.quantization_config (e.g. via
         # process_weights_after_loading), which would produce a different
         # hash than what the engine computes from the original config.
-        quant_config = getattr(model_config, "hf_config", None)
-        if quant_config is not None:
-            quant_config = getattr(quant_config, "quantization_config", None)
+        # ModelConfig always exposes hf_config/quantization directly;
+        # quantization_config is the only genuinely-optional attribute.
+        quant_config = getattr(model_config.hf_config, "quantization_config", None)
         quant_method = get_quant_method_name(
-            self.quantization or getattr(model_config, "quantization", None)
+            self.quantization or model_config.quantization
         )
         if not quant_method and quant_config is not None:
             quant_method = get_quant_method_name(quant_config)
@@ -402,10 +409,12 @@ class WeightCacheDaemon:
 
     def serve(self):
         """Block and serve IPC handles over Unix socket."""
-        # Clean up any stale socket
-        if os.path.exists(self.socket_path):
-            os.unlink(self.socket_path)
-
+        # Do NOT unlink an existing socket here. Stale-file cleanup is the launch
+        # path's job (cleanup_stale_daemon_files), which refuses to remove a
+        # socket whose .ready still points at a live PID. Blindly unlinking here
+        # would let a second daemon for the same rank silently steal a live
+        # daemon's socket; instead, a leftover live socket makes bind() fail
+        # loudly with "address already in use".
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         old_umask = os.umask(0o177)
         try:
@@ -596,6 +605,8 @@ def launch_weight_cache_daemons(
     ep_size: int = 1,
     nnodes: int = 1,
     node_rank: int = 0,
+    base_gpu_id: int = 0,
+    gpu_id_step: int = 1,
     load_format: str = "auto",
     dtype: str = "auto",
     quantization: Optional[str] = None,
@@ -637,8 +648,6 @@ def launch_weight_cache_daemons(
     import subprocess
     import sys
 
-    from .protocol import get_ready_path
-
     # Replicate _calculate_rank_ranges logic from engine.py
     pp_size_per_node = max(pp_size // nnodes, 1)
     nnodes_per_pp_rank = max(nnodes // pp_size, 1)
@@ -671,8 +680,6 @@ def launch_weight_cache_daemons(
     daemon_module = "sglang.srt.weight_cache.daemon"
 
     # Validate and clean up stale .ready/.sock files from prior runs.
-    from .protocol import cleanup_stale_daemon_files
-
     for pp_rank in pp_rank_range:
         for tp_rank in tp_rank_range:
             global_rank = compute_global_rank(tp_size, pp_rank, tp_rank)
@@ -681,8 +688,13 @@ def launch_weight_cache_daemons(
     procs = []
     for pp_rank in pp_rank_range:
         for tp_rank in tp_rank_range:
-            gpu_id = (pp_rank % pp_size_per_node) * tp_size_per_node + (
-                tp_rank % tp_size_per_node
+            gpu_id = compute_local_gpu_id(
+                pp_rank,
+                tp_rank,
+                pp_size_per_node,
+                tp_size_per_node,
+                base_gpu_id=base_gpu_id,
+                gpu_id_step=gpu_id_step,
             )
             cmd = [
                 python_path,
@@ -774,10 +786,20 @@ def launch_weight_cache_daemons(
         f"dist_init_method={dist_init_method})"
     )
 
-    # Monitor daemons — if any exits, terminate all and raise
+    # Monitor daemons — poll all of them and, the moment any one exits,
+    # terminate the rest and raise. A serial proc.wait() would not notice a
+    # mid-list death (e.g. procs[1] dying while procs[0] is still alive) until
+    # the earlier proc happened to exit, and it never surfaced the failure.
+    exited = None
     try:
-        for proc in procs:
-            proc.wait()
+        while exited is None:
+            for proc in procs:
+                if proc.poll() is not None:
+                    exited = proc
+                    break
+            else:
+                time.sleep(1)
+                continue
     except KeyboardInterrupt:
         logger.info("Received KeyboardInterrupt, shutting down daemons")
     finally:
@@ -790,6 +812,12 @@ def launch_weight_cache_daemons(
             except subprocess.TimeoutExpired:
                 proc.kill()
         logger.info("All weight cache daemons have been terminated")
+
+    if exited is not None:
+        raise RuntimeError(
+            f"Weight cache daemon (pid={exited.pid}) exited with code "
+            f"{exited.returncode}; terminated the remaining daemons."
+        )
 
 
 if __name__ == "__main__":
@@ -817,6 +845,21 @@ if __name__ == "__main__":
     parser.add_argument("--pp-size", type=int, default=1, help="Pipeline parallel size")
     parser.add_argument("--pp-rank", type=int, default=0, help="Pipeline parallel rank")
     parser.add_argument("--nnodes", type=int, default=1, help="Total number of nodes")
+    parser.add_argument(
+        "--base-gpu-id",
+        type=int,
+        default=0,
+        help="GPU id of this node's first rank (mirrors the engine's "
+        "--base-gpu-id). Used to place daemons on the same GPUs the engine "
+        "ranks will use.",
+    )
+    parser.add_argument(
+        "--gpu-id-step",
+        type=int,
+        default=1,
+        help="Stride between consecutive ranks' GPU ids (mirrors the engine's "
+        "--gpu-id-step).",
+    )
     parser.add_argument(
         "--node-rank",
         type=int,
@@ -861,6 +904,13 @@ if __name__ == "__main__":
         # Single-rank mode: launch one daemon for the specified rank
         gpu_id = args.gpu_id if args.gpu_id is not None else args.tp_rank
         tp_rank = args.tp_rank if args.tp_rank is not None else args.gpu_id
+        # Refuse to clobber a live daemon already holding this rank (mirrors the
+        # multi-rank launcher and the engine path, which the multi-rank spawns
+        # of this same entrypoint rely on). --force kills and takes over.
+        cleanup_stale_daemon_files(
+            compute_global_rank(args.tp_size, args.pp_rank, tp_rank),
+            force=args.force,
+        )
         run_weight_cache_daemon(
             model_path=args.model_path,
             gpu_id=gpu_id,
@@ -888,6 +938,8 @@ if __name__ == "__main__":
             ep_size=args.ep_size,
             nnodes=args.nnodes,
             node_rank=args.node_rank,
+            base_gpu_id=args.base_gpu_id,
+            gpu_id_step=args.gpu_id_step,
             load_format=args.load_format,
             dtype=args.dtype,
             quantization=args.quantization,
