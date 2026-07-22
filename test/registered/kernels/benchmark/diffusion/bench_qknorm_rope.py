@@ -11,11 +11,17 @@ from sglang.kernels.jit.benchmark.utils import (
     get_benchmark_range,
     run_benchmark_no_cudagraph,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.srt.utils import is_hip
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(
     est_time=13, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
 )
+register_amd_ci(est_time=13, stage="jit-kernel-benchmark", runner_config="amd")
+
+# The "split" provider uses FlashInfer RoPE (CUDA-only); on ROCm we benchmark
+# the fully-fused SGL JIT QKNorm+RoPE kernel alone.
+_IS_HIP = is_hip()
 
 MAX_SEQ_LEN = 131072
 ROPE_BASE = 10000.0
@@ -45,9 +51,14 @@ CASE_NAMES = get_benchmark_range(
     full_range=[case.name for case in BENCH_CASES],
     ci_range=[case.name for case in BENCH_CASES],
 )
-LINE_VALS = ["split", "fused"]
-LINE_NAMES = ["JIT QKNorm + FlashInfer RoPE", "SGL JIT Fused QKNorm+RoPE"]
-STYLES = [("red", "-"), ("blue", "--")]
+if _IS_HIP:
+    LINE_VALS = ["fused"]
+    LINE_NAMES = ["SGL JIT Fused QKNorm+RoPE"]
+    STYLES = [("blue", "--")]
+else:
+    LINE_VALS = ["split", "fused"]
+    LINE_NAMES = ["JIT QKNorm + FlashInfer RoPE", "SGL JIT Fused QKNorm+RoPE"]
+    STYLES = [("red", "-"), ("blue", "--")]
 
 
 def create_cos_sin_cache(
