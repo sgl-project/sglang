@@ -65,14 +65,20 @@ _PRE_LOAD_HOST_AVAIL = _host_available_bytes()
 # estimated reserve happened to sit ~0.2 GB above their true non-expert weights booted reliably.
 _NONEXPERT_RUNTIME_RESERVE = 0.5e9
 
-# Aggressive single-stream auto-K (SGLANG_PAGED_AGGRESSIVE_K=1, gated to max_running_requests==1). At bs=1
-# the two concurrency-scaled safety margins — the mem_fraction activation headroom (~10% of VRAM) and the
-# non-expert runtime padding above — are over-provisioned by ~a GB, capping K well below the physical
-# ceiling. Aggressive mode reclaims them: a FIXED activation reserve (below, overridable) replaces the
-# percentage, and the non-expert padding shrinks to a small real-workspace slack. Safe because it is gated
-# to bs=1 and the KV reserve still floors the pool to one prefill chunk (+ window). Defaults chosen from the
-# measured bs=1 footprint (capture pool ~0.1 GB + prefill activation + fragmentation slack).
-_AGGRESSIVE_ACT_RESERVE = 0.5e9  # fixed activations + cuda-graph + fragmentation reserve at bs=1
+# Aggressive auto-K (SGLANG_PAGED_AGGRESSIVE_K=1). The two concurrency-scaled safety margins — the
+# mem_fraction activation headroom (~10% of VRAM) and the non-expert runtime padding above — are
+# over-provisioned by ~a GB, capping K well below the physical ceiling. Aggressive mode reclaims them: a
+# MEASURED activation reserve (below) replaces the percentage, and the non-expert padding shrinks to a small
+# real-workspace slack. The KV reserve still floors the pool to one prefill chunk (+ window).
+#
+# Batch: chunked prefill caps the PREFILL activation peak at chunked_prefill_size regardless of batch (chunks
+# are scheduled, not run as one forward), so activations barely scale with bs — verified stable at bs=2 with
+# the bs=1 reserve. What does scale with bs is decode-time logits/workspaces + the captured-graph pool, so the
+# reserve carries a small per-running-request term. base + per_req*mrr; bs=1 == 0.5 GB (the tuned value).
+# Higher mrr also grows the KV reserve, which squeezes K on its own — so aggressive at high concurrency
+# self-limits. Validated for modest bs (≤~4 on this card); the linear term errs toward safety beyond that.
+_AGGRESSIVE_ACT_BASE = 0.4e9  # bs-independent: prefill-chunk activation + fragmentation slack
+_AGGRESSIVE_ACT_PER_REQ = 0.1e9  # per running request: decode logits/workspaces + captured-graph pool
 _AGGRESSIVE_WORKSPACE_SLACK = 0.2e9  # real loader/quant workspace kept on top of the EXACT non-expert bytes
 
 
@@ -220,15 +226,20 @@ def resolve_num_resident_experts(
             embed_bytes += int(1.0e9)  # VL checkpoints load a vision tower + projector
         nonexpert_bytes = max(nonexpert_reserve_gb * 1e9, _NONEXPERT_BASE + embed_bytes)
 
-    # Aggressive single-stream reclaim (opt-in, bs==1): replace the mem_fraction activation headroom with a
-    # fixed reserve and shrink the non-expert padding to a small workspace slack (see _AGGRESSIVE_* above).
-    aggressive = bool(os.environ.get("SGLANG_PAGED_AGGRESSIVE_K")) and mrr == 1
+    # Aggressive reclaim (opt-in): replace the mem_fraction activation headroom with a measured, batch-scaled
+    # reserve and shrink the non-expert padding to a small workspace slack (see _AGGRESSIVE_* above). Works at
+    # bs>1 — the reserve carries a per-running-request term.
+    aggressive = bool(os.environ.get("SGLANG_PAGED_AGGRESSIVE_K"))
     act_reserve = None
     if aggressive:
         if exact is not None:
             nonexpert_bytes = exact + _AGGRESSIVE_WORKSPACE_SLACK
         _act_gb = os.environ.get("SGLANG_PAGED_ACT_RESERVE_GB")
-        act_reserve = (float(_act_gb) * 1e9) if _act_gb else _AGGRESSIVE_ACT_RESERVE
+        act_reserve = (
+            (float(_act_gb) * 1e9)
+            if _act_gb
+            else _AGGRESSIVE_ACT_BASE + _AGGRESSIVE_ACT_PER_REQ * mrr
+        )
 
     # The budget the expert pool + KV/window share (before any window ring is charged).
     k_budget = (
@@ -281,7 +292,6 @@ def resolve_num_resident_experts(
     if _kvwin:
         _cps = int(getattr(sa, "chunked_prefill_size", 0) or 2048)
         ctx = min(ctx, int(_kvwin) + _cps)
-    mrr = max(1, int(getattr(sa, "max_running_requests", 1) or 1))
     kv_gb = getattr(sa, "paged_experts_kv_reserve_gb", -1.0)
     if kv_gb is not None and kv_gb >= 0:
         kv_reserve = kv_gb * 1e9

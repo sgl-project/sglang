@@ -24,19 +24,31 @@ from sglang.jit_kernel.paged_experts_decide import paged_experts_host_devptr
 from sglang.srt.layers.moe.paged_experts.store import _pinned_empty
 
 
+# CUDA-array-interface uint typestr per element width. We alias the pinned buffer as an unsigned int of the
+# same byte width (types that lack a CAI typestr — bf16, fp8 — have none of their own), then ``.view(dtype)``
+# reinterprets it. Covers every per-element KV dtype: fp8_e4m3/e5m2 (1B), fp16/bf16 (2B), fp32 (4B).
+_UINT_TYPESTR = {1: "|u1", 2: "<u2", 4: "<u4"}
+
+
 def _uva_buffer(shape, dtype: torch.dtype):
     """A CUDA tensor ALIASING mapped-UVA pinned host memory (kernel-readable over PCIe, host-resident).
 
-    Aliases via ``__cuda_array_interface__`` as ``uint16`` then ``.view(dtype)`` so 2-byte dtypes (fp16/bf16 —
-    bf16 has no CAI typestr) both work. Returns ``(device_view, host_tensor)``; keep the host tensor alive for
-    the lifetime of the view (its pages back the UVA mapping)."""
-    assert dtype.itemsize == 2, f"host-UVA tail pool is 2-byte KV only (fp16/bf16), got {dtype}"
+    Aliases the pinned bytes as a same-width uint (via ``__cuda_array_interface__``) then ``.view(dtype)``, so
+    any 1/2/4-byte KV element dtype works (fp8, fp16, bf16, fp32). Returns ``(device_view, host_tensor)``; keep
+    the host tensor alive for the lifetime of the view (its pages back the UVA mapping)."""
+    typestr = _UINT_TYPESTR.get(dtype.itemsize)
+    if typestr is None:
+        # Sub-byte-packed KV (e.g. nvfp4, 2 values/byte) can't be addressed as per-element rows here.
+        raise NotImplementedError(
+            f"windowed KV store supports 1/2/4-byte KV element dtypes (fp8/fp16/bf16/fp32); got {dtype} "
+            f"(itemsize {dtype.itemsize}). For sub-byte-packed KV (nvfp4) run without SGLANG_KV_WINDOW."
+        )
     host = _pinned_empty(tuple(shape), dtype)
-    host.zero_()
+    host.view(torch.uint8).zero_()  # dtype-agnostic zero-fill (fp8 has no reliable .zero_())
     cai = SimpleNamespace()
     cai.__cuda_array_interface__ = {
         "shape": tuple(shape),
-        "typestr": "<u2",  # element-size-only alias; reinterpreted below
+        "typestr": typestr,  # element-size-only alias; reinterpreted below
         "data": (int(paged_experts_host_devptr(host)), False),
         "version": 3,
         "strides": None,
