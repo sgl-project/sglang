@@ -2161,9 +2161,10 @@ def select_experts(
                 **_fused_topk_kwargs,
             )
     else:
-        assert (
-            num_token_non_padded is None
-        ), "num_token_non_padded is not yet supported in custom_routing_function"
+        # custom_routing_function itself is padding-unaware; its output on
+        # padded rows is garbage. That is fine because _post_process_topk_ids
+        # below masks rows >= num_token_non_padded (-1 on CUDA, 0 + zeroed
+        # weights on HIP) after the logical->physical remap.
         assert not apply_routed_scaling_factor_on_output, "Not implemented"
         topk_weights, topk_ids = custom_routing_function(
             hidden_states=hidden_states,
