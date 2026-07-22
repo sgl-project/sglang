@@ -76,6 +76,9 @@ def should_use_dsa_fused_topk(
 
 
 def is_dsa_enable_prefill_cp():
+    # Derive from the runtime CP topology + model arch rather than the legacy
+    # ``enable_dsa_prefill_context_parallel`` flag: DSA prefill CP is active when
+    # the CP group is on (attn_cp_size > 1) for a DeepSeek Sparse Attention model.
     if get_parallel().attn_cp_size <= 1:
         return False
     from sglang.srt.configs.model_config import is_deepseek_dsa
@@ -86,14 +89,14 @@ def is_dsa_enable_prefill_cp():
 def is_dsa_prefill_cp_in_seq_split():
     return (
         is_dsa_enable_prefill_cp()
-        and get_server_args().dsa_prefill_cp_mode == "in-seq-split"
+        and get_parallel().dsa_prefill_cp_mode == "in-seq-split"
     )
 
 
 def is_dsa_prefill_cp_round_robin_split():
     return (
         is_dsa_enable_prefill_cp()
-        and get_server_args().dsa_prefill_cp_mode == "round-robin-split"
+        and get_parallel().dsa_prefill_cp_mode == "round-robin-split"
     )
 
 

@@ -37,10 +37,14 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     get_tc_piecewise_forward_context,
     is_in_tc_piecewise_cuda_graph,
 )
-from sglang.srt.runtime_context import get_parallel, get_server_args
-from sglang.srt.state_capturer.indexer_topk import (
-    maybe_capture_indexer_topk,
+from sglang.srt.runtime_context import (
+    get_device,
+    get_exec,
+    get_parallel,
+    get_schedule,
+    get_server_args,
 )
+from sglang.srt.state_capturer.indexer_topk import maybe_capture_indexer_topk
 from sglang.srt.utils import (
     add_prefix,
     ceil_align,
@@ -105,9 +109,7 @@ if is_npu():
     import torch_npu
     from sglang.srt.hardware_backend.npu.utils import get_indexer_weight_stream
 
-from sglang.srt.distributed import (
-    get_attn_tp_group,
-)
+from sglang.srt.distributed import get_attn_tp_group
 from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.communicator import ScatterMode
@@ -460,7 +462,7 @@ class Indexer(MultiPlatformOp):
             base=rope_theta,  # type: ignore
             rope_scaling=rope_scaling,
             is_neox_style=is_neox_style,
-            device=get_server_args().device,
+            device=get_device().device,
         )
         self.block_size = block_size
         self.scale_fmt = scale_fmt
@@ -471,7 +473,7 @@ class Indexer(MultiPlatformOp):
             self.num_local_tokens = getattr(config, "index_local_tokens", 0)
 
         self.paged_mqa_logits_backend = DSAPagedMQALogitsBackend.resolve(
-            get_server_args().dsa_paged_mqa_logits_backend
+            get_exec().kernel.dsa_paged_mqa_logits_backend
         )
 
     @contextlib.contextmanager
@@ -1066,7 +1068,7 @@ class Indexer(MultiPlatformOp):
         total_mem = torch.cuda.get_device_properties(device_index).total_memory
 
         total_mem_budget = int(total_mem * self._MQA_LOGITS_TOTAL_MEM_FRACTION)
-        mem_fraction_static = get_server_args().mem_fraction_static
+        mem_fraction_static = get_schedule().mem_fraction_static
         if mem_fraction_static is None:
             static_budget = total_mem_budget
         else:

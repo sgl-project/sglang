@@ -47,7 +47,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils.common import (
     is_cpu,
     is_npu,
@@ -238,6 +238,10 @@ class LogitsMetadata:
 
     mm_input_embeds: Optional[torch.Tensor] = None
 
+    # DRAFT_EXTEND_V2: when set, lm_head runs only on these rows (see
+    # EagleDraftExtendInput.select_index).
+    draft_extend_select_index: Optional[torch.Tensor] = None
+
     @classmethod
     def from_forward_batch(cls, forward_batch: ForwardBatch):
         if (
@@ -265,6 +269,11 @@ class LogitsMetadata:
                 extend_token_ids_logprob
             ) = extend_logprob_pruned_lens_cpu = False
 
+        if forward_batch.forward_mode.is_draft_extend_v2():
+            draft_extend_select_index = forward_batch.spec_info.select_index
+        else:
+            draft_extend_select_index = None
+
         return cls(
             forward_mode=forward_batch.forward_mode,
             capture_hidden_mode=forward_batch.capture_hidden_mode,
@@ -288,6 +297,7 @@ class LogitsMetadata:
             global_num_tokens_for_logprob_gpu=forward_batch.global_num_tokens_for_logprob_gpu,
             dp_padding_mode=DpPaddingMode.SUM_LEN,
             mm_input_embeds=forward_batch.mm_input_embeds,
+            draft_extend_select_index=draft_extend_select_index,
         )
 
     def compute_dp_attention_metadata(self):
@@ -335,8 +345,8 @@ class LogitsProcessor(nn.Module):
         self.config = config
         self.vocab_size = config.vocab_size
         self.logit_scale = logit_scale
-        self.use_attn_tp_group = get_server_args().enable_dp_lm_head
-        self.use_fp32_lm_head = get_server_args().enable_fp32_lm_head
+        self.use_attn_tp_group = get_parallel().enable_dp_lm_head
+        self.use_fp32_lm_head = get_exec().features.enable_fp32_lm_head
         if self.use_attn_tp_group:
             self.attn_tp_size = get_parallel().attn_tp_size
             self.do_tensor_parallel_all_gather = (
@@ -360,8 +370,8 @@ class LogitsProcessor(nn.Module):
             self.final_logit_softcapping = None
 
         self.return_full_logits = return_full_logits
-        self.enable_mis = get_server_args().enable_mis
-        self.rl_on_policy_target = get_server_args().rl_on_policy_target
+        self.enable_mis = get_exec().features.enable_mis
+        self.rl_on_policy_target = get_exec().deterministic.rl_on_policy_target
 
         self._logits_gatherer = triton_symm_mem_ag.MultimemAllGatherer(
             max_tokens=triton_symm_mem_ag.recommended_max_tokens(
@@ -463,16 +473,13 @@ class LogitsProcessor(nn.Module):
             skip_chunking_for_dp_attn=self.do_tensor_parallel_all_gather_dp_attn,
         )
 
-        return LogitsProcessorOutput(
+        logits_output = LogitsProcessorOutput(
             next_token_logits=sampled_logits,
             hidden_states=hidden_states_to_store,
-            input_token_logprobs=logprobs_result.input_token_logprobs,
-            input_top_logprobs_val=logprobs_result.input_top_logprobs_val,
-            input_top_logprobs_idx=logprobs_result.input_top_logprobs_idx,
-            input_token_ids_logprobs_val=logprobs_result.input_token_ids_logprobs_val,
-            input_token_ids_logprobs_idx=logprobs_result.input_token_ids_logprobs_idx,
             mm_input_embeds=logits_metadata.mm_input_embeds,
         )
+        logprobs_result.write_input_to(logits_output)
+        return logits_output
 
     def _get_pruned_states(
         self,
@@ -490,7 +497,12 @@ class LogitsProcessor(nn.Module):
             or logits_metadata.forward_mode.is_target_verify()
             or logits_metadata.forward_mode.is_draft_extend_v2()
         ):
-            pruned_states = hidden_states
+            if logits_metadata.draft_extend_select_index is not None:
+                # Only next_token_logits narrows to [bs, vocab]; the
+                # FULL-capture hidden stays unpruned.
+                pruned_states = hidden_states[logits_metadata.draft_extend_select_index]
+            else:
+                pruned_states = hidden_states
             pruned_states_before_norm = hidden_states_before_norm
             if aux_hidden_states is not None:
                 aux_pruned_states = [hidden for hidden in aux_hidden_states]

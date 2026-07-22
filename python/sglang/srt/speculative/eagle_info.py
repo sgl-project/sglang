@@ -8,7 +8,7 @@ from sglang.kernels.ops.attention.utils import create_flashinfer_kv_indices_trit
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import get_spec
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 
 logger = logging.getLogger(__name__)
@@ -202,7 +202,7 @@ class EagleDraftInput(SpecInput):
             topk_index=torch.empty((0, topk), device=device, dtype=torch.int64),
             draft_probs=(
                 torch.empty((0, vocab_size), device=device, dtype=torch.float32)
-                if get_server_args().speculative_use_rejection_sampling
+                if get_spec().speculative_use_rejection_sampling
                 else None
             ),
             capture_hidden_mode=capture_hidden_mode,
@@ -313,6 +313,7 @@ class EagleDraftExtendInput(SpecInput):
     # Both kept for cuda-graph buffer indexing.
     num_correct_drafts: torch.Tensor = None
     num_accept_tokens: torch.Tensor = None
+    num_front_tokens: int = 0
     # CPU view, read by attention backends during the extend forward.
     num_accept_tokens_cpu: List[int] = None
 
@@ -337,6 +338,12 @@ class EagleDraftExtendInput(SpecInput):
 
     dsa_seed_topk_capture: Optional[torch.Tensor] = None
     dsa_seed_topk_select: Optional[torch.Tensor] = None
+
+    # Flat per-req index of each request's last accepted window row
+    # (i * window + front + num_correct_drafts[i]). When set, the logits
+    # processor runs lm_head only on these rows. None under gathered-buffer
+    # (DP) modes, whose logprob buffer sizing assumes all-row logits.
+    select_index: Optional[torch.Tensor] = None
 
     # None for draft-extend's idle batch; attention backends fall back to
     # rebuilding plain metadata from seq_lens when this is None.

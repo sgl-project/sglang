@@ -32,7 +32,7 @@ from typing import (
 import torch
 import torch.nn.functional as F
 
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_exec, get_lora, get_parallel
 
 try:
     from triton_kernels.matmul_ogs import GatherIndx, RoutingData, ScatterIndx
@@ -83,9 +83,7 @@ except ImportError:
     pass
 
 from sglang.jit_kernel.dsv4 import mask_topk_ids
-from sglang.srt.distributed import (
-    get_tp_group,
-)
+from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -98,9 +96,7 @@ from sglang.srt.eplb.expert_location_dispatch import (
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import get_moe_runner_backend
-from sglang.srt.layers.moe.utils import (
-    has_per_rank_fused_shared_slots,
-)
+from sglang.srt.layers.moe.utils import has_per_rank_fused_shared_slots
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 from sglang.srt.utils import (
@@ -252,11 +248,16 @@ class TopKOutputChecker:
     def format_is_bypassed(topk_output: TopKOutput) -> TypeGuard[BypassedTopKOutput]:
         return isinstance(topk_output, BypassedTopKOutput)
 
+    @staticmethod
+    def format_is_packed(topk_output: TopKOutput) -> TypeGuard[PackedTopKOutput]:
+        return isinstance(topk_output, PackedTopKOutput)
+
 
 class TopKOutputFormat(IntEnum):
     STANDARD = auto()
     TRITON_KERNEL = auto()
     BYPASSED = auto()
+    PACKED = auto()
 
 
 @runtime_checkable
@@ -338,6 +339,22 @@ class BypassedTopKOutput(NamedTuple):
         )
 
 
+class PackedTopKOutput(NamedTuple):
+    """Packed top-k output format used by FlashInfer TRT-LLM routed MoE.
+
+    ``packed_topk_ids`` is an int32 tensor of shape (num_tokens, top_k) where each
+    element encodes the expert id in the upper 16 bits and the bf16 routing
+    weight bits in the lower 16 bits, matching FlashInfer's packed layout.
+    """
+
+    packed_topk_ids: torch.Tensor
+    router_logits: torch.Tensor
+
+    @property
+    def format(self) -> TopKOutputFormat:
+        return TopKOutputFormat.PACKED
+
+
 def _make_round_robin_expert_ids(
     num_tokens: int,
     topk: int,
@@ -398,10 +415,9 @@ class TopK(MultiPlatformOp):
             assert num_expert_group is not None and topk_group is not None
 
         self.layer_id = layer_id
-        from sglang.srt.runtime_context import get_server_args
 
         self.enable_waterfill = (
-            num_fused_shared_experts > 0 and get_server_args().enable_waterfill
+            num_fused_shared_experts > 0 and get_exec().moe.enable_waterfill
         )
 
         self.waterfill_balancer = None
@@ -475,9 +491,8 @@ class TopK(MultiPlatformOp):
         # ===== TO BE REFACTORED ====
         elif get_moe_runner_backend().is_experimental_sgl_trtllm():
             try:
-                from sglang.srt.runtime_context import get_server_args
 
-                use_standard_for_lora = bool(get_server_args().enable_lora)
+                use_standard_for_lora = bool(get_lora().enable_lora)
             except ValueError:
                 use_standard_for_lora = False
             output_format = (
@@ -2131,9 +2146,10 @@ def select_experts(
                 **_fused_topk_kwargs,
             )
     else:
-        assert (
-            num_token_non_padded is None
-        ), "num_token_non_padded is not yet supported in custom_routing_function"
+        # custom_routing_function itself is padding-unaware; its output on
+        # padded rows is garbage. That is fine because _post_process_topk_ids
+        # below masks rows >= num_token_non_padded (-1 on CUDA, 0 + zeroed
+        # weights on HIP) after the logical->physical remap.
         assert not apply_routed_scaling_factor_on_output, "Not implemented"
         topk_weights, topk_ids = custom_routing_function(
             hidden_states=hidden_states,

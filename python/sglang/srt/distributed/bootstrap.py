@@ -61,15 +61,7 @@ def init_torch_distributed(
     tic = time.perf_counter()
     logger.info("Init torch distributed begin.")
 
-    try:
-        torch.get_device_module(device).set_device(ps.gpu_id)
-    except Exception:
-        logger.warning(
-            f"Context: {device=} {ps.gpu_id=} {os.environ.get('CUDA_VISIBLE_DEVICES')=} {ps.tp_rank=} {ps.tp_size=}"
-        )
-        raise
-
-    backend = _resolve_backend(device=device, server_args=server_args, gpu_id=ps.gpu_id)
+    backend = _resolve_backend(device=device, server_args=server_args)
 
     before_avail_memory = get_available_gpu_memory(device, ps.gpu_id)
     if not server_args.enable_p2p_check:
@@ -143,27 +135,10 @@ def init_torch_distributed(
     )
 
 
-def _resolve_backend(*, device: str, server_args: ServerArgs, gpu_id: int) -> str:
+def _resolve_backend(*, device: str, server_args: ServerArgs) -> str:
     backend = get_default_distributed_backend(device)
     if device == "cuda" and server_args.elastic_ep_backend == "mooncake":
         backend = "mooncake"
-        if server_args.mooncake_ib_device:
-            from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
-                get_ib_devices_for_gpu,
-            )
-
-            ib_device_for_gpu = get_ib_devices_for_gpu(
-                server_args.mooncake_ib_device, gpu_id
-            )
-            mooncake_ib_device = (
-                ib_device_for_gpu.split(",") if ib_device_for_gpu else []
-            )
-            try:
-                from mooncake import ep as mooncake_ep
-
-                mooncake_ep.set_device_filter(mooncake_ib_device)
-            except:
-                pass  # A warning will be raised in `init_distributed_environment`
     return backend
 
 

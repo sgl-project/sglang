@@ -26,7 +26,7 @@ from sglang.srt.mem_cache.common import (
     evict_from_tree_cache,
 )
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import get_exec, get_server_args
 from sglang.srt.utils import (
     is_cpu,
     is_cuda,
@@ -65,7 +65,7 @@ def write_cache_indices(
     prefix_tensors: list[torch.Tensor],
     req_to_token_pool: ReqToTokenPool,
 ):
-    if support_triton(get_server_args().attention_backend):
+    if support_triton(get_exec().kernel.attention_backend):
         prefix_pointers = torch.tensor(
             [t.data_ptr() for t in prefix_tensors],
             dtype=torch.uint64,
@@ -106,7 +106,7 @@ def get_last_loc(
     req_pool_indices_tensor: torch.Tensor,
     prefix_lens_tensor: torch.Tensor,
 ) -> torch.Tensor:
-    attn_backend = get_server_args().attention_backend
+    attn_backend = get_exec().kernel.attention_backend
     uses_triton_dispatch = attn_backend not in ("ascend", "torch_native")
 
     if _is_hip and uses_triton_dispatch:
@@ -315,6 +315,13 @@ def alloc_for_extend(
 
     prefix_tensors = [r.prefix_indices for r in batch.reqs]
 
+    reuse_kv = None
+    if batch.is_dllm():
+        reuse_kv = [
+            r.req_pool_idx is not None and bool(r.dllm_incomplete_ids)
+            for r in batch.reqs
+        ]
+
     # Create tensors for allocation
     prefix_lens_cpu = torch.tensor(batch.prefix_lens, dtype=torch.int64)
     extend_lens_cpu = torch.tensor(batch.extend_lens, dtype=torch.int64)
@@ -329,7 +336,18 @@ def alloc_for_extend(
     req_pool_indices_device = req_pool_indices_cpu.to(batch.device, non_blocking=True)
 
     # Allocate KV cache (throws exception on failure)
-    if _alloc_page_size(batch) == 1:
+    alloc_page_size = _alloc_page_size(batch)
+    if reuse_kv is not None and any(reuse_kv):
+        out_cache_loc = _alloc_extend_loc_with_kv_reuse(
+            batch,
+            reuse_kv,
+            req_pool_indices_cpu,
+            prefix_lens_cpu,
+            extend_lens_cpu,
+            req_pool_indices_device,
+            alloc_page_size,
+        )
+    elif alloc_page_size == 1:
         out_cache_loc = alloc_token_slots(batch.tree_cache, batch.extend_num_tokens)
     else:
         # Paged allocation - build last_loc
@@ -383,6 +401,87 @@ def alloc_for_extend(
             req.kv.kv_allocated_len = seq_len
 
     return out_cache_loc, req_pool_indices_device, req_pool_indices_cpu
+
+
+def _alloc_extend_loc_with_kv_reuse(
+    batch: ScheduleBatch,
+    reuse_kv: list[bool],
+    req_pool_indices_cpu: torch.Tensor,
+    prefix_lens_cpu: torch.Tensor,
+    extend_lens_cpu: torch.Tensor,
+    req_pool_indices_device: torch.Tensor,
+    alloc_page_size: int,
+) -> torch.Tensor:
+    device = batch.device
+    req_to_token = batch.req_to_token_pool.req_to_token
+
+    for i, req in enumerate(batch.reqs):
+        if not reuse_kv[i]:
+            continue
+        prefix_len = int(prefix_lens_cpu[i])
+        extend_len = int(extend_lens_cpu[i])
+        retained_len = len(req.dllm_incomplete_ids)
+        if extend_len != retained_len:
+            raise RuntimeError("dLLM FDFO retained KV must be reused as a full block.")
+        if req.kv is None or prefix_len + extend_len > req.kv.kv_allocated_len:
+            raise RuntimeError("dLLM FDFO retained KV is missing.")
+
+    alloc_extend_lens = [
+        0 if reuse_kv[i] else int(extend_lens_cpu[i]) for i in range(len(reuse_kv))
+    ]
+    alloc_extend_num_tokens = sum(alloc_extend_lens)
+
+    fresh_slots = None
+    if alloc_extend_num_tokens > 0:
+        if alloc_page_size == 1:
+            fresh_slots = alloc_token_slots(batch.tree_cache, alloc_extend_num_tokens)
+        else:
+            alloc_seq_lens_cpu = torch.tensor(
+                [
+                    (
+                        int(prefix_lens_cpu[i])
+                        if reuse_kv[i]
+                        else int(batch.seq_lens_cpu[i])
+                    )
+                    for i in range(len(reuse_kv))
+                ],
+                dtype=torch.int64,
+            )
+            last_loc = [
+                (t[-1:] if len(t) > 0 else torch.tensor([-1], device=device))
+                for t in (r.prefix_indices for r in batch.reqs)
+            ]
+            fresh_slots = alloc_paged_token_slots_extend(
+                tree_cache=batch.tree_cache,
+                prefix_lens=prefix_lens_cpu.to(device, non_blocking=True),
+                prefix_lens_cpu=prefix_lens_cpu,
+                seq_lens=alloc_seq_lens_cpu.to(device, non_blocking=True),
+                seq_lens_cpu=alloc_seq_lens_cpu,
+                last_loc=torch.cat(last_loc),
+                extend_num_tokens=alloc_extend_num_tokens,
+                req_pool_indices=req_pool_indices_device,
+                dsv4_state_lens=_compute_dsv4_state_lens(batch, is_decode=False),
+                batch=batch,
+            )
+
+    reuse_dtype = fresh_slots.dtype if fresh_slots is not None else torch.int64
+    parts: list[torch.Tensor] = []
+    fresh_ptr = 0
+    for i in range(len(reuse_kv)):
+        prefix_len = int(prefix_lens_cpu[i])
+        extend_len = int(extend_lens_cpu[i])
+        if reuse_kv[i]:
+            req_idx = int(req_pool_indices_cpu[i])
+            parts.append(
+                req_to_token[req_idx, prefix_len : prefix_len + extend_len].to(
+                    reuse_dtype
+                )
+            )
+        else:
+            parts.append(fresh_slots[fresh_ptr : fresh_ptr + extend_len])
+            fresh_ptr += extend_len
+
+    return torch.cat(parts)
 
 
 def alloc_paged_token_slots_decode(
