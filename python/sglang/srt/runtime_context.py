@@ -21,20 +21,27 @@ wrapper, not a cache. It gives call-sites one import and one naming scheme in
 place of a dozen free functions, plus a test-only ``override()`` hook to force a
 topology without monkeypatching the underlying getters.
 
-``get_server_args()`` returns the process-wide ``ServerArgs`` (the config
-tier). The context owns the storage: publishing goes through
-``RuntimeContext.set_server_args`` (the legacy
-``set_global_server_args_for_scheduler`` / ``get_global_server_args`` in
-``server_args.py`` are thin shims over this slot), and the object is returned
-by reference — the same live instance everywhere, never a copy.
+``get_server_args()`` returns the process-wide ``ServerArgs``. This is the pristine / resolved-at-startup **read-only** record kept
+for debug and reproduction; business code reads resolved config from the
+namespace bags below, not from this object. The context owns the storage:
+publishing goes through ``RuntimeContext.set_server_args`` (the legacy
+``set_global_server_args_for_scheduler`` / ``get_global_server_args`` are thin
+shims over this slot).
 
-``get_flags()`` returns the runtime-flags tier. Resolved configuration lives
-on ``server_args`` fields (declarations materialize at the end of
-``__post_init__``), so this tier only carries genuine runtime state that is
-not a function of the configuration alone — today the capture lifecycle
-(``flags.capture``). Flags live in typed dataclass groups; reads and writes
-are plain attribute access, and each group offers a transactional, test-only
-``override(**kw)``.
+``get_exec()`` / ``get_memory()`` / ``get_schedule()`` / ``get_device()`` /
+``get_model()`` / ``get_spec()`` / ``get_lora()`` / ``get_mm()`` /
+``get_disagg()`` / ``get_serving()`` / ``get_observability()`` return the
+resolved **config namespace bags** — the single source of truth for config,
+snapshotted from ``server_args`` at publish and driven by the ``NS(...)``
+metadata on each field (multi-level under ``exec.*``). Reads are attribute
+chains (``get_exec().moe.moe_runner_backend``); bags are read-only by bare
+assignment (written via ``override``).
+
+``get_flags()`` returns the runtime-flags tier: state that is **not** a pure
+function of config (the capture lifecycle, ACTIVE MoE backend, DP runtime) —
+never a mirror of config. Flags live in typed dataclass groups; reads and
+writes are plain attribute access, and each group offers a transactional,
+test-only ``override(**kw)``.
 """
 
 from __future__ import annotations
@@ -533,15 +540,130 @@ class ForwardFlags:
                 self._plain[name] = value
 
 
+class _ConfigBag:
+    """A resolved-config namespace bag.
+
+    Values are snapshotted from ``server_args`` at ``publish`` and this bag is
+    the **single source of truth** for its fields thereafter. Read is plain
+    attribute access; the bag is read-only by bare assignment. The sanctioned
+    writers are ``get_context().override(source, ...)`` (permanent) and
+    the scoped ``.override(**kw)`` context manager (tests). Sub-namespaces
+    (e.g. ``exec.moe``) are nested ``_ConfigBag`` instances reached by attribute.
+    """
+
+    __slots__ = ("_path", "_fields", "_subs")
+
+    def __init__(self, path: str):
+        object.__setattr__(self, "_path", path)
+        object.__setattr__(self, "_fields", {})  # {leaf: value}
+        object.__setattr__(self, "_subs", {})  # {subname: _ConfigBag}
+
+    def __getattr__(self, name: str) -> Any:
+        # Reached only when ``name`` is not a real attribute (slot).
+        fields = object.__getattribute__(self, "_fields")
+        if name in fields:
+            return fields[name]
+        subs = object.__getattribute__(self, "_subs")
+        if name in subs:
+            return subs[name]
+        path = object.__getattribute__(self, "_path")
+        raise AttributeError(f"config namespace {path!r} has no leaf/subgroup {name!r}")
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        raise AttributeError(
+            f"config namespace {self._path!r} is read-only; write via "
+            "get_context().override(source, ...) or the scoped .override(**kw)"
+        )
+
+    def _set(self, name: str, value: Any) -> None:
+        """Internal write (publish + override) that bypasses the read-only guard."""
+        object.__getattribute__(self, "_fields")[name] = value
+
+    def __contains__(self, name: str) -> bool:
+        return name in object.__getattribute__(self, "_fields")
+
+    @contextmanager
+    def override(self, **kwargs):
+        """Scoped, transactional test-only override of this bag's own leaves
+        (keys validated before any write; restored on exit)."""
+        fields = object.__getattribute__(self, "_fields")
+        unknown = set(kwargs) - set(fields)
+        if unknown:
+            path = object.__getattribute__(self, "_path")
+            raise ValueError(f"unknown config leaf for {path!r}: {sorted(unknown)}")
+        saved = {name: fields[name] for name in kwargs}
+        fields.update(kwargs)
+        try:
+            yield self
+        finally:
+            fields.update(saved)
+
+
+def _build_config_bags(server_args: Any) -> dict:
+    """Snapshot resolved ``server_args`` into the namespace bag tree, driven by
+    the ``NS(...)`` metadata on the dataclass fields. Returns
+    ``{top_level_name: _ConfigBag}``, arbitrarily nested (``exec.moe.eplb.…``).
+    Only dataclass fields carry ``NS`` markers, so derived properties/methods are
+    naturally excluded (they stay on the bag). A name used as both a leaf and a
+    subgroup at the same level is a hard error — no silent shadowing."""
+    from sglang.srt.arg_groups.arg_utils import namespace_of
+
+    _MISSING = object()
+    tops: dict = {}
+    for field, path in namespace_of(type(server_args)).items():
+        value = getattr(server_args, field, _MISSING)
+        if value is _MISSING:
+            # Every NS-declared field is a dataclass field, so a resolved config
+            # always carries it; a miss means a malformed/partial config object
+            # was published. Fail loud here rather than silently omitting the
+            # leaf (which surfaces later as a confusing "not a published leaf").
+            raise AttributeError(
+                f"config field {field!r} is declared NS({path!r}) but absent from "
+                f"the published {type(server_args).__name__}; cannot project its bag leaf"
+            )
+        parts = path.split(".")
+        bag = tops.get(parts[0])
+        if bag is None:
+            bag = tops[parts[0]] = _ConfigBag(parts[0])
+        for depth in range(1, len(parts)):
+            name = parts[depth]
+            if name in object.__getattribute__(bag, "_fields"):
+                raise ValueError(
+                    f"config namespace collision: {'.'.join(parts[: depth + 1])!r} "
+                    "is declared as both a leaf and a subgroup"
+                )
+            subs = object.__getattribute__(bag, "_subs")
+            child = subs.get(name)
+            if child is None:
+                child = subs[name] = _ConfigBag(".".join(parts[: depth + 1]))
+            bag = child
+        if field in object.__getattribute__(bag, "_subs"):
+            raise ValueError(
+                f"config namespace collision: leaf {field!r} under {path!r} "
+                "clashes with a subgroup of the same name"
+            )
+        bag._set(field, value)
+    return tops
+
+
 class RuntimeContext:
     """Container for the structured runtime accessors; exposes ``parallel``,
-    ``server_args``, ``flags``, ``resources``, and ``forward``."""
+    ``server_args``, the resolved config namespace bags, ``flags``,
+    ``resources``, and ``forward``."""
 
-    __slots__ = ("parallel", "_server_args", "flags", "resources", "forward")
+    __slots__ = (
+        "parallel",
+        "_server_args",
+        "_config_bags",
+        "flags",
+        "resources",
+        "forward",
+    )
 
     def __init__(self, parallel: ParallelContext):
         self.parallel = parallel
         self._server_args: ServerArgs | None = None
+        self._config_bags: dict | None = None
         self.flags = Flags()
         self.resources = Resources()
         self.forward = ForwardFlags()
@@ -599,6 +721,20 @@ class RuntimeContext:
             server_args, "enable_torch_compile", False
         )
         self._server_args = server_args
+        # Snapshot resolved config into the namespace bags (the single source of
+        # truth for config reads). Driven by NS(...) metadata; a mock/partial
+        # config with no NS markers yields an empty tree (no bags projected).
+        self._config_bags = _build_config_bags(server_args)
+
+    def config_bag(self, name: str) -> _ConfigBag:
+        """Return the top-level config namespace bag (``device`` / ``model`` /
+        ``exec`` / ``schedule`` / ``memory`` / ``spec`` / ``lora`` / ``mm`` /
+        ``disagg`` / ``serving`` / ``observability``). Fails closed until
+        ``publish`` / ``set_server_args`` has projected it."""
+        bags = self._config_bags
+        if not bags or name not in bags:
+            raise ValueError(f"config namespace {name!r} not published")
+        return bags[name]
 
     def override_server_args(self, **fields) -> _ServerArgsOverride:
         """Test-only scoped override for the config tier — the sibling of
@@ -710,6 +846,55 @@ def get_forward() -> ForwardFlags:
     return _CONTEXT.forward
 
 
+# --- Resolved config namespaces -------------------------
+# Each returns the top-level snapshot bag; reads are `get_exec().moe.field` etc.
+# All fail with ValueError("... not published") until publish has projected them.
+# ``parallel`` config leaves are served by ``get_parallel()`` (live wrapper);
+# their config-bag wiring is a scoped follow-up.
+def get_device() -> _ConfigBag:
+    return _CONTEXT.config_bag("device")
+
+
+def get_model() -> _ConfigBag:
+    return _CONTEXT.config_bag("model")
+
+
+def get_exec() -> _ConfigBag:
+    return _CONTEXT.config_bag("exec")
+
+
+def get_schedule() -> _ConfigBag:
+    return _CONTEXT.config_bag("schedule")
+
+
+def get_memory() -> _ConfigBag:
+    return _CONTEXT.config_bag("memory")
+
+
+def get_spec() -> _ConfigBag:
+    return _CONTEXT.config_bag("spec")
+
+
+def get_lora() -> _ConfigBag:
+    return _CONTEXT.config_bag("lora")
+
+
+def get_mm() -> _ConfigBag:
+    return _CONTEXT.config_bag("mm")
+
+
+def get_disagg() -> _ConfigBag:
+    return _CONTEXT.config_bag("disagg")
+
+
+def get_serving() -> _ConfigBag:
+    return _CONTEXT.config_bag("serving")
+
+
+def get_observability() -> _ConfigBag:
+    return _CONTEXT.config_bag("observability")
+
+
 def get_stream(name: str) -> Any:
     return _CONTEXT.get_stream(name)
 
@@ -741,6 +926,7 @@ def reset_context() -> None:
     Wrapper subsystems (``parallel``) hold no state and are unaffected.
     """
     _CONTEXT._server_args = None
+    _CONTEXT._config_bags = None
     _CONTEXT.flags = Flags()
     _CONTEXT.resources = Resources()
     _CONTEXT.forward = ForwardFlags()
