@@ -1,8 +1,9 @@
 """Unit tests for the flat raw prompt top logprob response format
-(`return_flat_raw_top_logprobs`).
+(`return_flat_raw_top_logprobs` / `return_flat_raw_top_logprobs_b64`).
 """
 
 import asyncio
+import base64
 import json
 import os
 import time
@@ -90,6 +91,21 @@ class TestFlatRawTopLogprobsValidation(CustomTestCase):
         for i in range(2):
             self.assertTrue(req[i].return_flat_raw_top_logprobs)
 
+    def test_b64_requires_flat_flag(self):
+        req = GenerateReqInput(text="hello", return_flat_raw_top_logprobs_b64=True)
+        with self.assertRaisesRegex(ValueError, "return_flat_raw_top_logprobs"):
+            req.normalize_batch_and_arguments()
+
+    def test_b64_flag_propagates_to_batch_items(self):
+        req = GenerateReqInput(
+            text=["a", "b"],
+            return_flat_raw_top_logprobs=True,
+            return_flat_raw_top_logprobs_b64=True,
+        )
+        req.normalize_batch_and_arguments()
+        for i in range(2):
+            self.assertTrue(req[i].return_flat_raw_top_logprobs_b64)
+
 
 class TestFlatAssembly(CustomTestCase):
     def test_flat_matches_nested_rows(self):
@@ -115,6 +131,26 @@ class TestFlatAssembly(CustomTestCase):
         for i in range(null_prefix, null_prefix + rows):
             start = (i - null_prefix) * k
             self.assertEqual(flat_val[start : start + k], _VAL_ROWS[i])
+
+    def test_b64_roundtrip(self):
+        fields = _build_flat_input_top_logprobs_fields(
+            _VAL_ROWS, _IDX_ROWS, top_logprobs_num=2, return_b64=True
+        )
+        self.assertEqual(fields["input_top_logprobs_shape"], [3, 2])
+        self.assertEqual(fields["input_top_logprobs_null_prefix"], 1)
+        self.assertEqual(fields["input_top_logprobs_val_flat_b64_dtype"], "float32")
+        self.assertEqual(fields["input_top_logprobs_idx_flat_b64_dtype"], "int32")
+        # shape is the literal array shape, so the b64 buffer reshapes with it.
+        val = np.frombuffer(
+            base64.b64decode(fields["input_top_logprobs_val_flat_b64"]),
+            dtype=np.dtype(fields["input_top_logprobs_val_flat_b64_dtype"]),
+        ).reshape(fields["input_top_logprobs_shape"])
+        idx = np.frombuffer(
+            base64.b64decode(fields["input_top_logprobs_idx_flat_b64"]),
+            dtype=np.dtype(fields["input_top_logprobs_idx_flat_b64_dtype"]),
+        ).reshape(fields["input_top_logprobs_shape"])
+        np.testing.assert_array_equal(val, np.asarray(_VAL_ROWS[1:], dtype=np.float32))
+        np.testing.assert_array_equal(idx, np.asarray(_IDX_ROWS[1:], dtype=np.int32))
 
     def test_all_null_rows(self):
         fields = _build_flat_input_top_logprobs_fields(
@@ -237,6 +273,29 @@ class TestAddLogprobToMetaInfo(CustomTestCase):
         )
 
 
+class TestB64MetaInfo(CustomTestCase):
+    def test_b64_fields_replace_flat_and_cache_reused(self):
+        state = _make_state(
+            return_logprob=True,
+            top_logprobs_num=2,
+            return_flat_raw_top_logprobs=True,
+            return_flat_raw_top_logprobs_b64=True,
+        )
+        state.input_top_logprobs_val.extend(_VAL_ROWS)
+        state.input_top_logprobs_idx.extend(_IDX_ROWS)
+        meta_info = _add_logprob_meta_info(state)
+        self.assertNotIn("input_top_logprobs", meta_info)
+        self.assertNotIn("input_top_logprobs_val_flat", meta_info)
+        self.assertIn("input_top_logprobs_val_flat_b64", meta_info)
+        self.assertEqual(meta_info["input_top_logprobs_shape"], [3, 2])
+        # No new rows -> the encoded payload is reused, not rebuilt.
+        again = _add_logprob_meta_info(state)
+        self.assertIs(
+            again["input_top_logprobs_val_flat_b64"],
+            meta_info["input_top_logprobs_val_flat_b64"],
+        )
+
+
 @unittest.skipUnless(
     os.environ.get("SGLANG_BENCH_FLAT_RAW_TOP_LOGPROBS"),
     "Serialization microbenchmark; set SGLANG_BENCH_FLAT_RAW_TOP_LOGPROBS=1 to run.",
@@ -299,6 +358,28 @@ class BenchFlatRawTopLogprobsSerialization(CustomTestCase):
                 val_rows, idx_rows, top_logprobs_num=k
             ),
             decode_flat,
+        )
+
+        def decode_b64(payload):
+            d = json.loads(payload)
+            shape = d["input_top_logprobs_shape"]
+            return (
+                np.frombuffer(
+                    base64.b64decode(d["input_top_logprobs_val_flat_b64"]),
+                    np.dtype(d["input_top_logprobs_val_flat_b64_dtype"]),
+                ).reshape(shape),
+                np.frombuffer(
+                    base64.b64decode(d["input_top_logprobs_idx_flat_b64"]),
+                    np.dtype(d["input_top_logprobs_idx_flat_b64_dtype"]),
+                ).reshape(shape),
+            )
+
+        bench(
+            "flat b64",
+            lambda: _build_flat_input_top_logprobs_fields(
+                val_rows, idx_rows, top_logprobs_num=k, return_b64=True
+            ),
+            decode_b64,
         )
 
 
