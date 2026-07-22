@@ -968,18 +968,22 @@ class ServerArgs:
             "combine), or 'fi_a2a' (FlashInfer MNNVL All-to-All kernel; requires "
             "SM90+ and MNNVL fabric memory, e.g. GB200 NVL72).",
             choices=["ag_rs", "a2a", "fi_a2a"],
+            resolvable=True,
         ),
     ] = "ag_rs"
     dcp_replicate_q_proj: A[
-        bool,
+        Optional[bool],
         Arg(
             help="For MLA decode context parallelism with the a2a/fi_a2a "
             "backend: replicate the Q projection so each DCP rank computes the "
             "full-head query locally (redundant projection compute), eliminating "
             "the per-layer head-dim all-gather of Q. Trades a small amount of "
-            "extra GEMM for one fewer collective per layer.",
+            "extra GEMM for one fewer collective per layer. Use "
+            "--no-dcp-replicate-q-proj to disable the model-specific default.",
+            action=argparse.BooleanOptionalAction,
+            resolvable=True,
         ),
-    ] = False
+    ] = None
     dwdp_size: A[
         int,
         Arg(

@@ -39,6 +39,7 @@ from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.utils.common import (
     cpu_has_amx_support,
     get_device_capability,
+    get_device_name,
     get_device_sm,
     get_nvidia_driver_version,
     get_quantization_config,
@@ -322,6 +323,47 @@ def _register_for(*architectures: str):
 
 @_register_for("KimiK3ForConditionalGeneration")
 def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
+    if server_args.dcp_size > 1:
+        overrides = {}
+        prefill_backend, decode_backend = attention_backends_of(server_args)
+        if prefill_backend != "tokenspeed_mla" or decode_backend != "tokenspeed_mla":
+            logger.info(
+                "Kimi-K3 DCP overrides attention backends: "
+                f"prefill={prefill_backend!r}, decode={decode_backend!r} -> "
+                "'tokenspeed_mla'."
+            )
+            overrides.update(
+                attention_backend="tokenspeed_mla",
+                prefill_attention_backend="tokenspeed_mla",
+                decode_attention_backend="tokenspeed_mla",
+            )
+
+        if server_args.kv_cache_dtype in (None, "auto", "bf16", "bfloat16"):
+            logger.info(
+                "Kimi-K3 DCP overrides KV cache dtype: "
+                f"{server_args.kv_cache_dtype!r} -> 'fp8_e4m3'."
+            )
+            overrides["kv_cache_dtype"] = "fp8_e4m3"
+
+        if server_args.dcp_replicate_q_proj is None:
+            logger.info("Kimi-K3 DCP enables replicated Q projection by default.")
+            overrides["dcp_replicate_q_proj"] = True
+
+        device_name = get_device_name()
+        normalized_device_name = (device_name or "").upper()
+        dcp_comm_backend = (
+            "fi_a2a"
+            if any(name in normalized_device_name for name in ("GB200", "GB300"))
+            else "a2a"
+        )
+        logger.info(
+            "Kimi-K3 DCP selects communication backend on "
+            f"{device_name!r}: {server_args.dcp_comm_backend!r} -> "
+            f"{dcp_comm_backend!r}."
+        )
+        overrides["dcp_comm_backend"] = dcp_comm_backend
+        return overrides
+
     if not (
         is_sm100_supported()
         and get_device_sm() in (100, 103)
@@ -330,8 +372,8 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
         return {}
     if server_args.speculative_algorithm != "DSPARK":
         logger.info(
-            "Use trtllm_mla as the default decode attention backend for "
-            "Kimi-K3 on SM100/SM103."
+            "Use trtllm_mla as the default prefill and decode attention "
+            "backend for Kimi-K3 on SM100/SM103."
         )
         return {
             "decode_attention_backend": "trtllm_mla",
