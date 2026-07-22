@@ -9,8 +9,7 @@
 /python/sglang/kernels/ops/attention/fla @yizhang2077 @hebiao064 @yuan-luo
 /python/sglang/multimodal_gen @mickqian @ping1jing2 @HaiShaw @yichiche @AgainstEntropy @BBuf
 /python/sglang/multimodal_gen/runtime/cache @DefTruth
-/python/sglang/multimodal_gen/runtime/layers/quantization/mxfp*_npu.py @TallMessiWu
-/python/sglang/multimodal_gen/runtime/layers/quantization/modelslim_mxfp*_scheme.py @TallMessiWu
+/python/sglang/multimodal_gen/runtime/layers/quantization/ @OrangeRedeng @TallMessiWu
 /python/sglang/multimodal_gen/test/server/ascend  @ping1jing2 @ssshinigami @Makcum888e @e-martirosian
 /python/sglang/srt/batch_invariant_ops @Fridge003 @hebiao064
 /python/sglang/srt/compilation @hebiao064 @Oasis-Git
