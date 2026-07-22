@@ -112,8 +112,7 @@ impl ServerArgs {
     }
 
     /// The model path (HF repo id / local dir) reported by `/get_model_info`.
-    /// The SGLang lang backend (`RuntimeEndpoint`) uses it for chat-template
-    /// detection. Falls back to the served name if `model_path` is absent.
+    /// Falls back to the served name if `model_path` is absent.
     pub fn model_path(&self) -> &str {
         self.str_field("model_path")
             .filter(|s| !s.is_empty())
