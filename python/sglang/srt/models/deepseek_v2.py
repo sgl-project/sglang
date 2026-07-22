@@ -29,10 +29,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.jit_kernel.dsv4 import (
-    silu_and_mul_clamp,
-    silu_and_mul_contig_post_quant,
-)
+from sglang.jit_kernel.dsv4 import silu_and_mul_clamp, silu_and_mul_contig_post_quant
 from sglang.kernels.ops.quantization.fp8_kernel import (
     create_per_token_group_quant_fp8_output_scale,
 )
@@ -78,9 +75,7 @@ from sglang.srt.layers.communicator_dsa_cp import (
     maybe_prefetch_next_full_attention_kv,
 )
 from sglang.srt.layers.cp.utils import is_cp_v2_active
-from sglang.srt.layers.dcp.planner import (
-    prepare_decode_context_parallel_metadata,
-)
+from sglang.srt.layers.dcp.planner import prepare_decode_context_parallel_metadata
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -115,9 +110,7 @@ from sglang.srt.layers.moe.utils import (
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config
-from sglang.srt.layers.quantization.fp8_utils import (
-    materialize_bpreshuffle_fp8_scale,
-)
+from sglang.srt.layers.quantization.fp8_utils import materialize_bpreshuffle_fp8_scale
 from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
     maybe_fuse_routed_scale_and_shared_add,
 )
@@ -183,11 +176,14 @@ from sglang.srt.models.deepseek_common.utils import (
     is_wint4afp8_or_wint4a16_config,
 )
 from sglang.srt.runtime_context import (
+    get_device,
+    get_exec,
     get_flags,
     get_forward,
     get_model,
     get_parallel,
     get_server_args,
+    get_spec,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
@@ -381,9 +377,7 @@ class DeepseekV2MLP(nn.Module):
             return down_output
 
         if self.use_fused_clamp_act_mul and self.swiglu_limit is not None:
-            from aiter.ops.triton.fusions.fused_clamp_act_mul import (
-                fused_clamp_act_mul,
-            )
+            from aiter.ops.triton.fusions.fused_clamp_act_mul import fused_clamp_act_mul
 
             if not self._fused_clamp_fp8_checked:
                 from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
@@ -494,7 +488,7 @@ class MoEGate(nn.Module):
                 True,  # is_vnni
             )
 
-        if get_server_args().enable_deterministic_inference:
+        if get_exec().deterministic.enable_deterministic_inference:
             return F.linear(hidden_states, self.weight, None)
 
         if (
@@ -560,7 +554,7 @@ class DeepseekV2MoE(nn.Module):
         n_shared_experts = (
             0 if config.n_shared_experts is None else int(config.n_shared_experts)
         )
-        _fusion_disabled = get_server_args().disable_shared_experts_fusion
+        _fusion_disabled = get_exec().moe.disable_shared_experts_fusion
 
         # num_fused_shared_experts drives weight remapping in deepseek_weight_loader:
         # mlp.shared_experts → mlp.experts.256 when > 0.
@@ -630,8 +624,7 @@ class DeepseekV2MoE(nn.Module):
             fused_shared_experts_scaling_factor = 1.0 / float(self.moe_ep_size)
 
         self.experts = get_moe_impl_class(quant_config)(
-            num_experts=num_experts_for_moe
-            + get_server_args().ep_num_redundant_experts,
+            num_experts=num_experts_for_moe + get_exec().moe.ep_num_redundant_experts,
             num_fused_shared_experts=self.num_fused_shared_experts,
             top_k=top_k_for_moe,
             hidden_size=config.hidden_size,
@@ -804,7 +797,7 @@ class DeepseekV2MoE(nn.Module):
             # TODO: we will support tp < ep in the future
             self.ep_size = get_parallel().moe_ep_size
             self.num_experts = (
-                config.n_routed_experts + get_server_args().ep_num_redundant_experts
+                config.n_routed_experts + get_exec().moe.ep_num_redundant_experts
             )
             self.renormalize = config.norm_topk_prob
             self.topk_group = config.topk_group
@@ -1718,7 +1711,7 @@ class DeepseekV2AttentionMLA(
                 base=rope_theta,
                 rope_scaling=rope_scaling,
                 is_neox_style=is_neox_style,
-                device=get_server_args().device,
+                device=get_device().device,
             )
 
             if rope_scaling and rope_scaling.get("apply_yarn_scaling", True):
@@ -2069,7 +2062,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             rope_scaling = config.rope_scaling
         max_position_embeddings = config.max_position_embeddings
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
-            get_server_args().speculative_algorithm
+            get_spec().speculative_algorithm
         )
         self.dsa_enable_prefill_cp = dsa_enable_prefill_cp
         self.mla_enable_prefill_cp = mla_enable_prefill_cp
@@ -2765,7 +2758,7 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         self.num_fused_shared_experts = 0
         server_args = get_server_args()
 
-        if get_server_args().disable_shared_experts_fusion:
+        if get_exec().moe.disable_shared_experts_fusion:
             return
 
         disable_reason = None

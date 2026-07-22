@@ -73,6 +73,7 @@ from sglang.srt.models.utils import (
     enable_fused_set_kv_buffer,
 )
 from sglang.srt.runtime_context import (
+    get_exec,
     get_forward,
     get_parallel,
     get_server_args,
@@ -261,7 +262,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         )
 
         self.experts = get_moe_impl_class(quant_config)(
-            num_experts=config.num_experts + get_server_args().ep_num_redundant_experts,
+            num_experts=config.num_experts + get_exec().moe.ep_num_redundant_experts,
             top_k=config.num_experts_per_tok,
             layer_id=layer_id,
             hidden_size=config.hidden_size,
@@ -283,7 +284,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             # TODO: we will support tp < ep in the future
             self.ep_size = get_parallel().moe_ep_size
             self.num_experts = (
-                config.num_experts + get_server_args().ep_num_redundant_experts
+                config.num_experts + get_exec().moe.ep_num_redundant_experts
             )
             self.top_k = config.num_experts_per_tok
 
@@ -514,7 +515,7 @@ class Qwen3MoeAttention(nn.Module):
         ) and self.head_dim in (64, 128, 256)
         _yarn_factor, _, _, _ = compute_yarn_parameters(config)
         self.use_fused_qk_norm_rope = (
-            get_server_args().enable_fused_qk_norm_rope
+            get_exec().kernel.enable_fused_qk_norm_rope
             and self.compatible_with_fused_qk_norm_rope
             and _is_cuda
             and can_use_fused_qk_norm_rope(
