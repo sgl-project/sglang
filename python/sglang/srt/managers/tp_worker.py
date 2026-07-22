@@ -411,12 +411,6 @@ class TpModelWorker(BaseTpWorker):
         for mr in self.model_runner_list[1:]:
             mr.finalize_startup_weight_load()
 
-    def cancel_startup_weight_load(self) -> None:
-        """Cancel deferred startup loading for all model runners."""
-        self.model_runner.cancel_startup_weight_load()
-        for mr in self.model_runner_list[1:]:
-            mr.cancel_startup_weight_load()
-
     def _init_model_config(self):
         from sglang.srt.configs.model_config import ModelConfig
 

@@ -842,38 +842,25 @@ class Scheduler(
         if self.draft_worker is not None:
             self.draft_worker.init_cuda_graphs()
 
-    def start_startup_weight_load(self) -> None:
-        """Start any checkpoint prefetch deferred until worker init completes."""
-        self.tp_worker.start_startup_weight_load()
-
-    def finalize_startup_weight_load(self) -> None:
-        """Commit any weights deferred until after CUDA graph capture."""
-        self.tp_worker.finalize_startup_weight_load()
-
-    def cancel_startup_weight_load(self) -> None:
-        """Cancel any weight loading still deferred during worker startup."""
-        self.tp_worker.cancel_startup_weight_load()
-
     def init_model_worker(self):
         # Load model weights.
         self.init_tp_model_worker()
-        try:
-            self.start_startup_weight_load()
-            self.maybe_init_draft_worker()
+        if self.server_args.startup_weight_load_mode == "overlap":
+            self.tp_worker.start_startup_weight_load()
+        self.maybe_init_draft_worker()
 
-            # Prepare KV cache pools for all workers
-            self.init_memory_pools()
+        # Prepare KV cache pools for all workers
+        self.init_memory_pools()
 
-            self.init_all_attention_backends()
-            self.init_all_cuda_graphs()
+        self.init_all_attention_backends()
+        self.init_all_cuda_graphs()
 
-            model_runner = self.tp_worker.model_runner
-            if model_runner.token_to_kv_pool.post_capture_active:
-                model_runner.post_capture_resize_kv_pool()
+        model_runner = self.tp_worker.model_runner
+        if model_runner.token_to_kv_pool.post_capture_active:
+            model_runner.post_capture_resize_kv_pool()
 
-            self.finalize_startup_weight_load()
-        finally:
-            self.cancel_startup_weight_load()
+        if self.server_args.startup_weight_load_mode == "overlap":
+            self.tp_worker.finalize_startup_weight_load()
 
         # Dispatch the model worker
         if self.spec_algorithm.is_none():

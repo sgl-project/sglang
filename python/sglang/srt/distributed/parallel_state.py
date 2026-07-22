@@ -2783,17 +2783,10 @@ vllm_get_tp_group = None
 vllm_get_world_group = None
 
 
-def _get_vllm_parallel_state():
+def monkey_patch_vllm_parallel_state(reverse: bool = False):
     try:
         import vllm.distributed.parallel_state as vllm_parallel_state
     except ImportError:
-        return None
-    return vllm_parallel_state
-
-
-def monkey_patch_vllm_parallel_state(reverse: bool = False):
-    vllm_parallel_state = _get_vllm_parallel_state()
-    if vllm_parallel_state is None:
         return
 
     global vllm_get_pp_group, vllm_get_tp_group, vllm_get_world_group
@@ -2809,26 +2802,3 @@ def monkey_patch_vllm_parallel_state(reverse: bool = False):
         setattr(vllm_parallel_state, "get_pp_group", get_pp_group)
         setattr(vllm_parallel_state, "get_tp_group", get_tp_group)
         setattr(vllm_parallel_state, "get_world_group", get_world_group)
-
-
-@contextlib.contextmanager
-def patched_vllm_parallel_state():
-    """Temporarily route vLLM parallel-state accessors through SGLang."""
-    vllm_parallel_state = _get_vllm_parallel_state()
-    if vllm_parallel_state is None:
-        yield
-        return
-
-    replacements = {
-        "get_pp_group": get_pp_group,
-        "get_tp_group": get_tp_group,
-        "get_world_group": get_world_group,
-    }
-    previous = {name: getattr(vllm_parallel_state, name) for name in replacements}
-    for name, replacement in replacements.items():
-        setattr(vllm_parallel_state, name, replacement)
-    try:
-        yield
-    finally:
-        for name, accessor in previous.items():
-            setattr(vllm_parallel_state, name, accessor)
