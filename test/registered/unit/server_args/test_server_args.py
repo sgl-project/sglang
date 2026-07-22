@@ -107,10 +107,47 @@ class TestMultimodalFeatureTransport(CustomTestCase):
 
         self.assertIn("overrides", logs.output[0])
 
-    def test_default_transport_is_cpu(self):
+    @patch("sglang.srt.server_args.is_cuda", return_value=False)
+    def test_default_transport_is_cpu_off_cuda(self, _mock_is_cuda):
         server_args = ServerArgs(model_path="dummy")
 
         with patch.dict(os.environ, {"SGLANG_USE_CUDA_IPC_TRANSPORT": "0"}):
+            server_args._handle_multimodal_feature_transport()
+
+            self.assertEqual(server_args.mm_feature_transport, "cpu")
+            self.assertFalse(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
+
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    def test_default_auto_resolves_cuda_ipc_on_single_node_cuda(self, _mock_is_cuda):
+        server_args = ServerArgs(model_path="dummy")
+
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("SGLANG_USE_CUDA_IPC_TRANSPORT", None)
+            with self.assertLogs(server_args_module.logger, level="INFO") as logs:
+                server_args._handle_multimodal_feature_transport()
+
+            self.assertEqual(server_args.mm_feature_transport, "cuda_ipc")
+            self.assertTrue(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
+
+        self.assertIn("auto-resolved to cuda_ipc", "\n".join(logs.output))
+
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    def test_default_auto_keeps_cpu_on_multi_node(self, _mock_is_cuda):
+        server_args = ServerArgs(model_path="dummy", nnodes=2)
+
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("SGLANG_USE_CUDA_IPC_TRANSPORT", None)
+            server_args._handle_multimodal_feature_transport()
+
+            self.assertEqual(server_args.mm_feature_transport, "cpu")
+            self.assertFalse(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
+
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    def test_default_auto_keeps_cpu_with_disaggregation(self, _mock_is_cuda):
+        server_args = ServerArgs(model_path="dummy", disaggregation_mode="prefill")
+
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("SGLANG_USE_CUDA_IPC_TRANSPORT", None)
             server_args._handle_multimodal_feature_transport()
 
             self.assertEqual(server_args.mm_feature_transport, "cpu")

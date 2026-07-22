@@ -2350,7 +2350,10 @@ class ServerArgs:
     mm_feature_transport: A[
         Optional[Literal["cpu", "cuda_ipc"]],
         "Transport multimodal features through CPU memory or a bounded CUDA IPC pool. "
-        "The default is CPU transport; CUDA IPC reserves GPU memory on the base GPU.",
+        "Unset resolves automatically: single-node CUDA deployments (without "
+        "disaggregation) use cuda_ipc, everything else uses cpu. CUDA IPC reserves "
+        "SGLANG_MM_FEATURE_CACHE_MB (default 1024 MiB) on the base GPU and falls "
+        "back to CPU transport per tensor when the pool is full.",
     ] = None
     keep_mm_feature_on_device: A[
         bool,
@@ -6722,6 +6725,19 @@ class ServerArgs:
                     "SGLANG_USE_CUDA_IPC_TRANSPORT is deprecated; use "
                     "--mm-feature-transport=%s instead.",
                     requested_transport,
+                )
+            elif is_cuda() and self.nnodes == 1 and self.disaggregation_mode == "null":
+                # Auto policy: single-node CUDA serving defaults to the bounded
+                # CUDA-IPC pool. The pool is only allocated when a multimodal
+                # processor exists, so text-only deployments are unaffected; a
+                # full pool degrades to CPU transport per tensor. Multi-node
+                # (IPC handles are intra-node) and PD-disaggregated deployments
+                # keep CPU transport.
+                requested_transport = "cuda_ipc"
+                logger.info(
+                    "Multimodal feature transport auto-resolved to cuda_ipc "
+                    "(single-node CUDA). Pass --mm-feature-transport=cpu to "
+                    "opt out."
                 )
             else:
                 requested_transport = "cpu"
