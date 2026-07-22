@@ -51,13 +51,8 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
     ForwardBatchDeepSeekMHAMixin,
 )
-from sglang.srt.runtime_context import get_parallel, get_server_args
-from sglang.srt.utils import (
-    is_cuda,
-    is_hip,
-    is_npu,
-    support_triton,
-)
+from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.utils import is_cuda, is_hip, is_npu, support_triton
 from sglang.srt.utils.common import ceil_align, is_pin_memory_available
 
 if TYPE_CHECKING:
@@ -218,6 +213,13 @@ class CaptureHiddenMode(IntEnum):
         return self.value < other.value
 
 
+def _attn_tp_local_shard_bounds(num_tokens_per_dp: int) -> Tuple[int, int]:
+    """(tokens_per_rank, rank_offset) of this attn-TP rank's contiguous shard."""
+    parallel = get_parallel()
+    tokens_per_rank = num_tokens_per_dp // parallel.attn_tp_size
+    return tokens_per_rank, tokens_per_rank * parallel.attn_tp_rank
+
+
 def compute_local_num_token_non_padded(
     global_num_token_non_padded: torch.Tensor,
     num_tokens_per_dp: int,
@@ -227,15 +229,27 @@ def compute_local_num_token_non_padded(
     Converts a global count (across all TP ranks) to a local count for this rank.
     The "global" scope is within the current DP rank; DP is handled via num_tokens_per_dp.
     """
-    attn_tp_rank = get_parallel().attn_tp_rank
-    attn_tp_size = get_parallel().attn_tp_size
-    tokens_per_rank = num_tokens_per_dp // attn_tp_size
-
+    tokens_per_rank, rank_offset = _attn_tp_local_shard_bounds(num_tokens_per_dp)
     return torch.clamp(
-        global_num_token_non_padded - tokens_per_rank * attn_tp_rank,
+        global_num_token_non_padded - rank_offset,
         0,
         tokens_per_rank,
     )
+
+
+def compute_local_num_token_non_padded_cpu(
+    global_num_token_non_padded: int,
+    num_tokens_per_dp: int,
+) -> int:
+    """Int-scalar twin of ``compute_local_num_token_non_padded``.
+
+    Replay-time hooks hold the global count as a host int
+    (``num_token_non_padded_cpu``) and write the localized result into a
+    device buffer; keeping the math on ints lets them use ``Tensor.fill_``
+    instead of staging a CPU tensor through a host-to-device copy per replay.
+    """
+    tokens_per_rank, rank_offset = _attn_tp_local_shard_bounds(num_tokens_per_dp)
+    return min(max(global_num_token_non_padded - rank_offset, 0), tokens_per_rank)
 
 
 @dataclass
@@ -922,7 +936,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             # --enable-mis: every request must carry delimiter indices (the score
             # endpoint always produces MIS-structured requests; consumers index
             # without None-checking).
-            if get_server_args().enable_mis and any(
+            if get_exec().features.enable_mis and any(
                 r.multi_item_delimiter_indices is not None for r in batch.reqs
             ):
                 assert all(
@@ -1091,7 +1105,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # batch_size * [3 * seq_len]
         batch_size = self.seq_lens_cpu.shape[0]
         mrope_positions_list = [[]] * batch_size
-        rl_on_policy_target = get_server_args().rl_on_policy_target
+        rl_on_policy_target = get_exec().deterministic.rl_on_policy_target
         for batch_idx in range(batch_size):
             mm_input = batch.multimodal_inputs[batch_idx]
             if self.forward_mode.is_decode():
