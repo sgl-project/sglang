@@ -245,7 +245,11 @@ def forward_mla_prepare_npu(
 
         q_nope_out = q_nope_out.transpose(0, 1)
 
-        q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
+        # NoPE MLA layers (e.g. Kimi-Linear, built with skip_rope=True) have no
+        # rotary_emb; q_pe/k_pe pass through unrotated. Mirrors the GPU guard in
+        # forward_absorb_prepare and the NPU MHA path above.
+        if m.rotary_emb is not None:
+            q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
 
         if dsa_use_prefill_cp(forward_batch):
             # support allgather+rerrange
