@@ -1,7 +1,7 @@
 import torch
 
 from sglang.jit_kernel.benchmark import marker
-from sglang.jit_kernel.fused_fp8_qkv_kv_cache import fused_fp8_qkv_kv_cache
+from sglang.kernels.ops.kvcache.fused_fp8_qkv_kv_cache import fused_fp8_qkv_kv_cache
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(

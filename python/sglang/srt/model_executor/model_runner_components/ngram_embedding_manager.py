@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.jit_kernel.ngram_embedding import update_token_table
+from sglang.kernels.ops.speculative.ngram_embedding import update_token_table
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.managers.schedule_batch import ForwardMode
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool

@@ -5,7 +5,7 @@ from typing import Callable, List, Optional, Sequence, Tuple
 import torch
 import triton.testing
 
-from sglang.jit_kernel.mp import multigpu_launch
+from sglang.kernels.ops.communication.mp import multigpu_launch
 from sglang.utils import is_in_ci
 
 

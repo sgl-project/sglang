@@ -24,7 +24,7 @@ from safetensors.torch import load_file
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.jit_kernel.fused_eh_norm import fused_eh_norm
+from sglang.kernels.ops.layernorm.fused_eh_norm import fused_eh_norm
 from sglang.srt.configs.model_config import is_deepseek_dsa
 from sglang.srt.distributed import get_pp_group
 from sglang.srt.environ import envs

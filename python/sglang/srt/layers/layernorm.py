@@ -130,8 +130,12 @@ if _is_cuda:
     # BEFORE the weight multiply, so the multiply is done in the narrow dtype.
     _jit_rmsnorm_hf_available = False
     try:
-        from sglang.jit_kernel.rmsnorm_hf import is_supported_rmsnorm_hf_hidden_size
-        from sglang.jit_kernel.rmsnorm_hf import rmsnorm_hf as _jit_rmsnorm_hf
+        from sglang.kernels.ops.layernorm.rmsnorm_hf import (
+            is_supported_rmsnorm_hf_hidden_size,
+        )
+        from sglang.kernels.ops.layernorm.rmsnorm_hf import (
+            rmsnorm_hf as _jit_rmsnorm_hf,
+        )
 
         _jit_rmsnorm_hf_available = True
     except ImportError:

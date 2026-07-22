@@ -26,11 +26,11 @@ import triton.language as tl
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.jit_kernel.all_reduce import (
+from sglang.kernel_api_logging import debug_kernel_api
+from sglang.kernels.ops.communication.all_reduce import (
     fused_parallel_qknorm,
     get_fused_parallel_qknorm_max_occupancy,
 )
-from sglang.kernel_api_logging import debug_kernel_api
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.distributed import get_pp_group, tensor_model_parallel_all_reduce
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder

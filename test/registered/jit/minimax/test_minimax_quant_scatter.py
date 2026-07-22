@@ -4,11 +4,11 @@ import sys
 import pytest
 import torch
 
-from sglang.jit_kernel.minimax_quant_ue8m0 import (
+from sglang.kernels.ops.moe.ep_moe_kernels import fill_gateup_input_triton_kernel
+from sglang.kernels.ops.quantization.minimax_quant_ue8m0 import (
     per_token_quant_fp8_ue8m0,
     per_token_quant_fp8_ue8m0_scatter,
 )
-from sglang.kernels.ops.moe.ep_moe_kernels import fill_gateup_input_triton_kernel
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="4-gpu-b200")

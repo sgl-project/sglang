@@ -93,7 +93,7 @@ def initialize_bf16_gemm_config(server_args: ServerArgs) -> None:
                 "--bf16-gemm-backend cutedsl requires SM100/SM103 (Blackwell)"
             )
 
-        from sglang.jit_kernel.cutedsl_bf16_gemm import (
+        from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import (
             cutedsl_bf16_gemm,
             use_cutedsl_bf16_gemm,
         )

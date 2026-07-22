@@ -3,7 +3,7 @@
 Dispatches to one of two interchangeable implementations via ``backend``:
 
 - ``"jit"``: runtime-compiled CUDA C++ (``sglang.jit_kernel.dsv3_fused_a_gemm``).
-- ``"cutedsl"``: CuTe DSL (``sglang.jit_kernel.cutedsl_dsv3_fused_a_gemm``).
+- ``"cutedsl"``: CuTe DSL (``sglang.kernels.ops.gemm.cutedsl_dsv3_fused_a_gemm``).
 - ``"auto"``: CuTe DSL on SM120+, otherwise the JIT kernel.
 
 All backends share the signature ``(mat_a, mat_b, output=None) -> Tensor`` with
@@ -71,7 +71,7 @@ def dsv3_fused_a_gemm(
     if backend == FusedAGemmBackend.JIT:
         from sglang.jit_kernel.dsv3_fused_a_gemm import dsv3_fused_a_gemm as impl
     else:
-        from sglang.jit_kernel.cutedsl_dsv3_fused_a_gemm import (
+        from sglang.kernels.ops.gemm.cutedsl_dsv3_fused_a_gemm import (
             dsv3_fused_a_gemm as impl,
         )
     return impl(mat_a, mat_b, output)

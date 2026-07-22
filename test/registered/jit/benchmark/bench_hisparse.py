@@ -6,7 +6,7 @@ import triton
 import triton.testing
 
 from sglang.jit_kernel.benchmark.utils import DEFAULT_DEVICE, DEFAULT_DTYPE
-from sglang.jit_kernel.hisparse import load_cache_to_device_buffer_mla
+from sglang.kernels.ops.kvcache.hisparse import load_cache_to_device_buffer_mla
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(

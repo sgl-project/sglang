@@ -4,8 +4,10 @@ import torch
 import triton
 import triton.testing
 
-from sglang.jit_kernel.awq_dequantize import awq_dequantize as jit_awq_dequantize
 from sglang.jit_kernel.benchmark.utils import run_benchmark
+from sglang.kernels.ops.quantization.awq_dequantize import (
+    awq_dequantize as jit_awq_dequantize,
+)
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.utils import is_in_ci
 
