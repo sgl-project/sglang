@@ -1,7 +1,7 @@
 //! Frame shaping for the native `/generate` protocol: the cumulative
 //! [`OutputAccumulator`] plus the functions that render [`ChunkEvent`]s /
 //! accumulated state into wire JSON (`meta_info`, logprob tuples, error and
-//! abort frames). No HTTP here — the sibling `sglang` module owns the handlers
+//! abort frames). No HTTP here — the sibling `native_api` module owns the handlers
 //! and streams; it calls these per frame.
 
 use crate::message::{ChunkEvent, ChunkExtras};

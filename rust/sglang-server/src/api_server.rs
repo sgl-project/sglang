@@ -7,8 +7,8 @@ mod common;
 mod frame;
 mod guard;
 mod log;
+mod native_api;
 mod openai;
-mod sglang;
 
 use std::sync::Arc;
 
@@ -19,14 +19,13 @@ use crate::runtime::channels::Senders;
 use crate::tokenizer_manager::ActivityCounter;
 
 /// Shared handler state: the submit machinery (`senders`, `egress_buf`)
-/// + shared tokenizer. `Clone` is cheap refcount bumps (every field is `Arc`).
+/// + shared tokenizer.
 #[derive(Clone)]
 struct AppState {
     senders: Senders,
     egress_buf: usize,
     server_args: Arc<ServerArgs>,
-    /// Egress heartbeat (bumped per drained ring frame). `/health_generate`
-    /// watches it advance to confirm the scheduler → detok path is alive.
+    /// Egress heartbeat (bumped per drained ring frame).
     egress_activity: ActivityCounter,
 }
 
@@ -47,7 +46,7 @@ pub async fn serve(
     // Each endpoint module registers its own routes and merges here.
     let app = Router::new()
         .merge(common::routes())
-        .merge(sglang::routes())
+        .merge(native_api::routes())
         .merge(openai::routes())
         // TODO(auth): no API-key boundary yet. Python gates every route (except
         // /health*, /metrics*, OPTIONS) via `add_api_key_middleware`; until ported,
