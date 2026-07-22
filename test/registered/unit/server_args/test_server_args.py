@@ -607,6 +607,126 @@ class TestContextParallelServerArgs(CustomTestCase):
                 )
 
 
+class TestBenchmarkArgs(unittest.TestCase):
+    _GRID_AXES = {
+        "prefill": (
+            "benchmark_prefill_granularity",
+            "benchmark_prefill_kv_read_granularity",
+        ),
+        "decode": (
+            "benchmark_decode_length_granularity",
+            "benchmark_decode_batch_granularity",
+        ),
+    }
+
+    @staticmethod
+    def _make_args(**overrides):
+        kwargs = dict(
+            model_path="dummy",
+            benchmark_mode="agg",
+            enable_forward_pass_metrics=True,
+        )
+        kwargs.update(overrides)
+        return ServerArgs(**kwargs)
+
+    def test_benchmark_mode_requires_forward_pass_metrics(self):
+        with self.assertRaisesRegex(
+            ValueError, "--benchmark-mode requires --enable-forward-pass-metrics"
+        ):
+            ServerArgs(model_path="dummy", benchmark_mode="agg")
+
+    def test_benchmark_mode_accepts_explicit_forward_pass_metrics(self):
+        server_args = self._make_args()
+
+        self.assertTrue(server_args.enable_forward_pass_metrics)
+
+    def test_benchmark_mode_rejects_ray(self):
+        with self.assertRaisesRegex(
+            ValueError, "--benchmark-mode is not supported with --use-ray"
+        ):
+            self._make_args(use_ray=True)
+
+    def test_benchmark_granularity_out_of_range_rejected(self):
+        invalid_values = (
+            (0, "must be >= 1"),
+            (-1, "must be >= 1"),
+            (1025, "must be <= 1024"),
+        )
+        for axes in self._GRID_AXES.values():
+            for arg in axes:
+                for value, error in invalid_values:
+                    with self.subTest(arg=arg, value=value):
+                        with self.assertRaisesRegex(ValueError, error):
+                            self._make_args(**{arg: value})
+
+    def test_benchmark_granularity_limit_allowed(self):
+        # A non-active grid does not contribute to the requested point total.
+        for mode, inactive_mode in (("prefill", "decode"), ("decode", "prefill")):
+            overrides = {arg: 1024 for arg in self._GRID_AXES[inactive_mode]}
+            with self.subTest(mode=mode):
+                self._make_args(benchmark_mode=mode, **overrides)
+
+        # This value is used by the documented high-granularity prefill example.
+        self._make_args(benchmark_mode="prefill", benchmark_prefill_granularity=512)
+
+    def test_benchmark_grid_point_limit(self):
+        cases = (
+            (
+                "prefill",
+                dict(
+                    benchmark_prefill_granularity=64,
+                    benchmark_prefill_kv_read_granularity=64,
+                ),
+                dict(benchmark_prefill_granularity=65),
+            ),
+            (
+                "decode",
+                dict(
+                    benchmark_decode_length_granularity=64,
+                    benchmark_decode_batch_granularity=64,
+                ),
+                dict(benchmark_decode_length_granularity=65),
+            ),
+            (
+                "agg",
+                dict(
+                    benchmark_prefill_granularity=32,
+                    benchmark_prefill_kv_read_granularity=64,
+                    benchmark_decode_length_granularity=32,
+                    benchmark_decode_batch_granularity=64,
+                ),
+                dict(benchmark_decode_length_granularity=33),
+            ),
+        )
+        for mode, boundary, overflow in cases:
+            with self.subTest(mode=mode, case="boundary"):
+                self._make_args(benchmark_mode=mode, **boundary)
+            with self.subTest(mode=mode, case="overflow"):
+                overflow_args = {**boundary, **overflow}
+                with self.assertRaisesRegex(
+                    ValueError, rf"--benchmark-mode {mode} requests .* maximum is 4096"
+                ):
+                    self._make_args(benchmark_mode=mode, **overflow_args)
+
+    def test_benchmark_warmup_iterations_negative_rejected(self):
+        with self.assertRaisesRegex(ValueError, "must be >= 0"):
+            self._make_args(benchmark_warmup_iterations=-1)
+
+    def test_benchmark_warmup_iterations_zero_allowed(self):
+        server_args = self._make_args(benchmark_warmup_iterations=0)
+        self.assertEqual(server_args.benchmark_warmup_iterations, 0)
+
+    def test_benchmark_values_not_validated_without_benchmark_mode(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            benchmark_prefill_granularity=0,
+            benchmark_prefill_kv_read_granularity=1025,
+            benchmark_warmup_iterations=-5,
+        )
+        self.assertEqual(server_args.benchmark_prefill_granularity, 0)
+        self.assertEqual(server_args.benchmark_prefill_kv_read_granularity, 1025)
+
+
 class TestPortArgs(unittest.TestCase):
     @patch("sglang.srt.server_args.tempfile.NamedTemporaryFile")
     def test_init_new_standard_case(self, mock_temp_file):

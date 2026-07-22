@@ -1346,6 +1346,33 @@ class ServerArgs:
     ] = False
     forward_pass_metrics_worker_id: A[str, Arg(help=argparse.SUPPRESS)] = ""
     forward_pass_metrics_ipc_name: A[Optional[str], Arg(help=argparse.SUPPRESS)] = None
+    benchmark_mode: A[
+        Optional[Literal["prefill", "decode", "agg"]],
+        Arg(
+            help="Run a scheduler-local self-benchmark on startup and write ForwardPassMetrics results to --benchmark-output-path.",
+            choices=["prefill", "decode", "agg"],
+        ),
+    ] = None
+    benchmark_prefill_granularity: A[
+        int, "Number of ISL sample points for self-benchmark prefill sweep."
+    ] = 16
+    benchmark_prefill_kv_read_granularity: A[
+        int,
+        "Number of KV-read sample points per ISL for self-benchmark prefill sweep. The default keeps the existing miss-only sweep.",
+    ] = 1
+    benchmark_decode_length_granularity: A[
+        int, "Number of context length sample points for self-benchmark decode sweep."
+    ] = 6
+    benchmark_decode_batch_granularity: A[
+        int, "Number of batch size sample points per decode context length."
+    ] = 6
+    benchmark_warmup_iterations: A[
+        int,
+        "Number of warmup forward passes before collecting benchmark data.",
+    ] = 5
+    benchmark_output_path: A[str, "Path to write self-benchmark results JSON."] = (
+        "/tmp/benchmark_results.json"
+    )
     enable_trace: A[bool, "Enable opentelemetry trace"] = False
     trace_modules: A[
         str,
@@ -2928,6 +2955,9 @@ class ServerArgs:
             raise ValueError(
                 "--default-chat-template-kwargs must decode to a JSON object"
             )
+
+        # Validate self-benchmark flags.
+        self._handle_self_benchmark_validation()
 
         # Handle deprecated arguments.
         self._handle_deprecated_args()
@@ -7020,6 +7050,26 @@ class ServerArgs:
                 f"--asr-max-concurrent-sessions must be positive "
                 f"(got {self.asr_max_concurrent_sessions})."
             )
+
+    def _handle_self_benchmark_validation(self):
+        """Validate startup self-benchmark flags."""
+        if self.benchmark_mode is None:
+            return
+        if not self.enable_forward_pass_metrics:
+            raise ValueError(
+                "--benchmark-mode requires --enable-forward-pass-metrics so "
+                "ForwardPassMetrics publication is enabled explicitly."
+            )
+        from sglang.srt.managers.scheduler_components.self_benchmark import (
+            SelfBenchmark,
+        )
+
+        SelfBenchmark.validate_args(self)
+        if self.use_ray:
+            # Ray reports scheduler readiness by calling SchedulerActor.get_info()
+            # before the scheduler event loop starts. Self-benchmarking currently
+            # runs inside that event loop, so Ray needs a separate readiness path.
+            raise ValueError("--benchmark-mode is not supported with --use-ray")
 
     def _handle_other_validations(self):
         from sglang.srt.arg_groups.overrides import resolved_view

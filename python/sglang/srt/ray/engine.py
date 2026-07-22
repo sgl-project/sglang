@@ -234,8 +234,19 @@ class RayEngine(Engine):
         if "log_level" not in kwargs:
             kwargs["log_level"] = "error"
         server_args = ServerArgs(**kwargs)
+        self._validate_self_benchmark_not_enabled(server_args)
         server_args.override("ray.placement_group", placement_group=placement_group)
         super().__init__(server_args=server_args)
+
+    @staticmethod
+    def _validate_self_benchmark_not_enabled(server_args: ServerArgs) -> None:
+        if server_args.benchmark_mode is None:
+            return
+        # Ray calls SchedulerActor.get_info() before run_event_loop(), while
+        # self-benchmarking is driven by the event loop. Keep readiness
+        # launcher-owned by rejecting Ray until it has an explicit benchmark
+        # completion wait path.
+        raise ValueError("--benchmark-mode is not supported with RayEngine")
 
     def shutdown(self):
         """Shutdown the engine — kill Ray scheduler actors then local processes."""
@@ -259,6 +270,8 @@ class RayEngine(Engine):
             Tuple of (RaySchedulerInitResult, None).
             scheduler_procs is None since Ray uses actors instead of mp.Process.
         """
+        cls._validate_self_benchmark_not_enabled(server_args)
+
         pg = server_args.placement_group or ray.util.get_current_placement_group()
         if pg is None:
             from ray.util.placement_group import (
