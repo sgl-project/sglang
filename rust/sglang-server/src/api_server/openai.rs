@@ -13,7 +13,15 @@ use axum::{
     response::{IntoResponse, Response},
 };
 
+use axum::{Router, routing::get};
+
 use super::AppState;
+
+/// The routes this module owns, mounted by `api_server::serve`.
+pub(super) fn routes() -> Router<AppState> {
+    // `/v1/models` is OpenAI-compatible; completions/chat land here too.
+    Router::new().route("/v1/models", get(available_models))
+}
 
 /// `GET /v1/models` — OpenAI-compatible model list. Served from `server_args`;
 /// no scheduler round-trip. Mirrors `http_server.available_models`.
@@ -22,7 +30,7 @@ use super::AppState;
 /// adapter (`id=lora_name, root=lora_path, parent=served_model_name,
 /// max_model_len=None`). Adapters load/unload at runtime, so that part needs a
 /// control-request query to the scheduler's LoRA registry.
-pub(super) async fn available_models(State(state): State<AppState>) -> Response {
+async fn available_models(State(state): State<AppState>) -> Response {
     let created = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
