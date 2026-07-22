@@ -916,6 +916,11 @@ def _fwd_kernel_unified(
     cur_seq_kv_len = tl.load(kv_indptr + cur_seq + 1) - cur_seq_kv_start_idx
     cur_seq_prefix_len = tl.load(prefix_lens + cur_seq)
 
+    # Grid axis 2 spans the batch-max extend length; blocks fully past this
+    # request's query length store nothing (the store is masked by mask_m).
+    if cur_block_m * BLOCK_M >= cur_seq_q_len:
+        return
+
     # Load window start position for sliding window attention
     # This is the absolute position of the first key in the window (0 if no sliding window)
     cur_window_start = 0
