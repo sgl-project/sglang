@@ -133,6 +133,30 @@ def get_dsa_index_head_dim(config: PretrainedConfig) -> int:
     return config.index_head_dim
 
 
+def _maybe_fix_glm_moe_dsa_qk_rope_head_dim(*configs: PretrainedConfig) -> None:
+    """Correct a broken qk_rope_head_dim in GLM-5.2 DSA (glm_moe_dsa) configs.
+
+    The GlmMoeDsaConfig class sets ``attribute_map = {"head_dim": "qk_rope_head_dim"}``,
+    so the checkpoint's ``head_dim`` (192) overwrites the real ``qk_rope_head_dim`` (64).
+    That makes qk_head_dim resolve to 192+192=384 and builds q_b_proj / fused kv_a_proj /
+    rope / KV cache with the wrong geometry, so weight loading aborts with a size mismatch
+    (both for the target model and the EAGLE/NextN draft model). Recover the true value
+    from the explicit ``qk_head_dim`` field the checkpoint still carries.
+    """
+    for config in configs:
+        if config is None or getattr(config, "model_type", None) != "glm_moe_dsa":
+            continue
+        qk_head_dim = getattr(config, "qk_head_dim", None)
+        qk_nope = getattr(config, "qk_nope_head_dim", None)
+        if qk_head_dim is None or qk_nope is None:
+            continue
+        corrected_rope = qk_head_dim - qk_nope
+        if corrected_rope > 0 and corrected_rope != getattr(
+            config, "qk_rope_head_dim", None
+        ):
+            config.qk_rope_head_dim = corrected_rope
+
+
 def is_minimax_sparse(config: PretrainedConfig) -> bool:
     arch = (config.architectures or [None])[0]
     return arch in (
@@ -300,6 +324,7 @@ class ModelConfig:
             rope_scaling is not None and "mrope_section" in rope_scaling
         )
 
+        _maybe_fix_glm_moe_dsa_qk_rope_head_dim(self.hf_config, self.hf_text_config)
         self.hf_generation_config = get_generation_config(
             self.model_path,
             trust_remote_code=trust_remote_code,
