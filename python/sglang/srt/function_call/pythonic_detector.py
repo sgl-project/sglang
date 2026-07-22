@@ -15,6 +15,13 @@ from sglang.srt.function_call.core_types import (
 
 logger = logging.getLogger(__name__)
 
+# Matches the start of a single pythonic call, e.g. "[get_weather(". Used only
+# to test a candidate '[' position in a single linear pass (see
+# `_find_tool_call_span`) -- it has no nested quantifiers over `.` so it
+# cannot backtrack catastrophically the way the old single-shot locator regex
+# could (see https://github.com/sgl-project/sglang/issues/31912).
+_CALL_START_RE = re.compile(r"\[\s*[a-zA-Z]+\w*\(")
+
 
 class PythonicDetector(BaseFormatDetector):
     """
@@ -31,13 +38,6 @@ class PythonicDetector(BaseFormatDetector):
     Reference: https://huggingface.co/meta-llama/Llama-4-Scout-17B-16E-Instruct?chat_template=default
     """
 
-    def __init__(self):
-        super().__init__()
-        self.tool_call_regex = re.compile(
-            r"\[([a-zA-Z]+\w*\(([a-zA-Z]+\w*=.*,\s*)*([a-zA-Z]+\w*=.*\s)?\),\s*)*([a-zA-Z]+\w*\(([a-zA-Z]+\w*=.*,\s*)*([a-zA-Z]+\w*=.*\s*)?\)\s*)+\]",
-            re.DOTALL,
-        )
-
     @staticmethod
     def _text_strip(text: str) -> str:
         # Llama 4 model sometime will output <|python_start|> and <|python_end|> tokens
@@ -46,8 +46,32 @@ class PythonicDetector(BaseFormatDetector):
         text = text.replace("<|python_end|>", "")
         return text
 
+    @staticmethod
+    def _find_tool_call_span(text: str) -> tuple[int, int] | None:
+        """
+        Locate the first top-level, call-shaped ``[...]`` span in ``text``,
+        e.g. ``[foo(a=1), bar(b=[1, 2])]``.
+
+        This walks the string once, tracking bracket depth, instead of using
+        a backtracking regex: a bracket-nesting depth counter is inherently
+        linear and can't blow up the way the old regex did on malformed or
+        truncated input (see GH #31912).
+        """
+        depth = 0
+        candidate_start = None
+        for i, ch in enumerate(text):
+            if ch == "[":
+                if depth == 0:
+                    candidate_start = i if _CALL_START_RE.match(text, i) else None
+                depth += 1
+            elif ch == "]" and depth > 0:
+                depth -= 1
+                if depth == 0 and candidate_start is not None:
+                    return candidate_start, i + 1
+        return None
+
     def has_tool_call(self, text: str) -> bool:
-        return bool(self.tool_call_regex.search(self._text_strip(text.strip())))
+        return self._find_tool_call_span(self._text_strip(text.strip())) is not None
 
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         # Try parsing the text as a Python list of function calls
@@ -56,13 +80,12 @@ class PythonicDetector(BaseFormatDetector):
         # Remove unexpected <|python_start|> and <|python_end|> for llama4
         text = self._text_strip(text)
 
-        match = self.tool_call_regex.search(text)
-        if match is None:
+        span = self._find_tool_call_span(text)
+        if span is None:
             return StreamingParseResult(normal_text=text, calls=[])
 
         # Extract the tool call part and any text before/after it
-        tool_call_start = match.start()
-        tool_call_end = match.end()
+        tool_call_start, tool_call_end = span
 
         normal_text_before = text[:tool_call_start] if tool_call_start > 0 else ""
         tool_call_text = text[tool_call_start:tool_call_end]
