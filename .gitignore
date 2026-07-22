@@ -71,9 +71,6 @@ instance/
 # Scrapy stuff:
 .scrapy
 
-# Sphinx documentation
-docs/_build/
-
 # PyBuilder
 .pybuilder/
 target/
@@ -167,9 +164,6 @@ cython_debug/
 
 # Vim
 *.swp
-
-# Documentation
-docs/_build
 
 # SGL
 benchmark/mmlu/data
