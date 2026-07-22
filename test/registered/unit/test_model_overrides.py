@@ -1708,9 +1708,11 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             self.assertEqual(
                 _llama4_overrides(_args(attention_backend="fa3"), None), {}
             )
-            self.assertEqual(
-                _gemma4_overrides(_args(), None), {"attention_backend": "trtllm_mha"}
-            )
+            with patch.object(overrides_module, "use_mlx", return_value=False):
+                self.assertEqual(
+                    _gemma4_overrides(_args(), None),
+                    {"attention_backend": "trtllm_mha"},
+                )
             self.assertEqual(
                 _minicpm_v4_6_overrides(_args(), None),
                 {"attention_backend": "triton"},
@@ -1740,9 +1742,11 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 self.assertEqual(
                     _llama4_overrides(_args(), None), {"attention_backend": "fa3"}
                 )
-            self.assertEqual(
-                _gemma4_overrides(_args(), None), {"attention_backend": "triton"}
-            )
+            with patch.object(overrides_module, "use_mlx", return_value=False):
+                self.assertEqual(
+                    _gemma4_overrides(_args(), None),
+                    {"attention_backend": "triton"},
+                )
         # Glm4Moe: unconditional tf32 declaration + (sm100) quant/moe absorption
         with patch.object(overrides_module, "is_sm100_supported", return_value=False):
             self.assertEqual(
@@ -1767,6 +1771,42 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                     "enable_tf32_matmul": True,
                 },
             )
+
+    def test_gemma4_mlx_uses_torch_native_attention(self):
+        from sglang.srt.arg_groups.overrides import _gemma4_overrides
+
+        def _args(*, device="cuda", attention_backend=None, backend_not_set=True):
+            return SimpleNamespace(
+                device=device,
+                attention_backend=attention_backend,
+                is_attention_backend_not_set=lambda: backend_not_set,
+                moe_runner_backend="triton",
+                quantization=None,
+            )
+
+        with patch.object(overrides_module, "is_sm100_supported", return_value=True):
+            with patch.object(overrides_module, "use_mlx", return_value=False):
+                self.assertEqual(
+                    _gemma4_overrides(_args(device="mps"), None),
+                    {"attention_backend": "trtllm_mha"},
+                )
+                self.assertEqual(
+                    _gemma4_overrides(
+                        _args(
+                            device="mps",
+                            attention_backend="torch_native",
+                            backend_not_set=False,
+                        ),
+                        None,
+                    ),
+                    {},
+                )
+
+            with patch.object(overrides_module, "use_mlx", return_value=True):
+                self.assertEqual(
+                    _gemma4_overrides(_args(), None),
+                    {"attention_backend": "torch_native"},
+                )
 
     def test_deepseek_moe_quant_slot_pass(self):
         from sglang.srt.arg_groups.overrides import (

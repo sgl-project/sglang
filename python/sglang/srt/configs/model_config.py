@@ -38,6 +38,7 @@ from sglang.srt.utils.hf_transformers_utils import (
     get_sparse_attention_config,
 )
 from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
+from sglang.srt.utils.tensor_bridge import use_mlx
 from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
@@ -308,6 +309,15 @@ class ModelConfig:
         )
 
         # Set enable_multimodal
+        model_arch = self.hf_config.architectures[0]
+        is_mlx_text_only_model = (
+            use_mlx() and model_arch == "Gemma4ForConditionalGeneration"
+        )
+        if is_mlx_text_only_model and enable_multimodal:
+            raise NotImplementedError(
+                "Gemma 4 multimodal inputs are not supported by the MLX backend yet. "
+                "Remove --enable-multimodal to use the text-only prototype."
+            )
         if enable_multimodal is None:
             mm_disabled_models = [
                 "Gemma3ForConditionalGeneration",
@@ -315,8 +325,15 @@ class ModelConfig:
                 "Step3VLForConditionalGeneration",
                 "InklingForConditionalGeneration",
             ]
-            if (
-                self.hf_config.architectures[0] in mm_disabled_models
+            if is_mlx_text_only_model:
+                enable_multimodal = False
+                logger.info(
+                    "Multimodal is disabled for %s on the MLX backend; "
+                    "the initial Gemma 4 Apple Silicon path is text-only.",
+                    self.hf_config.model_type,
+                )
+            elif (
+                model_arch in mm_disabled_models
                 and self.model_impl != ModelImpl.TRANSFORMERS
             ):
                 enable_multimodal = False

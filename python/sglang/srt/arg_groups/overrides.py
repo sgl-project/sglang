@@ -57,6 +57,7 @@ from sglang.srt.utils.common import (
     is_xpu,
     xpu_has_xmx_support,
 )
+from sglang.srt.utils.tensor_bridge import use_mlx
 
 logger = logging.getLogger(__name__)
 
@@ -707,7 +708,12 @@ def _llama4_overrides(server_args: Any, hf_config: Any) -> dict:
 )
 def _gemma4_overrides(server_args: Any, hf_config: Any) -> dict:
     overrides: Dict[str, Any] = {}
-    default_attention_backend = "trtllm_mha" if is_sm100_supported() else "triton"
+    if use_mlx():
+        # The MLX runner owns attention execution; torch_native keeps generic
+        # scheduler allocation on its portable PyTorch path.
+        default_attention_backend = "torch_native"
+    else:
+        default_attention_backend = "trtllm_mha" if is_sm100_supported() else "triton"
     if server_args.is_attention_backend_not_set():
         logger.info(
             f"Use {default_attention_backend} as default attention backend for Gemma4"

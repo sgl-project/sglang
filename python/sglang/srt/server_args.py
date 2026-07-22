@@ -5099,12 +5099,21 @@ class ServerArgs:
             # Default attention backend selection moved to the override registry
             # (arg_groups/overrides.py: _gemma4_overrides).
             prefill_backend, decode_backend = self._resolved_attention_backends()
-            accepted_backends = ("trtllm_mha", "triton", "ascend", "intel_xpu")
+            accepted_backends = (
+                "trtllm_mha",
+                "triton",
+                "ascend",
+                "intel_xpu",
+            )
+            if use_mlx():
+                # The MLX runner owns execution; torch_native is a
+                # scheduler-facing placeholder accepted on Apple Silicon.
+                accepted_backends += ("torch_native",)
             assert (
                 prefill_backend in accepted_backends
                 and decode_backend in accepted_backends
             ), (
-                "Gemma4 only supports trtllm_mha, triton, or intel_xpu attention backend, "
+                f"Gemma4 only supports {accepted_backends} attention backends, "
                 f"got prefill={prefill_backend}, decode={decode_backend}"
             )
 

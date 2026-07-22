@@ -62,6 +62,24 @@ class MlxTpModelWorker(TpModelWorker):
             init_kwargs["pool_size"] = get_schedule().max_total_tokens
         self._mlx_runner = MlxModelRunner(**init_kwargs)
 
+        if self._mlx_runner.native_cache_fallback:
+            if not get_schedule().disable_overlap_schedule:
+                raise NotImplementedError(
+                    "Gemma 4 on the MLX backend currently requires "
+                    "--disable-overlap-schedule."
+                )
+            if get_schedule().chunked_prefill_size != -1:
+                raise NotImplementedError(
+                    "Gemma 4 on the MLX backend currently requires "
+                    "--chunked-prefill-size -1."
+                )
+            if self.model_config.context_len > self._mlx_runner.pool_size:
+                raise NotImplementedError(
+                    "Gemma 4 on the MLX backend currently requires "
+                    "--context-length to be no larger than --max-total-tokens "
+                    "(2048 is the validated prototype setting)."
+                )
+
         self._model_runner = MlxModelRunnerStub(
             model_config=self.model_config,
             mem_fraction_static=get_schedule().mem_fraction_static,
@@ -74,6 +92,7 @@ class MlxTpModelWorker(TpModelWorker):
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             memory_pool_config=self.memory_pool_config,
             mlx_pool_size=self._mlx_runner.pool_size,
+            mlx_native_cache_fallback=self._mlx_runner.native_cache_fallback,
         )
 
         self._mlx_active_rids: set[str] = set()
@@ -131,6 +150,13 @@ class MlxTpModelWorker(TpModelWorker):
             # Prefer the just-snapshotted live auxiliary state for the final
             # insert. Any older tracked slot is released during component cleanup.
             req.mamba_last_track_seqlen = None
+            if self._mlx_runner.native_cache_fallback:
+                # Native-cache fallback requires overlap scheduling to be off,
+                # so no later in-flight graph can still reference this request.
+                # Release here rather than waiting for a future decode batch:
+                # a request may finish during prefill and the server may go idle.
+                self._mlx_runner.remove_request(req.rid)
+                self._mlx_active_rids.discard(req.rid)
 
     def _route_extend_request(self, rid: str, decoding_rids: set[str]) -> str:
         """Classify a request within an extend / mixed batch.

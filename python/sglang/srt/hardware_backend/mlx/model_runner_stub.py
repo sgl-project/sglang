@@ -105,8 +105,15 @@ class MlxModelRunnerStub(ModelRunner):
     # that path working instead of raising AttributeError.
     prefill_aware_swa = False
 
-    def __init__(self, *args, mlx_pool_size: int | None = None, **kwargs):
+    def __init__(
+        self,
+        *args,
+        mlx_pool_size: int | None = None,
+        mlx_native_cache_fallback: bool = False,
+        **kwargs,
+    ):
         self._mlx_pool_size = mlx_pool_size
+        self._mlx_native_cache_fallback = mlx_native_cache_fallback
         super().__init__(*args, **kwargs)
 
     def load_model(self):
@@ -167,9 +174,25 @@ class MlxModelRunnerStub(ModelRunner):
         requested = get_schedule().max_running_requests
         if requested is None:
             requested_per_worker = None
-            resolved = min(capacity_cap, 4096)
+            # The initial Gemma 4 path executes each request through its own
+            # model-native cache rather than SGLang's batched attention path.
+            # Default to one live request so a 131k advertised context does not
+            # create a needlessly large CPU ReqToTokenPool. Users can opt into
+            # more independent requests with --max-running-requests.
+            default_max_requests = (
+                1 if getattr(self, "_mlx_native_cache_fallback", False) else 4096
+            )
+            resolved = min(capacity_cap, default_max_requests)
         else:
-            requested_per_worker = requested // self.dp_size
+            # Match the canonical KV-cache resolver: requests are split only
+            # across attention-DP workers. Pure data-parallel replicas each
+            # need the full local limit.
+            attn_dp_size = getattr(
+                getattr(self, "ps", None),
+                "attn_dp_size",
+                1,
+            )
+            requested_per_worker = requested // attn_dp_size
             resolved = min(requested_per_worker, capacity_cap)
 
         aux_state_size = get_schedule().max_mamba_cache_size
