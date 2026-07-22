@@ -1918,12 +1918,24 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
 
         target_device = torch.device(self.device)
+
+        if (
+            weight_name_filter is not None
+            and self.model_config.quantization is not None
+        ):
+            return False, (
+                "weight_name_filter is not supported for quantized models: "
+                "all weights must be reloaded before post-processing."
+            )
+
+        original_model_path = self.model_config.model_path
         self.model_config.model_path = model_path
         load_config = LoadConfig(load_format=load_format)
 
         # Only support DefaultModelLoader for now
         loader = get_model_loader(load_config, self.model_config)
         if not isinstance(loader, DefaultModelLoader):
+            self.model_config.model_path = original_model_path
             message = f"Failed to get model loader: {loader}."
             return False, message
 
@@ -1946,9 +1958,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             try:
                 iter = get_weight_iter(self.model_config)
             except Exception as e:
+                self.model_config.model_path = original_model_path
                 message = f"Failed to get weights iterator: {e}."
                 return False, message
             try:
+                if weight_name_filter is None:
+                    restore_weight(self.model, target_device)
                 model = model_load_weights(self.model, iter)
             except Exception as e:
                 message = (
@@ -1956,6 +1971,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
                 del iter
                 gc.collect()
+                self.model_config.model_path = original_model_path
+                restore_weight(self.model, target_device)
                 iter = get_weight_iter(self.model_config)
                 self.model = model_load_weights(self.model, iter)
                 return False, message

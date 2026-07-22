@@ -421,7 +421,10 @@ class SchedulerWeightUpdaterManager:
                         skip_tensor_list=recv_req.skip_tensor_list,
                     )
                 except Exception as e:
-                    raise RuntimeError(f"[{role or 'target'}] {e}") from e
+                    # Exception notes identify the failing tensor.
+                    notes = "; ".join(getattr(e, "__notes__", []))
+                    detail = f"{e}" + (f" ({notes})" if notes else "")
+                    raise RuntimeError(f"[{role or 'target'}] {detail}") from e
 
             if recv_req.action == "checksum":
                 payload = _merge_checksum_payloads(

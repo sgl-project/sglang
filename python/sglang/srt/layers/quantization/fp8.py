@@ -393,6 +393,28 @@ class Fp8Config(QuantizationConfig):
             )
 
 
+def _snapshot_scale_checkpoint_state(scale) -> None:
+    """Capture the scale layout expected by the checkpoint loader."""
+    if scale is not None and not hasattr(scale, "_checkpoint_format_ue8m0"):
+        scale._checkpoint_format_ue8m0 = scale.format_ue8m0
+        scale._checkpoint_shape = tuple(scale.data.shape)
+        scale._checkpoint_dtype = scale.data.dtype
+
+
+def _restore_scale_checkpoint_state(scale) -> None:
+    """Restore a scale parameter to its checkpoint-loading layout."""
+    if scale is None or not hasattr(scale, "_checkpoint_format_ue8m0"):
+        return
+    scale.format_ue8m0 = scale._checkpoint_format_ue8m0
+    if tuple(scale.data.shape) != scale._checkpoint_shape:
+        scale._reload_kernel_buffer = scale.data
+        scale.data = torch.empty(
+            scale._checkpoint_shape,
+            dtype=scale._checkpoint_dtype,
+            device=scale.data.device,
+        )
+
+
 class Fp8LinearMethod(LinearMethodBase):
     """Linear method for FP8.
 
@@ -588,7 +610,12 @@ class Fp8LinearMethod(LinearMethodBase):
             else:
                 layer.register_parameter("input_scale", None)
 
+    def restore_weights_before_loading(self, layer: Module) -> None:
+        if self.block_quant:
+            _restore_scale_checkpoint_state(getattr(layer, "weight_scale_inv", None))
+
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
+        _snapshot_scale_checkpoint_state(getattr(layer, "weight_scale_inv", None))
         # If ROCm, normalize the weights and scales to e4m3fnuz
         if _is_fp8_fnuz:
             # activation_scheme: dynamic
@@ -1238,7 +1265,16 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.w13_input_scale = None
             layer.w2_input_scale = None
 
+    def restore_weights_before_loading(self, layer: Module) -> None:
+        if self.block_quant:
+            _restore_scale_checkpoint_state(
+                getattr(layer, "w13_weight_scale_inv", None)
+            )
+            _restore_scale_checkpoint_state(getattr(layer, "w2_weight_scale_inv", None))
+
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
+        _snapshot_scale_checkpoint_state(getattr(layer, "w13_weight_scale_inv", None))
+        _snapshot_scale_checkpoint_state(getattr(layer, "w2_weight_scale_inv", None))
         # AMD FP4 experts: use aiter's native MXFP4 MoE path
         if _use_aiter and self.is_fp4_expert:
             gu_intv = envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
