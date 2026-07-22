@@ -48,7 +48,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.utils import is_layer_skipped
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
@@ -77,9 +77,7 @@ if is_flashinfer_available():
         nvfp4_block_scale_interleave,
         trtllm_fp4_block_scale_moe,
     )
-    from flashinfer.fused_moe.core import (
-        get_w2_permute_indices_with_cache,
-    )
+    from flashinfer.fused_moe.core import get_w2_permute_indices_with_cache
 
     # SM90 mixed-input helpers landed in FlashInfer #3084 (post-0.6.10). Older
     # versions don't ship them; gate at import so unrelated code paths still load.
@@ -334,7 +332,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.use_flashinfer = get_moe_runner_backend().is_flashinfer_mxfp4()
         self.use_marlin = get_moe_runner_backend().is_marlin()
         self.flashinfer_mxfp4_moe_precision = (
-            get_server_args().flashinfer_mxfp4_moe_precision
+            get_exec().moe.flashinfer_mxfp4_moe_precision
         )
         # When `flashinfer_mxfp4` is enabled, dispatch to one of two FlashInfer
         # entry points depending on the GPU:
@@ -857,29 +855,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     layer.w2_weight_bias = Parameter(
                         layer.w2_weight_bias.float(), requires_grad=False
                     )
-                return
-            # Fallback if the TP-sharded layer cannot be AMX-packed
-            from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
-
-            w13_weight = MXFP4QuantizeUtil.dequantize(
-                quantized_data=layer.w13_weight,
-                dtype=torch.bfloat16,
-                scale=layer.w13_weight_scale,
-                block_sizes=[32],
-            )
-            w2_weight = MXFP4QuantizeUtil.dequantize(
-                quantized_data=layer.w2_weight,
-                dtype=torch.bfloat16,
-                scale=layer.w2_weight_scale,
-                block_sizes=[32],
-            )
-            del layer.w13_weight
-            del layer.w2_weight
-            del layer.w13_weight_scale
-            del layer.w2_weight_scale
-            layer.w13_weight = Parameter(w13_weight, requires_grad=False)
-            layer.w2_weight = Parameter(w2_weight, requires_grad=False)
-
             return
         else:
             from triton_kernels.numerics_details.mxfp import upcast_from_mxfp

@@ -26,7 +26,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.jit_kernel.utils import is_arch_support_pdl
+from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.srt.distributed import (
     get_pp_group,
     tensor_model_parallel_all_reduce,
@@ -34,9 +34,7 @@ from sglang.srt.distributed import (
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
-from sglang.srt.layers.dp_attention import (
-    is_dp_attention_enabled,
-)
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
@@ -68,7 +66,11 @@ from sglang.srt.models.utils import (
     create_fused_set_kv_buffer_arg,
     enable_fused_set_kv_buffer,
 )
-from sglang.srt.runtime_context import get_forward, get_parallel, get_server_args
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_forward,
+    get_parallel,
+)
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
@@ -226,7 +228,7 @@ class GptOssSparseMoeBlock(nn.Module):
 
         self.experts = experts_type(
             num_experts=config.num_local_experts
-            + get_server_args().ep_num_redundant_experts,
+            + get_exec().moe.ep_num_redundant_experts,
             top_k=config.num_experts_per_tok,
             layer_id=layer_id,
             hidden_size=config.hidden_size,
@@ -254,10 +256,40 @@ class GptOssSparseMoeBlock(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: Optional[ForwardBatch] = None,
     ) -> torch.Tensor:
+        if get_parallel().dwdp_size > 1:
+            return self.forward_dwdp(hidden_states)
+
         if not get_moe_a2a_backend().is_deepep():
             return self.forward_normal(hidden_states)
         else:
-            raise Exception("forward_deepep branch not implemented yet")
+            raise NotImplementedError("forward_deepep branch not implemented yet")
+
+    def forward_dwdp(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        num_tokens = hidden_states.shape[0]
+        hidden_dim_unpadded = self.hidden_size
+        is_prepadded = hidden_states.shape[-1] != hidden_dim_unpadded
+
+        if num_tokens > 0:
+            router_input = (
+                hidden_states[..., :hidden_dim_unpadded]
+                if is_prepadded
+                else hidden_states
+            )
+            router_logits, _ = self.router(router_input)
+            topk_output = self.topk(router_input, router_logits)
+            final_hidden_states = self.experts(hidden_states, topk_output)
+        else:
+            final_hidden_states = hidden_states
+
+        if is_prepadded:
+            ans = final_hidden_states[..., :hidden_dim_unpadded].contiguous()
+            ans = ans.view(num_tokens, hidden_dim_unpadded)
+        else:
+            ans = final_hidden_states.view(num_tokens, hidden_dim_unpadded)
+        return ans
 
     def get_moe_weights(self):
         return [
@@ -386,7 +418,7 @@ class GptOssAttention(nn.Module):
 
         # Choose dtype of sinks based on attention backend: trtllm_mha requires float32,
         # others can use bfloat16
-        attn_backend = get_server_args().attention_backend
+        attn_backend = get_exec().kernel.attention_backend
         sinks_dtype = torch.float32 if attn_backend == "trtllm_mha" else torch.bfloat16
         self.sinks = nn.Parameter(
             torch.empty(self.num_heads, dtype=sinks_dtype), requires_grad=False
@@ -742,7 +774,7 @@ class GptOssForCausalLM(nn.Module):
             config.hidden_size,
             # quant_config=quant_config,
             prefix=add_prefix("lm_head", prefix),
-            use_attn_tp_group=get_server_args().enable_dp_lm_head,
+            use_attn_tp_group=get_parallel().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
         self.capture_aux_hidden_states = False

@@ -65,10 +65,8 @@ from sglang.srt.models.deepseek_common.utils import (
     _use_aiter_bpreshuffle_gfx95,
     _use_aiter_gfx95,
 )
-from sglang.srt.runtime_context import get_parallel, get_server_args
-from sglang.srt.state_capturer.indexer_topk import (
-    maybe_capture_indexer_topk,
-)
+from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
+from sglang.srt.state_capturer.indexer_topk import maybe_capture_indexer_topk
 from sglang.srt.utils import BumpAllocator
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -88,30 +86,7 @@ class MlaBmmFusionPlan:
 
 
 if _is_cuda:
-    from sgl_kernel import bmm_fp8 as _raw_bmm_fp8
-
-    # TODO(yuwei): remove this wrapper after sgl-kernel registers its own fake/meta impl
-    # Wrap bmm_fp8 as a custom op so torch.compile does not trace into
-    # torch.cuda.current_blas_handle() (which returns a non-Tensor).
-    @register_custom_op(mutates_args=["out"])
-    def _bmm_fp8_op(
-        A: torch.Tensor,
-        B: torch.Tensor,
-        out: torch.Tensor,
-        A_scale: torch.Tensor,
-        B_scale: torch.Tensor,
-    ) -> None:
-        _raw_bmm_fp8(A, B, A_scale, B_scale, out.dtype, out)
-
-    def bmm_fp8(A, B, A_scale, B_scale, dtype, out=None):
-        if out is None:
-            out = torch.empty(
-                (A.shape[0], A.shape[1], B.shape[2]),
-                device=A.device,
-                dtype=dtype,
-            )
-        _bmm_fp8_op(A, B, out, A_scale, B_scale)
-        return out
+    from sglang.kernels.ops.gemm import bmm_fp8
 
 
 if _use_aiter:
@@ -176,7 +151,7 @@ def _should_defer_dsa_cp_kv_gather(
 class DeepseekMLAForwardMixin:
     def init_mla_forward(self: DeepseekV2AttentionMLA):
         self.flashinfer_mla_disable_ragged = (
-            get_server_args().flashinfer_mla_disable_ragged
+            get_exec().kernel.flashinfer_mla_disable_ragged
         )
 
     def should_run_indexer(
@@ -1013,8 +988,8 @@ class DeepseekMLAForwardMixin:
         """
         if self.current_attention_backend in ("dsa", "nsa"):
             return (
-                get_server_args().dsa_decode_backend == "trtllm"
-                or get_server_args().dsa_prefill_backend == "trtllm"
+                get_exec().kernel.dsa_decode_backend == "trtllm"
+                or get_exec().kernel.dsa_prefill_backend == "trtllm"
             ) and get_attn_backend().kv_cache_dtype == torch.float8_e4m3fn
 
         return (

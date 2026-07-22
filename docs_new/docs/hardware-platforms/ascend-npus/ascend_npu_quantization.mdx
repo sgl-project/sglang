@@ -15,7 +15,7 @@ SGLang supports **mix-bits** quantization (independently defines and loads each 
       <th>Layer type</th>
       <th>A2 Supported</th>
       <th>A3 Supported</th>
-      <th>A5 Supported</th>
+      <th>Ascend 950 Products Supported</th>
       <th>Diffusion models</th>
     </tr>
   </thead>
@@ -119,7 +119,7 @@ SGLang supports **mix-bits** quantization (independently defines and loads each 
       <th>Layer type</th>
       <th>A2 Supported</th>
       <th>A3 Supported</th>
-      <th>A5 Supported</th>
+      <th>Ascend 950 Products Supported</th>
     </tr>
   </thead>
   <tbody>
@@ -155,7 +155,7 @@ GPTQ on Ascend support
       <th>Layer type</th>
       <th>A2 Supported</th>
       <th>A3 Supported</th>
-      <th>A5 Supported</th>
+      <th>Ascend 950 Products Supported</th>
     </tr>
   </thead>
   <tbody>
@@ -198,7 +198,7 @@ GPTQ on Ascend support
       <th>Layer type</th>
       <th>A2 Supported</th>
       <th>A3 Supported</th>
-      <th>A5 Supported</th>
+      <th>Ascend 950 Products Supported</th>
     </tr>
   </thead>
   <tbody>
@@ -241,7 +241,7 @@ Compressed-tensors (LLM Compressor) on Ascend support:
       <th>Layer type</th>
       <th>A2 Supported</th>
       <th>A3 Supported</th>
-      <th>A5 Supported</th>
+      <th>Ascend 950 Products Supported</th>
     </tr>
   </thead>
   <tbody>
@@ -284,7 +284,7 @@ Compressed-tensors (LLM Compressor) on Ascend support:
       <th>Layer type</th>
       <th>A2 Supported</th>
       <th>A3 Supported</th>
-      <th>A5 Supported</th>
+      <th>Ascend 950 Products Supported</th>
     </tr>
   </thead>
   <tbody>
@@ -335,7 +335,7 @@ python3 -m sglang.launch_server \
 
 **MXFP8 for LLM dense models (e.g., Qwen3 / Qwen3.5):**
 
-LLM dense W8A8 MXFP8 Linear support on Ascend was added in [PR #22352](https://github.com/sgl-project/sglang/pull/22352). Requires Ascend A5 series or newer (`npu_dynamic_mx_quant` is not available on A2 / A3).
+LLM dense W8A8 MXFP8 Linear support on Ascend was added in [PR #22352](https://github.com/sgl-project/sglang/pull/22352). Requires Ascend 950 Products or newer (`npu_dynamic_mx_quant` is not available on A2 / A3).
 
 - Online MXFP8 quantization (BF16/FP16 weights → MXFP8 at load time):
 
@@ -365,7 +365,7 @@ python3 -m sglang.launch_server \
 
 **MXFP4 W4A8 for LLM dense models (e.g., Qwen3 / Qwen3.5):**
 
-LLM dense W4A8 (MXFP4 4-bit weights + MXFP8 8-bit activations) Linear support was added in [PR #23650](https://github.com/sgl-project/sglang/pull/23650). Requires Ascend A5 series or newer.
+LLM dense W4A8 (MXFP4 4-bit weights + MXFP8 8-bit activations) Linear support was added in [PR #23650](https://github.com/sgl-project/sglang/pull/23650). Requires Ascend 950 Products or newer.
 
 - Online W4A8 quantization (BF16/FP16 weights → MXFP4 at load time):
 
@@ -410,9 +410,9 @@ python3 -m sglang.launch_server \
 
 ## Diffusion Model Quantization on Ascend NPU
 
-SGLang-Diffusion supports MXFP8 online and offline quantization for diffusion models (such as Wan2.2) on Ascend NPUs. MXFP8 requires A5; the ModelSlim W8A8/W4A4 schemes work on A2/A3.
+SGLang-Diffusion supports MXFP8 online and offline quantization for diffusion models (such as Wan2.2) on Ascend NPUs. MXFP8 requires Ascend 950 Products; the ModelSlim W8A8/W4A4 schemes work on A2/A3.
 
-**Requirements for MXFP8:** CANN ≥ 8.0.RC3, Ascend A5
+**Requirements for MXFP8:** CANN ≥ 8.0.RC3, Ascend 950 Products
 
 <table>
   <thead>
@@ -422,7 +422,7 @@ SGLang-Diffusion supports MXFP8 online and offline quantization for diffusion mo
       <th>Scheme class</th>
       <th>Mode</th>
       <th>A2/A3 Supported</th>
-      <th>A5 Supported</th>
+      <th>Ascend 950 Products Supported</th>
       <th>Trigger</th>
     </tr>
   </thead>
