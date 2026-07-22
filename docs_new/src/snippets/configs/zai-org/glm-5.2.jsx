@@ -285,13 +285,9 @@ sgl-eval run aime25 \\
       ],
     },
     {
-      // Memory-bound — throughput can't beat balanced here, and the Blackwell HT
-      // optimization does NOT apply. GLM-5.2-FP8 weights occupy ~76% of each H200's 143GB
-      // (min mem-fraction-static ~0.76), leaving KV for only ~256 concurrent requests.
-      // There's no headroom to grow the batch (a bigger DeepEP buffer + uncapped batch
-      // OOMs the CUDA-graph capture), so HT keeps the 256 cap. At conc 1024/4096 the excess
-      // just queues — very high TTFT for no throughput gain. Genuinely higher tok/s/GPU on
-      // H200 would require smaller weights (e.g. NVFP4) to free KV.
+      // Memory-bound: FP8 weights + KV fill each H200. No max-running cap, but the CUDA-graph
+      // capture is bounded (--cuda-graph-max-bs 256, with a matching DeepEP dispatch buffer)
+      // since uncapping it OOMs. Throughput saturates at conc 256; higher conc just queues.
       match: { hw: "h200", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
       verified: true,
       env: [],
@@ -302,7 +298,7 @@ sgl-eval run aime25 \\
         "--enable-dp-attention",
         "--moe-a2a-backend deepep",
         "--mem-fraction-static 0.85",
-        "--max-running-requests 256",
+        "--cuda-graph-max-bs 128",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -415,6 +411,7 @@ sgl-eval run aime25 \\
       ],
     },
     {
+      // Throughput saturates at conc 256 — higher conc regresses vs balanced (queueing).
       match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
       verified: true,
       env: [
@@ -535,6 +532,8 @@ sgl-eval run aime25 \\
       ],
     },
     {
+      // Memory-bound (bf16). No max-running cap; CUDA-graph capture bounded (--cuda-graph-max-bs 256).
+      // Throughput saturates at conc 256 — higher conc just queues.
       match: { hw: "b300", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" },
       verified: true,
       env: [],
@@ -542,7 +541,7 @@ sgl-eval run aime25 \\
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
         "--mem-fraction-static 0.9",
-        "--max-running-requests 256",
+        "--cuda-graph-max-bs 256",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -756,8 +755,7 @@ sgl-eval run aime25 \\
         "--dp 8",
         "--enable-dp-attention",
         "--chunked-prefill-size 32768",
-        "--mem-fraction-static 0.92",
-        "--max-running-requests 512",
+        "--mem-fraction-static 0.85",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -822,7 +820,6 @@ sgl-eval run aime25 \\
         "--dp 8",
         "--enable-dp-attention",
         "--quantization modelopt_fp4",
-        "--max-running-requests 1024",
         "--chunked-prefill-size 8192",
         "--mem-fraction-static 0.85",
         "--host {{HOST_IP}}",
@@ -876,6 +873,7 @@ sgl-eval run aime25 \\
       ],
     },
     {
+      // Throughput saturates at conc 256 — higher conc regresses vs balanced (queueing).
       match: { hw: "gb300", variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "single" },
       verified: true,
       env: [],
@@ -887,7 +885,6 @@ sgl-eval run aime25 \\
         "--enable-dp-attention",
         "--chunked-prefill-size 8192",
         "--mem-fraction-static 0.92",
-        "--max-running-requests 512",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
