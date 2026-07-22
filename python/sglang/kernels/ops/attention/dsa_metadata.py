@@ -499,6 +499,15 @@ def _fused_dsa_draft_extend_metadata_kernel(
     col_block = page_pid - req_row * num_col_blocks
     offs_n = col_block * BLOCK_N + tl.arange(0, BLOCK_N)
 
+    # Skip column blocks past the request's kv length: no consumer reads there
+    # (attention and the indexer both stay within cache_seqlens).
+    kv_len = tl.load(
+        seq_lens + req_row * seq_lens_stride,
+        mask=req_row < bs,
+        other=0,
+    ).to(tl.int32)
+    if col_block * BLOCK_N >= kv_len:
+        return
     prefix = req_row * QO_LEN
     offs_r = tl.arange(0, BLOCK_ROWS)
     out_rows = prefix + offs_r

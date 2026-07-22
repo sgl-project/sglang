@@ -8,7 +8,7 @@ from sglang.kernels.ops.attention.utils import create_flashinfer_kv_indices_trit
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import get_spec
 from sglang.srt.speculative.spec_info import (
     PrecomputedExtendLayout,
     SpecInput,
@@ -206,7 +206,7 @@ class EagleDraftInput(SpecInput):
             topk_index=torch.empty((0, topk), device=device, dtype=torch.int64),
             draft_probs=(
                 torch.empty((0, vocab_size), device=device, dtype=torch.float32)
-                if get_server_args().speculative_use_rejection_sampling
+                if get_spec().speculative_use_rejection_sampling
                 else None
             ),
             capture_hidden_mode=capture_hidden_mode,

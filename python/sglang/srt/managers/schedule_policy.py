@@ -56,7 +56,7 @@ from sglang.srt.mem_cache.multi_ended_allocator import (
     UnifiedMambaTokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import get_disagg
 from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
@@ -193,7 +193,7 @@ class SchedulePolicy:
         if (
             not isinstance(policy, CacheAwarePolicy)
             and self.tree_cache.supports_fast_match_prefix()
-            and get_server_args().disaggregation_mode != "decode"
+            and get_disagg().disaggregation_mode != "decode"
         ):
             for r in waiting_queue:
                 match_prefix_for_req(self.tree_cache, r, include_req=True)
@@ -845,6 +845,17 @@ class PrefillAdder:
                     return req
                 _rem_tokens = self.rem_chunk_tokens
 
+        # A mid-chunk rank prefills this pass regardless of the delayer
+        # verdict, so report prefillable=True and ignore the result.
+        if self.prefill_delayer_single_pass is not None:
+            self.prefill_delayer_single_pass.negotiate_should_allow_prefill(
+                local_prefillable=True,
+                running_batch=self.running_batch.batch_size(),
+                max_prefill_bs=self.max_prefill_bs,
+                max_running_requests=self.max_running_requests,
+                waiting_queue_len=self.waiting_queue_len,
+            )
+
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
             req.prefix_indices
         )
@@ -1001,16 +1012,6 @@ class PrefillAdder:
     def add_one_req(
         self, req: Req, has_chunked_req: bool, truncation_align_size: Optional[int]
     ):
-        if (self.prefill_delayer_single_pass is not None) and (
-            not self.prefill_delayer_single_pass.negotiate_should_allow_prefill(
-                local_prefillable=True,
-                running_batch=self.running_batch.batch_size(),
-                max_prefill_bs=self.max_prefill_bs,
-                max_running_requests=self.max_running_requests,
-                waiting_queue_len=self.waiting_queue_len,
-            )
-        ):
-            return AddReqResult.OTHER
         # TODO support cp with multiple requests
         # Enabling context parallelism currently presents precision issues;
         # therefore, the prefill-batch setting is temporarily set to 1.
@@ -1085,6 +1086,20 @@ class PrefillAdder:
                     if self.rem_chunk_tokens is None or swa_cap <= 0:
                         return AddReqResult.NO_TOKEN
                     chunk_tokens_limit = min(self.rem_chunk_tokens, swa_cap)
+
+            # Negotiate only after every KV-budget gate (a NO_TOKEN rank must
+            # report not-prefillable via finalize()) and before init_load_back
+            # (a delay verdict must not start KV load-back).
+            if (self.prefill_delayer_single_pass is not None) and (
+                not self.prefill_delayer_single_pass.negotiate_should_allow_prefill(
+                    local_prefillable=True,
+                    running_batch=self.running_batch.batch_size(),
+                    max_prefill_bs=self.max_prefill_bs,
+                    max_running_requests=self.max_running_requests,
+                    waiting_queue_len=self.waiting_queue_len,
+                )
+            ):
+                return AddReqResult.OTHER
 
             if req.needs_host_load_back():
                 new_indices, req.last_node = self.tree_cache.init_load_back(
