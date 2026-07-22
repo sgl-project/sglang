@@ -765,12 +765,12 @@ class ModelConfig:
 
     def _derive_model_shapes(self):
         # Unify the config keys for hf_text_config
+        # Mamba/SSM configs have no attention heads; use 1 as safe default so
+        # head_dim falls back to hidden_size without crashing.
+        _n_heads = getattr(self.hf_text_config, "num_attention_heads", None) or 1
         self.head_dim = getattr(self.hf_text_config, "head_dim", None)
         if self.head_dim is None:
-            self.head_dim = (
-                self.hf_text_config.hidden_size
-                // self.hf_text_config.num_attention_heads
-            )
+            self.head_dim = self.hf_text_config.hidden_size // _n_heads
             setattr(self.hf_text_config, "head_dim", self.head_dim)
 
         self.v_head_dim = getattr(self.hf_text_config, "v_head_dim", None)
@@ -948,7 +948,7 @@ class ModelConfig:
 
             self.attention_arch = AttentionArch.MHA
 
-        self.num_attention_heads = self.hf_text_config.num_attention_heads
+        self.num_attention_heads = getattr(self.hf_text_config, "num_attention_heads", 1)
         self.num_key_value_heads = getattr(
             self.hf_text_config, "num_key_value_heads", None
         )
