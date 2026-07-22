@@ -11,7 +11,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -65,9 +65,7 @@ if _is_npu:
         )
 
 if _is_hip:
-    from sglang.kernels.ops.attention.utils import (
-        fused_qk_rope_reshape_and_cache,
-    )
+    from sglang.kernels.ops.attention.utils import fused_qk_rope_reshape_and_cache
 
 if _is_xpu:
     from sgl_kernel import fused_qk_rope_with_cos_sin_cache_inplace
@@ -127,7 +125,7 @@ class RotaryEmbedding(MultiPlatformOp):
         self._apply_rotary_emb_wrapped = apply_rotary_emb
 
         # XXX (MUSA): Implement sgl_kernel.rotary_embedding support for MUSA backend
-        if get_server_args().rl_on_policy_target is not None or _is_musa:
+        if get_exec().deterministic.rl_on_policy_target is not None or _is_musa:
             self._forward_method = self.forward_native
             self._apply_rotary_emb_wrapped = torch.compile(
                 dynamic=True,
@@ -151,7 +149,7 @@ class RotaryEmbedding(MultiPlatformOp):
         # create the cache on GPU for faster initialization. This may cause
         # a slight numerical difference between the HF implementation and ours.
         init_device = (
-            "cpu" if get_server_args().rl_on_policy_target is not None else None
+            "cpu" if get_exec().deterministic.rl_on_policy_target is not None else None
         )
         inv_freq = 1.0 / (
             base
@@ -162,7 +160,7 @@ class RotaryEmbedding(MultiPlatformOp):
                 / self.rotary_dim
             )
         )
-        if get_server_args().rl_on_policy_target is not None:
+        if get_exec().deterministic.rl_on_policy_target is not None:
             inv_freq = inv_freq.cuda()
         return inv_freq
 

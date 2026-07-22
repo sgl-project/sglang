@@ -114,8 +114,8 @@ def jit_rope_then_store(
     out_loc: torch.Tensor,
     is_neox: bool,
 ) -> None:
-    from sglang.jit_kernel.kvcache import store_cache
     from sglang.jit_kernel.rope import apply_rope_inplace
+    from sglang.kernels.ops.kvcache.kvcache import store_cache
 
     head_size = q.shape[-1]
     row_dim = k.shape[-2] * head_size

@@ -11,7 +11,7 @@ from sglang.kernels.ops.attention.fla.chunk_intra_token_parallel import (
 from sglang.kernels.ops.attention.fla.index import (
     prepare_chunk_indices,
 )
-from sglang.kernels.ops.attention.fla.op import exp, exp2, gather
+from sglang.kernels.ops.attention.fla.op import exp2, gather
 from sglang.kernels.ops.attention.fla.utils import (
     autotune_cache_kwargs,
     is_gather_supported,
@@ -632,7 +632,7 @@ def chunk_kda_fwd_kernel_inter_solve_fused(
             tl.store(p_u2, b_u2.to(p_u2.dtype.element_ty), boundary_check=(0, 1))
             tl.store(p_u3, b_u3.to(p_u3.dtype.element_ty), boundary_check=(0, 1))
 
-        # ---- w = A_inv @ (k * beta * exp(gk)), kg = k * exp(gn - gk) ----
+        # ---- w = A_inv @ (k * beta * exp2(gk)), kg = k * exp2(gn - gk) ----
         w_base = w_out + (bos * H + i_h) * K
         kg_base = kg_out + (bos * H + i_h) * K
         last_idx = min(i_t * BT + BT, T) - 1
@@ -680,10 +680,10 @@ def chunk_kda_fwd_kernel_inter_solve_fused(
             b_gk2r = tl.load(p_gk2, boundary_check=(0, 1)).to(tl.float32)
             b_gk3r = tl.load(p_gk3, boundary_check=(0, 1)).to(tl.float32)
 
-            b_kb0 = (b_k0r * b_b0[:, None] * exp(b_gk0r)).to(b_k0r.dtype)
-            b_kb1 = (b_k1r * b_b1r[:, None] * exp(b_gk1r)).to(b_k1r.dtype)
-            b_kb2 = (b_k2r * b_b2r[:, None] * exp(b_gk2r)).to(b_k2r.dtype)
-            b_kb3 = (b_k3r * b_b3r[:, None] * exp(b_gk3r)).to(b_k3r.dtype)
+            b_kb0 = (b_k0r * b_b0[:, None] * exp2(b_gk0r)).to(b_k0r.dtype)
+            b_kb1 = (b_k1r * b_b1r[:, None] * exp2(b_gk1r)).to(b_k1r.dtype)
+            b_kb2 = (b_k2r * b_b2r[:, None] * exp2(b_gk2r)).to(b_k2r.dtype)
+            b_kb3 = (b_k3r * b_b3r[:, None] * exp2(b_gk3r)).to(b_k3r.dtype)
 
             b_w0 = tl.dot(b_Ai00_h, b_kb0)
             b_w1 = tl.dot(b_Ai10_h, b_kb0) + tl.dot(b_Ai11_h, b_kb1)
@@ -716,10 +716,10 @@ def chunk_kda_fwd_kernel_inter_solve_fused(
             tl.store(p_w2, b_w2.to(p_w2.dtype.element_ty), boundary_check=(0, 1))
             tl.store(p_w3, b_w3.to(p_w3.dtype.element_ty), boundary_check=(0, 1))
 
-            b_kg0 = b_k0r * exp(b_gn[None, :] - b_gk0r)
-            b_kg1 = b_k1r * exp(b_gn[None, :] - b_gk1r)
-            b_kg2 = b_k2r * exp(b_gn[None, :] - b_gk2r)
-            b_kg3 = b_k3r * exp(b_gn[None, :] - b_gk3r)
+            b_kg0 = b_k0r * exp2(b_gn[None, :] - b_gk0r)
+            b_kg1 = b_k1r * exp2(b_gn[None, :] - b_gk1r)
+            b_kg2 = b_k2r * exp2(b_gn[None, :] - b_gk2r)
+            b_kg3 = b_k3r * exp2(b_gn[None, :] - b_gk3r)
 
             p_kg0 = tl.make_block_ptr(
                 kg_base, (T, K), (H * K, 1), (i_tc0, i_k * BK), (BC, BK), (1, 0)
@@ -918,7 +918,6 @@ def chunk_kda_fwd_intra(
     chunk_size: int = 64,
     chunk_indices: torch.LongTensor | None = None,
     safe_gate: bool = False,
-    disable_recompute: bool = False,
     fuse_recompute: bool = False,
     fuse_diagonal: bool = False,
 ):
@@ -1042,14 +1041,13 @@ def chunk_kda_fwd_intra(
         recompute_w_u_fwd as kda_recompute_w_u_fwd,
     )
 
-    w, u, qg, kg = kda_recompute_w_u_fwd(
+    w, u, kg = kda_recompute_w_u_fwd(
         k=k,
         v=v,
         beta=beta,
         A=Akk,
-        q=q if disable_recompute else None,
         gk=gk,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
     )
-    return w, u, qg, kg, Aqk, Akk
+    return w, u, None, kg, Aqk, Akk
