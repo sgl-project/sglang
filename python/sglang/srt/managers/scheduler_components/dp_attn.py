@@ -12,9 +12,7 @@ from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import world_dp_gather_enabled
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.managers.scheduler_components.recv_skipper import (
-    SchedulerRecvSkipper,
-)
+from sglang.srt.managers.scheduler_components.recv_skipper import SchedulerRecvSkipper
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -26,6 +24,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.metrics_collector import DPCooperationInfo
+from sglang.srt.runtime_context import get_parallel, get_schedule
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.common import require_mlp_tp_gather
@@ -226,6 +225,7 @@ def prepare_mlp_sync_batch_raw(
     require_mlp_tp_gather: bool,
     disable_overlap_schedule: bool,
     offload_tags: set[str],
+    dwdp: bool = False,
 ):
     # Check if other DP workers have running batches
     if (
@@ -327,8 +327,8 @@ def prepare_mlp_sync_batch_raw(
 
     # Decide whether to emit idle batch
     if skip_all_gather:
-        # Skip idle batch when attn-dp=1
-        need_idle_batch = dp_size > 1
+        # Skip idle batch when attn-dp=1 (and always under DWDP: ranks run independently)
+        need_idle_batch = not dwdp and dp_size > 1
     else:
         need_idle_batch = max(mlp_sync_info.global_num_tokens) > 0
 
@@ -377,15 +377,16 @@ class SchedulerDPAttnAdapter:
     def prepare_mlp_sync_batch(self, local_batch: ScheduleBatch):
         return prepare_mlp_sync_batch_raw(
             local_batch,
-            dp_size=self.server_args.dp_size,
+            dp_size=get_parallel().dp_size,
             attn_tp_size=self.ps.attn_tp_size,
             attn_cp_size=self.ps.attn_cp_size,
             tp_group=self.tp_group,
             get_idle_batch=self.get_idle_batch,
             disable_cuda_graph=cuda_graph_fully_disabled(),
             require_mlp_tp_gather=require_mlp_tp_gather(self.server_args),
-            disable_overlap_schedule=self.server_args.disable_overlap_schedule,
+            disable_overlap_schedule=get_schedule().disable_overlap_schedule,
             offload_tags=self.offload_tags,
+            dwdp=self.server_args.dwdp_size > 1,
         )
 
     def maybe_prepare_mlp_sync_batch(
