@@ -27,7 +27,6 @@ except ImportError:
     KERNELS_AVAILABLE = False
 
 register_cuda_ci(est_time=6, stage="base-b-kernel-unit", runner_config="1-gpu-large")
-register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
 register_amd_ci(est_time=10, suite="nightly-amd-kernel-1-gpu", nightly=True)
 
 

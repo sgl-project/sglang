@@ -33,7 +33,7 @@ from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocation_sizing import get_alloc_len_per_decode
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import get_compress_state_ring_size
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_model, get_parallel
 from sglang.srt.utils.common import (
     ceil_align,
     ceil_div,
@@ -78,11 +78,6 @@ def _get_dsv4_compress_state_dtype_sizes() -> tuple[int, int]:
     if dtype_name in ("float32", "fp32"):
         return 4, 4
     if dtype_name in ("bfloat16", "bf16"):
-        if envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get():
-            raise ValueError(
-                "SGLANG_DSV4_COMPRESS_STATE_DTYPE=bf16 is not supported when "
-                "SGLANG_OPT_USE_ONLINE_COMPRESS=1; online c128 state must stay float32."
-            )
         return 2, 2
     raise ValueError(
         "Unsupported SGLANG_DSV4_COMPRESS_STATE_DTYPE="
@@ -278,6 +273,14 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 cell_size = (cell_size // 2) + (
                     (n * k * effective_num_layers * 2 * kv_size) // scale_block_size
                 )
+                # FP4 prefill uses one shared FP8 dequant workspace across layers.
+                cell_size += n * k * 2 * kv_size
+            elif get_model().kv_cache_dtype == "mxfp8":
+                scale_block_size = 32
+                n = model_config.get_num_kv_heads(tp_size)
+                cell_size += (
+                    n * (model_config.head_dim + model_config.v_head_dim) * num_layers
+                ) // scale_block_size
 
         return cell_size
 
@@ -315,6 +318,8 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         ), "Hybrid SWA model must have at least one SWA layer"
 
         self._swa_full_tokens_ratio = kvc.server_args.swa_full_tokens_ratio
+        self._sliding_window_size = kvc.sliding_window_size
+        self._page_size = kvc.page_size
 
         # Full layer per-token memory (bytes)
         self._full_per_token = (
@@ -330,15 +335,43 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
             * kv_size
         )
 
+        if get_model().kv_cache_dtype == "mxfp8":
+            scale_block_size = 32
+            self._full_per_token += (
+                model_config.get_num_kv_heads(tp_size)
+                * (model_config.head_dim + model_config.v_head_dim)
+            ) // scale_block_size
+            self._swa_per_token += (
+                model_config.get_swa_num_kv_heads(tp_size)
+                * (model_config.swa_head_dim + model_config.swa_v_head_dim)
+            ) // scale_block_size
+
         # EAGLE/STANDALONE draft KV pool inherits max_total tokens with its
-        # full-attn layers; budget into the full term.
+        # full-attn layers; budget into the full term. A banded MTP depth
+        # (Inkling mtp_local_layer_ids) instead allocates an swa-geometry ring
+        # at FULL draft capacity, so budget those depths at swa_per_token.
         self._draft_full_layers_num = 0
+        self._draft_swa_full_layers_num = 0
         if (
             kvc.spec_algorithm.is_eagle() or kvc.spec_algorithm.is_standalone()
         ) and not kvc.is_draft_worker:
             draft_layers = kvc.spec_aux_config.eagle_draft_num_layers
             if draft_layers is not None and int(draft_layers) > 0:
-                self._draft_full_layers_num = int(draft_layers)
+                draft_layers = int(draft_layers)
+                banded_depths = 0
+                if (
+                    model_config.hf_config.architectures[0]
+                    == "InklingForConditionalGeneration"
+                ):
+                    banded_depths = len(
+                        [
+                            i
+                            for i in model_config.hf_text_config.mtp_local_layer_ids
+                            if i < draft_layers
+                        ]
+                    )
+                self._draft_swa_full_layers_num = banded_depths
+                self._draft_full_layers_num = draft_layers - banded_depths
 
         # Bytes per token of max_total_num_tokens.
         #
@@ -353,11 +386,13 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
             self._cell_size = (
                 self._swa_per_token * self._swa_layers_num
                 + self._full_per_token * self._draft_full_layers_num
+                + self._swa_per_token * self._draft_swa_full_layers_num
             )
         else:
             self._cell_size = (
                 self._full_per_token
                 * (self._full_layers_num + self._draft_full_layers_num)
+                + self._swa_per_token * self._draft_swa_full_layers_num
                 + self._swa_full_tokens_ratio
                 * self._swa_per_token
                 * self._swa_layers_num
@@ -388,6 +423,17 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         # Hybrid: full_tokens = max_total_num_tokens, swa_tokens = full_tokens * ratio
         full_tokens = align_page_size(max_total_num_tokens)
         swa_tokens = align_page_size(int(full_tokens * self._swa_full_tokens_ratio))
+
+        if (
+            self._sliding_window_size is not None
+            and self._sliding_window_size + self._page_size >= swa_tokens
+        ):
+            raise ValueError(
+                f"SWA pool ({swa_tokens} tokens) cannot hold even one request: "
+                f"the prefill admission floor is sliding_window_size "
+                f"({self._sliding_window_size}) + page_size ({self._page_size}). "
+                f"Increase --swa-full-tokens-ratio or the total KV budget."
+            )
 
         logger.info(
             f"Use sliding window memory pool. "
@@ -481,8 +527,9 @@ class SWAChunkCapPoolConfigurator(HybridSWAPoolConfigurator):
         # SWA pool sized tightly from the cap; the rest of the budget goes to full.
         swa_tokens = ceil_align(self._swa_cap, page_size)
         fixed_swa_bytes = swa_tokens * self._swa_per_token * self._swa_layers_num
-        full_cell_size = self._full_per_token * (
-            self._full_layers_num + self._draft_full_layers_num
+        full_cell_size = (
+            self._full_per_token * (self._full_layers_num + self._draft_full_layers_num)
+            + self._swa_per_token * self._draft_swa_full_layers_num
         )
         full_tokens = (
             int((available_bytes - fixed_swa_bytes) // full_cell_size) // page_size

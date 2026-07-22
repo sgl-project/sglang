@@ -3,7 +3,7 @@ from typing import Callable, List, Optional, Sequence
 
 import pytest
 
-from sglang.jit_kernel.mp import multigpu_launch
+from sglang.kernels.ops.communication.mp import multigpu_launch
 
 
 def multigpu_pytest_main(
@@ -14,7 +14,7 @@ def multigpu_pytest_main(
     pre_launch_fn: Optional[Callable[[List[int]], None]] = None,
     timeout: Optional[int] = 600,
 ) -> None:
-    """cudalib-style multi-GPU pytest entry point.
+    """Torchrun-based multi-GPU pytest entry point.
 
     Drop this at the bottom of a test file::
 

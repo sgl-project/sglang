@@ -268,12 +268,28 @@ class HostKVCache(abc.ABC):
             (self.size,), dtype=torch.uint8, device=self.device
         )
         self.free_slots = torch.arange(self.size, dtype=torch.int64)
+        # Keep freed chunks aside and consume them lazily from alloc() to avoid
+        # concatenating a large free-list on every host-pool free.
+        self.release_slots = []
+        self.num_release_slots = 0
         # Per-slot flag used to detect double-free.
         # slot_used[k] is true if slot k is allocated.
         self.slot_used = torch.zeros(self.size, dtype=torch.bool)
 
     def available_size(self):
-        return len(self.free_slots)
+        return len(self.free_slots) + self.num_release_slots
+
+    def _merge_release_slots(self):
+        if self.num_release_slots == 0:
+            return
+
+        if len(self.free_slots) == 0 and len(self.release_slots) == 1:
+            self.free_slots = self.release_slots[0]
+        else:
+            self.free_slots = torch.cat([self.free_slots, *self.release_slots])
+
+        self.release_slots = []
+        self.num_release_slots = 0
 
     @synchronized
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:
@@ -282,6 +298,9 @@ class HostKVCache(abc.ABC):
         ), "The requested size should be a multiple of the page size."
         if need_size > self.available_size():
             return None
+
+        if need_size > len(self.free_slots):
+            self._merge_release_slots()
 
         select_index = self.free_slots[:need_size]
         self.free_slots = self.free_slots[need_size:]
@@ -297,10 +316,14 @@ class HostKVCache(abc.ABC):
     @synchronized
     def free(self, indices: torch.Tensor) -> int:
         indices_cpu = indices.cpu()
+        if indices_cpu.numel() == 0:
+            return 0
+
         assert self.slot_used[indices_cpu].all(), (
             f"Double-free detected: slots not currently allocated: "
             f"{indices_cpu[~self.slot_used[indices_cpu]].tolist()}."
         )
         self.slot_used[indices_cpu] = False
-        self.free_slots = torch.cat([self.free_slots, indices_cpu])
+        self.release_slots.append(indices_cpu)
+        self.num_release_slots += len(indices_cpu)
         return len(indices)

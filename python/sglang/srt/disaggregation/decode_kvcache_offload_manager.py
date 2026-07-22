@@ -110,6 +110,9 @@ class DecodeKVCacheOffloadManager:
         self.offload_inflight = {}
         logger.info("Enable offload kv cache for decode side")
 
+    def release_host_resources(self) -> None:
+        self.decode_host_mem_pool.destroy()
+
     def _mark_offload_started(self, rid):
         self.offload_inflight[rid] = self.offload_inflight.get(rid, 0) + 1
 
@@ -222,9 +225,9 @@ class DecodeKVCacheOffloadManager:
     def _check_offload_progress(self, finish_count):
         """Check the progress of offload from device to host."""
         while finish_count > 0:
-            _, finish_event, ack_list = self.cache_controller.ack_write_queue.pop(0)
-            finish_event.synchronize()
-            for ack_id in ack_list:
+            ack = self.cache_controller.ack_write_queue.pop(0)
+            ack.finish_event.synchronize()
+            for ack_id in ack.node_ids:
                 (
                     req,
                     host_indices,
