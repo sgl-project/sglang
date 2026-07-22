@@ -3610,12 +3610,7 @@ class Scheduler(
             and self._pp_microbatches_drained()
         )
 
-        # Waiting queues: waiting + bootstrapping + preallocation + kv transfer (decode).
-        # ignore_waiting is set by flush-while-paused callers: with generation paused
-        # and running_batch drained, nothing in waiting_queue holds KV/pool state —
-        # neither requests pause_generation(mode="retract") just moved here nor
-        # requests that were never scheduled at all (the latter are always present
-        # under high concurrency, where in-flight targets exceed engine parallelism).
+        # Waiting queues: waiting + bootstrapping + preallocation + kv transfer (decode)
         if not ignore_waiting:
             idle &= len(self.waiting_queue) == 0
 
