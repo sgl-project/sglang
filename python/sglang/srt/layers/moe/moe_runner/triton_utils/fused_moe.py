@@ -372,6 +372,7 @@ def _prepare_fused_moe_run(
     use_int4_w4a16: bool,
     per_channel_quant: bool,
     block_shape: Optional[List[int]],
+    ignore_invalid_expert: bool = False,
 ):
     """Resolve config, down_config, TMA flag, and aligned expert routing ids.
 
@@ -409,7 +410,7 @@ def _prepare_fused_moe_run(
     )
 
     sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-        topk_ids, config["BLOCK_SIZE_M"], E
+        topk_ids, config["BLOCK_SIZE_M"], E, ignore_invalid_expert=ignore_invalid_expert
     )
 
     return (
