@@ -27,7 +27,6 @@ def compute_num_resident_experts(
     top_k: int,
     num_experts: int,
     activation_reserve_bytes: float | None = None,
-    min_kv_pool_bytes: float = 0.0,
 ) -> int:
     """Largest K that fits, clamped to ``[top_k, num_experts]``.
 
@@ -41,31 +40,23 @@ def compute_num_resident_experts(
     ``top_k`` — starving K for a KV pool that can never be allocated (sglang sizes the real KV pool from
     the leftover afterwards, clamped to physical VRAM).
 
-    ``activation_reserve_bytes`` (aggressive single-stream sizing): when given, it REPLACES the
-    ``free*(1-mem_fraction)`` percentage reserve with a FIXED byte reserve for activations + cuda-graph
-    pool + fragmentation slack. The percentage scales with card size, not with the bs=1 activation peak,
-    so at ``max_running_requests==1`` it over-reserves ~a GB; a measured fixed floor reclaims that for K.
-    Only spend it when the caller has gated on bs==1 and an outer boot-time back-off can catch an
-    over-estimate as a benign restart.
-
-    ``min_kv_pool_bytes`` floors the reserve so the leftover KV pool always holds at least one prefill
-    chunk (+ window): the extend allocator grabs a whole chunk before the ring can free, so a pool below
-    one chunk silently fails long prompts. Never floor the budget negative — a caller asking for more K
-    than physically fits still bottoms out at ``top_k`` (and boots-loud downstream).
+    ``activation_reserve_bytes`` ('max' sizing): when given, it REPLACES the ``free*(1-mem_fraction)``
+    percentage reserve with a FIXED, batch-scaled byte reserve for activations + cuda-graph pool +
+    fragmentation slack. The percentage scales with card size, not with the activation peak, so it
+    over-reserves ~a GB; a measured reserve reclaims that for K (opt-in — spends the safety headroom).
     """
     per_expert_pool = (
         moe_layers * per_expert_layer_bytes
     )  # VRAM for one resident expert (all layers)
     if activation_reserve_bytes is not None:
-        # Fixed measured reserve (aggressive, bs=1): spend the percentage headroom down to a real floor.
+        # Fixed measured reserve ('max'): spend the percentage headroom down to a real floor.
         budget = free_vram_bytes - activation_reserve_bytes - nonexpert_bytes
     else:
         budget = (
             free_vram_bytes * mem_fraction - nonexpert_bytes
         )  # shared by the K-slot pool AND the KV pool
-    # Floor the KV reserve so the real pool holds >= one prefill chunk (+ window); clamp to what's
-    # physically left after a minimum (top_k) pool so an over-estimate floors K to top_k, not negative.
-    kv_reserve_bytes = max(kv_reserve_bytes, min_kv_pool_bytes)
+    # Clamp the KV reserve to what's physically left after a minimum (top_k) pool so an over-estimate floors
+    # K to top_k, not negative.
     kv_reserve_bytes = max(0.0, min(kv_reserve_bytes, budget - top_k * per_expert_pool))
     k = int((budget - kv_reserve_bytes) / per_expert_pool)
     return max(top_k, min(num_experts, k))
@@ -97,45 +88,6 @@ def compute_window_experts(
     if w >= num_experts:
         return 0  # whole store fits the budget -> pin all, no window needed
     return max(1, min(num_experts - 1, w))
-
-
-def compute_window_size(
-    *,
-    context_length: int,
-    per_token_bytes: float,
-    per_expert_pool_bytes: float,
-    top_k: int,
-    budget_bytes: float,
-    window_cost_mult: float = 2.0,
-    page_size: int = 1,
-) -> int:
-    """KV-streaming window ``W`` (tokens). ``0`` => full-KV (do NOT window).
-
-    Fits/doesn't-fit policy — empirically justified (deep-position A/B) and machine-independent (no bandwidth
-    constant, no fitted thresholds). Whenever the WHOLE context KV fits VRAM alongside a minimal (``top_k``)
-    expert pool, full-KV strictly beats windowing at every decode position: resident KV is read from HBM
-    (~free) while a window's tail is re-streamed from host over PCIe every step, and full-KV's only cost —
-    expert page-in — is position-independent. So return ``0`` (let aggressive-K size the pool) whenever
-    full-KV fits, regardless of context length.
-
-    Window ONLY when full-KV is INFEASIBLE (context too large for VRAM even at ``top_k`` experts): give the
-    leftover after a ``top_k`` expert floor to the device ring (cost ~``window_cost_mult * per_token`` per
-    token: ring + pool retention), capped at the context. This is the capacity fallback — slow at depth,
-    but the only way to serve a context that cannot be held resident. Page-aligned.
-    """
-    if per_token_bytes <= 0:
-        return 0
-    full_kv_cost = top_k * per_expert_pool_bytes + context_length * per_token_bytes
-    if full_kv_cost <= budget_bytes:
-        return 0  # full-KV fits -> no windowing (best throughput at every position)
-    leftover = budget_bytes - top_k * per_expert_pool_bytes
-    if leftover <= 0:
-        return 0  # can't fit even top_k experts + a window; caller sizes down / boots loud
-    w = int(leftover / (window_cost_mult * per_token_bytes))
-    w = min(w, context_length)
-    if w <= 0:
-        return 0
-    return max(page_size, (w // page_size) * page_size)
 
 
 def kv_reserve_bytes_mha(
