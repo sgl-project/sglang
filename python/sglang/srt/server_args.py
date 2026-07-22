@@ -5466,15 +5466,33 @@ class ServerArgs:
                     "decode backend, got "
                     f"--linear-attn-decode-backend={decode!r}."
                 )
-            if self.enable_mamba_extra_buffer():
-                # The spec-verify path does not yet implement the device-side
-                # force-flush needed to keep `temporal` consistent with the ring at
-                # radix mamba-track boundaries, so it is incompatible with
-                # extra_buffer (radix prefix caching).
+            _algo = (self.speculative_algorithm or "").upper()
+            if self.enable_mamba_extra_buffer() and _algo not in ("DSPARK", "DFLASH"):
+                # KDA fold-every-commit (DSPARK/DFLASH) keeps `temporal` current
+                # and snapshots the crossing state in the same replay, so it works
+                # with extra_buffer. The GDN path lags `temporal` (no device-side
+                # force-flush at track boundaries) and does not.
                 raise ValueError(
                     "--enable-gdn-replayssm-spec is not yet compatible with mamba "
-                    "extra_buffer (radix prefix caching); use --disable-radix-cache "
-                    "or --mamba-radix-cache-strategy no_buffer."
+                    "extra_buffer (radix prefix caching) for this speculative "
+                    "algorithm; use --disable-radix-cache or "
+                    "--mamba-radix-cache-strategy no_buffer."
+                )
+            from sglang.srt.speculative.ragged_verify import (
+                RaggedVerifyMode,
+                read_ragged_verify_mode,
+            )
+
+            if read_ragged_verify_mode() is RaggedVerifyMode.COMPACT:
+                # Ring is written only on the dense verify layout; compact leaves
+                # it stale and there's no intermediate_ssm fallback -> commit would
+                # fold a stale ring into the state.
+                raise ValueError(
+                    "--enable-gdn-replayssm-spec (ReplaySSM) is not compatible with "
+                    "SGLANG_RAGGED_VERIFY_MODE=compact: the per-slot ring is written "
+                    "only on the dense verify layout, so compact-mode commits would "
+                    "fold a stale ring into the SSM state. Use "
+                    "SGLANG_RAGGED_VERIFY_MODE=static."
                 )
             if self.disaggregation_mode != "null":
                 raise ValueError(

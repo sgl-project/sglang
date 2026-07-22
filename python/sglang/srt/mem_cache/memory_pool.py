@@ -553,6 +553,11 @@ class MambaPool:
                 # SSM dtype to halve the ring traffic. g stays fp32 everywhere
                 # (exact-fold input). The two flags are mutually exclusive.
                 ring_dtype = conv_dtype if enable_gdn_replayssm_spec else ssm_dtype
+                # d/k look like dead weight for the KDA fold (it replays raw v/k),
+                # but forward_decode's fused-decode path is gated on
+                # `replayssm_d is None` -- skipping them would also flip KDA decode
+                # from decode-ring to fused, a behavior change needing its own
+                # validation. Keep allocating for now (memory follow-up).
                 replayssm_d = torch.zeros(
                     size=(num_mamba_layers, num_slots, hv, L, v_dim),
                     dtype=ring_dtype,
@@ -632,6 +637,10 @@ class MambaPool:
                 # The recurrent-verify fallback cannot be reached under the flag
                 # (GDN + linear chain + triton enforced in server_args; the
                 # backend asserts loudly if it ever is).
+                # ReplaySSM skips this dominant scratch (~9GB @ K3 dspark γ=7): the
+                # KDA verify kernel takes intermediate_states_buffer=None (skips the
+                # per-step write, CACHE_INTERMEDIATE_STATES=False) and the commit
+                # replays the ring into the checkpoint instead. This is the memory win.
                 if enable_gdn_replayssm_spec:
                     intermediate_ssm_state_cache = None
                 else:
@@ -754,8 +763,8 @@ class MambaPool:
                 logger.info(
                     f"GDN ReplaySSM ring buffers allocated (L="
                     f"{linear_replayssm_cache_len}): "
-                    f"d={get_tensor_size_bytes(replayssm_d) / GB:.3f}GB, "
-                    f"k={get_tensor_size_bytes(replayssm_k) / GB:.3f}GB, "
+                    f"d={(get_tensor_size_bytes(replayssm_d) / GB) if replayssm_d is not None else 0.0:.3f}GB, "
+                    f"k={(get_tensor_size_bytes(replayssm_k) / GB) if replayssm_k is not None else 0.0:.3f}GB, "
                     f"g={get_tensor_size_bytes(replayssm_g) / GB:.3f}GB "
                     + (
                         f"rawv={get_tensor_size_bytes(replayssm_rawv) / GB:.3f}GB, "

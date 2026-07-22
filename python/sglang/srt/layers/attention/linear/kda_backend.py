@@ -677,7 +677,11 @@ class KDAAttnBackend(MambaAttnBackendBase):
         conv_states = mamba_cache_params.conv[0]
         ssm_states = mamba_cache_params.temporal
         intermediate_state_cache = getattr(mamba_cache_params, "intermediate_ssm", None)
-        if intermediate_state_cache is None:
+        # ReplaySSM: intermediate_ssm is intentionally None (the ring + commit-time
+        # fold replace the per-step snapshots). Pass None to the verify kernel so it
+        # skips the write (CACHE_INTERMEDIATE_STATES=False); the output is unaffected.
+        replayssm_on = getattr(mamba_cache_params, "replayssm_rawv", None) is not None
+        if intermediate_state_cache is None and not replayssm_on:
             raise RuntimeError(
                 "KDA target_verify requires a speculative mamba cache "
                 "(MambaPool.SpeculativeState); none found."
@@ -745,6 +749,45 @@ class KDAAttnBackend(MambaAttnBackendBase):
         q = q.unflatten(-1, (-1, layer.head_q_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
         k = k.unflatten(-1, (-1, layer.head_k_dim)).unsqueeze(0)
         v = v.unflatten(-1, (-1, layer.head_v_dim)).unsqueeze(0)
+
+        # ReplaySSM (fold-every-commit): store the draft window's raw inputs into
+        # the per-slot ring so commit replays the accepted prefix into the fp32
+        # checkpoint, replacing the per-step intermediate_ssm. Dense verify only
+        # (there is no intermediate_ssm fallback under replayssm); the compact/
+        # ragged tier is refused at startup (see server_args).
+        replayssm_rawv = getattr(mamba_cache_params, "replayssm_rawv", None)
+        if replayssm_rawv is not None and ragged_layout is None:
+            HVh, Kd, Vd = v.shape[2], k.shape[-1], v.shape[-1]
+            T = draft_token_num
+            # Under cuda graph the captured batch includes padding rows whose slot
+            # is PAD_SLOT_ID (-1); a raw index_put_ with -1 device-asserts (CUDA
+            # bounds-checks without wrapping). Clamp to slot 0 -- the reserved null
+            # slot (allocator hands out 1..size), never read by any real commit --
+            # so padding rows write harmlessly. Real slots (>=1) are unchanged.
+            slots = cache_indices[:batch_size].clamp(min=0).to(torch.long)
+            kk = k[0].reshape(batch_size, T, HVh, Kd)  # pre-norm k
+            vv = v[0].reshape(batch_size, T, HVh, Vd)
+            aa = a[0].reshape(batch_size, T, HVh, Kd)
+            bb = b[0].reshape(batch_size, T, HVh)
+            a_log = layer.A_log.reshape(HVh)
+            dtb = layer.dt_bias.reshape(HVh, Kd)
+            # gate MUST match the verify kernel's two branches exactly
+            # (fused_sigmoid_gating_recurrent): safe gate when lower_bound is set
+            # (K3), plain softplus otherwise. A mismatch silently commits the
+            # wrong state.
+            x = aa.float() + dtb.reshape(1, 1, HVh, Kd)
+            exp_a_log = torch.exp(a_log).reshape(1, 1, HVh, 1)
+            if layer.lower_bound is not None:
+                gk = layer.lower_bound * torch.sigmoid(exp_a_log * x)
+            else:
+                gk = (-exp_a_log) * torch.nn.functional.softplus(x)
+            beta = torch.sigmoid(bb.float())
+            replayssm_rawv[slots, :, :T] = vv.transpose(1, 2).to(replayssm_rawv.dtype)
+            mamba_cache_params.replayssm_rawk[slots, :, :T] = kk.transpose(1, 2).to(
+                mamba_cache_params.replayssm_rawk.dtype
+            )
+            mamba_cache_params.replayssm_g[slots, :, :T] = gk.transpose(1, 2)
+            mamba_cache_params.replayssm_beta[slots, :, :T] = beta.transpose(1, 2)
 
         core_attn_out = self.kernel_dispatcher.target_verify(
             A_log=layer.A_log,
