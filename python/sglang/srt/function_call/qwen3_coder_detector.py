@@ -51,6 +51,8 @@ class Qwen3CoderDetector(BaseFormatDetector):
 
         # [FIX] New state flag: mark whether inside tool_call structure block
         self.is_inside_tool_call: bool = False
+        self.pending_post_tool_call: str = ""
+        self.just_exited_tool_call: bool = False
 
         # Initialize attributes that were missing in the original PR
         self.current_func_name: Optional[str] = None
@@ -266,6 +268,10 @@ class Qwen3CoderDetector(BaseFormatDetector):
             # 1. Priority detection: check if it's the start of Tool Call
             # -------------------------------------------------------
             if current_slice.startswith(self.tool_call_start_token):
+                # [FIX] Discard the whitespace characters in the middle of </tool_call> and <tool_call>, usually \n
+                if self.just_exited_tool_call:
+                    self.pending_post_tool_call = ""
+                    self.just_exited_tool_call = False
                 self.parsed_pos += len(self.tool_call_start_token)
                 self.is_inside_tool_call = True
                 continue
@@ -405,6 +411,8 @@ class Qwen3CoderDetector(BaseFormatDetector):
             if current_slice.startswith(self.tool_call_end_token):
                 self.parsed_pos += len(self.tool_call_end_token)
                 self.is_inside_tool_call = False  # [FIX] Exit tool call region
+                self.just_exited_tool_call = True
+                self.pending_post_tool_call = ""
                 continue
 
             # -------------------------------------------------------
@@ -418,7 +426,17 @@ class Qwen3CoderDetector(BaseFormatDetector):
 
             if next_open_angle == -1:
                 # This entire segment is plain text
-                if not self.is_inside_tool_call:
+                # [FIX] If just exited </tool_call>, buffer whitespace for delayed emission
+                if self.just_exited_tool_call:
+                    if current_slice.strip() == "":
+                        self.pending_post_tool_call += current_slice
+                    else:
+                        normal_text_chunks.append(
+                            self.pending_post_tool_call + current_slice
+                        )
+                        self.pending_post_tool_call = ""
+                        self.just_exited_tool_call = False
+                elif not self.is_inside_tool_call:
                     normal_text_chunks.append(current_slice)
                 # [FIX] If inside tool call, discard this text (usually \n), don't append
                 self.parsed_pos += len(current_slice)
@@ -446,7 +464,12 @@ class Qwen3CoderDetector(BaseFormatDetector):
                     break  # Wait for more
                 else:
                     # Just a plain '<' symbol
-                    if not self.is_inside_tool_call:
+                    # [FIX] If the whitespace character is not between </tool_call> and <tool_call>, it is preserved
+                    if self.just_exited_tool_call:
+                        normal_text_chunks.append(self.pending_post_tool_call + "<")
+                        self.pending_post_tool_call = ""
+                        self.just_exited_tool_call = False
+                    elif not self.is_inside_tool_call:
                         normal_text_chunks.append("<")
                     self.parsed_pos += 1
                     continue
@@ -454,7 +477,17 @@ class Qwen3CoderDetector(BaseFormatDetector):
             else:
                 # '<' is in the middle
                 text_segment = current_slice[:next_open_angle]
-                if not self.is_inside_tool_call:
+                # [FIX] If just exited </tool_call>, buffer/flush pending whitespace
+                if self.just_exited_tool_call:
+                    if text_segment.strip() == "":
+                        self.pending_post_tool_call += text_segment
+                    else:
+                        normal_text_chunks.append(
+                            self.pending_post_tool_call + text_segment
+                        )
+                        self.pending_post_tool_call = ""
+                        self.just_exited_tool_call = False
+                elif not self.is_inside_tool_call:
                     normal_text_chunks.append(text_segment)
                 # [FIX] If inside tool call, discard whitespace/text before Tag
                 self.parsed_pos += next_open_angle
