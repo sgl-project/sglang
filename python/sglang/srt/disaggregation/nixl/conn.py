@@ -497,6 +497,7 @@ class NixlKVManager(CommonKVManager):
             lambda ptr, size: self._register_staging_memory(ptr, size, gpu_id),
             self.kv_args,
             count,
+            self.server_args.chunked_prefill_size,
         )
 
     def _init_staging_allocator(self):
@@ -1781,7 +1782,6 @@ class NixlKVManager(CommonKVManager):
                 f"[Staging] Staged transfer cannot fit chunk "
                 f"(room={kv_chunk.room}, chunk_idx={chunk_idx}, "
                 f"pages={num_pages}). Increase "
-                f"SGLANG_DISAGG_STAGING_BUFFER_SIZE_MB / "
                 f"SGLANG_DISAGG_STAGING_POOL_SIZE_MB or reduce "
                 f"chunked_prefill_size."
             )
