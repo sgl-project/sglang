@@ -13,8 +13,7 @@ The initial `gfx1201` support includes BF16/FP16 dense models, FP8 online
 quantization for dense models, single-GPU BF16/FP8 Triton MoE, and single-GPU
 GPT-OSS inference with its native MXFP4 checkpoint. Use the Triton attention
 backend. Other quantization formats, custom all-reduce, and multi-GPU serving
-are not yet supported on this architecture. AITER greedy sampling can be
-enabled independently when AITER is installed.
+are not yet supported on this architecture. Keep AITER disabled on gfx1201.
 
 Use ROCm 7.2 or later. AMD's [Radeon PyTorch installation guide](https://rocm.docs.amd.com/projects/radeon-ryzen/en/latest/docs/install/installrad/native_linux/install-pytorch.html)
 lists the supported operating systems and official PyTorch containers. AMD's
@@ -85,20 +84,11 @@ kernel and leave the full Aiter backend disabled:
 export AMDGPU_TARGET=gfx1201
 export PYTORCH_ROCM_ARCH=gfx1201
 export GPU_ARCHS=gfx1201
-export AITER_USE_SYSTEM_TRITON=1
 export SGLANG_USE_AITER=0
-export SGLANG_USE_AITER_GREEDY_SAMPLE=1
 
 cd sgl-kernel
 python setup_rocm.py install
 cd ..
-
-git clone https://github.com/ROCm/aiter.git "$HOME/aiter"
-git -C "$HOME/aiter" checkout 9127c94a18e4398e1eba91f6639e910f0994ad02
-python -m pip install pybind11
-AITER_TRITON_ONLY=1 AITER_USE_SYSTEM_TRITON=1 GPU_ARCHS=gfx1201 \
-    python -m pip install --no-build-isolation \
-    --config-settings editable_mode=compat -e "$HOME/aiter"
 
 # SGLang currently uses the matmul_ogs API from this triton_kernels revision.
 python -m pip install --no-deps \
@@ -146,11 +136,6 @@ SGLANG_USE_AITER=0 python3 -m sglang.launch_server \
 The `gfx1201` path keeps the checkpoint's canonical MXFP4 value and scale
 layouts. It does not use the CDNA4 HBM swizzle. AITER/Quark MXFP4, expert
 parallelism, and tensor parallelism are not supported on this path.
-
-`SGLANG_USE_AITER_GREEDY_SAMPLE=1` enables only AITER's greedy sampling kernel.
-Keep `SGLANG_USE_AITER=0` and the Triton attention backend: AITER paged attention,
-GEMM, RMSNorm, quantization, and communication kernels are not enabled by this
-option. The first greedy request JIT-compiles AITER's sampling extension.
 
 Do not combine `gfx1201` with CDNA targets in the same `sgl-kernel` build. CDNA
 and RDNA resolve warp-size-dependent code differently, and some host-side launch
