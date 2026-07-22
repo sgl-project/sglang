@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import (
     List,
@@ -10,11 +11,14 @@ import torch
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.managers.io_struct import build_flat_input_top_logprobs_arrays
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.server_args import (
     MIS_DELIMITER_TOKEN_ID,
     ServerArgs,
 )
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(kw_only=True, slots=True, frozen=True)
@@ -82,6 +86,35 @@ class SchedulerLogprobResultProcessor:
         # Clean up temp storage
         req.temp_input_top_logprobs_idx = None
         req.temp_input_top_logprobs_val = None
+
+    def _flatten_input_top_logprobs(self, req: Req) -> None:
+        """Replace the nested input top logprob rows with flat arrays for
+        requests that opted into return_flat_raw_top_logprobs, so the batch
+        output ships two ndarrays instead of num_positions * k python lists.
+        """
+        if req.logprob.top_logprobs_num <= 0:
+            return
+        try:
+            (
+                req.logprob.input_top_logprobs_val_flat,
+                req.logprob.input_top_logprobs_idx_flat,
+                req.logprob.input_top_logprobs_flat_null_prefix,
+            ) = build_flat_input_top_logprobs_arrays(
+                req.logprob.input_top_logprobs_val,
+                req.logprob.input_top_logprobs_idx,
+                req.logprob.top_logprobs_num,
+            )
+        except ValueError as e:
+            # Unrepresentable rows (e.g. multi-item scoring): keep the nested
+            # format, mirroring the tokenizer manager fallback.
+            logger.warning(
+                "Falling back to nested input top logprobs for rid=%s: %s",
+                req.rid,
+                e,
+            )
+            return
+        req.logprob.input_top_logprobs_val = []
+        req.logprob.input_top_logprobs_idx = []
 
     def _process_input_token_ids_logprobs(self, req: Req) -> None:
         """Process input token IDs logprobs."""
@@ -263,6 +296,10 @@ class SchedulerLogprobResultProcessor:
                         len(req.logprob.input_token_ids_logprobs_idx)
                         == relevant_tokens_len
                     )
+
+            # After the length checks: the flat arrays replace the nested rows.
+            if req.return_flat_raw_top_logprobs:
+                self._flatten_input_top_logprobs(req)
 
     def add_logprob_return_values(
         self,
