@@ -241,6 +241,16 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             source=self.buffers,
         )
 
+        # DSA forces use_mha=False inside BCG capture/replay (see
+        # DeepseekSparseAttnBackend.set_dsa_prefill_impl), so the captured
+        # graph runs the sparse path for any prefix; the MHA-prefix replay
+        # ban below does not apply.
+        from sglang.srt.configs.model_config import is_deepseek_dsa
+
+        self.dsa_sparse_prefill_forced = is_deepseek_dsa(
+            self.model_runner.model_config.hf_config
+        )
+
         self.attention_layers = self.model_runner.attention_layers
         self.mha_companion_layers = self.model_runner.mha_companion_layers
         self.has_mha_companion_layers = any(
@@ -667,6 +677,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         return (
             self.prefill_backend_name == Backend.BREAKABLE
             and self.has_mha_companion_layers
+            and not self.dsa_sparse_prefill_forced
             and forward_batch.extend_prefix_lens_cpu is not None
             and any(forward_batch.extend_prefix_lens_cpu)
         )
@@ -693,6 +704,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         if (
             self.prefill_backend_name == Backend.BREAKABLE
             and self.has_mha_companion_layers
+            and not self.dsa_sparse_prefill_forced
             and batch.prefix_lens is not None
             and any(batch.prefix_lens)
         ):
