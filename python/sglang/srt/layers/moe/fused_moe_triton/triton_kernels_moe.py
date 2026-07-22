@@ -14,7 +14,7 @@ from triton_kernels.matmul import (
     PrecisionConfig,
     matmul,
 )
-from triton_kernels.matmul_ogs_details.opt_flags import update_opt_flags_constraints
+from triton_kernels.matmul_details.opt_flags import update_opt_flags_constraints
 from triton_kernels.numerics import InFlexData
 from triton_kernels.swiglu import swiglu_fn
 from triton_kernels.tensor import FP4
