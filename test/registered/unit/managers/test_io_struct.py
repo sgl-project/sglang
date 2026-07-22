@@ -139,6 +139,9 @@ class TestTokenizedReqInputMsgpack(unittest.TestCase):
                 torch.tensor([[0, 1]], dtype=torch.int64, device="cpu"),
             )
         )
+        self.assertTrue(
+            torch.equal(decoded.mm_inputs.token_type_ids, torch.tensor([0, 0]))
+        )
 
     def test_dynamic_model_specific_attribute_round_trip(self):
         mm_inputs = self._make_mm_inputs()
