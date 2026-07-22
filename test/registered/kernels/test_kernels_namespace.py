@@ -45,9 +45,11 @@ EXPECTED = {
     "moe.moe_align_block_size": {"aot", "jit"},
     "quantization.nvfp4_gemm_swiglu_nvfp4_quant": {"cute_dsl"},
     "kvcache.reshape_and_cache_flash": {"triton"},
+    "attention.sm89_paged_fp8_index_logits": {"triton"},
 }
 
 _CPU = PlatformInfo(device_type="cpu")
+_SM89 = PlatformInfo(device_type="cuda", cuda_arch_major=8, cuda_arch_minor=9)
 _SM90 = PlatformInfo(device_type="cuda", cuda_arch_major=9, cuda_arch_minor=0)
 _SM100 = PlatformInfo(device_type="cuda", cuda_arch_major=10, cuda_arch_minor=0)
 _HIP = PlatformInfo(device_type="hip")
@@ -166,6 +168,15 @@ def test_capabilities_or_semantics():
     assert not K.capabilities_satisfied(both, _CPU)
     assert K.capabilities_satisfied((), _CPU)  # empty = unrestricted
     assert K.capabilities_satisfied(Cap.CUDA, _SM90)  # single tolerated
+
+
+def test_sm89_paged_indexer_capability():
+    spec = K.registry.get_backend(
+        "attention.sm89_paged_fp8_index_logits", KernelBackend.TRITON
+    )
+    assert spec.is_available(_SM89)
+    assert not spec.is_available(_SM90)
+    assert not spec.is_available(_CPU)
 
 
 def test_capability_shortcuts():
