@@ -766,6 +766,73 @@ class DeepseekSparseAttnBackend(
             ragged_layout=ragged_layout,
         )
 
+    def _target_verify_eager_geometry(
+        self,
+        verify_layout: Optional[RaggedVerifyLayout],
+        batch_size: int,
+        cache_seqlens_int32: torch.Tensor,
+        page_table: torch.Tensor,
+        device,
+    ):
+        """Eager target-verify q geometry (extend_seq_lens_cpu, cu_seqlens_q,
+        seqlens_expanded, expanded page_table). The uniform path is the
+        verify_lens == next_n special case of the ragged one."""
+        if verify_layout is not None:
+            verify_lens_cpu = verify_layout.verify_lens_cpu
+            if verify_lens_cpu is None:
+                # Eager target-verify only runs off the graph path (e.g.
+                # over-capture-bs); a one-off host sync is acceptable here.
+                verify_lens_cpu = verify_layout.verify_lens.cpu().tolist()
+            extend_seq_lens_cpu = [int(v) for v in verify_lens_cpu]
+            verify_lens = verify_layout.verify_lens
+            max_extend_len = max(extend_seq_lens_cpu)
+        else:
+            extend_seq_lens_cpu = [self.speculative_num_draft_tokens] * batch_size
+            verify_lens = torch.tensor(
+                extend_seq_lens_cpu, dtype=torch.int32, device=device
+            )
+            max_extend_len = self.speculative_num_draft_tokens
+        total_q = int(sum(extend_seq_lens_cpu))
+        cu_seqlens_q = torch.arange(0, total_q + 1, 1, dtype=torch.int32, device=device)
+        seqlens_expanded = seqlens_expand_triton(
+            verify_lens, cache_seqlens_int32, total_q, max_extend_len
+        )
+        page_table = torch.repeat_interleave(
+            page_table, repeats=verify_lens, dim=0, output_size=total_q
+        )
+        return extend_seq_lens_cpu, cu_seqlens_q, seqlens_expanded, page_table
+
+    def _capture_verify_widths(
+        self,
+        verify_layout: Optional[RaggedVerifyLayout],
+        bs: int,
+        seq_lens: torch.Tensor,
+    ):
+        """Per-request verify widths for graph capture: (capture_extend_lens,
+        cache_seqlens_int32, real_rows)."""
+        if verify_layout is not None:
+            verify_lens_cpu = verify_layout.verify_lens_cpu
+            if verify_lens_cpu is None:
+                # padded_to_bucket drops host mirrors; capture is a
+                # one-time host-driven build, a D2H sync is fine here.
+                verify_lens_cpu = verify_layout.verify_lens.cpu().tolist()
+            capture_extend_lens = [int(v) for v in verify_lens_cpu]
+            # Stage the capture lens so the warmup execution of the
+            # graph-recorded prep (init_forward_metadata_in_graph) sees
+            # non-zero lengths.
+            self._ragged_verify_lens_buf[: len(capture_extend_lens)].copy_(
+                verify_layout.verify_lens
+            )
+            cache_seqlens_int32 = (seq_lens + verify_layout.verify_lens).to(torch.int32)
+            real_rows = int(verify_layout.graph_num_tokens)
+        else:
+            capture_extend_lens = [self.speculative_num_draft_tokens] * bs
+            cache_seqlens_int32 = (seq_lens + self.speculative_num_draft_tokens).to(
+                torch.int32
+            )
+            real_rows = bs * self.speculative_num_draft_tokens
+        return capture_extend_lens, cache_seqlens_int32, real_rows
+
     def init_forward_metadata_out_graph(
         self,
         forward_batch: ForwardBatch,
@@ -856,50 +923,15 @@ class DeepseekSparseAttnBackend(
             seqlens_expanded = cache_seqlens_int32
         elif forward_batch.forward_mode.is_target_verify():
             max_seqlen_q = 1
-            if verify_layout is not None:
-                verify_lens_cpu = verify_layout.verify_lens_cpu
-                if verify_lens_cpu is None:
-                    # Eager target-verify only runs off the graph path (e.g.
-                    # over-capture-bs); a one-off host sync is acceptable here.
-                    verify_lens_cpu = verify_layout.verify_lens.cpu().tolist()
-                extend_seq_lens_cpu = [int(v) for v in verify_lens_cpu]
-                total_q = int(sum(extend_seq_lens_cpu))
-                cu_seqlens_q = torch.arange(
-                    0, total_q + 1, 1, dtype=torch.int32, device=device
-                )
-                forward_batch.extend_seq_lens_cpu = extend_seq_lens_cpu
-                seqlens_expanded = seqlens_expand_triton(
-                    verify_layout.verify_lens,
-                    cache_seqlens_int32,
-                    total_q,
-                    max(extend_seq_lens_cpu),
-                )
-                page_table = torch.repeat_interleave(
-                    page_table,
-                    repeats=verify_layout.verify_lens,
-                    dim=0,
-                    output_size=total_q,
-                )
-            else:
-                cu_seqlens_q = torch.arange(
-                    0,
-                    batch_size * self.speculative_num_draft_tokens + 1,
-                    1,
-                    dtype=torch.int32,
-                    device=device,
-                )
-                extend_seq_lens_cpu = [self.speculative_num_draft_tokens] * batch_size
-                forward_batch.extend_seq_lens_cpu = extend_seq_lens_cpu
-
-                seqlens_expanded = seqlens_expand_triton(
-                    torch.tensor(extend_seq_lens_cpu, dtype=torch.int32, device=device),
-                    cache_seqlens_int32,
-                    self.speculative_num_draft_tokens * batch_size,
-                    self.speculative_num_draft_tokens,
-                )
-                page_table = torch.repeat_interleave(
-                    page_table, repeats=self.speculative_num_draft_tokens, dim=0
-                )
+            (
+                extend_seq_lens_cpu,
+                cu_seqlens_q,
+                seqlens_expanded,
+                page_table,
+            ) = self._target_verify_eager_geometry(
+                verify_layout, batch_size, cache_seqlens_int32, page_table, device
+            )
+            forward_batch.extend_seq_lens_cpu = extend_seq_lens_cpu
         elif forward_batch.forward_mode.is_draft_extend_v2():
             if forward_batch.extend_prefix_lens_cpu is None:
                 assert forward_batch.extend_prefix_lens is not None
@@ -1335,29 +1367,11 @@ class DeepseekSparseAttnBackend(
             else:
                 flashmla_metadata = None
         elif forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2():
-            if verify_layout is not None:
-                verify_lens_cpu = verify_layout.verify_lens_cpu
-                if verify_lens_cpu is None:
-                    # padded_to_bucket drops host mirrors; capture is a
-                    # one-time host-driven build, a D2H sync is fine here.
-                    verify_lens_cpu = verify_layout.verify_lens.cpu().tolist()
-                capture_extend_lens = [int(v) for v in verify_lens_cpu]
-                # Stage the capture lens so the warmup execution of the
-                # graph-recorded prep (init_forward_metadata_in_graph) sees
-                # non-zero lengths.
-                self._ragged_verify_lens_buf[: len(capture_extend_lens)].copy_(
-                    verify_layout.verify_lens
-                )
-                cache_seqlens_int32 = (seq_lens + verify_layout.verify_lens).to(
-                    torch.int32
-                )
-                real_rows = int(verify_layout.graph_num_tokens)
-            else:
-                capture_extend_lens = [self.speculative_num_draft_tokens] * bs
-                cache_seqlens_int32 = (seq_lens + self.speculative_num_draft_tokens).to(
-                    torch.int32
-                )
-                real_rows = bs * self.speculative_num_draft_tokens
+            (
+                capture_extend_lens,
+                cache_seqlens_int32,
+                real_rows,
+            ) = self._capture_verify_widths(verify_layout, bs, seq_lens)
             cu_seqlens_k = compute_cu_seqlens(cache_seqlens_int32)
             max_seqlen_q = 1
             if self.dsa_drop_wide_page_table:
