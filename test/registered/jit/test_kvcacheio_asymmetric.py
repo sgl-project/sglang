@@ -55,6 +55,7 @@ def make_host_pool(dtype, layout="page_first"):
     host.head_dim = K_HEAD_DIM
     host.v_head_dim = V_HEAD_DIM
     host.dtype = dtype
+    host.can_use_write_back_jit = False
     if layout == "page_first":
         k_dims = (TOTAL_ITEMS, NUM_LAYERS, HEAD_NUM, K_HEAD_DIM)
         v_dims = (TOTAL_ITEMS, NUM_LAYERS, HEAD_NUM, V_HEAD_DIM)

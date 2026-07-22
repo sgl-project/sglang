@@ -17,6 +17,9 @@ from sglang.jit_kernel.hicache import (
     transfer_hicache_all_layer_mla as jit_transfer_hicache_all_layer_mla,
 )
 from sglang.jit_kernel.hicache import (
+    transfer_hicache_all_layer_mla_staged_lf_pf as jit_transfer_hicache_all_layer_mla_staged_lf_pf,
+)
+from sglang.jit_kernel.hicache import (
     transfer_hicache_all_layer_staged_lf_pf as jit_transfer_hicache_all_layer_staged_lf_pf,
 )
 from sglang.jit_kernel.hicache import (
@@ -941,6 +944,51 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
     kernels derive copy sizes from each call's first tensor.
     """
 
+    def _init_write_back_staging_buffers(self):
+        self.staging_page_capacity = 0
+        self.staging_token_capacity = 0
+        self.staging_k_buffer = None
+        self.staging_v_buffer = None
+        self.can_use_write_back_jit = False
+        if self.layout != "page_first" or (_is_npu or _is_xpu or _is_mps):
+            return
+
+        # K and V have different element sizes. Use the single-buffer staged
+        # kernel for each side, which specializes to its native stride.
+        can_use_staged_jit = (_is_cuda or _is_hip) and all(
+            can_use_write_back_jit_kernel(element_size=element_size)
+            for element_size in (
+                self._k_token_stride_size(),
+                self._v_token_stride_size(),
+            )
+        )
+        if not can_use_staged_jit:
+            return
+
+        self.can_use_write_back_jit = True
+        self.staging_page_capacity = min(self.page_num, _WRITE_BACK_STAGING_PAGE_CHUNK)
+        self.staging_token_capacity = self.staging_page_capacity * self.page_size
+        self.staging_k_buffer = torch.empty(
+            (
+                self.staging_token_capacity,
+                self.layer_num,
+                self.head_num,
+                self.head_dim,
+            ),
+            dtype=self.dtype,
+            device=self.device_pool.device,
+        )
+        self.staging_v_buffer = torch.empty(
+            (
+                self.staging_token_capacity,
+                self.layer_num,
+                self.head_num,
+                self.v_head_dim,
+            ),
+            dtype=self.dtype,
+            device=self.device_pool.device,
+        )
+
     def get_size_per_token(self):
         self.head_num = self.device_pool.head_num
         self.head_dim = self.device_pool.head_dim
@@ -1092,24 +1140,42 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
                     f"Unsupported layout for models with head_dim != v_head_dim "
                     f"and io_backend='kernel': {self.layout}; expected 'page_first'."
                 )
-            transfer_kv_all_layer_mla_lf_pf(
-                src_layers=device_pool.k_data_ptrs,
-                dst=self.k_buffer,
-                src_indices=device_indices,
-                dst_indices=host_indices,
-                item_size=self._k_token_stride_size(),
-                dst_layout_dim=self._k_layout_dim(),
-                num_layers=self.layer_num,
-            )
-            transfer_kv_all_layer_mla_lf_pf(
-                src_layers=device_pool.v_data_ptrs,
-                dst=self.v_buffer,
-                src_indices=device_indices,
-                dst_indices=host_indices,
-                item_size=self._v_token_stride_size(),
-                dst_layout_dim=self._v_layout_dim(),
-                num_layers=self.layer_num,
-            )
+            if self.can_use_write_back_jit:
+                jit_transfer_hicache_all_layer_mla_staged_lf_pf(
+                    ptr_src=device_pool.k_data_ptrs,
+                    src_indices=device_indices,
+                    dst_indices=host_indices,
+                    staging=self.staging_k_buffer,
+                    dst=self.k_buffer,
+                    page_size=self.page_size,
+                )
+                jit_transfer_hicache_all_layer_mla_staged_lf_pf(
+                    ptr_src=device_pool.v_data_ptrs,
+                    src_indices=device_indices,
+                    dst_indices=host_indices,
+                    staging=self.staging_v_buffer,
+                    dst=self.v_buffer,
+                    page_size=self.page_size,
+                )
+            else:
+                transfer_kv_all_layer_mla_lf_pf(
+                    src_layers=device_pool.k_data_ptrs,
+                    dst=self.k_buffer,
+                    src_indices=device_indices,
+                    dst_indices=host_indices,
+                    item_size=self._k_token_stride_size(),
+                    dst_layout_dim=self._k_layout_dim(),
+                    num_layers=self.layer_num,
+                )
+                transfer_kv_all_layer_mla_lf_pf(
+                    src_layers=device_pool.v_data_ptrs,
+                    dst=self.v_buffer,
+                    src_indices=device_indices,
+                    dst_indices=host_indices,
+                    item_size=self._v_token_stride_size(),
+                    dst_layout_dim=self._v_layout_dim(),
+                    num_layers=self.layer_num,
+                )
         elif io_backend == "direct":
             if self.layout != "page_first_direct":
                 raise ValueError(
