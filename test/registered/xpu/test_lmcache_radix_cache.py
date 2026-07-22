@@ -189,7 +189,7 @@ class TestLMCRadixCacheXPU(unittest.TestCase):
                 gt_v.append(v.clone())
 
             req = _make_req("req-0", req_pool_idx, token_ids, tree)
-            tree.cache_finished_req(req)
+            tree.cache_finished_req(req, kv_len_to_handle=len(token_ids))
             # IP-mode store is async on tree.store_stream; evict()'s
             # synchronize() is what the real scheduler relies on to make the
             # store visible before slots are reused.
