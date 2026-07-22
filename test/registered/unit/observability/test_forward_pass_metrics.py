@@ -232,11 +232,12 @@ class TestForwardPassMetrics(unittest.TestCase):
             self.scheduler._fpm_publisher.metrics[0].wall_time, 0.035, places=4
         )
 
-    def test_disagg_prefill_queued_metrics(self):
+    def test_disagg_prefill_queued_metrics_include_compute_waiting_queue(self):
         self.scheduler.disaggregation_mode = DisaggregationMode.PREFILL
         self.scheduler.disagg_prefill_bootstrap_queue = types.SimpleNamespace(
-            queue=[_FakeReq(100), _FakeReq(200), _FakeReq(50)],
+            queue=[_FakeReq(100)],
         )
+        self.scheduler.waiting_queue = [_FakeReq(200), _FakeReq(50)]
         batch = self._make_batch()
 
         with patch(
