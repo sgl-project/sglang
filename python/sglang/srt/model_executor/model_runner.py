@@ -78,7 +78,6 @@ from sglang.srt.layers.cp.utils import (
     get_cp_strategy,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.moe.dwdp import DwdpManager
 from sglang.srt.layers.sampler import create_sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
@@ -323,12 +322,26 @@ class ModelRunner:
         if get_server_args().enable_tf32_matmul:
             torch.set_float32_matmul_precision("high")
 
+        # Set device early so that TransferEngine init (e.g. Ascend NPU)
+        # can access the device context.
+        try:
+            torch.get_device_module(self.device).set_device(ps.gpu_id)
+        except Exception:
+            import os
+
+            logger.warning(
+                f"Context: {self.device=} {ps.gpu_id=} {os.environ.get('CUDA_VISIBLE_DEVICES')=} {ps.tp_rank=} {ps.tp_size=}"
+            )
+            raise
+
+        # Initialize MooncakeTransferEngine BEFORE init_torch_distributed so
+        # that the shared TE can be passed to the Mooncake PG backend (avoids
+        # creating duplicate TransferEngines).
+        self.init_shared_mooncake_transfer_engine()
+
         # Get available memory before model loading.
         # Stored for later use by alloc_memory_pool().
         self.init_torch_distributed()
-
-        # Initialize MooncakeTransferEngine
-        self.init_shared_mooncake_transfer_engine()
 
         # Init forward stream for overlap schedule
         self.forward_stream = torch.get_device_module(self.device).Stream()
@@ -1027,6 +1040,8 @@ class ModelRunner:
             return
         if self.server_args.dwdp_size <= 1:
             return
+        from sglang.srt.layers.moe.dwdp import DwdpManager
+
         manager = DwdpManager(self.server_args)
         set_global_dwdp_manager(manager)
         manager.setup(self.model)
