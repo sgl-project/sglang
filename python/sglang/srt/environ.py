@@ -696,14 +696,6 @@ class Envs:
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
     SGLANG_DISABLE_DSA_INDEXER_FUSION = EnvBool(False)
-    # Dense-decode: force k-only (skip indexer) under a captured decode graph.
-    # Only safe when EVERY request's kv_len <= index_topk (single static graph).
-    SGLANG_DSA_DECODE_DENSE_GRAPH = EnvBool(False)
-    # Dense-decode Design A: capture dual dense/sparse decode graphs per bs and
-    # dispatch on max_kv_len vs index_topk at replay (correct for mixed lengths).
-    SGLANG_DSA_DECODE_DUAL_GRAPH = EnvBool(False)
-    # Env-gated debug marker for the decode k-only fast path.
-    SGLANG_KONLY_DEBUG = EnvBool(False)
 
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)

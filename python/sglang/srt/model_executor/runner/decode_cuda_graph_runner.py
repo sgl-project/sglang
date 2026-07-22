@@ -229,31 +229,30 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
 
         # --- DSA dense-decode dual-graph (Design A) --------------------
-        # When enabled, capture a "dense" (k-only, skip-indexer) and a "sparse"
-        # (full indexer) decode graph per bs bucket, and dispatch on max_kv_len
-        # vs index_topk at replay. Opt-in (extra ~52 graphs + ~2x capture time)
-        # and only meaningful for DSA models where the decode indexer can be
-        # skipped when kv_len <= index_topk.
+        # Capture a "dense" (k-only, skip-indexer) and a "sparse" (full indexer)
+        # decode graph per bs bucket, and dispatch on max_kv_len vs index_topk at
+        # replay. Auto-enabled for DSA models (index_topk present in the HF
+        # config) — correct for mixed lengths since any request with
+        # kv_len > index_topk falls back to the sparse graph. Adds ~52 graphs and
+        # ~2x capture time.
         self.dsa_dual_graph = False
         self.dsa_index_topk: Optional[int] = None
-        self._dsa_dispatch_counts = {"dense": 0, "sparse": 0}
-        self._dsa_dispatch_last: Optional[str] = None
-        if envs.SGLANG_DSA_DECODE_DUAL_GRAPH.get():
-            from sglang.srt.configs.model_config import (
-                get_dsa_index_topk,
-                is_deepseek_dsa,
-            )
+        from sglang.srt.configs.model_config import (
+            get_dsa_index_topk,
+            is_deepseek_dsa,
+        )
 
-            hf_config = model_runner.model_config.hf_config
-            if is_deepseek_dsa(hf_config):
-                self.dsa_dual_graph = True
-                self.dsa_index_topk = get_dsa_index_topk(hf_config)
-                logger.info(
-                    "[dense-decode] Design A dual-graph enabled: capturing "
-                    "dense (k-only) + sparse (full indexer) decode graphs; "
-                    "dispatch on max_kv_len vs index_topk=%d.",
-                    self.dsa_index_topk,
-                )
+        hf_config = model_runner.model_config.hf_config
+        if is_deepseek_dsa(hf_config):
+            self.dsa_index_topk = get_dsa_index_topk(hf_config)
+        self.dsa_dual_graph = self.dsa_index_topk is not None
+        if self.dsa_dual_graph:
+            logger.info(
+                "[dense-decode] Design A dual-graph enabled: capturing "
+                "dense (k-only) + sparse (full indexer) decode graphs; "
+                "dispatch on max_kv_len vs index_topk=%d.",
+                self.dsa_index_topk,
+            )
 
         self.attn_tp_size = get_parallel().attn_tp_size
         self.attn_tp_rank = get_parallel().attn_tp_rank
@@ -497,22 +496,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         else:
             # No length info: be safe and use the correct-for-all sparse graph.
             return "sparse"
-        variant = "dense" if max_kv_len <= self.dsa_index_topk else "sparse"
-        if envs.SGLANG_KONLY_DEBUG.get():
-            self._dsa_dispatch_counts[variant] += 1
-            total = sum(self._dsa_dispatch_counts.values())
-            if total % 100 == 0 or self._dsa_dispatch_last != variant:
-                logger.info(
-                    "[dense-decode] dispatch variant=%s max_kv_len=%d "
-                    "index_topk=%d (counts dense=%d sparse=%d)",
-                    variant,
-                    max_kv_len,
-                    self.dsa_index_topk,
-                    self._dsa_dispatch_counts["dense"],
-                    self._dsa_dispatch_counts["sparse"],
-                )
-            self._dsa_dispatch_last = variant
-        return variant
+        return "dense" if max_kv_len <= self.dsa_index_topk else "sparse"
 
     def _resolve_lora_variant(self, forward_batch: ForwardBatch):
         if not getattr(self, "record_nolora_graph", False):

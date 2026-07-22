@@ -586,10 +586,9 @@ class Indexer(MultiPlatformOp):
                 if variant == "sparse":
                     return False
 
-                # M2a "static" fallback (no dual-variant capture active): enable
-                # k-only only when the deployment guarantees every request's
-                # kv_len<=index_topk (e.g. i1k/o1k). WRONG for mixed >2K traffic.
-                return envs.SGLANG_DSA_DECODE_DENSE_GRAPH.get()
+                # No dual-variant capture signal: default to the correct-for-all
+                # full-indexer (sparse) path.
+                return False
             # Eager decode: safe to check per-step (host sync OK); correct for both
             # kv_len<=index_topk (k-only) and kv_len>index_topk (falls through).
             if fb.seq_lens_cpu is not None and fb.seq_lens_cpu.numel() > 0:
@@ -1378,12 +1377,6 @@ class Indexer(MultiPlatformOp):
             or forward_batch.forward_mode.is_decode_or_idle()
         )
         x_meta = x[0] if isinstance(x, tuple) else x
-        if forward_batch.forward_mode.is_decode_or_idle() and layer_id == 0:
-            if envs.SGLANG_KONLY_DEBUG.get():
-                logger.info(
-                    "[KONLY] decode k-only fired (skip-indexer): num_tok=%d",
-                    x_meta.shape[0],
-                )
 
         # Fast path: only compute and store k cache, skip all q and weights ops.
         # num_tokens (graph contract) slices to the unpadded count.
