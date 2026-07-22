@@ -17,7 +17,7 @@ register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="4-gpu-b
 if not torch.cuda.is_available():
     pytest.skip("CUDA required", allow_module_level=True)
 
-from sglang.jit_kernel.cutedsl_bf16_gemm import cutedsl_bf16_gemm  # noqa: E402
+from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import cutedsl_bf16_gemm  # noqa: E402
 
 N_VALUES = [1024, 2624, 6144]
 K_VALUES = [2048, 6144]
