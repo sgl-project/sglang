@@ -40,9 +40,13 @@ host to GPU each step — which shapes its performance profile (see [Performance
   expert table and the host-backed paging path. Off by default.
 
 - **`--paged-experts-num-resident PAGED_EXPERTS_NUM_RESIDENT`**: The number of experts kept resident per
-  layer (`K`), or `auto` (default) to size it from free VRAM using SGLang's memory model (see
-  [Resident-pool sizing](#resident-pool-sizing-auto-k)). Larger `K` raises the cache hit rate and reduces
-  paging, at the cost of VRAM that would otherwise go to the KV cache.
+  layer (`K`). Accepts an int to pin `K`, `auto` (default) to size it from free VRAM using SGLang's memory
+  model (see [Resident-pool sizing](#resident-pool-sizing-auto-k)), or `max` to push `K` higher by
+  reclaiming the concurrency-scaled safety margins that `auto` leaves for activations and the CUDA-graph
+  pool — a measured, opt-in reserve that spends headroom for more resident experts (~+19% single-stream
+  throughput in our runs). Larger `K` raises the cache hit rate and reduces paging, at the cost of VRAM
+  that would otherwise go to the KV cache; `max` trades away the safety headroom, so prefer `auto` unless
+  you have verified the workload's activation peak fits.
 
 - **`--paged-experts-store {pinned,paged}`**: The host expert store kind. `pinned` (default) page-locks
   the store and pages it with the fast transfer kernel. `paged` uses a non-pinned store instead — use it
@@ -233,3 +237,15 @@ the KV pool stay coherent by construction. The resolved value is logged at start
 
 A larger `K` means a higher hit rate and fewer page-ins, so the largest `K` that fits is preferred. You
 can pin an explicit integer if you want a fixed pool.
+
+**`--paged-experts-num-resident max`** pushes `K` past what `auto` allows by reclaiming the two safety
+margins `auto` leaves on the table: the `mem_fraction_static` activation headroom (~10% of VRAM) and the
+runtime padding above the exact non-expert weight bytes. Both are over-provisioned by ~a GB and cap `K`
+below the physical ceiling. `max` replaces the percentage headroom with a **measured** activation reserve
+— a small batch-scaled figure (a fixed prefill-chunk + fragmentation base, plus a per-running-request term
+for decode workspaces and the captured-graph pool) — and shrinks the non-expert padding to a real
+workspace slack. The KV reserve is unchanged, so the pool still floors to a single prefill chunk. In our
+runs this buys ~+19% single-stream throughput. Because it spends the headroom `auto` keeps for safety,
+`max` is opt-in and validated only for modest concurrency (≤~4 running requests on the cards we tested);
+at higher concurrency the growing KV reserve squeezes `K` back down on its own. Prefer `auto` unless you
+have confirmed the workload's activation peak fits.

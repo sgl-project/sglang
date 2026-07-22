@@ -1900,7 +1900,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
     </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--paged-experts-num-resident`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Resident experts per layer (K) for `--enable-paged-experts`, or `auto` to size from free VRAM using SGLang's memory model.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Resident experts per layer (K) for `--enable-paged-experts`: an int to pin K, `auto` (default) to size from free VRAM using SGLang's memory model (respects `--mem-fraction-static`), or `max` to reclaim the concurrency-scaled safety margins for the most resident experts (measured reserve; opt-in, spends headroom).</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`auto`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`auto` or Type: int</td>
     </tr>
