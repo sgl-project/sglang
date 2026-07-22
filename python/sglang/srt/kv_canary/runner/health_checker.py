@@ -6,7 +6,7 @@ from typing import Optional
 
 import torch
 
-from sglang.jit_kernel.kv_canary.verify import CanaryLaunchTag
+from sglang.kernels.ops.kv_canary.verify import CanaryLaunchTag
 from sglang.srt.kv_canary.config import CanaryConfig
 from sglang.srt.kv_canary.runner.future_tensor import DelayedDeviceHostHandler
 from sglang.srt.kv_canary.runner.kernel_launcher import passes_v_half_gate
