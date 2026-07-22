@@ -1907,6 +1907,23 @@ def apply_fp8_linear(
         # Fused GEMM_DQ; _scaled_mm with torch.compile requires len(weight_scale.shape) == len(x_scale.shape)
         if weight_scale.ndim == 0 and x_scale.ndim == 1:
             weight_scale = weight_scale.unsqueeze(0)
+        # ROCm hipBLASLt only supports the e4m3fnuz FP8 format in torch._scaled_mm.
+        # On ROCm, scaled_fp8_quant() emits e4m3fnuz activations, but checkpoints
+        # quantized with the standard e4m3fn format (e.g. ModelOpt FP8, used by
+        # FLUX.2) keep e4m3fn weights. The resulting e4m3fn x e4m3fnuz mix makes
+        # hipBLASLt raise HIPBLAS_STATUS_NOT_SUPPORTED. Fall back to a dequantize
+        # -> bf16 matmul, which is numerically equivalent
+        # (C = s_x * s_w * (X @ W) + bias) and supported on all ROCm GEMM backends.
+        if _is_hip and (
+            qinput.dtype == torch.float8_e4m3fn or weight.dtype == torch.float8_e4m3fn
+        ):
+            output = torch.matmul(
+                qinput.to(input.dtype) * x_scale.to(input.dtype),
+                weight.to(input.dtype) * weight_scale.to(input.dtype),
+            )
+            if bias is not None:
+                output = output + bias
+            return _process_scaled_mm_output(output, input_2d.shape, output_shape)
         output = torch._scaled_mm(
             qinput,
             weight,
