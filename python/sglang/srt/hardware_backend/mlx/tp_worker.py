@@ -31,7 +31,6 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     PPProxyTensors,
 )
-from sglang.srt.runtime_context import get_memory, get_model, get_schedule
 
 logger = logging.getLogger(__name__)
 
@@ -48,23 +47,25 @@ class MlxTpModelWorker(TpModelWorker):
     def _init_model_runner(self):
         """Create MLX runner first (auto-sizes pool), then stub with matching size."""
         from sglang.srt.hardware_backend.mlx.model_runner import MlxModelRunner
-        from sglang.srt.hardware_backend.mlx.model_runner_stub import MlxModelRunnerStub
+        from sglang.srt.hardware_backend.mlx.model_runner_stub import (
+            MlxModelRunnerStub,
+        )
 
         logger.info("Initializing MlxModelRunner for end-to-end MLX inference")
         init_kwargs = dict(
-            model_path=get_model().model_path,
-            trust_remote_code=get_model().trust_remote_code,
-            disable_radix_cache=get_memory().disable_radix_cache,
-            mem_fraction_static=get_schedule().mem_fraction_static,
-            quantization=get_model().quantization,
+            model_path=self.server_args.model_path,
+            trust_remote_code=self.server_args.trust_remote_code,
+            disable_radix_cache=self.server_args.disable_radix_cache,
+            mem_fraction_static=self.server_args.mem_fraction_static,
+            quantization=self.server_args.quantization,
         )
-        if get_schedule().max_total_tokens is not None:
-            init_kwargs["pool_size"] = get_schedule().max_total_tokens
+        if self.server_args.max_total_tokens is not None:
+            init_kwargs["pool_size"] = self.server_args.max_total_tokens
         self._mlx_runner = MlxModelRunner(**init_kwargs)
 
         self._model_runner = MlxModelRunnerStub(
             model_config=self.model_config,
-            mem_fraction_static=get_schedule().mem_fraction_static,
+            mem_fraction_static=self.server_args.mem_fraction_static,
             gpu_id=self.gpu_id,
             ps=self.ps,
             nccl_port=self.nccl_port,
