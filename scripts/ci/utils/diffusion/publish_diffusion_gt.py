@@ -1,5 +1,5 @@
 """
-Publish diffusion CI ground-truth images to sgl-project/ci-data
+Publish diffusion CI ground-truth images to sgl-project/ci-data-diffusion
 via the GitHub API (same pattern as publish_traces.py).
 """
 
@@ -48,7 +48,7 @@ else:
     )
 
 REPO_OWNER = "sgl-project"
-REPO_NAME = "ci-data"
+REPO_NAME = "ci-data-diffusion"
 BRANCH = "main"
 DEFAULT_TARGET_DIR = "diffusion-ci/consistency_gt/sglang_generated"
 
