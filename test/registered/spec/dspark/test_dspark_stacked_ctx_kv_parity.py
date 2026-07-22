@@ -15,6 +15,7 @@ from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.models.dflash import DFlashAttention
 from sglang.srt.models.dspark import DSparkDraftMixin
+from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -89,6 +90,7 @@ def _per_layer_reference(model, ctx_hidden, positions):
 class TestDSparkStackedCtxKvParity(CustomTestCase):
     def setUp(self):
         super().setUp()
+        set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
         self.rope = get_rope(
             HEAD_DIM,
             rotary_dim=HEAD_DIM,
