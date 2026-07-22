@@ -14,10 +14,10 @@ from sglang.jit_kernel.benchmark.utils import (
     DEFAULT_QUANTILES,
     get_benchmark_range,
 )
-from sglang.jit_kernel.mla_kv_pack_quantize_fp8 import (
+from sglang.kernels.jit.utils import is_arch_support_pdl
+from sglang.kernels.ops.attention.mla_kv_pack_quantize_fp8 import (
     mla_kv_pack_quantize_fp8 as hybrid_pack,
 )
-from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(

@@ -58,7 +58,7 @@ def jit_concat_mla_k(
     k: torch.Tensor, k_nope: torch.Tensor, k_rope: torch.Tensor
 ) -> None:
     """JIT compiled implementation."""
-    from sglang.jit_kernel.concat_mla import concat_mla_k
+    from sglang.kernels.ops.attention.concat_mla import concat_mla_k
 
     concat_mla_k(k, k_nope, k_rope)
 
@@ -67,7 +67,7 @@ def jit_concat_mla_absorb_q(
     a: torch.Tensor, b: torch.Tensor, out: torch.Tensor
 ) -> None:
     """JIT compiled implementation - wrapper for test compatibility."""
-    from sglang.jit_kernel.concat_mla import concat_mla_absorb_q
+    from sglang.kernels.ops.attention.concat_mla import concat_mla_absorb_q
 
     result = concat_mla_absorb_q(a, b)
     out.copy_(result)

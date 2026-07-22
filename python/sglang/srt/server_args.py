@@ -31,8 +31,8 @@ import uuid
 from functools import cached_property
 from typing import Any, Callable, Dict, List, Literal, Optional, Union
 
-from sglang.jit_kernel.kv_canary.consts import RealKvHashMode
 from sglang.kernels.ops.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
+from sglang.kernels.ops.kv_canary.consts import RealKvHashMode
 from sglang.srt.arg_groups.arg_utils import NS, A, Arg, add_cli_args_from_dataclass
 from sglang.srt.arg_groups.argparse_actions import (
     DeprecatedAction,
@@ -1179,6 +1179,24 @@ class ServerArgs:
         "(or SGLANG_GRPC_PORT) enables the native gRPC server; it is off by "
         "default. In legacy --smg-grpc-mode this is the SMG server port and "
         "defaults to --port + 10000.",
+        NS("serving"),
+    ] = None
+    sidecar: A[
+        Optional[str],
+        "Start a locally managed sidecar against the native gRPC server. "
+        "The selected module must expose main(argv) and read the resolved "
+        "native gRPC endpoint from SGLANG_GRPC_ENDPOINT. Requires --grpc-port "
+        "or SGLANG_GRPC_PORT.",
+        NS("serving"),
+    ] = None
+    sidecar_args: A[
+        Optional[List[str]],
+        Arg(
+            help="JSON array passed to the selected sidecar module's "
+            "main(argv) function. --sidecar-shutdown-timeout SECONDS is "
+            "consumed by SGLang.",
+            type_parser=json_list_type,
+        ),
         NS("serving"),
     ] = None
     skip_server_warmup: A[bool, "If set, skip warmup.", NS("serving")] = False
@@ -3730,6 +3748,23 @@ class ServerArgs:
         # Native gRPC is incompatible with launch paths it doesn't wire into.
         # Legacy takes precedence over grpc_port, keeping re-runs idempotent.
         native_grpc = self.grpc_port is not None and not legacy_grpc
+        if self.sidecar_args is not None:
+            if self.sidecar is None:
+                raise ValueError("--sidecar-args requires --sidecar.")
+            if not isinstance(self.sidecar_args, list) or not all(
+                isinstance(arg, str) for arg in self.sidecar_args
+            ):
+                raise ValueError("--sidecar-args must be a JSON array of strings.")
+        if self.sidecar is not None:
+            if not self.sidecar.strip():
+                raise ValueError("--sidecar must not be empty.")
+            if legacy_grpc:
+                raise ValueError(
+                    "--sidecar requires SGLang's native gRPC server; "
+                    "it cannot be combined with --smg-grpc-mode/--grpc-mode."
+                )
+            if self.grpc_port is None:
+                raise ValueError("--sidecar requires --grpc-port or SGLANG_GRPC_PORT.")
         if native_grpc:
             if self.use_ray:
                 raise ValueError(

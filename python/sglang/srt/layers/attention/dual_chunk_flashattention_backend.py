@@ -15,7 +15,7 @@ from sgl_kernel.sparse_flash_attn import (
     sparse_attn_func,
 )
 
-from sglang.jit_kernel.flash_attention import (
+from sglang.kernels.ops.attention.flash_attention import (
     flash_attn_varlen_func,
     flash_attn_with_kvcache,
 )

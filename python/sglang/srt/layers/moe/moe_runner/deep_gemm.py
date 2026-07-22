@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 import einops
 import torch
 
-from sglang.jit_kernel.dsv4 import silu_and_mul_masked_post_quant
+from sglang.kernels.ops.attention.dsv4 import silu_and_mul_masked_post_quant
 from sglang.kernels.ops.quantization import per_token_group_quant
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -183,7 +183,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         quant_info: DeepGemmMoeQuantInfo,
         running_state: dict,
     ) -> torch.Tensor:
-        from sglang.jit_kernel.dsv4 import silu_and_mul_contig_post_quant
+        from sglang.kernels.ops.attention.dsv4 import silu_and_mul_contig_post_quant
         from sglang.kernels.ops.moe.ep_moe_kernels import tma_align_input_scale
         from sglang.kernels.ops.quantization.fp8_kernel import (
             create_per_token_group_quant_fp8_output_scale,
