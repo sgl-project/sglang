@@ -708,9 +708,6 @@ class Envs:
     SGLANG_DSA_HIP_DISABLE_PRESHUFFLE = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_NSA_HIP_DISABLE_PRESHUFFLE"
     )
-    # Row-slice cap for the head-padded flash_mla_sparse call under decode
-    # context parallelism; bounds the padded q/out transients.
-    SGLANG_DSA_DCP_SPARSE_MAX_ROWS = EnvInt(8192)
     # Allow the fused top-k v2 transform under decode context parallelism
     # (off by default: the v2 plan is decode-shaped and slower on large
     # extend chunks).

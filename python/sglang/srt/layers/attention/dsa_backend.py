@@ -81,7 +81,6 @@ _IS_GFX95 = is_gfx95_supported()
 # Row-slice cap for the head-padded flash_mla_sparse call under DCP; bounds
 # the padded q/out transients (rows * 128 * 576 * 2B per buffer). Tunable for
 # perf/memory trade-off studies.
-_FLASHMLA_SPARSE_MAX_ROWS = envs.SGLANG_DSA_DCP_SPARSE_MAX_ROWS.get()
 
 if is_cuda():
     import deep_gemm
@@ -506,28 +505,14 @@ class DeepseekSparseAttnBackend(
                     f"one attention-DP shard; got attn_tp_size="
                     f"{parallel.attn_tp_size}, dcp_size={self.dcp_size}."
                 )
-            if self.dsa_prefill_impl == "flashmla_auto":
-                # Auto-select resolves per batch and could pick a kernel that
-                # does not surface the LSE; pin the deterministic choice.
-                self.dsa_prefill_impl = "flashmla_sparse"
-                self.enable_auto_select_prefill_impl = False
-            assert self.dsa_decode_impl in ("flashmla_sparse", "trtllm"), (
-                "DSA decode context parallelism requires a decode kernel that "
-                "surfaces the LSE for the cross-rank combine (flashmla_sparse "
-                f"or trtllm); got {self.dsa_decode_impl}."
-            )
-            assert self.dsa_prefill_impl in ("flashmla_sparse", "trtllm"), (
-                "DSA decode context parallelism requires --dsa-prefill-backend "
-                f"flashmla_sparse or trtllm; got {self.dsa_prefill_impl}."
-            )
-            assert not self.dsa_kv_cache_store_fp8 or (
+            assert (
                 self.dsa_decode_impl == "trtllm"
                 and self.dsa_prefill_impl == "trtllm"
             ), (
-                "Under DSA decode context parallelism, the fp8 KV cache is "
-                "supported on the trtllm backends only (flashmla_sparse is a "
-                "bf16-KV kernel); use the default trtllm backends or launch "
-                "with --kv-cache-dtype bfloat16."
+                "DSA decode context parallelism runs on the trtllm backends "
+                "only (the sm100 defaults): the sparse kernel must surface "
+                "the LSE for the cross-rank combine; got decode="
+                f"{self.dsa_decode_impl}, prefill={self.dsa_prefill_impl}."
             )
 
         # `flashmla_sparse_q8` = the native FP8 SM90 sparse-prefill kernel. It always
@@ -2196,19 +2181,6 @@ class DeepseekSparseAttnBackend(
 
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
-            if self.dcp_enabled:
-                # q arrives head-widened (all-gathered across the DCP group in
-                # forward_absorb_prepare); return (out, lse) so
-                # forward_absorb_core can LSE-combine + head reduce-scatter
-                # (cp_lse_ag_out_rs_mla), mirroring the decode scheme.
-                return self._forward_flashmla_sparse(
-                    q_all=q_all,
-                    kv_cache=kv_cache,
-                    page_table_1=page_table_1,
-                    sm_scale=layer.scaling,
-                    v_head_dim=layer.v_head_dim,
-                    return_lse=True,
-                )
             return self._forward_flashmla_sparse(
                 q_all=q_all,
                 kv_cache=kv_cache,
@@ -2354,16 +2326,12 @@ class DeepseekSparseAttnBackend(
         if self.dsa_decode_impl == "flashmla_sparse":
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
-            # Under DCP, q arrives head-widened (num_local_heads * dcp_size,
-            # all-gathered model-side); return (out, lse) so forward_absorb_core
-            # can run the cross-rank LSE combine (cp_lse_ag_out_rs_mla).
             return self._forward_flashmla_sparse(
                 q_all=q_all,
                 kv_cache=kv_cache,
                 page_table_1=page_table_1,
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
-                return_lse=self.dcp_enabled,
             )
         elif self.dsa_decode_impl == "flashmla_kv":
             if q_rope is not None:
@@ -2467,38 +2435,12 @@ class DeepseekSparseAttnBackend(
         v_head_dim: int,
         page_table_1: torch.Tensor,
         sm_scale: float,
-        return_lse: bool = False,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    ) -> torch.Tensor:
         from sgl_kernel.flash_mla import flash_mla_sparse_fwd
 
         # FlashMLA sparse kernel requires num_heads to be a multiple of 64 (Hopper) or 128 (Blackwell)
         # When using TP, num_heads might be smaller (e.g., 256//8=32)
         num_tokens, num_heads, head_dim = q_all.shape
-
-        # Under DCP the extend q is head-widened and then padded up to the
-        # kernel's head multiple, so the transient q/out buffers scale with
-        # rows * 128 * head_dim — multi-GB at large chunked-prefill sizes.
-        # Bound the footprint by slicing rows (page_table_1 rows align 1:1).
-        if self.dcp_enabled and num_tokens > _FLASHMLA_SPARSE_MAX_ROWS:
-            outs, lses = [], []
-            for s in range(0, num_tokens, _FLASHMLA_SPARSE_MAX_ROWS):
-                e = min(s + _FLASHMLA_SPARSE_MAX_ROWS, num_tokens)
-                r = self._forward_flashmla_sparse(
-                    q_all=q_all[s:e],
-                    kv_cache=kv_cache,
-                    v_head_dim=v_head_dim,
-                    page_table_1=page_table_1[s:e],
-                    sm_scale=sm_scale,
-                    return_lse=return_lse,
-                )
-                if return_lse:
-                    outs.append(r[0])
-                    lses.append(r[1])
-                else:
-                    outs.append(r)
-            if return_lse:
-                return torch.cat(outs, dim=0), torch.cat(lses, dim=0)
-            return torch.cat(outs, dim=0)
 
         # Determine required padding based on GPU architecture (use cached value)
         required_padding = 128 if self.device_sm_major >= 10 else 64
@@ -2521,7 +2463,7 @@ class DeepseekSparseAttnBackend(
         # indices shape must be (s_q, h_kv=1, topk), keep h_kv=1 unchanged
         indices_input = page_table_1.unsqueeze(1)
 
-        o, _, lse = flash_mla_sparse_fwd(
+        o, _, _ = flash_mla_sparse_fwd(
             q=q_input,
             kv=kv_cache,
             indices=indices_input,
@@ -2533,13 +2475,6 @@ class DeepseekSparseAttnBackend(
         if need_padding:
             o = o[:, :num_heads, :]
 
-        if return_lse:
-            # lse is [s_q, h_q] base-2 log-sum-exp, matching what
-            # cp_lse_ag_out_rs_mla expects. The head trim must be
-            # contiguous — the DCP combine all-gathers it.
-            if need_padding:
-                lse = lse[:, :num_heads].contiguous()
-            return o, lse
         return o
 
     def _forward_flashmla_sparse_q8kv8(
