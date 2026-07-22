@@ -3,17 +3,20 @@ Unit tests for mem_cache/common.py page helpers - no server, no model loading ne
 """
 
 import unittest
-import torch
+
 import numpy as np
-from sglang.test.ci.ci_register import register_cpu_ci
+import torch
+
 from sglang.srt.mem_cache.common import (
     kv_to_page_indices,
     kv_to_page_num,
-    page_align_floor
+    page_align_floor,
 )
+from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
 
 class TestKVToPageIndices(CustomTestCase):
     def test_maps_contiguous_rows_to_page_ids(self):
@@ -31,12 +34,14 @@ class TestKVToPageIndices(CustomTestCase):
         page_indices = kv_to_page_indices(kv_indices, page_size=1)
         np.testing.assert_array_equal(page_indices, np.array([0, 1, 2, 3]))
 
+
 class TestKVToPageNum(CustomTestCase):
     def test_ceil_division(self):
         self.assertEqual(kv_to_page_num(17, 4), 5)
         self.assertEqual(kv_to_page_num(16, 4), 4)
         self.assertEqual(kv_to_page_num(1, 4), 1)
         self.assertEqual(kv_to_page_num(0, 4), 0)
+
 
 class TestPageAlignFloor(CustomTestCase):
     def test_floor_align(self):
@@ -45,6 +50,7 @@ class TestPageAlignFloor(CustomTestCase):
         self.assertEqual(page_align_floor(15, 4), 12)
         self.assertEqual(page_align_floor(3, 4), 0)
         self.assertEqual(page_align_floor(0, 4), 0)
+
 
 if __name__ == "__main__":
     unittest.main()
