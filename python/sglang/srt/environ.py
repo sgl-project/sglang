@@ -708,9 +708,8 @@ class Envs:
     SGLANG_DSA_HIP_DISABLE_PRESHUFFLE = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_NSA_HIP_DISABLE_PRESHUFFLE"
     )
-    # Allow the fused top-k v2 transform under decode context parallelism
-    # (off by default: the v2 plan is decode-shaped and slower on large
-    # extend chunks).
+    # Allow the fused top-k v2 transform under DCP (off by default: the v2
+    # plan is decode-shaped and slower on large extend chunks).
     SGLANG_DSA_DCP_ENABLE_FUSED_TOPK = EnvBool(False)
     SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(0.2)
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)

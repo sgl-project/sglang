@@ -608,23 +608,17 @@ class DeepseekMLAForwardMixin:
                     torch.cuda.current_stream().wait_stream(self.alt_stream)
             elif forward_batch.forward_mode.is_extend(include_draft_extend_v2=True):
                 if self.use_dsa:
-                    # DSA extend under DCP mirrors the decode scheme instead of
-                    # gathering KV: all-gather q across the DCP group (ranks in
-                    # a DCP group hold different TP head groups), let each rank
-                    # run the sparse kernels for all gathered heads over its
-                    # local KV shard, then LSE-combine + head reduce-scatter in
-                    # forward_absorb_core. Covers spec draft-extend and
-                    # target-verify rows too (same row-wise recipe).
+                    # DSA extend mirrors the decode recipe: gather q across
+                    # the DCP group, attend the local KV shard with all
+                    # gathered heads, LSE-combine in forward_absorb_core.
+                    # Draft-extend and target-verify rows take the same path.
                     q_nope_out, q_pe = all_gather_q_for_mla_decode(
                         q_nope_out=q_nope_out,
                         q_pe=q_pe,
                     )
-                elif not forward_batch.forward_mode.is_extend():
-                    # draft-extend for the dense-MLA gather scheme is not
-                    # implemented (spec x DCP is experimental, DSA-only).
-                    pass
-                else:
-                    # for extend, gather kv
+                elif forward_batch.forward_mode.is_extend():
+                    # Dense MLA gathers KV instead; its draft-extend path is
+                    # not implemented.
                     all_gather_kv_cache_for_mla_extend(
                         get_token_to_kv_pool(),
                         self.attn_mqa,
@@ -636,10 +630,6 @@ class DeepseekMLAForwardMixin:
                         k_nope,
                         k_pe,
                     )
-            elif forward_batch.forward_mode.is_idle():
-                # dp-attention idle-companion batches: no tokens, nothing to
-                # gather or combine.
-                pass
             else:
                 logger.warning(
                     f"not supported forward_mode {forward_batch.forward_mode}"

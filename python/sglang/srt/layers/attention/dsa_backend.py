@@ -459,51 +459,37 @@ class DeepseekSparseAttnBackend(
         self.dcp_size = parallel.attn_dcp_size if self.dcp_enabled else 1
         self.dcp_rank = parallel.attn_dcp_rank if self.dcp_enabled else 0
         if self.dcp_enabled:
-            if self.use_fused_topk and not envs.SGLANG_DSA_DCP_ENABLE_FUSED_TOPK.get():
-                # Mechanically supported under DCP (the owner filter maps the
-                # fused output's global slots to local rows), but the v2
-                # transform's plan/persistent-pool is decode-shaped and
-                # measured ~2x slower on large extend chunks with no decode
-                # win to offset it; keep unfused until an extend-shaped plan
-                # exists. Set SGLANG_DSA_DCP_ENABLE_FUSED_TOPK=1 to experiment.
-                print_warning_once(
-                    "Disabling fused DSA top-k under decode context "
-                    "parallelism (no measured win; extend-shaped v2 plan "
-                    "pending). Set SGLANG_DSA_DCP_ENABLE_FUSED_TOPK=1 to override."
-                )
-                self.use_fused_topk = False
-            assert self.hisparse_coordinator is None, (
-                "DSA decode context parallelism does not support hisparse."
-            )
-            assert not model_runner.server_args.enable_prefill_cp, (
-                "DSA decode context parallelism does not compose with "
-                "prefill context parallelism yet: the DCP extend recipe "
-                "all-gathers q across the DCP group assuming every rank "
-                "holds the same extend rows, and prefill-CP row-splitting "
-                "violates that (DCP-group peers hold different tokens). "
-                "The fix is an MLA-style position-ordered KV gather for "
-                "CP-split extends; until then launch with either "
-                "--dcp-size or --enable-prefill-cp, not both."
-            )
-            if model_runner.server_args.enable_dp_attention:
-                # A DCP group must nest inside one attention-DP shard: ranks
-                # in a group share the same requests, so the replicated
-                # indexer keeps producing identical top-k within the group.
-                assert parallel.attn_tp_size % self.dcp_size == 0, (
-                    "Under dp-attention, dcp_size must divide attn_tp_size "
-                    f"(= tp_size / dp_size) so each DCP group stays within "
-                    f"one attention-DP shard; got attn_tp_size="
-                    f"{parallel.attn_tp_size}, dcp_size={self.dcp_size}."
-                )
             assert (
                 self.dsa_decode_impl == "trtllm"
                 and self.dsa_prefill_impl == "trtllm"
             ), (
-                "DSA decode context parallelism runs on the trtllm backends "
-                "only (the sm100 defaults): the sparse kernel must surface "
-                "the LSE for the cross-rank combine; got decode="
-                f"{self.dsa_decode_impl}, prefill={self.dsa_prefill_impl}."
+                "DCP requires the trtllm DSA backends (the sm100 defaults); "
+                f"got decode={self.dsa_decode_impl}, "
+                f"prefill={self.dsa_prefill_impl}."
             )
+            assert not model_runner.server_args.enable_prefill_cp, (
+                "DCP does not compose with prefill CP yet: the DCP extend "
+                "recipe assumes every rank in a DCP group holds the same "
+                "extend rows, and prefill CP splits rows across ranks."
+            )
+            assert self.hisparse_coordinator is None, (
+                "DCP does not support hisparse."
+            )
+            if model_runner.server_args.enable_dp_attention:
+                # Keep each DCP group inside one attention-DP shard so the
+                # replicated indexer sees identical requests group-wide.
+                assert parallel.attn_tp_size % self.dcp_size == 0, (
+                    f"dcp_size ({self.dcp_size}) must divide attn_tp_size "
+                    f"({parallel.attn_tp_size}) under dp-attention."
+                )
+            if self.use_fused_topk and not envs.SGLANG_DSA_DCP_ENABLE_FUSED_TOPK.get():
+                # The fused v2 transform is decode-shaped and ~2x slower on
+                # large extend chunks; stay unfused under DCP.
+                print_warning_once(
+                    "Disabling fused DSA top-k under DCP; set "
+                    "SGLANG_DSA_DCP_ENABLE_FUSED_TOPK=1 to override."
+                )
+                self.use_fused_topk = False
 
         # `flashmla_sparse_q8` = the native FP8 SM90 sparse-prefill kernel. It always
         # runs FP8 (requires fp8_e4m3 KV) and is SM90-only, so validate both at
@@ -789,11 +775,7 @@ class DeepseekSparseAttnBackend(
         owned = (page_table_1 >= 0) & (
             page_table_1 % self.dcp_size == self.dcp_rank
         )
-        return torch.where(
-            owned,
-            page_table_1 // self.dcp_size,
-            torch.full_like(page_table_1, -1),
-        )
+        return torch.where(owned, page_table_1 // self.dcp_size, -1)
 
     def get_device_int32_arange(self, length: int) -> torch.Tensor:
         if length > len(self._arange_buf):
