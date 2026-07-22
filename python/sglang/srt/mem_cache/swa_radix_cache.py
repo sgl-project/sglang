@@ -433,7 +433,24 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
             )
 
         value, last_node, best_value_len = self._match_prefix_helper(key)
+        self._record_swa_prefix_truncation(value, best_value_len)
         return self._match_post_processor(params, value, last_node, best_value_len)
+
+    def _record_swa_prefix_truncation(
+        self, value: List[torch.Tensor], best_value_len: int
+    ) -> None:
+        """Record prefix tokens matched in the tree but dropped from the hit.
+
+        ``_match_prefix_helper`` walks the full logical prefix into ``value`` but
+        only accepts the first ``best_value_len`` entries as a usable hit; the rest
+        is dropped because the sliding window was no longer covered by live
+        (non-tombstoned) SWA KV. The dropped token count is the SWA prefix-cache
+        truncation signal, exposed for cache-hit-rate debugging.
+        """
+        if self.metrics_collector is None or best_value_len >= len(value):
+            return
+        truncated_tokens = sum(len(v) for v in value[best_value_len:])
+        self.update_swa_prefix_truncation_metrics(truncated_tokens)
 
     def insert(self, params: InsertParams) -> InsertResult:
         if self.disable:

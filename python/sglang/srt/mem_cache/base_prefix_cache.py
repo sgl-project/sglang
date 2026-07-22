@@ -236,6 +236,12 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
             )
             self.metrics_collector.increment_eviction_num_tokens(num_evicted)
 
+    def update_swa_prefix_truncation_metrics(self, num_truncated_tokens: int):
+        if self.metrics_collector is not None and num_truncated_tokens > 0:
+            self.metrics_collector.increment_swa_prefix_truncated_num_tokens(
+                num_truncated_tokens
+            )
+
     @abstractmethod
     def reset(self):
         pass
