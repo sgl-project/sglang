@@ -1,0 +1,144 @@
+name: PR Test Stage (AMD)
+# Reusable workflow for the AMD suites that execute test/run_suite.py. The
+# caller keeps change detection and stage ordering; runner selection, ROCm
+# container setup, matrix fanout, execution, failure artifacts, and cleanup
+# live here so ROCm versions cannot drift independently.
+
+on:
+  workflow_call:
+    inputs:
+      suite:
+        description: 'run_suite.py suite name (without a ROCm-version suffix).'
+        type: string
+        required: true
+      runner_arch:
+        description: 'AMD runner architecture, for example mi300, mi325, or mi35x.'
+        type: string
+        required: true
+      gpu_count:
+        description: 'GPU count encoded in the runner label.'
+        type: number
+        required: true
+      rocm_version:
+        description: 'ROCm image family passed to amd_ci_start_container.sh.'
+        type: string
+        required: true
+      partitions:
+        description: 'JSON object with size and arr fields, for example {"size":3,"arr":[0,1,2]}.'
+        type: string
+        required: true
+      max_parallel:
+        description: 'Maximum number of matrix shards dispatched at once.'
+        type: number
+        required: true
+      auto_partition:
+        description: 'Forward matrix partition arguments to run_suite.py.'
+        type: boolean
+        default: true
+      aiter_ref:
+        description: 'Optional AITER commit override.'
+        type: string
+        default: ''
+      checkout_ref:
+        description: 'Git ref or SHA to test.'
+        type: string
+        required: true
+      continue_on_error:
+        description: 'Forward --continue-on-error to run_suite.py.'
+        type: boolean
+        default: false
+      run_timeout_minutes:
+        description: 'timeout-minutes for the Run test step.'
+        type: number
+        required: true
+      timeout_per_file:
+        description: 'run_suite.py --timeout-per-file value in seconds.'
+        type: number
+        default: 1200
+      rccl_smoke_test:
+        description: 'Run the 8-GPU RCCL communication smoke test before the suite.'
+        type: boolean
+        default: false
+      rccl_workarounds:
+        description: 'Apply the Stage-C RCCL environment overrides.'
+        type: boolean
+        default: false
+      enable_retry:
+        description: 'Enable the Stage-C per-file retry policy.'
+        type: boolean
+        default: false
+
+# Reusable workflows do not inherit workflow-level env from their caller.
+env:
+  AITER_COMMIT_OVERRIDE: ${{ inputs.aiter_ref }}
+  DOCKERHUB_AMD_USERNAME: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
+  DOCKERHUB_AMD_TOKEN: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
+  RUNNER_LABELS: ${{ inputs.runner_arch == 'mi35x' && format('linux-{0}-gpu-{1}', inputs.runner_arch, inputs.gpu_count) || format('linux-{0}-{1}gpu-sglang', inputs.runner_arch, inputs.gpu_count) }}
+
+jobs:
+  run:
+    name: ${{ format('{0} ({1}, {2})', inputs.suite, inputs.runner_arch == 'mi35x' && format('linux-{0}-gpu-{1}', inputs.runner_arch, inputs.gpu_count) || format('linux-{0}-{1}gpu-sglang', inputs.runner_arch, inputs.gpu_count), matrix.partition) }}
+    runs-on: ${{ inputs.runner_arch == 'mi35x' && format('linux-{0}-gpu-{1}', inputs.runner_arch, inputs.gpu_count) || format('linux-{0}-{1}gpu-sglang', inputs.runner_arch, inputs.gpu_count) }}
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ inputs.max_parallel }}
+      matrix:
+        partition: ${{ fromJson(inputs.partitions).arr }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.checkout_ref }}
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
+
+      - name: Start CI container
+        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version ${{ inputs.rocm_version }}
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
+
+      - name: Test RCCL multi-GPU communication
+        if: inputs.rccl_smoke_test
+        timeout-minutes: 5
+        run: |
+          echo "Testing RCCL multi-GPU communication with debug info..."
+          docker exec ci_sglang bash -c "cd /sglang-checkout && NCCL_DEBUG=INFO RCCL_DEBUG=INFO torchrun --nproc_per_node=${{ inputs.gpu_count }} scripts/ci/amd/test_rccl_multi_gpu.py"
+
+      - name: Run test
+        timeout-minutes: ${{ inputs.run_timeout_minutes }}
+        env:
+          CONTINUE_ON_ERROR_FLAG: ${{ inputs.continue_on_error && '--continue-on-error' || '' }}
+          PARTITION_ARGS: ${{ inputs.auto_partition && format('--auto-partition-id {0} --auto-partition-size {1}', matrix.partition, fromJson(inputs.partitions).size) || '' }}
+          RCCL_ENV_ARGS: ${{ inputs.rccl_workarounds && '-e NCCL_CUMEM_ENABLE=0 -e NCCL_NVLS_ENABLE=0 -e RCCL_MSCCL_ENABLE=0 -e SGLANG_USE_ROCM700A=1' || '' }}
+          RETRY_ARGS: ${{ inputs.enable_retry && '--enable-retry --max-attempts 2 --retry-wait-seconds 120 --retry-timeout-increase 0' || '' }}
+        run: |
+          set -o pipefail
+          bash scripts/ci/amd/amd_ci_exec.sh \
+            $RCCL_ENV_ARGS \
+            -w "/sglang-checkout/test" \
+            python3 run_suite.py \
+              --hw amd \
+              --suite ${{ inputs.suite }} \
+              $PARTITION_ARGS \
+              --timeout-per-file ${{ inputs.timeout_per_file }} \
+              $RETRY_ARGS \
+              $CONTINUE_ON_ERROR_FLAG \
+            2>&1 | tee amd-ci-test.log
+
+      - name: Upload failure log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: amd-ci-${{ inputs.suite }}-${{ inputs.rocm_version }}-${{ matrix.partition }}-${{ github.run_attempt }}
+          path: amd-ci-test.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Cleanup container
+        if: always()
+        run: docker rm -f ci_sglang 2>/dev/null || true
