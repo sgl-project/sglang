@@ -27,11 +27,10 @@ use super::frame::{
     stream_frame_string, tag_value,
 };
 use super::guard::AbortGuard;
+use super::submit::submit;
 use crate::environ::env_bool;
-use crate::fsm::RequestState;
 use crate::ids::RidHash;
-use crate::message::{EgressItem, EgressSink, GenerateBody, GenerateRequest, Request, RequestKind};
-use crate::runtime::channels::TmEvent;
+use crate::message::{EgressItem, GenerateBody, GenerateRequest, RequestKind};
 
 /// The routes this module owns, mounted by `api_server::serve`.
 pub(super) fn routes() -> Router<AppState> {
@@ -84,10 +83,10 @@ async fn health_generate(State(state): State<AppState>) -> Response {
         is_health_check: true,
         ..Default::default()
     };
-    let (id, rid, _keepalive) = match submit(&state, probe).await {
+    let (id, rid, _keepalive) = match submit(&state, RequestKind::Generate(probe)).await {
         // Hold the receiver so the probe's sink stays open until it completes.
         Ok((id, rid, rx)) => (id, rid, rx),
-        Err(()) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(resp) => return resp,
     };
     // Deregister on drop (never disarmed): a busy-skipped probe has no terminal
     // frame, so without this abort it leaks one detok entry per call.
@@ -111,41 +110,10 @@ async fn health_generate(State(state): State<AppState>) -> Response {
     }
 }
 
-/// Submit one generate request into the ingress pipeline; returns the
-/// client-visible rid (uuid hex, Python-parity), its hashed routing key, and the
-/// egress receiver. Rid policy: health probes get the Python server's
-/// `HEALTH_CHECK_<uuid>` form so scheduler logs and prefix-gated handling
-/// recognize them; a client-supplied rid (already fanned out per item by
-/// `split`) wins over minting.
-async fn submit(
-    state: &AppState,
-    req: GenerateRequest,
-) -> Result<(RidHash, String, mpsc::Receiver<EgressItem>), ()> {
-    let rid = if req.is_health_check {
-        crate::ids::new_health_check_rid()
-    } else {
-        req.rid.clone().unwrap_or_else(crate::ids::new_rid)
-    };
-    let id = RidHash::from_rid(&rid);
-    // Async-aware send so a full TM inbox yields (backpressure) instead of parking
-    // a thread; Err only when the inbox is closed (shutdown).
-    let (tx, rx) = mpsc::channel::<EgressItem>(state.egress_buf);
-    let request = Request {
-        rid_hash: id,
-        rid: rid.clone(),
-        state: RequestState::Received,
-        sink: EgressSink::Local(tx),
-        kind: RequestKind::Generate(req),
-    };
-    match state.senders.tm.send_async(TmEvent::Ingress(request)).await {
-        Ok(()) => Ok((id, rid, rx)),
-        Err(_) => {
-            tracing::error!("tm inbox closed; request dropped");
-            Err(())
-        }
-    }
-}
-
+/// `POST /generate` — the native generation endpoint. Splits the body
+/// into per-request payloads (a scalar body → one, a list body → a batch) and
+/// dispatches to the single or batch path; a malformed body is a 400 before
+/// anything reaches the scheduler.
 async fn generate(State(state): State<AppState>, Json(body): Json<GenerateBody>) -> Response {
     let stream = body.stream;
     // Fan `text`/`input_ids`/`sampling_params` (scalar or list) into per-request
@@ -171,11 +139,9 @@ async fn generate(State(state): State<AppState>, Json(body): Json<GenerateBody>)
 async fn generate_single(state: &AppState, req: GenerateRequest, stream: bool) -> Response {
     // `return_text_in_logprobs` is decoded on the detok shard into `*_txt`, so
     // `sglang_frame_value` just reads them — no tokenizer needed here.
-    let (id, rid_str, mut rx) = match submit(state, req).await {
+    let (id, rid_str, mut rx) = match submit(state, RequestKind::Generate(req)).await {
         Ok(v) => v,
-        Err(()) => {
-            return (StatusCode::SERVICE_UNAVAILABLE, "service unavailable").into_response();
-        }
+        Err(resp) => return resp,
     };
     // Abort on client disconnect: the guard fires when dropped before the request
     // finishes (axum drops the handler/SSE stream). Disarmed on a natural terminal.
@@ -202,7 +168,8 @@ async fn generate_single(state: &AppState, req: GenerateRequest, stream: bool) -
     }
 }
 
-/// Fold a unary request to its terminal → (HTTP status, result/`error` JSON, saw-terminal); `false` = truncation, caller keeps the abort guard armed. Shared by single + batch.
+/// Fold a unary request to its terminal → (HTTP status, result/`error` JSON, saw-terminal);
+/// `false` = truncation, caller keeps the abort guard armed. Shared by single + batch.
 async fn drain_unary(
     rx: &mut mpsc::Receiver<EgressItem>,
     rid_str: &str,
@@ -257,14 +224,12 @@ async fn generate_batch(
     let mut guard = AbortGuard::new_empty(state.senders.clone());
     let mut receivers = Vec::with_capacity(requests.len());
     for req in requests {
-        match submit(state, req).await {
+        match submit(state, RequestKind::Generate(req)).await {
             Ok((id, rid, rx)) => {
                 guard.arm(id, rid.clone());
                 receivers.push((id, rid, rx));
             }
-            Err(()) => {
-                return (StatusCode::SERVICE_UNAVAILABLE, "service unavailable").into_response();
-            }
+            Err(resp) => return resp,
         }
     }
 
