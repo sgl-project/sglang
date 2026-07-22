@@ -18,7 +18,7 @@ from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.glm4_moe import Glm4MoeModel
 from sglang.srt.models.glm4v import Glm4vForConditionalGeneration, Glm4vVisionModel
-from sglang.srt.runtime_context import get_exec, get_mm, get_parallel, get_server_args
+from sglang.srt.runtime_context import get_exec, get_mm, get_parallel
 from sglang.srt.utils import add_prefix, get_device_sm, is_cuda, log_info_on_rank0
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
@@ -69,7 +69,7 @@ class Glm4vMoeForConditionalGeneration(Glm4vForConditionalGeneration):
                     config.hidden_size,
                     quant_config=quant_config,
                     prefix=add_prefix("lm_head", prefix),
-                    use_attn_tp_group=get_server_args().enable_dp_lm_head,
+                    use_attn_tp_group=get_parallel().enable_dp_lm_head,
                 )
         else:
             # ranks other than the last rank will have a placeholder layer
