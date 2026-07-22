@@ -61,12 +61,10 @@ from sglang.srt.speculative.dspark_components.kernels.dspark_attn_metadata impor
 )
 from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
 from sglang.srt.speculative.ragged_verify import (
-    RaggedVerifyMode,
     compute_ragged_extend_lengths,
     compute_target_verify_graph_key,
     compute_uniform_extend_lengths,
-    read_ragged_verify_mode,
-    resolve_ragged_verify_layout,
+    resolve_compact_verify_layout,
 )
 from sglang.srt.utils import ceil_align, is_cuda, is_xpu
 from sglang.srt.utils.common import is_sm120_supported
@@ -578,26 +576,19 @@ class DeepseekV4AttnBackend(
         forward_batch: ForwardBatch,
         bs: int,
     ) -> Optional[RaggedVerifyLayout]:
-        layout = resolve_ragged_verify_layout(forward_batch)
+        layout = resolve_compact_verify_layout(
+            getattr(forward_batch, "spec_info", None),
+            padded_bs=None,
+            backend_name="DSV4",
+        )
         if layout is None:
             return None
-        if read_ragged_verify_mode() is not RaggedVerifyMode.COMPACT:
-            return None
-        if get_parallel().attn_cp_size > 1:
-            raise NotImplementedError(
-                "DSV4 ragged verify does not support context parallel (CP); "
-                "set SGLANG_RAGGED_VERIFY_MODE off for CP runs."
-            )
         if self.online_c128_mtp.enabled():
             raise NotImplementedError(
                 "DSV4 ragged verify does not support online c128 MTP; "
                 "set SGLANG_RAGGED_VERIFY_MODE off or disable online compress."
             )
-        # Layout invariants (verify_lens >= 1, total == sum) are enforced in
-        # RaggedVerifyLayout.__post_init__; don't re-check the device tensor
-        # here -- that would D2H-sync the host-free verify prep path.
-        layout = layout.padded_to_bucket(padded_bs=bs)
-        return layout
+        return layout.padded_to_bucket(padded_bs=bs)
 
     def _target_verify_graph_key(
         self,

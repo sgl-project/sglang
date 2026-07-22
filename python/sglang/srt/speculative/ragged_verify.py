@@ -203,6 +203,38 @@ def resolve_ragged_verify_layout(forward_batch) -> Optional[RaggedVerifyLayout]:
     return spec_info.ragged_verify_layout
 
 
+def resolve_compact_verify_layout(
+    spec_info,
+    *,
+    padded_bs: Optional[int],
+    backend_name: str,
+) -> Optional[RaggedVerifyLayout]:
+    """Resolve a spec input's layout for a compact-verify-capable backend:
+    None unless a layout is present and compact mode is on; CP is rejected.
+    padded_bs=None keeps the raw layout (eager: the batch carries exactly the
+    real verify tokens); otherwise pad to the captured slot count so the
+    tier's slack lands in the padding rows and the metadata build stays
+    sync-free. Layout invariants (verify_lens >= 1, total == sum) are enforced
+    in RaggedVerifyLayout.__post_init__; don't re-check the device tensor
+    here -- that would D2H-sync the host-free verify prep path.
+    """
+    from sglang.srt.runtime_context import get_parallel
+
+    layout = getattr(spec_info, "ragged_verify_layout", None)
+    if layout is None:
+        return None
+    if read_ragged_verify_mode() is not RaggedVerifyMode.COMPACT:
+        return None
+    if get_parallel().attn_cp_size > 1:
+        raise NotImplementedError(
+            f"{backend_name} ragged verify does not support context parallel "
+            "(CP); set SGLANG_RAGGED_VERIFY_MODE off for CP runs."
+        )
+    if padded_bs is None:
+        return layout
+    return layout.padded_to_bucket(padded_bs=padded_bs)
+
+
 class RaggedTargetVerifyGeometry(msgspec.Struct):
     cache_seqlens_int32: torch.Tensor
     cu_seqlens_q: torch.Tensor

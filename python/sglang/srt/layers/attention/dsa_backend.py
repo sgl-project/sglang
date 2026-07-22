@@ -67,6 +67,7 @@ from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyMode,
     compute_target_verify_graph_key,
     read_ragged_verify_mode,
+    resolve_compact_verify_layout,
 )
 from sglang.srt.utils import (
     get_bool_env_var,
@@ -344,11 +345,9 @@ class DeepseekSparseAttnBackend(
     # (page-table width) and never reads seq_lens_cpu / seq_lens_sum; opt out of
     # the D2H sync. The eager fallback derives lengths from GPU seq_lens.
     needs_cpu_seq_lens: bool = False
-    # Target-verify metadata is built per expanded token row (cu_seqlens_q is a
-    # unit arange, seqlens are expanded per request), so a ragged layout only
-    # changes the expanded row count. The SM100 DG-native [bs, next_n] paged-MQA
-    # schedule is the one uniform-width construct; it is bypassed (per-token
-    # schedule) when a ragged layout is present.
+    # Target-verify metadata is per expanded token row, so a ragged layout only
+    # changes the row count; the sole uniform-width construct (SM100 DG-native
+    # [bs, next_n] schedule) is bypassed when a ragged layout is present.
     supports_ragged_verify_graph: bool = True
 
     def __init__(
@@ -660,8 +659,7 @@ class DeepseekSparseAttnBackend(
     ) -> torch.Tensor:
         # target_verify with next_n>=2 uses DG-native q=[B,next_n,H,D] which
         # needs a [B, next_n] schedule; everything else stays per-token.
-        # A ragged verify layout has no uniform per-request width, so it always
-        # takes the per-token schedule.
+        # A ragged layout has no uniform width, so it also stays per-token.
         # TODO: SM90 supports DG-native next_n in {1,2} too — enable once
         # validated; for now DG-native is SM100+ only.
         next_n = self.speculative_num_draft_tokens
@@ -755,33 +753,6 @@ class DeepseekSparseAttnBackend(
         )
         return page_table[:, strided_indices] // page_size
 
-    def _resolve_verify_layout(
-        self,
-        spec_info,
-        bs: int,
-        pad_to_slots: bool = True,
-    ) -> Optional[RaggedVerifyLayout]:
-        layout = getattr(spec_info, "ragged_verify_layout", None)
-        if layout is None:
-            return None
-        if read_ragged_verify_mode() is not RaggedVerifyMode.COMPACT:
-            return None
-        if get_parallel().attn_cp_size > 1:
-            raise NotImplementedError(
-                "DSA ragged verify does not support context parallel (CP); "
-                "set SGLANG_RAGGED_VERIFY_MODE off for CP runs."
-            )
-        if not pad_to_slots:
-            # Eager forward: the batch carries exactly the real verify tokens,
-            # so the raw layout is the geometry (padding would add rows beyond
-            # the batch's q tokens).
-            return layout
-        # Graph capture/replay: pad to the captured slot count. The padded
-        # layout absorbs the tier's slack tokens into the padding rows
-        # (total == graph_num_tokens), so the whole tier stays covered and
-        # every metadata build below is sync-free.
-        return layout.padded_to_bucket(padded_bs=bs)
-
     def _target_verify_graph_key(
         self,
         bs: int,
@@ -821,8 +792,8 @@ class DeepseekSparseAttnBackend(
 
         if forward_batch.forward_mode.is_target_verify():
             draft_token_num = self.speculative_num_draft_tokens
-            verify_layout = self._resolve_verify_layout(
-                forward_batch.spec_info, batch_size, pad_to_slots=False
+            verify_layout = resolve_compact_verify_layout(
+                forward_batch.spec_info, padded_bs=None, backend_name="DSA"
             )
         else:
             draft_token_num = 0
@@ -1520,7 +1491,9 @@ class DeepseekSparseAttnBackend(
         """
         verify_layout = None
         if forward_mode.is_target_verify():
-            verify_layout = self._resolve_verify_layout(spec_info, bs)
+            verify_layout = resolve_compact_verify_layout(
+                spec_info, padded_bs=bs, backend_name="DSA"
+            )
         graph_key = self._target_verify_graph_key(bs, verify_layout)
 
         if graph_key not in self.decode_cuda_graph_metadata:
@@ -1596,10 +1569,8 @@ class DeepseekSparseAttnBackend(
             max_seqlen_k = self._graph_page_table_width(metadata)
 
             if verify_layout is not None and is_cuda() and not _is_hip:
-                # The whole ragged prep chain (fused metadata kernel,
-                # paged-MQA schedule, top-k plan) is recorded INSIDE the
-                # verify graph (init_forward_metadata_in_graph); replay only
-                # stages the per-step verify lens.
+                # The ragged prep chain is recorded inside the verify graph
+                # (init_forward_metadata_in_graph); replay only stages the lens.
                 self._ragged_verify_lens_buf[:bs].copy_(verify_layout.verify_lens)
                 total_rows = int(verify_layout.graph_num_tokens)
                 cache_seqlens = metadata.cache_seqlens_int32
