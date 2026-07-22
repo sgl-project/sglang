@@ -16,15 +16,19 @@ register_npu_ci(
 )
 
 QWEN3_6_27B_1080P_ENVS = {
+    "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
     "STREAMS_PER_DEVICE": "32",
     "HCCL_SOCKET_IFNAME": "lo",
     "GLOO_SOCKET_IFNAME": "lo",
     "HCCL_OP_EXPANSION_MODE": "AIV",
     "SGLANG_SET_CPU_AFFINITY": "1",
     "SGLANG_VIT_ENABLE_CUDA_GRAPH": "1",
-    "SGLANG_NPU_PROFILING": "0",
+    "SGLANG_ENABLE_SPEC_V2": "1",
+    "SGLANG_NPU_PROFILING": "1",
     "SGLANG_NPU_PROFILING_STAGE": "prefill",
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
+    "SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE": "1",
+    "SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES": "150",
     "ASCEND_USE_FIA": "1",
 }
 
@@ -40,35 +44,23 @@ QWEN3_6_27B_1080P_OTHER_ARGS = [
     "--chunked-prefill-size",
     -1,
     "--max-prefill-tokens",
-    82688,
+    48000,
     "--disable-radix-cache",
     "--trust-remote-code",
     "--max-running-requests",
-    38,
+    30,
     "--max-mamba-cache-size",
-    38,
+    40,
     "--mem-fraction-static",
-    0.70,
+    0.76,
     "--cuda-graph-bs",
-    1,
     2,
     4,
     8,
-    10,
-    12,
     16,
-    20,
     24,
     28,
     30,
-    32,
-    35,
-    38,
-    "--enable-prefill-delayer",
-    "--prefill-delayer-queue-min-ratio",
-    0.45,
-    "--prefill-delayer-max-delay-ms",
-    5500,
     "--enable-multimodal",
     "--mm-attention-backend",
     "ascend_attn",
@@ -84,6 +76,7 @@ QWEN3_6_27B_1080P_OTHER_ARGS = [
     1,
     "--speculative-num-draft-tokens",
     4,
+    "--mm-enable-dp-encoder",
     "--reasoning-parser",
     "qwen3",
     "--tool-call-parser",
@@ -101,15 +94,13 @@ class TestNPUQwen3_6_27B_1P_In1080p_30_Out256_50ms(TestNpuPerformanceTestCaseBas
     envs = QWEN3_6_27B_1080P_ENVS
     backend = "sglang-oai-chat"
     dataset_name = "image"
-    warmup_requests = 38
-    max_concurrency = 42
-    num_prompts = 152
+    max_concurrency = 30
+    num_prompts = 120
     input_len = 30
     output_len = 256
     random_range_ratio = 1
     image_resolution = "1920x1080"
     image_count = 1
-    seed = 1
     tpot = 50
     output_token_throughput = 226
 
