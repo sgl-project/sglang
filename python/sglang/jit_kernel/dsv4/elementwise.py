@@ -23,7 +23,10 @@ def _jit_fused_rope_module():
         make_name("fused_rope"),
         *args,
         cuda_files=["deepseek_v4/rope.cuh"],
-        cuda_wrappers=[("forward", f"FusedQKRopeKernel<{args}>::forward")],
+        cuda_wrappers=[
+            ("forward", f"FusedQKRopeKernel<{args}>::forward"),
+            ("pack", f"FusedQKRopeKernel<{args}>::pack"),
+        ],
     )
 
 
@@ -135,6 +138,34 @@ def fused_rope_inplace(
     freqs_real = torch.view_as_real(freqs_cis).flatten(-2).contiguous()
     module = _jit_fused_rope_module()
     module.forward(q, k, freqs_real, positions, inverse)
+
+
+def fused_rope_pack(
+    q: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    positions: torch.Tensor,
+    num_groups: int,
+    inverse: bool = False,
+) -> torch.Tensor:
+    """Apply RoPE while packing [tokens, heads, head_dim] into [tokens, groups, dim].
+
+    This is used by the DSV4 FP8 WO_A path to materialize the contiguous grouped
+    layout required by per-token-group quantization without a separate PyTorch
+    reshape clone.
+    """
+    if _is_hip:
+        raise RuntimeError("fused_rope_pack is only implemented for CUDA")
+
+    assert q.dim() == 3
+    assert q.shape[1] % num_groups == 0
+    packed_dim = q.shape[1] // num_groups * q.shape[2]
+    out = torch.empty(
+        (q.shape[0], num_groups, packed_dim), device=q.device, dtype=q.dtype
+    )
+    freqs_real = torch.view_as_real(freqs_cis).flatten(-2).contiguous()
+    module = _jit_fused_rope_module()
+    module.pack(q, out, freqs_real, positions, inverse)
+    return out
 
 
 def fused_q_norm_rope(

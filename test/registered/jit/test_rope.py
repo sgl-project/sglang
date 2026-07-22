@@ -41,6 +41,24 @@ def create_cos_sin_cache(
     return cache
 
 
+def create_complex_freqs_cis(
+    rotary_dim: int,
+    max_position: int = MAX_SEQ_LEN,
+    base: float = ROPE_BASE,
+) -> torch.Tensor:
+    """Create complex RoPE freqs compatible with DeepSeek V4 fused kernels."""
+    inv_freq = 1.0 / (
+        base
+        ** (
+            torch.arange(0, rotary_dim, 2, dtype=torch.float32, device=DEVICE)
+            / rotary_dim
+        )
+    )
+    t = torch.arange(max_position, dtype=torch.float32, device=DEVICE)
+    freqs = torch.einsum("i,j->ij", t, inv_freq)
+    return torch.polar(torch.ones_like(freqs), freqs)
+
+
 # ---------------------------------------------------------------------------
 # Implementation wrappers
 # ---------------------------------------------------------------------------
@@ -209,6 +227,62 @@ def test_rope_position_dtypes(dtype: torch.dtype) -> None:
     atol = rtol = 1e-2
     triton.testing.assert_close(q_fi, q_jit, atol=atol, rtol=rtol)
     triton.testing.assert_close(k_fi, k_jit, atol=atol, rtol=rtol)
+
+
+@pytest.mark.parametrize(
+    "head_dim",
+    [
+        pytest.param(128, id="vectorized-prefix"),
+        pytest.param(66, id="scalar-prefix"),
+    ],
+)
+@pytest.mark.parametrize("num_groups", [1, 2])
+@pytest.mark.parametrize("position_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("inverse", [False, True])
+def test_dsv4_fused_rope_pack_matches_inplace_materialize(
+    head_dim: int,
+    num_groups: int,
+    position_dtype: torch.dtype,
+    inverse: bool,
+) -> None:
+    """Validate fused DSV4 RoPE packing against the old materialization path."""
+    from sglang.jit_kernel.dsv4 import fused_rope_inplace, fused_rope_pack
+
+    num_tokens = 7
+    local_heads = 8
+    full_heads = 16
+    head_offset = 3
+    rope_dim = 64
+
+    q_base = torch.randn(num_tokens, full_heads, head_dim, device=DEVICE, dtype=DTYPE)
+    q = q_base[:, head_offset : head_offset + local_heads, :]
+    assert not q.is_contiguous()
+    assert q.stride(-1) == 1
+
+    positions = torch.arange(num_tokens, device=DEVICE, dtype=position_dtype) * 3 + 1
+    freqs_cis = create_complex_freqs_cis(rope_dim, max_position=32)
+
+    ref_base = q_base.clone()
+    ref = ref_base[:, head_offset : head_offset + local_heads, :]
+    fused_rope_inplace(
+        ref[..., -rope_dim:],
+        None,
+        freqs_cis,
+        positions=positions,
+        inverse=inverse,
+    )
+    ref = ref.reshape(num_tokens, num_groups, -1)
+
+    out = fused_rope_pack(
+        q,
+        freqs_cis,
+        positions=positions,
+        num_groups=num_groups,
+        inverse=inverse,
+    )
+
+    atol = rtol = 1e-2
+    triton.testing.assert_close(out, ref, atol=atol, rtol=rtol)
 
 
 @pytest.mark.parametrize("batch_size", BS_LIST)

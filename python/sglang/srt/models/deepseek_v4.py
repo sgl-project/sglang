@@ -27,6 +27,7 @@ from sglang.jit_kernel.dsv4 import (
     fused_norm_rope_inplace,
     fused_q_norm_rope,
     fused_rope_inplace,
+    fused_rope_pack,
     sglang_per_token_group_quant_fp8_dsv4_wo_a,
 )
 from sglang.kernels.ops.attention.deepseek_v4_rope import v4_rope_inplace_npu
@@ -1209,24 +1210,32 @@ class MQALayer(MqaAttentionBase):
                     save_kv_cache=save_kv_cache,
                 )
             o = o[:, tp_slice, :]
-        if _is_npu:
-            v4_rope_inplace_npu(
-                o[..., -self.qk_rope_head_dim :],
-                None,
+        if _FP8_WO_A_GEMM and _is_cuda:
+            o = fused_rope_pack(
+                o,
                 self.freqs_cis,
-                positions,
+                positions=positions,
+                num_groups=self.n_local_groups,
                 inverse=True,
             )
         else:
-            fused_rope_inplace(
-                o[..., -self.qk_rope_head_dim :],
-                None,
-                self.freqs_cis,
-                positions=positions,
-                inverse=True,
-            )
-
-        o = o.view(o.shape[0], self.n_local_groups, -1)
+            if _is_npu:
+                v4_rope_inplace_npu(
+                    o[..., -self.qk_rope_head_dim :],
+                    None,
+                    self.freqs_cis,
+                    positions,
+                    inverse=True,
+                )
+            else:
+                fused_rope_inplace(
+                    o[..., -self.qk_rope_head_dim :],
+                    None,
+                    self.freqs_cis,
+                    positions=positions,
+                    inverse=True,
+                )
+            o = o.view(o.shape[0], self.n_local_groups, -1)
 
         if _FP8_WO_A_GEMM:
             import deep_gemm
