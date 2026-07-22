@@ -226,9 +226,15 @@ class MetadataBuffers:
         hidden_size: int,
         hidden_states_dtype: torch.dtype,
         max_top_logprobs_num: int = 128,
+        max_sampling_mask_tokens: Optional[int] = None,
         custom_mem_pool: torch.cuda.MemPool = None,
     ):
         self.custom_mem_pool = custom_mem_pool
+        if max_sampling_mask_tokens is None:
+            max_sampling_mask_tokens = (
+                envs.SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS.get()
+            )
+        self.enable_sampling_mask = max_sampling_mask_tokens > 0
         bootstrap_room_dtype = torch.uint64
         device = "cpu"
         if is_npu():
@@ -266,6 +272,19 @@ class MetadataBuffers:
             self.output_top_logprobs_idx = torch.zeros(
                 (size, max_top_logprobs_num), dtype=torch.int32, device=device
             )
+            self.output_token_sampling_mask_len = None
+            self.output_token_sampling_mask_idx = None
+            self.output_token_sampling_logprobs = None
+            if self.enable_sampling_mask:
+                self.output_token_sampling_mask_len = torch.zeros(
+                    (size, 16), dtype=torch.int32, device=device
+                )
+                self.output_token_sampling_mask_idx = torch.zeros(
+                    (size, max_sampling_mask_tokens), dtype=torch.int32, device=device
+                )
+                self.output_token_sampling_logprobs = torch.zeros(
+                    (size, 16), dtype=torch.float32, device=device
+                )
             # For PD + spec decode
             self.output_topk_p = torch.zeros(
                 (size, 16), dtype=torch.float32, device=device
@@ -282,45 +301,43 @@ class MetadataBuffers:
             )
 
     def get_buf_infos(self):
-        ptrs = [
-            self.output_ids.data_ptr(),
-            self.cached_tokens.data_ptr(),
-            self.output_token_logprobs_val.data_ptr(),
-            self.output_token_logprobs_idx.data_ptr(),
-            self.output_top_logprobs_val.data_ptr(),
-            self.output_top_logprobs_idx.data_ptr(),
-            self.output_topk_p.data_ptr(),
-            self.output_topk_index.data_ptr(),
-            self.output_hidden_states.data_ptr(),
-            self.bootstrap_room.data_ptr(),
+        bufs = [
+            self.output_ids,
+            self.cached_tokens,
+            self.output_token_logprobs_val,
+            self.output_token_logprobs_idx,
+            self.output_top_logprobs_val,
+            self.output_top_logprobs_idx,
         ]
-        data_lens = [
-            self.output_ids.nbytes,
-            self.cached_tokens.nbytes,
-            self.output_token_logprobs_val.nbytes,
-            self.output_token_logprobs_idx.nbytes,
-            self.output_top_logprobs_val.nbytes,
-            self.output_top_logprobs_idx.nbytes,
-            self.output_topk_p.nbytes,
-            self.output_topk_index.nbytes,
-            self.output_hidden_states.nbytes,
-            self.bootstrap_room.nbytes,
-        ]
-        item_lens = [
-            self.output_ids[0].nbytes,
-            self.cached_tokens[0].nbytes,
-            self.output_token_logprobs_val[0].nbytes,
-            self.output_token_logprobs_idx[0].nbytes,
-            self.output_top_logprobs_val[0].nbytes,
-            self.output_top_logprobs_idx[0].nbytes,
-            self.output_topk_p[0].nbytes,
-            self.output_topk_index[0].nbytes,
-            self.output_hidden_states[0].nbytes,
-            self.bootstrap_room[0].nbytes,
-        ]
+        if self.enable_sampling_mask:
+            bufs.extend(
+                [
+                    self.output_token_sampling_mask_len,
+                    self.output_token_sampling_mask_idx,
+                    self.output_token_sampling_logprobs,
+                ]
+            )
+        bufs.extend(
+            [
+                self.output_topk_p,
+                self.output_topk_index,
+                self.output_hidden_states,
+                self.bootstrap_room,
+            ]
+        )
+        ptrs = [buf.data_ptr() for buf in bufs]
+        data_lens = [buf.nbytes for buf in bufs]
+        item_lens = [buf[0].nbytes for buf in bufs]
         return ptrs, data_lens, item_lens
 
     def get_buf(self, idx: int):
+        sampling_mask_len = None
+        sampling_mask_idx = None
+        sampling_logprobs = None
+        if self.enable_sampling_mask:
+            sampling_mask_len = self.output_token_sampling_mask_len[idx].clone()
+            sampling_mask_idx = self.output_token_sampling_mask_idx[idx].clone()
+            sampling_logprobs = self.output_token_sampling_logprobs[idx].clone()
         return (
             self.output_ids[idx].clone(),
             self.cached_tokens[idx].clone(),
@@ -328,6 +345,9 @@ class MetadataBuffers:
             self.output_token_logprobs_idx[idx].clone(),
             self.output_top_logprobs_val[idx].clone(),
             self.output_top_logprobs_idx[idx].clone(),
+            sampling_mask_len,
+            sampling_mask_idx,
+            sampling_logprobs,
             self.output_topk_p[idx].clone(),
             self.output_topk_index[idx].clone(),
             self.output_hidden_states[idx].clone(),
@@ -366,6 +386,14 @@ class MetadataBuffers:
                 )
 
             if req.logprob.output_top_logprobs_val:  # not none or empty list
+                top_logprobs_len = len(req.logprob.output_top_logprobs_val[0])
+                max_top_logprobs_len = self.output_top_logprobs_val.shape[1]
+                if top_logprobs_len > max_top_logprobs_len:
+                    raise RuntimeError(
+                        f"top_logprobs_num {top_logprobs_len} exceeds "
+                        f"disaggregation metadata capacity {max_top_logprobs_len}. "
+                        "Lower top_logprobs_num or increase the metadata buffer."
+                    )
                 self.output_top_logprobs_val[req.metadata_buffer_index][
                     : len(req.logprob.output_top_logprobs_val[0])
                 ] = torch.tensor(
@@ -381,6 +409,44 @@ class MetadataBuffers:
                     dtype=torch.int32,
                     device="cpu",
                 )
+        if req.return_sampling_mask:
+            if not self.enable_sampling_mask:
+                raise RuntimeError(
+                    "return_sampling_mask with disaggregation requires "
+                    "SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS > 0."
+                )
+            # Sentinel -1: the decode side records None for this handoff token.
+            self.output_token_sampling_mask_len[req.metadata_buffer_index][0] = -1
+            sampling_masks = req.output_token_sampling_mask
+            sampling_logprobs = req.output_token_sampling_logprobs
+            if sampling_masks:
+                sampling_mask = sampling_masks[0]
+                sampling_logprob = sampling_logprobs[0] if sampling_logprobs else None
+                if sampling_mask is not None and sampling_logprob is not None:
+                    mask_len = len(sampling_mask)
+                    max_mask_len = self.output_token_sampling_mask_idx.shape[1]
+                    if mask_len > max_mask_len:
+                        raise RuntimeError(
+                            f"Sampling mask length {mask_len} exceeds disaggregation "
+                            f"metadata capacity {max_mask_len}. Increase "
+                            "SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS."
+                        )
+                    self.output_token_sampling_mask_len[req.metadata_buffer_index][
+                        0
+                    ] = mask_len
+                    if mask_len:
+                        self.output_token_sampling_mask_idx[
+                            req.metadata_buffer_index, :mask_len
+                        ].copy_(
+                            torch.tensor(
+                                sampling_mask,
+                                dtype=torch.int32,
+                                device=self.output_token_sampling_mask_idx.device,
+                            )
+                        )
+                    self.output_token_sampling_logprobs[req.metadata_buffer_index][
+                        0
+                    ] = float(sampling_logprob)
         # For PD + spec decode
         if req.hidden_states_tensor is not None:
             # speculative_eagle_topk should not be greater than 16 currently

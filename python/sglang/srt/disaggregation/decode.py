@@ -1517,6 +1517,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             output_token_logprobs_idx,
             output_top_logprobs_val,
             output_top_logprobs_idx,
+            output_token_sampling_mask_len,
+            output_token_sampling_mask_idx,
+            output_token_sampling_logprobs,
             output_topk_p,
             output_topk_index,
             output_hidden_states,
@@ -1613,6 +1616,21 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     : decode_req.req.logprob.top_logprobs_num
                 ].tolist()
             )
+        if decode_req.req.return_sampling_mask:
+            assert (
+                output_token_sampling_mask_idx is not None
+            ), "sampling mask buffer disabled on decode side"
+            sampling_mask_len = int(output_token_sampling_mask_len[0].item())
+            if sampling_mask_len < 0:
+                decode_req.req.output_token_sampling_mask.append(None)
+                decode_req.req.output_token_sampling_logprobs.append(None)
+            else:
+                decode_req.req.output_token_sampling_mask.append(
+                    output_token_sampling_mask_idx[:sampling_mask_len].cpu().tolist()
+                )
+                decode_req.req.output_token_sampling_logprobs.append(
+                    float(output_token_sampling_logprobs[0].item())
+                )
 
         decode_req.kv_receiver.clear()
         decode_req.kv_receiver = None
