@@ -6,7 +6,6 @@ import unittest
 import torch
 
 from sglang.jit_kernel.kv_canary.scatter_req_token_ids import (
-    _SCATTER_BATCH_BLOCK,
     launch_scatter_req_token_ids_kernel,
     scatter_req_token_ids_torch_reference,
 )
@@ -212,6 +211,116 @@ class TestScatterReqTokenIds(CustomTestCase):
             torch.cuda.synchronize()
             self.assertTrue(torch.equal(triton_pool, ref_pool))
 
+    def test_scatter_large_batch_non_uniform(self) -> None:
+        """A large, non-uniform batch (bs=1024, past any per-program batch cap) is byte-equal.
+
+        The (request, column-block) grid scales directly with bs, so there is no
+        upper bound on the number of requests. Segment lengths vary widely and
+        some are empty, so this also fuzzes the offsets handling at scale.
+        """
+        rng = random.Random(1)
+        bs = 1024
+        max_reqs = bs + 1
+        max_context_len = 40
+
+        lens = [rng.randint(0, max_context_len) for _ in range(bs)]
+        rp = rng.sample(range(1, max_reqs), k=bs)
+        seqs = [[rng.randint(0, 1 << 30) for _ in range(n)] for n in lens]
+
+        flat = _build_flat(seqs)
+        offsets = _build_offsets(lens)
+        req_pool_indices = torch.tensor(rp, dtype=torch.int64, device=_DEVICE)
+        triton_pool = _build_pool(max_reqs=max_reqs, max_context_len=max_context_len)
+        ref_pool = _build_pool(max_reqs=max_reqs, max_context_len=max_context_len)
+
+        launch_scatter_req_token_ids_kernel(
+            flat_in=flat,
+            offsets=offsets,
+            req_pool_indices=req_pool_indices,
+            pool_out=triton_pool,
+        )
+        scatter_req_token_ids_torch_reference(
+            flat_in=flat,
+            offsets=offsets,
+            req_pool_indices=req_pool_indices,
+            pool_out=ref_pool,
+        )
+        torch.cuda.synchronize()
+        self.assertTrue(torch.equal(triton_pool, ref_pool))
+
+    def test_scatter_multi_column_block_and_truncation(self) -> None:
+        """Requests longer than one column tile (and than max_context_len) stay byte-equal.
+
+        Mixes a very long request (spanning several column blocks and truncated at
+        max_context_len) with short ones, at randomized non-uniform offsets, so the
+        cblk>0 tiles and the per-request truncation boundary are both exercised.
+        """
+        rng = random.Random(2)
+        max_context_len = 2048  # forces >1 column block (COL_BLOCK=1024)
+        # One request far longer than max_context_len, plus assorted shorter ones.
+        lens = [3000, 0, 1, 1025, 500, 2048, 2049, 7]
+        bs = len(lens)
+        max_reqs = 32
+        rp = rng.sample(range(1, max_reqs), k=bs)
+        seqs = [[rng.randint(0, 1 << 30) for _ in range(n)] for n in lens]
+
+        flat = _build_flat(seqs)
+        offsets = _build_offsets(lens)
+        req_pool_indices = torch.tensor(rp, dtype=torch.int64, device=_DEVICE)
+        triton_pool = _build_pool(max_reqs=max_reqs, max_context_len=max_context_len)
+        ref_pool = _build_pool(max_reqs=max_reqs, max_context_len=max_context_len)
+
+        launch_scatter_req_token_ids_kernel(
+            flat_in=flat,
+            offsets=offsets,
+            req_pool_indices=req_pool_indices,
+            pool_out=triton_pool,
+        )
+        scatter_req_token_ids_torch_reference(
+            flat_in=flat,
+            offsets=offsets,
+            req_pool_indices=req_pool_indices,
+            pool_out=ref_pool,
+        )
+        torch.cuda.synchronize()
+        self.assertTrue(torch.equal(triton_pool, ref_pool))
+
+    def test_scatter_one_long_among_many_short(self) -> None:
+        """A long request among 200 short/empty ones is byte-equal (early-return path).
+
+        The grid uses a batch-wide upper bound, so the short requests receive column
+        tiles past their write_len; those programs must return without writing.
+        """
+        rng = random.Random(3)
+        max_context_len = 4096
+        # One long request (spans multiple COL_BLOCK tiles) among short/empty ones.
+        lens = [3000] + [rng.randint(0, 4) for _ in range(200)]
+        bs = len(lens)
+        max_reqs = bs + 1
+        rp = rng.sample(range(1, max_reqs), k=bs)
+        seqs = [[rng.randint(0, 1 << 30) for _ in range(n)] for n in lens]
+
+        flat = _build_flat(seqs)
+        offsets = _build_offsets(lens)
+        req_pool_indices = torch.tensor(rp, dtype=torch.int64, device=_DEVICE)
+        triton_pool = _build_pool(max_reqs=max_reqs, max_context_len=max_context_len)
+        ref_pool = _build_pool(max_reqs=max_reqs, max_context_len=max_context_len)
+
+        launch_scatter_req_token_ids_kernel(
+            flat_in=flat,
+            offsets=offsets,
+            req_pool_indices=req_pool_indices,
+            pool_out=triton_pool,
+        )
+        scatter_req_token_ids_torch_reference(
+            flat_in=flat,
+            offsets=offsets,
+            req_pool_indices=req_pool_indices,
+            pool_out=ref_pool,
+        )
+        torch.cuda.synchronize()
+        self.assertTrue(torch.equal(triton_pool, ref_pool))
+
 
 class TestScatterInputValidation(CustomTestCase):
     """Cover the strict input checks in launch_scatter_req_token_ids_kernel."""
@@ -259,14 +368,13 @@ class TestScatterInputValidation(CustomTestCase):
                 pool_out=pool,
             )
 
-    def test_raises_on_bs_plus_one_exceeds_batch_block(self) -> None:
-        """bs+1 must fit in _SCATTER_BATCH_BLOCK; exceeding it triggers a ValueError."""
-        bs = _SCATTER_BATCH_BLOCK
-        flat = torch.empty(0, dtype=torch.int64, device=_DEVICE)
-        offsets = torch.zeros(bs + 1, dtype=torch.int64, device=_DEVICE)
-        req_pool_indices = torch.zeros(bs, dtype=torch.int64, device=_DEVICE)
+    def test_raises_on_wrong_dtype_flat_in(self) -> None:
+        """A flat_in with non-int64 dtype triggers a TypeError."""
+        flat = torch.tensor([10, 20], dtype=torch.int32, device=_DEVICE)
+        offsets = torch.tensor([0, 2], dtype=torch.int64, device=_DEVICE)
+        req_pool_indices = torch.tensor([1], dtype=torch.int64, device=_DEVICE)
         pool = _build_pool(max_reqs=4, max_context_len=4)
-        with self.assertRaises(ValueError):
+        with self.assertRaises(TypeError):
             launch_scatter_req_token_ids_kernel(
                 flat_in=flat,
                 offsets=offsets,
