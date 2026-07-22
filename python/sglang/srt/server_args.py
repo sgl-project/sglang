@@ -211,6 +211,7 @@ ATTENTION_BACKEND_CHOICES = [
     "tokenspeed_mla",
     "trtllm_mha",
     "dual_chunk_flash_attn",
+    "hpc_ops",  # HPC-Ops (https://github.com/Tencent/hpc-ops), Hopper+, requires --page-size 64
     # AMD specific
     "aiter",
     "wave",
