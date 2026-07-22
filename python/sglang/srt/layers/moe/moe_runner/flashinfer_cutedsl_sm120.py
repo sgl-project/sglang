@@ -104,7 +104,9 @@ def _run_sm120_b12x(
 
     b12x_moe_fp4 = _load_b12x_moe_fp4()
     if output is None:
-        device_idx = hidden_states.device.index if hidden_states.device.index is not None else 0
+        device_idx = (
+            hidden_states.device.index if hidden_states.device.index is not None else 0
+        )
         output_cache_key = (
             device_idx,
             int(hidden_states.shape[0]),
@@ -144,7 +146,9 @@ def _run_sm120_b12x(
     weight_E = int(quant_info.w13_weight.shape[0])
     n = int(quant_info.w2_weight.shape[2]) * 2
     num_topk = int(topk_ids.shape[1])
-    device_idx = hidden_states.device.index if hidden_states.device.index is not None else 0
+    device_idx = (
+        hidden_states.device.index if hidden_states.device.index is not None else 0
+    )
     cache_key = (
         device_idx,
         m,

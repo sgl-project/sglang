@@ -189,7 +189,9 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             return dataclasses.replace(
                 output,
                 **{
-                    field.name: self._slice_output(getattr(output, field.name), num_tokens)
+                    field.name: self._slice_output(
+                        getattr(output, field.name), num_tokens
+                    )
                     for field in dataclasses.fields(output)
                 },
             )
