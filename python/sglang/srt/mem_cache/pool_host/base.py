@@ -263,8 +263,11 @@ class HostKVCache(abc.ABC):
     @synchronized
     def clear(self):
         # Initialize memory states and tracking structures.
-        from sglang.srt.layers.dcp.comm import get_attention_dcp_world_size, dcp_enabled
-        allocator_size = self.size * get_attention_dcp_world_size() if dcp_enabled() else self.size
+        from sglang.srt.layers.dcp.comm import dcp_enabled, get_attention_dcp_world_size
+
+        allocator_size = (
+            self.size * get_attention_dcp_world_size() if dcp_enabled() else self.size
+        )
         self.mem_state = torch.zeros(
             (allocator_size,), dtype=torch.uint8, device=self.device
         )

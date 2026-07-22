@@ -601,7 +601,6 @@ class HiCacheController:
             self.attn_dcp_rank = 0
             self.attn_dcp_size = 1
 
-
         self.pp_rank = get_parallel().pp_rank
         self.pp_size = get_parallel().pp_size
 
@@ -687,8 +686,11 @@ class HiCacheController:
         """
         if self.attn_dcp_size <= 1:
             return device_indices
-         # Filter indices based on DCP rank and size
-        filtered_indices = device_indices[device_indices % self.attn_dcp_size == self.attn_dcp_rank] // self.attn_dcp_size
+        # Filter indices based on DCP rank and size
+        filtered_indices = (
+            device_indices[device_indices % self.attn_dcp_size == self.attn_dcp_rank]
+            // self.attn_dcp_size
+        )
         return filtered_indices
 
     def write(
@@ -983,7 +985,11 @@ class HiCacheController:
             # Must set the data before increasing the completed tokens.
             # Otherwise this page may be read before being set.
             self.mem_pool_host.set_from_flat_data_page(
-                host_indices[i * self.page_size] // self.attn_dcp_size if self.attn_dcp_size > 1 else host_indices[i * self.page_size],
+                (
+                    host_indices[i * self.page_size] // self.attn_dcp_size
+                    if self.attn_dcp_size > 1
+                    else host_indices[i * self.page_size]
+                ),
                 page_data[i],
             )
             if not operation.increment(self.page_size):
@@ -1132,7 +1138,11 @@ class HiCacheController:
     # todo: deprecate
     def _generic_page_set(self, hash_values, host_indices, extra_info=None) -> bool:
         data = [
-            self.mem_pool_host.get_data_page(host_indices[i * self.page_size] // self.attn_dcp_size if self.attn_dcp_size > 1 else host_indices[i * self.page_size])
+            self.mem_pool_host.get_data_page(
+                host_indices[i * self.page_size] // self.attn_dcp_size
+                if self.attn_dcp_size > 1
+                else host_indices[i * self.page_size]
+            )
             for i in range(len(hash_values))
         ]
         return self.storage_backend.batch_set(hash_values, data)

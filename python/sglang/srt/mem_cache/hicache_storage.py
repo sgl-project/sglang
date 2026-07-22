@@ -387,7 +387,9 @@ class HiCacheFile(HiCacheStorage):
         if attn_cp_size > 1:
             self.config_suffix += f"_cp{attn_cp_rank}_{attn_cp_size}"
         if storage_config.attn_dcp_size > 1:
-            self.config_suffix += f"_dcp{storage_config.attn_dcp_rank}_{storage_config.attn_dcp_size}"
+            self.config_suffix += (
+                f"_dcp{storage_config.attn_dcp_rank}_{storage_config.attn_dcp_size}"
+            )
 
         if not os.path.exists(self.file_path) and tp_rank == 0 and attn_cp_rank == 0:
             os.makedirs(self.file_path)
