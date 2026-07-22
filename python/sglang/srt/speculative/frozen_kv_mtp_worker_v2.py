@@ -42,6 +42,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
+from sglang.srt.runtime_context import get_exec, get_spec
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import EagleDraftWorkerBase
 from sglang.srt.speculative.eagle_utils import (
@@ -223,9 +224,9 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
 
     def _resolve_draft_backend_type(self) -> str:
         return (
-            self.server_args.speculative_draft_attention_backend
-            or self.server_args.decode_attention_backend
-            or self.server_args.attention_backend
+            get_spec().speculative_draft_attention_backend
+            or get_exec().kernel.decode_attention_backend
+            or get_exec().kernel.attention_backend
         )
 
     def _init_draft_attn_backend(self):
@@ -708,7 +709,9 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
             self._draft_worker.draft_attn_backend,
         )
 
-    def forward_batch_generation(self, batch: ScheduleBatch, on_publish=None):
+    def forward_batch_generation(
+        self, batch: ScheduleBatch, on_publish=None, grammar_barrier=None
+    ):
         # Mirrors EAGLEWorkerV2.forward_batch_generation; the only frozen-specific
         # change is the idle draft-input (FrozenKVMTPDraftInput + recurrent hidden
         # size). The draft / seed-based draft-extend hooks are FrozenKVMTPDraftWorker's.
@@ -758,7 +761,7 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
                 verify_input = self.draft_worker.draft(batch)
             assert verify_input.is_verify_input()
             batch.spec_info = verify_input
-            batch_output = self.verify(batch)
+            batch_output = self.verify(batch, grammar_barrier=grammar_barrier)
             # Publish before draft-extend so the fence is at verify-end.
             if on_publish is not None:
                 on_publish(batch_output.new_seq_lens)

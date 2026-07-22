@@ -54,8 +54,7 @@ PTA_URL="https://gitcode.com/Ascend/pytorch/releases/download/v26.0.0-pytorch2.1
 ${PIP_INSTALL} ${PTA_URL}
 
 ### Install zbal
-${UV_PIP_INSTALL} memfabric-zbal==1.1.1
-
+${UV_PIP_INSTALL} memfabric-zbal==1.2.0
 ### Install Triton-Ascend
 ${PIP_INSTALL} triton-ascend==3.2.1.dev20260530 --extra-index-url=https://mirrors.huaweicloud.com/ascend/repos/pypi/nightly --trusted-host triton-ascend.osinfra.cn
 

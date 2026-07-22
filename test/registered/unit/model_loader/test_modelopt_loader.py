@@ -456,6 +456,7 @@ class TestParseQuantHfConfig(CustomTestCase):
         ({"quant_method": "modelopt", "quant_algo": "FP8"}, "modelopt_fp8"),
         ({"quant_method": "modelopt", "quant_algo": "FP4"}, "modelopt_fp4"),
         ({"quant_method": "modelopt", "quant_algo": "NVFP4"}, "modelopt_fp4"),
+        ({"quant_algo": "NVFP4_AWQ"}, "modelopt_fp4"),
         ({"quant_method": "modelopt", "quant_algo": "MIXED_PRECISION"}, "w4afp8"),
         ({"quant_algo": "FP8"}, "modelopt_fp8"),
         ({"quant_algo": "FP4"}, "modelopt_fp4"),
@@ -492,6 +493,18 @@ class TestParseQuantHfConfig(CustomTestCase):
                 self.model_config.hf_config.quantization_config = dict(quant_cfg_input)
                 result = self.model_config._parse_quant_hf_config()
                 self.assertEqual(result["quant_method"], expected)
+
+    def test_awq_flat_config_defaults_group_size(self):
+        """NVFP4_AWQ flat config.json omits group_size; from_config must default it to 16."""
+        cfg = ModelOptFp4Config.from_config(
+            {
+                "quant_algo": "NVFP4_AWQ",
+                "ignore": ["lm_head"],
+                "quant_method": "modelopt",
+            }
+        )
+        self.assertEqual(cfg.group_size, 16)
+        self.assertTrue(cfg.is_awq)
 
     def test_non_modelopt_quant_method_unchanged(self):
         """Non-modelopt quant_method (e.g. 'gptq') must NOT enter the modelopt path."""
