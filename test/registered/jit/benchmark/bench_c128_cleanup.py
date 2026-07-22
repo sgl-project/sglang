@@ -8,7 +8,7 @@ import torch
 
 from sglang.jit_kernel.benchmark import marker
 from sglang.jit_kernel.benchmark.utils import DEFAULT_DEVICE, create_empty
-from sglang.jit_kernel.dsv4 import (
+from sglang.kernels.ops.attention.dsv4 import (
     C128DraftCleanup,
     clear_unaccepted_c128_draft_states,
 )

@@ -162,7 +162,7 @@ if _use_aiter:
 if _is_cuda:
     from sgl_kernel import fp8_scaled_mm
 
-    from sglang.jit_kernel.fp8_blockwise_gemm import fp8_blockwise_scaled_mm
+    from sglang.kernels.ops.gemm.fp8_blockwise_gemm import fp8_blockwise_scaled_mm
     from sglang.srt.utils.patch_torch import register_fake_if_exists
 
     @register_fake_if_exists("sgl_kernel::fp8_scaled_mm")

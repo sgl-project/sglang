@@ -8,7 +8,7 @@ import weakref
 
 import torch
 
-from sglang.jit_kernel.dsv4 import (
+from sglang.kernels.ops.attention.dsv4 import (
     C128DraftCleanup,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
