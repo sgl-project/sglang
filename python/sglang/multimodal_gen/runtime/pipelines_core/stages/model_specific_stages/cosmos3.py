@@ -83,7 +83,8 @@ COSMOS3_I2V_FLOW_SHIFT = 10.0
 COSMOS3_T2V_FLOW_SHIFT = 10.0
 COSMOS3_V2V_FLOW_SHIFT = 10.0
 COSMOS3_ACTION_FLOW_SHIFT = 10.0
-COSMOS3_EDGE_T2V_FLOW_SHIFT = 3.0
+# Edge uses a single low flow-shift for every video mode (t2v/i2v/v2v).
+COSMOS3_EDGE_VIDEO_FLOW_SHIFT = 3.0
 
 
 def _resize_crop_pil(
@@ -691,11 +692,13 @@ class Cosmos3TimestepPreparationStage(PipelineStage):
             return COSMOS3_ACTION_FLOW_SHIFT
         if batch.data_type == DataType.IMAGE:
             return COSMOS3_T2I_FLOW_SHIFT
+        if is_edge:
+            return COSMOS3_EDGE_VIDEO_FLOW_SHIFT
         if batch.preprocessed_image is not None:
             return COSMOS3_I2V_FLOW_SHIFT
         if batch.preprocessed_video is not None:
             return COSMOS3_V2V_FLOW_SHIFT
-        return COSMOS3_EDGE_T2V_FLOW_SHIFT if is_edge else COSMOS3_T2V_FLOW_SHIFT
+        return COSMOS3_T2V_FLOW_SHIFT
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         """Prepare scheduler timesteps."""

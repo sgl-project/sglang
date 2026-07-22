@@ -12,7 +12,10 @@ from sglang.multimodal_gen.configs.models.dits.cosmos3video import (
     _build_cosmos3_param_names_mapping,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import Cosmos3Config
-from sglang.multimodal_gen.configs.sample.cosmos3 import Cosmos3SamplingParams
+from sglang.multimodal_gen.configs.sample.cosmos3 import (
+    COSMOS3_EDGE_SUPPORTED_RESOLUTIONS,
+    Cosmos3SamplingParams,
+)
 from sglang.multimodal_gen.configs.sample.sampling_params import DataType
 from sglang.multimodal_gen.registry import (
     _PIPELINE_REGISTRY,
@@ -347,9 +350,9 @@ class TestCosmos3SchedulerConfig(unittest.TestCase):
             10.0,
         )
 
-    def test_edge_t2v_flow_shift_default(self):
+    def test_edge_flow_shift_default(self):
         stage = self._stage()
-        # Edge lowers only the T2V default; T2I and conditioned modes are unchanged.
+        # Edge uses 3.0 for T2I and every video mode (T2V/I2V/V2V); action stays high.
         self.assertEqual(
             stage._default_flow_shift_for_mode(self._batch(), is_edge=True), 3.0
         )
@@ -358,6 +361,24 @@ class TestCosmos3SchedulerConfig(unittest.TestCase):
                 self._batch(data_type=DataType.IMAGE), is_edge=True
             ),
             3.0,
+        )
+        self.assertEqual(
+            stage._default_flow_shift_for_mode(
+                self._batch(preprocessed_image=torch.empty(1)), is_edge=True
+            ),
+            3.0,
+        )
+        self.assertEqual(
+            stage._default_flow_shift_for_mode(
+                self._batch(preprocessed_video=torch.empty(1)), is_edge=True
+            ),
+            3.0,
+        )
+        self.assertEqual(
+            stage._default_flow_shift_for_mode(
+                self._batch(sp_kwargs={"action_mode": "policy"}), is_edge=True
+            ),
+            10.0,
         )
 
 
@@ -374,7 +395,15 @@ class TestCosmos3EdgeSamplingDefaults(unittest.TestCase):
         sp = Cosmos3SamplingParams(prompt="t", num_frames=1)
         sp._resolve_variant_defaults(is_edge=True)
         self.assertEqual((sp.width, sp.height), (640, 640))
-        self.assertEqual(sp.guidance_scale, 4.0)
+        self.assertEqual(sp.guidance_scale, 7.0)
+
+    def test_edge_restricts_supported_resolutions(self):
+        sp = Cosmos3SamplingParams(prompt="t", num_frames=1)
+        sp._resolve_variant_defaults(is_edge=True)
+        self.assertEqual(sp.supported_resolutions, COSMOS3_EDGE_SUPPORTED_RESOLUTIONS)
+        # Base high-res sizes are excluded so they trip the "unsupported" warning.
+        self.assertNotIn((1280, 720), sp.supported_resolutions)
+        self.assertNotIn((1024, 1024), sp.supported_resolutions)
 
     def test_non_edge_defers_resolution_to_base(self):
         sp = Cosmos3SamplingParams(prompt="t", num_frames=81)
