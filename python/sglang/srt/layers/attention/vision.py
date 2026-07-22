@@ -46,11 +46,11 @@ _is_xpu = is_xpu()
 if _is_cuda:
     from flashinfer.prefill import cudnn_batch_prefill_with_kv_cache
 
-    from sglang.jit_kernel.flash_attention import flash_attn_varlen_func
+    from sglang.kernels.ops.attention.flash_attention import flash_attn_varlen_func
 
     def flash_attn_func(*args, ver: int = 3, **kwargs):
         if ver == 4:
-            from sglang.jit_kernel.flash_attention_v4 import (
+            from sglang.kernels.ops.attention.flash_attention_v4 import (
                 flash_attn_varlen_func as flash_attn_varlen_func_fa4,
             )
 
@@ -85,6 +85,7 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.layers.rotary_embedding import apply_rotary_pos_emb
+from sglang.srt.layers.rotary_embedding.utils import apply_rotary_pos_emb_native_eager
 from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import add_prefix
 
@@ -203,11 +204,15 @@ def resolve_seqlens(
     return resolved_seqlens
 
 
-def resolve_max_seqlen(source, cu_seqlens: torch.Tensor) -> int:
-    """Return max segment length, caching it on a stable carrier so the
-    device->host sync (.item()) happens once per forward instead of once per layer.
+def resolve_max_seqlen(
+    source: torch.Tensor | SingletonCache | None, cu_seqlens: torch.Tensor
+) -> int:
+    """Return the maximum segment length, caching only on ``SingletonCache``.
+
+    Raw tensors have no mutable instance dictionary, so caching on them would
+    raise ``AttributeError``. They use the same calculation without a cache.
     """
-    if isinstance(source, SingletonCache) or isinstance(source, torch.Tensor):
+    if isinstance(source, SingletonCache):
         cached = getattr(source, "_max_seqlen", None)
         if cached is None:
             seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
@@ -798,11 +803,11 @@ class VisionAscendAttention(nn.Module):
              [b * s, h, head_size]
         """
         if forward_metadata is not None:
-            seq_lens = forward_metadata.seq_lens
-            if seq_lens.is_npu:
-                seq_lens = seq_lens.to("cpu")
+            # TND fused attention expects cumulative seqlens (cu_seqlens[1:]),
+            # not per-sequence lengths in forward_metadata.seq_lens.
+            cu = forward_metadata.cu_seqlens.to("cpu")
             output = torch.empty_like(q)
-            seq_len_arg = seq_lens.to(torch.int32)
+            seq_len_arg = cu[1:].to(torch.int32)
         elif envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get():
             if "output_ws" not in kwargs:
                 raise RuntimeError("output_ws should be prepared for npu-graph mode")
@@ -1331,7 +1336,18 @@ class VisionAttention(nn.Module):
                 cos = torch.cat([cos, cos], dim=-1)
                 sin = torch.cat([sin, sin], dim=-1)
 
-            q, k = apply_rotary_pos_emb(q, k, cos, sin)
+            # `apply_rotary_pos_emb` is torch.compile-decorated. Its first
+            # specialization may otherwise be compiled while a ViT CUDA graph
+            # is being captured, which makes Inductor attempt an illegal
+            # CPU-to-CUDA copy. The eager version is captured as part of the
+            # graph, so its pointwise work is still replayed without launch
+            # overhead.
+            rotary_fn = (
+                apply_rotary_pos_emb_native_eager
+                if envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get()
+                else apply_rotary_pos_emb
+            )
+            q, k = rotary_fn(q, k, cos, sin)
             q = q.view(original_q_shape)
             k = k.view(original_k_shape)
 
