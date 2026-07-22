@@ -32,6 +32,7 @@ from sglang.srt.layers.moe.token_dispatcher import (
     NixlEPDispatcher,
 )
 from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
+from sglang.srt.layers.utils.common import PPMissingLayer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
@@ -872,6 +873,7 @@ def model_forward_maybe_tbo(
     input_data_scatter_mode: ScatterMode,
     residual: Optional[torch.Tensor],
     zero_allocator: Optional[BumpAllocator] = None,
+    input_deepstack_embeds: Optional[torch.Tensor] = None,
 ):
     inputs = dict(
         positions=positions,
@@ -880,9 +882,17 @@ def model_forward_maybe_tbo(
         residual=residual,
         zero_allocator=zero_allocator,
     )
-    layer_input_scatter_mode = layers[0].layer_scatter_modes.layer_input_mode
+    if input_deepstack_embeds is not None:
+        inputs["input_deepstack_embeds"] = input_deepstack_embeds
+    # Filter out PPMissingLayer for Pipeline Parallelism
+    real_layers = [layer for layer in layers if not isinstance(layer, PPMissingLayer)]
+    if len(real_layers) == 0:
+        # All layers are PPMissingLayer, just return inputs
+        return hidden_states, residual
+
+    layer_input_scatter_mode = real_layers[0].layer_scatter_modes.layer_input_mode
     operations_strategy = OperationsStrategy.init_new_tbo(
-        layers, forward_batch.global_forward_mode
+        real_layers, forward_batch.global_forward_mode
     )
     if enable_tbo:
         return _model_forward_tbo(
@@ -940,6 +950,7 @@ def _model_forward_tbo_split_inputs(
     zero_allocator: Optional[BumpAllocator],
     input_data_scatter_mode: ScatterMode,
     layer_input_scatter_mode: ScatterMode,
+    input_deepstack_embeds: Optional[torch.Tensor] = None,
 ) -> List[Dict]:
     tbo_splitter_scatter_mode = ScatterMode.TP_ATTN_FULL
     context = CommunicateContext.init_new()
@@ -960,6 +971,7 @@ def _model_forward_tbo_split_inputs(
         positions=positions,
         forward_batch=forward_batch,
         zero_allocator=zero_allocator,
+        input_deepstack_embeds=input_deepstack_embeds,
     )
 
     def _post_transform(hidden_states, residual, forward_batch, **kwargs):
@@ -988,6 +1000,7 @@ def _model_forward_tbo_split_inputs_raw(
     positions: torch.Tensor,
     forward_batch: ForwardBatch,
     zero_allocator: Optional[BumpAllocator],
+    input_deepstack_embeds: Optional[torch.Tensor] = None,
 ) -> List[Dict]:
     return [
         dict(
@@ -997,6 +1010,7 @@ def _model_forward_tbo_split_inputs_raw(
                 positions=positions,
                 output_forward_batch=output_forward_batch,
                 tbo_subbatch_index=tbo_subbatch_index,
+                input_deepstack_embeds=input_deepstack_embeds,
             ),
             **(
                 dict(zero_allocator=zero_allocator)
@@ -1016,11 +1030,14 @@ def _model_forward_filter_inputs(
     positions: torch.Tensor,
     output_forward_batch: ForwardBatch,
     tbo_subbatch_index: int,
+    input_deepstack_embeds: Optional[torch.Tensor] = None,
 ) -> Dict:
     token_slice = slice(*output_forward_batch.tbo_parent_token_range)
     hidden_states = hidden_states[token_slice]
     residual = None if residual is None else residual[token_slice]
-    positions = positions[token_slice]
+    positions = None if positions is None else positions[token_slice]
+    if input_deepstack_embeds is not None:
+        input_deepstack_embeds = input_deepstack_embeds[token_slice]
 
     assert output_forward_batch.tbo_padded_len is not None
     padded_len = output_forward_batch.tbo_padded_len
@@ -1035,13 +1052,16 @@ def _model_forward_filter_inputs(
         res[: x.shape[0]] = x
         return res
 
-    return dict(
+    result = dict(
         hidden_states=_pad(hidden_states),
         residual=_pad(residual),
         positions=_pad(positions),
         forward_batch=output_forward_batch,
         tbo_subbatch_index=tbo_subbatch_index,
     )
+    if input_deepstack_embeds is not None:
+        result["input_deepstack_embeds"] = _pad(input_deepstack_embeds)
+    return result
 
 
 def _model_forward_tbo_merge_outputs(output_a, output_b, original_len):
