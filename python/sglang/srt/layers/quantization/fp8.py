@@ -2002,6 +2002,42 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             if _is_hip:
                 self.process_weights_hip_scale_padding(layer)
 
+            # On Blackwell (DEEPGEMM_SCALE_UE8M0), DeepGEMM requires weight scales in
+            # UE8M0 packed format. Per-tensor FP8 stores a single float32 scale per
+            # expert, which DeepGEMM misinterprets as UE8M0 on Blackwell.
+            # Convert to per-block UE8M0 format at load time.
+            from sglang.srt.layers import deep_gemm_wrapper
+
+            if (
+                not _is_hip
+                and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+                and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+                and self.is_deepgemm_moe_runner_backend_enabled()
+            ):
+                from sglang.srt.layers.quantization.fp8_utils import (
+                    quant_weight_ue8m0,
+                    transform_scale_ue8m0,
+                )
+
+                weight_block_size = [128, 128]
+                for w_param, s_param_name in [
+                    (layer.w13_weight, "w13_weight_scale"),
+                    (layer.w2_weight, "w2_weight_scale"),
+                ]:
+                    w = w_param.data  # (E, N, K) fp8
+                    s = getattr(layer, s_param_name).data  # (E,) float32 per-tensor
+                    num_experts = w.shape[0]
+                    # Dequantize per-tensor fp8 → bf16, requantize to per-block UE8M0
+                    w_bf16 = torch.empty_like(w, dtype=torch.bfloat16)
+                    for e in range(num_experts):
+                        w_bf16[e] = w[e].to(torch.bfloat16) * s[e]
+                    new_w, new_s = quant_weight_ue8m0(w_bf16, weight_block_size)
+                    new_s = transform_scale_ue8m0(new_s, mn=new_w.shape[-2])
+                    w_param.data = new_w
+                    scale_inv_param = torch.nn.Parameter(new_s, requires_grad=False)
+                    scale_inv_param.format_ue8m0 = True
+                    setattr(layer, s_param_name + "_inv", scale_inv_param)
+
         # If checkpoint is fp8, we need to handle that the
         # MoE kernels require single activation scale and single weight
         # scale for w13 per expert.
@@ -2094,6 +2130,42 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 )
 
                 align_fp8_moe_weights_for_flashinfer_trtllm(layer)
+
+            # On Blackwell (DEEPGEMM_SCALE_UE8M0), DeepGEMM requires weight scales in
+            # UE8M0 packed format. Per-tensor FP8 stores a single float32 scale per
+            # expert, which DeepGEMM misinterprets as UE8M0 on Blackwell.
+            # Convert to per-block UE8M0 format at load time.
+            from sglang.srt.layers import deep_gemm_wrapper
+
+            if (
+                not _is_hip
+                and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+                and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+                and self.is_deepgemm_moe_runner_backend_enabled()
+            ):
+                from sglang.srt.layers.quantization.fp8_utils import (
+                    quant_weight_ue8m0,
+                    transform_scale_ue8m0,
+                )
+
+                weight_block_size = [128, 128]
+                for w_param, s_param_name in [
+                    (layer.w13_weight, "w13_weight_scale"),
+                    (layer.w2_weight, "w2_weight_scale"),
+                ]:
+                    w = w_param.data  # (E, N, K) fp8
+                    s = getattr(layer, s_param_name).data  # (E,) float32 per-tensor
+                    num_experts = w.shape[0]
+                    # Dequantize per-tensor fp8 → bf16, requantize to per-block UE8M0
+                    w_bf16 = torch.empty_like(w, dtype=torch.bfloat16)
+                    for e in range(num_experts):
+                        w_bf16[e] = w[e].to(torch.bfloat16) * s[e]
+                    new_w, new_s = quant_weight_ue8m0(w_bf16, weight_block_size)
+                    new_s = transform_scale_ue8m0(new_s, mn=new_w.shape[-2])
+                    w_param.data = new_w
+                    scale_inv_param = torch.nn.Parameter(new_s, requires_grad=False)
+                    scale_inv_param.format_ue8m0 = True
+                    setattr(layer, s_param_name + "_inv", scale_inv_param)
 
         if hasattr(layer, "dispatcher"):
             layer.dispatcher.set_quant_config({"weight_dtype": layer.w13_weight.dtype})
@@ -2357,6 +2429,14 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
             if self.block_quant:
                 block_shape = self.quant_config.weight_block_size
+                w13_scale = layer.w13_weight_scale_inv
+                w2_scale = layer.w2_weight_scale_inv
+            elif hasattr(layer, "w13_weight_scale_inv") and getattr(
+                layer.w13_weight_scale_inv, "format_ue8m0", False
+            ):
+                # Per-tensor FP8 on Blackwell: weights were already requantized to
+                # per-block UE8M0 format during process_weights_after_loading.
+                block_shape = [128, 128]
                 w13_scale = layer.w13_weight_scale_inv
                 w2_scale = layer.w2_weight_scale_inv
             else:
