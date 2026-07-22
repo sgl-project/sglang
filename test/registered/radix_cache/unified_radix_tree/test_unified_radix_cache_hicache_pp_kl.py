@@ -1,6 +1,11 @@
+import os
+import shutil
+import tempfile
 import unittest
 from types import SimpleNamespace
 from urllib.parse import urlparse
+
+from test_unified_radix_cache_kl_nightly import AccuracyTwoPassMixin
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -101,6 +106,60 @@ class TestUnifiedQwen3HiCachePP(UnifiedRadixTreeTestMixin, CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
+
+
+class TestUnifiedQwen3HiCachePPL3(AccuracyTwoPassMixin, CustomTestCase):
+    """Qwen3-32B + HiCache L3 (file backend) + PP + UnifiedRadixCache."""
+
+    gsm8k_threshold = 0.8
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = QWEN3_32B_MODEL
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.hicache_dir = tempfile.mkdtemp(prefix="hicache_l3_pp_")
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--trust-remote-code",
+                "--tp-size",
+                "2",
+                "--pp-size",
+                "2",
+                "--mem-fraction-static",
+                "0.8",
+                "--cuda-graph-max-bs",
+                "32",
+                "--max-total-tokens",
+                "14000",
+                "--disable-piecewise-cuda-graph",
+                "--model-loader-extra-config",
+                '{"enable_multithread_load": true, "num_threads": 64}',
+                "--enable-hierarchical-cache",
+                "--hicache-write-policy",
+                "write_through",
+                "--hicache-storage-prefetch-policy",
+                "wait_complete",
+                "--hicache-io-backend",
+                "direct",
+                "--hicache-mem-layout",
+                "page_first_direct",
+                "--hicache-storage-backend",
+                "file",
+            ],
+            env={
+                "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1",
+                "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": cls.hicache_dir,
+            },
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+        if os.path.isdir(cls.hicache_dir):
+            shutil.rmtree(cls.hicache_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":
