@@ -38,7 +38,10 @@ class MistralDetector(BaseFormatDetector):
         self.bot_token = "[TOOL_CALLS] ["
         # Common marker shared by both JSON-array and compact formats.
         self._tool_calls_marker = "[TOOL_CALLS"
-        self.eot_token = "]"
+        # Intentionally leave eot_token as the base default (""). Mistral's
+        # tool-call array closes with "]", but that is a bare ASCII bracket that
+        # also appears constantly in ordinary prose, so it must never be used as
+        # a token to strip from flushed normal text (see parse_streaming_increment).
         self.tool_call_separator = ", "
 
     def has_tool_call(self, text: str) -> bool:
@@ -130,8 +133,10 @@ class MistralDetector(BaseFormatDetector):
             if not self._ends_with_partial_token(self._buffer, self._tool_calls_marker):
                 normal_text = self._buffer
                 self._buffer = ""
-                if self.eot_token in normal_text:
-                    normal_text = normal_text.replace(self.eot_token, "")
+                # This branch only runs when the buffer has no `[TOOL_CALLS`
+                # marker, so every character is genuine assistant prose. Flush it
+                # verbatim; do not strip "]" (see the eot_token note in __init__).
+                # The non-streaming detect_and_parse path likewise never strips.
                 return StreamingParseResult(normal_text=normal_text)
             return StreamingParseResult()
 
