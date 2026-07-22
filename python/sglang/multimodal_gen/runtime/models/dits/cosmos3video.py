@@ -494,6 +494,8 @@ class Cosmos3CausalAttention(nn.Module):
         num_key_value_heads: int,
         head_dim: int,
         qk_norm: bool = True,
+        use_k_norm_und_for_gen: bool = False,
+        rms_norm_eps: float = 1e-6,
         prefix: str = "",
         quant_config: QuantizationConfig | None = None,
     ):
@@ -541,6 +543,12 @@ class Cosmos3CausalAttention(nn.Module):
             self.norm_q = RMSNorm(head_dim, eps=1e-6)
             self.norm_k = RMSNorm(head_dim, eps=1e-6)
 
+        # Dense-backbone variants normalize the keys handed to the GEN
+        # cross-attention separately from the reasoner self-attention keys.
+        self.k_norm_und_for_gen = (
+            RMSNorm(head_dim, eps=rms_norm_eps) if use_k_norm_und_for_gen else None
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -576,6 +584,7 @@ class Cosmos3CausalAttention(nn.Module):
             :,
         ]
 
+        k_und = k
         if self.qk_norm:
             q = F.rms_norm(
                 q, (self.head_dim,), self.norm_q.weight, self.norm_q.variance_epsilon
@@ -584,6 +593,17 @@ class Cosmos3CausalAttention(nn.Module):
                 k, (self.head_dim,), self.norm_k.weight, self.norm_k.variance_epsilon
             )
         q, k = _apply_qwen3_rope_from_cache(q, k, cos_sin_cache)
+
+        if self.k_norm_und_for_gen is not None:
+            k_gen = F.rms_norm(
+                k_und,
+                (self.head_dim,),
+                self.k_norm_und_for_gen.weight,
+                self.k_norm_und_for_gen.variance_epsilon,
+            )
+            _, k_gen = _apply_qwen3_rope_from_cache(q, k_gen, cos_sin_cache)
+        else:
+            k_gen = k
 
         out = F.scaled_dot_product_attention(
             q.transpose(1, 2),
@@ -595,7 +615,7 @@ class Cosmos3CausalAttention(nn.Module):
         out = out.transpose(1, 2).reshape(batch_size, seq_len, -1)
 
         out, _ = self.to_out(out)
-        return out, k, v
+        return out, k_gen, v
 
 
 # -----------------------------------------------------------------------------
@@ -750,6 +770,7 @@ class Cosmos3UndDecoderLayer(nn.Module):
         rms_norm_eps: float,
         hidden_act: str,
         qk_norm: bool,
+        use_k_norm_und_for_gen: bool,
         layer_idx: int,
         prefix: str = "",
         quant_config: QuantizationConfig | None = None,
@@ -763,6 +784,8 @@ class Cosmos3UndDecoderLayer(nn.Module):
             num_key_value_heads=num_key_value_heads,
             head_dim=head_dim,
             qk_norm=qk_norm,
+            use_k_norm_und_for_gen=use_k_norm_und_for_gen,
+            rms_norm_eps=rms_norm_eps,
             prefix=add_prefix("self_attn", prefix),
             quant_config=quant_config,
         )
@@ -903,6 +926,7 @@ class Cosmos3LanguageModel(nn.Module):
         mrope_section: tuple[int, int, int],
         hidden_act: str,
         qk_norm: bool,
+        use_k_norm_und_for_gen: bool,
         quant_config: QuantizationConfig | None = None,
     ):
         super().__init__()
@@ -930,6 +954,7 @@ class Cosmos3LanguageModel(nn.Module):
                     rms_norm_eps=rms_norm_eps,
                     hidden_act=hidden_act,
                     qk_norm=qk_norm,
+                    use_k_norm_und_for_gen=use_k_norm_und_for_gen,
                     layer_idx=i,
                     prefix=f"layers.{i}",
                     quant_config=quant_config,
@@ -1051,6 +1076,7 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
             mrope_section=arch.mrope_section,
             hidden_act=arch.hidden_act,
             qk_norm=arch.qk_norm_for_text,
+            use_k_norm_und_for_gen=arch.use_und_k_norm_for_gen,
             quant_config=quant_config,
         )
 

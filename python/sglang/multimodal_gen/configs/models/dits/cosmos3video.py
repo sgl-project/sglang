@@ -153,6 +153,8 @@ class Cosmos3VideoArchConfig(DiTArchConfig):
     hidden_act: str = "silu"
     # Per-head QK-norm on the UND self-attention (text) pathway.
     qk_norm_for_text: bool = True
+    # Normalize the UND keys before they feed the GEN cross-attention.
+    use_und_k_norm_for_gen: bool = False
 
     # Latent space configuration
     latent_patch_size: int = 2
