@@ -959,8 +959,9 @@ class ServerArgs:
             help="Communication backend for the decode context-parallel (DCP) "
             "attention reduction: 'ag_rs' (AllGather + ReduceScatter), 'a2a' "
             "(fused NCCL All-to-All exchange of output+LSE + local Triton LSE "
-            "combine), or 'fi_a2a' (FlashInfer MNNVL All-to-All kernel; requires "
-            "SM90+ and MNNVL fabric memory, e.g. GB200 NVL72).",
+            "combine), or 'fi_a2a' (FlashInfer MNNVL All-to-All kernel; SM90+ "
+            "with either MNNVL fabric memory (GB200/GB300 NVL72) or a single-node "
+            "NVLink domain via the POSIX-FD path, which needs CAP_SYS_PTRACE).",
             choices=["ag_rs", "a2a", "fi_a2a"],
         ),
     ] = "ag_rs"

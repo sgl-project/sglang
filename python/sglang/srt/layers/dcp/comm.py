@@ -405,11 +405,23 @@ def init_fi_a2a_workspace(cp_group: "GroupCoordinator") -> None:
         TorchDistributedCommBackend,
     )
 
-    if not is_mnnvl_fabric_supported(torch.cuda.current_device()):
+    # fi_a2a has two transports, both handled by FlashInfer's MnnvlMemory:
+    #   * aarch64 NVL72 (GB200/GB300): CU_MEM_HANDLE_TYPE_FABRIC — needs an
+    #     initialized NVLink fabric cluster (is_mnnvl_fabric_supported() True).
+    #   * x86 Blackwell (B200/B300): CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR —
+    #     single-node NVLink P2P, no fabric cluster (is_mnnvl_fabric_supported()
+    #     False). Available on SM90+ (the LL128 kernel floor).
+    # So don't require the fabric cluster unconditionally: gate the fabric probe
+    # to the fabric path, and allow the POSIX-FD path on SM90+.
+    dev = torch.cuda.current_device()
+    fabric_ok = is_mnnvl_fabric_supported(dev)
+    sm_major, sm_minor = torch.cuda.get_device_capability(dev)
+    if not fabric_ok and (sm_major, sm_minor) < (9, 0):
         raise RuntimeError(
-            "--dcp-comm-backend fi_a2a requires MNNVL fabric memory (e.g. "
-            "GB200 NVL72); is_mnnvl_fabric_supported() returned False. Use "
-            "--dcp-comm-backend a2a or ag_rs on clusters without MNNVL."
+            "--dcp-comm-backend fi_a2a requires MNNVL fabric memory (GB200/GB300 "
+            "NVL72) or an SM90+ single-node NVLink domain (POSIX-FD path); got "
+            f"compute capability {sm_major}.{sm_minor} with no fabric. Use "
+            "--dcp-comm-backend a2a or ag_rs."
         )
 
     cp_size = cp_group.world_size
@@ -422,13 +434,30 @@ def init_fi_a2a_workspace(cp_group: "GroupCoordinator") -> None:
         tp_size=1,
         pp_size=1,
     )
-    workspace = decode_cp_a2a_allocate_mnnvl_workspace(
-        mapping,
-        mnnvl_config=MnnvlConfig(
-            comm_backend=TorchDistributedCommBackend(cp_group.device_group)
-        ),
-    )
-    decode_cp_a2a_init_workspace(workspace, cp_rank, cp_size)
+    try:
+        workspace = decode_cp_a2a_allocate_mnnvl_workspace(
+            mapping,
+            mnnvl_config=MnnvlConfig(
+                comm_backend=TorchDistributedCommBackend(cp_group.device_group)
+            ),
+        )
+        decode_cp_a2a_init_workspace(workspace, cp_rank, cp_size)
+    except Exception as e:
+        # The POSIX-FD (non-fabric, single-node) path imports peer ranks' file
+        # descriptors via pidfd_getfd, which needs PTRACE_MODE_ATTACH — blocked
+        # by default container caps + kernel.yama.ptrace_scope=1 (fails EPERM,
+        # "Operation not permitted"). Surface an actionable message instead of a
+        # raw errno from deep in graph init.
+        if not fabric_ok:
+            raise RuntimeError(
+                "fi_a2a single-node workspace init failed. FlashInfer's MNNVL "
+                "POSIX-FD exchange imports peer ranks' file descriptors via "
+                "pidfd_getfd, which requires CAP_SYS_PTRACE (or "
+                "kernel.yama.ptrace_scope=0). Launch the container with "
+                "--cap-add=SYS_PTRACE, or use --dcp-comm-backend a2a. "
+                f"Original error: {e!r}"
+            ) from e
+        raise
     # REQUIRED barrier before the first alltoall: every rank must finish init,
     # else a rank writes a peer's FIFO before it is ready -> deadlock.
     dist.barrier(group=cp_group.device_group)
