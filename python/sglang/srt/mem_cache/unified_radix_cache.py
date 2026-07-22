@@ -49,6 +49,7 @@ from sglang.srt.mem_cache.unified_cache_components import (
     FullComponent,
     LRURefreshPhase,
     MambaComponent,
+    SessionUnifiedRadixCacheMixin,
     SWAComponent,
     TreeComponent,
     get_and_increase_time_counter,
@@ -304,7 +305,9 @@ class _OngoingPrefetch(NamedTuple):
     comp_xfers: dict[ComponentType, list[PoolTransfer]]
 
 
-class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
+class UnifiedRadixCache(
+    SessionUnifiedRadixCacheMixin, KVCacheEventMixin, BasePrefixCache
+):
     def __init__(
         self,
         params: CacheInitParams,
@@ -316,6 +319,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.enable_kv_cache_events = params.enable_kv_cache_events
         self.kv_event_queue = []
         self.eviction_policy = params.eviction_policy.lower()
+        self.enable_session_radix_cache = params.enable_session_radix_cache
         self.eviction_strategy = get_eviction_strategy(self.eviction_policy)
 
         if self.token_to_kv_pool_allocator:
@@ -496,6 +500,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             best_match_node=self.root_node,
         )
         self._record_all_cleared_event()
+        self._reset_session_radix_state()
 
     def init_hicache(self, server_args: ServerArgs, params: CacheInitParams) -> None:
         """Initialize HiCache infrastructure."""
@@ -779,6 +784,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             DecLockRefParams(swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None)),
             skip_swa=getattr(req, "swa_prefix_lock_released", False),
         )
+
+        if is_insert and result is not None and result.last_device_node is not None:
+            req.last_node = result.last_device_node
 
         # cleanup
         for comp in self._components_tuple:
@@ -1117,7 +1125,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self._touch_node(node)
         node.priority = max(node.priority, priority)
         if len(key) == 0:
-            return InsertResult(prefix_len=0, mamba_exist=True)
+            return InsertResult(prefix_len=0, mamba_exist=True, last_device_node=node)
 
         child_key = key.child_key(self.page_size)
         total_prefix_length = 0
@@ -1183,7 +1191,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         # Finalize: let each component attach its data to the target node.
         # e.g. Mamba attaches mamba_value to the leaf node
-        result = InsertResult(prefix_len=total_prefix_length)
+        result = InsertResult(
+            prefix_len=total_prefix_length, last_device_node=target_node
+        )
         for component in self._components_tuple:
             component.commit_insert_component_data(
                 node=target_node,
@@ -1309,6 +1319,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self._update_evictable_leaf_sets(node)
 
     def _remove_leaf_from_parent(self, node: UnifiedTreeNode):
+        for component in self._components_tuple:
+            component.discard_deleted_session_leaf(node)
+
         key = node.key.child_key(self.page_size)
         v = node.parent.children.pop(key, None)
         assert v == node
@@ -2732,6 +2745,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         return self._all_component_values_flatten(ComponentType.MAMBA)
 
     def available_and_evictable_str(self) -> str:
+        # TODO(zhangmj): need more detailed log info for session reference.
         if self.supports_swa():
             full_available_size = self.token_to_kv_pool_allocator.full_available_size()
         else:
@@ -2887,6 +2901,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             E(
                 f"[Leaf] {len(overlap)} in both sets: {[n.id for n in list(overlap)[:5]]}"
             )
+
+        if self.enable_session_radix_cache:
+            for component in self._components_tuple:
+                component.validate_session_state(all_node_set, E)
 
         # Stale nodes: leaf sets must only contain tree-reachable nodes
         stale = self.evictable_device_leaves - all_node_set

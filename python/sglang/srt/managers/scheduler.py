@@ -464,6 +464,7 @@ class Scheduler(
         self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
         self.disable_radix_cache = result.disable_radix_cache
         self.tree_cache = result.tree_cache
+        self.init_session_radix_cache_guard()
 
         if (c := self.tp_worker.model_runner.canary_manager) is not None:
             c.attach_radix_cache(self.tree_cache)
@@ -948,6 +949,17 @@ class Scheduler(
                 num_pages=self.max_total_num_tokens // self.page_size,
                 context_len=self.model_config.context_len,
                 startup_available_gpu_memory_gb=avail_mem,
+            )
+
+    def init_session_radix_cache_guard(self) -> None:
+        if not self.server_args.enable_session_radix_cache:
+            return
+
+        if not getattr(self.tree_cache, "enable_session_radix_cache", False):
+            logger.warning(
+                "enable_session_radix_cache is set but tree_cache is %s, "
+                "session radix cache remains disabled.",
+                type(self.tree_cache).__name__,
             )
 
     def init_hisparse_coordinator(self) -> None:
@@ -2093,9 +2105,8 @@ class Scheduler(
             recv_req.session_params.id if recv_req.session_params is not None else None
         )
         # Radix-native sessions use only the top-level session_id.
-        radix_native_session = (
-            recv_req.session_id is not None
-            and self.server_args.enable_session_radix_cache
+        radix_native_session = recv_req.session_id is not None and getattr(
+            self.tree_cache, "enable_session_radix_cache", False
         )
 
         if session_id is None or radix_native_session:
@@ -2153,6 +2164,11 @@ class Scheduler(
             )
             req.tokenizer = self.tokenizer
 
+            if radix_native_session:
+                req.session_generation = self.tree_cache.current_session_generation(
+                    recv_req.session_id
+                )
+
             if self.disaggregation_mode != DisaggregationMode.NULL:
                 # Invalid request for disaggregated mode
                 if (
@@ -2183,6 +2199,10 @@ class Scheduler(
                 self.model_config.vocab_size,
                 eos_token_ids=self.model_config.hf_eos_token_id,
             )
+            if getattr(self.tree_cache, "enable_session_radix_cache", False):
+                req.session_generation = self.tree_cache.current_session_generation(
+                    session_id
+                )
             # TODO: set trace context
             if self.metrics_reporter.enable_metrics:
                 req.time_stats.set_metrics_collector(self.metrics_collector)
@@ -4433,15 +4453,19 @@ class Scheduler(
 
     def open_session(self, recv_req: OpenSessionReqInput):
         output = self.session_controller.open(recv_req)
+        if output.success and getattr(
+            self.tree_cache, "enable_session_radix_cache", False
+        ):
+            self.tree_cache.open_radix_session(recv_req.session_id)
         if self.ps.pp_rank == 0 and self.ps.tp_rank == 0 and self.ps.attn_cp_rank == 0:
             return output
         return None
 
     def close_session(self, recv_req: CloseSessionReqInput):
-        if self.server_args.enable_session_radix_cache:
+        if getattr(self.tree_cache, "enable_session_radix_cache", False):
             self.tree_cache.release_radix_session(recv_req.session_id)
         if recv_req.session_id in self.session_controller or not (
-            self.server_args.enable_session_radix_cache
+            getattr(self.tree_cache, "enable_session_radix_cache", False)
         ):
             self.session_controller.close(recv_req)
 
