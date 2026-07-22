@@ -1,0 +1,278 @@
+---
+title: DreamZero
+metatags:
+    description: "Serve DreamZero World-Action Model action inference with SGLang's native multimodal_gen runtime."
+tag: WAM
+---
+
+<div className="not-prose" style={{display: "flex", flexWrap: "wrap", gap: "6px", margin: "8px 0 30px"}}>
+  <span style={{display: "inline-block", padding: "4px 9px", borderRadius: "999px", background: "#eef2ff", color: "#3730a3", fontSize: "12px", fontWeight: 750}}>WAM</span>
+  <span style={{display: "inline-block", padding: "4px 9px", borderRadius: "999px", background: "#eef2ff", color: "#3730a3", fontSize: "12px", fontWeight: 750}}>DreamZero</span>
+  <span style={{display: "inline-block", padding: "4px 9px", borderRadius: "999px", background: "#eef2ff", color: "#3730a3", fontSize: "12px", fontWeight: 750}}>action generation</span>
+  <span style={{display: "inline-block", padding: "4px 9px", borderRadius: "999px", background: "#eef2ff", color: "#3730a3", fontSize: "12px", fontWeight: 750}}>closed-loop rollout</span>
+</div>
+
+## 1. Model Introduction
+
+DreamZero is a World-Action Model policy for robot action inference. It consumes preprocessed robot observations and language task context, runs a causal Wan-style DiT over observation and action blocks, and returns a continuous action chunk.
+
+SGLang serves DreamZero through the native `multimodal_gen` runtime and the shared action API. The pipeline encodes text, visual context, and observation latents, then runs DreamZero causal denoising with session-level cache reuse. Although the model computes video/action latent context internally, the server path publishes only the action tensor; generated video frames are not returned or stored.
+
+Validated checkpoint layout:
+
+| Checkpoint | Status | Notes |
+| --- | --- | --- |
+| Local SGLang-format DreamZero WAN2.2 5B LIBERO SFT checkpoints | Validated | Requires `model_index.json` plus `transformer/`, `text_encoder/`, `image_encoder/`, and `vae/` component directories |
+
+References:
+
+- [DreamZero](https://github.com/dreamzero0/dreamzero)
+- [DreamZero causal Wan DiT](https://github.com/dreamzero0/dreamzero/blob/main/groot/vla/model/dreamzero/modules/wan_video_dit_action_casual_chunk.py)
+- [DreamZero flow-matching action head](https://github.com/dreamzero0/dreamzero/blob/main/groot/vla/model/dreamzero/action_head/wan_flow_matching_action_tf.py)
+
+## 2. Installation
+
+Install SGLang with the diffusion dependencies:
+
+```bash Command
+git clone https://github.com/sgl-project/sglang.git
+cd sglang
+pip install -e "python[diffusion]"
+```
+
+For general environment setup, see the [SGLang Diffusion installation guide](/docs/sglang-diffusion/installation).
+
+## 3. Model Deployment
+
+Serve a DreamZero checkpoint in SGLang component layout:
+
+```bash Command
+sglang serve /path/to/dreamzero-wan2.2-5b-libero-sft \
+  --model-type diffusion \
+  --host 127.0.0.1 \
+  --port 30000
+```
+
+The local checkpoint directory must contain the SGLang-native component layout:
+
+```text File
+/path/to/dreamzero-wan2.2-5b-libero-sft/
+  model_index.json
+  transformer/
+  text_encoder/
+  image_encoder/
+  vae/
+```
+
+DreamZero serving dispatches to `DreamZeroPipeline` automatically for local model paths detected as DreamZero checkpoints. Use `--pipeline` or `--pipeline-class-name` only for private checkpoints that cannot be resolved by the registry.
+
+DreamZero denoise steps, CFG scale, flow shift, TP, and SP are server-side pipeline settings. Configure them at server startup or through a pipeline config file so closed-loop clients observe a stable policy during an evaluation run.
+
+Example pipeline override:
+
+```json File
+{
+  "default_num_inference_steps": 16,
+  "cfg_scale": 5.0,
+  "flow_shift": 5.0,
+  "dreamzero_max_sessions": 64,
+  "dreamzero_compile_components": true,
+  "dreamzero_tensor_parallel_size": 1,
+  "dreamzero_sequence_parallel_size": 1
+}
+```
+
+## 4. Action Request Schema
+
+DreamZero uses the shared `/v1/actions/generations` endpoint. Clients should pass observations that have already been transformed into DreamZero model input space. Dataset-level observation conversion, normalization, and action unnormalization are client responsibilities.
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `model` | string, optional | Served model name. When omitted, the server uses the currently loaded policy. |
+| `input.prompt` or `input.task` | string or array | Per-row prompt cache key or task text. DreamZero rollout clients usually send stable per-row prompt keys. |
+| `input.observation` | object | Preprocessed DreamZero model input. Typical keys include image/video tensors, state tensors, tokenized text, text masks, negative text tensors, and embodiment IDs. |
+| `parameters.session_ids` | array of strings | Stable logical session IDs used by the server-side DreamZero cache. Use one ID per batch row. |
+| `parameters.reset_mask` | array of booleans | Explicit client reset mask for `session_ids`. Normal rollout calls usually send all `false`; model lifecycle resets remain server-owned. |
+| `parameters.negative_prompts` | array of strings, optional | Stable cache keys for the negative prompt branch. |
+| `runtime.output_format` | `"list"` or `"numpy"`, optional | Use `"numpy"` with msgpack clients to avoid Python-list materialization. |
+| `runtime.response_format` | `"envelope"` or `"raw"`, optional | `"envelope"` returns the generic action response. `"raw"` returns the policy payload directly. |
+
+## 5. API Usage
+
+### 5.1 Metadata
+
+Use `/v1/actions/metadata` to inspect the currently served action policy:
+
+```bash Command
+curl -sS http://127.0.0.1:30000/v1/actions/metadata
+```
+
+For DreamZero, metadata reports `policy_family: "dreamzero"`, action shape defaults, parallelism settings, and whether realtime or OpenPI-compatible websocket routes are supported.
+
+### 5.2 Generic Action HTTP API
+
+Use `/v1/actions/generations` for direct action inference. JSON is useful for small smoke tests, but closed-loop DreamZero rollouts should use msgpack so tensors can be sent without expanding large image arrays into JSON.
+
+The example below shows the generic request shape. Replace `normalized_observation` with the output of your DreamZero data transform.
+
+```python Example
+import numpy as np
+import requests
+
+normalized_observation = {
+    "state": np.zeros((1, 1, 7), dtype=np.float32).tolist(),
+    "embodiment_id": [0],
+    # Add the image/video tensors and tokenized text fields expected by your
+    # DreamZero checkpoint's data transform.
+}
+
+payload = {
+    "input": {
+        "prompt": ["pick up the cube"],
+        "observation": normalized_observation,
+    },
+    "parameters": {
+        "session_ids": ["rollout-r0-slot0"],
+        "reset_mask": [False],
+        "negative_prompts": [""],
+    },
+    "runtime": {
+        "response_format": "envelope",
+        "output_format": "list",
+    },
+}
+
+response = requests.post(
+    "http://127.0.0.1:30000/v1/actions/generations",
+    json=payload,
+    timeout=60,
+)
+response.raise_for_status()
+data = response.json()
+
+actions = data["data"][0]["action"]["values"]
+print(len(actions), len(actions[0]))
+```
+
+### 5.3 Msgpack Rollout Path
+
+For production-style action rollouts, send msgpack and request numpy output:
+
+```python Example
+import msgpack
+import numpy as np
+import requests
+
+
+def pack_array(obj):
+    if isinstance(obj, np.ndarray):
+        return {
+            b"__ndarray__": True,
+            b"data": obj.tobytes(),
+            b"dtype": obj.dtype.str,
+            b"shape": obj.shape,
+        }
+    if isinstance(obj, np.generic):
+        return {
+            b"__npgeneric__": True,
+            b"data": obj.item(),
+            b"dtype": obj.dtype.str,
+        }
+    return obj
+
+
+def unpack_array(obj):
+    ndarray_marker = obj.get("__ndarray__") or obj.get(b"__ndarray__")
+    npgeneric_marker = obj.get("__npgeneric__") or obj.get(b"__npgeneric__")
+    data = obj.get("data", obj.get(b"data"))
+    dtype = obj.get("dtype", obj.get(b"dtype"))
+    shape = obj.get("shape", obj.get(b"shape"))
+    if ndarray_marker:
+        return np.ndarray(buffer=data, dtype=np.dtype(dtype), shape=shape)
+    if npgeneric_marker:
+        return np.dtype(dtype).type(data)
+    return obj
+
+
+payload = {
+    "input": {
+        "prompt": ["pick up the cube"],
+        "observation": normalized_observation,
+    },
+    "parameters": {
+        "session_ids": ["rollout-r0-slot0"],
+        "reset_mask": [False],
+        "negative_prompts": [""],
+    },
+    "runtime": {
+        "response_format": "envelope",
+        "output_format": "numpy",
+    },
+}
+
+body = msgpack.packb(payload, default=pack_array, use_bin_type=True)
+response = requests.post(
+    "http://127.0.0.1:30000/v1/actions/generations",
+    data=body,
+    headers={
+        "Content-Type": "application/msgpack",
+        "Accept": "application/msgpack",
+    },
+    timeout=60,
+)
+response.raise_for_status()
+result = msgpack.unpackb(response.content, object_hook=unpack_array, raw=False)
+actions = result["data"][0]["action"]["values"]
+```
+
+The returned `actions` are DreamZero normalized action chunks. Convert them back to environment action space with the same dataset/action transform used by the policy client.
+
+## 6. Configuration Tips
+
+- Keep `session_ids` stable for logical environment slots. Reusing the same ID lets the DreamZero server keep text, visual, and causal KV state across rollout steps.
+- Use `reset_mask` only for explicit client-side invalidation, such as intentionally starting a fresh logical session. Cache-window rollover, single-frame lifecycle changes, and prompt-change resets are handled by the server.
+- Use msgpack for batched rollout requests. JSON is primarily for schema inspection and tiny smoke tests because image/video tensors make JSON payloads large.
+- Configure `default_num_inference_steps`, `cfg_scale`, and `flow_shift` at server startup. DreamZero keeps these policy parameters stable inside one served model instance.
+- `cfg_parallel_degree=2` splits DreamZero conditional and unconditional branches across CFG ranks. The text encoder is kept replicated for this path so positive and negative prompts do not pass through tensor-parallel collectives as if they were one shared prompt.
+- `dreamzero_tensor_parallel_size` and `dreamzero_sequence_parallel_size` control DreamZero model parallelism inside the pipeline config. DreamZero SP is a 14B-oriented Q-sequence sharding path for long video/action sequences; it does not require Ulysses+Ring at the validated sequence length.
+- `dreamzero_compile_components` compiles the DreamZero DiT hot path. Disable it when debugging numerical parity or distributed compile issues.
+
+## 7. Validation Notes
+
+The DreamZero SGLang path has been validated on A800 GPUs through closed-loop LIBERO-Spatial evaluation with server-managed action inference. The main validated modes are:
+
+| Mode | Notes |
+| --- | --- |
+| Single GPU | Baseline server path with msgpack `/v1/actions/generations`. |
+| CFG parallel | Uses two CFG ranks for conditional and unconditional branches. |
+| Tensor parallel | Keeps replicated text/image encoders where required by DreamZero, while sharding the DiT path. |
+| Sequence parallel | Shards the action/video sequence path and validates server-side session cache behavior. |
+| TP+SP | Combines tensor parallelism with sequence parallel DreamZero execution. |
+| CFG+TP/SP | Combines CFG branch parallelism with tensor/sequence parallel DreamZero execution. |
+
+Latency snapshot over 50 action-generation requests:
+
+| Model | CFG | TP | SP | world_size | count | median latency | p90 latency |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 5B | 1 | 1 | 1 | 1 | 50 | 0.810s | 0.870s |
+| 5B | 2 | 1 | 1 | 2 | 50 | 0.451s | 0.507s |
+| 5B | 2 | 2 | 1 | 4 | 50 | 0.632s | 0.691s |
+| 5B | 2 | 1 | 2 | 4 | 50 | 0.517s | 0.575s |
+| 14B | 1 | 1 | 1 | 1 | 50 | 6.507s | 6.521s |
+| 14B | 2 | 1 | 1 | 2 | 50 | 3.471s | 3.706s |
+| 14B | 2 | 2 | 1 | 4 | 50 | 2.345s | 2.472s |
+| 14B | 2 | 1 | 2 | 4 | 50 | 2.291s | 2.469s |
+
+Run a full closed-loop evaluation in the target robot or simulator environment before using the policy in a controller. DreamZero action accuracy depends on the same observation normalization, prompt formatting, action unnormalization, and session-id policy used during validation.
+LIBERO Spatial, 500 trajectories:
+
+| Backend / mode | success_once | success_at_end | num_trajectories |
+|---|---:|---:|---:|
+| DreamZero official baseline | 0.910 | 0.276 | 500 |
+| SGLang DreamZero | 0.912 | 0.290 | 500 |
+| SGLang DreamZero CFG 2x2 GPU | 0.940 | 0.350 | 500 |
+| SGLang DreamZero CFG + TP 4 GPU | 0.932 | 0.322 | 500 |
+| SGLang DreamZero CFG + SP 4 GPU | 0.918 | 0.354 | 500 |
+| SGLang DreamZero TP + SP 4 GPU | 0.920 | 0.327 | 500 |
+
+For the full closed-loop LIBERO evaluation workflow, use RLinf's DreamZero SGLang evaluation guide. During review, see [RLinf PR #1383](https://github.com/RLinf/RLinf/pull/1383); after it lands, prefer the merged RLinf documentation page.

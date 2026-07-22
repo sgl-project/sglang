@@ -1279,6 +1279,19 @@
                 ]
               },
               {
+                "group": "WAM (World-Action Models)",
+                "pages": [
+                  "cookbook/wam/intro",
+                  {
+                    "group": "DreamZero",
+                    "tag": "NEW",
+                    "pages": [
+                      "cookbook/wam/DreamZero/DreamZero"
+                    ]
+                  }
+                ]
+              },
+              {
                 "group": "SpecBundle",
                 "pages": [
                   "cookbook/specbundle/supported_models",

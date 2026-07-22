@@ -1,4 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
+"""DreamZero-specific sequence-parallel helpers.
+
+DreamZero SP is intentionally narrower than the generic diffusion USP path.  It
+was added for the 14B DreamZero model, where the video/query sequence is roughly
+2k tokens and sharding that Q sequence across ranks gives a large latency win.
+At that sequence length the extra complexity and communication pattern of
+Ulysses+Ring is not needed for the validated DreamZero topology.
+
+The implementation therefore shards only the current video token sequence and
+its aligned per-token conditioning (RoPE frequencies and timestep embeddings).
+Action/state registers stay replicated on every SP rank.  When the causal DiT
+needs a full K/V slice or returns full video latents, the caller uses the gather
+helpers below to reconstruct the complete sequence and remove redundant
+replicated action registers.
+"""
+
 from __future__ import annotations
 
 from collections.abc import Mapping
@@ -18,7 +34,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 def shard_sequence_parallel_sequence(
     seqs: torch.Tensor, freqs: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Shard video tokens and their RoPE frequencies across the SP group."""
+    """Shard only the DreamZero video/query sequence across the SP group."""
     sp_size = get_sp_world_size()
     if sp_size == 1:
         return seqs, freqs
@@ -44,7 +60,7 @@ def shard_sequence_parallel_time_embedding(
     sp_seq_len: int,
     action_register_length: int | None,
 ) -> torch.Tensor:
-    """Shard video time embeddings while replicating the action register."""
+    """Shard video time embeddings while keeping action/state registers replicated."""
     sp_size = get_sp_world_size()
     if sp_size == 1:
         return e
