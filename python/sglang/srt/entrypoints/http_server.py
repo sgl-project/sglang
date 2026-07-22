@@ -742,11 +742,44 @@ async def get_server_info():
 
 @app.get("/server_info")
 async def server_info():
-    """Get the server information."""
-    # Returns internal states per DP.
-    internal_states: List[Dict[Any, Any]] = (
-        await _global_state.tokenizer_manager.get_internal_state()
-    )
+    """Get the server information.
+
+    In disaggregation modes (PD with MoRI/Mooncake/etc.), the scheduler event
+    loop can be blocked in bootstrap polling for many seconds during init.
+    The router/gateway calls this endpoint synchronously during worker
+    discovery; without a timeout the discovery hangs forever and workers
+    never register.
+
+    Wraps the scheduler-side roundtrip (``get_internal_state``) in
+    ``asyncio.wait_for`` with a small timeout (default 3 s, env-tunable via
+    ``SGLANG_SERVER_INFO_TIMEOUT_S``). On timeout, returns minimal info with
+    ``internal_states=[]`` so the gateway can mark the worker healthy and
+    proceed; ``internal_states`` is only used for monitoring/observability,
+    not for routing decisions.
+    """
+    import asyncio as _asyncio
+    import os as _os
+
+    try:
+        _timeout = float(
+            _os.environ.get("SGLANG_SERVER_INFO_TIMEOUT_S", "3.0")
+        )
+        internal_states: List[Dict[Any, Any]] = await _asyncio.wait_for(
+            _global_state.tokenizer_manager.get_internal_state(),
+            timeout=_timeout,
+        )
+    except (_asyncio.TimeoutError, Exception) as _e:
+        # Fall back to minimal info so the gateway/router can mark this worker
+        # healthy and proceed; clients hitting /server_info during a slow
+        # bootstrap will get incomplete monitoring data, which is a strict
+        # improvement over an indefinite hang.
+        logger.warning(
+            "/server_info: scheduler did not respond in time "
+            "(%s: %s); returning minimal info",
+            type(_e).__name__,
+            _e,
+        )
+        internal_states = []
 
     server_args = _global_state.tokenizer_manager.server_args
 
