@@ -202,13 +202,12 @@ def _torch_hadamard_transform(x: torch.Tensor, scale: float) -> torch.Tensor:
 
 
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
-    # from sgl_kernel import hadamard_transform
     if _is_hip:
         from fast_hadamard_transform import hadamard_transform
     elif _is_cpu and _cpu_amx:
         hadamard_transform = torch.ops.sgl_kernel.fast_hadamard_transform_cpu
     elif _is_xpu:
-        hadamard_transform = _torch_hadamard_transform
+        from sgl_kernel import hadamard_transform
     else:
         from sglang.jit_kernel.hadamard import hadamard_transform
 
