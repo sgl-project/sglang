@@ -619,6 +619,12 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         else:
             self.c4_shrink_factor = 1
         assert self.c4_shrink_factor >= 1
+        self.shared_cache_size = (
+            getattr(kvc.ps, "attn_cp_size", 1)
+            if getattr(kvc.server_args, "enable_dsa_shared_kv_cache", False)
+            else 1
+        )
+        assert self.shared_cache_size >= 1
         if self.c4_shrink_factor > 1:
             logger.info(f"HiSparse c4 host-to-device ratio = {self.c4_shrink_factor}")
 
@@ -699,16 +705,27 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
 
         c4_frac = 1 / (4 * self.c4_shrink_factor)
         return (
-            self.swa_ratio * kv_bytes * self.num_layers_total
-            + c4_frac * kv_bytes * self.num_layers_ca4
-            + 1 / 128 * kv_bytes * self.num_layers_ca128
-            + 1 / 4 * indexer_bytes * self.num_layers_ca4
-            + self.swa_ratio * c4_state_ratio * c4_state_bytes * self.num_layers_ca4
-            + c128_state_ratio * c128_state_bytes * self.num_layers_ca128
+            (
+                self.swa_ratio * kv_bytes * self.num_layers_total
+                + c4_frac * kv_bytes * self.num_layers_ca4
+                + 1 / 128 * kv_bytes * self.num_layers_ca128
+                + 1 / 4 * indexer_bytes * self.num_layers_ca4
+            )
+            / self.shared_cache_size
+            + self.swa_ratio
+            * c4_state_ratio
+            * c4_state_bytes
+            * self.num_layers_ca4
+            / self.shared_cache_size
+            + c128_state_ratio
+            * c128_state_bytes
+            * self.num_layers_ca128
+            / self.shared_cache_size
             + self.swa_ratio
             * c4_state_ratio
             * c4_indexer_state_bytes
             * self.num_layers_ca4
+            / self.shared_cache_size
         )
 
     def _compute_dsv4_sizes(self, full_token: int, page_size: int) -> _DSV4PoolSizes:
@@ -747,7 +764,11 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             state_last_dim = 2 * attn_head_dim
 
         return (
-            state_rows * state_last_dim * c128_state_dtype_size * self.num_layers_ca128
+            state_rows
+            * state_last_dim
+            * c128_state_dtype_size
+            * self.num_layers_ca128
+            // self.shared_cache_size
         )
 
     def _get_c128_state_fixed_bytes_for_token_capacity(

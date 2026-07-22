@@ -42,6 +42,24 @@ def _jit_fused_store_module(
     )
 
 
+@cache_once
+def _jit_fused_store_shared_module(
+    name: Literal["flashmla", "indexer"],
+    input_dtype: torch.dtype,
+    index_dtype: torch.dtype,
+    page_size: int,
+):
+    args = make_cpp_args(input_dtype, index_dtype, page_size, is_arch_support_pdl())
+    cname = "FlashMLA" if name == "flashmla" else "Indexer"
+    kernel_class = f"FusedStoreCache{cname}SharedKernel<{args}>"
+    return load_jit(
+        make_name("store_" + name + "_shared"),
+        *args,
+        cuda_files=["deepseek_v4/store.cuh"],
+        cuda_wrappers=[("run", f"{kernel_class}::run")],
+    )
+
+
 def get_paged_mqa_logits_metadata(seq_lens: torch.Tensor, page_size: int, num_sm: int):
     assert page_size == 64
     seq_lens = seq_lens.view(-1).to(torch.int32)
@@ -73,6 +91,26 @@ def fused_store_cache(
             page_size=page_size,
         )
         module.run(input, cache, indices)
+
+
+def fused_store_cache_shared(
+    input: torch.Tensor,
+    cache: torch.Tensor,
+    indices: torch.Tensor,
+    *,
+    page_size: int,
+    type: Literal["flashmla", "indexer"],
+    owner_rank: int,
+    owner_size: int,
+) -> None:
+    assert not is_hip_runtime(), "DSV4 shared cache store requires CUDA"
+    module = _jit_fused_store_shared_module(
+        name=type,
+        input_dtype=input.dtype,
+        index_dtype=indices.dtype,
+        page_size=page_size,
+    )
+    module.run(input, cache, indices, owner_rank, owner_size)
 
 
 @triton.jit

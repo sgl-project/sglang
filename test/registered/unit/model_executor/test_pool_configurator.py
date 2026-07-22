@@ -133,6 +133,7 @@ def _make_model_runner(
     sa.max_running_requests = max_running_requests
     sa.disaggregation_decode_extra_slots = disaggregation_decode_extra_slots
     sa.enable_dsa_cache_layer_split = False
+    sa.enable_dsa_shared_kv_cache = False
     sa.kv_cache_dtype = "auto"
     mr.server_args = sa
 
@@ -558,6 +559,65 @@ class TestEagleConfigurator(unittest.TestCase):
         total_layers = num_layers + eagle_draft_num_layers
         used = config.max_total_num_tokens * full_pt * total_layers
         self.assertLessEqual(used, available)
+
+
+class TestDSV4SharedStateCapacity(unittest.TestCase):
+    @staticmethod
+    def _configurator(shared_cache_size):
+        from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
+
+        compression_ratios = [0, 0] + [4, 128] * 20 + [4]
+        cfg = object.__new__(DSV4PoolConfigurator)
+        cfg.qk_nope_head_dim = 448
+        cfg.qk_rope_head_dim = 64
+        cfg.indexer_head_dim = 128
+        cfg.swa_ratio = 0.1
+        cfg.swa_page_size = 128
+        cfg.c4_ring_size = 8
+        cfg.c128_ring_size = 128
+        cfg.c4_shrink_factor = 1
+        cfg.num_layers_total = len(compression_ratios)
+        cfg.num_layers_ca4 = sum(ratio == 4 for ratio in compression_ratios)
+        cfg.num_layers_ca128 = sum(ratio == 128 for ratio in compression_ratios)
+        cfg.shared_cache_size = shared_cache_size
+        cfg.disaggregation_mode = "null"
+        cfg.disaggregation_decode_extra_slots = 0
+        cfg.online_c128_mtp_max_draft_tokens = 0
+        return cfg
+
+    def test_flash_l1_families_scale_by_cp_size(self):
+        replicated = self._configurator(1)
+        shared = self._configurator(8)
+
+        self.assertEqual(
+            (
+                shared.num_layers_total,
+                shared.num_layers_ca4,
+                shared.num_layers_ca128,
+            ),
+            (43, 21, 20),
+        )
+        self.assertAlmostEqual(
+            replicated._get_bytes_per_full_token(),
+            shared._get_bytes_per_full_token() * 8,
+        )
+        self.assertEqual(
+            replicated._get_c128_state_fixed_bytes(1),
+            shared._get_c128_state_fixed_bytes(1) * 8,
+        )
+
+    def test_flash_persistent_bytes_per_token_are_exactly_cp8_sharded(self):
+        replicated = self._configurator(1)
+        shared = self._configurator(8)
+
+        self.assertAlmostEqual(
+            replicated._get_bytes_per_full_token(), 7705.45, places=2
+        )
+        self.assertAlmostEqual(shared._get_bytes_per_full_token(), 963.18125, places=5)
+        self.assertAlmostEqual(
+            replicated._get_bytes_per_full_token() / shared._get_bytes_per_full_token(),
+            8.0,
+        )
 
 
 class TestFactory(unittest.TestCase):

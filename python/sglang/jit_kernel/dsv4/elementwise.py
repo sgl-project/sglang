@@ -266,6 +266,8 @@ def fused_k_norm_rope_flashmla(
     out_loc: torch.Tensor,
     kvcache: torch.Tensor,
     page_size: int,
+    owner_rank: int = 0,
+    owner_size: int = 1,
 ) -> None:
     freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
     head_dim = kv.shape[-1]
@@ -273,4 +275,14 @@ def fused_k_norm_rope_flashmla(
     module = _jit_main_k_norm_rope_flashmla_module(
         kv.dtype, head_dim, rope_dim, page_size
     )
-    module.forward(kv, kv_weight, freqs_real, positions, out_loc, kvcache, eps)
+    module.forward(
+        kv,
+        kv_weight,
+        freqs_real,
+        positions,
+        out_loc,
+        kvcache,
+        eps,
+        owner_rank,
+        owner_size,
+    )
