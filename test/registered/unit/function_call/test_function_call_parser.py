@@ -1,4 +1,5 @@
 import json
+import time
 import unittest
 
 from sglang.srt.entrypoints.openai.protocol import (
@@ -659,6 +660,40 @@ class TestPythonicDetector(unittest.TestCase):
         params = json.loads(result.calls[0].parameters)
         self.assertEqual(params["location"], "Mars")
         self.assertEqual(params["unit"], "celsius")
+
+    def test_has_tool_call_no_redos_on_truncated_input(self):
+        """Regression test for GH #31912: has_tool_call must not exhibit
+        catastrophic regex backtracking on a truncated/malformed pythonic
+        call. Before the fix, a 22-argument truncated call took ~8s; a
+        24-argument one would take minutes. This must resolve in
+        milliseconds regardless of argument count.
+        """
+        payload = "[search(" + ", ".join(f"a{i}=1" for i in range(40))
+
+        start = time.monotonic()
+        result = self.detector.has_tool_call(payload)
+        elapsed = time.monotonic() - start
+
+        self.assertLess(
+            elapsed,
+            0.5,
+            f"has_tool_call took {elapsed:.3f}s on truncated input; "
+            "looks like catastrophic regex backtracking regressed",
+        )
+        # Truncated call (missing closing bracket) is correctly not a match.
+        self.assertFalse(result)
+
+    def test_detect_and_parse_no_redos_on_truncated_input(self):
+        """Same as above but for detect_and_parse, the other call site that
+        used the vulnerable regex directly (see GH #31912)."""
+        payload = "[search(" + ", ".join(f"a{i}=1" for i in range(40))
+
+        start = time.monotonic()
+        result = self.detector.detect_and_parse(payload, self.tools)
+        elapsed = time.monotonic() - start
+
+        self.assertLess(elapsed, 0.5)
+        self.assertEqual(result.calls, [])
 
 
 class TestMistralDetector(unittest.TestCase):
