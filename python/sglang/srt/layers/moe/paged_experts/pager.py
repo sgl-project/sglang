@@ -1143,7 +1143,8 @@ def _drop_file_cache(path: str) -> None:
     across all shards/layers — up to the FULL model size — alongside the (separate) host store, doubling
     peak RAM during load. Dropping each shard as it's consumed keeps the source-side cache to ~one shard.
     Each layer reads DISJOINT byte ranges of a shared shard, so this drops almost nothing another layer
-    reuses (only bounded read-ahead). Linux-only; a no-op where posix_fadvise is unavailable."""
+    reuses (only bounded read-ahead). Linux-only; a no-op where posix_fadvise is unavailable.
+    """
     fadvise = getattr(os, "posix_fadvise", None)
     dontneed = getattr(os, "POSIX_FADV_DONTNEED", None)
     if fadvise is None or dontneed is None:
