@@ -13,7 +13,6 @@ from PIL import Image
 from sglang.multimodal_gen.configs.pipeline_configs import WanI2V480PConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.configs.pipeline_configs.mova import MOVAPipelineConfig
-from sglang.multimodal_gen.runtime.models.vision_utils import load_image, load_video
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
@@ -23,6 +22,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.vision import load_image, load_video
 from sglang.multimodal_gen.utils import best_output_size
 
 logger = init_logger(__name__)
@@ -68,12 +68,46 @@ class InputValidationStage(PipelineStage):
         return width, height
 
     def _generate_seeds(self, batch: Req, server_args: ServerArgs):
-        """Generate seeds for the inference"""
+        """Generate deterministic per-output seeds.
+
+        Batched requests pass one base seed per prompt through `extra`; each
+        prompt expands to `num_outputs_per_prompt` consecutive seeds.
+        """
         seed = batch.seed
         num_videos_per_prompt = batch.num_outputs_per_prompt
 
         assert seed is not None
-        seeds = [seed + i for i in range(num_videos_per_prompt)]
+
+        prompt_count = len(batch.prompt) if isinstance(batch.prompt, list) else 1
+        dynamic_batch_seeds = batch.extra.get("dynamic_batch_seeds")
+
+        if dynamic_batch_seeds is not None:
+            if (
+                not isinstance(dynamic_batch_seeds, list)
+                or len(dynamic_batch_seeds) != prompt_count
+            ):
+                raise ValueError(
+                    "dynamic_batch_seeds must be a list with one seed per prompt"
+                )
+            base_seeds = [int(item) for item in dynamic_batch_seeds]
+            seeds = []
+            for base_seed in base_seeds:
+                seeds.extend([base_seed + i for i in range(num_videos_per_prompt)])
+        elif isinstance(seed, list):
+            if len(seed) != num_videos_per_prompt:
+                raise ValueError(
+                    f"seed list length must match num_outputs_per_prompt "
+                    f"({num_videos_per_prompt}), got {len(seed)}"
+                )
+            seeds = [int(item) for item in seed]
+        else:
+            # Keep per-prompt seed streams deterministic and non-overlapping.
+            base_seeds = [
+                int(seed) + i * num_videos_per_prompt for i in range(prompt_count)
+            ]
+            seeds = []
+            for base_seed in base_seeds:
+                seeds.extend([base_seed + i for i in range(num_videos_per_prompt)])
         batch.seeds = seeds
 
         # Create generators based on generator_device parameter
@@ -393,7 +427,18 @@ class InputValidationStage(PipelineStage):
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         """Verify input validation stage inputs."""
         result = VerificationResult()
-        result.add_check("seed", batch.seed, [V.not_none, V.non_negative_int])
+        result.add_check(
+            "seed",
+            batch.seed,
+            [
+                V.not_none,
+                lambda x: (
+                    V.non_negative_int(x)
+                    if not isinstance(x, list)
+                    else bool(x) and all(V.non_negative_int(item) for item in x)
+                ),
+            ],
+        )
         result.add_check(
             "num_videos_per_prompt", batch.num_outputs_per_prompt, V.positive_int
         )

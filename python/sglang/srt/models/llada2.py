@@ -29,7 +29,6 @@ from transformers import PretrainedConfig
 
 from sglang.srt.distributed import (
     get_pp_group,
-    get_tensor_model_parallel_world_size,
     parallel_state,
     tensor_model_parallel_all_reduce,
 )
@@ -43,9 +42,6 @@ from sglang.srt.layers.communicator import (
     enable_moe_dense_fully_dp,
 )
 from sglang.srt.layers.dp_attention import (
-    get_attention_dp_size,
-    get_attention_tp_rank,
-    get_attention_tp_size,
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layernorm import RMSNorm
@@ -55,7 +51,11 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe import get_deepep_mode, get_moe_a2a_backend
+from sglang.srt.layers.moe import (
+    get_deepep_mode,
+    get_moe_a2a_backend,
+    should_skip_post_experts_all_reduce,
+)
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.token_dispatcher import DeepEPDispatcher
@@ -68,16 +68,22 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.utils import (
     apply_qk_norm,
     create_fused_set_kv_buffer_arg,
     enable_fused_set_kv_buffer,
 )
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import (
+    get_forward,
+    get_parallel,
+    get_server_args,
+    get_stream,
+)
 from sglang.srt.utils import (
+    LazyValue,
     add_prefix,
     is_cuda,
     is_non_idle_and_non_empty,
@@ -90,6 +96,15 @@ LoraConfig = None
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 _is_npu = is_npu()
+
+split_qkv_rmsnorm_rope_pos_cache_half_npu = None
+if _is_npu:
+    try:
+        from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope_pos_cache_half_npu import (
+            split_qkv_rmsnorm_rope_pos_cache_half_npu,
+        )
+    except (ImportError, OSError):
+        pass
 
 
 class LLaDA2MoeMLP(nn.Module):
@@ -134,16 +149,13 @@ class LLaDA2MoeMLP(nn.Module):
         self,
         hidden_states: torch.Tensor,
         forward_batch: Optional[ForwardBatch] = None,
-        use_reduce_scatter: bool = False,
     ) -> torch.Tensor:
         if (self.tp_size == 1) and hidden_states.shape[0] == 0:
             return hidden_states
 
         gate_up, _ = self.gate_up_proj(hidden_states)
         hidden_states = self.act_fn(gate_up)
-        hidden_states, _ = self.down_proj(
-            hidden_states, skip_all_reduce=use_reduce_scatter
-        )
+        hidden_states, _ = self.down_proj(hidden_states)
         return hidden_states
 
 
@@ -190,7 +202,7 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
         super().__init__()
         self.layer_id = layer_id
         self.alt_stream = alt_stream
-        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_size = get_parallel().tp_size
         self.top_k = config.num_experts_per_tok
         self.norm_topk_prob = config.norm_topk_prob
         self.hidden_size = config.hidden_size
@@ -219,7 +231,7 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
             self.router_dtype = torch.bfloat16
 
         # TODO global_server_args.ep_num_redundant_experts is used for eplb, not supported now
-        assert get_global_server_args().ep_num_redundant_experts == 0
+        assert get_server_args().ep_num_redundant_experts == 0
         # check group topk
         self.num_expert_group = getattr(config, "n_group", 0)
         self.topk_group = getattr(config, "topk_group", 0)
@@ -234,7 +246,7 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
             self.use_grouped_topk = False
 
         self.num_experts = (
-            config.num_experts + get_global_server_args().ep_num_redundant_experts
+            config.num_experts + get_server_args().ep_num_redundant_experts
         )
 
         self.gate = LLaDA2MoeGate(
@@ -261,7 +273,9 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
             # num_fused_shared_experts=self.num_fused_shared_experts,
             topk_group=self.topk_group,
             correction_bias=self.correction_bias,
+            scoring_func=self.score_function,
             routed_scaling_factor=self.routed_scaling_factor,
+            apply_routed_scaling_factor_on_output=_is_npu,
         )
 
         self.experts = get_moe_impl_class(quant_config)(
@@ -297,7 +311,7 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
         # dispatcher
         if get_moe_a2a_backend().is_deepep():
             # TODO: we will support tp < ep in the future
-            self.ep_size = get_tensor_model_parallel_world_size()
+            self.ep_size = get_parallel().tp_size
 
             self.deepep_dispatcher = DeepEPDispatcher(
                 group=parallel_state.get_tp_group().device_group,
@@ -316,10 +330,9 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
         self,
         hidden_states: torch.Tensor,
         forward_batch: Optional[ForwardBatch] = None,
-        use_reduce_scatter: bool = False,
     ) -> torch.Tensor:
         if not get_moe_a2a_backend().is_deepep():
-            return self.forward_normal(hidden_states, use_reduce_scatter)
+            return self.forward_normal(hidden_states)
         else:
             return self.forward_deepep(hidden_states, forward_batch)
 
@@ -359,7 +372,6 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
     def forward_normal(
         self,
         hidden_states: torch.Tensor,
-        use_reduce_scatter: bool = False,
     ) -> torch.Tensor:
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_size)
@@ -379,7 +391,9 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
         if self.num_shared_experts > 0:
             final_hidden_states = final_hidden_states + shared_output
 
-        if self.tp_size > 1 and not use_reduce_scatter:
+        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
+            is_tp_path=True,
+        ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states.view(num_tokens, hidden_size)
 
@@ -428,9 +442,9 @@ class LLaDA2MoeAttention(nn.Module):
         self.hidden_size = config.hidden_size
         self.total_num_heads = config.num_attention_heads
         self.total_kv_heads = config.num_key_value_heads
-        self.dp_size = get_attention_dp_size()
-        attn_tp_rank = get_attention_tp_rank()
-        attn_tp_size = get_attention_tp_size()
+        self.dp_size = get_parallel().attn_dp_size
+        attn_tp_rank = get_parallel().attn_tp_rank
+        attn_tp_size = get_parallel().attn_tp_size
 
         assert self.total_num_heads % attn_tp_size == 0
         if self.total_kv_heads >= attn_tp_size:
@@ -517,34 +531,59 @@ class LLaDA2MoeAttention(nn.Module):
         if hidden_states.shape[0] == 0:
             return hidden_states
         qkv, _ = self.query_key_value(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        if self.use_qk_norm:
-            q, k = apply_qk_norm(
-                q=q,
-                k=k,
-                q_norm=self.query_layernorm,
-                k_norm=self.key_layernorm,
-                head_dim=self.head_dim,
-                alt_stream=self.alt_stream,
+        if _is_npu and split_qkv_rmsnorm_rope_pos_cache_half_npu is not None:
+            q, k, v = split_qkv_rmsnorm_rope_pos_cache_half_npu(
+                qkv,
+                positions,
+                self.rotary_emb.cos_sin_cache,
+                self.q_size,
+                self.kv_size,
+                self.head_dim,
+                eps=self.query_layernorm.variance_epsilon if self.use_qk_norm else None,
+                q_weight=self.query_layernorm.weight if self.use_qk_norm else None,
+                k_weight=self.key_layernorm.weight if self.use_qk_norm else None,
+                q_bias=(
+                    getattr(self.query_layernorm, "bias", None)
+                    if self.use_qk_norm
+                    else None
+                ),
+                k_bias=(
+                    getattr(self.key_layernorm, "bias", None)
+                    if self.use_qk_norm
+                    else None
+                ),
+                rope_dim=self.rotary_dim,
             )
-        can_fuse_set_kv = (
-            self.head_dim == self.rotary_emb.rotary_dim
-            and enable_fused_set_kv_buffer(forward_batch)
-        )
-        q, k = self.rotary_emb(
-            positions,
-            q,
-            k,
-            fused_set_kv_buffer_arg=(
-                create_fused_set_kv_buffer_arg(
-                    value=v,
-                    layer=self.attn,
-                    forward_batch=forward_batch,
+            can_fuse_set_kv = False
+        else:
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            if self.use_qk_norm:
+                q, k = apply_qk_norm(
+                    q=q,
+                    k=k,
+                    q_norm=self.query_layernorm,
+                    k_norm=self.key_layernorm,
+                    head_dim=self.head_dim,
+                    alt_stream=self.alt_stream,
                 )
-                if can_fuse_set_kv
-                else None
-            ),
-        )
+            can_fuse_set_kv = (
+                self.head_dim == self.rotary_emb.rotary_dim
+                and enable_fused_set_kv_buffer(forward_batch)
+            )
+            q, k = self.rotary_emb(
+                positions,
+                q,
+                k,
+                fused_set_kv_buffer_arg=(
+                    create_fused_set_kv_buffer_arg(
+                        value=v,
+                        layer=self.attn,
+                        forward_batch=forward_batch,
+                    )
+                    if can_fuse_set_kv
+                    else None
+                ),
+            )
         context_layer = self.attn(
             q,
             k,
@@ -569,7 +608,7 @@ class LLaDA2MoeBlock(nn.Module):
         hidden_size = config.hidden_size
 
         self.input_layernorm = RMSNorm(hidden_size, eps=config.rms_norm_eps)
-        self.dp_size = get_attention_dp_size()
+        self.dp_size = get_parallel().attn_dp_size
         self.attention = LLaDA2MoeAttention(
             config,
             layer_id,
@@ -579,8 +618,8 @@ class LLaDA2MoeBlock(nn.Module):
             alt_stream=alt_stream,
         )
         self.layer_id = layer_id
-        self.attn_tp_size = get_attention_tp_size()
-        self.attn_tp_rank = get_attention_tp_rank()
+        self.attn_tp_size = get_parallel().attn_tp_size
+        self.attn_tp_rank = get_parallel().attn_tp_rank
 
         self.is_layer_sparse = self._is_layer_sparse(config, layer_id=layer_id)
         is_previous_layer_sparse = self._is_layer_sparse(config, layer_id=layer_id - 1)
@@ -658,11 +697,12 @@ class LLaDA2MoeBlock(nn.Module):
         )
 
         # For DP with padding, reduce scatter can be used instead of all-reduce.
-        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+        mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             forward_batch
         )
 
-        hidden_states = self.mlp(hidden_states, forward_batch, use_reduce_scatter)
+        with get_forward().scoped(mlp_reduce_scatter=mlp_reduce_scatter):
+            hidden_states = self.mlp(hidden_states, forward_batch)
 
         hidden_states, residual = self.layer_communicator.postprocess_layer(
             hidden_states=hidden_states,
@@ -773,7 +813,7 @@ class LLaDA2MoeModelLM(nn.Module):
         self.pp_group = get_pp_group()
         self.config = config
         self.quant_config = quant_config
-        alt_stream = torch.cuda.Stream() if _is_cuda else None
+        alt_stream = get_stream("alt") if _is_cuda else None
 
         self.model = LLaDA2MoeModel(
             config,
@@ -791,7 +831,7 @@ class LLaDA2MoeModelLM(nn.Module):
                 config.hidden_size,
                 quant_config=quant_config,
                 prefix=add_prefix("lm_head", prefix),
-                use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+                use_attn_tp_group=get_server_args().enable_dp_lm_head,
             )
         self.logits_processor = LogitsProcessor(config, return_full_logits=True)
 
@@ -926,12 +966,17 @@ class LLaDA2MoeModelLM(nn.Module):
                     )
                     weight_loader(param, loaded_weight)
 
-        self.routed_experts_weights_of_layer = {
-            layer_id: layer.mlp.get_moe_weights()
-            for layer_id, layer in enumerate(self.model.layers)
-            if not isinstance(layer, PPMissingLayer)
-            and isinstance(layer.mlp, LLaDA2MoeSparseMoeBlock)
-        }
+        # Lazy: get_moe_weights() snapshots x.data, and building the map here would
+        # pin every expert weight's pre-process_weights_after_loading storage.
+        if not hasattr(self, "routed_experts_weights_of_layer"):
+            self.routed_experts_weights_of_layer = LazyValue(
+                lambda: {
+                    layer_id: layer.mlp.get_moe_weights()
+                    for layer_id, layer in enumerate(self.model.layers)
+                    if not isinstance(layer, PPMissingLayer)
+                    and isinstance(layer.mlp, LLaDA2MoeSparseMoeBlock)
+                }
+            )
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):

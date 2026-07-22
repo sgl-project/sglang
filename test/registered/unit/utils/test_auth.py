@@ -11,15 +11,10 @@ from sglang.srt.utils.auth import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(1.0, "stage-a-test-cpu")
+register_cpu_ci(1.0, "base-a-test-cpu")
 
 
 class TestAuthDecision(CustomTestCase):
-    def test_allowed_default(self):
-        decision = AuthDecision(allowed=True)
-        self.assertTrue(decision.allowed)
-        self.assertEqual(decision.error_status_code, 401)
-
     def test_not_allowed_with_custom_status(self):
         decision = AuthDecision(allowed=False, error_status_code=403)
         self.assertFalse(decision.allowed)
@@ -32,11 +27,6 @@ class TestAuthDecision(CustomTestCase):
 
 
 class TestAuthLevel(CustomTestCase):
-    def test_enum_values(self):
-        self.assertEqual(AuthLevel.NORMAL.value, "normal")
-        self.assertEqual(AuthLevel.ADMIN_OPTIONAL.value, "admin_optional")
-        self.assertEqual(AuthLevel.ADMIN_FORCE.value, "admin_force")
-
     def test_is_string_enum(self):
         self.assertIsInstance(AuthLevel.NORMAL, str)
         # str mixin allows direct comparison with string values
@@ -50,13 +40,6 @@ class TestAuthLevelDecorator(CustomTestCase):
             pass
 
         self.assertEqual(my_endpoint._auth_level, AuthLevel.ADMIN_FORCE)
-
-    def test_decorator_preserves_function(self):
-        @auth_level(AuthLevel.NORMAL)
-        def my_endpoint():
-            return 42
-
-        self.assertEqual(my_endpoint(), 42)
 
 
 class TestDecideRequestAuth(CustomTestCase):

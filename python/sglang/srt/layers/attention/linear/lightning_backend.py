@@ -1,20 +1,21 @@
 import logging
 import math
-from typing import Optional, Union
 
 import torch
 
-from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
-from sglang.srt.layers.attention.linear.lightning_attn import (
+from sglang.kernels.ops.attention.linear.lightning_attn import (
     BailingLinearKernel,
     linear_decode_forward_triton,
 )
-from sglang.srt.layers.attention.linear.linear_metadata import BailingLinearMetadata
-from sglang.srt.layers.attention.linear.seg_la import SegLaMeta, seg_la_fwd
+from sglang.kernels.ops.attention.linear.seg_la import SegLaMeta, seg_la_fwd
+from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
+from sglang.srt.layers.attention.linear.linear_metadata import (
+    BailingLinearMetadata,
+)
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
+from sglang.srt.runtime_context import get_parallel, get_server_args
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +39,20 @@ class LightningAttentionBackend(MambaAttnBackendBase):
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
+        # seg_la processes draft tokens as a chain -- it has no parent-indices
+        # plumbing for tree-shaped drafts, so spec v2 tree verify (topk > 1) would
+        # commit wrong mamba states silently. Fail fast instead of mis-decoding.
+        if self.topk > 1:
+            raise NotImplementedError(
+                "Lightning (seg_la) linear-attention backend does not support "
+                f"speculative decoding with topk > 1 (got topk={self.topk}); "
+                "seg_la verifies a draft tree as a chain. Use "
+                "--speculative-eagle-topk 1."
+            )
+        # lightning attn does not need conv cache, but to keep the interface for mamba cache
+        self.conv_states_shape = (
+            model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0].shape
+        )
 
         assert not (
             model_runner.sliding_window_size is not None
@@ -49,7 +64,12 @@ class LightningAttentionBackend(MambaAttnBackendBase):
         self.device = model_runner.device
         self.decode_cuda_graph_metadata = {}
         self.kv_cache_dtype = model_runner.kv_cache_dtype
-        self.kv_cache_dtype_str = model_runner.server_args.kv_cache_dtype
+
+        self.kv_cache_dtype_str = getattr(
+            model_runner,
+            "kv_cache_dtype_str",
+            model_runner.server_args.kv_cache_dtype,
+        )
         self.BLOCK = (
             model_runner.model_config.block
             if hasattr(model_runner.model_config, "block")
@@ -67,6 +87,34 @@ class LightningAttentionBackend(MambaAttnBackendBase):
             f"linear_backend for linear attention in hybrid_linear_backend: {self.linear_backend}"
         )
 
+    def init_forward_metadata_out_graph(
+        self,
+        forward_batch: ForwardBatch,
+        in_capture: bool = False,
+    ):
+        # seq_lens_cpu is unused by the underlying _replay_metadata for
+        # non-target-verify modes; pass it through for compatibility.
+        bs = forward_batch.batch_size
+        metadata = self._replay_metadata(
+            bs,
+            forward_batch.req_pool_indices,
+            forward_batch.forward_mode,
+            forward_batch.spec_info,
+            forward_batch.seq_lens_cpu if not in_capture else None,
+            num_padding=(
+                0 if in_capture else getattr(forward_batch, "num_padding", None)
+            ),
+            in_capture=in_capture,
+            mamba_track_indices=getattr(forward_batch, "mamba_track_indices", None),
+        )
+        self.forward_metadata = BailingLinearMetadata.prepare_decode(
+            metadata.query_start_loc,
+            metadata.mamba_cache_indices,
+            bs,
+            forward_batch.seq_lens,
+        )
+        self.forward_metadata.mamba_track_indices = metadata.mamba_track_indices
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         metadata = self._forward_metadata(forward_batch)
         self.forward_metadata = BailingLinearMetadata.prepare_mixed(
@@ -74,39 +122,12 @@ class LightningAttentionBackend(MambaAttnBackendBase):
             metadata.mamba_cache_indices,
             forward_batch,
         )
-
-    def init_forward_metadata_capture_cuda_graph(
-        self,
-        bs: int,
-        num_tokens: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        encoder_lens: Optional[torch.Tensor],
-        forward_mode: ForwardMode,
-        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
-    ):
-        metadata = self._capture_metadata(bs, req_pool_indices, forward_mode, spec_info)
-        self.forward_metadata = BailingLinearMetadata.prepare_decode(
-            metadata.query_start_loc, metadata.mamba_cache_indices, bs, seq_lens
-        )
-
-    def init_forward_metadata_replay_cuda_graph(
-        self,
-        bs: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        seq_lens_sum: int,
-        encoder_lens: Optional[torch.Tensor],
-        forward_mode: ForwardMode,
-        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
-        seq_lens_cpu: Optional[torch.Tensor],
-    ):
-        metadata = self._replay_metadata(
-            bs, req_pool_indices, forward_mode, spec_info, seq_lens_cpu
-        )
-        self.forward_metadata = BailingLinearMetadata.prepare_decode(
-            metadata.query_start_loc, metadata.mamba_cache_indices, bs, seq_lens
-        )
+        self.forward_metadata.mamba_track_indices = metadata.mamba_track_indices
+        self.forward_metadata.track_ssm_h_src = metadata.track_ssm_h_src
+        self.forward_metadata.track_ssm_h_dst = metadata.track_ssm_h_dst
+        self.forward_metadata.track_ssm_final_src = metadata.track_ssm_final_src
+        self.forward_metadata.track_ssm_final_dst = metadata.track_ssm_final_dst
+        self.forward_metadata.has_mamba_track_mask = metadata.has_mamba_track_mask
 
     @staticmethod
     def _build_slope_tensor(
@@ -130,13 +151,9 @@ class LightningAttentionBackend(MambaAttnBackendBase):
         slopes = torch.tensor(
             get_slopes(n_attention_heads), dtype=torch.float32
         ).reshape(n_attention_heads, 1, 1)
-        from sglang.srt.layers.dp_attention import (
-            get_attention_tp_rank,
-            get_attention_tp_size,
-        )
 
-        tp_heads = n_attention_heads // get_attention_tp_size()
-        tp_rank = get_attention_tp_rank()
+        tp_heads = n_attention_heads // get_parallel().attn_tp_size
+        tp_rank = get_parallel().attn_tp_rank
         if num_hidden_layers <= 1:
             slope_rate_list = [slopes * (1 + 1e-5)]
         else:
@@ -244,6 +261,8 @@ class LightningAttentionBackend(MambaAttnBackendBase):
         mask=None,
         temp_cache=None,
         intermediate_state_indices=None,
+        track_lens=None,
+        track_state_indices=None,
     ):
         q_offsets = metadata.query_start_loc
 
@@ -265,9 +284,62 @@ class LightningAttentionBackend(MambaAttnBackendBase):
             meta=seg_meta,
             caches=temp_cache,
             cache_indices=intermediate_state_indices,
+            track_lens=track_lens,
+            track_state_indices=track_state_indices,
             decouple=True,
         )
         return hidden
+
+    def _prepare_seg_la_track_store(self, forward_batch, metadata):
+        if (
+            self.linear_backend != "seg_la"
+            or not metadata.has_mamba_track_mask
+            or metadata.num_prefills == 0
+            or forward_batch.mamba_track_mask is None
+        ):
+            return None, None
+
+        h_dst = metadata.track_ssm_h_dst
+        if h_dst is None or h_dst.numel() == 0:
+            return None, None
+
+        mamba_cache_chunk_size = get_server_args().mamba_cache_chunk_size
+        num_prefills = metadata.num_prefills
+        track_mask = forward_batch.mamba_track_mask[:num_prefills]
+        extend_lens = forward_batch.extend_seq_lens[:num_prefills]
+        prefix_lens = forward_batch.extend_prefix_lens[:num_prefills]
+        track_seqlens = forward_batch.mamba_track_seqlens[:num_prefills]
+
+        lens_to_track = track_seqlens - prefix_lens
+        boundary_lens = (
+            lens_to_track // mamba_cache_chunk_size
+        ) * mamba_cache_chunk_size
+        track_rows = (track_mask & (boundary_lens < extend_lens)).nonzero(
+            as_tuple=True
+        )[0]
+        if track_rows.numel() == 0:
+            return None, None
+
+        if h_dst.numel() != track_rows.numel():
+            raise RuntimeError(
+                "seg_la mamba track metadata mismatch: "
+                f"{h_dst.numel()} destination slots for {track_rows.numel()} rows"
+            )
+
+        track_lens = torch.zeros(
+            (metadata.batch_size,),
+            dtype=torch.int32,
+            device=metadata.mamba_cache_indices.device,
+        )
+        track_state_indices = torch.full(
+            (metadata.batch_size,),
+            -1,
+            dtype=h_dst.dtype,
+            device=metadata.mamba_cache_indices.device,
+        )
+        track_lens[track_rows] = boundary_lens[track_rows].to(torch.int32)
+        track_state_indices[track_rows] = h_dst
+        return track_lens, track_state_indices
 
     def forward_extend(
         self,
@@ -279,8 +351,6 @@ class LightningAttentionBackend(MambaAttnBackendBase):
         save_kv_cache=True,
         **kwargs,
     ):
-        q_rope = kwargs["q_rope"] if "q_rope" in kwargs else None
-        k_rope = kwargs["k_rope"] if "k_rope" in kwargs else None
         layer_id = layer.layer_id if layer else kwargs["layer_id"]
 
         metadata = self.forward_metadata
@@ -288,7 +358,6 @@ class LightningAttentionBackend(MambaAttnBackendBase):
         if self.kv_cache_dtype_str != "auto" and layer.k_scale is not None:
             q = q.to(self.kv_cache_dtype)
 
-        query_start_loc = self.forward_metadata.query_start_loc
         cache_indices = self.forward_metadata.mamba_cache_indices
         mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer_id)
         ssm_states = mamba_cache_params.temporal
@@ -313,6 +382,11 @@ class LightningAttentionBackend(MambaAttnBackendBase):
                 if forward_batch.forward_mode.is_target_verify()
                 else None
             )
+            track_lens, track_state_indices = (
+                (None, None)
+                if forward_batch.forward_mode.is_target_verify()
+                else self._prepare_seg_la_track_store(forward_batch, metadata)
+            )
             o = self._linear_attention_entry(
                 q,
                 k,
@@ -327,11 +401,34 @@ class LightningAttentionBackend(MambaAttnBackendBase):
                     else None
                 ),
                 intermediate_state_indices=intermediate_state_indices,
+                track_lens=track_lens,
+                track_state_indices=track_state_indices,
             )
         else:
             raise ValueError(
                 f"linear backend: {self.linear_backend} is not support for now"
             )
+
+        if (
+            not forward_batch.forward_mode.is_target_verify()
+            and forward_batch.mamba_track_mask is not None
+        ):
+            # save mamba cache for extra buffer
+            if self.linear_backend == "seg_la":
+                if (
+                    metadata.track_ssm_final_dst is not None
+                    and metadata.track_ssm_final_dst.numel() > 0
+                ):
+                    ssm_states[metadata.track_ssm_final_dst] = ssm_states[
+                        metadata.track_ssm_final_src
+                    ]
+            else:
+                mamba_track_mask = forward_batch.mamba_track_mask
+                mamba_track_indices = forward_batch.mamba_track_indices
+                dst_masked = mamba_track_indices[mamba_track_mask]
+                src_masked = metadata.mamba_cache_indices[mamba_track_mask]
+                ssm_states[dst_masked] = ssm_states[src_masked]
+
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     def forward_decode(
@@ -344,8 +441,6 @@ class LightningAttentionBackend(MambaAttnBackendBase):
         save_kv_cache=True,
         **kwargs,
     ) -> torch.Tensor:
-        q_rope = kwargs["q_rope"] if "q_rope" in kwargs else None
-        k_rope = kwargs["k_rope"] if "k_rope" in kwargs else None
         layer_id = layer.layer_id if layer else kwargs["layer_id"]
 
         # Use precomputed metadata across all layers
@@ -355,7 +450,6 @@ class LightningAttentionBackend(MambaAttnBackendBase):
             q = q.to(self.kv_cache_dtype)
 
         # Do linear attention
-        query_start_loc = self.forward_metadata.query_start_loc
         cache_indices = self.forward_metadata.mamba_cache_indices
         mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer_id)
         ssm_states = mamba_cache_params.temporal
@@ -369,4 +463,11 @@ class LightningAttentionBackend(MambaAttnBackendBase):
             raise ValueError(
                 f"linear backend: {self.linear_backend} is not support for now"
             )
+
+        self._track_mamba_state_decode(
+            forward_batch,
+            mamba_cache_params.conv[0],
+            ssm_states,
+            cache_indices,
+        )
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)

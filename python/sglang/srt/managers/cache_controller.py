@@ -16,36 +16,55 @@ limitations under the License.
 import logging
 import threading
 import time
-from queue import Empty, Full, Queue
+from functools import cache
+from queue import Empty, Queue
 from typing import TYPE_CHECKING, List, NamedTuple, Optional
 
 import torch
 
 from sglang.srt.mem_cache.hicache_storage import (
+    STORAGE_BATCH_SIZE,
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
+    PoolName,
+    PoolTransfer,
 )
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-    from sglang.srt.mem_cache.memory_pool_host import HostKVCache
+    from sglang.srt.mem_cache.pool_host import HostKVCache
 
-from sglang.srt.distributed import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-)
 from sglang.srt.layers.dp_attention import (
     get_attention_dp_rank,
-    get_attention_tp_rank,
-    get_attention_tp_size,
     is_dp_attention_enabled,
 )
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_device_module
 
 logger = logging.getLogger(__name__)
 
 device_module = get_device_module()
+
+
+@cache
+def _timing_events_supported() -> bool:
+    try:
+        device_module.Event(enable_timing=True)
+        return True
+    except (TypeError, NotImplementedError):
+        logger.warning(
+            "%s.Event does not support enable_timing=True; load-back "
+            "duration metric will be skipped on this backend.",
+            device_module.__name__,
+        )
+        return False
+
+
+def make_timing_event_pair():
+    timing_enabled = _timing_events_supported()
+    kwargs = {"enable_timing": True} if timing_enabled else {}
+    return device_module.Event(**kwargs), device_module.Event(**kwargs), timing_enabled
 
 
 class LayerLoadingEvent:
@@ -142,49 +161,8 @@ class HiCacheAck(NamedTuple):
     start_event: device_module.Event
     finish_event: device_module.Event
     node_ids: List[int]
-
-
-class TransferBuffer:
-    """
-    Overlapping buffer preparation and transfer operations to improve throughput.
-    """
-
-    def __init__(
-        self, stop_event, buffer_count: int = 3, max_buffer_size: int = 1024
-    ) -> None:
-        self.stop_event = stop_event
-        self.buffers = Queue(maxsize=buffer_count)
-        # todo: adjust the buffer size based on throughput profile of the system
-        self.max_buffer_size = max_buffer_size
-
-    def full(self) -> bool:
-        return self.buffers.full()
-
-    def empty(self) -> bool:
-        return self.buffers.empty()
-
-    def put(self, item, block=True, timeout=1) -> None:
-        while not self.stop_event.is_set():
-            try:
-                self.buffers.put(item, block=block, timeout=timeout)
-                break
-            except Full:
-                if not block:
-                    break
-                continue
-            except Exception as e:
-                logger.error(e)
-
-    def get(self, block=True, timeout=1) -> Optional[CacheOperation]:
-        try:
-            return self.buffers.get(block=block, timeout=timeout)
-        except Empty:
-            return None
-        except Exception as e:
-            logger.error(e)
-
-    def clear(self):
-        self.buffers.queue.clear()
+    num_tokens: int = 0
+    timing_enabled: bool = False
 
 
 class StorageOperation:
@@ -192,7 +170,7 @@ class StorageOperation:
 
     def __init__(
         self,
-        host_indices: torch.Tensor,
+        host_indices: Optional[torch.Tensor],
         token_ids: List[int],
         last_hash: Optional[str] = None,
         hash_value: Optional[List[str]] = None,
@@ -208,7 +186,7 @@ class StorageOperation:
         self.id = StorageOperation.counter
         StorageOperation.counter += 1
 
-    def __lt__(self, other: "StorageOperation"):
+    def __lt__(self, other: StorageOperation):
         return self.id < other.id
 
 
@@ -216,7 +194,6 @@ class PrefetchOperation(StorageOperation):
     def __init__(
         self,
         request_id: str,
-        host_indices: torch.Tensor,
         token_ids: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
@@ -225,9 +202,10 @@ class PrefetchOperation(StorageOperation):
 
         self._lock = threading.Lock()
         self._terminated_flag = False
+        self.storage_hit_count = 0
         self.start_time = time.monotonic()
 
-        super().__init__(host_indices, token_ids, last_hash, prefix_keys=prefix_keys)
+        super().__init__(None, token_ids, last_hash, prefix_keys=prefix_keys)
 
     def increment(self, num_tokens: int):
         with self._lock:
@@ -253,19 +231,22 @@ class HiCacheController:
         page_size: int,
         tp_group: torch.distributed.ProcessGroup,
         load_cache_event: threading.Event,
+        attn_cp_group: Optional[torch.distributed.ProcessGroup] = None,
+        attn_tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        pp_group: Optional[torch.distributed.ProcessGroup] = None,
         write_policy: str = "write_through_selective",
         io_backend: str = "",
         storage_backend: Optional[str] = None,
         prefetch_threshold: int = 256,
         model_name: Optional[str] = None,
         storage_backend_extra_config: Optional[dict] = None,
-        pp_rank: int = 0,
-        pp_size: int = 1,
-        attn_cp_rank: int = 0,
-        attn_cp_size: int = 1,
         enable_storage_metrics: bool = False,
     ):
         self.tp_group = tp_group
+        self.attn_cp_group = attn_cp_group
+        self.attn_tp_group = attn_tp_group
+        self.pp_group = pp_group
+        self.prefetch_sync_groups: List[torch.distributed.ProcessGroup] = []
         self.mem_pool_device_allocator = token_to_kv_pool_allocator
         mem_pool_device = token_to_kv_pool_allocator.get_kvcache()
         from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
@@ -280,20 +261,20 @@ class HiCacheController:
         self.enable_storage = False
         self.storage_backend = None
         self.storage_backend_type = None
-        self.pp_rank = pp_rank
-        self.pp_size = pp_size
-        self.attn_cp_rank = attn_cp_rank
-        self.attn_cp_size = attn_cp_size
         self.enable_storage_metrics = enable_storage_metrics
+
+        # Draft KV pool support (best-effort piggyback on target L2/L3 ops).
+        self.has_draft = False
+        self.mem_pool_device_draft = None
+        self.mem_pool_host_draft = None
+        self.draft_page_get_func = None
+        self.draft_page_set_func = None
 
         # Default storage page IO functions (may be overridden by attach).
         self.page_get_func = self._generic_page_get
         self.page_set_func = self._generic_page_set
 
         # Dedicated stop event for storage background threads (prefetch/backup).
-        # NOTE: Do NOT reuse `self.stop_event` here since it also guards core HiCache
-        # transfer buffers (CPU<->GPU). We want to allow runtime attach/detach of
-        # storage without stopping the whole controller.
         self.storage_stop_event = threading.Event()
 
         self.device = self.mem_pool_device.device
@@ -314,12 +295,6 @@ class HiCacheController:
         self.ack_load_queue: List[HiCacheAck] = []
         self.ack_write_queue: List[HiCacheAck] = []
 
-        self.stop_event = threading.Event()
-        self.write_buffer = TransferBuffer(self.stop_event)
-        self.load_buffer = TransferBuffer(
-            self.stop_event, buffer_count=10, max_buffer_size=100
-        )
-
         self.write_stream = device_module.Stream()
         self.load_stream = device_module.Stream()
 
@@ -336,6 +311,51 @@ class HiCacheController:
             except ValueError as e:
                 # Preserve the historical error shape on init for unknown backends.
                 raise ValueError(f"Failed to create storage backend: {e}") from e
+
+    def get_attn_cp_rank_and_size(self) -> tuple[int, int]:
+        """Derive CP rank/size from the attn_cp process group."""
+        if self.attn_cp_group is not None:
+            return (
+                torch.distributed.get_rank(group=self.attn_cp_group),
+                torch.distributed.get_world_size(group=self.attn_cp_group),
+            )
+        return 0, 1
+
+    def _create_prefetch_sync_groups(self) -> None:
+        from sglang.srt.distributed.parallel_state import create_custom_parallel_group
+
+        self.prefetch_sync_groups = []
+        seen_rank_sets = set()
+
+        if self.attn_cp_group is not None or self.attn_tp_group is not None:
+            base_groups = [self.attn_cp_group, self.attn_tp_group]
+        else:
+            base_groups = [self.tp_group]
+
+        for group in base_groups:
+            if group is None or torch.distributed.get_world_size(group=group) == 1:
+                continue
+            group_ranks = tuple(torch.distributed.get_process_group_ranks(group))
+            if group_ranks in seen_rank_sets:
+                continue
+            seen_rank_sets.add(group_ranks)
+            self.prefetch_sync_groups.append(
+                create_custom_parallel_group(
+                    group_ranks=list(group_ranks), backend="gloo"
+                )
+            )
+
+    def _destroy_prefetch_sync_groups(self) -> None:
+        for group in self.prefetch_sync_groups:
+            try:
+                torch.distributed.destroy_process_group(group)
+            except Exception:
+                pass
+        self.prefetch_sync_groups = []
+
+    def _all_reduce_prefetch_groups(self, tensor: torch.Tensor, op) -> None:
+        for group in self.prefetch_sync_groups:
+            torch.distributed.all_reduce(tensor, op=op, group=group)
 
     def _start_storage_threads(self):
         """Start storage prefetch/backup threads and their queues.
@@ -354,9 +374,10 @@ class HiCacheController:
         self.prefetch_queue = Queue()
         self.backup_queue = Queue()
 
-        self.prefetch_revoke_queue = Queue()
-        self.ack_backup_queue = Queue()
-        self.host_mem_release_queue = Queue()
+        self.prefetch_hit_queue: Queue[StorageOperation] = Queue()
+        self.prefetch_revoke_queue: Queue[str] = Queue()
+        self.ack_backup_queue: Queue[StorageOperation] = Queue()
+        self.host_mem_release_queue: Queue[torch.Tensor] = Queue()
 
         self.prefetch_thread.start()
         self.backup_thread.start()
@@ -369,7 +390,7 @@ class HiCacheController:
         # Always request stop. This is safe even when storage is already disabled,
         # and makes detach truly idempotent (previous partial detach may have left
         # threads alive).
-        # NOTE: do NOT clear stop_event unless threads have fully stopped; otherwise
+        # NOTE: do NOT clear storage_stop_event unless threads have fully stopped; otherwise
         # a still-alive thread may resume and touch released state.
         self.storage_stop_event.set()
 
@@ -459,25 +480,14 @@ class HiCacheController:
             self.enable_storage = True
             # todo: threshold policy for prefetching
             self.prefetch_threshold = max(prefetch_threshold, self.page_size)
-            self.prefetch_capacity_limit = max(
-                0, int(0.8 * (self.mem_pool_host.size - self.mem_pool_device.size))
-            )
-            # granularity of batch storage IO operations, in number of pages
-            self.storage_batch_size = 128
+            # Budget speculative prefetch at half the host pool, leaving the rest for the write-back staging path.
+            self.prefetch_capacity_limit = int(0.5 * self.mem_pool_host.size)
             # tracking the number of tokens locked in prefetching, updated by the main scheduler thread
             self.prefetch_tokens_occupied = 0
 
-            # create a new communication group for synchronizing storage operations across TP workers
-            self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
-            if self.tp_world_size > 1:
-                from sglang.srt.distributed.parallel_state import (
-                    create_custom_parallel_group,
-                )
-
-                group_ranks = torch.distributed.get_process_group_ranks(self.tp_group)
-                self.prefetch_tp_group = create_custom_parallel_group(
-                    group_ranks=group_ranks, backend="gloo"
-                )
+            # Use dedicated gloo groups so storage prefetch sync is isolated
+            # from other collectives and consistent across CPxTP participants.
+            self._create_prefetch_sync_groups()
 
             # Select the get and set functions
             self.page_get_func = self._generic_page_get
@@ -485,13 +495,15 @@ class HiCacheController:
 
             if (
                 self.storage_backend_type
-                in ["hf3fs", "mooncake", "eic", "nixl", "simm"]
+                in ["hf3fs", "mooncake", "eic", "nixl", "simm", "mori"]
             ) or (
                 self.storage_backend_type == "dynamic"
                 and bool(self.storage_config.extra_config.get("interface_v1", 0))
             ):
                 self.page_get_func = self._page_get_zero_copy
                 self.page_set_func = self._page_set_zero_copy
+
+            self._maybe_register_draft_with_storage()
 
             # Ensure stop_event is clear before starting threads.
             self.storage_stop_event.clear()
@@ -502,15 +514,7 @@ class HiCacheController:
                 self._stop_storage_threads()
             except Exception:
                 pass
-            try:
-                if hasattr(self, "prefetch_tp_group"):
-                    try:
-                        torch.distributed.destroy_process_group(self.prefetch_tp_group)
-                    except Exception:
-                        pass
-                    self.prefetch_tp_group = None
-            except Exception:
-                pass
+            self._destroy_prefetch_sync_groups()
             try:
                 if (
                     hasattr(self, "storage_backend")
@@ -525,6 +529,8 @@ class HiCacheController:
             self.enable_storage = False
             self.page_get_func = self._generic_page_get
             self.page_set_func = self._generic_page_set
+            self.draft_page_get_func = None
+            self.draft_page_set_func = None
             raise
 
     def detach_storage_backend(self):
@@ -547,19 +553,8 @@ class HiCacheController:
             # to avoid flipping `enable_storage` flags while threads are still alive.
             raise RuntimeError("Stop storage threads failed; detach aborted.") from e
 
-        # Best-effort destroy process group created for storage ops.
-        try:
-            if (
-                hasattr(self, "prefetch_tp_group")
-                and self.prefetch_tp_group is not None
-            ):
-                try:
-                    torch.distributed.destroy_process_group(self.prefetch_tp_group)
-                except Exception:
-                    pass
-                self.prefetch_tp_group = None
-        except Exception:
-            pass
+        # Best-effort destroy process groups created for storage ops.
+        self._destroy_prefetch_sync_groups()
 
         # Best-effort close (some backends rely on GC/destructor).
         try:
@@ -577,6 +572,8 @@ class HiCacheController:
         self.enable_storage = False
         self.page_get_func = self._generic_page_get
         self.page_set_func = self._generic_page_set
+        self.draft_page_get_func = None
+        self.draft_page_set_func = None
         # Now it's safe to clear the stop event for future re-attach.
         self.storage_stop_event.clear()
 
@@ -589,16 +586,27 @@ class HiCacheController:
             storage_backend_extra_config = {}
 
         if is_dp_attention_enabled():
-            self.tp_rank = get_attention_tp_rank()
-            self.tp_size = get_attention_tp_size()
+            self.tp_rank = get_parallel().attn_tp_rank
+            self.tp_size = get_parallel().attn_tp_size
             self.dp_rank = get_attention_dp_rank()
         else:
-            self.tp_rank = get_tensor_model_parallel_rank()
-            self.tp_size = get_tensor_model_parallel_world_size()
+            self.tp_rank = get_parallel().tp_rank
+            self.tp_size = get_parallel().tp_size
             self.dp_rank = 0
 
+        self.pp_rank = get_parallel().pp_rank
+        self.pp_size = get_parallel().pp_size
+
         # Currently, NPUMLATokenToKVPool is the subclass of MLATokenToKVPool.
-        is_mla_backend = isinstance(self.mem_pool_device, MLATokenToKVPool)
+        # DeepSeekV4TokenToKVPool has compressed MLA-style rank-replicated cache
+        # data. storage only needs rank 0 to write it back.
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+
+        is_mla_model = isinstance(self.mem_pool_device, MLATokenToKVPool)
+        is_compressed_mla_model = isinstance(
+            self.mem_pool_device, DeepSeekV4TokenToKVPool
+        )
+        is_rank_replicated = is_mla_model or is_compressed_mla_model
         # Least Common Multiple among heterogeneous tp size
         tp_lcm_size = storage_backend_extra_config.pop("tp_lcm_size", None)
         should_split_heads = False
@@ -608,19 +616,22 @@ class HiCacheController:
                 tp_lcm_size % self.tp_size == 0
             ), "tp_lcm_size must be divisible by tp_size."
             should_split_heads = (
-                not is_mla_backend
+                not is_rank_replicated
                 and self.mem_pool_host.layout == "page_head"
                 and tp_lcm_size > self.tp_size
             )
+
+        attn_cp_rank, attn_cp_size = self.get_attn_cp_rank_and_size()
 
         return HiCacheStorageConfig(
             tp_rank=self.tp_rank,
             tp_size=self.tp_size,
             pp_rank=self.pp_rank,
             pp_size=self.pp_size,
-            attn_cp_rank=self.attn_cp_rank,
-            attn_cp_size=self.attn_cp_size,
-            is_mla_model=is_mla_backend,
+            attn_cp_rank=attn_cp_rank,
+            attn_cp_size=attn_cp_size,
+            # TODO(hzh): Rename is_mla_model to is_rank_replicated.
+            is_mla_model=is_rank_replicated,
             enable_storage_metrics=self.enable_storage_metrics,
             is_page_first_layout=self.mem_pool_host.layout == "page_first",
             model_name=model_name,
@@ -630,13 +641,10 @@ class HiCacheController:
         )
 
     def reset(self):
-        self.stop_event.set()
         self.storage_stop_event.set()
 
         self.write_queue.clear()
         self.load_queue.clear()
-        self.write_buffer.clear()
-        self.load_buffer.clear()
         self.ack_write_queue.clear()
         self.ack_load_queue.clear()
         if self.enable_storage:
@@ -645,9 +653,11 @@ class HiCacheController:
             self.prefetch_queue.queue.clear()
             self.backup_queue.queue.clear()
             self.prefetch_revoke_queue.queue.clear()
+            self.prefetch_hit_queue.queue.clear()
             self.ack_backup_queue.queue.clear()
+            self.host_mem_release_queue.queue.clear()
+            self.prefetch_tokens_occupied = 0
 
-        self.stop_event.clear()
         self.storage_stop_event.clear()
 
         if self.enable_storage:
@@ -683,9 +693,24 @@ class HiCacheController:
             return
 
         op = CacheOperation.merge_ops(self.write_queue)
-        host_indices, device_indices = self.move_indices(
-            op.host_indices, op.device_indices
-        )
+        # Kernel write-back keeps host indices on CPU only for page_first AND only
+        # when the staged JIT write-back kernel is available (it stages through
+        # device memory and accepts CPU destination indices). Otherwise we fall back
+        # to the plain transfer kernel, whose CUDA/HIP implementation requires
+        # device-resident destination indices -- so the indices must be moved to the
+        # device first. Without the can_use_write_back_jit check this crashes on
+        # backends where the JIT kernel is unavailable, with
+        # "Destination indices must be a CUDA tensor".
+        if (
+            self.io_backend == "kernel"
+            and self.mem_pool_host.layout == "page_first"
+            and getattr(self.mem_pool_host, "can_use_write_back_jit", False)
+        ):
+            host_indices, device_indices = op.host_indices, op.device_indices
+        else:
+            host_indices, device_indices = self.move_indices(
+                op.host_indices, op.device_indices
+            )
         self.write_queue.clear()
 
         start_event = device_module.Event()
@@ -697,6 +722,13 @@ class HiCacheController:
             self.mem_pool_host.backup_from_device_all_layer(
                 self.mem_pool_device, host_indices, device_indices, self.io_backend
             )
+            if self.has_draft:
+                self.mem_pool_host_draft.backup_from_device_all_layer(
+                    self.mem_pool_device_draft,
+                    host_indices,
+                    device_indices,
+                    self.io_backend,
+                )
             finish_event.record()
             # NOTE: We must save the host indices and device indices here,
             # this is because we need to guarantee that these tensors are
@@ -760,8 +792,11 @@ class HiCacheController:
         producer_event = self.layer_done_counter.events[producer_id]
         producer_event.start_event.record()
 
+        ack_start_event, ack_finish_event, timing_enabled = make_timing_event_pair()
+
         with device_module.stream(self.load_stream):
             producer_event.start_event.wait(self.load_stream)
+            ack_start_event.record()
             for i in range(self.layer_num):
                 self.mem_pool_host.load_to_device_per_layer(
                     self.mem_pool_device,
@@ -770,7 +805,16 @@ class HiCacheController:
                     i,
                     self.io_backend,
                 )
+                if self.has_draft and i < self.mem_pool_host_draft.layer_num:
+                    self.mem_pool_host_draft.load_to_device_per_layer(
+                        self.mem_pool_device_draft,
+                        host_indices,
+                        device_indices,
+                        i,
+                        self.io_backend,
+                    )
                 producer_event.complete(i)
+            ack_finish_event.record()
             # NOTE: We must save the host indices and device indices here,
             # this is because we need to guarantee that these tensors are
             # still alive when the load stream is executing.
@@ -781,9 +825,11 @@ class HiCacheController:
 
         self.ack_load_queue.append(
             HiCacheAck(
-                start_event=producer_event.start_event,
-                finish_event=producer_event.finish_event,
+                start_event=ack_start_event,
+                finish_event=ack_finish_event,
                 node_ids=op.node_ids,
+                num_tokens=len(op.device_indices),
+                timing_enabled=timing_enabled,
             )
         )
         return producer_id
@@ -799,10 +845,61 @@ class HiCacheController:
         self.mem_pool_host.free(host_indices)
         return len(host_indices)
 
+    def set_draft_kv_pool(self, draft_device_pool, draft_host_pool) -> None:
+        """Register draft KV pools so L2/L3 ops piggyback draft transfers."""
+        self.has_draft = True
+        self.mem_pool_device_draft = draft_device_pool
+        self.mem_pool_host_draft = draft_host_pool
+        logger.info(
+            "HiCache draft KV registered: %s (host %d slots)",
+            type(draft_device_pool).__name__,
+            draft_host_pool.size,
+        )
+
+        # If storage is already attached, wire up the draft I/O path now.
+        # Otherwise this will be deferred until attach_storage_backend().
+        self._maybe_register_draft_with_storage()
+
+    def _maybe_register_draft_with_storage(self) -> None:
+        """Pick the draft L3 IO implementation."""
+        self.draft_page_get_func = None
+        self.draft_page_set_func = None
+        if not self.has_draft or not self.enable_storage:
+            return
+
+        backend = self.storage_backend_type
+
+        # Multi-pool zero-copy backends.
+        if backend == "mooncake":
+            if self.storage_config.should_split_heads:
+                logger.warning(
+                    "HiCache draft L3 disabled: should_split_heads not yet "
+                    "supported on the mooncake v2 path."
+                )
+                return
+            self.storage_backend.register_mem_host_pool_v2(
+                self.mem_pool_host_draft, PoolName.DRAFT
+            )
+            self.draft_page_get_func = self._draft_page_get_v2
+            self.draft_page_set_func = self._draft_page_set_v2
+            return
+
+        # TODO: support "hf3fs", "eic", "nixl", "simm"
+        if backend in {"hf3fs", "eic", "nixl", "simm"}:
+            logger.warning(
+                "HiCache draft L3 disabled: backend %s does not yet support "
+                "draft pool registration.",
+                backend,
+            )
+            return
+
+        # Generic backends.
+        self.draft_page_get_func = self._draft_page_get_generic
+        self.draft_page_set_func = self._draft_page_set_generic
+
     def prefetch(
         self,
         request_id: str,
-        host_indices: torch.Tensor,
         new_input_tokens: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
@@ -811,7 +908,7 @@ class HiCacheController:
         Prefetch KV caches from storage backend to host memory.
         """
         operation = PrefetchOperation(
-            request_id, host_indices, new_input_tokens, last_hash, prefix_keys
+            request_id, new_input_tokens, last_hash, prefix_keys
         )
         self.prefetch_queue.put(operation)
         return operation
@@ -869,11 +966,18 @@ class HiCacheController:
     def _page_transfer(self, operation):
         # Transfer batch by batch
         prefix_keys = operation.prefix_keys
-        for i in range(0, len(operation.hash_value), self.storage_batch_size):
-            batch_hashes = operation.hash_value[i : i + self.storage_batch_size]
+        for i in range(0, len(operation.hash_value), STORAGE_BATCH_SIZE):
+            batch_hashes = operation.hash_value[i : i + STORAGE_BATCH_SIZE]
             batch_host_indices = operation.host_indices[
                 i * self.page_size : (i + len(batch_hashes)) * self.page_size
             ]
+
+            # Best-effort draft L3 read before publishing target completion.
+            # Otherwise wait_complete can race and load back target KV before
+            # draft KV reaches host memory.
+            if self.has_draft:
+                self._draft_page_get(batch_hashes, batch_host_indices)
+
             prev_completed_tokens = operation.completed_tokens
             # Get one batch token, and update the completed_tokens if succeed
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
@@ -923,20 +1027,12 @@ class HiCacheController:
 
         storage_query_count = 0
         hash_value = []
+        page_hashes = self.get_hash_str(
+            tokens_to_fetch, last_hash, page_size=self.page_size
+        )
 
-        for start in range(
-            0, len(tokens_to_fetch), self.page_size * self.storage_batch_size
-        ):
-            end = min(
-                start + self.page_size * self.storage_batch_size, len(tokens_to_fetch)
-            )
-            batch_tokens = tokens_to_fetch[start:end]
-            batch_hashes = []
-            for i in range(0, len(batch_tokens), self.page_size):
-                last_hash = self.get_hash_str(
-                    batch_tokens[i : i + self.page_size], last_hash
-                )
-                batch_hashes.append(last_hash)
+        for start in range(0, len(page_hashes), STORAGE_BATCH_SIZE):
+            batch_hashes = page_hashes[start : start + STORAGE_BATCH_SIZE]
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
             hit_page_num = self.storage_backend.batch_exists(batch_hashes, extra_info)
             hash_value.extend(batch_hashes[:hit_page_num])
@@ -962,38 +1058,31 @@ class HiCacheController:
                 operation = self.prefetch_queue.get(block=True, timeout=1)
                 if operation is None:
                     continue
-                hash_value, storage_hit_count = self._storage_hit_query(operation)
-                if self.tp_world_size > 1:
-                    storage_hit_count_tensor = torch.tensor(
-                        storage_hit_count, dtype=torch.int
-                    )
-                    torch.distributed.all_reduce(
-                        storage_hit_count_tensor,
-                        op=torch.distributed.ReduceOp.MIN,
-                        group=self.prefetch_tp_group,
-                    )
-                    storage_hit_count = storage_hit_count_tensor.item()
+                if operation.is_terminated():
+                    hash_value, storage_hit_count = [], 0
+                else:
+                    hash_value, storage_hit_count = self._storage_hit_query(operation)
+                storage_hit_count_tensor = torch.tensor(
+                    storage_hit_count, dtype=torch.int
+                )
+                self._all_reduce_prefetch_groups(
+                    storage_hit_count_tensor, torch.distributed.ReduceOp.MIN
+                )
+                storage_hit_count = storage_hit_count_tensor.item()
 
                 if storage_hit_count < self.prefetch_threshold:
                     # not to prefetch if not enough benefits
                     self.prefetch_revoke_queue.put(operation.request_id)
-                    self.append_host_mem_release(operation.host_indices)
                     logger.debug(
                         f"Revoking prefetch for request {operation.request_id} due to insufficient hits ({storage_hit_count})."
                     )
                 else:
+                    # Record hit count, so the scheduler thread will know the exact memory to allocate
                     operation.hash_value = hash_value[
                         : (storage_hit_count // self.page_size)
                     ]
-                    # free the pre-allocated memory for pages that are not hit
-                    self.append_host_mem_release(
-                        operation.host_indices[storage_hit_count:]
-                    )
-                    operation.host_indices = operation.host_indices[:storage_hit_count]
-                    logger.debug(
-                        f"Prefetching {len(operation.hash_value)} pages for request {operation.request_id}."
-                    )
-                    self.prefetch_buffer.put(operation)
+                    operation.storage_hit_count = storage_hit_count
+                    self.prefetch_hit_queue.put(operation)
 
             except Empty:
                 continue
@@ -1027,12 +1116,78 @@ class HiCacheController:
             self.storage_backend.batch_set_v1(hash_values, host_indices, extra_info)
         )
 
+    def _draft_page_set(self, hash_values, host_indices) -> None:
+        """Best-effort write draft KV pages to L3 alongside the target backup."""
+        if self.draft_page_set_func is None:
+            return
+        try:
+            self.draft_page_set_func(hash_values, host_indices)
+        except Exception:
+            logger.debug(
+                "Draft L3 write failed (best-effort), skipping.", exc_info=True
+            )
+
+    def _draft_page_get(self, hash_values, host_indices) -> None:
+        """Best-effort read draft KV pages from L3 (mirrors `_draft_page_set`)."""
+        if self.draft_page_get_func is None:
+            return
+        try:
+            self.draft_page_get_func(hash_values, host_indices)
+        except Exception:
+            logger.debug("Draft L3 read failed (best-effort), skipping.", exc_info=True)
+
+    def _draft_page_set_v2(self, hash_values, host_indices) -> None:
+        self.storage_backend.batch_set_v2(
+            [
+                PoolTransfer(
+                    name=PoolName.DRAFT,
+                    host_indices=host_indices,
+                    keys=list(hash_values),
+                )
+            ]
+        )
+
+    def _draft_page_get_v2(self, hash_values, host_indices) -> None:
+        self.storage_backend.batch_get_v2(
+            [
+                PoolTransfer(
+                    name=PoolName.DRAFT,
+                    host_indices=host_indices,
+                    keys=list(hash_values),
+                )
+            ]
+        )
+
+    def _draft_page_set_generic(self, hash_values, host_indices) -> None:
+        # `{hash}.draft` mirrors HiCacheStorage._get_component_key's
+        # `{key}.{pool_name}` convention so target/draft pages never collide.
+        draft_keys = [f"{h}.{PoolName.DRAFT}" for h in hash_values]
+        draft_data = [
+            self.mem_pool_host_draft.get_data_page(host_indices[i * self.page_size])
+            for i in range(len(draft_keys))
+        ]
+        self.storage_backend.batch_set(draft_keys, draft_data)
+
+    def _draft_page_get_generic(self, hash_values, host_indices) -> None:
+        draft_keys = [f"{h}.{PoolName.DRAFT}" for h in hash_values]
+        draft_dummy = [
+            self.mem_pool_host_draft.get_dummy_flat_data_page() for _ in draft_keys
+        ]
+        draft_pages = self.storage_backend.batch_get(draft_keys, draft_dummy)
+        if draft_pages is None:
+            return
+        for i, p in enumerate(draft_pages):
+            if p is not None:
+                self.mem_pool_host_draft.set_from_flat_data_page(
+                    host_indices[i * self.page_size], p
+                )
+
     # Backup batch by batch
     def _page_backup(self, operation):
         # Backup batch by batch
         prefix_keys = operation.prefix_keys
-        for i in range(0, len(operation.hash_value), self.storage_batch_size):
-            batch_hashes = operation.hash_value[i : i + self.storage_batch_size]
+        for i in range(0, len(operation.hash_value), STORAGE_BATCH_SIZE):
+            batch_hashes = operation.hash_value[i : i + STORAGE_BATCH_SIZE]
             batch_host_indices = operation.host_indices[
                 i * self.page_size : (i + len(batch_hashes)) * self.page_size
             ]
@@ -1045,6 +1200,10 @@ class HiCacheController:
                     f"Write page to storage: {len(batch_hashes)} pages failed."
                 )
                 break
+
+            # Best-effort draft L3 write alongside target.
+            if self.has_draft:
+                self._draft_page_set(batch_hashes, batch_host_indices)
 
             if prefix_keys and len(prefix_keys) > 0:
                 prefix_keys += batch_hashes

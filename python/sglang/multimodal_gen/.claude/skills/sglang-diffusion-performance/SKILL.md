@@ -42,7 +42,7 @@ These options are intended to preserve output quality. In practice, some paths (
 | **FSDP Inference** | `--use-fsdp-inference` | Uses PyTorch FSDP to shard model weights across GPUs with prefetch. Low latency, low VRAM. | Reduces per-GPU VRAM | Mutually exclusive with `--dit-layerwise-offload`. More overhead than SP on high-bandwidth interconnects. |
 | **CPU Offload (components)** | `--text-encoder-cpu-offload`, `--image-encoder-cpu-offload`, `--vae-cpu-offload`, `--dit-cpu-offload` | Offloads specific pipeline components to CPU when not in use. | Reduces peak VRAM | Adds H2D transfer latency when the component is needed. Auto-enabled for low-VRAM GPUs (<30 GB). **Tip:** after the first request completes, the console prints a peak VRAM analysis with suggestions on which offload flags can be safely disabled — look for the `"Components that could stay resident"` log line. |
 | **Pin CPU Memory** | `--pin-cpu-memory` | Uses pinned (page-locked) memory for CPU offload transfers. | Faster H2D transfers | Slightly higher host memory usage. Enabled by default; disable only as workaround for CUDA errors. |
-| **Attention Backend (lossless)** | `--attention-backend fa` | Selects a lossless attention kernel for SGLang-native pipelines: `fa` (FlashAttention 2/3/4 alias) or `torch_sdpa`. | FA is usually faster than SDPA on long sequences | FA requires compatible GPU (Ampere+). For `--backend diffusers`, valid backend names differ; use the names documented in `docs/diffusion/performance/attention_backends.md`. |
+| **Attention Backend (lossless)** | `--attention-backend fa` | Selects a lossless attention kernel for SGLang-native pipelines: `fa` (FlashAttention 2/3/4 alias) or `torch_sdpa`. | FA is usually faster than SDPA on long sequences | FA requires compatible GPU (Ampere+). For `--backend diffusers`, valid backend names differ; use the names documented in `docs_new/docs/sglang-diffusion/attention_backends.mdx`. |
 | **Parallel Folding** | *(automatic when SP > 1)* | Reuses the SP process group as TP for the T5 text encoder, so text encoding is parallelized "for free". | Faster text encoding on multi-GPU | Automatic; no user action needed. Only applies to T5-based pipelines. |
 
 ---
@@ -54,7 +54,7 @@ These options **trade output quality** for speed or VRAM savings. Results will d
 | Option | CLI Flag / Env Var | What It Does | Speedup | Quality Impact / Limitations |
 |---|---|---|---|---|
 | **Approximate Attention** | `--attention-backend sage_attn` / `sage_attn_3` / `sliding_tile_attn` / `video_sparse_attn` / `sparse_video_gen_2_attn` / `vmoba_attn` / `sla_attn` / `sage_sla_attn` | Replaces exact attention with approximate or sparse variants. `sage_attn`: INT8/FP8 quantized Q·K; `sliding_tile_attn`: spatial-temporal tile skipping; others: model-specific sparse patterns. | ~1.5–2x on attention (varies by backend) | Quality degradation varies by backend and model. `sage_attn` is the most general; sparse backends (`sliding_tile_attn`, `video_sparse_attn`, etc.) are video-model-specific and may require config files (e.g. `--mask-strategy-file-path` for STA). Requires corresponding packages installed. |
-| **Cache-DiT** | `SGLANG_CACHE_DIT_ENABLED=true` + `--cache-dit-config <path>` | Caches intermediate residuals across denoising steps and skips redundant computations via a Selective Computation Mask (SCM). | ~1.5–2x on supported models | Quality depends on SCM config. Incompatible with `--dit-layerwise-offload`. Requires correct per-model config YAML. |
+| **Cache-DiT** | Native: `SGLANG_CACHE_DIT_ENABLED=true` plus `SGLANG_CACHE_DIT_*` env vars. Diffusers backend: `--backend diffusers --cache-dit-config <yaml-or-json>` | Caches intermediate residuals across denoising steps and skips redundant computations via DBCache, TaylorSeer, and optional SCM. | ~1.5-2x on supported models | Quality depends on cache policy. Incompatible with `--dit-layerwise-offload`. Do not pass `--cache-dit-config` for native SGLang tuning unless you are intentionally using the diffusers backend flow. |
 | **Quantized Models (Nunchaku / SVDQuant)** | `--enable-svdquant --transformer-weights-path <path>` + optional `--quantization-precision int4\|nvfp4`, `--quantization-rank 32` | W4A4-style quantization via [Nunchaku](https://nunchaku.tech). Reduces DiT weight memory by ~4x. Precision/rank can be auto-inferred from weight filename or set explicitly. | ~1.5–2x compute speedup | Lossy quantization; quality depends on rank and precision. Requires pre-quantized weights. Ampere (SM8x) or SM12x only (no Hopper SM90). Higher rank = better quality but more memory. |
 | **Pre-quantized Transformer Override** | `--transformer-path <dir-or-repo>` / `--transformer-weights-path <path>` | Load a quantized transformer component or raw transformer weights. For converted ModelOpt FP8/NVFP4 directories, prefer `--transformer-path`; use `--transformer-weights-path` for weight-only artifacts the model loader expects. | ~1.3–1.5x compute (dtype dependent) | Requires a validated quantized transformer override, such as one produced by the ModelOpt helper tools. Quality is usually slightly worse than BF16 and depends on the format, fallback layers, and calibration scope. |
 | **Component Precision Override** | `--dit-precision fp16`, `--vae-precision fp16\|bf16` | On-the-fly dtype conversion for individual components. E.g. convert a BF16 model to FP16 at load time, or run VAE in BF16 instead of FP32. | Reduces memory; FP16 can be faster on some GPUs | May affect numerical stability. VAE is FP32 by default for accuracy; lowering it is lossy. DiT defaults to BF16. |
@@ -82,20 +82,34 @@ For Wan2.2 specifically:
 - for pure latency tuning, benchmark pure Ulysses too, for example `--ulysses-degree=4 --ring-degree=1` on 4 GPUs
 - on 8 GPUs, compare pure `--ulysses-degree=8` against `--enable-cfg-parallel --ulysses-degree=4`
 
-### Nightly-aligned model, single GPU: LTX-2 two-stage
+### Nightly-aligned model, 2 GPUs: LTX-2 two-stage
 
 ```bash
 sglang generate --model-path Lightricks/LTX-2 \
   --pipeline-class-name LTX2TwoStagePipeline \
-  --prompt "A beautiful sunset over the ocean" \
-  --negative-prompt "shaky, glitchy, low quality, worst quality, deformed, distorted, disfigured, motion smear, motion artifacts, fused fingers, bad anatomy, weird hand, ugly, transition, static." \
-  --width 1536 --height 1024 \
-  --num-frames 121 --fps 24 \
-  --seed 1234 --num-gpus 1 \
+  --prompt "A cat and a dog baking a cake together in a kitchen." \
+  --width 768 --height 512 \
+  --num-frames 121 \
+  --seed 42 --num-gpus 2 --enable-cfg-parallel \
   --enable-torch-compile --warmup --save-output
 ```
 
-Note: this generate recipe is aligned with the nightly comparison case `ltx2_twostage_t2v`. `LTX2TwoStagePipeline` is a native path and auto-resolves the spatial upsampler plus distilled LoRA from the same model snapshot unless you override them.
+Note: this generate recipe is aligned with the nightly comparison case `ltx2_twostage_t2v`. The nightly config omits explicit steps and guidance, so this command omits them too and uses runtime defaults. `LTX2TwoStagePipeline` is a native path and auto-resolves the spatial upsampler plus distilled LoRA from the same model snapshot unless you override them.
+
+### Nightly-aligned model, 2 GPUs: LTX-2.3 TI2V two-stage
+
+```bash
+sglang generate --model-path Lightricks/LTX-2.3 \
+  --pipeline-class-name LTX2TwoStagePipeline \
+  --prompt "The cat starts walking slowly towards the camera." \
+  --image-path "${ASSET_DIR}/cat.png" \
+  --width 768 --height 512 \
+  --num-frames 121 \
+  --seed 42 --num-gpus 2 --cfg-parallel-size 2 \
+  --enable-torch-compile --warmup --save-output
+```
+
+Note: this matches the nightly comparison case `ltx2.3_twostage_ti2v_2gpus`. The nightly config omits explicit steps and guidance, so this command omits them too and uses runtime defaults. Download `${ASSET_DIR}/cat.png` with the benchmark/profile skill before running it.
 
 ### Native baseline, 2 GPUs: LTX-2.3 one-stage
 
@@ -112,7 +126,7 @@ sglang generate --model-path Lightricks/LTX-2.3 \
 
 Note: use this as the native `LTX2Pipeline` baseline for `LTX-2.3`. It keeps the validated one-stage resolution and explicit `LTX-2.3` sampling defaults, and matches the `ltx23-one-stage` benchmark preset in `sglang-diffusion-benchmark-profile`.
 
-### Benchmark target, 2 GPUs: LTX-2.3 two-stage
+### Skill-only stress target, 2 GPUs: LTX-2.3 two-stage high resolution
 
 ```bash
 sglang generate --model-path Lightricks/LTX-2.3 \
@@ -126,7 +140,7 @@ sglang generate --model-path Lightricks/LTX-2.3 \
   --enable-torch-compile --warmup --save-output
 ```
 
-Note: this is the recommended benchmark command for the `LTX-2.3` two-stage path. It uses the native `LTX2TwoStagePipeline` and matches the `ltx23-two-stage` benchmark preset in `sglang-diffusion-benchmark-profile`.
+Note: this is a high-resolution stress target for the native `LTX-2.3` two-stage path. It matches the skill-only `ltx23-two-stage` benchmark preset, not a nightly comparison case.
 
 ### Maximum speed, image model, single GPU, lossless
 
@@ -134,10 +148,66 @@ Note: this is the recommended benchmark command for the `LTX-2.3` two-stage path
 sglang generate --model-path <IMAGE_MODEL> \
   --enable-torch-compile --warmup \
   --dit-layerwise-offload false \
+  --dit-cpu-offload false \
   --prompt "..." --save-output
 ```
 
-Note: for image models, per-layer compute is smaller, so layerwise offload may not fully hide H2D transfer. Disable it if VRAM allows.
+Note: for image models, per-layer compute is smaller, so layerwise offload may not fully hide H2D transfer. Disable DiT layerwise and CPU offload if VRAM allows; otherwise a large image DiT can stay resident on CPU and make the denoise loop H2D-bound.
+
+### Image-edit baselines: JoyAI and FireRed
+
+```bash
+sglang generate --backend=sglang \
+  --model-path jdopensource/JoyAI-Image-Edit-Diffusers \
+  --prompt "Make the cat wear a red hat" \
+  --image-path "${ASSET_DIR}/cat.png" \
+  --width 1024 --height 1024 \
+  --num-inference-steps 40 --guidance-scale 4.0 \
+  --num-gpus 2 --enable-cfg-parallel --ulysses-degree 1 \
+  --dit-layerwise-offload false --dit-cpu-offload false \
+  --enable-torch-compile --warmup --save-output
+```
+
+```bash
+sglang generate --backend=sglang \
+  --model-path FireRedTeam/FireRed-Image-Edit-1.1 \
+  --prompt "Make the cat wear a red hat" \
+  --image-path "${ASSET_DIR}/cat.png" \
+  --width 1024 --height 1024 \
+  --num-inference-steps 40 --guidance-scale 4.0 \
+  --num-gpus 2 --enable-cfg-parallel --ulysses-degree 1 \
+  --dit-layerwise-offload false --dit-cpu-offload false \
+  --enable-torch-compile --warmup --save-output
+```
+
+Use `FireRedTeam/FireRed-Image-Edit-1.0` in the same command when comparing
+FireRed 1.0. These are native image-edit paths; keep the reference image, prompt,
+seed, and output size fixed when comparing denoise numbers. On H100, 2-GPU CFG
+parallel was faster than the otherwise matching 2-GPU Ulysses command: FireRed
+1.0 improved from 13419.15 ms to 10955.90 ms, and FireRed 1.1 improved from
+13414.72 ms to 10934.21 ms.
+
+### Hunyuan3D shape baseline
+
+```bash
+OUTPUT_DIR=$(python3 "$ENV_PY" print-output-dir --kind benchmarks --mkdir)
+CONFIG_DIR="${OUTPUT_DIR}/generated_configs"
+mkdir -p "${CONFIG_DIR}"
+printf '{"paint_enable": false}\n' > "${CONFIG_DIR}/hunyuan3d-shape.json"
+
+sglang generate --backend=sglang \
+  --model-path tencent/Hunyuan3D-2 \
+  --prompt "generate 3d mesh" \
+  --image-path "${ASSET_DIR}/cat.png" \
+  --config "${CONFIG_DIR}/hunyuan3d-shape.json" \
+  --num-inference-steps 50 --guidance-scale 5.0 \
+  --dit-layerwise-offload false --dit-cpu-offload false \
+  --enable-torch-compile --warmup --save-output
+```
+
+For Hunyuan3D, treat `Hunyuan3DShapeDenoisingStage` as the primary latency
+metric. Mesh export and paint stages are useful end-to-end checks but should not
+drive DiT optimization decisions.
 
 ### Low VRAM, decent speed (single GPU)
 
@@ -149,26 +219,72 @@ sglang generate --model-path <MODEL> \
   --prompt "..." --save-output
 ```
 
-### Maximum speed, lossy (SageAttention + Cache-DiT)
+### Maximum speed, lossy native path (SageAttention + Cache-DiT)
 
 ```bash
 SGLANG_CACHE_DIT_ENABLED=true sglang generate --model-path <MODEL> \
   --attention-backend sage_attn \
-  --cache-dit-config <config.yaml> \
+  --dit-layerwise-offload false \
   --enable-torch-compile --warmup \
+  --prompt "..." --save-output
+```
+
+Add native Cache-DiT knobs such as `SGLANG_CACHE_DIT_SCM_PRESET=medium`,
+`SGLANG_CACHE_DIT_RDT=0.24`, or `SGLANG_CACHE_DIT_TAYLORSEER=true` only after
+you have a BF16 baseline output to compare against.
+
+For a diffusers-backend Cache-DiT YAML/JSON config baseline, make the fallback
+explicit:
+
+```bash
+sglang generate --backend diffusers --model-path <MODEL> \
+  --cache-dit-config <config.yaml> \
   --dit-layerwise-offload false \
   --prompt "..." --save-output
 ```
 
 ---
 
+## Model-Specific Starting Points
+
+Use these as first commands to benchmark, not as universal winners.
+
+| Model family | First performance shape | Starting flags | Notes |
+|---|---|---|---|
+| FLUX.1 / FLUX.2 image | 1024x1024, runtime-default steps/guidance, 1 GPU | `--enable-torch-compile --warmup --dit-layerwise-offload false` | `black-forest-labs/FLUX.*` repos are gated; for FP8/NVFP4 use validated `--transformer-path` or `--transformer-weights-path` flows from the quant skill. |
+| FLUX.2 Klein / Klein Base | 1024x1024, runtime-default steps/guidance, 1 GPU | `--enable-torch-compile --warmup --dit-layerwise-offload false` | Current registry has `black-forest-labs/FLUX.2-klein-4B`, `FLUX.2-klein-9B`, and base variants. Klein is step-distilled; Klein Base is not. |
+| Qwen-Image / Qwen-Image-Edit | 1024x1024, runtime-default steps/guidance, 1 GPU | `--enable-torch-compile --warmup`; optionally native `SGLANG_CACHE_DIT_ENABLED=true` | Cache-DiT is lossy. For edit tasks, keep reference image, seed, and output size fixed. |
+| Z-Image / Z-Image-Turbo | 1024x1024, runtime-default steps/guidance, 1 GPU | `--enable-torch-compile --warmup` | Keep base Z-Image separate from Turbo: base uses 50-step CFG defaults, Turbo uses 9-step zero-CFG defaults. Mainline has Z-Image tanh/gate norm fusions. |
+| Wan2.2 A14B T2V/I2V | 1280x720, 81 frames | Nightly: `--num-gpus 4 --enable-cfg-parallel --ulysses-degree 2 --text-encoder-cpu-offload --pin-cpu-memory` | For lowest latency, also benchmark pure Ulysses on the same GPUs. |
+| Wan2.2 TI2V 5B | 1280x720, 81 frames, 1 GPU | `--enable-torch-compile --warmup` | Keep the input image and motion prompt fixed when comparing sparse attention or Cache-DiT. |
+| Wan2.1 / FastWan / TurboWan variants | 480p or 720p video, family defaults | `--enable-torch-compile --warmup`; add `--ulysses-degree` / CFG parallel only after measuring | Current registry includes Wan2.1, FastWan2.1, FastWan2.2 TI2V, TurboWan2.1, TurboWan2.2 I2V, and Wan2.1-Fun InP. Use the compatibility matrix and benchmark presets before choosing topology. |
+| Cosmos3 Nano / Super | T2I: 1024x1024 with `--num-frames 1`; T2V/I2V: 480p/720p video | `SGLANG_DISABLE_COSMOS3_GUARDRAILS=1` for benchmark isolation; `--enable-torch-compile --warmup` | One checkpoint serves T2I/T2V/I2V. Mode is request-driven: `num_frames == 1` means T2I, `--image-path` means I2V. |
+| Ideogram 4 FP8/NVFP4 | 1024x1024, native preset defaults | `--enable-torch-compile --warmup` | Do not set `--num-inference-steps` or `--guidance-scale` directly unless you also update the Ideogram preset; sampling params derive them from `preset`. |
+| ERNIE-Image / GLM-Image / SANA / SD3 | 1024-class image, family defaults | `--enable-torch-compile --warmup`; disable offload only after checking VRAM | Treat these as current native image families. Start with benchmark/profile presets for ERNIE, GLM, and SANA; use registry/config defaults for SD3 unless you add a new preset. |
+| LTX-2 / LTX-2.3 | 768x512 or HQ 1920x1088, 121 frames | `--pipeline-class-name LTX2TwoStagePipeline --enable-torch-compile --warmup`; HQ uses `LTX2TwoStageHQPipeline` | Use benchmark/profile presets for nightly alignment, one-stage, high-resolution stress, and HQ. Device mode choices are `original` and `resident`; `resident` is fastest but uses more VRAM. `snapshot` is a deprecated alias for `original`, so do not use it in new commands. |
+| HunyuanVideo | 848x480 or 720p class video | `--text-encoder-cpu-offload --pin-cpu-memory --enable-torch-compile --warmup` | Check VAE decode separately. GroupNorm+SiLU is default-eligible in mainline when wrapper guards pass; use `bench_group_norm_silu.py` when VAE residual blocks are hot. |
+| JoyAI-Image-Edit | 1024-class TI2I, 40 steps, guidance 4.0 | `--backend=sglang --num-gpus 2 --enable-cfg-parallel --ulysses-degree 1 --enable-torch-compile --warmup --dit-layerwise-offload false --dit-cpu-offload false` | Newly supported image-edit path. Keep the input image, prompt, seed, and output size fixed; 2-GPU CFG parallel is the validated H100 starting point. |
+| FireRed-Image-Edit 1.0 / 1.1 | 1024x1024 image edit, 40 steps, guidance 4.0 | `--backend=sglang --num-gpus 2 --enable-cfg-parallel --ulysses-degree 1 --enable-torch-compile --warmup --dit-layerwise-offload false --dit-cpu-offload false` | Uses the native `QwenImageEditPlusPipeline` path. 2-GPU CFG parallel is the validated H100 starting point; benchmark 1.0 and 1.1 separately because checkpoint differences can change denoise latency. |
+| Hunyuan3D-2 shape | Shape generation, 50 steps, guidance 5.0 | `--backend=sglang --enable-torch-compile --warmup --dit-layerwise-offload false --dit-cpu-offload false` | Focus on `Hunyuan3DShapeDenoisingStage`; keep mesh export/paint timings separate from denoise. |
+| MOVA / Helios / LingBot World | Use the benchmark/profile presets or server test cases first | `--enable-torch-compile --warmup`; pin offload and topology flags explicitly | These video/realtime families have model-specific stages and condition handling. Keep prompt/image/action inputs fixed and prefer perf dumps over wall time alone. |
+
+## Historical PR Watchlist
+
+Treat these performance PRs as direction and prior art only. Re-check the PR
+state and the active source tree before relying on any path, flag, or claim
+about whether the work has merged:
+
+- Fusion/kernel: #24025 LTX2 QK norm, #24059 Helios norm modulation, #24117 Z-Image packed QKV, #19488 Wan elementwise cross-block fusion, #19249 Z-Image gate/norm fusion, #20429 Qwen-Image layernorm/modulation, #20530 MOVA RMSNorm+RoPE.
+- VAE/decode: #22531 LTX2 parallel VAE, #20927 batched tiled VAE decode.
+- Runtime/parallel/cache: #22805 FLUX.2 packed QKV for A2A, #21742 hybrid attention schedule, #24053 USP replicated-prefix fix, #21613 TeaCache refactor, #24227 WanVideo TeaCache fix, #18764 dynamic batching, #24200 disaggregated diffusion.
+
 ## Tips
 
 - **Benchmarking**: always use `--warmup` and look for the line ending with `(with warmup excluded)` for accurate timing.
 - **Perf dump**: use `--perf-dump-path result.json` to save structured metrics, then compare with `python python/sglang/multimodal_gen/benchmarks/compare_perf.py baseline.json result.json`.
 - **Offload tuning**: after the first request, the runtime logs peak GPU memory and which components could stay resident. Use this to decide which `--*-cpu-offload` flags to disable.
-- **Backend selection**: `--backend sglang` (default, auto-detected) enables all native optimizations (fused kernels, SP, etc.). `--backend diffusers` falls back to vanilla Diffusers pipelines but supports `--cache-dit-config` and diffusers attention backends.
+- **Backend selection**: `--backend sglang` (default, auto-detected) enables native optimizations (fused kernels, SP, native Cache-DiT env knobs, etc.). `--backend diffusers` falls back to Diffusers pipelines and is the path that accepts `--cache-dit-config` plus diffusers attention backend names.
 - **Wan2.2-I2V sizing**: explicit `--width/--height` on `Wan2.2-I2V-A14B` control the target area while preserving the condition-image aspect ratio.
-- **Mainline diffusion fast paths**: before proposing a new kernel or overlap scheme, check `sglang-diffusion-benchmark-profile/existing-fast-paths.md`. It covers Z-Image residual-form modulation, fused diffusion `QK norm + RoPE`, and existing multi-GPU overlap families such as Ulysses / USP and turbo-layer async all-to-all.
+- **Mainline diffusion fast paths**: before proposing a new kernel or overlap scheme, check `sglang-diffusion-benchmark-profile/existing-fast-paths.md`. It covers GroupNorm+SiLU, Z-Image residual-form modulation, fused diffusion `QK norm + RoPE`, LTX2 split RoPE, LTX2 residual-gate add, varlen USP pack/scatter, packed QKV/NVFP4 expectations, and existing multi-GPU overlap families such as Ulysses / USP and turbo-layer async all-to-all.
 - **NVFP4 trace interpretation**: on FLUX.2 NVFP4 and Nunchaku-style checkpoints, packed QKV is expected. SGLang intentionally uses fused projection modules such as `to_qkv` / `to_added_qkv` instead of separate `to_q` / `to_k` / `to_v`, so a split-QKV trace usually means the quantized path did not engage rather than a brand new fusion opportunity.
-- **Hotspot workflow split**: use `sglang-diffusion-benchmark-profile` to prove and classify a slowdown with perf dumps plus `torch.profiler`; hand concrete kernel work to `sglang-diffusion-ako4all-kernel` or another specialized optimization skill instead of expanding the benchmark skill.
+- **Hotspot workflow split**: use `sglang-diffusion-benchmark-profile` to prove and classify a slowdown with perf dumps plus `torch.profiler`; hand concrete kernel work off with the perf/profile evidence attached instead of expanding the benchmark skill.

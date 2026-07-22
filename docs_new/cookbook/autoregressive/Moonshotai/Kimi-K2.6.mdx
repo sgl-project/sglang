@@ -2,7 +2,6 @@
 title: Kimi-K2.6
 metatags:
     description: "Deploy Kimi-K2.6 native multimodal agentic model with SGLang - reasoning, tool calling, and multimodal capabilities."
-tag: NEW
 ---
 
 ## 1. Model Introduction
@@ -66,7 +65,12 @@ tag: NEW
 - Thinking Mode: `temperature=1.0`, `top_p=0.95`
 - Instant Mode: `temperature=0.6`, `top_p=0.95`
 
-**License:** Modified MIT
+**Available Models:**
+
+- **INT4 (native checkpoint)**: [moonshotai/Kimi-K2.6](https://huggingface.co/moonshotai/Kimi-K2.6)
+- **NVFP4 (4-bit quantized, NVIDIA Blackwell)**: [nvidia/Kimi-K2.6-NVFP4](https://huggingface.co/nvidia/Kimi-K2.6-NVFP4)
+
+**License:** Modified MIT for the native checkpoint. The NVIDIA NVFP4 checkpoint is governed by the [NVIDIA Open Model License](https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-open-model-license/).
 
 For details, see [official documentation](https://huggingface.co/moonshotai/Kimi-K2.6) and [tech blog](https://kimi.com/blog/kimi-k2-6).
 
@@ -86,7 +90,8 @@ import { KimiK26Deployment } from '/src/snippets/autoregressive/kimi-k26-deploym
 
 ### 3.2 Configuration Tips
 
-- **Memory**: Requires GPUs with ≥140GB each. Supported platforms: H200 (8×, TP=8), B300 (8×, TP=8), MI300X/MI325X (4×, TP=4), MI350X/MI355X (4×, TP=4). Use `--context-length 128000` to conserve memory.
+- **Memory**: Requires GPUs with ≥140GB each. The native INT4 checkpoint supports H200 (8×, TP=8), B300 (8×, TP=8), GB300 (4×, TP=4), MI300X/MI325X (4×, TP=4), and MI350X/MI355X (4×, TP=4). Use `--context-length 128000` to conserve memory.
+- **NVFP4**: Use `nvidia/Kimi-K2.6-NVFP4` with `--quantization modelopt_fp4` on NVIDIA Blackwell. Use `tp=8` on B300 and `tp=4` on GB300.
 - **AMD GPU TP Constraint**: On AMD GPUs, TP must be ≤ 4 (not 8). Kimi-K2.6 has 64 attention heads; the AITER MLA kernel requires `heads_per_gpu % 16 == 0`. With TP=4, each GPU gets 16 heads (valid). With TP=8, each GPU gets 8 heads (invalid).
 - **AMD Docker Image**: Use `lmsysorg/sglang:v0.5.9-rocm700-mi35x` for MI350X/MI355X and `lmsysorg/sglang:v0.5.9-rocm700-mi30x` for MI300X/MI325X.
 - **DP Attention**: Enable with `--dp <N> --enable-dp-attention` for production throughput. A common choice is to set `--dp` equal to `--tp`, but this is not required.
@@ -469,6 +474,48 @@ Let me search for this product and similar items for you.
   Arguments: {"query":"Auntie Anne's Cinnamon Sugar Pretzel"}
 ```
 
+#### 4.2.5 Speculative Decoding
+
+**NVIDIA**
+
+Deploy Kimi-K2.6 with the following command (H200/B300, all features enabled):
+
+```shell Command
+sglang serve \
+  --model-path moonshotai/Kimi-K2.6 \
+  --tp 8 \
+  --reasoning-parser kimi_k2 \
+  --tool-call-parser kimi_k2 \
+  --speculative-algorithm EAGLE3 \
+  --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4 \
+  --speculative-draft-model-path lightseekorg/kimi-k2.6-eagle3.1-mla \
+  --trust-remote-code \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
+Deploy Kimi-K2.6-NVFP4 with the following command (B300, all features enabled):
+
+```shell Command
+sglang serve \
+  --model-path nvidia/Kimi-K2.6-NVFP4 \
+  --tp 8 \
+  --quantization modelopt_fp4 \
+  --reasoning-parser kimi_k2 \
+  --tool-call-parser kimi_k2 \
+  --speculative-algorithm EAGLE3 \
+  --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4 \
+  --speculative-draft-model-path lightseekorg/kimi-k2.6-eagle3.1-mla \
+  --trust-remote-code \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
+For GB300, use `--tp 4`.
 
 ## 5. Benchmark
 
@@ -482,6 +529,44 @@ Let me search for this product and similar items for you.
 - SGLang version: 0.5.9
 - Reasoning Parser: `kimi_k2`
 - Tool Call Parser: `kimi_k2`
+
+#### NVIDIA NVFP4 Accuracy Reference
+
+NVIDIA reports the following accuracy results for `nvidia/Kimi-K2.6-NVFP4` compared with the native INT4 baseline, using `temperature=1.0`, `top_p=0.95`, and max tokens 128,000:
+
+<table>
+  <thead>
+    <tr>
+      <th>Precision</th>
+      <th>GPQA Diamond</th>
+      <th>SciCode</th>
+      <th>τ²-Bench Telecom</th>
+      <th>MMMU Pro</th>
+      <th>AA-LCR</th>
+      <th>IFBench</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Baseline (INT4)</td>
+      <td>90.9</td>
+      <td>52.6</td>
+      <td>98.2</td>
+      <td>75.6</td>
+      <td>71.0</td>
+      <td>73.9</td>
+    </tr>
+    <tr>
+      <td>NVFP4</td>
+      <td>90.4</td>
+      <td>54.4</td>
+      <td>98.0</td>
+      <td>76.5</td>
+      <td>71.8</td>
+      <td>73.9</td>
+    </tr>
+  </tbody>
+</table>
 
 #### 5.1.1 K2-Vendor-Verifier (Tool Calling)
 

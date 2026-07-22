@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/distributed/device_communicators/custom_all_reduce_utils.py
 
 import ctypes
@@ -19,6 +21,7 @@ from typing_extensions import ParamSpec
 
 from sglang.srt.distributed.device_communicators.cuda_wrapper import CudaRTLibrary
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
+from sglang.srt.environ import envs as sglang_envs
 from sglang.srt.utils import is_cuda, is_hip, is_musa
 
 logger = logging.getLogger(__name__)
@@ -259,8 +262,8 @@ def gpu_p2p_access_check(src: int, tgt: int) -> bool:
         cuda_visible_devices = ",".join(str(i) for i in range(num_dev))
 
     # VLLM_CACHE_ROOT -> SGLANG_CACHE_ROOT
-    # "~/.cache/vllm" -> "~/.cache/sglang"
-    SGLANG_CACHE_ROOT = os.path.expanduser("~/.cache/sglang")
+    # "~/.cache/vllm" -> envs.SGLANG_CACHE_DIR
+    SGLANG_CACHE_ROOT = os.path.expanduser(sglang_envs.SGLANG_CACHE_DIR.get())
     path = os.path.join(
         SGLANG_CACHE_ROOT, f"gpu_p2p_access_cache_for_{cuda_visible_devices}.json"
     )

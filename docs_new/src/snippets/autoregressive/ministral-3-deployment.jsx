@@ -50,7 +50,7 @@ export const Ministral3Deployment = () => {
 
     let cmd = 'sglang serve \\\n';
 
-    cmd += `  --model ${modelCfg.modelId}`;
+    cmd += `  --model-path ${modelCfg.modelId}`;
 
     if (tp > 1) {
       cmd += ` \\\n  --tp ${tp}`;

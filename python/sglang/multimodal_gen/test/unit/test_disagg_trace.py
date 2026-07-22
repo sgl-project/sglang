@@ -19,6 +19,10 @@ from __future__ import annotations
 
 import json
 import unittest
+from contextlib import contextmanager
+from types import SimpleNamespace
+
+import torch
 
 from sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin import (
     SchedulerDisaggMixin,
@@ -26,8 +30,11 @@ from sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin import (
 )
 from sglang.multimodal_gen.runtime.disaggregation.transport.codec import pack_tensors
 from sglang.multimodal_gen.runtime.pipelines_core import Req
+from sglang.srt import server_args as srt_server_args_module
 from sglang.srt.observability import trace as srt_trace
 from sglang.srt.observability.trace import TraceNullContext, TraceReqContext
+from sglang.srt.runtime_context import reset_context
+from sglang.srt.server_args import set_global_server_args_for_scheduler
 
 try:
     from opentelemetry import propagate as otel_propagate
@@ -54,6 +61,22 @@ def _enable_minimal_otel() -> None:
     srt_trace.trace_set_thread_info("TestThread")
 
 
+@contextmanager
+def _srt_trace_server_args():
+    try:
+        prev_server_args = srt_server_args_module.get_global_server_args()
+    except ValueError:  # nothing published yet
+        prev_server_args = None
+    set_global_server_args_for_scheduler(SimpleNamespace(trace_modules="request"))
+    try:
+        yield
+    finally:
+        if prev_server_args is None:
+            reset_context()
+        else:
+            set_global_server_args_for_scheduler(prev_server_args)
+
+
 def _traceparent_from(ctx) -> str | None:
     """Re-inject a W3C carrier from an OTel Context and return the traceparent.
 
@@ -74,6 +97,43 @@ def _roundtrip_scalar_fields(scalar_fields: dict) -> dict:
 
 
 class TestDisaggTracePropagation(unittest.TestCase):
+    def test_transfer_keeps_seed_needed_to_rebuild_generator(self):
+        req = Req(request_id="test-seed", prompt="x")
+        req.generator = torch.Generator(device="cpu").manual_seed(req.seed)
+
+        _, scalar_fields = extract_transfer_fields(req)
+
+        self.assertEqual(scalar_fields["seed"], 42)
+
+        rebuilt = SchedulerDisaggMixin._build_disagg_req(None, dict(scalar_fields), {})
+        self.assertIsInstance(rebuilt.generator, torch.Generator)
+        self.assertEqual(rebuilt.seed, 42)
+
+        expected = torch.rand(
+            (), generator=torch.Generator(device="cpu").manual_seed(42)
+        )
+        actual = torch.rand((), generator=rebuilt.generator)
+        self.assertEqual(actual.item(), expected.item())
+
+    def test_build_disagg_req_rebuilds_generator_list(self):
+        scalar_fields = {
+            "request_id": "test-seed-list",
+            "prompt": "x",
+            "num_outputs_per_prompt": 2,
+            "seed": [11, 12],
+        }
+
+        rebuilt = SchedulerDisaggMixin._build_disagg_req(None, dict(scalar_fields), {})
+
+        self.assertEqual(rebuilt.seed, [11, 12])
+        self.assertEqual(len(rebuilt.generator), 2)
+        for seed, generator in zip(rebuilt.seed, rebuilt.generator):
+            expected = torch.rand(
+                (), generator=torch.Generator(device="cpu").manual_seed(seed)
+            )
+            actual = torch.rand((), generator=generator)
+            self.assertEqual(actual.item(), expected.item())
+
     def test_tracing_disabled_omits_trace_state(self):
         """With a default TraceNullContext Req, no _trace_state is emitted and
         the JSON codec does not encounter any live OTel objects."""
@@ -94,35 +154,37 @@ class TestDisaggTracePropagation(unittest.TestCase):
         TraceReqContext with an OTel Context (not the raw dict)."""
         _enable_minimal_otel()
 
-        ctx = TraceReqContext(rid="test-on", role="server", module_name="request")
-        ctx.trace_req_start()
-        self.assertTrue(ctx.tracing_enable)
-        self.assertFalse(ctx.is_copy)
+        with _srt_trace_server_args():
+            ctx = TraceReqContext(rid="test-on", role="server", module_name="request")
+            ctx.trace_req_start()
+            self.assertTrue(ctx.tracing_enable)
+            self.assertFalse(ctx.is_copy)
 
-        req = Req(request_id="test-on", prompt="x")
-        req.trace_ctx = ctx
+            req = Req(request_id="test-on", prompt="x")
+            req.trace_ctx = ctx
 
-        _, scalar_fields = extract_transfer_fields(req)
-        self.assertNotIn("trace_ctx", scalar_fields)
-        self.assertIn("_trace_state", scalar_fields)
-        state = scalar_fields["_trace_state"]
-        self.assertTrue(state.get("tracing_enable"))
-        # W3C carrier must be present so downstream roles can nest spans.
-        self.assertIn("traceparent", state.get("root_span_context", {}))
+            _, scalar_fields = extract_transfer_fields(req)
+            self.assertNotIn("trace_ctx", scalar_fields)
+            self.assertIn("_trace_state", scalar_fields)
+            state = scalar_fields["_trace_state"]
+            self.assertTrue(state.get("tracing_enable"))
+            # W3C carrier must be present so downstream roles can nest spans.
+            self.assertIn("traceparent", state.get("root_span_context", {}))
 
-        decoded = _roundtrip_scalar_fields(scalar_fields)
-        self.assertEqual(decoded["_trace_state"], state)
+            decoded = _roundtrip_scalar_fields(scalar_fields)
+            self.assertEqual(decoded["_trace_state"], state)
 
-        rebuilt = object.__new__(TraceReqContext)
-        rebuilt.__setstate__(decoded["_trace_state"])
-        self.assertTrue(rebuilt.tracing_enable)
-        self.assertTrue(rebuilt.is_copy)
-        # The sender's traceparent must survive into the rebuilt Context so
-        # downstream role spans nest under the original trace_id.
-        self.assertEqual(
-            _traceparent_from(rebuilt.root_span_context),
-            state["root_span_context"]["traceparent"],
-        )
+            rebuilt = object.__new__(TraceReqContext)
+            rebuilt.__setstate__(decoded["_trace_state"])
+            self.assertTrue(rebuilt.tracing_enable)
+            self.assertTrue(rebuilt.is_copy)
+            # The sender's traceparent must survive into the rebuilt Context so
+            # downstream role spans nest under the original trace_id.
+            self.assertEqual(
+                _traceparent_from(rebuilt.root_span_context),
+                state["root_span_context"]["traceparent"],
+            )
+            ctx.trace_req_finish()
 
     @unittest.skipUnless(_OTEL_AVAILABLE, "opentelemetry SDK not installed")
     def test_build_disagg_req_installs_rebuilt_ctx(self):
@@ -131,22 +193,26 @@ class TestDisaggTracePropagation(unittest.TestCase):
         the Req as a stray attribute."""
         _enable_minimal_otel()
 
-        ctx = TraceReqContext(rid="test-brq", role="server", module_name="request")
-        ctx.trace_req_start()
+        with _srt_trace_server_args():
+            ctx = TraceReqContext(rid="test-brq", role="server", module_name="request")
+            ctx.trace_req_start()
 
-        req = Req(request_id="test-brq", prompt="x")
-        req.trace_ctx = ctx
-        _, scalar_fields = extract_transfer_fields(req)
-        self.assertIn("_trace_state", scalar_fields)
+            req = Req(request_id="test-brq", prompt="x")
+            req.trace_ctx = ctx
+            _, scalar_fields = extract_transfer_fields(req)
+            self.assertIn("_trace_state", scalar_fields)
 
-        # _build_disagg_req is an instance method but its body does not touch
-        # ``self``; call via __func__ to avoid needing a real Scheduler.
-        rebuilt = SchedulerDisaggMixin._build_disagg_req(None, dict(scalar_fields), {})
+            # _build_disagg_req is an instance method but its body does not
+            # touch ``self``; call via __func__ to avoid needing a real Scheduler.
+            rebuilt = SchedulerDisaggMixin._build_disagg_req(
+                None, dict(scalar_fields), {}
+            )
 
-        self.assertIsInstance(rebuilt.trace_ctx, TraceReqContext)
-        self.assertTrue(rebuilt.trace_ctx.tracing_enable)
-        self.assertTrue(rebuilt.trace_ctx.is_copy)
-        self.assertFalse(hasattr(rebuilt, "_trace_state"))
+            self.assertIsInstance(rebuilt.trace_ctx, TraceReqContext)
+            self.assertTrue(rebuilt.trace_ctx.tracing_enable)
+            self.assertTrue(rebuilt.trace_ctx.is_copy)
+            self.assertFalse(hasattr(rebuilt, "_trace_state"))
+            ctx.trace_req_finish()
 
     @unittest.skipUnless(_OTEL_AVAILABLE, "opentelemetry SDK not installed")
     def test_build_disagg_req_falls_back_when_tracing_off(self):

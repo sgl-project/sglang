@@ -27,6 +27,78 @@ sys.path.insert(
 
 from ci_register import CIRegistry, HWBackend, ut_parse_one_file
 
+# Display order for backend tables / sections. The list is sourced from
+# HWBackend so a newly-added enum member can never be silently dropped from
+# the report -- if the assert below fires, add the new backend name here in
+# the right display slot. Order isn't alphabetical: CUDA/AMD/NPU/CPU lead
+# (highest test volume historically), then accelerators that have been
+# wired into the registry more recently (XPU, MUSA, MLX).
+BACKEND_DISPLAY_ORDER = ("CUDA", "AMD", "NPU", "CPU", "XPU", "MUSA", "MLX")
+assert set(BACKEND_DISPLAY_ORDER) == {
+    b.name for b in HWBackend
+}, "BACKEND_DISPLAY_ORDER is out of sync with HWBackend"
+
+# --------------------------------------------------------------------------- #
+# multimodal_gen test coverage
+#
+# multimodal_gen tests live under python/sglang/multimodal_gen/test/ and use
+# their own run_suite.py / partitioning framework, NOT the register_*_ci()
+# registry used under test/registered/. To surface them in the daily
+# overview we synthesize CIRegistry records from file paths + filename
+# tokens, using the rules below. These are heuristics derived from how the
+# multimodal_gen workflows (pr-test-{musa,npu,amd}.yml, pr-test-multimodal-
+# gen.yml) currently invoke each file -- they MAY drift if a workflow
+# stops/starts running a directory.
+# --------------------------------------------------------------------------- #
+MULTIMODAL_GEN_TEST_DIR = "python/sglang/multimodal_gen/test"
+
+# Subdirectory (relative to MULTIMODAL_GEN_TEST_DIR) -> backends those files
+# run on by default. Empty string is the top-level. Files whose tokenized
+# filename contains an explicit backend marker (see below) override this.
+_MM_GEN_SUBDIR_BACKENDS = {
+    # Top-level helper-style tests (e.g. test_consistency_metrics.py).
+    "": ("CUDA",),
+    # server/ top-level: pr-test-multimodal-gen.yml drives CUDA, pr-test-amd
+    # mirrors the same suite on AMD runners.
+    "server": ("CUDA", "AMD"),
+    "server/musa": ("MUSA",),
+    "server/ascend": ("NPU",),
+    "layers": ("CUDA",),
+    # unit/ are portable CPU-style unit tests. pr-test-amd now runs the `unit`
+    # suite on ROCm (multimodal-gen-unit-test-amd, both 7.0.0 and 7.2.0), so
+    # they are AMD-covered too, not CUDA-only.
+    "unit": ("CUDA", "AMD"),
+    "cli": ("CUDA",),
+    "manual": ("CUDA",),
+    # Standalone server/CLI single-file tests (restructured out of server/).
+    # Run on CUDA CI; AMD parity for these standalone files is TBD, so
+    # CUDA-only for now (previously matched no rule and were dropped entirely).
+    "single_test_file": ("CUDA",),
+    "single_test_file/component_accuracy": ("CUDA",),
+    # Nested unit suites run only on the CUDA lane today (they are not part of
+    # the AMD `unit` suite that multimodal-gen-unit-test-amd executes).
+    "unit/realtime": ("CUDA",),
+    "unit/sana_wm": ("CUDA",),
+    "unit/progressive_resolution": ("CUDA",),
+    # musa-named unit layer kernels.
+    "unit/musa/layers": ("MUSA",),
+}
+
+# Filenames that match `test_*.py` by convention but contain no real tests
+# (utility / fixture modules). Skipped before classification.
+_MM_GEN_HELPER_FILENAMES = frozenset({"test_utils.py"})
+
+# Filename token -> backend override. Tokenization is `stem.split("_")`, so a
+# file like `test_server_1_gpu_musa.py` yields tokens
+# {test, server, 1, gpu, musa} and matches `musa`. This correctly catches
+# both `test_musa_*.py` (musa-named kernels) and `test_*_musa*.py` (musa
+# variants of generic server tests). `nightly` is detected the same way and
+# flips the nightly flag without changing the backend.
+_MM_GEN_FILENAME_BACKEND_TOKENS = {
+    "musa": ("MUSA",),
+    "npu": ("NPU",),
+}
+
 
 def collect_all_tests(registered_dir: str) -> list[CIRegistry]:
     """Collect all CI registrations from registered directory."""
@@ -43,10 +115,92 @@ def collect_all_tests(registered_dir: str) -> list[CIRegistry]:
     return all_tests
 
 
+def collect_multimodal_gen_tests(
+    mm_gen_dir: str = MULTIMODAL_GEN_TEST_DIR,
+) -> list[CIRegistry]:
+    """Synthesize CIRegistry records for multimodal_gen tests.
+
+    multimodal_gen doesn't use register_*_ci(); see the module-level comment
+    above MULTIMODAL_GEN_TEST_DIR for the rules. Returns one record per
+    (file, backend) pair, matching the convention used for registered tests
+    that target multiple backends.
+    """
+    mm_gen_path = Path(mm_gen_dir)
+    if not mm_gen_path.is_dir():
+        return []
+
+    # Discover test files: anything matching test_*.py anywhere under the
+    # tree. The csrc/ and apps/ subtrees aren't part of the test/ directory
+    # so we don't need to exclude them.
+    test_files = sorted(mm_gen_path.glob("**/test_*.py"))
+    records: list[CIRegistry] = []
+
+    for file in test_files:
+        rel = file.relative_to(mm_gen_path)
+        subdir = "/".join(rel.parts[:-1])  # "" for top-level
+        filename_only = rel.parts[-1]
+
+        if filename_only in _MM_GEN_HELPER_FILENAMES:
+            continue  # test_utils.py and similar -- helper modules, not tests
+
+        # Tokenize stem to look for explicit backend / nightly markers.
+        stem_tokens = set(filename_only[:-3].split("_"))
+        nightly = "nightly" in stem_tokens
+
+        backends: tuple[str, ...] = ()
+        for token, override in _MM_GEN_FILENAME_BACKEND_TOKENS.items():
+            if token in stem_tokens:
+                backends = override
+                break
+        if not backends:
+            backends = _MM_GEN_SUBDIR_BACKENDS.get(subdir, ())
+
+        if not backends:
+            print(
+                f"Warning: multimodal_gen file {file} matches no backend "
+                f"rule (subdir={subdir!r}, tokens={sorted(stem_tokens)}); "
+                f"add a rule to _MM_GEN_SUBDIR_BACKENDS.",
+                file=sys.stderr,
+            )
+            continue
+
+        for backend_name in backends:
+            records.append(
+                CIRegistry(
+                    backend=HWBackend[backend_name],
+                    filename=str(file),
+                    # mm_gen does its own per-case partitioning -- file-level
+                    # estimates aren't available. Surfaced as 0 in the
+                    # by-suite section, which is correct (we don't know).
+                    est_time=0.0,
+                    suite=f"mm-gen-{backend_name.lower()}",
+                    nightly=nightly,
+                    disabled=None,
+                )
+            )
+
+    return records
+
+
 def get_folder_name(filename: str) -> str:
-    """Extract folder name from test filename."""
-    # e.g., "registered/models/test_foo.py" -> "models"
+    """Extract folder name from test filename.
+
+    Registered tests use test/registered/<folder>/test_*.py and map to
+    <folder>. multimodal_gen tests live outside that tree and get a virtual
+    `mm_gen/<subdir>` folder so they show up as their own rows in the
+    Folder Summary table.
+    """
     parts = Path(filename).parts
+    if "multimodal_gen" in parts:
+        try:
+            mg_idx = parts.index("multimodal_gen")
+            test_idx = parts.index("test", mg_idx)
+            sub_parts = parts[test_idx + 1 : -1]  # strip 'test' anchor + file
+            if sub_parts:
+                return "mm_gen/" + "/".join(sub_parts)
+            return "mm_gen"
+        except ValueError:
+            pass  # fall through to default
     if "registered" in parts:
         idx = parts.index("registered")
         if idx + 1 < len(parts) - 1:  # Has subfolder
@@ -113,7 +267,7 @@ def generate_summary_section(data: dict) -> str:
     lines.append("| Backend | Total | Enabled | Disabled | Per-Commit | Nightly |")
     lines.append("|---------|-------|---------|----------|------------|---------|")
 
-    for backend in ["CUDA", "AMD", "NPU", "CPU"]:
+    for backend in BACKEND_DISPLAY_ORDER:
         backend_tests = by_backend.get(backend, [])
         if not backend_tests:
             continue
@@ -128,21 +282,25 @@ def generate_summary_section(data: dict) -> str:
 
     lines.append("\n</details>\n")
 
-    # Folder summary (collapsible)
+    # Folder summary (collapsible). Only show columns for backends that
+    # have at least one registered test across the whole report -- otherwise
+    # adding scaffolding for an unused backend would widen every row with a
+    # column of zeros.
+    active_backends = [b for b in BACKEND_DISPLAY_ORDER if by_backend.get(b)]
     lines.append("<details>")
     lines.append("<summary><h2>Folder Summary</h2></summary>\n")
-    lines.append("| Folder | CUDA | AMD | NPU | CPU | Total |")
-    lines.append("|--------|------|-----|-----|-----|-------|")
+    header_cells = ["Folder", *active_backends, "Total"]
+    lines.append("| " + " | ".join(header_cells) + " |")
+    lines.append("|" + "|".join(["-" * max(len(c), 3) for c in header_cells]) + "|")
 
     for folder in sorted(by_folder.keys()):
         folder_tests = by_folder[folder]
-        cuda = sum(1 for t in folder_tests if t.backend == HWBackend.CUDA)
-        amd = sum(1 for t in folder_tests if t.backend == HWBackend.AMD)
-        npu = sum(1 for t in folder_tests if t.backend == HWBackend.NPU)
-        cpu = sum(1 for t in folder_tests if t.backend == HWBackend.CPU)
-        lines.append(
-            f"| {folder} | {cuda} | {amd} | {npu} | {cpu} | {len(folder_tests)} |"
-        )
+        backend_counts = {b.name: 0 for b in HWBackend}
+        for t in folder_tests:
+            backend_counts[t.backend.name] += 1
+        row = [folder] + [str(backend_counts[b]) for b in active_backends]
+        row.append(str(len(folder_tests)))
+        lines.append("| " + " | ".join(row) + " |")
 
     lines.append("\n</details>\n")
 
@@ -155,7 +313,9 @@ def generate_summary_section(data: dict) -> str:
         for t in sorted(disabled_tests, key=lambda x: (x.backend.name, x.filename)):
             test_name = get_test_basename(t.filename)
             reason = t.disabled[:50] + "..." if len(t.disabled) > 50 else t.disabled
-            lines.append(f"| `{test_name}` | {t.backend.name} | {t.suite} | {reason} |")
+            lines.append(
+                f"| `{test_name}` | {t.backend.name} | {t.effective_suite} | {reason} |"
+            )
         lines.append("\n</details>\n")
 
     return "\n".join(lines)
@@ -180,7 +340,7 @@ def generate_by_folder_section(data: dict) -> str:
         for t in folder_tests:
             folder_by_backend[t.backend.name].append(t)
 
-        for backend in ["CUDA", "AMD", "NPU", "CPU"]:
+        for backend in BACKEND_DISPLAY_ORDER:
             backend_tests = folder_by_backend.get(backend, [])
             if not backend_tests:
                 continue
@@ -197,7 +357,7 @@ def generate_by_folder_section(data: dict) -> str:
                     else ("Nightly" if t.nightly else "Per-Commit")
                 )
                 lines.append(
-                    f"| `{test_name}` | {t.suite} | {t.est_time:.0f}s | {status} |"
+                    f"| `{test_name}` | {t.effective_suite} | {t.est_time:.0f}s | {status} |"
                 )
 
             lines.append("")
@@ -214,7 +374,7 @@ def generate_by_suite_section(data: dict) -> str:
 
     lines.append("# All Tests by Test Suite\n")
 
-    for backend in ["CUDA", "AMD", "NPU", "CPU"]:
+    for backend in BACKEND_DISPLAY_ORDER:
         backend_tests = by_backend.get(backend, [])
         if not backend_tests:
             continue
@@ -231,7 +391,7 @@ def generate_by_suite_section(data: dict) -> str:
         # Group by suite within backend
         backend_suites = defaultdict(list)
         for t in backend_tests:
-            backend_suites[t.suite].append(t)
+            backend_suites[t.effective_suite].append(t)
 
         for suite in sorted(backend_suites.keys()):
             suite_tests = backend_suites[suite]
@@ -330,13 +490,13 @@ def generate_json_report(tests: list[CIRegistry]) -> str:
             "backends": {},
         }
 
-        for backend in ["CUDA", "AMD", "NPU", "CPU"]:
+        for backend in BACKEND_DISPLAY_ORDER:
             backend_tests = folder_by_backend.get(backend, [])
             if backend_tests:
                 data["tests_by_folder"][folder]["backends"][backend] = [
                     {
                         "filename": get_test_basename(t.filename),
-                        "suite": t.suite,
+                        "suite": t.effective_suite,
                         "est_time": t.est_time,
                         "status": (
                             "disabled"
@@ -348,14 +508,14 @@ def generate_json_report(tests: list[CIRegistry]) -> str:
                 ]
 
     # Section 2: Tests by Suite (Backend -> Suite)
-    for backend in ["CUDA", "AMD", "NPU", "CPU"]:
+    for backend in BACKEND_DISPLAY_ORDER:
         backend_tests = by_backend.get(backend, [])
         if not backend_tests:
             continue
 
         backend_suites = defaultdict(list)
         for t in backend_tests:
-            backend_suites[t.suite].append(t)
+            backend_suites[t.effective_suite].append(t)
 
         data["tests_by_suite"][backend] = {
             "total": len(backend_tests),
@@ -391,7 +551,7 @@ def generate_json_report(tests: list[CIRegistry]) -> str:
             }
 
     # Backend summary
-    for backend in ["CUDA", "AMD", "NPU", "CPU"]:
+    for backend in BACKEND_DISPLAY_ORDER:
         backend_tests = by_backend.get(backend, [])
         if backend_tests:
             data["backend_summary"][backend] = {
@@ -406,14 +566,16 @@ def generate_json_report(tests: list[CIRegistry]) -> str:
                 ),
             }
 
-    # Folder summary
+    # Folder summary -- one count per backend in HWBackend, in display
+    # order, so every registered backend shows up regardless of whether
+    # this folder has tests for it.
     for folder in sorted(by_folder.keys()):
         folder_tests = by_folder[folder]
+        backend_counts = {b: 0 for b in BACKEND_DISPLAY_ORDER}
+        for t in folder_tests:
+            backend_counts[t.backend.name] += 1
         data["folder_summary"][folder] = {
-            "CUDA": sum(1 for t in folder_tests if t.backend == HWBackend.CUDA),
-            "AMD": sum(1 for t in folder_tests if t.backend == HWBackend.AMD),
-            "NPU": sum(1 for t in folder_tests if t.backend == HWBackend.NPU),
-            "CPU": sum(1 for t in folder_tests if t.backend == HWBackend.CPU),
+            **backend_counts,
             "total": len(folder_tests),
         }
 
@@ -423,7 +585,7 @@ def generate_json_report(tests: list[CIRegistry]) -> str:
             {
                 "filename": get_test_basename(t.filename),
                 "backend": t.backend.name,
-                "suite": t.suite,
+                "suite": t.effective_suite,
                 "reason": t.disabled,
             }
         )
@@ -450,6 +612,14 @@ def main():
         default="test/registered",
         help="Path to registered test directory",
     )
+    parser.add_argument(
+        "--multimodal-gen-dir",
+        default=MULTIMODAL_GEN_TEST_DIR,
+        help=(
+            "Path to multimodal_gen test directory. Pass empty string to "
+            "skip multimodal_gen tests entirely."
+        ),
+    )
     args = parser.parse_args()
 
     # Change to repo root if needed
@@ -458,6 +628,8 @@ def main():
     os.chdir(repo_root)
 
     tests = collect_all_tests(args.registered_dir)
+    if args.multimodal_gen_dir:
+        tests.extend(collect_multimodal_gen_tests(args.multimodal_gen_dir))
 
     if args.output_format == "markdown":
         report = generate_markdown_report(tests, section=args.section)

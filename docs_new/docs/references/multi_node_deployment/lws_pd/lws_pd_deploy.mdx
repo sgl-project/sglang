@@ -147,7 +147,7 @@ spec:
             name: model
           - mountPath: /dev/infiniband
             name: ib
-          - mountPath: /sgl-workspace/sglang/python/sglang/srt/layers/moe/fused_moe_triton/configs
+          - mountPath: /sgl-workspace/sglang/python/sglang/srt/layers/moe/moe_runner/triton_utils/configs
             name: cf
           - mountPath: /root/.cache
             name: sgl-cache
@@ -305,7 +305,7 @@ spec:
             name: model
           - mountPath: /dev/infiniband
             name: ib
-          - mountPath: /sgl-workspace/sglang/python/sglang/srt/layers/moe/fused_moe_triton/configs
+          - mountPath: /sgl-workspace/sglang/python/sglang/srt/layers/moe/moe_runner/triton_utils/configs
             name: cf
         dnsPolicy: ClusterFirstWithHostNet
         hostIPC: true
@@ -384,7 +384,7 @@ spec:
           - "32768"
           - --disaggregation-ib-device
           - "mlx5_bond_0,mlx5_bond_1,mlx5_bond_2,mlx5_bond_3"
-          - --cuda-graph-max-bs
+          - --cuda-graph-max-bs-decode
           - "64"
           - --max-running-requests
           - "2048"
@@ -458,7 +458,7 @@ spec:
             name: model
           - mountPath: /dev/infiniband
             name: ib
-          - mountPath: /sgl-workspace/sglang/python/sglang/srt/layers/moe/fused_moe_triton/configs
+          - mountPath: /sgl-workspace/sglang/python/sglang/srt/layers/moe/moe_runner/triton_utils/configs
             name: cf
         dnsPolicy: ClusterFirstWithHostNet
         hostIPC: true
@@ -519,7 +519,7 @@ spec:
           - --disaggregation-ib-device
           # should modify according your rdma env
           - "mlx5_bond_0,mlx5_bond_1,mlx5_bond_2,mlx5_bond_3"
-          - --cuda-graph-max-bs
+          - --cuda-graph-max-bs-decode
           - "64"
           - --max-running-requests
           - "2048"
@@ -592,7 +592,7 @@ spec:
             name: model
           - mountPath: /dev/infiniband
             name: ib
-          - mountPath: /sgl-workspace/sglang/python/sglang/srt/layers/moe/fused_moe_triton/configs
+          - mountPath: /sgl-workspace/sglang/python/sglang/srt/layers/moe/moe_runner/triton_utils/configs
             name: cf
         dnsPolicy: ClusterFirstWithHostNet
         hostIPC: true

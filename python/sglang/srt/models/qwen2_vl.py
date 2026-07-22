@@ -34,7 +34,11 @@ from transformers import Qwen2VLConfig
 from transformers.models.qwen2_vl.configuration_qwen2_vl import Qwen2VLVisionConfig
 
 from sglang.srt.layers.activation import QuickGELU
-from sglang.srt.layers.attention.vision import VisionAttention
+from sglang.srt.layers.attention.vision import (
+    VisionAttention,
+    VisionAttentionMetadata,
+    prepare_vision_attention_metadata,
+)
 from sglang.srt.layers.conv import Conv3dLayer
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -162,6 +166,7 @@ class Qwen2VisionBlock(nn.Module):
         x: torch.Tensor,
         cu_seqlens: torch.Tensor,
         position_embeddings: torch.Tensor,
+        forward_metadata: Optional["VisionAttentionMetadata"] = None,
     ) -> torch.Tensor:
         hidden_states = self.norm1(x)
         hidden_states = rearrange(hidden_states, "s b ... -> b s ...")
@@ -169,6 +174,7 @@ class Qwen2VisionBlock(nn.Module):
             hidden_states,
             cu_seqlens=cu_seqlens,
             position_embeddings=position_embeddings,
+            forward_metadata=forward_metadata,
         )
         attn = rearrange(attn, "b s ... -> s b ...")
         x = x + attn
@@ -398,10 +404,20 @@ class Qwen2VisionTransformer(nn.Module):
         if is_npu():
             cu_seqlens = cu_seqlens.to("cpu")
 
+        # pre-compute attention metadata once for all layers
+        forward_metadata = prepare_vision_attention_metadata(
+            cu_seqlens, device=self.device
+        )
+
         # transformers
         x = x.unsqueeze(1)
         for blk in self.blocks:
-            x = blk(x, cu_seqlens=cu_seqlens, position_embeddings=position_embeddings)
+            x = blk(
+                x,
+                cu_seqlens=cu_seqlens,
+                position_embeddings=position_embeddings,
+                forward_metadata=forward_metadata,
+            )
 
         # adapter
         x = self.merger(x)

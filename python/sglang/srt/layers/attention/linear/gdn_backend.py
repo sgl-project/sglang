@@ -2,7 +2,12 @@ from typing import Optional, Tuple, Union
 
 import torch
 
-from sglang.srt.layers.attention.fla.fused_gdn_gating import fused_gdn_gating
+from sglang.kernels.ops.attention.fla.fused_gdn_gating import fused_gdn_gating
+from sglang.kernels.ops.mamba.causal_conv1d_triton import (
+    causal_conv1d_fn,
+    causal_conv1d_update,
+)
+from sglang.srt.configs.hybrid_arch import hybrid_gdn_config
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
 from sglang.srt.layers.attention.linear.utils import (
@@ -10,21 +15,24 @@ from sglang.srt.layers.attention.linear.utils import (
     get_linear_attn_decode_backend,
     get_linear_attn_prefill_backend,
 )
-from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
-    causal_conv1d_fn,
-    causal_conv1d_update,
-)
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.utils import is_cpu, is_cuda, is_npu
+from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu
 from sglang.srt.utils.common import rank0_log
 
 if not is_cpu():
-    from sglang.srt.layers.attention.fla.chunk_delta_h import (
+    from sglang.kernels.ops.attention.fla.chunk_delta_h import (
         CHUNK_SIZE as FLA_CHUNK_SIZE,
     )
+
+if is_cuda() or is_hip():
+    from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
+        fused_qkv_split_gdn_prefill,
+    )
+
+MAX_FUSED_QKV_SPLIT_DIM = 8192
 
 if is_cuda():
     from sglang.srt.layers.attention.mamba.causal_conv1d import (
@@ -50,6 +58,52 @@ elif is_cpu():
     fused_gdn_gating = torch.ops.sgl_kernel.fused_gdn_gating_cpu
 
 
+def maybe_set_default_flashinfer_gdn_prefill(model_runner: ModelRunner) -> None:
+    """Use FlashInfer for the narrow SM100 GDN prefill domain we validated."""
+    args = model_runner.server_args
+    if (
+        args.linear_attn_prefill_backend is not None
+        or args.linear_attn_backend != "triton"
+        or args.enable_page_major_kv_layout
+        or not is_cuda()
+        or torch.cuda.get_device_capability()[0] != 10
+    ):
+        return
+
+    # Extra-buffer strategies need intermediate state checkpoints.
+    if args.uses_mamba_radix_cache and args.mamba_radix_cache_strategy != "no_buffer":
+        return
+
+    cuda_version = torch.version.cuda
+    chunk_size = args.chunked_prefill_size
+    config = hybrid_gdn_config(model_runner.model_config)
+    if (
+        cuda_version is None
+        or int(cuda_version.split(".", 1)[0]) < 13
+        or args.enable_dynamic_chunking
+        or chunk_size is None
+        or not 1 <= chunk_size <= 8192
+        or getattr(config, "linear_key_head_dim", None) != 128
+        or getattr(config, "linear_value_head_dim", None) != 128
+        or model_runner.req_to_token_pool.mamba_pool.mamba_cache.temporal.dtype
+        != torch.bfloat16
+    ):
+        return
+
+    from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
+        is_flashinfer_gdn_prefill_available,
+    )
+
+    if is_flashinfer_gdn_prefill_available():
+        # server_args is resolved (read-only) by the time backends initialize;
+        # route this load-time default through the audited mutation entry.
+        args.override(
+            "gdn_backend.sm100_flashinfer_default",
+            linear_attn_prefill_backend="flashinfer",
+        )
+        rank0_log("Defaulting SM100 GDN prefill backend to FlashInfer.")
+
+
 class GDNKernelDispatcher:
     """Dispatches GDN kernel calls to the appropriate backend per mode."""
 
@@ -59,7 +113,9 @@ class GDNKernelDispatcher:
         prefill_backend: LinearAttnKernelBackend,
     ):
         triton_kernel = TritonGDNKernel()
+        self.tree_verify_kernel = triton_kernel
 
+        cutedsl_kernel = None
         if decode_backend.is_triton():
             self.decode_kernel = triton_kernel
         elif decode_backend.is_cutedsl():
@@ -69,7 +125,8 @@ class GDNKernelDispatcher:
                 CuteDSLGDNKernel,
             )
 
-            self.decode_kernel = CuteDSLGDNKernel()
+            cutedsl_kernel = CuteDSLGDNKernel()
+            self.decode_kernel = cutedsl_kernel
         elif decode_backend.is_flashinfer():
             if not is_cuda():
                 raise ValueError("FlashInfer GDN backend requires CUDA")
@@ -85,10 +142,26 @@ class GDNKernelDispatcher:
         if prefill_backend.is_triton():
             self.extend_kernel = triton_kernel
         elif prefill_backend.is_cutedsl():
-            raise ValueError(
-                "CuTe DSL backend only supports decode, not prefill. "
-                "Use --linear-attn-prefill-backend triton instead."
-            )
+            if not is_cuda():
+                raise ValueError("GDN CuTe DSL backend requires CUDA")
+            # Reuse the CuteDSL kernel if already created for decode
+            if cutedsl_kernel is None:
+                from sglang.srt.layers.attention.linear.kernels.gdn_cutedsl import (
+                    CuteDSLGDNKernel,
+                )
+
+                cutedsl_kernel = CuteDSLGDNKernel()
+            # The CuteDSL prefill kernel only exists on SM100+ (Blackwell).
+            # On SM90 (Hopper) fall back to Triton so users can pick
+            # `cutedsl` uniformly across hardware.
+            if cutedsl_kernel.supports_prefill:
+                self.extend_kernel = cutedsl_kernel
+            else:
+                rank0_log(
+                    "CuTe DSL GDN prefill is not supported on this GPU "
+                    "(requires SM100+). Falling back to Triton for prefill."
+                )
+                self.extend_kernel = triton_kernel
         elif prefill_backend.is_flashinfer():
             if not is_cuda():
                 raise ValueError("FlashInfer GDN backend requires CUDA")
@@ -105,8 +178,12 @@ class GDNKernelDispatcher:
         else:
             raise ValueError(f"Unsupported GDN prefill backend: {prefill_backend}")
 
-        # Verify kernel: use FlashInfer if either decode or prefill selected it
-        if decode_backend.is_flashinfer() or prefill_backend.is_flashinfer():
+        # Verify kernel: use FlashInfer when the selected FlashInfer kernel
+        # supports MTP verify. SM90 uses the fp32-state path; SM100 uses the
+        # bf16-state adapter in FlashInferGDNKernel.
+        if (
+            decode_backend.is_flashinfer() or prefill_backend.is_flashinfer()
+        ) and flashinfer_kernel.supports_target_verify:
             self.verify_kernel = flashinfer_kernel
         else:
             self.verify_kernel = triton_kernel
@@ -224,7 +301,15 @@ class GDNKernelDispatcher:
         query_start_loc: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
-        return self.verify_kernel.target_verify(
+        # FlashInfer verify supports a linear MTP chain. Tree-shaped drafts
+        # carry parent indices and must use Triton even when decode/prefill use
+        # FlashInfer.
+        verify_kernel = (
+            self.tree_verify_kernel
+            if kwargs.get("retrieve_parent_token") is not None
+            else self.verify_kernel
+        )
+        return verify_kernel.target_verify(
             A_log=A_log,
             dt_bias=dt_bias,
             q=q,
@@ -241,6 +326,8 @@ class GDNKernelDispatcher:
 
 class GDNAttnBackend(MambaAttnBackendBase):
     """Attention backend for GDN (Gated Delta Network) linear attention."""
+
+    needs_cpu_seq_lens: bool = False
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
@@ -285,6 +372,17 @@ class GDNAttnBackend(MambaAttnBackendBase):
         ssm_states = layer_cache.temporal
         query_start_loc = self.forward_metadata.query_start_loc
         cache_indices = self.forward_metadata.mamba_cache_indices
+        # GDN ReplaySSM (slice 1a): per-layer ring slices + the once-per-forward
+        # per-row write cursor. All None unless --enable-linear-replayssm, so the
+        # legacy dispatch below is byte-identical when the flag is off.
+        replayssm_write_pos = self.forward_metadata.replayssm_write_pos
+        # GDN ReplaySSM (slice 2b): per-row force-flush at radix track
+        # boundaries (None unless --enable-linear-replayssm). When present the
+        # kernel folds the ring into temporal[slot] on the snapshot steps.
+        replayssm_force_flush = self.forward_metadata.replayssm_force_flush
+        replayssm_d = layer_cache.replayssm_d
+        replayssm_k = layer_cache.replayssm_k
+        replayssm_g = layer_cache.replayssm_g
 
         assert isinstance(mixed_qkv, torch.Tensor)
         mixed_qkv = causal_conv1d_update(
@@ -310,6 +408,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 cache_indices=cache_indices,
                 num_v_heads=layer.num_v_heads,
                 head_v_dim=layer.head_v_dim,
+                replayssm_d=replayssm_d,
+                replayssm_k=replayssm_k,
+                replayssm_g=replayssm_g,
+                replayssm_write_pos=replayssm_write_pos,
+                replayssm_force_flush=replayssm_force_flush,
             )
             self._track_mamba_state_decode(
                 forward_batch, conv_states, ssm_states, cache_indices
@@ -380,6 +483,30 @@ class GDNAttnBackend(MambaAttnBackendBase):
         else:
             has_initial_states = forward_batch.extend_prefix_lens > 0
 
+        # Page-major envelope: the prefill kernels (CUDA causal_conv1d_fwd,
+        # chunk_gated_delta_rule) write state back in place assuming a contiguous
+        # slot layout, so they silently drop the write to the strided envelope
+        # pool. Run them on contiguous per-sequence copies (identity-indexed) and
+        # scatter the result back. No-op for the default contiguous pool.
+        # TODO(ch-wan): drop these .contiguous() copies by making the prefill conv
+        # and chunk_gated_delta_rule kernels honor the pool's real slot stride +
+        # int64 indexing, like packed_decode / causal_conv1d_update already do.
+        needs_state_gather = (not is_target_verify) and (
+            not conv_states.is_contiguous() or not ssm_states.is_contiguous()
+        )
+        if needs_state_gather:
+            conv_states_contig = conv_states[cache_indices].contiguous()
+            ssm_states_contig = ssm_states[cache_indices].contiguous()
+            state_cache_indices = torch.arange(
+                cache_indices.shape[0],
+                device=cache_indices.device,
+                dtype=cache_indices.dtype,
+            )
+        else:
+            conv_states_contig = conv_states
+            ssm_states_contig = ssm_states
+            state_cache_indices = cache_indices
+
         if is_target_verify:
             batch_size = seq_len // forward_batch.spec_info.draft_token_num
             draft_token_num = forward_batch.spec_info.draft_token_num
@@ -415,41 +542,92 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 layer.conv_weights,
                 layer.bias,
                 activation=layer.activation,
-                conv_states=conv_states,
+                conv_states=conv_states_contig,
                 has_initial_state=has_initial_states,
-                cache_indices=cache_indices,
+                cache_indices=state_cache_indices,
                 query_start_loc=query_start_loc,
                 seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
             ).transpose(0, 1)[:seq_len]
 
-        query, key, value = torch.split(
-            mixed_qkv,
-            [layer.q_dim, layer.k_dim, layer.v_dim],
-            dim=-1,
-        )
-
-        actual_seq_len = query.shape[0]
-        query = query.view(1, actual_seq_len, layer.num_q_heads, layer.head_q_dim)
-        key = key.view(1, actual_seq_len, layer.num_k_heads, layer.head_k_dim)
-        value = value.view(1, actual_seq_len, layer.num_v_heads, layer.head_v_dim)
+        actual_seq_len = mixed_qkv.shape[0]
+        qkv_dim = layer.q_dim + layer.k_dim + layer.v_dim
+        if (is_cuda() or is_hip()) and qkv_dim <= MAX_FUSED_QKV_SPLIT_DIM:
+            query, key, value = fused_qkv_split_gdn_prefill(
+                mixed_qkv,
+                layer.num_q_heads,
+                layer.num_k_heads,
+                layer.num_v_heads,
+                layer.head_q_dim,
+                layer.head_k_dim,
+                layer.head_v_dim,
+            )
+        else:
+            query, key, value = torch.split(
+                mixed_qkv,
+                [layer.q_dim, layer.k_dim, layer.v_dim],
+                dim=-1,
+            )
+            query = query.view(1, actual_seq_len, layer.num_q_heads, layer.head_q_dim)
+            key = key.view(1, actual_seq_len, layer.num_k_heads, layer.head_k_dim)
+            value = value.view(1, actual_seq_len, layer.num_v_heads, layer.head_v_dim)
 
         if is_target_verify:
-            core_attn_out = self.kernel_dispatcher.target_verify(
-                A_log=layer.A_log,
-                dt_bias=layer.dt_bias,
-                q=query,
-                k=key,
-                v=value,
-                a=a,
-                b=b,
-                ssm_states=ssm_states,
-                cache_indices=cache_indices,
-                query_start_loc=query_start_loc,
-                intermediate_states_buffer=intermediate_state_cache,
-                intermediate_state_indices=intermediate_state_indices,
-                cache_steps=forward_batch.spec_info.draft_token_num,
-                retrieve_parent_token=retrieve_parent_token,
+            # ReplaySSM spec-verify (Part B of #28511): when the per-slot ring is
+            # allocated (--enable-gdn-replayssm-spec, GDN + linear-chain topk<=1),
+            # reconstruct the verify output for the whole draft window from the
+            # frozen checkpoint (`temporal`) + the per-slot circular (d, k, g) ring
+            # instead of the recurrent verify that snapshots a full state per draft
+            # token. The cursors are advanced once per decode step by the worker
+            # (commit_gdn_replayssm_spec in spec_utils). GDN-only: KDA (per-K gate)
+            # routes through kda_backend and never reaches here; we additionally
+            # guard on `not replayssm_is_kda` for safety. Falls back to the
+            # recurrent verify when the ring is absent.
+            mamba_pool = self.req_to_token_pool.mamba_pool
+            use_replayssm_spec = (
+                mamba_cache_params.replayssm_d is not None
+                and getattr(mamba_pool, "replayssm_cache_base", None) is not None
+                and not getattr(mamba_pool, "replayssm_is_kda", False)
             )
+            if use_replayssm_spec:
+                core_attn_out = self._replayssm_target_verify(
+                    layer=layer,
+                    query=query,
+                    key=key,
+                    value=value,
+                    a=a,
+                    b=b,
+                    mamba_pool=mamba_pool,
+                    layer_cache=mamba_cache_params,
+                    cache_indices=cache_indices,
+                    query_start_loc=query_start_loc,
+                    draft_token_num=forward_batch.spec_info.draft_token_num,
+                )
+            else:
+                # The recurrent fallback needs the per-draft snapshots, which
+                # the pool gates OFF under --enable-gdn-replayssm-spec (the
+                # same flag that makes `use_replayssm_spec` true above), so
+                # this branch is unreachable with a None buffer by
+                # construction -- keep it loud rather than silently frozen.
+                assert intermediate_state_cache is not None, (
+                    "recurrent target_verify fallback requires intermediate_ssm, "
+                    "which is not allocated under --enable-gdn-replayssm-spec"
+                )
+                core_attn_out = self.kernel_dispatcher.target_verify(
+                    A_log=layer.A_log,
+                    dt_bias=layer.dt_bias,
+                    q=query,
+                    k=key,
+                    v=value,
+                    a=a,
+                    b=b,
+                    ssm_states=ssm_states,
+                    cache_indices=cache_indices,
+                    query_start_loc=query_start_loc,
+                    intermediate_states_buffer=intermediate_state_cache,
+                    intermediate_state_indices=intermediate_state_indices,
+                    cache_steps=forward_batch.spec_info.draft_token_num,
+                    retrieve_parent_token=retrieve_parent_token,
+                )
         else:
             g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
             core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
@@ -458,16 +636,22 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 v=value,
                 g=g,
                 beta=beta,
-                ssm_states=ssm_states,
-                cache_indices=cache_indices,
+                ssm_states=ssm_states_contig,
+                cache_indices=state_cache_indices,
                 query_start_loc=query_start_loc,
             )
 
-            if (is_npu() or is_cpu()) and last_recurrent_state is not None:
+            if is_npu() and last_recurrent_state is not None:
                 last_recurrent_state = last_recurrent_state.to(
                     ssm_states.dtype, copy=False
                 )
                 ssm_states[cache_indices] = last_recurrent_state
+
+            if needs_state_gather:
+                # Scatter the in-place-updated contiguous copies back to the
+                # strided envelope pool (advanced indexing handles the strides).
+                conv_states[cache_indices] = conv_states_contig
+                ssm_states[cache_indices] = ssm_states_contig
 
             if h is not None:
                 self._track_mamba_state_extend(
@@ -475,3 +659,92 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 )
 
         return core_attn_out
+
+    def _replayssm_target_verify(
+        self,
+        *,
+        layer: RadixLinearAttention,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        mamba_pool: MambaPool,
+        layer_cache: "MambaPool.SpeculativeState",
+        cache_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        draft_token_num: int,
+    ) -> torch.Tensor:
+        """ReplaySSM GDN spec-verify (Part B of #28511).
+
+        Reconstructs the verify output for the whole draft window from the frozen
+        checkpoint (``temporal``) + the per-slot circular ``(d, k, g)`` ring, and
+        appends this window's drafts to the rings (chunked ``d`` for output
+        reconstruction; raw ``v`` / pre-norm ``k`` / fp32 ``beta`` for the
+        closed-loop exact fold that replays the recurrent update into the fp32
+        checkpoint at flush). The rings are PER-LAYER
+        (sliced via ``mamba2_layer_cache``), while the cursors (write_pos,
+        cache_base, is_flush) are PER-SLOT pool attributes shared by all GDN layers
+        of the step; the cursors persist across steps and are advanced once per step
+        by the worker (commit_gdn_replayssm_spec) -- here we only read them and
+        write this step's ring entries. GDN has K == V, so ``temporal``
+        ([slots, HV, K, V]) is consumed directly as the kernel's [slots, HV, V, K]
+        checkpoint.
+        """
+        from sglang.kernels.ops.attention.fla.gdn_replayssm_spec_decode import (
+            gdn_replayssm_spec_decode,
+        )
+
+        H, K = layer.num_k_heads, layer.head_k_dim
+        HV, V = layer.num_v_heads, layer.head_v_dim
+        # q/k/v may be [1, seq, *] (fallback split) or [seq, *] (fused split);
+        # derive the packed token count from numel so both layouts flatten.
+        seq_len = query.numel() // (H * K)
+        q = query.reshape(seq_len, H, K)
+        k = key.reshape(seq_len, H, K)
+        v = value.reshape(seq_len, HV, V)
+        a = a.reshape(seq_len, HV)
+        b = b.reshape(seq_len, HV)
+        d_cache = layer_cache.replayssm_d  # [slots, HV, L, V]
+        max_cache_len = d_cache.shape[-2]  # ring length L
+        out = q.new_empty(seq_len, HV, V)
+        gdn_replayssm_spec_decode(
+            q=q,
+            k=k,
+            v=v,
+            a=a,
+            b=b,
+            A_log=layer.A_log,
+            dt_bias=layer.dt_bias,
+            checkpoint_state=layer_cache.temporal,
+            d_cache=d_cache,
+            k_cache=layer_cache.replayssm_k,
+            g_cache=layer_cache.replayssm_g,
+            # Closed-loop exact-fold rings: raw v / raw pre-norm k / fp32 beta.
+            # The flush replays these through the recurrent update (bit-identical
+            # to the recurrent baseline) instead of folding `d` open-loop.
+            rawv_cache=layer_cache.replayssm_rawv,
+            rawk_cache=layer_cache.replayssm_rawk,
+            beta_cache=layer_cache.replayssm_beta,
+            out=out,
+            query_start_loc=query_start_loc,
+            ssm_state_indices=cache_indices,
+            # Per-slot cursors live on the pool (shared across all GDN layers),
+            # NOT in forward_metadata: the verify kernel reads/writes them
+            # block-keyed via ssm_state_indices and must NOT advance write_pos
+            # (the worker does that after acceptance), so the decode-path
+            # forward_metadata.replayssm_write_pos snapshot is not used here.
+            write_pos=mamba_pool.replayssm_write_pos,
+            cache_base=mamba_pool.replayssm_cache_base,
+            is_flush=mamba_pool.replayssm_is_flush,
+            max_cache_len=max_cache_len,
+            max_spec_len=draft_token_num,
+            scale=K**-0.5,
+            use_qk_l2norm_in_kernel=True,
+            # SGLang marks invalid/padding requests with a negative mamba slot
+            # index (valid slots start at 0), so the kernel's "null block"
+            # sentinel is -1, not the vLLM default of 0.
+            null_block_id=-1,
+        )
+        # Match the recurrent target_verify output shape (== value.shape).
+        return out.reshape(value.shape)

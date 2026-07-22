@@ -16,6 +16,7 @@ Usage:
 
 import ast
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -26,7 +27,9 @@ CASE_LIST_TO_SUITE = {
     "ONE_GPU_CASES_A": "1-gpu",
     "ONE_GPU_CASES_B": "1-gpu",
     "ONE_GPU_CASES_C": "1-gpu-b200",
+    "ONE_GPU_MODELOPT_FP8_CASES": "1-gpu",
     "ONE_GPU_MODELOPT_CASES": "1-gpu-b200",
+    "ONE_GPU_B200_CASES": "1-gpu-b200",
     "TWO_GPU_CASES": "2-gpu",
     "TWO_GPU_CASES_A": "2-gpu",
     "TWO_GPU_CASES_B": "2-gpu",
@@ -39,8 +42,20 @@ DEFAULT_EST_TIME_SECONDS = 300.0
 STARTUP_OVERHEAD_SECONDS = 120.0
 
 # Paths relative to repository root
-BASELINE_REL_PATH = "python/sglang/multimodal_gen/test/server/perf_baselines.json"
+BASELINE_REL_PATH = "python/sglang/multimodal_gen/test/server/perf_baselines"
+BASELINE_PLATFORM_ORDER = ("h100", "b200", "5090")
 RUN_SUITE_REL_PATH = "python/sglang/multimodal_gen/test/run_suite.py"
+
+USE_NPU_CONFIGS = os.getenv("USE_NPU_CONFIGS", "0").lower() in ("1", "true")
+
+if USE_NPU_CONFIGS:
+    BASELINE_REL_PATH = (
+        "python/sglang/multimodal_gen/test/server/perf_baselines_npu.json"
+    )
+    CASE_LIST_TO_SUITE = {
+        "ONE_NPU_CASES": "1-npu",
+        "TWO_NPU_CASES": "2-npu",
+    }
 
 
 @dataclass
@@ -78,6 +93,30 @@ class DiffusionTestCaseVisitor(ast.NodeVisitor):
 
     def __init__(self):
         self.cases: Dict[str, List[str]] = {}  # list_name -> [case_id, ...]
+        self.factory_case_ids: Dict[str, str] = {}
+
+    def visit_Module(self, node: ast.Module):
+        for stmt in node.body:
+            if not isinstance(stmt, ast.FunctionDef):
+                continue
+            case_id = self._extract_factory_case_id(stmt)
+            if case_id:
+                self.factory_case_ids[stmt.name] = case_id
+
+        self.generic_visit(node)
+
+    def visit_Expr(self, node: ast.Expr):
+        """Handle ``LIST.append(...)`` mutations at any nesting level.
+
+        Previously only module-top-level ``ast.Expr`` statements were scanned for
+        ``.append()`` calls, so cases registered under a platform guard such as
+        ``if not current_platform.is_hip(): ONE_GPU_CASES.append(...)`` (used by
+        ``hunyuan3d_shape_gen`` and ``turbo_wan2_1_t2v_1.3b``) were invisible to
+        the partition planner and therefore never scheduled in CI. Visiting every
+        ``Expr`` lets ``generic_visit`` reach appends inside ``if``/``else`` blocks.
+        """
+        self._process_expr(node.value)
+        self.generic_visit(node)
 
     def visit_Assign(self, node: ast.Assign):
         self._process_assignment(node.targets, node.value)
@@ -106,12 +145,38 @@ class DiffusionTestCaseVisitor(ast.NodeVisitor):
         if not isinstance(target, ast.Name) or not isinstance(op, ast.Add):
             return
 
+        if isinstance(value, ast.Name):
+            target_suite = CASE_LIST_TO_SUITE.get(target.id)
+            value_suite = CASE_LIST_TO_SUITE.get(value.id)
+            if target_suite and value_suite and target_suite != value_suite:
+                return
+
         rhs_case_ids = self._extract_case_ids(value)
         if rhs_case_ids is None:
             return
 
         lhs_case_ids = self.cases.get(target.id, [])
         self.cases[target.id] = [*lhs_case_ids, *rhs_case_ids]
+
+    def _process_expr(self, node: ast.AST):
+        """Process list mutation calls such as `ONE_GPU_CASES.append(...)`."""
+        if not isinstance(node, ast.Call):
+            return
+        if not isinstance(node.func, ast.Attribute):
+            return
+        if node.func.attr != "append":
+            return
+        if not isinstance(node.func.value, ast.Name):
+            return
+        list_name = node.func.value.id
+        if list_name not in CASE_LIST_TO_SUITE:
+            return
+        if len(node.args) != 1:
+            return
+
+        case_id = self._extract_case_id_from_call(node.args[0])
+        if case_id:
+            self.cases.setdefault(list_name, []).append(case_id)
 
     def _extract_case_ids(self, node: ast.AST) -> Optional[List[str]]:
         """Extract case IDs from a supported expression."""
@@ -152,12 +217,25 @@ class DiffusionTestCaseVisitor(ast.NodeVisitor):
         if not isinstance(node, ast.Call):
             return None
 
-        # Check if it's a DiffusionTestCase call
-        if isinstance(node.func, ast.Name) and node.func.id == "DiffusionTestCase":
-            # First positional argument is the case_id
+        # First positional argument is the case_id.
+        if isinstance(node.func, ast.Name) and node.func.id in {
+            "DiffusionTestCase",
+            "_make_modelopt_ci_case",
+        }:
             if node.args and isinstance(node.args[0], ast.Constant):
                 return node.args[0].value
+        if isinstance(node.func, ast.Name) and not node.args:
+            return self.factory_case_ids.get(node.func.id)
 
+        return None
+
+    def _extract_factory_case_id(self, node: ast.FunctionDef) -> Optional[str]:
+        for child in ast.walk(node):
+            if not isinstance(child, ast.Return) or child.value is None:
+                continue
+            case_id = self._extract_case_id_from_call(child.value)
+            if case_id:
+                return case_id
         return None
 
 
@@ -268,28 +346,43 @@ class RunSuiteVisitor(ast.NodeVisitor):
         return result
 
 
+def _iter_baseline_paths(baseline_path: Path) -> List[Path]:
+    if baseline_path.is_file():
+        return [baseline_path]
+    if not baseline_path.is_dir():
+        return []
+
+    ordered_paths = [
+        baseline_path / f"{platform}.json" for platform in BASELINE_PLATFORM_ORDER
+    ]
+    ordered_paths.extend(
+        path
+        for path in sorted(baseline_path.glob("*.json"))
+        if path not in ordered_paths
+    )
+    return [path for path in ordered_paths if path.exists()]
+
+
 def load_baselines(baseline_path: Path) -> Dict[str, float]:
     """
-    Load performance baselines from JSON file.
+    Load performance baselines from a JSON file or platform baseline directory.
 
     Returns:
         Dictionary mapping case_id to estimated time in seconds.
     """
-    if not baseline_path.exists():
-        return {}
-
-    with open(baseline_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-
     baselines = {}
-    scenarios = data.get("scenarios", {})
+    for path in _iter_baseline_paths(baseline_path):
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
 
-    for case_id, scenario in scenarios.items():
-        if scenario.get("estimated_full_test_time_s") is not None:
-            baselines[case_id] = scenario["estimated_full_test_time_s"]
-        else:
-            expected_e2e_ms = scenario.get("expected_e2e_ms", 0)
-            baselines[case_id] = expected_e2e_ms / 1000.0 + STARTUP_OVERHEAD_SECONDS
+        scenarios = data.get("scenarios", {})
+        for case_id, scenario in scenarios.items():
+            if scenario.get("estimated_full_test_time_s") is not None:
+                est_time = scenario["estimated_full_test_time_s"]
+            else:
+                expected_e2e_ms = scenario.get("expected_e2e_ms", 0)
+                est_time = expected_e2e_ms / 1000.0 + STARTUP_OVERHEAD_SECONDS
+            baselines.setdefault(case_id, est_time)
 
     return baselines
 
@@ -366,7 +459,7 @@ def collect_diffusion_suites(
     Args:
         case_config_path: Path to case config (resolved from run_suite.py)
         run_suite_path: Path to run_suite.py
-        baseline_path: Path to perf_baselines.json
+        baseline_path: Path to perf_baselines/ or a single baseline JSON file
 
     Returns:
         Dictionary mapping suite name to DiffusionSuiteInfo.

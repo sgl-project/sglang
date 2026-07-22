@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import dataclasses
 from abc import ABC, abstractmethod
-from enum import Enum
-from typing import TYPE_CHECKING, Any, Callable, Optional
+from enum import Enum, IntFlag
+from typing import TYPE_CHECKING, Any, Callable, Optional, Sequence
 
 import torch
 from numpy import float64
@@ -17,7 +17,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
-from sglang.srt.mem_cache.hicache_storage import PoolTransfer
+from sglang.srt.mem_cache.hicache_storage import PoolTransfer, PoolTransferResult
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -67,12 +67,27 @@ class ComponentData:
     host_lock_ref: int = 0
 
 
+class EvictLayer(IntFlag):
+    """Which storage layer(s) to evict.  Combinable via bitwise OR."""
+
+    DEVICE = 1
+    HOST = 2
+    ALL = DEVICE | HOST
+
+
 class CacheTransferPhase(str, Enum):
 
     BACKUP_HOST = "backup_host"  # D→H
     LOAD_BACK = "load_back"  # H→D
     BACKUP_STORAGE = "backup_storage"  # H→Storage
     PREFETCH = "prefetch"  # Storage→H
+
+
+class LRURefreshPhase(str, Enum):
+
+    WALKDOWN = "walkdown"  # touching a node while walking through the tree
+    MATCH_END = "match_end"  # end of a successful prefix match
+    INSERT_END = "insert_end"  # after a new/updated leaf is committed
 
 
 def get_and_increase_time_counter() -> float64:
@@ -95,19 +110,51 @@ class TreeComponent(ABC):
     # Subclasses MUST set this as a class attribute (not @property)
     component_type: ComponentType
 
-    def node_has_component_data(self, node: UnifiedTreeNode) -> bool:
-        return node.component_data[self.component_type].value is not None
+    def node_has_component_data(
+        self, node: UnifiedTreeNode, target: EvictLayer = EvictLayer.DEVICE
+    ) -> bool:
+        cd = node.component_data[self.component_type]
+        if target is EvictLayer.DEVICE:
+            return cd.value is not None
+        return cd.host_value is not None
 
     def value_len(self, node: UnifiedTreeNode) -> int:
         value = node.component_data[self.component_type].value
         return len(value) if value is not None else 0
 
+    def refresh_lru(
+        self,
+        phase: LRURefreshPhase,
+        node: UnifiedTreeNode,
+        root_node: UnifiedTreeNode,
+    ) -> None:
+        ct = self.component_type
+        match phase:
+            case LRURefreshPhase.WALKDOWN:
+                if node.component_data[ct].value is None:
+                    return
+                self.cache.lru_lists[ct].reset_node_mru(node)
+            case LRURefreshPhase.MATCH_END:
+                self.cache.lru_lists[ct].reset_node_and_parents_mru(
+                    node, root_node, self.node_has_component_data
+                )
+            case LRURefreshPhase.INSERT_END:
+                # WALKDOWN already refreshed every node on the insert path
+                # (including the new leaf), so there is nothing more to do.
+                return
+            case _:
+                raise ValueError(f"Unknown LRURefreshPhase: {phase}")
+
     @abstractmethod
-    def create_match_validator(self) -> Callable[[UnifiedTreeNode], bool]:
+    def create_match_validator(
+        self, match_device_only: bool = False
+    ) -> Callable[[UnifiedTreeNode], bool]:
         """Return a per-match stateful predicate that decides whether a node
         is a valid match boundary for this component.
         Called once per match_prefix; the returned closure may carry state.
-        - Full: always True (every node is valid).
+        When match_device_only is true, host-backed nodes must not be accepted
+        as valid match boundaries.
+        - Full: returns True if the node has full component data.
         - SWA: tracks accumulated length since last gap; returns True only
           when the contiguous window reaches swa_sliding_window_size.
         - Mamba: returns True iff the node has mamba component data."""
@@ -143,12 +190,18 @@ class TreeComponent(ABC):
         portion: value_slice[dup_start:consumed_from]."""
         return prefix_len
 
-    def should_skip_leaf_creation(
-        self, total_prefix_len: int, key_len: int, params: InsertParams
-    ) -> bool:
-        """Return True to veto leaf creation when the entire new leaf would
-        be a tombstone for this component."""
-        return False
+    def recover_after_unevict(
+        self,
+        node: UnifiedTreeNode,
+        prefix_len: int,
+        total_prefix_len: int,
+        params: InsertParams,
+    ) -> None:
+        """Called after _unevict_node_on_insert restores the base (Full) value
+        on an evicted node. Aux components (e.g. SWA) override this to rebuild
+        their own data from the freshly assigned base value when their entry
+        is still tombstoned. Default no-op."""
+        return None
 
     def commit_insert_component_data(
         self,
@@ -186,17 +239,22 @@ class TreeComponent(ABC):
         ...
 
     @abstractmethod
-    def evict_component(self, node: UnifiedTreeNode, is_leaf: bool) -> int:
+    def evict_component(
+        self,
+        node: UnifiedTreeNode,
+        target: EvictLayer = EvictLayer.DEVICE,
+    ) -> tuple[int, int]:
         """Free this component's KV resources on a node being evicted.
-        For internal (non-leaf) nodes: free memory and tombstone the value
-        (set to None); the node structure is kept.
-        For leaf nodes: free memory; the node will be deleted by caller.
-        Returns the number of tokens/slots freed.
-        - Full: frees full_value via token_to_kv_pool_allocator.
-        - SWA: frees swa value via swa_token_to_kv_pool_allocator;
-          only tombstones on internal nodes.
-        - Mamba: frees mamba value via mamba_token_to_kv_pool_allocator;
-          only tombstones on internal nodes."""
+
+        *target* controls which layer(s) to evict:
+          - DEVICE: free device memory and tombstone (value = None).
+                    Host data is untouched.
+          - HOST:   free host memory (host_value = None).
+                    Device data is untouched.
+          - ALL:    free both device and host memory.
+                    No tombstone — caller will delete the node.
+
+        Returns (device_freed, host_freed) token counts."""
         ...
 
     def eviction_priority(self, is_leaf: bool) -> int:
@@ -241,9 +299,12 @@ class TreeComponent(ABC):
 
     @abstractmethod
     def acquire_component_lock(
-        self, node: UnifiedTreeNode, result: IncLockRefResult
+        self,
+        node: UnifiedTreeNode,
+        result: IncLockRefResult,
+        lock_host: bool = False,
     ) -> IncLockRefResult:
-        """Increment lock_ref for this component, protecting nodes from
+        """Increment component lock refs, protecting nodes from
         eviction. Updates evictable → protected size on first lock.
         - Full: path-lock — walks from node up to root, incrementing
           lock_ref on every ancestor.
@@ -251,21 +312,31 @@ class TreeComponent(ABC):
           sliding window is filled; records a component_uuid at the
           boundary for release_component_lock to know where to stop.
         - Mamba: single-node lock — only increments lock_ref on the
-          node itself (mamba state is per-leaf, not per-path)."""
+          node itself (mamba state is per-leaf, not per-path).
+
+        When ``lock_host`` is True, the lock applies to host-side state:
+        - Full: single-node host lock.
+        - SWA: host window-lock with a dedicated host UUID boundary.
+        - Mamba: single-node host lock with host LRU detach."""
         ...
 
     @abstractmethod
     def release_component_lock(
-        self, node: UnifiedTreeNode, params: Optional[DecLockRefParams]
+        self,
+        node: UnifiedTreeNode,
+        params: Optional[DecLockRefParams],
+        lock_host: bool = False,
     ) -> None:
-        """Decrement lock_ref for this component, un-protecting nodes.
+        """Decrement component lock refs, un-protecting nodes.
         Updates protected → evictable size when lock_ref drops to 0.
         - Full: path-unlock — walks from node up to root, decrementing
           lock_ref on every ancestor.
         - SWA: path-unlock — walks upward, stopping at the node whose
           component_uuid matches the one recorded during acquire.
         - Mamba: single-node unlock — only decrements lock_ref on the
-          node itself."""
+          node itself.
+
+        When ``lock_host`` is True, the inverse host-side semantics apply."""
         ...
 
     def prepare_for_caching_req(
@@ -302,10 +373,22 @@ class TreeComponent(ABC):
         paths it is still provided so components can free their resources."""
         pass
 
+    def free_out_of_window_slots(
+        self, req: Req, pre_len: int, insert_params: InsertParams
+    ) -> None:
+        pass
+
     # ---- HiCache Hooks ----
 
     def build_hicache_transfers(
-        self, node: UnifiedTreeNode, phase: CacheTransferPhase, **kw
+        self,
+        node: UnifiedTreeNode,
+        phase: CacheTransferPhase,
+        *,
+        req: Optional[Req] = None,
+        token_ids: Optional[Sequence[int]] = None,
+        prefetch_tokens: int = 0,
+        last_hash: Optional[str] = None,
     ) -> Optional[list[PoolTransfer]]:
         """Build transfer descriptors for this component in the given phase.
         Returns None if the component has nothing to transfer."""
@@ -316,6 +399,9 @@ class TreeComponent(ABC):
         node: UnifiedTreeNode,
         phase: CacheTransferPhase,
         transfers: list[PoolTransfer] = (),
+        *,
+        insert_result: Optional[InsertResult] = None,
+        pool_storage_result: Optional[PoolTransferResult] = None,
     ) -> None:
         """Post-transfer bookkeeping: store host indices, update LRU, etc."""
         pass

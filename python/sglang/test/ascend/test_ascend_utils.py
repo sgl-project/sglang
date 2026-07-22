@@ -13,23 +13,37 @@ Please remember to sort by variable name within each section.
 
 import asyncio
 import copy
+import logging
 import os
+import random
 import subprocess
+import threading
+import time
 from types import SimpleNamespace
-from typing import Awaitable, Callable, NamedTuple, Optional
+from typing import Awaitable, Callable, List, NamedTuple, Optional
 
-from sglang.bench_serving import run_benchmark
+import requests
+
+from sglang.benchmark.serving import run_benchmark
 from sglang.srt.utils import kill_process_tree
+from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     auto_config_device,
+    is_in_ci,
     popen_launch_server,
+    write_github_step_summary,
 )
+
+STDERR_FILENAME = "/tmp/stderr.txt"
+STDOUT_FILENAME = "/tmp/stdout.txt"
 
 # Model weights storage directory
 MODEL_WEIGHTS_DIR = "/root/.cache/modelscope/hub/models/"
 HF_MODEL_WEIGHTS_DIR = "/root/.cache/huggingface/hub/"
+IMAGES_DIR = "/root/.cache/modelscope/hub/datasets/images/"
+VIDEO_DIR = "/root/.cache/modelscope/hub/datasets/video/"
 
 # LLM model weights path
 AFM_4_5B_BASE_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "arcee-ai/AFM-4.5B-Base")
@@ -44,6 +58,9 @@ CHATGLM2_6B_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "ZhipuAI/chatglm2-6b"
 DBRX_INSTRUCT_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "AI-ModelScope/dbrx-instruct"
 )
+DEEPSEEK_R1_0528_W8A8_WEIGHTS_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "vllm-ascend/DeepSeek-R1-0528-W8A8"
+)
 DEEPSEEK_V3_2_EXP_W8A8_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "DeepSeek-V3.2-Exp-W8A8"
 )
@@ -56,6 +73,13 @@ DEEPSEEK_CODER_V2_LITE_WEIGHTS_PATH = os.path.join(
 DEEPSEEK_CODER_1_3_B_BASE_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "deepseek-ai/deepseek-coder-1.3b-base"
 )
+DOTS_OCR_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "rednote-hilab/dots.ocr")
+ECO_TECH_QWEN3_32B_W4A4_LAOS_WEIGHTS_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "Eco-Tech/Qwen3-32B-w4a4-LAOS"
+)
+ECO_TECH_QWEN3_30B_A3B_W4A4_LAOS_WEIGHTS_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "Eco-Tech/Qwen3-30B-A3B-w4a4-LAOS"
+)
 ERNIE_4_5_21B_A3B_PT_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "baidu/ERNIE-4.5-21B-A3B-PT"
 )
@@ -63,7 +87,17 @@ EXAONE_3_5_7_8B_INSTRUCT_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "LGAI-EXAONE/EXAONE-3.5-7.8B-Instruct"
 )
 GEMMA_3_4B_IT_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "google/gemma-3-4b-it")
+GEMMA_4_E2B_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "google/gemma-4-E2B-it")
+GEMMA_4_E4B_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "google/gemma-4-E4B-it")
+GEMMA_4_26B_A4B_IT_WEIGHTS_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "google/gemma-4-26B-A4B-it"
+)
+GEMMA_4_31B_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "google/gemma-4-31B-it")
 GLM_4_9B_CHAT_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "ZhipuAI/glm-4-9b-chat")
+GLM_5_1_W4A8_MODEL_PATH = os.path.join(MODEL_WEIGHTS_DIR, "Eco-Tech/GLM-5.1-w4a8")
+GPT_OSS_120B_BF16_WEIGHTS_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "eigen-ai-labs/gpt-oss-120b-bf16"
+)
 GRANITE_3_0_3B_A800M_INSTRUCT_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "ibm-granite/granite-3.0-3b-a800m-instruct"
 )
@@ -71,10 +105,17 @@ GRANITE_3_1_8B_INSTRUCT_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "ibm-granite/granite-3.1-8b-instruct"
 )
 GROK_2_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "huihui-ai/grok-2")
+GROK_2_WEIGHTS_TOKENIZER_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "huihui-ai/grok-2/tokenizer.tok.json"
+)
 INTERNLM2_7B_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "Shanghai_AI_Laboratory/internlm2-7b"
 )
 KIMI_K2_THINKING_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "Kimi/Kimi-K2-Thinking")
+KIMI_K2_5_W4A8_MODEL_PATH = os.path.join(MODEL_WEIGHTS_DIR, "Eco-Tech/Kimi-K2.5-w4a8")
+KIMI_K2_5_EAGLE3_MODEL_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "lightseekorg/kimi-k2.5-eagle3"
+)
 LING_LITE_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "inclusionAI/Ling-lite")
 LLAMA_2_7B_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "LLM-Research/Llama-2-7B")
 LLAMA_3_1_8B_INSTRUCT_WEIGHTS_PATH = os.path.join(
@@ -83,20 +124,38 @@ LLAMA_3_1_8B_INSTRUCT_WEIGHTS_PATH = os.path.join(
 LLAMA_3_2_1B_INSTRUCT_TOOL_CALLING_LORA_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "codelion/Llama-3.2-1B-Instruct-tool-calling-lora"
 )
+LLAMA_3_2_1B_INSTRUCT_TOOL_FAST_LORA_WEIGHTS_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "suayptalha/FastLlama-3.2-LoRA"
+)
 LLAMA_3_2_1B_INSTRUCT_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "LLM-Research/Llama-3.2-1B-Instruct"
 )
 LLAMA_3_2_1B_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "LLM-Research/Llama-3.2-1B")
+LLAMA_3_8B_EAGLE_WEIGHTS_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "lmsys/sglang-EAGLE-LLaMA3-Instruct-8B"
+)
+LLAMA_3_8B_INSTRUCT_WEIGHTS_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "LLM-Research/Meta-Llama-3-8B-Instruct"
+)
+
 LLAMA_4_SCOUT_17B_16E_INSTRUCT_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "meta-llama/Llama-4-Scout-17B-16E-Instruct"
+)
+LLaDA2_0_MINI_WEIGHTS_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "inclusionAI/LLaDA2.0-mini"
 )
 META_LLAMA_3_1_8B_INSTRUCT = os.path.join(
     MODEL_WEIGHTS_DIR, "LLM-Research/Meta-Llama-3.1-8B-Instruct"
 )
 MIMO_7B_RL_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "XiaomiMiMo/MiMo-7B-RL")
+MIMO_V2_FLASH_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "XiaomiMiMo/MiMo-V2-Flash")
+MIMO_V2_5_W8A8_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "solinliu/MiMo-V2.5-W8A8")
 MINICPM3_4B_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "OpenBMB/MiniCPM3-4B")
 MISTRAL_7B_INSTRUCT_V0_2_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "mistralai/Mistral-7B-Instruct-v0.2"
+)
+OLMO_2_1124_7B_INSTRUCT_WEIGHTS_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "allenai/OLMo-2-1124-7B-Instruct"
 )
 OLMOE_1B_7B_0924_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "allenai/OLMoE-1B-7B-0924"
@@ -111,14 +170,21 @@ QWEN2_5_7B_INSTRUCT_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "Qwen/Qwen2.5-7B-Instruct"
 )
 QWEN3_0_6B_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "Qwen/Qwen3-0.6B")
+QWEN3_5_27B_MODEL_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "Qwen/Qwen3.5-27B")
 QWEN3_1_7B_GPTQ_INT8_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "Qwen/Qwen3-1.7B-GPTQ-Int8"
 )
 QWEN3_235B_A22B_W8A8_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "vllm-ascend/Qwen3-235B-A22B-W8A8"
 )
+QWEN3_235B_A22B_EAGLE_MODEL_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "Qwen/Qwen3-235B-A22B-Eagle3"
+)
 QWEN3_30B_A3B_GPTQ_2507_INT4_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "Qwen/Qwen3-30B-A3B-GPTQ-Int4"
+)
+QWEN3_30B_A3B_GGUF_Q4_K_M_WEIGHTS_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "Qwen/Qwen3-30B-A3B-GGUF/Qwen3-30B-A3B-Q4_K_M.gguf"
 )
 QWEN3_30B_A3B_INSTRUCT_2507_INT4_AUTOROUND_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "Intel/Qwen3-30B-A3B-Instruct-2507-int4-AutoRound"
@@ -126,11 +192,18 @@ QWEN3_30B_A3B_INSTRUCT_2507_INT4_AUTOROUND_WEIGHTS_PATH = os.path.join(
 QWEN3_30B_A3B_INSTRUCT_2507_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "Qwen/Qwen3-30B-A3B-Instruct-2507"
 )
+QWEN3_4B_GGUF_Q4_K_M_WEIGHTS_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "Qwen/Qwen3-4B-GGUF/Qwen3-4B-Q4_K_M.gguf"
+)
 QWEN3_8B_INT4_AUTOROUND_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "Intel/Qwen3-8B-int4-AutoRound"
 )
 QWEN3_8B_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "Qwen/Qwen3-8B")
 QWEN3_8B_EAGLE3_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "Qwen/Qwen3-8B_eagle3")
+QWEN3_8B_DECRYPTED_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "YZY/Qwen3-8B")
+QWEN3_8B_EAGLE3_DECRYPTED_WEIGHTS_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "YZY/Qwen3-8B_eagle3"
+)
 QWEN3_32B_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "Qwen/Qwen3-32B")
 QWEN3_CODER_480B_A35B_INSTRUCT_W8A8_QUAROT_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "Qwen3-Coder-480B-A35B-Instruct-w8a8-QuaRot"
@@ -138,17 +211,33 @@ QWEN3_CODER_480B_A35B_INSTRUCT_W8A8_QUAROT_WEIGHTS_PATH = os.path.join(
 QWEN3_NEXT_80B_A3B_INSTRUCT_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "Qwen/Qwen3-Next-80B-A3B-Instruct"
 )
-QWEN3_32B_EAGLE3_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "Qwen/Qwen3-32B-Eagle3")
+QWEN3_32B_EAGLE3_WEIGHTS_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "Zjcxy-SmartAI/Qwen3-32B-Eagle3"
+)
 QWEN3_32B_W8A8_MINDIE_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "aleoyang/Qwen3-32B-w8a8-MindIE"
 )
 QWQ_32B_W8A8_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "vllm-ascend/QWQ-32B-W8A8")
 SMOLLM_1_7B_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "HuggingFaceTB/SmolLM-1.7B")
+SOLAR_10_7B_INSTRUCT_V1_0_WEIGHTS_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "upstage/SOLAR-10.7B-Instruct-v1.0"
+)
 STABLELM_2_1_6B_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "stabilityai/stablelm-2-1_6b"
 )
+STARCODER2_7B_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "bigcode/starcoder2-7b")
+TRINITY_MINI_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "arcee-ai/Trinity-Mini")
 XVERSE_MOE_A36B_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "xverse/XVERSE-MoE-A36B")
 MINIMAX_M2_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "cyankiwi/MiniMax-M2-BF16")
+MINIMAX_M2_5_W8A8_MODEL_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "Eco-Tech/MiniMax-M2.5-w8a8-QuaRot"
+)
+MINIMAX_M2_5_EAGLE3_MODEL_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "sgl-npu/MiniMax-M2.5-eagel-model-0318"
+)
+EAGLE3_LLAMA3_1_INSTRUCT_8B_WEIGHTS_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "sglang-EAGLE3-LLaMA3.1-Instruct-8B"
+)
 
 # VLM model weights path
 DEEPSEEK_VL2_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "deepseek-ai/deepseek-vl2")
@@ -156,7 +245,7 @@ GLM_4_5V_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "ZhipuAI/GLM-4.5V")
 JANUS_PRO_1B_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "deepseek-ai/Janus-Pro-1B")
 JANUS_PRO_7B_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "deepseek-ai/Janus-Pro-7B")
 KIMI_VL_A3B_INSTRUCT_WEIGHTS_PATH = os.path.join(
-    MODEL_WEIGHTS_DIR, "Kimi/Kimi-VL-A3B-Instruct"
+    MODEL_WEIGHTS_DIR, "moonshotai/Kimi-VL-A3B-Instruct"
 )
 LLAMA_3_2_11B_VISION_INSTRUCT_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "LLM-Research/Llama-3.2-11B-Vision-Instruct"
@@ -203,13 +292,24 @@ QWEN3_30B_A3B_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "Qwen/Qwen3-30B-A3B
 QWEN3_30B_A3B_W8A8_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "Qwen/Qwen3-30B-A3B-w8a8"
 )
+DEEPSEEK_V2_LITE_W8A8_WEIGHTS_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "vllm-ascend/DeepSeek-V2-Lite-W8A8"
+)
 
 DEEPSEEK_R1_DISTILL_QWEN_7B_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
 )
-
-QWEN3_30B_MODELSLIM_INT4_WEIGHTS_PATH = os.path.join(
-    MODEL_WEIGHTS_DIR, "Eco-Tech/Qwen3-30B-A3B-w4a4-LAOS"
+DEEPSEEK_R1_0528_W4A8_PER_CHANNEL_WEIGHTS_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "DeepSeek-R1-0528-w4a8-per-channel"
+)
+DEEPSEEK_R1_0528_W8A8_WEIGHTS_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "vllm-ascend/DeepSeek-R1-0528-W8A8"
+)
+QWEN3_5_397B_W4A8_MODEL_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "Eco-Tech/Qwen3.5-397B-A17B-w4a8-mtp"
+)
+QWEN3_5_397B_W8A8_MODEL_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "Eco-Tech/Qwen3.5-397B-A17B-w8a8-mtp"
 )
 
 # Embedding model weights path
@@ -252,10 +352,37 @@ SKYWORK_REWARD_LLAMA_3_1_8B_V0_2_WEIGHTS_PATH = os.path.join(
     HF_MODEL_WEIGHTS_DIR,
     "models--Skywork--Skywork-Reward-Llama-3.1-8B-v0.2/snapshots/d4117fbfd81b72f41b96341238baa1e3e90a4ce1",
 )
+KIMI_K2_6_W4A8_MODEL_PATH = os.path.join(MODEL_WEIGHTS_DIR, "Eco-Tech/Kimi-K2.6-w4a8")
+KIMI_K2_6_EAGLE3_MODEL_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "lightseekorg/kimi-k2.6-eagle3"
+)
+GLM_4_6V_FLASH_MODEL_PATH = os.path.join(MODEL_WEIGHTS_DIR, "ZhipuAI/GLM-4.6V-Flash")
+QWEN3_VL_8B_THINKING_MODEL_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "Qwen/Qwen3-VL-8B-Thinking"
+)
+QWEN3_VL_30B_A3B_THINKING_MODEL_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "Qwen/Qwen3-VL-30B-A3B-Thinking"
+)
+QWEN3_OMNI_30B_A3B_THINKING_MODEL_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "Qwen/Qwen3-Omni-30B-A3B-Thinking"
+)
+# Images path
+IMAGES_EXAMPLE_PATH = os.path.join(IMAGES_DIR, "example_image.png")
+IMAGES_023_PATH = os.path.join(IMAGES_DIR, "023.jpg")
+IMAGES_MAN_PATH = os.path.join(IMAGES_DIR, "man.png")
+IMAGES_LOGO_PATH = os.path.join(IMAGES_DIR, "logo.png")
+VIDEO_JOBS_PATH = os.path.join(VIDEO_DIR, "jobs.mp4")
+INVOICE_WITH_BARCODE_LOGO_IMAGES_PATH = os.path.join(
+    IMAGES_DIR, "invoice_with_barcode_logo.jpeg"
+)
 # fmt: on
 
 # Other
 DEEPSEEK_CODER_JSON_PATH = "/__w/sglang/sglang/test/registered/ascend/basic_function/parameter/deepseek_coder.json"
+FR_SPEC_TOKEN_MAP_PATH = "/root/.cache/sglang/FR-Spec/freq_32768.pt"
+CONFIG_YAML_PATH = (
+    "/__w/sglang/sglang/test/registered/ascend/basic_function/config/config.yaml"
+)
 
 
 class ModelTestConfig(NamedTuple):
@@ -349,40 +476,6 @@ def get_benchmark_args(
     header=None,
     max_concurrency=None,
 ):
-    """Constructing the parameter objects needed for inference tests
-
-    Parameters:
-        base_url: url
-        backend: Inference backend
-        dataset_name: Data set name
-        dataset_path: Dataset path
-        tokenizer: tokenizer
-        num_prompts: Total number of test requests
-        sharegpt_output_len: Output the number of tokens
-        random_input_len: The length of the randomly generated input prompt
-        random_output_len: The length of the randomly generated output prompt
-        sharegpt_context_len: Sharegpt dataset context length
-        request_rate: Request rate
-        disable_stream: Disable streaming output
-        disable_ignore_eos: Should eos_token be ignored?
-        seed: random seed
-        device: Device type
-        pd_separated: Enable PD separation
-        lora_name: LoRA fine-tuning model path
-        lora_request_distribution: LoRA request distribution strategy
-        lora_zipf_alpha: Control request distribution skewness
-        gsp_num_groups: Grouped Sequence Parallelism
-        gsp_prompts_per_group: Number of parallel prompts within each group
-        gsp_system_prompt_len: GSP system prompts length
-        gsp_question_len: GSP question length
-        gsp_output_len: GSP output length
-        gsp_num_turns: GSP Dialogue Rounds
-        header: HTTP request header
-        max_concurrency: Maximum number of concurrent requests
-    Returns:
-        The return parameter is the same as the input.
-    """
-
     return SimpleNamespace(
         backend=backend,
         base_url=base_url,
@@ -424,6 +517,7 @@ def get_benchmark_args(
         gsp_num_turns=gsp_num_turns,
         header=header,
         max_concurrency=max_concurrency,
+        ready_check_timeout_sec=0,
     )
 
 
@@ -451,6 +545,7 @@ def run_bench_serving(
     max_concurrency=None,
     background_task: Optional[Callable[[str, asyncio.Event], Awaitable[None]]] = None,
     lora_name: Optional[str] = None,
+    timeout_for_server_launch=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
 ):
     """Start the service and obtain the inference results.
 
@@ -478,6 +573,7 @@ def run_bench_serving(
         max_concurrency: Maximum number of concurrent requests
         background_task: Background tasks
         lora_name: LoRA fine-tuning model path
+        timeout_for_server_launch: Raise the service timeout period
     Returns:
         res: Number of requests successfully completed
 
@@ -490,7 +586,7 @@ def run_bench_serving(
     process = popen_launch_server(
         model,
         base_url,
-        timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+        timeout=timeout_for_server_launch,
         other_args=other_server_args,
     )
 
@@ -549,3 +645,317 @@ def run_bench_serving(
 
     assert res["completed"] == num_prompts
     return res
+
+
+# hook factory
+def create_attention_monitor_hook_factory(config):
+    """
+    Factory function to create a forward hook for monitoring self-attention layer states.
+    This hook records input/output statistics during model forward propagation.
+
+    Args:
+        config (dict): Configuration dictionary containing hook parameters
+            layer_index (int): Index of the target attention layer to monitor
+
+    Returns:
+        function: Forward hook function to be registered on the target module
+    """
+    # Get target layer index from config, default to 0 if not specified
+    layer_index = config.get("layer_index", 0)
+
+    # Initialize logging configuration if no handlers are set
+    if not logging.root.handlers:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s - %(levelname)s - %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+
+    def attention_monitor_hook(module, inputs, output):
+        """
+        Forward hook function that monitors and logs the internal states of a self-attention layer.
+        Executed automatically during the forward pass of the module it is registered to.
+
+        Args:
+            module (torch.nn.Module): The module this hook is attached to
+            inputs (tuple): Input tensors passed to the module's forward method
+            output (torch.Tensor): Output tensor returned by the module's forward method
+
+        Returns:
+            torch.Tensor: Unmodified output tensor to preserve model computation flow
+        """
+        # Record current timestamp for time-series tracking
+        timestamp = time.time()
+
+        # Extract hidden states from inputs (second input tensor of attention layer)
+        hidden_states = inputs[1] if inputs and len(inputs) > 1 else None
+
+        # Construct monitoring record with key statistics
+        monitor_record = {
+            "timestamp": timestamp,
+            "layer_index": layer_index,
+            "module_type": type(module).__name__,
+            # Compute sum of hidden states across last dim, take first 5 elements for logging
+            "inputs": hidden_states.sum(-1)[:5] if hidden_states is not None else None,
+            # Compute sum of output across last dim, take first 5 elements for logging
+            "outputs": output.sum(-1)[:5],
+        }
+
+        # Log the monitoring record
+        logging.info(f"hook effect: {monitor_record}")
+
+        # Return the original output to maintain normal model forward propagation
+        return output
+
+    return attention_monitor_hook
+
+
+def read_output(output_lines: List[str], filename: str = STDERR_FILENAME):
+    """Print the output in real time with another thread."""
+    while not os.path.exists(filename):
+        time.sleep(0.01)
+
+    pt = 0
+    while pt >= 0:
+        if pt > 0 and not os.path.exists(filename):
+            break
+        try:
+            lines = open(filename).readlines()
+        except FileNotFoundError:
+            print(f"{pt=}, {os.path.exists(filename)=}")
+            raise
+        for line in lines[pt:]:
+            print(line, end="", flush=True)
+            output_lines.append(line)
+            pt += 1
+        time.sleep(0.1)
+
+
+def run_and_check_memory_leak(
+    workload_func,
+    disable_radix_cache,
+    enable_mixed_chunk,
+    disable_overlap,
+    chunked_prefill_size,
+    assert_has_abort,
+    api_key: Optional[str] = None,
+):
+    other_args = [
+        "--chunked-prefill-size",
+        str(chunked_prefill_size),
+        "--log-level",
+        "debug",
+    ]
+    if disable_radix_cache:
+        other_args += ["--disable-radix-cache"]
+    if enable_mixed_chunk:
+        other_args += ["--enable-mixed-chunk"]
+    if disable_overlap:
+        other_args += ["--disable-overlap-schedule"]
+
+    model = LLAMA_3_1_8B_INSTRUCT_WEIGHTS_PATH
+    port = random.randint(4000, 5000)
+    base_url = f"http://127.0.0.1:{port}"
+
+    # Create files and launch the server
+    stdout = open(STDOUT_FILENAME, "w")
+    stderr = open(STDERR_FILENAME, "w")
+    process = popen_launch_server(
+        model,
+        base_url,
+        timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+        other_args=other_args,
+        return_stdout_stderr=(stdout, stderr),
+        api_key=api_key,
+    )
+
+    # Launch a thread to stream the output
+    output_lines = []
+    t = threading.Thread(target=read_output, args=(output_lines,))
+    t.start()
+
+    # Run the workload
+    workload_func(base_url, model)
+
+    # Clean up everything
+    kill_process_tree(process.pid)
+    stdout.close()
+    stderr.close()
+    if os.path.exists(STDOUT_FILENAME):
+        os.remove(STDOUT_FILENAME)
+    if os.path.exists(STDERR_FILENAME):
+        os.remove(STDERR_FILENAME)
+    kill_process_tree(process.pid)
+    t.join()
+
+    # Assert success
+    has_new_server = False
+    has_leak = False
+    has_abort = False
+    for line in output_lines:
+        if "Uvicorn running" in line:
+            has_new_server = True
+        if "leak" in line:
+            has_leak = True
+        if "Abort" in line:
+            has_abort = True
+
+    assert has_new_server
+    assert not has_leak
+    if assert_has_abort:
+        assert has_abort
+
+
+def run_mmlu_test(
+    disable_radix_cache=False,
+    enable_mixed_chunk=False,
+    disable_overlap=False,
+    chunked_prefill_size=32,
+):
+    def workload_func(base_url, model):
+        # Run the eval
+        args = SimpleNamespace(
+            base_url=base_url,
+            model=model,
+            eval_name="mmlu",
+            num_examples=128,
+            num_threads=128,
+        )
+
+        try:
+            metrics = run_eval(args)
+            assert metrics["score"] >= 0.65, f"{metrics=}"
+        finally:
+            pass
+
+    run_and_check_memory_leak(
+        workload_func,
+        disable_radix_cache,
+        enable_mixed_chunk,
+        disable_overlap,
+        chunked_prefill_size,
+        assert_has_abort=False,
+    )
+
+
+def send_concurrent_requests(
+    base_url: str,
+    num_requests: int,
+    num_concurrent: int = 8,
+    input_text: str = "The capital of France is",
+    max_new_tokens: int = 32,
+    temperature: float = 0.0,
+    request_timeout: int = 60,
+) -> list:
+    """Send multiple concurrent HTTP POST requests to the /generate endpoint.
+
+    Uses threading (NOT asyncio + blocking calls) to achieve true concurrency.
+    asyncio.gather() combined with synchronous requests.post() does not produce
+    real parallelism; threading is required for concurrent blocking I/O.
+
+    Parameters:
+        base_url: Server base URL, e.g. "http://127.0.0.1:30000"
+        num_requests: Total number of requests to send
+        num_concurrent: Maximum in-flight requests at any given time (semaphore)
+        input_text: Text prompt sent to every request
+        max_new_tokens: Maximum new tokens to generate per request
+        temperature: Sampling temperature (0 = greedy / deterministic)
+        request_timeout: Per-request HTTP timeout in seconds; raises on exceed
+
+    Returns:
+        Unsorted list of result dicts, one per request, each with:
+          task_id (int)    -- zero-based request index
+          status_code (int)-- HTTP status code, or -1 on exception
+          text (str)       -- response body, or exception message on failure
+    """
+
+    results: list = []
+    lock = threading.Lock()
+    semaphore = threading.Semaphore(num_concurrent)
+
+    def _send_one(task_id: int) -> None:
+        semaphore.acquire()
+        try:
+            response = requests.post(
+                f"{base_url}/generate",
+                json={
+                    "text": input_text,
+                    "sampling_params": {
+                        "temperature": temperature,
+                        "max_new_tokens": max_new_tokens,
+                    },
+                },
+                timeout=request_timeout,
+            )
+            with lock:
+                results.append(
+                    {
+                        "task_id": task_id,
+                        "status_code": response.status_code,
+                        "text": response.text,
+                    }
+                )
+        except Exception as exc:
+            with lock:
+                results.append(
+                    {
+                        "task_id": task_id,
+                        "status_code": -1,
+                        "text": str(exc),
+                    }
+                )
+        finally:
+            semaphore.release()
+
+    threads = [
+        threading.Thread(target=_send_one, args=(i,)) for i in range(num_requests)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    return results
+
+
+HEADER = """
+### Models
+| Model | Server | Client | Output Throughput | Expected Output Throughput | Latency | Expected Latency | Accuracy | Expected Accuracy | Status |
+| ----- | ------ | ------ | -------- | ------------------ | ------- | ---------------- | -------- | --------- | ------ |
+"""
+
+
+def write_results_to_github_step_summary(results: dict):
+    if not is_in_ci():
+        return
+
+    write_github_step_summary_once(HEADER)
+
+    get_float = lambda metrics, item, precision: (
+        f"{metrics[item]:.{precision}f}"
+        if isinstance(metrics.get(item, "-"), (int, float))
+        else metrics.get(item, "-")
+    )
+
+    summary = ""
+    for model, metrics in results.items():
+        model = model.replace(MODEL_WEIGHTS_DIR, "").replace(HF_MODEL_WEIGHTS_DIR, "")
+        output_throughput = get_float(metrics, "output_throughput", 2)
+        output_throughput_threshold = metrics.get("output_throughput_threshold", "N/A")
+        accuracy = get_float(metrics, "accuracy", 4)
+        accuracy_threshold = metrics.get("accuracy_threshold", "N/A")
+        latency = get_float(metrics, "latency", 4)
+        latency_threshold = metrics.get("latency_threshold", "N/A")
+        server = metrics.get("server", "N/A")
+        client = metrics.get("client", "N/A")
+        error = metrics.get("error", "")
+        status = "✅" if error == "" else "❌ " + str(error)
+        summary += f"| {model} | {server} | {client} | {output_throughput} | {output_throughput_threshold} | {latency} | {latency_threshold} | {accuracy} | {accuracy_threshold} | {status} |\n"
+    write_github_step_summary(summary)
+
+
+def write_github_step_summary_once(summary: str):
+    if getattr(write_github_step_summary_once, "has_written", False):
+        return
+    write_github_step_summary_once.has_written = True
+    write_github_step_summary(summary)

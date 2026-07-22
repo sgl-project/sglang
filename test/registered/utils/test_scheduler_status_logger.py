@@ -64,10 +64,15 @@ class TestSchedulerStatusLogger(CustomTestCase):
 def _find_log_events(log_dir: str, event_name: str):
     for f in Path(log_dir).glob("*.log"):
         for line in f.read_text().splitlines():
-            if line.startswith("{"):
-                data = json.loads(line)
-                if data.get("event") == event_name:
-                    yield data
+            idx = line.find("{")
+            if idx == -1:
+                continue
+            try:
+                data = json.loads(line[idx:])
+            except json.JSONDecodeError:
+                continue
+            if data.get("event") == event_name:
+                yield data
 
 
 if __name__ == "__main__":

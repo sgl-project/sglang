@@ -18,7 +18,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 import threading
-from typing import Callable
+from typing import Callable, List, Optional
 
 import ray
 from ray.util.placement_group import PlacementGroup
@@ -30,6 +30,7 @@ from sglang.srt.entrypoints.engine import (
     _calculate_rank_ranges,
     _compute_parallelism_ranks,
 )
+from sglang.srt.environ import envs
 from sglang.srt.ray.scheduler_actor import SchedulerActor
 from sglang.srt.server_args import PortArgs, ServerArgs
 
@@ -76,8 +77,165 @@ def _find_engine_bundle(
         )
 
 
+def _get_bundle_node_ip(placement_group: PlacementGroup, bundle_idx: int) -> str:
+    """Get the IP address of the node where a specific bundle is located.
+
+    Args:
+        placement_group: The placement group
+        bundle_idx: Bundle index to query
+
+    Returns:
+        IP address of the node where the bundle is located.
+    """
+
+    @ray.remote(num_cpus=0, num_gpus=0)
+    def get_node_ip():
+        return ray.util.get_node_ip_address()
+
+    return ray.get(
+        get_node_ip.options(
+            scheduling_strategy=PlacementGroupSchedulingStrategy(
+                placement_group=placement_group,
+                placement_group_bundle_index=bundle_idx,
+            ),
+        ).remote()
+    )
+
+
+def _compute_world_size(server_args: ServerArgs) -> int:
+    """Compute world_size (total number of scheduler actors/GPUs needed).
+
+    Normal: dp_size * tp_size * pp_size; DP attention: tp_size * pp_size.
+    """
+    if server_args.enable_dp_attention:
+        return server_args.tp_size * server_args.pp_size
+    return server_args.dp_size * server_args.tp_size * server_args.pp_size
+
+
+def _resolve_bundle_indices(pg: PlacementGroup, world_size: int) -> List[int]:
+    """Resolve bundle indices for Custom PG mode.
+
+    Parses SGLANG_RAY_BUNDLE_INDICES env var if set; otherwise returns
+    sequential indices [0, 1, ..., world_size-1].
+
+    Args:
+        pg: Placement group (used to get total_bundles count).
+        world_size: Number of bundle indices expected (pre-computed via _compute_world_size).
+
+    Returns:
+        List of bundle indices of length world_size.
+    """
+    total_bundles = len(pg.bundle_specs)
+    indices_str = envs.SGLANG_RAY_BUNDLE_INDICES.get()
+    if not indices_str:
+        return list(range(world_size))
+
+    indices = list(map(int, indices_str.split(",")))
+
+    if len(indices) != world_size:
+        raise ValueError(
+            f"SGLANG_RAY_BUNDLE_INDICES has {len(indices)} values, "
+            f"expected {world_size}"
+        )
+
+    if len(set(indices)) != len(indices):
+        raise ValueError(f"SGLANG_RAY_BUNDLE_INDICES has duplicates: {indices}")
+
+    for idx in indices:
+        if idx < 0 or idx >= total_bundles:
+            raise ValueError(f"Bundle index {idx} out of range [0, {total_bundles})")
+
+    return indices
+
+
+def _validate_custom_placement_group(pg: PlacementGroup, world_size: int) -> None:
+    """Validate custom placement group: 1 GPU per bundle, enough GPU bundles for world_size.
+
+    Args:
+        pg: User-provided placement group.
+        world_size: Number of GPU bundles required.
+    """
+    bundles = pg.bundle_specs
+    gpu_bundle_count = 0
+    for bundle in bundles:
+        gpu_count = bundle.get("GPU", 0)
+        if gpu_count > 1:
+            raise ValueError(
+                "Custom placement group must have exactly 1 GPU per bundle. "
+                f"Found bundle with {gpu_count} GPUs."
+            )
+        if gpu_count > 0:
+            gpu_bundle_count += 1
+
+    if gpu_bundle_count < world_size:
+        raise ValueError(
+            f"Custom placement group has {gpu_bundle_count} GPU bundles, "
+            f"but needs {world_size} for world_size. "
+            "Provide more bundles or reduce parallelism."
+        )
+
+
+def _create_scheduler_actor(
+    pg: PlacementGroup,
+    bundle_idx: int,
+    gpu_id: int,
+    server_args: ServerArgs,
+    port_args: PortArgs,
+    tp_rank: int,
+    pp_rank: int,
+    dp_rank: int,
+    dist_init_addr: str,
+    rank0_node_ip: str,
+) -> SchedulerActor:
+    """Create a SchedulerActor on the given placement group bundle.
+
+    Args:
+        pg: Placement group to schedule actor onto.
+        bundle_idx: Bundle index within the placement group.
+        gpu_id: GPU ID within the bundle (0 for custom PG, computed for auto PG).
+        rank0_node_ip: IP of rank-0's node, used for NCCL rendezvous.
+        dist_init_addr: Distributed init address (tcp://rank0_node_ip:nccl_port).
+    """
+    attn_cp_rank, moe_dp_rank, moe_ep_rank = _compute_parallelism_ranks(
+        server_args, tp_rank
+    )
+
+    return SchedulerActor.options(
+        num_cpus=0,
+        num_gpus=1,
+        name=(
+            f"sglang_scheduler_node{rank0_node_ip}"
+            f"_dp{dp_rank}_pp{pp_rank}_tp{tp_rank}"
+            f"_pg{pg.id.hex()[:8]}_bundle{bundle_idx}"
+        ),
+        scheduling_strategy=PlacementGroupSchedulingStrategy(
+            placement_group=pg,
+            placement_group_bundle_index=bundle_idx,
+        ),
+    ).remote(
+        server_args=server_args,
+        port_args=port_args,
+        gpu_id=gpu_id,
+        tp_rank=tp_rank,
+        attn_cp_rank=attn_cp_rank,
+        moe_dp_rank=moe_dp_rank,
+        moe_ep_rank=moe_ep_rank,
+        pp_rank=pp_rank,
+        dp_rank=dp_rank,
+        dist_init_addr=dist_init_addr,
+    )
+
+
 class RayEngine(Engine):
     """Engine using Ray actors for scheduler processes."""
+
+    def __init__(self, **kwargs):
+        placement_group = kwargs.pop("placement_group", None)
+        if "log_level" not in kwargs:
+            kwargs["log_level"] = "error"
+        server_args = ServerArgs(**kwargs)
+        server_args.override("ray.placement_group", placement_group=placement_group)
+        super().__init__(server_args=server_args)
 
     def shutdown(self):
         """Shutdown the engine — kill Ray scheduler actors then local processes."""
@@ -101,7 +259,7 @@ class RayEngine(Engine):
             Tuple of (RaySchedulerInitResult, None).
             scheduler_procs is None since Ray uses actors instead of mp.Process.
         """
-        pg = ray.util.get_current_placement_group()
+        pg = server_args.placement_group or ray.util.get_current_placement_group()
         if pg is None:
             from ray.util.placement_group import (
                 placement_group as create_placement_group,
@@ -130,69 +288,102 @@ class RayEngine(Engine):
             )
             ray.get(pg.ready())
 
+        is_custom_pg = server_args.placement_group is not None
         nnodes = server_args.nnodes
+        world_size = _compute_world_size(server_args)
 
-        # co-located with the Engine and rank0 scheduler at the same node
-        engine_bundle, engine_ip = _find_engine_bundle(pg, nnodes)
-        bundle_for_node = [engine_bundle] + [
-            i for i in range(nnodes) if i != engine_bundle
-        ]
-        rank0_node_ip = engine_ip
+        if not is_custom_pg:
+            engine_bundle, engine_ip = _find_engine_bundle(pg, nnodes)
+            bundle_for_node = [engine_bundle] + [
+                i for i in range(nnodes) if i != engine_bundle
+            ]
+            rank0_node_ip = engine_ip
+        else:
+            try:
+                _validate_custom_placement_group(pg, world_size)
+            except ValueError as e:
+                logger.error(f"Custom placement group validation failed: {e}")
+                raise RuntimeError(
+                    f"Custom placement group validation failed: {e}"
+                ) from e
+            bundle_for_node = None
+            indices_str = envs.SGLANG_RAY_BUNDLE_INDICES.get()
+            rank0_bundle_idx = int(indices_str.split(",")[0]) if indices_str else 0
+            rank0_node_ip = _get_bundle_node_ip(pg, rank0_bundle_idx)
 
         if server_args.dp_size == 1:
-            # Launch tensor parallel scheduler actors
-            world_size = server_args.tp_size * server_args.pp_size
-            gpus_per_node = world_size // nnodes
-
-            logger.info(
-                f"Ray cluster: {nnodes} nodes, "
-                f"Use {gpus_per_node} GPUs/node, world_size={world_size}"
-            )
-
             dist_init_addr = f"{rank0_node_ip}:{port_args.nccl_port}"
             logger.info(f"dist_init_addr: {dist_init_addr}")
 
             scheduler_actors = []
 
-            for node_idx in range(nnodes):
-                bundle_idx = bundle_for_node[node_idx]
-                pp_range, tp_range, pp_per_node, tp_per_node = _calculate_rank_ranges(
-                    nnodes,
-                    server_args.pp_size,
-                    server_args.tp_size,
-                    node_rank=node_idx,
+            if not is_custom_pg:
+                gpus_per_node = world_size // nnodes
+                logger.info(
+                    f"Ray cluster (auto PG): {nnodes} nodes, "
+                    f"{gpus_per_node} GPUs/node, world_size={world_size}"
                 )
-                for pp_rank in pp_range:
-                    for tp_rank in tp_range:
-                        local_gpu_idx = (pp_rank % pp_per_node) * tp_per_node + (
-                            tp_rank % tp_per_node
-                        )
 
-                        attn_cp_rank, moe_dp_rank, moe_ep_rank = (
-                            _compute_parallelism_ranks(server_args, tp_rank)
+                for node_idx in range(nnodes):
+                    bundle_idx = bundle_for_node[node_idx]
+                    pp_range, tp_range, pp_per_node, tp_per_node = (
+                        _calculate_rank_ranges(
+                            nnodes,
+                            server_args.pp_size,
+                            server_args.tp_size,
+                            node_rank=node_idx,
                         )
+                    )
+                    for pp_rank in pp_range:
+                        for tp_rank in tp_range:
+                            local_gpu_idx = (pp_rank % pp_per_node) * tp_per_node + (
+                                tp_rank % tp_per_node
+                            )
 
-                        actor = SchedulerActor.options(
-                            num_cpus=0,
-                            num_gpus=1,
-                            name=f"sglang_scheduler_node{rank0_node_ip}_pp{pp_rank}_tp{tp_rank}_pg{pg.id.hex()[:8]}_bundle{bundle_idx}",
-                            scheduling_strategy=PlacementGroupSchedulingStrategy(
-                                placement_group=pg,
-                                placement_group_bundle_index=bundle_idx,
-                            ),
-                        ).remote(
-                            server_args=server_args,
-                            port_args=port_args,
-                            gpu_id=local_gpu_idx,
-                            tp_rank=tp_rank,
-                            attn_cp_rank=attn_cp_rank,
-                            moe_dp_rank=moe_dp_rank,
-                            moe_ep_rank=moe_ep_rank,
-                            pp_rank=pp_rank,
-                            dp_rank=0,
-                            dist_init_addr=dist_init_addr,
-                        )
-                        scheduler_actors.append(actor)
+                            actor = _create_scheduler_actor(
+                                pg=pg,
+                                bundle_idx=bundle_idx,
+                                gpu_id=local_gpu_idx,
+                                server_args=server_args,
+                                port_args=port_args,
+                                tp_rank=tp_rank,
+                                pp_rank=pp_rank,
+                                dp_rank=0,
+                                dist_init_addr=dist_init_addr,
+                                rank0_node_ip=rank0_node_ip,
+                            )
+                            scheduler_actors.append(actor)
+
+            else:
+                try:
+                    bundle_indices = _resolve_bundle_indices(pg, world_size)
+                except ValueError as e:
+                    logger.error(f"Failed to resolve bundle indices: {e}")
+                    raise RuntimeError(f"Failed to resolve bundle indices: {e}") from e
+
+                logger.info(
+                    f"Ray cluster (custom PG): world_size={world_size}, "
+                    f"bundle_indices={bundle_indices}"
+                )
+
+                for rank in range(world_size):
+                    pp_rank = rank // server_args.tp_size
+                    tp_rank = rank % server_args.tp_size
+                    bundle_idx = bundle_indices[rank]
+
+                    actor = _create_scheduler_actor(
+                        pg=pg,
+                        bundle_idx=bundle_idx,
+                        gpu_id=0,  # Each bundle has exactly 1 GPU
+                        server_args=server_args,
+                        port_args=port_args,
+                        tp_rank=tp_rank,
+                        pp_rank=pp_rank,
+                        dp_rank=0,
+                        dist_init_addr=dist_init_addr,
+                        rank0_node_ip=rank0_node_ip,
+                    )
+                    scheduler_actors.append(actor)
 
             try:
                 scheduler_infos = ray.get(
@@ -228,7 +419,11 @@ class RayEngine(Engine):
             # Launch the data parallel controller
             return (
                 cls._launch_dp_scheduler_processes(
-                    server_args, port_args, pg, bundle_for_node, rank0_node_ip
+                    server_args,
+                    port_args,
+                    pg,
+                    bundle_for_node,
+                    rank0_node_ip,
                 ),
                 None,
             )
@@ -239,7 +434,7 @@ class RayEngine(Engine):
         server_args: ServerArgs,
         port_args: PortArgs,
         pg,
-        bundle_for_node: list,
+        bundle_for_node: Optional[List[int]],
         rank0_node_ip: str,
     ) -> RaySchedulerInitResult:
         """Launch DP schedulers via RayDataParallelController."""
@@ -265,6 +460,11 @@ class RayEngine(Engine):
         dp_server_args = dataclasses.replace(
             server_args,
             dist_init_addr=f"{rank0_node_ip}:{port_args.nccl_port}",
+        )
+        # dataclasses.replace only copies declared fields; placement_group is
+        # a dynamic attribute that must be manually appended after the rebuild.
+        dp_server_args.override(
+            "ray.placement_group", placement_group=server_args.placement_group
         )
 
         # Create the DP controller in-process. This blocks until all actors

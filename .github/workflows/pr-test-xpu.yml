@@ -68,76 +68,171 @@ jobs:
     uses: ./.github/workflows/pr-gate.yml
     secrets: inherit
 
-  build-and-test:
+  # ==================== Stage A ==================== #
+  stage-a-test-1-gpu-xpu:
     needs: [check-changes, pr-gate]
     if: needs.check-changes.outputs.main_package == 'true'
     runs-on: intel-bmg
     env:
-      HF_HOME: /home/sdp/.cache/huggingface
+      DOCKERHUB_INTEL_USERNAME: ${{ secrets.DOCKERHUB_INTEL_USERNAME }}
+      DOCKERHUB_INTEL_TOKEN: ${{ secrets.DOCKERHUB_INTEL_TOKEN }}
     steps:
+      - name: Reset workspace ownership
+        run: |
+          # Prior runs install sglang as root inside the CI container against
+          # the bind-mounted workspace, leaving root-owned egg-info on the host.
+          # actions/checkout's pre-clean step can't unlink those as the runner
+          # user, so reset ownership before checkout runs.
+          docker run --rm -v "${{ github.workspace }}:/w" busybox:latest \
+            chown -R "$(id -u):$(id -g)" /w || true
+
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
           ref: ${{ inputs.ref || github.ref }}
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Build Docker image
+      - name: Start CI container
         run: |
-          PR_REPO=${{ github.event.pull_request.head.repo.clone_url }}
-          PR_HEAD_REF=${{ github.head_ref }}
-          docker build \
-            ${PR_REPO:+--build-arg SG_LANG_REPO=$PR_REPO} \
-            ${PR_HEAD_REF:+--build-arg SG_LANG_BRANCH=$PR_HEAD_REF} \
-            --no-cache --progress=plain -f docker/xpu.Dockerfile -t xpu_sglang_main:bmg .
-
-      - name: Run container
-        id: start_container
-        run: |
-          container_id=$(docker run -dt \
-            --group-add 992 \
-            --group-add $(getent group video | cut -d: -f3) \
-            -v ${HF_HOME}:/root/.cache/huggingface \
-            --device /dev/dri \
-            -e HF_TOKEN="$(cat ~/huggingface_token.txt)" \
-            xpu_sglang_main:bmg)
-          echo "Started container: $container_id"
-          echo "container_id=$container_id" >> "$GITHUB_OUTPUT"
+          export HF_TOKEN="$(cat ~/huggingface_token.txt)"
+          bash scripts/ci/xpu/xpu_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install Dependency
-        timeout-minutes: 20
+        timeout-minutes: 60
         run: |
-          cid="${{ steps.start_container.outputs.container_id }}"
-          docker exec "$cid" /home/sdp/miniforge3/envs/py3.12/bin/python3 -m pip install --upgrade pip
-          docker exec "$cid" /home/sdp/miniforge3/envs/py3.12/bin/python3 -m pip install pytest expecttest ray huggingface_hub
-          docker exec "$cid" /home/sdp/miniforge3/envs/py3.12/bin/python3 -m pip uninstall -y flashinfer-python
-          docker exec "$cid" /bin/bash -c '/home/sdp/miniforge3/envs/py3.12/bin/hf auth login --token ${HF_TOKEN} '
+          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --upgrade pip
+          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install pytest expecttest ray huggingface_hub tabulate
+          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip uninstall -y flashinfer-python sgl-kernel sglang
+          docker exec ci_sglang_xpu cp /sglang-checkout/python/pyproject_xpu.toml /sglang-checkout/python/pyproject.toml
+          docker exec -w /sglang-checkout/python ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir . --extra-index-url https://download.pytorch.org/whl/xpu
+          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir --no-deps xgrammar==0.1.33
+          docker exec ci_sglang_xpu /bin/bash -c '/opt/venv/bin/hf auth login --token ${HF_TOKEN}'
 
-
-      - name: Run E2E Bfloat16 tests
-        timeout-minutes: 20
+      - name: Run stage-a tests
+        timeout-minutes: 30
         run: |
-          cid="${{ steps.start_container.outputs.container_id }}"
-          docker exec "$cid" bash -c "source /home/sdp/miniforge3/bin/activate && conda activate py3.12 && cd /home/sdp/sglang/test/srt && python3 run_suite.py --suite per-commit-xpu"
+          docker exec ci_sglang_xpu bash -c "source /opt/venv/bin/activate && cd /sglang-checkout/test && python3 run_suite.py --hw xpu --suite stage-a-test-1-gpu-xpu"
+
       - name: Cleanup container
         if: always()
         run: |
-          cid="${{ steps.start_container.outputs.container_id }}"
-          docker rm -f "$cid" || true
+          # pip install ran as root inside the container against the
+          # bind-mounted workspace, so build artifacts are root-owned on
+          # the host. Chown them back before rm to avoid Permission denied.
+          docker run --rm -v "${{ github.workspace }}:/w" busybox:latest \
+            chown -R "$(id -u):$(id -g)" /w || true
+          # Wipe everything the run wrote into the workspace so the next
+          # job starts from a clean tree.
+          rm -rf \
+            python/build \
+            python/dist \
+            python/sglang.egg-info \
+            python/sglang/*.egg-info \
+            test/result.jsonl \
+            test/results \
+            test/.pytest_cache \
+            .pytest_cache || true
+          find . -type d -name "__pycache__" -prune -exec rm -rf {} + || true
+          find . -type f -name "*.pyc" -delete || true
+          docker rm -f ci_sglang_xpu || true
+          if [[ -n "${CI_SGLANG_XPU_IMAGE:-}" ]]; then
+            docker rmi -f "${CI_SGLANG_XPU_IMAGE}" || true
+          fi
+
+  # ==================== Wait for Stage A ==================== #
+  wait-for-stage-a:
+    needs: [stage-a-test-1-gpu-xpu]
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "stage-a passed"
+
+  # ==================== Stage B ==================== #
+  stage-b-test-1-gpu-xpu:
+    needs: [check-changes, pr-gate, wait-for-stage-a]
+    if: needs.check-changes.outputs.main_package == 'true'
+    runs-on: intel-bmg
+    env:
+      DOCKERHUB_INTEL_USERNAME: ${{ secrets.DOCKERHUB_INTEL_USERNAME }}
+      DOCKERHUB_INTEL_TOKEN: ${{ secrets.DOCKERHUB_INTEL_TOKEN }}
+    steps:
+      - name: Reset workspace ownership
+        run: |
+          docker run --rm -v "${{ github.workspace }}:/w" busybox:latest \
+            chown -R "$(id -u):$(id -g)" /w || true
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Start CI container
+        run: |
+          export HF_TOKEN="$(cat ~/huggingface_token.txt)"
+          bash scripts/ci/xpu/xpu_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install Dependency
+        timeout-minutes: 60
+        run: |
+          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --upgrade pip
+          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install pytest expecttest ray huggingface_hub tabulate
+          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip uninstall -y flashinfer-python sgl-kernel sglang
+          docker exec ci_sglang_xpu cp /sglang-checkout/python/pyproject_xpu.toml /sglang-checkout/python/pyproject.toml
+          docker exec -w /sglang-checkout/python ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir . --extra-index-url https://download.pytorch.org/whl/xpu
+          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir --no-deps xgrammar==0.1.33
+          docker exec ci_sglang_xpu /bin/bash -c '/opt/venv/bin/hf auth login --token ${HF_TOKEN}'
+
+      - name: Run stage-b tests
+        timeout-minutes: 60
+        run: |
+          docker exec ci_sglang_xpu bash -c "source /opt/venv/bin/activate && cd /sglang-checkout/test && python3 run_suite.py --hw xpu --suite stage-b-test-1-gpu-xpu"
+
+      - name: Cleanup container
+        if: always()
+        run: |
+          # pip install ran as root inside the container against the
+          # bind-mounted workspace, so build artifacts are root-owned on
+          # the host. Chown them back before rm to avoid Permission denied.
+          docker run --rm -v "${{ github.workspace }}:/w" busybox:latest \
+            chown -R "$(id -u):$(id -g)" /w || true
+          # Wipe everything the run wrote into the workspace so the next
+          # job starts from a clean tree.
+          rm -rf \
+            python/build \
+            python/dist \
+            python/sglang.egg-info \
+            python/sglang/*.egg-info \
+            test/result.jsonl \
+            test/results \
+            test/.pytest_cache \
+            .pytest_cache || true
+          find . -type d -name "__pycache__" -prune -exec rm -rf {} + || true
+          find . -type f -name "*.pyc" -delete || true
+          docker rm -f ci_sglang_xpu || true
+          if [[ -n "${CI_SGLANG_XPU_IMAGE:-}" ]]; then
+            docker rmi -f "${CI_SGLANG_XPU_IMAGE}" || true
+          fi
 
   finish:
     if: always()
-    needs: [build-and-test, pr-gate]
+    needs: [stage-a-test-1-gpu-xpu, stage-b-test-1-gpu-xpu, pr-gate]
     runs-on: ubuntu-latest
     steps:
       - name: Check job status
         run: |
-          result="${{ needs.build-and-test.result }}"
-          if [ "$result" != "success" ] && [ "$result" != "skipped" ]; then
-            echo "Job failed with result: $result"
+          stage_a="${{ needs.stage-a-test-1-gpu-xpu.result }}"
+          stage_b="${{ needs.stage-b-test-1-gpu-xpu.result }}"
+          if [ "$stage_a" != "success" ] && [ "$stage_a" != "skipped" ]; then
+            echo "stage-a failed with result: $stage_a"
             exit 1
           fi
-          echo "All jobs completed successfully (result: $result)"
+          if [ "$stage_b" != "success" ] && [ "$stage_b" != "skipped" ]; then
+            echo "stage-b failed with result: $stage_b"
+            exit 1
+          fi
+          echo "All jobs completed successfully"
           exit 0

@@ -15,6 +15,18 @@ on:
         description: "Docker Hub repo to push to. Use lmsysorg/sglang-staging for testing."
         required: false
         default: "lmsysorg/sglang"
+      overlay_dockerfile:
+        description: "Optional extra Dockerfile lines appended after FROM <base> to build a layered image (e.g. 'RUN pip install ...'). Note: this job has no repo checkout, so only FROM + RUN work — you cannot COPY files from this repo. Leave empty to skip overlay."
+        required: false
+        default: ""
+      overlay_cudas:
+        description: "Comma-separated cuda variants to overlay onto (cu12, cu13). Default 'cu13'."
+        required: false
+        default: "cu13"
+      overlay_tag_suffix:
+        description: "Overlay output suffix appended to the base tag. EMPTY = overwrite the base tag(s); non-empty = append (e.g. 'msa')."
+        required: false
+        default: ""
   schedule:
     - cron: "0 0 * * *"
 
@@ -30,9 +42,17 @@ jobs:
       checkout_ref: ${{ steps.config.outputs.checkout_ref }}
       extra_build_args: ${{ steps.config.outputs.extra_build_args }}
       tag_config: ${{ steps.config.outputs.tag_config }}
+      overlay_cudas_json: ${{ steps.config.outputs.overlay_cudas_json }}
+      overlay_tags_json: ${{ steps.config.outputs.overlay_tags_json }}
     steps:
       - name: Compute build configuration
         id: config
+        env:
+          # Inject multi-line/free-text inputs via env to avoid ${{ }} injection
+          # breaking the bash script on quotes or $ in the Dockerfile snippet.
+          OVERLAY_DOCKERFILE_INPUT: ${{ inputs.overlay_dockerfile }}
+          OVERLAY_CUDAS_INPUT: ${{ inputs.overlay_cudas }}
+          OVERLAY_SUFFIX_INPUT: ${{ inputs.overlay_tag_suffix }}
         run: |
           # Determine checkout ref
           if [ -n "${{ inputs.pr_number }}" ]; then
@@ -41,11 +61,13 @@ jobs:
             echo "checkout_ref=" >> $GITHUB_OUTPUT
           fi
 
-          # Determine extra build args
+          # Determine extra build args. INSTALL_DYNAMO=1 installs the ai-dynamo
+          # nightly here only; release-docker.yml / release-docker-runtime.yml
+          # leave it at the Dockerfile default (0), keeping it out of releases.
           if [ "${{ github.event_name }}" = "schedule" ]; then
-            echo "extra_build_args=--build-arg USE_LATEST_SGLANG=1 --build-arg CMAKE_BUILD_PARALLEL_LEVEL=\$(nproc)" >> $GITHUB_OUTPUT
+            echo "extra_build_args=--build-arg USE_LATEST_SGLANG=1 --build-arg INSTALL_DYNAMO=1 --build-arg CMAKE_BUILD_PARALLEL_LEVEL=\$(nproc)" >> $GITHUB_OUTPUT
           else
-            echo "extra_build_args=--build-arg BRANCH_TYPE=local --build-arg CMAKE_BUILD_PARALLEL_LEVEL=\$(nproc)" >> $GITHUB_OUTPUT
+            echo "extra_build_args=--build-arg BRANCH_TYPE=local --build-arg INSTALL_DYNAMO=1 --build-arg CMAKE_BUILD_PARALLEL_LEVEL=\$(nproc)" >> $GITHUB_OUTPUT
           fi
 
           # Determine tag suffix
@@ -56,14 +78,62 @@ jobs:
             SUFFIX="-pr-${{ inputs.pr_number }}"
           fi
 
-          # Build tag config
+          # Build tag config. dev-cu13 / nightly-dev-cu13 are published as
+          # aliases on the cu130 image for backwards compatibility with
+          # consumers pinned to the pre-flip names.
           if [ -z "${SUFFIX}" ]; then
             # Nightly: include dated tags
-            TAG_CONFIG='[{"cuda":"cu129","tags":["dev","nightly-dev-{date}-{short_sha}"]},{"cuda":"cu130","tags":["dev-cu13","nightly-dev-cu13-{date}-{short_sha}"]}]'
+            TAG_CONFIG='[{"cuda":"cu129","tags":["dev-cu12","nightly-dev-cu12-{date}-{short_sha}"]},{"cuda":"cu130","tags":["dev","dev-cu13","nightly-dev-{date}-{short_sha}","nightly-dev-cu13-{date}-{short_sha}"]}]'
           else
-            TAG_CONFIG="[{\"cuda\":\"cu129\",\"tags\":[\"dev${SUFFIX}\"]},{\"cuda\":\"cu130\",\"tags\":[\"dev-cu13${SUFFIX}\"]}]"
+            TAG_CONFIG="[{\"cuda\":\"cu129\",\"tags\":[\"dev-cu12${SUFFIX}\"]},{\"cuda\":\"cu130\",\"tags\":[\"dev${SUFFIX}\",\"dev-cu13${SUFFIX}\"]}]"
           fi
           echo "tag_config=${TAG_CONFIG}" >> $GITHUB_OUTPUT
+
+          # Overlay configuration (optional). When overlay_dockerfile is set,
+          # build one or more layered images on top of the just-built base.
+          # SUFFIX was computed above from inputs.tag / inputs.pr_number.
+          if [ -n "${OVERLAY_DOCKERFILE_INPUT}" ]; then
+            # Refuse to overlay without a tag/pr_number: SUFFIX would be empty,
+            # so base would point at the moving 'dev'/'dev-cu12'/'dev-cu13'
+            # latest tags and overwrite mode would clobber them.
+            if [ -z "${SUFFIX}" ]; then
+              echo "overlay_dockerfile is set but neither 'tag' nor 'pr_number' was given." >&2
+              echo "Set one so the overlay targets a specific tag, not the moving 'dev' latest." >&2
+              exit 1
+            fi
+            CUDAS_INPUT="${OVERLAY_CUDAS_INPUT}"
+            [ -z "${CUDAS_INPUT}" ] && CUDAS_INPUT="cu13"
+            OVERLAY_TAGS='{}'
+            IFS=',' read -ra CUDAS <<< "${CUDAS_INPUT}"
+            for C in "${CUDAS[@]}"; do
+              C="$(echo "${C}" | xargs)"
+              if [ "${C}" = "cu13" ]; then
+                BASES='["dev'"${SUFFIX}"'","dev-cu13'"${SUFFIX}"'"]'
+              elif [ "${C}" = "cu12" ]; then
+                BASES='["dev-cu12'"${SUFFIX}"'"]'
+              else
+                echo "Unknown overlay cuda variant: ${C} (expected cu12 or cu13)" >&2
+                exit 1
+              fi
+              if [ -n "${OVERLAY_SUFFIX_INPUT}" ]; then
+                # Append mode: primary base tag + suffix.
+                PRIMARY="$(echo "${BASES}" | jq -r '.[0]')"
+                OUTS='["'"${PRIMARY}-${OVERLAY_SUFFIX_INPUT}"'"]'
+              else
+                # Overwrite mode: replace every base alias.
+                OUTS="${BASES}"
+              fi
+              OVERLAY_TAGS="$(echo "${OVERLAY_TAGS}" | jq -c \
+                --arg c "${C}" --argjson b "${BASES}" --argjson o "${OUTS}" \
+                '.[$c] = {bases:$b, outs:$o}')"
+            done
+            CUDAS_JSON="$(echo "${CUDAS_INPUT}" | jq -c -R 'split(",") | map(gsub("^\\s+|\\s+$";""))')"
+            echo "overlay_cudas_json=${CUDAS_JSON}" >> $GITHUB_OUTPUT
+            echo "overlay_tags_json=${OVERLAY_TAGS}" >> $GITHUB_OUTPUT
+          else
+            echo "overlay_cudas_json=[]" >> $GITHUB_OUTPUT
+            echo "overlay_tags_json={}" >> $GITHUB_OUTPUT
+          fi
 
   build-and-publish:
     needs: prepare
@@ -81,6 +151,50 @@ jobs:
     if: ${{ !inputs.tag && !inputs.pr_number }}
     uses: ./.github/workflows/_docker-cleanup-nightly.yml
     with:
-      tag_prefixes: '["nightly-dev", "nightly-dev-cu13"]'
+      tag_prefixes: '["nightly-dev", "nightly-dev-cu12", "nightly-dev-cu13"]'
       image_repo: ${{ inputs.image_repo || 'lmsysorg/sglang' }}
     secrets: inherit
+
+  build-overlay:
+    needs: [prepare, build-and-publish]
+    if: ${{ inputs.overlay_dockerfile != '' && github.repository == 'sgl-project/sglang' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cuda: ${{ fromJson(needs.prepare.outputs.overlay_cudas_json) }}
+    steps:
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Build and push overlay image (amd64 + arm64)
+        env:
+          REPO: ${{ inputs.image_repo || 'lmsysorg/sglang' }}
+          TAGS: ${{ needs.prepare.outputs.overlay_tags_json }}
+          CUDA: ${{ matrix.cuda }}
+          # Injected via env to keep Dockerfile quotes/$ verbatim.
+          SNIPPET: ${{ inputs.overlay_dockerfile }}
+        run: |
+          set -euo pipefail
+          BASE="$(printf '%s' "$TAGS" | jq -r --arg c "$CUDA" '.[$c].bases[0]')"
+          mapfile -t OUTS < <(printf '%s' "$TAGS" | jq -r --arg c "$CUDA" '.[$c].outs[]')
+          {
+            printf 'FROM %s:%s\n' "$REPO" "$BASE"
+            printf '%s\n' "$SNIPPET"
+          } > Dockerfile.overlay
+          echo "::group::overlay Dockerfile ($CUDA)"
+          cat Dockerfile.overlay
+          echo "::endgroup::"
+          OUT_ARGS=""
+          for o in "${OUTS[@]}"; do OUT_ARGS="$OUT_ARGS -t $REPO:$o"; done
+          docker buildx build \
+            --platform linux/amd64,linux/arm64 \
+            -f Dockerfile.overlay \
+            $OUT_ARGS \
+            --push .

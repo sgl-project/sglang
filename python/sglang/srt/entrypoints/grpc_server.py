@@ -5,11 +5,12 @@ A lightweight HTTP sidecar is started alongside the gRPC server to expose:
 - /metrics (Prometheus, when --enable-metrics is set)
 - /start_profile, /stop_profile (profiling control)
 
-The sidecar is started on --grpc-http-sidecar-port (default: --port + 1)
+The sidecar is started on --smg-http-sidecar-port (default: --port + 1)
 once the gRPC request manager is ready, regardless of whether --enable-metrics
 is set.
 """
 
+import inspect
 import json
 import logging
 import time
@@ -104,7 +105,7 @@ def _add_admin_routes(app, request_manager):
             record_shapes = (record_shapes is not False) and env_record_shapes
 
             req = ProfileReq(
-                type=ProfileReqType.START_PROFILE,
+                req_type=ProfileReqType.START_PROFILE,
                 output_dir=body.get("output_dir"),
                 start_step=body.get("start_step"),
                 num_steps=body.get("num_steps"),
@@ -133,7 +134,7 @@ def _add_admin_routes(app, request_manager):
 
     async def stop_profile_handler(request):
         try:
-            req = ProfileReq(type=ProfileReqType.STOP_PROFILE)
+            req = ProfileReq(req_type=ProfileReqType.STOP_PROFILE)
             results = await request_manager.send_communicator_req(
                 req, "profile_communicator", timeout=600.0
             )
@@ -167,8 +168,8 @@ async def serve_grpc(server_args, model_info=None):
     sidecar_app = web.Application()
     sidecar_runner = None
     sidecar_port = (
-        server_args.grpc_http_sidecar_port
-        if server_args.grpc_http_sidecar_port is not None
+        server_args.smg_http_sidecar_port
+        if server_args.smg_http_sidecar_port is not None
         else server_args.port + 1
     )
 
@@ -220,12 +221,37 @@ async def serve_grpc(server_args, model_info=None):
                 exc_info=True,
             )
 
-    try:
-        await _serve_grpc(
-            server_args,
-            model_info,
-            on_request_manager_ready=_on_request_manager_ready,
+    # Older smg-grpc-servicer releases (≤ 0.5.2) accept only (server_args,
+    # model_info) and reject the on_request_manager_ready hook. The hook is
+    # what calls _start_sidecar_server, so dropping the kwarg disables the
+    # entire HTTP sidecar (Prometheus /metrics and /start_profile +
+    # /stop_profile). Core gRPC serving still works without it.
+    serve_kwargs: dict = {}
+    sidecar_supported = (
+        "on_request_manager_ready" in inspect.signature(_serve_grpc).parameters
+    )
+    if sidecar_supported:
+        serve_kwargs["on_request_manager_ready"] = _on_request_manager_ready
+    elif server_args.enable_metrics:
+        # User explicitly asked for metrics but the installed servicer can't
+        # start the sidecar that serves them — fail loud rather than silently
+        # produce a server with no /metrics endpoint.
+        raise RuntimeError(
+            "--enable-metrics requires smg-grpc-servicer ≥ 0.5.3 (the version "
+            "that accepts 'on_request_manager_ready'); installed version "
+            "lacks the hook so the HTTP sidecar would never start. Upgrade "
+            "smg-grpc-servicer or remove --enable-metrics."
         )
+    else:
+        logger.warning(
+            "Installed smg-grpc-servicer does not accept "
+            "'on_request_manager_ready'; HTTP sidecar disabled "
+            "(no /metrics, /start_profile, /stop_profile). "
+            "Upgrade smg-grpc-servicer to ≥ 0.5.3 to enable it."
+        )
+
+    try:
+        await _serve_grpc(server_args, model_info, **serve_kwargs)
     finally:
         if sidecar_runner is not None:
             try:

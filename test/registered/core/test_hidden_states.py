@@ -8,7 +8,7 @@ from sglang.srt.utils import get_device, is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST, CustomTestCase
 
-register_cuda_ci(est_time=47, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=45, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=55, suite="stage-b-test-1-gpu-small-amd")
 
 _is_hip = is_hip()
@@ -19,29 +19,39 @@ if _is_hip:
 
 
 class TestHiddenState(CustomTestCase):
-    def test_return_hidden_states(self):
-        prompts = ["Today is", "Today is a sunny day and I like"]
-        model_path = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
-        tokenizer = AutoTokenizer.from_pretrained(model_path)
-        input_ids = tokenizer(prompts).input_ids
-
-        sampling_params = {
-            "temperature": 0,
-            "max_new_tokens": 8,
-        }
-
-        engine = sgl.Engine(
-            model_path=model_path,
+    @classmethod
+    def setUpClass(cls):
+        cls.model_path = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+        cls.tokenizer = AutoTokenizer.from_pretrained(cls.model_path)
+        cls.prompts = ["Today is", "Today is a sunny day and I like"]
+        cls.input_ids = cls.tokenizer(cls.prompts).input_ids
+        cls.sampling_params = {"temperature": 0, "max_new_tokens": 8}
+        # mem_fraction_static=0.7 leaves headroom for the HF reference
+        # model that test_return_hidden_states loads on the same GPU.
+        cls.engine = sgl.Engine(
+            model_path=cls.model_path,
             random_seed=42,
             skip_tokenizer_init=True,
             enable_return_hidden_states=True,
+            mem_fraction_static=0.7,
         )
-        outputs = engine.generate(
-            input_ids=input_ids,
-            sampling_params=sampling_params,
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.engine.shutdown()
+
+    def setUp(self):
+        # Tests share one Engine; flush radix cache so each test sees a
+        # cold prefill (test_return_hidden_states asserts on the prefill
+        # hidden-state shape, which collapses to 0 on a full cache hit).
+        self.engine.flush_cache()
+
+    def test_return_hidden_states(self):
+        outputs = self.engine.generate(
+            input_ids=self.input_ids,
+            sampling_params=self.sampling_params,
             return_hidden_states=True,
         )
-        engine.shutdown()
 
         for output in outputs:
             self.assertEqual(len(output["meta_info"]["hidden_states"]), 8)
@@ -57,10 +67,10 @@ class TestHiddenState(CustomTestCase):
         )
 
         model = AutoModelForCausalLM.from_pretrained(
-            model_path, torch_dtype=torch.bfloat16, device_map=get_device()
+            self.model_path, torch_dtype=torch.bfloat16, device_map=get_device()
         )
 
-        for input_id, output in zip(input_ids, outputs):
+        for input_id, output in zip(self.input_ids, outputs):
             with torch.inference_mode():
                 hf_out = model(
                     torch.tensor(
@@ -94,39 +104,22 @@ class TestHiddenState(CustomTestCase):
             )
 
     def test_repeatedly_changes_hidden_states(self):
-        prompts = ["Today is", "Today is a sunny day and I like"]
-        model_path = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
-        tokenizer = AutoTokenizer.from_pretrained(model_path)
-        input_ids = tokenizer(prompts).input_ids
-
-        sampling_params = {
-            "temperature": 0,
-            "max_new_tokens": 8,
-        }
-
-        engine = sgl.Engine(
-            model_path=model_path,
-            random_seed=42,
-            skip_tokenizer_init=True,
-            enable_return_hidden_states=True,
-        )
-        outputs_completion_first_round = engine.generate(
-            input_ids=input_ids,
-            sampling_params=sampling_params,
+        outputs_completion_first_round = self.engine.generate(
+            input_ids=self.input_ids,
+            sampling_params=self.sampling_params,
             return_hidden_states=True,
         )
-        outputs_hidden_state = engine.generate(
-            input_ids=input_ids,
-            sampling_params=sampling_params,
+        outputs_hidden_state = self.engine.generate(
+            input_ids=self.input_ids,
+            sampling_params=self.sampling_params,
             return_hidden_states=False,
         )
 
-        outputs_completion_last_round = engine.generate(
-            input_ids=input_ids,
-            sampling_params=sampling_params,
+        outputs_completion_last_round = self.engine.generate(
+            input_ids=self.input_ids,
+            sampling_params=self.sampling_params,
             return_hidden_states=True,
         )
-        engine.shutdown()
 
         for (
             output_completion_first_round,

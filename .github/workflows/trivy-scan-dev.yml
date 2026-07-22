@@ -22,7 +22,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        tag: ${{ inputs.tag && fromJSON(format('["{0}"]', inputs.tag)) || fromJSON('["dev", "dev-cu13"]') }}
+        tag: ${{ inputs.tag && fromJSON(format('["{0}"]', inputs.tag)) || fromJSON('["dev", "dev-cu12"]') }}
     steps:
       - name: Cleanup workspace (remove root-owned files from prior runs)
         run: sudo rm -rf "$GITHUB_WORKSPACE"/* || true

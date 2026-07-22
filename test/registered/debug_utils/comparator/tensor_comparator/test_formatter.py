@@ -1,4 +1,9 @@
 import sys
+from pathlib import Path
+
+_TEST_ROOT: Path = Path(__file__).resolve().parents[4]
+if str(_TEST_ROOT) not in sys.path:
+    sys.path.insert(0, str(_TEST_ROOT))
 
 import pytest
 from registered.debug_utils.comparator.testing_helpers import (
@@ -58,7 +63,7 @@ from sglang.srt.debug_utils.comparator.tensor_comparator.types import (
 from sglang.srt.debug_utils.comparator.utils import Pair
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=10, suite="stage-a-test-cpu", nightly=True)
+register_cpu_ci(est_time=10, suite="base-a-test-cpu", nightly=True)
 
 _DEFAULT_PERCENTILE_LINES: list[str] = [
     "      [blue]p1        [/]    -1.8000      -1.8000   [dim]+0.00e+00[/]",
@@ -116,6 +121,19 @@ class TestFormatComparison:
             "baseline=1.0 target=1.0005\n"
             "[abs_diff] p1=0.0001 p5=0.0001 p50=0.0002 p95=0.0004 p99=0.0005"
         )
+
+    def test_marker_follows_passed_not_rel_threshold(self):
+        """The ✅/❌ marker reflects diff.passed (the predicate verdict), not rel_diff vs a threshold."""
+        info = TensorComparisonInfo(
+            name="rescued",
+            baseline=_make_tensor_info(),
+            target=_make_tensor_info(),
+            unified_shape=[4, 8],
+            shape_mismatch=False,
+            diff=_make_diff(rel_diff=2.0, passed=True),
+        )
+
+        assert "✅ rel_diff=2.0\t" in format_comparison(info)
 
     def test_shape_mismatch(self):
         info = TensorComparisonInfo(

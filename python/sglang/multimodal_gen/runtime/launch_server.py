@@ -6,6 +6,7 @@ import os
 import signal
 import sys
 import threading
+import time
 
 import psutil
 import uvicorn
@@ -15,7 +16,9 @@ from sglang.multimodal_gen.runtime.disaggregation.orchestrator import (
 )
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.entrypoints.http_server import create_app
+from sglang.multimodal_gen.runtime.entrypoints.utils import ShutdownReq
 from sglang.multimodal_gen.runtime.managers.gpu_worker import run_scheduler_process
+from sglang.multimodal_gen.runtime.scheduler_client import SchedulerClient
 from sglang.multimodal_gen.runtime.server_args import (
     ServerArgs,
     prepare_server_args,
@@ -23,7 +26,13 @@ from sglang.multimodal_gen.runtime.server_args import (
 )
 from sglang.multimodal_gen.runtime.utils.common import is_port_available
 from sglang.multimodal_gen.runtime.utils.logging_utils import configure_logger, logger
-from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
+from sglang.multimodal_gen.runtime.utils.trace_wrapper import init_diffusion_tracing
+from sglang.multimodal_gen.utils import kill_itself_when_parent_died
+
+_SCHEDULER_SHUTDOWN_TIMEOUT_MS = 5000
+_WORKER_JOIN_TIMEOUT_S = 10
+_WORKER_TERMINATE_TIMEOUT_S = 1
+_WORKER_KILL_TIMEOUT_S = 1
 
 
 def _find_available_port(
@@ -81,6 +90,82 @@ def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = N
             itself.send_signal(signal.SIGQUIT)
         except psutil.NoSuchProcess:
             pass
+
+
+def _process_names(processes) -> str:
+    return ", ".join(getattr(p, "name", repr(p)) for p in processes)
+
+
+def _join_processes_with_deadline(processes, timeout_s: float) -> None:
+    deadline = time.monotonic() + timeout_s
+    for process in processes:
+        remaining_s = max(0.0, deadline - time.monotonic())
+        process.join(timeout=remaining_s)
+
+
+def _terminate_alive_processes(processes, timeout_s: float) -> list:
+    alive = [p for p in processes if p.is_alive()]
+    if not alive:
+        return []
+
+    logger.warning(
+        "Worker process(es) did not exit in time; terminating: %s",
+        _process_names(alive),
+    )
+    for process in alive:
+        process.terminate()
+    _join_processes_with_deadline(alive, timeout_s)
+    return [p for p in alive if p.is_alive()]
+
+
+def _kill_alive_processes(processes, timeout_s: float) -> None:
+    alive = [p for p in processes if p.is_alive()]
+    if not alive:
+        return
+
+    logger.warning(
+        "Worker process(es) did not terminate in time; killing: %s",
+        _process_names(alive),
+    )
+    for process in alive:
+        process.kill()
+    _join_processes_with_deadline(alive, timeout_s)
+
+
+def _run_http_server_process(server_args: ServerArgs) -> None:
+    kill_itself_when_parent_died()
+    launch_http_server_only(server_args)
+
+
+def _request_monolithic_scheduler_shutdown(server_args: ServerArgs) -> None:
+    if server_args.disagg_role != RoleType.MONOLITHIC:
+        return
+
+    client = SchedulerClient()
+    try:
+        client.initialize(server_args)
+        client.forward(ShutdownReq(), timeout_ms=_SCHEDULER_SHUTDOWN_TIMEOUT_MS)
+    except Exception as e:
+        logger.warning("Failed to request graceful scheduler shutdown: %s", e)
+    finally:
+        client.close()
+
+
+def shutdown_scheduler_processes(
+    server_args: ServerArgs | None,
+    processes: list,
+    *,
+    request_shutdown: bool = True,
+) -> None:
+    if not processes:
+        return
+
+    if request_shutdown and server_args is not None:
+        _request_monolithic_scheduler_shutdown(server_args)
+
+    _join_processes_with_deadline(processes, _WORKER_JOIN_TIMEOUT_S)
+    alive = _terminate_alive_processes(processes, _WORKER_TERMINATE_TIMEOUT_S)
+    _kill_alive_processes(alive, _WORKER_KILL_TIMEOUT_S)
 
 
 def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
@@ -194,18 +279,27 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
     logger.debug("All workers are ready")
 
     if launch_http_server:
+        if server_args.pipeline_config.task_type.is_action_gen():
+            logger.info(
+                "VLA pipeline ready: model=%s; per-request details are "
+                "debug-only (use --log-level debug).",
+                server_args.model_id or server_args.model_path,
+            )
         logger.info("Starting FastAPI server.")
         if server_args.webui:
             logger.info("Launch FastAPI server in another process because of webui.")
             http_server_process = mp.Process(
-                target=launch_http_server_only,
+                target=_run_http_server_process,
                 args=(server_args,),
-                name=f"sglang-diffusion-webui",
+                name="sglang-diffusion-webui",
                 daemon=True,
             )
             http_server_process.start()
         else:
-            launch_http_server_only(server_args)
+            try:
+                launch_http_server_only(server_args)
+            finally:
+                shutdown_scheduler_processes(server_args, processes)
 
     return processes
 
@@ -318,6 +412,7 @@ def launch_pool_disagg_server(
                 "pool_result_endpoint": result_ep,
                 "num_gpus": num_role_gpus,
                 "warmup": role_type == RoleType.ENCODER,
+                "server_warmup": False,
                 "scheduler_port": find_port(port_cursor),
                 "master_port": find_port(port_cursor + 100),
                 # Per-role parallelism (None = auto-derive from num_gpus)
@@ -407,7 +502,13 @@ def launch_pool_disagg_server(
             "Starting FastAPI server (connected to DiffusionServer at port %d).",
             server_args.scheduler_port,
         )
-        launch_http_server_only(server_args)
+        try:
+            launch_http_server_only(server_args)
+        finally:
+            diffusion_server.stop()
+            shutdown_scheduler_processes(
+                server_args, all_processes, request_shutdown=False
+            )
 
     return all_processes
 
@@ -442,9 +543,7 @@ def _run_disagg_role_process(
 
 
 def launch_http_server_only(server_args):
-    if server_args.enable_trace:
-        process_tracing_init(server_args.otlp_traces_endpoint, "sglang-diffusion")
-        trace_set_thread_info("DiffHTTPServer")
+    init_diffusion_tracing(server_args, "DiffHTTPServer")
 
     # set for endpoints to access global_server_args
     set_global_server_args(server_args)
@@ -456,6 +555,7 @@ def launch_http_server_only(server_args):
         host=server_args.host,
         port=server_args.port,
         reload=False,
+        ws_per_message_deflate=False,
     )
 
 
@@ -538,7 +638,10 @@ def launch_disagg_server(server_args: ServerArgs):
         "Starting HTTP server (connected to DiffusionServer at port %d).",
         base_port,
     )
-    launch_http_server_only(server_args)
+    try:
+        launch_http_server_only(server_args)
+    finally:
+        diffusion_server.stop()
 
 
 def launch_disagg_role(server_args: ServerArgs):
@@ -590,6 +693,7 @@ def launch_disagg_role(server_args: ServerArgs):
         "pool_work_endpoint": work_endpoint,
         "pool_result_endpoint": result_endpoint,
         "warmup": role_type == RoleType.ENCODER,
+        "server_warmup": False,
         "scheduler_port": internal_scheduler_port,
         # Per-role parallelism (None = auto-derive from num_gpus)
         "tp_size": role_par["tp_size"],
@@ -658,6 +762,8 @@ def launch_disagg_role(server_args: ServerArgs):
             p.join()
     except KeyboardInterrupt:
         logger.info("Role %s shutting down.", role_type.value)
+    finally:
+        shutdown_scheduler_processes(role_args, processes, request_shutdown=False)
 
 
 def dispatch_launch(server_args: ServerArgs):

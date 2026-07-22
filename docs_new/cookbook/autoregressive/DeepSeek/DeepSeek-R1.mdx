@@ -15,13 +15,18 @@ import { DeepSeekR1AdvancedDeployment } from '/src/snippets/autoregressive/deeps
 
 - **Advanced Reasoning**: Built-in reasoning capabilities for complex problem-solving
 - **Multiple Quantizations**: FP8 and FP4 variants for different performance/memory trade-offs
-- **Hardware Optimization**: Specifically tuned for NVIDIA B200 (Blackwell) and H200 (Hopper) GPUs, and AMD MI300X, MI325X and MI355X GPUs
+- **Hardware Optimization**: Specifically tuned for NVIDIA B200 (Blackwell) and H200 (Hopper) GPUs, AMD MI300X, MI325X and MI355X GPUs, as well as Intel Xeon CPUs
 - **High Performance**: Optimized for both throughput and latency scenarios
 
 **Available Models:**
 
 - **FP8 (8-bit quantized)**: [deepseek-ai/DeepSeek-R1-0528](https://huggingface.co/deepseek-ai/DeepSeek-R1-0528) - Recommended for H200 and MI300X
 - **FP4 (4-bit quantized)**: [nvidia/DeepSeek-R1-0528-FP4-v2](https://huggingface.co/nvidia/DeepSeek-R1-0528-FP4-v2) - Recommended for B200 and MI355X
+- **BF16 (upcast from FP8)**: [unsloth/DeepSeek-R1-0528-BF16](https://huggingface.co/unsloth/DeepSeek-R1-0528-BF16)
+- **INT8 (channel-wise)**: [meituan/DeepSeek-R1-Channel-INT8](https://huggingface.co/meituan/DeepSeek-R1-Channel-INT8)
+- **W4A8**: [novita/Deepseek-R1-0528-W4AFP8](https://huggingface.co/novita/Deepseek-R1-0528-W4AFP8)
+- **AWQ (4-bit)**: [QuixiAI/DeepSeek-R1-0528-AWQ](https://huggingface.co/QuixiAI/DeepSeek-R1-0528-AWQ)
+- **MXFP4**: [amd/DeepSeek-R1-MXFP4](https://huggingface.co/amd/DeepSeek-R1-MXFP4)
 
 **License:**
 To use DeepSeek-R1, you must agree to DeepSeek's Community License. See [LICENSE](https://huggingface.co/deepseek-ai/DeepSeek-R1-0528/blob/main/LICENSE) for details.
@@ -31,6 +36,8 @@ For more details, please refer to the [official DeepSeek-R1 repository](https://
 ## 2. SGLang Installation
 
 Please refer to the [official SGLang installation guide](../../../docs/get-started/install) for installation instructions.
+
+For SGLang CPU installation, please refer to the [CPU version installation guide](../../../docs/hardware-platforms/cpu_server#installation).
 
 ## 3. Model Deployment
 
@@ -50,7 +57,49 @@ Pareto-optimal configurations for B200, H200, MI300X, MI325X, and MI355X hardwar
 
 ### 3.3 Configuration Tips
 
-For more detailed configuration tips and advanced tuning, please refer to [DeepSeek V3/V3.1/R1 Usage](../../../docs/basic_usage/deepseek_v3).
+DeepSeek-R1 shares the same MoE architecture as DeepSeek-V3, so the same hardware and optimization recommendations apply.
+
+**Recommended GPU configurations by weight type:**
+
+<table style={{width: "100%", borderCollapse: "collapse"}}>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.02)"}}>Weight Type</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.05)"}}>Supported Hardware</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><strong>FP8</strong> (recommended)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>8× H200, 8× B200, 8× MI300X, 2×8× H100/H800/H20</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><strong>BF16</strong> (upcast from FP8)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>2×8× H200, 2×8× MI300X, 4×8× H100/H800, 4×8× A100/A800</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><strong>INT8</strong></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>16× A100/A800, 32× L40S, Xeon 6980P CPU, 4× Atlas 800I A3</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><strong>W4A8 / AWQ / MXFP4 / NVFP4</strong></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>8× H20/H100, 4× H200; 8× H100/A100; 8/4× MI355X/MI350X; 8/4× B200</td>
+    </tr>
+  </tbody>
+</table>
+
+> The official DeepSeek-R1 checkpoint is already in FP8 format — do **not** add `--quantization fp8` when serving it.
+
+**DeepGEMM precompilation (NVIDIA Hopper / Blackwell):** Precompile GEMM kernels to avoid JIT overhead (~10 min):
+```bash
+python3 -m sglang.compile_deep_gemm --model deepseek-ai/DeepSeek-R1 --tp 8 --trust-remote-code
+```
+
+**Data Parallelism Attention (`--enable-dp-attention`):** Recommended for high-throughput scenarios. Use `--enable-dp-attention --tp 8 --dp 8` on a single 8-GPU node.
+
+**NCCL timeout:** If model loading is slow, increase: `--dist-timeout 3600`.
+
+**Xeon CPU service configuration:** Please refer to the `Notes` part in the serving engine launching section in [the SGLang CPU server document](../../../docs/hardware-platforms/cpu_server#launch-of-the-serving-engine) to better understand how to configure the arguments, especially for TP (tensor parallel) and NUMA binding settings.
 
 ## 4. Model Invocation
 
@@ -290,6 +339,40 @@ final_response = client.chat.completions.create(
 
 print(final_response.choices[0].message.content)
 # Output: "The weather in Beijing is currently 22°C and sunny."
+```
+
+#### 4.2.3 Multi-Token Prediction (EAGLE Speculative Decoding)
+
+DeepSeek-R1 supports EAGLE-based Multi-Token Prediction (MTP), the same mechanism as DeepSeek-V3. Refer to [DeepSeek-V3 §4.2.3](/cookbook/autoregressive/DeepSeek/DeepSeek-V3#4-2-3-multi-token-prediction-eagle-speculative-decoding) for the complete launch command, flag reference, tuning guidance (`--speculative-num-steps`, `--speculative-eagle-topk`, `--max-running-requests`), and `bench_speculative.py` link. R1's speed benchmark commands that include `--speculative-*` flags use this mechanism.
+
+#### 4.2.4 Thinking Budget
+
+Limit the model's thinking token budget using `CustomLogitProcessor`. Launch with `--enable-custom-logit-processor`:
+
+```shell Command
+python3 -m sglang.launch_server \
+  --model deepseek-ai/DeepSeek-R1 \
+  --tp 8 \
+  --port 30000 \
+  --reasoning-parser deepseek-r1 \
+  --enable-custom-logit-processor
+```
+
+```python Example
+import openai
+from sglang.srt.sampling.custom_logit_processor import DeepSeekR1ThinkingBudgetLogitProcessor
+
+client = openai.Client(base_url="http://127.0.0.1:30000/v1", api_key="*")
+response = client.chat.completions.create(
+    model="deepseek-ai/DeepSeek-R1",
+    messages=[{"role": "user", "content": "Is Paris the Capital of France?"}],
+    max_tokens=1024,
+    extra_body={
+        "custom_logit_processor": DeepSeekR1ThinkingBudgetLogitProcessor().to_str(),
+        "custom_params": {"thinking_budget": 512},
+    },
+)
+print(response)
 ```
 
 ## 5. Benchmark

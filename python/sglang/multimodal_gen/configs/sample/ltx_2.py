@@ -47,6 +47,7 @@ class LTX2SamplingParams(SamplingParams):
 class LTX23SamplingParams(LTX2SamplingParams):
     """Sampling parameters matching official LTX-2.3 one-stage defaults."""
 
+    seed: int = 42
     generator_device: str = "cuda"
     guidance_scale: float = 3.0
     num_inference_steps: int = 30
@@ -64,9 +65,13 @@ class LTX23SamplingParams(LTX2SamplingParams):
     audio_modality_scale: float = 3.0
     audio_skip_step: int = 0
     audio_stg_blocks: list[int] = field(default_factory=lambda: [28])
+    skip_v2a_cross_attn_for_video_gt: bool = False
 
     def build_request_extra(self) -> dict[str, Any]:
         extra = super().build_request_extra()
+        # RL rollout uses the official CFG path (guidance_scale=1, no guider).
+        if self.rollout:
+            return extra
         extra["ltx2_stage1_guider_params"] = {
             "video_cfg_scale": self.video_cfg_scale,
             "video_stg_scale": self.video_stg_scale,
@@ -81,6 +86,8 @@ class LTX23SamplingParams(LTX2SamplingParams):
             "audio_skip_step": self.audio_skip_step,
             "audio_stg_blocks": self.audio_stg_blocks,
         }
+        if self.skip_v2a_cross_attn_for_video_gt:
+            extra["ltx2_skip_v2a_cross_attn_for_video_gt"] = True
         return extra
 
 

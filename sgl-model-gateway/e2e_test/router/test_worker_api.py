@@ -88,9 +88,9 @@ class TestIGWMode:
         http_instance = model_pool.get("llama-8b", ConnectionMode.HTTP)
 
         gateway = Gateway()
-        gateway.start(igw_mode=True)
-
         try:
+            gateway.start(igw_mode=True)
+
             # Add worker
             success, result = gateway.add_worker(http_instance.worker_url)
             assert success, f"Failed to add worker: {result}"
@@ -106,15 +106,16 @@ class TestIGWMode:
             logger.info("Models available: %d", len(models))
         finally:
             gateway.shutdown()
+            http_instance.release()
 
     def test_igw_add_and_remove_worker(self, model_pool: ModelPool):
         """Test adding and removing workers dynamically."""
         http_instance = model_pool.get("llama-8b", ConnectionMode.HTTP)
 
         gateway = Gateway()
-        gateway.start(igw_mode=True)
-
         try:
+            gateway.start(igw_mode=True)
+
             # Add worker
             success, _ = gateway.add_worker(http_instance.worker_url)
             assert success, "Failed to add worker"
@@ -132,6 +133,7 @@ class TestIGWMode:
                 logger.warning("Remove worker not supported: %s", msg)
         finally:
             gateway.shutdown()
+            http_instance.release()
 
     def test_igw_multiple_workers(self, model_pool: ModelPool):
         """Test adding multiple workers (HTTP + gRPC) to IGW gateway."""
@@ -139,9 +141,9 @@ class TestIGWMode:
         grpc_instance = model_pool.get("llama-8b", ConnectionMode.GRPC)
 
         gateway = Gateway()
-        gateway.start(igw_mode=True)
-
         try:
+            gateway.start(igw_mode=True)
+
             # Add both workers
             success1, _ = gateway.add_worker(http_instance.worker_url)
             success2, _ = gateway.add_worker(grpc_instance.worker_url)
@@ -157,6 +159,8 @@ class TestIGWMode:
                 logger.info("Worker: id=%s, url=%s", w.id, w.url)
         finally:
             gateway.shutdown()
+            grpc_instance.release()
+            http_instance.release()
 
 
 @pytest.mark.e2e
@@ -170,12 +174,12 @@ class TestDisableHealthCheck:
         http_instance = model_pool.get("llama-8b", ConnectionMode.HTTP)
 
         gateway = Gateway()
-        gateway.start(
-            igw_mode=True,
-            extra_args=["--disable-health-check"],
-        )
-
         try:
+            gateway.start(
+                igw_mode=True,
+                extra_args=["--disable-health-check"],
+            )
+
             # Add worker - should be immediately healthy since health checks are disabled
             success, worker_id = gateway.add_worker(
                 http_instance.worker_url,
@@ -202,6 +206,7 @@ class TestDisableHealthCheck:
                 ), "Worker should be healthy when health checks disabled"
         finally:
             gateway.shutdown()
+            http_instance.release()
 
     def test_disable_health_check_gateway_starts_without_health_checker(
         self, model_pool: ModelPool

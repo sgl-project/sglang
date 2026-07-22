@@ -21,8 +21,10 @@ documentation:
   - changed-files:
     - any-glob-to-any-file:
       - '**/*.md'
+      - '**/*.mdx'
       - 'docs/**/*'
       - 'README*'
+      - 'docs_new/**/*'
 
 # Dependencies
 dependencies:
@@ -120,3 +122,13 @@ mthreads:
     - any-glob-to-any-file:
       - '**/*mthreads*'
       - '**/*musa*'
+      - '**/musa/**'
+
+# Apple Silicon specific
+apple-silicon:
+  - changed-files:
+    - any-glob-to-any-file:
+      - '**/*metal*'
+      - '**/*mlx*'
+      - '**/mlx/**'
+      - '**/*mps*'
