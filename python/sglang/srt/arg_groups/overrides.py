@@ -1270,7 +1270,13 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
     declared: Dict[str, Any] = {}
 
     if view.enable_hisparse:
-        from sglang.srt.arg_groups.hisparse_hook import _hisparse_default_backend
+        from sglang.srt.arg_groups.hisparse_hook import (
+            _hisparse_default_backend,
+            use_runtime_sparse_attention,
+        )
+
+        if use_runtime_sparse_attention(view):
+            return {}
 
         backend = _hisparse_default_backend(kv_cache_dtype)
         if not user_set_prefill:
@@ -1665,6 +1671,15 @@ def _attention_backend_default(view: Any) -> dict:
         view.prefill_attention_backend == view.decode_attention_backend
     ):  # override the default attention backend
         return {"attention_backend": view.prefill_attention_backend}
+    if view.is_attention_backend_not_set():
+        from sglang.srt.arg_groups.hisparse_hook import (
+            get_hisparse_attention_backend,
+            use_runtime_sparse_attention,
+        )
+
+        if use_runtime_sparse_attention(view):
+            if sparse_backend := get_hisparse_attention_backend(view):
+                return {"attention_backend": sparse_backend}
     if view.attention_backend is None:
         backend = view._get_default_attn_backend(
             view.use_mla_backend(), view.get_model_config()
@@ -1925,6 +1940,29 @@ def _attention_backend_dual_chunk(view: Any) -> dict:
 def _page_size_default(view: Any) -> dict:
     if view.page_size is not None:
         return {}
+
+    from sglang.srt.arg_groups.hisparse_hook import (
+        get_hisparse_page_size,
+        use_runtime_sparse_attention,
+    )
+
+    if use_runtime_sparse_attention(view):
+        sparse_page_size = get_hisparse_page_size(view)
+        if sparse_page_size is not None:
+            if (
+                not isinstance(sparse_page_size, int)
+                or isinstance(sparse_page_size, bool)
+                or sparse_page_size <= 0
+            ):
+                raise ValueError(
+                    "Sparse runtime config page_size must be a positive integer, "
+                    f"got {sparse_page_size!r}."
+                )
+            logger.info(
+                "Using page_size=%d from --hisparse-config for Quest.",
+                sparse_page_size,
+            )
+            return {"page_size": sparse_page_size}
 
     # SHUFFLE 5D vectorized KV layout (aiter backend + pa_decode_gluon)
     # is tuned for and prefers page_size=64 — making it the default

@@ -198,11 +198,25 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
         if not forward_batch.forward_mode.is_extend():
             return
 
+        if getattr(forward_batch, "extend_prefix_lens", None) is not None:
+            new_req_mask = forward_batch.extend_prefix_lens == 0
+            if new_req_mask.any():
+                new_req_indices = req_pool_indices[new_req_mask]
+                self.states.repr_constructed[new_req_indices] = False
+                self.states.prompt_lens[new_req_indices] = 0
+                self.states.last_constructed_page[new_req_indices] = 0
+
+        prompt_lens = self.states.prompt_lens[req_pool_indices]
+        self.states.prompt_lens[req_pool_indices] = torch.maximum(prompt_lens, seq_lens)
+
         num_pages = seq_lens // self.page_size
-        valid_mask = (
-            ~self.states.repr_constructed[req_pool_indices]
-            & (seq_lens >= self.states.prompt_lens[req_pool_indices])
-            & (num_pages > 0)
+        start_page = torch.where(
+            self.states.repr_constructed[req_pool_indices],
+            self.states.last_constructed_page[req_pool_indices],
+            torch.zeros_like(num_pages),
+        )
+        valid_mask = (seq_lens >= self.states.prompt_lens[req_pool_indices]) & (
+            num_pages > start_page
         )
 
         if not valid_mask.any():
@@ -213,7 +227,7 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
             layer_id,
             req_pool_indices[valid_mask],
             seq_lens[valid_mask],
-            0,
+            start_page[valid_mask],
             num_pages[valid_mask],
             k_buffer,
         )

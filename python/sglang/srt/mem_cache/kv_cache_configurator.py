@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, Optional
 import msgspec
 import torch
 
+from sglang.srt.arg_groups.hisparse_hook import use_runtime_sparse_attention
 from sglang.srt.configs.hybrid_arch import hybrid_gdn_config, mambaish_config
 from sglang.srt.configs.model_config import (
     ModelConfig,
@@ -1442,7 +1443,10 @@ class KVCacheConfigurator:
                         need_sort=need_sort,
                     )
                 else:
-                    if get_memory().enable_hisparse:
+                    if (
+                        get_memory().enable_hisparse
+                        and not use_runtime_sparse_attention(self.server_args)
+                    ):
                         from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
                         hisparse_cfg = parse_hisparse_config(self.server_args)
