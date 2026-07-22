@@ -237,6 +237,59 @@ def test_partial_rope(batch_size: int, is_neox: bool, rope_dim: int, head_dim: i
     triton.testing.assert_close(k_fi, k_jit, atol=atol, rtol=rtol)
 
 
+@pytest.mark.parametrize("is_neox", IS_NEOX_LIST)
+@pytest.mark.parametrize("dtype", DTYPE_LIST)
+def test_rotary_embedding_uses_fused_kernel_for_partial_rope(
+    is_neox: bool, dtype: torch.dtype
+) -> None:
+    from sglang.srt.layers.rotary_embedding import RotaryEmbedding
+    from sglang.srt.server_args import (
+        ServerArgs,
+        set_global_server_args_for_scheduler,
+    )
+
+    set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
+
+    # Real MiMo-V2.5-Pro attention shape: head_dim=192 with a partial rotary dim
+    # of 64 (partial_rotary_factor=0.334) and 128 query / 8 KV heads. head_dim=192
+    # is not one of the fused kernel's supported dims, so the fused path must be
+    # selected via rotary_dim=64 instead.
+    batch_size = 129
+    num_qo_heads = 128
+    num_kv_heads = 8
+    head_dim = 192
+    rope_dim = 64
+    max_position = 4096
+
+    rotary_emb = RotaryEmbedding(
+        head_size=head_dim,
+        rotary_dim=rope_dim,
+        max_position_embeddings=max_position,
+        base=ROPE_BASE,
+        is_neox_style=is_neox,
+        dtype=dtype,
+    ).to(DEVICE)
+
+    assert not rotary_emb.use_fallback_kernel
+    assert rotary_emb.cos_sin_cache.dtype == torch.float32
+
+    q = torch.randn(batch_size, num_qo_heads, head_dim, device=DEVICE, dtype=dtype)
+    k = torch.randn(batch_size, num_kv_heads, head_dim, device=DEVICE, dtype=dtype)
+    positions = torch.randint(
+        0, max_position, (batch_size,), device=DEVICE, dtype=torch.int32
+    )
+
+    q_ref, k_ref = q.clone(), k.clone()
+    q_out, k_out = q.clone(), k.clone()
+
+    flashinfer_rope(q_ref, k_ref, rotary_emb.cos_sin_cache, positions.long(), is_neox)
+    rotary_emb(positions, q_out, k_out)
+
+    assert rotary_emb.cos_sin_cache.dtype == torch.float32
+    triton.testing.assert_close(q_ref, q_out, atol=1e-2, rtol=1e-2)
+    triton.testing.assert_close(k_ref, k_out, atol=1e-2, rtol=1e-2)
+
+
 @pytest.mark.parametrize("batch_size", BS_LIST)
 @pytest.mark.parametrize("gqa_ratio", GQA_RATIO)
 @pytest.mark.parametrize("num_kv_heads", NUM_KV_HEADS_LIST)

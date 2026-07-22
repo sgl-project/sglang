@@ -38,6 +38,7 @@ _is_cpu = is_cpu()
 _is_xpu = is_xpu()
 _is_musa = is_musa()
 _is_mps = is_mps()
+_FUSED_ROPE_SUPPORTED_DIMS = {64, 128, 256, 512}
 
 if _is_cuda:
     from sglang.jit_kernel.rope import apply_rope_with_cos_sin_cache_inplace
@@ -98,8 +99,12 @@ class RotaryEmbedding(MultiPlatformOp):
         if not (_is_cuda or _is_xpu or envs.SGLANG_ROPE_CACHE_FP32.get()):
             cache = cache.to(dtype)
 
+        use_fused_cuda_rope = _is_cuda and (
+            self.head_size in _FUSED_ROPE_SUPPORTED_DIMS
+            or self.rotary_dim in _FUSED_ROPE_SUPPORTED_DIMS
+        )
         if (
-            (not (_is_cuda) or self.head_size not in [64, 128, 256, 512])
+            not use_fused_cuda_rope
             and not (_is_cpu)
             and not (_is_xpu)
             and not (_is_npu)
@@ -367,6 +372,14 @@ class RotaryEmbedding(MultiPlatformOp):
         fused_set_kv_buffer_arg: Optional[Union[FusedSetKVBufferArg, dict]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if not self.use_fallback_kernel:
+            if (
+                fused_set_kv_buffer_arg is not None
+                and self.head_size != self.rotary_dim
+            ):
+                raise NotImplementedError(
+                    "Fused RoPE + KV cache store requires head_size == rotary_dim. "
+                    "Partial rotary embedding should use the separate KV cache store path."
+                )
             batch_size = positions.size(0)
             q_rope = query.view(batch_size, -1, self.head_size)
             k_rope = key.view(batch_size, -1, self.head_size)
