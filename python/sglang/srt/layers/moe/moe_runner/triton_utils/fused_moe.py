@@ -789,7 +789,9 @@ def _fused_moe_kernel_sequence(
                     routed_scaling_factor,
                 )
     elif _is_hip:
-        if _use_aiter:
+        if topk == 1 and routed_scaling_factor == 1.0 and not _use_intermediate:
+            pass  # we wrote directly into out_hidden_states
+        elif _use_aiter:
             moe_sum(
                 intermediate_cache3.view(*intermediate_cache3.shape),
                 out_hidden_states,
