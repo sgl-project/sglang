@@ -576,7 +576,10 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
         self.assertIsInstance(method, Fp8LinearMethod)
         self.assertTrue(method.use_mxfp8)
         self.assertEqual(quant_config.mxfp8_config.weight_block_size, [1, 32])
-        self.assertEqual(quant_config.exclude_modules, ["language_model.lm_head"])
+        self.assertEqual(
+            quant_config.exclude_modules,
+            ["language_model.lm_head", "lm_head"],
+        )
 
     def test_nemotron_mixed_precision_with_nvfp4_layers_uses_modelopt_mixed(self):
         model_config = ModelConfig.__new__(ModelConfig)

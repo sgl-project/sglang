@@ -2349,11 +2349,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 align_fp4_moe_weights_for_flashinfer_trtllm,
             )
 
-            # NOTE: no w1/w3 -> w3/w1 reorder here. The ModelOpt NVFP4 loader
-            # already lays w13 out in the order the TRT-LLM kernel expects
-            # (DeepSeek-V4-Pro-NVFP4 runs this same path without a reorder); the
-            # explicit reorder that the mxfp4/gpt-oss path needs would double-swap
-            # gate/up here and corrupt the SwiGLU.
             # FlashInfer TRTLLM processing - handles both w13 and w2
             align_fp4_moe_weights_for_flashinfer_trtllm(layer)
             # TRTLLM doesn't read *_blockscale_swizzled; alias to free the
