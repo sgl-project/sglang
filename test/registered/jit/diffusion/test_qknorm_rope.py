@@ -70,7 +70,7 @@ def fused_qknorm_rope(
     positions: torch.Tensor,
     is_neox: bool,
 ) -> None:
-    from sglang.jit_kernel.diffusion.qknorm_rope import fused_inplace_qknorm_rope
+    from sglang.kernels.ops.diffusion.qknorm_rope import fused_inplace_qknorm_rope
 
     fused_inplace_qknorm_rope(
         q,
