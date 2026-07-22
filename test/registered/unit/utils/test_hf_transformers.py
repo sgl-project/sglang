@@ -636,5 +636,77 @@ class TestPatchNemotronHPattern(unittest.TestCase):
             self.skipTest("NemotronHConfig not available in this transformers version")
 
 
+# ---------------------------------------------------------------------------
+# _validate_local_model_path
+# ---------------------------------------------------------------------------
+
+
+class TestValidateLocalModelPath(unittest.TestCase):
+    """Local paths that don't exist should fail fast with a clear error.
+
+    Without the pre-check, an absolute/relative path that doesn't exist falls
+    through to the HF stack, which treats it as a Hub repo id and raises a
+    cryptic ``HFValidationError: Repo id must be in the form ...``. See
+    ``sglang.srt.utils.hf_transformers.config._validate_local_model_path``.
+    """
+
+    def _validate(self, model):
+        from sglang.srt.utils.hf_transformers.config import (
+            _validate_local_model_path,
+        )
+
+        return _validate_local_model_path(model)
+
+    def test_missing_absolute_path_raises(self):
+        with self.assertRaises(FileNotFoundError):
+            self._validate("/__sglang_nonexistent__/path/to/draft")
+
+    def test_missing_dot_relative_path_raises(self):
+        with self.assertRaises(FileNotFoundError):
+            self._validate("./__sglang_nonexistent__/eagle")
+
+    def test_missing_parent_relative_path_raises(self):
+        with self.assertRaises(FileNotFoundError):
+            self._validate("../__sglang_nonexistent__/eagle")
+
+    def test_missing_home_relative_path_raises(self):
+        with self.assertRaises(FileNotFoundError):
+            self._validate("~/__sglang_nonexistent_dir_for_test__/eagle")
+
+    def test_error_message_is_actionable(self):
+        with self.assertRaises(FileNotFoundError) as ctx:
+            self._validate("/__sglang_nonexistent__/eagle")
+        msg = str(ctx.exception)
+        # Mentions the offending path and points at the repo-id alternative.
+        self.assertIn("/__sglang_nonexistent__/eagle", msg)
+        self.assertIn("repo id", msg)
+
+    def test_hub_repo_id_is_not_treated_as_local(self):
+        # 'namespace/repo_name' is a valid Hub id; it must pass through
+        # untouched even though no such local path exists.
+        self._validate("AngelSlim/Qwen3-1.7B_eagle3")
+
+    def test_bare_repo_name_is_not_treated_as_local(self):
+        self._validate("Qwen3-1.7B")
+
+    def test_existing_absolute_path_does_not_raise(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            # absolute + exists -> ok (this is the common "local model" case)
+            self._validate(tmp)
+
+    def test_pathlike_input_is_supported(self):
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            self._validate(Path(tmp))
+        with self.assertRaises(FileNotFoundError):
+            self._validate(Path("/__sglang_nonexistent__/eagle"))
+
+    def test_non_path_input_is_ignored(self):
+        # Defensive: non-str / non-PathLike inputs must pass through silently.
+        self._validate(None)
+        self._validate(123)
+
+
 if __name__ == "__main__":
     unittest.main()
