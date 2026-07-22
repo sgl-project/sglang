@@ -41,7 +41,7 @@ using PackageType = decltype(get_mem_package<kUnit>());
 // has no equivalent PTX, but non-temporal (streaming) loads/stores express the
 // same intent for one-shot HiCache write-back traffic that should not pollute
 // the cache. Guard the PTX behind USE_ROCM so the JIT module also compiles with
-// hipcc; see python/sglang/jit_kernel/utils.py for the ROCm build flags.
+// hipcc; see python/sglang/kernels/jit/utils/compile.py for the ROCm build flags.
 #ifdef USE_ROCM
 // Native Clang vector types so a single __builtin_nontemporal_{load,store} maps
 // to one vectorized global_{load,store}_dwordx{2,4}. Issuing N independent

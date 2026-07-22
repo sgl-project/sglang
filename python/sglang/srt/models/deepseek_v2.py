@@ -212,7 +212,7 @@ if _use_aiter:
     pass
 
 if _is_cuda:
-    from sglang.jit_kernel.dsv3_router_gemm import (
+    from sglang.kernels.ops.gemm._jit_dsv3_router_gemm import (
         dsv3_router_gemm as _jit_dsv3_router_gemm,
     )
 elif _is_npu:

@@ -10,7 +10,7 @@ from typing import Any, Callable
 import flashinfer
 import torch
 
-from sglang.jit_kernel.benchmark.utils import DEFAULT_DTYPE
+from sglang.kernels.jit.benchmark.utils import DEFAULT_DTYPE
 from sglang.kernels.jit.utils import KERNEL_PATH
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.utils import is_in_ci

@@ -66,7 +66,7 @@ class RMSNormOp(BaseFusedOp):
     )
     descriptions = {
         KernelBackend.AOT: "RMS normalization (sgl_kernel wheel).",
-        KernelBackend.JIT: "RMS normalization (sglang.jit_kernel).",
+        KernelBackend.JIT: "RMS normalization (sglang.kernels.jit).",
         KernelBackend.AITER: "RMS normalization (aiter rmsnorm2d_fwd, ROCm).",
         KernelBackend.TORCH_NPU: "RMS normalization (torch_npu, Ascend).",
         KernelBackend.TORCH: "RMS normalization (pure-torch reference).",
@@ -180,7 +180,7 @@ class FusedAddRMSNormOp(BaseFusedOp):
             "Fused residual-add + RMS normalization (sgl_kernel wheel)."
         ),
         KernelBackend.JIT: (
-            "Fused residual-add + RMS normalization (sglang.jit_kernel)."
+            "Fused residual-add + RMS normalization (sglang.kernels.jit)."
         ),
         KernelBackend.AITER: ("Fused residual-add + RMS normalization (aiter, ROCm)."),
         KernelBackend.TORCH_NPU: (
@@ -289,7 +289,7 @@ class GemmaRMSNormOp(BaseFusedOp):
     descriptions = {
         KernelBackend.AOT: "Gemma-style RMS normalization (sgl_kernel wheel).",
         KernelBackend.JIT: (
-            "Gemma-style RMS normalization (rocm-triton, sglang.jit_kernel)."
+            "Gemma-style RMS normalization (rocm-triton, sglang.kernels.jit)."
         ),
         KernelBackend.TORCH_NPU: ("Gemma-style RMS normalization (torch_npu, Ascend)."),
         KernelBackend.TORCH: "Gemma-style RMS normalization (pure-torch reference).",
@@ -382,7 +382,7 @@ class GemmaFusedAddRMSNormOp(BaseFusedOp):
         KernelBackend.AOT: ("Gemma-style fused residual-add + RMS normalization."),
         KernelBackend.JIT: (
             "Gemma-style fused residual-add + RMS normalization "
-            "(rocm-triton, sglang.jit_kernel)."
+            "(rocm-triton, sglang.kernels.jit)."
         ),
         KernelBackend.TORCH: (
             "Gemma-style fused residual-add + RMS normalization "

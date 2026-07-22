@@ -145,8 +145,12 @@ if _is_cuda:
 
         _jit_rmsnorm_hf = None
 
-    from sglang.jit_kernel.norm import fused_add_rmsnorm as _jit_fused_add_rmsnorm
-    from sglang.jit_kernel.norm import is_supported_jit_fused_add_rmsnorm_hidden_size
+    from sglang.kernels.ops.layernorm._jit_norm import (
+        fused_add_rmsnorm as _jit_fused_add_rmsnorm,
+    )
+    from sglang.kernels.ops.layernorm._jit_norm import (
+        is_supported_jit_fused_add_rmsnorm_hidden_size,
+    )
 
 
 logger = logging.getLogger(__name__)

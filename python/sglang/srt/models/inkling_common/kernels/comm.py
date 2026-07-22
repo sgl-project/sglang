@@ -94,7 +94,7 @@ def _ar_jit():
     lazy so importing comm.py doesn't pull in the JIT machinery)."""
     if not is_cuda():
         return None
-    from sglang.jit_kernel import inkling_all_reduce
+    from sglang.kernels.ops.model.inkling import inkling_all_reduce
 
     return inkling_all_reduce
 
@@ -103,7 +103,7 @@ def _ar_jit():
 def _ar_fused_jit():
     if not is_cuda():
         return None
-    from sglang.jit_kernel import inkling_ar_fused
+    from sglang.kernels.ops.model.inkling import inkling_ar_fused
 
     return inkling_ar_fused
 
@@ -674,7 +674,7 @@ def all_gather_hidden(input: torch.Tensor, group: GroupCoordinator) -> torch.Ten
 def _ar_ssconv_jit():
     if not is_cuda():
         return None
-    from sglang.jit_kernel import inkling_ar_scattered_sconv
+    from sglang.kernels.ops.model.inkling import inkling_ar_scattered_sconv
 
     return inkling_ar_scattered_sconv
 

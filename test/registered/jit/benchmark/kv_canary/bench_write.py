@@ -6,7 +6,7 @@ import torch
 import triton
 import triton.testing
 
-from sglang.jit_kernel.benchmark.kv_canary.utils import (
+from sglang.kernels.jit.benchmark.kv_canary.utils import (
     RING_CAPACITY,
     SWA_WINDOW,
     BenchCase,
@@ -16,7 +16,7 @@ from sglang.jit_kernel.benchmark.kv_canary.utils import (
     make_real_kv_sources,
     naive_slot_copy_fn,
 )
-from sglang.jit_kernel.benchmark.utils import (
+from sglang.kernels.jit.benchmark.utils import (
     DEFAULT_DEVICE,
     get_benchmark_range,
     run_benchmark,

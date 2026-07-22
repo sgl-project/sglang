@@ -7,19 +7,19 @@ from typing import Optional
 import pytest
 import torch
 
-from sglang.jit_kernel.tests.kv_canary._differential import _run_both_plan
-from sglang.jit_kernel.tests.kv_canary._fixtures import (
+from sglang.kernels.jit.tests.kv_canary._differential import _run_both_plan
+from sglang.kernels.jit.tests.kv_canary._fixtures import (
     allocate_plan_pair,
     derive_plan_capacity,
     make_lut,
     make_padding_mask,
     make_req_to_token,
 )
-from sglang.jit_kernel.tests.kv_canary._fuzz_driver import (
+from sglang.kernels.jit.tests.kv_canary._fuzz_driver import (
     FUZZ_SEEDS_PR,
     run_fuzz_combo,
 )
-from sglang.jit_kernel.tests.kv_canary._invariants import PlanInvariants
+from sglang.kernels.jit.tests.kv_canary._invariants import PlanInvariants
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
