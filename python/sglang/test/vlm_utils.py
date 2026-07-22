@@ -221,8 +221,8 @@ class ImageOpenAITestMixin(TestOpenAIMLLMServerBase):
         assert isinstance(text, str)
 
         # `driver` is for gemma-3-it
-        assert (
-            "man" in text or "person" or "driver" in text
+        assert any(
+            keyword in text for keyword in ("man", "person", "driver")
         ), f"text: {text}, should contain man, person or driver"
         assert (
             "cab" in text
