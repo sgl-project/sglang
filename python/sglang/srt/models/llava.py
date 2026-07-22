@@ -54,7 +54,7 @@ from sglang.srt.multimodal.mm_utils import (
     unpad_image,
     unpad_image_shape,
 )
-from sglang.srt.utils import add_prefix, flatten_nested_list, logger
+from sglang.srt.utils import add_prefix, flatten_nested_list, get_device, logger
 
 _KNOWN_BROKEN_AUTOMODEL_CONFIG = "VoxtralRealtimeTextConfig"
 _KNOWN_BROKEN_AUTOMODEL_ERROR = "Could not find VoxtralRealtimeTextModel"
@@ -476,11 +476,11 @@ class LlavaBaseForCausalLM(nn.Module):
         if "clip" in vision_path:
             self.vision_tower = CLIPVisionModel.from_pretrained(
                 vision_path, torch_dtype=torch.float16
-            ).cuda()
+            ).to(get_device())
         elif "siglip" in vision_path:
             self.vision_tower = SiglipVisionModel.from_pretrained(
                 vision_path, torch_dtype=torch.float16
-            ).cuda()
+            ).to(get_device())
             # Siglip needs all feature tokens
             self.config.mm_vision_select_feature = "full"
         self.vision_tower.eval()
