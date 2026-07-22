@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from sglang.srt.layers.attention.vision import (
     prepare_flashinfer_cudnn_vision_attention_metadata,
 )
+from sglang.srt.model_executor import model_runner
 from sglang.srt.models import kimi_k3_vl
 from sglang.srt.models.kimi_k3_vl import (
     KimiK3VisionTower,
@@ -83,6 +84,36 @@ def test_kimi_k3_skips_attention_precompile_on_cpu():
     assert not encoder.precompile_attention_backend(
         torch.bfloat16, torch.device("cpu")
     )
+
+
+def test_model_kernel_precompile_runs_after_loading_and_clears_cache(monkeypatch):
+    events = []
+    runner = model_runner.ModelRunner.__new__(model_runner.ModelRunner)
+    runner.model = SimpleNamespace(
+        precompile_kernels_after_loading=lambda: events.append("precompile")
+    )
+    runner.device = "cuda"
+
+    monkeypatch.setattr(
+        model_runner.current_platform,
+        "synchronize",
+        lambda: events.append("synchronize"),
+    )
+    monkeypatch.setattr(
+        model_runner.current_platform,
+        "empty_cache",
+        lambda: events.append("empty_cache"),
+    )
+
+    runner.maybe_precompile_model_kernels_after_loading()
+
+    assert events == [
+        "synchronize",
+        "empty_cache",
+        "precompile",
+        "synchronize",
+        "empty_cache",
+    ]
 
 
 @pytest.mark.parametrize("mode", ["bilinear", "bicubic"])

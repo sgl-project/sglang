@@ -1002,6 +1002,8 @@ class ModelRunner:
         if not self.is_draft_worker:
             get_offloader().post_init()
 
+        self.maybe_precompile_model_kernels_after_loading()
+
         # Register model for layerwise NVTX profiling if enabled
         if self.server_args.enable_layerwise_nvtx_marker:
             pyt_hooks = PytHooks()
@@ -1064,6 +1066,20 @@ class ModelRunner:
             tp_rank=self.ps.tp_rank,
             is_ep_scale_joiner=self.server_args.is_ep_scale_joiner,
         )
+
+    def maybe_precompile_model_kernels_after_loading(self) -> None:
+        """Run opt-in precompile after quant postprocessing, before pool sizing."""
+        precompile = getattr(self.model, "precompile_kernels_after_loading", None)
+        if precompile is None:
+            return
+
+        if self.device == "cuda":
+            current_platform.synchronize()
+            current_platform.empty_cache()
+        precompile()
+        if self.device == "cuda":
+            current_platform.synchronize()
+            current_platform.empty_cache()
 
     def maybe_init_dwdp(self):
         if self.is_draft_worker:

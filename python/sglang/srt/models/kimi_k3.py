@@ -2900,6 +2900,12 @@ class KimiK3ForConditionalGeneration(nn.Module):
         # Delegate so DummyModelLoader's post-load hook reaches the LM tower.
         self.language_model.post_load_weights()
 
+    def precompile_kernels_after_loading(self) -> None:
+        if self.vision_tower.precompile_fused_rope():
+            logger.info("Precompiled dynamic-token fused K3 vision RoPE kernel")
+        if self.vision_tower.precompile_attention_backend():
+            logger.info("Precompiled Kimi-K3 vision FA4 kernel")
+
     def get_input_embeddings(self):
         return self.language_model.model.embed_tokens
 
@@ -3020,10 +3026,6 @@ class KimiK3ForConditionalGeneration(nn.Module):
                 yield name.replace("language_model.", ""), loaded_weight
 
         self.language_model.load_weights(stream_language_weights())
-        if self.vision_tower.precompile_fused_rope():
-            logger.info("Precompiled dynamic-token fused K3 vision RoPE kernel")
-        if self.vision_tower.precompile_attention_backend():
-            logger.info("Precompiled Kimi-K3 vision FA4 kernel")
 
     @property
     def stacked_params_mapping(self):
