@@ -91,6 +91,10 @@ class WanT2V480PConfig(PipelineConfig):
     vae_precision: str = "fp32"
     text_encoder_precisions: tuple[str, ...] = field(default_factory=lambda: ("fp32",))
 
+    # Multi-output prompt conditioning (num_outputs_per_prompt > 1) is handled by
+    # the base-class `get_pos/neg_prompt_embeds`, which broadcast the conditioning
+    # batch via `expand_cond_to_batch`.
+
     def __post_init__(self):
         self.vae_config.load_encoder = False
         self.vae_config.load_decoder = True

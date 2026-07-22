@@ -163,6 +163,41 @@ def pad_text_embeddings_with_mask(
     return TextConditioningOutput(prompt_embeds, prompt_embeds_mask, seq_lens)
 
 
+def expand_cond_to_batch(
+    cond: "list[torch.Tensor] | torch.Tensor | None",
+    target_batch_size: int,
+) -> "list[torch.Tensor] | torch.Tensor | None":
+    """Broadcast a conditioning tensor (or list/None) along the batch dim.
+
+    When ``num_outputs_per_prompt > 1`` the sample batch is expanded to
+    ``target_batch_size`` while the text-conditioning tensors still carry the
+    original per-prompt batch dim. This repeats each prompt's conditioning
+    ``target_batch_size // current`` times via ``repeat_interleave``, so row
+    ``p`` maps to output rows ``[p*k : (p+1)*k]`` -- matching how the latent
+    sample batch is expanded for multi-output generation.
+
+    No-op when the batch dim already equals ``target_batch_size`` (the common
+    ``num_outputs_per_prompt == 1`` case), in which case the input is returned
+    unchanged. Raises ``ValueError`` when the current batch size does not
+    divide ``target_batch_size``.
+    """
+    if cond is None:
+        return None
+    if isinstance(cond, list):
+        return [expand_cond_to_batch(t, target_batch_size) for t in cond]
+
+    current_batch_size = cond.shape[0]
+    if current_batch_size == target_batch_size:
+        return cond
+    if current_batch_size == 0 or target_batch_size % current_batch_size != 0:
+        raise ValueError(
+            f"conditioning batch size ({current_batch_size}) must divide "
+            f"target batch size ({target_batch_size})."
+        )
+    repeat_factor = target_batch_size // current_batch_size
+    return cond.repeat_interleave(repeat_factor, dim=0).contiguous()
+
+
 def shard_rotary_emb_for_sp(emb):
     """Shard rotary embeddings [S, D] along the sequence for SP; non-divisible
     lengths pad by repeating the last row (position labels, never attention
@@ -670,10 +705,10 @@ class PipelineConfig:
         return safetensors_list
 
     def get_pos_prompt_embeds(self, batch):
-        return batch.prompt_embeds
+        return expand_cond_to_batch(batch.prompt_embeds, batch.batch_size)
 
     def get_neg_prompt_embeds(self, batch):
-        return batch.negative_prompt_embeds
+        return expand_cond_to_batch(batch.negative_prompt_embeds, batch.batch_size)
 
     def expand_conditioning_to_sample_batch(self, batch):
         """Used for single-request multi-output generation case."""
