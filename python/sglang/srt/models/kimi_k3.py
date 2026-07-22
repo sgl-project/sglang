@@ -123,9 +123,10 @@ def _cdiv(a: int, b: int) -> int:
 # fused front always lands both partial sums in one symmetric
 # [latent | shared] buffer and all-reduces once; see _forward_fused):
 #   "baseline" - two separate all-reduces (routed latent, then shared)
-#   "fi_fused" - flashinfer fused allreduce+rmsnorm for the latent reduce
 #   "concat"   - accepted for compat, behaves as "baseline" here (the
 #                single-collective tail now rides the fused front)
+# ("fi_fused" — the flashinfer fused allreduce+rmsnorm — was removed; it lost
+# every A/B and the K3 fused AR covers its niche.)
 # A/B history, pre-zero-copy concat path, 8xB300 bs=1 decode (2026-07-03):
 # baseline 35.2 tok/s beat concat 33.2 (21.5KB message falls off the
 # one-shot allreduce path into two-shot) and fi_fused 33.0. On MULTI-NODE
@@ -1052,33 +1053,11 @@ class KimiK3MoE(nn.Module):
             return latent
         return self.routed_expert_norm(latent)
 
-    def _fi_fused_reduce_norm(self, latent: torch.Tensor) -> torch.Tensor:
-        """Fuse the latent all-reduce with the RMSNorm epilogue; fall back to
-        plain all-reduce + norm when flashinfer declines the shape."""
-        from sglang.srt.layers.flashinfer_comm_fusion import (
-            flashinfer_allreduce_residual_rmsnorm,
-        )
-
-        norm = self.routed_expert_norm
-        assert norm is not None  # regime "fi_fused" requires the norm
-        zero_res = torch.zeros_like(latent)
-        norm_out, _ = flashinfer_allreduce_residual_rmsnorm(
-            latent,
-            zero_res,
-            norm.weight,
-            eps=norm.variance_epsilon,
-        )
-        if norm_out is not None:
-            return norm_out
-        return self._latent_norm(tensor_model_parallel_all_reduce(latent))
-
     def _reduce_latent(self, latent: torch.Tensor) -> torch.Tensor:
         """Unfused-front latent tail: TP-partial routed sums must be reduced
         in latent space BEFORE the RMSNorm (sum(norm(x_i)) != norm(sum(x_i)))."""
         if not self._routed_needs_reduce:
             return self._latent_norm(latent)
-        if self.moe_reduce_mode == "fi_fused" and self.routed_expert_norm is not None:
-            return self._fi_fused_reduce_norm(latent)
         return self._latent_norm(tensor_model_parallel_all_reduce(latent))
 
     def _forward_unfused(
@@ -1131,6 +1110,31 @@ class KimiK3MoE(nn.Module):
             return _add3(out, shared_output, prefix_sum)
         return out if prefix_sum is None else out + prefix_sum
 
+    def _forward_routed(self, hidden_states, router_logits, routed_input, latent):
+        topk_output = self.topk(hidden_states, router_logits)
+        with zero_copy_context.set_moe_output(latent):
+            expert_output = self.experts(routed_input, topk_output)
+        if expert_output.data_ptr() != latent.data_ptr():
+            latent.copy_(expert_output)
+
+    def _forward_shared(self, gate_up, shared_output):
+        shared = self.shared_experts
+        if TYPE_CHECKING:
+            assert shared is not None and isinstance(
+                shared.down_proj.weight, torch.Tensor
+            )
+        assert shared is not None
+        _k3_bf16_gemm(
+            shared.act_fn(gate_up),
+            shared.down_proj.weight,
+            out=shared_output,
+        )
+
+    def _get_fused_norm_params(self) -> tuple[torch.Tensor, float]:
+        norm = self.routed_expert_norm
+        assert self.fuse_ar_norm and norm is not None
+        return norm.weight, norm.variance_epsilon
+
     def _forward_fused(
         self, hidden_states: torch.Tensor, *, prefix_sum: Optional[torch.Tensor]
     ) -> torch.Tensor:
@@ -1156,11 +1160,10 @@ class KimiK3MoE(nn.Module):
         gate_up, router_logits, routed_input = torch.split(
             fused, self._front_sizes, dim=-1
         )
-        topk_output = self.topk(hidden_states, router_logits)
+        if num_tokens > 1 and self._moe_front_needs_contiguous:
+            routed_input = routed_input.contiguous()
         latent_numel = num_tokens * self.moe_hidden_size
         if k3_ar_fusion.enabled():
-            # fused MNNVL AR: the buffer lives in the torch symm pool so the
-            # NVLS 2shot can reduce it in place (small sizes take the push)
             with k3_ar_fusion.symm_alloc():
                 buf = hidden_states.new_empty(latent_numel + num_tokens * hidden_size)
         else:
@@ -1171,36 +1174,43 @@ class KimiK3MoE(nn.Module):
 
         latent = buf[:latent_numel].view(num_tokens, self.moe_hidden_size)
         shared_output = buf[latent_numel:].view(num_tokens, hidden_size)
-        _k3_bf16_gemm(
-            self.shared_experts.act_fn(gate_up),
-            self.shared_experts.down_proj.weight,
-            out=shared_output,
-        )
-
-        # NOTE: Marlin need contiguous input; bs = 1 is already contiguous.
-        # flashinfer_mxfp4 keeps the strided view (its quant reads strides).
-        if num_tokens > 1 and self._moe_front_needs_contiguous:
-            routed_input = routed_input.contiguous()
-        with zero_copy_context.set_moe_output(latent):
-            expert_output = self.experts(routed_input, topk_output)
-        if expert_output.data_ptr() != latent.data_ptr():
-            latent.copy_(expert_output)
-
-        # Re-derive both views from the returned tensor: all_reduce is NOT
-        # guaranteed in-place (custom-AR / pymscclpp paths return a new
-        # tensor; only the symmetric-mempool pynccl path and the K3 fused
-        # MNNVL path reduce in place).
         fused_norm = False
-        if k3_ar_fusion.enabled():
+        if self.alt_stream is not None and k3_ar_fusion.enabled():
+            current_stream = torch.cuda.current_stream()
+            self.alt_stream.wait_stream(current_stream)
+            self._forward_routed(hidden_states, router_logits, routed_input, latent)
+            with torch.cuda.stream(self.alt_stream):
+                self._forward_shared(gate_up, shared_output)
+                # low-SM pull so the side-stream AR leaves the SMs to the
+                # routed GEMMs it overlaps (K3 dims are fixed; tuned here)
+                k3_ar_fusion.all_reduce_low_sm(shared_output, num_blocks=4, unroll=8)
+            current_stream.wait_stream(self.alt_stream)
+            # NOTE: the latent AR must stay serialized after the shared AR
+            # (both reuse the v2 pull semaphores; concurrent calls would
+            # corrupt each other's barrier windows) — the join above does it.
             if self.fuse_ar_norm:
                 fused_norm = True
-                norm = self.routed_expert_norm
-                assert norm is not None
-                k3_ar_fusion.all_reduce_norm(buf, norm.weight, norm.variance_epsilon)
+                k3_ar_fusion.all_reduce_norm(
+                    latent.view(-1, self.moe_hidden_size),
+                    *self._get_fused_norm_params(),
+                    num_tokens=num_tokens,
+                )
             else:
+                k3_ar_fusion.all_reduce(latent)
+        else:  # single collective over the flat [latent | shared] pair
+            self._forward_shared(gate_up, shared_output)
+            self._forward_routed(hidden_states, router_logits, routed_input, latent)
+            if self.fuse_ar_norm and k3_ar_fusion.enabled():
+                fused_norm = True
+                k3_ar_fusion.all_reduce_norm(
+                    buf.view(-1, k3_ar_fusion.NORM_DIM),
+                    *self._get_fused_norm_params(),
+                    num_tokens=num_tokens,
+                )
+            elif k3_ar_fusion.enabled():
                 k3_ar_fusion.all_reduce(buf)
-        else:
-            buf = tensor_model_parallel_all_reduce(buf)
+            else:
+                buf = tensor_model_parallel_all_reduce(buf)
 
         latent = buf[:latent_numel].view(num_tokens, self.moe_hidden_size)
         shared_output = buf[latent_numel:].view(num_tokens, hidden_size)

@@ -201,7 +201,9 @@ def benchmark_norm(tokens: int, provider: str):
         x.normal_()
 
         def fn(t):
-            all_reduce.all_reduce_pull_norm(world, t, weight, 1e-6, input_mc_ptr=mc)
+            all_reduce.all_reduce_pull_norm(
+                world, t, weight, 1e-6, num_norm_rows=tokens, input_mc_ptr=mc
+            )
 
         clone = None
     else:  # nccl + unfused norm

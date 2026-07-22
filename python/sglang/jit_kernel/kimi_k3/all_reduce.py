@@ -171,10 +171,13 @@ def _push_norm_op(
     x: torch.Tensor,
     weight: torch.Tensor,
     eps: float,
+    num_norm_rows: int,
     ws_mc_base: int,
 ) -> None:
     comm = _COMM_MAP[world_size].obj
-    _jit_module(world_size).push_norm(comm, x.view(-1), weight, eps, ws_mc_base)
+    _jit_module(world_size).push_norm(
+        comm, x.view(-1), weight, eps, num_norm_rows, ws_mc_base
+    )
 
 
 @register_custom_op(mutates_args=["x"])
@@ -204,6 +207,7 @@ def _pull_norm_op(
     x: torch.Tensor,
     weight: torch.Tensor,
     eps: float,
+    num_norm_rows: int,
     input_mc_ptr: int,
     num_blocks: int,
     unroll: int,
@@ -214,6 +218,7 @@ def _pull_norm_op(
         x.view(-1),
         weight,
         eps,
+        num_norm_rows,
         input_mc_ptr,
         entry.pull_sem_mc_ptr,
         num_blocks,
@@ -250,13 +255,12 @@ def all_reduce_push_norm(
     weight: torch.Tensor,
     eps: float,
     *,
+    num_norm_rows: int,
     ws_mc_base: int,
 ) -> torch.Tensor:
-    """In-place allreduce + RMSNorm over the latent of the K3 latent|shared
-    MoE buffer via 1shot multicast push (buffer contract in the module
-    docstring; N and the normed row range are derived C++-side from ``x``'s
-    element count, which must be a multiple of 3 * 3584)."""
-    _push_norm_op(world_size, x, weight, eps, ws_mc_base)
+    """In-place allreduce via 1shot multicast push + RMSNorm over the first
+    ``num_norm_rows`` rows of ``x`` viewed as [numel / 3584, 3584]."""
+    _push_norm_op(world_size, x, weight, eps, num_norm_rows, ws_mc_base)
     return x
 
 
@@ -294,13 +298,14 @@ def all_reduce_pull_norm(
     weight: torch.Tensor,
     eps: float = 1e-6,
     *,
+    num_norm_rows: int,
     input_mc_ptr: int,
     num_blocks: Optional[int] = None,
     unroll: Optional[int] = None,
 ) -> torch.Tensor:
-    """In-place allreduce + RMSNorm over the latent of the K3 latent|shared
-    MoE buffer via low-SM NVLS 2shot (buffer contract in the module
-    docstring); ``x`` must live in multicast-bound symmetric memory."""
+    """In-place allreduce via low-SM NVLS 2shot + RMSNorm over the first
+    ``num_norm_rows`` rows of ``x`` viewed as [numel / 3584, 3584]; ``x``
+    must live in multicast-bound symmetric memory."""
     tuning = _resolve_tuning(
         NORM_TUNING,
         nbytes=x.nbytes,
@@ -308,6 +313,13 @@ def all_reduce_pull_norm(
         unroll=unroll,
     )
     _pull_norm_op(
-        world_size, x, weight, eps, input_mc_ptr, tuning.num_blocks, tuning.unroll
+        world_size,
+        x,
+        weight,
+        eps,
+        num_norm_rows,
+        input_mc_ptr,
+        tuning.num_blocks,
+        tuning.unroll,
     )
     return x

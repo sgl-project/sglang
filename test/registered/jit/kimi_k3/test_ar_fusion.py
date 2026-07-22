@@ -133,24 +133,26 @@ def _nccl_ref(x: torch.Tensor, residual):
     return ref if residual is None else ref + residual
 
 
-def _norm_ref(x_reduced: torch.Tensor, num_tokens: int, weight, eps: float):
-    """allreduce result -> RMSNorm over the first num_tokens rows of the
-    [3 * num_tokens, NORM_DIM] row view, in fp32 like the kernels."""
+def _norm_ref(x_reduced: torch.Tensor, num_norm_rows: int, weight, eps: float):
+    """allreduce result -> RMSNorm over the first num_norm_rows rows of the
+    [numel / NORM_DIM, NORM_DIM] row view, in fp32 like the kernels."""
     out = x_reduced.clone()
-    latent = out[: num_tokens * NORM_DIM].view(num_tokens, NORM_DIM).float()
-    factor = torch.rsqrt(latent.pow(2).mean(-1, keepdim=True) + eps)
-    normed = (latent * factor * weight.float()).to(torch.bfloat16)
-    out[: num_tokens * NORM_DIM] = normed.view(-1)
+    normed_part = out[: num_norm_rows * NORM_DIM].view(num_norm_rows, NORM_DIM).float()
+    factor = torch.rsqrt(normed_part.pow(2).mean(-1, keepdim=True) + eps)
+    normed = (normed_part * factor * weight.float()).to(torch.bfloat16)
+    out[: num_norm_rows * NORM_DIM] = normed.view(-1)
     return out
 
 
-def _assert_norm_close(x: torch.Tensor, ref: torch.Tensor, num_tokens: int):
-    # the shared (non-normed) 2/3 is a plain allreduce: bit-exact; the latent
+def _assert_norm_close(x: torch.Tensor, ref: torch.Tensor, num_norm_rows: int):
+    # the non-normed tail is a plain allreduce: bit-exact; the normed prefix
     # gets the fp32 norm epilogue: bf16 tolerances
     torch.testing.assert_close(
-        x[num_tokens * NORM_DIM :], ref[num_tokens * NORM_DIM :], atol=0, rtol=0
+        x[num_norm_rows * NORM_DIM :], ref[num_norm_rows * NORM_DIM :], atol=0, rtol=0
     )
-    torch.testing.assert_close(x[: num_tokens * NORM_DIM], ref[: num_tokens * NORM_DIM])
+    torch.testing.assert_close(
+        x[: num_norm_rows * NORM_DIM], ref[: num_norm_rows * NORM_DIM]
+    )
 
 
 @pytest.mark.parametrize("bs", PUSH_BS)
@@ -207,17 +209,40 @@ def test_ar_fusion_pull_tuning_grid(num_blocks: int, unroll: int):
 
 
 @pytest.mark.parametrize("num_tokens", PULL_BS)
+@pytest.mark.parametrize("rows_per_token", [3, 1])  # [N|2N] MoE buf / latent-only
 @torch.inference_mode()
-def test_ar_fusion_pull_norm(num_tokens: int):
+def test_ar_fusion_pull_norm(num_tokens: int, rows_per_token: int):
     _init_comm()
     world = dist.get_world_size()
     buf, mc = _init_pool_buf()
-    n = num_tokens * 3 * NORM_DIM
+    n = num_tokens * rows_per_token * NORM_DIM
     x = buf[:n]
-    x.copy_(_int_input(n, num_tokens + 23, per_rank=True))
+    x.copy_(_int_input(n, num_tokens + 23 + rows_per_token, per_rank=True))
     weight = _int_input(NORM_DIM, 29, per_rank=False) + 1  # small positive ints
     ref = _norm_ref(_nccl_ref(x, None), num_tokens, weight, eps=1e-6)
-    all_reduce.all_reduce_pull_norm(world, x, weight, 1e-6, input_mc_ptr=mc)
+    all_reduce.all_reduce_pull_norm(
+        world, x, weight, 1e-6, num_norm_rows=num_tokens, input_mc_ptr=mc
+    )
+    torch.cuda.synchronize()
+    _assert_norm_close(x, ref, num_tokens)
+
+
+@pytest.mark.parametrize("num_tokens", [1, 8, 24])
+@pytest.mark.parametrize("rows_per_token", [3, 1])
+@torch.inference_mode()
+def test_ar_fusion_push_norm(num_tokens: int, rows_per_token: int):
+    """The push-side norm (small-message regime of the serving dispatch) with
+    an explicit num_norm_rows, on both the MoE-buffer and latent-only row
+    layouts."""
+    comm = _init_comm()
+    world = comm.world_size
+    n = num_tokens * rows_per_token * NORM_DIM
+    x = _int_input(n, num_tokens + 41 + rows_per_token, per_rank=True)
+    weight = _int_input(NORM_DIM, 43, per_rank=False) + 1
+    ref = _norm_ref(_nccl_ref(x, None), num_tokens, weight, eps=1e-6)
+    all_reduce.all_reduce_push_norm(
+        world, x, weight, 1e-6, num_norm_rows=num_tokens, ws_mc_base=comm.mc_base_ptr
+    )
     torch.cuda.synchronize()
     _assert_norm_close(x, ref, num_tokens)
 
@@ -243,6 +268,7 @@ def test_ar_fusion_pull_norm_tuning_grid(num_blocks: int, unroll: int):
         x,
         weight,
         1e-6,
+        num_norm_rows=num_tokens,
         input_mc_ptr=mc,
         num_blocks=num_blocks,
         unroll=unroll,

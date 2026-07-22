@@ -59,9 +59,10 @@ struct FusionParams {
   uint32_t num_push_counters;  // cluster variant only: full counter array size
 };
 
-// The K3 latent|shared MoE buffer ([N, 3584] latent then [N, 7168] shared)
-// viewed as rows of the latent width: 3N rows of 3584 bf16, of which the
-// first N (the latent) get an RMSNorm epilogue. One row = 448 16B vectors.
+// The *_norm variants view the input as rows of the K3 latent width (3584
+// bf16 = 448 16B vectors per row) and give the first num_norm_rows an
+// RMSNorm epilogue (K3: the [N latent | 2N shared] MoE buffer with N normed
+// rows, or a latent-only [N, 3584] tensor normed in full).
 constexpr uint32_t kNormDim = 3584;
 constexpr uint32_t kNormRowVecs = kNormDim / 8;                       // 448
 constexpr uint32_t kNormWarps = kNormRowVecs / device::kWarpThreads;  // 14
@@ -596,21 +597,29 @@ struct AllReduceFusionKernel {
     return params;
   }
 
-  /// The K3 latent|shared MoE buffer: [num_tokens, 3584] latent then
-  /// [num_tokens, 7168] shared = 3 * num_tokens rows of 3584 bf16, of which
-  /// the first num_tokens (the latent) get the norm.
-  static FusionParams
-  make_params_norm(const host::distributed::CommunicatorObj& data, TensorView input, TensorView weight, float eps) {
+  /// The input viewed as rows of the norm width (3584 bf16 each); the first
+  /// num_norm_rows get the RMSNorm epilogue, the rest are a plain allreduce
+  /// (K3 uses [N latent rows | 2N shared rows] with num_norm_rows = N, or a
+  /// latent-only [N, 3584] tensor with num_norm_rows = N).
+  static FusionParams make_params_norm(
+      const host::distributed::CommunicatorObj& data,
+      TensorView input,
+      TensorView weight,
+      float eps,
+      int64_t num_norm_rows) {
     using namespace host;
     auto params = make_params(data, input, std::nullopt);
     SymbolicDevice device;
     device.set_options<kDLCUDA>();
     TensorMatcher({kNormDim}).with_dtype<bf16_t>().with_device<kDLCUDA>(device).verify(weight);
-    CHECK_HOST(params.num_vecs % (3 * kNormRowVecs) == 0);
-    const auto num_tokens = params.num_vecs / (3 * kNormRowVecs);
+    CHECK_HOST(params.num_vecs % kNormRowVecs == 0)
+        << "numel must be a multiple of " << kNormDim << ", got " << int64_t(params.num_vecs) * 8;
+    const auto num_rows = params.num_vecs / kNormRowVecs;
+    CHECK_HOST(0 <= num_norm_rows && num_norm_rows <= num_rows)
+        << "num_norm_rows " << num_norm_rows << " out of range [0, " << num_rows << "]";
     params.norm_weight = static_cast<const uint8_t*>(weight.data_ptr());
     params.norm_eps = static_cast<float>(eps);
-    params.num_norm_rows = static_cast<uint32_t>(num_tokens);
+    params.num_norm_rows = static_cast<uint32_t>(num_norm_rows);
     params.num_push_counters = data.num_push_blocks;
     return params;
   }
@@ -710,10 +719,11 @@ struct AllReduceFusionKernel {
         .enable_pdl(kUsePDL)(kernel, params);
   }
 
-  static void push_norm(CommunicatorRef ref, TensorView input, TensorView weight, float eps, int64_t ws_mc_base) {
+  static void push_norm(
+      CommunicatorRef ref, TensorView input, TensorView weight, float eps, int64_t num_norm_rows, int64_t ws_mc_base) {
     constexpr auto kClusterSize = 7;
     const auto& data = *ref.get();
-    auto params = make_params_norm(data, input, weight, eps);
+    auto params = make_params_norm(data, input, weight, eps, num_norm_rows);
     CHECK_HOST(ws_mc_base != 0) << "push requires a multicast-capable workspace";
     const int64_t nbytes = int64_t(params.num_vecs) * 16;
     CHECK_HOST(nbytes <= data.push_bytes)
@@ -759,6 +769,7 @@ struct AllReduceFusionKernel {
       TensorView input,
       TensorView weight,
       double eps,
+      int64_t num_norm_rows,
       int64_t input_mc_ptr,
       int64_t sem_mc_ptr,
       int64_t num_blocks,
@@ -771,11 +782,14 @@ struct AllReduceFusionKernel {
     SymbolicDevice device;
     device.set_options<kDLCUDA>();
     TensorMatcher({kNormDim}).with_dtype<bf16_t>().with_device<kDLCUDA>(device).verify(weight);
-    CHECK_HOST(params.num_vecs % (3 * kNormRowVecs) == 0)
-        << "numel must be a multiple of 3 * " << kNormDim << ", got " << int64_t(params.num_vecs) * 8;
+    CHECK_HOST(params.num_vecs % kNormRowVecs == 0)
+        << "numel must be a multiple of " << kNormDim << ", got " << int64_t(params.num_vecs) * 8;
+    const auto num_rows = params.num_vecs / kNormRowVecs;
+    CHECK_HOST(0 <= num_norm_rows && num_norm_rows <= num_rows)
+        << "num_norm_rows " << num_norm_rows << " out of range [0, " << num_rows << "]";
     params.norm_weight = static_cast<const uint8_t*>(weight.data_ptr());
     params.norm_eps = static_cast<float>(eps);
-    params.num_norm_rows = params.num_vecs / (3 * kNormRowVecs);
+    params.num_norm_rows = static_cast<uint32_t>(num_norm_rows);
     launch_pull_norm(params, num_blocks, unroll, input.device());
   }
 };

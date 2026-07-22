@@ -177,20 +177,52 @@ def all_reduce(
         )
 
 
+def all_reduce_low_sm(
+    x: torch.Tensor,
+    residual: Optional[torch.Tensor] = None,
+    *,
+    num_blocks: Optional[int] = None,
+    unroll: Optional[int] = None,
+) -> torch.Tensor:
+    """In-place ``x = allreduce(x) [+ residual]`` pinned to the low-SM NVLS
+    pull, with the launch geometry exposed; returns ``x``.
+
+    For side-stream use (the shared-expert all-reduce): unlike
+    :func:`all_reduce` it never dispatches to the push kernel — push fans
+    out over many blocks and would steal SMs from the main-stream GEMMs it
+    is meant to overlap. ``x`` must live in the symm pool at ANY size.
+    ``num_blocks`` / ``unroll`` default to the tuned tables when None.
+    """
+    from sglang.jit_kernel.kimi_k3 import all_reduce as mod
+
+    state = _STATE
+    assert state is not None
+    if x.shape[0] == 0:
+        return x if residual is None else x + residual
+    return mod.all_reduce_pull_res(
+        state.world_size,
+        x,
+        residual,
+        input_mc_ptr=_find_mc_ptr(state, x),
+        num_blocks=num_blocks,
+        unroll=unroll,
+    )
+
+
 def all_reduce_norm(
     x: torch.Tensor,
     weight: torch.Tensor,
     eps: float = 1e-6,
+    *,
+    num_tokens: int,
 ) -> torch.Tensor:
-    """In-place ``x = allreduce(x)`` with a fused RMSNorm over the latent;
-    returns ``x``.
+    """In-place ``x = allreduce(x)`` with a fused RMSNorm over the first
+    ``num_tokens`` rows; returns ``x``.
 
-    ``x`` is the flattened K3 latent|shared MoE buffer ([N, :data:`NORM_DIM`]
-    latent then [N, 2*:data:`NORM_DIM`] shared); the first N rows (the latent)
-    get the RMSNorm epilogue with ``weight`` / ``eps``. Same dispatch and
-    call-site contract as :func:`all_reduce` (the eligibility of the buffer
-    layout is a construction-time invariant of the caller, not re-checked
-    here).
+    ``x`` is a 2D ``[rows, NORM_DIM]`` bf16 tensor (a latent-only
+    ``[N, NORM_DIM]`` tensor with ``num_tokens = N``, or the flat K3
+    latent|shared buffer viewed as ``[3N, NORM_DIM]`` with ``num_tokens =
+    N``). Same dispatch and call-site contract as :func:`all_reduce`.
     """
     from sglang.jit_kernel.kimi_k3 import all_reduce as mod
 
@@ -201,9 +233,19 @@ def all_reduce_norm(
     nbytes = x.numel() * 2
     if nbytes <= min(_PUSH_MAX_BYTES, state.comm.max_push_size):
         return mod.all_reduce_push_norm(
-            state.world_size, x, weight, eps, ws_mc_base=state.comm.mc_base_ptr
+            state.world_size,
+            x,
+            weight,
+            eps,
+            num_norm_rows=num_tokens,
+            ws_mc_base=state.comm.mc_base_ptr,
         )
     else:
         return mod.all_reduce_pull_norm(
-            state.world_size, x, weight, eps, input_mc_ptr=_find_mc_ptr(state, x)
+            state.world_size,
+            x,
+            weight,
+            eps,
+            num_norm_rows=num_tokens,
+            input_mc_ptr=_find_mc_ptr(state, x),
         )
