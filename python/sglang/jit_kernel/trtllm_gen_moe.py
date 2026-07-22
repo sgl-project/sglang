@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import ctypes
 import hashlib
+import logging
 import os
 import pathlib
 import shutil
@@ -102,12 +103,49 @@ _SOURCES = [
 ]
 
 
-def sdk_dir() -> Optional[pathlib.Path]:
-    p = envs.SGLANG_TRTLLM_GEN_MOE_SDK.get()
-    if not p:
-        return None
+logger = logging.getLogger(__name__)
+
+# Formal on-box install location, searched when SGLANG_TRTLLM_GEN_MOE_SDK is
+# unset. The pre-formalization ad-hoc location (/scratch/nv_work/...) is still
+# honored as a fallback but is deprecated.
+_SDK_DEFAULT_DIR = "/opt/sglang/trtllm_gen_moe_sdk"
+_SDK_LEGACY_DIR = "/scratch/nv_work/trtllmgen_MOE"
+_warned_legacy_sdk_dir = False
+
+
+def _warn_legacy_sdk_dir(path: pathlib.Path) -> None:
+    global _warned_legacy_sdk_dir
+    if _warned_legacy_sdk_dir:
+        return
+    _warned_legacy_sdk_dir = True
+    logger.warning(
+        "trtllm-gen MoE SDK resolved from the deprecated location %s; move it "
+        "to %s (or point SGLANG_TRTLLM_GEN_MOE_SDK at it). The legacy "
+        "nv_work fallback will be removed.",
+        path,
+        _SDK_DEFAULT_DIR,
+    )
+
+
+def _sdk_dir_if_valid(p: str) -> Optional[pathlib.Path]:
     path = pathlib.Path(p)
     return path if (path / "csrc").is_dir() else None
+
+
+def sdk_dir() -> Optional[pathlib.Path]:
+    p = envs.SGLANG_TRTLLM_GEN_MOE_SDK.get()
+    if p:
+        path = _sdk_dir_if_valid(p)
+        if path is not None and "/nv_work/" in str(path.resolve()):
+            _warn_legacy_sdk_dir(path)
+        return path
+    path = _sdk_dir_if_valid(_SDK_DEFAULT_DIR)
+    if path is not None:
+        return path
+    path = _sdk_dir_if_valid(_SDK_LEGACY_DIR)
+    if path is not None:
+        _warn_legacy_sdk_dir(path)
+    return path
 
 
 def cubin_pool_dir() -> Optional[pathlib.Path]:

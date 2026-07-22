@@ -362,6 +362,44 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
     }
 
 
+def _is_mxfp4_pack_quantized(hf_config: Any) -> bool:
+    qc = getattr(getattr(hf_config, "text_config", hf_config), "quantization_config", None)
+    if not isinstance(qc, dict):
+        return False
+    groups = qc.get("config_groups") or {}
+    return any(
+        "mxfp4" in str(g.get("format", "")) for g in groups.values() if isinstance(g, dict)
+    )
+
+
+@_register_for("KimiK3ForConditionalGeneration")
+def _kimi_k3_moe_runner_overrides(server_args: Any, hf_config: Any) -> dict:
+    # MoE runner default, independent of the attention-backend gate above.
+    # trtllm-gen fused MoE (flashinfer_mxfp4) beats marlin on both the decode
+    # (M=bs) and the target-verify (M=bs*(gamma+1)) regimes on SM100/SM103;
+    # it hard-requires the SiTU cubin SDK on the box (K3's SiTU activation has
+    # no public cubins), so fall back to marlin when the SDK is absent.
+    if server_args.moe_runner_backend != "auto":
+        return {}
+    if not (is_sm100_supported() and get_device_sm() in (100, 103)):
+        return {}
+    if not _is_mxfp4_pack_quantized(hf_config):
+        return {}
+    from sglang.jit_kernel.trtllm_gen_moe import available as _trtllm_gen_moe_ok
+
+    if _trtllm_gen_moe_ok():
+        logger.info(
+            "Kimi-K3 on SM100/SM103: moe_runner_backend=flashinfer_mxfp4 "
+            "(trtllm-gen SiTU cubin SDK found)."
+        )
+        return {"moe_runner_backend": "flashinfer_mxfp4"}
+    logger.info(
+        "Kimi-K3 on SM100/SM103: trtllm-gen MoE SDK not found; "
+        "moe_runner_backend=marlin."
+    )
+    return {"moe_runner_backend": "marlin"}
+
+
 @_register_for(
     "DeepseekV3ForCausalLM",
     "DeepseekV32ForCausalLM",
