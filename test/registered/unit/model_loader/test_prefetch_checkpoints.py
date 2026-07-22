@@ -150,10 +150,10 @@ class TestPrefetchCheckpoints(CustomTestCase):
         warning.assert_called_once()
         self.assertEqual(
             warning.call_args.args[0],
-            "Failed to prefetch checkpoint file %r.",
+            "Failed to prefetch checkpoint file %r: %s",
         )
         self.assertEqual(warning.call_args.args[1], paths[0])
-        self.assertTrue(warning.call_args.kwargs["exc_info"])
+        self.assertIsInstance(warning.call_args.args[2], OSError)
 
     @patch("torch.distributed.is_initialized", return_value=False)
     def test_prefetch_progress_logs_all_crossed_buckets(self, _):

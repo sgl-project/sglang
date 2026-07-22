@@ -307,60 +307,56 @@ class TpModelWorker(BaseTpWorker):
         self._init_model_config()
         self._init_model_runner()
 
-        try:
-            if is_multi_layer_eagle:
-                self._init_multi_layer_eagle_model_runners()
+        if is_multi_layer_eagle:
+            self._init_multi_layer_eagle_model_runners()
 
-            self._init_dllm_algorithm()
+        self._init_dllm_algorithm()
 
-            if server_args.skip_tokenizer_init or self.is_draft_worker:
-                # A draft worker's tokenizer would only duplicate the target's:
-                # tokenizer_path always points at the target model.
-                self.tokenizer = self.processor = None
+        if server_args.skip_tokenizer_init or self.is_draft_worker:
+            # A draft worker's tokenizer would only duplicate the target's:
+            # tokenizer_path always points at the target model.
+            self.tokenizer = self.processor = None
+        else:
+            if self.model_config.is_multimodal:
+                self.processor = get_processor(
+                    server_args.tokenizer_path,
+                    tokenizer_mode=server_args.tokenizer_mode,
+                    trust_remote_code=server_args.trust_remote_code,
+                    revision=server_args.revision,
+                    tokenizer_backend=server_args.tokenizer_backend,
+                    model_name=server_args.model_path,
+                )
+                self.tokenizer = get_tokenizer_from_processor(self.processor)
             else:
-                if self.model_config.is_multimodal:
-                    self.processor = get_processor(
-                        server_args.tokenizer_path,
-                        tokenizer_mode=server_args.tokenizer_mode,
-                        trust_remote_code=server_args.trust_remote_code,
-                        revision=server_args.revision,
-                        tokenizer_backend=server_args.tokenizer_backend,
-                        model_name=server_args.model_path,
-                    )
-                    self.tokenizer = get_tokenizer_from_processor(self.processor)
-                else:
-                    self.tokenizer = get_tokenizer(
-                        server_args.tokenizer_path,
-                        tokenizer_mode=server_args.tokenizer_mode,
-                        trust_remote_code=server_args.trust_remote_code,
-                        revision=server_args.revision,
-                        tokenizer_backend=server_args.tokenizer_backend,
-                    )
-            self.device = self.model_runner.device
+                self.tokenizer = get_tokenizer(
+                    server_args.tokenizer_path,
+                    tokenizer_mode=server_args.tokenizer_mode,
+                    trust_remote_code=server_args.trust_remote_code,
+                    revision=server_args.revision,
+                    tokenizer_backend=server_args.tokenizer_backend,
+                )
+        self.device = self.model_runner.device
 
-            # Init nccl groups
-            self.pp_group = get_pp_group()
-            self.world_group = get_world_group()
+        # Init nccl groups
+        self.pp_group = get_pp_group()
+        self.world_group = get_world_group()
 
-            # Sync random seed across TP workers.
-            # Scale joiners cannot enter the launch-time WORLD broadcast.
-            if server_args.is_ep_scale_joiner:
-                self.random_seed = server_args.random_seed
-            else:
-                self.random_seed = broadcast_pyobj(
-                    [server_args.random_seed],
-                    self.ps.tp_size * self.ps.pp_rank + self.ps.tp_rank,
-                    self.world_group.cpu_group,
-                    src=self.world_group.ranks[0],
-                )[0]
-            set_random_seed(self.random_seed)
+        # Sync random seed across TP workers.
+        # Scale joiners cannot enter the launch-time WORLD broadcast.
+        if server_args.is_ep_scale_joiner:
+            self.random_seed = server_args.random_seed
+        else:
+            self.random_seed = broadcast_pyobj(
+                [server_args.random_seed],
+                self.ps.tp_size * self.ps.pp_rank + self.ps.tp_rank,
+                self.world_group.cpu_group,
+                src=self.world_group.ranks[0],
+            )[0]
+        set_random_seed(self.random_seed)
 
-            self.enable_overlap = not server_args.disable_overlap_schedule
-            self.enable_spec = server_args.speculative_algorithm is not None
-            self.hicache_layer_transfer_counter = None
-        except Exception:
-            self.cancel_startup_weight_load()
-            raise
+        self.enable_overlap = not server_args.disable_overlap_schedule
+        self.enable_spec = server_args.speculative_algorithm is not None
+        self.hicache_layer_transfer_counter = None
 
     def alloc_memory_pool(
         self,
@@ -403,13 +399,19 @@ class TpModelWorker(BaseTpWorker):
         for mr in self.model_runner_list[1:]:
             mr.init_cuda_graphs(capture_decode_cuda_graph=capture_decode_cuda_graph)
 
-    def finalize_startup_weight_load(self):
+    def start_startup_weight_load(self) -> None:
+        """Start deferred checkpoint prefetching for all model runners."""
+        self.model_runner.start_startup_weight_load()
+        for mr in self.model_runner_list[1:]:
+            mr.start_startup_weight_load()
+
+    def finalize_startup_weight_load(self) -> None:
         """Commit deferred startup weights for all model runners."""
         self.model_runner.finalize_startup_weight_load()
         for mr in self.model_runner_list[1:]:
             mr.finalize_startup_weight_load()
 
-    def cancel_startup_weight_load(self):
+    def cancel_startup_weight_load(self) -> None:
         """Cancel deferred startup loading for all model runners."""
         self.model_runner.cancel_startup_weight_load()
         for mr in self.model_runner_list[1:]:

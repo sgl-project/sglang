@@ -845,6 +845,11 @@ class CheckpointFilePrefetchHandle:
         """Stop scheduling shards and interrupt reads at the next block."""
         self._cancel_event.set()
 
+    def stop(self) -> None:
+        """Cancel prefetching and wait for the background worker to finish."""
+        self.cancel()
+        self.wait()
+
     @property
     def cancelled(self) -> bool:
         return self._cancel_event.is_set()
@@ -948,17 +953,15 @@ def _prefetch_all_checkpoints(
                 )
                 for future in done:
                     path = pending.pop(future)
-                    try:
-                        future.result()
-                    except Exception as exc:
+                    exc = future.exception()
+                    if exc is not None:
                         errors.append((path, exc))
                         logger.warning(
-                            "Failed to prefetch checkpoint file %r.",
+                            "Failed to prefetch checkpoint file %r: %s",
                             path,
-                            exc_info=True,
+                            exc,
                         )
-                    finally:
-                        record_complete()
+                    record_complete()
 
                     next_path = None if cancel_event.is_set() else next(file_iter, None)
                     if next_path is not None:
