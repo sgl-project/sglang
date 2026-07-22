@@ -461,12 +461,10 @@ class DSparkDraftMixin:
             )
 
     def _stacked_ctx_kv_params(self) -> Optional[dict]:
-        """Stack every layer's KV projection into one weight so the per-step
-        target-hidden KV write runs one GEMM instead of one per layer -- the
-        input hidden is identical for every layer, so concatenating the output
-        columns is exact. Cached after the first call; None (per-layer loop
-        fallback) when any layer's QKV weight cannot be sliced (quantized) or
-        the layers disagree on norm epsilon / bias presence.
+        """Stack every layer's KV projection into one weight (exact: the input
+        hidden is shared, so concatenating output columns is equivalent).
+        Cached; None (per-layer fallback) when a QKV weight cannot be sliced
+        (quantized) or layers disagree on norm epsilon / bias presence.
         """
         cached = getattr(self, "_stacked_ctx_kv_cache", False)
         if cached is not False:
@@ -561,8 +559,7 @@ class DSparkDraftMixin:
 
         kv_all = F.linear(ctx_hidden, stacked["weight"], stacked["bias"])
         kv_all = kv_all.view(tokens, num_layers, 2, kv_size)
-        # Batched per-head k-norm across layers (mirrors RMSNorm.forward_native:
-        # fp32 variance, weight multiply in fp32, cast back).
+        # Batched per-head k-norm across layers (fp32 variance + weight, cast back).
         k32 = (
             kv_all[:, :, 0, :]
             .reshape(tokens, num_layers, num_kv_heads, head_dim)
@@ -572,12 +569,11 @@ class DSparkDraftMixin:
         k32 = k32 * torch.rsqrt(variance + stacked["eps"])
         k32 = k32 * stacked["k_norm_weight"].view(1, num_layers, 1, head_dim)
         k_all = k32.to(ctx_hidden.dtype)
-        # One RoPE over all layers' heads: every layer shares the rotary params
-        # and positions, so the N*kv_heads heads rotate identically.
+        # One RoPE over all layers' heads (shared rotary params + positions).
         k_flat = k_all.reshape(tokens, num_layers * kv_size)
         dummy_q = k_flat.new_empty(k_flat.shape)
         _, k_flat = attn0.rotary_emb(positions, dummy_q, k_flat)
-        # [layers, tokens, heads, dim] so per-layer slices are contiguous views.
+        # [layers, tokens, heads, dim]: per-layer slices are contiguous views.
         k_all = (
             k_flat.view(tokens, num_layers, num_kv_heads, head_dim)
             .permute(1, 0, 2, 3)
