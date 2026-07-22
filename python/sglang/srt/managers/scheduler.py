@@ -2291,11 +2291,11 @@ class Scheduler(
             req.extend_image_inputs(image_inputs)
             self._maybe_compute_mrope_positions(req)
 
-            if len(req.origin_input_ids) >= self.max_req_input_len:
+            if len(req.origin_input_ids) > self.max_req_input_len:
                 req.set_finish_with_abort(
                     error_msg=(
                         "Multimodal prompt is too long after expanding multimodal tokens. "
-                        f"After expanding {len(req.origin_input_ids_unpadded)=} => {len(req.origin_input_ids)} >= {self.max_req_input_len}."
+                        f"After expanding {len(req.origin_input_ids_unpadded)=} => {len(req.origin_input_ids)} > {self.max_req_input_len}."
                     )
                 )
                 self.init_req_max_new_tokens(req)
@@ -2573,11 +2573,11 @@ class Scheduler(
             req.extend_image_inputs(image_inputs)
             self._maybe_compute_mrope_positions(req)
 
-            if len(req.origin_input_ids) >= self.max_req_input_len:
+            if len(req.origin_input_ids) > self.max_req_input_len:
                 req.set_finish_with_abort(
                     error_msg=(
                         "Multimodal prompt is too long after expanding multimodal tokens. "
-                        f"After expanding {len(req.origin_input_ids_unpadded)=} => {len(req.origin_input_ids)} >= {self.max_req_input_len}."
+                        f"After expanding {len(req.origin_input_ids_unpadded)=} => {len(req.origin_input_ids)} > {self.max_req_input_len}."
                     )
                 )
                 self._add_request_to_queue(req)
