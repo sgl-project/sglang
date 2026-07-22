@@ -2,14 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from http import HTTPStatus
-from typing import (
-    TYPE_CHECKING,
-    Any,
-    Callable,
-    List,
-    Optional,
-    Union,
-)
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, Union
 
 import zmq
 from torch.distributed import barrier
@@ -22,14 +15,9 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
     sock_recv,
 )
-from sglang.srt.managers.mm_utils import (
-    has_shm_features,
-    unwrap_shm_features,
-)
-from sglang.srt.utils import (
-    broadcast_pyobj,
-    point_to_point_pyobj,
-)
+from sglang.srt.managers.mm_utils import has_shm_features, unwrap_shm_features
+from sglang.srt.runtime_context import get_disagg, get_parallel
+from sglang.srt.utils import broadcast_pyobj, point_to_point_pyobj
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 
 if TYPE_CHECKING:
@@ -61,7 +49,7 @@ class SchedulerRequestReceiver:
     model_config: ModelConfig
     max_recv_per_poll: int
     stream_output: Callable[..., None]
-    get_last_forward_mode: Callable[[], Any]
+    get_last_batch: Callable[[], Any]
     scripted_scheduler_hook: Optional[ScriptedSchedulerHook] = None
 
     def recv_limit_reached(self, num_recv_reqs: int) -> bool:
@@ -79,7 +67,7 @@ class SchedulerRequestReceiver:
             self.scripted_scheduler_hook.step()
 
         if self.recv_skipper is not None:
-            if not self.recv_skipper.handle(self.get_last_forward_mode()):
+            if not self.recv_skipper.handle(self.get_last_batch()):
                 return []
 
         recv_reqs = self._pull_raw_reqs()
@@ -139,7 +127,7 @@ class SchedulerRequestReceiver:
         return recv_reqs
 
     def _broadcast_reqs_across_ranks(self, recv_reqs: Optional[List]) -> List:
-        if self.server_args.enable_dp_attention:
+        if get_parallel().enable_dp_attention:
             if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
                 work_reqs, control_reqs = self._split_work_and_control_reqs(recv_reqs)
             else:
@@ -167,7 +155,10 @@ class SchedulerRequestReceiver:
             # controller, so we broadcast within attn_tp_group + attn_cp_group
             # instead of the full tp_group.  This avoids an expensive
             # all-ranks gloo sync.
-            _local_ctrl = self.server_args.enable_dp_attention_local_control_broadcast
+            _local_ctrl = (
+                get_parallel().enable_dp_attention_local_control_broadcast
+                or self.server_args.is_ep_scale_joiner
+            )
             if _local_ctrl:
                 if self.ps.attn_tp_size != 1:
                     control_reqs = broadcast_pyobj(
@@ -217,8 +208,8 @@ class SchedulerRequestReceiver:
         # Process MM requests under EPD-disaggregation mode
         if (
             self.ps.pp_rank == 0
-            and self.server_args.language_only
-            and self.server_args.encoder_transfer_backend
+            and get_disagg().language_only
+            and get_disagg().encoder_transfer_backend
             in ["zmq_to_scheduler", "mooncake"]
         ):
             recv_reqs, abort_reqs = self.mm_receiver.process_waiting_requests(recv_reqs)
@@ -242,7 +233,7 @@ class SchedulerRequestReceiver:
                 # peer ranks may still be unpickling ShmPointerMMData
                 # (-> shm_open).  Synchronize the same CPU groups that carried
                 # SHM-backed work requests before materialize() unlinks them.
-                if self.server_args.enable_dp_attention:
+                if get_parallel().enable_dp_attention:
                     if self.ps.attn_tp_size > 1:
                         barrier(group=self.attn_tp_cpu_group)
                     if self.ps.attn_cp_size > 1:

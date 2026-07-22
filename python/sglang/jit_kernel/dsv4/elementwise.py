@@ -2,7 +2,7 @@ from typing import Optional, Tuple
 
 import torch
 
-from sglang.jit_kernel.utils import (
+from sglang.kernels.jit.utils import (
     cache_once,
     is_arch_support_pdl,
     load_jit,
@@ -126,7 +126,9 @@ def fused_rope_inplace(
         inverse: if True, apply inverse rotation (conjugate freqs)
     """
     if _is_hip or _is_xpu:
-        from sglang.srt.layers.deepseek_v4_rope import apply_rotary_emb_triton
+        from sglang.kernels.ops.attention.deepseek_v4_rope import (
+            apply_rotary_emb_triton,
+        )
 
         apply_rotary_emb_triton(q, freqs_cis, positions=positions, inverse=inverse)
         if k is not None:
@@ -194,6 +196,18 @@ def fused_q_indexer_rope_hadamard_quant(
     )
     if _is_hip:
         torch.ops.sgl_kernel.dsv4_fused_q_indexer_rope_hadamard_quant(
+            q_input,
+            q_fp8,
+            weight,
+            weights_out,
+            float(weight_scale),
+            freqs_real,
+            positions,
+        )
+    elif _is_xpu:
+        from sgl_kernel import fused_q_indexer_rope_hadamard_quant
+
+        fused_q_indexer_rope_hadamard_quant(
             q_input,
             q_fp8,
             weight,

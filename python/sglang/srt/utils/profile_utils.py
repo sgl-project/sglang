@@ -11,8 +11,9 @@ import torch
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import ProfileReqOutput
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.platforms import current_platform
+from sglang.srt.runtime_context import get_device
 from sglang.srt.utils import is_npu
 from sglang.srt.utils.torch_npu_patch_utils import apply_torch_npu_patches
 
@@ -61,7 +62,7 @@ class ProfileManager:
         )
         self.ps = ps
         self.cpu_group = cpu_group
-        self.first_rank_in_node = ps.gpu_id == get_server_args().base_gpu_id
+        self.first_rank_in_node = ps.gpu_id == get_device().base_gpu_id
         self.profiler_kwargs = None
         self.profiler = None
 
@@ -221,6 +222,16 @@ class _ProfilerBase(ABC):
     @staticmethod
     def create(activities, with_stack, record_shapes, **kwargs):
         inners = []
+        if current_platform.is_out_of_tree():
+            if current_platform.get_torch_profiler_activity_str() in activities:
+                inners.append(
+                    _ProfilerTorch(
+                        **kwargs,
+                        activities=activities,
+                        with_stack=with_stack,
+                        record_shapes=record_shapes,
+                    )
+                )
         if ("CPU" in activities) or ("GPU" in activities):
             inners.append(
                 _ProfilerTorch(
@@ -291,6 +302,12 @@ class _ProfilerTorch(_ProfilerConcreteBase):
             "CPU": torch.profiler.ProfilerActivity.CPU,
             "GPU": torch.profiler.ProfilerActivity.CUDA,
         }
+
+        if current_platform.is_out_of_tree():
+            activity_map[current_platform.get_torch_profiler_activity_str()] = (
+                current_platform.get_torch_profiler_activity()
+            )
+
         torchprof_activities = [
             activity_map[a] for a in self.activities if a in activity_map
         ]
@@ -412,3 +429,13 @@ class _ProfilerRPD(_ProfilerConcreteBase):
             from sglang.srt.utils.rpd_utils import rpd_to_chrome_trace
 
             rpd_to_chrome_trace("trace.rpd", self.rpd_profile_path)
+
+
+def build_step_span_name(forward_batch: ForwardBatch) -> str:
+    """Build a profile-trace span name for one forward step."""
+    mode = forward_batch.forward_mode
+    bs = forward_batch.batch_size
+    if mode == ForwardMode.EXTEND:
+        ext_toks = forward_batch.extend_num_tokens or 0
+        return f"step[EXTEND bs={bs} toks={ext_toks}]"
+    return f"step[{mode.name} bs={bs}]"

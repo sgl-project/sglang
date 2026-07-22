@@ -25,6 +25,7 @@ import triton
 import triton.language as tl
 
 from sglang.jit_kernel.norm import can_use_fused_inplace_qknorm, fused_inplace_qknorm
+from sglang.jit_kernel.rope import FusedSetKVBufferArg
 from sglang.srt.environ import envs
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.utils.cp_utils import is_prefill_context_parallel_enabled
@@ -33,7 +34,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import get_current_device_stream_fast, is_cuda, is_hip
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -306,8 +307,6 @@ def create_fused_set_kv_buffer_arg(
     layer: RadixAttention,
     forward_batch: ForwardBatch,
 ):
-    from sglang.jit_kernel.rope import FusedSetKVBufferArg
-
     layer_id = layer.layer_id
     token_to_kv_pool = get_token_to_kv_pool()
 
@@ -315,6 +314,7 @@ def create_fused_set_kv_buffer_arg(
     v_buffer = token_to_kv_pool.get_value_buffer(layer_id)
 
     if not _is_hip:
+        # CUDA path.
         assert layer.k_scale is None and layer.v_scale is None, "scale not supported"
         return FusedSetKVBufferArg(
             value=value,
@@ -323,10 +323,20 @@ def create_fused_set_kv_buffer_arg(
             cache_loc=forward_batch.out_cache_loc,
         )
     else:
+        # ROCm path.
         page_size = token_to_kv_pool.page_size
+        # A non-hybrid pool has no full->SWA remap: SWA and full layers
+        # share one slot space indexed directly by out_cache_loc (as --disable-hybrid-swa-memory
+        # gives). Leaving swa_slot_mapping=None makes the fused store write at
+        # out_cache_loc, matching the CUDA path (which never fuses the hybrid pool).
+        full_to_swa = (
+            token_to_kv_pool.full_to_swa_index_mapping
+            if isinstance(token_to_kv_pool, SWAKVPool)
+            else None
+        )
         slot_mapping_swa = (
-            token_to_kv_pool.full_to_swa_index_mapping.long()
-            if layer.sliding_window_size > 0
+            full_to_swa.long()
+            if layer.sliding_window_size > 0 and full_to_swa is not None
             else None
         )
         # SHUFFLE 5D pools (k_buffer.ndim == 5) consumed natively by
@@ -434,7 +444,7 @@ def _reshape_for_qk_norm(x: torch.Tensor, head_dim: int) -> torch.Tensor:
 
     if (
         _is_cuda
-        and get_server_args().cuda_graph_config.prefill.tc_compiler == "inductor"
+        and get_exec().graph.cuda_graph_config.prefill.tc_compiler == "inductor"
     ):
         return x.view(*x.shape[:-1], -1, head_dim)
     return x.reshape(-1, head_dim)
@@ -475,7 +485,7 @@ def apply_qk_norm(
         and allow_inplace  # TODO(dark): this can be relaxed if needed
         and (q_eps == k_eps)  # TODO(dark): this can also be relaxed
         and not envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
-        and get_server_args().cuda_graph_config.prefill.tc_compiler
+        and get_exec().graph.cuda_graph_config.prefill.tc_compiler
         != "inductor"  # let inductor fuse QK norm
         and can_use_fused_inplace_qknorm(head_dim, q.dtype)
     ):

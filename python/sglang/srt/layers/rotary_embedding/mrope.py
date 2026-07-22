@@ -7,18 +7,18 @@ from typing import List, Optional, Tuple
 
 import torch
 
-from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
-from sglang.srt.layers.rotary_embedding.triton_kernels import (
+from sglang.kernels.ops.attention.rotary_triton import (
     triton_ernie45_rope_fused_inplace,
     triton_mrope_fused,
 )
+from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
 from sglang.srt.layers.rotary_embedding.yarn import (
     yarn_find_correction_range,
     yarn_get_mscale_simple,
     yarn_linear_ramp_mask,
 )
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cuda,
@@ -41,92 +41,7 @@ if _is_npu:
 if _is_xpu:
     from sgl_kernel import multimodal_rotary_embedding
 
-import triton
-import triton.language as tl
-
-from sglang.srt.runtime_context import get_server_args
-
-
-@triton.jit
-def apply_interleaved_rope_kernel(
-    x_ptr,
-    out_ptr,
-    S: tl.constexpr,
-    D: tl.constexpr,
-    stride_x_m,
-    stride_x_s,
-    stride_out_s,
-    section_1_end,
-    section_2_end,
-    BLOCK_S: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-):
-    start_s = tl.program_id(0) * BLOCK_S
-    s_offsets = start_s + tl.arange(0, BLOCK_S)
-
-    dim_offset = tl.program_id(1) * BLOCK_SIZE
-    dim_indices = dim_offset + tl.arange(0, BLOCK_SIZE)
-
-    mask_s = s_offsets < S
-    mask_d = dim_indices < D
-    mask = mask_s[:, None] & mask_d[None, :]
-
-    val_ptr = (
-        x_ptr + 0 * stride_x_m + s_offsets[:, None] * stride_x_s + dim_indices[None, :]
-    )
-    val = tl.load(val_ptr, mask=mask, other=0.0)
-
-    cond_a = (dim_indices[None, :] % 3 == 1) & (
-        dim_indices[None, :] < section_1_end * 3
-    )
-    val_a_ptr = (
-        x_ptr + 1 * stride_x_m + s_offsets[:, None] * stride_x_s + dim_indices[None, :]
-    )
-    val_a = tl.load(val_a_ptr, mask=mask & cond_a, other=0.0)
-
-    cond_b = (dim_indices[None, :] % 3 == 2) & (
-        dim_indices[None, :] < section_2_end * 3
-    )
-    val_b_ptr = (
-        x_ptr + 2 * stride_x_m + s_offsets[:, None] * stride_x_s + dim_indices[None, :]
-    )
-    val_b = tl.load(val_b_ptr, mask=mask & cond_b, other=0.0)
-
-    val = tl.where(cond_a, val_a, val)
-    val = tl.where(cond_b, val_b, val)
-
-    out_ptr = out_ptr + s_offsets[:, None] * stride_out_s + dim_indices[None, :]
-    tl.store(out_ptr, val, mask=mask)
-
-
-def apply_interleaved_rope_triton(x: torch.Tensor, mrope_section: list) -> torch.Tensor:
-    x = x.contiguous()
-    M, S, D = x.shape
-
-    out = torch.empty((S, D), dtype=x.dtype, device=x.device)
-
-    BLOCK_S = 64
-    BLOCK_SIZE = 128
-
-    grid = (triton.cdiv(S, BLOCK_S), triton.cdiv(D, BLOCK_SIZE))
-
-    section_1_end = mrope_section[1]
-    section_2_end = mrope_section[2]
-
-    apply_interleaved_rope_kernel[grid](
-        x,
-        out,
-        S,
-        D,
-        x.stride(0),
-        x.stride(1),
-        out.stride(0),
-        section_1_end,
-        section_2_end,
-        BLOCK_S=BLOCK_S,
-        BLOCK_SIZE=BLOCK_SIZE,
-    )
-    return out
+from sglang.kernels.ops.attention.mrope import apply_interleaved_rope_triton
 
 
 def apply_interleaved_rope(x: torch.Tensor, mrope_section: list) -> torch.Tensor:
@@ -216,7 +131,7 @@ class MRotaryEmbedding(RotaryEmbedding):
             self.register_buffer("axis_map", axis_map, persistent=False)
         else:
             self.axis_map = None
-        if get_server_args().rl_on_policy_target is not None:
+        if get_exec().deterministic.rl_on_policy_target is not None:
             self._forward_method = self.forward_native
 
     def get_cos_sin_with_position(self, positions):
@@ -228,7 +143,7 @@ class MRotaryEmbedding(RotaryEmbedding):
         last_dim = cos_sin.size()[-1]
         cos, sin = cos_sin.chunk(2, dim=-1)
         if self.mrope_interleaved:
-            if support_triton(get_server_args().attention_backend):
+            if support_triton(get_exec().kernel.attention_backend):
                 cos = apply_interleaved_rope_triton(cos, self.mrope_section)
                 sin = apply_interleaved_rope_triton(sin, self.mrope_section)
             else:
@@ -387,6 +302,7 @@ class MRotaryEmbedding(RotaryEmbedding):
         fused_set_kv_buffer_arg=None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         assert positions.ndim in (1, 2)
+        self._match_cos_sin_cache_dtype(query)
         if positions.ndim == 2 and self.mrope_section:
             multimodal_rotary_embedding(
                 query,

@@ -10,7 +10,7 @@ import unittest
 from unittest.mock import patch
 
 import sglang.srt.server_args as server_args_module
-from sglang.srt.arg_groups.arg_utils import A, Arg
+from sglang.srt.arg_groups.arg_utils import NS, A, Arg
 from sglang.srt.runtime_context import (
     Flags,
     ParallelContext,
@@ -18,6 +18,7 @@ from sglang.srt.runtime_context import (
     _FlagGroupBase,
     get_context,
     get_flags,
+    get_memory,
     get_parallel,
     get_server_args,
     reset_context,
@@ -32,6 +33,8 @@ SIZE_RANK_DELEGATIONS = [
     ("world_rank", f"{_PS}.get_world_rank"),
     ("tp_size", f"{_PS}.get_tensor_model_parallel_world_size"),
     ("tp_rank", f"{_PS}.get_tensor_model_parallel_rank"),
+    ("dcp_size", f"{_PS}.get_dcp_world_size"),
+    ("dcp_rank", f"{_PS}.get_dcp_rank"),
     ("pp_size", f"{_PS}.get_pipeline_model_parallel_world_size"),
     ("pp_rank", f"{_PS}.get_pipeline_model_parallel_rank"),
     ("moe_ep_size", f"{_PS}.get_moe_expert_parallel_world_size"),
@@ -51,6 +54,7 @@ SIZE_RANK_DELEGATIONS = [
 GROUP_DELEGATIONS = [
     ("world_group", f"{_PS}.get_world_group"),
     ("tp_group", f"{_PS}.get_tp_group"),
+    ("dcp_group", f"{_PS}.get_dcp_group"),
     ("pp_group", f"{_PS}.get_pp_group"),
     ("moe_ep_group", f"{_PS}.get_moe_ep_group"),
     ("moe_dp_group", f"{_PS}.get_moe_dp_group"),
@@ -151,6 +155,40 @@ class TestParallelOverride(_IsolatedOverrides):
         self.assertEqual(p._overrides, {})
 
 
+class TestParallelDCP(_IsolatedOverrides):
+    def test_attn_dcp_defaults_when_group_is_uninitialized(self):
+        with (
+            patch(f"{_PS}.get_dcp_group_no_assert", return_value=None),
+            patch(f"{_PS}.get_dcp_world_size", side_effect=AssertionError),
+            patch(f"{_PS}.get_dcp_rank", side_effect=AssertionError),
+        ):
+            self.assertFalse(get_parallel().dcp_enabled)
+            self.assertEqual(get_parallel().attn_dcp_size, 1)
+            self.assertEqual(get_parallel().attn_dcp_rank, 0)
+
+    def test_attn_dcp_delegates_when_enabled(self):
+        with (
+            patch(f"{_PS}.get_dcp_group_no_assert", return_value=object()),
+            patch(f"{_PS}.get_dcp_world_size", return_value=8),
+            patch(f"{_PS}.get_dcp_rank", return_value=3),
+        ):
+            self.assertTrue(get_parallel().dcp_enabled)
+            self.assertEqual(get_parallel().attn_dcp_size, 8)
+            self.assertEqual(get_parallel().attn_dcp_rank, 3)
+
+    def test_dcp_enablement_is_platform_agnostic(self):
+        with (
+            patch(f"{_PS}.get_dcp_group_no_assert", return_value=object()),
+            patch("sglang.srt.utils.is_cuda", return_value=False) as is_cuda,
+            patch(f"{_PS}.get_dcp_world_size", return_value=8),
+            patch(f"{_PS}.get_dcp_rank", return_value=3),
+        ):
+            self.assertTrue(get_parallel().dcp_enabled)
+            self.assertEqual(get_parallel().attn_dcp_size, 8)
+            self.assertEqual(get_parallel().attn_dcp_rank, 3)
+            is_cuda.assert_not_called()
+
+
 class _IsolatedServerArgs(CustomTestCase):
     """Save/restore the published ServerArgs around each test (the slot is
     process-global; another test file sharing the process may have published)."""
@@ -178,8 +216,10 @@ class TestServerArgsOwnership(_IsolatedServerArgs):
         self.assertIs(get_server_args(), sentinel)
         self.assertIs(get_context().server_args, sentinel)
 
-    def test_tokenizer_alias_is_same_function(self):
-        self.assertIs(
+    def test_tokenizer_and_scheduler_setters_are_distinct_role_shims(self):
+        # The per-role publish shims are no longer aliases: each records its own
+        # process role via publish(role=...).
+        self.assertIsNot(
             server_args_module.set_global_server_args_for_tokenizer,
             server_args_module.set_global_server_args_for_scheduler,
         )
@@ -336,8 +376,10 @@ class TestFlagsTier(_IsolatedServerArgs):
 class _FakeResolvedArgs:
     """Publishable fixture with a resolvable whitelist (real flat leaves)."""
 
-    page_size: A[int | None, Arg(help="p", resolvable=True)] = None
-    sampling_backend: A[str | None, Arg(help="s", resolvable=True)] = None
+    page_size: A[int | None, Arg(help="p", resolvable=True), NS("memory")] = None
+    sampling_backend: A[
+        str | None, Arg(help="s", resolvable=True), NS("exec.kernel")
+    ] = None
     _resolved_overrides: list = dataclasses.field(default_factory=list)
 
 
@@ -696,6 +738,12 @@ class TestForwardFlags(_IsolatedServerArgs):
                 x = x + 1
             if fwd.is_extend_in_batch:
                 x = x + 2
+            if fwd.fuse_mlp_allreduce:
+                x = x + 4
+            if fwd.mlp_reduce_scatter:
+                x = x + 8
+            if fwd.flashinfer_trtllm_bypass:
+                x = x + 16
             return x
 
         self.assertEqual(probe(torch.zeros(())).item(), 0)
@@ -704,6 +752,13 @@ class TestForwardFlags(_IsolatedServerArgs):
         get_forward().set("is_extend_in_batch", True)
         self.assertEqual(probe(torch.zeros(())).item(), 2)
         get_forward().set("is_extend_in_batch", False)
+        with get_forward().scoped(
+            fuse_mlp_allreduce=True,
+            mlp_reduce_scatter=True,
+            flashinfer_trtllm_bypass=True,
+        ):
+            self.assertEqual(probe(torch.zeros(())).item(), 28)
+        self.assertEqual(probe(torch.zeros(())).item(), 0)
 
     def test_graph_visible_flags_are_process_visible_across_threads(self):
         # Documented divergence from the contextvar-backed flags: plain slots
@@ -812,6 +867,38 @@ class TestForwardFlags(_IsolatedServerArgs):
             self.assertIs(get_forward().moe_output_buffer, sentinel)
         self.assertIsNone(get_forward().moe_output_buffer)
 
+    def test_mlp_comm_forward_flags(self):
+        """Decoder-published MLP collective flags: scoped restore + skip helpers."""
+        from sglang.srt.layers.moe.utils import (
+            should_skip_mlp_all_reduce,
+            should_skip_post_experts_all_reduce,
+        )
+        from sglang.srt.runtime_context import get_forward
+
+        reset_context()
+        fwd = get_forward()
+        self.assertFalse(fwd.fuse_mlp_allreduce)
+        self.assertFalse(fwd.mlp_reduce_scatter)
+        self.assertFalse(fwd.flashinfer_trtllm_bypass)
+        self.assertFalse(should_skip_mlp_all_reduce())
+
+        with fwd.scoped(fuse_mlp_allreduce=True):
+            self.assertTrue(fwd.fuse_mlp_allreduce)
+            self.assertTrue(should_skip_mlp_all_reduce())
+            # Fusion alone is enough to skip post-experts AR.
+            self.assertTrue(should_skip_post_experts_all_reduce(is_tp_path=True))
+        self.assertFalse(fwd.fuse_mlp_allreduce)
+        self.assertFalse(should_skip_mlp_all_reduce())
+
+        with fwd.scoped(mlp_reduce_scatter=True):
+            self.assertTrue(fwd.mlp_reduce_scatter)
+            self.assertTrue(should_skip_mlp_all_reduce())
+        self.assertFalse(fwd.mlp_reduce_scatter)
+
+        with fwd.scoped(flashinfer_trtllm_bypass=True):
+            self.assertTrue(fwd.flashinfer_trtllm_bypass)
+        self.assertFalse(fwd.flashinfer_trtllm_bypass)
+
 
 class TestPublishLifecycle(_IsolatedServerArgs):
     """Publish installs the resolved server_args and seeds the capture tier."""
@@ -834,12 +921,15 @@ class TestPublishLifecycle(_IsolatedServerArgs):
         get_context().set_server_args(object())
         self.assertFalse(get_flags().capture.enable_torch_compile)
 
-    def test_declare_load_time_override_writes_through(self):
+    def test_declare_load_time_override_writes_the_bag(self):
         from sglang.srt.arg_groups.overrides import declare_load_time_override
 
         args = self._publish(page_size=1)
         declare_load_time_override("model.load_time", {"page_size": 64})
-        self.assertEqual(args.page_size, 64)
+        # The declaration lands on the config bag; the pristine startup record
+        # (server_args) is untouched.
+        self.assertEqual(get_memory().page_size, 64)
+        self.assertEqual(args.page_size, 1)
 
     def test_declare_load_time_override_validates_whitelist(self):
         from sglang.srt.arg_groups.overrides import declare_load_time_override
@@ -851,16 +941,14 @@ class TestPublishLifecycle(_IsolatedServerArgs):
 
     def test_declare_load_time_override_records_provenance(self):
         from sglang.srt.arg_groups.overrides import declare_load_time_override
-        from sglang.srt.server_args import ServerArgs
 
-        class _Args(_FakeResolvedArgs):
-            override = ServerArgs.override
-
-        args = _Args(page_size=1)
-        get_context().set_server_args(args)
+        self._publish(page_size=1)
         declare_load_time_override("model.load_time", {"page_size": 64})
-        self.assertEqual(args.page_size, 64)
-        self.assertIn(("model.load_time", {"page_size": 64}), args._resolved_overrides)
+        self.assertEqual(get_memory().page_size, 64)
+        self.assertIn(
+            ("model.load_time", {"page_size": 64}),
+            get_context().overrides_log(),
+        )
 
 
 if __name__ == "__main__":

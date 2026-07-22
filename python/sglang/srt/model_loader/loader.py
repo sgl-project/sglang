@@ -44,7 +44,7 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     get_remote_instance_transfer_engine_info_per_rank,
     register_memory_region,
 )
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import get_exec, get_server_args
 from sglang.srt.utils import get_available_gpu_memory
 
 # Try to import accelerate (optional dependency)
@@ -71,9 +71,7 @@ from sglang.srt.connector import (
     get_connector_type,
 )
 from sglang.srt.connector.utils import parse_model_name
-from sglang.srt.distributed import (
-    model_parallel_is_initialized,
-)
+from sglang.srt.distributed import model_parallel_is_initialized
 from sglang.srt.layers.modelopt_utils import QUANT_CFG_CHOICES
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
@@ -241,7 +239,7 @@ def _get_quantization_config(
         # (yizhang2077) workaround for nvidia/Llama-4-Maverick-17B-128E-Eagle3
         if quant_config is None:
             return None
-        # Carry DSV4 expert layout into Fp8Config so downstream readers don't read env.
+        # Carry DSV4 expert layout into quant configs so downstream readers don't read env.
         from sglang.srt.layers.quantization.fp8 import Fp8Config
 
         if isinstance(quant_config, Fp8Config):
@@ -268,6 +266,8 @@ def _get_quantization_config(
                 quant_config = HybridFp8NvFp4Config(
                     fp8_config=quant_config, nvfp4_config=nvfp4_config
                 )
+        elif quant_config.get_name() == "humming":
+            quant_config.is_fp4_experts = model_config.is_fp4_experts
         if not _is_npu:
             major, minor = get_device_capability()
 
@@ -817,10 +817,7 @@ class DefaultModelLoader(BaseModelLoader):
         if is_nvfp4_online:
             # Scope exact FP4 quantization math to load-time conversion only;
             # restore the original environment before serving starts.
-            with temp_set_env(
-                TRTLLM_DISABLE_FP4_QUANT_FAST_MATH="1",
-                FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH="1",
-            ):
+            with temp_set_env(FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH="1"):
                 model.load_weights(weights)
             if target_device.type == "cuda":
                 torch.cuda.synchronize()
@@ -866,9 +863,8 @@ class LayeredModelLoader(DefaultModelLoader):
         device_config: DeviceConfig,
     ) -> nn.Module:
         from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
-        from sglang.srt.runtime_context import get_server_args
 
-        torchao_config = get_server_args().torchao_config
+        torchao_config = get_exec().graph.torchao_config
         target_device = torch.device(device_config.device)
         quant_config = _get_quantization_config(model_config, self.load_config)
 
@@ -1255,7 +1251,7 @@ class QuantizedRLModelLoader(DefaultModelLoader):
 
         def quantize_weights_iterator(weights_iter):
             """Quantize individual shards before weight_loader stacks them."""
-            from sglang.srt.layers.quantization.fp8_kernel import (
+            from sglang.kernels.ops.quantization.fp8_kernel import (
                 per_token_group_quant_fp8,
             )
 

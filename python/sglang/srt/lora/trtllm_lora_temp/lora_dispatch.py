@@ -18,12 +18,12 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.kernels.ops.quantization.fp8_kernel import per_token_group_quant_fp8
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
-from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
 from sglang.srt.utils.common import next_power_of_2
 
 if TYPE_CHECKING:
@@ -337,8 +337,13 @@ def fused_experts_none_to_experimental_sgl_trtllm_bf16_lora(
     assert TopKOutputChecker.format_is_standard(topk_output)
     assert runner_config.top_k is not None
 
-    # No active LoRA in a non-capture decode -> plain (fast) bf16 path.
-    if not get_is_capture_mode() and not lora_info.has_active_lora:
+    # No-LoRA non-capture decode -> fast bf16 path, valid only for 4-D block-shuffled
+    # weights ([E, M//128, K//128, 128]); flat [E, 2F, D] stays on the decomposed kernel.
+    if (
+        not get_is_capture_mode()
+        and not lora_info.has_active_lora
+        and quant_info.gemm1_weights.dim() == 4
+    ):
         return fused_experts_none_to_flashinfer_trtllm_bf16(
             dispatch_output, quant_info, runner_config, use_routed_topk=True
         )

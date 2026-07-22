@@ -14,11 +14,15 @@ from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
     Qwen2_5_VisionRotaryEmbedding,
 )
 
-from sglang.srt.layers.attention.vision import VisionAttention
+from sglang.srt.layers.attention.vision import (
+    VisionAttention,
+    VisionAttentionMetadata,
+    prepare_vision_attention_metadata,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.models.qwen2_5_vl import Qwen2_5_VisionPatchMerger, Qwen2_5_VLMLP
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import get_mm, get_server_args
 from sglang.srt.utils import add_prefix
 
 
@@ -194,6 +198,7 @@ class MiMoVisionBlock(nn.Module):
         max_seqlen: int,
         position_embeddings: torch.Tensor,
         full_attn: bool = True,
+        forward_metadata: Optional[VisionAttentionMetadata] = None,
     ) -> torch.Tensor:
         S, B, H = x.shape
         # norm1: flatten to 2D -> [S*B, H], then reshape back
@@ -208,6 +213,7 @@ class MiMoVisionBlock(nn.Module):
             max_seqlen=max_seqlen,
             position_embeddings=position_embeddings,
             full_attn=full_attn,
+            forward_metadata=forward_metadata,
         )
         attn = rearrange(attn, "b s h -> s b h")
 
@@ -252,7 +258,7 @@ class MiMoVisionTransformer(nn.Module):
         self.fullatt_block_indexes = vision_config.fullatt_block_indexes
         self.window_size = vision_config.window_size
         self.patch_size = vision_config.patch_size
-        self.use_data_parallel = self.server_args.mm_enable_dp_encoder
+        self.use_data_parallel = get_mm().mm_enable_dp_encoder
         mlp_hidden_size: int = vision_config.intermediate_size
         self.patch_embed = MiMoVisionPatchEmbed(
             patch_size=patch_size,
@@ -279,7 +285,7 @@ class MiMoVisionTransformer(nn.Module):
                     num_heads=num_heads,
                     hidden_act=vision_config.hidden_act,
                     norm_layer=norm_layer,
-                    attn_implementation="flash_attention_3",
+                    attn_implementation=None,
                     quant_config=quant_config,
                     prefix=add_prefix(f"blocks.{i}", prefix),
                     use_sink=(
@@ -429,6 +435,9 @@ class MiMoVisionTransformer(nn.Module):
             ]
         )
         max_seqlen = seqlens.max().item()
+        forward_metadata = prepare_vision_attention_metadata(
+            cu_seqlens, device=x.device
+        )
 
         row_based_embeddings = get_position_embeddings(emb, x)
         col_based_embeddings = get_position_embeddings(
@@ -446,6 +455,7 @@ class MiMoVisionTransformer(nn.Module):
             reverse_window_index_1d_col,
             cu_seqlens,
             max_seqlen,
+            forward_metadata,
         )
 
     def run_blocks(
@@ -457,6 +467,7 @@ class MiMoVisionTransformer(nn.Module):
         reverse_window_index_1d_col: torch.Tensor,
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
+        forward_metadata: VisionAttentionMetadata,
     ) -> torch.Tensor:
         for layer_num, blk in enumerate(self.blocks):
             window_attn_type = self.vit_window_attn_types[layer_num]
@@ -485,6 +496,7 @@ class MiMoVisionTransformer(nn.Module):
                 max_seqlen=max_seqlen,
                 position_embeddings=position_embeddings,
                 full_attn=full_attn,
+                forward_metadata=forward_metadata,
             )
         x = self.merger(x)
         return x
@@ -502,6 +514,7 @@ class MiMoVisionTransformer(nn.Module):
             reverse_window_index_1d_col,
             cu_seqlens,
             max_seqlen,
+            forward_metadata,
         ) = self._prepare_forward(x, grid_thw)
 
         return self.run_blocks(
@@ -512,4 +525,5 @@ class MiMoVisionTransformer(nn.Module):
             reverse_window_index_1d_col,
             cu_seqlens,
             max_seqlen,
+            forward_metadata,
         )

@@ -25,7 +25,7 @@ import torch.nn as nn
 
 from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.layers.attention.vision import VisionAttention
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import get_mm
 
 
 class ViTCudaGraphRunner:
@@ -116,6 +116,18 @@ class ViTCudaGraphRunner:
         # x_3d: [S, B, H], B=1, S as graph_key
         return x_3d.shape[0]
 
+    def _capture_context(self):
+        # A DP-sharded encoder intentionally lets each rank capture only the
+        # images it owns (and some ranks can own none). Entering the TP
+        # communication capture in that case requires every TP peer to enter
+        # the same collective capture sequence, which deadlocks on an uneven
+        # image assignment. The encoder's output all-gather is outside this
+        # graph, and all layers are local in DP mode, so capture locally.
+        if getattr(self.vit, "use_data_parallel", False):
+            return nullcontext()
+        ca_comm = get_tp_group().ca_comm
+        return ca_comm.capture() if ca_comm is not None else nullcontext()
+
     def _create_graph(
         self,
         graph_key: int,
@@ -139,13 +151,28 @@ class ViTCudaGraphRunner:
         cu_full_kk = self.cu_full_len_kk[graph_key]
         max_full_len = int(cu_full_kk.max().item())
 
-        override_backend = get_server_args().mm_attention_backend
+        override_backend = get_mm().mm_attention_backend
 
-        tp_group = get_tp_group()
-        ca_comm = tp_group.ca_comm
-        capture_ctx = ca_comm.capture() if ca_comm is not None else nullcontext()
+        if self._fullatt_block_indexes and 0 not in vit.fullatt_block_indexes:
+            warmup_cu_ws = [cu_window, cu_window_kk, max_window_len]
+        else:
+            warmup_cu_ws = [cu_full, cu_full_kk, max_full_len]
+        if override_backend == "fa3":
+            warmup_cu_ws = [warmup_cu_ws[0], warmup_cu_ws[2]]
 
-        with capture_ctx, torch.cuda.graph(graph):
+        warmup_kwargs = dict(
+            cu_seqlens=warmup_cu_ws, output_ws=self.block_ws[graph_key]
+        )
+        if position_embeddings is not None:
+            warmup_kwargs["position_embeddings"] = position_embeddings
+        elif rotary_pos_emb_cos is not None and rotary_pos_emb_sin is not None:
+            warmup_kwargs["rotary_pos_emb_cos"] = rotary_pos_emb_cos
+            warmup_kwargs["rotary_pos_emb_sin"] = rotary_pos_emb_sin
+        with torch.no_grad():
+            vit.blocks[0](self.block_input[graph_key], **warmup_kwargs)
+        torch.cuda.synchronize()
+
+        with self._capture_context(), torch.cuda.graph(graph):
             y = None
             deepstack_outs: List[torch.Tensor] = []
             deepstack_capture_idx = 0
@@ -281,6 +308,8 @@ class ViTCudaGraphRunner:
             if graph_key not in self.cu_full_len:
                 self.cu_full_len[graph_key] = cu_seqlens
                 self.cu_full_len_kk[graph_key] = cu_seqlens[1:] - cu_seqlens[:-1]
+
+        self.block_input[graph_key].copy_(x_3d)
 
         if position_embeddings is not None:
             # make sure rotary workspace

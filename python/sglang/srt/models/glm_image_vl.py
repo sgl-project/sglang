@@ -27,13 +27,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
-from sglang.srt.layers.attention.vision import VisionAttention
+from sglang.srt.layers.attention.vision import (
+    VisionAttention,
+    VisionAttentionMetadata,
+    prepare_vision_attention_metadata,
+)
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.layers.linear import (
-    QKVParallelLinear,
-    RowParallelLinear,
-)
+from sglang.srt.layers.linear import QKVParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -53,7 +54,7 @@ from sglang.srt.models.qwen2 import Qwen2MLP as GlmImageTextMLP
 from sglang.srt.models.qwen3_vl import Qwen3_VisionMLP as GlmImageVisionMLP
 from sglang.srt.models.utils import compute_cu_seqlens_from_grid_numpy
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import get_mm, get_parallel
 from sglang.srt.utils import add_prefix, is_npu
 
 logger = logging.getLogger(__name__)
@@ -196,11 +197,16 @@ class GlmImageVisionBlock(nn.Module):
         self,
         x: torch.Tensor,
         cu_seqlens: torch.Tensor,
+        forward_metadata: Optional[VisionAttentionMetadata] = None,
     ) -> torch.Tensor:
         # x shape: (S, B, H) where B=1
         hidden_states = self.norm1(x)
         hidden_states = rearrange(hidden_states, "s b ... -> b s ...")
-        attn = self.attn(hidden_states, cu_seqlens=cu_seqlens)
+        attn = self.attn(
+            hidden_states,
+            cu_seqlens=cu_seqlens,
+            forward_metadata=forward_metadata,
+        )
         attn = rearrange(attn, "b s ... -> s b ...")
         x = x + attn
 
@@ -294,6 +300,9 @@ class GlmImageVisionModel(nn.Module):
             cu_seqlens = cu_seqlens.to(self.device, non_blocking=True)
         else:
             cu_seqlens = cu_seqlens.to("cpu")
+        forward_metadata = prepare_vision_attention_metadata(
+            cu_seqlens, device=hidden_states.device
+        )
 
         seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
 
@@ -309,7 +318,11 @@ class GlmImageVisionModel(nn.Module):
         hidden_states = hidden_states.unsqueeze(1)
 
         for blk in self.blocks:
-            hidden_states = blk(hidden_states, cu_seqlens=cu_seqlens)
+            hidden_states = blk(
+                hidden_states,
+                cu_seqlens=cu_seqlens,
+                forward_metadata=forward_metadata,
+            )
 
         # (S, 1, H) -> (S, H)
         return hidden_states.squeeze(1)
@@ -1002,7 +1015,7 @@ class GlmImageForConditionalGeneration(nn.Module):
         self.vision_config = config.vision_config
         self.vq_config = config.vq_config
         self.text_config = config.text_config
-        self.use_data_parallel = get_server_args().mm_enable_dp_encoder
+        self.use_data_parallel = get_mm().mm_enable_dp_encoder
 
         # Bridge rope_parameters -> rope_scaling so Glm4Model can pick it up
         if hasattr(self.text_config, "rope_parameters") and not getattr(
