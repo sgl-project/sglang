@@ -227,6 +227,7 @@ def chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter(
     A,
     Aqk,
     scale,
+    gk_scale,
     cu_seqlens,
     chunk_indices,
     T,
@@ -292,12 +293,15 @@ def chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter(
         o_k = i_k * BK + tl.arange(0, BK)
         m_k = o_k < K
         # [BK,]
-        b_gn = tl.load(g + (i_t * BT + i_i * BC) * H * K + o_k, mask=m_k, other=0)
+        b_gn = (
+            tl.load(g + (i_t * BT + i_i * BC) * H * K + o_k, mask=m_k, other=0)
+            * gk_scale
+        )
         # [BC, BK]
-        b_g = tl.load(p_g, boundary_check=(0, 1))
+        b_g = tl.load(p_g, boundary_check=(0, 1)) * gk_scale
         b_k = tl.load(p_k, boundary_check=(0, 1)) * exp2(b_g - b_gn[None, :])
         # [BK, BC]
-        b_gk = tl.load(p_gk, boundary_check=(0, 1))
+        b_gk = tl.load(p_gk, boundary_check=(0, 1)) * gk_scale
         b_kt = tl.load(b_kt, boundary_check=(0, 1))
         # [BC, BC]
         b_ktg = b_kt * exp2(b_gn[:, None] - b_gk)
@@ -332,6 +336,7 @@ def chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_intra(
     A,
     Aqk,
     scale,
+    gk_scale,
     cu_seqlens,
     chunk_indices,
     T,
@@ -392,7 +397,7 @@ def chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_intra(
     )
     b_q = tl.load(p_q, boundary_check=(0, 1))
     b_k = tl.load(p_k, boundary_check=(0, 1))
-    b_g = tl.load(p_g, boundary_check=(0, 1))
+    b_g = tl.load(p_g, boundary_check=(0, 1)) * gk_scale
 
     p_b = beta + (bos + i_t * BT + i_i * BC + o_i) * H + i_h
     b_k = b_k * tl.load(p_b, mask=m_A, other=0)[:, None]
@@ -402,7 +407,7 @@ def chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_intra(
 
     for j in range(0, min(BC, T - i_t * BT - i_i * BC)):
         b_kt = tl.load(p_kt, mask=m_k, other=0).to(tl.float32)
-        b_gk = tl.load(p_gk, mask=m_k, other=0).to(tl.float32)
+        b_gk = tl.load(p_gk, mask=m_k, other=0).to(tl.float32) * gk_scale
         b_ktg = b_kt[None, :] * exp2(b_g - b_gk[None, :])
         b_A = tl.sum(b_k * b_ktg, 1)
         b_A = tl.where(o_i > j, b_A, 0.0)
@@ -420,6 +425,7 @@ def chunk_kda_scaled_dot_kkt_fwd(
     gk: torch.Tensor | None = None,
     beta: torch.Tensor | None = None,
     scale: float | None = None,
+    gk_scale: float = 1.0,
     cu_seqlens: torch.LongTensor | None = None,
     chunk_size: int = 64,
     output_dtype: torch.dtype = torch.float32,
@@ -434,8 +440,12 @@ def chunk_kda_scaled_dot_kkt_fwd(
             The beta tensor of shape `[B, T, H]`.
         gk (torch.Tensor):
             The cumulative sum of the gate tensor of shape `[B, T, H, K]` applied to the key tensor,
-            in log2 space (natural-log cumsum scaled by `RCP_LN2`; the kernels apply `exp2`).
+            in log2 space (the kernels apply `exp2`).
             Default: `None`.
+        gk_scale (float):
+            Scale multiplied onto `gk` as it is loaded in the kernels. Pass a natural-log
+            cumsum with `gk_scale=RCP_LN2` to convert to log2 space in-kernel without
+            materializing a scaled copy of `gk`. Default: `1.0`.
         cu_seqlens (torch.LongTensor):
             The cumulative sequence lengths of the input tensor.
             Default: None
@@ -469,6 +479,7 @@ def chunk_kda_scaled_dot_kkt_fwd(
         A=A,
         Aqk=Aqk,
         scale=scale,
+        gk_scale=gk_scale,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
         T=T,
@@ -489,6 +500,7 @@ def chunk_kda_scaled_dot_kkt_fwd(
         A=A,
         Aqk=Aqk,
         scale=scale,
+        gk_scale=gk_scale,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
         T=T,
