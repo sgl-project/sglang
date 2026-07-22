@@ -110,9 +110,9 @@ class TestNgramTokenTableUpdate(CustomTestCase):
                 kwargs["tokens"], torch.tensor([101, 202, 303], dtype=torch.int32)
             )
         )
-        self.assertTrue(torch.equal(kwargs["row_indices"], req_pool_indices))
-        self.assertTrue(torch.equal(kwargs["column_starts"], info.out_column_starts))
-        self.assertTrue(torch.equal(kwargs["req_lens"], info.out_req_lens))
+        self.assertIs(kwargs["row_indices"], req_pool_indices)
+        self.assertIs(kwargs["column_starts"], info.out_column_starts)
+        self.assertIs(kwargs["req_lens"], info.out_req_lens)
         self.assertTrue(
             torch.equal(
                 info.out_column_starts, torch.tensor([11, 22, 33], dtype=torch.int32)
