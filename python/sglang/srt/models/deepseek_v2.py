@@ -343,7 +343,10 @@ class DeepseekV2MLP(nn.Module):
         if (
             self.swiglu_limit is not None
             and not self.down_proj.reduce_results
-            and self.down_proj.weight.dtype == torch.uint8
+            and (
+                self.down_proj.weight.dtype == torch.float8_e4m3fn
+                or self.down_proj.weight.dtype == torch.uint8
+            )
             and hasattr(self.down_proj, "weight_scale_inv")
         ):
             M, N = gate_up.shape

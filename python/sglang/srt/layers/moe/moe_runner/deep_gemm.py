@@ -231,7 +231,11 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         dispose_tensor(hidden_states)
         dispose_tensor(hidden_states_scale)
 
-        if envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.get():
+        if envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.get() or (
+            not (_is_npu or _is_hip)
+            and _is_cuda
+            and envs.SGLANG_OPT_SWIGLU_CLAMP_FUSION.get()
+        ):
             swiglu_limit_arg: Optional[float] = self.swiglu_limit
 
             down_input_fp8 = torch.empty(
