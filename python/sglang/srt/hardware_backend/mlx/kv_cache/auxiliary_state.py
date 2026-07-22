@@ -190,7 +190,21 @@ class MlxAuxiliaryStatePool:
 
 
 class MlxAuxiliaryStateReqToTokenPool(ReqToTokenPool):
-    """Req-to-token pool with MLX auxiliary-state slot bookkeeping."""
+    """Req-to-token pool with MLX auxiliary-state slot bookkeeping.
+
+    Auxiliary-slot release has exactly one owner per configuration:
+
+    * Radix cache enabled: the ``MlxAuxiliaryStateComponent`` of the unified
+      radix cache owns release — on finish it either frees the slot or
+      transfers it to the tree, nulling ``req.mamba_pool_idx`` before the
+      request row is freed. The pool must NOT free auxiliary slots itself.
+    * Radix cache disabled (``ChunkCache``): no tree component exists, and
+      ``release_kv_cache``'s ``free_mamba_cache`` fallback is gated on
+      ``HybridReqToTokenPool``, which this pool is not — so the pool itself
+      owns release. Construct with ``owns_auxiliary_state_release=True`` and
+      ``free(req)`` returns the slot together with the request row; without
+      this, every finished request leaks its slot until allocation asserts.
+    """
 
     def __init__(
         self,
@@ -200,6 +214,7 @@ class MlxAuxiliaryStateReqToTokenPool(ReqToTokenPool):
         device: str,
         enable_memory_saver: bool,
         auxiliary_state_size: int,
+        owns_auxiliary_state_release: bool = False,
     ):
         super().__init__(
             size=size,
@@ -207,6 +222,7 @@ class MlxAuxiliaryStateReqToTokenPool(ReqToTokenPool):
             device=device,
             enable_memory_saver=enable_memory_saver,
         )
+        self._owns_auxiliary_state_release = owns_auxiliary_state_release
         self.mamba_pool = MlxAuxiliaryStatePool(
             size=auxiliary_state_size,
             device=device,
@@ -268,6 +284,13 @@ class MlxAuxiliaryStateReqToTokenPool(ReqToTokenPool):
         )
 
     def free(self, req):
+        if self._owns_auxiliary_state_release:
+            # No-radix configuration: nothing else will ever release the
+            # auxiliary slot, so return it with the request row. Keyed on
+            # req.mamba_pool_idx (None-safe, nulled by free_mamba_cache), NOT
+            # on req_index_to_auxiliary_state_index_mapping, which may point
+            # at a slot the radix tree owns.
+            self.free_mamba_cache(req)
         super().free(req)
 
     def clear(self):

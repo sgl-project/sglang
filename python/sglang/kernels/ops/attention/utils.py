@@ -2,7 +2,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.jit_kernel.utils import is_arch_support_pdl
+from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.kernels.ops.attention.pad import (
     pad_sequence_with_mask as pad_sequence_with_mask,
 )
@@ -20,6 +20,12 @@ from sglang.kernels.ops.kvcache.cache_ops import (
 )
 from sglang.kernels.ops.kvcache.cache_ops import (
     concat_and_cast_mha_k_triton as concat_and_cast_mha_k_triton,
+)
+from sglang.kernels.ops.kvcache.cache_ops import (
+    concat_and_cast_q_fp8_pad as concat_and_cast_q_fp8_pad,
+)
+from sglang.kernels.ops.kvcache.cache_ops import (
+    concat_and_cast_q_fp8_pad_kernel as concat_and_cast_q_fp8_pad_kernel,
 )
 from sglang.kernels.ops.kvcache.cache_ops import (
     launch_reshape_and_cache_flash as launch_reshape_and_cache_flash,

@@ -1,24 +1,20 @@
 from __future__ import annotations
 
 import enum
-from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple, cast
+from typing import TYPE_CHECKING, List, Tuple, Union
 
 import torch
 import tvm_ffi
 from tvm_ffi import Module
 
-from sglang.jit_kernel.utils import (
+from sglang.kernel_api_logging import debug_kernel_api
+from sglang.kernels.jit.utils import (
     cache_once,
     is_arch_support_pdl,
+    lazy_register_class,
     load_jit,
     make_cpp_args,
 )
-from sglang.kernel_api_logging import debug_kernel_api
-
-
-class ConfigResult(NamedTuple):
-    num_blocks: int
-    num_threads: int
 
 
 class AllReduceAlgo(enum.Enum):
@@ -30,97 +26,142 @@ class AllReduceAlgo(enum.Enum):
         return self == AllReduceAlgo.ONE_SHOT_PUSH
 
     @property
-    def shot(self) -> int:
-        return 2 if self == AllReduceAlgo.TWO_SHOT_PULL else 1
+    def algo_name(self) -> str:
+        return _ALGO_NAMES[self]
 
+
+_ALGO_NAMES = {
+    AllReduceAlgo.ONE_SHOT_PUSH: "1shot_push",
+    AllReduceAlgo.ONE_SHOT_PULL: "1shot_pull",
+    AllReduceAlgo.TWO_SHOT_PULL: "2shot_pull",
+}
+
+# ``pull_arg`` of the all-reduce kernel: a row of the graph-params pointer
+# table selects graph mode; a plain bool selects multicast (True) / eager.
+PullArg = Union[torch.Tensor, bool]
 
 if TYPE_CHECKING:
-    CUSTOM_AR_HANDLE = List[int]
-    CUSTOM_AR_PAIR = Tuple[int, CUSTOM_AR_HANDLE]
+    # (cudaIpcMemHandle bytes, offset-in-allocation) for one device pointer
+    IPC_HANDLE_PAIR = Tuple[List[int], int]
 
-    class CustomAllReduceObj:
-        def __init__(
-            self,
-            rank: int,
-            world_size: int,
-            pull_buffer_bytes: int,
-            push_buffer_bytes: int,
-            graph_input_count: int,
-            *,
-            max_pull_blocks: Optional[int] = None,
-            max_push_blocks: Optional[int] = None,
-        ) -> None:
-            """
-            Create a CustomAllReduceObj instance.
 
-            :param rank: The rank of the current process.
-            :param world_size: The total number of processes in the group.
-            :param pull_buffer_bytes: The size of the buffer (in bytes) used for pull-based all-reduce.
-            :param push_buffer_bytes: The size of the buffer (in bytes) used for push-based all-reduce.
-            :param graph_input_count: The maximum number of inputs in all CUDA graphs.
-            :param max_pull_blocks: The maximum number of thread blocks to launch for pull-based all-reduce.
-                                    If None, it will be determined by the implementation.
-            :param max_push_blocks: The maximum number of thread blocks to launch for push-based all-reduce.
-                                    If None, it will be determined by the implementation.
-            """
+def _init_communicator() -> None:
+    module = load_jit(
+        "communicator",
+        cuda_files=["distributed/communicator.cuh"],
+        cuda_wrappers=[("register_once", "register_communicator")],
+    )
+    module.register_once()
 
-        @property
-        def world_size(self) -> int: ...
-        def share_storage(self) -> CUSTOM_AR_HANDLE: ...
-        def share_graph_inputs(self) -> List[CUSTOM_AR_PAIR]: ...
-        def post_init(self, handles: List[CUSTOM_AR_HANDLE]) -> None: ...
-        def register_inputs(self, handles: List[List[CUSTOM_AR_PAIR]]) -> None: ...
-        def set_cuda_graph_capture(self, is_capturing: bool) -> None: ...
-        def get_graph_capture_bases(
-            self,
-        ) -> Tuple[List[Tuple[int, int]], List[List[int]], List[int]]: ...
-        def free(self, tp_cpu_group: torch.distributed.ProcessGroup) -> None: ...
-        def all_reduce(
-            self, input: torch.Tensor, algo: AllReduceAlgo
-        ) -> tvm_ffi.Tensor: ...
-        def config_pull(
-            self, num_blocks: int = -1, num_threads: int = -1
-        ) -> ConfigResult:
-            """
-            Configure the CUDA kernel's grid and block dimensions.
-            This provides only the upper bound of the configuration,
-            and the actual launch configuration may be determined by implementation.
-            Note that push-based all-reduce can not be configured currently.
 
-            :param num_blocks: The maximum number of thread blocks to launch. -1 means no limit.
-            :param num_threads: The maximum number of threads per block. -1 means no limit.
+@lazy_register_class("sgl.Communicator", _init_communicator)
+class Communicator(tvm_ffi.Object):
+    """Storage plane of the custom all-reduce: a thin pointer holder.
 
-            :return: The previous configuration as a ConfigResult named tuple.
-            """
-            ...
+    All buffers are owned by the caller (symmetric-memory tensor views plus
+    a local push counter); this object only validates and records them.
+    """
+
+    if TYPE_CHECKING:
+        # C++ interface
+        rank: int
+        world_size: int
+
+        def _config(self, kwargs: dict) -> None: ...
+
+    def __init__(
+        self,
+        rank: int,
+        world_size: int,
+        push_workspaces: List[torch.Tensor],
+        pull_workspaces: List[torch.Tensor],
+        pull_semaphores: List[torch.Tensor],
+        push_counter: torch.Tensor,
+        pull_mc_workspace: int | None,
+    ) -> None:
+        """
+        :param push_workspaces: per-rank ``[2 * world_size, push_bytes]``
+                                uint8 views of symmetric memory.
+        :param pull_workspaces: per-rank ``[pull_bytes]`` uint8 views of
+                                symmetric memory.
+        :param pull_semaphores: per-rank ``[num_pull_blocks, 128]`` uint8
+                                views of symmetric memory.
+        :param push_counter: local ``[num_push_blocks, 4]`` uint8 tensor.
+        :param pull_mc_workspace: multicast address of the pull workspace,
+                                  or None when multicast is unavailable.
+        """
+        self.__ffi_init__(
+            rank,
+            world_size,
+            push_workspaces,
+            pull_workspaces,
+            pull_semaphores,
+            push_counter,
+            pull_mc_workspace,
+        )
+
+    def config(
+        self,
+        num_pull_blocks: int | None = None,
+        num_multicast_blocks: int | None = None,
+    ) -> Communicator:
+        kwargs = {}
+        if num_pull_blocks is not None:
+            kwargs["num_pull_blocks"] = num_pull_blocks
+        if num_multicast_blocks is not None:
+            kwargs["num_multicast_blocks"] = num_multicast_blocks
+        self._config(kwargs)
+        return self
+
+
+def _init_ipc_manager() -> None:
+    module = load_jit(
+        "cuda_ipc",
+        extra_ldflags=["-lcuda"],
+        cuda_files=["distributed/ipc.cuh"],
+        cuda_wrappers=[("register_once", "register_ipc_manager")],
+    )
+    module.register_once()
+
+
+@lazy_register_class("sgl.IPCManager", _init_ipc_manager)
+class IPCManager(tvm_ffi.Object):
+    """Batched cudaIpc handle exchange for CUDA-graph input pointers."""
+
+    if TYPE_CHECKING:
+        # C++ interface
+        def destroy(self) -> None: ...
+        def batch_get_handles(self, ptrs: List[int]) -> List[IPC_HANDLE_PAIR]: ...
+        def batch_open_handles(self, handles: List[IPC_HANDLE_PAIR]) -> List[int]: ...
+
+    def __init__(self) -> None:
+        self.__ffi_init__()
 
 
 @cache_once
-def _jit_custom_all_reduce_pull_module(dtype: torch.dtype, world_size: int) -> Module:
+def get_all_reduce_module(dtype: torch.dtype, world_size: int) -> Module:
     args = make_cpp_args(dtype, world_size, is_arch_support_pdl())
     return load_jit(
-        "custom_all_reduce_pull",
+        "custom_all_reduce",
         *args,
-        extra_ldflags=["-lcuda"],
-        cuda_files=["distributed/custom_all_reduce_pull.cuh"],
+        cuda_files=["distributed/custom_all_reduce.cuh"],
         cuda_wrappers=[("all_reduce", f"custom_all_reduce<{args}>")],
     )
 
 
-@cache_once
-def _jit_custom_all_reduce_push_module(dtype: torch.dtype, world_size: int) -> Module:
-    args = make_cpp_args(dtype, world_size, is_arch_support_pdl())
-    return load_jit(
-        "custom_all_reduce_push",
-        *args,
-        extra_ldflags=["-lcuda"],
-        cuda_files=["distributed/custom_all_reduce_push.cuh"],
-        cuda_wrappers=[("all_reduce", f"custom_all_reduce<{args}>")],
-    )
+@debug_kernel_api
+def custom_all_reduce(
+    comm: Communicator,
+    input: torch.Tensor,
+    algo: AllReduceAlgo,
+    pull_arg: PullArg,
+) -> tvm_ffi.Tensor:
+    module = get_all_reduce_module(input.dtype, comm.world_size)
+    return module.all_reduce(comm, input, algo.algo_name, pull_arg)
 
 
 @cache_once
-def _jit_fused_parallel_qknorm_module(
+def get_fused_parallel_qknorm_module(
     dtype: torch.dtype, world_size: int, q_dim: int, k_dim: int
 ) -> Module:
     args = make_cpp_args(dtype, world_size, q_dim, k_dim, is_arch_support_pdl())
@@ -128,7 +169,6 @@ def _jit_fused_parallel_qknorm_module(
     return load_jit(
         "tp_qknorm",
         *args,
-        extra_ldflags=["-lcuda"],
         cuda_files=["distributed/tp_qknorm.cuh"],
         cuda_wrappers=[
             ("fused_parallel_qknorm", f"{cls_name}::run"),
@@ -137,107 +177,23 @@ def _jit_fused_parallel_qknorm_module(
     )
 
 
-@cache_once
-def get_custom_all_reduce_cls() -> type[CustomAllReduceObj]:
-    module = load_jit(
-        "custom_all_reduce_base",
-        extra_ldflags=["-lcuda"],
-        cuda_files=["distributed/custom_all_reduce_base.cuh"],
-        cuda_wrappers=[("register_once", "register_custom_all_reduce")],
-    )
-    module.register_once()
-    device = torch.cuda.current_device()
-    props = torch.cuda.get_device_properties(device)
-    NUM_CTA = props.multi_processor_count
-    MAX_THREADS = 512
-
-    @tvm_ffi.register_object("sgl.CustomAllReduce")
-    class CustomAllReduceObjReal(tvm_ffi.Object):
-        __slots__ = ("__dict__",)
-
-        def __init__(
-            self,
-            rank: int,
-            world_size: int,
-            pull_buffer_bytes: int,
-            push_buffer_bytes: int,
-            graph_input_count: int,
-            *,
-            max_pull_blocks: Optional[int] = None,
-            max_push_blocks: Optional[int] = None,
-        ) -> None:
-            max_pull_blocks = NUM_CTA if max_pull_blocks is None else max_pull_blocks
-            max_push_blocks = NUM_CTA if max_push_blocks is None else max_push_blocks
-            self.__ffi_init__(
-                rank,
-                world_size,
-                max_pull_blocks,
-                max_push_blocks,
-                pull_buffer_bytes,
-                push_buffer_bytes,
-                graph_input_count,
-            )
-            self._world_size = world_size
-            self._pull_config = ConfigResult(min(NUM_CTA, max_pull_blocks), MAX_THREADS)
-            if max_pull_blocks > 0:  # special case: cannot configure 0 blocks
-                self.configure_pull(*self._pull_config)  # type: ignore
-
-        @property
-        def world_size(self) -> int:
-            return self._world_size
-
-        @debug_kernel_api
-        def all_reduce(
-            self,
-            input: torch.Tensor,
-            algo: AllReduceAlgo,
-        ) -> tvm_ffi.Tensor:
-            compile_fn = (
-                _jit_custom_all_reduce_push_module
-                if algo.is_push()
-                else _jit_custom_all_reduce_pull_module
-            )
-            module = compile_fn(input.dtype, self._world_size)
-            return module.all_reduce(self, input, algo.shot)
-
-        def config_pull(
-            self, num_blocks: int = -1, num_threads: int = -1
-        ) -> ConfigResult:
-            old_config = self._pull_config
-            num_blocks = num_blocks if num_blocks != -1 else old_config.num_blocks
-            num_threads = num_threads if num_threads != -1 else old_config.num_threads
-            new_config = ConfigResult(num_blocks, num_threads)
-            if new_config != old_config:
-                result = ConfigResult(*self.configure_pull(*new_config))  # type: ignore
-                assert result == self._pull_config
-                self._pull_config = new_config
-            return old_config
-
-        def free(self, tp_cpu_group: torch.distributed.ProcessGroup) -> None:
-            self.free_ipc_handles()  # type: ignore
-            torch.distributed.barrier(group=tp_cpu_group)
-            self.free_storage()  # type: ignore
-
-    return cast(type["CustomAllReduceObj"], CustomAllReduceObjReal)
-
-
 def get_fused_parallel_qknorm_max_occupancy(
     dtype: torch.dtype, world_size: int, q_dim: int, k_dim: int
 ) -> int:
-    module = _jit_fused_parallel_qknorm_module(dtype, world_size, q_dim, k_dim)
+    module = get_fused_parallel_qknorm_module(dtype, world_size, q_dim, k_dim)
     return module.get_max_occupancy()
 
 
 def fused_parallel_qknorm(
-    custom_ar: CustomAllReduceObj,
+    comm: Communicator,
     q: torch.Tensor,
     k: torch.Tensor,
     q_weight: torch.Tensor,
     k_weight: torch.Tensor,
     eps: float = 1e-6,
 ) -> None:
-    world_size = custom_ar.world_size
+    world_size = comm.world_size
     q_dim = q.shape[-1] * world_size
     k_dim = k.shape[-1] * world_size
-    module = _jit_fused_parallel_qknorm_module(q.dtype, world_size, q_dim, k_dim)
-    module.fused_parallel_qknorm(custom_ar, q, k, q_weight, k_weight, eps)
+    module = get_fused_parallel_qknorm_module(q.dtype, world_size, q_dim, k_dim)
+    module.fused_parallel_qknorm(comm, q, k, q_weight, k_weight, eps)
