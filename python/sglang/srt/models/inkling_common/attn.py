@@ -364,7 +364,8 @@ class InklingAttention(nn.Module):
 
     def _fused_attn_prologue_verify(self, q, k, v, forward_batch, log_scaling_tau=None):
         """Fused target-verify {k/v sconv + save_windows + qk-norm (+ KV store)}
-        (jit_kernel/inkling_attn_prologue.py); returns ``(q, k, v, did_store)``.
+        (kernels/ops/model/inkling/inkling_attn_prologue.py); returns
+        ``(q, k, v, did_store)``.
 
         The fused kernel writes raw bf16 KV, so it only does the store when the
         KV pool is bf16: full layers at ``out_cache_loc`` in the full pool,
