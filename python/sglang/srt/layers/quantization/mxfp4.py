@@ -603,39 +603,42 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             self._process_weights_for_sm90_cutlass(layer)
             return
         if self.use_flashinfer:
+            # Per-expert buffers are local (create_weights uses num_local_experts);
+            # the global self.num_experts here breaks EP>1. Mirrors the SM90 path.
+            E = layer.num_local_experts
             _alpha = getattr(layer.moe_runner_config, "gemm1_alpha", None) or 1.702
             _limit = getattr(layer.moe_runner_config, "gemm1_clamp_limit", None) or 7.0
             layer.gemm1_alpha = Parameter(
-                torch.tensor([_alpha] * self.num_experts, dtype=torch.float32).cuda(),
+                torch.tensor([_alpha] * E, dtype=torch.float32).cuda(),
                 requires_grad=False,
             )
             layer.gemm1_beta = Parameter(
-                torch.tensor([1.0] * self.num_experts, dtype=torch.float32).cuda(),
+                torch.tensor([1.0] * E, dtype=torch.float32).cuda(),
                 requires_grad=False,
             )
             layer.gemm1_clamp_limit = Parameter(
-                torch.tensor([_limit] * self.num_experts, dtype=torch.float32).cuda(),
+                torch.tensor([_limit] * E, dtype=torch.float32).cuda(),
                 requires_grad=False,
             )
             sf_block_size = 32  # mxfp4 block size
 
             assert (
                 layer.w13_weight.dim() == 3
-                and layer.w13_weight.shape[0] == self.num_experts
+                and layer.w13_weight.shape[0] == E
                 and layer.w13_weight.shape[1]
                 == self.intermediate_size_per_partition * 2
                 and layer.w13_weight.shape[2] == self.hidden_size // 2
             )
             assert (
                 layer.w13_weight_scale.dim() == 3
-                and layer.w13_weight_scale.shape[0] == self.num_experts
+                and layer.w13_weight_scale.shape[0] == E
                 and layer.w13_weight_scale.shape[1]
                 == self.intermediate_size_per_partition * 2
                 and layer.w13_weight_scale.shape[2] == self.hidden_size // sf_block_size
             )
             assert (
                 layer.w2_weight.dim() == 3
-                and layer.w2_weight.shape[0] == self.num_experts
+                and layer.w2_weight.shape[0] == E
                 and layer.w2_weight.shape[1] == self.hidden_size
                 and layer.w2_weight.shape[2]
                 == self.intermediate_size_per_partition // 2
@@ -648,13 +651,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             )
             assert (
                 layer.w13_weight_bias.dim() == 2
-                and layer.w13_weight_bias.shape[0] == self.num_experts
+                and layer.w13_weight_bias.shape[0] == E
                 and layer.w13_weight_bias.shape[1]
                 == self.intermediate_size_per_partition * 2
             )
             assert (
                 layer.w2_weight_bias.dim() == 2
-                and layer.w2_weight_bias.shape[0] == self.num_experts
+                and layer.w2_weight_bias.shape[0] == E
                 and layer.w2_weight_bias.shape[1] == self.hidden_size
             )
 
@@ -740,7 +743,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 epilogue_tile_m,
             )
 
-            for i in range(self.num_experts):
+            for i in range(E):
                 gemm1_weights_mxfp4_shuffled.append(
                     w13_weight[i]
                     .view(torch.uint8)[w13_weight_permute_indices]
@@ -781,7 +784,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             w13_weight_scale = (
                 torch.stack(gemm1_scales_mxfp4_shuffled)
                 .reshape(
-                    self.num_experts,
+                    E,
                     2 * self.intermediate_size_per_partition,
                     self.hidden_size // sf_block_size,
                 )
@@ -792,7 +795,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             w2_weight_scale = (
                 torch.stack(gemm2_scales_mxfp4_shuffled)
                 .reshape(
-                    self.num_experts,
+                    E,
                     self.hidden_size,
                     self.intermediate_size_per_partition // sf_block_size,
                 )
@@ -804,11 +807,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             layer.w2_weight = Parameter(w2_weight, requires_grad=False)
             layer.w2_weight_scale = Parameter(w2_weight_scale, requires_grad=False)
             layer.w13_weight_bias = Parameter(
-                torch.stack(gemm1_bias_shuffled).reshape(self.num_experts, -1),
+                torch.stack(gemm1_bias_shuffled).reshape(E, -1),
                 requires_grad=False,
             )
             layer.w2_weight_bias = Parameter(
-                torch.stack(gemm2_bias_shuffled).reshape(self.num_experts, -1),
+                torch.stack(gemm2_bias_shuffled).reshape(E, -1),
                 requires_grad=False,
             )
             return
@@ -1365,9 +1368,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                         "SGLANG_TRTLLM_GEN_MOE_SDK (see "
                         "sglang/jit_kernel/trtllm_gen_moe.py)."
                     )
-                assert (
-                    layer.num_local_experts == layer.num_experts
-                ), "situ trtllm-gen path is TP-only (no EP)"
+                # EP is cubin-internal: each rank computes its local expert slice
+                # [offset, +num_local) and the caller all-reduces. ep=1 -> TP path.
+                local_expert_offset = layer.moe_ep_rank * layer.num_local_experts
                 if TopKOutputChecker.format_is_standard(topk_output):
                     # Precomputed routing (radix router upstream): skip the
                     # in-op routing kernels entirely. At small T the in-op
@@ -1404,6 +1407,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                         top_k=packed_topk.shape[1],
                         intermediate_size=self.intermediate_size_per_partition,
                         activation_type=situ_moe.ACTIVATION_SITU,
+                        local_expert_offset=local_expert_offset,
+                        local_num_experts=layer.num_local_experts,
                         output=symm_output,
                         do_finalize=not defer_finalize,
                     )
@@ -1456,6 +1461,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     routing_method_type=situ_moe.ROUTING_DEEPSEEK_V3,
                     activation_type=situ_moe.ACTIVATION_SITU,
                     norm_topk_prob=topk_output.topk_config.renormalize,
+                    local_expert_offset=local_expert_offset,
+                    local_num_experts=layer.num_local_experts,
                     output=symm_output,
                 )
                 return StandardCombineInput(hidden_states=symm_output)
