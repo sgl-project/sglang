@@ -35,6 +35,7 @@ from sglang.srt.models.qwen3_next import Qwen3NextForCausalLM, Qwen3NextModel
 from sglang.srt.runtime_context import (
     get_model,
     get_parallel,
+    get_server_args,
     get_spec,
 )
 from sglang.srt.utils import add_prefix, is_npu
@@ -84,7 +85,7 @@ class Qwen3NextForCausalLMMTP(Qwen3NextForCausalLM):
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("model.shared_head.head", prefix),
-            use_attn_tp_group=get_parallel().enable_dp_lm_head,
+            use_attn_tp_group=get_server_args().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
         # Mirror Qwen3NextForCausalLM.__init__'s shared-expert fusion setup so

@@ -43,6 +43,7 @@ from sglang.srt.runtime_context import (
     get_device,
     get_exec,
     get_parallel,
+    get_server_args,
 )
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import BumpAllocator, empty_context, get_bool_env_var, is_hip
@@ -761,7 +762,7 @@ class TboForwardBatchPreparer:
 
         # TODO improve, e.g. unify w/ `init_raw`
         if (
-            get_parallel().moe_dense_tp_size == 1
+            get_server_args().moe_dense_tp_size == 1
             and batch.global_dp_buffer_len is not None
         ):
             sum_len = end_token_index - start_token_index

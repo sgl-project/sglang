@@ -57,6 +57,7 @@ from sglang.srt.runtime_context import (
     get_device,
     get_forward,
     get_parallel,
+    get_server_args,
     get_stream,
 )
 from sglang.srt.utils import (
@@ -1084,7 +1085,7 @@ class BailingMoELinearForCausalLM(nn.Module):
                     config.hidden_size,
                     params_dtype=torch.float32,
                     quant_config=quant_config,
-                    use_attn_tp_group=get_parallel().enable_dp_lm_head,
+                    use_attn_tp_group=get_server_args().enable_dp_lm_head,
                 )
             )
             self.logits_processor = LogitsProcessor(config)

@@ -56,6 +56,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_forward,
     get_parallel,
+    get_server_args,
     get_stream,
 )
 from sglang.srt.utils import LazyValue, add_prefix, is_cuda, make_layers
@@ -556,7 +557,7 @@ class SDARMoeForCausalLM(nn.Module):
                     config.vocab_size,
                     config.hidden_size,
                     quant_config=quant_config,
-                    use_attn_tp_group=get_parallel().enable_dp_lm_head,
+                    use_attn_tp_group=get_server_args().enable_dp_lm_head,
                     prefix=add_prefix("lm_head", prefix),
                 )
         else:

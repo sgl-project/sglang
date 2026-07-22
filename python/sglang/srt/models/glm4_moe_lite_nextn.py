@@ -35,7 +35,7 @@ from sglang.srt.models.glm4_moe_lite import (
     Glm4MoeLiteDecoderLayer,
     Glm4MoeLiteForCausalLM,
 )
-from sglang.srt.runtime_context import get_exec, get_parallel, get_spec
+from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args, get_spec
 from sglang.srt.utils import BumpAllocator, add_prefix, is_npu
 
 logger = logging.getLogger(__name__)
@@ -151,7 +151,7 @@ class Glm4MoeLiteForCausalLMNextN(Glm4MoeLiteForCausalLM):
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("model.shared_head.head", prefix),
-            use_attn_tp_group=get_parallel().enable_dp_lm_head,
+            use_attn_tp_group=get_server_args().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
 

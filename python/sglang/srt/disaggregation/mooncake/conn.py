@@ -55,7 +55,7 @@ from sglang.srt.observability.trace import (
     TraceReqContext,
     trace_set_thread_info,
 )
-from sglang.srt.runtime_context import get_parallel, get_schedule
+from sglang.srt.runtime_context import get_schedule
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.network import NetworkAddress
 
@@ -948,7 +948,7 @@ class MooncakeKVManager(CommonKVManager):
         if (
             self.attn_cp_size > 1
             and self.attn_cp_rank != 0
-            and not get_parallel().enable_dsa_cache_layer_split
+            and not self.server_args.enable_dsa_cache_layer_split
         ):
             skip_state = True
 

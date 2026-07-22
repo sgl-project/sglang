@@ -34,6 +34,7 @@ from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
+    get_server_args,
     get_stream,
 )
 from sglang.srt.utils import add_prefix, get_bool_env_var, is_cuda, is_hip, is_npu
@@ -494,7 +495,7 @@ class Qwen3ForCausalLM(nn.Module):
                     config.vocab_size,
                     config.hidden_size,
                     quant_config=quant_config,
-                    use_attn_tp_group=get_parallel().enable_dp_lm_head,
+                    use_attn_tp_group=get_server_args().enable_dp_lm_head,
                     prefix=add_prefix("lm_head", prefix),
                 )
         else:

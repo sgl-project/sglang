@@ -150,7 +150,6 @@ from sglang.srt.runtime_context import (
     get_global_dwdp_manager,
     get_lora,
     get_model,
-    get_parallel,
     get_schedule,
     set_global_dwdp_manager,
 )
@@ -393,12 +392,12 @@ class ModelRunner:
         is_scale_join = get_exec().moe.ep_join_mode == "scale"
         if is_scale_join:
             join_effective_ep_size = (
-                get_parallel().ep_join_rank_offset + self.ps.tp_size
+                self.server_args.ep_join_rank_offset + self.ps.tp_size
             )
             dist.barrier(group=self.tp_group.cpu_group)
             if self.ps.tp_rank == 0:
                 register_scale_cohort(
-                    get_parallel().ep_join_rank_offset,
+                    self.server_args.ep_join_rank_offset,
                     join_effective_ep_size,
                 )
             join_scale_process_group()
@@ -408,7 +407,7 @@ class ModelRunner:
         else:
             join_process_groups()
 
-        global_ep_rank = self.ps.tp_rank + get_parallel().ep_join_rank_offset
+        global_ep_rank = self.ps.tp_rank + self.server_args.ep_join_rank_offset
         broadcast_global_expert_location_metadata(
             model_config=self.model_config,
             moe_ep_rank=global_ep_rank,
@@ -442,9 +441,9 @@ class ModelRunner:
             new_dp_size=join_effective_ep_size,
             new_dp_rank=global_ep_rank,
         )
-        from sglang.srt.runtime_context import get_context
-
-        get_context().override("elastic_ep.scale_join", dp_size=join_effective_ep_size)
+        self.server_args.override(
+            "elastic_ep.scale_join", dp_size=join_effective_ep_size
+        )
         if self.eplb_manager is not None:
             self.eplb_manager.disable_rebalance(
                 "EPLB rebalance is disabled after elastic EP scale-up"
@@ -618,7 +617,7 @@ class ModelRunner:
         if self.is_draft_worker:
             return
         expert_rank = self.ps.moe_ep_rank + (
-            get_parallel().ep_join_rank_offset
+            self.server_args.ep_join_rank_offset
             if self.server_args.is_ep_scale_joiner
             else 0
         )
@@ -798,7 +797,7 @@ class ModelRunner:
             device=self.device,
             tp_group=(
                 self.attention_tp_group.cpu_group
-                if get_parallel().enable_dp_attention
+                if self.server_args.enable_dp_attention
                 else self.tp_group.cpu_group
             ),
             host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
@@ -1609,7 +1608,7 @@ class ModelRunner:
         if added <= 0:
             return
 
-        initial_ep_size = get_parallel().elastic_ep_initial_size
+        initial_ep_size = self.server_args.elastic_ep_initial_size
         assert initial_ep_size is not None
         self.server_args.override("elastic_ep.scale", ep_size=effective_size)
 
@@ -1628,7 +1627,7 @@ class ModelRunner:
         set_global_expert_location_metadata(new_metadata, allow_overwrite=True)
 
     def _elastic_global_rank(self) -> int:
-        return self.ps.tp_rank + get_parallel().ep_join_rank_offset
+        return self.ps.tp_rank + self.server_args.ep_join_rank_offset
 
     def _report_elastic_scale_failure(self, error: str, effective_size: int) -> None:
         if self.ps.tp_rank != 0 or self.server_args.is_ep_scale_joiner:
@@ -1705,9 +1704,7 @@ class ModelRunner:
             new_dp_size=target_size,
             new_dp_rank=self._elastic_global_rank(),
         )
-        from sglang.srt.runtime_context import get_context
-
-        get_context().override("elastic_ep.scale", dp_size=target_size)
+        self.server_args.override("elastic_ep.scale", dp_size=target_size)
 
         ElasticEPStateManager.mark_syncing_new_world()
         self._elastic_scale_ready_barrier(
