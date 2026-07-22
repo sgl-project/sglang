@@ -188,6 +188,11 @@ QUANTIZATION_CHOICES = [
     "humming",
 ]
 
+# TODO: support other online quantization merhods, now supports only Ascend w8a8_int8 MoE
+ONLINE_QUANTIZATION_CHOICES = [
+    "w8a8_int8",
+]
+
 
 SPECULATIVE_DRAFT_MODEL_QUANTIZATION_CHOICES = QUANTIZATION_CHOICES
 
@@ -358,6 +363,10 @@ def add_load_format_choices(choices):
 
 def add_quantization_method_choices(choices):
     QUANTIZATION_CHOICES.extend(choices)
+
+
+def add_online_quantization_method_choices(choices):
+    ONLINE_QUANTIZATION_CHOICES.extend(choices)
 
 
 def add_attention_backend_choices(choices):
@@ -586,6 +595,14 @@ class ServerArgs:
         Arg(
             help="The quantization method.",
             choices=QUANTIZATION_CHOICES,
+            resolvable=True,
+        ),
+    ] = None
+    online_quantization: A[
+        Optional[str],
+        Arg(
+            help="The online quantization method.",
+            choices=ONLINE_QUANTIZATION_CHOICES,
             resolvable=True,
         ),
     ] = None
