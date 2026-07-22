@@ -361,6 +361,7 @@ class Scheduler(
         self.enable_hisparse = server_args.enable_hisparse
         self.enable_dp_attention = server_args.enable_dp_attention
         self.enable_unified_memory = server_args.enable_unified_memory
+        self.debug_mode = server_args.debug_mode
 
         # Distributed rank info
         attn_tp_rank, attn_tp_size, attn_dp_rank, attn_dp_size = (
@@ -1497,32 +1498,40 @@ class Scheduler(
             if self.gracefully_exit:
                 break
 
-            # Receive requests
-            recv_reqs = self.request_receiver.recv_requests()
-            self.process_input_requests(recv_reqs)
-            if self._engine_paused:
-                continue
+            try:
+                # Receive requests
+                recv_reqs = self.request_receiver.recv_requests()
+                self.process_input_requests(recv_reqs)
+                if self._engine_paused:
+                    continue
 
-            # Get the next batch to run
-            plan = self.get_next_batch_to_run(
-                running_batch=self.running_batch, last_batch=self.last_batch
-            )
-            self.running_batch = plan.running_batch
-            batch = plan.batch_to_run
-            self.cur_batch_for_debug = batch
+                # Get the next batch to run
+                plan = self.get_next_batch_to_run(
+                    running_batch=self.running_batch, last_batch=self.last_batch
+                )
+                self.running_batch = plan.running_batch
+                batch = plan.batch_to_run
+                self.cur_batch_for_debug = batch
 
-            # Launch the current batch
-            if batch:
-                result = self.run_batch(batch)
-                self.process_batch_result(batch, result)
-            else:
-                # When the server is idle, do self-check and re-init some states.
-                self.on_idle()
+                # Launch the current batch
+                if batch:
+                    result = self.run_batch(batch)
+                    self.process_batch_result(batch, result)
+                else:
+                    # When the server is idle, do self-check and re-init some states.
+                    self.on_idle()
 
-            # Update last_batch
-            self.last_batch = batch
-            if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
-                self.invariant_checker.self_check_during_busy()
+                # Update last_batch
+                self.last_batch = batch
+                if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
+                    self.invariant_checker.self_check_during_busy()
+            except Exception as e:
+                # Default: re-raise so run_scheduler_process tears the process
+                # down exactly as it does today. Debug mode opts into surviving
+                # the error instead (see _recover_from_iteration_error).
+                if not self.debug_mode:
+                    raise
+                self._recover_from_iteration_error(e)
 
     @DynamicGradMode()
     def event_loop_overlap(self):
@@ -3794,6 +3803,97 @@ class Scheduler(
             )
             success = False
         return success
+
+    def _recover_from_iteration_error(self, exc: Exception) -> None:
+        """Debug-mode best-effort recovery from a serving-time exception.
+
+        All in-flight and queued requests are aborted and every pool/queue is reset
+        to its freshly-started state. If the reset itself raises, the process is in an
+        unrecoverable state (e.g. a poisoned CUDA context after an illegal memory
+        access), so the original exception is re-raised and the normal crash path
+        (SIGQUIT in run_scheduler_process) takes over. This only recovers CPU-side
+        Python exceptions; GPU-side faults are out of scope.
+        """
+        inflight_rids = [req.rid for req in self._all_inflight_reqs()]
+        logger.error(
+            "Scheduler iteration raised an exception. Debug mode is on; aborting "
+            "all in-flight/queued requests and resetting scheduler state instead "
+            "of tearing down the process.\n"
+            f"  in-flight rids: {inflight_rids}\n"
+            f"{get_exception_traceback()}"
+        )
+        try:
+            self._abort_all_and_reset()
+            # Verify the reset actually reached the scheduler's canonical idle
+            # state before trusting the loop to continue. is_fully_idle() checks
+            # every batch/queue plus collaborator staging (grammar, dllm, hicache),
+            # so a reset that left any of them non-empty is caught here and treated
+            # as unrecoverable rather than silently resuming on stale state.
+            if not self.is_fully_idle():
+                raise RuntimeError(
+                    "debug-mode reset did not return the scheduler to a fully-idle "
+                    "state; treating the recovery as failed."
+                )
+        except Exception:
+            logger.error(
+                "Debug-mode recovery failed; the scheduler state is "
+                "unrecoverable. Falling back to the normal crash path.\n"
+                f"{get_exception_traceback()}"
+            )
+            raise exc
+        logger.warning("Debug-mode recovery complete; resuming the event loop.")
+
+    def _all_inflight_reqs(self) -> List[Req]:
+        """De-duplicated requests tracked in any in-flight batch or chunked slot."""
+        reqs: Dict[str, Req] = {}
+        for batch in (self.running_batch, self.last_batch, self.cur_batch_for_debug):
+            if batch is not None:
+                for req in batch.reqs:
+                    reqs[req.rid] = req
+        if self.chunked_req is not None:
+            reqs.setdefault(self.chunked_req.rid, self.chunked_req)
+        return list(reqs.values())
+
+    def _abort_all_and_reset(self) -> None:
+        """Abort every request and reset pools/queues to the empty state.
+
+        Reuses the same pool-clearing primitives as flush_cache, minus its idle
+        guard (we are recovering precisely because we are not idle).
+        """
+        # abort_request notifies queued requests and marks running requests for
+        # abort, but it does not free the running requests' KV or notify their
+        # clients — the normal flow relies on a later forward pass for that. Since
+        # we discard the batch instead of running another forward, notify the
+        # in-flight clients explicitly (KV is freed wholesale by the reset below).
+        inflight_reqs = self._all_inflight_reqs()
+        self.abort_request(AbortReq(abort_all=True))
+        for req in inflight_reqs:
+            self.ipc_channels.send_to_tokenizer.send_output(
+                AbortReq(
+                    rid=req.rid,
+                    abort_message="Aborted by debug-mode recovery after "
+                    "a serving-time exception.",
+                ),
+                req,
+            )
+
+        # Wipe all memory pools wholesale so no KV is leaked across the reset.
+        self.tree_cache.reset()
+        self.req_to_token_pool.clear()
+        self.token_to_kv_pool_allocator.clear()
+        self.grammar_manager.clear()
+        if self.draft_worker:
+            self.draft_worker.clear_cache_pool()
+
+        # Reset loop-carried state to its __init__ values.
+        self.waiting_queue = []
+        self.running_batch = ScheduleBatch(reqs=[], batch_is_full=False)
+        self.last_batch = None
+        self.cur_batch_for_debug = None
+        self.chunked_req = None
+        # abort_request may have recorded a deferred chunked abort; drop it so the
+        # next iteration's process_pending_chunked_abort has no stale reference.
+        self._pending_chunked_abort_req = None
 
     def get_internal_state(self, recv_req: GetInternalStateReq):
         ret = dict(vars(get_server_args()))  # vars returns a ref to obj.__dict__
