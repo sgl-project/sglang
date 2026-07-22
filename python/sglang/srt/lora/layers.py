@@ -129,8 +129,6 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
 
         # Efficient embedding lookup for LoRA A (already support extra token embedding process)
         lora_a_output = self.run_lora_a_embedding(input_, batch_info)
-        if lora_a_output is None:
-            return base_output
 
         # Apply LoRA B weights using backend
         lora_output = self.lora_backend.run_lora_b_sgemm(
