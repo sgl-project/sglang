@@ -19,7 +19,7 @@ on:
         default: ''
         type: string
       publish_target_dir:
-        description: 'Remote target directory in sgl-project/ci-data. Leave empty to use sglang_generated, or official_generated when run_official_cases is true.'
+        description: 'Remote target directory in sgl-project/ci-data-diffusion. Leave empty to use sglang_generated, or official_generated when run_official_cases is true.'
         required: false
         default: ''
         type: string
@@ -44,7 +44,7 @@ on:
         default: ''
         type: string
       ci_data_ref:
-        description: 'ci-data ref to use for repro scripts when running official GT cases.'
+        description: 'ci-data-diffusion ref to use for repro scripts when running official GT cases.'
         required: false
         default: 'main'
         type: string
@@ -71,6 +71,16 @@ jobs:
       matrix: ${{ steps.compute.outputs.matrix }}
       case-count: ${{ steps.compute.outputs.case-count }}
     steps:
+      - name: Verify write access to sgl-project/ci-data-diffusion
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
+        run: |
+          if [ "$(gh api repos/sgl-project/ci-data-diffusion --jq .permissions.push)" != "true" ]; then
+            echo "::error::GH_PAT_FOR_NIGHTLY_CI_DATA lacks write (push) access to sgl-project/ci-data-diffusion. Grant it before running GT generation."
+            exit 1
+          fi
+          echo "OK: write access to sgl-project/ci-data-diffusion confirmed"
+
       - name: Compute official case matrix
         id: compute
         env:
@@ -163,10 +173,10 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
 
-      - name: Checkout ci-data repro scripts
+      - name: Checkout ci-data-diffusion repro scripts
         uses: actions/checkout@v4
         with:
-          repository: sgl-project/ci-data
+          repository: sgl-project/ci-data-diffusion
           ref: ${{ inputs.ci_data_ref || 'main' }}
           path: ci-data
           token: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
@@ -303,7 +313,7 @@ jobs:
             --target-dir "${{ env.PUBLISH_TARGET_DIR }}" \
             --check-only
 
-      - name: Publish official GT images to sgl-project/ci-data
+      - name: Publish official GT images to sgl-project/ci-data-diffusion
         env:
           GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
         run: |
@@ -334,6 +344,16 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
+
+      - name: Verify write access to sgl-project/ci-data-diffusion
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
+        run: |
+          if [ "$(gh api repos/sgl-project/ci-data-diffusion --jq .permissions.push)" != "true" ]; then
+            echo "::error::GH_PAT_FOR_NIGHTLY_CI_DATA lacks write (push) access to sgl-project/ci-data-diffusion. Grant it before running GT generation."
+            exit 1
+          fi
+          echo "OK: write access to sgl-project/ci-data-diffusion confirmed"
 
       - name: Compute partitions
         id: compute
@@ -412,7 +432,7 @@ jobs:
             --target-dir "${{ env.PUBLISH_TARGET_DIR }}" \
             --check-only
 
-      - name: Publish GT images to sgl-project/ci-data
+      - name: Publish GT images to sgl-project/ci-data-diffusion
         env:
           GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
         run: |
@@ -487,7 +507,7 @@ jobs:
             --target-dir "${{ env.PUBLISH_TARGET_DIR }}" \
             --check-only
 
-      - name: Publish GT images to sgl-project/ci-data
+      - name: Publish GT images to sgl-project/ci-data-diffusion
         env:
           GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
         run: |
@@ -562,7 +582,7 @@ jobs:
             --target-dir "${{ env.PUBLISH_TARGET_DIR }}" \
             --check-only
 
-      - name: Publish GT images to sgl-project/ci-data
+      - name: Publish GT images to sgl-project/ci-data-diffusion
         env:
           GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
         run: |
