@@ -241,7 +241,7 @@ from sglang.srt.observability.trace import process_tracing_init, trace_set_threa
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.platforms import current_platform
 from sglang.srt.plugins import load_plugins
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.server_args import PortArgs, ServerArgs
@@ -786,6 +786,11 @@ class Scheduler(
         )
 
         if self.server_args.speculative_draft_load_format is not None:
+            # Write the draft load_format onto server_args (not just the bag):
+            # the draft worker is built from a copy of self.server_args and
+            # build_load_config reads server_args.load_format, so a bag-only
+            # override would be ignored and the draft would load in the target's
+            # format.
             self.server_args.override(
                 "scheduler.draft_load_format",
                 load_format=self.server_args.speculative_draft_load_format,
@@ -890,8 +895,8 @@ class Scheduler(
             self.min_free_slots_delayer = MinFreeSlotsDelayer(
                 min_free_slots=min_free_slots
             )
-        if not get_server_args().pp_max_micro_batch_size:
-            get_server_args().override(
+        if not get_parallel().pp_max_micro_batch_size:
+            get_context().override(
                 "scheduler.pp_max_micro_batch_size_default",
                 pp_max_micro_batch_size=max(
                     self.max_running_requests // self.ps.pp_size, 1
@@ -1460,11 +1465,9 @@ class Scheduler(
         # HostKVCache.destroy. Called from run_scheduler_process's finally.
         if self.hisparse_coordinator is not None:
             self.hisparse_coordinator.destroy()
-        # A plain HiRadixCache (no hisparse) also holds a large pinned host KV
-        # pool; unregister it here too, else the kernel unpins it during reclaim.
-        host_pool = getattr(self.tree_cache, "token_to_kv_pool_host", None)
-        if host_pool is not None:
-            host_pool.destroy()
+        self.tree_cache.release_host_resources()
+        if self.decode_offload_manager is not None:
+            self.decode_offload_manager.release_host_resources()
 
     def run_event_loop(self) -> None:
         """Run the scheduler's event loop.
@@ -1646,18 +1649,33 @@ class Scheduler(
             and last_batch_is_extend
         )
 
-        # We do not support overlap + spec + grammar yet,
-        # so we need to turn off overlap for this batch.
-        # TODO(lsyin): support overlap + spec + grammar
+        # Spec algorithms that don't advance the grammar FSM inside verify() (see
+        # supports_grammar_overlap) still need overlap forced off for grammar decode
+        # batches, so the FSM is advanced before the next batch's bitmask.
         need_grammar_sync = (
             batch
             and not batch.spec_algorithm.is_none()
+            and not batch.spec_algorithm.supports_grammar_overlap()
             and batch.has_grammar
             and batch.forward_mode.is_decode()
             and len(self.result_queue) > 0
         )
 
+        # Algorithms that support grammar overlap advance the FSM inside verify()
+        # via the grammar barrier (overlapping the target forward), which resolves
+        # whatever result is still pending in the queue — including the
+        # extend->decode boundary — so no grammar-specific overlap disable is needed.
         return disable_overlap_for_batch or need_grammar_sync
+
+    def _advance_pending_grammar(self):
+        """Grammar barrier (spec-v2 overlap): advance the FSM over any not-yet
+        -processed decode result still in the queue, so a following verify()'s
+        bitmask sees the previous batch's committed tokens. Invoked mid-worker
+        (before generate_token_bitmask) so the CPU advance overlaps the target
+        verify forward. Idempotent; no-op when the queue is empty or has no grammar.
+        """
+        for prev_batch, prev_result in self.result_queue:
+            self.batch_result_processor.advance_grammar_fsm(prev_result, prev_batch)
 
     @scheduler_nvtx_method("scheduler.process_input_requests")
     def process_input_requests(self, recv_reqs: List):
@@ -2822,7 +2840,7 @@ class Scheduler(
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
     def get_num_allocatable_reqs(self, running_bs):
-        res = get_server_args().pp_max_micro_batch_size - running_bs
+        res = get_parallel().pp_max_micro_batch_size - running_bs
         res = min(res, self.req_to_token_pool.available_size())
         return res
 
@@ -3337,15 +3355,19 @@ class Scheduler(
                         # Spec_v2 fires on_publish mid-worker (between verify and
                         # draft_extend) so schedule prep can overlap with draft_extend.
                         # Non-spec has no later work — scheduler publishes after return.
-                        fwd_kwargs = (
-                            {
-                                "on_publish": partial(
-                                    self.future_map.publish, future_indices
+                        fwd_kwargs = {}
+                        if not batch.spec_algorithm.is_none():
+                            fwd_kwargs["on_publish"] = partial(
+                                self.future_map.publish, future_indices
+                            )
+                            # Grammar-overlap-capable workers advance the grammar FSM
+                            # inside verify() before building the bitmask; hand them the
+                            # barrier that resolves the previous batch's committed
+                            # tokens (overlapping the target forward).
+                            if batch.spec_algorithm.supports_grammar_overlap():
+                                fwd_kwargs["grammar_barrier"] = (
+                                    self._advance_pending_grammar
                                 )
-                            }
-                            if not batch.spec_algorithm.is_none()
-                            else {}
-                        )
 
                         # FIXME: pp is not compatible with overlap
                         batch_result = self.model_worker.forward_batch_generation(
@@ -3874,7 +3896,9 @@ class Scheduler(
         return success
 
     def get_internal_state(self, recv_req: GetInternalStateReq):
-        ret = dict(vars(get_server_args()))  # vars returns a ref to obj.__dict__
+        # Resolved config (pristine server_args + post-publish overrides) so a
+        # readback reflects values changed via /set_internal_state, not startup.
+        ret = get_context().resolved_server_args_dict()
         ret["last_gen_throughput"] = self.metrics_reporter.last_gen_throughput
         ret["memory_usage"] = {
             "weight": round(self.tp_worker.model_runner.weight_load_mem_usage, 2),
@@ -3994,8 +4018,8 @@ class Scheduler(
             if remaining.pop("dspark_clear_info_records", None):
                 self.draft_worker.clear_info_records()
             if remaining:
-                get_server_args().override(source="update_server_args", **remaining)
-            logger.info(f"Global server args updated! {get_server_args()=}")
+                get_context().override(source="update_server_args", **remaining)
+            logger.info(f"Config updated via context override: {remaining}")
 
         return SetInternalStateReqOutput(updated=if_success)
 
