@@ -51,6 +51,17 @@ def _routing_kwargs(routing_data: RoutingData) -> dict:
     return {"routing_data": routing_data}
 
 
+def _gather_indx_for_matmul(
+    gather_indx: GatherIndx, routing_data: RoutingData
+) -> GatherIndx:
+    if not _MATMUL_OGS_USES_RAGGED_METADATA:
+        return gather_indx
+    src_indx = torch.div(
+        gather_indx.src_indx, routing_data.n_expts_act, rounding_mode="trunc"
+    )
+    return GatherIndx(src_indx, gather_indx.dst_indx)
+
+
 def _assert_unsupported_quant_args(
     use_fp8_w8a8: bool,
     per_channel_quant: bool,
@@ -176,6 +187,7 @@ def triton_kernel_fused_experts(
     E, _, N = w1.shape
     n_expts_act = routing_data.n_expts_act
     dtype = hidden_states.dtype
+    matmul_gather_indx = _gather_indx_for_matmul(gather_indx, routing_data)
 
     if global_num_experts == -1:
         global_num_experts = E
@@ -189,7 +201,7 @@ def triton_kernel_fused_experts(
         hidden_states,
         w1,
         None,
-        gather_indx=gather_indx,
+        gather_indx=matmul_gather_indx,
         gammas=routing_data.gate_scal if apply_router_weight_on_input else None,
         **_routing_kwargs(routing_data),
     )
@@ -330,6 +342,7 @@ def triton_kernel_fused_experts_with_bias(
     M, K = hidden_states.shape
     E, _, N = w1.shape
     n_expts_act = routing_data.n_expts_act
+    matmul_gather_indx = _gather_indx_for_matmul(gather_indx, routing_data)
 
     if global_num_experts == -1:
         global_num_experts = E
@@ -358,7 +371,7 @@ def triton_kernel_fused_experts_with_bias(
         hidden_states,
         w1,
         b1,
-        gather_indx=gather_indx,
+        gather_indx=matmul_gather_indx,
         precision_config=w1_pcg,
         gammas=routing_data.gate_scal if apply_router_weight_on_input else None,
         fused_activation=act,

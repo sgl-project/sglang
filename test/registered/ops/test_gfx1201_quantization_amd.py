@@ -1,4 +1,5 @@
 import unittest
+from unittest import mock
 
 import torch
 
@@ -222,8 +223,14 @@ class TestGfx1201Quantization(unittest.TestCase):
             self.skipTest("triton_kernels is not installed")
 
         from triton_kernels.matmul_ogs import FlexCtx, PrecisionConfig
-        from triton_kernels.numerics_details.mxfp import downcast_to_mxfp_torch
+        from triton_kernels.numerics_details.mxfp import (
+            downcast_to_mxfp_torch,
+            upcast_from_mxfp_torch,
+        )
 
+        from sglang.srt.layers.moe.fused_moe_triton import (
+            triton_kernels_moe,
+        )
         from sglang.srt.layers.moe.fused_moe_triton.triton_kernels_moe import (
             triton_kernel_fused_experts_with_bias,
         )
@@ -237,6 +244,19 @@ class TestGfx1201Quantization(unittest.TestCase):
         )
         logits = torch.randn(tokens, experts, device="cuda", dtype=torch.float32)
         routing_data, gather_indx, scatter_indx = routing(logits, n_expts_act=2)
+
+        torch.testing.assert_close(gather_indx.src_indx, scatter_indx.dst_indx)
+        with mock.patch.object(
+            triton_kernels_moe, "_MATMUL_OGS_USES_RAGGED_METADATA", True
+        ):
+            new_api_gather_indx = triton_kernels_moe._gather_indx_for_matmul(
+                gather_indx, routing_data
+            )
+        torch.testing.assert_close(
+            new_api_gather_indx.src_indx,
+            torch.div(gather_indx.src_indx, 2, rounding_mode="trunc"),
+        )
+        torch.testing.assert_close(new_api_gather_indx.dst_indx, gather_indx.dst_indx)
 
         w13 = torch.randn(
             experts,
@@ -252,13 +272,13 @@ class TestGfx1201Quantization(unittest.TestCase):
             device="cuda",
             dtype=torch.bfloat16,
         )
-        w13_fp4, w13_scale = downcast_to_mxfp_torch(w13, torch.uint8, axis=-1)
-        w2_fp4, w2_scale = downcast_to_mxfp_torch(w2, torch.uint8, axis=-1)
+        w13_fp4, w13_scale_raw = downcast_to_mxfp_torch(w13, torch.uint8, axis=-1)
+        w2_fp4, w2_scale_raw = downcast_to_mxfp_torch(w2, torch.uint8, axis=-1)
         w13_wrapped, w13_flex, w13_scale = _swizzle_mxfp4(
-            w13_fp4, w13_scale, num_warps=8, use_hbm_swizzle=False
+            w13_fp4, w13_scale_raw, num_warps=8, use_hbm_swizzle=False
         )
         w2_wrapped, w2_flex, w2_scale = _swizzle_mxfp4(
-            w2_fp4, w2_scale, num_warps=8, use_hbm_swizzle=False
+            w2_fp4, w2_scale_raw, num_warps=8, use_hbm_swizzle=False
         )
 
         actual = triton_kernel_fused_experts_with_bias(
@@ -283,7 +303,33 @@ class TestGfx1201Quantization(unittest.TestCase):
         )
 
         self.assertEqual(actual.shape, hidden_states.shape)
-        self.assertTrue(torch.isfinite(actual).all())
+        w13_dequant = upcast_from_mxfp_torch(
+            w13_fp4, w13_scale_raw, target_dtype=torch.bfloat16, axis=-1
+        )
+        w2_dequant = upcast_from_mxfp_torch(
+            w2_fp4, w2_scale_raw, target_dtype=torch.bfloat16, axis=-1
+        )
+        topk_logits, topk_ids = logits.topk(2, dim=-1)
+        topk_weights = torch.softmax(topk_logits, dim=-1)
+        expected = torch.zeros_like(hidden_states, dtype=torch.float32)
+        for token_id in range(tokens):
+            for route_id in range(2):
+                expert_id = int(topk_ids[token_id, route_id])
+                gate_up = (
+                    hidden_states[token_id].float() @ w13_dequant[expert_id].float().t()
+                )
+                gate = gate_up[::2].clamp(max=7.0)
+                linear = gate_up[1::2].clamp(min=-7.0, max=7.0)
+                activated = gate * torch.sigmoid(1.702 * gate) * (linear + 1)
+                expert_output = activated @ w2_dequant[expert_id].float().t()
+                expected[token_id] += expert_output * topk_weights[token_id, route_id]
+
+        torch.testing.assert_close(
+            actual.float(),
+            expected,
+            atol=2.0,
+            rtol=0.05,
+        )
 
 
 if __name__ == "__main__":

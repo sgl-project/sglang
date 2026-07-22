@@ -75,8 +75,7 @@ try:
             n_expts_act,
             ragged_metadata,
         )
-        gather_src_indx = torch.div(combine_indx, n_expts_act, rounding_mode="trunc")
-        gather_indx = GatherIndx(gather_src_indx, dispatch_indx)
+        gather_indx = GatherIndx(combine_indx, dispatch_indx)
         scatter_indx = ScatterIndx(dispatch_indx, combine_indx)
         return routing_data, gather_indx, scatter_indx
 

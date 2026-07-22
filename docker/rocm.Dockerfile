@@ -93,8 +93,6 @@ ARG SETUPTOOLS_SCM_PRETEND_VERSION=""
 
 ARG TRITON_REPO="https://github.com/triton-lang/triton.git"
 ARG TRITON_COMMIT="42270451990532c67e69d753fbd026f28fcc4840"
-# SGLang still imports matmul_ogs, which was renamed after this revision.
-ARG TRITON_KERNELS_COMMIT="4a24bf0b19a027ec0833b31cbc9ac29add7b17af"
 
 ARG AITER_REPO="https://github.com/ROCm/aiter.git"
 ARG AITER_COMMIT=""
@@ -645,8 +643,7 @@ RUN if [ "$BUILD_TRITON" = "1" ]; then \
      && git checkout ${TRITON_COMMIT} \
      && pip install -r python/requirements.txt \
      && pip install -e . \
-     && pip install --no-deps \
-          "git+${TRITON_REPO}@${TRITON_KERNELS_COMMIT}#subdirectory=python/triton_kernels"; \
+     && if [ -d python/triton_kernels ]; then pip install -e python/triton_kernels --no-deps; fi; \
     fi
 
 # -----------------------
