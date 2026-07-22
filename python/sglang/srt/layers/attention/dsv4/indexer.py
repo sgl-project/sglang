@@ -20,6 +20,9 @@ from sglang.srt.layers.attention.dsv4.metadata import (
     NonPagedIndexerPlan,
     PagedIndexerMetadata,
 )
+from sglang.srt.layers.attention.dsv4.shared_cache_access import (
+    get_dsv4_shared_cache_access,
+)
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
@@ -568,6 +571,7 @@ class C4IndexerBackendMixin:
         if forward_batch.forward_mode.is_idle():
             return
         token_to_kv_pool = self.token_to_kv_pool
+        shared_access = get_dsv4_shared_cache_access(token_to_kv_pool)
 
         if TYPE_CHECKING:
             assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
@@ -608,6 +612,9 @@ class C4IndexerBackendMixin:
                 forward_batch=forward_batch,
                 skip_compressor=skip_compressor,
             )
+
+        if shared_access is not None:
+            shared_access.publish_writes()
 
         use_fp4_indexer = c4_indexer.use_fp4_indexer
 
@@ -660,6 +667,48 @@ class C4IndexerBackendMixin:
         c4_seq_lens = match_num_queries(indexer_metadata.c4_seq_lens, value=1)
         _c4sl = c4_seq_lens
         page_table = match_num_queries(indexer_metadata.page_table, value=0)
+        # The indexer kernel needs physical pages for the rank-local VMM alias,
+        # while topk_transform must emit logical slots for the C4 attention
+        # cache.  Keep the logical table before translating the read table;
+        # otherwise the top-k result is a rank-local physical slot and the
+        # attention path translates it a second time.
+        logical_page_table = page_table
+        staged_indexer_kv_cache = None
+        if shared_access is not None:
+            common_physical_pages = getattr(
+                core_metadata, "shared_compressed_physical_pages", None
+            )
+            common_page_table = getattr(
+                core_metadata, "shared_compressed_page_table", None
+            )
+            stage_plan = None
+            if common_physical_pages is not None and common_page_table is not None:
+                stage_plan = (
+                    common_physical_pages["indexer"],
+                    match_num_queries(common_page_table, value=0),
+                )
+            else:
+                stage_plan = getattr(
+                    indexer_metadata, "_dsv4_shared_indexer_stage_plan", None
+                )
+            if stage_plan is None:
+                stage_plan = shared_access.prepare_indexer_pages(page_table)
+                indexer_metadata._dsv4_shared_indexer_stage_plan = stage_plan
+            physical_pages, page_table = stage_plan
+            staged_indexer_kv_cache = shared_access.stage_indexer_pages(
+                c4_indexer.layer_id, physical_pages
+            )
+            page_table = page_table.to(torch.int32)
+            if getattr(core_metadata, "shared_stage_c4", True):
+                # Publish the C4 family plan and make topk_transform emit
+                # compact slots directly into that staged cache. The compact
+                # order is common, but C4 physical page numbers differ from
+                # indexer pages.
+                if common_physical_pages is not None:
+                    core_metadata._dsv4_shared_c4_stage_plan = common_physical_pages[4]
+                else:
+                    core_metadata._dsv4_shared_c4_stage_plan = physical_pages
+                logical_page_table = page_table
         c4_sparse_page_indices = match_num_queries(
             core_metadata.c4_sparse_page_indices, value=-1
         )
@@ -687,9 +736,11 @@ class C4IndexerBackendMixin:
                 plan=nonpaged_plan,
             )
         else:
-            c4_indexer_kv_cache = token_to_kv_pool.get_index_k_with_scale_buffer(
-                layer_id=c4_indexer.layer_id,
-            )
+            c4_indexer_kv_cache = staged_indexer_kv_cache
+            if c4_indexer_kv_cache is None:
+                c4_indexer_kv_cache = token_to_kv_pool.get_index_k_with_scale_buffer(
+                    layer_id=c4_indexer.layer_id,
+                )
             assert c4_indexer_kv_cache.dim() == 2
             head_dim_with_sf = 68 if use_fp4_indexer else 132
             c4_indexer_kv_cache = c4_indexer_kv_cache.view(
@@ -732,7 +783,7 @@ class C4IndexerBackendMixin:
             topk_transform_512_pytorch_vectorized(
                 logits,
                 c4_seq_lens,
-                page_table,
+                logical_page_table,
                 c4_sparse_page_indices,
                 indexer_metadata.c4_page_size,
                 raw_indices,
@@ -741,7 +792,7 @@ class C4IndexerBackendMixin:
             topk_transform_512_v2(
                 logits,
                 c4_seq_lens,
-                page_table,
+                logical_page_table,
                 c4_sparse_page_indices,
                 indexer_metadata.c4_page_size,
                 indexer_metadata.topk_metadata,
@@ -750,7 +801,7 @@ class C4IndexerBackendMixin:
             topk_transform_512(
                 logits,
                 c4_seq_lens,
-                page_table,
+                logical_page_table,
                 c4_sparse_page_indices,
                 indexer_metadata.c4_page_size,
                 raw_indices,

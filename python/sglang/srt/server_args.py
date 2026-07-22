@@ -1056,6 +1056,11 @@ class ServerArgs:
         "Split DSA (DeepSeek Sparse Attention) GPU KV/indexer cache layers across context-parallel ranks to reduce per-rank KV memory. Currently only supported with the mooncake transfer backend (mooncake / mooncake_tcp); mori/nixl support will be added later by the community.",
         NS("parallel"),
     ] = False
+    enable_dsa_shared_kv_cache: A[
+        bool,
+        "Share DeepSeek V4 GPU KV/indexer cache pages across context-parallel ranks.",
+        NS("parallel"),
+    ] = False
     enable_dsa_prefill_context_parallel: A[bool, Arg(no_cli=True), NS("parallel")] = (
         False
     )
@@ -4688,6 +4693,12 @@ class ServerArgs:
         hf_config = self.get_model_config().hf_config
         model_arch = hf_config.architectures[0]
 
+        if self.enable_dsa_shared_kv_cache:
+            from sglang.srt.arg_groups.deepseek_v4_hook import (
+                validate_deepseek_v4_shared_target,
+            )
+
+            validate_deepseek_v4_shared_target(self, hf_config, model_arch)
         if self.enable_dsa_cache_layer_split and not is_deepseek_dsa(hf_config):
             raise ValueError(
                 "--enable-dsa-cache-layer-split is only supported for DSA "
@@ -4719,9 +4730,12 @@ class ServerArgs:
         ]:
             from sglang.srt.arg_groups.deepseek_v4_hook import (
                 apply_deepseek_v4_defaults,
+                validate_deepseek_v4_shared_release,
             )
 
             apply_deepseek_v4_defaults(self, model_arch)
+            if self.enable_dsa_shared_kv_cache:
+                validate_deepseek_v4_shared_release(self, hf_config)
 
         if model_arch in [
             "DeepseekV3ForCausalLM",

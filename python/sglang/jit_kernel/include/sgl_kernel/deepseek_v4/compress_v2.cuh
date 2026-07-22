@@ -12,6 +12,31 @@
 
 namespace device::compress {
 
+struct SharedStateLayout {
+  int32_t rank;
+  int32_t size;
+  int32_t pages_per_rank;
+
+  SGL_DEVICE int32_t translate_page(int32_t logical_page) const {
+    if (size == 1) return logical_page;
+    const int32_t owner = logical_page % size;
+    const int32_t owner_from_rank = (owner - rank + size) % size;
+    return owner_from_rank * pages_per_rank + logical_page / size;
+  }
+
+  template <int32_t kPageSize>
+  SGL_DEVICE int32_t translate_loc(int32_t logical_loc) const {
+    if (size == 1) return logical_loc;
+    const int32_t logical_page = logical_loc / kPageSize;
+    return translate_page(logical_page) * kPageSize + logical_loc % kPageSize;
+  }
+
+  template <int32_t kPageSize>
+  SGL_DEVICE bool owns_loc(int32_t logical_loc) const {
+    return size == 1 || (logical_loc / kPageSize) % size == rank;
+  }
+};
+
 /// \brief Per-batch decode plan. Layout: 16 bytes.
 struct alignas(16) DecodePlan {
   uint32_t seq_len;

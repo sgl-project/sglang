@@ -35,6 +35,7 @@ namespace {
 using PlanD = device::compress::DecodePlan;
 using PlanC = device::compress::CompressPlan;
 using PlanW = device::compress::WritePlan;
+using SharedStateLayout = device::compress::SharedStateLayout;
 
 /// \brief Each thread will handle this many elements (split along head_dim)
 constexpr int32_t kTileElements = 4;
@@ -50,6 +51,7 @@ struct Compress4DecodeParams {
   const void* __restrict__ score_bias;
   const PlanD* __restrict__ plan_d;
   uint32_t batch_size;
+  SharedStateLayout state_layout;
 };
 
 struct Compress4PrefillParams {
@@ -61,6 +63,7 @@ struct Compress4PrefillParams {
   const PlanW* __restrict__ plan_w;
   uint32_t num_compress;
   uint32_t num_write;
+  SharedStateLayout state_layout;
 };
 
 template <int64_t kHeadDim_>
@@ -273,12 +276,14 @@ C4_KERNEL void flash_c4_decode(const __grid_constant__ Compress4DecodeParams par
 
   const auto kv_src = kv_input + global_bid * Trait::kElementSize;
   const auto kv_out = kv_output + global_bid * Trait::kHeadDim;
-  const auto kv_buf_0 = kv_buffer + plan.read_page_0 * Trait::kPageElementSize;
-  const auto kv_buf_1 = kv_buffer + plan.read_page_1 * Trait::kPageElementSize;
-  const auto kv_dst = kv_buffer + plan.write_loc * Trait::kElementSize;
+  const auto kv_buf_0 = kv_buffer + params.state_layout.translate_page(plan.read_page_0) * Trait::kPageElementSize;
+  const auto kv_buf_1 = kv_buffer + params.state_layout.translate_page(plan.read_page_1) * Trait::kPageElementSize;
+  const auto kv_dst = kv_buffer + params.state_layout.translate_loc<4>(plan.write_loc) * Trait::kElementSize;
 
   PDLWaitPrimary<kUsePDL>();
-  c4_write_decode<Trait, BufferFloat, InputFloat>(kv_dst, kv_src);
+  if (params.state_layout.owns_loc<4>(plan.write_loc)) {
+    c4_write_decode<Trait, BufferFloat, InputFloat>(kv_dst, kv_src);
+  }
   if (plan.seq_len % 4 == 0) {
     const auto need_overlap = plan.seq_len > 4;
     c4_forward<Trait, kUsePDL, BufferFloat, InputFloat, OutFloat>(
@@ -308,8 +313,8 @@ C4_KERNEL void flash_c4_prefill(const __grid_constant__ Compress4PrefillParams p
   const auto kv_src = kv_input + plan.ragged_id * Trait::kElementSize;
   // Compact output: one row per compress plan, indexed by `global_pid`.
   const auto kv_out = kv_output + global_pid * Trait::kHeadDim;
-  const auto kv_buf_0 = kv_buffer + plan.read_page_0 * Trait::kPageElementSize;
-  const auto kv_buf_1 = kv_buffer + plan.read_page_1 * Trait::kPageElementSize;
+  const auto kv_buf_0 = kv_buffer + params.state_layout.translate_page(plan.read_page_0) * Trait::kPageElementSize;
+  const auto kv_buf_1 = kv_buffer + params.state_layout.translate_page(plan.read_page_1) * Trait::kPageElementSize;
   const bool need_overlap = plan.seq_len > 4;
   PDLWaitPrimary<kUsePDL>();
   c4_forward<Trait, kUsePDL, BufferFloat, InputFloat, OutFloat>(
@@ -335,10 +340,11 @@ WRITE_KERNEL void write_c4_prefill(const __grid_constant__ Compress4PrefillParam
   const auto kv_input = static_cast<const InputFloat*>(params.kv_input) + split_offset;
   const auto kv_buffer = static_cast<BufferFloat*>(params.kv_buffer) + split_offset;
   if (plan.is_invalid()) return;
+  if (!params.state_layout.owns_loc<4>(plan.write_loc)) return;
 
   // each warp will handle a contiguous region
   const auto kv_src = kv_input + plan.ragged_id * Trait::kElementSize;
-  const auto kv_buf = kv_buffer + plan.write_loc * Trait::kElementSize;
+  const auto kv_buf = kv_buffer + params.state_layout.translate_loc<4>(plan.write_loc) * Trait::kElementSize;
   const auto gmem_input = tile::Memory<StorageInput>::warp();
 
   PDLWaitPrimary<kUsePDL>();
@@ -390,7 +396,10 @@ struct FlashCompress4Kernel {
       const tvm::ffi::TensorView kv_input,
       const tvm::ffi::TensorView kv_output,
       const tvm::ffi::TensorView ape,
-      const tvm::ffi::TensorView plan_d_) {
+      const tvm::ffi::TensorView plan_d_,
+      int64_t shared_rank,
+      int64_t shared_size,
+      int64_t pages_per_rank) {
     using namespace host;
 
     auto N = SymbolicSize{"batch_size"};
@@ -423,6 +432,10 @@ struct FlashCompress4Kernel {
         .score_bias = ape.data_ptr(),
         .plan_d = plan_d,
         .batch_size = batch_size,
+        .state_layout =
+            {static_cast<int32_t>(shared_rank),
+             static_cast<int32_t>(shared_size),
+             static_cast<int32_t>(pages_per_rank)},
     };
     const uint32_t num_blocks = div_ceil(batch_size * kNumSplit, kWarpsPerBlock);
     LaunchKernel(num_blocks, kBlockSize, device_.unwrap())  //
@@ -435,7 +448,10 @@ struct FlashCompress4Kernel {
       const tvm::ffi::TensorView kv_output,
       const tvm::ffi::TensorView ape,
       const tvm::ffi::TensorView plan_c_,
-      const tvm::ffi::TensorView plan_w_) {
+      const tvm::ffi::TensorView plan_w_,
+      int64_t shared_rank,
+      int64_t shared_size,
+      int64_t pages_per_rank) {
     using namespace host;
 
     auto N = SymbolicSize{"num_q_tokens"};
@@ -475,6 +491,10 @@ struct FlashCompress4Kernel {
         .plan_w = plan_w,
         .num_compress = num_c,
         .num_write = num_w,
+        .state_layout =
+            {static_cast<int32_t>(shared_rank),
+             static_cast<int32_t>(shared_size),
+             static_cast<int32_t>(pages_per_rank)},
     };
     RuntimeCheck(num_q_tokens >= num_w, "invalid prefill plan: num_q < num_w");
     if (const auto num_c_blocks = div_ceil(num_c * kNumSplit, kWarpsPerBlock)) {

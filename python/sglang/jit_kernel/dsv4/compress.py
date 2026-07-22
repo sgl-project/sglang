@@ -377,6 +377,7 @@ def compress_forward(
     compress_ratio: Literal[4, 128],
     out: Optional[torch.Tensor] = None,
     is_online: bool = False,
+    shared_state_layout: tuple[int, int, int] = (0, 1, 0),
 ) -> torch.Tensor:
     if out is None:
         num_q_tokens = plan[1].shape[0]  # NOTE: decode = bs, prefill = dynamic
@@ -399,7 +400,18 @@ def compress_forward(
     else:
         fn = module.decode if plan.is_decode else module.prefill
 
-    fn(kv_score_buffer, kv_score_input, out, ape, *plan[1:3])
+    if _is_xpu or is_online:
+        assert shared_state_layout == (0, 1, 0)
+        fn(kv_score_buffer, kv_score_input, out, ape, *plan[1:3])
+    else:
+        fn(
+            kv_score_buffer,
+            kv_score_input,
+            out,
+            ape,
+            *plan[1:3],
+            *shared_state_layout,
+        )
     return out
 
 
@@ -415,6 +427,8 @@ def compress_norm_rope_store(
     page_size: int,
     use_fp4: bool = False,
     bf16_store: bool = False,
+    owner_rank: int = 0,
+    owner_size: int = 1,
 ) -> None:
     if use_fp4:
         assert kv.shape[-1] == 128
@@ -448,4 +462,6 @@ def compress_norm_rope_store(
             kvcache,
             plan.is_decode,
             plan.compress_ratio,
+            owner_rank,
+            owner_size,
         )

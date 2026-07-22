@@ -17,6 +17,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     PhaseConfig,
 )
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.server_args import PortArgs, ServerArgs, prepare_server_args
 from sglang.srt.server_args_config_parser import ConfigArgumentMerger
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -31,6 +32,12 @@ register_cpu_ci(est_time=12, suite="base-c-test-cpu")
 # Mock get_device() so all tests run on CPU-only CI runners
 _mock_device = patch("sglang.srt.server_args.get_device", return_value="cuda")
 _mock_device.start()
+
+
+class TestDsv4SharedKvRuntimeContext(CustomTestCase):
+    def test_shared_kv_flag_is_published_in_parallel_namespace(self):
+        with get_context().override_server_args(enable_dsa_shared_kv_cache=True):
+            self.assertTrue(get_parallel().enable_dsa_shared_kv_cache)
 
 
 class TestPrepareServerArgs(CustomTestCase):
@@ -383,6 +390,254 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, r"fp8_e4m3"):
             server_args._validate_hisparse_kv_cache_dtype()
+
+
+class TestDeepSeekV4SharedCacheArgs(unittest.TestCase):
+    @staticmethod
+    def _make_args(**overrides):
+        values = dict(
+            model_path="dummy",
+            enable_dsa_shared_kv_cache=True,
+            disaggregation_mode="null",
+            tp_size=8,
+            # Real CLI parsing reaches the DSV4 model hook with the dataclass
+            # default; validate_deepseek_v4_cp resolves it later in the same
+            # adjustment pass.
+            attn_cp_size=1,
+            enable_prefill_cp=True,
+            cp_strategy="interleave",
+            pp_size=1,
+            max_running_requests=1,
+            speculative_eagle_topk=1,
+        )
+        values.update(overrides)
+        args = ServerArgs(**values)
+        args.cuda_graph_config = CudaGraphConfig()
+        hf_config = SimpleNamespace(
+            architectures=["DeepseekV4ForCausalLM"],
+            num_hidden_layers=43,
+            compress_ratios=[0, 0] + [4, 128] * 20 + [4, 0],
+        )
+        args.get_model_config = lambda: SimpleNamespace(
+            hf_config=hf_config, nvfp4_moe_meta=None
+        )
+        return args
+
+    @staticmethod
+    def _adjust(args):
+        with (
+            patch(
+                "sglang.srt.configs.model_config.is_deepseek_dsa",
+                return_value=False,
+            ),
+            patch(
+                "sglang.srt.configs.model_config.is_deepseek_v4",
+                return_value=True,
+            ),
+            patch("sglang.srt.server_args.is_cuda", return_value=True),
+        ):
+            args._handle_model_specific_adjustments()
+
+    def test_accepts_valid_flash_prefill_l1_configuration(self):
+        args = self._make_args()
+
+        self._adjust(args)
+
+        self.assertTrue(args.enable_dsa_shared_kv_cache)
+        self.assertEqual(args.attn_cp_size, 8)
+
+    def test_rejects_layer_split_at_the_same_time(self):
+        args = self._make_args(enable_dsa_cache_layer_split=True)
+
+        with self.assertRaisesRegex(ValueError, "cannot be enabled together"):
+            self._adjust(args)
+
+    def test_rejects_l2_until_owner_restore_exists(self):
+        args = self._make_args(enable_hierarchical_cache=True)
+
+        with self.assertRaisesRegex(ValueError, "L2 hierarchical cache"):
+            self._adjust(args)
+
+    def test_accepts_prefill_pd_with_mooncake(self):
+        args = self._make_args(disaggregation_mode="prefill")
+
+        self._adjust(args)
+
+        self.assertEqual(args.disaggregation_mode, "prefill")
+        self.assertEqual(args.disaggregation_transfer_backend, "mooncake")
+
+    def test_rejects_shared_decode_and_non_mooncake_prefill(self):
+        cases = (
+            (dict(disaggregation_mode="decode"), "Prefill worker only"),
+            (
+                dict(
+                    disaggregation_mode="prefill",
+                    disaggregation_transfer_backend="nixl",
+                ),
+                "Mooncake",
+            ),
+        )
+        for overrides, message in cases:
+            with self.subTest(overrides=overrides):
+                with self.assertRaisesRegex(ValueError, message):
+                    self._adjust(self._make_args(**overrides))
+
+    def test_rejects_unvalidated_pro_layer_profile(self):
+        args = self._make_args()
+        hf_config = args.get_model_config().hf_config
+        hf_config.num_hidden_layers = 61
+        hf_config.compress_ratios = [128, 128] + [4, 128] * 29 + [4]
+
+        with self.assertRaisesRegex(ValueError, "43-layer Flash"):
+            self._adjust(args)
+
+    def test_rejects_draft_architectures(self):
+        for architecture in (
+            "DeepseekV4ForCausalLMNextN",
+            "DeepseekV4ForCausalLMDSpark",
+        ):
+            with self.subTest(architecture=architecture):
+                args = self._make_args()
+                args.get_model_config().hf_config.architectures = [architecture]
+
+                with self.assertRaisesRegex(ValueError, "target architecture"):
+                    self._adjust(args)
+
+    def test_requires_tp8_cp8(self):
+        args = self._make_args(tp_size=4, attn_cp_size=4)
+
+        with self.assertRaisesRegex(ValueError, "TP8/CP8"):
+            self._adjust(args)
+
+    def test_rejects_multi_request_host_sync_path(self):
+        args = self._make_args(max_running_requests=2)
+
+        with self.assertRaisesRegex(ValueError, "max-running-requests 1"):
+            self._adjust(args)
+
+    def test_rejects_unimplemented_memory_saver_lifecycle(self):
+        args = self._make_args(enable_memory_saver=True)
+
+        with self.assertRaisesRegex(ValueError, "memory saver"):
+            self._adjust(args)
+
+    def test_requires_compressor_v2(self):
+        args = self._make_args()
+
+        with (
+            envs.SGLANG_OPT_USE_COMPRESSOR_V2.override(False),
+            self.assertRaisesRegex(ValueError, "Compressor V2"),
+        ):
+            self._adjust(args)
+
+    def test_rejects_hisparse_speculative_pp_and_l3(self):
+        cases = (
+            (dict(enable_hisparse=True), "HiSparse"),
+            (dict(speculative_algorithm="EAGLE"), "speculative decoding"),
+            (dict(pp_size=2), "pipeline parallelism"),
+            (dict(hicache_storage_backend="file"), "L3 storage backend"),
+        )
+        for overrides, message in cases:
+            with self.subTest(overrides=overrides):
+                with self.assertRaisesRegex(ValueError, message):
+                    self._adjust(self._make_args(**overrides))
+
+    def test_dsv4_validation_replaces_generic_legacy_cp_alias(self):
+        from sglang.srt.arg_groups.deepseek_v4_hook import validate_deepseek_v4_cp
+
+        args = SimpleNamespace(
+            enable_prefill_cp=True,
+            cp_strategy="interleave",
+            enable_prefill_context_parallel=True,
+            enable_dsa_prefill_context_parallel=False,
+            dsa_prefill_cp_mode="in-seq-split",
+            enable_dp_attention=False,
+            moe_dense_tp_size=8,
+            attn_cp_size=1,
+            tp_size=8,
+            dp_size=1,
+            ep_size=1,
+            enable_dsa_shared_kv_cache=True,
+        )
+
+        with envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.override(None):
+            envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.clear()
+            validate_deepseek_v4_cp(args)
+            self.assertFalse(envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get())
+
+        self.assertFalse(args.enable_prefill_context_parallel)
+        self.assertTrue(args.enable_dsa_prefill_context_parallel)
+        self.assertEqual(args.dsa_prefill_cp_mode, "round-robin-split")
+
+    def test_dsv4_cp_preserves_generic_alias_without_shared(self):
+        from sglang.srt.arg_groups.deepseek_v4_hook import validate_deepseek_v4_cp
+
+        args = SimpleNamespace(
+            enable_prefill_cp=True,
+            cp_strategy="interleave",
+            enable_prefill_context_parallel=True,
+            enable_dsa_prefill_context_parallel=False,
+            dsa_prefill_cp_mode="in-seq-split",
+            enable_dp_attention=False,
+            moe_dense_tp_size=8,
+            attn_cp_size=1,
+            tp_size=8,
+            dp_size=1,
+            ep_size=1,
+            enable_dsa_shared_kv_cache=False,
+        )
+
+        with envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.override(True):
+            validate_deepseek_v4_cp(args)
+            self.assertFalse(envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get())
+
+        self.assertTrue(args.enable_prefill_context_parallel)
+        self.assertTrue(args.enable_dsa_prefill_context_parallel)
+        self.assertEqual(args.dsa_prefill_cp_mode, "round-robin-split")
+
+    def test_dsv4_cp_preserves_explicit_sparse_prefill_opt_in(self):
+        from sglang.srt.arg_groups.deepseek_v4_hook import validate_deepseek_v4_cp
+
+        args = SimpleNamespace(
+            enable_prefill_cp=True,
+            cp_strategy="interleave",
+            enable_prefill_context_parallel=True,
+            enable_dsa_prefill_context_parallel=False,
+            dsa_prefill_cp_mode="in-seq-split",
+            enable_dp_attention=False,
+            moe_dense_tp_size=8,
+            attn_cp_size=1,
+            tp_size=8,
+            dp_size=1,
+            ep_size=1,
+            enable_dsa_shared_kv_cache=True,
+        )
+
+        with envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.override(True):
+            validate_deepseek_v4_cp(args)
+            self.assertTrue(envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get())
+
+    def test_dsv4_cp_keeps_upstream_sparse_disable_without_shared(self):
+        from sglang.srt.arg_groups.deepseek_v4_hook import validate_deepseek_v4_cp
+
+        args = SimpleNamespace(
+            enable_prefill_cp=True,
+            cp_strategy="interleave",
+            enable_prefill_context_parallel=True,
+            enable_dsa_prefill_context_parallel=False,
+            dsa_prefill_cp_mode="in-seq-split",
+            enable_dp_attention=False,
+            moe_dense_tp_size=8,
+            attn_cp_size=1,
+            tp_size=8,
+            dp_size=1,
+            ep_size=1,
+            enable_dsa_shared_kv_cache=False,
+        )
+
+        with envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.override(True):
+            validate_deepseek_v4_cp(args)
+            self.assertFalse(envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get())
 
 
 class TestFa4PageSizeAutoForce(CustomTestCase):

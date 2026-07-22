@@ -48,6 +48,9 @@ from sglang.srt.layers.attention.dsa.utils import (
 )
 from sglang.srt.layers.attention.dsv4.compressor import Compressor
 from sglang.srt.layers.attention.dsv4.indexer import C4Indexer
+from sglang.srt.layers.attention.dsv4.shared_cache_access import (
+    get_dsv4_shared_cache_access,
+)
 from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.communicator_dsa_cp import (
     dsa_cp_gather_hidden_states,
@@ -918,8 +921,10 @@ class MQALayer(MqaAttentionBase):
 
         unified = is_unified_kv_triton()
         is_decode = forward_batch.forward_mode.is_decode_or_idle()
-        do_fused_store = (unified and is_decode) or (
-            not unified and self.use_fused_qk_norm_rope
+        token_to_kv_pool = get_token_to_kv_pool()
+        shared_owner_cache = get_dsv4_shared_cache_access(token_to_kv_pool) is not None
+        do_fused_store = not shared_owner_cache and (
+            (unified and is_decode) or (not unified and self.use_fused_qk_norm_rope)
         )
 
         if do_fused_store:
@@ -940,7 +945,6 @@ class MQALayer(MqaAttentionBase):
                 else self.wkv(x_linear)[0]
             )
 
-            token_to_kv_pool = get_token_to_kv_pool()
             if unified:
                 swa_cache = token_to_kv_pool.get_unified_kv(self.layer_id)
                 # swa_loc is layer-independent; computed once per forward by the
@@ -1053,7 +1057,11 @@ class MQALayer(MqaAttentionBase):
                 )
             else:
                 self._compute_kv_to_cache(
-                    x_linear, positions, forward_batch, attn_backend, qkv_a=qkv_a
+                    x_linear,
+                    positions,
+                    forward_batch,
+                    attn_backend,
+                    qkv_a=qkv_a,
                 )
                 kv = None
 
@@ -1098,6 +1106,7 @@ class MQALayer(MqaAttentionBase):
             and self.alt_streams is not None
             and get_is_capture_mode()
             and x.shape[0] <= self._multi_stream_bs_limit
+            and get_dsv4_shared_cache_access(get_token_to_kv_pool()) is None
             and not (self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch))
             and not (_is_hip and self.compressor is None)
         )
@@ -2505,6 +2514,10 @@ class DeepseekV4ForCausalLM(nn.Module):
                     metadata = attn_backend.forward_metadata
                     core_meta = metadata.core_attn_metadata
                     core_meta.apply_cp_reindex()
+                    attn_backend.prepare_shared_compressed_stage_plan(
+                        core_meta,
+                        single_request=forward_batch.batch_size == 1,
+                    )
                     core_meta.init_flashmla_related(is_prefill=True)
                     if metadata.indexer_metadata is not None:
                         metadata.indexer_metadata = (
