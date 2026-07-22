@@ -7,8 +7,7 @@ import triton
 
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=17, suite="base-b-kernel-unit-1-gpu-large")
-register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
+register_cuda_ci(est_time=17, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 
 def torch_concat_mla_k(
@@ -59,7 +58,7 @@ def jit_concat_mla_k(
     k: torch.Tensor, k_nope: torch.Tensor, k_rope: torch.Tensor
 ) -> None:
     """JIT compiled implementation."""
-    from sglang.jit_kernel.concat_mla import concat_mla_k
+    from sglang.kernels.ops.attention.concat_mla import concat_mla_k
 
     concat_mla_k(k, k_nope, k_rope)
 
@@ -68,7 +67,7 @@ def jit_concat_mla_absorb_q(
     a: torch.Tensor, b: torch.Tensor, out: torch.Tensor
 ) -> None:
     """JIT compiled implementation - wrapper for test compatibility."""
-    from sglang.jit_kernel.concat_mla import concat_mla_absorb_q
+    from sglang.kernels.ops.attention.concat_mla import concat_mla_absorb_q
 
     result = concat_mla_absorb_q(a, b)
     out.copy_(result)

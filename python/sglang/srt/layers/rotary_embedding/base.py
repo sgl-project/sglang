@@ -7,10 +7,11 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.platforms import current_platform
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -24,7 +25,9 @@ from sglang.srt.utils import (
 )
 
 if TYPE_CHECKING:
-    from sglang.jit_kernel.rope import FusedSetKVBufferArg  # For type check-only
+    from sglang.kernels.ops.attention.rope import (
+        FusedSetKVBufferArg,  # For type check-only
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +42,7 @@ _is_musa = is_musa()
 _is_mps = is_mps()
 
 if _is_cuda:
-    from sglang.jit_kernel.rope import apply_rope_with_cos_sin_cache_inplace
+    from sglang.kernels.ops.attention.rope import apply_rope_with_cos_sin_cache_inplace
 
 if _is_npu:
     import torch_npu
@@ -64,7 +67,7 @@ if _is_npu:
         )
 
 if _is_hip:
-    from sglang.srt.layers.attention.utils import (
+    from sglang.kernels.ops.attention.utils import (
         fused_qk_rope_reshape_and_cache,
     )
 
@@ -93,8 +96,8 @@ class RotaryEmbedding(MultiPlatformOp):
         self.dtype = dtype
 
         cache = self._compute_cos_sin_cache()
-        # NOTE(ByronHsu): cache needs to be in FP32 for numerical stability
-        if not _is_cuda:
+        # NOTE(ByronHsu): cache needs to be in FP32 for numerical stability.
+        if not (_is_cuda or _is_xpu or envs.SGLANG_ROPE_CACHE_FP32.get()):
             cache = cache.to(dtype)
 
         if (
@@ -106,10 +109,10 @@ class RotaryEmbedding(MultiPlatformOp):
             and not (_is_mps)
             and not (current_platform.is_out_of_tree())
         ):
-            # rotary_embedding from sglang.jit_kernel.rope and vllm._custom_ops has the same implementation.
+            # rotary_embedding from sglang.kernels.ops.attention.rope and vllm._custom_ops has the same implementation.
             # TODO: Test on different devices and remove this conditional.
             if _is_cuda:
-                from sglang.jit_kernel.rope import rotary_embedding
+                from sglang.kernels.ops.attention.rope import rotary_embedding
             elif _is_hip:
                 from sgl_kernel import rotary_embedding
             else:
@@ -126,7 +129,7 @@ class RotaryEmbedding(MultiPlatformOp):
         self._apply_rotary_emb_wrapped = apply_rotary_emb
 
         # XXX (MUSA): Implement sgl_kernel.rotary_embedding support for MUSA backend
-        if get_global_server_args().rl_on_policy_target is not None or _is_musa:
+        if get_server_args().rl_on_policy_target is not None or _is_musa:
             self._forward_method = self.forward_native
             self._apply_rotary_emb_wrapped = torch.compile(
                 dynamic=True,
@@ -150,7 +153,7 @@ class RotaryEmbedding(MultiPlatformOp):
         # create the cache on GPU for faster initialization. This may cause
         # a slight numerical difference between the HF implementation and ours.
         init_device = (
-            "cpu" if get_global_server_args().rl_on_policy_target is not None else None
+            "cpu" if get_server_args().rl_on_policy_target is not None else None
         )
         inv_freq = 1.0 / (
             base
@@ -161,7 +164,7 @@ class RotaryEmbedding(MultiPlatformOp):
                 / self.rotary_dim
             )
         )
-        if get_global_server_args().rl_on_policy_target is not None:
+        if get_server_args().rl_on_policy_target is not None:
             inv_freq = inv_freq.cuda()
         return inv_freq
 
@@ -178,8 +181,6 @@ class RotaryEmbedding(MultiPlatformOp):
 
     def _ensure_cos_sin_cache_length(self, needed_max_pos: int):
         """Ensure cos_sin_cache length > needed_max_pos."""
-        from sglang.srt.environ import envs
-
         cur_len = int(self.cos_sin_cache.shape[0])
         if needed_max_pos < cur_len:
             return
@@ -294,10 +295,7 @@ class RotaryEmbedding(MultiPlatformOp):
             else:
                 cos_sin = self.cos_sin_cache.index_select(0, positions)
 
-            if (
-                fused_rope_qk_mqa is not None
-                and query.shape[0] * query.shape[1] < 65535
-            ):
+            if fused_rope_qk_mqa is not None and query.shape[0] < 65535:
                 return fused_rope_qk_mqa(
                     query,
                     key,

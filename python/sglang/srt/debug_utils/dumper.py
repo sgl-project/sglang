@@ -22,7 +22,7 @@ import torch
 import torch.distributed as dist
 import zmq
 
-from sglang.srt.managers.io_struct import sock_recv, sock_send
+from sglang.srt.managers.io_struct import sock_recv, sock_send, wrap_as_pickle
 
 # -------------------------------------- config base ------------------------------------------
 
@@ -315,6 +315,8 @@ class _Dumper:
         model: "torch.nn.Module",
         name_prefix: str = "param",
         save: bool = True,
+        get_grad: Optional[Callable] = None,
+        step: Optional[int] = None,
         **kwargs,
     ) -> None:
         for param_name, param in model.named_parameters():
@@ -332,6 +334,8 @@ class _Dumper:
                 enable_future_grad=False,
                 value_tag="Dumper.ParamValue",
                 grad_tag="Dumper.ParamGrad",
+                get_grad=get_grad,
+                step=step,
             )
 
     def dump_dict(self, name_prefix, data, save: bool = True, **kwargs):
@@ -469,6 +473,8 @@ class _Dumper:
         value_meta_only_fields: Optional[dict] = None,
         grad_meta_only_fields: Optional[dict] = None,
         grafter_extras: Optional[dict] = None,
+        get_grad: Optional[Callable] = None,
+        step: Optional[int] = None,
     ) -> None:
         self._http_manager  # noqa: B018
 
@@ -499,19 +505,22 @@ class _Dumper:
                 tags=tags,
                 value=value,
                 save=save,
+                step=step,
                 meta_only_fields={**(value_meta_only_fields or {}), **recompute_meta},
             )
 
-        if (
-            enable_curr_grad
-            and isinstance(value, torch.Tensor)
-            and (g := value.grad) is not None
-        ):
+        if enable_curr_grad and isinstance(value, torch.Tensor):
+            g = get_grad(value) if get_grad is not None else value.grad
+        else:
+            g = None
+
+        if g is not None:
             self._dump_single(
                 tag=grad_tag,
                 tags={**tags, "name": f"grad__{name}"},
                 value=g,
                 save=save,
+                step=step,
                 meta_only_fields={**(grad_meta_only_fields or {}), **recompute_meta},
             )
 
@@ -1440,7 +1449,7 @@ def _create_zmq_rpc_broadcast(
             except Exception as e:
                 _log(f"[ZmqRpc] error inside handler: {e}")
                 resp = {"result": None, "error": str(e)}
-            sock_send(sock, resp)
+            sock_send(sock, wrap_as_pickle(resp))
 
     thread = threading.Thread(target=serve_loop, daemon=True)
     thread.start()
@@ -1479,11 +1488,13 @@ class _ZmqRpcHandle:
         def call(*args, **kwargs):
             sock_send(
                 self._socket,
-                {
-                    "method": method_name,
-                    "args": args,
-                    "kwargs": kwargs,
-                },
+                wrap_as_pickle(
+                    {
+                        "method": method_name,
+                        "args": args,
+                        "kwargs": kwargs,
+                    }
+                ),
             )
             response = sock_recv(self._socket)
             if response["error"]:
@@ -1710,30 +1721,32 @@ class _SGLangPlugin(_FrameworkPlugin):
 
         info = {}
 
+        from sglang.srt.runtime_context import get_parallel
+
         try:
-            info["tp_rank"] = self._dist.get_tensor_model_parallel_rank()
-            info["tp_size"] = self._dist.get_tensor_model_parallel_world_size()
-            info["pp_rank"] = self._dist.get_pipeline_model_parallel_rank()
-            info["pp_size"] = self._dist.get_pipeline_model_parallel_world_size()
-            info["moe_ep_rank"] = self._dist.get_moe_expert_parallel_rank()
-            info["moe_ep_size"] = self._dist.get_moe_expert_parallel_world_size()
-            info["moe_tp_rank"] = self._dist.get_moe_tensor_parallel_rank()
-            info["moe_tp_size"] = self._dist.get_moe_tensor_parallel_world_size()
-            info["moe_dp_rank"] = self._dist.get_moe_data_parallel_rank()
-            info["moe_dp_size"] = self._dist.get_moe_data_parallel_world_size()
+            parallel = get_parallel()
+            info["tp_rank"] = parallel.tp_rank
+            info["tp_size"] = parallel.tp_size
+            info["pp_rank"] = parallel.pp_rank
+            info["pp_size"] = parallel.pp_size
+            info["moe_ep_rank"] = parallel.moe_ep_rank
+            info["moe_ep_size"] = parallel.moe_ep_size
+            info["moe_tp_rank"] = parallel.moe_tp_rank
+            info["moe_tp_size"] = parallel.moe_tp_size
+            info["moe_dp_rank"] = parallel.moe_dp_rank
+            info["moe_dp_size"] = parallel.moe_dp_size
         except (AttributeError, AssertionError):
             info["distributed_error"] = True
 
         try:
+            parallel = get_parallel()
             info["enable_dp_attention"] = self._dp_attn.is_dp_attention_enabled()
-            info["attn_tp_rank"] = self._dp_attn.get_attention_tp_rank()
-            info["attn_tp_size"] = self._dp_attn.get_attention_tp_size()
+            info["attn_tp_rank"] = parallel.attn_tp_rank
+            info["attn_tp_size"] = parallel.attn_tp_size
             info["attn_dp_rank"] = self._dp_attn.get_attention_dp_rank()
             info["attn_dp_size"] = self._dp_attn.get_attention_dp_size()
-            info["local_attn_dp_rank"] = self._dp_attn.get_local_attention_dp_rank()
-            info["local_attn_dp_size"] = self._dp_attn.get_local_attention_dp_size()
-            info["attn_cp_rank"] = self._dp_attn.get_attention_cp_rank()
-            info["attn_cp_size"] = self._dp_attn.get_attention_cp_size()
+            info["attn_cp_rank"] = parallel.attn_cp_rank
+            info["attn_cp_size"] = parallel.attn_cp_size
         except (AttributeError, AssertionError):
             info["dp_attention_error"] = True
 
@@ -1779,9 +1792,9 @@ class _SGLangPlugin(_FrameworkPlugin):
             return None
 
         try:
-            from sglang.srt.server_args import get_global_server_args
+            from sglang.srt.runtime_context import get_server_args
 
-            args = get_global_server_args()
+            args = get_server_args()
             if args is None:
                 return None
 

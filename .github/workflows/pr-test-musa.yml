@@ -77,9 +77,9 @@ jobs:
             multimodal_gen:
               - "python/pyproject_other.toml"
               - "python/sglang/multimodal_gen/runtime/platforms/musa.py"
-              - "python/sglang/multimodal_gen/test/layers/test_musa_rmsnorm.py"
-              - "python/sglang/multimodal_gen/test/layers/test_musa_silu_and_mul.py"
-              - "python/sglang/multimodal_gen/test/run_suite_musa.py"
+              - "python/sglang/multimodal_gen/test/unit/musa/layers/test_musa_rmsnorm.py"
+              - "python/sglang/multimodal_gen/test/unit/musa/layers/test_musa_silu_and_mul.py"
+              - "python/sglang/multimodal_gen/test/server/musa/run_suite.py"
               - "python/sglang/multimodal_gen/test/server/musa/**"
             sgl_kernel:
               - ".github/workflows/pr-test-musa.yml"
@@ -127,7 +127,7 @@ jobs:
           RUNAI_STREAMER_MEMORY_LIMIT: 0
         run: |
           cd python
-          python3 sglang/multimodal_gen/test/run_suite_musa.py \
+          python3 sglang/multimodal_gen/test/server/musa/run_suite.py \
             --suite 1-gpu-musa \
             --partition-id ${{ matrix.part }} \
             --total-partitions 2
@@ -162,7 +162,7 @@ jobs:
           RUNAI_STREAMER_MEMORY_LIMIT: 0
         run: |
           cd python
-          python3 sglang/multimodal_gen/test/run_suite_musa.py \
+          python3 sglang/multimodal_gen/test/server/musa/run_suite.py \
             --suite 2-gpu-musa
 
   multimodal-gen-layer-unit-test-musa:
@@ -190,8 +190,8 @@ jobs:
       - name: Run multimodal gen layer unit test
         timeout-minutes: 30
         run: |
-          pytest python/sglang/multimodal_gen/test/layers/test_musa_rmsnorm.py
-          pytest python/sglang/multimodal_gen/test/layers/test_musa_silu_and_mul.py
+          pytest python/sglang/multimodal_gen/test/unit/musa/layers/test_musa_rmsnorm.py
+          pytest python/sglang/multimodal_gen/test/unit/musa/layers/test_musa_silu_and_mul.py
 
 # =============================================== sgl-kernel ====================================================
   sgl-kernel-unit-test-musa:
@@ -217,7 +217,6 @@ jobs:
       - name: Run sgl-kernel test
         timeout-minutes: 20
         run: |
-          pytest sgl-kernel/tests/test_dsv3_router_gemm.py
           pytest sgl-kernel/tests/test_per_token_quant_fp8.py
           pytest sgl-kernel/tests/speculative/test_eagle_utils.py
           pytest sgl-kernel/tests/speculative/test_ngram_utils.py

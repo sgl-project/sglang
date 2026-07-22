@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from sglang.srt.layers.moe.topk import biased_grouped_topk_gpu, biased_grouped_topk_impl
+from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=2, suite="nightly-1-gpu", nightly=True)
@@ -29,11 +30,12 @@ def test_fused_topk_deepseek(seq_length, params, apply_routed_scaling_factor_on_
     """
     num_experts, num_expert_group, topk_group, topk = params
     dtype = torch.float32
+    device = get_device()
 
     torch.manual_seed(seq_length)
-    hidden_states = torch.randn(seq_length, 128, dtype=dtype, device="cuda")
-    gating_output = torch.randn(seq_length, num_experts, dtype=dtype, device="cuda")
-    correction_bias = torch.randn(num_experts, dtype=dtype, device="cuda")
+    hidden_states = torch.randn(seq_length, 128, dtype=dtype, device=device)
+    gating_output = torch.randn(seq_length, num_experts, dtype=dtype, device=device)
+    correction_bias = torch.randn(num_experts, dtype=dtype, device=device)
 
     routed_scaling_factor = 2.5 if apply_routed_scaling_factor_on_output else None
 
@@ -71,8 +73,8 @@ def test_fused_topk_deepseek(seq_length, params, apply_routed_scaling_factor_on_
     sum_check = torch.allclose(output_sum, ref_output_sum, rtol=1e-03, atol=1e-04)
 
     # Check 2: Scatter-based comparison with allowance for tie-breaking
-    res = torch.zeros(seq_length, num_experts, dtype=torch.float32, device="cuda")
-    ref = torch.zeros(seq_length, num_experts, dtype=torch.float32, device="cuda")
+    res = torch.zeros(seq_length, num_experts, dtype=torch.float32, device=device)
+    ref = torch.zeros(seq_length, num_experts, dtype=torch.float32, device=device)
 
     res.scatter_(1, indices.long(), output)
     ref.scatter_(1, ref_indices.long(), ref_output)

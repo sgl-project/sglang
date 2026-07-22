@@ -14,10 +14,10 @@ from typing import Optional
 import pytest
 import torch
 
-from sglang.jit_kernel.kpool_topk_transform import fast_kpool_topk_transform_fused
+from sglang.kernels.ops.moe.kpool_topk_transform import fast_kpool_topk_transform_fused
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=60, suite="base-b-kernel-unit-1-gpu-large")
+register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 
 def _ref_torch_kpool_transform_impl(

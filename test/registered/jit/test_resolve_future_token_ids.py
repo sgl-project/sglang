@@ -3,12 +3,13 @@ import sys
 import pytest
 import torch
 
-from sglang.jit_kernel.resolve_future_token_ids import resolve_future_token_ids_cuda
+from sglang.kernels.ops.speculative.resolve_future_token_ids import (
+    resolve_future_token_ids_cuda,
+)
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=9, suite="base-b-kernel-unit-1-gpu-large")
-register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
-register_amd_ci(est_time=9, suite="jit-kernel-unit-test-amd")
+register_cuda_ci(est_time=9, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_amd_ci(est_time=9, stage="jit-kernel-unit", runner_config="amd")
 
 
 def _reference_resolve(input_ids, future_map):

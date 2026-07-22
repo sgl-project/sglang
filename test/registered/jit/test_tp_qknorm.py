@@ -14,14 +14,14 @@ import torch.distributed as dist
 import triton
 
 import sglang.srt.distributed.parallel_state as ps
-from sglang.jit_kernel.all_reduce import (
-    _jit_custom_all_reduce_push_module,
-    _jit_fused_parallel_qknorm_module,
-    fused_parallel_qknorm,
-)
-from sglang.jit_kernel.mp import register_comm_cleanup
 from sglang.jit_kernel.tests.utils import multigpu_pytest_main
-from sglang.jit_kernel.utils import cache_once
+from sglang.kernels.jit.utils import cache_once
+from sglang.kernels.ops.communication.all_reduce import (
+    fused_parallel_qknorm,
+    get_all_reduce_module,
+    get_fused_parallel_qknorm_module,
+)
+from sglang.kernels.ops.communication.mp import register_comm_cleanup
 from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
     CustomAllReduceV2,
 )
@@ -29,12 +29,8 @@ from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
     est_time=300,
-    suite="base-b-kernel-unit-8-gpu-h200",
-)
-register_cuda_ci(
-    est_time=300,
-    suite="nightly-kernel-8-gpu-h200",
-    nightly=True,
+    stage="extra-b",
+    runner_config="8-gpu-h200",
 )
 
 
@@ -59,9 +55,9 @@ def _compile_one(dtype: torch.dtype, world_size: int) -> None:
     Top-level so it survives ``spawn`` pickling. Compiled artifacts are
     cached on disk by ``tvm_ffi``; torchrun children will reuse them.
     """
-    _jit_custom_all_reduce_push_module(dtype, world_size)
+    get_all_reduce_module(dtype, world_size)
     for q_dim, k_dim in Q_K_DIMS:
-        _jit_fused_parallel_qknorm_module(dtype, world_size, q_dim, k_dim)
+        get_fused_parallel_qknorm_module(dtype, world_size, q_dim, k_dim)
 
 
 def _precompile_kernels(num_gpus: List[int]) -> None:
@@ -106,10 +102,16 @@ def _init_cpu_group_once() -> dist.ProcessGroup:
 
 @cache_once
 def _init_nccl_group_once() -> dist.ProcessGroup:
+    # Reference NCCL group allocated independently of the parallel_state
+    # world group, so the test does not couple to framework internals.
     _init_cpu_group_once()
-    coord = ps._WORLD
-    assert coord is not None and coord.device_group is not None
-    return coord.device_group
+    local_rank = int(os.environ["LOCAL_RANK"])
+    device_group = dist.new_group(
+        backend="nccl",
+        device_id=torch.device(f"cuda:{local_rank}"),
+    )
+    assert isinstance(device_group, dist.ProcessGroup)
+    return device_group
 
 
 @cache_once
@@ -118,7 +120,9 @@ def _init_comm_once() -> CustomAllReduceV2:
     device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
     max_pull_size = 0
     max_push_size = 8 * max(BATCH_SIZES)
-    comm = CustomAllReduceV2(cpu_group, device, max_pull_size, max_push_size)
+    comm = CustomAllReduceV2(
+        cpu_group, device, max_pull_size=max_pull_size, max_push_size=max_push_size
+    )
     if comm.disabled:
         raise RuntimeError("JIT CustomAllReduceV2 is disabled on this system")
     register_comm_cleanup(comm)

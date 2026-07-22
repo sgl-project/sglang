@@ -4,14 +4,13 @@ import sys
 import pytest
 import torch
 
-from sglang.jit_kernel.mxfp8 import (
+from sglang.kernels.ops.quantization.mxfp8 import (
     es_sm100_mxfp8_blockscaled_grouped_quant,
     es_sm100_mxfp8_blockscaled_moe_grouped_gemm,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=5, suite="base-b-kernel-unit-1-gpu-large")
-register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
+register_cuda_ci(est_time=5, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 
 def align(val: int, alignment: int = 128) -> int:

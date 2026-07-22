@@ -14,7 +14,7 @@ if not is_hip():
 if not torch.cuda.is_available():
     pytest.skip("Requires a GPU.", allow_module_level=True)
 
-from sglang.jit_kernel.minimax_m3.qk_norm_rope import (  # noqa: E402
+from sglang.kernels.ops.attention.minimax_m3_qk_norm_rope import (  # noqa: E402
     qk_gemma_rmsnorm_rope,
     sparse_qk_index_gemma_rmsnorm_rope,
     sparse_qk_index_gemma_rmsnorm_rope_cache,
@@ -22,7 +22,7 @@ from sglang.jit_kernel.minimax_m3.qk_norm_rope import (  # noqa: E402
 from sglang.test.ci.ci_register import register_amd_ci  # noqa: E402
 
 # ROCm-only fused kernel; runs in the AMD jit-kernel unit suite.
-register_amd_ci(est_time=30, suite="jit-kernel-unit-test-amd")
+register_amd_ci(est_time=30, stage="jit-kernel-unit", runner_config="amd")
 
 DEVICE = "cuda"
 EPS = 1e-6

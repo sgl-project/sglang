@@ -4,12 +4,16 @@ import torch
 import triton
 import triton.testing
 
-from sglang.jit_kernel.awq_dequantize import awq_dequantize as jit_awq_dequantize
 from sglang.jit_kernel.benchmark.utils import run_benchmark
+from sglang.kernels.ops.quantization.awq_dequantize import (
+    awq_dequantize as jit_awq_dequantize,
+)
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.utils import is_in_ci
 
-register_cuda_ci(est_time=5, suite="base-b-kernel-benchmark-1-gpu-large")
+register_cuda_ci(
+    est_time=5, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
+)
 
 try:
     from sgl_kernel import awq_dequantize as aot_awq_dequantize

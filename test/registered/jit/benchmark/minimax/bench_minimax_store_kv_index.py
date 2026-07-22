@@ -4,10 +4,13 @@ per-buffer index_put_ stores (main K, main V, index K, optional index V)."""
 import torch
 
 from sglang.jit_kernel.benchmark import marker
-from sglang.jit_kernel.minimax_store_kv_index import store_kv_index
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.kernels.ops.kvcache.minimax_store_kv_index import store_kv_index
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=6, suite="base-b-kernel-benchmark-1-gpu-large")
+register_cuda_ci(
+    est_time=6, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
+)
+register_amd_ci(est_time=6, stage="jit-kernel-benchmark", runner_config="amd")
 
 HEAD_DIM = 128
 NUM_KV_HEADS = 1

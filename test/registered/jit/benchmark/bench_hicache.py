@@ -26,14 +26,17 @@ import triton.testing
 from sgl_kernel import transfer_kv_all_layer, transfer_kv_per_layer
 
 from sglang.jit_kernel.benchmark.utils import DEFAULT_QUANTILES, get_benchmark_range
-from sglang.jit_kernel.hicache import (
+from sglang.kernels.ops.kvcache.hicache import (
     can_use_hicache_jit_kernel,
     transfer_hicache_all_layer,
     transfer_hicache_one_layer,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=29, suite="base-b-kernel-benchmark-1-gpu-large")
+register_cuda_ci(
+    est_time=29, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
+)
+register_amd_ci(est_time=29, stage="jit-kernel-benchmark", runner_config="amd")
 
 DISABLE_TORCH = os.environ.get("DISABLE_TORCH", "0") == "1"
 PAGE_SIZE = 1

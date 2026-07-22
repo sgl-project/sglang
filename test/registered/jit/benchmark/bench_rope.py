@@ -12,7 +12,9 @@ from sglang.jit_kernel.benchmark.utils import (
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=6, suite="base-b-kernel-benchmark-1-gpu-large")
+register_cuda_ci(
+    est_time=6, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
+)
 
 MAX_SEQ_LEN = 131072
 ROPE_BASE = 10000.0
@@ -73,7 +75,7 @@ def sglang_pos_enc_rope(
     positions: torch.Tensor,
     is_neox: bool,
 ) -> None:
-    from sglang.jit_kernel.rope import rotary_embedding_with_key
+    from sglang.kernels.ops.attention.rope import rotary_embedding_with_key
 
     head_size = q.shape[-1]
     rotary_embedding_with_key(
@@ -92,7 +94,7 @@ def sglang_fused_rope(
     positions: torch.Tensor,
     is_neox: bool,
 ) -> None:
-    from sglang.jit_kernel.rope import apply_rope_inplace
+    from sglang.kernels.ops.attention.rope import apply_rope_inplace
 
     apply_rope_inplace(q, k, COS_SIN_CACHE, positions, is_neox=is_neox)
 
@@ -112,8 +114,8 @@ def jit_rope_then_store(
     out_loc: torch.Tensor,
     is_neox: bool,
 ) -> None:
-    from sglang.jit_kernel.kvcache import store_cache
-    from sglang.jit_kernel.rope import apply_rope_inplace
+    from sglang.kernels.ops.attention.rope import apply_rope_inplace
+    from sglang.kernels.ops.kvcache.kvcache import store_cache
 
     head_size = q.shape[-1]
     row_dim = k.shape[-2] * head_size
@@ -144,7 +146,7 @@ def jit_fused_rope_store(
     out_loc: torch.Tensor,
     is_neox: bool,
 ) -> None:
-    from sglang.jit_kernel.rope import apply_rope_inplace_with_kvcache
+    from sglang.kernels.ops.attention.rope import apply_rope_inplace_with_kvcache
 
     apply_rope_inplace_with_kvcache(
         q, k, v, k_cache, v_cache, COS_SIN_CACHE, positions, out_loc, is_neox=is_neox

@@ -25,6 +25,7 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
 )
 from sglang.srt.layers.moe.topk import StandardTopKOutput, TopKOutput, TopKOutputChecker
 from sglang.srt.layers.moe.utils import (
+    get_moe_a2a_backend,
     get_moe_runner_backend,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
@@ -84,7 +85,6 @@ assert isinstance(StandardCombineInput, CombineInput)
 
 
 class StandardDispatcher(BaseDispatcher):
-
     def __init__(self, moe_runner_config: MoeRunnerConfig):
         super().__init__()
         self.moe_ep_size = get_parallel().moe_ep_size
@@ -92,6 +92,11 @@ class StandardDispatcher(BaseDispatcher):
         self.enable_flashinfer_cutlass_moe = backend.is_flashinfer_cutlass()
         self.enable_flashinfer_mxfp4_moe = backend.is_flashinfer_mxfp4()
         self.enable_flashinfer_trtllm_routed_moe = backend.is_flashinfer_trtllm_routed()
+        # AITER fast paths can be on while the MoE runner stays Triton; only the
+        # AITER runner keeps global expert IDs, so Triton must remap to local range.
+        self.use_aiter_moe_runner = backend.is_aiter() or (
+            backend.is_auto() and _use_aiter and get_moe_a2a_backend().supports_aiter()
+        )
         # Skip local expert mapping when the backend handles EP with global expert IDs:
         # - cutlass / cutedsl / trtllm_routed handle EP internally
         # - mxfp4 dispatcher mapping is already global
@@ -196,7 +201,7 @@ class StandardDispatcher(BaseDispatcher):
                     )
 
         if self.local_expert_mapping is not None and not self.skip_local_expert_mapping:
-            if _use_aiter:
+            if self.use_aiter_moe_runner and self.expert_mask_gpu is None:
                 self.expert_mask_gpu = (
                     (
                         (self.local_expert_mapping >= 0)
@@ -205,7 +210,7 @@ class StandardDispatcher(BaseDispatcher):
                     .to(torch.int32)
                     .to(device="cuda")
                 )
-            else:
+            elif not self.use_aiter_moe_runner:
                 if TopKOutputChecker.format_is_standard(topk_output):
                     topk_output = topk_output._replace(
                         topk_ids=self.local_expert_mapping[topk_output.topk_ids]

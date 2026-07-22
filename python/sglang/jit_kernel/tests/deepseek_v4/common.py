@@ -5,7 +5,11 @@ from typing import List, Literal, Optional, Tuple
 
 import torch
 
-from sglang.jit_kernel.dsv4 import CompressorDecodePlan, CompressorPrefillPlan
+from sglang.kernels.ops.attention.dsv4 import (
+    CompressorDecodePlan,
+    CompressorPrefillPlan,
+)
+from sglang.srt.utils import get_device
 
 
 @dataclass
@@ -46,7 +50,7 @@ class LegacyContext:
             seq_lens=seq_lens_cpu,
             extend_lens=extend_lens_cpu,
             num_q_tokens=num_q_tokens,
-            device=torch.device("cuda"),
+            device=torch.device(get_device()),
         )
 
     def make_decode_plan(self, seq_lens_gpu: torch.Tensor) -> CompressorDecodePlan:
@@ -103,7 +107,7 @@ class PagedContext:
             seq_lens=seq_lens_cpu,
             extend_lens=extend_lens_cpu,
             req_to_token=self.req_to_token,
-            full_to_swa=self.full_to_swa,
+            full_to_state=self.full_to_swa,
             swa_page_size=self.swa_page_size,
             ring_size=self.ring_size,
             num_q_tokens=num_q_tokens,
@@ -114,7 +118,7 @@ class PagedContext:
             compress_ratio=self.compress_ratio,  # type: ignore
             req_pool_indices=self.req_pool_indices,
             req_to_token=self.req_to_token,
-            full_to_swa=self.full_to_swa,
+            full_to_state=self.full_to_swa,
             seq_lens=seq_lens_gpu,
             swa_page_size=self.swa_page_size,
             ring_size=self.ring_size,
@@ -127,7 +131,7 @@ def make_legacy_context(
     head_dim: int = 512,
 ) -> LegacyContext:
     pages_per_req = 2 if compress_ratio == 4 else 1
-    req_pool_indices = torch.arange(bs, dtype=torch.int64, device="cuda")
+    req_pool_indices = torch.arange(bs, dtype=torch.int64, device=get_device())
     return LegacyContext(
         bs=bs,
         head_dim=head_dim,
@@ -171,9 +175,9 @@ def make_paged_context(
         swa_page_size=swa_page_size,
         ring_size=ring_size,
         num_swa_pages_per_req=num_swa_pages_per_req,
-        req_pool_indices=req_pool_indices.cuda(),
-        req_to_token=req_to_token.cuda(),
-        full_to_swa=full_to_swa.cuda(),
+        req_pool_indices=req_pool_indices.to(get_device()),
+        req_to_token=req_to_token.to(get_device()),
+        full_to_swa=full_to_swa.to(get_device()),
     )
 
 
@@ -182,7 +186,7 @@ def make_state_pool(num_pages: int, compress_ratio: int, head_dim: int) -> torch
     return torch.zeros(
         (num_pages, compress_ratio, last_dim),
         dtype=torch.float32,
-        device="cuda",
+        device=get_device(),
     )
 
 

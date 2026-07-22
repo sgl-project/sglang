@@ -61,7 +61,9 @@ than restating.
   explicit maintainer-confirmed justification in the PR. The MDX strategy bullets describe serving semantics
   in the DSv4 style (single-user chat / typical multi-user / batch jobs), not internal
   toggles.
-- `dockerImages` covers the hw ids that have cells (else users hit the `:dev` fallback).
+- `dockerImages` covers the hw ids that have cells (else users hit the `:dev` fallback); a
+  `hw|quant` key (resolved before the plain `hw`) is valid when one quant on a shared GPU needs
+  a different image (e.g. an FP4 dev build) — don't flag those.
 - `multiNodeHints` present ONLY for hw whose fabric needs manual NIC env (e.g. `gb200`
   NVL72) — NOT every `multi-N` hw (standard-IB DeepEP / Marlin multi-node don't need it).
 - `github.cookbookModel` is set to the model's HF id (`<hf-org>/<model-slug>`). The issue
@@ -113,9 +115,19 @@ than restating.
 - A benchmark's quantization must match a variant actually listed — `(BF16)` on a model
   that only released FP8/FP4 is a factual bug.
 - `benchmarkCommands.speed` is `python3 -m sglang.bench_serving` (the workload), separate
-  from the `sglang serve` deploy command.
+  from the `sglang serve` deploy command, and should carry `--flush-cache`: bench_serving's
+  `random` prompts are deterministic, so a warm rerun hits the radix cache and inflates
+  throughput — speed numbers are measured cache-cold.
 - `sglang_version` is a real build the author ran (a release, or `dev`/nightly) — not a
   guessed/placeholder value (no leftover `0.0.0`).
+- **Latency percentile**: `config.latencyPercentile` (default `"P50"`, or `"Mean"`) matches the
+  percentile the TTFT/TPOT values actually are — the card renders `TTFT (<pct>)`. A benchmarks
+  entry may carry its own `latencyPercentile` to override the page value per cell
+  (entry → config → `"P50"`): on a P50 page, kept legacy Mean cells must set it — a
+  `sglang_version` tag alone doesn't convey the percentile. (`"Mean"` is temporary — legacy
+  data is being re-measured to P50.)
+- **Throughput convention**: `tokens_per_sec_per_gpu` is stored as **total (in+out)/GPU**
+  = `output tok/s/GPU × (isl+osl)/osl`, shown by the card as-is. Flag output-only values.
 - **Consistent accuracy harness across entries**: every value under one `accuracyLabels`
   column must be produced by the SAME harness — flag a page that, say, measures one
   platform's GSM8K with `few_shot_gsm8k --num-questions 200` and another's with

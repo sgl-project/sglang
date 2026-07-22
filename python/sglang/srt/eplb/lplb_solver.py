@@ -26,7 +26,6 @@ import torch
 logger = logging.getLogger(__name__)
 
 # Global per-layer LPLB solvers
-_global_lplb_solvers: dict[int, LPLBSolver] = {}
 
 
 # LP dispatch requires every EP rank to call solver.solve() on every forward
@@ -59,15 +58,21 @@ def assert_lplb_supported_model(architecture: str) -> None:
 
 
 def get_global_lplb_solver(layer_id: int) -> Optional[LPLBSolver]:
-    return _global_lplb_solvers.get(layer_id)
+    from sglang.srt.runtime_context import get_resources
+
+    return get_resources().lplb_solvers.get(layer_id)
 
 
 def set_global_lplb_solver(layer_id: int, solver: LPLBSolver):
-    _global_lplb_solvers[layer_id] = solver
+    from sglang.srt.runtime_context import get_resources
+
+    get_resources().lplb_solvers[layer_id] = solver
 
 
 def clear_global_lplb_solvers():
-    _global_lplb_solvers.clear()
+    from sglang.srt.runtime_context import get_resources
+
+    get_resources().lplb_solvers.clear()
 
 
 class LPLBSolver:
@@ -180,7 +185,7 @@ class LPLBSolver:
         # real request. No-op when the fused backend is unavailable.
         nc = self.A_base.shape[0]
         nv = self.A_base.shape[1] + 1  # +1 for Big-M column added in solve()
-        from sglang.jit_kernel.lplb.torch_solver import warmup as _ipm_warmup
+        from sglang.kernels.ops.lplb.torch_solver import warmup as _ipm_warmup
 
         _ipm_warmup(nc, nv, num_iters=5, device=device)
 
@@ -256,7 +261,7 @@ class LPLBSolver:
             prep_lp_inputs → solve_ipm → extract_log2phy_prob
         Raises if the JIT CUDA backend is unavailable.
         """
-        from sglang.jit_kernel.lplb import cuda_solver
+        from sglang.kernels.ops.lplb import cuda_solver
 
         cuda_solver.prep_lp_inputs(
             self._A_full,

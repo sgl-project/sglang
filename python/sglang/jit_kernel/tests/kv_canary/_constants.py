@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from sglang.jit_kernel.kv_canary.verify import CANARY_SLOT_BYTES
+from sglang.kernels.ops.kv_canary.verify import CANARY_SLOT_BYTES
 
 # Default fixture sizes — small enough for fast tests, large enough that ring overflow / multi-req cases
 # stay realistic without bloating the assertion surface.
