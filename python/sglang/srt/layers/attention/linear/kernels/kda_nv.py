@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""NVIDIA fused KDA prefill backend for Blackwell.
+"""NVIDIA split KDA prefill backend (K1-K4 CuTe/Triton/cuTile pipeline).
 
-Wraps the vendored ``kda_nv_prefill`` package through its fused-only
-``chunk_kda_fwd`` entry point. Besides removing launch/intermediate overhead,
-the kernel retains the triangular solve in FP32/TF32.
+Wraps the vendored ``kda_nv_prefill`` package through its FLA-compatible
+``chunk_kda_fwd`` interface. SGLang owns the boundary conversion from its
+V-major ``[B,H,V,K]`` cache to the vendor's K-major ``[B,H,K,V]`` state and
+back; the vendored split kernels keep their original internal layouts.
 
 The serving wrapper repacks ordinary packed prefill batches into bounded
 equal-length groups (B <= 8) and pads every sequence to one of
@@ -40,6 +41,36 @@ logger = logging.getLogger(__name__)
 
 _BUCKETS = (2048, 4096, 8192, 16384)
 _MAX_NV_BATCH = 8
+
+
+def _to_nv_state_layout(
+    state: torch.Tensor, *, head_k_dim: int, head_v_dim: int
+) -> torch.Tensor:
+    """Materialize SGLang [B,H,V,K] state as vendor [B,H,K,V]."""
+    expected = (head_v_dim, head_k_dim)
+    if state.ndim != 4 or tuple(state.shape[-2:]) != expected:
+        raise ValueError(
+            "SGLang KDA state must be [B,H,V,K] with "
+            f"(V,K)={expected}, got {tuple(state.shape)}"
+        )
+    return state.transpose(-1, -2).float().contiguous()
+
+
+def _from_nv_state_layout(
+    state: torch.Tensor,
+    *,
+    head_k_dim: int,
+    head_v_dim: int,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Materialize vendor [B,H,K,V] state as SGLang [B,H,V,K]."""
+    expected = (head_k_dim, head_v_dim)
+    if state.ndim != 4 or tuple(state.shape[-2:]) != expected:
+        raise ValueError(
+            "NV KDA state must be [B,H,K,V] with "
+            f"(K,V)={expected}, got {tuple(state.shape)}"
+        )
+    return state.transpose(-1, -2).to(dtype=dtype).contiguous()
 
 
 class NVKDAKernel(LinearAttnKernelBase):
@@ -170,7 +201,7 @@ class NVKDAKernel(LinearAttnKernelBase):
                     batch_size,
                     bucket,
                     num_heads,
-                    dtype=torch.float32,
+                    dtype=torch.bfloat16,
                     device=dev,
                 ),
                 "s0": torch.zeros(
@@ -381,7 +412,11 @@ class NVKDAKernel(LinearAttnKernelBase):
 
                 group_slots = all_slot_indices[seq_start : seq_start + group_size]
                 st["s0"].copy_(
-                    ssm_states.index_select(0, group_slots).transpose(-1, -2).float()
+                    _to_nv_state_layout(
+                        ssm_states.index_select(0, group_slots),
+                        head_k_dim=head_k_dim,
+                        head_v_dim=head_v_dim,
+                    )
                 )
                 res = self._fwd(
                     st["q"],
@@ -392,10 +427,13 @@ class NVKDAKernel(LinearAttnKernelBase):
                     scale=head_k_dim**-0.5,
                     initial_state=st["s0"],
                     output_final_state=True,
+                    cu_seqlens=None,
                     safe_gate=lower_bound is not None,
                     lower_bound=lower_bound,
+                    use_gate_in_kernel=True,
                     A_log=alog_flat,
                     dt_bias=dtb_flat,
+                    use_fused_k1234=False,
                 )
                 group_output, final_state = res[0], res[1]
 
@@ -410,7 +448,12 @@ class NVKDAKernel(LinearAttnKernelBase):
                 ssm_states.index_copy_(
                     0,
                     group_slots,
-                    final_state.transpose(-1, -2).contiguous().to(ssm_states.dtype),
+                    _from_nv_state_layout(
+                        final_state,
+                        head_k_dim=head_k_dim,
+                        head_v_dim=head_v_dim,
+                        dtype=ssm_states.dtype,
+                    ),
                 )
                 seq_start += group_size
                 token_start += group_tokens

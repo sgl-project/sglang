@@ -5,21 +5,15 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.layers.attention.linear.kernels.kda_nv import NVKDAKernel
+from sglang.srt.layers.attention.linear.kernels.kda_nv import (
+    NVKDAKernel,
+    _from_nv_state_layout,
+    _to_nv_state_layout,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
-
-_EXPECTED_FUSED_KWARGS = {
-    "scale",
-    "initial_state",
-    "output_final_state",
-    "safe_gate",
-    "lower_bound",
-    "A_log",
-    "dt_bias",
-}
 
 
 class _RejectTriton:
@@ -28,6 +22,34 @@ class _RejectTriton:
 
 
 class TestNVKDAAllPrefillWrapper(CustomTestCase):
+    def test_state_layout_round_trip(self):
+        state = torch.arange(2 * 3 * 5 * 7, dtype=torch.float32).view(2, 3, 5, 7)
+
+        nv_state = _to_nv_state_layout(state, head_k_dim=7, head_v_dim=5)
+
+        self.assertEqual(tuple(nv_state.shape), (2, 3, 7, 5))
+        self.assertTrue(nv_state.is_contiguous())
+        self.assertEqual(nv_state[1, 2, 6, 4], state[1, 2, 4, 6])
+
+        restored = _from_nv_state_layout(
+            nv_state,
+            head_k_dim=7,
+            head_v_dim=5,
+            dtype=torch.bfloat16,
+        )
+
+        self.assertEqual(tuple(restored.shape), (2, 3, 5, 7))
+        self.assertTrue(restored.is_contiguous())
+        self.assertTrue(torch.equal(restored, state.to(torch.bfloat16)))
+
+    def test_state_layout_rejects_swapped_contract(self):
+        with self.assertRaisesRegex(ValueError, "SGLang KDA state"):
+            _to_nv_state_layout(
+                torch.zeros(1, 2, 7, 5),
+                head_k_dim=7,
+                head_v_dim=5,
+            )
+
     def _make_kernel(self):
         calls = []
         kernel = NVKDAKernel()
@@ -43,7 +65,8 @@ class TestNVKDAAllPrefillWrapper(CustomTestCase):
                     "g": g.clone(),
                     "beta": beta.clone(),
                     "initial_state": kwargs["initial_state"].clone(),
-                    "kwargs": set(kwargs),
+                    "cu_seqlens": kwargs["cu_seqlens"],
+                    "use_fused_k1234": kwargs["use_fused_k1234"],
                 }
             )
             return v.clone(), kwargs["initial_state"] + 1.0
@@ -89,8 +112,9 @@ class TestNVKDAAllPrefillWrapper(CustomTestCase):
 
         self.assertEqual(len(calls), 1)
         self.assertEqual(tuple(calls[0]["q"].shape), (1, 2048, 1, 128))
-        self.assertEqual(calls[0]["beta"].dtype, torch.float32)
-        self.assertEqual(calls[0]["kwargs"], _EXPECTED_FUSED_KWARGS)
+        self.assertEqual(calls[0]["beta"].dtype, torch.bfloat16)
+        self.assertIsNone(calls[0]["cu_seqlens"])
+        self.assertFalse(calls[0]["use_fused_k1234"])
         self.assertTrue(torch.equal(output, x["v"]))
         self.assertTrue(torch.equal(states[1], torch.ones_like(states[1])))
 
@@ -118,7 +142,8 @@ class TestNVKDAAllPrefillWrapper(CustomTestCase):
         self.assertEqual(len(calls), 1)
         call = calls[0]
         self.assertEqual(tuple(call["q"].shape), (3, 2048, 1, 128))
-        self.assertEqual(call["kwargs"], _EXPECTED_FUSED_KWARGS)
+        self.assertIsNone(call["cu_seqlens"])
+        self.assertFalse(call["use_fused_k1234"])
         self.assertTrue(torch.equal(output, x["v"]))
 
         start = 0
