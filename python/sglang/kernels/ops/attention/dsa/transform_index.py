@@ -87,6 +87,10 @@ def transform_index_page_table_prefill_kernel(
 
     query_start = tl.load(cu_seqlens_q_ptr + request_id)
     query_end = tl.load(cu_seqlens_q_ptr + request_id + 1)
+    # Grid axis 1 spans the batch-max extend length; skip blocks fully past
+    # this request's query range (their stores are fully masked anyway).
+    if query_start + tl.program_id(1) * BLOCK_Q >= query_end:
+        return
     token_indices = query_start + query_offsets
     mask = (token_indices[:, None] < query_end) & (topk_offsets[None, :] < TOPK)
 

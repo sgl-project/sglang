@@ -266,10 +266,10 @@ def _make_swa_mapping(pool_token_cap, seed):
 @pytest.mark.parametrize("q_mode", [Q_MODE_NONE, Q_MODE_CUMSUM, Q_MODE_STRIDED])
 @pytest.mark.parametrize("with_swa", [False, True])
 # static_width=True exercises the production path: the backend passes the STATIC
-# max_num_pages (full upper bound), not a per-batch dynamic width, so the kernel
-# rewrites the whole page-table width every replay (tail pages beyond a request's
-# seq are gathered but ignored by the attention kernel via cache_seqlens). The
-# aten reference gathers the same full width, so this stays a bit-exact check.
+# max_num_pages (full upper bound), not a per-batch dynamic width. The kernel
+# self-guards on the device-side seqlen: pages past cdiv(cache_seqlen, PAGE_SIZE)
+# keep stale values the attention kernel never reads (it is bounded by
+# cache_seqlens), so the page-table checks compare the live prefix per row.
 @pytest.mark.parametrize("static_width", [False, True])
 def test_metadata_correctness(bs, seqlen_offset, q_mode, with_swa, static_width):
     if not torch.cuda.is_available():
@@ -372,9 +372,18 @@ def test_metadata_correctness(bs, seqlen_offset, q_mode, with_swa, static_width)
     cu_k_ref[1:] = torch.cumsum(cache_seqlens_ref, dim=0, dtype=torch.int32)
     torch.testing.assert_close(cu_seqlens_k, cu_k_ref, rtol=0, atol=0)
 
-    # ---- page_table ----
+    # ---- page_table (live [:pages(cache_seqlen)] prefix per row) ----
     pt_ref, gathered = _ref_page_table(req_to_token, req_pool_indices, max_seq_pages)
-    torch.testing.assert_close(page_table[:, :max_seq_pages], pt_ref, rtol=0, atol=0)
+    live_pages = torch.clamp(
+        (cache_seqlens_ref.to(torch.int64) + PAGE_SIZE - 1) // PAGE_SIZE,
+        max=max_seq_pages,
+    )
+    live_mask = torch.arange(max_seq_pages, device=DEVICE).view(
+        1, -1
+    ) < live_pages.view(-1, 1)
+    torch.testing.assert_close(
+        page_table[:, :max_seq_pages][live_mask], pt_ref[live_mask], rtol=0, atol=0
+    )
 
     # ---- cu_seqlens_q ----
     if q_mode == Q_MODE_CUMSUM:
@@ -392,7 +401,10 @@ def test_metadata_correctness(bs, seqlen_offset, q_mode, with_swa, static_width)
     if with_swa:
         swa_pt_ref = _ref_swa_page_table(gathered, swa_mapping)
         torch.testing.assert_close(
-            swa_page_table[:, :max_seq_pages], swa_pt_ref, rtol=0, atol=0
+            swa_page_table[:, :max_seq_pages][live_mask],
+            swa_pt_ref[live_mask],
+            rtol=0,
+            atol=0,
         )
 
         # swa_out_cache_loc reference: translate real prefix, zero-fill tail.

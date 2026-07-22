@@ -66,6 +66,16 @@ def _fused_dsa_decode_metadata_kernel(
     offs_n = col_block * BLOCK_N + tl.arange(0, BLOCK_N)
     mask = (row < bs) & (offs_n < max_len)
 
+    # Skip column blocks past the request's kv length: no consumer reads there
+    # (attention and the indexer both stay within cache_seqlens).
+    kv_len = tl.load(
+        seq_lens + row * seq_lens_stride,
+        mask=row < bs,
+        other=0,
+    ).to(tl.int32)
+    if col_block * BLOCK_N >= kv_len:
+        return
+
     req_idx = tl.load(
         req_pool_indices + row * req_pool_indices_stride,
         mask=row < bs,
@@ -278,6 +288,18 @@ def _fused_dsa_target_verify_metadata_kernel(
     mask = (out_row < expanded_size) & (offs_n < max_seqlen_k)
 
     req_row = out_row // next_n
+    # Skip column blocks past the request's kv length (seq_len + next_n): no
+    # consumer reads there (attention and the indexer stay within cache_seqlens).
+    kv_len = (
+        tl.load(
+            seq_lens + req_row * seq_lens_stride,
+            mask=out_row < expanded_size,
+            other=0,
+        ).to(tl.int32)
+        + next_n
+    )
+    if col_block * BLOCK_N >= kv_len:
+        return
     req_idx = tl.load(
         req_pool_indices + req_row * req_pool_indices_stride,
         mask=out_row < expanded_size,

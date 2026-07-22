@@ -313,6 +313,11 @@ def _fwd_kernel(
     cur_seq_len_prefix = tl.load(kv_indptr + cur_seq + 1) - cur_seq_kv_start_idx
     cur_seq_len = cur_seq_len_prefix + cur_seq_len_extend
 
+    # Grid axis 2 spans the batch-max extend length; blocks fully past this
+    # request's extend length store nothing (all stores are masked by mask_m).
+    if cur_block_m * BLOCK_M >= cur_seq_len_extend:
+        return
+
     if USE_CUSTOM_MASK:
         cur_seq_mask_start_idx = tl.load(mask_indptr + cur_seq)
 
