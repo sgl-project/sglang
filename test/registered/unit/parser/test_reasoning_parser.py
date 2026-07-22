@@ -3,11 +3,13 @@
 import unittest
 
 from sglang.srt.parser.reasoning_parser import (
+    Apertus2509Detector,
     BaseReasoningFormatDetector,
     DeepSeekR1Detector,
     Gemma4Detector,
     Glm45Detector,
     HunyuanDetector,
+    InklingDetector,
     KimiDetector,
     KimiK2Detector,
     Nemotron3Detector,
@@ -163,6 +165,107 @@ class TestQwen3Detector(CustomTestCase):
         result = self.detector.detect_and_parse(text)
         self.assertEqual(result.normal_text, text)
         self.assertEqual(result.reasoning_text, "")
+
+
+class TestInklingDetector(CustomTestCase):
+    def test_streaming_routes_blocks_across_all_string_boundaries(self):
+        detector = InklingDetector()
+        source = (
+            "<|message_model|><|content_thinking|>think<|end_message|>"
+            "<|message_model|><|content_text|>answer<|end_message|>"
+            "<|content_model_end_sampling|>"
+        )
+        reasoning = ""
+        content = ""
+        for char in source:
+            result = detector.parse_streaming_increment(char)
+            reasoning += result.reasoning_text
+            content += result.normal_text
+        self.assertEqual(reasoning, "think")
+        self.assertEqual(content, "answer")
+
+    def test_tool_header_is_preserved_for_the_tool_parser(self):
+        detector = InklingDetector()
+        source = (
+            "<|message_model|>weather<|content_invoke_tool_json|>"
+            '{"name":"weather","args":{"city":"SF"}}<|end_message|>'
+        )
+        content = ""
+        for char in source:
+            content += detector.parse_streaming_increment(char).normal_text
+        self.assertEqual(content, source)
+
+    def test_quoted_message_model_token_inside_content_is_preserved(self):
+        """Bug regression: the header branch flipped to header state on ANY
+        <|message_model|> occurrence, so a literal token the model wrote
+        inside a content block (e.g. quoting the protocol) silently swallowed
+        all payload text up to the next control token."""
+        detector = InklingDetector()
+        source = (
+            "<|message_model|><|content_text|>Header token: <|message_model|>"
+            " then more text<|end_message|>"
+        )
+        result = detector.detect_and_parse(source)
+        self.assertEqual(
+            result.normal_text, "Header token: <|message_model|> then more text"
+        )
+
+    def test_control_token_inside_tool_header_shares_the_full_alphabet(self):
+        """Bug regression: the tool-call detector validated headers against
+        INKLING_SPECIAL_TOKENS while the reasoning parser keyed on the larger
+        control alphabet (+ <|model_trigger_generation|>), so a control token
+        smuggled inside a header passed one machine and not the other."""
+        from sglang.srt.function_call.inkling_detector import (
+            InklingDetector as ToolDetector,
+        )
+
+        detector = ToolDetector()
+        prefix, name = detector._split_trailing_tool_header(
+            "<|message_model|>weather<|model_trigger_generation|>"
+        )
+        self.assertIsNone(name)
+
+    def test_continuation_stream_text_survives_chunk_boundaries(self):
+        """Bug regression: text arriving with no open block (a
+        continue_final_message stream resumes MID text block) was routed to
+        content only when a chunk held no control token; a chunk like
+        'ld<|end_message|>' silently dropped the 'ld'. All out-of-block text
+        must reach content regardless of chunking."""
+        source = (
+            " world<|end_message|><|message_model|><|content_text|>next<|end_message|>"
+        )
+        for chunks in (
+            [source],
+            [
+                " wor",
+                "ld<|end_message|>",
+                "<|message_model|><|content_text|>next<|end_message|>",
+            ],
+            list(source),
+        ):
+            detector = InklingDetector()
+            content = ""
+            for chunk in chunks:
+                content += detector.parse_streaming_increment(chunk).normal_text
+            self.assertEqual(content, " worldnext", msg=f"chunks={chunks!r}")
+
+    def test_finish_flushes_reasoning_truncated_before_end_token(self):
+        """Bug regression: with stream_reasoning=False the detector buffers the
+        thinking block and only flushes it on a control/end token. When
+        generation is cut mid-block (e.g. max_tokens) the stream ends with no
+        end token, so the buffered trace was dropped entirely; finish() must
+        emit it, matching the non-streaming detect_and_parse path."""
+        detector = InklingDetector(stream_reasoning=False)
+        source = "<|message_model|><|content_thinking|>truncated thinking"
+        streamed_reasoning = ""
+        for char in source:
+            streamed_reasoning += detector.parse_streaming_increment(
+                char
+            ).reasoning_text
+        # The block never closed, so nothing surfaces mid-stream.
+        self.assertEqual(streamed_reasoning, "")
+        # finish() flushes the buffered trace instead of dropping it.
+        self.assertEqual(detector.finish().reasoning_text, "truncated thinking")
 
 
 class TestKimiDetector(CustomTestCase):
@@ -349,6 +452,73 @@ class TestNemotron3Detector(CustomTestCase):
         # Truncated reasoning has no normal_text, so swap should occur
         self.assertEqual(result.normal_text, "Truncated reasoning without end token")
         self.assertEqual(result.reasoning_text, "")
+
+    def test_streaming_truncated_reasoning_reclassified_on_finish(self):
+        """force_nonempty_content: truncated reasoning (no think_end) is flushed
+        as normal_text when the stream ends, so streaming content is non-empty."""
+        detector = Nemotron3Detector(force_nonempty_content=True)
+        detector.parse_streaming_increment(detector.think_start_token)
+        detector.parse_streaming_increment("reasoning part one")
+        detector.parse_streaming_increment(" more reasoning")
+        end = detector.finish()
+        self.assertEqual(end.reasoning_text, "")
+        self.assertEqual(end.normal_text, "reasoning part one more reasoning")
+
+    def test_streaming_tool_start_ends_reasoning_and_noops_finish(self):
+        """tool_start_token interrupts reasoning; finish() then no-ops because
+        _in_reasoning is already False."""
+        detector = Nemotron3Detector(force_nonempty_content=True)
+        detector.parse_streaming_increment(detector.think_start_token)
+        detector.parse_streaming_increment("reasoning here")
+        result = detector.parse_streaming_increment(
+            detector.tool_start_token + "payload"
+        )
+        self.assertEqual(result.reasoning_text, "")
+        self.assertEqual(result.normal_text, detector.tool_start_token + "payload")
+        self.assertFalse(detector._in_reasoning)
+        end = detector.finish()
+        self.assertEqual(end.normal_text, "")
+
+    def test_streaming_truncated_no_stream_reasoning_strips_think_start(self):
+        """force_nonempty_content + stream_reasoning=False: the opening think
+        token must not leak into content when truncation is flushed on finish.
+
+        Regression: with stream_reasoning=False the base parse_streaming_increment
+        never clears _buffer, so the stripped think_start survives in _buffer and
+        finish() would prepend it to the reclassified content."""
+        detector = Nemotron3Detector(
+            force_nonempty_content=True, stream_reasoning=False
+        )
+        detector.parse_streaming_increment(detector.think_start_token)
+        detector.parse_streaming_increment("hidden reasoning")
+        end = detector.finish()
+        self.assertEqual(end.reasoning_text, "")
+        self.assertEqual(end.normal_text, "hidden reasoning")
+        self.assertNotIn(detector.think_start_token, end.normal_text)
+
+
+class TestApertus2509DetectorForceNonempty(CustomTestCase):
+    """force_nonempty_content swap on Apertus2509 (non-streaming, via base helper)."""
+
+    def test_swap_when_only_reasoning(self):
+        detector = Apertus2509Detector(force_nonempty_content=True)
+        text = (
+            detector.think_start_token
+            + "apertus reasoning only"
+            + detector.think_end_token
+        )
+        result = detector.detect_and_parse(text)
+        self.assertEqual(result.normal_text, "apertus reasoning only")
+        self.assertEqual(result.reasoning_text, "")
+
+    def test_no_swap_when_normal_exists(self):
+        detector = Apertus2509Detector(force_nonempty_content=True)
+        text = (
+            detector.think_start_token + "reason" + detector.think_end_token + "answer"
+        )
+        result = detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "reason")
+        self.assertEqual(result.normal_text, "answer")
 
 
 class TestGemma4Detector(CustomTestCase):

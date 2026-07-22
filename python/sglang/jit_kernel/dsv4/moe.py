@@ -2,15 +2,18 @@ from typing import Optional, Tuple
 
 import torch
 
-from sglang.jit_kernel.utils import (
+from sglang.kernels.jit.utils import (
     cache_once,
     is_arch_support_pdl,
     is_hip_runtime,
     load_jit,
     make_cpp_args,
 )
+from sglang.srt.utils import is_xpu
 
 from .utils import make_name
+
+_is_xpu = is_xpu()
 
 
 @cache_once
@@ -175,8 +178,13 @@ def silu_and_mul_clamp(
     output: torch.Tensor,
     swiglu_limit: float,
 ) -> None:
-    module = _jit_silu_and_mul_clamp_module(input.dtype)
-    module.run(input, output, float(swiglu_limit))
+    if _is_xpu:
+        from sgl_kernel import silu_and_mul_clamp
+
+        silu_and_mul_clamp(input, output, float(swiglu_limit))
+    else:
+        module = _jit_silu_and_mul_clamp_module(input.dtype)
+        module.run(input, output, float(swiglu_limit))
 
 
 def silu_and_mul_masked_post_quant(

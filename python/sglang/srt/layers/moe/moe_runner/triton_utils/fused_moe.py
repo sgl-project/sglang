@@ -13,8 +13,19 @@ import torch
 import torch.nn.functional as F
 import triton.language as tl
 
+from sglang.kernels.ops.moe.fused_moe_triton_kernels import (
+    act_and_mul_triton,
+    invoke_fused_moe_kernel,
+    moe_sum_reduce_triton,
+    support_tensor_descriptor,
+)
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+from sglang.srt.distributed import get_tp_group
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    use_symmetric_memory,
+)
 from sglang.srt.environ import envs
+from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
 from sglang.srt.layers.moe.utils import get_moe_padding_size
 from sglang.srt.runtime_context import get_server_args
@@ -31,12 +42,6 @@ from sglang.srt.utils import (
 from sglang.srt.utils.custom_op import register_custom_op
 
 from .fused_moe_triton_config import get_config_dtype_str, try_get_optimal_moe_config
-from .fused_moe_triton_kernels import (
-    act_and_mul_triton,
-    invoke_fused_moe_kernel,
-    moe_sum_reduce_triton,
-    support_tensor_descriptor,
-)
 from .moe_align_block_size import moe_align_block_size
 
 if TYPE_CHECKING:
@@ -468,6 +473,12 @@ def _fused_moe_kernel_sequence(
     topk = topk_ids.shape[1]
     compute_type = tl.bfloat16 if hidden_states.dtype == torch.bfloat16 else tl.float16
 
+    # LoRA hooks consume and update route-major intermediate buffers. The TMA
+    # down path keeps those buffers in expert-sorted, block-padded order, which
+    # is incompatible with the hook contract.
+    if hooks and (hooks.after_gate_up is not None or hooks.after_down is not None):
+        down_moe_use_tma = False
+
     padded_tokens = (
         min(num_tokens * topk, E + 1) * (config["BLOCK_SIZE_M"] - 1)
         if down_moe_use_tma
@@ -485,7 +496,14 @@ def _fused_moe_kernel_sequence(
     elif inplace:
         out_hidden_states = hidden_states
     else:
-        out_hidden_states = torch.empty_like(hidden_states)
+        # Allocate the MoE output in the NCCL symmetric memory pool when symmetric
+        # allocation is required, so the downstream all-reduce takes the low-latency
+        # symmetric path. Only this output enters the pool; the intermediate caches
+        # below stay on the default allocator to bound pool occupancy.
+        with use_symmetric_memory(
+            get_tp_group(), disabled=not is_allocation_symmetric()
+        ):
+            out_hidden_states = torch.empty_like(hidden_states)
 
     use_fused_moe_sum_all_reduce = (
         get_server_args().enable_fused_moe_sum_all_reduce
