@@ -2209,6 +2209,21 @@ class TestQwen3CoderDetector(unittest.TestCase):
                     },
                 ),
             ),
+            Tool(
+                type="function",
+                function=Function(
+                    name="write_file",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "file_path": {"type": "string"},
+                            "content": {"type": "string"},
+                            "overwrite": {"type": "boolean"},
+                        },
+                        "required": ["file_path", "content"],
+                    },
+                ),
+            ),
         ]
         self.detector = Qwen3CoderDetector()
 
@@ -2317,6 +2332,55 @@ class TestQwen3CoderDetector(unittest.TestCase):
             params = json.loads(collected_params)
             self.assertEqual(params["location"], "Boston")
             self.assertEqual(params["unit"], "celsius")
+
+    def test_streaming_string_parameter_emits_before_closing_tag(self):
+        """
+        Test streaming parsing of a long string parameter before the closing tag.
+
+        Scenario: A file-writing tool streams a large string parameter over
+        several chunks and the closing parameter tag is split across chunks.
+        Purpose: Verify that the parser emits JSON string fragments as the
+        value arrives instead of buffering the entire value until </parameter>.
+        """
+        chunks = [
+            "<tool_call>",
+            "<function=write_file>",
+            "<parameter=file_path>/tmp/demo.html</parameter>",
+            "<parameter=content>",
+            "<!DOCTYPE html>\n",
+            "<html>\n",
+            "<body>hello</body>\n",
+            "</par",
+            "ameter>",
+            "<parameter=overwrite>false</parameter>",
+            "</function>",
+            "</tool_call>",
+        ]
+
+        detector = Qwen3CoderDetector()
+        collected_params = ""
+        params_before_content_close = ""
+
+        for chunk in chunks:
+            result = detector.parse_streaming_increment(chunk, self.tools)
+            for call in result.calls:
+                if call.parameters:
+                    collected_params += call.parameters
+            if chunk == "<body>hello</body>\n":
+                params_before_content_close = collected_params
+
+        self.assertIn('"content": "', params_before_content_close)
+        self.assertIn("<!DOCTYPE html>", params_before_content_close)
+        self.assertIn("<html>", params_before_content_close)
+        self.assertIn("<body>hello</body>", params_before_content_close)
+
+        params = json.loads(collected_params)
+        self.assertEqual(params["file_path"], "/tmp/demo.html")
+        self.assertEqual(
+            params["content"],
+            "<!DOCTYPE html>\n<html>\n<body>hello</body>",
+        )
+        self.assertEqual(params["overwrite"], False)
 
     def test_streaming_with_text_and_tool(self):
         """
