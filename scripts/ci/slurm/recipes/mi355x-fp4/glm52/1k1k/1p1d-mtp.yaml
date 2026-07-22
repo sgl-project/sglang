@@ -24,8 +24,23 @@ backend:
       expert-parallel-size: 1
       data-parallel-size: 1
 
+# Model-specific docker env + sglang server args (generic launcher path; keeps
+# GLM off the hardcoded DeepSeek-V4 parser branch in launch_mi355x.sh). DSA
+# attention is auto-selected for GlmMoeDsaForCausalLM, so no --attention-backend
+# is set. GLM has a shared expert (n_shared_experts=1); shared-experts-fusion is
+# disabled to mirror the DeepSeek-V4 path.
+model:
+  env:
+    SGLANG_USE_AITER: 1
+  server_args:
+    - --reasoning-parser
+    - glm45
+    - --tool-call-parser
+    - glm45
+    - --disable-shared-experts-fusion
+
 runtime:
-  image: lmsysorg/sglang-rocm:v0.5.15.post1-rocm720-mi35x-20260715
+  image: lmsysorg/sglang-rocm:v0.5.13.post1-rocm720-mi35x-20260623
   # attention_backend intentionally unset: DSA is auto-selected for
   # GlmMoeDsaForCausalLM.
   # RoCE HCAs MORI uses for cross-node KV transfer.
