@@ -29,7 +29,11 @@ import sys
 import pytest
 import torch
 
-from sglang.jit_kernel.dsv4.topk import plan_topk_v2, topk_transform_512_v2
+from sglang.jit_kernel.dsv4.topk import (
+    plan_topk_v2,
+    topk_transform_512,
+    topk_transform_512_v2,
+)
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -293,6 +297,124 @@ def test_topk_v2_output_indices(batch: int, seq: int, k: int) -> None:
     our_raw = _run_raw(scores, seq_lens, page_table, k)
     ref_raw = _reference(scores, seq_lens, k)
     _assert_topk_close(scores.cpu(), ref_raw, our_raw, batch, seq_lens.cpu(), k)
+
+
+# Negative lengths model DP-padded / idle-companion rows (e.g. -4 from GLM 5.2
+# MTP draft-extend metadata, see #30378; DP-attention idle rows are the same
+# class -- issue #25574). The kernels must treat them as empty (trivial
+# all-(-1) output, via signed length comparisons) instead of reinterpreting
+# them as ~4e9-token rows -- which was an illegal memory access, or a silently
+# garbage output row when the unsigned chunk arithmetic happened to wrap. One
+# config per dispatch shape so every device-side seq_len read (main kernel,
+# fused small-batch cluster kernel, and the plan kernel's pool routing) is
+# exercised.
+NEGATIVE_LENGTH_CONFIGS = [
+    [4096, 4096, -4, 400],  # level 0 (Register2)
+    [9000, 9000, 9000, -4],  # level 1 (Register4)
+    [40000] * 16 + [-1048576, 400],  # level 2 (Streaming; batch > 15 => floor 65536)
+    [131072, 9000, 9000, -1],  # fused small-batch cluster
+    [131072, 9000, 9000, -4],  # fused small-batch cluster
+    [131072, 9000, 9000, -1048576],  # fused small-batch cluster
+    [131072] * 20 + [400] * 10 + [-4],  # persistent pool + main<3>
+    [131072] * 20 + [400] * 10 + [-1048576],  # persistent pool + main<3>
+]
+
+
+@pytest.mark.parametrize("k", [512, 2048])
+@pytest.mark.parametrize("lens", NEGATIVE_LENGTH_CONFIGS)
+@torch.inference_mode()
+def test_topk_v2_negative_lengths(lens: list, k: int) -> None:
+    """Negative rows -> all-(-1) out AND raw; non-negative rows unaffected."""
+    torch.manual_seed(abs(sum(lens)) + k)
+    device = "cuda"
+    batch = len(lens)
+    width = (max(lens) + 3) & ~3
+    scores = torch.randn(batch, width, dtype=torch.float32, device=device)
+    seq_lens = torch.tensor(lens, dtype=torch.int32, device=device)
+    num_pages = (width + PAGE_SIZE - 1) // PAGE_SIZE
+    page_table, inv_cpu = _make_page_table(batch, num_pages, "perm", device)
+    out = torch.full((batch, k), 7, dtype=torch.int32, device=device)  # poison
+    raw = torch.full((batch, k), 7, dtype=torch.int32, device=device)  # poison
+
+    metadata = plan_topk_v2(seq_lens)
+    topk_transform_512_v2(scores, seq_lens, page_table, out, PAGE_SIZE, metadata, raw)
+    torch.cuda.synchronize()
+
+    # Every row is fully written by the kernel (trivial rows pad with -1), so
+    # the poison also proves the negative rows were actually processed.
+    for i, L in enumerate(lens):
+        if L < 0:
+            assert (out[i] == -1).all(), f"row {i} (len={L}): out not all -1"
+            assert (raw[i] == -1).all(), f"row {i} (len={L}): raw not all -1"
+
+    # Non-negative rows must still match torch.topk (negative rows reference
+    # as length 0, which _assert_topk_close checks as "no valid entries").
+    clamped = torch.tensor([max(L, 0) for L in lens], dtype=torch.int32)
+    out_cpu = out.cpu().tolist()
+    our_raw = [_invert(out_cpu[i], inv_cpu[i]) for i in range(batch)]
+    ref_raw = _reference(scores, clamped, k)
+    _assert_topk_close(scores.cpu(), ref_raw, our_raw, batch, clamped, k)
+
+
+@torch.inference_mode()
+def test_topk_v2_plan_negative_lengths() -> None:
+    """A negative row must not be counted by the plan's threshold heuristic.
+
+    30 rows just above the 65536 candidate sit exactly at its cap (30). If the
+    plan's counting loop read the negative row unsigned (~4e9 > every
+    candidate), the count would become 31 > 30 and cluster_threshold would be
+    lifted to the next candidate (98304); it must stay at the floor, and the
+    negative row must not be routed to the persistent pool.
+    """
+    device = "cuda"
+    lens = [98000] * 30 + [-4]
+    seq_lens = torch.tensor(lens, dtype=torch.int32, device=device)
+    metadata = plan_topk_v2(seq_lens)
+    torch.cuda.synchronize()
+    threshold, num_items = metadata[0].tolist()
+    assert threshold == FLOOR, f"cluster_threshold {threshold} != {FLOOR}"
+    assert num_items == 30, f"num_cluster_items {num_items} != 30"
+
+    # A full-uint32 static threshold (> INT32_MAX) must not resurrect the
+    # unsigned routing: the compaction loop proves rows positive (signed)
+    # before the unsigned threshold compare, so nothing is routed here --
+    # neither the negative row nor the 98000-token rows.
+    metadata = plan_topk_v2(seq_lens, static_threshold=2**31)
+    torch.cuda.synchronize()
+    threshold_u32 = metadata[0, 0].item() & 0xFFFFFFFF
+    assert threshold_u32 == 2**31, f"static threshold not honored: {threshold_u32}"
+    assert metadata[0, 1].item() == 0, "rows routed past a 2^31 threshold"
+
+
+@torch.inference_mode()
+def test_topk_v1_negative_lengths() -> None:
+    """The v1 kernel dispatches on the same per-row lengths; negative
+    (padded) rows must take the same trivial all-(-1) path as in v2."""
+    k = 512
+    torch.manual_seed(20260714)
+    device = "cuda"
+    lens = [9000, 9000, -4, -1048576]
+    batch = len(lens)
+    width = (max(lens) + 3) & ~3
+    scores = torch.randn(batch, width, dtype=torch.float32, device=device)
+    seq_lens = torch.tensor(lens, dtype=torch.int32, device=device)
+    num_pages = (width + PAGE_SIZE - 1) // PAGE_SIZE
+    page_table, inv_cpu = _make_page_table(batch, num_pages, "perm", device)
+    out = torch.full((batch, k), 7, dtype=torch.int32, device=device)  # poison
+
+    topk_transform_512(scores, seq_lens, page_table, out, PAGE_SIZE)
+    torch.cuda.synchronize()
+
+    # naive_transform fills every slot >= length with -1, so the poison also
+    # proves the negative rows were actually processed (not skipped).
+    for i, L in enumerate(lens):
+        if L < 0:
+            assert (out[i] == -1).all(), f"row {i} (len={L}): out not all -1"
+    clamped = torch.tensor([max(L, 0) for L in lens], dtype=torch.int32)
+    out_cpu = out.cpu().tolist()
+    our_raw = [_invert(out_cpu[i], inv_cpu[i]) for i in range(batch)]
+    ref_raw = _reference(scores, clamped, k)
+    _assert_topk_close(scores.cpu(), ref_raw, our_raw, batch, clamped, k)
 
 
 if __name__ == "__main__":

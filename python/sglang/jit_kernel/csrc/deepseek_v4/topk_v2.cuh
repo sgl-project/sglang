@@ -97,6 +97,12 @@ struct TopKLaunchParams {
     };
   }
   SGL_DEVICE TopKProblem problem(uint32_t batch_id) const {
+    // The bit pattern of a negative length (DP-padded / idle-companion row)
+    // is preserved here; the trivial-path dispatch compares it as SIGNED, so
+    // such rows fall into trivial_transform and yield the all-(-1) output
+    // instead of being reinterpreted as a ~4e9-token row (illegal memory
+    // access, or a silently corrupted output row when the unsigned chunk
+    // arithmetic happens to wrap).
     return this->problem(batch_id, static_cast<uint32_t>(seq_lens[batch_id]));
   }
 };
@@ -133,12 +139,21 @@ SGL_DEVICE void for_each_item(uint32_t topk, const F& f) {
   }
 }
 
+/// Trivial (seq_len <= topk) dispatch, compared as SIGNED so that negative
+/// (DP-padded / idle-companion) lengths also land here and fill the row with
+/// -1 -- every non-negative candidate index compares >= -1, i.e. none wins.
+SGL_DEVICE bool is_trivial(const TopKProblem& problem) {
+  return static_cast<int32_t>(problem.seq_len) <= static_cast<int32_t>(problem.topk);
+}
+
 template <bool kPDL>
 SGL_DEVICE void trivial_transform(const TopKProblem& problem) {
   device::PDLWaitPrimary<kPDL>();
   device::PDLTriggerSecondary<kPDL>();
   for_each_item(problem.topk, [&](uint32_t tx, uint32_t) {
-    problem.transform_output(tx, tx < problem.seq_len ? static_cast<int32_t>(tx) : -1);
+    // signed compare: for a negative seq_len no index qualifies -> all -1
+    const bool valid = static_cast<int32_t>(tx) < static_cast<int32_t>(problem.seq_len);
+    problem.transform_output(tx, valid ? static_cast<int32_t>(tx) : -1);
   });
 }
 
@@ -166,7 +181,7 @@ TOPK_KERNEL void topk_main_kernel(const __grid_constant__ TopKLaunchParams param
   auto problem = params.problem(blockIdx.x);
   constexpr uint32_t kU32Max = std::numeric_limits<uint32_t>::max();
   __shared__ impl::MaxSmem<Register2::Smem, Register4::Smem, Streaming::Smem> smem;
-  if (problem.seq_len <= problem.topk) return trivial_transform<kPDL>(problem);
+  if (is_trivial(problem)) return trivial_transform<kPDL>(problem);
   __shared__ int32_t topk_indices[kMaxTopK];
   problem.out = topk_indices;
 
@@ -206,7 +221,7 @@ CLUSTER_TOPK_KERNEL void topk_small_batch_kernel(const __grid_constant__ TopKLau
   device::enable_smem_spilling();
   auto problem = params.problem(blockIdx.x);
   __shared__ impl::MaxSmem<Streaming::Smem, Cluster::Smem> smem;
-  if (problem.seq_len <= problem.topk) return trivial_transform<kPDL>(problem);
+  if (is_trivial(problem)) return trivial_transform<kPDL>(problem);
   __shared__ int32_t topk_indices[kMaxTopK];
   problem.out = topk_indices;
 
@@ -232,7 +247,7 @@ CLUSTER_TOPK_KERNEL void topk_small_batch_kernel(const __grid_constant__ TopKLau
 
 // --- Plan: choose cluster_threshold from the seq_len distribution -----------
 __global__ __launch_bounds__(kBlockSize, 1) void topk_plan(
-    const uint32_t* __restrict__ seq_lens,
+    const int32_t* __restrict__ seq_lens,
     PlanItem* __restrict__ metadata,  // [0]=GlobalMetadata, [1+i]=PlanItem
     const uint32_t batch_size,
     const uint32_t static_cluster_threshold) {
@@ -272,11 +287,13 @@ __global__ __launch_bounds__(kBlockSize, 1) void topk_plan(
     if (tx == 0) s_threshold = static_cluster_threshold;
   } else {
     for (uint32_t i = tx; i < batch_size; i += kBlockSize) {
-      const uint32_t sl = seq_lens[i];
+      // signed compare: negative (DP-padded / idle-companion) lengths never
+      // count toward any candidate threshold
+      const int32_t sl = seq_lens[i];
       uint32_t count = 0;
 #pragma unroll
       for (uint32_t j = 0; j < kNumCandidates; ++j) {
-        count += (sl > kCandidates[j].threshold ? 1 : 0);
+        count += (sl > static_cast<int32_t>(kCandidates[j].threshold) ? 1 : 0);
       }
       if (count > 0) atomicAdd(&s_counts[count - 1], 1);
     }
@@ -300,10 +317,14 @@ __global__ __launch_bounds__(kBlockSize, 1) void topk_plan(
   // Compact items with seq_len > threshold into metadata[1..N]: their batch ids
   // are the work list the persistent cluster pool fetches.
   for (uint32_t i = tx; i < batch_size; i += kBlockSize) {
-    const uint32_t sl = seq_lens[i];
-    if (sl > cluster_threshold) {
+    // signed guard first: negative (padded) rows are never routed to the pool
+    // as ~4e9-token items. The threshold compare itself stays unsigned so a
+    // full-uint32 static_cluster_threshold (> INT32_MAX) keeps its meaning --
+    // for a proven-positive sl this pair is exactly the old unsigned compare.
+    const int32_t sl = seq_lens[i];
+    if (sl > 0 && static_cast<uint32_t>(sl) > cluster_threshold) {
       const auto pos = atomicAdd(&s_count, 1);
-      metadata[1 + pos] = {i, sl};
+      metadata[1 + pos] = {i, static_cast<uint32_t>(sl)};
     }
   }
   __syncthreads();
@@ -338,7 +359,7 @@ struct TopKKernel {
     const auto device = device_.unwrap();
     LaunchKernel(1, kBlockSize, device)(  //
         topk_plan,
-        static_cast<const uint32_t*>(seq_lens.data_ptr()),
+        static_cast<const int32_t*>(seq_lens.data_ptr()),
         static_cast<PlanItem*>(metadata.data_ptr()),
         batch_size,
         static_cluster_threshold);
