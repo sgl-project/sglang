@@ -387,7 +387,11 @@ if is_blackwell_supported() and is_flashinfer_available():
             input,
             is_sf_swizzled_layout=is_sf_swizzled_layout,
             alignment=alignment,
-            sf_swizzle_layout=SfLayout.layout_128x4,
+            sf_swizzle_layout=(
+                SfLayout.layout_128x4
+                if is_sf_swizzled_layout
+                else SfLayout.layout_linear
+            ),
         )
 
     @register_custom_op(
