@@ -379,6 +379,8 @@ class FlashInferAttnBackend(AttentionBackend):
         self.max_context_len = model_runner.model_config.context_len
         self.page_size = model_runner.page_size
         self.skip_prefill = skip_prefill
+        self.is_draft_runner = model_runner.is_draft_worker
+        self.cuda_graph_custom_mask = None
         self.is_multimodal = model_runner.model_config.is_multimodal
         assert not (
             model_runner.sliding_window_size is not None
@@ -1042,12 +1044,13 @@ class FlashInferAttnBackend(AttentionBackend):
             if len(self.cuda_graph_kv_indices[i]) > 0:
                 self.cuda_graph_kv_indices[i][0] = 0
 
-        if not self.skip_prefill:
+        if not self.skip_prefill and not self.is_draft_runner:
             self.cuda_graph_custom_mask = torch.zeros(
                 (max_num_tokens * self.max_context_len),
                 dtype=torch.uint8,
                 device="cuda",
             )
+        if not self.skip_prefill:
             self.cuda_graph_qk_indptr = [x.clone() for x in self.kv_indptr]
             self.cuda_graph_qo_indptr = [x.clone() for x in self.kv_indptr]
 
