@@ -10,6 +10,7 @@ from sglang.srt.function_call.core_types import (
     StructureInfo,
     _GetInfoFunc,
 )
+from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
 
 logger = logging.getLogger(__name__)
 
@@ -39,10 +40,14 @@ class Qwen25Detector(BaseFormatDetector):
         self.eot_token = "\n</tool_call>"
         self.tool_call_separator = "\n"
         self._normal_text_buffer = ""  # Buffer for handling partial end tokens
+        self._xml_detector = Qwen3CoderDetector()
+        self._streaming_xml = False
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a Qwen 2.5 format tool call."""
-        return self.bot_token in text
+        return self.bot_token in text or (
+            "<function=" in text and self._xml_detector.has_tool_call(text)
+        )
 
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         """
@@ -52,6 +57,9 @@ class Qwen25Detector(BaseFormatDetector):
         :param tools: List of available tools.
         :return: ParseResult indicating success or failure, consumed text, leftover text, and parsed calls.
         """
+        if "<function=" in text and self._xml_detector.has_tool_call(text):
+            return self._xml_detector.detect_and_parse(text, tools)
+
         idx = text.find(self.bot_token)
         normal_text = text[:idx].strip() if idx != -1 else text
         if self.bot_token not in text:
@@ -79,6 +87,17 @@ class Qwen25Detector(BaseFormatDetector):
         Streaming incremental parsing for Qwen 2.5 tool calls.
         Uses base class implementation with buffering to handle partial end tokens.
         """
+        pending_text = self._buffer + new_text
+        if self._streaming_xml or (
+            "<function=" in pending_text
+            and self._xml_detector.has_tool_call(pending_text)
+        ):
+            self._streaming_xml = True
+            if self._buffer:
+                new_text = self._buffer + new_text
+                self._buffer = ""
+            return self._xml_detector.parse_streaming_increment(new_text, tools)
+
         result = super().parse_streaming_increment(new_text, tools)
 
         # Handle partial end tokens that are streamed character by character
