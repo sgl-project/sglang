@@ -32,7 +32,7 @@ from typing import (
 import torch
 import torch.nn.functional as F
 
-from sglang.srt.runtime_context import get_exec, get_lora, get_parallel
+from sglang.srt.runtime_context import get_parallel
 
 try:
     from triton_kernels.matmul_ogs import GatherIndx, RoutingData, ScatterIndx
@@ -83,7 +83,9 @@ except ImportError:
     pass
 
 from sglang.kernels.ops.attention.dsv4 import mask_topk_ids
-from sglang.srt.distributed import get_tp_group
+from sglang.srt.distributed import (
+    get_tp_group,
+)
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -96,7 +98,9 @@ from sglang.srt.eplb.expert_location_dispatch import (
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import get_moe_runner_backend
-from sglang.srt.layers.moe.utils import has_per_rank_fused_shared_slots
+from sglang.srt.layers.moe.utils import (
+    has_per_rank_fused_shared_slots,
+)
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 from sglang.srt.utils import (
@@ -415,9 +419,10 @@ class TopK(MultiPlatformOp):
             assert num_expert_group is not None and topk_group is not None
 
         self.layer_id = layer_id
+        from sglang.srt.runtime_context import get_server_args
 
         self.enable_waterfill = (
-            num_fused_shared_experts > 0 and get_exec().moe.enable_waterfill
+            num_fused_shared_experts > 0 and get_server_args().enable_waterfill
         )
 
         self.waterfill_balancer = None
@@ -491,8 +496,9 @@ class TopK(MultiPlatformOp):
         # ===== TO BE REFACTORED ====
         elif get_moe_runner_backend().is_experimental_sgl_trtllm():
             try:
+                from sglang.srt.runtime_context import get_server_args
 
-                use_standard_for_lora = bool(get_lora().enable_lora)
+                use_standard_for_lora = bool(get_server_args().enable_lora)
             except ValueError:
                 use_standard_for_lora = False
             output_format = (
