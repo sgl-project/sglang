@@ -15,8 +15,7 @@ from sglang.srt.layers.attention.linear.linear_metadata import (
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.runtime_context import get_parallel
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_parallel, get_server_args
 
 logger = logging.getLogger(__name__)
 
@@ -299,7 +298,7 @@ class LightningAttentionBackend(MambaAttnBackendBase):
         if h_dst is None or h_dst.numel() == 0:
             return None, None
 
-        mamba_cache_chunk_size = get_global_server_args().mamba_cache_chunk_size
+        mamba_cache_chunk_size = get_server_args().mamba_cache_chunk_size
         num_prefills = metadata.num_prefills
         track_mask = forward_batch.mamba_track_mask[:num_prefills]
         extend_lens = forward_batch.extend_seq_lens[:num_prefills]
