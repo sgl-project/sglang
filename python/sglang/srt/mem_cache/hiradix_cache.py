@@ -775,6 +775,10 @@ class HiRadixCache(RadixCache):
         self.evictable_host_leaves.clear()
         super().reset()
 
+    def release_host_resources(self) -> None:
+        if self.token_to_kv_pool_host is not None:
+            self.token_to_kv_pool_host.destroy()
+
     def get_height(self, node: TreeNode):
         height = 0
         while node != self.root_node:

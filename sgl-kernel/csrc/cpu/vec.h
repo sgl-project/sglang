@@ -44,6 +44,17 @@ inline std::tuple<Vectorized<float>, Vectorized<float>> load_float_vec2(const fl
   return std::make_tuple(x0, x1);
 }
 
+template <typename scalar_t, typename std::enable_if_t<is_reduced_floating_point_v<scalar_t>, int> = 1>
+inline at::vec::Vectorized<float> load_float_vec(const scalar_t* __restrict__ data) {
+  at::vec::Vectorized<float> out;
+  if constexpr (std::is_same_v<scalar_t, at::BFloat16>) {
+    at::vec::load_fp32_from_bf16(data, out);
+  } else {
+    at::vec::load_fp32_from_fp16(data, out);
+  }
+  return out;
+}
+
 #if defined(CPU_CAPABILITY_AVX512)
 
 // `at::vec::convert_from_float<>` from PyTorch doesn't have avx512-bf16 intrinsics

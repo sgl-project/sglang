@@ -814,7 +814,7 @@ def fused_gather_scatter_to_sconv_cache(
         and hidden_states.stride(-1) == 1
         and sconv_cache.stride(2) == 1
     ):
-        from sglang.jit_kernel.inkling_sconv import (
+        from sglang.kernels.ops.mamba.inkling_sconv import (
             fused_gather_scatter_to_sconv_cache as _cuda_gs,
         )
 
@@ -988,7 +988,7 @@ def fused_draft_extend_sconv_cache(
         and hidden_states.stride(-1) == 1
         and sconv_cache.stride(2) == 1
     ):
-        from sglang.jit_kernel.inkling_sconv import (
+        from sglang.kernels.ops.mamba.inkling_sconv import (
             fused_draft_extend_sconv_cache as _cuda_de,
         )
 

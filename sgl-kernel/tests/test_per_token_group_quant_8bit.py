@@ -1,8 +1,5 @@
 import itertools
-import os
 import sys
-import time
-from pathlib import Path
 
 import pytest
 import torch
@@ -17,7 +14,7 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
 from sglang.kernels.ops.quantization.fp8_kernel import (
     sglang_per_token_group_quant_8bit,
 )
-from sglang.srt.utils import get_bool_env_var, is_hip
+from sglang.srt.utils import is_hip
 
 _is_hip = is_hip()
 fp8_type_ = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
@@ -156,7 +153,7 @@ def test_per_token_group_quant_with_column_major(
         *triton_per_token_group_quant_8bit(**execute_kwargs)
     )
     x_q_sglang, x_s_sglang = _postprocess(
-        *sglang_per_token_group_quant_8bit(**execute_kwargs, enable_v2=True)
+        *sglang_per_token_group_quant_8bit(**execute_kwargs)
     )
 
     try:
