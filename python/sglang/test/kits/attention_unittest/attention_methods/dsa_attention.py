@@ -1133,11 +1133,14 @@ def dsa_impl_capability(impl: str) -> tuple[bool, str]:
 
     if impl == "fa3":
         try:
-            from sglang.jit_kernel.flash_attention import (  # noqa: F401
+            from sglang.kernels.ops.attention.flash_attention import (  # noqa: F401
                 flash_attn_with_kvcache,
             )
         except ImportError as exc:
-            return False, f"sglang.jit_kernel.flash_attention unavailable: {exc}"
+            return (
+                False,
+                f"sglang.kernels.ops.attention.flash_attention unavailable: {exc}",
+            )
         # sgl-kernel flash_attn is compiled for SM9.x (Hopper) only;
         # it raises NotImplementedError on Blackwell (SM10.x+).
         if major < 9 or major >= 10:
