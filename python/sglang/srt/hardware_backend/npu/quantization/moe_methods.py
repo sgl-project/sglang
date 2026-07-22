@@ -428,7 +428,7 @@ class NPUW4A8Int8MoEMethod(_NPUMoEMethodBase):
                     layer,
                     f"{weight_prefix}_scale_bias",
                     torch.nn.Parameter(
-                        bias.data.transpose(1, 2).sum(dim=1).contiguous(),
+                        bias.data.contiguous(),
                         requires_grad=False,
                     ),
                 )
