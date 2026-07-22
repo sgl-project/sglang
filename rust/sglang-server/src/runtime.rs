@@ -67,67 +67,112 @@ impl Default for RuntimeConfig {
             cores: None,
             tokenizer_path: None,
             revision: None,
-            server_args: Arc::new(ServerArgs::default()),
+            server_args: Arc::new(
+                ServerArgs::from_json("{}").expect("empty server_args blob parses"),
+            ),
         }
     }
 }
 
-/// Static server metadata for config endpoints (`/v1/models`, …) — the JSON
-/// blob the Python scheduler dumps from `server_args` + `model_config` at
-/// startup, parsed once and read by key. Immutable after construction; the
-/// per-request sharing into each `AppState` is done via an external `Arc`
-/// (see `api_server::AppState`), so the struct itself just owns its data. There
-/// is no exposure concern: these threads run inside the scheduler process, and
-/// each endpoint chooses what to return.
-#[derive(Default, Debug)]
+/// The scheduler's startup blob (`RustServer._build_server_args`) parsed once into
+/// typed fields: values are post-`__post_init__`, unknown keys (e.g. `api_key`) are dropped.
+#[derive(Debug, serde::Deserialize)]
 pub struct ServerArgs {
-    data: serde_json::Value,
+    /// HF repo id / local dir of the model, reported by `/get_model_info`.
+    #[serde(default)]
+    pub model_path: String,
+    /// Model name reported by `/v1/models` and `/server_info`.
+    #[serde(default)]
+    pub served_model_name: String,
+    /// Tokenizer source (model dir / `tokenizer.json` / HF repo id). Empty only
+    /// in minimal standalone blobs — then boot requires `skip_tokenizer_init`.
+    #[serde(default)]
+    pub tokenizer_path: String,
+    /// HF revision, used only when `tokenizer_path` is a repo id. `None` → main.
+    #[serde(default)]
+    pub revision: Option<String>,
+    /// HTTP bind address (see [`Self::bind`]).
+    #[serde(default = "default_host")]
+    pub host: String,
+    #[serde(default = "default_port")]
+    pub port: u16,
+    /// Log levels driving the access log — uvicorn runs at
+    /// `log_level_http or log_level` (see [`Self::http_access_log_enabled`]).
+    #[serde(default = "default_log_level")]
+    pub log_level: String,
+    #[serde(default)]
+    pub log_level_http: Option<String>,
+    /// Pinned tokenizer threads / detok shards (Python asserts both ≥ 1).
+    #[serde(default = "default_worker_num")]
+    pub tokenizer_worker_num: usize,
+    #[serde(default = "default_worker_num")]
+    pub detokenizer_worker_num: usize,
+    /// Token-ids-in / token-ids-out mode: no tokenizer load, raw `output_ids`
+    /// frames (drives the `Skip` detok backend and the ingress branch).
+    #[serde(default)]
+    pub skip_tokenizer_init: bool,
+    /// Streamed `/generate` frames carry per-step deltas instead of cumulative
+    /// text. Matches the Python `TokenizerManager`.
+    #[serde(default)]
+    pub incremental_streaming_output: bool,
+    /// The resolved Python `ModelConfig`, attached to the blob at dump time.
+    #[serde(default)]
+    pub model_config: ModelConfig,
+    /// Launch-time stamps (not `server_args` fields): sglang package version
+    /// and the scheduler-derived KV token capacity, reported by `/server_info`.
+    #[serde(default)]
+    pub version: Option<String>,
+    #[serde(default)]
+    pub max_total_num_tokens: Option<u64>,
+}
+
+/// The slice of the resolved Python `ModelConfig` the rust server reads.
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct ModelConfig {
+    /// Resolved context length (`max_model_len` in `/v1/models`); mandatory at
+    /// boot ([`ServerArgs::validate_mandatory`]).
+    #[serde(default)]
+    pub context_len: Option<u64>,
+    /// Bounds client-supplied token ids — ingress 400s out-of-vocab ids before
+    /// they crash the scheduler's embedding lookup. `None` → unvalidated.
+    #[serde(default)]
+    pub vocab_size: Option<u64>,
+}
+
+fn default_host() -> String {
+    "127.0.0.1".into()
+}
+fn default_port() -> u16 {
+    30000
+}
+fn default_log_level() -> String {
+    "info".into()
+}
+fn default_worker_num() -> usize {
+    1
 }
 
 impl ServerArgs {
-    /// Parse the JSON blob; errors on malformed JSON.
+    /// Parse the blob; errors on malformed JSON or a wrongly-typed field.
     pub fn from_json(s: &str) -> Result<Self, String> {
-        let data: serde_json::Value = serde_json::from_str(s).map_err(|e| e.to_string())?;
-        Ok(Self { data })
+        serde_json::from_str(s).map_err(|e| e.to_string())
     }
 
-    /// Fail fast at startup if a field an endpoint depends on can't be resolved.
+    /// Fail fast at startup if a field an endpoint depends on is missing.
     pub fn validate_mandatory(&self) -> Result<(), String> {
-        if self.served_model_name().is_empty() {
-            return Err("no 'served_model_name' or 'model_path' in server_args".into());
+        if self.served_model_name.is_empty() {
+            return Err("no 'served_model_name' in server_args".into());
         }
-        if self.context_len().is_none() {
+        if self.model_config.context_len.is_none() {
             return Err("no resolvable context length (model_config.context_len)".into());
         }
         Ok(())
     }
 
-    /// `served_model_name`, falling back to `model_path` (the dump mirrors
-    /// server_args, where `served_model_name` is `None` unless the user set it).
-    pub fn served_model_name(&self) -> &str {
-        self.str_field("served_model_name")
-            .filter(|s| !s.is_empty())
-            .or_else(|| self.str_field("model_path"))
-            .unwrap_or("")
-    }
-
-    /// The model path (HF repo id / local dir) reported by `/get_model_info`.
-    /// Falls back to the served name if `model_path` is absent.
-    pub fn model_path(&self) -> &str {
-        self.str_field("model_path")
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| self.served_model_name())
-    }
-
-    /// `max_model_len` for `/v1/models`: the resolved `model_config.context_len`
-    /// (model_config is attached to server_args before the dump), falling back
-    /// to the `context_length` user override.
-    pub fn context_len(&self) -> Option<u64> {
-        self.data
-            .get("model_config")
-            .and_then(|m| m.get("context_len"))
-            .and_then(|v| v.as_u64())
-            .or_else(|| self.data.get("context_length").and_then(|v| v.as_u64()))
+    /// Bind address `host:port`. `host` is expected to be an IP — the result is
+    /// parsed as a `SocketAddr`.
+    pub fn bind(&self) -> String {
+        format!("{}:{}", self.host, self.port)
     }
 
     /// Whether the HTTP access log is emitted, mirroring the Python server:
@@ -135,118 +180,21 @@ impl ServerArgs {
     /// only at info/debug. `--log-level-http warning` turns them off.
     pub fn http_access_log_enabled(&self) -> bool {
         let level = self
-            .str_field("log_level_http")
+            .log_level_http
+            .as_deref()
             .filter(|s| !s.is_empty())
-            .or_else(|| self.str_field("log_level"))
-            .unwrap_or("info");
+            .unwrap_or(&self.log_level);
         matches!(
             level.to_ascii_lowercase().as_str(),
             "trace" | "debug" | "info"
         )
     }
 
-    /// Bind address `host:port` from the dumped server_args (both must be
-    /// present). `host` is expected to be an IP — it's parsed as a `SocketAddr`.
-    pub fn bind(&self) -> String {
-        let host = self.str_field("host").unwrap_or("localhost");
-        let port = self.usize_field("port").unwrap_or(30000);
-        format!("{host}:{port}")
-    }
-
-    /// Tokenizer source: explicit `tokenizer_path`, falling back to `model_path`
-    /// (a model dir / HF repo id the Rust backend resolves). `None` → no tokenizer.
-    /// Mirrors the Python `server_args.tokenizer_path or server_args.model_path`.
-    pub fn tokenizer_path(&self) -> Option<String> {
-        self.str_field("tokenizer_path")
-            .filter(|s| !s.is_empty())
-            .or_else(|| self.str_field("model_path"))
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned)
-    }
-
-    /// `model_config.vocab_size` — bounds client-supplied token ids (the
-    /// scheduler crashes on an out-of-vocabulary embedding lookup, so the
-    /// ingress must 400 first, mirroring the Python TokenizerManager).
-    pub fn vocab_size(&self) -> Option<u64> {
-        self.data
-            .get("model_config")
-            .and_then(|m| m.get("vocab_size"))
-            .and_then(|v| v.as_u64())
-    }
-
-    /// sglang package version, stamped into the blob by `_build_server_args`.
-    pub fn version(&self) -> Option<&str> {
-        self.str_field("version").filter(|s| !s.is_empty())
-    }
-
-    /// Scheduler-derived KV token capacity, stamped at launch (the Python
-    /// `/server_info` reports it from `scheduler_info` the same way).
-    pub fn max_total_num_tokens(&self) -> Option<u64> {
-        self.data
-            .get("max_total_num_tokens")
-            .and_then(|v| v.as_u64())
-    }
-
-    /// HF `revision`, used only when `tokenizer_path` is a repo id. `None` → main.
-    pub fn revision(&self) -> Option<String> {
-        self.str_field("revision")
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned)
-    }
-
-    /// `tokenizer_worker_num` — pinned tokenizer threads (server_args default 1).
-    pub fn tokenizer_worker_num(&self) -> usize {
-        self.usize_field("tokenizer_worker_num").unwrap_or(1)
-    }
-
-    /// `detokenizer_worker_num` — pinned detok shards (server_args default 1).
-    pub fn detokenizer_worker_num(&self) -> usize {
-        self.usize_field("detokenizer_worker_num").unwrap_or(1)
-    }
-
-    /// Pinned API threads for the embedded HTTP api-server (server_args
-    /// default 4).
+    /// Pinned API threads for the embedded HTTP api-server. Python `server_args`
+    /// has no such field — this is derived: enough to cover the widest pool.
     pub fn api_worker_num(&self) -> usize {
-        let default_worker_num = 4
-            .max(self.tokenizer_worker_num())
-            .max(self.detokenizer_worker_num());
-        self.usize_field("api_worker_num")
-            .unwrap_or(default_worker_num)
-    }
-
-    /// `skip_tokenizer_init`: when set the server neither tokenizes input nor
-    /// detokenizes output — clients send token ids and receive token ids back.
-    /// Drives the detok backend (`Skip`, raw `output_ids` frames) and the
-    /// ingress branch (already-tokenized only). Read from the dumped blob so it
-    /// stays a single source of truth with the rest of `server_args`.
-    pub fn skip_tokenizer_init(&self) -> bool {
-        self.data
-            .get("skip_tokenizer_init")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false)
-    }
-
-    /// `incremental_streaming_output` (default `false`): when set, each streamed
-    /// `/generate` frame carries this step's **delta** `text`/`output_ids` rather
-    /// than the cumulative text so far. Matches the Python `TokenizerManager`.
-    pub fn incremental_streaming_output(&self) -> bool {
-        self.data
-            .get("incremental_streaming_output")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false)
-    }
-
-    fn str_field(&self, key: &str) -> Option<&str> {
-        self.data.get(key).and_then(|v| v.as_str())
-    }
-
-    /// A positive integer field (zero/absent → `None`, so callers default it).
-    fn usize_field(&self, key: &str) -> Option<usize> {
-        self.data
-            .get(key)
-            .and_then(|v| v.as_u64())
-            .filter(|&n| n > 0)
-            .map(|n| n as usize)
+        4.max(self.tokenizer_worker_num)
+            .max(self.detokenizer_worker_num)
     }
 }
 
@@ -346,7 +294,7 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
 
     // `skip_tokenizer_init`: clients send token ids and receive token ids — no
     // tokenizer is loaded, and the egress emits raw `output_ids` (no decode).
-    let skip_tokenizer_init = cfg.server_args.skip_tokenizer_init();
+    let skip_tokenizer_init = cfg.server_args.skip_tokenizer_init;
 
     // The same instance is shared by the tokenizer pool (encode) and the detok
     // shards (decode); `None` only under `skip_tokenizer_init`.
@@ -442,7 +390,7 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
                 senders.clone(),
                 ingress_tx,
                 skip_tokenizer_init,
-                cfg.server_args.vocab_size(),
+                cfg.server_args.model_config.vocab_size,
                 shutdown_rx.clone(),
             )
         });
