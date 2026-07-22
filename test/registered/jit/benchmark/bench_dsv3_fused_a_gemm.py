@@ -1,5 +1,4 @@
-"""Benchmark for DeepSeek V3 fused QKV-A GEMM: CuTe DSL vs CUDA JIT vs
-sgl_kernel AOT vs torch.
+"""Benchmark for DeepSeek V3 fused QKV-A GEMM: CuTe DSL vs CUDA JIT vs torch.
 
 Run on SM90+ (Hopper or later):
     python test/registered/jit/benchmark/bench_dsv3_fused_a_gemm.py
@@ -8,7 +7,6 @@ Run on SM90+ (Hopper or later):
 import torch
 import torch.nn.functional as F
 import triton.testing
-from sgl_kernel import dsv3_fused_a_gemm as sgl_kernel_dsv3_fused_a_gemm
 
 from sglang.jit_kernel.benchmark import marker
 from sglang.jit_kernel.cutedsl_dsv3_fused_a_gemm import (
@@ -16,7 +14,6 @@ from sglang.jit_kernel.cutedsl_dsv3_fused_a_gemm import (
 )
 from sglang.jit_kernel.dsv3_fused_a_gemm import dsv3_fused_a_gemm
 from sglang.jit_kernel.utils import get_jit_cuda_arch, is_hip_runtime
-from sglang.srt.utils.common import is_sm120_supported
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.utils import is_in_ci
 
@@ -31,14 +28,11 @@ DEVICE = "cuda"
 HD_OUT = 2112
 HD_IN_LIST = [6144, 7168]
 
-AOT_HD_IN = 7168
-HAS_AOT = not is_sm120_supported()
-
 NUM_TOKENS_LIST = [1, 8, 16] if IS_CI else list(range(1, 17))
 
-LINE_VALS = ["cutedsl", "jit", "sgl_kernel", "torch"]
-LINE_NAMES = ["CuTe DSL", "CUDA JIT", "sgl_kernel AOT", "torch F.linear"]
-STYLES = [("blue", "-"), ("orange", "--"), ("red", ":"), ("green", "-.")]
+LINE_VALS = ["cutedsl", "jit", "torch"]
+LINE_NAMES = ["CuTe DSL", "CUDA JIT", "torch F.linear"]
+STYLES = [("blue", "-"), ("orange", "--"), ("green", "-.")]
 
 
 def _median_us(fn, *args) -> float:
@@ -53,15 +47,11 @@ def _median_us(fn, *args) -> float:
 
 
 def _bench(num_tokens, provider, hd_in):
-    if provider == "sgl_kernel" and not (HAS_AOT and hd_in == AOT_HD_IN):
-        return float("nan")
-
     mat_a = torch.randn((num_tokens, hd_in), dtype=DTYPE, device=DEVICE)
     mat_b = torch.randn((HD_OUT, hd_in), dtype=DTYPE, device=DEVICE).transpose(0, 1)
     fn_map = {
         "cutedsl": cutedsl_dsv3_fused_a_gemm,
         "jit": dsv3_fused_a_gemm,
-        "sgl_kernel": sgl_kernel_dsv3_fused_a_gemm,
         "torch": lambda a, b: F.linear(a, b.T),
     }
     return _median_us(fn_map[provider], mat_a, mat_b)

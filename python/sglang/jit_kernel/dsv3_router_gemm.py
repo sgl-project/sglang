@@ -1,7 +1,7 @@
 """
 JIT kernel for DeepSeek V3 router GEMM.
 
-Replaces the AOT sgl_kernel.dsv3_router_gemm for SM90+ (Hopper) GPUs.
+Runtime-compiled CUDA C++ kernel for SM90+ (Hopper) GPUs.
 Supports num_experts in {256, 384}, hidden_dim a multiple of 1024, num_tokens 1-16.
 """
 

@@ -1,8 +1,7 @@
 """Unified entry point for the DeepSeek-V3 fused QKV-A GEMM.
 
-Dispatches to one of three interchangeable implementations via ``backend``:
+Dispatches to one of two interchangeable implementations via ``backend``:
 
-- ``"aot"``: prebuilt ``sgl_kernel.dsv3_fused_a_gemm`` (CUDA C++).
 - ``"jit"``: runtime-compiled CUDA C++ (``sglang.jit_kernel.dsv3_fused_a_gemm``).
 - ``"cutedsl"``: CuTe DSL (``sglang.jit_kernel.cutedsl_dsv3_fused_a_gemm``).
 - ``"auto"``: CuTe DSL on SM120+, otherwise the JIT kernel.
@@ -21,7 +20,6 @@ from sglang.srt.utils.common import get_device_sm, is_cuda, is_sm120_supported
 
 class FusedAGemmBackend(str, Enum):
     AUTO = "auto"
-    AOT = "aot"
     JIT = "jit"
     CUTEDSL = "cutedsl"
 
@@ -70,9 +68,7 @@ def dsv3_fused_a_gemm(
     if backend == FusedAGemmBackend.AUTO:
         backend = _AUTO_BACKEND
 
-    if backend == FusedAGemmBackend.AOT:
-        from sgl_kernel import dsv3_fused_a_gemm as impl
-    elif backend == FusedAGemmBackend.JIT:
+    if backend == FusedAGemmBackend.JIT:
         from sglang.jit_kernel.dsv3_fused_a_gemm import dsv3_fused_a_gemm as impl
     else:
         from sglang.jit_kernel.cutedsl_dsv3_fused_a_gemm import (
