@@ -13,9 +13,8 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-register_cuda_ci(est_time=450, stage="extra-b", runner_config="deepep-8-gpu-h200")
-DEEPSEEK_V32_MODEL_PATH = "/home/t4/models/deepSeek-v32-real"
-SERVER_LAUNCH_TIMEOUT = max(DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH, 1800)
+register_cuda_ci(est_time=616, stage="extra-b", runner_config="deepep-8-gpu-h200")
+DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2"
 
 
 class TestDeepseekV32CPInSeqSplit(CustomTestCase):
@@ -30,8 +29,6 @@ class TestDeepseekV32CPInSeqSplit(CustomTestCase):
             "--enable-dp-attention",
             "--dp",
             "2",
-            "--dist-timeout",
-            str(SERVER_LAUNCH_TIMEOUT),
             "--attn-cp-size",
             "4",
             "--enable-dsa-prefill-context-parallel",
@@ -57,9 +54,8 @@ class TestDeepseekV32CPInSeqSplit(CustomTestCase):
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
-            timeout=SERVER_LAUNCH_TIMEOUT,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=other_args,
-            env={"SGLANG_ENABLE_CP_V2": "0"},
         )
 
     @classmethod
@@ -124,7 +120,7 @@ class TestDeepseekV32CPRoundRobinSplit(CustomTestCase):
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
-            timeout=SERVER_LAUNCH_TIMEOUT,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=other_args,
             env={"SGLANG_ENABLE_CP_V2": "0"},
         )
@@ -151,7 +147,7 @@ class TestDeepseekV32CPRoundRobinSplit(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_a_gsm8k (deepseek-v32-cp-round-robin-split)\n"
+                f"### test_a_gsm8k (deepseek-v32-cp-in-seq-split)\n"
                 f'{metrics["score"]=:.3f}\n'
             )
             self.assertGreater(metrics["score"], 0.935)

@@ -14,7 +14,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=320, stage="extra-b", runner_config="deepep-8-gpu-h200")
-DEEPSEEK_V32_MODEL_PATH = "/home/t4/models/deepSeek-v32-real"
+DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2"
 SERVER_LAUNCH_TIMEOUT = max(DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH, 1800)
 
 
