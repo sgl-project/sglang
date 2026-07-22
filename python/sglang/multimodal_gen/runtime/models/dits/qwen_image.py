@@ -1292,6 +1292,25 @@ def to_hashable(obj):
     return obj
 
 
+def _repeat_conditioning_to_batch_size(
+    conditioning: Optional[torch.Tensor],
+    target_batch_size: int,
+    name: str,
+) -> Optional[torch.Tensor]:
+    if conditioning is None or conditioning.shape[0] == target_batch_size:
+        return conditioning
+
+    source_batch_size = conditioning.shape[0]
+    if source_batch_size <= 0 or target_batch_size % source_batch_size != 0:
+        raise ValueError(
+            f"{name} with batch size {source_batch_size} cannot expand to "
+            f"target batch size {target_batch_size}."
+        )
+
+    repeats = target_batch_size // source_batch_size
+    return conditioning.repeat_interleave(repeats, dim=0)
+
+
 class QwenImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     """
     The Transformer model introduced in Qwen.
@@ -1495,6 +1514,18 @@ class QwenImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             encoder_hidden_states = encoder_hidden_states[0]
         if isinstance(encoder_hidden_states_mask, list):
             encoder_hidden_states_mask = encoder_hidden_states_mask[0]
+
+        target_batch_size = hidden_states.shape[0]
+        encoder_hidden_states = _repeat_conditioning_to_batch_size(
+            encoder_hidden_states,
+            target_batch_size,
+            "encoder_hidden_states",
+        )
+        encoder_hidden_states_mask = _repeat_conditioning_to_batch_size(
+            encoder_hidden_states_mask,
+            target_batch_size,
+            "encoder_hidden_states_mask",
+        )
 
         hidden_states, _ = self.img_in(hidden_states)
 
