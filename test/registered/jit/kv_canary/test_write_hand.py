@@ -7,19 +7,6 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from sglang.jit_kernel.kv_canary import consts
-from sglang.jit_kernel.kv_canary import write as write_module
-from sglang.jit_kernel.kv_canary.consts import splitmix64, splitmix64_mix3
-from sglang.jit_kernel.kv_canary.verify import (
-    CANARY_SLOT_BYTES,
-    CanaryLaunchTag,
-    RealKvSource,
-    VerifyOrWriteContext,
-    launch_canary_verify_kernel,
-)
-from sglang.jit_kernel.kv_canary.write import (
-    launch_canary_write_kernel,
-)
 from sglang.jit_kernel.tests.kv_canary._canary_helpers import (
     FakeViolationLog,
     assert_canary_state_equal,
@@ -48,6 +35,19 @@ from sglang.jit_kernel.tests.kv_canary._fixtures import (
 from sglang.jit_kernel.tests.kv_canary._hand_oracle import (
     _hand_fold_all,
     _hand_fold_partial,
+)
+from sglang.kernels.ops.kv_canary import consts
+from sglang.kernels.ops.kv_canary import write as write_module
+from sglang.kernels.ops.kv_canary.consts import splitmix64, splitmix64_mix3
+from sglang.kernels.ops.kv_canary.verify import (
+    CANARY_SLOT_BYTES,
+    CanaryLaunchTag,
+    RealKvSource,
+    VerifyOrWriteContext,
+    launch_canary_verify_kernel,
+)
+from sglang.kernels.ops.kv_canary.write import (
+    launch_canary_write_kernel,
 )
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 

@@ -4,7 +4,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from sglang.jit_kernel.diffusion.ltx2_qknorm_split_rope import (
+from sglang.kernels.ops.diffusion.ltx2_qknorm_split_rope import (
     can_use_ltx2_qknorm_split_rope_cuda,
     ltx2_qknorm_split_rope_cuda,
 )

@@ -928,7 +928,7 @@ def flash_decode_with_topk_idx(
     # The page table + per-query effective KV length are allocated and returned.
     real_seq_lens = None
     if use_dense_main_attn:
-        from sglang.jit_kernel.minimax_decode_topk import (
+        from sglang.kernels.ops.attention.minimax_decode_topk import (
             minimax_decode_topk_page_table,
         )
 
@@ -960,7 +960,7 @@ def flash_decode_with_topk_idx(
         # Equivalent output to the 2-stage path (set of block ids, front-packed,
         # -1 padded); ~2-16x faster for long context. See
         # sglang/jit_kernel/minimax_decode_topk.py.
-        from sglang.jit_kernel.minimax_decode_topk import minimax_decode_topk
+        from sglang.kernels.ops.attention.minimax_decode_topk import minimax_decode_topk
 
         minimax_decode_topk(score, seq_lens, block_size, topk, out=topk_idx)
     else:

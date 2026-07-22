@@ -8,7 +8,7 @@ convention (cos|sin cache, neox pairs (i, i+rotary_dim/2)).
 import pytest
 import torch
 
-from sglang.jit_kernel.minimax_qknorm_rope import (
+from sglang.kernels.ops.attention.minimax_qknorm_rope import (
     minimax_qknorm_rope,
     minimax_qknorm_rope_grouped,
 )

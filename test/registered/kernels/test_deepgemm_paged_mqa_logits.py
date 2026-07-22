@@ -6,7 +6,7 @@ import sys
 import pytest
 import torch
 
-from sglang.jit_kernel.dsa import (
+from sglang.kernels.ops.attention.dsa import (
     deepgemm_paged_mqa_logits_native,
     deepgemm_paged_mqa_logits_split,
 )

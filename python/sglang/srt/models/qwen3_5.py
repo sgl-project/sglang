@@ -22,12 +22,11 @@ import torch
 import torch.nn as nn
 import triton
 
-from sglang.jit_kernel.triton.gdn_fused_proj import (
-    fused_qkvzba_split_reshape_cat_contiguous,
-)
-
 # Layers - Attention
 from sglang.kernels.ops.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
+from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
+    fused_qkvzba_split_reshape_cat_contiguous,
+)
 from sglang.kernels.ops.layernorm.elementwise import fused_sigmoid_mul
 
 # Configs

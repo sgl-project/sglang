@@ -13,7 +13,7 @@ from typing import Optional
 import pytest
 import torch
 
-from sglang.jit_kernel.moe_topk_sigmoid import topk_sigmoid
+from sglang.kernels.ops.moe.moe_topk_sigmoid import topk_sigmoid
 
 try:
     from sgl_kernel import topk_sigmoid as topk_sigmoid_aot

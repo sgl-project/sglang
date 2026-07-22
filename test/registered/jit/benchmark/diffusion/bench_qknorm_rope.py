@@ -153,7 +153,7 @@ def split_qknorm_rope(inputs: dict[str, torch.Tensor | bool]) -> None:
 
 
 def fused_qknorm_rope(inputs: dict[str, torch.Tensor | bool]) -> None:
-    from sglang.jit_kernel.diffusion.qknorm_rope import fused_inplace_qknorm_rope
+    from sglang.kernels.ops.diffusion.qknorm_rope import fused_inplace_qknorm_rope
 
     fused_inplace_qknorm_rope(
         inputs["q"],

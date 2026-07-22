@@ -21,13 +21,13 @@ from sglang.jit_kernel.benchmark.utils import (
     get_benchmark_range,
     run_benchmark,
 )
-from sglang.jit_kernel.kv_canary import consts
-from sglang.jit_kernel.kv_canary.verify import (
+from sglang.kernels.ops.kv_canary import consts
+from sglang.kernels.ops.kv_canary.verify import (
     CANARY_SLOT_BYTES,
     CanaryLaunchTag,
     VerifyOrWriteContext,
 )
-from sglang.jit_kernel.kv_canary.write import WritePlan, launch_canary_write_kernel
+from sglang.kernels.ops.kv_canary.write import WritePlan, launch_canary_write_kernel
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=900, suite="nightly-kernel-1-gpu", nightly=True)

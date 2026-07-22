@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Optional, Union
 import torch
 import triton
 
-from sglang.jit_kernel.fixup_zero_kv import fixup_zero_kv_rows
+from sglang.kernels.ops.attention.fixup_zero_kv import fixup_zero_kv_rows
 from sglang.kernels.ops.attention.pad import (
     pad_draft_extend_query as pad_draft_extend_query_triton,
 )

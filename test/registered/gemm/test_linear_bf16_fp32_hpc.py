@@ -1,6 +1,6 @@
 """Numerical tests for the HPC-Ops bf16xfp32 router GEMM path.
 
-Validates sglang.jit_kernel.dsv4.linear_bf16_fp32's HPC-Ops branch against
+Validates sglang.kernels.ops.attention.dsv4.linear_bf16_fp32's HPC-Ops branch against
 the fp32 reference on the LongCat-Flash router shapes. Skipped when HPC-Ops
 (https://github.com/Tencent/hpc-ops) is not installed or the GPU is not
 Hopper (the kernels ship sm90a only).
@@ -10,7 +10,7 @@ import unittest
 
 import torch
 
-from sglang.jit_kernel.dsv4.gemm import (
+from sglang.kernels.ops.attention.dsv4.gemm import (
     _hpc_gemm_bf16xfp32_available,
     _linear_bf16_fp32_hpc,
     linear_bf16_fp32,

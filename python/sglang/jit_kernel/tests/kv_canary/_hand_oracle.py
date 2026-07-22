@@ -4,7 +4,7 @@ diff comparison."""
 
 from __future__ import annotations
 
-from sglang.jit_kernel.kv_canary.consts import splitmix64
+from sglang.kernels.ops.kv_canary.consts import splitmix64
 
 
 def _fold_words(padded: bytes) -> int:

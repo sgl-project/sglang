@@ -1,6 +1,6 @@
 """Diffusion-model kernels (group-norm+silu, residual-gate-add, qk-norm+rope).
 
-These are JIT CUDA kernels; the wrappers forward to ``sglang.jit_kernel.diffusion``.
+These are JIT CUDA kernels; the wrappers forward to ``sglang.kernels.ops.diffusion``.
 """
 
 from __future__ import annotations
@@ -26,7 +26,7 @@ register_kernel(
     KernelSpec(
         op="diffusion.apply_group_norm_silu",
         backend=KernelBackend.JIT,
-        target="sglang.jit_kernel.diffusion.group_norm_silu:apply_group_norm_silu",
+        target="sglang.kernels.ops.diffusion.group_norm_silu:apply_group_norm_silu",
         capabilities=_CUDA,
         format_signature=FormatSignature(description="fused GroupNorm + SiLU"),
         description="Fused group-norm + SiLU (sglang.jit_kernel).",
@@ -36,7 +36,7 @@ register_kernel(
     KernelSpec(
         op="diffusion.residual_gate_add",
         backend=KernelBackend.JIT,
-        target="sglang.jit_kernel.diffusion.residual_gate_add:residual_gate_add_cuda",
+        target="sglang.kernels.ops.diffusion.residual_gate_add:residual_gate_add_cuda",
         capabilities=_CUDA,
         format_signature=FormatSignature(description="residual + gate * update"),
         description="Fused residual gate-add (sglang.jit_kernel).",
@@ -46,7 +46,7 @@ register_kernel(
     KernelSpec(
         op="diffusion.fused_inplace_qknorm_rope",
         backend=KernelBackend.JIT,
-        target="sglang.jit_kernel.diffusion.qknorm_rope:fused_inplace_qknorm_rope",
+        target="sglang.kernels.ops.diffusion.qknorm_rope:fused_inplace_qknorm_rope",
         capabilities=_CUDA,
         format_signature=FormatSignature(
             in_place=True, description="fused in-place QK-norm + RoPE"

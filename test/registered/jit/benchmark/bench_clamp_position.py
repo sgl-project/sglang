@@ -9,7 +9,7 @@ from sglang.jit_kernel.benchmark.utils import (
     get_benchmark_range,
     run_benchmark,
 )
-from sglang.jit_kernel.clamp_position import clamp_position_cuda
+from sglang.kernels.ops.attention.clamp_position import clamp_position_cuda
 from sglang.srt.utils import get_compiler_backend
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 

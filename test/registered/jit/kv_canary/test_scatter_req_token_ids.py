@@ -5,7 +5,7 @@ import unittest
 
 import torch
 
-from sglang.jit_kernel.kv_canary.scatter_req_token_ids import (
+from sglang.kernels.ops.kv_canary.scatter_req_token_ids import (
     _SCATTER_BATCH_BLOCK,
     launch_scatter_req_token_ids_kernel,
     scatter_req_token_ids_torch_reference,

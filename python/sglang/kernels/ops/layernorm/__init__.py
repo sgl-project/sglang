@@ -275,7 +275,7 @@ class GemmaRMSNormOp(BaseFusedOp):
     op = "layernorm.gemma_rmsnorm"
     priority = _NORM_PRIORITY
     # AOT (sgl_kernel) on CUDA; JIT is the ROCm rocm-triton path
-    # (sglang.jit_kernel.minimax_m3) — a JIT provenance pinned to HIP, distinct
+    # (sglang.kernels.ops.moe.minimax_m3_swiglu) — a JIT provenance pinned to HIP, distinct
     # from the CUDA-only JIT on the plain rmsnorm ops; torch_npu on Ascend.
     capabilities = {
         KernelBackend.AOT: _CUDA,
@@ -334,7 +334,7 @@ class GemmaRMSNormOp(BaseFusedOp):
         out: Optional[torch.Tensor] = None,
         enable_pdl: Optional[bool] = None,
     ) -> torch.Tensor:
-        from sglang.jit_kernel.minimax_m3.rmsnorm import (
+        from sglang.kernels.ops.layernorm.minimax_m3_rmsnorm import (
             gemma_rmsnorm as rocm_triton_gemma_rmsnorm,
         )
 
@@ -428,7 +428,7 @@ class GemmaFusedAddRMSNormOp(BaseFusedOp):
         eps: float = 1e-6,
         enable_pdl: Optional[bool] = None,
     ) -> None:
-        from sglang.jit_kernel.minimax_m3.rmsnorm import (
+        from sglang.kernels.ops.layernorm.minimax_m3_rmsnorm import (
             gemma_fused_add_rmsnorm as rocm_triton_gemma_fused_add_rmsnorm,
         )
 

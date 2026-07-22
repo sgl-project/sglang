@@ -5,25 +5,6 @@ from typing import Any, Optional
 import pytest
 import torch
 
-from sglang.jit_kernel.kv_canary import consts
-from sglang.jit_kernel.kv_canary.plan import launch_canary_plan_kernels
-from sglang.jit_kernel.kv_canary.plan_ref import (
-    launch_canary_plan_kernels_torch_reference,
-)
-from sglang.jit_kernel.kv_canary.verify import (
-    CanaryLaunchTag,
-    RealKvSource,
-    VerifyOrWriteContext,
-    VerifyPlan,
-    launch_canary_verify_kernel,
-)
-from sglang.jit_kernel.kv_canary.verify_ref import (
-    launch_canary_verify_kernel_torch_reference,
-)
-from sglang.jit_kernel.kv_canary.write import WritePlan, launch_canary_write_kernel
-from sglang.jit_kernel.kv_canary.write_ref import (
-    launch_canary_write_kernel_torch_reference,
-)
 from sglang.jit_kernel.tests.kv_canary._canary_helpers import (
     FakeViolationLog,
     assert_canary_buf_equal,
@@ -37,6 +18,25 @@ from sglang.jit_kernel.tests.kv_canary._fixtures import (
     clone_real_kv_sources,
     empty_extras,
     make_req_to_token,
+)
+from sglang.kernels.ops.kv_canary import consts
+from sglang.kernels.ops.kv_canary.plan import launch_canary_plan_kernels
+from sglang.kernels.ops.kv_canary.plan_ref import (
+    launch_canary_plan_kernels_torch_reference,
+)
+from sglang.kernels.ops.kv_canary.verify import (
+    CanaryLaunchTag,
+    RealKvSource,
+    VerifyOrWriteContext,
+    VerifyPlan,
+    launch_canary_verify_kernel,
+)
+from sglang.kernels.ops.kv_canary.verify_ref import (
+    launch_canary_verify_kernel_torch_reference,
+)
+from sglang.kernels.ops.kv_canary.write import WritePlan, launch_canary_write_kernel
+from sglang.kernels.ops.kv_canary.write_ref import (
+    launch_canary_write_kernel_torch_reference,
 )
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 

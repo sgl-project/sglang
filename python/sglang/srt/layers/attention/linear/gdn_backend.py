@@ -28,7 +28,9 @@ if not is_cpu():
     )
 
 if is_cuda() or is_hip():
-    from sglang.jit_kernel.triton.gdn_fused_proj import fused_qkv_split_gdn_prefill
+    from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
+        fused_qkv_split_gdn_prefill,
+    )
 
 MAX_FUSED_QKV_SPLIT_DIM = 8192
 

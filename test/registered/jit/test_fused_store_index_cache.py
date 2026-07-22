@@ -25,7 +25,7 @@ import torch
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 try:
-    from sglang.jit_kernel.fused_store_index_cache import (
+    from sglang.kernels.ops.attention.fused_store_index_cache import (
         can_use_dsa_fused_store,
         fused_store_index_k_cache,
     )

@@ -39,7 +39,7 @@ if TYPE_CHECKING:
 
 from sgl_kernel import merge_state_v2
 
-from sglang.jit_kernel.flash_attention import (
+from sglang.kernels.ops.attention.flash_attention import (
     flash_attn_varlen_func,
     flash_attn_with_kvcache,
 )
@@ -255,7 +255,7 @@ class FlashAttentionBackend(AttentionBackend):
 
             self._get_scheduler_metadata = get_scheduler_metadata
         elif self.fa_impl_ver == 4:
-            from sglang.jit_kernel.flash_attention_v4 import (
+            from sglang.kernels.ops.attention.flash_attention_v4 import (
                 flash_attn_varlen_func,
                 flash_attn_with_kvcache,
             )

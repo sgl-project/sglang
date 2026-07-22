@@ -89,14 +89,14 @@ from typing import Callable, Iterable, Literal, Optional
 import pytest
 import torch
 
-from sglang.jit_kernel.dsv4 import (
-    CompressorDecodePlan,
-    CompressorPrefillPlan,
-    compress_forward,
-)
 from sglang.jit_kernel.tests.deepseek_v4.common import (
     make_legacy_context,
     to_seq_extend,
+)
+from sglang.kernels.ops.attention.dsv4 import (
+    CompressorDecodePlan,
+    CompressorPrefillPlan,
+    compress_forward,
 )
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.utils import is_in_ci

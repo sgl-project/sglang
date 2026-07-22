@@ -80,7 +80,7 @@ if _is_cuda:
     try:
         from sgl_kernel import merge_state_v2
 
-        from sglang.jit_kernel.concat_mla import concat_mla_k
+        from sglang.kernels.ops.attention.concat_mla import concat_mla_k
         from sglang.kernels.ops.gemm import bmm_fp8
         from sglang.kernels.ops.quantization.fp8_kernel import per_tensor_quant_mla_fp8
 

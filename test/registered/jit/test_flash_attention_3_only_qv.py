@@ -11,7 +11,7 @@ import pytest
 import torch
 from einops import rearrange, repeat
 
-from sglang.jit_kernel.flash_attention import flash_attn_with_kvcache
+from sglang.kernels.ops.attention.flash_attention import flash_attn_with_kvcache
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 

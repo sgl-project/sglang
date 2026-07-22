@@ -643,7 +643,7 @@ class TestDSAIndexer(CustomTestCase):
         # preprocessed alongside the metadata (it asserts rather than silently
         # recomputing it) -- mirror what init_forward_metadata /
         # _build_forward_metadata_cuda_graph do.
-        from sglang.jit_kernel.dsv4.topk import plan_topk_v2
+        from sglang.kernels.ops.attention.dsv4.topk import plan_topk_v2
 
         attn_metadata = DSAMetadata(
             page_size=1,
