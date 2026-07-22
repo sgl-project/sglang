@@ -22,7 +22,7 @@ from transformers.models.qwen2.modeling_qwen2 import Qwen2Model
 
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import get_model
 
 logger = logging.getLogger(__name__)
 
@@ -1255,7 +1255,7 @@ class AudioEncoderMixin:
         else:
             raise ValueError(f"Invalid projection layers: {config.projection_layers}")
 
-        model_path = get_server_args().model_path
+        model_path = get_model().model_path
         if not os.path.isdir(model_path):
             from huggingface_hub import snapshot_download
 

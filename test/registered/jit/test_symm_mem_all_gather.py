@@ -27,7 +27,7 @@ import torch.distributed as dist
 
 import sglang.srt.distributed.parallel_state as ps
 from sglang.jit_kernel.tests.utils import multigpu_pytest_main
-from sglang.jit_kernel.utils import cache_once, get_ci_test_range
+from sglang.kernels.jit.utils import cache_once, get_ci_test_range
 from sglang.srt.distributed.device_communicators.triton_symm_mem_ag import (
     all_gather_inner,
     create_state,
