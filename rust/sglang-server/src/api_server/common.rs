@@ -1,8 +1,8 @@
 //! Common control-plane endpoints — `/server_info`, `/get_model_info`
 //! (+ `/model_info` alias), plus the control-request submission path
-//! (`await_control_result`, on the shared `submit`). Data-plane endpoints (incl. `/health*`,
-//! which round-trips a generate probe) live in the sibling `native_api` and
-//! `openai` modules; the shared `AppState` lives in the parent
+//! (`submit` / `await_control_result`). Data-plane endpoints (incl. `/health*`,
+//! which round-trips a generate probe) live in the sibling `sglang` (native
+//! protocol) and `openai` modules; the shared `AppState` lives in the parent
 //! `api_server` module.
 
 use axum::{
@@ -12,12 +12,14 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
+use tokio::sync::mpsc;
 
 use super::AppState;
-use super::guard::AbortGuard;
-use super::submit::submit;
-use crate::message::{ControlRequest, EgressItem, GetInternalStateReq, RequestKind};
+use crate::fsm::RequestState;
+use crate::ids::RidHash;
+use crate::message::{ControlRequest, EgressItem, EgressSink, Request, RequestKind};
 use crate::runtime::ServerArgs;
+use crate::runtime::channels::TmEvent;
 
 /// The routes this module owns, mounted by `api_server::serve`.
 pub(super) fn routes() -> Router<AppState> {
@@ -26,30 +28,51 @@ pub(super) fn routes() -> Router<AppState> {
         // non-streamed JSON result. Adding one = a route line + its struct tag.
         .route("/server_info", get(server_info))
         // Static config, no scheduler round-trip. `/get_model_info` (+ `/model_info`
-        // alias).
+        // alias) is what the SGLang lang backend (`RuntimeEndpoint`, gsm8k/eval)
+        // calls at startup.
         .route("/get_model_info", get(model_info))
         .route("/model_info", get(model_info))
 }
 
-/// Submit a control request through the ingress FSM (no tokenization) and await the
+/// Submit one control request into the ingress pipeline (always a rust-minted
+/// rid — control responses are routed by it, so no client-supplied form
+/// exists); returns the rid, its hashed routing key, and the egress receiver.
+async fn submit(
+    state: &AppState,
+    tag: &'static str,
+) -> Result<(RidHash, String, mpsc::Receiver<EgressItem>), ()> {
+    let rid = crate::ids::new_rid();
+    let id = RidHash::from_rid(&rid);
+    // Async-aware send so a full TM inbox yields (backpressure) instead of parking
+    // a thread; Err only when the inbox is closed (shutdown).
+    let (tx, rx) = mpsc::channel::<EgressItem>(state.egress_buf);
+    let request = Request {
+        rid_hash: id,
+        rid: rid.clone(),
+        state: RequestState::Received,
+        sink: EgressSink::Local(tx),
+        kind: RequestKind::Control(ControlRequest { tag }),
+    };
+    match state.senders.tm.send_async(TmEvent::Ingress(request)).await {
+        Ok(()) => Ok((id, rid, rx)),
+        Err(_) => {
+            tracing::error!("tm inbox closed; request dropped");
+            Err(())
+        }
+    }
+}
+
+/// Submit a `Control(tag)` through the ingress FSM (no tokenization) and await the
 /// scheduler's single msgpack result (a `structs.asdict` named map). Returns the
 /// raw bytes, or an error `Response` to return as-is.
 async fn await_control_result(
     state: &AppState,
-    control: ControlRequest,
+    tag: &'static str,
 ) -> Result<bytes::Bytes, Response> {
-    let (rid, mut rx) = submit(state, RequestKind::Control(Box::new(control)), false).await?;
-    // Control requests register a detok entry like any other, and only
-    // `handle_result` removes it — so a request that never produces one (a stalled
-    // scheduler, a client that hangs up mid-await) leaves the entry behind. A
-    // monitor polling `/server_info` then leaks one `DetokState` per poll, forever.
-    // The guard deregisters on drop; it is disarmed below when the result lands.
-    let mut guard = AbortGuard::new(state.senders.clone(), rid.clone());
-    let received = rx.recv().await;
-    if received.is_some() {
-        guard.disarm(&rid); // completed normally — nothing to abort
-    }
-    match received {
+    let (_id, _rid, mut rx) = submit(state, tag)
+        .await
+        .map_err(|()| (StatusCode::SERVICE_UNAVAILABLE, "service unavailable").into_response())?;
+    match rx.recv().await {
         Some(EgressItem::Control(bytes)) => Ok(bytes),
         Some(EgressItem::Error(e)) => {
             let code =
@@ -66,19 +89,40 @@ async fn await_control_result(
     }
 }
 
+/// Generic control endpoint: the scheduler's response straight to JSON (`tag` =
+/// request-struct name). For control endpoints whose response needs no shaping.
+#[allow(dead_code)] // first non-/server_info control endpoint will use this
+async fn control(State(state): State<AppState>, tag: &'static str) -> Response {
+    match await_control_result(&state, tag).await {
+        Ok(bytes) => match msgpack_to_json(&bytes) {
+            Ok(json) => {
+                (StatusCode::OK, [("content-type", "application/json")], json).into_response()
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "control: msgpack→json failed");
+                (StatusCode::INTERNAL_SERVER_ERROR, "bad control response").into_response()
+            }
+        },
+        Err(resp) => resp,
+    }
+}
+
+/// Convert a msgpack control response (the scheduler's native ring format) into
+/// JSON bytes for the HTTP client.
+fn msgpack_to_json(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let val = rmpv::decode::read_value(&mut &*bytes).map_err(|e| e.to_string())?;
+    serde_json::to_vec(&val).map_err(|e| e.to_string())
+}
+
 /// `GET /get_model_info` (+ `/model_info` alias) — static model metadata from
 /// `server_args` (no scheduler round-trip); `is_generation` always true.
 async fn model_info(State(state): State<AppState>) -> Response {
     let sa = &state.server_args;
     let body = serde_json::json!({
-        "model_path": sa.model_path,
-        "tokenizer_path": sa.tokenizer_path,
+        "model_path": sa.model_path(),
+        "tokenizer_path": sa.tokenizer_path(),
         "is_generation": true,
-        // Python's `TokenizerManager` merges this into every request
-        // (`{**preferred, **client}`); this server has no equivalent yet, so
-        // `RustServer.launch` REFUSES to start when it is set. It can therefore
-        // only be null here — echoing it keeps the field's shape.
-        "preferred_sampling_params": sa.preferred_sampling_params,
+        "preferred_sampling_params": serde_json::Value::Null,
         "weight_version": serde_json::Value::Null,
     });
     (
@@ -95,14 +139,7 @@ async fn model_info(State(state): State<AppState>) -> Response {
 ///
 /// TODO(server_info): Python also includes `kv_events`; add once plumbed.
 async fn server_info(State(state): State<AppState>) -> Response {
-    let bytes = match await_control_result(
-        &state,
-        ControlRequest::GetInternalStateReq(GetInternalStateReq::new(
-            crate::ids::Rid::new().to_string(),
-        )),
-    )
-    .await
-    {
+    let bytes = match await_control_result(&state, "GetInternalStateReq").await {
         Ok(b) => b,
         Err(resp) => return resp,
     };
@@ -154,12 +191,12 @@ fn shape_server_info(msgpack: &[u8], server_args: &ServerArgs) -> Result<Vec<u8>
     // Top-level non-secret config from typed accessors (structurally can't surface
     // a key field, unlike the raw dump).
     let response = serde_json::json!({
-        "model_path": server_args.model_path,
-        "served_model_name": server_args.served_model_name,
-        "tokenizer_path": server_args.tokenizer_path,
-        "max_context_length": server_args.model_config.context_len,
-        "max_total_num_tokens": server_args.max_total_num_tokens,
-        "version": server_args.version,
+        "model_path": server_args.model_path(),
+        "served_model_name": server_args.served_model_name(),
+        "tokenizer_path": server_args.tokenizer_path(),
+        "max_context_length": server_args.context_len(),
+        "max_total_num_tokens": server_args.max_total_num_tokens(),
+        "version": server_args.version(),
         "internal_states": [serde_json::Value::Object(state_out)],
     });
     serde_json::to_vec(&response).map_err(|e| e.to_string())

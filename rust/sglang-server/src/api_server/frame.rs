@@ -1,7 +1,7 @@
 //! Frame shaping for the native `/generate` protocol: the cumulative
 //! [`OutputAccumulator`] plus the functions that render [`ChunkEvent`]s /
 //! accumulated state into wire JSON (`meta_info`, logprob tuples, error and
-//! abort frames). No HTTP here — the sibling `native_api` module owns the handlers
+//! abort frames). No HTTP here — the sibling `sglang` module owns the handlers
 //! and streams; it calls these per frame.
 
 use crate::message::{ChunkEvent, ChunkExtras};
@@ -58,88 +58,14 @@ fn ragged_logprob_tuples(
         if l == 0 {
             positions.push(serde_json::Value::Null);
         } else {
-            // Bounds-checked like `hidden_states_rows`: a header whose `lens` run
-            // past the value buffer would otherwise panic the api thread on an
-            // out-of-range index.
             let tuples: Vec<serde_json::Value> = (off..off + l)
-                .filter_map(|j| {
-                    Some(serde_json::json!([
-                        lp_value(*vals.get(j)?),
-                        *idxs.get(j)?,
-                        text_slot(texts, j)
-                    ]))
-                })
+                .map(|j| serde_json::json!([lp_value(vals[j]), idxs[j], text_slot(texts, j)]))
                 .collect();
             positions.push(serde_json::Value::Array(tuples));
         }
         off += l;
     }
     serde_json::Value::Array(positions)
-}
-
-/// Append a flat family's `[logprob, token_id, text]` tuples to `dst`, comma
-/// separated and WITHOUT the enclosing brackets, so a cumulative frame can
-/// concatenate each delta instead of re-rendering every accumulated position.
-///
-/// Byte-identical to [`logprob_tuples`]'s serialization: `serde_json` writes an
-/// array as `[`, elements joined by `,`, `]` with no spaces, and each element here
-/// is rendered by the same `Value` Display.
-fn push_logprob_tuples(dst: &mut String, vals: &[f32], idxs: &[i32], texts: Option<&[String]>) {
-    use std::fmt::Write;
-    for (j, (&v, &tid)) in vals.iter().zip(idxs.iter()).enumerate() {
-        if !dst.is_empty() {
-            dst.push(',');
-        }
-        let _ = write!(dst, "[{},{tid},{}]", lp_value(v), text_slot(texts, j));
-    }
-}
-
-/// Ragged counterpart of [`push_logprob_tuples`] — one entry per position, `null`
-/// where `lens[p] == 0`. Mirrors [`ragged_logprob_tuples`] including its
-/// bounds-checked skip, so a header whose `lens` run past the value buffer yields
-/// the same (shortened) row rather than panicking.
-fn push_ragged_tuples(
-    dst: &mut String,
-    vals: &[f32],
-    idxs: &[i32],
-    lens: &[u32],
-    texts: Option<&[String]>,
-) {
-    use std::fmt::Write;
-    let mut off = 0usize;
-    for &l in lens {
-        let l = l as usize;
-        if !dst.is_empty() {
-            dst.push(',');
-        }
-        if l == 0 {
-            dst.push_str("null");
-        } else {
-            dst.push('[');
-            let mut first = true;
-            for j in off..off + l {
-                let (Some(&v), Some(&tid)) = (vals.get(j), idxs.get(j)) else {
-                    continue;
-                };
-                if !first {
-                    dst.push(',');
-                }
-                first = false;
-                let _ = write!(dst, "[{},{tid},{}]", lp_value(v), text_slot(texts, j));
-            }
-            dst.push(']');
-        }
-        off += l;
-    }
-}
-
-/// Render one set-once family (they ride the prefill or the final chunk) into a
-/// standalone JSON array, so it is serialized when it arrives rather than on every
-/// subsequent frame.
-fn ragged_array_json(vals: &[f32], idxs: &[i32], lens: &[u32], texts: Option<&[String]>) -> String {
-    let mut body = String::new();
-    push_ragged_tuples(&mut body, vals, idxs, lens, texts);
-    format!("[{body}]")
 }
 
 /// Reshape flat hidden-state f32s + per-row lengths into `meta_info`'s nested
@@ -149,14 +75,27 @@ fn hidden_states_rows(vals: &[f32], lens: &[u32]) -> serde_json::Value {
     let mut off = 0usize;
     for &l in lens {
         let l = l as usize;
-        // `get`, not a clamped index: clamping only the END leaves `off` past
-        // `vals.len()` after one over-long row, making the next range reversed
-        // (`start > end`) — which panics on the api thread rather than yielding
-        // an empty row. Same reasoning as the egress decoder's `take_f32`.
-        rows.push(serde_json::json!(vals.get(off..off + l).unwrap_or(&[])));
+        rows.push(serde_json::json!(&vals[off..(off + l).min(vals.len())]));
         off += l;
     }
     serde_json::Value::Array(rows)
+}
+
+/// Classify a terminal finish reason: `Some((code, message))` when it's an `abort`
+/// carrying a `status_code` (a scheduler request error, e.g. over-context → 400).
+/// Both unary + streaming paths inspect this instead of treating `Done` as normal.
+pub(super) fn abort_status(finish_reason: &Option<serde_json::Value>) -> Option<(u16, String)> {
+    let fr = finish_reason.as_ref()?;
+    if fr.get("type").and_then(|t| t.as_str()) != Some("abort") {
+        return None;
+    }
+    let code = fr.get("status_code").and_then(|s| s.as_u64())? as u16;
+    let message = fr
+        .get("message")
+        .and_then(|m| m.as_str())
+        .unwrap_or("request aborted")
+        .to_string();
+    Some((code, message))
 }
 
 /// The `{ "error": { message, code } }` object every error path emits (an SSE
@@ -168,7 +107,7 @@ pub(super) fn error_value(code: u16, message: &str) -> serde_json::Value {
 /// Format a decoded [`ChunkEvent`] as one SGLang `/generate` frame's JSON. `rid`
 /// (response `meta_info.id`) is passed as a string; the event's numeric `rid` is
 /// just the shard routing key.
-pub(super) fn frame_value(out: &ChunkEvent, rid: &str) -> serde_json::Value {
+pub(super) fn sglang_frame_value(out: &ChunkEvent, rid: &str) -> serde_json::Value {
     let mut v = serde_json::json!({
         "text": out.text,
         "meta_info": {
@@ -234,16 +173,9 @@ pub(super) fn frame_value(out: &ChunkEvent, rid: &str) -> serde_json::Value {
     v
 }
 
-/// Cumulative frame JSON from the accumulator's memoized parts — O(1) in the
-/// accumulated length, where rebuilding the `Value` is O(T) per frame and so O(T²)
-/// per request.
-///
-/// Byte-identical to `frame_value(..).to_string()`, which requires emitting
-/// `meta_info`'s keys in the alphabetical order `serde_json`'s `BTreeMap` gives
-/// them — pinned for both the plain and the logprob shapes by
-/// `cumulative_frame_json_matches_serde`. `None` only when the extras memo was
-/// invalidated (see `extras_memo_broken`), leaving the `Value` path as the
-/// fallback.
+/// Cumulative frame JSON from the accumulator's memoized ids/text — O(T), not O(T²).
+/// Byte-identical to `sglang_frame_value(..).to_string()` (a `BTreeMap` keeps keys
+/// alphabetical); pinned by `cumulative_frame_json_matches_serde`. `None` on extras.
 pub(super) fn cumulative_frame_json(
     acc: &OutputAccumulator,
     rid: &str,
@@ -251,52 +183,26 @@ pub(super) fn cumulative_frame_json(
 ) -> Option<String> {
     use std::fmt::Write;
 
-    if acc.extras_memo_broken {
+    let o = acc.snapshot();
+    if o.extras.is_some() {
         return None;
     }
-    let o = acc.snapshot();
-    // Through `Value`, not `to_string` on the struct: the `Value` path sorts the
-    // finish reason's own keys via `BTreeMap`, and this must match it byte for byte.
-    let finish = serde_json::to_value(&o.finish_reason).ok()?.to_string();
+    // Fixed size regardless of T, so this stays O(1) per frame.
+    let meta = serde_json::json!({
+        "id": rid,
+        "prompt_tokens": o.prompt_tokens,
+        "completion_tokens": o.completion_tokens,
+        "finish_reason": o.finish_reason,
+    })
+    .to_string();
 
-    // KEEP ALPHABETICAL: `serde_json::Map` is a `BTreeMap` here, so this is the
-    // order the `Value` path produces and the order the equivalence test asserts.
-    let mut m = String::new();
-    let _ = write!(m, "{{\"completion_tokens\":{}", o.completion_tokens);
-    let _ = write!(m, ",\"finish_reason\":{finish}");
-    if let Some(h) = &acc.hidden_json {
-        let _ = write!(m, ",\"hidden_states\":{h}");
-    }
-    let _ = write!(m, ",\"id\":{}", serde_json::Value::String(rid.to_string()));
-    if let Some(v) = &acc.in_tid_json {
-        let _ = write!(m, ",\"input_token_ids_logprobs\":{v}");
-    }
-    if let Some(v) = &acc.in_lp_json {
-        let _ = write!(m, ",\"input_token_logprobs\":{v}");
-    }
-    if let Some(v) = &acc.in_top_json {
-        let _ = write!(m, ",\"input_top_logprobs\":{v}");
-    }
-    // The `Value` path keys these off the source columns being non-empty; an empty
-    // source renders to an empty body, so the two guards coincide.
-    if !acc.out_tid_json.is_empty() {
-        let _ = write!(m, ",\"output_token_ids_logprobs\":[{}]", acc.out_tid_json);
-    }
-    if !acc.out_lp_json.is_empty() {
-        let _ = write!(m, ",\"output_token_logprobs\":[{}]", acc.out_lp_json);
-    }
-    if !acc.out_top_json.is_empty() {
-        let _ = write!(m, ",\"output_top_logprobs\":[{}]", acc.out_top_json);
-    }
-    let _ = write!(m, ",\"prompt_tokens\":{}}}", o.prompt_tokens);
-
-    let mut s = String::with_capacity(acc.text_json.len() + acc.ids_json.len() + m.len() + 40);
+    let mut s = String::with_capacity(acc.text_json.len() + acc.ids_json.len() + meta.len() + 40);
     s.push('{');
     if let Some(i) = index {
         let _ = write!(s, "\"index\":{i},");
     }
     s.push_str("\"meta_info\":");
-    s.push_str(&m);
+    s.push_str(&meta);
     if !acc.ids_json.is_empty() {
         s.push_str(",\"output_ids\":[");
         s.push_str(&acc.ids_json);
@@ -338,7 +244,7 @@ pub(super) fn cumulative_frame_string(
     index: Option<usize>,
 ) -> String {
     cumulative_frame_json(acc, rid_str, index)
-        .unwrap_or_else(|| tag_value(frame_value(acc.snapshot(), rid_str), index))
+        .unwrap_or_else(|| tag_value(sglang_frame_value(acc.snapshot(), rid_str), index))
 }
 
 /// Format one streaming frame: the accumulator's cumulative view (default), or this
@@ -352,9 +258,9 @@ pub(super) fn stream_frame_value(
     if incremental {
         let mut d = delta;
         d.completion_tokens = acc.snapshot().completion_tokens;
-        frame_value(&d, rid_str)
+        sglang_frame_value(&d, rid_str)
     } else {
-        frame_value(acc.snapshot(), rid_str)
+        sglang_frame_value(acc.snapshot(), rid_str)
     }
 }
 
@@ -373,31 +279,6 @@ pub(super) struct OutputAccumulator {
     /// JSON-escaped cumulative text, without the surrounding quotes. Escaping is
     /// per-character, so `escape(a + b) == escape(a) + escape(b)` and deltas append.
     text_json: String,
-    /// Memoized bodies (no enclosing brackets) of the three CUMULATIVE logprob
-    /// families, appended per delta — the same O(T) trick `ids_json` uses, extended
-    /// to the families that made a cumulative stream with logprobs O(T²). Cumulative
-    /// is SGLang's default, so that path re-rendered every accumulated position on
-    /// every frame: measured 117 ms for one 500-token top-5 request, versus 1.2 ms
-    /// incremental.
-    out_lp_json: String,
-    out_top_json: String,
-    out_tid_json: String,
-    /// Set-once families — they ride the prefill or the final chunk, so they are
-    /// rendered when they arrive rather than on every frame after.
-    in_lp_json: Option<String>,
-    in_top_json: Option<String>,
-    in_tid_json: Option<String>,
-    hidden_json: Option<String>,
-    /// Set once a family's text column falls out of lockstep with its values, at
-    /// which point the memo is abandoned for the `Value` path.
-    ///
-    /// Appending per delta assumes `text_slot(accumulated, global_j)` equals
-    /// `text_slot(delta, local_j)`, which holds only while every delta supplies
-    /// either a text per value or none at all. That is what a real request does —
-    /// `return_text_in_logprobs` is per-request, so the detok shard fills `*_txt`
-    /// for all deltas or none — but a mixed sequence would silently diverge from
-    /// `frame_value`, so it is detected rather than assumed.
-    extras_memo_broken: bool,
 }
 
 /// Append `s` JSON-escaped (no surrounding quotes) — `serde_json` quotes it, and the
@@ -427,7 +308,7 @@ impl OutputAccumulator {
         }
 
         let o = &mut self.out;
-        o.rid.clone_from(&d.rid); // constant across the request; keeps the accumulated view coherent
+        o.rid_hash = d.rid_hash; // constant across the request; keeps the accumulated view coherent
         o.text.push_str(&d.text);
         o.token_ids.extend_from_slice(&d.token_ids); // token_ids doubles as output_ids
         o.completion_tokens += d.completion_tokens;
@@ -454,48 +335,10 @@ impl OutputAccumulator {
         oe.out_lp_txt.extend_from_slice(&de.out_lp_txt);
         oe.out_top_txt.extend_from_slice(&de.out_top_txt);
         oe.out_tid_txt.extend_from_slice(&de.out_tid_txt);
-        // Append THIS delta's tuples, indexed within the delta — equivalent to
-        // indexing the accumulated arrays only while texts stay in lockstep, which
-        // the guard below verifies.
-        push_logprob_tuples(
-            &mut self.out_lp_json,
-            &de.out_lp_val,
-            &de.out_lp_idx,
-            opt_texts(&de.out_lp_txt),
-        );
-        push_ragged_tuples(
-            &mut self.out_top_json,
-            &de.out_top_val,
-            &de.out_top_idx,
-            &de.out_top_lens,
-            opt_texts(&de.out_top_txt),
-        );
-        push_ragged_tuples(
-            &mut self.out_tid_json,
-            &de.out_tid_val,
-            &de.out_tid_idx,
-            &de.out_tid_lens,
-            opt_texts(&de.out_tid_txt),
-        );
-        let lockstep = |txt: &Vec<String>, val: &Vec<f32>| txt.is_empty() || txt.len() == val.len();
-        if !lockstep(&oe.out_lp_txt, &oe.out_lp_val)
-            || !lockstep(&oe.out_top_txt, &oe.out_top_val)
-            || !lockstep(&oe.out_tid_txt, &oe.out_tid_val)
-        {
-            self.extras_memo_broken = true;
-        }
         if !de.in_lp_val.is_empty() {
             oe.in_lp_val = de.in_lp_val.clone();
             oe.in_lp_idx = de.in_lp_idx.clone();
             oe.in_lp_txt = de.in_lp_txt.clone();
-            let mut body = String::new();
-            push_logprob_tuples(
-                &mut body,
-                &oe.in_lp_val,
-                &oe.in_lp_idx,
-                opt_texts(&oe.in_lp_txt),
-            );
-            self.in_lp_json = Some(format!("[{body}]"));
         }
         // Input families ride once (prefill); `lens` non-empty marks their arrival.
         if !de.in_top_lens.is_empty() {
@@ -503,31 +346,17 @@ impl OutputAccumulator {
             oe.in_top_idx = de.in_top_idx.clone();
             oe.in_top_lens = de.in_top_lens.clone();
             oe.in_top_txt = de.in_top_txt.clone();
-            self.in_top_json = Some(ragged_array_json(
-                &oe.in_top_val,
-                &oe.in_top_idx,
-                &oe.in_top_lens,
-                opt_texts(&oe.in_top_txt),
-            ));
         }
         if !de.in_tid_lens.is_empty() {
             oe.in_tid_val = de.in_tid_val.clone();
             oe.in_tid_idx = de.in_tid_idx.clone();
             oe.in_tid_lens = de.in_tid_lens.clone();
             oe.in_tid_txt = de.in_tid_txt.clone();
-            self.in_tid_json = Some(ragged_array_json(
-                &oe.in_tid_val,
-                &oe.in_tid_idx,
-                &oe.in_tid_lens,
-                opt_texts(&oe.in_tid_txt),
-            ));
         }
         // Hidden states are non-cumulative: the latest non-empty set wins.
         if !de.hidden_lens.is_empty() {
             oe.hidden_val = de.hidden_val.clone();
             oe.hidden_lens = de.hidden_lens.clone();
-            self.hidden_json =
-                Some(hidden_states_rows(&oe.hidden_val, &oe.hidden_lens).to_string());
         }
     }
 
@@ -620,7 +449,7 @@ mod tests {
             })),
             ..Default::default()
         };
-        let frame = frame_value(&out, "1");
+        let frame = sglang_frame_value(&out, "1");
         assert_eq!(
             frame["meta_info"]["input_token_logprobs"],
             serde_json::json!([[serde_json::Value::Null, 10, "<s>"], [-0.5f32, 20, "hi"]])
@@ -668,6 +497,38 @@ mod tests {
         assert_eq!(opt_texts(&t), Some(t.as_slice()));
     }
 
+    /// The shared classifier both paths use: a validation abort yields its
+    /// `(code, message)` (the streaming path turns this into an SSE error event
+    /// instead of a normal `Done` frame); anything else yields `None`.
+    #[test]
+    fn abort_status_extracts_code_and_message() {
+        let (code, msg) = abort_status(&Some(serde_json::json!({
+            "type": "abort", "message": "over the limit", "status_code": 400
+        })))
+        .expect("validation abort → (code, message)");
+        assert_eq!(code, 400);
+        assert_eq!(msg, "over the limit");
+        // Normal finish, bare abort (no status), and no finish → not an error.
+        assert!(abort_status(&Some(serde_json::json!({"type": "stop"}))).is_none());
+        assert!(abort_status(&Some(serde_json::json!({"type": "abort"}))).is_none());
+        assert!(abort_status(&None).is_none());
+    }
+
+    /// A normal finish, a bare abort (no status), and no finish are not errors
+    /// (the unary path returns them as a 200 result frame).
+    #[test]
+    fn non_error_finishes_stay_ok() {
+        assert!(abort_status(&Some(serde_json::json!({"type": "stop", "matched": 5}))).is_none());
+        assert!(abort_status(&Some(serde_json::json!({"type": "length", "length": 8}))).is_none());
+        assert!(
+            abort_status(&Some(
+                serde_json::json!({"type": "abort", "message": "Aborted"})
+            ))
+            .is_none()
+        );
+        assert!(abort_status(&None).is_none());
+    }
+
     /// The memoized cumulative fast path must emit **byte-identical** JSON to the
     /// `serde_json::Value` builder it replaces — same keys, same alphabetical order
     /// (`Map` is a `BTreeMap`; no `preserve_order`), same escaping. Covers unicode
@@ -677,7 +538,7 @@ mod tests {
     fn cumulative_frame_json_matches_serde() {
         let deltas = [
             ChunkEvent {
-                rid: "7".into(),
+                rid_hash: 7,
                 text: String::new(),
                 token_ids: vec![],
                 completion_tokens: 0,
@@ -685,7 +546,7 @@ mod tests {
                 ..Default::default()
             },
             ChunkEvent {
-                rid: "7".into(),
+                rid_hash: 7,
                 text: "He\"llo\n\t".into(),
                 token_ids: vec![1000],
                 completion_tokens: 1,
@@ -693,7 +554,7 @@ mod tests {
                 ..Default::default()
             },
             ChunkEvent {
-                rid: "7".into(),
+                rid_hash: 7,
                 text: " 世界 🌍 \\".into(),
                 token_ids: vec![-2, 3],
                 completion_tokens: 2,
@@ -701,15 +562,12 @@ mod tests {
                 ..Default::default()
             },
             ChunkEvent {
-                rid: "7".into(),
+                rid_hash: 7,
                 text: "!".into(),
                 token_ids: vec![9],
                 completion_tokens: 1,
                 prompt_tokens: 128,
-                finish_reason: serde_json::from_value(
-                    serde_json::json!({"type": "stop", "matched": 9}),
-                )
-                .expect("finish reason must parse"),
+                finish_reason: Some(serde_json::json!({"type": "stop", "matched": 9})),
                 ..Default::default()
             },
         ];
@@ -719,147 +577,28 @@ mod tests {
             for d in &deltas {
                 acc.fold(d);
                 let fast = cumulative_frame_json(&acc, "7", index).expect("no extras → fast path");
-                let slow = tag_value(frame_value(acc.snapshot(), "7"), index);
+                let slow = tag_value(sglang_frame_value(acc.snapshot(), "7"), index);
                 assert_eq!(fast, slow, "index={index:?} text={:?}", acc.snapshot().text);
             }
         }
     }
 
-    /// The same equivalence, for the shape that made cumulative streaming O(T²):
-    /// every logprob family at once, across several deltas, with and without
-    /// `return_text_in_logprobs` texts and with a null ragged position.
-    ///
-    /// This is the guard on the memoization. The fast path hand-writes
-    /// `meta_info`'s keys, so it has to reproduce `serde_json`'s alphabetical
-    /// `BTreeMap` order and every family's exact tuple encoding; asserting equality
-    /// against the `Value` builder after each fold is what makes that safe to
-    /// maintain.
+    /// A frame carrying logprobs falls back to the `Value` builder (the fast path
+    /// only knows the plain text/ids shape).
     #[test]
-    fn cumulative_frame_json_matches_serde_with_logprobs() {
-        for with_texts in [false, true] {
-            let txt = |v: &[&str]| -> Vec<String> {
-                if with_texts {
-                    v.iter().map(|s| (*s).to_string()).collect()
-                } else {
-                    Vec::new()
-                }
-            };
-            let deltas = [
-                // Prefill: the set-once input families and a null top-k position.
-                ChunkEvent {
-                    rid: "9".into(),
-                    prompt_tokens: 4,
-                    extras: Some(Box::new(ChunkExtras {
-                        in_lp_val: vec![f32::NAN, -1.5],
-                        in_lp_idx: vec![10, 11],
-                        in_lp_txt: txt(&["a", "b"]),
-                        in_top_val: vec![-0.25],
-                        in_top_idx: vec![12],
-                        in_top_lens: vec![0, 1],
-                        in_top_txt: txt(&["c"]),
-                        in_tid_val: vec![-2.0],
-                        in_tid_idx: vec![13],
-                        in_tid_lens: vec![1],
-                        in_tid_txt: txt(&["d"]),
-                        ..Default::default()
-                    })),
-                    ..Default::default()
-                },
-                ChunkEvent {
-                    rid: "9".into(),
-                    text: "He\"llo".into(),
-                    token_ids: vec![100],
-                    completion_tokens: 1,
-                    prompt_tokens: 4,
-                    extras: Some(Box::new(ChunkExtras {
-                        out_lp_val: vec![-0.5],
-                        out_lp_idx: vec![100],
-                        out_lp_txt: txt(&["He\"llo"]),
-                        out_top_val: vec![-0.5, -3.0],
-                        out_top_idx: vec![100, 7],
-                        out_top_lens: vec![2],
-                        out_top_txt: txt(&["He\"llo", "x"]),
-                        out_tid_val: vec![-0.5],
-                        out_tid_idx: vec![100],
-                        out_tid_lens: vec![1],
-                        out_tid_txt: txt(&["He\"llo"]),
-                        ..Default::default()
-                    })),
-                    ..Default::default()
-                },
-                ChunkEvent {
-                    rid: "9".into(),
-                    text: " 世界".into(),
-                    token_ids: vec![-2, 3],
-                    completion_tokens: 2,
-                    prompt_tokens: 4,
-                    finish_reason: serde_json::from_value(
-                        serde_json::json!({"type": "stop", "matched": 3}),
-                    )
-                    .expect("finish reason must parse"),
-                    extras: Some(Box::new(ChunkExtras {
-                        out_lp_val: vec![f32::NAN, -0.125],
-                        out_lp_idx: vec![-2, 3],
-                        out_lp_txt: txt(&[" 世", "界"]),
-                        // A zero-length position must render as `null`, not `[]`.
-                        out_top_val: vec![-0.125],
-                        out_top_idx: vec![3],
-                        out_top_lens: vec![0, 1],
-                        out_top_txt: txt(&["界"]),
-                        out_tid_val: vec![],
-                        out_tid_idx: vec![],
-                        out_tid_lens: vec![0, 0],
-                        out_tid_txt: txt(&[]),
-                        hidden_val: vec![0.5, -0.25, 1.0],
-                        hidden_lens: vec![2, 1],
-                        ..Default::default()
-                    })),
-                },
-            ];
-
-            for index in [None, Some(2usize)] {
-                let mut acc = OutputAccumulator::default();
-                for d in &deltas {
-                    acc.fold(d);
-                    let fast = cumulative_frame_json(&acc, "9", index)
-                        .expect("the extras memo must stay valid for a well-formed request");
-                    let slow = tag_value(frame_value(acc.snapshot(), "9"), index);
-                    assert_eq!(fast, slow, "with_texts={with_texts} index={index:?}");
-                }
-            }
-        }
-    }
-
-    /// A delta sequence that supplies texts for some values and not others breaks
-    /// the append-equivalence the memo rests on (`text_slot` is indexed globally,
-    /// so a gap shifts every later text). The accumulator must notice and defer to
-    /// the `Value` builder rather than emit a frame that disagrees with it.
-    #[test]
-    fn mismatched_logprob_texts_fall_back_to_the_value_path() {
+    fn cumulative_frame_json_defers_on_extras() {
         let mut acc = OutputAccumulator::default();
         acc.fold(&ChunkEvent {
-            rid: "1".into(),
+            rid_hash: 1,
+            token_ids: vec![5],
+            text: "x".into(),
             extras: Some(Box::new(ChunkExtras {
                 out_lp_val: vec![-0.5],
                 out_lp_idx: vec![5],
-                ..Default::default() // no texts
-            })),
-            ..Default::default()
-        });
-        assert!(cumulative_frame_json(&acc, "1", None).is_some());
-        acc.fold(&ChunkEvent {
-            rid: "1".into(),
-            extras: Some(Box::new(ChunkExtras {
-                out_lp_val: vec![-0.25],
-                out_lp_idx: vec![6],
-                out_lp_txt: vec!["b".into()], // …now texts: out of lockstep
                 ..Default::default()
             })),
             ..Default::default()
         });
-        assert!(
-            cumulative_frame_json(&acc, "1", None).is_none(),
-            "a text column out of lockstep must invalidate the memo"
-        );
+        assert!(cumulative_frame_json(&acc, "1", None).is_none());
     }
 }
