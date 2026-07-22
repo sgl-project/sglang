@@ -57,6 +57,7 @@ class SessionSlot:
     mamba_pool_idx: Any = None
     mamba_ping_pong_track_buffer: Any = None
     mamba_next_track_idx: Any = None
+    mamba_last_track_idx: Any = None
     mamba_last_track_seqlen: Any = None
     mamba_branching_seqlen: Any = None
 
@@ -79,6 +80,7 @@ class SessionSlot:
         self.mamba_pool_idx = req.mamba_pool_idx
         self.mamba_ping_pong_track_buffer = req.mamba_ping_pong_track_buffer
         self.mamba_next_track_idx = req.mamba_next_track_idx
+        self.mamba_last_track_idx = req.mamba_last_track_idx
         self.mamba_last_track_seqlen = req.mamba_last_track_seqlen
         self.mamba_branching_seqlen = req.mamba_branching_seqlen
 
@@ -95,6 +97,7 @@ class SessionSlot:
         req.mamba_pool_idx = None
         req.mamba_ping_pong_track_buffer = None
         req.mamba_next_track_idx = None
+        req.mamba_last_track_idx = None
         req.mamba_last_track_seqlen = None
         req.mamba_branching_seqlen = None
 
@@ -108,6 +111,7 @@ class SessionSlot:
         req.mamba_pool_idx = self.mamba_pool_idx
         req.mamba_ping_pong_track_buffer = self.mamba_ping_pong_track_buffer
         req.mamba_next_track_idx = self.mamba_next_track_idx
+        req.mamba_last_track_idx = self.mamba_last_track_idx
         req.mamba_last_track_seqlen = self.mamba_last_track_seqlen
         req.mamba_branching_seqlen = self.mamba_branching_seqlen
 

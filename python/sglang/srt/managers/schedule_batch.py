@@ -2433,17 +2433,20 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 # so we need to add 1 to the seqlen to retrieve the correct mamba state from h.
                 mamba_track_seqlen = _force_track_h(mamba_track_seqlen_aligned)
 
-            # In lazy mode, skip the swap — the second ping-pong slot is not
-            # allocated yet; it will be allocated on demand at the track boundary
-            # in mamba_lazy_prealloc_at_boundary during prepare_for_decode.
+            # This extend forward writes its snapshot into buf[next]; commit
+            # that slot as the consumable one, paired with the
+            # mamba_last_track_seqlen update below. Non-lazy then advances the
+            # write pointer to the other (always-allocated) slot; in lazy mode
+            # the second slot is not allocated yet, so the swap happens on
+            # demand in mamba_lazy_prealloc_at_boundary during
+            # prepare_for_decode.
+            req.mamba_last_track_idx = req.mamba_next_track_idx
             if not server_args.enable_mamba_extra_buffer_lazy():
                 req.mamba_next_track_idx = (
                     self.req_to_token_pool.get_mamba_ping_pong_other_idx(
                         req.mamba_next_track_idx
                     )
                 )
-            else:
-                req.mamba_last_track_idx = req.mamba_next_track_idx
             if req.mamba_branching_seqlen is not None:
                 # track branching point in this forward if the branching point
                 # is within the current extend batch.
