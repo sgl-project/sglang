@@ -409,9 +409,9 @@ RUN pip uninstall -y sgl_kernel sglang
 #          echo "Using ${SGL_BRANCH} branch."; \
 #          git checkout ${SGL_BRANCH}; \
 #        fi \
-RUN git clone https://github.com/akao-amd/sglang \
+RUN git clone ${SGL_REPO} \
     && cd sglang \
-    && git checkout akao-amd/gfx1250-dev \
+    && git checkout ${SGL_BRANCH} \
     && cd sgl-kernel \
     && rm -f pyproject.toml \
     && mv pyproject_rocm.toml pyproject.toml \
