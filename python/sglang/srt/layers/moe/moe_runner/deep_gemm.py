@@ -6,7 +6,8 @@ from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 import einops
 import torch
 
-from sglang.jit_kernel.dsv4 import silu_and_mul_masked_post_quant
+from sglang.kernels.ops.attention.dsv4 import silu_and_mul_masked_post_quant
+from sglang.kernels.ops.quantization import per_token_group_quant
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
@@ -62,7 +63,6 @@ else:
     _legacy_silu_and_mul = None
 
 
-_MASKED_GEMM_FAST_ACT = get_bool_env_var("SGLANG_MASKED_GEMM_FAST_ACT")
 _DEEPGEMM_ON_H20 = get_bool_env_var("SGLANG_DEEPGEMM_ON_H20")
 
 
@@ -183,7 +183,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         quant_info: DeepGemmMoeQuantInfo,
         running_state: dict,
     ) -> torch.Tensor:
-        from sglang.jit_kernel.dsv4 import silu_and_mul_contig_post_quant
+        from sglang.kernels.ops.attention.dsv4 import silu_and_mul_contig_post_quant
         from sglang.kernels.ops.moe.ep_moe_kernels import tma_align_input_scale
         from sglang.kernels.ops.quantization.fp8_kernel import (
             create_per_token_group_quant_fp8_output_scale,
@@ -462,11 +462,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
 
         swiglu_limit_arg: Optional[float] = None
         if self.swiglu_limit is not None:
-            # DeepSeek V4: clamped swiglu requires JIT EP activation; the
-            # FAST_ACT fused-quant path doesn't carry a swiglu_limit arg.
-            assert (
-                not _MASKED_GEMM_FAST_ACT
-            ), "DeepSeek V4 does not support SGLANG_MASKED_GEMM_FAST_ACT"
+            # DeepSeek V4: clamped swiglu requires the DSV4 JIT EP activation.
             assert (
                 envs.SGLANG_OPT_USE_JIT_EP_ACTIVATION.get()
             ), "DeepSeek V4 requires SGLANG_OPT_USE_JIT_EP_ACTIVATION=True"
@@ -930,34 +926,6 @@ def _varlen_deep_gemm_silu_mul_quant(
     gemm1_clamp_limit: Optional[float] = None,
     num_real_tokens: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    from sglang.kernels.ops.moe.ep_moe_kernels import silu_and_mul_masked_post_quant_fwd
-    from sglang.kernels.ops.quantization.fp8_kernel import (
-        sglang_per_token_group_quant_8bit,
-    )
-
-    if _MASKED_GEMM_FAST_ACT:
-        assert (
-            gemm1_alpha is None
-        ), "gemm1_alpha is not supported with SGLANG_MASKED_GEMM_FAST_ACT"
-        assert not swizzle, (
-            "SGLANG_OPT_FIX_MEGA_MOE_MEMORY is incompatible with "
-            "SGLANG_MASKED_GEMM_FAST_ACT (swizzled layout only supported by JIT act)"
-        )
-        assert (
-            swiglu_limit is None
-        ), "swiglu_limit (DeepSeek V4) is not supported together with SGLANG_MASKED_GEMM_FAST_ACT"
-        return sglang_per_token_group_quant_8bit(
-            x=gateup_output,
-            dst_dtype=torch.float8_e4m3fn,
-            group_size=group_size,
-            masked_m=masked_m,
-            column_major_scales=True,
-            scale_tma_aligned=True,
-            scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-            fuse_silu_and_mul=True,
-            enable_v2=True,
-        )
-
     assert masked_m is not None
     hidden_states_device = gateup_output.device
     E, N, D_2 = gateup_output.shape
@@ -965,55 +933,63 @@ def _varlen_deep_gemm_silu_mul_quant(
     del D_2
     G = D // group_size
 
-    # Fused UE8M0 pack needs 4 groups per packed int32 (the G%4 and D guards below).
-    if (
-        gemm1_alpha is not None
-        and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
-        and num_real_tokens is not None
-        and G % 4 == 0
-        and D % (group_size * 4) == 0
-    ):
-        from sglang.kernels.ops.moe.ep_moe_kernels import (
-            silu_and_mul_masked_post_quant_packed_fwd,
-        )
-
+    # oai-swiglu (gemm1_alpha) stays on the Triton kernel until
+    # per_token_group_quant grows an activation-kind axis. The output_scale dtype picks the schedule: packed
+    # int32 UE8M0 (no follow-up transform; needs G % 4 == 0 and the
+    # num_real_tokens grid bound) when eligible, row-major fp32 otherwise.
+    if gemm1_alpha is not None:
         assert (
             swiglu_limit is None
         ), "swiglu_limit and gemm1_alpha are mutually exclusive"
         assert not swizzle, "swizzle is not supported with gemm1_alpha"
+        from sglang.kernels.ops.moe.ep_moe_kernels import (
+            silu_and_mul_masked_post_quant_fwd,
+        )
+
+        use_packed = (
+            deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+            and num_real_tokens is not None
+            and G % 4 == 0
+            and D % (group_size * 4) == 0
+        )
         down_input = torch.empty(
             (E, N, D), device=hidden_states_device, dtype=torch.float8_e4m3fn
         )
-        down_input_scale_packed = torch.empty(
-            (E, G // 4, N), device=hidden_states_device, dtype=torch.int32
+        down_input_scale = torch.empty(
+            (E, G // 4, N) if use_packed else (E, N, G),
+            device=hidden_states_device,
+            dtype=torch.int32 if use_packed else torch.float32,
         )
-        silu_and_mul_masked_post_quant_packed_fwd(
+        silu_and_mul_masked_post_quant_fwd(
             gateup_output,
             down_input,
-            down_input_scale_packed,
+            down_input_scale,
             group_size,
             masked_m,
-            num_real_tokens=num_real_tokens,
-            topk=topk,
+            scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
             gemm1_alpha=gemm1_alpha,
             gemm1_clamp_limit=gemm1_clamp_limit or 0.0,
+            num_real_tokens=num_real_tokens,
+            topk=topk,
         )
-        return down_input, down_input_scale_packed.transpose(-1, -2)
+        if use_packed:
+            down_input_scale = down_input_scale.transpose(-1, -2)
+        return down_input, down_input_scale
 
-    down_input = torch.empty(
-        (E, N, D),
-        device=hidden_states_device,
-        dtype=torch.float8_e4m3fn,
-    )
-
-    use_jit_ep_activation = envs.SGLANG_OPT_USE_JIT_EP_ACTIVATION.get()
-    if N % 4 != 0 or G % 4 != 0 or D // 8 < E:
-        use_jit_ep_activation = False
-    if gemm1_alpha is not None:
-        use_jit_ep_activation = False
-
-    if use_jit_ep_activation:
+    # DSV4-specific activations (clamped swiglu, swizzled gate|up layout) stay
+    # on the DSV4 JIT kernel; it is the only implementation carrying them.
+    if swiglu_limit is not None or swizzle:
+        assert (
+            envs.SGLANG_OPT_USE_JIT_EP_ACTIVATION.get()
+        ), "swiglu_limit / swizzle require SGLANG_OPT_USE_JIT_EP_ACTIVATION=True"
+        assert N % 4 == 0 and G % 4 == 0 and D // 8 >= E, (
+            "DSV4 JIT activation requires N % 4 == 0, G % 4 == 0 and "
+            f"D // 8 >= num_experts, got N={N} G={G} D={D} E={E}"
+        )
         packed_ue8m0 = deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+        down_input = torch.empty(
+            (E, N, D), device=hidden_states_device, dtype=torch.float8_e4m3fn
+        )
         down_input_scale = torch.empty(
             (E, G // 4, N) if packed_ue8m0 else (E, N, G),
             device=hidden_states_device,
@@ -1033,35 +1009,22 @@ def _varlen_deep_gemm_silu_mul_quant(
         )
         if packed_ue8m0:
             down_input_scale = down_input_scale.transpose(-1, -2)
-    else:
-        if gemm1_alpha is not None:
-            assert (
-                swiglu_limit is None
-            ), "swiglu_limit and gemm1_alpha are mutually exclusive"
-            assert not swizzle, "swizzle is not supported with gemm1_alpha"
-        else:
-            assert (
-                swiglu_limit is None
-            ), "swiglu_limit (DeepSeek V4) requires SGLANG_OPT_USE_JIT_EP_ACTIVATION=True"
-            assert (
-                not swizzle
-            ), "SGLANG_OPT_FIX_MEGA_MOE_MEMORY requires SGLANG_OPT_USE_JIT_EP_ACTIVATION=True"
-        down_input_scale = torch.empty(
-            (E, N, G),
-            device=hidden_states_device,
-            dtype=torch.float32,
-        )
-        silu_and_mul_masked_post_quant_fwd(
-            gateup_output,
-            down_input,
-            down_input_scale,
-            group_size,
-            masked_m,
-            scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-            gemm1_alpha=gemm1_alpha or 0.0,
-            gemm1_clamp_limit=gemm1_clamp_limit or 0.0,
-        )
-    return down_input, down_input_scale
+        return down_input, down_input_scale
+
+    # Default plain-silu path: the unified JIT masked fused quant. It allocates
+    # the outputs itself, with scales directly in the layout deep_gemm consumes
+    # (packed-int32 col-major for UE8M0, TMA-aligned col-major fp32 otherwise),
+    # so the caller's get_mn_major transform short-circuits.
+    expected_m = ceil_div(num_real_tokens * topk, E) if num_real_tokens else None
+    return per_token_group_quant(
+        gateup_output,
+        group_size=group_size,
+        scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+        fuse_silu_and_mul=True,
+        masked_m=masked_m,
+        expected_m=expected_m,
+        column_major_scales=True,
+    )
 
 
 def _apply_swiglu_limit(

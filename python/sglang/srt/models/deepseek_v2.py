@@ -29,7 +29,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.jit_kernel.dsv4 import (
+from sglang.kernels.ops.attention.dsv4 import (
     silu_and_mul_clamp,
     silu_and_mul_contig_post_quant,
 )
@@ -185,6 +185,7 @@ from sglang.srt.models.deepseek_common.utils import (
 from sglang.srt.runtime_context import (
     get_flags,
     get_forward,
+    get_model,
     get_parallel,
     get_server_args,
 )
@@ -227,7 +228,7 @@ elif _is_npu:
 else:
     pass
 
-from sglang.jit_kernel.fused_a_gemm import (
+from sglang.kernels.ops.gemm.fused_a_gemm import (
     fused_a_gemm_weight_eligible,
     linear_with_fused_a_gemm,
 )
@@ -505,7 +506,7 @@ class MoEGate(nn.Module):
             )
         ):
             if _is_cuda:
-                from sglang.jit_kernel.dsv4 import linear_bf16_fp32
+                from sglang.kernels.ops.attention.dsv4 import linear_bf16_fp32
 
                 return linear_bf16_fp32(hidden_states, self.weight)
             return F.linear(hidden_states, self.weight, None)
@@ -529,7 +530,7 @@ class MoEGate(nn.Module):
                 logits = F.linear(hidden_states, self.weight, None)
             else:
                 # cuBLAS bf16 x bf16 -> fp32 GEMM (torch.mm's out_dtype kwarg is CUDA-only)
-                from sglang.jit_kernel.dsv4 import linear_bf16_fp32
+                from sglang.kernels.ops.attention.dsv4 import linear_bf16_fp32
 
                 logits = linear_bf16_fp32(hidden_states, self.weight)
 
@@ -1605,7 +1606,7 @@ class DeepseekV2AttentionMLA(
         self.scaling = self.qk_head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
-        self.kv_cache_dtype = get_server_args().kv_cache_dtype
+        self.kv_cache_dtype = get_model().kv_cache_dtype
 
         # NOTE modification to rope_scaling must be done early enough, b/c e.g. Indexer needs it
         if rope_scaling:
