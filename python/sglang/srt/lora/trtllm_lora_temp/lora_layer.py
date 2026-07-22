@@ -39,7 +39,7 @@ def _warm_sgl_trtllm_moe_module() -> None:
     global _SGL_TRTLLM_MODULE_WARMED
     if _SGL_TRTLLM_MODULE_WARMED:
         return
-    from sglang.jit_kernel.trtllm_lora_temp.core import (
+    from sglang.kernels.ops.moe.trtllm_lora_temp.core import (
         get_sgl_trtllm_moe_sm100_raw_module,
     )
 

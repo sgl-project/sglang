@@ -8,7 +8,9 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 
-from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput
+from sglang.srt.managers.schedule_batch import (
+    MultimodalProcessorOutput,
+)
 from sglang.srt.models.kimi_k25 import KimiK25ForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
@@ -17,7 +19,6 @@ from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
 )
 from sglang.srt.multimodal.processors.kimi_common import KimiGridMMDataMixin
-from sglang.srt.runtime_context import get_mm
 from sglang.srt.utils.cuda_ipc_transport_utils import (
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
 )
@@ -463,7 +464,7 @@ class KimiK2_5VLImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
         # its IPC proxy lazy until that assignment is known, avoiding a full
         # image copy to every rank. The scheduler only honors this marker once
         # the processor has already set the item's hash and pad value.
-        if self.use_cuda_ipc and get_mm().mm_enable_dp_encoder:
+        if self.use_cuda_ipc and self.server_args.mm_enable_dp_encoder:
             for item in mm_items:
                 item.model_specific_data[DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY] = (
                     True

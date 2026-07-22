@@ -14,7 +14,9 @@ from sglang.srt.configs.inkling import (
     InklingModelConfig,
     InklingVisionConfig,
 )
-from sglang.srt.distributed import get_tensor_model_parallel_group
+from sglang.srt.distributed import (
+    get_tensor_model_parallel_group,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -70,12 +72,7 @@ from sglang.srt.models.inkling_common.util import (
     trtllm_bf16_weight_prep_enabled,
     use_inkling_shared_fused_moe,
 )
-from sglang.srt.runtime_context import (
-    get_exec,
-    get_model,
-    get_parallel,
-    get_server_args,
-)
+from sglang.srt.runtime_context import get_model, get_parallel, get_server_args
 from sglang.srt.utils import add_prefix, is_cuda, make_layers
 
 logger = logging.getLogger(__name__)
@@ -221,7 +218,7 @@ class InklingDecoderLayer(nn.Module):
         # cache (configs/inkling.py stream_dim) shard with them. The layer
         # all-gathers back to [T, H] after each sconv, before the residual add.
         self.attn_tp_group = get_parallel().attn_tp_group
-        self.scattered_sconv = get_exec().comm.enable_scattered_sconv
+        self.scattered_sconv = get_server_args().enable_scattered_sconv
         sconv_hidden = config.hidden_size
         if self.scattered_sconv:
             assert config.use_sconv, "--enable-scattered-sconv requires use_sconv"
@@ -628,7 +625,9 @@ class InklingCausalLLM(nn.Module):
             and sconv0 is not None
             and world in (4, 8)  # symm-mem multimem worlds, power-of-two
         ):
-            from sglang.jit_kernel.inkling_ar_fused import compile_inkling_ar_sconv_norm
+            from sglang.kernels.ops.model.inkling.inkling_ar_fused import (
+                compile_inkling_ar_sconv_norm,
+            )
 
             for do_track in (False, True):
                 compile_inkling_ar_sconv_norm(
@@ -647,7 +646,7 @@ class InklingCausalLLM(nn.Module):
         # local/SWA layer (head_dim != 128) that never uses the prologue while
         # later full-attention layers do.
         if is_cuda() and envs.SGLANG_OPT_USE_INKLING_FUSED_ATTN_PROLOGUE.get():
-            from sglang.jit_kernel.inkling_attn_prologue import (
+            from sglang.kernels.ops.model.inkling.inkling_attn_prologue import (
                 compile_inkling_attn_prologue,
             )
 
@@ -1279,7 +1278,9 @@ class InklingForConditionalGeneration(nn.Module):
             and not self.text_config.inference_moe_w13_interleaved
             and weight_loader is not default_weight_loader
         ):
-            from sglang.srt.layers.quantization.modelopt_quant import deinterleave_w13
+            from sglang.srt.layers.quantization.modelopt_quant import (
+                deinterleave_w13,
+            )
 
             loaded_weight = deinterleave_w13(loaded_weight)
         if (

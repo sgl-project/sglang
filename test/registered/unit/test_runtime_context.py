@@ -10,7 +10,7 @@ import unittest
 from unittest.mock import patch
 
 import sglang.srt.server_args as server_args_module
-from sglang.srt.arg_groups.arg_utils import NS, A, Arg
+from sglang.srt.arg_groups.arg_utils import A, Arg
 from sglang.srt.runtime_context import (
     Flags,
     ParallelContext,
@@ -18,7 +18,6 @@ from sglang.srt.runtime_context import (
     _FlagGroupBase,
     get_context,
     get_flags,
-    get_memory,
     get_parallel,
     get_server_args,
     reset_context,
@@ -216,10 +215,8 @@ class TestServerArgsOwnership(_IsolatedServerArgs):
         self.assertIs(get_server_args(), sentinel)
         self.assertIs(get_context().server_args, sentinel)
 
-    def test_tokenizer_and_scheduler_setters_are_distinct_role_shims(self):
-        # The per-role publish shims are no longer aliases: each records its own
-        # process role via publish(role=...).
-        self.assertIsNot(
+    def test_tokenizer_alias_is_same_function(self):
+        self.assertIs(
             server_args_module.set_global_server_args_for_tokenizer,
             server_args_module.set_global_server_args_for_scheduler,
         )
@@ -376,10 +373,8 @@ class TestFlagsTier(_IsolatedServerArgs):
 class _FakeResolvedArgs:
     """Publishable fixture with a resolvable whitelist (real flat leaves)."""
 
-    page_size: A[int | None, Arg(help="p", resolvable=True), NS("memory")] = None
-    sampling_backend: A[
-        str | None, Arg(help="s", resolvable=True), NS("exec.kernel")
-    ] = None
+    page_size: A[int | None, Arg(help="p", resolvable=True)] = None
+    sampling_backend: A[str | None, Arg(help="s", resolvable=True)] = None
     _resolved_overrides: list = dataclasses.field(default_factory=list)
 
 
@@ -921,15 +916,12 @@ class TestPublishLifecycle(_IsolatedServerArgs):
         get_context().set_server_args(object())
         self.assertFalse(get_flags().capture.enable_torch_compile)
 
-    def test_declare_load_time_override_writes_the_bag(self):
+    def test_declare_load_time_override_writes_through(self):
         from sglang.srt.arg_groups.overrides import declare_load_time_override
 
         args = self._publish(page_size=1)
         declare_load_time_override("model.load_time", {"page_size": 64})
-        # The declaration lands on the config bag; the pristine startup record
-        # (server_args) is untouched.
-        self.assertEqual(get_memory().page_size, 64)
-        self.assertEqual(args.page_size, 1)
+        self.assertEqual(args.page_size, 64)
 
     def test_declare_load_time_override_validates_whitelist(self):
         from sglang.srt.arg_groups.overrides import declare_load_time_override
@@ -941,14 +933,16 @@ class TestPublishLifecycle(_IsolatedServerArgs):
 
     def test_declare_load_time_override_records_provenance(self):
         from sglang.srt.arg_groups.overrides import declare_load_time_override
+        from sglang.srt.server_args import ServerArgs
 
-        self._publish(page_size=1)
+        class _Args(_FakeResolvedArgs):
+            override = ServerArgs.override
+
+        args = _Args(page_size=1)
+        get_context().set_server_args(args)
         declare_load_time_override("model.load_time", {"page_size": 64})
-        self.assertEqual(get_memory().page_size, 64)
-        self.assertIn(
-            ("model.load_time", {"page_size": 64}),
-            get_context().overrides_log(),
-        )
+        self.assertEqual(args.page_size, 64)
+        self.assertIn(("model.load_time", {"page_size": 64}), args._resolved_overrides)
 
 
 if __name__ == "__main__":
