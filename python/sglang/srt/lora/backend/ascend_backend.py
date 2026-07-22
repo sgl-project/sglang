@@ -21,6 +21,37 @@ class AscendLoRABackend(BaseLoRABackend):
     ):
         super().__init__(max_loras_per_batch, device)
 
+    def run_lora_a_embedding(self, input_ids, weights, vocab_size, extra_embeddings=None, *args, **kwargs):
+        assert extra_embeddings is None, "..."
+
+        total_seq_len = input_ids.shape[0]
+        if weights.numel() == 0:
+            return torch.zeros(total_seq_len, 0, ...)
+
+        num_loras, max_rank, vocab_size_w = weights.shape
+        clamped_ids = input_ids.clamp(0, vocab_size_w - 1).to(torch.int64)
+        token_lora_idx = torch.repeat_interleave(
+            self.batch_info.weight_indices.to(torch.int64),
+            self.batch_info.seg_lens,
+            output_size=total_seq_len,
+        )
+
+        rank_per_token = self.batch_info.lora_ranks[token_lora_idx]
+        scaling_per_token = self.batch_info.scalings[token_lora_idx]
+        rank_idx = torch.arange(max_rank, device=weights.device)
+        token_lora_idx_expanded = token_lora_idx.unsqueeze(1).expand(total_seq_len, max_rank)
+        rank_idx_expanded = rank_idx.unsqueeze(0).expand(total_seq_len, max_rank)
+        clamped_ids_expanded = clamped_ids.unsqueeze(1).expand(total_seq_len, max_rank)
+
+        result = weights[token_lora_idx_expanded, rank_idx_expanded, clamped_ids_expanded]
+
+        rank_mask = rank_idx.unsqueeze(0) < rank_per_token.unsqueeze(1)
+        result = result * rank_mask.to(result.dtype)
+
+        result = result * scaling_per_token.unsqueeze(1).to(result.dtype)
+
+        return result
+
     def run_lora_a_sgemm(
         self, x: torch.Tensor, weights: torch.Tensor, *args, **kwargs
     ) -> torch.Tensor:
