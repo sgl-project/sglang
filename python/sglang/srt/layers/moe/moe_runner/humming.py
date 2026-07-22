@@ -421,9 +421,8 @@ class HummingRunnerCore(MoeRunnerCore):
             and w2_meta.input_scale_group_size == 128
             and self.activation == "silu"
             and gate_up.dtype == torch.bfloat16
-            and intermediate % 128 == 0
-            and max_tokens % 4 == 0
-            and groups % 4 == 0
+            and intermediate % 256 == 0
+            and num_experts <= 256
             and intermediate // 8 >= num_experts
         )
         if use_jit:
