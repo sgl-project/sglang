@@ -6587,6 +6587,7 @@ class ServerArgs:
             "Qwen2_5OmniForConditionalGeneration",
             "KimiVLForConditionalGeneration",
             "KimiK25ForConditionalGeneration",
+            "KimiK3ForConditionalGeneration",
             "MiMoV2ForCausalLM",
         ]:
             raise ValueError(

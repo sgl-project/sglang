@@ -128,6 +128,7 @@ from sglang.srt.model_executor.model_runner_components.load_model_utils import (
     load_kv_cache_scales,
     load_model_with_memory_saver,
     maybe_downgrade_dtype_for_legacy_gpu,
+    maybe_precompile_model_kernels_after_loading,
     maybe_register_debug_tensor_dump_hook,
     maybe_trigger_remote_instance_nccl_send_group,
     report_online_quantization,
@@ -1068,18 +1069,7 @@ class ModelRunner:
         )
 
     def maybe_precompile_model_kernels_after_loading(self) -> None:
-        """Run opt-in precompile after quant postprocessing, before pool sizing."""
-        precompile = getattr(self.model, "precompile_kernels_after_loading", None)
-        if precompile is None:
-            return
-
-        if self.device == "cuda":
-            current_platform.synchronize()
-            current_platform.empty_cache()
-        precompile()
-        if self.device == "cuda":
-            current_platform.synchronize()
-            current_platform.empty_cache()
+        maybe_precompile_model_kernels_after_loading(self.model, self.device)
 
     def maybe_init_dwdp(self):
         if self.is_draft_worker:

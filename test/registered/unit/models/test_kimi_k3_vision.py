@@ -9,6 +9,7 @@ from sglang.srt.layers.attention.vision import (
     prepare_flashinfer_cudnn_vision_attention_metadata,
 )
 from sglang.srt.model_executor import model_runner
+from sglang.srt.model_executor.model_runner_components import load_model_utils
 from sglang.srt.models import kimi_k3_vl
 from sglang.srt.models.kimi_k3_vl import (
     KimiK3VisionTower,
@@ -122,12 +123,12 @@ def test_model_kernel_precompile_runs_after_loading_and_clears_cache(monkeypatch
     runner.device = "cuda"
 
     monkeypatch.setattr(
-        model_runner.current_platform,
+        load_model_utils.current_platform,
         "synchronize",
         lambda: events.append("synchronize"),
     )
     monkeypatch.setattr(
-        model_runner.current_platform,
+        load_model_utils.current_platform,
         "empty_cache",
         lambda: events.append("empty_cache"),
     )
@@ -507,3 +508,106 @@ def test_kimi_k3_fused_rope_gate_is_prepared_once_per_encoder(monkeypatch):
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+class _K3TowerStub:
+    device = torch.device("cpu")
+    merge_kernel_size = (2, 2)
+
+    def __init__(self):
+        self.config = SimpleNamespace(hidden_size=2)
+        self.patch_embed = SimpleNamespace(
+            proj=SimpleNamespace(weight=torch.empty(1, dtype=torch.float32))
+        )
+
+
+def test_kimi_k3_encoder_dp_defers_feature_materialization(monkeypatch):
+    """K3 vision is image-wise DP: the DP runner must receive lazy features
+    (pixel_values=None + a loader), and the loader must materialize exactly
+    the requested images on the owner rank with the tower dtype."""
+    from unittest.mock import patch as mock_patch
+
+    from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+    from sglang.srt.models.kimi_k3 import KimiK3ForConditionalGeneration
+
+    model = KimiK3ForConditionalGeneration.__new__(KimiK3ForConditionalGeneration)
+    torch.nn.Module.__init__(model)
+    model.use_data_parallel = True
+    model.vision_tower = _K3TowerStub()
+    model.mm_projector = lambda image_embeds: image_embeds
+
+    items = [
+        MultimodalDataItem(
+            modality=Modality.IMAGE,
+            offsets=[(0, 1)],
+            feature=torch.randn(4, 2, dtype=torch.float64),
+            model_specific_data={"grid_thws": torch.tensor([[1, 2, 2]])},
+        ),
+        MultimodalDataItem(
+            modality=Modality.IMAGE,
+            offsets=[(1, 2)],
+            feature=torch.randn(4, 2, dtype=torch.float64),
+            model_specific_data={"grid_thws": torch.tensor([[1, 2, 2]])},
+        ),
+    ]
+    sharded_embeddings = torch.randn(2, 2)
+
+    with mock_patch(
+        "sglang.srt.multimodal.mm_utils.run_dp_sharded_mrope_vision_model",
+        return_value=sharded_embeddings,
+    ) as run_dp, mock_patch(
+        "sglang.srt.models.kimi_k3.get_server_args",
+        return_value=SimpleNamespace(tp_size=1),
+    ), mock_patch(
+        "sglang.srt.models.kimi_k3.get_parallel",
+        return_value=SimpleNamespace(attn_tp_size=1),
+    ):
+        output = model.get_image_feature(items)
+        # exercise the loader inside the patch scope: it reads server args
+        loader_in_scope = run_dp.call_args.kwargs["load_local_pixel_values"]
+        local = loader_in_scope([1])
+        both = loader_in_scope([0, 1])
+
+    assert output is sharded_embeddings
+    tower, pixel_values, grid_thws = run_dp.call_args.args
+    assert tower is model.vision_tower
+    assert pixel_values is None
+    assert grid_thws == [[1, 2, 2], [1, 2, 2]]
+    assert run_dp.call_args.kwargs["rope_type"] == "rope_2d_packed"
+    loader = run_dp.call_args.kwargs["load_local_pixel_values"]
+    assert callable(loader)
+
+    # Owner-rank materialization: only the requested image, tower dtype.
+    assert local.shape == (4, 2)
+    assert local.dtype == torch.float32
+    assert torch.equal(local, items[1].feature.to(torch.float32))
+
+    assert both.shape == (8, 2)
+    assert torch.equal(
+        both,
+        torch.cat([items[0].feature, items[1].feature]).to(torch.float32),
+    )
+
+
+def test_kimi_k3_rejects_aggregated_items():
+    """One item must carry exactly one logical image: the DP owner
+    assignment and the bounded CUDA-IPC lease accounting are per-item, so
+    aggregated encoder inputs must be split upstream (EPD encode server)."""
+    from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+    from sglang.srt.models.kimi_k3 import KimiK3ForConditionalGeneration
+
+    model = KimiK3ForConditionalGeneration.__new__(KimiK3ForConditionalGeneration)
+    torch.nn.Module.__init__(model)
+    model.use_data_parallel = True
+    model.vision_tower = _K3TowerStub()
+    model.mm_projector = lambda image_embeds: image_embeds
+
+    aggregated = MultimodalDataItem(
+        modality=Modality.IMAGE,
+        offsets=[(0, 2)],
+        feature=torch.arange(12 * 2, dtype=torch.float64).reshape(12, 2),
+        model_specific_data={"grid_thws": torch.tensor([[1, 2, 2], [1, 2, 4]])},
+    )
+
+    with pytest.raises(ValueError, match="one vision grid per MultimodalDataItem"):
+        model.get_image_feature([aggregated])

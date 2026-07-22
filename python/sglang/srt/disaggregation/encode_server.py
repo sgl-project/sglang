@@ -55,6 +55,9 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
+from sglang.srt.model_executor.model_runner_components.load_model_utils import (
+    maybe_precompile_model_kernels_after_loading,
+)
 from sglang.srt.model_loader import get_model
 from sglang.srt.multimodal.processors.qwen_vl import preprocess_video
 from sglang.srt.observability.metrics_collector import EncoderMetricsCollector
@@ -183,7 +186,7 @@ def _convert(data):
 
 
 _mm_grid_attrs = {
-    # Kimi K2.5 HF processor uses grid_thws (see base_processor.ATTR_NAME_TO_MODALITY).
+    # Kimi K2.5/K3 HF processors use grid_thws (see base_processor.ATTR_NAME_TO_MODALITY).
     Modality.IMAGE: ["image_grid_thw", "image_grid_hws", "grid_thws"],
     Modality.VIDEO: ["video_grid_thw"],
     Modality.AUDIO: ["audio_feature_lens_raw"],
@@ -197,11 +200,12 @@ _mm_feature_attrs = {
 
 
 def _get_mm_grid_dim(mm_inputs, modality, model_type: Optional[str] = None):
-    # Kimi K2.5 vision processor only emits `grid_thws`; prefer it over generic keys
+    # Kimi K2.5/K3 vision processors only emit `grid_thws`; prefer it over generic keys
     # so we never pick a mis-typed or stale `image_grid_hws` field from kwargs.
     attrs = _mm_grid_attrs[modality]
     if (model_type or "").lower() in [
         "kimi_k25",
+        "kimi_k3",
         "kimi_vl",
     ] and modality == Modality.IMAGE:
         attrs = ("grid_thws", "image_grid_thw", "image_grid_hws")
@@ -317,6 +321,7 @@ class MMEncoder:
             load_config=self.load_config,
             device_config=self.device_config,
         )
+        maybe_precompile_model_kernels_after_loading(self.model, self.device)
 
         self.context = zmq.asyncio.Context(2)
         self.sync_context = zmq.Context()  # Reuse sync context for thread pool
@@ -776,7 +781,7 @@ class MMEncoder:
             return self._get_feat_extract_output_lengths(input_length)
         else:
             if (
-                self.model_type in ["kimi_k25", "kimi_vl"]
+                self.model_type in ["kimi_k25", "kimi_k3", "kimi_vl"]
                 and modality == Modality.IMAGE
             ):
                 return self._kimi_tokens_from_patch_grid(grid)
@@ -832,6 +837,9 @@ class MMEncoder:
         """
         if grid_thw is None:
             grid_thw = _get_mm_grid_dim(mm_inputs, modality, self.model_type)
+        split_kimi_k3_images = (
+            self.model_type == "kimi_k3" and modality == Modality.IMAGE
+        )
 
         # Audio features are per-item (list of mels for mimo_v2, or batched
         # N x n_mels x T_max for qwen2_audio); slice by item index and keep
@@ -851,31 +859,50 @@ class MMEncoder:
                 offsets.append(curr)
             for idx in indices:
                 sub_feature_list.append(mm_feature[offsets[idx] : offsets[idx + 1]])
-            sub_feature = torch.cat(sub_feature_list, dim=0)
+            if not split_kimi_k3_images:
+                sub_feature = torch.cat(sub_feature_list, dim=0)
 
-        mm_item = MultimodalDataItem.from_dict(
-            {
-                "modality": modality,
-                "feature": (
-                    sub_feature
-                    if isinstance(sub_feature, list)
-                    else _convert(sub_feature)
-                ),
-            }
-        )
+        if split_kimi_k3_images:
+            mm_items = [
+                MultimodalDataItem.from_dict(
+                    {
+                        "modality": modality,
+                        "feature": _convert(feature),
+                    }
+                )
+                for feature in sub_feature_list
+            ]
+        else:
+            mm_items = [
+                MultimodalDataItem.from_dict(
+                    {
+                        "modality": modality,
+                        "feature": (
+                            sub_feature
+                            if isinstance(sub_feature, list)
+                            else _convert(sub_feature)
+                        ),
+                    }
+                )
+            ]
 
         for k, v in mm_inputs.items():
             if k in _mm_feature_attrs.get(modality, []):
                 continue
             val = _convert(v)
             if k in _mm_grid_attrs.get(modality, []):
-                mm_item.set(k, val[indices])
+                if split_kimi_k3_images:
+                    for mm_item, idx in zip(mm_items, indices):
+                        mm_item.set(k, val[idx : idx + 1])
+                else:
+                    mm_items[0].set(k, val[indices])
             else:
-                mm_item.set(k, val)
+                for mm_item in mm_items:
+                    mm_item.set(k, val)
 
         forward_start = time.perf_counter()
         with torch.inference_mode():
-            new_embeddings = get_feature_fn([mm_item])
+            new_embeddings = get_feature_fn(mm_items)
             if not keep_on_gpu:
                 new_embeddings = new_embeddings.cpu()
             if new_embeddings.ndim != 2:
@@ -1450,12 +1477,20 @@ class MMEncoder:
     def _grid_count_per_leaf(self, leaves: List, modality: Modality) -> List[int]:
         """Number of grid entries each leaf produces under the model's processor.
 
-        Most processors map 1 leaf → 1 grid. Kimi-VL/K25 image processors expand
+        Most processors map 1 leaf → 1 grid. Kimi-VL/K2.5/K3 image processors expand
         a leaf shaped {"type": "image", "image": [pil1, pil2, ...]} into N grids
         (see _normalize_kimi_encoder_images). Cross-request batching needs these
         counts to keep per-request boundaries aligned with grid_dim.
         """
-        if self.model_type not in ("kimi_k25", "kimi_vl") or modality != Modality.IMAGE:
+        if (
+            self.model_type
+            not in (
+                "kimi_k25",
+                "kimi_k3",
+                "kimi_vl",
+            )
+            or modality != Modality.IMAGE
+        ):
             return [1] * len(leaves)
 
         def count(leaf):
@@ -1504,7 +1539,7 @@ class MMEncoder:
                     normalized.append(img)
             return normalized
 
-        # Kimi-K2.5 vision processor expects media dicts.
+        # Kimi-K2.5/K3 vision processors expect media dicts.
         normalized = []
         for img in images:
             wrapped = wrap_one(img)
@@ -1557,7 +1592,7 @@ class MMEncoder:
         if model_preprocessor:
             return model_preprocessor(images, Modality.IMAGE, self.vision_config)
         image_config = self.vision_config.get("image", {})
-        if self.model_type in ["kimi_k25", "kimi_vl"]:
+        if self.model_type in ["kimi_k25", "kimi_k3", "kimi_vl"]:
             images = self._normalize_kimi_encoder_images(images)
         return await asyncio.get_running_loop().run_in_executor(
             self.preproc_executor,
@@ -2150,7 +2185,7 @@ class MMEncoder:
         """Cross-request encoder fusion (image/audio). No cache path."""
         # items_per_req counts grid entries (post-expansion) so per-request
         # slicing of grid_dim/final_slices stays aligned for processors that
-        # expand one leaf into multiple grids (e.g. Kimi-VL/K25 dict-of-images).
+        # expand one leaf into multiple grids (e.g. Kimi-VL/K2.5/K3 dict-of-images).
         flat_items, items_per_req = [], []
         for req in requests:
             leaves = MMEncoder._flatten_nested_items(req["mm_items"])

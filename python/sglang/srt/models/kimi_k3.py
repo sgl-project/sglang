@@ -96,6 +96,7 @@ from sglang.srt.models.kimi_k3_vl import (
 )
 from sglang.srt.models.transformers import maybe_prefix
 from sglang.srt.models.utils import WeightsMapper
+from sglang.srt.multimodal.mm_utils import materialize_multimodal_features
 from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import make_layers
 from sglang.srt.utils.common import (
@@ -1229,9 +1230,7 @@ class KimiK3MoE(nn.Module):
         every rank (tp-fold redundant compute + a2a traffic)."""
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_size)
-        use_dp = (
-            self._dp_attention and forward_batch is not None and not self._ep_a2a
-        )
+        use_dp = self._dp_attention and forward_batch is not None and not self._ep_a2a
         if use_dp:
             local_hidden_states = hidden_states
             hidden_states = get_global_dp_buffer(get_tp_group())
@@ -2180,7 +2179,9 @@ class KimiK3DecoderLayer(nn.Module):
 
         # ---- MLP (consumes +prefix_sum: MoE folds it into the 3-way tail
         # add, dense adds it after down_proj) ----
-        out = self.mlp(hidden_states, prefix_sum=prefix_sum, forward_batch=forward_batch)
+        out = self.mlp(
+            hidden_states, prefix_sum=prefix_sum, forward_batch=forward_batch
+        )
         if shard_lo >= 0:
             # reassemble the batch: contiguous shards concatenate in rank order
             group = get_parallel().attn_tp_group
@@ -2854,6 +2855,12 @@ class KimiK3LinearForCausalLM(nn.Module):
 
 
 class KimiK3ForConditionalGeneration(nn.Module):
+    # Raw HF checkpoint prefixes, before hf_to_sglang_mapper is applied.
+    encoder_only_safetensors_weight_prefixes = (
+        "vision_tower.",
+        "mm_projector.",
+    )
+
     hf_to_sglang_mapper = WeightsMapper(
         orig_to_new_prefix={
             "language_model.layers.": "language_model.model.layers.",
@@ -2881,11 +2888,13 @@ class KimiK3ForConditionalGeneration(nn.Module):
         self.vision_tower = KimiK3VisionTower(config.vision_config)
         self.mm_projector = KimiK3MultiModalProjector(config.vision_config)
 
-        self.language_model = KimiK3LinearForCausalLM(
-            config.text_config,
-            quant_config,
-            prefix="",
-        )
+        self.language_model = None
+        if not config.encoder_only:
+            self.language_model = KimiK3LinearForCausalLM(
+                config.text_config,
+                quant_config,
+                prefix="",
+            )
 
     @property
     def model(self):
@@ -2898,53 +2907,118 @@ class KimiK3ForConditionalGeneration(nn.Module):
 
     def post_load_weights(self):
         # Delegate so DummyModelLoader's post-load hook reaches the LM tower.
-        self.language_model.post_load_weights()
+        if self.language_model is not None:
+            self.language_model.post_load_weights()
 
     def precompile_kernels_after_loading(self) -> None:
+        if self.config.language_only:
+            return
         if self.vision_tower.precompile_fused_rope():
             logger.info("Precompiled dynamic-token fused K3 vision RoPE kernel")
         if self.vision_tower.precompile_attention_backend():
             logger.info("Precompiled Kimi-K3 vision FA4 kernel")
 
     def get_input_embeddings(self):
+        if self.language_model is None:
+            raise AttributeError(
+                "get_input_embeddings() is not available in encoder-only mode"
+            )
         return self.language_model.model.embed_tokens
 
     @property
     def lm_head(self):
+        if self.language_model is None:
+            raise AttributeError("lm_head is not available in encoder-only mode")
         return self.language_model.lm_head
 
     def set_dspark_layers_to_capture(self, layer_ids: list[int]) -> None:
+        if self.language_model is None:
+            raise AttributeError(
+                "DSPARK layer capture is not available in encoder-only mode"
+            )
         self.language_model.set_dspark_layers_to_capture(layer_ids)
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         device = self.vision_tower.device
         target_dtype = self.vision_tower.patch_embed.proj.weight.dtype
-        pixel_values = torch.cat([item.feature for item in items], dim=0).to(
-            device=device, dtype=target_dtype
-        )
         image_grid_thws = []
         for item in items:
             grid_thw = item.model_specific_data.get("image_grid_thw")
             if grid_thw is None:
                 grid_thw = item.model_specific_data["grid_thws"]
+            if grid_thw.shape[0] != 1:
+                # One item must carry exactly one logical image so the DP
+                # owner assignment and the bounded CUDA-IPC lease accounting
+                # stay per-item; aggregated encoder inputs are split upstream
+                # (EPD encode server) before reaching this point.
+                raise ValueError(
+                    "Kimi-K3 expects one vision grid per MultimodalDataItem; "
+                    "split aggregated encoder inputs before get_image_feature()"
+                )
             image_grid_thws.append(grid_thw)
-        grid_thws_host = torch.concat(image_grid_thws, dim=0)
+        grid_thws_host = torch.concat(image_grid_thws, dim=0).cpu()
         grid_thw_list = grid_thws_host.tolist()
-        grid_thws = grid_thws_host.to(device)
+
+        def materialize_item_features(image_indices: List[int]) -> torch.Tensor:
+            """Materialize features for the images assigned to this rank.
+
+            K3 vision is image-wise data-parallel, so each image is consumed
+            by exactly one TP rank. Deferred CUDA-IPC proxies are
+            reconstructed here, after the assignment is known, so an image
+            crosses the tokenizer/scheduler boundary once instead of once
+            per rank; CPU-transport features likewise only pay their H2D
+            copy on the owner rank. The consumer count matches
+            MmItemMemoryPool.try_to_recycle(), which waits for the server TP
+            size rather than the attention subgroup size.
+            """
+            parallel = get_parallel()
+            server_args = get_server_args()
+            ipc_consumer_count = max(
+                getattr(server_args, "tp_size", parallel.attn_tp_size), 1
+            )
+            device_index = device.index
+            if device.type == "cuda" and device_index is None:
+                device_index = torch.cuda.current_device()
+
+            features = []
+            for image_index in image_indices:
+                item = items[image_index]
+                if device.type == "cuda":
+                    item.reconstruct(
+                        device_index, ipc_consumer_count=ipc_consumer_count
+                    )
+                feature = item.feature
+                if not isinstance(feature, torch.Tensor):
+                    raise TypeError(
+                        "Kimi-K3 image feature must be a torch.Tensor, "
+                        f"got {type(feature)}"
+                    )
+                features.append(feature)
+            return materialize_multimodal_features(
+                features, device=device, dtype=target_dtype
+            )
 
         if self.use_data_parallel:
             from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 
             image_embeds = run_dp_sharded_mrope_vision_model(
                 self.vision_tower,
-                pixel_values,
+                None,
                 grid_thw_list,
                 rope_type="rope_2d",
+                # K3's tower pools the temporal dimension away: a t>1 grid
+                # still yields h*w/merge_area output embeddings, so the DP
+                # gather length must ignore t.
+                pool_temporal_dimension=True,
+                load_local_pixel_values=materialize_item_features,
+                pixel_values_device=device,
+                pixel_values_dtype=target_dtype,
                 pass_grid_thw_list=True,
             )
             return self.mm_projector(image_embeds)
 
-        image_embeds = self.vision_tower(pixel_values, grid_thws)
+        pixel_values = materialize_item_features(list(range(len(items))))
+        image_embeds = self.vision_tower(pixel_values, grid_thws_host.to(device))
         return self.mm_projector(image_embeds)
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
@@ -2953,10 +3027,14 @@ class KimiK3ForConditionalGeneration(nn.Module):
 
     @property
     def start_layer(self) -> int:
+        if self.language_model is None:
+            return 0
         return self.language_model.model.start_layer
 
     @property
     def end_layer(self) -> int:
+        if self.language_model is None:
+            return self.config.text_config.num_hidden_layers
         return self.language_model.model.end_layer
 
     def prepare_context_parallel_metadata_for_dcp(
@@ -3012,11 +3090,17 @@ class KimiK3ForConditionalGeneration(nn.Module):
         if mapper is not None:
             weights = mapper.apply(weights)
 
-        vision_params = dict(self.named_parameters(remove_duplicate=False))
+        vision_params = (
+            None
+            if self.config.language_only
+            else dict(self.named_parameters(remove_duplicate=False))
+        )
 
         def stream_language_weights():
             for name, loaded_weight in weights:
                 if "vision_tower" in name or "mm_projector" in name:
+                    if vision_params is None:
+                        continue
                     if name not in vision_params:
                         logger.warning("Unmapped vision weight: %s", name)
                         continue
@@ -3028,7 +3112,14 @@ class KimiK3ForConditionalGeneration(nn.Module):
                     continue
                 yield name.replace("language_model.", ""), loaded_weight
 
-        self.language_model.load_weights(stream_language_weights())
+        if self.language_model is not None:
+            self.language_model.load_weights(stream_language_weights())
+        else:
+            # The vision weights are loaded as a side effect of advancing this
+            # streaming iterator.  Encoder-only mode must therefore drain it
+            # even though it discards every language-model tensor.
+            for _ in stream_language_weights():
+                pass
 
     @property
     def stacked_params_mapping(self):

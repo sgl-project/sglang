@@ -32,6 +32,9 @@ from sglang.srt.multimodal.processors.kimi_k25 import (
     _resize_bicubic_if_needed,
     navit_resize_config,
 )
+from sglang.srt.utils.cuda_ipc_transport_utils import (
+    DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
+)
 
 
 def _k3_to_cuda_chw(image: Union[torch.Tensor, Image.Image]) -> torch.Tensor:
@@ -243,6 +246,17 @@ class KimiK3ImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
             self.mm_tokens,
             sglang_original_input_ids=base_output.input_ids,
         )
+
+        # K3's tower is unconditionally image-wise data-parallel (each image
+        # is consumed by exactly one TP rank), so keep IPC proxies lazy until
+        # that assignment is known: one tokenizer/scheduler crossing per
+        # image instead of one per rank. K2.5 gates this on
+        # --mm-enable-dp-encoder; K3 needs no flag.
+        if getattr(self, "use_cuda_ipc", False):
+            for item in mm_items:
+                item.model_specific_data[DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY] = (
+                    True
+                )
 
         return MultimodalProcessorOutput(
             input_ids=input_ids.tolist(),
