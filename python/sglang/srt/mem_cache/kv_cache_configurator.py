@@ -1811,9 +1811,7 @@ class KVCacheConfigurator:
             else:
                 server_args.override(
                     "mamba_pool.memory_budget",
-                    max_mamba_cache_size=int(
-                        (mamba_budget_bytes - per_req) // per_req
-                    ),
+                    max_mamba_cache_size=int((mamba_budget_bytes - per_req) // per_req),
                 )
 
         # Validate: max_mamba_cache_size must be positive after memory allocation.
