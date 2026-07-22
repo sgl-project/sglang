@@ -350,18 +350,6 @@ class CudaGraphBufferRegistry:
             self._slots[slot.name] = slot
             return slot
         buffer = torch.zeros(shape, dtype=slot.dtype, device=device)
-        if slot.name == "input_ids":
-            # All-zeros dummy tokens are identical -> identical router logits
-            # -> every capture-warmup token collapses onto one expert group,
-            # inflating a2a MoE warmups (hot-rank dispatch + degenerate
-            # DeepGEMM autotune shapes). Small random ids (< any real vocab)
-            # keep routing spread. Fixed seed: TP ranks must hold identical
-            # dummy tokens or their router topk diverges and rank-coupled
-            # a2a hangs in data-plane waits. Replay overwrites the head with
-            # real ids and masks the padded tail via num_token_non_padded.
-            gen = torch.Generator(device=buffer.device)
-            gen.manual_seed(0x5EED)
-            buffer.random_(1, 256, generator=gen)
         if self.share_pool:
             # Coalesce with any same-named buffer (e.g. the legacy
             # DecodeInputBuffers field) so capture and replay see one
