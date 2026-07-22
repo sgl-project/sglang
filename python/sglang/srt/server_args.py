@@ -2086,10 +2086,10 @@ class ServerArgs:
     ] = "pinned"
     paged_experts_kv_reserve_gb: A[
         float,
-        "KV-cache headroom (GB) to reserve when auto-sizing K (--paged-experts-num-resident auto). "
-        "Default -1 reserves a single-stream context; the K-slot pool is fixed and sglang sizes the real "
-        "KV pool from the leftover, so K is NOT scaled down by --max-running-requests. Raise this to "
-        "guarantee a larger KV pool at the cost of fewer resident experts (more paging).",
+        "KV-cache headroom (GB) to reserve when sizing K (--paged-experts-num-resident auto or max). "
+        "Default -1 reserves for the declared concurrency x context; the K-slot pool is fixed and sglang "
+        "sizes the real KV pool from the leftover. Raise this to guarantee a larger KV pool at the cost of "
+        "fewer resident experts (more paging).",
     ] = -1.0
     paged_experts_eviction: A[
         str,
