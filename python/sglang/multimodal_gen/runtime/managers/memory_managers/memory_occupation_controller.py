@@ -16,6 +16,15 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 
+def _module_to_pinned_cpu(module: torch.nn.Module) -> None:
+    # Async D2H into pinned host memory; caller synchronizes once after the batch.
+    for t in list(module.parameters()) + list(module.buffers()):
+        if t.device.type == "cuda":
+            pin = torch.empty(t.shape, dtype=t.dtype, device="cpu", pin_memory=True)
+            pin.copy_(t.data, non_blocking=True)
+            t.data = pin
+
+
 def _get_module_device(module: torch.nn.Module) -> str:
     """Return best-effort device string for a module."""
     param = next(module.parameters(), None)
@@ -113,9 +122,13 @@ class MemoryOccupationController:
             for name in names:
                 module = modules[name]
                 src_device_map[name] = _get_module_device(module)
-                module.to(device)
+                if device.startswith("cpu"):
+                    _module_to_pinned_cpu(module)
+                else:
+                    module.to(device, non_blocking=True)
                 moved.append(name)
                 _move_unregistered_tensors(module, device)
+            torch.cuda.synchronize()
         except Exception as e:
             logger.warning(
                 f"[_move_modules] move failed, rollback started: target={device} moved={moved} error={e}",
