@@ -19,6 +19,7 @@ from sglang.srt.utils.async_probe import sanitize_nan_logits
 from sglang.srt.utils.common import (
     get_bool_env_var,
     is_cuda,
+    is_gfx1250_supported,
     is_hip,
     is_musa,
     is_npu,
@@ -51,7 +52,9 @@ if _use_aiter:
 # to an empty string and breaks downstream consumers. Set this to 1 to fall back to
 # torch.argmax (which always returns a valid index). Default off so behavior is
 # unchanged elsewhere.
-_disable_aiter_greedy_sample = get_bool_env_var("SGLANG_DISABLE_AITER_GREEDY_SAMPLE")
+_disable_aiter_greedy_sample = (
+    get_bool_env_var("SGLANG_DISABLE_AITER_GREEDY_SAMPLE") or is_gfx1250_supported()
+)
 
 if is_npu():
     import torch_npu
