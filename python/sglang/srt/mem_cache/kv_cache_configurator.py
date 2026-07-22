@@ -58,7 +58,15 @@ from sglang.srt.mem_cache.memory_pool import (
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_exec,
+    get_memory,
+    get_model,
+    get_parallel,
+    get_schedule,
+    get_spec,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.common import (
@@ -115,9 +123,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner_components.spec_aux_hidden_state import (
         SpecAuxHiddenStateConfig,
     )
-    from sglang.srt.model_executor.pool_configurator import (
-        MemoryPoolConfig,
-    )
+    from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 
 
 class KVCacheConfigResult(msgspec.Struct, frozen=True, kw_only=True):
@@ -205,7 +211,7 @@ class KVCacheConfigurator:
     def _build_fp4_quant_method(self, *, num_layers: int):
         if not is_float4_e2m1fn_x2(self.kv_cache_dtype):
             return None
-        quant_name = resolve_kv_cache_quant(self.server_args.kv_cache_dtype)
+        quant_name = resolve_kv_cache_quant(get_model().kv_cache_dtype)
         if quant_name is None:
             return None
         quant_method = get_kv_cache_quant_method(
@@ -308,8 +314,8 @@ class KVCacheConfigurator:
         # from one byte buffer, then return. Gated to the target worker
         # (req_to_token_pool is None); supports hybrid Mamba and hybrid SWA (not DSV4).
         if (
-            self.server_args.enable_unified_memory
-            and self.server_args.disaggregation_mode == "null"
+            get_memory().enable_unified_memory
+            and get_disagg().disaggregation_mode == "null"
             and req_to_token_pool is None
         ):
             if self.mambaish_config is not None:
@@ -358,13 +364,13 @@ class KVCacheConfigurator:
                 # TARGET_VERIFY, so their pools skip the per-step intermediate
                 # (SpeculativeState) buffers only the target pool consumes.
                 req_to_token_pool = req_to_token_pool.clone_with_new_mamba(
-                    mamba_size=self.server_args.max_mamba_cache_size,
+                    mamba_size=get_schedule().max_mamba_cache_size,
                     mamba_spec_state_size=sizes.max_running_requests,
                     cache_params=self.mambaish_config.mamba2_cache_params,
                     device=self.device,
                     enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
                     draft_model_idx=self.draft_model_idx,
-                    speculative_eagle_topk=self.server_args.speculative_eagle_topk,
+                    speculative_eagle_topk=get_spec().speculative_eagle_topk,
                 )
 
         # Initialize token_to_kv_pool
@@ -394,7 +400,7 @@ class KVCacheConfigurator:
         # unsupported pool families before allocation. Keep this guard here so
         # future pool-selection refactors fail at boot instead of on first use.
         if (
-            self.server_args.prefill_only_disable_kv_cache
+            get_schedule().prefill_only_disable_kv_cache
             and not self.is_draft_worker
             and not isinstance(token_to_kv_pool, NoOpMHATokenToKVPool)
         ):
@@ -432,8 +438,8 @@ class KVCacheConfigurator:
         assert self.page_size >= 1, f"page_size must be >= 1, got {self.page_size}"
         # Mirror the non-shared path's extra_max_context_len computation.
         extra_max_context_len = 4
-        if self.server_args.speculative_num_draft_tokens is not None:
-            extra_max_context_len += self.server_args.speculative_num_draft_tokens
+        if get_spec().speculative_num_draft_tokens is not None:
+            extra_max_context_len += get_spec().speculative_num_draft_tokens
 
         mamba_layer_ids = [
             i
@@ -462,14 +468,14 @@ class KVCacheConfigurator:
             model_context_len=self.model_config.context_len,
             extra_max_context_len=extra_max_context_len,
             max_total_num_tokens=max_total_num_tokens,
-            max_mamba_cache_size=self.server_args.max_mamba_cache_size,
+            max_mamba_cache_size=get_schedule().max_mamba_cache_size,
             max_num_reqs=max_num_reqs,
-            enable_memory_saver=self.server_args.enable_memory_saver,
+            enable_memory_saver=get_exec().features.enable_memory_saver,
             enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
-            speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
-            disable_overlap_schedule=self.server_args.disable_overlap_schedule,
-            need_sort=self.server_args.disaggregation_mode in ("decode", "prefill"),
-            mamba_full_memory_ratio=self.server_args.mamba_full_memory_ratio,
+            speculative_num_draft_tokens=get_spec().speculative_num_draft_tokens,
+            disable_overlap_schedule=get_schedule().disable_overlap_schedule,
+            need_sort=get_disagg().disaggregation_mode in ("decode", "prefill"),
+            mamba_full_memory_ratio=get_schedule().mamba_full_memory_ratio,
             # Overlap mode: the allocator's `free` drops a wait_stream(forward_stream)
             # barrier so eager compaction serializes after the in-flight forward's
             # v2p/KV reads. Near-no-op in normal mode.
@@ -502,13 +508,13 @@ class KVCacheConfigurator:
         ), "unified memory pool does not support MLA-SWA hybrid yet"
         # Mirror the non-shared path's extra_max_context_len computation.
         extra_max_context_len = 4
-        if self.server_args.speculative_num_draft_tokens is not None:
-            extra_max_context_len += self.server_args.speculative_num_draft_tokens
+        if get_spec().speculative_num_draft_tokens is not None:
+            extra_max_context_len += get_spec().speculative_num_draft_tokens
         req_to_token_pool = ReqToTokenPool(
             size=max_num_reqs,
             max_context_len=self.model_config.context_len + extra_max_context_len,
             device=self.device,
-            enable_memory_saver=self.server_args.enable_memory_saver,
+            enable_memory_saver=get_exec().features.enable_memory_saver,
         )
 
         head_num = self.model_config.get_num_kv_heads(get_parallel().attn_tp_size)
@@ -558,8 +564,8 @@ class KVCacheConfigurator:
             full_attention_layer_ids=full_attention_layer_ids,
             full_max_total_num_tokens=full_max_total_num_tokens,
             swa_max_total_num_tokens=swa_max_total_num_tokens,
-            enable_memory_saver=self.server_args.enable_memory_saver,
-            need_sort=self.server_args.disaggregation_mode in ("decode", "prefill"),
+            enable_memory_saver=get_exec().features.enable_memory_saver,
+            need_sort=get_disagg().disaggregation_mode in ("decode", "prefill"),
             # Overlap mode: same wait_stream(forward_stream) rationale as
             # `_init_unified_mamba_pools`.
             forward_stream=self.forward_stream,
@@ -579,7 +585,7 @@ class KVCacheConfigurator:
         is_dsv4_model: bool,
         current_platform,
     ):
-        if not self.server_args.prefill_only_disable_kv_cache or self.is_draft_worker:
+        if not get_schedule().prefill_only_disable_kv_cache or self.is_draft_worker:
             return
 
         unsupported_pool_family = None
@@ -588,7 +594,7 @@ class KVCacheConfigurator:
         elif current_platform.is_out_of_tree() and not self.mambaish_config:
             unsupported_pool_family = "out-of-tree platform KV pool"
         elif (
-            self.server_args.attention_backend == "ascend" and not self.mambaish_config
+            get_exec().kernel.attention_backend == "ascend" and not self.mambaish_config
         ):
             unsupported_pool_family = "NPU/Ascend KV pool"
         elif self.use_mla_backend and is_dsa_model:
@@ -614,9 +620,9 @@ class KVCacheConfigurator:
     def _build_req_to_token_pool(self, *, max_num_reqs: int) -> ReqToTokenPool:
         extra_max_context_len = get_req_to_token_extra_context_len(self.server_args)
 
-        if self.server_args.disaggregation_mode == "decode":
+        if get_disagg().disaggregation_mode == "decode":
             # Extra slots for pre-allocated requests
-            pre_alloc_size = self.server_args.disaggregation_decode_extra_slots
+            pre_alloc_size = get_disagg().disaggregation_decode_extra_slots
             if self.mambaish_config:
                 req_to_token_pool = self._build_hybrid_mamba_decode_req_pool(
                     max_num_reqs=max_num_reqs,
@@ -648,15 +654,13 @@ class KVCacheConfigurator:
         extra_max_context_len: int,
         pre_alloc_size: int,
     ) -> ReqToTokenPool:
-        from sglang.srt.disaggregation.decode import (
-            HybridMambaDecodeReqToTokenPool,
-        )
+        from sglang.srt.disaggregation.decode import HybridMambaDecodeReqToTokenPool
 
         req_to_token_pool = HybridMambaDecodeReqToTokenPool(
             size=max_num_reqs,
             max_context_len=self.model_config.context_len + extra_max_context_len,
             device=self.device,
-            enable_memory_saver=self.server_args.enable_memory_saver,
+            enable_memory_saver=get_exec().features.enable_memory_saver,
             cache_params=self.mambaish_config.mamba2_cache_params,
             mamba_layer_ids=(
                 [
@@ -666,11 +670,11 @@ class KVCacheConfigurator:
                 ]
             ),
             speculative_num_draft_tokens=self.server_args.max_speculative_num_draft_tokens,
-            speculative_eagle_topk=self.server_args.speculative_eagle_topk,
+            speculative_eagle_topk=get_spec().speculative_eagle_topk,
             enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
             pre_alloc_size=pre_alloc_size,
-            enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
-            mamba_size=self.server_args.max_mamba_cache_size,
+            enable_overlap_schedule=not get_schedule().disable_overlap_schedule,
+            mamba_size=get_schedule().max_mamba_cache_size,
             start_layer=self.layer_info.start_layer,
         )
         return req_to_token_pool
@@ -688,7 +692,7 @@ class KVCacheConfigurator:
             size=max_num_reqs,
             max_context_len=self.model_config.context_len + extra_max_context_len,
             device=self.device,
-            enable_memory_saver=self.server_args.enable_memory_saver,
+            enable_memory_saver=get_exec().features.enable_memory_saver,
             pre_alloc_size=pre_alloc_size,
         )
         return req_to_token_pool
@@ -701,11 +705,11 @@ class KVCacheConfigurator:
     ) -> ReqToTokenPool:
         req_to_token_pool = HybridReqToTokenPool(
             size=max_num_reqs,
-            mamba_size=self.server_args.max_mamba_cache_size,
+            mamba_size=get_schedule().max_mamba_cache_size,
             mamba_spec_state_size=max_num_reqs,
             max_context_len=self.model_config.context_len + extra_max_context_len,
             device=self.device,
-            enable_memory_saver=self.server_args.enable_memory_saver,
+            enable_memory_saver=get_exec().features.enable_memory_saver,
             cache_params=self.mambaish_config.mamba2_cache_params,
             mamba_layer_ids=(
                 [
@@ -717,18 +721,18 @@ class KVCacheConfigurator:
             enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
             enable_mamba_extra_buffer_lazy=self.server_args.enable_mamba_extra_buffer_lazy(),
             speculative_num_draft_tokens=self.server_args.max_speculative_num_draft_tokens,
-            speculative_eagle_topk=self.server_args.speculative_eagle_topk,
-            enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
+            speculative_eagle_topk=get_spec().speculative_eagle_topk,
+            enable_overlap_schedule=not get_schedule().disable_overlap_schedule,
             start_layer=self.layer_info.start_layer,
-            enable_linear_replayssm=self.server_args.enable_linear_replayssm,
-            linear_replayssm_cache_len=self.server_args.linear_replayssm_cache_len,
-            mamba_envelope_layout=self.server_args.enable_page_major_kv_layout,
+            enable_linear_replayssm=get_exec().mamba.enable_linear_replayssm,
+            linear_replayssm_cache_len=get_exec().mamba.linear_replayssm_cache_len,
+            mamba_envelope_layout=get_memory().enable_page_major_kv_layout,
             # ReplaySSM spec-verify is GDN-only: activate the pool machinery
             # (rings + cursors + the intermediate_ssm gate) only for GDN-hybrid
             # models, so any other mamba-ish model (Mamba2/Nemotron, lightning,
             # ...) run with the flag set stays byte-identical to flag-off.
             enable_gdn_replayssm_spec=(
-                self.server_args.enable_gdn_replayssm_spec
+                get_exec().mamba.enable_gdn_replayssm_spec
                 and self.hybrid_gdn_config is not None
             ),
         )
@@ -754,7 +758,7 @@ class KVCacheConfigurator:
             size=max_num_reqs,
             max_context_len=self.model_config.context_len + extra_max_context_len,
             device=self.device,
-            enable_memory_saver=self.server_args.enable_memory_saver,
+            enable_memory_saver=get_exec().features.enable_memory_saver,
         )
         return req_to_token_pool
 
@@ -770,7 +774,7 @@ class KVCacheConfigurator:
         # selected by swapping in the PageMajorMHATokenToKVPool subclass. The
         # default keeps upstream's per-layer layout. The Mamba state pool is routed
         # separately via `mamba_envelope_layout` on the req-to-token pool above.
-        enable_page_major = self.server_args.enable_page_major_kv_layout
+        enable_page_major = get_memory().enable_page_major_kv_layout
         mha_pool_class = (
             PageMajorMHATokenToKVPool if enable_page_major else MHATokenToKVPool
         )
@@ -802,7 +806,7 @@ class KVCacheConfigurator:
                     max_total_num_tokens=sizes.max_total_num_tokens,
                 )
         elif (
-            self.server_args.attention_backend == "ascend" and not self.mambaish_config
+            get_exec().kernel.attention_backend == "ascend" and not self.mambaish_config
         ):
             if self.is_hybrid_swa:
                 token_to_kv_pool = self._build_ascend_swa_kv_pool(
@@ -878,14 +882,12 @@ class KVCacheConfigurator:
         c128_state_dtype: Optional[torch.dtype],
         req_to_token_pool: ReqToTokenPool,
     ) -> KVCache:
-        swa_page_size = self.server_args.page_size
+        swa_page_size = get_schedule().page_size
         if not _is_npu:
             assert swa_page_size == 256, "In paged swa mode, page_size must be 256."
 
         if self.is_draft_worker:
-            from sglang.srt.models.deepseek_v4_nextn import (
-                COMPRESS_RATIO_NEXTN_LAYER,
-            )
+            from sglang.srt.models.deepseek_v4_nextn import COMPRESS_RATIO_NEXTN_LAYER
 
             compression_ratios = [
                 COMPRESS_RATIO_NEXTN_LAYER
@@ -912,12 +914,12 @@ class KVCacheConfigurator:
             # sliding eviction in ``ScheduleBatch._evict_swa``.
             c4_state_pool_size = npu_state_pool_size(
                 ratio=4,
-                page_size=self.server_args.page_size,
+                page_size=get_schedule().page_size,
                 max_num_reqs=max_running_requests,
             )
             c128_state_pool_size = npu_state_pool_size(
                 ratio=128,
-                page_size=self.server_args.page_size,
+                page_size=get_schedule().page_size,
                 max_num_reqs=max_running_requests,
             )
         else:
@@ -935,7 +937,7 @@ class KVCacheConfigurator:
             c128_size=c128_max_total_num_tokens,
             c4_state_pool_size=c4_state_pool_size,
             c128_state_pool_size=c128_state_pool_size,
-            page_size=self.server_args.page_size,
+            page_size=get_schedule().page_size,
             swa_page_size=swa_page_size,
             sliding_window=self.model_config.window_size,
             dtype=self.kv_cache_dtype,
@@ -946,11 +948,11 @@ class KVCacheConfigurator:
             indexer_head_dim=self.model_config.index_head_dim,
             layer_num=self.layer_info.num_effective_layers,
             device=self.device,
-            enable_memory_saver=self.server_args.enable_memory_saver,
+            enable_memory_saver=get_exec().features.enable_memory_saver,
             compression_ratios=compression_ratios,
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
-            enable_hisparse=self.server_args.enable_hisparse,
+            enable_hisparse=get_memory().enable_hisparse,
             online_mtp_max_draft_tokens=(
                 self.server_args.max_speculative_num_draft_tokens or 0
             ),
@@ -961,7 +963,7 @@ class KVCacheConfigurator:
         PoolCls = current_platform.get_dsa_kv_pool_cls()
         token_to_kv_pool = PoolCls(
             max_total_num_tokens,
-            page_size=self.server_args.page_size,
+            page_size=get_schedule().page_size,
             dtype=self.kv_cache_dtype,
             kv_lora_rank=self.model_config.kv_lora_rank,
             qk_rope_head_dim=self.model_config.qk_rope_head_dim,
@@ -972,7 +974,7 @@ class KVCacheConfigurator:
                 kv_cache_dtype=self.kv_cache_dtype,
                 server_args=self.server_args,
             ),
-            enable_memory_saver=self.server_args.enable_memory_saver,
+            enable_memory_saver=get_exec().features.enable_memory_saver,
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
             index_head_dim=get_dsa_index_head_dim(self.model_config.hf_config),
@@ -985,14 +987,14 @@ class KVCacheConfigurator:
         PoolCls = current_platform.get_mla_kv_pool_cls()
         token_to_kv_pool = PoolCls(
             max_total_num_tokens,
-            page_size=self.server_args.page_size,
+            page_size=get_schedule().page_size,
             dtype=self.kv_cache_dtype,
             kv_lora_rank=self.model_config.kv_lora_rank,
             qk_rope_head_dim=self.model_config.qk_rope_head_dim,
             index_head_dim=(self.model_config.index_head_dim if is_dsa_model else None),
             layer_num=self.layer_info.num_effective_layers,
             device=self.device,
-            enable_memory_saver=self.server_args.enable_memory_saver,
+            enable_memory_saver=get_exec().features.enable_memory_saver,
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
         )
@@ -1002,13 +1004,13 @@ class KVCacheConfigurator:
         PoolCls = current_platform.get_mha_kv_pool_cls()
         token_to_kv_pool = PoolCls(
             max_total_num_tokens,
-            page_size=self.server_args.page_size,
+            page_size=get_schedule().page_size,
             dtype=self.kv_cache_dtype,
             head_num=self.model_config.get_num_kv_heads(get_parallel().attn_tp_size),
             head_dim=self.model_config.head_dim,
             layer_num=self.layer_info.num_effective_layers,
             device=self.device,
-            enable_memory_saver=self.server_args.enable_memory_saver,
+            enable_memory_saver=get_exec().features.enable_memory_saver,
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
         )
@@ -1020,9 +1022,7 @@ class KVCacheConfigurator:
         full_max_total_num_tokens: Optional[int],
         swa_max_total_num_tokens: Optional[int],
     ) -> KVCache:
-        from sglang.srt.hardware_backend.npu.memory_pool_npu import (
-            NPUMHATokenToKVPool,
-        )
+        from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMHATokenToKVPool
 
         kwargs = {}
         if self.is_hybrid_swa_compress:
@@ -1039,7 +1039,7 @@ class KVCacheConfigurator:
         token_to_kv_pool = SWAKVPool(
             size=full_max_total_num_tokens,
             size_swa=swa_max_total_num_tokens,
-            page_size=self.server_args.page_size,
+            page_size=get_schedule().page_size,
             dtype=self.kv_cache_dtype,
             post_capture_active=self.post_capture_kv_active,
             head_num=self.model_config.get_num_kv_heads(get_parallel().attn_tp_size),
@@ -1055,39 +1055,35 @@ class KVCacheConfigurator:
     def _build_ascend_mla_kv_pool(
         self, *, max_total_num_tokens: int, is_dsa_model: bool
     ) -> KVCache:
-        from sglang.srt.hardware_backend.npu.memory_pool_npu import (
-            NPUMLATokenToKVPool,
-        )
+        from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
 
         token_to_kv_pool = NPUMLATokenToKVPool(
             max_total_num_tokens,
-            page_size=self.server_args.page_size,
+            page_size=get_schedule().page_size,
             dtype=self.kv_cache_dtype,
             kv_lora_rank=self.model_config.kv_lora_rank,
             qk_rope_head_dim=self.model_config.qk_rope_head_dim,
             index_head_dim=(self.model_config.index_head_dim if is_dsa_model else None),
             layer_num=self.layer_info.num_effective_layers,
             device=self.device,
-            enable_memory_saver=self.server_args.enable_memory_saver,
+            enable_memory_saver=get_exec().features.enable_memory_saver,
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
         )
         return token_to_kv_pool
 
     def _build_ascend_mha_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
-        from sglang.srt.hardware_backend.npu.memory_pool_npu import (
-            NPUMHATokenToKVPool,
-        )
+        from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMHATokenToKVPool
 
         token_to_kv_pool = NPUMHATokenToKVPool(
             max_total_num_tokens,
-            page_size=self.server_args.page_size,
+            page_size=get_schedule().page_size,
             dtype=self.kv_cache_dtype,
             head_num=self.model_config.get_num_kv_heads(get_parallel().attn_tp_size),
             head_dim=self.model_config.head_dim,
             layer_num=self.layer_info.num_effective_layers,
             device=self.device,
-            enable_memory_saver=self.server_args.enable_memory_saver,
+            enable_memory_saver=get_exec().features.enable_memory_saver,
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
         )
@@ -1101,7 +1097,7 @@ class KVCacheConfigurator:
             dsa_cp_layer_shard_size,
         ) = get_glm_dsa_cp_layer_shard_info(self)
         pool_kwargs = {}
-        if self.server_args.enable_hisparse:
+        if get_memory().enable_hisparse:
             PoolCls = HiSparseDSATokenToKVPool
             from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
@@ -1121,7 +1117,7 @@ class KVCacheConfigurator:
             PoolCls = DSATokenToKVPool
         token_to_kv_pool = PoolCls(
             max_total_num_tokens,
-            page_size=self.server_args.page_size,
+            page_size=get_schedule().page_size,
             dtype=self.kv_cache_dtype,
             kv_lora_rank=self.model_config.kv_lora_rank,
             qk_rope_head_dim=self.model_config.qk_rope_head_dim,
@@ -1132,7 +1128,7 @@ class KVCacheConfigurator:
                 kv_cache_dtype=self.kv_cache_dtype,
                 server_args=self.server_args,
             ),
-            enable_memory_saver=self.server_args.enable_memory_saver,
+            enable_memory_saver=get_exec().features.enable_memory_saver,
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
             index_head_dim=get_dsa_index_head_dim(self.model_config.hf_config),
@@ -1143,13 +1139,13 @@ class KVCacheConfigurator:
     def _build_mla_fp4_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
         token_to_kv_pool = MLATokenToKVPoolFP4(
             max_total_num_tokens,
-            page_size=self.server_args.page_size,
+            page_size=get_schedule().page_size,
             dtype=self.kv_cache_dtype,
             kv_lora_rank=self.model_config.kv_lora_rank,
             qk_rope_head_dim=self.model_config.qk_rope_head_dim,
             layer_num=self.layer_info.num_effective_layers,
             device=self.device,
-            enable_memory_saver=self.server_args.enable_memory_saver,
+            enable_memory_saver=get_exec().features.enable_memory_saver,
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
         )
@@ -1158,13 +1154,13 @@ class KVCacheConfigurator:
     def _build_mla_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
         token_to_kv_pool = MLATokenToKVPool(
             max_total_num_tokens,
-            page_size=self.server_args.page_size,
+            page_size=get_schedule().page_size,
             dtype=self.kv_cache_dtype,
             kv_lora_rank=self.model_config.kv_lora_rank,
             qk_rope_head_dim=self.model_config.qk_rope_head_dim,
             layer_num=self.layer_info.num_effective_layers,
             device=self.device,
-            enable_memory_saver=self.server_args.enable_memory_saver,
+            enable_memory_saver=get_exec().features.enable_memory_saver,
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
         )
@@ -1191,7 +1187,7 @@ class KVCacheConfigurator:
             }
         swa_pool_class = (
             MHATokenToKVPoolMXFP8
-            if self.server_args.kv_cache_dtype == "mxfp8"
+            if get_model().kv_cache_dtype == "mxfp8"
             else mha_pool_class
         )
         swa_attention_layer_ids = self.model_config.swa_attention_layer_ids
@@ -1221,7 +1217,7 @@ class KVCacheConfigurator:
         token_to_kv_pool = SWAKVPool(
             size=full_max_total_num_tokens,
             size_swa=size_swa,
-            page_size=self.server_args.page_size,
+            page_size=get_schedule().page_size,
             dtype=self.kv_cache_dtype,
             post_capture_active=self.post_capture_kv_active,
             head_num=self.model_config.get_num_kv_heads(get_parallel().attn_tp_size),
@@ -1229,7 +1225,7 @@ class KVCacheConfigurator:
             swa_attention_layer_ids=swa_attention_layer_ids,
             full_attention_layer_ids=full_attention_layer_ids,
             device=self.device,
-            enable_kv_cache_copy=(self.server_args.speculative_algorithm is not None),
+            enable_kv_cache_copy=(get_spec().speculative_algorithm is not None),
             token_to_kv_pool_class=swa_pool_class,
             **kwargs,
         )
@@ -1244,7 +1240,7 @@ class KVCacheConfigurator:
         )
         token_to_kv_pool = MiniMaxSparseKVPool(
             size=max_total_num_tokens,
-            page_size=self.server_args.page_size,
+            page_size=get_schedule().page_size,
             dtype=self.kv_cache_dtype,
             index_dtype=self.model_dtype,
             head_num=self.model_config.get_num_kv_heads(get_parallel().attn_tp_size),
@@ -1254,7 +1250,7 @@ class KVCacheConfigurator:
             sparse_layer_ids=sparse_layer_ids,
             disable_value_sparse_layer_ids=disable_value_sparse_layer_ids,
             device=self.device,
-            enable_memory_saver=self.server_args.enable_memory_saver,
+            enable_memory_saver=get_exec().features.enable_memory_saver,
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
         )
@@ -1289,11 +1285,11 @@ class KVCacheConfigurator:
         # buffers) for the full-attention layers, same as the SWA branch.
         full_pool_class = (
             MHATokenToKVPoolMXFP8
-            if self.server_args.kv_cache_dtype == "mxfp8" and not self.use_mla_backend
+            if get_model().kv_cache_dtype == "mxfp8" and not self.use_mla_backend
             else mha_pool_class
         )
         token_to_kv_pool = HybridLinearKVPool(
-            page_size=self.server_args.page_size,
+            page_size=get_schedule().page_size,
             size=max_total_num_tokens,
             dtype=self.kv_cache_dtype,
             head_num=self.model_config.get_num_kv_heads(get_parallel().attn_tp_size),
@@ -1302,8 +1298,8 @@ class KVCacheConfigurator:
             full_attention_layer_ids=full_attention_layer_ids,
             device=self.device,
             mamba_pool=req_to_token_pool.mamba_pool,
-            enable_memory_saver=self.server_args.enable_memory_saver,
-            enable_kv_cache_copy=(self.server_args.speculative_algorithm is not None),
+            enable_memory_saver=get_exec().features.enable_memory_saver,
+            enable_kv_cache_copy=(get_spec().speculative_algorithm is not None),
             use_mla=self.use_mla_backend,
             start_layer=self.layer_info.start_layer,
             full_kv_pool_class=full_pool_class,
@@ -1316,30 +1312,30 @@ class KVCacheConfigurator:
     def _build_mha_fp4_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
         token_to_kv_pool = MHATokenToKVPoolFP4(
             max_total_num_tokens,
-            page_size=self.server_args.page_size,
+            page_size=get_schedule().page_size,
             dtype=self.kv_cache_dtype,
             head_num=self.model_config.get_num_kv_heads(get_parallel().attn_tp_size),
             head_dim=self.model_config.head_dim,
             v_head_dim=self.model_config.v_head_dim,
             layer_num=self.layer_info.num_effective_layers,
             device=self.device,
-            enable_memory_saver=self.server_args.enable_memory_saver,
+            enable_memory_saver=get_exec().features.enable_memory_saver,
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
-            enable_alt_stream=not self.server_args.enable_pdmux,
-            enable_kv_cache_copy=(self.server_args.speculative_algorithm is not None),
+            enable_alt_stream=not get_disagg().enable_pdmux,
+            enable_kv_cache_copy=(get_spec().speculative_algorithm is not None),
         )
         return token_to_kv_pool
 
     def _build_mha_kv_pool(
         self, *, max_total_num_tokens: int, mha_pool_class: type, quant_method=None
     ) -> KVCache:
-        if self.server_args.kv_cache_dtype == "mxfp8":
+        if get_model().kv_cache_dtype == "mxfp8":
             pool_cls = MHATokenToKVPoolMXFP8
         else:
             pool_cls = (
                 NoOpMHATokenToKVPool
-                if self.server_args.prefill_only_disable_kv_cache
+                if get_schedule().prefill_only_disable_kv_cache
                 else mha_pool_class
             )
         pool_kwargs = {}
@@ -1349,18 +1345,18 @@ class KVCacheConfigurator:
             pool_kwargs["post_capture_active"] = self.post_capture_kv_active
         token_to_kv_pool = pool_cls(
             max_total_num_tokens,
-            page_size=self.server_args.page_size,
+            page_size=get_schedule().page_size,
             dtype=self.kv_cache_dtype,
             head_num=self.model_config.get_num_kv_heads(get_parallel().attn_tp_size),
             head_dim=self.model_config.head_dim,
             v_head_dim=self.model_config.v_head_dim,
             layer_num=self.layer_info.num_effective_layers,
             device=self.device,
-            enable_memory_saver=self.server_args.enable_memory_saver,
+            enable_memory_saver=get_exec().features.enable_memory_saver,
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
-            enable_alt_stream=not self.server_args.enable_pdmux,
-            enable_kv_cache_copy=(self.server_args.speculative_algorithm is not None),
+            enable_alt_stream=not get_disagg().enable_pdmux,
+            enable_kv_cache_copy=(get_spec().speculative_algorithm is not None),
             **pool_kwargs,
         )
         return token_to_kv_pool
@@ -1375,20 +1371,20 @@ class KVCacheConfigurator:
         token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator],
     ) -> BaseTokenToKVPoolAllocator:
         # Initialize token_to_kv_pool_allocator
-        need_sort = self.server_args.disaggregation_mode in ("decode", "prefill")
+        need_sort = get_disagg().disaggregation_mode in ("decode", "prefill")
         if token_to_kv_pool_allocator is None:
             if current_platform.is_out_of_tree():
                 AllocatorCls = current_platform.get_paged_allocator_cls()
                 token_to_kv_pool_allocator = AllocatorCls(
                     sizes.max_total_num_tokens,
-                    page_size=self.server_args.page_size,
+                    page_size=get_schedule().page_size,
                     dtype=self.kv_cache_dtype,
                     device=self.device,
                     kvcache=token_to_kv_pool,
                     need_sort=need_sort,
                 )
             elif _is_npu and (
-                self.server_args.attention_backend == "ascend"
+                get_exec().kernel.attention_backend == "ascend"
                 or is_dsv4_model
                 or self.hybrid_gdn_config is not None
             ):
@@ -1406,7 +1402,7 @@ class KVCacheConfigurator:
                     token_to_kv_pool_allocator = swa_allocator_cls(
                         sizes.full_max_total_num_tokens,
                         sizes.swa_max_total_num_tokens,
-                        page_size=self.server_args.page_size,
+                        page_size=get_schedule().page_size,
                         dtype=self.kv_cache_dtype,
                         device=self.device,
                         kvcache=token_to_kv_pool,
@@ -1419,7 +1415,7 @@ class KVCacheConfigurator:
 
                     token_to_kv_pool_allocator = NPUPagedTokenToKVPoolAllocator(
                         sizes.max_total_num_tokens,
-                        page_size=self.server_args.page_size,
+                        page_size=get_schedule().page_size,
                         dtype=self.kv_cache_dtype,
                         device=self.device,
                         kvcache=token_to_kv_pool,
@@ -1429,7 +1425,7 @@ class KVCacheConfigurator:
                 if self.is_hybrid_swa and sizes.full_max_total_num_tokens == 0:
                     token_to_kv_pool_allocator = PureSWATokenToKVPoolAllocator(
                         sizes.swa_max_total_num_tokens,
-                        page_size=self.server_args.page_size,
+                        page_size=get_schedule().page_size,
                         dtype=self.kv_cache_dtype,
                         device=self.device,
                         kvcache=token_to_kv_pool,
@@ -1439,22 +1435,20 @@ class KVCacheConfigurator:
                     token_to_kv_pool_allocator = SWATokenToKVPoolAllocator(
                         sizes.full_max_total_num_tokens,
                         sizes.swa_max_total_num_tokens,
-                        page_size=self.server_args.page_size,
+                        page_size=get_schedule().page_size,
                         dtype=self.kv_cache_dtype,
                         device=self.device,
                         kvcache=token_to_kv_pool,
                         need_sort=need_sort,
                     )
                 else:
-                    if self.server_args.enable_hisparse:
-                        from sglang.srt.mem_cache.sparsity import (
-                            parse_hisparse_config,
-                        )
+                    if get_memory().enable_hisparse:
+                        from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
                         hisparse_cfg = parse_hisparse_config(self.server_args)
                         token_to_kv_pool_allocator = HiSparseTokenToKVPoolAllocator(
                             sizes.max_total_num_tokens,
-                            page_size=self.server_args.page_size,
+                            page_size=get_schedule().page_size,
                             dtype=self.kv_cache_dtype,
                             device=self.device,
                             kvcache=token_to_kv_pool,
@@ -1462,8 +1456,7 @@ class KVCacheConfigurator:
                             host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
                         )
                     elif (
-                        self.server_args.page_size == 1
-                        and self.server_args.dcp_size == 1
+                        get_schedule().page_size == 1 and self.server_args.dcp_size == 1
                     ):
                         token_to_kv_pool_allocator = TokenToKVPoolAllocator(
                             sizes.max_total_num_tokens,
@@ -1475,7 +1468,7 @@ class KVCacheConfigurator:
                     else:
                         token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
                             sizes.max_total_num_tokens * self.server_args.dcp_size,
-                            page_size=self.server_args.page_size
+                            page_size=get_schedule().page_size
                             * self.server_args.dcp_size,
                             dtype=self.kv_cache_dtype,
                             device=self.device,
@@ -1483,7 +1476,7 @@ class KVCacheConfigurator:
                             need_sort=need_sort,
                         )
 
-            if self.server_args.enable_hisparse and is_dsv4_model:
+            if get_memory().enable_hisparse and is_dsv4_model:
                 assert self.is_hybrid_swa, "DeepSeek V4 HiSparse requires SWA mode."
                 token_to_kv_pool_allocator = DeepSeekV4HiSparseTokenToKVPoolAllocator(
                     token_to_kv_pool_allocator
@@ -1535,7 +1528,7 @@ class KVCacheConfigurator:
             cpu_group=get_world_group().cpu_group,
         )
 
-        slack_gb = pre_model_load_memory * (1 - self.server_args.mem_fraction_static)
+        slack_gb = pre_model_load_memory * (1 - get_schedule().mem_fraction_static)
         if self.mambaish_config is not None and self.post_capture_kv_active:
             # Mamba state is a fixed pre-capture allocation, so it can't ride the ~0 post-capture slack.
             slack_gb = max(
@@ -1559,7 +1552,7 @@ class KVCacheConfigurator:
             )
             raise ValueError(
                 f"Loaded weights leave no GPU memory for the KV cache under "
-                f"--mem-fraction-static={self.server_args.mem_fraction_static}. "
+                f"--mem-fraction-static={get_schedule().mem_fraction_static}. "
                 f"Raise --mem-fraction-static above "
                 f"{suggested_mem_fraction_static:.3f} "
                 f"(minimum viable = 1 - available/pre = "
@@ -1570,14 +1563,14 @@ class KVCacheConfigurator:
         return int(rest_memory * (1 << 30))  # return in bytes
 
     def _calculate_mamba_ratio(self) -> int:
-        if self.server_args.disable_radix_cache:
+        if get_memory().disable_radix_cache:
             return 1
 
         additional_ratio = 0
         if self.server_args.enable_mamba_extra_buffer():
             # ping-pong buffer size is 2 when overlap schedule is on, 1 otherwise.
             # Lazy mode saves 1 slot (2 → 1) for overlap; non-overlap already uses 1.
-            if not self.server_args.disable_overlap_schedule:
+            if not get_schedule().disable_overlap_schedule:
                 if self.server_args.enable_mamba_extra_buffer_lazy():
                     additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP_LAZY
                 else:
@@ -1596,7 +1589,7 @@ class KVCacheConfigurator:
         Page alignment is handled by the configurator, not here.
         If constraints change the value, the configurator re-runs and re-aligns.
         """
-        user_limit = self.server_args.max_total_tokens
+        user_limit = get_schedule().max_total_tokens
 
         # Apply user-specified upper bound
         if user_limit is not None:
@@ -1626,7 +1619,7 @@ class KVCacheConfigurator:
         estimated = int(token_capacity / self.model_config.context_len * 512)
         estimated = max(min(estimated, 4096), 2048)
 
-        max_num_reqs = self.server_args.max_running_requests
+        max_num_reqs = get_schedule().max_running_requests
         if max_num_reqs is not None:
             requested_per_worker = max_num_reqs // self.ps.attn_dp_size
             max_num_reqs = min(requested_per_worker, token_capacity // 2)
@@ -1637,13 +1630,13 @@ class KVCacheConfigurator:
         if self.mambaish_config is not None:
             ratio = self._calculate_mamba_ratio()
             max_num_reqs = min(
-                max_num_reqs, self.server_args.max_mamba_cache_size // ratio
+                max_num_reqs, get_schedule().max_mamba_cache_size // ratio
             )
 
             if max_num_reqs <= 0:
                 raise RuntimeError(
                     f"Hybrid (mamba/linear-attention) state cache is too small to serve "
-                    f"any requests. max_mamba_cache_size={self.server_args.max_mamba_cache_size}, "
+                    f"any requests. max_mamba_cache_size={get_schedule().max_mamba_cache_size}, "
                     f"mamba_ratio={ratio}, resulting max_num_reqs={max_num_reqs}. "
                     f"Try: (1) reduce --max-running-requests, "
                     f"(2) increase --mem-fraction-static, or "
@@ -1673,7 +1666,7 @@ class KVCacheConfigurator:
         )
         configurator = create_memory_pool_configurator(self)
         config = configurator.finalize_with_max_running_requests(config)
-        config.mem_fraction_static = self.server_args.mem_fraction_static
+        config.mem_fraction_static = get_schedule().mem_fraction_static
         return config
 
     def config_from_budget(
@@ -1689,18 +1682,20 @@ class KVCacheConfigurator:
 
         configurator = create_memory_pool_configurator(self)
         config = configurator.calculate_pool_sizes(
-            budget_bytes, self.server_args.page_size
+            budget_bytes, get_schedule().page_size
         )
         max_tokens = self._apply_token_constraints(config.max_total_num_tokens)
         if cap_tokens is not None:
             max_tokens = min(max_tokens, cap_tokens)
         if max_tokens != config.max_total_num_tokens:
             config = configurator.calculate_pool_sizes_from_max_tokens(
-                max_tokens, self.server_args.page_size
+                max_tokens, get_schedule().page_size
             )
         return config
 
     def _handle_max_mamba_cache(self, total_rest_memory):
+        from sglang.srt.runtime_context import get_context
+
         config = self.mambaish_config
         server_args = self.server_args
         assert config is not None
@@ -1710,11 +1705,11 @@ class KVCacheConfigurator:
             assert server_args.speculative_num_draft_tokens is not None
             assert server_args.max_running_requests is not None
 
-        if server_args.max_mamba_cache_size is not None:
+        if get_schedule().max_mamba_cache_size is not None:
             # Use explicitly set max_mamba_cache_size
-            server_args.override(
+            get_context().override(
                 "mamba_pool.per_dp_shard",
-                max_mamba_cache_size=server_args.max_mamba_cache_size
+                max_mamba_cache_size=get_schedule().max_mamba_cache_size
                 // self.ps.attn_dp_size,
             )
             # Reserve intermediate memory based on capped max_num_reqs
@@ -1722,7 +1717,7 @@ class KVCacheConfigurator:
                 ratio = self._calculate_mamba_ratio()
                 capped_reqs = min(
                     server_args.max_running_requests // self.ps.attn_dp_size,
-                    server_args.max_mamba_cache_size // ratio,
+                    get_schedule().max_mamba_cache_size // ratio,
                 )
                 intermediate_size = (
                     config.mamba2_cache_params.mamba_cache_per_req
@@ -1735,7 +1730,7 @@ class KVCacheConfigurator:
             and server_args.max_running_requests is not None
         ):
             # Use explicitly set max_running_requests when radix cache is disabled
-            server_args.override(
+            get_context().override(
                 "mamba_pool.from_max_running_requests",
                 max_mamba_cache_size=server_args.max_running_requests
                 // self.ps.attn_dp_size,
@@ -1744,7 +1739,7 @@ class KVCacheConfigurator:
             if has_spec_dec:
                 intermediate_size = (
                     config.mamba2_cache_params.mamba_cache_per_req
-                    * server_args.max_mamba_cache_size
+                    * get_schedule().max_mamba_cache_size
                     * server_args.speculative_num_draft_tokens
                 )
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
@@ -1769,7 +1764,7 @@ class KVCacheConfigurator:
                 ratio = self._calculate_mamba_ratio()
                 D = server_args.speculative_num_draft_tokens
                 # Joint solve: main_state + intermediate = mamba_budget
-                server_args.override(
+                get_context().override(
                     "mamba_pool.memory_budget_spec",
                     max_mamba_cache_size=int(
                         mamba_budget_bytes // (per_req * (1 + D / ratio))
@@ -1779,12 +1774,12 @@ class KVCacheConfigurator:
                 # so the return value only has main_state subtracted from total
                 capped_reqs = min(
                     server_args.max_running_requests // self.ps.attn_dp_size,
-                    server_args.max_mamba_cache_size // ratio,
+                    get_schedule().max_mamba_cache_size // ratio,
                 )
                 intermediate_size = per_req * capped_reqs * D
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
             else:
-                server_args.override(
+                get_context().override(
                     "mamba_pool.memory_budget",
                     max_mamba_cache_size=int(mamba_budget_bytes // per_req),
                 )
@@ -1793,10 +1788,10 @@ class KVCacheConfigurator:
         # A non-positive value means GPU memory is insufficient for the requested
         # configuration. Fail fast with actionable advice instead of silently
         # producing garbled output at runtime.
-        if server_args.max_mamba_cache_size <= 0:
+        if get_schedule().max_mamba_cache_size <= 0:
             raise RuntimeError(
                 f"Not enough GPU memory for hybrid (mamba/linear-attention) state cache. "
-                f"Computed max_mamba_cache_size={server_args.max_mamba_cache_size} "
+                f"Computed max_mamba_cache_size={get_schedule().max_mamba_cache_size} "
                 f"(total_rest_memory={total_rest_memory:.2f} GB, "
                 f"mamba_cache_per_req={config.mamba2_cache_params.mamba_cache_per_req / (1 << 20):.2f} MB). "
                 f"Try: (1) reduce --max-running-requests, "
@@ -1806,7 +1801,7 @@ class KVCacheConfigurator:
             )
 
         mamba_state_memory = (
-            server_args.max_mamba_cache_size
+            get_schedule().max_mamba_cache_size
             * config.mamba2_cache_params.mamba_cache_per_req
             / (1 << 30)
         )

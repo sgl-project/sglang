@@ -48,6 +48,7 @@ from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.observability.req_time_stats import DPControllerReqTimeStats
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
+from sglang.srt.runtime_context import get_exec
 from sglang.srt.server_args import (
     DP_ATTENTION_HANDSHAKE_PORT_DELTA,
     PortArgs,
@@ -231,7 +232,7 @@ class DataParallelController:
                 sock_send(worker, obj)
 
     def update_active_ranks(self, ranks: ActiveRanksOutput):
-        if self.server_args.elastic_ep_backend is not None:
+        if get_exec().moe.elastic_ep_backend is not None:
             if len(ranks.status) != self.max_dp_size:
                 logger.warning(
                     "[Elastic EP][DPC] active rank status len=%d != max_dp_size=%d; "
@@ -484,7 +485,7 @@ class DataParallelController:
             logger.debug("Worker port broadcast completed")
             return worker_ports
         finally:
-            if self.server_args.elastic_ep_backend is None:
+            if get_exec().moe.elastic_ep_backend is None:
                 rep_socket.close()
             else:
                 threading.Thread(
@@ -815,6 +816,12 @@ def run_data_parallel_controller_process(
     kill_itself_when_parent_died()
     parent_process = psutil.Process().parent()
 
+    # Publish the resolved config at DP-controller process entry: this process
+    # reads config namespaces (e.g. get_exec().moe.*) in its own address space
+    # before spawning schedulers.
+    from sglang.srt.runtime_context import publish
+
+    publish(server_args, role="scheduler")
     configure_logger(server_args)
     if server_args.enable_trace:
         process_tracing_init(
