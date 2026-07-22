@@ -153,6 +153,35 @@ class TestMultimodalFeatureTransport(CustomTestCase):
             self.assertEqual(server_args.mm_feature_transport, "cpu")
             self.assertFalse(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
 
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    def test_default_auto_keeps_cpu_for_encoder_only(self, _mock_is_cuda):
+        server_args = ServerArgs(model_path="dummy", encoder_only=True)
+
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("SGLANG_USE_CUDA_IPC_TRANSPORT", None)
+            with self.assertLogs(server_args_module.logger, level="INFO") as logs:
+                server_args._handle_multimodal_feature_transport()
+
+            self.assertEqual(server_args.mm_feature_transport, "cpu")
+            self.assertFalse(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
+
+        self.assertIn("encoder-only serving", "\n".join(logs.output))
+
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    def test_encoder_only_ignores_explicit_cuda_ipc(self, _mock_is_cuda):
+        server_args = ServerArgs(
+            model_path="dummy",
+            encoder_only=True,
+            mm_feature_transport="cuda_ipc",
+        )
+
+        with self.assertLogs(server_args_module.logger, level="WARNING") as logs:
+            server_args._handle_multimodal_feature_transport()
+
+        self.assertEqual(server_args.mm_feature_transport, "cpu")
+        self.assertFalse(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
+        self.assertIn("does not control encoder-only", "\n".join(logs.output))
+
     @patch("sglang.srt.server_args.is_cuda", return_value=False)
     def test_cuda_ipc_rejects_non_nvidia_platforms(self, _mock_is_cuda):
         server_args = ServerArgs(model_path="dummy", mm_feature_transport="cuda_ipc")

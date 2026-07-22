@@ -6737,6 +6737,13 @@ class ServerArgs:
                     "--mm-feature-transport=%s instead.",
                     requested_transport,
                 )
+            elif self.encoder_only:
+                requested_transport = "cpu"
+                logger.info(
+                    "Multimodal feature transport auto-resolved to cpu for "
+                    "encoder-only serving; encoder outputs use "
+                    "--encoder-transfer-backend instead."
+                )
             elif is_cuda() and self.nnodes == 1 and self.disaggregation_mode == "null":
                 # Auto policy: single-node CUDA serving defaults to the bounded
                 # CUDA-IPC pool. The pool is only allocated when a multimodal
@@ -6761,6 +6768,14 @@ class ServerArgs:
                 requested_transport,
                 int(legacy_ipc_enabled),
             )
+
+        if self.encoder_only and requested_transport == "cuda_ipc":
+            logger.warning(
+                "--mm-feature-transport=cuda_ipc does not control encoder-only "
+                "output transfer; using cpu for this inactive transport. Select "
+                "--encoder-transfer-backend for encoder outputs."
+            )
+            requested_transport = "cpu"
 
         if requested_transport == "cuda_ipc":
             if not is_cuda():
