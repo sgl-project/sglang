@@ -620,5 +620,24 @@ class TestGenerateReqInputNormalization(CustomTestCase):
             req.normalize_batch_and_arguments()
 
 
+class TestSetInternalStateReqSerialization(CustomTestCase):
+    """SetInternalStateReq must round-trip string knobs (e.g. schedule_policy)
+    through msgspec — the annotation was previously Dict[str, Union[int, float]]
+    and silently rejected string values at request validation."""
+
+    def test_string_and_numeric_values_roundtrip(self):
+        import msgspec
+
+        from sglang.srt.managers.io_struct import SetInternalStateReq
+
+        req = SetInternalStateReq(
+            server_args={"schedule_policy": "lpm", "pp_max_micro_batch_size": 8}
+        )
+        encoded = msgspec.msgpack.encode(req)
+        decoded = msgspec.msgpack.decode(encoded, type=SetInternalStateReq)
+        self.assertEqual(decoded.server_args["schedule_policy"], "lpm")
+        self.assertEqual(decoded.server_args["pp_max_micro_batch_size"], 8)
+
+
 if __name__ == "__main__":
     unittest.main()

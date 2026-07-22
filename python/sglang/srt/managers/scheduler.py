@@ -172,6 +172,8 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
+    CacheAgnosticPolicy,
+    CacheAwarePolicy,
     PrefillAdder,
     SchedulePolicy,
 )
@@ -3947,6 +3949,7 @@ class Scheduler(
                 "speculative_accept_threshold_acc",
                 "dspark_force_budget_frac",
                 "dspark_clear_info_records",
+                "schedule_policy",
             ]
         )
 
@@ -3988,6 +3991,17 @@ class Scheduler(
                     )
                     if_success = False
                     break
+            elif k == "schedule_policy":
+                valid_policies = {p.value for p in CacheAwarePolicy} | {
+                    p.value for p in CacheAgnosticPolicy
+                }
+                if v not in valid_policies:
+                    logging.warning(
+                        f"Updating schedule_policy to {v!r} is rejected; "
+                        f"valid policies: {sorted(valid_policies)}."
+                    )
+                    if_success = False
+                    break
 
         if if_success:
             if (
@@ -4014,6 +4028,21 @@ class Scheduler(
                 self.draft_worker.clear_info_records()
             if remaining:
                 get_server_args().override(source="update_server_args", **remaining)
+            if "schedule_policy" in server_args_dict:
+                # The policy object is pure CPU-side state (no CUDA graphs or
+                # memory layouts depend on it), so it can be rebuilt between
+                # scheduling passes. Requests already in the waiting queue are
+                # re-ordered by the new policy on the next pass.
+                new_policy = server_args_dict["schedule_policy"]
+                self.schedule_policy = new_policy
+                self.policy = SchedulePolicy(
+                    new_policy,
+                    self.tree_cache,
+                    self.enable_hierarchical_cache,
+                    self.enable_priority_scheduling,
+                    self.schedule_low_priority_values_first,
+                )
+                logger.info(f"Schedule policy switched to {new_policy!r} at runtime.")
             logger.info(f"Global server args updated! {get_server_args()=}")
 
         return SetInternalStateReqOutput(updated=if_success)

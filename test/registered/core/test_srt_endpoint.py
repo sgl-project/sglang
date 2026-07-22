@@ -555,6 +555,52 @@ class TestSRTEndpoint(CustomTestCase):
         version = response_json["version"]
         self.assertIsInstance(version, str)
 
+    def test_set_schedule_policy_runtime(self):
+        """schedule_policy can be switched at runtime via /set_internal_state."""
+        try:
+            for policy in ["lpm", "dfs-weight", "fcfs"]:
+                response = requests.post(
+                    self.base_url + "/set_internal_state",
+                    json={"server_args": {"schedule_policy": policy}},
+                )
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.json(), [True])
+
+                # The server keeps scheduling and serving under the new policy.
+                gen = requests.post(
+                    self.base_url + "/generate",
+                    json={
+                        "text": "The capital of France is",
+                        "sampling_params": {"temperature": 0, "max_new_tokens": 8},
+                    },
+                )
+                self.assertEqual(gen.status_code, 200)
+        finally:
+            # Restore the default so other tests are unaffected.
+            requests.post(
+                self.base_url + "/set_internal_state",
+                json={"server_args": {"schedule_policy": "fcfs"}},
+            )
+
+    def test_set_schedule_policy_invalid(self):
+        """Unknown schedule_policy values are rejected without side effects."""
+        response = requests.post(
+            self.base_url + "/set_internal_state",
+            json={"server_args": {"schedule_policy": "not-a-policy"}},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), [False])
+
+        # The server still serves after the rejected update.
+        gen = requests.post(
+            self.base_url + "/generate",
+            json={
+                "text": "The capital of France is",
+                "sampling_params": {"temperature": 0, "max_new_tokens": 8},
+            },
+        )
+        self.assertEqual(gen.status_code, 200)
+
     def test_logit_bias(self):
         """Test that a very high logit bias forces sampling of a specific token."""
         # Choose a token ID to bias (using 5 as an example)
