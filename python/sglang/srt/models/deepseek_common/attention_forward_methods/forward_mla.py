@@ -537,6 +537,18 @@ class DeepseekMLAForwardMixin:
 
         dsa_prefill_cp = dsa_use_prefill_cp(forward_batch)
         mla_prefill_cp = mla_use_prefill_cp(forward_batch)
+        if (
+            dsa_prefill_cp
+            and skip_rope_for_dsa_tilelang_fused
+            and self.rotary_emb is not None
+        ):
+            # gfx950 DSA-CP: the fused rope+cache kernel ropes q and the
+            # (gathered) full K with one positions array, but under CP q is the
+            # local round-robin shard while K is gathered to the full sequence,
+            # so the local positions cannot rope the full K. Rope q/k here with
+            # the local positions (each token by its own global position) before
+            # the gather, then take the non-fused attention branch in core.
+            q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
         defer_kv_gather_until_after_rope = _should_defer_dsa_cp_kv_gather(
             dsa_prefill_cp=dsa_prefill_cp,
             fuse_rope_for_trtllm_mla=fuse_rope_for_trtllm_mla,
@@ -607,7 +619,11 @@ class DeepseekMLAForwardMixin:
         save_kv_cache = True
 
         if self.current_attention_backend in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
-            if self._skip_rope_for_dsa_tilelang_fused() and self.rotary_emb is not None:
+            if (
+                self._skip_rope_for_dsa_tilelang_fused()
+                and self.rotary_emb is not None
+                and not dsa_use_prefill_cp(forward_batch)
+            ):
                 cos = self.rotary_emb.cos_cache
                 sin = self.rotary_emb.sin_cache
                 kv_cache_dtype = (
