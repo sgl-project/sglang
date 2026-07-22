@@ -1,12 +1,8 @@
-"""Parity: dspark dense-draft stacked ctx-KV write vs the per-layer loop.
+"""Parity: dspark stacked ctx-KV write vs the per-layer loop.
 
-The stacked path (`DSparkDraftMixin._project_ctx_kv_stacked`) collapses every
-layer's KV projection into one GEMM + a batched k-norm + one shared RoPE. This
-guards it against wiring bugs (wrong slice / layer order / permute / eps) that
-the accuracy suite cannot catch: the ctx KV feeds only the draft, and spec
-decoding keeps the final output correct regardless of draft-KV quality, so a
-broken write shows up only as an accept-length collapse. Compare the two paths
-directly on the same input, and check the safety fallbacks return None.
+Accuracy tests cannot catch a broken ctx-KV write (spec decoding stays correct
+regardless of draft KV; only accept length drops), so compare the two paths
+directly and check the fallbacks return None.
 """
 
 import types
@@ -57,7 +53,7 @@ def _make_attn(rope, *, eps=EPS, has_bias=False, quantized=False, g=None):
     attn.qkv_proj = _MockQKV(weight, bias, quantized=quantized)
     k_norm = RMSNorm(HEAD_DIM, eps=eps).to(DEVICE)
     with torch.no_grad():
-        # Distinct per layer so a wrong layer order fails the parity check.
+        # Distinct per layer so a wrong layer order fails parity.
         k_norm.weight.copy_(torch.randn(HEAD_DIM, device=DEVICE, generator=g))
     attn.k_norm = k_norm
     attn.rotary_emb = rope
@@ -122,9 +118,7 @@ class TestDSparkStackedCtxKvParity(CustomTestCase):
             ctx_hidden=ctx_hidden, positions=positions, stacked=stacked
         )
 
-        # fp32: the two paths are algebraically identical; residual is only the
-        # fused-vs-manual RMSNorm rounding. bf16 loosens to that dtype's ulp
-        # while still catching O(1) wiring errors.
+        # fp32 tol covers only fused-vs-manual RMSNorm rounding; bf16 is looser.
         rtol, atol = (2e-4, 2e-4) if dtype == torch.float32 else (2e-2, 2e-2)
         for i in range(num_layers):
             torch.testing.assert_close(k_all[i], ref_k[i], rtol=rtol, atol=atol)
