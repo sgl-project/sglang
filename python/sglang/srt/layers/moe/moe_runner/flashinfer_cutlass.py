@@ -25,7 +25,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
     register_fused_func,
 )
 from sglang.srt.utils import is_flashinfer_available
-from sglang.srt.utils.common import next_power_of_2
+from sglang.srt.utils.common import is_sm120_supported, next_power_of_2
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
@@ -147,6 +147,17 @@ def _maybe_apply_routed_scaling_factor(
     return output
 
 
+def _swizzled_nvfp4_scale_to_mma_layout(
+    scale: torch.Tensor, *, m: int, k: int
+) -> torch.Tensor:
+    num_groups = scale.shape[0]
+    m_tiles = (m + 127) // 128
+    k_tiles = ((k + 15) // 16 + 3) // 4
+    return scale.reshape(num_groups, m_tiles, k_tiles, 32, 4, 4).permute(
+        3, 4, 1, 5, 2, 0
+    )
+
+
 def _prepare_input(
     dispatch_output,
     quant_info: FlashInferCutlassMoeQuantInfo,
@@ -201,6 +212,37 @@ def _run_flashinfer_cutlass(
                 dtype=output_dtype,
                 device=x.device,
             )
+
+    if quant_info.quant_type == "fp4" and is_sm120_supported():
+        from flashinfer.fused_moe import b12x_fused_moe
+
+        quant_scales = quant_info.quant_scales
+        assert quant_scales is not None and len(quant_scales) == 6
+        w13_weight = quant_info.w13_weight
+        w2_weight = quant_info.w2_weight
+        return b12x_fused_moe(
+            x=x,
+            w1_weight=w13_weight,
+            w1_weight_sf=_swizzled_nvfp4_scale_to_mma_layout(
+                quant_scales[1], m=w13_weight.shape[1], k=w13_weight.shape[2] * 2
+            ),
+            w2_weight=w2_weight,
+            w2_weight_sf=_swizzled_nvfp4_scale_to_mma_layout(
+                quant_scales[4], m=w2_weight.shape[1], k=w2_weight.shape[2] * 2
+            ),
+            token_selected_experts=topk_ids.to(torch.int),
+            token_final_scales=topk_weights,
+            num_experts=w13_weight.shape[0],
+            top_k=topk_ids.shape[1],
+            w1_alpha=quant_scales[2],
+            w2_alpha=quant_scales[5],
+            fc2_input_scale=quant_scales[3],
+            num_local_experts=w13_weight.shape[0],
+            output=output,
+            output_dtype=output_dtype,
+            activation=runner_config.activation,
+            quant_mode="nvfp4",
+        )
 
     w13_weight = quant_info.w13_weight
     w2_weight = quant_info.w2_weight

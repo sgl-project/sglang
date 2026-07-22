@@ -23,6 +23,7 @@ from sglang.srt.layers.quantization.utils import (
     swizzle_blockscale,
 )
 from sglang.srt.utils import next_power_of_2, set_weight_attrs
+from sglang.srt.utils.common import is_sm120_supported
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +47,9 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
             )
         self.group_size = 16
         self.use_flashinfer_trtllm = get_moe_runner_backend().is_flashinfer_trtllm()
+        self.use_flashinfer_b12x = (
+            not self.use_flashinfer_trtllm and is_sm120_supported()
+        )
 
     @classmethod
     def get_min_capability(cls) -> int:
@@ -175,7 +179,7 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
         )
         delattr(layer, "w2_weight_packed")
 
-        if self.use_flashinfer_trtllm:
+        if self.use_flashinfer_trtllm or self.use_flashinfer_b12x:
             w, s = reorder_w1w3_to_w3w1(
                 layer.w13_weight.data, layer.w13_weight_scale.data, dim=-2
             )
@@ -237,6 +241,20 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
         layer.w2_input_scale_quant = torch.nn.Parameter(
             (w2_input_global_scale), requires_grad=False
         )
+
+        if self.use_flashinfer_b12x:
+            # The SM12x kernel dynamically quantizes both activation inputs.
+            # Fold the checkpoint's per-expert weight multiplier into the
+            # block scales and use neutral global/input scales at runtime.
+            layer.w13_weight_scale.data = (
+                layer.w13_weight_scale.float() * layer.w13_weight_scale_2.view(-1, 1, 1)
+            ).to(layer.w13_weight_scale.dtype)
+            layer.w2_weight_scale.data = (
+                layer.w2_weight_scale.float() * layer.w2_weight_scale_2.view(-1, 1, 1)
+            ).to(layer.w2_weight_scale.dtype)
+            layer.g1_alphas.data.fill_(1.0)
+            layer.g2_alphas.data.fill_(1.0)
+            layer.w2_input_scale_quant.data.fill_(1.0)
 
         # TensorRT-LLM specific processing
         if self.use_flashinfer_trtllm:
