@@ -447,7 +447,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             self.backend.capture_one(
                 shape_key,
                 run_once,
-                dummies=None,
+                capture_inputs=None,
                 post_warmup_hook=post_warmup_hook,
             )
 
@@ -943,7 +943,7 @@ class OneGraphMultiLayerEagleMultiStepDraftExtendCudaGraphRunner(
         first.backend.capture_one(
             shape_key,
             multi_step_fn,
-            dummies=None,
+            capture_inputs=None,
             post_warmup_hook=getattr(
                 first.attn_backend, "on_after_cuda_graph_warmup", None
             ),
