@@ -328,6 +328,52 @@ class Qwen3Detector(BaseReasoningFormatDetector):
         )
 
 
+class Qwen3CoderReasoningDetector(BaseReasoningFormatDetector):
+    """
+    Reasoning detector for Qwen3-Coder family thinking variants
+    (e.g., Qwen3.6-Coder, Qwen3-Coder thinking SKUs).
+
+    Assumes reasoning format:
+      (<think>)*(.*)</think>
+
+    Qwen3-Coder uses ``<tool_call>`` as the function-call boundary token (matched
+    by ``function_call.qwen3_coder_detector.Qwen3CoderDetector``). In long
+    agentic loops the model frequently switches from reasoning to a tool call
+    without first emitting ``</think>``. Without ``tool_start_token`` the
+    parser would keep buffering everything as ``reasoning_content``, dropping
+    the tool call from ``normal_text`` and breaking the agent loop.
+
+    This detector mirrors :class:`Glm45Detector` (which uses the same ``<think>``
+    / ``<tool_call>`` convention) but is registered under the dedicated
+    ``qwen3-coder`` model_type so existing ``qwen3`` thinking deployments are
+    unaffected.
+
+    Note: this is the *reasoning* detector. The tool-call payload itself is
+    parsed by the separate :class:`sglang.srt.function_call.qwen3_coder_detector.Qwen3CoderDetector`.
+
+    Args:
+        stream_reasoning (bool): If False, accumulates reasoning content until the end tag.
+            If True, streams reasoning content as it arrives.
+    """
+
+    def __init__(
+        self,
+        stream_reasoning: bool = True,
+        force_reasoning: bool = False,
+        continue_final_message: bool = False,
+        previous_content: str = "",
+    ):
+        super().__init__(
+            "<think>",
+            "</think>",
+            force_reasoning=force_reasoning,
+            stream_reasoning=stream_reasoning,
+            tool_start_token="<tool_call>",
+            continue_final_message=continue_final_message,
+            previous_content=previous_content,
+        )
+
+
 class KimiDetector(BaseReasoningFormatDetector):
     """
     Detector for Kimi Thinking model.
@@ -1394,6 +1440,7 @@ class ReasoningParser:
         "mimo": _MimoDetector,
         "poolside_v1": _PoolsideV1Detector,
         "qwen3": Qwen3Detector,
+        "qwen3-coder": Qwen3CoderReasoningDetector,
         "qwen3-thinking": Qwen3Detector,
         "minimax": Qwen3Detector,
         "minimax-append-think": MiniMaxAppendThinkDetector,

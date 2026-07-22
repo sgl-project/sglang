@@ -13,6 +13,7 @@ from sglang.srt.parser.reasoning_parser import (
     KimiDetector,
     KimiK2Detector,
     Nemotron3Detector,
+    Qwen3CoderReasoningDetector,
     Qwen3Detector,
     ReasoningParser,
 )
@@ -368,6 +369,140 @@ class TestGlm45Detector(CustomTestCase):
         self.assertEqual(result.normal_text, "<tool_call>tool call")
 
 
+class TestQwen3CoderReasoningDetector(CustomTestCase):
+    """Test cases for Qwen3-Coder reasoning detector with tool interruption support."""
+
+    def setUp(self):
+        self.detector = Qwen3CoderReasoningDetector()
+
+    def test_init(self):
+        """Test Qwen3CoderReasoningDetector initialization."""
+        self.assertEqual(self.detector.think_start_token, "<think>")
+        self.assertEqual(self.detector.think_end_token, "</think>")
+        self.assertEqual(self.detector.tool_start_token, "<tool_call>")
+        self.assertFalse(self.detector._in_reasoning)
+        self.assertTrue(self.detector.stream_reasoning)
+
+    def test_detect_and_parse_normal_reasoning(self):
+        """Test parsing a normal reasoning block followed by content."""
+        text = "<think>Let me plan the refactor</think>Here is the patch."
+        result = self.detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "Let me plan the refactor")
+        self.assertEqual(result.normal_text, "Here is the patch.")
+
+    def test_detect_and_parse_tool_interrupt(self):
+        """
+        Primary regression test for the agent-loop bug.
+
+        Qwen3-Coder thinking variants frequently jump straight to a tool call
+        without emitting </think> when the reasoning budget is tight. Without
+        tool_start_token wiring, everything would be swallowed as
+        reasoning_content and the tool call would never reach the function-call
+        parser.
+        """
+        text = "<think>I should read the file<tool_call>{\"name\":\"read_file\"}"
+        result = self.detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "I should read the file")
+        self.assertEqual(
+            result.normal_text, "<tool_call>{\"name\":\"read_file\"}"
+        )
+
+    def test_detect_and_parse_multiple_tool_calls_find(self):
+        """Multiple <tool_call> tokens: split at the first occurrence."""
+        text = (
+            "<think>plan<tool_call>first<tool_call>second<tool_call>third"
+        )
+        result = self.detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "plan")
+        self.assertEqual(
+            result.normal_text,
+            "<tool_call>first<tool_call>second<tool_call>third",
+        )
+
+    def test_detect_and_parse_truncated_reasoning(self):
+        """Truncated reasoning with no end tag and no tool call."""
+        text = "<think>thinking but cut off"
+        result = self.detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "thinking but cut off")
+        self.assertEqual(result.normal_text, "")
+
+    def test_detect_and_parse_normal_text_only(self):
+        """Plain content with no reasoning block."""
+        text = "Direct answer with no thinking."
+        result = self.detector.detect_and_parse(text)
+        self.assertEqual(result.normal_text, text)
+        self.assertEqual(result.reasoning_text, "")
+
+    def test_streaming_normal_flow(self):
+        """Streaming with a fully-closed reasoning block."""
+        result1 = self.detector.parse_streaming_increment("<think>")
+        self.assertEqual(result1.normal_text, "")
+        self.assertEqual(result1.reasoning_text, "")
+        self.assertTrue(self.detector._in_reasoning)
+
+        result2 = self.detector.parse_streaming_increment("planning...")
+        self.assertEqual(result2.normal_text, "")
+        self.assertEqual(result2.reasoning_text, "planning...")
+
+        result3 = self.detector.parse_streaming_increment("</think>answer")
+        self.assertEqual(result3.normal_text, "answer")
+        self.assertEqual(result3.reasoning_text, "")
+        self.assertFalse(self.detector._in_reasoning)
+
+    def test_streaming_tool_interrupt_split_tokens(self):
+        """Streaming with mid-thought tool-call interruption (no </think>)."""
+        self.detector.parse_streaming_increment("<think>")
+
+        result1 = self.detector.parse_streaming_increment("planning")
+        self.assertEqual(result1.reasoning_text, "planning")
+
+        result2 = self.detector.parse_streaming_increment("<tool_call>")
+        self.assertEqual(result2.reasoning_text, "")
+        self.assertEqual(result2.normal_text, "<tool_call>")
+        self.assertFalse(self.detector._in_reasoning)
+
+        result3 = self.detector.parse_streaming_increment("{\"name\":\"x\"}")
+        self.assertEqual(result3.reasoning_text, "")
+        self.assertEqual(result3.normal_text, "{\"name\":\"x\"}")
+
+    def test_streaming_no_stream_reasoning(self):
+        """stream_reasoning=False still flushes on tool interruption."""
+        detector = Qwen3CoderReasoningDetector(stream_reasoning=False)
+
+        detector.parse_streaming_increment("<think>")
+
+        result = detector.parse_streaming_increment("planning")
+        self.assertEqual(result.reasoning_text, "")
+        self.assertEqual(result.normal_text, "")
+
+        # Mirrors Glm45Detector behavior: <think> tag remains in self._buffer
+        # in the non-streaming path and is flushed on tool interruption.
+        result = detector.parse_streaming_increment("<tool_call>do_thing")
+        self.assertEqual(result.reasoning_text, "<think>planning")
+        self.assertEqual(result.normal_text, "<tool_call>do_thing")
+
+    def test_streaming_empty_reasoning_with_tool(self):
+        """Empty reasoning block immediately followed by a tool call."""
+        self.detector.parse_streaming_increment("<think>")
+        result = self.detector.parse_streaming_increment("<tool_call>noop")
+        self.assertEqual(result.reasoning_text, "")
+        self.assertEqual(result.normal_text, "<tool_call>noop")
+
+    def test_forced_reasoning_mode(self):
+        """force_reasoning=True still honors tool interruption."""
+        detector = Qwen3CoderReasoningDetector(force_reasoning=True)
+
+        text = "Implicit reasoning"
+        result = detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "Implicit reasoning")
+        self.assertEqual(result.normal_text, "")
+
+        text = "More reasoning<tool_call>act"
+        result = detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "More reasoning")
+        self.assertEqual(result.normal_text, "<tool_call>act")
+
+
 class TestHunyuanDetector(CustomTestCase):
     """Test cases for Hunyuan detector with tool interruption support."""
 
@@ -579,6 +714,9 @@ class TestReasoningParser(CustomTestCase):
 
         parser = ReasoningParser("glm45")
         self.assertIsInstance(parser.detector, Glm45Detector)
+
+        parser = ReasoningParser("qwen3-coder")
+        self.assertIsInstance(parser.detector, Qwen3CoderReasoningDetector)
 
         parser = ReasoningParser("hunyuan")
         self.assertIsInstance(parser.detector, HunyuanDetector)
