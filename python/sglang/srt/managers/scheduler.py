@@ -1789,7 +1789,14 @@ class Scheduler(
             enable_overlap=self.enable_overlap,
             spec_algorithm=self.spec_algorithm,
             get_require_mlp_sync=lambda: self.require_mlp_sync,
+            local_breakable_eligible_fn=self._local_breakable_replay_eligible,
         )
+
+    def _local_breakable_replay_eligible(self, batch) -> bool:
+        runner = getattr(self.tp_worker, "model_runner", None)
+        prefill_runner = getattr(runner, "prefill_cuda_graph_runner", None)
+        eligible = getattr(prefill_runner, "schedule_batch_replay_eligible", None)
+        return True if eligible is None else eligible(batch)
 
     def init_pool_stats_observer(self) -> None:
         self.pool_stats_observer = SchedulerPoolStatsObserver(

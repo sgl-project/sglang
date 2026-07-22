@@ -227,6 +227,7 @@ def prepare_mlp_sync_batch_raw(
     disable_overlap_schedule: bool,
     offload_tags: set[str],
     dwdp: bool = False,
+    local_breakable_eligible: Optional[Callable[[ScheduleBatch], bool]] = None,
 ):
     # Check if other DP workers have running batches
     if (
@@ -266,7 +267,17 @@ def prepare_mlp_sync_batch_raw(
     can_run_breakable_cuda_graph = (
         local_batch is None
         or local_batch.forward_mode.is_idle()
-        or local_batch.forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED)
+        or (
+            # Rank-local replay eligibility (prefix/MHA path, token bounds,
+            # embeds) must join the min()-reduced consensus: a rank that
+            # silently falls back to eager while peers replay deadlocks on
+            # mismatched collectives.
+            local_batch.forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED)
+            and (
+                local_breakable_eligible is None
+                or local_breakable_eligible(local_batch)
+            )
+        )
     ) and check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE)
 
     is_extend_in_batch = local_batch.forward_mode.is_extend() if local_batch else False
@@ -374,6 +385,7 @@ class SchedulerDPAttnAdapter:
     enable_overlap: bool
     spec_algorithm: SpeculativeAlgorithm
     get_require_mlp_sync: Callable[[], bool]
+    local_breakable_eligible_fn: Optional[Callable[[ScheduleBatch], bool]] = None
 
     def prepare_mlp_sync_batch(self, local_batch: ScheduleBatch):
         return prepare_mlp_sync_batch_raw(
@@ -388,6 +400,7 @@ class SchedulerDPAttnAdapter:
             disable_overlap_schedule=self.server_args.disable_overlap_schedule,
             offload_tags=self.offload_tags,
             dwdp=self.server_args.dwdp_size > 1,
+            local_breakable_eligible=self.local_breakable_eligible_fn,
         )
 
     def maybe_prepare_mlp_sync_batch(

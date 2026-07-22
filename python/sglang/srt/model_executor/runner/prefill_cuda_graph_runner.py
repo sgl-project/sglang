@@ -678,6 +678,35 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         forward_batch.mha_return_lse = False
         forward_batch.set_attn_attend_prefix_cache(False)
 
+    def schedule_batch_replay_eligible(self, batch) -> bool:
+        """Rank-local replay eligibility, evaluated on the ScheduleBatch
+        BEFORE the dp mlp-sync so it joins the min()-reduced
+        can_run_breakable_cuda_graph consensus. Under DP attention every
+        rank must reach the same replay-vs-eager decision: a lone eager
+        rank re-derives its own attention path (e.g. MHA on DSA models)
+        and its collectives mismatch the replaying ranks' captured ones,
+        deadlocking the batch. Mirrors the rank-local checks of
+        can_run_graph -- keep the two in sync.
+        """
+        if batch.input_embeds is not None:
+            return False
+        if (
+            self.prefill_backend_name == Backend.BREAKABLE
+            and self.has_mha_companion_layers
+            and batch.prefix_lens is not None
+            and any(batch.prefix_lens)
+        ):
+            return False
+        num_tokens = batch.extend_num_tokens
+        if num_tokens is None:
+            return True
+        if num_tokens > self.max_num_tokens:
+            return False
+        padded_num_tokens = self._pad_to_bucket(num_tokens, self.capture_num_tokens)
+        if padded_num_tokens > num_tokens * _MAX_PREFILL_CUDA_GRAPH_PADDING_FACTOR:
+            return False
+        return True
+
     def can_run_graph(self, forward_batch: ForwardBatch) -> bool:
         if self._is_full_backend and forward_batch.batch_size > self._capture_req_slots:
             return False
