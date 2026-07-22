@@ -47,7 +47,7 @@ gptq_shuffle = _unsupported_kernel
 try:
     from sgl_kernel import gptq_gemm, gptq_shuffle
 
-    from sglang.jit_kernel.gptq_marlin_repack import gptq_marlin_repack
+    from sglang.kernels.ops.quantization.gptq_marlin_repack import gptq_marlin_repack
 except Exception:
     pass
 
