@@ -549,8 +549,14 @@ class RMSNorm(MultiPlatformOp):
 
             x_var = x[..., : self.variance_size_override]
 
-        variance = x_var.pow(2).mean(dim=-1, keepdim=True)
-        x = x * torch.rsqrt(variance + self.variance_epsilon)
+        if is_true_on_policy_enabled() and self.variance_size_override is None:
+            # TOP: delegate to SGLang's fused batch-invariant RMSNorm (the same kernel the
+            # Megatron plugin imports), so training and rollout run the identical op.
+            _ones = torch.ones(x.shape[-1], device=x.device, dtype=x.dtype)
+            x = rms_norm_batch_invariant(x, _ones, self.variance_epsilon)
+        else:
+            variance = x_var.pow(2).mean(dim=-1, keepdim=True)
+            x = x * torch.rsqrt(variance + self.variance_epsilon)
 
         if self.cast_x_before_out_mul:
             x = self.weight * x.to(orig_dtype)
