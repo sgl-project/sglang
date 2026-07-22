@@ -10,8 +10,8 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.jit_kernel.utils import cache_once, load_jit, override_jit_cuda_arch
 from sglang.kernel_api_logging import debug_kernel_api
+from sglang.kernels.jit.utils import cache_once, load_jit, override_jit_cuda_arch
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -40,7 +40,7 @@ def _q8kv8_cuda_flags() -> list[str]:
     #     torch.utils.cpp_extension's AOT path does (COMMON_NVCC_FLAGS). The JIT
     #     toolchain never defines them, so undefining is a no-op.
     #   * --expt-relaxed-constexpr and -O3: already supplied by the JIT default
-    #     target flags (see utils._get_default_target_flags).
+    #     target flags (see utils.arch.get_default_target_flags).
     #   * --expt-extended-lambda, -lineinfo, -D_USE_MATH_DEFINES: not required
     #     by this single-translation-unit kernel.
     return [

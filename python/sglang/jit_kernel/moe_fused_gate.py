@@ -7,8 +7,8 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.jit_kernel.utils import cache_once, is_arch_support_pdl, load_jit
 from sglang.kernel_api_logging import debug_kernel_api
+from sglang.kernels.jit.utils import cache_once, is_arch_support_pdl, load_jit
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -287,6 +287,8 @@ def moe_fused_gate(
     assert bias.ndim == 1, "bias must be 1D"
     assert scores.size(1) == bias.size(0), "scores and bias must have same num_experts"
     assert topk > num_fused_shared_experts, "topk must be > num_fused_shared_experts"
+    if routed_scaling_factor is None:
+        routed_scaling_factor = 1.0
 
     M, N = scores.shape
     K = topk
