@@ -211,6 +211,8 @@ if docker exec ci_sglang test -d /sgl-workspace/mori; then
     cd /sgl-workspace/mori
     git checkout '${MORI_COMMIT}'
     git submodule update --init --recursive
+    apt-get update
+    apt-get install -y --no-install-recommends libgrpc++-dev 2>/dev/null || true
     python3 setup.py develop
     python3 -c 'import os, torch; print(os.path.join(os.path.dirname(torch.__file__), \"lib\"))' > /etc/ld.so.conf.d/torch.conf
     ldconfig
