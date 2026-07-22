@@ -94,7 +94,7 @@ jobs:
     uses: ./.github/workflows/nightly-test-amd.yml
     secrets: inherit
     with:
-      ref: amd/aiter-ci
+      ref: b3a0185cab0411bdfe26a2ae9f3485499e03d6cd
       aiter_ref: ${{ needs.resolve-aiter.outputs.aiter_sha }}
       job_filter: 'all'
       continue_on_error: ${{ inputs.continue_on_error == '' && true || inputs.continue_on_error }}
@@ -105,7 +105,7 @@ jobs:
     uses: ./.github/workflows/nightly-test-amd-rocm720.yml
     secrets: inherit
     with:
-      ref: amd/aiter-ci
+      ref: b3a0185cab0411bdfe26a2ae9f3485499e03d6cd
       aiter_ref: ${{ needs.resolve-aiter.outputs.aiter_sha }}
       job_filter: 'all'
       continue_on_error: ${{ inputs.continue_on_error == '' && true || inputs.continue_on_error }}
@@ -116,9 +116,10 @@ jobs:
     uses: ./.github/workflows/pr-test-amd.yml
     secrets: inherit
     with:
-      ref: amd/aiter-ci
+      ref: b3a0185cab0411bdfe26a2ae9f3485499e03d6cd
       run_all_tests: true
       aiter_ref: ${{ needs.resolve-aiter.outputs.aiter_sha }}
+      runner_arch: mi300
       continue_on_error: ${{ inputs.continue_on_error == '' && true || inputs.continue_on_error }}
 
   call-pr-test-amd-rocm720:
@@ -127,7 +128,7 @@ jobs:
     uses: ./.github/workflows/pr-test-amd-rocm720.yml
     secrets: inherit
     with:
-      ref: amd/aiter-ci
+      ref: b3a0185cab0411bdfe26a2ae9f3485499e03d6cd
       run_all_tests: true
       aiter_ref: ${{ needs.resolve-aiter.outputs.aiter_sha }}
       continue_on_error: ${{ inputs.continue_on_error == '' && true || inputs.continue_on_error }}
@@ -146,7 +147,8 @@ jobs:
         run: |
           echo "## AMD AITER Scout Results" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "- **SGLang ref:** \`amd/aiter-ci\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **SGLang ref:** \`b3a0185cab0411bdfe26a2ae9f3485499e03d6cd\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **MI30x runner pool:** \`mi300\`" >> $GITHUB_STEP_SUMMARY
           echo "- **AITER SHA:** \`${{ needs.resolve-aiter.outputs.aiter_sha }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- **AITER commit:** https://github.com/ROCm/aiter/commit/${{ needs.resolve-aiter.outputs.aiter_sha }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY

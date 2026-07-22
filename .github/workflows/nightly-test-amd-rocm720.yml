@@ -142,7 +142,7 @@ jobs:
 
   nightly-test-1-gpu-unit-rocm720:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-test-1-gpu-unit-rocm720,'))
-    runs-on: linux-mi325-1gpu-sglang
+    runs-on: linux-mi300-1gpu-sglang
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -172,7 +172,7 @@ jobs:
 
   nightly-test-1-gpu-kernel-rocm720:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-test-1-gpu-kernel-rocm720,'))
-    runs-on: linux-mi325-1gpu-sglang
+    runs-on: linux-mi300-1gpu-sglang
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -237,7 +237,7 @@ jobs:
 
   nightly-accuracy-2-gpu-rocm720:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-accuracy-2-gpu-rocm720,'))
-    runs-on: linux-mi325-2gpu-sglang
+    runs-on: linux-mi300-2gpu-sglang
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -336,7 +336,7 @@ jobs:
 
   nightly-accuracy-2-gpu-vlm-rocm720:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-accuracy-2-gpu-vlm-rocm720,'))
-    runs-on: linux-mi325-2gpu-sglang
+    runs-on: linux-mi300-2gpu-sglang
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -367,7 +367,7 @@ jobs:
 
   nightly-perf-2-gpu-text-rocm720:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-perf-2-gpu-text-rocm720,'))
-    runs-on: linux-mi325-2gpu-sglang
+    runs-on: linux-mi300-2gpu-sglang
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -399,7 +399,7 @@ jobs:
 
   nightly-perf-2-gpu-vlm-rocm720:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-perf-2-gpu-vlm-rocm720,'))
-    runs-on: linux-mi325-2gpu-sglang
+    runs-on: linux-mi300-2gpu-sglang
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -431,7 +431,7 @@ jobs:
 
   nightly-4-gpu-rocm720:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-4-gpu-rocm720,'))
-    runs-on: linux-mi325-4gpu-sglang
+    runs-on: linux-mi300-4gpu-sglang
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -467,7 +467,7 @@ jobs:
 
   nightly-accuracy-8-gpu-rocm720:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-accuracy-8-gpu-rocm720,'))
-    runs-on: linux-mi325-8gpu-sglang
+    runs-on: linux-mi300-8gpu-sglang
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -546,7 +546,7 @@ jobs:
 
   nightly-8-gpu-grok1-int4-rocm720:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-grok1-int4-rocm720,'))
-    runs-on: linux-mi325-8gpu-sglang
+    runs-on: linux-mi300-8gpu-sglang
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -643,7 +643,7 @@ jobs:
 
   nightly-8-gpu-grok2-rocm720:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-grok2-rocm720,'))
-    runs-on: linux-mi325-8gpu-sglang
+    runs-on: linux-mi300-8gpu-sglang
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -740,7 +740,7 @@ jobs:
 
   nightly-8-gpu-deepseek-v31-rocm720:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-deepseek-v31-rocm720,'))
-    runs-on: linux-mi325-8gpu-sglang
+    runs-on: linux-mi300-8gpu-sglang
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -786,7 +786,7 @@ jobs:
 
   nightly-8-gpu-deepseek-v32-rocm720:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-deepseek-v32-rocm720,'))
-    runs-on: linux-mi325-8gpu-sglang
+    runs-on: linux-mi300-8gpu-sglang
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -830,7 +830,7 @@ jobs:
 
   nightly-8-gpu-deepseek-v32-mtp-rocm720:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-deepseek-v32-mtp-rocm720,'))
-    runs-on: linux-mi325-8gpu-sglang
+    runs-on: linux-mi300-8gpu-sglang
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -874,7 +874,7 @@ jobs:
 
   nightly-8-gpu-deepseek-v3-kv-fp8-rocm720:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-deepseek-v3-kv-fp8-rocm720,'))
-    runs-on: linux-mi325-8gpu-sglang
+    runs-on: linux-mi300-8gpu-sglang
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -1435,7 +1435,7 @@ jobs:
 
   nightly-8-gpu-kimi-k26-rocm720:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-kimi-k26-rocm720,'))
-    runs-on: linux-mi325-8gpu-sglang
+    runs-on: linux-mi300-8gpu-sglang
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -1508,7 +1508,7 @@ jobs:
 
   nightly-8-gpu-qwen3-235b-rocm720:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-qwen3-235b-rocm720,'))
-    runs-on: linux-mi325-8gpu-sglang
+    runs-on: linux-mi300-8gpu-sglang
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -1580,7 +1580,7 @@ jobs:
 
   nightly-8-gpu-qwen35-rocm720:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-qwen35-rocm720,'))
-    runs-on: linux-mi325-8gpu-sglang
+    runs-on: linux-mi300-8gpu-sglang
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -1712,7 +1712,7 @@ jobs:
 
   nightly-8-gpu-glm51-rocm720:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-glm51-rocm720,'))
-    runs-on: linux-mi325-8gpu-sglang
+    runs-on: linux-mi300-8gpu-sglang
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -1896,7 +1896,7 @@ jobs:
 
   nightly-8-gpu-minimax-m27-rocm720:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-minimax-m27-rocm720,'))
-    runs-on: linux-mi325-8gpu-sglang
+    runs-on: linux-mi300-8gpu-sglang
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -1946,7 +1946,7 @@ jobs:
 
   nightly-1-gpu-zimage-turbo-rocm720:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-1-gpu-zimage-turbo-rocm720,'))
-    runs-on: linux-mi325-1gpu-sglang
+    runs-on: linux-mi300-1gpu-sglang
     steps:
       - name: Checkout code
         uses: actions/checkout@v4

@@ -95,6 +95,11 @@ on:
         required: false
         type: boolean
         default: false
+      runner_arch:
+        description: 'AMD runner pool to dispatch GPU jobs to'
+        required: false
+        type: string
+        default: mi325
 
 # Mirror pr-test.yml: the chained extra suite (call-pr-test-amd-extra ->
 # pr-test-amd-extra.yml) declares actions: write / issues: read /
@@ -214,6 +219,7 @@ jobs:
     uses: ./.github/workflows/pr-test-amd-extra.yml
     with:
       ref: ${{ inputs.pr_head_sha || inputs.ref || '' }}
+      runner_arch: ${{ inputs.runner_arch || 'mi325' }}
       aiter_ref: ${{ inputs.aiter_ref }}
       continue_on_error: true
     secrets: inherit
