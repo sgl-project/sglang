@@ -48,7 +48,9 @@ from sglang.kernels.ops.attention.flash_attn.cute import (
     blackwell_helpers as sm100_utils,
 )
 from sglang.kernels.ops.attention.flash_attn.cute import mma_sm100_desc as sm100_desc
-from sglang.kernels.ops.attention.flash_attn.cute import utils
+from sglang.kernels.ops.attention.flash_attn.cute import (
+    utils,
+)
 from sglang.kernels.ops.attention.flash_attn.cute.block_info import BlockInfo
 from sglang.kernels.ops.attention.flash_attn.cute.block_sparse_utils import (
     get_total_block_count,
