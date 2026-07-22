@@ -4,7 +4,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.jit_kernel.utils import (
+from sglang.kernels.jit.utils import (
     cache_once,
     is_arch_support_pdl,
     is_hip_runtime,
@@ -60,7 +60,9 @@ def fused_store_cache(
     type: Literal["flashmla", "indexer"],
 ) -> None:
     if is_hip_runtime():
-        from sglang.jit_kernel.triton_store_cache import triton_fused_store_cache
+        from sglang.kernels.ops.kvcache.triton_store_cache import (
+            triton_fused_store_cache,
+        )
 
         triton_fused_store_cache(input, cache, indices, page_size=page_size, type=type)
     else:
