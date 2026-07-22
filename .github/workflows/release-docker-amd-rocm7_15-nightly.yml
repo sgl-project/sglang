@@ -10,8 +10,8 @@ on:
         options:
           - 'all'
           - publish
-  schedule:
-    - cron: '0 12 * * *'
+  # schedule:
+  #   - cron: '0 12 * * *'
 
 concurrency:
   # A PR number if a pull request and otherwise the commit hash. This cancels
@@ -19,12 +19,12 @@ concurrency:
   # (postsubmit). The workflow name is prepended to avoid conflicts between
   # different workflows.
   group: ${{ github.workflow }}-${{ github.event.number || github.sha }}
-  cancel-in-progress: True
+  cancel-in-progress: false
 
 jobs:
   publish:
     if: github.repository == 'sgl-project/sglang' && (github.event_name != 'workflow_dispatch' || inputs.job_select == 'all' || inputs.job_select == 'publish')
-    runs-on: amd-docker-scale
+    runs-on: linux-mi300-1gpu-sglang
     environment: 'prod'
     strategy:
       fail-fast: false
@@ -68,11 +68,11 @@ jobs:
           echo "Detected version: ${VERSION}"
           echo "Pretend version for pip: ${PRETEND_VERSION}"
 
-      - name: Login to Docker Hub
-        uses: docker/login-action@v2
-        with:
-          username: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
+      # - name: Login to Docker Hub (AMD)
+      #   uses: docker/login-action@v2
+      #   with:
+      #     username: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
+      #     password: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
 
       - name: Build and Push to rocm/sgl-dev
         run: |
@@ -82,7 +82,7 @@ jobs:
           echo "Pretend version: ${pretend_version}"
 
           if [ "${{ matrix.gpu_arch }}" = "gfx1250-rocm7_15" ]; then
-            rocm_tag="rocm7_15-gfx1250"
+            rocm_tag="rocm7.15-mi45x"
           else
             echo "Unsupported gfx arch"
             exit 1
@@ -93,25 +93,9 @@ jobs:
 
           # remove --build-arg NIC_BACKEND=ainic for auto detection nic support in mori
           # UBUNTU_MIRROR forces apt over HTTPS to dodge port-80 reachability flakes
-          # to Canonical's archive.ubuntu.com mirror IPs from the amd-docker-scale runner.
-          docker build . -f docker/rocm.Dockerfile --build-arg SGL_BRANCH=${{ github.ref_name }} --build-arg BUILD_TYPE=${{ matrix.build_type }} --build-arg GPU_ARCH=${{ matrix.gpu_arch }} --build-arg ENABLE_MORI=1 --build-arg SETUPTOOLS_SCM_PRETEND_VERSION=${pretend_version} --build-arg UBUNTU_MIRROR=https://archive.ubuntu.com -t rocm/sgl-dev:${tag}-${{ env.DATE }} --no-cache
-          docker push rocm/sgl-dev:${tag}-${{ env.DATE }}
-
-      # Persist the tag right after rocm/sgl-dev push succeeds so the local
-      # registry mirror can run even if a later step in this job (lmsys push)
-      # fails. By default this step only runs when the previous step succeeded,
-      # so the artifact only exists when an image actually landed on Docker Hub.
-      - name: Save published image tag
-        run: |
-          mkdir -p image-tag
-          echo "${{ env.IMAGE_TAG }}" > "image-tag/${{ matrix.gpu_arch }}.txt"
-
-      - name: Upload image tag artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: image-tag-${{ matrix.gpu_arch }}
-          path: image-tag/${{ matrix.gpu_arch }}.txt
-          retention-days: 1
+          # to Canonical's archive.ubuntu.com mirror IPs from the build runner.
+          docker build . -f docker/rocm.Dockerfile --build-arg SGL_BRANCH=${{ github.sha }} --build-arg BUILD_TYPE=${{ matrix.build_type }} --build-arg GPU_ARCH=${{ matrix.gpu_arch }} --build-arg GPU_ARCH_LIST_ARG=gfx1250 --build-arg ENABLE_MORI=1 --build-arg SGLANG_VERSION=${pretend_version} --build-arg UBUNTU_MIRROR=https://archive.ubuntu.com -t rocm/sgl-dev:${tag}-${{ env.DATE }} --no-cache
+          # docker push rocm/sgl-dev:${tag}-${{ env.DATE }}
 
       - name: Login to Docker Hub (lmsys)
         uses: docker/login-action@v2
@@ -123,49 +107,3 @@ jobs:
         run: |
           docker tag rocm/sgl-dev:${{ env.IMAGE_TAG }} lmsysorg/sglang-rocm:${{ env.IMAGE_TAG }}
           docker push lmsysorg/sglang-rocm:${{ env.IMAGE_TAG }}
-
-  # Mirror the freshly published rocm/sgl-dev image to the in-network Docker
-  # registry so AMD CI runners can pull without hitting Docker Hub rate limits.
-  # The tag is read verbatim from the publish job's artifact so this job uses
-  # exactly the same tag that publish pushed (only the registry prefix differs).
-  # `!cancelled()` lets us still mirror successful matrix legs when other legs
-  # of publish failed; legs without an artifact will fail at download and be
-  # the only ones marked red.
-  push_local_registry:
-    if: ${{ !cancelled() && github.repository == 'sgl-project/sglang' && (github.event_name != 'workflow_dispatch' || inputs.job_select == 'all' || inputs.job_select == 'publish') }}
-    runs-on: linux-mi300-1gpu-sglang
-    environment: 'prod'
-    needs: publish
-    strategy:
-      fail-fast: false
-      matrix:
-        gpu_arch: ['gfx1250-rocm7_15']
-    steps:
-      - name: Download image tag artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: image-tag-${{ matrix.gpu_arch }}
-
-      - name: Read image tag
-        run: |
-          image_tag=$(tr -d '[:space:]' < "${{ matrix.gpu_arch }}.txt")
-          if [ -z "${image_tag}" ]; then
-            echo "::error::Image tag artifact is empty"
-            exit 1
-          fi
-          echo "IMAGE_TAG=${image_tag}" >> $GITHUB_ENV
-          echo "Resolved IMAGE_TAG=${image_tag}"
-
-      - name: Login to Docker Hub (AMD)
-        uses: docker/login-action@v2
-        with:
-          username: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
-
-      - name: Mirror rocm/sgl-dev to local registry
-        run: |
-          src="rocm/sgl-dev:${{ env.IMAGE_TAG }}"
-          dst="10.245.143.50:5000/rocm/sgl-dev:${{ env.IMAGE_TAG }}"
-          docker pull "${src}"
-          docker tag "${src}" "${dst}"
-          docker push "${dst}"
