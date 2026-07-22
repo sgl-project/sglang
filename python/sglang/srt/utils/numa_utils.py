@@ -460,14 +460,17 @@ def init_threads_binding(
         local_omp_cpuid = cpu_ids_by_node[numa_index]
     else:
         threads_bind_list = omp_cpuids.split("|")
-        assert world_size == len(threads_bind_list), (
-            f"SGLANG_CPU_OMP_THREADS_BIND setting must be aligned with the total number of ranks (dp_size * tp_size * pp_size = {world_size}). "
-            f"Please double check your settings."
-        )
+        # Bound-check numa_index against the bind list rather than asserting
+        # world_size == len(...): in router mode each worker is an independent
+        # dp_size=1 server, so world_size is locally 1 and can't equal a
+        # multi-group bind string. numa_index (== the global gpu_id) is the
+        # correct frame here, so this per-rank bound both prevents IndexError
+        # and catches an under-sized bind list, without needing the global
+        # rank count.
         assert 0 <= numa_index < len(threads_bind_list), (
             f"NUMA index {numa_index} (derived from the worker's global device id / gpu_id) "
             f"is out of range for the {len(threads_bind_list)} SGLANG_CPU_OMP_THREADS_BIND entries. "
-            f"Ensure the number of '|'-separated bind groups matches dp_size * tp_size * pp_size."
+            f"Ensure the number of '|'-separated bind groups matches dp_size * tp_size * pp_size (across all DP workers)."
         )
         local_omp_cpuid = threads_bind_list[numa_index]
         if world_size > n_numa_node:
