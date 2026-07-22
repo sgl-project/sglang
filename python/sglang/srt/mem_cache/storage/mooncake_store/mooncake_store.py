@@ -567,6 +567,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             self.backup_pgs = []
             self.prefetch_bandwidth = []
             self.backup_bandwidth = []
+            self._logical_kv_anchor = False
 
         except ValueError as e:
             logger.error("Configuration loading failed: %s", e)
@@ -647,9 +648,15 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         super().register_mem_pool_host(mem_pool_host)
-        if getattr(self.mem_pool_host, "kv_buffer", None) is None:
-            # Hybrid logical anchors only own allocation indices. Their physical
-            # tensors are registered through register_mem_host_pool_v2().
+        self._logical_kv_anchor = getattr(
+            self.mem_pool_host, "is_logical_anchor", False
+        )
+        if self._logical_kv_anchor:
+            logger.info(
+                "Mooncake Store detected logical KV anchor; KV pages will be "
+                "tracked with marker keys and hybrid pools will be registered via v2."
+            )
+            self.gb_per_page = 0
             return
         try:
             for buffer in self._iter_host_pool_buffers(self.mem_pool_host):
@@ -660,6 +667,26 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
         bytes_per_page = mem_pool_host.get_ksize_per_token() * mem_pool_host.page_size
         self.gb_per_page = bytes_per_page / (1 << 30)
+
+    @staticmethod
+    def _logical_anchor_key(key: str) -> str:
+        return f"{key}_logical_kv"
+
+    def _batch_set_logical_anchor(self, keys: List[str]) -> List[bool]:
+        key_strs = [self._logical_anchor_key(key) for key in keys]
+        exist_result = self._batch_exist(key_strs)
+        results = [state == 1 for state in exist_result]
+        # Mooncake's put() path rejects zero-length payloads, so use one byte.
+        marker = b"1"
+        for i, key in enumerate(key_strs):
+            if results[i]:
+                continue
+            results[i] = self.store.put(key, marker) == 0
+        return results
+
+    def _batch_get_logical_anchor(self, keys: List[str]) -> List[bool]:
+        key_strs = [self._logical_anchor_key(key) for key in keys]
+        return [state == 1 for state in self._batch_exist(key_strs)]
 
     def register_mem_host_pool_v2(self, host_pool: HostKVCache, host_pool_name):
         # KV anchor memory is already registered via register_mem_pool_host().
@@ -709,7 +736,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
     def _get_hybrid_page_component_keys(
         self, page_keys: List[str], transfer: PoolTransfer
     ) -> Tuple[List[str], int]:
-        host_pool = getattr(self, "registered_pools", {}).get(transfer.name)
+        host_pool = self.registered_pools.get(transfer.name)
         if host_pool is None:
             raise ValueError(f"Unregistered Mooncake hybrid pool: {transfer.name}")
 
@@ -779,12 +806,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         pool_transfers: Optional[List[PoolTransfer]] = None,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> PoolTransferResult:
-        if self.mem_pool_host.kv_buffer is None:
-            # Logical anchor: no physical KV object exists in Mooncake, so the
-            # usable prefix is determined entirely by required sidecar objects.
-            kv_pages = len(keys)
-        else:
-            kv_pages = self.batch_exists(keys, extra_info)
+        kv_pages = self.batch_exists(keys, extra_info)
 
         hit_count: dict = {PoolName.KV: kv_pages} if kv_pages else {}
         final_pages = kv_pages
@@ -833,7 +855,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         # storage objects per logical page, but API still reports page-level result.
         results: dict = {}
         for transfer in transfers:
-            host_pool = getattr(self, "registered_pools", {}).get(transfer.name)
+            host_pool = self.registered_pools.get(transfer.name)
             keys = transfer.keys
             page_size = getattr(host_pool, "page_size", 1) or 1
             host_indices = transfer.host_indices
@@ -1001,12 +1023,15 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         host_indices: torch.Tensor,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
-        if self.mem_pool_host.kv_buffer is None:
-            # DeepSeek V4's KV anchor is logical only; v2 side pools carry data.
+        if self.mem_pool_host.kv_buffer is None and not self._logical_kv_anchor:
+            # Non-KV logical anchors carry data through v2 side pools only.
             return [True] * len(keys)
 
         # Apply extra_backend_tag prefix if available
         keys = self._tag_keys(keys)
+
+        if self._logical_kv_anchor:
+            return self._batch_get_logical_anchor(keys)
 
         key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(keys, host_indices)
 
@@ -1030,12 +1055,15 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         host_indices: torch.Tensor,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
-        if self.mem_pool_host.kv_buffer is None:
-            # DeepSeek V4's KV anchor is logical only; v2 side pools carry data.
+        if self.mem_pool_host.kv_buffer is None and not self._logical_kv_anchor:
+            # Non-KV logical anchors carry data through v2 side pools only.
             return [True] * len(keys)
 
         # Apply extra_backend_tag prefix if available
         keys = self._tag_keys(keys)
+
+        if self._logical_kv_anchor:
+            return self._batch_set_logical_anchor(keys)
 
         key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(keys, host_indices)
         key_multiplier = len(key_strs) // len(keys)
@@ -1210,6 +1238,14 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
     ) -> int:
         # Apply extra_backend_tag prefix if available
         keys = self._tag_keys(keys)
+
+        if self._logical_kv_anchor:
+            query_keys = [self._logical_anchor_key(key) for key in keys]
+            exist_result = self._batch_exist(query_keys)
+            for i, state in enumerate(exist_result):
+                if state != 1:
+                    return i
+            return len(query_keys)
 
         if self.is_mla_backend:
             query_keys = [f"{key}_{self.mla_suffix}_k" for key in keys]
