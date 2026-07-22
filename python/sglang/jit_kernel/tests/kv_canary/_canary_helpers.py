@@ -5,10 +5,6 @@ from typing import Optional
 
 import torch
 
-from sglang.jit_kernel.kv_canary import consts
-from sglang.jit_kernel.kv_canary.consts import splitmix64, splitmix64_mix3
-from sglang.jit_kernel.kv_canary.verify import VerifyPlan
-from sglang.jit_kernel.kv_canary.write import WritePlan
 from sglang.jit_kernel.tests.kv_canary._constants import (
     _I64_SIGN_BIT,
     _U64_MASK,
@@ -20,6 +16,10 @@ from sglang.jit_kernel.tests.kv_canary._fixtures import (
     make_real_kv_source,
     make_real_kv_sources,
 )
+from sglang.kernels.ops.kv_canary import consts
+from sglang.kernels.ops.kv_canary.consts import splitmix64, splitmix64_mix3
+from sglang.kernels.ops.kv_canary.verify import VerifyPlan
+from sglang.kernels.ops.kv_canary.write import WritePlan
 
 __all__ = [
     "FakeViolationLog",

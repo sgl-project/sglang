@@ -5,7 +5,7 @@ from typing import Callable
 
 import torch
 
-from sglang.jit_kernel.kv_canary.verify import CANARY_SLOT_BYTES, RealKvSource
+from sglang.kernels.ops.kv_canary.verify import CANARY_SLOT_BYTES, RealKvSource
 
 BS_AXIS: list[int] = [1, 4, 32, 128, 256, 1024]
 PREFIX_AXIS: list[int] = [0, 128, 1024, 4096, 10240, 16384]

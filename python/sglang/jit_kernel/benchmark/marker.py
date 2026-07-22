@@ -21,7 +21,7 @@ from typing import (
 
 import torch
 
-from sglang.jit_kernel.utils import cache_once
+from sglang.kernels.jit.utils import cache_once
 from sglang.utils import is_in_ci
 
 F = TypeVar("F", bound=Callable[..., "BenchResult"])
