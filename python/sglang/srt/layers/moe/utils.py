@@ -200,15 +200,21 @@ class DeepEPMode(Enum):
 class DispatcherOutputDtype(Enum):
     """
     Describes the dispatch output data type for DeepEP.
+
+    - BF16: dispatch hidden states in bf16
+    - FP8: dispatch hidden states in fp8
+    - INT8: dispatch hidden states in int8
+    - NVFP4: dispatch hidden states in nvfp4
+    - MXFP8: dispatch hidden states in mxfp8 (fp8_e4m3 + e8m0 block scale)
+    - MXFP4: dispatch hidden states in mxfp4 (fp4_e2m1 + e8m0 block scale)
     """
 
     BF16 = "bf16"
-    INT8 = "int8"  # NPU only
     FP8 = "fp8"
-    MXFP8_e4m3fn = "mxfp8_e4m3fn"  # NPU only
-    MXFP8_e5m2 = "mxfp8_e5m2"  # NPU only
+    INT8 = "int8"
     NVFP4 = "nvfp4"
-    MXFP4_e2m1fn_x2 = "mxfp4_e2m1fn_x2"  # NPU only
+    MXFP8 = "mxfp8"
+    MXFP4 = "mxfp4"
 
 
 def get_deepep_output_dtype(self) -> DispatcherOutputDtype:

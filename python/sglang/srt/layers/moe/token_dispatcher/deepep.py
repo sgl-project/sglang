@@ -458,20 +458,11 @@ class _DeepEPDispatcherImplBase:
         elif dtype == DispatcherOutputDtype.NVFP4:
             self.use_fp8 = False
             self.use_nvfp4 = True
-        elif dtype == DispatcherOutputDtype.MXFP8_e4m3fn:
+        elif dtype == DispatcherOutputDtype.MXFP8:
             self.use_fp8 = True
             self.use_nvfp4 = False
             self.fp8_configs = dict(round_scale=True, use_ue8m0=True)
-        elif dtype == DispatcherOutputDtype.MXFP8_e5m2:
-            if isinstance(self, _DeepEPDispatcherImplLowLatency):
-                raise ValueError(
-                    "MXFP8_e5m2 is not supported by DeepEP low-latency "
-                    "dispatch; use --deepep-mode normal"
-                )
-            self.use_fp8 = True
-            self.use_nvfp4 = False
-            self.fp8_configs = dict(round_scale=True, use_ue8m0=True)
-        elif dtype == DispatcherOutputDtype.MXFP4_e2m1fn_x2:
+        elif dtype == DispatcherOutputDtype.MXFP4:
             self.use_fp8 = False
             self.use_nvfp4 = False
             self.use_mxfp4 = True
@@ -488,11 +479,9 @@ class _DeepEPDispatcherImplBase:
             return None
         elif dtype == DispatcherOutputDtype.INT8:
             return torch.tensor([], dtype=torch.int8, device="npu")
-        elif dtype == DispatcherOutputDtype.MXFP8_e4m3fn:
+        elif dtype == DispatcherOutputDtype.MXFP8:
             return torch.tensor([], dtype=torch.float8_e4m3fn, device="npu")
-        elif dtype == DispatcherOutputDtype.MXFP8_e5m2:
-            return torch.tensor([], dtype=torch.float8_e5m2, device="npu")
-        elif dtype == DispatcherOutputDtype.MXFP4_e2m1fn_x2:
+        elif dtype == DispatcherOutputDtype.MXFP4:
             return torch.tensor([], dtype=torch.float4_e2m1fn_x2, device="npu")
         else:
             raise RuntimeError(f"Unexpected output dtype for NPU quant tensor: {dtype}")
@@ -518,9 +507,8 @@ class _DeepEPDispatcherImplBase:
                 )
                 self.deepep_output_dtype = DispatcherOutputDtype.FP8
             elif self.deepep_output_dtype in (
-                DispatcherOutputDtype.MXFP8_e4m3fn,
-                DispatcherOutputDtype.MXFP8_e5m2,
-                DispatcherOutputDtype.MXFP4_e2m1fn_x2,
+                DispatcherOutputDtype.MXFP8,
+                DispatcherOutputDtype.MXFP4,
             ):
                 raise ValueError(
                     f"{self.deepep_output_dtype.value} DeepEP dispatcher output "

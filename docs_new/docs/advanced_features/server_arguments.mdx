@@ -1768,9 +1768,9 @@ Please consult the documentation below and [server_args.py](https://github.com/s
     </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--deepep-dispatcher-output-dtype`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Select DeepEP dispather output dtype, could be <code>bf16</code>, <code>fp8</code>, <code>int8</code> (only Ascend A2/A3 NPU), <code>nvfp4</code> or <code>auto</code>. Default is <code>auto</code>, which follows a priority order (server argument → deprecated env var → input_global_scale check → dispatcher_output_dtype from quant_config → flashinfer/cutlass backend → NPU BF16 default → GPU FP8 default).</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Select the DeepEP dispatcher output dtype. <code>mxfp8</code> means FP8 E4M3 data with E8M0 block scales; <code>mxfp4</code> means packed FP4 E2M1 data with E8M0 block scales. Default is <code>auto</code>, which follows a priority order (server argument → deprecated env var → input_global_scale check → dispatcher_output_dtype from quant_config → flashinfer/cutlass backend → NPU BF16 default → GPU FP8 default).</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`auto`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>auto</code>, <code>bf16</code>, <code>fp8</code>, <code>int8</code>, <code>nvfp4</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>auto</code>, <code>bf16</code>, <code>fp8</code>, <code>int8</code>, <code>nvfp4</code>, <code>mxfp8</code>, <code>mxfp4</code></td>
     </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--ep-num-redundant-experts`</td>
