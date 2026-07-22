@@ -44,7 +44,7 @@ from sglang.srt.mem_cache.allocation import (
 from sglang.srt.mem_cache.allocation import (
     assign_req_to_token_pool_func as assign_req_to_token_pool_func,
 )
-from sglang.srt.runtime_context import get_exec, get_server_args
+from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import (
     is_cpu,
     is_cuda,
@@ -801,7 +801,7 @@ def commit_mamba_states_after_verify(
             # we need to update the mamba state for the request at the crossing point.
             seq_lens_pre_verify = batch.seq_lens
             seq_lens_post_verify = batch.seq_lens + accept_lens
-            mamba_track_interval = get_exec().mamba.mamba_track_interval
+            mamba_track_interval = get_server_args().mamba_track_interval
             to_track_mask = (
                 seq_lens_pre_verify // mamba_track_interval
                 != seq_lens_post_verify // mamba_track_interval
