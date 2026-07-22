@@ -21,8 +21,12 @@ class AscendLoRABackend(BaseLoRABackend):
     ):
         super().__init__(max_loras_per_batch, device)
 
-    def run_lora_a_embedding(self, input_ids, weights, vocab_size, extra_embeddings=None, *args, **kwargs):
-        assert extra_embeddings is None, "Ascend LoRA embedding backend does not support extra embeddings (added tokens)."
+    def run_lora_a_embedding(
+            self, input_ids, weights, vocab_size, extra_embeddings=None, *args, **kwargs
+    ):
+        assert (
+            extra_embeddings is None
+        ), "Ascend LoRA embedding backend does not support extra embeddings (added tokens)."
 
         total_seq_len = input_ids.shape[0]
         if weights.numel() == 0:
@@ -39,11 +43,15 @@ class AscendLoRABackend(BaseLoRABackend):
         rank_per_token = self.batch_info.lora_ranks[token_lora_idx]
         scaling_per_token = self.batch_info.scalings[token_lora_idx]
         rank_idx = torch.arange(max_rank, device=weights.device)
-        token_lora_idx_expanded = token_lora_idx.unsqueeze(1).expand(total_seq_len, max_rank)
+        token_lora_idx_expanded = token_lora_idx.unsqueeze(1).expand(
+            total_seq_len, max_rank
+        )
         rank_idx_expanded = rank_idx.unsqueeze(0).expand(total_seq_len, max_rank)
         clamped_ids_expanded = clamped_ids.unsqueeze(1).expand(total_seq_len, max_rank)
 
-        result = weights[token_lora_idx_expanded, rank_idx_expanded, clamped_ids_expanded]
+        result = weights[
+            token_lora_idx_expanded, rank_idx_expanded, clamped_ids_expanded
+        ]
 
         rank_mask = rank_idx.unsqueeze(0) < rank_per_token.unsqueeze(1)
         result = result * rank_mask.to(result.dtype)
