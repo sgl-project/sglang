@@ -668,22 +668,18 @@ def _get_custom_mem_pool(device: str):
     return custom_mem_pool, pool_type
 
 
-def init_staging_buffers(register_fn, kv_args, count: int) -> list:
-    """Create prefill-side staging buffers and register them with the transport.
+def init_staging_buffers(
+    register_fn, kv_args, count: int, chunked_prefill_size: int
+) -> list:
+    """Create prefill-side staging buffers, each sized to one prefill chunk.
 
-    Args:
-        register_fn: callable(ptr: int, size: int) that registers a memory
-            region with the transport backend.
-        kv_args: KVArgs with gpu_id.
-        count: number of staging buffers to create.
-
-    Returns list of StagingBuffer instances.
+    Sizing to one chunk (``chunked_prefill_size`` tokens of this rank's KV) means
+    a chunk can never be too large for the buffer.
     """
     from sglang.srt.disaggregation.common.staging_buffer import StagingBuffer
-    from sglang.srt.environ import envs
 
-    size_mb = envs.SGLANG_DISAGG_STAGING_BUFFER_SIZE_MB.get()
-    size_bytes = size_mb * 1024 * 1024
+    full_chunk_pages = max(1, chunked_prefill_size // kv_args.page_size)
+    size_bytes = full_chunk_pages * sum(kv_args.kv_item_lens)
     gpu_id = kv_args.gpu_id
     device = f"cuda:{gpu_id}"
 

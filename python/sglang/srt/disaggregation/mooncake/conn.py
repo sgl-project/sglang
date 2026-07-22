@@ -302,6 +302,7 @@ class MooncakeKVManager(CommonKVManager):
             lambda ptr, size: self.engine.batch_register([ptr], [size]),
             self.kv_args,
             count,
+            self.server_args.chunked_prefill_size,
         )
         self.kv_buffer_tensors = None
 
@@ -442,7 +443,7 @@ class MooncakeKVManager(CommonKVManager):
             # not fall back to the slice path (leaks the decode-side allocation).
             logger.warning_once(
                 "[Staging] a chunk does not fit the staging ring; failing affected "
-                "requests. Increase SGLANG_DISAGG_STAGING_BUFFER_SIZE_MB or "
+                "requests. Increase SGLANG_DISAGG_STAGING_POOL_SIZE_MB or "
                 "reduce chunked_prefill_size."
             )
             return (-1, False)
