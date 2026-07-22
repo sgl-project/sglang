@@ -101,9 +101,10 @@ def _load_layer_done_counter_class():
     module = importlib.util.module_from_spec(spec)
     sys.modules[module_name] = module
     try:
-        with patch.dict(
-            sys.modules, {parallel_state_name: parallel_state_stub}
-        ), patch("ctypes.CDLL", return_value=MagicMock()):
+        with (
+            patch.dict(sys.modules, {parallel_state_name: parallel_state_stub}),
+            patch("ctypes.CDLL", return_value=MagicMock()),
+        ):
             spec.loader.exec_module(module)
     finally:
         sys.modules.pop(module_name, None)
@@ -130,7 +131,16 @@ class _FakeLayerLoadingEvent:
         assert not self._finished and not self._wait_started
         self.wait_remaining = [count + 1 for count in self.wait_remaining]
 
-    def wait(self, layer_index, count=1):
+    def pending_transfers(self):
+        counts = set(self.wait_remaining)
+        assert len(counts) == 1
+        return self.wait_remaining[0]
+
+    def remove_transfer(self):
+        assert not self._wait_started
+        self.wait_remaining = [count - 1 for count in self.wait_remaining]
+
+    def wait(self, layer_index, count=1, timeout_s=None):
         self._wait_started = True
         self.wait_calls.append((layer_index, count))
         if layer_index == self._num_layers - 1:
@@ -152,6 +162,7 @@ def _sync_context():
         is_pp_sender=False,
         is_sync_leader=True,
         needs_sync=False,
+        world_rank=0,
     )
 
 
@@ -160,7 +171,11 @@ def test_layerwise_reset_waits_for_returned_batch_task_id():
     connector.enable_layerwise = True
     connector.layer_done_counter = MagicMock()
     connector.layer_done_counter.update_producer.return_value = 1
+    connector.layer_done_counter.consumer_index = -1
+    connector.layer_done_counter.num_counters = 3
+    connector.layer_done_counter.expected_transfer_count.return_value = 1
     connector.layer_done_counter.events = [MagicMock(), MagicMock(), MagicMock()]
+    connector.layer_done_counter.events[1].pending_transfers.return_value = 1
     connector._pending_lookups = {"request": 17}
     connector._sync_ctx = _sync_context()
     connector.kv_manager = MagicMock()
@@ -175,6 +190,7 @@ def test_layerwise_reset_waits_for_returned_batch_task_id():
     connector._inflight_loads = {}
     connector._completed_layerwise = []
     connector._inflight_stores = {}
+    connector._layerwise_generation = 0
 
     loaded, producer_id = connector.start_load_kv_layerwise(
         "request", torch.tensor([3, 4], dtype=torch.int64)
@@ -241,6 +257,8 @@ def test_layerwise_counter_groups_restore_requests_in_one_prefill_batch():
     counter.producer_index = -1
     counter.consumer_index = -1
     counter._task_to_producer = {}
+    counter._consumer_task_ids = []
+    counter.wait_timeout_s = None
 
     producer_ids = []
     for task_id in (11, 12, 13):
@@ -257,3 +275,133 @@ def test_layerwise_counter_groups_restore_requests_in_one_prefill_batch():
     assert counter.consumer_index == -1
 
     assert counter.update_producer() == 1
+
+
+def test_layerwise_follower_can_reuse_a_completed_counter():
+    counter = FlexKVLayerDoneCounter.__new__(FlexKVLayerDoneCounter)
+    counter.num_layers = 2
+    counter.num_counters = 3
+    counter.events = [_FakeLayerLoadingEvent(2) for _ in range(3)]
+    counter.producer_index = -1
+    counter.consumer_index = -1
+    counter._task_to_producer = {}
+    counter._consumer_task_ids = []
+    counter.wait_timeout_s = None
+    # A normal final-layer wait leaves _wait_started set while marking the
+    # event finished. Explicit registration must still treat it as reusable.
+    counter.events[0]._finished = True
+    counter.events[0]._wait_started = True
+
+    assert counter.expected_transfer_count(0) == 1
+    counter.register_task_with_explicit_counter_id(21, 0)
+
+    assert counter.events[0]._finished is False
+    assert counter.events[0]._wait_started is False
+
+
+def test_layerwise_rollback_preserves_existing_batch_transfers():
+    counter = FlexKVLayerDoneCounter.__new__(FlexKVLayerDoneCounter)
+    counter.num_layers = 2
+    counter.num_counters = 3
+    counter.events = [_FakeLayerLoadingEvent(2) for _ in range(3)]
+    counter.producer_index = -1
+    counter.consumer_index = -1
+    counter._task_to_producer = {}
+    counter._consumer_task_ids = []
+    counter.wait_timeout_s = None
+
+    producer_id = counter.update_producer()
+    for task_id in (11, 12, 13):
+        counter.register_task(task_id, producer_id)
+        counter.set_consumer(task_id)
+
+    counter.rollback_prepared_transfer(13, producer_id, transfer_added=True)
+
+    assert counter.consumer_index == producer_id
+    assert counter.events[producer_id].wait_remaining == [2, 2]
+    assert counter._consumer_task_ids == [11, 12]
+
+
+def test_layerwise_follower_uses_leader_counter_instead_of_local_timing():
+    connector = FlexKVConnector.__new__(FlexKVConnector)
+    connector.enable_layerwise = True
+    connector.layer_done_counter = MagicMock()
+    connector.layer_done_counter.num_counters = 3
+    connector.layer_done_counter.expected_transfer_count.return_value = 2
+    connector.layer_done_counter.events = [MagicMock(), MagicMock(), MagicMock()]
+    connector.layer_done_counter.events[0].pending_transfers.return_value = 2
+    connector._pending_lookups = {"request": 17}
+    manifest = {
+        "cmd": 3,
+        "task_id": 17,
+        "producer_id": 0,
+        "generation": 0,
+        "slot_count": 2,
+        "expected_signal_count": 2,
+        "error": None,
+    }
+    connector._sync_ctx = SimpleNamespace(
+        is_sync_leader=False,
+        should_send_slot_mapping_to_remote=False,
+        needs_sync=True,
+        world_rank=1,
+        scatter=MagicMock(return_value=manifest),
+        all_reduce_min=MagicMock(side_effect=lambda value: value),
+    )
+    connector.kv_manager = None
+    connector._to_cpu_int64 = lambda value: value
+    connector._build_swa_slot_mapping = lambda value: None
+    connector._launched_load_tids = []
+    connector._layerwise_generation = 0
+
+    loaded, producer_id = connector.start_load_kv_layerwise(
+        "request", torch.tensor([3, 4], dtype=torch.int64)
+    )
+
+    assert (loaded, producer_id) == (2, 0)
+    connector.layer_done_counter.update_producer.assert_not_called()
+    connector.layer_done_counter.register_task_with_explicit_counter_id.assert_called_once_with(
+        17, 0
+    )
+    connector.layer_done_counter.set_consumer.assert_called_once_with(17)
+
+
+def test_layerwise_preflight_rejects_rank_skewed_batch_boundary():
+    connector = FlexKVConnector.__new__(FlexKVConnector)
+    connector.enable_layerwise = True
+    connector.layer_done_counter = MagicMock()
+    connector.layer_done_counter.num_counters = 3
+    # The leader still has one transfer in counter 0, but this follower has
+    # already crossed the batch boundary and would expect a fresh count of 1.
+    connector.layer_done_counter.expected_transfer_count.return_value = 1
+    connector._pending_lookups = {"request": 17}
+    connector._sync_ctx = SimpleNamespace(
+        is_sync_leader=False,
+        should_send_slot_mapping_to_remote=False,
+        needs_sync=True,
+        world_rank=1,
+        scatter=MagicMock(
+            return_value={
+                "cmd": 3,
+                "task_id": 17,
+                "producer_id": 0,
+                "generation": 0,
+                "slot_count": 2,
+                "expected_signal_count": 2,
+                "error": None,
+            }
+        ),
+        all_reduce_min=MagicMock(side_effect=lambda value: value),
+    )
+    connector.kv_manager = None
+    connector._to_cpu_int64 = lambda value: value
+    connector._build_swa_slot_mapping = lambda value: None
+    connector._launched_load_tids = []
+    connector._layerwise_generation = 0
+
+    loaded, producer_id = connector.start_load_kv_layerwise(
+        "request", torch.tensor([3, 4], dtype=torch.int64)
+    )
+
+    assert (loaded, producer_id) == (0, -1)
+    connector.layer_done_counter.register_task_with_explicit_counter_id.assert_not_called()

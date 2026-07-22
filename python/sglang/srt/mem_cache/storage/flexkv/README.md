@@ -258,6 +258,9 @@ This is the path you'll use under any non-trivial deployment topology
   `register_layer_transfer_counter`; the per-layer hook blocks each
   forward layer on its own eventfd until the FlexKV transfer worker
   signals the layer is staged.
+* For a detailed explanation of CP rank synchronization, failure modes,
+  diagnostics, and validation, see
+  [`LAYERWISE_CP_RESTORE_HANG.md`](LAYERWISE_CP_RESTORE_HANG.md).
 * Layerwise mode requires the FlexKV transfer worker's UDS socket
   (`/tmp/flexkv_layerwise_eventfd.sock` by default) to be reachable —
   the connector handshakes with it at startup. The socket path is
@@ -317,6 +320,8 @@ Supported:
 * `FLEXKV_CONFIG_PATH` — full FlexKV YAML / JSON config (also set
   automatically by `--flexkv-config-file`).
 * `FLEXKV_ENABLE_LAYERWISE_TRANSFER` — `1` to enable layerwise mode.
+* `FLEXKV_LAYERWISE_WAIT_TIMEOUT_S` — maximum time to wait for one layer's
+  eventfd signals (default `240`; set `0` to disable the timeout).
 * `FLEXKV_LAYERWISE_EVENTFD_SOCKET` — UDS socket path (default
   `/tmp/flexkv_layerwise_eventfd.sock`); auto-suffixed per
   `(pp_rank, dp_client_id)` when those dims are > 1.

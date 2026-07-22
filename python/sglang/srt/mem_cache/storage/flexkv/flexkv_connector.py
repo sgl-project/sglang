@@ -211,9 +211,11 @@ class FlexKVConnector:
         self.layer_done_counter: Optional[FlexKVLayerDoneCounter] = None
         if self.enable_layerwise:
             self.layer_done_counter = FlexKVLayerDoneCounter(
-                self.rank_info.num_layers_per_pp_stage
+                self.rank_info.num_layers_per_pp_stage,
+                world_rank=world_rank,
             )
             self._send_eventfds_to_worker()
+        self._layerwise_generation = 0
 
         # 9. Wait for the KVManager (and its remote subprocess) to be ready.
         if self._sync_ctx.is_sync_leader:
@@ -394,49 +396,196 @@ class FlexKVConnector:
         slot_mapping: torch.Tensor,
     ) -> Tuple[int, int]:
         """Layerwise load. Fires ``launch(layerwise_transfer=True)`` and
-        returns ``(n_slots, producer_id)``. The caller registers
-        ``producer_id`` with the layer hook so the KV pool blocks on
-        the right eventfds during forward."""
+        returns ``(n_slots, producer_id)`` after registering the producer
+        with the layer hook so the KV pool blocks on the right eventfds."""
         assert self.enable_layerwise and self.layer_done_counter is not None, (
             "start_load_kv_layerwise called but layerwise transfer is "
             "disabled. Set FLEXKV_ENABLE_LAYERWISE_TRANSFER=1."
         )
         fkv_task_id = self._pending_lookups.pop(rid, -1)
-        if fkv_task_id < 0:
-            return 0, -1
 
         slot_mapping_cpu = self._to_cpu_int64(slot_mapping)
         swa_slot_mapping = self._build_swa_slot_mapping(slot_mapping)
         swa_slots = 0 if swa_slot_mapping is None else int(swa_slot_mapping.numel())
         n = slot_mapping_cpu.numel()
 
-        if self._sync_ctx.should_send_slot_mapping_to_remote:
-            self._send_slot_mapping_to_remote(fkv_task_id, slot_mapping_cpu)
-
-        # Allocate / receive producer slot.
-        if self._sync_ctx.is_pp_receiver:
-            payload = self._sync_ctx.scatter_pp(None)
-            if payload.get("cmd") != CMD_LAYERWISE:
-                raise RuntimeError(
-                    f"Tag mismatch: expected CMD_LAYERWISE, got "
-                    f"{payload.get('cmd')}"
+        # Counter selection must be a single global decision.  Choosing from
+        # local timing state lets CP ranks cross a batch boundary at different
+        # moments under overlap scheduling, so they can wait on eventfds that
+        # the leader's FlexKV launch will never signal.
+        generation = getattr(self, "_layerwise_generation", 0)
+        producer_id = -1
+        expected_signal_count = -1
+        selected_new_counter = False
+        selection_error = None
+        if self._sync_ctx.is_sync_leader:
+            try:
+                if fkv_task_id < 0:
+                    raise RuntimeError(f"No pending FlexKV lookup for rid={rid}")
+                producer_id = self.layer_done_counter.update_producer()
+                selected_new_counter = (
+                    self.layer_done_counter.consumer_index != producer_id
                 )
-            producer_id = int(payload["counter_id"])
-            self.layer_done_counter.register_task_with_explicit_counter_id(
-                fkv_task_id, producer_id
-            )
-        else:
-            producer_id = self.layer_done_counter.update_producer()
-            self.layer_done_counter.register_task(fkv_task_id, producer_id)
+                expected_signal_count = self.layer_done_counter.expected_transfer_count(
+                    producer_id,
+                    allow_unclaimed_active=selected_new_counter,
+                )
+            except Exception as exc:  # noqa: BLE001
+                selection_error = str(exc)
 
-        if self._sync_ctx.is_pp_sender:
-            self._sync_ctx.scatter_pp(
-                {
-                    "cmd": CMD_LAYERWISE,
-                    "fkv_task_id": fkv_task_id,
-                    "counter_id": producer_id,
-                }
+        manifest = {
+            "cmd": CMD_LAYERWISE,
+            "task_id": fkv_task_id,
+            "producer_id": producer_id,
+            "generation": generation,
+            "slot_count": n,
+            "expected_signal_count": expected_signal_count,
+            "error": selection_error,
+        }
+        if self._sync_ctx.needs_sync:
+            manifest = self._sync_ctx.scatter(manifest)
+
+        local_ok = 1
+        local_error = None
+        registered = False
+        transfer_added = False
+        try:
+            if not isinstance(manifest, dict) or manifest.get("cmd") != CMD_LAYERWISE:
+                raise RuntimeError("Invalid FlexKV layerwise manifest")
+            if manifest.get("error"):
+                raise RuntimeError(str(manifest["error"]))
+            if int(manifest["generation"]) != generation:
+                raise RuntimeError(
+                    "FlexKV layerwise generation mismatch: "
+                    f"local={generation}, leader={manifest.get('generation')}"
+                )
+            if int(manifest["task_id"]) != fkv_task_id or fkv_task_id < 0:
+                raise RuntimeError(
+                    "FlexKV layerwise task mismatch: "
+                    f"local={fkv_task_id}, leader={manifest.get('task_id')}"
+                )
+            if int(manifest["slot_count"]) != n:
+                raise RuntimeError(
+                    "FlexKV layerwise slot-count mismatch: "
+                    f"local={n}, leader={manifest.get('slot_count')}"
+                )
+            producer_id = int(manifest["producer_id"])
+            expected_signal_count = int(manifest["expected_signal_count"])
+            if not 0 <= producer_id < self.layer_done_counter.num_counters:
+                raise RuntimeError(f"Invalid FlexKV producer_id={producer_id}")
+            if expected_signal_count <= 0:
+                raise RuntimeError(
+                    f"Invalid FlexKV expected signal count {expected_signal_count}"
+                )
+            if not self._sync_ctx.is_sync_leader:
+                local_expected = self.layer_done_counter.expected_transfer_count(
+                    producer_id
+                )
+                if local_expected != expected_signal_count:
+                    raise RuntimeError(
+                        "FlexKV layerwise batch boundary differs across ranks: "
+                        f"local_expected={local_expected}, "
+                        f"leader_expected={expected_signal_count}"
+                    )
+        except Exception as exc:  # noqa: BLE001
+            local_ok = 0
+            local_error = str(exc)
+
+        # Include remote slot metadata and local counter registration in the
+        # same all-rank preflight. Nothing reaches KVManager.launch until every
+        # rank reports that it is ready to consume the leader's counter.
+        if local_ok and self._sync_ctx.should_send_slot_mapping_to_remote:
+            try:
+                self._send_slot_mapping_to_remote(fkv_task_id, slot_mapping_cpu)
+            except Exception as exc:  # noqa: BLE001
+                local_ok = 0
+                local_error = f"remote slot metadata failed: {exc}"
+
+        if local_ok:
+            try:
+                if self._sync_ctx.is_sync_leader:
+                    self.layer_done_counter.register_task(fkv_task_id, producer_id)
+                else:
+                    self.layer_done_counter.register_task_with_explicit_counter_id(
+                        fkv_task_id, producer_id
+                    )
+                registered = True
+                self.layer_done_counter.set_consumer(fkv_task_id)
+                transfer_added = True
+                local_signal_count = self.layer_done_counter.events[
+                    producer_id
+                ].pending_transfers()
+                if local_signal_count != expected_signal_count:
+                    raise RuntimeError(
+                        "FlexKV layerwise signal-count changed during registration: "
+                        f"local={local_signal_count}, leader={expected_signal_count}"
+                    )
+            except Exception as exc:  # noqa: BLE001
+                local_ok = 0
+                local_error = f"counter registration failed: {exc}"
+
+        self._layerwise_generation = generation + 1
+        all_ranks_ok = (
+            self._sync_ctx.all_reduce_min(local_ok)
+            if self._sync_ctx.needs_sync
+            else local_ok
+        )
+        if all_ranks_ok == 0:
+            cleanup_ok = 1
+            cleanup_error = None
+            try:
+                if registered or transfer_added:
+                    self.layer_done_counter.rollback_prepared_transfer(
+                        fkv_task_id,
+                        producer_id,
+                        transfer_added=transfer_added,
+                    )
+                elif self._sync_ctx.is_sync_leader and selected_new_counter:
+                    self.layer_done_counter.abort_unregistered_selection(producer_id)
+            except Exception as exc:  # noqa: BLE001
+                cleanup_ok = 0
+                cleanup_error = str(exc)
+            all_cleanup_ok = (
+                self._sync_ctx.all_reduce_min(cleanup_ok)
+                if self._sync_ctx.needs_sync
+                else cleanup_ok
             )
+            if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
+                try:
+                    if fkv_task_id >= 0:
+                        self.kv_manager.cancel([fkv_task_id])
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "[FlexKV-Layerwise] pre-launch cancel failed for task %d: %s",
+                        fkv_task_id,
+                        exc,
+                    )
+            if all_cleanup_ok == 0:
+                raise RuntimeError(
+                    "FlexKV layerwise counter rollback failed on at least one rank: "
+                    f"{cleanup_error or 'remote rank failure'}"
+                )
+            logger.warning(
+                "[FlexKV-Layerwise] phase=preflight_reject rank=%d "
+                "generation=%d task_id=%d producer_id=%d reason=%s",
+                self._sync_ctx.world_rank,
+                generation,
+                fkv_task_id,
+                producer_id,
+                local_error or "another rank rejected the pre-launch state",
+            )
+            return 0, -1
+
+        logger.info(
+            "[FlexKV-Layerwise] phase=registered rank=%d generation=%d "
+            "task_id=%d producer_id=%d expected_signal_count=%d rid=%s",
+            self._sync_ctx.world_rank,
+            generation,
+            fkv_task_id,
+            producer_id,
+            expected_signal_count,
+            rid,
+        )
 
         if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
             launched_task_ids = self.kv_manager.launch(
@@ -463,8 +612,6 @@ class FlexKVConnector:
                 rid,
             )
 
-        # Tell the layer hook which counter slot to wait on.
-        self.layer_done_counter.set_consumer(fkv_task_id)
         return n, producer_id
 
     def drain_launched_loads(self, threshold: int = 100) -> None:
@@ -577,7 +724,7 @@ class FlexKVConnector:
             payload = self._sync_ctx.scatter_pp(None)
             if payload.get("cmd") != CMD_PUT_META:
                 raise RuntimeError(
-                    f"Tag mismatch: expected CMD_PUT_META, got " f"{payload.get('cmd')}"
+                    f"Tag mismatch: expected CMD_PUT_META, got {payload.get('cmd')}"
                 )
             fkv_task_id = int(payload["fkv_task_id"])
             mask_list = payload.get("unmatched_mask", [])
@@ -1155,7 +1302,7 @@ class FlexKVConnector:
                     raise
                 if attempt % 30 == 0:
                     logger.info(
-                        "[FlexKV] GPU register retry %s attempt=%d/%d " "error=%s",
+                        "[FlexKV] GPU register retry %s attempt=%d/%d error=%s",
                         self._label,
                         attempt + 1,
                         max_retries,
@@ -1172,9 +1319,9 @@ class FlexKVConnector:
         if self._is_dsv4:
             self._register_dsv4_to_server(kv_caches)
             return
-        assert (
-            kv_caches[0].ndim == 3
-        ), f"Expected 3D KV cache tensor, got shape={kv_caches[0].shape}"
+        assert kv_caches[0].ndim == 3, (
+            f"Expected 3D KV cache tensor, got shape={kv_caches[0].shape}"
+        )
 
         is_mla = self.model_config.use_mla
         num_blocks, num_kv_heads, head_size = kv_caches[0].shape
@@ -1473,8 +1620,7 @@ class FlexKVConnector:
                     ) from exc
                 if not ack or ack[0] != 1:
                     raise RuntimeError(
-                        f"FlexKV layerwise worker NACK'd eventfd transfer "
-                        f"(ack={ack!r})"
+                        f"FlexKV layerwise worker NACK'd eventfd transfer (ack={ack!r})"
                     )
                 logger.info(
                     "[FlexKV] Eventfd handshake complete %s counters=%d layers=%d",
