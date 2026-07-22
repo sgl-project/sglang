@@ -6064,7 +6064,7 @@ class ServerArgs:
                 "--enable-cp-cache-layer-split is incompatible with "
                 "--prefill-only-disable-kv-cache"
             )
-        if is_hip():
+        if not is_cuda():
             raise ValueError(
                 "--enable-cp-cache-layer-split is currently supported only on CUDA"
             )
