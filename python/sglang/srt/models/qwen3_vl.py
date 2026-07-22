@@ -1321,11 +1321,24 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
+    def _cat_item_features(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+        # in qwen-vl, last dim is the same.
+        # Under CUDA IPC transport at high concurrency the IPC feature pool can
+        # overflow and spill some item.feature to CPU while others stay on GPU.
+        # Qwen3VL deliberately skips the generic pre-embed move-to-device because
+        # self.visual.forward does a single big H2D on the concatenated tensor
+        # (cheaper than N per-item H2D); an all-CPU cat is fine too since
+        # self.visual then moves the result itself. But torch.cat fails on a
+        # MIXED cpu/cuda list. Preserve the single-cat fast path for the
+        # homogeneous case; only unify per-item when an IPC spill actually
+        # produced mixed devices.
+        feats = [item.feature for item in items]
+        if len({f.device for f in feats}) > 1:
+            feats = [f.to(self.visual.device, non_blocking=True) for f in feats]
+        return torch.cat(feats, dim=0).type(self.visual.dtype)
+
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
-        # in qwen-vl, last dim is the same
-        pixel_values = torch.cat([item.feature for item in items], dim=0).type(
-            self.visual.dtype
-        )
+        pixel_values = self._cat_item_features(items)
         image_grid_thw = torch.concat([item.image_grid_thw for item in items], dim=0)
         assert pixel_values.dim() == 2, pixel_values.dim()
         assert image_grid_thw.dim() == 2, image_grid_thw.dim()
@@ -1341,10 +1354,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             return self.visual(pixel_values, grid_thw=image_grid_thw)
 
     def get_video_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
-        # in qwen-vl, last dim is the same
-        pixel_values = torch.cat([item.feature for item in items], dim=0).type(
-            self.visual.dtype
-        )
+        pixel_values = self._cat_item_features(items)
         video_grid_thw = torch.concat([item.video_grid_thw for item in items], dim=0)
         assert pixel_values.dim() == 2, pixel_values.dim()
         assert video_grid_thw.dim() == 2, video_grid_thw.dim()
