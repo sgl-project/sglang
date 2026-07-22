@@ -13,7 +13,7 @@ import triton
 import triton.language as tl
 
 from sglang.jit_kernel.inkling_gate_topk_renorm import inkling_gate_topk_renorm_v2
-from sglang.jit_kernel.utils import is_arch_support_pdl
+from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.moe_runner.triton_utils.gate_topk import (
     fpval_to_key,
