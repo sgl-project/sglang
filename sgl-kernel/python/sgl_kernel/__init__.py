@@ -55,7 +55,6 @@ else:
     )
     from sgl_kernel.gemm import (
         awq_dequantize,
-        bmm_fp8,
         fp8_scaled_mm,
         gptq_gemm,
         gptq_shuffle,
@@ -152,7 +151,6 @@ else:
         "apply_shuffle_mul_sum",
         "apply_token_bitmask_inplace_cuda",
         "awq_dequantize",
-        "bmm_fp8",
         "build_tree_kernel_efficient",
         "causal_conv1d_fwd",
         "causal_conv1d_update",

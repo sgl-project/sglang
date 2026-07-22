@@ -50,6 +50,10 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     is_in_tc_piecewise_cuda_graph,
 )
 from sglang.srt.platforms.device_mixin import _DEVICE_TO_DISTRIBUTED_BACKEND
+from sglang.srt.runtime_context import (
+    get_global_dwdp_manager,
+    set_global_dwdp_manager,
+)
 from sglang.srt.utils import (
     get_current_device_stream_fast,
     get_int_env_var,
@@ -2615,6 +2619,11 @@ def get_moe_tensor_parallel_rank():
 
 def destroy_model_parallel():
     """Set the groups to none and destroy them."""
+    dwdp_mgr = get_global_dwdp_manager()
+    if dwdp_mgr is not None:
+        dwdp_mgr.cleanup()
+        set_global_dwdp_manager(None)
+
     global _TP
     if _TP:
         _TP.destroy()

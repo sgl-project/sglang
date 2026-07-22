@@ -256,14 +256,6 @@ void sgl_per_token_group_quant_8bit_v2(
     bool fuse_silu_and_mul,
     const std::optional<torch::Tensor>& masked_m);
 void sgl_per_token_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor output_s);
-void bmm_fp8(
-    at::Tensor A,
-    at::Tensor B,
-    at::Tensor D,
-    at::Tensor A_scale,
-    at::Tensor B_scale,
-    at::Tensor workspace_buffer,
-    int64_t cublas_handle);
 
 torch::Tensor gptq_gemm(
     torch::Tensor a,
