@@ -325,6 +325,20 @@ def _register_for(*architectures: str):
 def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
     if server_args.dcp_size > 1:
         overrides = {}
+        if server_args.speculative_algorithm == "DSPARK":
+            from sglang.srt.speculative.ragged_verify import (
+                RaggedVerifyMode,
+                read_ragged_verify_mode,
+            )
+
+            ragged_mode = read_ragged_verify_mode()
+            if ragged_mode is not RaggedVerifyMode.STATIC:
+                raise ValueError(
+                    "Kimi-K3 DCP + DSPARK currently requires "
+                    "SGLANG_RAGGED_VERIFY_MODE=static; compact/cap-accept are "
+                    f"not validated under DCP (got {ragged_mode.value!r})."
+                )
+
         prefill_backend, decode_backend = attention_backends_of(server_args)
         if prefill_backend != "tokenspeed_mla" or decode_backend != "tokenspeed_mla":
             logger.info(
@@ -405,12 +419,16 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
 
 
 def _is_mxfp4_pack_quantized(hf_config: Any) -> bool:
-    qc = getattr(getattr(hf_config, "text_config", hf_config), "quantization_config", None)
+    qc = getattr(
+        getattr(hf_config, "text_config", hf_config), "quantization_config", None
+    )
     if not isinstance(qc, dict):
         return False
     groups = qc.get("config_groups") or {}
     return any(
-        "mxfp4" in str(g.get("format", "")) for g in groups.values() if isinstance(g, dict)
+        "mxfp4" in str(g.get("format", ""))
+        for g in groups.values()
+        if isinstance(g, dict)
     )
 
 

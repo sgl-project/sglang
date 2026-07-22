@@ -118,9 +118,7 @@ class TestDCPCommBackendValidation(CustomTestCase):
         args.speculative_algorithm = "DSPARK"
         args.attention_backend = "tokenspeed_mla"
         args.model_config = SimpleNamespace(
-            hf_config=SimpleNamespace(
-                architectures=["KimiK3ForConditionalGeneration"]
-            )
+            hf_config=SimpleNamespace(architectures=["KimiK3ForConditionalGeneration"])
         )
         args._handle_dcp_validation()  # no raise
 
