@@ -1173,12 +1173,16 @@ class ServerArgs:
     ] = "model"
     asr_max_buffer_seconds: A[
         int,
-        "Maximum seconds of PCM audio the streaming ASR WebSocket handler will accumulate before closing the session with a buffer_overflow error. Guards against OOM when a client streams audio faster than inference can consume it. Default 60s.",
+        "Maximum seconds of PCM audio a single streaming ASR item may receive before the session is closed with a buffer_overflow error. Measured on total audio received per item (not the compacted resident buffer, which input slicing bounds separately), so it caps per-item duration and guards against unbounded per-item state growth when a client streams faster than inference can consume. Default 60s.",
     ] = 60
     asr_max_concurrent_sessions: A[
         int,
         "Maximum number of concurrent realtime ASR WebSocket sessions served by /v1/realtime. New connections beyond this cap are accepted, sent an error{code:too_many_sessions} frame, and closed. Default 32.",
     ] = 32
+    asr_disable_input_slicing: A[
+        bool,
+        "Disable the realtime ASR WebSocket input-slicing path for adapters that support it, forcing cumulative inference (re-send the whole accumulated buffer every chunk). Slicing is ON by default: after the adapter's min_audio_sec gate, long sessions feed a bounded tail slice instead of the full buffer, which bounds prefill/memory. Short and mid-length utterances stay cumulative because they never cross the gate. Set this flag for A/B testing or when you want the cumulative path unconditionally.",
+    ] = False
     preferred_sampling_params: A[
         Optional[str],
         Arg(
