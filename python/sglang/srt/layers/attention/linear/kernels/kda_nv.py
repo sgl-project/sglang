@@ -8,10 +8,12 @@ back; the vendored split kernels keep their original internal layouts.
 
 The serving wrapper repacks ordinary packed prefill batches into bounded
 equal-length groups (B <= 8) and pads every sequence to one of
-2k/4k/8k/16k. This makes short and multi-sequence prefill use the same NV
+2k/4k/8k/16k. This makes short multi-sequence prefill use the same NV
 pipeline while bounding compile variants and transient workspaces. Everything
 that is not an ordinary state-committing prefill stays on its dedicated path:
 
+- single-sequence prefill, including chunks of one long request, where Triton
+  retains the neutral BS=1 performance;
 - track batches needing an *interior* chunk snapshot (mamba extra_buffer
   with a non-boundary track point): the pipeline never materializes
   per-chunk states. Boundary-aligned track batches reuse the final state;
@@ -259,13 +261,13 @@ class NVKDAKernel(LinearAttnKernelBase):
             not needs_interior_snapshot
             and not kwargs.get("is_spec_decode")
             and seq_lens_cpu is not None
-            and len(seq_lens_cpu) > 0
+            and len(seq_lens_cpu) > 1
             and supported_shape
         )
         if not eligible:
             if (
                 seq_lens_cpu is not None
-                and len(seq_lens_cpu) > 0
+                and len(seq_lens_cpu) > 1
                 and not kwargs.get("is_spec_decode")
                 and not needs_interior_snapshot
                 and not supported_shape

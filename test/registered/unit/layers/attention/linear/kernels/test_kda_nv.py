@@ -1,7 +1,7 @@
 """Unit tests for the NV KDA prefill routing/repacking wrapper."""
 
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -92,8 +92,9 @@ class TestNVKDAAllPrefillWrapper(CustomTestCase):
             "query_start_loc": query_start_loc,
         }
 
-    def test_short_single_sequence_uses_nv(self):
+    def test_short_single_sequence_uses_triton(self):
         kernel, calls = self._make_kernel()
+        kernel._triton.extend = Mock(return_value="triton")
         x = self._inputs([5])
         states = torch.zeros(3, 1, 128, 128, dtype=torch.bfloat16)
 
@@ -110,13 +111,10 @@ class TestNVKDAAllPrefillWrapper(CustomTestCase):
             A_log=torch.zeros(128, dtype=torch.float32),
         )
 
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(tuple(calls[0]["q"].shape), (1, 2048, 1, 128))
-        self.assertEqual(calls[0]["beta"].dtype, torch.bfloat16)
-        self.assertIsNone(calls[0]["cu_seqlens"])
-        self.assertFalse(calls[0]["use_fused_k1234"])
-        self.assertTrue(torch.equal(output, x["v"]))
-        self.assertTrue(torch.equal(states[1], torch.ones_like(states[1])))
+        self.assertEqual(output, "triton")
+        self.assertEqual(calls, [])
+        kernel._triton.extend.assert_called_once()
+        self.assertTrue(torch.count_nonzero(states).item() == 0)
 
     def test_packed_multi_sequence_repacking_preserves_order_and_slots(self):
         kernel, calls = self._make_kernel()
@@ -165,7 +163,7 @@ class TestNVKDAAllPrefillWrapper(CustomTestCase):
 
     def test_non_fp32_beta_falls_back_to_triton(self):
         kernel, calls = self._make_kernel()
-        x = self._inputs([5])
+        x = self._inputs([2, 3])
         x["beta"] = x["beta"].bfloat16()
         states = torch.zeros(3, 1, 128, 128, dtype=torch.bfloat16)
 
@@ -179,9 +177,9 @@ class TestNVKDAAllPrefillWrapper(CustomTestCase):
                 x["g"],
                 x["beta"],
                 ssm_states=states,
-                cache_indices=torch.tensor([1], dtype=torch.int32),
+                cache_indices=torch.tensor([1, 2], dtype=torch.int32),
                 query_start_loc=x["query_start_loc"],
-                extend_seq_lens_cpu=[5],
+                extend_seq_lens_cpu=[2, 3],
                 A_log=torch.zeros(128, dtype=torch.float32),
             )
         self.assertEqual(calls, [])
