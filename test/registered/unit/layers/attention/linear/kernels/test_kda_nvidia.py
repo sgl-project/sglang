@@ -1,14 +1,14 @@
-"""Unit tests for the NV KDA prefill routing/repacking wrapper."""
+"""Unit tests for the NVIDIA KDA prefill routing/repacking wrapper."""
 
 import unittest
 from unittest.mock import Mock, patch
 
 import torch
 
-from sglang.srt.layers.attention.linear.kernels.kda_nv import (
-    NVKDAKernel,
-    _from_nv_state_layout,
-    _to_nv_state_layout,
+from sglang.srt.layers.attention.linear.kernels.kda_nvidia import (
+    NvidiaKDAKernel,
+    _from_nvidia_kda_state_layout,
+    _to_nvidia_kda_state_layout,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -21,18 +21,20 @@ class _RejectTriton:
         raise AssertionError("ordinary prefill unexpectedly fell back to Triton")
 
 
-class TestNVKDAAllPrefillWrapper(CustomTestCase):
+class TestNvidiaKDAAllPrefillWrapper(CustomTestCase):
     def test_state_layout_round_trip(self):
         state = torch.arange(2 * 3 * 5 * 7, dtype=torch.float32).view(2, 3, 5, 7)
 
-        nv_state = _to_nv_state_layout(state, head_k_dim=7, head_v_dim=5)
+        nvidia_kda_state = _to_nvidia_kda_state_layout(
+            state, head_k_dim=7, head_v_dim=5
+        )
 
-        self.assertEqual(tuple(nv_state.shape), (2, 3, 7, 5))
-        self.assertTrue(nv_state.is_contiguous())
-        self.assertEqual(nv_state[1, 2, 6, 4], state[1, 2, 4, 6])
+        self.assertEqual(tuple(nvidia_kda_state.shape), (2, 3, 7, 5))
+        self.assertTrue(nvidia_kda_state.is_contiguous())
+        self.assertEqual(nvidia_kda_state[1, 2, 6, 4], state[1, 2, 4, 6])
 
-        restored = _from_nv_state_layout(
-            nv_state,
+        restored = _from_nvidia_kda_state_layout(
+            nvidia_kda_state,
             head_k_dim=7,
             head_v_dim=5,
             dtype=torch.bfloat16,
@@ -44,7 +46,7 @@ class TestNVKDAAllPrefillWrapper(CustomTestCase):
 
     def test_state_layout_rejects_swapped_contract(self):
         with self.assertRaisesRegex(ValueError, "SGLang KDA state"):
-            _to_nv_state_layout(
+            _to_nvidia_kda_state_layout(
                 torch.zeros(1, 2, 7, 5),
                 head_k_dim=7,
                 head_v_dim=5,
@@ -52,7 +54,7 @@ class TestNVKDAAllPrefillWrapper(CustomTestCase):
 
     def _make_kernel(self):
         calls = []
-        kernel = NVKDAKernel()
+        kernel = NvidiaKDAKernel()
         kernel._l2norm = lambda x: x
         kernel._triton = _RejectTriton()
 
@@ -187,13 +189,13 @@ class TestNVKDAAllPrefillWrapper(CustomTestCase):
             patch("torch.cuda.is_available", return_value=True),
             patch("torch.cuda.get_device_capability", return_value=(10, 0)),
         ):
-            self.assertTrue(NVKDAKernel().supports_prefill)
+            self.assertTrue(NvidiaKDAKernel().supports_prefill)
 
         with (
             patch("torch.cuda.is_available", return_value=True),
             patch("torch.cuda.get_device_capability", return_value=(12, 0)),
         ):
-            self.assertFalse(NVKDAKernel().supports_prefill)
+            self.assertFalse(NvidiaKDAKernel().supports_prefill)
 
 
 if __name__ == "__main__":

@@ -129,24 +129,26 @@ class KDAKernelDispatcher:
                 rank0_log(
                     "KDA cutedsl prefill needs SM100; falling back to Triton extend."
                 )
-        elif prefill_backend.is_nv():
+        elif prefill_backend.is_nvidia_kda():
             if not is_cuda():
-                raise ValueError("KDA NV prefill backend requires CUDA")
-            from sglang.srt.layers.attention.linear.kernels.kda_nv import (
-                NVKDAKernel,
+                raise ValueError("NVIDIA KDA prefill backend requires CUDA")
+            from sglang.srt.layers.attention.linear.kernels.kda_nvidia import (
+                NvidiaKDAKernel,
             )
 
-            nv_kernel = NVKDAKernel()
-            if nv_kernel.supports_prefill:
-                self.extend_kernel = nv_kernel
+            nvidia_kda_kernel = NvidiaKDAKernel()
+            if nvidia_kda_kernel.supports_prefill:
+                self.extend_kernel = nvidia_kda_kernel
             else:
                 self.extend_kernel = triton_kernel
-                rank0_log("KDA NV prefill needs SM100; falling back to Triton extend.")
+                rank0_log(
+                    "NVIDIA KDA prefill needs SM100; falling back to Triton extend."
+                )
         else:
             raise ValueError(
                 f"Unsupported KDA prefill backend: {prefill_backend}. "
-                "KDA supports 'triton', 'flashkda', 'cutedsl', or 'nv' "
-                "(cutedsl/nv prefill need SM100)."
+                "KDA supports 'triton', 'flashkda', 'cutedsl', or 'nvidia_kda' "
+                "(cutedsl/nvidia_kda prefill need SM100)."
             )
 
         self.supports_packed_decode = getattr(
@@ -631,7 +633,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             is_spec_decode=forward_batch.forward_mode.is_draft_extend_v2(),
             return_intermediate_states=track_ssm,
             # Which global chunk rows of h the track snapshot will read; lets
-            # kernels that cannot materialize per-chunk states (NV) take the
+            # kernels that cannot materialize per-chunk states (NVIDIA KDA) take the
             # fast path when the snapshot only needs the final state.
             track_ssm_h_src=(
                 self.forward_metadata.track_ssm_h_src if track_ssm else None

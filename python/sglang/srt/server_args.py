@@ -353,7 +353,7 @@ LINEAR_ATTN_KERNEL_BACKEND_CHOICES = [
     "cutedsl",
     "flashinfer",
     "flashkda",
-    "nv",
+    "nvidia_kda",
 ]
 
 

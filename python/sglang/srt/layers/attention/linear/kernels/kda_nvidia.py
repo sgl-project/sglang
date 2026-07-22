@@ -1,14 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """NVIDIA split KDA prefill backend (K1-K4 CuTe/Triton/cuTile pipeline).
 
-Wraps the vendored ``kda_nv_prefill`` package through its FLA-compatible
+Wraps the vendored ``kda_nvidia_prefill`` package through its FLA-compatible
 ``chunk_kda_fwd`` interface. SGLang owns the boundary conversion from its
 V-major ``[B,H,V,K]`` cache to the vendor's K-major ``[B,H,K,V]`` state and
 back; the vendored split kernels keep their original internal layouts.
 
 The serving wrapper repacks ordinary packed prefill batches into bounded
 equal-length groups (B <= 8) and pads every sequence to one of
-2k/4k/8k/16k. This makes short multi-sequence prefill use the same NV
+2k/4k/8k/16k. This makes short multi-sequence prefill use the same NVIDIA KDA
 pipeline while bounding compile variants and transient workspaces. Everything
 that is not an ordinary state-committing prefill stays on its dedicated path:
 
@@ -42,10 +42,10 @@ from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
 logger = logging.getLogger(__name__)
 
 _BUCKETS = (2048, 4096, 8192, 16384)
-_MAX_NV_BATCH = 8
+_MAX_NVIDIA_KDA_BATCH = 8
 
 
-def _to_nv_state_layout(
+def _to_nvidia_kda_state_layout(
     state: torch.Tensor, *, head_k_dim: int, head_v_dim: int
 ) -> torch.Tensor:
     """Materialize SGLang [B,H,V,K] state as vendor [B,H,K,V]."""
@@ -58,7 +58,7 @@ def _to_nv_state_layout(
     return state.transpose(-1, -2).float().contiguous()
 
 
-def _from_nv_state_layout(
+def _from_nvidia_kda_state_layout(
     state: torch.Tensor,
     *,
     head_k_dim: int,
@@ -69,13 +69,13 @@ def _from_nv_state_layout(
     expected = (head_k_dim, head_v_dim)
     if state.ndim != 4 or tuple(state.shape[-2:]) != expected:
         raise ValueError(
-            "NV KDA state must be [B,H,K,V] with "
+            "NVIDIA KDA state must be [B,H,K,V] with "
             f"(K,V)={expected}, got {tuple(state.shape)}"
         )
     return state.transpose(-1, -2).to(dtype=dtype).contiguous()
 
 
-class NVKDAKernel(LinearAttnKernelBase):
+class NvidiaKDAKernel(LinearAttnKernelBase):
     def __init__(self):
         # This kernel uses tcgen05 + TMEM, which are available on datacenter
         # Blackwell (SM100/SM103, reported as capability major 10), but not on
@@ -101,7 +101,7 @@ class NVKDAKernel(LinearAttnKernelBase):
     def _ensure_loaded(self):
         if self._fwd is None:
             from sglang.kernels.ops.attention.fla.l2norm import l2norm_fwd
-            from sglang.kernels.ops.attention.linear.kda_nv_prefill import (
+            from sglang.kernels.ops.attention.linear.kda_nvidia_prefill import (
                 chunk_kda_fwd,
             )
 
@@ -110,10 +110,10 @@ class NVKDAKernel(LinearAttnKernelBase):
             logger.info("Using NVIDIA chunked KDA prefill (Blackwell)")
 
     def decode(self, *args, **kwargs):
-        raise NotImplementedError("NVKDAKernel is prefill-only")
+        raise NotImplementedError("NvidiaKDAKernel is prefill-only")
 
     def target_verify(self, *args, **kwargs):
-        raise NotImplementedError("NVKDAKernel does not support target_verify")
+        raise NotImplementedError("NvidiaKDAKernel does not support target_verify")
 
     def _triton_extend(
         self,
@@ -286,7 +286,7 @@ class NVKDAKernel(LinearAttnKernelBase):
                 if unsupported_key not in self._unsupported_logged:
                     self._unsupported_logged.add(unsupported_key)
                     logger.warning(
-                        "NV KDA prefill only supports BF16 q/k/v/g, FP32 beta, "
+                        "NVIDIA KDA prefill only supports BF16 q/k/v/g, FP32 beta, "
                         "K=V=128 with A_log; "
                         "got q/k/v/g/beta=%s/%s/%s/%s/%s, Kq/Kk/V=%d/%d/%d, "
                         "A_log=%s. Falling back to Triton.",
@@ -325,7 +325,7 @@ class NVKDAKernel(LinearAttnKernelBase):
             or len(seq_lens) != cache_indices.numel()
         ):
             logger.warning(
-                "NV KDA cannot repack prefill shape T=%d seq_lens=%s; falling "
+                "NVIDIA KDA cannot repack prefill shape T=%d seq_lens=%s; falling "
                 "back to Triton",
                 num_tokens,
                 seq_lens,
@@ -363,7 +363,7 @@ class NVKDAKernel(LinearAttnKernelBase):
             seq_start = 0
             token_start = 0
             while seq_start < len(seq_lens):
-                group_lens = seq_lens[seq_start : seq_start + _MAX_NV_BATCH]
+                group_lens = seq_lens[seq_start : seq_start + _MAX_NVIDIA_KDA_BATCH]
                 group_size = len(group_lens)
                 group_tokens = sum(group_lens)
                 bucket = next(b for b in _BUCKETS if b >= max(group_lens))
@@ -371,7 +371,7 @@ class NVKDAKernel(LinearAttnKernelBase):
                 if engage_key not in self._engaged_logged:
                     self._engaged_logged.add(engage_key)
                     logger.info(
-                        "NV KDA prefill engaged: sequences=%d max_T=%d -> B=%d "
+                        "NVIDIA KDA prefill engaged: sequences=%d max_T=%d -> B=%d "
                         "bucket=%d",
                         len(seq_lens),
                         max(group_lens),
@@ -414,7 +414,7 @@ class NVKDAKernel(LinearAttnKernelBase):
 
                 group_slots = all_slot_indices[seq_start : seq_start + group_size]
                 st["s0"].copy_(
-                    _to_nv_state_layout(
+                    _to_nvidia_kda_state_layout(
                         ssm_states.index_select(0, group_slots),
                         head_k_dim=head_k_dim,
                         head_v_dim=head_v_dim,
@@ -449,7 +449,7 @@ class NVKDAKernel(LinearAttnKernelBase):
                 ssm_states.index_copy_(
                     0,
                     group_slots,
-                    _from_nv_state_layout(
+                    _from_nvidia_kda_state_layout(
                         final_state,
                         head_k_dim=head_k_dim,
                         head_v_dim=head_v_dim,
@@ -461,7 +461,7 @@ class NVKDAKernel(LinearAttnKernelBase):
         except Exception:
             ssm_states.index_copy_(0, all_slot_indices, state_backup)
             logger.warning(
-                "NV KDA prefill failed (T=%d sequences=%d); restored states "
+                "NVIDIA KDA prefill failed (T=%d sequences=%d); restored states "
                 "and fell back to Triton for this batch",
                 num_tokens,
                 len(seq_lens),
