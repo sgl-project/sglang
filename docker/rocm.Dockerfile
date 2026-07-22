@@ -169,7 +169,7 @@ ARG SGL_DEFAULT="main"
 ARG SGL_BRANCH=${SGL_DEFAULT}
 
 # Version override for setuptools_scm (used in nightly builds)
-ARG SETUPTOOLS_SCM_PRETEND_VERSION=""
+ARG SGLANG_VERSION=""
 
 ARG TRITON_REPO="https://github.com/triton-lang/triton.git"
 ENV TRITON_COMMIT="${TRITON_COMMIT:-${TRITON_COMMIT_DEFAULT}}"
@@ -326,9 +326,8 @@ RUN if [ "$BUILD_LLVM" = "1" ]; then \
 
 # -----------------------
 # AITER
-# Unset setuptools_scm override so AITER gets its own version (AITER_COMMIT), not SGLang's
-# (SETUPTOOLS_SCM_PRETEND_VERSION is set later for SGLang nightly builds and would otherwise
-# leak into AITER's version when AITER uses setuptools_scm)
+# Clear any inherited setuptools_scm override so AITER gets its own version
+# from AITER_COMMIT rather than SGLang's nightly version.
 
 ENV SETUPTOOLS_SCM_PRETEND_VERSION=
 # Keep the base image's Torch-compatible Triton by default. Override with
@@ -392,7 +391,7 @@ ARG BUILD_TYPE=all
 
 # Set version for setuptools_scm if provided (for nightly builds). Only pass in the SGLang
 # pip install RUN so it does not affect AITER, sgl-model-gateway, TileLang, FHT, MORI, etc.
-ARG SETUPTOOLS_SCM_PRETEND_VERSION
+ARG SGLANG_VERSION
 
 RUN pip install IPython \
     && pip install orjson \
@@ -421,9 +420,9 @@ RUN cd sglang \
     && rm -rf python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml \
     && sed -i 's/compressed-tensors[^"]*"/compressed-tensors>=0.9.2"/g' python/pyproject.toml \
     && if [ "$BUILD_TYPE" = "srt" ]; then \
-         export SETUPTOOLS_SCM_PRETEND_VERSION="${SETUPTOOLS_SCM_PRETEND_VERSION}" && python -m pip --no-cache-dir install --no-build-isolation -c /tmp/constraints.txt -e "python[srt_hip,diffusion_hip]"; \
+         SETUPTOOLS_SCM_PRETEND_VERSION="${SGLANG_VERSION}" python -m pip --no-cache-dir install --no-build-isolation -c /tmp/constraints.txt -e "python[srt_hip,diffusion_hip]"; \
        else \
-         export SETUPTOOLS_SCM_PRETEND_VERSION="${SETUPTOOLS_SCM_PRETEND_VERSION}" && python -m pip --no-cache-dir install --no-build-isolation -c /tmp/constraints.txt -e "python[all_hip]"; \
+         SETUPTOOLS_SCM_PRETEND_VERSION="${SGLANG_VERSION}" python -m pip --no-cache-dir install --no-build-isolation -c /tmp/constraints.txt -e "python[all_hip]"; \
        fi
 
 RUN python -m pip cache purge
