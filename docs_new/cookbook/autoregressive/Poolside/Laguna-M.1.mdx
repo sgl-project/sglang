@@ -1,7 +1,6 @@
 ---
 title: Laguna-M.1
 description: "Deploy poolside's Laguna-M.1 — a 225B-parameter Mixture-of-Experts model (23B active) for agentic coding — with SGLang on NVIDIA H200, B200, B300, GB200, and GB300, across BF16, FP8, and NVFP4."
-tag: NEW
 ---
 
 ## Deployment
@@ -27,15 +26,15 @@ cd sglang
 uv pip install -e python
 ```
 
-Then run the **Python** output of the command panel below in that environment. The **Docker** tab is simpler — its image (`dev-cu13-618-nightly`) bundles the CUDA-13 runtime and the M.1 code. Once M.1 support lands in a tagged release, `uv pip install sglang` will pull it directly.
+Then run the **Python** output of the command panel below in that environment. The **Docker** tab is simpler — `lmsysorg/sglang:latest` bundles the CUDA-13 runtime and the M.1 code.
 
 </Tab>
 
 <Tab title="Docker">
 
 ```bash Command
-# Pinned nightly with the Laguna-M.1 build (PR #28400 + #28604; CUDA 13 — covers H200 + all Blackwell):
-docker pull lmsysorg/sglang:dev-cu13-618-nightly
+# CUDA 13 — covers H200 + all Blackwell:
+docker pull lmsysorg/sglang:latest
 ```
 
 For how to launch the image, see [Install → Method 3: Using Docker](../../../docs/get-started/install#method-3-using-docker). Substitute the inner `sglang serve ...` with what the command generator below produces.

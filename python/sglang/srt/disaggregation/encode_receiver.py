@@ -82,9 +82,10 @@ class EncoderBootstrapServer:
     accessible through :meth:`list_urls`.
 
     Health-check tuning is controlled by env vars
-    ``SGLANG_ENCODER_BOOTSTRAP_HEALTH_CHECK_INTERVAL`` (seconds; 0 disables)
-    and ``SGLANG_ENCODER_BOOTSTRAP_HEALTH_CHECK_TIMEOUT`` (seconds).  Explicit
-    constructor args take precedence over the env vars.
+    ``SGLANG_ENCODER_BOOTSTRAP_HEALTH_CHECK_INTERVAL`` (seconds; 0 disables),
+    ``SGLANG_ENCODER_BOOTSTRAP_HEALTH_CHECK_TIMEOUT`` (seconds), and
+    ``SGLANG_ENCODER_BOOTSTRAP_EVICTED_TTL`` (seconds; 0 keeps probing
+    forever). Explicit constructor args take precedence over the env vars.
     """
 
     def __init__(
@@ -94,6 +95,7 @@ class EncoderBootstrapServer:
         urls: Optional[List[str]] = None,
         health_check_interval: Optional[float] = None,
         health_check_timeout: Optional[float] = None,
+        evicted_ttl: Optional[float] = None,
     ):
 
         self.host = host
@@ -111,8 +113,19 @@ class EncoderBootstrapServer:
             if health_check_timeout is not None
             else envs.SGLANG_ENCODER_BOOTSTRAP_HEALTH_CHECK_TIMEOUT.get()
         )
-        self._consecutive_failures: Dict[str, int] = {}
-        self._max_consecutive_failures = 3
+        self._evicted_ttl = (
+            evicted_ttl
+            if evicted_ttl is not None
+            else envs.SGLANG_ENCODER_BOOTSTRAP_EVICTED_TTL.get()
+        )
+        # Evict only after this many consecutive probe failures (a busy
+        # encoder can miss a single 2s probe under load), and keep probing
+        # evicted URLs so they re-register automatically once healthy.
+        # Values are eviction timestamps; URLs older than ``_evicted_ttl``
+        # (when > 0) are permanently dropped.
+        self._health_fail_threshold = 3
+        self._health_fail_counts: Dict[str, int] = {}
+        self._evicted_urls: Dict[str, float] = {}
 
         @asynccontextmanager
         async def lifespan(fast_api_app: FastAPI):
@@ -170,7 +183,8 @@ class EncoderBootstrapServer:
     def register(self, url: str) -> bool:
         """Add *url* if not already present.  Returns True if added."""
         with self._lock:
-            self._consecutive_failures.pop(url, None)
+            self._health_fail_counts.pop(url, None)
+            self._evicted_urls.pop(url, None)
             if url not in self._urls:
                 self._urls.append(url)
                 logger.info(f"Registered encoder URL: {url}")
@@ -179,14 +193,20 @@ class EncoderBootstrapServer:
             return False
 
     def unregister(self, url: str) -> bool:
-        """Remove *url* if present.  Returns True if removed."""
+        """Remove *url* if present.  Returns True if removed.
+
+        An explicit unregister also drops the URL from the health-check
+        revival set so it does not come back automatically.
+        """
         with self._lock:
+            removed = url in self._urls or url in self._evicted_urls
             if url in self._urls:
                 self._urls.remove(url)
-                self._consecutive_failures.pop(url, None)
+            self._evicted_urls.pop(url, None)
+            self._health_fail_counts.pop(url, None)
+            if removed:
                 logger.info(f"Unregistered encoder URL: {url}")
-                return True
-            return False
+            return removed
 
     def list_urls(self) -> List[str]:
         """Return a snapshot of all registered encoder URLs."""
@@ -204,42 +224,78 @@ class EncoderBootstrapServer:
             return False
 
     async def _health_check_loop(self):
-        """Probe each registered encoder periodically and evict dead ones."""
+        """Probe registered (and previously evicted) encoders periodically.
+
+        A URL is evicted only after ``_health_fail_threshold`` consecutive
+        probe failures — a busy encoder may miss a single short-timeout probe
+        under load. Evicted URLs keep being probed and re-register
+        automatically once they respond again. After ``_evicted_ttl`` seconds
+        without a successful probe (when > 0), they are permanently dropped
+        so a dead encoder does not get probed forever.
+        """
 
         timeout = ClientTimeout(total=self._health_check_timeout)
         while True:
             try:
                 await asyncio.sleep(self._health_check_interval)
-                snapshot = self.list_urls()
-                if not snapshot:
+                now = time.time()
+                with self._lock:
+                    expired = []
+                    if self._evicted_ttl > 0:
+                        expired = [
+                            url
+                            for url, ts in self._evicted_urls.items()
+                            if now - ts >= self._evicted_ttl
+                        ]
+                        for url in expired:
+                            self._evicted_urls.pop(url, None)
+                            self._health_fail_counts.pop(url, None)
+                    candidates = list(
+                        dict.fromkeys(self._urls + list(self._evicted_urls))
+                    )
+                if expired:
+                    logger.warning(
+                        f"Health check permanently dropped {len(expired)} "
+                        f"encoder(s) after {self._evicted_ttl}s unhealthy: "
+                        f"{expired}"
+                    )
+                if not candidates:
                     continue
                 async with ClientSession(timeout=timeout) as session:
                     results = await asyncio.gather(
-                        *(self._probe(session, url) for url in snapshot),
+                        *(self._probe(session, url) for url in candidates),
                         return_exceptions=True,
                     )
-                evicted = []
+                evicted, revived = [], []
                 with self._lock:
-                    for url, ok in zip(snapshot, results):
+                    for url, ok in zip(candidates, results):
                         if ok is True:
-                            self._consecutive_failures.pop(url, None)
+                            self._health_fail_counts.pop(url, None)
+                            if url in self._evicted_urls:
+                                self._evicted_urls.pop(url, None)
+                                if url not in self._urls:
+                                    self._urls.append(url)
+                                revived.append(url)
                         else:
-                            self._consecutive_failures[url] = (
-                                self._consecutive_failures.get(url, 0) + 1
-                            )
-                            if (
-                                self._consecutive_failures[url]
-                                >= self._max_consecutive_failures
-                            ):
+                            if url in self._evicted_urls:
+                                continue
+                            count = self._health_fail_counts.get(url, 0) + 1
+                            self._health_fail_counts[url] = count
+                            if count >= self._health_fail_threshold:
                                 if url in self._urls:
                                     self._urls.remove(url)
-                                self._consecutive_failures.pop(url, None)
+                                self._evicted_urls[url] = now
+                                self._health_fail_counts.pop(url, None)
                                 evicted.append(url)
+                if revived:
+                    logger.info(
+                        f"Health check revived {len(revived)} encoder(s): {revived}"
+                    )
                 if evicted:
                     logger.warning(
-                        f"Health check evicted {len(evicted)} encoder(s) "
-                        f"after {self._max_consecutive_failures} consecutive "
-                        f"failures: {evicted}"
+                        f"Health check evicted {len(evicted)} encoder(s) after "
+                        f"{self._health_fail_threshold} consecutive failures "
+                        f"(will re-add when healthy): {evicted}"
                     )
             except asyncio.CancelledError:
                 raise

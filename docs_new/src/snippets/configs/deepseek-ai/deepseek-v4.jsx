@@ -4,7 +4,7 @@
 export const config = {
   modelName: "DeepSeek-V4",
 
-  latencyPercentile: "Mean", // temporary; re-measure to P50
+  latencyPercentile: "P50",
 
   supportedHardware: [
     "h100", "h200", "b200", "b300", "gb200", "gb300",
@@ -80,7 +80,7 @@ export const config = {
   --dataset-name {{DATASET}} \\
   --random-input-len {{ISL}} --random-output-len {{OSL}} \\
   --num-prompts {{NUM_PROMPTS}} --max-concurrency {{MAX_CONCURRENCY}} \\
-  --warmup-requests 64`,
+  --warmup-requests 64 --flush-cache`,
     accuracy: {
       gsm8k_pct:
 `# To install sgl-eval: pip install git+https://github.com/sgl-project/sgl-eval
@@ -1276,7 +1276,7 @@ sgl-eval run aime25 \\
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 4",
-        "--mem-fraction-static 0.83",
+        "--mem-fraction-static 0.90",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -1421,7 +1421,6 @@ sgl-eval run aime25 \\
 
     // ====================================================================
     // RTX PRO 6000 (SM120 / Blackwell Desktop) — Flash + low-latency only
-    // (V4-Pro doesn't fit on 8× 96 GB); TP-only, Marlin MoE runner.
     // ====================================================================
     {
       match: { hw: "rtx6000", variant: "flash", quant: "fp4", strategy: "low-latency", nodes: "single" },
@@ -1430,9 +1429,9 @@ sgl-eval run aime25 \\
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
-        "--tp 4",
-        "--moe-runner-backend marlin",
-        "--mem-fraction-static 0.70",
+        "--tp 2",
+        "--moe-runner-backend flashinfer_mxfp4",
+        "--mem-fraction-static 0.92",
         "--cuda-graph-max-bs-decode 32",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
