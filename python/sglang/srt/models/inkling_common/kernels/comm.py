@@ -240,7 +240,8 @@ def ar_sconv_norm_fusable(
     """True when a decode {all-reduce -> sconv -> add+RMSNorm} chain
     (attn-side: wo_ud AR -> attn_sconv -> mlp_norm; MoE-side: MoE AR ->
     mlp_sconv -> next attn_norm)
-    can run as the single fused kernel (kernels/ops/model/inkling/inkling_ar_fused.py). Must be
+    can run as the single fused kernel
+    (kernels/ops/model/inkling/inkling_ar_fused.py). Must be
     evaluated identically by the producing layer (MoE ``reduce=False``) and the
     consuming layer/tail -- it is a pure function of per-forward state."""
     if not is_cuda():
@@ -688,7 +689,8 @@ def scattered_ar_sconv_fusable(
 ) -> bool:
     """True when an extend {reduce_scatter_hidden -> sconv(shard) ->
     all_gather_hidden} chain can run as the single fused v3/v3b-style kernel
-    (kernels/ops/model/inkling/inkling_ar_scattered_sconv.py). Pure function of per-forward
+    (kernels/ops/model/inkling/inkling_ar_scattered_sconv.py). Pure function of
+    per-forward
     state -- the producing layer (reduce=False) and the consuming site must
     evaluate it identically."""
     if not is_cuda():
