@@ -66,7 +66,7 @@ _is_npu = is_npu()
 _is_xpu = is_xpu()
 
 if not _is_npu:
-    from sglang.jit_kernel.dsa import (
+    from sglang.kernels.ops.attention.dsa import (
         aiter_paged_mqa_logits,
         cutedsl_paged_mqa_logits,
         deepgemm_paged_mqa_logits_native,
@@ -79,7 +79,7 @@ else:
     deepgemm_paged_mqa_logits_split = None
 
 if _is_cuda:
-    from sglang.jit_kernel.dsa import pick_dsl_expand
+    from sglang.kernels.ops.attention.dsa import pick_dsl_expand
 else:
     pick_dsl_expand = None
 
@@ -173,7 +173,7 @@ def _uses_dsa_attention_backend(forward_batch: ForwardBatch) -> bool:
 
 
 if _is_cuda:
-    from sglang.jit_kernel.dsv4 import fused_q_indexer_rope_first_quant
+    from sglang.kernels.ops.attention.dsv4 import fused_q_indexer_rope_first_quant
     from sglang.kernels.ops.quantization.dsv32 import (
         fused_k_indexer_norm_rope,
         fused_k_indexer_norm_rope_store,

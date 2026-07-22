@@ -155,7 +155,7 @@ def _assert_shared_outer_merged_align_semantics(
 def test_multi_slot_shared_outer_merged_align_cuda_graph_parity(num_slots):
     """The fused hot path must replay with current multi-LoRA routing data."""
 
-    from sglang.jit_kernel.trtllm_lora_temp.moe_lora_merged_align import (
+    from sglang.kernels.ops.moe.trtllm_lora_temp.moe_lora_merged_align import (
         moe_lora_merged_align,
     )
 

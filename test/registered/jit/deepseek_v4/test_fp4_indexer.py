@@ -5,14 +5,14 @@ import sys
 import pytest
 import torch
 
-from sglang.jit_kernel.dsv4 import (
-    CompressorDecodePlan,
-    compress_norm_rope_store,
-    fused_q_indexer_rope_hadamard_fp4_quant,
-)
 from sglang.kernels.ops.attention.deepseek_v4_rope import (
     apply_rotary_emb_triton,
     precompute_freqs_cis,
+)
+from sglang.kernels.ops.attention.dsv4 import (
+    CompressorDecodePlan,
+    compress_norm_rope_store,
+    fused_q_indexer_rope_hadamard_fp4_quant,
 )
 from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
     quantize_fp4_indexer_tensor,

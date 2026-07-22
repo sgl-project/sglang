@@ -686,7 +686,7 @@ class DeepseekSparseAttnBackend(
         # when the fold is disabled; such metadata is never dispatched to v2.
         if not envs.SGLANG_OPT_USE_TOPK_V2.get():
             return None
-        from sglang.jit_kernel.dsv4.topk import plan_topk_v2
+        from sglang.kernels.ops.attention.dsv4.topk import plan_topk_v2
 
         return plan_topk_v2(seqlens_expanded)
 
@@ -699,7 +699,7 @@ class DeepseekSparseAttnBackend(
         # nothing to refresh.
         if metadata.topk_v2_plan is None:
             return
-        from sglang.jit_kernel.dsv4.topk import plan_topk_v2
+        from sglang.kernels.ops.attention.dsv4.topk import plan_topk_v2
 
         metadata.topk_v2_plan.copy_(plan_topk_v2(metadata.dsa_seqlens_expanded))
 

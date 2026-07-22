@@ -112,10 +112,10 @@ elif _is_hip:
 
 if _is_hip:
     try:
-        from sglang.jit_kernel.minimax_m3.rmsnorm import (
+        from sglang.kernels.ops.layernorm.minimax_m3_rmsnorm import (
             gemma_fused_add_rmsnorm as rocm_triton_gemma_fused_add_rmsnorm,
         )
-        from sglang.jit_kernel.minimax_m3.rmsnorm import (
+        from sglang.kernels.ops.layernorm.minimax_m3_rmsnorm import (
             gemma_rmsnorm as rocm_triton_gemma_rmsnorm,
         )
 

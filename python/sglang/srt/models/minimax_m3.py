@@ -104,7 +104,7 @@ _M3_FUSED_QKNORM_ROPE_ROTARY_DIM = 64
 _has_rocm_qk_norm_rope = False
 if _is_hip:
     try:
-        from sglang.jit_kernel.minimax_m3.qk_norm_rope import (
+        from sglang.kernels.ops.attention.minimax_m3_qk_norm_rope import (
             qk_gemma_rmsnorm_rope,
             sparse_qk_index_gemma_rmsnorm_rope,
             sparse_qk_index_gemma_rmsnorm_rope_cache,

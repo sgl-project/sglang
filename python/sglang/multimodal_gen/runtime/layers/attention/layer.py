@@ -11,12 +11,12 @@ import torch
 import torch.nn as nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
-from sglang.jit_kernel.diffusion.triton.varlen_pack_pad import (
+from sglang.kernels.ops.attention.flash_attention import flash_attn_varlen_func
+from sglang.kernels.ops.diffusion.triton.varlen_pack_pad import (
     build_inv_indices,
     fused_pack_qkv,
     fused_scatter_to_padded,
 )
-from sglang.kernels.ops.attention.flash_attention import flash_attn_varlen_func
 from sglang.multimodal_gen.runtime.breakable_cuda_graph.replay_token import (
     get_current_replay_token,
 )

@@ -765,7 +765,7 @@ def _merged_experts_fused_moe_lora_add_impl(
             and bucket_experts + 1 <= 1024
             and topk_ids.shape[0] < 512
         ):
-            from sglang.jit_kernel.trtllm_lora_temp.moe_lora_merged_align import (
+            from sglang.kernels.ops.moe.trtllm_lora_temp.moe_lora_merged_align import (
                 moe_lora_merged_align,
             )
 

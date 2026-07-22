@@ -17,7 +17,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from sglang.jit_kernel.dsv4 import fused_q_indexer_rope_first_quant
+from sglang.kernels.ops.attention.dsv4 import fused_q_indexer_rope_first_quant
 from sglang.kernels.ops.attention.fused_store_index_cache import (
     can_use_dsa_fused_store,
     fused_store_index_k_cache,
