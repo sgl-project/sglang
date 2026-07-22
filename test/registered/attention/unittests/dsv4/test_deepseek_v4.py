@@ -21,6 +21,9 @@ from unittest import mock
 
 import torch
 
+from sglang.jit_kernel.dsv4 import CompressorPrefillPlan
+from sglang.jit_kernel.dsv4.online_c128_mtp import OnlineC128MTPController
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.test_utils import CustomTestCase
 
@@ -261,6 +264,73 @@ class TestDSV4AttentionBackendCorrectness(CustomTestCase):
                 run_dsv4_eagle_verify_cuda_graph_case(
                     self, case, topk=1, force_gpu_only_seq_lens=True
                 )
+
+    def test_online_c128_mtp_cuda_graph_without_cpu_seq_lens(self):
+        case = DSV4AttentionCase(
+            name="runner_cuda_graph_dsv4_online_c128_mtp_gpu_plan",
+            backend="dsv4",
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            num_heads=64,
+            page_size=DSV4_PAGE_SIZE,
+            prefix_lens=(127,),
+            extend_lens=(4,),
+            compress_ratio=128,
+        )
+        original_generate_online_mtp = CompressorPrefillPlan.generate_online_mtp
+        observed_shapes = []
+
+        def checked_generate_online_mtp(**kwargs):
+            prefix_lens = kwargs["prefix_lens"]
+            active_batch_size = kwargs["active_batch_size"]
+            self.assertTrue(prefix_lens.is_cuda)
+            self.assertTrue(kwargs["req_pool_indices"].is_cuda)
+            observed_shapes.append((prefix_lens.shape[0], active_batch_size))
+            plan = original_generate_online_mtp(**kwargs)
+            if active_batch_size == 0:
+                invalid = torch.tensor(
+                    [-1, 0, -1, -1], dtype=torch.int32, device="cuda"
+                )
+                for output in (plan.plan_c, plan.plan_w):
+                    self.assertTrue(
+                        torch.equal(
+                            output.view(torch.int32),
+                            invalid.expand(prefix_lens.shape[0], -1),
+                        )
+                    )
+            return plan
+
+        with (
+            envs.SGLANG_PREP_IN_CUDA_GRAPH.override(True),
+            envs.SGLANG_OPT_USE_ONLINE_COMPRESS.override(True),
+            envs.SGLANG_EXPERIMENTAL_ONLINE_C128_MTP.override(True),
+            mock.patch.object(
+                OnlineC128MTPController, "prepare_forward", return_value=128
+            ),
+            mock.patch.object(
+                OnlineC128MTPController, "state_slot_offset", return_value=128
+            ),
+            mock.patch.object(
+                CompressorPrefillPlan,
+                "generate_online",
+                side_effect=AssertionError("online MTP must not use the host planner"),
+            ),
+            mock.patch.object(
+                CompressorPrefillPlan,
+                "generate_online_mtp",
+                side_effect=checked_generate_online_mtp,
+            ),
+        ):
+            run_dsv4_eagle_verify_cuda_graph_case(
+                self,
+                case,
+                topk=1,
+                cuda_graph_capture_batch_size=2,
+                force_gpu_only_seq_lens=True,
+                active_verify_batch_size=0,
+            )
+
+        self.assertIn((2, 2), observed_shapes)
+        self.assertIn((2, 0), observed_shapes)
 
     def test_eagle_draft_extend_without_cpu_seq_lens(self):
         case = DSV4AttentionCase(

@@ -891,6 +891,7 @@ def run_dsv4_eagle_verify_cuda_graph_case(
     device: str = "cuda",
     cuda_graph_capture_batch_size: int = 2,
     force_gpu_only_seq_lens: bool = False,
+    active_verify_batch_size: int | None = None,
 ):
     """DSV4 EAGLE target_verify CUDA-graph capture/replay. Chain only —
     `DeepseekV4AttnBackend.__init__` asserts `self.topk in [0, 1]` at
@@ -937,6 +938,17 @@ def run_dsv4_eagle_verify_cuda_graph_case(
         batch.spec_info = _make_eagle_verify_input(
             spec_case, batch, topk=topk, device=device
         )
+        if active_verify_batch_size is not None:
+            # Capture warms every row in the bucket; replay may carry fewer
+            # real requests and must invalidate the captured padding rows.
+            active_bs = (
+                spec_case.batch_size
+                if spec_case.name.endswith("_cuda_graph_capture")
+                else min(active_verify_batch_size, spec_case.batch_size)
+            )
+            batch.spec_info.draft_token = batch.spec_info.draft_token[
+                : active_bs * num_draft_tokens
+            ]
         if force_gpu_only_seq_lens:
             batch.seq_lens_cpu = None
             batch.seq_lens_sum = None

@@ -362,6 +362,35 @@ class CompressorPrefillPlan(NamedTuple):
             pin_buffer,
         )
 
+    @staticmethod
+    def generate_online_mtp(
+        prefix_lens: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        num_draft_tokens: int,
+        state_slot_offset: int = 0,
+        active_batch_size: Optional[int] = None,
+    ) -> CompressorPrefillPlan:
+        """Build a fixed-shape online-C128 target-verify plan on GPU."""
+        batch_size = int(prefix_lens.shape[0])
+        if active_batch_size is None:
+            active_batch_size = batch_size
+        assert req_pool_indices.shape == prefix_lens.shape
+        assert 0 < num_draft_tokens <= 8
+        assert 0 <= active_batch_size <= batch_size
+        assert active_batch_size * num_draft_tokens <= 1 << 16
+        assert state_slot_offset >= 0
+
+        from .online_c128_mtp_plan import plan_online_c128_mtp_prefill
+
+        plan_c, plan_w = plan_online_c128_mtp_prefill(
+            prefix_lens=prefix_lens,
+            req_pool_indices=req_pool_indices,
+            active_batch_size=active_batch_size,
+            num_draft_tokens=num_draft_tokens,
+            state_slot_offset=state_slot_offset,
+        )
+        return CompressorPrefillPlan(128, plan_c, plan_w)
+
     @property
     def is_decode(self) -> bool:
         return False
