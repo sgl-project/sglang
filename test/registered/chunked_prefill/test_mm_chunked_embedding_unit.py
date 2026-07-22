@@ -9,6 +9,7 @@ of the combined tensor pins the whole concatenated buffer).
 CPU-only: exercises mm_utils internals directly, no engine or GPU.
 """
 
+import pytest
 import torch
 
 from sglang.srt.managers import mm_utils
@@ -140,3 +141,9 @@ def test_tensor_cache_entries_share_storage():
         assert (
             emb.untyped_storage().nbytes() == total_tokens * HIDDEN * emb.element_size()
         )
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v"]))
