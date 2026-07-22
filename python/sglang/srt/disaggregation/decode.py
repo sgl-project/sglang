@@ -86,7 +86,7 @@ from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
     set_time_batch,
 )
-from sglang.srt.runtime_context import get_disagg, get_parallel
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_num_new_pages
 from sglang.srt.utils.network import NetworkAddress
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
@@ -2151,7 +2151,7 @@ class SchedulerDisaggregationDecodeMixin:
                 # Decode-radix path: new requests already matched in
                 # `pop_preallocated`. Retracted requests reset `last_node`,
                 # so re-match only when that state is missing.
-                if get_disagg().disaggregation_decode_enable_radix_cache:
+                if self.server_args.disaggregation_decode_enable_radix_cache:
                     tree_cache = self.tree_cache if req.last_node is None else None
                 else:
                     tree_cache = self.tree_cache
@@ -2191,7 +2191,7 @@ class SchedulerDisaggregationDecodeMixin:
         if self.enable_decode_hicache:
             self.tree_cache.check_hicache_events()
 
-        if get_disagg().disaggregation_decode_enable_offload_kvcache:
+        if self.server_args.disaggregation_decode_enable_offload_kvcache:
             self.decode_offload_manager.check_offload_progress()
 
         # try to resume retracted requests if there are enough space for another `num_reserved_decode_tokens` decode steps
@@ -2203,7 +2203,9 @@ class SchedulerDisaggregationDecodeMixin:
 
         if not hasattr(self, "polling_count"):
             self.polling_count = 0
-            self.polling_interval = get_disagg().disaggregation_decode_polling_interval
+            self.polling_interval = (
+                self.server_args.disaggregation_decode_polling_interval
+            )
 
         self.polling_count = (self.polling_count + 1) % self.polling_interval
 
