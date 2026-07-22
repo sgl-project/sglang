@@ -22,7 +22,7 @@ class AscendLoRABackend(BaseLoRABackend):
         super().__init__(max_loras_per_batch, device)
 
     def run_lora_a_embedding(self, input_ids, weights, vocab_size, extra_embeddings=None, *args, **kwargs):
-        assert extra_embeddings is None, "..."
+        assert extra_embeddings is None, "Ascend LoRA embedding backend does not support extra embeddings (added tokens)."
 
         total_seq_len = input_ids.shape[0]
         if weights.numel() == 0:
