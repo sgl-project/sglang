@@ -11,6 +11,13 @@ set -euxo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUST_WORKSPACE_DIR="${SCRIPT_DIR}/../../../rust"
 
+# Channel pinned by rust/rust-toolchain.toml, used as the default toolchain:
+# setuptools-rust wheel builds run cargo from python/ — outside the pin's
+# cwd-based scope — so only the default toolchain makes them use the same
+# rustc as the workspace. Falls back to stable if the pin can't be parsed.
+PINNED_CHANNEL="$(sed -n 's/^channel *= *"\([^"]*\)".*/\1/p' "${RUST_WORKSPACE_DIR}/rust-toolchain.toml" 2>/dev/null || true)"
+DEFAULT_CHANNEL="${PINNED_CHANNEL:-stable}"
+
 # Make cargo/rustc visible to the rest of this shell and to subsequent
 # GitHub Actions steps in the same job.
 export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:${PATH}"
@@ -66,8 +73,15 @@ if command -v cargo >/dev/null 2>&1 && command -v rustc >/dev/null 2>&1; then
     if rustc --version >/dev/null 2>&1; then
         echo "rust already installed: $(rustc --version), $(cargo --version)"
     elif command -v rustup >/dev/null 2>&1; then
-        echo "rustup shims present but no usable toolchain; installing stable as default..."
-        rustup default stable
+        echo "rustup shims present but no usable default toolchain; installing ${DEFAULT_CHANNEL} as default..."
+        # `rustup default <channel>` alone is not enough: the toolchain dir may
+        # exist but be corrupt (a partial install baked into a runner image
+        # fails later with "Missing manifest in toolchain '...'"), and rustup
+        # treats any existing dir as installed. Remove it and install fresh
+        # before selecting it as default.
+        rustup toolchain uninstall "${DEFAULT_CHANNEL}" || true
+        rustup toolchain install "${DEFAULT_CHANNEL}"
+        rustup default "${DEFAULT_CHANNEL}"
     else
         echo "ERROR: cargo/rustc on PATH but non-functional and rustup is missing; remove the stale binaries and re-run"
         exit 1
@@ -102,10 +116,10 @@ else
             "${RUSTUP_UPDATE_ROOT}/dist/${RUSTUP_ARCH}/rustup-init" \
             -o "${RUSTUP_TMP}/rustup-init"
         chmod +x "${RUSTUP_TMP}/rustup-init"
-        "${RUSTUP_TMP}/rustup-init" -y --no-modify-path
+        "${RUSTUP_TMP}/rustup-init" -y --no-modify-path --default-toolchain "${DEFAULT_CHANNEL}"
     else
         curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.rustup.rs \
-            | sh -s -- -y --no-modify-path
+            | sh -s -- -y --no-modify-path --default-toolchain "${DEFAULT_CHANNEL}"
     fi
 fi
 
