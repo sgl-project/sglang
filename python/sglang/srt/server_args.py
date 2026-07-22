@@ -2196,8 +2196,8 @@ class ServerArgs:
     linear_attn_verify_backend: A[
         Optional[str],
         Arg(
-            help="Override the kernel backend for linear attention speculative target-verify. If not set, follows the decode backend (flashinfer decode -> flashinfer verify, otherwise triton). Currently consumed by the KDA backend.",
-            choices=LINEAR_ATTN_KERNEL_BACKEND_CHOICES,
+            help="Override the kernel backend for linear attention speculative target-verify. If not set, follows the decode backend (flashinfer decode -> flashinfer verify, otherwise triton). KDA supports triton, nv_cutedsl, and flashinfer verify backends.",
+            choices=LINEAR_ATTN_KERNEL_BACKEND_CHOICES + ["nv_cutedsl"],
         ),
     ] = None
     # ReplaySSM buffered output-only linear-attn decode (GDN + KDA): per-slot
@@ -5372,6 +5372,21 @@ class ServerArgs:
         ):
             raise ValueError(
                 "--linear-attn-decode-backend flashinfer on SM100+ requires "
+                "--mamba-ssm-dtype bfloat16, "
+                f"got {self.mamba_ssm_dtype!r}"
+            )
+
+        verify = self.linear_attn_verify_backend
+        if verify is None and decode == "flashinfer":
+            verify = "flashinfer"
+        if (
+            verify == "flashinfer"
+            and self.mamba_ssm_dtype != "bfloat16"
+            and is_cuda()
+            and torch.cuda.get_device_capability()[0] >= 10
+        ):
+            raise ValueError(
+                "--linear-attn-verify-backend flashinfer on SM100+ requires "
                 "--mamba-ssm-dtype bfloat16, "
                 f"got {self.mamba_ssm_dtype!r}"
             )

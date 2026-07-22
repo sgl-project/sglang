@@ -235,6 +235,26 @@ class TestMambaCacheStochasticRounding(unittest.TestCase):
             server_args._handle_mamba_backend()
 
 
+class TestLinearAttentionBackendStateDtype(unittest.TestCase):
+    @patch("torch.cuda.get_device_capability", return_value=(10, 0))
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    @patch("sglang.srt.server_args.is_sm100_supported", return_value=False)
+    def test_flashinfer_verify_rejects_fp32_ssm_state(
+        self, _mock_sm100, _mock_is_cuda, _mock_capability
+    ):
+        server_args = ServerArgs(
+            model_path="dummy",
+            mamba_ssm_dtype="float32",
+            linear_attn_decode_backend="triton",
+            linear_attn_verify_backend="flashinfer",
+        )
+
+        with self.assertRaisesRegex(
+            ValueError, "--linear-attn-verify-backend flashinfer.*bfloat16"
+        ):
+            server_args._handle_linear_attn_backend()
+
+
 class TestLoadBalanceMethod(unittest.TestCase):
     def _load_balance_args(self, **kwargs):
         server_args = ServerArgs(model_path="dummy", **kwargs)

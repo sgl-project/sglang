@@ -1,3 +1,4 @@
+import importlib.util
 from typing import Optional, Tuple, Union
 
 import torch
@@ -43,6 +44,7 @@ class KDAKernelDispatcher:
         prefill_backend: LinearAttnKernelBackend,
         verify_backend: LinearAttnKernelBackend,
     ):
+        self.verify_backend = verify_backend
         triton_kernel = TritonKDAKernel()
 
         if decode_backend.is_triton():
@@ -77,6 +79,7 @@ class KDAKernelDispatcher:
         #     the KDA correctness tests assert against.
         #   flashinfer: recurrent_kda (SM100, chain only); reuses the decode kernel
         #     when decode is also flashinfer.
+        #   nv_cutedsl: fused Kimi-K3/DSpARK dense verify.
         if verify_backend.is_triton():
             self.verify_kernel = triton_kernel
         elif verify_backend.is_flashinfer():
@@ -90,6 +93,8 @@ class KDAKernelDispatcher:
                 )
 
                 self.verify_kernel = FlashInferKDAKernel()
+        elif verify_backend.is_nv_cutedsl():
+            self.verify_kernel = triton_kernel
         elif verify_backend.is_custom():
             # Future custom KDA verify kernel plugs in here.
             raise NotImplementedError(
@@ -99,8 +104,7 @@ class KDAKernelDispatcher:
         else:
             raise ValueError(
                 f"Unsupported KDA verify backend: {verify_backend}. "
-                "KDA verify supports 'triton' or 'flashinfer' "
-                "(CuTe DSL has no verify kernel)."
+                "KDA verify supports 'triton', 'nv_cutedsl', or 'flashinfer'."
             )
 
         if prefill_backend.is_triton():
@@ -691,6 +695,31 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
         draft_token_num = forward_batch.spec_info.draft_token_num
         ragged_layout = forward_batch.spec_info.ragged_verify_layout
+        if self._can_run_dspark_cutedsl_mtp(
+            layer=layer,
+            mixed_qkv=mixed_qkv,
+            a=a,
+            b=b,
+            draft_token_num=draft_token_num,
+            ragged_layout=ragged_layout,
+            conv_states=conv_states,
+            intermediate_state_cache=intermediate_state_cache,
+            intermediate_conv_window_cache=intermediate_conv_window_cache,
+            retrieve_parent_token=retrieve_parent_token,
+        ):
+            return self._run_dspark_cutedsl_mtp(
+                layer=layer,
+                mixed_qkv=mixed_qkv,
+                a=a,
+                b=b,
+                conv_states=conv_states,
+                ssm_states=ssm_states,
+                intermediate_state_cache=intermediate_state_cache,
+                intermediate_conv_window_cache=intermediate_conv_window_cache,
+                intermediate_state_indices=intermediate_state_indices,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+            )
         if ragged_layout is None:
             batch_size = seq_len // draft_token_num
             dense_token_indices = None
@@ -813,3 +842,134 @@ class KDAAttnBackend(MambaAttnBackendBase):
             covered = dense_token_indices < (batch_size * draft_token_num)
             core_attn_out = torch.where(covered.view(1, -1, 1, 1), core_attn_out, 0.0)
         return core_attn_out
+
+    def _can_run_dspark_cutedsl_mtp(
+        self,
+        *,
+        layer: RadixLinearAttention,
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        draft_token_num: int,
+        ragged_layout,
+        conv_states: torch.Tensor,
+        intermediate_state_cache: torch.Tensor,
+        intermediate_conv_window_cache: torch.Tensor,
+        retrieve_parent_token: Optional[torch.Tensor],
+    ) -> bool:
+        """Return whether the fixed Kimi-K3/DSpARK CuTe contract is satisfied."""
+        if not self.kernel_dispatcher.verify_backend.is_nv_cutedsl() or not is_cuda():
+            return False
+        if importlib.util.find_spec("cutlass") is None:
+            return False
+        if torch.cuda.get_device_capability()[0] != 10:
+            return False
+        if ragged_layout is not None or retrieve_parent_token is not None:
+            return False
+        # draft_token_num = 1 bonus + dspark block size; the CuTe kernel is
+        # specialized per block size and capped at 8 by shared-memory growth.
+        if not 2 <= draft_token_num <= 8:
+            return False
+        if layer.bias is not None or layer.lower_bound is None:
+            return False
+        if (
+            layer.head_q_dim != 128
+            or layer.head_k_dim != 128
+            or layer.head_v_dim != 128
+        ):
+            return False
+        if (
+            layer.num_q_heads != layer.num_k_heads
+            or layer.num_k_heads != layer.num_v_heads
+        ):
+            return False
+        if (
+            mixed_qkv.dtype != torch.bfloat16
+            or a.dtype != torch.bfloat16
+            or b.dtype != torch.bfloat16
+        ):
+            return False
+        if layer.conv_weights is None or tuple(layer.conv_weights.shape) != (
+            layer.q_dim + layer.k_dim + layer.v_dim,
+            4,
+        ):
+            return False
+        if layer.conv_weights.dtype != torch.float32:
+            return False
+        if conv_states.shape[-2] != 3 or intermediate_conv_window_cache.shape[-2] != 3:
+            return False
+        if intermediate_state_cache.shape[1] < draft_token_num:
+            return False
+        if tuple(intermediate_state_cache.shape[-3:]) != (
+            layer.num_v_heads,
+            layer.head_v_dim,
+            layer.head_k_dim,
+        ):
+            return False
+        return True
+
+    @staticmethod
+    def _run_dspark_cutedsl_mtp(
+        *,
+        layer: RadixLinearAttention,
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        conv_states: torch.Tensor,
+        ssm_states: torch.Tensor,
+        intermediate_state_cache: torch.Tensor,
+        intermediate_conv_window_cache: torch.Tensor,
+        intermediate_state_indices: torch.Tensor,
+        cache_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+    ) -> torch.Tensor:
+        from sglang.jit_kernel.kimi_k3.kda_decode_mtp import (
+            fused_kda_decode_mtp_dspark,
+        )
+
+        seq_len = mixed_qkv.shape[0]
+        h = layer.num_v_heads
+        x_q, x_k, x_v = mixed_qkv.split([layer.q_dim, layer.k_dim, layer.v_dim], dim=-1)
+        x_q = x_q.reshape(1, seq_len, h, layer.head_q_dim)
+        x_k = x_k.reshape(1, seq_len, h, layer.head_k_dim)
+        x_v = x_v.reshape(1, seq_len, h, layer.head_v_dim)
+        w_q, w_k, w_v = layer.conv_weights.split(
+            [layer.q_dim, layer.k_dim, layer.v_dim], dim=0
+        )
+        cs_q, cs_k, cs_v = conv_states.split(
+            [layer.q_dim, layer.k_dim, layer.v_dim], dim=-1
+        )
+        cs_q = cs_q.transpose(-1, -2)
+        cs_k = cs_k.transpose(-1, -2)
+        cs_v = cs_v.transpose(-1, -2)
+        intermediate_conv_window_cache = intermediate_conv_window_cache.transpose(
+            -1, -2
+        )
+        ic_q, ic_k, ic_v = intermediate_conv_window_cache.split(
+            [layer.q_dim, layer.k_dim, layer.v_dim], dim=-2
+        )
+        return fused_kda_decode_mtp_dspark(
+            x_q=x_q,
+            x_k=x_k,
+            x_v=x_v,
+            w_q=w_q,
+            w_k=w_k,
+            w_v=w_v,
+            cs_q=cs_q,
+            cs_k=cs_k,
+            cs_v=cs_v,
+            g=a,
+            beta=b,
+            A_log=layer.A_log.reshape(-1),
+            dt_bias=layer.dt_bias.reshape(-1),
+            recurrent_state=ssm_states,
+            intermediate_ssm=intermediate_state_cache,
+            intermediate_state_indices=intermediate_state_indices,
+            intermediate_conv_q=ic_q,
+            intermediate_conv_k=ic_k,
+            intermediate_conv_v=ic_v,
+            ssm_state_indices=cache_indices.to(torch.int32),
+            cu_seqlens=query_start_loc.to(torch.int32),
+            lower_bound=float(layer.lower_bound),
+            scale=layer.head_q_dim**-0.5,
+        )

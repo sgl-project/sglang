@@ -20,10 +20,8 @@
 //     pool updates, mirroring kda_packed_decode;
 //   * tvm-ffi host wrapper (KdaFusedDecodeKernel) with TensorMatcher shape /
 //     stride / dtype validation replaces the pybind binding;
-//   * optional 1D-TMA bulk state load (SGLANG_KDA_FUSED_DECODE_TMA_LOAD),
-//     ported from the standalone KDA_decode/kda_decode_fusion_kernel.cu
-//     experiment on chunan/kda (same mbarrier staging, same 3/4-stage
-//     dispatch by grid size).
+//   * optional 1D-TMA bulk state load (SGLANG_KDA_FUSED_DECODE_TMA_LOAD)
+
 
 #include <sgl_kernel/tensor.h>  // For TensorMatcher, SymbolicSize, SymbolicDevice
 #include <sgl_kernel/utils.h>   // For RuntimeCheck
