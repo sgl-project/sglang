@@ -92,16 +92,19 @@ __global__ void mxfp4_decode_kernel(const __grid_constant__ Mxfp4DecodeParams pa
 
   PDLWaitPrimary<kUsePDL>();
 
-  // ---- load Q (16 floats per lane) -----------------------------------------
+  // ---- load Q (16 floats per lane, two 8-element aligned vectors) -----------
   float q_val[16];  // kHeadDim / kWarpThreads = 16
   {
     const auto* q_bf16 = static_cast<const bf16_t*>(q) + gid * kHeadDim;
-    using VecQ = AlignedVector<bf16_t, 16>;
+    using VecQ = AlignedVector<bf16_t, 8>;
     const auto gmem_q = tile::Memory<VecQ>::warp();
-    VecQ q_vec = gmem_q.load(q_bf16);
 #pragma unroll
-    for (int i = 0; i < 16; ++i)
-      q_val[i] = cast<float>(q_vec[i]);
+    for (int k = 0; k < 2; ++k) {
+      VecQ q_vec = gmem_q.load(q_bf16 + k * (kWarpThreads * 8));
+#pragma unroll
+      for (int i = 0; i < 8; ++i)
+        q_val[k * 8 + i] = cast<float>(q_vec[i]);
+    }
   }
 
   // ---- locate K page --------------------------------------------------------
@@ -176,14 +179,17 @@ __global__ void mxfp4_decode_kernel(const __grid_constant__ Mxfp4DecodeParams pa
   auto* o_bf16 = static_cast<bf16_t*>(o) + gid * kHeadDim;
 
   {
-    using VecO = AlignedVector<bf16_t, 16>;
-    VecO o_vec;
-#pragma unroll
-    for (int i = 0; i < 16; ++i) {
-      o_vec[i] = cast<bf16_t>(o_val[i] * inv_s);
-    }
+    using VecO = AlignedVector<bf16_t, 8>;
     const auto gmem_o = tile::Memory<VecO>::warp();
-    gmem_o.store(o_bf16, o_vec);
+#pragma unroll
+    for (int k = 0; k < 2; ++k) {
+      VecO o_vec;
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        o_vec[i] = cast<bf16_t>(o_val[k * 8 + i] * inv_s);
+      }
+      gmem_o.store(o_bf16 + k * (kWarpThreads * 8), o_vec);
+    }
   }
 
   PDLTriggerSecondary<kUsePDL>();
@@ -223,7 +229,7 @@ struct Mxfp4DecodeKernel {
         .indices = static_cast<const int32_t*>(indices.data_ptr()),
         .o = o.data_ptr(),
         .sm_scale = sm_scale,
-        .page_stride_bytes = static_cast<uint32_t>(page_size) * kBytesPerToken,
+        .page_stride_bytes = static_cast<uint32_t>(static_cast<uint32_t>(page_size) * kBytesPerToken),
         .page_size = static_cast<uint32_t>(page_size),
     };
 
