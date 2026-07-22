@@ -700,6 +700,25 @@ class GenerateReqInput:
             return self.positional_embed_overrides
         return self.positional_embed_overrides[i]
 
+    def _get_mm_hashes_item(self, i: int):
+        if self.mm_hashes is None:
+            return None
+        if not self.mm_hashes:
+            return self.mm_hashes
+        if isinstance(self.mm_hashes[0], list):
+            return self.mm_hashes[i]
+
+        item_image_data = self.image_data[i] if self.image_data is not None else None
+        if isinstance(item_image_data, list):
+            if len(item_image_data) == 1 and len(self.mm_hashes) == len(
+                self.image_data
+            ):
+                return [self.mm_hashes[i]]
+            if len(self.mm_hashes) == len(item_image_data):
+                return self.mm_hashes
+
+        return self.mm_hashes
+
     def __getitem__(self, i):
         # Cache sub-objects so that repeated obj[i] calls return the same instance.
         # This avoids subtle bugs where different call sites get divergent objects.
@@ -717,6 +736,8 @@ class GenerateReqInput:
             image_data=self.image_data[i],
             video_data=self.video_data[i],
             audio_data=self.audio_data[i],
+            mm_hashes=self._get_mm_hashes_item(i),
+            use_audio_in_video=self.use_audio_in_video,
             sampling_params=self.sampling_params[i],
             return_logprob=self.return_logprob[i],
             logprob_start_len=self.logprob_start_len[i],
@@ -780,6 +801,10 @@ class GenerateReqInput:
                 if self.multi_item_delimiter_indices is not None
                 else None
             ),
+            max_dynamic_patch=self.max_dynamic_patch,
+            min_dynamic_patch=self.min_dynamic_patch,
+            image_max_dynamic_patch=self.image_max_dynamic_patch,
+            video_max_dynamic_patch=self.video_max_dynamic_patch,
         )
         cache[i] = sub
         return sub

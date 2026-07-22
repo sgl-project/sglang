@@ -594,6 +594,53 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         self.assertTrue(req[0].return_prompt_token_ids)
         self.assertTrue(req[1].return_prompt_token_ids)
 
+    def test_getitem_preserves_multimodal_scalar_controls(self):
+        """Batch subrequests must keep request-level multimodal controls."""
+        req = GenerateReqInput(
+            text=["Hello", "World"],
+            sampling_params=[{}, {}],
+            rid=["id1", "id2"],
+            use_audio_in_video=True,
+            max_dynamic_patch=12,
+            min_dynamic_patch=2,
+            image_max_dynamic_patch=10,
+            video_max_dynamic_patch=4,
+        )
+        req.normalize_batch_and_arguments()
+
+        for item in (req[0], req[1]):
+            self.assertTrue(item.use_audio_in_video)
+            self.assertEqual(item.max_dynamic_patch, 12)
+            self.assertEqual(item.min_dynamic_patch, 2)
+            self.assertEqual(item.image_max_dynamic_patch, 10)
+            self.assertEqual(item.video_max_dynamic_patch, 4)
+
+    def test_getitem_slices_flat_mm_hashes_for_batched_images(self):
+        req = GenerateReqInput(
+            text=["Hello", "World"],
+            image_data=["image1.jpg", "image2.jpg"],
+            mm_hashes=["hash1", "hash2"],
+            sampling_params=[{}, {}],
+            rid=["id1", "id2"],
+        )
+        req.normalize_batch_and_arguments()
+
+        self.assertEqual(req[0].mm_hashes, ["hash1"])
+        self.assertEqual(req[1].mm_hashes, ["hash2"])
+
+    def test_getitem_preserves_flat_mm_hashes_for_parallel_multi_image(self):
+        req = GenerateReqInput(
+            text="Hello",
+            image_data=["image1.jpg", "image2.jpg"],
+            mm_hashes=["hash1", "hash2"],
+            sampling_params={"n": 2},
+            rid="id1",
+        )
+        req.normalize_batch_and_arguments()
+
+        self.assertEqual(req[0].mm_hashes, ["hash1", "hash2"])
+        self.assertEqual(req[1].mm_hashes, ["hash1", "hash2"])
+
     def test_regenerate_rid(self):
         """Test the regenerate_rid method."""
         req = GenerateReqInput(text="Hello")
