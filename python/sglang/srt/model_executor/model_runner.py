@@ -1026,8 +1026,6 @@ class ModelRunner:
             return
         if self.server_args.dwdp_size <= 1:
             return
-        # Lazy import: DWDP uses NVLink-specific cuda-python bindings that are
-        # only available (and only needed) on CUDA platforms with dwdp_size > 1.
         from sglang.srt.layers.moe.dwdp import DwdpManager
 
         manager = DwdpManager(self.server_args)

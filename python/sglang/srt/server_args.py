@@ -4857,10 +4857,18 @@ class ServerArgs:
         assert (
             is_cuda() or is_musa() or is_npu() or is_hip()
         ), "extra_buffer needs CUDA/MUSA/NPU/ROCm (FLA)."
+        if view.mamba_radix_cache_strategy == "extra_buffer_lazy":
+            # The PD-disagg decode pool is not wired for lazy slots.
+            assert view.disaggregation_mode == "null", (
+                "extra_buffer_lazy unsupported under PD disaggregation; use "
+                "--mamba-radix-cache-strategy extra_buffer."
+            )
+            algo = (view.speculative_algorithm or "").upper()
+            assert algo not in ("DFLASH", "DSPARK"), (
+                f"extra_buffer_lazy unsupported with {view.speculative_algorithm}; "
+                "use --mamba-radix-cache-strategy extra_buffer."
+            )
         if view.speculative_num_draft_tokens is not None:
-            assert (
-                view.mamba_radix_cache_strategy != "extra_buffer_lazy"
-            ), "extra_buffer_lazy unsupported with spec."
             assert view.mamba_track_interval >= view.speculative_num_draft_tokens
         if view.page_size is not None:
             assert view.mamba_track_interval % view.page_size == 0
