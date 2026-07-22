@@ -62,12 +62,6 @@ def _apply_srt_w8a8_fp8_linear(*args, **kwargs) -> torch.Tensor:
     return apply_fp8_linear(*args, **kwargs)
 
 
-def _is_cutlass_fp8_supported() -> bool:
-    from sglang.srt.layers.quantization.fp8_utils import cutlass_fp8_supported
-
-    return cutlass_fp8_supported()
-
-
 def _apply_weight_only_fp8_linear(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -90,7 +84,6 @@ def _apply_weight_only_fp8_linear(
                 weight_scale=weight_scale,
                 input_scale=None,
                 bias=bias,
-                cutlass_fp8_supported=_is_cutlass_fp8_supported(),
             )
             _log_w8a8_fp8_gemm_warning_once()
             return output

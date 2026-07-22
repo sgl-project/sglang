@@ -207,10 +207,16 @@ On Ascend, various layers quantization configurations are supported, see [Ascend
 ## GEMM Backends for FP4/FP8 Quantization
 
 <Note>
-Backend selection applies to **blockwise FP8**, **MXFP8** (dense linear), and **NVFP4** GEMM. When running offline or online FP8 or FP4 quantized models, you can select the GEMM backend via `--fp8-gemm-backend` and `--fp4-gemm-backend`.
+Backend selection is supported for **FP8** (blockwise, per-tensor/per-channel, and MXFP8 dense linear) and **NVFP4** GEMM. When running FP8 or FP4 quantized models, you can select the GEMM backend via `--fp8-gemm-backend` and `--fp4-gemm-backend`.
 </Note>
 
-### `--fp8-gemm-backend` (Blockwise FP8 GEMM)
+### `--fp8-gemm-backend` (FP8 GEMM)
+
+SGLang has two FP8 GEMM paths, chosen automatically by the checkpoint's quantization scheme. `--fp8-gemm-backend` selects the kernel for each path; **the two paths support different backends**, listed in separate tables below.
+
+#### Blockwise FP8 GEMM
+
+For block-quantized checkpoints (e.g. DeepSeek-style `weight_block_size`).
 
 <table>
   <thead>
@@ -265,6 +271,37 @@ Backend selection applies to **blockwise FP8**, **MXFP8** (dense linear), and **
 </table>
 
 **`auto` selection order:** 1) DeepGEMM (SM90/SM100, installed); 2) FlashInfer TRTLLM (SM100, FlashInfer available); 3) CUTLASS (SM120); 4) AITER (AMD); 5) Triton (fallback).
+
+#### Per-tensor / per-channel FP8 GEMM
+
+For non-blockwise checkpoints (e.g. most ModelOpt and W8A8 FP8 models). This path supports only the backends below; any other value falls back to `auto`.
+
+<table>
+  <thead>
+    <tr>
+      <th>Backend</th>
+      <th>Hardware</th>
+      <th>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>auto</code> / <code>cutlass</code></td>
+      <td>SM89 (CUDA 12.4+), SM90+ (CUDA 12.0+)</td>
+      <td>Default: sgl-kernel CUTLASS <code>fp8_scaled_mm</code>, falling back to <code>torch._scaled_mm</code> on unsupported hardware</td>
+    </tr>
+    <tr>
+      <td><code>flashinfer</code></td>
+      <td>Blackwell</td>
+      <td>FlashInfer auto-tuned <code>bmm_fp8</code> (autotunes over all its backends); static per-tensor scales only, otherwise falls back to the default</td>
+    </tr>
+    <tr>
+      <td><code>triton</code></td>
+      <td>All</td>
+      <td>Triton scaled-MM kernel</td>
+    </tr>
+  </tbody>
+</table>
 
 **MXFP8 dense linear:** `auto` uses `flashinfer_cutlass` on SM100 (else `triton`). `flashinfer_cutlass` is fastest on most shapes; `flashinfer_trtllm` is faster only at small M.
 

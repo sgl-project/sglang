@@ -21,11 +21,16 @@ from sglang.srt.layers.quantization.base_config import (
 )
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
-    cutlass_fp8_supported,
     input_to_float8,
     normalize_e4m3fn_to_e4m3fnuz,
+    use_flashinfer_fp8,
 )
-from sglang.srt.utils import set_weight_attrs
+from sglang.srt.utils import (
+    is_blackwell_supported,
+    is_sm89_supported,
+    is_sm90_supported,
+    set_weight_attrs,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -103,7 +108,6 @@ class W8A8Fp8Config(QuantizationConfig):
 class W8A8Fp8LinearMethod(LinearMethodBase):
 
     def __init__(self, quantization_config: W8A8Fp8Config):
-        self.cutlass_fp8_supported = cutlass_fp8_supported()
         self.quantization_config = quantization_config
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
@@ -121,7 +125,9 @@ class W8A8Fp8LinearMethod(LinearMethodBase):
             layer.weight_scale = Parameter(weight_scale, requires_grad=False)
         else:
             # If checkpoint not offline quantized, quantize the weights with per-channel quantization.
-            if self.cutlass_fp8_supported:
+            if (
+                is_sm89_supported() or is_sm90_supported() or is_blackwell_supported()
+            ) and not use_flashinfer_fp8():
                 # if cutlass supported, we use cutlass_scaled_mm
                 # which requires per-channel quantization on weight
                 qweight, weight_scale = per_token_group_quant_fp8(
@@ -190,7 +196,6 @@ class W8A8Fp8LinearMethod(LinearMethodBase):
             layer.weight,
             layer.weight_scale,
             bias=bias,
-            cutlass_fp8_supported=self.cutlass_fp8_supported,
         )
 
 

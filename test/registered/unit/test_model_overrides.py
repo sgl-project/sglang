@@ -1544,29 +1544,6 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             )
         self.assertEqual(_moe_runner_backend_quant_constraints(_view()), {})
 
-    def test_cutlass_moe_env_override_pass(self):
-        from sglang.srt.arg_groups.overrides import (
-            ResolvedView,
-            _cutlass_moe_env_override,
-        )
-
-        with patch("sglang.srt.environ.envs.SGLANG_CUTLASS_MOE") as e:
-            e.get.return_value = True
-            self.assertEqual(
-                _cutlass_moe_env_override(
-                    ResolvedView(SimpleNamespace(quantization="fp8"))
-                ),
-                {"moe_runner_backend": "cutlass"},
-            )
-            with self.assertRaises(AssertionError):
-                _cutlass_moe_env_override(
-                    ResolvedView(SimpleNamespace(quantization=None))
-                )
-            e.get.return_value = False
-            self.assertEqual(
-                _cutlass_moe_env_override(ResolvedView(SimpleNamespace())), {}
-            )
-
     def test_gguf_quantization_pass(self):
         from sglang.srt.arg_groups.overrides import ResolvedView, _gguf_quantization
 

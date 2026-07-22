@@ -43,10 +43,18 @@ class KernelBackend(str, Enum):
     JIT = "jit"  # sglang.jit_kernel (nvcc / hipcc)
     AOT = "aot"  # sgl_kernel wheel (CUDA / ROCm builds)
     CUTE_DSL = "cute_dsl"
-    FLASHINFER = "flashinfer"
+    FLASHINFER = "flashinfer"  # FlashInfer auto-tuned wrapper (e.g. bmm_fp8/mm_fp4)
     DEEPGEMM = "deepgemm"
     AITER = "aiter"  # AMD aiter library (device=HIP)
     TORCH_NPU = "torch_npu"  # Ascend NPU vendor runtime (device=NPU)
+    MARLIN = "marlin"  # Marlin weight-only fallback kernels
+    # Named FlashInfer GEMM sub-kernels that are independently selectable
+    # (unlike the generic FLASHINFER wrapper, which auto-tunes internally).
+    FLASHINFER_TRTLLM = "flashinfer_trtllm"
+    FLASHINFER_CUTLASS = "flashinfer_cutlass"
+    FLASHINFER_DEEPGEMM = "flashinfer_deepgemm"
+    FLASHINFER_CUDNN = "flashinfer_cudnn"
+    FLASHINFER_CUTEDSL = "flashinfer_cutedsl"
     # TODO(RFC #29630): more provenance as needed (cpu-avx, sgl_kernel_npu, ...)
 
 
