@@ -26,6 +26,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.quantization.fp8_utils import fp8_dtype_to_triton
+
 
 @triton.jit
 def _fp8_quantize_kernel(
@@ -52,9 +54,10 @@ def _fp8_quantize_kernel(
     x = tl.load(x_ptr + x_off, mask=m_mask[:, None])
 
     x_fp8 = (x.to(tl.float32) * scale_inv).to(FP8_DTYPE)
+    x_fp8_bytes = x_fp8.to(tl.uint8, bitcast=True)
 
     out_off = m_idx[:, None] * out_row_stride + n_idx[None, :]
-    tl.store(out_ptr + out_off, x_fp8, mask=m_mask[:, None])
+    tl.store(out_ptr + out_off, x_fp8_bytes, mask=m_mask[:, None])
 
     if ENABLE_PDL:
         tl.extra.cuda.gdc_launch_dependents()
@@ -123,7 +126,7 @@ def fp8_quantize(
     out_M, _, out_row_stride = _flatten_to_2d(out)
     assert out_M == M
 
-    fp8_dtype_const = tl.float8e4nv if fp8_dtype is torch.float8_e4m3fn else tl.float8e5
+    fp8_dtype_const = fp8_dtype_to_triton(fp8_dtype)
 
     if M <= 2048:
         block_m = 4
@@ -141,7 +144,7 @@ def fp8_quantize(
 
     _fp8_quantize_kernel[grid](
         x,
-        out,
+        out.view(torch.uint8),
         scale_inv,
         M,
         x_row_stride,
