@@ -9,15 +9,14 @@ mod guard;
 mod log;
 mod native_api;
 mod openai;
-mod submit;
 
 use std::sync::Arc;
 
 use axum::Router;
 
 use crate::runtime::ServerArgs;
+use crate::runtime::channels::Senders;
 use crate::tokenizer_manager::ActivityCounter;
-use crate::tokenizer_manager::Senders;
 
 /// Shared handler state: the submit machinery (`senders`, `egress_buf`)
 /// + shared tokenizer.
@@ -36,9 +35,6 @@ pub async fn serve(
     egress_buf: usize,
     server_args: Arc<ServerArgs>,
     egress_activity: ActivityCounter,
-    // The SAME set ingress releases from — see `Ingress::on_abort`. Constructing a
-    // local one here would leave the api server admitting rids that nothing ever
-    // releases.
     shutdown: flume::Receiver<()>,
 ) {
     let state = AppState {
