@@ -128,7 +128,7 @@ def test_dp_flattened_page_table(nkv, bs, seq_len):
     + effective KV length against the per-head block-id selection, including the
     head-minor head-encoded page index (base_page*nkv + h, the index into an HND
     cache [num_pages, nkv, ps, D] reshaped to [num_pages*nkv, 1, ps, D])."""
-    D, block, topk, ps = 128, 128, 16, 64
+    block, topk, ps = 128, 16, 64
     ppb = block // ps
     torch.manual_seed(nkv * 131 + bs * 31 + seq_len)
     ppr = (seq_len + ps - 1) // ps

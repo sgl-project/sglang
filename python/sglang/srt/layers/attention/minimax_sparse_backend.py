@@ -471,7 +471,6 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             forward_batch.req_pool_indices,
             forward_batch.seq_lens,
             self._max_seqlen_k,
-            1,
             self.block_size_k,
             self.topk_blocks,
             self.init_blocks,
