@@ -118,8 +118,8 @@ fn msgpack_to_json(bytes: &[u8]) -> Result<Vec<u8>, String> {
 async fn model_info(State(state): State<AppState>) -> Response {
     let sa = &state.server_args;
     let body = serde_json::json!({
-        "model_path": sa.model_path(),
-        "tokenizer_path": sa.tokenizer_path(),
+        "model_path": sa.model_path,
+        "tokenizer_path": sa.tokenizer_path,
         "is_generation": true,
         "preferred_sampling_params": serde_json::Value::Null,
         "weight_version": serde_json::Value::Null,
@@ -190,12 +190,12 @@ fn shape_server_info(msgpack: &[u8], server_args: &ServerArgs) -> Result<Vec<u8>
     // Top-level non-secret config from typed accessors (structurally can't surface
     // a key field, unlike the raw dump).
     let response = serde_json::json!({
-        "model_path": server_args.model_path(),
-        "served_model_name": server_args.served_model_name(),
-        "tokenizer_path": server_args.tokenizer_path(),
-        "max_context_length": server_args.context_len(),
-        "max_total_num_tokens": server_args.max_total_num_tokens(),
-        "version": server_args.version(),
+        "model_path": server_args.model_path,
+        "served_model_name": server_args.served_model_name,
+        "tokenizer_path": server_args.tokenizer_path,
+        "max_context_length": server_args.model_config.context_len,
+        "max_total_num_tokens": server_args.max_total_num_tokens,
+        "version": server_args.version,
         "internal_states": [serde_json::Value::Object(state_out)],
     });
     serde_json::to_vec(&response).map_err(|e| e.to_string())

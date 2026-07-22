@@ -89,12 +89,16 @@ impl Server {
                 PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("bad http_addr: {e}"))
             })?;
 
-        let tokenizer_worker_num = server_args.tokenizer_worker_num();
-        let detokenizer_worker_num = server_args.detokenizer_worker_num();
+        let tokenizer_worker_num = server_args.tokenizer_worker_num;
+        let detokenizer_worker_num = server_args.detokenizer_worker_num;
         let api_worker_num = server_args.api_worker_num();
 
-        let tokenizer_path = server_args.tokenizer_path();
-        let revision = server_args.revision();
+        // Empty only in minimal standalone blobs (the Python dump always resolves
+        // it); empty → no tokenizer, which `runtime::start` allows only under
+        // `skip_tokenizer_init`.
+        let tokenizer_path =
+            (!server_args.tokenizer_path.is_empty()).then(|| server_args.tokenizer_path.clone());
+        let revision = server_args.revision.clone();
 
         let server_args = std::sync::Arc::new(server_args);
 

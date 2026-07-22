@@ -35,7 +35,7 @@ async fn available_models(State(state): State<AppState>) -> Response {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let name = state.server_args.served_model_name();
+    let name = &state.server_args.served_model_name;
     let base = serde_json::json!({
         "id": name,
         "object": "model",
@@ -43,7 +43,7 @@ async fn available_models(State(state): State<AppState>) -> Response {
         "owned_by": "sglang",
         "root": name,
         "parent": serde_json::Value::Null,
-        "max_model_len": state.server_args.context_len(),
+        "max_model_len": state.server_args.model_config.context_len,
     });
     let list = serde_json::json!({ "object": "list", "data": [base] });
     (
