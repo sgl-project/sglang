@@ -2,7 +2,7 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
-from sglang.srt.runtime_context import get_context, reset_context
+from sglang.srt.runtime_context import get_context, get_exec, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -35,23 +35,25 @@ class TestDeepseekV4SharedExpertFusionPolicy(unittest.TestCase):
         return server_args
 
     def test_disables_shared_fusion_without_enforce(self):
-        server_args = self._publish(enforce=False)
+        self._publish(enforce=False)
         model = self._make_model()
 
         DeepseekV4ForCausalLM.determine_num_fused_shared_experts(model)
 
         self.assertEqual(model.num_fused_shared_experts, 0)
-        # post-init declaration writes through to the published config
-        self.assertTrue(server_args.disable_shared_experts_fusion)
+        # The disable decision is published via declare_load_time_override, which
+        # writes to the runtime-config namespace (get_exec().moe), not to the
+        # ServerArgs record.
+        self.assertTrue(get_exec().moe.disable_shared_experts_fusion)
 
     def test_enables_shared_fusion_when_enforced(self):
-        server_args = self._publish(enforce=True)
+        self._publish(enforce=True)
         model = self._make_model()
 
         DeepseekV4ForCausalLM.determine_num_fused_shared_experts(model)
 
         self.assertEqual(model.num_fused_shared_experts, 1)
-        self.assertFalse(server_args.disable_shared_experts_fusion)
+        self.assertFalse(get_exec().moe.disable_shared_experts_fusion)
 
 
 if __name__ == "__main__":

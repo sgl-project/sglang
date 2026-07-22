@@ -14,6 +14,7 @@ from sglang.srt.layers.quantization.base_config import (  # noqa: E501
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.layers.quantization.quark.schemes import (
     QuarkLinearScheme,
@@ -88,13 +89,14 @@ class QuarkConfig(QuantizationConfig):
 
     def __init__(
         self,
-        quant_config: Optional[dict[str, Any]] = None,
+        quant_config: dict[str, Any] | None = None,
         hf_config: "PretrainedConfig | None" = None,
         kv_cache_group: Optional[list[str]] = None,
         kv_cache_config: Optional[dict[str, Any]] = None,
         pack_method: str = "reorder",
         is_prequantized: bool = False,
         online_scheme: Optional[str] = None,
+        dequantization_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__()
         if kv_cache_group is None:
@@ -112,23 +114,39 @@ class QuarkConfig(QuantizationConfig):
         if quant_config is None:
             raise ValueError("Either quant_config or online_scheme must be provided")
 
+        self.online_scheme = online_scheme
         self.quant_config = quant_config
         self.kv_cache_group = kv_cache_group
         self.kv_cache_config = kv_cache_config
         self.pack_method = pack_method
         self.exclude_layers = cast(list[str], self.quant_config.get("exclude", []))
         self.is_prequantized = is_prequantized
-
+        self.dequantization_config = dequantization_config
         self.packed_modules_mapping = self.quant_config["packed_modules_mapping"]
-        self._quantized_layers = set()
+        self._online_quantized_layers = set()
 
-    @property
-    def quantized_layers(self) -> tuple[list[str], int]:
-        # Extract unique layer types (last part after ".")
-        layer_types = sorted(
-            set(name.split(".")[-1] for name in self._quantized_layers)
+        if isinstance(self.dequantization_config, Fp8Config):
+            self.weight_block_size = self.dequantization_config.weight_block_size
+
+    def log_online_quantization(self) -> None:
+        """
+        Log which layers are using online quantization, as well as a count for each layer type.
+        """
+        # Count layers per type (last two parts after ".")
+        type_counts: dict[str, int] = {}
+        for name in self._online_quantized_layers:
+            parts = name.split(".")
+            layer_type = ".".join(parts[-2:]) if len(parts) >= 2 else parts[-1]
+            type_counts[layer_type] = type_counts.get(layer_type, 0) + 1
+
+        type_counts = dict(sorted(type_counts.items()))
+        count = len(self._online_quantized_layers)
+
+        type_summary = ", ".join(f"{t}: {c}" for t, c in type_counts.items())
+        logger.info_once(
+            f"Online {self.online_scheme} quantization: "
+            f"quantized {count} layers in total ({type_summary})."
         )
-        return layer_types, len(self._quantized_layers)
 
     def get_linear_method(self) -> "QuarkLinearMethod":
         return QuarkLinearMethod(self)
@@ -188,14 +206,18 @@ class QuarkConfig(QuantizationConfig):
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional["QuantizeMethodBase"]:
         # Check if the layer is skipped for quantization.
-
         if should_ignore_layer(
             prefix,
             ignore=self.exclude_layers,
             fused_mapping=self.packed_modules_mapping,
         ):
             if isinstance(layer, LinearBase):
-                return UnquantizedLinearMethod()
+                if self.dequantization_config is not None:
+                    # In case of online requantization, "exclude" means keeping the original precision.
+                    # NOTE: Only FP8 supported for now.
+                    return Fp8LinearMethod(quant_config=self.dequantization_config)
+                else:
+                    return UnquantizedLinearMethod()
             elif isinstance(layer, RadixAttention):
                 return QuarkKVCacheMethod(self)
             return None
@@ -203,17 +225,17 @@ class QuarkConfig(QuantizationConfig):
         if isinstance(layer, LinearBase):
             scheme = self.get_linear_scheme(layer=layer, layer_name=prefix)
             layer.scheme = scheme
-            self._quantized_layers.add(prefix)
+            self._online_quantized_layers.add(prefix)
             return QuarkLinearMethod(self)
 
         if isinstance(layer, RadixAttention):
-            self._quantized_layers.add(prefix)
+            self._online_quantized_layers.add(prefix)
             return QuarkKVCacheMethod(self)
 
         from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
         if isinstance(layer, FusedMoE):
-            self._quantized_layers.add(prefix)
+            self._online_quantized_layers.add(prefix)
             layer.scheme = self.get_moe_scheme(layer, prefix)
             return QuarkFusedMoEMethod(self)
 
@@ -221,6 +243,33 @@ class QuarkConfig(QuantizationConfig):
 
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> "QuarkConfig":
+        if config["quant_method"] != "quark":
+            assert "requantization_method" in config
+
+            if (
+                config["quant_method"] == "fp8"
+                and config["requantization_method"] == "quark_mxfp4"
+                and config["activation_scheme"] == "dynamic"
+            ):
+                hf_config = config["hf_config"]
+                quant_config = QuarkConfig._create_online_mxfp4_config(
+                    model_type=hf_config.model_type
+                )
+                dequantization_config = Fp8Config.from_config(config)
+                quark_config = cls(
+                    quant_config=quant_config,
+                    hf_config=hf_config,
+                    is_prequantized=False,
+                    dequantization_config=dequantization_config,
+                    online_scheme=config["requantization_method"],
+                )
+            else:
+                raise NotImplementedError(
+                    f"Requantization into {config['requantization_method']} is not supported, from the original quant_method={config['quant_method']} and activation_scheme={config['activation_scheme']}. "
+                )
+
+            return quark_config
+
         export_config = config.get("export")
         if export_config is None:
             raise ValueError(
@@ -305,7 +354,17 @@ class QuarkConfig(QuantizationConfig):
             "re:.*embed_tokens",
         ]
 
-        if model_type == "qwen3_5_moe":
+        # Exclusion for accuracy adapted from
+        # https://huggingface.co/amd/DeepSeek-V3.2-mxfp4/blob/main/config.json
+        if model_type in ["deepseek_v3", "deepseek_v32"]:
+            exclude.extend(
+                [
+                    "re:.*model.layers.61.*",
+                    "re:.*self_attn.*",
+                    "re:.*mlp.gate$",
+                ]
+            )
+        elif model_type == "qwen3_5_moe":
             # Exclusion for accuracy adapted from
             # https://huggingface.co/amd/Qwen3.5-397B-A17B-MXFP4/blob/main/config.json
             exclude.extend(
@@ -565,6 +624,7 @@ class QuarkConfig(QuantizationConfig):
                 weight_config,
                 input_config,
                 is_checkpoint_mxfp4_serialized=self.is_prequantized,
+                dequantization_config=self.dequantization_config,
             )
         if self._is_fp8_w8a8_block(weight_config, input_config):
             self._check_scheme_supported(QuarkW8A8Fp8Block.get_min_capability())
@@ -618,6 +678,7 @@ class QuarkConfig(QuantizationConfig):
                 weight_config,
                 input_config,
                 is_checkpoint_mxfp4_serialized=self.is_prequantized,
+                dequantization_config=self.dequantization_config,
             )
         elif self._is_mx_w4a8(weight_config, input_config):
             logger.info_once("Using Quark MXFP4-W/FP8-A MoE scheme")
@@ -684,9 +745,13 @@ class QuarkLinearMethod(LinearMethodBase):
 
     def __init__(self, quantization_config: QuarkConfig):
         self.quantization_config = quantization_config
+        self.quant_config = quantization_config
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         layer.scheme.process_weights_after_loading(layer)
+
+        if self.quantization_config.online_scheme is not None:
+            self.quantization_config.log_online_quantization()
 
     def create_weights(
         self,
@@ -739,6 +804,9 @@ class QuarkFusedMoEMethod(FusedMoEMethodBase):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         layer.scheme.process_weights_after_loading(layer)
+
+        if self.quantization_config.online_scheme is not None:
+            self.quantization_config.log_online_quantization()
 
     def create_weights(
         self,

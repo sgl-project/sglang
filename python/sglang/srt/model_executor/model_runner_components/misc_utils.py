@@ -24,6 +24,12 @@ def maybe_disable_chunked_prefix_cache(
     # model's (often non-MLA) config must not flip the shared setting.
     if is_draft_worker:
         return
+
+    # This is a load-time gate that runs in ModelRunner.__init__ BEFORE the
+    # runner publishes its config (and direct/benchmark construction never
+    # publishes earlier), so read/write the supplied server_args. The runner's
+    # subsequent publish snapshots this into the schedule bag for get_schedule()
+    # readers.
     if (
         not use_mla_backend
         or server_args.attention_backend

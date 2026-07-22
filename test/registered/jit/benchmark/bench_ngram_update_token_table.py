@@ -7,7 +7,7 @@ from sglang.jit_kernel.benchmark.utils import (
     get_benchmark_range,
     run_benchmark_no_cudagraph,
 )
-from sglang.jit_kernel.ngram_embedding import (
+from sglang.kernels.ops.speculative.ngram_embedding import (
     update_token_table,
     update_token_table_decode,
 )
