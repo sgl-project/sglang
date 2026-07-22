@@ -42,6 +42,7 @@ from typing import (
 
 import aiohttp
 import numpy as np
+import orjson
 import requests
 import uvicorn
 import uvloop
@@ -60,6 +61,7 @@ from fastapi import (
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
+from fastapi.routing import APIRoute
 
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
@@ -416,10 +418,35 @@ async def lifespan(fast_api_app: FastAPI):
 
 
 # Fast API
+class ORJSONRequest(Request):
+    """Request whose ``json()`` uses orjson.
+
+    Large multimodal chat bodies (data-URL images are tens of MB) otherwise
+    pay stdlib ``json.loads`` inside FastAPI's dependency resolution; orjson
+    parses the same bytes several times faster with identical semantics.
+    """
+
+    async def json(self) -> Any:
+        if not hasattr(self, "_json"):
+            self._json = orjson.loads(await self.body())
+        return self._json
+
+
+class ORJSONRoute(APIRoute):
+    def get_route_handler(self):
+        original_handler = super().get_route_handler()
+
+        async def custom_handler(request: Request):
+            return await original_handler(ORJSONRequest(request.scope, request.receive))
+
+        return custom_handler
+
+
 app = FastAPI(
     lifespan=lifespan,
     openapi_url=None if get_bool_env_var("DISABLE_OPENAPI_DOC") else "/openapi.json",
 )
+app.router.route_class = ORJSONRoute
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
