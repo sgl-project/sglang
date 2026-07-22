@@ -25,7 +25,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     input_to_float8,
     normalize_e4m3fn_to_e4m3fnuz,
 )
-from sglang.srt.utils import set_weight_attrs
+from sglang.srt.utils import get_bool_env_var, is_hip, set_weight_attrs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -34,6 +34,10 @@ if TYPE_CHECKING:
     )
 
 _is_fp8_fnuz = is_fp8_fnuz()
+# Route per-channel (PTPC) MoE through the aiter asm fused_moe(per_Token) on fnuz
+# HIP (gfx942). The upstream Triton per-channel fnuz MoE path produces corrupted
+# output on gfx942, so the checkpoint decodes to garbage without this.
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
 
 class W8A8Fp8Config(QuantizationConfig):
@@ -219,13 +223,25 @@ class W8A8FP8MoEMethod(FusedMoEMethodBase):
     ):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
+        # For an offline-quantized (OCP e4m3fn) checkpoint, create the expert
+        # weight params as e4m3fn so the loader copy_ is bit-faithful. On fnuz
+        # hardware (gfx942/MI300) we later reinterpret+rescale via
+        # normalize_e4m3fn_to_e4m3fnuz in process_weights_after_loading. Creating
+        # them as fp8_dtype (e4m3fnuz) here would make copy_ value-convert, which
+        # NaNs every checkpoint weight whose magnitude exceeds the fnuz max (240).
+        weight_dtype = (
+            torch.float8_e4m3fn
+            if self.quant_config.is_checkpoint_fp8_serialized
+            else fp8_dtype
+        )
+
         # WEIGHTS
         w13_weight = torch.nn.Parameter(
             torch.empty(
                 num_experts,
                 2 * intermediate_size_per_partition,
                 hidden_size,
-                dtype=fp8_dtype,
+                dtype=weight_dtype,
             ),
             requires_grad=False,
         )
@@ -237,7 +253,7 @@ class W8A8FP8MoEMethod(FusedMoEMethodBase):
                 num_experts,
                 hidden_size,
                 intermediate_size_per_partition,
-                dtype=fp8_dtype,
+                dtype=weight_dtype,
             ),
             requires_grad=False,
         )
@@ -271,20 +287,49 @@ class W8A8FP8MoEMethod(FusedMoEMethodBase):
         layer.register_parameter("w2_input_scale", w2_input_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        layer.w13_weight = Parameter(layer.w13_weight, requires_grad=False)
-        layer.w2_weight = Parameter(layer.w2_weight, requires_grad=False)
-        layer.w13_weight_scale = Parameter(
-            layer.w13_weight_scale.data, requires_grad=False
-        )
-        layer.w2_weight_scale = Parameter(
-            layer.w2_weight_scale.data, requires_grad=False
-        )
+        # On fnuz hardware (gfx942/MI300) the experts were loaded bit-faithfully
+        # as OCP e4m3fn; reinterpret to e4m3fnuz and double the scale so the
+        # per-channel dequant matches the checkpoint without overflow.
+        if _is_fp8_fnuz and layer.w13_weight.dtype == torch.float8_e4m3fn:
+            w13_weight, w13_weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
+                weight=layer.w13_weight, weight_scale=layer.w13_weight_scale
+            )
+            w2_weight, w2_weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
+                weight=layer.w2_weight, weight_scale=layer.w2_weight_scale
+            )
+            layer.w13_weight = Parameter(w13_weight, requires_grad=False)
+            layer.w2_weight = Parameter(w2_weight, requires_grad=False)
+            layer.w13_weight_scale = Parameter(w13_weight_scale, requires_grad=False)
+            layer.w2_weight_scale = Parameter(w2_weight_scale, requires_grad=False)
+        else:
+            layer.w13_weight = Parameter(layer.w13_weight, requires_grad=False)
+            layer.w2_weight = Parameter(layer.w2_weight, requires_grad=False)
+            layer.w13_weight_scale = Parameter(
+                layer.w13_weight_scale.data, requires_grad=False
+            )
+            layer.w2_weight_scale = Parameter(
+                layer.w2_weight_scale.data, requires_grad=False
+            )
+
+        if _use_aiter:
+            # aiter asm fused_moe expects MFMA-shuffled expert weights.
+            from aiter.ops.shuffle import shuffle_weight
+
+            layer.w13_weight = Parameter(
+                shuffle_weight(layer.w13_weight.data.contiguous(), (16, 16)),
+                requires_grad=False,
+            )
+            layer.w2_weight = Parameter(
+                shuffle_weight(layer.w2_weight.data.contiguous(), (16, 16)),
+                requires_grad=False,
+            )
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
-        self.runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
+        backend = MoeRunnerBackend.AITER if _use_aiter else MoeRunnerBackend.TRITON
+        self.runner = MoeRunner(backend, moe_runner_config)
 
     def get_triton_quant_info(self, layer: torch.nn.Module) -> TritonMoeQuantInfo:
         return TritonMoeQuantInfo(
@@ -303,6 +348,21 @@ class W8A8FP8MoEMethod(FusedMoEMethodBase):
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
+
+        if _use_aiter:
+            from sglang.srt.layers.moe.moe_runner.aiter import (
+                AiterMoeQuantInfo,
+                AiterQuantType,
+            )
+
+            quant_info = AiterMoeQuantInfo(
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                quant_type=AiterQuantType.PER_TOKEN,
+                w13_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+            )
+            return self.runner.run(dispatch_output, quant_info)
 
         quant_info = self.get_triton_quant_info(layer)
         return self.runner.run(dispatch_output, quant_info)
