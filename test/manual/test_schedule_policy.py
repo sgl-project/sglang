@@ -3,6 +3,7 @@ from array import array
 from unittest.mock import patch
 
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.managers.intra_turn_prefix_cache import build_intra_turn_prefix_plan
 from sglang.srt.managers.schedule_policy import (
     CacheAgnosticPolicy,
     CacheAwarePolicy,
@@ -121,6 +122,25 @@ class TestSchedulePolicy(CustomTestCase):
             [req.defer_for_in_batch_prefix_cache for req in waiting_queue],
             [False, False, True, True],
         )
+
+    def test_build_intra_turn_prefix_plan(self):
+        shared_prefix = list(range(64))
+        reqs = [
+            _make_req(1, "shared seed", shared_prefix + [1]),
+            _make_req(2, "shared duplicate", shared_prefix + [2]),
+            _make_req(3, "unrelated", [1000, 1001]),
+        ]
+        for req in reqs:
+            req.init_next_round_input(self.tree_cache)
+            req.set_extend_range(len(req.prefix_indices), len(req.origin_input_ids))
+
+        plan = build_intra_turn_prefix_plan(reqs, min_shared_new_tokens=32)
+
+        self.assertIsNotNone(plan)
+        self.assertEqual([req.rid for req in plan.stage.reqs], [1, 2])
+        self.assertEqual(plan.stage.common_prefix_len, 64)
+        self.assertEqual(plan.stage.stage_new_tokens, 64)
+        self.assertEqual(plan.stage.estimated_saved_tokens, 64)
 
     def test_calc_priority_priority_enabled_fcfs_scheduling(self):
         tree_cache = RadixCache.create_simulated()
