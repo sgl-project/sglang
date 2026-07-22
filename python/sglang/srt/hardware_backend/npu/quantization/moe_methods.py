@@ -332,7 +332,7 @@ class NPUW8A8Int8MoEMethod(_NPUMoEMethodBase):
 
         # Process weight
         weight: torch.Tensor = getattr(layer, f"{weight_prefix}_weight")
-        weight.data = npu_format_cast(weight.data.transpose(1, 2))
+        weight.data = npu_format_cast(weight.data.transpose(1, 2).contiguous())
         setattr(
             layer,
             f"{weight_prefix}_weight",
