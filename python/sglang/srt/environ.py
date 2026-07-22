@@ -768,6 +768,13 @@ class Envs:
     # output and the latent|shared MoE reduce; everything else falls back to
     # the regular all-reduce path. See srt/layers/k3_ar_fusion.py.
     SGLANG_K3_AR_FUSION = EnvBool(False)
+    # Defer the trtllm-gen MoE finalize (top-k weighted unpermute) out of the
+    # fused-MoE op: KimiK3MoE._forward_fused receives the permuted gemm2
+    # output + routing weights + index map and fuses the finalize into the
+    # push all-reduce (+RMSNorm) staging pass. flashinfer_mxfp4 + situ (the
+    # packed-routing trtllm-gen path) only; sizes beyond the push window
+    # fall back to the in-op finalize.
+    SGLANG_K3_DEFER_MOE_FINALIZE = EnvBool(False)
     # AttnRes aggregation backend:
     # fast (optimized CUDA, SM100+/H=7168 only) | fused (triton) | jit (CUDA)
     # | torch | legacy

@@ -1378,7 +1378,14 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     packed_topk = PackTopkIds.execute(
                         topk_output.topk_ids, topk_output.topk_weights
                     )
-                    situ_moe.trtllm_fp4_block_scale_routed_moe(
+                    # Deferred finalize (K3 forward_deferred_finalize): return
+                    # the finalize inputs instead of the finalized output.
+                    from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+                        _deferred_finalize_enabled,
+                    )
+
+                    defer_finalize = _deferred_finalize_enabled.get()
+                    result = situ_moe.trtllm_fp4_block_scale_routed_moe(
                         packed_topk_ids=packed_topk,
                         hidden_states=x_quant,
                         hidden_states_scale=x_scale,
@@ -1398,8 +1405,21 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                         intermediate_size=self.intermediate_size_per_partition,
                         activation_type=situ_moe.ACTIVATION_SITU,
                         output=symm_output,
+                        do_finalize=not defer_finalize,
                     )
-                    return StandardCombineInput(hidden_states=symm_output)
+                    if defer_finalize:
+                        from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+                            FlashInferTrtllmDeferredFinalizeOutput,
+                        )
+
+                        gemm2_out, topk_weights, expanded_idx = result
+                        result = FlashInferTrtllmDeferredFinalizeOutput(
+                            gemm2_out=gemm2_out,
+                            expert_weights=topk_weights,
+                            expanded_idx_to_permuted_idx=expanded_idx,
+                            top_k=packed_topk.shape[1],
+                        )
+                    return StandardCombineInput(hidden_states=result)
 
                 # Bypassed topk: route from logits inside the op.
                 correction_bias = topk_output.topk_config.correction_bias

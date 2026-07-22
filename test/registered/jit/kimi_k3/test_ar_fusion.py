@@ -247,6 +247,179 @@ def test_ar_fusion_push_norm(num_tokens: int, rows_per_token: int):
     _assert_norm_close(x, ref, num_tokens)
 
 
+FIN_TOPK = 16
+
+
+def _build_permuted_layout(num_tokens: int, seed: int):
+    """trtllm-gen permuted gemm2 layout (rows grouped by expert, per-expert
+    tile padding). Deterministic on CPU: idx/weights are identical on every
+    rank (TP semantics — same routing), gemm2 values are per-rank."""
+    num_experts, tile = 896, 8
+    gen = torch.Generator(device="cpu").manual_seed(seed)
+    topk_ids = torch.stack(
+        [torch.randperm(num_experts, generator=gen)[:FIN_TOPK] for _ in range(num_tokens)]
+    )
+    counts = torch.bincount(topk_ids.flatten(), minlength=num_experts)
+    padded = (counts + tile - 1) // tile * tile
+    bases = torch.cumsum(padded, 0) - padded
+    fill = torch.zeros(num_experts, dtype=torch.long)
+    idx = torch.empty(num_tokens * FIN_TOPK, dtype=torch.int32)
+    for i, e in enumerate(topk_ids.flatten().tolist()):
+        idx[i] = bases[e] + fill[e]
+        fill[e] += 1
+    weights = torch.rand(num_tokens, FIN_TOPK, generator=gen).to(torch.bfloat16)
+    num_rows = int(padded.sum())
+    g = torch.Generator(device="cpu").manual_seed(seed * 31 + dist.get_rank())
+    gemm2 = (torch.randn(num_rows, NORM_DIM, generator=g) * 2).to(torch.bfloat16)
+    dev = _device()
+    return gemm2.to(dev), idx.to(dev), weights.to(dev)
+
+
+def _finalize_norm_ref(gemm2, idx, weights, norm_w, eps: float) -> torch.Tensor:
+    """Replicates the fused kernel numerics: fp32 ascending-k local finalize
+    cast to bf16 (the staged push value), rank-ordered fp32 cross-rank sum,
+    fp32 RMSNorm. Only the rsqrt may differ from the kernel by ulps."""
+    num_tokens = weights.shape[0]
+    idx2 = idx.view(num_tokens, FIN_TOPK).long()
+    acc = torch.zeros(num_tokens, NORM_DIM, dtype=torch.float32, device=gemm2.device)
+    for k in range(FIN_TOPK):
+        acc += weights[:, k, None].float() * gemm2[idx2[:, k]].float()
+    local = acc.to(torch.bfloat16)
+    world = dist.get_world_size()
+    gathered = [torch.empty_like(local) for _ in range(world)]
+    dist.all_gather(gathered, local, group=_init_nccl_group())
+    total = torch.zeros_like(acc)
+    for r in range(world):
+        total += gathered[r].float()
+    factor = torch.rsqrt(total.square().mean(dim=-1, keepdim=True) + eps)
+    return (total * factor * norm_w.float()).to(torch.bfloat16)
+
+
+@pytest.mark.parametrize("bs", PUSH_BS)
+@torch.inference_mode()
+def test_ar_fusion_finalize_push_norm(bs: int):
+    comm = _init_comm()
+    world = comm.world_size
+    eps = 1e-6
+    gemm2, idx, weights = _build_permuted_layout(bs, seed=bs + 23)
+    g = torch.Generator(device="cpu").manual_seed(77)
+    norm_w = (torch.rand(NORM_DIM, generator=g) + 0.5).to(torch.bfloat16).to(_device())
+    ref = _finalize_norm_ref(gemm2, idx, weights, norm_w, eps)
+    out = torch.empty(bs, NORM_DIM, dtype=torch.bfloat16, device=_device())
+    all_reduce.finalize_all_reduce_push_norm(
+        world, out, gemm2, idx, weights, norm_w, eps, ws_mc_base=comm.mc_base_ptr
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+
+@torch.inference_mode()
+def test_ar_fusion_finalize_push_norm_stress():
+    """Back-to-back fused calls interleaved with plain pushes exercise the
+    shared push-workspace phase double-buffering across kernel variants."""
+    comm = _init_comm()
+    world = comm.world_size
+    eps = 1e-5
+    g = torch.Generator(device="cpu").manual_seed(78)
+    norm_w = (torch.rand(NORM_DIM, generator=g) + 0.5).to(torch.bfloat16).to(_device())
+    for it in range(12):
+        bs = (1, 8, 32)[it % 3]
+        gemm2, idx, weights = _build_permuted_layout(bs, seed=9000 + it)
+        ref = _finalize_norm_ref(gemm2, idx, weights, norm_w, eps)
+        out = torch.empty(bs, NORM_DIM, dtype=torch.bfloat16, device=_device())
+        all_reduce.finalize_all_reduce_push_norm(
+            world, out, gemm2, idx, weights, norm_w, eps, ws_mc_base=comm.mc_base_ptr
+        )
+        torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+        x = _int_input(bs * H, 8000 + it, per_rank=True)
+        ref2 = _nccl_ref(x, None)
+        all_reduce.all_reduce_push_res(world, x, None, ws_mc_base=comm.mc_base_ptr)
+        torch.testing.assert_close(x, ref2, atol=0, rtol=0)
+
+
+@torch.inference_mode()
+def test_ar_fusion_finalize_push_norm_perf():
+    """Not an assertion — prints the crossover sweep so perf regressions and
+    dispatch-threshold drift show up in the log. Three implementations:
+
+      fused     finalize+AR+norm in ONE push kernel (finalize_push_norm)
+      fin+arn   standalone finalize kernel -> production-optimal fused
+                AR+norm (push_norm <= 512KB else pull_norm) — the STRONG
+                baseline: the fused kernel must beat this to earn its slot,
+                and where it stops winning is the finalize_push_fits bound
+      fin+ar+n  finalize -> plain push AR -> jit rmsnorm (unfused norm)
+
+    Steady-state loop timing, all ranks in lockstep; rank 0 prints.
+    """
+    from sglang.jit_kernel.kimi_k3 import moe_finalize
+    from sglang.jit_kernel.norm import rmsnorm
+
+    comm = _init_comm()
+    world = comm.world_size
+    cpu_group = _init_world()
+    buf, mc = _init_pool_buf()
+    eps = 1e-6
+    push_max_bytes = 512 * 1024  # k3_ar_fusion._PUSH_MAX_BYTES
+    g = torch.Generator(device="cpu").manual_seed(79)
+    norm_w = (torch.rand(NORM_DIM, generator=g) + 0.5).to(torch.bfloat16).to(_device())
+    iters = 50
+
+    def time_loop(fn) -> float:
+        for _ in range(5):
+            fn()
+        torch.cuda.synchronize()
+        dist.barrier(group=cpu_group)
+        start, end = torch.cuda.Event(True), torch.cuda.Event(True)
+        start.record()
+        for _ in range(iters):
+            fn()
+        end.record()
+        torch.cuda.synchronize()
+        return start.elapsed_time(end) / iters * 1000  # us
+
+    rows = []
+    for bs in (1, 4, 8, 16, 32, 64, 128, 256):
+        gemm2, idx, weights = _build_permuted_layout(bs, seed=600 + bs)
+        out = torch.empty(bs, NORM_DIM, dtype=torch.bfloat16, device=_device())
+        x = buf[: bs * NORM_DIM]  # symm-pool target for the pull-normed baseline
+        use_push = bs * NORM_DIM * 2 <= push_max_bytes
+
+        def fused():
+            all_reduce.finalize_all_reduce_push_norm(
+                world, out, gemm2, idx, weights, norm_w, eps, ws_mc_base=comm.mc_base_ptr
+            )
+
+        def fin_arnorm():
+            moe_finalize(gemm2, idx, weights, out=x.view(bs, NORM_DIM))
+            if use_push:
+                all_reduce.all_reduce_push_norm(
+                    world, x, norm_w, eps, num_norm_rows=bs, ws_mc_base=comm.mc_base_ptr
+                )
+            else:
+                all_reduce.all_reduce_pull_norm(
+                    world, x, norm_w, eps, num_norm_rows=bs, input_mc_ptr=mc
+                )
+
+        def fin_ar_norm():
+            moe_finalize(gemm2, idx, weights, out=out)
+            all_reduce.all_reduce_push_res(world, out, None, ws_mc_base=comm.mc_base_ptr)
+            rmsnorm(out, norm_w, eps=eps)
+
+        rows.append(
+            (bs, use_push, time_loop(fused), time_loop(fin_arnorm), time_loop(fin_ar_norm))
+        )
+
+    if dist.get_rank() == 0:
+        print("\nfinalize+AR+norm crossover sweep (us/call, world=%d):" % world)
+        print("  bs    | fused   | fin+arn (disp) | fin+ar+n | fused saving vs strong")
+        for bs, use_push, f, strong, weak in rows:
+            disp = "push" if use_push else "pull"
+            print(
+                f"  bs={bs:4d}  {f:7.2f}   {strong:7.2f} ({disp})   {weak:7.2f}"
+                f"   {strong - f:+6.2f}us ({strong / f:4.2f}x)"
+            )
+
+
 @pytest.mark.parametrize("num_blocks", [1, 4, 16])
 @pytest.mark.parametrize("unroll", [4, 8])
 @torch.inference_mode()
