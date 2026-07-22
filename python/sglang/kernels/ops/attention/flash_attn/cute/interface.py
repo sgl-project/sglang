@@ -692,7 +692,12 @@ def _flash_attn_fwd(
 
     # SplitKV uses float32 partial output, which doubles the O buffer size
     # in shared memory, causing OOM for diff-headdim (192, 128)
-    if arch // 10 in [10, 11] and head_dim != head_dim_v and num_splits > 1:
+    if (
+        arch // 10 in [10, 11]
+        and head_dim != head_dim_v
+        and num_splits > 1
+        and not (page_table is not None and q_stage == 1)
+    ):
         if num_n_blocks >= 64 and head_dim_v != 512:
             tile_n = 64
             num_n_blocks = (seqlen_k_loaded + tile_n - 1) // tile_n

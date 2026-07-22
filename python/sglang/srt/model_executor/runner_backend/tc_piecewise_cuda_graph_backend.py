@@ -35,6 +35,7 @@ from sglang.srt.compilation.compile_phase import (
     enable_torch_compile_warmup,
     set_pcg_capture_stream,
 )
+from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
@@ -177,6 +178,7 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
                     )
                 set_graph_pool_id(self._pool)
 
+                set_torch_compile_config()
                 self.install_compile(
                     inner_model,
                     compile_config=self._compile_config,

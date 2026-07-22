@@ -195,11 +195,9 @@ class NVILAForConditionalGeneration(nn.Module):
             for x, block_size in zip(vision_features_list, block_sizes)
         ]
 
-        vision_features = torch.stack(
+        vision_features = torch.cat(
             [einops.rearrange(x, "1 c h w -> (h w) c") for x in vision_features_list]
         )
-
-        vision_features = einops.rearrange(vision_features, "n p d -> (n p) d")
 
         return vision_features
 
