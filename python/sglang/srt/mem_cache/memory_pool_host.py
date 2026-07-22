@@ -2042,3 +2042,182 @@ class DSAIndexerPoolHost(HostKVCache):
             self.index_k_with_scale_buffer.data_ptr() % page_size_bytes == 0
             and page_stride_bytes % page_size_bytes == 0
         )
+
+
+class HiSparseMHATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
+    """Host pool for MHA K/V (MiniMax M3 HiSparse).
+
+    Allocates per-layer K and V buffers in CPU pinned memory.
+    """
+
+    def __init__(
+        self,
+        device_pool,
+        host_to_device_ratio: int,
+        page_size: int,
+    ):
+        self.head_num = device_pool.head_num
+        self.head_dim = device_pool.head_dim
+        self.v_head_dim = device_pool.v_head_dim
+        super().__init__(
+            device_pool=device_pool,
+            host_to_device_ratio=host_to_device_ratio,
+            host_size=0,
+            page_size=page_size,
+            layout="layer_first",
+            pin_memory=True,
+            device="cpu",
+            allocator_type="default",
+        )
+        self.token_stride_size_k = self.head_num * self.head_dim * self.dtype.itemsize
+        self.token_stride_size_v = self.head_num * self.v_head_dim * self.dtype.itemsize
+        self.token_stride_size = self.token_stride_size_k
+
+    def get_size_per_token(self):
+        self.layer_num = self._effective_host_layer_num()
+        k_per_token = self.head_num * self.head_dim * self.dtype.itemsize
+        v_per_token = self.head_num * self.v_head_dim * self.dtype.itemsize
+        return (k_per_token + v_per_token) * self.layer_num
+
+    def get_ksize_per_token(self):
+        self.layer_num = self._effective_host_layer_num()
+        return self.head_num * self.head_dim * self.dtype.itemsize * self.layer_num
+
+    def init_kv_buffer(self):
+        alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
+        k_dims = (self.layer_num, self.size, self.head_num, self.head_dim)
+        v_dims = (self.layer_num, self.size, self.head_num, self.v_head_dim)
+        self.k_host_buffer = alloc_func(
+            k_dims,
+            dtype=self.dtype,
+            device=self.device,
+            pin_memory=self.pin_memory,
+            allocator=self.allocator,
+        )
+        self.v_host_buffer = alloc_func(
+            v_dims,
+            dtype=self.dtype,
+            device=self.device,
+            pin_memory=self.pin_memory,
+            allocator=self.allocator,
+        )
+        self.k_data_ptrs = torch.tensor(
+            [self.k_host_buffer[i].data_ptr() for i in range(self.layer_num)],
+            dtype=torch.uint64,
+            device=self.device_pool.device,
+        )
+        self.v_data_ptrs = torch.tensor(
+            [self.v_host_buffer[i].data_ptr() for i in range(self.layer_num)],
+            dtype=torch.uint64,
+            device=self.device_pool.device,
+        )
+        self.data_ptrs = torch.cat([self.k_data_ptrs, self.v_data_ptrs], dim=0)
+        return self.k_host_buffer
+
+    def backup_from_device_all_layer(
+        self, device_pool, host_indices, device_indices, io_backend
+    ):
+        for layer_id in range(device_pool.start_layer, device_pool.end_layer):
+            self._backup_one_layer(
+                device_pool=device_pool,
+                host_indices=host_indices,
+                device_indices=device_indices,
+                layer_id=layer_id,
+            )
+
+    def _backup_one_layer(
+        self,
+        device_pool,
+        host_indices: torch.Tensor,
+        device_indices: torch.Tensor,
+        layer_id: int,
+    ):
+        host_layer = layer_id - device_pool.start_layer
+        transfer_kv_per_layer_mla(
+            src=device_pool.get_key_buffer(layer_id),
+            dst=self.k_host_buffer[host_layer],
+            src_indices=device_indices,
+            dst_indices=host_indices,
+            item_size=self.token_stride_size_k,
+        )
+        transfer_kv_per_layer_mla(
+            src=device_pool.get_value_buffer(layer_id),
+            dst=self.v_host_buffer[host_layer],
+            src_indices=device_indices,
+            dst_indices=host_indices,
+            item_size=self.token_stride_size_v,
+        )
+
+    def load_to_device_per_layer(
+        self, device_pool, host_indices, device_indices, layer_id, io_backend
+    ):
+        host_layer = layer_id - device_pool.start_layer
+        transfer_kv_per_layer_mla(
+            src=self.k_host_buffer[host_layer],
+            dst=device_pool.get_key_buffer(layer_id),
+            src_indices=host_indices,
+            dst_indices=device_indices,
+            item_size=self.token_stride_size_k,
+        )
+        transfer_kv_per_layer_mla(
+            src=self.v_host_buffer[host_layer],
+            dst=device_pool.get_value_buffer(layer_id),
+            src_indices=host_indices,
+            dst_indices=device_indices,
+            item_size=self.token_stride_size_v,
+        )
+
+    def get_contiguous_buf_infos(self):
+        k_ptrs = [int(self.k_data_ptrs[i].item()) for i in range(self.layer_num)]
+        v_ptrs = [int(self.v_data_ptrs[i].item()) for i in range(self.layer_num)]
+        k_lens = [self.k_host_buffer[i].nbytes for i in range(self.layer_num)]
+        v_lens = [self.v_host_buffer[i].nbytes for i in range(self.layer_num)]
+        k_item = [self.token_stride_size_k * self.page_size] * self.layer_num
+        v_item = [self.token_stride_size_v * self.page_size] * self.layer_num
+        return k_ptrs + v_ptrs, k_lens + v_lens, k_item + v_item
+
+    def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
+        k_page = self.k_host_buffer[:, index : index + self.page_size, :, :]
+        v_page = self.v_host_buffer[:, index : index + self.page_size, :, :]
+        data_page = torch.cat([k_page.flatten(), v_page.flatten()])
+        if not flat:
+            return data_page.unsqueeze(0)
+        return data_page
+
+    def get_dummy_flat_data_page(self) -> torch.Tensor:
+        k_dummy = torch.zeros(
+            self.layer_num,
+            self.page_size,
+            self.head_num,
+            self.head_dim,
+            dtype=self.dtype,
+            device=self.device,
+            pin_memory=self.pin_memory,
+        )
+        v_dummy = torch.zeros(
+            self.layer_num,
+            self.page_size,
+            self.head_num,
+            self.v_head_dim,
+            dtype=self.dtype,
+            device=self.device,
+            pin_memory=self.pin_memory,
+        )
+        return torch.cat([k_dummy.flatten(), v_dummy.flatten()])
+
+    def set_from_flat_data_page(self, index: int, data_page: torch.Tensor) -> None:
+        k_numel = self.layer_num * self.page_size * self.head_num * self.head_dim
+        k_flat = data_page[:k_numel]
+        v_flat = data_page[k_numel:]
+        self.k_host_buffer[:, index : index + self.page_size, :, :] = k_flat.reshape(
+            self.layer_num,
+            self.page_size,
+            self.head_num,
+            self.head_dim,
+        )
+        self.v_host_buffer[:, index : index + self.page_size, :, :] = v_flat.reshape(
+            self.layer_num,
+            self.page_size,
+            self.head_num,
+            self.v_head_dim,
+        )

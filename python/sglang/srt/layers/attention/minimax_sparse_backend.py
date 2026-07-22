@@ -154,12 +154,72 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         )
         self.dense_backend: Optional[AttentionBackend] = None
 
+        self.hisparse_coordinator = getattr(runner, "hisparse_coordinator", None)
+        if self.hisparse_coordinator is not None:
+            self._loc_mapping = (
+                self.kv_pool.main_pool.full_to_hisparse_device_index_mapping
+            )
+            self._hisparse_block_offsets = torch.arange(
+                self.block_size_k, device=runner.device, dtype=torch.int32
+            )
+        else:
+            self._loc_mapping = None
+            self._hisparse_block_offsets = None
+
         logger.info(
             f"[MiniMaxSparse] Backend initialized "
             f"(score_type={self.score_type!r}, "
             f"main_attn={'MSA' if self.use_msa else 'triton'}, "
+            f"hisparse={'enabled' if self._loc_mapping is not None else 'disabled'}, "
             f"disable_value_layers={sorted(self.disable_value_layer_ids)})"
         )
+
+    def _hisparse_swap_in_blocks(
+        self,
+        forward_batch: ForwardBatch,
+        topk_idx: torch.Tensor,
+        layer_id: int,
+    ) -> torch.Tensor:
+        """Expand block-level topk_idx to token positions, swap-in from host,
+        and return hisparse_slots for the attention kernel.
+
+        Returns: hisparse_slots [batch, topk_blocks * block_size] — device locs
+        that the kernel reads directly instead of going through req_to_token.
+        All operations are CUDA tensor ops, graph-safe.
+        """
+        num_kv_heads, batch_size, topk = topk_idx.shape
+
+        # Expand blocks to tokens using pre-allocated offsets
+        token_positions = (
+            topk_idx.unsqueeze(-1) * self.block_size_k + self._hisparse_block_offsets
+        )
+        # [kv_heads, batch, topk * block_size] → flatten per head
+        token_positions = token_positions.reshape(num_kv_heads, batch_size, -1)
+        # Concatenate heads: [batch, kv_heads * topk * block_size]
+        token_positions = token_positions.permute(1, 0, 2).reshape(batch_size, -1)
+
+        # Clamp invalid token positions:
+        #  - topk_idx contains -1 padding → block expansion yields negatives
+        #  - partial last block extends past seq_len → no host-backed KV data
+        # Clamp to [0, seq_len-1].  Duplicates of seq_len-1 (newest_token)
+        # are correctly counted by the kernel via atomicAdd on s_newest_hit.
+        max_pos = (forward_batch.seq_lens.unsqueeze(1) - 1).to(token_positions.dtype)
+        token_positions = token_positions.clamp(min=0).clamp(max=max_pos)
+
+        top_k_device_locs = self.hisparse_coordinator.swap_in_selected_pages(
+            req_pool_indices=forward_batch.req_pool_indices,
+            compressed_seq_lens=forward_batch.seq_lens,
+            top_k_result=token_positions,
+            layer_id=layer_id,
+        )
+
+        # top_k_device_locs: [batch, kv_heads * topk * block_size]
+        # Reshape back to per-kv-head layout: [kv_heads, batch, topk * block_size]
+        n_per_head = topk * self.block_size_k
+        hisparse_slots_all = top_k_device_locs.reshape(
+            batch_size, num_kv_heads, n_per_head
+        ).permute(1, 0, 2)
+        return hisparse_slots_all
 
     def init_forward_metadata_out_graph(
         self, forward_batch: ForwardBatch, in_capture: bool = False
@@ -346,6 +406,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             disable_index_value=disable_value,
             use_msa=self.use_msa,
             seqlens_cpu=forward_batch.extend_seq_lens_cpu,
+            loc_mapping=self._loc_mapping,
         )
 
         if actual_num_tokens < original_num_tokens:
@@ -458,6 +519,16 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                     "did not prepare the plan for this forward (gate mismatch)."
                 )
 
+        hisparse_swap_in_fn = None
+        if self.hisparse_coordinator is not None:
+
+            def hisparse_swap_in_fn(topk_idx):
+                return self._hisparse_swap_in_blocks(
+                    forward_batch=forward_batch,
+                    topk_idx=topk_idx,
+                    layer_id=layer.layer_id,
+                )
+
         idx_o, o = minimax_sparse_decode(
             q,
             None,
@@ -483,6 +554,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             use_msa=self._use_msa_decode,
             msa_kv_indices=msa_kv_indices,
             msa_plan=msa_plan,
+            hisparse_swap_in_fn=hisparse_swap_in_fn,
         )
         return (
             None if idx_o is None else idx_o.reshape(q.shape[0], -1).contiguous(),
@@ -501,6 +573,7 @@ class MiniMaxHybridAttnBackend(AttentionBackend):
         self.sparse = sparse_backend
         self.sparse_layer_ids = sparse_layer_ids
         self.sparse.dense_backend = dense_backend
+        self._hisparse_enabled = sparse_backend._loc_mapping is not None
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         self.sparse.init_forward_metadata(forward_batch)

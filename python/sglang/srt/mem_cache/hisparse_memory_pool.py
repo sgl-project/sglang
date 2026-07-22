@@ -6,7 +6,7 @@ from typing import Optional
 import torch
 
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, MHATokenToKVPool
 from sglang.srt.utils import is_cuda, is_hip
 
 logger = logging.getLogger(__name__)
@@ -120,3 +120,99 @@ class HiSparseDSATokenToKVPool(DSATokenToKVPool):
 
     def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
         raise NotImplementedError("HiSparseDevicePool does not support load_cpu_copy")
+
+
+class HiSparseMHAMainPool(MHATokenToKVPool):
+    """MHATokenToKVPool with hisparse logical→device mapping for the main KV cache.
+
+    Used by MiniMax M3 HiSparse. The index pools (index_kv_pool, index_k_pool)
+    are standard MHATokenToKVPool without mapping — they stay fully on device.
+    """
+
+    def __init__(
+        self,
+        size: int,
+        page_size: int,
+        dtype: torch.dtype,
+        head_num: int,
+        head_dim: int,
+        layer_num: int,
+        device: str,
+        enable_memory_saver: bool,
+        start_layer: Optional[int] = None,
+        end_layer: Optional[int] = None,
+    ):
+        super().__init__(
+            size=size,
+            page_size=page_size,
+            dtype=dtype,
+            head_num=head_num,
+            head_dim=head_dim,
+            layer_num=layer_num,
+            device=device,
+            enable_memory_saver=enable_memory_saver,
+            start_layer=start_layer,
+            end_layer=end_layer,
+        )
+        self.full_to_hisparse_device_index_mapping: Optional[torch.Tensor] = None
+        self.bytes_per_token_k = head_num * head_dim * self.store_dtype.itemsize
+        self.bytes_per_token_v = head_num * head_dim * self.store_dtype.itemsize
+
+    def register_mapping(
+        self, full_to_hisparse_device_index_mapping: torch.Tensor
+    ) -> None:
+        self.full_to_hisparse_device_index_mapping = (
+            full_to_hisparse_device_index_mapping
+        )
+
+    def translate_loc_to_hisparse_device(self, indices: torch.Tensor) -> torch.Tensor:
+        return self.full_to_hisparse_device_index_mapping[indices]
+
+    def _translate_loc_to_hisparse_device(self, indices: torch.Tensor) -> torch.Tensor:
+        return self.full_to_hisparse_device_index_mapping[indices]
+
+    def translate_loc_from_full_to_hisparse_device(
+        self, full_indices: torch.Tensor
+    ) -> torch.Tensor:
+        return self.full_to_hisparse_device_index_mapping[full_indices]
+
+    def translate_loc_from_full_to_compressed(
+        self, full_indices: torch.Tensor
+    ) -> torch.Tensor:
+        return full_indices
+
+    def set_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        *args,
+        **kwargs,
+    ):
+        from sglang.srt.mem_cache.memory_pool import unwrap_write_loc
+
+        raw_loc, swa_loc, full_loc = unwrap_write_loc(loc)
+        translated = self.translate_loc_to_hisparse_device(raw_loc)
+        super().set_kv_buffer(layer, translated, cache_k, cache_v, *args, **kwargs)
+
+    def transfer_values_on_device(
+        self,
+        dst_indices: torch.Tensor,
+        src_indices: torch.Tensor,
+    ) -> None:
+        item_size = self.bytes_per_token_k + self.bytes_per_token_v
+        transfer_kv_all_layer_mla(
+            src_layers=self.data_ptrs,
+            dst_layers=self.data_ptrs,
+            src_indices=src_indices,
+            dst_indices=dst_indices,
+            item_size=item_size,
+            num_layers=self.layer_num,
+        )
+
+    def get_cpu_copy(self, indices, mamba_indices=None):
+        raise NotImplementedError("HiSparseMHAMainPool does not support get_cpu_copy")
+
+    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+        raise NotImplementedError("HiSparseMHAMainPool does not support load_cpu_copy")
