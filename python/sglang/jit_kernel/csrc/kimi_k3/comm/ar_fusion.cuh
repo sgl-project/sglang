@@ -1,4 +1,4 @@
-// K3 MNNVL fused all-reduce (bf16-only), two zero-copy algorithms:
+// K3 MNNVL fused all-reduce (bf16-only), two zero-copy algorithm families:
 //
 //   - push (1shot): lamport-style push, but the data staging is a SINGLE
 //     multicast store into slot `rank` of every peer's push workspace
@@ -6,17 +6,29 @@
 //     local zero-marker polling reduce. Input is read in place and the
 //     result is written back in place — no staging copies. Works for any
 //     input tensor; reuses the CustomAllReduceV2 push workspace + counter.
+//     Best for small messages.
 //
-//   - pull_mc (2shot): NVLS reduce-scatter + broadcast directly ON the input
-//     tensor, which therefore MUST live in (multicast-bound) symmetric
-//     memory: each rank `multimem.ld_reduce`s its shard from the input's
-//     multicast address and `multimem.st`s the result back — in-place, zero
-//     copies. Reuses the CustomAllReduceV2 pull semaphores for the
-//     enter/exit barriers.
+//   - pull (2shot): low-SM NVLS pull directly ON the input tensor, which
+//     therefore MUST live in (multicast-bound) symmetric memory: each rank
+//     `multimem.ld_reduce`s its shard from the input's multicast address and
+//     `multimem.st`s the result back — in-place, zero copies. Two
+//     NCCL-style ideas keep a handful of blocks (tuned 1~16, 4 at the large
+//     end) at the fabric limit:
 //
-// Both kernels optionally fuse a residual add (`out = allreduce(x) + r`).
-// Contract: the residual must be identical on every rank (it is a fully
-// reduced tensor, e.g. the attn-res prefix sum) or absent.
+//       * deep pipelining: the copy loop manually keeps `unroll` multimem
+//         loads in flight per thread before the first store, cascading
+//         through halving widths for mid-size tails.
+//       * multicast barriers on the CustomAllReduceV2 pull semaphores: the
+//         generic pull kernels' reservation protocol with each arrival sent
+//         as ONE `multimem.red.add` on the semaphore flag's multicast alias
+//         instead of per-peer unicast reds — identical memory effects, so
+//         both kernel families share the slots freely (single-stream calls
+//         are serialized).
+//
+// Both families fuse either a residual add (`out = allreduce(x) + r`; the
+// residual must be identical on every rank — a fully reduced tensor such as
+// the attn-res prefix sum — or absent) or the RMSNorm epilogue over the
+// latent of the K3 latent|shared MoE buffer (*_norm variants).
 //
 #include <sgl_kernel/math.cuh>
 #include <sgl_kernel/utils.cuh>
@@ -31,13 +43,12 @@
 namespace sglang {
 
 struct FusionParams {
-  uint8_t* input;                             // push: tensor pointer (in place); pull_mc: multicast VA of the tensor
-  const uint8_t* residual;                    // may be null (compile-time kHasResidual selects)
-  uint8_t* push_ws_mc;                        // push only: multicast VA of the push workspace base
-  uint8_t* push_ws_local;                     // push only: local push workspace base (poll side)
-  Counter* push_counter;                      // push only: per-block phase counters (local memory)
-  Semaphore* pull_semaphores[kMaxWorldSize];  // pull_mc only: per-rank semaphores
-  int64_t push_buffer_stride;                 // per-buffer bytes (2 * world_size buffers)
+  uint8_t* input;              // tensor pointer (in place)
+  const uint8_t* residual;     // may be null (compile-time kHasResidual selects)
+  uint8_t* push_ws_mc;         // multicast VA of the push workspace base
+  uint8_t* push_ws_local;      // local push workspace base (poll side)
+  Counter* push_counter;       // per-block phase counters (local memory)
+  int64_t push_buffer_stride;  // per-buffer bytes (2 * world_size buffers)
   uint32_t rank;
   uint32_t num_vecs;  // 16B vectors
   // *_norm variants only: RMSNorm epilogue over the first num_norm_rows
@@ -50,51 +61,10 @@ struct FusionParams {
 
 // The K3 latent|shared MoE buffer ([N, 3584] latent then [N, 7168] shared)
 // viewed as rows of the latent width: 3N rows of 3584 bf16, of which the
-// first N (the latent) get an RMSNorm epilogue. One row = 448 16B vectors =
-// one 448-thread block pass, so the row sum-of-squares is a block reduce.
+// first N (the latent) get an RMSNorm epilogue. One row = 448 16B vectors.
 constexpr uint32_t kNormDim = 3584;
 constexpr uint32_t kNormRowVecs = kNormDim / 8;                       // 448
 constexpr uint32_t kNormWarps = kNormRowVecs / device::kWarpThreads;  // 14
-
-// RMSNorm epilogue for one row vector, identical math to
-// elementwise/rmsnorm.cuh: fp32 sum of squares (block reduce), factor =
-// rsqrt(sumsq / dim + eps), out = bf16(x * factor * w). One __syncthreads
-// per call: after the barrier every warp redundantly reduces the 14 warp
-// partials itself (shuffle reduce, warp-local by construction), and the
-// caller alternates `smem_half` between consecutive norm rows so the next
-// row's partial writes can't race this row's reads (the WAR pair is two
-// rows apart and separated by the intervening row's barrier). Every thread
-// of the block must call this.
-SGL_DEVICE device::AlignedVector<bf16x2_t, 4> apply_row_norm(
-    const device::AlignedVector<bf16x2_t, 4>& x,
-    const device::AlignedVector<bf16x2_t, 4>& w,
-    float eps,
-    float (&smem)[32],
-    uint32_t smem_half) {
-  using namespace device;
-  float sum_of_squares = 0.0f;
-#pragma unroll
-  for (uint32_t j = 0; j < 4; ++j) {
-    const auto [a, b] = cast<fp32x2_t>(x[j]);
-    sum_of_squares += a * a + b * b;
-  }
-  sum_of_squares = warp::reduce_sum(sum_of_squares);
-  const auto warp_id = threadIdx.x / kWarpThreads;
-  const auto lane = threadIdx.x % kWarpThreads;
-  float* const half = smem + smem_half * 16;
-  half[warp_id] = sum_of_squares;  // all lanes write the same value
-  __syncthreads();
-  const auto local_sum = lane < kNormWarps ? half[lane] : 0.0f;
-  const auto norm_factor = math::rsqrt(warp::reduce_sum(local_sum) / kNormDim + eps);
-  AlignedVector<bf16x2_t, 4> out;
-#pragma unroll
-  for (uint32_t j = 0; j < 4; ++j) {
-    const auto [a, b] = cast<fp32x2_t>(x[j]);
-    const auto [wa, wb] = cast<fp32x2_t>(w[j]);
-    out[j] = cast<bf16x2_t>(fp32x2_t{a * norm_factor * wa, b * norm_factor * wb});
-  }
-  return out;
-}
 
 template <uint32_t kWorldSize, bool kHasResidual, bool kUsePDL>
 __global__ __launch_bounds__(1024, 1) void all_reduce_push_res_kernel(const __grid_constant__ FusionParams params) {
@@ -164,72 +134,6 @@ __global__ __launch_bounds__(1024, 1) void all_reduce_push_res_kernel(const __gr
   device::PDLTriggerSecondary<kUsePDL>();
   __syncthreads();
   if (tx == 0) params.push_counter[bx].inc(1);  // u32 overflow is safe under mod 2
-}
-
-template <uint32_t kWorldSize, bool kHasResidual, bool kUsePDL>
-__global__ __launch_bounds__(512) void all_reduce_pull_res_kernel(const __grid_constant__ FusionParams params) {
-  using vec_t = device::AlignedVector<bf16x2_t, 4>;
-  using SumOp = device::ReductionTrait<device::ReductionOp::SUM, bf16x2_t>;
-
-  const auto tx = threadIdx.x;
-  const auto bx = blockIdx.x;
-  const auto global_tid = bx * blockDim.x + tx;
-  const auto num_threads = blockDim.x * gridDim.x;
-  const auto r = params.rank;
-
-  // this rank's shard of the 16B-vector range
-  const auto avg_vecs = params.num_vecs / kWorldSize;
-  const auto rem_vecs = params.num_vecs % kWorldSize;
-  const auto vec_bias = avg_vecs * r + min(r, rem_vecs);
-  const auto num_vecs = avg_vecs + (r < rem_vecs ? 1 : 0);
-  const auto mc_shard = params.input + int64_t(vec_bias) * 16;
-  [[maybe_unused]] const auto res_shard = kHasResidual ? params.residual + int64_t(vec_bias) * 16 : nullptr;
-
-  // enter barrier (relaxed): all ranks' producers have finished writing the
-  // input (each rank signals only after its own PDL wait). Mirrors
-  // AllReducePullImpl::sync_enter_pull<false>.
-  uint32_t counter_val = 0;
-  if (tx < kWorldSize) {
-    device::PDLWaitPrimary<kUsePDL>();
-    const auto semaphore = &params.pull_semaphores[tx][bx];
-    const auto current = tx == r ? semaphore->counter_ptr()->inc(2 * kWorldSize) : 0;
-    counter_val = current + kWorldSize;
-    semaphore->put_relaxed();
-    if (tx == r) {
-      while (semaphore->get_relaxed() - current < kWorldSize)
-        ;
-    }
-  }
-  __syncthreads();
-
-  // reduce-scatter via multimem load, fuse residual, broadcast via multimem
-  // store — in place on the symmetric input
-  for (auto vid = global_tid; vid < num_vecs; vid += num_threads) {
-    vec_t vec;
-    ld_multimem_16B(vec, mc_shard, vid);
-    if constexpr (kHasResidual) {
-      vec_t res_vec;
-      res_vec.load(res_shard, vid);
-#pragma unroll
-      for (uint32_t j = 0; j < 4; ++j) {
-        vec[j] = SumOp::reduce(vec[j], res_vec[j]);
-      }
-    }
-    st_multimem_16B(vec, mc_shard, vid);
-  }
-
-  // exit barrier (release/acquire): every peer's broadcast into MY buffer is
-  // visible before my next kernel reads it. Mirrors sync_exit_pull<true>.
-  device::PDLTriggerSecondary<kUsePDL>();
-  __syncthreads();
-  if (tx < kWorldSize) {
-    const auto semaphore = &params.pull_semaphores[tx][bx];
-    semaphore->put_release();
-    if (tx == r) {
-      while (semaphore->get_acquire() - counter_val < kWorldSize)
-        ;
-    }
-  }
 }
 
 template <typename T2, size_t N, size_t M>
@@ -398,63 +302,249 @@ __global__ __launch_bounds__(kNormRowVecs / kClusterSize) __cluster_dims__(kClus
   }
 }
 
-template <uint32_t kWorldSize, bool kUsePDL>
-__global__ __launch_bounds__(kNormRowVecs)  //
-    void all_reduce_pull_norm_kernel(const __grid_constant__ FusionParams params) {
+// ---------------------------------------------------------------------------
+// Pull family: low-SM NVLS, reusing the CustomAllReduceV2 pull semaphores
+// ---------------------------------------------------------------------------
+
+inline constexpr uint32_t kPullBlockSize = 512;
+
+struct PullParams {
+  uint8_t* input_mc;        // multicast VA of the symmetric input
+  const uint8_t* residual;  // may be null (compile-time kHasResidual selects)
+  Semaphore* sem_local;     // this rank's v2 pull semaphores (poll side)
+  uint8_t* sem_mc;          // multicast VA of the pull-semaphore region
+  uint32_t rank;
+  uint32_t world_size;
+  uint32_t num_vecs;  // 16B vectors
+  // pull_norm only: RMSNorm epilogue over the first num_norm_rows rows of
+  // the [num_vecs / kNormRowVecs, kNormDim] row view
+  const uint8_t* norm_weight;
+  float norm_eps;
+  uint32_t num_norm_rows;
+};
+
+// K3 pull barriers reuse the v2 pull-semaphore slots with EXACTLY the
+// generic kernels' reservation protocol — reserve a 2 * world_size flag
+// window on the local m_counter, signal arrival on m_flag, wait for the
+// window to fill — except that each arrival is ONE `multimem.red.add` on
+// the m_flag's multicast alias instead of world_size per-peer unicast reds
+// (same aggregate effect: every rank's flag gains world_size arrivals per
+// phase). Identical memory effects per call, so both kernel families share
+// the slots freely (single-stream calls are serialized).
+//
+// The multicast alias of Semaphore::m_flag (the struct's first member):
+SGL_DEVICE uint32_t* pull_sem_mc_flag(uint8_t* sem_mc, uint32_t block) {
+  static_assert(sizeof(Semaphore) == 128);
+  return reinterpret_cast<uint32_t*>(sem_mc + block * sizeof(Semaphore));
+}
+
+SGL_DEVICE void multimem_red_add_relaxed(uint32_t* mc_flag) {
+#if SGL_ARCH_HOPPER_OR_GREATER
+  asm volatile("multimem.red.relaxed.sys.global.add.u32 [%0], 1;" ::"l"(mc_flag) : "memory");
+#else
+  assert(false && "multimem red is only supported on Hopper or later architecture");
+#endif
+}
+
+SGL_DEVICE void multimem_red_add_release(uint32_t* mc_flag) {
+#if SGL_ARCH_HOPPER_OR_GREATER
+  asm volatile("multimem.red.release.sys.global.add.u32 [%0], 1;" ::"l"(mc_flag) : "memory");
+#else
+  assert(false && "multimem red is only supported on Hopper or later architecture");
+#endif
+}
+
+// enter barrier (relaxed): reserve this call's flag window, signal arrival
+// with one multicast red, poll the local flag until all world_size arrivals
+// landed — every rank's producer has finished writing the input. The
+// reservation atomicAdd sits BEFORE the PDL wait: it is safe there (the
+// previous same-slot call's reservation completed at ITS enter, which
+// precedes its launch_dependents and hence this kernel's start, so windows
+// are handed out in stream order) and it keeps the RMW latency off the
+// post-wait critical path. The red must stay AFTER the wait — it asserts
+// the producer grid has flushed. Returns the window base for the exit
+// barrier — meaningful in thread 0 only, the sole barrier poller.
+template <bool kUsePDL>
+SGL_DEVICE uint32_t pull_barrier_enter(const PullParams& params) {
+  uint32_t current = 0;
+  if (threadIdx.x == 0) {
+    const auto semaphore = &params.sem_local[blockIdx.x];
+    const auto reserved = semaphore->counter_ptr()->inc(2 * params.world_size);
+    current = reserved + params.world_size;
+    device::PDLWaitPrimary<kUsePDL>();
+    multimem_red_add_relaxed(pull_sem_mc_flag(params.sem_mc, blockIdx.x));
+    while (semaphore->get_relaxed() - reserved < params.world_size)
+      ;
+  }
+  __syncthreads();
+  return current;
+}
+
+// exit barrier (release/acquire): every peer has finished reading my buffer
+// (and, for 2shot, its broadcast into it is visible) before my next kernel
+// may touch it. Mirrors AllReducePullImpl::sync_exit_pull<true>.
+template <bool kUsePDL>
+SGL_DEVICE void pull_barrier_exit(const PullParams& params, uint32_t current) {
+  device::PDLTriggerSecondary<kUsePDL>();
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    const auto semaphore = &params.sem_local[blockIdx.x];
+    multimem_red_add_release(pull_sem_mc_flag(params.sem_mc, blockIdx.x));
+    while (semaphore->get_acquire() - current < params.world_size)
+      ;
+  }
+}
+
+// One pipelined pass at width kWidth (kWidth multimem loads in flight per
+// thread), then recurse to kWidth/2 for the remainder, down to a plain
+// unroll-1 tail. The cascade matters for mid sizes: a shard smaller than
+// kUnroll * step would otherwise skip the main loop entirely and run the
+// whole range with a single request in flight.
+template <uint32_t kWidth, bool kHasResidual>
+SGL_DEVICE void
+pull_reduce_pass(uint32_t& vid, const uint32_t num_vecs, const uint32_t step, uint8_t* mc_ptr, const uint8_t* res_ptr) {
   using vec_t = device::AlignedVector<bf16x2_t, 4>;
+  using SumOp = device::ReductionTrait<device::ReductionOp::SUM, bf16x2_t>;
+  for (; vid + (kWidth - 1) * step < num_vecs; vid += kWidth * step) {
+    vec_t vec[kWidth];
+#pragma unroll
+    for (uint32_t u = 0; u < kWidth; ++u) {
+      ld_multimem_16B(vec[u], mc_ptr, vid + u * step);
+    }
+    if constexpr (kHasResidual) {
+#pragma unroll
+      for (uint32_t u = 0; u < kWidth; ++u) {
+        vec_t res_vec;
+        res_vec.load(res_ptr, vid + u * step);
+#pragma unroll
+        for (uint32_t j = 0; j < 4; ++j) {
+          vec[u][j] = SumOp::reduce(vec[u][j], res_vec[j]);
+        }
+      }
+    }
+#pragma unroll
+    for (uint32_t u = 0; u < kWidth; ++u) {
+      st_multimem_16B(vec[u], mc_ptr, vid + u * step);
+    }
+  }
+  if constexpr (kWidth > 1) {
+    pull_reduce_pass<kWidth / 2, kHasResidual>(vid, num_vecs, step, mc_ptr, res_ptr);
+  }
+}
+
+template <uint32_t kUnroll, bool kHasResidual, bool kUsePDL>
+__global__
+__launch_bounds__(kPullBlockSize, 1) void all_reduce_pull_res_kernel(const __grid_constant__ PullParams params) {
+  static_assert(1 <= kUnroll && kUnroll <= 16 && (kUnroll & (kUnroll - 1)) == 0);
 
   const auto tx = threadIdx.x;
   const auto bx = blockIdx.x;
+  const auto barrier_window = pull_barrier_enter<kUsePDL>(params);
+
+  // this rank's shard of the 16B-vector range
   const auto r = params.rank;
-  const auto num_rows = params.num_vecs / kNormRowVecs;
+  const auto avg_vecs = params.num_vecs / params.world_size;
+  const auto rem_vecs = params.num_vecs % params.world_size;
+  const auto vec_bias = int64_t(avg_vecs) * r + min(r, rem_vecs);
+  const auto num_vecs = avg_vecs + (r < rem_vecs ? 1 : 0);
+  const auto mc_ptr = params.input_mc + vec_bias * 16;
+  const auto res_ptr = kHasResidual ? params.residual + vec_bias * 16 : nullptr;
+
+  // deep-pipelined body: issue up to kUnroll multimem loads back-to-back
+  // before the first (residual add and) store, keeping kUnroll requests in
+  // flight per thread to hide the NVLink latency with very few blocks; the
+  // remainder cascades through halving widths down to 1.
+  const auto step = kPullBlockSize * gridDim.x;
+  auto vid = bx * kPullBlockSize + tx;
+  pull_reduce_pass<kUnroll, kHasResidual>(vid, num_vecs, step, mc_ptr, res_ptr);
+
+  pull_barrier_exit<kUsePDL>(params, barrier_window);
+}
+
+// Fused RMSNorm over the latent of the K3 latent|shared MoE buffer: the
+// row-structured counterpart of the res kernel with kUnroll ROWS in flight
+// per block. One block pass covers kUnroll consecutive rows: 448 threads
+// each ld_reduce one 16B vector per row back-to-back, warp partials of the
+// normed rows go to smem (one __syncthreads per group), non-norm rows store
+// immediately. smem is parity double-buffered across groups so the next
+// group's partial writes can't race this group's reads (the WAR pair is two
+// groups apart and separated by the intervening group's barrier). Works on
+// this rank's row shard, in place.
+template <uint32_t kUnroll, bool kUsePDL>
+__global__
+__launch_bounds__(kNormRowVecs, 1) void all_reduce_pull_norm_kernel(const __grid_constant__ PullParams params) {
+  using vec_t = device::AlignedVector<bf16x2_t, 4>;
+  using namespace device;
+
+  const auto tx = threadIdx.x;
+  const auto bx = blockIdx.x;
+  const auto barrier_window = pull_barrier_enter<kUsePDL>(params);
 
   // this rank's shard of the row range
-  const auto avg_rows = num_rows / kWorldSize;
-  const auto rem_rows = num_rows % kWorldSize;
+  const auto num_rows = params.num_vecs / kNormRowVecs;
+  const auto r = params.rank;
+  const auto avg_rows = num_rows / params.world_size;
+  const auto rem_rows = num_rows % params.world_size;
   const auto row_bias = avg_rows * r + min(r, rem_rows);
   const auto my_rows = avg_rows + (r < rem_rows ? 1 : 0);
 
-  // enter barrier (relaxed), same as the plain pull kernel
-  uint32_t counter_val = 0;
-  if (tx < kWorldSize) {
-    device::PDLWaitPrimary<kUsePDL>();
-    const auto semaphore = &params.pull_semaphores[tx][bx];
-    const auto current = tx == r ? semaphore->counter_ptr()->inc(2 * kWorldSize) : 0;
-    counter_val = current + kWorldSize;
-    semaphore->put_relaxed();
-    if (tx == r) {
-      while (semaphore->get_relaxed() - current < kWorldSize)
-        ;
-    }
-  }
-  __syncthreads();
-
   vec_t wvec;
   wvec.load(params.norm_weight, tx);
-  __shared__ float smem[32];
-  uint32_t norm_iter = 0;
-  for (auto row_local = bx; row_local < my_rows; row_local += gridDim.x) {
-    const auto row = row_bias + row_local;
-    const auto vid = int64_t(row) * kNormRowVecs + tx;
-    vec_t vec;
-    ld_multimem_16B(vec, params.input, vid);
-    if (row < params.num_norm_rows) {  // block-uniform branch
-      vec = apply_row_norm(vec, wvec, params.norm_eps, smem, norm_iter++ & 1);
+  __shared__ float smem[2][kUnroll][kNormWarps];
+  const auto warp = tx / kWarpThreads;
+  const auto lane = tx % kWarpThreads;
+  uint32_t parity = 0;
+
+  const auto row_step = gridDim.x * kUnroll;
+  for (auto row0 = bx * kUnroll; row0 < my_rows; row0 += row_step) {
+    const auto cnt = min(kUnroll, my_rows - row0);
+    const auto vid0 = int64_t(row_bias + row0) * kNormRowVecs + tx;
+    vec_t vec[kUnroll];
+#pragma unroll
+    for (uint32_t u = 0; u < kUnroll; ++u) {
+      if (u < cnt) ld_multimem_16B(vec[u], params.input_mc, vid0 + u * kNormRowVecs);
     }
-    st_multimem_16B(vec, params.input, vid);
+    // norm rows: push this warp's partial sum of squares to smem; non-norm
+    // rows (the shared 2/3) don't wait for the barrier — store right away
+    auto& sm = smem[parity];
+    parity ^= 1;
+#pragma unroll
+    for (uint32_t u = 0; u < kUnroll; ++u) {
+      if (u >= cnt) continue;  // block-uniform
+      if (row_bias + row0 + u < params.num_norm_rows) {
+        float sum_of_squares = 0.0f;
+#pragma unroll
+        for (uint32_t j = 0; j < 4; ++j) {
+          const auto [a, b] = cast<fp32x2_t>(vec[u][j]);
+          sum_of_squares += a * a + b * b;
+        }
+        sum_of_squares = warp::reduce_sum(sum_of_squares);
+        if (lane == 0) sm[u][warp] = sum_of_squares;
+      } else {
+        st_multimem_16B(vec[u], params.input_mc, vid0 + u * kNormRowVecs);
+      }
+    }
+    __syncthreads();
+#pragma unroll
+    for (uint32_t u = 0; u < kUnroll; ++u) {
+      if (u >= cnt || row_bias + row0 + u >= params.num_norm_rows) continue;  // block-uniform
+      float total = 0.0f;
+#pragma unroll
+      for (uint32_t w = 0; w < kNormWarps; ++w) {
+        total += sm[u][w];
+      }
+      const auto norm_factor = math::rsqrt(total / kNormDim + params.norm_eps);
+#pragma unroll
+      for (uint32_t j = 0; j < 4; ++j) {
+        const auto [a, b] = cast<fp32x2_t>(vec[u][j]);
+        const auto [wa, wb] = cast<fp32x2_t>(wvec[j]);
+        vec[u][j] = cast<bf16x2_t>(fp32x2_t{a * norm_factor * wa, b * norm_factor * wb});
+      }
+      st_multimem_16B(vec[u], params.input_mc, vid0 + u * kNormRowVecs);
+    }
   }
 
-  // exit barrier (release/acquire)
-  device::PDLTriggerSecondary<kUsePDL>();
-  __syncthreads();
-  if (tx < kWorldSize) {
-    const auto semaphore = &params.pull_semaphores[tx][bx];
-    semaphore->put_release();
-    if (tx == r) {
-      while (semaphore->get_acquire() - counter_val < kWorldSize)
-        ;
-    }
-  }
+  pull_barrier_exit<kUsePDL>(params, barrier_window);
 }
 
 }  // namespace sglang
@@ -472,8 +562,6 @@ struct AllReduceFusionKernel {
 
   template <bool kHasResidual>
   static constexpr auto res_push_kernel = all_reduce_push_res_kernel<kWorldSize, kHasResidual, kUsePDL>;
-  template <bool kHasResidual>
-  static constexpr auto res_pull_kernel = all_reduce_pull_res_kernel<kWorldSize, kHasResidual, kUsePDL>;
 
   static FusionParams
   make_params(const host::distributed::CommunicatorObj& data, TensorView input, std::optional<TensorView> residual) {
@@ -502,9 +590,6 @@ struct AllReduceFusionKernel {
     params.push_ws_mc = nullptr;
     params.push_ws_local = data.push_workspaces[data.rank];
     params.push_counter = data.push_counter;
-    for (uint32_t i = 0; i < kWorldSize; ++i) {
-      params.pull_semaphores[i] = data.pull_semaphores[i];
-    }
     params.push_buffer_stride = data.push_bytes;
     params.rank = data.rank;
     params.num_vecs = static_cast<uint32_t>(num_elems / 8);
@@ -530,6 +615,87 @@ struct AllReduceFusionKernel {
     return params;
   }
 
+  // Shared pull validation; the reduce is in place on the symmetric input.
+  static PullParams make_pull_params(
+      const host::distributed::CommunicatorObj& data,
+      TensorView input,
+      std::optional<TensorView> residual,
+      int64_t input_mc_ptr,
+      int64_t sem_mc_ptr) {
+    using namespace host;
+    SymbolicSize N = {"num_elements"};
+    SymbolicDevice device;
+    device.set_options<kDLCUDA>();
+    if (residual.has_value()) {
+      TensorMatcher({N})  //
+          .with_dtype<bf16_t>()
+          .with_device<kDLCUDA>(device)
+          .verify(input)
+          .verify(residual.value());
+    } else {
+      TensorMatcher({N})  //
+          .with_dtype<bf16_t>()
+          .with_device<kDLCUDA>(device)
+          .verify(input);
+    }
+    const auto num_elems = N.unwrap();
+    CHECK_HOST(data.world_size == kWorldSize);
+    CHECK_HOST(num_elems > 0 && num_elems % 8 == 0) << "numel must be a positive multiple of 8, got " << num_elems;
+    // headroom below 2^32 so the unrolled loop's `vid + (kUnroll-1)*step`
+    // arithmetic can never wrap around u32
+    CHECK_HOST(num_elems / 8 < (int64_t(1) << 31)) << "numel exceeds the 16B-vector limit";
+    CHECK_HOST(input_mc_ptr != 0) << "pull requires the input's multicast address";
+    CHECK_HOST(sem_mc_ptr != 0) << "pull requires the semaphores' multicast address";
+    PullParams params{};
+    params.input_mc = reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(input_mc_ptr));
+    params.residual = residual.has_value() ? static_cast<const uint8_t*>(residual.value().data_ptr()) : nullptr;
+    params.sem_local = data.pull_semaphores[data.rank];
+    params.sem_mc = reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(sem_mc_ptr));
+    params.rank = data.rank;
+    params.world_size = data.world_size;
+    params.num_vecs = static_cast<uint32_t>(num_elems / 8);
+    return params;
+  }
+
+  // Runtime unroll dispatch: every supported width is compiled into the
+  // module so the tuned per-size unroll needs no extra JIT builds.
+  template <bool kHasResidual>
+  static void launch_pull_res(const PullParams& params, int64_t num_blocks, int64_t unroll, DLDevice device) {
+    const auto run = [&](auto kernel) {
+      host::LaunchKernel(static_cast<uint32_t>(num_blocks), kPullBlockSize, device).enable_pdl(kUsePDL)(kernel, params);
+    };
+    switch (unroll) {
+      case 2:
+        return run(all_reduce_pull_res_kernel<2, kHasResidual, kUsePDL>);
+      case 4:
+        return run(all_reduce_pull_res_kernel<4, kHasResidual, kUsePDL>);
+      case 8:
+        return run(all_reduce_pull_res_kernel<8, kHasResidual, kUsePDL>);
+      case 16:
+        return run(all_reduce_pull_res_kernel<16, kHasResidual, kUsePDL>);
+      default:
+        CHECK_HOST(false) << "unsupported unroll " << unroll << " (must be 2, 4, 8, or 16)";
+    }
+  }
+
+  static void launch_pull_norm(const PullParams& params, int64_t num_blocks, int64_t unroll, DLDevice device) {
+    const auto run = [&](auto kernel) {
+      host::LaunchKernel(static_cast<uint32_t>(num_blocks), kNormRowVecs, device).enable_pdl(kUsePDL)(kernel, params);
+    };
+    switch (unroll) {
+      case 2:
+        return run(all_reduce_pull_norm_kernel<2, kUsePDL>);
+      case 4:
+        return run(all_reduce_pull_norm_kernel<4, kUsePDL>);
+      case 8:
+        return run(all_reduce_pull_norm_kernel<8, kUsePDL>);
+      case 16:
+        return run(all_reduce_pull_norm_kernel<16, kUsePDL>);
+      default:
+        CHECK_HOST(false) << "unsupported unroll " << unroll << " (must be 2, 4, 8, or 16)";
+    }
+  }
+
  public:
   static void push_res(CommunicatorRef ref, TensorView input, std::optional<TensorView> residual, int64_t ws_mc_base) {
     const auto& data = *ref.get();
@@ -542,21 +708,6 @@ struct AllReduceFusionKernel {
     const auto kernel = residual.has_value() ? res_push_kernel<true> : res_push_kernel<false>;
     host::LaunchKernel(data.num_push_blocks, choose_block_size(params.num_vecs), input.device())
         .enable_pdl(kUsePDL)(kernel, params);
-  }
-
-  static void
-  pull_res(CommunicatorRef ref, TensorView input, std::optional<TensorView> residual, int64_t input_mc_ptr) {
-    const auto& data = *ref.get();
-    auto params = make_params(data, input, residual);
-    CHECK_HOST(input_mc_ptr != 0) << "pull_res requires the input's multicast address";
-    params.input = reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(input_mc_ptr));
-    // tuned on B200x8 (bs=64..8192 x 7168 bf16): 32 CTAs is near optimal
-    constexpr uint32_t kDefaultBlocks = 32;
-    constexpr uint32_t kBlockSize = 512;
-    const auto num_blocks = std::min<uint32_t>(kDefaultBlocks, data.num_pull_blocks);
-    const auto stream = host::LaunchKernel::resolve_device(input.device());
-    const auto kernel = residual.has_value() ? res_pull_kernel<true> : res_pull_kernel<false>;
-    host::LaunchKernel(num_blocks, kBlockSize, stream).enable_pdl(kUsePDL)(kernel, params);
   }
 
   static void push_norm(CommunicatorRef ref, TensorView input, TensorView weight, float eps, int64_t ws_mc_base) {
@@ -576,14 +727,55 @@ struct AllReduceFusionKernel {
         .enable_pdl(kUsePDL)(all_reduce_push_norm_cluster_kernel<kWorldSize, kClusterSize, kUsePDL>, params);
   }
 
-  static void pull_norm(CommunicatorRef ref, TensorView input, TensorView weight, float eps, int64_t input_mc_ptr) {
-    constexpr uint32_t kDefaultBlocks = 64;
+  /// Low-SM NVLS pull (+ optional residual): in-place reduce-scatter +
+  /// broadcast on the symmetric input. `sem_mc_ptr` is the multicast VA of
+  /// the v2 pull-semaphore region; num_blocks — which must be uniform
+  /// across ranks per call — is clamped to the semaphore capacity.
+  static void pull_res(
+      CommunicatorRef ref,
+      TensorView input,
+      std::optional<TensorView> residual,
+      int64_t input_mc_ptr,
+      int64_t sem_mc_ptr,
+      int64_t num_blocks,
+      int64_t unroll) {
     const auto& data = *ref.get();
-    auto params = make_params_norm(data, input, weight, eps);
-    CHECK_HOST(input_mc_ptr != 0) << "pull_norm requires the input's multicast address";
-    params.input = reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(input_mc_ptr));
-    const auto num_blocks = std::min<uint32_t>(kDefaultBlocks, data.num_pull_blocks);
-    host::LaunchKernel(num_blocks, kNormRowVecs, input.device())
-        .enable_pdl(kUsePDL)(all_reduce_pull_norm_kernel<kWorldSize, kUsePDL>, params);
+    const auto params = make_pull_params(data, input, residual, input_mc_ptr, sem_mc_ptr);
+    CHECK_HOST(num_blocks >= 1) << "invalid num_blocks: " << num_blocks;
+    num_blocks = std::min<int64_t>(num_blocks, data.num_pull_blocks);
+    if (residual.has_value()) {
+      launch_pull_res<true>(params, num_blocks, unroll, input.device());
+    } else {
+      launch_pull_res<false>(params, num_blocks, unroll, input.device());
+    }
+  }
+
+  /// Low-SM NVLS pull + RMSNorm over the latent of the K3 latent|shared MoE
+  /// buffer ([num_tokens, 3584] latent then [num_tokens, 7168] shared);
+  /// num_tokens and the normed row range are derived from the element count.
+  /// Same semaphore / num_blocks semantics as pull_res.
+  static void pull_norm(
+      CommunicatorRef ref,
+      TensorView input,
+      TensorView weight,
+      double eps,
+      int64_t input_mc_ptr,
+      int64_t sem_mc_ptr,
+      int64_t num_blocks,
+      int64_t unroll) {
+    const auto& data = *ref.get();
+    auto params = make_pull_params(data, input, std::nullopt, input_mc_ptr, sem_mc_ptr);
+    CHECK_HOST(num_blocks >= 1) << "invalid num_blocks: " << num_blocks;
+    num_blocks = std::min<int64_t>(num_blocks, data.num_pull_blocks);
+    using namespace host;
+    SymbolicDevice device;
+    device.set_options<kDLCUDA>();
+    TensorMatcher({kNormDim}).with_dtype<bf16_t>().with_device<kDLCUDA>(device).verify(weight);
+    CHECK_HOST(params.num_vecs % (3 * kNormRowVecs) == 0)
+        << "numel must be a multiple of 3 * " << kNormDim << ", got " << int64_t(params.num_vecs) * 8;
+    params.norm_weight = static_cast<const uint8_t*>(weight.data_ptr());
+    params.norm_eps = static_cast<float>(eps);
+    params.num_norm_rows = params.num_vecs / (3 * kNormRowVecs);
+    launch_pull_norm(params, num_blocks, unroll, input.device());
   }
 };

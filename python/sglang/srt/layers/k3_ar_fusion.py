@@ -86,7 +86,7 @@ def _init_state() -> Optional[_State]:
         return None
     from sglang.jit_kernel.kimi_k3 import all_reduce as mod
 
-    mod.register_comm(comm.obj)
+    mod.register_comm(comm.obj, pull_sem_mc_ptr=comm.pull_sem_mc_ptr)
     _STATE = _State(comm, comm.world_size, group.cpu_group.group_name)
     logger.info("K3 all-reduce fusion enabled (world_size=%d)", comm.world_size)
     return _STATE
