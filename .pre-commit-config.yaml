@@ -72,6 +72,16 @@ repos:
           - '--extra-keys=metadata.kernelspec metadata.language_info.version'
   - repo: local
     hooks:
+      - id: forbid-docs-new-path
+        name: forbid docs_new/ (renamed to docs/)
+        # docs_new/ was renamed to docs/ in #32123. `language: fail` fires only
+        # when a staged path matches `files:` below, then prints the offending
+        # paths — no shell/merge-base logic, so none of the shallow-checkout or
+        # silent-diff pitfalls of the old legacy-docs/ gate apply here.
+        entry: >-
+          docs_new/ was renamed to docs/. Move these changes under docs/ instead.
+        language: fail
+        files: ^docs_new/
       - id: check-chinese-characters
         name: check chinese characters in multimodal_gen
         entry: >-

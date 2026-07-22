@@ -13,6 +13,22 @@ jobs:
         with:
           fetch-depth: 0
 
+      # Fail-fast gate: docs_new/ was renamed to docs/ (#32123). git's rename
+      # detection silently re-adds NEW files under docs_new/ on merge without a
+      # conflict, which would resurrect the directory. We check the checked-out
+      # tree directly (git ls-files) rather than diffing against the base ref —
+      # a presence check needs no merge-base and sidesteps the shallow-checkout
+      # / silent-diff failures that plagued the old legacy-docs/ gate.
+      - name: Forbid docs_new/ (renamed to docs/)
+        run: |
+          set -euo pipefail
+          matches="$(git ls-files -- docs_new)"
+          if [ -n "$matches" ]; then
+            echo "::error::docs_new/ was renamed to docs/. Move these files under docs/ instead:"
+            echo "$matches"
+            exit 1
+          fi
+
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
