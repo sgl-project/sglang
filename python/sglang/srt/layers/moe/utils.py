@@ -490,6 +490,8 @@ def should_skip_post_experts_all_reduce(*, is_tp_path: bool) -> bool:
     """
     if should_skip_mlp_all_reduce():
         return True
+    if get_server_args().dwdp_size > 1:
+        return True
     if should_use_dp_reduce_scatterv():
         return True
     if is_tp_path and should_use_flashinfer_cutlass_moe_fp4_allgather():

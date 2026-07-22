@@ -18,11 +18,7 @@ from typing import Iterable, List, Optional, Set, Tuple, Union
 
 import torch
 from torch import nn
-from transformers import (
-    Gemma4TextConfig,
-    PretrainedConfig,
-    PreTrainedModel,
-)
+from transformers import Gemma4TextConfig, PretrainedConfig, PreTrainedModel
 
 from sglang.kernels.ops.layernorm.gemma4_fused_ops import (
     gemma4_fused_routing,
@@ -31,9 +27,7 @@ from sglang.kernels.ops.layernorm.gemma4_fused_ops import (
     gemma_rmsnorm_residual_scalar,
     gemma_routing_post_topk,
 )
-from sglang.srt.distributed import (
-    get_pp_group,
-)
+from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.layernorm import Gemma4RMSNorm, RMSNorm
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
@@ -55,10 +49,8 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.models.gemma3_causal import Gemma3MLP, Gemma3TextScaledWordEmbedding
-from sglang.srt.models.utils import (
-    create_fused_set_kv_buffer_arg,
-)
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.models.utils import create_fused_set_kv_buffer_arg
+from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
 from sglang.srt.utils import add_prefix, make_layers
 
 logger = logging.getLogger(__name__)
@@ -254,7 +246,7 @@ class Gemma4MoE(nn.Module):
         experts_type = get_moe_impl_class(quant_config)
 
         self.experts = experts_type(
-            num_experts=config.num_experts + get_server_args().ep_num_redundant_experts,
+            num_experts=config.num_experts + get_exec().moe.ep_num_redundant_experts,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
             layer_id=layer_id,
