@@ -16,8 +16,6 @@
 
 from __future__ import annotations
 
-from typing import Optional
-
 import torch
 
 _TDM_DISABLED = False
@@ -51,7 +49,12 @@ def _import_aiter_w4a8():
         _routing_mod.is_tdm_avail = lambda: False
         _TDM_DISABLED = True
 
-    return _routing_mod.routing, moe_gemm_a8w4, downcast_to_static_fp8, downcast_to_static_fp8_gather
+    return (
+        _routing_mod.routing,
+        moe_gemm_a8w4,
+        downcast_to_static_fp8,
+        downcast_to_static_fp8_gather,
+    )
 
 
 def _interleave_gate_up(t: torch.Tensor) -> torch.Tensor:
@@ -147,7 +150,9 @@ def aiter_w4a8_gfx1250_forward(
             "aiter triton W4A8 MoE (moe_gemm_a8w4) is required for the gfx1250 "
             "GPT-OSS MXFP4 path but was not found in the installed aiter build."
         )
-    routing, moe_gemm_a8w4, downcast_to_static_fp8, downcast_to_static_fp8_gather = imported
+    routing, moe_gemm_a8w4, downcast_to_static_fp8, downcast_to_static_fp8_gather = (
+        imported
+    )
 
     assert hidden_states.dtype == torch.bfloat16
 
