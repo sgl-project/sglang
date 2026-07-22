@@ -8,7 +8,7 @@ import tvm_ffi
 from tvm_ffi import Module
 
 from sglang.kernel_api_logging import debug_kernel_api
-from sglang.kernels.jit import (
+from sglang.kernels.jit.utils import (
     cache_once,
     is_arch_support_pdl,
     lazy_register_class,

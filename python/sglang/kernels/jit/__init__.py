@@ -1,33 +1,6 @@
-"""Public interface of sglang.kernels.jit."""
+"""Internal JIT home under ``sglang.kernels`` (RFC #29630).
 
-from sglang.kernels.jit.arch import (
-    get_jit_cuda_arch,
-    is_arch_support_pdl,
-    override_jit_cuda_arch,
-)
-from sglang.kernels.jit.common import (
-    cache_once,
-    empty_sentinel,
-    get_ci_test_range,
-    is_hip_runtime,
-    is_musa_runtime,
-    lazy_register_class,
-    should_run_full_tests,
-)
-from sglang.kernels.jit.compile import KERNEL_PATH, load_jit, make_cpp_args
-
-__all__ = [
-    "empty_sentinel",
-    "should_run_full_tests",
-    "get_ci_test_range",
-    "cache_once",
-    "lazy_register_class",
-    "is_hip_runtime",
-    "is_musa_runtime",
-    "make_cpp_args",
-    "load_jit",
-    "override_jit_cuda_arch",
-    "get_jit_cuda_arch",
-    "is_arch_support_pdl",
-    "KERNEL_PATH",
-]
+Mirrors the legacy ``sglang.jit_kernel`` tree; shared build/runtime
+infrastructure lives in :mod:`sglang.kernels.jit.utils`. csrc / include /
+operators migrate here in later phases.
+"""

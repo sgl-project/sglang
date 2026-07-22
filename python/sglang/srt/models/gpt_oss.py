@@ -26,7 +26,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.kernels.jit import is_arch_support_pdl
+from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.srt.distributed import (
     get_pp_group,
     tensor_model_parallel_all_reduce,

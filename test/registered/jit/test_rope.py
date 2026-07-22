@@ -4,7 +4,7 @@ import pytest
 import torch
 import triton
 
-from sglang.kernels.jit import get_ci_test_range
+from sglang.kernels.jit.utils import get_ci_test_range
 from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 

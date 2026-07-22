@@ -6,7 +6,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.jit import is_arch_support_pdl
+from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.srt.layers.moe.moe_runner.triton_utils.helion_utils import (
     get_model_depths,
     helion_aot_autotune,

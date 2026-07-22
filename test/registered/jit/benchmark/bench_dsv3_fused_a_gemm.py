@@ -13,7 +13,7 @@ from sglang.jit_kernel.cutedsl_dsv3_fused_a_gemm import (
     dsv3_fused_a_gemm as cutedsl_dsv3_fused_a_gemm,
 )
 from sglang.jit_kernel.dsv3_fused_a_gemm import dsv3_fused_a_gemm
-from sglang.kernels.jit import get_jit_cuda_arch, is_hip_runtime
+from sglang.kernels.jit.utils import get_jit_cuda_arch, is_hip_runtime
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.utils import is_in_ci
 

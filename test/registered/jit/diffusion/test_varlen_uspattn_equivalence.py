@@ -20,7 +20,7 @@ from sglang.jit_kernel.diffusion.triton.varlen_pack_pad import (
     fused_scatter_to_padded,
 )
 from sglang.jit_kernel.flash_attention import flash_attn_varlen_func
-from sglang.kernels.jit import get_ci_test_range
+from sglang.kernels.jit.utils import get_ci_test_range
 from sglang.multimodal_gen.runtime.layers.attention.backends import (
     flash_attn as _fa_backend,
 )

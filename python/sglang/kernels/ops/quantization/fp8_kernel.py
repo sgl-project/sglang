@@ -28,7 +28,7 @@ try:
 except:
     pass
 
-from sglang.kernels.jit import is_arch_support_pdl
+from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.utils import (
     ceil_align,

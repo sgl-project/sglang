@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.kernels.jit import (
+from sglang.kernels.jit.utils import (
     cache_once,
     is_arch_support_pdl,
     load_jit,

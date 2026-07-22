@@ -10,7 +10,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.jit import is_arch_support_pdl
+from sglang.kernels.jit.utils import is_arch_support_pdl
 
 PAD_SLOT_ID = -1
 

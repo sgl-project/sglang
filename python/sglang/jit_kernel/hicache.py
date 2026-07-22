@@ -4,7 +4,7 @@ import logging
 from typing import TYPE_CHECKING
 
 from sglang.kernel_api_logging import debug_kernel_api
-from sglang.kernels.jit import cache_once, load_jit, make_cpp_args
+from sglang.kernels.jit.utils import cache_once, load_jit, make_cpp_args
 
 if TYPE_CHECKING:
     import torch

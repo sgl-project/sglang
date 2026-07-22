@@ -28,7 +28,7 @@ import torch.distributed as dist
 import sglang.srt.distributed.parallel_state as ps
 from sglang.jit_kernel.benchmark import marker
 from sglang.jit_kernel.benchmark.utils import get_benchmark_range, multigpu_bench_main
-from sglang.kernels.jit import cache_once
+from sglang.kernels.jit.utils import cache_once
 from sglang.srt.distributed.device_communicators.triton_symm_mem_ag import (
     all_gather_inner,
     create_state,

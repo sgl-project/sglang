@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.kernels.jit import (
+from sglang.kernels.jit.utils import (
     cache_once,
     get_jit_cuda_arch,
     load_jit,
