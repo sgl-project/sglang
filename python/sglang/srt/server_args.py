@@ -5250,6 +5250,19 @@ class ServerArgs:
             assert view.mamba_track_interval % view.page_size == 0
             assert self.mamba_cache_chunk_size is not None
 
+            if (
+                view.chunked_prefill_size is not None
+                and 0 < view.chunked_prefill_size < self.mamba_cache_chunk_size
+            ):
+                logger.warning(
+                    "Mamba radix extra-buffer is enabled with chunked_prefill_size=%s "
+                    "smaller than mamba_cache_chunk_size=%s. This can make "
+                    "mamba_track_mask false for unfinished chunked-prefill handoff "
+                    "and skip Mamba state checkpoints.",
+                    view.chunked_prefill_size,
+                    self.mamba_cache_chunk_size,
+                )
+
     def _handle_mamba_radix_cache(self, model_arch: str):
         # Resolution moved to the resolution pipeline (arg_groups/overrides.py:
         # _mamba_radix_cache_resolution), invoked here at each legacy call
