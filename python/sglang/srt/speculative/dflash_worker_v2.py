@@ -208,6 +208,7 @@ class _DominoDraftSampler:
             lm_head_org_vocab_start=self.lm_head_org_vocab_start,
             lm_head_num_org=self.lm_head_num_org,
             lm_head_num_org_padded=self.lm_head_num_org_padded,
+            prefer_tp_candidate_pool=bs > 1,
         )
         self.out[: bs * (self.block_size - 1)].copy_(proposals.reshape(-1))
 

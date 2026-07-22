@@ -314,6 +314,7 @@ def domino_greedy_rollout(
     lm_head_org_vocab_start: int = 0,
     lm_head_num_org: int | None = None,
     lm_head_num_org_padded: int | None = None,
+    prefer_tp_candidate_pool: bool | None = None,
 ) -> torch.Tensor:
     """Generate a Domino chain using one block-shared base-logit candidate pool."""
     if draft_hidden.ndim != 3:
@@ -375,13 +376,17 @@ def domino_greedy_rollout(
     local_logits = F.linear(logits_input, weight).view(
         num_proposals, batch_size, local_vocab_size
     )
-    full_base_logits_bytes = (
-        num_proposals * batch_size * int(vocab_size) * local_logits.element_size()
-    )
+    if prefer_tp_candidate_pool is None:
+        full_base_logits_bytes = (
+            num_proposals * batch_size * int(vocab_size) * local_logits.element_size()
+        )
+        prefer_tp_candidate_pool = (
+            full_base_logits_bytes > _DOMINO_TP_FULL_BASE_LOGITS_MAX_BYTES
+        )
     use_tp_candidate_pool = (
         tp_size > 1
+        and prefer_tp_candidate_pool
         and 0 < candidate_pool_size < int(vocab_size)
-        and full_base_logits_bytes > _DOMINO_TP_FULL_BASE_LOGITS_MAX_BYTES
     )
     first_ids = None
     candidate_ids = None

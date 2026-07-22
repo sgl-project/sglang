@@ -305,6 +305,8 @@ class TestDFlashDominoRollout(CustomTestCase):
                 self.candidate_ids = None
                 self.local_top_scores = None
                 self.remote_top_scores = None
+                self.full_logit_gathers = 0
+                self.candidate_all_reduces = 0
 
             def all_gather_into_tensor(self, output, local):
                 output[: local.shape[0]].copy_(local)
@@ -314,6 +316,7 @@ class TestDFlashDominoRollout(CustomTestCase):
                         remote_pos + 16 if local.dtype == torch.long else remote_max
                     )
                 elif local.shape[0] == local_vocab_size:
+                    self.full_logit_gathers += 1
                     remote = self.remote_logits.reshape(-1, local_vocab_size).T
                 else:
                     k = local.shape[1]
@@ -348,6 +351,7 @@ class TestDFlashDominoRollout(CustomTestCase):
                 output[local.shape[0] :].copy_(remote)
 
             def all_reduce(self, local):
+                self.candidate_all_reduces += 1
                 remote_owned = (self.candidate_ids >= 16) & (self.candidate_ids < 31)
                 remote_pos = (self.candidate_ids - 16).clamp(0, 14)
                 remote = torch.gather(
@@ -362,7 +366,6 @@ class TestDFlashDominoRollout(CustomTestCase):
                 return local
 
         block_size = 7
-        batch_size = 3
         local_vocab_size = 16
         padded_weight = torch.cat(
             (
@@ -377,34 +380,48 @@ class TestDFlashDominoRollout(CustomTestCase):
         )
         local_weight = padded_weight[:local_vocab_size]
         remote_weight = padded_weight[local_vocab_size:]
-        verified_ids = torch.tensor([1, 4, 9], device=self.device)
-
-        for shift_label in (True, False):
-            draft_hidden = torch.randn(
-                batch_size,
-                block_size,
-                self.hidden_size,
-                device=self.device,
-                dtype=self.dtype,
-            )
-            start = 0 if shift_label else 1
-            z = draft_hidden[:, start : start + block_size - 1]
-            logits_input = (
-                z.transpose(0, 1)
-                .contiguous()
-                .view((block_size - 1) * batch_size, self.hidden_size)
-            )
-            remote_logits = F.linear(logits_input, remote_weight).view(
-                block_size - 1, batch_size, local_vocab_size
-            )
-
-            cases = ((0, False), (5, False), (5, True))
-            for candidate_pool_size, force_compact in cases:
+        cases = (
+            (8, 5, None, 1 << 60, False),
+            (8, 5, None, 0, True),
+            (1, 5, False, 1 << 60, False),
+            (8, 5, True, 1 << 60, True),
+            (8, 0, True, 1 << 60, False),
+        )
+        for (
+            batch_size,
+            candidate_pool_size,
+            prefer_tp_candidate_pool,
+            full_base_logits_max_bytes,
+            expect_compact,
+        ) in cases:
+            verified_ids = torch.arange(batch_size, device=self.device)
+            for shift_label in (True, False):
                 with self.subTest(
+                    batch_size=batch_size,
                     shift_label=shift_label,
                     candidate_pool_size=candidate_pool_size,
-                    force_compact=force_compact,
+                    prefer_tp_candidate_pool=prefer_tp_candidate_pool,
+                    full_base_logits_max_bytes=full_base_logits_max_bytes,
+                    expect_compact=expect_compact,
                 ):
+                    draft_hidden = torch.randn(
+                        batch_size,
+                        block_size,
+                        self.hidden_size,
+                        device=self.device,
+                        dtype=self.dtype,
+                    )
+                    start = 0 if shift_label else 1
+                    z = draft_hidden[:, start : start + block_size - 1]
+                    logits_input = (
+                        z.transpose(0, 1)
+                        .contiguous()
+                        .view((block_size - 1) * batch_size, self.hidden_size)
+                    )
+                    remote_logits = F.linear(logits_input, remote_weight).view(
+                        block_size - 1, batch_size, local_vocab_size
+                    )
+                    tp_group = FakeTpGroup(remote_logits)
                     rollout_kwargs = dict(
                         draft_hidden=draft_hidden,
                         verified_ids=verified_ids,
@@ -415,18 +432,16 @@ class TestDFlashDominoRollout(CustomTestCase):
                         vocab_size=self.vocab_size,
                         shift_label=shift_label,
                         candidate_pool_size=candidate_pool_size,
-                        tp_group=FakeTpGroup(remote_logits),
+                        tp_group=tp_group,
                         lm_head_num_org=local_vocab_size,
                         lm_head_num_org_padded=local_vocab_size,
+                        prefer_tp_candidate_pool=prefer_tp_candidate_pool,
                     )
-                    if force_compact:
-                        with mock.patch(
-                            "sglang.srt.speculative.domino_utils."
-                            "_DOMINO_TP_FULL_BASE_LOGITS_MAX_BYTES",
-                            0,
-                        ):
-                            actual = domino_greedy_rollout(**rollout_kwargs)
-                    else:
+                    with mock.patch(
+                        "sglang.srt.speculative.domino_utils."
+                        "_DOMINO_TP_FULL_BASE_LOGITS_MAX_BYTES",
+                        full_base_logits_max_bytes,
+                    ):
                         actual = domino_greedy_rollout(**rollout_kwargs)
                     expected = self._oracle(
                         draft_hidden,
@@ -435,6 +450,56 @@ class TestDFlashDominoRollout(CustomTestCase):
                         candidate_pool_size=candidate_pool_size,
                     )
                     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                    self.assertEqual(
+                        tp_group.candidate_all_reduces, int(expect_compact)
+                    )
+                    self.assertEqual(
+                        tp_group.full_logit_gathers, int(not expect_compact)
+                    )
+
+    def test_capture_sampler_uses_capture_bucket_policy(self):
+        from sglang.srt.speculative.dflash_worker_v2 import _DominoDraftSampler
+
+        block_size = 7
+        sampler = _DominoDraftSampler(
+            target_embedding=self.embedding,
+            lm_head_weight=self.lm_head_weight,
+            prefix_gru=self.prefix_gru,
+            embed_proj=self.embed_proj,
+            vocab_size=self.vocab_size,
+            block_size=block_size,
+            shift_label=True,
+            max_bs=8,
+            candidate_pool_size=5,
+        )
+        for batch_size, expect_compact in ((1, False), (8, True)):
+            with self.subTest(capture_bucket=batch_size, expect_compact=expect_compact):
+                hidden_states = torch.randn(
+                    batch_size * block_size,
+                    self.hidden_size,
+                    device=self.device,
+                    dtype=self.dtype,
+                )
+                input_ids = torch.zeros(
+                    batch_size * block_size,
+                    device=self.device,
+                    dtype=torch.long,
+                )
+                proposals = torch.zeros(
+                    batch_size,
+                    block_size - 1,
+                    device=self.device,
+                    dtype=torch.long,
+                )
+                with mock.patch(
+                    "sglang.srt.speculative.dflash_worker_v2.domino_greedy_rollout",
+                    return_value=proposals,
+                ) as rollout:
+                    sampler(hidden_states, input_ids)
+                self.assertEqual(
+                    rollout.call_args.kwargs["prefer_tp_candidate_pool"],
+                    expect_compact,
+                )
 
     def test_block_candidate_pool_matches_oracle(self):
         block_size = 7
