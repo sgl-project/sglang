@@ -1,0 +1,159 @@
+---
+title: MiniCPM5-1B
+metatags:
+    description: "Deploy OpenBMB MiniCPM5-1B with SGLang for compact long-context chat, reasoning, and tool-calling workloads."
+tag: NEW
+---
+
+## 1. Model introduction
+
+[MiniCPM5-1B](https://huggingface.co/openbmb/MiniCPM5-1B) is the first checkpoint in OpenBMB's MiniCPM5 series. It is a compact causal language model for local assistants, coding agents, tool-use workflows, and reasoning tasks for small deployments.
+
+**Key features:**
+
+- **Compact deployment**: 1B-class dense model designed for local and edge use cases.
+- **Long context**: supports up to 131,072 tokens.
+- **Hybrid reasoning**: supports Think and No Think modes through the chat template.
+- **Tool calling**: emits XML-style function calls that SGLang can convert to OpenAI-compatible `tool_calls` with the `minicpm5` parser.
+
+**License:** [Apache 2.0](https://www.apache.org/licenses/LICENSE-2.0).
+
+## 2. SGLang installation
+
+Install SGLang with SRT support:
+
+```bash Command
+pip install sglang
+```
+
+For other installation methods, see the [official SGLang installation guide](/docs/get-started/install).
+
+## 3. Model deployment
+
+Start an OpenAI-compatible SGLang server:
+
+```bash Command
+python -m sglang.launch_server \
+  --model-path openbmb/MiniCPM5-1B \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
+To enable MiniCPM5 tool calling, add the built-in parser:
+
+```bash Command
+python -m sglang.launch_server \
+  --model-path openbmb/MiniCPM5-1B \
+  --tool-call-parser minicpm5 \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
+You can also use automatic template and parser detection:
+
+```bash Command
+python -m sglang.launch_server \
+  --model-path openbmb/MiniCPM5-1B \
+  --tool-call-parser auto \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
+## 4. Model invocation
+
+### 4.1 Basic usage
+
+```bash Command
+curl http://localhost:30000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "openbmb/MiniCPM5-1B",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Who are you? Please briefly introduce yourself."
+      }
+    ],
+    "max_tokens": 128,
+    "temperature": 0.7
+  }'
+```
+
+### 4.2 Python client OpenAI Compatible API
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:30000/v1",
+    api_key="EMPTY",
+)
+
+response = client.chat.completions.create(
+    model="openbmb/MiniCPM5-1B",
+    messages=[
+        {
+            "role": "user",
+            "content": "Who are you? Please briefly introduce yourself.",
+        }
+    ],
+    max_tokens=128,
+    temperature=0.7,
+)
+
+print(response.choices[0].message.content)
+```
+
+### 4.3 Thinking mode
+
+MiniCPM5-1B supports Think and No Think modes through the chat template. The Hugging Face model card recommends these sampling settings:
+
+| Mode | Recommended parameters | Template option |
+| --- | --- | --- |
+| Think | `temperature=0.9`, `top_p=0.95` | `enable_thinking=True` |
+| No Think | `temperature=0.7`, `top_p=0.95` | `enable_thinking=False` |
+
+For local Transformers usage, pass `enable_thinking` through `tokenizer.apply_chat_template`. For SGLang serving, use the model's chat template behavior and set sampling parameters per request.
+
+### 4.4 Tool calling
+
+Launch the server with `--tool-call-parser minicpm5`, then send OpenAI-compatible tool definitions:
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
+
+response = client.chat.completions.create(
+    model="openbmb/MiniCPM5-1B",
+    messages=[
+        {
+            "role": "user",
+            "content": "Call the weather tool for San Francisco.",
+        }
+    ],
+    tools=[
+        {
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get the weather for a city.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "city": {"type": "string"},
+                    },
+                    "required": ["city"],
+                },
+            },
+        }
+    ],
+)
+
+print(response.choices[0].message.tool_calls)
+```
+
+## 5. References
+
+- [MiniCPM5-1B Hugging Face model card](https://huggingface.co/openbmb/MiniCPM5-1B)
+- [SGLang OpenAI-compatible API](/docs/basic_usage/openai_api_completions)
