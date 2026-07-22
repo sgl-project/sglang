@@ -41,6 +41,7 @@ from torch.distributed import barrier
 from sglang.kernels.ops.mamba.triton_ops import (
     initialize_mamba_selective_state_update_backend,
 )
+from sglang.srt.beam_search.coordinator import BeamCoordinator
 from sglang.srt.configs.model_config import ModelConfig, ModelImpl, is_minimax_sparse
 from sglang.srt.constrained.grammar_manager import GrammarManager
 from sglang.srt.debug_utils.pr_fix_toggle import maybe_revert_pr_fix
@@ -1873,7 +1874,22 @@ class Scheduler(
             enable_hicache_storage=lambda: self.enable_hicache_storage,
         )
 
+    def init_beam_coordinator(self) -> None:
+        self.beam_coordinator = BeamCoordinator(
+            server_args=self.server_args,
+            model_config=self.model_config,
+            spec_algorithm=self.spec_algorithm,
+            enable_overlap=self.enable_overlap,
+            dllm_enabled=self.dllm_config is not None,
+            max_req_len=self.max_req_len,
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            tree_cache=self.tree_cache,
+            future_map=self.future_map,
+        )
+
     def init_batch_result_processor(self) -> None:
+        self.init_beam_coordinator()
         self.batch_result_processor = SchedulerBatchResultProcessor(
             is_generation=self.is_generation,
             disaggregation_mode=self.disaggregation_mode,
@@ -1894,6 +1910,7 @@ class Scheduler(
                 server_args=self.server_args, model_config=self.model_config
             ),
             output_streamer=self.output_streamer,
+            beam_coordinator=self.beam_coordinator,
             abort_request=self.abort_request,
         )
 
@@ -2109,13 +2126,19 @@ class Scheduler(
                 # Use default bootstrap port
                 recv_req.bootstrap_port = self.server_args.disaggregation_bootstrap_port
 
+            # Beam request (sampling_params.beam_width > 1): the leader rides
+            # the standard per-row top-2k logprob channel internally.
+            beam_width = BeamCoordinator.request_beam_width(recv_req)
+            is_beam = beam_width > 1
             req = Req(
                 recv_req.rid,
                 recv_req.input_text,
                 recv_req.input_ids,
                 recv_req.sampling_params,
-                return_logprob=recv_req.return_logprob,
-                top_logprobs_num=recv_req.top_logprobs_num,
+                return_logprob=True if is_beam else recv_req.return_logprob,
+                top_logprobs_num=(
+                    2 * beam_width if is_beam else recv_req.top_logprobs_num
+                ),
                 token_ids_logprob=recv_req.token_ids_logprob,
                 return_sampling_mask=recv_req.return_sampling_mask,
                 stream=recv_req.stream,
@@ -2152,6 +2175,14 @@ class Scheduler(
                 multi_item_delimiter_indices=recv_req.multi_item_delimiter_indices,
             )
             req.tokenizer = self.tokenizer
+
+            if is_beam:
+                error_msg = self.beam_coordinator.validate_and_init(req, recv_req)
+                if error_msg:
+                    logger.error(error_msg)
+                    prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
+                    self.output_streamer.stream_output([req], req.return_logprob)
+                    return
 
             if self.disaggregation_mode != DisaggregationMode.NULL:
                 # Invalid request for disaggregated mode
@@ -2778,6 +2809,15 @@ class Scheduler(
                     # Merge running_batch with prefill batch
                     running_batch.merge_batch(last_batch)
 
+        # Spawn pending beam members as decode-ready rows (their leader merged
+        # just above, so the whole group enters decode in the same tick).
+        member_batch = self.beam_coordinator.build_pending_member_batch()
+        if member_batch is not None:
+            if running_batch.is_empty():
+                running_batch = member_batch
+            else:
+                running_batch.merge_batch(member_batch)
+
         # For prefill-only batch, filter out finished requests since they
         # won't go through the decode step. This keeps running_batch accurate
         # for load reporting (num_running_reqs via /v1/loads).
@@ -2836,9 +2876,32 @@ class Scheduler(
 
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
-    def get_num_allocatable_reqs(self, running_bs):
-        res = get_server_args().pp_max_micro_batch_size - running_bs
-        res = min(res, self.req_to_token_pool.available_size())
+    def get_num_allocatable_reqs(
+        self,
+        running_bs: int,
+        beam_width: Optional[int] = None,
+        running_batch: Optional[ScheduleBatch] = None,
+    ) -> int:
+        pp_budget = get_server_args().pp_max_micro_batch_size - running_bs
+        available = self.req_to_token_pool.available_size()
+
+        # New-path beam groups: reserve the member rows that admitted-but-not-
+        # yet-spawned groups will claim (beam_width - 1 each, leader included
+        # in its own row), so admission never over-commits the req slot pool.
+        active_batch = running_batch or self.running_batch
+        pending_member_rows = sum(
+            r.beam_group.beam_width - 1
+            for r in active_batch.reqs
+            if r.beam_group is not None
+            and len(r.beam_group.member_reqs) < r.beam_group.beam_width
+            and not r.finished()
+        )
+        available = max(available - pending_member_rows, 0)
+        res = min(pp_budget, available)
+        if beam_width is not None:
+            # A beam candidate owns beam_width rows once decoding.
+            res = min(res, available // beam_width)
+
         return res
 
     def get_new_batch_prefill(self, running_batch: ScheduleBatch) -> NextBatchPlan:
@@ -2892,7 +2955,9 @@ class Scheduler(
             and self.chunked_req is None
             and self.min_free_slots_delayer.should_delay(
                 running_bs=running_bs,
-                num_allocatable_reqs=self.get_num_allocatable_reqs(running_bs),
+                num_allocatable_reqs=self.get_num_allocatable_reqs(
+                    running_bs, running_batch=running_batch
+                ),
             )
         ):
             return None, running_batch
@@ -2903,7 +2968,7 @@ class Scheduler(
         # In PP case, chunked requests (or dllm requests) can start in one microbatch and end in another microbatch, so the max_running_requests per microbatch should not be strict.
         # Instead, we should always allow chunked requests to be added, otherwise, there will be a memory leak.
         if (
-            self.get_num_allocatable_reqs(running_bs) <= 0
+            self.get_num_allocatable_reqs(running_bs, running_batch=running_batch) <= 0
             and self.chunked_req is None
             and not self.enable_priority_preemption
         ):
@@ -2972,7 +3037,14 @@ class Scheduler(
                 continue
 
             running_bs = len(running_batch.reqs)
-            if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
+            candidate_beam_width = (
+                req.beam_group.beam_width if req.beam_group is not None else None
+            )
+            if len(adder.can_run_list) >= self.get_num_allocatable_reqs(
+                running_bs,
+                candidate_beam_width,
+                running_batch=running_batch,
+            ):
                 running_batch.batch_is_full = True
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 # In prefill mode, prealloc queue and transfer queue can also take memory,

@@ -44,6 +44,10 @@ import zmq
 import zmq.asyncio
 from fastapi import BackgroundTasks
 
+from sglang.srt.beam_search.output import (
+    build_beam_search_out,
+    try_build_beam_search_out_dict,
+)
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.encode_receiver import create_mm_receiver
@@ -1536,6 +1540,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             ):
                 out["text"] = state.get_text()
 
+            # If this is a beam search result, convert it to a regular out dict so
+            # all subsequent finished/logging/metrics logic is shared automatically.
+            if out.get("beam_results"):
+                if not finished:
+                    # Intermediate beam search output — skip until finished
+                    continue
+                out = build_beam_search_out(out)
+
             if finished:
                 # Record response sent time right before we log finished results and metrics.
                 if not state.time_stats.response_sent_to_client_time:
@@ -2025,7 +2037,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 meta_info["dp_rank"] = recv_obj.dp_ranks[i]
 
             state.finished = recv_obj.finished_reasons[i] is not None
-            if isinstance(recv_obj, BatchStrOutput):
+
+            # Build beam search out dict after meta_info is fully populated,
+            beam_out_dict = try_build_beam_search_out_dict(recv_obj, i, meta_info)
+
+            if beam_out_dict is not None:
+                out_dict = beam_out_dict
+            elif isinstance(recv_obj, BatchStrOutput):
                 # Not all request types have `stream` (e.g., EmbeddingReqInput). Default to non-streaming.
                 is_stream = getattr(state.obj, "stream", False)
                 incremental = is_stream and self.incremental_streaming_output

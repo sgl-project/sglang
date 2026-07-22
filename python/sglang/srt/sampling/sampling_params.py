@@ -98,6 +98,9 @@ class SamplingParams(msgspec.Struct, kw_only=True, omit_defaults=True):
     repetition_penalty: float = 1.0
     min_new_tokens: int = 0
     n: int = 1
+    # beam_width > 1 turns the request into a beam search request; n then means
+    # "number of returned sequences" (n <= beam_width, default = beam_width).
+    beam_width: Optional[int] = None
     json_schema: Optional[str] = None
     regex: Optional[str] = None
     ebnf: Optional[str] = None
@@ -173,6 +176,8 @@ class SamplingParams(msgspec.Struct, kw_only=True, omit_defaults=True):
             self.top_k = TOP_K_ALL  # whole vocabulary
 
     def verify(self, vocab_size):
+        if self.beam_width is not None and self.beam_width < 1:
+            raise ValueError(f"beam_width must be at least 1, got {self.beam_width}.")
         if not math.isfinite(self.temperature) or self.temperature < 0.0:
             raise ValueError(
                 f"temperature must be a non-negative finite number, got {self.temperature}."

@@ -49,6 +49,7 @@ import zmq
 import zmq.asyncio
 from pydantic import PlainValidator
 
+from sglang.srt.beam_search.types import BeamSearchSequence
 from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.embed_types import PositionalEmbeds
@@ -94,6 +95,10 @@ class BaseBatchReq(msgspec.Struct, tag=True, kw_only=True, array_like=True):
     @classmethod
     def __get_pydantic_core_schema__(cls, source, handler):
         return msgspec_struct_pydantic_core_schema(cls, handler)
+
+
+class BeamSearchOutput(BaseBatchReq, kw_only=True):
+    sequences: List[BeamSearchSequence]
 
 
 class PickleWrapper(msgspec.Struct, tag=True, array_like=True):
@@ -398,6 +403,24 @@ class GenerateReqInput:
                 self.is_single = False
                 self.batch_size = len(self.input_embeds)
 
+    def _sampling_params_beam_width(self) -> int:
+        """beam_width of the request's sampling params (1 = not a beam request)."""
+        if isinstance(self.sampling_params, dict):
+            return self.sampling_params.get("beam_width") or 1
+        elif isinstance(self.sampling_params, list) and self.sampling_params:
+            return self.sampling_params[0].get("beam_width") or 1
+        return 1
+
+    def _handle_beam_search_parallel_sampling(self) -> int:
+        """Disable parallel-sampling fan-out for beam requests.
+
+        beam_width > 1 makes this a beam request; n keeps its "number of
+        returned sequences" meaning, so there is no fan-out.
+        """
+        if self._sampling_params_beam_width() > 1:
+            return 1
+        return self.parallel_sample_num
+
     def _handle_parallel_sampling(self):
         """Handle parallel sampling parameters and adjust batch size if needed."""
         # Determine parallel sample count
@@ -413,6 +436,8 @@ class GenerateReqInput:
                     raise ValueError(
                         "The parallel_sample_num should be the same for all samples in sample params."
                     )
+
+        self.parallel_sample_num = self._handle_beam_search_parallel_sampling()
 
         # If using parallel sampling with a single example, convert to batch
         if self.parallel_sample_num > 1 and self.is_single:
@@ -1267,6 +1292,10 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     # Number of times each request was retracted.
     retraction_counts: Optional[List[int]] = None
 
+    # Per-item beam carrier; None entries are non-beam items in a mixed
+    # batch (the whole field is None when the batch has no beam item).
+    beam_search_output: Optional[List[Optional[BeamSearchOutput]]] = None
+
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: Optional[List[List[int]]] = None
 
@@ -1348,6 +1377,10 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
 
     # Number of times each request was retracted.
     retraction_counts: Optional[List[int]] = None
+
+    # Per-item beam carrier; None entries are non-beam items in a mixed
+    # batch (the whole field is None when the batch has no beam item).
+    beam_search_output: Optional[List[Optional[BeamSearchOutput]]] = None
 
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: Optional[List[List[int]]] = None
