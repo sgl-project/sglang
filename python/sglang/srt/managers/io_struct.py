@@ -734,6 +734,13 @@ class GenerateReqInput:
             return_routed_experts=self.return_routed_experts,
             routed_experts_start_len=self.routed_experts_start_len,
             return_indexer_topk=self.return_indexer_topk,
+            # NOTE: this constructor is an explicit allowlist, so any request-scoped
+            # field not listed here is silently dropped when an n>1 batch is sliced.
+            # Other fields still affected by this are tracked in #27216 (multimodal
+            # tiling), #27217 (EPD/disaggregation), #27218 (session_params), and
+            # #27231 (background).
+            require_reasoning=self.require_reasoning,
+            routing_key=self.routing_key,
             modalities=self.modalities[i] if self.modalities else None,
             session_params=self.session_params,
             lora_path=self.lora_path[i] if self.lora_path is not None else None,
