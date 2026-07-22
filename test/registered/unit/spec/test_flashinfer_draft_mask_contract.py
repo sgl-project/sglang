@@ -10,10 +10,10 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 def _import_flashinfer_backend():
     try:
+        from sglang.srt.layers.attention import flashinfer_backend
         from sglang.srt.layers.attention.flashinfer_backend import (
             FlashInferAttnBackend,
         )
-        from sglang.srt.layers.attention import flashinfer_backend
     except Exception as exc:
         pytest.skip(f"FlashInfer backend is unavailable: {exc}")
     return FlashInferAttnBackend, flashinfer_backend
