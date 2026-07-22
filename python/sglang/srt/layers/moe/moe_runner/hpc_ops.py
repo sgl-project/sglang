@@ -55,8 +55,8 @@ def pad_hpc_ops_block_scale(scale: torch.Tensor) -> torch.Tensor:
     """Pad the K dim (last dim) of a [E, N/128, K/128] block scale to %4."""
     k = scale.shape[-1]
     k_pad = (k + _SCALE_K_ALIGN - 1) // _SCALE_K_ALIGN * _SCALE_K_ALIGN
-    if k == k_pad and scale.is_contiguous():
-        return scale
+    if k == k_pad:
+        return scale.contiguous()
     padded = scale.new_zeros((*scale.shape[:-1], k_pad))
     padded[..., :k].copy_(scale)
     return padded

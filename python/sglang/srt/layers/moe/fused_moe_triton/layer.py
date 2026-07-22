@@ -155,6 +155,24 @@ class FusedMoeWeightScaleSupported(Enum):
     BLOCK = "block"
 
 
+def _validate_hpc_ops_quant_method(quant_method) -> None:
+    """--moe-runner-backend hpc_ops makes the standard dispatcher keep global
+    expert ids for every MoE layer, so the resolved quant method must be the
+    FP8 one the hpc_ops runner supports. Quant methods that never construct a
+    MoeRunner (e.g. W4AFp8 calls its kernel directly from apply()) bypass the
+    MoeRunner-level guard, so validate here at layer init.
+    """
+    if get_moe_runner_backend().is_hpc_ops() and not isinstance(
+        quant_method, Fp8MoEMethod
+    ):
+        raise ValueError(
+            "--moe-runner-backend hpc_ops only supports Fp8MoEMethod "
+            "(FP8 blockwise or per-tensor MoE), but this layer selected "
+            f"{type(quant_method).__name__}. Remove --moe-runner-backend "
+            "hpc_ops for this model."
+        )
+
+
 class FusedMoE(torch.nn.Module):
     """FusedMoE layer for MoE models.
 
@@ -331,6 +349,7 @@ class FusedMoE(torch.nn.Module):
                     self.use_flashinfer_trtllm_moe,
                     self.use_deep_gemm,
                 )
+        _validate_hpc_ops_quant_method(self.quant_method)
         self.supports_deferred_finalize = (
             envs.SGLANG_ENABLE_MOE_DEFERRED_FINALIZE.get()
             and get_moe_runner_backend().is_flashinfer_trtllm()
