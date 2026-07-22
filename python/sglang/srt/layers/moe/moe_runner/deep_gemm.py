@@ -66,6 +66,14 @@ else:
 _DEEPGEMM_ON_H20 = get_bool_env_var("SGLANG_DEEPGEMM_ON_H20")
 
 
+def _get_mn_major_tma_aligned_tensor_keep_owner(sf: torch.Tensor) -> torch.Tensor:
+    """Transform a scale to deep_gemm's MN-major TMA-aligned layout without losing ownership of its storage."""
+    out = deep_gemm_wrapper.get_mn_major_tma_aligned_tensor(sf)
+    # An already-aligned scale short-circuits to a NON-owning alias over tvm-ffi;
+    # rebinding through it would free the storage mid-forward, so keep the owner.
+    return sf if out.data_ptr() == sf.data_ptr() else out
+
+
 # TODO(kaixih@nvidia): ideally we should merge this logic into
 # `fill_gateup_input_triton_kernel` to directly generate e8m0 scale.
 @torch.compile(disable=_is_hip or _is_npu)
@@ -439,7 +447,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                     hidden_states_scale
                 )
         elif deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES:
-            hidden_states_scale = deep_gemm_wrapper.get_mn_major_tma_aligned_tensor(
+            hidden_states_scale = _get_mn_major_tma_aligned_tensor_keep_owner(
                 hidden_states_scale
             )
 
@@ -529,7 +537,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 )
             )
         elif deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES:
-            down_input_scale = deep_gemm_wrapper.get_mn_major_tma_aligned_tensor(
+            down_input_scale = _get_mn_major_tma_aligned_tensor_keep_owner(
                 down_input_scale
             )
 
