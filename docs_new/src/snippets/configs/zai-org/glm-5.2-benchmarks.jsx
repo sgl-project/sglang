@@ -27,12 +27,12 @@ export const benchmarks = [
   },
       {
     match: { hw: "h200", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
-    sglang_version: "0.5.15",
+    sglang_version: "0.5.15.post1",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1024 },
-        ttft_ms: 530003, tpot_ms: 58.93, tokens_per_sec_per_gpu: 1766 },
+        ttft_ms: 530991, tpot_ms: 62.11, tokens_per_sec_per_gpu: 1711 },
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 4096 },
-        ttft_ms: 2372600, tpot_ms: 66.17, tokens_per_sec_per_gpu: 1615 },
+        ttft_ms: 2379560, tpot_ms: 66.4, tokens_per_sec_per_gpu: 1599 },
     ],
   },
   // ---- B200 + FP8 ----  (8-GPU single node, TP8; real weights, --random-range-ratio 1.0, flush-cache every run)
@@ -158,12 +158,12 @@ export const benchmarks = [
   },
     {
     match: { hw: "b300", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" },
-    sglang_version: "0.5.15",
+    sglang_version: "0.5.15.post1",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1024 },
-        ttft_ms: 453045, tpot_ms: 50.85, tokens_per_sec_per_gpu: 2129 },
+        ttft_ms: 454915, tpot_ms: 50.99, tokens_per_sec_per_gpu: 2120 },
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 4096 },
-        ttft_ms: 2087134, tpot_ms: 54.13, tokens_per_sec_per_gpu: 2126 },
+        ttft_ms: 2089630, tpot_ms: 55.61, tokens_per_sec_per_gpu: 2122 },
     ],
   },
   // ---- BF16 multi-node (inferred) ----  benchmarks pending
@@ -286,12 +286,12 @@ export const benchmarks = [
   },
     {
     match: { hw: "gb300", variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "single" },
-    sglang_version: "0.5.15",
+    sglang_version: "0.5.15.post1",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1024 },
-        ttft_ms: 186446, tpot_ms: 92.05, tokens_per_sec_per_gpu: 7617 },
+        ttft_ms: 111104, tpot_ms: 182.37, tokens_per_sec_per_gpu: 7904 },
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 4096 },
-        ttft_ms: 1101528, tpot_ms: 92.49, tokens_per_sec_per_gpu: 7541 },
+        ttft_ms: 871704, tpot_ms: 229.03, tokens_per_sec_per_gpu: 7686 },
     ],
   },
     {
