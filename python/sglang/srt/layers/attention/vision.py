@@ -803,11 +803,11 @@ class VisionAscendAttention(nn.Module):
              [b * s, h, head_size]
         """
         if forward_metadata is not None:
-            seq_lens = forward_metadata.seq_lens
-            if seq_lens.is_npu:
-                seq_lens = seq_lens.to("cpu")
+            # TND fused attention expects cumulative seqlens (cu_seqlens[1:]),
+            # not per-sequence lengths in forward_metadata.seq_lens.
+            cu = forward_metadata.cu_seqlens.to("cpu")
             output = torch.empty_like(q)
-            seq_len_arg = seq_lens.to(torch.int32)
+            seq_len_arg = cu[1:].to(torch.int32)
         elif envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get():
             if "output_ws" not in kwargs:
                 raise RuntimeError("output_ws should be prepared for npu-graph mode")

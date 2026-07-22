@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING, List, Sequence, Tuple
 
 import torch
 
-from sglang.jit_kernel.utils import (
+from sglang.kernels.jit.utils import (
     cache_once,
     is_arch_support_pdl,
     load_jit,
