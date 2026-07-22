@@ -4,9 +4,9 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.kernels.ops.attention.dsa.dequant_k_cache import dequantize_k_cache_paged
 from sglang.kernels.ops.attention.utils import concat_and_cast_mha_k_triton
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.dsa.dequant_k_cache import dequantize_k_cache_paged
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.dcp import (
@@ -43,7 +43,7 @@ if TYPE_CHECKING:
 if _is_cuda:
     from sgl_kernel import merge_state_v2
 
-    from sglang.jit_kernel.concat_mla import concat_mla_k
+    from sglang.kernels.ops.attention.concat_mla import concat_mla_k
 elif _is_musa:
     from sgl_kernel import concat_mla_k
 
@@ -141,7 +141,6 @@ def _forward_dsa_indexer_for_mha(
 
 
 class DeepseekMHAForwardMixin:
-
     def init_mha_forward(self: DeepseekV2AttentionMLA):
         self.disable_chunked_prefix_cache = (
             get_server_args().disable_chunked_prefix_cache
@@ -224,7 +223,6 @@ class DeepseekMHAForwardMixin:
                 )
                 q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
             elif _use_aiter_gfx95 and self.q_b_proj.weight.dtype == torch.float8_e4m3fn:
-
                 q, _, _, _ = fused_rms_fp8_group_quant(
                     q,
                     self.q_a_layernorm.weight,
@@ -256,7 +254,6 @@ class DeepseekMHAForwardMixin:
         latent_cache = latent_cache.unsqueeze(1)
 
         if _use_aiter_gfx95 and self.kv_b_proj.weight.dtype == torch.float8_e4m3fn:
-
             kv_a_quanted, kv_a, _, _ = fused_rms_fp8_group_quant(
                 kv_a,
                 self.kv_a_layernorm.weight,
@@ -464,7 +461,6 @@ class DeepseekMHAForwardMixin:
         accum_lse: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-
         # kv_b_proj needs BF16 input, but legacy q.dtype was BF16 by accident.
         backend = _resolve_attn_backend(forward_batch)
         pack_fn = getattr(backend, "pack_prefix_chunk_kv", None)
@@ -507,7 +503,17 @@ class DeepseekMHAForwardMixin:
                 k[..., : self.qk_nope_head_dim] = k_nope
                 k[..., self.qk_nope_head_dim :] = k_pe
 
-            output, lse = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
+            output, lse = self.attn_mha(
+                q,
+                k,
+                v,
+                forward_batch,
+                save_kv_cache=False,
+                # Prefix K/V is independent of the suffix query length. Under
+                # FullCG this is the fixed captured chunk extent; per-request
+                # active lengths remain encoded in the backend metadata.
+                key_value_num_tokens=k.shape[0],
+            )
             tmp_output = torch.empty_like(accum_output)
             tmp_lse = torch.empty_like(accum_lse)
             merge_state_v2(output, lse, accum_output, accum_lse, tmp_output, tmp_lse)

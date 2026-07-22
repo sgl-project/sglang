@@ -5,12 +5,12 @@ from typing import Literal, Optional
 
 import torch
 
-from sglang.jit_kernel.kv_canary.verify import (
+from sglang.jit_kernel.tests.kv_canary._constants import DEFAULT_NUM_SLOTS
+from sglang.kernels.ops.kv_canary.verify import (
     RealKvSource,
     VerifyPlan,
 )
-from sglang.jit_kernel.kv_canary.write import WritePlan
-from sglang.jit_kernel.tests.kv_canary._constants import DEFAULT_NUM_SLOTS
+from sglang.kernels.ops.kv_canary.write import WritePlan
 
 _DEVICE = torch.device("cuda")
 

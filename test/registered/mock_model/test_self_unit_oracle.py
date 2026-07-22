@@ -5,7 +5,7 @@ import unittest
 
 import torch
 
-from sglang.jit_kernel.kv_canary.consts import splitmix64
+from sglang.kernels.ops.kv_canary.consts import splitmix64
 from sglang.srt.kv_canary.token_oracle.oracle import (
     HashOracle,
     _splitmix64_tensor,
