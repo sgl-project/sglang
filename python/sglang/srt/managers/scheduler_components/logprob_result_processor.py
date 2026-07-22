@@ -1,20 +1,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import (
-    List,
-    Tuple,
-)
+from typing import List, Tuple
 
 import torch
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.server_args import (
-    MIS_DELIMITER_TOKEN_ID,
-    ServerArgs,
-)
+from sglang.srt.runtime_context import get_exec
+from sglang.srt.server_args import MIS_DELIMITER_TOKEN_ID, ServerArgs
 
 
 @dataclass(kw_only=True, slots=True, frozen=True)
@@ -164,7 +159,7 @@ class SchedulerLogprobResultProcessor:
         delimiter token receive logprobs.
         """
         return (
-            self.server_args.enable_mis
+            get_exec().features.enable_mis
             and req.is_prefill_only
             and req.multi_item_delimiter_indices is not None
         )

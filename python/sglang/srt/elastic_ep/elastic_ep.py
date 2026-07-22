@@ -442,7 +442,7 @@ def get_healthy_expert_location_src_rank(
     *, invoked_in_elastic_ep_rejoin_path: bool
 ) -> int:
     world_group = get_world_group()
-    # NOTE: do not key off `self.server_args.elastic_ep_rejoin` here.
+    # NOTE: do not key off `get_exec().moe.elastic_ep_rejoin` here.
     # A rank that was started as a rejoin rank may later act as a healthy
     # rank in a subsequent recovery cycle.
     local_rejoin_flag = bool(invoked_in_elastic_ep_rejoin_path)

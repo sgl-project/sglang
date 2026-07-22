@@ -26,7 +26,7 @@ from sglang.srt.models.inkling_common.kernels.sconv import (
     save_intermediate_conv_windows,
     update_sconv_cache,
 )
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
 from sglang.srt.utils import is_cuda, set_weight_attrs
 
@@ -482,7 +482,7 @@ class ShortConvolution(nn.Module):
 
         crossed = track_step = None
         if do_tracking:
-            mamba_track_interval = get_server_args().mamba_track_interval
+            mamba_track_interval = get_exec().mamba.mamba_track_interval
             pre_seqlen = forward_batch.seq_lens[:batch_size] - draft_token_num
             post_seqlen = pre_seqlen + num_accept_tokens
             crossed = (pre_seqlen // mamba_track_interval) != (

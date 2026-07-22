@@ -48,6 +48,7 @@ from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.observability.req_time_stats import DPControllerReqTimeStats
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
+from sglang.srt.runtime_context import get_exec
 from sglang.srt.server_args import (
     DP_ATTENTION_HANDSHAKE_PORT_DELTA,
     PortArgs,
@@ -231,7 +232,7 @@ class DataParallelController:
                 sock_send(worker, obj)
 
     def update_active_ranks(self, ranks: ActiveRanksOutput):
-        if self.server_args.elastic_ep_backend is not None:
+        if get_exec().moe.elastic_ep_backend is not None:
             if len(ranks.status) != self.max_dp_size:
                 logger.warning(
                     "[Elastic EP][DPC] active rank status len=%d != max_dp_size=%d; "
@@ -484,7 +485,7 @@ class DataParallelController:
             logger.debug("Worker port broadcast completed")
             return worker_ports
         finally:
-            if self.server_args.elastic_ep_backend is None:
+            if get_exec().moe.elastic_ep_backend is None:
                 rep_socket.close()
             else:
                 threading.Thread(

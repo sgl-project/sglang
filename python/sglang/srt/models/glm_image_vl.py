@@ -34,10 +34,7 @@ from sglang.srt.layers.attention.vision import (
 )
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.layers.linear import (
-    QKVParallelLinear,
-    RowParallelLinear,
-)
+from sglang.srt.layers.linear import QKVParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -57,7 +54,7 @@ from sglang.srt.models.qwen2 import Qwen2MLP as GlmImageTextMLP
 from sglang.srt.models.qwen3_vl import Qwen3_VisionMLP as GlmImageVisionMLP
 from sglang.srt.models.utils import compute_cu_seqlens_from_grid_numpy
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import get_mm, get_parallel
 from sglang.srt.utils import add_prefix, is_npu
 
 logger = logging.getLogger(__name__)
@@ -1018,7 +1015,7 @@ class GlmImageForConditionalGeneration(nn.Module):
         self.vision_config = config.vision_config
         self.vq_config = config.vq_config
         self.text_config = config.text_config
-        self.use_data_parallel = get_server_args().mm_enable_dp_encoder
+        self.use_data_parallel = get_mm().mm_enable_dp_encoder
 
         # Bridge rope_parameters -> rope_scaling so Glm4Model can pick it up
         if hasattr(self.text_config, "rope_parameters") and not getattr(

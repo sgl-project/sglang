@@ -74,7 +74,7 @@ from sglang.srt.model_loader.weight_utils import (
 from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
 from sglang.srt.models.kimi_vl_moonvit import MoonVitPretrainedModel
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import get_mm
 from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
@@ -126,7 +126,7 @@ class KimiVLForConditionalGeneration(nn.Module):
         self.config = config
         assert isinstance(config.vision_config, MoonViTConfig)
 
-        self.use_data_parallel = get_server_args().mm_enable_dp_encoder
+        self.use_data_parallel = get_mm().mm_enable_dp_encoder
         self.vision_tower = MoonVitPretrainedModel(
             config.vision_config,
             prefix=add_prefix("vision_tower", prefix),

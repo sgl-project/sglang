@@ -12,9 +12,7 @@ from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import world_dp_gather_enabled
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.managers.scheduler_components.recv_skipper import (
-    SchedulerRecvSkipper,
-)
+from sglang.srt.managers.scheduler_components.recv_skipper import SchedulerRecvSkipper
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -26,6 +24,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.metrics_collector import DPCooperationInfo
+from sglang.srt.runtime_context import get_schedule
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.common import require_mlp_tp_gather
@@ -385,7 +384,7 @@ class SchedulerDPAttnAdapter:
             get_idle_batch=self.get_idle_batch,
             disable_cuda_graph=cuda_graph_fully_disabled(),
             require_mlp_tp_gather=require_mlp_tp_gather(self.server_args),
-            disable_overlap_schedule=self.server_args.disable_overlap_schedule,
+            disable_overlap_schedule=get_schedule().disable_overlap_schedule,
             offload_tags=self.offload_tags,
             dwdp=self.server_args.dwdp_size > 1,
         )

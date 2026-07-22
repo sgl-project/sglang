@@ -47,6 +47,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
 )
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
+from sglang.srt.runtime_context import get_exec, get_model, get_schedule, get_spec
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import MultiprocessingSerializer, broadcast_pyobj, set_random_seed
 from sglang.srt.utils.hf_transformers_utils import (
@@ -405,14 +406,14 @@ class TpModelWorker(BaseTpWorker):
         self.model_config = ModelConfig.from_server_args(
             self.server_args,
             model_path=(
-                self.server_args.model_path
+                get_model().model_path
                 if not self.is_draft_worker
-                else self.server_args.speculative_draft_model_path
+                else get_spec().speculative_draft_model_path
             ),
             model_revision=(
-                self.server_args.revision
+                get_model().revision
                 if not self.is_draft_worker
-                else self.server_args.speculative_draft_model_revision
+                else get_spec().speculative_draft_model_revision
             ),
             is_draft_model=self.is_draft_worker,
             context_length=self.context_length,
@@ -423,7 +424,7 @@ class TpModelWorker(BaseTpWorker):
 
         self._model_runner = ModelRunner(
             model_config=self.model_config,
-            mem_fraction_static=self.server_args.mem_fraction_static,
+            mem_fraction_static=get_schedule().mem_fraction_static,
             gpu_id=self.gpu_id,
             ps=self.ps,
             nccl_port=self.nccl_port,
@@ -439,11 +440,11 @@ class TpModelWorker(BaseTpWorker):
         from sglang.srt.model_executor.model_runner import ModelRunner
 
         self.model_runner_list.append(self.model_runner)
-        for i in range(1, self.server_args.speculative_num_steps):
+        for i in range(1, get_spec().speculative_num_steps):
             self.model_runner_list.append(
                 ModelRunner(
                     model_config=self.model_config,
-                    mem_fraction_static=self.server_args.mem_fraction_static,
+                    mem_fraction_static=get_schedule().mem_fraction_static,
                     gpu_id=self.gpu_id,
                     ps=self.ps,
                     nccl_port=self.nccl_port,
@@ -459,7 +460,7 @@ class TpModelWorker(BaseTpWorker):
     def _init_dllm_algorithm(self):
         from sglang.srt.dllm.algorithm.base import DllmAlgorithm
 
-        if self.server_args.dllm_algorithm is not None:
+        if get_exec().dllm.dllm_algorithm is not None:
             self.dllm_algorithm = DllmAlgorithm.from_server_args(self.server_args)
         else:
             self.dllm_algorithm = None
@@ -485,9 +486,9 @@ class TpModelWorker(BaseTpWorker):
         )
         return (
             self.model_runner.max_total_num_tokens,
-            self.server_args.max_prefill_tokens,
+            get_schedule().max_prefill_tokens,
             self.model_runner.max_running_requests,
-            self.server_args.max_queued_requests,
+            get_schedule().max_queued_requests,
             max_req_len,
             max_req_len - 5,
             self.random_seed,

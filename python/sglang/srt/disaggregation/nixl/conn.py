@@ -13,6 +13,8 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
 import numpy as np
 import numpy.typing as npt
 
+from sglang.srt.runtime_context import get_schedule
+
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.common.staging_handler import StagingTransferInfo
 
@@ -535,9 +537,7 @@ class NixlKVManager(CommonKVManager):
     def _is_watermark_ready(
         self, agent_name: str, alloc_round: int, alloc_end: int
     ) -> bool:
-        from sglang.srt.disaggregation.common.staging_handler import (
-            is_watermark_ready,
-        )
+        from sglang.srt.disaggregation.common.staging_handler import is_watermark_ready
 
         return is_watermark_ready(self._staging_ctx, agent_name, alloc_round, alloc_end)
 
@@ -558,9 +558,7 @@ class NixlKVManager(CommonKVManager):
         threading.Thread(target=decode_staging_thread, daemon=True).start()
 
     def _handle_staging_req(self, msg):
-        from sglang.srt.disaggregation.common.staging_handler import (
-            handle_staging_req,
-        )
+        from sglang.srt.disaggregation.common.staging_handler import handle_staging_req
 
         room = int(msg[1].decode("ascii"))
         session_id = msg[4].decode("ascii")
@@ -625,7 +623,7 @@ class NixlKVManager(CommonKVManager):
             room,
             self.transfer_infos,
             self.kv_buffer_tensors,
-            self.server_args.chunked_prefill_size,
+            get_schedule().chunked_prefill_size,
             self._staging_ctx.prefetch_requested,
             self._staging_ctx.prefetch_sockets,
         )
@@ -1739,9 +1737,7 @@ class NixlKVManager(CommonKVManager):
             req, page_start, num_pages, session_id=req.agent_name
         )
         if not ready:
-            from sglang.srt.disaggregation.common.staging_buffer import (
-                StagingAllocator,
-            )
+            from sglang.srt.disaggregation.common.staging_buffer import StagingAllocator
 
             if c_offset == StagingAllocator.ALLOC_OVERSIZED:
                 raise RuntimeError(

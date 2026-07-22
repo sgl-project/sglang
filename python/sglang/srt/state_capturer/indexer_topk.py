@@ -6,7 +6,7 @@ import pybase64
 import torch
 
 from sglang.srt.configs.model_config import ModelConfig, get_num_indexer_layers
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.state_capturer.base import BaseTopkCapturer
 
 logger = logging.getLogger(__name__)
@@ -89,9 +89,8 @@ def create_indexer_capturer(
     max_running_requests: int,
     device: str,
 ) -> Optional[IndexerTopkCapturer]:
-    from sglang.srt.runtime_context import get_server_args
 
-    enable = get_server_args().enable_return_indexer_topk
+    enable = get_exec().features.enable_return_indexer_topk
     # Producer wiring is CUDA-only (Indexer.forward_cuda + MLA skip_topk
     # path); other backends would create a capturer but never feed it.
     if enable and device != "cuda":
