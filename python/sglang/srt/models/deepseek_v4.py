@@ -3,7 +3,6 @@ from __future__ import annotations
 import concurrent.futures
 import functools
 import logging
-import time
 from contextlib import nullcontext
 from typing import (
     TYPE_CHECKING,
