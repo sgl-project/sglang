@@ -707,12 +707,18 @@ class UnifiedMambaPool(MambaPool):
         self.enable_custom_mem_pool = False
         self.custom_mem_pool = None
         self.num_mamba_layers = spec.layer_num
-        # GDN/KDA ReplaySSM unsupported; replicate parent's disabled-state attrs so
-        # paths guarded by `replayssm_write_pos is not None` don't AttributeError.
+        # GDN/KDA ReplaySSM / spec unsupported; replicate parent's disabled-state
+        # attrs so unconditional reads (e.g. `replayssm_cache_base is not None` in
+        # the req-slot alloc path) and `... is not None` guards don't AttributeError.
         self.enable_linear_replayssm = False
         self.linear_replayssm_cache_len = 16
         self.replayssm_write_pos = None
         self.replayssm_is_kda = False
+        self.enable_gdn_replayssm_spec = False
+        self.replayssm_cache_base = None
+        self.replayssm_is_flush = None
+        self.debug_memory_pool = False
+        self.conv_shard_groups = None
 
         assert (
             conv_views[0].shape[0] == self.num_mamba_layers
@@ -931,10 +937,12 @@ class UnifiedHybridReqToTokenPool(HybridReqToTokenPool):
         mamba_envelope_layout: bool = False,
         enable_linear_replayssm: bool = False,
         linear_replayssm_cache_len: int = 16,
+        enable_gdn_replayssm_spec: bool = False,
     ):
         # mamba_envelope_layout / speculative_eagle_topk / enable_linear_replayssm /
-        # linear_replayssm_cache_len: accepted to match the parent signature but NOT
-        # forwarded — the shared pool's conv/temporal state are fixed-shape views.
+        # linear_replayssm_cache_len / enable_gdn_replayssm_spec: accepted to match
+        # the parent signature but NOT forwarded — the shared pool's conv/temporal
+        # state are fixed-shape views (replayssm/spec are gated off under unified).
         assert mamba_size == self._shared_mamba_size, (
             f"UnifiedHybridReqToTokenPool._init_mamba_pool: mamba_size={mamba_size} "
             f"!= unified_buffer.max_slots({self._mamba_sub_pool_name!r}) - 1 "

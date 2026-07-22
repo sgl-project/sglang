@@ -6996,13 +6996,40 @@ class ServerArgs:
         if not self.enable_page_major_kv_layout:
             return
         # Only the Triton attention kernels read the strided 4-D envelope K/V
-        # views; FA3 / FlashInfer do not.
+        # views. EXCEPTION: the unified-memory MLA pool exposes each layer as a
+        # DENSE contiguous per-layer view (build_dense_mla_views), which the
+        # paged MLA kernels can consume directly — so trtllm_mla is allowed for
+        # the MLA full-attention layers under unified memory (Stage 2). Their
+        # block table is filled with dense page ids via create_flashmla_kv_indices_triton
+        # (v2p + kernel_page_multiplier). flashinfer_mla / flashmla / cutlass_mla
+        # are not wired yet — keep them Triton-only for now.
+        if self.enable_unified_memory and self.use_mla_backend():
+            # Dense per-layer MLA views (build_dense_mla_views) let the paged MLA
+            # kernels read the pool directly; their kv_indices / block tables are
+            # remapped to dense ids. trtllm_mla (decode) and flashinfer_mla
+            # (prefill + decode) are wired; flashmla / cutlass_mla share the same
+            # create_flashmla block-table path and can be added likewise.
+            # Names here are the RESOLVED backend ids from _resolved_attention_backends:
+            # "flashinfer" is the MLA flashinfer backend (FlashInferMLAAttnBackend)
+            # for an MLA model, "trtllm_mla" the trtllm decode kernel.
+            # cutedsl_mla resolves to TRTLLMMLABackend(backend="cute-dsl") and
+            # shares the trtllm dense read/write path (no separate wiring).
+            allowed_full = {
+                "triton",
+                "trtllm_mla",
+                "flashinfer",
+                "cutedsl_mla",
+                "tokenspeed_mla",
+            }
+        else:
+            allowed_full = {"triton"}
         backends = set(self._resolved_attention_backends())
         backends.discard(None)
-        assert backends <= {"triton"}, (
+        assert backends <= allowed_full, (
             "--enable-page-major-kv-layout requires the Triton attention backend "
-            f"for the full-attention layers; got {sorted(backends)}. Pass "
-            "--attention-backend triton."
+            f"for the full-attention layers (unified-memory MLA also allows "
+            f"trtllm_mla); got {sorted(backends)}, allowed {sorted(allowed_full)}. "
+            "Pass a compatible --attention-backend."
         )
         # The Mamba state is stored in envelope-strided views; only the
         # stride-aware Triton causal-conv / SSM kernels read them correctly.

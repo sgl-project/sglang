@@ -698,6 +698,13 @@ class FlashInferMLAIndicesUpdaterDecode:
         self.kv_indptr = attn_backend.kv_indptr
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.q_indptr = attn_backend.q_indptr_decode
+        # Unified dense MLA pool: VIRTUAL -> DENSE kv_indices (see prefill updater).
+        _alloc = model_runner.token_to_kv_pool_allocator
+        self._translate_kv_loc_dense = (
+            getattr(_alloc, "translate_kv_loc_dense", None)
+            if getattr(_alloc, "kernel_page_multiplier", 1) > 1
+            else None
+        )
 
     def update(
         self,
@@ -755,6 +762,14 @@ class FlashInferMLAIndicesUpdaterDecode:
                 kv_indices,
                 self.req_to_token.shape[1],
             )
+            # Unified pool: VIRTUAL -> DENSE, cast back to int32 (flashinfer
+            # requires int32; dense ids fit). NOTE: flashinfer *decode* under
+            # unified + cuda graph is not the validated K3 path (decode uses
+            # trtllm_mla); the fresh gather here allocates, so a captured
+            # flashinfer-decode graph would need a capture-stable int64 scratch —
+            # left for when that combo is exercised.
+            if self._translate_kv_loc_dense is not None:
+                kv_indices = self._translate_kv_loc_dense(kv_indices).to(torch.int32)
 
             if get_parallel().dcp_enabled:
                 plan_dcp_decode_metadata(
@@ -820,6 +835,15 @@ class FlashInferMLAIndicesUpdaterPrefill:
         self.qo_indptr = attn_backend.qo_indptr
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.prefill_wrapper_ragged = attn_backend.prefill_wrapper_ragged
+        # Unified dense MLA pool: kv_indices built from req_to_token are VIRTUAL;
+        # the paged wrapper reads the dense per-layer view, so remap them to DENSE
+        # token ids. None (identity) unless the unified MLA pool is active.
+        _alloc = model_runner.token_to_kv_pool_allocator
+        self._translate_kv_loc_dense = (
+            getattr(_alloc, "translate_kv_loc_dense", None)
+            if getattr(_alloc, "kernel_page_multiplier", 1) > 1
+            else None
+        )
 
     def update(
         self,
@@ -890,6 +914,12 @@ class FlashInferMLAIndicesUpdaterPrefill:
                 kv_indices,
                 self.req_to_token.shape[1],
             )
+            # Unified pool: VIRTUAL -> DENSE token ids for the paged wrapper.
+            # Prefill is not cuda-graph captured under unified memory, so an eager
+            # gather is safe. Dense ids fit int32 (max = full_slots*num_layers ~
+            # 1e7 << 2^31); the flashinfer wrapper requires int32.
+            if self._translate_kv_loc_dense is not None:
+                kv_indices = self._translate_kv_loc_dense(kv_indices).to(torch.int32)
             qo_indptr[1 : bs + 1] = torch.cumsum(seq_lens - prefix_lens, dim=0)
             qo_indptr = qo_indptr[: bs + 1]
             custom_mask = None
