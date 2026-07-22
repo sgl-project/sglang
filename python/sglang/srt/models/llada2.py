@@ -83,6 +83,7 @@ from sglang.srt.runtime_context import (
     get_stream,
 )
 from sglang.srt.utils import (
+    LazyValue,
     add_prefix,
     is_cuda,
     is_non_idle_and_non_empty,
@@ -296,6 +297,16 @@ def block_topk_triton(
     )
 
     return topk_weights, topk_ids
+
+
+split_qkv_rmsnorm_rope_pos_cache_half_npu = None
+if _is_npu:
+    try:
+        from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope_pos_cache_half_npu import (
+            split_qkv_rmsnorm_rope_pos_cache_half_npu,
+        )
+    except (ImportError, OSError):
+        pass
 
 
 class LLaDA2MoeMLP(nn.Module):
@@ -779,34 +790,59 @@ class LLaDA2MoeAttention(nn.Module):
         if hidden_states.shape[0] == 0:
             return hidden_states
         qkv, _ = self.query_key_value(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        if self.use_qk_norm:
-            q, k = apply_qk_norm(
-                q=q,
-                k=k,
-                q_norm=self.query_layernorm,
-                k_norm=self.key_layernorm,
-                head_dim=self.head_dim,
-                alt_stream=self.alt_stream,
+        if _is_npu and split_qkv_rmsnorm_rope_pos_cache_half_npu is not None:
+            q, k, v = split_qkv_rmsnorm_rope_pos_cache_half_npu(
+                qkv,
+                positions,
+                self.rotary_emb.cos_sin_cache,
+                self.q_size,
+                self.kv_size,
+                self.head_dim,
+                eps=self.query_layernorm.variance_epsilon if self.use_qk_norm else None,
+                q_weight=self.query_layernorm.weight if self.use_qk_norm else None,
+                k_weight=self.key_layernorm.weight if self.use_qk_norm else None,
+                q_bias=(
+                    getattr(self.query_layernorm, "bias", None)
+                    if self.use_qk_norm
+                    else None
+                ),
+                k_bias=(
+                    getattr(self.key_layernorm, "bias", None)
+                    if self.use_qk_norm
+                    else None
+                ),
+                rope_dim=self.rotary_dim,
             )
-        can_fuse_set_kv = (
-            self.head_dim == self.rotary_emb.rotary_dim
-            and enable_fused_set_kv_buffer(forward_batch)
-        )
-        q, k = self.rotary_emb(
-            positions,
-            q,
-            k,
-            fused_set_kv_buffer_arg=(
-                create_fused_set_kv_buffer_arg(
-                    value=v,
-                    layer=self.attn,
-                    forward_batch=forward_batch,
+            can_fuse_set_kv = False
+        else:
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            if self.use_qk_norm:
+                q, k = apply_qk_norm(
+                    q=q,
+                    k=k,
+                    q_norm=self.query_layernorm,
+                    k_norm=self.key_layernorm,
+                    head_dim=self.head_dim,
+                    alt_stream=self.alt_stream,
                 )
-                if can_fuse_set_kv
-                else None
-            ),
-        )
+            can_fuse_set_kv = (
+                self.head_dim == self.rotary_emb.rotary_dim
+                and enable_fused_set_kv_buffer(forward_batch)
+            )
+            q, k = self.rotary_emb(
+                positions,
+                q,
+                k,
+                fused_set_kv_buffer_arg=(
+                    create_fused_set_kv_buffer_arg(
+                        value=v,
+                        layer=self.attn,
+                        forward_batch=forward_batch,
+                    )
+                    if can_fuse_set_kv
+                    else None
+                ),
+            )
         context_layer = self.attn(
             q,
             k,
@@ -1189,12 +1225,17 @@ class LLaDA2MoeModelLM(nn.Module):
                     )
                     weight_loader(param, loaded_weight)
 
-        self.routed_experts_weights_of_layer = {
-            layer_id: layer.mlp.get_moe_weights()
-            for layer_id, layer in enumerate(self.model.layers)
-            if not isinstance(layer, PPMissingLayer)
-            and isinstance(layer.mlp, LLaDA2MoeSparseMoeBlock)
-        }
+        # Lazy: get_moe_weights() snapshots x.data, and building the map here would
+        # pin every expert weight's pre-process_weights_after_loading storage.
+        if not hasattr(self, "routed_experts_weights_of_layer"):
+            self.routed_experts_weights_of_layer = LazyValue(
+                lambda: {
+                    layer_id: layer.mlp.get_moe_weights()
+                    for layer_id, layer in enumerate(self.model.layers)
+                    if not isinstance(layer, PPMissingLayer)
+                    and isinstance(layer.mlp, LLaDA2MoeSparseMoeBlock)
+                }
+            )
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
