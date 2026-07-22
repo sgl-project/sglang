@@ -146,6 +146,10 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
     sock_send,
 )
+from sglang.srt.managers.intra_turn_prefix_cache import (
+    IntraTurnPrefixPlan,
+    build_intra_turn_prefix_plan,
+)
 from sglang.srt.managers.load_snapshot import create_load_snapshot_writer
 from sglang.srt.managers.min_free_slots_delayer import (
     MinFreeSlotsDelayer,
@@ -365,6 +369,12 @@ class Scheduler(
         self.enable_hisparse = server_args.enable_hisparse
         self.enable_dp_attention = server_args.enable_dp_attention
         self.enable_unified_memory = server_args.enable_unified_memory
+        self.enable_two_stage_intra_turn_prefix_cache = (
+            envs.SGLANG_ENABLE_TWO_STAGE_INTRA_TURN_PREFIX_CACHE.get()
+        )
+        self.intra_turn_prefix_cache_min_shared_tokens = (
+            envs.SGLANG_INTRA_TURN_PREFIX_CACHE_MIN_SHARED_TOKENS.get()
+        )
 
         # Distributed rank info
         attn_tp_rank, attn_tp_size, attn_dp_rank, attn_dp_size = (
@@ -2934,7 +2944,10 @@ class Scheduler(
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
-            if req.defer_for_in_batch_prefix_cache:
+            if (
+                req.defer_for_in_batch_prefix_cache
+                and not self.enable_two_stage_intra_turn_prefix_cache
+            ):
                 continue
 
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
@@ -3040,6 +3053,8 @@ class Scheduler(
             chunked_req=self.chunked_req,
         )
 
+        new_batch.intra_turn_prefix_plan = self._build_intra_turn_prefix_plan(new_batch)
+
         new_batch.contains_last_prefill_chunk = (
             self.chunked_req is None or len(can_run_list) != 1
         )
@@ -3051,7 +3066,8 @@ class Scheduler(
                 self.tree_cache.ready_to_load_host_cache()
             )
 
-        new_batch.prepare_for_extend()
+        if new_batch.intra_turn_prefix_plan is None:
+            new_batch.prepare_for_extend()
 
         if self.tp_worker.model_runner.prefill_aware_swa:
             for req in can_run_list:
@@ -3092,6 +3108,53 @@ class Scheduler(
             new_batch.decoding_reqs = None
 
         return new_batch, running_batch
+
+    def _build_intra_turn_prefix_plan(
+        self, batch: ScheduleBatch
+    ) -> Optional[IntraTurnPrefixPlan]:
+        if not self._can_use_two_stage_intra_turn_prefix_cache(batch):
+            return None
+
+        return build_intra_turn_prefix_plan(
+            batch.reqs,
+            min_shared_new_tokens=self.intra_turn_prefix_cache_min_shared_tokens,
+        )
+
+    def _can_use_two_stage_intra_turn_prefix_cache(self, batch: ScheduleBatch) -> bool:
+        if not self.enable_two_stage_intra_turn_prefix_cache:
+            return False
+        if not self.is_generation:
+            return False
+        if self.enable_overlap or self.enable_overlap_mlx or self.enable_pdmux:
+            return False
+        if self.enable_hisparse or self.enable_hicache_storage:
+            return False
+        if self.enable_dp_attention or self.require_mlp_sync:
+            return False
+        if self.disaggregation_mode != DisaggregationMode.NULL:
+            return False
+        if self.server_args.pp_size > 1 or self.page_size != 1:
+            return False
+        if self.chunked_req is not None or self.chunked_prefill_size is not None:
+            return False
+        if self.spec_algorithm is not None and not self.spec_algorithm.is_none():
+            return False
+        if self.model_config.is_encoder_decoder:
+            return False
+        if self.ngram_embedding_manager.enabled:
+            return False
+        if batch.return_logprob or batch.return_hidden_states or batch.is_prefill_only:
+            return False
+        if getattr(self.tree_cache, "disable", True):
+            return False
+        if (
+            not self.tree_cache.is_tree_cache()
+            or not self.tree_cache.supports_fast_match_prefix()
+        ):
+            return False
+        if self.tree_cache.supports_mamba() or self.tree_cache.supports_swa():
+            return False
+        return True
 
     def _can_schedule_lora_req(
         self, req: Req, running_loras: set[Optional[str]]
@@ -3277,6 +3340,9 @@ class Scheduler(
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         """Run a batch."""
+        if batch.intra_turn_prefix_plan is not None:
+            self._prepare_two_stage_intra_turn_prefix_cache(batch)
+
         self.forward_ct += 1
         batch.forward_iter = self.forward_ct
 
@@ -3473,6 +3539,94 @@ class Scheduler(
         self._maybe_report_active_ranks()
 
         return ret
+
+    def _prepare_two_stage_intra_turn_prefix_cache(self, batch: ScheduleBatch) -> None:
+        plan = batch.intra_turn_prefix_plan
+        batch.intra_turn_prefix_plan = None
+        if plan is None:
+            return
+
+        stage_req = self._build_intra_turn_synthetic_req(plan)
+        stage_locked = False
+        stage_released = False
+        try:
+            stage_req.init_next_round_input(self.tree_cache, cow_mamba=False)
+            self.tree_cache.inc_lock_ref(stage_req.last_node)
+            stage_locked = True
+            stage_req.set_extend_range(
+                len(stage_req.prefix_indices),
+                len(stage_req.full_untruncated_fill_ids),
+            )
+            if stage_req.extend_range.length > 0:
+                stage_batch = ScheduleBatch.init_new(
+                    [stage_req],
+                    self.req_to_token_pool,
+                    self.token_to_kv_pool_allocator,
+                    self.tree_cache,
+                    self.model_config,
+                    self.enable_overlap,
+                    self.spec_algorithm,
+                )
+                stage_batch.prepare_for_extend()
+                self._run_intra_turn_prefix_stage_batch(stage_batch)
+
+            release_kv_cache(stage_req, self.tree_cache, is_insert=True)
+            stage_released = True
+            stage_locked = False
+        finally:
+            if not stage_released:
+                if stage_req.req_pool_idx is not None:
+                    release_kv_cache(stage_req, self.tree_cache, is_insert=False)
+                    stage_locked = False
+                elif stage_locked and stage_req.last_node is not None:
+                    self.tree_cache.dec_lock_ref(stage_req.last_node)
+
+        for req in plan.stage.reqs:
+            self._rematch_req_after_intra_turn_prefix_insert(req)
+
+        batch.prepare_for_extend()
+        logger.debug(
+            "two-stage intra-turn prefix cache materialized shared prefix: "
+            "group_size=%d shared_len=%d stage_new_tokens=%d estimated_saved_tokens=%d",
+            len(plan.stage.reqs),
+            plan.stage.common_prefix_len,
+            plan.stage.stage_new_tokens,
+            plan.stage.estimated_saved_tokens,
+        )
+
+    def _build_intra_turn_synthetic_req(
+        self, plan: IntraTurnPrefixPlan
+    ) -> Req:
+        source_req = plan.stage.reqs[0]
+        synthetic_req = Req(
+            rid=f"__intra_turn_prefix_cache__:{source_req.rid}:{plan.stage.common_prefix_len}",
+            origin_input_text="",
+            origin_input_ids=plan.stage.shared_token_ids,
+            sampling_params=source_req.sampling_params,
+            return_logprob=False,
+            stream=False,
+            extra_key=source_req.extra_key,
+            priority=getattr(source_req, "priority", 0) or 0,
+            vocab_size=source_req.vocab_size,
+        )
+        synthetic_req.lora_id = source_req.lora_id
+        synthetic_req.routing_key = source_req.routing_key
+        return synthetic_req
+
+    def _run_intra_turn_prefix_stage_batch(self, batch: ScheduleBatch) -> None:
+        self.forward_ct += 1
+        batch.forward_iter = self.forward_ct
+        resolve_forward_inputs(batch, self.future_map)
+        with self._forward_isolation(batch, overlap=False):
+            self.model_worker.forward_batch_generation(batch)
+        batch.input_ids = None
+
+    def _rematch_req_after_intra_turn_prefix_insert(self, req: Req) -> None:
+        if req.last_node is not None:
+            self.tree_cache.dec_lock_ref(req.last_node)
+        req.init_next_round_input(self.tree_cache, cow_mamba=False)
+        self.tree_cache.inc_lock_ref(req.last_node)
+        req.set_extend_range(len(req.prefix_indices), req.extend_range.end)
 
     def _maybe_report_active_ranks(self) -> None:
         if not (
