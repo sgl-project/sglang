@@ -1137,6 +1137,27 @@ def _fill_gptq_marlin_from_checkpoint(
         store.fill_tensor(name, t)
 
 
+def _drop_file_cache(path: str) -> None:
+    """Best-effort ``POSIX_FADV_DONTNEED`` on a checkpoint shard AFTER its experts have been copied into the
+    store. ``safe_open`` mmaps each shard, so without this the read pages accumulate in the OS page cache
+    across all shards/layers — up to the FULL model size — alongside the (separate) host store, doubling
+    peak RAM during load. Dropping each shard as it's consumed keeps the source-side cache to ~one shard.
+    Each layer reads DISJOINT byte ranges of a shared shard, so this drops almost nothing another layer
+    reuses (only bounded read-ahead). Linux-only; a no-op where posix_fadvise is unavailable."""
+    fadvise = getattr(os, "posix_fadvise", None)
+    dontneed = getattr(os, "POSIX_FADV_DONTNEED", None)
+    if fadvise is None or dontneed is None:
+        return
+    try:
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            fadvise(fd, 0, 0, dontneed)  # (offset=0, len=0) => whole file
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
+
 def _fill_bf16_from_checkpoint(
     store: ExpertStore, model_path: str, layer_idx: int
 ) -> None:
@@ -1152,7 +1173,8 @@ def _fill_bf16_from_checkpoint(
         for proj in ("gate_proj", "up_proj", "down_proj"):
             by_shard.setdefault(wmap[f"{pre}{e}.{proj}.weight"], []).append((e, proj))
     for shard, items in by_shard.items():
-        with safe_open(os.path.join(snap, shard), framework="pt") as f:
+        _shard_path = os.path.join(snap, shard)
+        with safe_open(_shard_path, framework="pt") as f:
             for e, proj in items:
                 t = f.get_tensor(f"{pre}{e}.{proj}.weight").to(dt)
                 if proj == "down_proj":
@@ -1165,6 +1187,7 @@ def _fill_bf16_from_checkpoint(
                     row[:half].copy_(t)
                 else:  # up_proj
                     row[half:].copy_(t)
+        _drop_file_cache(_shard_path)  # release this shard's page cache before the next
 
 
 def _fill_fp8_block_from_checkpoint(
@@ -1198,7 +1221,8 @@ def _fill_fp8_block_from_checkpoint(
                     (e, proj, suffix)
                 )
     for shard, items in by_shard.items():
-        with safe_open(os.path.join(snap, shard), framework="pt") as f:
+        _shard_path = os.path.join(snap, shard)
+        with safe_open(_shard_path, framework="pt") as f:
             for e, proj, suffix in items:
                 t = f.get_tensor(f"{pre}{e}.{proj}.{suffix}")
                 base = "w2_weight" if proj == "down_proj" else "w13_weight"
@@ -1214,6 +1238,7 @@ def _fill_fp8_block_from_checkpoint(
                     row[:half].copy_(t)
                 else:  # up_proj
                     row[half:].copy_(t)
+        _drop_file_cache(_shard_path)  # release this shard's page cache before the next
 
 
 _STORE_CACHE_VERSION = 1
