@@ -50,6 +50,33 @@ class TestTemplateContentFormatDetection(CustomTestCase):
         result = detect_jinja_template_content_format(deepseek_pattern)
         self.assertEqual(result, "string")
 
+    def test_media_substring_in_word_is_not_multimodal(self):
+        """A text-only template containing a media keyword only as a substring of
+        an unrelated word (e.g. 'revision') must stay 'string'; classifying it as
+        'openai' renders a parts-list content as a Python list repr."""
+        for word in ["revision", "provision", "television", "supervision"]:
+            pattern = (
+                "{# handles the "
+                + word
+                + " case #}"
+                + "{%- for message in messages %}{{ message['content'] }}{%- endfor %}"
+            )
+            self.assertEqual(
+                detect_jinja_template_content_format(pattern),
+                "string",
+                f"template mentioning {word!r} should be 'string'",
+            )
+
+    def test_real_media_keyword_still_openai(self):
+        """A real content-type media token still classifies as 'openai'."""
+        for token in ["'image'", "'image_url'", "'input_audio'", "'video'"]:
+            pattern = "{% if part['type'] == " + token + " %}x{% endif %}"
+            self.assertEqual(
+                detect_jinja_template_content_format(pattern),
+                "openai",
+                f"template with {token} should be 'openai'",
+            )
+
     def test_detect_invalid_template(self):
         """Test handling of invalid template (should default to 'string')."""
         invalid_pattern = "{{{{ invalid jinja syntax }}}}"
