@@ -12,6 +12,7 @@
 
 mod api_server;
 mod detokenizer;
+mod environ;
 mod error;
 mod fsm;
 mod ids;
