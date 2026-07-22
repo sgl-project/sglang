@@ -428,9 +428,9 @@ class AscendAttnBackend(AttentionBackend):
             req_pool_indices=forward_batch.req_pool_indices,
             seq_lens=forward_batch.seq_lens,
             seq_lens_cpu=(
-                forward_batch.seq_lens_cpu
-                if not in_capture or _is_dflash_verify(forward_batch.spec_info)
-                else forward_batch.seq_lens.cpu()
+                forward_batch.seq_lens.cpu()
+                if in_capture
+                else forward_batch.seq_lens_cpu
             ),
             forward_mode=forward_batch.forward_mode,
             spec_info=forward_batch.spec_info,
@@ -487,8 +487,9 @@ class AscendAttnBackend(AttentionBackend):
             seq_lens_list_cumsum = np.cumsum(forward_batch.extend_seq_lens_cpu)
             self.forward_metadata.seq_lens_list_cumsum = seq_lens_list_cumsum
 
-        if forward_batch.forward_mode.is_target_verify() and not _is_dflash_verify(
-            forward_batch.spec_info
+        if (
+            forward_batch.forward_mode.is_target_verify()
+            and not _is_dflash_verify(forward_batch.spec_info)
         ):
             self.forward_metadata.seq_lens_cpu_int += self.speculative_num_draft_tokens
         elif (
