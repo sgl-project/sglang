@@ -46,6 +46,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_device_core_count,
     get_int_env_var,
+    is_hcu,
     is_cuda,
     is_gfx95_supported,
     is_gfx942_supported,
@@ -987,9 +988,15 @@ class TritonAttnBackend(AttentionBackend):
         else:
             self.cuda_graph_kv_indices = kv_indices_buf
 
+        custom_mask_numel = max_num_tokens * self.max_context_len
+        if is_hcu():
+            # EAGLE verify includes a per-request draft-token square in addition
+            # to the context mask. Keep the extra capacity HCU-only for now.
+            num_tokens_per_req = max_num_tokens // max_bs
+            custom_mask_numel += max_num_tokens * num_tokens_per_req
         if not self.skip_prefill and not self.is_draft_runner:
             self.cuda_graph_custom_mask = torch.zeros(
-                (max_num_tokens * self.max_context_len),
+                custom_mask_numel,
                 dtype=torch.uint8,
                 device=self.device,
             )
