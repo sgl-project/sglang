@@ -127,6 +127,8 @@ def fused_qkvzba_split_reshape_cat(
         device=mixed_ba.device,
     )
     a = torch.empty_like(b)
+    if batch * seq_len == 0:
+        return mixed_qkv, z, b, a
     grid = (batch * seq_len, num_heads_qk)
     fused_qkvzba_split_reshape_cat_kernel[grid](
         mixed_qkv,
@@ -292,6 +294,8 @@ def fused_qkvzba_split_reshape_cat_contiguous(
         device=mixed_ba.device,
     )
     a = torch.empty_like(b)
+    if batch * seq_len == 0:
+        return mixed_qkv, z, b, a
     grid = (batch * seq_len, num_heads_qk)
     fused_qkvzba_split_reshape_cat_contiguous_kernel[grid](
         mixed_qkv,
@@ -387,6 +391,8 @@ def fused_qkv_split_gdn_prefill(
     )
 
     qkv_dim = num_q_heads * head_q + num_k_heads * head_k + num_v_heads * head_v
+    if seq_len == 0:
+        return q, k, v
     fused_qkv_split_gdn_prefill_kernel[(seq_len,)](
         q,
         k,

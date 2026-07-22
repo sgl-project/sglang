@@ -590,6 +590,9 @@ def fused_qk_gemma_rmsnorm(
     q_out = torch.empty(q_rows, head_dim, dtype=q.dtype, device=q.device)
     k_out = torch.empty(k_rows, head_dim, dtype=k.dtype, device=k.device)
 
+    if q_rows == 0:
+        return q_out, k_out
+
     BLOCK_HD = triton.next_power_of_2(head_dim)
 
     _fused_qk_gemma_rmsnorm_kernel[(q_rows,)](
@@ -705,6 +708,9 @@ def fused_qk_gemma_rmsnorm_with_gate(
     q_out = torch.empty(q_rows, head_dim, dtype=q_gate.dtype, device=q_gate.device)
     k_out = torch.empty(k_rows, head_dim, dtype=k.dtype, device=k.device)
     gate_out = torch.empty(q_rows, head_dim, dtype=q_gate.dtype, device=q_gate.device)
+
+    if q_rows == 0:
+        return q_out, k_out, gate_out
 
     BLOCK_HD = triton.next_power_of_2(head_dim)
 
