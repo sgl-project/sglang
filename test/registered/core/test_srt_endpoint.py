@@ -46,7 +46,7 @@ class TestSRTEndpoint(CustomTestCase):
             # The tiny logprob chunk size routes this file's logprob tests
             # through the multi-chunk stitching path (requests at or below 64
             # rows still cover the non-chunked path).
-            env={**SERVER_ENV, "SGLANG_LOGITS_PROCESSER_CHUNK_SIZE": "64"},
+            env={**SERVER_ENV, "SGLANG_LOGPROB_CHUNK_SIZE": "64"},
             other_args=(
                 "--enable-custom-logit-processor",
                 "--mem-fraction-static",

@@ -13,7 +13,7 @@ from sglang.test.test_utils import (
     run_bench_serving,
 )
 
-register_xpu_ci(est_time=600, suite="stage-b-test-1-gpu-xpu")
+register_xpu_ci(est_time=600, suite="nightly-xpu-1-gpu", nightly=True)
 
 
 def triton_attention_benchmark(extra_args=None, mem_fraction_static="0.84"):
