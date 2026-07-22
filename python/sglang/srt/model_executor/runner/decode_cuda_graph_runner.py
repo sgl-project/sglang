@@ -1033,17 +1033,28 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
         with timer_ctx, self.backend.replay_session():
             self.load_batch(forward_batch, pp_proxy_tensors)
-            # Publish a read-done event for the WAR barrier: a cuda-graph forward
-            # finishes its shared req_to_token / SWA reads at this pre-replay
-            # snapshot, so plain DECODE and DFLASH TARGET_VERIFY both qualify.
-            if forward_batch.forward_mode.is_decode() or (
+            # Publish a read-done event for the WAR barrier. Plain-attention
+            # DECODE and DFLASH TARGET_VERIFY finish their shared req_to_token /
+            # SWA reads at this pre-replay snapshot. Hybrid linear-attention
+            # DECODE keeps reading shared state during replay and publishes below.
+            if (
                 forward_batch.forward_mode.is_target_verify()
                 and self.model_runner.spec_algorithm.is_dflash()
+            ) or (
+                forward_batch.forward_mode.is_decode()
+                and self.model_runner.mambaish_config is None
             ):
                 read_done = self.device_module.Event()
                 read_done.record()
                 self.model_runner.war_fastpath_read_done_event = read_done
             output = self.backend.replay(self._replay_graph_key, forward_batch)
+            if (
+                forward_batch.forward_mode.is_decode()
+                and self.model_runner.mambaish_config is not None
+            ):
+                read_done = self.device_module.Event()
+                read_done.record()
+                self.model_runner.war_fastpath_read_done_event = read_done
 
         if isinstance(output, LogitsProcessorOutput):
             if self.is_dllm:
