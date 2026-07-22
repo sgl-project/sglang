@@ -4231,5 +4231,112 @@ for _cfg in _CONFIGS:
 del _cfg, _name
 
 
+class TestUnifiedRadixPrefetchCorruption(CustomTestCase):
+    """Prefetch must not hang a backed-up host child under an un-backed-up parent.
+
+    Under write-through that broke the "child backed up => parent backed up"
+    invariant, failing as an idle-sanity error and, on eviction, as
+    `_remove_leaf_from_parent -> assert v == node`. Fix: drop the refill.
+    """
+
+    ps = 16
+    cfg = CacheConfig(
+        page_size=ps,
+        components=(ComponentType.FULL,),
+        kv_size=4096,
+        max_context_len=4096,
+    )
+
+    def _init_hicache(self, cache, *, write_policy="write_through"):
+        import sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler as assembler
+
+        orig_get_mha_host_pool_cls = assembler.get_mha_host_pool_cls
+
+        def get_mha_host_pool_cls_wrapper(device_pool):
+            host_pool_cls = orig_get_mha_host_pool_cls(device_pool)
+
+            def kv_host_pool_wrapper(*args, **kwargs):
+                kwargs["pin_memory"] = False
+                return host_pool_cls(*args, **kwargs)
+
+            return kv_host_pool_wrapper
+
+        patcher = mock.patch.object(
+            assembler,
+            "get_mha_host_pool_cls",
+            side_effect=get_mha_host_pool_cls_wrapper,
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        server_args = ServerArgs(
+            model_path="dummy",
+            page_size=self.cfg.page_size,
+            hicache_io_backend="direct",
+            hicache_write_policy=write_policy,
+        )
+        server_args._mamba_cache_chunk_size = max(FLA_CHUNK_SIZE, self.cfg.page_size)
+        set_global_server_args_for_scheduler(server_args)
+        cache.init_hicache(server_args, cache.cache_init_params)
+        cache.write_through_threshold = 1 << 30
+        cache.load_back_threshold = 0
+
+    def _insert_device(self, cache, allocator, ids):
+        """Insert a device-only chain (no auto-backup) and return its leaf."""
+        key = RadixKey(array("q", ids)).page_aligned(self.ps)
+        val = allocator.alloc(len(key))
+        self.assertIsNotNone(val)
+        val = val.to(dtype=torch.int64)
+        cache.insert(InsertParams(key=key, value=val, prev_prefix_len=0))
+        return cache.match_prefix(MatchPrefixParams(key=key)).last_device_node
+
+    def _attach_host_child(self, cache, parent, start_token):
+        """Mimic a prefetch commit: hang a backed-up host chain under `parent`."""
+        ps = self.ps
+        child_key = RadixKey(
+            array("q", list(range(start_token, start_token + 2 * ps)))
+        ).page_aligned(ps)
+        host_idx = cache.cache_controller.mem_pool_host.alloc(len(child_key))
+        self.assertIsNotNone(host_idx, "host pool alloc failed")
+        host_idx = host_idx.to(dtype=torch.int64)
+        hashes = [f"h{i}" for i in range(len(child_key) // ps)]
+        res = cache._insert_helper_host(parent, child_key, host_idx, hashes)
+        return res.inserted_host_node
+
+    def test_prefetch_refill_under_unbacked_parent_is_dropped(self):
+        """Write-through: a refill under an un-backed-up parent is dropped."""
+        cache, allocator, _ = build_fixture(self.cfg)
+        self._init_hicache(cache)
+
+        parent = self._insert_device(cache, allocator, list(range(1, 1 + 3 * self.ps)))
+        self.assertFalse(parent.backuped)
+
+        child = self._attach_host_child(cache, parent, start_token=1000)
+        self.assertIsNone(child)
+        self.assertEqual(len(parent.children), 0)
+        cache.sanity_check()
+
+    def test_prefetch_refill_leaves_eviction_path_uncorrupted(self):
+        """Write-through: eviction after such a refill must not corrupt the tree."""
+        cache, allocator, _ = build_fixture(self.cfg)
+        self._init_hicache(cache)
+
+        parent = self._insert_device(cache, allocator, list(range(1, 1 + 3 * self.ps)))
+        self._attach_host_child(cache, parent, start_token=1000)
+
+        cache.evict(EvictParams(num_tokens=10 * self.ps))
+        cache.sanity_check()
+
+    def test_prefetch_refill_kept_under_unbacked_parent_in_write_back(self):
+        """Write-back keeps the refill (it has no backed-up-parent requirement)."""
+        cache, allocator, _ = build_fixture(self.cfg)
+        self._init_hicache(cache, write_policy="write_back")
+
+        parent = self._insert_device(cache, allocator, list(range(1, 1 + 3 * self.ps)))
+        child = self._attach_host_child(cache, parent, start_token=1000)
+        self.assertIsNotNone(child)
+        cache.sanity_check()
+
+
 if __name__ == "__main__":
     unittest.main()

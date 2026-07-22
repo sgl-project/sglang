@@ -1233,8 +1233,17 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 result.inserted_host_node = node
             return result
 
-        # Parent not backed up: drop this best-effort prefetch refill (free its host pages).
-        if node is not self.root_node and not node.backuped:
+        # Drop the refill only under write-through (a non-write-back policy).
+        if (
+            node is not self.root_node
+            and not node.backuped
+            and self.cache_controller.write_policy != "write_back"
+        ):
+            logger.info(
+                "HiCache prefetch dropped %d-token refill under un-backed-up node %d",
+                len(host_value),
+                node.id,
+            )
             self.cache_controller.mem_pool_host.free(host_value)
             return result
 
