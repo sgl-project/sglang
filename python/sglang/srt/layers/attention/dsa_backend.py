@@ -111,6 +111,16 @@ def _all_gather_dsa_trtllm_fp8_kv(
 
 
 _is_hip = is_hip()
+# gfx950 (MI355) ships a native asm MLA decode kernel for gqa:64, so the
+# 64->4x16 head-split in _mla_decode_fwd_grouped only helps gfx942 (which aborts
+# on gqa:64). Splitting on gfx950 is a pure regression (4x sequential kernels +
+# per-group contiguous/copy), so detect gfx950 and skip the split there.
+try:
+    _IS_GFX950 = _is_hip and (
+        "gfx950" in torch.cuda.get_device_properties(0).gcnArchName
+    )
+except Exception:
+    _IS_GFX950 = False
 # ROCm gfx950 only: route the fp8-KV + prefill-CP DSA decode through a per-query
 # Triton sparse-MLA kernel. Off by default; opt in with SGLANG_DSA_TRITON_FP8_DECODE=1.
 _DSA_TRITON_FP8_DECODE = os.environ.get("SGLANG_DSA_TRITON_FP8_DECODE", "0") == "1"
@@ -178,7 +188,9 @@ def _mla_decode_fwd_grouped(
     nhead = q.shape[1]
     GROUP = 16
     can_split = (
-        nhead > 32
+        os.environ.get("SGLANG_DSA_NO_HEAD_SPLIT", "0") != "1"
+        and not _IS_GFX950
+        and nhead > 32
         and nhead % GROUP == 0
         and q.dtype == kv_buffer.dtype
         and q.dtype in (torch.bfloat16, fp8_dtype)
