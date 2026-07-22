@@ -142,7 +142,7 @@ def reference_decode_attention(
     out = torch.zeros_like(q)
 
     for i in range(N):
-        page = k_pages[i]
+        page = k_pages[int(page_indices[i])]  # k_pages [num_pages, page_size, 512]
         qi = q[i]
 
         m = torch.tensor(float("-inf"), device=q.device)
@@ -198,8 +198,8 @@ def test_correctness_single_page():
     # Create flat K cache [total_rows, 368]
     k_cache = k_mxfp4.view(-1, BYTES_PER_TOKEN).contiguous()
 
-    # Each head reads from its own page
-    page_indices = torch.arange(num_heads, dtype=torch.int32, device=dev) * page_size
+    # Each head reads from its own page (index 0..num_pages-1)
+    page_indices = torch.arange(num_heads, dtype=torch.int32, device=dev) % num_pages
 
     # Kernel
     from sglang.jit_kernel.dsv4.mxfp4_decode import mxfp4_decode_attention
@@ -246,10 +246,10 @@ def test_multi_head_different_pages():
     )
     k_cache = k_mxfp4.view(-1, BYTES_PER_TOKEN).contiguous()
 
-    # Scramble page assignments
-    page_indices = (
-        torch.randint(0, num_pages, (total_queries,), device=dev) * page_size
-    ).to(torch.int32)
+    # Scramble page assignments (page numbers, not row offsets)
+    page_indices = torch.randint(0, num_pages, (total_queries,), device=dev).to(
+        torch.int32
+    )
 
     from sglang.jit_kernel.dsv4.mxfp4_decode import mxfp4_decode_attention
 
@@ -288,9 +288,7 @@ def bench_decode():
     k_cache = k_mxfp4.view(-1, BYTES_PER_TOKEN).contiguous()
 
     q = torch.randn(total, HEAD_DIM, dtype=torch.bfloat16, device=dev)
-    page_indices = (torch.arange(total, device=dev) % num_pages * page_size).to(
-        torch.int32
-    )
+    page_indices = (torch.arange(total, device=dev) % num_pages).to(torch.int32)
 
     from sglang.jit_kernel.dsv4.mxfp4_decode import mxfp4_decode_attention
 
