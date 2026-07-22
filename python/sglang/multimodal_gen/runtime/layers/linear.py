@@ -210,7 +210,46 @@ class LinearBase(torch.nn.Module):
         raise NotImplementedError
 
 
-class ReplicatedLinear(LinearBase):
+class ParrallelLenear(LinearBase):
+    def __init__(
+        self,
+        input_size: int,
+        output_size: int,
+        skip_bias_add: bool = False,
+        params_dtype: torch.dtype | None = None,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ):
+        super().__init__(
+            input_size, output_size, skip_bias_add, params_dtype, quant_config, prefix
+        )
+
+    def parallel_input(self, input_: torch.Tensor) -> torch.Tensor:
+        return input_
+
+    def apply_quant_method(
+        self, input_: torch.Tensor, bias: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, Parameter | None]:
+        bias = self.bias if not self.skip_bias_add else None
+        output_bias = self.bias if self.skip_bias_add else None
+        assert self.quant_method is not None
+        output = self.quant_method.apply(self, input_, bias)
+        return output, output_bias
+
+    def collect_output(self, output_parallel: torch.Tensor) -> torch.Tensor:
+        return output_parallel
+
+    def forward(self, input_) -> tuple[torch.Tensor, Parameter | None]:
+        input_parallel = self.parallel_input(input_)
+        output_parallel, output_bias = self.apply_quant_method(
+            input_parallel, self.bias
+        )
+        output = self.collect_output(output_parallel)
+
+        return output, output_bias
+
+
+class ReplicatedLinear(ParrallelLenear):
     """Replicated linear layer.
 
     Args:
@@ -286,13 +325,6 @@ class ReplicatedLinear(LinearBase):
         )
         param.data.copy_(loaded_weight)
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, Parameter | None]:
-        bias = self.bias if not self.skip_bias_add else None
-        assert self.quant_method is not None
-        output = self.quant_method.apply(self, x, bias)
-        output_bias = self.bias if self.skip_bias_add else None
-        return output, output_bias
-
     def extra_repr(self) -> str:
         s = f"in_features={self.input_size}"
         s += f", output_features={self.output_size}"
@@ -300,7 +332,7 @@ class ReplicatedLinear(LinearBase):
         return s
 
 
-class ColumnParallelLinear(LinearBase):
+class ColumnParallelLinear(ParrallelLenear):
     """Linear layer with column parallelism.
 
     The linear layer is defined as Y = XA + b. A is parallelized along
@@ -419,12 +451,7 @@ class ColumnParallelLinear(LinearBase):
             loaded_weight = loaded_weight.reshape(1)
         param.load_column_parallel_weight(loaded_weight=loaded_weight)
 
-    def forward(self, input_: torch.Tensor) -> tuple[torch.Tensor, Parameter | None]:
-        bias = self.bias if not self.skip_bias_add else None
-
-        # Matrix multiply.
-        assert self.quant_method is not None
-        output_parallel = self.quant_method.apply(self, input_, bias)
+    def collect_output(self, output_parallel: torch.Tensor) -> torch.Tensor:
         if self.gather_output:
             # All-gather across the partitions.
             output = tensor_model_parallel_all_gather(
@@ -432,8 +459,7 @@ class ColumnParallelLinear(LinearBase):
             )
         else:
             output = output_parallel
-        output_bias = self.bias if self.skip_bias_add else None
-        return output, output_bias
+        return output
 
     def extra_repr(self) -> str:
         s = f"in_features={self.input_size}"
@@ -1095,7 +1121,7 @@ class RowParallelLinear(LinearBase):
 
         param.load_row_parallel_weight(loaded_weight=loaded_weight)
 
-    def forward(self, input_) -> tuple[torch.Tensor, Parameter | None]:
+    def parallel_input(self, input_: torch.Tensor) -> torch.Tensor:
         if self.input_is_parallel:
             input_parallel = input_
         else:
@@ -1104,23 +1130,28 @@ class RowParallelLinear(LinearBase):
                 input_, num_partitions=self.tp_size
             )
             input_parallel = splitted_input[tp_rank].contiguous()
+        return input_parallel
 
-        # Matrix multiply.
-        assert self.quant_method is not None
+    def apply_quant_method(
+        self, input_: torch.Tensor, bias: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, Parameter | None]:
         # Only fuse bias add into GEMM for rank 0 (this ensures that
         # bias will not get added more than once in TP>1 case)
-        bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
-        output_parallel = self.quant_method.apply(self, input_parallel, bias=bias_)
+        bias = self.bias if (not self.skip_bias_add and self.tp_rank == 0) else None
+        output_bias = self.bias if self.skip_bias_add else None
+
+        assert self.quant_method is not None
+        output_parallel = self.quant_method.apply(self, input_, bias=bias)
+        return output_parallel, output_bias
+
+    def collect_output(self, output_parallel: torch.Tensor) -> torch.Tensor:
         if self.reduce_results and self.tp_size > 1:
             output = tensor_model_parallel_all_reduce(
                 output_parallel, tp_group=self.tp_group
             )
         else:
             output = output_parallel
-
-        output_bias = self.bias if self.skip_bias_add else None
-
-        return output, output_bias
+        return output
 
     def extra_repr(self) -> str:
         s = f"input_features={self.input_size_per_partition}"

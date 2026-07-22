@@ -11,7 +11,6 @@ from typing import Any
 import torch
 import torch.distributed as dist
 from safetensors.torch import load_file
-from torch.distributed.tensor import DTensor
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.layers.lora.linear import (
@@ -29,7 +28,13 @@ from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import 
 from sglang.multimodal_gen.runtime.pipelines_core.lora_format_adapter import (
     normalize_lora_state_dict,
 )
-from sglang.multimodal_gen.runtime.server_args import LORA_MERGE_MODES, ServerArgs
+from sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline_utils import (
+    VALID_TARGETS,
+    _has_active_unmerged_lora,
+    _normalize_lora_params,
+    _resolve_lora_merge_mode,
+    _should_merge_lora_for_layers,
+)
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_lora
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -60,7 +65,6 @@ class LoRAPipeline(ComposedPipelineBase):
     lora_layers: dict[str, BaseLayerWithLoRA]
     lora_layers_critic: dict[str, BaseLayerWithLoRA]
     lora_layers_transformer_2: dict[str, BaseLayerWithLoRA]
-    server_args: ServerArgs
     exclude_lora_layers: list[str]
     device: torch.device
     lora_target_modules: list[str] | None
@@ -71,8 +75,6 @@ class LoRAPipeline(ComposedPipelineBase):
     lora_initialized: bool
     # Track merge status per module: {"transformer": True, "transformer_2": False}
     is_lora_merged: dict[str, bool]
-    # Valid target values for set_lora (class constant, immutable)
-    VALID_TARGETS: list[str] = ["all", "transformer", "transformer_2", "critic"]
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -156,7 +158,7 @@ class LoRAPipeline(ComposedPipelineBase):
                 )
             return [("critic", self.lora_layers_critic)], None
         else:
-            return [], f"Invalid target: {target}. Valid targets: {self.VALID_TARGETS}"
+            return [], f"Invalid target: {target}. Valid targets: {VALID_TARGETS}"
 
     @contextmanager
     def _temporarily_disable_offload(
@@ -322,60 +324,6 @@ class LoRAPipeline(ComposedPipelineBase):
                 converted_count_critic,
             )
 
-    def _normalize_lora_params(
-        self,
-        lora_nickname: str | list[str],
-        lora_path: str | None | list[str | None],
-        strength: float | list[float],
-        target: str | list[str],
-    ) -> tuple[list[str], list[str | None], list[float], list[str]]:
-        """
-        Normalize LoRA parameters to lists for multi-LoRA support.
-
-        Requirements:
-        - each nickname must have a corresponding lora_path (no implicit repeat)
-        - strength / target if scalar broadcast, else length must match nickname
-        """
-        # nickname
-        if isinstance(lora_nickname, str):
-            lora_nicknames = [lora_nickname]
-        else:
-            lora_nicknames = lora_nickname
-
-        # lora_path: require 1:1 mapping with nickname (no implicit repeat)
-        if isinstance(lora_path, list):
-            lora_paths = lora_path
-        else:
-            lora_paths = [lora_path]
-        if len(lora_paths) != len(lora_nicknames):
-            raise ValueError(
-                f"Length mismatch: lora_nickname has {len(lora_nicknames)} items, "
-                f"but lora_path has {len(lora_paths)} items. "
-                "Provide one path per nickname."
-            )
-
-        # strength and target: allow scalar broadcast, else length must match
-        if isinstance(strength, (int, float)):
-            strengths = [float(strength)] * len(lora_nicknames)
-        else:
-            strengths = [float(s) for s in strength]
-        if len(strengths) != len(lora_nicknames):
-            raise ValueError(
-                f"Length mismatch: lora_nickname has {len(lora_nicknames)} items, "
-                f"but strength has {len(strengths)} items"
-            )
-
-        if isinstance(target, str):
-            targets = [target] * len(lora_nicknames)
-        else:
-            targets = target
-        if len(targets) != len(lora_nicknames):
-            raise ValueError(
-                f"Length mismatch: lora_nickname has {len(lora_nicknames)} items, "
-                f"but target has {len(targets)} items"
-            )
-        return lora_nicknames, lora_paths, strengths, targets
-
     def _check_lora_config_matches(
         self,
         module_name: str,
@@ -413,74 +361,21 @@ class LoRAPipeline(ComposedPipelineBase):
             and stored_strengths == target_strengths
         )
 
-    @staticmethod
-    def _uses_dtensor_weights(lora_layers: dict[str, BaseLayerWithLoRA]) -> bool:
-        return any(isinstance(layer.weight, DTensor) for layer in lora_layers.values())
-
-    @staticmethod
-    def _has_active_unmerged_lora(
-        lora_layers: dict[str, BaseLayerWithLoRA],
-    ) -> bool:
-        return any(
-            not layer.merged and not layer.disable_lora
-            for layer in lora_layers.values()
-        )
-
     def _is_lora_effective_for_module(
         self,
         module_name: str,
         lora_layers: dict[str, BaseLayerWithLoRA],
     ) -> bool:
-        return self.is_lora_merged.get(
-            module_name, False
-        ) or self._has_active_unmerged_lora(lora_layers)
-
-    def _resolve_lora_merge_mode(
-        self,
-        merge_weights: bool | None,
-        merge_mode: str | None,
-    ) -> str:
-        if merge_mode is None:
-            if merge_weights is not None:
-                merge_mode = "merge" if merge_weights else "dynamic"
-            else:
-                merge_mode = self.server_args.lora_merge_mode
-        if merge_mode not in LORA_MERGE_MODES:
-            raise ValueError(
-                f"Invalid LoRA merge mode: {merge_mode}. Valid modes: {LORA_MERGE_MODES}"
-            )
-        return merge_mode
-
-    def _should_merge_lora_for_layers(
-        self,
-        module_name: str,
-        lora_layers: dict[str, BaseLayerWithLoRA],
-        merge_mode: str,
-    ) -> bool:
-        if merge_mode == "dynamic":
-            return False
-        uses_dtensor_weights = self._uses_dtensor_weights(lora_layers)
-        if merge_mode == "auto":
-            if uses_dtensor_weights:
-                logger.info(
-                    "Using dynamic LoRA for %s because FSDP-sharded weights would require a full-gather merge.",
-                    module_name,
-                )
-                return False
-            return True
-        if uses_dtensor_weights:
-            logger.warning(
-                "Merging LoRA for %s with FSDP-sharded weights may require full-gather and can OOM.",
-                module_name,
-            )
-        return True
+        return self.is_lora_merged.get(module_name, False) or _has_active_unmerged_lora(
+            lora_layers
+        )
 
     def _apply_lora_to_layers(
         self,
         lora_layers: dict[str, BaseLayerWithLoRA],
         lora_nicknames: list[str],
         lora_paths: list[str | None],
-        rank: int,
+        distributed_rank: int,
         strengths: list[float],
         clear_existing: bool = False,
         merge_weights: bool = True,
@@ -492,7 +387,7 @@ class LoRAPipeline(ComposedPipelineBase):
             lora_layers: The dictionary of LoRA layers to apply weights to.
             lora_nicknames: The list of nicknames of the LoRA adapters.
             lora_paths: The list of paths to the LoRA adapters. Must match length of lora_nicknames.
-            rank: The distributed rank (for logging).
+            distributed_rank: The distributed rank (for logging).
             strengths: The list of LoRA strengths for merge. Must match length of lora_nicknames.
             clear_existing: If True, clear existing LoRA weights before adding new ones.
 
@@ -568,7 +463,7 @@ class LoRAPipeline(ComposedPipelineBase):
                         if not has_any_lora:
                             layer.disable_lora = True
 
-        if rank == 0:
+        if distributed_rank == 0:
             total_layers = len(lora_layers)
             example_limit = 8
             for idx, path in enumerate(lora_paths):
@@ -781,19 +676,14 @@ class LoRAPipeline(ComposedPipelineBase):
         Load LoRA adapter(s) into the pipeline and apply them to the specified transformer(s).
         Supports both single LoRA (backward compatible) and multiple LoRA adapters.
         """
-        merge_mode = self._resolve_lora_merge_mode(merge_weights, merge_mode)
-
-        # Normalize inputs to lists for multi-LoRA support
-        lora_nicknames, lora_paths, strengths, targets = self._normalize_lora_params(
-            lora_nickname, lora_path, strength, target
+        merge_mode = _resolve_lora_merge_mode(
+            merge_weights, merge_mode, self.server_args.lora_merge_mode
         )
 
-        # Validate targets
-        invalid_targets = [t for t in targets if t not in self.VALID_TARGETS]
-        if invalid_targets:
-            raise ValueError(
-                f"Invalid target(s): {invalid_targets}. Valid targets: {self.VALID_TARGETS}"
-            )
+        # Normalize inputs to lists for multi-LoRA support
+        lora_nicknames, lora_paths, strengths, targets = _normalize_lora_params(
+            lora_nickname, lora_path, strength, target
+        )
 
         # Disable layerwise offload before convert_to_lora_layers to ensure weights are accessible
         # This is critical because convert_to_lora_layers needs to save cpu_weight from actual weights,
@@ -806,7 +696,7 @@ class LoRAPipeline(ComposedPipelineBase):
 
         # Check adapter presence and load missing adapters
         adapter_updated = False
-        rank = dist.get_rank()
+        distributed_rank = dist.get_rank()
 
         # load required adapters
         for nickname, path in zip(lora_nicknames, lora_paths):
@@ -823,7 +713,7 @@ class LoRAPipeline(ComposedPipelineBase):
                     should_load = True
             if should_load:
                 adapter_updated = True
-                self.load_lora_adapter(path, nickname, rank)
+                self.load_lora_adapter(path, nickname, distributed_rank)
 
         # Group by target to apply separately
         target_to_indices = {}
@@ -854,7 +744,7 @@ class LoRAPipeline(ComposedPipelineBase):
             # Skip if LoRA configuration matches exactly (including order and strength)
             # Since all modules for the same target apply the same config, checking one is sufficient
             first_module_name, first_lora_layers_dict = target_modules[0]
-            first_effective_merge_weights = self._should_merge_lora_for_layers(
+            first_effective_merge_weights = _should_merge_lora_for_layers(
                 first_module_name, first_lora_layers_dict, merge_mode
             )
             if not first_effective_merge_weights and len(tgt_nicknames) > 1:
@@ -868,7 +758,7 @@ class LoRAPipeline(ComposedPipelineBase):
                 merge_weights_by_module[module_name] = (
                     first_effective_merge_weights
                     if module_name == first_module_name
-                    else self._should_merge_lora_for_layers(
+                    else _should_merge_lora_for_layers(
                         module_name, lora_layers_dict, merge_mode
                     )
                 )
@@ -911,7 +801,7 @@ class LoRAPipeline(ComposedPipelineBase):
                             lora_layers_dict,
                             tgt_nicknames,
                             tgt_paths,
-                            rank,
+                            distributed_rank,
                             tgt_strengths,
                             clear_existing=True,
                             merge_weights=effective_merge_weights,
@@ -932,7 +822,7 @@ class LoRAPipeline(ComposedPipelineBase):
 
         logger.info(
             "Rank %d: LoRA adapter(s) %s applied to %d layers (targets: %s, strengths: %s, merge_mode=%s)",
-            rank,
+            distributed_rank,
             ", ".join(map(str, lora_paths)) if lora_paths else None,
             adapted_count,
             ", ".join(targets) if len(set(targets)) > 1 else targets[0],
@@ -997,7 +887,7 @@ class LoRAPipeline(ComposedPipelineBase):
         # Disable layerwise offload if enabled: load all layers to GPU
         with self._temporarily_disable_offload(target_modules=target_modules):
             for module_name, lora_layers_dict in target_modules:
-                if not self._should_merge_lora_for_layers(
+                if not _should_merge_lora_for_layers(
                     module_name, lora_layers_dict, self.server_args.lora_merge_mode
                 ):
                     for layer in lora_layers_dict.values():
@@ -1066,7 +956,7 @@ class LoRAPipeline(ComposedPipelineBase):
 
         for module_name, lora_layers_dict in target_modules:
             if not self.is_lora_merged.get(module_name, False):
-                if self._has_active_unmerged_lora(lora_layers_dict):
+                if _has_active_unmerged_lora(lora_layers_dict):
                     for layer in lora_layers_dict.values():
                         if not layer.disable_lora:
                             layer.disable_lora = True
