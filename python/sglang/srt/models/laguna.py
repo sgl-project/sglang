@@ -692,6 +692,10 @@ class LagunaForCausalLM(nn.Module):
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
 
+    def get_attention_sliding_window_size(self) -> Optional[int]:
+        # Hugging Face's value is inclusive; SGLang's window is exclusive.
+        return int(self.config.sliding_window) - 1
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             ("qkv_proj", "q_proj", "q"),
