@@ -157,6 +157,56 @@ if _is_cpu:
         torch.ops.sgl_kernel.fused_qkvzba_split_reshape_cat_contiguous_cpu
     )
 
+
+@lru_cache(maxsize=1)
+def _enable_qwen35_fused_ar_quant() -> bool:
+    """Gate the fused AR+RMSNorm+per-group-FP8-quant path for Qwen3.5.
+
+    The single-kernel backend is ROCm/aiter/gfx95-only. The model gate stays
+    tied to ROCm/aiter so non-gfx95 HIP can keep the existing 2-kernel fallback
+    behavior for tuple handoff when this branch is used. It replaces the
+    existing ``--enable-aiter-allreduce-fusion`` 3-kernel path
+    (AR → RMSNorm → per-group quant) with either a single fused kernel (when
+    the fully-fused variant is eligible) or a 2-kernel path
+    (fused AR+RMSNorm + separate per-group quant) that still saves one
+    kernel launch vs. baseline. The LayerCommunicator gracefully falls back
+    to ``forward_with_allreduce_fusion`` (plain AR+RMSNorm) when the fused
+    quant helper returns ``None``, so turning this on never regresses the
+    AR+RMSNorm fusion itself.
+
+    Opt-out: set ``SGLANG_DISABLE_FUSED_AR_QUANT=1`` to fall back to the
+    unmodified AR+RMSNorm fusion path.
+    """
+    if not _use_aiter:
+        return False
+    if get_bool_env_var("SGLANG_DISABLE_FUSED_AR_QUANT", default="false"):
+        return False
+    return bool(get_server_args().enable_aiter_allreduce_fusion)
+
+
+def _linear_accepts_fp8_tuple(linear: nn.Module) -> bool:
+    quant_method = getattr(linear, "quant_method", None)
+    return quant_method.__class__.__name__ == "Fp8LinearMethod" and (
+        getattr(quant_method, "block_quant", False)
+        or getattr(quant_method, "use_mxfp8", False)
+    )
+
+
+def _select_fused_ar_input_for_linear(hidden_states, linear: nn.Module):
+    if not isinstance(hidden_states, tuple):
+        return hidden_states
+    if len(hidden_states) == 3:
+        hs_bf16, hs_fp8, hs_scale = hidden_states
+        if _linear_accepts_fp8_tuple(linear):
+            return (hs_fp8, hs_scale)
+        return hs_bf16
+    if len(hidden_states) == 2 and _linear_accepts_fp8_tuple(linear):
+        return hidden_states
+    raise TypeError(
+        f"{linear.__class__.__name__} cannot consume fused AR quant tuple input"
+    )
+
+
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import (
         split_qkvgate_gemma_rmsnorm_rope,
@@ -490,6 +540,14 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         return query, key, value, z, b, a
 
     def _forward_input_proj(self, hidden_states: torch.Tensor):
+        # AMD/aiter fused AR+RMSNorm+per-group-quant path ships a
+        # ``(bf16, fp8, scale)`` 3-tuple so the FP8 ``in_proj_qkvz`` can
+        # consume ``(fp8, scale)`` (skipping its internal quant) while the
+        # bf16 ``in_proj_ba`` consumes the unquantized bf16. Non-aiter runs skip
+        # the tuple branch and keep the original control flow below unchanged.
+        if _use_aiter and isinstance(hidden_states, tuple):
+            return self._forward_input_proj_fused_quant_amd(hidden_states)
+
         if (
             _is_cpu
             or _is_npu
@@ -524,6 +582,39 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         else:
             projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
             projected_states_ba, _ = self.in_proj_ba(hidden_states)
+        return projected_states_qkvz, projected_states_ba
+
+    def _forward_input_proj_fused_quant_amd(self, hidden_states):
+        """AMD-only variant for the fused AR+RMSNorm+per-group-quant path.
+
+        ``hidden_states`` is a ``(bf16, fp8, scale)`` 3-tuple produced by the
+        upstream fused kernel. FP8 ``in_proj_qkvz`` takes ``(fp8, scale)``
+        directly; unquantized variants take the bf16 side-output.
+        """
+        hs_bf16 = hidden_states[0]
+        hs_qkvz = _select_fused_ar_input_for_linear(hidden_states, self.in_proj_qkvz)
+        seq_len = hs_bf16.shape[0]
+
+        if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE):
+            DUAL_STREAM_TOKEN_THRESHOLD = 0
+        else:
+            DUAL_STREAM_TOKEN_THRESHOLD = 1024
+
+        if (
+            self.alt_stream is not None
+            and get_is_capture_mode()
+            and seq_len < DUAL_STREAM_TOKEN_THRESHOLD
+            and _gdn_use_alt_stream
+        ):
+            current_stream = torch.cuda.current_stream()
+            self.alt_stream.wait_stream(current_stream)
+            projected_states_qkvz, _ = self.in_proj_qkvz(hs_qkvz)
+            with torch.cuda.stream(self.alt_stream):
+                projected_states_ba, _ = self.in_proj_ba(hs_bf16)
+            current_stream.wait_stream(self.alt_stream)
+        else:
+            projected_states_qkvz, _ = self.in_proj_qkvz(hs_qkvz)
+            projected_states_ba, _ = self.in_proj_ba(hs_bf16)
         return projected_states_qkvz, projected_states_ba
 
     def forward(
@@ -664,12 +755,21 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         self.post_attention_layernorm = GemmaRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        # GDN layers need both bf16 (for the small in_proj_ba gating
+        # projection) and a quantized tuple only when in_proj_qkvz can consume
+        # it. Otherwise, stay on the plain AR+RMSNorm path.
+        enable_fused_ar_quant = (
+            _enable_qwen35_fused_ar_quant()
+            and _linear_accepts_fp8_tuple(self.linear_attn.in_proj_qkvz)
+        )
         self.layer_communicator = LayerCommunicator(
             layer_scatter_modes=self.layer_scatter_modes,
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,
             is_last_layer=(layer_id == config.num_hidden_layers - 1),
+            enable_fused_ar_quant=enable_fused_ar_quant,
+            fused_ar_quant_keep_bf16=enable_fused_ar_quant,
         )
 
     def forward(
@@ -873,12 +973,19 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
+        # Standard attention layers benefit from a fused quant epilogue only
+        # when qkv_proj can consume the returned quantized tuple.
+        enable_fused_ar_quant = (
+            _enable_qwen35_fused_ar_quant() and _linear_accepts_fp8_tuple(self.qkv_proj)
+        )
         self.layer_communicator = LayerCommunicator(
             layer_scatter_modes=self.layer_scatter_modes,
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,
             is_last_layer=(layer_id == config.num_hidden_layers - 1),
+            enable_fused_ar_quant=enable_fused_ar_quant,
+            fused_ar_quant_keep_bf16=False,
         )
 
         self.alt_stream = alt_stream
@@ -948,6 +1055,10 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         return q, k, v, gate
 
     def forward_prepare_native(self, positions, hidden_states):
+        if _use_aiter and isinstance(hidden_states, tuple):
+            hidden_states = _select_fused_ar_input_for_linear(
+                hidden_states, self.qkv_proj
+            )
         qkv, _ = self.qkv_proj(hidden_states)
         if self.attn_output_gate:
             q_gate, k, v = qkv.split(
@@ -967,6 +1078,10 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         return q, k, v, gate
 
     def forward_prepare_fused_gate(self, positions, hidden_states):
+        if _use_aiter and isinstance(hidden_states, tuple):
+            hidden_states = _select_fused_ar_input_for_linear(
+                hidden_states, self.qkv_proj
+            )
         qkv, _ = self.qkv_proj(hidden_states)
         if self.attn_output_gate:
             q_gate, k, v = qkv.split(
