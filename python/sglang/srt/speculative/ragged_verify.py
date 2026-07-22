@@ -209,14 +209,11 @@ def resolve_compact_verify_layout(
     padded_bs: Optional[int],
     backend_name: str,
 ) -> Optional[RaggedVerifyLayout]:
-    """Resolve a spec input's layout for a compact-verify-capable backend:
-    None unless a layout is present and compact mode is on; CP is rejected.
-    padded_bs=None keeps the raw layout (eager: the batch carries exactly the
-    real verify tokens); otherwise pad to the captured slot count so the
-    tier's slack lands in the padding rows and the metadata build stays
-    sync-free. Layout invariants (verify_lens >= 1, total == sum) are enforced
-    in RaggedVerifyLayout.__post_init__; don't re-check the device tensor
-    here -- that would D2H-sync the host-free verify prep path.
+    """None unless a layout is present and compact mode is on; CP is rejected.
+    padded_bs=None keeps the raw layout (eager); otherwise pad to the captured
+    slot count so the tier's slack lands in the padding rows. Layout invariants
+    are enforced in __post_init__; don't re-check the device tensor here --
+    that would D2H-sync the host-free verify prep path.
     """
     from sglang.srt.runtime_context import get_parallel
 

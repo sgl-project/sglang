@@ -817,9 +817,8 @@ class DeepseekSparseAttnBackend(
                 # one-time host-driven build, a D2H sync is fine here.
                 verify_lens_cpu = verify_layout.verify_lens.cpu().tolist()
             capture_extend_lens = [int(v) for v in verify_lens_cpu]
-            # Stage the capture lens so the warmup execution of the
-            # graph-recorded prep (init_forward_metadata_in_graph) sees
-            # non-zero lengths.
+            # Stage the capture lens so the warmup run of the graph-recorded
+            # prep sees non-zero lengths.
             self._ragged_verify_lens_buf[: len(capture_extend_lens)].copy_(
                 verify_layout.verify_lens
             )
@@ -1652,12 +1651,9 @@ class DeepseekSparseAttnBackend(
                     metadata.cu_seqlens_k[1:].copy_(
                         torch.cumsum(cache_seqlens, dim=0, dtype=torch.int32)
                     )
-                    # Sync-free ragged expansion: map each expanded row to its
-                    # request by searchsorted over the device qo_indptr. The
-                    # padded layout covers the full tier (padding rows absorb
-                    # the slack tokens), so every row maps to a real or padded
-                    # request; padded rows' outputs are discarded by the
-                    # runner's output slice.
+                    # Sync-free row->request map via searchsorted over the
+                    # device qo_indptr; padding rows cover the tier's slack and
+                    # their outputs are discarded by the runner's output slice.
                     qo_indptr = verify_layout.qo_indptr_device
                     row_ids = torch.arange(
                         total_rows, dtype=qo_indptr.dtype, device=self.device
@@ -1694,9 +1690,8 @@ class DeepseekSparseAttnBackend(
                     )
                     metadata.page_table_1[:, :max_seqlen_k].copy_(page_indices)
 
-                    # Fill the constant per-req qo lengths on-device;
-                    # torch.tensor(list, device=cuda) does a pageable H2D copy
-                    # that blocks the host.
+                    # Fill on-device: torch.tensor(list, device=cuda) is a
+                    # blocking pageable H2D copy.
                     extend_seq_lens = torch.full(
                         (bs,),
                         self.speculative_num_draft_tokens,
