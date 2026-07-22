@@ -1082,7 +1082,7 @@ class OpenAIServingChat(OpenAIServingBase):
         audio_tokens = {}
         video_tokens = {}
         output_ids: Dict[int, List[int]] = {}
-        
+
         stream_started = False
         try:
             include_usage, continuous_usage_stats = should_include_usage(
@@ -1114,10 +1114,15 @@ class OpenAIServingChat(OpenAIServingBase):
                 audio_tokens[index] = content["meta_info"].get("audio_tokens", 0)
                 video_tokens[index] = content["meta_info"].get("video_tokens", 0)
 
+                finish_reason = content["meta_info"].get("finish_reason", None)
+                finish_reason_type = finish_reason["type"] if finish_reason else None
+
                 if return_output_ids:
                     chunk_output_ids = content.get("output_ids")
-                    if chunk_output_ids is not None:
-                        if self.tokenizer_manager.server_args.incremental_streaming_output:
+                    if chunk_output_ids is not None and finish_reason_type != "abort":
+                        if (
+                            self.tokenizer_manager.server_args.incremental_streaming_output
+                        ):
                             output_ids.setdefault(index, []).extend(chunk_output_ids)
                         else:
                             output_ids[index] = chunk_output_ids
@@ -1134,9 +1139,6 @@ class OpenAIServingChat(OpenAIServingBase):
                             content, n_prev_token, total_output_logprobs
                         ).model_dump()
                     n_prev_tokens[index] = total_output_logprobs
-
-                finish_reason = content["meta_info"].get("finish_reason", None)
-                finish_reason_type = finish_reason["type"] if finish_reason else None
 
                 # Track finish_reason for each index
                 if finish_reason_type:
@@ -1156,7 +1158,11 @@ class OpenAIServingChat(OpenAIServingBase):
                             code.value,
                         )
                         yield f"data: {error}\n\n"
-                        break
+                        # Terminate the stream immediately: skip finalization so
+                        # no buffered event (e.g. sglext.output_ids) is emitted
+                        # after the error.
+                        yield "data: [DONE]\n\n"
+                        return
                     finish_reasons[index] = finish_reason
 
                 # First chunk with role
@@ -1250,9 +1256,8 @@ class OpenAIServingChat(OpenAIServingBase):
 
             sglext_output_ids = None
             if return_output_ids and output_ids:
-                max_index = max(output_ids.keys())
                 sglext_output_ids = [
-                    list(output_ids.get(i, [])) for i in range(max_index + 1)
+                    list(output_ids.get(i, [])) for i in range(request.n)
                 ]
 
             if (
@@ -1356,11 +1361,7 @@ class OpenAIServingChat(OpenAIServingBase):
         )
         output_ids = None
         if self._should_return_output_ids(request):
-            collected = [ret_item.get("output_ids") for ret_item in ret]
-            if any(ids is not None for ids in collected):
-                output_ids = [
-                    list(ids) if ids is not None else [] for ids in collected
-                ]
+            output_ids = [list(ret_item["output_ids"]) for ret_item in ret]
         response_sglext = None
         if routed_experts or cached_tokens_details or output_ids is not None:
             response_sglext = SglExt(
