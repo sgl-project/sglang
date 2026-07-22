@@ -14,27 +14,38 @@ from typing import List
 
 
 def flatten_ragged(per_pos_val, per_pos_idx):
-    """Flatten a per-position ``list[Optional[list]]`` (top-k / token-ids
-    logprobs) into flat ``val``/``idx`` buffers plus a per-position ``lens``
-    vector for the columnar egress wire. A falsy (None/empty) position
-    contributes no values and a ``0`` length — the Rust side reshapes it back to
-    a ``null`` position, matching ``detokenize_top_logprobs_tokens``.
-    """
+    """Flatten per-position ``list[Optional[list]]`` val/idx pairs into flat
+    buffers + a shared ``lens`` vector (falsy position -> len 0 -> Rust ``null``).
+    idx must mirror val exactly (asserted): the wire pairs both buffers by the
+    one ``lens`` vector, so divergence shifts or drops token ids downstream."""
+
     flat_val: List[float] = []
     flat_idx: List[int] = []
     lens: List[int] = []
     if not per_pos_val:
+        assert not per_pos_idx, (
+            f"ragged idx column has {len(per_pos_idx)} positions but the val "
+            "column is empty"
+        )
         return flat_val, flat_idx, lens
-    per_pos_idx = per_pos_idx or []
+    assert per_pos_idx is not None and len(per_pos_idx) == len(per_pos_val), (
+        f"ragged idx column has {len(per_pos_idx) if per_pos_idx else 0} "
+        f"positions, val column has {len(per_pos_val)}"
+    )
     for p, pv in enumerate(per_pos_val):
+        pi = per_pos_idx[p]
         if pv:
-            pi = per_pos_idx[p] if p < len(per_pos_idx) else []
             # A truthy position holds only real logprobs; a `None`/empty position
             # is the falsy branch below (len 0), so no per-value None check here.
+            assert pi is not None and len(pi) == len(pv), (
+                f"position {p}: idx len "
+                f"{len(pi) if pi is not None else None} != val len {len(pv)}"
+            )
             flat_val.extend(pv)
-            flat_idx.extend(pi or [])
+            flat_idx.extend(pi)
             lens.append(len(pv))
         else:
+            assert not pi, f"position {p}: idx has {len(pi)} entries but val is empty"
             lens.append(0)
     return flat_val, flat_idx, lens
 
