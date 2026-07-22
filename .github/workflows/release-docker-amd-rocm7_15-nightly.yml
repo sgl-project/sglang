@@ -94,7 +94,9 @@ jobs:
           # remove --build-arg NIC_BACKEND=ainic for auto detection nic support in mori
           # UBUNTU_MIRROR forces apt over HTTPS to dodge port-80 reachability flakes
           # to Canonical's archive.ubuntu.com mirror IPs from the build runner.
-          docker build . -f docker/rocm.Dockerfile --build-arg SGL_BRANCH=${{ github.sha }} --build-arg BUILD_TYPE=${{ matrix.build_type }} --build-arg GPU_ARCH=${{ matrix.gpu_arch }} --build-arg GPU_ARCH_LIST_ARG=gfx1250 --build-arg ENABLE_MORI=1 --build-arg SGLANG_VERSION=${pretend_version} --build-arg UBUNTU_MIRROR=https://archive.ubuntu.com -t rocm/sgl-dev:${tag}-${{ env.DATE }} --no-cache
+          # --ulimit raises the container's nofile hard limit so the in-Dockerfile
+          # `ulimit -n 65536` (sgl-model-gateway build) does not hit EPERM on this runner.
+          docker build . -f docker/rocm.Dockerfile --ulimit nofile=65536:65536 --build-arg SGL_BRANCH=${{ github.sha }} --build-arg BUILD_TYPE=${{ matrix.build_type }} --build-arg GPU_ARCH=${{ matrix.gpu_arch }} --build-arg GPU_ARCH_LIST_ARG=gfx1250 --build-arg ENABLE_MORI=1 --build-arg ENABLE_NIXL=0 --build-arg SGLANG_VERSION=${pretend_version} --build-arg UBUNTU_MIRROR=https://archive.ubuntu.com -t rocm/sgl-dev:${tag}-${{ env.DATE }} --no-cache
           # docker push rocm/sgl-dev:${tag}-${{ env.DATE }}
 
       - name: Login to Docker Hub (lmsys)
