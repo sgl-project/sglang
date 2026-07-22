@@ -100,6 +100,7 @@ class TreeNode:
         self.host_mamba_ref_counter = 0
         # store the host indices of KV cache
         self.host_value = None
+        self.write_through_pending_id: Optional[int] = None
         # store hash values of each pages
         self.hash_value: Optional[List[str]] = None
 
@@ -540,7 +541,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     def cache_finished_req(
         self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int
-    ) -> None:
+    ) -> Optional[RadixKey]:
         """Cache request when it finishes."""
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
@@ -548,7 +549,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             ]
             self.token_to_kv_pool_allocator.free(kv_indices)
             self.req_to_token_pool.free_mamba_cache(req)
-            return
+            return None
 
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_len_to_handle]
         kv_indices = self.req_to_token_pool.req_to_token[
@@ -623,9 +624,10 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                     mamba_value = req.mamba_pool_idx.unsqueeze(-1).clone()
                 mamba_ping_pong_track_buffer_to_keep = None
 
+            cached_key = RadixKey(token_ids[:page_aligned_len], req.extra_key)
             result = self.insert(
                 InsertParams(
-                    key=RadixKey(token_ids[:page_aligned_len], req.extra_key),
+                    key=cached_key,
                     value=page_aligned_kv_indices,
                     mamba_value=mamba_value,
                     prev_prefix_len=req.cache_protected_len,
@@ -638,6 +640,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         else:
             self.token_to_kv_pool_allocator.free(kv_indices[req.cache_protected_len :])
             mamba_exist = True
+            cached_key = None
 
         if mamba_exist:
             mamba_ping_pong_track_buffer_to_keep = None
@@ -657,6 +660,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             )
 
         self.dec_lock_ref(req.last_node)
+        return cached_key
 
     def cache_unfinished_req(self, req: Req, chunked=False) -> None:
         """Cache request when it is unfinished."""

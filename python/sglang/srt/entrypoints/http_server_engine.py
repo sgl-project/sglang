@@ -118,6 +118,8 @@ class HttpServerEngineAdapter(EngineBase):
         custom_logit_processor=None,
         priority=None,
         session_id=None,
+        storage_checkpoint=False,
+        storage_checkpoint_dependency=None,
     ):
         payload = {
             "text": prompt,
@@ -132,6 +134,8 @@ class HttpServerEngineAdapter(EngineBase):
             "custom_logit_processor": custom_logit_processor,
             "priority": priority,
             "session_id": session_id,
+            "storage_checkpoint": storage_checkpoint,
+            "storage_checkpoint_dependency": storage_checkpoint_dependency,
         }
         # Filter out None values
         payload = {k: v for k, v in payload.items() if v is not None}

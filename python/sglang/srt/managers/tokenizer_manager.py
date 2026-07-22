@@ -94,6 +94,7 @@ from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_regi
 from sglang.srt.managers.tokenizer_control_mixin import TokenizerControlMixin
 from sglang.srt.managers.tokenizer_manager_score_mixin import TokenizerManagerScoreMixin
 from sglang.srt.managers.utils import is_health_check_generate_req
+from sglang.srt.mem_cache.storage_prefetch import make_storage_checkpoint_handle
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_TOKENIZER,
@@ -638,6 +639,28 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Normalize the request
         obj.normalize_batch_and_arguments()
         self._set_default_priority(obj)
+
+        if (
+            isinstance(obj, GenerateReqInput)
+            and self.disaggregation_mode != DisaggregationMode.NULL
+        ):
+            checkpoint_requested = (
+                any(obj.storage_checkpoint)
+                if isinstance(obj.storage_checkpoint, list)
+                else obj.storage_checkpoint
+            )
+            dependency_requested = (
+                any(value is not None for value in obj.storage_checkpoint_dependency)
+                if isinstance(obj.storage_checkpoint_dependency, list)
+                else obj.storage_checkpoint_dependency is not None
+            )
+            if checkpoint_requested or dependency_requested:
+                raise ValueError(
+                    "storage_checkpoint and storage_checkpoint_dependency are not "
+                    "supported with P/D disaggregation because checkpoint state is "
+                    "local to one scheduler process. Use unified serving or omit "
+                    "these fields."
+                )
 
         if isinstance(obj, GenerateReqInput) and obj.routed_dp_rank is not None:
             dp_size = self.elastic_worker_count
@@ -1220,6 +1243,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 disagg_prefill_dp_rank=obj.disagg_prefill_dp_rank,
                 priority=obj.priority,
                 extra_key=obj.extra_key,
+                storage_checkpoint=obj.storage_checkpoint,
+                storage_checkpoint_dependency=obj.storage_checkpoint_dependency,
                 routing_key=obj.routing_key,
                 token_type_ids=token_type_ids,
                 need_wait_for_mm_inputs=obj.need_wait_for_mm_inputs,
@@ -2034,6 +2059,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 meta_info["dp_rank"] = recv_obj.dp_ranks[i]
 
             state.finished = recv_obj.finished_reasons[i] is not None
+            if (
+                state.finished
+                and isinstance(state.obj, GenerateReqInput)
+                and state.obj.storage_checkpoint
+                and recv_obj.finished_reasons[i].get("type") != "abort"
+            ):
+                meta_info["storage_checkpoint_handle"] = make_storage_checkpoint_handle(
+                    rid
+                )
             if isinstance(recv_obj, BatchStrOutput):
                 # Not all request types have `stream` (e.g., EmbeddingReqInput). Default to non-streaming.
                 is_stream = getattr(state.obj, "stream", False)

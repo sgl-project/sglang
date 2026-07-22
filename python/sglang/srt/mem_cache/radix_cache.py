@@ -436,7 +436,7 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
 
     def cache_finished_req(
         self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int
-    ):
+    ) -> Optional[RadixKey]:
         """Cache request when it finishes."""
         # In deterministic mode, disable finished request insertion to radix cache
         if self.disable_finished_insert:
@@ -448,7 +448,7 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
                 req.req_pool_idx, req.cache_protected_len : kv_len_to_handle
             ]
             self.token_to_kv_pool_allocator.free(kv_indices)
-            return
+            return None
 
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_len_to_handle]
         kv_indices = self.req_to_token_pool.req_to_token[
@@ -486,6 +486,8 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         # Remove req slot release the cache lock
         if req.last_node is not None:
             self.dec_lock_ref(req.last_node)
+
+        return radix_key if is_insert else None
 
     def cache_unfinished_req(self, req: Req, chunked=False):
         """Cache request when it is unfinished."""

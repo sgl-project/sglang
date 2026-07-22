@@ -34,6 +34,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransferResult,
 )
 from sglang.srt.mem_cache.memory_pool_host import PoolEntry
+from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchState
 from sglang.srt.utils import get_device_module
 
 if TYPE_CHECKING:
@@ -117,6 +118,24 @@ class StorageOperation(BaseStorageOperation):
         self.pool_transfers = pool_transfers
         self.pool_storage_result = PoolTransferResult.empty()
 
+    def durable_page_count(self, page_size: int, backup_skip: bool) -> int:
+        durable_pages = super().durable_page_count(page_size, backup_skip)
+        if backup_skip or not self.pool_transfers:
+            return durable_pages
+
+        required_pages_by_pool: dict[PoolName, int] = {}
+        for transfer in self.pool_transfers:
+            required_pages_by_pool[transfer.name] = required_pages_by_pool.get(
+                transfer.name, 0
+            ) + len(transfer.keys or [])
+        for pool_name, required_pages in required_pages_by_pool.items():
+            completed_pages = self.pool_storage_result.extra_pool_hit_pages.get(
+                pool_name, 0
+            )
+            if completed_pages < required_pages:
+                return 0
+        return durable_pages
+
 
 class PrefetchOperation(StorageOperation):
     def __init__(
@@ -126,14 +145,17 @@ class PrefetchOperation(StorageOperation):
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
         pool_transfers: Optional[list[PoolTransfer]] = None,
+        host_indices: Optional[torch.Tensor] = None,
     ):
         self.request_id = request_id
         self._lock = threading.Lock()
         self._terminated_flag = False
         self.storage_hit_count = 0
         self.start_time = time.monotonic()
+        self.storage_prefetch_state = StoragePrefetchState.QUERYING
+        self.worker_done = threading.Event()
         super().__init__(
-            None,
+            host_indices,
             token_ids,
             last_hash,
             prefix_keys=prefix_keys,
@@ -563,6 +585,7 @@ class HybridCacheController(BaseHiCacheController):
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
         extra_pools: Optional[list[PoolTransfer]] = None,
+        host_indices: Optional[torch.Tensor] = None,
     ) -> PrefetchOperation:
         operation = PrefetchOperation(
             request_id,
@@ -570,6 +593,7 @@ class HybridCacheController(BaseHiCacheController):
             last_hash,
             prefix_keys=prefix_keys,
             pool_transfers=extra_pools,
+            host_indices=host_indices,
         )
         self.prefetch_queue.put(operation)
         return operation
@@ -589,6 +613,7 @@ class HybridCacheController(BaseHiCacheController):
             prefix_keys=prefix_keys,
             pool_transfers=extra_pools,
         )
+        self.storage_write_tracker.register(operation.id, operation.hash_value)
         self.backup_queue.put(operation)
         return operation.id
 
@@ -596,19 +621,29 @@ class HybridCacheController(BaseHiCacheController):
         hash_value = self.get_hash_str(
             operation.token_ids, operation.last_hash, page_size=self.page_size
         )
+        while True:
+            if not self.storage_write_tracker.wait_until_clear(
+                hash_value,
+                lambda: operation.is_terminated() or self.storage_stop_event.is_set(),
+            ):
+                return [], 0
 
-        extra_info = HiCacheStorageExtraInfo(
-            prefix_keys=operation.prefix_keys.copy() if operation.prefix_keys else None
-        )
-        if operation.pool_transfers:
-            hit_result = self.storage_backend.batch_exists_v2(
-                hash_value, operation.pool_transfers, extra_info
+            extra_info = HiCacheStorageExtraInfo(
+                prefix_keys=(
+                    operation.prefix_keys.copy() if operation.prefix_keys else None
+                )
             )
-        else:
-            kv_hit_count = self.storage_backend.batch_exists(hash_value, extra_info)
-            hit_result = PoolTransferResult(
-                kv_hit_pages=kv_hit_count, extra_pool_hit_pages={}
-            )
+            if operation.pool_transfers:
+                hit_result = self.storage_backend.batch_exists_v2(
+                    hash_value, operation.pool_transfers, extra_info
+                )
+            else:
+                kv_hit_count = self.storage_backend.batch_exists(hash_value, extra_info)
+                hit_result = PoolTransferResult(
+                    kv_hit_pages=kv_hit_count, extra_pool_hit_pages={}
+                )
+            if not self.storage_write_tracker.has_pending(hash_value):
+                break
 
         kv_hit_pages = hit_result.kv_hit_pages
         operation.pool_storage_result.update_kv_hit_pages(kv_hit_pages)

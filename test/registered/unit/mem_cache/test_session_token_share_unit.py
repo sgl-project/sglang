@@ -23,7 +23,13 @@ from sglang.test.test_utils import CustomTestCase
 VOCAB = 1 << 20
 
 
-def _recv(rid, input_ids, max_new_tokens=8):
+def _recv(
+    rid,
+    input_ids,
+    max_new_tokens=8,
+    storage_checkpoint=False,
+    storage_checkpoint_dependency=None,
+):
     return SimpleNamespace(
         rid=rid,
         input_ids=array("q", input_ids),
@@ -46,6 +52,8 @@ def _recv(rid, input_ids, max_new_tokens=8):
         priority=None,
         routing_key=None,
         extra_key=None,
+        storage_checkpoint=storage_checkpoint,
+        storage_checkpoint_dependency=storage_checkpoint_dependency,
         http_worker_ipc=None,
         time_stats=None,
     )
@@ -62,6 +70,21 @@ class TestSessionTokenShare(CustomTestCase):
             tokenizer=None,
             vocab_size=VOCAB,
         )
+
+    def test_storage_checkpoint_fields_propagate(self):
+        req = self.session.create_req(
+            _recv(
+                "r1",
+                [1, 2, 3],
+                storage_checkpoint=True,
+                storage_checkpoint_dependency="hicache:prior-request",
+            ),
+            tokenizer=None,
+            vocab_size=VOCAB,
+        )
+
+        self.assertTrue(req.storage_checkpoint)
+        self.assertEqual(req.storage_checkpoint_dependency, "hicache:prior-request")
 
     def _decode_and_finish(self, req, output, baked=None):
         """Simulate decode then a successful finish.

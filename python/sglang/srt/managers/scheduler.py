@@ -227,6 +227,10 @@ from sglang.srt.managers.utils import (
 )
 from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req, release_kv_cache
+from sglang.srt.mem_cache.storage_prefetch import (
+    StorageCheckpointState,
+    StoragePrefetchState,
+)
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
@@ -1865,12 +1869,20 @@ class Scheduler(
             get_waiting_queue=lambda: self.waiting_queue,
             get_stats=lambda: self.metrics_reporter.stats,
             get_chunked_req=lambda: self.chunked_req,
-            get_disagg_prefill_bootstrap_queue=lambda: self.disagg_prefill_bootstrap_queue,
-            get_disagg_prefill_inflight_queue=lambda: self.disagg_prefill_inflight_queue,
+            get_disagg_prefill_bootstrap_queue=lambda: (
+                self.disagg_prefill_bootstrap_queue
+            ),
+            get_disagg_prefill_inflight_queue=lambda: (
+                self.disagg_prefill_inflight_queue
+            ),
             get_disagg_decode_prealloc_queue=lambda: self.disagg_decode_prealloc_queue,
             get_disagg_decode_transfer_queue=lambda: self.disagg_decode_transfer_queue,
-            get_spec_total_num_accept_tokens=lambda: self.metrics_reporter.spec_total_num_accept_tokens,
-            get_spec_total_num_forward_ct=lambda: self.metrics_reporter.spec_total_num_forward_ct,
+            get_spec_total_num_accept_tokens=lambda: (
+                self.metrics_reporter.spec_total_num_accept_tokens
+            ),
+            get_spec_total_num_forward_ct=lambda: (
+                self.metrics_reporter.spec_total_num_forward_ct
+            ),
         )
 
     def init_output_streamer(self) -> None:
@@ -2157,6 +2169,8 @@ class Scheduler(
                 ),
                 routing_key=recv_req.routing_key,
                 extra_key=recv_req.extra_key,
+                storage_checkpoint=recv_req.storage_checkpoint,
+                storage_checkpoint_dependency=recv_req.storage_checkpoint_dependency,
                 http_worker_ipc=recv_req.http_worker_ipc,
                 dllm_config=self.dllm_config,
                 time_stats=recv_req.time_stats,
@@ -2225,6 +2239,16 @@ class Scheduler(
             return
 
         self._maybe_namespace_elastic_radix_cache(req)
+
+        checkpoint_error = self._storage_checkpoint_request_error(req)
+        if checkpoint_error is not None:
+            req.set_finish_with_abort(checkpoint_error)
+            req.storage_checkpoint = False
+            req.storage_checkpoint_handle = None
+            req.storage_checkpoint_dependency = None
+            self.init_req_max_new_tokens(req)
+            self._add_request_to_queue(req)
+            return
 
         if self.spec_algorithm.is_dflash_family():
             error_msg = validate_dflash_request(req, self.enable_overlap)
@@ -2389,30 +2413,209 @@ class Scheduler(
         for tokenized_req in recv_req:
             self.handle_generate_request(tokenized_req)
 
-    def _prefetch_kvcache(self, req: Req):
-        if self.enable_hicache_storage:
-            req.init_next_round_input(self.tree_cache, cow_mamba=False)
-            last_host_node = req.last_host_node
-            if last_host_node.backuped or last_host_node is self.tree_cache.root_node:
-                last_hash = last_host_node.get_last_hash_value()
-                matched_len = len(req.prefix_indices) + req.host_hit_length
-                match_end = req._compute_max_prefix_len(
-                    len(req.full_untruncated_fill_ids)
-                )
-                new_input_tokens = req.full_untruncated_fill_ids[matched_len:match_end]
+    def _pin_storage_prefetch_local_match(self, req: Req, last_host_node: Any) -> None:
+        root_node = self.tree_cache.root_node
+        if len(req.prefix_indices) > 0 and req.last_node is not root_node:
+            self.tree_cache.pin_storage_prefetch_device_admission(
+                req.rid, req.last_node
+            )
+        if last_host_node is root_node:
+            return
+        if (
+            last_host_node.backuped
+            or req.host_hit_length > 0
+            or getattr(req, "swa_host_hit_length", 0) > 0
+            or getattr(req, "mamba_host_hit_length", 0) > 0
+        ):
+            self.tree_cache.pin_storage_prefetch_admission(
+                req.rid, last_host_node, occupied_tokens=0
+            )
 
-                prefix_keys = (
-                    last_host_node.get_prefix_hash_values(last_host_node.parent)
-                    if self.tree_cache.hicache_storage_pass_prefix_keys
-                    else None
+    def _prefetch_kvcache(self, req: Req):
+        if (
+            self.enable_hicache_storage
+            and getattr(req, "storage_checkpoint_handle", None) is not None
+            and not getattr(req, "storage_checkpoint_reserved", False)
+        ):
+            self._reserve_storage_checkpoint(req)
+            req.storage_checkpoint_reserved = True
+        if not self.enable_hicache_storage or req.storage_prefetch_state not in {
+            StoragePrefetchState.NOT_ATTEMPTED,
+            StoragePrefetchState.DEFERRED,
+        }:
+            return
+
+        req.storage_prefetch_local_match = False
+        req.init_next_round_input(self.tree_cache, cow_mamba=False)
+        last_host_node = req.last_host_node
+        last_hash = last_host_node.get_last_hash_value()
+        matched_len = len(req.prefix_indices) + req.host_hit_length
+        match_end = req._compute_max_prefix_len(len(req.full_untruncated_fill_ids))
+        new_input_tokens = req.full_untruncated_fill_ids[matched_len:match_end]
+
+        if req.storage_prefetch_deadline is None:
+            req.storage_prefetch_deadline = (
+                time.monotonic()
+                + self.tree_cache.storage_prefetch_timeout(len(new_input_tokens))
+            )
+
+        checkpoint_dependency = req.storage_checkpoint_dependency
+        if checkpoint_dependency is not None:
+            checkpoint_state = self.tree_cache.get_storage_checkpoint_dependency_state(
+                req.rid, checkpoint_dependency
+            )
+            if checkpoint_state is StorageCheckpointState.FAILED:
+                req.storage_prefetch_state = StoragePrefetchState.FAILED
+                return
+            if checkpoint_state is not StorageCheckpointState.READY:
+                complete_local_match = match_end > 0 and not new_input_tokens
+                self.tree_cache._require_storage_prefetch_rank_agreement(
+                    "pending checkpoint local match",
+                    {
+                        "complete": int(complete_local_match),
+                        "device_match": len(req.prefix_indices),
+                        "host_match": req.host_hit_length,
+                        "swa_host_match": getattr(req, "swa_host_hit_length", 0),
+                        "mamba_host_match": getattr(req, "mamba_host_hit_length", 0),
+                        "match_end": match_end,
+                        "anchor_is_root": int(
+                            last_host_node is self.tree_cache.root_node
+                        ),
+                        "anchor_is_backed": int(last_host_node.backuped),
+                    },
                 )
-                self.tree_cache.prefetch_from_storage(
-                    req.rid,
-                    last_host_node,
-                    new_input_tokens,
-                    last_hash,
-                    prefix_keys,
+                if complete_local_match:
+                    req.storage_prefetch_local_match = True
+                    self._pin_storage_prefetch_local_match(req, last_host_node)
+                    req.storage_prefetch_state = StoragePrefetchState.MISS
+                    logger.debug(
+                        "HiCache checkpoint admission req=%s using complete "
+                        "local match while checkpoint is pending device=%d "
+                        "host=%d match_end=%d",
+                        req.rid,
+                        len(req.prefix_indices),
+                        req.host_hit_length,
+                        match_end,
+                    )
+                    return
+                req.storage_prefetch_state = StoragePrefetchState.DEFERRED
+                return
+            self.tree_cache._require_storage_prefetch_rank_agreement(
+                "local match",
+                {
+                    "device_match": len(req.prefix_indices),
+                    "host_match": req.host_hit_length,
+                    "swa_host_match": getattr(req, "swa_host_hit_length", 0),
+                    "mamba_host_match": getattr(req, "mamba_host_hit_length", 0),
+                    "match_end": match_end,
+                    "anchor_is_root": int(last_host_node is self.tree_cache.root_node),
+                    "anchor_is_backed": int(last_host_node.backuped),
+                },
+            )
+            req.storage_prefetch_local_match = (
+                matched_len > 0
+                and len(new_input_tokens) < self.tree_cache.prefetch_threshold
+            )
+
+        if not (last_host_node.backuped or last_host_node is self.tree_cache.root_node):
+            req.storage_prefetch_local_match = (
+                checkpoint_dependency is not None and matched_len > 0
+            )
+            if req.storage_prefetch_local_match:
+                self._pin_storage_prefetch_local_match(req, last_host_node)
+            req.storage_prefetch_state = StoragePrefetchState.MISS
+            return
+
+        if req.storage_prefetch_local_match:
+            self._pin_storage_prefetch_local_match(req, last_host_node)
+
+        prefix_keys = (
+            last_host_node.get_prefix_hash_values(last_host_node.parent)
+            if self.tree_cache.hicache_storage_pass_prefix_keys
+            else None
+        )
+        req.storage_prefetch_state = self.tree_cache.prefetch_from_storage(
+            req.rid,
+            last_host_node,
+            new_input_tokens,
+            last_hash,
+            prefix_keys,
+            req.storage_checkpoint_dependency,
+        )
+
+    def _storage_prefetch_ready_for_admission(self, req: Req) -> bool:
+        state = req.storage_prefetch_state
+        deadline = req.storage_prefetch_deadline
+        deadline_expired = (
+            not state.is_terminal
+            and deadline is not None
+            and time.monotonic() >= deadline
+        )
+        if not state.is_terminal and deadline is not None:
+            deadline_expired = self.tree_cache.synchronize_storage_prefetch_flag(
+                deadline_expired
+            )
+        if deadline_expired:
+            if req.storage_checkpoint_dependency is not None:
+                self.tree_cache.record_storage_checkpoint_dependency_result(
+                    req.rid, "timeout"
                 )
+            self.tree_cache.release_aborted_request(req.rid)
+            req.storage_prefetch_state = StoragePrefetchState.FAILED
+            state = req.storage_prefetch_state
+
+        if state in {
+            StoragePrefetchState.NOT_ATTEMPTED,
+            StoragePrefetchState.DEFERRED,
+        }:
+            self._prefetch_kvcache(req)
+            state = req.storage_prefetch_state
+
+        if state.is_in_progress:
+            prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
+            state = self.tree_cache.get_storage_prefetch_state(req.rid)
+            req.storage_prefetch_state = state
+            if not prefetch_done:
+                return False
+
+        if not state.is_terminal:
+            return False
+
+        loaded_tokens = self.tree_cache.pop_prefetch_loaded_tokens(req.rid)
+        if loaded_tokens > 0:
+            req.storage_hit_length = loaded_tokens
+        return True
+
+    def _reserve_storage_checkpoint(self, req: Req) -> None:
+        if (
+            self.enable_hicache_storage
+            and req.storage_checkpoint_handle is not None
+            and not getattr(req, "storage_checkpoint_reserved", False)
+        ):
+            self.tree_cache.reserve_storage_checkpoint(req.storage_checkpoint_handle)
+            req.storage_checkpoint_reserved = True
+
+    def _storage_checkpoint_request_error(self, req: Req) -> Optional[str]:
+        if not (
+            req.storage_checkpoint or req.storage_checkpoint_dependency is not None
+        ):
+            return None
+        if self.disaggregation_mode != DisaggregationMode.NULL:
+            return (
+                "storage_checkpoint and storage_checkpoint_dependency are not "
+                "supported with P/D disaggregation."
+            )
+        if getattr(req, "session_id", None) is not None:
+            return (
+                "storage_checkpoint and storage_checkpoint_dependency are not "
+                "supported with sessions."
+            )
+        if not self.enable_hicache_storage:
+            return (
+                "storage_checkpoint and storage_checkpoint_dependency require "
+                "an attached HiCache L3 storage backend."
+            )
+        return None
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if not self._set_or_validate_priority(req):
@@ -2420,16 +2623,19 @@ class Scheduler(
         if self.disaggregation_mode == DisaggregationMode.NULL:
             if self._abort_on_queued_limit(req):
                 return
+            self._reserve_storage_checkpoint(req)
             self._prefetch_kvcache(req)
             self.waiting_queue.append(req)
             req.time_stats.set_wait_queue_entry_time()
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
+            self._reserve_storage_checkpoint(req)
             self._prefetch_kvcache(req)
             self.disagg_prefill_bootstrap_queue.add(
                 req, self.model_config.num_key_value_heads
             )
             req.time_stats.set_prefill_bootstrap_queue_entry_time()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
+            self._reserve_storage_checkpoint(req)
             self.disagg_decode_prealloc_queue.add(req, is_retracted=is_retracted)
             if not is_retracted:
                 req.time_stats.set_decode_prealloc_queue_entry_time()
@@ -2999,21 +3205,45 @@ class Scheduler(
                     break
 
             if self.enable_hicache_storage:
-                prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
-                if not prefetch_done:
-                    # skip staging requests that are ongoing prefetch
+                if not self._storage_prefetch_ready_for_admission(req):
                     continue
-                # Pop the number of tokens loaded from storage (L3 hits)
-                loaded_tokens = self.tree_cache.pop_prefetch_loaded_tokens(req.rid)
-                if loaded_tokens > 0:
-                    req.storage_hit_length = loaded_tokens
 
             req.init_next_round_input(self.tree_cache)
+            can_run_count = len(adder.can_run_list)
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),
                 truncation_align_size=self.truncation_align_size,
             )
+            admitted = (
+                len(adder.can_run_list) > can_run_count
+                and adder.can_run_list[-1] is req
+            )
+            if (
+                self.enable_hicache_storage
+                and req.storage_checkpoint_dependency is not None
+            ):
+                self.tree_cache._require_storage_prefetch_rank_agreement(
+                    "checkpoint admission",
+                    {
+                        "admitted": int(admitted),
+                        "local_match": int(req.storage_prefetch_local_match),
+                    },
+                )
+                if admitted:
+                    if req.storage_prefetch_local_match:
+                        self.tree_cache.record_storage_checkpoint_dependency_result(
+                            req.rid, "ready"
+                        )
+                    self.tree_cache.complete_storage_prefetch_admission(req.rid)
+                elif (
+                    req.storage_prefetch_local_match
+                    and req.storage_prefetch_state is StoragePrefetchState.MISS
+                ):
+                    self.tree_cache.release_storage_prefetch_admission(req.rid)
+                    req.storage_prefetch_state = StoragePrefetchState.NOT_ATTEMPTED
+                    req.storage_prefetch_deadline = None
+                    req.storage_prefetch_local_match = False
 
             if self.enable_lora:
                 running_loras.add(req.lora_id)
@@ -3760,6 +3990,10 @@ class Scheduler(
                 if tc.enable_storage:
                     idle &= len(tc.ongoing_prefetch) == 0
                     idle &= len(tc.ongoing_backup) == 0
+                    idle &= len(tc.storage_pending_checkpoints) == 0
+                    idle &= len(tc.storage_prefetch_ownership) == 0
+                    idle &= len(tc.storage_prefetch_admission_host_locks) == 0
+                    idle &= len(tc.storage_prefetch_admission_device_locks) == 0
 
         return idle
 

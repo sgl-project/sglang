@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import hashlib
 import logging
+import math
 import sys
 import threading
 import time
 from array import array
-from collections import defaultdict
+from collections import defaultdict, deque
 from functools import partial
+from itertools import islice
 from queue import Empty, Queue
-from typing import TYPE_CHECKING, Any, Iterator, NamedTuple, Optional, TypeVar
+from typing import TYPE_CHECKING, Any, Iterator, NamedTuple, Optional, Sequence, TypeVar
 
 import torch
 
@@ -39,6 +42,26 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.storage_prefetch import (
+    CheckpointRetryResource,
+    L3StagingLease,
+    PendingStorageCheckpoint,
+    PrefetchOwnershipTransition,
+    StorageCheckpointRegistry,
+    StorageCheckpointRetryQueues,
+    StorageCheckpointState,
+    StoragePrefetchAdmissionPin,
+    StoragePrefetchDeviceAdmissionPin,
+    StoragePrefetchOwnership,
+    StoragePrefetchState,
+    StoragePrefetchTracker,
+    _index_values,
+    _take_indices,
+    bounded_host_eviction_scan,
+    get_host_eviction_scan_budget,
+    l3_staging_allocation,
+    make_storage_checkpoint_handle,
+)
 from sglang.srt.mem_cache.unified_cache_components import (
     _NUM_COMPONENT_TYPES,
     BASE_COMPONENT_TYPE,
@@ -75,6 +98,30 @@ if TYPE_CHECKING:
 
 
 T = TypeVar("T")
+
+_CHECKPOINT_RETRY_QUANTUM = 8
+_CHECKPOINT_SCAN_QUANTUM = 64
+_ABORTED_PREFETCH_CLEANUP_QUANTUM = 8
+_L3_STAGING_EVICTION_QUANTUM_PAGES = 64
+_L3_STAGING_HOST_EVICTION_SCAN_QUANTUM = 256
+_L3_STAGING_PROMOTION_QUANTUM_PAGES = 64
+_L3_STAGING_DISCARD_QUANTUM_ENTRIES = 64
+_L3_STAGING_DISCARD_SCAN_QUANTUM_NODES = 256
+_L3_STAGING_RECLAIM_QUANTUM_LEASES = 64
+_CHECKPOINT_STAGING_CAPACITY_EXCEEDED = "staging_capacity"
+
+_CHECKPOINT_BLOCKED_RESOURCES = {
+    "host": CheckpointRetryResource.HOST,
+    "auxiliary": CheckpointRetryResource.AUXILIARY,
+    "storage": CheckpointRetryResource.STORAGE,
+    "continuation": CheckpointRetryResource.SCHEDULER,
+}
+_CAPACITY_RETRY_RESOURCES = frozenset(
+    {
+        CheckpointRetryResource.HOST,
+        CheckpointRetryResource.AUXILIARY,
+    }
+)
 
 
 class UnifiedTreeNode:
@@ -151,6 +198,7 @@ class UnifiedLRUList:
         self.head.lru_next[self._pt] = self.tail
         self.tail.lru_prev[self._pt] = self.head
         self.cache: dict[int, UnifiedTreeNode] = {}
+        self._host_scan_cursor: UnifiedTreeNode | None = None
 
     def _add_node_after(self, prev_node: UnifiedTreeNode, new_node: UnifiedTreeNode):
         pt = self._pt
@@ -247,6 +295,33 @@ class UnifiedLRUList:
 
     def get_prev_no_host_lock(self, node: UnifiedTreeNode, check_id: bool = True):
         """Host-LRU walker: skip nodes whose component host_lock_ref > 0."""
+        budget = get_host_eviction_scan_budget()
+        if budget is not None:
+            if check_id:
+                assert node.id in self.cache
+            if node is self.tail:
+                x = (
+                    self._host_scan_cursor
+                    if self.in_list(self._host_scan_cursor)
+                    else node.lru_prev[self._pt]
+                )
+            else:
+                x = node.lru_prev[self._pt]
+            while x is not self.head:
+                if budget.remaining_nodes == 0:
+                    self._host_scan_cursor = x
+                    return None
+                budget.remaining_nodes -= 1
+                if x.component_data[self.component_type].host_lock_ref == 0:
+                    previous = x.lru_prev[self._pt]
+                    self._host_scan_cursor = (
+                        previous if previous is not self.head else None
+                    )
+                    return x
+                x = x.lru_prev[self._pt]
+            self._host_scan_cursor = None
+            return None
+
         if check_id:
             assert node.id in self.cache
         pt = self._pt
@@ -399,6 +474,57 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if not waited and self.tp_world_size > 1:
             torch.distributed.barrier(group=self.tp_group)
 
+    def synchronize_storage_prefetch_flag(self, flag: bool) -> bool:
+        flag_tensor = torch.tensor(int(flag), dtype=torch.int)
+        self._all_reduce_attn_groups(flag_tensor, torch.distributed.ReduceOp.MAX)
+        return flag_tensor.item() != 0
+
+    def synchronize_storage_prefetch_min(self, value: int) -> int:
+        value_tensor = torch.tensor(value, dtype=torch.int)
+        self._all_reduce_attn_groups(value_tensor, torch.distributed.ReduceOp.MIN)
+        return int(value_tensor.item())
+
+    def synchronize_storage_prefetch_min_values(self, values: list[int]) -> list[int]:
+        value_tensor = torch.tensor(values, dtype=torch.int64)
+        self._all_reduce_attn_groups(value_tensor, torch.distributed.ReduceOp.MIN)
+        return [int(value) for value in value_tensor.tolist()]
+
+    def _synchronize_storage_state_change_resources(
+        self, resources: set[CheckpointRetryResource]
+    ) -> set[CheckpointRetryResource]:
+        ordered_resources = tuple(CheckpointRetryResource)
+        flags = torch.tensor(
+            [int(resource in resources) for resource in ordered_resources],
+            dtype=torch.int,
+        )
+        self._all_reduce_attn_groups(flags, torch.distributed.ReduceOp.MAX)
+        return {
+            resource
+            for resource, present in zip(ordered_resources, flags.tolist(), strict=True)
+            if present
+        }
+
+    def _require_storage_prefetch_rank_agreement(
+        self, phase: str, values: dict[str, int]
+    ) -> None:
+        local_values = list(values.values())
+        reduced = self.synchronize_storage_prefetch_min_values(
+            local_values + [-value for value in local_values]
+        )
+        count = len(local_values)
+        minimums = reduced[:count]
+        maximums = [-value for value in reduced[count:]]
+        divergent = {
+            name: (minimum, maximum)
+            for name, minimum, maximum in zip(values, minimums, maximums, strict=True)
+            if minimum != maximum
+        }
+        if divergent:
+            raise RuntimeError(
+                f"HiCache storage prefetch {phase} diverged across attention "
+                f"ranks: {divergent}"
+            )
+
     def _drain_async_work(self):
         """
         Block until all outstanding async sends are consumed, then clear.
@@ -452,6 +578,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     def _reset_full(self) -> None:
         """Full reset: destroy entire tree and all state."""
+        if hasattr(self, "storage_pending_checkpoints"):
+            for handle in tuple(self.storage_pending_checkpoints):
+                self._release_storage_checkpoint(handle, release_staging=True)
+        if hasattr(self, "storage_prefetch_admission_host_locks"):
+            request_ids = set(self.storage_prefetch_admission_host_locks)
+            request_ids.update(self.storage_prefetch_admission_device_locks)
+            for request_id in request_ids:
+                self.release_storage_prefetch_admission(request_id)
+
         self.root_node = UnifiedTreeNode(self.tree_components)
         self.root_node.priority = -sys.maxsize
         self.root_node.key = RadixKey(array("q"), None)
@@ -469,6 +604,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         self.evictable_device_leaves: set[UnifiedTreeNode] = set()
         self.evictable_host_leaves: set[UnifiedTreeNode] = set()
+        self.evictable_host_scan_queue: dict[UnifiedTreeNode, None] = {}
         self.host_lru_lists = {
             ct: UnifiedLRUList(ct, self.tree_components, use_host_ptr=True)
             for ct in self.tree_components
@@ -477,12 +613,40 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.ongoing_load_back: dict[int, _OngoingLoadBack] = {}
         self.enable_storage = False
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
+        self.storage_prefetch_tracker = StoragePrefetchTracker()
+        self.storage_checkpoint_registry = StorageCheckpointRegistry()
         self.ongoing_prefetch: dict[str, _OngoingPrefetch] = {}
         self.ongoing_backup: dict[int, tuple[UnifiedTreeNode, DecLockRefParams]] = {}
+        self.storage_pending_checkpoints: dict[str, PendingStorageCheckpoint] = {}
+        self.storage_checkpoint_generation = 0
+        self.storage_checkpoint_owners_by_operation: dict[int, tuple[str, int]] = {}
+        self.storage_checkpoint_retries = StorageCheckpointRetryQueues()
+        self.storage_state_change_resources: set[CheckpointRetryResource] = set()
+        self.storage_prefetch_ownership: dict[str, StoragePrefetchOwnership] = {}
+        self.storage_prefetch_aborted_requests: set[str] = set()
+        self.storage_prefetch_admission_host_locks: dict[
+            str, StoragePrefetchAdmissionPin
+        ] = {}
+        self.storage_prefetch_admission_device_locks: dict[
+            str, StoragePrefetchDeviceAdmissionPin
+        ] = {}
+        self.storage_checkpoint_dependency_results: dict[str, str] = {}
+        self.l3_staging_pending_leases: deque[L3StagingLease] = deque()
+        self.l3_staging_pending_keys: set[tuple[Any, ...]] = set()
+        self.l3_staging_pending_tokens: dict[tuple[Any, ...], int] = {}
+        self.l3_staging_pending_by_key: dict[tuple[Any, ...], L3StagingLease] = {}
+        self.l3_staging_pending_token_total = 0
+        self.l3_staging_reclaim_eligible = 0
+        self.l3_staging_generation_seen = 0
+        self.storage_radix_tree_generation = 0
 
         if self.cache_controller is not None:
             self.cache_controller.reset()
             self.cache_controller.mem_pool_host.clear()
+            self.cache_controller.l3_staging.reset_after_clear()
+            self.l3_staging_generation_seen = (
+                self.cache_controller.l3_staging.generation
+            )
             self.enable_storage = self.cache_controller.enable_storage
 
         self._empty_match_result = MatchResult(
@@ -545,6 +709,24 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             storage_extra_config=storage_extra_config,
             storage_prefetch_threshold=storage_prefetch_threshold,
         )
+        self.cache_controller.scheduler_managed_prefetch = True
+        if storage_backend is not None:
+            try:
+                self.cache_controller.l3_staging.install(
+                    self.cache_controller.mem_pool_host,
+                    envs.SGLANG_HICACHE_L3_STAGING_RESERVE_RATIO.get(),
+                    self.cache_controller._synchronize_staging_values,
+                )
+            except Exception:
+                self.cache_controller.detach_storage_backend()
+                raise
+            if self.cache_controller.l3_staging.reserve_tokens:
+                logger.info(
+                    "HiCache isolated L3 staging enabled ratio=%.3f pools=%s",
+                    self.cache_controller.l3_staging.reserve_ratio,
+                    self.cache_controller.l3_staging.usage(),
+                )
+        self.l3_staging_generation_seen = self.cache_controller.l3_staging.generation
 
         # State initialization
         self.write_through_threshold = (
@@ -711,10 +893,780 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self._update_evictable_leaf_sets(node)
         return DecLockRefResult()
 
+    def record_storage_checkpoint_dependency_result(
+        self, request_id: str, result: str
+    ) -> None:
+        if result not in {"ready", "failed", "timeout"}:
+            raise ValueError(f"Unknown storage checkpoint result: {result}")
+        if request_id in self.storage_checkpoint_dependency_results:
+            return
+        self.storage_checkpoint_dependency_results[request_id] = result
+        logger.info(
+            "HiCache checkpoint dependency req=%s result=%s", request_id, result
+        )
+        if (
+            self.enable_storage_metrics
+            and self.storage_metrics_collector is not None
+            and hasattr(
+                self.storage_metrics_collector,
+                "log_storage_checkpoint_dependency",
+            )
+        ):
+            self.storage_metrics_collector.log_storage_checkpoint_dependency(result)
+
+    def get_storage_checkpoint_dependency_state(
+        self, request_id: str, checkpoint_dependency: str
+    ) -> StorageCheckpointState:
+        previous = self.storage_checkpoint_dependency_results.get(request_id)
+        if previous == "ready":
+            return StorageCheckpointState.READY
+        if previous in {"failed", "timeout"}:
+            return StorageCheckpointState.FAILED
+
+        state = self.storage_checkpoint_registry.get_state(checkpoint_dependency)
+        flags = torch.tensor(
+            [
+                int(state is StorageCheckpointState.FAILED),
+                int(state is not StorageCheckpointState.READY),
+            ],
+            dtype=torch.int,
+        )
+        self._all_reduce_attn_groups(flags, torch.distributed.ReduceOp.MAX)
+        if flags[0].item() != 0:
+            self.record_storage_checkpoint_dependency_result(request_id, "failed")
+            return StorageCheckpointState.FAILED
+        if flags[1].item() != 0:
+            return StorageCheckpointState.PENDING
+        self.record_storage_checkpoint_dependency_result(request_id, "ready")
+        return StorageCheckpointState.READY
+
+    @staticmethod
+    def _staging_lease_key(lease: L3StagingLease) -> tuple[Any, ...]:
+        count = len(lease.indices)
+        return (
+            id(lease.quota),
+            lease.owner_node.id if lease.owner_node is not None else -1,
+            lease.component_type,
+            count,
+            int(lease.indices[0]) if count else -1,
+            int(lease.indices[-1]) if count else -1,
+            id(lease.indices) if lease.owner_node is None else 0,
+        )
+
+    @staticmethod
+    def _staging_lease_pending_tokens(lease: L3StagingLease) -> int:
+        return max(0, len(lease.indices) - lease.reclaim_index_cursor)
+
+    @staticmethod
+    def _staging_lease_logical_fingerprint(
+        lease: L3StagingLease,
+    ) -> tuple[int, ...]:
+        component_value = (
+            -1 if lease.component_type is None else int(lease.component_type)
+        )
+        digest = hashlib.sha256(lease.quota.name.encode())
+        digest.update(b"\0")
+        digest.update(str(component_value).encode())
+        for hash_value in tuple(getattr(lease.owner_node, "hash_value", None) or ()):
+            digest.update(b"\0")
+            digest.update(hash_value.encode())
+        return (
+            int(lease.owner_node is not None),
+            component_value,
+            UnifiedRadixCache._staging_lease_pending_tokens(lease),
+            lease.reclaim_index_cursor,
+            *(
+                int.from_bytes(digest.digest()[offset : offset + 4], "big") & 0x7FFFFFFF
+                for offset in range(0, digest.digest_size, 4)
+            ),
+        )
+
+    @staticmethod
+    def _logical_fingerprint_digest(
+        fingerprints: Sequence[tuple[int, ...]],
+    ) -> tuple[int, ...]:
+        digest = hashlib.sha256()
+        for fingerprint in fingerprints:
+            for value in fingerprint:
+                digest.update(int(value).to_bytes(8, "big", signed=True))
+        return tuple(
+            int.from_bytes(digest.digest()[offset : offset + 4], "big") & 0x7FFFFFFF
+            for offset in range(0, digest.digest_size, 4)
+        )
+
+    def _l3_staging_leases(
+        self,
+        host_indices: Optional[torch.Tensor],
+        extra_pools: Optional[list[PoolTransfer]] = None,
+        owner_node: Optional[UnifiedTreeNode] = None,
+    ) -> tuple[L3StagingLease, ...]:
+        controller = self.cache_controller
+        if controller is None or not controller.l3_staging.quotas:
+            return ()
+
+        mem_pool_host = controller.mem_pool_host
+        anchor_pool = getattr(
+            getattr(mem_pool_host, "anchor_entry", None),
+            "host_pool",
+            mem_pool_host,
+        )
+        candidates = []
+        if host_indices is not None:
+            candidates.append((anchor_pool, host_indices, BASE_COMPONENT_TYPE))
+        for transfer in extra_pools or ():
+            if transfer.host_indices is None or transfer.indices_from_pool is not None:
+                continue
+            entry = mem_pool_host.entry_map.get(transfer.name)
+            if entry is None:
+                continue
+            component_type = {
+                PoolName.SWA: ComponentType.SWA,
+                PoolName.MAMBA: ComponentType.MAMBA,
+            }.get(transfer.name)
+            candidates.append((entry.host_pool, transfer.host_indices, component_type))
+
+        leases = []
+        for pool, indices, component_type in candidates:
+            quota = controller.l3_staging.quota_for_pool(pool)
+            if quota is not None and quota.count_in_use(indices) > 0:
+                leases.append(
+                    L3StagingLease(
+                        quota=quota,
+                        indices=indices,
+                        owner_node=owner_node,
+                        component_type=component_type,
+                    )
+                )
+        return tuple(leases)
+
+    def _checkpoint_staging_leases(
+        self, nodes: Sequence[UnifiedTreeNode]
+    ) -> tuple[L3StagingLease, ...]:
+        leases = []
+        for node in nodes:
+            extra_pools = [
+                transfer
+                for component in self._components_tuple
+                if component.component_type != BASE_COMPONENT_TYPE
+                for transfer in (
+                    component.build_hicache_transfers(
+                        node, CacheTransferPhase.BACKUP_STORAGE
+                    )
+                    or ()
+                )
+            ]
+            leases.extend(
+                self._l3_staging_leases(
+                    node.component_data[BASE_COMPONENT_TYPE].host_value,
+                    extra_pools,
+                    owner_node=node,
+                )
+            )
+        return tuple(leases)
+
+    def _enqueue_staging_leases(
+        self,
+        leases: Sequence[L3StagingLease],
+        *,
+        schedule: bool = True,
+        eligible: bool = True,
+    ) -> None:
+        live_leases = tuple(
+            lease for lease in leases if self._staging_lease_pending_tokens(lease) > 0
+        )
+        for lease in live_leases:
+            key = self._staging_lease_key(lease)
+            canonical = self.l3_staging_pending_by_key.get(key)
+            previous_tokens = self.l3_staging_pending_tokens.get(key)
+            if previous_tokens is not None:
+                if canonical is None:
+                    raise RuntimeError("HiCache staging queue index is inconsistent")
+                if lease.reclaim_index_cursor > canonical.reclaim_index_cursor:
+                    canonical.reclaim_index_cursor = lease.reclaim_index_cursor
+                    canonical.discard_scan_node = None
+                    canonical.discard_scan_remaining = None
+                current_tokens = self._staging_lease_pending_tokens(canonical)
+                self.l3_staging_pending_token_total += current_tokens - previous_tokens
+                self.l3_staging_pending_tokens[key] = current_tokens
+                continue
+            pending_tokens = self._staging_lease_pending_tokens(lease)
+            self.l3_staging_pending_keys.add(key)
+            self.l3_staging_pending_tokens[key] = pending_tokens
+            self.l3_staging_pending_by_key[key] = lease
+            self.l3_staging_pending_token_total += pending_tokens
+            self.l3_staging_pending_leases.append(lease)
+            if eligible:
+                self.l3_staging_reclaim_eligible += 1
+        if live_leases and schedule:
+            self.storage_state_change_resources.update(_CAPACITY_RETRY_RESOURCES)
+
+    def _promote_l3_staging_leases(self, pending: list[L3StagingLease]) -> int:
+        pending.sort(key=self._staging_lease_logical_fingerprint)
+        fingerprints = [
+            self._staging_lease_logical_fingerprint(lease) for lease in pending
+        ]
+        digest = self._logical_fingerprint_digest(fingerprints)
+        self._require_storage_prefetch_rank_agreement(
+            "staging promotion plan",
+            {
+                "entry_count": len(fingerprints),
+                **{f"digest_{index}": value for index, value in enumerate(digest)},
+            },
+        )
+
+        remaining_pages = _L3_STAGING_PROMOTION_QUANTUM_PAGES
+        promoted_tokens = 0
+
+        def promote(lease: L3StagingLease) -> None:
+            nonlocal promoted_tokens, remaining_pages
+            if remaining_pages == 0:
+                return
+            window_start = lease.reclaim_index_cursor
+            window_end = min(
+                len(lease.indices),
+                window_start + remaining_pages * lease.quota.page_size,
+            )
+            if window_start >= window_end:
+                return
+            window_indices = lease.indices[window_start:window_end]
+            live_positions = [
+                window_start + position
+                for position, value in enumerate(_index_values(window_indices))
+                if value in lease.quota.in_use_indices
+            ]
+            remaining_pages -= (window_end - window_start) // lease.quota.page_size
+            if not live_positions:
+                lease.reclaim_index_cursor = window_end
+                return
+            selected_tokens = len(live_positions)
+            selected_tokens -= selected_tokens % lease.quota.page_size
+            if selected_tokens == 0:
+                return
+            promoted = lease.quota.promote(
+                _take_indices(lease.indices, live_positions[:selected_tokens])
+            )
+            promoted_tokens += promoted
+            if promoted == len(live_positions):
+                lease.reclaim_index_cursor = window_end
+
+        owner_groups: dict[int, list[L3StagingLease]] = {}
+        unowned = []
+        for lease in pending:
+            if lease.owner_node is None:
+                unowned.append(lease)
+            else:
+                owner_groups.setdefault(id(lease.owner_node), []).append(lease)
+
+        for lease in unowned:
+            promote(lease)
+        for leases in owner_groups.values():
+            base_leases = [
+                lease for lease in leases if lease.component_type == BASE_COMPONENT_TYPE
+            ]
+            for lease in base_leases:
+                promote(lease)
+            if any(
+                self._staging_lease_pending_tokens(lease) > 0 for lease in base_leases
+            ):
+                continue
+            for lease in leases:
+                if lease.component_type != BASE_COMPONENT_TYPE:
+                    promote(lease)
+        return promoted_tokens
+
+    def _staging_discard_plan(
+        self,
+        lease: L3StagingLease,
+        scan_budget: list[int],
+    ) -> tuple[tuple[tuple[UnifiedTreeNode, TreeComponent, Any, int], ...], bool]:
+        if lease.owner_node is None or lease.component_type is None:
+            return (), False
+
+        window_start = lease.reclaim_index_cursor
+        window_end = min(
+            len(lease.indices),
+            window_start + _L3_STAGING_PROMOTION_QUANTUM_PAGES * lease.quota.page_size,
+        )
+        window_indices = lease.indices[window_start:window_end]
+        live_indices = {
+            value
+            for value in _index_values(window_indices)
+            if value in lease.quota.in_use_indices
+        }
+        if not live_indices:
+            lease.reclaim_index_cursor = window_end
+            lease.discard_scan_node = None
+            lease.discard_scan_remaining = None
+            return (), window_end < len(lease.indices)
+        window_deferred = window_end < len(lease.indices)
+
+        component = self.components.get(lease.component_type)
+        if component is None:
+            return (), False
+        if lease.discard_scan_remaining is None:
+            remaining = live_indices
+            node = lease.owner_node
+        else:
+            remaining = set(lease.discard_scan_remaining).intersection(live_indices)
+            node = lease.discard_scan_node
+            if node is None:
+                remaining = live_indices
+                node = lease.owner_node
+
+        plan = []
+        while node is not self.root_node and remaining:
+            if scan_budget[0] == 0:
+                if plan:
+                    lease.discard_scan_node = None
+                    lease.discard_scan_remaining = None
+                    return tuple(plan), True
+                lease.discard_scan_node = node
+                lease.discard_scan_remaining = frozenset(remaining)
+                return (), True
+            scan_budget[0] -= 1
+            component_data = node.component_data[lease.component_type]
+            host_value = component_data.host_value
+            if host_value is not None:
+                host_values = set(_index_values(host_value))
+                overlap = remaining.intersection(host_values)
+                if overlap:
+                    if (
+                        component_data.host_lock_ref != 0
+                        or component_data.value is None
+                        or not host_values.issubset(lease.quota.in_use_indices)
+                    ):
+                        lease.discard_scan_node = None
+                        lease.discard_scan_remaining = None
+                        return (), False
+                    plan.append((node, component, lease.quota, len(host_values)))
+                    remaining.difference_update(overlap)
+            node = node.parent
+            if len(plan) == _L3_STAGING_DISCARD_QUANTUM_ENTRIES:
+                lease.discard_scan_node = None
+                lease.discard_scan_remaining = None
+                return tuple(plan), bool(remaining) or window_deferred
+
+        lease.discard_scan_node = None
+        lease.discard_scan_remaining = None
+        return tuple(plan), window_deferred and not remaining
+
+    @staticmethod
+    def _staging_discard_fingerprint(
+        entry: tuple[UnifiedTreeNode, TreeComponent, Any, int],
+    ) -> tuple[int, ...]:
+        node, component, quota, token_count = entry
+        hash_values = tuple(node.hash_value or ())
+        digest = hashlib.sha256()
+        digest.update(quota.name.encode())
+        digest.update(b"\0")
+        digest.update(str(int(component.component_type)).encode())
+        for hash_value in hash_values:
+            digest.update(b"\0")
+            digest.update(hash_value.encode())
+        return (
+            int(bool(hash_values)),
+            int(component.component_type),
+            token_count,
+            len(hash_values),
+            *(
+                int.from_bytes(digest.digest()[offset : offset + 4], "big") & 0x7FFFFFFF
+                for offset in range(0, digest.digest_size, 4)
+            ),
+        )
+
+    def _discard_releasable_l3_staging(
+        self, pending: list[L3StagingLease]
+    ) -> tuple[int, bool]:
+        load_back_active = int(bool(self.ongoing_load_back))
+        load_back_extrema = self.synchronize_storage_prefetch_min_values(
+            [load_back_active, -load_back_active]
+        )
+        if -load_back_extrema[1] != 0:
+            return 0, False
+
+        planned = {}
+        scan_budget = [_L3_STAGING_DISCARD_SCAN_QUANTUM_NODES]
+        scan_deferred = False
+        for lease in pending:
+            lease_plan, lease_deferred = self._staging_discard_plan(lease, scan_budget)
+            scan_deferred = scan_deferred or lease_deferred
+            for node, component, quota, token_count in lease_plan:
+                planned[(node.id, component.component_type)] = (
+                    node,
+                    component,
+                    quota,
+                    token_count,
+                )
+
+        blocked_base_entries = set()
+        for key, (node, component, _quota, _token_count) in planned.items():
+            if component.component_type != BASE_COMPONENT_TYPE:
+                continue
+            if any(
+                node.component_data[component_type].host_value is not None
+                and (node.id, component_type) not in planned
+                for component_type in self.components
+                if component_type != BASE_COMPONENT_TYPE
+            ):
+                blocked_base_entries.add(key)
+        for key in blocked_base_entries:
+            del planned[key]
+
+        entries = sorted(
+            planned.values(),
+            key=lambda entry: (
+                entry[1].component_type == BASE_COMPONENT_TYPE,
+                self._staging_discard_fingerprint(entry),
+            ),
+        )
+        discard_deferred = (
+            scan_deferred or len(entries) > _L3_STAGING_DISCARD_QUANTUM_ENTRIES
+        )
+        entries = entries[:_L3_STAGING_DISCARD_QUANTUM_ENTRIES]
+        self._require_storage_prefetch_rank_agreement(
+            "staging replica discard count", {"entries": len(entries)}
+        )
+        if not entries:
+            return 0, discard_deferred
+
+        fingerprints = [self._staging_discard_fingerprint(entry) for entry in entries]
+        self._require_storage_prefetch_rank_agreement(
+            "staging replica discard plan",
+            {
+                f"entry_{entry_index}_field_{field_index}": value
+                for entry_index, fingerprint in enumerate(fingerprints)
+                for field_index, value in enumerate(fingerprint)
+            },
+        )
+        if any(fingerprint[0] == 0 for fingerprint in fingerprints):
+            raise RuntimeError(
+                "HiCache staging replica discard owner has no storage hashes"
+            )
+
+        quotas = self.cache_controller.l3_staging.quotas.values()
+        discard_counts = {quota.name: 0 for quota in quotas}
+        for _node, _component, quota, token_count in entries:
+            discard_counts[quota.name] += token_count
+        self._require_storage_prefetch_rank_agreement(
+            "staging replica discard", discard_counts
+        )
+        for node, component, _quota, token_count in entries:
+            _device_freed, host_freed = self._evict_component_and_detach_lru(
+                node, component, target=EvictLayer.HOST
+            )
+            if host_freed != token_count:
+                raise RuntimeError(
+                    "HiCache staging replica discard freed an unexpected "
+                    f"number of tokens: expected={token_count} actual={host_freed}"
+                )
+            self._update_evictable_leaf_sets(node)
+        return len(entries), discard_deferred
+
+    def _reclaim_l3_staging_headroom(self) -> int:
+        controller = self.cache_controller
+        reserve_tokens = (
+            int(getattr(controller.l3_staging, "reserve_tokens", 0))
+            if controller
+            else 0
+        )
+        quota_count = (
+            len(getattr(controller.l3_staging, "quotas", {})) if controller else 0
+        )
+        self._require_storage_prefetch_rank_agreement(
+            "staging configuration",
+            {"reserve_tokens": reserve_tokens, "quota_count": quota_count},
+        )
+        if reserve_tokens == 0:
+            if controller is not None:
+                controller.l3_staging.shortfall_tokens = 0
+            return 0
+        if controller is None or quota_count == 0:
+            raise RuntimeError("HiCache L3 staging reserve has no installed quota")
+
+        quotas = sorted(
+            controller.l3_staging.quotas.values(), key=lambda quota: quota.name
+        )
+        head_count = min(
+            len(self.l3_staging_pending_leases),
+            self.l3_staging_reclaim_eligible,
+            _L3_STAGING_RECLAIM_QUANTUM_LEASES,
+        )
+        head_fingerprints = [
+            self._staging_lease_logical_fingerprint(lease)
+            for lease in islice(self.l3_staging_pending_leases, head_count)
+        ]
+        head_digest = self._logical_fingerprint_digest(head_fingerprints)
+        self._require_storage_prefetch_rank_agreement(
+            "staging reclaim head",
+            {
+                "queue_length": len(self.l3_staging_pending_leases),
+                "eligible": self.l3_staging_reclaim_eligible,
+                "head_count": head_count,
+                **{f"digest_{index}": value for index, value in enumerate(head_digest)},
+            },
+        )
+        pending = []
+        for _ in range(head_count):
+            lease = self.l3_staging_pending_leases.popleft()
+            self.l3_staging_reclaim_eligible -= 1
+            key = self._staging_lease_key(lease)
+            self.l3_staging_pending_keys.discard(key)
+            previous_tokens = self.l3_staging_pending_tokens.pop(key, 0)
+            self.l3_staging_pending_by_key.pop(key, None)
+            self.l3_staging_pending_token_total -= previous_tokens
+            if self._staging_lease_pending_tokens(lease) > 0:
+                pending.append(lease)
+
+        pending_by_quota = {
+            id(quota): min(
+                quota.used_tokens,
+                sum(
+                    self._staging_lease_pending_tokens(lease)
+                    for lease in pending
+                    if lease.quota is quota
+                ),
+            )
+            for quota in quotas
+        }
+        self._require_storage_prefetch_rank_agreement(
+            "staging quota",
+            {
+                value_name: value
+                for quota in quotas
+                for value_name, value in (
+                    (f"{quota.name}.capacity", quota.capacity_tokens),
+                    (f"{quota.name}.used", quota.used_tokens),
+                    (f"{quota.name}.available", quota.available_tokens),
+                    (
+                        f"{quota.name}.ordinary_available",
+                        quota.original_available_size(),
+                    ),
+                    (f"{quota.name}.pending", pending_by_quota[id(quota)]),
+                )
+            },
+        )
+
+        promoted_tokens = self._promote_l3_staging_leases(pending)
+        pending = [
+            lease for lease in pending if self._staging_lease_pending_tokens(lease) > 0
+        ]
+        pending_by_quota = defaultdict(int)
+        for lease in pending:
+            pending_by_quota[id(lease.quota)] += self._staging_lease_pending_tokens(
+                lease
+            )
+        pending_by_quota = {
+            id(quota): min(quota.used_tokens, pending_by_quota[id(quota)])
+            for quota in quotas
+        }
+
+        mem_pool_host = controller.mem_pool_host
+        anchor_pool = getattr(
+            getattr(mem_pool_host, "anchor_entry", None),
+            "host_pool",
+            mem_pool_host,
+        )
+        evicted_values = {}
+        remaining_eviction_pages = _L3_STAGING_EVICTION_QUANTUM_PAGES
+        continue_eviction = False
+        with bounded_host_eviction_scan(
+            _L3_STAGING_HOST_EVICTION_SCAN_QUANTUM
+        ) as host_scan_budget:
+            for quota in quotas:
+                requested = pending_by_quota.get(id(quota), 0)
+                eviction_needed = max(0, requested - quota.original_available_size())
+                if eviction_needed == 0:
+                    continue
+                if remaining_eviction_pages == 0:
+                    continue_eviction = True
+                    continue
+                eviction_pages = min(
+                    math.ceil(eviction_needed / quota.page_size),
+                    remaining_eviction_pages,
+                )
+                eviction_request = eviction_pages * quota.page_size
+                remaining_eviction_pages -= eviction_pages
+                entry = next(
+                    (
+                        candidate
+                        for candidate in getattr(mem_pool_host, "entries", ())
+                        if candidate.host_pool is quota.pool
+                    ),
+                    None,
+                )
+                if quota.pool is anchor_pool:
+                    evicted = self.evict_host(eviction_request)
+                else:
+                    evicted = (
+                        entry.host_evict_fn(eviction_request)
+                        if entry is not None and entry.host_evict_fn is not None
+                        else 0
+                    )
+                evicted = int(evicted or 0)
+                evicted_values[quota.name] = evicted
+                if 0 < evicted < eviction_needed:
+                    continue_eviction = True
+                if evicted < eviction_needed and host_scan_budget.remaining_nodes == 0:
+                    continue_eviction = True
+
+        if evicted_values:
+            self._require_storage_prefetch_rank_agreement(
+                "staging promotion eviction", evicted_values
+            )
+            self._require_storage_prefetch_rank_agreement(
+                "staging post-eviction quota",
+                {
+                    value_name: value
+                    for quota in quotas
+                    for value_name, value in (
+                        (f"{quota.name}.used", quota.used_tokens),
+                        (f"{quota.name}.available", quota.available_tokens),
+                        (
+                            f"{quota.name}.ordinary_available",
+                            quota.original_available_size(),
+                        ),
+                    )
+                },
+            )
+            promoted_tokens += self._promote_l3_staging_leases(pending)
+
+        pending = [
+            lease for lease in pending if self._staging_lease_pending_tokens(lease) > 0
+        ]
+        discarded_entries, discard_deferred = self._discard_releasable_l3_staging(
+            pending
+        )
+        pending = [
+            lease for lease in pending if self._staging_lease_pending_tokens(lease) > 0
+        ]
+        made_progress = (
+            promoted_tokens > 0
+            or discarded_entries > 0
+            or any(evicted > 0 for evicted in evicted_values.values())
+        )
+        if made_progress:
+            self.storage_state_change_resources.update(_CAPACITY_RETRY_RESOURCES)
+        self._require_storage_prefetch_rank_agreement(
+            "staging continuation",
+            {
+                "made_progress": int(made_progress),
+                "continue_eviction": int(continue_eviction),
+                "discard_deferred": int(discard_deferred),
+            },
+        )
+        self._enqueue_staging_leases(
+            pending,
+            schedule=False,
+            eligible=made_progress or continue_eviction or discard_deferred,
+        )
+        shortfall = self.l3_staging_pending_token_total
+        controller.l3_staging.shortfall_tokens = shortfall
+        if shortfall and (
+            self.l3_staging_reclaim_eligible > 0
+            or continue_eviction
+            or discard_deferred
+        ):
+            self.storage_state_change_resources.add(CheckpointRetryResource.SCHEDULER)
+        return shortfall
+
+    def pin_storage_prefetch_admission(
+        self,
+        request_id: str,
+        node: UnifiedTreeNode,
+        occupied_tokens: int,
+        staging_leases: tuple[L3StagingLease, ...] = (),
+    ) -> None:
+        existing = self.storage_prefetch_admission_host_locks.get(request_id)
+        if (
+            existing is not None
+            and existing.node is node
+            and existing.occupied_tokens == occupied_tokens
+            and tuple(map(self._staging_lease_key, existing.staging_leases))
+            == tuple(map(self._staging_lease_key, staging_leases))
+        ):
+            return
+        if (
+            existing is not None
+            and self.cache_controller is not None
+            and existing.occupied_tokens
+            > self.cache_controller.prefetch_tokens_occupied
+        ):
+            raise RuntimeError(
+                "HiCache prefetch admission accounting underflow while replacing "
+                f"request {request_id}"
+            )
+        lock_params = (
+            existing.lock_params
+            if existing is not None and existing.node is node
+            else self.inc_host_lock_ref(node).to_dec_params()
+        )
+        self.storage_prefetch_admission_host_locks[request_id] = (
+            StoragePrefetchAdmissionPin(
+                node=node,
+                lock_params=lock_params,
+                occupied_tokens=occupied_tokens,
+                staging_leases=staging_leases,
+            )
+        )
+        if existing is not None:
+            if existing.node is not node:
+                self.dec_host_lock_ref(existing.node, existing.lock_params)
+            self.cache_controller.prefetch_tokens_occupied -= existing.occupied_tokens
+            self._enqueue_staging_leases(existing.staging_leases)
+            self.storage_state_change_resources.update(_CAPACITY_RETRY_RESOURCES)
+
+    def pin_storage_prefetch_device_admission(
+        self, request_id: str, node: UnifiedTreeNode
+    ) -> None:
+        existing = self.storage_prefetch_admission_device_locks.get(request_id)
+        if existing is not None and existing.node is node:
+            return
+        lock_params = self.inc_lock_ref(node).to_dec_params()
+        self.storage_prefetch_admission_device_locks[request_id] = (
+            StoragePrefetchDeviceAdmissionPin(node=node, lock_params=lock_params)
+        )
+        if existing is not None:
+            self.dec_lock_ref(existing.node, existing.lock_params)
+
+    def release_storage_prefetch_admission(self, request_id: str) -> None:
+        host_pin = self.storage_prefetch_admission_host_locks.get(request_id)
+        if (
+            host_pin is not None
+            and self.cache_controller is not None
+            and host_pin.occupied_tokens
+            > self.cache_controller.prefetch_tokens_occupied
+        ):
+            raise RuntimeError(
+                "HiCache prefetch admission accounting underflow while releasing "
+                f"request {request_id}"
+            )
+        device_pin = self.storage_prefetch_admission_device_locks.pop(request_id, None)
+        if device_pin is not None:
+            self.dec_lock_ref(device_pin.node, device_pin.lock_params)
+        host_pin = self.storage_prefetch_admission_host_locks.pop(request_id, None)
+        if host_pin is not None:
+            self.dec_host_lock_ref(host_pin.node, host_pin.lock_params)
+            if self.cache_controller is not None:
+                self.cache_controller.prefetch_tokens_occupied -= (
+                    host_pin.occupied_tokens
+                )
+            self._enqueue_staging_leases(host_pin.staging_leases)
+        if device_pin is not None or host_pin is not None:
+            self.storage_state_change_resources.update(_CAPACITY_RETRY_RESOURCES)
+
+    def complete_storage_prefetch_admission(self, request_id: str) -> None:
+        self.release_storage_prefetch_admission(request_id)
+        self.storage_checkpoint_dependency_results.pop(request_id, None)
+
     def cache_finished_req(
         self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int, **kwargs
     ) -> None:
         if self.session.try_cache_finished_req(req, is_insert=is_insert, **kwargs):
+            if req.storage_checkpoint_handle is not None:
+                self.storage_checkpoint_registry.fail(req.storage_checkpoint_handle)
+                self._release_storage_checkpoint(
+                    req.storage_checkpoint_handle, release_staging=True
+                )
             return
 
         if self.disable:
@@ -724,6 +1676,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             self.token_to_kv_pool_allocator.free(kv_indices)
             for comp in self._components_tuple:
                 comp.cleanup_after_caching_req(req, is_finished=True)
+            if req.storage_checkpoint_handle is not None:
+                self.storage_checkpoint_registry.fail(req.storage_checkpoint_handle)
+                self._release_storage_checkpoint(
+                    req.storage_checkpoint_handle, release_staging=True
+                )
             return
 
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_len_to_handle]
@@ -733,6 +1690,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         result = None
         insert_params = None
+        radix_key = None
 
         if is_insert:
             insert_params = InsertParams(
@@ -785,6 +1743,722 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             comp.cleanup_after_caching_req(
                 req, is_finished=True, insert_result=result, insert_params=insert_params
             )
+        if req.storage_checkpoint_handle is not None:
+            from sglang.srt.managers.schedule_batch import FINISH_ABORT
+
+            if isinstance(req.finished_reason, FINISH_ABORT):
+                self.storage_checkpoint_registry.fail(req.storage_checkpoint_handle)
+                self._release_storage_checkpoint(
+                    req.storage_checkpoint_handle, release_staging=True
+                )
+            else:
+                self._create_storage_checkpoint(
+                    req.storage_checkpoint_handle, radix_key
+                )
+
+    def reserve_storage_checkpoint(self, handle: str) -> None:
+        self._release_storage_checkpoint(handle, release_staging=True)
+        self.storage_checkpoint_registry.reserve(handle)
+
+    def _release_storage_checkpoint(
+        self, handle: str, *, release_staging: bool = False
+    ) -> None:
+        checkpoint = self.storage_pending_checkpoints.pop(handle, None)
+        if checkpoint is None:
+            return
+        released_pin = False
+        if checkpoint.device_pin is not None:
+            self.dec_lock_ref(*checkpoint.device_pin)
+            released_pin = True
+        if checkpoint.host_pin is not None:
+            self.dec_host_lock_ref(*checkpoint.host_pin)
+            released_pin = True
+        if release_staging or (
+            self.storage_checkpoint_registry.get_state(handle)
+            is not StorageCheckpointState.PENDING
+        ):
+            self._enqueue_staging_leases(checkpoint.staging_leases)
+        if released_pin:
+            self.storage_state_change_resources.update(_CAPACITY_RETRY_RESOURCES)
+
+    def _checkpoint_path(self, radix_key: RadixKey) -> Optional[list[UnifiedTreeNode]]:
+        target_node = self.match_prefix(
+            MatchPrefixParams(key=radix_key)
+        ).best_match_node
+        path = []
+        node = target_node
+        while node is not self.root_node:
+            path.append(node)
+            node = node.parent
+        path.reverse()
+        if not path or any(node.hash_value is None for node in path):
+            return None
+        matched_tokens = sum(len(node.hash_value) * self.page_size for node in path)
+        if matched_tokens != len(radix_key):
+            return None
+        return self._align_checkpoint_swa_boundary(path)
+
+    def _checkpoint_swa_prefix_tokens(self, total_tokens: int) -> Optional[int]:
+        component = self.components.get(ComponentType.SWA)
+        if component is None:
+            return None
+        window_tokens = (
+            (component.sliding_window_size + self.page_size - 1) // self.page_size
+        ) * self.page_size
+        return max(total_tokens - window_tokens, 0)
+
+    def _align_checkpoint_swa_boundary(
+        self, path: list[UnifiedTreeNode]
+    ) -> list[UnifiedTreeNode]:
+        prefix_tokens = self._checkpoint_swa_prefix_tokens(
+            sum(len(node.key) for node in path)
+        )
+        if not prefix_tokens:
+            return path
+        node_start = 0
+        for index, node in enumerate(path):
+            node_end = node_start + len(node.key)
+            if node_start < prefix_tokens < node_end:
+                prefix_node = self._split_node(
+                    node.key, node, prefix_tokens - node_start
+                )
+                return [*path[:index], prefix_node, node, *path[index + 1 :]]
+            node_start = node_end
+        return path
+
+    @staticmethod
+    def _checkpoint_path_hashes(path: Sequence[UnifiedTreeNode]) -> tuple[str, ...]:
+        return tuple(
+            page_hash for node in path for page_hash in (node.hash_value or ())
+        )
+
+    def _pin_storage_checkpoint_path(
+        self,
+        checkpoint: PendingStorageCheckpoint,
+        path: list[UnifiedTreeNode],
+    ) -> None:
+        target = path[-1]
+        existing_device = checkpoint.device_pin
+        existing_host = checkpoint.host_pin
+        released_pin = False
+        if target.backuped:
+            if checkpoint.host_pin is None or checkpoint.host_pin[0] is not target:
+                checkpoint.host_pin = (
+                    target,
+                    self.inc_host_lock_ref(target).to_dec_params(),
+                )
+            if (checkpoint.requires_device_pin or existing_device is not None) and (
+                checkpoint.device_pin is None or checkpoint.device_pin[0] is not target
+            ):
+                checkpoint.device_pin = (
+                    target,
+                    self.inc_lock_ref(target).to_dec_params(),
+                )
+        elif checkpoint.device_pin is None or checkpoint.device_pin[0] is not target:
+            checkpoint.device_pin = (
+                target,
+                self.inc_lock_ref(target).to_dec_params(),
+            )
+
+        if existing_host is not None and existing_host != checkpoint.host_pin:
+            self.dec_host_lock_ref(*existing_host)
+            released_pin = True
+        if existing_device is not None and existing_device != checkpoint.device_pin:
+            self.dec_lock_ref(*existing_device)
+            released_pin = True
+        if not target.backuped and existing_host is not None:
+            checkpoint.host_pin = None
+        checkpoint.path = tuple(path)
+        if released_pin:
+            self.storage_state_change_resources.update(_CAPACITY_RETRY_RESOURCES)
+
+    def _capture_checkpoint_staging(
+        self,
+        checkpoint: PendingStorageCheckpoint,
+        nodes: Sequence[UnifiedTreeNode],
+    ) -> None:
+        if not checkpoint.requires_device_pin:
+            checkpoint.requires_device_pin = any(
+                node.component_data[component.component_type].value is not None
+                and node.component_data[component.component_type].host_value is None
+                for node in nodes
+                for component in self._components_tuple
+                if component.component_type != BASE_COMPONENT_TYPE
+            )
+        if not checkpoint.staging_lease_keys and checkpoint.staging_leases:
+            checkpoint.staging_lease_keys.update(
+                self._staging_lease_key(lease) for lease in checkpoint.staging_leases
+            )
+        for lease in self._checkpoint_staging_leases(nodes):
+            key = self._staging_lease_key(lease)
+            if key not in checkpoint.staging_lease_keys:
+                checkpoint.staging_leases.append(lease)
+                checkpoint.staging_lease_keys.add(key)
+
+    def _l3_staging_capacity_state(
+        self,
+        base_tokens: int,
+        transfers: Sequence[PoolTransfer],
+        extra_requirements: Optional[dict[PoolName, int]] = None,
+    ) -> Optional[str]:
+        controller = self.cache_controller
+        if controller is None or not controller.l3_staging.quotas:
+            return None
+        mem_pool_host = controller.mem_pool_host
+        anchor_pool = getattr(
+            getattr(mem_pool_host, "anchor_entry", None),
+            "host_pool",
+            mem_pool_host,
+        )
+        requirements: dict[int, int] = defaultdict(int)
+        if base_tokens:
+            requirements[id(anchor_pool)] = base_tokens
+        for transfer in transfers:
+            if transfer.indices_from_pool is not None:
+                continue
+            if transfer.device_indices is None:
+                continue
+            entry = mem_pool_host.entry_map.get(transfer.name)
+            if entry is not None:
+                requirements[id(entry.host_pool)] += len(transfer.device_indices)
+        for pool_name, required in (extra_requirements or {}).items():
+            entry = mem_pool_host.entry_map.get(pool_name)
+            if entry is not None:
+                requirements[id(entry.host_pool)] += required
+
+        values = {
+            value_name: value
+            for pool_id, quota in controller.l3_staging.quotas.items()
+            for value_name, value in (
+                (f"{quota.name}.required", requirements.get(pool_id, 0)),
+                (f"{quota.name}.capacity", quota.capacity_tokens),
+                (f"{quota.name}.available", quota.available_tokens),
+            )
+        }
+        values["missing_pool_count"] = sum(
+            pool_id not in controller.l3_staging.quotas for pool_id in requirements
+        )
+        self._require_storage_prefetch_rank_agreement("staging reservation", values)
+        if any(
+            pool_id not in controller.l3_staging.quotas
+            or required > controller.l3_staging.quotas[pool_id].capacity_tokens
+            for pool_id, required in requirements.items()
+        ):
+            return _CHECKPOINT_STAGING_CAPACITY_EXCEEDED
+        if any(
+            required > controller.l3_staging.quotas[pool_id].available_tokens
+            for pool_id, required in requirements.items()
+        ):
+            return "host"
+        return None
+
+    def _prefetch_staging_capacity_state(self, prefetch_tokens: int) -> Optional[str]:
+        controller = self.cache_controller
+        if controller is None or not controller.l3_staging.quotas:
+            return None
+        mem_pool_host = controller.mem_pool_host
+        extra_requirements = {}
+        swa_component = self.components.get(ComponentType.SWA)
+        if swa_component is not None:
+            window_tokens = (
+                (swa_component.sliding_window_size + self.page_size - 1)
+                // self.page_size
+            ) * self.page_size
+            if prefetch_tokens >= window_tokens:
+                extra_requirements[PoolName.SWA] = window_tokens
+        if ComponentType.MAMBA in self.components:
+            entry = mem_pool_host.entry_map.get(PoolName.MAMBA)
+            if entry is not None:
+                extra_requirements[PoolName.MAMBA] = entry.host_pool.page_size
+        return self._l3_staging_capacity_state(prefetch_tokens, (), extra_requirements)
+
+    def _queue_storage_checkpoint_retry(
+        self,
+        checkpoint: PendingStorageCheckpoint,
+        blocked_reason: str,
+    ) -> None:
+        resource = _CHECKPOINT_BLOCKED_RESOURCES.get(blocked_reason)
+        if resource is None:
+            raise ValueError(
+                f"Unknown storage checkpoint block reason: {blocked_reason}"
+            )
+        if checkpoint.retry_queued and checkpoint.blocked_resource is resource:
+            return
+        checkpoint.blocked_resource = resource
+        checkpoint.blocked_generation = self.storage_checkpoint_retries.generations[
+            resource
+        ]
+        checkpoint.retry_ticket += 1
+        checkpoint.retry_queued = True
+        self.storage_checkpoint_retries.queues[resource].append(
+            (checkpoint.handle, checkpoint.generation, checkpoint.retry_ticket)
+        )
+        if resource is CheckpointRetryResource.SCHEDULER:
+            self.storage_state_change_resources.add(resource)
+
+    def _checkpoint_skip_components(
+        self, node_end: int, total_tokens: int
+    ) -> frozenset[ComponentType]:
+        swa_prefix_tokens = self._checkpoint_swa_prefix_tokens(total_tokens)
+        if swa_prefix_tokens is not None and node_end <= swa_prefix_tokens:
+            return frozenset({ComponentType.SWA})
+        return frozenset()
+
+    def _drive_storage_checkpoint(
+        self,
+        checkpoint: PendingStorageCheckpoint,
+        path: Sequence[UnifiedTreeNode],
+    ) -> str:
+        write_tracker = self.cache_controller.storage_write_tracker
+        page_offset = checkpoint.cursor_pages
+        scanned_nodes = 0
+        for node in path:
+            node_hashes = node.hash_value or []
+            node_end = page_offset + len(node_hashes)
+            if scanned_nodes == _CHECKPOINT_SCAN_QUANTUM:
+                self.storage_state_change_resources.add(
+                    CheckpointRetryResource.SCHEDULER
+                )
+                return "continuation"
+            scanned_nodes += 1
+            expected = checkpoint.path_hashes[page_offset:node_end]
+            if tuple(node_hashes) != expected:
+                self.storage_checkpoint_registry.fail(checkpoint.handle)
+                return "storage"
+            durable_hashes = write_tracker.get_durable_hashes(node_hashes)
+            has_pending_write = write_tracker.has_pending(node_hashes)
+            self._require_storage_prefetch_rank_agreement(
+                "checkpoint node state",
+                {
+                    "durable_hashes": len(durable_hashes),
+                    "pending_write": int(has_pending_write),
+                    "write_through_pending": int(
+                        node.write_through_pending_id is not None
+                    ),
+                    "host_resident": int(node.backuped),
+                    "node_pages": len(node_hashes),
+                },
+            )
+            if len(durable_hashes) == len(set(node_hashes)):
+                checkpoint.cursor_pages = node_end
+                page_offset = node_end
+                continue
+            if has_pending_write or node.write_through_pending_id is not None:
+                return "storage"
+
+            skip_components = self._checkpoint_skip_components(
+                node_end * self.page_size, len(checkpoint.radix_key)
+            )
+            if not node.backuped:
+                preview_transfers = [
+                    transfer
+                    for component in self._components_tuple
+                    if component.component_type != BASE_COMPONENT_TYPE
+                    and component.component_type not in skip_components
+                    for transfer in (
+                        component.build_hicache_transfers(
+                            node, CacheTransferPhase.BACKUP_HOST
+                        )
+                        or ()
+                    )
+                ]
+                device_value = node.component_data[BASE_COMPONENT_TYPE].value
+                capacity_state = self._l3_staging_capacity_state(
+                    len(device_value) if device_value is not None else 0,
+                    preview_transfers,
+                )
+                if capacity_state is not None:
+                    return capacity_state
+                with l3_staging_allocation():
+                    written = self.write_backup(node, skip_components=skip_components)
+                self._require_storage_prefetch_rank_agreement(
+                    "checkpoint host backup", {"written_tokens": written}
+                )
+                self._capture_checkpoint_staging(checkpoint, (node,))
+                return "storage" if written > 0 else "host"
+
+            with l3_staging_allocation():
+                auxiliary_started = self._write_missing_aux_backup(
+                    node, skip_components=skip_components
+                )
+            self._require_storage_prefetch_rank_agreement(
+                "checkpoint auxiliary backup",
+                {
+                    "state": (
+                        1
+                        if auxiliary_started is True
+                        else (
+                            0
+                            if auxiliary_started is False
+                            else (
+                                -2
+                                if auxiliary_started
+                                == _CHECKPOINT_STAGING_CAPACITY_EXCEEDED
+                                else -1
+                            )
+                        )
+                    )
+                },
+            )
+            self._capture_checkpoint_staging(checkpoint, (node,))
+            if auxiliary_started == _CHECKPOINT_STAGING_CAPACITY_EXCEEDED:
+                return _CHECKPOINT_STAGING_CAPACITY_EXCEEDED
+            if auxiliary_started is False:
+                return "auxiliary"
+            if auxiliary_started is True:
+                return "storage"
+
+            operation_id = self.write_backup_storage(node)
+            self._require_storage_prefetch_rank_agreement(
+                "checkpoint storage submission",
+                {"submitted": int(operation_id is not None)},
+            )
+            if operation_id is None:
+                return "storage"
+            checkpoint.active_operation_ids.add(operation_id)
+            self.storage_checkpoint_owners_by_operation[operation_id] = (
+                checkpoint.handle,
+                checkpoint.generation,
+            )
+            self._capture_checkpoint_staging(checkpoint, (node,))
+            return "storage"
+        return "storage"
+
+    @staticmethod
+    def _reset_checkpoint_path_scan(checkpoint: PendingStorageCheckpoint) -> None:
+        checkpoint.path_scan_node = None
+        checkpoint.path_scan_reverse_nodes = deque()
+        checkpoint.path_scan_drive_reverse_nodes = deque()
+        checkpoint.path_scan_hash_cursor = 0
+        checkpoint.path_scan_key_tokens = 0
+        checkpoint.path_scan_valid = True
+        checkpoint.path_scan_tree_generation = -1
+
+    def _scan_storage_checkpoint_path(
+        self, checkpoint: PendingStorageCheckpoint
+    ) -> tuple[Optional[list[UnifiedTreeNode]], Optional[deque[UnifiedTreeNode]], bool]:
+        if (
+            checkpoint.path_scan_reverse_nodes
+            and checkpoint.path_scan_tree_generation
+            != self.storage_radix_tree_generation
+        ):
+            self._reset_checkpoint_path_scan(checkpoint)
+        if not checkpoint.path_scan_reverse_nodes:
+            if not checkpoint.path:
+                return None, None, True
+            checkpoint.path_scan_node = checkpoint.path[-1]
+            checkpoint.path_scan_hash_cursor = len(checkpoint.path_hashes)
+            checkpoint.path_scan_key_tokens = 0
+            checkpoint.path_scan_valid = True
+            checkpoint.path_scan_tree_generation = self.storage_radix_tree_generation
+
+        node = checkpoint.path_scan_node
+        scanned_nodes = []
+        while (
+            node is not self.root_node and len(scanned_nodes) < _CHECKPOINT_SCAN_QUANTUM
+        ):
+            if node is None:
+                checkpoint.path_scan_valid = False
+                break
+            scanned_nodes.append(node)
+            node_hashes = tuple(node.hash_value or ())
+            node_end = checkpoint.path_scan_hash_cursor
+            hash_start = checkpoint.path_scan_hash_cursor - len(node_hashes)
+            if (
+                hash_start < 0
+                or checkpoint.path_hashes[hash_start : checkpoint.path_scan_hash_cursor]
+                != node_hashes
+            ):
+                checkpoint.path_scan_valid = False
+            else:
+                checkpoint.path_scan_hash_cursor = hash_start
+            if node.key is None:
+                checkpoint.path_scan_valid = False
+            else:
+                checkpoint.path_scan_key_tokens += len(node.key)
+            checkpoint.path_scan_reverse_nodes.appendleft(node)
+            if node_end > checkpoint.cursor_pages:
+                checkpoint.path_scan_drive_reverse_nodes.appendleft(node)
+            node = node.parent
+
+        self._capture_checkpoint_staging(checkpoint, scanned_nodes)
+        checkpoint.path_scan_node = node
+        complete = node is self.root_node or node is None
+        if complete:
+            checkpoint.path_scan_valid = (
+                checkpoint.path_scan_valid
+                and node is self.root_node
+                and checkpoint.path_scan_hash_cursor == 0
+                and checkpoint.path_scan_key_tokens == len(checkpoint.radix_key)
+            )
+        self._require_storage_prefetch_rank_agreement(
+            "checkpoint path scan",
+            {
+                "complete": int(complete),
+                "valid": int(checkpoint.path_scan_valid),
+                "scanned_nodes": len(scanned_nodes),
+                "accumulated_nodes": len(checkpoint.path_scan_reverse_nodes),
+                "remaining_hashes": checkpoint.path_scan_hash_cursor,
+                "key_tokens": checkpoint.path_scan_key_tokens,
+                "tree_generation": self.storage_radix_tree_generation,
+                **{
+                    f"path_digest_{index}": value
+                    for index, value in enumerate(checkpoint.path_hash_digest)
+                },
+            },
+        )
+        if not complete:
+            self.storage_state_change_resources.add(CheckpointRetryResource.SCHEDULER)
+            return None, None, False
+
+        valid = checkpoint.path_scan_valid
+        path = list(checkpoint.path_scan_reverse_nodes)
+        drive_path = checkpoint.path_scan_drive_reverse_nodes
+        checkpoint.path_scan_drive_reverse_nodes = deque()
+        self._reset_checkpoint_path_scan(checkpoint)
+        if not valid:
+            return None, None, True
+        self._pin_storage_checkpoint_path(checkpoint, path)
+        return path, drive_path, True
+
+    def retry_storage_checkpoint(self, handle: str) -> None:
+        state = self.storage_checkpoint_registry.get_state(handle)
+        if state is not StorageCheckpointState.PENDING:
+            self._release_storage_checkpoint(handle)
+            return
+        checkpoint = self.storage_pending_checkpoints.get(handle)
+        if checkpoint is None:
+            self.storage_checkpoint_registry.fail(handle)
+            return
+        path, drive_path, scan_complete = self._scan_storage_checkpoint_path(checkpoint)
+        if not scan_complete:
+            self._queue_storage_checkpoint_retry(checkpoint, "continuation")
+            return
+        if path is None or drive_path is None:
+            self.storage_checkpoint_registry.fail(handle)
+            self._release_storage_checkpoint(handle, release_staging=True)
+            return
+        blocked_reason = self._drive_storage_checkpoint(checkpoint, drive_path)
+        if blocked_reason == _CHECKPOINT_STAGING_CAPACITY_EXCEEDED:
+            self.storage_checkpoint_registry.fail(handle)
+            self._release_storage_checkpoint(handle, release_staging=True)
+            return
+        if (
+            self.storage_checkpoint_registry.get_state(handle)
+            is not StorageCheckpointState.PENDING
+        ):
+            self._release_storage_checkpoint(handle)
+            return
+        self._queue_storage_checkpoint_retry(checkpoint, blocked_reason)
+
+    def _drive_storage_checkpoint_retries(
+        self, changed_resources: set[CheckpointRetryResource]
+    ) -> None:
+        retries = self.storage_checkpoint_retries
+        for resource in changed_resources:
+            retries.generations[resource] += 1
+        continuation_resources = set(retries.continuation_resources)
+        retries.continuation_resources.clear()
+        eligible_resources = changed_resources | continuation_resources
+        resources = tuple(CheckpointRetryResource)
+
+        def ticket_is_eligible(
+            resource: CheckpointRetryResource,
+            ticket: tuple[str, int, int],
+        ) -> bool:
+            checkpoint = self.storage_pending_checkpoints.get(ticket[0])
+            stale = (
+                checkpoint is None
+                or checkpoint.generation != ticket[1]
+                or checkpoint.retry_ticket != ticket[2]
+                or checkpoint.blocked_resource is not resource
+            )
+            return stale or (
+                checkpoint.blocked_generation < retries.generations[resource]
+            )
+
+        for _ in range(_CHECKPOINT_RETRY_QUANTUM):
+            selected_resource = None
+            selected_ticket = None
+            for offset in range(len(resources)):
+                index = (retries.cursor + offset) % len(resources)
+                resource = resources[index]
+                queue = retries.queues[resource]
+                if resource not in eligible_resources or not queue:
+                    continue
+                ticket = queue[0]
+                if not ticket_is_eligible(resource, ticket):
+                    continue
+                selected_resource = resource
+                selected_ticket = ticket
+                retries.cursor = (index + 1) % len(resources)
+                break
+            handle = selected_ticket[0] if selected_ticket is not None else ""
+            digest = hashlib.sha256(handle.encode()).digest()
+            self._require_storage_prefetch_rank_agreement(
+                "checkpoint retry ticket",
+                {
+                    "present": int(selected_ticket is not None),
+                    "resource": (
+                        resources.index(selected_resource)
+                        if selected_resource is not None
+                        else -1
+                    ),
+                    "generation": (
+                        selected_ticket[1] if selected_ticket is not None else -1
+                    ),
+                    "sequence": (
+                        selected_ticket[2] if selected_ticket is not None else -1
+                    ),
+                    "handle_0": int.from_bytes(digest[:4], "big") & 0x7FFFFFFF,
+                    "handle_1": int.from_bytes(digest[4:8], "big") & 0x7FFFFFFF,
+                },
+            )
+            if selected_resource is None or selected_ticket is None:
+                break
+            retries.queues[selected_resource].popleft()
+            checkpoint = self.storage_pending_checkpoints.get(selected_ticket[0])
+            if (
+                checkpoint is None
+                or checkpoint.generation != selected_ticket[1]
+                or checkpoint.retry_ticket != selected_ticket[2]
+            ):
+                continue
+            checkpoint.retry_queued = False
+            self.retry_storage_checkpoint(checkpoint.handle)
+
+        remaining_resources = {
+            resource
+            for resource in eligible_resources
+            if retries.queues[resource]
+            and ticket_is_eligible(resource, retries.queues[resource][0])
+        }
+        self._require_storage_prefetch_rank_agreement(
+            "checkpoint retry continuation",
+            {
+                resource.name: int(resource in remaining_resources)
+                for resource in resources
+            },
+        )
+        retries.continuation_resources.update(remaining_resources)
+        if remaining_resources:
+            self.storage_state_change_resources.add(CheckpointRetryResource.SCHEDULER)
+
+    def _create_storage_checkpoint(
+        self, handle: str, radix_key: Optional[RadixKey]
+    ) -> None:
+        if (
+            radix_key is None
+            or not self.enable_storage
+            or self.cache_controller is None
+        ):
+            self._release_storage_checkpoint(handle, release_staging=True)
+            self.storage_checkpoint_registry.fail(handle)
+            return
+
+        path = self._checkpoint_path(radix_key)
+        if path is None:
+            self._release_storage_checkpoint(handle, release_staging=True)
+            self.storage_checkpoint_registry.fail(handle)
+            return
+
+        self._release_storage_checkpoint(handle, release_staging=True)
+        self.storage_checkpoint_generation += 1
+        page_hashes = self._checkpoint_path_hashes(path)
+        pending = PendingStorageCheckpoint(
+            handle=handle,
+            generation=self.storage_checkpoint_generation,
+            radix_key=radix_key,
+            path=tuple(path),
+            path_hashes=page_hashes,
+        )
+        self.storage_pending_checkpoints[handle] = pending
+        self._capture_checkpoint_staging(pending, path)
+        self._pin_storage_checkpoint_path(pending, path)
+        self._reclaim_l3_staging_headroom()
+
+        write_tracker = self.cache_controller.storage_write_tracker
+        checkpoint = self.storage_checkpoint_registry.create(
+            handle,
+            page_hashes,
+            durable_hashes=write_tracker.get_durable_hashes(page_hashes),
+            has_pending=write_tracker.has_pending,
+        )
+        if checkpoint.state is StorageCheckpointState.READY:
+            self._release_storage_checkpoint(handle)
+            return
+
+        blocked_reason = self._drive_storage_checkpoint(pending, path)
+        if blocked_reason == _CHECKPOINT_STAGING_CAPACITY_EXCEEDED:
+            self.storage_checkpoint_registry.fail(handle)
+            self._release_storage_checkpoint(handle, release_staging=True)
+            logger.error(
+                "HiCache checkpoint failed handle=%s reason=staging-capacity",
+                handle,
+            )
+            return
+        self._queue_storage_checkpoint_retry(pending, blocked_reason)
+        logger.info(
+            "HiCache checkpoint deferred handle=%s reason=%s staging=%s",
+            handle,
+            blocked_reason,
+            self.cache_controller.l3_staging.usage(),
+        )
+
+    def _write_missing_aux_backup(
+        self,
+        node: UnifiedTreeNode,
+        skip_components: frozenset[ComponentType] = frozenset(),
+    ) -> bool | str | None:
+        if self.cache_controller is None:
+            return False
+
+        comp_xfers: dict[ComponentType, list[PoolTransfer]] = {}
+        for comp in self._components_tuple:
+            if comp.component_type == BASE_COMPONENT_TYPE:
+                continue
+            if comp.component_type in skip_components:
+                continue
+            component_data = node.component_data[comp.component_type]
+            if component_data.value is None or component_data.host_value is not None:
+                continue
+            transfers = comp.build_hicache_transfers(
+                node, CacheTransferPhase.BACKUP_HOST
+            )
+            if transfers:
+                comp_xfers[comp.component_type] = transfers
+
+        if not comp_xfers:
+            return None
+
+        device_value = node.component_data[BASE_COMPONENT_TYPE].value
+        if device_value is None:
+            return False
+        aux_xfers = [transfer for xfers in comp_xfers.values() for transfer in xfers]
+        capacity_state = self._l3_staging_capacity_state(0, aux_xfers)
+        if capacity_state is not None:
+            return (
+                capacity_state
+                if capacity_state == _CHECKPOINT_STAGING_CAPACITY_EXCEEDED
+                else False
+            )
+        host_indices = self.cache_controller.write(
+            device_value[:0], node_id=node.id, extra_pools=aux_xfers
+        )
+        if host_indices is None:
+            return False
+        assert host_indices.numel() == 0
+
+        for component_type, transfers in comp_xfers.items():
+            self.components[component_type].commit_hicache_transfer(
+                node,
+                CacheTransferPhase.BACKUP_HOST,
+                transfers=transfers,
+            )
+
+        lock_params = self.inc_lock_ref(node).to_dec_params()
+        self._track_write_through_node(node, lock_params)
+        return True
 
     def cache_unfinished_req(self, req: Req, chunked: bool = False, **kwargs) -> None:
         if self.session.try_cache_unfinished_req(req, chunked=chunked, **kwargs):
@@ -1057,6 +2731,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         self._update_evictable_leaf_sets(new_node)
         self._update_evictable_leaf_sets(child)
+        self.storage_radix_tree_generation += 1
         return new_node
 
     def _touch_node(self, node: UnifiedTreeNode):
@@ -1086,6 +2761,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self._update_evictable_leaf_sets(new_node)
         self._update_evictable_leaf_sets(parent)
         self._record_store_event(new_node)
+        self.storage_radix_tree_generation += 1
         return new_node
 
     def _unevict_node_on_insert(
@@ -1252,6 +2928,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self._update_evictable_leaf_sets(new_node)
         self._update_evictable_leaf_sets(node)
         result.inserted_host_node = new_node
+        self.storage_radix_tree_generation += 1
         return result
 
     # ---- Evict Helpers ----
@@ -1312,6 +2989,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         key = node.key.child_key(self.page_size)
         v = node.parent.children.pop(key, None)
         assert v == node
+        self.storage_radix_tree_generation += 1
 
     def _evict_component_and_detach_lru(
         self,
@@ -1383,6 +3061,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     )
 
             self.evictable_host_leaves.discard(cur)
+            self.evictable_host_scan_queue.pop(cur, None)
             self._remove_leaf_from_parent(cur)
             parent = cur.parent
             self._update_evictable_leaf_sets(parent)
@@ -1460,8 +3139,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         if self._is_host_leaf(node):
             self.evictable_host_leaves.add(node)
+            self.evictable_host_scan_queue.setdefault(node, None)
         else:
             self.evictable_host_leaves.discard(node)
+            self.evictable_host_scan_queue.pop(node, None)
 
     def _evict_to_host(
         self, node: UnifiedTreeNode, tracker: Optional[dict[ComponentType, int]] = None
@@ -1480,6 +3161,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             node, UnifiedLRUList.insert_mru, target=EvictLayer.HOST, skip_existing=True
         )
         self._update_evictable_leaf_sets(node.parent)
+        self.storage_state_change_resources.update(_CAPACITY_RETRY_RESOURCES)
 
     def _evict_device_leaf(
         self, node: UnifiedTreeNode, tracker: dict[ComponentType, int]
@@ -1534,12 +3216,19 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             )
             tracker[comp.component_type] += hf
         self.evictable_host_leaves.discard(node)
+        self.evictable_host_scan_queue.pop(node, None)
         self._remove_leaf_from_parent(node)
         self._iteratively_delete_tombstone_leaf(node, tracker)
+        self.storage_state_change_resources.update(_CAPACITY_RETRY_RESOURCES)
 
     # ---- HiCache: Backup / LoadBack ----
 
-    def write_backup(self, node: UnifiedTreeNode, write_back: bool = False) -> int:
+    def write_backup(
+        self,
+        node: UnifiedTreeNode,
+        write_back: bool = False,
+        skip_components: frozenset[ComponentType] = frozenset(),
+    ) -> int:
         """Backup a node's data from device to host (D->H)."""
         if self.cache_controller is None:
             return 0
@@ -1548,7 +3237,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if not write_back and (
             node.parent is not self.root_node and not node.parent.backuped
         ):
-            if self.write_backup(node.parent) <= 0:
+            if (
+                self.write_backup(
+                    node.parent,
+                    skip_components=skip_components,
+                )
+                <= 0
+            ):
                 return 0
 
         device_value = node.component_data[BASE_COMPONENT_TYPE].value
@@ -1558,6 +3253,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         comp_xfers: dict[ComponentType, list] = {}
         for comp in self._components_tuple:
             if comp.component_type == BASE_COMPONENT_TYPE:
+                continue
+            if comp.component_type in skip_components:
                 continue
             t = comp.build_hicache_transfers(node, CacheTransferPhase.BACKUP_HOST)
             if t:
@@ -1823,13 +3520,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         ):
             self.write_backup(node)
 
-    def write_backup_storage(self, node: UnifiedTreeNode) -> None:
+    def write_backup_storage(self, node: UnifiedTreeNode) -> Optional[int]:
         if (
             not self.enable_storage
             or self.cache_controller is None
             or not node.backuped
         ):
-            return
+            return None
 
         prefix_keys = None
         if self.hicache_storage_pass_prefix_keys:
@@ -1868,6 +3565,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             node,
             self.inc_host_lock_ref(node).to_dec_params(),
         )
+        return operation_id
 
     def prefetch_from_storage(
         self,
@@ -1876,9 +3574,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         new_input_tokens: list[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[list[str]] = None,
-    ) -> None:
+        checkpoint_dependency: Optional[str] = None,
+    ) -> StoragePrefetchState:
+        if req_id in self.ongoing_prefetch or req_id in self.storage_prefetch_ownership:
+            raise RuntimeError(f"HiCache prefetch {req_id} already owns host memory")
         if not self.enable_storage or self.cache_controller is None:
-            return
+            state = StoragePrefetchState.MISS
+            self.storage_prefetch_tracker.set(req_id, state)
+            return state
 
         extra_key = last_host_node.key.extra_key if last_host_node.key else None
         prefetch_key = RadixKey(
@@ -1886,41 +3589,130 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             extra_key=extra_key,
             is_bigram=self.is_eagle,
         ).page_aligned(self.page_size)
+        if checkpoint_dependency is not None:
+            checkpoint_state = self.get_storage_checkpoint_dependency_state(
+                req_id, checkpoint_dependency
+            )
+            if checkpoint_state is StorageCheckpointState.FAILED:
+                state = StoragePrefetchState.FAILED
+                self.storage_prefetch_tracker.set(req_id, state)
+                return state
+            if checkpoint_state is not StorageCheckpointState.READY:
+                state = StoragePrefetchState.DEFERRED
+                self.storage_prefetch_tracker.set(req_id, state)
+                return state
+
         prefetch_length = len(prefetch_key)
-        if (
-            prefetch_length < self.prefetch_threshold
-            or self.cache_controller.prefetch_rate_limited()
+        if prefetch_length < self.prefetch_threshold:
+            state = StoragePrefetchState.MISS
+            self.storage_prefetch_tracker.set(req_id, state)
+            return state
+        pending_write = torch.tensor(
+            int(
+                self.cache_controller.has_pending_storage_write(prefetch_key, last_hash)
+            ),
+            dtype=torch.int,
+        )
+        self._all_reduce_attn_groups(pending_write, torch.distributed.ReduceOp.MAX)
+        if pending_write.item() != 0:
+            state = StoragePrefetchState.DEFERRED
+            self.storage_prefetch_tracker.set(req_id, state)
+            return state
+        if self.synchronize_storage_prefetch_flag(
+            self.cache_controller.prefetch_rate_limited()
         ):
-            return
+            state = StoragePrefetchState.DEFERRED
+            self.storage_prefetch_tracker.set(req_id, state)
+            return state
 
         anchor_lock_params = self.inc_host_lock_ref(last_host_node).to_dec_params()
+        quotas_enabled = bool(self.cache_controller.l3_staging.quotas)
+        allocation_length = prefetch_length
+        if quotas_enabled:
+            capacity_state = self._prefetch_staging_capacity_state(allocation_length)
+            if capacity_state is not None and checkpoint_dependency is None:
+                with l3_staging_allocation():
+                    available_size = (
+                        self.cache_controller.mem_pool_host.available_size()
+                    )
+                available_size = self.synchronize_storage_prefetch_min(available_size)
+                allocation_length = min(
+                    prefetch_length,
+                    available_size - available_size % self.page_size,
+                )
+                if allocation_length >= self.prefetch_threshold:
+                    capacity_state = self._prefetch_staging_capacity_state(
+                        allocation_length
+                    )
+            if (
+                capacity_state is not None
+                or allocation_length < self.prefetch_threshold
+            ):
+                self.dec_host_lock_ref(last_host_node, anchor_lock_params)
+                state = (
+                    StoragePrefetchState.FAILED
+                    if capacity_state == _CHECKPOINT_STAGING_CAPACITY_EXCEEDED
+                    and checkpoint_dependency is not None
+                    else StoragePrefetchState.DEFERRED
+                )
+                self.storage_prefetch_tracker.set(req_id, state)
+                return state
+
+        with l3_staging_allocation():
+            host_indices = self.cache_controller.mem_pool_host.alloc(allocation_length)
+            if host_indices is None and not quotas_enabled:
+                self.evict_host(allocation_length)
+                host_indices = self.cache_controller.mem_pool_host.alloc(
+                    allocation_length
+                )
+        if quotas_enabled and host_indices is None:
+            raise RuntimeError("HiCache L3 staging capacity changed after reservation")
+        synchronized_length = self.synchronize_storage_prefetch_min(
+            len(host_indices) if host_indices is not None else 0
+        )
+        if synchronized_length < self.prefetch_threshold:
+            if host_indices is not None:
+                self.cache_controller.mem_pool_host.free(host_indices)
+            self.dec_host_lock_ref(last_host_node, anchor_lock_params)
+            state = StoragePrefetchState.DEFERRED
+            self.storage_prefetch_tracker.set(req_id, state)
+            return state
+        assert host_indices is not None
+        if len(host_indices) > synchronized_length:
+            self.cache_controller.mem_pool_host.free(host_indices[synchronized_length:])
+            host_indices = host_indices[:synchronized_length]
+        prefetch_key = prefetch_key[:synchronized_length]
+
         comp_xfers: dict[ComponentType, list[PoolTransfer]] = {}
         alloc_failed = False
         for comp in self._components_tuple:
             if comp.component_type == BASE_COMPONENT_TYPE:
                 continue
-            transfers = comp.build_hicache_transfers(
-                last_host_node,
-                CacheTransferPhase.PREFETCH,
-                token_ids=prefetch_key.token_ids,
-                prefetch_tokens=len(prefetch_key),
-                last_hash=last_hash,
-            )
+            with l3_staging_allocation():
+                transfers = comp.build_hicache_transfers(
+                    last_host_node,
+                    CacheTransferPhase.PREFETCH,
+                    token_ids=prefetch_key.token_ids,
+                    prefetch_tokens=len(prefetch_key),
+                    last_hash=last_hash,
+                )
             if transfers == []:
                 alloc_failed = True
                 break
             if transfers:
                 comp_xfers[comp.component_type] = transfers
-        kv_xfer = PoolTransfer(name=PoolName.KV, host_indices=None)
+        kv_xfer = PoolTransfer(name=PoolName.KV, host_indices=host_indices)
         sidecar_xfers = self._build_sidecar_transfers(
             CacheTransferPhase.PREFETCH, kv_xfer, comp_xfers
         )
+        alloc_failed = self.synchronize_storage_prefetch_flag(alloc_failed)
         if alloc_failed:
-            self.cache_controller.append_host_mem_release(
-                extra_pools=[x for xfers in comp_xfers.values() for x in xfers],
-            )
+            self.cache_controller.mem_pool_host.free(host_indices)
+            self._release_prefetch_aux_allocations(comp_xfers)
             self.dec_host_lock_ref(last_host_node, anchor_lock_params)
-            return
+            state = StoragePrefetchState.DEFERRED
+            self.storage_prefetch_tracker.set(req_id, state)
+            return state
 
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
         aux_xfers.extend(sidecar_xfers)
@@ -1930,16 +3722,26 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             last_hash,
             prefix_keys,
             extra_pools=aux_xfers or None,
+            host_indices=host_indices,
         )
         self.ongoing_prefetch[req_id] = _OngoingPrefetch(
             last_host_node,
             prefetch_key,
-            None,
+            host_indices,
             operation,
             anchor_lock_params,
             comp_xfers,
         )
+        self.storage_prefetch_ownership[req_id] = StoragePrefetchOwnership(
+            operation_id=operation.id,
+            generation=operation.id,
+            host_indices=host_indices,
+            owned_tokens=len(host_indices),
+        )
         self.cache_controller.prefetch_tokens_occupied += len(prefetch_key)
+        state = StoragePrefetchState.QUERYING
+        self.storage_prefetch_tracker.set(req_id, state)
+        return state
 
     def _prefetch_timeout_check_linear_func(self, operation: PrefetchOperation) -> bool:
         return (
@@ -1947,6 +3749,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             > self.prefetch_timeout_base
             + len(operation.hash_value) * self.prefetch_timeout_per_page
         )
+
+    def storage_prefetch_timeout(self, num_tokens: int) -> float:
+        num_pages = (num_tokens + self.page_size - 1) // self.page_size
+        return self.prefetch_timeout_base + num_pages * self.prefetch_timeout_per_page
 
     def can_terminate_prefetch(self, operation: PrefetchOperation) -> bool:
         if self.prefetch_stop_policy == "best_effort":
@@ -1984,9 +3790,135 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         operation_terminated = states[1].item() == 1
         return can_terminate or operation_terminated
 
+    @staticmethod
+    def _prefetch_transition_fingerprint(
+        transition: PrefetchOwnershipTransition,
+    ) -> dict[str, int]:
+        request_digest = hashlib.sha256(transition.request_id.encode()).digest()
+        hash_digest = hashlib.sha256()
+        for value in transition.hash_values:
+            encoded = value.encode()
+            hash_digest.update(len(encoded).to_bytes(8, "big"))
+            hash_digest.update(encoded)
+        return {
+            "request_id_0": int.from_bytes(request_digest[:4], "big") & 0x7FFFFFFF,
+            "request_id_1": int.from_bytes(request_digest[4:8], "big") & 0x7FFFFFFF,
+            "generation": transition.generation,
+            "state": transition.state.value,
+            "retained_tokens": transition.retained_tokens,
+            "hash_count": len(transition.hash_values),
+            **{
+                f"hash_digest_{index}": int.from_bytes(
+                    hash_digest.digest()[offset : offset + 4], "big"
+                )
+                & 0x7FFFFFFF
+                for index, offset in enumerate(range(0, hash_digest.digest_size, 4))
+            },
+        }
+
+    def _truncate_prefetch_ownership(
+        self, request_id: str, retained_tokens: int
+    ) -> StoragePrefetchOwnership:
+        ownership = self.storage_prefetch_ownership.get(request_id)
+        if ownership is None:
+            raise RuntimeError(f"HiCache prefetch {request_id} has no ownership")
+        if retained_tokens % self.page_size != 0:
+            raise RuntimeError(
+                f"HiCache prefetch {request_id} retained unaligned memory"
+            )
+        if not 0 <= retained_tokens <= ownership.owned_tokens:
+            raise RuntimeError(
+                f"HiCache prefetch {request_id} ownership cannot move from "
+                f"{ownership.owned_tokens} to {retained_tokens}"
+            )
+        if retained_tokens < ownership.owned_tokens:
+            self.cache_controller.mem_pool_host.free(
+                ownership.host_indices[retained_tokens : ownership.owned_tokens]
+            )
+            ownership.owned_tokens = retained_tokens
+            self.storage_state_change_resources.add(CheckpointRetryResource.HOST)
+        return ownership
+
+    def _release_prefetch_aux_allocations(
+        self, comp_xfers: dict[ComponentType, list[PoolTransfer]]
+    ) -> None:
+        self._release_prefetch_pool_allocations(
+            [transfer for transfers in comp_xfers.values() for transfer in transfers]
+        )
+
+    def _release_prefetch_pool_allocations(
+        self, transfers: Sequence[PoolTransfer]
+    ) -> None:
+        controller = self.cache_controller
+        mem_pool_host = controller.mem_pool_host
+        anchor_entry = getattr(mem_pool_host, "anchor_entry", None)
+        released = False
+        for transfer in transfers:
+            host_indices = transfer.host_indices
+            entry = mem_pool_host.entry_map.get(transfer.name)
+            if (
+                host_indices is None
+                or len(host_indices) == 0
+                or entry is None
+                or entry is anchor_entry
+                or entry.is_primary_index_anchor
+                or transfer.indices_from_pool is not None
+            ):
+                continue
+            entry.host_pool.free(host_indices)
+            released = True
+        if released:
+            self.storage_state_change_resources.add(CheckpointRetryResource.AUXILIARY)
+
+    def _apply_prefetch_ownership_transition(
+        self, transition: PrefetchOwnershipTransition
+    ) -> None:
+        self._require_storage_prefetch_rank_agreement(
+            "ownership transition",
+            self._prefetch_transition_fingerprint(transition),
+        )
+        info = self.ongoing_prefetch.get(transition.request_id)
+        ownership = self.storage_prefetch_ownership.get(transition.request_id)
+        if info is None or ownership is None:
+            return
+        operation = info.operation
+        if (
+            ownership.operation_id != operation.id
+            or ownership.generation != transition.generation
+        ):
+            return
+        if transition.state is not StoragePrefetchState.READING:
+            self._revoke_pending_prefetch(transition.request_id, transition.state)
+            return
+        if transition.request_id in self.storage_prefetch_aborted_requests:
+            self._revoke_pending_prefetch(
+                transition.request_id, StoragePrefetchState.FAILED
+            )
+            return
+        if (
+            transition.retained_tokens < self.prefetch_threshold
+            or len(transition.hash_values) * self.page_size
+            != transition.retained_tokens
+        ):
+            raise RuntimeError(
+                f"HiCache prefetch {transition.request_id} published an "
+                "inconsistent ownership transition"
+            )
+        ownership = self._truncate_prefetch_ownership(
+            transition.request_id, transition.retained_tokens
+        )
+        operation.hash_value = list(transition.hash_values)
+        operation.host_indices = ownership.host_indices[: transition.retained_tokens]
+        operation.storage_prefetch_state = StoragePrefetchState.READING
+        operation.worker_done.clear()
+        self.storage_prefetch_tracker.set(
+            transition.request_id, StoragePrefetchState.READING
+        )
+        self.cache_controller.prefetch_buffer.put(operation)
+
     def check_prefetch_progress(self, req_id: str) -> bool:
         if req_id not in self.ongoing_prefetch:
-            return True
+            return self.storage_prefetch_tracker.get(req_id).is_terminal
 
         (
             last_host_node,
@@ -1996,23 +3928,40 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             anchor_lock_params,
             comp_xfers,
         ) = self.ongoing_prefetch[req_id]
+        state = operation.storage_prefetch_state
+        query_in_progress = self.synchronize_storage_prefetch_flag(
+            state is StoragePrefetchState.QUERYING
+        )
+        if query_in_progress:
+            self.storage_prefetch_tracker.set(req_id, state)
+            return False
+        if state is StoragePrefetchState.READING:
+            read_in_progress = self.synchronize_storage_prefetch_flag(
+                not operation.worker_done.is_set()
+            )
+            if read_in_progress:
+                self.storage_prefetch_tracker.set(req_id, state)
+                return False
+            self._truncate_prefetch_ownership(req_id, int(operation.completed_tokens))
+        self.storage_prefetch_tracker.set(req_id, state)
         if not self.can_terminate_prefetch(operation):
             return False
-        if operation.host_indices is None:
-            self.cache_controller.terminate_prefetch(operation)
-            self._revoke_pending_prefetch(req_id)
-            return True
 
         completed_tokens, hash_value = self.cache_controller.terminate_prefetch(
             operation
         )
+        ownership = self.storage_prefetch_ownership.get(req_id)
+        if ownership is None or ownership.owned_tokens != completed_tokens:
+            raise RuntimeError(
+                f"HiCache prefetch {req_id} completion disagrees with "
+                "scheduler ownership"
+            )
 
         min_completed_tokens = self._sync_and_check_hybrid_prefetch_result(
             req_id,
             operation,
             completed_tokens,
             hash_value,
-            host_indices,
             last_host_node,
             anchor_lock_params,
             prefetch_key,
@@ -2028,6 +3977,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             host_indices[:min_completed_tokens],
             hash_value[: min_completed_tokens // self.page_size],
         )
+        self._require_storage_prefetch_rank_agreement(
+            "host insertion",
+            {
+                "matched_tokens": insert_result.prefix_len,
+                "has_final_host_node": int(
+                    insert_result.inserted_host_node is not None
+                ),
+            },
+        )
 
         for ct, xfers in comp_xfers.items():
             self.components[ct].commit_hicache_transfer(
@@ -2038,27 +3996,76 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 pool_storage_result=operation.pool_storage_result,
             )
 
-        self.cache_controller.mem_pool_host.free(
-            host_indices[: insert_result.prefix_len]
+        loaded_from_storage = min_completed_tokens - insert_result.prefix_len
+        extra_transfers = [
+            transfer for transfers in comp_xfers.values() for transfer in transfers
+        ]
+        staging_leases = self._l3_staging_leases(
+            host_indices[insert_result.prefix_len : min_completed_tokens],
+            extra_transfers,
+            owner_node=insert_result.inserted_host_node,
         )
-        self.cache_controller.append_host_mem_release(
-            host_indices[min_completed_tokens:completed_tokens]
-        )
+        admission_occupied_tokens = 0
+        hold_staging = False
+        if self.storage_checkpoint_dependency_results.get(req_id) == "ready":
+            final_host_node = insert_result.inserted_host_node
+            if (
+                final_host_node is None
+                and last_host_node is not self.root_node
+                and last_host_node.backuped
+            ):
+                final_host_node = last_host_node
+            if final_host_node is not None:
+                admission_occupied_tokens = loaded_from_storage
+                self.pin_storage_prefetch_admission(
+                    req_id,
+                    final_host_node,
+                    admission_occupied_tokens,
+                    staging_leases,
+                )
+                hold_staging = True
+        if not hold_staging:
+            self._enqueue_staging_leases(staging_leases)
+
+        if insert_result.prefix_len > 0:
+            self.cache_controller.mem_pool_host.free(
+                host_indices[: insert_result.prefix_len]
+            )
+        if min_completed_tokens < completed_tokens:
+            self.cache_controller.mem_pool_host.free(
+                host_indices[min_completed_tokens:completed_tokens]
+            )
+        self.storage_prefetch_ownership.pop(req_id)
         self.dec_host_lock_ref(last_host_node, anchor_lock_params)
         del self.ongoing_prefetch[req_id]
-        self.cache_controller.prefetch_tokens_occupied -= len(prefetch_key)
+        self.storage_state_change_resources.update(_CAPACITY_RETRY_RESOURCES)
+        released_tokens = len(prefetch_key) - admission_occupied_tokens
+        if released_tokens > self.cache_controller.prefetch_tokens_occupied:
+            raise RuntimeError(
+                f"HiCache prefetch {req_id} occupancy accounting underflow"
+            )
+        self.cache_controller.prefetch_tokens_occupied -= released_tokens
 
-        loaded_from_storage = min_completed_tokens - insert_result.prefix_len
         self.prefetch_loaded_tokens_by_reqid[req_id] = loaded_from_storage
-        logger.info(
-            "HiCache prefetch success req=%s completed_local=%d completed_synced=%d matched=%d loaded=%d tail_release=%d occupied=%d",
+        self.storage_prefetch_tracker.set(
             req_id,
+            (
+                StoragePrefetchState.READY
+                if loaded_from_storage > 0
+                else StoragePrefetchState.MISS
+            ),
+        )
+        logger.info(
+            "HiCache durable prefetch req=%s state=%s completed_local=%d "
+            "completed_synced=%d matched=%d loaded=%d occupied=%d staging=%s",
+            req_id,
+            self.storage_prefetch_tracker.get(req_id).name,
             completed_tokens,
             min_completed_tokens,
             insert_result.prefix_len,
             loaded_from_storage,
-            completed_tokens - min_completed_tokens,
             self.cache_controller.prefetch_tokens_occupied,
+            self.cache_controller.l3_staging.usage(),
         )
         if self.enable_storage_metrics and self.storage_metrics_collector is not None:
             self.storage_metrics_collector.log_prefetched_tokens(loaded_from_storage)
@@ -2070,7 +4077,6 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         operation: PrefetchOperation,
         completed_tokens: int,
         hash_value: list[str],
-        host_indices: torch.Tensor,
         last_host_node: UnifiedTreeNode,
         anchor_lock_params: DecLockRefParams,
         prefetch_key: RadixKey,
@@ -2126,16 +4132,19 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             for transfer, count in zip(pool_transfers, pool_hit_pages)
         )
         if pool_transfers and not all_succeeded:
-            # The controller's prefetch IO thread already releases the untransferred
-            # tail (host_indices[completed_tokens:])
-            self.cache_controller.append_host_mem_release(
-                host_indices=host_indices[:completed_tokens],
-                extra_pools=pool_transfers,
-            )
+            self._truncate_prefetch_ownership(req_id, 0)
+            self.storage_prefetch_ownership.pop(req_id)
+            self._release_prefetch_pool_allocations(pool_transfers)
             self.dec_host_lock_ref(last_host_node, anchor_lock_params)
             del self.ongoing_prefetch[req_id]
+            self.storage_state_change_resources.update(_CAPACITY_RETRY_RESOURCES)
+            if len(prefetch_key) > self.cache_controller.prefetch_tokens_occupied:
+                raise RuntimeError(
+                    f"HiCache prefetch {req_id} occupancy accounting underflow"
+                )
             self.cache_controller.prefetch_tokens_occupied -= len(prefetch_key)
             self.prefetch_loaded_tokens_by_reqid[req_id] = 0
+            self.storage_prefetch_tracker.set(req_id, StoragePrefetchState.MISS)
             logger.warning(
                 "HiCache hybrid prefetch discarded req=%s completed=%d requested=%d",
                 req_id,
@@ -2152,37 +4161,28 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         operation.mark_terminate()
 
     def pop_prefetch_loaded_tokens(self, req_id: str) -> int:
+        self.storage_prefetch_tracker.forget(req_id)
         return self.prefetch_loaded_tokens_by_reqid.pop(req_id, 0)
 
     def release_aborted_request(self, rid: str) -> None:
+        checkpoint_handle = make_storage_checkpoint_handle(rid)
+        self.storage_checkpoint_registry.fail_if_present(checkpoint_handle)
+        self._release_storage_checkpoint(checkpoint_handle, release_staging=True)
+        self.release_storage_prefetch_admission(rid)
         self.prefetch_loaded_tokens_by_reqid.pop(rid, None)
+        self.storage_checkpoint_dependency_results.pop(rid, None)
         if rid not in self.ongoing_prefetch:
+            self.storage_prefetch_tracker.forget(rid)
             return
+        self.ongoing_prefetch[rid].operation.mark_terminate()
+        self.storage_prefetch_aborted_requests.add(rid)
 
-        (
-            last_host_node,
-            prefetch_key,
-            host_indices,
-            operation,
-            anchor_lock_params,
-            comp_xfers,
-        ) = self.ongoing_prefetch[rid]
-        if operation.host_indices is None:
-            self.cache_controller.terminate_prefetch(operation)
-            self._revoke_pending_prefetch(rid)
-            return
-
-        completed_tokens, _ = self.cache_controller.terminate_prefetch(operation)
-        self._barrier_attn_groups()
-        self.dec_host_lock_ref(last_host_node, anchor_lock_params)
-        del self.ongoing_prefetch[rid]
-        self.cache_controller.append_host_mem_release(
-            host_indices=host_indices[:completed_tokens],
-            extra_pools=[x for xfers in comp_xfers.values() for x in xfers],
-        )
-        self.cache_controller.prefetch_tokens_occupied -= len(prefetch_key)
-
-    def _revoke_pending_prefetch(self, req_id: str) -> None:
+    def _revoke_pending_prefetch(
+        self,
+        req_id: str,
+        state: StoragePrefetchState = StoragePrefetchState.MISS,
+    ) -> None:
+        was_aborted = req_id in self.storage_prefetch_aborted_requests
         info = self.ongoing_prefetch.pop(req_id, None)
         if info is None:
             return
@@ -2195,13 +4195,78 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             comp_xfers,
         ) = info
         cc = self.cache_controller
-        cc.append_host_mem_release(
-            extra_pools=[x for xfers in comp_xfers.values() for x in xfers]
-        )
+        self._truncate_prefetch_ownership(req_id, 0)
+        self.storage_prefetch_ownership.pop(req_id)
+        self._release_prefetch_aux_allocations(comp_xfers)
         self.dec_host_lock_ref(last_host_node, anchor_lock_params)
+        self.storage_state_change_resources.update(_CAPACITY_RETRY_RESOURCES)
         cc.prefetch_tokens_occupied = max(
             0, cc.prefetch_tokens_occupied - len(prefetch_key)
         )
+        self.storage_prefetch_aborted_requests.discard(req_id)
+        if was_aborted:
+            self.storage_prefetch_tracker.forget(req_id)
+        else:
+            self.storage_prefetch_tracker.set(req_id, state)
+
+    def _cleanup_aborted_prefetches(self) -> None:
+        aborted = sorted(self.storage_prefetch_aborted_requests)
+        for index in range(_ABORTED_PREFETCH_CLEANUP_QUANTUM):
+            request_id = aborted[index] if index < len(aborted) else None
+            digest = hashlib.sha256((request_id or "").encode()).digest()
+            self._require_storage_prefetch_rank_agreement(
+                "aborted prefetch cleanup",
+                {
+                    "present": int(request_id is not None),
+                    "request_id_0": int.from_bytes(digest[:4], "big") & 0x7FFFFFFF,
+                    "request_id_1": int.from_bytes(digest[4:8], "big") & 0x7FFFFFFF,
+                },
+            )
+            if request_id is None:
+                return
+            info = self.ongoing_prefetch.get(request_id)
+            if info is None:
+                self.storage_prefetch_aborted_requests.discard(request_id)
+                continue
+            operation = info.operation
+            if operation.storage_prefetch_state is StoragePrefetchState.QUERYING:
+                continue
+            if (
+                operation.storage_prefetch_state is StoragePrefetchState.READING
+                and self.synchronize_storage_prefetch_flag(
+                    not operation.worker_done.is_set()
+                )
+            ):
+                continue
+            self._revoke_pending_prefetch(request_id, StoragePrefetchState.FAILED)
+
+    @staticmethod
+    def _backup_sequence_fingerprint(operations: Sequence[Any]) -> dict[str, int]:
+        digest = hashlib.sha256()
+        for operation in operations:
+            digest.update(int(operation.id).to_bytes(8, "big", signed=True))
+            for value in tuple(operation.hash_value or ()):
+                encoded = value.encode()
+                digest.update(len(encoded).to_bytes(8, "big"))
+                digest.update(encoded)
+            for transfer in getattr(operation, "pool_transfers", None) or ():
+                encoded_name = str(transfer.name).encode()
+                digest.update(len(encoded_name).to_bytes(8, "big"))
+                digest.update(encoded_name)
+                for value in tuple(transfer.keys or ()):
+                    encoded = value.encode()
+                    digest.update(len(encoded).to_bytes(8, "big"))
+                    digest.update(encoded)
+        return {
+            "count": len(operations),
+            **{
+                f"digest_{index}": int.from_bytes(
+                    digest.digest()[offset : offset + 4], "big"
+                )
+                & 0x7FFFFFFF
+                for index, offset in enumerate(range(0, digest.digest_size, 4))
+            },
+        }
 
     def _drain_storage_control_queues_impl(
         self,
@@ -2224,56 +4289,80 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 drained += 1
                 yield item
 
-        def _drain_revoke():
-            for req_id in _drain_queue(cc.prefetch_revoke_queue, n_revoke):
-                self._revoke_pending_prefetch(req_id)
+        changed_resources = set(self.storage_state_change_resources)
+        self.storage_state_change_resources.clear()
 
-        def _drain_and_alloc_storage_hit():
-            for operation in _drain_queue(cc.prefetch_hit_queue, n_storage_hit):
-                req_id = operation.request_id
-                info = self.ongoing_prefetch.get(req_id)
-                if info is None:
-                    # request already aborted/cleaned up, skip
-                    continue
-                if operation.is_terminated():
-                    # request was aborted while the storage query was in flight
-                    self._revoke_pending_prefetch(req_id)
-                    continue
+        transitions = list(_drain_queue(cc.prefetch_revoke_queue, n_revoke))
+        for transition in transitions:
+            if not isinstance(transition, PrefetchOwnershipTransition):
+                raise RuntimeError(
+                    "Unified HiCache received a legacy prefetch transition"
+                )
+            self._apply_prefetch_ownership_transition(transition)
+        if transitions:
+            changed_resources.update(
+                {
+                    CheckpointRetryResource.HOST,
+                    CheckpointRetryResource.AUXILIARY,
+                }
+            )
 
-                alloc_len = operation.storage_hit_count
-                host_indices = cc.mem_pool_host.alloc(alloc_len)
-                if host_indices is None:
-                    self.evict_host(alloc_len)
-                    host_indices = cc.mem_pool_host.alloc(alloc_len)
-                if host_indices is None:
-                    # Memory-pressure fallback: a shorter page-aligned prefix.
-                    available_size = cc.mem_pool_host.available_size()
-                    alloc_len = min(
-                        operation.storage_hit_count,
-                        available_size - (available_size % self.page_size),
+        if self.synchronize_storage_prefetch_flag(
+            bool(self.storage_prefetch_aborted_requests)
+        ):
+            self._cleanup_aborted_prefetches()
+
+        operations = list(_drain_queue(cc.ack_backup_queue, n_backup))
+        if operations:
+            self._require_storage_prefetch_rank_agreement(
+                "storage backup completion sequence",
+                self._backup_sequence_fingerprint(operations),
+            )
+            changed_resources.update(CheckpointRetryResource)
+            durable_pages = torch.tensor(
+                [
+                    operation.durable_page_count(
+                        self.page_size, backup_skip=cc.backup_skip
                     )
-                    if alloc_len >= self.prefetch_threshold:
-                        host_indices = cc.mem_pool_host.alloc(alloc_len)
-                if host_indices is None:
-                    self._revoke_pending_prefetch(req_id)
-                    continue
-
-                operation.storage_hit_count = alloc_len
-                operation.hash_value = operation.hash_value[
-                    : alloc_len // self.page_size
-                ]
-                operation.host_indices = host_indices
-                self.ongoing_prefetch[req_id] = info._replace(host_indices=host_indices)
-                cc.prefetch_buffer.put(operation)
-
-        def _drain_backup():
-            drained = 0
-            for operation in _drain_queue(cc.ack_backup_queue, n_backup):
-                drained += 1
+                    for operation in operations
+                ],
+                dtype=torch.int,
+            )
+            self._all_reduce_attn_groups(durable_pages, torch.distributed.ReduceOp.MIN)
+            for operation, durable_page_count in zip(
+                operations, durable_pages.tolist(), strict=True
+            ):
+                completion = cc.storage_write_tracker.complete(
+                    operation.id, int(durable_page_count)
+                )
+                if completion is not None:
+                    self.storage_checkpoint_registry.record_write_completion(
+                        completion, cc.storage_write_tracker.has_pending
+                    )
+                checkpoint_owner = self.storage_checkpoint_owners_by_operation.pop(
+                    operation.id, None
+                )
+                if checkpoint_owner is not None:
+                    checkpoint = self.storage_pending_checkpoints.get(
+                        checkpoint_owner[0]
+                    )
+                    if (
+                        checkpoint is not None
+                        and checkpoint.generation == checkpoint_owner[1]
+                    ):
+                        checkpoint.active_operation_ids.discard(operation.id)
                 entry = self.ongoing_backup.pop(operation.id, None)
+                owner_node = entry[0] if entry is not None else None
                 if entry is not None:
                     node, lock_params = entry
                     self.dec_host_lock_ref(node, lock_params)
+                self._enqueue_staging_leases(
+                    self._l3_staging_leases(
+                        operation.host_indices,
+                        getattr(operation, "pool_transfers", None),
+                        owner_node=owner_node,
+                    )
+                )
                 if (
                     log_metrics
                     and self.enable_storage_metrics
@@ -2282,43 +4371,52 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     self.storage_metrics_collector.log_backuped_tokens(
                         operation.completed_tokens
                     )
-            return drained
 
-        def _drain_release():
-            host_indices_list = []
-            released_tokens = 0
-            for host_indices in _drain_queue(cc.host_mem_release_queue, n_release):
-                host_indices_list.append(host_indices)
-                released_tokens += len(host_indices)
-            if host_indices_list:
-                cc.mem_pool_host.free(torch.cat(host_indices_list, dim=0))
-            return len(host_indices_list), released_tokens
+        host_indices_list = list(_drain_queue(cc.host_mem_release_queue, n_release))
+        if host_indices_list:
+            cc.mem_pool_host.free(torch.cat(host_indices_list, dim=0))
+            changed_resources.add(CheckpointRetryResource.HOST)
 
-        def _drain_extra_release():
-            drained: dict[PoolName, tuple[int, int]] = {}
-            if not extra_release_counts:
-                return drained
+        if extra_release_counts:
             for pool_name, limit in extra_release_counts.items():
                 release_queue = cc.extra_host_mem_release_queues.get(pool_name)
                 if release_queue is None:
                     continue
-                host_indices_list = []
-                released_tokens = 0
-                for host_indices in _drain_queue(release_queue, limit):
-                    host_indices_list.append(host_indices)
-                    released_tokens += len(host_indices)
-                if host_indices_list:
-                    entry = cc.mem_pool_host.entry_map.get(pool_name)
-                    if entry is not None:
-                        entry.host_pool.free(torch.cat(host_indices_list, dim=0))
-                drained[pool_name] = (len(host_indices_list), released_tokens)
-            return drained
+                indices = list(_drain_queue(release_queue, limit))
+                if not indices:
+                    continue
+                entry = cc.mem_pool_host.entry_map.get(pool_name)
+                if entry is not None:
+                    entry.host_pool.free(torch.cat(indices, dim=0))
+                    changed_resources.add(CheckpointRetryResource.AUXILIARY)
 
-        _drain_revoke()
-        _drain_and_alloc_storage_hit()
-        _drain_backup()
-        _drain_release()
-        _drain_extra_release()
+        changed_resources.update(self.storage_state_change_resources)
+        self.storage_state_change_resources.clear()
+        staging_generation = int(
+            getattr(getattr(cc, "l3_staging", None), "generation", 0)
+        )
+        if staging_generation != getattr(
+            self, "l3_staging_generation_seen", staging_generation
+        ):
+            changed_resources.update(_CAPACITY_RETRY_RESOURCES)
+        changed_resources = self._synchronize_storage_state_change_resources(
+            changed_resources
+        )
+        if changed_resources.intersection(_CAPACITY_RETRY_RESOURCES):
+            self.l3_staging_reclaim_eligible = len(self.l3_staging_pending_leases)
+        if changed_resources.intersection(
+            _CAPACITY_RETRY_RESOURCES | {CheckpointRetryResource.SCHEDULER}
+        ):
+            self._reclaim_l3_staging_headroom()
+            changed_resources.update(self.storage_state_change_resources)
+            self.storage_state_change_resources.clear()
+            changed_resources = self._synchronize_storage_state_change_resources(
+                changed_resources
+            )
+        self._drive_storage_checkpoint_retries(changed_resources)
+        self.l3_staging_generation_seen = int(
+            getattr(getattr(cc, "l3_staging", None), "generation", 0)
+        )
 
     def drain_storage_control_queues(self) -> None:
         cc = self.cache_controller
@@ -2439,6 +4537,25 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             logger.error("Failed to clear hierarchical cache storage backend: %s", e)
             return False
         if ok:
+            for handle in tuple(self.storage_pending_checkpoints):
+                self.storage_checkpoint_registry.fail(handle)
+                self._release_storage_checkpoint(handle, release_staging=True)
+            request_ids = set(self.storage_prefetch_admission_host_locks)
+            request_ids.update(self.storage_prefetch_admission_device_locks)
+            for request_id in request_ids:
+                self.release_storage_prefetch_admission(request_id)
+            self._reclaim_l3_staging_headroom()
+            self.cache_controller.storage_write_tracker.clear()
+            self.storage_checkpoint_registry.clear()
+            self.storage_checkpoint_retries.clear()
+            self.storage_checkpoint_owners_by_operation.clear()
+            self.storage_checkpoint_dependency_results.clear()
+            self.storage_state_change_resources.intersection_update(
+                _CAPACITY_RETRY_RESOURCES | {CheckpointRetryResource.SCHEDULER}
+            )
+            self.l3_staging_generation_seen = (
+                self.cache_controller.l3_staging.generation
+            )
             logger.info("Hierarchical cache storage backend cleared successfully!")
         return ok
 
@@ -2474,6 +4591,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         finish_count_tensor = torch.tensor(finish_count, dtype=torch.int, device="cpu")
         self._all_reduce(finish_count_tensor, torch.distributed.ReduceOp.MIN)
         finish_count = finish_count_tensor.item()
+        had_completions = finish_count > 0
 
         # Process completed acks
         while finish_count > 0:
@@ -2482,6 +4600,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             for ack_id in ack.node_ids:
                 self._finish_write_through_ack(ack_id)
             finish_count -= 1
+        if had_completions:
+            self.storage_state_change_resources.update(
+                {
+                    CheckpointRetryResource.HOST,
+                    CheckpointRetryResource.AUXILIARY,
+                    CheckpointRetryResource.STORAGE,
+                }
+            )
 
     def loading_check(self) -> None:
         """Poll load-back completions."""
@@ -2499,6 +4625,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         finish_count_tensor = torch.tensor(finish_count, dtype=torch.int, device="cpu")
         self._all_reduce(finish_count_tensor, torch.distributed.ReduceOp.MIN)
         finish_count = finish_count_tensor.item()
+        had_completions = finish_count > 0
 
         while finish_count > 0:
             ack = cc.ack_load_queue.pop(0)
@@ -2516,6 +4643,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                         duration_ms / 1000.0
                     )
             finish_count -= 1
+        if had_completions:
+            self.storage_state_change_resources.update(_CAPACITY_RETRY_RESOURCES)
 
     # ---- HiCache: Scheduler Entry Points ----
 
@@ -2880,6 +5009,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 E(f"H-leaf extra: {[n.id for n in list(extra)[:5]]}")
             if missing:
                 E(f"H-leaf missing: {[n.id for n in list(missing)[:5]]}")
+        queued_hst_leaves = set(self.evictable_host_scan_queue)
+        if queued_hst_leaves != expected_hst_leaves:
+            extra = queued_hst_leaves - expected_hst_leaves
+            missing = expected_hst_leaves - queued_hst_leaves
+            if extra:
+                E(f"H-leaf scan queue extra: {[n.id for n in list(extra)[:5]]}")
+            if missing:
+                E(f"H-leaf scan queue missing: {[n.id for n in list(missing)[:5]]}")
 
         # D-leaf ∩ H-leaf = ∅
         overlap = self.evictable_device_leaves & self.evictable_host_leaves

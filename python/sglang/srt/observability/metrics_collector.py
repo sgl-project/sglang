@@ -236,7 +236,6 @@ class SchedulerMetricsCollectorContext:
 
 
 class SchedulerMetricsCollector(_StatLoggerDIMixin):
-
     def __init__(
         self,
         labels: Dict[str, str],
@@ -1769,6 +1768,19 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
         )
 
+        self.storage_checkpoint_dependency_counters = {
+            result: Counter(
+                name=f"sglang:storage_checkpoint_dependency_{result}_total",
+                documentation=(
+                    f"Number of rollout checkpoint dependencies resolved as {result}."
+                ),
+                labelnames=labels.keys(),
+            )
+            for result in ("ready", "failed", "timeout")
+        }
+        for counter in self.storage_checkpoint_dependency_counters.values():
+            counter.labels(**labels).inc(0)
+
         bucket_io = [
             1,
             5,
@@ -1822,6 +1834,12 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
     def log_backuped_tokens(self, backuped_tokens: int):
         if backuped_tokens > 0:
             self.backuped_tokens_total.labels(**self.labels).inc(backuped_tokens)
+
+    def log_storage_checkpoint_dependency(self, result: str) -> None:
+        counter = self.storage_checkpoint_dependency_counters.get(result)
+        if counter is None:
+            raise ValueError(f"Unknown storage checkpoint result: {result}")
+        counter.labels(**self.labels).inc()
 
     def _log_histogram(self, histogram, data: Union[int, float]):
         histogram.labels(**self.labels).observe(data)

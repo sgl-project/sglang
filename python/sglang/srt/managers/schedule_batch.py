@@ -92,6 +92,10 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.storage_prefetch import (
+    StoragePrefetchState,
+    make_storage_checkpoint_handle,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.observability.metrics_collector import (
     DPCooperationInfo,
@@ -750,6 +754,8 @@ class Req(ReqDllmMixin):
         priority: Optional[int] = None,
         metrics_collector: Optional[SchedulerMetricsCollector] = None,
         extra_key: Optional[str] = None,
+        storage_checkpoint: bool = False,
+        storage_checkpoint_dependency: Optional[str] = None,
         routing_key: Optional[str] = None,
         dimensions: Optional[int] = None,
         http_worker_ipc: Optional[str] = None,
@@ -828,6 +834,11 @@ class Req(ReqDllmMixin):
             ) + lora_id  # lora_id is concatenated to the extra key
 
         self.extra_key = extra_key
+        self.storage_checkpoint = storage_checkpoint
+        self.storage_checkpoint_handle = (
+            make_storage_checkpoint_handle(rid) if storage_checkpoint else None
+        )
+        self.storage_checkpoint_dependency = storage_checkpoint_dependency
         self.lora_id = lora_id
         self.routing_key = routing_key
 
@@ -905,6 +916,10 @@ class Req(ReqDllmMixin):
         self.num_matched_prefix_tokens = 0
         # Tokens loaded from storage backend (L3) during prefetch for this request
         self.storage_hit_length = 0
+        self.storage_prefetch_state = StoragePrefetchState.NOT_ATTEMPTED
+        self.storage_prefetch_deadline: Optional[float] = None
+        self.storage_prefetch_local_match = False
+        self.storage_checkpoint_reserved = False
         # The node to lock until for swa radix tree lock ref
         self.swa_uuid_for_lock: Optional[int] = None
         # Whether the prefill-time SWA tree lock has been released early

@@ -174,6 +174,86 @@ python3 -m sglang.launch_server \
   --hicache-storage-prefetch-policy timeout
 ```
 
+## Durable checkpoints for multi-turn RL rollouts
+
+Use a storage checkpoint when turn N+1 can arrive before turn N's asynchronous
+L3 write finishes. This mode forces the page-aligned KV prefix of turn N through
+an isolated host staging reserve to L3, then lets turn N+1 wait for the
+corresponding storage acknowledgements instead of observing a transient miss.
+
+You need `--enable-hierarchical-cache` and an L3 storage backend. Use the native
+`/generate` API:
+
+Reserve host-cache headroom for checkpoint writes and dependent-request
+prefetches before starting the server:
+
+```bash Command
+export SGLANG_HICACHE_L3_STAGING_RESERVE_RATIO=0.2
+```
+
+This physically partitions 20% of each participating host cache plane for L3
+traffic. Ordinary L2 allocations cannot consume the reserve. After an L3
+operation completes, SGLang promotes the resident pages into ordinary L2 by
+swapping allocator ownership with free L2 slots; the KV data itself is not
+copied. If ordinary L2 is full, SGLang can instead discard a completed staging
+replica after no in-flight L3 operation needs it, but only when the same data
+remains available on GPU. Successful checkpoints are durable in L3 before this
+handoff. Reclamation and eviction scans are bounded per scheduler tick. The
+default is `0` for compatibility. Values must be in `[0, 1)`; use `0.1` to
+`0.2` as a starting point and account for the corresponding reduction in
+ordinary L2 capacity.
+
+<Warning>
+  Storage checkpoints currently require unified serving and do not support
+  session-based requests. They are rejected in prefill/decode-disaggregated
+  deployments because the two scheduler processes do not share checkpoint
+  state.
+</Warning>
+
+```python Example
+import requests
+
+url = "http://HOST:PORT/generate"
+turn_n_input_ids = [1001, 1002, 1003]
+
+turn_n = requests.post(
+    url,
+    json={
+        "rid": "rollout-123-turn-0",
+        "input_ids": turn_n_input_ids,
+        "sampling_params": {"max_new_tokens": 128},
+        "storage_checkpoint": True,
+    },
+).json()
+checkpoint = turn_n["meta_info"]["storage_checkpoint_handle"]
+turn_n_plus_1_input_ids = turn_n_input_ids + turn_n["output_ids"] + [1004, 1005]
+
+turn_n_plus_1 = requests.post(
+    url,
+    json={
+        "rid": "rollout-123-turn-1",
+        "input_ids": turn_n_plus_1_input_ids,
+        "sampling_params": {"max_new_tokens": 128},
+        "storage_checkpoint_dependency": checkpoint,
+    },
+).json()
+```
+
+`storage_checkpoint_dependency` synchronizes durability; it does not replace the
+request's token prefix. The dependent request waits while the checkpoint is
+pending. If the checkpoint fails or the configured prefetch deadline expires,
+SGLang recomputes the missing KV instead of failing generation.
+
+Checkpoint handles are local to the serving replica. With `dp > 1`, route all
+turns of one rollout to the same DP replica outside SGLang. The response's
+`meta_info.dp_rank` identifies that replica. Do not place the rollout ID in
+`extra_key`, because `extra_key` changes the radix-cache namespace and prevents
+an unnamespaced L3 prefix from matching. Do not carry checkpoint handles across
+a model-weight update or cache flush.
+
+The `file` backend is suitable for validating checkpoint correctness. Use a
+production backend such as NIXL, Mooncake, or HF3FS for performance testing.
+
 
 ## Custom Storage Backend Integration
 
