@@ -4,7 +4,7 @@ from typing import Optional, Type
 import pytest
 import torch
 
-from sglang.jit_kernel.fp8_blockwise_gemm import fp8_blockwise_scaled_mm
+from sglang.kernels.ops.gemm.fp8_blockwise_gemm import fp8_blockwise_scaled_mm
 from sglang.srt.utils import is_sm120_supported
 from sglang.test.ci.ci_register import register_cuda_ci
 

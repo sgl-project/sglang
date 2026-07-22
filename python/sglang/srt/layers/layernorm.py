@@ -31,7 +31,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     check_cuda_graph_backend,
 )
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -130,10 +130,12 @@ if _is_cuda:
     # BEFORE the weight multiply, so the multiply is done in the narrow dtype.
     _jit_rmsnorm_hf_available = False
     try:
-        from sglang.jit_kernel.rmsnorm_hf import (
+        from sglang.kernels.ops.layernorm.rmsnorm_hf import (
             is_supported_rmsnorm_hf_hidden_size,
         )
-        from sglang.jit_kernel.rmsnorm_hf import rmsnorm_hf as _jit_rmsnorm_hf
+        from sglang.kernels.ops.layernorm.rmsnorm_hf import (
+            rmsnorm_hf as _jit_rmsnorm_hf,
+        )
 
         _jit_rmsnorm_hf_available = True
     except ImportError:
@@ -144,9 +146,7 @@ if _is_cuda:
         _jit_rmsnorm_hf = None
 
     from sglang.jit_kernel.norm import fused_add_rmsnorm as _jit_fused_add_rmsnorm
-    from sglang.jit_kernel.norm import (
-        is_supported_jit_fused_add_rmsnorm_hidden_size,
-    )
+    from sglang.jit_kernel.norm import is_supported_jit_fused_add_rmsnorm_hidden_size
 
 
 logger = logging.getLogger(__name__)
@@ -206,7 +206,7 @@ def _forward_with_allreduce_fusion(
                     return fused_result
 
             # For AITER route, preserve correctness when fused path is unavailable.
-            if _use_aiter and get_server_args().enable_aiter_allreduce_fusion:
+            if _use_aiter and get_exec().comm.enable_aiter_allreduce_fusion:
                 x = tensor_model_parallel_all_reduce(x)
                 return norm_module.forward(x, residual, None)
 
@@ -284,7 +284,7 @@ class RMSNorm(MultiPlatformOp):
             if (
                 residual is not None
                 or self.cast_x_before_out_mul
-                or get_server_args().rl_on_policy_target == "fsdp"
+                or get_exec().deterministic.rl_on_policy_target == "fsdp"
             ):
                 return self.forward_native(x, residual, post_residual_addition)
             out = rms_norm_batch_invariant(
@@ -391,7 +391,7 @@ class RMSNorm(MultiPlatformOp):
             if (
                 residual is not None
                 or self.cast_x_before_out_mul
-                or get_server_args().rl_on_policy_target == "fsdp"
+                or get_exec().deterministic.rl_on_policy_target == "fsdp"
                 or (self._fused_pad_kernel is not None and self.x_pad_to_multiple > 0)
             ):
                 return self.forward_native(x, residual, post_residual_addition)
@@ -452,7 +452,7 @@ class RMSNorm(MultiPlatformOp):
             if (
                 residual is not None
                 or self.cast_x_before_out_mul
-                or get_server_args().rl_on_policy_target == "fsdp"
+                or get_exec().deterministic.rl_on_policy_target == "fsdp"
             ):
                 return self.forward_native(x, residual, post_residual_addition)
             return rms_norm_batch_invariant(
@@ -579,7 +579,10 @@ class RMSNorm(MultiPlatformOp):
         if self.variance_size_override is not None:
             return self.forward_native(x, residual, post_residual_addition)
         if is_batch_invariant_mode_enabled():
-            if residual is not None or get_server_args().rl_on_policy_target == "fsdp":
+            if (
+                residual is not None
+                or get_exec().deterministic.rl_on_policy_target == "fsdp"
+            ):
                 return self.forward_native(x, residual, post_residual_addition)
             return rms_norm_batch_invariant(
                 x,
