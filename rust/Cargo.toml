@@ -23,9 +23,9 @@ uuid = { version = "1", features = ["v4"] }
 # Profiles only take effect at the workspace root; per-member profile sections
 # are ignored by cargo. Per-package tweaks live in the override tables below.
 [profile.release]
-lto = "thin"
+lto = true
 strip = true
-opt-level = 2
+opt-level = 3
 codegen-units = 1
 
 [profile.dev]
