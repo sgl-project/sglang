@@ -2369,6 +2369,96 @@ class TestQwen3CoderDetector(unittest.TestCase):
         self.assertTrue(full_text.startswith("Let me"))
         self.assertGreater(len(all_calls), 0)
 
+    def test_streaming_string_parameter_value_incremental(self):
+        """
+        Test that string parameter values are emitted before </parameter>.
+
+        Scenario: A string parameter value is fed in multiple chunks.
+        Purpose: Verify Qwen3CoderDetector streams argument text incrementally.
+        """
+        chunks = [
+            "<tool_call>",
+            "<function=sql_interpreter>",
+            "<parameter=query>",
+            "SELECT ",
+            "* FROM ",
+            "users",
+            "</parameter>",
+            "</function>",
+            "</tool_call>",
+        ]
+
+        detector = Qwen3CoderDetector()
+        collected_params = ""
+        saw_value_before_end = False
+
+        for chunk in chunks:
+            result = detector.parse_streaming_increment(chunk, self.tools)
+            for call in result.calls:
+                if call.parameters:
+                    collected_params += call.parameters
+            if chunk == "SELECT " and "SELECT " in collected_params:
+                saw_value_before_end = True
+
+        self.assertTrue(saw_value_before_end)
+        params = json.loads(collected_params)
+        self.assertEqual(params["query"], "SELECT * FROM users")
+
+    def test_streaming_complete_string_parameter_uses_natural_chunk(self):
+        """
+        Test that complete string parameters are emitted as valid argument deltas.
+
+        Scenario: A full string parameter arrives in one chunk.
+        Purpose: Verify the parser does not force artificial character splitting.
+        """
+        text = (
+            "<tool_call>"
+            "<function=get_current_weather>"
+            "<parameter=location>Boston</parameter>"
+            "</function>"
+            "</tool_call>"
+        )
+
+        detector = Qwen3CoderDetector()
+        result = detector.parse_streaming_increment(text, self.tools)
+        param_fragments = [call.parameters for call in result.calls if call.parameters]
+
+        self.assertIn('{"location": "', "".join(param_fragments))
+        self.assertIn("Boston", param_fragments)
+        self.assertNotIn('"location": "Boston"', param_fragments)
+
+        params = json.loads("".join(param_fragments))
+        self.assertEqual(params["location"], "Boston")
+
+    def test_streaming_string_parameter_trims_formatting_newline(self):
+        """
+        Test that a formatting newline before </parameter> is not emitted.
+
+        Scenario: The final value chunk ends with a newline before the closing tag.
+        Purpose: Match non-streaming cleanup behavior for string parameters.
+        """
+        chunks = [
+            "<tool_call>",
+            "<function=get_current_weather>",
+            "<parameter=location>",
+            "Boston\n",
+            "</parameter>",
+            "</function>",
+            "</tool_call>",
+        ]
+
+        detector = Qwen3CoderDetector()
+        collected_params = ""
+
+        for chunk in chunks:
+            result = detector.parse_streaming_increment(chunk, self.tools)
+            for call in result.calls:
+                if call.parameters:
+                    collected_params += call.parameters
+
+        params = json.loads(collected_params)
+        self.assertEqual(params["location"], "Boston")
+
     # ==================== Parameter Type Tests ====================
 
     def test_integer_parameter_conversion(self):
