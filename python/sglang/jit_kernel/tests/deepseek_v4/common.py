@@ -5,7 +5,10 @@ from typing import List, Literal, Optional, Tuple
 
 import torch
 
-from sglang.jit_kernel.dsv4 import CompressorDecodePlan, CompressorPrefillPlan
+from sglang.kernels.ops.attention.dsv4 import (
+    CompressorDecodePlan,
+    CompressorPrefillPlan,
+)
 from sglang.srt.utils import get_device
 
 

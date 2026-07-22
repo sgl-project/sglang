@@ -1820,12 +1820,16 @@ def suppress_noisy_warnings():
     cutlass_dsl_noisy = {
         (
             DeprecationWarning,
-            "Use explicit `struct.scalar.ptr` for pointer instead.",
+            "Using `struct.scalar` as pointer is deprecated.",
         ),
         (
             UserWarning,
             "NamedBarrier wait also arrives on the barrier. "
             "Routing call to NamedBarrier.arrive_and_wait().",
+        ),
+        (
+            DeprecationWarning,
+            "builtin type swigvarlink has no __module__ attribute",
         ),
     }
     for cat, msg in cutlass_dsl_noisy:
@@ -1907,7 +1911,7 @@ def check_pkg_version_at_least(pkg: str, min_version: str) -> bool:
 
     Args:
         pkg: Package name (distribution name, e.g., "flashinfer-python")
-        min_version: Minimum version required (e.g., "0.6.14")
+        min_version: Minimum version required (e.g., "0.6.15.post1")
 
     Returns:
         True if package is installed and version >= min_version, False otherwise
@@ -4059,6 +4063,9 @@ SUPPORTED_LORA_TARGET_MODULES = [
     "gate_up_proj",
     "embed_tokens",
     "lm_head",
+    # Inkling attention projections (merged q/k/v/r and its row-parallel output).
+    "qkvr",
+    "wo_ud",
 ]
 
 LORA_TARGET_ALL_MODULES = "all"
