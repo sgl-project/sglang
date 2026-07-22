@@ -259,6 +259,7 @@ class MlxAuxiliaryStateReqToTokenPool(ReqToTokenPool):
                 self.auxiliary_state_pool.free(track_buffer)
             req.mamba_ping_pong_track_buffer = None
             req.mamba_next_track_idx = None
+            req.mamba_last_track_idx = None
 
     def free_auxiliary_state_cache(self, req, track_buffer_to_keep=None):
         self.free_mamba_cache(
@@ -362,6 +363,7 @@ class MlxAuxiliaryStateComponent(MambaComponent):
                     self.cache.req_to_token_pool.auxiliary_state_pool.free(track_buffer)
                 req.mamba_ping_pong_track_buffer = None
                 req.mamba_next_track_idx = None
+                req.mamba_last_track_idx = None
             req.mamba_last_track_seqlen = None
             return
 
@@ -386,5 +388,6 @@ class MlxAuxiliaryStateComponent(MambaComponent):
                 self.cache.req_to_token_pool.auxiliary_state_pool.free(track_buffer)
                 req.mamba_ping_pong_track_buffer = None
                 req.mamba_next_track_idx = None
+                req.mamba_last_track_idx = None
             req.mamba_pool_idx = None
         req.mamba_last_track_seqlen = None

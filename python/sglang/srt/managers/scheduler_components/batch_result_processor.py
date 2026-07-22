@@ -947,6 +947,10 @@ class SchedulerBatchResultProcessor:
         if lazy:
             self.mamba_lazy_post_decode_at_boundary(req, batch, i)
         else:
+            # The boundary forward wrote buf[next]; commit it as the
+            # consumable slot, then advance the write pointer to the other
+            # (always-allocated) slot.
+            req.mamba_last_track_idx = req.mamba_next_track_idx
             req.mamba_next_track_idx = (
                 batch.req_to_token_pool.get_mamba_ping_pong_other_idx(
                     req.mamba_next_track_idx
@@ -956,13 +960,15 @@ class SchedulerBatchResultProcessor:
     def _mamba_check_track_boundary(self, req, batch, result, i):
         """Check if this decode step crosses a mamba track interval boundary.
 
-        Returns (at_boundary, track_seqlen).  The boundary condition
-        matches what the forward's tracking mask used:
-        ``prepare_for_decode`` increments both ``seq_lens_cpu`` and
-        ``kv_committed_len`` by 1, then checks
-        ``seq_lens_cpu % interval == 0``.  Using ``kv_committed_len``
-        here reproduces that check exactly, and the value is always a
-        multiple of ``interval`` (hence page-aligned).
+        Returns (at_boundary, track_seqlen).  The boundary condition must
+        match what this batch's forward used for its tracking mask, so it
+        reads ``batch.seq_lens_cpu[i]`` — the same per-batch snapshot
+        ``prepare_for_decode`` built the mask from.  It must NOT read
+        ``req.kv_committed_len``: that is shared mutable state which, under
+        overlap scheduling, the next batch's ``prepare_for_decode`` has
+        already advanced by the time this result is processed — firing the
+        boundary bookkeeping one batch early.  The returned track_seqlen is
+        always a multiple of ``interval`` (hence page-aligned).
 
         For spec decode, the boundary is detected by comparing the
         accepted seq_len range against interval boundaries.
