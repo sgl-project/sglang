@@ -15,7 +15,7 @@
 a pluggable backend.
 
 Backend selection comes from cuda_graph_config.decode:
-  - "full"      — default, FullCudaGraphBackend: one
+  - "full"      — default, FullCu`daGraphBackend: one
                       torch.cuda.CUDAGraph per shape.
   - "breakable" — experimental, BreakableCudaGraphBackend:
                       segmented capture (no torch.compile).
@@ -99,6 +99,7 @@ from sglang.srt.utils import (
     require_attn_tp_gather,
     require_mlp_tp_gather,
 )
+from sglang.srt.utils.kernel_shape_profiler import disable, enable, is_enabled
 from sglang.srt.utils.profile_utils import export_cuda_graph_capture_trace
 
 try:
@@ -226,6 +227,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.enable_profile_cuda_graph = (
             model_runner.server_args.enable_profile_cuda_graph
         )
+        self.enable_shape_discovery_for_cuda_graph_profile = (
+            model_runner.server_args.enable_shape_discovery_for_cuda_graph_profile
+        )
+        self.enable_pdmux = model_runner.server_args.enable_pdmux
 
         self.attn_tp_size = get_parallel().attn_tp_size
         self.attn_tp_rank = get_parallel().attn_tp_rank
@@ -653,6 +658,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             + "\n\nMemory Usage is saved to cuda_graph_runner_memory_usage.pickle\n"
         )
         logger.info(log_message)
+        if self.enable_shape_discovery_for_cuda_graph_profile:
+            disable()
 
         # Optionally persist the shaped capture trace (record_shapes=True) for
         # offline per-kernel analysis -- opt-in via
@@ -1004,11 +1011,25 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     stream_idx,
                     variant_label,
                 )
-                post_warmup_hook = getattr(
+                base_post_warmup_hook = getattr(
                     self.model_runner.attn_backend,
                     "on_after_cuda_graph_warmup",
                     None,
                 )
+
+                def post_warmup_hook():
+                    if base_post_warmup_hook is not None:
+                        base_post_warmup_hook()
+                    # Activate the kernel shape profiler AFTER warmup runs so
+                    # that lazily-imported modules (e.g. tilelang_kernel) are
+                    # already in sys.modules and auto-discovery can find them.
+                    if (
+                        self.enable_profile_cuda_graph
+                        and self.enable_shape_discovery_for_cuda_graph_profile
+                        and not is_enabled()
+                    ):
+                        enable()
+
                 maybe_flashinfer_autotune_speculative_draft(
                     self,
                     run_once,

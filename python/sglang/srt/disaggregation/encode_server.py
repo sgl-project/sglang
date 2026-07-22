@@ -2365,6 +2365,7 @@ class EncoderProfiler:
         self.output_dir = None
         self.prefix = None
         self.profile_id = None
+        self._kernel_shape_profiler_enabled = False
 
     def start(self, obj: ProfileReq):
         if self.profiler is not None:
@@ -2387,12 +2388,18 @@ class EncoderProfiler:
         if not torch_activities and not profile_memory:
             return False, "no supported activities"
 
+        record_shapes = False if obj.record_shapes is None else obj.record_shapes
         self.profiler = torch.profiler.profile(
             activities=torch_activities,
             with_stack=True if obj.with_stack is None else obj.with_stack,
-            record_shapes=False if obj.record_shapes is None else obj.record_shapes,
+            record_shapes=record_shapes,
             profile_memory=profile_memory,
         )
+        if record_shapes and obj.shape_discovery:
+            import sglang.srt.utils.kernel_shape_profiler as kernel_shape_profiler
+
+            kernel_shape_profiler.enable()
+            self._kernel_shape_profiler_enabled = True
         self.profiler.start()
         self.steps_left = obj.num_steps
         logger.info(
@@ -2413,6 +2420,11 @@ class EncoderProfiler:
         if self.profiler is None:
             return False, "profiling not running"
         self.profiler.stop()
+        if self._kernel_shape_profiler_enabled:
+            import sglang.srt.utils.kernel_shape_profiler as kernel_shape_profiler
+
+            kernel_shape_profiler.disable()
+            self._kernel_shape_profiler_enabled = False
         filename = f"{self.prefix}-rank{self.rank}-{self.profile_id}.trace.json"
         trace_path = os.path.join(self.output_dir, filename)
         self.profiler.export_chrome_trace(trace_path)

@@ -1884,6 +1884,8 @@ class ProfileReq(BaseReq, kw_only=True):
     profile_prefix: Optional[str] = None
     # Only profile these stages and ignore others
     profile_stages: Optional[List[str]] = None
+    # Whether to enable shape discovery (Triton / FlashInfer kernel metadata)
+    shape_discovery: bool = False
 
 
 class ProfileReqOutput(BaseReq, kw_only=True):

@@ -1571,6 +1571,10 @@ class ServerArgs:
     enable_profile_cuda_graph: A[bool, "Enable profiling of cuda graph capture."] = (
         False
     )
+    enable_shape_discovery_for_cuda_graph_profile: A[
+        bool,
+        "Enable shape discovery during cuda graph capture profiling.",
+    ] = False
     enable_cudagraph_gc: A[
         bool,
         "Enable garbage collection during CUDA graph capture. If disabled (default), GC is frozen during capture to speed up the process.",
