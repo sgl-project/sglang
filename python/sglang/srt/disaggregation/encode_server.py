@@ -2510,6 +2510,13 @@ class EncoderScheduler:
         max_batch_size: int,
         request_timeout: float = ENCODER_REQ_TIMEOUT,
     ):
+        if encoder.server_args.tp_size > 1:
+            raise ValueError(
+                "Overlapped image loading does not support tp_size > 1: images are "
+                "preloaded on rank 0 only while TP workers load inline, and the "
+                "loader-consumer thread dispatches on a second event loop, so the "
+                "ZMQ send order can diverge from rank-0's collective forward order."
+            )
         self.encoder = encoder
         self.send_sockets = send_sockets
         self.max_batch_size = max(1, int(max_batch_size))
