@@ -327,7 +327,7 @@ class SchedulerWeightUpdaterManager:
     def release_memory_occupation(self, recv_req: ReleaseMemoryOccupationReqInput):
         scheduler = self.scheduler
         assert self.is_fully_idle(
-            ignore_retracted=scheduler is not None and scheduler._engine_paused
+            ignore_waiting=scheduler is not None and scheduler._engine_paused
         ), "release_memory_occupation should be called only when server is idle."
 
         tags = recv_req.tags
