@@ -58,13 +58,13 @@ class ContextParallelMetadata:
 
 
 def is_prefill_context_parallel_enabled():
-    return get_server_args().enable_prefill_context_parallel
+    return get_parallel().enable_prefill_context_parallel
 
 
 def is_prefill_cp_in_seq_split():
     return (
         is_prefill_context_parallel_enabled()
-        and get_server_args().prefill_cp_mode == "in-seq-split"
+        and get_parallel().prefill_cp_mode == "in-seq-split"
     )
 
 

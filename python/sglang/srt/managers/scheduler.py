@@ -1198,7 +1198,7 @@ class Scheduler(
                 gloo_group=self.attn_tp_cpu_group,
                 tp_rank=self.ps.tp_rank,
                 tp_size=self.ps.tp_size,
-                dp_size=self.server_args.dp_size,
+                dp_size=get_parallel().dp_size,
                 gpu_id=self.ps.gpu_id,
                 bootstrap_port=get_disagg().disaggregation_bootstrap_port,
                 max_total_num_tokens=self.max_total_num_tokens,
@@ -4313,7 +4313,7 @@ class Scheduler(
 
         old_ep_size = ElasticEPStateManager.get_effective_ep_size()
         new_ep_size = recv_req.new_ep_size
-        max_ep_size = self.server_args.max_ep_size or old_ep_size
+        max_ep_size = get_parallel().max_ep_size or old_ep_size
 
         logger.debug(
             "[Elastic EP][scale] request received: new_ep_size=%d "

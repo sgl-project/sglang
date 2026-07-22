@@ -19,10 +19,7 @@ from torch import nn
 
 from sglang.srt.configs import NemotronHConfig
 from sglang.srt.distributed import get_pp_group
-from sglang.srt.layers.dp_attention import (
-    attn_tp_all_reduce,
-    is_dp_attention_enabled,
-)
+from sglang.srt.layers.dp_attention import attn_tp_all_reduce, is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -38,7 +35,7 @@ from sglang.srt.models.nemotron_h import (
     NemotronHMoEDecoderLayer,
 )
 from sglang.srt.models.nemotron_h_utils import is_attn_layer
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix
 
 
@@ -338,7 +335,7 @@ class NemotronHForCausalLMMTP(NemotronHForCausalLM):
             self.config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("lm_head", prefix),
-            use_attn_tp_group=get_server_args().enable_dp_lm_head,
+            use_attn_tp_group=get_parallel().enable_dp_lm_head,
         )
 
         self.logits_processor = LogitsProcessor(config)

@@ -116,6 +116,7 @@ from sglang.srt.runtime_context import (
     get_lora,
     get_model,
     get_observability,
+    get_parallel,
     get_serving,
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -1365,7 +1366,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         return batch_size > 0 and (
             self.server_args.enable_tokenizer_batch_encode
             or (
-                (not self.server_args.enable_dp_attention)
+                (not get_parallel().enable_dp_attention)
                 and (not self._batch_has_text(batch_size, requests))
             )
         )

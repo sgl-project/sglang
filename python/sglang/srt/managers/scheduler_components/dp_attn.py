@@ -24,7 +24,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.metrics_collector import DPCooperationInfo
-from sglang.srt.runtime_context import get_schedule
+from sglang.srt.runtime_context import get_parallel, get_schedule
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.common import require_mlp_tp_gather
@@ -377,7 +377,7 @@ class SchedulerDPAttnAdapter:
     def prepare_mlp_sync_batch(self, local_batch: ScheduleBatch):
         return prepare_mlp_sync_batch_raw(
             local_batch,
-            dp_size=self.server_args.dp_size,
+            dp_size=get_parallel().dp_size,
             attn_tp_size=self.ps.attn_tp_size,
             attn_cp_size=self.ps.attn_cp_size,
             tp_group=self.tp_group,
