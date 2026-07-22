@@ -106,6 +106,32 @@ class TestAttnResFusedTma(CustomTestCase):
         ref = _reference(prefix, bank, 5, cw, ow, _EPS)
         torch.testing.assert_close(out.float(), ref, rtol=2e-2, atol=4e-2)
 
+    def test_fused_prefix_write(self):
+        """write_prefix=True snapshots the prefix row into bank[:, nvb]
+        bit-exactly without touching any other row or the aggregation
+        output. nvb 1..8 covers the prefix row landing in every chunk
+        shape of the dispatch table; the large T exercises the persistent
+        token loop (each CTA writes several tokens' rows)."""
+        num_sm = torch.cuda.get_device_properties(0).multi_processor_count
+        for nvb in range(1, 9):
+            for T in (1, 5, 6 * num_sm + 3):
+                with self.subTest(nvb=nvb, T=T):
+                    prefix, bank, cw, ow = _make_inputs(
+                        T, seed=8 * T + nvb, num_bank_slots=9
+                    )
+                    bank_ref = bank.clone()
+                    out = torch.empty_like(prefix)
+                    attn_res_fused_tma(
+                        prefix, bank, cw, ow, out, nvb, _EPS, write_prefix=True
+                    )
+                    ref = _reference(prefix, bank_ref, nvb, cw, ow, _EPS)
+                    torch.testing.assert_close(out.float(), ref, rtol=2e-2, atol=4e-2)
+                    self.assertTrue(torch.equal(bank[:, nvb], prefix))
+                    self.assertTrue(torch.equal(bank[:, :nvb], bank_ref[:, :nvb]))
+                    self.assertTrue(
+                        torch.equal(bank[:, nvb + 1 :], bank_ref[:, nvb + 1 :])
+                    )
+
     def test_pdl_chain_under_cuda_graph(self):
         """A preceding kernel writes prefix_sum; capture + replay (where the
         PDL launch attribute is active) must match eager execution."""

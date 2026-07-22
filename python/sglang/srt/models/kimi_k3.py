@@ -209,9 +209,8 @@ _K3_FUSE_O_GATE = envs.SGLANG_K3_FUSE_O_GATE.get()
 _K3_KDA_FUSED_DECODE = envs.SGLANG_KDA_FUSED_DECODE.get()
 
 # Multi-stream overlap (deepseek_v4-style alt-stream pool, capture mode only):
-# work that is independent of the attention core — the MLA output-gate GEMM
-# and the attn-res bank write — is issued on alt streams so it runs while
-# attention occupies the main stream.
+# the MLA output-gate GEMM is independent of the attention core, so it is
+# issued on an alt stream and runs while attention occupies the main stream.
 _K3_MULTI_STREAM = envs.SGLANG_K3_MULTI_STREAM.get()
 
 
@@ -1977,7 +1976,7 @@ class KimiK3DecoderLayer(nn.Module):
                 prefix=f"{prefix}.self_attn",
                 all_reduce_fusion=self.all_reduce_fusion,
                 alt_stream=alt_streams[1] if alt_streams is not None else None,
-                gate_alt_stream=alt_streams[3] if alt_streams is not None else None,
+                gate_alt_stream=alt_streams[2] if alt_streams is not None else None,
             )
 
         # MLP / MoE
@@ -2030,21 +2029,6 @@ class KimiK3DecoderLayer(nn.Module):
                 prefix=f"{prefix}.mlp_res_proj",
             )
 
-        # Bank-write overlap (clean path only): the [T, H] snapshot copy is
-        # independent of attention, so write layers issue it on an alt stream
-        # and join before agg2 reads the bank. Legacy stays byte-identical.
-        self._res_write_alt_stream = (
-            alt_streams[2]
-            if (
-                _K3_MULTI_STREAM
-                and alt_streams is not None
-                and self.use_attn_residuals
-                and self.is_block_write_layer
-                and _K3_ATTN_RES_MODE != "legacy"
-            )
-            else None
-        )
-
         # dispatch to impl
         self._forward_attn_residual = (
             self._forward_attn_residual_legacy
@@ -2058,26 +2042,6 @@ class KimiK3DecoderLayer(nn.Module):
             o_proj = getattr(self.self_attn, "o_proj", None)
             assert o_proj is not None, "SP-MoE requires attention exposing o_proj"
             o_proj.reduce_results = False
-
-    def _write_bank(
-        self, attn_res: BaseAttnResidual, prefix_sum: torch.Tensor
-    ) -> Optional[tuple[torch.Tensor, torch.cuda.Event]]:
-        """Snapshot prefix_sum into the bank, on the alt stream when eligible
-        so the [T, H] copy overlaps the attention core.
-
-        Returns None when written synchronously; otherwise (prefix_sum ref,
-        join event) — the caller must wait on the event before anything reads
-        the bank, and the returned ref keeps prefix_sum alive until that join
-        (a freed tensor's memory could be reused by main-stream kernels while
-        the alt stream still reads it)."""
-        alt = self._res_write_alt_stream
-        if alt is None or prefix_sum.shape[0] == 0:
-            attn_res.write(prefix_sum)
-            return None
-        alt.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(alt):
-            attn_res.write(prefix_sum)
-        return (prefix_sum, alt.record_event())
 
     def _finish_attn_reduce(
         self, attn_out: torch.Tensor, allow_scatter: bool
@@ -2225,19 +2189,18 @@ class KimiK3DecoderLayer(nn.Module):
         # un-added MLP delta and prefix_sum the prefix it extends (None at
         # stream start / PP entry, where hidden_states already is the head).
 
-        # ---- Aggregation 1: attention side ----
+        # ---- Aggregation 1: attention side. Write layers snapshot the
+        # pre-attention prefix into the bank in the same call (fused into
+        # the fast kernel; standalone copy on other paths). ----
         hidden_states, prefix_sum = attn_res.forward(
             hidden_states,
             prefix_sum,
             self.self_attention_res_proj,
             self.self_attention_res_norm,
             self.input_layernorm,
+            write=self.is_block_write_layer,
         )
-
-        # ---- Write snapshot (before attention, using pre-update prefix) ----
-        bank_write_join = None
         if self.is_block_write_layer:
-            bank_write_join = self._write_bank(attn_res, prefix_sum)
             prefix_sum = None
 
         # ---- Attention ----
@@ -2268,10 +2231,6 @@ class KimiK3DecoderLayer(nn.Module):
             prefix_sum = None
 
         # ---- Aggregation 2: MLP side (on the shard under SP-MoE) ----
-        if bank_write_join is not None:
-            # agg2 is the first bank reader after the alt-stream write.
-            torch.cuda.current_stream().wait_event(bank_write_join[1])
-            bank_write_join = None
         hidden_states, prefix_sum = attn_res.forward(
             hidden_states,
             prefix_sum,
@@ -2434,11 +2393,12 @@ class KimiK3LinearModel(nn.Module):
 
         # Multi-stream pool (deepseek_v4 pattern): every alt stream is
         # constructed here and threaded down to the layers. Slots:
-        #   [0] MoE (reserved, currently unused; this is written by HUMAN!!!)
+        #   [0] MoE dual-stream shared-expert tail
         #   [1] DeepseekV2AttentionMLA base internals (forwarded; unused by K3)
-        #   [2] attn-res bank write, overlaps the attention core
-        #   [3] MLA output-gate GEMM, overlaps the attention core
-        self.alt_streams = [torch.cuda.Stream() for _ in range(4)]
+        #   [2] MLA output-gate GEMM, overlaps the attention core
+        # (The attn-res bank write no longer needs a stream: it is fused
+        # into the agg1 fast kernel, see AttnResidual.forward(write=True).)
+        self.alt_streams = [torch.cuda.Stream() for _ in range(3)]
 
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,

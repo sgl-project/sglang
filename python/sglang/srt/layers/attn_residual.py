@@ -66,11 +66,14 @@ def _aggregate_fast(
     score_proj: ReplicatedLinear,
     score_norm: RMSNorm,
     out_norm: RMSNorm,
+    write_bank_row: bool = False,
 ) -> torch.Tensor:
     """Warp-specialized TMA kernel: online softmax over row chunks with the
     output RMSNorm fused, one persistent CTA per SM, per-nvb tuned launch
     config (GB300 benchmark winner across nvb; attn_res_chain remains
-    available as a benchmark alternate)."""
+    available as a benchmark alternate). With write_bank_row the kernel also
+    snapshots the prefix row into bank[:, nvb, :] (bit-exact, zero extra
+    reads — the row streams through the score pass anyway)."""
     from sglang.jit_kernel.kimi_k3.attn_res import attn_res_fused_tma
 
     # The kernel applies one eps to both the score norm and the output norm.
@@ -79,7 +82,14 @@ def _aggregate_fast(
     cw = get_cw(score_proj, score_norm, dtype=torch.bfloat16)
     out = torch.empty_like(prefix_sum)
     attn_res_fused_tma(
-        prefix_sum, bank, cw, out_norm.weight, out, nvb, score_norm.variance_epsilon
+        prefix_sum,
+        bank,
+        cw,
+        out_norm.weight,
+        out,
+        nvb,
+        score_norm.variance_epsilon,
+        write_prefix=write_bank_row,
     )
     return out
 
@@ -339,6 +349,7 @@ def _aggregate_fused_add(
     score_proj: ReplicatedLinear,
     score_norm: RMSNorm,
     out_norm: RMSNorm,
+    write_bank_row: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Aggregation point with the upstream residual add fused into the score
     kernel: prefix = bf16(prefix_a + prefix_b) is computed on the fly by the
@@ -346,8 +357,10 @@ def _aggregate_fused_add(
     the combine kernel / downstream consumers. Returns (normed, prefix).
 
     jit mode only; other paths (including the optimized-kernel route, which
-    has no fused-add variant yet) fall back to add-then-aggregate."""
+    has no fused-add variant yet) fall back to add-then-aggregate.
+    write_bank_row rides the fallback's _aggregate (fast mode only)."""
     if _MODE == "jit":
+        assert not write_bank_row, "fused bank write is fast-mode only"
         from sglang.jit_kernel.kimi_k3.attn_res import (
             attn_res_combine,
             attn_res_score_fused_add,
@@ -375,7 +388,15 @@ def _aggregate_fused_add(
 
     prefix = prefix_a + prefix_b
     return (
-        _aggregate(prefix, bank, nvb, score_proj, score_norm, out_norm),
+        _aggregate(
+            prefix,
+            bank,
+            nvb,
+            score_proj,
+            score_norm,
+            out_norm,
+            write_bank_row=write_bank_row,
+        ),
         prefix,
     )
 
@@ -390,13 +411,26 @@ def _aggregate(
     score_proj: ReplicatedLinear,
     score_norm: RMSNorm,
     out_norm: RMSNorm,
+    write_bank_row: bool = False,
 ) -> torch.Tensor:
     """Single aggregation point: score → softmax → mix → norm.
 
     Caller handles nvb == 0 (layer 0 attn side: just out_norm(prefix_sum)).
+    write_bank_row is fast-mode only (in-kernel snapshot of the prefix row
+    into bank[:, nvb, :]); other modes keep the standalone .write() copy —
+    the caller (AttnResidual.forward) owns that fallback.
     """
     if _MODE == "fast":
-        return _aggregate_fast(prefix_sum, bank, nvb, score_proj, score_norm, out_norm)
+        return _aggregate_fast(
+            prefix_sum,
+            bank,
+            nvb,
+            score_proj,
+            score_norm,
+            out_norm,
+            write_bank_row=write_bank_row,
+        )
+    assert not write_bank_row, "fused bank write is fast-mode only"
     if _MODE == "torch":
         return _aggregate_torch(prefix_sum, bank, nvb, score_proj, score_norm, out_norm)
     if _MODE == "jit":
@@ -427,6 +461,8 @@ class BaseAttnResidual(Protocol):
         score_proj: ReplicatedLinear,
         score_norm: RMSNorm,
         out_norm: RMSNorm,
+        rows: Optional[slice] = None,
+        write: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]: ...
 
 
@@ -463,12 +499,23 @@ class AttnResidual:
         score_norm: RMSNorm,
         out_norm: RMSNorm,
         rows: Optional[slice] = None,
+        write: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Aggregate; with write=True also snapshot the aggregated prefix
+        (the second return value) into the next bank row — fused into the
+        fast kernel (the row streams through its score pass anyway), a
+        standalone .write() copy on every other path."""
         nvb = self.num_valid_blocks
         # Layer 0 attention side: nothing banked yet
         if nvb == 0:
             assert prefix_sum is None
+            if write:
+                self.write(hidden_states)
             return out_norm(hidden_states), hidden_states
+
+        # The bank write targets the full-batch row (agg1 runs before the
+        # SP-MoE reduce-scatter); a sharded write would corrupt the bank.
+        assert not (write and rows is not None)
 
         # SP-MoE: the caller holds only its token shard; align the banked
         # residual rows to it (dim-0 slice of a contiguous buffer stays
@@ -477,6 +524,7 @@ class AttnResidual:
             self.block_residual if rows is None else self.block_residual[rows]
         )
 
+        fused_write = write and _MODE == "fast"
         if prefix_sum is None:
             # hidden_states already is the whole head (PP entry or a
             # block-boundary restart).
@@ -487,17 +535,24 @@ class AttnResidual:
                 score_proj,
                 score_norm,
                 out_norm,
+                write_bank_row=fused_write,
             )
-            return normed, hidden_states
-
-        # Pending add: folded into the score kernel in jit mode, explicit
-        # add + aggregate otherwise (bit-identical, handled inside).
-        return _aggregate_fused_add(
-            prefix_sum,
-            hidden_states,
-            block_residual,
-            nvb,
-            score_proj,
-            score_norm,
-            out_norm,
-        )
+            prefix = hidden_states
+        else:
+            # Pending add: folded into the score kernel in jit mode, explicit
+            # add + aggregate otherwise (bit-identical, handled inside).
+            normed, prefix = _aggregate_fused_add(
+                prefix_sum,
+                hidden_states,
+                block_residual,
+                nvb,
+                score_proj,
+                score_norm,
+                out_norm,
+                write_bank_row=fused_write,
+            )
+        if fused_write:
+            self.num_valid_blocks += 1  # row nvb written in-kernel
+        elif write:
+            self.write(prefix)
+        return normed, prefix
