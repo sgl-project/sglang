@@ -1190,6 +1190,98 @@ class ServingChatTestCase(unittest.TestCase):
         serving_chat = OpenAIServingChat(tm, TemplateManager())
         self.assertEqual(serving_chat.chat_encoding_spec, "dsv4")
 
+    def _make_dsv4_serving_chat(self):
+        """Build an OpenAIServingChat wired for the dsv4 custom encoder."""
+        from sglang.srt.managers.template_manager import TemplateManager
+
+        tm = _MockTokenizerManager()
+        tm.server_args.reasoning_parser = "deepseek-v4"
+        mock_hf_config = Mock()
+        mock_hf_config.architectures = ["DeepseekV4ForCausalLM"]
+        tm.model_config.hf_config = mock_hf_config
+        tm.tokenizer.chat_template = None
+
+        serving_chat = OpenAIServingChat(tm, TemplateManager())
+        self.assertEqual(serving_chat.chat_encoding_spec, "dsv4")
+        return serving_chat
+
+    def test_dsv4_default_thinking_aligns_prompt_and_parser(self):
+        """SGLANG_DEFAULT_THINKING must drive BOTH the dsv4 prompt and the
+        reasoning parser.
+
+        Regression: the env turned thinking ON in the prompt
+        (``_apply_jinja_template``) while ``_get_reasoning_from_request`` still
+        treated the request as non-thinking, so the leading reasoning and the
+        ``</think>`` marker leaked into ``content`` and ``reasoning_content``
+        came back empty.
+        """
+        from sglang.srt.environ import envs
+
+        serving_chat = self._make_dsv4_serving_chat()
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+        )
+        with patch.object(envs.SGLANG_DEFAULT_THINKING, "get", return_value=True):
+            serving_chat._process_messages(req, is_multimodal=False)
+
+        # The resolved decision is persisted onto the request...
+        self.assertEqual(req.chat_template_kwargs, {"thinking": True})
+        # ...so the parser side now agrees the request is in thinking mode.
+        self.assertTrue(serving_chat._get_reasoning_from_request(req))
+
+    def test_dsv4_default_thinking_off_keeps_parser_off(self):
+        """With the env default OFF and no request override, both sides stay
+        in chat mode."""
+        from sglang.srt.environ import envs
+
+        serving_chat = self._make_dsv4_serving_chat()
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+        )
+        with patch.object(envs.SGLANG_DEFAULT_THINKING, "get", return_value=False):
+            serving_chat._process_messages(req, is_multimodal=False)
+
+        self.assertEqual(req.chat_template_kwargs, {"thinking": False})
+        self.assertFalse(serving_chat._get_reasoning_from_request(req))
+
+    def test_dsv4_explicit_thinking_false_overrides_env_default(self):
+        """An explicit ``thinking=False`` in the request wins over the env, and
+        unrelated keys such as ``reasoning_effort`` are preserved."""
+        from sglang.srt.environ import envs
+
+        serving_chat = self._make_dsv4_serving_chat()
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            chat_template_kwargs={"thinking": False, "reasoning_effort": "max"},
+        )
+        with patch.object(envs.SGLANG_DEFAULT_THINKING, "get", return_value=True):
+            serving_chat._process_messages(req, is_multimodal=False)
+
+        self.assertEqual(
+            req.chat_template_kwargs, {"thinking": False, "reasoning_effort": "max"}
+        )
+        self.assertFalse(serving_chat._get_reasoning_from_request(req))
+
+    def test_dsv4_default_thinking_drives_parser_with_input_ids(self):
+        """Bypass coverage: even when input_ids skip the prompt encoder, the
+        env-resolved thinking decision still reaches the reasoning parser."""
+        from sglang.srt.environ import envs
+
+        serving_chat = self._make_dsv4_serving_chat()
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            input_ids=[1, 2, 3],
+        )
+        with patch.object(envs.SGLANG_DEFAULT_THINKING, "get", return_value=True):
+            serving_chat._process_messages(req, is_multimodal=False)
+
+        self.assertEqual(req.chat_template_kwargs, {"thinking": True})
+        self.assertTrue(serving_chat._get_reasoning_from_request(req))
+
     # ------------- dsv4 task + latest_reminder -------------
     def test_dsv4_task_field_schema(self):
         """Top-level `task` accepts the 6 DS task tokens and rejects others."""
