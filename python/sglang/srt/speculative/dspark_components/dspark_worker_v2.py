@@ -14,7 +14,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     compute_position,
 )
-from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
@@ -294,7 +294,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             self._draft_worker.init_attention_backends()
 
     def init_cuda_graphs(self):
-        capture_decode_cuda_graph = not get_exec().graph.disable_cuda_graph
+        capture_decode_cuda_graph = not self.server_args.disable_cuda_graph
         if is_cuda() and capture_decode_cuda_graph:
             available_mem = get_available_gpu_memory(self.device, self.gpu_id)
             if available_mem < 1.0:
@@ -320,7 +320,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         return maybe_build_draft_sampler(
             draft_model=self.draft_model,
             gamma=self.gamma,
-            max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
+            max_bs=max(self.server_args.cuda_graph_config.decode.bs),
             device=self.device,
             tp_rank=self.ps.tp_rank,
             confidence_fn=(
@@ -375,7 +375,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         self, batch: ScheduleBatch, on_publish
     ) -> GenerationBatchResult:
         if batch.forward_mode.is_idle():
-            if get_parallel().enable_dp_attention:
+            if self.server_args.enable_dp_attention:
                 self.target_worker.forward_batch_generation(
                     batch, capture_hidden_mode=CaptureHiddenMode.FULL
                 )
@@ -443,7 +443,7 @@ class DSparkWorkerV2(BaseSpecWorker):
     def _dp_verify_tier_num_tokens(self, batch: ScheduleBatch) -> Optional[int]:
         if not (
             self._draft_is_moe
-            and get_parallel().enable_dp_attention
+            and self.server_args.enable_dp_attention
             and batch.global_num_tokens is not None
             and self._verify_planner.is_compact_mode
         ):
@@ -487,7 +487,7 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         if batch.forward_mode.is_idle():
             self._observers.note_idle_decode_step()
-            if get_parallel().enable_dp_attention:
+            if self.server_args.enable_dp_attention:
                 if self._draft_is_moe:
                     self._proposer.run_idle_participation(batch)
                 self._verify_executor.run_idle_participation(
@@ -549,7 +549,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         global_num_reqs = (
             max(batch.global_num_tokens)
             if self._draft_is_moe
-            and get_parallel().enable_dp_attention
+            and self.server_args.enable_dp_attention
             and batch.global_num_tokens is not None
             else None
         )

@@ -16,7 +16,9 @@ from sglang.kernels.ops.model.inkling.inkling_gate_topk_renorm import (
     inkling_gate_gemv_fused,
 )
 from sglang.srt.configs.inkling import InklingModelConfig
-from sglang.srt.distributed import get_tensor_model_parallel_group
+from sglang.srt.distributed import (
+    get_tensor_model_parallel_group,
+)
 from sglang.srt.environ import GateGemvMode, envs
 from sglang.srt.layers.moe import get_moe_runner_backend
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
@@ -57,7 +59,7 @@ from sglang.srt.models.inkling_common.util import (
     lora_compatible_layout_enabled,
     use_inkling_shared_fused_moe,
 )
-from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 from sglang.srt.utils import add_prefix, is_cuda, is_hip
 
@@ -889,8 +891,9 @@ class InklingMoE(nn.Module):
         )
         # --enable-scattered-sconv: the output reduction becomes a hidden-dim
         # reduce-scatter (the consumer mlp_sconv runs on the [T, H/P] shard).
+        from sglang.srt.runtime_context import get_server_args
 
-        self.scattered_sconv = get_exec().comm.enable_scattered_sconv
+        self.scattered_sconv = get_server_args().enable_scattered_sconv
         # Fold the shared-expert partials into the custom AR kernels (or their
         # stage-in copies) instead of a separate torch.add per MoE layer.
         self._fused_ar_shared = envs.SGLANG_OPT_USE_INKLING_FUSED_AR_SHARED.get()

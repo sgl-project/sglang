@@ -14,7 +14,6 @@ from sglang.srt.managers.load_snapshot import (
     QueueMetrics,
     SpeculativeMetrics,
 )
-from sglang.srt.runtime_context import get_lora
 
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state_wrapper import ParallelState
@@ -145,7 +144,7 @@ class SchedulerLoadInquirer:
             )
 
         lora = None
-        if get_lora().enable_lora:
+        if self.server_args.enable_lora:
             lora = LoRAMetrics(
                 slots_used=stats.lora_pool_slots_used,
                 slots_total=stats.lora_pool_slots_total,

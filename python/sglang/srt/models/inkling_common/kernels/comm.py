@@ -7,7 +7,7 @@ import msgspec
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_exec
+from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import is_cuda
 
 if TYPE_CHECKING:
@@ -251,7 +251,7 @@ def ar_sconv_norm_fusable(
         and envs.SGLANG_OPT_USE_INKLING_FUSED_AR_SCONV_NORM.get()
     ):
         return False
-    if get_exec().comm.enable_scattered_sconv:
+    if get_server_args().enable_scattered_sconv:
         # The decode {AR -> sconv -> norm} fusion is full-width; under scattered
         # sconv the output sconvs are hidden-sharded, so it does not apply.
         return False
@@ -396,7 +396,7 @@ def get_ar_buffer(
         envs.SGLANG_OPT_USE_INKLING_CUSTOM_AR.get()
         # Scattered sconv replaces the AR with reduce_scatter_hidden, which
         # stages from comm.buffer[:n] -- never hand out the v4 region there.
-        and not get_exec().comm.enable_scattered_sconv
+        and not get_server_args().enable_scattered_sconv
     ):
         res = _get_inkling_ar_resources(comm)
         if (
@@ -696,7 +696,7 @@ def scattered_ar_sconv_fusable(
     if not is_cuda():
         return False
     if not (
-        get_exec().comm.enable_scattered_sconv
+        get_server_args().enable_scattered_sconv
         and envs.SGLANG_OPT_USE_INKLING_CUSTOM_AR.get()
         and envs.SGLANG_OPT_USE_INKLING_FUSED_AR_SCONV.get()
     ):
@@ -1033,7 +1033,7 @@ def fullwidth_ar_sconv_fusable(
     if not is_cuda():
         return False
     if not (
-        not get_exec().comm.enable_scattered_sconv
+        not get_server_args().enable_scattered_sconv
         and envs.SGLANG_OPT_USE_INKLING_CUSTOM_AR.get()
         and envs.SGLANG_OPT_USE_INKLING_FUSED_AR_SCONV.get()
     ):

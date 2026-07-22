@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from sglang.srt.runtime_context import get_disagg
-
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -647,15 +645,15 @@ class TokenizerWorker(TokenizerManager):
         self.tokenizer_ipc_name = port_args.tokenizer_ipc_name
 
         # For PD disaggregtion
-        from sglang.srt.runtime_context import get_context
-
-        get_context().override(
+        self.server_args.override(
             "tokenizer_worker.restore_disaggregation_mode",
             disaggregation_mode=disaggregation_mode,
         )
-        self.disaggregation_mode = DisaggregationMode(get_disagg().disaggregation_mode)
+        self.disaggregation_mode = DisaggregationMode(
+            self.server_args.disaggregation_mode
+        )
         self.disaggregation_transfer_backend = TransferBackend(
-            get_disagg().disaggregation_transfer_backend
+            self.server_args.disaggregation_transfer_backend
         )
 
         # Register this worker with the router for pause/continue broadcasting
