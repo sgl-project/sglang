@@ -9,8 +9,7 @@ import torch
 from sglang.srt.utils import is_sm90_supported
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="1-gpu-large")
-register_cuda_ci(est_time=300, suite="nightly-kernel-1-gpu", nightly=True)
+register_cuda_ci(est_time=240, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 
 DTYPE_FP8 = torch.float8_e4m3fn
@@ -115,7 +114,7 @@ def _torch_sparse_attention_ref(
 
 
 def _run_and_check(d_qk, with_sink, s_q=2, topk=TOPK, s_kv=S_KV):
-    from sglang.jit_kernel.sparse_mla_q8kv8_prefill_sm90 import (
+    from sglang.kernels.ops.attention.sparse_mla_q8kv8_prefill_sm90 import (
         sparse_mla_q8kv8_prefill_fwd,
     )
 
@@ -213,7 +212,7 @@ def test_sparse_mla_q8kv8_prefill_precision(d_qk: int, s_q: int, topk: int, s_kv
     """Demonstrate that Q8KV8 kernel precision is near-lossless versus the
     fp32 reference: max/mean/p99 absolute error are small and the fraction
     of elements exceeding 0.1 absolute error is under 1%."""
-    from sglang.jit_kernel.sparse_mla_q8kv8_prefill_sm90 import (
+    from sglang.kernels.ops.attention.sparse_mla_q8kv8_prefill_sm90 import (
         sparse_mla_q8kv8_prefill_fwd,
     )
 
@@ -286,7 +285,7 @@ def test_sparse_mla_q8kv8_prefill_precision(d_qk: int, s_q: int, topk: int, s_kv
 def test_sparse_mla_q8kv8_prefill_no_alias_between_calls():
     """Two default-allocation calls with the same shape must return independent
     storage. This guards against regressing to a module-scope output cache."""
-    from sglang.jit_kernel.sparse_mla_q8kv8_prefill_sm90 import (
+    from sglang.kernels.ops.attention.sparse_mla_q8kv8_prefill_sm90 import (
         sparse_mla_q8kv8_prefill_fwd,
     )
 
@@ -333,7 +332,7 @@ def test_sparse_mla_q8kv8_prefill_no_alias_between_calls():
 def test_sparse_mla_q8kv8_prefill_caller_owned_buffers():
     """Caller-provided ``out`` / ``max_logits`` / ``lse`` tensors must be
     written into in-place and returned as-is."""
-    from sglang.jit_kernel.sparse_mla_q8kv8_prefill_sm90 import (
+    from sglang.kernels.ops.attention.sparse_mla_q8kv8_prefill_sm90 import (
         sparse_mla_q8kv8_prefill_fwd,
     )
 
@@ -374,7 +373,7 @@ def test_sparse_mla_q8kv8_prefill_caller_owned_buffers():
 )
 def test_sparse_mla_q8kv8_prefill_rejects_bad_buffers():
     """Validation: wrong shape/dtype and aliasing must raise ValueError."""
-    from sglang.jit_kernel.sparse_mla_q8kv8_prefill_sm90 import (
+    from sglang.kernels.ops.attention.sparse_mla_q8kv8_prefill_sm90 import (
         sparse_mla_q8kv8_prefill_fwd,
     )
 
@@ -416,6 +415,191 @@ def test_sparse_mla_q8kv8_prefill_rejects_bad_buffers():
     # d_v != 512.
     with pytest.raises(ValueError):
         _call(d_v=256)
+
+
+# ---------------------------------------------------------------------------
+# End-to-end-discovered corner-case gates.
+#
+# Everything ABOVE (matches_reference / corner_cases / precision /
+# no_alias_between_calls / caller_owned_buffers / rejects_bad_buffers) is the
+# original unit suite: small, all-valid (or topk_length-bounded) shapes checked
+# against a reference that REPRODUCES the kernel's own clamp semantics.  That
+# suite is blind to three bug classes that only surface under real
+# DeepSeek-V3.2 serving; the gates below reproduce them as standalone kernel
+# tests:
+#
+#   1. masked -1-sentinel SEMANTICS on few-valid rows (ctx << topk): pad slots
+#      must contribute NOTHING to the softmax denominator.  This needs a MASKED
+#      (-inf) fp32 reference -- a reference that mimics the kernel's own clamp
+#      is blind to the bug.
+#   2. s_q ENVELOPE to 6144: first-band NaNs from an is_kv_valid data race that
+#      only appears past s_q=2048 (never exercised above).
+#   3. LARGE S_KV (65536) / large index values: gathered multi-request buffers
+#      reach tens of thousands of rows in e2e; the suite above used s_kv<=1024.
+#
+# These use h=128 (the real DeepSeek head count) and large s_q/s_kv, so they are
+# heavier than the suite above; same SM90 skipif.  They also DOCUMENT that the
+# kernel is run-to-run nondeterministic at the fp8 noise floor, so they compare
+# against an fp32 reference (never bitwise / self-consistency).
+# ---------------------------------------------------------------------------
+
+_D_FULL = 576  # nope(512) + rope(64): the real DeepSeek MLA absorbed q/kv width
+
+
+def _ref_masked_blocked(q, kv, indices, sm_scale, d_v, row_start, row_end):
+    """fp32 reference with PROPER -1 masking (pad slots -> -inf), computed over a
+    block of query rows [row_start, row_end) to bound peak memory.  Unlike
+    ``_torch_sparse_attention_ref`` (which bounds validity via topk_length and so
+    reproduces the kernel's clamp), this masks every -1 index out of the softmax,
+    making it sensitive to the denominator-pollution bug."""
+    q_f = q.float()
+    kv_f = kv.float()[:, 0, :]
+    idx_block = indices[row_start:row_end, 0, :].long()
+    gathered = kv_f[idx_block.clamp(min=0)]
+    scores = torch.einsum("qhd,qkd->qhk", q_f[row_start:row_end], gathered) * sm_scale
+    scores = scores.masked_fill((idx_block < 0)[:, None, :], float("-inf"))
+    probs = torch.softmax(scores, dim=-1)
+    return torch.einsum("qhk,qkd->qhd", probs, gathered[:, :, :d_v])
+
+
+@pytest.mark.skipif(
+    not _sm90_available(), reason="Q8KV8 sparse prefill requires SM90 CUDA"
+)
+@pytest.mark.parametrize("s_q", [2048, 4096])
+def test_sparse_mla_q8kv8_prefill_masked_sentinels(s_q: int):
+    """NEW gate (bug class 1): causal -1 structure (row i has min(1+i, topk)
+    valid slots, the rest -1).  The kernel must mask pad slots out of the softmax
+    denominator.  Checked against a MASKED (-inf) fp32 reference; a reference
+    that reproduced the kernel's clamp would be blind to this.
+    Gate: per-band cos > 0.97 AND magnitude ratio > 0.9
+    (the denominator-pollution bug crushes magnitude 50-2000x, unmistakable even
+    under fp8 noise)."""
+    from sglang.kernels.ops.attention.sparse_mla_q8kv8_prefill_sm90 import (
+        sparse_mla_q8kv8_prefill_fwd,
+    )
+
+    h, topk, band, n = 128, 2048, 512, 4608
+    s_kv = n + topk
+    g = torch.Generator(device="cuda").manual_seed(11)
+    q = torch.randn((s_q, h, _D_FULL), device="cuda", generator=g).to(DTYPE_FP8)
+    kv = torch.zeros((s_kv, H_KV, _D_FULL), dtype=DTYPE_FP8, device="cuda")
+    kv[:n] = torch.randn((n, H_KV, _D_FULL), device="cuda", generator=g).to(DTYPE_FP8)
+    idx = torch.full((s_q, H_KV, topk), -1, dtype=torch.int32, device="cuda")
+    slot = torch.arange(topk, device="cuda")
+    valid = torch.clamp(1 + torch.arange(s_q, device="cuda"), max=topk)
+    rnd = torch.randint(
+        0, n, (s_q, topk), dtype=torch.int32, device="cuda", generator=g
+    )
+    idx[:, 0, :] = torch.where(
+        slot[None, :] < valid[:, None], rnd, torch.full_like(rnd, -1)
+    )
+    one = torch.ones(1, dtype=torch.float32, device="cuda")
+    sm_scale = 1.0 / math.sqrt(_D_FULL)
+
+    out, _, _ = sparse_mla_q8kv8_prefill_fwd(
+        q=q, kv=kv, indices=idx, sm_scale=sm_scale, q_scale=one, kv_scale=one, d_v=D_V
+    )
+    torch.cuda.synchronize()
+
+    worst_cos, worst_mag = 1.0, 1.0
+    for s in range(0, s_q, band):
+        e = min(s + band, s_q)
+        ref = _ref_masked_blocked(q, kv, idx, sm_scale, D_V, s, e)
+        ob = out[s:e].float()
+        cos = torch.nn.functional.cosine_similarity(
+            ob.reshape(-1), ref.reshape(-1), dim=0
+        ).item()
+        mag = (ob.norm() / ref.norm().clamp(min=1e-9)).item()
+        worst_cos = min(worst_cos, cos)
+        if mag < 1.0:
+            worst_mag = min(worst_mag, mag)
+        del ref, ob
+        torch.cuda.empty_cache()
+
+    print(
+        f"\n  masked-sentinels s_q={s_q}: worst cos={worst_cos:.4f} "
+        f"worst |out|/|ref|={worst_mag:.3f}"
+    )
+    assert worst_cos > 0.97, f"cos {worst_cos:.4f} <= 0.97 (denominator pollution?)"
+    assert worst_mag > 0.9, f"mag {worst_mag:.3f} <= 0.9 (denominator pollution?)"
+
+
+@pytest.mark.skipif(
+    not _sm90_available(), reason="Q8KV8 sparse prefill requires SM90 CUDA"
+)
+@pytest.mark.parametrize("s_q", [2048, 4096, 6144])
+def test_sparse_mla_q8kv8_prefill_sq_envelope(s_q: int):
+    """NEW gate (bug class 2): all-valid correctness across the s_q envelope.
+    s_q=6144 previously produced first-band NaNs (an is_kv_valid data race that
+    only appears past s_q=2048)."""
+    from sglang.kernels.ops.attention.sparse_mla_q8kv8_prefill_sm90 import (
+        sparse_mla_q8kv8_prefill_fwd,
+    )
+
+    h, topk, s_kv, band = 128, 2048, 8192, 1024
+    g = torch.Generator(device="cuda").manual_seed(7)
+    q = torch.randn((s_q, h, _D_FULL), device="cuda", generator=g).to(DTYPE_FP8)
+    kv = torch.randn((s_kv, H_KV, _D_FULL), device="cuda", generator=g).to(DTYPE_FP8)
+    idx = torch.randint(
+        0, s_kv, (s_q, H_KV, topk), dtype=torch.int32, device="cuda", generator=g
+    )
+    one = torch.ones(1, dtype=torch.float32, device="cuda")
+    sm_scale = 1.0 / math.sqrt(_D_FULL)
+
+    out, _, _ = sparse_mla_q8kv8_prefill_fwd(
+        q=q, kv=kv, indices=idx, sm_scale=sm_scale, q_scale=one, kv_scale=one, d_v=D_V
+    )
+    torch.cuda.synchronize()
+
+    has_nan = torch.isnan(out.float()).any().item()
+    worst_cos = 1.0
+    for s in range(0, s_q, band):
+        e = min(s + band, s_q)
+        ref = _ref_masked_blocked(q, kv, idx, sm_scale, D_V, s, e)
+        cos = torch.nn.functional.cosine_similarity(
+            out[s:e].float().reshape(-1), ref.reshape(-1), dim=0
+        ).item()
+        worst_cos = min(worst_cos, cos)
+        del ref
+        torch.cuda.empty_cache()
+
+    print(f"\n  s_q-envelope s_q={s_q}: nan={has_nan} worst cos={worst_cos:.4f}")
+    assert not has_nan, f"NaN in output at s_q={s_q} (is_kv_valid race)"
+    assert worst_cos > 0.99, f"cos {worst_cos:.4f} <= 0.99"
+
+
+@pytest.mark.skipif(
+    not _sm90_available(), reason="Q8KV8 sparse prefill requires SM90 CUDA"
+)
+def test_sparse_mla_q8kv8_prefill_large_skv():
+    """NEW gate (bug class 3): large gathered buffers / large index values
+    (s_kv=65536, indices in [33000, 65536)).  E2E multi-request gather buffers
+    reach tens of thousands of rows; the suite above used s_kv<=1024."""
+    from sglang.kernels.ops.attention.sparse_mla_q8kv8_prefill_sm90 import (
+        sparse_mla_q8kv8_prefill_fwd,
+    )
+
+    h, topk, s_kv, s_q = 128, 2048, 65536, 2048
+    g = torch.Generator(device="cuda").manual_seed(13)
+    q = torch.randn((s_q, h, _D_FULL), device="cuda", generator=g).to(DTYPE_FP8)
+    kv = torch.randn((s_kv, H_KV, _D_FULL), device="cuda", generator=g).to(DTYPE_FP8)
+    idx = torch.randint(
+        33000, s_kv, (s_q, H_KV, topk), dtype=torch.int32, device="cuda", generator=g
+    )
+    one = torch.ones(1, dtype=torch.float32, device="cuda")
+    sm_scale = 1.0 / math.sqrt(_D_FULL)
+
+    out, _, _ = sparse_mla_q8kv8_prefill_fwd(
+        q=q, kv=kv, indices=idx, sm_scale=sm_scale, q_scale=one, kv_scale=one, d_v=D_V
+    )
+    torch.cuda.synchronize()
+
+    ref = _ref_masked_blocked(q, kv, idx, sm_scale, D_V, 0, 1024)
+    cos = torch.nn.functional.cosine_similarity(
+        out[:1024].float().reshape(-1), ref.reshape(-1), dim=0
+    ).item()
+    print(f"\n  large-S_KV={s_kv}: band-0 cos={cos:.4f}")
+    assert cos > 0.99, f"cos {cos:.4f} <= 0.99"
 
 
 if __name__ == "__main__":

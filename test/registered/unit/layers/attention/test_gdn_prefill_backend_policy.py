@@ -35,6 +35,14 @@ def make_runner(
     for name, value in arg_overrides.items():
         setattr(args, name, value)
 
+    # The policy routes its load-time default through the audited mutation entry
+    # (server_args.override); mirror that on the stub so the write lands.
+    def _override(source, **fields):
+        for _field, _value in fields.items():
+            setattr(args, _field, _value)
+
+    args.override = _override
+
     return SimpleNamespace(
         server_args=args,
         model_config=SimpleNamespace(),

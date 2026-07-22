@@ -18,21 +18,27 @@ from typing import (
 import torch
 import torch.nn.functional as F
 
-from sglang.jit_kernel.dsv4.online_c128_mtp import OnlineC128MTPController
-from sglang.srt.environ import envs
-from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.dsv4.attn_metadata_kernels import (
+from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (
+    dequantize_k_cache_paged,
+)
+from sglang.kernels.ops.attention.dsv4.metadata_kernel import (
+    init_compression_metadata as _init_compression_metadata_triton,
+)
+from sglang.kernels.ops.attention.dsv4.online_c128_mtp import OnlineC128MTPController
+from sglang.kernels.ops.attention.dsv4.quant_k_cache import (
+    quant_to_nope_fp8_rope_bf16_pack_triton,
+)
+from sglang.kernels.ops.attention.dsv4_attn_metadata_kernels import (
     BuildCausalSwaPageIndices,
     BuildPageTablePositions,
     ExpandPrefillCausally,
 )
+from sglang.srt.environ import envs
+from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.dsv4.compressor_v2 import (
     CompressorBackendMixin,
     FusedCompressMetadata,
     create_paged_compressor_data,
-)
-from sglang.srt.layers.attention.dsv4.dequant_k_cache import (
-    dequantize_k_cache_paged,
 )
 from sglang.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
 from sglang.srt.layers.attention.dsv4.metadata import (
@@ -40,12 +46,6 @@ from sglang.srt.layers.attention.dsv4.metadata import (
     PagedIndexerMetadata,
     copy_metadata,
     maybe_copy_inplace,
-)
-from sglang.srt.layers.attention.dsv4.metadata_kernel import (
-    init_compression_metadata as _init_compression_metadata_triton,
-)
-from sglang.srt.layers.attention.dsv4.quant_k_cache import (
-    quant_to_nope_fp8_rope_bf16_pack_triton,
 )
 from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
     SparsePrefillChunkCache,
@@ -68,7 +68,7 @@ from sglang.srt.speculative.ragged_verify import (
     read_ragged_verify_mode,
     resolve_ragged_verify_layout,
 )
-from sglang.srt.utils import ceil_align, is_xpu
+from sglang.srt.utils import ceil_align, is_cuda, is_xpu
 from sglang.srt.utils.common import is_sm120_supported
 
 if TYPE_CHECKING:
@@ -79,6 +79,7 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 
 _is_sm120 = is_sm120_supported()
+_is_cuda = is_cuda()
 _is_xpu = is_xpu()
 
 logger = logging.getLogger(__name__)
@@ -92,6 +93,8 @@ def _get_logical_forward_mode(forward_batch: ForwardBatch) -> ForwardMode:
     # IDLE is a real per-DP-rank mode. Do not let a stale _original_forward_mode
     # from a reused/padded ForwardBatch turn an empty rank into TARGET_VERIFY.
     if forward_batch.forward_mode.is_idle():
+        return forward_batch.forward_mode
+    if forward_batch.forward_mode == ForwardMode.EXTEND:
         return forward_batch.forward_mode
     return (
         getattr(forward_batch, "_original_forward_mode", None)
@@ -497,6 +500,7 @@ class DeepseekV4AttnBackend(
         super().__init__()
         self.model_runner = model_runner
         self.device = torch.device(model_runner.device)
+        self.max_context_len = model_runner.model_config.context_len
         head_dim = model_runner.model_config.head_dim
         assert (
             head_dim == 512
@@ -553,17 +557,17 @@ class DeepseekV4AttnBackend(
             DSV4RawDecodeMetadata,
         ] = None
         self.online_c128_mtp = OnlineC128MTPController(self)
-        # Draft-extend and online-c128 verify metadata are host-planned, so
-        # spec runs keep the relay publish (the mirror only exists under
-        # spec-v2; without spec the flag has no consumer either way).
-        # DSPARK is the exception: its draft path carries its own host lens
-        # (reserved_seq_lens_cpu) and its verify prep is device-side.
-        spec_alg = model_runner.spec_algorithm
-        if not spec_alg.is_none() and not spec_alg.is_dspark():
-            self.needs_cpu_seq_lens = True
         self.sparse_prefill_workspace = SparsePrefillWorkspace(self.device)
+        spec_alg = model_runner.spec_algorithm
+        self.needs_cpu_seq_lens = not spec_alg.is_dspark() and (
+            not _is_cuda
+            or not envs.SGLANG_PREP_IN_CUDA_GRAPH.get()
+            or self.online_c128_mtp.enabled()
+        )
 
         self.is_dspark_draft = model_runner.is_draft_worker and spec_alg.is_dspark()
+        self.is_draft_runner = model_runner.is_draft_worker
+        self.cuda_graph_custom_mask = None
 
     def _move_to_device(self, x: List[int]) -> torch.Tensor:
         pin_tensor = torch.tensor(x, dtype=torch.int32, pin_memory=True)
@@ -610,7 +614,7 @@ class DeepseekV4AttnBackend(
         self,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        seq_lens_cpu: List[int],
+        seq_lens_cpu: Optional[List[int]],
         extend_seq_lens: torch.Tensor,
         use_prefill_cuda_graph: bool,
         online_c128_state_slot_offset: int,
@@ -618,6 +622,7 @@ class DeepseekV4AttnBackend(
         if not self.online_c128_mtp.enabled():
             return None
 
+        assert seq_lens_cpu is not None
         num_draft_tokens = self.speculative_num_draft_tokens
         seq_lens_cpu = [int(x) + num_draft_tokens for x in seq_lens_cpu]
         extend_lens_cpu = [num_draft_tokens] * len(seq_lens_cpu)
@@ -800,9 +805,11 @@ class DeepseekV4AttnBackend(
         if envs.SGLANG_PREP_IN_CUDA_GRAPH.get():
             assert out_cache_loc is not None
             bs = len(seq_lens)
-            seq_lens_cpu_list = (
-                seq_lens_cpu.tolist() if seq_lens_cpu is not None else None
-            )
+            if self.needs_cpu_seq_lens:
+                assert seq_lens_cpu is not None
+                seq_lens_cpu_list = seq_lens_cpu.tolist()
+            else:
+                seq_lens_cpu_list = None
             if ragged_layout is None:
                 self.extend_seq_lens_buffer[:bs].fill_(
                     self.speculative_num_draft_tokens
@@ -838,12 +845,14 @@ class DeepseekV4AttnBackend(
                 total_verify_tokens=total_verify_tokens,
             )
         else:
-            seq_lens_cpu = seq_lens.tolist()
+            seq_lens_cpu_list = (
+                seq_lens_cpu.tolist() if seq_lens_cpu is not None else seq_lens.tolist()
+            )
             return self.init_forward_metadata_target_verify_old(
                 max_seq_len=max_seq_len,
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
-                seq_lens_cpu=seq_lens_cpu,
+                seq_lens_cpu=seq_lens_cpu_list,
                 out_cache_loc=out_cache_loc,
                 use_prefill_cuda_graph=use_prefill_cuda_graph,
                 online_c128_state_slot_offset=online_c128_state_slot_offset,
@@ -1039,32 +1048,38 @@ class DeepseekV4AttnBackend(
 
     def init_forward_metadata_draft_extend(
         self,
-        max_seq_len: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        seq_lens_cpu: List[int],
         num_tokens_per_req: int,
         out_cache_loc: Optional[torch.Tensor] = None,
-        use_prefill_cuda_graph: bool = False,
     ) -> DSV4Metadata:
         batch_size = len(seq_lens)
-        extend_seq_lens_cpu = [num_tokens_per_req] * batch_size
-        extend_seq_lens = self._move_to_device(extend_seq_lens_cpu)
         num_tokens = num_tokens_per_req * batch_size
         if out_cache_loc is None:
             out_cache_loc = seq_lens.new_zeros(num_tokens)
-        return self.init_forward_metadata_prefill(
-            seq_lens=seq_lens,
-            max_seq_len=max_seq_len,
-            req_pool_indices=req_pool_indices,
-            seq_lens_cpu=seq_lens_cpu,
-            out_cache_loc=out_cache_loc,
-            num_tokens=num_tokens,
-            extend_seq_lens=extend_seq_lens,
-            extend_seq_lens_cpu=extend_seq_lens_cpu,
-            extend_start_loc=None,
+
+        seq_lens_casual, req_pool_indices_repeated = (
+            self.expand_extend_with_same_length(
+                bs=batch_size,
+                qo_len=num_tokens_per_req,
+                seq_lens=seq_lens,
+                req_pool_indices=req_pool_indices,
+            )
+        )
+        core_attn_metadata = self.make_core_attn_metadata(
+            req_to_token=self.req_to_token,
+            req_pool_indices_repeated=req_pool_indices_repeated,
+            seq_lens_casual=seq_lens_casual,
+            # Draft extend is SWA-only. Keep the required 2-D page-table
+            # placeholder narrow instead of materializing the full context.
+            max_seq_len=self.page_size,
+            out_loc=out_cache_loc,
             need_compress=False,
-            use_prefill_cuda_graph=use_prefill_cuda_graph,
+            is_prefill=True,
+        )
+        return DSV4Metadata(
+            core_attn_metadata=core_attn_metadata,
+            indexer_metadata=None,
         )
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
@@ -1149,6 +1164,7 @@ class DeepseekV4AttnBackend(
         bs = forward_batch.batch_size
         req_pool_indices = forward_batch.req_pool_indices
         seq_lens = forward_batch.seq_lens
+        uses_cpu_seq_lens = self.needs_cpu_seq_lens or self.is_dspark_draft
 
         if in_capture:
             # Captured graph does no real cache writes, so synthesize a dummy
@@ -1164,14 +1180,14 @@ class DeepseekV4AttnBackend(
                 out_cache_loc = None
             actual_forward_mode = forward_batch.forward_mode
             seq_lens_sum = int(seq_lens.sum().item())
-            seq_lens_cpu = seq_lens.cpu()
+            seq_lens_cpu = seq_lens.cpu() if uses_cpu_seq_lens else None
         else:
             out_cache_loc = forward_batch.out_cache_loc
             actual_forward_mode = getattr(
                 forward_batch, "actual_forward_mode", forward_batch.forward_mode
             )
             seq_lens_sum = forward_batch.seq_lens_sum
-            seq_lens_cpu = forward_batch.seq_lens_cpu
+            seq_lens_cpu = forward_batch.seq_lens_cpu if uses_cpu_seq_lens else None
 
         if actual_forward_mode == ForwardMode.IDLE:
             logger.debug(
@@ -1181,7 +1197,8 @@ class DeepseekV4AttnBackend(
             )
             device = seq_lens.device
             seq_lens = torch.ones(bs, dtype=seq_lens.dtype, device=device)
-            seq_lens_cpu = torch.ones(bs, dtype=torch.int64)
+            if uses_cpu_seq_lens:
+                seq_lens_cpu = torch.ones(bs, dtype=torch.int64)
             seq_lens_sum = bs
             req_pool_indices = torch.zeros(
                 bs, dtype=req_pool_indices.dtype, device=device
@@ -1297,17 +1314,11 @@ class DeepseekV4AttnBackend(
                     mode="constant",
                     value=0,
                 )
-            draft_extend_seq_lens_cpu = (
-                seq_lens_cpu.tolist() if seq_lens_cpu is not None else seq_lens.tolist()
-            )
             temp_metadata = self.init_forward_metadata_draft_extend(
-                max_seq_len=chosen_max_seq_len,
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
-                seq_lens_cpu=draft_extend_seq_lens_cpu,
                 num_tokens_per_req=num_tokens_per_req,
                 out_cache_loc=out_cache_loc,
-                use_prefill_cuda_graph=True,
             )
         else:
             self.online_c128_mtp.clear()
@@ -1348,6 +1359,9 @@ class DeepseekV4AttnBackend(
         logical_forward_mode = _get_logical_forward_mode(forward_batch)
         req_pool_indices = forward_batch.req_pool_indices
         seq_lens = forward_batch.seq_lens.to(torch.int32)
+        # Regular prefill batches already carry scheduler-maintained CPU lengths.
+        # Keep using those when present; needs_cpu_seq_lens only controls whether
+        # speculative overlap must publish a new GPU-to-CPU mirror each step.
         seq_lens_cpu = forward_batch.seq_lens_cpu
         assert self.req_to_token_pool.req_to_token is self.req_to_token
 
@@ -1359,7 +1373,7 @@ class DeepseekV4AttnBackend(
         elif seq_lens_cpu is not None:
             max_seq_len = int(seq_lens_cpu.max().item())
         else:
-            max_seq_len = int(seq_lens.max().item())
+            max_seq_len = self.MAX_SEQ_LEN_FOR_CAPTURE
         verify_bs = _get_target_verify_bs(forward_batch)
         online_c128_state_slot_offset = self.online_c128_mtp.prepare_forward(
             logical_forward_mode,
@@ -1406,29 +1420,35 @@ class DeepseekV4AttnBackend(
                 online_c128_state_slot_offset=online_c128_state_slot_offset,
                 ragged_layout=ragged_layout,
             )
-        elif logical_forward_mode.is_prefill(include_draft_extend_v2=True):
+        elif logical_forward_mode.is_draft_extend_v2():
+            num_tokens_per_req = self.speculative_num_draft_tokens
+            assert num_tokens_per_req > 0
+            metadata = self.init_forward_metadata_draft_extend(
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                num_tokens_per_req=num_tokens_per_req,
+                out_cache_loc=forward_batch.out_cache_loc,
+            )
+        elif logical_forward_mode.is_prefill():
             extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
             extend_seq_lens = forward_batch.extend_seq_lens
             assert (
                 seq_lens is not None
+                and seq_lens_cpu is not None
                 and extend_seq_lens is not None
                 and extend_seq_lens_cpu is not None
-            )
-            is_draft = forward_batch.forward_mode.is_draft_extend_v2()
-            prefill_seq_lens_cpu = (
-                seq_lens_cpu.tolist() if seq_lens_cpu is not None else seq_lens.tolist()
             )
             metadata = self.init_forward_metadata_prefill(
                 max_seq_len=max_seq_len,
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
-                seq_lens_cpu=prefill_seq_lens_cpu,
+                seq_lens_cpu=seq_lens_cpu.tolist(),
                 out_cache_loc=forward_batch.out_cache_loc,
                 num_tokens=sum(extend_seq_lens_cpu),
                 extend_seq_lens=extend_seq_lens,
                 extend_seq_lens_cpu=extend_seq_lens_cpu,
                 extend_start_loc=forward_batch.extend_start_loc,
-                need_compress=not is_draft,
+                need_compress=True,
                 use_prefill_cuda_graph=use_prefill_cuda_graph,
             )
         else:
@@ -1480,6 +1500,20 @@ class DeepseekV4AttnBackend(
         self.draft_extend_num_tokens_per_req = (
             max_num_tokens // max_bs if max_bs > 0 else 1
         )
+        if self.speculative_num_draft_tokens and not self.is_draft_runner:
+            # DSV4's verify metadata ignores custom_mask, but handing
+            # build_tree a preallocated scratch keeps it from dynamically
+            # allocating a FULL_MASK buffer (bs * max_context_len under the
+            # GPU-only spec path) every verify step.
+            self.cuda_graph_custom_mask = torch.zeros(
+                max_num_tokens
+                * (self.max_context_len + self.speculative_num_draft_tokens),
+                dtype=torch.bool,
+                device=self.device,
+            )
+
+    def get_verify_buffers_to_fill_after_draft(self):
+        return [self.cuda_graph_custom_mask, None]
 
     def replay_cuda_graph_metadata_from(
         self,
@@ -1656,9 +1690,14 @@ class DeepseekV4AttnBackend(
                     extra_indices.shape[-1] % 64 == 0
                 ), f"{extra_indices.shape=}'s last dimension is not aligned to 64"
 
-            if forward_batch.forward_mode.is_extend_without_speculative() and (
-                q.shape[0] > _LARGE_INDEXER_QUERY_THRESHOLD
-                or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
+            # sparse_prefill_fwd does not support SM120.
+            if (
+                forward_batch.forward_mode.is_extend_without_speculative()
+                and not _is_sm120
+                and (
+                    q.shape[0] > _LARGE_INDEXER_QUERY_THRESHOLD
+                    or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
+                )
             ):
                 return self._forward_prefill_sparse(
                     q=q,
