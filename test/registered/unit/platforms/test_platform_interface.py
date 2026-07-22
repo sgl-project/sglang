@@ -431,6 +431,106 @@ class TestPinMemoryAvailability(CustomTestCase):
         mock_cuda_available.assert_not_called()
 
 
+class TestDeviceNameDispatch(CustomTestCase):
+    """Tests for common device-name dispatch through OOT platforms."""
+
+    def test_oot_device_name_override_is_used_before_runtime_probe(self):
+        from sglang.srt.utils import common
+
+        class P(SRTPlatform):
+            _enum = PlatformEnum.OOT
+            device_name = "custom"
+            device_type = "custom"
+
+            def __init__(self):
+                self.calls = []
+
+            def get_device_name(self, device_id=0):
+                self.calls.append(device_id)
+                return "Custom Accelerator"
+
+        platform = P()
+        with (
+            patch.object(common, "current_platform", platform),
+            patch("torch.cuda.is_available", return_value=True),
+            patch("torch.cuda.get_device_name") as mock_cuda_name,
+        ):
+            self.assertEqual(common.get_device_name(2), "Custom Accelerator")
+
+        self.assertEqual(platform.calls, [2])
+        mock_cuda_name.assert_not_called()
+
+    def test_oot_device_name_uses_documented_device_mixin_override(self):
+        from sglang.srt.utils import common
+
+        class M(DeviceMixin):
+            def get_device_name(self, device_id=0):
+                return f"Mixin Accelerator {device_id}"
+
+        class P(SRTPlatform, M):
+            _enum = PlatformEnum.OOT
+            device_name = "custom"
+            device_type = "custom"
+
+        with patch.object(common, "current_platform", P()):
+            self.assertEqual(common.get_device_name(3), "Mixin Accelerator 3")
+
+    def test_oot_without_override_preserves_legacy_runtime_detection(self):
+        from sglang.srt.utils import common
+
+        class P(SRTPlatform):
+            _enum = PlatformEnum.OOT
+            device_name = "custom"
+            device_type = "custom"
+
+        with (
+            patch.object(common, "current_platform", P()),
+            patch("torch.cuda.is_available", return_value=True),
+            patch(
+                "torch.cuda.get_device_name", return_value="Legacy CUDA Device"
+            ) as mock_cuda_name,
+        ):
+            self.assertEqual(common.get_device_name(4), "Legacy CUDA Device")
+
+        mock_cuda_name.assert_called_once_with(4)
+
+    def test_oot_device_name_override_errors_propagate(self):
+        from sglang.srt.utils import common
+
+        for error_type in (RuntimeError, NotImplementedError):
+            with self.subTest(error_type=error_type):
+
+                class P(SRTPlatform):
+                    _enum = PlatformEnum.OOT
+                    device_name = "custom"
+                    device_type = "custom"
+
+                    def get_device_name(self, device_id=0):
+                        raise error_type("device name query failed")
+
+                with patch.object(common, "current_platform", P()):
+                    with self.assertRaisesRegex(error_type, "query failed"):
+                        common.get_device_name(0)
+
+    def test_in_tree_platform_keeps_legacy_runtime_detection(self):
+        from sglang.srt.utils import common
+
+        class P(CudaSRTPlatform):
+            def get_device_name(self, device_id=0):
+                raise AssertionError("in-tree platform hook should not run")
+
+        with (
+            patch.object(common, "current_platform", P()),
+            patch("torch.cuda.is_available", return_value=True),
+            patch(
+                "torch.cuda.get_device_name", return_value="Legacy CUDA Device"
+            ) as mock_cuda_name,
+        ):
+            self.assertEqual(common.get_device_name(5), "Legacy CUDA Device")
+
+        mock_cuda_name.assert_called_once_with(5)
+
+
 # ---------------------------------------------------------------------------
 # Platform Discovery: _resolve_platform
 # ---------------------------------------------------------------------------

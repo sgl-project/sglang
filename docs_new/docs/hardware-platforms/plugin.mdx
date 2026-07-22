@@ -70,7 +70,7 @@ Key design points:
 - All methods are **instance methods** (not classmethods), called through the `current_platform` singleton
 - Device operations and factory methods raise `NotImplementedError` by default (fail-fast)
 - Capability flags use safe conservative defaults (`False`/`pass`)
-- Methods are annotated `[Active]` (called by SGLang core) or `[Planned]` (reserved for future migration)
+- Methods are annotated `[Active]` (at least one SGLang core path is routed through `current_platform`) or `[Planned]` (reserved for future migration)
 
 ### Platform Discovery (`current_platform`)
 
@@ -203,6 +203,7 @@ class MyDeviceMixin(DeviceMixin):
     device_type = "my_device"   # torch device type
 
     def set_device(self, device) -> None: ...
+    # Optional override; otherwise SRT keeps legacy runtime name detection.
     def get_device_name(self, device_id=0) -> str: ...
     def get_device_total_memory(self, device_id=0) -> int: ...
     def get_current_memory_usage(self, device=None) -> float: ...
@@ -292,7 +293,7 @@ python -c "from sglang.srt.platforms import current_platform; print(current_plat
 
 #### Device Operations (from DeviceMixin)
 
-> Methods annotated **[Active]** are called by SGLang core through `current_platform` — OOT implementations take effect immediately.
+> Methods annotated **[Active]** have at least one SGLang core path routed through `current_platform` — OOT implementations take effect on those routed paths.
 > Methods annotated **[Planned]** are reserved interfaces — SGLang core still uses hardcoded calls (e.g. `torch.cuda.empty_cache()`). OOT implementations will NOT take effect until the core is migrated in a future PR.
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
@@ -326,8 +327,8 @@ python -c "from sglang.srt.platforms import current_platform; print(current_plat
     <tr>
       <td><code>get_device_name(device_id)</code></td>
       <td><code>raise NotImplementedError</code></td>
-      <td>Planned</td>
-      <td>Get human-readable device name</td>
+      <td><strong>Active</strong></td>
+      <td>Optional OOT override for a human-readable device name. Without an override, SRT keeps its existing runtime detection.</td>
     </tr>
     <tr>
       <td><code>get_device_uuid(device_id)</code></td>
