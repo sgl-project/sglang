@@ -1822,6 +1822,8 @@ class TranscriptionRequest(BaseModel):
     temperature: float = 0.0
     timestamp_granularities: Optional[List[str]] = None
     stream: bool = False
+    prompt: Optional[str] = None
+    chat_template_kwargs: Optional[Dict] = None
     # Internal fields (not from API)
     audio_data: Optional[bytes] = None
     audio_duration_s: float = 0.0

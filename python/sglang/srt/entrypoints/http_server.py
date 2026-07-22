@@ -19,6 +19,7 @@ This file implements HTTP APIs for the inference engine via fastapi.
 
 import asyncio
 import dataclasses
+import json
 import logging
 import os
 import ssl
@@ -1738,6 +1739,8 @@ async def openai_v1_audio_transcriptions(
     timestamp_granularities: Optional[List[str]] = Form(
         default=None, alias="timestamp_granularities[]"
     ),
+    prompt: Optional[str] = Form(default=None),
+    chat_template_kwargs: Optional[str] = Form(default=None),
 ):
     """OpenAI-compatible audio transcription endpoint."""
     if response_format not in ["json", "text", "verbose_json"]:
@@ -1752,6 +1755,23 @@ async def openai_v1_audio_transcriptions(
 
     audio_data = await file.read()
 
+    parsed_chat_template_kwargs: Optional[Dict] = None
+    if chat_template_kwargs is not None:
+        try:
+            parsed = json.loads(chat_template_kwargs)
+            if parsed is not None and not isinstance(parsed, dict):
+                raise ValueError("chat_template_kwargs must be a JSON object")
+            parsed_chat_template_kwargs = parsed
+        except (json.JSONDecodeError, ValueError) as e:
+            return ORJSONResponse(
+                content={
+                    "error": {
+                        "message": f"Invalid chat_template_kwargs: {str(e)}"
+                    }
+                },
+                status_code=400,
+            )
+
     return (
         await raw_request.app.state.openai_serving_transcription.create_transcription(
             audio_data=audio_data,
@@ -1761,6 +1781,8 @@ async def openai_v1_audio_transcriptions(
             temperature=temperature,
             stream=stream,
             timestamp_granularities=timestamp_granularities,
+            prompt=prompt,
+            chat_template_kwargs=parsed_chat_template_kwargs,
             raw_request=raw_request,
         )
     )
