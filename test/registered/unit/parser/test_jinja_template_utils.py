@@ -245,6 +245,35 @@ class TestTemplateContentFormatDetection(CustomTestCase):
         self.assertEqual(len(modalities), 1)
         self.assertEqual(modalities[0], ["vision"])
 
+    def test_process_content_image_with_flat_max_dynamic_patch(self):
+        """Test flat image max_dynamic_patch is preserved in ImageData."""
+        msg_dict = {
+            "role": "user",
+            "content": [
+                {
+                    "type": "input_image",
+                    "image_url": "http://example.com/image.jpg",
+                    "detail": "high",
+                    "max_dynamic_patch": 8,
+                }
+            ],
+        }
+
+        image_data = []
+        video_data = []
+        audio_data = []
+        modalities = []
+
+        result = process_content_for_template_format(
+            msg_dict, "openai", image_data, video_data, audio_data, modalities
+        )
+
+        self.assertEqual(result["content"], [{"type": "image"}])
+        self.assertEqual(len(image_data), 1)
+        self.assertEqual(image_data[0].url, "http://example.com/image.jpg")
+        self.assertEqual(image_data[0].detail, "high")
+        self.assertEqual(image_data[0].max_dynamic_patch, 8)
+
     def test_process_content_filter_none_values(self):
         """Test that None values are filtered out of processed messages."""
         msg_dict = {
