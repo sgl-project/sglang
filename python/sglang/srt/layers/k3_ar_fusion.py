@@ -249,3 +249,41 @@ def all_reduce_norm(
             num_norm_rows=num_tokens,
             input_mc_ptr=_find_mc_ptr(state, x),
         )
+
+
+def finalize_push_fits(num_tokens: int) -> bool:
+    """Whether a [num_tokens, NORM_DIM] latent fits the 1shot push window
+    (the finalize-fused AR is push-only; larger sizes keep the in-op
+    finalize + :func:`all_reduce_norm` NVLS path)."""
+    state = _STATE
+    assert state is not None
+    nbytes = num_tokens * NORM_DIM * 2
+    return nbytes <= min(_PUSH_MAX_BYTES, state.comm.max_push_size)
+
+
+def finalize_all_reduce_push_norm(
+    out: torch.Tensor,
+    gemm2_out: torch.Tensor,
+    expanded_idx_to_permuted_idx: torch.Tensor,
+    expert_weights: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Deferred MoE finalize fused into the 1shot push AR + RMSNorm on every
+    row; ``out`` ([T, NORM_DIM] bf16) is output-only. Caller checked
+    :func:`finalize_push_fits`; same call-site contract as
+    :func:`all_reduce`."""
+    from sglang.jit_kernel.kimi_k3 import all_reduce as mod
+
+    state = _STATE
+    assert state is not None
+    return mod.finalize_all_reduce_push_norm(
+        state.world_size,
+        out,
+        gemm2_out,
+        expanded_idx_to_permuted_idx,
+        expert_weights,
+        weight,
+        eps,
+        ws_mc_base=state.comm.mc_base_ptr,
+    )

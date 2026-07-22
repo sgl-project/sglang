@@ -65,6 +65,7 @@ def _jit_module(world_size: int) -> Module:
             ("push_norm", f"{cls}::push_norm"),
             ("pull_res", f"{cls}::pull_res"),
             ("pull_norm", f"{cls}::pull_norm"),
+            ("finalize_push_norm", f"{cls}::finalize_push_norm"),
         ],
         extra_cuda_cflags=["-O3"],
     )
@@ -180,6 +181,30 @@ def _push_norm_op(
     )
 
 
+@register_custom_op(mutates_args=["out"])
+def _finalize_push_norm_op(
+    world_size: int,
+    out: torch.Tensor,
+    gemm2_out: torch.Tensor,
+    expanded_idx_to_permuted_idx: torch.Tensor,
+    expert_weights: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    ws_mc_base: int,
+) -> None:
+    comm = _COMM_MAP[world_size].obj
+    _jit_module(world_size).finalize_push_norm(
+        comm,
+        out.view(-1),
+        gemm2_out,
+        expanded_idx_to_permuted_idx,
+        expert_weights,
+        weight,
+        eps,
+        ws_mc_base,
+    )
+
+
 @register_custom_op(mutates_args=["x"])
 def _pull_res_op(
     world_size: int,
@@ -262,6 +287,37 @@ def all_reduce_push_norm(
     ``num_norm_rows`` rows of ``x`` viewed as [numel / 3584, 3584]."""
     _push_norm_op(world_size, x, weight, eps, num_norm_rows, ws_mc_base)
     return x
+
+
+def finalize_all_reduce_push_norm(
+    world_size: int,
+    out: torch.Tensor,
+    gemm2_out: torch.Tensor,
+    expanded_idx_to_permuted_idx: torch.Tensor,
+    expert_weights: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    *,
+    ws_mc_base: int,
+) -> torch.Tensor:
+    """Deferred MoE finalize + 1shot push all-reduce + RMSNorm on EVERY row.
+
+    ``out`` ([T, 3584] bf16) is output-only; each rank's partial latent
+    (``sum_k expert_weights[t, k] * gemm2_out[idx[t*16 + k]]``, -1 slots
+    skipped) is computed during the multicast staging pass from the
+    trtllm-gen deferred-finalize triple (``do_finalize=False``) and never
+    materializes in global memory. top_k is fixed to 16 (K3)."""
+    _finalize_push_norm_op(
+        world_size,
+        out,
+        gemm2_out,
+        expanded_idx_to_permuted_idx,
+        expert_weights,
+        weight,
+        eps,
+        ws_mc_base,
+    )
+    return out
 
 
 def all_reduce_pull_res(

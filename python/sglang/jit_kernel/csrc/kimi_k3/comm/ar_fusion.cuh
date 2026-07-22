@@ -57,6 +57,11 @@ struct FusionParams {
   float norm_eps;
   uint32_t num_norm_rows;
   uint32_t num_push_counters;  // cluster variant only: full counter array size
+  // finalize_push_norm only: trtllm-gen deferred-finalize inputs (kimi_k3.py
+  // SGLANG_K3_DEFER_MOE_FINALIZE); `input` is then output-only ([T, kNormDim])
+  const uint8_t* fin_gemm2;    // [P, kNormDim] bf16, permuted rows
+  const uint8_t* fin_idx;      // [T * kFinTopK] int32, -1 = dropped slot
+  const uint8_t* fin_weights;  // [T, kFinTopK] bf16
 };
 
 // The *_norm variants view the input as rows of the K3 latent width (3584
@@ -137,6 +142,81 @@ __global__ __launch_bounds__(1024, 1) void all_reduce_push_res_kernel(const __gr
   if (tx == 0) params.push_counter[bx].inc(1);  // u32 overflow is safe under mod 2
 }
 
+// --- deferred-finalize staging (finalize_push_norm) ------------------------
+// The trtllm-gen MoE with do_finalize=False hands back its finalize inputs
+// (see jit_kernel/trtllm_gen_moe.py); the fused kernel computes the finalize
+// during the push staging pass, so the rank-local latent never materializes.
+
+constexpr uint32_t kFinTopK = 16;
+
+// bf16 x bf16 -> fp32 fused multiply-add (same idiom as gemm/tiny_gemm.cuh).
+// The bf16 product is exact in fp32, so the fallback is bit-identical.
+SGL_DEVICE float fma_f32_bf16(bf16_t a, bf16_t b, float acc) {
+#if SGL_ARCH_BLACKWELL_OR_GREATER
+  const uint16_t a_bits = __bfloat16_as_ushort(a);
+  const uint16_t b_bits = __bfloat16_as_ushort(b);
+  float result;
+  asm("fma.rn.f32.bf16 %0, %1, %2, %3;" : "=f"(result) : "h"(a_bits), "h"(b_bits), "f"(acc));
+  return result;
+#else
+  return fmaf(device::cast<fp32_t>(a), device::cast<fp32_t>(b), acc);
+#endif
+}
+
+// One 16B vector of the deferred MoE finalize (fused twin of the standalone
+// kimi_k3/moe_finalize.cuh, latent width fixed to kNormDim):
+//   local[t] = sum_k fin_weights[t, k] * fin_gemm2[fin_idx[t*16 + k]]
+// All 16 gathers issue before the FMA chain; threads of the same token
+// broadcast-load the same routing rows.
+SGL_DEVICE device::AlignedVector<bf16x2_t, 4> finalize_vec(const FusionParams& params, uint32_t vid) {
+  using namespace device;
+  constexpr uint32_t kIdxVecSize = kMaxVecBytes / sizeof(int32_t);
+  constexpr uint32_t kWVecSize = kMaxVecBytes / sizeof(bf16_t);
+  constexpr uint32_t kIdxVecs = kFinTopK / kIdxVecSize;  // 2 on SM100+
+  constexpr uint32_t kWVecs = kFinTopK / kWVecSize;      // 1 on SM100+
+
+  const uint32_t token = vid / kNormRowVecs;
+  const uint32_t hvec = vid % kNormRowVecs;
+
+  AlignedVector<int32_t, kIdxVecSize> idx[kIdxVecs];
+#pragma unroll
+  for (uint32_t j = 0; j < kIdxVecs; ++j) {
+    idx[j].load(params.fin_idx, token * kIdxVecs + j);
+  }
+  AlignedVector<bf16_t, kWVecSize> weight[kWVecs];
+#pragma unroll
+  for (uint32_t j = 0; j < kWVecs; ++j) {
+    weight[j].load(params.fin_weights, token * kWVecs + j);
+  }
+
+  const auto* g2 = reinterpret_cast<const bf16_t*>(params.fin_gemm2);
+  AlignedVector<bf16_t, 8> in[kFinTopK];
+#pragma unroll
+  for (uint32_t k = 0; k < kFinTopK; ++k) {
+    const int32_t row = idx[k / kIdxVecSize][k % kIdxVecSize];
+    if (row >= 0) {
+      in[k].load(g2 + static_cast<int64_t>(row) * kNormDim, hvec);
+    }
+  }
+  float acc[8] = {};
+#pragma unroll
+  for (uint32_t k = 0; k < kFinTopK; ++k) {
+    const int32_t row = idx[k / kIdxVecSize][k % kIdxVecSize];
+    if (row < 0) continue;
+    const bf16_t w_k = weight[k / kWVecSize][k % kWVecSize];
+#pragma unroll
+    for (uint32_t i = 0; i < 8; ++i) {
+      acc[i] = fma_f32_bf16(in[k][i], w_k, acc[i]);
+    }
+  }
+  AlignedVector<bf16x2_t, 4> out;
+#pragma unroll
+  for (uint32_t j = 0; j < 4; ++j) {
+    out[j] = cast<bf16x2_t>(fp32x2_t{acc[2 * j], acc[2 * j + 1]});
+  }
+  return out;
+}
+
 template <typename T2, size_t N, size_t M>
 SGL_DEVICE float reduce_sqr(device::AlignedVector<T2, N>& out_vec, device::AlignedVector<T2, N> (&vec)[M]) {
   fp32x2_t acc_vec[N];
@@ -160,7 +240,10 @@ SGL_DEVICE float reduce_sqr(device::AlignedVector<T2, N>& out_vec, device::Align
   return sum_eq;
 }
 
-template <uint32_t kWorldSize, uint32_t kClusterSize, bool kUsePDL>
+// kFinalize: stage 1 computes the deferred MoE finalize per vector instead of
+// reading a staged input tensor; `input` is then output-only. The host sets
+// num_norm_rows to the full row count (every reduced row is normed).
+template <uint32_t kWorldSize, uint32_t kClusterSize, bool kUsePDL, bool kFinalize = false>
 __global__ __launch_bounds__(kNormRowVecs / kClusterSize) __cluster_dims__(kClusterSize, 1, 1)  //
     void all_reduce_push_norm_cluster_kernel(const __grid_constant__ FusionParams params) {
   namespace cg = cooperative_groups;
@@ -207,11 +290,16 @@ __global__ __launch_bounds__(kNormRowVecs / kClusterSize) __cluster_dims__(kClus
   const auto push_ptr = params.push_ws_mc + r * stride_bytes + phase_stride_bytes;
   const auto poll_ptr = params.push_ws_local + phase_stride_bytes;
 
-  // stage 1: identical multicast staging (grid-stride)
+  // stage 1: multicast staging (grid-stride); kFinalize computes each vector
+  // in place of the load
   static_assert(fp_trait<bf16_t>::pos_zero == 0, "the empty marker is all-zero bits");
   for (auto vid = global_tid; vid < num_vecs; vid += num_threads) {
     vec_t vec;
-    ld_global_16B(vec, params.input, vid);
+    if constexpr (kFinalize) {
+      vec = finalize_vec(params, vid);
+    } else {
+      ld_global_16B(vec, params.input, vid);
+    }
     auto& bits = *reinterpret_cast<uint4*>(&vec);
     if (bits.x == 0) bits.x = fp_trait<bf16_t>::neg_zero;
     if (bits.y == 0) bits.y = fp_trait<bf16_t>::neg_zero;
@@ -735,6 +823,56 @@ struct AllReduceFusionKernel {
     CHECK_HOST(num_row_clusters < data.num_push_blocks);
     host::LaunchKernel((num_row_clusters + 1) * kClusterSize, kNormRowVecs / kClusterSize, input.device())
         .enable_pdl(kUsePDL)(all_reduce_push_norm_cluster_kernel<kWorldSize, kClusterSize, kUsePDL>, params);
+  }
+
+  /// Deferred MoE finalize + 1shot push all-reduce + RMSNorm over EVERY row.
+  /// `out` (flattened [num_tokens * kNormDim] bf16) is output-only: each
+  /// rank's partial latent is computed from the trtllm-gen deferred-finalize
+  /// triple during the staging pass and never materializes in global memory.
+  static void finalize_push_norm(
+      CommunicatorRef ref,
+      TensorView out,
+      TensorView gemm2_out,
+      TensorView permuted_idx,
+      TensorView expert_weights,
+      TensorView weight,
+      float eps,
+      int64_t ws_mc_base) {
+    using namespace host;
+    constexpr auto kClusterSize = 7;
+    const auto& data = *ref.get();
+    // every row of the latent-only output is normed
+    auto params = make_params_norm(data, out, weight, eps, out.size(0) / kNormDim);
+    const auto num_tokens = params.num_vecs / kNormRowVecs;
+
+    auto P = SymbolicSize{"num_permuted_rows"};
+    auto T = SymbolicSize{"num_tokens"};
+    T.set_value(num_tokens);
+    auto K = SymbolicSize{"top_k"};
+    auto TK = SymbolicSize{"num_expanded"};
+    TK.set_value(static_cast<int64_t>(num_tokens) * kFinTopK);
+    SymbolicDevice device;
+    device.set_options<kDLCUDA>();
+    TensorMatcher({P, kNormDim}).with_dtype<bf16_t>().with_device<kDLCUDA>(device).verify(gemm2_out);
+    TensorMatcher({T, K}).with_dtype<bf16_t>().with_device<kDLCUDA>(device).verify(expert_weights);
+    TensorMatcher({TK}).with_dtype<int32_t>().with_device<kDLCUDA>(device).verify(permuted_idx);
+    CHECK_HOST(K.unwrap() == kFinTopK) << "finalize_push_norm is specialized for top_k = " << kFinTopK;
+
+    CHECK_HOST(ws_mc_base != 0) << "push requires a multicast-capable workspace";
+    const int64_t nbytes = int64_t(params.num_vecs) * 16;
+    CHECK_HOST(nbytes <= data.push_bytes)
+        << "output size " << nbytes << " exceeds push workspace size " << data.push_bytes;
+    params.push_ws_mc = reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(ws_mc_base));
+    params.fin_gemm2 = static_cast<const uint8_t*>(gemm2_out.data_ptr());
+    params.fin_idx = static_cast<const uint8_t*>(permuted_idx.data_ptr());
+    params.fin_weights = static_cast<const uint8_t*>(expert_weights.data_ptr());
+
+    constexpr uint32_t kMaxClusters = 96;
+    const auto num_row_clusters = std::max<uint32_t>(std::min(num_tokens, kMaxClusters), 1);
+    CHECK_HOST(num_row_clusters < data.num_push_blocks);
+    host::LaunchKernel((num_row_clusters + 1) * kClusterSize, kNormRowVecs / kClusterSize, out.device())
+        .enable_pdl(kUsePDL)(
+            all_reduce_push_norm_cluster_kernel<kWorldSize, kClusterSize, kUsePDL, /*kFinalize=*/true>, params);
   }
 
   /// Low-SM NVLS pull (+ optional residual): in-place reduce-scatter +

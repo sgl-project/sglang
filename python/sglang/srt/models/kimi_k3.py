@@ -848,6 +848,18 @@ class KimiK3MoE(nn.Module):
             not get_moe_runner_backend().is_flashinfer_mxfp4()
         )
 
+        # Defer the trtllm-gen finalize (top-k weighted unpermute) out of the
+        # MoE op and fuse it into the push all-reduce's staging pass
+        # (k3_ar_fusion.finalize_all_reduce_push_norm): the rank-local latent
+        # never materializes. Only the situ packed-routing trtllm-gen path
+        # serves the deferral; sizes beyond the push window fall back to the
+        # in-op finalize at runtime (finalize_push_fits).
+        self._defer_moe_finalize = (
+            envs.SGLANG_K3_DEFER_MOE_FINALIZE.get()
+            and get_moe_runner_backend().is_flashinfer_mxfp4()
+            and config.hidden_act == "situ"
+        )
+
         # Shared experts (operate in original hidden_size space).
         # Replicate the shared-expert weights (tp1, DSv2 convention) under EP
         # a2a: the block runs on partial batches (shard / DP-local rows), and
@@ -1116,6 +1128,14 @@ class KimiK3MoE(nn.Module):
         if expert_output.data_ptr() != latent.data_ptr():
             latent.copy_(expert_output)
 
+    def _forward_routed_deferred(self, hidden_states, router_logits, routed_input):
+        """Routed experts with the in-op finalize skipped: returns the
+        FlashInferTrtllmDeferredFinalizeOutput triple (permuted gemm2 output,
+        expanded_idx_to_permuted_idx, expert_weights) for the finalize-fused
+        all-reduce."""
+        topk_output = self.topk(hidden_states, router_logits)
+        return self.experts.forward_deferred_finalize(routed_input, topk_output)
+
     def _forward_shared(self, gate_up, shared_output):
         shared = self.shared_experts
         if TYPE_CHECKING:
@@ -1175,9 +1195,21 @@ class KimiK3MoE(nn.Module):
         shared_output = buf[latent_numel:].view(num_tokens, hidden_size)
         fused_norm = False
         if self.alt_stream is not None and k3_ar_fusion.enabled():
+            defer_finalize = (
+                self._defer_moe_finalize
+                and self.fuse_ar_norm
+                and k3_ar_fusion.finalize_push_fits(num_tokens)
+            )
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
-            self._forward_routed(hidden_states, router_logits, routed_input, latent)
+            if defer_finalize:
+                deferred = self._forward_routed_deferred(
+                    hidden_states, router_logits, routed_input
+                )
+            else:
+                self._forward_routed(
+                    hidden_states, router_logits, routed_input, latent
+                )
             with torch.cuda.stream(self.alt_stream):
                 self._forward_shared(gate_up, shared_output)
                 # low-SM pull so the side-stream AR leaves the SMs to the
@@ -1187,7 +1219,18 @@ class KimiK3MoE(nn.Module):
             # NOTE: the latent AR must stay serialized after the shared AR
             # (both reuse the v2 pull semaphores; concurrent calls would
             # corrupt each other's barrier windows) — the join above does it.
-            if self.fuse_ar_norm:
+            if defer_finalize:
+                # finalize folded into the push AR's staging pass; the norm
+                # covers every latent row
+                fused_norm = True
+                k3_ar_fusion.finalize_all_reduce_push_norm(
+                    latent,
+                    deferred.gemm2_out,
+                    deferred.expanded_idx_to_permuted_idx,
+                    deferred.expert_weights,
+                    *self._get_fused_norm_params(),
+                )
+            elif self.fuse_ar_norm:
                 fused_norm = True
                 k3_ar_fusion.all_reduce_norm(
                     latent.view(-1, self.moe_hidden_size),
