@@ -35,7 +35,10 @@ import psutil  # isort: skip
 import setproctitle
 import torch
 import torch.distributed
-from torch.cuda import Stream as CudaStream
+try:
+    from torch.cuda import Stream as CudaStream
+except ImportError:
+    CudaStream = None  # type: ignore[misc,assignment]
 from torch.distributed import barrier
 
 from sglang.kernels.ops.mamba.triton_ops import (
