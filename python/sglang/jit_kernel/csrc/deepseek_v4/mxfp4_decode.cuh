@@ -60,8 +60,14 @@ __device__ __forceinline__ float e2m1_positive(uint32_t code) {
   return lut[code & 0x07u];
 }
 
+// Fast E8M0 → float: 2^(bits-127) as an integer shift of the IEEE 754
+// exponent field.  Subnormals (bits == 0 → 2^-127 ≈ 5.88e-39) are clamped
+// to zero, which is safe for scale factors.
 __device__ __forceinline__ float e8m0_to_float(uint8_t bits) {
-  return exp2f(static_cast<float>(static_cast<int>(bits) - 127));
+  if (bits == 0) return 0.0f;  // 2^-127 is practically zero
+  const int k = static_cast<int>(bits) - 127;
+  const uint32_t u = static_cast<uint32_t>(k + 127) << 23;
+  return __int_as_float(u);
 }
 
 // --- parameter struct --------------------------------------------------------
