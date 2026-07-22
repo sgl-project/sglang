@@ -45,10 +45,18 @@ def _get_flashinfer_gdn_kernels():
                 gated_delta_rule_decode_pretranspose,
                 gated_delta_rule_mtp,
             )
-            from flashinfer.gdn_kernels.gdn_decode_bf16_state import (
-                gated_delta_rule_mtp as gated_delta_rule_mtp_bf16,
-            )
             from flashinfer.gdn_prefill import chunk_gated_delta_rule
+
+            # The BF16-state MTP kernel is CuTe-DSL based and only used on
+            # SM100+ (`use_state_pool`). Importing it unconditionally makes
+            # the whole backend unavailable on Hopper when the DSL deps
+            # (`cutlass`) are missing, even though the SM90 kernels above
+            # imported fine.
+            gated_delta_rule_mtp_bf16 = None
+            if is_cuda() and torch.cuda.get_device_capability()[0] >= 10:
+                from flashinfer.gdn_kernels.gdn_decode_bf16_state import (
+                    gated_delta_rule_mtp as gated_delta_rule_mtp_bf16,
+                )
 
             _flashinfer_chunk_gated_delta_rule = chunk_gated_delta_rule
             _flashinfer_gated_delta_rule_mtp = gated_delta_rule_mtp
