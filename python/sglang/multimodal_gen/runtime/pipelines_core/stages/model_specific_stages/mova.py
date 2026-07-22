@@ -29,6 +29,7 @@ from sglang.multimodal_gen.runtime.distributed.communication_op import (
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_cfg_group,
     get_classifier_free_guidance_rank,
+    get_sp_group,
 )
 from sglang.multimodal_gen.runtime.distributed.sp_shard_utils import (
     SpShard,
@@ -722,68 +723,60 @@ class MOVADenoisingStage(PipelineStage):
         grid_size = (t, h, w)
         full_visual_seq_len = t * h * w
 
-        # Build visual freqs for full sequence
-        visual_dit._init_freqs()
-        if _is_npu:
-            # TODO: remove this when torch.complex128 is supported for torch.cat on NPU
-            visual_freqs = tuple(
-                freq.to(device=visual_x.device, dtype=torch.complex64)
-                for freq in visual_dit.freqs
-            )
-        else:
-            visual_freqs = tuple(freq.to(visual_x.device) for freq in visual_dit.freqs)
-        visual_freqs = (
-            torch.cat(
-                [
-                    visual_freqs[0][:t].view(t, 1, 1, -1).expand(t, h, w, -1),
-                    visual_freqs[1][:h].view(1, h, 1, -1).expand(t, h, w, -1),
-                    visual_freqs[2][:w].view(1, 1, w, -1).expand(t, h, w, -1),
-                ],
-                dim=-1,
-            )
-            .reshape(full_visual_seq_len, 1, -1)
-            .to(visual_x.device)
-        )
-
         # Patchify audio latents
         audio_x, (f,) = self.audio_dit.patchify(audio_x, None)
         full_audio_seq_len = f
-
-        # Build audio freqs for full sequence
-        self.audio_dit._init_freqs()
-        if _is_npu:
-            # TODO: remove this when torch.complex128 is supported for torch.cat on NPU
-            audio_freqs = tuple(
-                freq.to(device=audio_x.device, dtype=torch.complex64)
-                for freq in self.audio_dit.freqs
-            )
-        else:
-            audio_freqs = tuple(
-                freq.to(audio_x.device) for freq in self.audio_dit.freqs
-            )
-        audio_freqs = torch.cat(
-            [
-                audio_freqs[0][:f].view(f, -1).expand(f, -1),
-                audio_freqs[1][:f].view(f, -1).expand(f, -1),
-                audio_freqs[2][:f].view(f, -1).expand(f, -1),
-            ],
-            dim=-1,
-        ).reshape(full_audio_seq_len, 1, -1)
 
         # Shard sequences for SP
         visual_x, visual_shard = self._shard_sequence_for_sp(visual_x, dim=1)
         audio_x, audio_shard = self._shard_sequence_for_sp(audio_x, dim=1)
 
-        # Shard freqs to match local sequence length
-        visual_freqs, _ = self._shard_sequence_for_sp(visual_freqs, dim=0)
-        audio_freqs, _ = self._shard_sequence_for_sp(audio_freqs, dim=0)
-
-        # Tail-pad meta so self-attention excludes SP padding (built once per
-        # step, shared by every block).
         visual_attn_meta = tail_attn_meta(
             visual_shard, visual_x.shape[0], visual_x.device
         )
         audio_attn_meta = tail_attn_meta(audio_shard, audio_x.shape[0], audio_x.device)
+
+        sp_rank = get_sp_group().rank_in_group
+        local_video_len = visual_x.shape[1]
+        local_audio_len = audio_x.shape[1]
+
+        # Build visual freqs for full sequence
+
+        # Calculate local sequence offset for the current SP rank
+        v_token_start = sp_rank * local_video_len
+        token_indices = torch.arange(
+            v_token_start,
+            v_token_start + local_video_len,
+            device=visual_x.device,
+            dtype=torch.long,
+        )
+
+        frame_stride = h * w
+        t_idx = token_indices // frame_stride
+        rem = token_indices % frame_stride
+        h_idx = rem // w
+        w_idx = rem % w
+
+        positions_v_local = torch.stack((t_idx, h_idx, w_idx), dim=1)
+
+        # Get freqs in complex64 dtype
+        cos_v, sin_v = visual_dit.rotary_emb.forward_uncached(positions_v_local)
+        visual_freqs = torch.complex(cos_v.float(), sin_v.float()).unsqueeze(-2)
+
+        # Build audio freqs for full sequence
+
+        # Calculate local sequence offset for the current SP rank
+        a_token_start = sp_rank * local_audio_len
+        a_token_indices = torch.arange(
+            a_token_start,
+            a_token_start + local_audio_len,
+            device=audio_x.device,
+            dtype=torch.long,
+        ).unsqueeze(-1)
+
+        # Get freqs in complex64 dtypes
+        cos_a, sin_a = self.audio_dit.rotary_emb.forward_uncached(a_token_indices)
+        audio_freqs = torch.complex(cos_a.float(), sin_a.float()).unsqueeze(-2)
 
         # Forward through dual-tower DiT
         visual_x, audio_x = self.forward_dual_tower_dit(
