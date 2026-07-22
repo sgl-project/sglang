@@ -1,17 +1,17 @@
 # Usage (to build SGLang ROCm docker image):
 #
 #   docker build \
-#     --build-arg GPU_ARCH=gfx1250-rocm7_14 \
+#     --build-arg GPU_ARCH=gfx1250-rocm7_15 \
 #     --build-arg GPU_ARCH_LIST_ARG=gfx1250 \
 #     --build-arg ROCM_VERSION=7.15.0a20260629 \
 #     --build-arg INDEX_URL=https://rocm.nightlies.amd.com/whl-multi-arch/ \
 #     --build-arg TORCH_VERSION=2.11.0 \
 #     --build-arg TORCHVISION_VERSION=0.26.0 \
 #     --build-arg TRITON_VERSION=3.7.0+gitb4e20bbe \
-#     -t rocm/ufb-private:sglang-latest-gfx1250-rocm7.14.0a20260623-full \
+#     -t rocm/ufb-private:sglang-latest-gfx1250-rocm7.15.0a20260623-full \
 #     -f docker/rocm.Dockerfile .
 #
-#   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx1250-rocm7_14 -t v0.5.10.post1-rocm714-gfx1250 -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx1250-rocm7_15 -t v0.5.10.post1-rocm715-gfx1250 -f rocm.Dockerfile .
 #   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx942 -t v0.5.10.post1-rocm700-mi30x -f rocm.Dockerfile .
 #   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx942-rocm720 -t v0.5.10.post1-rocm720-mi30x -f rocm.Dockerfile .
 #   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx950 -t v0.5.10.post1-rocm700-mi35x -f rocm.Dockerfile .
@@ -22,7 +22,7 @@
 # Keep the build-arg for user to select the desired nic support, current choice: [ainic, bxnt]
 # if no set this arg, it will support nic auto detection. On a target with more than 1 type of
 # RDMA NICs installed (rare), overwrite w. runtime env MORI_DEVICE_NIC = "bnxt"|"ionic"|"mlx5"
-#   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx1250-rocm7_14 --build-arg ENABLE_MORI=1 -t v0.5.10.post1-rocm714-gfx1250 -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx1250-rocm7_15 --build-arg ENABLE_MORI=1 -t v0.5.10.post1-rocm715-gfx1250 -f rocm.Dockerfile .
 #   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx942 --build-arg ENABLE_MORI=1 -t v0.5.10.post1-rocm700-mi30x -f rocm.Dockerfile .
 #   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx942-rocm720 --build-arg ENABLE_MORI=1 -t v0.5.10.post1-rocm720-mi30x -f rocm.Dockerfile .
 #   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx950 --build-arg ENABLE_MORI=1 -t v0.5.10.post1-rocm700-mi35x -f rocm.Dockerfile .
@@ -35,7 +35,7 @@
 #   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx950-rocm720 -t v0.5.10.post1-rocm720-mi35x -f rocm.Dockerfile .
 
 # Default base images
-ARG BASE_IMAGE_1250_ROCM7_14="ubuntu:24.04"
+ARG BASE_IMAGE_1250_ROCM7_15="ubuntu:24.04"
 ARG BASE_IMAGE_942="rocm/sgl-dev:rocm7-vllm-20250904"
 ARG BASE_IMAGE_942_ROCM720="rocm/pytorch:rocm7.2_ubuntu22.04_py3.10_pytorch_release_2.9.1"
 ARG BASE_IMAGE_950="rocm/sgl-dev:rocm7-vllm-20250904"
@@ -45,9 +45,9 @@ ARG BASE_IMAGE_950_ROCM720="rocm/pytorch:rocm7.2_ubuntu22.04_py3.10_pytorch_rele
 ARG GPU_ARCH=gfx950
 
 # ===============================
-# Base image 1250 with rocm7_14 and args
+# Base image 1250 with rocm7_15 and args
 # Builds from ubuntu:24.04 — installs ROCm SDK and torch stack via pip.
-FROM $BASE_IMAGE_1250_ROCM7_14 AS gfx1250-rocm7_14
+FROM $BASE_IMAGE_1250_ROCM7_15 AS gfx1250-rocm7_15
 
 # Install Python and system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -242,7 +242,7 @@ RUN if [ -n "$UBUNTU_MIRROR" ]; then \
 # See https://github.com/ROCm/ROCm/issues/5992
 RUN set -eux; \
     case "${GPU_ARCH}" in \
-      *rocm7_14*) \
+      *rocm7_15*) \
         ;; \
       *rocm720*) \
         echo "ROCm 7.2 (GPU_ARCH=${GPU_ARCH}): libdrm-amdgpu packages already present, skipping"; \
@@ -272,7 +272,7 @@ RUN apt-get purge -y sccache; python -m pip uninstall -y sccache; rm -f "$(which
 # The ROCm 7.2 base image (rocm/pytorch) does not pre-install this package.
 RUN set -eux; \
     case "${GPU_ARCH}" in \
-      *rocm7_14*) \
+      *rocm7_15*) \
         # Should install it properly, however it seems there are race
         # conditions between torch and amdsmi module initialization code.
         # keep the following section commented before it is fixed.
@@ -309,11 +309,11 @@ RUN if [ "$BUILD_LLVM" = "1" ]; then \
 # The double-sed patch was to workaround TheRock#2484. As TheRock#3250 has fixed
 # the PATH issue of LLVM, this can be removed for ROCm versions later than
 # 0a20260625.  Keep this commented because we may end up pinning earlier versions.
-# RUN if [ "${GPU_ARCH}" = "gfx1250-rocm7_14" ]; then \
+# RUN if [ "${GPU_ARCH}" = "gfx1250-rocm7_15" ]; then \
 #       apt-get update && apt-get install -y ninja-build patchelf cmake \
 #       && git clone https://github.com/ROCm/FlyDSL.git --branch v0.2.0; \
 #     fi
-# RUN if [ "${GPU_ARCH}" = "gfx1250-rocm7_14" ]; then \
+# RUN if [ "${GPU_ARCH}" = "gfx1250-rocm7_15" ]; then \
 #       cd FlyDSL \
 #       && sed -i '/-DMLIR_ENABLE_ROCM_RUNNER=ON/a\    -DROCM_TEST_CHIPSET="gfx942" \\' scripts/build_llvm.sh \
 #       && sed -i scripts/build_llvm.sh -e '51i\ls && sed -i mlir/lib/Target/LLVM/ROCDL/Target.cpp -e "s|{\\"ld.lld\\"|{\\"/opt/venv/lib/python3.12/site-packages/_rocm_sdk_devel/llvm/bin/ld.lld\\"|"' \
@@ -349,7 +349,7 @@ RUN git clone ${AITER_REPO} \
 RUN cd aiter \
      && echo "[AITER] GPU_ARCH=${GPU_ARCH}" \
      && echo "[AITER] AITER_USE_SYSTEM_TRITON=${AITER_USE_SYSTEM_TRITON}" \
-     && if [ "${GPU_ARCH}" = "gfx1250-rocm7_14" ]; then \
+     && if [ "${GPU_ARCH}" = "gfx1250-rocm7_15" ]; then \
           PATH=$PATH:$ROCM_HOME/llvm/bin ENABLE_CK=0 GPU_ARCHS="${GPU_ARCH_LIST}" python setup.py build_ext --inplace \
           && PATH=$PATH:$ROCM_HOME/llvm/bin ENABLE_CK=0 GPU_ARCHS="${GPU_ARCH_LIST}" pip install --no-build-isolation -e .; \
         elif [ "$BUILD_AITER_ALL" = "1" ] && [ "$BUILD_LLVM" = "1" ]; then \
@@ -520,7 +520,7 @@ RUN /bin/bash -lc 'set -euo pipefail; \
   git fetch --depth=1 origin "${TILELANG_COMMIT}" || true && \
   git checkout -f "${TILELANG_COMMIT}" && \
   git submodule update --init --recursive && \
-  if [ "${GPU_ARCH}" = "gfx1250-rocm7_14" ]; then \
+  if [ "${GPU_ARCH}" = "gfx1250-rocm7_15" ]; then \
     export ROCM_PATH=${ROCM_HOME}; \
   else \
     export ROCM_PATH=/opt/rocm; \
@@ -633,10 +633,7 @@ RUN /bin/bash -lc 'set -euo pipefail; \
   git checkout "${MORI_COMMIT}"; \
   git submodule update --init --recursive; \
   \
-  if [ "${GPU_ARCH}" = "gfx1250-rocm7_14" ]; then \
-    # Fix for ROCm SDK: add find_package(NUMA) before hsakmt
-    sed -i "/find_package(hsa-runtime64 REQUIRED)/i find_package(NUMA REQUIRED)" src/application/CMakeLists.txt; \
-    \
+  if [ "${GPU_ARCH}" = "gfx1250-rocm7_15" ]; then \
     export ROCM_PATH=${ROCM_HOME}; \
     # Build with proper CMAKE_PREFIX_PATH to find NUMA and other ROCm SDK dependencies
     PATH=${ROCM_HOME}/bin:$PATH \
@@ -758,7 +755,7 @@ RUN cd /tmp/whl \
 # so future `pip install` will break the ROCm stack.
 # A workaround for this is to reinstall the default triton
 # wheel with the `rocm/pytorch` image in the root directory.
-# For ROCm 7.14, it is a different story:
+# For ROCm 7.15, it is a different story:
 # https://github.com/ROCm/rocm-systems/issues/7643
 # Rebuilding tag 3.7.0 seems to workaround this issue without
 # sacrificing accuracy. The previous section to rewrite the metadata

@@ -97,7 +97,7 @@ _is_npu = is_npu()
 _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
 
 if _use_aiter:
-    from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype as _aiter_fp8_dtype
+    from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype as _aiter_fp8_dtype
 
     if _is_gfx1250_supported:
         from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
