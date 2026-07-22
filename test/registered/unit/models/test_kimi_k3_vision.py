@@ -573,7 +573,7 @@ def test_kimi_k3_encoder_dp_defers_feature_materialization(monkeypatch):
     assert tower is model.vision_tower
     assert pixel_values is None
     assert grid_thws == [[1, 2, 2], [1, 2, 2]]
-    assert run_dp.call_args.kwargs["rope_type"] == "rope_2d_packed"
+    assert run_dp.call_args.kwargs["rope_type"] == "rope_2d"
     loader = run_dp.call_args.kwargs["load_local_pixel_values"]
     assert callable(loader)
 

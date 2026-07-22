@@ -3110,10 +3110,10 @@ class KimiK3ForConditionalGeneration(nn.Module):
                 # still yields h*w/merge_area output embeddings, so the DP
                 # gather length must ignore t.
                 pool_temporal_dimension=True,
+                pass_grid_thw_list=True,
                 load_local_pixel_values=materialize_item_features,
                 pixel_values_device=device,
                 pixel_values_dtype=target_dtype,
-                pass_grid_thw_list=True,
             )
             return self.mm_projector(image_embeds)
 
