@@ -2,7 +2,7 @@ import torch
 
 from sglang.jit_kernel.benchmark import marker
 from sglang.jit_kernel.benchmark.utils import create_random
-from sglang.jit_kernel.moe_fused_gate import moe_fused_gate, moe_fused_gate_jit
+from sglang.kernels.ops.moe.moe_fused_gate import moe_fused_gate, moe_fused_gate_jit
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(

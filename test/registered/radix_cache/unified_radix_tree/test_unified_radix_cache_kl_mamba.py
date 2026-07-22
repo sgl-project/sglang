@@ -1,5 +1,6 @@
 import os
 import shutil
+import subprocess
 import tempfile
 import unittest
 
@@ -127,6 +128,11 @@ class TestUnifiedMambaHiCache(UnifiedRadixTreeTestMixin, CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
+        cls.process.terminate()
+        try:
+            cls.process.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            pass
         kill_process_tree(cls.process.pid)
 
 
@@ -188,6 +194,11 @@ class TestUnifiedMambaHiCacheL3(AccuracyTwoPassMixin, CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
+        cls.process.terminate()
+        try:
+            cls.process.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            pass
         kill_process_tree(cls.process.pid)
         if os.path.isdir(cls.hicache_dir):
             shutil.rmtree(cls.hicache_dir, ignore_errors=True)

@@ -16,7 +16,7 @@ from sglang.srt.eplb.expert_location import (
     get_global_expert_location_metadata,
 )
 from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import get_model
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -274,8 +274,8 @@ def update_expert_location_with_recovery(
         else:
             # Load the missing weights from disk
             update_weights_from_disk_callable(
-                get_server_args().model_path,
-                get_server_args().load_format,
+                get_model().model_path,
+                get_model().load_format,
                 weight_name_filter=weight_name_filter,
             )
 
