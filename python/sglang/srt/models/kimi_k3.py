@@ -68,7 +68,7 @@ from sglang.srt.layers.moe.utils import (
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
-from sglang.srt.layers.utils import PPMissingLayer
+from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -2782,6 +2782,13 @@ class KimiK3LinearForCausalLM(nn.Module):
         for args in weights:
             name, loaded_weight = args[:2]
             kwargs = args[2] if len(args) > 2 else {}
+
+            layer_id = get_layer_id(name)
+            if layer_id is not None and (
+                layer_id < self.model.start_layer
+                or layer_id >= self.model.end_layer
+            ):
+                continue
 
             # Skip weights of layers outside a truncated config (e.g.
             # num_hidden_layers override for fast testing); the checkpoint may
