@@ -35,7 +35,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.d
 from sglang.multimodal_gen.runtime.models.dits.dreamzero_causal import (
     DreamZeroCausalWanModel,
 )
-from sglang.multimodal_gen.runtime.pipelines.dreamzero_pipeline import DreamZeroPipeline
+from sglang.multimodal_gen.runtime.pipelines.dreamzero_pipeline import (
+    DreamZeroPipeline,
+    _disable_text_encoder_folding_for_cfg,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.dreamzero.denoising import (
     DreamZeroCausalDenoisingStage,
 )
@@ -153,6 +156,44 @@ def test_dreamzero_dit_rope_lengths_are_configurable():
     assert model.freqs[2].shape[0] == 9
     assert model.freqs_action.shape[0] == 10
     assert model.freqs_state.shape[0] == 11
+
+
+def test_dreamzero_dit_keeps_cross_attention_norm_for_native_loading():
+    config = DreamZeroCausalWanConfig(
+        arch_config=DreamZeroCausalWanArchConfig(
+            model_type="ti2v",
+            dim=64,
+            ffn_dim=128,
+            num_heads=4,
+            num_layers=1,
+            frame_seqlen=8,
+            text_dim=32,
+            hidden_size=16,
+        )
+    )
+    model = DreamZeroCausalWanModel(config=config)
+
+    assert not isinstance(model.blocks[0].norm3, torch.nn.Identity)
+
+
+def test_dreamzero_cfg_disables_text_encoder_folding():
+    config = DreamZeroPipelineConfig()
+    config.text_encoder_configs[0].parallel_folding_mode = "world"
+    server_args = types.SimpleNamespace(
+        enable_cfg_parallel=True,
+        pipeline_config=config,
+    )
+
+    _disable_text_encoder_folding_for_cfg(server_args)
+
+    assert config.text_encoder_configs[0].parallel_folding_mode is None
+
+    config.text_encoder_configs[0].parallel_folding_mode = "world"
+    server_args.enable_cfg_parallel = False
+
+    _disable_text_encoder_folding_for_cfg(server_args)
+
+    assert config.text_encoder_configs[0].parallel_folding_mode == "world"
 
 
 def test_dreamzero_action_response_uses_common_action_contract():

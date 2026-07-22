@@ -27,7 +27,7 @@ class DreamZeroCausalWanArchConfig(DiTArchConfig):
     num_layers: int = 40
     max_chunk_size: int = 4
     qk_norm: bool = True
-    cross_attn_norm: bool = False
+    cross_attn_norm: bool = True
     eps: float = 1e-6
     num_frame_per_block: int = 2
     action_dim: int = 32

@@ -224,6 +224,13 @@ def _load_dreamzero_image_encoder(
     return image_encoder
 
 
+def _disable_text_encoder_folding_for_cfg(server_args: ServerArgs) -> None:
+    if not server_args.enable_cfg_parallel:
+        return
+    for text_encoder_config in server_args.pipeline_config.text_encoder_configs:
+        text_encoder_config.parallel_folding_mode = None
+
+
 class DreamZeroPipeline(ComposedPipelineBase):
     """Pipeline that composes DreamZero obs prep, text encoding, DiT and action output."""
 
@@ -262,6 +269,7 @@ class DreamZeroPipeline(ComposedPipelineBase):
         server_args.pipeline_config.dit_config.arch_config.use_tensor_parallel = (
             server_args.pipeline_config.dreamzero_tensor_parallel_size > 1
         )
+        _disable_text_encoder_folding_for_cfg(server_args)
         modules.update(super().load_modules(server_args, loaded_modules))
 
         modules["image_encoder"] = _load_dreamzero_image_encoder(
