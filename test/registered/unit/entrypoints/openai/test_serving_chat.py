@@ -46,6 +46,7 @@ class _MockTokenizerManager:
             reasoning_parser=None,
             stream_response_default_include_usage=False,
             default_chat_template_kwargs=None,
+            return_input_ids=False,
             return_output_ids=False,
             incremental_streaming_output=False,
         )
@@ -1847,6 +1848,7 @@ class ServingChatTestCase(unittest.TestCase):
         return [
             {
                 "text": "Answer",
+                "prompt_token_ids": [1, 2, 3],
                 "output_ids": list(output_ids),
                 "meta_info": {
                     "id": "chatcmpl-output-ids",
@@ -1860,11 +1862,12 @@ class ServingChatTestCase(unittest.TestCase):
             for output_ids in output_ids_by_choice
         ]
 
-    def test_non_streaming_output_ids_emits_sglext(self):
+    def test_non_streaming_ids_emit_sglext(self):
         req = ChatCompletionRequest(
             model="x",
             messages=[{"role": "user", "content": "Hi?"}],
             n=2,
+            return_input_ids=True,
             return_output_ids=True,
         )
 
@@ -1873,13 +1876,15 @@ class ServingChatTestCase(unittest.TestCase):
         )
 
         self.assertIsNotNone(response.sglext)
+        self.assertEqual(response.sglext.input_ids, [1, 2, 3])
         self.assertEqual(response.sglext.output_ids, [[5, 6, 7], [8, 9]])
         dumped = json.loads(response.model_dump_json())
+        self.assertEqual(dumped["sglext"]["input_ids"], [1, 2, 3])
         self.assertEqual(dumped["sglext"]["output_ids"], [[5, 6, 7], [8, 9]])
         # None sglext fields stay stripped from the serialized response.
         self.assertNotIn("routed_experts", dumped["sglext"])
 
-    def test_non_streaming_output_ids_not_returned_by_default(self):
+    def test_non_streaming_ids_not_returned_by_default(self):
         req = ChatCompletionRequest(
             model="x", messages=[{"role": "user", "content": "Hi?"}]
         )
@@ -1890,7 +1895,8 @@ class ServingChatTestCase(unittest.TestCase):
 
         self.assertIsNone(response.sglext)
 
-    def test_non_streaming_output_ids_server_default_enables_flag(self):
+    def test_non_streaming_ids_server_default_enables_flag(self):
+        self.tm.server_args.return_input_ids = True
         self.tm.server_args.return_output_ids = True
         req = ChatCompletionRequest(
             model="x", messages=[{"role": "user", "content": "Hi?"}]
@@ -1901,10 +1907,14 @@ class ServingChatTestCase(unittest.TestCase):
         )
 
         self.assertIsNotNone(response.sglext)
+        self.assertEqual(response.sglext.input_ids, [1, 2, 3])
         self.assertEqual(response.sglext.output_ids, [[5, 6, 7]])
 
-    def test_output_ids_header_enables_flag(self):
-        self.fastapi_request.headers = {"x-sglext-return-output-ids": "1"}
+    def test_ids_header_enables_flag(self):
+        self.fastapi_request.headers = {
+            "x-sglext-return-input-ids": "1",
+            "x-sglext-return-output-ids": "1",
+        }
         req = ChatCompletionRequest(
             model="x",
             messages=[{"role": "user", "content": "Hi?"}],
@@ -1926,6 +1936,7 @@ class ServingChatTestCase(unittest.TestCase):
                 req, self.fastapi_request
             )
 
+        self.assertTrue(processed_request.return_input_ids)
         self.assertTrue(processed_request.return_output_ids)
 
     def _run_output_ids_stream(self, chunk_output_ids, incremental):
@@ -1939,6 +1950,7 @@ class ServingChatTestCase(unittest.TestCase):
                 finished = i == len(chunk_output_ids) - 1
                 yield {
                     "text": "chunk",
+                    "prompt_token_ids": [1, 2, 3],
                     "output_ids": list(ids),
                     "meta_info": {
                         "id": "chatcmpl-output-ids-stream",
@@ -1961,6 +1973,7 @@ class ServingChatTestCase(unittest.TestCase):
             messages=[{"role": "user", "content": "Hi?"}],
             max_tokens=100,
             stream=True,
+            return_input_ids=True,
             return_output_ids=True,
         )
 
@@ -1983,6 +1996,8 @@ class ServingChatTestCase(unittest.TestCase):
 
         self.assertEqual(len(sglext_chunks), 1)
         self.assertEqual(sglext_chunks[0]["choices"], [])
+        # input_ids is captured once as a flat shared prompt, not accumulated.
+        self.assertEqual(sglext_chunks[0]["sglext"]["input_ids"], [1, 2, 3])
         self.assertEqual(sglext_chunks[0]["sglext"]["output_ids"], [[5, 6, 7]])
 
     def test_streaming_output_ids_non_incremental_keeps_latest_full_list(self):
@@ -1991,6 +2006,7 @@ class ServingChatTestCase(unittest.TestCase):
         )
 
         self.assertEqual(len(sglext_chunks), 1)
+        self.assertEqual(sglext_chunks[0]["sglext"]["input_ids"], [1, 2, 3])
         self.assertEqual(sglext_chunks[0]["sglext"]["output_ids"], [[5, 6, 7]])
 
     def _run_output_ids_stream_with_graceful_abort(

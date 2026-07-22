@@ -410,6 +410,7 @@ class SglExt(BaseModel):
 
     routed_experts: Optional[str] = None
     cached_tokens_details: Optional[CachedTokensDetails] = None
+    input_ids: Optional[List[int]] = None
     output_ids: Optional[List[List[int]]] = None
 
     @model_serializer(mode="wrap")
@@ -695,6 +696,7 @@ class ChatCompletionRequest(BaseModel):
     return_cached_tokens_details: bool = False
     return_prompt_token_ids: bool = False
     return_meta_info: bool = False
+    return_input_ids: bool = False
     return_output_ids: bool = False
     reasoning_effort: Optional[Literal["none", "low", "medium", "high", "max"]] = Field(
         default=None,

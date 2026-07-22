@@ -333,6 +333,13 @@ class OpenAIServingChat(OpenAIServingBase):
         """Post-process reasoning and tool_calls before building response."""
         return reasoning_text, tool_calls
 
+    def _should_return_input_ids(self, request: ChatCompletionRequest) -> bool:
+        """Whether prompt (input) token ids should be returned via sglext."""
+        return (
+            request.return_input_ids
+            or self.tokenizer_manager.server_args.return_input_ids
+        )
+
     def _should_return_output_ids(self, request: ChatCompletionRequest) -> bool:
         """Whether sampled output token ids should be returned via sglext."""
         return (
@@ -545,6 +552,11 @@ class OpenAIServingChat(OpenAIServingBase):
         raw_request: Request = None,
     ) -> tuple[GenerateReqInput, ChatCompletionRequest]:
         # Header-based opt-in (same rationale as request_headers.py).
+        if raw_request is not None and not request.return_input_ids:
+            header_value = raw_request.headers.get("x-sglext-return-input-ids")
+            if header_value is not None and header_value.lower() in ("1", "true"):
+                request.return_input_ids = True
+
         if raw_request is not None and not request.return_output_ids:
             header_value = raw_request.headers.get("x-sglext-return-output-ids")
             if header_value is not None and header_value.lower() in ("1", "true"):
@@ -645,7 +657,10 @@ class OpenAIServingChat(OpenAIServingBase):
             video_max_dynamic_patch=vid_max_dynamic_patch,
             max_dynamic_patch=getattr(request, "max_dynamic_patch", None),
             use_audio_in_video=getattr(request, "use_audio_in_video", False),
-            return_prompt_token_ids=request.return_prompt_token_ids,
+            return_prompt_token_ids=(
+                request.return_prompt_token_ids
+                or self._should_return_input_ids(request)
+            ),
         )
 
         return adapted_request, request
@@ -1081,6 +1096,7 @@ class OpenAIServingChat(OpenAIServingBase):
         image_tokens = {}
         audio_tokens = {}
         video_tokens = {}
+        input_ids: Optional[List[int]] = None
         output_ids: Dict[int, List[int]] = {}
 
         stream_started = False
@@ -1090,6 +1106,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 self.tokenizer_manager.server_args.stream_response_default_include_usage,
             )
 
+            return_input_ids = self._should_return_input_ids(request)
             return_output_ids = self._should_return_output_ids(request)
 
             async for content in self.tokenizer_manager.generate_request(
@@ -1116,6 +1133,13 @@ class OpenAIServingChat(OpenAIServingBase):
 
                 finish_reason = content["meta_info"].get("finish_reason", None)
                 finish_reason_type = finish_reason["type"] if finish_reason else None
+
+                if return_input_ids and input_ids is None:
+                    # The prompt is the full, shared prompt (same across choices
+                    # and constant across chunks), so capture it once.
+                    chunk_input_ids = content.get("prompt_token_ids")
+                    if chunk_input_ids is not None and finish_reason_type != "abort":
+                        input_ids = list(chunk_input_ids)
 
                 if return_output_ids:
                     chunk_output_ids = content.get("output_ids")
@@ -1254,6 +1278,10 @@ class OpenAIServingChat(OpenAIServingBase):
                 if first_details is not None:
                     sglext_details = cached_tokens_details_from_dict(first_details)
 
+            sglext_input_ids = None
+            if return_input_ids and input_ids:
+                sglext_input_ids = list(input_ids)
+
             sglext_output_ids = None
             if return_output_ids and output_ids:
                 sglext_output_ids = [
@@ -1263,6 +1291,7 @@ class OpenAIServingChat(OpenAIServingBase):
             if (
                 sglext_routed is not None
                 or sglext_details is not None
+                or sglext_input_ids is not None
                 or sglext_output_ids is not None
             ):
                 sglext_chunk = ChatCompletionStreamResponse(
@@ -1273,6 +1302,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     sglext=SglExt(
                         routed_experts=sglext_routed,
                         cached_tokens_details=sglext_details,
+                        input_ids=sglext_input_ids,
                         output_ids=sglext_output_ids,
                     ),
                 )
@@ -1359,14 +1389,23 @@ class OpenAIServingChat(OpenAIServingBase):
         cached_tokens_details = process_cached_tokens_details_from_ret(
             first_ret, request
         )
+        input_ids = None
+        if self._should_return_input_ids(request):
+            input_ids = list(ret[0]["prompt_token_ids"])
         output_ids = None
         if self._should_return_output_ids(request):
             output_ids = [list(ret_item["output_ids"]) for ret_item in ret]
         response_sglext = None
-        if routed_experts or cached_tokens_details or output_ids is not None:
+        if (
+            routed_experts
+            or cached_tokens_details
+            or input_ids is not None
+            or output_ids is not None
+        ):
             response_sglext = SglExt(
                 routed_experts=routed_experts,
                 cached_tokens_details=cached_tokens_details,
+                input_ids=input_ids,
                 output_ids=output_ids,
             )
 
