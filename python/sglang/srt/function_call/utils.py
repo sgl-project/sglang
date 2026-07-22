@@ -320,6 +320,9 @@ def infer_type_from_json_schema(schema: Dict[str, Any]) -> Optional[str]:
                 # If all types are the same, return unified type
                 if len(set(types)) == 1:
                     return types[0]
+                # If it's an optional type, return original type.
+                if len(set(types)) == 2 and "null" in types:
+                    return [t for t in types if t != "null"][0]
                 # When types differ, prioritize string (safest)
                 if "string" in types:
                     return "string"
