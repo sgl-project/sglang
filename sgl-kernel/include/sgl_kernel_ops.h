@@ -627,6 +627,8 @@ void transfer_kv_all_layer_direct_lf_pf(
  */
 at::Tensor weak_ref_tensor(const at::Tensor& tensor);
 
+torch::Tensor get_cuda_view_from_cpu_tensor(torch::Tensor& cpu_tensor);
+
 /*
  * From FlashInfer
  */
