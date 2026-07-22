@@ -9,7 +9,11 @@ from weakref import WeakValueDictionary
 
 import torch
 
-from sglang.kernels.ops.moe.ep_moe_kernels import moe_permute, moe_unpermute
+from sglang.kernels.ops.moe.ep_moe_kernels import (
+    moe_permute,
+    moe_permute_with_scale,
+    moe_unpermute,
+)
 from sglang.kernels.ops.moe.moe_fused_mul_sum import moe_fused_mul_sum
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.moe_runner.base import (
@@ -73,6 +77,7 @@ class HummingRunnerInput(RunnerInput):
     gemm_type: HummingGemmType
     expert_num_tokens: torch.Tensor | None = None
     expected_m: int | None = None
+    hidden_states_scale: torch.Tensor | None = None
     apply_routed_scaling_factor: bool = True
 
     @property
@@ -103,6 +108,7 @@ def humming_moe_runner_core_run(
     topk_ids: torch.Tensor,
     expert_num_tokens: torch.Tensor | None = None,
     expected_m: int | None = None,
+    hidden_states_scale: torch.Tensor | None = None,
     apply_routed_scaling_factor: bool = True,
 ) -> torch.Tensor:
     runner = HummingRunnerCore.runner_cores[moe_runner_id]
@@ -111,6 +117,7 @@ def humming_moe_runner_core_run(
             hidden_states=hidden_states,
             topk_ids=topk_ids,
             topk_weights=topk_weights,
+            hidden_states_scale=hidden_states_scale,
             apply_routed_scaling_factor=apply_routed_scaling_factor,
         )
     elif gemm_type == "grouped_contiguous":
@@ -118,6 +125,7 @@ def humming_moe_runner_core_run(
             hidden_states=hidden_states,
             topk_ids=topk_ids,
             topk_weights=topk_weights,
+            hidden_states_scale=hidden_states_scale,
             apply_routed_scaling_factor=apply_routed_scaling_factor,
         )
     elif gemm_type == "grouped_masked":
@@ -128,6 +136,7 @@ def humming_moe_runner_core_run(
             topk_weights=topk_weights,
             expected_m=expected_m,
             expert_num_tokens=expert_num_tokens,
+            hidden_states_scale=hidden_states_scale,
         )
     else:
         raise ValueError(f"Unknown gemm type: {gemm_type}")
@@ -396,6 +405,62 @@ class HummingRunnerCore(MoeRunnerCore):
         else:
             raise ValueError(f"Unsupported activation: {self.activation}")
 
+    def _grouped_masked_act_quant(
+        self,
+        gate_up: torch.Tensor,
+        expert_num_tokens: torch.Tensor,
+        buffers: dict[str, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        num_experts, max_tokens, two_i = gate_up.shape
+        intermediate = two_i // 2
+        w2_meta = self.layer.humming_metas["w2"]
+        groups = intermediate // 128
+        use_jit = (
+            envs.SGLANG_OPT_USE_JIT_EP_ACTIVATION.get()
+            and w2_meta.a_dtype == dtypes.float8e4m3
+            and w2_meta.input_scale_group_size == 128
+            and self.activation == "silu"
+            and gate_up.dtype == torch.bfloat16
+            and intermediate % 256 == 0
+            and num_experts <= 256
+            and intermediate // 8 >= num_experts
+        )
+        if use_jit:
+            from sglang.jit_kernel.dsv4.moe import silu_and_mul_masked_post_quant
+
+            down_input = torch.empty(
+                (num_experts, max_tokens, intermediate),
+                dtype=torch.float8_e4m3fn,
+                device=gate_up.device,
+            )
+            down_scale = torch.empty(
+                (num_experts, max_tokens, groups),
+                dtype=torch.float32,
+                device=gate_up.device,
+            )
+            silu_and_mul_masked_post_quant(
+                gate_up,
+                down_input,
+                down_scale,
+                128,
+                expert_num_tokens,
+                scale_ue8m0=False,
+                topk=self.config.top_k,
+                swiglu_limit=self.swiglu_limit,
+            )
+            return down_input.flatten(0, 1), down_scale.flatten(0, 1)
+
+        self.apply_activation(
+            inputs=buffers["gate_up_output"],
+            outputs=buffers["activation_output"],
+        )
+        return HummingMethod.may_quant_input(
+            layer=self.layer,
+            inputs=buffers["activation_output"],
+            quanted_input=buffers.get("quanted_down_input"),
+            sublayer_name="w2",
+        )
+
     def run(
         self,
         runner_input: HummingRunnerInput,
@@ -406,7 +471,9 @@ class HummingRunnerCore(MoeRunnerCore):
         self.layer = quant_info.layer
         if runner_input.hidden_states.size(0) == 0:
             return HummingRunnerOutput(
-                hidden_states=torch.empty_like(runner_input.hidden_states)
+                hidden_states=torch.empty_like(
+                    runner_input.hidden_states, dtype=self.config.params_dtype
+                )
             )
 
         # To make it compatible with dynamic shapes in torch.compile,
@@ -420,6 +487,7 @@ class HummingRunnerCore(MoeRunnerCore):
             topk_ids=runner_input.topk_ids,
             expected_m=runner_input.expected_m,
             expert_num_tokens=runner_input.expert_num_tokens,
+            hidden_states_scale=runner_input.hidden_states_scale,
             apply_routed_scaling_factor=runner_input.apply_routed_scaling_factor,
         )
 
@@ -471,9 +539,14 @@ class HummingRunnerCore(MoeRunnerCore):
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
+        hidden_states_scale: torch.Tensor | None = None,
         apply_routed_scaling_factor: bool = True,
     ):
         hidden_states = hidden_states.view(-1, hidden_states.size(-1))
+        if hidden_states_scale is not None:
+            hidden_states_scale = hidden_states_scale.reshape(
+                -1, hidden_states_scale.size(-1)
+            ).contiguous()
         buffers = self.prepare_buffers(
             hidden_states=hidden_states,
             topk_ids=topk_ids,
@@ -485,6 +558,7 @@ class HummingRunnerCore(MoeRunnerCore):
         inputs, input_scale = HummingMethod.may_quant_input(
             layer=self.layer,
             inputs=hidden_states,
+            input_scale=hidden_states_scale,
             quanted_input=buffers.get("quanted_gate_up_input", None),
             sublayer_name="w13",
         )
@@ -538,6 +612,7 @@ class HummingRunnerCore(MoeRunnerCore):
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
+        hidden_states_scale: torch.Tensor | None = None,
         apply_routed_scaling_factor: bool = True,
     ):
         configs = self.get_humming_gemm_configs(HummingGemmType.GROUPED_CONTIGUOUS)
@@ -549,16 +624,36 @@ class HummingRunnerCore(MoeRunnerCore):
             gemm_type=HummingGemmType.GROUPED_CONTIGUOUS,
         )
 
-        hidden_states, src2dst, expert_first_token_offset = moe_permute(
-            inputs=hidden_states,
-            topk_ids=topk_ids,
-            num_experts=self.num_experts,
-            is_ep=self.num_experts != self.global_num_experts,
-        )
+        is_ep = self.num_experts != self.global_num_experts
+        if hidden_states_scale is None:
+            hidden_states, src2dst, expert_first_token_offset = moe_permute(
+                inputs=hidden_states,
+                topk_ids=topk_ids,
+                num_experts=self.num_experts,
+                is_ep=is_ep,
+            )
+        else:
+            hidden_states_scale = hidden_states_scale.reshape(
+                -1, hidden_states_scale.size(-1)
+            ).contiguous()
+            (
+                hidden_states,
+                hidden_states_scale,
+                src2dst,
+                expert_first_token_offset,
+            ) = moe_permute_with_scale(
+                inputs=hidden_states,
+                input_scale=hidden_states_scale,
+                topk_ids=topk_ids,
+                num_experts=self.num_experts,
+                is_ep=is_ep,
+                outputs=buffers["quanted_gate_up_input"],
+            )
 
         inputs, input_scale = HummingMethod.may_quant_input(
             layer=self.layer,
             inputs=hidden_states,
+            input_scale=hidden_states_scale,
             quanted_input=buffers.get("quanted_gate_up_input", None),
             sublayer_name="w13",
         )
@@ -620,10 +715,15 @@ class HummingRunnerCore(MoeRunnerCore):
         topk_weights: torch.Tensor,
         expert_num_tokens: torch.Tensor,
         expected_m: int,
+        hidden_states_scale: torch.Tensor | None = None,
     ):
         configs = self.get_humming_gemm_configs(HummingGemmType.GROUPED_MASKED)
         valid_shape_m = self.estimate_local_valid_shape_m(topk_ids, expected_m)
         hidden_states = hidden_states.view(-1, hidden_states.size(-1))
+        if hidden_states_scale is not None:
+            hidden_states_scale = hidden_states_scale.reshape(
+                -1, hidden_states_scale.size(-1)
+            ).contiguous()
 
         buffers = self.prepare_buffers(
             hidden_states=hidden_states,
@@ -634,6 +734,7 @@ class HummingRunnerCore(MoeRunnerCore):
         inputs, input_scale = HummingMethod.may_quant_input(
             layer=self.layer,
             inputs=hidden_states,
+            input_scale=hidden_states_scale,
             quanted_input=buffers.get("quanted_gate_up_input", None),
             sublayer_name="w13",
         )
@@ -650,22 +751,19 @@ class HummingRunnerCore(MoeRunnerCore):
             sublayer_name="w13",
         )
 
-        self.apply_activation(
-            inputs=buffers["gate_up_output"],
-            outputs=buffers["activation_output"],
+        gate_up = buffers["gate_up_output"].view(
+            expert_num_tokens.shape[0],
+            -1,
+            buffers["gate_up_output"].shape[-1],
         )
-
-        inputs, input_scale = HummingMethod.may_quant_input(
-            layer=self.layer,
-            inputs=buffers["activation_output"],
-            quanted_input=buffers.get("quanted_down_input", None),
-            sublayer_name="w2",
+        down_input, down_scale = self._grouped_masked_act_quant(
+            gate_up, expert_num_tokens, buffers
         )
 
         HummingMethod.forward_layer(
             layer=self.layer,
-            inputs=inputs,
-            input_scale=input_scale,
+            inputs=down_input,
+            input_scale=down_scale,
             outputs=buffers["down_output"].view(-1, hidden_states.size(-1)),
             valid_shape_m=valid_shape_m,
             expert_layout=expert_num_tokens,
@@ -703,6 +801,41 @@ def fused_experts_none_to_humming(
     return StandardCombineInput(hidden_states=runner_output.hidden_states)
 
 
+def _validate_deepep_dispatch_input(
+    hidden_states: torch.Tensor,
+    hidden_states_scale: torch.Tensor | None,
+    layer: torch.nn.Module,
+) -> None:
+    expects_fp8 = layer._humming_uses_deepep_fp8_dispatch
+    is_fp8 = hidden_states.dtype == torch.float8_e4m3fn
+    if not expects_fp8:
+        if is_fp8 or hidden_states_scale is not None:
+            raise ValueError(
+                "DeepEP returned FP8 input while Humming is configured for BF16 "
+                "dispatch."
+            )
+        return
+
+    if not is_fp8 or hidden_states_scale is None:
+        raise ValueError(
+            "Humming expected DeepEP FP8 hidden states and group-128 scales."
+        )
+
+    expected_groups, remainder = divmod(hidden_states.size(-1), 128)
+    if (
+        remainder != 0
+        or hidden_states_scale.dtype != torch.float32
+        or hidden_states_scale.size(-1) != expected_groups
+        or hidden_states_scale.numel() != hidden_states.numel() // 128
+    ):
+        raise ValueError(
+            "Humming requires row-major FP32 DeepEP scales with group size 128."
+        )
+    meta = layer.humming_metas["w13"]
+    if meta.a_dtype != dtypes.float8e4m3 or meta.input_scale_group_size != 128:
+        raise ValueError("Humming w13 must use FP8 group-128 input metadata.")
+
+
 @register_pre_permute("deepep_ll", "humming")
 def pre_permute_deepep_ll_to_humming(
     dispatch_output: DeepEPLLDispatchOutput,
@@ -715,6 +848,9 @@ def pre_permute_deepep_ll_to_humming(
     topk_weights = dispatch_output.topk_weights
     running_state["topk_ids"] = topk_ids
     running_state["topk_weights"] = topk_weights
+    _validate_deepep_dispatch_input(
+        hidden_states, dispatch_output.hidden_states_scale, quant_info.layer
+    )
 
     return HummingRunnerInput(
         hidden_states=hidden_states,
@@ -723,6 +859,7 @@ def pre_permute_deepep_ll_to_humming(
         expert_num_tokens=dispatch_output.masked_m,
         expected_m=dispatch_output.expected_m,
         gemm_type=HummingGemmType.GROUPED_MASKED,
+        hidden_states_scale=dispatch_output.hidden_states_scale,
         apply_routed_scaling_factor=False,
     )
 
@@ -759,12 +896,16 @@ def pre_permute_deepep_normal_to_humming(
     topk_weights = dispatch_output.topk_weights
     running_state["topk_ids"] = topk_ids
     running_state["topk_weights"] = topk_weights
+    _validate_deepep_dispatch_input(
+        hidden_states, dispatch_output.hidden_states_scale, quant_info.layer
+    )
 
     return HummingRunnerInput(
         hidden_states=hidden_states,
         topk_weights=topk_weights,
         topk_ids=topk_ids.int(),
         gemm_type=get_standard_humming_moe_gemm_type(),
+        hidden_states_scale=dispatch_output.hidden_states_scale,
         apply_routed_scaling_factor=False,
     )
 

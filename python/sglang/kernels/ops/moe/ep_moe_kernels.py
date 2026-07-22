@@ -1973,22 +1973,12 @@ def fp8_per_token_to_per_tensor_quant_triton(
     )
 
 
-def moe_permute(
+def _moe_permute_rows(
     inputs: torch.Tensor,
     topk_ids: torch.Tensor,
-    num_experts: int,
-    use_int64_offset: bool = False,
-    is_ep: bool = False,
+    src2dst: torch.Tensor,
     outputs: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    from sglang.jit_kernel.moe_permute_prepare import moe_permute_prepare
-
-    expert_offsets, src2dst = moe_permute_prepare(
-        topk_ids=topk_ids,
-        num_experts=num_experts,
-        use_int64_offset=use_int64_offset,
-        is_ep=is_ep,
-    )
+) -> torch.Tensor:
     output_shape = (topk_ids.nelement(), inputs.size(-1))
     if outputs is None:
         outputs = torch.empty(output_shape, dtype=inputs.dtype, device=inputs.device)
@@ -2008,7 +1998,54 @@ def moe_permute(
         BLOCK_SIZE=512,
     )
 
+    return outputs
+
+
+def moe_permute(
+    inputs: torch.Tensor,
+    topk_ids: torch.Tensor,
+    num_experts: int,
+    use_int64_offset: bool = False,
+    is_ep: bool = False,
+    outputs: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    from sglang.jit_kernel.moe_permute_prepare import moe_permute_prepare
+
+    expert_offsets, src2dst = moe_permute_prepare(
+        topk_ids=topk_ids,
+        num_experts=num_experts,
+        use_int64_offset=use_int64_offset,
+        is_ep=is_ep,
+    )
+    outputs = _moe_permute_rows(inputs, topk_ids, src2dst, outputs)
+
     return outputs, src2dst, expert_offsets
+
+
+def moe_permute_with_scale(
+    inputs: torch.Tensor,
+    input_scale: torch.Tensor,
+    topk_ids: torch.Tensor,
+    num_experts: int,
+    use_int64_offset: bool = False,
+    is_ep: bool = False,
+    outputs: torch.Tensor | None = None,
+    scale_outputs: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if inputs.size(0) != input_scale.size(0):
+        raise ValueError("inputs and input_scale must have the same number of rows")
+
+    outputs, src2dst, expert_offsets = moe_permute(
+        inputs=inputs,
+        topk_ids=topk_ids,
+        num_experts=num_experts,
+        use_int64_offset=use_int64_offset,
+        is_ep=is_ep,
+        outputs=outputs,
+    )
+    scale_outputs = _moe_permute_rows(input_scale, topk_ids, src2dst, scale_outputs)
+
+    return outputs, scale_outputs, src2dst, expert_offsets
 
 
 def moe_unpermute(
