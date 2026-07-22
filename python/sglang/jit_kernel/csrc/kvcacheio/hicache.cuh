@@ -121,12 +121,36 @@ SGL_DEVICE void store_nc(uint4* __restrict__ dst, const uint4& value) {
 
 }  // namespace details
 
+// Compute the memory package unit for load/store operations.
+// For backward compatibility with 128-aligned sizes, we keep the original
+// logic: Package = 128 / kNumThreads (each loop iteration covers 128 bytes).
+// For non-128-aligned sizes (e.g. 576), we fall back to the largest
+// supported package (16B/8B/4B) that divides kPerThread evenly.
+template <int64_t kBytes, uint32_t kNumThreads>
+constexpr uint32_t get_mem_unit() {
+  constexpr int64_t kPerThread = kBytes / kNumThreads;
+  static_assert(kBytes % kNumThreads == 0, "kBytes must be divisible by kNumThreads");
+  if constexpr (kBytes % 128 == 0) {
+    // Original logic: 128 / kNumThreads -> 16, 8, or 4
+    return 128 / kNumThreads;
+  } else if constexpr (kPerThread % 16 == 0) {
+    return 16;
+  } else if constexpr (kPerThread % 8 == 0) {
+    return 8;
+  } else if constexpr (kPerThread % 4 == 0) {
+    return 4;
+  } else {
+    static_assert(kPerThread % 4 == 0, "kBytes/kNumThreads must be multiple of 4 bytes");
+    return 4;
+  }
+}
+
 template <int64_t kBytes, uint32_t kNumThreads>
 SGL_DEVICE auto load_vec(const void* __restrict__ src) {
-  static_assert(kBytes % 128 == 0, "kBytes must be multiple of 128 bytes");
-  static_assert(128 % kNumThreads == 0, "kNumThreads must divide 128 bytes");
-  constexpr uint32_t kLoopCount = kBytes / 128;
-  using Package = details::PackageType<128 / kNumThreads>;
+  constexpr uint32_t kUnit = get_mem_unit<kBytes, kNumThreads>();
+  constexpr uint32_t kPerThread = kBytes / kNumThreads;
+  constexpr uint32_t kLoopCount = kPerThread / kUnit;
+  using Package = details::PackageType<kUnit>;
   using Storage = details::LocalStorage<Package, kLoopCount>;
 
   const auto src_packed = static_cast<const Package*>(src);
@@ -145,9 +169,9 @@ SGL_DEVICE auto load_vec(const void* __restrict__ src) {
 template <int64_t kBytes, uint32_t kNumThreads, typename Storage>
 SGL_DEVICE void store_vec(void* __restrict__ dst, const Storage& vec) {
   using Package = std::decay_t<decltype(vec.data[0])>;
-  constexpr uint32_t kBytesPerLoop = sizeof(Package) * kNumThreads;
-  constexpr uint32_t kLoopCount = kBytes / kBytesPerLoop;
-  static_assert(kBytes % kBytesPerLoop == 0, "Invalid Storage configuration");
+  constexpr uint32_t kPerThread = kBytes / kNumThreads;
+  constexpr uint32_t kLoopCount = kPerThread / sizeof(Package);
+  static_assert(kPerThread % sizeof(Package) == 0, "Invalid Storage configuration");
 
   const auto dst_packed = static_cast<Package*>(dst);
   const auto lane_id = threadIdx.x % kNumThreads;
