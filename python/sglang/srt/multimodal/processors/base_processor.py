@@ -9,6 +9,7 @@ from abc import ABC, abstractmethod
 from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
 import numpy as np
+import requests
 import torch
 from PIL import Image
 from transformers import BaseImageProcessor
@@ -649,8 +650,8 @@ class BaseMultimodalProcessor(ABC):
             elif modality == Modality.AUDIO:
                 return load_audio(data, audio_sample_rate)
 
-        except ValueError as e:
-            # Bad input (e.g. invalid base64) -> 400, not 500.
+        except (ValueError, OSError, requests.RequestException) as e:
+            # Invalid or unavailable user-provided media -> 400, not 500.
             data_str = str(data)
             if len(data_str) > 100:
                 data_str = data_str[:100] + "..."

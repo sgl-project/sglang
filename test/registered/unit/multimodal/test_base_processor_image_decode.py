@@ -17,9 +17,10 @@ import asyncio
 import concurrent.futures
 import io
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import numpy as np
+import requests
 from PIL import Image
 
 from sglang.srt.managers.schedule_batch import Modality
@@ -97,6 +98,28 @@ class TestLoadSingleItemImageDecode(CustomTestCase):
                     image_data=["bad-image"],
                 )
             )
+
+    def test_unreachable_image_url_is_a_client_error(self):
+        with patch(
+            "sglang.srt.multimodal.processors.base_processor.load_image",
+            side_effect=requests.ConnectionError("connection refused"),
+        ):
+            with self.assertRaisesRegex(ValueError, "connection refused"):
+                _StubProcessor._load_single_item(
+                    "https://127.0.0.1:1/not-an-image.png", Modality.IMAGE
+                )
+
+    def test_invalid_image_bytes_are_a_client_error(self):
+        with self.assertRaisesRegex(ValueError, "cannot identify image file"):
+            _StubProcessor._load_single_item(b"not an image", Modality.IMAGE)
+
+    def test_unexpected_loader_bug_remains_a_server_error(self):
+        with patch(
+            "sglang.srt.multimodal.processors.base_processor.load_image",
+            side_effect=TypeError("unexpected loader bug"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "unexpected loader bug"):
+                _StubProcessor._load_single_item(b"image", Modality.IMAGE)
 
 
 if __name__ == "__main__":
