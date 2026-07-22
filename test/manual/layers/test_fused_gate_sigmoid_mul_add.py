@@ -4,10 +4,12 @@ import pytest
 import torch
 
 from sglang.kernels.ops.layernorm.elementwise import fused_gate_sigmoid_mul_add
+from sglang.srt.utils import get_device
 
 DTYPES = [torch.float16, torch.bfloat16]
 TOKEN_COUNTS = [1, 2, 4, 8, 16, 64, 512, 1024, 2048, 4096, 8192]
 HIDDEN_DIMS = [2048, 3072, 4096, 6144]
+DEVICE = get_device()
 
 
 def _reference(hidden_states, gate_weight, shared_output, final_hidden_states):
@@ -27,10 +29,10 @@ def seed():
 def test_correctness(num_tokens, hidden_dim, dtype):
     rtol, atol = (2e-2, 2e-2) if dtype == torch.bfloat16 else (1e-2, 1e-2)
 
-    hidden_states = torch.randn(num_tokens, hidden_dim, dtype=dtype, device="cuda")
-    gate_weight = torch.randn(hidden_dim, dtype=dtype, device="cuda")
-    shared_output = torch.randn(num_tokens, hidden_dim, dtype=dtype, device="cuda")
-    final_ref = torch.randn(num_tokens, hidden_dim, dtype=dtype, device="cuda")
+    hidden_states = torch.randn(num_tokens, hidden_dim, dtype=dtype, device=DEVICE)
+    gate_weight = torch.randn(hidden_dim, dtype=dtype, device=DEVICE)
+    shared_output = torch.randn(num_tokens, hidden_dim, dtype=dtype, device=DEVICE)
+    final_ref = torch.randn(num_tokens, hidden_dim, dtype=dtype, device=DEVICE)
     final_test = final_ref.clone()
 
     _reference(hidden_states, gate_weight, shared_output, final_ref)
@@ -42,10 +44,10 @@ def test_correctness(num_tokens, hidden_dim, dtype):
 @pytest.mark.parametrize("dtype", DTYPES)
 def test_gate_near_zero(dtype):
     num_tokens, hidden_dim = 16, 2048
-    hs = torch.randn(num_tokens, hidden_dim, dtype=dtype, device="cuda")
-    gw = torch.zeros(hidden_dim, dtype=dtype, device="cuda")
-    so = torch.randn(num_tokens, hidden_dim, dtype=dtype, device="cuda")
-    f_ref = torch.randn(num_tokens, hidden_dim, dtype=dtype, device="cuda")
+    hs = torch.randn(num_tokens, hidden_dim, dtype=dtype, device=DEVICE)
+    gw = torch.zeros(hidden_dim, dtype=dtype, device=DEVICE)
+    so = torch.randn(num_tokens, hidden_dim, dtype=dtype, device=DEVICE)
+    f_ref = torch.randn(num_tokens, hidden_dim, dtype=dtype, device=DEVICE)
     f_test = f_ref.clone()
 
     _reference(hs, gw, so, f_ref)
@@ -56,10 +58,10 @@ def test_gate_near_zero(dtype):
 
 def test_inplace_semantics():
     num_tokens, hidden_dim = 32, 2048
-    hs = torch.randn(num_tokens, hidden_dim, dtype=torch.float16, device="cuda")
-    gw = torch.randn(hidden_dim, dtype=torch.float16, device="cuda")
-    so = torch.randn(num_tokens, hidden_dim, dtype=torch.float16, device="cuda")
-    fhs = torch.randn(num_tokens, hidden_dim, dtype=torch.float16, device="cuda")
+    hs = torch.randn(num_tokens, hidden_dim, dtype=torch.float16, device=DEVICE)
+    gw = torch.randn(hidden_dim, dtype=torch.float16, device=DEVICE)
+    so = torch.randn(num_tokens, hidden_dim, dtype=torch.float16, device=DEVICE)
+    fhs = torch.randn(num_tokens, hidden_dim, dtype=torch.float16, device=DEVICE)
     original_ptr = fhs.data_ptr()
 
     fused_gate_sigmoid_mul_add(hs, gw, so, fhs)
