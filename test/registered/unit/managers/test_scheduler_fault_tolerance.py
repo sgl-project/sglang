@@ -103,12 +103,17 @@ class TestDevFaultToleranceRecovery(CustomTestCase):
         # process_pending_chunked_abort from touching a discarded req.
         self.assertIsNone(sched._pending_chunked_abort_req)
 
-    def test_recover_resets_state_and_resumes_on_success(self):
-        # Guards the wiring event-loop -> _recover -> _abort_all_and_reset: a
-        # successful recovery must actually reset (not just swallow the error).
+    def test_recover_drives_reset_and_verification_on_success(self):
+        # Guards the success-path orchestration of _recover: it must drive the
+        # reset (abort_request) AND the post-reset verification (is_fully_idle),
+        # then return without raising. This is the only case exercising the happy
+        # path, so it catches a _recover that wrongly raises even on success.
         sched = _make_scheduler_stub(running_rids=("r1",))
-        sched._recover_from_iteration_error(RuntimeError("boom"))
-        self.assertEqual(sched.waiting_queue, [])
+
+        sched._recover_from_iteration_error(RuntimeError("boom"))  # must not raise
+
+        sched.abort_request.assert_called_once()
+        sched.is_fully_idle.assert_called_once()
 
     def test_recover_reraises_when_reset_leaves_non_idle_state(self):
         # Post-reset verification: if the scheduler is not fully idle after the
