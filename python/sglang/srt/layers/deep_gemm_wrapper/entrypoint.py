@@ -18,9 +18,31 @@ logger = logging.getLogger(__name__)
 
 if ENABLE_JIT_DEEPGEMM:
     import deep_gemm
-    from deep_gemm.utils.layout import get_mn_major_tma_aligned_tensor  # noqa: F401
+    from deep_gemm.utils.layout import (
+        get_mn_major_tma_aligned_tensor as _deep_gemm_get_mn_major_tma_aligned_tensor,
+    )
 
 _SANITY_CHECK = envs.SGLANG_DEEPGEMM_SANITY_CHECK.get()
+
+
+def get_mn_major_tma_aligned_tensor(scale: torch.Tensor) -> torch.Tensor:
+    """Return an owning MN-major, TMA-aligned FP32 scale tensor."""
+    if scale.dtype == torch.float32 and scale.dim() in (2, 3):
+        mn, sf_k = scale.shape[-2:]
+        tma_aligned_mn = (mn + 3) // 4 * 4  # 16-byte alignment for FP32.
+        is_aligned = (
+            scale.stride(-2) == 1
+            and scale.stride(-1) == tma_aligned_mn
+            and (scale.dim() == 2 or scale.stride(-3) == tma_aligned_mn * sf_k)
+        )
+        if is_aligned:
+            # DeepGEMM's TVM-FFI no-op transform returns a non-owning DLPack
+            # alias. Replacing the original tensor with that alias can release
+            # its backing allocation before the next GEMM, especially in a
+            # CUDA graph pool.
+            return scale
+
+    return _deep_gemm_get_mn_major_tma_aligned_tensor(scale)
 
 
 # TODO maybe rename these functions

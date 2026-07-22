@@ -1013,8 +1013,7 @@ def _varlen_deep_gemm_silu_mul_quant(
 
     # Default plain-silu path: the unified JIT masked fused quant. It allocates
     # the outputs itself, with scales directly in the layout deep_gemm consumes
-    # (packed-int32 col-major for UE8M0, TMA-aligned col-major fp32 otherwise),
-    # so the caller's get_mn_major transform short-circuits.
+    # (packed-int32 col-major for UE8M0, TMA-aligned col-major fp32 otherwise).
     expected_m = ceil_div(num_real_tokens * topk, E) if num_real_tokens else None
     return per_token_group_quant(
         gateup_output,

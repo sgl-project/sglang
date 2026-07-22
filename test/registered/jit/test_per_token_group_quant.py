@@ -429,6 +429,32 @@ def test_masked_fused():
         assert torch.all(x_q[e, m:].view(torch.int8) == 0), "padding touched"
 
 
+def test_deep_gemm_preserves_tma_aligned_scale_owner(monkeypatch):
+    from sglang.srt.layers.deep_gemm_wrapper import entrypoint
+
+    scale = create_per_token_group_quant_fp8_output_scale(
+        x_shape=(18, 127, 2560),
+        device="cuda",
+        group_size=G,
+        column_major_scales=True,
+        scale_tma_aligned=True,
+        scale_ue8m0=False,
+    )
+
+    def fail_if_called(_):
+        raise AssertionError("an already-aligned owning tensor must not be rewrapped")
+
+    monkeypatch.setattr(
+        entrypoint,
+        "_deep_gemm_get_mn_major_tma_aligned_tensor",
+        fail_if_called,
+    )
+    prepared = entrypoint.get_mn_major_tma_aligned_tensor(scale)
+
+    assert prepared is scale
+    assert prepared.data_ptr() == scale.untyped_storage().data_ptr()
+
+
 @pytest.mark.parametrize("out_dtype,column_major_scales,scale_ue8m0", AUTO_ALLOC_CASES)
 def test_auto_allocation(out_dtype, column_major_scales, scale_ue8m0):
     """Omitting output_q/output_s allocates them per out_dtype / major mode /
