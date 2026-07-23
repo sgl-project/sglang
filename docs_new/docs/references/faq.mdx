@@ -26,6 +26,13 @@ This error may result from kernel errors or out-of-memory issues:
       you can try to decrease `--mem-fraction-static`, decrease `--cuda-graph-max-bs-decode`, or decrease `--chunked-prefill-size`.
 - Other bugs, please file an issue on GitHub.
 
+### `import sgl_kernel` fails with `undefined symbol`
+
+If `import sgl_kernel` (or server startup) fails with an error like `undefined symbol: c10::MessageLogger::stream[abi:cxx11]()`, this is a PyTorch C++ ABI mismatch, not a missing GPU architecture. The prebuilt `sgl_kernel` wheel is compiled against one PyTorch version and does not link against a different one, because PyTorch does not guarantee C++ ABI compatibility across versions.
+
+- Install the PyTorch version `sgl_kernel` was built against, or use the matching NGC container (`nvcr.io/nvidia/sglang`), which ships PyTorch and `sgl_kernel` together.
+- Or build `sgl_kernel` from source against your installed PyTorch.
+- To let `import sgl_kernel` proceed anyway for debugging, set `SGLANG_KERNEL_ALLOW_MISSING_OPS=1`; the compiled kernels stay unavailable and will raise if called.
 
 ## Frequently Asked Questions
 
