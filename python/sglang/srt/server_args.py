@@ -5497,16 +5497,18 @@ class ServerArgs:
                 read_ragged_verify_mode,
             )
 
-            if read_ragged_verify_mode() is RaggedVerifyMode.COMPACT:
-                # Ring is written only on the dense verify layout; compact leaves
-                # it stale and there's no intermediate_ssm fallback -> commit would
-                # fold a stale ring into the state.
+            ragged_mode = read_ragged_verify_mode()
+            if ragged_mode is not RaggedVerifyMode.STATIC:
+                # The ring is written only on the dense verify layout; every
+                # non-static mode (compact, cap-accept) builds a ragged layout that
+                # skips the ring-write, and there is no intermediate_ssm fallback ->
+                # commit would fold a stale ring into the SSM state.
                 raise ValueError(
-                    "--enable-linear-replayssm-spec (ReplaySSM) is not compatible with "
-                    "SGLANG_RAGGED_VERIFY_MODE=compact: the per-slot ring is written "
-                    "only on the dense verify layout, so compact-mode commits would "
-                    "fold a stale ring into the SSM state. Use "
-                    "SGLANG_RAGGED_VERIFY_MODE=static."
+                    "--enable-linear-replayssm-spec (ReplaySSM) requires the dense "
+                    f"verify layout, but SGLANG_RAGGED_VERIFY_MODE={ragged_mode.value}: "
+                    "the per-slot ring is written only on the dense layout, so a "
+                    "ragged-mode commit would fold a stale ring into the SSM state. "
+                    "Use SGLANG_RAGGED_VERIFY_MODE=static."
                 )
             if self.disaggregation_mode != "null":
                 raise ValueError(
