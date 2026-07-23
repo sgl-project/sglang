@@ -371,6 +371,7 @@ class LMCRadixCache(RadixCache):
             new_node.parent = last_node
             last_node.children[new_node.key.child_key(self.page_size)] = new_node
             self.evictable_size_ += fetched
+            self.entry_count_ += 1
             self._update_leaf_status(last_node)
             self._update_leaf_status(new_node)
 
