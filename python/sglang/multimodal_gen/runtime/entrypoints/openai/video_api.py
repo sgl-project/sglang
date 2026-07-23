@@ -83,6 +83,36 @@ def _parse_form_extra_value(value: Any) -> Any:
         return value
 
 
+def _validate_http_hdmap_path(hdmap_path) -> None:
+    """Reject raw local filesystem paths for HDMap over the HTTP API.
+
+    ``hdmap_path`` is fed to ``load_image``, which opens local files directly —
+    a raw server path from an untrusted HTTP body is an arbitrary-file-read
+    vector. Over HTTP, only remote URLs (http/https) or data URLs are allowed.
+    CLI callers build sampling params directly (bypassing this) and may still
+    pass trusted local paths.
+    """
+    if hdmap_path is None:
+        return
+    entries = hdmap_path if isinstance(hdmap_path, list) else [hdmap_path]
+    for entry in entries:
+        if not isinstance(entry, str):
+            continue
+        low = entry.strip().lower()
+        if not (
+            low.startswith("http://")
+            or low.startswith("https://")
+            or low.startswith("data:")
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "hdmap_path must be an http(s) or data URL over the HTTP API; "
+                    "local filesystem paths are not permitted."
+                ),
+            )
+
+
 def _is_probably_video_source(source: Any) -> bool:
     content_type = (getattr(source, "content_type", "") or "").lower()
     if content_type.startswith("video/"):
@@ -205,6 +235,7 @@ def _cosmos3_sampling_param_kwargs(
 def _build_video_sampling_params(request_id: str, request: VideoGenerationsRequest):
     """Resolve video-specific defaults (fps, seconds → num_frames) then
     delegate to the shared build_sampling_params."""
+    _validate_http_hdmap_path(request.hdmap_path)
     server_args = get_global_server_args()
     seconds = request.seconds if request.seconds is not None else DEFAULT_VIDEO_SECONDS
     fps = request.fps if request.fps is not None else DEFAULT_FPS
@@ -261,6 +292,9 @@ def _build_video_sampling_params(request_id: str, request: VideoGenerationsReque
         output_quality=request.output_quality,
         perf_dump_path=request.perf_dump_path,
         diffusers_kwargs=request.diffusers_kwargs,
+        # OmniDreams HDMap / trajectory conditioning (Phase 4).
+        hdmap_path=request.hdmap_path,
+        num_views=request.num_views,
         **cosmos3_kwargs,
     )
 

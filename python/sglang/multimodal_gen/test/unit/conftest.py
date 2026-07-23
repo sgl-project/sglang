@@ -1,11 +1,55 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import os
 from types import SimpleNamespace
 
 import pytest
 
 from sglang.multimodal_gen.runtime import server_args as server_args_module
 from sglang.multimodal_gen.runtime.server_args import set_global_server_args
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _omnidreams_model_parallel(request):
+    """Initialise a 1-rank model-parallel group for OmniDreams test modules.
+
+    OmniDreams' DiT builds Column/Row/MergedColumnParallelLinear directly (like
+    ltx_2 / flux_2), which require an initialised TP group. Mirror the runtime
+    (always initialised, world_size==1 on a single card). Idempotent across
+    modules; gated to OmniDreams modules so other unit tests are unaffected.
+    """
+    if "omnidreams" not in request.module.__name__:
+        yield
+        return
+    from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+        maybe_init_distributed_environment_and_model_parallel,
+    )
+
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", "29505")
+    os.environ.setdefault("RANK", "0")
+    os.environ.setdefault("LOCAL_RANK", "0")
+    os.environ.setdefault("WORLD_SIZE", "1")
+    maybe_init_distributed_environment_and_model_parallel(tp_size=1, sp_size=1)
+
+    # The forward/AR tests build untrained random-weight models; the flash /
+    # mem-efficient SDPA backends are non-deterministic, which can flip a deep AR
+    # rollout to NaN run-to-run. Pin the deterministic math backend for stability.
+    import torch
+
+    if torch.cuda.is_available():
+        prev_flash = torch.backends.cuda.flash_sdp_enabled()
+        prev_mem = torch.backends.cuda.mem_efficient_sdp_enabled()
+        torch.backends.cuda.enable_flash_sdp(False)
+        torch.backends.cuda.enable_mem_efficient_sdp(False)
+        torch.backends.cuda.enable_math_sdp(True)
+        try:
+            yield
+        finally:
+            torch.backends.cuda.enable_flash_sdp(prev_flash)
+            torch.backends.cuda.enable_mem_efficient_sdp(prev_mem)
+        return
+    yield
 
 
 def _make_unit_server_args():

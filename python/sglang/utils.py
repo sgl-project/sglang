@@ -38,6 +38,8 @@ KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS: dict[str, str] = {
     "pi0.5": "Pi05Pipeline",
     "hunyuan3d": "Hunyuan3D2Pipeline",
     "flux.2-dev-nvfp4": "Flux2NvfpPipeline",
+    "omnidreams": "OmniDreamsPipeline",
+    "omni-dreams": "OmniDreamsPipeline",
     "fal/ideogram-v4-fast": "Ideogram4FastPipeline",
     "fal--ideogram-v4-fast": "Ideogram4FastPipeline",
     "fal/ideogram-v4-instant": "Ideogram4InstantPipeline",
