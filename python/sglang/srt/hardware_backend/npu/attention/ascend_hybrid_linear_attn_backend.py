@@ -265,22 +265,13 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
         )
         last_steps = last_correct_step_indices.to(torch.int64)  # [N]
 
-        # NPU: skip intermediate_ssm copy when accept_lens == 1.
-        # The state at step 0 is the just-computed recurrent state, which
-        # is already correct in the model's ssm buffer.  The intermediate
-        # cache path exists for CUDA's per-step gather; on NPU the fused
-        # kernel may produce slightly different bfloat16 rounding that
-        # accumulates over thousands of decode steps and drifts into
-        # garbage output.
-        all_step0 = (last_steps == 0).all().item()
-        if not all_step0:
-            move_intermediate_cache(
-                ssm_states,
-                intermediate_state_cache,
-                dst_indices_tensor,
-                src_indices_tensor,
-                last_steps,
-            )
+        move_intermediate_cache(
+            ssm_states,
+            intermediate_state_cache,
+            dst_indices_tensor,
+            src_indices_tensor,
+            last_steps,
+        )
 
         draft_token_num = intermediate_state_cache.shape[2]
         if mamba_track_indices is not None:
