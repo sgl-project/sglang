@@ -124,6 +124,49 @@ fn token_handoff_prefill_frame_is_terminal(frame: &[u8]) -> bool {
 }
 
 impl PDRouter {
+    fn inject_token_handoff_request_id(request: &mut Value) -> Result<String, String> {
+        let object = request
+            .as_object_mut()
+            .ok_or_else(|| "Request must be a JSON object".to_string())?;
+        let rid = format!("token-handoff-{}", uuid::Uuid::new_v4());
+        object.insert("rid".to_string(), Value::String(rid.clone()));
+        Ok(rid)
+    }
+
+    async fn abort_token_handoff_worker(client: &Client, worker_url: &str, rid: &str) {
+        let abort_url = api_path(worker_url, "/abort_request");
+        match client
+            .post(&abort_url)
+            .json(&json!({ "rid": rid }))
+            .send()
+            .await
+        {
+            Ok(response) if response.status().is_success() => {}
+            Ok(response) => warn!(
+                "Token handoff abort returned {} worker_url={} rid={}",
+                response.status(),
+                worker_url,
+                rid
+            ),
+            Err(error) => warn!(
+                "Token handoff abort failed worker_url={} rid={} error={}",
+                worker_url, rid, error
+            ),
+        }
+    }
+
+    async fn abort_token_handoff_pair(
+        client: &Client,
+        prefill_url: &str,
+        decode_url: &str,
+        rid: &str,
+    ) {
+        tokio::join!(
+            Self::abort_token_handoff_worker(client, prefill_url, rid),
+            Self::abort_token_handoff_worker(client, decode_url, rid)
+        );
+    }
+
     fn worker_endpoint_url(worker: &dyn Worker, endpoint: &str) -> String {
         api_path(worker.base_url(), endpoint)
     }
@@ -688,7 +731,7 @@ impl PDRouter {
     async fn execute_dual_dispatch_internal(
         &self,
         headers: Option<&HeaderMap>,
-        json_request: Value,
+        mut json_request: Value,
         context: PDRequestContext<'_>,
         prefill: Arc<dyn Worker>,
         decode: Arc<dyn Worker>,
@@ -704,6 +747,19 @@ impl PDRouter {
         let mut headers_with_trace = headers.cloned().unwrap_or_default();
         inject_trace_context_http(&mut headers_with_trace);
         let headers = Some(&headers_with_trace);
+
+        let token_handoff_enabled = context.is_stream
+            && context.batch_size.is_none()
+            && !context.return_logprob
+            && std::env::var_os("SGLANG_PD_TOKEN_HANDOFF").is_some();
+        let token_handoff_rid = if token_handoff_enabled {
+            match Self::inject_token_handoff_request_id(&mut json_request) {
+                Ok(rid) => Some(rid),
+                Err(error) => return Self::handle_serialization_error(error),
+            }
+        } else {
+            None
+        };
 
         let (prepared_prefill, prepared_decode) = match Self::prepare_pd_worker_requests(
             context.route,
@@ -736,16 +792,14 @@ impl PDRouter {
             false,
         );
 
-        if context.is_stream
-            && !context.return_logprob
-            && std::env::var_os("SGLANG_PD_TOKEN_HANDOFF").is_some()
-        {
+        if token_handoff_enabled {
             return self.create_token_handoff_streaming_response(
                 prefill_request,
                 decode_request,
                 headers.cloned(),
                 prefill,
                 decode,
+                token_handoff_rid.expect("token handoff request id must be initialized"),
             );
         }
 
@@ -1275,12 +1329,16 @@ impl PDRouter {
         headers: Option<HeaderMap>,
         prefill: Arc<dyn Worker>,
         decode: Arc<dyn Worker>,
+        rid: String,
     ) -> Response {
         use crate::core::AttachedBody;
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<bytes::Bytes, String>>();
         let prefill_for_task = Arc::clone(&prefill);
         let decode_for_task = Arc::clone(&decode);
+        let client = self.client.clone();
+        let prefill_url = prefill.url().to_string();
+        let decode_url = decode.url().to_string();
 
         tokio::spawn(async move {
             // Start Decode immediately so it can bootstrap and register its KV
@@ -1296,6 +1354,7 @@ impl PDRouter {
                          data: [DONE]\n\n",
                         response.status()
                     ))));
+                    Self::abort_token_handoff_worker(&client, &decode_url, &rid).await;
                     decode_task.abort();
                     return;
                 }
@@ -1306,6 +1365,7 @@ impl PDRouter {
                          data: [DONE]\n\n",
                         error
                     ))));
+                    Self::abort_token_handoff_worker(&client, &decode_url, &rid).await;
                     decode_task.abort();
                     return;
                 }
@@ -1320,6 +1380,12 @@ impl PDRouter {
                 let chunk_result = tokio::select! {
                     chunk_result = prefill_stream.next() => chunk_result,
                     _ = tx.closed() => {
+                        Self::abort_token_handoff_pair(
+                            &client,
+                            &prefill_url,
+                            &decode_url,
+                            &rid,
+                        ).await;
                         decode_task.abort();
                         return;
                     }
@@ -1339,6 +1405,7 @@ impl PDRouter {
                              data: [DONE]\n\n",
                             error
                         ))));
+                        Self::abort_token_handoff_worker(&client, &decode_url, &rid).await;
                         decode_task.abort();
                         return;
                     }
@@ -1359,6 +1426,13 @@ impl PDRouter {
                 pending.extend_from_slice(&chunk);
                 if let Some(done_pos) = memmem::find(&pending, done_marker) {
                     if done_pos > 0 && tx.send(Ok(pending.split_to(done_pos).freeze())).is_err() {
+                        Self::abort_token_handoff_pair(
+                            &client,
+                            &prefill_url,
+                            &decode_url,
+                            &rid,
+                        )
+                        .await;
                         decode_task.abort();
                         return;
                     }
@@ -1368,6 +1442,13 @@ impl PDRouter {
                     .len()
                     .saturating_sub(done_marker.len().saturating_sub(1));
                 if safe_len > 0 && tx.send(Ok(pending.split_to(safe_len).freeze())).is_err() {
+                    Self::abort_token_handoff_pair(
+                        &client,
+                        &prefill_url,
+                        &decode_url,
+                        &rid,
+                    )
+                    .await;
                     decode_task.abort();
                     return;
                 }
@@ -1376,6 +1457,7 @@ impl PDRouter {
 
             if prefill_finished_request {
                 let _ = tx.send(Ok(bytes::Bytes::from_static(b"data: [DONE]\n\n")));
+                Self::abort_token_handoff_worker(&client, &decode_url, &rid).await;
                 decode_task.abort();
                 return;
             }
@@ -1415,7 +1497,10 @@ impl PDRouter {
             loop {
                 let chunk_result = tokio::select! {
                     chunk_result = decode_stream.next() => chunk_result,
-                    _ = tx.closed() => return,
+                    _ = tx.closed() => {
+                        Self::abort_token_handoff_worker(&client, &decode_url, &rid).await;
+                        return;
+                    },
                 };
                 let Some(chunk_result) = chunk_result else {
                     break;
@@ -1424,6 +1509,7 @@ impl PDRouter {
                     Ok(chunk) => {
                         let done = memmem::find(&chunk, b"data: [DONE]").is_some();
                         if tx.send(Ok(chunk)).is_err() {
+                            Self::abort_token_handoff_worker(&client, &decode_url, &rid).await;
                             return;
                         }
                         if done {
@@ -2020,6 +2106,21 @@ mod tests {
 "#
         ));
         assert!(!token_handoff_prefill_frame_is_terminal(b"data: [DONE]\n\n"));
+    }
+
+    #[test]
+    fn test_token_handoff_request_id_is_scalar_and_replaced() {
+        let mut request = json!({
+            "model": "test-model",
+            "stream": true,
+            "rid": "client-supplied"
+        });
+
+        let rid =
+            PDRouter::inject_token_handoff_request_id(&mut request).expect("request id injection");
+
+        assert!(rid.starts_with("token-handoff-"));
+        assert_eq!(request["rid"], Value::String(rid));
     }
 
     #[test]
