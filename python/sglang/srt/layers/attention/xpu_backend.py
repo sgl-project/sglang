@@ -106,6 +106,15 @@ class XPUAttentionBackend(AttentionBackend):
         self.has_swa = (
             self.sliding_window_size is not None and self.sliding_window_size > -1
         )
+
+        # If num_splits == 0, the kernel uses a heuristic to automatically
+        # determine the number of splits. Split-KV reduces across a
+        # non-deterministic number of partitions, so we pin num_splits to 1
+        # when deterministic inference is enabled to keep attention reduction
+        # order fixed. This mirrors the flash-attention (fa3) backend.
+        self.num_splits = (
+            1 if model_runner.server_args.enable_deterministic_inference else 0
+        )
         self.is_encoder_decoder = model_runner.model_config.is_encoder_decoder
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -525,7 +534,7 @@ class XPUAttentionBackend(AttentionBackend):
         )
 
         # For fa3 interface version compatibility, we put new fields into conditional keyword args
-        kwargs = {}
+        kwargs = {"num_splits": self.num_splits}
         if sinks is not None:
             kwargs["sinks"] = sinks
 
@@ -661,6 +670,7 @@ class XPUAttentionBackend(AttentionBackend):
                         softmax_scale=layer.scaling,
                         causal=False,
                         return_softmax_lse=True,
+                        num_splits=self.num_splits,
                     )
                 else:
                     # MHA for extend part of sequence without attending prefix kv cache
@@ -675,6 +685,7 @@ class XPUAttentionBackend(AttentionBackend):
                         softmax_scale=layer.scaling,
                         causal=True,
                         return_softmax_lse=forward_batch.mha_return_lse,
+                        num_splits=self.num_splits,
                     )
                 if forward_batch.mha_return_lse:
                     output, lse, *rest = output
@@ -723,6 +734,7 @@ class XPUAttentionBackend(AttentionBackend):
                     k_descale=k_descale,
                     v_descale=v_descale,
                     return_softmax_lse=use_cascade_attn,
+                    num_splits=self.num_splits,
                 )
                 if use_cascade_attn:
                     o, softmax_lse, *rest = result
@@ -744,6 +756,7 @@ class XPUAttentionBackend(AttentionBackend):
                             k_descale=k_descale,
                             v_descale=v_descale,
                             return_softmax_lse=True,
+                            num_splits=self.num_splits,
                         )
                     )
                     o, _ = merge_state_v2_wrapper(
@@ -831,7 +844,7 @@ class XPUAttentionBackend(AttentionBackend):
         causal = not layer.is_cross_attention
 
         # For fa3 interface version compatibility, we put new fields into conditional keyword args
-        kwargs = {}
+        kwargs = {"num_splits": self.num_splits}
         if sinks is not None:
             kwargs["sinks"] = sinks
 
