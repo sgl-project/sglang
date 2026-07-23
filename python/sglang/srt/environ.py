@@ -731,6 +731,11 @@ class Envs:
     # output and the latent|shared MoE reduce; everything else falls back to
     # the regular all-reduce path. See srt/layers/k3_ar_fusion.py.
     SGLANG_K3_AR_FUSION = EnvBool(False)
+    # Fused o_proj GEMM + all-reduce (bf16, TP 2..8, SM100+): one
+    # kernel computes the TP-local o_proj partial and the cross-rank sum over
+    # a P2P comm region, replacing the GEMM + NCCL AR pair at M <= 512.
+    SGLANG_K3_GEMM_AR = EnvBool(False)
+
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)
 

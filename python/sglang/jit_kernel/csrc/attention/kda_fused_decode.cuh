@@ -389,6 +389,25 @@ __device__ __forceinline__ float fp32_at(const float* ptr, int64_t idx) {
   return ptr[idx];
 }
 
+// One-token KDA (Kimi Delta Attention) decode step, fused end to end:
+//  1. Causal conv1d update: q/k/v = SiLU(bias + w_{q,k,v}_t (dot) [conv_state, x_{q,k,v}]),
+//     shift-registers cs_q/cs_k/cs_v advanced in place (x_q/x_k/x_v are the raw
+//     per-token projections, w_*_t the depthwise conv taps).
+//  2. Per-head decay gate from a_log/g/dt_bias:
+//       decay = exp(lower_bound * sigmoid(exp(a_log) * (g + dt_bias)))   if kUseLowerBound
+//             = exp(-exp(a_log) * softplus(g + dt_bias))                otherwise
+//  3. q, k are L2-normalized over kDimK (q additionally scaled by `scale`); beta
+//     is sigmoid(raw) when kApplyBetaSigmoid, else used as-is.
+//  4. Delta-rule recurrent state update per value row v of the [kDimV, kDimK] state h:
+//       h_decay = h * decay
+//       v_new   = (v - h_decay . k) * beta
+//       h'      = h_decay + k (outer) v_new        (written back to `state`)
+//       o       = h' . q
+//  5. Optional gated RMSNorm (onorm) over o: out = o * rsqrt(mean(o^2) + onorm_eps)
+//     * onorm_weight * sigmoid(onorm_g).
+// Grid maps one block per (batch/token, value-head); kUseStaticDecodeLayout picks a
+// fixed (B, HV) launch shape for CUDA-graph capture, cu_seqlens/ssm_state_indices
+// otherwise resolve the token's batch slot and recurrent-state slot.
 template <
     bool kApplyOnorm,
     bool kUseStaticDecodeLayout = false,
@@ -409,42 +428,47 @@ template <
     bool kUseTmaLoad = false,
     int kTmaStages = kNumChunks,
     bool kUsePDL = false>
+// Shapes below use K3's per-TP-rank sizing (linear_attn_config: num_heads=96 over
+// TP=8 -> H=HV=12 local heads; head_dim=128 -> kDimK=kDimV=128; kSeg = H*128 = 1536;
+// short_conv_kernel_size=4 -> kKernelWidth=4, kConvStateWidth=3). B is the live
+// (post-padding, under kUseStaticDecodeLayout) decode batch size; slots is the
+// recurrent-state / conv-cache pool capacity, addressed by ssm_state_indices, not B.
 __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kernel(
-    const __nv_bfloat16* __restrict__ x_q,
-    const __nv_bfloat16* __restrict__ x_k,
-    const __nv_bfloat16* __restrict__ x_v,
-    const float* __restrict__ w_q_t,
-    const float* __restrict__ w_k_t,
-    const float* __restrict__ w_v_t,
-    const float* __restrict__ bias_q,
-    const float* __restrict__ bias_k,
-    const float* __restrict__ bias_v,
-    __nv_bfloat16* __restrict__ cs_q,
-    __nv_bfloat16* __restrict__ cs_k,
-    __nv_bfloat16* __restrict__ cs_v,
-    const float* __restrict__ a_log,
-    const __nv_bfloat16* __restrict__ g,
-    const float* __restrict__ dt_bias,
-    const __nv_bfloat16* __restrict__ beta,
-    const __nv_bfloat16* __restrict__ onorm_g,
-    const float* __restrict__ onorm_weight,
-    const int* __restrict__ ssm_state_indices,
-    const int* __restrict__ cu_seqlens,
-    float* __restrict__ state,
-    __nv_bfloat16* __restrict__ out,
-    int B,
-    int H,
-    int HV,
-    float lower_bound,
-    float scale,
-    float onorm_eps,
-    int64_t x_row_stride,
-    int64_t g_row_stride,
-    int64_t beta_row_stride,
-    int64_t onormg_row_stride,
-    int64_t cs_slot_stride,
-    int64_t cs_w_stride,
-    int64_t state_slot_stride) {
+    const __nv_bfloat16* __restrict__ x_q,  // [B, H*128] row bos*x_row_stride + hk, sliced from mixed_qkv q-segment
+    const __nv_bfloat16* __restrict__ x_k,  // [B, H*128] row bos*x_row_stride + hk, sliced from mixed_qkv k-segment
+    const __nv_bfloat16* __restrict__ x_v,  // [B, HV*128] row bos*x_row_stride + hvv, sliced from mixed_qkv v-segment
+    const float* __restrict__ w_q_t,  // [kKernelWidth=4, H*128] dense conv taps for q, indexed w*hkv_dim + hk
+    const float* __restrict__ w_k_t,  // [4, H*128] dense conv taps for k
+    const float* __restrict__ w_v_t,  // [4, HV*128] dense conv taps for v
+    const float* __restrict__ bias_q,  // [H*128] conv bias for q, sliced from conv_bias
+    const float* __restrict__ bias_k,  // [H*128] conv bias for k
+    const float* __restrict__ bias_v,  // [HV*128] conv bias for v
+    __nv_bfloat16* __restrict__ cs_q,  // [slots, kConvStateWidth=3, H*128] q shift-register, sliced from conv_states
+    __nv_bfloat16* __restrict__ cs_k,  // [slots, 3, H*128] k shift-register
+    __nv_bfloat16* __restrict__ cs_v,  // [slots, 3, HV*128] v shift-register
+    const float* __restrict__ a_log,  // [H] per-head log-decay base, indexed by i_h
+    const __nv_bfloat16* __restrict__ g,  // [B, HV*128] raw forget gate, row bos*g_row_stride + i_hv*kDimK + k
+    const float* __restrict__ dt_bias,  // [H*128] gate bias added to g before the decay nonlinearity
+    const __nv_bfloat16* __restrict__ beta,  // [B, HV] raw beta logit, row bos*beta_row_stride + i_hv
+    const __nv_bfloat16* __restrict__ onorm_g,  // [B, HV*128] onorm sigmoid gate, row i_n*onormg_row_stride + i_hv*128 + v
+    const float* __restrict__ onorm_weight,  // [128] onorm RMSNorm scale, shared across all heads
+    const int* __restrict__ ssm_state_indices,  // [B] recurrent-state slot per token; <0 marks a padded cuda-graph slot
+    const int* __restrict__ cu_seqlens,  // [B+1] token offsets into x_q/x_k/x_v/g/beta; unused under kUseStaticDecodeLayout
+    float* __restrict__ state,  // [slots, HV, 128, 128] recurrent KDA state h, inner [V,K] contiguous, slot pitch = state_slot_stride
+    __nv_bfloat16* __restrict__ out,  // [B, hv_count*128] fused-decode output, row i_n, col i_hv*128 + v
+    int B,     // live decode batch size (token count for this launch)
+    int H,     // local key/query heads on this TP rank (12 for K3)
+    int HV,    // local value heads on this TP rank (12 for K3, H==HV since KDA is MHA not GQA)
+    float lower_bound,  // linear_attn_config.gate_lower_bound (-5.0 for K3) when kUseLowerBound
+    float scale,        // query scale applied after L2-normalization
+    float onorm_eps,    // onorm RMSNorm epsilon
+    int64_t x_row_stride,     // element stride between consecutive tokens' rows in x_q/x_k/x_v (>= 3*H*128)
+    int64_t g_row_stride,     // element stride between consecutive tokens' rows in g (>= HV*128)
+    int64_t beta_row_stride,  // element stride between consecutive tokens' rows in beta (>= HV)
+    int64_t onormg_row_stride,  // element stride between consecutive tokens' rows in onorm_g (>= HV*128)
+    int64_t cs_slot_stride,   // element stride between consecutive slots in cs_q/cs_k/cs_v
+    int64_t cs_w_stride,      // element stride between shift-register taps (w=0..2) within a slot
+    int64_t state_slot_stride) {  // element stride between consecutive slots in state (dense HV*128*128, or larger for shared pools)
   device::PDLWaitPrimary<kUsePDL>();
   const int tid = threadIdx.x;
   const int lane = tid & 31;

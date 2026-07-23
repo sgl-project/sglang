@@ -17,6 +17,43 @@ namespace device::distributed {
 
 inline constexpr uint32_t kMaxWorldSize = 8;
 
+SGL_DEVICE uint32_t load_relaxed_sys(const uint32_t* ptr) {
+  uint32_t val;
+  asm volatile("ld.relaxed.sys.global.u32 %0, [%1];" : "=r"(val) : "l"(ptr) : "memory");
+  return val;
+}
+
+SGL_DEVICE void red_add_relaxed_sys(uint32_t* ptr, uint32_t val) {
+  asm volatile("red.relaxed.sys.global.add.u32 [%0], %1;" : : "l"(ptr), "r"(val) : "memory");
+}
+
+SGL_DEVICE uint32_t load_acquire_sys(const uint32_t* ptr) {
+  uint32_t val;
+  asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(val) : "l"(ptr) : "memory");
+  return val;
+}
+
+SGL_DEVICE void fence_release_sys() {
+  asm volatile("fence.release.sys;" ::: "memory");
+}
+
+SGL_DEVICE void red_add_release_sys(uint32_t* ptr, uint32_t val) {
+  asm volatile("red.release.sys.global.add.u32 [%0], %1;" : : "l"(ptr), "r"(val) : "memory");
+}
+
+SGL_DEVICE uint32_t atomic_add_acq_rel_gpu(uint32_t* ptr, uint32_t val) {
+  uint32_t old;
+  asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], %2;"
+               : "=r"(old)
+               : "l"(ptr), "r"(val)
+               : "memory");
+  return old;
+}
+
+SGL_DEVICE void multimem_store_relaxed(uint32_t* ptr, uint32_t val) {
+  asm volatile("multimem.st.relaxed.sys.global.b32 [%0], %1;" : : "l"(ptr), "r"(val) : "memory");
+}
+
 struct Counter {
  public:
   Counter(const Counter&) = delete;
@@ -41,20 +78,16 @@ struct alignas(128) Semaphore {
     return &m_counter;
   }
   SGL_DEVICE uint32_t get_relaxed() const {
-    uint32_t val;
-    asm volatile("ld.relaxed.sys.global.u32 %0, [%1];" : "=r"(val) : "l"(&m_flag) : "memory");
-    return val;
+    return load_relaxed_sys(&m_flag);
   }
   SGL_DEVICE void put_relaxed() {
-    asm volatile("red.relaxed.sys.global.add.u32 [%0], 1;" : : "l"(&m_flag) : "memory");
+    red_add_relaxed_sys(&m_flag, 1);
   }
   SGL_DEVICE uint32_t get_acquire() const {
-    uint32_t val;
-    asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(val) : "l"(&m_flag) : "memory");
-    return val;
+    return load_acquire_sys(&m_flag);
   }
   SGL_DEVICE void put_release() {
-    asm volatile("red.release.sys.global.add.u32 [%0], 1;" : : "l"(&m_flag) : "memory");
+    red_add_release_sys(&m_flag, 1);
   }
 
  private:

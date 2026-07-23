@@ -21,6 +21,7 @@ namespace sglang {
 namespace gemm_ag {
 
 using device::distributed::Counter;
+using device::distributed::multimem_store_relaxed;
 
 constexpr uint32_t kWorld = 8;                      // TP world size
 constexpr uint32_t kVecSize = 32 / sizeof(bf16_t);  // 16 bf16 per 32B vector
@@ -125,7 +126,7 @@ __global__ __launch_bounds__(K / kVecSize) void gemm_ag_gemv_kernel(
     const uint32_t elem = (params.rank * M + m) * kNLocal + bx * N_SPLIT + n;
     const auto base = reinterpret_cast<bf16_t*>(params.ws_mc + phase * params.half_bytes);
     const auto dst = reinterpret_cast<uint32_t*>(base + elem);
-    asm volatile("multimem.st.relaxed.sys.global.b32 [%0], %1;" ::"l"(dst), "r"(bits) : "memory");
+    multimem_store_relaxed(dst, bits);
   }
   PDLTriggerSecondary<kUsePDL>();
 }

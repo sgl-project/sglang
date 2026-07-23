@@ -29,7 +29,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
-from sglang.srt.layers import k3_ar_fusion, zero_copy_context
+from sglang.srt.layers import k3_ar_fusion, k3_gemm_ar, zero_copy_context
 from sglang.srt.layers.activation import SiluAndMul, SituAndMul
 from sglang.srt.layers.attn_residual import (
     AttnResidual,
@@ -1198,6 +1198,7 @@ class KimiK3DeltaAttention(nn.Module):
             use_dp_attention_reduce=not self.all_reduce_fusion,
             prefix=f"{prefix}.o_proj",
         )
+        k3_gemm_ar.maybe_wrap_o_proj(self.o_proj)
         conv_weights = self.qkv_conv1d.weight.squeeze(1)
         bias = self.qkv_conv1d.bias
 
@@ -1414,6 +1415,9 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             reduce_results=not self.all_reduce_fusion,
             alt_stream=alt_stream,
         )
+        # Installed before the output-gate wrap below so the gate multiply is
+        # applied to x before the fused GEMM+AR sees it.
+        k3_gemm_ar.maybe_wrap_o_proj(self.o_proj)
         if self.all_reduce_fusion:
             # reduce_results=False was passed through super().__init__ above;
             # the fused all-reduce does the reduce itself and needs the o_proj
