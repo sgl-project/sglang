@@ -2011,10 +2011,19 @@ class PreshardedModelLoader(DefaultModelLoader):
         (e.g., DeepSeek-V2) install auxiliary tensors via post_load_weights
         as plain attributes (``self_attn.w_kc`` / ``w_vc`` / ``w_scale``),
         not registered parameters or buffers; they must be persisted so
-        reload doesn't re-run the conversion logic that produced them."""
+        reload doesn't re-run the conversion logic that produced them.
+
+        Views of registered parameters (e.g. GDN ``attn.conv_weights`` as a
+        view of ``conv1d.weight``) are intentionally **skipped** here: they
+        are re-derived after reload via ``_rebind_parameter_aliases`` so
+        inference keeps sharing storage with the underlying Parameter.
+        """
         seen: set = set()
-        for name, _ in model.state_dict().items():
+        param_storages: set = set()
+        for name, tensor in model.state_dict().items():
             seen.add(name)
+            if tensor.numel() > 0:
+                param_storages.add((tensor.device, tensor.untyped_storage().data_ptr()))
         extras: Dict[str, torch.Tensor] = {}
         for module_name, module in model.named_modules():
             prefix = f"{module_name}." if module_name else ""
@@ -2029,9 +2038,64 @@ class PreshardedModelLoader(DefaultModelLoader):
                     val, torch.nn.Parameter
                 ):
                     full_name = f"{prefix}{attr_name}"
-                    if full_name not in seen:
-                        extras[full_name] = val
+                    if full_name in seen:
+                        continue
+                    # Skip views / slices of parameters — rebound after load.
+                    if val.numel() > 0:
+                        key = (val.device, val.untyped_storage().data_ptr())
+                        if key in param_storages:
+                            continue
+                    extras[full_name] = val
         return extras
+
+    @staticmethod
+    def _rebind_parameter_aliases(model: nn.Module) -> None:
+        """Refresh derived state that a raw state_dict copy cannot restore.
+
+        1. **GemmaRMSNorm.gemma_weight** — non-persistent buffer (not in
+           state_dict) set by the weight_loader as ``weight + 1``. TP>1
+           fused allreduce paths read this buffer; leaving it at the
+           ones-init makes norms wrong under TP while TP=1 (non-fused
+           kernels that take ``weight`` and add 1 internally) still works.
+
+        2. **GDN / Qwen3.5 linear-attn aliases** — ``attn.conv_weights`` is a
+           view of ``conv1d.weight``; ``A_log`` / ``dt_bias`` are shared
+           Parameter objects. Rebind so forward uses loaded storage.
+        """
+        for _, module in model.named_modules():
+            # --- Gemma-style derived buffer ---
+            gemma_w = getattr(module, "gemma_weight", None)
+            weight = getattr(module, "weight", None)
+            if (
+                isinstance(gemma_w, torch.Tensor)
+                and isinstance(weight, torch.nn.Parameter)
+                and gemma_w.shape == weight.shape
+            ):
+                torch.add(weight.data, 1.0, out=gemma_w)
+
+            # --- GDN linear-attention aliases ---
+            attn = getattr(module, "attn", None)
+            conv1d = getattr(module, "conv1d", None)
+            if attn is None:
+                continue
+            if hasattr(module, "A_log") and hasattr(attn, "A_log"):
+                attn.A_log = module.A_log
+            if hasattr(module, "dt_bias") and hasattr(attn, "dt_bias"):
+                attn.dt_bias = module.dt_bias
+            if conv1d is None:
+                continue
+            cweight = getattr(conv1d, "weight", None)
+            if cweight is not None and hasattr(attn, "conv_weights"):
+                # Qwen3.5 unsqueezes conv1d weight to (out, 1, in); kernels
+                # consume the squeezed (out, in) view.
+                if cweight.dim() == 3 and cweight.size(1) == 1:
+                    attn.conv_weights = cweight.view(cweight.size(0), cweight.size(2))
+                else:
+                    attn.conv_weights = (
+                        cweight.squeeze() if cweight.dim() > 2 else cweight
+                    )
+            if hasattr(conv1d, "bias") and hasattr(attn, "bias"):
+                attn.bias = conv1d.bias
 
     def _first_time_load_and_dump(
         self,
@@ -2062,7 +2126,12 @@ class PreshardedModelLoader(DefaultModelLoader):
                     with device_loading_context(module, target_device):
                         quant_method.process_weights_after_loading(module)
 
-            state_dict = ShardedStateLoader._filter_subtensors(model.state_dict())
+            # Dump the full state_dict (no subtensor filter). Shared Parameter
+            # aliases (e.g. parent.dt_bias and attn.dt_bias, or tied
+            # embed_tokens/lm_head) must all be present so reload can fill
+            # every registered name; filter-to-one-key is unsafe when aliases
+            # are not guaranteed to be the same object after re-init.
+            state_dict = dict(model.state_dict())
             extras = self._collect_extra_tensors(model)
             self._dump_state_to_disk(state_dict, extras, presharded_dir, shard_config)
             del state_dict
@@ -2387,9 +2456,8 @@ class PreshardedModelLoader(DefaultModelLoader):
                     f"at {presharded_dir}; expected {self.PLAN_VERSION}."
                 )
 
-            # State was captured AFTER process_weights_after_loading, so it
-            # matches the model layout we just produced; copy in-place.
-            state_dict = ShardedStateLoader._filter_subtensors(model.state_dict())
+            # Full state_dict (no subtensor filter) — see dump path comment.
+            state_dict = dict(model.state_dict())
             reads = plan.get("rank_to_reads", {}).get(str(rank), [])
 
             by_file: Dict[str, List[Dict[str, Any]]] = collections.defaultdict(list)
@@ -2459,10 +2527,11 @@ class PreshardedModelLoader(DefaultModelLoader):
                         setattr(module, attr_name, tensor.to(target_device))
                         continue
                     if r["name"] not in state_dict:
-                        raise KeyError(
-                            f"Presharded ckpt has parameter '{r['name']}' "
-                            f"that is not present in the initialized model."
-                        )
+                        # Legacy dumps may omit Parameter aliases that the
+                        # re-init model still exposes (or vice versa). Skip
+                        # unknown names; missing required keys are checked
+                        # after the loop. View-only aliases are rebound below.
+                        continue
                     param_data = state_dict[r["name"]].data
                     param_shape = state_dict[r["name"]].shape
                     for dim, size in enumerate(tensor.shape):
@@ -2487,12 +2556,32 @@ class PreshardedModelLoader(DefaultModelLoader):
                 gc.collect()
                 torch.cuda.empty_cache()
 
-            missing = set(state_dict.keys()) - loaded_param_keys
+            # A Parameter may appear under multiple state_dict names that
+            # share storage (tied embeddings, GDN A_log/dt_bias aliases).
+            # Loading any one name covers all aliases of that storage.
+            loaded_storages: set = set()
+            for k in loaded_param_keys:
+                t = state_dict[k]
+                if t.numel() > 0:
+                    loaded_storages.add((t.device, t.untyped_storage().data_ptr()))
+            missing = []
+            for k, t in state_dict.items():
+                if k in loaded_param_keys:
+                    continue
+                if t.numel() == 0:
+                    # Empty tensors are not dumped; leave as-initialized.
+                    continue
+                storage_key = (t.device, t.untyped_storage().data_ptr())
+                if storage_key not in loaded_storages:
+                    missing.append(k)
             if missing:
                 raise ValueError(
                     f"Missing keys {tuple(sorted(missing))} in presharded "
                     f"checkpoint at {presharded_dir}."
                 )
+
+            # Refresh derived buffers / rebind GDN aliases after the raw copy.
+            self._rebind_parameter_aliases(model)
 
             if self._verify_on_load:
                 self._verify_rank_checksum(verify_hashes, plan, rank, presharded_dir)
