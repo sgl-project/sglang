@@ -70,7 +70,8 @@ def _gqa_share_sparse_prefill_blockq_kernel(
     v_cache_ptr,  # same shape
     req_to_token_ptr,  # [num_requests, max_context]
     req_pool_indices_ptr,  # [num_pack_groups] -- one request per pack group
-    idx_ptr,  # [num_kv_heads, num_pack_groups, max_topk] int32, -1-padded
+    pack_last_ptr,  # [num_pack_groups] int32 -- latest-in-pack token idx per group
+    idx_ptr,  # [num_kv_heads, total_q, max_topk] int32, -1-padded (group g reads row pack_last[g])
     q_start_ptr,  # [num_pack_groups] int32 -- absolute token start of the group
     q_end_ptr,  # [num_pack_groups] int32 -- exclusive upper bound (cu_seqlens[r+1])
     seq_lens_ptr,  # [total_q] int32 -- per-query causal KV length
@@ -110,6 +111,7 @@ def _gqa_share_sparse_prefill_blockq_kernel(
     stride_qstart_g,
     stride_qend_g,
     stride_req_g,
+    stride_pl_g,
     stride_o_c,
     stride_o_n,
     stride_o_h,
@@ -129,6 +131,16 @@ def _gqa_share_sparse_prefill_blockq_kernel(
     BLOCK_SIZE_D: tl.constexpr,
     SANITIZE_PAGE_IDS: tl.constexpr,
     SCALAR_STORE: tl.constexpr,
+    # When SCALAR_STORE (= single_chunk, lse_partial is write-only -- the merge
+    # kernel that reads it only runs under `if not single_chunk`), skip the lse
+    # store. That store is the ONLY post-loop use of q_token/head_flat in
+    # SCALAR_STORE mode (acc_o goes to scratch via a scalar base), so skipping it
+    # dead-strips those prologue vectors after the Q load -- completing the
+    # SCALAR_STORE spill fix (the lse store is otherwise a remaining vector store
+    # that keeps them live across the loop). Bit-exact: lse_partial is unread on
+    # this path; lse_i is still computed for the final exp(m_i - lse_i) scale.
+    # A/B flag: False keeps the old always-store behaviour for comparison.
+    SKIP_LSE_STORE: tl.constexpr,
 ):
     """PACK_Q-query shared-topk sparse attention (prefill main path).
 
@@ -199,11 +211,33 @@ def _gqa_share_sparse_prefill_blockq_kernel(
         other=0.0,
     )
 
-    m_i = tl.full((BLOCK_ROWS,), float("-inf"), dtype=tl.float32)
-    lse_i = tl.full((BLOCK_ROWS,), float("-inf"), dtype=tl.float32)
+    # Finite-floor init (-1e30, NOT -inf) for the online-softmax running max/logsum.
+    # This eliminates the per-step ``row_contributes = m_ij > -inf`` guard and its 5
+    # ``tl.where`` ops (2 on [M,N], 3 on [M]) -- ~7% faster, measured bit-exact vs
+    # the guarded -inf path (bench_surgical_blockq.py: max-abs-diff 0.000e+00).
+    # Mechanism: a row that fully masks a block (shared-topk: an earlier-in-pack
+    # token's causal window misses a near-tail block the latest token selected, OR
+    # a -1 sentinel slot) has qk all -inf. With -inf init, m_ij = max(-inf, -inf) =
+    # -inf -> exp(qk - m_ij) = exp(-inf - -inf) = NaN, which the guard had to clamp
+    # to 0. With the finite floor, m_ij = max(-1e30, -inf) = -1e30 (finite), so
+    # exp(-inf - -1e30) = exp(-inf) = 0 (p naturally 0) and exp(-1e30 - -1e30) =
+    # exp(0) = 1 (acc_o rescale naturally a no-op) -- the guarded path's result
+    # falls out of the math with no ``where``. -1e30 is representable in fp32 and
+    # exp(-1e30 - finite) underflows to 0, so the floor drops out of the lse sum
+    # for contributing rows too (no precision loss). Same trick as the GPU kernel.
+    _NEG = -1.0e30
+    m_i = tl.full((BLOCK_ROWS,), _NEG, dtype=tl.float32)
+    lse_i = tl.full((BLOCK_ROWS,), _NEG, dtype=tl.float32)
     acc_o = tl.full((BLOCK_ROWS, BLOCK_SIZE_D), 0.0, dtype=tl.float32)
 
-    idx_base = idx_ptr + pid_kh * stride_ti_h + pid_g * stride_ti_g
+    # Pack group g's shared topk = the full per-query topk of its latest-in-pack
+    # token (pack_last[g]). Gather the row in the prologue (one scalar load per
+    # program) instead of a host-side topk_idx[:, pack_last, :].contiguous() --
+    # that host gather (aclnnIndex_TransposeAiCore_Transpose) was the last kernel
+    # before blockq and fed its ~1.5ms Wait Time. pack_last_g is a prologue
+    # scalar, dead before the loop -> no cross-loop-resident vector -> no spill.
+    pack_last_g = tl.load(pack_last_ptr + pid_g * stride_pl_g).to(tl.int32)
+    idx_base = idx_ptr + pid_kh * stride_ti_h + pack_last_g * stride_ti_g
     chunk_start_topk = pid_c * CHUNK_SIZE_T
 
     for step in tl.range(CHUNK_SIZE_T):
@@ -257,20 +291,12 @@ def _gqa_share_sparse_prefill_blockq_kernel(
         qk = tl.where(pos_mask, qk, float("-inf"))
 
         m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
-        # Per-row "this block contributes" guard. Unlike the decode kernel --
-        # where each query's own topk is causally relevant -- the SHARED topk
-        # means an earlier-in-pack token (smaller causal window) can fully mask
-        # a near-tail block that the later token selected. For such rows qk is
-        # all -inf -> m_ij = -inf, and exp(qk - m_ij) = exp(-inf - -inf) = nan.
-        # Guard on ``m_ij > -inf`` (per-row); a -1 sentinel topk slot makes
-        # every row non-contributing (subsumes the scalar valid_block guard for
-        # the softmax update; valid_block is still used for the gather mask).
-        row_contributes = m_ij > float("-inf")  # [BLOCK_ROWS]
-        p = tl.where(
-            row_contributes[:, None],
-            tl.exp(qk - m_ij[:, None]),
-            tl.zeros((BLOCK_ROWS, BLOCK_SIZE_N), dtype=tl.float32),
-        )
+        # No row_contributes guard: the finite-floor m_i/lse_i init (-1e30, see
+        # above) makes m_ij finite even for fully-masked rows, so exp(qk - m_ij)
+        # is 0 (not NaN) there and the acc_o rescale is a no-op -- the guarded
+        # path's result falls out of the math. valid_block is still used for the
+        # K/V gather mask (pos_mask_col); the softmax math needs no per-row guard.
+        p = tl.exp(qk - m_ij[:, None])  # 0 where qk=-inf (masked); NaN-free
         l_ij = tl.sum(p, axis=1)
 
         # V load sequenced AFTER the p compute so its UB live range starts as
@@ -289,19 +315,16 @@ def _gqa_share_sparse_prefill_blockq_kernel(
             other=0.0,
         )
 
-        acc_o_scale = tl.where(
-            row_contributes,
-            tl.exp(m_i - m_ij),
-            tl.full((BLOCK_ROWS,), 1.0, dtype=tl.float32),
-        )
-        acc_o_new = acc_o * acc_o_scale[:, None] + tl.dot(p.to(v.dtype), v)
-        lse_i_new = m_ij + tl.log(tl.exp(lse_i - m_ij) + l_ij)
+        # Direct online-softmax update (no guard wheres). For non-contributing
+        # rows p=0 and exp(m_i - m_ij)=1 -> acc_o unchanged, lse_i unchanged.
+        acc_o = acc_o * tl.exp(m_i - m_ij)[:, None] + tl.dot(p.to(v.dtype), v)
+        lse_i = m_ij + tl.log(tl.exp(lse_i - m_ij) + l_ij)
+        m_i = m_ij
 
-        acc_o = tl.where(row_contributes[:, None], acc_o_new, acc_o)
-        m_i = tl.where(row_contributes, m_ij, m_i)
-        lse_i = tl.where(row_contributes, lse_i_new, lse_i)
-
-    # Final scale; empty rows (lse_i=-inf, e.g. all-sentinel topk) -> clean 0.
+    # Final scale. With the finite-floor init lse_i is finite (never -inf): for an
+    # empty row (all-sentinel topk) m_i == lse_i == -1e30 -> scale = exp(0) = 1 and
+    # acc_o == 0 (never updated) -> output 0, same as the -inf path. The where is
+    # kept as a defensive no-op (always-True under the floor).
     scale = tl.where(
         lse_i > float("-inf"),
         tl.exp(m_i - lse_i),
@@ -343,12 +366,17 @@ def _gqa_share_sparse_prefill_blockq_kernel(
             mask=row_valid[:, None] & dim_mask[None, :],
         )
 
-    l_offsets = pid_c * stride_l_c + q_token * stride_l_n + head_flat * stride_l_h
-    tl.store(
-        lse_ptr + l_offsets,
-        lse_i.to(lse_ptr.dtype.element_ty),
-        mask=row_valid,
-    )
+    # lse store: needed when multi-chunk (merge reads lse_partial) OR when the
+    # A/B flag forces the old always-store behaviour. Skipped on single_chunk
+    # (SCALAR_STORE) when SKIP_LSE_STORE -- lse_partial is write-only there, and
+    # skipping dead-strips q_token/head_flat (only post-loop use in this mode).
+    if (not SCALAR_STORE) or (not SKIP_LSE_STORE):
+        l_offsets = pid_c * stride_l_c + q_token * stride_l_n + head_flat * stride_l_h
+        tl.store(
+            lse_ptr + l_offsets,
+            lse_i.to(lse_ptr.dtype.element_ty),
+            mask=row_valid,
+        )
 
 
 @triton.jit
@@ -413,7 +441,8 @@ def flash_prefill_bnsd_blockq_sparse(
     q: torch.Tensor,  # [total_q, num_q_heads, head_dim]
     k_cache_bnsd: torch.Tensor,  # [num_pages, block_size, num_kv_heads, head_dim]
     v_cache_bnsd: torch.Tensor,  # same shape
-    topk_idx_blockq: torch.Tensor,  # [num_kv_heads, num_pack_groups, max_topk] int32, -1-padded
+    topk_idx: torch.Tensor,  # [num_kv_heads, total_q, max_topk] int32, -1-padded (full per-query)
+    pack_last: torch.Tensor,  # [num_pack_groups] int32 -- latest-in-pack token idx per group
     seq_lens: torch.Tensor,  # [total_q] per-query causal KV length
     q_start: torch.Tensor,  # [num_pack_groups] int32
     q_end: torch.Tensor,  # [num_pack_groups] int32
@@ -429,19 +458,26 @@ def flash_prefill_bnsd_blockq_sparse(
     max_num_topk_chunks: int = 8,
     num_warps: int = 4,
     num_stages: int = 2,
+    # A/B for the single_chunk lse-store skip (see kernel SKIP_LSE_STORE). True
+    # (default) = skip the write-only lse store on single_chunk + dead-strip
+    # q_token/head_flat; False = old always-store behaviour for comparison.
+    skip_lse_store: bool = True,
 ) -> torch.Tensor:
     """PACK_Q shared-topk prefill sparse attention. Returns [total_q, QH, D].
 
     One program per (pack group, kv head). A pack group is ``pack_q`` consecutive
     in-request extend tokens sharing one topk block list
-    (``topk_idx_blockq[:, g, :]``). Each selected K/V block is loaded once and
-    reused across all ``pack_q * gqa`` Q rows. No membership bits.
+    (``topk_idx[:, pack_last[g], :]`` -- the latest-in-pack token's per-query
+    topk, gathered in the kernel prologue). Each selected K/V block is loaded
+    once and reused across all ``pack_q * gqa`` Q rows. No membership bits.
 
     Args:
-        topk_idx_blockq: per-pack-group topk, shape
-            ``[num_kv_heads, num_pack_groups, max_topk]`` int32, ``-1``-padded.
-            Typically derived by gathering the latest-in-pack token's per-query
-            topk (its causal window is a superset of the earlier tokens').
+        topk_idx: full per-query topk, shape
+            ``[num_kv_heads, total_q, max_topk]`` int32, ``-1``-padded. Pack group
+            g reads row ``pack_last[g]`` (the latest-in-pack token's topk; its
+            causal window is a superset of the earlier tokens').
+        pack_last: ``[num_pack_groups]`` int32, latest-in-pack token index per
+            group (the row of ``topk_idx`` this group shares).
         seq_lens: per-query causal KV length ``[total_q]``. Each row uses its
             own token's length for causal masking.
         q_start / q_end: absolute token bounds of each pack group;
@@ -465,13 +501,15 @@ def flash_prefill_bnsd_blockq_sparse(
     num_pack_groups = q_start.shape[0]
     assert q_end.shape[0] == num_pack_groups
     assert req_pool_indices.shape[0] == num_pack_groups
-    assert topk_idx_blockq.shape[0] == num_kv_heads
-    assert topk_idx_blockq.shape[1] == num_pack_groups
-    assert topk_idx_blockq.dtype == torch.int32
+    assert pack_last.shape[0] == num_pack_groups
+    assert topk_idx.shape[0] == num_kv_heads
+    assert topk_idx.shape[1] == total_q
+    assert topk_idx.dtype == torch.int32
+    assert pack_last.dtype == torch.int32
     assert seq_lens.shape[0] == total_q
     assert seq_lens.dtype == torch.int32
 
-    max_topk = topk_idx_blockq.shape[2]
+    max_topk = topk_idx.shape[2]
     max_kv_len = int(max_num_blocks) * block_size
     max_req_to_token_cols = req_to_token.shape[1]
 
@@ -539,7 +577,8 @@ def flash_prefill_bnsd_blockq_sparse(
         v_cache_bnsd,
         req_to_token,
         req_pool_indices,
-        topk_idx_blockq,
+        pack_last,
+        topk_idx,
         q_start,
         q_end,
         seq_lens,
@@ -570,12 +609,13 @@ def flash_prefill_bnsd_blockq_sparse(
         v_cache_bnsd.stride(3),
         req_to_token.stride(0),
         req_to_token.stride(1),
-        topk_idx_blockq.stride(0),
-        topk_idx_blockq.stride(1),
-        topk_idx_blockq.stride(2),
+        topk_idx.stride(0),
+        topk_idx.stride(1),
+        topk_idx.stride(2),
         q_start.stride(0),
         q_end.stride(0),
         req_pool_indices.stride(0),
+        pack_last.stride(0),
         o_partial.stride(0),
         o_partial.stride(1),
         o_partial.stride(2),
@@ -592,6 +632,7 @@ def flash_prefill_bnsd_blockq_sparse(
         BLOCK_SIZE_N=block_size,
         SANITIZE_PAGE_IDS=sanitize_page_ids,
         SCALAR_STORE=single_chunk,
+        SKIP_LSE_STORE=skip_lse_store,
         num_warps=num_warps,
         num_stages=num_stages,
     )

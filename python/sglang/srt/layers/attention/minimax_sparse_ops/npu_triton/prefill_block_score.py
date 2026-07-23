@@ -39,6 +39,11 @@ from sglang.srt.layers.attention.minimax_sparse_ops.npu_triton.flash_block_score
     _next_power_of_2,
 )
 
+# Fused post-score TopK (flash_prefill_bnsd_topk_from_score) is only used up to
+# this many KV blocks (32K context at block_size=128). Beyond it the O(K*topk)
+# triton topk loses to CANN torch.topk's O(K); see the gate in
+# flash_prefill_bnsd_indexer / flash_prefill_bnsd_with_topk_idx.
+
 
 @triton.jit
 def _prefill_bnsd_score_kernel(
@@ -721,6 +726,218 @@ def flash_prefill_bnsd_score_attn(
     return score, idx_o
 
 
+@triton.jit
+def _prefill_topk_from_score_kernel(
+    score_ptr,  # [num_kv_heads, total_q, max_seqblock_k] fp32 (-inf for invalid)
+    seq_lens_ptr,  # [total_q] int32 -- per-query CAUSAL KV length (prefix+within+1)
+    out_ptr,  # [num_kv_heads, total_q, topk + 1] int32 -- topk + appended local block
+    total_q,
+    max_seqblock_k,
+    block_size,
+    topk,
+    stride_s_h,
+    stride_s_q,
+    stride_s_k,
+    stride_o_h,
+    stride_o_q,
+    stride_o_t,
+    BLOCK_SIZE_Q: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    TOPK: tl.constexpr,
+):
+    """Fused block-TopK + causal-local-block append from the score tensor.
+
+    Replaces ``torch.topk`` + ``.to(int32)`` + pad + ``.contiguous()`` +
+    ``_append_local_block_to_topk_idx_kernel`` (4-5 launches, the last one a
+    total_q-program launch-overhead-bound kernel) with ONE query-block-tiled
+    kernel. Mirrors the validated NPU decode score+topk fusion
+    (``_decode_bnsd_score_topk_chunk_kernel``) and the GPU reference
+    (``prefill/flash_with_topk_idx.py::_topk_index_kernel``): the score tensor is
+    already -inf for out-of-causal-range blocks, so TopK by score selects exactly
+    the causally-valid blocks; the local block is appended at slot ``topk`` (-1 if
+    already selected) with the SAME validation/dedup semantics as
+    ``_append_local_block_to_topk_idx_kernel`` (so the main-attention kernel sees
+    a bit-equivalent block set).
+
+    Grid: ``(cdiv(total_q, BLOCK_SIZE_Q), num_kv_heads)`` -- one program per
+    (query-block of BSQ tokens, kv head). BSQ tokens/program keeps the program
+    count ~total_q/BSQ (NOT total_q), dodging the launch-overhead cliff that left
+    the per-token append kernel at 306us/call. ``num_kv_heads`` here equals the
+    score's head dim (index gqa=1 fast path: num_idx_heads == num_kv_heads).
+
+    TopK via repeated max+argmax reduction (same loop as
+    ``_merge_bnsd_score_topk_candidates_kernel``) -- NOT bitonic, which hits the
+    Ascend broadcast-compare miscompile the kimi union path tripped. argmax breaks
+    ties toward the lowest block index (``tl.min``), deterministic.
+    """
+    pid_qb = tl.program_id(0)
+    pid_h = tl.program_id(1)
+
+    off_q = tl.arange(0, BLOCK_SIZE_Q)  # [BSQ]
+    q_tok = pid_qb * BLOCK_SIZE_Q + off_q  # [BSQ]
+    q_valid = q_tok < total_q
+
+    # Per-query causal KV length -> query position + local block. Clamp the load
+    # for phantom rows (q_tok >= total_q, partial-tail query-block); their output
+    # is masked by q_valid so the value is irrelevant (other=1 -> pos 0).
+    seq_len_q = tl.load(seq_lens_ptr + q_tok, mask=q_valid, other=1).to(tl.int32)
+    query_pos = tl.maximum(seq_len_q - 1, 0)  # [BSQ]
+    # local block = block containing the query's last KV position. block_size is a
+    # power of two so // is a shift (nearly free on Ascend).
+    local_blk = tl.minimum(query_pos // block_size, max_seqblock_k - 1)  # [BSQ]
+
+    off_k = tl.arange(0, BLOCK_SIZE_K)  # [K]
+    k_valid = off_k < max_seqblock_k  # [K]
+
+    # Score slab [BSQ, K]; out-of-range / future blocks are -inf (score kernel
+    # wrote -inf for key_pos >= seq_len or q_token < key_pos; unwritten blocks
+    # past the request stay -inf from the score tensor's -inf init).
+    s_offsets = (
+        pid_h * stride_s_h
+        + q_tok[:, None] * stride_s_q
+        + off_k[None, :] * stride_s_k
+    )
+    scores = tl.load(
+        score_ptr + s_offsets,
+        mask=q_valid[:, None] & k_valid[None, :],
+        other=float("-inf"),
+    )  # [BSQ, K] fp32
+
+    # TopK selection: TOPK iterations of max + argmax (lowest-index tie-break),
+    # each selected block validated + removed before the next. Mirrors
+    # _merge_bnsd_score_topk_candidates_kernel's reduction. ``tl.range`` (dynamic
+    # loop, not unrolled) keeps the loop body small -- ``static_range`` unrolls
+    # TOPK=17 copies of the [BSQ, K] max/argmax and bloats register pressure.
+    for rank in tl.range(0, TOPK):
+        best = tl.max(scores, axis=1)  # [BSQ]
+        is_best = scores == best[:, None]  # [BSQ, K] (== -inf ties handled below)
+        pos = tl.min(
+            tl.where(is_best, off_k[None, :], BLOCK_SIZE_K), axis=1
+        )  # [BSQ] argmax (min index on ties)
+        # Store the selected block only if it is genuinely finite-scored
+        # (``best > -inf``). Once only -inf blocks remain (future / beyond-request
+        # blocks, OR blocks already picked and blanked to -inf below), the rest of
+        # the slots are -1 -- WITHOUT this guard a picked-and-blanked block (still
+        # a causally-valid index) would be re-selected and pass the range check,
+        # duplicating it. ``pos * block_size <= query_pos`` is the same causal
+        # validation as ``_append_local_block_to_topk_idx_kernel`` (defensive: in
+        # the real score tensor finite <=> causally valid, so this is a subset).
+        valid_blk = (
+            (best > float("-inf"))
+            & (pos < max_seqblock_k)
+            & (pos * block_size <= query_pos)
+        )
+        out_blk = tl.where(valid_blk, pos, -1)
+        tl.store(
+            out_ptr
+            + pid_h * stride_o_h
+            + q_tok * stride_o_q
+            + rank * stride_o_t,
+            tl.where(q_valid, out_blk, -1),
+            mask=q_valid,
+        )
+        # Remove the selected position so the next iteration picks the next best.
+        # Blank to -inf (works for finite winners; for -inf tie groups the slot is
+        # already -inf so this is a no-op and the guard above emits -1).
+        scores = tl.where(off_k[None, :] == pos[:, None], float("-inf"), scores)
+
+    # Append the causal local block at slot TOPK: -1 if it is already among the
+    # selected TOPK (dedup, avoids double-counting in the main-attention online
+    # softmax), else local_blk. Reload the just-written TOPK slots to test
+    # membership (small [BSQ, TOPK] load).
+    rank_off = tl.arange(0, TOPK)  # [TOPK]
+    sel_offsets = (
+        pid_h * stride_o_h
+        + q_tok[:, None] * stride_o_q
+        + rank_off[None, :] * stride_o_t
+    )
+    selected = tl.load(out_ptr + sel_offsets, mask=q_valid[:, None], other=-1)  # [BSQ, TOPK]
+    local_present = (
+        tl.sum((selected == local_blk[:, None]).to(tl.int32), axis=1) > 0
+    )  # [BSQ]
+    out_local = tl.where(local_present, -1, local_blk)
+    tl.store(
+        out_ptr
+        + pid_h * stride_o_h
+        + q_tok * stride_o_q
+        + TOPK * stride_o_t,
+        tl.where(q_valid, out_local, -1),
+        mask=q_valid,
+    )
+
+
+def flash_prefill_bnsd_topk_from_score(
+    score: torch.Tensor,  # [num_kv_heads, total_q, max_seqblock_k] fp32
+    per_query_seq_lens: torch.Tensor,  # [total_q] int32 -- per-query causal KV len
+    topk: int,
+    block_size_k: int,
+) -> torch.Tensor:
+    """Fused TopK + causal-local-block append -> topk_idx [num_kv_heads, total_q, topk+1].
+
+    One query-block-tiled triton kernel replaces ``torch.topk`` + cast + pad +
+    ``.contiguous()`` + ``_append_local_block_to_topk_idx_kernel``. The local
+    block is already appended (slot ``topk``), so the caller's
+    ``_prepare_npu_triton_topk_idx`` must SKIP its own append for this tensor
+    (detected by ``shape[2] == topk + 1``).
+
+    ``score`` is the output of ``flash_prefill_bnsd_score`` /
+    ``flash_prefill_bnsd_score_attn``: -inf for out-of-causal-range blocks. Only
+    valid on the index-gqa=1 fast path (``num_idx_heads == num_kv_heads``, i.e.
+    ``score.shape[0] == num_kv_heads``) -- which is the only path the prefill
+    backend takes under TP=16.
+    """
+    num_kv_heads, total_q, max_seqblock_k = score.shape
+    assert score.dtype == torch.float32, "score must be fp32"
+    assert per_query_seq_lens.dtype == torch.int32
+    assert per_query_seq_lens.shape[0] == total_q
+    device = score.device
+
+    if total_q == 0:
+        return torch.empty(
+            (num_kv_heads, 0, topk + 1), dtype=torch.int32, device=device
+        )
+
+    out = torch.empty(
+        (num_kv_heads, total_q, topk + 1), dtype=torch.int32, device=device
+    )
+
+    BLOCK_SIZE_K = triton.next_power_of_2(max_seqblock_k)
+    # BSQ is capped at 16 (NOT the UB-safe max of 64): msprof op shows this kernel
+    # is scalar-bound (aiv_scalar_ratio 57%) on the vector core, and benchmarking
+    # BSQ in {1,2,4,8,16,32,64} at production shape (total_q=3072/K=128) puts the
+    # minimum at BSQ=16 (grid=192 ~= 6 waves of 32 vector cores) -- smaller tiles
+    # cut per-program scalar work and raise parallelism; BSQ<16 loses to program-
+    # launch overhead, BSQ>16 loses to per-program scalar. The UB ceiling (the
+    # bsq*2*K*4<=32KB guard) still binds for large K (e.g. 128K -> BSQ=8).
+    bsq = 1
+    while bsq < 16 and bsq * 2 * BLOCK_SIZE_K * 4 <= 32768:
+        bsq *= 2
+    BLOCK_SIZE_Q = max(1, bsq)
+
+    grid = (triton.cdiv(total_q, BLOCK_SIZE_Q), num_kv_heads)
+    _prefill_topk_from_score_kernel[grid](
+        score,
+        per_query_seq_lens,
+        out,
+        total_q,
+        max_seqblock_k,
+        block_size_k,
+        topk,
+        score.stride(0),
+        score.stride(1),
+        score.stride(2),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        BLOCK_SIZE_Q=BLOCK_SIZE_Q,
+        BLOCK_SIZE_K=BLOCK_SIZE_K,
+        TOPK=topk,
+        num_warps=4,
+        num_stages=1,
+    )
+    return out
+
+
 def flash_prefill_bnsd_indexer(
     q: torch.Tensor,  # idx_q [total_q, num_idx_heads, idx_dim]
     k_cache_bnsd: torch.Tensor,  # idx_k
@@ -735,18 +952,39 @@ def flash_prefill_bnsd_indexer(
     sm_scale: float,
     score_type: str = "max",
     qblock_mappings: Optional[tuple] = None,
+    per_query_seq_lens: Optional[torch.Tensor] = None,
 ):
     """Prefill indexer (fused): returns (idx_o, topk_idx [num_idx_heads, total_q, topk]).
 
     topk_idx is UN-reduced (per index head) to match the decode
     ``flash_decode_bnsd_with_topk_idx`` contract; the caller does GQA reduction
     via ``topk_index_reduce``.
+
+    When ``per_query_seq_lens`` is supplied AND num_idx_heads == num_kv_heads (the
+    TP=16 index-gqa=1 fast path), the TopK + causal-local-block append run as ONE
+    fused query-block-tiled kernel (``flash_prefill_bnsd_topk_from_score``) and
+    the returned tensor is ``[num_kv_heads, total_q, topk + 1]`` with the local
+    block ALREADY appended at slot ``topk`` -- the caller's
+    ``_prepare_npu_triton_topk_idx`` detects this (``shape[2] == topk + 1``) and
+    skips its own append. Otherwise the legacy ``torch.topk`` + pad path runs and
+    returns ``[..., topk]`` (local appended later).
     """
     score, idx_o = flash_prefill_bnsd_score_attn(
         q, k_cache_bnsd, v_cache_bnsd, cu_seqlens, seq_lens,
         req_to_token, req_pool_indices, block_size_q, block_size_k,
         sm_scale, score_type, qblock_mappings,
     )
+    # Fused TopK + local-append (env SGLANG_MINIMAX_NPU_PREFILL_FUSE_TOPK, no
+    # K-gate). When ON, the TopK + local-append run as one query-block-tiled
+    # triton kernel; when OFF, the legacy torch.topk + tiled append_local runs.
+    if (
+        per_query_seq_lens is not None
+        and q.shape[1] == k_cache_bnsd.shape[2]
+    ):
+        # Fused TopK + local-block append -> [num_kv_heads, total_q, topk + 1].
+        return idx_o, flash_prefill_bnsd_topk_from_score(
+            score, per_query_seq_lens, topk, block_size_k
+        )
     max_seqblock_k = score.shape[-1]
     actual_topk = min(topk, max_seqblock_k)
     _, idx = torch.topk(score, k=actual_topk, dim=-1)  # [num_idx_heads, total_q, k]
@@ -773,19 +1011,35 @@ def flash_prefill_bnsd_with_topk_idx(
     sm_scale: float,
     score_type: str = "max",
     qblock_mappings: Optional[tuple] = None,
+    per_query_seq_lens: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Prefill indexer: score (varlen, batched over query-blocks) + topk.
 
     Returns topk_idx [num_idx_heads, total_q, topk] UN-reduced (per index head);
     caller does GQA reduction. Score-only variant (no idx_o) for the
     ``disable_index_value`` case.
+
+    When ``per_query_seq_lens`` is supplied AND num_idx_heads == num_kv_heads, the
+    TopK + local-block append run fused (``flash_prefill_bnsd_topk_from_score``)
+    and the returned tensor is ``[num_kv_heads, total_q, topk + 1]`` with local
+    already appended (caller skips its own append). See ``flash_prefill_bnsd_indexer``.
     """
+    from sglang.srt.environ import envs
+
+    max_seqblock_k = (int(seq_lens.max().item()) + block_size_k - 1) // block_size_k
     score = flash_prefill_bnsd_score(
         q, k_cache_bnsd, cu_seqlens, seq_lens,
         req_to_token, req_pool_indices, block_size_q, block_size_k,
         sm_scale, score_type, qblock_mappings=qblock_mappings,
     )
-    max_seqblock_k = score.shape[-1]
+    # Fused TopK (env SGLANG_MINIMAX_NPU_PREFILL_FUSE_TOPK, no K-gate).
+    if (
+        per_query_seq_lens is not None
+        and q.shape[1] == k_cache_bnsd.shape[2]
+    ):
+        return flash_prefill_bnsd_topk_from_score(
+            score, per_query_seq_lens, topk, block_size_k
+        )
     actual_topk = min(topk, max_seqblock_k)
     idx = torch.topk(score, k=actual_topk, dim=-1).indices.to(torch.int32)
     if actual_topk < topk:

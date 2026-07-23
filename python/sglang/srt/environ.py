@@ -401,6 +401,26 @@ class Envs:
     # UB cap is PACK_Q=4 (gqa=16, D=128, bf16); larger overflows the 192KB UB.
     SGLANG_MINIMAX_NPU_PREFILL_PACKQ = EnvInt(None)
 
+    # MiniMax M3 NPU prefill: fuse the block-TopK + causal-local-block append
+    # (between the score kernel and the main sparse-attention kernel) into ONE
+    # query-block-tiled triton kernel (`_prefill_topk_from_score_kernel`),
+    # replacing `torch.topk` + cast + pad + the launch-overhead-bound
+    # `_append_local_block_to_topk_idx_kernel`. Default ON.
+    #
+    # Fact-based tuning (msprof op + microbench, production shape total_q=3072/
+    # topk=17): the fused kernel is a pure vector-core op, scalar-bound
+    # (aiv_scalar_ratio 57%), and is O(K*topk) vs CANN torch.topk's O(K). So it
+    # only pays off at small K and only when measured as the FULL chain (it also
+    # drops the cast + the pack_last gather that Part B moved into the blockq
+    # kernel). BSQ is capped at 16 (grid ~= 6 vector-core waves -- the measured
+    # minimum; larger BSQ is per-program-scalar-bound, smaller loses to launch
+    # overhead). Fused is K-gated to max_seqblock_k<=256 (16K/32K context):
+    # per-call-sync full-chain microbench shows fused WINS at K=128(16K,
+    # -0.054ms/layer), parity at K=256(32K)/K=512(64K), and LOSES at K=1024
+    # (128K) -- so 64K/128K stay on the legacy torch.topk+append path (no
+    # regression). Kill-switch: set =0 to force the legacy path everywhere.
+    SGLANG_MINIMAX_NPU_PREFILL_FUSE_TOPK = EnvBool(False)
+
     # Scheduler: memory leak test
     SGLANG_TEST_RETRACT = EnvBool(False)
     SGLANG_TEST_RETRACT_INTERVAL = EnvInt(3)

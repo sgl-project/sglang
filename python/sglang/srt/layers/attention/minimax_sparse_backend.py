@@ -166,7 +166,10 @@ def _choose_prefill_pack_q(
     ]
     if not sat:
         return 1
-    if max_seqlen_k >= 32768 and 4 in sat:
+    # pack_q=4 microbench @ total_q=3072/KV=16K (20260724): 27.1ms vs pack_q=2
+    # 39.2ms vs per-query 66.8ms (aiv_mte3 stays 0.059 -> no spill). The former
+    # >=32K gate left the 16K production shape on the slower pack_q=2.
+    if max_seqlen_k >= 16384 and 4 in sat:
         return 4
     if 2 in sat:
         return 2
@@ -802,6 +805,13 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             and topk_idx.is_contiguous()
             and seq_lens.is_contiguous()
         ):
+            # Fused prefill topk (flash_prefill_bnsd_topk_from_score) already
+            # appended the causal local block at slot topk, so the tensor is
+            # [num_kv_heads, total_q, topk + 1] -> skip the separate (launch-
+            # overhead-bound, total_q-program) append kernel. The legacy path and
+            # the decode/verify paths pass [..., topk] and still need the append.
+            if topk_idx.shape[2] == self.topk_blocks + 1:
+                return topk_idx
             from sglang.srt.layers.attention.minimax_sparse_ops.npu_triton.topk_sparse_decode import (
                 append_local_block_to_topk_idx,
             )
@@ -1818,6 +1828,22 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             flash_prefill_bnsd_with_topk_idx as _flash_prefill_score_topk,
         )
 
+        # Fused TopK + causal-local-block append (env SGLANG_MINIMAX_NPU_PREFILL_
+        # FUSE_TOPK, default ON, kill-switch =0). When on, pass per-query causal
+        # Fused TopK (env SGLANG_MINIMAX_NPU_PREFILL_FUSE_TOPK, default OFF,
+        # kill-switch =0). When on, pass per-query causal seq_lens so the indexer
+        # fuses topk + local-append into one query-block-tiled kernel (BSQ=16,
+        # K-gated to max_seqblock_k<=256). The fused tensor has local already
+        # appended ([..., topk+1]); _prepare_npu_triton_topk_idx detects this
+        # (shape[2] == topk+1) and skips its own append.
+        from sglang.srt.environ import envs
+
+        topk_per_query_seq_lens = (
+            per_query_seq_lens
+            if envs.SGLANG_MINIMAX_NPU_PREFILL_FUSE_TOPK.get()
+            else None
+        )
+
         if disable_index_value:
             idx_o = None
             topk_idx = _flash_prefill_score_topk(
@@ -1833,6 +1859,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 idx_dim**-0.5,
                 self.score_type,
                 qblock_mappings=meta.qblock_mappings,
+                per_query_seq_lens=topk_per_query_seq_lens,
             )
         else:
             idx_o, topk_idx = flash_prefill_bnsd_indexer(
@@ -1849,6 +1876,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 idx_dim**-0.5,
                 self.score_type,
                 qblock_mappings=meta.qblock_mappings,
+                per_query_seq_lens=topk_per_query_seq_lens,
             )
 
         # 2) Reduce heads and append forced blocks in the GQA kernel layout.
@@ -1916,18 +1944,21 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             )
 
             pg = self._build_pack_group_meta(meta, pack_q, q.device)
-            # Per-pack-group topk = the latest-in-pack token's per-query topk
-            # (its causal window is a superset of the earlier tokens'; earlier
-            # rows mask the few extra near-tail blocks via per-row causal). The
-            # +1 is the appended causal local block from _prepare_npu_triton_topk_idx.
-            topk_blockq = topk_idx[:, pg.pack_last, :].contiguous()
+            # Pass the full per-query topk_idx [num_kv_heads, total_q, max_topk]
+            # + pack_last directly; the blockq kernel gathers pack group g's
+            # shared topk (the latest-in-pack token's list, topk_idx[:, pack_last[g],
+            # :]) in its prologue. This drops the host-side
+            # `topk_idx[:, pg.pack_last, :].contiguous()` (aclnnIndex_TransposeAiCore)
+            # that was the last kernel before blockq and fed its ~1.5ms Wait Time.
+            # The +1 in max_topk is the appended causal local block.
             # PACK_Q=4 needs the larger Q tile single-buffered (UB).
             blockq_ns = main_num_stages if pack_q <= 2 else min(main_num_stages, 1)
             return flash_prefill_bnsd_blockq_sparse(
                 q=q,
                 k_cache_bnsd=k_bnsd,
                 v_cache_bnsd=v_bnsd,
-                topk_idx_blockq=topk_blockq,
+                topk_idx=topk_idx,
+                pack_last=pg.pack_last,
                 seq_lens=per_query_seq_lens,
                 q_start=pg.q_start,
                 q_end=pg.q_end,
