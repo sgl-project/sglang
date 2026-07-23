@@ -92,7 +92,10 @@ async def test_multi_tokenizer_rejects_in_place_pause_before_dispatch():
     worker._dispatch_to_scheduler = Mock()
 
     with pytest.raises(RuntimeError, match="multiple tokenizer workers"):
-        await worker.pause_generation(PauseGenerationReqInput(mode="in_place"))
+        await asyncio.wait_for(
+            worker.pause_generation(PauseGenerationReqInput(mode="in_place")),
+            timeout=1,
+        )
 
     worker._dispatch_to_scheduler.assert_not_called()
 
