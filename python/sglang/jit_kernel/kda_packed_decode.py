@@ -5,8 +5,7 @@ the triton kernel keeps a [BV, K] fp32 state tile in one warp's registers and
 tops out at ~5 TB/s; this kernel streams the state one 512B row at a time and
 reaches the in-place read+write bandwidth of the part (~9.6 TB/s probe).
 Outputs match the triton kernel to ULPs (warp-shuffle reduction order), not
-bits — gated by SGLANG_KDA_DECODE_CUDA and a covered() check; everything else
-falls back to triton.
+bits. Unsupported inputs fall back to triton through a covered() check.
 """
 
 from __future__ import annotations
@@ -21,12 +20,9 @@ from sglang.jit_kernel.utils import (
     load_jit,
     make_cpp_args,
 )
-from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
-
-KDA_DECODE_CUDA_ENABLED = envs.SGLANG_KDA_DECODE_CUDA.get()
 
 _WARPS: int = 8
 # The row-streaming layout needs enough (batch x head) CTAs to fill the GPU;

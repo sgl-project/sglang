@@ -58,7 +58,7 @@ struct FusionParams {
   uint32_t num_norm_rows;
   uint32_t num_push_counters;  // cluster variant only: full counter array size
   // finalize_push_norm only: trtllm-gen deferred-finalize inputs (kimi_k3.py
-  // SGLANG_K3_DEFER_MOE_FINALIZE); `input` is then output-only ([T, kNormDim])
+  // deferred finalize path); `input` is then output-only ([T, kNormDim])
   const uint8_t* fin_gemm2;    // [P, kNormDim] bf16, permuted rows
   const uint8_t* fin_idx;      // [T * kFinTopK] int32, -1 = dropped slot
   const uint8_t* fin_weights;  // [T, kFinTopK] bf16

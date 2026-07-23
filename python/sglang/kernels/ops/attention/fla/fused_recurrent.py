@@ -353,7 +353,7 @@ def fused_recurrent_gated_delta_rule_packed_decode(
             f"Invalid head config inferred from mixed_qkv: H={H}, HV={HV}."
         )
 
-    # Batched-decode CUDA fast path (SGLANG_KDA_DECODE_CUDA, default on):
+    # Batched-decode CUDA fast path:
     # row-streaming state update reaches the in-place R+W bandwidth of the
     # part (~9.6 TB/s) where this triton kernel tops out at ~5 TB/s holding a
     # [BV, K] register tile per warp. ULP-level output differences only
@@ -361,7 +361,7 @@ def fused_recurrent_gated_delta_rule_packed_decode(
     if use_qk_l2norm_in_kernel:
         from sglang.jit_kernel import kda_packed_decode as kda_decode_cuda
 
-        if kda_decode_cuda.KDA_DECODE_CUDA_ENABLED and kda_decode_cuda.covered(
+        if kda_decode_cuda.covered(
             mixed_qkv,
             a,
             b,
@@ -655,7 +655,7 @@ def fused_recurrent_kda_packed_decode(
             f"Invalid head config inferred from mixed_qkv: H={H}, HV={HV}."
         )
 
-    # Batched-decode CUDA fast path (SGLANG_KDA_DECODE_CUDA, default on):
+    # Batched-decode CUDA fast path:
     # row-streaming state update reaches the in-place R+W bandwidth of the
     # part (~9.6 TB/s) where this triton kernel tops out at ~5 TB/s holding a
     # [BV, K] register tile per warp. ULP-level output differences only
@@ -663,7 +663,7 @@ def fused_recurrent_kda_packed_decode(
     if use_qk_l2norm_in_kernel:
         from sglang.jit_kernel import kda_packed_decode as kda_decode_cuda
 
-        if kda_decode_cuda.KDA_DECODE_CUDA_ENABLED and kda_decode_cuda.covered(
+        if kda_decode_cuda.covered(
             mixed_qkv,
             a,
             b,

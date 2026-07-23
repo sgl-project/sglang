@@ -163,7 +163,7 @@ def _k3_bf16_gemm(
 # kernel, jit_kernel/kda_fused_decode). The model hands the output-norm gate
 # to the KDA backend via an attempt-and-verify stash on the attention layer;
 # unconsumed stashes fall back to the unfused chain + o_norm here.
-_K3_KDA_FUSED_DECODE = envs.SGLANG_KDA_FUSED_DECODE.get()
+
 
 def _merge_weights_as_views(
     mods: list, pad_rows_to: int = 1
@@ -451,8 +451,7 @@ class KimiK3MoE(nn.Module):
         # serves the deferral; sizes beyond the push window fall back to the
         # in-op finalize at runtime (finalize_push_fits).
         self._defer_moe_finalize = (
-            envs.SGLANG_K3_DEFER_MOE_FINALIZE.get()
-            and get_moe_runner_backend().is_flashinfer_mxfp4()
+            get_moe_runner_backend().is_flashinfer_mxfp4()
             and config.hidden_act == "situ"
         )
 
@@ -1256,8 +1255,6 @@ class KimiK3DeltaAttention(nn.Module):
         the compiled kernel the stash stays unset and decode keeps the
         unfused chain. Called once from load_weights (after all weights are
         loaded, before cuda graph capture)."""
-        if not _K3_KDA_FUSED_DECODE:
-            return
         layer = self.attn
         w = layer.conv_weights
         seg = 12 * 128  # compiled for H = HV = 12 heads of 128 (TP8)

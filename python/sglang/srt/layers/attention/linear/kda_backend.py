@@ -416,7 +416,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         # the output-norm gate for this forward (attempt-and-verify stash,
         # see kimi_k3.py) and the shapes are covered; the model applies the
         # norm itself whenever the stash is left unconsumed.
-        if kda_fused_decode.KDA_FUSED_DECODE_ENABLED and replayssm_d is None:
+        if replayssm_d is None:
             fused_static = getattr(layer, "_k3_fused_decode_args", None)
             onorm_gate = getattr(layer, "_k3_onorm_gate", None)
             if (

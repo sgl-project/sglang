@@ -12,9 +12,9 @@ Kernel body vendored from the NVIDIA x Moonshot Kimi K3 optimization package
 integration patches). Specialized for the K3 KDA decode regime:
 H = HV = 12, K = V = 128, kernel width 4, no lower bound, T = 1 per request.
 
-Gated by SGLANG_KDA_FUSED_DECODE plus a covered() check; the model must hand
-off the output-norm gate (attempt-and-verify stash on the attention layer,
-see kimi_k3.py). Everything else falls back to the unfused chain.
+The model must hand off the output-norm gate (attempt-and-verify stash on the
+attention layer, see kimi_k3.py), and a covered() check gates supported inputs.
+Everything else falls back to the unfused chain.
 """
 
 from __future__ import annotations
@@ -29,12 +29,9 @@ from sglang.jit_kernel.utils import (
     load_jit,
     make_cpp_args,
 )
-from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
-
-KDA_FUSED_DECODE_ENABLED = envs.SGLANG_KDA_FUSED_DECODE.get()
 
 _H = 12  # q/k/v heads per rank (TP8) — the compiled static layout
 _SEG = _H * 128  # 1536: per-segment width of q, k and v

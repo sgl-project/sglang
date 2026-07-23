@@ -717,9 +717,6 @@ class Envs:
     # Collapse per-layer mamba prefix-cache track launches into one
     # all-layers launch per decode step (see MambaAttnBackendBase).
     SGLANG_MAMBA_TRACK_FUSED = EnvBool(True)
-    # CUDA row-streaming KDA packed-decode kernel for batched decode
-    # (B >= 8, K = V = 128); ULP-level differences vs the triton kernel.
-    SGLANG_KDA_DECODE_CUDA = EnvBool(True)
     # TRT-LLM-gen fused MoE (SiTU) via sglang JIT: path to the private
     # FlashInfer snapshot checkout (internal collaboration artifact with
     # csrc/, include/, 3rdparty/, local_cubins/). Unset = feature off.
@@ -728,27 +725,12 @@ class Envs:
     # <SDK>/local_cubins/).
     SGLANG_TRTLLM_GEN_MOE_CUBIN_POOL = EnvStr(None)
 
-    # Fully fused KDA decode step: causal conv1d update + delta-rule
-    # recurrence + gated RMSNorm in one kernel (vendored NVIDIA x Moonshot
-    # many-heads kernel; H = HV = 12, K = V = 128). Engages only when the
-    # model hands off the output-norm gate (Kimi K3); tolerance-level
-    # differences vs the unfused chain.
-    SGLANG_KDA_FUSED_DECODE = EnvBool(True)
-
     # MNNVL fused all-reduce (bf16, TP8): zero-copy 1shot multicast-push for
     # small messages and in-place NVLS 2shot on symmetric-memory tensors for
     # large ones, with an optional fused residual add. Covers the KDA o_proj
     # output and the latent|shared MoE reduce; everything else falls back to
     # the regular all-reduce path. See srt/layers/k3_ar_fusion.py.
     SGLANG_K3_AR_FUSION = EnvBool(False)
-    # Defer the trtllm-gen MoE finalize (top-k weighted unpermute) out of the
-    # fused-MoE op: KimiK3MoE._forward_fused receives the permuted gemm2
-    # output + routing weights + index map and fuses the finalize into the
-    # push all-reduce (+RMSNorm) staging pass. flashinfer_mxfp4 + situ (the
-    # packed-routing trtllm-gen path) only; sizes beyond the push window
-    # fall back to the in-op finalize.
-    SGLANG_K3_DEFER_MOE_FINALIZE = EnvBool(True)
-
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)
 
