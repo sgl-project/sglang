@@ -41,7 +41,9 @@ def _unsupported_derived_weight_cache_error() -> Optional[str]:
     an update would silently keep serving the old router weights. Returns an
     error message when such a cache is active, None otherwise.
     """
-    from sglang.jit_kernel.dsv4.gemm import bf16xfp32_weight_split_cache_active
+    from sglang.kernels.ops.attention.dsv4.gemm import (
+        bf16xfp32_weight_split_cache_active,
+    )
 
     if bf16xfp32_weight_split_cache_active():
         return (
