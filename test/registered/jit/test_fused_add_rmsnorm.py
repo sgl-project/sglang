@@ -20,7 +20,7 @@ def sglang_jit_fused_add_rmsnorm(
     *,
     cast_x_before_out_mul: bool = False,
 ) -> None:
-    from sglang.jit_kernel.norm import fused_add_rmsnorm
+    from sglang.kernels.ops.layernorm._jit_norm import fused_add_rmsnorm
 
     fused_add_rmsnorm(
         input, residual, weight, eps, cast_x_before_out_mul=cast_x_before_out_mul

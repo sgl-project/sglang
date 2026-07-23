@@ -5,7 +5,7 @@ from typing import Any, Callable, Iterator, Optional
 
 import torch
 
-from sglang.jit_kernel.tests.kv_canary._canary_helpers import (
+from sglang.kernels.jit.tests.kv_canary._canary_helpers import (
     FakeViolationLog,
     assert_canary_buf_equal,
     assert_canary_state_equal,

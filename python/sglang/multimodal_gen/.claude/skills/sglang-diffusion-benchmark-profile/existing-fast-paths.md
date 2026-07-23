@@ -10,17 +10,17 @@ framework-specific optimization workflow.
 - `python/sglang/multimodal_gen/runtime/layers/elementwise.py`
 - `python/sglang/multimodal_gen/runtime/layers/fused_scale_shift_gate.py`
 - `python/sglang/multimodal_gen/runtime/layers/rotary_embedding/utils.py`
-- `python/sglang/jit_kernel/diffusion/triton/scale_shift.py`
-- `python/sglang/jit_kernel/diffusion/group_norm_silu.py`
-- `python/sglang/jit_kernel/diffusion/triton/group_norm_silu.py`
-- `python/sglang/jit_kernel/diffusion/triton/norm.py`
-- `python/sglang/jit_kernel/diffusion/triton/rmsnorm_onepass.py`
-- `python/sglang/jit_kernel/diffusion/triton/rotary.py`
-- `python/sglang/jit_kernel/diffusion/triton/ltx2_rotary.py`
-- `python/sglang/jit_kernel/diffusion/residual_gate_add.py`
-- `python/sglang/jit_kernel/csrc/diffusion/residual_gate_add.cuh`
-- `python/sglang/jit_kernel/diffusion/triton/varlen_pack_pad.py`
-- `python/sglang/jit_kernel/diffusion/cutedsl/scale_residual_norm_scale_shift.py`
+- `python/sglang/kernels/ops/diffusion/triton/scale_shift.py`
+- `python/sglang/kernels/ops/diffusion/group_norm_silu.py`
+- `python/sglang/kernels/ops/diffusion/triton/group_norm_silu.py`
+- `python/sglang/kernels/ops/diffusion/triton/norm.py`
+- `python/sglang/kernels/ops/diffusion/triton/rmsnorm_onepass.py`
+- `python/sglang/kernels/ops/diffusion/triton/rotary.py`
+- `python/sglang/kernels/ops/diffusion/triton/ltx2_rotary.py`
+- `python/sglang/kernels/ops/diffusion/residual_gate_add.py`
+- `python/sglang/kernels/jit/csrc/diffusion/residual_gate_add.cuh`
+- `python/sglang/kernels/ops/diffusion/triton/varlen_pack_pad.py`
+- `python/sglang/kernels/ops/diffusion/cutedsl/scale_residual_norm_scale_shift.py`
 - `test/registered/jit/diffusion/test_qwen_image_modulation.py`
 - `test/registered/jit/diffusion/test_group_norm_silu.py`
 - `test/registered/jit/diffusion/test_residual_gate_add.py`
@@ -29,7 +29,7 @@ framework-specific optimization workflow.
 - `test/registered/jit/benchmark/diffusion/bench_qwen_image_modulation.py`
 - `test/registered/jit/benchmark/diffusion/bench_group_norm_silu.py`
 - `test/registered/jit/benchmark/diffusion/bench_residual_gate_add.py`
-- `python/sglang/jit_kernel/norm.py`
+- `python/sglang/kernels/ops/layernorm/_jit_norm.py`
 - `python/sglang/multimodal_gen/runtime/platforms/cuda.py`
 - `python/sglang/multimodal_gen/runtime/layers/attention/selector.py`
 - `docs_new/docs/sglang-diffusion/attention_backends.mdx` (repo root)
@@ -137,7 +137,7 @@ framework-specific optimization workflow.
 **QK Norm Optimization**
 
 - Entry point: `apply_qk_norm` in `layernorm.py`.
-- Fast path: JIT fused inplace QK norm from `python/sglang/jit_kernel/norm.py` via `fused_inplace_qknorm`.
+- Fast path: JIT fused inplace QK norm from `python/sglang/kernels/ops/layernorm/_jit_norm.py` via `fused_inplace_qknorm`.
 - Preconditions for fused path:
   - CUDA only.
   - `allow_inplace=True` and `q_eps == k_eps`.
@@ -149,7 +149,7 @@ framework-specific optimization workflow.
 **QK Norm + RoPE Optimization**
 
 - Entry point: `apply_qk_norm_rope` in `layernorm.py`.
-- Fast path: JIT fused inplace QK norm + RoPE from `python/sglang/jit_kernel/diffusion/qknorm_rope.py` via `fused_inplace_qknorm_rope`.
+- Fast path: JIT fused inplace QK norm + RoPE from `python/sglang/kernels/ops/diffusion/qknorm_rope.py` via `fused_inplace_qknorm_rope`.
 - Toggle: `SGLANG_ENABLE_FUSED_QKNORM_ROPE=1` keeps the fused path enabled by default.
 - Preconditions for fused path:
   - CUDA only.

@@ -14,7 +14,7 @@ import torch.distributed as dist
 import triton
 
 import sglang.srt.distributed.parallel_state as ps
-from sglang.jit_kernel.tests.utils import multigpu_pytest_main
+from sglang.kernels.jit.tests.utils import multigpu_pytest_main
 from sglang.kernels.jit.utils import cache_once
 from sglang.kernels.ops.communication.all_reduce import (
     fused_parallel_qknorm,

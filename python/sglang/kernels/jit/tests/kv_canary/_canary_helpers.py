@@ -5,14 +5,14 @@ from typing import Optional
 
 import torch
 
-from sglang.jit_kernel.tests.kv_canary._constants import (
+from sglang.kernels.jit.tests.kv_canary._constants import (
     _I64_SIGN_BIT,
     _U64_MASK,
     DEFAULT_NUM_SLOTS,
     DEFAULT_RING_CAPACITY,
     DEFAULT_SLOT_STRIDE_BYTES,
 )
-from sglang.jit_kernel.tests.kv_canary._fixtures import (
+from sglang.kernels.jit.tests.kv_canary._fixtures import (
     make_real_kv_source,
     make_real_kv_sources,
 )

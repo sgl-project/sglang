@@ -19,7 +19,7 @@ def sglang_jit_qknorm_across_heads(
     q_weight: torch.Tensor,
     k_weight: torch.Tensor,
 ) -> None:
-    from sglang.jit_kernel.norm import fused_inplace_qknorm_across_heads
+    from sglang.kernels.ops.layernorm._jit_norm import fused_inplace_qknorm_across_heads
 
     fused_inplace_qknorm_across_heads(q, k, q_weight, k_weight)
 

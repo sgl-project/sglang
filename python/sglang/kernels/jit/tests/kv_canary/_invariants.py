@@ -11,7 +11,7 @@ from typing import Optional
 
 import torch
 
-from sglang.jit_kernel.tests.kv_canary._canary_helpers import FakeViolationLog
+from sglang.kernels.jit.tests.kv_canary._canary_helpers import FakeViolationLog
 from sglang.kernels.ops.kv_canary import consts
 from sglang.kernels.ops.kv_canary.verify import CanaryLaunchTag, VerifyPlan
 from sglang.kernels.ops.kv_canary.write import WritePlan

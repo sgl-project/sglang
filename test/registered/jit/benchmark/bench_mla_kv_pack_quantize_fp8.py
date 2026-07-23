@@ -8,7 +8,7 @@ import triton
 import triton.language as tl
 import triton.testing
 
-from sglang.jit_kernel.benchmark.utils import (
+from sglang.kernels.jit.benchmark.utils import (
     DEFAULT_DEVICE,
     DEFAULT_DTYPE,
     DEFAULT_QUANTILES,

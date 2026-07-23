@@ -25,7 +25,7 @@ import triton
 import triton.testing
 from sgl_kernel import transfer_kv_all_layer, transfer_kv_per_layer
 
-from sglang.jit_kernel.benchmark.utils import DEFAULT_QUANTILES, get_benchmark_range
+from sglang.kernels.jit.benchmark.utils import DEFAULT_QUANTILES, get_benchmark_range
 from sglang.kernels.ops.kvcache.hicache import (
     can_use_hicache_jit_kernel,
     transfer_hicache_all_layer,

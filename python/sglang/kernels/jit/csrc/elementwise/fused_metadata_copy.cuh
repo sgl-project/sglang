@@ -1,6 +1,6 @@
 /*
  * Fused metadata copy kernel for DSA backend CUDA graph replay.
- * JIT-compiled version for python/sglang/jit_kernel.
+ * JIT-compiled version for python/sglang/kernels/jit.
  *
  * OVERVIEW:
  * This kernel fuses multiple tensor copy operations (cache_seqlens, cu_seqlens_k,

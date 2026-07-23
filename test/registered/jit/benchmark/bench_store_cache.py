@@ -1,7 +1,7 @@
 import torch
 
-from sglang.jit_kernel.benchmark import marker
-from sglang.jit_kernel.benchmark.utils import (
+from sglang.kernels.jit.benchmark import marker
+from sglang.kernels.jit.benchmark.utils import (
     DEFAULT_DEVICE,
     create_empty,
     create_random,

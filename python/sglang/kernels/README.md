@@ -26,7 +26,7 @@ Groups populated in this phase: `activation`, `gemm`, `kvcache`, `layernorm`,
 `moe`, `quantization`. The remaining groups (`attention`, `communication`,
 `diffusion`, `grammar`, `mamba`, `memory`, `sampling`, `spatial`,
 `speculative`) are reserved package placeholders whose implementations still
-live in `sglang.jit_kernel` / `sgl_kernel` / `triton_ops` and will migrate in
+live in `sglang.kernels.jit` / `sgl_kernel` / `triton_ops` and will migrate in
 later phases.
 
 ## How it works
@@ -104,7 +104,7 @@ What this buys (see the
 > SGLang runtime code and tests should import callable kernels from
 > `sglang.kernels.ops.*`.
 
-Implementation work can still happen in `sglang.jit_kernel` or `sgl_kernel`.
+Implementation work can still happen in `sglang.kernels.jit` or `sgl_kernel`.
 When a PR adds a new callable kernel, add a `sglang.kernels.ops.*` entry point
-for it, and avoid growing `sglang.jit_kernel` as a long-term public operator
+for it, and avoid growing `sglang.kernels.jit` as a long-term public operator
 namespace.

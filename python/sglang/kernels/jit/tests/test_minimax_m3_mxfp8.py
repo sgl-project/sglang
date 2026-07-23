@@ -12,7 +12,7 @@ ROCm-only. The pure quant test runs on any ROCm arch; the native MXFP8
 ``dot_scaled`` linear/MoE tests are gated to CDNA4 gfx95x (the hardware
 microscaling matrix cores) -- gfx942 has no native ``dot_scaled`` MX path.
 
-Run:  pytest python/sglang/jit_kernel/tests/test_minimax_m3_mxfp8.py -v
+Run:  pytest python/sglang/kernels/jit/tests/test_minimax_m3_mxfp8.py -v
 """
 
 import pytest

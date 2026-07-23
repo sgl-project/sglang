@@ -58,7 +58,7 @@ __device__ float convert_to_float(T x) {
   }
 }
 
-// Reference pack (bit-identical to jit_kernel/flashinfer_trtllm_moe/topk_pack.py):
+// Reference pack (bit-identical to kernels/ops/moe/trtllm_lora_temp/topk_pack.py):
 // low 16 bits = bf16(weight) bits (round-to-nearest-even, same as torch/triton
 // `.to(bfloat16)`), high 16 bits = int16 expert id.
 __device__ __forceinline__ int32_t pack_routed(int32_t id, float w) {

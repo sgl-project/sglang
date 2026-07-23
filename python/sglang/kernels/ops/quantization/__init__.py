@@ -67,7 +67,7 @@ register_kernel(
                 "layouts, optional fused silu_and_mul and masked EP-MoE schedule"
             ),
         ),
-        description="Unified per-token-group quantization (sglang.jit_kernel).",
+        description="Unified per-token-group quantization (sglang.kernels.jit).",
     )
 )
 

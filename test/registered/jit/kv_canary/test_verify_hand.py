@@ -8,7 +8,7 @@ from typing import Callable
 import pytest
 import torch
 
-from sglang.jit_kernel.tests.kv_canary._canary_helpers import (
+from sglang.kernels.jit.tests.kv_canary._canary_helpers import (
     FakeViolationLog,
     assert_only_bits_set,
     chain_anchor_signed,
@@ -26,12 +26,12 @@ from sglang.jit_kernel.tests.kv_canary._canary_helpers import (
     to_signed_int64,
     write_slot_fields,
 )
-from sglang.jit_kernel.tests.kv_canary._differential import (
+from sglang.kernels.jit.tests.kv_canary._differential import (
     _run_both_verify,
     run_verify_diff,
 )
-from sglang.jit_kernel.tests.kv_canary._fixtures import clone_real_kv_sources
-from sglang.jit_kernel.tests.kv_canary._hand_oracle import (
+from sglang.kernels.jit.tests.kv_canary._fixtures import clone_real_kv_sources
+from sglang.kernels.jit.tests.kv_canary._hand_oracle import (
     _hand_fold_all,
     _hand_fold_partial,
 )

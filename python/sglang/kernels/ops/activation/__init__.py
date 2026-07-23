@@ -119,7 +119,7 @@ class SiluAndMulOp(_GatedActivationOp):
     }
     descriptions = {
         KernelBackend.AOT: "silu_and_mul (sgl_kernel wheel).",
-        KernelBackend.JIT: "silu_and_mul (sglang.jit_kernel).",
+        KernelBackend.JIT: "silu_and_mul (sglang.kernels.jit).",
         KernelBackend.AITER: "silu_and_mul (aiter, ROCm).",
         KernelBackend.TORCH: "silu_and_mul (pure-torch reference).",
     }
@@ -153,7 +153,7 @@ class GeluAndMulOp(_GatedActivationOp):
     kernel_attr = "gelu_and_mul"
     descriptions = {
         KernelBackend.AOT: "gelu_and_mul (sgl_kernel wheel).",
-        KernelBackend.JIT: "gelu_and_mul (sglang.jit_kernel).",
+        KernelBackend.JIT: "gelu_and_mul (sglang.kernels.jit).",
         KernelBackend.TORCH: "gelu_and_mul (pure-torch reference).",
     }
 
@@ -170,7 +170,7 @@ class GeluTanhAndMulOp(_GatedActivationOp):
     kernel_attr = "gelu_tanh_and_mul"
     descriptions = {
         KernelBackend.AOT: "gelu_tanh_and_mul (sgl_kernel wheel).",
-        KernelBackend.JIT: "gelu_tanh_and_mul (sglang.jit_kernel).",
+        KernelBackend.JIT: "gelu_tanh_and_mul (sglang.kernels.jit).",
         KernelBackend.TORCH: "gelu_tanh_and_mul (pure-torch reference).",
     }
 
@@ -195,7 +195,7 @@ class ReLU2Op(BaseFusedOp):
         description="relu(x) ** 2; returns tensor",
     )
     descriptions = {
-        KernelBackend.JIT: "relu(x)**2 (sglang.jit_kernel).",
+        KernelBackend.JIT: "relu(x)**2 (sglang.kernels.jit).",
         KernelBackend.TORCH: "relu(x)**2 (pure-torch reference).",
     }
 

@@ -9,7 +9,7 @@ import torch
 import triton
 import triton.testing
 
-from sglang.jit_kernel.benchmark.utils import (
+from sglang.kernels.jit.benchmark.utils import (
     DEFAULT_DEVICE,
     get_benchmark_range,
     run_benchmark,

@@ -5,7 +5,7 @@ from typing import Any, Optional
 import pytest
 import torch
 
-from sglang.jit_kernel.tests.kv_canary._canary_helpers import (
+from sglang.kernels.jit.tests.kv_canary._canary_helpers import (
     FakeViolationLog,
     assert_canary_buf_equal,
     assert_canary_state_equal,
@@ -14,7 +14,7 @@ from sglang.jit_kernel.tests.kv_canary._canary_helpers import (
     stamp_clean_chain,
     write_slot_fields,
 )
-from sglang.jit_kernel.tests.kv_canary._fixtures import (
+from sglang.kernels.jit.tests.kv_canary._fixtures import (
     clone_real_kv_sources,
     empty_extras,
     make_req_to_token,

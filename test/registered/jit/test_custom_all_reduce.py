@@ -28,7 +28,7 @@ import torch
 import torch.distributed as dist
 
 import sglang.srt.distributed.parallel_state as ps
-from sglang.jit_kernel.tests.utils import multigpu_pytest_main
+from sglang.kernels.jit.tests.utils import multigpu_pytest_main
 from sglang.kernels.jit.utils import cache_once, get_ci_test_range
 from sglang.kernels.ops.communication.all_reduce import (
     AllReduceAlgo,

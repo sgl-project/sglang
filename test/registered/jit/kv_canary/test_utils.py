@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from sglang.jit_kernel.benchmark.kv_canary.utils import (
+from sglang.kernels.jit.benchmark.kv_canary.utils import (
     MAX_EXTEND_TOKENS_PER_FORWARD,
     build_fast_matrix_cases,
     build_full_matrix_cases,

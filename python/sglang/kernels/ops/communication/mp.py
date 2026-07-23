@@ -1,7 +1,7 @@
 """Multi-process / multi-GPU launching utilities (torchrun-based).
 
-Shared `multigpu_launch` helper that both `sglang.jit_kernel.tests.utils` and
-`sglang.jit_kernel.benchmark.utils` build their domain-specific entry points on
+Shared `multigpu_launch` helper that both `sglang.kernels.jit.tests.utils` and
+`sglang.kernels.jit.benchmark.utils` build their domain-specific entry points on
 top of (`multigpu_pytest_main`, `multigpu_bench_main`).
 
 When a script that calls one of those wrappers is run with plain `python`, the
