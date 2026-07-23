@@ -1397,21 +1397,6 @@ class MooncakeKVManager(CommonKVManager):
             dst_dcp_size,
             dst_dcp_rank,
         )
-        logger.info(
-            "DSV4 state transfer: payload_lens=%s state_types=%s "
-            "src_state_ptrs=%d dst_state_ptrs=%d swa_count=%d "
-            "swa_locs=%d/%d offset=%d dst_offset=%d swa_ring=%s",
-            [len(x) if x is not None else None for x in prefill_state_indices],
-            [st.value for st in state_types],
-            len(src_state_ptrs),
-            len(dst_state_ptrs),
-            swa_count,
-            src_swa_locs.size,
-            src_swa_global_locs.size,
-            src_state_position_offset,
-            dst_state_position_offset,
-            swa_ring_state_idx is not None,
-        )
 
         def paired_state_locs_from_swa_locs(
             src_swa_locs: npt.NDArray[np.int32],
