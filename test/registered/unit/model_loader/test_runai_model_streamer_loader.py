@@ -16,6 +16,7 @@ from sglang.srt.models.deepseek_v4 import (
     _dequant_fp8_wo_a,
     _dequant_fp8_wo_a_streaming,
 )
+from sglang.srt.models.deepseek_v4_dspark import DeepseekV4ForCausalLMDSpark
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -167,6 +168,39 @@ class TestRunaiModelStreamerLoader(CustomTestCase):
 
         converted_weight = converted["layers.0.attn.wo_a.weight"]
         self.assertGreater(converted_weight.abs().sum().item(), 0)
+
+    def test_deepseek_v4_dspark_load_weights_streams_wo_a_dequant(self):
+        weight = torch.eye(128, dtype=torch.float32).to(torch.float8_e4m3fn)
+        scale = torch.ones((1, 1), dtype=torch.float32)
+        setattr(scale, weight_utils.RUNAI_STREAMER_TENSOR_ATTR, True)
+        loaded_weights = []
+
+        def weight_loader(_param, loaded_weight):
+            loaded_weights.append(loaded_weight)
+
+        param = SimpleNamespace(weight_loader=weight_loader)
+        remapper = SimpleNamespace(confidence_head=None)
+        model = SimpleNamespace(
+            config=SimpleNamespace(n_routed_experts=1),
+            named_parameters=lambda: [
+                ("stages.0.self_attn.wo_a.weight", param),
+            ],
+            _remap_dspark_weight_name=lambda name: (
+                DeepseekV4ForCausalLMDSpark._remap_dspark_weight_name(remapper, name)
+            ),
+            _assert_confidence_head_loaded=lambda **_kwargs: None,
+        )
+
+        def weights():
+            yield "mtp.0.attn.wo_a.scale", scale
+            scale.fill_(0)
+            yield "mtp.0.attn.wo_a.weight", weight
+
+        DeepseekV4ForCausalLMDSpark.load_weights(model, weights())
+
+        self.assertEqual(len(loaded_weights), 1)
+        self.assertEqual(loaded_weights[0].dtype, torch.bfloat16)
+        self.assertGreater(loaded_weights[0].abs().sum().item(), 0)
 
     def test_deepseek_v4_streaming_dequant_preserves_missing_scale_behavior(self):
         weight = torch.eye(128, dtype=torch.float32).to(torch.float8_e4m3fn)
