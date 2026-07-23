@@ -1872,6 +1872,13 @@ class MiMoV2Processor(BaseMultimodalProcessor):
     ):
         if audio_data is None:
             audio_data = getattr(request_obj, "audio_data", [])
+        # /v1/audio/transcriptions can pass list[str] segments or list[int] token IDs.
+        if isinstance(input_text, list):
+            if input_text and isinstance(input_text[0], int):
+                input_text = self._tokenizer.decode(input_text)
+            else:
+                input_text = "".join(input_text)
+        input_text = input_text or ""
         if audio_data and not self.AUDIO_TOKEN_REGEX.search(input_text):
             input_text = f"{self.mm_tokens.audio_token}{input_text}"
 
