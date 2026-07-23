@@ -1,4 +1,5 @@
 import argparse
+import concurrent.futures
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -216,6 +217,14 @@ except Exception:  # pragma: no cover - environment dependent
     _HAS_MORI = False
 
 try:
+    from sglang.srt.disaggregation.common.utils import FastQueue as _FQ  # noqa: E402,F811
+    from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager  # noqa: E402
+
+    _HAS_MOONCAKE = True
+except Exception:  # pragma: no cover - environment dependent
+    _HAS_MOONCAKE = False
+
+try:
     from sglang.srt.disaggregation.role_switch import (  # noqa: E402
         _release_prefix_cache_for_role_switch,
         teardown_disaggregation,
@@ -256,6 +265,51 @@ class TestMoriTeardownNoThreadLeak(unittest.TestCase):
             self.assertFalse(t.is_alive(), "transfer worker survived teardown (leak)")
         self.assertEqual(m._worker_threads, [])
         self.assertEqual(m._transfer_queues, [])
+
+
+@unittest.skipUnless(_HAS_MOONCAKE, "mooncake not importable in this environment")
+class TestMooncakeTeardownNoThreadLeak(unittest.TestCase):
+    """teardown() must stop+join the transfer workers it started, so a P->D->P
+    flip loop does not leak transfer threads per cycle."""
+
+    def test_teardown_joins_transfer_workers(self):
+        m = MooncakeKVManager.__new__(MooncakeKVManager)
+        m.disaggregation_mode = DisaggregationMode.PREFILL
+        m._stopped = False
+        m.enable_trace = False
+        m._worker_threads = []
+        m.transfer_queues = [_FQ() for _ in range(3)]
+        m.executors = [
+            concurrent.futures.ThreadPoolExecutor(1)
+            for _ in range(3)
+        ]
+        m.server_socket = MagicMock()
+        m._zmq_ctx = MagicMock()
+        m._socket_lock = threading.Lock()
+        m._socket_cache = {}
+        m._monitor_cache = {}
+        m.engine = MagicMock()
+        m.kv_args = SimpleNamespace(
+            kv_data_ptrs=[], aux_data_ptrs=[], state_data_ptrs=[]
+        )
+        for i, (q, ex) in enumerate(zip(m.transfer_queues, m.executors)):
+            t = threading.Thread(
+                target=m.transfer_worker, args=(q, ex, None, i), daemon=True
+            )
+            t.start()
+            m._worker_threads.append(t)
+        started = list(m._worker_threads)
+        time.sleep(0.05)  # let workers park in FastQueue.get()
+        for t in started:
+            self.assertTrue(t.is_alive())
+
+        MooncakeKVManager.teardown(m)
+
+        for t in started:
+            self.assertFalse(t.is_alive(), "transfer worker survived teardown (leak)")
+        self.assertEqual(m._worker_threads, [])
+        self.assertEqual(m.transfer_queues, [])
+        self.assertEqual(m.executors, [])
 
 
 def _radix_scheduler(disable_radix_cache):
