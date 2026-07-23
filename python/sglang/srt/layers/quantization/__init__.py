@@ -48,7 +48,11 @@ from sglang.srt.layers.quantization.npu_mxfp4 import Mxfp4W4A8Config
 from sglang.srt.layers.quantization.nvfp4_online import NvFp4OnlineConfig
 from sglang.srt.layers.quantization.petit import PetitNvFp4Config
 from sglang.srt.layers.quantization.qoq import QoQConfig
-from sglang.srt.layers.quantization.quark.quark import QuarkConfig
+
+try:
+    from sglang.srt.layers.quantization.quark.quark import QuarkConfig
+except Exception:
+    QuarkConfig = None
 from sglang.srt.layers.quantization.quark_int4fp8_moe import QuarkInt4Fp8Config
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config
 from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8Config

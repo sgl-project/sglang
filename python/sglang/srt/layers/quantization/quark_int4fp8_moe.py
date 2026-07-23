@@ -18,15 +18,16 @@ from sglang.srt.layers.quantization.base_config import (
 )
 from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import BAR_FORMAT, is_hip, set_weight_attrs
+from sglang.srt.utils import BAR_FORMAT, get_bool_env_var, is_hip, set_weight_attrs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import DispatchOutput
 
 _is_hip = is_hip()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 
-if _is_hip:
+if _use_aiter:
     from aiter.ops.shuffle import shuffle_weight
 
     ON_GFX950 = "gfx950" in torch.cuda.get_device_properties("cuda").gcnArchName
