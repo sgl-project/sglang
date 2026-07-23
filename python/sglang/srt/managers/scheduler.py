@@ -3611,7 +3611,7 @@ class Scheduler(
         for req in batch.reqs:
             req.pipelined_kv_sent = False
             start_idx = req.start_send_idx
-            end_idx = min(req.fill_len, len(req.origin_input_ids))
+            end_idx = min(req.extend_range.end, len(req.origin_input_ids))
             kv_indices = (
                 self.req_to_token_pool.req_to_token[req.req_pool_idx, start_idx:end_idx]
                 .cpu()
@@ -3657,7 +3657,9 @@ class Scheduler(
                     )
                 if is_last_group:
                     req.pipelined_kv_sent = True
-                    req.start_send_idx = min(req.fill_len, len(req.origin_input_ids))
+                    req.start_send_idx = min(
+                        req.extend_range.end, len(req.origin_input_ids)
+                    )
 
         # Sample next tokens unless this is a logprob-only/prefill-only batch.
         assert (
@@ -3684,7 +3686,7 @@ class Scheduler(
         batch.output_ids = next_token_ids
 
         if batch.return_logprob:
-            extend_input_len_per_req = [req.extend_input_len for req in batch.reqs]
+            extend_input_len_per_req = [req.extend_range.length for req in batch.reqs]
             extend_logprob_start_len_per_req = [
                 req.extend_logprob_start_len for req in batch.reqs
             ]

@@ -543,7 +543,7 @@ class SchedulerDisaggregationPrefillMixin:
         for req in batch.reqs:
             state_indices = None
             if state_types:
-                seq_len = min(req.fill_len, len(req.origin_input_ids))
+                seq_len = min(req.extend_range.end, len(req.origin_input_ids))
 
                 def _mamba_payload():
                     return [
