@@ -151,6 +151,13 @@ class TestKvEvents(CustomTestCase):
             self.assertGreater(
                 len(stored_blocks), 0, "Should have at least one BlockStored event"
             )
+            self.assertTrue(
+                any(
+                    isinstance(event, BlockStored) and len(event.block_hashes) > 1
+                    for event in events
+                ),
+                "Expected at least one coalesced BlockStored event",
+            )
             # BlockRemoved events may not always occur in this short test, so just check if they do occur
             # that they reference previously stored blocks
             for removed_hash in removed_hashes:
