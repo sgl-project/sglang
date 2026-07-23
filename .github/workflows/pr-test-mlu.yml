@@ -1,0 +1,148 @@
+name: PR Test (MLU)
+
+# Label-gated MLU CI workflow. The PR must carry BOTH `run-ci` (basic-CI
+# prerequisite) and `run-ci-mlu` (explicit opt-in) for the MLU test job to
+# run. The label check happens at runtime in pr-gate.yml via a live PR
+# fetch, so reruns after adding the labels pick up the new label set; a
+# workflow-level `if` would read the frozen event payload, which never
+# updates on rerun. The job graph runs unconditionally on push (main),
+# workflow_dispatch and workflow_call, where the label gate is skipped.
+
+on:
+  push:
+    branches: [ main ]
+  # Run the reviewed base-branch workflow, never workflow code from the PR.
+  pull_request_target:
+    branches: [ main ]
+    # `labeled` lets the workflow re-fire when `run-ci-mlu` (or `run-ci`)
+    # is added after the latest push. See call-gate.if for the matching guard
+    # that prevents unrelated label additions from dispatching a full run.
+    types: [opened, synchronize, reopened, labeled]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref (branch, tag, or SHA) to test. If not provided, uses the current ref."
+        required: false
+        type: string
+        default: ""
+      trigger_type:
+        description: "Task type sent to the Cambricon Runner: ci, pr, pull_request, push, or nightly"
+        required: false
+        type: string
+        default: "ci"
+  workflow_call:
+    inputs:
+      ref:
+        description: "Git ref (branch, tag, or SHA) to test. If not provided, uses the current ref."
+        required: false
+        type: string
+        default: ""
+      trigger_type:
+        description: "Task type sent to the Cambricon Runner: ci, pr, pull_request, push, or nightly"
+        required: false
+        type: string
+        default: "ci"
+
+permissions:
+  actions: read
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: pr-test-mlu-${{ github.event.pull_request.number || inputs.ref || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
+
+jobs:
+  # Runtime live-fetch label gate: requires both `run-ci` and `run-ci-mlu`.
+  # A failure here cascades to the test job via `needs`, so a PR without the
+  # labels ends in one red ~30s gate job instead of consuming MLU runners.
+  #
+  # The job-level `if` only filters the `labeled` event type so that adding an
+  # unrelated label doesn't dispatch a full run; the actual label-presence
+  # gate is enforced at runtime inside pr-gate.yml.
+  call-gate:
+    if: |
+      github.event_name != 'pull_request_target' ||
+      github.event.action != 'labeled' ||
+      github.event.label.name == 'run-ci' ||
+      github.event.label.name == 'run-ci-mlu'
+    uses: ./.github/workflows/pr-gate.yml
+    with:
+      require-run-ci: true
+      require-run-ci-mlu: true
+    secrets: inherit
+
+  pr-test-mlu:
+    needs: [call-gate]
+    if: ${{ !cancelled() && needs.call-gate.result == 'success' }}
+    runs-on:
+      group: mlu-ci
+      labels: mlu-pr
+    timeout-minutes: 120
+    steps:
+      # Do not checkout the PR on this self-hosted runner. Jenkins
+      # receives and executes the immutable PR SHA in its isolated MLU pod.
+      - name: Submit MLU CI task to Cambricon Runner
+        env:
+          SGLANG_MLU_CI_REPO_NAME: sglang
+          SGLANG_MLU_CI_PR_ID: ${{ github.event.pull_request.number || '' }}
+          SGLANG_MLU_CI_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || format('{0}/{1}.git', github.server_url, github.repository) }}
+          SGLANG_MLU_CI_GIT_REF: ${{ github.event.pull_request.head.sha || inputs.ref || github.ref_name }}
+          SGLANG_MLU_CI_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          SGLANG_MLU_CI_TRIGGER_TYPE: ${{ inputs.trigger_type || 'ci' }}
+          SGLANG_MLU_CI_BRIDGE_URL: http://127.0.0.1:14547
+          SGLANG_MLU_CI_TIMEOUT_SECONDS: "6600"
+          SGLANG_MLU_CI_LOG_DIR: ${{ runner.temp }}/mlu-ci-logs
+          SGLANG_MLU_CI_OBSERVE_ONLY: ${{ github.event_name == 'pull_request_target' }}
+        run: |
+          if ! command -v sglang-mlu-ci >/dev/null 2>&1; then
+            classification="MLU CI failure classification: type=infrastructure, stage=runner_client"
+            mkdir -p "${SGLANG_MLU_CI_LOG_DIR}"
+
+            observe_only=false
+            conclusion=failure
+            annotation=error
+            annotation_title="MLU CI infrastructure failure"
+            policy=failure
+            exit_code=1
+            if [[ "${SGLANG_MLU_CI_OBSERVE_ONLY}" == "true" ]]; then
+              observe_only=true
+              conclusion=success
+              annotation=warning
+              annotation_title="MLU CI infrastructure warning"
+              policy="warning (observe-only; GitHub job remains successful)"
+              exit_code=0
+            fi
+
+            echo "::${annotation} title=${annotation_title}::${classification}"
+            {
+              echo "## MLU CI result"
+              echo
+              echo "- Status: \`error\`"
+              echo "- Failure type: \`infrastructure\`"
+              echo "- Failure stage: \`runner_client\`"
+              echo "- GitHub conclusion policy: ${policy}"
+            } >> "${GITHUB_STEP_SUMMARY}"
+            printf '{\n  "failure_stage": "runner_client",\n  "failure_type": "infrastructure",\n  "github_conclusion": "%s",\n  "observe_only": %s,\n  "status": "error",\n  "task_id": "runner-client-%s-%s"\n}\n' \
+              "${conclusion}" "${observe_only}" "${GITHUB_RUN_ID}" "${GITHUB_RUN_ATTEMPT}" \
+              > "${SGLANG_MLU_CI_LOG_DIR}/result-runner-client-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.json"
+            exit "${exit_code}"
+          fi
+          sglang-mlu-ci
+
+      - name: Upload MLU CI result metadata
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mlu-ci-result-pr-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/mlu-ci-logs/result-*.json
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Upload MLU Jenkins log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mlu-jenkins-log-pr-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/mlu-ci-logs/
+          if-no-files-found: warn
