@@ -865,7 +865,14 @@ mod tests {
 
         let messages = serde_json::json!([{"role":"user","content":"hello world hello world"}]);
         // Engine-side blocks are keyed on tokenize(render(messages)).
-        let templated_tokens = registry.encode_chat("tiny", &messages, None).unwrap();
+        let templated_tokens = registry
+            .encode_chat(
+                "tiny",
+                &messages,
+                None,
+                crate::tokenizer::dsv4::RenderOpts::chat(),
+            )
+            .unwrap();
         let block_size = 4u32;
         let templated_hashes = compute_block_hashes(&templated_tokens, block_size as usize);
         assert!(
@@ -922,7 +929,14 @@ mod tests {
         let content = "hello world hello world";
         let messages = serde_json::json!([{"role":"user","content":content}]);
 
-        let templated = registry.encode_chat("tiny", &messages, None).unwrap();
+        let templated = registry
+            .encode_chat(
+                "tiny",
+                &messages,
+                None,
+                crate::tokenizer::dsv4::RenderOpts::chat(),
+            )
+            .unwrap();
         let raw = adapter::encode(&registry.get("tiny").unwrap(), content).unwrap();
         assert_ne!(
             compute_block_hashes(&templated, 4),
@@ -945,7 +959,14 @@ mod tests {
 
         let messages =
             serde_json::json!([{"role":"user","content":"hello world hello world hello world"}]);
-        let encoded = registry.encode_chat("tiny", &messages, None).unwrap();
+        let encoded = registry
+            .encode_chat(
+                "tiny",
+                &messages,
+                None,
+                crate::tokenizer::dsv4::RenderOpts::chat(),
+            )
+            .unwrap();
         let block_size = 4u32;
         let hashes = compute_block_hashes(&encoded, block_size as usize);
         assert!(!hashes.is_empty());
@@ -1630,7 +1651,14 @@ mod tests {
             }),
         );
         let messages = serde_json::json!([{"role":"user","content":"hello world"}]);
-        let expected = registry.encode_chat("tiny", &messages, None).unwrap();
+        let expected = registry
+            .encode_chat(
+                "tiny",
+                &messages,
+                None,
+                crate::tokenizer::dsv4::RenderOpts::chat(),
+            )
+            .unwrap();
 
         let model = ModelId("tiny".into());
         let value = serde_json::json!({ "model": "tiny", "messages": messages });
@@ -1640,6 +1668,57 @@ mod tests {
             "chat-encoder ids must be engine-equivalent"
         );
         assert_eq!(rt.ids, expected);
+    }
+
+    /// End-to-end: `request_tokens_for` threads the request's thinking mode through
+    /// `resolve_render_opts` → `encode_chat` → the dsv4 encoder, so a thinking-mode
+    /// body produces DIFFERENT routing tokens (the generation prompt opens `<think>`)
+    /// than the same messages in chat mode. Without this the whole feature's wiring
+    /// is untested: every other routing test uses a chat-mode body, so a refactor
+    /// that hardcoded `RenderOpts::chat()` in `request_tokens_for` would stay green
+    /// while silently routing thinking-mode endpoints on chat-mode tokens.
+    #[test]
+    fn request_tokens_for_threads_thinking_mode() {
+        let registry = tokenizer_registry_with_tiny();
+        registry.attach_chat_encoder_for_test("tiny", crate::tokenizer::ChatEncoder::DeepSeekV4);
+        let model = ModelId("tiny".into());
+        let messages = serde_json::json!([{"role":"user","content":"hello world"}]);
+
+        let chat_ids = request_tokens_for(
+            &registry,
+            &model,
+            &serde_json::json!({ "messages": messages.clone() }),
+        )
+        .expect("tokens")
+        .ids;
+        let thinking_ids = request_tokens_for(
+            &registry,
+            &model,
+            &serde_json::json!({
+                "messages": messages.clone(),
+                "chat_template_kwargs": {"thinking": true}
+            }),
+        )
+        .expect("tokens")
+        .ids;
+
+        assert_ne!(
+            chat_ids, thinking_ids,
+            "request_tokens_for must thread chat_template_kwargs.thinking into the render"
+        );
+        // The thinking body matches the encoder driven with thinking opts directly.
+        let expected_thinking = registry
+            .encode_chat(
+                "tiny",
+                &messages,
+                None,
+                crate::tokenizer::dsv4::RenderOpts {
+                    thinking: true,
+                    reasoning_effort: crate::tokenizer::dsv4::ReasoningEffort::None,
+                },
+            )
+            .unwrap();
+        assert_eq!(thinking_ids, expected_thinking);
     }
 
     /// `request_tokens_for` on the raw-prompt path (no chat encoder) is NOT

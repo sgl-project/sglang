@@ -1,0 +1,417 @@
+[
+  {
+    "name": "chat_single_user",
+    "messages": [
+      {
+        "role": "user",
+        "content": "ABCD"
+      }
+    ],
+    "tools": null,
+    "thinking": false,
+    "reasoning_effort": null,
+    "expected": "<｜begin▁of▁sentence｜><｜User｜>ABCD<｜Assistant｜></think>"
+  },
+  {
+    "name": "chat_with_tools",
+    "messages": [
+      {
+        "role": "system",
+        "content": "S"
+      },
+      {
+        "role": "user",
+        "content": "hi"
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "read",
+          "description": "Read a file",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "path": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    ],
+    "thinking": false,
+    "reasoning_effort": null,
+    "expected": "<｜begin▁of▁sentence｜>S\n\n## Tools\n\nYou have access to a set of tools to help answer the user's question. You can invoke tools by writing a \"<｜DSML｜tool_calls>\" block like the following:\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"$TOOL_NAME\">\n<｜DSML｜parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜parameter>\n...\n</｜DSML｜invoke>\n<｜DSML｜invoke name=\"$TOOL_NAME2\">\n...\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>\n\nString parameters should be specified as is and set `string=\"true\"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\nIf thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\nOtherwise, output directly after </think> with tool calls or final response.\n\n### Available Tool Schemas\n\n{\"description\": \"Read a file\", \"name\": \"read\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\"}}}, \"strict\": false}\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n<｜User｜>hi<｜Assistant｜></think>"
+  },
+  {
+    "name": "chat_max_effort_suppresses_preamble",
+    "messages": [
+      {
+        "role": "system",
+        "content": "SYS"
+      },
+      {
+        "role": "user",
+        "content": "U1"
+      }
+    ],
+    "tools": null,
+    "thinking": false,
+    "reasoning_effort": "max",
+    "expected": "<｜begin▁of▁sentence｜>SYS<｜User｜>U1<｜Assistant｜></think>"
+  },
+  {
+    "name": "thinking_single_user",
+    "messages": [
+      {
+        "role": "user",
+        "content": "ABCD"
+      }
+    ],
+    "tools": null,
+    "thinking": true,
+    "reasoning_effort": null,
+    "expected": "<｜begin▁of▁sentence｜><｜User｜>ABCD<｜Assistant｜><think>"
+  },
+  {
+    "name": "thinking_multiturn_no_tools_drops_prior_reasoning",
+    "messages": [
+      {
+        "role": "user",
+        "content": "U1"
+      },
+      {
+        "role": "assistant",
+        "content": "A1",
+        "reasoning_content": "R1"
+      },
+      {
+        "role": "user",
+        "content": "U2"
+      }
+    ],
+    "tools": null,
+    "thinking": true,
+    "reasoning_effort": null,
+    "expected": "<｜begin▁of▁sentence｜><｜User｜>U1<｜Assistant｜></think>A1<｜end▁of▁sentence｜><｜User｜>U2<｜Assistant｜><think>"
+  },
+  {
+    "name": "thinking_assistant_after_last_user_keeps_reasoning_no_tools",
+    "messages": [
+      {
+        "role": "user",
+        "content": "U1"
+      },
+      {
+        "role": "assistant",
+        "content": "A1",
+        "reasoning_content": "R1"
+      }
+    ],
+    "tools": null,
+    "thinking": true,
+    "reasoning_effort": null,
+    "expected": "<｜begin▁of▁sentence｜><｜User｜>U1<｜Assistant｜><think>R1</think>A1<｜end▁of▁sentence｜>"
+  },
+  {
+    "name": "thinking_multiple_prior_assistants_no_tools",
+    "messages": [
+      {
+        "role": "user",
+        "content": "U1"
+      },
+      {
+        "role": "assistant",
+        "content": "A1",
+        "reasoning_content": "R1"
+      },
+      {
+        "role": "user",
+        "content": "U2"
+      },
+      {
+        "role": "assistant",
+        "content": "A2",
+        "reasoning_content": "R2"
+      },
+      {
+        "role": "user",
+        "content": "U3"
+      }
+    ],
+    "tools": null,
+    "thinking": true,
+    "reasoning_effort": null,
+    "expected": "<｜begin▁of▁sentence｜><｜User｜>U1<｜Assistant｜></think>A1<｜end▁of▁sentence｜><｜User｜>U2<｜Assistant｜></think>A2<｜end▁of▁sentence｜><｜User｜>U3<｜Assistant｜><think>"
+  },
+  {
+    "name": "thinking_developer_before_last_user_dropped_no_tools",
+    "messages": [
+      {
+        "role": "user",
+        "content": "U0"
+      },
+      {
+        "role": "developer",
+        "content": "D1"
+      },
+      {
+        "role": "assistant",
+        "content": "A1",
+        "reasoning_content": "R1"
+      },
+      {
+        "role": "user",
+        "content": "U2"
+      }
+    ],
+    "tools": null,
+    "thinking": true,
+    "reasoning_effort": null,
+    "expected": "<｜begin▁of▁sentence｜><｜User｜>U0<｜Assistant｜></think>A1<｜end▁of▁sentence｜><｜User｜>U2<｜Assistant｜><think>"
+  },
+  {
+    "name": "thinking_multiturn_with_tools_keeps_reasoning",
+    "messages": [
+      {
+        "role": "user",
+        "content": "U1"
+      },
+      {
+        "role": "assistant",
+        "content": "",
+        "reasoning_content": "Let me read",
+        "tool_calls": [
+          {
+            "id": "c1",
+            "type": "function",
+            "function": {
+              "name": "read",
+              "arguments": "{\"path\": \"/x\"}"
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "tool_call_id": "c1",
+        "content": "FILE"
+      },
+      {
+        "role": "user",
+        "content": "U2"
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "read",
+          "description": "Read a file",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "path": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    ],
+    "thinking": true,
+    "reasoning_effort": null,
+    "expected": "<｜begin▁of▁sentence｜>\n\n## Tools\n\nYou have access to a set of tools to help answer the user's question. You can invoke tools by writing a \"<｜DSML｜tool_calls>\" block like the following:\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"$TOOL_NAME\">\n<｜DSML｜parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜parameter>\n...\n</｜DSML｜invoke>\n<｜DSML｜invoke name=\"$TOOL_NAME2\">\n...\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>\n\nString parameters should be specified as is and set `string=\"true\"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\nIf thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\nOtherwise, output directly after </think> with tool calls or final response.\n\n### Available Tool Schemas\n\n{\"description\": \"Read a file\", \"name\": \"read\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\"}}}, \"strict\": false}\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n<｜User｜>U1<｜Assistant｜><think>Let me read</think>\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"read\">\n<｜DSML｜parameter name=\"path\" string=\"true\">/x</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls><｜end▁of▁sentence｜><｜User｜><tool_result>FILE</tool_result>\n\nU2<｜Assistant｜><think>"
+  },
+  {
+    "name": "thinking_with_tools_two_tool_rounds_keeps_all_reasoning",
+    "messages": [
+      {
+        "role": "user",
+        "content": "U1"
+      },
+      {
+        "role": "assistant",
+        "content": "",
+        "reasoning_content": "r1",
+        "tool_calls": [
+          {
+            "id": "a",
+            "type": "function",
+            "function": {
+              "name": "read",
+              "arguments": "{\"path\": \"/a\"}"
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "tool_call_id": "a",
+        "content": "FA"
+      },
+      {
+        "role": "assistant",
+        "content": "",
+        "reasoning_content": "r2",
+        "tool_calls": [
+          {
+            "id": "b",
+            "type": "function",
+            "function": {
+              "name": "read",
+              "arguments": "{\"path\": \"/b\"}"
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "tool_call_id": "b",
+        "content": "FB"
+      },
+      {
+        "role": "user",
+        "content": "U2"
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "read",
+          "description": "Read a file",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "path": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    ],
+    "thinking": true,
+    "reasoning_effort": null,
+    "expected": "<｜begin▁of▁sentence｜>\n\n## Tools\n\nYou have access to a set of tools to help answer the user's question. You can invoke tools by writing a \"<｜DSML｜tool_calls>\" block like the following:\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"$TOOL_NAME\">\n<｜DSML｜parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜parameter>\n...\n</｜DSML｜invoke>\n<｜DSML｜invoke name=\"$TOOL_NAME2\">\n...\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>\n\nString parameters should be specified as is and set `string=\"true\"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\nIf thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\nOtherwise, output directly after </think> with tool calls or final response.\n\n### Available Tool Schemas\n\n{\"description\": \"Read a file\", \"name\": \"read\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\"}}}, \"strict\": false}\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n<｜User｜>U1<｜Assistant｜><think>r1</think>\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"read\">\n<｜DSML｜parameter name=\"path\" string=\"true\">/a</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls><｜end▁of▁sentence｜><｜User｜><tool_result>FA</tool_result><｜Assistant｜><think>r2</think>\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"read\">\n<｜DSML｜parameter name=\"path\" string=\"true\">/b</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls><｜end▁of▁sentence｜><｜User｜><tool_result>FB</tool_result>\n\nU2<｜Assistant｜><think>"
+  },
+  {
+    "name": "thinking_empty_reasoning_still_emits_think_block",
+    "messages": [
+      {
+        "role": "user",
+        "content": "U1"
+      },
+      {
+        "role": "assistant",
+        "content": "",
+        "reasoning_content": "",
+        "tool_calls": [
+          {
+            "id": "c1",
+            "type": "function",
+            "function": {
+              "name": "read",
+              "arguments": "{}"
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "tool_call_id": "c1",
+        "content": "R"
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "read",
+          "description": "Read a file",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "path": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    ],
+    "thinking": true,
+    "reasoning_effort": null,
+    "expected": "<｜begin▁of▁sentence｜>\n\n## Tools\n\nYou have access to a set of tools to help answer the user's question. You can invoke tools by writing a \"<｜DSML｜tool_calls>\" block like the following:\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"$TOOL_NAME\">\n<｜DSML｜parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜parameter>\n...\n</｜DSML｜invoke>\n<｜DSML｜invoke name=\"$TOOL_NAME2\">\n...\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>\n\nString parameters should be specified as is and set `string=\"true\"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\nIf thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\nOtherwise, output directly after </think> with tool calls or final response.\n\n### Available Tool Schemas\n\n{\"description\": \"Read a file\", \"name\": \"read\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\"}}}, \"strict\": false}\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n<｜User｜>U1<｜Assistant｜><think></think>\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"read\">\n\n</｜DSML｜invoke>\n</｜DSML｜tool_calls><｜end▁of▁sentence｜><｜User｜><tool_result>R</tool_result><｜Assistant｜><think>"
+  },
+  {
+    "name": "thinking_reasoning_effort_max_prefix",
+    "messages": [
+      {
+        "role": "system",
+        "content": "SYS"
+      },
+      {
+        "role": "user",
+        "content": "U1"
+      }
+    ],
+    "tools": null,
+    "thinking": true,
+    "reasoning_effort": "max",
+    "expected": "<｜begin▁of▁sentence｜>Reasoning Effort: Absolute maximum with no shortcuts permitted.\nYou MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\nExplicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\nSYS<｜User｜>U1<｜Assistant｜><think>"
+  },
+  {
+    "name": "thinking_reasoning_effort_high_no_prefix",
+    "messages": [
+      {
+        "role": "system",
+        "content": "SYS"
+      },
+      {
+        "role": "user",
+        "content": "U1"
+      }
+    ],
+    "tools": null,
+    "thinking": true,
+    "reasoning_effort": "high",
+    "expected": "<｜begin▁of▁sentence｜>SYS<｜User｜>U1<｜Assistant｜><think>"
+  },
+  {
+    "name": "thinking_max_effort_with_tools",
+    "messages": [
+      {
+        "role": "system",
+        "content": "SYS"
+      },
+      {
+        "role": "user",
+        "content": "U1"
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "read",
+          "description": "Read a file",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "path": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    ],
+    "thinking": true,
+    "reasoning_effort": "max",
+    "expected": "<｜begin▁of▁sentence｜>Reasoning Effort: Absolute maximum with no shortcuts permitted.\nYou MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\nExplicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\nSYS\n\n## Tools\n\nYou have access to a set of tools to help answer the user's question. You can invoke tools by writing a \"<｜DSML｜tool_calls>\" block like the following:\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"$TOOL_NAME\">\n<｜DSML｜parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜parameter>\n...\n</｜DSML｜invoke>\n<｜DSML｜invoke name=\"$TOOL_NAME2\">\n...\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>\n\nString parameters should be specified as is and set `string=\"true\"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\nIf thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\nOtherwise, output directly after </think> with tool calls or final response.\n\n### Available Tool Schemas\n\n{\"description\": \"Read a file\", \"name\": \"read\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\"}}}, \"strict\": false}\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n<｜User｜>U1<｜Assistant｜><think>"
+  }
+]

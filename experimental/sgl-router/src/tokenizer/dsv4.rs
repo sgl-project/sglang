@@ -11,9 +11,14 @@
 //!
 //! # Scope
 //!
-//! Text content, chat (non-thinking) mode — the engine default
-//! (`SGLANG_DEFAULT_THINKING=false`). For a user turn the engine emits
-//! `BOS <｜User｜> content <｜Assistant｜> </think>`. Preprocessing mirrors
+//! Text content, both chat (non-thinking) and thinking mode — the engine picks
+//! per request from `chat_template_kwargs.thinking`, falling back to its
+//! `SGLANG_DEFAULT_THINKING`; [`resolve_render_opts`] mirrors that so the router
+//! matches whichever mode the engine runs. Chat mode emits a user turn as
+//! `BOS <｜User｜> content <｜Assistant｜> </think>`; thinking mode opens the
+//! assistant with `<think>` and renders a kept prior assistant turn's
+//! `reasoning_content` as `<think>…</think>` (subject to the drop-thinking rules —
+//! prior reasoning is dropped without tools, kept with). Preprocessing mirrors
 //! `serving_chat.py`/`encode_messages`: an empty system message is inserted when
 //! the first message isn't a system message, and `merge_tool_messages` folds
 //! `tool` messages into the following user turn (as `<tool_result>` blocks) and
@@ -23,9 +28,9 @@
 //! [`render_tool_calls`]), and multiple results ordered by their originating
 //! call (see [`sort_tool_results_by_call_order`]). Byte-exactness here is what
 //! lets a tool-carrying request's block hashes match the engine's cached blocks
-//! instead of diverging from the first block and routing by min-load. Out of
-//! scope: `tasks` (alter only the trailing transition) and per-turn
-//! `reasoning_content` (never emitted in chat mode) — neither causes divergence.
+//! instead of diverging from the first block (tools) or the first assistant turn
+//! (thinking) and routing by min-load. `tasks` stay out of scope — they drive
+//! internal task-classification rendering and never appear on router traffic.
 //!
 //! Tokenization does not auto-prepend special tokens (the `dynamo_tokenizers`
 //! HF wrapper hardcodes `add_special_tokens = false`;
@@ -44,31 +49,230 @@ const EOS: &str = "<｜end▁of▁sentence｜>";
 const USER: &str = "<｜User｜>";
 /// Assistant-turn marker, opening the generation prompt (token id 128804).
 const ASSISTANT: &str = "<｜Assistant｜>";
+/// Thinking-start marker (`encoding_dsv4.thinking_start_token`); a thinking-mode
+/// generation prompt / historical assistant turn opens with it.
+const THINK_START: &str = "<think>";
 /// Thinking-end marker; the chat-mode generation prompt ends with it (128822).
 const THINK_END: &str = "</think>";
 /// DSML block token wrapping tool-call / tools markup (`encoding_dsv4.dsml_token`).
 const DSML: &str = "｜DSML｜";
 
+/// Reasoning-effort level, mirroring `encoding_dsv4`'s `reasoning_effort`
+/// (`"max"` / `"high"` / `None`). Only `Max` alters the prompt — it prepends the
+/// [`REASONING_EFFORT_MAX`] preamble at the very front in thinking mode. `High` is
+/// kept distinct (not collapsed into `None`) intentionally: it is a lossless 1:1
+/// mirror of the engine's own tri-state, so a future engine build that gives
+/// `high` its own rendering only touches [`render_one`], not this type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReasoningEffort {
+    None,
+    High,
+    Max,
+}
+
+/// How to render, mirroring the engine's per-request `thinking_mode` +
+/// `reasoning_effort`. The engine derives these from the request's
+/// `chat_template_kwargs.thinking` / `reasoning_effort` (falling back to its
+/// `SGLANG_DEFAULT_THINKING` / `SGLANG_DSV4_REASONING_EFFORT` defaults); the
+/// router mirrors that resolution in [`resolve_render_opts`] so its routing
+/// tokens match the engine's cached blocks even when the engine runs a
+/// non-default (e.g. thinking-on) mode. `RenderOpts::chat()` reproduces the
+/// chat-mode encoder output byte-for-byte.
+#[derive(Clone, Copy, Debug)]
+pub struct RenderOpts {
+    /// `true` = thinking mode (engine `thinking_mode == "thinking"`).
+    pub thinking: bool,
+    pub reasoning_effort: ReasoningEffort,
+}
+
+impl RenderOpts {
+    /// Chat / non-thinking mode with no effort preamble — the engine default,
+    /// byte-identical to the chat-mode encoder output.
+    pub const fn chat() -> Self {
+        RenderOpts {
+            thinking: false,
+            reasoning_effort: ReasoningEffort::None,
+        }
+    }
+}
+
+/// Resolve the render options for a request, mirroring the engine's dsv4 request
+/// normalization. Reasoning effort follows the engine precedence
+/// (`serving_chat._convert_to_internal_request` pops `chat_template_kwargs.reasoning_effort`
+/// onto the top-level field before the encoder reads it):
+/// `chat_template_kwargs.reasoning_effort` > top-level `reasoning_effort` > env
+/// default; only `max`/`high` alter the prompt. Thinking follows the engine's
+/// `chat_template_kwargs.thinking` truthiness (`serving_chat.py`), else the router's
+/// env default.
+///
+/// The router is a separate process from the engine, so it cannot observe an
+/// engine-side default (`SGLANG_DEFAULT_THINKING` / `--default-chat-template-kwargs`)
+/// a request doesn't carry; the env defaults (`SGLANG_ROUTER_DSV4_DEFAULT_THINKING`
+/// / `SGLANG_ROUTER_DSV4_REASONING_EFFORT`, read once) MUST be set to match the
+/// engine's, or cache-aware routing degrades (best-effort, never incorrect — the
+/// engine re-tokenizes for correctness, see `input_ids_safe_to_forward`). Deeper
+/// `protocol.py` normalizations (the `reasoning` object's `effort` alias,
+/// `reasoning_effort="none"` force-disabling thinking, `enable_thinking`) are NOT
+/// mirrored — they too only degrade routing. `enable_thinking` is intentionally
+/// not read: the dsv4 engine path keys solely on `chat_template_kwargs.thinking`.
+pub fn resolve_render_opts(request: &serde_json::Value) -> RenderOpts {
+    let ctk = request.get("chat_template_kwargs");
+
+    let effort = ctk
+        .and_then(|k| k.get("reasoning_effort"))
+        .and_then(|v| v.as_str())
+        .or_else(|| request.get("reasoning_effort").and_then(|v| v.as_str()))
+        .map(str::to_owned)
+        .or_else(|| default_reasoning_effort().clone());
+    let reasoning_effort = match effort.as_deref() {
+        Some("max") => ReasoningEffort::Max,
+        Some("high") => ReasoningEffort::High,
+        _ => ReasoningEffort::None,
+    };
+
+    let thinking = ctk
+        .and_then(|k| k.get("thinking"))
+        .map(json_truthy)
+        .unwrap_or_else(default_thinking);
+
+    RenderOpts {
+        thinking,
+        reasoning_effort,
+    }
+}
+
+/// Python-truthiness of a JSON value, mirroring the engine's `if thinking_requested`
+/// test on the raw `chat_template_kwargs.thinking` value (`serving_chat.py`): a bool
+/// as-is, a string/array/object truthy iff non-empty, a number iff non-zero, null
+/// falsy. A conformant client sends a bool; this only matters for odd payloads, and
+/// keeps routing matching the engine on them.
+fn json_truthy(v: &serde_json::Value) -> bool {
+    match v {
+        serde_json::Value::Bool(b) => *b,
+        serde_json::Value::String(s) => !s.is_empty(),
+        serde_json::Value::Number(n) => n.as_f64().is_none_or(|f| f != 0.0),
+        serde_json::Value::Array(a) => !a.is_empty(),
+        serde_json::Value::Object(o) => !o.is_empty(),
+        serde_json::Value::Null => false,
+    }
+}
+
+/// Parse a boolean env value the way the engine's `EnvBool` does (`environ.py`):
+/// case-insensitive `true`/`1`/`yes`/`y` → `Some(true)`, `false`/`0`/`no`/`n` →
+/// `Some(false)`, anything else `None`. Matching the engine's exact token set is
+/// load-bearing: `y` is engine-true, so a set that omitted it would silently
+/// disagree with a `SGLANG_DEFAULT_THINKING=y` engine.
+fn parse_env_bool(value: &str) -> Option<bool> {
+    match value.to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "y" => Some(true),
+        "false" | "0" | "no" | "n" => Some(false),
+        _ => None,
+    }
+}
+
+/// Resolve the thinking default from the env value (pure; the env read + one-time
+/// caching + logging live in [`router_defaults`]). Mirrors the engine's
+/// `EnvBool` + `EnvField.get`: a recognized token → that bool; a non-empty
+/// unrecognized value → WARN + `false` — the engine behaves identically (its
+/// `EnvField.get` catches `EnvBool.parse`'s `ValueError`, warns, and returns the
+/// `False` default; it does NOT surface a hard error). Unset/empty → `false`.
+fn resolve_default_thinking(env: Option<&str>) -> bool {
+    match env {
+        Some(s) if !s.is_empty() => parse_env_bool(s).unwrap_or_else(|| {
+            tracing::warn!(
+                value = %s,
+                "SGLANG_ROUTER_DSV4_DEFAULT_THINKING is not a recognized boolean \
+                 (true/1/yes/y | false/0/no/n); using false (the engine warns + defaults \
+                 false the same way) — dsv4 routing renders chat mode, mismatching a thinking engine"
+            );
+            false
+        }),
+        _ => false,
+    }
+}
+
+/// Resolve the reasoning-effort default from the env value (pure). Only `max`/`high`
+/// affect rendering; anything else collapses to `None` silently — matching the
+/// engine, which keeps only `max`/`high` (`serving_chat.py`) and does not warn.
+fn resolve_default_effort(env: Option<&str>) -> Option<String> {
+    match env {
+        Some("max") => Some("max".to_owned()),
+        Some("high") => Some("high".to_owned()),
+        _ => None,
+    }
+}
+
+/// The router's render defaults, resolved once from env
+/// (`SGLANG_ROUTER_DSV4_DEFAULT_THINKING` / `SGLANG_ROUTER_DSV4_REASONING_EFFORT`)
+/// and logged once at INFO so an operator can confirm they match the engine's
+/// `SGLANG_DEFAULT_THINKING` / `SGLANG_DSV4_REASONING_EFFORT`. Both are logged
+/// together because an effort mismatch is a LARGER divergence than a thinking one
+/// (the `max` preamble sits at block 0, so a mismatch shifts every block hash, not
+/// just the trailing token) — it must be equally visible.
+fn router_defaults() -> &'static (bool, Option<String>) {
+    static V: std::sync::OnceLock<(bool, Option<String>)> = std::sync::OnceLock::new();
+    V.get_or_init(|| {
+        let thinking = resolve_default_thinking(
+            std::env::var("SGLANG_ROUTER_DSV4_DEFAULT_THINKING")
+                .ok()
+                .as_deref(),
+        );
+        let effort = resolve_default_effort(
+            std::env::var("SGLANG_ROUTER_DSV4_REASONING_EFFORT")
+                .ok()
+                .as_deref(),
+        );
+        tracing::info!(
+            default_thinking = thinking,
+            default_reasoning_effort = effort.as_deref().unwrap_or("(none)"),
+            "dsv4 router render defaults resolved; must match the engine's SGLANG_DEFAULT_THINKING \
+             / SGLANG_DSV4_REASONING_EFFORT (i.e. --default-chat-template-kwargs) for cache-aware \
+             routing to match"
+        );
+        (thinking, effort)
+    })
+}
+
+fn default_thinking() -> bool {
+    router_defaults().0
+}
+
+fn default_reasoning_effort() -> &'static Option<String> {
+    &router_defaults().1
+}
+
+/// The `encoding_dsv4.REASONING_EFFORT_MAX` preamble, emitted at the very front
+/// of the prompt (after BOS, before the system content) only in thinking mode
+/// with `reasoning_effort == Max`. Kept byte-identical to the engine.
+const REASONING_EFFORT_MAX: &str = "Reasoning Effort: Absolute maximum with no shortcuts permitted.\nYou MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\nExplicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n";
+
 /// Render `messages` (+ the request's top-level `tools`) into the DeepSeek-V4
 /// chat prompt for routing.
 ///
-/// Mirrors `encoding_dsv4.encode_messages` for the routing subset (chat /
-/// non-thinking mode, text content), including tool calls and tool results.
-/// `messages` is the request's `messages` array; `tools` is the request's
-/// top-level `tools` array (OpenAI format), or `None`. Non-array `messages`
-/// renders to just the BOS marker (the caller then tokenizes it and, finding no
-/// useful prefix, degrades to min-load like any short prompt).
+/// Mirrors `encoding_dsv4.encode_messages` for the routing subset (chat and
+/// thinking mode, text content), including tool calls, tool results, and per-turn
+/// reasoning. `messages` is the request's `messages` array; `tools` is the
+/// request's top-level `tools` array (OpenAI format), or `None`; `opts` carries
+/// the resolved thinking mode / reasoning effort. Non-array `messages` renders to
+/// just the BOS marker (the caller then tokenizes it and, finding no useful
+/// prefix, degrades to min-load like any short prompt).
 ///
 /// Byte-exactness with the engine is what lets a request's block hashes match
 /// the engine's cached blocks. These line up with `encoding_dsv4`: tools
 /// render right after the system content (where `serving_chat` attaches
 /// `request.tools`); a `tool` message folds into the following user turn as a
 /// `<tool_result>` block (`merge_tool_messages`); an assistant turn's
-/// `tool_calls` render as a `DSML` block; and multiple tool results in one turn
-/// are ordered by their originating call (`sort_tool_results_by_call_order`).
-/// Per-turn `tasks`/`reasoning_content` stay out of scope (task alters only the
-/// trailing transition; reasoning is never emitted in chat mode).
-pub fn render_messages(messages: &serde_json::Value, tools: Option<&serde_json::Value>) -> String {
+/// `tool_calls` render as a `DSML` block; multiple tool results in one turn are
+/// ordered by their originating call (`sort_tool_results_by_call_order`); and in
+/// thinking mode the `<think>` transitions and prior-turn `reasoning_content`
+/// render per the engine's `drop_thinking` rules (see [`render_one`],
+/// [`drop_thinking_messages`]). `tasks` stay out of scope — they never appear on
+/// router traffic.
+pub fn render_messages(
+    messages: &serde_json::Value,
+    tools: Option<&serde_json::Value>,
+    opts: RenderOpts,
+) -> String {
     let raw = messages.as_array().map(Vec::as_slice).unwrap_or(&[]);
     let mut msgs = merge_tool_messages(raw);
 
@@ -90,15 +294,76 @@ pub fn render_messages(messages: &serde_json::Value, tools: Option<&serde_json::
         .and_then(|t| t.as_array())
         .filter(|arr| !arr.is_empty());
 
+    // Mirror `encode_messages`' drop resolution: the engine calls it with the
+    // default `drop_thinking = true`, then forces it OFF when any message carries
+    // tools (`effective_drop_thinking`). So: no tools → drop earlier turns'
+    // reasoning; tools present → keep it (DeepSeek requires prior reasoning in the
+    // context of a tool-calling multi-turn conversation).
+    let effective_drop_thinking = tool_list.is_none();
+    if opts.thinking && effective_drop_thinking {
+        msgs = drop_thinking_messages(msgs);
+    }
+    let last_user_idx = last_user_index(&msgs);
+
     let mut out = String::from(BOS);
+    // Reasoning-effort preamble sits at the very front (after BOS, before the
+    // system content), thinking mode + `max` only — `encoding_dsv4.render_message`
+    // index 0.
+    if opts.thinking && opts.reasoning_effort == ReasoningEffort::Max {
+        out.push_str(REASONING_EFFORT_MAX);
+    }
     for i in 0..msgs.len() {
-        render_one(i, &msgs, &mut out);
+        render_one(
+            i,
+            &msgs,
+            &mut out,
+            opts,
+            last_user_idx,
+            effective_drop_thinking,
+        );
         if i == 0 {
             if let Some(list) = tool_list {
                 out.push_str("\n\n");
                 out.push_str(&render_tools(list));
             }
         }
+    }
+    out
+}
+
+/// Index of the last `user`/`developer` message (the engine's
+/// `find_last_user_index`), or `-1` when there is none. `i64` mirrors the
+/// engine's `-1` sentinel so the `index >= last_user_idx` transition comparisons
+/// are exact.
+fn last_user_index(msgs: &[MergedMsg]) -> i64 {
+    for i in (0..msgs.len()).rev() {
+        if matches!(msgs[i].role.as_str(), "user" | "developer") {
+            return i as i64;
+        }
+    }
+    -1
+}
+
+/// Mirror `encoding_dsv4._drop_thinking_messages` (applied only in thinking mode
+/// when dropping is in effect, i.e. no tools): messages at/after the last user
+/// turn are kept verbatim; before it, `user`/`system`/`tool`/`latest_reminder`/
+/// `direct_search_results` pass through, an assistant turn keeps everything but its
+/// `reasoning_content`, and a `developer` (or any other) turn is dropped entirely.
+fn drop_thinking_messages(msgs: Vec<MergedMsg>) -> Vec<MergedMsg> {
+    let last_user = last_user_index(&msgs);
+    let mut out = Vec::with_capacity(msgs.len());
+    for (idx, mut m) in msgs.into_iter().enumerate() {
+        let keep = matches!(
+            m.role.as_str(),
+            "user" | "system" | "tool" | "latest_reminder" | "direct_search_results"
+        );
+        if keep || idx as i64 >= last_user {
+            out.push(m);
+        } else if m.role == "assistant" {
+            m.reasoning_content.clear();
+            out.push(m);
+        }
+        // developer / other roles before the last user turn are dropped.
     }
     out
 }
@@ -126,12 +391,14 @@ enum Block {
 
 /// A message after `merge_tool_messages`. `blocks` is `Some` only for user turns
 /// (their text + folded-in tool results); `tool_calls` is non-empty only for
-/// assistant turns.
+/// assistant turns; `reasoning_content` is a prior assistant turn's thinking
+/// block, rendered only in thinking mode (see [`render_one`]).
 struct MergedMsg {
     role: String,
     content: String,
     tool_calls: Vec<ToolCall>,
     blocks: Option<Vec<Block>>,
+    reasoning_content: String,
 }
 
 impl MergedMsg {
@@ -141,6 +408,7 @@ impl MergedMsg {
             content: String::new(),
             tool_calls: Vec::new(),
             blocks: None,
+            reasoning_content: String::new(),
         }
     }
 }
@@ -195,6 +463,10 @@ fn merge_tool_messages(raw: &[serde_json::Value]) -> Vec<MergedMsg> {
                 let mut am = MergedMsg::plain("assistant");
                 am.content = content_to_string(m.get("content"));
                 am.tool_calls = parse_tool_calls(m.get("tool_calls"));
+                // Prior-turn thinking block. The engine renders it verbatim as
+                // `reasoning_content or ""` (a plain string), so pass it through
+                // as-is; a missing/non-string value is treated as empty.
+                am.reasoning_content = str_field(m, "reasoning_content");
                 merged.push(am);
             }
             other => {
@@ -292,7 +564,14 @@ fn sort_tool_results_by_call_order(merged: &mut [MergedMsg]) {
 }
 
 /// Append merged message `i`'s encoded form to `out`.
-fn render_one(i: usize, msgs: &[MergedMsg], out: &mut String) {
+fn render_one(
+    i: usize,
+    msgs: &[MergedMsg],
+    out: &mut String,
+    opts: RenderOpts,
+    last_user_idx: i64,
+    effective_drop_thinking: bool,
+) {
     let m = &msgs[i];
     match m.role.as_str() {
         "system" => out.push_str(&m.content),
@@ -310,8 +589,16 @@ fn render_one(i: usize, msgs: &[MergedMsg], out: &mut String) {
             }
         }
         "assistant" => {
-            // Chat mode emits no reasoning block; a prior assistant turn is its
-            // content, then any tool calls, closed by EOS.
+            // Thinking mode renders the turn's `reasoning_content` followed by
+            // `</think>` before its content; the opening `<think>` came from the
+            // preceding user turn's transition below. Kept when reasoning isn't
+            // being dropped (tools present) OR this turn is strictly after the last
+            // user turn — matching `encoding_dsv4.render_message` (`prev_has_task`
+            // is always false here; tasks are out of scope). Chat mode emits none.
+            if opts.thinking && (!effective_drop_thinking || i as i64 > last_user_idx) {
+                out.push_str(&m.reasoning_content);
+                out.push_str(THINK_END);
+            }
             out.push_str(&m.content);
             if !m.tool_calls.is_empty() {
                 out.push_str("\n\n");
@@ -333,7 +620,16 @@ fn render_one(i: usize, msgs: &[MergedMsg], out: &mut String) {
     };
     if next_takes_transition && (m.role == "user" || m.role == "developer") {
         out.push_str(ASSISTANT);
-        out.push_str(THINK_END);
+        // Chat mode always closes with `</think>`. Thinking mode opens the next
+        // assistant turn with `<think>`: always when reasoning is kept (tools
+        // present), else only at/after the last user turn (the current
+        // generation) — mirroring `encoding_dsv4.render_message`.
+        let token = if opts.thinking && (!effective_drop_thinking || i as i64 >= last_user_idx) {
+            THINK_START
+        } else {
+            THINK_END
+        };
+        out.push_str(token);
     }
 }
 
@@ -566,11 +862,47 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn effort(s: Option<&str>) -> ReasoningEffort {
+        match s {
+            Some("max") => ReasoningEffort::Max,
+            Some("high") => ReasoningEffort::High,
+            _ => ReasoningEffort::None,
+        }
+    }
+
+    /// Byte-exact parity against the engine's `encoding_dsv4.encode_messages` in
+    /// BOTH chat and thinking mode, across fixtures generated from the engine
+    /// encoder itself (transition token `<think>`/`</think>`, prior reasoning
+    /// kept-with-tools vs dropped-without, the empty-reasoning `<think></think>`
+    /// block, and the `reasoning_effort=max` front preamble). A mismatch here is
+    /// exactly a router↔engine routing-tokenization divergence — the thing that
+    /// collapses cache-aware routing on a thinking-mode engine.
+    #[test]
+    fn thinking_and_chat_parity_fixtures() {
+        let raw = include_str!("testdata/dsv4_thinking_cases.json");
+        let cases: Vec<serde_json::Value> = serde_json::from_str(raw).expect("fixture json parses");
+        assert!(!cases.is_empty(), "fixtures present");
+        for c in &cases {
+            let name = c["name"].as_str().unwrap();
+            let tools = c.get("tools").filter(|t| !t.is_null());
+            let opts = RenderOpts {
+                thinking: c["thinking"].as_bool().unwrap(),
+                reasoning_effort: effort(c["reasoning_effort"].as_str()),
+            };
+            let got = render_messages(&c["messages"], tools, opts);
+            assert_eq!(got, c["expected"].as_str().unwrap(), "case `{name}`");
+        }
+    }
+
     /// Byte-exact against the engine's `/tokenize`: a single user turn renders
     /// `BOS <｜User｜> content <｜Assistant｜> </think>`.
     #[test]
     fn single_user_turn() {
-        let out = render_messages(&json!([{"role":"user","content":"ABCD"}]), None);
+        let out = render_messages(
+            &json!([{"role":"user","content":"ABCD"}]),
+            None,
+            RenderOpts::chat(),
+        );
         assert_eq!(
             out,
             "<｜begin▁of▁sentence｜><｜User｜>ABCD<｜Assistant｜></think>"
@@ -587,6 +919,7 @@ mod tests {
                 {"role":"user","content":"ABCD"}
             ]),
             None,
+            RenderOpts::chat(),
         );
         assert_eq!(
             out,
@@ -606,6 +939,7 @@ mod tests {
                 {"role":"user","content":"U2"}
             ]),
             None,
+            RenderOpts::chat(),
         );
         assert_eq!(
             out,
@@ -623,6 +957,7 @@ mod tests {
                 {"role":"user","content":"ABCD"}
             ]),
             None,
+            RenderOpts::chat(),
         );
         assert_eq!(
             out,
@@ -640,6 +975,7 @@ mod tests {
                 {"role":"user","content":[{"type":"text","text":"AB"},{"type":"text","text":"CD"}]}
             ]),
             None,
+            RenderOpts::chat(),
         );
         assert_eq!(
             out,
@@ -658,6 +994,7 @@ mod tests {
                 {"role":"user","content":"U2"}
             ]),
             None,
+            RenderOpts::chat(),
         );
         assert_eq!(
             out,
@@ -677,6 +1014,7 @@ mod tests {
                 {"role":"user","content":"U3"}
             ]),
             None,
+            RenderOpts::chat(),
         );
         assert_eq!(
             out,
@@ -691,7 +1029,11 @@ mod tests {
     #[test]
     fn developer_role_renders_like_user_without_merging() {
         assert_eq!(
-            render_messages(&json!([{"role":"developer","content":"D1"}]), None),
+            render_messages(
+                &json!([{"role":"developer","content":"D1"}]),
+                None,
+                RenderOpts::chat()
+            ),
             "<｜begin▁of▁sentence｜><｜User｜>D1<｜Assistant｜></think>"
         );
         assert_eq!(
@@ -701,6 +1043,7 @@ mod tests {
                     {"role":"developer","content":"D2"}
                 ]),
                 None,
+                RenderOpts::chat()
             ),
             "<｜begin▁of▁sentence｜><｜User｜>D1<｜User｜>D2<｜Assistant｜></think>"
         );
@@ -710,7 +1053,10 @@ mod tests {
     /// degrade path (the caller then routes by min-load on the empty prefix).
     #[test]
     fn empty_messages_renders_bos_only() {
-        assert_eq!(render_messages(&json!([]), None), "<｜begin▁of▁sentence｜>");
+        assert_eq!(
+            render_messages(&json!([]), None, RenderOpts::chat()),
+            "<｜begin▁of▁sentence｜>"
+        );
     }
 
     /// `py_json` reproduces Python `json.dumps(v, ensure_ascii=False)` default
@@ -751,7 +1097,10 @@ mod tests {
             {"type":"function","function":{"name":"get_weather","description":"Get weather","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}}
         ]);
         let expected = "<｜begin▁of▁sentence｜>SYS\n\n## Tools\n\nYou have access to a set of tools to help answer the user's question. You can invoke tools by writing a \"<｜DSML｜tool_calls>\" block like the following:\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"$TOOL_NAME\">\n<｜DSML｜parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜parameter>\n...\n</｜DSML｜invoke>\n<｜DSML｜invoke name=\"$TOOL_NAME2\">\n...\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>\n\nString parameters should be specified as is and set `string=\"true\"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\nIf thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\nOtherwise, output directly after </think> with tool calls or final response.\n\n### Available Tool Schemas\n\n{\"description\": \"Get weather\", \"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}}, \"strict\": false}\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n<｜User｜>hi<｜Assistant｜></think>";
-        assert_eq!(render_messages(&messages, Some(&tools)), expected);
+        assert_eq!(
+            render_messages(&messages, Some(&tools), RenderOpts::chat()),
+            expected
+        );
     }
 
     /// An empty `tools` array is falsy engine-side — no tools block is rendered.
@@ -759,7 +1108,7 @@ mod tests {
     fn empty_tools_array_renders_no_tools_block() {
         let messages = json!([{"role":"user","content":"hi"}]);
         assert_eq!(
-            render_messages(&messages, Some(&json!([]))),
+            render_messages(&messages, Some(&json!([])), RenderOpts::chat()),
             "<｜begin▁of▁sentence｜><｜User｜>hi<｜Assistant｜></think>"
         );
     }
@@ -770,7 +1119,7 @@ mod tests {
     fn renders_tools_when_no_system_message_present() {
         let messages = json!([{"role":"user","content":"hi"}]);
         let tools = json!([{"type":"function","function":{"name":"ping","description":"p"}}]);
-        let out = render_messages(&messages, Some(&tools));
+        let out = render_messages(&messages, Some(&tools), RenderOpts::chat());
         assert!(
             out.starts_with("<｜begin▁of▁sentence｜>\n\n## Tools\n\n"),
             "tools block should follow the inserted empty system; got: {out}"
@@ -797,7 +1146,10 @@ mod tests {
             {"role":"user","content":"u2"}
         ]);
         let expected = "<｜begin▁of▁sentence｜><｜User｜>u1<｜Assistant｜></think>reading\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"read\">\n<｜DSML｜parameter name=\"filePath\" string=\"true\">/x</｜DSML｜parameter>\n<｜DSML｜parameter name=\"limit\" string=\"false\">10</｜DSML｜parameter>\n<｜DSML｜parameter name=\"nested\" string=\"false\">{\"a\": 1}</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls><｜end▁of▁sentence｜><｜User｜><tool_result>FILE</tool_result>\n\nu2<｜Assistant｜></think>";
-        assert_eq!(render_messages(&messages, None), expected);
+        assert_eq!(
+            render_messages(&messages, None, RenderOpts::chat()),
+            expected
+        );
     }
 
     /// Byte-exact against the engine: multiple tool results in one user turn are
@@ -814,7 +1166,10 @@ mod tests {
             {"role":"tool","tool_call_id":"a","content":"RA"}
         ]);
         let expected = "<｜begin▁of▁sentence｜>\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"t1\">\n\n</｜DSML｜invoke>\n<｜DSML｜invoke name=\"t2\">\n\n</｜DSML｜invoke>\n</｜DSML｜tool_calls><｜end▁of▁sentence｜><｜User｜><tool_result>RA</tool_result>\n\n<tool_result>RB</tool_result><｜Assistant｜></think>";
-        assert_eq!(render_messages(&messages, None), expected);
+        assert_eq!(
+            render_messages(&messages, None, RenderOpts::chat()),
+            expected
+        );
     }
 
     /// Byte-exact against the engine: multiple tools render one canonical schema
@@ -831,7 +1186,10 @@ mod tests {
             {"type":"function","function":{"name":"b","strict":true}}
         ]);
         let expected = "<｜begin▁of▁sentence｜>S\n\n## Tools\n\nYou have access to a set of tools to help answer the user's question. You can invoke tools by writing a \"<｜DSML｜tool_calls>\" block like the following:\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"$TOOL_NAME\">\n<｜DSML｜parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜parameter>\n...\n</｜DSML｜invoke>\n<｜DSML｜invoke name=\"$TOOL_NAME2\">\n...\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>\n\nString parameters should be specified as is and set `string=\"true\"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\nIf thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\nOtherwise, output directly after </think> with tool calls or final response.\n\n### Available Tool Schemas\n\n{\"description\": \"da\", \"name\": \"a\", \"parameters\": {\"type\": \"object\"}, \"strict\": false}\n{\"description\": null, \"name\": \"b\", \"parameters\": null, \"strict\": true}\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n<｜User｜>hi<｜Assistant｜></think>";
-        assert_eq!(render_messages(&messages, Some(&tools)), expected);
+        assert_eq!(
+            render_messages(&messages, Some(&tools), RenderOpts::chat()),
+            expected
+        );
     }
 
     /// Byte-exact against the engine: an inlined-object `arguments` (permitted by
@@ -846,7 +1204,10 @@ mod tests {
             {"role":"tool","tool_call_id":"c1","content":"R"}
         ]);
         let expected = "<｜begin▁of▁sentence｜>\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"f\">\n<｜DSML｜parameter name=\"arguments\" string=\"false\">{\"x\": 1, \"y\": \"z\"}</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls><｜end▁of▁sentence｜><｜User｜><tool_result>R</tool_result><｜Assistant｜></think>";
-        assert_eq!(render_messages(&messages, None), expected);
+        assert_eq!(
+            render_messages(&messages, None, RenderOpts::chat()),
+            expected
+        );
     }
 
     /// Byte-exact against the engine: an unparsable `arguments` string wraps
@@ -861,6 +1222,109 @@ mod tests {
             {"role":"tool","tool_call_id":"c1","content":"R"}
         ]);
         let expected = "<｜begin▁of▁sentence｜>\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"f\">\n<｜DSML｜parameter name=\"arguments\" string=\"true\">not json</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls><｜end▁of▁sentence｜><｜User｜><tool_result>R</tool_result><｜Assistant｜></think>";
-        assert_eq!(render_messages(&messages, None), expected);
+        assert_eq!(
+            render_messages(&messages, None, RenderOpts::chat()),
+            expected
+        );
+    }
+
+    /// `parse_env_bool` matches the engine's `EnvBool` token set exactly
+    /// (`true/1/yes/y` | `false/0/no/n`, case-insensitive), and returns `None`
+    /// for anything else — including `on`, which a hand-rolled set might wrongly
+    /// accept and thereby diverge from the engine.
+    #[test]
+    fn parse_env_bool_matches_engine_token_set() {
+        for t in ["true", "1", "yes", "y", "TRUE", "Yes", "Y"] {
+            assert_eq!(parse_env_bool(t), Some(true), "{t}");
+        }
+        for f in ["false", "0", "no", "n", "FALSE", "No"] {
+            assert_eq!(parse_env_bool(f), Some(false), "{f}");
+        }
+        for u in ["on", "off", "enabled", "t", "", "2"] {
+            assert_eq!(parse_env_bool(u), None, "{u}");
+        }
+    }
+
+    /// `json_truthy` mirrors Python truthiness on the raw `thinking` value.
+    #[test]
+    fn json_truthy_mirrors_python() {
+        assert!(json_truthy(&json!(true)));
+        assert!(!json_truthy(&json!(false)));
+        assert!(json_truthy(&json!("true"))); // non-empty string is truthy
+        assert!(json_truthy(&json!("false"))); // even "false" — non-empty
+        assert!(!json_truthy(&json!("")));
+        assert!(json_truthy(&json!(1)));
+        assert!(!json_truthy(&json!(0)));
+        assert!(!json_truthy(&serde_json::Value::Null));
+        assert!(!json_truthy(&json!([])));
+        assert!(json_truthy(&json!([1])));
+        assert!(!json_truthy(&json!({})));
+        assert!(json_truthy(&json!({ "k": 1 })));
+    }
+
+    /// `resolve_render_opts` honors per-request overrides (the paths that don't
+    /// depend on env): `chat_template_kwargs.thinking` truthiness, and the effort
+    /// precedence `chat_template_kwargs.reasoning_effort` > top-level > (env).
+    #[test]
+    fn resolve_render_opts_request_overrides() {
+        let opts = resolve_render_opts(&json!({"chat_template_kwargs": {"thinking": true}}));
+        assert!(opts.thinking);
+        assert_eq!(opts.reasoning_effort, ReasoningEffort::None);
+
+        assert!(
+            !resolve_render_opts(&json!({"chat_template_kwargs": {"thinking": false}})).thinking
+        );
+        // non-bool thinking follows truthiness (matches the engine), not `.as_bool()`.
+        assert!(
+            resolve_render_opts(&json!({"chat_template_kwargs": {"thinking": "true"}})).thinking
+        );
+        assert!(
+            !resolve_render_opts(&json!({"chat_template_kwargs": {"thinking": null}})).thinking
+        );
+
+        // chat_template_kwargs.reasoning_effort wins over the top-level field.
+        assert_eq!(
+            resolve_render_opts(&json!({
+                "reasoning_effort": "high",
+                "chat_template_kwargs": {"reasoning_effort": "max"}
+            }))
+            .reasoning_effort,
+            ReasoningEffort::Max
+        );
+        // top-level reasoning_effort is honored when chat_template_kwargs lacks it.
+        assert_eq!(
+            resolve_render_opts(&json!({"reasoning_effort": "high"})).reasoning_effort,
+            ReasoningEffort::High
+        );
+        // unknown effort collapses to None (matches the engine's max/high-only gate).
+        assert_eq!(
+            resolve_render_opts(&json!({"reasoning_effort": "medium"})).reasoning_effort,
+            ReasoningEffort::None
+        );
+    }
+
+    /// The env-default resolvers (the deploy-critical `SGLANG_ROUTER_DSV4_*` knobs):
+    /// pure over the env value so the empty / unrecognized / valid branches are
+    /// pinned without the process-global `OnceLock`.
+    #[test]
+    fn resolve_default_thinking_branches() {
+        assert!(!resolve_default_thinking(None)); // unset → false (engine default)
+        assert!(!resolve_default_thinking(Some(""))); // set-empty → false
+        assert!(resolve_default_thinking(Some("true")));
+        assert!(resolve_default_thinking(Some("y"))); // engine EnvBool token
+        assert!(!resolve_default_thinking(Some("false")));
+        assert!(!resolve_default_thinking(Some("enabled"))); // unrecognized → false (WARNs)
+    }
+
+    #[test]
+    fn resolve_default_effort_branches() {
+        assert_eq!(resolve_default_effort(None), None);
+        assert_eq!(resolve_default_effort(Some("max")), Some("max".to_owned()));
+        assert_eq!(
+            resolve_default_effort(Some("high")),
+            Some("high".to_owned())
+        );
+        assert_eq!(resolve_default_effort(Some("medium")), None); // engine keeps only max/high
+        assert_eq!(resolve_default_effort(Some("")), None);
     }
 }

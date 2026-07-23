@@ -64,8 +64,14 @@ pub fn request_tokens_for(
             // Pass the request's top-level `tools` so the chat encoder renders
             // them into the prefix the way the engine does — otherwise tool
             // traffic routes on a tools-omitted tokenization that never matches
-            // the engine's cached blocks (see `dsv4::render_messages`).
-            if let Some(ids) = tokenizers.encode_chat(&model_id.0, messages, value.get("tools")) {
+            // the engine's cached blocks (see `dsv4::render_messages`). Resolve
+            // thinking-mode / reasoning-effort the way the engine does (per-request
+            // override, else the router's engine-matching default) so the routing
+            // tokens still match when the engine runs a non-default thinking mode.
+            let opts = crate::tokenizer::dsv4::resolve_render_opts(value);
+            if let Some(ids) =
+                tokenizers.encode_chat(&model_id.0, messages, value.get("tools"), opts)
+            {
                 return Some(RequestTokens {
                     ids,
                     engine_equivalent: true,

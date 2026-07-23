@@ -37,10 +37,13 @@ impl ChatEncoder {
         &self,
         messages: &serde_json::Value,
         tools: Option<&serde_json::Value>,
+        opts: dsv4::RenderOpts,
     ) -> Result<String> {
         match self {
+            // The Jinja path does not thread thinking-mode/tools yet (future
+            // work); it ignores `opts` and renders the model's default template.
             ChatEncoder::Jinja(t) => t.render(messages),
-            ChatEncoder::DeepSeekV4 => Ok(dsv4::render_messages(messages, tools)),
+            ChatEncoder::DeepSeekV4 => Ok(dsv4::render_messages(messages, tools, opts)),
         }
     }
 }
@@ -301,6 +304,7 @@ impl TokenizerRegistry {
         model_id: &str,
         messages: &serde_json::Value,
         tools: Option<&serde_json::Value>,
+        opts: dsv4::RenderOpts,
     ) -> Option<Vec<u32>> {
         // Clone the Arc and drop the DashMap guard before the CPU-bound
         // render+encode (mirrors `get`), so no shard read-lock is held across it.
@@ -308,7 +312,7 @@ impl TokenizerRegistry {
         let tokenizer = self.get(model_id)?;
         let rendered = entry
             .encoder
-            .render(messages, tools)
+            .render(messages, tools, opts)
             .inspect_err(|e| {
                 // `{e:#}` prints the full anyhow chain, so the underlying
                 // minijinja cause (e.g. a `raise_exception` message) is
@@ -628,7 +632,7 @@ mod tests {
 
         let messages = serde_json::json!([{"role":"user","content":"hi"}]);
         let chat_ids = reg
-            .encode_chat("tiny", &messages, None)
+            .encode_chat("tiny", &messages, None, dsv4::RenderOpts::chat())
             .expect("encode_chat");
         assert!(!chat_ids.is_empty());
 
@@ -645,7 +649,7 @@ mod tests {
             .get("tiny")
             .unwrap()
             .encoder
-            .render(&messages, None)
+            .render(&messages, None, dsv4::RenderOpts::chat())
             .unwrap();
         assert_eq!(chat_ids, adapter::encode(&tok, &rendered).unwrap());
     }
@@ -659,7 +663,9 @@ mod tests {
         );
         assert!(!reg.has_chat_encoder("tiny"));
         let messages = serde_json::json!([{"role":"user","content":"hi"}]);
-        assert!(reg.encode_chat("tiny", &messages, None).is_none());
+        assert!(reg
+            .encode_chat("tiny", &messages, None, dsv4::RenderOpts::chat())
+            .is_none());
     }
 
     /// A template that fails to render (here, one that calls `raise_exception`)
@@ -682,7 +688,8 @@ mod tests {
         assert!(reg.has_chat_encoder("tiny"));
         let messages = serde_json::json!([{"role":"user","content":"hi"}]);
         assert!(
-            reg.encode_chat("tiny", &messages, None).is_none(),
+            reg.encode_chat("tiny", &messages, None, dsv4::RenderOpts::chat())
+                .is_none(),
             "a failing render must yield None so routing falls back to raw text"
         );
     }
@@ -1051,7 +1058,7 @@ mod tests {
 
         // Gate 3: the pinned engine-/tokenize vector (dsv4.rs module doc).
         let pinned = serde_json::json!([{"role": "user", "content": "ABCD"}]);
-        let rendered = dsv4::render_messages(&pinned, None);
+        let rendered = dsv4::render_messages(&pinned, None, dsv4::RenderOpts::chat());
         for (name, tok) in [("hf", &hf), ("fast", &fast), ("fast+l1", &fast_l1)] {
             assert_eq!(
                 adapter::encode(tok, &rendered).unwrap(),
@@ -1091,7 +1098,7 @@ mod tests {
         eprintln!("turn | tokens | hf_ms | fast_ms | fast_l1_ms");
         for upto in (2..=messages.len()).step_by(8) {
             let msgs = serde_json::Value::Array(messages[..upto].to_vec());
-            let text = dsv4::render_messages(&msgs, None);
+            let text = dsv4::render_messages(&msgs, None, dsv4::RenderOpts::chat());
             let (want, hf_ms) = time_encode(&hf, &text);
             let (got_fast, fast_ms) = time_encode(&fast, &text);
             let (got_l1, l1_ms) = time_encode(&fast_l1, &text);

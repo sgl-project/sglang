@@ -1437,7 +1437,12 @@ fn build_outgoing_body(
 ///
 /// Replicated-and-safe: plain text `messages` with a string `content`.
 /// Not replicated → omit:
-///   * `tools` / `functions` — the encoder doesn't render tool schemas.
+///   * `tools` / `functions` — the DeepSeek-V4 encoder DOES render tool schemas
+///     for routing, but tool-carrying ids are still withheld from forwarding out
+///     of conservatism: the generic Jinja encoder does not render tools, and even
+///     the dsv4 render has documented per-version edge cases (`py_json` float
+///     formatting, the tool-`arguments` fallback). A safety choice, not "not
+///     rendered".
 ///   * multimodal (array) `content` — a text tokenizer can't represent images.
 ///   * `chat_template` — an OpenAI-compatible per-request template override
 ///     (e.g. vLLM); the router renders with the model's default template, so a
@@ -1450,17 +1455,21 @@ fn build_outgoing_body(
 ///     engine rewrites/strips the final assistant turn; the encoder renders it
 ///     verbatim.
 ///
-/// NOTE: the router's chat encoder renders in the engine's default
-/// (non-thinking) mode. Current sglang derives thinking from the request
-/// (`chat_template_kwargs`), which this guard already omits, so a plain request
-/// the router rendered matches the engine. The only way to diverge is an engine
-/// build that applies a non-default thinking mode the router can't observe from
-/// the request — the same router↔engine tokenization-parity assumption that
-/// cache-aware routing already depends on. The same assumption covers
-/// `add_special_tokens`: the router renders specials via the chat template, which
-/// matches the engine on tokenizers that auto-add them (the common case); a
-/// tokenizer that does not would diverge by a leading special, again undetectable
-/// from the request.
+/// NOTE: the DeepSeek-V4 encoder renders in the mode
+/// `dsv4::resolve_render_opts` picks — the per-request `chat_template_kwargs`
+/// (thinking/reasoning_effort, which this guard omits from forwarding above) or,
+/// for a plain request, the router's `SGLANG_ROUTER_DSV4_DEFAULT_THINKING` /
+/// `SGLANG_ROUTER_DSV4_REASONING_EFFORT` defaults. So a plain request's forwarded
+/// `input_ids` match the engine ONLY when those router defaults match the engine's
+/// `SGLANG_DEFAULT_THINKING` / `SGLANG_DSV4_REASONING_EFFORT` (i.e.
+/// `--default-chat-template-kwargs`) — keep them in sync at deploy time. A mismatch
+/// forwards wrong-mode ids: the one divergence class this predicate can't detect,
+/// since a plain request carries no mode field to key on (routing itself only
+/// degrades, but a forwarded mismatch reaches the engine — see the deploy runbook).
+/// The same parity assumption covers `add_special_tokens`: the router renders
+/// specials via the chat template, which matches the engine on tokenizers that
+/// auto-add them (the common case); a tokenizer that does not would diverge by a
+/// leading special, again undetectable from the request.
 fn input_ids_safe_to_forward(value: &serde_json::Value) -> bool {
     if request_has_tools(value) || request_is_multimodal(value) {
         return false;
