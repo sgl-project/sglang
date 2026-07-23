@@ -989,10 +989,22 @@ def safetensors_weights_iterator(
 
 def fastsafetensors_weights_iterator(
     hf_weights_files: List[str],
+    nogds: Optional[bool] = None,
+    max_threads: Optional[int] = None,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """
     Iterate over the weights in the model safetensor files
     using fastsafetensor library to accelerate loading via GPU Direct Storage (if available).
+
+    nogds: force-disable the GPU Direct Storage path. If None (default), auto-detect:
+        integrated/unified-memory GPUs (props.is_integrated, e.g. DGX Spark/GB10 - see the
+        same check in get_available_gpu_memory) don't have a discrete-VRAM DMA target for GDS
+        to accelerate in the first place, and letting the library attempt it anyway falls back
+        through a non-reclaimable pinned-host-memory staging path that can inflate real memory
+        usage several-fold over the actual checkpoint size. On these devices we default to
+        nogds=True. Discrete GPUs keep the library's own default (attempt GDS).
+    max_threads: forwarded to SafeTensorsFileLoader's max_threads (worker threads per rank).
+        If None, use the fastsafetensors library default.
     """
     if SafeTensorsFileLoader is None:
         raise ImportError(
@@ -1011,6 +1023,16 @@ def fastsafetensors_weights_iterator(
 
     device = torch.device(f"cuda:{rank}")
 
+    if nogds is None:
+        try:
+            nogds = bool(torch.cuda.get_device_properties(device).is_integrated)
+        except Exception:
+            nogds = False
+
+    loader_kwargs = {"nogds": nogds}
+    if max_threads is not None:
+        loader_kwargs["max_threads"] = max_threads
+
     weight_files_sub_lists = [
         hf_weights_files[i : i + pg.size()]
         for i in range(0, len(hf_weights_files), pg.size())
@@ -1026,7 +1048,23 @@ def fastsafetensors_weights_iterator(
         disable=False,
         bar_format=_BAR_FORMAT,
     ):
-        loader = SafeTensorsFileLoader(pg, device)
+        try:
+            loader = SafeTensorsFileLoader(pg, device, **loader_kwargs)
+        except Exception as e:
+            # GDS can fail at construction (e.g. is_gds_supported() raising on a
+            # device/filesystem combination that doesn't back it) rather than
+            # degrading gracefully. Retry once with nogds=True before giving up -
+            # matches vLLM's fastsafetensors integration, which hits the same
+            # library and handles this the same way.
+            if loader_kwargs["nogds"] or "gds" not in str(e).lower():
+                raise
+            logger.warning(
+                "fastsafetensors: GDS construction failed (%s); retrying with "
+                "nogds=True.",
+                e,
+            )
+            loader_kwargs["nogds"] = True
+            loader = SafeTensorsFileLoader(pg, device, **loader_kwargs)
         rank_file_map = {i: [f] for i, f in enumerate(f_list)}
         loader.add_filenames(rank_file_map)
         try:
