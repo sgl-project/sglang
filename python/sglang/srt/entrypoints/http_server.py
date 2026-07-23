@@ -2176,10 +2176,20 @@ def _execute_server_warmup(server_args: ServerArgs):
         and server_args.disaggregation_mode == "null"
         and model_info["is_generation"]
     ):
+        served_model_name = ""
+        if not envs.SGLANG_RUST_SERVER.get():
+            served_model_name = _global_state.tokenizer_manager.served_model_name
+        else:
+            # _global_state.tokenizer_manager is not initialized in the rust server,
+            # so we need to get the model name from the model_info
+            served_model_name = model_info.get(
+                "model_path", server_args.served_model_name
+            )
+            served_model_name = served_model_name or server_args.model_path
         # TODO: ChatCompletionRequest does not have bootstrap info required by disaggregation mode, disable image-warmup for now
         # Only use chat completions format for generation models, not embedding models
         json_data = {
-            "model": _global_state.tokenizer_manager.served_model_name,
+            "model": served_model_name,
             "messages": [
                 {
                     "role": "user",
@@ -2228,9 +2238,15 @@ def _execute_server_warmup(server_args: ServerArgs):
                 verify=ssl_verify,
             )
             assert res.status_code == 200, f"{res.text}"
-            _global_state.tokenizer_manager.server_status = ServerStatus.Up
+            # Skip server_status update for Rust server
+            if not envs.SGLANG_RUST_SERVER.get():
+                _global_state.tokenizer_manager.server_status = ServerStatus.Up
 
         else:
+            # TODO: @rainj-me fix this when Rust server supports disaggregation
+            assert (
+                not envs.SGLANG_RUST_SERVER.get()
+            ), "Rust server is not supported for disaggregation warmup for now"
             logger.info(f"Start of pd disaggregation warmup ...")
             status_codes = asyncio.run(
                 _send_disaggregation_warmup_requests(
@@ -2682,13 +2698,27 @@ def launch_server(
         run_detokenizer_process_func=run_detokenizer_process_func,
     )
 
-    _setup_and_run_http_server(
-        server_args,
-        tokenizer_manager,
-        template_manager,
-        port_args,
-        scheduler_init_result.scheduler_infos,
-        subprocess_watchdog,
-        execute_warmup_func=execute_warmup_func,
-        launch_callback=launch_callback,
-    )
+    if envs.SGLANG_RUST_SERVER.get():
+        # The Rust server serves api-server, tokenizer, and detokenizer, so the
+        # main process has no Python HTTP server / tokenizer manager to run.
+        # Run a warmup /generate before advertising readiness: the Rust /health
+        # and /get_model_info endpoints are static (200 as soon as the server
+        # binds, before any forward pass), so without this the first real request
+        # pays the cold-start cost (observed as a >60s first generation).
+        if not server_args.skip_server_warmup:
+            _execute_server_warmup(server_args)
+        logger.info("The server is fired up and ready to roll!")
+        if launch_callback is not None:
+            launch_callback()
+        scheduler_init_result.block_until_scheduler_exits()
+    else:
+        _setup_and_run_http_server(
+            server_args,
+            tokenizer_manager,
+            template_manager,
+            port_args,
+            scheduler_init_result.scheduler_infos,
+            subprocess_watchdog,
+            execute_warmup_func=execute_warmup_func,
+            launch_callback=launch_callback,
+        )

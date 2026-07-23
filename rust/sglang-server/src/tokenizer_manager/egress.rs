@@ -1,0 +1,187 @@
+//! TokenizerManager egress thread — drains the egress ring (scheduler output
+//! pushed from Python) and routes each message to the detok shard that owns its
+//! `RidHash`. Routing is a pure function of the rid, so it matches the shard
+//! the request registered with on ingress — no shared map, no lock.
+//!
+//! The ring carries a 1-byte frame tag: `BATCH` (a whole decode batch, fanned
+//! out here into per-request chunks), `RESULT` (a single control-request JSON
+//! payload, e.g. `/server_info`), or `ERROR` (a terminal per-request failure the
+//! scheduler ingress couldn't decode, routed back as a 400).
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use bytes::Bytes;
+
+use crate::ids::RidHash;
+use crate::message::{
+    ChunkEvent, EGRESS_TAG_BATCH, EGRESS_TAG_ERROR, EGRESS_TAG_RESULT, for_each_chunk,
+};
+use crate::runtime::Runnable;
+use crate::runtime::channels::{DetokMsg, Senders, recv};
+use crate::runtime::ring::EgressConsumer;
+
+/// A monotonic counter bumped once per egress-ring frame the dispatcher drains.
+/// It's the rust-native equivalent of the Python `TokenizerManager`'s
+/// `last_receive_tstamp`: `/health_generate` watches it advance to confirm the
+/// scheduler → detok path is alive (the value itself is meaningless).
+pub type ActivityCounter = Arc<AtomicU64>;
+
+/// Egress dispatcher stage. Owns the egress-ring consumer + the detok-shard
+/// senders, so the runtime spawns it as a [`Runnable`].
+pub struct Egress {
+    egress: EgressConsumer,
+    senders: Senders,
+    activity: ActivityCounter,
+    shutdown: flume::Receiver<()>,
+}
+
+impl Egress {
+    pub fn new(
+        egress: EgressConsumer,
+        senders: Senders,
+        activity: ActivityCounter,
+        shutdown: flume::Receiver<()>,
+    ) -> Self {
+        Self {
+            egress,
+            senders,
+            activity,
+            shutdown,
+        }
+    }
+}
+
+impl Runnable for Egress {
+    fn run(self) {
+        // Reused across frames (`clear` keeps capacity) — steady state allocates nothing.
+        let shards = self.senders.detok.len();
+        let mut buckets: Vec<Vec<ChunkEvent>> = (0..shards).map(|_| Vec::new()).collect();
+
+        while let Some(bytes) = recv(self.egress.receiver(), &self.shutdown) {
+            let Some((&tag, body)) = bytes.split_first() else {
+                continue;
+            };
+            match tag {
+                // A whole decode batch: bucket each request by the shard owning its
+                // rid, then hand each shard its chunks in one send.
+                EGRESS_TAG_BATCH => {
+                    for b in buckets.iter_mut() {
+                        b.clear();
+                    }
+                    let ok = for_each_chunk(body, |ev| {
+                        buckets[RidHash(ev.rid_hash).shard(shards)].push(ev);
+                    });
+                    if !ok {
+                        tracing::warn!("egress: bad batch frame");
+                    }
+                    for (i, b) in buckets.iter_mut().enumerate() {
+                        if b.is_empty() {
+                            continue;
+                        }
+                        let chunks = DetokMsg::Chunks(std::mem::take(b));
+                        if self.senders.detok[i].send(chunks).is_err() {
+                            tracing::error!("egress: detok shard closed");
+                        }
+                    }
+                    // Any frame off the ring = the scheduler produced output → alive.
+                    self.activity.fetch_add(1, Ordering::Relaxed);
+                }
+                EGRESS_TAG_RESULT => {
+                    if let Some((rid, msg)) = decode_result(body) {
+                        self.route(rid, msg);
+                    }
+                }
+                EGRESS_TAG_ERROR => {
+                    if let Some((rid, msg)) = decode_error(body) {
+                        self.route(rid, msg);
+                    }
+                }
+                other => tracing::warn!(tag = other, "egress: unknown frame tag"),
+            }
+        }
+    }
+}
+
+impl Egress {
+    /// Route one message to the shard owning `rid`. HOL ceiling: a slow shard stalls
+    /// this thread; the fix is a per-shard egress ring (see `threads::TM_CORES`).
+    #[inline]
+    fn route(&self, rid: RidHash, msg: DetokMsg) {
+        if self.senders.detok_for(rid).send(msg).is_err() {
+            tracing::error!("egress: detok shard closed");
+        }
+    }
+}
+
+/// Control result: `[rid, payload]` → single non-streamed delivery to the sink.
+fn decode_result(body: &[u8]) -> Option<(RidHash, DetokMsg)> {
+    let val = rmpv::decode::read_value(&mut &body[..]).ok()?;
+    let rmpv::Value::Array(arr) = val else {
+        return None;
+    };
+    let mut items = arr.into_iter();
+    let rid = RidHash::from_rid(items.next()?.as_str()?);
+    // The decode already owns the payload buffer — move it out.
+    let payload = match items.next()? {
+        rmpv::Value::Binary(b) => Bytes::from(b),
+        rmpv::Value::String(s) => Bytes::from(s.into_bytes()),
+        _ => return None,
+    };
+    Some((
+        rid,
+        DetokMsg::Result {
+            rid_hash: rid,
+            payload,
+        },
+    ))
+}
+
+/// Per-request failure: `[rid, message]` → terminal `Error` to the sink (→ 400).
+fn decode_error(body: &[u8]) -> Option<(RidHash, DetokMsg)> {
+    let val = rmpv::decode::read_value(&mut &body[..]).ok()?;
+    let rmpv::Value::Array(arr) = val else {
+        return None;
+    };
+    let mut items = arr.into_iter();
+    let rid = RidHash::from_rid(items.next()?.as_str()?);
+    let message = match items.next()? {
+        rmpv::Value::String(s) => s.into_str()?,
+        _ => return None,
+    };
+    Some((
+        rid,
+        DetokMsg::Fail {
+            rid_hash: rid,
+            message,
+        },
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::message::frame_egress_error;
+    use crate::runtime::channels::DetokMsg;
+
+    /// A framed error round-trips: `frame_egress_error` → tag stripped →
+    /// `decode_error` yields the rid + a `Fail` carrying the message.
+    #[test]
+    fn error_frame_roundtrips_to_fail() {
+        let framed = frame_egress_error("42", "invalid request: bad field");
+        assert_eq!(framed[0], EGRESS_TAG_ERROR);
+        let (rid, msg) = decode_error(&framed[1..]).expect("decodes");
+        let want = RidHash::from_rid("42");
+        assert_eq!(rid, want);
+        match msg {
+            DetokMsg::Fail {
+                rid_hash: id,
+                message,
+            } => {
+                assert_eq!(id, want);
+                assert_eq!(message, "invalid request: bad field");
+            }
+            _ => panic!("expected Fail"),
+        }
+    }
+}

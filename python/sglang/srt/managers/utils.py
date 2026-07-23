@@ -2,14 +2,17 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, List, Optional, Union
 
+import msgspec
 import torch
 
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.eplb.expert_distribution import ExpertDistributionMetrics
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.managers import io_struct
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.state_capturer.base import TopkCaptureOutput
@@ -321,3 +324,55 @@ class EmbeddingBatchResult:
 def is_health_check_generate_req(recv_req):
     rid = getattr(recv_req, "rid", None)
     return rid is not None and rid.startswith(HEALTH_CHECK_RID_PREFIX)
+
+
+class MsgpackDecodeError(ValueError):
+    """A msgpack frame the typed decoder rejected, with the failure explained:
+    ``rid`` (when recoverable from the raw tagged array) and a human-readable
+    ``reason`` whose leading ``$[<n>]`` array index is resolved to the struct
+    field name.
+    """
+
+    def __init__(self, rid: Optional[str], reason: str):
+        super().__init__(reason)
+        self.rid = rid
+        self.reason = reason
+
+
+def msgpack_decode_explained(data: bytes) -> Any:
+    """`io_struct.msgpack_decode`, but a rejected frame raises
+    `MsgpackDecodeError` carrying the rid (recovered via an untyped re-decode of
+    the tagged array) and a reason with the failing field named — for callers
+    that must report the failure back to a client (e.g. the rust ingress)
+    instead of just crashing."""
+    # TODO: the hook_custom_types() currently only apply for unit tests, once it
+    # esclate to the main code, we can provide a function to access the _all_types
+
+    try:
+        return io_struct.msgpack_decode(data)
+    except Exception as e:
+        msg = str(e)
+        try:
+            arr = msgspec.msgpack.decode(data)
+        except Exception:
+            arr = None
+        if not (isinstance(arr, (list, tuple)) and arr):
+            raise MsgpackDecodeError(None, msg) from e
+        # Tagged array_like layout is [tag, *fields]; rid is the first field of
+        # every BaseReq struct.
+        rid = str(arr[1]) if len(arr) > 1 and arr[1] is not None else None
+        tag_to_fields = {
+            cls.__struct_config__.tag: cls.__struct_fields__
+            for cls in io_struct._all_types
+            if isinstance(cls, type) and issubclass(cls, msgspec.Struct)
+        }
+        fields = tag_to_fields.get(arr[0])
+        if fields is not None:
+            # Leading ``$[<n>]`` in a msgspec ValidationError path, e.g.
+            # ``$[12][0]``.
+            m = re.search(r"\$\[(\d+)\]", msg)
+            if m is not None:
+                idx = int(m.group(1))
+                if 1 <= idx <= len(fields):
+                    msg = f"{msg[:m.start()]}$.{fields[idx - 1]}{msg[m.end():]}"
+        raise MsgpackDecodeError(rid, msg) from e

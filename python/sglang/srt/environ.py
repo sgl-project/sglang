@@ -1157,6 +1157,9 @@ class Envs:
     SGLANG_KV_CANARY_SWA_DIVERGENCE_STATS_INTERVAL = EnvInt(0)
     SGLANG_KV_CANARY_ENABLE_MHA_V = EnvBool(False)
 
+    # Sglang Rust Server
+    SGLANG_RUST_SERVER = EnvBool(False)
+
 
 envs = Envs()
 EnvField._allow_set_name = False

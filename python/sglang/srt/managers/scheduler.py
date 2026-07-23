@@ -162,6 +162,7 @@ from sglang.srt.managers.prefill_delayer import (
     PrefillDelayer,
     PrefillDelayerSinglePassExecutor,
 )
+from sglang.srt.managers.rust_server import RustServer
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     MultimodalInputs,
@@ -180,7 +181,10 @@ from sglang.srt.managers.scheduler_components.batch_result_processor import (
 )
 from sglang.srt.managers.scheduler_components.dp_attn import SchedulerDPAttnAdapter
 from sglang.srt.managers.scheduler_components.flush_wrapper import SchedulerFlushWrapper
-from sglang.srt.managers.scheduler_components.idle_sleeper import IdleSleeper
+from sglang.srt.managers.scheduler_components.idle_sleeper import (
+    IdleSleeper,
+    RustServerIdleSleeper,
+)
 from sglang.srt.managers.scheduler_components.invariant_checker import (
     SchedulerInvariantChecker,
     create_scheduler_watchdog,
@@ -546,6 +550,10 @@ class Scheduler(
 
         self.maybe_init_scripted_scheduler_hook()
 
+        # Start the embedded Rust frontend (rank 0) before the request receiver,
+        # which reads self.rust_ring_recv to pick its ingress transport.
+        self.maybe_init_rust_server()
+
         self.init_request_receiver()
 
         self.init_dp_attn_adapter()
@@ -621,9 +629,12 @@ class Scheduler(
         )
 
         self.load_snapshot_writer = None
+        self.recv_from_tokenizer = None
+
         if not is_rank_zero:
             return
 
+        self.recv_from_tokenizer = self.ipc_channels.recv_from_tokenizer
         dp_rank = self.ps.dp_rank if self.ps.dp_rank is not None else 0
         try:
             self.load_snapshot_writer = create_load_snapshot_writer(
@@ -1693,11 +1704,16 @@ class Scheduler(
 
             output = self._request_dispatcher(recv_req)
             if output is not None:
-                if not isinstance(output, RpcReqOutput):
-                    self.ipc_channels.send_to_tokenizer.send_output(output, recv_req)
-                else:
+                if self.rust_server is not None:
+                    # Embedded Rust server: every control-request response goes
+                    # back through the egress ring (the zmq tokenizer socket is
+                    # not consumed); the Rust api_server shapes it per-endpoint.
+                    self.rust_server.push_control_output(recv_req, output)
+                elif isinstance(output, RpcReqOutput):
                     if self.ipc_channels.recv_from_rpc is not None:
                         sock_send(self.ipc_channels.recv_from_rpc, output)
+                else:
+                    self.ipc_channels.send_to_tokenizer.send_output(output, recv_req)
 
         self.flush_wrapper.check_pending()
         if self.external_corpus_manager is not None:
@@ -1753,9 +1769,33 @@ class Scheduler(
         else:
             self.scripted_scheduler_hook = None
 
+    def maybe_init_rust_server(self) -> None:
+        """Start the embedded Rust server (rank 0) if ``SGLANG_RUST_SERVER`` is
+        set, and point the ingress receiver at it. All the plumbing lives in
+        ``RustServer`` (scheduler_components/rust_scheduler.py)."""
+
+        is_rank_zero = (
+            self.ps.pp_rank == 0
+            and self.ps.attn_tp_rank == 0
+            and self.ps.attn_cp_rank == 0
+        )
+        if not (envs.SGLANG_RUST_SERVER.get() and is_rank_zero):
+            # Always define the attribute: init_output_streamer and the
+            # process_input_requests hook read self.rust_server unconditionally.
+            self.rust_server = None
+            return
+
+        rust_server = RustServer.launch(self)
+        self.rust_server = rust_server
+        # The rust server *is* the ingress source: SchedulerRequestReceiver
+        # drains its request ring (rust_server_mode) instead of a zmq socket.
+        self.recv_from_tokenizer = rust_server
+        # Park the idle loop on the request ring within the rank-0 rust-server
+        self.idle_sleeper = RustServerIdleSleeper(rust_server)
+
     def init_request_receiver(self) -> None:
         self.request_receiver = SchedulerRequestReceiver(
-            recv_from_tokenizer=self.ipc_channels.recv_from_tokenizer,
+            recv_from_tokenizer=self.recv_from_tokenizer,
             recv_from_rpc=self.ipc_channels.recv_from_rpc,
             recv_skipper=self.recv_skipper,
             input_blocker=self.input_blocker,
@@ -1874,6 +1914,7 @@ class Scheduler(
             spec_algorithm=self.spec_algorithm,
             disaggregation_mode=self.disaggregation_mode,
             enable_hicache_storage=lambda: self.enable_hicache_storage,
+            rust_server=self.rust_server,
         )
 
     def init_batch_result_processor(self) -> None:

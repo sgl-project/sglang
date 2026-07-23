@@ -15,6 +15,7 @@ import zmq
 from torch.distributed import barrier
 
 from sglang.srt.disaggregation.utils import prepare_abort
+from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
@@ -35,6 +36,7 @@ from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.distributed.parallel_state_wrapper import ParallelState
+    from sglang.srt.managers.rust_server import RustServer
     from sglang.srt.server_args import ServerArgs
     from sglang.test.scripted_runtime.scheduler_hook import ScriptedSchedulerHook
     from sglang.test.scripted_runtime.tokenizer_recv_proxy import (
@@ -44,7 +46,7 @@ if TYPE_CHECKING:
 
 @dataclass(kw_only=True, slots=True, frozen=True)
 class SchedulerRequestReceiver:
-    recv_from_tokenizer: Union[zmq.Socket, ScriptedTokenizerRecvProxy]
+    recv_from_tokenizer: Union[zmq.Socket, ScriptedTokenizerRecvProxy, RustServer]
     recv_from_rpc: Optional[zmq.Socket]
     recv_skipper: Any
     input_blocker: Any
@@ -102,6 +104,15 @@ class SchedulerRequestReceiver:
         if self.ps.pp_rank == 0:
             if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
                 recv_reqs = []
+
+                # Rust ringbuffer backend: drain the in-process ring fed by the
+                # embedded Rust TokenizerManager instead of a zmq socket. Same
+                # non-blocking, msgpack-decoded contract as the zmq path below.
+                if envs.SGLANG_RUST_SERVER.get():
+                    recv_reqs.extend(
+                        self.recv_from_tokenizer.drain(self.max_recv_per_poll)
+                    )
+                    return recv_reqs
 
                 while True:
                     try:

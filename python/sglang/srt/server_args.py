@@ -7028,7 +7028,7 @@ class ServerArgs:
                 "Please choose one tokenizer batching approach."
             )
 
-        if self.skip_tokenizer_init:
+        if self.skip_tokenizer_init and not envs.SGLANG_RUST_SERVER.get():
             # Tokenizer workers still serve HTTP / state / output work, so
             # their fanout is preserved; detokenizer workers only decode.
             if self.detokenizer_worker_num != 1:
