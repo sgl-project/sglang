@@ -38,6 +38,7 @@ def _make_unit_server_args():
         comfyui_mode=False,
         disable_autocast=False,
         enable_cfg_parallel=False,
+        enable_breakable_cuda_graph=False,
         enable_layerwise_nvtx_marker=False,
         enable_torch_compile=False,
         model_loaded={},

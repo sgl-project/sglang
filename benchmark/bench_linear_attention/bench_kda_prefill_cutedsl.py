@@ -29,18 +29,18 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "python")
 import torch
 import torch.nn.functional as F
 
-from sglang.srt.layers.attention.fla.kda import chunk_kda, fused_recurrent_kda
-from sglang.srt.layers.attention.linear.kernels.kda_blackwell import prepare_metadata
-from sglang.srt.layers.attention.linear.kernels.kda_blackwell.kernel_h import (
+from sglang.kernels.ops.attention.fla.kda import chunk_kda, fused_recurrent_kda
+from sglang.kernels.ops.attention.linear.kda_blackwell import prepare_metadata
+from sglang.kernels.ops.attention.linear.kda_blackwell.kernel_h import (
     kda_h_cutedsl,
 )
-from sglang.srt.layers.attention.linear.kernels.kda_blackwell.kernel_kkt_inv_uw import (
+from sglang.kernels.ops.attention.linear.kda_blackwell.kernel_kkt_inv_uw import (
     kkt_inv_uw_cutedsl,
 )
-from sglang.srt.layers.attention.linear.kernels.kda_blackwell.kernel_o import (
+from sglang.kernels.ops.attention.linear.kda_blackwell.kernel_o import (
     kda_o_cutedsl,
 )
-from sglang.srt.layers.attention.linear.kernels.kda_blackwell.prologue import (
+from sglang.kernels.ops.attention.linear.kda_blackwell.prologue import (
     kda_prologue,
 )
 

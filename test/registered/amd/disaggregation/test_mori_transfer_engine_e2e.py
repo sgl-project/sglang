@@ -39,7 +39,7 @@ class MoriTransferEngineBase(PDDisaggregationServerBase):
                 raise unittest.SkipTest("torch.cuda is not available.")
             if torch.cuda.device_count() < cls.required_gpus:
                 raise unittest.SkipTest(
-                    f"MORI PD smoke test requires >= {cls.required_gpus} visible GPUs."
+                    f"MORI PD check requires >= {cls.required_gpus} visible GPUs."
                 )
         except Exception as e:
             raise unittest.SkipTest(f"torch is not available/usable: {e}")

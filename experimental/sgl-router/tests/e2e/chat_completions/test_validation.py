@@ -7,7 +7,7 @@ The shape:
   - non-streaming + streaming chat completion
   - assistant message non-empty, role correct, finish_reason set
 
-These are the smoke tests that run first; if they pass, the heavier
+These quick checks run first; if they pass, the heavier
 multi-worker acceptance tests are worth running.
 """
 

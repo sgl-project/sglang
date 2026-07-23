@@ -18,7 +18,10 @@ from einops import rearrange
 from torch import Tensor
 
 from sglang.multimodal_gen.configs.models.dits.krea2 import Krea2DitConfig
-from sglang.multimodal_gen.runtime.distributed import get_tp_world_size
+from sglang.multimodal_gen.runtime.distributed import (
+    get_sp_world_size,
+    get_tp_world_size,
+)
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 from sglang.multimodal_gen.runtime.layers.attention.layer import build_varlen_mask_meta
 from sglang.multimodal_gen.runtime.layers.linear import (
@@ -67,7 +70,7 @@ def _fused_qknorm_rope_enabled() -> bool:
 
 
 def _can_use_fused_qknorm_rope(head_dim: int, dtype: torch.dtype) -> bool:
-    from sglang.jit_kernel.diffusion.qknorm_rope import (
+    from sglang.kernels.ops.diffusion.qknorm_rope import (
         can_use_fused_inplace_qknorm_rope,
     )
 
@@ -113,7 +116,7 @@ def norm_scale_shift(
     pass ``scale + 1``), kept off the checkpoint so the identity load is unaffected.
     """
     if x.is_cuda and x.shape[-1] % 256 == 0:
-        from sglang.jit_kernel.diffusion.cutedsl.scale_residual_norm_scale_shift import (
+        from sglang.kernels.ops.diffusion.cutedsl.scale_residual_norm_scale_shift import (
             fused_norm_scale_shift,
         )
 
@@ -269,6 +272,8 @@ class Attention(nn.Module):
         freqs: Tensor | None = None,
         key_mask: Tensor | None = None,
         mask_meta: dict | None = None,
+        num_replicated_prefix: int = 0,
+        skip_sequence_parallel: bool = False,
     ) -> Tensor:
         q, _ = self.to_q(qkv)
         k, _ = self.to_k(qkv)
@@ -287,7 +292,7 @@ class Attention(nn.Module):
             and _fused_qknorm_rope_enabled()
             and _can_use_fused_qknorm_rope(hd, q.dtype)
         ):
-            from sglang.jit_kernel.diffusion.qknorm_rope import (
+            from sglang.kernels.ops.diffusion.qknorm_rope import (
                 fused_inplace_qknorm_rope,
             )
 
@@ -311,7 +316,13 @@ class Attention(nn.Module):
                 rope_dim=hd,
             )
             out = self.attn(
-                q, k, v, attn_mask=key_mask, attn_mask_meta=mask_meta
+                q,
+                k,
+                v,
+                attn_mask=key_mask,
+                attn_mask_meta=mask_meta,
+                num_replicated_prefix=num_replicated_prefix,
+                skip_sequence_parallel_override=skip_sequence_parallel,
             ).flatten(2)
         else:
             q, k, v = (
@@ -330,6 +341,8 @@ class Attention(nn.Module):
                 v.transpose(1, 2).contiguous(),
                 attn_mask=key_mask,
                 attn_mask_meta=mask_meta,
+                num_replicated_prefix=num_replicated_prefix,
+                skip_sequence_parallel_override=skip_sequence_parallel,
             ).flatten(2)
         out, _ = self.to_out[0](out * F.sigmoid(gate))
         return out
@@ -371,7 +384,13 @@ class TextFusionBlock(nn.Module):
         key_mask: Tensor | None = None,
         mask_meta: dict | None = None,
     ) -> Tensor:
-        x = x + self.attn(self.norm1(x), key_mask=key_mask, mask_meta=mask_meta)
+        # Text-fusion runs on the full replicated text, so skip the SP all-to-all.
+        x = x + self.attn(
+            self.norm1(x),
+            key_mask=key_mask,
+            mask_meta=mask_meta,
+            skip_sequence_parallel=True,
+        )
         x = x + self.ff(self.norm2(x))
         return x
 
@@ -445,30 +464,40 @@ class SingleStreamBlock(nn.Module):
 
     def forward(
         self,
-        x: Tensor,
+        hidden_states: Tensor,
         vec: Tensor,
         freqs: Tensor,
         key_mask: Tensor | None = None,
         mask_meta: dict | None = None,
+        num_replicated_prefix: int = 0,
     ) -> Tensor:
         mod = vec + self.scale_shift_table.reshape(-1)
         prescale, preshift, pregate, postscale, postshift, postgate = mod.chunk(
             6, dim=-1
         )
-        x = x + pregate * self.attn(
+        hidden_states = hidden_states + pregate * self.attn(
             norm_scale_shift(
-                x, self.norm1.weight + 1, prescale, preshift, self.norm1.eps
+                hidden_states,
+                self.norm1.weight + 1,
+                prescale,
+                preshift,
+                self.norm1.eps,
             ),
             freqs,
             key_mask,
             mask_meta,
+            num_replicated_prefix=num_replicated_prefix,
         )
-        x = x + postgate * self.ff(
+        hidden_states = hidden_states + postgate * self.ff(
             norm_scale_shift(
-                x, self.norm2.weight + 1, postscale, postshift, self.norm2.eps
+                hidden_states,
+                self.norm2.weight + 1,
+                postscale,
+                postshift,
+                self.norm2.eps,
             )
         )
-        return x
+        return hidden_states
 
 
 # --------------------------------------------------------------------------- #
@@ -565,8 +594,18 @@ class Krea2Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         combined = torch.cat((context, img), dim=1)
         freqs = self.posemb(pos)
 
+        # Under SP the image tokens are sharded across ranks while the text prefix
+        # stays replicated; keep the leading txtlen tokens out of the all-to-all.
+        num_replicated_prefix = txtlen if get_sp_world_size() > 1 else 0
         for block in self.transformer_blocks:
-            combined = block(combined, tvec, freqs, joint_key, joint_meta)
+            combined = block(
+                combined,
+                tvec,
+                freqs,
+                joint_key,
+                joint_meta,
+                num_replicated_prefix=num_replicated_prefix,
+            )
 
         final = self.final_layer(combined, t)
         output = final[:, txtlen : txtlen + imglen, :]

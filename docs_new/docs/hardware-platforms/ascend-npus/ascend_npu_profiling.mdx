@@ -221,7 +221,7 @@ sending `/stop_profile`.
 
 <Note>
 `bench_serving --profile` creates a timestamp subdirectory inside
-`--profile-output-dir` (e.g. `<output_dir>/<timestamp>/`). The output path is
+`--profile-output-dir` (e.g., `<output_dir>/<timestamp>/`). The output path is
 shown in the server log as `Profiling done. Traces are saved to: <path>`.
 </Note>
 
@@ -259,6 +259,7 @@ python3 -m sglang.profiler \
   --num-steps 3 \
   --cpu --gpu &
 ```
+
 ```bash Command
 # Terminal 2: Wait for "Waiting for N steps" output from Terminal 1, then send requests.
 # The profiler starts recording once /start_profile is received by the server.
@@ -392,7 +393,7 @@ set of supported parameters:
     <tr>
       <td><code>profile_stages</code></td>
       <td>
-        Stages to profile, e.g. <code>["prefill", "decode"]</code>.
+        Stages to profile, e.g., <code>["prefill", "decode"]</code>.
         Requires <code>profile_by_stage</code>
       </td>
       <td>None</td>
@@ -407,15 +408,18 @@ them via:
 
 - **When profiling starts**: server log outputs
   `Profiling starts. Traces will be saved to: <path> (with profile id: <id>)`
-```
+
+```text
 [2026-05-19 13:23:15] Profiling starts. Traces will be saved to: /tmp/1779196995.6948605 (with profile id: 1779196995.6979997)
 [2026-05-19 13:23:15] [WARNING] [350443] profiler.py: Invalid parameter export_type: None, reset it to text.
 [2026-05-19 13:23:15] [WARNING] [350443] profiler.py: Invalid parameter export_type: None, reset it to text.
 [2026-05-19 13:23:15] INFO:     127.0.0.1:40714 - "POST /start_profile HTTP/1.1" 200 OK
 ```
+
 - **When profiling stops**: server log outputs
   `Profiling done. Traces are saved to: <path>`
-```
+
+```text
 [2026-05-19 13:23:17] Stop profiling...
 [2026-05-19 13:23:17] [WARNING] [350443] profiler.py: Incorrect schedule: Stop profiler while current state is RECORD which may result in incomplete parsed data.
 [rank0]:[W519 13:23:17.084812760 compiler_depend.ts:3136] Warning: The indexFromRank 0is not equal indexFromCurDevice 4 , which might be normal if the number of devices on your collective communication server is inconsistent.Otherwise, you need to check if the current device is correct when calling the interface.If it's incorrect, it might have introduced an error. (function operator())
@@ -424,8 +428,10 @@ them via:
 [2026-05-19 13:23:32] [INFO] [352725] profiler.py: All profiling data parsed in a total time of 0:00:14.305669
 [2026-05-19 13:23:32] Profiling done. Traces are saved to: /tmp/1779196995.6948605
 ```
+
 - **CLI output**: `sglang.profiler` outputs `Dump profiling traces to <path>`
-```
+
+```text
 Dump profiling traces to /tmp/1779243331.3219
 Waiting for 10 steps and the trace to be flushed.... (profile_by_stage=False)
 ```

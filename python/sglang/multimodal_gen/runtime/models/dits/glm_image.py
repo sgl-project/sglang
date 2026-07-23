@@ -201,10 +201,10 @@ class GlmImageCombinedTimestepSizeEmbeddings(nn.Module):
     ) -> torch.Tensor:
         timesteps_proj = self.time_proj(timestep)
 
-        crop_coords_proj = self.condition_proj(crop_coords.flatten()).view(
+        crop_coords_proj = self.condition_proj(crop_coords.flatten()).reshape(
             crop_coords.size(0), -1
         )
-        target_size_proj = self.condition_proj(target_size.flatten()).view(
+        target_size_proj = self.condition_proj(target_size.flatten()).reshape(
             target_size.size(0), -1
         )
 
@@ -901,17 +901,56 @@ class GlmImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             ]
         ] = None,
         ###
-        guidance: torch.Tensor = None,  # TODO: this should probably be removed
+        guidance: torch.Tensor = None,
     ) -> Tuple[torch.Tensor]:
         if kv_caches is not None:
             kv_caches.set_mode(kv_caches_mode)
 
         batch_size, num_channels, height, width = hidden_states.shape
 
-        timestep -= 1.0
-
         if isinstance(encoder_hidden_states, list):
             encoder_hidden_states = encoder_hidden_states[0]
+
+        if current_platform.is_npu() and batch_size > 1 and kv_caches is None:
+
+            def slice_batch(value, index):
+                if (
+                    isinstance(value, torch.Tensor)
+                    and value.dim() > 0
+                    and value.shape[0] == batch_size
+                ):
+                    return value[index : index + 1]
+                return value
+
+            outputs = []
+            for index in range(batch_size):
+                sample_encoder_hidden_states = encoder_hidden_states[index : index + 1]
+                sample_attention_mask = slice_batch(attention_mask, index)
+                if isinstance(sample_attention_mask, torch.Tensor):
+                    valid_text_length = int(sample_attention_mask.sum().item())
+                    sample_encoder_hidden_states = sample_encoder_hidden_states[
+                        :, :valid_text_length
+                    ]
+                    sample_attention_mask = None
+
+                outputs.append(
+                    self.forward(
+                        hidden_states=hidden_states[index : index + 1],
+                        encoder_hidden_states=sample_encoder_hidden_states,
+                        prior_token_id=prior_token_id[index : index + 1],
+                        prior_token_drop=prior_token_drop[index : index + 1],
+                        timestep=slice_batch(timestep, index),
+                        target_size=slice_batch(target_size, index),
+                        crop_coords=slice_batch(crop_coords, index),
+                        attention_kwargs=attention_kwargs,
+                        attention_mask=sample_attention_mask,
+                        freqs_cis=freqs_cis,
+                        guidance=slice_batch(guidance, index),
+                    )
+                )
+            return torch.cat(outputs, dim=0)
+
+        timestep = timestep - 1.0
 
         # 1. RoPE
         image_rotary_emb = freqs_cis
@@ -925,7 +964,7 @@ class GlmImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         hidden_states = self.image_projector(hidden_states)
         encoder_hidden_states = self.glyph_projector(encoder_hidden_states)
         prior_embedding = self.prior_token_embedding(prior_token_id)
-        prior_embedding[prior_token_drop] *= 0.0
+        prior_embedding = prior_embedding.masked_fill(prior_token_drop.unsqueeze(-1), 0)
         prior_hidden_states = self.prior_projector(prior_embedding)
         # SP: when latents are H-sharded, hidden_states has fewer patches than prior_hidden_states.
         # Shard prior_hidden_states along seq dim to match (prior is row-major, same as latent patches).

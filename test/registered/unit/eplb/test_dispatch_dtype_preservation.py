@@ -12,7 +12,6 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 import unittest
-from unittest.mock import patch
 
 import torch
 
@@ -58,28 +57,25 @@ def _make_permuted_info():
 class TestStaticDispatchDtype(CustomTestCase):
     """Tests for _topk_ids_logical_to_physical_static dtype preservation."""
 
-    def test_preserves_int32_dtype_on_hip(self):
+    def test_preserves_int32_dtype(self):
         """int32 input must produce int32 output when dispatch map is int64."""
         info = _make_identity_info()
         topk_ids = torch.tensor([5, 103, 206], dtype=torch.int32)
-        with patch("sglang.srt.eplb.expert_location_dispatch._is_hip", True):
-            result = _topk_ids_logical_to_physical_static(topk_ids, info)
+        result = _topk_ids_logical_to_physical_static(topk_ids, info)
         self.assertEqual(result.dtype, torch.int32)
 
     def test_preserves_int64_dtype(self):
         """int64 input with int64 map should stay int64."""
         info = _make_identity_info()
         topk_ids = torch.tensor([5, 103, 206], dtype=torch.int64)
-        with patch("sglang.srt.eplb.expert_location_dispatch._is_hip", True):
-            result = _topk_ids_logical_to_physical_static(topk_ids, info)
+        result = _topk_ids_logical_to_physical_static(topk_ids, info)
         self.assertEqual(result.dtype, torch.int64)
 
     def test_values_correct_after_cast(self):
         """Remapped values are correct, not corrupted by the dtype cast."""
         info = _make_permuted_info()
         topk_ids = torch.tensor([0, 1, 2, 127, 255], dtype=torch.int32)
-        with patch("sglang.srt.eplb.expert_location_dispatch._is_hip", True):
-            result = _topk_ids_logical_to_physical_static(topk_ids, info)
+        result = _topk_ids_logical_to_physical_static(topk_ids, info)
         expected = info.partial_logical_to_rank_dispatch_physical_map[topk_ids.long()]
         self.assertTrue(torch.equal(result, expected.to(torch.int32)))
 
@@ -87,8 +83,7 @@ class TestStaticDispatchDtype(CustomTestCase):
         """2-D input shape is preserved through the remap."""
         info = _make_identity_info()
         topk_ids = torch.randint(0, NUM_LOGICAL, (32, 8), dtype=torch.int32)
-        with patch("sglang.srt.eplb.expert_location_dispatch._is_hip", True):
-            result = _topk_ids_logical_to_physical_static(topk_ids, info)
+        result = _topk_ids_logical_to_physical_static(topk_ids, info)
         self.assertEqual(result.shape, (32, 8))
         self.assertEqual(result.dtype, torch.int32)
 
@@ -96,13 +91,12 @@ class TestStaticDispatchDtype(CustomTestCase):
 class TestDynamicDispatchDtype(CustomTestCase):
     """Tests for _topk_ids_logical_to_physical_dynamic dtype preservation."""
 
-    def test_preserves_int32_dtype_on_hip(self):
+    def test_preserves_int32_dtype(self):
         """int32 input must produce int32 output when dispatch map is int64."""
         info = _make_permuted_info()
         info.ep_dispatch_algorithm = "dynamic"
         topk_ids = torch.tensor([5, 103, 206], dtype=torch.int32)
-        with patch("sglang.srt.eplb.expert_location_dispatch._is_hip", True):
-            result = _topk_ids_logical_to_physical_dynamic(topk_ids, info)
+        result = _topk_ids_logical_to_physical_dynamic(topk_ids, info)
         self.assertEqual(result.dtype, torch.int32)
 
     def test_preserves_int64_dtype(self):
@@ -110,8 +104,7 @@ class TestDynamicDispatchDtype(CustomTestCase):
         info = _make_permuted_info()
         info.ep_dispatch_algorithm = "dynamic"
         topk_ids = torch.tensor([5, 103, 206], dtype=torch.int64)
-        with patch("sglang.srt.eplb.expert_location_dispatch._is_hip", True):
-            result = _topk_ids_logical_to_physical_dynamic(topk_ids, info)
+        result = _topk_ids_logical_to_physical_dynamic(topk_ids, info)
         self.assertEqual(result.dtype, torch.int64)
 
     def test_values_correct_single_candidate(self):
@@ -119,8 +112,7 @@ class TestDynamicDispatchDtype(CustomTestCase):
         info = _make_permuted_info()
         info.ep_dispatch_algorithm = "dynamic"
         topk_ids = torch.tensor([0, 1, 2, 127, 255], dtype=torch.int32)
-        with patch("sglang.srt.eplb.expert_location_dispatch._is_hip", True):
-            result = _topk_ids_logical_to_physical_dynamic(topk_ids, info)
+        result = _topk_ids_logical_to_physical_dynamic(topk_ids, info)
         expected = info.partial_logical_to_all_physical_map[topk_ids.long(), 0]
         self.assertTrue(torch.equal(result, expected.to(torch.int32)))
 
@@ -129,8 +121,7 @@ class TestDynamicDispatchDtype(CustomTestCase):
         info = _make_permuted_info()
         info.ep_dispatch_algorithm = "dynamic"
         topk_ids = torch.randint(0, NUM_LOGICAL, (32, 8), dtype=torch.int32)
-        with patch("sglang.srt.eplb.expert_location_dispatch._is_hip", True):
-            result = _topk_ids_logical_to_physical_dynamic(topk_ids, info)
+        result = _topk_ids_logical_to_physical_dynamic(topk_ids, info)
         self.assertEqual(result.shape, (32, 8))
         self.assertEqual(result.dtype, torch.int32)
 
@@ -141,8 +132,7 @@ class TestDynamicDispatchDtype(CustomTestCase):
         info = _make_permuted_info()
         info.ep_dispatch_algorithm = "dynamic"
         topk_ids = torch.randint(0, NUM_LOGICAL, (64, 8), dtype=torch.int32)
-        with patch("sglang.srt.eplb.expert_location_dispatch._is_hip", True):
-            result = _topk_ids_logical_to_physical_dynamic(topk_ids, info)
+        result = _topk_ids_logical_to_physical_dynamic(topk_ids, info)
         self.assertEqual(
             result.dtype,
             torch.int32,
