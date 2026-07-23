@@ -965,9 +965,6 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
         ):
             e4m3_max = 256.0
 
-        # A plain float would make flashinfer materialize the scale through a
-        # pageable host-to-device copy, which is illegal during CUDA graph
-        # capture; torch.full writes it device-side.
         global_scale_inv = torch.full(
             (1,),
             1.0 / (e4m3_max * 6.0),
