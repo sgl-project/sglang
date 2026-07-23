@@ -1,75 +1,85 @@
 use super::{
-    ChoiceTracker, DEFAULT_GRPC_MAX_MESSAGE_SIZE, GenerationOffsets, TypedTerminal,
+    ChoiceTracker, DEFAULT_GRPC_MAX_MESSAGE_SIZE, TypedTerminal, expected_generation_choices,
     openai_status_code, resolve_max_message_size, terminal_error_status, typed_generation_chunk,
 };
-use crate::bridge::{ResponseData, TerminalError};
+use crate::bridge::{ResponseData, ResponseMetadata, TerminalError};
+use prost::Message;
 use tonic::Code;
+
+#[derive(Clone, PartialEq, Message)]
+struct LegacySamplingParams {
+    #[prost(string, optional, tag = "14")]
+    json_schema: Option<String>,
+    #[prost(string, optional, tag = "15")]
+    regex: Option<String>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct LegacyGenerateResponse {
+    #[prost(int32, repeated, tag = "1")]
+    output_ids: Vec<i32>,
+    #[prost(map = "string, string", tag = "2")]
+    meta_info: std::collections::HashMap<String, String>,
+    #[prost(bool, tag = "3")]
+    finished: bool,
+}
+
+#[test]
+#[allow(deprecated)]
+fn legacy_generation_wire_fields_remain_compatible() {
+    let legacy_sampling = LegacySamplingParams {
+        json_schema: Some("{\"type\":\"string\"}".into()),
+        regex: Some("[a-z]+".into()),
+    };
+    let decoded_sampling =
+        crate::proto::SamplingParams::decode(legacy_sampling.encode_to_vec().as_slice()).unwrap();
+    assert_eq!(decoded_sampling.json_schema, legacy_sampling.json_schema);
+    assert_eq!(decoded_sampling.regex, legacy_sampling.regex);
+
+    let legacy_response = LegacyGenerateResponse {
+        output_ids: vec![1, 2, 3],
+        meta_info: [("finish_reason".into(), "\"stop\"".into())]
+            .into_iter()
+            .collect(),
+        finished: true,
+    };
+    let decoded_response =
+        crate::proto::GenerateResponse::decode(legacy_response.encode_to_vec().as_slice()).unwrap();
+    assert_eq!(decoded_response.output_ids, legacy_response.output_ids);
+    assert_eq!(decoded_response.meta_info, legacy_response.meta_info);
+    assert!(decoded_response.finished);
+}
 
 #[test]
 fn openai_status_code_uses_forwarded_status_when_present() {
-    let meta_info = serde_json::from_value(serde_json::json!({"status_code": 429})).unwrap();
+    let meta_info = [("status_code".to_string(), "429".to_string())]
+        .into_iter()
+        .collect();
     assert_eq!(openai_status_code(&meta_info, 200), 429);
 }
 
 #[test]
 fn openai_status_code_falls_back_when_missing_or_invalid() {
-    assert_eq!(openai_status_code(&serde_json::Map::new(), 200), 200);
+    assert_eq!(
+        openai_status_code(&std::collections::HashMap::new(), 200),
+        200
+    );
 
-    let meta_info =
-        serde_json::from_value(serde_json::json!({"status_code": "not-an-int"})).unwrap();
+    let meta_info = [("status_code".into(), "not-an-int".into())]
+        .into_iter()
+        .collect();
     assert_eq!(openai_status_code(&meta_info, 200), 200);
 }
 
-fn response_data(
-    output_ids: Vec<i32>,
-    text: &str,
-    incremental: bool,
-    meta_info: serde_json::Value,
-) -> ResponseData {
+fn response_data(output_ids: Vec<i32>, text: &str, meta_info: serde_json::Value) -> ResponseData {
     ResponseData {
         text: Some(text.to_string()),
         output_ids: Some(output_ids),
         embedding: None,
         choice_index: 1,
-        incremental,
         json_bytes: None,
-        meta_info: serde_json::from_value(meta_info).unwrap(),
+        meta_info: ResponseMetadata::Typed(serde_json::from_value(meta_info).unwrap()),
     }
-}
-
-#[test]
-fn cumulative_and_incremental_token_chunks_are_normalized_to_deltas() {
-    let mut cumulative = GenerationOffsets::default();
-    let first = typed_generation_chunk(
-        response_data(vec![1, 2], "hé", false, serde_json::json!({})),
-        false,
-        &mut cumulative,
-    )
-    .unwrap();
-    let second = typed_generation_chunk(
-        response_data(vec![1, 2, 3], "héllo", false, serde_json::json!({})),
-        false,
-        &mut cumulative,
-    )
-    .unwrap();
-    assert_eq!(first.delta_output_ids, vec![1, 2]);
-    assert_eq!(second.delta_output_ids, vec![3]);
-
-    let mut incremental = GenerationOffsets::default();
-    let first = typed_generation_chunk(
-        response_data(vec![1], "hé", true, serde_json::json!({})),
-        false,
-        &mut incremental,
-    )
-    .unwrap();
-    let second = typed_generation_chunk(
-        response_data(vec![2], "llo", true, serde_json::json!({})),
-        false,
-        &mut incremental,
-    )
-    .unwrap();
-    assert_eq!(first.delta_output_ids, vec![1]);
-    assert_eq!(second.delta_output_ids, vec![2]);
 }
 
 #[test]
@@ -102,59 +112,31 @@ fn choice_tracker_requires_one_terminal_per_choice() {
 }
 
 #[test]
-fn logprobs_are_delta_aligned_and_prompt_logprobs_emit_once() {
-    let mut offsets = GenerationOffsets::default();
+fn typed_logprobs_are_aligned_with_delta_tokens() {
     let metadata = serde_json::json!({
         "input_token_logprobs": [[-0.1, 10, "prompt"]],
         "input_top_logprobs": [[[-0.1, 10, "prompt"]]],
         "output_token_logprobs": [[-0.2, 20, "a"]],
         "output_top_logprobs": [[[-0.2, 20, "a"], [-1.2, 21, "b"]]]
     });
-    let first = typed_generation_chunk(
-        response_data(vec![20], "a", false, metadata),
-        false,
-        &mut offsets,
-    )
-    .unwrap();
+    let first = typed_generation_chunk(response_data(vec![20], "a", metadata), false).unwrap();
     let logprobs = first.logprobs.unwrap();
     assert_eq!(logprobs.prompt.len(), 1);
     assert_eq!(logprobs.output.len(), first.delta_output_ids.len());
     assert_eq!(logprobs.output[0].top_logprobs.len(), 2);
-
-    let second = typed_generation_chunk(
-        response_data(
-            vec![20, 22],
-            "ac",
-            false,
-            serde_json::json!({
-                "input_token_logprobs": [[-0.1, 10, "prompt"]],
-                "output_token_logprobs": [[-0.2, 20, "a"], [-0.3, 22, "c"]]
-            }),
-        ),
-        false,
-        &mut offsets,
-    )
-    .unwrap();
-    let logprobs = second.logprobs.unwrap();
-    assert!(logprobs.prompt.is_empty());
-    assert_eq!(logprobs.output.len(), second.delta_output_ids.len());
-    assert_eq!(logprobs.output[0].token_id, 22);
 }
 
 #[test]
 fn prompt_logprobs_do_not_require_output_logprobs() {
-    let mut offsets = GenerationOffsets::default();
     let chunk = typed_generation_chunk(
         response_data(
             vec![],
             "",
-            false,
             serde_json::json!({
                 "input_token_logprobs": [[-0.1, 10, "prompt"]]
             }),
         ),
         true,
-        &mut offsets,
     )
     .unwrap();
     let logprobs = chunk.logprobs.expect("prompt logprobs");
@@ -163,36 +145,18 @@ fn prompt_logprobs_do_not_require_output_logprobs() {
 }
 
 #[test]
-fn malformed_logprobs_and_routed_experts_are_rejected() {
-    let mut offsets = GenerationOffsets::default();
+fn malformed_logprobs_are_rejected() {
     let error = typed_generation_chunk(
         response_data(
             vec![1],
             "a",
-            false,
             serde_json::json!({"output_token_logprobs": "invalid"}),
         ),
         false,
-        &mut offsets,
     )
     .err()
     .expect("malformed output logprobs should fail");
     assert!(error.contains("non-array output logprobs"));
-
-    let mut offsets = GenerationOffsets::default();
-    let error = typed_generation_chunk(
-        response_data(
-            vec![1],
-            "a",
-            false,
-            serde_json::json!({"routed_experts": [1, "invalid"]}),
-        ),
-        false,
-        &mut offsets,
-    )
-    .err()
-    .expect("malformed routed experts should fail");
-    assert!(error.contains("non-i32"));
 }
 
 #[test]
@@ -201,18 +165,15 @@ fn finish_reasons_preserve_string_and_token_stops() {
         (serde_json::json!("END"), Some("END"), None),
         (serde_json::json!(42), None, Some(42)),
     ] {
-        let mut offsets = GenerationOffsets::default();
         let chunk = typed_generation_chunk(
             response_data(
                 vec![],
                 "",
-                false,
                 serde_json::json!({
                     "finish_reason": {"type": "stop", "matched": matched}
                 }),
             ),
             true,
-            &mut offsets,
         )
         .unwrap();
         let TypedTerminal::Finish(finish) = chunk.terminal.unwrap() else {
@@ -232,13 +193,12 @@ fn finish_reasons_preserve_string_and_token_stops() {
 
 #[test]
 fn terminal_metadata_is_typed_and_not_duplicated_in_extensions() {
-    let mut offsets = GenerationOffsets::default();
     let chunk = typed_generation_chunk(
         response_data(
             vec![7],
             "done",
-            false,
             serde_json::json!({
+                "id": "internal-child-rid",
                 "finish_reason": {"type": "stop", "matched": "END"},
                 "prompt_tokens": 8,
                 "completion_tokens": 1,
@@ -247,7 +207,6 @@ fn terminal_metadata_is_typed_and_not_duplicated_in_extensions() {
             }),
         ),
         true,
-        &mut offsets,
     )
     .unwrap();
     let usage = chunk.usage.unwrap();
@@ -257,24 +216,68 @@ fn terminal_metadata_is_typed_and_not_duplicated_in_extensions() {
     assert!(matches!(chunk.terminal, Some(TypedTerminal::Finish(_))));
     let fields = chunk.engine_metadata.unwrap().fields;
     assert!(fields.contains_key("weight_version"));
+    assert!(!fields.contains_key("id"));
     assert!(!fields.contains_key("finish_reason"));
     assert!(!fields.contains_key("prompt_tokens"));
 }
 
 #[test]
+fn typed_response_uses_the_rust_owned_public_request_id() {
+    let chunk = typed_generation_chunk(
+        response_data(
+            vec![7],
+            "done",
+            serde_json::json!({
+                "id": "internal-child-rid",
+                "finish_reason": {"type": "stop"}
+            }),
+        ),
+        true,
+    )
+    .unwrap();
+    assert!(chunk.usage.is_none());
+    let response = chunk.into_response("public-parent-rid".into());
+
+    assert_eq!(response.request_id, "public-parent-rid");
+    assert!(
+        !response
+            .engine_metadata
+            .is_some_and(|metadata| metadata.fields.contains_key("id"))
+    );
+}
+
+#[test]
+fn typed_generation_rejects_invalid_or_unbounded_choice_counts() {
+    let request_with_n = |n| crate::proto::GenerateRequest {
+        sampling_params: Some(crate::proto::SamplingParams {
+            n: Some(n),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    assert_eq!(expected_generation_choices(&request_with_n(1)).unwrap(), 1);
+    assert_eq!(
+        expected_generation_choices(&request_with_n(1024)).unwrap(),
+        1024
+    );
+    for invalid in [0, -1, 1025, i32::MAX] {
+        let error = expected_generation_choices(&request_with_n(invalid)).unwrap_err();
+        assert_eq!(error.code(), Code::InvalidArgument);
+    }
+}
+
+#[test]
 fn aborts_become_typed_generation_errors() {
-    let mut offsets = GenerationOffsets::default();
     let chunk = typed_generation_chunk(
         response_data(
             vec![],
             "",
-            false,
             serde_json::json!({
                 "finish_reason": {"type": "abort", "message": "bad request", "status_code": 400}
             }),
         ),
         true,
-        &mut offsets,
     )
     .unwrap();
     match chunk.terminal.unwrap() {

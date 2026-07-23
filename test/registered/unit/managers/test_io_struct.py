@@ -263,6 +263,30 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         # Modalities should be set for all 3 examples
         self.assertEqual(req.modalities, ["image", "image", "image"])
 
+    def test_parallel_sampling_keeps_one_logical_rid_per_prompt(self):
+        single = GenerateReqInput(
+            text="Hello",
+            rid="single",
+            sampling_params={"n": 3},
+        )
+        single.normalize_batch_and_arguments()
+
+        self.assertEqual(single.rid, ["single"])
+        self.assertEqual([single[i].rid for i in range(3)], ["single"] * 3)
+
+        batch = GenerateReqInput(
+            text=["Hello", "World"],
+            rid="batch",
+            sampling_params={"n": 2},
+        )
+        batch.normalize_batch_and_arguments()
+
+        self.assertEqual(batch.rid, ["batch_0", "batch_1"])
+        self.assertEqual(
+            [batch[i].rid for i in range(4)],
+            ["batch_0", "batch_1", "batch_0", "batch_1"],
+        )
+
     def test_audio_data_handling(self):
         """Test handling of audio_data."""
         req = copy.deepcopy(self.base_req)
