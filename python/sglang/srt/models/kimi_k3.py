@@ -118,37 +118,6 @@ def _cdiv(a: int, b: int) -> int:
     return (a + b - 1) // b
 
 
-# Latent MoE TP reduction strategy for the UNFUSED-front path only (the
-# fused front always lands both partial sums in one symmetric
-# [latent | shared] buffer and all-reduces once; see _forward_fused):
-#   "baseline" - two separate all-reduces (routed latent, then shared)
-#   "concat"   - accepted for compat, behaves as "baseline" here (the
-#                single-collective tail now rides the fused front)
-# ("fi_fused" — the flashinfer fused allreduce+rmsnorm — was removed; it lost
-# every A/B and the K3 fused AR covers its niche.)
-# A/B history, pre-zero-copy concat path, 8xB300 bs=1 decode (2026-07-03):
-# baseline 35.2 tok/s beat concat 33.2 (21.5KB message falls off the
-# one-shot allreduce path into two-shot) and fi_fused 33.0. On MULTI-NODE
-# TP the trade flipped: one 21.5KB NCCL collective beat a 7KB + 14KB pair
-# (2x4 GB300 MNNVL bs=1: 22.05 -> 21.36 ms ITL). Re-benchmark now that the
-# fused-front buffer is written with zero copies.
-_K3_MOE_REDUCE_MODE = envs.SGLANG_K3_MOE_REDUCE_MODE.get()
-
-
-def _resolve_moe_reduce_mode() -> str:
-    if _K3_MOE_REDUCE_MODE is not None:
-        return _K3_MOE_REDUCE_MODE
-    try:
-        from sglang.srt.distributed import get_tp_group
-        from sglang.srt.distributed.parallel_state import in_the_same_node_as
-
-        if not all(in_the_same_node_as(get_tp_group().cpu_group, source_rank=0)):
-            return "concat"
-    except Exception:
-        pass
-    return "baseline"
-
-
 # Horizontal fusion of same-input GEMMs (decode is launch/BW bound):
 #   moe_front: shared gate_up + router gate + latent down_proj -> one GEMM
 #   kda_bfa:   KDA b_proj + f_a_proj -> one GEMV
@@ -384,7 +353,6 @@ class KimiK3MoE(nn.Module):
 
         # Latent MoE
         self.use_latent_moe = config.routed_expert_hidden_size is not None
-        self.moe_reduce_mode = _resolve_moe_reduce_mode()
         # Merged front weight ([H, gate_up + E + latent]), built after weight
         # loading by _merge_front_weights().
         self._front_w: Optional[torch.Tensor] = None
