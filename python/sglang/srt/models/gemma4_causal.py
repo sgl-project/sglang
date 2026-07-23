@@ -178,9 +178,16 @@ class Gemma4Router(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Returns raw router logits [T, E]."""
-        if not self._scale_fused:
-            self.fuse_scale()
-        x = self.norm(x)
+        if x.device.type == "cpu":
+            # CPU Gemma4RMSNorm ignores norm.weight when with_scale=False,
+            # so apply the router scale explicitly to preserve the
+            # Gemma 4 routing semantics.
+            x = self.norm(x)
+            x = x * self.scale * self.root_size
+        else:
+            if not self._scale_fused:
+                self.fuse_scale()
+            x = self.norm(x)
         router_logits, _ = self.proj(x)
         return router_logits
 
