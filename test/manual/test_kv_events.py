@@ -116,7 +116,9 @@ class TestKvEvents(CustomTestCase):
                     # Validate BlockStored structure
                     self.assertIsInstance(event.block_hashes, list)
                     self.assertGreater(
-                        len(event.block_hashes), 0, "Should have at least one block hash"
+                        len(event.block_hashes),
+                        0,
+                        "Should have at least one block hash",
                     )
                     self.assertIsInstance(event.token_ids, list)
                     self.assertEqual(
