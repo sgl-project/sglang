@@ -42,6 +42,7 @@ from sglang.srt.utils import (
     is_hip,
     is_musa,
     is_npu,
+    is_npu_a5,
     is_xpu,
 )
 
@@ -50,6 +51,7 @@ _is_flashinfer_available = is_flashinfer_available()
 _is_hip = is_hip()
 _is_musa = is_musa()
 _is_npu = is_npu()
+_is_npu_a5 = is_npu_a5()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
@@ -999,7 +1001,11 @@ class GemmaRMSNorm(MultiPlatformOp):
                 x, self.weight, residual, self.variance_epsilon
             )
             return norm_out, residual
-
+        if _is_npu_a5:
+            # GemmaRmsNorm has not been supported on A5 yet (https://gitcode.com/cann/ops-nn/tree/d01e449f32c184c5c340d8a73a74fd7d82d49b04/norm/gemma_rms_norm).
+            # Use generic RMS Norm with weight + 1.0 to simulate (1 + g_i) behavior.
+            x, _ = torch_npu.npu_rms_norm(x, self.weight + 1.0, self.variance_epsilon)
+            return x
         x, _ = torch_npu.npu_gemma_rms_norm(x, self.weight, self.variance_epsilon)
         return x
 

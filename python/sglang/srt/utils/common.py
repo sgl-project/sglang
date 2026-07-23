@@ -185,6 +185,19 @@ def is_npu() -> bool:
     return True
 
 
+_A5_SOC_VERSION = 260
+@lru_cache(maxsize=1)
+def is_npu_a5() -> bool:
+    """
+    Check whether the current NPU is an Ascend A5 (Ascend 950) architecture.
+
+    The SoC version enum value for the A5 architecture is defined as 260 in
+    the CANN/C++ layer of torch_npu. This value covers all Ascend 950 series
+    variants including 950PR and 950DT.
+    """
+    return is_npu() and torch.npu.get_soc_version() == _A5_SOC_VERSION
+
+
 @lru_cache(maxsize=1)
 def is_host_cpu_x86() -> bool:
     machine = platform.machine().lower()
