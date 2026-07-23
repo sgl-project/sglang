@@ -203,6 +203,7 @@ class TestVideoDecoderWrapper(CustomTestCase):
 
     def test_get_frames_as_tensor_uses_backend_conversion(self):
         torchcodec_data = MagicMock()
+        torchcodec_data.device.type = "cpu"
         torchcodec_pinned = object()
         torchcodec_data.pin_memory.return_value = torchcodec_pinned
         torchcodec_decoder = MagicMock()
@@ -225,6 +226,7 @@ class TestVideoDecoderWrapper(CustomTestCase):
         decord_decoder.get_batch.return_value = decord_batch
         decord_wrapper = make_wrapper(decord_decoder)
         converted = MagicMock()
+        converted.device.type = "cpu"
         decord_pinned = object()
         converted.pin_memory.return_value = decord_pinned
         fake_torch = types.ModuleType("torch")
