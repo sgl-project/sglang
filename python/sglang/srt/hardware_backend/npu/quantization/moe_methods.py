@@ -428,14 +428,15 @@ class NPUW4A8Int8MoEMethod(_NPUMoEMethodBase):
                     layer,
                     f"{weight_prefix}_scale_bias",
                     torch.nn.Parameter(
-                        bias.data.transpose(1, 2).sum(dim=1).contiguous(),
+                        bias.data.contiguous(),
                         requires_grad=False,
                     ),
                 )
 
         # Process weight
         weight = getattr(layer, f"{weight_prefix}_weight")
-        weight.data = npu_format_cast(weight.data.transpose(1, 2))
+        weight.data = weight.data.transpose(1, 2).contiguous()
+        weight.data = npu_format_cast(weight.data)
         weight.data = self._pack_to_int32(weight.data)
 
         # Set dispatcher output dtype
@@ -491,7 +492,7 @@ class NPUW4A8Int8MoEMethod(_NPUMoEMethodBase):
             f"Last dimension of weight must be divisible by 4 for int8→int32 packing, "
             f"got shape {weight.shape}"
         )
-        return weight.contiguous().view(torch.int32)
+        return weight.view(torch.int32).contiguous()
 
     def apply(
         self,
