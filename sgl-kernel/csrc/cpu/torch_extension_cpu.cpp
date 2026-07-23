@@ -440,6 +440,12 @@ void shm_allreduce(at::Tensor& data, int64_t op);
 // shared memory all_gather
 at::Tensor shm_allgather(at::Tensor& data, int64_t dim);
 
+// shared memory all_gather_into_tensor
+void shm_allgather_into_tensor(at::Tensor& output_tensor, at::Tensor& data);
+
+// shared memory reduce_scatter_tensor
+void shm_reduce_scatter_tensor(at::Tensor& output_tensor, at::Tensor& data, int64_t op);
+
 // rope
 std::tuple<at::Tensor, at::Tensor> rotary_embedding_cpu(
     at::Tensor& positions,
@@ -501,6 +507,10 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> fused_qkvzba_split_re
     int64_t num_heads_v,
     int64_t head_qk,
     int64_t head_v);
+
+// fused_input_proj_cpu
+std::tuple<at::Tensor, at::Tensor>
+fused_input_proj_cpu(at::Tensor& hidden_states, at::Tensor& qkvz_weight, at::Tensor& ba_weight, bool is_vnni);
 
 // image preprocessor
 std::tuple<at::Tensor, at::Tensor> image_preprocess_cpu(
@@ -806,6 +816,10 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("shm_allreduce", torch::kCPU, &shm_allreduce);
   m.def("shm_allgather(Tensor data, int dim) -> Tensor");
   m.impl("shm_allgather", torch::kCPU, &shm_allgather);
+  m.def("shm_allgather_into_tensor(Tensor(a!) output_tensor, Tensor data) -> ()");
+  m.impl("shm_allgather_into_tensor", torch::kCPU, &shm_allgather_into_tensor);
+  m.def("shm_reduce_scatter_tensor(Tensor(a!) output_tensor, Tensor data, int reduce_op) -> ()");
+  m.impl("shm_reduce_scatter_tensor", torch::kCPU, &shm_reduce_scatter_tensor);
 
   // rope
   m.def(
@@ -844,6 +858,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "num_heads_v, int "
       "head_qk, int head_v) -> (Tensor, Tensor, Tensor, Tensor)");
   m.impl("fused_qkvzba_split_reshape_cat_contiguous_cpu", torch::kCPU, &fused_qkvzba_split_reshape_cat_contiguous_cpu);
+  // fused_input_proj_cpu
+  m.def(
+      "fused_input_proj_cpu(Tensor hidden_states, Tensor qkvz_weight, Tensor ba_weight, bool is_vnni) -> (Tensor, "
+      "Tensor)");
+  m.impl("fused_input_proj_cpu", torch::kCPU, &fused_input_proj_cpu);
 
   // image preprocessor
   m.def(

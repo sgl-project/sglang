@@ -4,12 +4,8 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.jit_kernel.utils import is_arch_support_pdl
-from sglang.srt.layers.dcp import (
-    dcp_enabled,
-    get_attention_dcp_rank,
-    get_attention_dcp_world_size,
-)
+from sglang.kernels.jit.utils import is_arch_support_pdl
+from sglang.srt.runtime_context import get_parallel
 
 
 @triton.jit
@@ -120,10 +116,10 @@ def set_mla_kv_buffer_triton(
     Name retained for caller compatibility; the implementation is no longer
     Triton-only.
     """
-    from sglang.jit_kernel.set_mla_kv_buffer import (
+    from sglang.kernels.ops.kvcache._jit_set_mla_kv_buffer import (
         can_use_set_mla_kv_buffer,
     )
-    from sglang.jit_kernel.set_mla_kv_buffer import (
+    from sglang.kernels.ops.kvcache._jit_set_mla_kv_buffer import (
         set_mla_kv_buffer as jit_set_mla_kv_buffer,
     )
 
@@ -134,7 +130,7 @@ def set_mla_kv_buffer_triton(
         n_loc >= _TMA_BULK_STORE_MIN_LOCS
         and is_arch_support_pdl()
         and can_use_set_mla_kv_buffer(nope_bytes, rope_bytes)
-        and not dcp_enabled()
+        and not get_parallel().dcp_enabled
     ):
         jit_set_mla_kv_buffer(kv_buffer, loc, cache_k_nope, cache_k_rope)
         return
@@ -161,8 +157,8 @@ def set_mla_kv_buffer_triton(
         nope_dim,
         rope_dim,
         BLOCK=BLOCK,
-        DCP_RANK=get_attention_dcp_rank(),
-        DCP_WORLD_SIZE=get_attention_dcp_world_size(),
+        DCP_RANK=get_parallel().attn_dcp_rank,
+        DCP_WORLD_SIZE=get_parallel().attn_dcp_size,
         **pdl_kwargs,
     )
 

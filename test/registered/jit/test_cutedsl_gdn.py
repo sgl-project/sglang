@@ -13,7 +13,7 @@ try:
     import cutlass  # noqa: F401
     from cutlass.cute.runtime import from_dlpack
 
-    from sglang.jit_kernel import cutedsl_gdn
+    from sglang.kernels.ops.attention import cutedsl_gdn
 
     CUTEDSL_AVAILABLE = True
 except ImportError:
@@ -21,7 +21,7 @@ except ImportError:
     cutedsl_gdn = None
 
 try:
-    from sglang.srt.layers.attention.fla.fused_sigmoid_gating_recurrent import (
+    from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (
         fused_sigmoid_gating_delta_rule_update,
     )
 
@@ -30,7 +30,6 @@ except ImportError:
     TRITON_AVAILABLE = False
 
 register_cuda_ci(est_time=5, stage="base-b-kernel-unit", runner_config="1-gpu-large")
-register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
 
 
 def run_triton_kernel(A_log, dt_bias, q, k, v, a, b, initial_state, indices, scale):

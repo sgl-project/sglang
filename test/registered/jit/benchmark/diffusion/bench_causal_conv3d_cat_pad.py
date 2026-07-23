@@ -2,14 +2,14 @@ from dataclasses import dataclass
 
 import torch
 
-from sglang.jit_kernel.benchmark import marker
-from sglang.jit_kernel.diffusion.causal_conv3d_cat_pad import (
+from sglang.kernels.jit.benchmark import marker
+from sglang.kernels.ops.diffusion.causal_conv3d_cat_pad import (
     fused_causal_conv3d_cat_pad_cuda,
 )
-from sglang.jit_kernel.diffusion.triton.causal_conv3d_pad import (
+from sglang.kernels.ops.diffusion.triton.causal_conv3d_pad import (
     fused_causal_conv3d_cat_pad as fused_causal_conv3d_cat_pad_triton,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(
     est_time=20,
@@ -17,6 +17,7 @@ register_cuda_ci(
     runner_config="1-gpu-large",
     disabled="standalone benchmark",
 )
+register_amd_ci(est_time=20, stage="jit-kernel-benchmark", runner_config="amd")
 
 DEVICE = "cuda"
 DTYPE = torch.bfloat16

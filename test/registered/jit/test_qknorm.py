@@ -5,10 +5,11 @@ import pytest
 import torch
 import triton
 
-from sglang.jit_kernel.utils import get_ci_test_range
+from sglang.kernels.jit.utils import get_ci_test_range
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=37, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+# Nightly is not redundant here: it sets SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1 to expand get_ci_test_range sweeps.
 register_cuda_ci(est_time=148, suite="nightly-kernel-1-gpu", nightly=True)
 
 
@@ -33,7 +34,7 @@ def sglang_jit_qknorm(
     q_weight: torch.Tensor,
     k_weight: torch.Tensor,
 ) -> None:
-    from sglang.jit_kernel.norm import fused_inplace_qknorm
+    from sglang.kernels.ops.layernorm._jit_norm import fused_inplace_qknorm
 
     fused_inplace_qknorm(q, k, q_weight, k_weight)
 

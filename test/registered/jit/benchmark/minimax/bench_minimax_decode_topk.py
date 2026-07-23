@@ -9,9 +9,9 @@ intermediate buffers; the baseline is two launches with split-K partials.
 import torch
 import triton
 
-from sglang.jit_kernel.benchmark import marker
-from sglang.jit_kernel.minimax_decode_topk import minimax_decode_topk
-from sglang.srt.layers.attention.minimax_sparse_ops.decode.flash_with_topk_idx import (
+from sglang.kernels.jit.benchmark import marker
+from sglang.kernels.ops.attention.minimax_decode_topk import minimax_decode_topk
+from sglang.kernels.ops.attention.minimax_sparse.decode.flash_with_topk_idx import (
     _topk_index_merge_kernel,
     _topk_index_partial_kernel,
 )

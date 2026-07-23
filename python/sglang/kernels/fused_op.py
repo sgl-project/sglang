@@ -12,7 +12,7 @@ supports:
   every other backend is checked against.
 - ``forward_torch_compile`` — provided by the base class as
   ``torch.compile(forward_native)``.
-- ``forward_triton`` / ``forward_cuda_jit`` / ``forward_cuda_aot`` /
+- ``forward_triton`` / ``forward_jit`` / ``forward_aot`` /
   ``forward_cute_dsl`` / ``forward_flashinfer`` / ``forward_deepgemm`` —
   opt-in overrides.
 
@@ -28,7 +28,7 @@ implementations with a single switch.
 
 Like the rest of ``sglang.kernels``, importing this module (and instantiating
 subclasses) never imports a kernel backend (``sgl_kernel`` /
-``sglang.jit_kernel``) or triggers JIT compilation; backends are imported
+``sglang.kernels.jit``) or triggers JIT compilation; backends are imported
 lazily inside the ``forward_<backend>`` methods.
 """
 
@@ -36,7 +36,16 @@ from __future__ import annotations
 
 import functools
 from abc import ABC, abstractmethod
-from typing import Any, ClassVar, Dict, List, Mapping, Optional, Tuple
+from typing import (
+    AbstractSet,
+    Any,
+    ClassVar,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Tuple,
+)
 
 import msgspec
 
@@ -47,29 +56,34 @@ from sglang.kernels.spec import (
     KernelBackend,
     KernelSpec,
     PlatformInfo,
+    capabilities_satisfied,
 )
 
-# backend -> forward_<backend> method name.
+# backend (provenance) -> forward_<backend> method name.
 BACKEND_METHODS: Dict[KernelBackend, str] = {
     KernelBackend.TORCH: "forward_native",
     KernelBackend.TORCH_COMPILE: "forward_torch_compile",
     KernelBackend.TRITON: "forward_triton",
-    KernelBackend.CUDA_JIT: "forward_cuda_jit",
-    KernelBackend.CUDA_AOT: "forward_cuda_aot",
+    KernelBackend.JIT: "forward_jit",
+    KernelBackend.AOT: "forward_aot",
     KernelBackend.CUTE_DSL: "forward_cute_dsl",
     KernelBackend.FLASHINFER: "forward_flashinfer",
     KernelBackend.DEEPGEMM: "forward_deepgemm",
+    KernelBackend.AITER: "forward_aiter",
+    KernelBackend.TORCH_NPU: "forward_npu",
 }
 
 # best -> fallback. ``torch_compile`` is deliberately absent: auto-selection
 # must never trigger a surprise compilation in a serving process; force it
-# explicitly when wanted.
+# explicitly when wanted. Per-op priority overrides this (see BaseFusedOp).
 DEFAULT_PRIORITY: Tuple[KernelBackend, ...] = (
-    KernelBackend.CUDA_AOT,
-    KernelBackend.CUDA_JIT,
+    KernelBackend.AOT,
+    KernelBackend.JIT,
     KernelBackend.FLASHINFER,
     KernelBackend.DEEPGEMM,
     KernelBackend.CUTE_DSL,
+    KernelBackend.AITER,
+    KernelBackend.TORCH_NPU,
     KernelBackend.TRITON,
     KernelBackend.TORCH,
 )
@@ -181,8 +195,11 @@ class BaseFusedOp(ABC):
         Backend preference for auto-selection, best first. Defaults to
         :data:`DEFAULT_PRIORITY`.
     capabilities:
-        Per-backend :class:`CapabilityRequirement`, consulted by
-        :meth:`backend_eligible` (and exported into the registry specs).
+        Per-backend set of :class:`CapabilityRequirement` (OR semantics;
+        omitted / empty = runs on any device), consulted by
+        :meth:`backend_eligible` (and exported into the registry specs). Use the
+        ``CapabilityRequirement.CUDA`` / ``.HIP`` / ``.NPU`` shortcuts, e.g.
+        ``{KernelBackend.AOT: {CapabilityRequirement.CUDA, CapabilityRequirement.HIP}}``.
     format_signature:
         Data-contract description shared by all backends of this op.
     descriptions:
@@ -191,7 +208,9 @@ class BaseFusedOp(ABC):
 
     op: ClassVar[str]
     priority: ClassVar[Tuple[KernelBackend, ...]] = DEFAULT_PRIORITY
-    capabilities: ClassVar[Mapping[KernelBackend, CapabilityRequirement]] = {}
+    capabilities: ClassVar[
+        Mapping[KernelBackend, AbstractSet[CapabilityRequirement]]
+    ] = {}
     format_signature: ClassVar[FormatSignature] = FormatSignature()
     descriptions: ClassVar[Mapping[KernelBackend, str]] = {}
 
@@ -234,11 +253,11 @@ class BaseFusedOp(ABC):
     def forward_triton(self, *args, **kwargs):
         raise NotImplementedError(f"{self.op}: no triton backend")
 
-    def forward_cuda_jit(self, *args, **kwargs):
-        raise NotImplementedError(f"{self.op}: no cuda_jit backend")
+    def forward_jit(self, *args, **kwargs):
+        raise NotImplementedError(f"{self.op}: no jit backend")
 
-    def forward_cuda_aot(self, *args, **kwargs):
-        raise NotImplementedError(f"{self.op}: no cuda_aot backend")
+    def forward_aot(self, *args, **kwargs):
+        raise NotImplementedError(f"{self.op}: no aot backend")
 
     def forward_cute_dsl(self, *args, **kwargs):
         raise NotImplementedError(f"{self.op}: no cute_dsl backend")
@@ -248,6 +267,12 @@ class BaseFusedOp(ABC):
 
     def forward_deepgemm(self, *args, **kwargs):
         raise NotImplementedError(f"{self.op}: no deepgemm backend")
+
+    def forward_aiter(self, *args, **kwargs):
+        raise NotImplementedError(f"{self.op}: no aiter backend")
+
+    def forward_npu(self, *args, **kwargs):
+        raise NotImplementedError(f"{self.op}: no npu backend")
 
     # --- selection ---
 
@@ -259,12 +284,13 @@ class BaseFusedOp(ABC):
         """Whether ``backend`` may run *this* call.
 
         The base implementation checks the backend's
-        :class:`CapabilityRequirement` against the detected platform.
-        Subclasses may extend it with per-call shape/dtype gates so
+        :class:`CapabilityRequirement` set (OR semantics) against the detected
+        platform. Subclasses may extend it with per-call shape/dtype gates so
         auto-selection bounces to the next backend instead of raising.
         """
-        capability = self.capabilities.get(backend)
-        return capability is None or capability.is_satisfied_by(_platform())
+        return capabilities_satisfied(
+            self.capabilities.get(backend, frozenset()), _platform()
+        )
 
     def _resolve_backend(self, *args, **kwargs) -> KernelBackend:
         forced = get_fused_op_backend()
@@ -300,7 +326,7 @@ def register_fused_op(instance: BaseFusedOp, module: str, attr: str) -> BaseFuse
 
     ``module``/``attr`` locate the module-level instance so that
     ``KernelSpec.load()`` can lazily resolve e.g.
-    ``"<module>:<attr>.forward_cuda_aot"`` to the bound backend method. Returns
+    ``"<module>:<attr>.forward_aot"`` to the bound backend method. Returns
     ``instance`` so group packages can write
     ``_RMSNORM = register_fused_op(_RMSNormOp(), __name__, "_RMSNORM")``.
     """
@@ -310,7 +336,7 @@ def register_fused_op(instance: BaseFusedOp, module: str, attr: str) -> BaseFuse
                 op=instance.op,
                 backend=backend,
                 target=f"{module}:{attr}.{BACKEND_METHODS[backend]}",
-                capability=instance.capabilities.get(backend, CapabilityRequirement()),
+                capabilities=frozenset(instance.capabilities.get(backend, ())),
                 format_signature=instance.format_signature,
                 description=instance.descriptions.get(backend, ""),
             )
