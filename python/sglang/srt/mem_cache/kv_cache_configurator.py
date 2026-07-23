@@ -1717,8 +1717,7 @@ class KVCacheConfigurator:
                 max_mamba_cache_size=server_args.max_mamba_cache_size
                 // self.ps.attn_dp_size,
             )
-            # Reserve intermediate memory based on capped max_num_reqs (+1:
-            # the pool's padding slot, see memory_pool.py)
+            # Reserve intermediate memory based on capped max_num_reqs (+1 padding slot)
             if has_spec_dec:
                 ratio = self._calculate_mamba_ratio()
                 capped_reqs = min(
@@ -1741,8 +1740,7 @@ class KVCacheConfigurator:
                 max_mamba_cache_size=server_args.max_running_requests
                 // self.ps.attn_dp_size,
             )
-            # Reserve intermediate memory based on capped max_num_reqs (+1:
-            # the pool's padding slot)
+            # Reserve intermediate memory based on capped max_num_reqs (+1 padding slot)
             if has_spec_dec:
                 intermediate_size = (
                     config.mamba2_cache_params.mamba_cache_per_req
@@ -1755,14 +1753,9 @@ class KVCacheConfigurator:
             assert config.mamba2_cache_params.mamba_cache_per_req > 0
             per_req = config.mamba2_cache_params.mamba_cache_per_req
 
-            # Solve jointly for max_mamba_cache_size accounting for intermediate
-            # memory. Every per-slot pool buffer carries a +1 padding slot
-            # (index 0, the sink for cuda-graph padded batches; see
-            # memory_pool.py), so the mamba budget must cover:
-            #   1. main mamba state: (max_mamba_cache_size + 1) * per_req
-            #   2. intermediate states: (max_mamba_cache_size / ratio + 1) * D * per_req
-            # So: max_mamba_cache_size * per_req * (1 + D/ratio) + (1 + D) * per_req
-            #     = mamba_budget_bytes
+            # Solve jointly for max_mamba_cache_size (K), including the pool's
+            # +1 padding slot on both buffers (see memory_pool.py):
+            #   (K + 1) * per_req + (K / ratio + 1) * D * per_req = mamba_budget_bytes
             mamba_budget = (
                 total_rest_memory
                 * server_args.mamba_full_memory_ratio
@@ -1811,7 +1804,7 @@ class KVCacheConfigurator:
                 f"(4) use GPUs with more memory."
             )
 
-        # +1: the pool's padding slot is allocated alongside the request slots
+        # +1: the pool's padding slot
         mamba_state_memory = (
             (server_args.max_mamba_cache_size + 1)
             * config.mamba2_cache_params.mamba_cache_per_req
