@@ -9,7 +9,7 @@ the consumer ``_gqa_share_sparse_decode_kernel`` contract.
 import pytest
 import torch
 
-from sglang.jit_kernel.minimax_decode_topk import minimax_decode_topk
+from sglang.kernels.ops.attention.minimax_decode_topk import minimax_decode_topk
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=40, stage="base-b-kernel-unit", runner_config="1-gpu-large")

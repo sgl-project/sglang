@@ -1,12 +1,12 @@
 import torch
 
-from sglang.jit_kernel.benchmark import marker
-from sglang.jit_kernel.benchmark.utils import (
+from sglang.kernels.jit.benchmark import marker
+from sglang.kernels.jit.benchmark.utils import (
     DEFAULT_DEVICE,
     create_empty,
     create_random,
 )
-from sglang.jit_kernel.kvcache import store_cache
+from sglang.kernels.ops.kvcache.kvcache import store_cache
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(

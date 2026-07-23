@@ -186,14 +186,14 @@ jobs:
               - "sgl-kernel/**/!(*.md|THIRDPARTYNOTICES.txt|LICENSE)"
               - ".github/workflows/pr-test-amd.yml"
             jit_kernel:
-              - "python/sglang/jit_kernel/**"
+              - "python/sglang/kernels/**"
               - "test/registered/jit/**"
               - ".github/workflows/pr-test-amd.yml"
             multimodal_gen:
               - "python/sglang/multimodal_gen/**/!(*.md|*.ipynb)"
               - "python/sglang/cli/**"
               - "python/sglang/srt/observability/**"
-              - "python/sglang/jit_kernel/diffusion/**"
+              - "python/sglang/kernels/ops/diffusion/**"
               - "test/registered/jit/diffusion/**"
               - "test/registered/jit/benchmark/diffusion/**"
               - "python/pyproject_rocm.toml"
@@ -1135,7 +1135,7 @@ jobs:
       fail-fast: false
       matrix:
         runner: [linux-mi35x-gpu-8]
-        part: [0, 1]
+        part: [0, 1, 2]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -1157,7 +1157,7 @@ jobs:
       - name: Run test
         timeout-minutes: 60
         run: |
-          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-c-test-large-8-gpu-amd-mi35x --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --timeout-per-file 3600 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-c-test-large-8-gpu-amd-mi35x --auto-partition-id ${{ matrix.part }} --auto-partition-size 3 --timeout-per-file 3600 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
   # =============================================== Disaggregation ====================================================
   stage-b-test-large-8-gpu-mi35x-disaggregation-amd:

@@ -13,7 +13,7 @@ try:
     import cutlass  # noqa: F401
     from cutlass.cute.runtime import from_dlpack
 
-    from sglang.jit_kernel import cutedsl_gdn
+    from sglang.kernels.ops.attention import cutedsl_gdn
 
     CUTEDSL_AVAILABLE = True
 except ImportError:

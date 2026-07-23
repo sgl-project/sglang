@@ -13,13 +13,13 @@ import numpy as np
 import psutil
 import torch
 
-from sglang.jit_kernel.hicache import (
+from sglang.kernels.ops.kvcache.hicache import (
     can_use_write_back_jit_kernel,
 )
-from sglang.jit_kernel.hicache import (
+from sglang.kernels.ops.kvcache.hicache import (
     transfer_hicache_all_layer_mla_staged_lf_pf as jit_transfer_hicache_all_layer_mla_staged_lf_pf,
 )
-from sglang.jit_kernel.hisparse import transfer_cache_dsv4_mla
+from sglang.kernels.ops.kvcache.hisparse import transfer_cache_dsv4_mla
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, MambaPool
 from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
 
@@ -39,7 +39,7 @@ if _is_cuda or _is_hip:
         transfer_kv_per_layer_mla_pf_lf,
     )
 if _is_cuda:
-    from sglang.jit_kernel.transfer_mamba import (
+    from sglang.kernels.ops.mamba.transfer_mamba import (
         transfer_kv_mamba_lf_pf,
         transfer_kv_mamba_pf_lf,
     )
@@ -1570,6 +1570,10 @@ class HostPoolGroup:
     def clear(self) -> None:
         for entry in self.entries:
             entry.host_pool.clear()
+
+    def destroy(self) -> None:
+        for entry in self.entries:
+            entry.host_pool.destroy()
 
     def available_size(self):
         return self.anchor_entry.host_pool.available_size()
