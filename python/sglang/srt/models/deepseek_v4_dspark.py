@@ -9,6 +9,10 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.kernels.ops.attention.dsv4 import fused_q_norm_rope, fused_rope_inplace
+from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
+    BuildStepLocal,
+    CommitKvProj,
+)
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.environ import envs
 from sglang.srt.layers.layernorm import RMSNorm
@@ -39,10 +43,6 @@ from sglang.srt.models.dspark import (
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.dspark_components.dspark_config import (
     parse_dspark_draft_config,
-)
-from sglang.srt.speculative.dspark_components.kernels.dspark_draft_model import (
-    BuildStepLocal,
-    CommitKvProj,
 )
 from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyMode,
