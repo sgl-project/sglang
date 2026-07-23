@@ -492,11 +492,44 @@ exec python3 -m sglang.launch_server \
   --disaggregation-mode decode --disaggregation-bootstrap-port $DBOOT
 EOF
 
+# Bind-mount the host's ionic (AMD/Pensando RoCE) ibverbs userspace into the
+# server containers. This resolves paths on the COMPUTE node at srun time, so it
+# is host-version-independent: ionic is an out-of-tree vendor provider whose
+# userspace must match the host kernel module. On a node whose host libibverbs
+# was upgraded (e.g. mia1-p01-g20, kernel ABI 4) the container's stock provider
+# is too old and enumerates zero NICs ("No IB devices found"); mounting the host
+# provider brings all 8 NICs up PORT_ACTIVE. On nodes that still match the
+# container (g09/g29/g53, host libibverbs 39.0) the mounted files are the same
+# versions the container already ships, so this is a no-op. Every mount is
+# existence-guarded, so a host without ionic contributes nothing.
+cat > "$WORKDIR/ibv_mounts.sh" <<'EOF'
+#!/bin/bash
+MOUNTS=""
+add_path() { [ -e "$1" ] && MOUNTS="$MOUNTS -v $1:$1:ro"; }
+add_glob() {
+  local p
+  p=$(find /lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu /lib64 /usr/lib64 \
+        -name "$1" -print -quit 2>/dev/null)
+  [ -n "$p" ] && MOUNTS="$MOUNTS -v $p:$p:ro"
+}
+add_path /etc/libibverbs.d
+add_path /usr/lib/x86_64-linux-gnu/libibverbs
+IONIC_LINK="/usr/lib/x86_64-linux-gnu/libibverbs/libionic-rdmav34.so"
+if [ -L "$IONIC_LINK" ]; then
+  IONIC_REAL=$(readlink -f "$IONIC_LINK" 2>/dev/null)
+  [ -f "$IONIC_REAL" ] && MOUNTS="$MOUNTS -v $IONIC_REAL:$IONIC_REAL:ro"
+fi
+add_glob "libnl-3.so*"
+add_glob "libmnl.so*"
+echo "$MOUNTS"
+EOF
+
 cat > "$WORKDIR/prefill.sh" <<EOF
 #!/bin/bash
 source "$WORKDIR/model_flags.sh"
 docker rm -f mi355x_prefill 2>/dev/null || true
-docker run $DOCKER_COMMON --name mi355x_prefill \
+IBV_MOUNTS=\$(bash "$WORKDIR/ibv_mounts.sh")
+docker run $DOCKER_COMMON \$IBV_MOUNTS --name mi355x_prefill \
   -e HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 $MORI_ENV $DSV4_ENV_STR "\${MODEL_ENV_ARGS[@]}" \
   $IMAGE bash /host_home/.mi355x_ci/${MATRIX_CONFIG_NAME}/prefill_entry.sh
 EOF
@@ -505,7 +538,8 @@ cat > "$WORKDIR/decode.sh" <<EOF
 #!/bin/bash
 source "$WORKDIR/model_flags.sh"
 docker rm -f mi355x_decode 2>/dev/null || true
-docker run $DOCKER_COMMON --name mi355x_decode \
+IBV_MOUNTS=\$(bash "$WORKDIR/ibv_mounts.sh")
+docker run $DOCKER_COMMON \$IBV_MOUNTS --name mi355x_decode \
   -e HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 $MORI_ENV $DSV4_ENV_STR "\${MODEL_ENV_ARGS[@]}" \
   $IMAGE bash /host_home/.mi355x_ci/${MATRIX_CONFIG_NAME}/decode_entry.sh
 EOF
@@ -606,8 +640,19 @@ mapfile -t NODES < <(scontrol show hostnames "$SLURM_JOB_NODELIST")
 PNODES=("${NODES[@]:0:PW}")
 DNODES=("${NODES[@]:PW:DW}")
 PNODE="${PNODES[0]}"; DNODE="${DNODES[0]}"
-PIP=$(getent ahostsv4 "$PNODE" | head -1 | awk '{print $1}')
-DIP=$(getent ahostsv4 "$DNODE" | head -1 | awk '{print $1}')
+# Resolve each node's fabric IP from a PEER compute node, not the login node.
+# Some nodes have a stale login-side /etc/hosts entry pointing at a dead IP
+# (e.g. g53 -> a .164 no host owns), which makes bench's decode health curl hang
+# forever. Compute nodes resolve each other correctly. Fall back to login getent
+# if the peer probe returns empty.
+resolve_from_peer() {  # $1=target node, $2=peer node to resolve from
+  local ip
+  ip=$(srun --overlap -N1 --nodelist="$2" getent hosts "$1" 2>/dev/null | awk '{print $1; exit}')
+  [ -z "$ip" ] && ip=$(getent ahostsv4 "$1" | head -1 | awk '{print $1}')
+  echo "$ip"
+}
+PIP=$(resolve_from_peer "$PNODE" "$DNODE")
+DIP=$(resolve_from_peer "$DNODE" "$PNODE")
 echo "[drive] prefill nodes: ${PNODES[*]} ; decode nodes: ${DNODES[*]}"
 echo "[drive] bench targets prefill=$PNODE($PIP) decode=$DNODE($DIP)"
 if (( PW > 1 || DW > 1 )); then
