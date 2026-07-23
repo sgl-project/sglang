@@ -180,7 +180,9 @@ wait_for_server() {
 
 if [[ "${MINWM_BENCHMARK_MODE}" == "spmatrix720p" ]]; then
   SP_CASES="${MINWM_CASES_PATH:-${SCRIPT_DIR}/cases_720p_compile_smoke.json}"
-  SP_RESULTS="${LOCAL_RESULTS}/sp-matrix-720p"
+  # Keep completed lanes directly on the mounted result store. Spot retries can
+  # then skip valid SP artifacts instead of discarding an entire matrix.
+  SP_RESULTS="${MINWM_SP_RESULTS_DIR:-${RESULTS}/sp-matrix-720p}"
   SP_WARMUP_RUNS="${MINWM_SP_WARMUP_RUNS:-1}"
   ARTIFACT_HOLD_SECONDS="${MINWM_ARTIFACT_HOLD_SECONDS:-0}"
   if ! [[ "${SP_WARMUP_RUNS}" =~ ^[0-9]+$ ]]; then
@@ -194,6 +196,47 @@ if [[ "${MINWM_BENCHMARK_MODE}" == "spmatrix720p" ]]; then
   mkdir -p "${SP_RESULTS}"
   nvidia-smi -L | tee "${RESULTS}/sp-gpus.txt"
   nvidia-smi topo -m | tee "${RESULTS}/sp-topology.txt"
+
+  sp_lane_complete() {
+    local prefix="$1"
+    python3 - "${SP_CASES}" "${SP_RESULTS}" "${prefix}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+
+manifest = json.loads(Path(sys.argv[1]).read_text())
+root = Path(sys.argv[2])
+prefix = sys.argv[3]
+expected_shape = (
+    int(manifest["contract"]["reference_pixel_frames"])
+    + int(manifest["contract"]["generated_pixel_frames"]),
+    int(manifest["contract"]["height"]),
+    int(manifest["contract"]["width"]),
+    3,
+)
+run_path = root / f"{prefix}_run.json"
+if not run_path.is_file():
+    raise SystemExit(1)
+run = json.loads(run_path.read_text())
+if {item["id"] for item in run["cases"]} != {
+    item["id"] for item in manifest["cases"]
+}:
+    raise SystemExit(1)
+for case in manifest["cases"]:
+    case_dir = root / "cases" / case["id"]
+    paths = [
+        case_dir / f"{prefix}.npy",
+        case_dir / f"{prefix}.mp4",
+        case_dir / f"{prefix}.json",
+    ]
+    if not all(path.is_file() and path.stat().st_size > 0 for path in paths):
+        raise SystemExit(1)
+    if np.load(paths[0], mmap_mode="r", allow_pickle=False).shape != expected_shape:
+        raise SystemExit(1)
+PY
+  }
 
   run_sp_lane() {
     local degree="$1"
@@ -251,14 +294,17 @@ if [[ "${MINWM_BENCHMARK_MODE}" == "spmatrix720p" ]]; then
   }
 
   for degree in 1 2 4 8; do
-    run_sp_lane "${degree}"
+    if sp_lane_complete "sp${degree}"; then
+      echo "MINWM_SP_RESUME_SKIP degree=${degree}"
+    else
+      run_sp_lane "${degree}"
+    fi
   done
   python3 "${SCRIPT_DIR}/compare_sp_matrix.py" \
     --cases "${SP_CASES}" \
     --results "${SP_RESULTS}" \
     --degrees 1,2,4,8 \
     | tee "${RESULTS}/sp-matrix-compare.log"
-  cp -r "${SP_RESULTS}" "${RESULTS}/"
   cp "${SP_RESULTS}/sp_matrix_report.json" "${RESULTS}/"
   cp "${SP_RESULTS}/sp_matrix_report.md" "${RESULTS}/"
   touch "${RESULTS}/sp-matrix-artifacts-ready"
