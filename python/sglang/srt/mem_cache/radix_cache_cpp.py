@@ -77,6 +77,21 @@ class RadixCacheCpp(BasePrefixCache):
 
         raise NotImplementedError("Host cache is not supported yet")
 
+    def build_cached_tokens_by_component(
+        self,
+        req: Req,
+        *,
+        device: int,
+        host: int,
+        storage: int,
+    ) -> dict[str, dict[str, int]]:
+        return self._cached_tokens_for_component(
+            "full",
+            device=device,
+            host=host,
+            storage=storage,
+        )
+
     def _merge_tensor(self, l: List[torch.Tensor]) -> torch.Tensor:
         """
         Merge a list of tensors into a single tensor.

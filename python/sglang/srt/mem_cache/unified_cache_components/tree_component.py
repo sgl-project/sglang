@@ -168,7 +168,8 @@ class TreeComponent(ABC):
         best_value_len: int,
     ) -> MatchResult:
         """Post-process the match result after prefix matching completes.
-        - Full & SWA: pass through unchanged.
+        - Full: passes through unchanged.
+        - SWA: records device/host token attribution for its active window.
         - Mamba: performs copy-on-write — allocates a new mamba slot, copies
           the matched node's mamba state into the request pool, and records
           branching_seqlen in result."""
@@ -402,9 +403,13 @@ class TreeComponent(ABC):
         *,
         insert_result: Optional[InsertResult] = None,
         pool_storage_result: Optional[PoolTransferResult] = None,
-    ) -> None:
-        """Post-transfer bookkeeping: store host indices, update LRU, etc."""
-        pass
+    ) -> Optional[int]:
+        """Post-transfer bookkeeping: store indices, update LRU, etc.
+
+        For PREFETCH, token-backed components may return the number of cached
+        tokens attributed to storage. Other components and phases may return None.
+        """
+        return None
 
     def drive_host_eviction(
         self, num_tokens: int, tracker: dict[ComponentType, int]

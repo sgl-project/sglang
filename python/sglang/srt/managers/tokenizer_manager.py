@@ -2520,11 +2520,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if state.finished:
             # Get detailed cache breakdown if available
             cached_tokens_details = None
+            cached_tokens_by_component = None
             if (
                 hasattr(recv_obj, "cached_tokens_details")
                 and recv_obj.cached_tokens_details
             ):
                 cached_tokens_details = recv_obj.cached_tokens_details[i]
+            if (
+                hasattr(recv_obj, "cached_tokens_by_component")
+                and recv_obj.cached_tokens_by_component
+            ):
+                cached_tokens_by_component = recv_obj.cached_tokens_by_component[i]
 
             spec_verify_ct = (
                 recv_obj.spec_verify_ct[i]
@@ -2541,7 +2547,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 recv_obj.cached_tokens[i],
                 state.time_stats.get_e2e_latency(),
                 self._request_has_grammar(state.obj),
-                cached_tokens_details,
+                cached_tokens_details=cached_tokens_details,
+                cached_tokens_by_component=cached_tokens_by_component,
                 spec_verify_ct=spec_verify_ct,
             )
 

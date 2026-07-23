@@ -192,6 +192,9 @@ def _handle_output_by_index(output, i):
             cached_tokens_details=_extract_field_by_index(
                 output, "cached_tokens_details", i
             ),
+            cached_tokens_by_component=_extract_field_by_index(
+                output, "cached_tokens_by_component", i
+            ),
             image_tokens=_extract_field_by_index(output, "image_tokens", i),
             audio_tokens=_extract_field_by_index(output, "audio_tokens", i),
             video_tokens=_extract_field_by_index(output, "video_tokens", i),
@@ -299,6 +302,9 @@ def _handle_output_by_index(output, i):
             cached_tokens=_extract_field_by_index(output, "cached_tokens", i),
             cached_tokens_details=_extract_field_by_index(
                 output, "cached_tokens_details", i
+            ),
+            cached_tokens_by_component=_extract_field_by_index(
+                output, "cached_tokens_by_component", i
             ),
             image_tokens=_extract_field_by_index(output, "image_tokens", i),
             audio_tokens=_extract_field_by_index(output, "audio_tokens", i),
