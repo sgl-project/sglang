@@ -117,10 +117,10 @@ Some models support internal reasoning or thinking processes that can be exposed
 
 #### Basic Usage
 
-To enable reasoning output, you need to:
-1. Launch the server with the appropriate reasoning parser
-2. Set the model-specific parameter in `chat_template_kwargs`
-3. Optionally use `separate_reasoning: False` to not get reasoning content separately (default to `True`)
+To use reasoning output:
+1. Launch the server with the appropriate reasoning parser.
+2. Use the model-specific parameter in `chat_template_kwargs` when you need to override the model's chat-template default.
+3. Optionally use `separate_reasoning: False` to keep reasoning in the response content instead of returning it separately (defaults to `True`).
 
 <Note>
 **Note for Qwen3-Thinking models:** These models always generate thinking content and do not support the `enable_thinking` parameter. Use `--reasoning-parser qwen3-thinking` or `--reasoning-parser qwen3` to parse the thinking content.
@@ -176,8 +176,27 @@ Thus, the total count is **3**.
 **Answer:** 3.
 ```
 <Note>
-Setting `"enable_thinking": False` (or omitting it) will result in `reasoning_content` being `None`. Qwen3-Thinking models always generate reasoning content and don't support the `enable_thinking` parameter.
+Setting `"enable_thinking": False` disables reasoning for Qwen3. Omitting the parameter follows the model's chat-template default; Qwen3 enables thinking by default. Qwen3-Thinking models always generate reasoning content and do not support the `enable_thinking` parameter.
 </Note>
+
+#### Set a Server-Wide Template Default
+
+If most requests should use the same chat-template mode, set a default when launching the server:
+
+```bash Command
+python -m sglang.launch_server \
+  --model-path Qwen/Qwen3-4B \
+  --reasoning-parser qwen3 \
+  --default-chat-template-kwargs '{"enable_thinking": false}'
+```
+
+`--default-chat-template-kwargs` accepts a JSON object and merges it into each request's `chat_template_kwargs`. For each key, the precedence is:
+
+1. An explicit value in the request's `chat_template_kwargs`
+2. The value in `--default-chat-template-kwargs`
+3. The model's chat-template default
+
+The accepted keys are model-specific. For example, Qwen3 uses `enable_thinking`, while other model families may use `thinking` or may not expose a reasoning toggle. The reasoning parser controls how reasoning tokens are separated from the response; it does not by itself enable reasoning in the chat template.
 
 #### Logit Bias Support
 
