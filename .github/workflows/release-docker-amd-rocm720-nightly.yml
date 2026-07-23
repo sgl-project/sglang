@@ -10,6 +10,15 @@ on:
         options:
           - 'all'
           - publish
+      gpu_arch:
+        description: 'Select which ROCm 7.2 GPU arch to build'
+        required: false
+        type: choice
+        default: 'all'
+        options:
+          - 'all'
+          - gfx942-rocm720
+          - gfx950-rocm720
   schedule:
     - cron: '0 12 * * *'
 
@@ -29,7 +38,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        gpu_arch: ['gfx942-rocm720', 'gfx950-rocm720']
+        gpu_arch: ${{ fromJson((github.event_name == 'workflow_dispatch' && inputs.gpu_arch != 'all' && inputs.gpu_arch != '') && format('["{0}"]', inputs.gpu_arch) || '["gfx942-rocm720", "gfx950-rocm720"]') }}
         build_type: ['all']
     steps:
       - name: Checkout repository
@@ -141,7 +150,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        gpu_arch: ['gfx942-rocm720', 'gfx950-rocm720']
+        gpu_arch: ${{ fromJson((github.event_name == 'workflow_dispatch' && inputs.gpu_arch != 'all' && inputs.gpu_arch != '') && format('["{0}"]', inputs.gpu_arch) || '["gfx942-rocm720", "gfx950-rocm720"]') }}
     steps:
       - name: Download image tag artifact
         uses: actions/download-artifact@v4
