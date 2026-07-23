@@ -97,10 +97,6 @@ sgl-eval run aime25 \\
     mi355x: "lmsysorg/sglang-rocm:v0.5.13.post1-rocm720-mi35x-20260618",
     mi325x: "lmsysorg/sglang-rocm:v0.5.13.post1-rocm700-mi30x-20260616",
     mi300x: "lmsysorg/sglang-rocm:v0.5.13.post1-rocm700-mi30x-20260616",
-    // NVFP4 needs the dev image with modelopt_fp4 support (per-quant override).
-    "b200|nvfp4":  "lmsysorg/sglang:dev-glm52-nvfp4",
-    "b300|nvfp4":  "lmsysorg/sglang:dev-glm52-nvfp4",
-    "gb300|nvfp4": "lmsysorg/sglang:dev-glm52-nvfp4",
   },
 
   github: {
@@ -111,14 +107,39 @@ sgl-eval run aime25 \\
 
     // ----- Card 1: "Attention Parallelism" -----
     // DSA prefill Context Parallelism (CP) splits the long-prefill attention across
-    // `cp` ranks — verified on Hopper (H200). On Blackwell the DSA-CP FP8 rope kernel
-    // is not yet adapted, so keep CP off there for now.
+    // `cp` ranks — runs on Hopper (H200) and Blackwell (B200/GB300/B300).
+    // CP sizes auto-gate in the engine to the runtime derivation
+    // attn_cp_size = tp/dp (a user-passed --attn-cp-size is overridden).
+    // CP is single-machine only (tp_size <= 8). Interleave CP + DP-Attention
+    // currently fails the runtime's dp_size == 1 assert but is allowed here
+    // with a warning (combined support is planned upstream).
+    // Strategy knob: interleave (ex round-robin-split) is the layout verified
+    // here and the default; zigzag (ex in-seq-split) is exposed as an
+    // experiment — the runtime auto-configures deepep + ep=tp for it and
+    // restricts it to batch_size=1 (long-context single-request runs).
     attention: {
       knobs: [
         { id: "tp", label: "TP", values: [null, 4, 8] },
-        { id: "cp", label: "CP (DSA prefill)", values: [null, 1, 2, 4, 8],
-          disable: { hw: ["b200", "gb300", "b300", "mi355x", "mi325x", "mi300x"] },
-          disableReason: "DSA prefill Context Parallel is verified on Hopper (H200); the Blackwell sm100 DSA-CP FP8 rope kernel is not yet adapted, and the ROCm DSA-CP path is not yet validated on AMD (MI300X/MI325X/MI355X)." },
+        { id: "cp", label: "CP (DSA prefill)",
+          values: [null, { value: 1, label: "Off" }, 4, 8],
+          disable: [
+            { when: { hw: ["mi355x", "mi325x", "mi300x"] },
+              reason: "The ROCm DSA-CP path is not yet validated on AMD (MI300X/MI325X/MI355X) — keep CP off there for now." },
+            { when: { nodes: ["multi-2"] },
+              reason: "Prefill Context Parallel is single-machine only (SGLang asserts tp_size <= 8; cross-machine CP has precision issues)." },
+          ] },
+        { id: "cpStrategy", label: "CP Strategy",
+          values: [
+            null,
+            "interleave",
+            { value: "zigzag", label: "zigzag (experimental)" },
+          ],
+          disable: [
+            { when: { hw: ["mi355x", "mi325x", "mi300x"] },
+              reason: "The ROCm DSA-CP path is not yet validated on AMD (MI300X/MI325X/MI355X) — keep CP off there for now." },
+            { when: { nodes: ["multi-2"] },
+              reason: "Prefill Context Parallel is single-machine only (SGLang asserts tp_size <= 8; cross-machine CP has precision issues)." },
+          ] },
         { id: "dpAttn", label: "DP-Attention",
           values: [null, false, 4, 8],
           labels: { "auto": "Auto", "false": "Off" } },
@@ -164,7 +185,48 @@ sgl-eval run aime25 \\
       ],
     },
 
-    // ----- Card 5: "Hierarchical KV Cache" -----
+    // ----- Card 5: "PD Disaggregation" -----
+    // GLM-5.2 is a DSA model (same family as DeepSeek-V3.2/V4) and supports
+    // prefill/decode disaggregation. Owns the `--disaggregation-*` flags; the
+    // engine also pins role-specific serving ports (spaced apart) so prefill +
+    // decode don't collide on one host.
+    pdDisagg: {
+      modes: [
+        { id: "off",     label: "Off" },
+        { id: "prefill", label: "Prefill role" },
+        { id: "decode",  label: "Decode role" },
+      ],
+      transferBackends: [
+        // Mooncake (recommended). The NCCL/MNNVL env is only needed on the
+        // NVLink-multinode Grace-Blackwell platform (GB300 here).
+        { id: "mooncake", label: "Mooncake",
+          env: [
+            "NCCL_MNNVL_ENABLE=1",
+            "NCCL_CUMEM_ENABLE=1",
+            "SGLANG_MOONCAKE_CUSTOM_MEM_POOL=True",
+            "MC_FORCE_MNNVL=1",
+          ],
+          envWhen: { hw: ["gb300"] } },
+        { id: "nixl",     label: "NiXL" },
+      ],
+      // No IB-device knob: mooncake auto-detects the HCA. Pass
+      // --disaggregation-ib-device only if discovery picks the wrong NIC
+      // (see Configuration Tips).
+      // Router fronting the prefill + decode roles; substitute <prefill-host>/<decode-host>.
+      router: {
+        port: 8000,
+        command:
+`python3 -m sglang_router.launch_router \\
+  --pd-disaggregation \\
+  --prefill http://<prefill-host>:{{PREFILL_PORT}} \\
+  --decode http://<decode-host>:{{DECODE_PORT}} \\
+  --host 0.0.0.0 --port {{ROUTER_PORT}} \\
+  --disable-circuit-breaker \\
+  --health-check-interval-secs 999999`,
+      },
+    },
+
+    // ----- Card 6: "Hierarchical KV Cache" -----
     hicache: {
       backends: [
         { id: null,       label: "Auto" },
@@ -627,7 +689,6 @@ sgl-eval run aime25 \\
     // high-throughput add DP-Attention (dp8). low-latency uses MTP 5-1-6, balanced MTP 2-1-3.
     // GB300: 4-GPU single node, TP4 (the node fits the ~381 GB build); GB300 adds dp4 on
     // balanced & high-throughput; low-latency uses MTP 5-1-6.
-    // Blackwell NVFP4 measured on the dev-glm52-nvfp4 preview image.
     // ====================================================================
     {
       match: { hw: "b200", variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
@@ -702,6 +763,11 @@ sgl-eval run aime25 \\
         "--speculative-num-draft-tokens 6",
         "--chunked-prefill-size 8192",
         "--mem-fraction-static 0.85",
+        "--kv-cache-dtype fp8_e4m3",
+        "--bf16-gemm-backend cutedsl",
+        "--max-running-requests 16",
+        "--cuda-graph-max-bs 16",
+        "--max-prefill-tokens 8192",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -764,6 +830,11 @@ sgl-eval run aime25 \\
         "--speculative-num-draft-tokens 6",
         "--chunked-prefill-size 8192",
         "--mem-fraction-static 0.85",
+        "--kv-cache-dtype fp8_e4m3",
+        "--bf16-gemm-backend cutedsl",
+        "--max-running-requests 16",
+        "--cuda-graph-max-bs 16",
+        "--max-prefill-tokens 8192",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],

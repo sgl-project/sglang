@@ -23,10 +23,21 @@ class SchedulerLoader(ComponentLoader):
         """Load the scheduler based on the model path, and inference args."""
         config = get_diffusers_component_config(component_path=component_model_path)
 
-        class_name = config.pop("_class_name")
+        checkpoint_class_name = config.pop("_class_name", None)
+        class_name = (
+            getattr(server_args.pipeline_config, "scheduler_class_override", None)
+            or checkpoint_class_name
+        )
         assert (
             class_name is not None
         ), "Model config does not contain a _class_name attribute. Only diffusers format is supported."
+
+        if checkpoint_class_name is not None and class_name != checkpoint_class_name:
+            logger.info(
+                "Overriding scheduler class from %s to %s",
+                checkpoint_class_name,
+                class_name,
+            )
 
         scheduler_cls, _ = ModelRegistry.resolve_model_cls(class_name)
 

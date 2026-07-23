@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 
 NAMESPACE = os.environ.get("NAMESPACE")
 CONFIGMAP_NAME = os.environ.get("KUBE_CONFIG_MAP")
+ACTIVE_TEST_CLASS = "active-test-class"
 
 LOCAL_TIMEOUT = 3600
 ALL_ROLE_SET = {"prefill", "decode", "router", "master", "worker"}
@@ -41,6 +42,7 @@ BOOTSTRAP_INIT_PORT = 8995
 # Timeouts and delays
 ROUTER_CONFIGMAP_TIMEOUT = 300
 SERVER_INITIALIZATION_DELAY = 30
+SERVICE_EXIT_WAIT_SECONDS = 120
 
 
 def get_nic_name():
@@ -188,6 +190,65 @@ def query_configmap(name, namespace):
     except Exception as e:
         logger.error(f"Unexpected error querying ConfigMap: {e}")
         return None
+
+
+def upsert_configmap_field_strict(
+    name: str,
+    namespace: str,
+    key: str,
+    value: str,
+):
+    """
+    Add or update a field in ConfigMap using patch.
+    Strict mode: fail if ConfigMap does not exist.
+    """
+    from kubernetes.client.rest import ApiException
+
+    k8s_api = get_k8s_api()
+    patch = {"data": {key: value}}
+
+    try:
+        k8s_api.patch_namespaced_config_map(name=name, namespace=namespace, body=patch)
+        logger.info(f"Upserted ConfigMap {name}: {key}={value}")
+    except ApiException as e:
+        if e.status == 404:
+            raise RuntimeError(
+                f"ConfigMap {name} does not exist in namespace {namespace}"
+            )
+        logger.error(f"Failed to upsert ConfigMap {name}: {e}")
+        raise
+
+
+def wait_for_prefill_decode_exit(
+    key: str,
+    value: str,
+    timeout: int = ROUTER_CONFIGMAP_TIMEOUT,
+    poll_interval: int = 15,
+):
+    start_time = time.time()
+
+    while time.time() - start_time < timeout:
+        configmap = query_configmap(CONFIGMAP_NAME, NAMESPACE)
+        if not configmap or not configmap.data:
+            logger.info(f"ConfigMap data is not available yet, waiting for 15s...")
+            time.sleep(poll_interval)
+            continue
+
+        existing_value = configmap.data.get(key)
+
+        upsert_configmap_field_strict(CONFIGMAP_NAME, NAMESPACE, key, value)
+
+        if existing_value is not None:
+            logger.info(
+                "%s already set (%s), waiting 120s for prefill/decode to exit ...",
+                key,
+                existing_value,
+            )
+            time.sleep(SERVICE_EXIT_WAIT_SECONDS)
+        else:
+            logger.info("%s set for the first time (%s)", key, value)
+
+        return
 
 
 # Get node count from Kubernetes
@@ -779,7 +840,7 @@ def wait_server_ready(url, timeout=LOCAL_TIMEOUT):
                 logger.info(
                     f"Server {url} returned status code: {response.status_code}"
                 )
-        except Exception as e:
+        except Exception:
             # logger.error(f"Server {url} request error: {e}, retrying...")
             pass
 

@@ -22,7 +22,6 @@ QWEN3_6_27B_128K_ENVS = {
     "GLOO_SOCKET_IFNAME": "lo",
     "HCCL_OP_EXPANSION_MODE": "AIV",
     "SGLANG_SET_CPU_AFFINITY": "1",
-    "SGLANG_ENABLE_SPEC_V2": "1",
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
     "SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE": "1",
     "SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES": "20",
@@ -65,6 +64,10 @@ QWEN3_6_27B_128K_OTHER_ARGS = [
     "bfloat16",
     "--mamba-ssm-dtype",
     "bfloat16",
+    "--reasoning-parser",
+    "qwen3",
+    "--tool-call-parser",
+    "qwen3_coder",
 ]
 
 
@@ -72,7 +75,7 @@ class TestNPUQwen3_6_27B_2P_In128k_Out1k_50ms(TestNpuPerformanceTestCaseBase):
     """Test NPU performance for Qwen3.6-27B-w8a8 2p in128k out1k 50ms"""
 
     benchmark_tool = BENCHMARK_TOOL_DEFAULT
-    aisbench_dataset_type = AISBENCHMARK_DATASET_DEFAULT
+    dataset_type = AISBENCHMARK_DATASET_DEFAULT
     model = QWEN3_6_27B_W8A8_MODEL_PATH
     other_args = QWEN3_6_27B_128K_OTHER_ARGS
     envs = QWEN3_6_27B_128K_ENVS
@@ -82,6 +85,7 @@ class TestNPUQwen3_6_27B_2P_In128k_Out1k_50ms(TestNpuPerformanceTestCaseBase):
     input_len = 128000
     output_len = 1000
     random_range_ratio = 1
+    seed = 1
     tpot = 50
     output_token_throughput = 41.39
 

@@ -63,6 +63,7 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
         end_layer: Optional[int] = None,
         enable_alt_stream: bool = True,
         enable_kv_cache_copy: bool = False,
+        **kwargs,
     ):
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
         super().__init__(
@@ -82,6 +83,7 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
             end_layer=end_layer,
             enable_alt_stream=enable_alt_stream,
             enable_kv_cache_copy=enable_kv_cache_copy,
+            **kwargs,
         )
 
     def _create_buffers(self):
@@ -179,7 +181,7 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
         layer_id_override: Optional[int] = None,
         dcp_kv_mask: Optional[torch.Tensor] = None,
     ):
-        loc, _ = unwrap_write_loc(loc_info)
+        loc, _, _ = unwrap_write_loc(loc_info)
         if layer_id_override is not None:
             layer_id = layer_id_override
         else:
@@ -441,7 +443,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
     ):
-        loc, _ = unwrap_write_loc(loc_info)
+        loc, _, _ = unwrap_write_loc(loc_info)
         layer_id = layer.layer_id
         if cache_k.dtype != self.dtype:
             cache_k = cache_k.to(self.dtype)
