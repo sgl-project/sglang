@@ -16,6 +16,7 @@ from sglang.srt.managers.multi_tokenizer_mixin import (
     get_tokenizer_worker_class,
 )
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.server_args import ServerArgs
 from sglang.utils import TypeBasedDispatcher
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -104,26 +105,10 @@ class TestMultiTokenizerMixin(unittest.TestCase):
 
         Returns (instance, start_disagg_service mock, metrics collector class mock).
         """
-        server_args = SimpleNamespace(
-            allow_auto_truncate=False,
-            bucket_e2e_request_latency=None,
-            bucket_inter_token_latency=None,
-            bucket_time_to_first_token=None,
-            crash_dump_folder=None,
+        server_args = ServerArgs(
+            model_path="dummy",
             disaggregation_mode="decode",
-            disaggregation_transfer_backend="mooncake",
-            enable_lora=None,
             enable_metrics=True,
-            enable_trace=False,
-            extra_metric_labels=None,
-            gc_warning_threshold_secs=0.0,
-            incremental_streaming_output=False,
-            language_only=False,
-            preferred_sampling_params=None,
-            served_model_name="test-model",
-            skip_tokenizer_init=False,
-            soft_watchdog_timeout=None,
-            tokenizer_metrics_allowed_custom_labels=None,
         )
         port_args = SimpleNamespace(tokenizer_ipc_name="ipc://test-tokenizer")
 
