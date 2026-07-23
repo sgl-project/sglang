@@ -112,3 +112,8 @@ path = "benches/tree_lookup.rs"
 name = "policy_select"
 harness = false
 path = "benches/policy_select.rs"
+
+[[bench]]
+name = "tokenize"
+harness = false
+path = "benches/tokenize.rs"
