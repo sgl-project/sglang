@@ -58,6 +58,10 @@ class TestMaxTokenPoolSize(CustomTestCase):
             max_total_num_tokens=2048,
             full_max_total_num_tokens=None,
             swa_max_total_num_tokens=None,
+            # `max_token_pool_size` reads `self.effective_max_total_num_tokens`
+            # via property-descriptor semantics. SimpleNamespace bypasses those
+            # descriptors, so we materialize the expected value directly.
+            effective_max_total_num_tokens=2048,
         )
         self.assertEqual(_max_token_pool_size(instance), 2048)
 
@@ -73,6 +77,7 @@ class TestMaxTokenPoolSize(CustomTestCase):
             max_total_num_tokens=1024,
             full_max_total_num_tokens=None,
             swa_max_total_num_tokens=None,
+            effective_max_total_num_tokens=1024,
         )
         self.assertEqual(_max_token_pool_size(instance), 1024)
 
