@@ -67,7 +67,9 @@ if _is_cuda:
     from sglang.kernels.ops.activation._jit_activation import (
         gelu_tanh_and_mul as _jit_gelu_tanh_and_mul,
     )
-    from sglang.kernels.ops.activation._jit_activation import relu2
+    from sglang.kernels.ops.activation._jit_activation import (
+        relu2,
+    )
     from sglang.kernels.ops.activation._jit_activation import (
         silu_and_mul as _jit_silu_and_mul,
     )
@@ -101,6 +103,7 @@ if _is_cuda:
 
     def gelu_tanh_and_mul(input: torch.Tensor, out=None) -> torch.Tensor:
         return _act_and_mul(_jit_gelu_tanh_and_mul, _sgl_gelu_tanh_and_mul, input, out)
+
 elif _is_xpu:
     from sgl_kernel import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
 elif _is_hip:
