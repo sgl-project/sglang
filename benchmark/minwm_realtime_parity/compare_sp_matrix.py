@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import statistics
 from pathlib import Path
@@ -189,6 +190,7 @@ def main() -> None:
         "contract": {
             **manifest["contract"],
             "hardware": f"single-node {max(degrees)}x {gpu_name} Spot",
+            "location": os.environ.get("MINWM_SP_LOCATION"),
             "attention": "packed deterministic causal attention",
             "reference_lane": "sp1",
             "parity_scope": "generated uint8 frames",

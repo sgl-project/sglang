@@ -18,8 +18,10 @@ sequence parallel：支持 `sp_degree == ulysses_degree > 1`、`ring_degree == 1
 Ring、TP+SP、FSDP+SP 和 whole-DiT compile+SP 仍会被显式拒绝。
 
 本地单测覆盖了 uniform/varlen shard、帧内 shard 边界、packed QKV collective 和
-local-head KV ownership；多卡 bitwise 与性能矩阵尚未写入本报告，因此当前实现不能
-引用下文 SP1 的历史数据来声称 SP2/SP4/SP8 已完成生产验收。
+local-head KV ownership；`us-east-1-atl-2a` Local Zone 的 8×B300 Spot 正式矩阵
+也已完成。SP2/SP4/SP8 相对 SP1 的 generated uint8 frame 全部逐字节相同，但这个
+720p workload 的单流吞吐没有提升：SP2 约慢 4.30%，SP4 约慢 4.40%，SP8 约慢
+4.92%。
 
 ## 2. 背景和真正的兼容性目标
 
@@ -137,6 +139,10 @@ bounded 请求按完整 horizon 预分配；unbounded 请求允许 cache 增长�
 | H200 triptych bitwise | 1248x704 | 10.822 client FPS | 同 case、warm full-clip exact lane |
 | H200 optimized eager | 1248x704 | 10.853 client FPS | 与下一行只差 whole-DiT compile |
 | H200 optimized compiled | 1248x704 | 12.711 client FPS | 非 parity、组合性能 lane |
+| B300 SP1 exact | 1248x704 | 15.891 client FPS | Local Zone Spot SP reference |
+| B300 SP2 exact | 1248x704 | 15.207 client FPS | bitwise；相对 SP1 为 0.957x |
+| B300 SP4 exact | 1248x704 | 15.191 client FPS | bitwise；相对 SP1 为 0.956x |
+| B300 SP8 exact | 1248x704 | 15.109 client FPS | bitwise；相对 SP1 为 0.951x |
 
 在相同 720p case 的 warm full-case 口径下，minWM baseline 约为 8.20 generated FPS，
 SGLang API 约为 10.095 generated FPS，API 快约 23%。不要把 832x480 的 23 FPS
@@ -178,6 +184,21 @@ compile，并保留与 minWM `main` 相同的局部 fused-segment compile；性�
 因此用于比较“已验收 exact”与“组合性能上限”，不能把总差值全部归因给 compile。
 832x480 的受控矩阵中，compile 在相同 dense/优化组件上单独贡献了约 `26.16%`。
 
+最新 SP 矩阵固定在一台 `p6-b300.48xlarge` Spot，区域为
+`us-east-1-atl-2a`，8 张 B300 之间均为 `NV18`。四档使用相同 checkpoint、输入、
+seed、完整历史 KV、deterministic packed attention、一次完整 warmup，再统计七个
+steady chunk。SP1/2/4/8 的 scheduler FPS 分别是
+`15.896/15.191/15.158/15.107`，client FPS 分别是
+`15.891/15.207/15.191/15.109`。所有 SP lane 的 generated frames 都满足
+`max_abs=0、RMSE=0、SSIM=1、changed_value_fraction=0`。
+
+这组结果验证了功能和数值合同，但否定了“SP>1 会提高当前 720p 单流 FPS”的假设。
+SP 只分摊 sequence attention 与 causal KV；权重、FFN、VAE 和 RGB/output 路径没有
+随 degree 等比例分摊，all-to-all 反而成为净开销。峰值显存/GPU 从 SP1 的
+`51,588 MiB` 降到 SP2/4/8 的 `50,560/48,826/48,918 MiB`，降幅仅
+`1.99%/5.35%/5.18%`，而节点总显存随 replica 数增加。它适合扩大可承载 sequence，
+不应在这个 shape 上作为低延迟吞吐优化默认打开。
+
 ## 9. Sequence Parallel 审计与 24 FPS 上限
 
 MinWM 现在复用 LingBot 的 varlen Ulysses collective 骨架，并补齐以下 causal 合同：
@@ -191,11 +212,12 @@ MinWM 现在复用 LingBot 的 varlen Ulysses collective 骨架，并补齐以�
 
 当前只允许 `sp_degree == ulysses_degree > 1` 且 `ring_degree == 1`。Sampling params
 必须保持 `enable_sequence_shard=True`；SP>1 却显式关闭 shard 会直接报错。Ring、
-TP+SP、FSDP+SP 和 whole-DiT compile+SP 尚未实现。多卡 GPU 验收仍需覆盖 reference
-clean commit、四次 DMD forward、clean-final KV 写入、连续 action、prompt update、
-bounded/unbounded history 以及 SP2/SP4/SP8。
+TP+SP、FSDP+SP 和 whole-DiT compile+SP 尚未实现。正式多卡矩阵已经覆盖一个
+bounded 129-frame 连续 action 请求中的 reference clean commit、四次 DMD forward、
+clean-final KV 写入和完整历史，并验收 SP2/SP4/SP8；prompt update、unbounded
+history、跨更多 case 的多卡回归仍需补齐。
 
-即使将来接通 Ulysses，单靠 SP 也无法让当前 720p 串行 pipeline 到 24 FPS。H200
+即使已经接通 Ulysses，单靠 SP 也无法让当前 720p 串行 pipeline 到 24 FPS。H200
 24-chunk profile 的中位时间约为：
 
 - DiT：637.35 ms；
@@ -245,16 +267,15 @@ causal KV、数值 parity、benchmark、同步播放器、中英文文档和第�
 Ulysses 实现。它没有声称完成：
 
 - Ring Attention，以及 Ulysses 与 TP/FSDP/whole-DiT compile 的组合；
-- SP2/SP4/SP8 的多卡 bitwise 与性能验收；
 - 多 session dynamic batching；
 - 720p 24 FPS；
 - whole-DiT compile 的 strict parity；
 - 0721 checkpoint 的原生首帧训练合同。
 
-推荐的下一阶段顺序是：先在相同 prompt/seed/首帧/action 的多卡环境中完成
-SP2/SP4/SP8 bitwise 或预声明 tolerance 的验收矩阵，并分开记录 all-to-all 与 final
-all-gather；再 profile VAE/RGB，做 decode/DiT pipeline overlap；最后评估 Ring 或混合
-并行是否值得。
+推荐的下一阶段顺序是：先用 Nsight 分开记录 attention compute、input/reverse
+all-to-all 与 final all-gather，解释 B300 上约 4–5% 的负加速；再 profile VAE/RGB，
+做 decode/DiT pipeline overlap；然后补 prompt update、unbounded history 和多 case
+的多卡回归；最后评估 Ring 或混合并行是否值得。
 Whole-DiT performance profile 若要成为产品默认值，也必须单独定义并通过数值 tolerance
 和冷启动预算，而不能继承 eager exact lane 的 bitwise 结论。
 

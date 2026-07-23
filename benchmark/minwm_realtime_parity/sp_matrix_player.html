@@ -20,6 +20,7 @@
     .lede { color: #aeb8ca; margin: 10px 0 0; }
     .status { display: inline-flex; margin-top: 16px; padding: 7px 11px; border-radius: 999px; background: #183c31; color: #87edc5; }
     .status.fail { background: #4a2028; color: #ff9eaa; }
+    .finding { margin: 12px 0 0; color: #ffd38a; }
     .metric-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin: 20px 0; }
     .metric { padding: 16px; border: 1px solid #2a3242; border-radius: 14px; background: rgba(17, 22, 32, .92); }
     .metric strong { display: block; font-size: 24px; font-variant-numeric: tabular-nums; }
@@ -55,6 +56,7 @@
     <h1>MinWM 720p · Causal Ulysses SP</h1>
     <p id="hardware" class="lede">单机 8 GPU Spot，同一 checkpoint、输入、seed 与 deterministic packed attention。默认一键同步播放 SP1 与 SP2。</p>
     <span id="status" class="status">读取实测报告…</span>
+    <p id="finding" class="finding"></p>
   </header>
   <main>
     <section id="metrics" class="metric-grid"></section>
@@ -107,7 +109,8 @@
     const caseItem = report.cases[0];
     const laneMap = new Map(report.lanes.map(lane => [lane.degree, lane]));
     const fps = report.contract.fps;
-    document.querySelector('#hardware').textContent = `${report.contract.hardware}，同一 checkpoint、输入、seed 与 deterministic packed attention。默认一键同步播放 SP1 与 SP2。`;
+    const location = report.contract.location ? ` · ${report.contract.location}` : '';
+    document.querySelector('#hardware').textContent = `${report.contract.hardware}${location}，同一 checkpoint、输入、seed 与 deterministic packed attention。默认一键同步播放 SP1 与 SP2。`;
 
     const fmt = (value, digits=2) => value == null ? 'n/a' : Number(value).toFixed(digits);
     const formatTime = seconds => `${Math.floor(seconds / 60)}:${String(Math.floor(seconds % 60)).padStart(2, '0')}`;
@@ -116,6 +119,14 @@
     if (!report.summary.all_generated_bitwise) status.classList.add('fail');
 
     const sp2 = laneMap.get(2);
+    const sp2Delta = sp2?.performance.client_speedup_vs_sp1 == null
+      ? null
+      : (sp2.performance.client_speedup_vs_sp1 - 1) * 100;
+    document.querySelector('#finding').textContent = sp2Delta == null
+      ? ''
+      : sp2Delta > 0
+        ? `当前 workload 的 SP2 client throughput 提升 ${fmt(sp2Delta, 2)}%。`
+        : `当前 workload 的 SP2 client throughput 没有提升，实测变化 ${fmt(sp2Delta, 2)}%；all-to-all 开销高于 attention 分片收益。`;
     [
       ['SP2 Client FPS', fmt(sp2?.performance.client_fps, 3)],
       ['SP2 加速比', `${fmt(sp2?.performance.client_speedup_vs_sp1, 3)}×`],

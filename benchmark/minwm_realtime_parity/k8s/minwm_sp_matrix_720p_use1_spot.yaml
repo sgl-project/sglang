@@ -148,6 +148,8 @@ spec:
               value: "1"
             - name: MINWM_SP_DEGREES
               value: "1 2 4 8"
+            - name: MINWM_SP_LOCATION
+              value: us-east-1-atl-2a
             - name: MINWM_CUDA_LAUNCH_BLOCKING
               value: "0"
             - name: MINWM_STAGE_FROM_MOUNT

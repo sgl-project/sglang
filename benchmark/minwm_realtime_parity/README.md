@@ -160,6 +160,40 @@ paths remain valid.
 Lossless `baseline.npy` and `sglang.npy` arrays are the metric source; MP4 files
 are only visualization artifacts and are never used for numeric acceptance.
 
+## Local Zone Spot SP matrix
+
+The 2026-07-23 formal SP1/SP2/SP4/SP8 run used one Spot
+`p6-b300.48xlarge` in Local Zone `us-east-1-atl-2a`: eight NVIDIA B300
+SXM6 GPUs with full `NV18` connectivity. The fixed workload is the latest 0721
+checkpoint, deterministic packed causal attention, full-history KV, one warmup
+clip, and one measured 1248x704 clip containing 129 frames at 24 FPS
+(5.375 seconds). Client FPS excludes chunk zero and measures the remaining seven
+16-frame chunks.
+
+| SP | Scheduler FPS | Client FPS | Client speedup vs SP1 | TTFF | Peak/GPU |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 15.896 | 15.891 | 1.000x | 1.541 s | 51,588 MiB |
+| 2 | 15.191 | 15.207 | 0.957x | 1.543 s | 50,560 MiB |
+| 4 | 15.158 | 15.191 | 0.956x | 1.569 s | 48,826 MiB |
+| 8 | 15.107 | 15.109 | 0.951x | 1.756 s | 48,918 MiB |
+
+All SP2/SP4/SP8 generated uint8 frames are bitwise identical to SP1:
+`max_abs=0`, `RMSE=0`, `SSIM=1`, and `changed_value_fraction=0`. SP therefore
+passes the requested numerical-parity matrix, but it does **not** improve
+single-stream throughput for this workload. SP2 is 4.30% slower than SP1, while
+SP4 and SP8 are 4.40% and 4.92% slower. Ulysses only shards sequence attention
+and causal KV here; model weights, FFN, VAE, and output handling remain replicated
+or serial, so the all-to-all cost exceeds the attention saving. Per-GPU peak
+memory falls only 1.99% at SP2 and about 5.3% at SP4/SP8, while node-total memory
+increases with the number of replicas.
+
+The copied local artifact is under
+`results/latest-checkpoint-sp-matrix-720p-b300-spot/sp-matrix-720p/`.
+Its `player/index.html` defaults to a synchronized SP1/SP2 pair and can switch
+the right-hand video to SP4 or SP8. It works through `file://` and has also been
+browser-tested through a local HTTP server: one click started both 5.375-second
+videos with less than 0.1 ms observed start-time skew.
+
 ## Latest-checkpoint formal run
 
 The 2026-07-22 Spot B200 formal result for the requested latest checkpoint is:
