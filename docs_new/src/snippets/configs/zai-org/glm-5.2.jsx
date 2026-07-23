@@ -285,6 +285,9 @@ sgl-eval run aime25 \\
       ],
     },
     {
+      // Memory-bound: FP8 weights + KV fill each H200. No max-running cap, but the CUDA-graph
+      // capture is bounded (--cuda-graph-max-bs 256, with a matching DeepEP dispatch buffer)
+      // since uncapping it OOMs. Throughput saturates at conc 256; higher conc just queues.
       match: { hw: "h200", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
       verified: true,
       env: [],
@@ -295,7 +298,7 @@ sgl-eval run aime25 \\
         "--enable-dp-attention",
         "--moe-a2a-backend deepep",
         "--mem-fraction-static 0.85",
-        "--max-running-requests 256",
+        "--cuda-graph-max-bs 128",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -344,17 +347,20 @@ sgl-eval run aime25 \\
       ],
     },
     {
+      // Blackwell HT: raise the DeepEP dispatch buffer (default 128) and drop the
+      // --max-running-requests cap so the engine sizes the running batch to KV
+      // (~560 concurrent here, vs the old 256 cap). mem-fraction-static drops 0.85->0.80
+      // to leave room for the larger decode CUDA-graph capture. Trades TTFT for throughput.
       match: { hw: "b200", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
       verified: true,
-      env: [],
+      env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=512"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
         "--dp 8",
         "--enable-dp-attention",
         "--moe-a2a-backend deepep",
-        "--mem-fraction-static 0.85",
-        "--max-running-requests 256",
+        "--mem-fraction-static 0.80",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -405,6 +411,8 @@ sgl-eval run aime25 \\
       ],
     },
     {
+      // Scales past balanced (verified): mfs 0.90 grows the KV batch, cuda-graph-max-bs 512
+      // sizes the decode capture for it.
       match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
       verified: true,
       env: [
@@ -416,7 +424,8 @@ sgl-eval run aime25 \\
         "--dp 4",
         "--enable-dp-attention",
         "--moe-a2a-backend deepep",
-        "--mem-fraction-static 0.85",
+        "--mem-fraction-static 0.90",
+        "--cuda-graph-max-bs 512",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -465,17 +474,20 @@ sgl-eval run aime25 \\
       ],
     },
     {
+      // Blackwell HT: raise the DeepEP dispatch buffer (default 128) and drop the
+      // --max-running-requests cap so the engine sizes the running batch to KV
+      // (~1700+ concurrent here; GLM's DSA keeps KV cheap). mem-fraction-static 0.85->0.80
+      // leaves room for the larger decode CUDA-graph capture. Trades TTFT for throughput.
       match: { hw: "b300", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
       verified: true,
-      env: [],
+      env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=512"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
         "--dp 8",
         "--enable-dp-attention",
         "--moe-a2a-backend deepep",
-        "--mem-fraction-static 0.85",
-        "--max-running-requests 256",
+        "--mem-fraction-static 0.80",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -522,6 +534,8 @@ sgl-eval run aime25 \\
       ],
     },
     {
+      // Memory-bound (bf16). No max-running cap; CUDA-graph capture bounded (--cuda-graph-max-bs 256).
+      // Throughput saturates at conc 256 — higher conc just queues.
       match: { hw: "b300", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" },
       verified: true,
       env: [],
@@ -529,7 +543,7 @@ sgl-eval run aime25 \\
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
         "--mem-fraction-static 0.9",
-        "--max-running-requests 256",
+        "--cuda-graph-max-bs 256",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -743,8 +757,7 @@ sgl-eval run aime25 \\
         "--dp 8",
         "--enable-dp-attention",
         "--chunked-prefill-size 32768",
-        "--mem-fraction-static 0.92",
-        "--max-running-requests 512",
+        "--mem-fraction-static 0.85",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -809,7 +822,6 @@ sgl-eval run aime25 \\
         "--dp 8",
         "--enable-dp-attention",
         "--quantization modelopt_fp4",
-        "--max-running-requests 1024",
         "--chunked-prefill-size 8192",
         "--mem-fraction-static 0.85",
         "--host {{HOST_IP}}",
@@ -863,6 +875,8 @@ sgl-eval run aime25 \\
       ],
     },
     {
+      // Scales past balanced (verified): a larger chunked-prefill (16384) lifts throughput
+      // at high concurrency.
       match: { hw: "gb300", variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "single" },
       verified: true,
       env: [],
@@ -872,9 +886,8 @@ sgl-eval run aime25 \\
         "--quantization modelopt_fp4",
         "--dp 4",
         "--enable-dp-attention",
-        "--chunked-prefill-size 8192",
+        "--chunked-prefill-size 16384",
         "--mem-fraction-static 0.92",
-        "--max-running-requests 512",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
