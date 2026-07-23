@@ -1,0 +1,172 @@
+name: PR Test (MLU)
+
+on:
+  push:
+    branches: [ main ]
+  # Run the reviewed base-branch workflow, never workflow code from the PR.
+  pull_request_target:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref (branch, tag, or SHA) to test. If not provided, uses the current ref."
+        required: false
+        type: string
+        default: ""
+      run_all_tests:
+        description: "Run MLU CI regardless of file changes"
+        required: false
+        type: boolean
+        default: false
+      trigger_type:
+        description: "Task type sent to the Cambricon Runner: ci, pr, pull_request, push, or nightly"
+        required: false
+        type: string
+        default: "ci"
+  workflow_call:
+    inputs:
+      ref:
+        description: "Git ref (branch, tag, or SHA) to test. If not provided, uses the current ref."
+        required: false
+        type: string
+        default: ""
+      run_all_tests:
+        description: "Run MLU CI regardless of file changes"
+        required: false
+        type: boolean
+        default: false
+      trigger_type:
+        description: "Task type sent to the Cambricon Runner: ci, pr, pull_request, push, or nightly"
+        required: false
+        type: string
+        default: "ci"
+
+permissions:
+  actions: read
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: pr-test-mlu-${{ github.event.pull_request.number || inputs.ref || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
+
+jobs:
+  check-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      changes_exist: ${{ steps.filter.outputs.main_package == 'true' || steps.filter.outputs.mlu_backend == 'true' || steps.run-mode.outputs.run_all_tests == 'true' }}
+    steps:
+      - name: Checkout code for change detection
+        if: github.event_name != 'pull_request_target'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Determine run mode
+        id: run-mode
+        run: |
+          if [[ "${{ inputs.run_all_tests }}" == "true" ]]; then
+            echo "run_all_tests=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run_all_tests=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Detect file changes
+        id: filter
+        uses: dorny/paths-filter@v3
+        if: steps.run-mode.outputs.run_all_tests != 'true'
+        with:
+          filters: |
+            main_package:
+              - "python/sglang/!(multimodal_gen)/**/!(*.md)"
+              - "python/pyproject_mlu.toml"
+              - "test/**/!(*.md)"
+              - ".github/workflows/pr-test-mlu.yml"
+            mlu_backend:
+              - "python/pyproject_mlu.toml"
+              - "python/sglang/srt/platforms/mlu.py"
+              - "python/sglang/srt/hardware_backend/mlu/**"
+              - "python/sglang/srt/distributed/device_communicators/mlu_communicator.py"
+              - "test/registered/mlu/**"
+              - "docs/platforms/cambricon_mlu.md"
+              - ".github/workflows/pr-test-mlu.yml"
+
+  pr-gate:
+    needs: check-changes
+    if: needs.check-changes.outputs.changes_exist == 'true'
+    uses: ./.github/workflows/pr-gate.yml
+
+  pr-test-mlu:
+    needs: [check-changes, pr-gate]
+    if: needs.check-changes.outputs.changes_exist == 'true'
+    runs-on:
+      group: mlu-ci
+      labels: mlu-pr
+    timeout-minutes: 120
+    steps:
+      # Do not checkout the PR on this self-hosted runner. Jenkins
+      # receives and executes the immutable PR SHA in its isolated MLU pod.
+      - name: Submit MLU CI task to Cambricon Runner
+        env:
+          SGLANG_MLU_CI_REPO_NAME: sglang
+          SGLANG_MLU_CI_PR_ID: ${{ github.event.pull_request.number || '' }}
+          SGLANG_MLU_CI_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || format('{0}/{1}.git', github.server_url, github.repository) }}
+          SGLANG_MLU_CI_GIT_REF: ${{ github.event.pull_request.head.sha || inputs.ref || github.ref_name }}
+          SGLANG_MLU_CI_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          SGLANG_MLU_CI_TRIGGER_TYPE: ${{ inputs.trigger_type || 'ci' }}
+          SGLANG_MLU_CI_BRIDGE_URL: http://127.0.0.1:14547
+          SGLANG_MLU_CI_TIMEOUT_SECONDS: "6600"
+          SGLANG_MLU_CI_LOG_DIR: ${{ runner.temp }}/mlu-ci-logs
+          SGLANG_MLU_CI_OBSERVE_ONLY: ${{ github.event_name == 'pull_request_target' }}
+        run: |
+          if ! command -v sglang-mlu-ci >/dev/null 2>&1; then
+            classification="MLU CI failure classification: type=infrastructure, stage=runner_client"
+            mkdir -p "${SGLANG_MLU_CI_LOG_DIR}"
+
+            observe_only=false
+            conclusion=failure
+            annotation=error
+            annotation_title="MLU CI infrastructure failure"
+            policy=failure
+            exit_code=1
+            if [[ "${SGLANG_MLU_CI_OBSERVE_ONLY}" == "true" ]]; then
+              observe_only=true
+              conclusion=success
+              annotation=warning
+              annotation_title="MLU CI infrastructure warning"
+              policy="warning (observe-only; GitHub job remains successful)"
+              exit_code=0
+            fi
+
+            echo "::${annotation} title=${annotation_title}::${classification}"
+            {
+              echo "## MLU CI result"
+              echo
+              echo "- Status: \`error\`"
+              echo "- Failure type: \`infrastructure\`"
+              echo "- Failure stage: \`runner_client\`"
+              echo "- GitHub conclusion policy: ${policy}"
+            } >> "${GITHUB_STEP_SUMMARY}"
+            printf '{\n  "failure_stage": "runner_client",\n  "failure_type": "infrastructure",\n  "github_conclusion": "%s",\n  "observe_only": %s,\n  "status": "error",\n  "task_id": "runner-client-%s-%s"\n}\n' \
+              "${conclusion}" "${observe_only}" "${GITHUB_RUN_ID}" "${GITHUB_RUN_ATTEMPT}" \
+              > "${SGLANG_MLU_CI_LOG_DIR}/result-runner-client-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.json"
+            exit "${exit_code}"
+          fi
+          sglang-mlu-ci
+
+      - name: Upload MLU CI result metadata
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mlu-ci-result-pr-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/mlu-ci-logs/result-*.json
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Upload MLU Jenkins log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mlu-jenkins-log-pr-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/mlu-ci-logs/
+          if-no-files-found: warn

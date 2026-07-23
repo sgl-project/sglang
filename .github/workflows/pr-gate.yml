@@ -21,7 +21,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Fetch latest PR info
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' || github.event_name == 'pull_request_target'
         id: pr
         uses: actions/github-script@v8
         with:
@@ -37,7 +37,7 @@ jobs:
             core.setOutput("user", pr.data.user.login);
 
       - name: Log PR info
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' || github.event_name == 'pull_request_target'
         run: |
           echo "===== PR Info ====="
           echo "PR Event: ${{ github.event_name }}"
@@ -50,13 +50,13 @@ jobs:
           echo "==================="
 
       - name: Block draft PR
-        if: github.event_name == 'pull_request' && fromJson(steps.pr.outputs.draft)
+        if: (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && fromJson(steps.pr.outputs.draft)
         run: |
           echo "PR is draft. Blocking CI."
           exit 1
 
       - name: Require run-ci label (optional)
-        if:  github.event_name == 'pull_request' && inputs.require-run-ci == true
+        if: (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && inputs.require-run-ci == true
         run: |
           labels='${{ steps.pr.outputs.labels }}'
           if [[ "${{ contains(fromJson(steps.pr.outputs.labels), 'run-ci') }}" == "false" ]]; then
@@ -70,7 +70,7 @@ jobs:
       # then reruns) could never un-skip. A runtime step using gh-api-fetched
       # labels lets reruns pick up the new label set.
       - name: Require run-ci-extra label (optional)
-        if: github.event_name == 'pull_request' && inputs.require-run-ci-extra == true
+        if: (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && inputs.require-run-ci-extra == true
         run: |
           if [[ "${{ contains(fromJson(steps.pr.outputs.labels), 'run-ci-extra') }}" == "false" ]]; then
             echo "Missing required label 'run-ci-extra'. Add the label (e.g. via /tag-and-rerun-ci extra) to opt this PR into the extra test workflow."
@@ -78,7 +78,7 @@ jobs:
           fi
 
       - name: Enforce rate limit for low-permission actors (optional)
-        if: github.event_name == 'pull_request' && inputs.cool-down-minutes > 0
+        if: (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && inputs.cool-down-minutes > 0
         uses: actions/github-script@v8
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
@@ -87,6 +87,11 @@ jobs:
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const eventName = context.eventName;
+            // The base CI workflow still uses pull_request, so target-based
+            // callers share the same rate-limit history as normal PR runs.
+            const rateLimitEventName = eventName === "pull_request_target"
+              ? "pull_request"
+              : eventName;
             const curRun = await github.rest.actions.getWorkflowRun({
               owner, repo, run_id: context.runId
             });
@@ -168,7 +173,7 @@ jobs:
               owner,
               repo,
               workflow_id: 'pr-test.yml',
-              event: eventName,
+              event: rateLimitEventName,
               per_page: 100,
             });
 

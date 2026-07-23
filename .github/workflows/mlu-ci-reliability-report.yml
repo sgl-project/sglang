@@ -1,0 +1,96 @@
+name: MLU CI Reliability Report
+
+on:
+  schedule:
+    - cron: '17 0 * * 1' # Every Monday at 00:17 UTC
+  workflow_dispatch:
+    inputs:
+      days:
+        description: 'Number of days to include'
+        required: false
+        default: '7'
+        type: string
+      issue_number:
+        description: 'Report issue number; defaults to the repository variable or sgl-project/sglang#32300'
+        required: false
+        default: ''
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: mlu-ci-reliability-report
+  cancel-in-progress: false
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: read
+    env:
+      REPORT_DAYS: ${{ inputs.days || '7' }}
+    steps:
+      - name: Checkout trusted reporter
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Build MLU CI reliability report
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          end_time_args=()
+          if [[ "${GITHUB_EVENT_NAME}" == "schedule" ]]; then
+            end_time_args=(--end-time "$(date -u +%Y-%m-%dT%H:00:00Z)")
+          fi
+          python scripts/ci/utils/mlu_ci_reliability_report.py \
+            --repo "${GITHUB_REPOSITORY}" \
+            --event all \
+            --days "${REPORT_DAYS}" \
+            "${end_time_args[@]}" \
+            --output mlu-ci-reliability.md \
+            --json-output mlu-ci-reliability.json
+          cat mlu-ci-reliability.md >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload report data
+        uses: actions/upload-artifact@v4
+        with:
+          name: mlu-ci-reliability-${{ github.run_id }}
+          path: |
+            mlu-ci-reliability.md
+            mlu-ci-reliability.json
+          retention-days: 30
+          if-no-files-found: error
+
+  publish:
+    needs: report
+    if: ${{ github.repository == 'sgl-project/sglang' || inputs.issue_number != '' || vars.MLU_CI_REPORT_ISSUE_NUMBER != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      issues: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      REPORT_ISSUE_NUMBER: ${{ inputs.issue_number || vars.MLU_CI_REPORT_ISSUE_NUMBER || '32300' }}
+    steps:
+      - name: Download report data
+        uses: actions/download-artifact@v4
+        with:
+          name: mlu-ci-reliability-${{ github.run_id }}
+          path: report-data
+
+      - name: Publish report to the RFC issue
+        run: |
+          if [[ ! "${REPORT_ISSUE_NUMBER}" =~ ^[0-9]+$ ]]; then
+            echo "::error::Report issue number must be numeric"
+            exit 1
+          fi
+          gh issue comment "${REPORT_ISSUE_NUMBER}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --body-file report-data/mlu-ci-reliability.md
