@@ -61,6 +61,10 @@ class DecodeKVCacheOffloadManager:
                 server_args.hicache_size,
                 self.page_size,
                 server_args.hicache_mem_layout,
+                # Match the prefill-side HiRadixCache: storage backends with a
+                # dedicated host allocator (e.g. mooncake standalone storage)
+                # need decode offload buffers inside their registered segment.
+                allocator_type=server_args.hicache_storage_backend,
             )
         elif isinstance(kv_cache, MLATokenToKVPool):
             self.decode_host_mem_pool = MLATokenToKVPoolHost(
@@ -69,6 +73,7 @@ class DecodeKVCacheOffloadManager:
                 server_args.hicache_size,
                 self.page_size,
                 server_args.hicache_mem_layout,
+                allocator_type=server_args.hicache_storage_backend,
             )
         else:
             raise ValueError("Unsupported KV cache type for decode offload")

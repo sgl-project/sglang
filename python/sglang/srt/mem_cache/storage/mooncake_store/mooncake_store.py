@@ -38,6 +38,8 @@ class MooncakeHostTensorAllocator(HostTensorAllocator):
 
         self.allocator = MooncakeHostMemAllocator()
         self.ptr = None
+        self.logical_size = None
+        self.allocated_size = None
 
     def allocate(
         self, dims: tuple, dtype: torch.dtype, device: str = "cpu"
@@ -51,8 +53,10 @@ class MooncakeHostTensorAllocator(HostTensorAllocator):
         for d in dims:
             size *= d
         size *= torch.tensor([], dtype=self.dtype).element_size()
-        ptr_int = self.allocator.alloc(size)
+        allocated_size = self._allocated_nbytes(size)
+        ptr_int = self.allocator.alloc(allocated_size)
         self.ptr = ptr_int
+        self.logical_size, self.allocated_size = size, allocated_size
         c_type = ctypes.c_byte * size
         c_array = c_type.from_address(ptr_int)
 
@@ -64,6 +68,36 @@ class MooncakeHostTensorAllocator(HostTensorAllocator):
             tensor = tensor.view(dtype)
 
         return tensor.view(dims)
+
+    @staticmethod
+    def _allocated_nbytes(logical_size: int) -> int:
+        if os.getenv("MC_STORE_USE_HUGEPAGE", "0").strip().lower() not in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        ):
+            return logical_size
+        page_size_name = os.getenv("MC_STORE_HUGEPAGE_SIZE", "2MB").strip().upper()
+        page_sizes = {
+            "2MB": 2 * 1024 * 1024,
+            "1GB": 1024 * 1024 * 1024,
+        }
+        if page_size_name not in page_sizes:
+            raise ValueError(
+                f"Unsupported MC_STORE_HUGEPAGE_SIZE={page_size_name!r}; "
+                f"expected one of {sorted(page_sizes)}"
+            )
+        page_size = page_sizes[page_size_name]
+        return (logical_size + page_size - 1) // page_size * page_size
+
+    def cuda_registration_nbytes(self, buffer: torch.Tensor) -> int:
+        # Register the full (hugepage-aligned) backing allocation: pinning
+        # only the logical size would leave the alignment tail unpinned and
+        # break RDMA transfers from within that region.
+        if buffer.data_ptr() != self.ptr or self.allocated_size is None:
+            raise RuntimeError("Mooncake allocator does not own the host buffer")
+        return self.allocated_size
 
 
 def _parse_global_segment_size(value) -> int:
