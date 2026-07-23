@@ -224,6 +224,9 @@ class KimiLinearStateShape:
     # Conv tuples read (K-1, dim) — the overlapping dedup view would alias
     # along the dim axis, so the dedup conv-intermediate layout must stay off.
     disable_conv_window_dedup: bool = True
+    # Per-slot conv tensors are [K-1, sharded_channels], unlike the usual
+    # [sharded_channels, K-1] layout.
+    conv_slice_axis: int = 1
 
     num_heads: int
     head_dim: int

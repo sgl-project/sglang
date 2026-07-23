@@ -811,6 +811,7 @@ class MambaPool:
         # Full (unsharded) conv sub-block dims for PD transfer across different
         # attn_tp_size (GDN: [key_dim, key_dim, value_dim]); None otherwise.
         self.conv_shard_groups = getattr(cache_params.shape, "conv_shard_groups", None)
+        self.conv_slice_axis = getattr(cache_params.shape, "conv_slice_axis", 0)
 
     def get_speculative_mamba2_params_all_layers(self) -> SpeculativeState:
         assert isinstance(self.mamba_cache, self.SpeculativeState)
@@ -1055,15 +1056,16 @@ class MambaPool:
             if value is None:
                 continue
             if isinstance(value, list):
-                state_tensors.extend(value)
+                state_tensors.extend((field, tensor) for tensor in value)
             else:
-                state_tensors.append(value)
+                state_tensors.append((field, value))
 
         dim_per_tensor = []
-        for state_tensor in state_tensors:
+        for field, state_tensor in state_tensors:
             # state_tensor shape: [num_layers, size+1, sliceable_dim, ...]
-            # The sliceable dimension is at index 2 (after num_layers and size)
-            sliceable_dim = state_tensor.shape[2]
+            # Kimi conv state transposes the two per-slot axes to [K-1, dim].
+            axis = 2 + (self.conv_slice_axis if field == "conv" else 0)
+            sliceable_dim = state_tensor.shape[axis]
             # Repeat for each layer since we have per-layer data_ptrs
             dim_per_tensor += [sliceable_dim] * self.num_mamba_layers
         return dim_per_tensor
