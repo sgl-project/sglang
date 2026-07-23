@@ -447,53 +447,106 @@ class TestStructuralSignature(unittest.TestCase):
     future sharding knob that changes shapes is automatically caught
     without touching `_build_subfolder_name`."""
 
-    def test_hash_is_deterministic(self):
-        sig_input = [("a.weight", (4, 4), "torch.float32")]
-        self.assertEqual(
-            PreshardedModelLoader._hash_structural_signature(sig_input),
-            PreshardedModelLoader._hash_structural_signature(list(sig_input)),
-        )
-
-    def test_hash_changes_with_shape(self):
-        a = [("a.weight", (4, 4), "torch.float32")]
-        b = [("a.weight", (4, 8), "torch.float32")]
-        self.assertNotEqual(
-            PreshardedModelLoader._hash_structural_signature(a),
-            PreshardedModelLoader._hash_structural_signature(b),
-        )
-
-    def test_hash_changes_with_dtype(self):
-        a = [("a.weight", (4, 4), "torch.float32")]
-        b = [("a.weight", (4, 4), "torch.float16")]
-        self.assertNotEqual(
-            PreshardedModelLoader._hash_structural_signature(a),
-            PreshardedModelLoader._hash_structural_signature(b),
-        )
-
-    def test_hash_changes_with_added_or_removed_tensor(self):
-        # Simulates a new sharding knob splitting one tensor into two (or
-        # adding a new per-rank buffer) -- the exact case manual flag
-        # enumeration would miss if nobody updates _build_subfolder_name.
-        a = [("a.weight", (4, 4), "torch.float32")]
-        b = [
+    def test_hash_changes_with_shape_dtype_or_added_tensor(self):
+        # Regression: a future sharding knob that changes shapes/dtypes or
+        # adds per-rank buffers must change the digest, otherwise cache
+        # collisions load wrong weights. One case covers the three axes that
+        # `_hash_structural_signature` is responsible for.
+        base = [("a.weight", (4, 4), "torch.float32")]
+        shape = [("a.weight", (4, 8), "torch.float32")]
+        dtype = [("a.weight", (4, 4), "torch.float16")]
+        extra = [
             ("a.weight", (4, 4), "torch.float32"),
             ("a.extra_buf", (4,), "torch.float32"),
         ]
-        self.assertNotEqual(
-            PreshardedModelLoader._hash_structural_signature(a),
-            PreshardedModelLoader._hash_structural_signature(b),
-        )
+        h = PreshardedModelLoader._hash_structural_signature
+        self.assertNotEqual(h(base), h(shape))
+        self.assertNotEqual(h(base), h(dtype))
+        self.assertNotEqual(h(base), h(extra))
 
-    def test_hash_is_order_independent_given_presorted_input(self):
-        # _compute_structural_signature always sorts before hashing, so
-        # callers that pre-sort (as it does) get a stable hash regardless
-        # of the original state_dict iteration order.
-        a = [("a.weight", (4, 4), "torch.float32"), ("b.weight", (2,), "torch.int8")]
-        b = sorted(reversed(a))
-        self.assertEqual(
-            PreshardedModelLoader._hash_structural_signature(a),
-            PreshardedModelLoader._hash_structural_signature(sorted(b)),
-        )
+    def test_local_signature_sorts_state_dict_order(self):
+        # Production path sorts state_dict items before hashing. If that
+        # sorted(...) is dropped, two identical models whose state_dict
+        # iteration order differs would get different signatures and thrash
+        # the cache. Guard the sort, not just the pure hash helper.
+        import torch.nn as nn
+
+        class OrderedModule(nn.Module):
+            def __init__(self, order):
+                super().__init__()
+                for name in order:
+                    self.register_parameter(
+                        name, nn.Parameter(torch.zeros(2, 2), requires_grad=False)
+                    )
+
+        def _init_stub(model_config, load_config, quant_config):
+            return OrderedModule(model_config.order)
+
+        loader = object.__new__(PreshardedModelLoader)
+        loader.load_config = SimpleNamespace()
+        with mock.patch(
+            "sglang.srt.model_loader.loader._get_quantization_config",
+            return_value=None,
+        ), mock.patch(
+            "sglang.srt.model_loader.loader._initialize_model",
+            side_effect=_init_stub,
+        ), mock.patch(
+            "sglang.srt.model_loader.loader.set_default_torch_dtype",
+            return_value=mock.MagicMock(__enter__=mock.Mock(), __exit__=mock.Mock()),
+        ):
+            sig_ab = loader._compute_local_structural_signature(
+                SimpleNamespace(
+                    quantization=None, dtype=torch.float32, order=["a", "b"]
+                )
+            )
+            sig_ba = loader._compute_local_structural_signature(
+                SimpleNamespace(
+                    quantization=None, dtype=torch.float32, order=["b", "a"]
+                )
+            )
+        self.assertIsNotNone(sig_ab)
+        self.assertEqual(sig_ab, sig_ba)
+
+    def test_rank_invariant_signature_aggregates_per_rank_locals(self):
+        # Under PP, ranks build different local digests. The shared cache key
+        # must still agree across ranks: all-gather then hash the ordered
+        # list. Without this, each PP stage would pick a different
+        # presharded subfolder and the multi-rank dump protocol breaks.
+        fake_group = mock.Mock()
+        fake_group.world_size = 2
+        # Simulate two ranks each calling with their own local sig; both
+        # must see the same gathered list and thus the same aggregate.
+        fake_group.all_gather_object.side_effect = lambda local: ["sig-pp0", "sig-pp1"]
+
+        with mock.patch(
+            "sglang.srt.distributed.get_world_group", return_value=fake_group
+        ):
+            agg_from_rank0 = (
+                PreshardedModelLoader._make_rank_invariant_structural_signature(
+                    "sig-pp0"
+                )
+            )
+            agg_from_rank1 = (
+                PreshardedModelLoader._make_rank_invariant_structural_signature(
+                    "sig-pp1"
+                )
+            )
+        self.assertIsNotNone(agg_from_rank0)
+        self.assertEqual(agg_from_rank0, agg_from_rank1)
+        # Changing any rank's local contribution must change the aggregate.
+        fake_group.all_gather_object.side_effect = lambda local: [
+            "sig-pp0",
+            "sig-pp1-changed",
+        ]
+        with mock.patch(
+            "sglang.srt.distributed.get_world_group", return_value=fake_group
+        ):
+            agg_changed = (
+                PreshardedModelLoader._make_rank_invariant_structural_signature(
+                    "sig-pp0"
+                )
+            )
+        self.assertNotEqual(agg_from_rank0, agg_changed)
 
     def test_compute_structural_signature_returns_none_on_failure(self):
         # No self.load_config (and no real model class behind
@@ -552,11 +605,11 @@ class TestStructuralSignature(unittest.TestCase):
         # clean them up (via finally), otherwise the real model init reuses
         # the meta module and fails with "Cannot copy out of meta tensor".
         import torch.nn as nn
+
         from sglang.srt.layers.rotary_embedding.factory import _ROPE_DICT
 
         # Plant a fake meta-device rotary module in the global cache.
         fake_key = ("_test_meta_rope_cleanup_sentinel",)
-        fake_module = nn.Linear(4, 4)
         with torch.device("meta"):
             fake_module = nn.Linear(4, 4)
         _ROPE_DICT[fake_key] = fake_module
@@ -580,6 +633,211 @@ class TestStructuralSignature(unittest.TestCase):
 
         self.assertIsNone(result)
         self.assertNotIn(fake_key, _ROPE_DICT)
+
+
+class TestShardConfig(unittest.TestCase):
+    """Bookkeeping guards for the enumerated cache-key fields and the
+    load-time match path. Dropping a field from `_collect_shard_config` or
+    breaking `_shard_config_matches` would silently collide caches; these
+    cases pin the failure modes the PR is meant to prevent."""
+
+    def _base_config(self, **overrides):
+        cfg = {
+            "tp": 8,
+            "dp": 1,
+            "ep": 1,
+            "pp": 1,
+            "moe_dense_tp_size": None,
+            "moe_dp_size": 1,
+            "enable_dp_lm_head": False,
+            "enable_fp32_lm_head": False,
+            "quantization": None,
+            "model_dtype": "torch.bfloat16",
+            "ep_num_redundant_experts": 0,
+            "enable_eplb": False,
+            "init_expert_location": "trivial",
+            "structural_signature": "deadbeef",
+        }
+        cfg.update(overrides)
+        return cfg
+
+    def test_collect_shard_config_includes_required_keys(self):
+        # Registry completeness: dropping a key from the dict literal in
+        # `_collect_shard_config` is the exact failure mode that left
+        # moe_dense_tp_size / LM-head flags out of the cache key before.
+        loader = object.__new__(PreshardedModelLoader)
+        server_args = SimpleNamespace(
+            moe_dense_tp_size=1,
+            moe_dp_size=2,
+            enable_dp_lm_head=True,
+            enable_fp32_lm_head=True,
+            ep_num_redundant_experts=4,
+            enable_eplb=True,
+            init_expert_location="trivial",
+        )
+        model_config = SimpleNamespace(quantization="fp8", dtype=torch.bfloat16)
+        required = {
+            "tp",
+            "dp",
+            "ep",
+            "pp",
+            "moe_dense_tp_size",
+            "moe_dp_size",
+            "enable_dp_lm_head",
+            "enable_fp32_lm_head",
+            "quantization",
+            "model_dtype",
+            "ep_num_redundant_experts",
+            "enable_eplb",
+            "init_expert_location",
+            "structural_signature",
+        }
+        with mock.patch(
+            "sglang.srt.model_loader.loader.get_global_server_args",
+            return_value=server_args,
+        ), mock.patch(
+            "sglang.srt.distributed.get_tensor_model_parallel_world_size",
+            return_value=8,
+        ), mock.patch(
+            "sglang.srt.distributed.get_moe_data_parallel_world_size",
+            return_value=2,
+        ), mock.patch(
+            "sglang.srt.distributed.get_moe_expert_parallel_world_size",
+            return_value=4,
+        ), mock.patch(
+            "sglang.srt.distributed.get_pipeline_model_parallel_world_size",
+            return_value=1,
+        ), mock.patch.object(
+            loader, "_compute_structural_signature", return_value="sig16"
+        ):
+            cfg = loader._collect_shard_config(model_config)
+        self.assertEqual(required, set(cfg.keys()))
+        self.assertEqual(cfg["moe_dense_tp_size"], 1)
+        self.assertEqual(cfg["moe_dp_size"], 2)
+        self.assertTrue(cfg["enable_dp_lm_head"])
+        self.assertTrue(cfg["enable_fp32_lm_head"])
+        self.assertEqual(cfg["init_expert_location"], "trivial")
+
+    def test_enumerated_fields_change_subfolder_hash(self):
+        # Each enumerated content/shape knob must feed the subfolder name.
+        # A silent drop from `_collect_shard_config` would leave this red.
+        loader = object.__new__(PreshardedModelLoader)
+        base = self._base_config()
+        base_name = loader._build_subfolder_name(base)
+        field_variants = {
+            "moe_dense_tp_size": 1,
+            "moe_dp_size": 2,
+            "enable_dp_lm_head": True,
+            "enable_fp32_lm_head": True,
+            "ep_num_redundant_experts": 8,
+            "enable_eplb": True,
+            "init_expert_location": "file:map.json:sha1:abcd",
+            "structural_signature": "cafebabe",
+            "quantization": "fp8",
+        }
+        for field, value in field_variants.items():
+            with self.subTest(field=field):
+                other = self._base_config(**{field: value})
+                other_name = loader._build_subfolder_name(other)
+                self.assertNotEqual(
+                    base_name,
+                    other_name,
+                    f"changing {field} must change the cache subfolder name",
+                )
+
+    def test_shard_config_matches_equality_and_missing(self):
+        # Match must require exact stored equality; missing/mismatched
+        # shard_config is a cache miss (never raises) so reload re-dumps.
+        loader = object.__new__(PreshardedModelLoader)
+        cfg = self._base_config()
+        with tempfile.TemporaryDirectory() as tmp:
+            # No checksum.json → miss.
+            self.assertFalse(loader._shard_config_matches(tmp, cfg))
+            # Matching stored config → hit.
+            with open(
+                os.path.join(tmp, PreshardedModelLoader.CHECKSUM_FILENAME), "w"
+            ) as f:
+                json.dump({"shard_config": cfg}, f)
+            self.assertTrue(loader._shard_config_matches(tmp, cfg))
+            # One field differs → miss.
+            mismatched = self._base_config(moe_dense_tp_size=1)
+            self.assertFalse(loader._shard_config_matches(tmp, mismatched))
+            # Plan without shard_config key → miss (upgrade path).
+            with open(
+                os.path.join(tmp, PreshardedModelLoader.CHECKSUM_FILENAME), "w"
+            ) as f:
+                json.dump({"version": 1}, f)
+            self.assertFalse(loader._shard_config_matches(tmp, cfg))
+
+    def test_init_expert_location_hashes_file_contents(self):
+        # Overwriting the same path with a different expert map must bust
+        # the cache; keying on the path alone would silently reuse weights.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "experts.json")
+            with open(path, "w") as f:
+                json.dump({"logical_count": [[1, 0], [0, 1]]}, f)
+            key_a = PreshardedModelLoader._normalize_init_expert_location(path)
+            with open(path, "w") as f:
+                json.dump({"logical_count": [[0, 1], [1, 0]]}, f)
+            key_b = PreshardedModelLoader._normalize_init_expert_location(path)
+        self.assertNotEqual(key_a, key_b)
+        self.assertTrue(key_a.startswith("file:experts.json:sha1:"))
+        self.assertEqual(
+            PreshardedModelLoader._normalize_init_expert_location("trivial"),
+            "trivial",
+        )
+
+    def test_redump_clears_ready_before_rewrite(self):
+        # Config-mismatch re-dump into an already-ready dir must drop READY
+        # before mutating files, otherwise concurrent readers can observe
+        # READY + partial checksum/safetensors.
+        loader = object.__new__(PreshardedModelLoader)
+        loader._hash_num_threads = 1
+        loader._max_file_bytes = 10**12
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ready_path = os.path.join(tmp, PreshardedModelLoader.READY_FILENAME)
+            with open(ready_path, "w") as f:
+                f.write("{}")
+            self.assertTrue(os.path.isfile(ready_path))
+
+            # Force rank 0 / world 1 so the method runs the rank-0 prologue
+            # and then fails early on empty state (no need for full dump).
+            with mock.patch.object(
+                PreshardedModelLoader,
+                "_world_rank_and_size",
+                return_value=(0, 1),
+            ), mock.patch.object(
+                PreshardedModelLoader, "_world_barrier", return_value=None
+            ), mock.patch.object(
+                PreshardedModelLoader,
+                "_build_dump_plan",
+                return_value={
+                    "version": 1,
+                    "files": [],
+                    "rank_to_reads": {"0": []},
+                    "rank_checksums": {"0": "0"},
+                },
+            ), mock.patch.object(
+                PreshardedModelLoader, "_dump_files_for_rank", return_value=None
+            ):
+                loader._dump_state_to_disk(
+                    state_dict={},
+                    extras={},
+                    presharded_dir=tmp,
+                    shard_config=self._base_config(),
+                )
+            # Dump rewrote READY at the end; the critical property is that
+            # the prologue unlinked the *previous* READY before rewriting
+            # checksum.json. Assert checksum was written and READY exists
+            # only as the fresh sentinel from this dump.
+            self.assertTrue(os.path.isfile(ready_path))
+            with open(ready_path) as f:
+                sentinel = json.load(f)
+            self.assertIn("plan_version", sentinel)
+            with open(os.path.join(tmp, PreshardedModelLoader.CHECKSUM_FILENAME)) as f:
+                plan = json.load(f)
+            self.assertEqual(plan["shard_config"]["tp"], 8)
 
 
 if __name__ == "__main__":

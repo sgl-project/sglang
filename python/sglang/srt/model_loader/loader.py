@@ -1766,17 +1766,42 @@ class PreshardedModelLoader(DefaultModelLoader):
             "dp": _safe(get_moe_data_parallel_world_size),
             "ep": _safe(get_moe_expert_parallel_world_size),
             "pp": _safe(get_pipeline_model_parallel_world_size),
-            "moe_dense_tp_size": getattr(server_args, "moe_dense_tp_size", None),
+            # ServerArgs knobs that affect weight layout / dtype / expert
+            # placement. Live world sizes above already capture some of these
+            # once parallel groups exist; enumerating the args keeps the key
+            # correct before groups are ready and covers knobs that are not
+            # world-size dimensions (LM head sharding/dtype, EPLB content).
+            "moe_dense_tp_size": server_args.moe_dense_tp_size,
+            "moe_dp_size": server_args.moe_dp_size,
+            "enable_dp_lm_head": server_args.enable_dp_lm_head,
+            "enable_fp32_lm_head": server_args.enable_fp32_lm_head,
             "quantization": model_config.quantization,
-            "model_dtype": str(getattr(model_config, "dtype", "unknown")),
-            "ep_num_redundant_experts": getattr(
-                server_args, "ep_num_redundant_experts", None
-            ),
-            "init_expert_location": getattr(
-                server_args, "init_expert_location", None
+            "model_dtype": str(model_config.dtype),
+            "ep_num_redundant_experts": server_args.ep_num_redundant_experts,
+            "enable_eplb": server_args.enable_eplb,
+            "init_expert_location": self._normalize_init_expert_location(
+                server_args.init_expert_location
             ),
             "structural_signature": self._compute_structural_signature(model_config),
         }
+
+    @staticmethod
+    def _normalize_init_expert_location(value: Optional[str]) -> Optional[str]:
+        """Fold file-backed expert maps into a content digest so overwriting
+        the same path with a different mapping cannot reuse a stale cache.
+
+        ``trivial`` and inline JSON/strings are already content-identity (the
+        string *is* the config). Paths ending in ``.json``/``.pt`` load file
+        contents at EPLB init, so the key must hash those bytes."""
+        if value is None or value == "trivial":
+            return value
+        if value.endswith((".json", ".pt")) and os.path.isfile(value):
+            h = hashlib.sha1()
+            with open(value, "rb") as f:
+                for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                    h.update(chunk)
+            return f"file:{os.path.basename(value)}:sha1:{h.hexdigest()[:16]}"
+        return value
 
     def _build_subfolder_name(self, shard_config: Dict[str, Any]) -> str:
         """``TP-{tp}-sig-{hash16}``: TP stays human-readable (the dimension
@@ -1816,7 +1841,19 @@ class PreshardedModelLoader(DefaultModelLoader):
         )
         return False
 
-    def _compute_structural_signature(
+    def _compute_structural_signature(self, model_config: ModelConfig) -> Optional[str]:
+        """Rank-invariant structural signature for the shared cache key.
+
+        Each rank builds a local (name, shape, dtype) digest under its own
+        parallel state (PP stages have different layers). Those local digests
+        are all-gathered and hashed in rank order so every rank derives the
+        same subfolder name and the dump/load protocol can share one
+        ``presharded_dir``.
+        """
+        local_sig = self._compute_local_structural_signature(model_config)
+        return self._make_rank_invariant_structural_signature(local_sig)
+
+    def _compute_local_structural_signature(
         self, model_config: ModelConfig
     ) -> Optional[str]:
         from sglang.srt.layers.rotary_embedding.factory import _ROPE_DICT
@@ -1857,16 +1894,43 @@ class PreshardedModelLoader(DefaultModelLoader):
                 "be protected -- sharding knobs not listed in "
                 "_collect_shard_config won't be caught automatically. "
                 "Error: %s",
-                getattr(getattr(model_config, "hf_config", None), "model_type", "unknown"),
+                getattr(
+                    getattr(model_config, "hf_config", None), "model_type", "unknown"
+                ),
                 e,
             )
             return None
         finally:
             _clear_meta_rope_cache()
 
+    @classmethod
+    def _make_rank_invariant_structural_signature(
+        cls, local_sig: Optional[str]
+    ) -> Optional[str]:
+        """All-gather per-rank local signatures and hash the ordered list.
+
+        Pipeline-parallel ranks build different local shape digests; without
+        this step they would pick different cache subfolders and break the
+        shared dump/load protocol. When the world group is unavailable
+        (single-process / unit tests), return the local signature unchanged.
+        """
+        try:
+            from sglang.srt.distributed import get_world_group
+
+            group = get_world_group()
+            if group.world_size <= 1:
+                return local_sig
+            all_sigs = group.all_gather_object(local_sig)
+        except (AssertionError, AttributeError, RuntimeError):
+            return local_sig
+
+        if all(s is None for s in all_sigs):
+            return None
+        return hashlib.sha1(repr(all_sigs).encode()).hexdigest()[:16]
+
     @staticmethod
     def _hash_structural_signature(
-        sig_input: List[Tuple[str, Tuple[int, ...], str]]
+        sig_input: List[Tuple[str, Tuple[int, ...], str]],
     ) -> str:
         h = hashlib.sha1(repr(sig_input).encode())
         return h.hexdigest()[:16]
@@ -2019,6 +2083,12 @@ class PreshardedModelLoader(DefaultModelLoader):
         rank, world_size = self._world_rank_and_size()
         tmp_dir = os.path.join(presharded_dir, self.TMP_SUBDIR)
         if rank == 0:
+            # Re-dump path (config mismatch / upgrade) may target a directory
+            # that still has READY from a previous dump. Drop READY first so
+            # concurrent readers cannot observe READY + half-rewritten files.
+            ready_path = os.path.join(presharded_dir, self.READY_FILENAME)
+            if os.path.isfile(ready_path):
+                os.unlink(ready_path)
             os.makedirs(tmp_dir, exist_ok=True)
         self._world_barrier()
 
