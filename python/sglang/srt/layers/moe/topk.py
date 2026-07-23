@@ -1585,14 +1585,12 @@ def biased_grouped_topk_gpu(
             # ===== END TO BE REFACTORED ====
             from sglang.jit_kernel.moe_fused_gate import moe_fused_gate as jit_gate
 
-            # With the radix-select fast path enabled, pass bf16 logits
-            # through untouched: bf16 -> fp32 is exact, the triton router loads
-            # to fp32 internally anyway (identical math), and skipping the
-            # upcast drops one elementwise kernel per MoE layer.
-            _use_radix = envs.SGLANG_OPT_USE_ROUTE_RADIX_V2.get()
+            # Pass BF16 logits through untouched for the automatic radix-select
+            # fast path. BF16 -> FP32 is exact, and unsupported shapes fall back
+            # inside moe_fused_gate.
             _gating = (
                 gating_output
-                if (_use_radix and gating_output.dtype == torch.bfloat16)
+                if gating_output.dtype == torch.bfloat16
                 else gating_output.to(dtype=torch.float32)
             )
             return jit_gate(

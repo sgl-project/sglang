@@ -1,14 +1,34 @@
 import pytest
 import torch
 
-from sglang.jit_kernel.moe_fused_gate_radix import moe_fused_gate_radix as route_radix
-from sglang.jit_kernel.moe_route_radix_v2 import route_radix_v2
+from sglang.jit_kernel.moe_fused_gate import moe_fused_gate
+from sglang.jit_kernel.moe_route_radix import route_radix
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 NUM_EXPERTS = 896
 TOPK = 16
+
+
+def _triton_reference(
+    scores: torch.Tensor,
+    bias: torch.Tensor,
+    renormalize: bool,
+    routed_scaling_factor: float,
+    apply_scale: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # FP32 scores are outside route_radix.covered(), so this exercises the
+    # Triton implementation even though radix is the canonical BF16 path.
+    return moe_fused_gate(
+        scores.float(),
+        bias,
+        topk=TOPK,
+        scoring_func="sigmoid",
+        renormalize=renormalize,
+        routed_scaling_factor=routed_scaling_factor,
+        apply_routed_scaling_factor_on_output=apply_scale,
+    )
 
 
 def _make_case(case: str, num_tokens: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -33,7 +53,7 @@ def _make_case(case: str, num_tokens: int) -> tuple[torch.Tensor, torch.Tensor]:
         scores[:, ::3] = float("nan")
     elif case == "mostly_nan":
         # Fewer than topk non-NaN entries: NaN-floored experts get selected
-        # and their raw-sigmoid weights are NaN (v1 semantics).
+        # and their raw-sigmoid weights are NaN (Triton semantics).
         scores[:, : NUM_EXPERTS - 10] = float("nan")
     elif case == "huge_negative_bias":
         # biased values below the -1e30 NaN floor.
@@ -58,47 +78,40 @@ def _make_case(case: str, num_tokens: int) -> tuple[torch.Tensor, torch.Tensor]:
 @pytest.mark.parametrize(
     "renormalize,apply_scale", [(True, True), (False, False), (True, False)]
 )
-def test_route_radix_v2_vs_v1(num_tokens, case, renormalize, apply_scale):
+def test_route_radix_vs_triton(num_tokens, case, renormalize, apply_scale):
     torch.manual_seed(num_tokens)
     scores, bias = _make_case(case, num_tokens)
     args = (scores, bias, TOPK, renormalize, 2.5, apply_scale)
 
-    ref_w, ref_i = route_radix(*args)
-    w, i = route_radix_v2(*args, sorted=True)
-    assert torch.equal(ref_i, i), f"sorted ids diverge from v1: {case}"
-    torch.testing.assert_close(ref_w, w, rtol=1e-6, atol=0.0, equal_nan=True)
-
-    uw, ui = route_radix_v2(*args, sorted=False)
+    ref_w, ref_i = _triton_reference(scores, bias, renormalize, 2.5, apply_scale)
     ref_order = ref_i.argsort(dim=-1)
-    u_order = ui.argsort(dim=-1)
-    assert torch.equal(
-        ref_i.gather(1, ref_order), ui.gather(1, u_order)
-    ), f"unsorted winner set diverges from v1: {case}"
-    torch.testing.assert_close(
-        ref_w.gather(1, ref_order),
-        uw.gather(1, u_order),
-        rtol=1e-6,
-        atol=0.0,
-        equal_nan=True,
-    )
+    for sorted_output in (True, False):
+        w, i = route_radix(*args, sorted=sorted_output)
+        order = i.argsort(dim=-1)
+        assert torch.equal(
+            ref_i.to(torch.int32).gather(1, ref_order), i.gather(1, order)
+        ), f"winner set diverges from Triton: {case}, sorted={sorted_output}"
+        torch.testing.assert_close(
+            ref_w.gather(1, ref_order),
+            w.gather(1, order),
+            rtol=1e-6,
+            atol=0.0,
+            equal_nan=True,
+        )
 
 
-def test_route_radix_v2_unsorted_id_order():
+def test_route_radix_unsorted_id_order():
     # sorted=False documents compaction (expert-id ascending) output order.
     torch.manual_seed(0)
     scores = torch.randn(4, NUM_EXPERTS, dtype=torch.bfloat16, device="cuda")
     bias = torch.randn(NUM_EXPERTS, dtype=torch.float32, device="cuda")
-    _, ids = route_radix_v2(scores, bias, TOPK, True, 2.5, True, sorted=False)
+    _, ids = route_radix(scores, bias, TOPK, True, 2.5, True, sorted=False)
     assert torch.equal(ids, ids.sort(dim=-1).values)
 
 
-def test_route_radix_v2_flag_dispatch():
-    # SGLANG_OPT_USE_ROUTE_RADIX_V2=1 must route the moe_fused_gate entry
-    # point to v2-unsorted: same winner set as the triton router, ids in
-    # expert-id-ascending order (the v2-unsorted signature).
-    from sglang.jit_kernel.moe_fused_gate import moe_fused_gate
-    from sglang.srt.environ import envs
-
+def test_route_radix_automatic_dispatch_and_fallback():
+    # Covered BF16 inputs route to radix-unsorted automatically. Unsupported FP32
+    # inputs retain the Triton fallback.
     torch.manual_seed(0)
     scores = torch.randn(2, NUM_EXPERTS, dtype=torch.bfloat16, device="cuda")
     bias = torch.randn(NUM_EXPERTS, dtype=torch.float32, device="cuda")
@@ -109,30 +122,25 @@ def test_route_radix_v2_flag_dispatch():
         routed_scaling_factor=2.5,
         apply_routed_scaling_factor_on_output=True,
     )
-    ref_w, ref_i = moe_fused_gate(scores.float(), bias, **common)  # triton
-    with envs.SGLANG_OPT_USE_ROUTE_RADIX_V2.override(True):
-        w, i = moe_fused_gate(scores, bias, **common)
-    assert torch.equal(i, i.sort(dim=-1).values), "dispatch did not reach v2-unsorted"
+    ref_w, ref_i = moe_fused_gate(scores.float(), bias, **common)
+    w, i = moe_fused_gate(scores, bias, **common)
+    assert torch.equal(
+        i, i.sort(dim=-1).values
+    ), "dispatch did not reach radix-unsorted"
     ref_order = ref_i.argsort(dim=-1)
     assert torch.equal(ref_i.to(torch.int32).gather(1, ref_order), i)
     torch.testing.assert_close(ref_w.gather(1, ref_order), w, rtol=1e-6, atol=0.0)
 
-    # Kill-switch: with the flag off, dispatch falls back to the triton path.
-    # ids come back in the triton (biased-descending) order — proof the v2
-    # id-ascending path was not taken. Weights get a tolerance: the triton
-    # kernel fed bf16 directly rounds slightly differently from the fp32
-    # reference (production upcasts to fp32 upstream when the flag is off).
-    with envs.SGLANG_OPT_USE_ROUTE_RADIX_V2.override(False):
-        fw, fi = moe_fused_gate(scores, bias, **common)
+    fw, fi = moe_fused_gate(scores.float(), bias, **common)
     assert torch.equal(ref_i.to(fi.dtype), fi)
-    torch.testing.assert_close(ref_w, fw, rtol=1e-6, atol=0.0)
+    torch.testing.assert_close(ref_w, fw, rtol=0.0, atol=0.0)
 
 
-def test_route_radix_v2_all_equal_min_id():
+def test_route_radix_all_equal_min_id():
     scores = torch.full((2, NUM_EXPERTS), 0.5, dtype=torch.bfloat16, device="cuda")
     bias = torch.zeros(NUM_EXPERTS, dtype=torch.float32, device="cuda")
     for sorted_flag in (True, False):
-        _, ids = route_radix_v2(scores, bias, TOPK, True, 2.5, True, sorted=sorted_flag)
+        _, ids = route_radix(scores, bias, TOPK, True, 2.5, True, sorted=sorted_flag)
         expected = torch.arange(TOPK, dtype=torch.int32, device="cuda")
         assert torch.equal(ids, expected.expand(2, -1))
 

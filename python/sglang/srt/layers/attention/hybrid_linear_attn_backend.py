@@ -10,7 +10,6 @@ from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
     track_mamba_states_if_needed,
 )
 from sglang.srt.configs.hybrid_arch import mamba2_config
-from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
 from sglang.srt.layers.attention.mamba.mamba2_metadata import (
@@ -26,12 +25,6 @@ from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpecInput
 
 logger = logging.getLogger(__name__)
-
-
-# Collapse the per-layer decode track launches into one all-layers launch
-# (fires at the last mamba layer; identical result, see
-# _track_mamba_state_decode).
-_MAMBA_TRACK_FUSED = envs.SGLANG_MAMBA_TRACK_FUSED.get()
 
 
 class MambaAttnBackendBase(AttentionBackend):
@@ -719,13 +712,13 @@ class MambaAttnBackendBase(AttentionBackend):
         dests come from the metadata (under cuda-graph: the static buffer), so the
         InputBuffer registry slot is never mutated.
 
-        With SGLANG_MAMBA_TRACK_FUSED (default on) and a known layer_id, the
-        per-layer launches collapse into ONE all-layers launch fired at the
-        last mamba layer: the mask/src/dst indices are shared across layers and
-        every layer's state is final by then, so the result is identical."""
+        With a known layer_id, the per-layer launches collapse into ONE
+        all-layers launch fired at the last mamba layer: the mask/src/dst
+        indices are shared across layers and every layer's state is final by
+        then, so the result is identical."""
         if forward_batch.mamba_track_mask is None:
             return
-        if _MAMBA_TRACK_FUSED and layer_id is not None:
+        if layer_id is not None:
             pools = self._track_pools()
             if pools is not None:
                 conv_pool, ssm_pool, last_pool_idx = pools

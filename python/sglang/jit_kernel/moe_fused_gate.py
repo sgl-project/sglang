@@ -7,10 +7,9 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.jit_kernel import moe_route_radix_v2
+from sglang.jit_kernel import moe_route_radix
 from sglang.jit_kernel.utils import cache_once, is_arch_support_pdl, load_jit
 from sglang.kernel_api_logging import debug_kernel_api
-from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -294,10 +293,10 @@ def moe_fused_gate(
     # K3 radix-select fast path: native-CUDA radix-select replaces the 16
     # dependent argmax rounds (single CTA per token; ids bit-identical to this
     # triton kernel incl. ties).
-    #   SGLANG_OPT_USE_ROUTE_RADIX_V2 (default ON) — v2, register-resident
-    #     keys, winners in expert-id order (skips the biased-descending sort;
-    #     downstream MoE kernels are order-insensitive). All batch sizes:
-    #     3.1-3.5x over the triton kernel at [1..8192, 896] top-16 on B200.
+    # The radix kernel keeps keys register-resident and returns winners in
+    # expert-id order (skipping the biased-descending sort; downstream MoE
+    # kernels are order-insensitive). It is 3.1-3.5x faster than the Triton
+    # kernel at [1..8192, 896] top-16 on B200.
     if (
         scoring_func.lower() == "sigmoid"
         and num_fused_shared_experts == 0
@@ -312,10 +311,8 @@ def moe_fused_gate(
             routed_scaling_factor,
             apply_routed_scaling_factor_on_output,
         )
-        if envs.SGLANG_OPT_USE_ROUTE_RADIX_V2.get() and moe_route_radix_v2.covered(
-            scores, bias, topk
-        ):
-            return moe_route_radix_v2.route_radix_v2(*radix_args, sorted=False)
+        if moe_route_radix.covered(scores, bias, topk):
+            return moe_route_radix.route_radix(*radix_args, sorted=False)
 
     M, N = scores.shape
     K = topk

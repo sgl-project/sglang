@@ -60,7 +60,7 @@ struct RouteRadixParams {
   int sorted;
 };
 
-inline constexpr float kNanFloor_ = -1e30f;  // must match moe_fused_gate_radix.cuh
+inline constexpr float kNanFloor_ = -1e30f;
 
 // Monotone unsigned key: larger biased -> larger key. Caller must have floored
 // biased-NaN. Canonicalizes -0.0 -> +0.0 so equal values get equal keys.
@@ -107,7 +107,7 @@ SGL_DEVICE uint32_t block_exclusive_sum(uint32_t cnt, uint32_t lane_id, uint32_t
 
 template <bool kUsePDL>
 __global__ __launch_bounds__(LargeRouterRadixTrait::kBlockSize)  //
-    void route_radix_v2_kernel(const __grid_constant__ RouteRadixParams params) {
+    void route_radix_kernel(const __grid_constant__ RouteRadixParams params) {
   using namespace device;
   using T = LargeRouterRadixTrait;
   constexpr uint32_t kVecSize = T::kVecSize;
@@ -302,7 +302,7 @@ __global__ __launch_bounds__(LargeRouterRadixTrait::kBlockSize)  //
 }  // namespace sglang
 
 template <bool kUsePDL>
-struct RouteRadixV2Kernel {
+struct RouteRadixKernel {
   static void
   run(const tvm::ffi::TensorView scores,
       const tvm::ffi::TensorView bias,
@@ -328,9 +328,9 @@ struct RouteRadixV2Kernel {
 
     RuntimeCheck(
         N_.unwrap() == sglang::kNumExperts_ && K_.unwrap() == sglang::kTopK_ && topk == sglang::kTopK_,
-        "route_radix_v2 is specialized for N=896, K=16");
+        "route_radix is specialized for N=896, K=16");
     // 8-byte vectorized row loads need 8B-aligned row starts.
-    RuntimeCheck(scores.stride(0) % 4 == 0, "route_radix_v2: scores row stride must be a multiple of 4");
+    RuntimeCheck(scores.stride(0) % 4 == 0, "route_radix: scores row stride must be a multiple of 4");
 
     const auto M = static_cast<uint32_t>(M_.unwrap());
     if (M == 0) return;
@@ -350,6 +350,6 @@ struct RouteRadixV2Kernel {
         sorted ? 1 : 0};
 
     LaunchKernel(M, sglang::LargeRouterRadixTrait::kBlockSize, device.unwrap())
-        .enable_pdl(kUsePDL)(sglang::route_radix_v2_kernel<kUsePDL>, params);
+        .enable_pdl(kUsePDL)(sglang::route_radix_kernel<kUsePDL>, params);
   }
 };
