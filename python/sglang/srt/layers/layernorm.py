@@ -1071,6 +1071,19 @@ class Gemma3RMSNorm(MultiPlatformOp):
         return self.forward_native(x)
 
     def forward_cuda(self, x):
+        if x.numel() == 0:
+            return x
+        # Fused kernel needs a contiguous buffer; forcing .contiguous() on the
+        # transposed q/k norm views would reorder memory and break a downstream
+        # permute().view(), so fall back to forward_native for those.
+        if x.is_contiguous():
+            if x.dim() == 2:
+                return gemma_rmsnorm(x, self.weight.data, self.eps)
+            original_shape = x.shape
+            out = gemma_rmsnorm(
+                x.reshape(-1, original_shape[-1]), self.weight.data, self.eps
+            )
+            return out.reshape(original_shape)
         return self.forward_native(x)
 
     def forward_npu(self, x):
