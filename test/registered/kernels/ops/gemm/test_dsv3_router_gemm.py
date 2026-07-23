@@ -11,7 +11,7 @@ from sglang.kernels.jit.utils import (
     get_jit_cuda_arch,
     is_hip_runtime,
 )
-from sglang.kernels.ops.gemm._jit_dsv3_router_gemm import dsv3_router_gemm
+from sglang.kernels.ops.gemm.dsv3_router_gemm import dsv3_router_gemm
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=37, stage="base-b-kernel-unit", runner_config="1-gpu-large")

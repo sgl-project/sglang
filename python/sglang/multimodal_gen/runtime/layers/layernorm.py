@@ -17,7 +17,7 @@ from sglang.kernels.ops.diffusion.qknorm_rope import (
 )
 from sglang.kernels.ops.diffusion.triton.rmsnorm_onepass import triton_one_pass_rms_norm
 from sglang.kernels.ops.diffusion.triton.scale_shift import fuse_scale_shift_kernel
-from sglang.kernels.ops.layernorm._jit_norm import (
+from sglang.kernels.ops.layernorm.norm import (
     can_use_fused_inplace_qknorm,
     fused_inplace_qknorm,
 )

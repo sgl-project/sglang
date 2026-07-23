@@ -5,10 +5,10 @@ including on the row-strided qkvr-slice layouts."""
 import pytest
 import torch
 
+from sglang.kernels.ops.attention.inkling_row_scale import row_scale_bf16
 from sglang.kernels.ops.attention.log_scaling_tau import (
     _apply_log_scaling_tau_kernel,
 )
-from sglang.kernels.ops.model.inkling.inkling_row_scale import row_scale_bf16
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -51,7 +51,7 @@ def test_row_compact_bitexact(rows, inner, strided):
     """The tau-less compaction flavor (kHasTau=false) must reproduce
     .contiguous() exactly on the same strided layouts row_scale handles --
     no other test exercises run_compact."""
-    from sglang.kernels.ops.model.inkling.inkling_row_scale import row_compact_bf16
+    from sglang.kernels.ops.attention.inkling_row_scale import row_compact_bf16
 
     torch.manual_seed(rows + inner)
     if strided:
