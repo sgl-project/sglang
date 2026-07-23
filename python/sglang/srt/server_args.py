@@ -306,7 +306,7 @@ FP4_GEMM_RUNNER_BACKEND_CHOICES = [
     "marlin",
 ]
 
-BF16_GEMM_BACKEND_CHOICES = ["auto", "cutedsl"]
+BF16_GEMM_BACKEND_CHOICES = ["auto", "cutedsl", "torch"]
 
 RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru", "priority"]
 RETRACTION_POLICY_CHOICES = ["length", "priority"]
@@ -1662,7 +1662,7 @@ class ServerArgs:
     bf16_gemm_backend: A[
         str,
         Arg(
-            help="Choose the backend for unquantized BF16 GEMM operations. Options: 'auto' (default; uses cuBLAS via torch.nn.functional.linear), 'cutedsl' (SGLang JIT CuTe DSL TGV BF16 GEMM on SM10X; dispatches between the CuTe DSL kernel and cuBLAS).",
+            help="Choose the backend for unquantized BF16 GEMM operations. Options: 'auto' (default; selects 'cutedsl' on SM100/SM103 (Blackwell), otherwise uses cuBLAS via torch.nn.functional.linear), 'cutedsl' (SGLang JIT CuTe DSL TGV BF16 GEMM on SM10X; dispatches between the CuTe DSL kernel and cuBLAS), 'torch' (always uses cuBLAS via torch.nn.functional.linear, even on SM100/SM103).",
             cli_name="--bf16-gemm-backend",
             choices=BF16_GEMM_BACKEND_CHOICES,
         ),
@@ -2383,6 +2383,13 @@ class ServerArgs:
         ),
         NS("exec.mamba"),
     ] = None
+    mamba_max_states_per_path: A[
+        int,
+        "Maximum number of cached Mamba states retained per root-to-tail path "
+        "(-1 means unlimited). When enabled, after each insert the shallowest eligible "
+        "interior states beyond the cap are removed while their full KV remains. "
+        "Tail, fork, and locked nodes are preserved. Must be -1 or a positive integer.",
+    ] = -1
     enable_mamba_cache_stochastic_rounding: A[
         bool,
         "Enable stochastic rounding when writing FP16 Mamba SSM cache states. Requires --mamba-ssm-dtype float16 and CUDA. With --mamba-backend triton, requires SM100.",
@@ -3310,6 +3317,8 @@ class ServerArgs:
         # _handle_model_specific_adjustments never runs.
         self._resolved_overrides = []
 
+        self._validate_mamba_max_states_per_path()
+
         if self.model_path.lower() in ["none", "dummy"]:
             return
 
@@ -3486,6 +3495,14 @@ class ServerArgs:
         from sglang.srt.arg_groups.overrides import materialize_declarations
 
         materialize_declarations(self)
+
+    def _validate_mamba_max_states_per_path(self):
+        value = self.mamba_max_states_per_path
+        if value == 0 or value < -1:
+            raise ValueError(
+                "--mamba-max-states-per-path must be -1 (unlimited) or a positive "
+                f"integer, got {value}."
+            )
 
     def _handle_model_capability_adjustments(self):
         if parse_connector_type(self.model_path) == ConnectorType.INSTANCE:
@@ -5249,6 +5266,19 @@ class ServerArgs:
         if view.page_size is not None:
             assert view.mamba_track_interval % view.page_size == 0
             assert self.mamba_cache_chunk_size is not None
+
+            if (
+                view.chunked_prefill_size is not None
+                and 0 < view.chunked_prefill_size < self.mamba_cache_chunk_size
+            ):
+                logger.warning(
+                    "Mamba radix extra-buffer is enabled with chunked_prefill_size=%s "
+                    "smaller than mamba_cache_chunk_size=%s. This can make "
+                    "mamba_track_mask false for unfinished chunked-prefill handoff "
+                    "and skip Mamba state checkpoints.",
+                    view.chunked_prefill_size,
+                    self.mamba_cache_chunk_size,
+                )
 
     def _handle_mamba_radix_cache(self, model_arch: str):
         # Resolution moved to the resolution pipeline (arg_groups/overrides.py:
