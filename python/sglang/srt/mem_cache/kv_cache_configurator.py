@@ -1764,6 +1764,17 @@ class KVCacheConfigurator:
             self.hybrid_gdn_config is not None
             or kimi_linear_config(self.model_config) is not None
         )
+        # The ReplaySSM ring is allocated per slot but is not part of
+        # mamba_cache_per_req, so the solve must charge it too or num_slots is
+        # over-provisioned (the ring silently eats into the KV budget).
+        replayssm_ring_per_req = (
+            config.mamba2_cache_params.replayssm_ring_bytes_per_req(
+                cache_len=self.server_args.linear_replayssm_cache_len,
+                enable_spec=True,
+            )
+            if replayssm_active
+            else 0
+        )
         if has_spec_dec:
             assert server_args.speculative_num_draft_tokens is not None
             assert server_args.max_running_requests is not None
@@ -1849,9 +1860,10 @@ class KVCacheConfigurator:
                 intermediate_size = per_req * (capped_reqs + 1) * D
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
             else:
+                per_slot = per_req + replayssm_ring_per_req
                 server_args.override(
                     "mamba_pool.memory_budget",
-                    max_mamba_cache_size=int((mamba_budget_bytes - per_req) // per_req),
+                    max_mamba_cache_size=int((mamba_budget_bytes - per_slot) // per_slot),
                 )
 
         # Validate: max_mamba_cache_size must be positive after memory allocation.
@@ -1870,10 +1882,12 @@ class KVCacheConfigurator:
                 f"(4) use GPUs with more memory."
             )
 
-        # +1: the pool's padding slot is allocated alongside the request slots
+        # +1: the pool's padding slot is allocated alongside the request slots.
+        # ReplaySSM ring rides on every slot too (replayssm_ring_per_req is 0 when
+        # the ring is not allocated).
         mamba_state_memory = (
             (server_args.max_mamba_cache_size + 1)
-            * config.mamba2_cache_params.mamba_cache_per_req
+            * (config.mamba2_cache_params.mamba_cache_per_req + replayssm_ring_per_req)
             / (1 << 30)
         )
         return total_rest_memory - mamba_state_memory

@@ -124,6 +124,34 @@ class BaseLinearStateParams(ABC):
             + ssm_numel * self.dtype.temporal.itemsize
         ) * len(self.layers)
 
+    def replayssm_ring_bytes_per_req(self, cache_len: int, enable_spec: bool) -> int:
+        """Per-req bytes of the ReplaySSM ring (all layers), which are NOT part of
+        ``mamba_cache_per_req`` -- the memory solver must add these so num_slots is
+        not over-provisioned. MUST mirror the allocation in ``MambaPool`` (memory_pool):
+        the d/k/g ring (all modes) plus, for spec-verify, the raw v / pre-norm k /
+        beta rings. d/k (and spec rawv/rawk) use the conv dtype under spec-verify (the
+        ssm dtype for the decode ring); g and beta are fp32. Keep in sync with MambaPool.
+        """
+        hv, v_dim, k_dim = self.shape.temporal
+        h_k = self.shape.num_k_heads_per_tp
+        L = cache_len
+        conv_b = self.dtype.conv.itemsize
+        ring_b = conv_b if enable_spec else self.dtype.temporal.itemsize
+        fp32_b = 4
+        g_numel = hv * L * (k_dim if self.is_kda else 1)
+        per_layer = (
+            hv * L * v_dim * ring_b  # d
+            + h_k * L * k_dim * ring_b  # k
+            + g_numel * fp32_b  # g (fp32)
+        )
+        if enable_spec:
+            per_layer += (
+                hv * L * v_dim * conv_b  # rawv
+                + h_k * L * k_dim * conv_b  # rawk
+                + hv * L * fp32_b  # beta (fp32)
+            )
+        return per_layer * len(self.layers)
+
     @property
     def is_kda(self) -> bool:
         """KDA per-K-channel gate vs GDN/Mamba2 per-head scalar gate. Selects
