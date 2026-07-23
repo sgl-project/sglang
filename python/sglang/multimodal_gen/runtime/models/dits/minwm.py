@@ -7,6 +7,7 @@ import inspect
 import importlib.util
 import logging
 import os
+from functools import lru_cache
 from pathlib import Path
 
 import torch
@@ -32,7 +33,7 @@ from sglang.multimodal_gen.runtime.distributed.sp_shard_utils import (
 )
 from sglang.multimodal_gen.runtime.layers.attention import LocalAttention
 from sglang.multimodal_gen.runtime.layers.layernorm import tensor_parallel_rms_norm
-from sglang.multimodal_gen.runtime.layers.rotary_embedding import get_rotary_pos_embed
+from sglang.multimodal_gen.runtime.layers.rotary_embedding import NDRotaryEmbedding
 from sglang.multimodal_gen.runtime.layers.usp import (
     _usp_input_all_to_all,
     _usp_input_all_to_all_varlen,
@@ -748,6 +749,16 @@ class MinWMCausalTransformer3DModel(CausalWanTransformer3DModel):
             torch.use_deterministic_algorithms(True)
         super().__init__(config, hf_config, quant_config)
         self.sp_size = get_sp_world_size()
+        d = self.hidden_size // self.num_attention_heads
+        self._sequence_shard_rotary_emb = NDRotaryEmbedding(
+            rope_dim_list=[d - 4 * (d // 6), 2 * (d // 6), 2 * (d // 6)],
+            rope_theta=10000,
+            dtype=(
+                torch.float64
+                if current_platform.is_float64_supported()
+                else torch.float32
+            ),
+        )
         old_time = self.condition_embedder.time_embedder
         exact_time = _MinWMTimestepEmbedder(
             self.hidden_size,
@@ -776,6 +787,29 @@ class MinWMCausalTransformer3DModel(CausalWanTransformer3DModel):
                 f"2 * (action_kernel_size - 1) = {expected_history}"
             )
         self._install_parity_debug_hooks()
+
+    @lru_cache(maxsize=16)
+    def _compute_sequence_shard_rope(
+        self,
+        local_seq_len: int,
+        token_start: int,
+        frame_stride: int,
+        width: int,
+        start_frame: int,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        token_indices = torch.arange(
+            token_start,
+            token_start + local_seq_len,
+            device=device,
+            dtype=torch.long,
+        )
+        t_idx = token_indices // frame_stride + start_frame
+        remainder = token_indices % frame_stride
+        h_idx = remainder // width
+        w_idx = remainder % width
+        positions = torch.stack((t_idx, h_idx, w_idx), dim=1)
+        return self._sequence_shard_rotary_emb.forward_uncached(positions)
 
     def forward(
         self,
@@ -865,28 +899,17 @@ class MinWMCausalTransformer3DModel(CausalWanTransformer3DModel):
             // frame_stride
         )
 
-        d = self.hidden_size // self.num_attention_heads
-        rope_dim_list = [d - 4 * (d // 6), 2 * (d // 6), 2 * (d // 6)]
-        freqs_cos, freqs_sin = get_rotary_pos_embed(
-            (
-                post_patch_num_frames,
-                post_patch_height,
-                post_patch_width,
-            ),
-            self.hidden_size,
-            self.num_attention_heads,
-            rope_dim_list,
-            dtype=(
-                torch.float64
-                if current_platform.is_float64_supported()
-                else torch.float32
-            ),
-            rope_theta=10000,
+        freqs_cos, freqs_sin = self._compute_sequence_shard_rope(
+            seq_splits[sp_rank],
+            local_start,
+            frame_stride,
+            post_patch_width,
             start_frame=start_frame,
+            device=hidden_states.device,
         )
         freqs_cis = (
-            freqs_cos.to(hidden_states.device)[local_start:local_end].float(),
-            freqs_sin.to(hidden_states.device)[local_start:local_end].float(),
+            freqs_cos.float(),
+            freqs_sin.float(),
         )
 
         hidden_states = self.patch_embedding(hidden_states)

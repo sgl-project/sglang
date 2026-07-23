@@ -21,6 +21,7 @@ from sglang.multimodal_gen.runtime.models.dits.minwm_action import (
 )
 from sglang.multimodal_gen.runtime.models.dits.minwm import (
     MinWMCausalSelfAttention,
+    MinWMCausalTransformer3DModel,
     MinWMPatchEmbed,
     MinWMRMSNorm,
     _frame_gate,
@@ -434,6 +435,47 @@ def test_minwm_sequence_shard_frame_indices_support_mid_frame_boundaries(monkeyp
 
     hidden_states = torch.zeros(1, 3, 8)
     assert _minwm_frame_indices(hidden_states, 4).tolist() == [1, 1, 2]
+
+
+def test_minwm_sequence_shard_rope_uses_flattened_token_positions():
+    class CaptureRotaryEmbedding(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.positions = None
+
+        def forward_uncached(self, positions):
+            self.positions = positions
+            return positions.float(), -positions.float()
+
+    model = MinWMCausalTransformer3DModel.__new__(MinWMCausalTransformer3DModel)
+    torch.nn.Module.__init__(model)
+    model._sequence_shard_rotary_emb = CaptureRotaryEmbedding()
+
+    cos, sin = model._compute_sequence_shard_rope(
+        local_seq_len=4,
+        token_start=4,
+        frame_stride=6,
+        width=3,
+        start_frame=7,
+        device=torch.device("cpu"),
+    )
+
+    expected_positions = torch.tensor(
+        [
+            [7, 1, 1],
+            [7, 1, 2],
+            [8, 0, 0],
+            [8, 0, 1],
+        ]
+    )
+    torch.testing.assert_close(
+        model._sequence_shard_rotary_emb.positions,
+        expected_positions,
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(cos, expected_positions.float(), rtol=0, atol=0)
+    torch.testing.assert_close(sin, -expected_positions.float(), rtol=0, atol=0)
 
 
 def test_minwm_causal_cache_uses_local_ulysses_heads(monkeypatch):
