@@ -66,7 +66,7 @@ class RMSNormOp(BaseFusedOp):
     )
     descriptions = {
         KernelBackend.AOT: "RMS normalization (sgl_kernel wheel).",
-        KernelBackend.JIT: "RMS normalization (sglang.jit_kernel).",
+        KernelBackend.JIT: "RMS normalization (sglang.kernels.jit).",
         KernelBackend.AITER: "RMS normalization (aiter rmsnorm2d_fwd, ROCm).",
         KernelBackend.TORCH_NPU: "RMS normalization (torch_npu, Ascend).",
         KernelBackend.TORCH: "RMS normalization (pure-torch reference).",
@@ -113,7 +113,7 @@ class RMSNormOp(BaseFusedOp):
     ) -> torch.Tensor:
         import torch
 
-        from sglang.jit_kernel.norm import rmsnorm as jit_rmsnorm
+        from sglang.kernels.ops.layernorm.norm import rmsnorm as jit_rmsnorm
 
         if out is None:
             out = torch.empty_like(input)
@@ -180,7 +180,7 @@ class FusedAddRMSNormOp(BaseFusedOp):
             "Fused residual-add + RMS normalization (sgl_kernel wheel)."
         ),
         KernelBackend.JIT: (
-            "Fused residual-add + RMS normalization (sglang.jit_kernel)."
+            "Fused residual-add + RMS normalization (sglang.kernels.jit)."
         ),
         KernelBackend.AITER: ("Fused residual-add + RMS normalization (aiter, ROCm)."),
         KernelBackend.TORCH_NPU: (
@@ -227,7 +227,9 @@ class FusedAddRMSNormOp(BaseFusedOp):
         eps: float = 1e-6,
         enable_pdl: Optional[bool] = None,
     ) -> None:
-        from sglang.jit_kernel.norm import fused_add_rmsnorm as jit_fused_add_rmsnorm
+        from sglang.kernels.ops.layernorm.norm import (
+            fused_add_rmsnorm as jit_fused_add_rmsnorm,
+        )
 
         return jit_fused_add_rmsnorm(input, residual, weight, eps)
 
@@ -273,7 +275,7 @@ class GemmaRMSNormOp(BaseFusedOp):
     op = "layernorm.gemma_rmsnorm"
     priority = _NORM_PRIORITY
     # AOT (sgl_kernel) on CUDA; JIT is the ROCm rocm-triton path
-    # (sglang.jit_kernel.minimax_m3) — a JIT provenance pinned to HIP, distinct
+    # (sglang.kernels.ops.moe.minimax_m3_swiglu) — a JIT provenance pinned to HIP, distinct
     # from the CUDA-only JIT on the plain rmsnorm ops; torch_npu on Ascend.
     capabilities = {
         KernelBackend.AOT: _CUDA,
@@ -287,7 +289,7 @@ class GemmaRMSNormOp(BaseFusedOp):
     descriptions = {
         KernelBackend.AOT: "Gemma-style RMS normalization (sgl_kernel wheel).",
         KernelBackend.JIT: (
-            "Gemma-style RMS normalization (rocm-triton, sglang.jit_kernel)."
+            "Gemma-style RMS normalization (rocm-triton, sglang.kernels.jit)."
         ),
         KernelBackend.TORCH_NPU: ("Gemma-style RMS normalization (torch_npu, Ascend)."),
         KernelBackend.TORCH: "Gemma-style RMS normalization (pure-torch reference).",
@@ -332,7 +334,7 @@ class GemmaRMSNormOp(BaseFusedOp):
         out: Optional[torch.Tensor] = None,
         enable_pdl: Optional[bool] = None,
     ) -> torch.Tensor:
-        from sglang.jit_kernel.minimax_m3.rmsnorm import (
+        from sglang.kernels.ops.layernorm.minimax_m3_rmsnorm import (
             gemma_rmsnorm as rocm_triton_gemma_rmsnorm,
         )
 
@@ -380,7 +382,7 @@ class GemmaFusedAddRMSNormOp(BaseFusedOp):
         KernelBackend.AOT: ("Gemma-style fused residual-add + RMS normalization."),
         KernelBackend.JIT: (
             "Gemma-style fused residual-add + RMS normalization "
-            "(rocm-triton, sglang.jit_kernel)."
+            "(rocm-triton, sglang.kernels.jit)."
         ),
         KernelBackend.TORCH: (
             "Gemma-style fused residual-add + RMS normalization "
@@ -426,7 +428,7 @@ class GemmaFusedAddRMSNormOp(BaseFusedOp):
         eps: float = 1e-6,
         enable_pdl: Optional[bool] = None,
     ) -> None:
-        from sglang.jit_kernel.minimax_m3.rmsnorm import (
+        from sglang.kernels.ops.layernorm.minimax_m3_rmsnorm import (
             gemma_fused_add_rmsnorm as rocm_triton_gemma_fused_add_rmsnorm,
         )
 
@@ -510,8 +512,6 @@ from sglang.kernels.spec import KernelSpec
 # Triton / TileLang kernels migrated from srt/layers top-level strays
 # (RFC #29630, Phase 2.5); registered for inventory.
 _PHASE25_KERNELS = [
-    ("elementwise", "fused_dual_residual_rmsnorm", "triton"),
-    ("elementwise", "fused_rmsnorm", "triton"),
     ("gemma4_fused_ops", "gemma4_fused_routing", "triton"),
     ("gemma4_fused_ops", "gemma_qkv_rmsnorm", "triton"),
     ("mhc_head", "fused_hc_head", "triton"),
@@ -525,3 +525,15 @@ for _mod, _fn, _bk in _PHASE25_KERNELS:
         )
     )
 del _mod, _fn, _bk
+
+# The fused-rmsnorm variants physically live in the shared fused-pointwise
+# collection (sglang.kernels.ops.elementwise.elementwise) but stay layernorm ops.
+for _fn in ("fused_dual_residual_rmsnorm", "fused_rmsnorm"):
+    register_kernel(
+        KernelSpec(
+            op=f"layernorm.{_fn}",
+            backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.elementwise.elementwise:{_fn}",
+        )
+    )
+del _fn

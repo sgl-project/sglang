@@ -213,13 +213,25 @@ def _fused_metadata_kernel_general(
         return
 
     i = pid_b
+    # Self-guard on the device-side seq_len: skip column chunks past the
+    # request's live pages (tails keep stale values the attention kernels
+    # never read past cache_seqlens).
+    seq_len = tl.load(seq_lens + i * seq_lens_stride_0).to(tl.int32)
+    if page_size == 1:
+        num_live_pages = seq_len + seq_len_delta
+    else:
+        num_live_pages = (seq_len + seq_len_delta + (1 << SHIFT) - 1) >> SHIFT
+    num_live_pages = tl.minimum(num_live_pages, max_seq_pages)
+    col_start = pid_c * BLOCK_COLS
+    if col_start >= num_live_pages:
+        return
+
     # Load row index for this batch (all threads in block have same i)
     row_idx = tl.load(req_pool_indices + i * req_pool_indices_stride_0)
     row_offset = row_idx * req_to_token_stride_0
 
-    col_start = pid_c * BLOCK_COLS
     col_offsets = col_start + tl.arange(0, BLOCK_COLS)
-    mask = col_offsets < max_seq_pages
+    mask = col_offsets < num_live_pages
 
     # Compute column indices in the source tensor (token offset)
     if page_size == 1:
@@ -303,13 +315,21 @@ def _fused_metadata_kernel_ps1_no_swa(
         return
 
     i = pid_b
+    # Self-guard on the device-side seq_len: skip column chunks past the
+    # request's live pages (tails keep stale values the attention kernels
+    # never read past cache_seqlens).
+    seq_len = tl.load(seq_lens + i * seq_lens_stride_0).to(tl.int32)
+    num_live_pages = tl.minimum(seq_len + seq_len_delta, max_seq_pages)
+    col_start = pid_c * BLOCK_COLS
+    if col_start >= num_live_pages:
+        return
+
     # Load row index for this batch (all threads in block have same i)
     row_idx = tl.load(req_pool_indices + i * req_pool_indices_stride_0)
     row_offset = row_idx * req_to_token_stride_0
 
-    col_start = pid_c * BLOCK_COLS
     col_offsets = col_start + tl.arange(0, BLOCK_COLS)
-    mask = col_offsets < max_seq_pages
+    mask = col_offsets < num_live_pages
 
     # page_size = 1: col_idx = col_offsets
     rt_offsets = row_offset + col_offsets * req_to_token_stride_1
@@ -555,6 +575,10 @@ def normal_decode_set_metadata(
       5. (optional) swa_page_table for sliding window attention
 
     Achieves ~5.2x speedup on H200 hardware for typical decode workloads.
+
+    Contract: only the live prefix (cdiv(cache_seqlens, page_size) pages) of each
+    page_table / swa_page_table row is (re)written; the tail keeps stale values
+    across CUDA-graph replays, so consumers must bound reads by cache_seqlens.
     """
     assert (
         page_size > 0 and (page_size & (page_size - 1)) == 0

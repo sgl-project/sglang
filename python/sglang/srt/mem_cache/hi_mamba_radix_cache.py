@@ -153,8 +153,6 @@ class HiMambaRadixCache(MambaRadixCache):
             prefetch_threshold=prefetch_threshold,
             load_cache_event=self.load_cache_event,
             enable_storage_metrics=self.enable_storage_metrics,
-            attn_cp_group=params.attn_cp_cache_group,
-            attn_tp_group=params.attn_tp_cache_group,
         )
         self._apply_storage_runtime_config(
             storage_backend=server_args.hicache_storage_backend,
@@ -208,6 +206,9 @@ class HiMambaRadixCache(MambaRadixCache):
             self.mamba_pool_host.available_size(),
         )
         super().reset()
+
+    def release_host_resources(self) -> None:
+        self.host_pool_group.destroy()
 
     def write_backup(self, node: TreeNode, write_back=False) -> int:
         # Backup invariant (for write-through mode): backed-up nodes must form a

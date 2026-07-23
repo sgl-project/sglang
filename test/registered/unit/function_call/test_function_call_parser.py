@@ -149,6 +149,68 @@ class TestInklingDetector(unittest.TestCase):
         self.assertEqual(json.loads(args_by_index[0]), {"city": "SF"})
         self.assertEqual(json.loads(args_by_index[1]), {"city": "NY"})
 
+    def test_streaming_two_complete_tool_calls_in_one_delta_both_emit(self):
+        """Bug regression: parse_streaming_increment parsed one call per delta
+        and re-buffered the rest, relying on the NEXT delta to drain it. Two
+        complete calls arriving in a single (e.g. final) delta left the second
+        stranded in the buffer with no stream-end flush, so only the first was
+        emitted."""
+        detector = InklingDetector()
+        source = (
+            "<|message_model|>weather<|content_invoke_tool_json|>"
+            '{"name":"weather","args":{"city":"SF"}}<|end_message|>'
+            "<|message_model|>weather<|content_invoke_tool_json|>"
+            '{"name":"weather","args":{"city":"NY"}}<|end_message|>'
+        )
+        args_by_index: dict = {}
+        for call in detector.parse_streaming_increment(source, self.tools).calls:
+            args_by_index[call.tool_index] = (
+                args_by_index.get(call.tool_index, "") + call.parameters
+            )
+        self.assertEqual(sorted(args_by_index), [0, 1])
+        self.assertEqual(json.loads(args_by_index[0]), {"city": "SF"})
+        self.assertEqual(json.loads(args_by_index[1]), {"city": "NY"})
+
+    def test_streaming_text_then_tool_call_in_one_delta_emits_both(self):
+        """Bug regression: a delta carrying visible text followed by a complete
+        tool call emitted only the text and stranded the call in the buffer
+        (the drain loop stopped after the leading-text run), so a final such
+        delta dropped the call. The drain must continue past leading text."""
+        detector = InklingDetector()
+        source = (
+            "Sure, let me check.<|message_model|>weather<|content_invoke_tool_json|>"
+            '{"name":"weather","args":{"city":"SF"}}<|end_message|>'
+        )
+        result = detector.parse_streaming_increment(source, self.tools)
+        self.assertIn("Sure, let me check.", result.normal_text)
+        names = [c.name for c in result.calls if c.name]
+        self.assertEqual(names, ["weather"])
+        args = "".join(c.parameters for c in result.calls)
+        self.assertEqual(json.loads(args), {"city": "SF"})
+
+    def test_streaming_rejected_middle_call_keeps_later_valid_call(self):
+        """Bug regression: a rejected call (header/name mismatch) cleared the
+        whole buffer, discarding a later valid call that arrived in the same
+        delta. Only the rejected call's span may be dropped; the drain must
+        continue so the trailing valid call still streams."""
+        detector = InklingDetector()
+        source = (
+            "<|message_model|>weather<|content_invoke_tool_json|>"
+            '{"name":"weather","args":{"city":"SF"}}<|end_message|>'
+            "<|message_model|>other<|content_invoke_tool_json|>"
+            '{"name":"weather","args":{"city":"XX"}}<|end_message|>'
+            "<|message_model|>weather<|content_invoke_tool_json|>"
+            '{"name":"weather","args":{"city":"NY"}}<|end_message|>'
+        )
+        args_by_index: dict = {}
+        for call in detector.parse_streaming_increment(source, self.tools).calls:
+            args_by_index[call.tool_index] = (
+                args_by_index.get(call.tool_index, "") + call.parameters
+            )
+        self.assertEqual(sorted(args_by_index), [0, 1])
+        self.assertEqual(json.loads(args_by_index[0]), {"city": "SF"})
+        self.assertEqual(json.loads(args_by_index[1]), {"city": "NY"})
+
     def test_streaming_rejection_does_not_collide_tool_indices(self):
         """Bug regression: a rejected mid-stream call reset current_tool_id to
         -1, so the NEXT valid call re-announced as tool_index 0 — colliding
@@ -2147,6 +2209,27 @@ class TestQwen3CoderDetector(unittest.TestCase):
                     },
                 ),
             ),
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_current_time",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "cities": {
+                                "anyOf": [
+                                    {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                    },
+                                    {"type": "null"},
+                                ],
+                                "default": None,
+                            }
+                        },
+                    },
+                ),
+            ),
         ]
         self.detector = Qwen3CoderDetector()
 
@@ -2351,6 +2434,75 @@ class TestQwen3CoderDetector(unittest.TestCase):
         self.assertEqual(params["todos"][0]["content"], "Buy groceries")
         self.assertEqual(params["todos"][1]["status"], "completed")
 
+    def test_anyof_array_parameter_conversion(self):
+        """
+        Test array parameter conversion for nullable anyOf schemas.
+
+        Scenario: A Pydantic-style nullable list schema is represented by anyOf.
+        Purpose: Verify array values are parsed as arrays, not JSON-looking strings.
+        """
+        text = """<tool_call>
+<function=get_current_time>
+<parameter=cities>
+["NYC"]
+</parameter>
+</function>
+</tool_call>"""
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        params = json.loads(result.calls[0].parameters)
+        self.assertIsInstance(params["cities"], list)
+        self.assertEqual(params["cities"], ["NYC"])
+
+    def test_anyof_array_parameter_conversion_null(self):
+        """
+        Test 'null' is converted correctly for nullable anyOf schemas.
+
+        Scenario: A Pydantic-style nullable list schema is represented by anyOf.
+        Purpose: Verify null values are parsed as 'None', not as strings.
+        """
+        text = """<tool_call>
+<function=get_current_time>
+<parameter=cities>
+null
+</parameter>
+</function>
+</tool_call>"""
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["cities"], None)
+
+    def test_streaming_anyof_array_parameter_conversion(self):
+        """
+        Test streaming array parameter conversion for nullable anyOf schemas.
+
+        Scenario: A Pydantic-style nullable list schema is streamed in Qwen3 Coder format.
+        Purpose: Verify the streamed JSON fragments encode an array value, not a string value.
+        """
+        chunks = [
+            "<tool_call>",
+            "<function=get_current_time>",
+            "<parameter=cities>",
+            '["NYC"]',
+            "</parameter>",
+            "</function>",
+            "</tool_call>",
+        ]
+
+        detector = Qwen3CoderDetector()
+        collected_params = ""
+
+        for chunk in chunks:
+            result = detector.parse_streaming_increment(chunk, self.tools)
+            for call in result.calls:
+                if call.parameters:
+                    collected_params += call.parameters
+
+        params = json.loads(collected_params)
+        self.assertIsInstance(params["cities"], list)
+        self.assertEqual(params["cities"], ["NYC"])
+
     # ==================== Edge Cases ====================
 
     def test_empty_parameter_value(self):
@@ -2403,6 +2555,63 @@ class TestQwen3CoderDetector(unittest.TestCase):
         # Should not crash
         result = self.detector.detect_and_parse(text, self.tools)
         self.assertIsInstance(result, StreamingParseResult)
+
+    def test_nested_anyof_array_with_multiple_types_parameter_conversion(self):
+        """
+        Test several edge cases of parameter conversion for nullable anyOf schemas.
+        1) Test nested anyOf 'T | None' extracts 'T' correctly.
+        2) Test that order of null and non-null type doesn't affect schema parsing.
+        3) Test that list of multiple types (including dict) is parsed correctly.
+        """
+
+        tool = Tool(
+            type="function",
+            function=Function(
+                name="process_optional_list",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "optional_items_to_process": {
+                            "anyOf": [
+                                {
+                                    "anyOf": [
+                                        # Note: here "null" is listed before the non-null type.
+                                        {"type": "null"},
+                                        {
+                                            "anyOf": [
+                                                {
+                                                    "type": "array",
+                                                    "items": {},
+                                                },
+                                                {"type": "null"},
+                                            ],
+                                        },
+                                    ],
+                                },
+                                {"type": "null"},
+                            ],
+                            "default": None,
+                        }
+                    },
+                },
+            ),
+        )
+
+        text = """<tool_call>
+<function=process_optional_list>
+<parameter=optional_items_to_process>
+[true, null, {"enabled": false}]
+</parameter>
+</function>
+</tool_call>"""
+
+        result = self.detector.detect_and_parse(text, [tool])
+
+        params = json.loads(result.calls[0].parameters)
+        self.assertIsInstance(params["optional_items_to_process"], list)
+        self.assertEqual(
+            params["optional_items_to_process"], [True, None, {"enabled": False}]
+        )
 
     # ==================== Structural tag (xgrammar builtin) ====================
     # Qwen3 Coder uses the new builtin structural tag path. supports_structural_tag()

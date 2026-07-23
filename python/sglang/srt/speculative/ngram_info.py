@@ -119,7 +119,6 @@ class NgramVerifyInput(SpecInput):
     def filter_batch(
         self,
         new_indices: torch.Tensor,
-        has_been_filtered: bool = True,
         new_indices_cpu: Optional[List[int]] = None,
     ):
         if self.future_indices is not None:

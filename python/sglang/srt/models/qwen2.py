@@ -104,6 +104,24 @@ class Qwen2MLP(nn.Module):
         x, _ = self.down_proj(x, forward_batch=forward_batch)
         return x
 
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        """Load weights with centralized gate_up_proj stacked dispatch."""
+        from sglang.srt.model_loader.auto_loader import STANDARD_GATE_UP_MAPPING
+
+        loaded: set[str] = set()
+        params_dict = dict(self.named_parameters())
+        for name, tensor in weights:
+            target = STANDARD_GATE_UP_MAPPING.try_load(name, tensor, params_dict)
+            if target is not None:
+                loaded.add(target)
+                continue
+            # Direct params: down_proj, scales, etc.
+            if name in params_dict:
+                wl = getattr(params_dict[name], "weight_loader", default_weight_loader)
+                wl(params_dict[name], tensor)
+                loaded.add(name)
+        return loaded
+
 
 class Qwen2Attention(nn.Module):
     def __init__(
@@ -193,6 +211,27 @@ class Qwen2Attention(nn.Module):
         attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.o_proj(attn_output)
         return output
+
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        """Load weights with centralized qkv_proj stacked dispatch."""
+        from sglang.srt.model_loader.auto_loader import STANDARD_QKV_MAPPING
+
+        loaded: set[str] = set()
+        params_dict = dict(self.named_parameters())
+        for name, tensor in weights:
+            target = STANDARD_QKV_MAPPING.try_load(name, tensor, params_dict)
+            if target is not None:
+                loaded.add(target)
+                continue
+            # Direct params: o_proj, scales, biases
+            if name in params_dict:
+                wl = getattr(params_dict[name], "weight_loader", default_weight_loader)
+                wl(params_dict[name], tensor)
+                loaded.add(name)
+            elif not (name.endswith(".bias") or name.endswith(".kv_scale")):
+                # Don't warn for optional bias or legacy kv_scale
+                pass
+        return loaded
 
 
 class Qwen2DecoderLayer(nn.Module):
@@ -569,6 +608,13 @@ class Qwen2ForCausalLM(nn.Module):
         return self.model.end_layer
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        from sglang.srt.environ import envs
+
+        if envs.SGLANG_ENABLE_WEIGHT_LOADER_V2.get():
+            return self._load_weights_v2(weights)
+        return self._legacy_load_weights(weights)
+
+    def _legacy_load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -637,6 +683,52 @@ class Qwen2ForCausalLM(nn.Module):
                     weight_loader(param, loaded_weight)
                 else:
                     logger.warning(f"Parameter {name} not found in params_dict")
+
+    def _load_weights_v2(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        """AutoWeightsLoader-based weight loading.
+
+        Stacked params (qkv_proj, gate_up_proj) are handled by module-local
+        load_weights on Qwen2Attention and Qwen2MLP via walker delegation.
+        Quantization is handled entirely inside param.weight_loader.
+        """
+        from sglang.srt.model_loader.auto_loader import (
+            AutoWeightsLoader,
+            filter_pp_weights,
+        )
+
+        # 1. PP layer filter — drop layers outside this rank's range.
+        if hasattr(self.model, "start_layer"):
+            weights = filter_pp_weights(
+                weights, self.model.start_layer, self.model.end_layer
+            )
+
+        # 2. Tied embeddings — skip lm_head from walker; we copy from
+        #    embed_tokens after loading completes.
+        skip_prefixes = []
+        if self.config.tie_word_embeddings:
+            skip_prefixes.append("lm_head.")
+
+        # 3. Walk the module tree.
+        loader = AutoWeightsLoader(
+            self,
+            skip_prefixes=skip_prefixes,
+            skip_substrs=["projector", "model.vision_tower"],
+            ignore_unexpected_suffixes=[".bias", ".kv_scale"],
+        )
+        loaded = loader.load_weights(weights)
+
+        # 4. Tied embedding post-copy: replicate embed_tokens → lm_head.
+        if self.config.tie_word_embeddings:
+            params_dict = dict(self.named_parameters())
+            if "lm_head.weight" in params_dict:
+                embed = dict(self.model.named_parameters()).get("embed_tokens.weight")
+                if embed is not None:
+                    lm_head = params_dict["lm_head.weight"]
+                    wl = getattr(lm_head, "weight_loader", default_weight_loader)
+                    wl(lm_head, embed.data)
+                    loaded.add("lm_head.weight")
+
+        return loaded
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight

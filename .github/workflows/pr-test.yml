@@ -228,7 +228,7 @@ jobs:
   call-jit-kernel-tests:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels]
     # Run on scheduled/parallel-dispatch runs (same pattern as the base-* stages) so the
-    # jit_kernel suite is exercised on main 3x daily, not only on PRs that touch jit_kernel/**.
+    # jit_kernel suite is exercised on main 3x daily, not only on PRs that touch kernels/**.
     # check-changes already forces jit_kernel='true' on scheduled runs (run_all_tests).
     if: |
       always() &&
@@ -520,19 +520,20 @@ jobs:
       timeout_per_file: '1800'
     secrets: inherit
 
-  base-c-test-4-gpu-gb300:
-    needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels]
-    if: ${{ !failure() && !cancelled() }}
-    uses: ./.github/workflows/_pr-test-stage.yml
-    with:
-      self_name: base-c-test-4-gpu-gb300
-      runner_config: 4-gpu-gb300
-      check_changes: ${{ toJson(needs.check-changes.outputs) }}
-      caller_inputs: ${{ toJson(inputs) }}
-      partitions: ${{ needs.check-changes.outputs.partitions }}
-      run_timeout_minutes: '30'
-      timeout_per_file: '1800'
-    secrets: inherit
+  # temporarily disabled due to runner availability
+#   base-c-test-4-gpu-gb300:
+#     needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels]
+#     if: ${{ !failure() && !cancelled() }}
+#     uses: ./.github/workflows/_pr-test-stage.yml
+#     with:
+#       self_name: base-c-test-4-gpu-gb300
+#       runner_config: 4-gpu-gb300
+#       check_changes: ${{ toJson(needs.check-changes.outputs) }}
+#       caller_inputs: ${{ toJson(inputs) }}
+#       partitions: ${{ needs.check-changes.outputs.partitions }}
+#       run_timeout_minutes: '30'
+#       timeout_per_file: '1800'
+#     secrets: inherit
 
   pr-test-finish:
     needs:
@@ -564,7 +565,7 @@ jobs:
         base-c-test-deepep-4-gpu-b200,
         base-c-test-deepep-8-gpu-h200,
         base-c-test-4-gpu-b200,
-        base-c-test-4-gpu-gb300,
+#         base-c-test-4-gpu-gb300,  # temporarily disabled due to runner availability
       ]
     if: always()
     runs-on: ubuntu-latest

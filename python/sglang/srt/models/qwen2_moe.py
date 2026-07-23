@@ -27,7 +27,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.kernels.ops.layernorm.elementwise import fused_gate_sigmoid_mul_add
+from sglang.kernels.ops.elementwise.elementwise import fused_gate_sigmoid_mul_add
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.distributed import (
     get_pp_group,
@@ -429,7 +429,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                         shared_output,
                     )
                 elif _is_hip:
-                    from sglang.jit_kernel.triton.sigmoid_gate_mul import (
+                    from sglang.kernels.ops.moe.triton_sigmoid_gate_mul import (
                         sigmoid_gate_mul_broadcast,
                     )
 

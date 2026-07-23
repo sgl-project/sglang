@@ -4,8 +4,9 @@
 /docs @wisclmy0611 @zijiexia @sogalin
 /docs_new @wisclmy0611 @zijiexia @Richardczl98 @JustinTong0323 @sogalin
 /python/pyproject.toml @merrymercy @Fridge003 @ispobock
-/python/sglang/jit_kernel @DarkSharpness @BBuf @celve @HydraQYH @yuan-luo
-/python/sglang/jit_kernel/diffusion @yingluosanqian @BBuf @mickqian
+/python/sglang/kernels @DarkSharpness @BBuf @celve @HydraQYH @yuan-luo
+/python/sglang/kernels/ops/diffusion @yingluosanqian @BBuf @mickqian
+/python/sglang/kernels/ops/attention/fla @yizhang2077 @hebiao064 @yuan-luo
 /python/sglang/multimodal_gen @mickqian @ping1jing2 @HaiShaw @yichiche @AgainstEntropy @BBuf
 /python/sglang/multimodal_gen/runtime/cache @DefTruth
 /python/sglang/multimodal_gen/test/server/ascend  @ping1jing2 @ssshinigami @Makcum888e @e-martirosian
@@ -36,7 +37,6 @@
 /python/sglang/srt/hardware_backend/npu/quantization @OrangeRedeng @TamirBaydasov @Alisehen
 /python/sglang/srt/layers @merrymercy @Ying1123 @Fridge003 @ispobock @HaiShaw @ch-wan @BBuf @Edwardf0t1
 /python/sglang/srt/layers/attention @merrymercy @Fridge003 @ispobock @Qiaolin-Yu @hebiao064 @HaiShaw
-/python/sglang/srt/layers/attention/fla @yizhang2077 @hebiao064 @yuan-luo
 /python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py @yizhang2077 @hebiao064 @hanming-lu @yuan-luo
 /python/sglang/srt/layers/attention/mamba @yizhang2077 @hebiao064
 /python/sglang/srt/layers/attention/dsa @1am9trash @hubertlu-tw @kkHuang-amd @HaiShaw @Fridge003 @YAMY1234 @rainj-me
@@ -101,5 +101,5 @@
 /python/sglang/srt/speculative/adaptive_*.py @Qiaolin-Yu @alphabetc1
 /python/sglang/srt/speculative/cpp_ngram @hnyls2002 @Qiaolin-Yu @kpham-sgl
 /python/sglang/srt/speculative/frozen_kv_mtp_*.py @hnyls2002 @Qiaolin-Yu @kpham-sgl @pyc96
-/python/sglang/jit_kernel/ngram_*.py @hnyls2002 @Qiaolin-Yu @kpham-sgl
-/python/sglang/jit_kernel/csrc/ngram_corpus @hnyls2002 @Qiaolin-Yu @kpham-sgl
+/python/sglang/kernels/ops/speculative/ngram_*.py @hnyls2002 @Qiaolin-Yu @kpham-sgl
+/python/sglang/kernels/jit/csrc/ngram_corpus @hnyls2002 @Qiaolin-Yu @kpham-sgl

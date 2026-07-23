@@ -22,7 +22,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.kernels.ops.layernorm.elementwise import (
+from sglang.kernels.ops.elementwise.elementwise import (
     fused_dual_residual_rmsnorm,
     fused_rmsnorm,
     gelu_and_mul_triton,
