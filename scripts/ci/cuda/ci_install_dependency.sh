@@ -290,14 +290,35 @@ install_sglang() {
     echo "Installing python extras: [${EXTRAS}]"
     $PIP_CMD install -e "python[${EXTRAS}]" $PIP_INSTALL_SUFFIX
 
-    # Defensive: some runners ended up with nvidia-cusparselt-cu13 metadata
-    # present but libcusparseLt.so.0 missing on disk, breaking any torch import.
-    # If the file is missing, force-reinstall the wheel before downstream steps.
-    SITE_PACKAGES=$(python3 -c "import site; print(site.getsitepackages()[0])")
-    if [ ! -f "$SITE_PACKAGES/nvidia/cusparselt/lib/libcusparseLt.so.0" ] \
-       && pip show nvidia-cusparselt-cu13 >/dev/null 2>&1; then
-        echo "WARNING: nvidia-cusparselt-cu13 metadata present but libcusparseLt.so.0 missing — reinstalling"
-        $PIP_CMD install --reinstall nvidia-cusparselt-cu13 $PIP_INSTALL_SUFFIX
+    # Defensive self-heal: some runners end up with nvidia-* CUDA lib packages
+    # whose metadata is present but whose .so payload is missing on disk (an
+    # interrupted force-reinstall or a node-level disk reclaim strips the libs,
+    # leaving the dist-info behind). pip then treats them as satisfied and won't
+    # restore them, so a later `import torch` / dlopen fails at job start with
+    #   libcudnn.so.9 / libnvshmem_host.so.3 / libcusparseLt.so.0:
+    #   cannot open shared object file
+    # and prepare_runner.sh's prevalidate step dies before any test runs.
+    # (torch is reinstalled --no-deps above, so it never restores these.)
+    #
+    # Detect the specific broken package(s) by comparing each nvidia-* wheel's
+    # RECORD manifest against the filesystem (see detect_broken_nvidia_libs.py),
+    # then reinstall ONLY those. This reinstalls KBs-MBs instead of every
+    # nvidia-* wheel (several GB), catches libs loaded lazily via dlopen that
+    # `import torch` wouldn't surface, and needs no loader-error parsing.
+    BROKEN_NVIDIA=$(python3 "${SCRIPT_DIR}/../utils/detect_broken_nvidia_libs.py" 2>/dev/null || true)
+    if [ -n "$BROKEN_NVIDIA" ]; then
+        # shellcheck disable=SC2086
+        echo "WARNING: nvidia packages with missing .so on disk — reinstalling: $(echo $BROKEN_NVIDIA | tr '\n' ' ')"
+        # Use pip --force-reinstall, NOT uv's --reinstall: uv restores from its
+        # content-addressed cache and does not re-materialize .so files that were
+        # deleted on disk (verified — it leaves the import broken), whereas pip
+        # --force-reinstall always re-extracts the wheel. --break-system-packages
+        # is a no-op inside the CI venv and needed on bare Ubuntu 24.04 runners.
+        # shellcheck disable=SC2086
+        python3 -m pip install --force-reinstall --no-deps --break-system-packages $BROKEN_NVIDIA
+        python3 -c "import torch" >/dev/null 2>&1 \
+            && echo "torch import OK after nvidia lib reinstall" \
+            || echo "::warning::torch still not importable after nvidia lib reinstall"
     fi
 
     mark_step_done "${FUNCNAME[0]}"
