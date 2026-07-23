@@ -61,16 +61,16 @@ if _is_cuda:
     from sgl_kernel import gelu_tanh_and_mul as _sgl_gelu_tanh_and_mul
     from sgl_kernel import silu_and_mul as _sgl_silu_and_mul
 
-    from sglang.kernels.ops.activation._jit_activation import (
+    from sglang.kernels.ops.activation.activation import (
         gelu_and_mul as _jit_gelu_and_mul,
     )
-    from sglang.kernels.ops.activation._jit_activation import (
+    from sglang.kernels.ops.activation.activation import (
         gelu_tanh_and_mul as _jit_gelu_tanh_and_mul,
     )
-    from sglang.kernels.ops.activation._jit_activation import (
+    from sglang.kernels.ops.activation.activation import (
         relu2,
     )
-    from sglang.kernels.ops.activation._jit_activation import (
+    from sglang.kernels.ops.activation.activation import (
         silu_and_mul as _jit_silu_and_mul,
     )
 
