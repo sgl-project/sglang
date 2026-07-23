@@ -2,7 +2,7 @@
 /docker @Fridge003 @ispobock @HaiShaw @ishandhanani @yctseng0211 @sogalin
 /docker/npu.Dockerfile @ping1jing2 @iforgetmyname @whybeyoung
 /docs @wisclmy0611 @zijiexia @sogalin
-/docs_new @wisclmy0611 @zijiexia @Richardczl98 @JustinTong0323 @sogalin
+/docs @wisclmy0611 @zijiexia @Richardczl98 @JustinTong0323 @sogalin
 /python/pyproject.toml @merrymercy @Fridge003 @ispobock
 /python/sglang/kernels @DarkSharpness @BBuf @celve @HydraQYH @yuan-luo
 /python/sglang/kernels/ops/diffusion @yingluosanqian @BBuf @mickqian
@@ -95,8 +95,8 @@
 /python/sglang/srt/models/gemma4_*.py @kpham-sgl @pyc96
 /python/sglang/srt/multimodal/processors/gemma4.py @kpham-sgl @pyc96
 /python/sglang/test/ascend @ping1jing2 @ssshinigami @e-martirosian
-/docs_new/cookbook/autoregressive/Google/Gemma4.mdx @wisclmy0611 @zijiexia @Richardczl98 @kpham-sgl @pyc96
-/docs_new/src/snippets/autoregressive/gemma4-deployment.jsx @wisclmy0611 @zijiexia @Richardczl98 @kpham-sgl @pyc96
+/docs/cookbook/autoregressive/Google/Gemma4.mdx @wisclmy0611 @zijiexia @Richardczl98 @kpham-sgl @pyc96
+/docs/src/snippets/autoregressive/gemma4-deployment.jsx @wisclmy0611 @zijiexia @Richardczl98 @kpham-sgl @pyc96
 /python/sglang/srt/speculative/ngram_*.py @hnyls2002 @Qiaolin-Yu @kpham-sgl
 /python/sglang/srt/speculative/adaptive_*.py @Qiaolin-Yu @alphabetc1
 /python/sglang/srt/speculative/cpp_ngram @hnyls2002 @Qiaolin-Yu @kpham-sgl

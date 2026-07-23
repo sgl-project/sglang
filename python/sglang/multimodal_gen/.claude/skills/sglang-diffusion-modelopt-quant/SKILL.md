@@ -25,7 +25,7 @@ This skill owns the ModelOpt-to-SGLang bridge. It is not a generic kernel-tuning
 - For multi-transformer pipelines, use per-component overrides when different components need different checkpoints.
 - For B200 NVFP4 validation, keep backend-sensitive environment variables explicit. Wan2.2 NVFP4 is commonly validated with `SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND=cudnn`; benchmark the default CUTLASS path separately if that is what you are evaluating.
 - When a branch is missing the validated helper tools, refresh `python/sglang/multimodal_gen/tools/build_modelopt_fp8_transformer.py`, `python/sglang/multimodal_gen/tools/build_modelopt_nvfp4_transformer.py`, and `python/sglang/multimodal_gen/tools/compare_diffusion_trajectory_similarity.py` instead of inventing one-off scripts elsewhere.
-- After validating a new ModelOpt quant path, update the ModelOpt support matrix in `docs_new/docs/sglang-diffusion/quantization.mdx` before closing the task.
+- After validating a new ModelOpt quant path, update the ModelOpt support matrix in `docs/docs/sglang-diffusion/quantization.mdx` before closing the task.
 
 ## Read First
 
@@ -71,9 +71,9 @@ Treat a new family, a new precision, or a new checkpoint layout as unsupported u
 Current B200 CI also contains an Ideogram4 NVFP4 native load case
 (`ideogram4_nvfp4_t2i` via `Comfy-Org/Ideogram-4`). Treat that as source
 evidence for an existing NVFP4 path, but do not expand the ModelOpt support
-matrix to Ideogram4 unless `docs_new/docs/sglang-diffusion/quantization.mdx` is updated with the
+matrix to Ideogram4 unless `docs/docs/sglang-diffusion/quantization.mdx` is updated with the
 exact checkpoint, loader path, quality check, and benchmark scope.
-Before writing CLI examples, re-read the active branch's `docs_new/docs/sglang-diffusion/quantization.mdx`: FLUX.2 NVFP4 is an official `black-forest-labs/*` repo rather than a `lmsys/*` converted repo, and its preferred flag depends on the current documented loader flow. Use `--transformer-path` for a component override directory with `config.json`; use `--transformer-weights-path` when the repo or path should be probed as raw weights.
+Before writing CLI examples, re-read the active branch's `docs/docs/sglang-diffusion/quantization.mdx`: FLUX.2 NVFP4 is an official `black-forest-labs/*` repo rather than a `lmsys/*` converted repo, and its preferred flag depends on the current documented loader flow. Use `--transformer-path` for a component override directory with `config.json`; use `--transformer-weights-path` when the repo or path should be probed as raw weights.
 
 B200 CI coverage can include loose BF16-vs-quantized quality checks. Inspect the active branch's `run_suite.py` before assuming they are part of the suite; mainline and feature branches may differ. Those checks are intended to catch blank, corrupted, or obviously divergent images, not exact image parity.
 
@@ -100,7 +100,7 @@ accuracy check, and benchmark scope are validated on the active branch.
 
 ## Documentation Maintenance
 
-- Keep the validated ModelOpt support matrix in `docs_new/docs/sglang-diffusion/quantization.mdx`.
+- Keep the validated ModelOpt support matrix in `docs/docs/sglang-diffusion/quantization.mdx`.
 - Each row should record the validated scope, the Hugging Face repo or path for the quantized DiT weights, and the key caveats.
 - If the quantized DiT weights are not published yet, write `unpublished` explicitly instead of leaving the field blank.
 
@@ -402,6 +402,6 @@ When documenting results:
 | `tools/build_modelopt_fp8_transformer.py` | Build an SGLang-loadable FP8 transformer from a ModelOpt export |
 | `tools/build_modelopt_nvfp4_transformer.py` | Build mixed BF16+NVFP4 transformer directories when a family needs preserved BF16 layers |
 | `tools/compare_diffusion_trajectory_similarity.py` | reduced deterministic BF16-vs-quantized validation |
-| `docs_new/docs/sglang-diffusion/quantization.mdx` | public ModelOpt support matrix and CLI examples |
+| `docs/docs/sglang-diffusion/quantization.mdx` | public ModelOpt support matrix and CLI examples |
 | `test/server/testcase_configs.py` | reusable ModelOpt testcase constants, thresholds, and helpers |
 | `test/server/gpu_cases.py` | concrete GPU and B200 ModelOpt CI case lists |

@@ -9,7 +9,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent.parent
 OLD_DOCS = REPO / "docs"
-NEW_DOCS = REPO / "docs_new" / "docs"
+NEW_DOCS = REPO / "docs" / "docs"
 
 # Directory-level renames (old → new, under /docs/ prefix)
 SECTION_RENAMES = {

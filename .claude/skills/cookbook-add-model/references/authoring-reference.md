@@ -4,8 +4,8 @@ Loaded on demand by the `cookbook-add-model` skill. This is the field-by-field
 contract for when the clone needs more than a rename. The two engine files are
 the canonical specs — read their headers first:
 
-- [`_deployment.jsx`](../../../../docs_new/src/snippets/_deployment.jsx) — the 5-dim matrix widget; lists every config field.
-- [`_playground.jsx`](../../../../docs_new/src/snippets/_playground.jsx) — the diff-based override widget; lists the `playgroundFeatures` axes + the `AXIS_HANDLERS` interface.
+- [`_deployment.jsx`](../../../../docs/src/snippets/_deployment.jsx) — the 5-dim matrix widget; lists every config field.
+- [`_playground.jsx`](../../../../docs/src/snippets/_playground.jsx) — the diff-based override widget; lists the `playgroundFeatures` axes + the `AXIS_HANDLERS` interface.
 
 Engine extension (adding a new playground axis) lives in [engine-axis.md](engine-axis.md).
 
@@ -13,7 +13,7 @@ Engine extension (adding a new playground axis) lives in [engine-axis.md](engine
 
 ## 2.1 Create the config file
 
-**Path**: `docs_new/src/snippets/configs/<vendor>/<model>.jsx`. The vendor folder is
+**Path**: `docs/src/snippets/configs/<vendor>/<model>.jsx`. The vendor folder is
 the HuggingFace org (`deepseek-ai`, `Qwen`, `moonshotai`, ...); the file
 name is a short hyphenated model id (`deepseek-v4`, `qwen3.5`, ...).
 
@@ -182,7 +182,7 @@ schemas (full reference in the `_playground.jsx` header):
 
 ## 2.4 Create the MDX page
 
-Path: `docs_new/cookbook/<category>/<Vendor>/<Model>.mdx`. Import both widgets and
+Path: `docs/cookbook/<category>/<Vendor>/<Model>.mdx`. Import both widgets and
 the per-model config, render them inside the relevant sections:
 
 ```mdx

@@ -1,6 +1,6 @@
 ---
 name: cookbook-review-pr
-description: Review a pull request against the SGLang Cookbook (docs_new/, Mintlify) contribution checklist — the config-driven format (per-model config + benchmarks JSX consumed by the shared _deployment.jsx / _playground.jsx engines). Run with /cookbook-review-pr <PR number>.
+description: Review a pull request against the SGLang Cookbook (docs/, Mintlify) contribution checklist — the config-driven format (per-model config + benchmarks JSX consumed by the shared _deployment.jsx / _playground.jsx engines). Run with /cookbook-review-pr <PR number>.
 ---
 
 # Cookbook Review PR
@@ -29,9 +29,9 @@ than restating.
 ## Checklist
 
 ### 1. File hygiene
-- A cookbook PR should only touch: `docs_new/src/snippets/configs/<vendor>/*.jsx`
-  (config + benchmarks), `docs_new/cookbook/**/*.mdx`, `docs_new/docs.json`,
-  `docs_new/cookbook/<category>/intro.mdx` (vendor card), `docs_new/cards/logos/<vendor>.png`
+- A cookbook PR should only touch: `docs/src/snippets/configs/<vendor>/*.jsx`
+  (config + benchmarks), `docs/cookbook/**/*.mdx`, `docs/docs.json`,
+  `docs/cookbook/<category>/intro.mdx` (vendor card), `docs/cards/logos/<vendor>.png`
   (new vendor only). Flag stray files (`settings.local.json`, lockfiles, IDE configs).
 - Pages must be `.mdx`, not `.md`. Files end with a trailing newline. Check commit history
   for unrelated commits accidentally included.
@@ -156,20 +156,20 @@ than restating.
   other model page has. Leave `mode` unset (the Deploy/Playground panels self-cap at 900px, so
   the default column holds them fine). `mode: wide` belongs only on category `intro.mdx` grids.
 - `tag: NEW` only for genuine new launches; when one is added, stale `tag: NEW` on older
-  pages should be dropped in the same PR (`grep -RlE "^tag: NEW" docs_new/cookbook/`).
+  pages should be dropped in the same PR (`grep -RlE "^tag: NEW" docs/cookbook/`).
 - MDX imports BOTH `Deployment` and `Playground` from `/src/snippets/...` (absolute).
 - Deploy heading slugs to `deployment` (or `deploy`), Playground to `playground` — so
   "↑ Switch base" and "Open the Playground →" scroll. No numbered headings for these two.
 
 ### 8. Navigation & homepage
-- New page → `docs_new/docs.json` updated: under the right vendor group inside
+- New page → `docs/docs.json` updated: under the right vendor group inside
   `navigation` → Cookbook → Autoregressive Models, root-relative, **no `.mdx`**:
   `cookbook/<category>/<Vendor>/<Model>`.
-- Homepage `<Card href>` in `docs_new/cookbook/<category>/intro.mdx` points to the vendor's
-  flagship; new vendors get a new `<Card>` + a logo at `docs_new/cards/logos/<vendor>.png` —
+- Homepage `<Card href>` in `docs/cookbook/<category>/intro.mdx` points to the vendor's
+  flagship; new vendors get a new `<Card>` + a logo at `docs/cards/logos/<vendor>.png` —
   **940×525 RGBA transparent, icon-only (no wordmark)**, lowercase filename, tracked via
   `git add -f` (`*.png` is gitignored repo-wide). Card order matches the `docs.json` nav order.
-- Don't change `docs_new/cookbook/intro.mdx` for individual model adds (top-level only).
+- Don't change `docs/cookbook/intro.mdx` for individual model adds (top-level only).
 
 ### 9. Links & factual
 - HuggingFace URLs resolve to a real model. License section matches the actual HF license
@@ -226,7 +226,7 @@ than restating.
 
 ### 13. Build / validate
 ```bash
-cd docs_new
+cd docs
 mint validate
 mint broken-links
 ```

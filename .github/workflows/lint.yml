@@ -31,7 +31,7 @@ jobs:
         with:
           args: --config .github/linters/lychee.toml README.md
 
-      # docs_new/ (Mintlify) internal-link check. Runs only in CI — contributors
+      # docs/ (Mintlify) internal-link check. Runs only in CI — contributors
       # are NOT required to install `mint` for local pre-commit. External links
       # are covered separately by the nightly lychee job (no --check-external here).
       - name: Set up Node
@@ -39,13 +39,13 @@ jobs:
         with:
           node-version: "20"
 
-      # Hard gate: docs_new internal links/anchors/redirects must resolve.
+      # Hard gate: docs internal links/anchors/redirects must resolve.
       # mint is pinned for reproducibility (its heading-slug rules are
       # version-sensitive); bump deliberately after re-verifying locally.
-      - name: Check docs_new links (Mintlify broken-links)
+      - name: Check docs links (Mintlify broken-links)
         run: |
           npm install -g mint@4.2.559
-          cd docs_new
+          cd docs
           mint broken-links --check-anchors --check-redirects
 
       - name: Run sgl-kernel clang-format checks

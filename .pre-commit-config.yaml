@@ -37,7 +37,7 @@ repos:
         args:
           - --select=F401,F821,UP037
           - --fix
-        files: ^(benchmark/|docs_new/|examples/|python/sglang/|sgl-model-gateway/py_*|test/)
+        files: ^(benchmark/|docs/|examples/|python/sglang/|sgl-model-gateway/py_*|test/)
         exclude: |
           (?x)^(
           .*/__init__\.py$|
@@ -118,8 +118,8 @@ repos:
         files: ^experimental/sgl-router/.*\.rs$
         pass_filenames: false
       - id: mint-broken-links
-        name: check docs_new links (Mintlify; opt-in, requires `mint` on PATH)
-        entry: bash -c 'cd docs_new && mint broken-links --check-anchors --check-redirects'
+        name: check docs links (Mintlify; opt-in, requires `mint` on PATH)
+        entry: bash -c 'cd docs && mint broken-links --check-anchors --check-redirects'
         language: system
         pass_filenames: false
         always_run: true
