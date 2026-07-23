@@ -27,6 +27,9 @@ __global__ void add3_kernel(const __grid_constant__ Add3Params params) {
   const int64_t vid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (vid >= params.n_vecs) return;
 
+  // Trigger early, so that the next kernel gets a chance to prefetch.
+  device::PDLTriggerSecondary<kUsePDL>();
+
   vec_t a, b, c;
   if constexpr (kPrefetchBC) {
     b.load(params.b, vid);
@@ -39,8 +42,6 @@ __global__ void add3_kernel(const __grid_constant__ Add3Params params) {
     b.load(params.b, vid);
     c.load(params.c, vid);
   }
-  // Trigger early, so that the next kernel gets a chance to prefetch.
-  device::PDLTriggerSecondary<kUsePDL>();
 
   vec_t out;
 #pragma unroll

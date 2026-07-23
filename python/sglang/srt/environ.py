@@ -747,7 +747,7 @@ class Envs:
     # push all-reduce (+RMSNorm) staging pass. flashinfer_mxfp4 + situ (the
     # packed-routing trtllm-gen path) only; sizes beyond the push window
     # fall back to the in-op finalize.
-    SGLANG_K3_DEFER_MOE_FINALIZE = EnvBool(False)
+    SGLANG_K3_DEFER_MOE_FINALIZE = EnvBool(True)
 
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)
