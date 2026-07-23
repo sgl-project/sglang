@@ -2980,7 +2980,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.spec_info:
             self.spec_info.filter_batch(
                 new_indices=keep_indices_device,
-                has_been_filtered=False,
                 new_indices_cpu=keep_indices,
             )
 
