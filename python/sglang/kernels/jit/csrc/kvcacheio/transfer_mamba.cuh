@@ -101,7 +101,7 @@ struct TransferMambaKernel {
 
     TensorMatcher({L})  //
         .with_dtype<int64_t>()
-        .with_device<kDLCUDA>(device_)
+        .with_device<kDLGPU>(device_)
         .verify(src_indices)
         .verify(dst_indices);
 
@@ -147,13 +147,13 @@ struct TransferMambaKernel {
 
     TensorMatcher({L})  //
         .with_dtype<int64_t>()
-        .with_device<kDLCUDA>(device_)
+        .with_device<kDLGPU>(device_)
         .verify(src_indices)
         .verify(dst_indices);
     // src_ptrs is a 1D tensor of device pointers (uint64) on CUDA
     TensorMatcher({static_cast<int64_t>(num_layers)})  //
         .with_dtype<uint64_t>()
-        .with_device<kDLCUDA>(device_)
+        .with_device<kDLGPU>(device_)
         .verify(src_ptrs);
 
     RuntimeCheck(item_size > 0, "transfer_mamba: item_size must be positive");
