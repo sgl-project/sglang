@@ -24,6 +24,7 @@ from sglang.srt.mem_cache.unified_cache_components.tree_component import (
     ComponentType,
     EvictLayer,
     LRURefreshPhase,
+    PrepareLoadBackResult,
     TreeComponent,
     get_and_increase_time_counter,
 )
@@ -511,6 +512,37 @@ class MambaComponent(TreeComponent):
 
     # ---- HiCache Hooks ----
 
+    def prepare_load_back(
+        self,
+        node: UnifiedTreeNode,
+        *,
+        req: Optional[Req] = None,
+    ) -> PrepareLoadBackResult:
+        cd = node.component_data[self.component_type]
+        # skip unless the node needs a load-back (device value absent), like build_hicache_transfers
+        if (
+            req is None
+            or req.mamba_pool_idx is not None
+            or cd.host_value is None
+            or cd.value is not None
+        ):
+            return PrepareLoadBackResult()
+        dst = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
+        if dst is None:
+            self.cache.evict(EvictParams(num_tokens=0, mamba_num=1))
+            dst = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
+            assert dst is not None, "Cannot alloc mamba for load_back"
+        req.mamba_pool_idx = dst[0]
+        return PrepareLoadBackResult(allocated_mamba_slot=dst)
+
+    def finalize_load_back(
+        self, req: Optional[Req], prep: PrepareLoadBackResult, success: bool
+    ) -> None:
+        # A called-off load-back returns the slot prepare allocated and clears req (the H->D copy never ran).
+        if not success and prep.allocated_mamba_slot is not None:
+            self.cache.req_to_token_pool.mamba_allocator.free(prep.allocated_mamba_slot)
+            req.mamba_pool_idx = None
+
     def build_hicache_transfers(
         self,
         node: UnifiedTreeNode,
@@ -551,16 +583,10 @@ class MambaComponent(TreeComponent):
                     )
                 )
 
-            # Per-request mamba CoW (H→D copy into request's device slot)
+            # Per-request mamba CoW: H→D copy into the request's device slot allocated by prepare_load_back.
             cd = node.component_data[ct]
             if req is not None and cd.host_value is not None:
-                if req.mamba_pool_idx is None:
-                    dst = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
-                    if dst is None:
-                        self.cache.evict(EvictParams(num_tokens=0, mamba_num=1))
-                        dst = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
-                        assert dst is not None, "Cannot alloc mamba for load_back"
-                    req.mamba_pool_idx = dst[0]
+                assert req.mamba_pool_idx is not None
                 transfers.append(
                     PoolTransfer(
                         name=PoolName.MAMBA,
