@@ -10,8 +10,11 @@
 //!
 //! All are non-blocking, so the GIL is never held across a wait.
 
+mod detokenizer;
 mod environ;
 mod error;
 mod fsm;
 mod ids;
 mod message;
+mod runtime;
+mod tokenizer;
