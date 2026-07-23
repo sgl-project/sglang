@@ -68,6 +68,7 @@ on:
           - nightly-8-gpu-mi35x-deepseek-r1-hicache-rocm720
           # 8-GPU DeepSeek-V4 (MI35x only)
           - nightly-8-gpu-mi35x-deepseek-v4-flash-rocm720
+          - nightly-8-gpu-mi35x-deepseek-v4-pro-fp4-load-exp-rocm720
           - nightly-8-gpu-mi35x-deepseek-v4-pro-rocm720
           - nightly-8-gpu-mi35x-deepseek-v4-pro-mtp-rocm720
           # 8-GPU Kimi-K2.6 (MI30x + MI35x)
@@ -1331,6 +1332,83 @@ jobs:
             python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x-deepseek-v4-flash --nightly --timeout-per-file 7200 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }}
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
 
+  nightly-8-gpu-mi35x-deepseek-v4-pro-fp4-load-exp-rocm720:
+    name: dsv4-pro-fp4-load-exp / ${{ matrix.experiment }}
+    if: github.event_name == 'workflow_dispatch' && contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-deepseek-v4-pro-fp4-load-exp-rocm720,')
+    runs-on: linux-mi35x-gpu-8
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include:
+          - experiment: baseline
+            prefetch: "0"
+            h2d_threads: "0"
+          - experiment: prefetch-2
+            prefetch: "1"
+            h2d_threads: "0"
+          - experiment: h2d-4
+            prefetch: "0"
+            h2d_threads: "4"
+          - experiment: prefetch-2-h2d-4
+            prefetch: "1"
+            h2d_threads: "4"
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
+
+      - name: Setup docker (ROCm 7.2)
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+          ENABLE_CACHE_HOST: "1"
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
+          bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
+
+      - name: Dump load-path diagnostics
+        run: |
+          echo "NODE_NAME=${NODE_NAME:-unknown}"
+          bash scripts/ci/amd/amd_ci_exec.sh bash -lc '
+            echo SGLANG_LOAD_DIAG_BEGIN
+            findmnt -T /sgl-data -o SOURCE,FSTYPE,OPTIONS || true
+            df -h /sgl-data || true
+            free -h || true
+            for f in /sys/fs/cgroup/memory.max /sys/fs/cgroup/memory.current /sys/fs/cgroup/memory.stat; do
+              if [[ -r "$f" ]]; then echo "### $f"; cat "$f"; fi
+            done
+            numactl --hardware || true
+            rocm-smi --showtoponuma --showbus || true
+            echo SGLANG_LOAD_DIAG_END
+          '
+
+      - name: Load-only DeepSeek-V4-Pro FP4 (${{ matrix.experiment }})
+        timeout-minutes: 90
+        run: |
+          > github_summary.md
+          echo "## DeepSeek-V4-Pro FP4 load-only: ${{ matrix.experiment }}" >> github_summary.md
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            -e SGLANG_DSV4_LOAD_EXPERIMENT="${{ matrix.experiment }}" \
+            -e SGLANG_DSV4_LOAD_PREFETCH="${{ matrix.prefetch }}" \
+            -e SGLANG_DSV4_PREFETCH_THREADS=2 \
+            -e SGLANG_DSV4_WEIGHT_LOAD_THREADS="${{ matrix.h2d_threads }}" \
+            -e SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton \
+            -e SGLANG_SORT_WEIGHT_FILES=0 \
+            python3 run_suite.py --hw amd \
+              --suite nightly-amd-8-gpu-mi35x-deepseek-v4-pro-fp4-load-exp \
+              --nightly --timeout-per-file 3600
+          echo "$(<github_summary.md)" >> "$GITHUB_STEP_SUMMARY" || true
+
   nightly-8-gpu-mi35x-deepseek-v4-pro-rocm720:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-deepseek-v4-pro-rocm720,'))
     runs-on: linux-mi35x-gpu-8
@@ -2026,6 +2104,7 @@ jobs:
       - nightly-8-gpu-mi35x-deepseek-r1-hicache-rocm720
       # 8-GPU DeepSeek-V4 (MI35x only)
       - nightly-8-gpu-mi35x-deepseek-v4-flash-rocm720
+      - nightly-8-gpu-mi35x-deepseek-v4-pro-fp4-load-exp-rocm720
       - nightly-8-gpu-mi35x-deepseek-v4-pro-rocm720
       - nightly-8-gpu-mi35x-deepseek-v4-pro-mtp-rocm720
       # 8-GPU Kimi-K2.6 (MI30x + MI35x)
