@@ -12,8 +12,6 @@ from functools import cached_property
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
-import triton
-import triton.language as tl
 from torch import nn
 
 from sglang.kernels.ops.attention.fla.fused_norm_gate import FusedRMSNormGated
@@ -37,6 +35,7 @@ from sglang.srt.layers.attn_residual import (
     AttnResidual,
     BaseAttnResidual,
     aggregate_stream,
+    get_cw,
 )
 from sglang.srt.layers.dcp.planner import prepare_decode_context_parallel_metadata
 from sglang.srt.layers.dp_attention import (
@@ -234,359 +233,6 @@ def _merge_weights_as_views(
         m.weight.data = merged[off : off + n]
         off += n
     return merged, sizes
-
-
-# "fused" = new single-kernel aggregation (attn_residual.py)
-# "torch" = pytorch reference (attn_residual.py)
-# "legacy" = existing multi-kernel path (below)
-_K3_ATTN_RES_MODE = envs.SGLANG_K3_ATTN_RES_MODE.get()
-
-_ATTN_RES_MAX_B = 16
-_ATTN_RES_BLOCK_H = 1024
-
-
-@triton.jit
-def _attn_res_scores_kernel(
-    prefix_ptr,  # [T, H]
-    block_ptr,  # [T, NB_total, H]
-    cw_ptr,  # [H] fp32 precombined rmsnorm_weight * proj_weight (set 1)
-    scores_ptr,  # [T, MAX_B] fp32 out (set 1)
-    cw2_ptr,  # [H] fp32 precombined weights (set 2, optional)
-    scores2_ptr,  # [T, MAX_B] fp32 out (set 2, optional)
-    NVB,
-    eps,
-    stride_pm,
-    stride_bm,
-    stride_bb,
-    stride_sm,
-    H: tl.constexpr,
-    BLOCK_H: tl.constexpr,
-    HAS_SECOND: tl.constexpr,
-):
-    """Per-(token, row) score(s): s_j = dot(RMSNorm(v_j), pw). Row NVB is
-    prefix_sum. With HAS_SECOND, also computes the score under a second
-    (norm, proj) weight set in the same pass — the rows are frozen between
-    block writes, so the MLP-side aggregation of the same layer can reuse
-    them without re-reading v (halves pass-1 memory traffic per layer)."""
-    pid_t = tl.program_id(0)
-    j = tl.program_id(1)
-    if j > NVB:
-        return
-    sumsq = 0.0
-    dotv = 0.0
-    dotv2 = 0.0
-    for h0 in tl.static_range(0, H, BLOCK_H):
-        offs_h = h0 + tl.arange(0, BLOCK_H)
-        if j < NVB:
-            v_raw = tl.load(block_ptr + pid_t * stride_bm + j * stride_bb + offs_h)
-        else:
-            v_raw = tl.load(prefix_ptr + pid_t * stride_pm + offs_h)
-        v = v_raw.to(tl.float32)
-        cw = tl.load(cw_ptr + offs_h)
-        sumsq += tl.sum(v * v)
-        dotv += tl.sum(v * cw)
-        if HAS_SECOND:
-            cw2 = tl.load(cw2_ptr + offs_h)
-            dotv2 += tl.sum(v * cw2)
-    rrms = 1.0 / tl.sqrt(sumsq / H + eps)
-    tl.store(scores_ptr + pid_t * stride_sm + j, dotv * rrms)
-    if HAS_SECOND:
-        tl.store(scores2_ptr + pid_t * stride_sm + j, dotv2 * rrms)
-
-
-@triton.jit
-def _attn_res_combine_norm_kernel(
-    prefix_ptr,
-    block_ptr,
-    scores_ptr,  # [T, MAX_B] fp32
-    out_nw_ptr,  # [H] output RMSNorm weight
-    out_ptr,  # [T, H] normed aggregate
-    NVB,
-    out_eps,
-    stride_pm,
-    stride_bm,
-    stride_bb,
-    stride_sm,
-    stride_om,
-    H: tl.constexpr,
-    BLOCK_H: tl.constexpr,
-    MAX_B: tl.constexpr,
-):
-    """out[t] = RMSNorm(sum_j softmax(scores)_j * v_j) * out_nw. One CTA per
-    token, full-H loop (the fused norm needs the full-row sumsq), fusing the
-    input_layernorm / post_attention_layernorm that always follows the
-    aggregation."""
-    pid_t = tl.program_id(0)
-
-    offs_b = tl.arange(0, MAX_B)
-    mask_b = offs_b <= NVB
-    scores = tl.load(
-        scores_ptr + pid_t * stride_sm + offs_b,
-        mask=mask_b,
-        other=float("-inf"),
-    )
-    m = tl.max(scores, axis=0)
-    e = tl.where(mask_b, tl.exp(scores - m), 0.0)
-    p = e / tl.sum(e, axis=0)
-
-    # Pass 1 over H: aggregate + accumulate sumsq for the fused norm.
-    sumsq = 0.0
-    for h0 in tl.static_range(0, H, BLOCK_H):
-        offs_h = h0 + tl.arange(0, BLOCK_H)
-        acc = tl.zeros([BLOCK_H], tl.float32)
-        for j in range(0, NVB + 1):
-            if j < NVB:
-                v_raw = tl.load(block_ptr + pid_t * stride_bm + j * stride_bb + offs_h)
-            else:
-                v_raw = tl.load(prefix_ptr + pid_t * stride_pm + offs_h)
-            p_j = tl.sum(tl.where(offs_b == j, p, 0.0), axis=0)
-            acc += p_j * v_raw.to(tl.float32)
-        sumsq += tl.sum(acc * acc)
-        # Stash the raw aggregate chunk; renormalized in pass 2.
-        tl.store(out_ptr + pid_t * stride_om + offs_h, acc.to(out_ptr.dtype.element_ty))
-    rrms = 1.0 / tl.sqrt(sumsq / H + out_eps)
-    # Pass 2: scale in place with the norm weight.
-    for h0 in tl.static_range(0, H, BLOCK_H):
-        offs_h = h0 + tl.arange(0, BLOCK_H)
-        a = tl.load(out_ptr + pid_t * stride_om + offs_h).to(tl.float32)
-        out_nw = tl.load(out_nw_ptr + offs_h).to(tl.float32)
-        tl.store(
-            out_ptr + pid_t * stride_om + offs_h,
-            (a * rrms * out_nw).to(out_ptr.dtype.element_ty),
-        )
-
-
-def _attn_res_cw(proj: ReplicatedLinear, norm: RMSNorm) -> torch.Tensor:
-    """Cached fp32 product of the (frozen) rmsnorm weight and score-proj
-    weight: dot(RMSNorm(v), pw) == dot(v, nw*pw) / rms(v). fp32 keeps the
-    in-kernel math identical to loading both factors separately."""
-    cw = getattr(proj, "_attn_res_cw", None)
-    if cw is None:
-        cw = (norm.weight.float() * proj.weight.view(-1).float()).contiguous()
-        proj._attn_res_cw = cw
-    return cw
-
-
-def _attn_res_scores(
-    prefix_sum: torch.Tensor,
-    block_residual: torch.Tensor,
-    proj: ReplicatedLinear,
-    norm: RMSNorm,
-    num_valid_blocks: int,
-    proj2: Optional[ReplicatedLinear] = None,
-    norm2: Optional[RMSNorm] = None,
-) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    T, H = prefix_sum.shape
-    scores = torch.empty(
-        (T, _ATTN_RES_MAX_B), dtype=torch.float32, device=prefix_sum.device
-    )
-    has_second = proj2 is not None
-    scores2 = (
-        torch.empty_like(scores)
-        if has_second
-        else scores  # dummy, unused when HAS_SECOND=False
-    )
-    cw = _attn_res_cw(proj, norm)
-    _attn_res_scores_kernel[(T, num_valid_blocks + 1)](
-        prefix_sum,
-        block_residual,
-        cw,
-        scores,
-        _attn_res_cw(proj2, norm2) if has_second else cw,
-        scores2,
-        num_valid_blocks,
-        norm.variance_epsilon,
-        prefix_sum.stride(0),
-        block_residual.stride(0),
-        block_residual.stride(1),
-        scores.stride(0),
-        H=H,
-        BLOCK_H=_ATTN_RES_BLOCK_H,
-        HAS_SECOND=has_second,
-        num_warps=8,
-    )
-    return scores, (scores2 if has_second else None)
-
-
-def _attn_res_prefix_update(
-    old: Optional[torch.Tensor],
-    delta: torch.Tensor,
-    proj: ReplicatedLinear,
-    norm: RMSNorm,
-    scores: torch.Tensor,
-    idx: int,
-) -> torch.Tensor:
-    """Residual update + score of the updated prefix row into scores[:, idx].
-
-    The add stays a plain (parallel) elementwise op; only the score is a
-    kernel. A fully fused single-CTA-per-token version was measured SLOWER at
-    bs=1 (serial 28KB chain on one SM vs parallel add + tiny score kernel).
-    """
-    new = delta if old is None else old + delta
-    T, H = new.shape
-    # Reuse the scores kernel for a single row: NVB=0 makes row 0 take the
-    # prefix path; aim the output at column `idx` via a pointer offset.
-    scores_at_idx = scores[:, idx:]
-    cw = _attn_res_cw(proj, norm)
-    _attn_res_scores_kernel[(T, 1)](
-        new,
-        new,  # block_ptr unused when NVB == 0
-        cw,
-        scores_at_idx,
-        cw,  # dummy second set (HAS_SECOND=False)
-        scores_at_idx,
-        0,
-        norm.variance_epsilon,
-        new.stride(0),
-        0,
-        0,
-        scores.stride(0),
-        H=H,
-        BLOCK_H=_ATTN_RES_BLOCK_H,
-        HAS_SECOND=False,
-        num_warps=8,
-    )
-    return new
-
-
-@triton.jit
-def _attn_res_combine_kernel(
-    prefix_ptr,
-    block_ptr,
-    scores_ptr,  # [T, MAX_B] fp32
-    out_ptr,  # [T, H]
-    NVB,
-    stride_pm,
-    stride_bm,
-    stride_bb,
-    stride_sm,
-    stride_om,
-    BLOCK_H: tl.constexpr,
-    MAX_B: tl.constexpr,
-):
-    """out[t, chunk] = sum_j softmax(scores)_j * v_j[chunk]. (T, H-chunks)
-    grid: the small-T/decode variant — a fused output norm is impossible here
-    (needs full-row sumsq), but the chunked grid keeps SMs busy at bs=1."""
-    pid_t = tl.program_id(0)
-    pid_h = tl.program_id(1)
-    offs_h = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
-
-    offs_b = tl.arange(0, MAX_B)
-    mask_b = offs_b <= NVB
-    scores = tl.load(
-        scores_ptr + pid_t * stride_sm + offs_b,
-        mask=mask_b,
-        other=float("-inf"),
-    )
-    m = tl.max(scores, axis=0)
-    e = tl.where(mask_b, tl.exp(scores - m), 0.0)
-    p = e / tl.sum(e, axis=0)
-
-    acc = tl.zeros([BLOCK_H], tl.float32)
-    for j in range(0, NVB + 1):
-        if j < NVB:
-            v_raw = tl.load(block_ptr + pid_t * stride_bm + j * stride_bb + offs_h)
-        else:
-            v_raw = tl.load(prefix_ptr + pid_t * stride_pm + offs_h)
-        p_j = tl.sum(tl.where(offs_b == j, p, 0.0), axis=0)
-        acc += p_j * v_raw.to(tl.float32)
-    tl.store(out_ptr + pid_t * stride_om + offs_h, acc.to(out_ptr.dtype.element_ty))
-
-
-# Below this token count, the norm-fused (T,)-grid combine cannot fill the
-# SMs (one CTA per token); use the chunked combine + separate norm instead.
-# Env-overridable for A/B testing.
-# A/B on 8xB300 (2026-07-03): the norm-fused (T,)-grid combine + shared
-# dual-scores path LOSES at every tested size — bs=1 (single-CTA rows) AND
-# bs=64 decode (650 vs 673 tok/s: 64 CTAs underfill 148 SMs), while prefill
-# (T>=1024) shows no measurable difference (attn-res is a tiny fraction of
-# GEMM-dominated prefill). Disabled by default; kernels kept for retuning.
-_ATTN_RES_FUSED_NORM_MIN_T = envs.SGLANG_K3_ATTN_RES_FUSED_MIN_T.get()
-
-
-def _attn_res_combine_norm(
-    prefix_sum: torch.Tensor,
-    block_residual: torch.Tensor,
-    scores: torch.Tensor,
-    num_valid_blocks: int,
-    out_norm: RMSNorm,
-) -> torch.Tensor:
-    T, H = prefix_sum.shape
-    out = torch.empty_like(prefix_sum)
-    if T < _ATTN_RES_FUSED_NORM_MIN_T:
-        _attn_res_combine_kernel[(T, H // _ATTN_RES_BLOCK_H)](
-            prefix_sum,
-            block_residual,
-            scores,
-            out,
-            num_valid_blocks,
-            prefix_sum.stride(0),
-            block_residual.stride(0),
-            block_residual.stride(1),
-            scores.stride(0),
-            out.stride(0),
-            BLOCK_H=_ATTN_RES_BLOCK_H,
-            MAX_B=_ATTN_RES_MAX_B,
-            num_warps=4,
-        )
-        return out_norm(out)
-    _attn_res_combine_norm_kernel[(T,)](
-        prefix_sum,
-        block_residual,
-        scores,
-        out_norm.weight,
-        out,
-        num_valid_blocks,
-        out_norm.variance_epsilon,
-        prefix_sum.stride(0),
-        block_residual.stride(0),
-        block_residual.stride(1),
-        scores.stride(0),
-        out.stride(0),
-        H=H,
-        BLOCK_H=_ATTN_RES_BLOCK_H,
-        MAX_B=_ATTN_RES_MAX_B,
-        num_warps=8,
-    )
-    return out
-
-
-def _apply_attn_res_fused(
-    prefix_sum: torch.Tensor,
-    block_residual: torch.Tensor,
-    proj: ReplicatedLinear,
-    norm: RMSNorm,
-    num_valid_blocks: int,
-    out_norm: RMSNorm,
-) -> torch.Tensor:
-    """Aggregation + fused following RMSNorm (every aggregation in K3 is
-    immediately followed by one). num_valid_blocks must be > 0."""
-    scores, _ = _attn_res_scores(
-        prefix_sum, block_residual, proj, norm, num_valid_blocks
-    )
-    return _attn_res_combine_norm(
-        prefix_sum, block_residual, scores, num_valid_blocks, out_norm
-    )
-
-
-def _apply_attn_res_torch(
-    prefix_sum: torch.Tensor,
-    block_residual: torch.Tensor,
-    proj: ReplicatedLinear,
-    norm: RMSNorm,
-    num_valid_blocks: int,
-) -> torch.Tensor:
-    """Eager reference implementation (kept for testing/fallback)."""
-    if num_valid_blocks <= 0:
-        return prefix_sum
-
-    v = torch.cat(
-        (block_residual[:, :num_valid_blocks, :], prefix_sum.unsqueeze(1)), dim=1
-    )
-    k = norm(v)
-    probs = (k @ proj.weight.squeeze(0)).softmax(-1).unsqueeze(1)
-    hidden_states = torch.matmul(probs, v).squeeze(1)
-    return hidden_states
 
 
 # ---------------------------------------------------------------------------
@@ -1207,9 +853,7 @@ class KimiK3MoE(nn.Module):
                     hidden_states, router_logits, routed_input
                 )
             else:
-                self._forward_routed(
-                    hidden_states, router_logits, routed_input, latent
-                )
+                self._forward_routed(hidden_states, router_logits, routed_input, latent)
             with torch.cuda.stream(self.alt_stream):
                 self._forward_shared(gate_up, shared_output)
                 # low-SM pull so the side-stream AR leaves the SMs to the
@@ -1982,10 +1626,9 @@ class KimiK3DecoderLayer(nn.Module):
             and get_parallel().attn_tp_group.world_size > 1
         )
 
-        # The fused all-reduce only serves the attn-res clean path (the
-        # production path: attn_res is config-static and the clean/legacy
-        # choice is env-static), so the legacy and standard paths stay
-        # byte-for-byte untouched and always see a reduced attention output.
+        # The fused all-reduce only serves the attn-res path (attn_res is
+        # config-static), so the standard path stays byte-for-byte untouched
+        # and always sees a reduced attention output.
         # Mutually exclusive with SP-MoE: both complete o_proj's deferred
         # reduction, but SP-MoE reduce-scatters to a shard whereas the fusion
         # produces the full batch in a symm buffer — an SP-MoE layer builds
@@ -1997,7 +1640,6 @@ class KimiK3DecoderLayer(nn.Module):
             and attn_tp_size > 1
             and attn_tp_size == get_tensor_model_parallel_world_size()
             and config.attn_res_block_size is not None
-            and _K3_ATTN_RES_MODE != "legacy"
             and k3_ar_fusion.enabled()
         )
 
@@ -2072,12 +1714,7 @@ class KimiK3DecoderLayer(nn.Module):
                 prefix=f"{prefix}.mlp_res_proj",
             )
 
-        # dispatch to impl
-        self._forward_attn_residual = (
-            self._forward_attn_residual_legacy
-            if _K3_ATTN_RES_MODE == "legacy"
-            else self._forward_attn_residual_clean
-        )
+        self._forward_attn_residual = self._forward_attn_residual_clean
 
         if self._sp_moe:
             # o_proj emits TP-partial sums; _finish_attn_reduce completes the
@@ -2300,108 +1937,6 @@ class KimiK3DecoderLayer(nn.Module):
             out = full
         return out, None
 
-    def _forward_attn_residual_legacy(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        prefix_sum: Optional[torch.Tensor],
-        attn_res: BaseAttnResidual,
-        forward_batch: ForwardBatch,
-        zero_allocator: BumpAllocator,
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-        assert prefix_sum is None, "legacy attn-res path does not support extra input"
-        block_residual = attn_res.block_residual
-        prefix_sum = hidden_states
-        nvb = self.prev_valid_blocks
-        mlp_valid_blocks = nvb + (1 if self.is_block_write_layer else 0)
-        # The dual-score pass (attention-side + MLP-side frozen-row scores in
-        # one read) and the norm-fused combine are BANDWIDTH optimizations:
-        # at small T (decode) all row-CTAs run in parallel anyway, so sharing
-        # saves no wall clock while the extra cw2 loads and the single-CTA
-        # prefix-score kernel sit on the critical path. Dispatch by T.
-        use_shared_scores = (
-            prefix_sum.shape[0] >= _ATTN_RES_FUSED_NORM_MIN_T and nvb > 0
-        )
-
-        if use_shared_scores:
-            # scores2 row layout matches the MLP-side aggregation:
-            #   - non-write layers: rows 0..nvb-1 frozen blocks; index nvb is
-            #     overwritten below with the updated-prefix score.
-            #   - write layers: the new block IS prefix_sum, whose mlp-score
-            #     landed at index nvb == block_write_idx; the updated
-            #     prefix's score goes to index nvb+1.
-            scores, scores2 = _attn_res_scores(
-                prefix_sum,
-                block_residual,
-                self.self_attention_res_proj,
-                self.self_attention_res_norm,
-                nvb,
-                proj2=self.mlp_res_proj,
-                norm2=self.mlp_res_norm,
-            )
-        elif nvb > 0:
-            scores, _ = _attn_res_scores(
-                prefix_sum,
-                block_residual,
-                self.self_attention_res_proj,
-                self.self_attention_res_norm,
-                nvb,
-            )
-
-        if nvb > 0:
-            hidden_states = _attn_res_combine_norm(
-                prefix_sum, block_residual, scores, nvb, self.input_layernorm
-            )
-        else:
-            # Layer 0: aggregation is a passthrough; just norm.
-            hidden_states = self.input_layernorm(prefix_sum)
-
-        if self.is_block_write_layer:
-            block_residual[:, self.block_write_idx, :].copy_(prefix_sum)
-
-        attn_out = self._run_self_attn(
-            hidden_states, positions, forward_batch, zero_allocator
-        )
-        # legacy path updates full-batch prefix/snapshots post-attention:
-        # complete the deferred o_proj reduction as a plain all-reduce
-        attn_out, _ = self._finish_attn_reduce(attn_out, allow_scatter=False)
-
-        if use_shared_scores:
-            # Residual update + only the updated-prefix score (frozen-row
-            # scores were computed above).
-            prefix_sum = _attn_res_prefix_update(
-                None if self.is_block_write_layer else prefix_sum,
-                attn_out,
-                self.mlp_res_proj,
-                self.mlp_res_norm,
-                scores2,
-                mlp_valid_blocks,
-            )
-        else:
-            if self.is_block_write_layer:
-                prefix_sum = attn_out
-            else:
-                prefix_sum = prefix_sum + attn_out
-            scores2, _ = _attn_res_scores(
-                prefix_sum,
-                block_residual,
-                self.mlp_res_proj,
-                self.mlp_res_norm,
-                mlp_valid_blocks,
-            )
-
-        hidden_states = _attn_res_combine_norm(
-            prefix_sum,
-            block_residual,
-            scores2,
-            mlp_valid_blocks,
-            self.post_attention_layernorm,
-        )
-        return (
-            self.mlp(hidden_states, prefix_sum=prefix_sum, forward_batch=forward_batch),
-            None,
-        )
-
 
 # ---------------------------------------------------------------------------
 # KimiK3LinearModel — language model backbone
@@ -2562,24 +2097,14 @@ class KimiK3LinearModel(nn.Module):
 
         if hidden_states.shape[0] != 0:
             if attn_res is not None:
-                if _K3_ATTN_RES_MODE == "legacy":
-                    hidden_states = _apply_attn_res_fused(
-                        hidden_states,
-                        attn_res.block_residual,
-                        self.output_attn_res_proj,
-                        self.output_attn_res_norm,
-                        attn_res_block_num,
-                        out_norm=self.norm,
-                    )
-                else:
-                    # ---- Final aggregation (output side, folds delayed add) ----
-                    hidden_states, _ = attn_res.forward(
-                        hidden_states,
-                        residual,
-                        self.output_attn_res_proj,
-                        self.output_attn_res_norm,
-                        self.norm,
-                    )
+                # ---- Final aggregation (output side, folds delayed add) ----
+                hidden_states, _ = attn_res.forward(
+                    hidden_states,
+                    residual,
+                    self.output_attn_res_proj,
+                    self.output_attn_res_norm,
+                    self.norm,
+                )
             else:
                 if residual is None:
                     hidden_states = self.norm(hidden_states)
@@ -2785,8 +2310,7 @@ class KimiK3LinearForCausalLM(nn.Module):
 
             layer_id = get_layer_id(name)
             if layer_id is not None and (
-                layer_id < self.model.start_layer
-                or layer_id >= self.model.end_layer
+                layer_id < self.model.start_layer or layer_id >= self.model.end_layer
             ):
                 continue
 
@@ -2916,20 +2440,21 @@ class KimiK3LinearForCausalLM(nn.Module):
                 self_attn.w_scale = self_attn.kv_b_proj.weight_scale
 
         # Post-load: precompute the attn-res combined score weights BEFORE
-        # cuda graph capture (the lazy path inside _attn_res_cw would bake
-        # the multiply into every captured graph replay otherwise).
+        # cuda graph capture (a lazy first call inside get_cw would bake the
+        # multiply into every captured graph replay otherwise). Warm both
+        # dtypes: the fast kernel consumes bf16, the triton fallback fp32.
+        def _warm_cw(proj, norm):
+            get_cw(proj, norm, dtype=torch.bfloat16)
+            get_cw(proj, norm)
+
         for layer in self.model.layers:
             if isinstance(layer, PPMissingLayer):
                 continue
             if getattr(layer, "use_attn_residuals", False):
-                _attn_res_cw(
-                    layer.self_attention_res_proj, layer.self_attention_res_norm
-                )
-                _attn_res_cw(layer.mlp_res_proj, layer.mlp_res_norm)
+                _warm_cw(layer.self_attention_res_proj, layer.self_attention_res_norm)
+                _warm_cw(layer.mlp_res_proj, layer.mlp_res_norm)
         if hasattr(self.model, "output_attn_res_proj"):
-            _attn_res_cw(
-                self.model.output_attn_res_proj, self.model.output_attn_res_norm
-            )
+            _warm_cw(self.model.output_attn_res_proj, self.model.output_attn_res_norm)
 
         # Post-load: merge the horizontally-fused decode weights. Module
         # weights are re-pointed to views of the merged buffers (net extra
