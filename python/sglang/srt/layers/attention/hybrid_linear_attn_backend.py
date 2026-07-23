@@ -242,6 +242,14 @@ class MambaAttnBackendBase(AttentionBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         self.forward_metadata = self._forward_metadata(forward_batch)
 
+    def update_verify_buffers_to_fill_after_draft(
+        self, spec_info: SpecInput, cuda_graph_bs: Optional[int]
+    ):
+        # Plan-stream fixup hook: mamba plan-time metadata (state slot indices,
+        # per-bs static query_start_loc) is draft-output independent — nothing
+        # to redo.
+        pass
+
     def _init_track_conv_indices(
         self, query_start_loc: torch.Tensor, forward_batch: ForwardBatch
     ):
@@ -865,6 +873,24 @@ class HybridLinearAttnBackend(AttentionBackend):
     def on_after_cuda_graph_warmup(self):
         for attn_backend in self.attn_backend_list:
             attn_backend.on_after_cuda_graph_warmup()
+
+    def get_verify_buffers_to_fill_after_draft(self):
+        # Verify tree-mask / position buffers live on the full-attn child (the
+        # linear side consumes no mask). Handing them out lets the draft stage
+        # write straight into the captured verify buffers instead of allocating
+        # a fresh mask every step.
+        return self.full_attn_backend.get_verify_buffers_to_fill_after_draft()
+
+    def update_verify_buffers_to_fill_after_draft(
+        self, spec_info: SpecInput, cuda_graph_bs: Optional[int]
+    ):
+        # Plan-stream fixup after draft completes: forward to both children.
+        # Sub-backends that cannot run under the plan stream keep the fail-loud
+        # NotImplementedError base behavior.
+        for attn_backend in self.attn_backend_list:
+            attn_backend.update_verify_buffers_to_fill_after_draft(
+                spec_info=spec_info, cuda_graph_bs=cuda_graph_bs
+            )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         if forward_batch.forward_mode.is_draft_extend_v2():
