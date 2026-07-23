@@ -779,6 +779,38 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         )
         return views, item_bytes
 
+    def swa_region_buffers(self) -> Tuple[List[torch.Tensor], int]:
+        """
+        Page-granular views of the SWA ring region [0, swa_pages) of every
+        unified_kv layer, one indexed row per sliding-window page
+        (``unified_swa_ring_size`` consecutive ring rows). Mirrors
+        ``unified_region_buffers`` so the SWA host pool transfers a whole window
+        per page and device rows match the host ``item_bytes`` in transfer_kv.
+        """
+        assert self._unified_kv, "swa_region_buffers requires unified_kv layout"
+
+        swa_pages = self.unified_kv_pool.swa_pages
+        head_dim = self.unified_kv_pool.head_dim
+        rows_per_page = self.unified_swa_ring_size
+        assert (
+            swa_pages % rows_per_page == 0
+        ), f"swa_pages {swa_pages} not a multiple of ring size {rows_per_page}"
+        num_pages = swa_pages // rows_per_page
+
+        views: List[torch.Tensor] = []
+        for buf in self.unified_kv_pool.kv_buffer:
+            page_view = (
+                buf.narrow(0, 0, swa_pages)
+                .reshape(num_pages, rows_per_page * head_dim)
+                .view(torch.uint8)
+            )
+            views.append(page_view)
+
+        item_bytes = (
+            rows_per_page * head_dim * self.unified_kv_pool.kv_buffer[0].element_size()
+        )
+        return views, item_bytes
+
     def get_state_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
         data_ptrs: List[int] = []
         data_lens: List[int] = []
@@ -807,6 +839,31 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 item_lens.append(t[0].nbytes * pool.ring_size)
 
         return data_ptrs, data_lens, item_lens
+
+    def get_swa_state_coupling_infos(self) -> List[Tuple[int, int]]:
+        """FlexKV integration contract: the SWA-slot -> state-row mapping.
+
+        FlexKV registers the c4 / indexer state device buffers itself (handles
+        come from ``get_state_buf_infos``); it only needs the mapping to
+        co-place / co-fetch each state row with the SWA window it rides. Returns
+        one ``(swa_page_size, ring_size)`` per sidecar state pool, in the SAME
+        order/filtering as the state-pool entries of ``get_state_buf_infos``. For
+        a SWA device location ``swa_loc`` the coupled state row is
+        ``(swa_loc // swa_page_size) * ring_size + (swa_loc % ring_size)`` when
+        ``swa_loc >= 0`` else ``-1`` (== translate_from_swa_loc_to_state_loc).
+
+        Co-lifetime invariant the connector MUST honor: for a given (rid, B) the
+        SWA window and its coupled state rows are allocated/freed together and
+        must be co-present on fetch -- if any coupled row is missing, drop the
+        whole SWA window (recompute), never fetch with a desynced state.
+        """
+        infos: List[Tuple[int, int]] = []
+        for pools in [self.compress_state_pools, self.indexer_compress_state_pools]:
+            for pool in pools:
+                if pool is None or pool.ratio == 128:
+                    continue
+                infos.append((pool.swa_page_size, pool.ring_size))
+        return infos
 
     def get_c128_state_buf_infos(
         self,
