@@ -67,6 +67,7 @@ from sglang.srt.managers.schedule_batch import (
     ReqKvInfo,
     ScheduleBatch,
 )
+from sglang.srt.managers.scheduler_components.metrics_reporter import PrefillStats
 from sglang.srt.managers.schedule_policy import match_prefix_for_req
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -83,6 +84,7 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.observability.metrics_collector import QueueCount
 from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
     set_time_batch,
@@ -2334,6 +2336,19 @@ class SchedulerDisaggregationDecodeMixin:
         if replay_mode:
             new_batch.token_handoff_replay_batch = True
             new_batch.prepare_for_extend()
+            replay_tokens = sum(req.extend_range.length for req in can_run_list)
+            prompt_tokens = sum(len(req.prefix_indices) for req in can_run_list)
+            new_batch.prefill_stats = PrefillStats(
+                log_input_tokens=prompt_tokens + replay_tokens,
+                log_hit_tokens=prompt_tokens,
+                reprocessed_log_input_tokens=replay_tokens,
+                reprocessed_log_hit_tokens=0,
+                new_token_ratio=self.new_token_ratio_tracker.current,
+                num_running_reqs=QueueCount.from_reqs(
+                    running_batch.reqs, self.enable_priority_scheduling
+                ),
+                num_new_seqs=len(can_run_list),
+            )
         else:
             # construct fake completed prefill
             new_batch.prepare_for_prebuilt()
