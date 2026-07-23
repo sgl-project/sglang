@@ -12,7 +12,7 @@ import torch.nn.functional as F
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.utils import is_cuda, is_musa
+from sglang.srt.utils import is_cuda, is_hip, is_musa
 
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
 
@@ -45,6 +45,33 @@ if is_cuda() or is_musa():
         top_k_renorm_prob = None
         top_p_renorm_prob = None
         tree_speculative_sampling_target_only = None
+elif is_hip():
+
+    def _dspark_top_k_renorm_prob_torch(probs, top_ks):
+        top_ks = top_ks.to(device=probs.device)
+        sorted_probs, sorted_indices = torch.sort(probs, dim=-1, descending=True)
+        rank = torch.arange(probs.shape[-1], device=probs.device).view(1, -1)
+        sorted_probs = torch.where(
+            rank < top_ks.view(-1, 1), sorted_probs, torch.zeros_like(sorted_probs)
+        )
+        renorm = torch.zeros_like(probs).scatter_(-1, sorted_indices, sorted_probs)
+        return renorm / renorm.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+
+    def _dspark_top_p_renorm_prob_torch(probs, top_ps):
+        top_ps = top_ps.to(device=probs.device)
+        sorted_probs, sorted_indices = torch.sort(probs, dim=-1, descending=True)
+        cumsum_excl = torch.cumsum(sorted_probs, dim=-1) - sorted_probs
+        sorted_probs = torch.where(
+            cumsum_excl <= top_ps.view(-1, 1),
+            sorted_probs,
+            torch.zeros_like(sorted_probs),
+        )
+        renorm = torch.zeros_like(probs).scatter_(-1, sorted_indices, sorted_probs)
+        return renorm / renorm.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+
+    top_k_renorm_prob = _dspark_top_k_renorm_prob_torch
+    top_p_renorm_prob = _dspark_top_p_renorm_prob_torch
+    tree_speculative_sampling_target_only = None
 else:
     top_k_renorm_prob = None
     top_p_renorm_prob = None
