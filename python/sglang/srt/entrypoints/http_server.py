@@ -152,7 +152,11 @@ from sglang.srt.managers.multi_tokenizer_mixin import (
     read_from_shared_memory,
     write_data_for_multi_tokenizer,
 )
-from sglang.srt.managers.tokenizer_manager import ServerStatus, TokenizerManager
+from sglang.srt.managers.tokenizer_manager import (
+    ServerStatus,
+    TokenizerManager,
+    shutdown_scheduler_and_child_processes,
+)
 from sglang.srt.observability.func_timer import enable_func_timer
 from sglang.srt.observability.trace import (
     process_tracing_init,
@@ -2594,6 +2598,11 @@ def _setup_and_run_http_server(
                 )
     finally:
         if server_args.tokenizer_worker_num > 1:
+            if subprocess_watchdog is not None:
+                subprocess_watchdog.stop()
+            shutdown_scheduler_and_child_processes(
+                tokenizer_manager.dispatch_scheduler_shutdown
+            )
             if multi_tokenizer_args_shm is not None:
                 multi_tokenizer_args_shm.unlink()
             if _global_state is not None:

@@ -1,12 +1,17 @@
-import unittest
+import sys
+from unittest.mock import Mock, sentinel
+
+import pytest
 
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import maybe_stub_sgl_kernel
+from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import BatchStrOutput
 from sglang.srt.managers.multi_tokenizer_mixin import (
+    MultiTokenizerRouter,
     TokenizerWorker,
     _handle_output_by_index,
     get_tokenizer_worker_class,
@@ -79,7 +84,7 @@ def _make_batch_str_output() -> BatchStrOutput:
     )
 
 
-class TestMultiTokenizerMixin(unittest.TestCase):
+class TestMultiTokenizerMixin(CustomTestCase):
     def test_batch_str_output_preserves_cached_tokens_details(self):
         output = _make_batch_str_output()
 
@@ -105,6 +110,31 @@ class TestMultiTokenizerMixin(unittest.TestCase):
         with self.assertRaisesRegex(TypeError, "TokenizerWorker"):
             get_tokenizer_worker_class(InvalidServerArgs())
 
+    def test_router_dispatches_shutdown_on_its_event_loop(self):
+        router = MultiTokenizerRouter.__new__(MultiTokenizerRouter)
+        router.send_to_scheduler = sentinel.socket
+        router._loop = sentinel.loop
+        send = Mock(return_value=sentinel.coroutine)
+        completed = Mock()
+        submit = Mock(return_value=completed)
+
+        with (
+            envs.SGLANG_SCHEDULER_SHUTDOWN_TIMEOUT.override(2.0),
+            pytest.MonkeyPatch.context() as monkeypatch,
+        ):
+            monkeypatch.setattr(
+                "sglang.srt.managers.multi_tokenizer_mixin.async_sock_send", send
+            )
+            monkeypatch.setattr(
+                "sglang.srt.managers.multi_tokenizer_mixin.asyncio.run_coroutine_threadsafe",
+                submit,
+            )
+            router.dispatch_scheduler_shutdown()
+
+        send.assert_called_once()
+        submit.assert_called_once_with(sentinel.coroutine, sentinel.loop)
+        completed.result.assert_called_once_with(timeout=2.0)
+
 
 if __name__ == "__main__":
-    unittest.main()
+    sys.exit(pytest.main([__file__]))
