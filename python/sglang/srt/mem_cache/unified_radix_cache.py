@@ -5060,20 +5060,29 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                         f"{ct} device LRU: "
                         f"+tree={tree_ids - lru_ids}, +lru={lru_ids - tree_ids}"
                     )
-                # Aux host-only states must match the host LRU.
+                # Host locks may temporarily detach protected nodes from the
+                # evictable host LRU.
                 host_lru = self.host_lru_lists[ct]
-                s3_ids = {
-                    n.id
+                host_only_nodes = [
+                    n
                     for n in all_nodes
                     if n is not self.root_node
                     and n.component_data[ct].value is None
                     and n.component_data[ct].host_value is not None
+                ]
+                host_only_ids = {n.id for n in host_only_nodes}
+                evictable_host_only_ids = {
+                    n.id
+                    for n in host_only_nodes
+                    if n.component_data[ct].host_lock_ref == 0
                 }
                 host_lru_ids = set(host_lru.cache.keys())
-                if s3_ids != host_lru_ids:
+                missing_host_lru_ids = evictable_host_only_ids - host_lru_ids
+                extra_host_lru_ids = host_lru_ids - host_only_ids
+                if missing_host_lru_ids or extra_host_lru_ids:
                     E(
                         f"{ct} host LRU: "
-                        f"+S3={s3_ids - host_lru_ids}, +lru={host_lru_ids - s3_ids}"
+                        f"+S3={missing_host_lru_ids}, +lru={extra_host_lru_ids}"
                     )
                 # The same aux node must not appear in both device and host LRU.
                 inv5_overlap = lru_ids & host_lru_ids

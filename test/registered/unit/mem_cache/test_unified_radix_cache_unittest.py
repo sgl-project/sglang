@@ -3101,6 +3101,17 @@ class UnifiedRadixCacheSuite:
                 self.assertTrue(cache.host_lru_lists[aux].in_list(node))
         cache.sanity_check()
 
+        host_lock_params = cache.inc_host_lock_ref(node).to_dec_params()
+        for aux in aux_types:
+            component_data = node.component_data[aux]
+            if component_data.value is None and component_data.host_value is not None:
+                self.assertGreater(component_data.host_lock_ref, 0)
+                self.assertFalse(cache.host_lru_lists[aux].in_list(node))
+        cache.sanity_check()
+
+        cache.dec_host_lock_ref(node, host_lock_params)
+        cache.sanity_check()
+
     def _build_chain_pages(self, cache, allocator, req_to_token_pool, num_pages):
         """Insert an incremental chain of single-page extensions.
 
