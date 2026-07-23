@@ -288,6 +288,10 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
                 self.assertTrue(manager_cache_controller.is_rank_replicated_pool(pool))
 
     def test_hybrid_backup_thread_dispatches_when_primary_backup_is_skipped(self):
+        self.assertIs(
+            HybridCacheController.backup_thread_func,
+            HiCacheController.backup_thread_func,
+        )
         operation = object()
         controller = HybridCacheController.__new__(HybridCacheController)
         controller.storage_stop_event = mock.Mock()

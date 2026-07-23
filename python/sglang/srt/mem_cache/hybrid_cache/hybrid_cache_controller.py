@@ -5,7 +5,7 @@ import logging
 import os
 import threading
 import time
-from queue import Empty, Queue
+from queue import Queue
 from typing import TYPE_CHECKING, Any, Callable, List, Optional
 
 import torch
@@ -675,11 +675,9 @@ class HybridCacheController(BaseHiCacheController):
             results = self._extra_pool_backup(operation.pool_transfers)
             operation.pool_storage_result.update_extra_pool_hit_pages(results)
 
-        # Backup kv pools
-        if not self.backup_skip:
-            super()._page_backup(operation)
-        else:
-            operation.completed_tokens = len(operation.hash_value) * self.page_size
+        # Backup kv pools. The base implementation applies backup_skip only to
+        # the primary pool, after hybrid sidecar pools have been handled above.
+        super()._page_backup(operation)
 
     def _extra_pool_backup(
         self, pool_transfers: list[PoolTransfer]
@@ -708,20 +706,6 @@ class HybridCacheController(BaseHiCacheController):
         if backup_pools:
             results.update(self.storage_backend.batch_set_v2(backup_pools))
         return results
-
-    def backup_thread_func(self):
-        """Dispatch every hybrid operation; apply backup_skip per pool."""
-        while not self.storage_stop_event.is_set():
-            try:
-                operation = self.backup_queue.get(block=True, timeout=1)
-                if operation is None:
-                    continue
-
-                self._page_backup(operation)
-                self.ack_backup_queue.put(operation)
-
-            except Empty:
-                continue
 
     def _resolve_sidecar_derived_pool_transfers(self, operation):
         for transfer in operation.pool_transfers:
