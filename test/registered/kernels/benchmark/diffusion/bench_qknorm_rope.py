@@ -131,7 +131,7 @@ def clone_inputs(
 def split_qknorm_rope(inputs: dict[str, torch.Tensor | bool]) -> None:
     from flashinfer.rope import apply_rope_with_cos_sin_cache_inplace
 
-    from sglang.kernels.ops.layernorm._jit_norm import fused_inplace_qknorm
+    from sglang.kernels.ops.layernorm.norm import fused_inplace_qknorm
 
     q = inputs["q"]
     k = inputs["k"]

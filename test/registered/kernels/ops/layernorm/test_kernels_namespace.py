@@ -21,6 +21,7 @@ GROUPS = [
     "attention",
     "communication",
     "diffusion",
+    "elementwise",
     "embeddings",
     "gemm",
     "grammar",
@@ -31,7 +32,6 @@ GROUPS = [
     "moe",
     "quantization",
     "sampling",
-    "spatial",
     "speculative",
 ]
 
