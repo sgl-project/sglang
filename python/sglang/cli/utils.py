@@ -114,13 +114,13 @@ def get_model_path(extra_argv):
     if model_path is None:
         # Fallback for --help or other cases where model-path is not provided
         if any(h in extra_argv for h in ["-h", "--help"]):
-            raise Exception(
+            raise ValueError(
                 "Usage: sglang serve --model-path <model-name-or-path> [additional-arguments]\n\n"
                 "This command can launch either a standard language model server or a diffusion model server.\n"
                 "The server type is determined by the --model-path.\n"
             )
         else:
-            raise Exception(
+            raise ValueError(
                 "Error: --model-path is required. "
                 "Please provide the path to the model."
             )
