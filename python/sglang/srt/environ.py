@@ -734,13 +734,6 @@ class Envs:
     # model hands off the output-norm gate (Kimi K3); tolerance-level
     # differences vs the unfused chain.
     SGLANG_KDA_FUSED_DECODE = EnvBool(True)
-    # Stage the fused-decode kernel's recurrent-state read via 1D TMA bulk
-    # copy (mbarrier complete-tx) instead of cp.async; bit-exact vs the
-    # cp.async path. Stage count auto-dispatches by grid size (B*HV >= 1024
-    # -> 3 stages, else 4); override with SGLANG_KDA_FUSED_DECODE_TMA_STAGES
-    # (2/3/4). Requires sm_90+.
-    SGLANG_KDA_FUSED_DECODE_TMA_LOAD = EnvBool(True)
-    SGLANG_KDA_FUSED_DECODE_TMA_STAGES = EnvInt(0)
 
     # MNNVL fused all-reduce (bf16, TP8): zero-copy 1shot multicast-push for
     # small messages and in-place NVLS 2shot on symmetric-memory tensors for
