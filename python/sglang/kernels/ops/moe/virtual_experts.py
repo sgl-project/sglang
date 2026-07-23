@@ -730,7 +730,9 @@ def _merged_experts_fused_moe_lora_add_impl(
                 .contiguous()
                 .view(-1, b_rank)
             )
-            out_arg = output[..., b_idx * half_out : (b_idx + 1) * half_out].contiguous()
+            out_arg = output[
+                ..., b_idx * half_out : (b_idx + 1) * half_out
+            ].contiguous()
         invoke_fused_moe_kernel(
             inter_arg,
             b_virtual,
