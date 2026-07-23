@@ -79,6 +79,7 @@ class TransferInfo:
     required_dst_info_num: int
     is_dummy: bool
     decode_prefix_len: Optional[int] = None
+    dst_device_kv_indices: Optional[npt.NDArray[np.int32]] = None
     # Note: always put the optional staging field at the final (it will be set through 'STAGING_RSP' pkg when needed)
     staging: Optional[StagingTransferInfo] = None
 
@@ -106,6 +107,11 @@ class TransferInfo:
             is_dummy=is_dummy,
             decode_prefix_len=(
                 int(msg[8].decode("ascii")) if len(msg) > 8 and msg[8] != b"" else None
+            ),
+            dst_device_kv_indices=(
+                np.frombuffer(msg[9], dtype=np.int32)
+                if len(msg) > 9 and msg[9] != b""
+                else None
             ),
         )
 
@@ -591,6 +597,8 @@ class MooncakeKVManager(CommonKVManager):
         executor: concurrent.futures.ThreadPoolExecutor,
         state_type: Optional[StateType] = None,
         force_flat: bool = False,
+        dst_device_data_indices: Optional[npt.NDArray[np.int32]] = None,
+        dst_device_data_ptrs: Optional[set[int]] = None,
     ) -> int:
         """
         Generic KV cache transfer supporting both MHA and MLA architectures.
@@ -600,10 +608,18 @@ class MooncakeKVManager(CommonKVManager):
         even on a non-MLA backend, for K-only state buffers (e.g. MiniMax sparse
         index) whose per-layer list must not be half-split into K/V.
         """
-        # Group by indices for optimization
+        # Host and device buffers may use different destination page spaces.
+        # Build both transfer plans once, then select per destination buffer.
         prefill_kv_blocks, dst_kv_blocks = group_concurrent_contiguous(
             prefill_data_indices, dst_data_indices
         )
+        device_prefill_kv_blocks = device_dst_kv_blocks = None
+        if dst_device_data_indices is not None:
+            device_prefill_kv_blocks, device_dst_kv_blocks = (
+                group_concurrent_contiguous(
+                    prefill_data_indices, dst_device_data_indices
+                )
+            )
 
         layers_params = None
 
@@ -653,7 +669,18 @@ class MooncakeKVManager(CommonKVManager):
             src_ptr: int, dst_ptr: int, item_len: int
         ) -> List[Tuple[int, int, int]]:
             transfer_blocks = []
-            for prefill_index, decode_index in zip(prefill_kv_blocks, dst_kv_blocks):
+            if dst_device_data_ptrs and int(dst_ptr) in dst_device_data_ptrs:
+                assert (
+                    device_prefill_kv_blocks is not None
+                    and device_dst_kv_blocks is not None
+                )
+                src_blocks, dst_blocks = (
+                    device_prefill_kv_blocks,
+                    device_dst_kv_blocks,
+                )
+            else:
+                src_blocks, dst_blocks = prefill_kv_blocks, dst_kv_blocks
+            for prefill_index, decode_index in zip(src_blocks, dst_blocks):
                 src_addr = src_ptr + int(prefill_index[0]) * item_len
                 dst_addr = dst_ptr + int(decode_index[0]) * item_len
                 length = item_len * len(prefill_index)
@@ -701,7 +728,19 @@ class MooncakeKVManager(CommonKVManager):
         dst_kv_ptrs: list[int],
         dst_kv_indices: npt.NDArray[np.int32],
         executor: concurrent.futures.ThreadPoolExecutor,
+        dst_device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
     ):
+        dst_device_kv_ptrs = None
+        if dst_device_kv_indices is not None:
+            compression_ratios = self.kv_args.mla_compression_ratios
+            assert compression_ratios is not None
+            if len(dst_kv_ptrs) == len(self.kv_args.kv_data_ptrs):
+                start = self.kv_args.prefill_start_layer
+                end = self.kv_args.prefill_end_layer
+                assert end is not None
+                compression_ratios = compression_ratios[start:end]
+            c4_layer_num = sum(ratio == 4 for ratio in compression_ratios)
+            dst_device_kv_ptrs = set(dst_kv_ptrs[c4_layer_num:])
         return self._send_kvcache_generic(
             mooncake_session_id=mooncake_session_id,
             src_data_ptrs=self.kv_args.kv_data_ptrs,
@@ -710,6 +749,8 @@ class MooncakeKVManager(CommonKVManager):
             prefill_data_indices=prefill_kv_indices,
             dst_data_indices=dst_kv_indices,
             executor=executor,
+            dst_device_data_indices=dst_device_kv_indices,
+            dst_device_data_ptrs=dst_device_kv_ptrs,
         )
 
     def send_kvcache_slice(
@@ -1343,6 +1384,11 @@ class MooncakeKVManager(CommonKVManager):
                                 break
 
                         chunked_dst_kv_indice = req.dst_kv_indices[kv_chunk.index_slice]
+                        chunked_dst_device_kv_indice = (
+                            req.dst_device_kv_indices[kv_chunk.index_slice]
+                            if req.dst_device_kv_indices is not None
+                            else None
+                        )
 
                         # NOTE: This is temporarily a workaround to deal with the case where the prefill_kv_indices
                         # is mismatched with the dst_kv_indices when page size > 1, this should never happen.
@@ -1354,6 +1400,10 @@ class MooncakeKVManager(CommonKVManager):
                             )
                             kv_chunk.prefill_kv_indices = kv_chunk.prefill_kv_indices[
                                 : len(chunked_dst_kv_indice)
+                            ]
+                        if chunked_dst_device_kv_indice is not None:
+                            chunked_dst_device_kv_indice = chunked_dst_device_kv_indice[
+                                : len(kv_chunk.prefill_kv_indices)
                             ]
 
                         target_rank_registration_info: KVArgsRegisterInfo = (
@@ -1376,6 +1426,7 @@ class MooncakeKVManager(CommonKVManager):
                                 target_rank_registration_info.dst_kv_ptrs,
                                 chunked_dst_kv_indice,
                                 executor,
+                                dst_device_kv_indices=(chunked_dst_device_kv_indice),
                             )
                         elif (
                             self.enable_staging
@@ -1948,6 +1999,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
         aux_index: Optional[int] = None,
         state_indices: Optional[List] = None,
         decode_prefix_len: Optional[int] = None,
+        device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
     ):
         if self.bootstrap_infos is None:
             self.kv_mgr.record_failure(
@@ -1986,6 +2038,11 @@ class MooncakeKVReceiver(CommonKVReceiver):
                         ),
                         str(self.required_dst_info_num).encode("ascii"),
                         str(decode_prefix_len or 0).encode("ascii"),
+                        (
+                            np.asarray(device_kv_indices, dtype=np.int32).tobytes()
+                            if not is_dummy and device_kv_indices is not None
+                            else b""
+                        ),
                     ]
                 )
         self.init_time = time.time()
