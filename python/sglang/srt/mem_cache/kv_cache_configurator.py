@@ -1047,6 +1047,7 @@ class KVCacheConfigurator:
             swa_attention_layer_ids=self.model_config.swa_attention_layer_ids,
             full_attention_layer_ids=self.model_config.full_attention_layer_ids,
             device=self.device,
+            enable_memory_saver=self.server_args.enable_memory_saver,
             token_to_kv_pool_class=NPUMHATokenToKVPool,
             **kwargs,
         )
@@ -1229,6 +1230,7 @@ class KVCacheConfigurator:
             swa_attention_layer_ids=swa_attention_layer_ids,
             full_attention_layer_ids=full_attention_layer_ids,
             device=self.device,
+            enable_memory_saver=self.server_args.enable_memory_saver,
             enable_kv_cache_copy=(self.server_args.speculative_algorithm is not None),
             token_to_kv_pool_class=swa_pool_class,
             **kwargs,
