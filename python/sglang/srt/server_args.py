@@ -2389,6 +2389,7 @@ class ServerArgs:
         "(-1 means unlimited). When enabled, after each insert the shallowest eligible "
         "interior states beyond the cap are removed while their full KV remains. "
         "Tail, fork, and locked nodes are preserved. Must be -1 or a positive integer.",
+        NS("exec.mamba"),
     ] = -1
     enable_mamba_cache_stochastic_rounding: A[
         bool,
