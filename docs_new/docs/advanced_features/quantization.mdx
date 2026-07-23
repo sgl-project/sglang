@@ -162,6 +162,13 @@ The following table summarizes quantization method support across NVIDIA and AMD
       <td><a href="https://github.com/NVIDIA/Model-Optimizer">NVIDIA ModelOpt</a>; use Marlin W4A16 fallback on Ampere/Hopper and native FP4 backends on Blackwell</td>
     </tr>
     <tr>
+      <td><code>modelopt_mixed</code></td>
+      <td>Yes (SM100+ with MXFP8; SM80+ for NVFP4 fallback)</td>
+      <td>No</td>
+      <td>No</td>
+      <td><a href="https://github.com/NVIDIA/Model-Optimizer">NVIDIA ModelOpt</a> mixed checkpoints with MXFP8 dense/shared-expert linears and NVFP4 routed experts</td>
+    </tr>
+    <tr>
       <td><code>nvfp4_online</code></td>
       <td>Yes (Blackwell/SM100 or SM103)</td>
       <td>No</td>
@@ -560,6 +567,9 @@ If a model is already quantized (e.g., from Hugging Face), you can load it direc
         --port 30000
     ```
 
+* **Mixed Precision Models:**
+    ModelOpt `MIXED_PRECISION` checkpoints are auto-detected as `modelopt_mixed`. MXFP8 dense/shared-expert linears use the shared FP8 backend and require Blackwell; routed experts use NVFP4/W4A16_NVFP4. FlashInfer CUTLASS pads output shards internally without changing checkpoint tensors.
+
 ##### Creating Your Own Quantized Checkpoints
 
 If a pre-quantized checkpoint is not available for your model, you can create one using NVIDIA Model Optimizer's `hf_ptq.py` script.
@@ -618,6 +628,7 @@ python examples/usage/modelopt_quantize_and_export.py quantize \
 
 - `modelopt_fp8`: FP8 quantization with optimal performance on NVIDIA Hopper and Blackwell GPUs
 - `modelopt_fp4`: FP4 quantization with optimal performance on Nvidia Blackwell GPUs
+- `modelopt_mixed`: ModelOpt mixed checkpoints with FP8, NVFP4/W4A16_NVFP4, and MXFP8 (Blackwell required for MXFP8)
 
 ##### Python API Usage
 
