@@ -269,46 +269,46 @@ class MinimaxM2Detector(BaseFormatDetector):
                 if function_match:
                     function_name = function_match.group(1).strip()
 
-                    # Validate function name
-                    if function_name in self._tool_indices:
-                        self._current_function_name = function_name
-                        self._function_name_sent = True
-
-                        # Initialize tool call tracking
-                        if self.current_tool_id == -1:
-                            self.current_tool_id = 0
-
-                        # Ensure tracking arrays are large enough
-                        while len(self.prev_tool_call_arr) <= self.current_tool_id:
-                            self.prev_tool_call_arr.append({})
-                        while len(self.streamed_args_for_tool) <= self.current_tool_id:
-                            self.streamed_args_for_tool.append("")
-
-                        # Store tool call info
-                        self.prev_tool_call_arr[self.current_tool_id] = {
-                            "name": function_name,
-                            "arguments": {},
-                        }
-
-                        # Send tool name with empty parameters
-                        calls.append(
-                            ToolCallItem(
-                                tool_index=self.current_tool_id,
-                                name=function_name,
-                                parameters="",
-                            )
-                        )
-
-                        # Remove the processed function declaration
-                        self._buf = self._buf[function_match.end() :]
-                        continue
-                    else:
-                        # Invalid function name, reset state
-                        logger.warning(f"Invalid function name: {function_name}")
+                    if (
+                        function_name not in self._tool_indices
+                        and self._handle_unknown_tool(function_name)
+                    ):
                         self._reset_streaming_state()
                         normal += self._buf
                         self._buf = ""
                         break
+
+                    self._current_function_name = function_name
+                    self._function_name_sent = True
+
+                    # Initialize tool call tracking
+                    if self.current_tool_id == -1:
+                        self.current_tool_id = 0
+
+                    # Ensure tracking arrays are large enough
+                    while len(self.prev_tool_call_arr) <= self.current_tool_id:
+                        self.prev_tool_call_arr.append({})
+                    while len(self.streamed_args_for_tool) <= self.current_tool_id:
+                        self.streamed_args_for_tool.append("")
+
+                    # Store tool call info
+                    self.prev_tool_call_arr[self.current_tool_id] = {
+                        "name": function_name,
+                        "arguments": {},
+                    }
+
+                    # Send tool name with empty parameters
+                    calls.append(
+                        ToolCallItem(
+                            tool_index=self.current_tool_id,
+                            name=function_name,
+                            parameters="",
+                        )
+                    )
+
+                    # Remove the processed function declaration
+                    self._buf = self._buf[function_match.end() :]
+                    continue
                 else:
                     # Function name not complete yet, wait for more text
                     break
