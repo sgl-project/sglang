@@ -347,7 +347,22 @@ class PrefillBootstrapQueue:
         """
         Set max_new_tokens = 1, so PrefillAdder memory estimation is accurate
         """
-        if token_handoff_eligible(req, self.scheduler):
+        handoff_eligible = token_handoff_eligible(req, self.scheduler)
+        if self.scheduler.server_args.enable_disaggregation_token_handoff:
+            logger.info(
+                "Token handoff admission rid=%s eligible=%s stream=%s "
+                "return_logprob=%s grammar=%s multimodal=%s temperature=%s "
+                "max_new_tokens=%s",
+                req.rid,
+                handoff_eligible,
+                req.stream,
+                req.return_logprob,
+                req.grammar is not None,
+                req.multimodal_inputs is not None,
+                req.sampling_params.temperature,
+                req.sampling_params.max_new_tokens,
+            )
+        if handoff_eligible:
             req.token_handoff_enabled = True
             req.token_handoff_original_max_new_tokens = (
                 req.sampling_params.max_new_tokens
