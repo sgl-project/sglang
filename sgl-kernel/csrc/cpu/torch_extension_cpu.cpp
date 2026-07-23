@@ -62,7 +62,7 @@ at::Tensor fused_add_layernorm_cpu(
 std::tuple<at::Tensor, at::Tensor> fused_qk_rmsnorm_cpu(
     const at::Tensor& q, const at::Tensor& k, const at::Tensor& q_weight, const at::Tensor& k_weight, double eps);
 at::Tensor fused_qk_rmsnorm_sumsq_cpu(const at::Tensor& q, const at::Tensor& k);
-std::tuple<at::Tensor, at::Tensor> fused_qk_rmsnorm_apply_cpu(
+std::tuple<at::Tensor, at::Tensor> fused_qk_rmsnorm_apply_from_stats_cpu(
     const at::Tensor& q,
     const at::Tensor& k,
     const at::Tensor& q_weight,
@@ -608,9 +608,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("fused_qk_rmsnorm_sumsq_cpu(Tensor q, Tensor k) -> Tensor");
   m.impl("fused_qk_rmsnorm_sumsq_cpu", torch::kCPU, &fused_qk_rmsnorm_sumsq_cpu);
   m.def(
-      "fused_qk_rmsnorm_apply_cpu(Tensor q, Tensor k, Tensor q_weight, Tensor k_weight, Tensor sum_sq, int "
+      "fused_qk_rmsnorm_apply_from_stats_cpu(Tensor q, Tensor k, Tensor q_weight, Tensor k_weight, Tensor sum_sq, int "
       "tp_world_size, float eps) -> (Tensor, Tensor)");
-  m.impl("fused_qk_rmsnorm_apply_cpu", torch::kCPU, &fused_qk_rmsnorm_apply_cpu);
+  m.impl("fused_qk_rmsnorm_apply_from_stats_cpu", torch::kCPU, &fused_qk_rmsnorm_apply_from_stats_cpu);
   m.def(
       "fused_qk_gemma_rmsnorm_cpu(Tensor q, Tensor k, Tensor q_weight, Tensor k_weight, float eps, int head_dim) -> "
       "(Tensor, Tensor)");
