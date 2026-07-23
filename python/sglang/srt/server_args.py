@@ -4099,8 +4099,12 @@ class ServerArgs:
             ("full torch.compile mode", lambda: self.enable_torch_compile),
             ("pipeline parallelism (pp_size > 1)", lambda: self.pp_size > 1),
             (
-                "non-CUDA hardware (HIP/NPU/CPU/MPS/XPU)",
-                lambda: is_hip() or is_npu() or is_cpu() or is_mps() or is_xpu(),
+                "non-CUDA hardware (HIP/CPU/MPS/XPU/NPU)",
+                lambda: is_hip()
+                or is_cpu()
+                or is_mps()
+                or is_xpu()
+                or (is_npu() and not envs.SGLANG_NPU_ENABLE_PIECEWISE_CUDA_GRAPH.get()),
             ),
             (
                 "OOT platform without piecewise support",
