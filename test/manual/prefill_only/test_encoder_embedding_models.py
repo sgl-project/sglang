@@ -28,7 +28,11 @@ from sglang.test.test_utils import CustomTestCase, get_similarities, is_in_ci
 # python -m unittest test_encoder_embedding_models.TestEncoderEmbeddingModels.test_prefill_logits
 
 
-MODELS = [("BAAI/bge-small-en", 1, 1e-5), ("BAAI/bge-m3", 1, 1e-5)]
+MODELS = [
+    ("BAAI/bge-small-en", 1, 1e-5),
+    ("BAAI/bge-m3", 1, 1e-5),
+    ("answerdotai/ModernBERT-base", 1, 1e-5),
+]
 
 ATTENTION_BACKEND = ["torch_native", "triton", "flashinfer"]
 BATCH_SIZE = [1, 2]
@@ -37,7 +41,6 @@ sgl_to_st_ratio = []
 
 
 class TestEncoderEmbeddingModels(CustomTestCase):
-
     @classmethod
     def setUpClass(cls):
         mp.set_start_method("spawn", force=True)
