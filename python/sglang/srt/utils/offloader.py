@@ -27,6 +27,130 @@ _SubmoduleAccessor = Callable[[torch.nn.Module], torch.nn.Module]
 _WhitelistParamNamesCreator = Callable[[torch.nn.Module], List[str]]
 
 
+class _ParamViewTracker:
+    """Detect and refresh tensor attributes that share storage with parameters.
+
+    When ``functional_call`` substitutes registered parameters/buffers via a
+    state dict, *regular* tensor attributes that are views of those parameters
+    are NOT updated.  This class detects such attributes at module-wrap time
+    and rebuilds them from the device-state dict before each forward call.
+
+    Handles single tensors (e.g. ``self.conv_weights = param.view(...)``)
+    and sequences (e.g. ``self.conv_weights = (view1, view2, view3)``).
+    """
+
+    def __init__(self, module: torch.nn.Module):
+        # {(submod_name, attr_name): [(index|None, param_name, offset, size, stride), ...]}
+        self._entries: dict[tuple[str, str], list[tuple]] = {}
+        self._detect(module)
+
+    # ------------------------------------------------------------------ detect
+    def _detect(self, module: torch.nn.Module):
+        # storage data_ptr -> [(param_name, param)]
+        storage_map: dict[int, list[tuple[str, torch.nn.Parameter]]] = {}
+        for name, p in module.named_parameters():
+            sptr = p.untyped_storage().data_ptr()
+            storage_map.setdefault(sptr, []).append((name, p))
+
+        if not storage_map:
+            return
+
+        for submod_name, submod in module.named_modules():
+            for attr_name in list(vars(submod)):
+                if attr_name.startswith("_"):
+                    continue
+                val = getattr(submod, attr_name, None)
+
+                if isinstance(val, torch.Tensor) and not isinstance(
+                    val, torch.nn.Parameter
+                ):
+                    self._check_single(submod_name, attr_name, val, storage_map)
+                elif isinstance(val, (tuple, list)):
+                    self._check_sequence(submod_name, attr_name, val, storage_map)
+
+    def _check_single(self, submod_name, attr_name, tensor, storage_map):
+        match = self._find_source_param(tensor, storage_map)
+        if match is not None:
+            param_name, offset = match
+            self._entries.setdefault((submod_name, attr_name), []).append(
+                (None, param_name, offset, tuple(tensor.size()), tuple(tensor.stride()))
+            )
+
+    def _check_sequence(self, submod_name, attr_name, seq, storage_map):
+        for i, elem in enumerate(seq):
+            if isinstance(elem, torch.Tensor) and not isinstance(
+                elem, torch.nn.Parameter
+            ):
+                match = self._find_source_param(elem, storage_map)
+                if match is not None:
+                    param_name, offset = match
+                    self._entries.setdefault((submod_name, attr_name), []).append(
+                        (
+                            i,
+                            param_name,
+                            offset,
+                            tuple(elem.size()),
+                            tuple(elem.stride()),
+                        )
+                    )
+
+    @staticmethod
+    def _find_source_param(tensor, storage_map):
+        """Return (param_name, element_offset) if *tensor* shares storage
+        with a parameter, else ``None``."""
+        try:
+            sptr = tensor.untyped_storage().data_ptr()
+            tptr = tensor.data_ptr()
+            esz = tensor.element_size()
+            tnbytes = tensor.numel() * esz
+        except RuntimeError:
+            return None
+
+        for param_name, param in storage_map.get(sptr, []):
+            pptr = param.data_ptr()
+            pnbytes = param.numel() * esz
+            if tptr >= pptr and tptr + tnbytes <= pptr + pnbytes:
+                return param_name, (tptr - pptr) // esz
+        return None
+
+    # ---------------------------------------------------------------- refresh
+    @property
+    def has_views(self) -> bool:
+        return bool(self._entries)
+
+    def refresh(self, module: torch.nn.Module, device_state: dict):
+        """Rebuild stale views from *device_state* and set them on *module*."""
+        for (submod_name, attr_name), entries in self._entries.items():
+            submod = module
+            if submod_name:
+                for part in submod_name.split("."):
+                    submod = getattr(submod, part)
+
+            if entries[0][0] is None:
+                # single tensor attribute
+                _, param_name, offset, size, stride = entries[0]
+                param_tensor = device_state.get(param_name)
+                if param_tensor is not None:
+                    setattr(
+                        submod,
+                        attr_name,
+                        param_tensor.as_strided(
+                            size, stride, param_tensor.storage_offset() + offset
+                        ),
+                    )
+            else:
+                # sequence (tuple / list) attribute
+                old = getattr(submod, attr_name)
+                new = list(old)
+                for idx, param_name, offset, size, stride in entries:
+                    param_tensor = device_state.get(param_name)
+                    if param_tensor is not None:
+                        new[idx] = param_tensor.as_strided(
+                            size, stride, param_tensor.storage_offset() + offset
+                        )
+                setattr(submod, attr_name, type(old)(new))
+
+
 class BaseOffloader(ABC):
     def wrap_modules(
         self,
@@ -107,6 +231,11 @@ class OffloaderV1(BaseOffloader):
         if self._cpu_offload_bytes >= self._cpu_offload_max_bytes:
             return module
 
+        # Detect tensor attributes that share storage with parameters.
+        # Must happen BEFORE offloading changes param storage so that the
+        # view-to-param relationships are still valid.
+        view_tracker = _ParamViewTracker(module)
+
         pin_memory = is_pin_memory_available()
         # offload parameters to CPU
         # use pin_memory if possible, which helps cudagraph capture speed
@@ -142,7 +271,14 @@ class OffloaderV1(BaseOffloader):
                     k: v.to(device, non_blocking=True)
                     for k, v in module.state_dict().items()
                 }
-                output = functional_call(module, device_state, args=args, kwargs=kwargs)
+                # Refresh tensor attributes that are views of parameters,
+                # because functional_call only substitutes registered
+                # parameters/buffers but not plain tensor attributes.
+                if view_tracker.has_views:
+                    view_tracker.refresh(module, device_state)
+                output = functional_call(
+                    module, device_state, args=args, kwargs=kwargs, tie_weights=False
+                )
                 module.forward = forward
                 return output
 
@@ -221,6 +357,9 @@ class OffloaderV2(BaseOffloader):
                     )
                 )
 
+        # Detect views for each offloaded submodule and store them for
+        # refresh during forward.
+
         for index, module in enumerate(offload_submodules):
             _hook_module_forward_for_offloader(
                 index=index,
@@ -244,6 +383,8 @@ class OffloaderV2(BaseOffloader):
 
 
 def _hook_module_forward_for_offloader(index, module, offloaders, prefetch_step):
+    view_tracker = offloaders[index]._view_tracker
+
     def _on_forward_end():
         offloaders[(index + prefetch_step) % len(offloaders)].start_onload()
         offloaders[index].offload()
@@ -254,16 +395,22 @@ def _hook_module_forward_for_offloader(index, module, offloaders, prefetch_step)
         get_parameter_and_buffer_dicts=lambda: offloaders[
             index
         ].wait_and_get_device_tensors(),
+        view_tracker=view_tracker,
     )
 
 
-def _hook_module_forward_raw(module, on_forward_end, get_parameter_and_buffer_dicts):
+def _hook_module_forward_raw(
+    module, on_forward_end, get_parameter_and_buffer_dicts, view_tracker=None
+):
     original_forward = module.forward
 
     def forward(*args, **kwargs):
         module.forward = original_forward
+        device_tensors = get_parameter_and_buffer_dicts()
+        if view_tracker is not None and view_tracker.has_views:
+            view_tracker.refresh(module, device_tensors)
         output = functional_call(
-            module, get_parameter_and_buffer_dicts(), args=args, kwargs=kwargs
+            module, device_tensors, args=args, kwargs=kwargs, tie_weights=False
         )
         on_forward_end()
         module.forward = forward
@@ -291,6 +438,10 @@ class _ModuleOffloader(ABC):
 
         self._device_tensors = None
         self._load_event = None
+
+        # Detect views BEFORE per-param offloaders move parameters, so that
+        # the view-to-param storage relationships are still valid.
+        self._view_tracker = _ParamViewTracker(module)
 
         param_dict = dict(self.module.named_parameters())
         assert all(
