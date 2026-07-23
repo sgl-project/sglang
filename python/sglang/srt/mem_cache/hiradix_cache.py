@@ -1718,17 +1718,11 @@ class HiRadixCache(RadixCache):
         self, node: TreeNode, key: RadixKey, host_value, hash_value
     ) -> Tuple[int, int]:
         # Returns (matched_length, inserted_length):
-        #   matched_length  -- prefix that overlapped existing *already-backed-up*
+        #   matched_length  -- prefix tokens that overlapped existing backed-up
         #                       nodes (redundant); the caller frees
         #                       `host_indices[:matched_length]`.
         #   inserted_length -- tokens actually materialized into the host tree
-        #                       (backfilled + new suffix; used for L3-hit metrics).
-        #
-        # Host indices layout after return (contiguous, non-overlapping):
-        #   [0..matched_length)              → redundant, caller frees
-        #   [matched_length..matched+bfill)  → backfilled into existing nodes
-        #   [matched+bfill..matched+bfill+suffix) → new_node host_value
-        # The last two regions are owned by tree nodes and must NOT be freed.
+        #                       (new suffix only; used for L3-hit metrics).
         node.last_access_time = time.monotonic()
         if len(key) == 0:
             return 0, 0
@@ -1736,25 +1730,11 @@ class HiRadixCache(RadixCache):
         child_key = key.child_key(self.page_size)
 
         matched_length = 0
-        backfilled_length = 0
         while len(key) > 0 and child_key in node.children.keys():
             node = node.children[child_key]
             node.last_access_time = time.monotonic()
             prefix_len = node.key.match(key, page_size=self.page_size)
-
-            # Backfill: if this matched node is device-only (not yet backed up),
-            # use the overlapping prefetch host pages to fill its host_value,
-            # maintaining the contiguous backup invariant from root without
-            # discarding valid L3 hits. The host pages are NOT redundant in this
-            # case — they become owned by the node, so we do NOT add them to
-            # matched_length (which the caller frees).
-            if node is not self.root_node and not node.backuped:
-                node.host_value = host_value[:prefix_len].clone()
-                backfilled_length += prefix_len
-                self._update_host_leaf_status(node)
-                self._record_store_event(node, medium=StorageMedium.CPU)
-            else:
-                matched_length += prefix_len
+            matched_length += prefix_len
 
             key = key[prefix_len:]
             host_value = host_value[prefix_len:]
@@ -1768,14 +1748,14 @@ class HiRadixCache(RadixCache):
                 child_key = key.child_key(self.page_size)
 
         if len(key):
-            # Safety net: if the while loop never executed (no matching child
-            # under the starting node), `node` is still the caller-supplied
-            # starting point, which may be an unbacked device node. We cannot
-            # attach a host-only child under it without breaking the backup
-            # invariant. Free the remaining pages and bail out.
+            # Guard: do not attach a host-only child under a device node that
+            # is not backed up. Doing so would break the backup invariant
+            # (backed-up nodes must form a contiguous prefix from root) and
+            # later trips the `_evict_regular` non-leaf assertion. Free the
+            # remaining host pages to prevent memory leaks and bail out.
             if node is not self.root_node and not node.backuped:
                 self.cache_controller.mem_pool_host.free(host_value)
-                return matched_length, backfilled_length
+                return matched_length, 0
 
             new_node = TreeNode(priority=node.priority)
             new_node.parent = node
@@ -1791,7 +1771,7 @@ class HiRadixCache(RadixCache):
             # cache indexers can resolve descendants that extend this L2-only prefix.
             self._record_store_event(new_node, medium=StorageMedium.CPU)
 
-        return matched_length, len(key) + backfilled_length
+        return matched_length, len(key)
 
     def _match_prefix_helper(self, node: TreeNode, key: RadixKey):
         node.last_access_time = time.monotonic()
