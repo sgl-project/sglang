@@ -1145,13 +1145,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     hicache_reserved_tokens=reserved_restore_tokens,
                 )
                 if uses_swa_tail_prealloc:
-                    swa_allocatable_tokens = (
-                        self._swa_tail_allocatable_token_budget(
-                            retractable_tokens=retractable_tokens,
-                            retractable_swa_tokens=retractable_swa_tokens,
-                            count_retracted=True,
-                            extra_reserved_reqs=len(preallocated_reqs),
-                        )
+                    swa_allocatable_tokens = self._swa_tail_allocatable_token_budget(
+                        retractable_tokens=retractable_tokens,
+                        retractable_swa_tokens=retractable_swa_tokens,
+                        count_retracted=True,
+                        extra_reserved_reqs=len(preallocated_reqs),
                     )
             else:
                 prefix_indices = None
