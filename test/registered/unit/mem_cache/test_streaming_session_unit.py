@@ -25,6 +25,7 @@ class _FakeInnerCache:
         self.page_size = page_size
         self.match_results = list(match_results or [])
         self.dec_lock_ref_calls = []
+        self.dec_lock_ref_params = []
 
     def cache_finished_req(self, *args, **kwargs):
         raise AssertionError("Streaming requests should not delegate to inner cache")
@@ -36,6 +37,7 @@ class _FakeInnerCache:
 
     def dec_lock_ref(self, node, *args, **kwargs):
         self.dec_lock_ref_calls.append(node)
+        self.dec_lock_ref_params.append(args[0] if args else kwargs.get("params"))
 
     def supports_mamba(self):
         return False
@@ -67,6 +69,7 @@ class _FakeReq:
         self.last_node = None
         self.cache_protected_len = 0
         self.swa_uuid_for_lock = None
+        self.mamba_lock_skip_ids = None
         self.mamba_pool_idx = None
         self.mamba_ping_pong_track_buffer = None
         self.mamba_next_track_idx = None
@@ -183,6 +186,37 @@ def test_nth_mid_abort_nukes_session_slot():
     # Pool slot returned.
     assert req_to_token_pool.free_slots == [0]
     assert req.req_pool_idx is None
+
+
+def test_release_session_threads_mamba_skip_ids():
+    """release_session must forward the slot's mamba_lock_skip_ids to
+    dec_lock_ref. The first req's last_node may be full-only-locked (mamba
+    skipped at inc), so without the skip set the release would drop a mamba
+    lock the session never took -- another request's, on a shared node."""
+    from sglang.srt.mem_cache.unified_cache_components import ComponentType
+
+    req_to_token = torch.arange(256, dtype=torch.int32).reshape(2, 128)
+    req_to_token_pool = SimpleNamespace(req_to_token=req_to_token, free_slots=[])
+    allocator = _FakeAllocator()
+    inner = _FakeInnerCache(req_to_token_pool, allocator, page_size=1)
+    tree_cache = StreamingSession(inner)
+
+    lock_node = SimpleNamespace(id=42)
+    tree_cache.slots["session-a"] = SessionSlot(
+        req_pool_idx=0,
+        kv_committed_len=50,
+        kv=SimpleNamespace(kv_allocated_len=50, swa_evicted_seqlen=0),
+        last_node=lock_node,
+        cache_protected_len=0,
+        mamba_lock_skip_ids={42},
+    )
+
+    tree_cache.release_session("session-a")
+
+    assert inner.dec_lock_ref_calls == [lock_node]
+    params = inner.dec_lock_ref_params[0]
+    assert params is not None
+    assert params.skip_lock_node_ids.get(ComponentType.MAMBA) == {42}
 
 
 # Shrink tests removed: streaming sessions are append-only after the

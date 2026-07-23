@@ -780,7 +780,10 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         return DecLockRefResult()
 
     def dec_swa_lock_only(
-        self, node: TreeNode, swa_uuid_for_lock: Optional[int] = None
+        self,
+        node: TreeNode,
+        swa_uuid_for_lock: Optional[int] = None,
+        mamba_lock_skip_ids: Optional[set] = None,  # unused, signature parity only
     ):
         """
         Decrement only the swa_lock_ref (and swa_protected_size_) along the chain
