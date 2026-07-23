@@ -202,7 +202,7 @@ binding = "PyO3"
 [tool.setuptools.package-data]
 "sglang" = [
   "srt/**/*",
-  "jit_kernel/**/*"
+  "kernels/**/*"
 ]
 
 [tool.setuptools.packages.find]
