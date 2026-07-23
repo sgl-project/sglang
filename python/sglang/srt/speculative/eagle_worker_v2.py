@@ -1077,6 +1077,21 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # draft_extend, which runs on the draft runner.
         return self._draft_worker.draft_runner
 
+    def requires_dp_attention_eager_forward(self, batch: ScheduleBatch) -> bool:
+        """Keep seedless GLM MTP draft fallback rank-consistent under DP attention."""
+        if not self.draft_worker.seed_dsa_topk_from_draft_extend:
+            return False
+
+        draft_input = batch.spec_info
+        if draft_input is None:
+            return False
+
+        has_seed_now = getattr(draft_input, "dsa_topk_indices", None) is not None
+        has_future_seed = getattr(
+            draft_input, "future_dsa_topk_indices_available", False
+        )
+        return not (has_seed_now or has_future_seed)
+
     @property
     def spec_v2_attn_backends(self) -> tuple:
         # Every attn backend a spec_v2 forward touches; consumed by

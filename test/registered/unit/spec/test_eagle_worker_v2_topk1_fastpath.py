@@ -145,6 +145,37 @@ class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
 
 
 class TestEagleWorkerV2BackendFallback(CustomTestCase):
+    def test_seedless_pd_draft_requests_rank_consistent_eager_forward(self):
+        worker = object.__new__(EAGLEWorkerV2)
+        worker._draft_worker = SimpleNamespace(seed_dsa_topk_from_draft_extend=True)
+
+        for seed, future_seed, expect_eager in (
+            (None, False, True),
+            (torch.ones((1, 1)), False, False),
+            (None, True, False),
+        ):
+            with self.subTest(
+                seed_present=seed is not None,
+                future_seed=future_seed,
+            ):
+                batch = SimpleNamespace(
+                    spec_info=SimpleNamespace(
+                        dsa_topk_indices=seed,
+                        future_dsa_topk_indices_available=future_seed,
+                    )
+                )
+                self.assertEqual(
+                    worker.requires_dp_attention_eager_forward(batch),
+                    expect_eager,
+                )
+
+        worker._draft_worker.seed_dsa_topk_from_draft_extend = False
+        self.assertFalse(
+            worker.requires_dp_attention_eager_forward(
+                SimpleNamespace(spec_info=SimpleNamespace(dsa_topk_indices=None))
+            )
+        )
+
     def test_missing_seed_cuda_graph_fallback(self):
         graph_result = (
             [],
