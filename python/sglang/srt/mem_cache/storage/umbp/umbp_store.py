@@ -803,6 +803,12 @@ class UMBPStore(HiCacheStorage):
                 safe_cap = int(cfg.ssd.capacity_bytes * 0.95)
                 cfg.ssd.spdk_proxy_tenant_quota_bytes = max(1, safe_cap // dp_size_hint)
 
+        # Initialize registration state before the optional constructor-time
+        # register_mem_pool_host() call below. In particular, do not overwrite
+        # the logical-anchor flag after that call has detected a LogicalHostPool.
+        self.registered_pools: dict = {}
+        self._kv_anchor_is_logical = False
+
         self.client = UMBPClient(cfg)
         if mem_pool_host is not None:
             self.register_mem_pool_host(mem_pool_host)
@@ -871,15 +877,6 @@ class UMBPStore(HiCacheStorage):
                     dp_rank=_dp_rank if _is_dp_mode else None,
                 )
                 self._kv_events_subscriber.start()
-
-        # Name -> HostKVCache map used by the v2 multi-pool path. Populated by
-        # register_mem_host_pool_v2(); initialized here so the v2 lookups never
-        # depend on registration order.
-        self.registered_pools: dict = {}
-        # Whether the KV anchor is a logical-only pool (no physical KV buffer,
-        # e.g. DeepSeek-V4's LogicalHostPool). Set for real in
-        # register_mem_pool_host().
-        self._kv_anchor_is_logical = False
 
     # ------------------------------------------------------------------
     # Host memory pool registration
@@ -1287,7 +1284,17 @@ class UMBPStore(HiCacheStorage):
             component_keys, key_multiplier = self._get_hybrid_page_component_keys(
                 keys, transfer
             )
-            exists = self.client.batch_exists(component_keys)
+            exists = list(self.client.batch_exists(component_keys))
+            if len(exists) != len(component_keys):
+                logger.error(
+                    "UMBP v2 batch_exists result-size mismatch for pool %s: "
+                    "expected=%d actual=%d; treating the storage prefix as a miss",
+                    transfer.name,
+                    len(component_keys),
+                    len(exists),
+                )
+                final_pages = 0
+                break
             # Collapse per-object results into per-page presence.
             page_exists = [
                 all(exists[i * key_multiplier : (i + 1) * key_multiplier])
@@ -1359,6 +1366,18 @@ class UMBPStore(HiCacheStorage):
                         key_strs, list(ptr_list), list(element_size_list)
                     )
                 ]
+
+            if len(io_results) != len(key_strs):
+                logger.error(
+                    "UMBP v2 %s result-size mismatch for pool %s: "
+                    "expected=%d actual=%d; treating every page as failed",
+                    "set" if is_set else "get",
+                    transfer.name,
+                    len(key_strs),
+                    len(io_results),
+                )
+                results[transfer.name] = [False] * len(keys)
+                continue
 
             # Collapse per-object results back to per-page results.
             results[transfer.name] = [
