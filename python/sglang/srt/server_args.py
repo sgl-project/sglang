@@ -5430,8 +5430,9 @@ class ServerArgs:
             and "WhisperForConditionalGeneration"
             in (model_config.hf_config.architectures or [])
         ):
-            logger.info("Radix cache is disabled for Whisper")
-            self.disable_radix_cache = True
+            # logger.info("Radix cache is disabled for Whisper")
+            # self.disable_radix_cache = True
+            pass
 
         # Major NVIDIA platforms backends: the page-size snaps of this family
         # moved to the resolution pipeline (arg_groups/overrides.py:

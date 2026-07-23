@@ -2088,7 +2088,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             encoder_reserve = ceil_align(encoder_len, page_size)
             seq_lens[i] -= encoder_reserve
 
-            if len(req.prefix_indices) < encoder_reserve:
+            if len(req.prefix_indices) < encoder_len:
                 # NOTE: the encoder part should be considered as a whole
                 assert len(req.prefix_indices) == 0
                 input_ids[i] = input_ids[i][encoder_reserve:]
@@ -2145,12 +2145,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             offset = 0
             extend_logprob_start_lens = self.extend_logprob_start_lens[:]
             for i, req in enumerate(self.reqs):
+                encoder_len = self.encoder_lens_cpu[i]
                 # Encoder region spans the page-aligned reserve.
-                encoder_reserve = ceil_align(self.encoder_lens_cpu[i], page_size)
+                encoder_reserve = ceil_align(encoder_len, page_size)
                 old_start_len = extend_logprob_start_lens[i]
                 old_contribution = req.extend_range.length - old_start_len
 
-                if len(req.prefix_indices) < encoder_reserve:
+                if len(req.prefix_indices) < encoder_len:
                     tokens_to_strip = max(0, encoder_reserve - old_start_len)
                     new_token_ids_parts.append(
                         self.extend_input_logprob_token_ids[
@@ -2180,7 +2181,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if encoder_len == 0:
                 continue
             encoder_reserve = ceil_align(encoder_len, page_size)
-            if len(req.prefix_indices) < encoder_reserve:
+            if len(req.prefix_indices) < encoder_len:
                 assert len(req.prefix_indices) == 0
                 req.extend_range = req.extend_range._replace(
                     start=req.extend_range.start + encoder_reserve
