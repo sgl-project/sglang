@@ -563,6 +563,18 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             async_finish=self.async_finish,
             allocate_on_comm_stream=previous_event is not None,
         )
+        gateup_input_fp8 = torch.empty(
+            x.shape,
+            dtype=torch.float8_e4m3fn,
+            device=x.device
+        )
+        if x.shape[0] > 0:
+            sgl_per_tensor_quant_fp8(
+                x,
+                gateup_input_fp8,
+                static_scale,
+                True
+            )
         # FIXME: `handle` should be transmitted with tokens from dispatch to combine.
         # However, doing this would incur an unknown synchronization error, but keeping
         # `handle` as a member variable works.
@@ -576,7 +588,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             self.handle,
             event,
         ) = buffer.dispatch(
-            x,
+            gateup_input_fp8,,
             topk_idx=topk_ids,
             topk_weights=topk_weights,
             num_tokens_per_rank=num_tokens_per_rank,
@@ -620,6 +632,8 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         return output, previous_event
 
     def combine_b(self, output, previous_event):
+        if output.shape[0] == 0:
+            output = output.to(torch.bfloat16)
         hidden_states, event = self._combine_core(output, previous_event)
         event.current_stream_wait() if self.async_finish else ()
         self.handle = None
