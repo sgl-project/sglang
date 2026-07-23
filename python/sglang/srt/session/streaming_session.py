@@ -251,7 +251,9 @@ class StreamingSession(BasePrefixCache):
         # KV reuse.
         if self.page_size > 1:
             expected_prefix_len = min(slot.kv_committed_len, len(params.key))
-            aligned_prefix_len = (expected_prefix_len // self.page_size) * self.page_size
+            aligned_prefix_len = (
+                expected_prefix_len // self.page_size
+            ) * self.page_size
             if aligned_prefix_len < slot.cache_protected_len or aligned_prefix_len == 0:
                 # Aligned length below protected prefix or zero: release
                 # the slot's KV resources to avoid leak, then return None
