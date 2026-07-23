@@ -1,14 +1,14 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: minwm-spmatrix720p-b200-west-20260723-21
+  name: minwm-spmatrix720p-b200-west-20260723-22
   namespace: default
   labels:
-    app.kubernetes.io/name: minwm-spmatrix720p-b200-west-20260723-21
+    app.kubernetes.io/name: minwm-spmatrix720p-b200-west-20260723-22
     seedleap.ai/owner: chenshengdong
     seedleap.ai/purpose: minwm-sp-parity-perf
     seedleap.ai/task: minwm-realtime-parity
-    seedleap.ai/run-id: latest-ckpt-v20-spmatrix720p-attempt21-west-spot
+    seedleap.ai/run-id: latest-ckpt-v20-spmatrix720p-attempt22-west-spot-efa
   annotations:
     seedleap.ai/capacity-type: spot
     seedleap.ai/repo: seedleap/sglang
@@ -27,11 +27,11 @@ spec:
   template:
     metadata:
       labels:
-        app.kubernetes.io/name: minwm-spmatrix720p-b200-west-20260723-21
+        app.kubernetes.io/name: minwm-spmatrix720p-b200-west-20260723-22
         seedleap.ai/owner: chenshengdong
         seedleap.ai/purpose: minwm-sp-parity-perf
         seedleap.ai/task: minwm-realtime-parity
-        seedleap.ai/run-id: latest-ckpt-v20-spmatrix720p-attempt21-west-spot
+        seedleap.ai/run-id: latest-ckpt-v20-spmatrix720p-attempt22-west-spot-efa
       annotations:
         seedleap.ai/repo: seedleap/sglang
         seedleap.ai/branch: codex/minwm-realtime-api
@@ -47,7 +47,7 @@ spec:
           effect: NoSchedule
       nodeSelector:
         eks.amazonaws.com/capacityType: SPOT
-        eks.amazonaws.com/nodegroup: minwm-spot-p6-b200-0703
+        eks.amazonaws.com/nodegroup: loomvideo-spot-p6b200-efa-0614
         node.kubernetes.io/instance-type: p6-b200.48xlarge
         seedleap.ai/workload: wan22-ti2v
       containers:
@@ -69,7 +69,7 @@ spec:
             - name: MINWM_BENCHMARK_MODE
               value: spmatrix720p
             - name: MINWM_RUN_ID
-              value: latest-ckpt-v20-spmatrix720p-attempt21-west-spot
+              value: latest-ckpt-v20-spmatrix720p-attempt22-west-spot-efa
             - name: MINWM_SP_WARMUP_RUNS
               value: "1"
             - name: MINWM_STAGE_FROM_MOUNT
