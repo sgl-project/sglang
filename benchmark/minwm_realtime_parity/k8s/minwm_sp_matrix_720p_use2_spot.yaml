@@ -1,22 +1,22 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: minwm-spmatrix720p-h100-west-20260723-26
+  name: minwm-spmatrix720p-b200-use2-20260723-27
   namespace: default
   labels:
-    app.kubernetes.io/name: minwm-spmatrix720p-h100-west-20260723-26
+    app.kubernetes.io/name: minwm-spmatrix720p-b200-use2-20260723-27
     seedleap.ai/owner: chenshengdong
     seedleap.ai/purpose: minwm-sp-parity-perf
     seedleap.ai/task: minwm-realtime-parity
-    seedleap.ai/run-id: latest-ckpt-v20-spmatrix720p-attempt26-west-h100-spot
+    seedleap.ai/run-id: latest-ckpt-v20-spmatrix720p-attempt27-use2-b200-spot
   annotations:
     seedleap.ai/capacity-type: spot
     seedleap.ai/repo: seedleap/sglang
     seedleap.ai/branch: codex/minwm-realtime-api
-    seedleap.ai/commit: "b1596e4af0840cead6c801041a12bd5093575df1"
-    seedleap.ai/sglang-git-ref: "b1596e4af0840cead6c801041a12bd5093575df1"
+    seedleap.ai/commit: "980a2870aee594343a6d226f027f722bffe702ba"
+    seedleap.ai/sglang-git-ref: "980a2870aee594343a6d226f027f722bffe702ba"
     seedleap.ai/minwm-git-ref: "2efc6485f65e8fcab506665efde79bc41406385e"
-    seedleap.ai/checkpoint-version-id: "wduScksw2f3yPErnG9lBioOuE2AToyAP"
+    seedleap.ai/checkpoint-version-id: "kDZQsOi0DluXcfC5mzZ7keaUJxkadhL1"
     seedleap.ai/ttl: 24h
 spec:
   completionMode: Indexed
@@ -27,18 +27,17 @@ spec:
   template:
     metadata:
       labels:
-        app.kubernetes.io/name: minwm-spmatrix720p-h100-west-20260723-26
+        app.kubernetes.io/name: minwm-spmatrix720p-b200-use2-20260723-27
         seedleap.ai/owner: chenshengdong
         seedleap.ai/purpose: minwm-sp-parity-perf
         seedleap.ai/task: minwm-realtime-parity
-        seedleap.ai/run-id: latest-ckpt-v20-spmatrix720p-attempt26-west-h100-spot
+        seedleap.ai/run-id: latest-ckpt-v20-spmatrix720p-attempt27-use2-b200-spot
       annotations:
         seedleap.ai/repo: seedleap/sglang
         seedleap.ai/branch: codex/minwm-realtime-api
-        seedleap.ai/commit: "b1596e4af0840cead6c801041a12bd5093575df1"
+        seedleap.ai/commit: "980a2870aee594343a6d226f027f722bffe702ba"
     spec:
       restartPolicy: Never
-      priorityClassName: wan22-debug-low
       terminationGracePeriodSeconds: 60
       tolerations:
         - key: seedleap.ai/workload
@@ -47,8 +46,8 @@ spec:
           effect: NoSchedule
       nodeSelector:
         eks.amazonaws.com/capacityType: SPOT
-        eks.amazonaws.com/nodegroup: minwm-spot-p5-h100-sglang-0718
-        node.kubernetes.io/instance-type: p5.48xlarge
+        eks.amazonaws.com/nodegroup: loomvideo-spot-p6b200-use2
+        node.kubernetes.io/instance-type: p6-b200.48xlarge
         seedleap.ai/workload: wan22-ti2v
       containers:
         - name: benchmark
@@ -63,27 +62,25 @@ spec:
                   key: token
                   optional: true
             - name: SGLANG_GIT_REF
-              value: "b1596e4af0840cead6c801041a12bd5093575df1"
+              value: "980a2870aee594343a6d226f027f722bffe702ba"
             - name: MINWM_GIT_REF
               value: "2efc6485f65e8fcab506665efde79bc41406385e"
             - name: MINWM_BENCHMARK_MODE
               value: spmatrix720p
             - name: MINWM_RUN_ID
-              value: latest-ckpt-v20-spmatrix720p-attempt26-west-h100-spot
+              value: latest-ckpt-v20-spmatrix720p-attempt27-use2-b200-spot
             - name: MINWM_SP_WARMUP_RUNS
               value: "1"
             - name: MINWM_STAGE_FROM_MOUNT
-              value: "1"
-            - name: MINWM_S3_MOUNT
-              value: /s3
-            - name: MINWM_CHECKPOINT_MOUNT_PATH
-              value: /s3/world-model/evals/minwm/checkpoint-staging/wan22-5B-stage3-dmd-8-0721-6a531f0e067/global_step_003200/ema_student/model.pt
-            - name: MINWM_PRETRAINED_MOUNT_PATH
-              value: /s3/world-model/checkpoints/minWM/Wan2.2-TI2V-5B-from-diffusers
+              value: "0"
+            - name: AWS_REGION
+              value: us-west-2
+            - name: AWS_DEFAULT_REGION
+              value: us-west-2
             - name: MINWM_CHECKPOINT_S3_EAST
-              value: s3://leap-world-us-east-2/world-model/evals/minwm/checkpoint-staging/wan22-5B-stage3-dmd-8-0721-6a531f0e067/global_step_003200/ema_student/model.pt
+              value: s3://leap-world-us-west-2/ray-res/shuffle_parquet_and_csv/minwm-sp-bench-20260723/inputs/checkpoint/model.pt
             - name: MINWM_CHECKPOINT_VERSION_EAST
-              value: wduScksw2f3yPErnG9lBioOuE2AToyAP
+              value: kDZQsOi0DluXcfC5mzZ7keaUJxkadhL1
             - name: MINWM_CHECKPOINT_SOURCE_URI
               value: s3://leap-world-us-west-2/world-model/minwm/checkpoints/run-archive/rolling/Wan21/Action2V/dmd/wan22-5B-stage3-dmd-8-0721-6a531f0e067/global_step_003200/ema_student/model.pt
             - name: MINWM_CHECKPOINT_SOURCE_VERSION
@@ -95,9 +92,11 @@ spec:
             - name: MINWM_CHECKPOINT_CRC64
               value: I0IQ+p0pREI=
             - name: MINWM_PRETRAINED_S3
-              value: s3://leap-world-us-east-2/world-model/checkpoints/minWM/Wan2.2-TI2V-5B-from-diffusers
+              value: s3://leap-world-us-west-2/ray-res/shuffle_parquet_and_csv/minwm-sp-bench-20260723/inputs/pretrained
             - name: MINWM_RESULTS_ROOT
-              value: /s3/world-model/evals/minwm/realtime-parity/20260723-codex-578d/results
+              value: /work/minwm-results
+            - name: MINWM_RESULTS_S3_URI
+              value: s3://leap-world-us-west-2/ray-res/shuffle_parquet_and_csv/minwm-sp-bench-20260723/.latent_cache/results
           command:
             - /bin/bash
             - -lc
@@ -125,16 +124,11 @@ spec:
             requests:
               nvidia.com/gpu: "8"
           volumeMounts:
-            - name: s3
-              mountPath: /s3
             - name: work
               mountPath: /work
             - name: shm
               mountPath: /dev/shm
       volumes:
-        - name: s3
-          persistentVolumeClaim:
-            claimName: s3-claim
         - name: work
           emptyDir: {}
         - name: shm
