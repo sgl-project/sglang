@@ -4,7 +4,10 @@ use async_trait::async_trait;
 use axum::{
     body::Body,
     extract::Request,
-    http::{header::CONTENT_TYPE, HeaderMap, HeaderValue, StatusCode},
+    http::{
+        header::{CONTENT_LENGTH, CONTENT_TYPE, TRANSFER_ENCODING},
+        HeaderMap, HeaderValue, StatusCode,
+    },
     response::{IntoResponse, Response},
 };
 use futures_util::StreamExt;
@@ -80,6 +83,16 @@ struct PDRequestContext<'a> {
 /// transport failure can't be misattributed to a healthy prefill.
 #[derive(Clone, Copy)]
 struct BreakerOutcomesRecorded;
+
+fn token_handoff_response_headers(mut headers: HeaderMap) -> HeaderMap {
+    // These headers originate from the client request. Reusing its framing
+    // headers on the merged Prefill+Decode body truncates the SSE stream to
+    // the request body's Content-Length. Let Hyper frame the dynamic response.
+    headers.remove(CONTENT_LENGTH);
+    headers.remove(TRANSFER_ENCODING);
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+    headers
+}
 
 impl PDRouter {
     fn worker_endpoint_url(worker: &dyn Worker, endpoint: &str) -> String {
@@ -1396,8 +1409,7 @@ impl PDRouter {
         ];
         let mut response = Response::new(body);
         *response.status_mut() = StatusCode::OK;
-        let mut response_headers = headers.unwrap_or_default();
-        response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+        let response_headers = token_handoff_response_headers(headers.unwrap_or_default());
         *response.headers_mut() = response_headers;
         AttachedBody::wrap_response(response, guards)
     }
@@ -1928,6 +1940,22 @@ mod tests {
             .build();
         worker.set_healthy(healthy);
         Box::new(worker)
+    }
+
+    #[test]
+    fn test_token_handoff_response_headers_drop_request_framing() {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_LENGTH, HeaderValue::from_static("123"));
+        headers.insert(TRANSFER_ENCODING, HeaderValue::from_static("chunked"));
+
+        let headers = token_handoff_response_headers(headers);
+
+        assert!(!headers.contains_key(CONTENT_LENGTH));
+        assert!(!headers.contains_key(TRANSFER_ENCODING));
+        assert_eq!(
+            headers.get(CONTENT_TYPE),
+            Some(&HeaderValue::from_static("text/event-stream"))
+        );
     }
 
     #[test]
