@@ -6,23 +6,23 @@ from dataclasses import dataclass
 import pytest
 import torch
 
-from sglang.jit_kernel.tests.kv_canary._canary_helpers import (
+from sglang.kernels.jit.tests.kv_canary._canary_helpers import (
     FakeViolationLog,
     make_canary_buf,
     make_log_pair,
     make_write_plan_pair,
     stamp_pair,
 )
-from sglang.jit_kernel.tests.kv_canary._differential import _run_both_write
-from sglang.jit_kernel.tests.kv_canary._fixtures import (
+from sglang.kernels.jit.tests.kv_canary._differential import _run_both_write
+from sglang.kernels.jit.tests.kv_canary._fixtures import (
     clone_real_kv_sources,
     make_real_kv_sources,
 )
-from sglang.jit_kernel.tests.kv_canary._fuzz_driver import (
+from sglang.kernels.jit.tests.kv_canary._fuzz_driver import (
     FUZZ_SEEDS_PR,
     run_fuzz_combo,
 )
-from sglang.jit_kernel.tests.kv_canary._invariants import WriteInvariants
+from sglang.kernels.jit.tests.kv_canary._invariants import WriteInvariants
 from sglang.kernels.ops.kv_canary import consts
 from sglang.kernels.ops.kv_canary.verify import (
     CanaryLaunchTag,

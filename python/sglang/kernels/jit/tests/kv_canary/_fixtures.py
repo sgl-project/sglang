@@ -5,7 +5,7 @@ from typing import Literal, Optional
 
 import torch
 
-from sglang.jit_kernel.tests.kv_canary._constants import DEFAULT_NUM_SLOTS
+from sglang.kernels.jit.tests.kv_canary._constants import DEFAULT_NUM_SLOTS
 from sglang.kernels.ops.kv_canary.verify import (
     RealKvSource,
     VerifyPlan,

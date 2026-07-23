@@ -7,7 +7,7 @@ import pytest
 import torch
 import triton
 
-from sglang.jit_kernel.tests.deepseek_v4.common import (
+from sglang.kernels.jit.tests.deepseek_v4.common import (
     LegacyContext,
     PagedContext,
     make_legacy_context,
