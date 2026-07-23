@@ -120,8 +120,8 @@ repos:
       - id: clippy-rust-workspace
         name: clippy rust/ workspace (auto-fix)
         # Two steps: apply machine-applicable fixes, then fail on anything left
-        # (combining --fix with -D warnings can abort the fix phase). Requires
-        # protoc for the sglang-grpc build script.
+        # (combining --fix with -D warnings can abort the fix phase). protoc is
+        # not required: sglang-grpc's build.rs falls back to a vendored binary.
         entry: bash -c 'cd rust && cargo clippy --workspace --fix --allow-dirty --allow-staged && cargo clippy --workspace -- -D warnings'
         language: system
         files: ^rust/.*\.rs$

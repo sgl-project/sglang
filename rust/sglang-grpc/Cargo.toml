@@ -34,6 +34,9 @@ tonic = { version = "0.12", features = ["gzip", "transport"] }
 
 [build-dependencies]
 tonic-build = "0.12"
+# Fallback protoc for machines without a system install (see build.rs); keeps
+# `cargo clippy/check/build` and lint CI working without apt/brew protobuf.
+protoc-bin-vendored = "3"
 
 [features]
 default = ["pyo3/extension-module"]
