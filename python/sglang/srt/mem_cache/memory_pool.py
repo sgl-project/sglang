@@ -401,7 +401,7 @@ class MambaPool:
                 *physical_conv_shape,
             ),
             dtype=conv_dtype,
-            device="cuda",
+            device=self.device,
         )
         physical_conv_strides = phys.stride()[2:]
         window_stride = physical_conv_strides[window_axis]
@@ -645,7 +645,7 @@ class MambaPool:
                             temporal_state_shape[2],
                         ),
                         dtype=ssm_dtype,
-                        device="cuda",
+                        device=device,
                     )
                 # Cache intermediate conv windows (last K-1 inputs) per draft token
                 # during target verify.
@@ -701,7 +701,7 @@ class MambaPool:
                                 conv_shape[1],
                             ),
                             dtype=conv_dtype,
-                            device="cuda",
+                            device=device,
                         )
                         for conv_shape in conv_state_shape
                     ]
