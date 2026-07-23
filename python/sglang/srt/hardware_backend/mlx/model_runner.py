@@ -70,6 +70,7 @@ class MlxPendingPrefill:
     full_token_ids: list[int]
     req_pool_idx: int
     synced_offset: int
+    target_output: Any | None = None
 
 
 @dataclass
@@ -102,6 +103,17 @@ class MlxPendingDecode:
     lazy_tokens: mx.array
     req_ids: list[str]
     caches: list[list[Any]]
+
+
+@dataclass
+class MlxPendingVerify:
+    """Isolated native-cache verification awaiting an accept decision."""
+
+    req_id: str
+    query_token_ids: tuple[int, ...]
+    transaction: Any
+    speculative_cache: list[Any]
+    target_output: Any
 
 
 _MLX_QUANTIZATION_PRESETS: dict[str, tuple[int, int]] = {
@@ -150,6 +162,7 @@ class MlxModelRunner:
     def __init__(
         self,
         model_path: str,
+        revision: str | None = None,
         trust_remote_code: bool = False,
         disable_radix_cache: bool = False,
         pool_size: int | None = None,
@@ -157,6 +170,7 @@ class MlxModelRunner:
         quantization: str | None = None,
     ):
         self.model_path = model_path
+        self.revision = revision
         self.trust_remote_code = trust_remote_code
         self.model = None
         self.disable_radix_cache = disable_radix_cache
@@ -175,6 +189,13 @@ class MlxModelRunner:
         self._native_cache_fallback = (
             _mlx_model_type(self.model) in _NATIVE_CACHE_FALLBACK_MODEL_TYPES
         )
+        self._target_adapter = None
+        if self._native_cache_fallback:
+            from sglang.srt.hardware_backend.mlx.model_adapter import (
+                Gemma4TargetAdapter,
+            )
+
+            self._target_adapter = Gemma4TargetAdapter(self.model)
         if self._native_cache_fallback and not self.disable_radix_cache:
             raise NotImplementedError(
                 "Gemma 4 on the MLX backend currently requires "
@@ -203,6 +224,23 @@ class MlxModelRunner:
             layer_list,
             attn_attrs,
         )
+        if self._native_cache_fallback:
+            text_root = getattr(self.model, "language_model", self.model)
+            backbone = getattr(text_root, "model", None)
+            previous_kvs = tuple(getattr(backbone, "previous_kvs", ()))
+            if len(previous_kvs) == self._cache_layout.num_layers:
+                compact_owners = tuple(
+                    idx
+                    for idx, layer in enumerate(self._cache_layout.layers)
+                    if bool(getattr(layer.self_attn, "has_kv", True))
+                )
+                self._cache_layout = self._cache_layout.with_native_cache_owners(
+                    previous_kvs,
+                    {
+                        owner: cache_idx
+                        for cache_idx, owner in enumerate(compact_owners)
+                    },
+                )
         if self._cache_layout.num_attention_layers == 0:
             raise RuntimeError("MLX model has no supported attention layers")
         if self._cache_layout.has_auxiliary_state and not hasattr(
@@ -468,6 +506,7 @@ class MlxModelRunner:
             self.model_path,
             tokenizer_config={"trust_remote_code": self.trust_remote_code},
             return_config=True,
+            revision=self.revision,
         )
         self.model, _tokenizer, config = loaded
 
@@ -724,6 +763,41 @@ class MlxModelRunner:
         self._eval_with_cache(pending.lazy_token, pending.cache)
         return self.prefill_finalize(pending)
 
+    def prefill_for_mtp(
+        self,
+        req_id: str,
+        new_token_ids: list[int],
+        full_token_ids: list[int],
+        prefix_slot_ids: list[int],
+        new_slot_ids: list[int],
+        req_pool_idx: int,
+        req: Any | None = None,
+    ) -> tuple[int, Any]:
+        """Prefill native Gemma 4 and retain only this call's target hidden rows."""
+
+        if not self.native_cache_fallback:
+            raise RuntimeError("Gemma 4 MTP prefill requires the native-cache path")
+        pending = self.prefill_start(
+            req_id=req_id,
+            new_token_ids=new_token_ids,
+            full_token_ids=full_token_ids,
+            prefix_slot_ids=prefix_slot_ids,
+            new_slot_ids=new_slot_ids,
+            req_pool_idx=req_pool_idx,
+            req=req,
+            collect_hidden_states=True,
+        )
+        assert pending.target_output is not None
+        hidden = pending.target_output.hidden_states
+        arrays = [pending.lazy_token]
+        if hidden is not None:
+            arrays.append(hidden)
+        arrays.extend(self._cache_state_arrays([pending.cache]))
+        mx.eval(*arrays)
+        token = self.prefill_finalize(pending)
+        self._assert_native_history_lag(req_id)
+        return token, pending.target_output
+
     def extend(
         self,
         req_id: str,
@@ -807,6 +881,147 @@ class MlxModelRunner:
         mx.eval(pending.lazy_tokens, *cache_arrays)
         return self.decode_batch_finalize(pending)
 
+    def verify_start(
+        self,
+        req_id: str,
+        query_token_ids: list[int] | tuple[int, ...],
+    ) -> MlxPendingVerify:
+        """Run target verification on an isolated native-cache clone."""
+
+        if not self.native_cache_fallback or self._target_adapter is None:
+            raise RuntimeError("native Gemma 4 verification is unavailable")
+        if req_id not in self._req_caches:
+            raise KeyError(f"verify_start called for unknown request {req_id!r}")
+        queries = tuple(int(token) for token in query_token_ids)
+
+        from sglang.srt.hardware_backend.mlx.kv_cache.native_transaction import (
+            MlxNativeCacheTransaction,
+        )
+
+        def replay_forward(cache, accepted_queries):
+            return self._forward_native_queries_sequential(
+                cache,
+                accepted_queries,
+                collect_hidden_states=False,
+            ).logits
+
+        transaction = MlxNativeCacheTransaction(
+            self._req_caches[req_id], queries, replay_forward
+        )
+        speculative_cache = transaction.begin()
+        try:
+            output = self._forward_native_queries_sequential(
+                speculative_cache,
+                queries,
+                collect_hidden_states=True,
+            )
+        except BaseException:
+            transaction.abort()
+            raise
+        return MlxPendingVerify(
+            req_id=req_id,
+            query_token_ids=queries,
+            transaction=transaction,
+            speculative_cache=speculative_cache,
+            target_output=output,
+        )
+
+    def _forward_native_queries_sequential(
+        self,
+        cache: list[Any] | tuple[Any, ...],
+        query_token_ids: tuple[int, ...],
+        *,
+        collect_hidden_states: bool,
+    ) -> Any:
+        """Run verification with the same one-token shape as normal decode.
+
+        MLX kernels can make slightly different floating-point choices for a
+        two-token prefill-shaped forward than for two one-token decode calls.
+        Greedy verification must reproduce the target-only decode path exactly,
+        including near-tied logits, so both speculative evaluation and commit
+        replay advance one query at a time.
+        """
+
+        if self._target_adapter is None:
+            raise RuntimeError("native Gemma 4 target adapter is unavailable")
+        if not query_token_ids:
+            raise ValueError("native verification requires at least one query")
+
+        outputs = []
+        for token_id in query_token_ids:
+            outputs.append(
+                self._target_adapter.forward(
+                    mx.array([[int(token_id)]], dtype=mx.int32),
+                    cache=list(cache),
+                    collect_hidden_states=collect_hidden_states,
+                )
+            )
+
+        from sglang.srt.hardware_backend.mlx.model_adapter import (
+            MlxTargetForwardOutput,
+        )
+
+        hidden_states = None
+        if collect_hidden_states:
+            hidden_rows = [output.hidden_states for output in outputs]
+            if any(hidden is None for hidden in hidden_rows):
+                raise RuntimeError("target adapter omitted requested hidden states")
+            hidden_states = mx.concatenate(hidden_rows, axis=1)
+        return MlxTargetForwardOutput(
+            logits=mx.concatenate([output.logits for output in outputs], axis=1),
+            hidden_states=hidden_states,
+        )
+
+    def verify_materialize(self, pending: MlxPendingVerify) -> tuple[int, ...]:
+        """Materialize all verification rows without changing visible cache state."""
+
+        arrays = [pending.target_output.logits]
+        if pending.target_output.hidden_states is not None:
+            arrays.append(pending.target_output.hidden_states)
+        arrays.extend(self._cache_state_arrays([pending.speculative_cache]))
+        mx.eval(*arrays)
+        target_ids = mx.argmax(pending.target_output.logits, axis=-1)
+        mx.eval(target_ids)
+        return tuple(int(token) for token in target_ids.reshape(-1).tolist())
+
+    def verify_finalize(self, pending: MlxPendingVerify, decision: Any) -> None:
+        """Commit accepted query KV and append the full emitted run privately."""
+
+        if pending.req_id != decision.request_id:
+            pending.transaction.abort()
+            raise ValueError("verification decision belongs to a different request")
+        if len(decision.emitted_token_ids) != decision.committed_query_count:
+            pending.transaction.abort()
+            raise ValueError(
+                "linear verification must emit one token per committed query"
+            )
+        pending.transaction.commit(decision.committed_query_count)
+        self._req_token_ids[pending.req_id].extend(decision.emitted_token_ids)
+        self._assert_native_history_lag(pending.req_id)
+
+    @staticmethod
+    def verify_abort(pending: MlxPendingVerify) -> None:
+        if pending.transaction.active:
+            pending.transaction.abort()
+
+    def _assert_native_history_lag(self, req_id: str) -> None:
+        if not self.native_cache_fallback:
+            return
+        cache = self._req_caches[req_id]
+        offsets = {int(entry.offset) for entry in cache}
+        if len(offsets) != 1:
+            raise RuntimeError(
+                f"native target cache offsets disagree for request {req_id!r}: "
+                f"{sorted(offsets)}"
+            )
+        cache_length = offsets.pop()
+        history_length = len(self._req_token_ids[req_id])
+        if history_length != cache_length + 1:
+            raise RuntimeError(
+                "native Gemma 4 token history must remain one token ahead of "
+                f"target KV: history={history_length}, cache={cache_length}"
+            )
+
     def prefill_start(
         self,
         req_id: str,
@@ -816,6 +1031,8 @@ class MlxModelRunner:
         new_slot_ids: list[int],
         req_pool_idx: int,
         req: Any | None = None,
+        *,
+        collect_hidden_states: bool = False,
     ) -> MlxPendingPrefill:
         """Queue a prefill forward pass without evaluating.
 
@@ -831,8 +1048,21 @@ class MlxModelRunner:
         if self.disable_radix_cache:
             cache = self._acquire_cache()
             input_ids = mx.array([new_token_ids], dtype=mx.int32)
-            model_output = self.model(input_ids, cache=cache)
-            logits = self._extract_logits(model_output)
+            target_output = None
+            if collect_hidden_states:
+                if self._target_adapter is None:
+                    raise RuntimeError(
+                        "optional MLX target hidden states require native Gemma 4"
+                    )
+                target_output = self._target_adapter.forward(
+                    input_ids,
+                    cache=cache,
+                    collect_hidden_states=True,
+                )
+                logits = target_output.logits
+            else:
+                model_output = self.model(input_ids, cache=cache)
+                logits = self._extract_logits(model_output)
             lazy_token = mx.argmax(logits[:, -1, :], axis=-1)
             return MlxPendingPrefill(
                 lazy_token=lazy_token,
@@ -841,6 +1071,7 @@ class MlxModelRunner:
                 full_token_ids=list(full_token_ids),
                 req_pool_idx=req_pool_idx,
                 synced_offset=0,
+                target_output=target_output,
             )
 
         assert self._attention_kv_pool is not None

@@ -1668,6 +1668,7 @@ class ServingChatTestCase(unittest.TestCase):
         ret = [
             {
                 "text": "Answer",
+                "output_ids": [42],
                 "prompt_token_ids": [11, 12, 13],
                 "meta_info": {
                     "id": "chatcmpl-token-ids",
@@ -1684,9 +1685,11 @@ class ServingChatTestCase(unittest.TestCase):
         choice = response.choices[0]
 
         self.assertEqual(choice.prompt_token_ids, [11, 12, 13])
+        self.assertEqual(choice.output_token_ids, [42])
         self.assertEqual(choice.meta_info, ret[0]["meta_info"])
         dumped_choice = response.model_dump()["choices"][0]
         self.assertEqual(dumped_choice["prompt_token_ids"], [11, 12, 13])
+        self.assertEqual(dumped_choice["output_token_ids"], [42])
         self.assertEqual(dumped_choice["meta_info"], ret[0]["meta_info"])
 
     def test_streaming_cached_tokens_details_emits_sglext(self):

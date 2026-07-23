@@ -183,6 +183,14 @@ sglang serve --model-path google/gemma-4-26B-A4B-it \
 
 Each Gemma 4 variant ships with a paired `*-assistant` draft model for NEXTN multi-token prediction. Use the commands below to enable MTP for the corresponding target model. These match the configuration generated when you toggle **Speculative Decoding (MTP) → Enabled** in the [interactive selector](#3-1-basic-configuration).
 
+<Note>
+The commands in this section describe the GPU implementation. Apple Silicon
+currently has a separate experimental E2B-only path with one-token drafting,
+pinned MLX checkpoints, and stricter native-cache limits. Follow the
+[Apple Silicon Gemma 4 MTP guide](/docs/hardware-platforms/apple_metal#experimental-gemma-4-frozen-kv-mtp)
+instead of using the commands below on a Mac.
+</Note>
+
 ```bash Command
 # Gemma 4 E2B + MTP
 sglang serve \

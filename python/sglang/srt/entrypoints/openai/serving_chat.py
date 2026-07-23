@@ -1546,6 +1546,9 @@ class OpenAIServingChat(OpenAIServingBase):
             choice_meta_info = (
                 ret_item["meta_info"] if request.return_meta_info else None
             )
+            choice_output_token_ids = (
+                ret_item.get("output_ids") if request.return_meta_info else None
+            )
             # NOTE: content should not be None but empty string to make sure retokenize consistency.
             reasoning_text, tool_calls = self._get_parsed_response_fields(
                 reasoning_text, tool_calls
@@ -1568,6 +1571,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 ),
                 hidden_states=hidden_states,
                 prompt_token_ids=choice_prompt_token_ids,
+                output_token_ids=choice_output_token_ids,
                 meta_info=choice_meta_info,
             )
             choices.append(choice_data)

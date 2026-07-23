@@ -230,8 +230,20 @@ class SchedulerBatchResultProcessor:
 
                     req.update_finish_state()
                     if req.finished():
+                        if isinstance(self.draft_worker, BaseSpecWorker):
+                            self.draft_worker.note_request_finished(
+                                rid=req.rid,
+                                natural_stop=isinstance(
+                                    req.finished_reason, FINISH_MATCHED_TOKEN
+                                ),
+                            )
                         self._maybe_collect_routed_experts(req)
                         self._maybe_collect_indexer_topk(req)
+                        prepare_release = getattr(
+                            self.model_worker, "prepare_for_kv_cache_release", None
+                        )
+                        if callable(prepare_release):
+                            prepare_release(req)
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.set_completion_time()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:

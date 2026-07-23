@@ -5,6 +5,8 @@ import logging
 import os
 from typing import TYPE_CHECKING, Optional
 
+from sglang.srt.utils.tensor_bridge import use_mlx
+
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
@@ -25,22 +27,51 @@ def _resolve_speculative_algorithm_alias(
     speculative_algorithm: Optional[str],
     speculative_draft_model_path: Optional[str],
     trust_remote_code: bool = False,
-    kwargs: Optional[dict] = {},
+    kwargs: Optional[dict] = None,
+    speculative_draft_model_revision: Optional[str] = None,
 ) -> Optional[str]:
     """Resolve CLI speculative algorithm; NEXTN/EAGLE may become FROZEN_KV_MTP for Gemma4 assistant drafts."""
 
     is_gemma4_draft = False
     if speculative_draft_model_path:
-        from sglang.srt.utils.hf_transformers_utils import get_config
+        kwargs = dict(kwargs or {})
+        # Transformers does not know ``gemma4_assistant`` yet.  Read its JSON
+        # metadata through the MLX-local parser before falling back to the
+        # generic AutoConfig path used by every other draft model.
+        try:
+            from sglang.srt.hardware_backend.mlx.spec_config import (
+                is_gemma4_assistant_config,
+                load_assistant_config_dict,
+            )
 
-        cfg = get_config(
-            speculative_draft_model_path, trust_remote_code=trust_remote_code, **kwargs
-        )
-        draft_archs = getattr(cfg, "architectures", None) or []
-        is_gemma4_draft = any(
-            arch in ("Gemma4AssistantForCausalLM", "Gemma4UnifiedAssistantForCausalLM")
-            for arch in draft_archs
-        )
+            raw_config = load_assistant_config_dict(
+                speculative_draft_model_path,
+                revision=speculative_draft_model_revision,
+                configuration_file=kwargs.get("_configuration_file"),
+            )
+            is_gemma4_draft = is_gemma4_assistant_config(raw_config)
+        except ValueError:
+            is_gemma4_draft = False
+
+        if not is_gemma4_draft:
+            from sglang.srt.utils.hf_transformers_utils import get_config
+
+            if speculative_draft_model_revision is not None:
+                kwargs.setdefault("revision", speculative_draft_model_revision)
+            cfg = get_config(
+                speculative_draft_model_path,
+                trust_remote_code=trust_remote_code,
+                **kwargs,
+            )
+            draft_archs = getattr(cfg, "architectures", None) or []
+            is_gemma4_draft = any(
+                arch
+                in (
+                    "Gemma4AssistantForCausalLM",
+                    "Gemma4UnifiedAssistantForCausalLM",
+                )
+                for arch in draft_archs
+            )
 
     if speculative_algorithm == "EAGLE3" and is_gemma4_draft:
         raise ValueError(
@@ -100,6 +131,7 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
         server_args.speculative_draft_model_path,
         trust_remote_code=server_args.trust_remote_code,
         kwargs=kwargs,
+        speculative_draft_model_revision=(server_args.speculative_draft_model_revision),
     )
 
     # Validate --speculative-draft-window-size once, regardless of algorithm.
@@ -475,6 +507,30 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
 
 
 def _handle_frozen_kv_mtp(server_args: ServerArgs) -> None:
+    if use_mlx():
+        if not server_args.disable_overlap_schedule:
+            server_args.disable_overlap_schedule = True
+            logger.warning(
+                "MLX Frozen-KV MTP forces synchronous scheduling; disabling "
+                "overlap scheduling."
+            )
+        if server_args.max_running_requests is None:
+            server_args.max_running_requests = 1
+            logger.warning("MLX Frozen-KV MTP defaults --max-running-requests to 1.")
+        if server_args.speculative_eagle_topk is None:
+            server_args.speculative_eagle_topk = 1
+        if server_args.speculative_num_steps is None:
+            server_args.speculative_num_steps = 1
+        if server_args.speculative_num_draft_tokens is None:
+            server_args.speculative_num_draft_tokens = 2
+
+        from sglang.srt.hardware_backend.mlx.spec_config import (
+            validate_mlx_frozen_kv_mtp_args,
+        )
+
+        validate_mlx_frozen_kv_mtp_args(server_args)
+        return
+
     if server_args.max_running_requests is None:
         server_args.max_running_requests = 48
         logger.warning(

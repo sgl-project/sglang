@@ -264,6 +264,15 @@ class SpeculativeAlgorithm(Enum):
             return DSparkWorkerV2
 
         if self.is_frozen_kv_mtp():
+            from sglang.srt.utils.tensor_bridge import use_mlx
+
+            if use_mlx():
+                from sglang.srt.hardware_backend.mlx.speculative_worker import (
+                    MlxFrozenKVMTPWorker,
+                )
+
+                return MlxFrozenKVMTPWorker
+
             # V2 worker drives both overlap and non-overlap (scheduler runs it
             # synchronously when overlap is disabled), same as EAGLE.
             from sglang.srt.speculative.frozen_kv_mtp_worker_v2 import (

@@ -584,6 +584,7 @@ class _MlxBenchRunner:
         # standalone bench mode where no scheduler is present.
         init_kwargs = dict(
             model_path=server_args.model_path,
+            revision=server_args.revision,
             trust_remote_code=server_args.trust_remote_code,
             disable_radix_cache=True,
             mem_fraction_static=server_args.mem_fraction_static,

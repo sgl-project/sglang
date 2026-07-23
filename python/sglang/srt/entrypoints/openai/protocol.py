@@ -1056,6 +1056,7 @@ class ChatCompletionResponseChoice(BaseModel):
     matched_stop: Union[None, int, str] = None
     hidden_states: Optional[object] = None
     prompt_token_ids: Optional[List[int]] = None
+    output_token_ids: Optional[List[int]] = None
     meta_info: Optional[Dict[str, Any]] = None
 
     @model_serializer(mode="wrap")
@@ -1065,6 +1066,8 @@ class ChatCompletionResponseChoice(BaseModel):
             data.pop("hidden_states", None)
         if self.prompt_token_ids is None:
             data.pop("prompt_token_ids", None)
+        if self.output_token_ids is None:
+            data.pop("output_token_ids", None)
         if self.meta_info is None:
             data.pop("meta_info", None)
         return data

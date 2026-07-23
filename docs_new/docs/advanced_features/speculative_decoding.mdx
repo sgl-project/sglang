@@ -395,6 +395,14 @@ print(response.choices[0].message.content)
 
 We support [MTP (Multi-Token Prediction)](https://arxiv.org/pdf/2404.19737) in SGLang by using speculative decoding. We use `XiaomiMiMo/MiMo-7B-RL` as an example here (for DeepSeek MTP usage, refer to [DeepSeek-V3.2 cookbook §4.2.3](/cookbook/autoregressive/DeepSeek/DeepSeek-V3_2#4-2-3-multi-token-prediction-eagle-speculative-decoding)).
 
+<Note>
+Gemma 4 E2B also has an experimental, one-token Frozen-KV MTP path on Apple
+Silicon. It uses fixed native-cache guardrails and a separately pinned
+assistant checkpoint, so do not adapt the CUDA-oriented example below. Follow
+the [Apple Silicon Gemma 4 MTP guide](/docs/hardware-platforms/apple_metal#experimental-gemma-4-frozen-kv-mtp)
+for its exact command, limitations, and activation checks.
+</Note>
+
 ```bash Command
 python3 -m sglang.launch_server \
     --model XiaomiMiMo/MiMo-7B-RL \

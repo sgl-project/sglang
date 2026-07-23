@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import importlib.util
 import unittest
-from dataclasses import asdict
 from types import SimpleNamespace
 from unittest import mock
 
@@ -28,81 +27,18 @@ _HAS_GEMMA4_MLX = (
 _SKIP_REASON = "requires mlx-lm with Gemma 4 support"
 
 if _HAS_GEMMA4_MLX:
-    import mlx.core as mx
-    from mlx_lm.models import gemma4, gemma4_text
+    from registered.unit.hardware_backend.mlx.gemma4_test_utils import (
+        build_runner as _build_runner,
+    )
+    from registered.unit.hardware_backend.mlx.gemma4_test_utils import (
+        reference_tokens as _reference_tokens,
+    )
+    from registered.unit.hardware_backend.mlx.gemma4_test_utils import (
+        tiny_gemma4 as _tiny_gemma4,
+    )
 
-    from sglang.srt.hardware_backend.mlx.model_runner import MlxModelRunner
     from sglang.srt.hardware_backend.mlx.model_runner_stub import MlxModelRunnerStub
     from sglang.srt.hardware_backend.mlx.tp_worker import MlxTpModelWorker
-
-
-def _tiny_gemma4(*, wrapped: bool = False):
-    """Build a four-layer model containing every target cache quirk."""
-    args = gemma4_text.ModelArgs(
-        hidden_size=16,
-        num_hidden_layers=4,
-        intermediate_size=32,
-        num_attention_heads=2,
-        head_dim=4,
-        global_head_dim=8,
-        vocab_size=32,
-        vocab_size_per_layer_input=32,
-        num_key_value_heads=1,
-        num_global_key_value_heads=1,
-        num_kv_shared_layers=2,
-        hidden_size_per_layer_input=0,
-        sliding_window=8,
-        sliding_window_pattern=2,
-        max_position_embeddings=4096,
-        attention_k_eq_v=True,
-        use_double_wide_mlp=False,
-        layer_types=[
-            "sliding_attention",
-            "full_attention",
-            "sliding_attention",
-            "full_attention",
-        ],
-    )
-    model = (
-        gemma4.Model(
-            gemma4.ModelArgs(
-                text_config=asdict(args),
-                vocab_size=args.vocab_size,
-            )
-        )
-        if wrapped
-        else gemma4_text.Model(args)
-    )
-    mx.eval(model.parameters())
-    return model
-
-
-def _build_runner(model, **kwargs):
-    options = {
-        "model_path": "tiny-gemma4",
-        "disable_radix_cache": True,
-        "pool_size": 64,
-    }
-    options.update(kwargs)
-    with mock.patch.object(
-        MlxModelRunner,
-        "_load_model",
-        new=lambda runner: setattr(runner, "model", model),
-    ):
-        return MlxModelRunner(**options)
-
-
-def _reference_tokens(model, prompt: list[int], steps: int) -> list[int]:
-    cache = model.make_cache()
-    input_ids = mx.array([prompt], dtype=mx.int32)
-    output = []
-    for _ in range(steps):
-        logits = model(input_ids, cache=cache)
-        token = mx.argmax(logits[:, -1, :], axis=-1)
-        mx.eval(token, *[value for entry in cache for value in entry.state])
-        output.append(int(token.item()))
-        input_ids = token[:, None]
-    return output
 
 
 @unittest.skipUnless(_HAS_GEMMA4_MLX, _SKIP_REASON)

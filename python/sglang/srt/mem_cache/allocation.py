@@ -646,6 +646,21 @@ def assign_req_to_token_pool_func(
             req_to_token.shape[1],
         )
         return
+    if req_to_token.device.type == "cpu":
+        # The MLX backend intentionally keeps scheduler bookkeeping in a
+        # lightweight CPU pool even though its execution device is MPS.  A
+        # Triton launch is neither available nor appropriate for that pool.
+        cursor = 0
+        for index in range(batch_size):
+            req_index = int(req_pool_indices[index].item())
+            start = int(start_offset[index].item())
+            end = int(end_offset[index].item())
+            length = end - start
+            req_to_token[req_index, start:end] = out_cache_loc[
+                cursor : cursor + length
+            ].to(device=req_to_token.device, dtype=req_to_token.dtype)
+            cursor += length
+        return
     assign_req_to_token_pool[(batch_size,)](
         req_pool_indices,
         req_to_token,

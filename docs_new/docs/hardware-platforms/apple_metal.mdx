@@ -87,6 +87,133 @@ The MLX backend supports two quantization paths on Apple Silicon:
    ```
    The MLX backend silently ignores `--quantization mlx_q4` when the model is already quantized in its HF config (path 1), so the same flag is safe to pass either way.
 
+## Experimental Gemma 4 Frozen-KV MTP
+
+SGLang includes a correctness-first Frozen-KV MTP prototype for Gemma 4 on
+Apple Silicon. The assistant proposes one token, and the target model verifies
+it before SGLang emits any output. Greedy output token IDs therefore remain
+identical to target-only decoding.
+
+<Warning>
+This Level 1 prototype is experimental, E2B-only, and not production-ready. It
+does not claim a throughput improvement. Batching, overlap scheduling,
+radix/prefix reuse, paged KV cache, and performance work remain gated behind
+later correctness milestones.
+</Warning>
+
+### Prerequisites
+
+Use macOS on Apple Silicon and install SGLang from source with the `all_mps`
+extra shown above. Gemma 4 MTP requires the pinned assistant provider:
+
+```bash
+uv pip install "mlx-vlm==0.5.0"
+```
+
+The tested model pair is:
+
+- Target: `mlx-community/gemma-4-e2b-it-4bit` at revision
+  `238767527555cb75a05732a84dff5d6ba0dd6809`
+- Assistant: `mlx-community/gemma-4-E2B-it-assistant-bf16` at revision
+  `a7770799b560135ebdbfae8b7f468947415003bc`
+
+### Launch the server
+
+Use the complete command below to preserve the validated Level 1
+configuration:
+
+```bash
+SGLANG_USE_MLX=1 python -m sglang.launch_server \
+  --model-path mlx-community/gemma-4-e2b-it-4bit \
+  --revision 238767527555cb75a05732a84dff5d6ba0dd6809 \
+  --speculative-algorithm FROZEN_KV_MTP \
+  --speculative-draft-model-path mlx-community/gemma-4-E2B-it-assistant-bf16 \
+  --speculative-draft-model-revision a7770799b560135ebdbfae8b7f468947415003bc \
+  --speculative-num-steps 1 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 2 \
+  --disable-radix-cache \
+  --disable-overlap-schedule \
+  --chunked-prefill-size -1 \
+  --max-running-requests 1 \
+  --context-length 2048 \
+  --max-total-tokens 2048 \
+  --host 127.0.0.1 \
+  --port 30000
+```
+
+Do not add `--language-only`. The MLX Gemma 4 path already disables
+multimodal execution; `--language-only` configures encoder disaggregation and
+is not supported for this model.
+
+### Send a greedy request
+
+Every request must set `temperature` to `0` explicitly. For the native API:
+
+```bash
+curl -s http://127.0.0.1:30000/generate \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "text": "Explain why the sky appears blue in two sentences.",
+    "sampling_params": {
+      "temperature": 0,
+      "max_new_tokens": 16
+    }
+  }' | jq '{
+    output_ids,
+    speculative: (.meta_info | {
+      spec_num_correct_drafts,
+      spec_num_proposed_drafts,
+      spec_correct_drafts_histogram
+    })
+  }'
+```
+
+For a non-streaming OpenAI chat request, set `return_meta_info: true` to expose
+the exact generated IDs as `choices[0].output_token_ids` and the same
+per-request speculative counters under `choices[0].meta_info`. This extension
+does not enable logprobs.
+
+### Verify that MTP is active
+
+Inspect the worker state after a request:
+
+```bash
+curl -s http://127.0.0.1:30000/server_info \
+  | jq '.internal_states[0].speculative_worker'
+```
+
+An active MTP run reports
+`implementation: "mlx_gemma4_frozen_kv_mtp"`, with positive
+`proposed_tokens` and `verified_tokens`. The response also includes accepted
+draft counts, target/assistant timing, the assistant fingerprint and load
+count, request lifecycle counts, and MLX active/cache/peak memory. After a
+request finishes or is aborted, `active_request_count`, `native_request_count`,
+and `assistant_request_binding_count` must return to zero.
+
+`POST /flush_cache` clears request state and bindings but retains the assistant
+weights. You can confirm this by checking that `assistant_fingerprint` and
+`assistant_load_count` do not change across the flush.
+
+### Level 1 restrictions
+
+The server rejects unsupported configurations before loading assistant weights
+and rejects unsupported request features before mutating target cache state.
+Keep all of these constraints in place:
+
+- Text-only Gemma 4 E2B with the exact matching assistant; E4B, 12B, 31B,
+  26B-A4B, and multimodal inputs are unsupported.
+- Greedy decoding only, with one proposal, one draft step, top-k 1, and verify
+  width 2. Requests must use `temperature=0` and `n=1`.
+- One running request on one Apple host. TP, DP, PP, DP attention,
+  disaggregation, sessions, and LoRA are unsupported.
+- Context length and `max_total_tokens` no greater than 2,048.
+- Synchronous scheduling with radix cache, overlap scheduling, chunked
+  prefill, and mixed chunked prefill disabled.
+- No sampling or repetition penalties, `min_new_tokens`, logit bias, logprobs,
+  grammar/structured output, custom logits processors, returned hidden states,
+  or returned sampling masks.
+
 ## Benchmarking with Requests
 
 `sglang.benchmark_one_batch` calls the synchronous prefill/decode methods directly without going through the scheduler and the overlap code path.

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from typing import Any, Sequence
 
 
@@ -20,6 +20,10 @@ class MlxModelCacheLayout:
     attention_layer_indices: tuple[int, ...]
     auxiliary_layer_indices: tuple[int, ...]
     attention_pool_index_by_layer: dict[int, int]
+    # Native Gemma 4 cache metadata. Logical YOCO-shared layers resolve to an
+    # owning logical layer, and only owners receive compact cache-list slots.
+    native_cache_owner_by_layer: tuple[int, ...] = ()
+    native_cache_index_by_owner: dict[int, int] = field(default_factory=dict)
 
     @classmethod
     def from_attention_discovery(
@@ -91,3 +95,29 @@ class MlxModelCacheLayout:
             [request_cache[layer_idx] for request_cache in caches_by_request]
             for layer_idx in self.attention_layer_indices
         ]
+
+    def with_native_cache_owners(
+        self,
+        owner_by_layer: Sequence[int],
+        cache_index_by_owner: dict[int, int],
+    ) -> MlxModelCacheLayout:
+        if len(owner_by_layer) != self.num_layers:
+            raise ValueError(
+                "native cache owner metadata must cover every logical layer"
+            )
+        return replace(
+            self,
+            native_cache_owner_by_layer=tuple(int(owner) for owner in owner_by_layer),
+            native_cache_index_by_owner=dict(cache_index_by_owner),
+        )
+
+    def native_cache_index(self, logical_layer_idx: int) -> int:
+        if not self.native_cache_owner_by_layer:
+            raise RuntimeError("model layout has no native-cache owner metadata")
+        try:
+            owner = self.native_cache_owner_by_layer[logical_layer_idx]
+            return self.native_cache_index_by_owner[owner]
+        except (IndexError, KeyError) as exc:
+            raise KeyError(
+                f"logical layer {logical_layer_idx} has no compact native cache owner"
+            ) from exc

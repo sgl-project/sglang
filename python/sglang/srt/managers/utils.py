@@ -16,7 +16,7 @@ from sglang.srt.state_capturer.base import TopkCaptureOutput
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import GenerationBatchResult
-    from sglang.srt.speculative.eagle_info import EagleDraftInput
+    from sglang.srt.speculative.spec_info import SpecInput
 
 
 logger = logging.getLogger(__name__)
@@ -85,7 +85,7 @@ class GenerationBatchResult:
     new_seq_lens: Optional[torch.Tensor] = None
 
     # relay path: forward stream -> next step forward
-    next_draft_input: Optional[EagleDraftInput] = None
+    next_draft_input: Optional[SpecInput] = None
 
     # Refs the worker wants scheduler to keep alive for the same 2-iter window
     # as batch_record_buf. Used for cross-stream tensor lifetime (e.g. a spec
