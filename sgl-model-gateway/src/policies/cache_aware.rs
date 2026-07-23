@@ -325,11 +325,43 @@ impl CacheAwarePolicy {
             );
         }
 
-        // Use shortest queue when imbalanced
+        // When imbalanced, keep cache locality within the near-min-load window
+        // (load <= min_load + balance_abs_threshold): pick the longest cached
+        // prefix there, falling back to the shortest-queue worker otherwise.
         let min_load_idx = healthy_indices
             .iter()
             .min_by_key(|&&idx| workers[idx].load())
             .copied()?;
+
+        let selected_idx = request_text
+            .and_then(|text| {
+                let tree = self
+                    .trees
+                    .get(tree_key)
+                    .map(|entry| entry.value().clone())?;
+                let max_near_min_load = min_load.saturating_add(self.config.balance_abs_threshold);
+
+                healthy_indices
+                    .iter()
+                    .copied()
+                    .filter(|&idx| workers[idx].load() <= max_near_min_load)
+                    .filter_map(|idx| {
+                        let matched_chars = tree
+                            .prefix_match_tenant(text, workers[idx].url())
+                            .chars()
+                            .count();
+                        (matched_chars > 0).then_some((idx, matched_chars, workers[idx].load()))
+                    })
+                    // Highest cached-prefix match wins; break ties toward the
+                    // lighter-loaded worker so imbalanced routing still sheds load.
+                    .min_by(|a, b| {
+                        b.1.cmp(&a.1)
+                            .then_with(|| a.2.cmp(&b.2))
+                            .then_with(|| a.0.cmp(&b.0))
+                    })
+                    .map(|(idx, _, _)| idx)
+            })
+            .unwrap_or(min_load_idx);
 
         // Even in imbalanced mode, update the tree to maintain cache state
         if let Some(text) = request_text {
@@ -338,7 +370,7 @@ impl CacheAwarePolicy {
             let tree = self.trees.get(tree_key).map(|entry| entry.value().clone());
 
             if let Some(tree) = tree {
-                let worker_url = workers[min_load_idx].url();
+                let worker_url = workers[selected_idx].url();
                 // Now we can work with the tree without holding the HashMap lock
                 tree.insert(text, worker_url);
 
@@ -365,9 +397,9 @@ impl CacheAwarePolicy {
         }
 
         // Increment processed counter
-        workers[min_load_idx].increment_processed();
+        workers[selected_idx].increment_processed();
 
-        Some(min_load_idx)
+        Some(selected_idx)
     }
 }
 
