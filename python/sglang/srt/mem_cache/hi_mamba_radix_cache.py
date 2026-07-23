@@ -1136,6 +1136,9 @@ class HiMambaRadixCache(MambaRadixCache):
         new_node.hash_value, child.hash_value = split_node_hash_value(
             child.hash_value, split_len, self.page_size
         )
+        new_node.event_hash_value, child.event_hash_value = split_node_hash_value(
+            child.event_hash_value, split_len, self.page_size
+        )
 
         child.last_access_time = get_last_access_time()
         if child.mamba_value is not None:
@@ -1896,6 +1899,7 @@ class HiMambaRadixCache(MambaRadixCache):
             RadixKey(
                 token_ids=fetched_token_ids,
                 extra_key=last_host_node.key.extra_key,
+                cache_salt=last_host_node.key.cache_salt,
             ),
             written_indices,
             hash_value[: min_completed_tokens // self.page_size],

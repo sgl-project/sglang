@@ -64,6 +64,7 @@ class _FakeReq:
         self.origin_input_ids = list(range(committed))
         self.output_ids = []
         self.extra_key = None
+        self.cache_salt = None
         self.last_node = None
         self.cache_protected_len = 0
         self.swa_uuid_for_lock = None

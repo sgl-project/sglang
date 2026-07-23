@@ -1945,6 +1945,8 @@ class MMReceiverBase(ABC):
                 if self.scheduler.metrics_reporter.enable_metrics
                 else None
             ),
+            extra_key=recv_req.extra_key,
+            cache_salt=recv_req.cache_salt,
             http_worker_ipc=recv_req.http_worker_ipc,
             dllm_config=self.scheduler.dllm_config,
         )

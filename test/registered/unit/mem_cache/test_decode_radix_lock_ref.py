@@ -79,6 +79,7 @@ class MockReq:
         self.cache_protected_len = cache_protected_len
         self.last_node = last_node
         self.extra_key = None
+        self.cache_salt = None
         self.prefix_indices = torch.empty(0, dtype=torch.int64)
         self.priority = 0
         self.kv_committed_len = len(fill_ids)

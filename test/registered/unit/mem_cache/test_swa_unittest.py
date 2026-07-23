@@ -572,6 +572,7 @@ class TestSWA(unittest.TestCase):
             (req.req_pool_idx, slice(0, req._kv_committed_len)), kv_indices
         )
         req.extra_key = None
+        req.cache_salt = None
         req.last_node = tree.root_node
         req.swa_uuid_for_lock = None
         req.kv.swa_evicted_seqlen = 0
@@ -609,6 +610,7 @@ class TestSWA(unittest.TestCase):
             (req2.req_pool_idx, slice(0, req2._kv_committed_len)), kv_indices2
         )
         req2.extra_key = None
+        req2.cache_salt = None
         req2.last_node = tree.root_node
         req2.swa_uuid_for_lock = None
         req2.kv.swa_evicted_seqlen = 0

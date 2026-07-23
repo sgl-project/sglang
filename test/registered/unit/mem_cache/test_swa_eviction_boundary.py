@@ -110,6 +110,7 @@ def _make_req(req_pool_idx, token_ids, cache_protected_len, tree):
             swa_evicted_seqlen=0,
         ),
         extra_key=None,
+        cache_salt=None,
         last_node=tree.root_node,
         swa_uuid_for_lock=None,
         swa_prefix_lock_released=False,
