@@ -1,7 +1,16 @@
+import ast
+import re
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
+import sglang.srt.layers.quantization as quantization
+import sglang.srt.utils as srt_utils
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.layers.quantization import (
+    CPU_QUANTIZATION_METHODS,
+    QUANTIZATION_METHODS,
+    get_quantization_config,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -71,6 +80,40 @@ class TestQuantLogString(CustomTestCase):
         result = model_config.get_quantization_config_log_str()
         print(f"\n[Test No Quant] Result: {result}")
         self.assertIsNone(result)
+
+
+class TestCpuUnsupportedQuantizationMessage(CustomTestCase):
+    """The CPU rejection message must advertise only CPU-supported methods."""
+
+    def test_cpu_error_lists_only_cpu_methods(self):
+        # A method that exists in the registry but is not CPU-supported. This
+        # request must be rejected on CPU, and the rejection message must not
+        # advertise methods that CPU cannot serve.
+        method = "awq_marlin"
+        self.assertIn(method, QUANTIZATION_METHODS)
+        self.assertNotIn(method, CPU_QUANTIZATION_METHODS)
+
+        # Enter the real CPU validation branch by forcing only the two
+        # platform-detection predicates; get_quantization_config itself runs
+        # unmodified.
+        with (
+            patch.object(srt_utils, "is_cpu", return_value=True),
+            patch.object(quantization, "cpu_has_amx_support", return_value=True),
+        ):
+            with self.assertRaises(ValueError) as ctx:
+                get_quantization_config(method)
+
+        message = str(ctx.exception)
+        match = re.search(r"Available methods on CPU:\s*(\[.*\])", message)
+        self.assertIsNotNone(
+            match, f"CPU error message not in the expected form: {message!r}"
+        )
+        advertised = set(ast.literal_eval(match.group(1)))
+
+        # The advertised set must be exactly the CPU-supported methods, and in
+        # particular must not include the method that was just rejected.
+        self.assertEqual(advertised, set(CPU_QUANTIZATION_METHODS))
+        self.assertNotIn(method, advertised)
 
 
 if __name__ == "__main__":
