@@ -705,6 +705,7 @@ class HiCacheController:
             self.io_backend == "kernel"
             and self.mem_pool_host.layout == "page_first"
             and getattr(self.mem_pool_host, "can_use_write_back_jit", False)
+            and getattr(self.mem_pool_host, "_uses_staged_write_back", True)
         ):
             host_indices, device_indices = op.host_indices, op.device_indices
         else:

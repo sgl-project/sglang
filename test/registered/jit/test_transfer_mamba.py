@@ -170,13 +170,13 @@ def assert_host_matches_device(host, device_pool, host_indices, device_indices):
     """Verify host backup data matches device source data."""
     for layer_id in range(NUM_LAYERS):
         # Temporal
-        host_temporal = host.temporal_buffer[host_indices, layer_id, 0].cpu()
+        host_temporal = host.temporal_buffer[host_indices.cpu(), layer_id, 0]
         dev_temporal = device_pool.mamba_cache.temporal[layer_id][device_indices].cpu()
         torch.testing.assert_close(host_temporal, dev_temporal)
 
         # Conv
         for conv_idx in range(len(host.conv_buffer)):
-            host_conv = host.conv_buffer[conv_idx][host_indices, layer_id, 0].cpu()
+            host_conv = host.conv_buffer[conv_idx][host_indices.cpu(), layer_id, 0]
             dev_conv = device_pool.mamba_cache.conv[conv_idx][layer_id][
                 device_indices
             ].cpu()
@@ -187,13 +187,13 @@ def assert_device_matches_host(host, device_pool, host_indices, device_indices):
     """Verify device load data matches host source data."""
     for layer_id in range(NUM_LAYERS):
         # Temporal
-        host_temporal = host.temporal_buffer[host_indices, layer_id, 0].to(DEVICE)
+        host_temporal = host.temporal_buffer[host_indices.cpu(), layer_id, 0].to(DEVICE)
         dev_temporal = device_pool.mamba_cache.temporal[layer_id][device_indices]
         torch.testing.assert_close(dev_temporal, host_temporal)
 
         # Conv
         for conv_idx in range(len(host.conv_buffer)):
-            host_conv = host.conv_buffer[conv_idx][host_indices, layer_id, 0].to(DEVICE)
+            host_conv = host.conv_buffer[conv_idx][host_indices.cpu(), layer_id, 0].to(DEVICE)
             dev_conv = device_pool.mamba_cache.conv[conv_idx][layer_id][device_indices]
             torch.testing.assert_close(dev_conv, host_conv)
 
@@ -211,7 +211,7 @@ def test_mamba_kernel_backup_load_roundtrip(dtype, layout):
 
     # Use a few indices for the test
     device_indices = torch.tensor([1, 5, 10], dtype=torch.int64, device=DEVICE)
-    host_indices = torch.tensor([0, 1, 2], dtype=torch.int64)
+    host_indices = torch.tensor([0, 1, 2], dtype=torch.int64, device=DEVICE)
     load_indices = torch.tensor([3, 7, 12], dtype=torch.int64, device=DEVICE)
 
     # --- Backup: device -> host (kernel) ---
@@ -267,7 +267,7 @@ def test_mamba_kernel_empty_indices(dtype, layout):
     fill_device_data(device_pool, dtype)
 
     empty_device = torch.tensor([], dtype=torch.int64, device=DEVICE)
-    empty_host = torch.tensor([], dtype=torch.int64)
+    empty_host = torch.tensor([], dtype=torch.int64, device=DEVICE)
 
     host.backup_from_device_all_layer(
         device_pool, empty_host, empty_device, io_backend="kernel"
@@ -292,7 +292,7 @@ def test_mamba_kernel_single_item(dtype, layout):
     fill_device_data(device_pool, dtype)
 
     device_indices = torch.tensor([7], dtype=torch.int64, device=DEVICE)
-    host_indices = torch.tensor([3], dtype=torch.int64)
+    host_indices = torch.tensor([3], dtype=torch.int64, device=DEVICE)
     load_indices = torch.tensor([9], dtype=torch.int64, device=DEVICE)
 
     host.backup_from_device_all_layer(
@@ -323,7 +323,7 @@ def test_mamba_kernel_full_indices(dtype, layout):
     fill_device_data(device_pool, dtype)
 
     device_indices = torch.arange(SIZE, dtype=torch.int64, device=DEVICE)
-    host_indices = torch.arange(SIZE, dtype=torch.int64)
+    host_indices = torch.arange(SIZE, dtype=torch.int64, device=DEVICE)
     load_indices = torch.arange(SIZE, dtype=torch.int64, device=DEVICE)
 
     host.backup_from_device_all_layer(
