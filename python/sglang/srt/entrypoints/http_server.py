@@ -2153,7 +2153,13 @@ def _execute_server_warmup(server_args: ServerArgs):
         and not is_mps()
     )
     if model_info["is_generation"]:
-        if is_vlm and not server_args.skip_tokenizer_init:
+        if (
+            is_vlm
+            and not server_args.skip_tokenizer_init
+            and server_args.disaggregation_mode == "null"
+        ):
+            # In PD disaggregation mode the warmup payload uses input_ids (no messages),
+            # so /v1/chat/completions would return 400. Fall back to /generate.
             request_name = "/v1/chat/completions"
         else:
             request_name = "/generate"
