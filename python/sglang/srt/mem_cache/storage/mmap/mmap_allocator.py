@@ -4,6 +4,7 @@ import logging
 import math
 import mmap
 import os
+import uuid
 import weakref
 
 import torch
@@ -39,6 +40,7 @@ _MAP_HUGETLB = 0x40000
 _MAP_HUGE_2MB = 21 << 26  # 0x1400000
 _MAP_HUGE_1GB = 30 << 26  # 0x78000000
 _MAP_FAILED = ctypes.c_void_p(-1).value
+_MADV_POPULATE_WRITE = getattr(mmap, "MADV_POPULATE_WRITE", 23)
 
 
 def _alloc_hugepage(n_bytes: int, alloc_bytes: int, extra_flags: int) -> ctypes.Array:
@@ -124,4 +126,76 @@ def alloc_mmap(dims: tuple, dtype: torch.dtype) -> torch.Tensor:
         flags=mmap.MAP_SHARED | mmap.MAP_ANONYMOUS | _MAP_POPULATE,
         prot=mmap.PROT_READ | mmap.PROT_WRITE,
     )
+    try:
+        # MADV_POPULATE_WRITE guarantees pages are populated and writable,
+        # throwing an error on failure (e.g. out of memory).
+        mm.madvise(_MADV_POPULATE_WRITE)
+    except OSError:
+        # Fall back to MAP_POPULATE if MADV_POPULATE_WRITE is not supported (<5.14 kernel).
+        pass
     return torch.frombuffer(mm, dtype=dtype, count=math.prod(dims)).reshape(dims)
+
+
+def alloc_shm(dims: tuple, dtype: torch.dtype) -> tuple[torch.Tensor, int, mmap.mmap]:
+    """Allocate a host tensor via shared memory (/dev/shm).
+
+    Returns a tuple of (tensor, fd, mm).
+    The caller is responsible for keeping the fd open if they need to share it,
+    and closing it when they are done.
+    """
+    hugepage_size = (envs.SGLANG_HUGEPAGE_SIZE.get() or "").strip().upper()
+    n_bytes = math.prod(dims) * torch.empty([], dtype=dtype).element_size()
+
+    # Note: hugepages are not directly supported with /dev/shm mmap files
+    # without mounting hugetlbfs there, so we fall back to plain page size.
+    if hugepage_size != "":
+        logger.warning(
+            "Hugepages are not supported with SHM allocator. "
+            "Falling back to plain page-size mmap."
+        )
+
+    page_size = mmap.PAGESIZE
+    alloc_bytes = math.ceil(n_bytes / page_size) * page_size
+
+    # Create an anonymous shared memory file descriptor via memfd_create
+    fd = None
+    try:
+        # MFD_CLOEXEC is standard on Linux 3.17+
+        fd = os.memfd_create(
+            f"sglang_host_pool_{uuid.uuid4().hex}",
+            flags=getattr(os, "MFD_CLOEXEC", 1),
+        )
+    except (AttributeError, OSError):
+        # Fallback to creating a file in /dev/shm if memfd_create is not supported
+        shm_path = f"/dev/shm/sglang_host_pool_{uuid.uuid4().hex}.mmap"
+        try:
+            fd = os.open(shm_path, os.O_CREAT | os.O_RDWR | os.O_TRUNC, 0o600)
+            try:
+                os.unlink(shm_path)
+            except OSError:
+                pass
+        except Exception as e:
+            raise OSError(f"Failed to create shm file: {e}")
+
+    try:
+        os.ftruncate(fd, alloc_bytes)
+        mm = mmap.mmap(
+            fd,
+            alloc_bytes,
+            flags=mmap.MAP_SHARED | _MAP_POPULATE,
+            prot=mmap.PROT_READ | mmap.PROT_WRITE,
+        )
+        try:
+            # MADV_POPULATE_WRITE guarantees pages are populated and writable,
+            # throwing an error on failure (e.g. out of memory).
+            mm.madvise(_MADV_POPULATE_WRITE)
+        except OSError:
+            # Fall back to MAP_POPULATE if MADV_POPULATE_WRITE is not supported (<5.14 kernel).
+            pass
+    except Exception as e:
+        if fd is not None:
+            os.close(fd)
+        raise e
+
+    tensor = torch.frombuffer(mm, dtype=dtype, count=math.prod(dims)).reshape(dims)
+    return tensor, fd, mm
