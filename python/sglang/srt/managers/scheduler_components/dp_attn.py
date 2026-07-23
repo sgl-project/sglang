@@ -39,6 +39,24 @@ if TYPE_CHECKING:
 _ENABLE_METRICS_DP_ATTENTION = envs.SGLANG_ENABLE_METRICS_DP_ATTENTION.get()
 
 
+def _spec_input_cuda_graph_compatible(local_batch: Optional[ScheduleBatch]) -> bool:
+    """Return the local spec-input graph admission bit.
+
+    None/idle/prebuilt inputs stay permissive so an active rank with complete
+    runtime state can still use graphs. Any active incompatible input is
+    min-reduced by ``MLPSyncBatchInfo`` and forces every DP rank eager.
+    """
+    if (
+        local_batch is None
+        or local_batch.forward_mode.is_idle()
+        or local_batch.forward_mode.is_prebuilt()
+    ):
+        return True
+    return getattr(
+        getattr(local_batch, "spec_info", None), "cuda_graph_compatible", True
+    )
+
+
 def _resolve_elastic_world_dp_size(
     dp_size: int,
     *,
@@ -263,6 +281,9 @@ def prepare_mlp_sync_batch_raw(
         or local_batch.forward_mode.is_decode_or_idle()
         or local_batch.forward_mode.is_prebuilt()
     ) and not disable_cuda_graph
+    can_run_decode_cuda_graph = (
+        can_run_decode_cuda_graph and _spec_input_cuda_graph_compatible(local_batch)
+    )
     breakable_prefill = check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE)
     prefill_graph_runner = (
         model_runner.prefill_cuda_graph_runner if breakable_prefill else None
