@@ -843,15 +843,18 @@ class FlexKVLayerDoneCounter:
         except TimeoutError as exc:
             task_ids = list(getattr(self, "_consumer_task_ids", []))
             rank = getattr(self, "world_rank", -1)
+            timeout_s = getattr(self, "wait_timeout_s", None)
             logger.error(
-                "[FlexKV-Layerwise] phase=wait_timeout rank=%d task_ids=%s "
-                "counter_id=%d layer=%d wait_count=%d timeout_s=%s",
-                rank,
+                "[ERROR][FlexKV-SGLang] operation=load action=wait "
+                "status=timeout direction=H2D flexkv_task_ids=%s "
+                "transfer_mode=layerwise rank=%d counter_id=%d layer=%d "
+                "wait_count=%d timeout=%s",
                 task_ids,
+                rank,
                 self.consumer_index,
                 threshold,
                 wait_count,
-                getattr(self, "wait_timeout_s", None),
+                "-" if timeout_s is None else f"{timeout_s}s",
             )
             raise TimeoutError(
                 "FlexKV layerwise wait timed out: "
