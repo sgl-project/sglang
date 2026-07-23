@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from enum import Enum
 from functools import lru_cache
-from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Callable, List, NamedTuple, Optional, Tuple, Union
 
 import torch
 
@@ -298,6 +298,18 @@ class Fp8GemmRunnerBackend(Enum):
         return self == Fp8GemmRunnerBackend.AITER
 
 
+class PackedUe8m0LinearInput(NamedTuple):
+    """FP8 activations and packed UE8M0 scales consumed by DeepGEMM."""
+
+    data: torch.Tensor
+    scale: torch.Tensor
+
+
+class BlockFp8LinearDispatch(NamedTuple):
+    op: Callable
+    prequantized_op: Optional[Callable]
+
+
 FP8_GEMM_RUNNER_BACKEND: Fp8GemmRunnerBackend | None = None
 
 
@@ -453,8 +465,12 @@ if is_sm90_supported() and is_flashinfer_available():
 
 
 def dispatch_w8a8_block_fp8_linear() -> Callable:
+    return dispatch_w8a8_block_fp8_linear_config().op
+
+
+def dispatch_w8a8_block_fp8_linear_config() -> BlockFp8LinearDispatch:
     """
-    Dispatch to the appropriate FP8 block linear implementation.
+    Dispatch the ordinary FP8 block linear op and any prequantized variant.
 
     This function selects the backend based on:
     1. The --fp8-gemm-backend server argument (preferred)
@@ -462,12 +478,22 @@ def dispatch_w8a8_block_fp8_linear() -> Callable:
     """
     backend = get_fp8_gemm_runner_backend()
 
-    # Handle explicit backend selection via --fp8-gemm-backend
-    if not backend.is_auto():
-        return _dispatch_explicit_backend(backend)
-
-    # Auto mode: Select based purely on hardware/backend availability
-    return _dispatch_auto_backend()
+    use_deepgemm = (
+        deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+        if backend.is_auto()
+        else backend.is_deep_gemm()
+    )
+    op = (
+        _dispatch_auto_backend()
+        if backend.is_auto()
+        else _dispatch_explicit_backend(backend)
+    )
+    return BlockFp8LinearDispatch(
+        op=op,
+        prequantized_op=(
+            deepgemm_w8a8_block_fp8_linear_prequantized if use_deepgemm else None
+        ),
+    )
 
 
 def dispatch_w8a8_mxfp8_linear() -> Callable:
@@ -866,6 +892,35 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
     if bias is not None:
         output += bias
     return output.to(dtype=output_dtype).view(*output_shape)
+
+
+def deepgemm_w8a8_block_fp8_linear_prequantized(
+    input: PackedUe8m0LinearInput,
+    weight: torch.Tensor,
+    block_size: List[int],
+    weight_scale: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Run DeepGEMM on packed UE8M0 input without a backend fallback."""
+    if weight.shape[0] % 64 != 0 or weight.shape[1] % 128 != 0:
+        raise ValueError(
+            "Prequantized FP8 input requires a DeepGEMM shape with N divisible "
+            "by 64 and K divisible by 128"
+        )
+
+    input_2d = input.data.view(-1, input.data.shape[-1])
+    output_shape = [*input.data.shape[:-1], weight.shape[0]]
+    output = w8a8_block_fp8_matmul_deepgemm(
+        input_2d,
+        weight,
+        input.scale,
+        weight_scale,
+        block_size,
+        output_dtype=torch.bfloat16,
+    )
+    if bias is not None:
+        output += bias
+    return output.to(dtype=torch.bfloat16).view(*output_shape)
 
 
 def _unpack_ue8m0_scale_for_triton(
