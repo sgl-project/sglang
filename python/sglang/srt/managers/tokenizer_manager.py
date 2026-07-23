@@ -692,11 +692,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 await self.is_pause_cond.wait_for(lambda: not self.is_pause)
 
             reader_lock = self.model_update_lock.reader_lock
-            await reader_lock.__aenter__()
-            async with self.is_pause_cond:
-                if not self.is_pause:
-                    return reader_lock
-            await reader_lock.__aexit__(None, None, None)
+            reader_acquired = False
+            keep_reader = False
+            try:
+                await self.model_update_lock.acquire_reader()
+                reader_acquired = True
+                async with self.is_pause_cond:
+                    if not self.is_pause:
+                        keep_reader = True
+                        return reader_lock
+            finally:
+                if reader_acquired and not keep_reader:
+                    await reader_lock.__aexit__(None, None, None)
 
     def _detect_input_format(
         self, texts: Union[str, List[str]], is_cross_encoder: bool

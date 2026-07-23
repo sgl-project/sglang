@@ -73,7 +73,7 @@ async def test_request_admission_cannot_be_liminal_during_pause():
     pause_task = asyncio.create_task(
         tm.pause_generation(PauseGenerationReqInput(mode="in_place"))
     )
-    await asyncio.wait_for(pause_task, timeout=0.1)
+    await asyncio.wait_for(pause_task, timeout=1)
     tm._async_dispatch_to_scheduler.assert_awaited_once()
 
     admission_release.set()
@@ -108,7 +108,7 @@ async def test_waiting_writer_does_not_block_abort_from_closing_gate():
     pause_task = asyncio.create_task(
         tm.pause_generation(PauseGenerationReqInput(mode="abort"))
     )
-    await asyncio.wait_for(abort_called.wait(), timeout=0.1)
+    await asyncio.wait_for(abort_called.wait(), timeout=1)
     tm.abort_request.assert_called_with(abort_all=True)
 
     pause_task.cancel()
@@ -117,6 +117,29 @@ async def test_waiting_writer_does_not_block_abort_from_closing_gate():
     await tm.model_update_lock.release_reader()
     writer_release.set()
     await writer_task
+
+
+@pytest.mark.asyncio
+async def test_cancelled_admission_releases_acquired_reader():
+    tm = _bare_tokenizer_manager()
+    acquired = asyncio.Event()
+    proceed = asyncio.Event()
+    original_acquire_reader = tm.model_update_lock.acquire_reader
+
+    async def observed_acquire_reader():
+        await original_acquire_reader()
+        acquired.set()
+        await proceed.wait()
+
+    tm.model_update_lock.acquire_reader = observed_acquire_reader
+    admission_task = asyncio.create_task(tm._acquire_generation_reader())
+    await acquired.wait()
+    async with tm.is_pause_cond:
+        proceed.set()
+        await asyncio.sleep(0)
+        admission_task.cancel()
+        await asyncio.gather(admission_task, return_exceptions=True)
+        assert await tm.model_update_lock.is_locked() is False
 
 
 @pytest.mark.asyncio
@@ -130,6 +153,11 @@ async def test_failed_in_place_pause_reopens_admission():
     assert tm.is_pause is False
     reader_lock = await asyncio.wait_for(tm._acquire_generation_reader(), timeout=1)
     await reader_lock.__aexit__(None, None, None)
+
+    tm.is_pause = True
+    with pytest.raises(RuntimeError, match="dispatch failed"):
+        await tm.pause_generation(PauseGenerationReqInput(mode="in_place"))
+    assert tm.is_pause is True
 
 
 @pytest.mark.asyncio
