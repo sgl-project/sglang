@@ -79,3 +79,9 @@ def test_gemma_fused_add_rmsnorm_matches_reference(shape, dtype):
 
     torch.testing.assert_close(residual_out, ref_residual, atol=2e-2, rtol=2e-2)
     torch.testing.assert_close(got, ref, atol=2e-2, rtol=2e-2)
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v"]))
