@@ -149,30 +149,30 @@ __global__ void mxfp4_decode_kernel(const __grid_constant__ Mxfp4DecodeParams pa
     dot = warp::reduce_sum(dot);
     dot *= params.sm_scale;
 
-    // online softmax
+    // online softmax (fast-math exp for performance)
     const float m_new = max(m, dot);
-    const float e_val = expf(dot - m_new);
-    const float rc = expf(m - m_new);
-    s_val = s_val * rc + e_val;
+    const float e_val = __expf(dot - m_new);
+    const float rc = __expf(m - m_new);
+    s_val = fmaf(s_val, rc, e_val);
     m = m_new;
 
     // V-weighted sum
 #pragma unroll
     for (int i = 0; i < kValsPerLane; ++i)
-      o_val[i] = o_val[i] * rc + k_val[i] * e_val;
+      o_val[i] = fmaf(o_val[i], rc, k_val[i] * e_val);
   }
 
   // ---- attn_sink (virtual token with V=0) ---------------------------------
   if (params.attn_sink != nullptr) {
     const float sink = params.attn_sink[gid];
     const float m_new = max(m, sink);
-    const float e_sink = expf(sink - m_new);
-    const float rc = expf(m - m_new);
-    s_val = s_val * rc + e_sink;
+    const float e_sink = __expf(sink - m_new);
+    const float rc = __expf(m - m_new);
+    s_val = fmaf(s_val, rc, e_sink);
     m = m_new;
 #pragma unroll
     for (int i = 0; i < kValsPerLane; ++i)
-      o_val[i] *= rc;
+      o_val[i] = o_val[i] * rc;
   }
 
   // ---- finalize & store -----------------------------------------------------
