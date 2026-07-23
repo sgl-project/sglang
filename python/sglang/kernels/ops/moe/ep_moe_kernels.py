@@ -312,6 +312,12 @@ def _silu_and_mul_post_quant_kernel(
 
     N_GROUPS: tl.constexpr = BLOCK_N // QUANT_GROUP_SIZE
 
+    # torch.compile represents Python float launch arguments as fp64. Keep the
+    # quantization arithmetic in fp32 so lowering the final value to fp8 does
+    # not require an unsupported fp64 -> fp8 conversion.
+    fp8_max = tl.cast(fp8_max, tl.float32)
+    fp8_min = tl.cast(fp8_min, tl.float32)
+
     offs_in_d = hidden_dim_block_index * BLOCK_N + tl.arange(0, BLOCK_N)
     input_ptr_offs = input_ptr + expert_id * stride_input_0 + offs_in_d
     output_ptr_offs = output_ptr + expert_id * stride_output_0 + offs_in_d

@@ -1016,26 +1016,40 @@ def _varlen_deep_gemm_silu_mul_quant(
             down_input_scale = down_input_scale.transpose(-1, -2)
         return down_input, down_input_scale
 
-    # Keep these allocations at the DeepGEMM call site. On Hopper, match the
-    # pre-#30924 path: allocate a row-major FP32 scale, let the quant kernel
-    # write it, then let the existing DeepGEMM layout transform allocate the
-    # TMA buffer. Blackwell keeps the packed UE8M0 layout it consumes directly.
+    # On Hopper, keep the complete pre-#30924 path: caller-owned row-major
+    # outputs written by the Triton fused activation/quant kernel, followed by
+    # the existing DeepGEMM layout transform. The unified JIT masked schedule
+    # can produce NaNs under the full TBO CUDA-graph memory schedule even when
+    # passed caller-owned outputs. Blackwell keeps its packed UE8M0 JIT path.
     down_input = torch.empty(
         (E, N, D), device=hidden_states_device, dtype=torch.float8_e4m3fn
     )
-    if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
-        down_input_scale = create_per_token_group_quant_fp8_output_scale(
-            x_shape=down_input.shape,
-            device=hidden_states_device,
-            group_size=group_size,
-            column_major_scales=True,
-            scale_tma_aligned=True,
-            scale_ue8m0=True,
+    if not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+        from sglang.kernels.ops.moe.ep_moe_kernels import (
+            silu_and_mul_masked_post_quant_fwd,
         )
-    else:
+
         down_input_scale = torch.empty(
             (E, N, G), device=hidden_states_device, dtype=torch.float32
         )
+        silu_and_mul_masked_post_quant_fwd(
+            gateup_output,
+            down_input,
+            down_input_scale,
+            group_size,
+            masked_m,
+            scale_ue8m0=False,
+        )
+        return down_input, down_input_scale
+
+    down_input_scale = create_per_token_group_quant_fp8_output_scale(
+        x_shape=down_input.shape,
+        device=hidden_states_device,
+        group_size=group_size,
+        column_major_scales=True,
+        scale_tma_aligned=True,
+        scale_ue8m0=True,
+    )
     expected_m = ceil_div(num_real_tokens * topk, E) if num_real_tokens else None
     return per_token_group_quant(
         gateup_output,

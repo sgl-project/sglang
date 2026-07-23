@@ -432,6 +432,7 @@ def test_masked_fused():
 
 
 def test_masked_fused_deep_gemm_caller_owns_outputs(monkeypatch):
+    from sglang.kernels.ops.moe import ep_moe_kernels
     from sglang.srt.layers import deep_gemm_wrapper
     from sglang.srt.layers.moe.moe_runner import deep_gemm as deep_gemm_runner
 
@@ -439,12 +440,23 @@ def test_masked_fused_deep_gemm_caller_owns_outputs(monkeypatch):
     masked_m = torch.tensor([17, 9, 1], device="cuda", dtype=torch.int32)
     captured = {}
 
-    def capture_outputs(input, output_q=None, output_s=None, **kwargs):
+    def capture_jit_outputs(input, output_q=None, output_s=None, **kwargs):
+        captured["kernel"] = "jit"
         captured["q"] = output_q
         captured["s"] = output_s
         return output_q, output_s
 
-    monkeypatch.setattr(deep_gemm_runner, "per_token_group_quant", capture_outputs)
+    def capture_triton_outputs(input, output, output_scale, *args, **kwargs):
+        captured["kernel"] = "triton"
+        captured["q"] = output
+        captured["s"] = output_scale
+
+    monkeypatch.setattr(deep_gemm_runner, "per_token_group_quant", capture_jit_outputs)
+    monkeypatch.setattr(
+        ep_moe_kernels,
+        "silu_and_mul_masked_post_quant_fwd",
+        capture_triton_outputs,
+    )
     output_q, output_s = deep_gemm_runner._varlen_deep_gemm_silu_mul_quant(
         x,
         masked_m,
@@ -456,9 +468,11 @@ def test_masked_fused_deep_gemm_caller_owns_outputs(monkeypatch):
     assert output_s is captured["s"]
     assert output_q.shape == (3, 17, 512)
     if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+        assert captured["kernel"] == "jit"
         assert output_s.dtype == torch.int32
         assert output_s.stride(-2) == 1
     else:
+        assert captured["kernel"] == "triton"
         assert output_s.dtype == torch.float32
         assert output_s.is_contiguous()
 
