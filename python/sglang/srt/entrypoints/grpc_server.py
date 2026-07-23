@@ -221,7 +221,7 @@ async def serve_grpc(server_args, model_info=None):
                 exc_info=True,
             )
 
-    # Older smg-grpc-servicer releases (≤ 0.5.2) accept only (server_args,
+    # Older smg-grpc-servicer releases (≤ 0.5.4) accept only (server_args,
     # model_info) and reject the on_request_manager_ready hook. The hook is
     # what calls _start_sidecar_server, so dropping the kwarg disables the
     # entire HTTP sidecar (Prometheus /metrics and /start_profile +
@@ -237,7 +237,7 @@ async def serve_grpc(server_args, model_info=None):
         # start the sidecar that serves them — fail loud rather than silently
         # produce a server with no /metrics endpoint.
         raise RuntimeError(
-            "--enable-metrics requires smg-grpc-servicer ≥ 0.5.3 (the version "
+            "--enable-metrics requires smg-grpc-servicer ≥ 0.5.5 (the version "
             "that accepts 'on_request_manager_ready'); installed version "
             "lacks the hook so the HTTP sidecar would never start. Upgrade "
             "smg-grpc-servicer or remove --enable-metrics."
@@ -247,7 +247,7 @@ async def serve_grpc(server_args, model_info=None):
             "Installed smg-grpc-servicer does not accept "
             "'on_request_manager_ready'; HTTP sidecar disabled "
             "(no /metrics, /start_profile, /stop_profile). "
-            "Upgrade smg-grpc-servicer to ≥ 0.5.3 to enable it."
+            "Upgrade smg-grpc-servicer to ≥ 0.5.5 to enable it."
         )
 
     try:
