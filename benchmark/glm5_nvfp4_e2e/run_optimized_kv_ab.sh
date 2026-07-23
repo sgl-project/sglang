@@ -96,9 +96,9 @@ capture_environment() {
   } >"${RESULT_DIR}/environment/manifest.txt"
   git -C "${REPO_ROOT}" status --short --branch >"${RESULT_DIR}/environment/git_status.txt"
   git -C "${REPO_ROOT}" diff --binary HEAD >"${RESULT_DIR}/environment/tracked_worktree.patch"
-  cp "${REPO_ROOT}/benchmark/glm52_nvfp4_e2e/run_optimized_kv_ab.sh" \
+  cp "${REPO_ROOT}/benchmark/glm5_nvfp4_e2e/run_optimized_kv_ab.sh" \
     "${RESULT_DIR}/environment/run_optimized_kv_ab.sh"
-  cp "${REPO_ROOT}/benchmark/glm52_nvfp4_e2e/summarize_optimized_kv_ab.py" \
+  cp "${REPO_ROOT}/benchmark/glm5_nvfp4_e2e/summarize_optimized_kv_ab.py" \
     "${RESULT_DIR}/environment/summarize_optimized_kv_ab.py"
   sha256sum \
     "${REPO_ROOT}/python/sglang/srt/layers/attention/dsa/nvfp4_k_cache.py" \
@@ -346,7 +346,7 @@ for variant in ${RUN_VARIANTS}; do
   run_variant "${variant}"
 done
 if [[ "${RUN_SUMMARY}" == "1" ]]; then
-  python3 "${REPO_ROOT}/benchmark/glm52_nvfp4_e2e/summarize_optimized_kv_ab.py" \
+  python3 "${REPO_ROOT}/benchmark/glm5_nvfp4_e2e/summarize_optimized_kv_ab.py" \
     --result-dir "${RESULT_DIR}" \
     --expected-capacity "${COMMON_CAPACITY}"
 fi

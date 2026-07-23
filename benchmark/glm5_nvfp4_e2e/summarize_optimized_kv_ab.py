@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Summarize the one-round GLM-5 optimized NVFP4 KV-cache E2E A/B."""
+"""Summarize the one-round GLM-5 NVFP4 KV-cache E2E A/B."""
 
 import argparse
 import csv
