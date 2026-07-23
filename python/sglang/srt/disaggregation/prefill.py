@@ -86,7 +86,6 @@ def token_handoff_eligible(req: Req, scheduler: Scheduler) -> bool:
         and req.grammar is None
         and req.multimodal_inputs is None
         and scheduler.page_size == 1
-        and scheduler.ps.tp_size == 1
         and scheduler.ps.pp_size == 1
         and scheduler.spec_algorithm.is_none()
         # SamplingParams.normalize rewrites temperature=0 to
