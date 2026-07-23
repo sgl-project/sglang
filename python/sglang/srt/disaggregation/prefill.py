@@ -940,7 +940,16 @@ class SchedulerDisaggregationPrefillMixin:
                             req.finished_reason,
                             len(req.output_ids),
                         )
-                        release_kv_cache(req, self.tree_cache)
+                        # A terminal sample can already have released its KV
+                        # allocation before the asynchronous transfer poll
+                        # observes Success. Avoid releasing the same request a
+                        # second time; non-Mamba caches reject that state.
+                        if (
+                            req.req_pool_idx is not None
+                            or req.kv is not None
+                            or req.mamba_pool_idx is not None
+                        ):
+                            release_kv_cache(req, self.tree_cache)
                         req.disagg_kv_sender.clear()
                         done_reqs.append(req)
                         req.time_stats.set_prefill_kv_transfer_finish_time()
