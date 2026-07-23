@@ -20,6 +20,7 @@ def validate_deepseek_v4_mega_moe_token_budget(
         or envs.SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE.get()
     )
     if not mega_moe_enabled or server_args.disaggregation_mode == "decode":
+        # decode node will skip the check because decode bs is not relevant with --chunk-prefill-size
         return
 
     if server_args.pp_size > 1 and server_args.enable_dynamic_chunking:
