@@ -52,6 +52,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+import os as _os
+
+_SWA_DBG_CHECKSUM = _os.environ.get("SGLANG_SWA_DBG_CHECKSUM") == "1"
+
 SWA_WINDOW = 128
 C4_TOPK = 512
 PAGE_INDEX_ALIGNED_SIZE = 64
@@ -1301,17 +1305,13 @@ class DeepseekV4HipRadixBackend(
         return o
 
     def get_swa_out_cache_loc(self, forward_batch: ForwardBatch) -> torch.Tensor:
-        """Resolve the SWA KV-store write target for the current forward.
+        """Resolve where this forward writes SWA KV.
 
-        Fast path: the per-forward value cached by init_forward_metadata_in_graph
-        (recorded inside cuda graphs, so replay re-reads live buffers). Fallback:
-        translate at store time, matching the pre-cache behavior, for paths that
-        never run the in-graph init — eager idle (forward_idle skips attn init),
-        runners that only run the out-graph prep (e.g.
-        EAGLEDraftExtendCudaGraphRunner) — or whose batch was re-padded after
-        init (shape mismatch). Idle always falls back: its metadata is absent or
-        left over from a previous forward, and translating the zero-padded
-        out_cache_loc writes to the dummy slot.
+        Fast path: the value cached by init_forward_metadata_in_graph (recorded
+        inside cuda graphs, so replay re-reads live buffers). Fallback: translate at
+        store time for paths that skip the in-graph init (eager idle, out-graph-only
+        runners like EAGLEDraftExtendCudaGraphRunner, or a batch re-padded after
+        init). Idle always falls back, since its metadata is stale or absent.
         """
         out_cache_loc = forward_batch.out_cache_loc
         core = getattr(self.forward_metadata, "core_attn_metadata", None)
@@ -1329,15 +1329,11 @@ class DeepseekV4HipRadixBackend(
     def get_unified_swa_loc(self, forward_batch: ForwardBatch) -> torch.Tensor:
         """SWA ring write target for unified_kv, shared by all layers.
 
-        Fast path: the per-forward value cached in _attach_unified_kv_decode_streams
-        (recorded inside cuda graphs, so replay re-reads live buffers). Fallback:
-        recompute at store time, matching the pre-cache per-layer behavior, for
-        paths that never ran the decode-stream init (eager prefill/extend, idle,
-        or a batch re-padded after init -> shape mismatch).
-
-        Cached swa_loc is computed once from committed positions, so every draft-decode
-        step would reuse the same ring slot and break the chain. Recompute from the live
-        per-step positions; only the draft path is affected, the rest keeps the fast path.
+        Fast path: the value cached in _attach_unified_kv_decode_streams (recorded
+        inside cuda graphs). Fallback: recompute at store time for paths that skip
+        the decode-stream init (eager prefill/extend, idle, or a re-padded batch).
+        Draft-decode also recomputes: the cached slot is fixed from committed
+        positions, so reusing it every draft step would break the chain.
         """
         positions = forward_batch.positions
         core = getattr(self.forward_metadata, "core_attn_metadata", None)
@@ -1365,6 +1361,408 @@ class DeepseekV4HipRadixBackend(
                 torch.int32
             )
         return result
+
+    def capture_swa_windows(
+        self, layer_id: int, kv: torch.Tensor, forward_batch: ForwardBatch
+    ) -> None:
+        """Snapshot each page-boundary sliding window from the extend KV for host
+        offload.
+
+        The device ring only holds the current window, so interior boundary windows
+        get overwritten during chunked prefill. At each boundary B, copy kv[B-win:B]
+        into the host pool in token order (same layout as the ring->host backup, so
+        restore is byte-identical); the first half [B-page, B-win) is never in a
+        window and is skipped. The host page is allocated once per (req, B) on the
+        first SWA layer and reused by later layers. No-op unless the host SWA pool
+        is wired.
+        """
+        pool = self.token_to_kv_pool
+        host_pool = getattr(pool, "_swa_host_pool", None)
+        if host_pool is None:
+            return
+        if kv is None or not forward_batch.forward_mode.is_extend():
+            return
+
+        swa_layer = layer_id - pool.start_layer
+
+        # Build the per-forward capture PLAN once (on the first SWA layer) and
+        # reuse it for all `layer_num` layers. Which page boundaries to snapshot,
+        # their flat-KV slice, host page row and ring-roll are IDENTICAL across
+        # layers (only the KV bytes differ), so recomputing the plan per layer
+        # wasted `layer_num-1` redundant GPU->CPU syncs
+        # (`req_pool_indices.tolist()` / `orig_seq_lens.tolist()` on device
+        # tensors) that each stalled the compute stream mid-forward -- the
+        # dominant strict-SWA prefill overhead. The plan is stashed on the
+        # forward_batch so TBO micro-batches never collide.
+        plan = getattr(forward_batch, "_swa_capture_plan", None)
+        if plan is None or swa_layer == 0:
+            ext = forward_batch.extend_seq_lens_cpu
+            seqs = forward_batch.seq_lens_cpu
+            if ext is None or seqs is None:
+                return
+            staging = host_pool._capture_staging
+            # One host page == one device SWA ring block == unified_swa_ring_size
+            # rows. The device ring indexes token position p at row p % ring, so
+            # with speculative decoding the ring carries `spec_extra` slack rows
+            # beyond the sliding window and `page % ring` need NOT be 0; capture
+            # the trailing `ring` tokens and ROLL them into ring layout (h below).
+            # h == 0 (no spec, page % ring == 0) is identity.
+            win = pool.unified_swa_ring_size
+            page = self.page_size
+            slot_page = host_pool.slot_page_size
+            assert (
+                win == slot_page
+            ), f"SWA tile geometry mismatch: ring={win} slot_page={slot_page}"
+            # The two `.tolist()` calls below are the only device->host syncs; by
+            # gating this whole block on `swa_layer == 0` they run once per
+            # forward instead of once per layer.
+            seqs_l = seqs.tolist()
+            req_l = forward_batch.req_pool_indices.tolist()
+            stride = max(1, int(getattr(pool, "_swa_offload_page_stride", 1)))
+            _orig = getattr(forward_batch, "orig_seq_lens", None)
+            orig_l = _orig.tolist() if _orig is not None else None
+            plan = []
+            offset = 0
+            for i, e in enumerate(ext):
+                e = int(e)
+                if e <= 0:
+                    continue
+                total = int(seqs_l[i])
+                cs = total - e
+                rid = int(req_l[i])
+                boundary = (total // page) * page  # last page-aligned pos in chunk
+                tail_B = (int(orig_l[i]) // page) * page if orig_l is not None else -1
+                B = ((cs // page) + 1) * page  # first page boundary after cs
+                while B <= boundary:
+                    # Window straddles before this chunk's flat-KV start (only
+                    # with a non-page-aligned prefix-cache `cs`): not present in
+                    # `kv`, skip (reuse recomputes it), like the host-pool-full /
+                    # stride skips.
+                    if B - win < cs:
+                        if _SWA_DBG_CHECKSUM:
+                            logger.warning(
+                                "[CAP-DBG] SWA window straddles chunk start, skip "
+                                "B=%d win=%d cs=%d",
+                                B,
+                                win,
+                                cs,
+                            )
+                        B += page
+                        continue
+                    # stride gate: keep every `stride`-th page boundary, plus the
+                    # TRUE sequence tail page `tail_B` (matched directly).
+                    if (B // page) % stride != 0 and B != tail_B:
+                        B += page
+                        continue
+                    key = (rid, int(B))
+                    hidx = staging.get(key)
+                    if hidx is None:
+                        hidx = host_pool.alloc(win)
+                        if hidx is None:
+                            # Host pool full: skip (reuse recomputes this window).
+                            if _SWA_DBG_CHECKSUM:
+                                logger.warning(
+                                    "[CAP-DBG] SWA host pool FULL, skip key=%s", key
+                                )
+                            B += page
+                            continue
+                        staging[key] = hidx
+                        if _SWA_DBG_CHECKSUM:
+                            logger.warning("[CAP-DBG] SWA staged key=%s", key)
+                    h = int(B) % win
+                    page_row = int(hidx[0].item()) // slot_page
+                    plan.append(
+                        (
+                            offset + (B - win - cs),
+                            offset + (B - cs),
+                            page_row,
+                            h,
+                            rid,
+                            int(B),
+                        )
+                    )
+                    B += page
+                offset += e
+            forward_batch._swa_capture_plan = plan
+
+        if plan:
+            host_layer_buf = host_pool.data_refs[swa_layer]
+            for kv_lo, kv_hi, page_row, h, rid, B in plan:
+                win_slice = kv[kv_lo:kv_hi]
+                assert (
+                    win_slice.numel() * win_slice.element_size() == host_pool.item_bytes
+                ), (
+                    "SWA window bytes != host item_bytes: "
+                    f"{win_slice.numel() * win_slice.element_size()} vs "
+                    f"{host_pool.item_bytes}"
+                )
+                # Roll flat token order into device ring layout (row p%win holds
+                # token p); h == 0 leaves it unchanged (non-spec path).
+                if h:
+                    win_slice = torch.roll(win_slice, shifts=h, dims=0)
+                _flat = win_slice.contiguous().view(torch.uint8).reshape(-1)
+                host_layer_buf[page_row].copy_(_flat, non_blocking=True)
+                if _SWA_DBG_CHECKSUM:
+                    _crc_map = getattr(host_pool, "_capture_crc", None)
+                    if _crc_map is not None:
+                        _idx = (
+                            torch.arange(
+                                _flat.numel(), device=_flat.device, dtype=torch.int64
+                            )
+                            + 1
+                        )
+                        _crc_map[(rid, int(B), swa_layer)] = int(
+                            (_flat.to(torch.int64) * _idx).sum().item()
+                        )
+            # H2 gate: the window D2H copies above were enqueued non_blocking on
+            # the CURRENT (compute/forward) stream. Record the capture-completion
+            # event on that same stream so a later cross-stream consumer (restore
+            # H2D / L3 write-through / device-landing check) orders strictly after
+            # the host page is fully written via wait_capture_done(). Mirrors the
+            # decode-source capture path; recorded per SWA layer (once per
+            # capture_swa_windows call) only when a window was staged.
+            _rec = getattr(host_pool, "record_capture_done", None)
+            if _rec is not None:
+                _rec()
+
+    def capture_swa_windows_decode(self, forward_batch: ForwardBatch) -> None:
+        """Decode-source SWA capture (completes the prefill+decode dual source).
+
+        Prefill snapshots windows from the flat extend-K. Decode has no flat past KV
+        and runs under a cuda graph, so windows at boundaries crossed during decode
+        are captured here instead, out of the graph, by copying the per-request SWA
+        ring block after the step that lands on a page boundary. The whole ring block
+        (ring_size rows, including speculative slack) is copied positionally, so it
+        is byte-identical to prefill capture and positional restore even when
+        ring_size does not divide the page under spec decode.
+
+        seq_lens_cpu[i] must be the post-step length. Call out of the cuda graph,
+        after the decode forward wrote the ring and before the next step overwrites
+        ring slot 0. No-op unless the host SWA pool is wired.
+        """
+        pool = self.token_to_kv_pool
+        host_pool = getattr(pool, "_swa_host_pool", None)
+        if host_pool is None:
+            return
+        if not forward_batch.forward_mode.is_decode_or_idle():
+            return
+        device_buffers = getattr(host_pool, "device_buffers", None)
+        seqs = forward_batch.seq_lens_cpu
+        if device_buffers is None or seqs is None:
+            return
+        page = self.page_size
+        ring = pool.unified_swa_ring_size
+        # A whole per-request ring block (`ring` rows, incl. speculative slack)
+        # is snapshot positionally below, so no page % ring alignment is needed
+        # (ring need not divide page under spec); restore writes it back to the
+        # same ring rows. The per-row item_bytes check inside the copy guards size.
+        staging = host_pool._capture_staging
+        seqs_l = seqs.tolist()
+        req_l = forward_batch.req_pool_indices.tolist()
+        layer_num = host_pool.layer_num
+        # Only real requests: cuda-graph decode pads seq_lens/req_pool_indices to
+        # a static batch size; padded rows carry stale values that could stage a
+        # bogus (rid, B). Bound the scan to batch_size when present.
+        bs = getattr(forward_batch, "batch_size", None)
+        n = len(seqs_l) if bs is None else min(int(bs), len(seqs_l))
+        # Same stride model as prefill: keep one window every `stride` pages.
+        # Unlike prefill there is NO forced tail page -- the decode length is not
+        # known ahead of time, and once the sequence advances past a boundary its
+        # window is overwritten in the ring, so a boundary can only be captured at
+        # the step that crosses it. With stride>1 a reused decode-extended prefix
+        # therefore resumes at the last stride-aligned boundary (the stride knob's
+        # intended host-offload/reuse-granularity trade-off); stride==1 keeps
+        # every boundary for maximal reuse.
+        stride = max(1, int(getattr(pool, "_swa_offload_page_stride", 1)))
+        captured_any = False
+        for i in range(n):
+            total = int(seqs_l[i])
+            # capture only at the step that lands the sequence on a page boundary
+            if total <= 0 or total % page != 0:
+                continue
+            B = total
+            if (B // page) % stride != 0:
+                continue  # stride gate: skip non-stride-aligned boundaries
+            rid = int(req_l[i])
+            key = (rid, B)
+            if key in staging:
+                # already captured (prefill produced it, or an earlier revisit) --
+                # never overwrite a live host page.
+                continue
+            hidx = host_pool.alloc(ring)
+            if hidx is None:
+                # Host pool full: skip -> reuse recomputes this boundary (I6).
+                if _SWA_DBG_CHECKSUM:
+                    logger.warning(
+                        "[CAP-DBG] decode SWA host pool FULL, skip key=%s", key
+                    )
+                continue
+            staging[key] = hidx
+            if _SWA_DBG_CHECKSUM:
+                logger.warning("[CAP-DBG] decode SWA staged key=%s", key)
+            page_row = int(hidx[0].item()) // host_pool.slot_page_size
+            _crc_map = (
+                getattr(host_pool, "_capture_crc", None) if _SWA_DBG_CHECKSUM else None
+            )
+            for li in range(layer_num):
+                # Whole per-request device ring block (`ring` rows, incl. spec
+                # slack) in ring layout: row (p%ring) holds token p. Copied
+                # positionally -- matches prefill's rolled capture and positional
+                # restore byte-for-byte (NOT plain token order).
+                ring_block = device_buffers[li][rid]
+                _flat = ring_block.contiguous().view(torch.uint8).reshape(-1)
+                assert _flat.numel() == host_pool.item_bytes, (
+                    "decode SWA window bytes != host item_bytes: "
+                    f"{_flat.numel()} vs {host_pool.item_bytes}"
+                )
+                host_pool.data_refs[li][page_row].copy_(_flat, non_blocking=True)
+                if _crc_map is not None:
+                    _idx = (
+                        torch.arange(
+                            _flat.numel(), device=_flat.device, dtype=torch.int64
+                        )
+                        + 1
+                    )
+                    _crc_map[(rid, int(B), li)] = int(
+                        (_flat.to(torch.int64) * _idx).sum().item()
+                    )
+            captured_any = True
+
+        # H2 (overlap-schedule safety): the D2H copies above were enqueued
+        # non_blocking on the CURRENT stream. Under the overlap scheduler that is
+        # the worker's forward_stream -- the SAME stream that ran the decode
+        # forward (which wrote the ring) and that will run the next forward
+        # (which overwrites ring slot 0), so the ring read is same-stream-ordered
+        # between the two writes (hazard H1 holds by construction, overlap on or
+        # off). But a later consumer of these host pages (restore H2D, L3
+        # write-through, device-landing check) may run on a DIFFERENT stream;
+        # record the capture-completion event on this stream so those consumers
+        # can order strictly after the page is fully written via
+        # wait_capture_done() (hazard H2). Recorded once per step, only when a
+        # window was actually staged, so no-op decode steps stay free.
+        if captured_any:
+            _rec = getattr(host_pool, "record_capture_done", None)
+            if _rec is not None:
+                _rec()
+
+    def capture_compress_state_windows_decode(
+        self, forward_batch: ForwardBatch
+    ) -> None:
+        """Decode-source c4 / c4-indexer state capture, the compress-state mirror of
+        capture_swa_windows_decode.
+
+        Prefill snapshots boundary state from the flat extend buffer; decode has no
+        flat past state and runs under a cuda graph, so the boundary group state
+        [B-ratio, B) crossed during decode is captured here, out of the graph, after
+        the decode forward wrote the state ring and before the next step overwrites
+        the slot. For each request whose post-step length lands on a stride-aligned
+        boundary B, snapshot the boundary-group state rows of every c4 layer into the
+        host tile keyed (rid, B), using the same key, host offset and device rows as
+        prefill capture and riding restore so the tiles are interchangeable. No-op
+        unless the state riding pools are wired.
+        """
+        pool = self.token_to_kv_pool
+        li_map = getattr(pool, "_c4_state_layer_index", None)
+        if li_map is None:
+            return
+        if not forward_batch.forward_mode.is_decode_or_idle():
+            return
+        seqs = forward_batch.seq_lens_cpu
+        if seqs is None:
+            return
+        specs = [
+            (
+                getattr(pool, "_c4_state_host_pool", None),
+                getattr(pool, "compress_state_pools", None),
+            ),
+            (
+                getattr(pool, "_c4_indexer_state_host_pool", None),
+                getattr(pool, "indexer_compress_state_pools", None),
+            ),
+        ]
+        specs = [(hp, sps) for hp, sps in specs if hp is not None and sps is not None]
+        if not specs:
+            return
+
+        page = self.page_size
+        ring = pool.unified_swa_ring_size
+        stride = max(1, int(getattr(pool, "_swa_offload_page_stride", 1)))
+        seqs_l = seqs.tolist()
+        req_l = forward_batch.req_pool_indices.tolist()
+        bs = getattr(forward_batch, "batch_size", None)
+        n = len(seqs_l) if bs is None else min(int(bs), len(seqs_l))
+        captured = {id(hp): False for hp, _ in specs}
+        for i in range(n):
+            total = int(seqs_l[i])
+            # capture only at the step that lands the sequence on a page boundary
+            if total <= 0 or total % page != 0:
+                continue
+            B = total
+            if (B // page) % stride != 0:
+                continue  # stride gate (mirrors prefill / SWA decode)
+            r = int(req_l[i])
+            key = (r, int(B))
+            for hp, state_pools in specs:
+                staging = hp._capture_staging
+                if key in staging:
+                    # already captured (prefill produced it, or an earlier
+                    # revisit) -- never overwrite a live host tile.
+                    continue
+                ring_size = hp.slot_page_size
+                hidx = hp.alloc(ring_size)
+                if hidx is None:
+                    continue  # host pool full -> reuse recomputes (I6)
+                staging[key] = hidx
+                slot_bytes = hp.item_bytes // ring_size
+                page_row = int(hidx[0].item()) // ring_size
+                for gl, li in li_map.items():
+                    sp = state_pools[gl] if gl < len(state_pools) else None
+                    if sp is None:
+                        continue
+                    ratio = sp.ratio
+                    dev = sp.kv_score_buffer.kv_score
+                    pos = torch.arange(
+                        B - ratio, B, device=dev.device, dtype=torch.int64
+                    )
+                    swa_loc = r * ring + (pos % ring)
+                    state_locs = sp.translate_from_swa_loc_to_state_loc(swa_loc)
+                    # pack at tile start (matches capture/restore); host tile
+                    # layout is geometry-independent since device rows are
+                    # addressed via translate_from_swa_loc_to_state_loc.
+                    off0 = 0
+                    win = dev[state_locs].contiguous().view(torch.uint8).reshape(-1)
+                    if win.numel() != ratio * slot_bytes:
+                        raise AssertionError(
+                            "decode state window bytes "
+                            f"{win.numel()} != {ratio * slot_bytes}"
+                        )
+                    dst = hp.data_refs[li][page_row]
+                    dst[off0 * slot_bytes : off0 * slot_bytes + win.numel()].copy_(
+                        win, non_blocking=True
+                    )
+                    if _SWA_DBG_CHECKSUM:
+                        _crcm = getattr(hp, "_capture_state_crc", None)
+                        if _crcm is not None:
+                            _cidx = (
+                                torch.arange(
+                                    win.numel(), device=win.device, dtype=torch.int64
+                                )
+                                + 1
+                            )
+                            _crcm[(r, int(B), li)] = int(
+                                (win.to(torch.int64) * _cidx).sum().item()
+                            )
+                captured[id(hp)] = True
+
+        # H2 (overlap safety): the D2H copies above were enqueued non_blocking on
+        # the current (forward) stream; record each pool's capture-completion
+        # event so a later cross-stream consumer (riding restore H2D) orders
+        # strictly after the host tile is fully written via wait_capture_done().
+        for hp, _ in specs:
+            if captured[id(hp)]:
+                _rec = getattr(hp, "record_capture_done", None)
+                if _rec is not None:
+                    _rec()
 
     def store_cache(
         self, layer_id: int, swa_k: torch.Tensor, forward_batch: ForwardBatch

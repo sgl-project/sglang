@@ -1364,6 +1364,41 @@ class ModelRunner:
         if self.server_args.elastic_ep_backend is not None:
             self.maybe_join_ep_ranks()
 
+        # Dual-source strict SWA HiCache (Task B0): decode has no flat past-KV and
+        # runs under the cuda graph, so windows at page boundaries crossed DURING
+        # decode are captured here -- OUT of the graph, after the decode forward
+        # wrote the ring and before the next step overwrites ring slot 0.
+        # No-op unless the strict SWA host pool is wired (feature flag) and this is
+        # a real decode step on a non-draft worker; the backend guards the rest.
+        if not self.is_draft_worker and forward_batch.forward_mode.is_decode():
+            _swa_decode_capture = getattr(
+                self.attn_backend, "capture_swa_windows_decode", None
+            )
+            if _swa_decode_capture is not None:
+                # Scheduler-overlap safety (Task B1, closed): this capture is
+                # enqueued on the CURRENT stream, which under the overlap
+                # scheduler is the worker's forward_stream -- the same stream that
+                # ran this decode forward (ring write) and that will run the next
+                # forward (ring overwrite). So the ring read is same-stream-ordered
+                # between the two writes whether overlap is on or off (hazard H1).
+                # Cross-stream consumers of the captured host page (restore H2D /
+                # L3 write-through / device-landing check) are ordered via the
+                # capture-completion event recorded by capture_swa_windows_decode
+                # and awaited through wait_capture_done (hazard H2). Both hazards
+                # are thus handled by construction + explicit event, so no
+                # --disable-overlap-schedule guardrail is needed here.
+                _swa_decode_capture(forward_batch)
+
+            # Phase C (Task B2): decode-source c4/c4-indexer overlap-state
+            # capture. Same timing/stream/event contract as the SWA decode
+            # capture above (out of graph, forward stream, per-pool capture-done
+            # event). No-op unless the strict state riding pools are wired.
+            _state_decode_capture = getattr(
+                self.attn_backend, "capture_compress_state_windows_decode", None
+            )
+            if _state_decode_capture is not None:
+                _state_decode_capture(forward_batch)
+
         return output
 
     def _maybe_execute_deferred_mamba_cow_and_clear(
