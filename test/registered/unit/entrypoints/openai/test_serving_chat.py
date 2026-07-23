@@ -1656,6 +1656,35 @@ class ServingChatTestCase(unittest.TestCase):
             },
         )
 
+    def test_non_streaming_actions_emit_sglext(self):
+        """Test that non-streaming chat responses emit VLA actions in sglext."""
+
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Act"}],
+            max_tokens=1,
+        )
+        actions = [[[0.1, 0.2], [0.3, 0.4]]]
+        ret = [
+            {
+                "text": "",
+                "meta_info": {
+                    "id": "chatcmpl-actions-test",
+                    "prompt_tokens": 3,
+                    "completion_tokens": 1,
+                    "cached_tokens": 0,
+                    "actions": actions,
+                    "finish_reason": {"type": "stop", "matched": None},
+                    "weight_version": "default",
+                },
+            }
+        ]
+
+        response = self.chat._build_chat_response(req, ret, 1234567890)
+
+        self.assertIsNotNone(response.sglext)
+        self.assertEqual(response.sglext.actions, actions[0])
+
     def test_non_streaming_chat_response_returns_requested_prompt_ids_and_meta_info(
         self,
     ):
@@ -1679,6 +1708,35 @@ class ServingChatTestCase(unittest.TestCase):
                 },
             }
         ]
+
+    def test_non_streaming_actions_emit_sglext(self):
+        """Test that non-streaming chat responses emit VLA actions in sglext."""
+
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Act"}],
+            max_tokens=1,
+        )
+        actions = [[[0.1, 0.2], [0.3, 0.4]]]
+        ret = [
+            {
+                "text": "",
+                "meta_info": {
+                    "id": "chatcmpl-actions-test",
+                    "prompt_tokens": 3,
+                    "completion_tokens": 1,
+                    "cached_tokens": 0,
+                    "actions": actions,
+                    "finish_reason": {"type": "stop", "matched": None},
+                    "weight_version": "default",
+                },
+            }
+        ]
+
+        response = self.chat._build_chat_response(req, ret, 1234567890)
+
+        self.assertIsNotNone(response.sglext)
+        self.assertEqual(response.sglext.actions, actions[0])
 
         response = self.chat._build_chat_response(req, ret, created=123)
         choice = response.choices[0]

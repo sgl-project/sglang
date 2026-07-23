@@ -578,6 +578,45 @@ class TestFromScheduleBatch(CustomTestCase):
         # custom_params should be collected for all reqs
         self.assertEqual(len(info.custom_params), 2)
 
+    @patch("sglang.srt.sampling.sampling_batch_info.get_global_server_args")
+    def test_custom_params_preserved_without_custom_logit_processor(
+        self, mock_server_args
+    ):
+        """Model-side custom params should not require a custom logit processor."""
+        mock_server_args.return_value.enable_deterministic_inference = False
+        mock_server_args.return_value.enable_custom_logit_processor = False
+
+        req1 = self._make_req()
+        req1.sampling_params.custom_params = {"state": [0.0, 1.0]}
+        req2 = self._make_req()
+        req2.sampling_params.custom_params = None
+
+        batch = MagicMock()
+        batch.reqs = [req1, req2]
+        batch.device = DEVICE
+        info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
+
+        self.assertFalse(info.has_custom_logit_processor)
+        self.assertEqual(info.custom_params, [{"state": [0.0, 1.0]}, None])
+
+    def test_filter_custom_params_without_custom_logit_processor(self):
+        info = _make_info(
+            batch_size=3,
+            custom_params=[{"state": [0]}, None, {"state": [2]}],
+        )
+
+        info.filter_batch([2, 0], torch.tensor([2, 0]))
+
+        self.assertEqual(info.custom_params, [{"state": [2]}, {"state": [0]}])
+
+    def test_merge_custom_params_without_custom_logit_processor(self):
+        lhs = _make_info(batch_size=1, custom_params=[{"state": [0]}])
+        rhs = _make_info(batch_size=2, custom_params=[None, {"state": [2]}])
+
+        lhs.merge_batch(rhs)
+
+        self.assertEqual(lhs.custom_params, [{"state": [0]}, None, {"state": [2]}])
+
 
 if __name__ == "__main__":
     unittest.main()

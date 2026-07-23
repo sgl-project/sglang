@@ -147,6 +147,14 @@ class SamplingBatchInfo:
             default=0,
         )
 
+        raw_custom_params = [r.sampling_params.custom_params for r in reqs]
+        custom_params = (
+            raw_custom_params
+            if has_custom_logit_processor
+            or any(param is not None for param in raw_custom_params)
+            else None
+        )
+
         if has_custom_logit_processor:
             # Merge the same type of custom logit processors together
             processor_dict = {}
@@ -169,10 +177,8 @@ class SamplingBatchInfo:
                 )
                 for processor_str, true_indices in processor_dict.items()
             }
-            custom_params = [r.sampling_params.custom_params for r in reqs]
         else:
             merged_custom_logit_processor = None
-            custom_params = None
 
         # Each penalizers will do nothing if they evaluate themselves as not required by looking at
         # the sampling_params of the requests (See {_is_required()} of each penalizers). So this
@@ -299,8 +305,18 @@ class SamplingBatchInfo:
     def filter_batch(self, keep_indices: List[int], keep_indices_device: torch.Tensor):
         self.penalizer_orchestrator.filter(keep_indices_device)
 
+        if self.custom_params is not None:
+            self.custom_params = [self.custom_params[i] for i in keep_indices]
+
         if self.has_custom_logit_processor:
             self._filter_batch_custom_logit_processor(keep_indices, keep_indices_device)
+
+        if (
+            self.custom_params is not None
+            and not self.has_custom_logit_processor
+            and all(param is None for param in self.custom_params)
+        ):
+            self.custom_params = None
 
         for item in [
             "temperatures",
@@ -325,7 +341,7 @@ class SamplingBatchInfo:
     def _filter_batch_custom_logit_processor(
         self, keep_indices: List[int], keep_indices_device: torch.Tensor
     ):
-        """Filter the custom logit processor and custom params"""
+        """Filter custom logit processors to match the active request rows."""
         self.custom_logit_processor = {
             k: (p, mask[keep_indices_device])
             for k, (p, mask) in self.custom_logit_processor.items()
@@ -333,13 +349,10 @@ class SamplingBatchInfo:
                 mask[keep_indices_device]
             )  # ignore the custom logit processor whose mask is all False
         }
-        self.custom_params = [self.custom_params[i] for i in keep_indices]
 
-        # If the custom logit processor is an empty dict, set the flag to False,
-        # and set the custom logit processor and custom params to None.
+        # If the custom logit processor is an empty dict, set the flag to False.
         if len(self.custom_logit_processor) == 0:
             self.custom_logit_processor = None
-            self.custom_params = None
             self.has_custom_logit_processor = False
 
     @staticmethod
@@ -384,26 +397,45 @@ class SamplingBatchInfo:
 
     def merge_batch(self, other: SamplingBatchInfo):
         self.penalizer_orchestrator.merge(other.penalizer_orchestrator)
+        bs1 = len(self)
+        bs2 = len(other)
+        has_custom_logit_processor = (
+            self.has_custom_logit_processor or other.has_custom_logit_processor
+        )
 
         # Merge the custom logit processors and custom params lists
-        if self.has_custom_logit_processor or other.has_custom_logit_processor:
+        if has_custom_logit_processor:
             # Merge the custom logit processors
             self.custom_logit_processor = (
                 SamplingBatchInfo.merge_custom_logit_processor(
                     self.custom_logit_processor,
                     other.custom_logit_processor,
-                    len(self),
-                    len(other),
+                    bs1,
+                    bs2,
                     self.device,
                 )
             )
-            # Merge the custom params lists
-            self.custom_params = self.custom_params or [None] * len(self)
-            other.custom_params = other.custom_params or [None] * len(other)
-            self.custom_params.extend(other.custom_params)
 
             # Set the flag to True if any of the two has custom logit processor
             self.has_custom_logit_processor = True
+
+        if (
+            self.custom_params is not None
+            or other.custom_params is not None
+            or has_custom_logit_processor
+        ):
+            # Preserve model-side custom parameters even when no custom logit
+            # processor is attached; VLA action heads consume these directly.
+            self_params = self.custom_params or [None] * bs1
+            other_params = other.custom_params or [None] * bs2
+            self.custom_params = self_params + other_params
+
+        if (
+            self.custom_params is not None
+            and not self.has_custom_logit_processor
+            and all(param is None for param in self.custom_params)
+        ):
+            self.custom_params = None
 
         self_len = len(self)
         other_len = len(other)

@@ -300,6 +300,35 @@ class ServingCompletionTestCase(unittest.TestCase):
             },
         )
 
+    def test_non_streaming_actions_emit_sglext(self):
+        """Test that non-streaming completion responses emit VLA actions in sglext."""
+
+        req = CompletionRequest(
+            model="x",
+            prompt=[1, 2, 3],
+            max_tokens=1,
+        )
+        actions = [[[0.1, 0.2], [0.3, 0.4]]]
+        ret = [
+            {
+                "text": "",
+                "meta_info": {
+                    "id": "cmpl-actions-test",
+                    "prompt_tokens": 3,
+                    "completion_tokens": 1,
+                    "cached_tokens": 0,
+                    "actions": actions,
+                    "finish_reason": {"type": "stop", "matched": None},
+                    "weight_version": "default",
+                },
+            }
+        ]
+
+        response = self.sc._build_completion_response(req, ret, 1234567890)
+
+        self.assertIsNotNone(response.sglext)
+        self.assertEqual(response.sglext.actions, actions[0])
+
     def test_streaming_cached_tokens_details_emits_sglext(self):
         """Test that streaming completion responses emit cached token details in sglext."""
 
