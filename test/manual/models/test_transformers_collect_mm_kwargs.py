@@ -2,7 +2,6 @@
 Unit tests for MultiModalMixin._collect_mm_kwargs' handling of 5D
 pixel_values features in the generic Transformers fallback backend
 (sglang.srt.models.transformers).
-
 """
 
 import unittest
