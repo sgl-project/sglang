@@ -320,6 +320,17 @@ class OpenAIServingResponses(OpenAIServingChat):
                         ),
                     )
 
+                    # Keep special tokens when tools are present so native
+                    # tool-call markers (e.g. gemma4 <|tool_call>) survive into
+                    # `content` for FunctionCallParser; otherwise tool calls under
+                    # tool_choice="auto" leak as plain text. Mirrors serving_chat.py.
+                    if (
+                        isinstance(sampling_params, dict)
+                        and getattr(request, "tools", None)
+                        and request.tool_choice != "none"
+                    ):
+                        sampling_params["skip_special_tokens"] = False
+
                     context: ConversationContext
                     if self.use_harmony:
                         if request.stream:
