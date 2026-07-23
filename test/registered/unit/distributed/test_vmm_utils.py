@@ -20,8 +20,8 @@ import torch
 import torch.distributed as dist
 from cuda.bindings import driver as drv
 
-from sglang.kernels.jit.tests.utils import multigpu_pytest_main
 from sglang.kernels.jit.utils import cache_once
+from sglang.kernels.testing.utils import multigpu_pytest_main
 from sglang.srt.distributed.device_communicators.vmm_utils import (
     check_drv,
     exchange_posix_fds,

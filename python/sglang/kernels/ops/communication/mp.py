@@ -1,6 +1,6 @@
 """Multi-process / multi-GPU launching utilities (torchrun-based).
 
-Shared `multigpu_launch` helper that both `sglang.kernels.jit.tests.utils` and
+Shared `multigpu_launch` helper that both `sglang.kernels.testing.utils` and
 `sglang.kernels.jit.benchmark.utils` build their domain-specific entry points on
 top of (`multigpu_pytest_main`, `multigpu_bench_main`).
 
