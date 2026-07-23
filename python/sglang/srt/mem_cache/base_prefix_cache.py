@@ -177,6 +177,10 @@ class MatchResult(NamedTuple):
         mamba_branching_seqlen: The mamba radix cache branching point, which is the longest
                                 page-aligned position that could've been cache hit if there
                                 exists a mamba state.
+        fuzzy_matched_len:  Number of tokens in `device_indices` that came from a
+                            fuzzy (non-exact) match rather than the radix tree.
+                            Those slots hold donor KV that must be position-corrected
+                            before the forward pass. None/0 for exact-only caches.
     """
 
     device_indices: torch.Tensor
@@ -188,6 +192,7 @@ class MatchResult(NamedTuple):
     mamba_host_hit_length: int = 0
     mamba_branching_seqlen: Optional[int] = None
     cache_protected_len: Optional[int] = None
+    fuzzy_matched_len: Optional[int] = None
 
 
 def zero_match_result(tree_cache, match_result: MatchResult) -> MatchResult:
