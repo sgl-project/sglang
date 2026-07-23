@@ -289,7 +289,7 @@ class TestFusedQKRMSNorm:
         global_sum_sq = torch.stack(local_sum_sq).sum(dim=0)
 
         shard_outputs = [
-            torch.ops.sgl_kernel.fused_qk_rmsnorm_apply_cpu(
+            torch.ops.sgl_kernel.fused_qk_rmsnorm_apply_from_stats_cpu(
                 q_shard,
                 k_shard,
                 q_weight_shard,

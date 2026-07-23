@@ -207,7 +207,7 @@ def register_fake_ops(tp_size: int):
     def _(q, k):
         return torch.empty((q.shape[0], 2), dtype=torch.float32, device=q.device)
 
-    @register_cpu_compile_fake("fused_qk_rmsnorm_apply_cpu")
+    @register_cpu_compile_fake("fused_qk_rmsnorm_apply_from_stats_cpu")
     def _(q, k, *args, **kwargs):
         return torch.empty_like(q), torch.empty_like(k)
 
