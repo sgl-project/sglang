@@ -34,6 +34,11 @@ class TritonRunnerInput(RunnerInput):
     sorted_token_ids: torch.Tensor
     expert_ids: torch.Tensor
     num_tokens_post_padded: torch.Tensor
+    # deepep_normal/mori deliver hidden_states in a dispatcher-owned,
+    # possibly read-only buffer; the permute hook sets this so the core
+    # allocates a fresh output instead of writing in place (avoids
+    # mutating the shared runner config across forwards).
+    force_no_inplace: bool = False
 
     @property
     def runner_backend(self) -> MoeRunnerBackend:
@@ -90,10 +95,18 @@ class TritonRunnerCore(MoeRunnerCore):
         # correct empty output. shape[0] is host-side (no D2H sync); under
         # cuda-graph capture the buffer is never truncated so this never fires.
         if runner_input.hidden_states.shape[0] == 0:
+            # Output hidden dim == input hidden dim for MoE; read it from
+            # the input so it is independent of quant packing layout (int4
+            # packs along the contract dim, not the output dim).
             out = runner_input.hidden_states.new_empty(
-                (0, quant_info.w2_weight.shape[1])
+                (0, runner_input.hidden_states.shape[1])
             )
             return TritonRunnerOutput(hidden_states=out)
+
+        # deepep_normal/mori dispatch delivers hidden_states in a read-only
+        # dispatcher buffer; the permute hook flags force_no_inplace so we
+        # skip in-place writes without mutating the shared runner config.
+        effective_inplace = self.config.inplace and not runner_input.force_no_inplace
 
         if quant_info.use_mxfp8 and is_hip() and is_gfx95_supported():
             from sglang.kernels.ops.moe.mxfp8_moe_amd_gfx95 import (
@@ -113,7 +126,7 @@ class TritonRunnerCore(MoeRunnerCore):
                 activation=self.config.activation,
                 is_gated=self.config.is_gated,
                 no_combine=self.config.no_combine,
-                inplace=self.config.inplace,
+                inplace=effective_inplace,
                 apply_router_weight_on_input=self.config.apply_router_weight_on_input,
                 routed_scaling_factor=self.config.routed_scaling_factor,
                 gemm1_alpha=self.config.gemm1_alpha,
@@ -172,7 +185,7 @@ class TritonRunnerCore(MoeRunnerCore):
             activation=self.config.activation,
             is_gated=self.config.is_gated,
             no_combine=self.config.no_combine,
-            inplace=self.config.inplace,
+            inplace=effective_inplace,
             apply_router_weight_on_input=self.config.apply_router_weight_on_input,
             # For int4/compressed-tensors experts routed_scaling_factor is NOT
             # fused into topk_weights (should_fuse_routed_scaling_factor_in_topk
@@ -368,8 +381,9 @@ def pre_permute_deepep_normal_to_triton(
     # an external, RDMA-registered, read-only-mapped region). The triton runner
     # core writes MoE output in-place into hidden_states when config.inplace is
     # True (the default), which faults on that buffer ("write to read-only
-    # page"). Force a fresh output allocation for this dispatch format.
-    runner_config.inplace = False
+    # page"). Flag the runner input so the core allocates a fresh output
+    # for this dispatch format, instead of mutating the shared runner
+    # config object (which persists across forwards).
 
     # Mori packs origin routing (used by combine) and dispatches into a
     # fixed-size buffer; cap it to the configured input budget so the kernel
@@ -482,6 +496,7 @@ def pre_permute_deepep_normal_to_triton(
         sorted_token_ids=sorted_token_ids,
         expert_ids=expert_ids,
         num_tokens_post_padded=num_tokens_post_padded,
+        force_no_inplace=True,
     )
 
 
