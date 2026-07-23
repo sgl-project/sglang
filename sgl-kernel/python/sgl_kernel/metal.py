@@ -139,9 +139,7 @@ def rms_norm(
             f"rms_norm weight length {w.shape[0]} must match x hidden dim {x.shape[1]}"
         )
     if x.dtype != w.dtype:
-        raise ValueError(
-            f"rms_norm x/w dtypes must match, got {x.dtype} vs {w.dtype}"
-        )
+        raise ValueError(f"rms_norm x/w dtypes must match, got {x.dtype} vs {w.dtype}")
     # Kernel reads x/w as flat row-major buffers; make them contiguous
     # (no-op if already). Local import keeps mlx optional at module load.
     import mlx.core as mx
