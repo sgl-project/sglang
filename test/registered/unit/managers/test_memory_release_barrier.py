@@ -6,12 +6,18 @@ import pytest
 from sglang.srt.managers.io_struct import (
     PauseGenerationReqInput,
     ReleaseMemoryOccupationReqInput,
+    ReleaseMemoryOccupationReqOutput,
 )
+from sglang.srt.managers.multi_tokenizer_mixin import TokenizerWorker
 from sglang.srt.managers.scheduler_components.weight_updater import (
     SchedulerWeightUpdaterManager,
 )
+from sglang.srt.managers.tokenizer_control_mixin import TokenizerControlMixin
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.utils.aio_rwlock import RWLock
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 def _bare_tokenizer_manager():
@@ -78,6 +84,34 @@ async def test_failed_in_place_pause_reopens_admission():
     assert tm.is_pause is False
     reader_lock = await asyncio.wait_for(tm._acquire_generation_reader(), timeout=1)
     await reader_lock.__aexit__(None, None, None)
+
+
+@pytest.mark.asyncio
+async def test_multi_tokenizer_rejects_in_place_pause_before_dispatch():
+    worker = object.__new__(TokenizerWorker)
+    worker._dispatch_to_scheduler = Mock()
+
+    with pytest.raises(RuntimeError, match="multiple tokenizer workers"):
+        await worker.pause_generation(PauseGenerationReqInput(mode="in_place"))
+
+    worker._dispatch_to_scheduler.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_release_surfaces_fanout_failure():
+    manager = object.__new__(TokenizerManager)
+    manager.auto_create_handle_loop = Mock()
+    manager.release_memory_occupation_communicator = AsyncMock(
+        return_value=[
+            ReleaseMemoryOccupationReqOutput(),
+            ReleaseMemoryOccupationReqOutput(success=False, message="rank busy"),
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="rank busy"):
+        await TokenizerControlMixin.release_memory_occupation(
+            manager, ReleaseMemoryOccupationReqInput(tags=["kv_cache"])
+        )
 
 
 def test_busy_release_returns_failure_instead_of_asserting():
