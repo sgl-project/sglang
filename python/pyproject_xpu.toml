@@ -54,7 +54,7 @@ dependencies = [
   "scipy",
   "sentencepiece",
   "setproctitle",
-  "sgl-kernel @ git+https://github.com/sgl-project/sgl-kernel-xpu.git",
+  "sgl-kernel @ git+https://github.com/yuchengliu1/sgl-kernel-xpu.git@update_pt213",
   "smg-grpc-servicer>=0.5.0",
   "soundfile==0.13.1",
   "tiktoken",
