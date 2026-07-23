@@ -9,6 +9,7 @@ from sglang.srt.disaggregation.token_handoff import (
     TokenHandoffState,
     estimate_catch_up,
 )
+from sglang.srt.managers.schedule_batch import Req
 
 
 def test_exact_count_commit_transfers_single_output_owner():
@@ -134,3 +135,17 @@ def test_catch_up_estimate_requires_decode_replay_to_beat_live_decode():
     assert feasible.initial_backlog_tokens == 6
     assert feasible.estimated_bridge_tokens >= feasible.initial_backlog_tokens
     assert feasible.estimated_catch_up_ms > 10
+
+
+def test_incremental_detokenizer_can_resume_at_cross_worker_output_boundary():
+    req = type("ReqStub", (), {})()
+    req.origin_input_ids_unpadded = [10, 11, 12, 13, 14, 15]
+    req.output_ids = [21, 22, 23, 24]
+
+    decode_ids, read_offset = Req.prime_incremental_detokenize_at_output_offset(req, 2)
+
+    # Five tokens of surrounding context end exactly at the Prefill-owned
+    # boundary; the Decode-owned suffix remains available for first emission.
+    assert decode_ids == [13, 14, 15, 21, 22, 23, 24]
+    assert read_offset == 5
+    assert req.cur_decode_ids_len == 4

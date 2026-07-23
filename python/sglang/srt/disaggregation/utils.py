@@ -415,6 +415,13 @@ class MetadataBuffers:
         self.cached_tokens[req.metadata_buffer_index][4] = image_t
         self.cached_tokens[req.metadata_buffer_index][5] = audio_t
         self.cached_tokens[req.metadata_buffer_index][6] = video_t
+        # In token-handoff mode, output_ids contains the full sealed token log,
+        # while this slot records the prefix whose text was already handed to
+        # the Prefill HTTP stream.  Decode validates the whole log but only
+        # suppresses this client-owned prefix.
+        self.cached_tokens[req.metadata_buffer_index][7] = getattr(
+            req, "token_handoff_prefill_owned_tokens", 0
+        )
         if req.return_logprob:
             if req.logprob.output_token_logprobs_val:  # not none or empty list
                 self.output_token_logprobs_val[req.metadata_buffer_index][0] = (

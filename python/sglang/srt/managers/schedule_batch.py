@@ -1284,6 +1284,29 @@ class Req(ReqDllmMixin):
 
         return self.surr_and_decode_ids, self.read_offset - self.surr_offset
 
+    def prime_incremental_detokenize_at_output_offset(self, output_offset: int):
+        """Prime streaming after an output prefix was emitted elsewhere.
+
+        The returned decode context starts just before ``output_offset`` but
+        also contains every locally known output token after that boundary.
+        This lets a second worker emit the unowned suffix with correct BPE
+        context without re-emitting the prefix.
+        """
+
+        if not 0 <= output_offset <= len(self.output_ids):
+            raise ValueError(
+                f"output_offset must be in [0, {len(self.output_ids)}], "
+                f"got {output_offset}"
+            )
+
+        read_offset = len(self.origin_input_ids_unpadded) + output_offset
+        self.read_offset = read_offset
+        self.surr_offset = max(read_offset - INIT_INCREMENTAL_DETOKENIZATION_OFFSET, 0)
+        all_ids = self.origin_input_ids_unpadded + self.output_ids
+        self.surr_and_decode_ids = all_ids[self.surr_offset :]
+        self.cur_decode_ids_len = len(self.output_ids)
+        return self.surr_and_decode_ids, self.read_offset - self.surr_offset
+
     def _stop_match_tail_len(self, new_accepted_len: int) -> int:
         max_len_tail_str = max(
             self.sampling_params.stop_str_max_len + 1,

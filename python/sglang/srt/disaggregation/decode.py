@@ -1760,11 +1760,26 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             if token_handoff_count > 0
             else None
         )
+        token_handoff_prefill_owned = (
+            int(cached_tokens[7].item()) if token_handoff_log is not None else 0
+        )
+        if not 0 <= token_handoff_prefill_owned <= token_handoff_count:
+            prepare_abort(
+                decode_req.req,
+                "Invalid token handoff output ownership boundary: "
+                f"{token_handoff_prefill_owned=} {token_handoff_count=}",
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+            decode_req.kv_receiver.clear()
+            decode_req.kv_receiver = None
+            return
         if token_handoff_log is not None:
             logger.info(
-                "Token handoff received rid=%s bridge_tokens=%d",
+                "Token handoff received rid=%s bridge_tokens=%d "
+                "prefill_owned_tokens=%d",
                 decode_req.req.rid,
                 token_handoff_count,
+                token_handoff_prefill_owned,
             )
 
         if replayed_boundary:
@@ -1780,16 +1795,15 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             req.output_ids.append(token_handoff_log[0])
             req.token_handoff_replay_remaining = token_handoff_log[1:]
             req.token_handoff_original_stream = req.stream
+            req.token_handoff_prefill_owned_tokens = token_handoff_prefill_owned
             req.stream = False
         else:
             decode_req.req.output_ids.append(committed_output_id)
             if token_handoff_log is not None:
-                # Prefill already streamed this boundary token. Prime Decode's
-                # incremental detokenizer and suppress it from the chained
-                # response.
-                decode_ids, _ = decode_req.req.init_incremental_detokenize()
-                decode_req.req.send_decode_id_offset = len(decode_ids)
-                decode_req.req.send_token_offset = token_handoff_count
+                decode_req.req.prime_incremental_detokenize_at_output_offset(
+                    token_handoff_prefill_owned
+                )
+                decode_req.req.send_token_offset = token_handoff_prefill_owned
         decode_req.req.cached_tokens = cached_tokens[0].item()
         # The prefill node already reported its prefix-cache hit in
         # cached_tokens[0]. Seed already_computed with it so that
@@ -2172,16 +2186,20 @@ class SchedulerDisaggregationDecodeMixin:
 
             if not remaining:
                 req.stream = req.token_handoff_original_stream
-                decode_ids, _ = req.init_incremental_detokenize()
-                req.send_decode_id_offset = len(decode_ids)
-                req.send_token_offset = len(req.output_ids)
+                owned_tokens = req.token_handoff_prefill_owned_tokens
+                req.prime_incremental_detokenize_at_output_offset(owned_tokens)
+                req.send_decode_id_offset = 0
+                req.send_token_offset = owned_tokens
                 logger.info(
-                    "Token handoff replay verified rid=%s bridge_tokens=%d",
+                    "Token handoff replay verified rid=%s bridge_tokens=%d "
+                    "prefill_owned_tokens=%d",
                     req.rid,
                     len(req.output_ids),
+                    owned_tokens,
                 )
                 del req.token_handoff_replay_remaining
                 del req.token_handoff_original_stream
+                del req.token_handoff_prefill_owned_tokens
 
     def get_new_prebuilt_batch(
         self: Scheduler, running_batch: ScheduleBatch

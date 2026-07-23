@@ -939,17 +939,25 @@ class SchedulerDisaggregationPrefillMixin:
                     # Seal the live producer before publishing the final token
                     # log. Decode's metadata gate is still closed because the
                     # initial aux row carried bootstrap_room=0.
+                    req.token_handoff_prefill_owned_tokens = req.send_token_offset
                     req.finished_reason = FINISH_LENGTH(length=len(req.output_ids))
                     req.finished_len = len(req.output_ids)
-                    self.disagg_metadata_buffers.set_buf(
-                        req, token_handoff_ready=True
-                    )
+                    self.disagg_metadata_buffers.set_buf(req, token_handoff_ready=True)
+                    # The final Prefill message only closes this half of the
+                    # chained stream. Tokens generated ahead of the last
+                    # streamed result are owned by Decode and must not be
+                    # emitted here as a racing detokenizer tail.
+                    req.send_token_offset = len(req.output_ids)
+                    decode_ids, _ = req.init_incremental_detokenize()
+                    req.send_decode_id_offset = len(decode_ids)
                     try:
                         req.disagg_kv_sender.resend_aux()
                         logger.info(
-                            "Token handoff sealed rid=%s bridge_tokens=%d",
+                            "Token handoff sealed rid=%s bridge_tokens=%d "
+                            "prefill_owned_tokens=%d",
                             req.rid,
                             len(req.output_ids),
+                            req.token_handoff_prefill_owned_tokens,
                         )
                     except Exception:
                         logger.exception(

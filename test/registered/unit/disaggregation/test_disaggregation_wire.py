@@ -147,10 +147,12 @@ class TestEagleDsaSeedTransfer(unittest.TestCase):
         req.rid = "handoff-test"
         req.token_handoff_enabled = True
         req.output_ids = [101, 102, 103]
+        req.token_handoff_prefill_owned_tokens = 2
 
         buffers.set_buf(req, token_handoff_ready=False)
         self.assertEqual(buffers.output_ids[0, :3].tolist(), [101, 102, 103])
         self.assertEqual(buffers.output_ids[0, 15].item(), 3)
+        self.assertEqual(buffers.cached_tokens[0, 7].item(), 2)
         self.assertEqual(buffers.bootstrap_room[0, 0].item(), 0)
 
         buffers.set_buf(req, token_handoff_ready=True)
