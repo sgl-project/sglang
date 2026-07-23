@@ -175,6 +175,14 @@ class GDNKernelDispatcher:
 
                 flashinfer_kernel = FlashInferGDNKernel()
                 self.extend_kernel = flashinfer_kernel
+        elif prefill_backend.is_flashqla():
+            if not is_cuda():
+                raise ValueError("FlashQLA GDN backend requires CUDA")
+            from sglang.srt.layers.attention.linear.kernels.gdn_flashqla import (
+                FlashQLAGDNKernel,
+            )
+
+            self.extend_kernel = FlashQLAGDNKernel()
         else:
             raise ValueError(f"Unsupported GDN prefill backend: {prefill_backend}")
 
