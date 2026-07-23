@@ -28,6 +28,7 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
 _is_mps = is_mps()
+
 if _is_cuda or _is_hip:
     from sgl_kernel.kvcacheio import (
         transfer_kv_all_layer_direct_lf_pf,
@@ -827,8 +828,59 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         )
         self.can_use_jit = False
         self.can_use_write_back_jit = False
+        # SWA-capture completion event (lazily created on first capture, GPU
+        # only). Gates cross-stream consumers of a captured host page; see
+        # record_capture_done / wait_capture_done.
+        self._capture_done_event = None
         self._init_write_back_staging_buffers()
         self.clear()
+
+    def _ensure_capture_done_event(self):
+        """Lazily create the SWA-capture completion event (GPU only).
+
+        SWA-window capture (prefill and decode-source) enqueues its D2H on the compute
+        stream. That is same-stream-ordered against the ring write, but a cross-stream
+        consumer (restore H2D, L3 write-through, the device-landing check) must still
+        wait until the host page is fully written. record_capture_done records this
+        event on the compute stream and wait_capture_done awaits it. Returns None only
+        on cpu / no-GPU, where there is no stream to order.
+        """
+        if self._capture_done_event is None:
+            dev = self.gpu_device
+            if dev is None or str(dev) == "cpu":
+                return None
+            self._capture_done_event = torch.cuda.Event()
+        return self._capture_done_event
+
+    def record_capture_done(self, stream=None) -> None:
+        """Record the capture-completion event on ``stream`` (default: current)
+        AFTER the capture D2H copies were enqueued there, so any consumer that
+        calls ``wait_capture_done`` is ordered strictly after the host page is
+        fully written -- regardless of which stream produced or consumes it.
+        No-op on cpu / no-GPU."""
+        ev = self._ensure_capture_done_event()
+        if ev is None:
+            return
+        s = (
+            stream
+            if stream is not None
+            else torch.cuda.current_stream(device=self.gpu_device)
+        )
+        ev.record(s)
+
+    def wait_capture_done(self, stream=None) -> None:
+        """Make ``stream`` (default: current) wait until all enqueued SWA-capture
+        D2H copies have completed, so a cross-batch host-page read sees finished
+        bytes. No-op when no capture has run on this pool yet."""
+        ev = self._capture_done_event
+        if ev is None:
+            return
+        s = (
+            stream
+            if stream is not None
+            else torch.cuda.current_stream(device=self.gpu_device)
+        )
+        s.wait_event(ev)
 
     def _init_write_back_staging_buffers(self):
         self.staging_buffer = None
@@ -853,7 +905,12 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         return data_ptrs, data_lens, item_lens
 
     def _to_page_indices(self, indices: torch.Tensor) -> torch.Tensor:
-        return indices.reshape(-1, self.slot_page_size)[:, 0] // self.slot_page_size
+        # `_l3_page_size` (set on the unified c4/indexer STATE pools): the L3
+        # sidecar hands SWA host indices (one page == swa_ring_size slots), so the
+        # coupled DURABLE row is `index // swa_ring_size`, NOT the state pool's own
+        # ring_size slot. None (every other pool) => plain slot_page_size paging.
+        ps = getattr(self, "_l3_page_size", None) or self.slot_page_size
+        return indices.reshape(-1, ps)[:, 0] // ps
 
     def _has_transfer_indices(
         self, host_indices: torch.Tensor | None, device_indices: torch.Tensor | None
@@ -880,7 +937,14 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         return self.kv_buffer if isinstance(self.kv_buffer, list) else [self.kv_buffer]
 
     def clear(self):
-        self.free_slots = torch.arange(self.size, dtype=torch.int64)
+        # Reserve the leading ``_durable_reserve_slots`` token slots (== N SWA
+        # page rows) so the allocator never hands them out. Those durable rows
+        # are addressed directly by the coupled SWA window page row
+        # (promote_captured_page writes them), while transient capture staging
+        # allocs only from the slack tail. Default 0 => arange(0, size), the
+        # plain behavior for every non-state pool.
+        reserve = int(getattr(self, "_durable_reserve_slots", 0) or 0)
+        self.free_slots = torch.arange(reserve, self.size, dtype=torch.int64)
         self.release_slots = []
         self.num_release_slots = 0
 
@@ -904,7 +968,14 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
 
     @synchronized
     def free(self, indices: torch.Tensor) -> int:
-        indices_cpu = indices.cpu()
+        # Never return durable-reserve rows to the free list: a durable row is
+        # owned by its coupled SWA window and recycled implicitly when that
+        # window's row is reused, not via this allocator. Filtered rows feed the
+        # upstream deferred-release queue (release_slots) like any other free.
+        indices_cpu = indices.to(dtype=torch.int64, device="cpu").flatten()
+        reserve = int(getattr(self, "_durable_reserve_slots", 0) or 0)
+        if reserve:
+            indices_cpu = indices_cpu[indices_cpu >= reserve]
         if indices_cpu.numel() == 0:
             return 0
 
@@ -912,9 +983,27 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         self.num_release_slots += len(indices_cpu)
         return len(indices)
 
+    def promote_captured_page(self, staged_indices, durable_row: int) -> None:
+        """Co-lifetime: copy the c4/indexer state tile captured at
+        ``staged_indices`` (a slack-region page) into the durable ``durable_row``
+        (== the coupled SWA window host page row) for every layer, then release
+        the staging page. After this, ``get_data_page``/restore address the tile
+        by the SWA window row, so the state and its window share one L3 slot."""
+        staged_row = int(staged_indices[0].item()) // self.slot_page_size
+        for li in range(self.layer_num):
+            self.data_refs[li][durable_row].copy_(self.data_refs[li][staged_row])
+        self.free(staged_indices)
+
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
     ):
+        # Unified c4/indexer STATE pool: L1<->L2 (device<->host) is owned by the
+        # manual bit-exact capture ride (swa_component), NOT the controller -- the
+        # unified path overwrites the state ring mid-prefill, so a controller device
+        # read here would be a dirty read. Durable host rows are already filled by
+        # the capture/promote path; this transfer is a no-op (L2<->L3 only).
+        if getattr(self, "_manual_device_ride", False):
+            return
         if not self._has_transfer_indices(host_indices, device_indices):
             return
         if (
@@ -985,9 +1074,68 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
                 f"Unsupported V4 paged host layout/backend: {self.layout}/{io_backend}"
             )
 
+    def load_to_device_all_layer(
+        self, device_pool, host_indices, device_indices, io_backend
+    ):
+        """H->D restore for all layers in one fused op (reverse of
+        backup_from_device_all_layer).
+
+        The per-layer path issues one transfer op per layer, so a single reused window
+        costs layer_num kernel launches plus redundant index recomputation. The
+        direct/kernel layer_first primitives already accept the full per-layer
+        buffer/pointer lists, so we move every layer in one call. Byte-for-byte
+        identical to the per-layer loop (same primitive, same page indices); only the
+        launch overhead is removed.
+        """
+        if not self._has_transfer_indices(host_indices, device_indices):
+            return
+        if (
+            host_indices.numel() % self.slot_page_size != 0
+            or device_indices.numel() % self.slot_page_size != 0
+        ):
+            # Token-granular DSV4 C4 preload (not one contiguous byte range per
+            # token); mirror backup's all-layer token-granular helper.
+            transfer_cache_dsv4_mla(
+                src_ptrs=self.data_ptrs,
+                dst_ptrs=self.device_ptrs,
+                src_indices=host_indices.to(dtype=torch.int64),
+                dst_indices=device_indices.to(dtype=torch.int64),
+            )
+            return
+        host_rows = self._to_page_indices(host_indices)
+        device_rows = self._to_page_indices(device_indices)
+        if io_backend == "kernel" and self.layout == "layer_first":
+            transfer_kv_all_layer_mla(
+                src_layers=self.data_ptrs,
+                dst_layers=self.device_ptrs,
+                src_indices=host_rows,
+                dst_indices=device_rows,
+                item_size=self.item_bytes,
+                num_layers=self.layer_num,
+            )
+        elif io_backend == "direct" and self.layout == "layer_first":
+            transfer_kv_direct(
+                src_layers=self.data_refs,
+                dst_layers=self.device_buffers,
+                src_indices=host_rows,
+                dst_indices=device_rows,
+                page_size=1,
+            )
+        else:
+            # Layouts without a fused all-layer H2D path: fall back to the
+            # proven per-layer loop (correctness over speed).
+            for layer_id in range(self.layer_num):
+                self.load_to_device_per_layer(
+                    device_pool, host_indices, device_indices, layer_id, io_backend
+                )
+
     def load_to_device_per_layer(
         self, device_pool, host_indices, device_indices, layer_id, io_backend
     ):
+        # Unified c4/indexer STATE pool: L1<->L2 restore is owned by the manual
+        # bit-exact ride (_restore_state_windows), not the controller; no-op here.
+        if getattr(self, "_manual_device_ride", False):
+            return
         if not self._has_transfer_indices(host_indices, device_indices):
             return
         if (
@@ -1047,38 +1195,48 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
             )
 
     def get_data_page(self, index, flat=True):
-        index = int(index) // self.slot_page_size
+        # `_l3_page_size` (unified state pools): address the durable row by the
+        # coupled SWA window page; None => plain slot paging (SWA / C4 / C128).
+        _ps = getattr(self, "_l3_page_size", None) or self.slot_page_size
+        page_row = int(index) // _ps
         if self.layout == "layer_first":
             data_page = torch.stack(
-                [self.kv_buffer[i][index] for i in range(self.layer_num)]
+                [self.kv_buffer[i][page_row] for i in range(self.layer_num)]
             )
         elif self.layout in ["page_first", "page_first_direct"]:
-            data_page = self.kv_buffer[index]
+            data_page = self.kv_buffer[page_row]
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
-        return data_page.flatten() if flat else data_page
+        if not flat:
+            return data_page
+        return data_page.flatten()
 
     def get_dummy_flat_data_page(self):
-        return torch.zeros(
+        base = torch.zeros(
             (self.layer_num, self.item_bytes),
             dtype=self.dtype,
             device=self.device,
             pin_memory=self.pin_memory,
         ).flatten()
+        return base
 
     def set_from_flat_data_page(self, index, data_page):
-        index = int(index) // self.slot_page_size
+        # `_l3_page_size` (unified state pools): write the durable row addressed by
+        # the coupled SWA window page; None => plain slot paging.
+        _ps = getattr(self, "_l3_page_size", None) or self.slot_page_size
+        page_row = int(index) // _ps
+        data_page = data_page.view(self.dtype).reshape(-1)
         if self.layout == "layer_first":
-            data = data_page.view(self.dtype).reshape(self.layer_num, self.item_bytes)
+            data = data_page.reshape(self.layer_num, self.item_bytes)
             for i in range(self.layer_num):
-                self.kv_buffer[i][index].copy_(data[i])
+                self.kv_buffer[i][page_row].copy_(data[i])
         elif self.layout == "page_first":
-            self.kv_buffer[index].copy_(
-                data_page.view(self.dtype).reshape(self.layer_num, self.item_bytes)
+            self.kv_buffer[page_row].copy_(
+                data_page.reshape(self.layer_num, self.item_bytes)
             )
         elif self.layout == "page_first_direct":
-            self.kv_buffer[index].copy_(
-                data_page.view(self.dtype).reshape(self.layer_num, 1, self.item_bytes)
+            self.kv_buffer[page_row].copy_(
+                data_page.reshape(self.layer_num, 1, self.item_bytes)
             )
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
