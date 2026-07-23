@@ -66,6 +66,7 @@ def test_correctness(
     sys.path.insert(0, "/sgl-workspace/sglang/python")
 
     from sgl_kernel import sgl_act_mul_blockwise_quant, sgl_per_token_group_quant_8bit
+
     from sglang.kernels.ops.moe.fused_moe_triton_kernels import (
         act_and_mul_triton,
     )
@@ -194,15 +195,15 @@ def test_correctness(
 
     # Thresholds (FP8 e4m3 has coarse steps — max step is 32 at large values)
     assert fp8_max_diff <= 32.0, f"FP8 output max diff vs ref too large: {fp8_max_diff}"
-    assert scale_rel_diff < 0.02, (
-        f"Scale relative diff vs ref too large: {scale_rel_diff}"
-    )
-    assert fp8_max_diff_baseline <= 32.0, (
-        f"FP8 output max diff vs baseline too large: {fp8_max_diff_baseline}"
-    )
-    assert scale_rel_diff_baseline < 0.02, (
-        f"Scale relative diff vs baseline too large: {scale_rel_diff_baseline}"
-    )
+    assert (
+        scale_rel_diff < 0.02
+    ), f"Scale relative diff vs ref too large: {scale_rel_diff}"
+    assert (
+        fp8_max_diff_baseline <= 32.0
+    ), f"FP8 output max diff vs baseline too large: {fp8_max_diff_baseline}"
+    assert (
+        scale_rel_diff_baseline < 0.02
+    ), f"Scale relative diff vs baseline too large: {scale_rel_diff_baseline}"
     print("  ✅ PASSED\n")
 
 
@@ -227,6 +228,7 @@ def benchmark(
     sys.path.insert(0, "/sgl-workspace/sglang/python")
 
     from sgl_kernel import sgl_act_mul_blockwise_quant, sgl_per_token_group_quant_8bit
+
     from sglang.kernels.ops.moe.fused_moe_triton_kernels import (
         act_and_mul_triton,
     )

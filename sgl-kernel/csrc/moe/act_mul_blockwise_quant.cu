@@ -24,16 +24,16 @@ using namespace act_mul_quant;
 
 template <bool kHasSwiGLULimit>
 __global__ void sgl_act_mul_blockwise_quant_kernel(
-    __nv_fp8_e4m3* __restrict__ output,        // [num_total_tokens, hidden_dim]
-    float* __restrict__ output_scale,           // [num_total_tokens, num_groups]
-    const __nv_bfloat16* __restrict__ input,    // [num_total_tokens, 2 * hidden_dim]
-    const int32_t* __restrict__ expert_ids,     // [num_blocks], -1 = skip
-    int expert_step,                            // rows per block (power of 2)
+    __nv_fp8_e4m3* __restrict__ output,       // [num_total_tokens, hidden_dim]
+    float* __restrict__ output_scale,         // [num_total_tokens, num_groups]
+    const __nv_bfloat16* __restrict__ input,  // [num_total_tokens, 2 * hidden_dim]
+    const int32_t* __restrict__ expert_ids,   // [num_blocks], -1 = skip
+    int expert_step,                          // rows per block (power of 2)
     int num_total_tokens,
-    int hidden_dim,                             // C (half of input width)
-    int num_groups,                             // hidden_dim / 128
-    int num_block_col,                          // grid partitioning
-    int num_block_row,                          // grid partitioning
+    int hidden_dim,     // C (half of input width)
+    int num_groups,     // hidden_dim / 128
+    int num_block_col,  // grid partitioning
+    int num_block_row,  // grid partitioning
     float swiglu_limit) {
   // 2D grid decomposition: Y = row blocks, X = column blocks
   int block_linear_id = blockIdx.x;
@@ -47,8 +47,7 @@ __global__ void sgl_act_mul_blockwise_quant_kernel(
   constexpr int kRows = 4;
 
 #pragma unroll 1
-  for (int irow0 = iblocky * kRows; irow0 < num_total_tokens;
-       irow0 += num_block_row * kRows) {
+  for (int irow0 = iblocky * kRows; irow0 < num_total_tokens; irow0 += num_block_row * kRows) {
 #pragma unroll
     for (int r = 0; r < kRows; ++r) {
       int irow = irow0 + r;
@@ -151,12 +150,10 @@ void sgl_act_mul_blockwise_quant(
   const int hidden_dim = input.size(1) / 2;
   const int num_groups = hidden_dim / kGroupSize;
 
-  TORCH_CHECK(hidden_dim % kGroupSize == 0,
-              "hidden_dim must be divisible by group_size (128)");
-  TORCH_CHECK(output.size(0) == num_total_tokens && output.size(1) == hidden_dim,
-              "output shape mismatch");
-  TORCH_CHECK(output_scale.size(0) == num_total_tokens && output_scale.size(1) == num_groups,
-              "output_scale shape mismatch");
+  TORCH_CHECK(hidden_dim % kGroupSize == 0, "hidden_dim must be divisible by group_size (128)");
+  TORCH_CHECK(output.size(0) == num_total_tokens && output.size(1) == hidden_dim, "output shape mismatch");
+  TORCH_CHECK(
+      output_scale.size(0) == num_total_tokens && output_scale.size(1) == num_groups, "output_scale shape mismatch");
 
   if (num_total_tokens == 0) return;
 
