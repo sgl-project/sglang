@@ -1011,11 +1011,8 @@ class SchedulerPPMixin:
                 **tensor_dict,
                 **logprob_dict,
             }
-        
-        if (
-            not batch.spec_algorithm.is_none()
-            and result.next_draft_input is not None
-        ):
+
+        if not batch.spec_algorithm.is_none() and result.next_draft_input is not None:
             draft_input = result.next_draft_input
             if draft_input.topk_p is not None:
                 tensor_dict["draft_topk_p"] = draft_input.topk_p
@@ -1024,9 +1021,7 @@ class SchedulerPPMixin:
             if draft_input.hidden_states is not None:
                 tensor_dict["draft_hidden_states"] = draft_input.hidden_states
             if draft_input.dsa_topk_indices is not None:
-                tensor_dict["draft_dsa_topk_indices"] = (
-                    draft_input.dsa_topk_indices
-                )
+                tensor_dict["draft_dsa_topk_indices"] = draft_input.dsa_topk_indices
 
         return tensor_dict
 
@@ -1171,9 +1166,7 @@ class SchedulerPPMixin:
                 topk_p=pp_outputs.tensors.get("draft_topk_p"),
                 topk_index=pp_outputs.tensors.get("draft_topk_index"),
                 hidden_states=pp_outputs.tensors.get("draft_hidden_states"),
-                dsa_topk_indices=pp_outputs.tensors.get(
-                    "draft_dsa_topk_indices"
-                ),
+                dsa_topk_indices=pp_outputs.tensors.get("draft_dsa_topk_indices"),
             )
             batch.spec_info = next_draft_input
 

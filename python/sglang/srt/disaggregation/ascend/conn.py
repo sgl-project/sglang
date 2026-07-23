@@ -5,7 +5,6 @@ from typing import List, Tuple
 import numpy as np
 import numpy.typing as npt
 
-from sglang.srt.distributed import get_pp_group
 from sglang.srt.disaggregation.ascend.transfer_engine import AscendTransferEngine
 from sglang.srt.disaggregation.common.utils import group_concurrent_contiguous
 from sglang.srt.disaggregation.mooncake.conn import (
@@ -14,6 +13,7 @@ from sglang.srt.disaggregation.mooncake.conn import (
     MooncakeKVReceiver,
     MooncakeKVSender,
 )
+from sglang.srt.distributed import get_pp_group
 from sglang.srt.utils.network import get_local_ip_auto
 
 logger = logging.getLogger(__name__)
@@ -72,13 +72,14 @@ class AscendKVManager(MooncakeKVManager):
             # draft kv
             if transfer_draft_kv:
                 for i in range(kv_buf_groups):
-                    layer_offset = i * draft_kv_layers + kv_buf_groups*hidden_kv_layers
+                    layer_offset = (
+                        i * draft_kv_layers + kv_buf_groups * hidden_kv_layers
+                    )
                     sliced_dst_kv_ptrs.extend(
-                        dst_kv_ptrs[layer_offset: layer_offset + draft_kv_layers]
+                        dst_kv_ptrs[layer_offset : layer_offset + draft_kv_layers]
                     )
         layers_current_pp_stage = len(src_kv_ptrs)
         return src_kv_ptrs, sliced_dst_kv_ptrs, layers_current_pp_stage
-            
 
     def send_kvcache(
         self,

@@ -37,7 +37,11 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     check_cuda_graph_backend,
 )
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    PPProxyTensors,
+)
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.runner import (
     DecodeCudaGraphRunner,
@@ -307,7 +311,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
     def init_lm_head(self):
         if self.draft_worker.pp_group.is_last_rank:
             embed, head = self.target_worker.model_runner.model.get_embed_and_head()
-            target_lm_head = getattr(self.target_worker.model_runner.model, "lm_head", None)
+            target_lm_head = getattr(
+                self.target_worker.model_runner.model, "lm_head", None
+            )
 
             def maybe_share_target_lm_head():
                 if (
@@ -1121,7 +1127,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 )
 
     def forward_batch_generation(
-        self, batch: ScheduleBatch, on_publish=None, pp_proxy_tensors: Optional[PPProxyTensors] = None
+        self,
+        batch: ScheduleBatch,
+        on_publish=None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ):
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             if self.draft_worker.draft_worker.pp_group.is_last_rank:
@@ -1132,7 +1141,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     else CaptureHiddenMode.FULL
                 )
                 batch_output = self.target_worker.forward_batch_generation(
-                    batch, capture_hidden_mode=target_capture_mode, pp_proxy_tensors=pp_proxy_tensors
+                    batch,
+                    capture_hidden_mode=target_capture_mode,
+                    pp_proxy_tensors=pp_proxy_tensors,
                 )
 
                 # Spec_v2 convention: batch.seq_lens = length BEFORE this iter's tokens.
@@ -1161,7 +1172,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     )
                     return batch_output
             else:
-                return self.target_worker.forward_batch_generation(batch, pp_proxy_tensors=pp_proxy_tensors)
+                return self.target_worker.forward_batch_generation(
+                    batch, pp_proxy_tensors=pp_proxy_tensors
+                )
         else:
             self.activate_step_by_batch(batch.seq_lens.shape[0])
 

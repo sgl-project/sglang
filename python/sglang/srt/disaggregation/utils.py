@@ -943,7 +943,9 @@ def setup_state_kv_args(
                     len(kv_args.kv_data_ptrs) // token_to_kv_pool.layer_num
                 )
                 kv_args.hidden_kv_layers = total_kv_layers
-                kv_args.draft_kv_layers = draft_token_to_kv_pool.layer_num if draft_token_to_kv_pool else 0
+                kv_args.draft_kv_layers = (
+                    draft_token_to_kv_pool.layer_num if draft_token_to_kv_pool else 0
+                )
             else:
                 append_state_component(
                     kv_args, StateType.DSA, data_ptrs, data_lens, item_lens
