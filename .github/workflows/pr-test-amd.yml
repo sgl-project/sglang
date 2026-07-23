@@ -557,6 +557,9 @@ jobs:
       - name: Ensure VRAM is clear
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
+      - name: Probe GPU health
+        run: bash scripts/ci/amd/check_gpu_health.sh
+
       - name: Start CI container
         run: bash scripts/ci/amd/amd_ci_start_container.sh
         env:
@@ -1146,6 +1149,9 @@ jobs:
       - name: Ensure VRAM is clear
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
+      - name: Probe GPU health
+        run: bash scripts/ci/amd/check_gpu_health.sh
+
       - name: Start CI container
         run: bash scripts/ci/amd/amd_ci_start_container.sh
         env:
@@ -1187,6 +1193,9 @@ jobs:
 
       - name: Ensure VRAM is clear
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
+
+      - name: Probe GPU health
+        run: bash scripts/ci/amd/check_gpu_health.sh
 
       - name: Check Host RDMA Environment
         id: rdma_detect
