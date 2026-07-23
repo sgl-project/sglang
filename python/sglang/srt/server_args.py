@@ -3279,6 +3279,7 @@ class ServerArgs:
             "'client'. 'client': connect to existing daemon and load via IPC.",
             choices=["off", "daemon", "client"],
         ),
+        NS("model"),
     ] = "off"
     weight_cache_socket: A[
         Optional[str],
@@ -3286,12 +3287,14 @@ class ServerArgs:
             help="Unix socket path for weight cache daemon (client mode)."
             "If not set, uses /tmp/sglang_weight_cache_rank{global_rank}.sock",
         ),
+        NS("model"),
     ] = None
     weight_cache_timeout: A[
         int,
         Arg(
             help="Timeout in seconds for weight cache daemon readiness (default: 1800).",
         ),
+        NS("model"),
     ] = 1800
 
     # -------------------------------------------------------------------------
