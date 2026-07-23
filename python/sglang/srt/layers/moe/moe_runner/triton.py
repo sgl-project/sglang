@@ -174,10 +174,12 @@ class TritonRunnerCore(MoeRunnerCore):
             no_combine=self.config.no_combine,
             inplace=self.config.inplace,
             apply_router_weight_on_input=self.config.apply_router_weight_on_input,
-            # Dense-compacted mori input already carries routed_scaling_factor in
-            # topk_weights (applied at gather), so the kernel must not re-apply it.
-            # Passing 1.0 lets the topk==1 direct-write reduction guard fire
-            # instead of scaling a never-written intermediate buffer into output.
+            # For int4/compressed-tensors experts routed_scaling_factor is NOT
+            # fused into topk_weights (should_fuse_routed_scaling_factor_in_topk
+            # is False); the model applies it post-experts (see deepseek_v2.py).
+            # So the kernel passes 1.0 -- both to avoid double-scaling and to let
+            # the topk==1 direct-write reduction guard fire instead of scaling a
+            # never-written intermediate buffer into output.
             routed_scaling_factor=(
                 1.0
                 if running_state.get("mori_dense", False)
@@ -379,10 +381,8 @@ def pre_permute_deepep_normal_to_triton(
 
         # Mori normal dispatch delivers a fixed-size buffer with the valid
         # received tokens front-packed at [0, totalRecvTokenNum) and zero
-        # padding after. We keep the full (static) buffer shape and only remap
-        # ids with tensor ops: any data-dependent truncation would change the
-        # shape and break cuda-graph capture/replay on the decode path (which
-        # runs under a graph). topk_ids carry GLOBAL expert ids in
+        # padding after. This runs eager, so we truncate to the valid rows and
+        # remap ids with tensor ops. topk_ids carry GLOBAL expert ids in
         # [0, num_experts); the triton runner's moe_align/kernel index this
         # rank's LOCAL experts, so remap to [0, num_local_experts) and route
         # non-local experts (and padding rows) to -1, the EP filtered-expert id
@@ -399,9 +399,8 @@ def pre_permute_deepep_normal_to_triton(
         # would run moe_align + both GEMMs over the whole fixed dispatch buffer,
         # including the zero-padded tail past the valid front-packed tokens.
         # num_recv_tokens_per_expert is a host python list, so sum() is a
-        # host-side count (no D2H sync). On the eager path (prefill runs eager
-        # here) bound work to the valid rows by truncation; under cuda-graph
-        # capture (decode) shapes must stay static, so keep the full buffer.
+        # host-side count (no D2H sync). Both prefill and decode run eager here,
+        # so bound work to the valid rows by truncation.
         nre = getattr(dispatch_output, "num_recv_tokens_per_expert", None)
         # mori combine reads the expert output back through the same fixed-size
         # dispatch buffer it built src_info against, so it expects hidden with
@@ -409,13 +408,16 @@ def pre_permute_deepep_normal_to_triton(
         # zero-pad the (truncated) kernel output back to that shape before
         # handing it to combine.
         running_state["mori_full_rows"] = int(hidden_states.shape[0])
-        _did_trunc = False
-        if nre is not None and not torch.cuda.is_current_stream_capturing():
-            valid = int(sum(nre))
-            hidden_states = hidden_states[:valid]
-            topk_ids = topk_ids[:valid]
-            topk_weights = topk_weights[:valid]
-            _did_trunc = True
+        # This path runs eager on both prefill and decode: the dense-compaction
+        # below builds a data-dependent shape a HIP graph cannot capture, so the
+        # decode recipe sets --disable-cuda-graph. Assert the invariant instead
+        # of carrying a dead static-shape branch for cuda-graph capture.
+        assert not torch.cuda.is_current_stream_capturing()
+        assert nre is not None
+        valid = int(sum(nre))
+        hidden_states = hidden_states[:valid]
+        topk_ids = topk_ids[:valid]
+        topk_weights = topk_weights[:valid]
 
         local = topk_ids.to(torch.int64) - ep_rank * nle
         topk_ids = torch.where(
@@ -429,22 +431,18 @@ def pre_permute_deepep_normal_to_triton(
         # path (filter_expert=False, identical to EP=1) and the down-GEMM writes
         # each pair's weighted expert output directly to its output row. This
         # avoids the HIP filter_expert reduction path; each pair's output is
-        # scatter-added back per token in post_permute. Only on the truncated
-        # eager path -- cuda-graph capture keeps the static -1 buffer shape.
-        if _did_trunc:
-            valid_mask = topk_ids >= 0
-            pair_rows = valid_mask.nonzero(as_tuple=True)[0]
-            dense_experts = topk_ids[valid_mask].to(torch.int32).view(-1, 1)
-            dense_weights = topk_weights[valid_mask].view(-1, 1)
-            dense_hidden = hidden_states.index_select(0, pair_rows)
-            running_state["mori_dense"] = True
-            running_state["mori_dense_pair_rows"] = pair_rows
-            running_state["mori_dense_out_rows"] = int(hidden_states.shape[0])
-            hidden_states = dense_hidden
-            topk_ids = dense_experts
-            topk_weights = dense_weights
-        else:
-            running_state["mori_dense"] = False
+        # scatter-added back per token in post_permute.
+        valid_mask = topk_ids >= 0
+        pair_rows = valid_mask.nonzero(as_tuple=True)[0]
+        dense_experts = topk_ids[valid_mask].to(torch.int32).view(-1, 1)
+        dense_weights = topk_weights[valid_mask].view(-1, 1)
+        dense_hidden = hidden_states.index_select(0, pair_rows)
+        running_state["mori_dense"] = True
+        running_state["mori_dense_pair_rows"] = pair_rows
+        running_state["mori_dense_out_rows"] = int(hidden_states.shape[0])
+        hidden_states = dense_hidden
+        topk_ids = dense_experts
+        topk_weights = dense_weights
 
         running_state["combine_topk_ids"] = dispatch_output.origin_topk_ids
         running_state["combine_topk_weights"] = dispatch_output.origin_topk_weights
@@ -471,7 +469,6 @@ def pre_permute_deepep_normal_to_triton(
         use_int4_w4a16=quant_info.use_int4_w4a16,
         per_channel_quant=quant_info.per_channel_quant,
         block_shape=quant_info.block_shape,
-        ignore_invalid_expert=is_mori and not running_state.get("mori_dense", False),
     )
 
     running_state["config"] = config
