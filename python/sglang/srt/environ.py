@@ -574,6 +574,8 @@ class Envs:
     # ROCm/AITER path. Requires GPU_MAX_HW_QUEUES>=5 to avoid HW-queue serialization.
     SGLANG_ROCM_USE_MULTI_STREAM = EnvBool(False)
     SGLANG_HACK_FLASHMLA_BACKEND = EnvStr("tilelang")
+    # Route unified_kv DSV4 decode to the FlyDSL v4 bf16 kernel (aiter) on ROCm.
+    SGLANG_USE_FLYDSL_DECODE = EnvBool(False)
 
     # MPS (Apple Silicon)
     SGLANG_USE_MLX = EnvBool(False)
