@@ -153,7 +153,8 @@ class MlxModelRunnerStub(ModelRunner):
 
         Honors ``--max-running-requests``, mirroring the base runner's clamp
         (``model_runner_kv_cache_mixin._resolve_max_num_reqs``): the requested
-        value is split per dp worker and capped by the KV pool capacity. When
+        value is split across attention-DP KV-cache owners and capped by the KV
+        pool capacity. Pure-DP replicas retain the full per-replica limit. When
         the flag is unset, fall back to a capacity-based default.
 
         On hybrid / linear-attention models the concurrency is additionally
@@ -170,7 +171,7 @@ class MlxModelRunnerStub(ModelRunner):
             requested_per_worker = None
             resolved = min(capacity_cap, 4096)
         else:
-            requested_per_worker = requested // self.dp_size
+            requested_per_worker = requested // self.ps.attn_dp_size
             resolved = min(requested_per_worker, capacity_cap)
 
         aux_state_size = self.server_args.max_mamba_cache_size
@@ -193,7 +194,7 @@ class MlxModelRunnerStub(ModelRunner):
         if requested_per_worker is not None and resolved < requested_per_worker:
             logger.warning(
                 "max_running_requests was reduced from the requested %d to %d "
-                "(per dp worker) due to the available KV cache or "
+                "(per attention-DP worker) due to the available KV cache or "
                 "auxiliary-state capacity.",
                 requested_per_worker,
                 resolved,
