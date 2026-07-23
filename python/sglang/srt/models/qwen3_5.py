@@ -38,6 +38,7 @@ from sglang.srt.configs.qwen3_5 import (
 
 # Distributed
 from sglang.srt.distributed import get_pp_group
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.attention.mamba.mamba import mamba_v2_sharded_weight_loader
@@ -718,7 +719,11 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 quant_config=quant_config,
                 alt_stream=(
                     alt_stream
-                    if (_is_cuda or _disable_shared_experts_fusion())
+                    if (
+                        _is_cuda
+                        or _disable_shared_experts_fusion()
+                        or envs.SGLANG_NPU_USE_MULTI_STREAM.get()
+                    )
                     else None
                 ),
                 prefix=add_prefix("mlp", prefix.replace(".linear_attn", "")),
@@ -943,7 +948,11 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 quant_config=quant_config,
                 alt_stream=(
                     alt_stream
-                    if (_is_cuda or _disable_shared_experts_fusion())
+                    if (
+                        _is_cuda
+                        or _disable_shared_experts_fusion()
+                        or envs.SGLANG_NPU_USE_MULTI_STREAM.get()
+                    )
                     else None
                 ),
                 prefix=add_prefix("mlp", prefix.replace(".self_attn", "")),
@@ -1340,7 +1349,11 @@ class Qwen3_5ForCausalLM(nn.Module):
         if _is_hip:
             self._maybe_autodisable_shared_experts_fusion(config, quant_config)
 
-        alt_stream = get_stream("alt") if _is_cuda or _hip_use_alt_stream else None
+        alt_stream = (
+            get_stream("alt")
+            if _is_cuda or _hip_use_alt_stream or envs.SGLANG_NPU_USE_MULTI_STREAM.get()
+            else None
+        )
 
         # Embedding layer
         if self.pp_group.is_first_rank:
