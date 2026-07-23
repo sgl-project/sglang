@@ -1,3 +1,4 @@
+import asyncio
 from typing import Optional
 
 import torch
@@ -95,17 +96,32 @@ class TransformersAutoMultimodalProcessor(BaseMultimodalProcessor):
         )
         return mrope_positions.squeeze(1), mrope_position_delta
 
-    def _load_images(self, image_data) -> list:
-        """Download / decode images from URLs, file paths, or base64."""
+    async def _load_images(self, image_data) -> list:
+        """Download / decode images from URLs, file paths, or base64.
+
+        Each ``load_image`` call performs blocking I/O (HTTP fetch, file
+        read, base64 decode) plus a synchronous PIL decode, so running
+        them on the event-loop thread stalls every concurrent request
+        for the duration. Offload each item to a worker thread and
+        ``asyncio.gather`` the results so multi-image requests load in
+        parallel without blocking the event loop. Mirrors the unblock
+        pattern landed for ``base_processor.load_mm_data`` in
+        sgl-project/sglang#24751.
+        """
         if not image_data:
             return []
-        images = []
-        for data in image_data:
+
+        def _load_one(data):
             img, _ = load_image(data)
             if img.mode != "RGB":
                 img = img.convert("RGB")
-            images.append(img)
-        return images
+            return img
+
+        return list(
+            await asyncio.gather(
+                *(asyncio.to_thread(_load_one, data) for data in image_data)
+            )
+        )
 
     def _apply_hf_processor(self, text: str, images=None, videos=None):
         """Run the HF processor on text + media and return the full output.
@@ -154,7 +170,7 @@ class TransformersAutoMultimodalProcessor(BaseMultimodalProcessor):
             video_data = [video_data]
 
         # Load raw media
-        images = self._load_images(image_data)
+        images = await self._load_images(image_data)
         # TODO: video / audio loading when needed
 
         # Apply HF processor — handles token expansion internally
