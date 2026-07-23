@@ -148,37 +148,28 @@ class SWAComponent(TreeComponent):
         value_chunks: list[torch.Tensor],
         best_value_len: int,
     ) -> MatchResult:
-        swa_host_hit = self.prepare_swa_load_back(result.best_match_node)
+        ct = self.component_type
+        n_swa = 0
+        swa_host_hit = 0
+        node = result.best_match_node
+        root = self.cache.root_node
+        while node is not root and n_swa < self.sliding_window_size:
+            cd = node.component_data[ct]
+            if cd.value is not None:
+                n_swa += len(cd.value)
+            elif cd.host_value is not None:
+                swa_host_hit += min(
+                    len(cd.host_value), self.sliding_window_size - n_swa
+                )
+                n_swa += len(cd.host_value)
+            else:
+                break
+            node = node.parent
         if swa_host_hit > 0:
             return result._replace(
                 swa_host_hit_length=max(result.swa_host_hit_length, swa_host_hit)
             )
         return result
-
-    def prepare_swa_load_back(self, node: UnifiedTreeNode) -> int:
-        ct = self.component_type
-        page_size = self.cache.page_size
-        window_size = (
-            (self.sliding_window_size + page_size - 1) // page_size * page_size
-        )
-        covered = 0
-        host_tokens = 0
-        cur = node
-        while cur is not self.cache.root_node and covered < window_size:
-            cd = cur.component_data[ct]
-            value = cd.value if cd.value is not None else cd.host_value
-            if value is None:
-                break
-            remaining = window_size - covered
-            if len(value) > remaining:
-                self.cache._split_node(cur.key, cur, len(cur.key) - remaining)
-                cd = cur.component_data[ct]
-                value = cd.value if cd.value is not None else cd.host_value
-            covered += len(value)
-            if cd.value is None:
-                host_tokens += len(value)
-            cur = cur.parent
-        return host_tokens
 
     def update_component_on_insert_overlap(
         self,
@@ -649,9 +640,19 @@ class SWAComponent(TreeComponent):
             backed_up: list[torch.Tensor] = []
             nodes: list = []
             cur = node
-            while cur is not self.cache.root_node and n_swa < self.sliding_window_size:
+            swa_window_size = (
+                (self.sliding_window_size + self.cache.page_size - 1)
+                // self.cache.page_size
+                * self.cache.page_size
+            )
+            while cur is not self.cache.root_node and n_swa < swa_window_size:
                 cd = cur.component_data[ct]
                 assert cd.host_value is not None or cd.value is not None
+                value = cd.value if cd.value is not None else cd.host_value
+                remaining = swa_window_size - n_swa
+                if len(value) > remaining:
+                    self.cache._split_node(cur.key, cur, len(cur.key) - remaining)
+                    cd = cur.component_data[ct]
                 if cd.value is not None:
                     # device exists, skip it
                     n_swa += len(cd.value)
@@ -667,12 +668,6 @@ class SWAComponent(TreeComponent):
 
             backed_up.reverse()
             nodes.reverse()
-
-            assert n_swa <= (
-                (self.sliding_window_size + self.cache.page_size - 1)
-                // self.cache.page_size
-                * self.cache.page_size
-            )
 
             return [
                 PoolTransfer(

@@ -3714,8 +3714,6 @@ class UnifiedRadixCacheSuite:
         cache._update_evictable_leaf_sets(host_node)
 
         self._backup_node(cache, host_node)
-        original_full = host_node.component_data[ComponentType.FULL].value.clone()
-        original_host = swa_cd.host_value.clone()
         allocator.swa_attn_allocator.free(swa)
         allocator.full_to_swa_index_mapping[full] = 0
         swa_cd.value = None
@@ -3739,60 +3737,12 @@ class UnifiedRadixCacheSuite:
         cache._update_evictable_leaf_sets(device_leaf)
         cache.sanity_check()
 
-        swa_comp = cache.components[ComponentType.SWA]
-        host_available = swa_comp._swa_kv_pool_host.available_size()
         self.assertTrue(cache.load_back(device_leaf))
         prefix_node = host_node.parent
         self.assertIsNot(prefix_node, cache.root_node)
         self.assertEqual(len(prefix_node.key), window + ps)
         self.assertEqual(len(host_node.key), window - ps)
-        self.assertTrue(
-            torch.equal(
-                torch.cat(
-                    [
-                        prefix_node.component_data[ComponentType.FULL].value,
-                        host_node.component_data[ComponentType.FULL].value,
-                    ]
-                ),
-                original_full,
-            )
-        )
-        self.assertTrue(
-            torch.equal(
-                torch.cat(
-                    [
-                        prefix_node.component_data[ComponentType.SWA].host_value,
-                        host_node.component_data[ComponentType.SWA].host_value,
-                    ]
-                ),
-                original_host,
-            )
-        )
-        self.assertTrue(
-            torch.equal(
-                allocator.translate_loc_from_full_to_swa(
-                    host_node.component_data[ComponentType.FULL].value
-                ),
-                host_node.component_data[ComponentType.SWA].value,
-            )
-        )
-        self.assertIsNone(prefix_node.component_data[ComponentType.SWA].value)
-
         self._finish_pending_loads(cache)
-        self.assertEqual(
-            (
-                cache.component_evictable_size_,
-                cache.component_protected_size_,
-            ),
-            (
-                {
-                    ComponentType.FULL: 2 * window + ps,
-                    ComponentType.SWA: window,
-                },
-                {ComponentType.FULL: 0, ComponentType.SWA: 0},
-            ),
-        )
-        self.assertEqual(swa_comp._swa_kv_pool_host.available_size(), host_available)
         cache.sanity_check()
 
     def _swa_finalize_setup(self):

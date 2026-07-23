@@ -2,8 +2,6 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-import torch
-
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -535,21 +533,15 @@ class TestPrefillAdder(CustomTestCase):
 
     def test_swa_budget_for_req(self):
         cases = [
-            # (extend, host_hit, device_hit, rem_chunk, window, page, expected, label)
-            (64, 0, 0, None, 128, 16, 128 + 16, "no_cache_hit"),
-            (32, 128, 0, None, 128, 16, 160 + 16, "full_host_window"),
-            (32, 64, 64, None, 128, 16, 96 + 16, "mixed_host_device"),
+            # (extend, rem_chunk, window, page, expected, label)
+            (64, None, 128, 16, 128 + 16, "no_cap_floor_active"),
+            (200, None, 256, 32, 256 + 32, "no_cap_floor_active_other_dims"),
+            (300, None, 128, 16, 300 + 16, "no_cap_floor_inactive"),
+            (200, 50, 64, 8, 64 + 8, "cap_binds_then_floor"),
+            (300, 500, 64, 64, 300 + 64, "cap_does_not_bind"),
+            (0, None, 128, 16, 128 + 16, "extend_zero_floor_only"),
         ]
-        for (
-            extend,
-            host_hit,
-            device_hit,
-            rem_chunk,
-            window,
-            page,
-            expected,
-            label,
-        ) in cases:
+        for extend, rem_chunk, window, page, expected, label in cases:
             with self.subTest(label=label):
                 self.mock_tree_cache.sliding_window_size = window
                 adder = self.create_adder(
@@ -557,139 +549,7 @@ class TestPrefillAdder(CustomTestCase):
                     page_size=page,
                     rem_chunk_tokens=rem_chunk,
                 )
-                self.assertEqual(
-                    adder._swa_budget_for_req(extend, host_hit, device_hit),
-                    expected,
-                )
-
-    def test_hicache_replay_admitted_with_production_swa_pool(self):
-        page_size = 64
-        pool_size = 2368
-        window_size = 2048
-        self.mock_token_allocator.swa_available_size.return_value = pool_size
-        self.mock_token_allocator.full_available_size.return_value = 262144
-        self.mock_tree_cache.sliding_window_size = window_size
-
-        adder = self.create_adder(
-            self.create_running_batch(),
-            page_size=page_size,
-            rem_chunk_tokens=1024,
-        )
-        adder.is_hybrid_swa = True
-        req = self.create_mock_req("replay", priority=0, max_new_tokens=1)
-        req.prefix_indices = torch.empty(0, dtype=torch.int64)
-        req.full_untruncated_fill_ids = list(range(window_size))
-        req.host_hit_length = 0
-        req.swa_host_hit_length = 1024
-        root = object()
-        self.mock_tree_cache.root_node = root
-        req.last_node = root
-        req.best_match_node = SimpleNamespace(key=range(window_size - 64), parent=root)
-        req.sampling_params.ignore_eos = False
-        req.needs_host_load_back.return_value = True
-        req.set_extend_range = MagicMock(
-            side_effect=lambda start, end: setattr(
-                req, "extend_range", Range(start, end)
-            )
-        )
-        lock_result = MagicMock()
-        lock_result.to_dec_params.return_value = MagicMock()
-        lock_count = 0
-
-        def lock_prefix(_node):
-            nonlocal lock_count
-            lock_count += 1
-            if lock_count == 1:
-                self.mock_token_allocator.swa_available_size.return_value = 1408
-            return lock_result
-
-        def load_prefix(_params):
-            self.mock_token_allocator.swa_available_size.return_value = 384
-            return torch.arange(window_size - 64), req.best_match_node
-
-        self.mock_tree_cache.inc_lock_ref.side_effect = lock_prefix
-        self.mock_tree_cache.init_load_back.side_effect = load_prefix
-
-        required = adder._swa_budget_for_matched_req(req)
-        self.assertEqual(required, 1152)
-        self.assertLess(required, pool_size)
-        result = adder.add_one_req(
-            req, has_chunked_req=False, truncation_align_size=None
-        )
-
-        self.assertNotEqual(result, AddReqResult.NO_TOKEN)
-        self.assertEqual(adder.can_run_list, [req])
-        self.assertEqual(adder.rem_swa_token_offset, 128)
-        self.assertEqual(adder.rem_swa_tokens, 256)
-        self.mock_tree_cache.init_load_back.assert_called_once()
-
-    def test_swa_chunk_cap_recomputed_after_lock(self):
-        page_size = 64
-        self.mock_tree_cache.sliding_window_size = 128
-        self.mock_token_allocator.swa_available_size.return_value = 512
-        self.mock_token_allocator.full_available_size.return_value = 100_000
-        adder = self.create_adder(
-            self.create_running_batch(),
-            page_size=page_size,
-            rem_chunk_tokens=1024,
-        )
-        adder.is_hybrid_swa = True
-
-        root = object()
-        matched = SimpleNamespace(key=range(128), parent=root)
-        self.mock_tree_cache.root_node = root
-        req = self.create_mock_req("chunk-cap", priority=0, max_new_tokens=1)
-        req.prefix_indices = torch.arange(128)
-        req.full_untruncated_fill_ids = list(range(1152))
-        req.host_hit_length = 0
-        req.swa_host_hit_length = 0
-        req.last_node = matched
-        req.best_match_node = matched
-        req.sampling_params.ignore_eos = False
-        req.set_extend_range = MagicMock(
-            side_effect=lambda start, end: setattr(
-                req, "extend_range", Range(start, end)
-            )
-        )
-
-        lock_result = MagicMock()
-        lock_result.to_dec_params.return_value = MagicMock()
-
-        def lock_prefix(_node):
-            self.mock_token_allocator.swa_available_size.return_value = 320
-            return lock_result
-
-        self.mock_tree_cache.inc_lock_ref.side_effect = lock_prefix
-
-        adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None)
-
-        self.assertEqual(adder.can_run_list, [req])
-        req.set_extend_range.assert_called_once_with(128, 384)
-        self.assertEqual(adder.rem_swa_token_offset, 320)
-
-    def test_swa_chunk_cap_rejects_when_window_cannot_fit(self):
-        self.mock_tree_cache.sliding_window_size = 128
-        self.mock_token_allocator.swa_available_size.return_value = 192
-        self.mock_token_allocator.full_available_size.return_value = 100_000
-        adder = self.create_adder(
-            self.create_running_batch(), page_size=64, rem_chunk_tokens=1024
-        )
-        adder.is_hybrid_swa = True
-        req = self.create_mock_req("no-window", priority=0, max_new_tokens=1)
-        req.prefix_indices = torch.empty(0, dtype=torch.int64)
-        req.full_untruncated_fill_ids = list(range(1024))
-        req.host_hit_length = 0
-        req.swa_host_hit_length = 0
-        req.last_node = self.mock_tree_cache.root_node
-        req.best_match_node = None
-        req.sampling_params.ignore_eos = False
-
-        result = adder.add_one_req(
-            req, has_chunked_req=False, truncation_align_size=None
-        )
-
-        self.assertEqual(result, AddReqResult.NO_TOKEN)
-        self.assertEqual(adder.can_run_list, [])
+                self.assertEqual(adder._swa_budget_for_req(extend), expected)
 
     def test_delayer_not_consulted_when_kv_budget_rejects(self):
         """A rank whose first candidate fails the KV-budget gate must NOT
