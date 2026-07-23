@@ -294,6 +294,7 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
 
     def test_pop_preallocated_rechecks_budget_after_lock(self):
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.pp_size = 1
 
         req = MagicMock()
         req.rid = "req-1"
