@@ -238,25 +238,26 @@ def _is_complete_json(input_str: str) -> bool:
 _safe_ast_lock = threading.Lock()
 
 
-def _run_ast_strict(fn, *args):
-    """Run an ``ast`` function with invalid-escape warnings promoted to errors.
+def _run_ast_quiet(fn, *args):
+    """Run an ``ast`` function with invalid-escape warnings suppressed.
+
+    CPython parses invalid escapes (e.g. ``"\\d+"``) with the backslash kept
+    and only emits a warning, so the parsed value is already correct —
+    promoting the warning to an error would drop otherwise-valid tool calls.
 
     Holds ``_safe_ast_lock`` because ``catch_warnings`` touches global state."""
     with _safe_ast_lock, warnings.catch_warnings():
-        warnings.filterwarnings("error", category=SyntaxWarning)
-        warnings.filterwarnings("error", category=DeprecationWarning)
-        try:
-            return fn(*args)
-        except (SyntaxWarning, DeprecationWarning) as e:
-            raise SyntaxError(str(e)) from e
+        warnings.filterwarnings("ignore", category=SyntaxWarning)
+        warnings.filterwarnings("ignore", category=DeprecationWarning)
+        return fn(*args)
 
 
 def safe_literal_eval(value: str) -> Any:
-    return _run_ast_strict(ast.literal_eval, value)
+    return _run_ast_quiet(ast.literal_eval, value)
 
 
 def safe_ast_parse(source: str) -> ast.Module:
-    return _run_ast_strict(ast.parse, source)
+    return _run_ast_quiet(ast.parse, source)
 
 
 def _get_tool_schema_defs(tools: List[Tool]) -> dict:
