@@ -138,10 +138,10 @@ export const QwenImageDeployment = () => {
     if (values.hardware === 'ascend3') targetTabName = 'Ascend A3';
 
     const allTabs = document.querySelectorAll('button, [role="tab"]');
-    
+
     allTabs.forEach((tab) => {
       const text = tab.textContent.trim();
-      
+
       if (text === targetTabName && tab.getAttribute('aria-selected') !== 'true') {
         tab.click();
       }

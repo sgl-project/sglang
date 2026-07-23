@@ -34,10 +34,10 @@
         },
         bestPractice: {
           name: 'bestPractice',
-          title: 'Sequence Parallelism',
+          title: 'Optimization',
           items: [
             { id: 'off', label: 'Standard', default: true },
-            { id: 'on', label: 'Best Practice (4 GPUs)', default: false },
+            { id: 'on', label: 'Best Practice', default: false },
           ],
         },
       };
@@ -89,14 +89,14 @@
 
       useEffect(() => {
         const isAscend = values.hardware === 'ascend2' || values.hardware === 'ascend3';
-        
+
         const targetTabName = isAscend ? 'Ascend A3' : 'NVIDIA B200';
 
         const allTabs = document.querySelectorAll('button, [role="tab"]');
-        
+
         allTabs.forEach((tab) => {
           const text = tab.textContent.trim();
-          
+
           if (text === targetTabName && tab.getAttribute('aria-selected') !== 'true') {
             tab.click();
           }
@@ -135,16 +135,22 @@
           return '# Error: Invalid configuration';
         }
 
-    
+
         if (hardware === 'ascend2' || hardware === 'ascend3') {
           const numGpus = bestPractice === 'on' ? 4 : 2;
 
           if (task === 't2v') {
-            return `sglang serve \\
-  --model-path /home/weights/Wan2.2-T2V-A14B-Diffusers/ \\
+            const hardConfig = bestPractice === 'on'
+              ? `SGLANG_CACHE_DIT_FN=2 SGLANG_CACHE_DIT_BN=1 SGLANG_CACHE_DIT_WARMUP=4 SGLANG_CACHE_DIT_RDT=0.4 SGLANG_CACHE_DIT_MC=4 SGLANG_CACHE_DIT_TAYLORSEER=true SGLANG_CACHE_DIT_TS_ORDER=2 SGLANG_CACHE_DIT_ENABLED=true `
+              : '';
+
+            return `${hardConfig}ASCEND_RT_VISIBLE_DEVICES=8,9,10,11,12,13,14,15 sglang serve \\
+  --model-path /models/Wan-AI/Wan2.2-T2V-A14B-Diffusers/ \\
   --tp-size 2 \\
-  --sp-degree 2 \\
-  --num-gpus ${numGpus}`;
+  --sp-degree 4 \\
+  --num-gpus 8 \\
+  --port 30006 \\
+  --attention-backend laser_attn`;
           }
 
           if (task === 'i2v') {
