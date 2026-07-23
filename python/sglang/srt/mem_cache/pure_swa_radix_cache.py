@@ -102,6 +102,15 @@ class PureSWARadixCache(RadixCache):
 
         if swa_evict_floor > 0:
             insert_end = min(swa_evict_floor, keys_len)
+        elif swa_evicted_seqlen > old_prefix_len:
+            # Non-prefill-aware SWA (swa_evict_floor == 0): decode's
+            # free_swa_out_of_window_slots already freed the out-of-window range
+            # [old_prefix_len, swa_evicted_seqlen). Only [0, old_prefix_len) is
+            # still a live, contiguous prefix -- inserting past it re-adds freed
+            # slots, which a later match_prefix would hand out as a "cache hit"
+            # (stale KV, since the allocator has recycled those slots) and which
+            # evict() would then free a second time (double-free of the pool).
+            insert_end = min(old_prefix_len, keys_len)
         else:
             insert_end = keys_len
 
@@ -119,9 +128,16 @@ class PureSWARadixCache(RadixCache):
             if alive_start < keys_len:
                 self.token_to_kv_pool_allocator.free(kv_indices[alive_start:keys_len])
         else:
-            free_end = (
-                min(swa_evict_floor, keys_len) if swa_evict_floor > 0 else keys_len
-            )
+            if swa_evict_floor > 0:
+                free_end = min(swa_evict_floor, keys_len)
+            elif swa_evicted_seqlen > old_prefix_len:
+                # Same freed-hole boundary as the insert path: [old_prefix_len,
+                # swa_evicted_seqlen) was already freed during decode, so freeing
+                # up to keys_len here would double-free that range (and the
+                # still-alive tail, freed again below).
+                free_end = min(old_prefix_len, keys_len)
+            else:
+                free_end = keys_len
             if free_end > old_prefix_len:
                 self.token_to_kv_pool_allocator.free(
                     kv_indices[old_prefix_len:free_end]
