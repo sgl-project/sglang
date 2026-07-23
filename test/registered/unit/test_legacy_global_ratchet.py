@@ -31,7 +31,7 @@ _RATCHETS = [
     (
         "set_global_server_args_for_*",
         r"\bset_global_server_args_for_(?:scheduler|tokenizer)\s*\(",
-        4,
+        5,
     ),
 ]
 
