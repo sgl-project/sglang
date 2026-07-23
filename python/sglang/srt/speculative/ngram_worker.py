@@ -3,7 +3,16 @@ from typing import List, Optional
 
 import numpy as np
 import torch
-from sgl_kernel.speculative import reconstruct_indices_from_tree_mask
+
+from sglang.srt.utils import is_npu
+
+ _is_npu = is_npu()
+ if not _is_npu:
+     from sgl_kernel.speculative import reconstruct_indices_from_tree_mask
+ else:
+    from sgl_kernel_npu.speculative import (
+        reconstruct_indices_from_tree_mask_triton as reconstruct_indices_from_tree_mask,
+    )
 
 from sglang.kernels.ops.speculative.cache_locs import (
     assign_extend_cache_locs_func as assign_extend_cache_locs_func,
