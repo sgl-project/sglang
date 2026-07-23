@@ -2,16 +2,10 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.test.ci.ci_register import (
-    register_amd_ci,
-    register_cpu_ci,
-    register_cuda_ci,
-)
+from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=2, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=2, suite="stage-b-test-1-gpu-small-amd")
-register_cpu_ci(est_time=2, suite="base-c-test-cpu")
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 def _req(output_len: int, input_len: int = 8, priority=None):
