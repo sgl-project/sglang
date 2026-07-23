@@ -538,7 +538,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 "swa_page_table",
                 bs,
             )
-            if self.expand_encoder_only_verify and not metadata.is_ragged_verify:
+            if self._needs_encoder_only_expand(forward_mode, metadata):
                 verify_rows = bs * metadata.max_seq_len_q
                 # Static per-capture row map (expanded row i -> request i // L);
                 # the recorded refresh in _apply_cuda_graph_metadata uses it.
@@ -575,6 +575,18 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             metadata.swa_out_cache_loc = self.cuda_graph_swa_out_cache_loc[:num_tokens]
 
         return metadata
+
+    def _needs_encoder_only_expand(
+        self, forward_mode: ForwardMode, metadata: TRTLLMMHAMetadata
+    ) -> bool:
+        # Single gate for preparing the expanded ENCODER_ONLY verify metadata
+        # (TRTLLMMHAMetadata.encoder_*); the per-layer forward path consumes it
+        # only for layers whose attn_type is ENCODER_ONLY.
+        return (
+            self.expand_encoder_only_verify
+            and forward_mode.is_target_verify()
+            and not metadata.is_ragged_verify
+        )
 
     def _apply_cuda_graph_metadata(
         self,
@@ -670,11 +682,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             q_mode=q_mode,
         )
 
-        if (
-            self.expand_encoder_only_verify
-            and forward_mode.is_target_verify()
-            and metadata.encoder_row_map is not None
-        ):
+        if self._needs_encoder_only_expand(forward_mode, metadata):
             # Recorded into the graph: refresh the expanded rows from the
             # freshly rebuilt base metadata.
             metadata.encoder_cache_seqlens.copy_(
@@ -930,11 +938,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             metadata, forward_batch.req_pool_indices, metadata.cache_seqlens_int32
         )
 
-        if (
-            self.expand_encoder_only_verify
-            and forward_batch.forward_mode.is_target_verify()
-            and not metadata.is_ragged_verify
-        ):
+        if self._needs_encoder_only_expand(forward_batch.forward_mode, metadata):
             row_map = (
                 torch.arange(batch_size * metadata.max_seq_len_q, device=device)
                 // metadata.max_seq_len_q
