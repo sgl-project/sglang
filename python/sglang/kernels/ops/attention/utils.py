@@ -2,7 +2,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.jit_kernel.utils import is_arch_support_pdl
+from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.kernels.ops.attention.pad import (
     pad_sequence_with_mask as pad_sequence_with_mask,
 )
@@ -20,6 +20,12 @@ from sglang.kernels.ops.kvcache.cache_ops import (
 )
 from sglang.kernels.ops.kvcache.cache_ops import (
     concat_and_cast_mha_k_triton as concat_and_cast_mha_k_triton,
+)
+from sglang.kernels.ops.kvcache.cache_ops import (
+    concat_and_cast_q_fp8_pad as concat_and_cast_q_fp8_pad,
+)
+from sglang.kernels.ops.kvcache.cache_ops import (
+    concat_and_cast_q_fp8_pad_kernel as concat_and_cast_q_fp8_pad_kernel,
 )
 from sglang.kernels.ops.kvcache.cache_ops import (
     launch_reshape_and_cache_flash as launch_reshape_and_cache_flash,
@@ -47,7 +53,7 @@ from sglang.srt.utils import is_cuda
 _is_cuda = is_cuda()
 
 if _is_cuda:
-    from sglang.jit_kernel.concat_mla import concat_mla_absorb_q
+    from sglang.kernels.ops.attention.concat_mla import concat_mla_absorb_q
 
 
 # When num_kv_heads=1, we have tensors with degenerate strides,

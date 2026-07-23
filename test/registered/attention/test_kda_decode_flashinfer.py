@@ -10,11 +10,11 @@ import torch
 
 from sglang.test.ci.ci_register import register_cuda_ci
 
-# SM100 single-GPU kernel-unit suite, same slot as the CuteDSL KDA prefill test.
+# SM100 suite, same slot as the CuteDSL KDA prefill test.
 # Disabled in public CI until the B200 runner image ships recurrent_kda.
 register_cuda_ci(
     est_time=60,
-    stage="base-b-kernel-unit",
+    stage="base-b",
     runner_config="4-gpu-b200",
     disabled="recurrent_kda (SM100 KDA decode) not guaranteed in public CI FlashInfer build",
 )
