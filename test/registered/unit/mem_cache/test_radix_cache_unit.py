@@ -76,21 +76,28 @@ class TestKVCacheEventQueue(unittest.TestCase):
             medium=medium,
         )
 
-    def test_enqueue_coalesces_compatible_stores_and_removes(self):
+    def test_enqueue_coalesces_compatible_stores(self):
         queue = _KVCacheEventQueue()
         queue._enqueue_kv_event(self._store(1, None))
         queue._enqueue_kv_event(self._store(2, 1))
+
+        events = queue.take_events()
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].block_hashes, [1, 2])
+        self.assertEqual(events[0].parent_block_hash, None)
+        self.assertEqual(events[0].token_ids, [1, 2, 2, 3])
+
+    def test_enqueue_coalesces_compatible_removes(self):
+        queue = _KVCacheEventQueue()
         queue._enqueue_kv_event(BlockRemoved(block_hashes=[1], medium=StorageMedium.GPU))
         queue._enqueue_kv_event(
             BlockRemoved(block_hashes=[2, 3], medium=StorageMedium.GPU)
         )
 
         events = queue.take_events()
-        self.assertEqual(len(events), 2)
-        self.assertEqual(events[0].block_hashes, [1, 2])
-        self.assertEqual(events[0].parent_block_hash, None)
-        self.assertEqual(events[0].token_ids, [1, 2, 2, 3])
-        self.assertEqual(events[1].block_hashes, [1, 2, 3])
+        self.assertEqual(len(events), 1)
+        self.assertIsInstance(events[0], BlockRemoved)
+        self.assertEqual(events[0].block_hashes, [1, 2, 3])
 
     def test_enqueue_preserves_fusion_boundaries(self):
         incompatible_stores = [
