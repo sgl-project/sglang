@@ -3,8 +3,10 @@ import sys
 import pytest
 import torch
 
-from sglang.jit_kernel.mla_kv_pack_quantize_fp8 import mla_kv_pack_quantize_fp8
-from sglang.jit_kernel.utils import get_ci_test_range
+from sglang.kernels.jit.utils import get_ci_test_range
+from sglang.kernels.ops.attention.mla_kv_pack_quantize_fp8 import (
+    mla_kv_pack_quantize_fp8,
+)
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-large")

@@ -54,10 +54,10 @@ def fused_experts_none_to_experimental_sgl_trtllm_fp8_lora_two_stream(
     # ---- two-stream fast path ----
     from flashinfer.fused_moe import Fp8QuantizationType
 
-    from sglang.jit_kernel.trtllm_lora_temp import (
+    from sglang.kernels.ops.moe.trtllm_lora_temp import (
         trtllm_fp8_block_scale_routed_moe_lora,
     )
-    from sglang.jit_kernel.trtllm_lora_temp.topk_pack import fused_pack_topk
+    from sglang.kernels.ops.moe.trtllm_lora_temp.topk_pack import fused_pack_topk
     from sglang.kernels.ops.moe.trtllm_lora_temp.virtual_experts import (
         merged_experts_fused_moe_lora_add,
     )
@@ -358,10 +358,10 @@ def fused_experts_none_to_experimental_sgl_trtllm_fp4_lora_two_stream(
         )
 
     # ---- two-stream fast path ----
-    from sglang.jit_kernel.trtllm_lora_temp import (
+    from sglang.kernels.ops.moe.trtllm_lora_temp import (
         trtllm_fp4_block_scale_routed_moe_lora,
     )
-    from sglang.jit_kernel.trtllm_lora_temp.topk_pack import fused_pack_topk
+    from sglang.kernels.ops.moe.trtllm_lora_temp.topk_pack import fused_pack_topk
     from sglang.kernels.ops.moe.trtllm_lora_temp.virtual_experts import (
         merged_experts_fused_moe_lora_add,
     )
@@ -606,8 +606,8 @@ def fused_experts_none_to_experimental_sgl_trtllm_bf16_lora_two_stream(
         )
 
     # ---- two-stream fast path ----
-    from sglang.jit_kernel.trtllm_lora_temp import trtllm_bf16_routed_moe_lora
-    from sglang.jit_kernel.trtllm_lora_temp.topk_pack import fused_pack_topk
+    from sglang.kernels.ops.moe.trtllm_lora_temp import trtllm_bf16_routed_moe_lora
+    from sglang.kernels.ops.moe.trtllm_lora_temp.topk_pack import fused_pack_topk
     from sglang.kernels.ops.moe.trtllm_lora_temp.virtual_experts import (
         merged_experts_fused_moe_lora_add,
     )

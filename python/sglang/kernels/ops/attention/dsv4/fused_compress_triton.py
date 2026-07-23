@@ -18,7 +18,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.jit_kernel.dsv4.compress_old import (
+from sglang.kernels.ops.attention.dsv4.compress_old import (
     CompressorDecodePlan,
     CompressorPrefillPlan,
 )

@@ -23,7 +23,7 @@ Add a new operation that scales each element of a tensor by a scalar factor:
 
 ---
 
-## Common Abstractions in `python/sglang/jit_kernel/include/sgl_kernel/`
+## Common Abstractions in `python/sglang/kernels/jit/include/sgl_kernel/`
 
 **Always prefer these abstractions over raw CUDA primitives.** They provide safety, readability, and consistency with the rest of the codebase.
 
@@ -191,16 +191,16 @@ LaunchKernel(num_blocks, kBlockSize, device.unwrap())(kernel, params);
 ## Step 0 (optional): Generate a `.clangd` config for better IDE support
 
 ```bash
-python -m sglang.jit_kernel -h  # for verbose help info about clangd configuration
-python -m sglang.jit_kernel
-python -m sglang.jit_kernel --dep cutlass flashinfer  # with cutlass/flashinfer dependency
+python -m sglang.kernels.jit -h  # for verbose help info about clangd configuration
+python -m sglang.kernels.jit
+python -m sglang.kernels.jit --dep cutlass flashinfer  # with cutlass/flashinfer dependency
 ```
 
 ---
 
-## Step 1: Implement the CUDA kernel in `jit_kernel/csrc/`
+## Step 1: Implement the CUDA kernel in `kernels/jit/csrc/`
 
-Create `python/sglang/jit_kernel/csrc/elementwise/scale.cuh`.
+Create `python/sglang/kernels/jit/csrc/elementwise/scale.cuh`.
 
 The implementation fully uses the project abstractions described above:
 
@@ -330,9 +330,9 @@ void scale(tvm::ffi::TensorView dst, tvm::ffi::TensorView src, float factor) {
 
 ---
 
-## Step 2: Add the Python wrapper in `jit_kernel/`
+## Step 2: Add the Python wrapper in `kernels/jit/`
 
-Create `python/sglang/jit_kernel/scale.py`:
+Create `python/sglang/kernels/jit/scale.py`:
 
 ```python
 from __future__ import annotations
@@ -341,7 +341,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.jit_kernel.utils import (
+from sglang.kernels.jit.utils import (
     cache_once,
     is_arch_support_pdl,
     load_jit,
@@ -438,10 +438,10 @@ if torch.cuda.get_device_capability()[0] < 9:
 
 ## Step 4: Write tests (required)
 
-JIT kernel correctness tests and benchmarks live under `test/registered/jit/` and `test/registered/jit/benchmark/` (NOT inside the `sglang` package -- a `register_*_ci(...)` call anywhere under `python/sglang/` is rejected by the `check-no-registered-tests-in-package` pre-commit hook). Only their test-only helpers (e.g. `benchmark/marker.py`) stay alongside the kernel source under `python/sglang/jit_kernel/` and are imported by absolute path. **CI does not run `pytest` in those directories directly.** The unified runner `test/run_suite.py` discovers every `test_*.py` and `bench_*.py` under `test/registered/`, collects `register_*_ci(...)` calls by **statically parsing each file's AST**, and executes the selected suite. Every test file must register at least one CUDA entry or the collector fails its sanity check.
+JIT kernel correctness tests and benchmarks live under `test/registered/jit/` and `test/registered/jit/benchmark/` (NOT inside the `sglang` package -- a `register_*_ci(...)` call anywhere under `python/sglang/` is rejected by the `check-no-registered-tests-in-package` pre-commit hook). Only their test-only helpers (e.g. `benchmark/marker.py`) stay alongside the kernel source under `python/sglang/kernels/jit/` and are imported by absolute path. **CI does not run `pytest` in those directories directly.** The unified runner `test/run_suite.py` discovers every `test_*.py` and `bench_*.py` under `test/registered/`, collects `register_*_ci(...)` calls by **statically parsing each file's AST**, and executes the selected suite. Every test file must register at least one CUDA entry or the collector fails its sanity check.
 
 - **PR / per-commit CUDA suites** (see `test/run_suite.py` → `PER_COMMIT_SUITES`): JIT unit tests use `base-b-kernel-unit-test-1-gpu-large` on H100 and `base-b-kernel-unit-test-4-gpu-b200` on B200/SM100 paths (see `.github/workflows/pr-test-jit-kernel.yml`). Multi-GPU JIT tests use `base-b-kernel-unit-test-8-gpu-h200`.
-- **Nightly kernel suite**: `nightly-kernel-1-gpu` with `--nightly` — typically used with `SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1` in CI for expanded parameter grids (see `python/sglang/jit_kernel/utils.py` → `should_run_full_tests` / `get_ci_test_range`). Wired in `.github/workflows/nightly-test-nvidia.yml` (e.g. `python3 run_suite.py --hw cuda --suite nightly-kernel-1-gpu --nightly --continue-on-error`).
+- **Nightly kernel suite**: `nightly-kernel-1-gpu` with `--nightly` — typically used with `SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1` in CI for expanded parameter grids (see `python/sglang/kernels/jit/utils/compile.py` → `should_run_full_tests` / `get_ci_test_range`). Wired in `.github/workflows/nightly-test-nvidia.yml` (e.g. `python3 run_suite.py --hw cuda --suite nightly-kernel-1-gpu --nightly --continue-on-error`).
 
 Registration pattern (module level, **literal** `est_time`, `stage`, and `runner_config` values — required for AST parsing):
 
@@ -477,7 +477,7 @@ Create `test/registered/jit/test_scale.py`:
 ```python
 import pytest
 import torch
-from sglang.jit_kernel.scale import scale
+from sglang.kernels.jit.scale import scale
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -527,7 +527,7 @@ if __name__ == "__main__":
 
 Benchmarks are `bench_*.py` files under `test/registered/jit/benchmark/`. They are picked up by the same `run_suite.py` machinery as unit tests. Register them for **`base-b-kernel-benchmark-test-1-gpu-large`** (PR JIT benchmark job: `python3 run_suite.py --hw cuda --suite base-b-kernel-benchmark-test-1-gpu-large`).
 
-Benchmarks use the project's own `marker` framework (in `python/sglang/jit_kernel/benchmark/marker.py`) — **do not** use `triton.testing.perf_report` / `triton.testing.do_bench` directly. The marker framework provides (public names: `benchmark`, `parametrize`, `do_bench`, `skip`, `BenchResult`, `BenchSkip`):
+Benchmarks use the project's own `marker` framework (in `python/sglang/kernels/jit/benchmark/marker.py`) — **do not** use `triton.testing.perf_report` / `triton.testing.do_bench` directly. The marker framework provides (public names: `benchmark`, `parametrize`, `do_bench`, `skip`, `BenchResult`, `BenchSkip`):
 
 - **`@marker.benchmark(line_arg, line_vals, *, unit="us")`** — the **innermost** decorator (bottom of the stack, directly above `def benchmark`). Declares the column axis: each value in `line_vals` becomes a result column, and `line_arg` is the parameter name passed into the benchmark function. `unit` is one of `"us" | "ms" | "s"`.
 - **`@marker.parametrize(names, vals, ci_vals=None)`** — stackable decorator that adds a row axis (pytest-style). Each `@parametrize` adds one (or more, correlated) parameter the benchmark is swept over (Cartesian product across all `parametrize` decorators). `names` may be a single name (`"size"`) or a comma-separated correlated tuple axis (`"h,d"`, with `vals` then a list of tuples like `[(1, 64), (2, 128)]`). Pass the optional third `ci_vals` for a smaller sweep that is auto-selected under `is_in_ci()` — this is the built-in CI-shrinking mechanism, so you usually don't need `get_benchmark_range` for swept axes.
@@ -547,9 +547,9 @@ Create `test/registered/jit/benchmark/bench_scale.py`:
 ```python
 import torch
 
-from sglang.jit_kernel.benchmark import marker
-from sglang.jit_kernel.benchmark.utils import create_random
-from sglang.jit_kernel.scale import scale as jit_scale
+from sglang.kernels.jit.benchmark import marker
+from sglang.kernels.jit.benchmark.utils import create_random
+from sglang.kernels.jit.scale import scale as jit_scale
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=6, stage="base-b-kernel-benchmark", runner_config="1-gpu-large")
@@ -614,7 +614,7 @@ cd test && python3 run_suite.py --hw cuda --suite base-b-kernel-benchmark-test-1
 ## Troubleshooting
 
 - **`No CI registry found in ...` from `run_suite.py`**: add a module-level `register_cuda_ci(...)` with literal `est_time`, `stage`, and `runner_config` (and optional `nightly=True`); starred args and non-literal values break AST collection
-- **JIT compilation fails**: ensure the `.cuh` file is under `python/sglang/jit_kernel/csrc/`; reduce template argument combinations
+- **JIT compilation fails**: ensure the `.cuh` file is under `python/sglang/kernels/jit/csrc/`; reduce template argument combinations
 - **CUDA crash / illegal memory access**: `CUDA_LAUNCH_BLOCKING=1`; `compute-sanitizer --tool memcheck python ...`
 - **Unstable benchmark results**: `marker.do_bench` uses CUDA-graph-based timing by default; set `use_cuda_graph=False` only if the kernel can't be captured. Make sure `graph_clone_args` covers every *read* tensor — reusing a single buffer keeps it L2-hot and skews results
 - **Missing GB/s column**: the column is on by default; check that `SGLANG_KERNEL_DISABLE_LOG_BANDWIDTH` is not `1` and `disable_log_bandwidth` is not `True`. For in-place kernels (return `None`) the `memory_output="out"` default counts nothing — pass the written tensors via `memory_output=(...)`
@@ -626,30 +626,30 @@ cd test && python3 run_suite.py --hw cuda --suite base-b-kernel-benchmark-test-1
 - `docs_new/docs/developer_guide/development_jit_kernel_guide.mdx`
 - `test/run_suite.py` — suite names, discovery of `test/registered/`, execution entrypoint for CI
 - `python/sglang/test/ci/ci_register.py` — `register_cuda_ci` and AST registration rules
-- `python/sglang/jit_kernel/utils.py` — `cache_once`, `load_jit`, `make_cpp_args`, `should_run_full_tests`, `get_ci_test_range`
-- `python/sglang/jit_kernel/include/sgl_kernel/tensor.h` — `TensorMatcher`, `SymbolicSize/DType/Device`
-- `python/sglang/jit_kernel/include/sgl_kernel/utils.cuh` — type aliases, `LaunchKernel`, `SGL_DEVICE`
-- `python/sglang/jit_kernel/include/sgl_kernel/vec.cuh` — `AlignedVector`
-- `python/sglang/jit_kernel/include/sgl_kernel/tile.cuh` — `tile::Memory`
-- `python/sglang/jit_kernel/include/sgl_kernel/type.cuh` — `DTypeTrait`, `packed_t`, `device::cast`, `device::unpack`, `ReductionTrait`
-- `python/sglang/jit_kernel/include/sgl_kernel/math.cuh` — `device::math::`
-- `python/sglang/jit_kernel/include/sgl_kernel/warp.cuh` — `warp::reduce<Op>` and `reduce_sum/max/min` wrappers
-- `python/sglang/jit_kernel/include/sgl_kernel/cta.cuh` — `cta::reduce_max`
-- `python/sglang/jit_kernel/include/sgl_kernel/atomic.cuh` — `atomic::max`
-- `python/sglang/jit_kernel/include/sgl_kernel/runtime.cuh` — occupancy / SM count helpers
-- `python/sglang/jit_kernel/csrc/add_constant.cuh` — minimal runnable reference
-- `python/sglang/jit_kernel/csrc/elementwise/rmsnorm.cuh` — real example using `TensorMatcher` + `LaunchKernel` + `tile::Memory`
-- `python/sglang/jit_kernel/csrc/elementwise/qknorm.cuh` — real example using `runtime::get_blocks_per_sm` + persistent kernel pattern
-- `python/sglang/jit_kernel/benchmark/marker.py` — `benchmark`, `parametrize`, `do_bench`, `BenchResult`
-- `python/sglang/jit_kernel/benchmark/utils.py` — `create_random` / `create_empty` / `get_benchmark_range` helpers and `DEFAULT_DTYPE` / `DEFAULT_DEVICE`
+- `python/sglang/kernels/jit/utils/compile.py` — `cache_once`, `load_jit`, `make_cpp_args`, `should_run_full_tests`, `get_ci_test_range`
+- `python/sglang/kernels/jit/include/sgl_kernel/tensor.h` — `TensorMatcher`, `SymbolicSize/DType/Device`
+- `python/sglang/kernels/jit/include/sgl_kernel/utils.cuh` — type aliases, `LaunchKernel`, `SGL_DEVICE`
+- `python/sglang/kernels/jit/include/sgl_kernel/vec.cuh` — `AlignedVector`
+- `python/sglang/kernels/jit/include/sgl_kernel/tile.cuh` — `tile::Memory`
+- `python/sglang/kernels/jit/include/sgl_kernel/type.cuh` — `DTypeTrait`, `packed_t`, `device::cast`, `device::unpack`, `ReductionTrait`
+- `python/sglang/kernels/jit/include/sgl_kernel/math.cuh` — `device::math::`
+- `python/sglang/kernels/jit/include/sgl_kernel/warp.cuh` — `warp::reduce<Op>` and `reduce_sum/max/min` wrappers
+- `python/sglang/kernels/jit/include/sgl_kernel/cta.cuh` — `cta::reduce_max`
+- `python/sglang/kernels/jit/include/sgl_kernel/atomic.cuh` — `atomic::max`
+- `python/sglang/kernels/jit/include/sgl_kernel/runtime.cuh` — occupancy / SM count helpers
+- `python/sglang/kernels/jit/csrc/add_constant.cuh` — minimal runnable reference
+- `python/sglang/kernels/jit/csrc/elementwise/rmsnorm.cuh` — real example using `TensorMatcher` + `LaunchKernel` + `tile::Memory`
+- `python/sglang/kernels/jit/csrc/elementwise/qknorm.cuh` — real example using `runtime::get_blocks_per_sm` + persistent kernel pattern
+- `python/sglang/kernels/jit/benchmark/marker.py` — `benchmark`, `parametrize`, `do_bench`, `BenchResult`
+- `python/sglang/kernels/jit/benchmark/utils.py` — `create_random` / `create_empty` / `get_benchmark_range` helpers and `DEFAULT_DTYPE` / `DEFAULT_DEVICE`
 - `test/registered/jit/benchmark/bench_qknorm.py` — real example: multi-axis `parametrize` (with `ci_vals`) + in-place `memory_output`
 - `test/registered/jit/benchmark/bench_store_cache.py` — real example: scoped `memory_args` / `memory_output` + selective `graph_clone_args`
 
 ## Summary of Files Created
 
 ```
-python/sglang/jit_kernel/csrc/elementwise/scale.cuh   # NEW: CUDA kernel
-python/sglang/jit_kernel/scale.py                     # NEW: Python wrapper
+python/sglang/kernels/jit/csrc/elementwise/scale.cuh   # NEW: CUDA kernel
+python/sglang/kernels/jit/scale.py                     # NEW: Python wrapper
 test/registered/jit/test_scale.py                     # NEW: Tests
 test/registered/jit/benchmark/bench_scale.py          # NEW: Benchmark
 ```
