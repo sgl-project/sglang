@@ -7,7 +7,8 @@
 // "pending" until an entry has a non-null speed metric or accuracy. Speed shape:
 //   speed: [{ workload: {dataset, isl, osl, max_concurrency}, ttft_ms, tpot_ms,
 //             tokens_per_sec_per_gpu }, ...]
-//   - ttft_ms/tpot_ms are P50 (median); set config.latencyPercentile ("P50" default, or "Mean").
+//   - ttft_ms/tpot_ms are P50 (median); set config.latencyPercentile ("P50" default, or "Mean");
+//     an entry-level latencyPercentile overrides the page value per cell.
 //   - tokens_per_sec_per_gpu = total (in+out) tok/s/GPU
 //     (= output tok/s ÷ GPUs × (isl+osl)/osl). interactivity is derived = 1000/TPOT (tokens/s/user).
 // Per-cell `accuracy: { <key>: <pct> }` overrides the config's defaultAccuracy.

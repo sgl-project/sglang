@@ -202,5 +202,115 @@ class TestHybridLinearFullLocRouting(unittest.TestCase):
         self.assertNotIn("already_physical", kwargs)
 
 
+class _RecordingMLAPool(_RecordingPool):
+    """Also records the model-level MLA entry points."""
+
+    def __init__(self):
+        super().__init__()
+        self.mla_set_calls = []
+        self.mla_get_calls = []
+
+    def set_mla_kv_buffer(self, layer, loc, cache_k_nope, cache_k_rope):
+        self.mla_set_calls.append(loc)
+
+    def get_mla_kv_buffer(self, layer, loc, dst_dtype=None):
+        self.mla_get_calls.append(loc)
+        return None, None
+
+
+class TestHybridLinearMLARouting(unittest.TestCase):
+    """MLA-side routing contracts of `HybridLinearKVPool`:
+
+    - `set_kv_buffer` (MLA branch) mirrors the MHA branch — write the
+      pre-translated `KVWriteLoc.full_loc` when present (unified pool, where it
+      carries the DENSE loc), else the raw `loc` (static pool, already physical).
+    - `set_mla_kv_buffer` / `get_mla_kv_buffer` receive VIRTUAL locs and apply
+      `_full_translate` exactly once (identity for a static pool)."""
+
+    def _make_bare_pool(self, translate=None):
+        from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+
+        pool = object.__new__(HybridLinearKVPool)
+        pool.full_kv_pool = _RecordingMLAPool()
+        pool.use_mla = True
+        pool.full_attention_layer_id_mapping = {0: 0}
+        pool._full_translate = translate if translate is not None else (lambda x: x)
+        return pool
+
+    def test_mla_writes_full_loc_from_write_loc(self):
+        pool = self._make_bare_pool()
+        virtual_loc = torch.tensor([7, 8, 9], dtype=torch.int64)
+        dense_phys = torch.tensor([21, 24, 27], dtype=torch.int64)
+
+        layer = types.SimpleNamespace(layer_id=0)
+        pool.set_kv_buffer(
+            layer,
+            _loc_info(virtual_loc, full_phys=dense_phys),
+            torch.zeros(3, 1, 8),
+            None,
+        )
+
+        self.assertEqual(len(pool.full_kv_pool.calls), 1)
+        forwarded, _ = pool.full_kv_pool.calls[0]
+        self.assertIs(forwarded, dense_phys)
+        self.assertIsNot(forwarded, virtual_loc)
+
+    def test_mla_falls_back_to_loc_when_absent(self):
+        pool = self._make_bare_pool()
+        phys_loc = torch.tensor([7, 8, 9], dtype=torch.int64)
+
+        layer = types.SimpleNamespace(layer_id=0)
+        pool.set_kv_buffer(
+            layer,
+            _loc_info(phys_loc),
+            torch.zeros(3, 1, 8),
+            None,
+        )
+
+        self.assertEqual(len(pool.full_kv_pool.calls), 1)
+        forwarded, _ = pool.full_kv_pool.calls[0]
+        self.assertIs(forwarded, phys_loc)
+
+    def test_set_mla_kv_buffer_translates_exactly_once(self):
+        calls = []
+
+        def translate(ids):
+            calls.append(ids)
+            return ids + 100
+
+        pool = self._make_bare_pool(translate=translate)
+        virtual_loc = torch.tensor([7, 8, 9], dtype=torch.int64)
+        layer = types.SimpleNamespace(layer_id=0)
+
+        pool.set_mla_kv_buffer(
+            layer, virtual_loc, torch.zeros(3, 1, 6), torch.zeros(3, 1, 2)
+        )
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(pool.full_kv_pool.mla_set_calls), 1)
+        self.assertTrue(
+            torch.all(pool.full_kv_pool.mla_set_calls[0] == virtual_loc + 100)
+        )
+
+    def test_get_mla_kv_buffer_translates_exactly_once(self):
+        calls = []
+
+        def translate(ids):
+            calls.append(ids)
+            return ids + 100
+
+        pool = self._make_bare_pool(translate=translate)
+        virtual_loc = torch.tensor([4, 5], dtype=torch.int64)
+        layer = types.SimpleNamespace(layer_id=0)
+
+        pool.get_mla_kv_buffer(layer, virtual_loc)
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(pool.full_kv_pool.mla_get_calls), 1)
+        self.assertTrue(
+            torch.all(pool.full_kv_pool.mla_get_calls[0] == virtual_loc + 100)
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -30,11 +30,12 @@ class HybridAttnBackend(AttentionBackend):
         self.spec_attn_is_prefill = (
             model_runner.server_args.speculative_attention_mode == "prefill"
         )
-        # decide_needs_cpu_seq_lens ORs this flag across backends; without the
-        # delegation the base-class default (True) forces a per-step seq_lens
-        # D2H + host sync even when both sub-backends opted out.
-        self.needs_cpu_seq_lens = (
-            prefill_backend.needs_cpu_seq_lens or decode_backend.needs_cpu_seq_lens
+        # Gates the FutureMap's per-step seq_lens D2H (decide_needs_cpu_seq_lens
+        # ORs it across backends). Count only what runs in the spec decode loop:
+        # decode always, prefill only when mode=prefill routes verify to it --
+        # else a cpu-lens prefill backend forces the D2H on steps it never serves.
+        self.needs_cpu_seq_lens = decode_backend.needs_cpu_seq_lens or (
+            self.spec_attn_is_prefill and prefill_backend.needs_cpu_seq_lens
         )
 
     @property

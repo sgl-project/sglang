@@ -486,6 +486,30 @@ def get_dp_encoder_lb_assignment(
     return (shuffle_indices, gpu_sample_counts, gpu_loads)
 
 
+def _pad_mrope_vision_embeddings_for_tp_gather(
+    image_embeds_local: torch.Tensor, max_len_per_rank: int
+) -> torch.Tensor:
+    """Pad the DP encoder output for a fixed-shape TP all-gather.
+
+    Allocating the padding fragment and then concatenating it creates two
+    temporary buffers on every underfilled rank. Allocate the final
+    fixed-shape input directly and copy just the valid embeddings instead.
+    """
+
+    current_len = image_embeds_local.shape[0]
+    if current_len >= max_len_per_rank:
+        return image_embeds_local
+
+    padded = torch.empty(
+        (max_len_per_rank, *image_embeds_local.shape[1:]),
+        dtype=image_embeds_local.dtype,
+        device=image_embeds_local.device,
+    )
+    if current_len > 0:
+        padded[:current_len].copy_(image_embeds_local)
+    return padded
+
+
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/vision.py
 def run_dp_sharded_vision_model(
     image_input: torch.Tensor, vision_model: torch.nn.Module
@@ -527,9 +551,11 @@ def run_dp_sharded_mrope_vision_model(
     grid_thw_list: list,
     *,
     rope_type: Literal["rope_3d", "rope_2d", "rope_2d_packed"],
+    pool_temporal_dimension: bool = False,
     load_local_pixel_values: Optional[Callable[[list[int]], torch.Tensor]] = None,
     pixel_values_device: Optional[torch.device] = None,
     pixel_values_dtype: Optional[torch.dtype] = None,
+    pass_grid_thw_list: bool = False,
 ):
     """Run a vision model with data parallelism (DP) sharding.
     The function will shard the input image tensor on the
@@ -546,6 +572,11 @@ def run_dp_sharded_mrope_vision_model(
                    "rope_2d" for packed 2D rope outputs (e.g., Kimi-VL)
                    "rope_2d_packed" for packed 2D rope outputs that accept
                    ``grid_thws`` positionally (e.g., Kimi-K2.5/K2.7)
+        pool_temporal_dimension: Whether the vision model pools away the temporal
+                   grid dimension. Its output length is then h * w divided by
+                   the spatial merge area instead of t * h * w divided by it.
+        pass_grid_thw_list: Forward the existing host grid list to the vision
+            model so graph-aware towers do not materialize it from a CUDA tensor.
     Returns:
         torch.Tensor: Output image embeddings
 
@@ -584,11 +615,13 @@ def run_dp_sharded_mrope_vision_model(
             device=pixel_values.device if rope_type == "rope_2d" else None,
         )
         if rope_type == "rope_2d":
-            image_embeds = vision_model(
-                pixel_values,
-                grid_hw=grid_thw,
-                max_seqlen=max(math.prod(grid) for grid in grid_thw_list),
-            )
+            kwargs = {
+                "grid_hw": grid_thw,
+                "max_seqlen": max(math.prod(grid) for grid in grid_thw_list),
+            }
+            if pass_grid_thw_list:
+                kwargs["grid_thw_list"] = grid_thw_list
+            image_embeds = vision_model(pixel_values, **kwargs)
             # MoonViT returns one tensor per image. The multi-GPU path below
             # already concatenates these tensors before returning, so keep the
             # TP=1 DP-encoder path on the same projector-facing contract.
@@ -616,8 +649,8 @@ def run_dp_sharded_mrope_vision_model(
     # image_to_tp_rank = [0, 2, 1, 3]
     # gpu_sample_counts = [1, 3]
     # grouped_pixel_values_len = [1000, 350]
-    image_to_tp_rank, gpu_sample_counts, grouped_pixel_values_len = (
-        get_dp_encoder_lb_assignment(patches_per_image, tp_size)
+    image_to_tp_rank, gpu_sample_counts, _ = get_dp_encoder_lb_assignment(
+        patches_per_image, tp_size
     )
 
     # cu_gpu_sample_counts = [0, 1, 4]
@@ -656,11 +689,27 @@ def run_dp_sharded_mrope_vision_model(
             vision_model.spatial_merge_size * vision_model.spatial_merge_size
         )
 
+    output_tokens_per_image = [
+        math.prod(grid[1:] if pool_temporal_dimension else grid)
+        // embed_dim_reduction_factor
+        for grid in grid_thw_list
+    ]
+    grouped_output_lengths = []
+    assignment_offset = 0
+    for sample_count in gpu_sample_counts:
+        rank_images = image_to_tp_rank[
+            assignment_offset : assignment_offset + sample_count
+        ]
+        grouped_output_lengths.append(
+            sum(output_tokens_per_image[i] for i in rank_images)
+        )
+        assignment_offset += sample_count
+
     # Find the max length across all ranks
     # The output embedding of every DP rank has to be
     # padded to this length for tensor_model_parallel_all_gather
     # to work
-    max_len_per_rank = max(grouped_pixel_values_len) // embed_dim_reduction_factor
+    max_len_per_rank = max(grouped_output_lengths)
     local_grid_thw_list = [grid_thw_list[i] for i in image_idxs_local]
 
     # Run the vision model on the local pixel_values_local
@@ -670,11 +719,13 @@ def run_dp_sharded_mrope_vision_model(
                 local_grid_thw_list, device=pixel_values_local.device
             )
             if rope_type == "rope_2d":
-                image_embeds_local = vision_model(
-                    pixel_values_local,
-                    grid_hw=local_grid_thw,
-                    max_seqlen=max(math.prod(grid) for grid in local_grid_thw_list),
-                )
+                kwargs = {
+                    "grid_hw": local_grid_thw,
+                    "max_seqlen": max(math.prod(grid) for grid in local_grid_thw_list),
+                }
+                if pass_grid_thw_list:
+                    kwargs["grid_thw_list"] = local_grid_thw_list
+                image_embeds_local = vision_model(pixel_values_local, **kwargs)
             else:
                 image_embeds_local = vision_model(pixel_values_local, local_grid_thw)
             if isinstance(image_embeds_local, list):
@@ -683,7 +734,7 @@ def run_dp_sharded_mrope_vision_model(
             out_dim = getattr(vision_model.config, "hidden_size", None)
             image_embeds_local = torch.empty(
                 (0, embed_dim_reduction_factor, out_dim),
-                device=input_device,
+                device=vision_model.device,
                 dtype=input_dtype,
             )
     else:
@@ -701,34 +752,15 @@ def run_dp_sharded_mrope_vision_model(
                 out_dim = vision_model.config.hidden_size
             image_embeds_local = torch.empty(
                 (0, out_dim),
-                device=input_device,
+                device=vision_model.device,
                 dtype=input_dtype,
             )
 
-    # Pad the output based on max_len_per_rank
-    # for tensor_model_parallel_all_gather to work
-    current_len = image_embeds_local.shape[0]
-    if current_len < max_len_per_rank:
-        padding_size = max_len_per_rank - current_len
-        if packed_2d_rope:
-            padding = torch.empty(
-                (
-                    padding_size,
-                    image_embeds_local.shape[1],
-                    image_embeds_local.shape[2],
-                ),
-                dtype=image_embeds_local.dtype,
-                device=image_embeds_local.device,
-            )
-        else:
-            padding = torch.empty(
-                (padding_size, image_embeds_local.shape[1]),
-                dtype=image_embeds_local.dtype,
-                device=image_embeds_local.device,
-            )
-        image_embeds_local_padded = torch.cat([image_embeds_local, padding], dim=0)
-    else:
-        image_embeds_local_padded = image_embeds_local
+    # The TP all-gather needs a common first dimension. Allocate that final
+    # shape directly instead of materializing a padding fragment and catting it.
+    image_embeds_local_padded = _pad_mrope_vision_embeddings_for_tp_gather(
+        image_embeds_local, max_len_per_rank
+    )
 
     # Do all_gather to collect embeddings from all ranks
     gathered_embeds = get_parallel().attn_tp_group.all_gather(
@@ -739,14 +771,8 @@ def run_dp_sharded_mrope_vision_model(
     rank_embeddings = list[torch.Tensor]()
     for rank in range(tp_size):
         start_idx = rank * max_len_per_rank
-        end_idx = start_idx + (
-            grouped_pixel_values_len[rank] // embed_dim_reduction_factor
-        )
+        end_idx = start_idx + grouped_output_lengths[rank]
         rank_embeddings.append(gathered_embeds[start_idx:end_idx])
-
-    patches_per_output_image = [
-        (patch_size // embed_dim_reduction_factor) for patch_size in patches_per_image
-    ]
 
     # Reconstruct embeddings in the original order
     original_order_embeddings = [None] * len(grid_thw_list)
@@ -763,7 +789,7 @@ def run_dp_sharded_mrope_vision_model(
             # Split rank embeddings back to individual images
             embed_start = 0
             for img_idx in rank_images:
-                img_patches = patches_per_output_image[img_idx]
+                img_patches = output_tokens_per_image[img_idx]
                 original_order_embeddings[img_idx] = rank_embed[
                     embed_start : embed_start + img_patches
                 ]

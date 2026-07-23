@@ -43,9 +43,19 @@ class _FakeSpecAlgorithm:
         return False
 
 
+class _FakeForwardMode:
+    def is_decode(self) -> bool:
+        return True
+
+    def is_extend(self) -> bool:
+        return False
+
+
 class _FakeBatch:
     def __init__(self, reqs):
         self.reqs = reqs
+        self.has_grammar = any(req.grammar is not None for req in reqs)
+        self.forward_mode = _FakeForwardMode()
         self.spec_algorithm = _FakeSpecAlgorithm()
 
 
@@ -95,6 +105,8 @@ def _make_result(num_draft_tokens, accept_lens, flat_tokens):
         num_correct_drafts_per_req_cpu=None,
         block_accept_lens=None,
         cap_lens=None,
+        copy_done=None,
+        grammar_advanced=False,
     )
 
 

@@ -107,7 +107,8 @@ class TestMultimodalFeatureTransport(CustomTestCase):
 
         self.assertIn("overrides", logs.output[0])
 
-    def test_default_transport_is_cpu(self):
+    @patch("sglang.srt.server_args.is_cuda", return_value=False)
+    def test_default_transport_is_cpu_off_cuda(self, _mock_is_cuda):
         server_args = ServerArgs(model_path="dummy")
 
         with patch.dict(os.environ, {"SGLANG_USE_CUDA_IPC_TRANSPORT": "0"}):
@@ -115,6 +116,71 @@ class TestMultimodalFeatureTransport(CustomTestCase):
 
             self.assertEqual(server_args.mm_feature_transport, "cpu")
             self.assertFalse(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
+
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    def test_default_auto_resolves_cuda_ipc_on_single_node_cuda(self, _mock_is_cuda):
+        server_args = ServerArgs(model_path="dummy")
+
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("SGLANG_USE_CUDA_IPC_TRANSPORT", None)
+            with self.assertLogs(server_args_module.logger, level="INFO") as logs:
+                server_args._handle_multimodal_feature_transport()
+
+            self.assertEqual(server_args.mm_feature_transport, "cuda_ipc")
+            self.assertTrue(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
+
+        self.assertIn("auto-resolved to cuda_ipc", "\n".join(logs.output))
+
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    def test_default_auto_keeps_cpu_on_multi_node(self, _mock_is_cuda):
+        server_args = ServerArgs(model_path="dummy", nnodes=2)
+
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("SGLANG_USE_CUDA_IPC_TRANSPORT", None)
+            server_args._handle_multimodal_feature_transport()
+
+            self.assertEqual(server_args.mm_feature_transport, "cpu")
+            self.assertFalse(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
+
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    def test_default_auto_keeps_cpu_with_disaggregation(self, _mock_is_cuda):
+        server_args = ServerArgs(model_path="dummy", disaggregation_mode="prefill")
+
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("SGLANG_USE_CUDA_IPC_TRANSPORT", None)
+            server_args._handle_multimodal_feature_transport()
+
+            self.assertEqual(server_args.mm_feature_transport, "cpu")
+            self.assertFalse(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
+
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    def test_default_auto_keeps_cpu_for_encoder_only(self, _mock_is_cuda):
+        server_args = ServerArgs(model_path="dummy", encoder_only=True)
+
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("SGLANG_USE_CUDA_IPC_TRANSPORT", None)
+            with self.assertLogs(server_args_module.logger, level="INFO") as logs:
+                server_args._handle_multimodal_feature_transport()
+
+            self.assertEqual(server_args.mm_feature_transport, "cpu")
+            self.assertFalse(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
+
+        self.assertIn("encoder-only serving", "\n".join(logs.output))
+
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    def test_encoder_only_ignores_explicit_cuda_ipc(self, _mock_is_cuda):
+        server_args = ServerArgs(
+            model_path="dummy",
+            encoder_only=True,
+            mm_feature_transport="cuda_ipc",
+        )
+
+        with self.assertLogs(server_args_module.logger, level="WARNING") as logs:
+            server_args._handle_multimodal_feature_transport()
+
+        self.assertEqual(server_args.mm_feature_transport, "cpu")
+        self.assertFalse(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
+        self.assertIn("does not control encoder-only", "\n".join(logs.output))
 
     @patch("sglang.srt.server_args.is_cuda", return_value=False)
     def test_cuda_ipc_rejects_non_nvidia_platforms(self, _mock_is_cuda):
@@ -167,6 +233,26 @@ class TestMambaCacheStochasticRounding(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "requires SM100"):
             server_args._handle_mamba_backend()
+
+
+class TestLinearAttentionBackendStateDtype(unittest.TestCase):
+    @patch("torch.cuda.get_device_capability", return_value=(10, 0))
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    @patch("sglang.srt.server_args.is_sm100_supported", return_value=False)
+    def test_flashinfer_verify_rejects_fp32_ssm_state(
+        self, _mock_sm100, _mock_is_cuda, _mock_capability
+    ):
+        server_args = ServerArgs(
+            model_path="dummy",
+            mamba_ssm_dtype="float32",
+            linear_attn_decode_backend="triton",
+            linear_attn_verify_backend="flashinfer",
+        )
+
+        with self.assertRaisesRegex(
+            ValueError, "--linear-attn-verify-backend flashinfer.*bfloat16"
+        ):
+            server_args._handle_linear_attn_backend()
 
 
 class TestLoadBalanceMethod(unittest.TestCase):

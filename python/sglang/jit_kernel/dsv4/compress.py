@@ -258,7 +258,6 @@ class CompressorPrefillPlan(NamedTuple):
                 torch.empty((0, 8), dtype=torch.uint8, device=_dev),
                 pin_buffer,
             )
-        module = _jit_compress_plan_module()
         if _is_xpu:
             fn = plan_compress_prefill
         else:

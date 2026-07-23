@@ -731,6 +731,45 @@ def patch_merger(
     return outputs
 
 
+def concat_or_single(tensors: Sequence[torch.Tensor], dim: int = 0) -> torch.Tensor:
+    """Concatenate multiple tensors without copying a singleton input."""
+
+    return tensors[0] if len(tensors) == 1 else torch.cat(tensors, dim=dim)
+
+
+def tpool_patch_merger(
+    x: torch.Tensor,
+    grid_thws: torch.Tensor,
+    merge_kernel_size: tuple[int, int] = (2, 2),
+    *,
+    grid_thw_list: Optional[Sequence[Sequence[int]]] = None,
+) -> List[torch.Tensor]:
+    """Group spatial patches and average only across real video frames."""
+
+    d_model = x.size(-1)
+    outputs = []
+    pre_sum = 0
+    shapes = grid_thws.tolist() if grid_thw_list is None else grid_thw_list
+    for t, h, w in shapes:
+        t, h, w = int(t), int(h), int(w)
+        seq = x[pre_sum : pre_sum + t * h * w]
+        kernel_height, kernel_width = merge_kernel_size
+        new_height, new_width = h // kernel_height, w // kernel_width
+        reshaped_seq = seq.view(
+            t, new_height, kernel_height, new_width, kernel_width, d_model
+        )
+        reshaped_seq = reshaped_seq.permute(0, 1, 3, 2, 4, 5).contiguous()
+        reshaped_seq = reshaped_seq.squeeze(0) if t == 1 else reshaped_seq.mean(dim=0)
+        outputs.append(
+            reshaped_seq.view(
+                new_height * new_width, kernel_height * kernel_width, d_model
+            )
+        )
+        pre_sum += t * h * w
+
+    return outputs
+
+
 class MoonVitVLProjector(nn.Module):
 
     def __init__(

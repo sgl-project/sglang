@@ -40,9 +40,11 @@ from sglang.srt.layers.dcp.comm import (
     all_gather_q_for_mla_decode,
     cp_lse_ag_out_rs_mha,
     cp_lse_ag_out_rs_mla,
+    dcp_a2a_lse_reduce,
     dcp_enabled,
     get_attention_dcp_rank,
     get_attention_dcp_world_size,
+    init_fi_a2a_workspace,
 )
 from sglang.srt.layers.dcp.layout import (
     filter_dcp_local_kv_indices,
@@ -61,6 +63,8 @@ from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
 
 __all__ = [
     "DecodeContextParallelMetadata",
+    "dcp_a2a_lse_reduce",
+    "init_fi_a2a_workspace",
     "all_gather_kv_cache_for_dcp",
     "all_gather_kv_cache_for_mha_chunk_extend",
     "all_gather_kv_cache_for_mha_extend",

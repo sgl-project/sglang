@@ -177,7 +177,8 @@ One entry per measured block only (cells without entries already render
 total (in+out) tok/s/GPU = `output tok/s ÷ (tp × nnodes) ×
 (isl+osl)/osl` — stored directly (the card shows it as-is). TTFT/TPOT
 take the P50 (median) rows; set `config.latencyPercentile` (default `"P50"`; use
-`"Mean"` only for legacy Mean-recorded data — temporary, being migrated to P50).
+`"Mean"` only for legacy Mean-recorded data — temporary, being migrated to P50; an
+entry-level `latencyPercentile` overrides the page value per cell).
 Put the workload's
 `num_prompts` into `workload`. **`config.accuracyLabels` is required whenever
 the benchmarks carry accuracy data** — the engine ships no default eval set

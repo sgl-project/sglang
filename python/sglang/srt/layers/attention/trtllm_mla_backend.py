@@ -121,6 +121,7 @@ class TRTLLMMLADecodeMetadata:
     cu_seqlens_q: Optional[torch.Tensor] = None
     seq_lens_q: Optional[torch.Tensor] = None
     seq_lens_k: Optional[torch.Tensor] = None
+    global_seq_lens_k: Optional[torch.Tensor] = None
 
 
 class TRTLLMMLABackend(FlashInferMLAAttnBackend):
@@ -211,6 +212,29 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         # Tree-mask scratch is fetched from the target backend only.
         self.is_draft_runner = model_runner.is_draft_worker
 
+        # Unified-memory dense-view hooks (None on the static pool). req_to_token
+        # holds VIRTUAL token ids; the block table needs DENSE page ids, so the
+        # kv-index kernels gather virtual->physical page through `_v2p_page_table`
+        # then scale by `_kernel_page_multiplier` (= num MLA layers). See
+        # build_dense_mla_views / create_flashmla_kv_indices_triton.
+        alloc = model_runner.token_to_kv_pool_allocator
+        self._kernel_page_multiplier = getattr(alloc, "kernel_page_multiplier", 1)
+        self._unified_mla = self._kernel_page_multiplier > 1
+        self._v2p_page_table = (
+            getattr(alloc, "full_v2p_page_table", None) if self._unified_mla else None
+        )
+        # virtual token id -> DENSE kernel-facing id, for the KV write loc.
+        self._translate_kv_loc_dense = (
+            getattr(alloc, "translate_kv_loc_dense", None)
+            if self._unified_mla
+            else None
+        )
+        # Per-forward dense write loc ([:n] view of a capture-stable buffer),
+        # set by the cuda-graph out-graph hook; None on the eager path (where the
+        # write translates through the pool's _full_translate hook instead).
+        self._decode_dense_loc: Optional[torch.Tensor] = None
+        self.cuda_graph_out_cache_loc_dense: Optional[torch.Tensor] = None
+
     def _calc_padded_blocks(self, max_seq_len: int) -> int:
         """
         Calculate padded block count that satisfies both TRT-LLM and Triton constraints.
@@ -273,6 +297,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             self.req_to_token.stride(0),
             max_blocks,
             PAGED_SIZE=self.page_size,
+            v2p_ptr=self._v2p_page_table,
+            PAGE_MULT=self._kernel_page_multiplier,
         )
 
         return block_kv_indices
@@ -290,6 +316,13 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         self.decode_cuda_graph_kv_indices = torch.full(
             (max_bs, max_blocks_per_seq), -1, dtype=torch.int32, device=self.device
         )
+        # Unified pool: capture-stable buffer for the DENSE KV write loc, filled
+        # out-of-graph in init_forward_metadata_out_graph so the in-graph
+        # set_mla_kv_buffer captures no translate.
+        if self._unified_mla:
+            self.cuda_graph_out_cache_loc_dense = torch.zeros(
+                max_num_tokens, dtype=torch.int64, device=self.device
+            )
         num_tokens_per_req = max_num_tokens // max_bs
 
         if is_float4_e2m1fn_x2(self.data_type):
@@ -354,6 +387,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         if forward_mode.is_target_verify():
             metadata.seq_lens_k = torch.zeros((bs,), dtype=torch.int32, device=device)
+            metadata.global_seq_lens_k = torch.zeros(
+                (bs,), dtype=torch.int32, device=device
+            )
         elif forward_mode.is_draft_extend_v2():
             num_tokens_per_req = self.num_draft_tokens
             metadata.max_seq_len_q = num_tokens_per_req
@@ -395,7 +431,12 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         if forward_mode.is_target_verify():
             # Intentional int64 -> int32 same-kind out= downcast.
-            torch.add(seq_lens[:bs], self.num_draft_tokens, out=metadata.seq_lens_k)
+            torch.add(
+                seq_lens[:bs],
+                self.num_draft_tokens,
+                out=metadata.global_seq_lens_k,
+            )
+            metadata.seq_lens_k.copy_(metadata.global_seq_lens_k)
             seq_lens = metadata.seq_lens_k
         elif forward_mode.is_draft_extend_v2():
             num_tokens_per_req = self.num_draft_tokens
@@ -421,6 +462,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             self.req_to_token.stride(0),
             metadata.block_kv_indices.shape[1],
             PAGED_SIZE=self.page_size,
+            v2p_ptr=self._v2p_page_table,
+            PAGE_MULT=self._kernel_page_multiplier,
         )
 
     def get_cuda_graph_seq_len_fill_value(self) -> int:
@@ -479,8 +522,32 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 forward_mode=forward_mode,
             )
 
+        # Unified pool: precompute the DENSE KV write loc into the capture-stable
+        # buffer (both capture and each replay-prep run this out of the graph),
+        # so the in-graph set_mla_kv_buffer writes a dense loc without capturing a
+        # translate. Only decode writes KV under unified (spec is gated off).
+        if self._unified_mla and forward_mode.is_decode_or_idle():
+            out_cache_loc = forward_batch.out_cache_loc
+            n = out_cache_loc.shape[0]
+            dst = self.cuda_graph_out_cache_loc_dense[:n]
+            self._translate_kv_loc_dense(out_cache_loc, out=dst)
+            # Replay-prep receives the RAW (unpadded) out_cache_loc
+            # (build_replay_fb_view), but the captured write kernel consumes
+            # the full captured tier of this buffer. Zero the tail so pad
+            # rows write to the dense sink (row 0) instead of stale dense
+            # locs left by earlier larger replays — a stale tail scatters
+            # pad-row garbage into live KV pages. Mirrors the runner's
+            # PaddingPolicy.ZERO on its own out_cache_loc slot.
+            self.cuda_graph_out_cache_loc_dense[n:].zero_()
+            self._decode_dense_loc = dst
+        else:
+            self._decode_dense_loc = None
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize the metadata for a forward pass."""
+        # Eager path: no capture-stable dense write loc; the pool's _full_translate
+        # hook translates the write loc (safe out of a cuda graph).
+        self._decode_dense_loc = None
         # Delegate to parent for non-decode modes.
         if (
             forward_batch.forward_mode.is_extend()
@@ -541,6 +608,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 max_seq = max_seq + self.num_draft_tokens
                 seq_lens = seq_lens + self.num_draft_tokens
                 self.forward_decode_metadata.seq_lens_k = seq_lens.to(torch.int32)
+                self.forward_decode_metadata.global_seq_lens_k = (
+                    self.forward_decode_metadata.seq_lens_k
+                )
             elif forward_batch.forward_mode.is_draft_extend_v2():
                 sum_seq_lens_q = sum(forward_batch.extend_seq_lens_cpu)
                 max_seq_len_q = max(forward_batch.extend_seq_lens_cpu)
@@ -771,9 +841,17 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             assert (
                 k is not None and k_rope is not None
             ), "For populating trtllm_mla kv cache, both k_nope and k_rope should be not None."
-            self.token_to_kv_pool.set_mla_kv_buffer(
-                layer, forward_batch.out_cache_loc, k, k_rope
-            )
+            if self._decode_dense_loc is not None:
+                # cuda-graph path: dense write loc precomputed out-of-graph, so
+                # the in-graph write captures no translate allocation.
+                self.token_to_kv_pool.set_mla_kv_buffer(
+                    layer, self._decode_dense_loc, k, k_rope, loc_is_dense=True
+                )
+            else:
+                # eager (or static pool): the pool's _full_translate handles it.
+                self.token_to_kv_pool.set_mla_kv_buffer(
+                    layer, forward_batch.out_cache_loc, k, k_rope
+                )
 
         # Prepare query tensor inline
         if merge_query:
@@ -929,17 +1007,15 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
             if forward_batch.forward_mode.is_target_verify():
                 draft_token_num = forward_batch.spec_info.draft_token_num
-                max_seq_len = metadata.max_seq_len_k + draft_token_num
+                dcp_enabled = get_parallel().dcp_enabled
+                max_seq_len = metadata.max_seq_len_k + (
+                    0 if dcp_enabled else draft_token_num
+                )
                 ragged_layout = forward_batch.spec_info.ragged_verify_layout
-                if ragged_layout is None:
-                    # Uniform verify: all sequences carry draft_token_num tokens.
+                if ragged_layout is None or dcp_enabled:
                     q = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
                     needs_unpad = False
                 else:
-                    # Front-align packed tokens into a zeroed dense [bs, N]
-                    # buffer under uniform seq_lens_k: row j attends exactly to
-                    # seq_i + j, over-length tier-padding rows are clamped, and
-                    # rows past a request's verify len yield discarded output.
                     if ragged_layout.bs != bs:
                         ragged_layout = ragged_layout.padded_to_bucket(padded_bs=bs)
                     total_tokens = q.shape[0]
@@ -1009,6 +1085,44 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                     unpad_sum_seq_lens_q = total_tokens
 
             assert kv_cache.dtype == self.data_type
+
+            if (
+                forward_batch.forward_mode.is_target_verify()
+                and get_parallel().dcp_enabled
+            ):
+                raw_out, lse = self._run_decode_kernel(
+                    query=q,
+                    kv_cache=kv_cache,
+                    block_tables=metadata.block_kv_indices,
+                    seq_lens=metadata.seq_lens_k,
+                    max_seq_len=max_seq_len,
+                    layer=layer,
+                    causal_seqs=metadata.global_seq_lens_k,
+                    cp_world=get_parallel().dcp_size,
+                    cp_rank=get_parallel().dcp_rank,
+                    return_lse=True,
+                )
+                output = raw_out.view(
+                    bs * draft_token_num,
+                    layer.tp_q_head_num,
+                    layer.v_head_dim,
+                )
+                lse = lse.view(bs * draft_token_num, layer.tp_q_head_num)
+                dense_q_indptr = torch.arange(
+                    0,
+                    (bs + 1) * draft_token_num,
+                    draft_token_num,
+                    dtype=torch.int32,
+                    device=q.device,
+                )
+                fixup_zero_kv_rows(
+                    output,
+                    lse,
+                    metadata.seq_lens_k,
+                    dense_q_indptr,
+                    draft_token_num,
+                )
+                return output.flatten(1), lse
 
             raw_out = self._run_decode_kernel(
                 query=q,

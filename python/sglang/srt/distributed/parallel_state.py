@@ -50,6 +50,10 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     is_in_tc_piecewise_cuda_graph,
 )
 from sglang.srt.platforms.device_mixin import _DEVICE_TO_DISTRIBUTED_BACKEND
+from sglang.srt.runtime_context import (
+    get_global_dwdp_manager,
+    set_global_dwdp_manager,
+)
 from sglang.srt.utils import (
     get_current_device_stream_fast,
     get_int_env_var,
@@ -660,10 +664,22 @@ class GroupCoordinator:
             self.pymscclpp_comm is not None
             and self.pymscclpp_comm.should_mscclpp_allreduce(input_)
         )
+        # With the MNNVL opt-in, let CustomAllReduceV2 take eligible (small)
+        # inputs ahead of the symm-mem pynccl fast path; otherwise pynccl
+        # would absorb every all-reduce whenever --enable-symm-mem is on and
+        # v2 never runs. Large inputs fail should_custom_ar and still go to
+        # the symm-mem path below.
+        _ca_takes_input = (
+            _CA_V2_MULTINODE
+            and self.ca_comm is not None
+            and not self.ca_comm.disabled
+            and self.ca_comm.should_custom_ar(input_)
+        )
         if (
             self.pynccl_comm is not None
             and self.is_symmetric_memory_enabled()
             and not should_use_pymscclpp_allreduce
+            and not _ca_takes_input
         ):
             self.debug_check_symmetric_mempool(self, {"input": input_}, "all_reduce")
             with self.pynccl_comm.change_state(enable=True):
@@ -934,7 +950,12 @@ class GroupCoordinator:
         return True
 
     def _all_to_all_single(self, output: torch.Tensor, input: torch.Tensor) -> None:
-        torch.distributed.all_to_all_single(output, input, group=self.device_group)
+        # pynccl path keeps the a2a exchange CUDA-graph-capturable (DCP a2a backend).
+        pynccl_comm = self.pynccl_comm
+        if pynccl_comm is not None and not pynccl_comm.disabled:
+            pynccl_comm.all_to_all_single(output, input)
+        else:
+            torch.distributed.all_to_all_single(output, input, group=self.device_group)
 
     def all_to_all_single(self, output: torch.Tensor, input: torch.Tensor):
         if self.world_size == 1:
@@ -1840,6 +1861,9 @@ logger = logging.getLogger(__name__)
 _ENABLE_CUSTOM_ALL_REDUCE = True
 _ENABLE_MSCCLPP_ALL_REDUCE = False
 _ENABLE_TORCH_SYMM_MEM_ALL_REDUCE = False
+# Read once at import: whether CustomAllReduceV2 is opted in on a multi-node
+# (MNNVL) group. Used on the all_reduce hot path (see GroupCoordinator).
+_CA_V2_MULTINODE = envs.SGLANG_ENABLE_CUSTOM_ALL_REDUCE_V2_MULTINODE.get()
 
 
 def set_custom_all_reduce(enable: bool):
@@ -2615,6 +2639,11 @@ def get_moe_tensor_parallel_rank():
 
 def destroy_model_parallel():
     """Set the groups to none and destroy them."""
+    dwdp_mgr = get_global_dwdp_manager()
+    if dwdp_mgr is not None:
+        dwdp_mgr.cleanup()
+        set_global_dwdp_manager(None)
+
     global _TP
     if _TP:
         _TP.destroy()

@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import ctypes
 import hashlib
+import logging
 import os
 import pathlib
 import shutil
@@ -102,12 +103,49 @@ _SOURCES = [
 ]
 
 
-def sdk_dir() -> Optional[pathlib.Path]:
-    p = envs.SGLANG_TRTLLM_GEN_MOE_SDK.get()
-    if not p:
-        return None
+logger = logging.getLogger(__name__)
+
+# Formal on-box install location, searched when SGLANG_TRTLLM_GEN_MOE_SDK is
+# unset. The pre-formalization ad-hoc location (/scratch/nv_work/...) is still
+# honored as a fallback but is deprecated.
+_SDK_DEFAULT_DIR = "/opt/sglang/trtllm_gen_moe_sdk"
+_SDK_LEGACY_DIR = "/scratch/nv_work/trtllmgen_MOE"
+_warned_legacy_sdk_dir = False
+
+
+def _warn_legacy_sdk_dir(path: pathlib.Path) -> None:
+    global _warned_legacy_sdk_dir
+    if _warned_legacy_sdk_dir:
+        return
+    _warned_legacy_sdk_dir = True
+    logger.warning(
+        "trtllm-gen MoE SDK resolved from the deprecated location %s; move it "
+        "to %s (or point SGLANG_TRTLLM_GEN_MOE_SDK at it). The legacy "
+        "nv_work fallback will be removed.",
+        path,
+        _SDK_DEFAULT_DIR,
+    )
+
+
+def _sdk_dir_if_valid(p: str) -> Optional[pathlib.Path]:
     path = pathlib.Path(p)
     return path if (path / "csrc").is_dir() else None
+
+
+def sdk_dir() -> Optional[pathlib.Path]:
+    p = envs.SGLANG_TRTLLM_GEN_MOE_SDK.get()
+    if p:
+        path = _sdk_dir_if_valid(p)
+        if path is not None and "/nv_work/" in str(path.resolve()):
+            _warn_legacy_sdk_dir(path)
+        return path
+    path = _sdk_dir_if_valid(_SDK_DEFAULT_DIR)
+    if path is not None:
+        return path
+    path = _sdk_dir_if_valid(_SDK_LEGACY_DIR)
+    if path is not None:
+        _warn_legacy_sdk_dir(path)
+    return path
 
 
 def cubin_pool_dir() -> Optional[pathlib.Path]:
@@ -305,6 +343,8 @@ def trtllm_fp4_block_scale_moe(
     routing_method_type: int = ROUTING_DEEPSEEK_V3,
     activation_type: int = ACTIVATION_SITU,
     norm_topk_prob: bool = True,
+    local_expert_offset: int = 0,
+    local_num_experts: Optional[int] = None,
     tactic: Sequence[int] = (-1, -1),
     output: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
@@ -359,8 +399,8 @@ def trtllm_fp4_block_scale_moe(
         n_group,
         topk_group,
         intermediate_size,
-        0,  # local_expert_offset
-        num_experts,  # local_num_experts
+        local_expert_offset,
+        num_experts if local_num_experts is None else local_num_experts,
         routed_scaling_factor,
         routing_method_type,
         True,  # do_finalize
@@ -391,9 +431,12 @@ def trtllm_fp4_block_scale_routed_moe(
     top_k: int,
     intermediate_size: int,
     activation_type: int = ACTIVATION_SITU,
+    local_expert_offset: int = 0,
+    local_num_experts: Optional[int] = None,
     tactic: Sequence[int] = (-1, -1),
     output: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
+    do_finalize: bool = True,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """FP4 block-scale MoE with PRECOMPUTED routing (PackedPrecomputed).
 
     ``packed_topk_ids``: int32 ``[T, top_k]`` with ``(expert_id << 16) |
@@ -401,6 +444,13 @@ def trtllm_fp4_block_scale_routed_moe(
     from the caller's router, the in-op routing kernels are skipped. This
     is the fast path at small T, where the in-op single-CTA routing kernel
     (~22 µs at 896 experts) costs more than an external radix router.
+
+    ``do_finalize=False`` skips the in-op finalize (top-k weighted
+    unpermute) and returns its inputs instead:
+    ``(gemm2_output [padded_rows, hidden] bf16 in permuted layout,
+    topk_weights [T, top_k] bf16 unpacked from packed_topk_ids,
+    expanded_idx_to_permuted_idx [T*top_k] int32 with -1 = dropped slot)``.
+    ``output`` is left unwritten in that mode.
     """
     module = _jit_trtllm_gen_moe_module()
     hidden_states = hidden_states.contiguous()
@@ -415,7 +465,7 @@ def trtllm_fp4_block_scale_routed_moe(
         output = torch.empty(
             num_tokens, hidden_size, dtype=torch.bfloat16, device=device
         )
-    module.trtllm_fp4_block_scale_moe_private(
+    result = module.trtllm_fp4_block_scale_moe_private(
         _ROUTING_INPUT_PACKED,
         None,  # routing_logits
         packed_topk_ids.contiguous(),
@@ -441,11 +491,11 @@ def trtllm_fp4_block_scale_routed_moe(
         None,  # n_group
         None,  # topk_group
         intermediate_size,
-        0,  # local_expert_offset
-        num_experts,  # local_num_experts
+        local_expert_offset,
+        num_experts if local_num_experts is None else local_num_experts,
         1.0,  # routed_scaling_factor (already applied by the router)
         _ROUTING_TOPK,  # routing_method_type (unused for precomputed)
-        True,  # do_finalize
+        do_finalize,
         True,  # enable_pdl
         activation_type,
         output,
@@ -453,4 +503,10 @@ def trtllm_fp4_block_scale_routed_moe(
         True,  # norm_topk_prob (unused for precomputed)
         None,  # routing_replay_out
     )
-    return output
+    if do_finalize:
+        return output
+    # Deferred: [gemm2_output, expert_weights (None in packed mode — the
+    # weights live in the topk_weights buffer mode 2 unpacked into),
+    # expanded_idx_to_permuted_idx]. Index access — iterating the tvm-ffi
+    # Array yields one-shot dlpack capsules.
+    return result[0], topk_weights, result[2]

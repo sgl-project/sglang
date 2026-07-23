@@ -419,6 +419,7 @@ class NPUW4A8Int8MoEMethod(_NPUMoEMethodBase):
             if scale_second is not None:
                 delattr(layer, f"{weight_prefix}_weight_scale_second")
                 delattr(layer, f"{weight_prefix}_weight_offset_second")
+            self._update_bias(layer, weight_prefix)
         else:
             # With clip: simple squeeze + unsqueeze
             processed_scale = scale.data.squeeze(-1).unsqueeze(1).contiguous()
@@ -450,6 +451,16 @@ class NPUW4A8Int8MoEMethod(_NPUMoEMethodBase):
         # Set dispatcher output dtype
         if weight_prefix == "w13":
             self._set_dispatcher_output_dtype(layer, "int8")
+
+    @staticmethod
+    def _update_bias(
+        layer: torch.nn.Module,
+        weight_prefix: str,
+    ) -> None:
+        scale_bias_name = f"{weight_prefix}_scale_bias"
+        if hasattr(layer, scale_bias_name):
+            scale_bias = getattr(layer, scale_bias_name)
+            scale_bias.data = scale_bias.data.transpose(1, 2).contiguous().sum(dim=1)
 
     def _process_scale(
         self,

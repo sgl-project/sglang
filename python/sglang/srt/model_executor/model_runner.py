@@ -128,6 +128,7 @@ from sglang.srt.model_executor.model_runner_components.load_model_utils import (
     load_kv_cache_scales,
     load_model_with_memory_saver,
     maybe_downgrade_dtype_for_legacy_gpu,
+    maybe_precompile_model_kernels_after_loading,
     maybe_register_debug_tensor_dump_hook,
     maybe_trigger_remote_instance_nccl_send_group,
     report_online_quantization,
@@ -160,7 +161,11 @@ from sglang.srt.model_executor.runner import (
     get_batch_sizes_to_capture,
 )
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import (
+    get_global_dwdp_manager,
+    get_server_args,
+    set_global_dwdp_manager,
+)
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import (  # noqa: F401  (re-export)
     CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS,
@@ -537,6 +542,7 @@ class ModelRunner:
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             memory_pool_config=self.memory_pool_config,
+            draft_model_idx=self.draft_model_idx,
         )
 
     def init_mindspore_runner(self):
@@ -571,6 +577,9 @@ class ModelRunner:
             moe_ep_size=self.ps.moe_ep_size,
             moe_ep_rank=self.ps.moe_ep_rank,
         )
+
+        self.maybe_init_dwdp()
+
         # Must run before backend/graph init so no draft graph records a
         # routed-experts capture-write kernel.
         if self.is_draft_worker:
@@ -834,6 +843,50 @@ class ModelRunner:
         self.prefill_attention_backend_str = backends.prefill_attention_backend_str
         self.decode_attention_backend_str = backends.decode_attention_backend_str
 
+        if self.server_args.dcp_size > 1 and self.server_args.dcp_replicate_q_proj:
+            self._prepare_replicated_q_proj()
+
+    def _prepare_replicated_q_proj(self) -> None:
+        # --dcp-replicate-q-proj: gather each rank's attn_tp head-shard of
+        # q_b_proj / w_kc into full-head buffers once here (pre-capture) so the
+        # MLA decode path can skip the per-layer Q all-gather. bf16/fp16 only.
+        from sglang.srt.distributed.parallel_state import get_dcp_group
+        from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+        from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
+
+        dcp_group = get_dcp_group()
+        if dcp_group.world_size <= 1:
+            return
+        n_prepared = 0
+        for m in self.model.modules():
+            if not isinstance(m, DeepseekV2AttentionMLA):
+                continue
+            if m.w_kc is None:
+                continue
+            qp = m.q_b_proj if m.has_q_b_proj else m.q_proj
+            # q-replicate only supports the unquantized bf16/fp16 absorb path;
+            # quantized q-proj (packed weights) and non-16-bit w_kc keep the
+            # per-layer Q all-gather.
+            if (
+                m.w_kc.dtype not in (torch.bfloat16, torch.float16)
+                or not isinstance(qp.quant_method, UnquantizedLinearMethod)
+                or qp.weight.dtype not in (torch.bfloat16, torch.float16)
+            ):
+                logger.warning(
+                    "dcp_replicate_q_proj: skipping quantized q-proj/w_kc "
+                    "(bf16/fp16 only); this layer keeps the Q all-gather."
+                )
+                continue
+            m.w_kc_qrep = dcp_group.all_gather(m.w_kc.contiguous(), dim=0)
+            m.q_b_proj_qrep_weight = dcp_group.all_gather(
+                qp.weight.data.contiguous(), dim=0
+            )
+            n_prepared += 1
+        logger.info(
+            "dcp_replicate_q_proj: prepared full-head Q weights for %d MLA layers",
+            n_prepared,
+        )
+
     def init_cuda_graphs(self, capture_decode_cuda_graph: bool = True):
         capture = capture_cuda_graphs(
             model_runner=self, capture_decode_cuda_graph=capture_decode_cuda_graph
@@ -950,6 +1003,8 @@ class ModelRunner:
         if not self.is_draft_worker:
             get_offloader().post_init()
 
+        self.maybe_precompile_model_kernels_after_loading()
+
         # Register model for layerwise NVTX profiling if enabled
         if self.server_args.enable_layerwise_nvtx_marker:
             pyt_hooks = PytHooks()
@@ -1012,6 +1067,20 @@ class ModelRunner:
             tp_rank=self.ps.tp_rank,
             is_ep_scale_joiner=self.server_args.is_ep_scale_joiner,
         )
+
+    def maybe_precompile_model_kernels_after_loading(self) -> None:
+        maybe_precompile_model_kernels_after_loading(self.model, self.device)
+
+    def maybe_init_dwdp(self):
+        if self.is_draft_worker:
+            return
+        if self.server_args.dwdp_size <= 1:
+            return
+        from sglang.srt.layers.moe.dwdp import DwdpManager
+
+        manager = DwdpManager(self.server_args)
+        set_global_dwdp_manager(manager)
+        manager.setup(self.model)
 
     def init_lora_manager(self):
         self.lora_manager = LoRAManager(
@@ -1423,6 +1492,10 @@ class ModelRunner:
             # dispatch below reads the pool.
             self._maybe_execute_deferred_mamba_cow_and_clear(forward_batch)
 
+            dwdp_mgr = get_global_dwdp_manager()
+            if dwdp_mgr is not None:
+                dwdp_mgr.prefetch_first_layers()
+
             if forward_batch.forward_mode.is_split_prefill():
                 # Layer-split mode; stays on ModelRunner, not the eager runner.
                 ret = self.forward_split_prefill(
@@ -1551,7 +1624,6 @@ class ModelRunner:
         self.sampler.compute_logprobs_only(
             logits_output,
             forward_batch.sampling_info,
-            forward_batch.return_logprob,
             forward_batch.top_logprobs_nums,
             forward_batch.token_ids_logprobs,
         )

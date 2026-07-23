@@ -13,10 +13,14 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
+import asyncio
+import concurrent.futures
 import io
 import unittest
+from unittest.mock import Mock, patch
 
 import numpy as np
+import requests
 from PIL import Image
 
 from sglang.srt.managers.schedule_batch import Modality
@@ -29,6 +33,9 @@ class _StubProcessor(BaseMultimodalProcessor):
     # exercises exactly the lazy-decode branch the fix targets. The abstract methods
     # are never called: we only invoke the _load_single_item classmethod.
     gpu_image_decode = False
+
+    async def process_mm_data_async(self, *args, **kwargs):
+        raise NotImplementedError
 
 
 def _png_bytes(mode: str = "RGB", size=(8, 8)) -> bytes:
@@ -74,6 +81,45 @@ class TestLoadSingleItemImageDecode(CustomTestCase):
         img = _StubProcessor._load_single_item(data, Modality.IMAGE)
         ref = Image.open(io.BytesIO(data)).convert("RGB")
         np.testing.assert_array_equal(np.asarray(img), np.asarray(ref))
+
+    def test_fast_loader_preserves_invalid_input_as_value_error(self):
+        processor = object.__new__(_StubProcessor)
+        future = concurrent.futures.Future()
+        future.set_exception(ValueError("invalid base64 image"))
+        processor._submit_mm_data_loading_tasks_simple = Mock(
+            side_effect=[[(Modality.IMAGE, 0, future)], [], []]
+        )
+
+        with self.assertRaisesRegex(ValueError, "invalid base64 image"):
+            asyncio.run(
+                processor.fast_load_mm_data(
+                    prompt="<image>",
+                    multimodal_tokens=Mock(),
+                    image_data=["bad-image"],
+                )
+            )
+
+    def test_unreachable_image_url_is_a_client_error(self):
+        with patch(
+            "sglang.srt.multimodal.processors.base_processor.load_image",
+            side_effect=requests.ConnectionError("connection refused"),
+        ):
+            with self.assertRaisesRegex(ValueError, "connection refused"):
+                _StubProcessor._load_single_item(
+                    "https://127.0.0.1:1/not-an-image.png", Modality.IMAGE
+                )
+
+    def test_invalid_image_bytes_are_a_client_error(self):
+        with self.assertRaisesRegex(ValueError, "cannot identify image file"):
+            _StubProcessor._load_single_item(b"not an image", Modality.IMAGE)
+
+    def test_unexpected_loader_bug_remains_a_server_error(self):
+        with patch(
+            "sglang.srt.multimodal.processors.base_processor.load_image",
+            side_effect=TypeError("unexpected loader bug"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "unexpected loader bug"):
+                _StubProcessor._load_single_item(b"image", Modality.IMAGE)
 
 
 if __name__ == "__main__":

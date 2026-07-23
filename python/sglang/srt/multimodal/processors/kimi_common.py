@@ -38,6 +38,30 @@ class KimiGridMMDataMixin:
             for image in images
         ]
 
+    @staticmethod
+    def validate_tokenized_image_placeholders(
+        input_ids, image_token_id: int, expected_image_count: int
+    ) -> bool:
+        """Validate structural image tokens, returning whether IDs were supplied."""
+        if not isinstance(input_ids, (list, torch.Tensor)):
+            return False
+
+        token_ids = np.asarray(
+            (
+                input_ids.detach().flatten().cpu()
+                if isinstance(input_ids, torch.Tensor)
+                else input_ids
+            ),
+            dtype=np.int64,
+        )
+        placeholder_count = int(np.count_nonzero(token_ids == image_token_id))
+        if placeholder_count != expected_image_count:
+            raise ValueError(
+                "Kimi image placeholders must map one-to-one to image data: "
+                f"expected {expected_image_count}, found {placeholder_count} token(s)"
+            )
+        return True
+
     def _num_image_tokens_from_grid(
         self, grid_thw: Union[torch.Tensor, np.ndarray, list, tuple]
     ) -> int:

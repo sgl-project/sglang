@@ -168,6 +168,12 @@ class TritonKDAKernel(LinearAttnKernelBase):
         cache_steps: int,
         retrieve_parent_token: torch.Tensor,
         lower_bound: Optional[float] = None,
+        # fused ReplaySSM ring-write (dense verify only; off elsewhere).
+        cache_ring: bool = False,
+        replayssm_rawv: Optional[torch.Tensor] = None,
+        replayssm_rawk: Optional[torch.Tensor] = None,
+        replayssm_g: Optional[torch.Tensor] = None,
+        replayssm_beta: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
         # KDA MTP / speculative-decode verify via the fused KDA kernel (IS_KDA=True),
@@ -197,6 +203,11 @@ class TritonKDAKernel(LinearAttnKernelBase):
             cache_steps=cache_steps,
             retrieve_parent_token=retrieve_parent_token,
             lower_bound=lower_bound,
+            cache_ring=cache_ring,
+            replayssm_rawv=replayssm_rawv,
+            replayssm_rawk=replayssm_rawk,
+            replayssm_g=replayssm_g,
+            replayssm_beta=replayssm_beta,
         )
 
     def extend(

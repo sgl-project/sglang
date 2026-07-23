@@ -310,7 +310,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             cuda_graph_bs = forward_batch.batch_size
 
         is_bs_supported = (
-            self.backend.can_run(forward_batch, cuda_graph_bs)
+            self.backend.can_run(forward_batch, self._make_graph_key(cuda_graph_bs))
             if self.disable_padding
             else cuda_graph_bs <= self.max_bs
         )
@@ -484,7 +484,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             self.backend.capture_one(
                 shape_key,
                 run_once,
-                dummies=None,
+                capture_inputs=None,
                 post_warmup_hook=post_warmup_hook,
             )
 

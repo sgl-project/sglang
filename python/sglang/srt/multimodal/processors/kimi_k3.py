@@ -15,7 +15,6 @@ import numpy as np
 import torch
 from PIL import Image
 
-from sglang.kernels.ops.mm.process import normalize_and_patchify
 from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput
 from sglang.srt.models.kimi_k3 import KimiK3ForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
@@ -28,9 +27,11 @@ from sglang.srt.multimodal.processors.kimi_common import KimiGridMMDataMixin
 from sglang.srt.multimodal.processors.kimi_k25 import (
     KimiGPUProcessorWrapper,
     _get_image_dimensions,
-    _grid_thw_from_resize_config,
-    _resize_bicubic_if_needed,
+    _gpu_preprocess_images,
     navit_resize_config,
+)
+from sglang.srt.utils.cuda_ipc_transport_utils import (
+    DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
 )
 
 
@@ -90,28 +91,6 @@ def _fill_transparent_bg(x: torch.Tensor, bg_cfg: Union[dict, None]) -> torch.Te
     return (alpha * rgb + (1.0 - alpha) * bg).clamp(0.0, 255.0)
 
 
-def _k3_process_single_image(
-    image: Union[torch.Tensor, Image.Image],
-    config: dict,
-    image_scale: torch.Tensor,
-    image_bias: torch.Tensor,
-    patch_size: int,
-    transparent_bg_config: Union[dict, None],
-) -> torch.Tensor:
-    image = _k3_to_cuda_chw(image)
-
-    new_h, new_w = config["new_height"], config["new_width"]
-    padded_h = new_h + config["pad_height"]
-    padded_w = new_w + config["pad_width"]
-
-    x = _resize_bicubic_if_needed(image.unsqueeze(0), new_h, new_w)
-    x = _fill_transparent_bg(x, transparent_bg_config)
-
-    return normalize_and_patchify(
-        x, image_scale, image_bias, patch_size, padded_h, padded_w
-    ).squeeze(0)
-
-
 class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
     def __init__(self, *args, transparent_bg_config=None, **kwargs):
         super().__init__(*args, **kwargs)
@@ -140,23 +119,19 @@ class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
         )
 
         image_scale, image_bias = self._get_gpu_norm_tensors()
-        patches = []
-        grids = []
-        for image, config in zip(images, resize_configs):
-            patches.append(
-                _k3_process_single_image(
-                    image,
-                    config,
-                    image_scale,
-                    image_bias,
-                    self._patch_size,
-                    self._transparent_bg_config,
-                )
-            )
-            grids.append(_grid_thw_from_resize_config(config, self._patch_size))
-
-        pixel_values = torch.cat(patches, dim=0)
-        grid_thws = torch.tensor(grids, dtype=torch.int64)
+        # Shared source-compatible batched pipeline (same as K2.5): RGBA
+        # inputs land in their own source-shape groups, and the
+        # transparent-background compositing runs on each resized batch
+        # before patchify -- identical order to the previous per-image path.
+        pixel_values, grid_thws = _gpu_preprocess_images(
+            images,
+            resize_configs,
+            image_scale,
+            image_bias,
+            self._patch_size,
+            to_chw=_k3_to_cuda_chw,
+            post_resize=lambda x: _fill_transparent_bg(x, self._transparent_bg_config),
+        )
 
         return {
             "input_ids": input_ids,
@@ -207,18 +182,53 @@ class KimiK3ImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
         *args,
         **kwargs,
     ):
-        base_output = await self.load_mm_data(
-            prompt=input_text,
-            image_data=image_data,
-            multimodal_tokens=self.mm_tokens,
-            discard_alpha_channel=False,
-        )
+        if getattr(request_obj, "video_data", None) or kwargs.get("audio_data"):
+            raise ValueError("Kimi-K3 supports image input only")
+
+        expected_image_count = len(image_data or [])
+        if self.validate_tokenized_image_placeholders(
+            input_text, self.mm_tokens.image_token_id, expected_image_count
+        ):
+            # Keep structural media tokens distinct from user text that happens to
+            # spell ``<|media_pad|>``. Decoding the whole prompt and matching the
+            # resulting string would lose that distinction and could bind an image
+            # to user-provided text instead of the renderer-inserted token.
+            base_output = await self.fast_load_mm_data(
+                prompt=input_text,
+                image_data=image_data,
+                multimodal_tokens=self.mm_tokens,
+                discard_alpha_channel=False,
+            )
+        else:
+            base_output = await self.load_mm_data(
+                prompt=input_text,
+                image_data=image_data,
+                multimodal_tokens=self.mm_tokens,
+                discard_alpha_channel=False,
+            )
+
+        if len(base_output.images) != expected_image_count:
+            raise ValueError(
+                "Kimi image placeholders must map one-to-one to image data: "
+                f"expected {expected_image_count}, loaded {len(base_output.images)}"
+            )
 
         mm_items, input_ids, _ = await self.process_and_combine_mm_data_async(
             base_output,
             self.mm_tokens,
             sglang_original_input_ids=base_output.input_ids,
         )
+
+        # K3's tower is unconditionally image-wise data-parallel (each image
+        # is consumed by exactly one TP rank), so keep IPC proxies lazy until
+        # that assignment is known: one tokenizer/scheduler crossing per
+        # image instead of one per rank. K2.5 gates this on
+        # --mm-enable-dp-encoder; K3 needs no flag.
+        if getattr(self, "use_cuda_ipc", False):
+            for item in mm_items:
+                item.model_specific_data[DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY] = (
+                    True
+                )
 
         return MultimodalProcessorOutput(
             input_ids=input_ids.tolist(),

@@ -174,6 +174,7 @@ def attn_res_fused_tma(
     nvb: int,
     eps: float,
     *,
+    write_prefix: bool = False,
     chunk_rows: int | None = None,
     occupancy: int | None = None,
     consumer_regs: int | None = None,
@@ -199,6 +200,9 @@ def attn_res_fused_tma(
     out        : [T, H] bf16 output buffer
     nvb        : number of valid bank rows (1..8)
     eps        : RMSNorm epsilon (shared by score and output norms)
+    write_prefix : also snapshot the prefix row into bank[:, nvb, :]
+                 (bit-exact copy, fused into the score pass which already
+                 has the row in registers); requires NB > nvb
     """
     if not 1 <= nvb <= _MAX_BANK_ROWS:
         raise ValueError(
@@ -214,7 +218,9 @@ def attn_res_fused_tma(
         occupancy if occupancy is not None else best[1],
         consumer_regs if consumer_regs is not None else best[2],
     )
-    _jit_fused_tma_module(*config).run(prefix_sum, bank, cw, ow, out, nvb, eps)
+    _jit_fused_tma_module(*config).run(
+        prefix_sum, bank, cw, ow, out, nvb, eps, write_prefix
+    )
 
 
 def attn_res_score_fused_add(

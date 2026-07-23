@@ -8,7 +8,11 @@ from typing import TYPE_CHECKING, Any, Optional
 import msgspec
 import torch
 
-from sglang.srt.configs.hybrid_arch import hybrid_gdn_config, mambaish_config
+from sglang.srt.configs.hybrid_arch import (
+    hybrid_gdn_config,
+    kimi_linear_config,
+    mambaish_config,
+)
 from sglang.srt.configs.model_config import (
     ModelConfig,
     get_dsa_index_head_dim,
@@ -48,6 +52,7 @@ from sglang.srt.mem_cache.memory_pool import (
     KVCache,
     MHATokenToKVPool,
     MHATokenToKVPoolFP4,
+    MHATokenToKVPoolMXFP8,
     MiniMaxSparseKVPool,
     MLATokenToKVPool,
     MLATokenToKVPoolFP4,
@@ -176,12 +181,30 @@ class KVCacheConfigurator:
     req_to_token_pool: Optional[ReqToTokenPool]
     token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator]
     memory_pool_config: Optional[MemoryPoolConfig]
+    draft_model_idx: Optional[int] = None
     mambaish_config: Optional[Any] = field(init=False)
     hybrid_gdn_config: Optional[Any] = field(init=False)
+    is_inkling_mtp_draft: bool = field(init=False)
+    draft_swa_full_capacity: bool = field(init=False)
 
     def __post_init__(self) -> None:
         self.mambaish_config = mambaish_config(self.model_config)
         self.hybrid_gdn_config = hybrid_gdn_config(self.model_config)
+        # Each multi-layer EAGLE MTP head owns one transformer block at
+        # layer_id=draft_model_idx; heads at a banded 's' depth route that layer
+        # into the SWA ring sub-pool (draft_swa_full_capacity) so the SWA
+        # store/read path activates for this depth, exactly like a trunk local
+        # layer.
+        self.is_inkling_mtp_draft = (
+            self.is_draft_worker
+            and self.draft_model_idx is not None
+            and self.model_config.hf_config.architectures[0]
+            == "InklingForConditionalGenerationMTP"
+        )
+        self.draft_swa_full_capacity = self.is_inkling_mtp_draft and (
+            self.draft_model_idx
+            in set(self.model_config.hf_text_config.mtp_local_layer_ids)
+        )
 
     def _build_fp4_quant_method(self, *, num_layers: int):
         if not is_float4_e2m1fn_x2(self.kv_cache_dtype):
@@ -240,6 +263,18 @@ class KVCacheConfigurator:
         if self.is_hybrid_swa:
             full_max_total_num_tokens = config.full_max_total_num_tokens
             swa_max_total_num_tokens = config.swa_max_total_num_tokens
+
+        # Under DCP the shared allocator emits virtual locs in
+        # [0, max_total * dcp_size). Draft-worker pools are replicated (not
+        # DCP-sharded) and consume these locs untranslated, so every
+        # token-loc-indexed capacity must cover the full virtual space.
+        dcp_size = self.server_args.dcp_size
+        if self.is_draft_worker and dcp_size > 1:
+            max_total_num_tokens *= dcp_size
+            if full_max_total_num_tokens is not None:
+                full_max_total_num_tokens *= dcp_size
+            if swa_max_total_num_tokens is not None:
+                swa_max_total_num_tokens *= dcp_size
 
         # DSV4 compressed-attention pool sizes. Draft worker reuses target's
         # full/swa sizes but does NOT own c4/c128/state pools (those live on
@@ -329,6 +364,24 @@ class KVCacheConfigurator:
         else:
             # Draft worker shares req_to_token_pool with the target worker.
             assert self.is_draft_worker
+            # Each multi-layer EAGLE MTP head owns one transformer block at
+            # layer_id=draft_model_idx and needs its own sconv/mamba cache while
+            # sharing the target's request-to-token mapping.
+            if self.is_inkling_mtp_draft and isinstance(
+                req_to_token_pool, HybridReqToTokenPool
+            ):
+                # speculative_num_draft_tokens=None: draft heads never run
+                # TARGET_VERIFY, so their pools skip the per-step intermediate
+                # (SpeculativeState) buffers only the target pool consumes.
+                req_to_token_pool = req_to_token_pool.clone_with_new_mamba(
+                    mamba_size=self.server_args.max_mamba_cache_size,
+                    mamba_spec_state_size=sizes.max_running_requests,
+                    cache_params=self.mambaish_config.mamba2_cache_params,
+                    device=self.device,
+                    enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
+                    draft_model_idx=self.draft_model_idx,
+                    speculative_eagle_topk=self.server_args.speculative_eagle_topk,
+                )
 
         # Initialize token_to_kv_pool
         is_dsa_model = is_deepseek_dsa(self.model_config.hf_config)
@@ -387,9 +440,6 @@ class KVCacheConfigurator:
 
         config = self.mambaish_config
         assert config is not None
-        assert (
-            not self.use_mla_backend
-        ), "unified memory pool does not support MLA-hybrid-Mamba yet"
         # The full sub-pool is page-aware (via `MultiEndedAllocator(page_size=...)`);
         # the mamba sub-pool stays page=1.
         assert self.page_size >= 1, f"page_size must be >= 1, got {self.page_size}"
@@ -419,6 +469,12 @@ class KVCacheConfigurator:
             end_layer=self.layer_info.end_layer,
             is_draft_worker=self.is_draft_worker,
             use_mla_backend=self.use_mla_backend,
+            kv_lora_rank=(
+                self.model_config.kv_lora_rank if self.use_mla_backend else None
+            ),
+            qk_rope_head_dim=(
+                self.model_config.qk_rope_head_dim if self.use_mla_backend else None
+            ),
             mamba_layer_ids=mamba_layer_ids,
             full_attention_layer_ids=full_attention_layer_ids,
             mamba2_cache_params=config.mamba2_cache_params,
@@ -662,6 +718,18 @@ class KVCacheConfigurator:
         max_num_reqs: int,
         extra_max_context_len: int,
     ) -> ReqToTokenPool:
+        # DSPARK/DFLASH commit routes through the backend fold (KDA-only); a
+        # non-KDA model there would scatter a None intermediate_ssm and crash.
+        _algo = (self.server_args.speculative_algorithm or "").upper()
+        if (
+            self.server_args.enable_gdn_replayssm_spec
+            and _algo in ("DSPARK", "DFLASH")
+            and kimi_linear_config(self.model_config) is None
+        ):
+            raise ValueError(
+                "--enable-gdn-replayssm-spec with DSPARK/DFLASH requires a KDA "
+                "(kimi_linear) model; got a non-KDA model."
+            )
         req_to_token_pool = HybridReqToTokenPool(
             size=max_num_reqs,
             mamba_size=self.server_args.max_mamba_cache_size,
@@ -686,6 +754,17 @@ class KVCacheConfigurator:
             enable_linear_replayssm=self.server_args.enable_linear_replayssm,
             linear_replayssm_cache_len=self.server_args.linear_replayssm_cache_len,
             mamba_envelope_layout=self.server_args.enable_page_major_kv_layout,
+            # ReplaySSM spec-verify is for linear-attn models (GDN chunked-flush
+            # or KDA fold); activate the pool machinery only for those, so any
+            # other mamba-ish model (Mamba2/Nemotron, lightning, ...) run with the
+            # flag set stays byte-identical to flag-off.
+            enable_gdn_replayssm_spec=(
+                self.server_args.enable_gdn_replayssm_spec
+                and (
+                    self.hybrid_gdn_config is not None
+                    or kimi_linear_config(self.model_config) is not None
+                )
+            ),
         )
         return req_to_token_pool
 
@@ -1144,19 +1223,48 @@ class KVCacheConfigurator:
                 "swa_v_head_dim": self.model_config.swa_v_head_dim,
                 "v_head_dim": self.model_config.v_head_dim,
             }
+        swa_pool_class = (
+            MHATokenToKVPoolMXFP8
+            if self.server_args.kv_cache_dtype == "mxfp8"
+            else mha_pool_class
+        )
+        swa_attention_layer_ids = self.model_config.swa_attention_layer_ids
+        full_attention_layer_ids = self.model_config.full_attention_layer_ids
+        if self.is_inkling_mtp_draft:
+            if self.draft_swa_full_capacity:
+                # Banded 's' depth: route the draft's single layer into the SWA
+                # ring sub-pool so use_sliding_window_kv_pool activates the SWA
+                # store/read path for this depth, exactly like a trunk local
+                # layer.
+                swa_attention_layer_ids = [self.draft_model_idx]
+                full_attention_layer_ids = []
+            else:
+                swa_attention_layer_ids = []
+                full_attention_layer_ids = [self.draft_model_idx]
+        # Size the banded draft's SWA ring to FULL draft capacity (not the
+        # trunk-window-derived swa_max): with the identity full->swa mapping
+        # registered in _build_token_to_kv_pool_allocator, every logical slot
+        # the shared target allocator hands out (up to full_max) must be
+        # addressable in the ring, whatever the head-vs-trunk window
+        # relationship.
+        size_swa = (
+            full_max_total_num_tokens
+            if self.draft_swa_full_capacity
+            else swa_max_total_num_tokens
+        )
         token_to_kv_pool = SWAKVPool(
             size=full_max_total_num_tokens,
-            size_swa=swa_max_total_num_tokens,
+            size_swa=size_swa,
             page_size=self.server_args.page_size,
             dtype=self.kv_cache_dtype,
             post_capture_active=self.post_capture_kv_active,
             head_num=self.model_config.get_num_kv_heads(get_parallel().attn_tp_size),
             head_dim=self.model_config.head_dim,
-            swa_attention_layer_ids=self.model_config.swa_attention_layer_ids,
-            full_attention_layer_ids=self.model_config.full_attention_layer_ids,
+            swa_attention_layer_ids=swa_attention_layer_ids,
+            full_attention_layer_ids=full_attention_layer_ids,
             device=self.device,
             enable_kv_cache_copy=(self.server_args.speculative_algorithm is not None),
-            token_to_kv_pool_class=mha_pool_class,
+            token_to_kv_pool_class=swa_pool_class,
             **kwargs,
         )
         return token_to_kv_pool
@@ -1211,6 +1319,13 @@ class KVCacheConfigurator:
         quant_method = self._build_fp4_quant_method(
             num_layers=len(full_attention_layer_ids)
         )
+        # MXFP8 KV cache needs the block-scaled pool (data + UE8M0 scale
+        # buffers) for the full-attention layers, same as the SWA branch.
+        full_pool_class = (
+            MHATokenToKVPoolMXFP8
+            if self.server_args.kv_cache_dtype == "mxfp8" and not self.use_mla_backend
+            else mha_pool_class
+        )
         token_to_kv_pool = HybridLinearKVPool(
             page_size=self.server_args.page_size,
             size=max_total_num_tokens,
@@ -1225,7 +1340,7 @@ class KVCacheConfigurator:
             enable_kv_cache_copy=(self.server_args.speculative_algorithm is not None),
             use_mla=self.use_mla_backend,
             start_layer=self.layer_info.start_layer,
-            full_kv_pool_class=mha_pool_class,
+            full_kv_pool_class=full_pool_class,
             quant_method=quant_method,
             post_capture_active=self.post_capture_kv_active and quant_method is None,
             **extra_args,
@@ -1253,11 +1368,14 @@ class KVCacheConfigurator:
     def _build_mha_kv_pool(
         self, *, max_total_num_tokens: int, mha_pool_class: type, quant_method=None
     ) -> KVCache:
-        pool_cls = (
-            NoOpMHATokenToKVPool
-            if self.server_args.prefill_only_disable_kv_cache
-            else mha_pool_class
-        )
+        if self.server_args.kv_cache_dtype == "mxfp8":
+            pool_cls = MHATokenToKVPoolMXFP8
+        else:
+            pool_cls = (
+                NoOpMHATokenToKVPool
+                if self.server_args.prefill_only_disable_kv_cache
+                else mha_pool_class
+            )
         pool_kwargs = {}
         if quant_method is not None:
             pool_kwargs["quant_method"] = quant_method
@@ -1413,15 +1531,31 @@ class KVCacheConfigurator:
         else:
             assert self.is_draft_worker
             if self.is_hybrid_swa:
-                swa_allocator = getattr(
-                    token_to_kv_pool_allocator,
-                    "logical_attn_allocator",
-                    token_to_kv_pool_allocator,
-                )
-                assert isinstance(swa_allocator, SWATokenToKVPoolAllocator)
-                token_to_kv_pool.register_mapping(
-                    swa_allocator.full_to_swa_index_mapping
-                )
+                if self.draft_swa_full_capacity:
+                    # Banded depth: the SWA ring is full draft capacity, so use
+                    # an IDENTITY full->swa mapping — store and read locs both
+                    # equal out_cache_loc, and a slot is never evicted before
+                    # the request frees it. The window itself is enforced by the
+                    # FA sliding-window kernel, not by the ring. Layout mirrors
+                    # SWATokenToKVPoolAllocator's mapping (size + page_size
+                    # entries + trailing -1 sentinel so a -1 last_loc maps
+                    # to -1).
+                    n = sizes.full_max_total_num_tokens + self.page_size
+                    identity_mapping = torch.arange(
+                        n + 1, dtype=torch.int64, device=self.device
+                    )
+                    identity_mapping[-1] = -1
+                    token_to_kv_pool.register_mapping(identity_mapping)
+                else:
+                    swa_allocator = getattr(
+                        token_to_kv_pool_allocator,
+                        "logical_attn_allocator",
+                        token_to_kv_pool_allocator,
+                    )
+                    assert isinstance(swa_allocator, SWATokenToKVPoolAllocator)
+                    token_to_kv_pool.register_mapping(
+                        swa_allocator.full_to_swa_index_mapping
+                    )
         return token_to_kv_pool_allocator
 
     def _profile_available_bytes(self, pre_model_load_memory: int) -> int:
@@ -1622,6 +1756,14 @@ class KVCacheConfigurator:
         assert config is not None
 
         has_spec_dec = not self.spec_algorithm.is_none()
+        # ReplaySSM drops the per-step intermediate_ssm scratch, so its mamba budget
+        # no longer reserves the (1 + D/ratio) intermediate factor -- the whole
+        # budget goes to persistent slots (K sized like non-spec), which is how the
+        # freed ~9GB turns into higher max_running.
+        replayssm_active = self.server_args.enable_gdn_replayssm_spec and (
+            self.hybrid_gdn_config is not None
+            or kimi_linear_config(self.model_config) is not None
+        )
         if has_spec_dec:
             assert server_args.speculative_num_draft_tokens is not None
             assert server_args.max_running_requests is not None
@@ -1633,8 +1775,10 @@ class KVCacheConfigurator:
                 max_mamba_cache_size=server_args.max_mamba_cache_size
                 // self.ps.attn_dp_size,
             )
-            # Reserve intermediate memory based on capped max_num_reqs
-            if has_spec_dec:
+            # Reserve intermediate memory based on capped max_num_reqs (+1: the
+            # pool's padding slot, see memory_pool.py). Skipped under replayssm
+            # (no intermediate_ssm allocated).
+            if has_spec_dec and not replayssm_active:
                 ratio = self._calculate_mamba_ratio()
                 capped_reqs = min(
                     server_args.max_running_requests // self.ps.attn_dp_size,
@@ -1642,7 +1786,7 @@ class KVCacheConfigurator:
                 )
                 intermediate_size = (
                     config.mamba2_cache_params.mamba_cache_per_req
-                    * capped_reqs
+                    * (capped_reqs + 1)
                     * server_args.speculative_num_draft_tokens
                 )
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
@@ -1656,11 +1800,12 @@ class KVCacheConfigurator:
                 max_mamba_cache_size=server_args.max_running_requests
                 // self.ps.attn_dp_size,
             )
-            # Reserve intermediate memory based on capped max_num_reqs
-            if has_spec_dec:
+            # Reserve intermediate memory based on capped max_num_reqs (+1: the
+            # pool's padding slot). Skipped under replayssm.
+            if has_spec_dec and not replayssm_active:
                 intermediate_size = (
                     config.mamba2_cache_params.mamba_cache_per_req
-                    * server_args.max_mamba_cache_size
+                    * (server_args.max_mamba_cache_size + 1)
                     * server_args.speculative_num_draft_tokens
                 )
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
@@ -1669,11 +1814,14 @@ class KVCacheConfigurator:
             assert config.mamba2_cache_params.mamba_cache_per_req > 0
             per_req = config.mamba2_cache_params.mamba_cache_per_req
 
-            # Solve jointly for max_mamba_cache_size accounting for intermediate memory.
-            # The mamba budget (from the ratio split) must cover both:
-            #   1. main mamba state: max_mamba_cache_size * per_req
-            #   2. intermediate states: (max_mamba_cache_size / ratio) * D * per_req
-            # So: max_mamba_cache_size * per_req * (1 + D/ratio) = mamba_budget_bytes
+            # Solve jointly for max_mamba_cache_size accounting for intermediate
+            # memory. Every per-slot pool buffer carries a +1 padding slot
+            # (index 0, the sink for cuda-graph padded batches; see
+            # memory_pool.py), so the mamba budget must cover:
+            #   1. main mamba state: (max_mamba_cache_size + 1) * per_req
+            #   2. intermediate states: (max_mamba_cache_size / ratio + 1) * D * per_req
+            # So: max_mamba_cache_size * per_req * (1 + D/ratio) + (1 + D) * per_req
+            #     = mamba_budget_bytes
             mamba_budget = (
                 total_rest_memory
                 * server_args.mamba_full_memory_ratio
@@ -1681,14 +1829,15 @@ class KVCacheConfigurator:
             )
             mamba_budget_bytes = mamba_budget * (1 << 30)
 
-            if has_spec_dec:
+            if has_spec_dec and not replayssm_active:
                 ratio = self._calculate_mamba_ratio()
                 D = server_args.speculative_num_draft_tokens
                 # Joint solve: main_state + intermediate = mamba_budget
                 server_args.override(
                     "mamba_pool.memory_budget_spec",
                     max_mamba_cache_size=int(
-                        mamba_budget_bytes // (per_req * (1 + D / ratio))
+                        (mamba_budget_bytes - per_req * (1 + D))
+                        // (per_req * (1 + D / ratio))
                     ),
                 )
                 # Intermediate memory is included in mamba_budget, subtract it
@@ -1697,12 +1846,12 @@ class KVCacheConfigurator:
                     server_args.max_running_requests // self.ps.attn_dp_size,
                     server_args.max_mamba_cache_size // ratio,
                 )
-                intermediate_size = per_req * capped_reqs * D
+                intermediate_size = per_req * (capped_reqs + 1) * D
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
             else:
                 server_args.override(
                     "mamba_pool.memory_budget",
-                    max_mamba_cache_size=int(mamba_budget_bytes // per_req),
+                    max_mamba_cache_size=int((mamba_budget_bytes - per_req) // per_req),
                 )
 
         # Validate: max_mamba_cache_size must be positive after memory allocation.
@@ -1721,8 +1870,9 @@ class KVCacheConfigurator:
                 f"(4) use GPUs with more memory."
             )
 
+        # +1: the pool's padding slot is allocated alongside the request slots
         mamba_state_memory = (
-            server_args.max_mamba_cache_size
+            (server_args.max_mamba_cache_size + 1)
             * config.mamba2_cache_params.mamba_cache_per_req
             / (1 << 30)
         )

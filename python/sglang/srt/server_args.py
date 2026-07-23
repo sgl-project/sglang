@@ -69,6 +69,7 @@ from sglang.srt.utils.common import (
     get_int_env_var,
     get_quantization_config,
     human_readable_int,
+    is_blackwell_supported,
     is_cpu,
     is_cuda,
     is_flashinfer_available,
@@ -262,6 +263,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "aiter",
     "marlin",
     "humming",
+    "experimental_sgl_marlin",
 ]
 
 MOE_A2A_BACKEND_CHOICES = [
@@ -346,7 +348,13 @@ MAMBA_RADIX_CACHE_STRATEGY_CHOICES = [
 
 MAMBA_BACKEND_CHOICES = ["triton", "flashinfer"]
 
-LINEAR_ATTN_KERNEL_BACKEND_CHOICES = ["triton", "cutedsl", "flashinfer", "flashkda"]
+LINEAR_ATTN_KERNEL_BACKEND_CHOICES = [
+    "triton",
+    "cutedsl",
+    "flashinfer",
+    "flashkda",
+    "nvidia_kda",
+]
 
 
 # Allow external code to add more choices
@@ -605,7 +613,8 @@ class ServerArgs:
             help=(
                 'Data type for kv cache storage. "auto" will use model data type. '
                 '"bf16" or "bfloat16" for BF16 KV cache. "fp8_e5m2" and '
-                '"fp8_e4m3" are supported for CUDA 11.8+. "nvfp4" selects '
+                '"fp8_e4m3" are supported for CUDA 11.8+. "mxfp8" is supported '
+                'by the FA4 backend. "nvfp4" selects '
                 'the NVFP4 FP4 E2M1 KV cache recipe; "fp4_mx_block16" '
                 "selects the MX-style block-size-16 FP4 E2M1 KV cache "
                 "recipe. Both require CUDA 12.8+ and PyTorch 2.8.0+"
@@ -614,6 +623,7 @@ class ServerArgs:
                 "auto",
                 "fp8_e5m2",
                 "fp8_e4m3",
+                "mxfp8",
                 "bf16",
                 "bfloat16",
                 "nvfp4",
@@ -947,6 +957,39 @@ class ServerArgs:
         Arg(
             help="The decode context parallelism size.",
             aliases=["--decode-context-parallel-size"],
+        ),
+    ] = 1
+    dcp_comm_backend: A[
+        str,
+        Arg(
+            help="Communication backend for the decode context-parallel (DCP) "
+            "attention reduction: 'ag_rs' (AllGather + ReduceScatter), 'a2a' "
+            "(fused NCCL All-to-All exchange of output+LSE + local Triton LSE "
+            "combine), or 'fi_a2a' (FlashInfer MNNVL All-to-All kernel; requires "
+            "SM90+ and MNNVL fabric memory, e.g. GB200 NVL72).",
+            choices=["ag_rs", "a2a", "fi_a2a"],
+            resolvable=True,
+        ),
+    ] = "ag_rs"
+    dcp_replicate_q_proj: A[
+        Optional[bool],
+        Arg(
+            help="For MLA decode context parallelism with the a2a/fi_a2a "
+            "backend: replicate the Q projection so each DCP rank computes the "
+            "full-head query locally (redundant projection compute), eliminating "
+            "the per-layer head-dim all-gather of Q. Trades a small amount of "
+            "extra GEMM for one fewer collective per layer. Use "
+            "--no-dcp-replicate-q-proj to disable the model-specific default.",
+            action=argparse.BooleanOptionalAction,
+            resolvable=True,
+        ),
+    ] = None
+    dwdp_size: A[
+        int,
+        Arg(
+            help="DWDP (Distributed Weight Data Parallelism) group size. "
+            "When > 1, MoE prefill uses weight prefetch instead of token all-to-all. "
+            "Must equal tp_size. Only supported with --disaggregation-mode null or prefill.",
         ),
     ] = 1
     enable_prefill_cp: A[
@@ -1618,7 +1661,10 @@ class ServerArgs:
     ] = False
     disable_custom_all_reduce: A[
         bool,
-        "Disable the custom all-reduce kernel and fall back to NCCL.",
+        Arg(
+            help="Disable the custom all-reduce kernel and fall back to NCCL.",
+            resolvable=True,
+        ),
     ] = False
     enable_mscclpp: A[
         bool,
@@ -1627,6 +1673,10 @@ class ServerArgs:
     enable_torch_symm_mem: A[
         bool,
         "Enable using torch symm mem for all-reduce kernel and fall back to NCCL. Only supports CUDA device SM90 and above. SM90 supports world size 4, 6, 8. SM100 supports world size 6, 8.",
+    ] = False
+    enable_scattered_sconv: A[
+        bool,
+        "Inkling: replace the attention/MLP output all-reduce with a hidden-dimension reduce-scatter, run the channelwise output short convolution on the [T, H/P] shard, then all-gather before the residual add. This shards the convolution cache across tensor-parallel ranks without changing communication volume.",
     ] = False
     pre_warm_nccl: A[
         bool,
@@ -1658,7 +1708,10 @@ class ServerArgs:
             resolvable=True,
         ),
     ] = None
-    enable_aiter_allreduce_fusion: A[bool, "Enable Aiter AllReduce Fusion."] = False
+    enable_aiter_allreduce_fusion: A[
+        bool,
+        Arg(help="Enable Aiter AllReduce Fusion.", resolvable=True),
+    ] = False
 
     # -------------------------------------------------------------------------
     # Torch compile and torchao
@@ -1772,6 +1825,7 @@ class ServerArgs:
         Arg(
             help="Attention backend for speculative decoding operations (both target verify and draft extend). Can be one of 'prefill' (default) or 'decode'.",
             choices=["prefill", "decode"],
+            resolvable=True,
         ),
     ] = "prefill"
     speculative_draft_attention_backend: A[
@@ -2083,7 +2137,10 @@ class ServerArgs:
     ] = 0
     mamba_full_memory_ratio: A[
         float,
-        "The ratio of mamba state memory to full kv cache memory.",
+        Arg(
+            help="The ratio of mamba state memory to full kv cache memory.",
+            resolvable=True,
+        ),
     ] = 0.9
     mamba_radix_cache_strategy: A[
         str,
@@ -2136,6 +2193,13 @@ class ServerArgs:
             choices=LINEAR_ATTN_KERNEL_BACKEND_CHOICES,
         ),
     ] = None
+    linear_attn_verify_backend: A[
+        Optional[str],
+        Arg(
+            help="Override the kernel backend for linear attention speculative target-verify. If not set, follows the decode backend (flashinfer decode -> flashinfer verify, otherwise triton). KDA supports triton, nv_cutedsl, and flashinfer verify backends.",
+            choices=LINEAR_ATTN_KERNEL_BACKEND_CHOICES + ["nv_cutedsl"],
+        ),
+    ] = None
     # ReplaySSM buffered output-only linear-attn decode (GDN + KDA): per-slot
     # ring + periodic flush to cut per-step HBM state traffic.
     enable_linear_replayssm: A[
@@ -2153,6 +2217,16 @@ class ServerArgs:
         int,
         "Ring-buffer length L for ReplaySSM linear-attn decode. The full recurrent state is flushed to HBM every L decode steps.",
     ] = 16
+    # ReplaySSM spec-verify (Part B of RFC #28511): GDN linear-chain target-verify
+    # via a per-slot circular (d, k, g) ring + periodic flush instead of per-draft
+    # full-state snapshots. GDN only; linear-chain (topk <= 1) only. Reuses the
+    # `linear_replayssm` ring (replayssm_d/k/g + write_pos) and adds two per-slot
+    # cursors (cache_base, is_flush); the ring length reuses
+    # `linear_replayssm_cache_len`.
+    enable_gdn_replayssm_spec: A[
+        bool,
+        "Enable the ReplaySSM GDN spec-verify kernel (Part B of RFC #28511): a per-slot circular (d, k, g) ring + periodic flush replacing the recurrent verify's per-draft full-state snapshots. GDN only, linear-chain (--speculative-eagle-topk in {None, 1}) only. Reuses --linear-replayssm-cache-len for the ring length.",
+    ] = False
 
     # -------------------------------------------------------------------------
     # Hierarchical cache
@@ -2286,7 +2360,10 @@ class ServerArgs:
     mm_feature_transport: A[
         Optional[Literal["cpu", "cuda_ipc"]],
         "Transport multimodal features through CPU memory or a bounded CUDA IPC pool. "
-        "The default is CPU transport; CUDA IPC reserves GPU memory on the base GPU.",
+        "Unset resolves automatically: single-node CUDA deployments (without "
+        "disaggregation) use cuda_ipc, everything else uses cpu. CUDA IPC reserves "
+        "SGLANG_MM_FEATURE_CACHE_MB (default 1024 MiB) on the base GPU and falls "
+        "back to CPU transport per tensor when the pool is full.",
     ] = None
     keep_mm_feature_on_device: A[
         bool,
@@ -2912,6 +2989,14 @@ class ServerArgs:
         self._validate_prefill_only_disable_kv_cache_args()
         self._handle_dcp_validation()
 
+        # Model-arch prefill CUDA-graph default must land before cuda-graph
+        # resolution (the declarative registry materializes too late to affect
+        # it). Inkling opts into full-graph prefill capture here.
+        self._apply_inkling_prefill_cuda_graph_default()
+
+        # must run before _handle_cuda_graph_config and _handle_data_parallelism
+        self._handle_dwdp()
+
         self._handle_cuda_graph_config()
 
         # Handle device-specific backends.
@@ -2946,6 +3031,7 @@ class ServerArgs:
         self._handle_int8_mamba_checkpoint()
         self._handle_linear_attn_backend()
         self._handle_kv4_compatibility()
+        self._handle_mxfp8_kv_cache_compatibility()
         self._handle_page_size()
         self._handle_amd_specifics()
         self._handle_nccl_pre_warm()
@@ -2984,6 +3070,7 @@ class ServerArgs:
         self._handle_eplb_and_dispatch()
         self._handle_expert_distribution_metrics()
         self._handle_elastic_ep()
+        self._validate_experimental_sgl_marlin()
 
         # Handle pipeline parallelism.
         self._handle_pipeline_parallelism()
@@ -2992,6 +3079,9 @@ class ServerArgs:
         from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
 
         handle_speculative_decoding(self)
+
+        # Needs the draft-token count derived just above.
+        self._validate_gdn_replayssm_spec_ring()
 
         # Validate the CuteDSL A2A token budget now that num_tokens_per_req is final.
         self._validate_cutedsl_a2a_token_budget()
@@ -3107,28 +3197,65 @@ class ServerArgs:
         handle_pd_disaggregation(self)
 
     def _handle_dcp_validation(self):
-        # Decode context parallel (DCP) is currently implemented and validated
-        # only on AMD HIP/ROCm. Reject invalid or unverified configurations
-        # early instead of letting them fail deeper in model initialization.
         if self.dcp_size < 1:
             raise ValueError(
                 "Decode context parallel size (--dcp-size / "
                 "--decode-context-parallel-size) must be >= 1, but got "
                 f"dcp_size={self.dcp_size}."
             )
+        if self.dcp_comm_backend in ("a2a", "fi_a2a") and self.dcp_size <= 1:
+            raise ValueError(
+                f"--dcp-comm-backend {self.dcp_comm_backend} only affects the "
+                "decode context-parallel attention reduction and therefore "
+                "requires --dcp-size / --decode-context-parallel-size > 1, but "
+                f"got dcp_size={self.dcp_size}."
+            )
+        if self.dcp_comm_backend == "fi_a2a" and not is_cuda():
+            raise ValueError(
+                "--dcp-comm-backend fi_a2a delegates the exchange to FlashInfer's "
+                "MNNVL All-to-All kernel, which requires an NVIDIA CUDA platform "
+                "with SM90+ and MNNVL fabric memory (e.g. GB200 NVL72). The "
+                "authoritative fabric probe runs at model-runner init; use 'a2a' "
+                "or 'ag_rs' on clusters without MNNVL."
+            )
+        if self.dcp_replicate_q_proj:
+            if self.dcp_size <= 1:
+                raise ValueError("--dcp-replicate-q-proj requires --dcp-size > 1.")
+            if self.dcp_comm_backend not in ("a2a", "fi_a2a"):
+                raise ValueError(
+                    "--dcp-replicate-q-proj only applies to the a2a/fi_a2a DCP "
+                    "communication backend (it removes the head-dim Q all-gather); "
+                    f"got --dcp-comm-backend={self.dcp_comm_backend}."
+                )
         if not self.dcp_size > 1:
             return
         if is_hip():
             return
         elif is_cuda():
             if self.speculative_algorithm is not None:
-                raise ValueError(
-                    "Decode context parallel (--dcp-size / "
-                    "--decode-context-parallel-size > 1) on CUDA platform "
-                    "does not support any speculative algorithm, but got "
-                    f"dcp_size={self.dcp_size} on a CUDA platform with "
-                    "speculative decoding enabled."
+                model_arches = self.get_model_config().hf_config.architectures
+                decode_backend = self.decode_attention_backend or self.attention_backend
+                # Kimi K3 shares Kimi Linear's DCP + DSPARK-static path (same
+                # deepseek_common MLA target-verify + LSE-merge, same aux hidden
+                # capture); both hybrid archs on tokenspeed_mla are validated.
+                kimi_hybrid_dspark = (
+                    self.speculative_algorithm == "DSPARK"
+                    and (
+                        "KimiLinearForCausalLM" in model_arches
+                        or "KimiK3ForConditionalGeneration" in model_arches
+                    )
+                    and decode_backend == "tokenspeed_mla"
                 )
+                if not kimi_hybrid_dspark:
+                    raise ValueError(
+                        "Decode context parallel (--dcp-size / "
+                        "--decode-context-parallel-size > 1) with speculative "
+                        "decoding on CUDA is only validated for Kimi Linear / "
+                        "Kimi K3 + DSPARK + tokenspeed_mla, but got "
+                        f"architectures={model_arches}, "
+                        f"speculative_algorithm={self.speculative_algorithm!r}, "
+                        f"decode_attention_backend={decode_backend!r}."
+                    )
         else:
             raise ValueError(
                 "Decode context parallel (--dcp-size / "
@@ -3480,19 +3607,28 @@ class ServerArgs:
                 )
                 self.cuda_graph_config.decode.backend = Backend.DISABLED
 
-            if self.cuda_graph_config.prefill.backend not in (
-                Backend.DISABLED,
-                Backend.TC_PIECEWISE,
-            ):
-                logger.warning(
-                    "XPU platform currently only supports prefill tc_piecewise CUDA graph; "
-                    "disabling unsupported prefill backend."
-                )
-                self.cuda_graph_config.prefill.backend = Backend.DISABLED
-
     # ------------------------------------------------------------------
     # CUDA graph configuration resolution
     # ------------------------------------------------------------------
+    def _apply_inkling_prefill_cuda_graph_default(self):
+        """Inkling opts into full-graph prefill CUDA-graph capture. Must run
+        before _handle_cuda_graph_config: the generic breakable default is
+        auto-disabled for this multimodal arch, and declarative model overrides
+        materialize too late to steer cuda-graph resolution. Honors an explicit
+        --cuda-graph-backend-prefill / --disable-prefill-cuda-graph."""
+        if (
+            self.cuda_graph_backend_prefill is not None
+            or self.disable_prefill_cuda_graph
+            or parse_connector_type(self.model_path) == ConnectorType.INSTANCE
+        ):
+            return
+        arch = self.get_model_config().hf_config.architectures[0]
+        if arch in (
+            "InklingForConditionalGeneration",
+            "InklingForConditionalGenerationMTP",
+        ):
+            self.cuda_graph_backend_prefill = Backend.FULL
+
     def _handle_cuda_graph_config(self):
         self._parse_cuda_graph_config()
         self._apply_cuda_graph_compatibility()
@@ -3719,8 +3855,6 @@ class ServerArgs:
                 "MoE A2A backend",
                 lambda: _resolved_view(self).moe_a2a_backend != "none",
             ),
-            # DP-attn × BCG capture/replay not yet validated.
-            ("DP attention", lambda: self._resolved().enable_dp_attention),
             # Multimodal prefill replay faults under BCG; allowlisted archs opt back in.
             (
                 "multimodal model",
@@ -4278,6 +4412,16 @@ class ServerArgs:
         )
         validate_declarations(self, self._resolved_overrides)
 
+        if model_arch in (
+            "KimiLinearForCausalLM",
+            "KimiK3ForConditionalGeneration",
+        ):
+            from sglang.srt.arg_groups.kimi_k3_hook import (
+                apply_kimi_k3_spec_backend_defaults,
+            )
+
+            apply_kimi_k3_spec_backend_defaults(self)
+
         if model_arch in [
             "DeepseekV4ForCausalLM",
         ]:
@@ -4562,7 +4706,7 @@ class ServerArgs:
                 )
                 if (
                     expected_attn_tp_size is not None
-                    and effective_attn_tp_size != expected_attn_tp_size
+                    and expected_attn_tp_size % effective_attn_tp_size != 0
                 ):
                     raise ValueError(
                         "MiMoV2ForCausalLM requires effective attention TP "
@@ -4761,10 +4905,20 @@ class ServerArgs:
         assert (
             is_cuda() or is_musa() or is_npu() or is_hip()
         ), "extra_buffer needs CUDA/MUSA/NPU/ROCm (FLA)."
+        if view.mamba_radix_cache_strategy == "extra_buffer_lazy":
+            # The PD-disagg decode pool is not wired for lazy slots.
+            assert view.disaggregation_mode == "null", (
+                "extra_buffer_lazy unsupported under PD disaggregation; use "
+                "--mamba-radix-cache-strategy extra_buffer."
+            )
+            algo = (view.speculative_algorithm or "").upper()
+            # dspark verifies through prepare_mamba_track_for_verify (lazy plan
+            # wired); dflash bypasses that hook, so it stays unsupported.
+            assert algo != "DFLASH", (
+                f"extra_buffer_lazy unsupported with {view.speculative_algorithm}; "
+                "use --mamba-radix-cache-strategy extra_buffer."
+            )
         if view.speculative_num_draft_tokens is not None:
-            assert (
-                view.mamba_radix_cache_strategy != "extra_buffer_lazy"
-            ), "extra_buffer_lazy unsupported with spec."
             assert view.mamba_track_interval >= view.speculative_num_draft_tokens
         if view.page_size is not None:
             assert view.mamba_track_interval % view.page_size == 0
@@ -4985,6 +5139,16 @@ class ServerArgs:
             self.enable_mixed_chunk = False
             self.disable_radix_cache = True
 
+    def _handle_mxfp8_kv_cache_compatibility(self):
+        """MXFP8 KV cache uses operands available only on SM100+ (Blackwell)."""
+        if self.kv_cache_dtype != "mxfp8":
+            return
+        if not is_blackwell_supported():
+            raise ValueError(
+                "--kv-cache-dtype mxfp8 requires an SM100+ (Blackwell) GPU for the "
+                "block-scaled operands used by the FA4 MXFP8 attention path."
+            )
+
     def _handle_kv4_compatibility(self):
         """Check FP4 KV cache compatibility with the attention backend"""
         from sglang.srt.arg_groups.overrides import resolved_view
@@ -5167,6 +5331,10 @@ class ServerArgs:
             self.linear_attn_decode_backend is None
             and is_sm100_supported()
             and self.mamba_ssm_dtype == "bfloat16"
+            # The unified pool implies the page-major layout, whose strided mamba
+            # state only the Triton linear-attn kernels read — defaulting to
+            # flashinfer here would trip the page-major backend assert.
+            and not self.enable_unified_memory
         ):
             self.linear_attn_decode_backend = "flashinfer"
             logger.info(
@@ -5204,6 +5372,21 @@ class ServerArgs:
         ):
             raise ValueError(
                 "--linear-attn-decode-backend flashinfer on SM100+ requires "
+                "--mamba-ssm-dtype bfloat16, "
+                f"got {self.mamba_ssm_dtype!r}"
+            )
+
+        verify = self.linear_attn_verify_backend
+        if verify is None and decode == "flashinfer":
+            verify = "flashinfer"
+        if (
+            verify == "flashinfer"
+            and self.mamba_ssm_dtype != "bfloat16"
+            and is_cuda()
+            and torch.cuda.get_device_capability()[0] >= 10
+        ):
+            raise ValueError(
+                "--linear-attn-verify-backend flashinfer on SM100+ requires "
                 "--mamba-ssm-dtype bfloat16, "
                 f"got {self.mamba_ssm_dtype!r}"
             )
@@ -5272,6 +5455,128 @@ class ServerArgs:
                     "--linear-replayssm-cache-len must be >= 1, got "
                     f"{self.linear_replayssm_cache_len}."
                 )
+
+        # ReplaySSM spec-verify (Part B of #28511): GDN-only, linear-chain target
+        # verify. Reuses the `linear_replayssm` ring (replayssm_d/k/g + write_pos)
+        # plus two extra per-slot cursors (cache_base, is_flush) and the chunked
+        # (I+A)^-1 reconstruction verify kernel. The intra-window interaction uses a
+        # strictly-lower causal mask, so it is valid ONLY for a linear draft chain
+        # (speculative_eagle_topk in {None, 1}, i.e. NEXTN / MTP); EAGLE tree verify
+        # (topk > 1) must fall back to the recurrent verify. GDN-only is enforced at
+        # runtime (KDA routes through kda_backend, which never enters this path; the
+        # pool gate also checks `not cache_params.is_kda`). The ring length reuses
+        # --linear-replayssm-cache-len (no separate flag).
+        if self.enable_gdn_replayssm_spec:
+            if self.speculative_eagle_topk not in (None, 1):
+                raise ValueError(
+                    "--enable-gdn-replayssm-spec requires a linear draft chain "
+                    "(--speculative-eagle-topk in {None, 1}); the chunked verify "
+                    "kernel uses a strictly-lower causal mask and is invalid for "
+                    "EAGLE tree verify. Got "
+                    f"--speculative-eagle-topk={self.speculative_eagle_topk!r}."
+                )
+            if decode != "triton":
+                raise ValueError(
+                    "--enable-gdn-replayssm-spec requires the Triton linear-attn "
+                    "decode backend, got "
+                    f"--linear-attn-decode-backend={decode!r}."
+                )
+            _algo = (self.speculative_algorithm or "").upper()
+            if self.enable_mamba_extra_buffer() and _algo not in ("DSPARK", "DFLASH"):
+                # KDA fold-every-commit (DSPARK/DFLASH) keeps `temporal` current
+                # and snapshots the crossing state in the same replay, so it works
+                # with extra_buffer. The GDN path lags `temporal` (no device-side
+                # force-flush at track boundaries) and does not.
+                raise ValueError(
+                    "--enable-gdn-replayssm-spec is not yet compatible with mamba "
+                    "extra_buffer (radix prefix caching) for this speculative "
+                    "algorithm; use --disable-radix-cache or "
+                    "--mamba-radix-cache-strategy no_buffer."
+                )
+            from sglang.srt.speculative.ragged_verify import (
+                RaggedVerifyMode,
+                read_ragged_verify_mode,
+            )
+
+            if read_ragged_verify_mode() is RaggedVerifyMode.COMPACT:
+                # Ring is written only on the dense verify layout; compact leaves
+                # it stale and there's no intermediate_ssm fallback -> commit would
+                # fold a stale ring into the state.
+                raise ValueError(
+                    "--enable-gdn-replayssm-spec (ReplaySSM) is not compatible with "
+                    "SGLANG_RAGGED_VERIFY_MODE=compact: the per-slot ring is written "
+                    "only on the dense verify layout, so compact-mode commits would "
+                    "fold a stale ring into the SSM state. Use "
+                    "SGLANG_RAGGED_VERIFY_MODE=static."
+                )
+            if self.disaggregation_mode != "null":
+                raise ValueError(
+                    "--enable-gdn-replayssm-spec is not supported under PD "
+                    "disaggregation yet (follow-up). Got "
+                    f"--disaggregation-mode={self.disaggregation_mode!r}."
+                )
+            if self.linear_replayssm_cache_len < 1:
+                raise ValueError(
+                    "--linear-replayssm-cache-len must be >= 1, got "
+                    f"{self.linear_replayssm_cache_len}."
+                )
+            if self.enable_linear_replayssm:
+                raise ValueError(
+                    "--enable-gdn-replayssm-spec and --enable-linear-replayssm are "
+                    "mutually exclusive: they share the ring storage but drive it "
+                    "with incompatible cursor protocols (per-decode-forward vs "
+                    "per-verify-commit advance)."
+                )
+            ring_len = self.linear_replayssm_cache_len
+            if ring_len & (ring_len - 1) != 0:
+                raise ValueError(
+                    "--linear-replayssm-cache-len must be a power of two for the "
+                    f"circular spec-verify ring, got {ring_len}."
+                )
+            # ring_len >= 2 * max drafts is checked in
+            # _validate_gdn_replayssm_spec_ring() (draft tokens not derived yet).
+            # Closed-loop exact fold: the flush replays raw ring inputs through
+            # the recurrent update into the checkpoint, bit-identical to the
+            # recurrent baseline -- which keeps its state in fp32. A 16-bit
+            # checkpoint would re-quantize the exactly-folded state every flush
+            # and become the dominant residual error source, so require fp32.
+            if self.mamba_ssm_dtype is None:
+                logger.info(
+                    "--enable-gdn-replayssm-spec: setting --mamba-ssm-dtype "
+                    "float32 (the closed-loop exact fold requires the fp32 SSM "
+                    "checkpoint for recurrent-parity)."
+                )
+                self.mamba_ssm_dtype = "float32"
+            elif self.mamba_ssm_dtype != "float32":
+                raise ValueError(
+                    "--enable-gdn-replayssm-spec requires --mamba-ssm-dtype "
+                    f"float32, got {self.mamba_ssm_dtype!r}. The closed-loop "
+                    "exact fold keeps the committed state bit-identical to the "
+                    "recurrent baseline, which is only meaningful against the "
+                    "fp32 checkpoint; a 16-bit checkpoint would re-quantize it "
+                    "every flush."
+                )
+
+    def _validate_gdn_replayssm_spec_ring(self):
+        """Enforce ring_len >= 2 * max draft tokens for the spec-verify ring.
+
+        Early-flush margin: write_pos + spec_len <= ring_len must hold on every
+        verify step (see _advance_gdn_spec_cursors_kernel). Runs after
+        handle_speculative_decoding() so the (adaptive-aware) max is final;
+        MambaPool re-checks at ring allocation as a backstop.
+        """
+        if not self.enable_gdn_replayssm_spec:
+            return
+        max_drafts = self.max_speculative_num_draft_tokens
+        if max_drafts is None:
+            return
+        ring_len = self.linear_replayssm_cache_len
+        if ring_len < 2 * max_drafts:
+            raise ValueError(
+                "--linear-replayssm-cache-len must be >= 2 * the maximum "
+                "speculative draft-token count for the spec-verify ring "
+                f"(early-flush margin), got {ring_len} < {2 * max_drafts}."
+            )
 
     def _handle_legacy_cp_arguments(self):
         legacy_mode_to_strategy = {
@@ -5401,6 +5706,61 @@ class ServerArgs:
         from sglang.srt.layers.cp.base import init_cp_strategy
 
         init_cp_strategy(self)
+
+    def _handle_dwdp(self):
+        if self.dwdp_size <= 1:
+            return
+
+        assert (
+            self.dwdp_size >= 2
+        ), f"dwdp_size must be >= 2 when enabled, got {self.dwdp_size}"
+        assert (
+            self.dwdp_size == self.tp_size
+        ), f"dwdp_size ({self.dwdp_size}) must equal tp_size ({self.tp_size})"
+        assert self.disaggregation_mode in (
+            "null",
+            "prefill",
+        ), "DWDP requires --disaggregation-mode null or prefill"
+        assert (
+            not self.enable_eplb
+        ), "EPLB dynamic migration conflicts with static DWDP partitioning"
+        assert (
+            self.speculative_algorithm is None
+        ), "DWDP does not support speculative decoding (MTP/draft workers)"
+        assert self.pp_size == 1, "DWDP requires pp_size == 1"
+        assert (
+            not self.enable_two_batch_overlap
+        ), "DWDP's prefetch event protocol does not support two-batch overlap"
+
+        if self.disaggregation_mode == "null":
+            logger.warning(
+                "DWDP with --disaggregation-mode null: decode steps re-fetch all "
+                "remote expert weights every step, which is slow. DWDP is "
+                "recommended only with --disaggregation-mode prefill."
+            )
+
+        self.dp_size = self.dwdp_size
+        self.enable_dp_attention = True
+        self.enable_dp_attention_local_control_broadcast = True
+        self.enable_dp_lm_head = True
+        self.moe_dense_tp_size = 1
+        self.ep_size = self.dwdp_size
+        self.moe_ep_size = self.dwdp_size
+        self.moe_dp_size = 1
+        self.moe_a2a_backend = "none"
+
+        envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.set(True)
+
+        self.disable_cuda_graph = True
+
+        logger.info(
+            f"DWDP enabled: dwdp_size={self.dwdp_size}, "
+            f"auto-forced dp_size={self.dp_size}, moe_ep_size={self.moe_ep_size}, "
+            f"moe_dense_tp_size=1, moe_a2a_backend=none, "
+            f"dp_attention_local_control_broadcast=True, "
+            f"enable_dp_lm_head=True, SCHEDULER_SKIP_ALL_GATHER=True, "
+            f"disable_cuda_graph=True"
+        )
 
     def _handle_data_parallelism(self):
         # The dp_size==1 resets moved to the resolution pipeline
@@ -5900,6 +6260,19 @@ class ServerArgs:
                 f"(got moe_a2a_backend={resolved.moe_a2a_backend})."
             )
 
+    def _validate_experimental_sgl_marlin(self):
+        view = self._resolved()
+        if view.moe_runner_backend != "experimental_sgl_marlin":
+            return
+
+        # ===== TO BE REFACTORED ====
+        from sglang.srt.lora.marlin_lora_temp.policy import (
+            validate_experimental_sgl_marlin_server_args,
+        )
+
+        validate_experimental_sgl_marlin_server_args(self, view)
+        # ===== END TO BE REFACTORED ====
+
     def _handle_expert_distribution_metrics(self):
         if self.enable_expert_distribution_metrics and (
             self.expert_distribution_recorder_mode is None
@@ -5946,6 +6319,12 @@ class ServerArgs:
                 "--prefill-only-disable-kv-cache does not currently support "
                 "--kv-cache-dtype=nvfp4 or --kv-cache-dtype=fp4_mx_block16 because "
                 "the FP4 pool uses a separate allocation path."
+            )
+        if self.kv_cache_dtype == "mxfp8":
+            raise ValueError(
+                "--prefill-only-disable-kv-cache does not currently support "
+                "--kv-cache-dtype=mxfp8 because the MXFP8 pool stores separate "
+                "scale-factor buffers."
             )
 
         # Structural preconditions for the FA backend's fa_skip_kv_cache path,
@@ -6241,6 +6620,7 @@ class ServerArgs:
             "Qwen2_5OmniForConditionalGeneration",
             "KimiVLForConditionalGeneration",
             "KimiK25ForConditionalGeneration",
+            "KimiK3ForConditionalGeneration",
             "MiMoV2ForCausalLM",
         ]:
             raise ValueError(
@@ -6390,6 +6770,26 @@ class ServerArgs:
                     "--mm-feature-transport=%s instead.",
                     requested_transport,
                 )
+            elif self.encoder_only:
+                requested_transport = "cpu"
+                logger.info(
+                    "Multimodal feature transport auto-resolved to cpu for "
+                    "encoder-only serving; encoder outputs use "
+                    "--encoder-transfer-backend instead."
+                )
+            elif is_cuda() and self.nnodes == 1 and self.disaggregation_mode == "null":
+                # Auto policy: single-node CUDA serving defaults to the bounded
+                # CUDA-IPC pool. The pool is only allocated when a multimodal
+                # processor exists, so text-only deployments are unaffected; a
+                # full pool degrades to CPU transport per tensor. Multi-node
+                # (IPC handles are intra-node) and PD-disaggregated deployments
+                # keep CPU transport.
+                requested_transport = "cuda_ipc"
+                logger.info(
+                    "Multimodal feature transport auto-resolved to cuda_ipc "
+                    "(single-node CUDA). Pass --mm-feature-transport=cpu to "
+                    "opt out."
+                )
             else:
                 requested_transport = "cpu"
         elif legacy_ipc_is_set and legacy_ipc_enabled != (
@@ -6401,6 +6801,14 @@ class ServerArgs:
                 requested_transport,
                 int(legacy_ipc_enabled),
             )
+
+        if self.encoder_only and requested_transport == "cuda_ipc":
+            logger.warning(
+                "--mm-feature-transport=cuda_ipc does not control encoder-only "
+                "output transfer; using cpu for this inactive transport. Select "
+                "--encoder-transfer-backend for encoder outputs."
+            )
+            requested_transport = "cpu"
 
         if requested_transport == "cuda_ipc":
             if not is_cuda():
@@ -6441,9 +6849,15 @@ class ServerArgs:
         envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.set(
             "1" if self.enable_deterministic_inference else "0"
         )
-        # Custom all-reduce v2 uses IPC handles and is intra-node only. Force-disable
-        # on multi-node so the dispatch falls back to the legacy CustomAllreduce path.
-        if self.nnodes > 1 and envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.get():
+        # Custom all-reduce v2's graph zero-copy path uses IPC handles and is
+        # intra-node only. Force-disable on multi-node so the dispatch falls back
+        # to the legacy CustomAllreduce path, unless the MNNVL opt-in is set (the
+        # eager pull path works across nodes via the symm-mem workspace).
+        if (
+            self.nnodes > 1
+            and envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.get()
+            and not envs.SGLANG_ENABLE_CUSTOM_ALL_REDUCE_V2_MULTINODE.get()
+        ):
             if envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.is_set():
                 logger.warning(
                     "Disabling SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2 because nnodes=%d "
@@ -6657,13 +7071,40 @@ class ServerArgs:
         if not self.enable_page_major_kv_layout:
             return
         # Only the Triton attention kernels read the strided 4-D envelope K/V
-        # views; FA3 / FlashInfer do not.
+        # views. EXCEPTION: the unified-memory MLA pool exposes each layer as a
+        # DENSE contiguous per-layer view (build_dense_mla_views), which the
+        # paged MLA kernels can consume directly — so trtllm_mla is allowed for
+        # the MLA full-attention layers under unified memory (Stage 2). Their
+        # block table is filled with dense page ids via create_flashmla_kv_indices_triton
+        # (v2p + kernel_page_multiplier). flashinfer_mla / flashmla / cutlass_mla
+        # are not wired yet — keep them Triton-only for now.
+        if self.enable_unified_memory and self.use_mla_backend():
+            # Dense per-layer MLA views (build_dense_mla_views) let the paged MLA
+            # kernels read the pool directly; their kv_indices / block tables are
+            # remapped to dense ids. trtllm_mla (decode) and flashinfer_mla
+            # (prefill + decode) are wired; flashmla / cutlass_mla share the same
+            # create_flashmla block-table path and can be added likewise.
+            # Names here are the RESOLVED backend ids from _resolved_attention_backends:
+            # "flashinfer" is the MLA flashinfer backend (FlashInferMLAAttnBackend)
+            # for an MLA model, "trtllm_mla" the trtllm decode kernel.
+            # cutedsl_mla resolves to TRTLLMMLABackend(backend="cute-dsl") and
+            # shares the trtllm dense read/write path (no separate wiring).
+            allowed_full = {
+                "triton",
+                "trtllm_mla",
+                "flashinfer",
+                "cutedsl_mla",
+                "tokenspeed_mla",
+            }
+        else:
+            allowed_full = {"triton"}
         backends = set(self._resolved_attention_backends())
         backends.discard(None)
-        assert backends <= {"triton"}, (
+        assert backends <= allowed_full, (
             "--enable-page-major-kv-layout requires the Triton attention backend "
-            f"for the full-attention layers; got {sorted(backends)}. Pass "
-            "--attention-backend triton."
+            f"for the full-attention layers (unified-memory MLA also allows "
+            f"trtllm_mla); got {sorted(backends)}, allowed {sorted(allowed_full)}. "
+            "Pass a compatible --attention-backend."
         )
         # The Mamba state is stored in envelope-strided views; only the
         # stride-aware Triton causal-conv / SSM kernels read them correctly.

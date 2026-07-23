@@ -124,7 +124,11 @@ struct AttnResTMAParams {
   const bf16_t* __restrict__ cw;          // [H] score norm * proj weight
   const bf16_t* __restrict__ ow;          // [H] out norm weight
   bf16_t* __restrict__ out;               // [T, H]
-  int64_t stride_bm;                      // bank stride along T (in elements)
+  // Fused bank write (nullptr = off): per-token destination of the prefix
+  // row snapshot, bank row nvb (strided by stride_bm like the read rows).
+  // The kernel never reads row nvb, so the write races with nothing.
+  bf16_t* __restrict__ prefix_dst;
+  int64_t stride_bm;  // bank stride along T (in elements)
   float eps;
   uint32_t num_tokens;
 };
@@ -345,6 +349,21 @@ SGL_DEVICE void KimiK3AttnResTrait<kDim_, kNumBankRows_, kChunkRows_, kConsumerR
         }
         ptx::mbarrier_arrive(&smem->bar_free[slot]);
 
+        // Fused bank write: the prefix row (last row of the last chunk) is
+        // already in registers; snapshot it to bank row nvb with plain
+        // stores — the .write() copy kernel disappears. Placed after the
+        // arrive so the slot handoff is not delayed.
+        if (params.prefix_dst != nullptr && base_row + an == kNumRows + 1) {
+          const uint32_t pr = kNumRows - base_row;
+          auto* dst = params.prefix_dst + static_cast<int64_t>(token) * params.stride_bm;
+#pragma unroll
+          for (uint32_t si = 0; si < kSlicesPerGroup; ++si) {
+            const auto tile = si * kNumGroups + group;
+            if (tile >= kNumTiles) continue;
+            rows[si][pr].store(dst, tile * (kTile / kVecElems) + tid_in_group);
+          }
+        }
+
         float acc_rms[kChunkRows];
         float acc_dot[kChunkRows];
 #pragma unroll
@@ -520,7 +539,8 @@ struct AttnResFusedTmaKernel {
       const tvm::ffi::TensorView ow,
       const tvm::ffi::TensorView out,
       int64_t nvb,
-      double eps) {
+      double eps,
+      bool write_prefix) {
     using namespace host;
 
     auto T_ = SymbolicSize{"num_tokens"};
@@ -546,6 +566,12 @@ struct AttnResFusedTmaKernel {
         nvb,
         " NB=",
         NB);
+    RuntimeCheck(
+        !write_prefix || nvb < NB,
+        "attn_res_fused_tma: write_prefix targets bank row nvb, needs nvb < NB, got nvb=",
+        nvb,
+        " NB=",
+        NB);
 
     if (num_tokens == 0) return;
 
@@ -564,6 +590,7 @@ struct AttnResFusedTmaKernel {
         .cw = static_cast<const bf16_t*>(cw.data_ptr()),
         .ow = static_cast<const bf16_t*>(ow.data_ptr()),
         .out = static_cast<bf16_t*>(out.data_ptr()),
+        .prefix_dst = write_prefix ? static_cast<bf16_t*>(bank.data_ptr()) + nvb * H : nullptr,
         .stride_bm = NB * H,
         .eps = static_cast<float>(eps),
         .num_tokens = static_cast<uint32_t>(num_tokens),

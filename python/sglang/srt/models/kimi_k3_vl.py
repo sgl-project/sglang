@@ -12,7 +12,8 @@ mm_projector.proj.0/proj.2, mm_projector.post_norm), so loading needs no
 renames.
 """
 
-from typing import List, Optional, Tuple, Union
+from dataclasses import dataclass, replace
+from typing import List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
@@ -23,6 +24,7 @@ from sglang.jit_kernel.vision_rope import (
     apply_fused_qk_complex_rope,
     precompile_fused_qk_complex_rope,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.vision import (
     FLASHINFER_WORKSPACE_SIZE_BYTES,
     QKV_BACKEND_IMPL,
@@ -30,12 +32,22 @@ from sglang.srt.layers.attention.vision import (
     prepare_flashinfer_cudnn_vision_attention_metadata,
     prepare_vision_attention_metadata,
 )
+from sglang.srt.models.kimi_vl_moonvit import concat_or_single, tpool_patch_merger
 from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import print_info_once
 
-_FUSED_ROPE_MIN_TOKENS = 2048
 _SM103_TRITON_MAX_SEQLEN = 1536
 _SM103_FA4_MIN_ATTENTION_WORK = 3_000_000
+
+GridTHW = Tuple[int, int, int]
+SegmentBounds = Tuple[Tuple[int, int], ...]
+
+
+def _resolve_grid_thw_list(
+    grid_thws: torch.Tensor, grid_thw_list: Optional[Sequence[Sequence[int]]] = None
+) -> Tuple[GridTHW, ...]:
+    values = grid_thws.tolist() if grid_thw_list is None else grid_thw_list
+    return tuple((int(t), int(h), int(w)) for t, h, w in values)
 
 
 def _get_mm_attention_backend() -> str:
@@ -94,17 +106,28 @@ def apply_rope(
 
 
 def _can_use_fused_rope(hidden_states: torch.Tensor, freqs_cis: torch.Tensor) -> bool:
-    if hidden_states.shape[0] < _FUSED_ROPE_MIN_TOKENS:
-        return False
+    return _can_use_fused_rope_for_shape(
+        dtype=hidden_states.dtype,
+        device=hidden_states.device,
+        freqs_cis=freqs_cis,
+    )
+
+
+def _can_use_fused_rope_for_shape(
+    *,
+    dtype: torch.dtype,
+    device: torch.device,
+    freqs_cis: torch.Tensor,
+) -> bool:
     if not (
-        hidden_states.is_cuda
+        device.type == "cuda"
         and freqs_cis.is_cuda
-        and hidden_states.device == freqs_cis.device
-        and hidden_states.dtype in (torch.bfloat16, torch.float16)
+        and device == freqs_cis.device
+        and dtype in (torch.bfloat16, torch.float16)
         and freqs_cis.dtype == torch.complex64
     ):
         return False
-    major, _ = torch.cuda.get_device_capability(hidden_states.device)
+    major, _ = torch.cuda.get_device_capability(device)
     return major >= 9
 
 
@@ -113,10 +136,26 @@ def sdpa_varlen_attention(
     k: torch.Tensor,
     v: torch.Tensor,
     cu_seqlens: torch.Tensor,
+    *,
+    segment_bounds: Optional[SegmentBounds] = None,
 ) -> torch.Tensor:
+    is_single_segment = (
+        len(segment_bounds) == 1
+        if segment_bounds is not None
+        else cu_seqlens.numel() == 2
+    )
+    if is_single_segment:
+        out = F.scaled_dot_product_attention(
+            q.transpose(0, 1).unsqueeze(0),
+            k.transpose(0, 1).unsqueeze(0),
+            v.transpose(0, 1).unsqueeze(0),
+        )
+        return out.squeeze(0).transpose(0, 1).flatten(start_dim=-2)
     outputs = []
-    bounds = cu_seqlens.tolist()
-    for start, end in zip(bounds[:-1], bounds[1:]):
+    if segment_bounds is None:
+        bounds = cu_seqlens.tolist()
+        segment_bounds = tuple(zip(bounds[:-1], bounds[1:]))
+    for start, end in segment_bounds:
         seg_q = q[start:end].transpose(0, 1).unsqueeze(0)
         seg_k = k[start:end].transpose(0, 1).unsqueeze(0)
         seg_v = v[start:end].transpose(0, 1).unsqueeze(0)
@@ -160,7 +199,6 @@ def interpolate_pos_emb(
 
 
 class Learnable2DInterpPosEmbDividedFixed(nn.Module):
-
     def __init__(
         self,
         height: int,
@@ -184,9 +222,14 @@ class Learnable2DInterpPosEmbDividedFixed(nn.Module):
             persistent=False,
         )
 
-    def forward(self, x: torch.Tensor, grid_thws: torch.Tensor) -> torch.Tensor:
+    def position_embeddings(
+        self,
+        grid_thws: torch.Tensor,
+        *,
+        grid_thw_list: Optional[Sequence[Sequence[int]]] = None,
+    ) -> torch.Tensor:
         pos_embs = []
-        for t, h, w in grid_thws.tolist():
+        for t, h, w in _resolve_grid_thw_list(grid_thws, grid_thw_list):
             assert t <= self.num_frames, f"t:{t} > num_frames:{self.num_frames}"
             if (h, w) == self.weight.shape[:-1]:
                 pos_emb_2d = self.weight.flatten(end_dim=1)
@@ -204,11 +247,24 @@ class Learnable2DInterpPosEmbDividedFixed(nn.Module):
 
             pos_embs.append(pos_emb_3d.reshape(-1, pos_emb_3d.shape[-1]))
 
-        return x + torch.cat(pos_embs)
+        return torch.cat(pos_embs)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        grid_thws: torch.Tensor,
+        *,
+        grid_thw_list: Optional[Sequence[Sequence[int]]] = None,
+        position_embeddings: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if position_embeddings is None:
+            position_embeddings = self.position_embeddings(
+                grid_thws, grid_thw_list=grid_thw_list
+            )
+        return x + position_embeddings
 
 
 class MoonVision3dPatchEmbed(nn.Module):
-
     def __init__(
         self,
         out_dim: int,
@@ -244,13 +300,24 @@ class MoonVision3dPatchEmbed(nn.Module):
             interpolation_mode=pos_emb_interpolation_mode,
         )
 
-    def forward(self, x: torch.Tensor, grid_thws: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        grid_thws: torch.Tensor,
+        *,
+        grid_thw_list: Optional[Sequence[Sequence[int]]] = None,
+        position_embeddings: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         x = self.proj(x).view(x.size(0), -1)
-        return self.pos_emb(x, grid_thws)
+        return self.pos_emb(
+            x,
+            grid_thws,
+            grid_thw_list=grid_thw_list,
+            position_embeddings=position_embeddings,
+        )
 
 
 class Rope2DPosEmbRepeated(nn.Module):
-
     def __init__(
         self, dim: int, max_height: int, max_width: int, theta_base: float = 10000
     ):
@@ -278,14 +345,18 @@ class Rope2DPosEmbRepeated(nn.Module):
         return freqs_cis.reshape(self.max_height, self.max_width, -1)
 
     def get_freqs_cis(
-        self, grid_thws: torch.Tensor, device: torch.device
+        self,
+        grid_thws: torch.Tensor,
+        device: torch.device,
+        *,
+        grid_thw_list: Optional[Sequence[Sequence[int]]] = None,
     ) -> torch.Tensor:
         if not hasattr(self, "freqs_cis"):
             self.register_buffer(
                 "freqs_cis", self._precompute_freqs_cis(device), persistent=False
             )
 
-        shapes = grid_thws.tolist()
+        shapes = _resolve_grid_thw_list(grid_thws, grid_thw_list)
         assert all(
             1 <= h <= self.max_height and 1 <= w <= self.max_width for t, h, w in shapes
         ), (shapes, self.max_height, self.max_width)
@@ -299,7 +370,6 @@ class Rope2DPosEmbRepeated(nn.Module):
 
 
 class MLP2(nn.Module):
-
     def __init__(self, dims: List[int], activation, bias: bool = True):
         super().__init__()
         assert len(dims) == 3
@@ -320,7 +390,6 @@ def _make_norm(norm_type: str, dim: int) -> nn.Module:
 
 
 class MoonViTEncoderLayer(nn.Module):
-
     def __init__(
         self,
         num_heads: int,
@@ -371,6 +440,7 @@ class MoonViTEncoderLayer(nn.Module):
         self,
         x: torch.Tensor,
         cu_seqlens: torch.Tensor,
+        segment_bounds: SegmentBounds,
         rope_freqs_cis: torch.Tensor,
         forward_metadata: VisionAttentionMetadata,
         use_fused_rope: bool,
@@ -391,7 +461,13 @@ class MoonViTEncoderLayer(nn.Module):
             xq, xk = apply_rope(xq, xk, rope_freqs_cis)
 
         if selected_attention_backend == "sdpa":
-            attn_out = sdpa_varlen_attention(xq, xk, xv, cu_seqlens)
+            attn_out = sdpa_varlen_attention(
+                xq,
+                xk,
+                xv,
+                cu_seqlens,
+                segment_bounds=segment_bounds,
+            )
         else:
             if selected_attention_backend == "flashinfer_cudnn":
                 xv = xv.contiguous()
@@ -410,6 +486,7 @@ class MoonViTEncoderLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         cu_seqlens: torch.Tensor,
+        segment_bounds: SegmentBounds,
         rope_freqs_cis: torch.Tensor,
         forward_metadata: VisionAttentionMetadata,
         use_fused_rope: bool,
@@ -420,6 +497,7 @@ class MoonViTEncoderLayer(nn.Module):
         hidden_states = self._attention(
             hidden_states,
             cu_seqlens,
+            segment_bounds,
             rope_freqs_cis,
             forward_metadata,
             use_fused_rope,
@@ -433,8 +511,18 @@ class MoonViTEncoderLayer(nn.Module):
         return residual + hidden_states
 
 
-class MoonViT3dEncoder(nn.Module):
+@dataclass(frozen=True)
+class KimiK3VisionForwardMetadata:
+    grid_thw_list: Tuple[GridTHW, ...]
+    segment_bounds: SegmentBounds
+    rope_freqs_cis: torch.Tensor
+    attention: VisionAttentionMetadata
+    use_fused_rope: bool
+    selected_attention_backend: str
+    position_embeddings: Optional[torch.Tensor] = None
 
+
+class MoonViT3dEncoder(nn.Module):
     def __init__(self, hidden_dim: int, num_layers: int, block_cfg: dict) -> None:
         super().__init__()
         qkv_hidden_size = block_cfg.get("qkv_hidden_size") or block_cfg["hidden_dim"]
@@ -514,9 +602,7 @@ class MoonViT3dEncoder(nn.Module):
         q = packed_qkv[:, 0].contiguous()
         k = packed_qkv[:, 1].contiguous()
         v = packed_qkv[:, 2]
-        cu_seqlens = torch.tensor(
-            [0, num_tokens], dtype=torch.int32, device=device
-        )
+        cu_seqlens = torch.tensor([0, num_tokens], dtype=torch.int32, device=device)
         metadata = prepare_vision_attention_metadata(cu_seqlens, device=device)
         with torch.inference_mode():
             block.attention_backend_impls["fa4"](
@@ -531,79 +617,95 @@ class MoonViT3dEncoder(nn.Module):
         torch.cuda.synchronize(device)
         return True
 
-    def forward(
-        self, hidden_states: torch.Tensor, grid_thws: torch.Tensor
-    ) -> torch.Tensor:
+    def prepare_forward_metadata(
+        self,
+        *,
+        grid_thws: torch.Tensor,
+        total_tokens: int,
+        dtype: torch.dtype,
+        device: torch.device,
+        grid_thw_list: Optional[Sequence[Sequence[int]]] = None,
+    ) -> KimiK3VisionForwardMetadata:
+        shapes = _resolve_grid_thw_list(grid_thws, grid_thw_list)
         rope_freqs_cis = self.rope_2d.get_freqs_cis(
-            grid_thws=grid_thws, device=hidden_states.device
+            grid_thws=grid_thws,
+            device=device,
+            grid_thw_list=shapes,
         )
-
-        lengths = torch.cat(
-            (
-                torch.zeros(1, dtype=grid_thws.dtype, device=grid_thws.device),
-                grid_thws[:, 0] * grid_thws[:, 1] * grid_thws[:, 2],
-            )
-        )
-        cu_seqlens = lengths.cumsum(dim=0, dtype=torch.int32)
+        cumulative_lengths = [0]
+        for t, h, w in shapes:
+            cumulative_lengths.append(cumulative_lengths[-1] + t * h * w)
+        cu_seqlens = torch.tensor(cumulative_lengths, dtype=torch.int32, device=device)
 
         if self.attention_backend == "flashinfer_cudnn":
-            forward_metadata = prepare_flashinfer_cudnn_vision_attention_metadata(
+            attention = prepare_flashinfer_cudnn_vision_attention_metadata(
                 cu_seqlens,
-                device=hidden_states.device,
+                device=device,
                 elem_per_token=self.attention_width,
             )
         else:
-            forward_metadata = prepare_vision_attention_metadata(
-                cu_seqlens, device=hidden_states.device
-            )
+            attention = prepare_vision_attention_metadata(cu_seqlens, device=device)
 
-        use_fused_rope = _can_use_fused_rope(hidden_states, rope_freqs_cis)
         selected_attention_backend = _resolve_mm_attention_backend(
             self.attention_backend,
-            max_seqlen=forward_metadata.max_seqlen,
-            total_tokens=hidden_states.shape[0],
-            device=hidden_states.device,
+            max_seqlen=attention.max_seqlen,
+            total_tokens=total_tokens,
+            device=device,
         )
+        return KimiK3VisionForwardMetadata(
+            grid_thw_list=shapes,
+            segment_bounds=tuple(zip(cumulative_lengths[:-1], cumulative_lengths[1:])),
+            rope_freqs_cis=rope_freqs_cis,
+            attention=attention,
+            use_fused_rope=_can_use_fused_rope_for_shape(
+                dtype=dtype,
+                device=device,
+                freqs_cis=rope_freqs_cis,
+            ),
+            selected_attention_backend=selected_attention_backend,
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        grid_thws: torch.Tensor,
+        *,
+        forward_metadata: Optional[KimiK3VisionForwardMetadata] = None,
+        grid_thw_list: Optional[Sequence[Sequence[int]]] = None,
+    ) -> torch.Tensor:
+        if forward_metadata is None:
+            forward_metadata = self.prepare_forward_metadata(
+                grid_thws=grid_thws,
+                total_tokens=hidden_states.shape[0],
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+                grid_thw_list=grid_thw_list,
+            )
+            forward_metadata = replace(
+                forward_metadata,
+                use_fused_rope=_can_use_fused_rope(
+                    hidden_states, forward_metadata.rope_freqs_cis
+                ),
+            )
+        attention = forward_metadata.attention
+        cu_seqlens = attention.cu_seqlens
+        rope_freqs_cis = forward_metadata.rope_freqs_cis
+
         for block in self.blocks:
             hidden_states = block(
                 hidden_states,
                 cu_seqlens,
+                forward_metadata.segment_bounds,
                 rope_freqs_cis,
-                forward_metadata,
-                use_fused_rope,
-                selected_attention_backend,
+                attention,
+                forward_metadata.use_fused_rope,
+                forward_metadata.selected_attention_backend,
             )
 
         return self.final_layernorm(hidden_states)
 
 
-def tpool_patch_merger(
-    x: torch.Tensor,
-    grid_thws: torch.Tensor,
-    merge_kernel_size: Tuple[int, int] = (2, 2),
-) -> List[torch.Tensor]:
-    d_model = x.size(-1)
-
-    outputs = []
-    pre_sum = 0
-    for t, h, w in grid_thws.tolist():
-        seq = x[pre_sum : pre_sum + t * h * w]
-        kernel_height, kernel_width = merge_kernel_size
-        new_height, new_width = h // kernel_height, w // kernel_width
-        reshaped_seq = seq.view(
-            t, new_height, kernel_height, new_width, kernel_width, d_model
-        )
-        reshaped_seq = reshaped_seq.permute(0, 1, 3, 2, 4, 5).contiguous().mean(dim=0)
-        outputs.append(
-            reshaped_seq.view(new_height * new_width, kernel_height * kernel_width, -1)
-        )
-        pre_sum += t * h * w
-
-    return outputs
-
-
 class KimiK3VisionTower(nn.Module):
-
     def __init__(self, vision_config, **kwargs):
         super().__init__()
         config = vision_config
@@ -659,6 +761,7 @@ class KimiK3VisionTower(nn.Module):
                 "linear_bias": getattr(config, "linear_bias", True),
             },
         )
+        self.cuda_graph_runner = None
 
     @property
     def dtype(self) -> torch.dtype:
@@ -674,6 +777,28 @@ class KimiK3VisionTower(nn.Module):
     def precompile_attention_backend(self) -> bool:
         return self.encoder.precompile_attention_backend(self.dtype, self.device)
 
+    def prepare_forward_metadata(
+        self,
+        grid_thws: torch.Tensor,
+        *,
+        grid_thw_list: Optional[Sequence[Sequence[int]]] = None,
+        total_tokens: int,
+        dtype: Optional[torch.dtype] = None,
+    ) -> KimiK3VisionForwardMetadata:
+        metadata = self.encoder.prepare_forward_metadata(
+            grid_thws=grid_thws,
+            total_tokens=total_tokens,
+            dtype=self.dtype if dtype is None else dtype,
+            device=self.device,
+            grid_thw_list=grid_thw_list,
+        )
+        return replace(
+            metadata,
+            position_embeddings=self.patch_embed.pos_emb.position_embeddings(
+                grid_thws, grid_thw_list=metadata.grid_thw_list
+            ),
+        )
+
     def forward(
         self,
         pixel_values: torch.Tensor,
@@ -681,6 +806,8 @@ class KimiK3VisionTower(nn.Module):
         max_seqlen: Optional[int] = None,
         *,
         grid_hw: Optional[torch.Tensor] = None,
+        grid_thw_list: Optional[Sequence[Sequence[int]]] = None,
+        forward_metadata: Optional[KimiK3VisionForwardMetadata] = None,
     ) -> List[torch.Tensor]:
         # run_dp_sharded_mrope_vision_model calls rope_2d towers with
         # grid_hw=/max_seqlen= keywords (#30878); K3 grids are (t, h, w) and the
@@ -688,10 +815,65 @@ class KimiK3VisionTower(nn.Module):
         if grid_thws is None:
             grid_thws = grid_hw
         assert grid_thws.ndim == 2 and grid_thws.size(1) == 3, grid_thws.shape
-        hidden_states = self.patch_embed(pixel_values, grid_thws)
-        hidden_states = self.encoder(hidden_states, grid_thws)
+        if (
+            forward_metadata is None
+            and pixel_values.is_cuda
+            and envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get()
+        ):
+            if grid_thw_list is None:
+                grid_thw_list = _resolve_grid_thw_list(grid_thws)
+            else:
+                grid_thw_list = _resolve_grid_thw_list(grid_thws, grid_thw_list)
+            if self.cuda_graph_runner is None:
+                from sglang.srt.multimodal.kimi_k3_vit_cuda_graph_runner import (
+                    KimiK3ViTCudaGraphRunner,
+                )
+
+                self.cuda_graph_runner = KimiK3ViTCudaGraphRunner(
+                    self,
+                    capacity=(envs.SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY.get()),
+                    min_hits=envs.SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MIN_HITS.get(),
+                    max_seqlen=(envs.SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MAX_SEQLEN.get()),
+                )
+            return self.cuda_graph_runner.run(pixel_values, grid_thws, grid_thw_list)
+        return self._forward_eager(
+            pixel_values,
+            grid_thws,
+            grid_thw_list=grid_thw_list,
+            forward_metadata=forward_metadata,
+        )
+
+    def _forward_eager(
+        self,
+        pixel_values: torch.Tensor,
+        grid_thws: torch.Tensor,
+        *,
+        grid_thw_list: Optional[Sequence[Sequence[int]]] = None,
+        forward_metadata: Optional[KimiK3VisionForwardMetadata] = None,
+    ) -> List[torch.Tensor]:
+        if forward_metadata is not None:
+            grid_thw_list = forward_metadata.grid_thw_list
+        hidden_states = self.patch_embed(
+            pixel_values,
+            grid_thws,
+            grid_thw_list=grid_thw_list,
+            position_embeddings=(
+                None
+                if forward_metadata is None
+                else forward_metadata.position_embeddings
+            ),
+        )
+        hidden_states = self.encoder(
+            hidden_states,
+            grid_thws,
+            forward_metadata=forward_metadata,
+            grid_thw_list=grid_thw_list,
+        )
         return tpool_patch_merger(
-            hidden_states, grid_thws, merge_kernel_size=self.merge_kernel_size
+            hidden_states,
+            grid_thws,
+            merge_kernel_size=self.merge_kernel_size,
+            grid_thw_list=grid_thw_list,
         )
 
 
@@ -723,8 +905,8 @@ class KimiK3MultiModalProjector(nn.Module):
         self, image_features: Union[torch.Tensor, List[torch.Tensor]]
     ) -> torch.Tensor:
         if isinstance(image_features, (list, tuple)):
-            x = torch.cat(
-                [item.reshape(item.shape[0], -1) for item in image_features], dim=0
+            x = concat_or_single(
+                [item.reshape(item.shape[0], -1) for item in image_features]
             )
         else:
             x = image_features.reshape(image_features.shape[0], -1)

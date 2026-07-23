@@ -4,7 +4,7 @@
 export const config = {
   modelName: "DeepSeek-V4",
 
-  latencyPercentile: "Mean", // temporary; re-measure to P50
+  latencyPercentile: "P50",
 
   supportedHardware: [
     "h100", "h200", "b200", "b300", "gb200", "gb300",
@@ -80,7 +80,7 @@ export const config = {
   --dataset-name {{DATASET}} \\
   --random-input-len {{ISL}} --random-output-len {{OSL}} \\
   --num-prompts {{NUM_PROMPTS}} --max-concurrency {{MAX_CONCURRENCY}} \\
-  --warmup-requests 64`,
+  --warmup-requests 64 --flush-cache`,
     accuracy: {
       gsm8k_pct:
 `# To install sgl-eval: pip install git+https://github.com/sgl-project/sgl-eval
@@ -1276,7 +1276,7 @@ sgl-eval run aime25 \\
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 4",
-        "--mem-fraction-static 0.83",
+        "--mem-fraction-static 0.90",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],

@@ -39,6 +39,7 @@ from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.utils.common import (
     cpu_has_amx_support,
     get_device_capability,
+    get_device_name,
     get_device_sm,
     get_nvidia_driver_version,
     get_quantization_config,
@@ -322,17 +323,141 @@ def _register_for(*architectures: str):
 
 @_register_for("KimiK3ForConditionalGeneration")
 def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
-    if (
+    if server_args.dcp_size > 1:
+        overrides = {}
+        if server_args.speculative_algorithm == "DSPARK":
+            from sglang.srt.speculative.ragged_verify import (
+                RaggedVerifyMode,
+                read_ragged_verify_mode,
+            )
+
+            ragged_mode = read_ragged_verify_mode()
+            if ragged_mode is not RaggedVerifyMode.STATIC:
+                raise ValueError(
+                    "Kimi-K3 DCP + DSPARK currently requires "
+                    "SGLANG_RAGGED_VERIFY_MODE=static; compact/cap-accept are "
+                    f"not validated under DCP (got {ragged_mode.value!r})."
+                )
+
+        prefill_backend, decode_backend = attention_backends_of(server_args)
+        if prefill_backend != "tokenspeed_mla" or decode_backend != "tokenspeed_mla":
+            logger.info(
+                "Kimi-K3 DCP overrides attention backends: "
+                f"prefill={prefill_backend!r}, decode={decode_backend!r} -> "
+                "'tokenspeed_mla'."
+            )
+            overrides.update(
+                attention_backend="tokenspeed_mla",
+                prefill_attention_backend="tokenspeed_mla",
+                decode_attention_backend="tokenspeed_mla",
+            )
+
+        if server_args.kv_cache_dtype in (None, "auto", "bf16", "bfloat16"):
+            logger.info(
+                "Kimi-K3 DCP overrides KV cache dtype: "
+                f"{server_args.kv_cache_dtype!r} -> 'fp8_e4m3'."
+            )
+            overrides["kv_cache_dtype"] = "fp8_e4m3"
+
+        if server_args.dcp_replicate_q_proj is None:
+            logger.info("Kimi-K3 DCP enables replicated Q projection by default.")
+            overrides["dcp_replicate_q_proj"] = True
+
+        device_name = get_device_name()
+        normalized_device_name = (device_name or "").upper()
+        dcp_comm_backend = (
+            "fi_a2a"
+            if any(name in normalized_device_name for name in ("GB200", "GB300"))
+            else "a2a"
+        )
+        logger.info(
+            "Kimi-K3 DCP selects communication backend on "
+            f"{device_name!r}: {server_args.dcp_comm_backend!r} -> "
+            f"{dcp_comm_backend!r}."
+        )
+        overrides["dcp_comm_backend"] = dcp_comm_backend
+        return overrides
+
+    if not (
         is_sm100_supported()
         and get_device_sm() in (100, 103)
         and server_args.is_attention_backend_not_set()
     ):
+        return {}
+    if server_args.speculative_algorithm != "DSPARK":
         logger.info(
-            "Use cutedsl_mla as the default decode attention backend for "
-            "Kimi-K3 on SM100/SM103."
+            "Use trtllm_mla as the default prefill and decode attention "
+            "backend for Kimi-K3 on SM100/SM103."
         )
-        return {"decode_attention_backend": "cutedsl_mla"}
-    return {}
+        return {
+            "decode_attention_backend": "trtllm_mla",
+            "prefill_attention_backend": "trtllm_mla",
+        }
+    # DSPARK: verify runs on the decode backend (mode=decode), so this picks the
+    # verify kernel. cutedsl rejects verify q_len > 4, mode=prefill flashinfer
+    # verify is slow, and plain decode is cold under dspark. tokenspeed verify is
+    # fastest on fp8 KV but hard-requires fp8_e4m3 and caps q_len <= 8.
+    q_len = server_args.speculative_num_draft_tokens or (
+        server_args.speculative_dspark_block_size + 1
+        if server_args.speculative_dspark_block_size is not None
+        # Checkpoint auto-infer happens after overrides; K3 draft uses block 7.
+        else 8
+    )
+    if server_args.kv_cache_dtype == "fp8_e4m3" and q_len <= 8:
+        backend = "tokenspeed_mla"
+    else:
+        backend = "trtllm_mla"
+    logger.info(
+        "Kimi-K3 DSPARK on SM100/SM103: decode/verify attention backend "
+        f"{backend} (speculative_attention_mode=decode)."
+    )
+    return {
+        "decode_attention_backend": backend,
+        "prefill_attention_backend": "trtllm_mla",
+        "speculative_attention_mode": "decode",
+    }
+
+
+def _is_mxfp4_pack_quantized(hf_config: Any) -> bool:
+    qc = getattr(
+        getattr(hf_config, "text_config", hf_config), "quantization_config", None
+    )
+    if not isinstance(qc, dict):
+        return False
+    groups = qc.get("config_groups") or {}
+    return any(
+        "mxfp4" in str(g.get("format", ""))
+        for g in groups.values()
+        if isinstance(g, dict)
+    )
+
+
+@_register_for("KimiK3ForConditionalGeneration")
+def _kimi_k3_moe_runner_overrides(server_args: Any, hf_config: Any) -> dict:
+    # MoE runner default, independent of the attention-backend gate above.
+    # trtllm-gen fused MoE (flashinfer_mxfp4) beats marlin on both the decode
+    # (M=bs) and the target-verify (M=bs*(gamma+1)) regimes on SM100/SM103;
+    # it hard-requires the SiTU cubin SDK on the box (K3's SiTU activation has
+    # no public cubins), so fall back to marlin when the SDK is absent.
+    if server_args.moe_runner_backend != "auto":
+        return {}
+    if not (is_sm100_supported() and get_device_sm() in (100, 103)):
+        return {}
+    if not _is_mxfp4_pack_quantized(hf_config):
+        return {}
+    from sglang.jit_kernel.trtllm_gen_moe import available as _trtllm_gen_moe_ok
+
+    if _trtllm_gen_moe_ok():
+        logger.info(
+            "Kimi-K3 on SM100/SM103: moe_runner_backend=flashinfer_mxfp4 "
+            "(trtllm-gen SiTU cubin SDK found)."
+        )
+        return {"moe_runner_backend": "flashinfer_mxfp4"}
+    logger.info(
+        "Kimi-K3 on SM100/SM103: trtllm-gen MoE SDK not found; "
+        "moe_runner_backend=marlin."
+    )
+    return {"moe_runner_backend": "marlin"}
 
 
 @_register_for(
@@ -836,6 +961,57 @@ def _deepseek_v4_overrides(server_args: Any, hf_config: Any) -> dict:
             "Use flashinfer_trtllm_routed as MoE runner backend for "
             f"{model_arch} hybrid FP8+NVFP4 checkpoint."
         )
+    return overrides
+
+
+@_register_for(
+    "InklingForConditionalGeneration",
+    "InklingForConditionalGenerationMTP",
+)
+def _inkling_overrides(server_args: Any, hf_config: Any) -> dict:
+    """Inkling architecture defaults: SWA / mamba KV-pool ratios tuned for the
+    hybrid-SWA layout, the extra-buffer mamba strategy, and the unified radix
+    tree (which Inkling requires — models/inkling.py asserts it). The full-graph
+    prefill default is set separately (inline, before cuda-graph resolution) —
+    see ServerArgs.__post_init__ / _apply_inkling_prefill_cuda_graph_default. The
+    server-arg defaults each yield to an explicit user value (compared against
+    the ServerArgs class default); the prefill declaration is materialized
+    before _parse_cuda_graph_config folds cuda_graph_backend_prefill into
+    prefill.backend, and an explicit --cuda-graph-backend-prefill /
+    --disable-prefill-cuda-graph still wins. The unified-radix env write follows
+    the MiniMax-M3 handler precedent (env is not a resolvable server-arg)."""
+    from sglang.srt.server_args import ServerArgs
+
+    overrides: Dict[str, Any] = {}
+    # NOTE: the full-graph prefill default is NOT set here. cuda-graph config is
+    # resolved in __post_init__ before declarations are materialized, so a
+    # cuda_graph_backend_prefill declared here lands too late (the breakable
+    # default would already have been auto-disabled for this multimodal arch).
+    # It is set inline before _handle_cuda_graph_config instead.
+    if server_args.swa_full_tokens_ratio == ServerArgs.swa_full_tokens_ratio:
+        overrides["swa_full_tokens_ratio"] = 0.1
+    if server_args.mamba_full_memory_ratio == ServerArgs.mamba_full_memory_ratio:
+        overrides["mamba_full_memory_ratio"] = 0.1
+    # Inkling requires the extra-buffer mamba strategy (inkling.py asserts
+    # enable_mamba_extra_buffer()); the generic "auto" resolution does not cover
+    # Inkling, so pin it here. Yields to an explicit --mamba-scheduler-strategy.
+    if server_args.mamba_radix_cache_strategy == ServerArgs.mamba_radix_cache_strategy:
+        overrides["mamba_radix_cache_strategy"] = "extra_buffer"
+    # Inkling attention runs only on the fa4 (Blackwell) or triton backends --
+    # models/inkling_common/attn.py asserts attention_backend in {fa4, triton}.
+    # The generic resolver would otherwise pick trtllm_mha (SM100) / fa3
+    # (Hopper), so a bare launch fails on the first attention forward. Pin a
+    # supported default when the user left every attention-backend flag unset
+    # (mirrors the MiniMax-M3 SM100 fa4-default above); an explicit
+    # --attention-backend / --prefill/decode-attention-backend still wins.
+    if server_args.is_attention_backend_not_set():
+        inkling_attn_backend = "fa4" if is_sm100_supported() else "triton"
+        overrides["attention_backend"] = inkling_attn_backend
+        logger.info(
+            f"Use {inkling_attn_backend} as the attention backend for Inkling "
+            "(requires fa4 or triton)."
+        )
+    envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.set(True)
     return overrides
 
 

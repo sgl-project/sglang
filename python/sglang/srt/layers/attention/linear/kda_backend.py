@@ -1,3 +1,4 @@
+import importlib.util
 from typing import Optional, Tuple, Union
 
 import torch
@@ -11,8 +12,10 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBack
 from sglang.srt.layers.attention.linear.kernels.kda_triton import TritonKDAKernel
 from sglang.srt.layers.attention.linear.utils import (
     LinearAttnKernelBackend,
+    build_verify_intermediate_state_indices,
     get_linear_attn_decode_backend,
     get_linear_attn_prefill_backend,
+    get_linear_attn_verify_backend,
 )
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.utils import is_cpu, is_cuda, is_npu
@@ -40,7 +43,9 @@ class KDAKernelDispatcher:
         self,
         decode_backend: LinearAttnKernelBackend,
         prefill_backend: LinearAttnKernelBackend,
+        verify_backend: LinearAttnKernelBackend,
     ):
+        self.verify_backend = verify_backend
         triton_kernel = TritonKDAKernel()
 
         if decode_backend.is_triton():
@@ -69,15 +74,39 @@ class KDAKernelDispatcher:
                 "KDA supports 'triton', 'cutedsl', or 'flashinfer'."
             )
 
-        # target_verify (MTP / speculative decode) kernel: each decode backend
-        # verifies with its own kernel. FlashInfer decode uses recurrent_kda (SM100,
-        # chain only); Triton -- and CuTe DSL, which has no verify of its own -- use
-        # the Triton fused KDA verify, which handles chain + tree
-        # (retrieve_parent_token) and per-step checkpointing and is the reference the
-        # KDA backend correctness tests assert against.
-        self.verify_kernel = (
-            self.decode_kernel if decode_backend.is_flashinfer() else triton_kernel
-        )
+        # target_verify kernel, selected via --linear-attn-verify-backend (defaults
+        # to follow decode: flashinfer -> recurrent_kda, else triton).
+        #   triton: fused chain + tree (retrieve_parent_token) verify; the reference
+        #     the KDA correctness tests assert against.
+        #   flashinfer: recurrent_kda (SM100, chain only); reuses the decode kernel
+        #     when decode is also flashinfer.
+        #   nv_cutedsl: fused Kimi-K3/DSpARK dense verify.
+        if verify_backend.is_triton():
+            self.verify_kernel = triton_kernel
+        elif verify_backend.is_flashinfer():
+            if decode_backend.is_flashinfer():
+                self.verify_kernel = self.decode_kernel
+            else:
+                if not is_cuda():
+                    raise ValueError("KDA FlashInfer verify backend requires CUDA")
+                from sglang.srt.layers.attention.linear.kernels.kda_flashinfer import (
+                    FlashInferKDAKernel,
+                )
+
+                self.verify_kernel = FlashInferKDAKernel()
+        elif verify_backend.is_nv_cutedsl():
+            self.verify_kernel = triton_kernel
+        elif verify_backend.is_custom():
+            # Future custom KDA verify kernel plugs in here.
+            raise NotImplementedError(
+                "--linear-attn-verify-backend custom: no custom KDA verify kernel "
+                "is registered yet."
+            )
+        else:
+            raise ValueError(
+                f"Unsupported KDA verify backend: {verify_backend}. "
+                "KDA verify supports 'triton', 'nv_cutedsl', or 'flashinfer'."
+            )
 
         if prefill_backend.is_triton():
             self.extend_kernel = triton_kernel
@@ -105,11 +134,26 @@ class KDAKernelDispatcher:
                 rank0_log(
                     "KDA cutedsl prefill needs SM100; falling back to Triton extend."
                 )
+        elif prefill_backend.is_nvidia_kda():
+            if not is_cuda():
+                raise ValueError("NVIDIA KDA prefill backend requires CUDA")
+            from sglang.srt.layers.attention.linear.kernels.kda_nvidia import (
+                NvidiaKDAKernel,
+            )
+
+            nvidia_kda_kernel = NvidiaKDAKernel()
+            if nvidia_kda_kernel.supports_prefill:
+                self.extend_kernel = nvidia_kda_kernel
+            else:
+                self.extend_kernel = triton_kernel
+                rank0_log(
+                    "NVIDIA KDA prefill needs SM100; falling back to Triton extend."
+                )
         else:
             raise ValueError(
                 f"Unsupported KDA prefill backend: {prefill_backend}. "
-                "KDA supports 'triton', 'flashkda', or 'cutedsl' "
-                "(cutedsl prefill needs SM100)."
+                "KDA supports 'triton', 'flashkda', 'cutedsl', or 'nvidia_kda' "
+                "(cutedsl/nvidia_kda prefill need SM100)."
             )
 
         self.supports_packed_decode = getattr(
@@ -224,6 +268,8 @@ class KDAKernelDispatcher:
             cache_steps=cache_steps,
             retrieve_parent_token=retrieve_parent_token,
             lower_bound=lower_bound,
+            # Forward extras (e.g. the fused ring-write cache_ring/replayssm_*).
+            **kwargs,
         )
 
     def extend(
@@ -282,6 +328,12 @@ class KDAAttnBackend(MambaAttnBackendBase):
     # to its dense layout, so ragged verify graphs are supported.
     supports_ragged_verify_graph: bool = True
 
+    # Read by decide_needs_cpu_seq_lens. Decode/verify metadata is GPU-only
+    # (graph replay already passes seq_lens_cpu=None), extend reads
+    # extend_seq_lens_cpu from schedule, mamba track indices rebuild from req
+    # objects, and the replayssm seq_lens_cpu force-flush is GDN-only.
+    needs_cpu_seq_lens: bool = False
+
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
         # Needed by the extra_buffer track path: _init_track_conv_indices reads
@@ -295,22 +347,29 @@ class KDAAttnBackend(MambaAttnBackendBase):
         )
         decode_backend = get_linear_attn_decode_backend()
         prefill_backend = get_linear_attn_prefill_backend()
-        # KDA FlashInfer speculative decode (target_verify) is linear-chain only --
-        # recurrent_kda has no tree-ancestor traversal. Reject EAGLE tree verify
-        # (topk > 1) early at setup instead of deep in the per-step verify call.
-        # (The kernel keeps a per-call retrieve_parent_token guard as a backstop; it
-        # also covers ngram tree, which this topk field does not.)
+        verify_backend = get_linear_attn_verify_backend()
+        # KDA FlashInfer target_verify (recurrent_kda) is chain-only (no tree-ancestor
+        # traversal). Reject EAGLE tree verify (topk > 1) early at setup, keyed on the
+        # verify backend (not decode). The kernel keeps a per-call
+        # retrieve_parent_token backstop that also covers ngram tree.
         speculative_topk = model_runner.server_args.speculative_eagle_topk or 1
-        if decode_backend.is_flashinfer() and speculative_topk > 1:
+        if verify_backend.is_flashinfer() and speculative_topk > 1:
             raise ValueError(
                 "KDA FlashInfer speculative decoding only supports topk=1 "
                 "(EAGLE tree verify / retrieve_parent_token is unsupported)."
             )
-        self.kernel_dispatcher = KDAKernelDispatcher(decode_backend, prefill_backend)
+        self.kernel_dispatcher = KDAKernelDispatcher(
+            decode_backend, prefill_backend, verify_backend
+        )
         # Per-request row index into the speculative `intermediate_ssm` scratch,
-        # used by the MTP / target_verify path (mirrors GDNAttnBackend).
-        self.verify_intermediate_state_indices = torch.arange(
-            self.req_to_token_pool.size, dtype=torch.int32, device=model_runner.device
+        # used by the MTP / target_verify path (mirrors GDNAttnBackend). Sized
+        # past the pool for attn_tp-padded warmup/MLP-sync batches (see helper).
+        self.verify_intermediate_state_indices = (
+            build_verify_intermediate_state_indices(
+                self.req_to_token_pool.size,
+                model_runner.server_args,
+                model_runner.device,
+            )
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -585,6 +644,12 @@ class KDAAttnBackend(MambaAttnBackendBase):
             # in place (e.g. FlashKDA) must not run for it.
             is_spec_decode=forward_batch.forward_mode.is_draft_extend_v2(),
             return_intermediate_states=track_ssm,
+            # Which global chunk rows of h the track snapshot will read; lets
+            # kernels that cannot materialize per-chunk states (NVIDIA KDA) take the
+            # fast path when the snapshot only needs the final state.
+            track_ssm_h_src=(
+                self.forward_metadata.track_ssm_h_src if track_ssm else None
+            ),
         )
         if track_ssm:
             # Snapshot the SSM state at the last track-aligned chunk boundary
@@ -624,7 +689,11 @@ class KDAAttnBackend(MambaAttnBackendBase):
         conv_states = mamba_cache_params.conv[0]
         ssm_states = mamba_cache_params.temporal
         intermediate_state_cache = getattr(mamba_cache_params, "intermediate_ssm", None)
-        if intermediate_state_cache is None:
+        # ReplaySSM: intermediate_ssm is intentionally None (the ring + commit-time
+        # fold replace the per-step snapshots). Pass None to the verify kernel so it
+        # skips the write (CACHE_INTERMEDIATE_STATES=False); the output is unaffected.
+        replayssm_on = getattr(mamba_cache_params, "replayssm_rawv", None) is not None
+        if intermediate_state_cache is None and not replayssm_on:
             raise RuntimeError(
                 "KDA target_verify requires a speculative mamba cache "
                 "(MambaPool.SpeculativeState); none found."
@@ -634,6 +703,31 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
         draft_token_num = forward_batch.spec_info.draft_token_num
         ragged_layout = forward_batch.spec_info.ragged_verify_layout
+        if self._can_run_dspark_cutedsl_mtp(
+            layer=layer,
+            mixed_qkv=mixed_qkv,
+            a=a,
+            b=b,
+            draft_token_num=draft_token_num,
+            ragged_layout=ragged_layout,
+            conv_states=conv_states,
+            intermediate_state_cache=intermediate_state_cache,
+            intermediate_conv_window_cache=intermediate_conv_window_cache,
+            retrieve_parent_token=retrieve_parent_token,
+        ):
+            return self._run_dspark_cutedsl_mtp(
+                layer=layer,
+                mixed_qkv=mixed_qkv,
+                a=a,
+                b=b,
+                conv_states=conv_states,
+                ssm_states=ssm_states,
+                intermediate_state_cache=intermediate_state_cache,
+                intermediate_conv_window_cache=intermediate_conv_window_cache,
+                intermediate_state_indices=intermediate_state_indices,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+            )
         if ragged_layout is None:
             batch_size = seq_len // draft_token_num
             dense_token_indices = None
@@ -693,6 +787,27 @@ class KDAAttnBackend(MambaAttnBackendBase):
         k = k.unflatten(-1, (-1, layer.head_k_dim)).unsqueeze(0)
         v = v.unflatten(-1, (-1, layer.head_v_dim)).unsqueeze(0)
 
+        # ReplaySSM (fold-every-commit): store the draft window's raw inputs into
+        # the per-slot ring so commit replays the accepted prefix into the fp32
+        # checkpoint, replacing the per-step intermediate_ssm. Dense verify only
+        # (there is no intermediate_ssm fallback under replayssm); the compact/
+        # ragged tier is refused at startup (see server_args).
+        # the ReplaySSM ring-write is fused into the verify kernel (CACHE_RING)
+        # -- it stores pre-norm k / raw v / in-kernel gate / beta per step from the
+        # values the recurrent kernel already holds, replacing the eager torch
+        # scatter. Dense verify only; ring_kwargs is empty otherwise (and for
+        # non-triton verify kernels, which never see replayssm).
+        replayssm_rawv = getattr(mamba_cache_params, "replayssm_rawv", None)
+        ring_kwargs = {}
+        if replayssm_rawv is not None and ragged_layout is None:
+            ring_kwargs = dict(
+                cache_ring=True,
+                replayssm_rawv=replayssm_rawv,
+                replayssm_rawk=mamba_cache_params.replayssm_rawk,
+                replayssm_g=mamba_cache_params.replayssm_g,
+                replayssm_beta=mamba_cache_params.replayssm_beta,
+            )
+
         core_attn_out = self.kernel_dispatcher.target_verify(
             A_log=layer.A_log,
             dt_bias=layer.dt_bias,
@@ -709,6 +824,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             cache_steps=draft_token_num,
             retrieve_parent_token=retrieve_parent_token,
             lower_bound=layer.lower_bound,
+            **ring_kwargs,
         )
         if dense_token_indices is not None:
             # Kernel output is empty-allocated and the capped qsl skips the
@@ -717,3 +833,134 @@ class KDAAttnBackend(MambaAttnBackendBase):
             covered = dense_token_indices < (batch_size * draft_token_num)
             core_attn_out = torch.where(covered.view(1, -1, 1, 1), core_attn_out, 0.0)
         return core_attn_out
+
+    def _can_run_dspark_cutedsl_mtp(
+        self,
+        *,
+        layer: RadixLinearAttention,
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        draft_token_num: int,
+        ragged_layout,
+        conv_states: torch.Tensor,
+        intermediate_state_cache: torch.Tensor,
+        intermediate_conv_window_cache: torch.Tensor,
+        retrieve_parent_token: Optional[torch.Tensor],
+    ) -> bool:
+        """Return whether the fixed Kimi-K3/DSpARK CuTe contract is satisfied."""
+        if not self.kernel_dispatcher.verify_backend.is_nv_cutedsl() or not is_cuda():
+            return False
+        if importlib.util.find_spec("cutlass") is None:
+            return False
+        if torch.cuda.get_device_capability()[0] != 10:
+            return False
+        if ragged_layout is not None or retrieve_parent_token is not None:
+            return False
+        # draft_token_num = 1 bonus + dspark block size; the CuTe kernel is
+        # specialized per block size and capped at 8 by shared-memory growth.
+        if not 2 <= draft_token_num <= 8:
+            return False
+        if layer.bias is not None or layer.lower_bound is None:
+            return False
+        if (
+            layer.head_q_dim != 128
+            or layer.head_k_dim != 128
+            or layer.head_v_dim != 128
+        ):
+            return False
+        if (
+            layer.num_q_heads != layer.num_k_heads
+            or layer.num_k_heads != layer.num_v_heads
+        ):
+            return False
+        if (
+            mixed_qkv.dtype != torch.bfloat16
+            or a.dtype != torch.bfloat16
+            or b.dtype != torch.bfloat16
+        ):
+            return False
+        if layer.conv_weights is None or tuple(layer.conv_weights.shape) != (
+            layer.q_dim + layer.k_dim + layer.v_dim,
+            4,
+        ):
+            return False
+        if layer.conv_weights.dtype != torch.float32:
+            return False
+        if conv_states.shape[-2] != 3 or intermediate_conv_window_cache.shape[-2] != 3:
+            return False
+        if intermediate_state_cache.shape[1] < draft_token_num:
+            return False
+        if tuple(intermediate_state_cache.shape[-3:]) != (
+            layer.num_v_heads,
+            layer.head_v_dim,
+            layer.head_k_dim,
+        ):
+            return False
+        return True
+
+    @staticmethod
+    def _run_dspark_cutedsl_mtp(
+        *,
+        layer: RadixLinearAttention,
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        conv_states: torch.Tensor,
+        ssm_states: torch.Tensor,
+        intermediate_state_cache: torch.Tensor,
+        intermediate_conv_window_cache: torch.Tensor,
+        intermediate_state_indices: torch.Tensor,
+        cache_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+    ) -> torch.Tensor:
+        from sglang.jit_kernel.kimi_k3.kda_decode_mtp import (
+            fused_kda_decode_mtp_dspark,
+        )
+
+        seq_len = mixed_qkv.shape[0]
+        h = layer.num_v_heads
+        x_q, x_k, x_v = mixed_qkv.split([layer.q_dim, layer.k_dim, layer.v_dim], dim=-1)
+        x_q = x_q.reshape(1, seq_len, h, layer.head_q_dim)
+        x_k = x_k.reshape(1, seq_len, h, layer.head_k_dim)
+        x_v = x_v.reshape(1, seq_len, h, layer.head_v_dim)
+        w_q, w_k, w_v = layer.conv_weights.split(
+            [layer.q_dim, layer.k_dim, layer.v_dim], dim=0
+        )
+        cs_q, cs_k, cs_v = conv_states.split(
+            [layer.q_dim, layer.k_dim, layer.v_dim], dim=-1
+        )
+        cs_q = cs_q.transpose(-1, -2)
+        cs_k = cs_k.transpose(-1, -2)
+        cs_v = cs_v.transpose(-1, -2)
+        intermediate_conv_window_cache = intermediate_conv_window_cache.transpose(
+            -1, -2
+        )
+        ic_q, ic_k, ic_v = intermediate_conv_window_cache.split(
+            [layer.q_dim, layer.k_dim, layer.v_dim], dim=-2
+        )
+        return fused_kda_decode_mtp_dspark(
+            x_q=x_q,
+            x_k=x_k,
+            x_v=x_v,
+            w_q=w_q,
+            w_k=w_k,
+            w_v=w_v,
+            cs_q=cs_q,
+            cs_k=cs_k,
+            cs_v=cs_v,
+            g=a,
+            beta=b,
+            A_log=layer.A_log.reshape(-1),
+            dt_bias=layer.dt_bias.reshape(-1),
+            recurrent_state=ssm_states,
+            intermediate_ssm=intermediate_state_cache,
+            intermediate_state_indices=intermediate_state_indices,
+            intermediate_conv_q=ic_q,
+            intermediate_conv_k=ic_k,
+            intermediate_conv_v=ic_v,
+            ssm_state_indices=cache_indices.to(torch.int32),
+            cu_seqlens=query_start_loc.to(torch.int32),
+            lower_bound=float(layer.lower_bound),
+            scale=layer.head_q_dim**-0.5,
+        )

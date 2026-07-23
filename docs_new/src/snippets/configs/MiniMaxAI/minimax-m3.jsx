@@ -92,13 +92,15 @@ sgl-eval run mmmu_pro \\
   ],
 
   dockerImages: {
-    // lmsysorg/sglang:latest (cu13, multi-arch amd64+arm64) covers H200 + all
-    // Blackwell (incl. sm_103 B300/GB300 and Grace arm64).
-    b200: "lmsysorg/sglang:latest",
-    b300: "lmsysorg/sglang:latest",
-    gb200: "lmsysorg/sglang:latest",
-    gb300: "lmsysorg/sglang:latest",
-    h200: "lmsysorg/sglang:latest",
+    // M3-specific dev images (multi-arch amd64+arm64). cu13 carries the sm_103
+    // (B300/GB300) + Grace arm64 builds; cu12 is the Hopper/CUDA-12 build;
+    // dev-minimax-m3 is the rolling default. M3 model support is not yet in a
+    // tagged release, so :latest cannot serve it.
+    b200: "lmsysorg/sglang:dev-minimax-m3",
+    b300: "lmsysorg/sglang:dev-cu13-minimax-m3",
+    gb200: "lmsysorg/sglang:dev-cu13-minimax-m3",
+    gb300: "lmsysorg/sglang:dev-cu13-minimax-m3",
+    h200: "lmsysorg/sglang:dev-cu12-minimax-m3",
     // AMD ROCm images — published M3 builds, by arch (gfx942 -> mi30x, gfx950 -> mi35x).
     mi300x: "aigmkt/minimax-m3-sglang-rocm700-mi30x",
     mi325x: "aigmkt/minimax-m3-sglang-rocm700-mi30x",

@@ -5,8 +5,7 @@ import torch
 
 from sglang.kernels.ops.mamba.causal_conv1d_triton import PAD_SLOT_ID
 from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
-    fused_conv_window_scatter_with_mask,
-    fused_mamba_state_scatter_with_mask,
+    scatter_mamba_states_after_mtp_verify,
     track_mamba_states_all_layers,
     track_mamba_states_if_needed,
 )
@@ -103,10 +102,16 @@ class MambaAttnBackendBase(AttentionBackend):
             )
             # The ring cursor is a per-slot decode counter shared by all GDN layers;
             # manage it once here (snapshot, hand to layers, advance mod L), not per-layer.
+            # Gate on the linear_replayssm FLAG, not on cursor-tensor presence: the
+            # spec-verify ring (--enable-gdn-replayssm-spec) shares the write_pos
+            # allocation but owns it exclusively via commit_gdn_replayssm_spec
+            # (advance-by-accept-count once per verify step). Advancing it here as
+            # well inserts one phantom/stale ring entry per step and cumulatively
+            # poisons the reconstruction (degenerate repetition at 10k+ tokens).
             mamba_pool = getattr(self.req_to_token_pool, "mamba_pool", None)
             write_pos_buf = (
-                getattr(mamba_pool, "replayssm_write_pos", None)
-                if mamba_pool is not None
+                mamba_pool.replayssm_write_pos
+                if mamba_pool is not None and mamba_pool.enable_linear_replayssm
                 else None
             )
             if write_pos_buf is not None:
@@ -337,12 +342,20 @@ class MambaAttnBackendBase(AttentionBackend):
         )
 
     def _replayssm_enabled(self) -> bool:
-        """True iff --enable-linear-replayssm allocated the ring cursor
-        (MambaPool.replayssm_write_pos doubles as the on/off gate)."""
+        """True iff --enable-linear-replayssm is on for this pool.
+
+        Gate on the FLAG, not on ``replayssm_write_pos is not None``: the
+        spec-verify ring (--enable-gdn-replayssm-spec) also allocates the
+        cursor tensor but owns it exclusively via commit_gdn_replayssm_spec.
+        The decode-ring metadata machinery gated here (per-bs static cursor
+        buffers, the per-replay snapshot + advance-by-one in _replay_metadata,
+        and the decode-kernel ring rerouting downstream) must stay fully
+        dormant for the spec ring.
+        """
         mamba_pool = getattr(self.req_to_token_pool, "mamba_pool", None)
         if mamba_pool is None:
             return False
-        return getattr(mamba_pool, "replayssm_write_pos", None) is not None
+        return bool(mamba_pool.enable_linear_replayssm)
 
     def _replayssm_track_flush_mask(
         self, seq_lens_cpu: torch.Tensor, bs: int
@@ -565,7 +578,10 @@ class MambaAttnBackendBase(AttentionBackend):
                     static_ff.copy_(force_flush_dev)
                 else:
                     static_ff.zero_()
-                if not in_capture:
+                # Defense in depth: the decode-ring advance is only meaningful for
+                # decode/idle forwards (mirrors the eager path's gating). A
+                # TARGET_VERIFY replay must never advance the cursor.
+                if not in_capture and forward_mode.is_decode_or_idle():
                     L = mamba_pool.linear_replayssm_cache_len
                     # Advance only valid (non-padded) slots; a forced flush empties
                     # the ring -> next write_pos 0, like the natural L-1 wrap.
@@ -1116,45 +1132,40 @@ class HybridLinearAttnBackend(AttentionBackend):
             ]
         )
 
-        mamba_caches = (
-            self.linear_attn_backend.req_to_token_pool.get_speculative_mamba2_params_all_layers()
-        )
+        req_pool = self.linear_attn_backend.req_to_token_pool
+        mamba_caches = req_pool.get_speculative_mamba2_params_all_layers()
 
-        conv_states = mamba_caches.conv[0]
-        ssm_states = mamba_caches.temporal
-        intermediate_state_cache = mamba_caches.intermediate_ssm
-        intermediate_conv_window_cache = mamba_caches.intermediate_conv_window[0]
+        # ReplaySSM-KDA: the accepted drafts live in the per-slot ring (written
+        # during verify); no intermediate_ssm is allocated. Replay the accepted
+        # prefix into `temporal` instead of scattering an intermediate state.
+        # dspark/dflash call this method directly; the generic spec_utils commit
+        # handles replayssm before reaching here (returns early), so this branch is
+        # only hit by the direct callers. Chain layout only (topk <= 1), so
+        # accept_lens == last_correct_step_indices + 1.
+        mamba_pool = req_pool.mamba_pool
+        if getattr(mamba_pool, "replayssm_is_kda", False):
+            from sglang.kernels.ops.attention.fla.kda_replayssm_spec_decode import (
+                commit_kda_replayssm_after_verify,
+            )
 
-        fused_mamba_state_scatter_with_mask(
-            ssm_states,
-            intermediate_state_cache,
+            commit_kda_replayssm_after_verify(
+                spec_state=mamba_caches,
+                state_batch_indices=state_indices_tensor,
+                accept_lens=last_correct_step_indices + 1,
+                last_correct_step_indices=last_correct_step_indices,
+                mamba_track_indices=mamba_track_indices,
+                mamba_steps_to_track=mamba_steps_to_track,
+                null_block_id=-1,
+            )
+            return
+
+        scatter_mamba_states_after_mtp_verify(
+            mamba_caches,
             state_indices_tensor,
             last_correct_step_indices,
+            mamba_track_indices,
+            mamba_steps_to_track,
         )
-        # conv intermediate uses the deduplicated sliding-window layout, so it
-        # needs the strided-read scatter variant.
-        fused_conv_window_scatter_with_mask(
-            conv_states,
-            intermediate_conv_window_cache,
-            state_indices_tensor,
-            last_correct_step_indices,
-        )
-
-        # Track indices for prefix cache
-        if mamba_track_indices is not None:
-            assert mamba_steps_to_track is not None
-            fused_mamba_state_scatter_with_mask(
-                ssm_states,
-                intermediate_state_cache,
-                mamba_track_indices,
-                mamba_steps_to_track,
-            )
-            fused_conv_window_scatter_with_mask(
-                conv_states,
-                intermediate_conv_window_cache,
-                mamba_track_indices,
-                mamba_steps_to_track,
-            )
 
 
 class ShortConvHybridAttnBackend(HybridLinearAttnBackend):
