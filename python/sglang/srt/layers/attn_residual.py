@@ -73,9 +73,8 @@ def _aggregate_fast(
 ) -> torch.Tensor:
     """Warp-specialized TMA kernel: online softmax over row chunks with the
     output RMSNorm fused, one persistent CTA per SM, per-nvb tuned launch
-    config (GB300 benchmark winner across nvb; attn_res_chain remains
-    available as a benchmark alternate). With write_bank_row the kernel also
-    snapshots the prefix row into bank[:, nvb, :] (bit-exact, zero extra
+    config (GB300 benchmark winner across nvb). With write_bank_row the kernel
+    also snapshots the prefix row into bank[:, nvb, :] (bit-exact, zero extra
     reads — the row streams through the score pass anyway)."""
     from sglang.jit_kernel.kimi_k3.attn_res import attn_res_fused_tma
 
