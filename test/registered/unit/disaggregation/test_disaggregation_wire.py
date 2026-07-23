@@ -158,6 +158,25 @@ class TestEagleDsaSeedTransfer(unittest.TestCase):
         buffers.set_buf(req, token_handoff_ready=True)
         self.assertEqual(buffers.bootstrap_room[0, 0].item(), req.bootstrap_room)
 
+    def test_token_handoff_metadata_width_tracks_configured_bridge_budget(self):
+        buffers = MetadataBuffers(
+            size=1,
+            hidden_size=2,
+            hidden_states_dtype=torch.float32,
+            output_ids_width=65,
+        )
+        req = self._make_req(None)
+        req.rid = "wide-handoff-test"
+        req.token_handoff_enabled = True
+        req.output_ids = list(range(64))
+        req.token_handoff_prefill_owned_tokens = 7
+
+        buffers.set_buf(req)
+
+        self.assertEqual(buffers.output_ids.shape, (1, 65))
+        self.assertEqual(buffers.output_ids[0, :64].tolist(), list(range(64)))
+        self.assertEqual(buffers.output_ids[0, -1].item(), 64)
+
     def test_decode_input_requires_valid_seed_for_every_request(self):
         seeds = (
             torch.tensor([1, 2, 3], dtype=torch.int32),

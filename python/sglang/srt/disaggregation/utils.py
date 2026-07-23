@@ -237,7 +237,10 @@ class MetadataBuffers:
         max_sampling_mask_tokens: Optional[int] = None,
         custom_mem_pool: torch.cuda.MemPool = None,
         output_dsa_topk_indices_dim: int = 0,
+        output_ids_width: int = 16,
     ):
+        if output_ids_width < 16:
+            raise ValueError("output_ids_width must be at least 16")
         self.custom_mem_pool = custom_mem_pool
         self.output_dsa_topk_indices_dim = output_dsa_topk_indices_dim
         if max_sampling_mask_tokens is None:
@@ -266,7 +269,9 @@ class MetadataBuffers:
 
             # We transfer the metadata of first output token to decode
             # The minimal size for RDMA is 64Bytes, so we pad it to > 64Bytes
-            self.output_ids = torch.zeros((size, 16), dtype=torch.int32, device=device)
+            self.output_ids = torch.zeros(
+                (size, output_ids_width), dtype=torch.int32, device=device
+            )
             self.cached_tokens = torch.zeros(
                 (size, 16), dtype=torch.int32, device=device
             )
@@ -385,16 +390,17 @@ class MetadataBuffers:
         output_row.zero_()
         if getattr(req, "token_handoff_enabled", False):
             token_log = list(req.output_ids)
-            if not 1 <= len(token_log) <= 15:
+            max_log_tokens = output_row.shape[0] - 1
+            if not 1 <= len(token_log) <= max_log_tokens:
                 raise RuntimeError(
-                    f"Token handoff log length must be in [1, 15], got "
+                    f"Token handoff log length must be in [1, {max_log_tokens}], got "
                     f"{len(token_log)} for request {req.rid}"
                 )
             output_row[: len(token_log)] = torch.tensor(
                 token_log, dtype=torch.int32, device=output_row.device
             )
-            # Slot 15 is the protocol discriminator and exact sealed count.
-            output_row[15] = len(token_log)
+            # The final slot is the protocol discriminator and exact count.
+            output_row[-1] = len(token_log)
         else:
             output_row[0] = req.output_ids[0]
         # The cached_tokens buffer is (size, 16); slots 0-3 hold cached token

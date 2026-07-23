@@ -33,6 +33,26 @@ class CatchUpEstimate:
     reason: str | None = None
 
 
+@dataclass(frozen=True)
+class BatchedReplayPlan:
+    """Teacher-forced EXTEND inputs plus its sampled boundary token."""
+
+    input_token_ids: list[int]
+    expected_next_token_id: int
+
+
+def build_batched_replay_plan(token_log: list[int]) -> BatchedReplayPlan:
+    """Split a sealed bridge log into one EXTEND and one verification token."""
+
+    if len(token_log) < 2:
+        raise ValueError("batched replay requires at least two bridge tokens")
+    normalized = [int(token_id) for token_id in token_log]
+    return BatchedReplayPlan(
+        input_token_ids=normalized[:-1],
+        expected_next_token_id=normalized[-1],
+    )
+
+
 def estimate_catch_up(
     *,
     remaining_copy_ms: float,

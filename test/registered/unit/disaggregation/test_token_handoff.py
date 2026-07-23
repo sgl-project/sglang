@@ -3,10 +3,12 @@ import math
 import pytest
 
 from sglang.srt.disaggregation.token_handoff import (
+    BatchedReplayPlan,
     HandoffPhase,
     HandoffProtocolError,
     OutputOwner,
     TokenHandoffState,
+    build_batched_replay_plan,
     estimate_catch_up,
 )
 from sglang.srt.managers.schedule_batch import Req
@@ -135,6 +137,17 @@ def test_catch_up_estimate_requires_decode_replay_to_beat_live_decode():
     assert feasible.initial_backlog_tokens == 6
     assert feasible.estimated_bridge_tokens >= feasible.initial_backlog_tokens
     assert feasible.estimated_catch_up_ms > 10
+
+
+def test_batched_replay_plan_teacher_forces_all_but_boundary_token():
+    plan = build_batched_replay_plan([21, 22, 23, 24])
+
+    assert plan == BatchedReplayPlan(
+        input_token_ids=[21, 22, 23],
+        expected_next_token_id=24,
+    )
+    with pytest.raises(ValueError, match="at least two"):
+        build_batched_replay_plan([21])
 
 
 def test_incremental_detokenizer_can_resume_at_cross_worker_output_boundary():

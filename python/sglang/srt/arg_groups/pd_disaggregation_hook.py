@@ -33,9 +33,9 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                     "--enable-disaggregation-token-handoff currently requires "
                     "--disaggregation-transfer-backend mooncake"
                 )
-            if not 1 <= server_args.disaggregation_token_handoff_max_tokens <= 15:
+            if not 1 <= server_args.disaggregation_token_handoff_max_tokens <= 256:
                 raise ValueError(
-                    "--disaggregation-token-handoff-max-tokens must be in [1, 15]"
+                    "--disaggregation-token-handoff-max-tokens must be in [1, 256]"
                 )
             if not (
                 1
@@ -105,9 +105,9 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                     "--enable-disaggregation-token-handoff currently requires "
                     "--disaggregation-transfer-backend mooncake"
                 )
-            if not 1 <= server_args.disaggregation_token_handoff_max_tokens <= 15:
+            if not 1 <= server_args.disaggregation_token_handoff_max_tokens <= 256:
                 raise ValueError(
-                    "--disaggregation-token-handoff-max-tokens must be in [1, 15]"
+                    "--disaggregation-token-handoff-max-tokens must be in [1, 256]"
                 )
             if not (
                 1

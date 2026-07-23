@@ -587,19 +587,16 @@ class SchedulerDisaggregationPrefillMixin:
                 ]
             )
 
-        # The MVP deliberately gives an admitted bridge request exclusive use
-        # of this Prefill worker. This avoids mixed-batch result semantics while
-        # we measure whether the handoff is valuable at all.
-        if not running_batch.is_empty():
-            running_batch = self.update_running_batch(running_batch)
-            batch = running_batch if not running_batch.is_empty() else None
-            if batch:
-                set_schedule_time_batch(batch)
-            return NextBatchPlan(batch_to_run=batch, running_batch=running_batch)
-
+        # Follow the regular scheduler's prefill-first policy: retain bridge
+        # Decode requests in running_batch, but admit ready prompt work before
+        # taking another bridge step. This prevents one in-flight handoff from
+        # monopolizing a Prefill worker under concurrent load.
         prefill_plan = self.get_new_batch_prefill(running_batch)
         batch = prefill_plan.batch_to_run
         running_batch = prefill_plan.running_batch
+        if batch is None and not running_batch.is_empty():
+            running_batch = self.update_running_batch(running_batch)
+            batch = running_batch if not running_batch.is_empty() else None
         batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(batch)
 
         if batch:
@@ -930,9 +927,26 @@ class SchedulerDisaggregationPrefillMixin:
             elif poll == KVPoll.Success:  # transfer done
                 if getattr(req, "token_handoff_enabled", False):
                     req.token_handoff_kv_ready = True
+                    if req.finished():
+                        # EOS/stop/abort won on Prefill before ownership could
+                        # transfer. Keep its terminal reason and leave the
+                        # metadata gate closed; the Router forwards Prefill's
+                        # final [DONE] and cancels the speculative Decode HTTP
+                        # request.
+                        logger.info(
+                            "Token handoff finished on Prefill before commit "
+                            "rid=%s reason=%s bridge_tokens=%d",
+                            req.rid,
+                            req.finished_reason,
+                            len(req.output_ids),
+                        )
+                        release_kv_cache(req, self.tree_cache)
+                        req.disagg_kv_sender.clear()
+                        done_reqs.append(req)
+                        req.time_stats.set_prefill_kv_transfer_finish_time()
+                        continue
                     if (
-                        not req.finished()
-                        and len(req.output_ids) < req.token_handoff_min_tokens
+                        len(req.output_ids) < req.token_handoff_min_tokens
                     ):
                         undone_reqs.append(req)
                         continue

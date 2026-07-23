@@ -94,6 +94,35 @@ fn token_handoff_response_headers(mut headers: HeaderMap) -> HeaderMap {
     headers
 }
 
+fn token_handoff_prefill_frame_is_terminal(frame: &[u8]) -> bool {
+    let Ok(frame) = std::str::from_utf8(frame) else {
+        return false;
+    };
+    let Some(data) = frame
+        .lines()
+        .find_map(|line| line.strip_prefix("data: "))
+    else {
+        return false;
+    };
+    if data == "[DONE]" {
+        return false;
+    }
+    let Ok(event) = serde_json::from_str::<Value>(data) else {
+        return false;
+    };
+    if event.get("error").is_some() {
+        return true;
+    }
+    event
+        .get("choices")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|choice| choice.get("finish_reason"))
+        .filter_map(Value::as_str)
+        .any(|reason| reason != "length")
+}
+
 impl PDRouter {
     fn worker_endpoint_url(worker: &dyn Worker, endpoint: &str) -> String {
         api_path(worker.base_url(), endpoint)
@@ -1285,6 +1314,8 @@ impl PDRouter {
             let mut prefill_stream = prefill_response.bytes_stream();
             let done_marker = b"data: [DONE]";
             let mut pending = bytes::BytesMut::new();
+            let mut inspection_pending = bytes::BytesMut::new();
+            let mut prefill_finished_request = false;
             loop {
                 let chunk_result = tokio::select! {
                     chunk_result = prefill_stream.next() => chunk_result,
@@ -1313,6 +1344,13 @@ impl PDRouter {
                     }
                 };
 
+                inspection_pending.extend_from_slice(&chunk);
+                while let Some(frame_end) = memmem::find(&inspection_pending, b"\n\n") {
+                    let frame = inspection_pending.split_to(frame_end + 2);
+                    prefill_finished_request |=
+                        token_handoff_prefill_frame_is_terminal(&frame);
+                }
+
                 // Prefill is the first stream owner, but its [DONE] is only an
                 // ownership boundary. Keep any final data event and suppress
                 // that sentinel so Decode can continue the same client stream.
@@ -1335,6 +1373,12 @@ impl PDRouter {
                 }
             }
             prefill_for_task.record_outcome(true);
+
+            if prefill_finished_request {
+                let _ = tx.send(Ok(bytes::Bytes::from_static(b"data: [DONE]\n\n")));
+                decode_task.abort();
+                return;
+            }
 
             let decode_response = match decode_task.await {
                 Ok(Ok(response)) if response.status().is_success() => response,
@@ -1956,6 +2000,26 @@ mod tests {
             headers.get(CONTENT_TYPE),
             Some(&HeaderValue::from_static("text/event-stream"))
         );
+    }
+
+    #[test]
+    fn test_token_handoff_prefill_terminal_frame_stops_chaining() {
+        assert!(token_handoff_prefill_frame_is_terminal(
+            br#"data: {"choices":[{"finish_reason":"stop"}]}
+
+"#
+        ));
+        assert!(token_handoff_prefill_frame_is_terminal(
+            br#"data: {"error":"prefill failed"}
+
+"#
+        ));
+        assert!(!token_handoff_prefill_frame_is_terminal(
+            br#"data: {"choices":[{"finish_reason":"length"}]}
+
+"#
+        ));
+        assert!(!token_handoff_prefill_frame_is_terminal(b"data: [DONE]\n\n"));
     }
 
     #[test]
