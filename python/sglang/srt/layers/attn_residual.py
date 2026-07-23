@@ -4,18 +4,15 @@
 # The public API is the AttnResidual class (constructed once per forward
 # pass; type against BaseAttentionResidual). It owns the frozen snapshot bank
 # [T, NB, H] and the valid-row counter, and dispatches each aggregation point
-# (score rows → softmax → weighted sum → RMSNorm) to the implementation
-# selected by SGLANG_K3_ATTN_RES_MODE:
-#   "fast"   — warp-specialized TMA kernel (default): cp.async.bulk producer
-#              + online-softmax consumers over a double-buffered chunk ring,
-#              out norm fused, per-nvb tuned launch config, one persistent
-#              CTA per SM. Requires SM100a+ and H=7168; fails loudly when
-#              unsupported — pick another mode there.
-#   "fused"  — Triton 2-kernel pipeline with full H-parallelism
-#   "jit"    — CUDA JIT kernels with lower launch overhead than Triton
-#   "torch"  — PyTorch reference (readable, for debugging)
-#   "legacy" — original multi-kernel path in kimi_k3.py (bank held here, but
-#              scoring/combining bypasses this module)
+# (score rows → softmax → weighted sum → RMSNorm) by hardware capability:
+#   fast  — warp-specialized TMA kernel: cp.async.bulk producer +
+#           online-softmax consumers over a double-buffered chunk ring, out
+#           norm fused, per-nvb tuned launch config, one persistent CTA per
+#           SM. Taken on SM100+ with H=7168.
+#   fused — Triton 2-kernel pipeline with full H-parallelism; the fallback
+#           everywhere the fast kernel does not apply.
+# aggregate_stream_torch is the eager reference (tests and the
+# H % _BLOCK_H != 0 shape fallback of aggregate_stream).
 
 from typing import Optional, Protocol
 
@@ -23,13 +20,23 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.environ import envs
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 
-_MODE = envs.SGLANG_K3_ATTN_RES_MODE.get()
 _BLOCK_H: int = 1024  # H = 7168 = 7 x 1024
 _MAX_ROWS: int = 16  # next_pow2(8 + 1), K3 has <= 8 snapshots
+
+_FAST_SUPPORTED = None
+
+
+def _use_fast(hidden_size: int) -> bool:
+    """The TMA kernel needs SM100+ (tcgen05, cp.async.bulk) and its H=7168
+    template instantiation; everything else takes the triton pipeline."""
+    global _FAST_SUPPORTED
+    if _FAST_SUPPORTED is None:
+        major, _ = torch.cuda.get_device_capability()
+        _FAST_SUPPORTED = major >= 10
+    return _FAST_SUPPORTED and hidden_size == 7168
 
 
 # ---- Precomputed weight cache ------------------------------------------------
@@ -42,12 +49,8 @@ def get_cw(
 ) -> torch.Tensor:
     """Cached product norm_weight ⊙ proj_weight (both [H]) in `dtype`.
 
-    Cached per dtype: "fast" mode consumes bf16 while the triton/jit paths
-    consume fp32, and a shared slot would hand one path the other's dtype."""
-    # Distinct attribute from kimi_k3._attn_res_cw, which prewarms a raw
-    # fp32 tensor under `_attn_res_cw` for the legacy in-model kernels; a
-    # shared name would hand this dict lookup that tensor (post-load prewarm
-    # runs for every mode).
+    Cached per dtype: the fast kernel consumes bf16 while the triton path
+    consumes fp32, and a shared slot would hand one path the other's dtype."""
     cache = getattr(proj, "_attn_res_cw_cache", None)
     if cache is None:
         cache = {}
@@ -254,35 +257,6 @@ def _aggregate_fused(
     return out_norm(_mix_fused(prefix_sum, bank, nvb, score_proj, score_norm))
 
 
-# ---- JIT CUDA path: score → combine → RMSNorm(standard) ---------------------
-
-
-def _aggregate_jit(
-    prefix_sum: torch.Tensor,
-    bank: torch.Tensor,
-    nvb: int,
-    score_proj: ReplicatedLinear,
-    score_norm: RMSNorm,
-    out_norm: RMSNorm,
-) -> torch.Tensor:
-    from sglang.jit_kernel.kimi_k3.attn_res import attn_res_combine, attn_res_score
-
-    T, H = prefix_sum.shape
-    cw = get_cw(score_proj, score_norm)
-    n_h_blocks = H // _BLOCK_H
-
-    # Step 1: score each row (2D grid, full row-parallelism)
-    scores = torch.empty((T, _MAX_ROWS), dtype=torch.float32, device=prefix_sum.device)
-    attn_res_score(prefix_sum, bank, cw, scores, nvb, score_norm.variance_epsilon)
-
-    # Step 2: softmax + weighted sum (2D grid, full H-parallelism)
-    out = torch.empty_like(prefix_sum)
-    attn_res_combine(prefix_sum, bank, scores, out, nvb)
-
-    # Step 3: standard RMSNorm (sglang's optimized kernel)
-    return out_norm(out)
-
-
 # ---- PyTorch reference -------------------------------------------------------
 
 
@@ -309,18 +283,6 @@ def aggregate_stream_torch(
     return mixed.to(prefix_sum.dtype)
 
 
-def _aggregate_torch(
-    prefix_sum: torch.Tensor,
-    bank: torch.Tensor,
-    nvb: int,
-    score_proj: ReplicatedLinear,
-    score_norm: RMSNorm,
-    out_norm: RMSNorm,
-) -> torch.Tensor:
-    mixed = aggregate_stream_torch(prefix_sum, bank, nvb, score_proj, score_norm)
-    return out_norm(mixed)
-
-
 def aggregate_stream(
     prefix_sum: torch.Tensor,
     bank: torch.Tensor,
@@ -333,12 +295,12 @@ def aggregate_stream(
     raw wire only carries the current block's running prefix."""
     if nvb == 0:
         return prefix_sum
-    if _MODE == "torch" or prefix_sum.shape[1] % _BLOCK_H != 0:
+    if prefix_sum.shape[1] % _BLOCK_H != 0:
         return aggregate_stream_torch(prefix_sum, bank, nvb, score_proj, score_norm)
     return _mix_fused(prefix_sum, bank, nvb, score_proj, score_norm)
 
 
-# ---- Fused residual-add + aggregation (jit mode) -----------------------------
+# ---- Residual-add + aggregation ----------------------------------------------
 
 
 def _aggregate_fused_add(
@@ -351,41 +313,9 @@ def _aggregate_fused_add(
     out_norm: RMSNorm,
     write_bank_row: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Aggregation point with the upstream residual add fused into the score
-    kernel: prefix = bf16(prefix_a + prefix_b) is computed on the fly by the
-    prefix-row CTA (bit-identical to the standalone add) and materialized for
-    the combine kernel / downstream consumers. Returns (normed, prefix).
-
-    jit mode only; other paths (including the optimized-kernel route, which
-    has no fused-add variant yet) fall back to add-then-aggregate.
-    write_bank_row rides the fallback's _aggregate (fast mode only)."""
-    if _MODE == "jit":
-        assert not write_bank_row, "fused bank write is fast-mode only"
-        from sglang.jit_kernel.kimi_k3.attn_res import (
-            attn_res_combine,
-            attn_res_score_fused_add,
-        )
-
-        T, H = prefix_a.shape
-        cw = get_cw(score_proj, score_norm)
-        prefix = torch.empty_like(prefix_a)
-        scores = torch.empty(
-            (T, _MAX_ROWS), dtype=torch.float32, device=prefix_a.device
-        )
-        attn_res_score_fused_add(
-            prefix_a,
-            prefix_b,
-            prefix,
-            bank,
-            cw,
-            scores,
-            nvb,
-            score_norm.variance_epsilon,
-        )
-        out = torch.empty_like(prefix)
-        attn_res_combine(prefix, bank, scores, out, nvb)
-        return out_norm(out), prefix
-
+    """Aggregation point with a pending upstream residual add: materialize
+    prefix = prefix_a + prefix_b, then aggregate. Returns (normed, prefix).
+    write_bank_row rides _aggregate (fast path only)."""
     prefix = prefix_a + prefix_b
     return (
         _aggregate(
@@ -401,7 +331,7 @@ def _aggregate_fused_add(
     )
 
 
-# ---- Mode dispatch ------------------------------------------------------------
+# ---- Capability dispatch -------------------------------------------------------
 
 
 def _aggregate(
@@ -416,11 +346,11 @@ def _aggregate(
     """Single aggregation point: score → softmax → mix → norm.
 
     Caller handles nvb == 0 (layer 0 attn side: just out_norm(prefix_sum)).
-    write_bank_row is fast-mode only (in-kernel snapshot of the prefix row
-    into bank[:, nvb, :]); other modes keep the standalone .write() copy —
+    write_bank_row is fast-path only (in-kernel snapshot of the prefix row
+    into bank[:, nvb, :]); the triton path keeps the standalone .write() copy —
     the caller (AttnResidual.forward) owns that fallback.
     """
-    if _MODE == "fast":
+    if _use_fast(prefix_sum.shape[1]):
         return _aggregate_fast(
             prefix_sum,
             bank,
@@ -430,11 +360,7 @@ def _aggregate(
             out_norm,
             write_bank_row=write_bank_row,
         )
-    assert not write_bank_row, "fused bank write is fast-mode only"
-    if _MODE == "torch":
-        return _aggregate_torch(prefix_sum, bank, nvb, score_proj, score_norm, out_norm)
-    if _MODE == "jit":
-        return _aggregate_jit(prefix_sum, bank, nvb, score_proj, score_norm, out_norm)
+    assert not write_bank_row, "fused bank write is fast-path only"
     return _aggregate_fused(prefix_sum, bank, nvb, score_proj, score_norm, out_norm)
 
 
@@ -467,7 +393,7 @@ class BaseAttnResidual(Protocol):
 
 
 class AttnResidual:
-    """Default implementation backed by the mode-dispatched kernels above."""
+    """Default implementation backed by the capability-dispatched kernels above."""
 
     def __init__(
         self,
@@ -524,7 +450,7 @@ class AttnResidual:
             self.block_residual if rows is None else self.block_residual[rows]
         )
 
-        fused_write = write and _MODE == "fast"
+        fused_write = write and _use_fast(hidden_states.shape[1])
         if prefix_sum is None:
             # hidden_states already is the whole head (PP entry or a
             # block-boundary restart).
@@ -539,8 +465,7 @@ class AttnResidual:
             )
             prefix = hidden_states
         else:
-            # Pending add: folded into the score kernel in jit mode, explicit
-            # add + aggregate otherwise (bit-identical, handled inside).
+            # Pending add: materialize the prefix, then aggregate.
             normed, prefix = _aggregate_fused_add(
                 prefix_sum,
                 hidden_states,

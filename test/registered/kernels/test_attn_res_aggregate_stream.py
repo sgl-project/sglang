@@ -39,9 +39,7 @@ def _make_modules(seed: int):
     ).to(device="cuda")
     with torch.no_grad():
         norm.weight.copy_(1 + 0.1 * torch.randn(_H, generator=gen, device="cuda"))
-        proj.weight.copy_(
-            torch.randn(1, _H, generator=gen, device="cuda") * _H**-0.5
-        )
+        proj.weight.copy_(torch.randn(1, _H, generator=gen, device="cuda") * _H**-0.5)
     return proj, norm
 
 
@@ -69,7 +67,7 @@ class TestAggregateStream(CustomTestCase):
                     prefix_ref, bank_ref = prefix.clone(), bank.clone()
 
                     # _mix_fused directly: pins the triton pair regardless
-                    # of the SGLANG_K3_ATTN_RES_MODE dispatch.
+                    # of the capability dispatch.
                     out = _mix_fused(prefix, bank, nvb, self.proj, self.norm)
                     ref = aggregate_stream_torch(
                         prefix, bank, nvb, self.proj, self.norm
@@ -102,9 +100,7 @@ class TestAggregateStream(CustomTestCase):
             )
         prefix, bank = _make_inputs(17, seed=4)
         out = _aggregate_fused(prefix, bank, 6, self.proj, self.norm, out_norm)
-        ref = out_norm(
-            aggregate_stream_torch(prefix, bank, 6, self.proj, self.norm)
-        )
+        ref = out_norm(aggregate_stream_torch(prefix, bank, 6, self.proj, self.norm))
         torch.testing.assert_close(out.float(), ref.float(), rtol=2e-2, atol=4e-2)
 
 

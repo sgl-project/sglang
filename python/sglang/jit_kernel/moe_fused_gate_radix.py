@@ -6,7 +6,8 @@ _router_triton_kernel exactly (ids bit-identical incl. adversarial ties/NaN;
 weights <= 2.4e-7 rel); 1.79x over the tuned triton router at [1, 896] top-16
 (graphed A/B on GB300), CUDA-graph capturable.
 
-Opt-in via SGLANG_MOE_FUSED_GATE_RADIX=1; callers must also check `covered()`.
+Not dispatched in serving (moe_route_radix_v2 superseded it at every batch
+size); kept as the bit-exact selection reference for the v2 test/bench.
 """
 
 from __future__ import annotations
@@ -16,13 +17,11 @@ from typing import TYPE_CHECKING, Tuple
 import torch
 
 from sglang.jit_kernel.utils import cache_once, load_jit
-from sglang.srt.environ import envs
 from sglang.srt.layers.moe import single_token_handoff
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
-MOE_FUSED_GATE_RADIX_ENABLED = envs.SGLANG_MOE_FUSED_GATE_RADIX.get()
 
 _NUM_EXPERTS = 896
 _TOPK = 16

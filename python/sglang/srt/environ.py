@@ -775,16 +775,7 @@ class Envs:
     # packed-routing trtllm-gen path) only; sizes beyond the push window
     # fall back to the in-op finalize.
     SGLANG_K3_DEFER_MOE_FINALIZE = EnvBool(False)
-    # AttnRes aggregation backend:
-    # fast (optimized CUDA, SM100+/H=7168 only) | fused (triton) | jit (CUDA)
-    # | torch | legacy
-    SGLANG_K3_ATTN_RES_MODE = EnvStr("fast")
     SGLANG_K3_ATTN_RES_FUSED_MIN_T = EnvInt(999999)
-    # Radix-select fast path for the K3 top-16-of-896 sigmoid router
-    # (opt-in; ids bit-identical to the triton router).
-    SGLANG_MOE_FUSED_GATE_RADIX = EnvBoolWithAlias(
-        False, deprecated_name="SGLANG_JIT_ROUTE_RADIX"
-    )
 
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)
@@ -1140,11 +1131,11 @@ class Envs:
     SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK = EnvBool(False)
     SGLANG_OPT_USE_TOPK_V2 = EnvBool(True)
     # v2 radix-select router for K3 routing ([M, 896] bf16 top-16, all batch
-    # sizes; 3.1-3.5x over the triton router on B200). Takes precedence over
-    # the v1 SGLANG_JIT_ROUTE_RADIX kernel. Same winner set as the triton
-    # router, but winners come out in expert-id order (the biased-descending
-    # sort is skipped — downstream MoE kernels are order-insensitive) and the
-    # renorm sum may differ by ~1 ulp. Set to false to fall back to triton.
+    # sizes; 3.1-3.5x over the triton router on B200). Same winner set as the
+    # triton router, but winners come out in expert-id order (the
+    # biased-descending sort is skipped — downstream MoE kernels are
+    # order-insensitive) and the renorm sum may differ by ~1 ulp. Set to
+    # false to fall back to triton.
     SGLANG_OPT_USE_ROUTE_RADIX_V2 = EnvBool(True)
 
     SGLANG_OPT_USE_BF16_ROUTER_GEMM = EnvBool(True)
