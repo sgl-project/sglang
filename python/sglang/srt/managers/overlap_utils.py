@@ -7,6 +7,9 @@ import msgspec
 import torch
 
 from sglang.kernels.ops.speculative.gather_spec_extras import gather_spec_extras
+from sglang.kernels.ops.speculative.scatter_spec_extras import (
+    scatter_spec_extras,
+)
 from sglang.srt.environ import envs
 from sglang.srt.utils import is_cuda, is_hip, is_npu
 
@@ -69,6 +72,31 @@ _is_npu = is_npu()
 # write -1 back. Catches "gather without intermediate stash" bugs. CI enables
 # via the existing SGLANG_IS_IN_CI; off in production.
 _DEBUG_ASSERT = envs.SGLANG_IS_IN_CI.get()
+
+
+def _can_scatter_spec_extras(
+    indices: torch.Tensor,
+    pairs: Sequence[tuple[Optional[torch.Tensor], Optional[torch.Tensor]]],
+    draft_pair: Optional[tuple[torch.Tensor, torch.Tensor]],
+) -> bool:
+    """Whether payload rows satisfy the flat-addressing Triton contract."""
+    if indices.dim() != 1 or indices.dtype not in (torch.int32, torch.int64):
+        return False
+    for destination, source in pairs:
+        if destination is None or source is None:
+            if destination is not None or source is not None:
+                return False
+            continue
+        if (
+            destination.dim() < 1
+            or source.shape != (indices.shape[0], *destination.shape[1:])
+            or destination.device != indices.device
+            or source.device != indices.device
+            or not destination.is_contiguous()
+            or not source.is_contiguous()
+        ):
+            return False
+    return draft_pair is None or draft_pair[0].dtype == draft_pair[1].dtype
 
 
 @torch.compile(dynamic=True, disable=_is_npu)
@@ -509,6 +537,58 @@ class FutureMap:
         if not self._forward_buf_initialized:
             self._lazy_init_forward_buf(payload)
         self._maybe_init_dsa_topk_indices_buf(payload)
+
+        if _is_cuda and indices.device.type == "cuda":
+            topk_p_buf = self.topk_p_buf if self.need_topk else None
+            topk_p = payload.topk_p if self.need_topk else None
+            topk_index_buf = self.topk_index_buf if self.need_topk else None
+            topk_index = payload.topk_index if self.need_topk else None
+            hidden_states_buf = (
+                self.hidden_states_buf if self.need_hidden_states else None
+            )
+            hidden_states = payload.hidden_states if self.need_hidden_states else None
+            draft_probs_buf = (
+                self.draft_probs_buf if payload.draft_probs is not None else None
+            )
+            draft_probs = payload.draft_probs if draft_probs_buf is not None else None
+            dsa_topk_indices_buf = (
+                self.dsa_topk_indices_buf
+                if payload.dsa_topk_indices is not None
+                else None
+            )
+            dsa_topk_indices = (
+                payload.dsa_topk_indices if dsa_topk_indices_buf is not None else None
+            )
+            pairs = (
+                (self.output_tokens_buf, payload.bonus_tokens),
+                (topk_p_buf, topk_p),
+                (topk_index_buf, topk_index),
+                (hidden_states_buf, hidden_states),
+                (draft_probs_buf, draft_probs),
+                (dsa_topk_indices_buf, dsa_topk_indices),
+            )
+            draft_pair = (
+                (draft_probs_buf, draft_probs) if draft_probs_buf is not None else None
+            )
+            if _can_scatter_spec_extras(indices, pairs, draft_pair):
+                scatter_spec_extras(
+                    indices,
+                    output_tokens_buf=self.output_tokens_buf,
+                    bonus_tokens=payload.bonus_tokens,
+                    topk_p_buf=topk_p_buf,
+                    topk_p=topk_p,
+                    topk_index_buf=topk_index_buf,
+                    topk_index=topk_index,
+                    hidden_states_buf=hidden_states_buf,
+                    hidden_states=hidden_states,
+                    draft_probs_buf=draft_probs_buf,
+                    draft_probs=draft_probs,
+                    dsa_topk_indices_buf=dsa_topk_indices_buf,
+                    dsa_topk_indices=dsa_topk_indices,
+                )
+                return
+
+        # Retain the original assignments off CUDA or for incompatible layouts.
         self.output_tokens_buf[indices] = payload.bonus_tokens.to(
             self.output_tokens_buf.dtype
         )

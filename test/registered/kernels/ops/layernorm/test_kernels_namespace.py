@@ -45,6 +45,7 @@ EXPECTED = {
     "moe.moe_align_block_size": {"aot", "jit"},
     "quantization.nvfp4_gemm_swiglu_nvfp4_quant": {"cute_dsl"},
     "kvcache.reshape_and_cache_flash": {"triton"},
+    "speculative.scatter_spec_extras": {"triton"},
 }
 
 _CPU = PlatformInfo(device_type="cpu")
@@ -75,6 +76,13 @@ def test_group_importable(group):
 @pytest.mark.parametrize("op, backends", list(EXPECTED.items()))
 def test_registry_backends(op, backends):
     assert {s.backend.value for s in K.registry.get(op)} == backends
+
+
+def test_scatter_spec_extras_is_cuda_only():
+    spec = K.registry.get("speculative.scatter_spec_extras")[0]
+    assert spec.capabilities == frozenset({Cap.CUDA})
+    assert spec.is_available(_SM90)
+    assert not spec.is_available(_HIP)
 
 
 def test_specs_well_formed():
