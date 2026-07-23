@@ -24,6 +24,7 @@ from sglang.srt.mem_cache.unified_cache_components.tree_component import (
     ComponentType,
     EvictLayer,
     LRURefreshPhase,
+    PrepareLoadBackResult,
     TreeComponent,
     get_and_increase_time_counter,
 )
@@ -55,6 +56,7 @@ class MambaComponent(TreeComponent):
         self.enable_mamba_extra_buffer = params.enable_mamba_extra_buffer
         self.enable_mamba_extra_buffer_lazy = params.enable_mamba_extra_buffer_lazy
         self.mamba_cache_chunk_size = get_server_args().mamba_cache_chunk_size
+        self.mamba_max_states_per_path = get_server_args().mamba_max_states_per_path
         # HiCache state
         self._mamba_pool_host = None  # set to host mamba pool when HiCache enabled
 
@@ -162,6 +164,7 @@ class MambaComponent(TreeComponent):
             self.cache.component_evictable_size_[self.component_type] += len(
                 params.mamba_value
             )
+            self._evict_excess_path_states(node)
             return
         if node.component_data[self.component_type].value is None:
             node.component_data[self.component_type].value = params.mamba_value
@@ -174,10 +177,48 @@ class MambaComponent(TreeComponent):
                 params.mamba_value
             )
             node.last_access_time = get_and_increase_time_counter()
+            self._evict_excess_path_states(node)
             return
         self.cache.lru_lists[self.component_type].reset_node_mru(node)
         node.last_access_time = get_and_increase_time_counter()
         result.mamba_exist = True
+
+    def _evict_excess_path_states(self, tail: UnifiedTreeNode) -> None:
+        """Evict shallow eligible device checkpoints beyond the path cap.
+
+        Full KV and any existing host backup are retained. The tail, forks,
+        locked nodes, and device leaves are preserved, so the cap is a
+        best-effort soft limit.
+        """
+        cap = self.mamba_max_states_per_path
+        if cap < 0:
+            return
+
+        ct = self.component_type
+        holders = []
+        node = tail
+        while node is not None and node is not self.cache.root_node:
+            if node.component_data[ct].value is not None:
+                holders.append(node)
+            node = node.parent
+
+        excess = len(holders) - cap
+        if excess <= 0:
+            return
+
+        tracker = {component: 0 for component in self.cache.tree_components}
+        for node in reversed(holders):
+            if excess <= 0 or node is tail:
+                break
+            if node.component_data[ct].lock_ref > 0 or len(node.children) != 1:
+                continue
+            if node in self.cache.evictable_device_leaves:
+                continue
+            self.cache._evict_component_and_detach_lru(
+                node, self, target=EvictLayer.DEVICE, tracker=tracker
+            )
+            self.cache._cascade_evict(node, self, tracker)
+            excess -= 1
 
     def redistribute_on_node_split(
         self, new_parent: UnifiedTreeNode, child: UnifiedTreeNode
@@ -472,6 +513,37 @@ class MambaComponent(TreeComponent):
 
     # ---- HiCache Hooks ----
 
+    def prepare_load_back(
+        self,
+        node: UnifiedTreeNode,
+        *,
+        req: Optional[Req] = None,
+    ) -> PrepareLoadBackResult:
+        cd = node.component_data[self.component_type]
+        # skip unless the node needs a load-back (device value absent), like build_hicache_transfers
+        if (
+            req is None
+            or req.mamba_pool_idx is not None
+            or cd.host_value is None
+            or cd.value is not None
+        ):
+            return PrepareLoadBackResult()
+        dst = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
+        if dst is None:
+            self.cache.evict(EvictParams(num_tokens=0, mamba_num=1))
+            dst = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
+            assert dst is not None, "Cannot alloc mamba for load_back"
+        req.mamba_pool_idx = dst[0]
+        return PrepareLoadBackResult(allocated_mamba_slot=dst)
+
+    def finalize_load_back(
+        self, req: Optional[Req], prep: PrepareLoadBackResult, success: bool
+    ) -> None:
+        # A called-off load-back returns the slot prepare allocated and clears req (the H->D copy never ran).
+        if not success and prep.allocated_mamba_slot is not None:
+            self.cache.req_to_token_pool.mamba_allocator.free(prep.allocated_mamba_slot)
+            req.mamba_pool_idx = None
+
     def build_hicache_transfers(
         self,
         node: UnifiedTreeNode,
@@ -512,16 +584,10 @@ class MambaComponent(TreeComponent):
                     )
                 )
 
-            # Per-request mamba CoW (H→D copy into request's device slot)
+            # Per-request mamba CoW: H→D copy into the request's device slot allocated by prepare_load_back.
             cd = node.component_data[ct]
             if req is not None and cd.host_value is not None:
-                if req.mamba_pool_idx is None:
-                    dst = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
-                    if dst is None:
-                        self.cache.evict(EvictParams(num_tokens=0, mamba_num=1))
-                        dst = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
-                        assert dst is not None, "Cannot alloc mamba for load_back"
-                    req.mamba_pool_idx = dst[0]
+                assert req.mamba_pool_idx is not None
                 transfers.append(
                     PoolTransfer(
                         name=PoolName.MAMBA,
