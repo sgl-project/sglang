@@ -3,7 +3,9 @@ from typing import Optional
 
 import torch
 
-from sglang.jit_kernel.cutedsl_kda import cutedsl_fused_sigmoid_gating_kda_update
+from sglang.kernels.ops.attention.cutedsl_kda import (
+    cutedsl_fused_sigmoid_gating_kda_update,
+)
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
@@ -105,6 +107,13 @@ class CuteDSLKDAKernel(LinearAttnKernelBase):
         lower_bound: Optional[float] = None,
         **kwargs,
     ) -> torch.Tensor:
+        if kwargs.get("return_intermediate_states"):
+            raise NotImplementedError(
+                "CuteDSLKDAKernel.extend cannot return intermediate chunk "
+                "states required by mamba_radix_cache_strategy=extra_buffer; "
+                "use --linear-attn-prefill-backend triton or "
+                "--mamba-radix-cache-strategy no_buffer."
+            )
         head_k_dim = k.shape[-1]
         self._ensure_extend_loaded(head_k_dim)
 

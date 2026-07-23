@@ -9,7 +9,7 @@ from sglang.kernels.ops.speculative.cache_locs import (
 )
 from sglang.kernels.ops.speculative.eagle import fill_bonus_tokens_func
 from sglang.srt.layers.logprob_processor import compute_spec_v2_logprobs
-from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.managers.utils import GenerationBatchResult, _async_d2h
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -110,9 +110,18 @@ def prepare_for_draft_extend(
     cuda_graph_runner: Any,
     *,
     return_hidden_states_before_norm: bool,
+    widened_out_cache_loc: Optional[torch.Tensor] = None,
+    widened_positions: Optional[torch.Tensor] = None,
 ):
     bs = len(batch.seq_lens)
-    extend_num_tokens = bs * num_draft_tokens
+    # Optional window widening (num_front_tokens=0 -> off): prepend that many
+    # rows below the boundary. Locs/positions arrive precomputed; token/hidden
+    # buffers are zeroed placeholders the caller fills after the plan-stream join.
+    num_front_tokens = draft_extend_input.num_front_tokens
+    widen = num_front_tokens > 0 and not batch.forward_mode.is_idle()
+    front_offset = num_front_tokens if widen else 0
+    num_window_tokens = num_draft_tokens + front_offset
+    extend_num_tokens = bs * num_window_tokens
     # When seq_lens_cpu is absent, stay on GPU-only path -- no .tolist()/.cpu().
     gpu_only = batch.seq_lens_cpu is None
 
@@ -121,7 +130,21 @@ def prepare_for_draft_extend(
     # may run this under a plan stream; casting inside the plan stream creates a
     # cross-stream dependency that can lead to data races and break MTP acceptance.
     # The caller should cast to int64 before entering the plan stream context.
-    batch.input_ids = predict
+    if widen:
+        assert widened_out_cache_loc is not None and widened_positions is not None
+        batch.input_ids = predict.new_zeros((extend_num_tokens,))
+        batch.out_cache_loc = widened_out_cache_loc
+        # init_new adopts spec_info.positions when present.
+        draft_extend_input.positions = widened_positions
+        # Placeholder for the widened hidden window, filled by the worker.
+        if draft_extend_input.hidden_states is not None:
+            draft_extend_input.hidden_states = (
+                draft_extend_input.hidden_states.new_empty(
+                    (extend_num_tokens, draft_extend_input.hidden_states.shape[1])
+                )
+            )
+    else:
+        batch.input_ids = predict
     maybe_detect_oob(
         batch.input_ids,
         0,
@@ -131,13 +154,15 @@ def prepare_for_draft_extend(
     # init_new requires both list or both Tensor;
     # gpu_only emits device tensors to skip H2D.
     if gpu_only:
-        batch.prefix_lens = batch.seq_lens.to(torch.int32)
+        batch.prefix_lens = (batch.seq_lens - front_offset).clamp(min=0).to(torch.int32)
         batch.extend_lens = torch.full(
-            (bs,), num_draft_tokens, dtype=torch.int32, device=batch.seq_lens.device
+            (bs,), num_window_tokens, dtype=torch.int32, device=batch.seq_lens.device
         )
     else:
-        batch.prefix_lens = batch.seq_lens_cpu.tolist()
-        batch.extend_lens = [num_draft_tokens] * bs
+        batch.prefix_lens = [
+            max(int(x) - front_offset, 0) for x in batch.seq_lens_cpu.tolist()
+        ]
+        batch.extend_lens = [num_window_tokens] * bs
     batch.extend_num_tokens = extend_num_tokens
     capture_mode = (
         CaptureHiddenMode.NULL
@@ -162,9 +187,9 @@ def prepare_for_draft_extend(
         forward_batch.seq_lens_cpu = forward_batch.seq_lens_cpu + num_draft_tokens
         forward_batch.seq_lens_sum = int(forward_batch.seq_lens_cpu.sum())
     else:
-        # Supply CPU mirror (extend_seq_lens are all num_draft_tokens) so
+        # Supply CPU mirror (extend_seq_lens are all num_window_tokens) so
         # backend max() reads from list without a per-iter D2H sync.
-        forward_batch.extend_seq_lens_cpu = [num_draft_tokens] * bs
+        forward_batch.extend_seq_lens_cpu = [num_window_tokens] * bs
     can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run_graph(
         forward_batch
     )
@@ -442,6 +467,7 @@ def run_eagle_verify(
     device: str,
     metadata_ready_pre_pad: bool,
     finalize_tree_path: bool,
+    grammar_barrier=None,
 ) -> GenerationBatchResult:
     """Shared verify step: target-verify forward, sampling, acceptance bookkeeping.
 
@@ -502,13 +528,21 @@ def run_eagle_verify(
             ),
         )
 
-    # Prepare grammar data on CPU if needed
+    # Prepare grammar data on CPU if needed. Use async pinned D2H copies (not
+    # blocking .cpu()) and record an event. The copies are issued before the
+    # target verify launch below so they run right after the draft, but the
+    # host does not block here. We wait on grammar_copy_done only just before
+    # the CPU bitmask traversal reads the buffers, so the traversal (and these
+    # copies) overlap the target verify forward instead of stalling the GPU.
+    grammar_copy_done = None
     if batch.has_grammar:
-        retrieve_next_token_cpu = verify_input.retrieve_next_token.cpu()
-        retrieve_next_sibling_cpu = verify_input.retrieve_next_sibling.cpu()
-        draft_tokens_cpu = verify_input.draft_token.view(
-            verify_input.retrieve_next_token.shape
-        ).cpu()
+        retrieve_next_token_cpu = _async_d2h(verify_input.retrieve_next_token)
+        retrieve_next_sibling_cpu = _async_d2h(verify_input.retrieve_next_sibling)
+        draft_tokens_cpu = _async_d2h(
+            verify_input.draft_token.view(verify_input.retrieve_next_token.shape)
+        )
+        grammar_copy_done = torch.get_device_module(device).Event()
+        grammar_copy_done.record()
 
     if metadata_ready_pre_pad:
         # Multi-layer eagle preserved-verbatim behavior: metadata init is
@@ -536,6 +570,17 @@ def run_eagle_verify(
     # Generate vocab mask for constrained decoding
     vocab_mask = None
     if batch.has_grammar:
+        # Grammar barrier: advance the previous batch's grammar FSM over its
+        # committed tokens before building this batch's bitmask. Runs after the
+        # target forward launch, so the FSM advance and the traversal below both
+        # overlap the target verify forward. No-op if there is nothing pending.
+        if grammar_barrier is not None:
+            grammar_barrier()
+        # Wait for the async draft/verify-input D2H copies above to land before
+        # the CPU traversal reads them. The event was recorded right after the
+        # copies (before the target verify launch), so this wait — and the
+        # traversal below — overlap the target verify forward.
+        grammar_copy_done.synchronize()
         # Generate the logit mask for structured output.
         vocab_mask = generate_token_bitmask(
             batch.reqs,
@@ -548,7 +593,12 @@ def run_eagle_verify(
 
         if vocab_mask is not None:
             assert verify_input.grammar is not None
-            vocab_mask = vocab_mask.to(verify_input.retrieve_next_token.device)
+            # non_blocking H2D so the mask copy overlaps the tail of the target
+            # verify forward instead of syncing the host; stream ordering keeps
+            # it before eagle_sample's apply_vocab_mask below.
+            vocab_mask = vocab_mask.to(
+                verify_input.retrieve_next_token.device, non_blocking=True
+            )
             # NOTE: otherwise, this vocab mask will be the one from the previous extend stage
             # and will be applied to produce wrong results
             batch.sampling_info.vocab_mask = None

@@ -74,6 +74,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "disable_overlap_schedule",
                     "uses_mamba_radix_cache",
                     "mamba_radix_cache_strategy",
+                    "mamba_full_memory_ratio",
                     "speculative_moe_runner_backend",
                     "speculative_moe_a2a_backend",
                     "disable_shared_experts_fusion",
@@ -84,6 +85,8 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "decode_attention_backend",
                     "flashinfer_allreduce_fusion_backend",
                     "fp8_gemm_runner_backend",
+                    "disable_custom_all_reduce",
+                    "enable_aiter_allreduce_fusion",
                 }
             ),
         )
