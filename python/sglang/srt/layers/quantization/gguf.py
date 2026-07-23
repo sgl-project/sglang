@@ -51,7 +51,7 @@ if _is_cuda:
         ggml_mul_mat_vec_a8,
     )
 
-    from sglang.jit_kernel.activation import gelu_and_mul, silu_and_mul
+    from sglang.kernels.ops.activation._jit_activation import gelu_and_mul, silu_and_mul
 elif _is_musa:
     from sgl_kernel import gelu_and_mul, moe_align_block_size, moe_sum, silu_and_mul
     from sgl_kernel.quantization import (

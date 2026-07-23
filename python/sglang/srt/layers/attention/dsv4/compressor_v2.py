@@ -4,13 +4,13 @@ from typing import TYPE_CHECKING, List, Literal, Optional, TypeAlias, Union, cas
 
 import torch
 
-from sglang.jit_kernel.dsv4 import (
+from sglang.kernels.jit.utils import is_hip_runtime
+from sglang.kernels.ops.attention.dsv4 import (
     CompressorDecodePlan,
     CompressorPrefillPlan,
     compress_forward,
     compress_norm_rope_store,
 )
-from sglang.jit_kernel.utils import is_hip_runtime
 from sglang.srt.environ import envs
 
 if TYPE_CHECKING:

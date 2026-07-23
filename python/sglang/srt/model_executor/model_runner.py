@@ -323,12 +323,26 @@ class ModelRunner:
         if get_server_args().enable_tf32_matmul:
             torch.set_float32_matmul_precision("high")
 
+        # Set device early so that TransferEngine init (e.g. Ascend NPU)
+        # can access the device context.
+        try:
+            torch.get_device_module(self.device).set_device(ps.gpu_id)
+        except Exception:
+            import os
+
+            logger.warning(
+                f"Context: {self.device=} {ps.gpu_id=} {os.environ.get('CUDA_VISIBLE_DEVICES')=} {ps.tp_rank=} {ps.tp_size=}"
+            )
+            raise
+
+        # Initialize MooncakeTransferEngine BEFORE init_torch_distributed so
+        # that the shared TE can be passed to the Mooncake PG backend (avoids
+        # creating duplicate TransferEngines).
+        self.init_shared_mooncake_transfer_engine()
+
         # Get available memory before model loading.
         # Stored for later use by alloc_memory_pool().
         self.init_torch_distributed()
-
-        # Initialize MooncakeTransferEngine
-        self.init_shared_mooncake_transfer_engine()
 
         # Init forward stream for overlap schedule
         self.forward_stream = torch.get_device_module(self.device).Stream()
@@ -1092,18 +1106,16 @@ class ModelRunner:
             return self.max_total_num_tokens
 
     def _record_kv_cache_dtype(self, resolved: str) -> None:
-        # Load-time resolution transition: the weight-resolved kv-cache dtype
-        # is declared into the flags tier; the dual-apply inside the helper
-        # replaces the legacy in-place write. Mock runners whose server_args
-        # is not the published object keep the plain write.
+        # the weight-resolved kv-cache dtype is written to the config
+        # bags via get_context().override, so get_model().kv_cache_dtype readers
+        # see it. server_args stays the pristine RAW record -- configure_kv_cache
+        # _dtype reads it as the resolver INPUT. A draft / mock runner whose
+        # server_args is not the published object keeps the private-bag write.
         from sglang.srt.runtime_context import get_context
 
         if get_context()._server_args is self.server_args:
-            from sglang.srt.arg_groups.overrides import declare_load_time_override
-
-            declare_load_time_override(
-                "ModelRunner.configure_kv_cache_dtype",
-                {"kv_cache_dtype": resolved},
+            get_context().override(
+                "ModelRunner.configure_kv_cache_dtype", kv_cache_dtype=resolved
             )
         else:
             self.server_args.override(
@@ -1114,6 +1126,8 @@ class ModelRunner:
         spec_algorithm = getattr(self, "spec_algorithm", None)
         resolved_kv_cache_dtype, self.kv_cache_dtype = (
             kv_cache_dtype.configure_kv_cache_dtype(
+                # RAW user intent = resolver INPUT; server_args stays pristine
+                # so read it here -- not the resolved get_model() bag.
                 server_args_kv_cache_dtype=self.server_args.kv_cache_dtype,
                 model=getattr(self, "model", None),
                 model_dtype=getattr(self, "dtype", torch.bfloat16),
@@ -1125,6 +1139,15 @@ class ModelRunner:
                     self.server_args, "speculative_draft_attention_backend", None
                 ),
             )
+        )
+        # This runner's OWN resolved dtype string (target or draft). Attention
+        # backends read it directly instead of the process-global get_model()
+        # bag: a draft runner does not publish its args, so the bag would carry
+        # the target's dtype and mis-drive the draft's FP8 cast/descale paths.
+        self.kv_cache_dtype_str = (
+            resolved_kv_cache_dtype
+            if resolved_kv_cache_dtype is not None
+            else self.server_args.kv_cache_dtype
         )
         if resolved_kv_cache_dtype is not None:
             self._record_kv_cache_dtype(resolved_kv_cache_dtype)
