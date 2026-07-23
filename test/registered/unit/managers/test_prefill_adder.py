@@ -788,6 +788,7 @@ class TestPrefillAdder(CustomTestCase):
         scheduler.max_req_len = 262143
         scheduler.max_total_num_tokens = 262144
         scheduler.max_new_tokens_limit = None
+        scheduler.page_size = 64
 
         req = SimpleNamespace(
             origin_input_ids=range(262137),
