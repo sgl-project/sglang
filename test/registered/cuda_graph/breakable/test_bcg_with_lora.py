@@ -7,10 +7,14 @@ and once with =disabled — and compares per-token prompt logprobs for:
   * base-model (no-adapter) requests served by the same LoRA-enabled server,
   * one multi-request batch mixing LoRA and base requests (bs > 1 replay).
 
-Two guards against passing vacuously:
+Three guards against passing vacuously:
   * scrapes the breakable server's logs for a "Prefill batch ... cuda graph:
     True" line — the scheduler reports can_run_cuda_graph per batch, which is
     True only when PrefillCudaGraphRunner.execute actually served the batch;
+  * repeats that scrape on a log window during which a lone adapter-carrying
+    request is the only work in flight, so the line cannot come from a
+    base-model or warmup batch — catching a fallback that ejects only
+    adapter-carrying batches to eager prefill;
   * asserts the adapter materially changes prompt logprobs while the prefill
     graph is enabled, which catches a graph captured without LoRA applied.
 """
@@ -19,6 +23,7 @@ import os
 import re
 import shutil
 import tempfile
+import time
 import unittest
 
 import requests
@@ -133,6 +138,54 @@ class BCGLoRAServerMixin:
         }
 
     @classmethod
+    def _log_sizes(cls):
+        return [os.path.getsize(path) for path in (cls.stdout_path, cls.stderr_path)]
+
+    @classmethod
+    def _logs_appended_since(cls, sizes):
+        # Binary read: the size snapshot is a byte offset, and text-mode
+        # seek() is only defined for tell() cookies.
+        chunks = []
+        for path, start in zip((cls.stdout_path, cls.stderr_path), sizes):
+            with open(path, "rb") as f:
+                f.seek(start)
+                chunks.append(f.read().decode(errors="replace"))
+        return "\n".join(chunks)
+
+    @classmethod
+    def _probe_lora_replay_window(cls):
+        """Send one adapter-carrying request with nothing else in flight and
+        return the log text appended while it ran. Any "Prefill batch" line
+        in this window belongs to that request, so a "cuda graph: True" match
+        here pins the graph replay to a LoRA batch specifically — the
+        file-wide scrape in test_prefill_graph_replay_logged is also
+        satisfied by base-model or warmup batches. Polls because the server
+        process flushes its log pipes asynchronously.
+        """
+        # Baseline only once the log files go quiet: the pipe-dump threads
+        # flush asynchronously, so a line from an earlier (base-model) batch
+        # could otherwise drain into the probe window and satisfy the guard
+        # for the wrong batch.
+        sizes = cls._log_sizes()
+        quiet_deadline = time.monotonic() + 10
+        while time.monotonic() < quiet_deadline:
+            time.sleep(1.0)
+            new_sizes = cls._log_sizes()
+            if new_sizes == sizes:
+                break
+            sizes = new_sizes
+
+        _generate(PROMPTS[0], LORA_NAME)
+        deadline = time.monotonic() + 30
+        while True:
+            window = cls._logs_appended_since(sizes)
+            if PREFILL_GRAPH_REPLAY_PATTERN.search(window) or (
+                time.monotonic() > deadline
+            ):
+                return window
+            time.sleep(0.5)
+
+    @classmethod
     def setUpClass(cls):
         cls.log_dir = tempfile.mkdtemp(prefix=f"bcg_lora_{cls.lora_backend}_")
         cls.stdout_path = os.path.join(cls.log_dir, "server.out")
@@ -148,6 +201,7 @@ class BCGLoRAServerMixin:
         )
         try:
             cls.with_graph = cls._collect()
+            cls.lora_replay_window = cls._probe_lora_replay_window()
         finally:
             kill_process_tree(process.pid)
             cls.stdout.close()
@@ -188,6 +242,24 @@ class BCGLoRAServerMixin:
             PREFILL_GRAPH_REPLAY_PATTERN,
             "No prefill batch was served by the prefill CUDA graph; the "
             "breakable-vs-disabled comparison is vacuous.",
+        )
+
+    def test_lora_request_replays_prefill_graph(self):
+        # The file-wide scrape above is also satisfied by base-model or
+        # warmup batches. This window held a lone adapter-carrying request,
+        # so it fails if LoRA batches specifically fall back to eager
+        # prefill (e.g. an eligibility gate keyed on active adapters) even
+        # while base batches keep replaying the graph.
+        prefill_lines = [
+            line
+            for line in self.lora_replay_window.splitlines()
+            if "Prefill batch" in line
+        ]
+        self.assertTrue(
+            any(PREFILL_GRAPH_REPLAY_PATTERN.search(line) for line in prefill_lines),
+            "The lone adapter-carrying probe request was not served by the "
+            "prefill CUDA graph; LoRA batches are falling back to eager "
+            f"prefill. Prefill lines in the probe window: {prefill_lines}",
         )
 
     def test_lora_prefill_logprobs_match_eager(self):

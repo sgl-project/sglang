@@ -186,8 +186,8 @@ def capture_prefill_graph(
     ):
         logger.warning(
             "Disable prefill CUDA graph because the current LoRA "
-            "configuration does not support it (unsupported LoRA backend "
-            "or MoE LoRA)."
+            "configuration does not support it (unsupported LoRA backend, "
+            "MoE LoRA, or DP attention)."
         )
         return eager_runner
 
