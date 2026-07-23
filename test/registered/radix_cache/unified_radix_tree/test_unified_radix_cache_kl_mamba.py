@@ -1,5 +1,6 @@
 import os
 import shutil
+import subprocess
 import tempfile
 import unittest
 
@@ -108,9 +109,9 @@ class TestUnifiedMambaHiCache(UnifiedRadixTreeTestMixin, CustomTestCase):
                 "--hicache-write-policy",
                 "write_through",
                 "--hicache-io-backend",
-                "kernel",
+                "direct",
                 "--hicache-mem-layout",
-                "page_first",
+                "page_first_direct",
                 "--max-total-tokens",
                 "12000",
                 "--max-mamba-cache-size",
@@ -125,6 +126,11 @@ class TestUnifiedMambaHiCache(UnifiedRadixTreeTestMixin, CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
+        cls.process.terminate()
+        try:
+            cls.process.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            pass
         kill_process_tree(cls.process.pid)
 
 
@@ -169,9 +175,9 @@ class TestUnifiedMambaHiCacheL3(AccuracyTwoPassMixin, CustomTestCase):
                 "--hicache-storage-prefetch-policy",
                 "wait_complete",
                 "--hicache-io-backend",
-                "kernel",
+                "direct",
                 "--hicache-mem-layout",
-                "page_first",
+                "page_first_direct",
                 "--hicache-storage-backend",
                 "file",
                 "--max-mamba-cache-size",
@@ -186,6 +192,11 @@ class TestUnifiedMambaHiCacheL3(AccuracyTwoPassMixin, CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
+        cls.process.terminate()
+        try:
+            cls.process.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            pass
         kill_process_tree(cls.process.pid)
         if os.path.isdir(cls.hicache_dir):
             shutil.rmtree(cls.hicache_dir, ignore_errors=True)

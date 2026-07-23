@@ -131,6 +131,10 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
         num_padding: Optional[int] = None,
+        in_capture: bool = False,
+        mamba_track_indices: Optional[torch.Tensor] = None,
+        *args,
+        **kwargs,
     ):
         # out_graph passes seq_lens_cpu=None at capture; mirror the base guard.
         if seq_lens_cpu is None:
@@ -144,6 +148,9 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
         mamba_indices = self.req_to_token_pool.get_mamba_indices(req_pool_indices)
         mamba_indices[bs - num_padding :] = 0
         self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
+        track_buf = None
+        if mamba_track_indices is not None:
+            track_buf = mamba_track_indices
         if forward_mode.is_decode_or_idle():
             if num_padding == 0:
                 self.query_start_loc_list[bs - 1].copy_(
@@ -189,6 +196,7 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
             return ForwardMetadata(
                 query_start_loc=self.query_start_loc_list[bs - 1],
                 mamba_cache_indices=self.state_indices_list[bs - 1],
+                mamba_track_indices=track_buf,
                 retrieve_next_token=self.retrieve_next_token_list[bs - 1],
                 retrieve_next_sibling=self.retrieve_next_sibling_list[bs - 1],
                 retrieve_parent_token=self.retrieve_parent_token_list[bs - 1],
@@ -198,6 +206,7 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
                 query_start_loc=self.query_start_loc_list[bs - 1],
                 mamba_cache_indices=self.state_indices_list[bs - 1],
                 mamba_cache_indices_gdn=self.state_indices_list_gdn[bs - 1],
+                mamba_track_indices=track_buf,
             )
 
     def get_cuda_graph_seq_len_fill_value(self):
@@ -256,13 +265,22 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
         )
         last_steps = last_correct_step_indices.to(torch.int64)  # [N]
 
-        move_intermediate_cache(
-            ssm_states,
-            intermediate_state_cache,
-            dst_indices_tensor,
-            src_indices_tensor,
-            last_steps,
-        )
+        # NPU: skip intermediate_ssm copy when accept_lens == 1.
+        # The state at step 0 is the just-computed recurrent state, which
+        # is already correct in the model's ssm buffer.  The intermediate
+        # cache path exists for CUDA's per-step gather; on NPU the fused
+        # kernel may produce slightly different bfloat16 rounding that
+        # accumulates over thousands of decode steps and drifts into
+        # garbage output.
+        all_step0 = (last_steps == 0).all().item()
+        if not all_step0:
+            move_intermediate_cache(
+                ssm_states,
+                intermediate_state_cache,
+                dst_indices_tensor,
+                src_indices_tensor,
+                last_steps,
+            )
 
         draft_token_num = intermediate_state_cache.shape[2]
         if mamba_track_indices is not None:

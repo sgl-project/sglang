@@ -54,7 +54,6 @@ from sglang.multimodal_gen.runtime.utils.trace_wrapper import (
 
 logger = init_logger(__name__)
 
-# TODO: move to somewhere appropriate
 try:
     # Set the start method to 'spawn' to avoid CUDA errors in forked processes.
     # This must be done at the top level of the module, before any CUDA context
@@ -377,6 +376,34 @@ class DiffGenerator:
             return None
         return results[0] if len(results) == 1 else results
 
+    def generate_action(
+        self,
+        sampling_params_kwargs: dict | None = None,
+        external_trace_header: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        sampling_params_kwargs = sampling_params_kwargs or {}
+        sampling_params = SamplingParams.from_user_sampling_params_args(
+            self.server_args.model_path,
+            server_args=self.server_args,
+            **sampling_params_kwargs,
+        )
+        if sampling_params.data_type != DataType.ACTION:
+            raise ValueError(
+                f"generate_action requires an ACTION pipeline, got {sampling_params.data_type}"
+            )
+
+        req = prepare_request(
+            server_args=self.server_args,
+            sampling_params=sampling_params,
+            external_trace_header=external_trace_header,
+        )
+        output_batch = self._send_to_scheduler_and_wait_for_response(req)
+        if output_batch.error:
+            raise RuntimeError(output_batch.error)
+        if output_batch.output is None:
+            raise RuntimeError("action policy returned no output")
+        return output_batch.output[0]
+
     def _resolve_prompts(
         self,
         prompt: str | list[str] | None,
@@ -431,12 +458,17 @@ class DiffGenerator:
             and output_index < len(output_batch.metrics_list)
         ):
             metrics = output_batch.metrics_list[output_index]
+        if req.data_type == DataType.ACTION:
+            size = ("action",)
+        else:
+            size = (req.height, req.width, req.num_frames)
         return dict(
             prompt=req.prompt,
-            size=(req.height, req.width, req.num_frames),
+            size=size,
             generation_time=generation_time,
             peak_memory_mb=output_batch.peak_memory_mb,
             metrics=metrics.to_dict() if metrics else {},
+            action=output_batch.action_pred,
             trajectory_latents=output_batch.trajectory_latents,
             trajectory_timesteps=output_batch.trajectory_timesteps,
             rollout_trajectory_data=output_batch.rollout_trajectory_data,
@@ -603,7 +635,7 @@ class DiffGenerator:
         # sends the shutdown command to the server
         if self.local_scheduler_process and self.owns_scheduler_client:
             try:
-                sync_scheduler_client.forward(ShutdownReq())
+                sync_scheduler_client.forward(ShutdownReq(), timeout_ms=5000)
             except Exception:
                 pass
 
@@ -615,11 +647,45 @@ class DiffGenerator:
                         f"Local worker {process.name} did not terminate gracefully, forcing."
                     )
                     process.terminate()
+                    process.join(timeout=1)
+                    if process.is_alive():
+                        process.kill()
+                        process.join(timeout=1)
             self.local_scheduler_process = None
 
         if self.owns_scheduler_client:
             sync_scheduler_client.close()
             self.owns_scheduler_client = False
+
+    def _force_shutdown_local_processes(self) -> None:
+        local_scheduler_process = getattr(self, "local_scheduler_process", None)
+        log = globals().get("logger")
+        if local_scheduler_process:
+            for process in local_scheduler_process:
+                if process.is_alive():
+                    if log is not None:
+                        log.warning(
+                            f"Local worker {process.name} did not terminate gracefully, forcing."
+                        )
+                    process.terminate()
+            for process in local_scheduler_process:
+                process.join(timeout=1)
+                if process.is_alive():
+                    if log is not None:
+                        log.warning(
+                            f"Local worker {process.name} did not terminate after terminate(), killing."
+                        )
+                    process.kill()
+                    process.join(timeout=1)
+            self.local_scheduler_process = None
+
+        if getattr(self, "owns_scheduler_client", False):
+            try:
+                client = globals().get("sync_scheduler_client")
+                if client is not None:
+                    client.close()
+            finally:
+                self.owns_scheduler_client = False
 
     def __enter__(self):
         return self
@@ -630,15 +696,18 @@ class DiffGenerator:
     def __del__(self):
         owns_scheduler_client = bool(getattr(self, "owns_scheduler_client", False))
         local_scheduler_process = getattr(self, "local_scheduler_process", None)
+        log = globals().get("logger")
         if owns_scheduler_client:
-            logger.warning(
-                "Generator was garbage collected without being shut down. "
-                "Attempting to shut down the local server and client."
-            )
-            self.shutdown()
+            if log is not None:
+                log.warning(
+                    "Generator was garbage collected without being shut down. "
+                    "Forcing local server and client cleanup."
+                )
+            self._force_shutdown_local_processes()
         elif local_scheduler_process:
-            logger.warning(
-                "Generator was garbage collected without being shut down. "
-                "Attempting to shut down the local server."
-            )
-            self.shutdown()
+            if log is not None:
+                log.warning(
+                    "Generator was garbage collected without being shut down. "
+                    "Forcing local server cleanup."
+                )
+            self._force_shutdown_local_processes()

@@ -22,13 +22,33 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _async_d2h(t: torch.Tensor) -> torch.Tensor:
+    """Async D2H copy for overlap scheduling. On CUDA the dest is pinned (a D2H
+    to pageable host memory blocks the caller until done) and record_stream keeps
+    the source alive until the copy stream drains, so the caching allocator can't
+    recycle it early. Non-CUDA falls back to a plain copy."""
+    if not t.is_cuda:
+        return t.to("cpu", non_blocking=True)
+    cpu_t = torch.empty(t.shape, dtype=t.dtype, pin_memory=True)
+    cpu_t.copy_(t, non_blocking=True)
+    t.record_stream(torch.cuda.current_stream(t.device))
+    return cpu_t
+
+
 @dataclasses.dataclass
 class GenerationBatchResult:
     logits_output: Optional[LogitsProcessorOutput] = None
     pp_hidden_states_proxy_tensors: Optional[PPProxyTensors] = None
-    next_token_ids: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None
+    next_token_ids: Optional[
+        Union[torch.Tensor, List[torch.Tensor], List[List[int]]]
+    ] = None
     num_correct_drafts: int = 0  # no bonus included
     num_correct_drafts_per_req_cpu: Optional[List[int]] = None
+    num_block_accept_tokens: int = 0
+    num_cap_tokens: int = 0
+    # FDFO dLLM batching: per-request accepted block length and carried algo state.
+    accept_length_per_req_cpu: Optional[List[int]] = None
+    dllm_algo_state: Optional[List[Any]] = None
     can_run_cuda_graph: bool = False
 
     # PP skip output comm: True when output send/recv was skipped and
@@ -46,9 +66,20 @@ class GenerationBatchResult:
     future_indices: Optional[torch.Tensor] = None
     speculative_num_draft_tokens: Optional[int] = None
 
+    # Grammar FSM advance memoization (spec-v2 overlap). advance_grammar_fsm sets
+    # these once — eagerly via the scheduler's grammar barrier inside verify(), or
+    # lazily in _resolve_spec_v2_tokens — and the latter consumes
+    # grammar_retained_tokens instead of re-advancing the FSM.
+    grammar_advanced: bool = False
+    grammar_retained_tokens: Optional[list] = None
+
     # FIXME(lsyin): maybe move to a better place?
     # sync path: forward stream -> output processor
     accept_lens: Optional[torch.Tensor] = None
+
+    block_accept_lens: Optional[torch.Tensor] = None
+
+    cap_lens: Optional[torch.Tensor] = None
 
     # Next-iter seq_lens; published via on_publish.
     new_seq_lens: Optional[torch.Tensor] = None
@@ -72,6 +103,13 @@ class GenerationBatchResult:
     fpm_start_event: Optional[torch.cuda.Event] = None
     fpm_end_event: Optional[torch.cuda.Event] = None
 
+    @property
+    def has_sampled_token_ids(self) -> bool:
+        """True when this iter sampled token ids; False when none were produced
+        this rank/split (a non-last PP rank or a non-final prefill split)."""
+        return isinstance(self.next_token_ids, torch.Tensor)
+
+    @torch.profiler.record_function("copy_result_to_cpu")
     def copy_to_cpu(self, return_logprob: bool, return_hidden_states: bool = True):
         """Copy tensors to CPU in overlap scheduling.
         Only the tensors which are needed for processing results are copied,
@@ -79,45 +117,53 @@ class GenerationBatchResult:
         """
         if return_logprob:
             if self.logits_output.next_token_logprobs is not None:
-                self.logits_output.next_token_logprobs = (
-                    self.logits_output.next_token_logprobs.to("cpu", non_blocking=True)
+                self.logits_output.next_token_logprobs = _async_d2h(
+                    self.logits_output.next_token_logprobs
                 )
             if self.logits_output.input_token_logprobs is not None:
-                self.logits_output.input_token_logprobs = (
-                    self.logits_output.input_token_logprobs.to("cpu", non_blocking=True)
+                self.logits_output.input_token_logprobs = _async_d2h(
+                    self.logits_output.input_token_logprobs
                 )
             if self.logits_output.next_token_top_logprobs_val is not None:
                 self.logits_output.next_token_top_logprobs_val = [
-                    v.to("cpu", non_blocking=True) if torch.is_tensor(v) else v
+                    _async_d2h(v) if torch.is_tensor(v) else v
                     for v in self.logits_output.next_token_top_logprobs_val
                 ]
             if self.logits_output.next_token_top_logprobs_idx is not None:
                 self.logits_output.next_token_top_logprobs_idx = [
-                    x.to("cpu", non_blocking=True) if torch.is_tensor(x) else x
+                    _async_d2h(x) if torch.is_tensor(x) else x
                     for x in self.logits_output.next_token_top_logprobs_idx
                 ]
             if self.logits_output.next_token_token_ids_logprobs_val is not None:
                 self.logits_output.next_token_token_ids_logprobs_val = [
-                    v.to("cpu", non_blocking=True) if torch.is_tensor(v) else v
+                    _async_d2h(v) if torch.is_tensor(v) else v
                     for v in self.logits_output.next_token_token_ids_logprobs_val
                 ]
         if return_hidden_states and self.logits_output.hidden_states is not None:
-            self.logits_output.hidden_states = self.logits_output.hidden_states.to(
-                "cpu", non_blocking=True
+            self.logits_output.hidden_states = _async_d2h(
+                self.logits_output.hidden_states
             )
-        self.next_token_ids = self.next_token_ids.to("cpu", non_blocking=True)
+        self.next_token_ids = _async_d2h(self.next_token_ids)
 
         if self.accept_lens is not None:
-            self.accept_lens = self.accept_lens.to("cpu", non_blocking=True)
+            self.accept_lens = _async_d2h(self.accept_lens)
 
-        if self.routed_experts_output is not None:
-            self.routed_experts_output.copy_to_cpu()
+        if self.block_accept_lens is not None:
+            self.block_accept_lens = _async_d2h(self.block_accept_lens)
 
-        if self.indexer_topk_output is not None:
-            self.indexer_topk_output.copy_to_cpu()
+        if self.cap_lens is not None:
+            self.cap_lens = _async_d2h(self.cap_lens)
 
-        if (x := self.expert_distribution_metrics) is not None:
-            x.copy_to_cpu()
+        # Sub-objects only declare their device fields; the single copy+safety
+        # primitive (_async_d2h: pinned D2H + record_stream) is injected here so
+        # all device->host copying and lifetime safety lives in one place.
+        for holder in (
+            self.routed_experts_output,
+            self.indexer_topk_output,
+            self.expert_distribution_metrics,
+        ):
+            if holder is not None:
+                holder.map_device_tensors(_async_d2h)
 
         self.copy_done.record()
 
@@ -185,6 +231,8 @@ def get_logprob_dict_from_result(result: GenerationBatchResult) -> dict:
         "next_token_top_logprobs_idx": result.logits_output.next_token_top_logprobs_idx,
         "next_token_token_ids_logprobs_val": result.logits_output.next_token_token_ids_logprobs_val,
         "next_token_token_ids_logprobs_idx": result.logits_output.next_token_token_ids_logprobs_idx,
+        "next_token_sampling_mask_idx": result.logits_output.next_token_sampling_mask_idx,
+        "next_token_sampling_logprobs": result.logits_output.next_token_sampling_logprobs,
         "input_token_logprobs": result.logits_output.input_token_logprobs,
         "input_top_logprobs_val": result.logits_output.input_top_logprobs_val,
         "input_top_logprobs_idx": result.logits_output.input_top_logprobs_idx,
@@ -209,6 +257,8 @@ def get_logprob_from_pp_outputs(
         next_token_token_ids_logprobs_idx=next_pp_outputs[
             "next_token_token_ids_logprobs_idx"
         ],
+        next_token_sampling_mask_idx=next_pp_outputs["next_token_sampling_mask_idx"],
+        next_token_sampling_logprobs=next_pp_outputs["next_token_sampling_logprobs"],
         input_token_logprobs=next_pp_outputs["input_token_logprobs"],
         input_top_logprobs_val=next_pp_outputs["input_top_logprobs_val"],
         input_top_logprobs_idx=next_pp_outputs["input_top_logprobs_idx"],
@@ -243,30 +293,27 @@ class EmbeddingBatchResult:
     def can_run_cuda_graph(self) -> bool:
         return False
 
+    @torch.profiler.record_function("copy_embedding_to_cpu")
     def copy_to_cpu(self):
         """Copy embeddings and pooled hidden states to CPU for overlap scheduling."""
         if isinstance(self.embeddings, torch.Tensor):
             self.copy_done = torch.get_device_module(self.embeddings.device).Event()
-            self.embeddings = self.embeddings.to("cpu", non_blocking=True)
+            self.embeddings = _async_d2h(self.embeddings)
         else:
             assert isinstance(self.embeddings, list)
             if len(self.embeddings) == 0:
                 return
 
             self.copy_done = torch.get_device_module(self.embeddings[0].device).Event()
-            self.embeddings = [
-                emb.to("cpu", non_blocking=True) for emb in self.embeddings
-            ]
+            self.embeddings = [_async_d2h(emb) for emb in self.embeddings]
 
         if self.pooled_hidden_states is not None:
             if isinstance(self.pooled_hidden_states, list):
                 self.pooled_hidden_states = [
-                    t.to("cpu", non_blocking=True) for t in self.pooled_hidden_states
+                    _async_d2h(t) for t in self.pooled_hidden_states
                 ]
             else:
-                self.pooled_hidden_states = self.pooled_hidden_states.to(
-                    "cpu", non_blocking=True
-                )
+                self.pooled_hidden_states = _async_d2h(self.pooled_hidden_states)
 
         self.copy_done.record()
 

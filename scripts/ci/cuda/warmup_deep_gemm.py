@@ -115,7 +115,7 @@ def compute_deepseek_v2v3_shapes(config, tp):
     Shape derivation based on:
     - MoE: python/sglang/srt/layers/moe/fused_moe_triton/layer.py
     - MLA: python/sglang/srt/models/deepseek_v2.py
-    - FP8: python/sglang/srt/layers/quantization/fp8_kernel.py
+    - FP8: python/sglang/kernels/ops/quantization/fp8_kernel.py
     """
     shapes = []
 

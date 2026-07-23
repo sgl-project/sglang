@@ -49,7 +49,7 @@ class StandaloneServerBase:
         assert cls.attention_backend, f"{cls.__name__} must set `attention_backend`"
         args = [
             "--trust-remote-code",
-            "--cuda-graph-max-bs",
+            "--cuda-graph-max-bs-decode",
             "8",
             "--speculative-algorithm",
             "STANDALONE",

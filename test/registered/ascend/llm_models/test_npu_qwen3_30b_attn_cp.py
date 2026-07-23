@@ -37,7 +37,7 @@ class TestQwen330BAttnCP(GSM8KAscendMixin, CustomTestCase):
         "2",
         "--attn-cp-size",
         "2",
-        "--cuda-graph-max-bs",
+        "--cuda-graph-max-bs-decode",
         "32",
         "--enable-prefill-context-parallel",
     ]

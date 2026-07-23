@@ -23,6 +23,7 @@ from transformers import CONFIG_MAPPING
 from transformers.configuration_utils import PretrainedConfig
 
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
+from sglang.srt.runtime_context import get_parallel
 
 
 class Lfm2MoeConfig(PretrainedConfig):
@@ -149,7 +150,6 @@ class Lfm2MoeConfig(PretrainedConfig):
 
         LFM2-MoE uses ShortConv layers with a small fixed-size cache.
         """
-        from sglang.srt.layers.dp_attention import get_attention_tp_size
 
         conv_layer_ids = self.linear_layer_ids
         if not conv_layer_ids:
@@ -161,7 +161,7 @@ class Lfm2MoeConfig(PretrainedConfig):
         # actual cache size is kernel_size - 1 (e.g., 2 for kernel=3)
 
         try:
-            tp_size = get_attention_tp_size()
+            tp_size = get_parallel().attn_tp_size
         except (AssertionError, RuntimeError):
             tp_size = 1
 

@@ -22,10 +22,12 @@ Current coverage:
 
 import asyncio
 import dataclasses
+import json
 import unittest
 from types import SimpleNamespace
 
 from sglang.srt.entrypoints import http_server
+from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -33,7 +35,9 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
-def _call_server_info_with(server_args: ServerArgs) -> dict:
+def _call_server_info_with(
+    server_args: ServerArgs, internal_states: list[dict] | None = None
+) -> dict:
     """Invoke `http_server.server_info()` against a stub global state.
 
     Bypasses the FastAPI HTTP layer (no TestClient): the handler is an
@@ -44,7 +48,7 @@ def _call_server_info_with(server_args: ServerArgs) -> dict:
     """
 
     async def _fake_internal_state():
-        return [{"max_req_input_len": 1024}]
+        return internal_states or [{"max_req_input_len": 1024}]
 
     stub_state = SimpleNamespace(
         tokenizer_manager=SimpleNamespace(
@@ -290,6 +294,31 @@ class TestServerInfoExistingFieldsPreserved(CustomTestCase):
         # And the new structured block is separately present:
         self.assertIn("kv_events", info)
         self.assertIsNotNone(info["kv_events"])
+
+    def test_lora_refs_are_json_serializable_dicts(self):
+        lora_ref = LoRARef(
+            lora_id="lora-id",
+            lora_name="adapter",
+            lora_path="/tmp/adapter",
+            pinned=True,
+        )
+        args = ServerArgs(model_path="dummy")
+        args.lora_paths = [lora_ref]
+
+        info = _call_server_info_with(
+            args,
+            internal_states=[{"lora_paths": [lora_ref]}],
+        )
+
+        expected = {
+            "lora_id": "lora-id",
+            "lora_name": "adapter",
+            "lora_path": "/tmp/adapter",
+            "pinned": True,
+        }
+        self.assertEqual(info["lora_paths"], [expected])
+        self.assertEqual(info["internal_states"][0]["lora_paths"], [expected])
+        json.dumps(info)
 
 
 if __name__ == "__main__":

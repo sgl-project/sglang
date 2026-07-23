@@ -40,6 +40,20 @@ def get_allocator_from_storage(allocator_type):
                 "Fallback to use default allocator."
             )
             return HostTensorAllocator()
+    elif allocator_type == "mori":
+        try:
+            from sglang.srt.mem_cache.storage.umbp.umbp_host_allocator import (
+                UMBPHostTensorAllocator,
+            )
+
+            return UMBPHostTensorAllocator()
+        except (ImportError, RuntimeError) as exc:
+            logger.warning(
+                "UMBPHostTensorAllocator unavailable (%s). "
+                "Falling back to torch.empty-based allocator.",
+                exc,
+            )
+            return HostTensorAllocator()
     else:
         return HostTensorAllocator()
 
@@ -54,6 +68,19 @@ def _cuda_host_register(buffer: torch.Tensor) -> None:
             f"{cudart.cudaGetErrorString(rc)}) for ptr={buffer.data_ptr():#x} "
             f"size={n_bytes}; host buffer is not pinned and device transfers "
             f"may silently return stale data."
+        )
+
+
+def _cuda_host_unregister(buffer: torch.Tensor) -> None:
+    cudart = torch.cuda.cudart()
+    rc = cudart.cudaHostUnregister(buffer.data_ptr())
+    if int(rc) != 0:
+        # Best-effort on shutdown: warn, don't raise -- a leak is reclaimed at exit.
+        logger.warning(
+            "cudaHostUnregister failed (rc=%d, %s) for ptr=%#x",
+            int(rc),
+            cudart.cudaGetErrorString(rc),
+            buffer.data_ptr(),
         )
 
 

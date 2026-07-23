@@ -51,6 +51,16 @@ class NixlRegistry:
         # from a single monotonic counter.
         self._obj_devid_lock = threading.Lock()
         self._obj_devid_next = 1
+        self.path_mode = mem_type == "FILE" and self._probe_path_mode()
+        if mem_type == "FILE" and self.path_mode:
+            logger.info("HiCacheNixl: path-mode FILE registration active.")
+        elif mem_type == "FILE":
+            # TODO: NIXL 1.3.0 adds path-mode support; remove this fd fallback once 1.3.0 is widely installed.
+            logger.info(
+                "HiCacheNixl: the installed NIXL build does not "
+                "support path-mode FILE registration; using legacy "
+                "fd registration."
+            )
 
     @contextmanager
     def _open_files(self, paths: List[str], create: bool):
@@ -95,6 +105,31 @@ class NixlRegistry:
                 except Exception as e:
                     logger.debug("deregister_memory skipped: %s", e)
 
+    def _probe_path_mode(self) -> bool:
+        """Probe whether NIXL honours path-mode metaInfo.
+
+        Register a FILE_SEG with a valid path-mode string pointing at a
+        nonexistent path (no 'create' flag). A path-mode-capable NIXL tries
+        to open() the path, fails with NIXL_ERR_BACKEND, and raises. A
+        pre-path-mode NIXL ignores metaInfo and returns NIXL_SUCCESS.
+        Error from register_memory => path mode supported.
+        """
+        reg_descs = self.agent.get_reg_descs(
+            [(0, 4096, 1, "rw:/nonexistent-nixl-probe")], "FILE"
+        )
+        if reg_descs is None:
+            return False
+        try:
+            reg = self.agent.register_memory(reg_descs)
+            if reg is not None:
+                try:
+                    self.agent.deregister_memory(reg)
+                except Exception:
+                    pass
+            return False
+        except Exception:
+            return True
+
     @contextmanager
     def storage(self, buffers, keys, direction):
         """Open + register the storage side; deregister and close fds on exit.
@@ -108,18 +143,32 @@ class NixlRegistry:
             return
 
         if self.mem_type == "FILE":
-            with self._open_files(keys, create=(direction == "WRITE")) as fds:
-                if fds is None:
-                    yield None
-                    return
-                tuples = [(0, sizes[i], fds[i], keys[i]) for i in range(len(keys))]
+            if self.path_mode:
+                parts = ["rw", "create"] if direction == "WRITE" else ["ro"]
+                if self.file_manager.use_direct_io:
+                    parts.append("direct")
+                spec = ",".join(parts)
+                tuples = [
+                    (0, sizes[i], i + 1, f"{spec}:{keys[i]}") for i in range(len(keys))
+                ]
                 with self._registered(tuples, "FILE") as reg:
                     if reg is None:
                         yield None
                         return
-                    yield self.agent.get_xfer_descs(
-                        [(0, sizes[i], fds[i]) for i in range(len(fds))], "FILE"
-                    )
+                    yield reg.trim()
+            else:
+                with self._open_files(keys, create=(direction == "WRITE")) as fds:
+                    if fds is None:
+                        yield None
+                        return
+                    tuples = [(0, sizes[i], fds[i], keys[i]) for i in range(len(keys))]
+                    with self._registered(tuples, "FILE") as reg:
+                        if reg is None:
+                            yield None
+                            return
+                        yield self.agent.get_xfer_descs(
+                            [(0, sizes[i], fds[i]) for i in range(len(fds))], "FILE"
+                        )
         else:  # OBJ
             # Reg tuple: (addr=0, size, devId, metaInfo=key).
             # Xfer tuple: (addr=0, size, devId). devId links each xfer desc

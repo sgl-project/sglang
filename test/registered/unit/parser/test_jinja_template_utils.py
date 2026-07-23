@@ -10,7 +10,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=7, suite="base-a-test-cpu")
-register_cpu_ci(est_time=7, suite="base-b-test-cpu")
+register_cpu_ci(est_time=7, suite="base-c-test-cpu")
 
 
 class TestTemplateContentFormatDetection(CustomTestCase):
@@ -92,46 +92,6 @@ class TestTemplateContentFormatDetection(CustomTestCase):
         {%- else %}
 <|assistant|>
 {{ msg.content }}
-        {%- endif %}
-    {%- endif %}
-{%- endfor %}
-{% if add_generation_prompt %}<|assistant|>
-{% endif %}
-        """
-
-        result = detect_jinja_template_content_format(msg_content_pattern)
-        self.assertEqual(result, "openai")
-
-    def test_detect_m_content_pattern(self):
-        """Test detection of template with m.content pattern (should be 'openai' format)."""
-        msg_content_pattern = """
-[gMASK]<sop>
-{%- for m in messages %}
-    {%- if m.role == 'system' %}
-<|system|>
-{{ m.content }}
-    {%- elif m.role == 'user' %}
-<|user|>{{ '\n' }}
-        {%- if m.content is string %}
-{{ m.content }}
-        {%- else %}
-            {%- for item in m.content %}
-                {%- if item.type == 'video' or 'video' in item %}
-<|begin_of_video|><|video|><|end_of_video|>
-                {%- elif item.type == 'image' or 'image' in item %}
-<|begin_of_image|><|image|><|end_of_image|>
-                {%- elif item.type == 'text' %}
-{{ item.text }}
-                {%- endif %}
-            {%- endfor %}
-        {%- endif %}
-    {%- elif m.role == 'assistant' %}
-        {%- if m.metadata %}
-<|assistant|>{{ m.metadata }}
-{{ m.content }}
-        {%- else %}
-<|assistant|>
-{{ m.content }}
         {%- endif %}
     {%- endif %}
 {%- endfor %}

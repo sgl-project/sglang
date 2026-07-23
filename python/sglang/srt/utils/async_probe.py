@@ -76,6 +76,12 @@ def sanitize_nan_logits(logits: torch.Tensor, msg: str = ""):
     torch.nan_to_num_(logits, nan=-1e30, posinf=1e30, neginf=-1e30)
 
 
+def maybe_assert_async(cond: torch.Tensor, msg: str = ""):
+    if not envs.SGLANG_ENABLE_ASYNC_ASSERT.get():
+        return
+    torch._assert_async(cond, msg)
+
+
 def maybe_detect_nan(tensor: Optional[torch.Tensor], msg: str = ""):
     """Async NaN check — no GPU-CPU sync, error surfaces at next sync point."""
     if not envs.SGLANG_ENABLE_ASYNC_ASSERT.get():
@@ -94,6 +100,19 @@ def maybe_detect_inf(tensor: Optional[torch.Tensor], msg: str = ""):
     if tensor is None:
         return
     torch._assert_async(~torch.any(torch.isinf(tensor)), f"Inf detected! {msg}")
+
+
+def maybe_detect_in_closed_range(
+    tensor: Optional[torch.Tensor], low: float, high: float, msg: str = ""
+):
+    if not envs.SGLANG_ENABLE_ASYNC_ASSERT.get():
+        return
+    if tensor is None or tensor.numel() == 0:
+        return
+    torch._assert_async(
+        ((tensor >= low) & (tensor <= high)).all(),
+        f"value outside [{low}, {high}]: {msg}",
+    )
 
 
 def maybe_detect_oob(indices: Optional[torch.Tensor], low: int, high: int, msg: str):

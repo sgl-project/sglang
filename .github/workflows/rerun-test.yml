@@ -145,7 +145,15 @@ jobs:
             echo "Begin ($i/$total): python3 $cmd"
             echo "."
             file_start=$SECONDS
-            (cd test/ && python3 $cmd -f) || exit 1
+            # base-a perf tests (fwd_occupancy) need async assert off; match
+            # _pr-test-stage.yml's base-a carve-out.
+            test_file="${cmd%% *}"
+            test_file="${test_file%%::*}"
+            async_assert=true
+            if grep -qE 'register_cuda_ci\(.*stage[[:space:]]*=[[:space:]]*"base-a"' "test/$test_file" 2>/dev/null; then
+              async_assert=false
+            fi
+            (cd test/ && SGLANG_ENABLE_ASYNC_ASSERT=$async_assert python3 $cmd -f) || exit 1
             elapsed=$(( SECONDS - file_start ))
             echo "."
             echo "End ($i/$total): elapsed=${elapsed}s"

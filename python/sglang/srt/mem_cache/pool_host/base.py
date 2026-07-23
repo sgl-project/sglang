@@ -10,12 +10,63 @@ import psutil
 import torch
 
 from sglang.srt.mem_cache.memory_pool import KVCache
-from sglang.srt.mem_cache.pool_host.common import get_allocator_from_storage
+from sglang.srt.mem_cache.pool_host.common import (
+    _cuda_host_unregister,
+    get_allocator_from_storage,
+)
+from sglang.srt.utils import is_cuda, is_hip
 
 logger = logging.getLogger(__name__)
 
+_is_cuda = is_cuda()
+_is_hip = is_hip()
+
 # Host RAM to leave free when sizing HiCache pools (OS, other processes).
 HICACHE_HOST_MEMORY_RESERVE_BYTES: int = 10 * (1024**3)
+
+_WRITE_BACK_STAGING_PAGE_CHUNK = 64
+
+
+def sync_fixed_hicache_size(size: int, host_size: int) -> int:
+    """Sync fixed-size HiCache token capacity across PP ranks.
+
+    A fixed --hicache-size is specified in GB, but each PP stage may have a
+    different bytes/token because it owns different layers. Use the global
+    minimum token capacity within the PP group so all stages expose the same
+    host-cache capacity.
+    Ratio-based sizing already derives from the synced device pool size.
+    """
+    if host_size <= 0 or not torch.distributed.is_available():
+        return size
+
+    if not torch.distributed.is_initialized():
+        return size
+
+    try:
+        from sglang.srt.distributed.parallel_state import get_pp_group
+
+        pp_group = get_pp_group()
+    except AssertionError:
+        return size
+
+    if pp_group.world_size <= 1:
+        return size
+
+    tensor = torch.tensor(size, dtype=torch.int64)
+    torch.distributed.all_reduce(
+        tensor,
+        op=torch.distributed.ReduceOp.MIN,
+        group=pp_group.cpu_group,
+    )
+    synced_size = int(tensor.item())
+
+    if synced_size != size:
+        logger.info(
+            "Sync fixed-size HiCache host token capacity from %d to %d.",
+            size,
+            synced_size,
+        )
+    return synced_size
 
 
 def synchronized(func):
@@ -51,7 +102,9 @@ class HostKVCache(abc.ABC):
         self.dtype = device_pool.store_dtype
         self.size_per_token = self.get_size_per_token()
         if host_size > 0:
-            self.size = int(host_size * 1e9 // self.size_per_token)
+            self.size = sync_fixed_hicache_size(
+                int(host_size * 1e9 // self.size_per_token), host_size
+            )
         else:
             self.size = int(device_pool.size * host_to_device_ratio)
         # Align up the host memory pool size to the page size
@@ -60,9 +113,14 @@ class HostKVCache(abc.ABC):
         self.start_layer = device_pool.start_layer
         self.end_layer = device_pool.end_layer
 
-        assert (
-            self.size > device_pool.size
-        ), "The host memory should be larger than the device memory with the current protocol"
+        if self.size <= device_pool.size:
+            logger.warning(
+                "HiCache host KV pool (%d tokens) is smaller than the device pool (%d tokens);"
+                "L2 cache effectiveness is reduced."
+                "Consider increasing --hicache-ratio (or --hicache-size) for higher L2 cache hit rate.",
+                self.size,
+                device_pool.size,
+            )
 
         # Verify there is enough available host memory.
         host_mem = psutil.virtual_memory()
@@ -86,9 +144,64 @@ class HostKVCache(abc.ABC):
         self.lock = threading.RLock()
         self.clear()
 
+    def destroy(self):
+        """Unregister pinned host buffers in userspace before process exit.
+
+        Large cudaHostRegister'd buffers are otherwise unpinned by the kernel
+        during SIGKILL reclaim, which can stall teardown in uninterruptible
+        sleep for tens of seconds. Idempotent. (Only the host_register path
+        needs this; npu/musa pin_memory buffers are freed by torch.)
+        """
+        if getattr(self, "_destroyed", False):
+            return
+        self._destroyed = True
+        buffers = getattr(self, "kv_buffer", None)
+        if buffers is not None and self.pin_memory and (_is_cuda or _is_hip):
+            if not isinstance(buffers, (list, tuple)):
+                buffers = [buffers]
+            for buf in buffers:
+                if buf is not None:
+                    _cuda_host_unregister(buf)
+        self.kv_buffer = None
+
     @abc.abstractmethod
     def get_size_per_token(self):
         raise NotImplementedError()
+
+    def _is_device_layer_sharded(self, device_pool=None) -> bool:
+        device_pool = device_pool or self.device_pool
+        return bool(device_pool.layer_shard_enabled)
+
+    def _device_owned_layer_range(self, device_pool=None) -> tuple[int, int]:
+        """Contiguous ``[start, end)`` local device layers this rank stores.
+
+        ``(0, layer_num)`` when the device pool is not layer-sharded.
+        """
+        device_pool = device_pool or self.device_pool
+        if not self._is_device_layer_sharded(device_pool):
+            return 0, device_pool.layer_num
+        return device_pool._owned_local_layer_range()
+
+    def _effective_host_layer_num(self, device_pool=None) -> int:
+        """Number of layers the host pool allocates for this rank."""
+        device_pool = device_pool or self.device_pool
+        if not self._is_device_layer_sharded(device_pool):
+            return device_pool.layer_num
+        shard_size = device_pool.layer_shard_size
+        return (device_pool.layer_num + shard_size - 1) // shard_size
+
+    def _is_device_layer_owned(self, device_pool, layer_id: int) -> bool:
+        start, end = self._device_owned_layer_range(device_pool)
+        return start <= layer_id < end
+
+    def _host_layer_index(self, layer_id: int, device_pool=None) -> int:
+        """Map a full local device layer id to its compacted host-buffer slot."""
+        start, _ = self._device_owned_layer_range(device_pool)
+        return layer_id - start
+
+    def _owned_device_layer_ids(self, device_pool) -> list[int]:
+        start, end = self._device_owned_layer_range(device_pool)
+        return list(range(start, end))
 
     @abc.abstractmethod
     def init_kv_buffer(self):
@@ -154,9 +267,28 @@ class HostKVCache(abc.ABC):
             (self.size,), dtype=torch.uint8, device=self.device
         )
         self.free_slots = torch.arange(self.size, dtype=torch.int64)
+        # Keep freed chunks aside and consume them lazily from alloc() to avoid
+        # concatenating a large free-list on every host-pool free.
+        self.release_slots = []
+        self.num_release_slots = 0
+        # Per-slot flag used to detect double-free.
+        # slot_used[k] is true if slot k is allocated.
+        self.slot_used = torch.zeros(self.size, dtype=torch.bool)
 
     def available_size(self):
-        return len(self.free_slots)
+        return len(self.free_slots) + self.num_release_slots
+
+    def _merge_release_slots(self):
+        if self.num_release_slots == 0:
+            return
+
+        if len(self.free_slots) == 0 and len(self.release_slots) == 1:
+            self.free_slots = self.release_slots[0]
+        else:
+            self.free_slots = torch.cat([self.free_slots, *self.release_slots])
+
+        self.release_slots = []
+        self.num_release_slots = 0
 
     @synchronized
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:
@@ -166,12 +298,31 @@ class HostKVCache(abc.ABC):
         if need_size > self.available_size():
             return None
 
+        if need_size > len(self.free_slots):
+            self._merge_release_slots()
+
         select_index = self.free_slots[:need_size]
         self.free_slots = self.free_slots[need_size:]
+
+        assert not self.slot_used[select_index].any(), (
+            f"Double-alloc detected: slots already allocated: "
+            f"{select_index[self.slot_used[select_index]].tolist()}."
+        )
+        self.slot_used[select_index] = True
 
         return select_index
 
     @synchronized
     def free(self, indices: torch.Tensor) -> int:
-        self.free_slots = torch.cat([self.free_slots, indices.cpu()])
+        indices_cpu = indices.cpu()
+        if indices_cpu.numel() == 0:
+            return 0
+
+        assert self.slot_used[indices_cpu].all(), (
+            f"Double-free detected: slots not currently allocated: "
+            f"{indices_cpu[~self.slot_used[indices_cpu]].tolist()}."
+        )
+        self.slot_used[indices_cpu] = False
+        self.release_slots.append(indices_cpu)
+        self.num_release_slots += len(indices_cpu)
         return len(indices)

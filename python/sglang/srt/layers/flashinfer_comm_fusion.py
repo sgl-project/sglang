@@ -13,8 +13,7 @@ from sglang.srt.distributed import (
     get_tp_group,
 )
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
-from sglang.srt.runtime_context import get_parallel
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import (
     ceil_align,
     get_cuda_driver_bindings,
@@ -35,16 +34,10 @@ _flashinfer_allreduce_unavailable = False
 _flashinfer_create_workspace_supports_group = False
 _flashinfer_create_workspace_supports_comm_backend = False
 _flashinfer_allreduce_supports_trigger_completion = False
-_mnnvl_non_blackwell_fallback_logged = False
 
 
 def _mnnvl_supported(is_multi_node: bool) -> bool:
-    """Whether the mnnvl backend is usable on the current system.
-
-    mnnvl runs on Blackwell (SM10x) for both single- and multi-node, and on
-    SM90 for single-node only. Multi-node mnnvl on non-Blackwell is not
-    supported and must fall back to trtllm.
-    """
+    """Whether the mnnvl backend is usable on the current system."""
     if is_sm100_supported():
         return True
     return is_sm90_supported() and not is_multi_node
@@ -52,21 +45,33 @@ def _mnnvl_supported(is_multi_node: bool) -> bool:
 
 def _resolve_backend(backend: str, is_multi_node: bool = False) -> str:
     """Resolve the requested FlashInfer allreduce fusion backend."""
-    global _mnnvl_non_blackwell_fallback_logged
+    if not (is_sm90_supported() or is_sm100_supported()):
+        raise ValueError(
+            "FlashInfer allreduce fusion requires SM90 or SM10X NVIDIA GPUs."
+        )
 
     if backend == "auto":
-        # Prefer mnnvl wherever it is supported (any Blackwell system, or SM90
-        # single-node); fall back to trtllm otherwise.
-        return "mnnvl" if _mnnvl_supported(is_multi_node) else "trtllm"
+        if is_multi_node:
+            if is_sm100_supported():
+                return "mnnvl"
+            raise ValueError(
+                "FlashInfer allreduce fusion does not support multi-node on "
+                "non-Blackwell systems."
+            )
+        if is_sm100_supported():
+            return "mnnvl"
+        return "trtllm"
+
+    if backend == "trtllm" and is_multi_node:
+        raise ValueError(
+            "FlashInfer allreduce fusion trtllm backend supports single-node only."
+        )
 
     if backend == "mnnvl" and not _mnnvl_supported(is_multi_node):
-        if not _mnnvl_non_blackwell_fallback_logged:
-            logger.info(
-                "FlashInfer allreduce fusion: forcing trtllm backend "
-                "(mnnvl requires a Blackwell system, or SM90 single-node)."
-            )
-            _mnnvl_non_blackwell_fallback_logged = True
-        return "trtllm"
+        raise ValueError(
+            "FlashInfer allreduce fusion mnnvl backend requires a Blackwell "
+            "system, or SM90 single-node."
+        )
     return backend
 
 
@@ -198,11 +203,11 @@ if is_flashinfer_available():
 #   trtllm    | Yes   | Yes   | Yes         | Yes         | No         |
 #   mnnvl     | Yes   | Yes   | Single-node | Yes         | Blackwell  |
 #
-# mnnvl runs on any Blackwell GPU (SM10x) for both single- and multi-node, and
-# on SM90 for single-node only. auto resolves to mnnvl wherever it is supported
-# and to trtllm otherwise. An explicit mnnvl request on an unsupported
-# configuration (e.g. SM90 multi-node) falls back to trtllm (see
-# _resolve_backend).
+# FlashInfer allreduce fusion requires SM90 or SM10X. auto resolves to mnnvl
+# on Blackwell (SM100/SM103) systems (single- and multi-node) and to trtllm on
+# SM90 single-node systems. SM90 multi-node and non-SM90/SM10X configurations
+# are rejected. Either mnnvl or trtllm can be requested explicitly on
+# single-node systems, and mnnvl additionally on Blackwell multi-node.
 
 
 def is_flashinfer_allreduce_unavailable() -> bool:
@@ -574,14 +579,22 @@ class FlashInferWorkspaceManager:
                 self._logged_init = False
 
 
-_attn_tp_workspace_manager = FlashInferWorkspaceManager()
-_moe_tp_workspace_manager = FlashInferWorkspaceManager()
-
-
 def _get_workspace_manager(use_attn_tp_group: bool) -> FlashInferWorkspaceManager:
-    return (
-        _attn_tp_workspace_manager if use_attn_tp_group else _moe_tp_workspace_manager
+    """The per-group fusion workspace manager; the instances live on
+    ``ctx.resources`` (one per comm group, created lazily)."""
+    from sglang.srt.runtime_context import get_resources
+
+    buffers = get_resources().buffers
+    name = (
+        "flashinfer_fusion_attn_tp_workspace"
+        if use_attn_tp_group
+        else "flashinfer_fusion_moe_tp_workspace"
     )
+    manager = buffers.get(name)
+    if manager is None:
+        manager = FlashInferWorkspaceManager()
+        buffers[name] = manager
+    return manager
 
 
 def _sync_allreduce_unavailable_across_tp():
@@ -659,7 +672,7 @@ def ensure_workspace_initialized(
     token_num = token_num or max_token_num
     group_key = (device_group, cpu_group)
     effective_dtype = dtype or torch.bfloat16
-    server_args = get_global_server_args()
+    server_args = get_server_args()
     backend = resolve_flashinfer_allreduce_fusion_backend(server_args)
     if backend is None:
         return False
@@ -847,11 +860,13 @@ def pre_initialize_workspaces(
 
 
 def cleanup_flashinfer_workspace():
-    global _attn_tp_workspace_manager, _moe_tp_workspace_manager
-    if _attn_tp_workspace_manager is not None:
-        _attn_tp_workspace_manager.cleanup()
-    if (
-        _moe_tp_workspace_manager is not None
-        and _moe_tp_workspace_manager is not _attn_tp_workspace_manager
+    from sglang.srt.runtime_context import get_resources
+
+    buffers = get_resources().buffers
+    for name in (
+        "flashinfer_fusion_attn_tp_workspace",
+        "flashinfer_fusion_moe_tp_workspace",
     ):
-        _moe_tp_workspace_manager.cleanup()
+        manager = buffers.get(name)
+        if manager is not None:
+            manager.cleanup()

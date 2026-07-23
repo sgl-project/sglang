@@ -211,7 +211,7 @@ def init_process_dst(
                 str(base_gpu_id),
                 "--tp-size",
                 str(tp_size),
-                "--cuda-graph-max-bs",
+                "--cuda-graph-max-bs-decode",
                 2,
                 "--tokenizer-path",
                 model_name,
@@ -302,7 +302,7 @@ def test_load_weights_from_remote_instance(
         try:
             key, value = param_queue.get(timeout=5)
             results[key] = value
-        except Exception as e:
+        except Exception:
             if all(not p.is_alive() for p in context.processes):
                 break
 

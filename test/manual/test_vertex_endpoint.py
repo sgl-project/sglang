@@ -26,7 +26,7 @@ class TestVertexEndpoint(CustomTestCase):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--cuda-graph-max-bs", 2],
+            other_args=["--cuda-graph-max-bs-decode", 2],
         )
 
     @classmethod

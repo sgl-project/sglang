@@ -55,6 +55,8 @@ class LTXVideoVAEArchConfig(VAEArchConfig):
     # Native LTX variant metadata.
     ltx_variant: str = "ltx_2"
     condition_encoder_subdir: str = ""
+    video_encoder_variant: str = "ltx_2"
+    video_encoder_config: dict[str, Any] = field(default_factory=dict)
     video_decoder_variant: str = "ltx_2"
     video_decoder_config: dict[str, Any] = field(default_factory=dict)
 

@@ -23,8 +23,14 @@
 //   accuracyLabels     [key, label, unit][] — the eval set shown in the
 //                      benchmark card + "⚡ Reproduce". NO engine default:
 //                      required whenever benchmarks carry accuracy data
+//   latencyPercentile  optional, TEMPORARY — "Mean" | "P50" (default "P50"); the
+//                      percentile the TTFT/TPOT values are, shown as "TTFT (<pct>)".
+//                      A benchmarks entry may carry its own latencyPercentile to
+//                      override the page value per cell (entry → config → "P50").
+//                      Legacy "Mean" data is being re-measured to P50; drop once done
 //   multiNodeHints     optional — {[hwId]: string[]} prepended as `# ...` lines
-//   dockerImages       optional — per-hw image for `docker run` mode
+//   dockerImages       optional — `docker run` image, keyed by `hw|quant`
+//                      then `hw`; falls back to `lmsysorg/sglang:dev`
 //   github             optional — "Submit verified cell" issue-template overrides
 //   playgroundFeatures optional — consumed by _playground.jsx (see its header)
 //
@@ -500,8 +506,9 @@ export const Deployment = ({ config, benchmarks }) => {
 
     let cmd;
     if (mode === "docker") {
-      // Image picked by hardware; falls back to `:dev` if unmapped.
-      const image = (config.dockerImages && config.dockerImages[sel.hw]) || "lmsysorg/sglang:dev";
+      // Image keyed by `hw|quant` (most specific) then `hw`; `:dev` if unmapped.
+      const di = config.dockerImages || {};
+      const image = di[`${sel.hw}|${sel.quant}`] || di[sel.hw] || "lmsysorg/sglang:dev";
       const portFlag = flags.find((x) => x.split(/[\s=]/)[0] === "--port");
       const servePort = portFlag ? portFlag.slice("--port".length).trim() : "{{PORT}}";
       const vendorOf = (hwId) => {
@@ -572,11 +579,14 @@ export const Deployment = ({ config, benchmarks }) => {
   const renderBenchmarkCard = (entry) => {
     // [key, label, unit, compute?]. Optional compute(measurement) supplies
     // derived metrics (preferred over measurement[key] when present).
+    const pct = (entry && entry.latencyPercentile) || config.latencyPercentile || "P50";
     const SPEED_LABELS = [
-      ["ttft_ms",                "TTFT",            "ms"],
-      ["tpot_ms",                "TPOT",            "ms"],
-      ["tokens_per_sec_per_gpu", "tokens/sec/GPU",  ""],
-      ["interactivity",          "interactivity",   "tok/s",
+      ["ttft_ms",                `TTFT (${pct})`,      "ms"],
+      ["tpot_ms",                `TPOT (${pct})`,      "ms"],
+      // throughput per gpu = total(input+output)/elapsed/GPU;
+      // stored directly in the benchmarks file (= output tok/s/GPU × (isl+osl)/osl).
+      ["tokens_per_sec_per_gpu", "throughput per gpu", "tok/s"],
+      ["interactivity",          "interactivity",   "tokens/s/user",
         (m) => (m.tpot_ms != null && m.tpot_ms !== 0)
           ? Math.round((1000 / m.tpot_ms) * 10) / 10
           : null],
@@ -666,7 +676,11 @@ export const Deployment = ({ config, benchmarks }) => {
             ])}
           </div>
           {legend && (
-            <div style={s.benchLegend}>{legend}</div>
+            <div style={s.benchLegend}>
+              {(Array.isArray(legend) ? legend : [legend]).map((line, i) => (
+                <div key={`legend-${i}`}>{line}</div>
+              ))}
+            </div>
           )}
         </div>
       );
@@ -691,7 +705,10 @@ export const Deployment = ({ config, benchmarks }) => {
       });
       return { title: "Speed", sharedText, colHeaders, rows,
                colCount: measurements.length,
-               legend: "interactivity = 1000 / TPOT(ms)" };
+               legend: [
+                 `throughput per gpu = (input+output tokens)/elapsed/GPU`,
+                 `interactivity = 1000/TPOT(ms) (tokens/s/user)`,
+               ] };
     };
 
     // One row per ACCURACY_LABELS entry with a non-null value; single value column.

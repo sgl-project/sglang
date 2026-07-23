@@ -1,0 +1,93 @@
+"""Test FlashInfer Cutlass BF16 MoE + FlashInfer alltoall on B200 with DP attention.
+
+Config: Qwen3-30B-A3B, B200x4, EP=4 DP=4, flashinfer cutlass + flashinfer a2a.
+"""
+
+import os
+import unittest
+from types import SimpleNamespace
+
+import torch
+
+from sglang.srt.utils import kill_process_tree
+from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.run_eval import run_eval
+from sglang.test.test_utils import (
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+    DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
+    popen_launch_server,
+)
+
+register_cuda_ci(
+    est_time=600,
+    stage="extra-b",
+    runner_config="4-gpu-b200",
+    disabled="Waived until sgl-kernel fix is released",
+)
+
+MODEL = os.environ.get("QWEN3_30B_A3B_MODEL_PATH", "Qwen/Qwen3-30B-A3B")
+
+SKIP_TEST = torch.cuda.get_device_capability() < (10, 0)
+SKIP_REASON = "Requires Blackwell (B200, sm_100a) or above."
+
+
+@unittest.skipIf(SKIP_TEST, SKIP_REASON)
+class TestFlashinferCutlassFlashinferA2A(CustomTestCase):
+    """FlashInfer Cutlass BF16 MoE + FlashInfer one-sided alltoall + DP4 EP4 on B200."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = MODEL
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH * 3,
+            other_args=[
+                "--trust-remote-code",
+                "--tp",
+                "4",
+                "--ep-size",
+                "4",
+                "--dp",
+                "4",
+                "--enable-dp-attention",
+                "--enable-dp-lm-head",
+                "--moe-runner-backend",
+                "flashinfer_cutlass",
+                "--moe-a2a-backend",
+                "flashinfer",
+                "--max-prefill-tokens",
+                "4096",
+                "--disable-radix-cache",
+                "--disable-flashinfer-autotune",
+                "--watchdog-timeout",
+                "900",
+            ],
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def test_gsm8k(self):
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            eval_name="gsm8k",
+            num_examples=1319,
+            max_tokens=10240,
+            repeat=1,
+            num_threads=1319,
+            num_shots=8,
+            temperature=0.6,
+            top_p=0.95,
+            top_k=20,
+        )
+        metrics = run_eval(args)
+        print(metrics)
+        self.assertGreater(metrics["score"], 0.90)
+
+
+if __name__ == "__main__":
+    unittest.main()

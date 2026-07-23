@@ -25,6 +25,7 @@ from sglang.srt.configs.mamba_utils import (
     Mamba2StateShape,
     mamba2_state_dtype,
 )
+from sglang.srt.runtime_context import get_parallel
 
 logger = logging.get_logger(__name__)
 
@@ -62,7 +63,6 @@ class Lfm2Config(HFLfm2Config):
         LFM2 uses ShortConv layers with a small fixed-size cache (kernel_size - 1).
         Unlike full Mamba2 models, LFM2 only uses the conv state, not SSM temporal state.
         """
-        from sglang.srt.layers.dp_attention import get_attention_tp_size
 
         conv_layer_ids = self.linear_layer_ids
         if not conv_layer_ids:
@@ -71,9 +71,9 @@ class Lfm2Config(HFLfm2Config):
         hidden_size = self.hidden_size
         conv_kernel = int(self.conv_L_cache)
 
-        # get_attention_tp_size() requires initialization, default to 1 if not available
+        # get_parallel().attn_tp_size requires initialization, default to 1 if not available
         try:
-            tp_size = get_attention_tp_size()
+            tp_size = get_parallel().attn_tp_size
         except (AssertionError, RuntimeError):
             tp_size = 1
 

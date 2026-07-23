@@ -5,11 +5,13 @@ import unittest
 from typing import List, Tuple
 
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.simple_eval_gsm8k import get_one_example
-from sglang.test.simple_eval_mixed_prefix_gsm8k import MixedPrefixGSM8KEval
+from sglang.test.simple_eval_mixed_prefix_gsm8k import (
+    MixedPrefixGSM8KEval,
+    get_one_example,
+)
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-b-test-cpu")
+register_cpu_ci(est_time=5, suite="base-c-test-cpu")
 
 
 def _write_synthetic_dataset(path: str, n: int) -> None:

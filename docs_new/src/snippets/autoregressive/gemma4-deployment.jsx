@@ -75,7 +75,7 @@ export const Gemma4Deployment = () => {
       e4b: { tp: 1, mem: 0.9 },
       '12b': { tp: 1, mem: 0.9 },
       '31b': { tp: 1, mem: 0.9 },
-      '26b-a4b': { tp: 1, mem: 0.9 },
+      '26b-a4b': { tp: 1, mem: 0.75 },
     },
     b300: {
       e2b: { tp: 1, mem: 0.9 },

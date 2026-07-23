@@ -5,7 +5,10 @@ import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple
 
-from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.eplb.expert_distribution import (
+    _ExpertDistributionRecorderNoop,
+    get_global_expert_distribution_recorder,
+)
 from sglang.srt.layers.dp_attention import get_is_extend_in_batch
 from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
@@ -36,7 +39,7 @@ from functools import lru_cache
 
 import torch
 
-from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
+from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
 
 # Blockwise quantization group sizes: number of elements sharing one scale factor
 FP8_BLOCK_SIZE = 128
@@ -53,7 +56,15 @@ logger = logging.getLogger(__name__)
 
 def _should_record_expert_distribution() -> bool:
     recorder = get_global_expert_distribution_recorder()
-    return recorder.recording or torch.get_device_module().is_current_stream_capturing()
+    if recorder.recording:
+        return True
+    # While capturing, only bake in the count kernel if a recorder is actually
+    # configured (non-Noop); otherwise it would replay as dead work every decode
+    # step. Configured recorders still bake it in, so start_record() works after
+    # capture.
+    if torch.get_device_module().is_current_stream_capturing():
+        return not isinstance(recorder, _ExpertDistributionRecorderNoop)
+    return False
 
 
 class MoriEPPDispatchHooks(DeepEPPDispatchHooks):
@@ -145,6 +156,7 @@ class CombineDtype(Enum):
     bf16 = "bfloat16"
     fp8 = "float8_blockwise"
     fp8_direct_cast = "float8_direct_cast"
+    fp4 = "fp4_blockwise"  # packed E2M1, blockwise-scaled; ~half the combine transport of fp8
 
 
 @dataclass(frozen=True)
@@ -210,6 +222,7 @@ def init_mori_op(
     dispatch_dtype=DispatchDtype.bf16,
     combine_dtype=CombineDtype.bf16,
     enable_sdma=False,
+    use_external_inp_buf=True,
 ):
 
     import mori
@@ -285,11 +298,14 @@ def init_mori_op(
         combine_quant_type = "fp8_blockwise"
     elif combine_dtype == CombineDtype.fp8_direct_cast:
         combine_quant_type = "fp8_direct_cast"
+    elif combine_dtype == CombineDtype.fp4:
+        combine_quant_type = "fp4_blockwise"
 
     logger.info(
         f"[MORI init] {world_size=} {rank=} {hidden_size=} {params_dtype=} "
         f"{num_max_dispatch_tokens_per_rank=} {num_local_experts=} "
         f"{router_topk=} {mode=} {dispatch_dtype=} {combine_dtype=} "
+        f"{use_external_inp_buf=} "
     )
 
     def check_mori_compatibility(kwargs: dict) -> None:
@@ -321,6 +337,7 @@ def init_mori_op(
         max_total_recv_tokens=get_int_env_var(
             "SGLANG_MORI_PREALLOC_MAX_RECV_TOKENS", 0
         ),
+        use_external_inp_buf=use_external_inp_buf,
         kernel_type=kernel_type,
         gpu_per_node=gpu_per_node,
         rdma_block_num=rdma_block_num,
@@ -389,6 +406,7 @@ class _MoriEPDispatcherImplBase:
         )
 
         self.enable_sdma = get_bool_env_var("MORI_ENABLE_SDMA", "false")
+        self.use_external_inp_buf = True
 
         self._mori_op = None
         self.dispatch_dtype = DispatchDtype.bf16
@@ -418,6 +436,7 @@ class _MoriEPDispatcherImplBase:
                 self.dispatch_dtype,
                 self.combine_dtype,
                 self.enable_sdma,
+                self.use_external_inp_buf,
             )
         return self._mori_op
 
@@ -455,12 +474,14 @@ class _MoriEPDispatcherImplBase:
                     self.combine_dtype = CombineDtype.bf16
                 elif combine_dtype == "fp8_direct_cast":
                     self.combine_dtype = CombineDtype.fp8_direct_cast
+                elif combine_dtype == "fp4":
+                    self.combine_dtype = CombineDtype.fp4
         elif "SGLANG_MORI_FP8_COMB" in os.environ:
             # Deprecated: will be removed in a future release
             logger.warning_once(
                 "SGLANG_MORI_FP8_COMB is deprecated "
                 "and will be removed in a future release. "
-                "Use SGLANG_MORI_COMBINE_DTYPE=auto|bf16|fp8|fp8_direct_cast instead."
+                "Use SGLANG_MORI_COMBINE_DTYPE=auto|bf16|fp8|fp4|fp8_direct_cast instead."
             )
             if get_bool_env_var("SGLANG_MORI_FP8_COMB", "False"):
                 self.combine_dtype = CombineDtype.fp8
@@ -511,6 +532,9 @@ class _MoriEPDispatcherImplBase:
     def clear_overlap_args(self) -> None:
         self.overlap_args = None
         self.meta_overlap_args = None
+
+    def _combine_kwargs(self, hidden_states: torch.Tensor) -> dict:
+        return {}
 
 
 class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
@@ -773,7 +797,10 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
                     if self.enable_sdma
                     else self.mori_op.combine
                 )
-                combined_hidden_states = combine_fn(hidden_states, None, topk_ids)[0]
+                combine_kwargs = self._combine_kwargs(hidden_states)
+                combined_hidden_states = combine_fn(
+                    hidden_states, None, topk_ids, **combine_kwargs
+                )[0]
                 if self.enable_sdma:
                     self.mori_op.combine_recv()
 
@@ -786,8 +813,9 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
             combined_hidden_states.record_stream(comm_stream)
 
         else:
+            combine_kwargs = self._combine_kwargs(hidden_states)
             combined_hidden_states = self.mori_op.combine(
-                hidden_states, None, topk_ids
+                hidden_states, None, topk_ids, **combine_kwargs
             )[0]
 
         return combined_hidden_states, done_event

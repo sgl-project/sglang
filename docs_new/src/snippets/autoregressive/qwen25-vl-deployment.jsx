@@ -6,7 +6,8 @@ export const Qwen25VLDeployment = () => {
       items: [
         { id: 'mi300x', label: 'MI300X', default: true },
         { id: 'mi325x', label: 'MI325X', default: false },
-        { id: 'mi355x', label: 'MI355X', default: false }
+        { id: 'mi355x', label: 'MI355X', default: false },
+        { id: 'xeon', label: 'XEON', default: false }
       ]
     },
     modelsize: {
@@ -33,25 +34,29 @@ export const Qwen25VLDeployment = () => {
       baseName: '72B',
       mi300x: { tp: 8, ep: 0 },
       mi325x: { tp: 8, ep: 0 },
-      mi355x: { tp: 8, ep: 0 }
+      mi355x: { tp: 8, ep: 0 },
+      xeon: { tp: 6, ep: 0 }
     },
     '32b': {
       baseName: '32B',
       mi300x: { tp: 2, ep: 0 },
       mi325x: { tp: 2, ep: 0 },
-      mi355x: { tp: 2, ep: 0 }
+      mi355x: { tp: 2, ep: 0 },
+      xeon: { tp: 6, ep: 0 }
     },
     '7b': {
       baseName: '7B',
       mi300x: { tp: 1, ep: 0 },
       mi325x: { tp: 1, ep: 0 },
-      mi355x: { tp: 1, ep: 0 }
+      mi355x: { tp: 1, ep: 0 },
+      xeon: { tp: 3, ep: 0 }
     },
     '3b': {
       baseName: '3B',
       mi300x: { tp: 1, ep: 0 },
       mi325x: { tp: 1, ep: 0 },
-      mi355x: { tp: 1, ep: 0 }
+      mi355x: { tp: 1, ep: 0 },
+      xeon: { tp: 3, ep: 0 }
     }
   };
 
@@ -72,6 +77,10 @@ export const Qwen25VLDeployment = () => {
 
     let cmd = 'python -m sglang.launch_server \\\n';
     cmd += `  --model ${modelName}`;
+
+    if (hardware === 'xeon') {
+      cmd += ` \\\n  --device cpu \\\n  --disable-overlap-schedule`;
+    }
 
     if (hwConfig.tp > 1) {
       cmd += ` \\\n  --tp ${hwConfig.tp}`;

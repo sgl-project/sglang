@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import copy
-from collections import deque
-from typing import Deque, Generic, List, Optional, TypeVar
+import logging
+from typing import Callable, Generic, List, Optional, TypeVar
 
-import zmq
+logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
@@ -22,46 +22,49 @@ class FanOutCommunicator(Generic[T]):
     Only one request is in-flight at any time in either mode.
     """
 
-    def __init__(self, sender: zmq.Socket, fan_out: int, mode="queueing"):
-        self._sender = sender
+    def __init__(
+        self,
+        send: Callable[[T], None],
+        fan_out: int,
+        mode: str = "queueing",
+    ):
+        self._send = send
         self._fan_out = fan_out
         self._mode = mode
         self._result_event: Optional[asyncio.Event] = None
         self._result_values: Optional[List[T]] = None
-        self._ready_queue: Deque[asyncio.Event] = deque()
+        self._result_fan_out: Optional[int] = None
+        self._queueing_lock = asyncio.Lock()
 
         assert mode in ["queueing", "watching"]
 
     async def queueing_call(self, obj: T):
-        ready_event = asyncio.Event()
-        if self._result_event is not None or len(self._ready_queue) > 0:
-            self._ready_queue.append(ready_event)
-            await ready_event.wait()
-            assert self._result_event is None
-            assert self._result_values is None
+        # asyncio.Lock is FIFO-fair: a new caller cannot acquire while earlier
+        # callers are still waiting, so requests are strictly serialized in
+        # arrival order. It also releases on exception/cancellation, so a
+        # failed caller never blocks the callers queued behind it.
+        async with self._queueing_lock:
+            if obj is not None:
+                self._send(obj)
 
-        if obj is not None:
-            self._sender.send_pyobj(obj)
-
-        self._result_event = asyncio.Event()
-        self._result_values = []
-        await self._result_event.wait()
-        result_values = self._result_values
-        self._result_event = self._result_values = None
-
-        if len(self._ready_queue) > 0:
-            self._ready_queue.popleft().set()
-
-        return result_values
+            self._result_event = asyncio.Event()
+            self._result_values = []
+            self._result_fan_out = self._fan_out
+            await self._result_event.wait()
+            result_values = self._result_values
+            self._result_event = self._result_values = None
+            self._result_fan_out = None
+            return result_values
 
     async def watching_call(self, obj):
         if self._result_event is None:
             assert self._result_values is None
             self._result_values = []
             self._result_event = asyncio.Event()
+            self._result_fan_out = self._fan_out
 
             if obj is not None:
-                self._sender.send_pyobj(obj)
+                self._send(obj)
 
         # Capture local refs before await -- after event fires, the first
         # awakened coroutine clears shared state; later awaiters use local refs.
@@ -72,6 +75,7 @@ class FanOutCommunicator(Generic[T]):
         result_values = copy.deepcopy(values)
         if self._result_event is event:
             self._result_event = self._result_values = None
+            self._result_fan_out = None
         return result_values
 
     async def __call__(self, obj):
@@ -80,9 +84,22 @@ class FanOutCommunicator(Generic[T]):
         else:
             return await self.watching_call(obj)
 
+    def set_fan_out(self, fan_out: int):
+        self._fan_out = fan_out
+
     def handle_recv(self, recv_obj: T):
+        if (
+            self._result_values is None
+            or self._result_event is None
+            or self._result_fan_out is None
+        ):
+            logger.debug(
+                "Dropping communicator response without active waiter: %s",
+                type(recv_obj).__name__,
+            )
+            return
         self._result_values.append(recv_obj)
-        if len(self._result_values) == self._fan_out:
+        if len(self._result_values) == self._result_fan_out:
             self._result_event.set()
 
     @staticmethod

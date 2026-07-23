@@ -48,10 +48,11 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix, is_npu
+from sglang.srt.utils import add_prefix, is_npu, is_xpu
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 _is_npu = is_npu()
+_is_xpu = is_xpu()
 
 
 def _get_alibi_slopes(total_num_heads: int) -> torch.Tensor:
@@ -190,7 +191,9 @@ class BaiChuanAttention(nn.Module):
             alibi_slopes = _get_alibi_slopes(self.total_num_heads)
             alibi_slopes = alibi_slopes[head_start:head_end]
             self.alibi_slopes = torch.tensor(
-                alibi_slopes, dtype=dtype, device="npu" if _is_npu else "cuda"
+                alibi_slopes,
+                dtype=dtype,
+                device="npu" if _is_npu else "xpu" if _is_xpu else "cuda",
             )
         else:
             self.rotary_emb = get_rope(

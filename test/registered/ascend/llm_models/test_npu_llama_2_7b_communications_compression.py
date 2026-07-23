@@ -25,7 +25,7 @@ class TestLlama(GSM8KAscendMixin, CustomTestCase):
         32,
         "--attention-backend",
         "ascend",
-        "--cuda-graph-max-bs",
+        "--cuda-graph-max-bs-decode",
         32,
         "--tp-size",
         2,

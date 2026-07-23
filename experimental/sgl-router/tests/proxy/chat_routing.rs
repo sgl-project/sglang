@@ -90,6 +90,48 @@ async fn non_streaming_returns_200() {
     assert_eq!(v["choices"][0]["message"]["content"], "ok");
 }
 
+/// Edge counters fire through the real middleware: `requests_total` at entry +
+/// `responses_total` on exit, with matched-route/method labels. The unit tests
+/// call record_* directly, so this is the only check that the middleware is
+/// actually wired (MatchedPath -> record_ingress / record_response).
+#[tokio::test]
+async fn edge_counters_recorded_through_middleware() {
+    let worker = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let ctx = build_ctx_with_worker(&worker.url);
+    let app = build_router(ctx.clone());
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "tiny",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": false
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let _ = res.into_body().collect().await;
+
+    let m = ctx.metrics.render();
+    // intake — counted at entry by the middleware (the path unit tests miss)
+    assert!(
+        m.contains(r#"sgl_router_requests_total{route="/v1/chat/completions",method="POST"} 1"#),
+        "edge intake counter missing; got:\n{m}",
+    );
+    // response — counted on the way out by the middleware
+    assert!(
+        m.contains(
+            r#"sgl_router_responses_total{route="/v1/chat/completions",method="POST",status_code="200"} 1"#
+        ),
+        "edge response counter missing; got:\n{m}",
+    );
+}
+
 #[tokio::test]
 async fn non_streaming_upstream_unreachable_returns_502_unreachable() {
     // Bind a port, drop it — guarantees a closed/refused TCP destination.
@@ -288,7 +330,9 @@ async fn streaming_5xx_request_records_duration_and_status_but_not_ttft() {
         "TTFT must NOT be recorded for a non-2xx streaming response; got:\n{m}",
     );
     assert!(
-        m.contains(r#"sgl_router_responses_total{status_code="500"} 1"#),
+        m.contains(
+            r#"sgl_router_responses_total{route="/v1/chat/completions",method="POST",status_code="500"} 1"#
+        ),
         "the 500 status must be counted; got:\n{m}",
     );
     assert!(

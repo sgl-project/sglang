@@ -35,20 +35,23 @@ def is_two_stream_active(x: torch.Tensor) -> bool:
     return x.shape[0] <= lora_envs.SGLANG_TWO_STREAM_MAX_TOKENS.get()
 
 
-_LORA_SIDE_STREAM: Optional[torch.cuda.Stream] = None
+def supports_two_stream_dense_lora(lora_a: torch.Tensor, lora_b: torch.Tensor) -> bool:
+    """Keep the temporary shrink kernel within its safe combined-rank tile."""
+    return lora_a.shape[-2] <= 128 and lora_b.shape[-1] <= 64
+
+
+# One side stream per consumer stream: routed (main/capture) and InklingMoE's sink (alt
+# stream) run concurrently; sharing one side stream is a premature-reuse WAR -> IMA.
+_LORA_SIDE_STREAMS: dict[torch.cuda.Stream, torch.cuda.Stream] = {}
 
 
 def get_lora_side_stream() -> torch.cuda.Stream:
-    """Lazily allocate a single shared LoRA side stream.
-
-    Within one decode layer the three sites (qkv → attn → o_proj → moe_gate_up)
-    run sequentially, so one stream suffices and avoids extra graph-capture
-    nodes from per-site streams.
-    """
-    global _LORA_SIDE_STREAM
-    if _LORA_SIDE_STREAM is None:
-        _LORA_SIDE_STREAM = torch.cuda.Stream()
-    return _LORA_SIDE_STREAM
+    # Lazy creation is capture-safe: graph warmup runs on the capture stream
+    # (graph_capture() sets it), so every key exists before any capture region.
+    consumer = torch.cuda.current_stream()
+    if consumer not in _LORA_SIDE_STREAMS:
+        _LORA_SIDE_STREAMS[consumer] = torch.cuda.Stream()
+    return _LORA_SIDE_STREAMS[consumer]
 
 
 def init_lora_two_stream_resources(device: Optional[torch.device] = None) -> None:
@@ -92,6 +95,7 @@ _ORIGINAL_COLUMN_FORWARD: Optional[Callable] = None
 _ORIGINAL_REPLICATED_FORWARD: Optional[Callable] = None
 _ORIGINAL_MOE_LORA_FUNC: Optional[Callable] = None
 _ORIGINAL_FP4_MOE_LORA_FUNC: Optional[Callable] = None
+_ORIGINAL_BF16_MOE_LORA_FUNC: Optional[Callable] = None
 _INSTALLED: bool = False
 
 
@@ -123,6 +127,10 @@ def get_original_fp4_moe_lora_func() -> Callable:
     return _ORIGINAL_FP4_MOE_LORA_FUNC
 
 
+def get_original_bf16_moe_lora_func() -> Callable:
+    return _ORIGINAL_BF16_MOE_LORA_FUNC
+
+
 def install_two_stream_overrides() -> None:
     """Install the side-stream overlapped overrides if ``SGLANG_LORA_TWO_STREAM=1``.
 
@@ -132,14 +140,15 @@ def install_two_stream_overrides() -> None:
       2. ``RowParallelLinearWithLoRA.forward`` (O8 — o_proj LoRA shrink overlap)
       3. ``MergedColumnParallelLinearWithLoRA.forward`` (O9 — merged-column LoRA
          shrink overlap: dense gate_up + mamba in_proj_qkvz)
-      4. ``flashinfer_trtllm.fused_experts_none_to_experimental_sgl_trtllm_fp8_lora``
-         (O1 — MoE gate_up LoRA overlap)
+      4. ``lora_dispatch.fused_experts_none_to_experimental_sgl_trtllm_fp8_lora``
+         (O1 — MoE gate_up LoRA overlap), plus its fp4 (O1-fp4) and bf16
+         (O1-bf16) siblings
 
     The saved originals are exposed via :func:`get_original_qkv_forward`,
     :func:`get_original_row_forward`, :func:`get_original_moe_lora_func` so the
     new versions can fall back when their per-batch gate says single-stream.
     """
-    global _INSTALLED, _ORIGINAL_QKV_FORWARD, _ORIGINAL_ROW_FORWARD, _ORIGINAL_MERGED_FORWARD, _ORIGINAL_COLUMN_FORWARD, _ORIGINAL_REPLICATED_FORWARD, _ORIGINAL_MOE_LORA_FUNC, _ORIGINAL_FP4_MOE_LORA_FUNC
+    global _INSTALLED, _ORIGINAL_QKV_FORWARD, _ORIGINAL_ROW_FORWARD, _ORIGINAL_MERGED_FORWARD, _ORIGINAL_COLUMN_FORWARD, _ORIGINAL_REPLICATED_FORWARD, _ORIGINAL_MOE_LORA_FUNC, _ORIGINAL_FP4_MOE_LORA_FUNC, _ORIGINAL_BF16_MOE_LORA_FUNC
 
     if _INSTALLED:
         return
@@ -178,15 +187,20 @@ def install_two_stream_overrides() -> None:
 
     import sglang.srt.lora.trtllm_lora_temp.lora_dispatch as ft
     from sglang.srt.lora.trtllm_lora_temp.moe_overlap import (
+        fused_experts_none_to_experimental_sgl_trtllm_bf16_lora_two_stream,
         fused_experts_none_to_experimental_sgl_trtllm_fp4_lora_two_stream,
         fused_experts_none_to_experimental_sgl_trtllm_fp8_lora_two_stream,
     )
 
-    # O1 (FP8 Qwen) + O1-fp4 (NVFP4 Kimi): MoE gate_up LoRA overlap. Each patched
-    # fn falls back to its saved single-stream original for non-decode batches.
+    # O1 (FP8 Qwen) + O1-fp4 (NVFP4 Kimi) + O1-bf16 (unquantized Qwen): MoE gate_up
+    # LoRA overlap. Each patched fn falls back to its saved single-stream original
+    # for non-decode batches.
     _ORIGINAL_MOE_LORA_FUNC = ft.fused_experts_none_to_experimental_sgl_trtllm_fp8_lora
     _ORIGINAL_FP4_MOE_LORA_FUNC = (
         ft.fused_experts_none_to_experimental_sgl_trtllm_fp4_lora
+    )
+    _ORIGINAL_BF16_MOE_LORA_FUNC = (
+        ft.fused_experts_none_to_experimental_sgl_trtllm_bf16_lora
     )
     ft.fused_experts_none_to_experimental_sgl_trtllm_fp8_lora = (
         fused_experts_none_to_experimental_sgl_trtllm_fp8_lora_two_stream
@@ -194,12 +208,16 @@ def install_two_stream_overrides() -> None:
     ft.fused_experts_none_to_experimental_sgl_trtllm_fp4_lora = (
         fused_experts_none_to_experimental_sgl_trtllm_fp4_lora_two_stream
     )
+    ft.fused_experts_none_to_experimental_sgl_trtllm_bf16_lora = (
+        fused_experts_none_to_experimental_sgl_trtllm_bf16_lora_two_stream
+    )
 
     _INSTALLED = True
 
 
 __all__ = [
     "is_two_stream_active",
+    "supports_two_stream_dense_lora",
     "get_lora_side_stream",
     "init_lora_two_stream_resources",
     "get_original_qkv_forward",
@@ -209,5 +227,6 @@ __all__ = [
     "get_original_replicated_forward",
     "get_original_moe_lora_func",
     "get_original_fp4_moe_lora_func",
+    "get_original_bf16_moe_lora_func",
     "install_two_stream_overrides",
 ]
