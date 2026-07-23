@@ -14,3 +14,4 @@ mod environ;
 mod error;
 mod fsm;
 mod ids;
+mod message;
