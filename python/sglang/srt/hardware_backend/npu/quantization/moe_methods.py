@@ -21,9 +21,6 @@ from sglang.srt.hardware_backend.npu.moe.matmul import GroupedMatmul
 logger = logging.getLogger(__name__)
 
 
-MXFP4_BLOCK_SIZE = 32
-
-
 def _get_float8_e8m0fnu_dtype():
     return getattr(torch, "float8_e8m0fnu", None)
 
@@ -172,6 +169,12 @@ class NPUW4A4MXFP4MoEMethod(_NPUMoEMethodBase):
     def __init__(self):
         super().__init__(quant_config=None)
         self.matmul = GroupedMatmul()
+        fp4_dtype = _get_float4_e2m1fn_x2_dtype()
+        if fp4_dtype is None:
+            raise RuntimeError("NPU W4A4 MXFP4 MoE requires float4 support.")
+        self.hidden_states_quantizer = HiddenStatesDynamicQuant(
+            quant_dtype=fp4_dtype, use_mx_quant=True
+        )
 
     def process_weights_after_loading(
         self, layer: torch.nn.Module, weight_prefix: str
@@ -210,21 +213,16 @@ class NPUW4A4MXFP4MoEMethod(_NPUMoEMethodBase):
         weight_prefix: str,
         group_list_type: int,
     ) -> torch.Tensor:
-        fp4_dtype = _get_float4_e2m1fn_x2_dtype()
+        fp4_dtype = self.hidden_states_quantizer.quant_dtype
         e8m0_dtype = _get_float8_e8m0fnu_dtype()
-        if fp4_dtype is None or e8m0_dtype is None:
+        if e8m0_dtype is None:
             raise RuntimeError(
                 "NPU W4A4 MXFP4 MoE requires float4 and float8 E8M0 support."
             )
 
         if pertoken_scale is None:
-            hidden_states, pertoken_scale = torch.ops.npu.npu_dynamic_mx_quant(
-                hidden_states,
-                axis=1,
-                round_mode="rint",
-                dst_type=fp4_dtype,
-                block_size=MXFP4_BLOCK_SIZE,
-                scale_alg=None,
+            hidden_states, pertoken_scale = self.hidden_states_quantizer(
+                hidden_states
             )
         elif pertoken_scale is not None:
             pertoken_scale = pertoken_scale.reshape(

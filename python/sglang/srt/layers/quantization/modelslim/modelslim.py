@@ -16,10 +16,10 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
 )
 from sglang.srt.layers.quantization.modelslim.schemes import (
-    ModelSlimMXFP4MoE,
     ModelSlimMXFP4Scheme,
     ModelSlimMXFP4W4A8Scheme,
     ModelSlimMXFP8Scheme,
+    ModelSlimW4A4MXFP4MoE,
     ModelSlimW4A4Int4,
     ModelSlimW4A4Int4MoE,
     ModelSlimW4A8Int8MoE,
@@ -236,7 +236,7 @@ class ModelSlimConfig(QuantizationConfig):
         prefix: str,
     ):
         moe_quant_schemes = [
-            ("W4A4_MXFP4", ModelSlimMXFP4MoE),
+            ("W4A4_MXFP4", ModelSlimW4A4MXFP4MoE),
             ("W4A4_DYNAMIC", ModelSlimW4A4Int4MoE),
             ("W4A8_DYNAMIC", ModelSlimW4A8Int8MoE),
             ("W8A8_DYNAMIC", ModelSlimW8A8Int8MoE),
