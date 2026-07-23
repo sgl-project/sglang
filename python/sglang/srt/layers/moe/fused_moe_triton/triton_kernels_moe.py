@@ -30,7 +30,7 @@ if is_sm120_supported():
     update_opt_flags_constraints({"is_persistent": False})
 
 if is_cuda():
-    from sglang.kernels.ops.activation._jit_activation import gelu_and_mul, silu_and_mul
+    from sglang.kernels.ops.activation.activation import gelu_and_mul, silu_and_mul
 else:
     from sgl_kernel import gelu_and_mul, silu_and_mul
 

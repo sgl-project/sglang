@@ -10,7 +10,7 @@ from torch import nn
 from triton.language.extra import libdevice
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
-from sglang.kernels.ops.model.inkling.inkling_gate_topk_renorm import (
+from sglang.kernels.ops.moe.inkling_gate_topk_renorm import (
     ensure_gate_gemv_fused_scratch,
     inkling_gate_gemv,
     inkling_gate_gemv_fused,
