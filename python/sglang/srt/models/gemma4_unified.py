@@ -53,6 +53,7 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.gemma4_causal import Gemma4TextModel, pp_filter_load_weight
 from sglang.srt.models.gemma4_mm import Gemma4ForConditionalGeneration
+from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
@@ -147,12 +148,13 @@ class Gemma4UnifiedForConditionalGeneration(Gemma4ForConditionalGeneration):
         self.pp_group = get_pp_group()
         self.config = config
         self.quant_config = quant_config
+        self.enable_multimodal = get_server_args().enable_multimodal
 
         text_config = config.text_config
 
         # Encoder-free embedders are consumed only at the input-embedding stage,
         # so they live on the first PP rank only.
-        if self.pp_group.is_first_rank:
+        if self.pp_group.is_first_rank and self.enable_multimodal:
             self.vision_embedder = (
                 Gemma4UnifiedVisionEmbedder(config.vision_config)
                 if getattr(config, "vision_config", None) is not None
@@ -355,6 +357,15 @@ class Gemma4UnifiedForConditionalGeneration(Gemma4ForConditionalGeneration):
         loaded_params: Set[str] = set()
 
         for name, loaded_weight in weights:
+            if not self.enable_multimodal and any(
+                module_name in name
+                for module_name in (
+                    "vision_embedder.",
+                    "embed_vision.",
+                    "embed_audio.",
+                )
+            ):
+                continue
             name = re.sub(r"^model\.", "", name)
 
             if pp_filter_load_weight(
