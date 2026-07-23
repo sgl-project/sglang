@@ -756,6 +756,27 @@ def run_dp_sharded_mrope_vision_model(
                 dtype=input_dtype,
             )
 
+    # Single-image fast path: exactly one owner rank computed the embedding
+    # and the other tp_size-1 ranks are empty. The symmetric all-gather below
+    # would move tp_size x max_len_per_rank rows (i.e. (tp_size-1)/tp_size of
+    # it is padding) and allocate a tp_size-times-larger padded buffer. A
+    # broadcast from the owner delivers the identical embedding to every rank
+    # while moving one copy. Bit-identical to the all-gather path, which for a
+    # single image just reconstructs the owner's own rows.
+    if len(grid_thw_list) == 1:
+        owner_local = image_to_tp_rank[0]
+        n_tok = output_tokens_per_image[0]
+        if tp_rank_local == owner_local:
+            out_embeddings = image_embeds_local.contiguous()
+        else:
+            out_embeddings = torch.empty(
+                (n_tok, *image_embeds_local.shape[1:]),
+                dtype=input_dtype,
+                device=input_device,
+            )
+        get_parallel().attn_tp_group.broadcast(out_embeddings, src=owner_local)
+        return out_embeddings
+
     # The TP all-gather needs a common first dimension. Allocate that final
     # shape directly instead of materializing a padding fragment and catting it.
     image_embeds_local_padded = _pad_mrope_vision_embeddings_for_tp_gather(
