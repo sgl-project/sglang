@@ -828,6 +828,12 @@ class PrefillAdder:
         )
 
     def add_chunked_req(self, req: Req):
+        # A resumed chunked_req with no input left must keep ownership, but it
+        # must not run a zero-token forward: overlap futures expect one output
+        # per request (mixed HP+int2 KV page-aligned chunking can produce this).
+        if len(req.full_untruncated_fill_ids) - len(req.prefix_indices) <= 0:
+            return req
+
         if self.dllm_config is not None:
             _rem_tokens = self._get_dllm_remain_tokens()
         else:
@@ -844,6 +850,8 @@ class PrefillAdder:
                 if self.is_hybrid_swa:
                     return req
                 _rem_tokens = self.rem_chunk_tokens
+            if _rem_tokens <= 0:
+                return req
 
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
             req.prefix_indices
@@ -888,6 +896,8 @@ class PrefillAdder:
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
             req.prefix_indices
         )
+        if cand_extend_input_len <= 0:
+            return AddReqResult.OTHER
         paged_input = self.ceil_paged_tokens(cand_extend_input_len)
         # Shared Mamba pool: fold the new mamba state's shared-gap cost into the
         # budget gate so admission can't over-commit (0 for baseline / non-Mamba).
@@ -1001,6 +1011,11 @@ class PrefillAdder:
     def add_one_req(
         self, req: Req, has_chunked_req: bool, truncation_align_size: Optional[int]
     ):
+        # Nothing to prefill (fully cached); running a zero-token forward breaks
+        # the one-output-per-request contract of the overlap scheduler.
+        if len(req.full_untruncated_fill_ids) - len(req.prefix_indices) <= 0:
+            return AddReqResult.OTHER
+
         if (self.prefill_delayer_single_pass is not None) and (
             not self.prefill_delayer_single_pass.negotiate_should_allow_prefill(
                 local_prefillable=True,

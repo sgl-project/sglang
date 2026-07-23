@@ -57,6 +57,13 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.mem_cache.unified_kv_allocator import UnifiedInt2HPKVAllocator
+from sglang.srt.mem_cache.unified_kv_pool import (
+    UnifiedInt2HPKVPool,
+    compute_page_geometry,
+    resolve_hp_dtype,
+    resolve_scale_dtype,
+)
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import ServerArgs
@@ -849,6 +856,11 @@ class KVCacheConfigurator:
                     req_to_token_pool=req_to_token_pool,
                     mha_pool_class=mha_pool_class,
                 )
+            elif self._mixed_kv_int2_enabled():
+                token_to_kv_pool = self._build_unified_int2_kv_pool(
+                    max_total_num_tokens=sizes.max_total_num_tokens,
+                    req_to_token_pool=req_to_token_pool,
+                )
             else:
                 quant_method = None
                 if is_float4_e2m1fn_x2(self.kv_cache_dtype):
@@ -1331,6 +1343,101 @@ class KVCacheConfigurator:
         )
         return token_to_kv_pool
 
+    def _mixed_kv_int2_enabled(self) -> bool:
+        """True when --kv-cache-dtype int2 + SGLANG_ENABLE_MIXED_KV_WINDOWS route
+        this worker through the unified HP+int2 KV pool. Mirrors the gates in
+        ``ServerArgs._unified_mixed_kv_active`` and
+        ``pool_configurator._attention_supports_mixed_kv``."""
+        from sglang.srt.model_executor.pool_configurator import (
+            _attention_supports_mixed_kv,
+        )
+
+        if not envs.SGLANG_ENABLE_MIXED_KV_WINDOWS.get():
+            return False
+        if self.server_args.kv_cache_dtype != "int2":
+            return False
+        if not _attention_supports_mixed_kv(self.server_args):
+            return False
+        if self.is_hybrid_swa:
+            return False
+        if self.server_args.disaggregation_mode not in (None, "null"):
+            return False
+        if self.server_args.speculative_algorithm is not None:
+            return False
+        hp_window_tokens = (
+            envs.SGLANG_MIXED_KV_PREFIX_TOKENS.get()
+            + envs.SGLANG_MIXED_KV_RECENT_TOKENS.get()
+        )
+        if hp_window_tokens <= 0:
+            logger.warning(
+                "Mixed KV windows enabled but both prefix/recent windows are "
+                "zero. Falling back to the standard quantized KV cache."
+            )
+            return False
+        return True
+
+    def _build_unified_int2_kv_pool(
+        self, *, max_total_num_tokens: int, req_to_token_pool: ReqToTokenPool
+    ) -> KVCache:
+        hp_dtype = resolve_hp_dtype(envs.SGLANG_MIXED_KV_HP_DTYPE.get())
+        scale_dtype = resolve_scale_dtype(envs.SGLANG_MIXED_KV_SCALE_DTYPE.get())
+        _, n_q = compute_page_geometry(hp_dtype)
+        # ``--page-size`` for the unified path is set by
+        # ``ServerArgs._handle_page_size`` to equal ``N_Q``; validate so a
+        # stale value here surfaces immediately.
+        assert self.page_size == n_q, (
+            f"Unified mixed KV requires page_size={n_q} (= N_Q), "
+            f"got page_size={self.page_size}"
+        )
+        # +1 quant page for the reserved padded-write page 0.
+        num_quant_pages = (max_total_num_tokens + n_q - 1) // n_q + 1
+        # HP-prefix pool: default to 16x max_req_slots * P (rounded up to
+        # N_Q). 0 disables HP-prefix caching.
+        p_tokens = envs.SGLANG_MIXED_KV_PREFIX_TOKENS.get()
+        hp_prefix_pool = envs.SGLANG_MIXED_KV_HP_PREFIX_POOL_TOKENS.get()
+        if hp_prefix_pool <= 0:
+            hp_prefix_pool = req_to_token_pool.size * p_tokens * 16
+        hp_prefix_pool = (hp_prefix_pool + n_q - 1) // n_q * n_q
+        logger.info(
+            "Enable unified mixed KV (int2): prefix=%s recent=%s "
+            "flush_interval=%s num_quant_pages=%s N_Q=%s hp_dtype=%s "
+            "scale_dtype=%s max_total_num_tokens=%s max_req_slots=%s "
+            "hp_prefix_pool_tokens=%s",
+            p_tokens,
+            envs.SGLANG_MIXED_KV_RECENT_TOKENS.get(),
+            n_q,
+            num_quant_pages,
+            n_q,
+            envs.SGLANG_MIXED_KV_HP_DTYPE.get(),
+            envs.SGLANG_MIXED_KV_SCALE_DTYPE.get(),
+            max_total_num_tokens,
+            req_to_token_pool.size,
+            hp_prefix_pool,
+        )
+        return UnifiedInt2HPKVPool(
+            num_quant_pages=num_quant_pages,
+            num_hp_prefix_slots=hp_prefix_pool,
+            hp_dtype=hp_dtype,
+            hp_prefix_tokens=p_tokens,
+            hp_recent_tokens=envs.SGLANG_MIXED_KV_RECENT_TOKENS.get(),
+            dtype=self.server_args.kv_cache_dtype,
+            head_num=self.model_config.get_num_kv_heads(get_parallel().attn_tp_size),
+            head_dim=self.model_config.head_dim,
+            v_head_dim=self.model_config.v_head_dim,
+            layer_num=self.layer_info.num_effective_layers,
+            device=self.device,
+            enable_memory_saver=self.server_args.enable_memory_saver,
+            # NOTE: row 0 of req_to_token is the cuda-graph padding row, so
+            # real slot ids run [1, size]; size every per-slot table by the
+            # actual row count, not `.size`.
+            max_req_slots=req_to_token_pool.req_to_token.shape[0],
+            start_layer=self.layer_info.start_layer,
+            end_layer=self.layer_info.end_layer,
+            model_dtype=self.model_dtype,
+            kv_cache_quant_group_size=self.server_args.kv_cache_quant_group_size,
+            scale_dtype=scale_dtype,
+        )
+
     def _build_mha_kv_pool(
         self, *, max_total_num_tokens: int, mha_pool_class: type, quant_method=None
     ) -> KVCache:
@@ -1347,6 +1454,16 @@ class KVCacheConfigurator:
             pool_kwargs["quant_method"] = quant_method
         else:
             pool_kwargs["post_capture_active"] = self.post_capture_kv_active
+        if self.server_args.kv_cache_dtype == "int2":
+            # Plain (non-mixed) int2 pool: scale/zero dtype is configurable via
+            # SGLANG_MIXED_KV_SCALE_DTYPE (defaults to float32).
+            pool_kwargs["model_dtype"] = self.model_dtype
+            pool_kwargs["kv_cache_quant_group_size"] = (
+                self.server_args.kv_cache_quant_group_size
+            )
+            pool_kwargs["scale_dtype"] = resolve_scale_dtype(
+                envs.SGLANG_MIXED_KV_SCALE_DTYPE.get()
+            )
         token_to_kv_pool = pool_cls(
             max_total_num_tokens,
             page_size=self.server_args.page_size,
@@ -1377,6 +1494,25 @@ class KVCacheConfigurator:
         # Initialize token_to_kv_pool_allocator
         need_sort = self.server_args.disaggregation_mode in ("decode", "prefill")
         if token_to_kv_pool_allocator is None:
+            if isinstance(token_to_kv_pool, UnifiedInt2HPKVPool):
+                pool = token_to_kv_pool
+                return UnifiedInt2HPKVAllocator(
+                    num_quant_pages=pool.num_quant_pages,
+                    quant_tokens_per_page=pool.N_Q,
+                    hp_prefix_tokens=pool.hp_prefix_tokens,
+                    hp_recent_tokens=pool.hp_recent_tokens,
+                    hp_recent_ring_size=pool.hp_recent_ring_size,
+                    max_req_slots=pool.max_req_slots,
+                    num_hp_prefix_slots=pool.num_hp_prefix_slots,
+                    dtype=self.server_args.kv_cache_dtype,
+                    hp_dtype=pool.hp_dtype,
+                    device=self.device,
+                    kvcache=pool,
+                    need_sort=need_sort,
+                    scheduler_size=(
+                        sizes.max_total_num_tokens + pool.num_hp_prefix_slots
+                    ),
+                )
             if current_platform.is_out_of_tree():
                 AllocatorCls = current_platform.get_paged_allocator_cls()
                 token_to_kv_pool_allocator = AllocatorCls(

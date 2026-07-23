@@ -27,7 +27,7 @@ def configure_kv_cache_dtype(
     is_draft_worker: bool,
     is_dflash: bool,
     speculative_draft_attention_backend: str,
-) -> tuple[Optional[str], torch.dtype]:
+) -> tuple[Optional[str], "torch.dtype | str"]:
     resolved_kv_cache_dtype: Optional[str] = None
     if server_args_kv_cache_dtype == "auto":
         quant_config = getattr(model, "quant_config", None)
@@ -54,6 +54,12 @@ def configure_kv_cache_dtype(
         kv_cache_dtype = torch.float8_e4m3fn
     elif server_args_kv_cache_dtype in ("bf16", "bfloat16"):
         kv_cache_dtype = torch.bfloat16
+    elif server_args_kv_cache_dtype == "int2":
+        # OSCAR mixed-precision INT2 KV cache: 2-bit codes are packed into
+        # uint8 storage by the unified pool, so there is no torch dtype to
+        # resolve here — downstream pool/backend selection keys off the
+        # "int2" string.
+        kv_cache_dtype = "int2"
     elif server_args_kv_cache_dtype == "fp4_e2m1":
         raise ValueError(
             "--kv-cache-dtype=fp4_e2m1 is deprecated. "

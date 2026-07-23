@@ -611,7 +611,9 @@ class ServerArgs:
                 'by the FA4 backend. "nvfp4" selects '
                 'the NVFP4 FP4 E2M1 KV cache recipe; "fp4_mx_block16" '
                 "selects the MX-style block-size-16 FP4 E2M1 KV cache "
-                "recipe. Both require CUDA 12.8+ and PyTorch 2.8.0+"
+                'recipe. Both require CUDA 12.8+ and PyTorch 2.8.0+. "int2" '
+                "selects the OSCAR mixed-precision INT2 KV cache (Triton "
+                "quantized KV path with high-precision sink/recent windows)."
             ),
             choices=[
                 "auto",
@@ -623,10 +625,21 @@ class ServerArgs:
                 "nvfp4",
                 "fp4_mx_block16",
                 "fp4_e2m1",
+                "int2",
             ],
             resolvable=True,
         ),
     ] = "auto"
+    kv_cache_quant_group_size: A[
+        Optional[int],
+        Arg(
+            help=(
+                "Optional head-dimension group size for the int2 KV cache "
+                "quantization. Only applies to --kv-cache-dtype int2. "
+                "By default, KV scales are shared across the full head."
+            ),
+        ),
+    ] = None
     enable_fp32_lm_head: A[
         bool, "If set, the LM head outputs (logits) are in FP32."
     ] = False
@@ -5133,6 +5146,27 @@ class ServerArgs:
             raise RuntimeError("KV4 is not tested on non-CUDA platforms.")
 
     def _handle_page_size(self):
+        # Unified mixed-KV (int2 + HP windows) requires the radix-cache /
+        # allocator page_size to equal ``N_Q`` so tree splits land on
+        # physical page boundaries and the allocator preserves whole-page
+        # exclusive ownership (see
+        # ``python/sglang/srt/mem_cache/unified_kv_allocator.py``).
+        if self._unified_mixed_kv_active():
+            n_q = self._unified_mixed_kv_page_size()
+            if self.page_size is None:
+                self.page_size = n_q
+                logger.info(
+                    "Unified mixed KV (int2) enabled: page_size=%s (= N_Q).",
+                    n_q,
+                )
+            elif self.page_size != n_q:
+                raise ValueError(
+                    f"Unified mixed KV requires --page-size={n_q} (= N_Q for "
+                    f"hp_dtype={self._unified_mixed_kv_hp_dtype()}); got "
+                    f"--page-size={self.page_size}."
+                )
+            return
+
         # Moved to the resolution pipeline (arg_groups/overrides.py:
         # _page_size_default), invoked here at its legacy slot.
         from sglang.srt.arg_groups.overrides import (
@@ -5141,6 +5175,62 @@ class ServerArgs:
         )
 
         run_post_process_pass(self, _page_size_default)
+
+    def _unified_mixed_kv_active(self) -> bool:
+        """Return True when --kv-cache-dtype int2 + the SGLANG_ENABLE_MIXED_KV_*
+        environment variables would route ModelRunner through the unified
+        HP+int2 KV pool. Mirrors the gates in
+        ``model_runner_kv_cache_mixin._init_pools`` and
+        ``pool_configurator._attention_supports_mixed_kv``.
+        """
+        from sglang.srt.environ import envs
+
+        if not envs.SGLANG_ENABLE_MIXED_KV_WINDOWS.get():
+            return False
+        if self.kv_cache_dtype != "int2":
+            return False
+        ab = self.attention_backend
+        pab = self.prefill_attention_backend or ab
+        dab = self.decode_attention_backend or ab
+        attn_ok = (pab == "triton" and dab == "triton") or (
+            pab == "fa3" and dab == "triton"
+        )
+        if not attn_ok:
+            return False
+        if self.disaggregation_mode not in (None, "null"):
+            return False
+        if self.speculative_algorithm is not None:
+            return False
+        # Hybrid SWA models route through a separate pool and are explicitly
+        # excluded from the unified path. We only check this when a real
+        # model path is configured (the dummy/none paths bypass model load).
+        if self.model_path.lower() not in ["none", "dummy"]:
+            try:
+                if getattr(self.get_model_config(), "is_hybrid_swa", False):
+                    return False
+            except Exception:
+                # If the config cannot be loaded yet, defer the decision.
+                # ``model_runner_kv_cache_mixin`` re-checks before
+                # constructing the unified pool, so a missed positive here
+                # only loses page_size autoconfig (the user can always set
+                # it explicitly).
+                return False
+        return True
+
+    def _unified_mixed_kv_hp_dtype(self) -> str:
+        from sglang.srt.environ import envs
+
+        return envs.SGLANG_MIXED_KV_HP_DTYPE.get()
+
+    def _unified_mixed_kv_page_size(self) -> int:
+        from sglang.srt.mem_cache.unified_kv_pool import (
+            compute_page_geometry,
+            resolve_hp_dtype,
+        )
+
+        hp_dtype = resolve_hp_dtype(self._unified_mixed_kv_hp_dtype())
+        _, n_q = compute_page_geometry(hp_dtype)
+        return int(n_q)
 
     def _handle_amd_specifics(self):
         if is_hip():
@@ -7677,6 +7767,54 @@ class ServerArgs:
             assert (
                 self.chunked_prefill_size % self.page_size == 0
             ), "chunked_prefill_size must be divisible by page_size"
+
+        if self.kv_cache_quant_group_size is not None:
+            if self.kv_cache_quant_group_size <= 0:
+                raise ValueError("--kv-cache-quant-group-size must be positive")
+            if self.kv_cache_dtype != "int2":
+                raise ValueError(
+                    "--kv-cache-quant-group-size is only supported with "
+                    "--kv-cache-dtype int2"
+                )
+            if self.model_path.lower() not in ["none", "dummy"] and getattr(
+                self.get_model_config(), "is_hybrid_swa", False
+            ):
+                raise ValueError(
+                    "--kv-cache-quant-group-size is only supported for the "
+                    "full-attention int2 KV cache path (Triton backend, or "
+                    "hybrid FA3-prefill + Triton-decode) and is not "
+                    "supported with hybrid SWA models"
+                )
+
+        # int2 has no FA3 decode reader path; it lives only in the Triton
+        # backend. FA3 prefill is supported via HybridAttnBackend
+        # (--prefill-attention-backend fa3 --decode-attention-backend
+        # triton), but sending decode to FA3 with int2 would crash in
+        # forward_decode (``q.to("int2")``). Reject the unsupported
+        # combinations up front so we fail at startup with a clear message
+        # rather than a cryptic TypeError mid-forward.
+        if self.kv_cache_dtype == "int2":
+            bad_backend = None
+            if (
+                self.attention_backend not in (None, "triton")
+                and self.prefill_attention_backend is None
+                and self.decode_attention_backend is None
+            ):
+                bad_backend = f"--attention-backend {self.attention_backend}"
+            elif (
+                self.decode_attention_backend is not None
+                and self.decode_attention_backend != "triton"
+            ):
+                bad_backend = (
+                    f"--decode-attention-backend {self.decode_attention_backend}"
+                )
+            if bad_backend is not None:
+                raise ValueError(
+                    "--kv-cache-dtype int2 requires the Triton decode path. "
+                    f"Got {bad_backend}. Use either `--attention-backend "
+                    "triton` or `--prefill-attention-backend fa3 "
+                    "--decode-attention-backend triton`."
+                )
 
         # Check pdmux
         if self.enable_pdmux:

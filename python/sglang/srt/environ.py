@@ -336,6 +336,42 @@ class Envs:
     # size the KV pool after CUDA-graph capture
     SGLANG_ENABLE_POST_CAPTURE_KV_SIZING = EnvBool(False)
 
+    # Mixed-precision KV windows (INT2 body + high-precision sink/recent windows)
+    SGLANG_ENABLE_MIXED_KV_WINDOWS = EnvBool(False)
+    SGLANG_MIXED_KV_PREFIX_TOKENS = EnvInt(32)
+    SGLANG_MIXED_KV_RECENT_TOKENS = EnvInt(128)
+    SGLANG_MIXED_KV_HP_DTYPE = EnvStr("bfloat16")
+    SGLANG_MIXED_KV_SCALE_DTYPE = EnvStr("float32")
+    # Shared HP-prefix pool size (in HP slot units; rounded up to N_Q).
+    # 0 = use the default of ``max_running_requests * P * 16``.
+    SGLANG_MIXED_KV_HP_PREFIX_POOL_TOKENS = EnvInt(0)
+    # Oscar rotation + per-row clip for int2 KV cache. Learned per-layer
+    # orthogonal matrices loaded from K/V rotation checkpoints.
+    SGLANG_OSCAR_K_ROTATION_PATH = EnvStr("")
+    SGLANG_OSCAR_V_ROTATION_PATH = EnvStr("")
+    SGLANG_OSCAR_K_CLIP_RATIO = EnvFloat(0.0)
+    SGLANG_OSCAR_V_CLIP_RATIO = EnvFloat(0.0)
+    SGLANG_OSCAR_ABSORB_V_ROTATION = EnvBool(False)
+    # Fuse oscar K-rotation (rows @ R_k) into the prefill clip+quantize+pack
+    # kernel. Eliminates the separate bf16 GEMM staging and the intermediate
+    # rotated-K tensor for the quant pack. Requires oscar mode, V-rotation
+    # absorbed (so V skips rotation), per-row scale (single-scale int2), and
+    # at least one of K/V clip ratios > 0. Off by default; safe to leave off.
+    SGLANG_OSCAR_FUSED_ROTATE_CLIP_QUANT = EnvBool(False)
+    # Use Lloyd-Max MSE-optimal buckets for INT2 KV quantization instead of
+    # the default uniform min-max. Applies only to single-scale pretransformed
+    # clip kernels (num_groups == 1). Requires oscar rotation + clip enabled.
+    SGLANG_LLOYD_MAX = EnvBool(False)
+    SGLANG_MIXED_KV_HP_MAX_SPLITS = EnvInt(8)
+    # Triton int2 decode-kernel tuning overrides (None = use built-in
+    # batch-size-dependent defaults).
+    SGLANG_INT2_BLOCK_N = EnvInt(None)
+    SGLANG_INT2_BLOCK_H = EnvInt(None)
+    SGLANG_INT2_NUM_WARPS = EnvInt(None)
+    SGLANG_INT2_NUM_STAGES = EnvInt(None)
+    # Hadamard transform order for the fused int2 KV quant kernels.
+    SGLANG_HADAMARD_ORDER = EnvInt(16)
+
     # Scheduler: memory leak test
     SGLANG_TEST_RETRACT = EnvBool(False)
     SGLANG_TEST_RETRACT_INTERVAL = EnvInt(3)

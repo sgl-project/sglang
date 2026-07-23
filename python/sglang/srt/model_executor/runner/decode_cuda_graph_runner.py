@@ -51,6 +51,7 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
+from sglang.srt.mem_cache.unified_kv_pool import UnifiedInt2HPKVPool
 from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     CudaGraphBufferRegistry,
     build_decode_registry,
@@ -698,6 +699,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         seq_lens = _slot("seq_lens")
         seq_lens_cpu = _slot("seq_lens_cpu")
         out_cache_loc = _slot("out_cache_loc")
+        if self.capture_forward_mode.is_decode_or_idle() and isinstance(
+            self.model_runner.token_to_kv_pool, UnifiedInt2HPKVPool
+        ):
+            if self.model_runner.token_to_kv_pool.mixed_kv_enabled():
+                # The unified mixed-KV allocator reserves HP page 0 for padded
+                # graph writes; quant page 0 must never receive dummy tokens.
+                out_cache_loc.fill_(self.model_runner.token_to_kv_pool.hp_global_offset)
         positions = _slot("positions")
         encoder_lens = (
             _slot("encoder_lens") if registry.has_slot("encoder_lens") else None
@@ -1157,6 +1165,18 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             buffers.input_embeds[:raw_num_token].copy_(forward_batch.input_embeds)
         # Padded tokens aren't read, so skip zeroing. Ragged input_ids arrive
         # from the planner already padded to the tier, invalid slots zeroed.
+        if (
+            isinstance(self.model_runner.token_to_kv_pool, UnifiedInt2HPKVPool)
+            and self.model_runner.token_to_kv_pool.mixed_kv_enabled()
+            and raw_bs < bs
+        ):
+            # The unified mixed-KV allocator reserves HP page 0 for padded
+            # graph writes. Keep padded seq_lens at the graph fill value (1):
+            # the Triton split planner assumes positive lengths across the
+            # static graph batch.
+            buffers.out_cache_loc[raw_num_token:padded_num_tokens].fill_(
+                self.model_runner.token_to_kv_pool.hp_global_offset
+            )
         if self.enable_two_batch_overlap:
             self.tbo_plugin.replay_prepare(
                 forward_mode=self.capture_forward_mode,

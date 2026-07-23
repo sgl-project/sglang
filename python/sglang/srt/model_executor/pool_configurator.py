@@ -33,6 +33,11 @@ from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocation_sizing import get_alloc_len_per_decode
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import get_compress_state_ring_size
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+from sglang.srt.mem_cache.unified_kv_pool import (
+    compute_page_geometry,
+    resolve_hp_dtype,
+    resolve_scale_dtype,
+)
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.common import (
     ceil_align,
@@ -40,6 +45,35 @@ from sglang.srt.utils.common import (
     is_float4_e2m1fn_x2,
     spec_decode_alloc_len_per_request,
 )
+
+
+def _attention_supports_mixed_kv(server_args) -> bool:
+    """Return True when the active attention-backend configuration can run
+    the unified HP+int2 KV pool end-to-end.
+
+    The pool's read-path (dequant + rotation + int2 decode) lives in the
+    Triton backend today. The FA3 prefill backend gained a rotation-aware
+    int2 prefill path in
+    ``python/sglang/srt/layers/attention/quantized_kv_prefill.py``, so the
+    hybrid ``prefill=fa3 + decode=triton`` configuration is supported too.
+    Any other combination stays on the plain ``MHATokenToKVPool`` int2 path.
+
+    ``prefill_attention_backend`` and ``decode_attention_backend`` can both
+    be unset (``None``), in which case the model runner falls back to
+    ``attention_backend`` for both roles (see
+    ``ServerArgs.get_attention_backends``). Apply the same resolution here
+    so partially-specified configurations (e.g. only ``--attention-backend
+    triton``, or only ``--prefill-attention-backend fa3`` with
+    ``--attention-backend triton``) are recognized correctly.
+    """
+    ab = server_args.attention_backend
+    pab = server_args.prefill_attention_backend or ab
+    dab = server_args.decode_attention_backend or ab
+    if pab == "triton" and dab == "triton":
+        return True
+    if pab == "fa3" and dab == "triton":
+        return True
+    return False
 
 
 @dataclass
@@ -83,6 +117,71 @@ def _get_dsv4_compress_state_dtype_sizes() -> tuple[int, int]:
         "Unsupported SGLANG_DSV4_COMPRESS_STATE_DTYPE="
         f"{dtype_name!r}. Expected one of: float32, fp32, bfloat16, bf16."
     )
+
+
+def _resolve_quant_group_count(head_dim: int, group_size: Optional[int]) -> int:
+    effective_group_size = head_dim if group_size is None else group_size
+    if effective_group_size <= 0:
+        raise ValueError(
+            f"kv_cache_quant_group_size must be positive, got {effective_group_size}"
+        )
+    if head_dim % effective_group_size != 0:
+        raise ValueError(
+            f"head_dim ({head_dim}) must be divisible by "
+            f"kv_cache_quant_group_size ({effective_group_size})"
+        )
+    return head_dim // effective_group_size
+
+
+def _get_int_kv_bytes_per_head_pair(
+    k_head_dim: int,
+    v_head_dim: int,
+    kv_cache_dtype: str,
+    group_size: Optional[int],
+    scale_dtype_bytes: int = 4,
+) -> int:
+    """Bytes per *quant-token* per head-pair for the int2 KV cache.
+
+    Used by both the non-mixed path and the mixed path: the scheduler's
+    ``max_total_num_tokens`` is denominated in quant tokens (= slot ids on the
+    int2 tier), and the mixed allocator's ``size`` = ``(num_pages - 1) * N_Q``
+    is also in quant tokens, so the leak check
+    ``size - available - evictable - protected`` closes in a single unit.
+    """
+    assert (
+        kv_cache_dtype == "int2"
+    ), f"Only int2 quant KV is supported, got {kv_cache_dtype}"
+    pack_factor = 4
+    k_groups = _resolve_quant_group_count(k_head_dim, group_size)
+    v_groups = _resolve_quant_group_count(v_head_dim, group_size)
+    packed_k_bytes = k_head_dim // pack_factor
+    packed_v_bytes = v_head_dim // pack_factor
+    # Interleaved (scale, zero) per group in ``scale_dtype``.
+    scales_zeros_bytes = 2 * scale_dtype_bytes * (k_groups + v_groups)
+    return packed_k_bytes + packed_v_bytes + scales_zeros_bytes
+
+
+def _get_unified_mixed_kv_bytes_per_quant_token(
+    k_head_dim: int,
+    v_head_dim: int,
+    hp_dtype_bytes: int,
+    scale_dtype_bytes: int,
+    k_groups: int,
+    v_groups: int,
+    n_q: int,
+) -> int:
+    """Shared-arena bytes per *quant token* in the unified pool.
+
+    A page of the shared K/V arena is sized to host either 1 HP token or N_Q
+    quant tokens; its byte size is therefore ``(head_dim + v_head_dim) *
+    hp_dtype_bytes``. Per quant token that is this over ``N_Q``. Scales/zeros
+    live in a parallel arena (one entry per quant slot) and are included
+    here so the scheduler's cell-size matches the actual allocator size.
+    """
+    arena_bytes_per_page = (k_head_dim + v_head_dim) * hp_dtype_bytes
+    arena_bytes_per_quant_token = arena_bytes_per_page // n_q
+    scales_zeros_bytes_per_quant_token = 2 * scale_dtype_bytes * (k_groups + v_groups)
+    return arena_bytes_per_quant_token + scales_zeros_bytes_per_quant_token
 
 
 class MemoryPoolConfigurator:
@@ -173,6 +272,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         # args to config cell size
         model_config = kvc.model_config
         kv_cache_dtype = kvc.kv_cache_dtype
+        kv_quant_group_size = kvc.server_args.kv_cache_quant_group_size
         from sglang.srt.layers.cp.utils import (
             get_glm_dsa_layer_split_effective_num_layers,
         )
@@ -181,8 +281,61 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             kvc, num_layers
         )
 
-        kv_size = torch._utils._element_size(kv_cache_dtype)
         tp_size = get_parallel().attn_tp_size
+
+        # Mixed HP+quant pool: the shared arena bytes per logical token are
+        # ``(head_dim + v_head_dim) * hp_dtype_bytes`` (== 1 HP token worth).
+        # Plus the scales/zeros arena sized for every page's quant view.
+        enable_mixed_kv = (
+            kv_cache_dtype == "int2"
+            and envs.SGLANG_ENABLE_MIXED_KV_WINDOWS.get()
+            and _attention_supports_mixed_kv(kvc.server_args)
+            and not kvc.is_hybrid_swa
+            and kvc.server_args.disaggregation_mode in (None, "null")
+            and kvc.server_args.speculative_algorithm is None
+        )
+
+        if kv_cache_dtype == "int2":
+            scale_dtype = resolve_scale_dtype(envs.SGLANG_MIXED_KV_SCALE_DTYPE.get())
+            scale_bytes = torch.empty(0, dtype=scale_dtype).element_size()
+        else:
+            scale_bytes = None
+
+        if enable_mixed_kv:
+            hp_dtype = resolve_hp_dtype(envs.SGLANG_MIXED_KV_HP_DTYPE.get())
+            hp_dtype_bytes = torch.empty(0, dtype=hp_dtype).element_size()
+            _, n_q = compute_page_geometry(hp_dtype)
+            k_groups = _resolve_quant_group_count(
+                model_config.head_dim, kv_quant_group_size
+            )
+            v_groups = _resolve_quant_group_count(
+                model_config.v_head_dim, kv_quant_group_size
+            )
+            # max_total_num_tokens is denominated in *quant tokens* (slot ids
+            # on the int2 tier). This matches the unified allocator's
+            # scheduler-facing ``size = (num_pages - 1) * N_Q``.
+            bytes_per_head = _get_unified_mixed_kv_bytes_per_quant_token(
+                model_config.head_dim,
+                model_config.v_head_dim,
+                hp_dtype_bytes,
+                scale_bytes,
+                k_groups,
+                v_groups,
+                n_q,
+            )
+            kv_size = None
+        elif kv_cache_dtype == "int2":
+            bytes_per_head = _get_int_kv_bytes_per_head_pair(
+                model_config.head_dim,
+                model_config.v_head_dim,
+                kv_cache_dtype,
+                kv_quant_group_size,
+                scale_bytes,
+            )
+            kv_size = None
+        else:
+            kv_size = torch._utils._element_size(kv_cache_dtype)
+            bytes_per_head = None
 
         if kvc.use_mla_backend:
             cell_size = (
@@ -258,12 +411,19 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             # cell_size is already a sum over heterogeneous sub-pools.
             return main_pool_bytes + indexer_bytes
         else:
-            cell_size = (
-                model_config.get_num_kv_heads(tp_size)
-                * (model_config.head_dim + model_config.v_head_dim)
-                * effective_num_layers
-                * kv_size
-            )
+            if bytes_per_head is not None:
+                cell_size = (
+                    model_config.get_num_kv_heads(tp_size)
+                    * bytes_per_head
+                    * effective_num_layers
+                )
+            else:
+                cell_size = (
+                    model_config.get_num_kv_heads(tp_size)
+                    * (model_config.head_dim + model_config.v_head_dim)
+                    * effective_num_layers
+                    * kv_size
+                )
 
             if is_float4_e2m1fn_x2(kv_cache_dtype):
                 # kv_scale_buffer
@@ -308,8 +468,46 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
     def __init__(self, kvc: KVCacheConfigurator):
         model_config = kvc.model_config
         kv_cache_dtype = kvc.kv_cache_dtype
-        kv_size = torch._utils._element_size(kv_cache_dtype)
+        kv_quant_group_size = kvc.server_args.kv_cache_quant_group_size
         tp_size = get_parallel().attn_tp_size
+
+        if kv_cache_dtype == "int2" and kv_quant_group_size is not None:
+            raise ValueError(
+                "--kv-cache-quant-group-size is only supported for the "
+                "full-attention Triton int2 KV cache path and is not supported "
+                "with hybrid SWA models"
+            )
+
+        if kv_cache_dtype == "int2":
+            full_per_token = model_config.get_num_kv_heads(tp_size) * (
+                _get_int_kv_bytes_per_head_pair(
+                    model_config.head_dim,
+                    model_config.v_head_dim,
+                    kv_cache_dtype,
+                    kv_quant_group_size,
+                )
+            )
+            swa_per_token = model_config.get_swa_num_kv_heads(tp_size) * (
+                _get_int_kv_bytes_per_head_pair(
+                    model_config.swa_head_dim,
+                    model_config.swa_v_head_dim,
+                    kv_cache_dtype,
+                    kv_quant_group_size,
+                )
+            )
+            kv_size = None
+        else:
+            kv_size = torch._utils._element_size(kv_cache_dtype)
+            full_per_token = (
+                model_config.get_num_kv_heads(tp_size)
+                * (model_config.head_dim + model_config.v_head_dim)
+                * kv_size
+            )
+            swa_per_token = (
+                model_config.get_swa_num_kv_heads(tp_size)
+                * (model_config.swa_head_dim + model_config.swa_v_head_dim)
+                * kv_size
+            )
 
         self._full_layers_num = len(model_config.full_attention_layer_ids)
         self._swa_layers_num = len(model_config.swa_attention_layer_ids)
@@ -322,18 +520,10 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         self._page_size = kvc.page_size
 
         # Full layer per-token memory (bytes)
-        self._full_per_token = (
-            model_config.get_num_kv_heads(tp_size)
-            * (model_config.head_dim + model_config.v_head_dim)
-            * kv_size
-        )
+        self._full_per_token = full_per_token
 
         # SWA layer per-token memory (bytes)
-        self._swa_per_token = (
-            model_config.get_swa_num_kv_heads(tp_size)
-            * (model_config.swa_head_dim + model_config.swa_v_head_dim)
-            * kv_size
-        )
+        self._swa_per_token = swa_per_token
 
         if kvc.server_args.kv_cache_dtype == "mxfp8":
             scale_block_size = 32

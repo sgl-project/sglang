@@ -18,6 +18,12 @@ from sglang.kernels.ops.kvcache.trtllm_mha_page_table import (
 )
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.quantized_kv_prefill import (
+    apply_inverse_v_rotation,
+    build_prefix_indices_from_req_to_token,
+    dequantize_prefix_kv,
+    prepare_quantized_extend_qkv,
+)
 from sglang.srt.layers.cp.base import CPAttentionBackendKind, get_cp_strategy
 from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.radix_attention import AttentionType
@@ -113,6 +119,9 @@ class FlashAttentionMetadata:
 
     # For sliding window attention topk>1 spec decoding
     swa_spec_metadata: Optional[FlashAttentionMetadata] = None
+
+    # Total number of tokens for flattened KV (used by quantized path)
+    kv_flatten_size: int = 0
 
 
 class FlashAttentionBackend(AttentionBackend):
@@ -1120,10 +1129,16 @@ class FlashAttentionBackend(AttentionBackend):
             and self.attn_cp_size > 1
         )
 
+        # Int2 takes a dedicated rotation-aware path below: Q/K/V are
+        # pre-rotated (Hadamard or Oscar) once, and the rotated K/V is then
+        # written to the pool with ``already_hadamard_transformed=True`` so the
+        # pool does not rotate a second time. We therefore skip the eager save
+        # here for int2 and defer to the quantized prefill branch.
+        int2_deferred_save = self.kv_cache_dtype_str == "int2" and not self.use_mla
         if k is not None:
             assert v is not None
 
-            if save_kv_cache and not self.fa_skip_kv_cache:
+            if save_kv_cache and not self.fa_skip_kv_cache and not int2_deferred_save:
                 cache_loc = (
                     forward_batch.out_cache_loc
                     if not layer.is_cross_attention
@@ -1198,7 +1213,10 @@ class FlashAttentionBackend(AttentionBackend):
         # has corresponding quantization method so that layer.k_scale is not None,
         # 3) layer.head_dim <= 256 since fa3 kernel require fp16 and bf16 data type in this case,
         # 4) fa_impl_ver != 4 since fa4 does not currently support fp8 queries and keys.
-        if (
+        if self.kv_cache_dtype_str == "int2":
+            # int2 scales live interleaved in the pool, not as FA descales.
+            pass
+        elif (
             self.kv_cache_dtype_str != "auto"
             and layer.head_dim <= 256
             and self.fa_impl_ver != 4
@@ -1300,6 +1318,28 @@ class FlashAttentionBackend(AttentionBackend):
         # Use Flash Attention for prefill
         if not self.use_mla:
             # Do multi-head attention
+            if self.kv_cache_dtype_str == "int2":
+                o = self._forward_extend_int2_mha(
+                    q=q,
+                    k=k,
+                    v=v,
+                    layer=layer,
+                    forward_batch=forward_batch,
+                    save_kv_cache=save_kv_cache,
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_k=cu_seqlens_k,
+                    cache_seqlens=cache_seqlens,
+                    max_seqlen_q=max_seqlen_q,
+                    max_seq_len_k=metadata.max_seq_len_k,
+                    causal=causal,
+                    window_size=window_size,
+                    is_swa_layer=is_swa_layer,
+                    use_local_attn=use_local_attn,
+                    is_cp_mode=is_cp_mode,
+                    use_cascade_attn=use_cascade_attn,
+                    fa_kwargs=kwargs,
+                )
+                return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
             key_cache, value_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
 
             key_cache = key_cache.view(
@@ -1672,6 +1712,187 @@ class FlashAttentionBackend(AttentionBackend):
 
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
+    def _forward_extend_int2_mha(
+        self,
+        *,
+        q,
+        k,
+        v,
+        layer,
+        forward_batch,
+        save_kv_cache,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        cache_seqlens,
+        max_seqlen_q,
+        max_seq_len_k,
+        causal,
+        window_size,
+        is_swa_layer,
+        use_local_attn,
+        is_cp_mode,
+        use_cascade_attn,
+        fa_kwargs,
+    ):
+        # Rotation-aware path that shares logic with TritonAttnBackend
+        # (see python/sglang/srt/layers/attention/quantized_kv_prefill.py).
+        # Handles the pure-int2 ``MHATokenToKVPool`` and the mixed
+        # HP+int2 ``UnifiedInt2HPKVPool`` uniformly, and supports
+        # Hadamard / Oscar / off rotation modes.
+        #
+        # Prefix is dequantized from the int2 pool; extend is kept in
+        # its higher-precision (bf16/fp16) rotated form to avoid a
+        # lossy round-trip through the pool. Differs from
+        # ``TritonAttnBackend._forward_extend_quantized_dense`` in that
+        # FA3 derives metadata (``cu_seqlens_q``, ``cache_seqlens``,
+        # ``page_table``) from ``FlashAttentionMetadata`` rather than
+        # from the triton ``forward_metadata``; the rotation and
+        # dequant helpers are shared.
+        #
+        # The int2 prefill path does NOT currently support:
+        #   - cross-attention layers
+        #   - sliding-window / local-attention layers
+        #   - context-parallel (CP) extend
+        #   - empty / unpopulated ``extend_seq_lens``
+        # Each is asserted below so we fail loudly rather than emit
+        # silently wrong attention output.
+        assert (
+            not layer.is_cross_attention
+        ), "FA3 int2 prefill does not support cross-attention layers"
+        assert not is_swa_layer and not use_local_attn, (
+            "FA3 int2 prefill does not support sliding-window / "
+            "local-attention layers"
+        )
+        assert (
+            not is_cp_mode
+        ), "FA3 int2 prefill does not support context-parallel extend"
+        assert not use_cascade_attn, (
+            "FA3 int2 prefill does not support cascade attention "
+            "(speculative target-verify with topk > 1)"
+        )
+        assert (
+            k is not None and v is not None
+        ), "FA3 int2 prefill requires non-None K / V"
+        assert (
+            forward_batch.extend_seq_lens is not None
+        ), "FA3 int2 prefill requires forward_batch.extend_seq_lens"
+        assert forward_batch.extend_seq_lens_cpu, (
+            "FA3 int2 prefill requires a non-empty " "forward_batch.extend_seq_lens_cpu"
+        )
+
+        kv_pool = self.token_to_kv_pool
+        # Remember the model dtype so we can cast the attention output
+        # back to it (Oscar rotation promotes to hp_dtype, which is
+        # often bf16; without this cast a fp16 model would feed bf16
+        # into the downstream o_proj).
+        model_dtype = q.dtype
+
+        q3 = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+        k3 = k.contiguous()
+        v3 = v.contiguous()
+
+        q3, k3, v3, need_v_inverse = prepare_quantized_extend_qkv(
+            kv_pool, layer, q3, k3, v3
+        )
+
+        # Deferred int2 save: write the pre-rotated K/V so the pool
+        # keeps the rotated-domain representation. ``already_hadamard_
+        # transformed=True`` tells the pool to skip its own rotation.
+        if save_kv_cache:
+            cache_loc = forward_batch.out_cache_loc
+            kv_pool.set_kv_buffer(
+                layer,
+                cache_loc,
+                k3,
+                v3,
+                layer.k_scale,
+                layer.v_scale,
+                already_hadamard_transformed=True,
+                is_decode=False,
+            )
+
+        # Build prefix-only slot list per request:
+        # ``prefix_seqlens[b] = cache_seqlens[b] - extend_seq_lens[b]``.
+        # ``cache_seqlens`` already includes the extend we just saved;
+        # subtracting gives the pre-extend prefix.
+        extend_seq_lens_gpu = forward_batch.extend_seq_lens.to(
+            cache_seqlens.device, dtype=cache_seqlens.dtype
+        )
+        prefix_seqlens = cache_seqlens - extend_seq_lens_gpu
+        # Read slot ids straight from ``req_to_token`` rather than from
+        # the strided / divided ``page_table`` produced by FA3's paged
+        # path. The FA3 paged convention encodes ``slot = page * page_size
+        # + offset`` and only round-trips correctly when adjacent
+        # positions live on the same physical page. For the unified
+        # mixed HP+int2 pool that invariant breaks: HP slots store as
+        # ``HP_OFFSET + hp_page_id`` (with N_H=1) so every HP position
+        # has a different page id, and the strided/divided
+        # representation silently scrambles HP slot ids -- causing
+        # gibberish outputs as soon as the model attends to a
+        # cross-tier prefix (e.g. chunked prefill of long batched
+        # prompts where HP_prefix and HP_recent flank a long quant
+        # middle).
+        prefix_slots = build_prefix_indices_from_req_to_token(
+            req_to_token=self.req_to_token,
+            req_pool_indices=forward_batch.req_pool_indices,
+            cache_seqlens=prefix_seqlens,
+            cache_seqlens_cpu=forward_batch.extend_prefix_lens_cpu,
+        )
+        prefix_k, prefix_v = dequantize_prefix_kv(
+            kv_pool, layer.layer_id, prefix_slots, q3.dtype
+        )
+
+        # Per-request concat: [prefix_k (dequant) | extend_k (k3)].
+        prefix_seqlens_cpu = forward_batch.extend_prefix_lens_cpu
+        if isinstance(prefix_seqlens_cpu, torch.Tensor):
+            assert (
+                prefix_seqlens_cpu.device.type == "cpu"
+            ), "FA3 int2 prefill requires CPU prefix length metadata"
+            prefix_seqlens_cpu = prefix_seqlens_cpu.tolist()
+        extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
+        extend_start_loc_cpu = []
+        _extend_cursor = 0
+        for _ext_len in extend_seq_lens_cpu:
+            extend_start_loc_cpu.append(_extend_cursor)
+            _extend_cursor += int(_ext_len)
+        unified_k_parts = []
+        unified_v_parts = []
+        prefix_cursor = 0
+        for i, ext_len in enumerate(extend_seq_lens_cpu):
+            pfx_len = int(prefix_seqlens_cpu[i])
+            ext_start = int(extend_start_loc_cpu[i])
+            ext_end = ext_start + int(ext_len)
+            pfx_k = prefix_k[prefix_cursor : prefix_cursor + pfx_len]
+            pfx_v = prefix_v[prefix_cursor : prefix_cursor + pfx_len]
+            prefix_cursor += pfx_len
+            req_k = torch.cat([pfx_k, k3[ext_start:ext_end]], dim=0)
+            req_v = torch.cat([pfx_v, v3[ext_start:ext_end]], dim=0)
+            unified_k_parts.append(req_k)
+            unified_v_parts.append(req_v)
+
+        unified_k = torch.cat(unified_k_parts, dim=0) if unified_k_parts else k3[:0]
+        unified_v = torch.cat(unified_v_parts, dim=0) if unified_v_parts else v3[:0]
+        result = flash_attn_varlen_func(
+            q=q3,
+            k=unified_k,
+            v=unified_v,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seq_len_k,
+            softmax_scale=layer.scaling,
+            causal=causal,
+            window_size=window_size,
+            softcap=layer.logit_cap,
+            **fa_kwargs,
+        )
+        result = apply_inverse_v_rotation(result, kv_pool, layer, need_v_inverse)
+        # Cast back to the model dtype so downstream o_proj sees the
+        # same dtype whether or not rotation promoted to hp_dtype.
+        if result.dtype != model_dtype:
+            result = result.to(model_dtype)
+        return result
+
     def forward_decode(
         self,
         q: torch.Tensor,
@@ -1694,6 +1915,16 @@ class FlashAttentionBackend(AttentionBackend):
     ) -> torch.Tensor:
         if score_mod is not None and self.fa_impl_ver != 4:
             raise RuntimeError("score_mod is only supported by the FA4 backend.")
+        # int2 has no fa3 decode path: ``self.kv_cache_dtype`` is the string
+        # ``"int2"`` (not a torch dtype). ``check_server_args`` rejects
+        # ``--attention-backend fa3 --kv-cache-dtype int2`` at startup and
+        # routes decode to the triton backend's int2 kernels, so this branch
+        # should never be reached with int2; fail loudly rather than emit a
+        # cryptic ``q.to("int2")`` TypeError mid-forward.
+        assert self.kv_cache_dtype_str != "int2", (
+            "FA3 forward_decode does not support int2 KV cache; use "
+            "--decode-attention-backend triton"
+        )
         if k is not None:
             assert v is not None
             if save_kv_cache:

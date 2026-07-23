@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import itertools
+import logging
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -23,6 +24,7 @@ import numpy as np
 import torch
 import triton
 import triton.language as tl
+from torch import nn
 
 from sglang.jit_kernel.norm import can_use_fused_inplace_qknorm, fused_inplace_qknorm
 from sglang.jit_kernel.rope import FusedSetKVBufferArg
@@ -37,6 +39,8 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import get_current_device_stream_fast, is_cuda, is_hip
 from sglang.srt.utils.custom_op import register_custom_op
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.layernorm import RMSNorm
@@ -734,3 +738,290 @@ def fused_qk_gemma_rmsnorm_with_gate(
 
 # Register the inplace op
 fused_inplace_qknorm = register_custom_op(fused_inplace_qknorm, mutates_args=["q", "k"])
+
+
+def _is_fp8_channelwise_qkv(qkv_proj: nn.Module, weight: torch.Tensor) -> bool:
+    """True if qkv_proj has compressed-tensors-style per-output-channel FP8
+    weights — i.e. ``weight`` is e4m3fn ``[out, in]`` and ``weight_scale`` is
+    fp32 ``[out, 1]``. This must be checked **before**
+    ``process_weights_after_loading`` runs, since that hook transposes the
+    weight to ``[in, out]``."""
+    if weight.dtype != torch.float8_e4m3fn:
+        return False
+    weight_scale = getattr(qkv_proj, "weight_scale", None)
+    if weight_scale is None:
+        return False
+    if weight_scale.dtype != torch.float32:
+        return False
+    if weight_scale.ndim != 2 or weight_scale.shape != (weight.shape[0], 1):
+        return False
+    return True
+
+
+def _is_fp8_per_tensor_qkv(qkv_proj: nn.Module, weight: torch.Tensor) -> bool:
+    """True if qkv_proj has per-tensor FP8 weights — ``weight`` is e4m3fn
+    ``[out, in]`` and ``weight_scale`` is fp32 ``[3]`` (one scalar per Q/K/V
+    shard, the standard ``compressed-tensors`` ``QuantizationStrategy.TENSOR``
+    layout). Same pre-``process_weights_after_loading`` requirement as
+    ``_is_fp8_channelwise_qkv``."""
+    if weight.dtype != torch.float8_e4m3fn:
+        return False
+    weight_scale = getattr(qkv_proj, "weight_scale", None)
+    if weight_scale is None:
+        return False
+    if weight_scale.dtype != torch.float32:
+        return False
+    if weight_scale.ndim != 1 or weight_scale.shape != (3,):
+        return False
+    return True
+
+
+def _absorb_v_dense(attn: nn.Module, R_v: torch.Tensor) -> None:
+    weight = attn.qkv_proj.weight
+    v_offset = attn.q_size + attn.kv_size
+    v_weight = weight.data.narrow(0, v_offset, attn.kv_size)
+    v_weight_3d = v_weight.reshape(attn.num_kv_heads, attn.head_dim, -1)
+    folded_weight = torch.matmul(R_v.T, v_weight_3d.to(torch.float32)).to(
+        dtype=weight.dtype
+    )
+    v_weight.copy_(folded_weight.reshape_as(v_weight))
+
+
+def _absorb_v_fp8_channel(attn: nn.Module, R_v: torch.Tensor) -> None:
+    """Dequantize the V slice with its per-channel scale, fold R_v into it,
+    recompute per-output-channel scales, and re-quantize back to fp8 e4m3fn.
+
+    The rotation mixes output channels within each kv head, so old per-row
+    scales no longer match the new row magnitudes — we must pick fresh ones.
+    """
+    weight = attn.qkv_proj.weight
+    weight_scale = attn.qkv_proj.weight_scale
+    v_offset = attn.q_size + attn.kv_size
+
+    v_weight_fp8 = weight.data.narrow(0, v_offset, attn.kv_size)
+    v_scale = weight_scale.data.narrow(0, v_offset, attn.kv_size)
+
+    # Dequant: per-row scale broadcasts over the in_features dim.
+    v_fp32 = v_weight_fp8.to(torch.float32) * v_scale
+    v_fp32_3d = v_fp32.reshape(attn.num_kv_heads, attn.head_dim, -1)
+    folded = torch.matmul(R_v.T, v_fp32_3d).reshape_as(v_fp32)
+
+    # Recompute per-output-channel scales.
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max
+    new_scale = (folded.abs().amax(dim=1, keepdim=True) / fp8_max).clamp(min=1e-12)
+    requantized = (folded / new_scale).clamp(-fp8_max, fp8_max).to(torch.float8_e4m3fn)
+
+    v_weight_fp8.copy_(requantized)
+    v_scale.copy_(new_scale.to(v_scale.dtype))
+
+
+def _absorb_v_fp8_per_tensor(attn: nn.Module, R_v: torch.Tensor) -> None:
+    """Per-tensor FP8: ``weight_scale`` is ``[Q_scale, K_scale, V_scale]``.
+
+    The downstream ``process_weights_after_loading`` calls
+    ``requantize_with_max_scale``, which (a) takes ``max(weight_scale)`` and
+    (b) for each shard dequantizes with its own ``weight_scale[idx]`` then
+    requantizes with the max. So if we update ``weight_scale[V_idx]`` and the
+    fp8 values of the V shard to be consistent with that new V scale, the
+    rotated V is preserved through requantization.
+
+    Caveat: if the on-disk checkpoint was *fused* (only ``weight_scale[0]``
+    set, the other two are ``finfo.min`` sentinels), the unfused-path trigger
+    (``weight_scale[-1] > finfo.min``) didn't fire before. Setting
+    ``weight_scale[2]`` to a real value flips ``unfused_module_in_checkpoint``
+    to True, so we must also copy the loaded scale into ``weight_scale[1]``
+    (and ``[0]`` already has it) so Q/K dequantize with the right scale.
+    """
+    fp8_dtype = torch.float8_e4m3fn
+    fp8_max = torch.finfo(fp8_dtype).max
+    sentinel = torch.finfo(torch.float32).min
+
+    weight = attn.qkv_proj.weight
+    weight_scale = attn.qkv_proj.weight_scale
+
+    # Determine the effective scale of each shard. If a shard's slot is
+    # still the sentinel, it inherits weight_scale[0] (fused-on-disk case).
+    fused_on_disk = weight_scale.data[-1] <= sentinel
+    if fused_on_disk:
+        shared = weight_scale.data[0].item()
+        v_scale_in = shared
+        # Backfill K so the unfused path we're about to trigger sees a real
+        # K scale rather than the sentinel.
+        for idx in range(weight_scale.shape[0]):
+            if weight_scale.data[idx] <= sentinel:
+                weight_scale.data[idx] = shared
+    else:
+        v_scale_in = weight_scale.data[2].item()
+
+    v_offset = attn.q_size + attn.kv_size
+    v_weight_fp8 = weight.data.narrow(0, v_offset, attn.kv_size)
+
+    # Dequant with the V slice's scalar scale, fold R_v, recompute a fresh
+    # scalar scale, requant.
+    v_fp32 = v_weight_fp8.to(torch.float32) * v_scale_in
+    v_fp32_3d = v_fp32.reshape(attn.num_kv_heads, attn.head_dim, -1)
+    folded = torch.matmul(R_v.T, v_fp32_3d).reshape_as(v_fp32)
+
+    new_scale = max(folded.abs().max().item() / fp8_max, 1e-12)
+    requantized = (folded / new_scale).clamp(-fp8_max, fp8_max).to(fp8_dtype)
+
+    v_weight_fp8.copy_(requantized)
+    weight_scale.data[2] = new_scale
+
+
+def _absorb_v_bias(attn: nn.Module, R_v: torch.Tensor) -> None:
+    bias = getattr(attn.qkv_proj, "bias", None)
+    if bias is None:
+        return
+    v_offset = attn.q_size + attn.kv_size
+    v_bias = bias.data.narrow(0, v_offset, attn.kv_size)
+    v_bias_2d = v_bias.reshape(attn.num_kv_heads, attn.head_dim)
+    folded_bias = torch.matmul(v_bias_2d.to(torch.float32), R_v).to(dtype=bias.dtype)
+    v_bias.copy_(folded_bias.reshape_as(v_bias))
+
+
+def maybe_absorb_oscar_v_rotation_into_qkv(
+    model: nn.Module,
+    *,
+    quant_config: Optional[Any] = None,
+    model_label: str = "model",
+) -> bool:
+    """Fold the per-layer Oscar V-rotation matrix into each layer's qkv_proj weight.
+
+    Works for any decoder model whose layers expose a standard fused-QKV
+    attention block: ``layer.self_attn.{qkv_proj, q_size, kv_size,
+    num_kv_heads, head_dim, attn}``. The wrapper is expected to expose
+    ``model.start_layer``, ``model.end_layer`` and ``model.layers`` (the
+    inner pp-aware Model). Must be called from ``model.load_weights`` (i.e.
+    *before* ``process_weights_after_loading`` transposes/repacks quantized
+    weights).
+
+    Supported qkv_proj layouts:
+
+    * dense (any floating dtype, ``[out, in]``).
+    * compressed-tensors per-output-channel FP8: ``weight`` is e4m3fn
+      ``[out, in]`` paired with ``weight_scale`` fp32 ``[out, 1]``. The V
+      slice is dequantized with its scales, rotated, and re-quantized with
+      freshly recomputed per-row scales (the rotation mixes rows within a
+      kv head, so old scales no longer match).
+
+    Returns True iff absorption ran on at least one layer.
+    """
+    from sglang.srt.mem_cache.memory_pool import (
+        load_oscar_rotation_config,
+        load_oscar_rotations,
+    )
+
+    if not envs.SGLANG_OSCAR_ABSORB_V_ROTATION.get():
+        return False
+
+    oscar_cfg = load_oscar_rotation_config()
+
+    start_layer = model.start_layer
+    end_layer = model.end_layer
+    if start_layer >= end_layer:
+        return False
+
+    first_attn = model.layers[start_layer].self_attn
+    qkv_weight = getattr(first_attn.qkv_proj, "weight", None)
+    if qkv_weight is None or qkv_weight.ndim != 2:
+        raise RuntimeError(
+            f"SGLANG_OSCAR_ABSORB_V_ROTATION=1 was requested for {model_label} "
+            f"but layer {start_layer}'s qkv_proj.weight is not a 2D parameter "
+            f"(got {None if qkv_weight is None else f'ndim={qkv_weight.ndim}'}). "
+            "Cannot fold V rotation into qkv_proj — runtime would silently skip "
+            "the V-rotation step, producing wrong outputs. Either disable "
+            "SGLANG_OSCAR_ABSORB_V_ROTATION or use a checkpoint with a 2D "
+            "qkv_proj.weight."
+        )
+
+    is_dense = qkv_weight.dtype in (torch.float32, torch.float16, torch.bfloat16)
+    is_fp8_channel = _is_fp8_channelwise_qkv(first_attn.qkv_proj, qkv_weight)
+    is_fp8_per_tensor = _is_fp8_per_tensor_qkv(first_attn.qkv_proj, qkv_weight)
+    if not (is_dense or is_fp8_channel or is_fp8_per_tensor):
+        weight_scale = getattr(first_attn.qkv_proj, "weight_scale", None)
+        scale_desc = (
+            f"shape={tuple(weight_scale.shape)} dtype={weight_scale.dtype}"
+            if weight_scale is not None
+            else "missing"
+        )
+        raise RuntimeError(
+            f"SGLANG_OSCAR_ABSORB_V_ROTATION=1 was requested for {model_label} "
+            f"but {model_label}'s qkv_proj layout is not supported "
+            f"(weight dtype={qkv_weight.dtype}, weight_scale={scale_desc}). "
+            "Supported layouts: (a) dense bf16/fp16/fp32, (b) per-output-channel "
+            "FP8 with weight_scale shape [out, 1], (c) per-tensor FP8 with "
+            "weight_scale shape [3] (one scalar per Q/K/V shard). "
+            "Block-quantized FP8 (2D scale) and other quant schemes are not "
+            "yet supported. Without absorption the runtime would silently skip "
+            "the V-rotation step, producing wrong outputs. Either disable "
+            "SGLANG_OSCAR_ABSORB_V_ROTATION or extend the *_absorb_v_* "
+            "helpers in models/utils.py for this layout."
+        )
+
+    rotations = load_oscar_rotations(
+        oscar_cfg.v_rotation_path,
+        layer_num=end_layer - start_layer,
+        start_layer=start_layer,
+        head_dim=first_attn.head_dim,
+        device=qkv_weight.device,
+        dtype=torch.float32,
+    )
+
+    folded_layers = 0
+    for layer_id in range(start_layer, end_layer):
+        attn = model.layers[layer_id].self_attn
+        if getattr(attn.attn, "oscar_v_rotation_absorbed", False):
+            continue
+        weight = getattr(attn.qkv_proj, "weight", None)
+        if weight is None or weight.ndim != 2:
+            raise RuntimeError(
+                f"SGLANG_OSCAR_ABSORB_V_ROTATION=1: {model_label} layer "
+                f"{layer_id} qkv_proj.weight is not 2D (layer {start_layer} "
+                f"was). Mixed qkv_proj layouts across layers are not supported."
+            )
+
+        R_v = rotations[layer_id - start_layer]
+        if is_fp8_channel and _is_fp8_channelwise_qkv(attn.qkv_proj, weight):
+            _absorb_v_fp8_channel(attn, R_v)
+        elif is_fp8_per_tensor and _is_fp8_per_tensor_qkv(attn.qkv_proj, weight):
+            _absorb_v_fp8_per_tensor(attn, R_v)
+        elif is_dense and weight.dtype in (
+            torch.float32,
+            torch.float16,
+            torch.bfloat16,
+        ):
+            _absorb_v_dense(attn, R_v)
+        else:
+            raise RuntimeError(
+                f"SGLANG_OSCAR_ABSORB_V_ROTATION=1: {model_label} layer "
+                f"{layer_id} qkv_proj layout differs from layer {start_layer} "
+                f"(weight dtype={weight.dtype}). Cannot fold V rotation."
+            )
+
+        _absorb_v_bias(attn, R_v)
+        attn.attn.oscar_v_rotation_absorbed = True
+        folded_layers += 1
+
+    if folded_layers == 0:
+        raise RuntimeError(
+            f"SGLANG_OSCAR_ABSORB_V_ROTATION=1 was requested for {model_label} "
+            f"but no layers were folded (start_layer={start_layer}, "
+            f"end_layer={end_layer}, all already-absorbed?). Runtime would "
+            "silently skip V rotation."
+        )
+
+    if is_fp8_channel:
+        layout_name = "fp8_channel"
+    elif is_fp8_per_tensor:
+        layout_name = "fp8_per_tensor"
+    else:
+        layout_name = "dense"
+    logger.info(
+        "Absorbed Oscar V rotation into %s qkv_proj for %d/%d local layers (layout=%s).",
+        model_label,
+        folded_layers,
+        end_layer - start_layer,
+        layout_name,
+    )
+    return True

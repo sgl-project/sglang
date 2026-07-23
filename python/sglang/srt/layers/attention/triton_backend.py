@@ -5,7 +5,9 @@ from typing import TYPE_CHECKING, List, Optional
 
 import torch
 import triton
+import triton.language as tl
 
+from sglang.jit_kernel.flash_attention import flash_attn_varlen_func
 from sglang.kernels.ops.attention.metadata import get_num_kv_splits_triton
 from sglang.kernels.ops.kvcache.kv_indices import (
     create_flashinfer_kv_indices_triton,
@@ -21,14 +23,23 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.quantized_kv_prefill import (
+    _apply_oscar_rotation,
+    _pool_uses_oscar_rotation,
+    apply_inverse_v_rotation,
+    apply_segmented_hadamard_transform,
+    dequantize_prefix_kv,
+    prepare_quantized_extend_qkv,
+)
 from sglang.srt.layers.dcp import (
     cp_lse_ag_out_rs_mha,
     create_triton_kv_indices_for_dcp_triton,
     get_dcp_lens,
 )
 from sglang.srt.layers.radix_attention import AttentionType
-from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc, MHATokenToKVPool
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.mem_cache.unified_kv_pool import UnifiedInt2HPKVPool
 from sglang.srt.model_executor.cuda_graph_config import cuda_graph_fully_disabled
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_parallel
@@ -74,6 +85,123 @@ def _mla_decode_kv_splits_cap(
     return max(base_max_kv_splits, min(sm_cap, ctx_cap))
 
 
+@triton.jit
+def _count_mixed_hp_lens_kernel(
+    req_to_token_ptr,  # int32 [num_req_slots, max_ctx]
+    req_pool_indices_ptr,  # int64 [bs]
+    seq_lens_ptr,  # int32 [bs]
+    hp_lens_ptr,  # int32 [bs]
+    rtt_stride_row,
+    HP_OFFSET: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Count per-request HP lengths without dense mask materialization.
+
+    This keeps the req-pool indirection fused with the tier classification so
+    ``_build_mixed_kv_indices`` never has to materialize a gathered ``rows``
+    tensor or per-token boolean masks. The quant tier length is derived from
+    ``seq_len - hp_len`` on the Python side.
+    """
+    req = tl.program_id(0)
+    req_pool_idx = tl.load(req_pool_indices_ptr + req).to(tl.int64)
+    seq_len = tl.load(seq_lens_ptr + req).to(tl.int32)
+
+    hp_count = tl.zeros((), dtype=tl.int32)
+    num_loops = tl.cdiv(seq_len, BLOCK_SIZE)
+    for i in range(num_loops):
+        offs = i * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        valid = offs < seq_len
+        slot = tl.load(
+            req_to_token_ptr + req_pool_idx * rtt_stride_row + offs.to(tl.int64),
+            mask=valid,
+            other=0,
+        ).to(tl.int64)
+        hp_count += tl.sum((valid & (slot >= HP_OFFSET)).to(tl.int32), axis=0)
+
+    tl.store(hp_lens_ptr + req, hp_count)
+
+
+@triton.jit
+def _scatter_mixed_kv_indices_kernel(
+    req_to_token_ptr,  # int32 [num_req_slots, max_ctx]
+    req_pool_indices_ptr,  # int64 [bs]
+    seq_lens_ptr,  # int32 or int64 [bs] -- cast inside
+    hp_kv_indptr_ptr,  # int32 [bs + 1]   already cumsum'd
+    quant_kv_indptr_ptr,  # int32 [bs + 1]   already cumsum'd
+    hp_kv_indices_ptr,  # int64 [*] destination, pre-sized
+    quant_kv_indices_ptr,  # int64 [*] destination, pre-sized
+    rtt_stride_row,
+    HP_OFFSET: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Slot-id-classified scatter into hp/quant index buffers, one block per req.
+
+    For each request i we walk ``req_to_token[req_pool_indices[i], 0..seq_len)``
+    in ``BLOCK_SIZE`` chunks. Each lane decides whether its slot id is HP
+    (``slot >= HP_OFFSET``) or quant, then contributes to within-block exclusive
+    prefix sums that act as scatter offsets into the pre-cumsum'd
+    ``hp_kv_indptr`` / ``quant_kv_indptr`` tier-local layout. No masked-select,
+    no Python bs-loop, and no D2H sync: stride and offset arithmetic is all on
+    device with shapes known statically.
+    """
+    req = tl.program_id(0)
+    req_pool_idx = tl.load(req_pool_indices_ptr + req).to(tl.int64)
+    seq_len = tl.load(seq_lens_ptr + req).to(tl.int32)
+    hp_base = tl.load(hp_kv_indptr_ptr + req).to(tl.int64)
+    quant_base = tl.load(quant_kv_indptr_ptr + req).to(tl.int64)
+
+    # Running counters for the chunked scatter. Triton tracks these as scalar
+    # SSA values that accumulate across the Python-side for loop below.
+    hp_running = tl.zeros((), dtype=tl.int32)
+    quant_running = tl.zeros((), dtype=tl.int32)
+
+    num_loops = tl.cdiv(seq_len, BLOCK_SIZE)
+    for i in range(num_loops):
+        offs = i * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        valid = offs < seq_len
+        slot = tl.load(
+            req_to_token_ptr + req_pool_idx * rtt_stride_row + offs.to(tl.int64),
+            mask=valid,
+            other=0,
+        ).to(tl.int64)
+        # HP slot ids start at exactly ``HP_OFFSET`` (page 0 is a valid HP
+        # page), so the boundary is ``>=`` not ``>``. The unified pool /
+        # allocator (``unified_kv_pool._split_global_locs``,
+        # ``unified_kv_allocator.free``) and the GPU flush kernel
+        # (``gpu_flush_int2``) all classify by ``>=``; using ``>`` here would
+        # misclassify HP slot id ``HP_OFFSET`` as quant and read OOB from
+        # the quant buffer.
+        is_hp = valid & (slot >= HP_OFFSET)
+        is_quant = valid & (
+            slot < HP_OFFSET
+        )  # == valid & ~is_hp; explicit to avoid ~bool dtype quirks
+
+        hp_inc = is_hp.to(tl.int32)
+        quant_inc = is_quant.to(tl.int32)
+
+        # tl.cumsum gives an inclusive prefix; subtract the lane value to get
+        # the exclusive prefix (= rank of this lane among HP/quant entries
+        # within this block).
+        hp_rank = tl.cumsum(hp_inc, axis=0) - hp_inc
+        quant_rank = tl.cumsum(quant_inc, axis=0) - quant_inc
+
+        tl.store(
+            hp_kv_indices_ptr + hp_base + (hp_running + hp_rank).to(tl.int64),
+            slot - HP_OFFSET,
+            mask=is_hp,
+        )
+        tl.store(
+            quant_kv_indices_ptr
+            + quant_base
+            + (quant_running + quant_rank).to(tl.int64),
+            slot,
+            mask=is_quant,
+        )
+
+        hp_running += tl.sum(hp_inc, axis=0)
+        quant_running += tl.sum(quant_inc, axis=0)
+
+
 def logit_capping_mod(logit_capping_method, logit_cap):
     # positive logit_cap -> tanh cap
     if logit_capping_method == "tanh":
@@ -105,6 +233,19 @@ class ForwardMetadata:
     # PHYSICAL full-attn write target for the unified pool (eager: translated tensor;
     # cuda-graph: capture-stable buffer view). None for non-unified pools.
     out_cache_loc_full_physical: Optional[torch.Tensor] = None
+    # Per-tier indptr/indices for the unified single-launch mixed int2 path.
+    mixed_hp_kv_indptr: Optional[torch.Tensor] = None
+    mixed_hp_kv_indices: Optional[torch.Tensor] = None
+    mixed_quant_kv_indptr: Optional[torch.Tensor] = None
+    mixed_quant_kv_indices: Optional[torch.Tensor] = None
+    # Single combined stage-1 scratch: HP splits in the first hp_max slots,
+    # quant splits in the next quant_max slots. Stage-2 reduces both in one
+    # launch.
+    mixed_attn_logits: Optional[torch.Tensor] = None
+    mixed_attn_lse: Optional[torch.Tensor] = None
+    # Per-tier split counts populated by get_num_kv_splits_triton.
+    mixed_hp_num_kv_splits: Optional[torch.Tensor] = None
+    mixed_quant_num_kv_splits: Optional[torch.Tensor] = None
 
 
 class TritonAttnBackend(AttentionBackend):
@@ -121,6 +262,8 @@ class TritonAttnBackend(AttentionBackend):
         # Lazy import to avoid the initialization of cuda context
         from sglang.kernels.ops.attention.decode_attention import (
             decode_attention_fwd,
+            decode_attention_fwd_int2_unified,
+            decode_attention_fwd_quantized,
         )
         from sglang.kernels.ops.attention.extend_attention import (
             build_unified_kv_indices,
@@ -134,6 +277,12 @@ class TritonAttnBackend(AttentionBackend):
         super().__init__()
 
         self.decode_attention_fwd = torch.compiler.disable(decode_attention_fwd)
+        self.decode_attention_fwd_quantized = torch.compiler.disable(
+            decode_attention_fwd_quantized
+        )
+        self.decode_attention_fwd_int2_unified = torch.compiler.disable(
+            decode_attention_fwd_int2_unified
+        )
         self.extend_attention_fwd = torch.compiler.disable(extend_attention_fwd)
         self.extend_attention_fwd_unified = torch.compiler.disable(
             extend_attention_fwd_unified
@@ -195,11 +344,44 @@ class TritonAttnBackend(AttentionBackend):
             self.v_head_dim = model_runner.token_to_kv_pool.get_v_head_dim()
             self.swa_v_head_dim = None
         else:
-            self.v_head_dim = model_runner.token_to_kv_pool.get_value_buffer(0).shape[
-                -1
-            ]
+            self.v_head_dim = getattr(
+                model_runner.token_to_kv_pool,
+                "v_head_dim",
+                model_runner.token_to_kv_pool.get_value_buffer(0).shape[-1],
+            )
             self.swa_v_head_dim = None
         self.max_context_len = model_runner.model_config.context_len
+        self.enable_mixed_kv = (
+            getattr(model_runner.token_to_kv_pool, "mixed_kv_enabled", None) is not None
+            and model_runner.token_to_kv_pool.mixed_kv_enabled()
+            and not self.use_mla
+            and self.sliding_window_size is None
+            and self.swa_v_head_dim is None
+        )
+        self.mixed_hp_prefix_tokens = (
+            model_runner.token_to_kv_pool.hp_prefix_tokens
+            if self.enable_mixed_kv
+            else 0
+        )
+        self.mixed_hp_recent_tokens = (
+            model_runner.token_to_kv_pool.hp_recent_tokens
+            if self.enable_mixed_kv
+            else 0
+        )
+        self.mixed_hp_global_offset = (
+            model_runner.token_to_kv_pool.hp_global_offset
+            if self.enable_mixed_kv
+            else 0
+        )
+        # Mixed-KV decode uses a fixed HP split count because the HP window is
+        # bounded by ``hp_prefix + hp_recent + flush_interval - 1`` tokens.
+        # ``SGLANG_MIXED_KV_HP_MAX_SPLITS`` is therefore the direct per-request
+        # HP cap for the unified int2 decode path.
+        self.max_hp_kv_splits = (
+            envs.SGLANG_MIXED_KV_HP_MAX_SPLITS.get() if self.enable_mixed_kv else 0
+        )
+        # Output dtype for per-tier intermediate buffers in the mixed-KV path.
+        self.model_dtype = model_runner.dtype
         self.device = model_runner.device
         self.device_core_count = get_device_core_count(model_runner.gpu_id)
         self.static_kv_splits = get_bool_env_var(
@@ -289,7 +471,16 @@ class TritonAttnBackend(AttentionBackend):
         self,
         num_kv_splits: torch.Tensor,
         seq_lens: torch.Tensor,
+        max_kv_splits: Optional[int] = None,
     ):
+        """Fill ``num_kv_splits`` with a per-sequence split count.
+
+        ``max_kv_splits`` overrides the per-call upper bound (defaults to
+        ``self.max_kv_splits``). The mixed-KV path uses the override to cap
+        the HP-side split count independently of the quant/primary side.
+        """
+        if max_kv_splits is None:
+            max_kv_splits = self.max_kv_splits
         num_token, num_seq = num_kv_splits.shape[0], seq_lens.shape[0]
         # NOTE(alcanderian): Considering speculative_decodeing,
         # num_kv_splits.shape[0] will be topk * real_num_token.
@@ -303,7 +494,7 @@ class TritonAttnBackend(AttentionBackend):
         if (
             self.static_kv_splits or self.device_core_count <= 0
         ) and not self.enable_deterministic:
-            num_kv_splits.fill_(self.max_kv_splits)
+            num_kv_splits.fill_(max_kv_splits)
             return
 
         if self.split_tile_size is not None and self.enable_deterministic:
@@ -312,9 +503,10 @@ class TritonAttnBackend(AttentionBackend):
             else:
                 expanded_seq_lens = seq_lens
 
-            num_kv_splits[:] = (
-                expanded_seq_lens + self.split_tile_size - 1
-            ) // self.split_tile_size
+            num_kv_splits[:] = torch.clamp(
+                (expanded_seq_lens + self.split_tile_size - 1) // self.split_tile_size,
+                max=max_kv_splits,
+            )
             return
 
         if num_seq < 256:
@@ -329,10 +521,185 @@ class TritonAttnBackend(AttentionBackend):
             num_group,
             self.num_head,
             self.num_kv_head,
-            self.max_kv_splits,
+            max_kv_splits,
             self.device_core_count,
             MAX_NUM_SEQ=SCHEDULE_SEQ,
         )
+
+    def _build_mixed_kv_indices(
+        self,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        hp_kv_indptr: torch.Tensor,
+        hp_kv_indices: torch.Tensor,
+        quant_kv_indptr: torch.Tensor,
+        quant_kv_indices: torch.Tensor,
+        bs: int,
+    ):
+        """Classify each token's slot id as HP vs quant and scatter into the
+        caller-provided per-tier index buffers.
+
+        Sync-free on the decode hot path. Previously this routine ran a
+        ``for i in range(bs)`` Python loop with ``rows[hp_mask[i]]``
+        masked-selects whose output shape is data-dependent -- each
+        masked-select forces a cudaStreamSynchronize so PyTorch can learn the
+        size. That was the single biggest CPU-critical-path blocker in
+        mixed-KV decode after the flush pipeline was fused.
+
+        The replacement:
+          * ``hp_kv_indptr`` is built from a Triton HP-length counting kernel
+            that streams ``req_to_token`` through the req-pool indirection --
+            no dense gather/mask materialization, no sync.
+          * ``quant_kv_indptr`` is derived from the full sequence lengths minus
+            the HP prefix sum, so there is no separate quant-length pass.
+          * The per-(req, pos) scatter into ``hp_kv_indices`` /
+            ``quant_kv_indices`` happens inside a single triton kernel
+            (``_scatter_mixed_kv_indices_kernel``) that walks each request's
+            ``[0, seq_len)`` range in ``BLOCK_SIZE`` chunks and uses
+            ``tl.cumsum`` for within-block ranks. No Python bs-loop, no
+            masked-select, no sync.
+        """
+        seq_lens = seq_lens[:bs]
+        req_pool_indices = req_pool_indices[:bs].to(torch.int64)
+        # Cast seq_lens to int32 once; both mixed-KV Triton kernels want
+        # int32. Keeps the conversion off the hot path's per-step alloc trail.
+        seq_lens_i32 = seq_lens.to(torch.int32)
+        hp_lens = torch.empty_like(seq_lens_i32)
+        # Count directly from ``req_to_token`` so the hot path no longer
+        # materializes a dense gathered ``rows`` tensor or boolean masks.
+        _count_mixed_hp_lens_kernel[(bs,)](
+            self.req_to_token,
+            req_pool_indices,
+            seq_lens_i32,
+            hp_lens,
+            self.req_to_token.stride(0),
+            HP_OFFSET=int(self.mixed_hp_global_offset),
+            BLOCK_SIZE=512,
+            num_warps=2,
+            num_stages=1,
+        )
+
+        # indptr = exclusive prefix sum of per-req lengths. ``cumsum`` + slice
+        # assignment are shape-static so no D2H read is forced. The leading
+        # ``[0]`` element stays at zero from the buffer's ``torch.zeros``
+        # allocation; assigning a Python scalar there would force a sync H2D
+        # copy that blocks the CPU on prior decode work, recreating the
+        # ~1.5 ms inter-step bubble.
+        hp_kv_indptr[1 : bs + 1] = torch.cumsum(hp_lens, dim=0)
+        quant_kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens_i32, dim=0)
+        quant_kv_indptr[1 : bs + 1] -= hp_kv_indptr[1 : bs + 1]
+
+        # Single triton launch scatters the tier-classified slot ids directly
+        # into the pre-sized destination buffers. BLOCK_SIZE here is the
+        # per-request chunk size; picking 512 matches
+        # ``create_flashinfer_kv_indices_triton`` and balances occupancy
+        # against the ``tl.cumsum`` reduction depth.
+        _scatter_mixed_kv_indices_kernel[(bs,)](
+            self.req_to_token,
+            req_pool_indices,
+            seq_lens_i32,
+            hp_kv_indptr,
+            quant_kv_indptr,
+            hp_kv_indices,
+            quant_kv_indices,
+            self.req_to_token.stride(0),
+            HP_OFFSET=int(self.mixed_hp_global_offset),
+            BLOCK_SIZE=512,
+            num_warps=2,
+            num_stages=1,
+        )
+
+    def _forward_extend_quantized_dense(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        o: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        causal: bool,
+        pre_rotated_q: Optional[torch.Tensor] = None,
+        pre_rotated_k: Optional[torch.Tensor] = None,
+        pre_rotated_v: Optional[torch.Tensor] = None,
+        need_v_inverse_override: Optional[bool] = None,
+    ):
+        kv_pool = self.token_to_kv_pool
+        q3 = (
+            pre_rotated_q
+            if pre_rotated_q is not None
+            else q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        )
+        k3 = pre_rotated_k if pre_rotated_k is not None else k.contiguous()
+        v3 = pre_rotated_v if pre_rotated_v is not None else v.contiguous()
+        if need_v_inverse_override is None:
+            q3, k3, v3, need_v_inverse = prepare_quantized_extend_qkv(
+                kv_pool,
+                layer,
+                q3,
+                k3,
+                v3,
+                q_already_hadamard_transformed=pre_rotated_q is not None,
+                kv_already_hadamard_transformed=(
+                    pre_rotated_k is not None and pre_rotated_v is not None
+                ),
+            )
+        else:
+            need_v_inverse = need_v_inverse_override
+
+        prefix_k, prefix_v = dequantize_prefix_kv(
+            kv_pool,
+            layer.layer_id,
+            self.forward_metadata.kv_indices,
+            q3.dtype,
+        )
+
+        unified_k_parts = []
+        unified_v_parts = []
+        unified_k_lens = []
+        prefix_indptr = self.forward_metadata.kv_indptr
+        extend_start_loc = forward_batch.extend_start_loc
+        for i, extend_len in enumerate(forward_batch.extend_seq_lens_cpu):
+            prefix_start = int(prefix_indptr[i].item())
+            prefix_end = int(prefix_indptr[i + 1].item())
+            extend_start = int(extend_start_loc[i].item())
+            extend_end = extend_start + int(extend_len)
+            req_k = torch.cat(
+                [prefix_k[prefix_start:prefix_end], k3[extend_start:extend_end]], dim=0
+            )
+            req_v = torch.cat(
+                [prefix_v[prefix_start:prefix_end], v3[extend_start:extend_end]], dim=0
+            )
+            unified_k_parts.append(req_k)
+            unified_v_parts.append(req_v)
+            unified_k_lens.append(req_k.shape[0])
+
+        unified_k = torch.cat(unified_k_parts, dim=0) if unified_k_parts else k3[:0]
+        unified_v = torch.cat(unified_v_parts, dim=0) if unified_v_parts else v3[:0]
+        cu_seqlens_q = self.forward_metadata.qo_indptr.to(torch.int32)
+        cu_seqlens_k = torch.empty(
+            (len(unified_k_lens) + 1,), dtype=torch.int32, device=self.device
+        )
+        cu_seqlens_k[0] = 0
+        cu_seqlens_k[1:] = torch.cumsum(
+            torch.tensor(unified_k_lens, dtype=torch.int32, device=self.device), dim=0
+        )
+
+        result = flash_attn_varlen_func(
+            q=q3,
+            k=unified_k,
+            v=unified_v,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max(forward_batch.extend_seq_lens_cpu),
+            max_seqlen_k=max(unified_k_lens) if unified_k_lens else 0,
+            softmax_scale=layer.scaling,
+            causal=causal,
+            window_size=(-1, -1),
+            softcap=logit_capping_mod(layer.logit_capping_method, layer.logit_cap),
+        )
+        result = apply_inverse_v_rotation(result, kv_pool, layer, need_v_inverse)
+        o.copy_(result.view_as(o))
+        return o
 
     def _dcp_lens(self, lens: torch.Tensor, start: Optional[torch.Tensor] = None):
         return get_dcp_lens(lens, self.dcp_size, self.dcp_rank, start)
@@ -695,6 +1062,14 @@ class TritonAttnBackend(AttentionBackend):
         window_kv_offsets = None
         swa_attn_logits = None
         spec_info = forward_batch.spec_info
+        mixed_hp_kv_indptr = None
+        mixed_hp_kv_indices = None
+        mixed_quant_kv_indptr = None
+        mixed_quant_kv_indices = None
+        mixed_attn_logits = None
+        mixed_attn_lse = None
+        mixed_hp_num_kv_splits = None
+        mixed_quant_num_kv_splits = None
 
         if forward_batch.forward_mode.is_decode_or_idle():
             if spec_info is None or spec_info.kv_indptr is None:
@@ -723,6 +1098,55 @@ class TritonAttnBackend(AttentionBackend):
                     )
                     if self._translate_kv_loc is not None:
                         kv_indices = self._translate_kv_loc(kv_indices)
+                if self.enable_mixed_kv:
+                    mixed_hp_kv_indptr = torch.zeros(
+                        (bs + 1,), dtype=torch.int32, device=self.device
+                    )
+                    mixed_quant_kv_indptr = torch.zeros(
+                        (bs + 1,), dtype=torch.int32, device=self.device
+                    )
+                    mixed_hp_kv_indices = torch.empty(
+                        forward_batch.seq_lens_sum,
+                        dtype=torch.int64,
+                        device=self.device,
+                    )
+                    mixed_quant_kv_indices = torch.empty(
+                        forward_batch.seq_lens_sum,
+                        dtype=torch.int64,
+                        device=self.device,
+                    )
+                    total_splits = self.max_kv_splits + self.max_hp_kv_splits
+                    # Single combined stage-1 scratch. LSE is pre-filled with
+                    # -inf so the tier-agnostic stage-2 can skip unused splits.
+                    mixed_attn_logits = torch.empty(
+                        (bs, self.num_head, total_splits, self.v_head_dim),
+                        dtype=torch.float32,
+                        device=self.device,
+                    )
+                    mixed_attn_lse = torch.full(
+                        (bs, self.num_head, total_splits),
+                        float("-inf"),
+                        dtype=torch.float32,
+                        device=self.device,
+                    )
+                    mixed_hp_num_kv_splits = torch.full(
+                        (bs,),
+                        self.max_hp_kv_splits,
+                        dtype=torch.int32,
+                        device=self.device,
+                    )
+                    mixed_quant_num_kv_splits = torch.empty(
+                        (bs,), dtype=torch.int32, device=self.device
+                    )
+                    self._build_mixed_kv_indices(
+                        forward_batch.req_pool_indices,
+                        forward_batch.seq_lens,
+                        mixed_hp_kv_indptr,
+                        mixed_hp_kv_indices,
+                        mixed_quant_kv_indptr,
+                        mixed_quant_kv_indices,
+                        bs,
+                    )
                 if (
                     self.sliding_window_size is not None
                     and self.sliding_window_size > 0
@@ -766,14 +1190,22 @@ class TritonAttnBackend(AttentionBackend):
                 device=self.device,
             )
             num_kv_splits = torch.empty((bs,), dtype=torch.int32, device=self.device)
-            self.get_num_kv_splits(
-                num_kv_splits,
-                (
-                    self._dcp_lens(forward_batch.seq_lens).clamp_min(1)
-                    if self.dcp_size > 1
-                    else forward_batch.seq_lens
-                ),
-            )
+            if self.enable_mixed_kv and mixed_quant_num_kv_splits is not None:
+                # HP uses the fixed cap above; only the quant tier is
+                # right-sized, and it uses the full sequence length as a cheap
+                # planning proxy instead of per-tier mixed-KV counts.
+                self.get_num_kv_splits(
+                    mixed_quant_num_kv_splits, forward_batch.seq_lens
+                )
+            else:
+                self.get_num_kv_splits(
+                    num_kv_splits,
+                    (
+                        self._dcp_lens(forward_batch.seq_lens).clamp_min(1)
+                        if self.dcp_size > 1
+                        else forward_batch.seq_lens
+                    ),
+                )
 
             qo_indptr = None
             custom_mask = None
@@ -923,6 +1355,14 @@ class TritonAttnBackend(AttentionBackend):
             swa_attn_logits=swa_attn_logits,
             swa_out_cache_loc=swa_out_cache_loc,
             out_cache_loc_full_physical=out_cache_loc_full_physical,
+            mixed_hp_kv_indptr=mixed_hp_kv_indptr,
+            mixed_hp_kv_indices=mixed_hp_kv_indices,
+            mixed_quant_kv_indptr=mixed_quant_kv_indptr,
+            mixed_quant_kv_indices=mixed_quant_kv_indices,
+            mixed_attn_logits=mixed_attn_logits,
+            mixed_attn_lse=mixed_attn_lse,
+            mixed_hp_num_kv_splits=mixed_hp_num_kv_splits,
+            mixed_quant_num_kv_splits=mixed_quant_num_kv_splits,
         )
 
     def init_cuda_graph_state(
@@ -1022,6 +1462,47 @@ class TritonAttnBackend(AttentionBackend):
                 device=self.device,
             )
 
+        if self.enable_mixed_kv:
+            self.cuda_graph_mixed_hp_kv_indptr = torch.zeros(
+                (max_bs + 1,), dtype=torch.int32, device=self.device
+            )
+            self.cuda_graph_mixed_quant_kv_indptr = torch.zeros(
+                (max_bs + 1,), dtype=torch.int32, device=self.device
+            )
+            self.cuda_graph_mixed_hp_kv_indices = torch.zeros(
+                (max_num_tokens * self.max_context_len),
+                dtype=torch.int64,
+                device=self.device,
+            )
+            self.cuda_graph_mixed_quant_kv_indices = torch.zeros(
+                (max_num_tokens * self.max_context_len),
+                dtype=torch.int64,
+                device=self.device,
+            )
+            total_splits = self.max_kv_splits + self.max_hp_kv_splits
+            # Single combined stage-1 scratch. LSE pre-filled to -inf so the
+            # tier-agnostic stage-2 skips unused splits.
+            self.cuda_graph_mixed_attn_logits = torch.zeros(
+                (max_num_tokens, self.num_head, total_splits, self.v_head_dim),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            self.cuda_graph_mixed_attn_lse = torch.full(
+                (max_num_tokens, self.num_head, total_splits),
+                float("-inf"),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            self.cuda_graph_mixed_hp_num_kv_splits = torch.full(
+                (max_num_tokens,),
+                self.max_hp_kv_splits,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            self.cuda_graph_mixed_quant_num_kv_splits = torch.zeros(
+                (max_num_tokens,), dtype=torch.int32, device=self.device
+            )
+
     def _build_cuda_graph_forward_metadata(
         self,
         bs: int,
@@ -1060,6 +1541,42 @@ class TritonAttnBackend(AttentionBackend):
                 swa_attn_logits=self.cuda_graph_swa_attn_logits,
                 swa_out_cache_loc=swa_out_cache_loc,
                 out_cache_loc_full_physical=out_cache_loc_full_physical,
+                mixed_hp_kv_indptr=(
+                    self.cuda_graph_mixed_hp_kv_indptr[: bs + 1]
+                    if self.enable_mixed_kv
+                    else None
+                ),
+                mixed_hp_kv_indices=(
+                    self.cuda_graph_mixed_hp_kv_indices
+                    if self.enable_mixed_kv
+                    else None
+                ),
+                mixed_quant_kv_indptr=(
+                    self.cuda_graph_mixed_quant_kv_indptr[: bs + 1]
+                    if self.enable_mixed_kv
+                    else None
+                ),
+                mixed_quant_kv_indices=(
+                    self.cuda_graph_mixed_quant_kv_indices
+                    if self.enable_mixed_kv
+                    else None
+                ),
+                mixed_attn_logits=(
+                    self.cuda_graph_mixed_attn_logits if self.enable_mixed_kv else None
+                ),
+                mixed_attn_lse=(
+                    self.cuda_graph_mixed_attn_lse if self.enable_mixed_kv else None
+                ),
+                mixed_hp_num_kv_splits=(
+                    self.cuda_graph_mixed_hp_num_kv_splits
+                    if self.enable_mixed_kv
+                    else None
+                ),
+                mixed_quant_num_kv_splits=(
+                    self.cuda_graph_mixed_quant_num_kv_splits
+                    if self.enable_mixed_kv
+                    else None
+                ),
             )
         elif forward_mode.is_target_verify():
             custom_mask = (
@@ -1134,6 +1651,24 @@ class TritonAttnBackend(AttentionBackend):
             _, _, window_kv_lens, num_kv_splits_lens = self._update_decode_kv_buffers(
                 bs, seq_lens, req_pool_indices
             )
+            if self.enable_mixed_kv:
+                self._build_mixed_kv_indices(
+                    req_pool_indices,
+                    seq_lens,
+                    self.cuda_graph_mixed_hp_kv_indptr,
+                    self.cuda_graph_mixed_hp_kv_indices,
+                    self.cuda_graph_mixed_quant_kv_indptr,
+                    self.cuda_graph_mixed_quant_kv_indices,
+                    bs,
+                )
+                self.cuda_graph_mixed_hp_num_kv_splits[:bs] = self.max_hp_kv_splits
+                # Quant tier is right-sized from the full sequence length (cheap
+                # planning proxy); the unified attention wrapper re-fills LSE
+                # with -inf every call so the shared scratch enters stage-2 in
+                # a known state.
+                self.get_num_kv_splits(
+                    self.cuda_graph_mixed_quant_num_kv_splits[:bs], seq_lens[:bs]
+                )
             self.get_num_kv_splits(
                 self.cuda_graph_num_kv_splits[:bs], num_kv_splits_lens[:bs]
             )
@@ -1225,7 +1760,33 @@ class TritonAttnBackend(AttentionBackend):
         else:
             o = torch.empty_like(q)
 
+        kv_pool = self.token_to_kv_pool
+        kv_dtype_is_int2 = (
+            isinstance(kv_pool, (MHATokenToKVPool, UnifiedInt2HPKVPool))
+            and kv_pool.dtype == "int2"
+        )
+        # Int2 prefill used to rotate K/V once for attention and again when
+        # writing the KV cache. Pre-rotate here so both consumers can share
+        # the same tensors; the write then passes
+        # ``already_hadamard_transformed=True`` so the pool skips its own
+        # rotation.
+        use_quantized_dense_prefill = (
+            kv_dtype_is_int2
+            and not self.enable_deterministic
+            and self.dcp_size == 1
+            and (layer.sliding_window_size is None or layer.sliding_window_size <= -1)
+            and self.forward_metadata.custom_mask is None
+            and self.forward_metadata.window_kv_offsets is None
+        )
+        pre_rotated_q = None
+        pre_rotated_k = None
+        pre_rotated_v = None
+        need_v_inverse = None
+
         if k is None and v is None:
+            assert (
+                not kv_dtype_is_int2
+            ), "int2 KV cache cannot rebuild K/V from the packed pool buffers"
             pool = self.token_to_kv_pool
             cache_loc = forward_batch.out_cache_loc
             if isinstance(pool, SWAKVPool) and pool.layers_mapping[layer.layer_id][1]:
@@ -1236,6 +1797,16 @@ class TritonAttnBackend(AttentionBackend):
         elif k is None or v is None:
             raise ValueError("Both k and v should be None or not None")
         else:
+            if use_quantized_dense_prefill:
+                pre_rotated_q, pre_rotated_k, pre_rotated_v, need_v_inverse = (
+                    prepare_quantized_extend_qkv(
+                        kv_pool,
+                        layer,
+                        q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                        k.contiguous(),
+                        v.contiguous(),
+                    )
+                )
             # Save KV cache first (must do this before unified kernel)
             if save_kv_cache:
                 loc_info = KVWriteLoc(
@@ -1243,7 +1814,19 @@ class TritonAttnBackend(AttentionBackend):
                     self.forward_metadata.swa_out_cache_loc,
                     full_loc=self.forward_metadata.out_cache_loc_full_physical,
                 )
-                if layer.k_scale is None:
+                if pre_rotated_k is not None and pre_rotated_v is not None:
+                    # Int2: write the pre-rotated K/V so the pool keeps the
+                    # rotated-domain representation without a second rotation.
+                    kv_pool.set_kv_buffer(
+                        layer,
+                        loc_info,
+                        pre_rotated_k,
+                        pre_rotated_v,
+                        layer.k_scale,
+                        layer.v_scale,
+                        already_hadamard_transformed=True,
+                    )
+                elif layer.k_scale is None:
                     self._set_kv_buffer(forward_batch, layer, loc_info, k, v)
                 elif self.use_mla:
                     # For MLA, scale K manually before storing since MLATokenToKVPool
@@ -1301,6 +1884,21 @@ class TritonAttnBackend(AttentionBackend):
                 sinks,
                 score_mod=score_mod,
                 aux_tensors=aux_tensors,
+            )
+
+        if use_quantized_dense_prefill:
+            return self._forward_extend_quantized_dense(
+                q,
+                k,
+                v,
+                o,
+                layer,
+                forward_batch,
+                causal,
+                pre_rotated_q=pre_rotated_q,
+                pre_rotated_k=pre_rotated_k,
+                pre_rotated_v=pre_rotated_v,
+                need_v_inverse_override=need_v_inverse,
             )
 
         # Normal mode: use original 2-stage kernel
@@ -1701,6 +2299,18 @@ class TritonAttnBackend(AttentionBackend):
                     k,
                     v,
                 )
+            elif isinstance(self.token_to_kv_pool, UnifiedInt2HPKVPool):
+                # Mixed HP+int2 decode write: loc holds HP-recent slot ids from
+                # alloc_hp_recent; is_decode routes to the HP-only write path.
+                self.token_to_kv_pool.set_kv_buffer(
+                    layer,
+                    forward_batch.out_cache_loc,
+                    k,
+                    v,
+                    layer.k_scale,
+                    layer.v_scale,
+                    is_decode=True,
+                )
             else:
                 self._set_kv_buffer(
                     forward_batch,
@@ -1739,6 +2349,120 @@ class TritonAttnBackend(AttentionBackend):
             and layer.v_head_dim == self.swa_v_head_dim
         ):
             attn_logits = self.forward_metadata.swa_attn_logits
+
+        # Int2 quantized KV cache path (the only supported quant tier).
+        kv_pool = self.token_to_kv_pool
+        if isinstance(kv_pool, (MHATokenToKVPool, UnifiedInt2HPKVPool)) and (
+            kv_pool.dtype == "int2"
+        ):
+            assert self.dcp_size == 1, "int2 KV cache does not support DCP"
+            uses_oscar = _pool_uses_oscar_rotation(kv_pool)
+
+            q_for_decode = q.contiguous().view(
+                -1, layer.tp_q_head_num, layer.qk_head_dim
+            )
+            mixed_decode_metadata_available = (
+                self.forward_metadata.mixed_hp_kv_indptr is not None
+            )
+            mixed_decode_enabled = (
+                self.enable_mixed_kv
+                and sinks is None
+                and mixed_decode_metadata_available
+            )
+            if (
+                self.enable_mixed_kv
+                and mixed_decode_metadata_available
+                and sinks is not None
+            ):
+                raise NotImplementedError(
+                    "Mixed KV windows do not support sink tokens in Triton decode."
+                )
+
+            # Hard guarantee that the upstream gating actually held: if mixed
+            # KV is enabled with an int2 pool, ``init_forward_metadata`` must
+            # have built the per-tier indices. Falling through to the
+            # non-mixed ``decode_attention_fwd_quantized`` path would treat
+            # HP slot ids (>= HP_OFFSET) as quant slot ids and read OOB
+            # garbage from the quant buffer. The known offenders are the
+            # ``spec_info != None`` decode-or-idle paths (currently gated out
+            # at server-args level); this assertion makes the gating
+            # load-bearing at the kernel boundary so any future widening of
+            # those upstream gates surfaces here loudly instead of silently
+            # corrupting attention output.
+            if self.enable_mixed_kv:
+                assert mixed_decode_metadata_available, (
+                    "Mixed-KV pool active but mixed decode metadata not built. "
+                    "spec_info / non-decode-or-idle paths must not reach the "
+                    "mixed-KV decode dispatch -- check upstream gating in "
+                    "ServerArgs._unified_mixed_kv_active and the "
+                    "KVCacheConfigurator int2 pool selection."
+                )
+
+            oscar_layer_idx = layer.layer_id - kv_pool.start_layer
+
+            if uses_oscar:
+                q_for_decode = _apply_oscar_rotation(
+                    q_for_decode, kv_pool._R_k[oscar_layer_idx]
+                )
+            else:
+                q_for_decode = apply_segmented_hadamard_transform(q_for_decode)
+            if mixed_decode_enabled:
+                bs = q_for_decode.shape[0]
+                self.decode_attention_fwd_int2_unified(
+                    q_for_decode,
+                    kv_pool.get_hp_key_buffer(layer.layer_id),
+                    kv_pool.get_hp_value_buffer(layer.layer_id),
+                    kv_pool.get_raw_key_buffer(layer.layer_id),
+                    kv_pool.get_raw_value_buffer(layer.layer_id),
+                    kv_pool.get_key_scales_zeros(layer.layer_id),
+                    kv_pool.get_value_scales_zeros(layer.layer_id),
+                    o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                    self.forward_metadata.mixed_hp_kv_indptr,
+                    self.forward_metadata.mixed_hp_kv_indices,
+                    self.forward_metadata.mixed_quant_kv_indptr,
+                    self.forward_metadata.mixed_quant_kv_indices,
+                    self.forward_metadata.mixed_attn_logits[:bs],
+                    self.forward_metadata.mixed_attn_lse[:bs],
+                    self.forward_metadata.mixed_hp_num_kv_splits[:bs],
+                    self.forward_metadata.mixed_quant_num_kv_splits[:bs],
+                    self.max_hp_kv_splits,
+                    self.max_kv_splits,
+                    layer.scaling,
+                    logit_cap=logits_soft_cap,
+                    sinks=sinks,
+                    xai_temperature_len=layer.xai_temperature_len,
+                )
+            else:
+                # Use optimized quantized attention kernel
+                self.decode_attention_fwd_quantized(
+                    q_for_decode,
+                    kv_pool.get_raw_key_buffer(layer.layer_id),
+                    kv_pool.get_raw_value_buffer(layer.layer_id),
+                    kv_pool.get_key_scales_zeros(layer.layer_id),
+                    kv_pool.get_value_scales_zeros(layer.layer_id),
+                    o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                    kv_indptr,
+                    kv_indices,
+                    self.forward_metadata.attn_logits,
+                    self.forward_metadata.attn_lse,
+                    self.forward_metadata.num_kv_splits,
+                    self.max_kv_splits,
+                    layer.scaling,
+                    kv_pool.dtype,
+                    logit_cap=logits_soft_cap,
+                    sinks=sinks,
+                    xai_temperature_len=layer.xai_temperature_len,
+                )
+            # int2: V is always rotated, so apply the inverse rotation to the
+            # output. Oscar mode uses ``o @ R_v.T``; Hadamard mode re-applies
+            # the segmented FWHT (self-inverse with 1/sqrt(N)).
+            if uses_oscar:
+                R_v = kv_pool._R_v[oscar_layer_idx]
+                o3 = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+                o3.copy_((o3.to(R_v.dtype) @ R_v.T).to(o3.dtype))
+            else:
+                o = apply_segmented_hadamard_transform(o)
+            return o
 
         if self.dcp_size > 1:
             if score_mod is not None:

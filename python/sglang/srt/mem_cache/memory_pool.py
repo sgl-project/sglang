@@ -32,6 +32,7 @@ from dataclasses import dataclass, fields
 from functools import cached_property
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
 
+import msgspec
 import numpy as np
 import torch
 import triton
@@ -49,15 +50,24 @@ from sglang.kernels.ops.kvcache.cache_move import (
     store_cache_4d,
 )
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
+from sglang.QuantKernel.fused_hadamard_int2_kv import (
+    can_fuse_hadamard_grouped_int2,
+    quantized_set_kv_int2_hadamard_fused_triton,
+    validate_hadamard_order_for_kv_fuse_int2,
+)
 from sglang.srt.configs.mamba_utils import BaseLinearStateParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
+from sglang.srt.layers.attention.quantized_kv_prefill import (
+    apply_segmented_hadamard_transform as _apply_segmented_hadamard_transform,
+)
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     UnquantizedKVCacheMethod,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
+from sglang.srt.mem_cache.kv_quant_kernels import quantized_set_kv_int2_triton
 from sglang.srt.mem_cache.kv_vmm_backing import KvVmmBufferOwner
 from sglang.srt.mem_cache.layout.page_major import (
     build_page_major_mamba_views,
@@ -123,6 +133,99 @@ def conv_window_dedup_enabled(
         and not is_kda
         and (speculative_eagle_topk is None or speculative_eagle_topk <= 1)
     )
+
+
+class OscarRotationConfig(msgspec.Struct, frozen=True, kw_only=True):
+    """Config for the Oscar-style learned rotation + per-row clip applied to
+    int2 KV cache. The rotation matrices in ``k_rotation_path`` /
+    ``v_rotation_path`` (loaded via :func:`load_oscar_rotations`) are applied
+    to K/V rows; clip ratios drive per-row quantile clipping. Empty rotation
+    paths disable the Oscar path (the unified pool then has no rotations
+    loaded and rejects construction)."""
+
+    k_rotation_path: str
+    v_rotation_path: str
+    k_clip_ratio: float
+    v_clip_ratio: float
+
+    def __post_init__(self):
+        for name, r in (("k", self.k_clip_ratio), ("v", self.v_clip_ratio)):
+            if not (0.0 <= r <= 1.0):
+                raise ValueError(
+                    f"SGLANG_OSCAR_{name.upper()}_CLIP_RATIO must be in [0, 1], got {r}"
+                )
+        if not (self.k_rotation_path and self.v_rotation_path):
+            raise ValueError(
+                "Oscar int2 KV cache requires both SGLANG_OSCAR_K_ROTATION_PATH "
+                "and SGLANG_OSCAR_V_ROTATION_PATH to point at rotation checkpoints"
+            )
+
+
+def load_oscar_rotation_config() -> OscarRotationConfig:
+    """Build a :class:`OscarRotationConfig` from the ``SGLANG_OSCAR_*``
+    environment variables (registered in ``sglang.srt.environ``).
+
+    Values are read on every call, not at import time, so tests can use
+    ``envs.SGLANG_OSCAR_*.override(...)`` (or plain ``os.environ[...] = ...``)
+    to flip the config between pool constructions without reloading this
+    module.
+    """
+    return OscarRotationConfig(
+        k_rotation_path=envs.SGLANG_OSCAR_K_ROTATION_PATH.get(),
+        v_rotation_path=envs.SGLANG_OSCAR_V_ROTATION_PATH.get(),
+        k_clip_ratio=envs.SGLANG_OSCAR_K_CLIP_RATIO.get(),
+        v_clip_ratio=envs.SGLANG_OSCAR_V_CLIP_RATIO.get(),
+    )
+
+
+def load_oscar_rotations(
+    path: str,
+    layer_num: int,
+    start_layer: int,
+    head_dim: int,
+    device: torch.device,
+    dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """Load per-layer Oscar rotation matrices from ``path``.
+
+    The checkpoint schema is the one produced by the offline Oscar pipeline::
+
+        {"layers": {layer_id: {"rotation": Tensor[head_dim, head_dim]}, ...}}
+
+    Returns a stacked tensor of shape ``[layer_num, head_dim, head_dim]`` in
+    ``dtype`` on ``device``, indexed by local layer index
+    (``global_layer_id - start_layer``). Raises ``ValueError`` if any layer in
+    ``[start_layer, start_layer + layer_num)`` is missing or has mismatched
+    head_dim.
+    """
+    state = torch.load(path, map_location="cpu")
+    if "layers" not in state:
+        raise ValueError(f"Oscar rotation checkpoint at {path} missing 'layers' key")
+    layers = state["layers"]
+    out = torch.empty((layer_num, head_dim, head_dim), dtype=dtype)
+    for local in range(layer_num):
+        global_lid = start_layer + local
+        if global_lid not in layers and str(global_lid) not in layers:
+            raise ValueError(
+                f"Oscar rotation checkpoint at {path} missing layer {global_lid}"
+            )
+        ldata = layers.get(global_lid, layers.get(str(global_lid)))
+        R = ldata["rotation"]
+        if R.shape != (head_dim, head_dim):
+            raise ValueError(
+                f"Oscar rotation layer {global_lid} has shape {tuple(R.shape)}, "
+                f"expected ({head_dim}, {head_dim})"
+            )
+        out[local] = R.to(dtype)
+    logger.info(
+        "Loaded Oscar rotation from %s for layers [%d, %d) head_dim=%d dtype=%s",
+        path,
+        start_layer,
+        start_layer + layer_num,
+        head_dim,
+        dtype,
+    )
+    return out.to(device)
 
 
 def get_tensor_size_bytes(t: Union[torch.Tensor, List[torch.Tensor]]):
@@ -1568,18 +1671,31 @@ class KVCache(abc.ABC):
         self,
         size: int,
         page_size: int,
-        dtype: torch.dtype,
+        dtype: Union[torch.dtype, str],
         layer_num: int,
         device: str,
         enable_memory_saver: bool,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
+        model_dtype: Optional[
+            torch.dtype
+        ] = None,  # to dequantize the kv cache to model_dtype
     ):
         self.size = size
         self.page_size = page_size
         self.dtype = dtype
         self.device = device
-        if dtype in (torch.float8_e5m2, torch.float8_e4m3fn, torch.float8_e4m3fnuz):
+        if model_dtype is not None:
+            self.model_dtype = model_dtype
+        elif dtype == "int2":
+            raise ValueError(f"model_dtype is required for {dtype} kv cache")
+
+        if dtype in (
+            torch.float8_e5m2,
+            torch.float8_e4m3fn,
+            torch.float8_e4m3fnuz,
+            "int2",
+        ):
             # NOTE: Store as torch.uint8 because Tensor.index_put is not implemented for torch.float8_e5m2
             self.store_dtype = torch.uint8
         else:
@@ -1702,6 +1818,9 @@ class MHATokenToKVPool(KVCache):
         kv_cache_layout: Optional[str] = None,
         quant_method=None,
         post_capture_active: bool = False,
+        model_dtype: Optional[torch.dtype] = None,
+        kv_cache_quant_group_size: Optional[int] = None,
+        scale_dtype: Optional[torch.dtype] = None,
     ):
         if post_capture_active:
             # Reserved upper bound only (unbacked VA): page-align UP so
@@ -1716,6 +1835,7 @@ class MHATokenToKVPool(KVCache):
             enable_memory_saver,
             start_layer,
             end_layer,
+            model_dtype,
         )
         self.post_capture_active = post_capture_active
         self._post_capture_owner = None
@@ -1726,6 +1846,22 @@ class MHATokenToKVPool(KVCache):
             if swa_v_head_dim is not None
             else v_head_dim if v_head_dim is not None else head_dim
         )
+        self.kv_cache_quant_group_size = kv_cache_quant_group_size
+        # Scale/zero dtype for int2-packed scales. fp32 preserves the historical
+        # default; bf16/fp16 are opt-in via env. Unused for non-int2 dtypes.
+        self.scale_dtype = scale_dtype if scale_dtype is not None else torch.float32
+        if self.dtype == "int2":
+            self.k_quant_group_size, self.k_num_scale_groups = (
+                self._resolve_quant_grouping(self.head_dim, "K")
+            )
+            self.v_quant_group_size, self.v_num_scale_groups = (
+                self._resolve_quant_grouping(self.v_head_dim, "V")
+            )
+        else:
+            self.k_quant_group_size = None
+            self.v_quant_group_size = None
+            self.k_num_scale_groups = None
+            self.v_num_scale_groups = None
 
         # Layout: NHD (default) | HND (SGLANG_USE_HND_KVCACHE) | vectorized_5d (ROCm AITER).
         # HND folds (page, head) into one paged index for per-kv-head sparse page tables
@@ -1800,6 +1936,35 @@ class MHATokenToKVPool(KVCache):
         self.row_dim = self.head_num * self.head_dim
         self.same_kv_dim = self.head_dim == self.v_head_dim
 
+    def _resolve_quant_grouping(
+        self, head_dim: int, tensor_name: str
+    ) -> tuple[int, int]:
+        group_size = (
+            head_dim
+            if self.kv_cache_quant_group_size is None
+            else self.kv_cache_quant_group_size
+        )
+        if group_size <= 0:
+            raise ValueError(
+                f"{tensor_name} kv_cache_quant_group_size must be positive, got {group_size}"
+            )
+        if head_dim % group_size != 0:
+            raise ValueError(
+                f"{tensor_name} head_dim ({head_dim}) must be divisible by "
+                f"kv_cache_quant_group_size ({group_size})"
+            )
+        return group_size, head_dim // group_size
+
+    def _allocate_scales_zeros_buffers(self, num_groups: int):
+        return [
+            torch.zeros(
+                (self.size + self.page_size, self.head_num, 2 * num_groups),
+                dtype=self.scale_dtype,
+                device=self.device,
+            )
+            for _ in range(self.layer_num)
+        ]
+
     def _init_kv_copy_and_warmup(self):
         # Zero-layer pool (e.g. all-SWA model's full sub-pool) has no buffers.
         if self.layer_num == 0:
@@ -1853,7 +2018,13 @@ class MHATokenToKVPool(KVCache):
         return not isinstance(self.quant_method, UnquantizedKVCacheMethod)
 
     def _create_buffers(self):
-        if self.is_quantized_kv_cache:
+        if self.dtype == "int2":
+            if self.post_capture_active:
+                raise NotImplementedError(
+                    "Post-capture KV backing is not supported for int2 KV cache."
+                )
+            self._create_int2_buffers()
+        elif self.is_quantized_kv_cache:
             if self.post_capture_active:
                 raise NotImplementedError(
                     "Post-capture KV backing is not supported for quantized KV cache."
@@ -1894,6 +2065,56 @@ class MHATokenToKVPool(KVCache):
         self.dq_v_buffer = buf.get("dq_v_buffer")
         self.store_dtype = buf.get("store_dtype", torch.uint8)
         self._check_quantized_buffer_access_requirements()
+
+    def _create_int2_buffers(self):
+        # INT2: 2-bit codes packed 4-per-byte into uint8, plus interleaved
+        # per-group (scale, zero) pairs in ``scale_dtype``.
+        assert (
+            self.head_dim % 4 == 0
+        ), f"head_dim: {self.head_dim}, kv cache dtype: int2"
+        assert (
+            self.v_head_dim % 4 == 0
+        ), f"v_head_dim: {self.v_head_dim}, kv cache dtype: int2"
+        self.k_scale_buffer = None
+        self.v_scale_buffer = None
+        self.dq_k_buffer = None
+        self.dq_v_buffer = None
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            with (
+                torch.cuda.use_mem_pool(self.custom_mem_pool)
+                if self.enable_custom_mem_pool
+                else nullcontext()
+            ):
+                self.k_buffer = [
+                    torch.zeros(
+                        (
+                            self.size + self.page_size,
+                            self.head_num,
+                            self.head_dim // 4,
+                        ),
+                        dtype=self.store_dtype,
+                        device=self.device,
+                    )
+                    for _ in range(self.layer_num)
+                ]
+                self.v_buffer = [
+                    torch.zeros(
+                        (
+                            self.size + self.page_size,
+                            self.head_num,
+                            self.v_head_dim // 4,
+                        ),
+                        dtype=self.store_dtype,
+                        device=self.device,
+                    )
+                    for _ in range(self.layer_num)
+                ]
+                self.k_scales_zeros = self._allocate_scales_zeros_buffers(
+                    self.k_num_scale_groups
+                )
+                self.v_scales_zeros = self._allocate_scales_zeros_buffers(
+                    self.v_num_scale_groups
+                )
 
     def _check_quantized_buffer_access_requirements(self):
         expected_workspace_dtype = self.quant_method.dequant_workspace_dtype()
@@ -1939,6 +2160,10 @@ class MHATokenToKVPool(KVCache):
         buffers = [*self.k_buffer, *self.v_buffer]
         if getattr(self, "k_scale_buffer", None) is not None:
             buffers.extend([*self.k_scale_buffer, *self.v_scale_buffer])
+        if self.dtype == "int2":
+            # INT2 stores interleaved (scale, zero) pairs per slot; they must
+            # be remapped together with the packed codes.
+            buffers.extend([*self.k_scales_zeros, *self.v_scales_zeros])
         return buffers
 
     def _init_data_ptrs_and_strides(self):
@@ -2196,6 +2421,10 @@ class MHATokenToKVPool(KVCache):
     def _get_key_buffer(self, layer_id: int):
         # for internal use of referencing
         local_layer_id = layer_id - self.start_layer
+        if self.dtype == "int2":
+            # Packed 2-bit codes; consumers use the raw uint8 buffer together
+            # with get_key_scales_zeros().
+            return self.k_buffer[local_layer_id]
         if (
             self.is_quantized_kv_cache
             and self.quant_method.needs_plain_kv_dequant_read()
@@ -2220,6 +2449,8 @@ class MHATokenToKVPool(KVCache):
     def _get_value_buffer(self, layer_id: int):
         # for internal use of referencing
         local_layer_id = layer_id - self.start_layer
+        if self.dtype == "int2":
+            return self.v_buffer[local_layer_id]
         if (
             self.is_quantized_kv_cache
             and self.quant_method.needs_plain_kv_dequant_read()
@@ -2241,6 +2472,130 @@ class MHATokenToKVPool(KVCache):
     def get_kv_buffer(self, layer_id: int):
         return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
 
+    def get_raw_key_buffer(self, layer_id: int):
+        """Get raw quantized K buffer without dequantization (int2)."""
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+        return self.k_buffer[layer_id - self.start_layer]
+
+    def get_raw_value_buffer(self, layer_id: int):
+        """Get raw quantized V buffer without dequantization (int2)."""
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+        return self.v_buffer[layer_id - self.start_layer]
+
+    def get_key_scales_zeros(self, layer_id: int):
+        """Get scales and zeros for K (int2 quantization)."""
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+        return self.k_scales_zeros[layer_id - self.start_layer]
+
+    def get_value_scales_zeros(self, layer_id: int):
+        """Get scales and zeros for V (int2 quantization)."""
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+        return self.v_scales_zeros[layer_id - self.start_layer]
+
+    def get_raw_kv_buffer(self, layer_id: int):
+        """
+        Get raw quantized KV buffer with scales/zeros for efficient dequantization.
+
+        Returns a dict containing:
+        - k_buffer: Raw quantized K buffer
+        - v_buffer: Raw quantized V buffer
+        - k_scales_zeros: Scales and zeros for K (if quantized)
+        - v_scales_zeros: Scales and zeros for V (if quantized)
+        - dtype: KV cache dtype string
+        """
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+
+        result = {
+            "k_buffer": self.k_buffer[layer_id - self.start_layer],
+            "v_buffer": self.v_buffer[layer_id - self.start_layer],
+            "dtype": self.dtype,
+        }
+
+        if self.dtype == "int2":
+            result["k_scales_zeros"] = self.k_scales_zeros[layer_id - self.start_layer]
+            result["v_scales_zeros"] = self.v_scales_zeros[layer_id - self.start_layer]
+        else:
+            result["k_scales_zeros"] = None
+            result["v_scales_zeros"] = None
+
+        return result
+
+    def _set_int2_kv_buffer(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        *,
+        already_hadamard_transformed: bool = False,
+    ):
+        # INT2: Hadamard rotation is mandatory (always fused)
+        hadamard_order = envs.SGLANG_HADAMARD_ORDER.get()
+        validate_hadamard_order_for_kv_fuse_int2(hadamard_order, cache_k.shape[-1])
+        validate_hadamard_order_for_kv_fuse_int2(hadamard_order, cache_v.shape[-1])
+        # The fused Hadamard+int2 kernel processes K and V in the same
+        # launch and so requires identical head_dim on both. Check that
+        # first; only then is it meaningful to call ``can_fuse_*`` per
+        # tensor (the per-tensor check inspects the scales/zeros layout
+        # for the same head_dim).
+        local_layer_id = layer_id - self.start_layer
+        kv_head_dim = cache_k.shape[-1]
+        kv_dims_match = kv_head_dim == cache_v.shape[-1]
+        use_fused_int2 = (
+            kv_dims_match
+            and can_fuse_hadamard_grouped_int2(
+                kv_head_dim, self.k_scales_zeros[local_layer_id]
+            )
+            and can_fuse_hadamard_grouped_int2(
+                kv_head_dim, self.v_scales_zeros[local_layer_id]
+            )
+        )
+        if already_hadamard_transformed:
+            # Prefill can reuse the already-rotated K/V tensors that fed the
+            # attention path, so grouped quantization does not force a second
+            # standalone Hadamard pass here.
+            quantized_set_kv_int2_triton(
+                cache_k,
+                cache_v,
+                loc,
+                self.k_buffer[local_layer_id],
+                self.v_buffer[local_layer_id],
+                self.k_scales_zeros[local_layer_id],
+                self.v_scales_zeros[local_layer_id],
+            )
+        elif use_fused_int2:
+            quantized_set_kv_int2_hadamard_fused_triton(
+                cache_k,
+                cache_v,
+                loc,
+                self.k_buffer[local_layer_id],
+                self.v_buffer[local_layer_id],
+                self.k_scales_zeros[local_layer_id],
+                self.v_scales_zeros[local_layer_id],
+                hadamard_order,
+            )
+        else:
+            cache_k = _apply_segmented_hadamard_transform(
+                cache_k, hadamard_order, cache_k.dtype
+            )
+            cache_v = _apply_segmented_hadamard_transform(
+                cache_v, hadamard_order, cache_v.dtype
+            )
+            quantized_set_kv_int2_triton(
+                cache_k,
+                cache_v,
+                loc,
+                self.k_buffer[local_layer_id],
+                self.v_buffer[local_layer_id],
+                self.k_scales_zeros[local_layer_id],
+                self.v_scales_zeros[local_layer_id],
+            )
+
     def set_kv_buffer(
         self,
         layer: RadixAttention,
@@ -2251,6 +2606,7 @@ class MHATokenToKVPool(KVCache):
         v_scale: Optional[float] = None,
         layer_id_override: Optional[int] = None,
         dcp_kv_mask: Optional[torch.Tensor] = None,
+        already_hadamard_transformed: bool = False,
     ):
         loc, _, _ = unwrap_write_loc(loc_info)
         # Catch stale slot ids here instead of as illegal-addr / silent KV
@@ -2260,6 +2616,18 @@ class MHATokenToKVPool(KVCache):
             layer_id_override if layer_id_override is not None else layer.layer_id
         )
         global_layer_id = layer.layer_id if layer is not None else layer_id
+
+        if self.dtype == "int2":
+            if dcp_kv_mask is not None:
+                raise RuntimeError("dcp_kv_mask is not supported for int2 KV cache.")
+            self._set_int2_kv_buffer(
+                layer_id,
+                loc,
+                cache_k,
+                cache_v,
+                already_hadamard_transformed=already_hadamard_transformed,
+            )
+            return
 
         if self.is_quantized_kv_cache:
             if dcp_kv_mask is not None:
@@ -2627,6 +2995,8 @@ class MHATokenToKVPool(KVCache):
         k_scale: Optional[float] = None,
         v_scale: Optional[float] = None,
         layer_id_override: Optional[int] = None,
+        already_hadamard_transformed: bool = False,
+        is_decode: bool = False,
     ):
         if layer_id_override is not None:
             layer_id = layer_id_override

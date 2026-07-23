@@ -229,6 +229,7 @@ from sglang.srt.managers.utils import (
 )
 from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req, release_kv_cache
+from sglang.srt.mem_cache.unified_kv_pool import UnifiedInt2HPKVPool
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
@@ -464,6 +465,14 @@ class Scheduler(
         self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
         self.disable_radix_cache = result.disable_radix_cache
         self.tree_cache = result.tree_cache
+
+        # Mixed HP+int2 KV: the overlap loop stashes each forward's completion
+        # event on the pool so the decode-flush apply kernels can order their
+        # req_to_token writes behind the previous forward's reads.
+        kvcache = self.token_to_kv_pool_allocator.get_kvcache()
+        self.enable_mixed_kv_stream_wait = (
+            isinstance(kvcache, UnifiedInt2HPKVPool) and kvcache.mixed_kv_enabled()
+        )
 
         if (c := self.tp_worker.model_runner.canary_manager) is not None:
             c.attach_radix_cache(self.tree_cache)
@@ -1551,6 +1560,22 @@ class Scheduler(
                 self.invariant_checker.self_check_during_busy()
 
     @DynamicGradMode()
+    def maybe_wait_mixed_kv_forward_done(self):
+        """Mixed HP+int2 KV: hand the last pending forward's completion event
+        to the pool. The stream wait is issued later, inside
+        ``_alloc_for_decode_mixed`` at the apply-quant-and-remap boundary, so
+        host-syncing pre-flush work (radix eviction, retract free, plan-kernel
+        free) does not stall behind the previous forward."""
+        if not self.enable_mixed_kv_stream_wait or not self.result_queue:
+            return
+
+        _, result = self.result_queue[-1]
+        if result.forward_done is None:
+            return
+
+        kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
+        kv_pool.stash_pending_forward(result.forward_done)
+
     def event_loop_overlap(self):
         """A scheduler loop that overlaps the CPU processing and GPU computation."""
         self.result_queue: Deque[
@@ -1571,6 +1596,10 @@ class Scheduler(
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
                 continue
+
+            # Mixed HP+int2 KV: stash the previous forward's completion event
+            # on the pool before planning the next batch.
+            self.maybe_wait_mixed_kv_forward_done()
 
             # Get the next batch to run
             plan = self.get_next_batch_to_run(
@@ -2692,11 +2721,28 @@ class Scheduler(
             batch.top_logprobs_nums = [r.logprob.top_logprobs_num for r in reqs]
             batch.token_ids_logprobs = [list(r.origin_input_ids) for r in reqs]
 
+        # Build sampling info from scratch for these requests
         batch.sampling_info = SamplingBatchInfo.from_schedule_batch(
             batch, self.model_config.vocab_size
         )
-        # todo hisparse, maybe other info to contain for the new batch
         return batch
+
+    def _promote_completed_chunked_req_to_running(self, req: Req) -> bool:
+        """Mixed HP+int2 KV chunked prefill can leave a chunked req with zero
+        input left; once its final-chunk output token exists, move it straight
+        to the running (decode) batch instead of scheduling an empty extend."""
+        if len(req.output_ids) == 0:
+            return False
+
+        req.is_chunked = 0
+        req.is_retracted = False
+        batch = self._build_hisparse_decode_batch([req])
+        if self.running_batch.is_empty():
+            self.running_batch = batch
+        else:
+            self.running_batch.merge_batch(batch)
+        self.running_batch.batch_is_full = False
+        return True
 
     @scheduler_nvtx_method("scheduler.get_next_batch_to_run")
     def get_next_batch_to_run(
@@ -2947,8 +2993,21 @@ class Scheduler(
         )
 
         if self.chunked_req is not None:
-            self.chunked_req.init_next_round_input()
-            self.chunked_req = adder.add_chunked_req(self.chunked_req)
+            chunked_req = self.chunked_req
+            chunked_req.init_next_round_input()
+            remaining_input_len = len(chunked_req.full_untruncated_fill_ids) - len(
+                chunked_req.prefix_indices
+            )
+            if remaining_input_len <= 0:
+                if self._promote_completed_chunked_req_to_running(chunked_req):
+                    self.chunked_req = None
+                else:
+                    # The final prefill result may still be pending in overlap mode.
+                    # Keep ownership so its stashed KV cannot become orphaned.
+                    self.chunked_req = chunked_req
+                    return None
+            else:
+                self.chunked_req = adder.add_chunked_req(chunked_req)
 
         if self.enable_lora:
             running_loras = {
@@ -3393,6 +3452,12 @@ class Scheduler(
                                 forward_done,
                                 batch.out_cache_loc,
                             )
+                        if self.enable_mixed_kv_stream_wait:
+                            # Mixed HP+int2 KV: decode-flush apply kernels must
+                            # not write req_to_token positions the previous
+                            # forward still reads; record the boundary here.
+                            batch_result.forward_done = self.device_module.Event()
+                            batch_result.forward_done.record(stream=self.forward_stream)
                         # FIXME(lsyin): maybe move this to forward_batch_generation
                         batch_result.copy_done = self.device_module.Event()
                         if batch_result.delay_sample_func is None:
