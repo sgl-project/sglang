@@ -5,6 +5,7 @@ import unittest
 from sglang.srt.parser.reasoning_parser import (
     Apertus2509Detector,
     BaseReasoningFormatDetector,
+    CohereCommand4Detector,
     DeepSeekR1Detector,
     Gemma4Detector,
     Glm45Detector,
@@ -134,6 +135,43 @@ class TestBaseReasoningFormatDetector(CustomTestCase):
         self.assertEqual(result.reasoning_text, "reasoning")
         self.assertEqual(result.normal_text, "normal")
 
+    def test_finish_flushes_truncated_reasoning_no_stream_reasoning(self):
+        """Bug regression: with stream_reasoning=False the base detector buffers
+        the whole thinking block and only emits it on </think>. A stream cut
+        short (e.g. max_tokens) before </think> left the trace stuck in _buffer,
+        and finish() dropped it. finish() must now emit it as reasoning, with the
+        opening think token stripped, matching the non-streaming path."""
+        detector = BaseReasoningFormatDetector(
+            "<think>", "</think>", stream_reasoning=False
+        )
+        detector.parse_streaming_increment("<think>")
+        self.assertEqual(
+            detector.parse_streaming_increment("half a thought").reasoning_text, ""
+        )
+        end = detector.finish()
+        self.assertEqual(end.reasoning_text, "half a thought")
+        self.assertEqual(end.normal_text, "")
+        # State is cleared, so a second finish() is a no-op (no duplicate flush).
+        self.assertEqual(detector._buffer, "")
+        self.assertEqual(detector.finish().reasoning_text, "")
+
+    def test_finish_drops_partial_end_tag_when_streaming_reasoning(self):
+        """With stream_reasoning=True the reasoning is emitted chunk by chunk, so
+        finish() must not re-emit. Only a partial end-tag fragment can linger in
+        _buffer; that fragment is an incomplete token, not content, and must be
+        dropped rather than surfaced as reasoning."""
+        detector = BaseReasoningFormatDetector(
+            "<think>", "</think>", stream_reasoning=True
+        )
+        self.assertEqual(
+            detector.parse_streaming_increment("<think>thought").reasoning_text,
+            "thought",
+        )
+        self.assertEqual(detector.parse_streaming_increment("</thi").reasoning_text, "")
+        end = detector.finish()
+        self.assertEqual(end.reasoning_text, "")
+        self.assertEqual(end.normal_text, "")
+
 
 class TestDeepSeekR1Detector(CustomTestCase):
     def setUp(self):
@@ -153,6 +191,22 @@ class TestDeepSeekR1Detector(CustomTestCase):
         # Should be treated as reasoning because force_reasoning=True
         self.assertEqual(result.reasoning_text, "I need to think about this.")
         self.assertEqual(result.normal_text, "The answer is 42.")
+
+    def test_finish_flushes_truncated_forced_reasoning(self):
+        """Bug regression: DeepSeek-R1 forces reasoning without a <think> start
+        token, so the whole output is reasoning until </think>. With
+        stream_reasoning=False a stream cut before </think> buffered the trace;
+        finish() must flush it as reasoning instead of dropping it."""
+        detector = DeepSeekR1Detector(stream_reasoning=False)
+        self.assertEqual(
+            detector.parse_streaming_increment(
+                "reasoning with no end token"
+            ).reasoning_text,
+            "",
+        )
+        end = detector.finish()
+        self.assertEqual(end.reasoning_text, "reasoning with no end token")
+        self.assertEqual(end.normal_text, "")
 
 
 class TestQwen3Detector(CustomTestCase):
@@ -1248,6 +1302,38 @@ class TestPoolsideV1Registered(CustomTestCase):
         rp = ReasoningParser("poolside_v1", stream_reasoning=True)
         self.assertEqual(rp.detector.reasoning_default, "explicit_enable_thinking")
         self.assertTrue(rp.detector.thinks_internally)
+
+
+class TestCohereCommand4DetectorFinish(CustomTestCase):
+    """finish() flush for Cohere's custom streaming state machine.
+
+    This detector pins _in_reasoning True for its whole run and tracks phase via
+    _reasoning_done, so it overrides finish() rather than inheriting the base
+    one, which keys on _in_reasoning."""
+
+    def test_finish_flushes_truncated_reasoning(self):
+        """Stream cut mid-thinking (stream_reasoning=False, no <|END_THINKING|>)
+        must flush the buffered trace as reasoning instead of dropping it."""
+        detector = CohereCommand4Detector(stream_reasoning=False)
+        self.assertEqual(
+            detector.parse_streaming_increment("partial thinking").reasoning_text,
+            "",
+        )
+        end = detector.finish()
+        self.assertEqual(end.reasoning_text, "partial thinking")
+        self.assertEqual(end.normal_text, "")
+
+    def test_finish_flushes_answer_tail_as_normal_text(self):
+        """Regression guard for the base-class fix: once reasoning has closed, a
+        truncated answer tail (stream ended before <|END_TEXT|>) must be flushed
+        as normal_text. The base finish() keyed on _in_reasoning would misfile it
+        as reasoning because this detector never clears _in_reasoning."""
+        detector = CohereCommand4Detector(stream_reasoning=False)
+        detector.parse_streaming_increment("thinking<|END_THINKING|>")
+        detector.parse_streaming_increment("<|START_TEXT|>the answer")
+        end = detector.finish()
+        self.assertEqual(end.normal_text, "the answer")
+        self.assertEqual(end.reasoning_text, "")
 
 
 if __name__ == "__main__":
