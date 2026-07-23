@@ -536,8 +536,16 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             include_req=True,
         )
         # Always lock to match aggregated scheduling behavior
-        self.tree_cache.inc_lock_ref(result.last_device_node)
+        lock_result = self.tree_cache.inc_lock_ref(result.last_device_node)
+        req.set_tree_cache_lock(lock_result)
         return self._build_decode_prefix_match(req, result)
+
+    def _release_prefix_lock(self, req: Req) -> None:
+        self.tree_cache.dec_lock_ref(
+            req.last_node,
+            req.get_tree_cache_lock_params(),
+        )
+        req.clear_tree_cache_lock()
 
     def _resolve_prefill_dp_rank(self, req: Req) -> Optional[int]:
         prefill_info = self.kv_manager.prefill_info_table.get(_bootstrap_addr(req))
@@ -1009,11 +1017,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 > full_allocatable_tokens
             ):
                 if prefix_len > 0:
-                    self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                    self._release_prefix_lock(decode_req.req)
                 break
             if required_tokens_for_request > full_allocatable_tokens:
                 if prefix_len > 0:
-                    self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                    self._release_prefix_lock(decode_req.req)
                 break
 
             if uses_swa_tail_prealloc:
@@ -1031,7 +1039,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     > swa_allocatable_tokens
                 ):
                     if prefix_len > 0:
-                        self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                        self._release_prefix_lock(decode_req.req)
                     break
 
             dst_kv_indices = self._pre_alloc(

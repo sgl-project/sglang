@@ -27,17 +27,19 @@ register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
 
 import unittest
 from array import array
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 
 from sglang.srt.disaggregation.decode import DecodePreallocQueue
 from sglang.srt.disaggregation.decode_hicache_mixin import DecodePrefixMatch
 from sglang.srt.mem_cache.base_prefix_cache import (
+    IncLockRefResult,
     InsertParams,
     MatchPrefixParams,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
+from sglang.srt.mem_cache.unified_cache_components.tree_component import ComponentType
 from sglang.srt.utils.common import Range
 
 
@@ -110,6 +112,30 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
                 value=torch.tensor(prefix_values, dtype=torch.int64),
             )
         )
+
+    def test_match_prefix_preserves_complete_lock_ownership(self):
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.tree_cache = MagicMock()
+        queue._build_decode_prefix_match = MagicMock(return_value=MagicMock())
+
+        req = MagicMock()
+        req.origin_input_ids = [1, 2, 3, 4]
+        node = object()
+        match_result = MagicMock(last_device_node=node)
+        lock_result = IncLockRefResult(
+            swa_uuid_for_lock=17,
+            skip_lock_node_ids={ComponentType.SWA: {41, 42}},
+        )
+        queue.tree_cache.inc_lock_ref.return_value = lock_result
+
+        with patch(
+            "sglang.srt.disaggregation.decode.match_prefix_for_req",
+            return_value=match_result,
+        ):
+            queue._match_prefix_and_lock(req)
+
+        queue.tree_cache.inc_lock_ref.assert_called_once_with(node)
+        req.set_tree_cache_lock.assert_called_once_with(lock_result)
 
     def test_incremental_transfer_success(self):
         """Scenario 1: prefix match > 0, transfer succeeds.
@@ -364,7 +390,10 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         self.assertEqual(preallocated, [])
         self.assertEqual(failed, [])
         queue._pre_alloc.assert_not_called()
-        queue.tree_cache.dec_lock_ref.assert_called_once_with(req.last_node)
+        queue.tree_cache.dec_lock_ref.assert_called_once_with(
+            req.last_node, req.get_tree_cache_lock_params()
+        )
+        req.clear_tree_cache_lock.assert_called_once_with()
         self.assertEqual(queue._allocatable_token_budgets.call_count, 2)
 
     def test_repeated_incremental_no_leak(self):

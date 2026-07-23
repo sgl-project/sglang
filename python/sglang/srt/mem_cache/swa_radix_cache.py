@@ -500,10 +500,10 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         # Remove req slot release the cache lock
         self.dec_lock_ref(
             req.last_node,
-            DecLockRefParams(swa_uuid_for_lock=req.swa_uuid_for_lock),
+            req.get_tree_cache_lock_params(),
             skip_swa=req.swa_prefix_lock_released,
         )
-        req.swa_prefix_lock_released = False
+        req.clear_tree_cache_lock()
 
     def cache_unfinished_req(self, req: Req, chunked=False) -> None:
         """Cache request when it is unfinished."""
@@ -556,12 +556,11 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
 
         self.dec_lock_ref(
             req.last_node,
-            DecLockRefParams(swa_uuid_for_lock=req.swa_uuid_for_lock),
+            req.get_tree_cache_lock_params(),
             skip_swa=req.swa_prefix_lock_released,
         )
-        req.swa_prefix_lock_released = False
+        req.clear_tree_cache_lock()
         result = self.inc_lock_ref(new_last_node)
-        swa_uuid_for_lock = result.swa_uuid_for_lock
 
         # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
         if len(new_indices) < len(kv_indices):
@@ -571,7 +570,7 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         else:
             req.prefix_indices = new_indices
         req.last_node = new_last_node
-        req.swa_uuid_for_lock = swa_uuid_for_lock
+        req.set_tree_cache_lock(result)
 
     def pretty_print(self) -> None:
         self._print_helper(self.root_node, 0)

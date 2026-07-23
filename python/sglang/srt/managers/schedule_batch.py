@@ -80,7 +80,9 @@ from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
+    DecLockRefParams,
     EvictParams,
+    IncLockRefResult,
     MatchPrefixParams,
     zero_match_result,
 )
@@ -867,6 +869,11 @@ class Req(ReqDllmMixin):
         self.storage_hit_length = 0
         # The node to lock until for swa radix tree lock ref
         self.swa_uuid_for_lock: Optional[int] = None
+        # Complete ownership token returned by tree_cache.inc_lock_ref().
+        # In addition to the SWA window UUID this preserves tombstone node IDs
+        # skipped during acquire, so release cannot consume a lock that a
+        # different request acquired after restoring one of those tombstones.
+        self.tree_cache_lock_params: Optional[DecLockRefParams] = None
         # Whether the prefill-time SWA tree lock has been released early
         self.swa_prefix_lock_released: bool = False
         # The prefix length that is inserted into the tree cache
@@ -1026,6 +1033,26 @@ class Req(ReqDllmMixin):
 
         # For hisparse
         self.hisparse_staging = False
+
+    def set_tree_cache_lock(self, result: IncLockRefResult) -> None:
+        """Persist the complete ownership token for a tree-cache lock."""
+        self.tree_cache_lock_params = result.to_dec_params()
+        # Keep the legacy field for the early SWA-only release path.
+        self.swa_uuid_for_lock = result.swa_uuid_for_lock
+        self.swa_prefix_lock_released = False
+
+    def get_tree_cache_lock_params(self) -> DecLockRefParams:
+        """Return release parameters, including tombstones skipped at acquire."""
+        if self.tree_cache_lock_params is not None:
+            return self.tree_cache_lock_params
+        # Backward-compatible fallback for callers that predate complete lock
+        # ownership tracking.
+        return DecLockRefParams(swa_uuid_for_lock=self.swa_uuid_for_lock)
+
+    def clear_tree_cache_lock(self) -> None:
+        self.tree_cache_lock_params = None
+        self.swa_uuid_for_lock = None
+        self.swa_prefix_lock_released = False
 
     @property
     def seqlen(self) -> int:
@@ -1475,6 +1502,7 @@ class Req(ReqDllmMixin):
         self.cache_protected_len = 0
         self.num_matched_prefix_tokens = 0
         self.swa_uuid_for_lock = None
+        self.tree_cache_lock_params = None
         self.swa_prefix_lock_released = False
         self.extend_range = None
         self.dllm_initialized = False

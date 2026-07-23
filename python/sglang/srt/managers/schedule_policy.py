@@ -762,8 +762,7 @@ class PrefillAdder:
 
     def _req_inc_lock_ref(self, req: Req):
         result = self.tree_cache.inc_lock_ref(req.last_node)
-        if self.is_hybrid_swa:
-            req.swa_uuid_for_lock = result.swa_uuid_for_lock
+        req.set_tree_cache_lock(result)
 
     def add_dllm_staging_req(self, req: Req):
         assert self.dllm_config is not None

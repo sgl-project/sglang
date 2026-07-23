@@ -38,7 +38,7 @@ from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
-    DecLockRefParams,
+    EvictParams,
     MatchPrefixParams,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -324,6 +324,19 @@ class _SWADecodeRadixScenarios:
         allocator.full_to_swa_index_mapping[full_indices] = swa_indices
         return full_indices[:need_size]
 
+    def _alloc_swa_tail(self, allocator, seq_len, swa_tail_len):
+        """Call the production bs=1 paged SWA-tail allocator."""
+        device = allocator.device
+        return allocator.alloc_extend_swa_tail(
+            prefix_lens=torch.tensor([0], dtype=torch.int64, device=device),
+            prefix_lens_cpu=torch.tensor([0], dtype=torch.int64),
+            seq_lens=torch.tensor([seq_len], dtype=torch.int64, device=device),
+            seq_lens_cpu=torch.tensor([seq_len], dtype=torch.int64),
+            last_loc=torch.tensor([-1], dtype=torch.int64, device=device),
+            extend_num_tokens=seq_len,
+            swa_tail_len=swa_tail_len,
+        )
+
     # ---- tests ----
 
     def test_swa_collapse_recovers_full_indices(self):
@@ -366,8 +379,9 @@ class _SWADecodeRadixScenarios:
 
         cache.dec_lock_ref(
             req.last_node,
-            DecLockRefParams(swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None)),
+            req.get_tree_cache_lock_params(),
         )
+        req.clear_tree_cache_lock()
         cache.sanity_check()
 
     def test_shared_out_of_window_prefix_does_not_assert(self):
@@ -427,10 +441,9 @@ class _SWADecodeRadixScenarios:
 
         cache.dec_lock_ref(
             req2.last_node,
-            DecLockRefParams(
-                swa_uuid_for_lock=getattr(req2, "swa_uuid_for_lock", None)
-            ),
+            req2.get_tree_cache_lock_params(),
         )
+        req2.clear_tree_cache_lock()
         cache.sanity_check()
 
     def test_in_window_prefix_baseline_unaffected(self):
@@ -466,8 +479,121 @@ class _SWADecodeRadixScenarios:
 
         cache.dec_lock_ref(
             req.last_node,
-            DecLockRefParams(swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None)),
+            req.get_tree_cache_lock_params(),
         )
+        req.clear_tree_cache_lock()
+        cache.sanity_check()
+
+    def test_real_swa_tail_allocation_caches_and_frees_cleanly(self):
+        """Exercise the real tail-only allocator, including zero head mappings."""
+        if self.page_size == 1:
+            self.skipTest("SWA-tail preallocation requires page_size > 1")
+
+        cache, allocator, req_to_token_pool = self._build()
+        tokens = self._seq(1)
+        total = len(tokens)
+        swa_tail_len = self.sliding_window_size
+        self.assertLess(swa_tail_len, total)
+
+        full_before = allocator.full_available_size()
+        swa_before = allocator.swa_available_size()
+        kv_indices = self._alloc_swa_tail(allocator, total, swa_tail_len)
+        self.assertIsNotNone(kv_indices)
+        self.assertEqual(len(kv_indices), total)
+        self.assertEqual(full_before - allocator.full_available_size(), total)
+        self.assertEqual(swa_before - allocator.swa_available_size(), swa_tail_len)
+
+        mapping = allocator.full_to_swa_index_mapping[kv_indices.to(torch.int64)]
+        self.assertTrue(torch.all(mapping[:-swa_tail_len] == 0).item())
+        self.assertTrue(torch.all(mapping[-swa_tail_len:] > 0).item())
+
+        req = self._make_req(req_to_token_pool)
+        req.origin_input_ids = array("q", tokens)
+        req.output_ids = array("q")
+        req.full_untruncated_fill_ids = array("q", tokens)
+        req.set_extend_range(0, total)
+        req_to_token_pool.write((req.req_pool_idx, slice(0, total)), kv_indices)
+        req.kv_committed_len = total
+        req.kv_allocated_len = total
+        req.last_node = cache.root_node
+        req.cache_protected_len = 0
+        req.extra_key = None
+        req.swa_evicted_seqlen = total - swa_tail_len
+
+        cache.cache_unfinished_req(req)
+        self.assertEqual(len(req.prefix_indices), total)
+        self.assertEqual(req.cache_protected_len, total)
+        cache.cache_finished_req(req, is_insert=True)
+        cache.sanity_check()
+
+        cache.evict(EvictParams(num_tokens=total, swa_num_tokens=swa_tail_len))
+        self.assertEqual(allocator.full_available_size(), full_before)
+        self.assertEqual(allocator.swa_available_size(), swa_before)
+        cache.sanity_check()
+
+    def test_releasing_full_only_lock_does_not_steal_restored_swa_lock(self):
+        """A tombstone skipped by A may later be restored and locked by B."""
+        if self.page_size == 1:
+            self.skipTest("SWA-tail preallocation requires page_size > 1")
+
+        cache, allocator, req_to_token_pool = self._build()
+        tokens = self._seq(1)
+        total = len(tokens)
+
+        # A inserts a Full-only path and locks it while every SWA component on
+        # that path is a tombstone. Its ownership token must remember the skip.
+        req_a = self._make_req(req_to_token_pool)
+        req_a.origin_input_ids = array("q", tokens)
+        req_a.output_ids = array("q")
+        req_a.full_untruncated_fill_ids = array("q", tokens)
+        req_a.set_extend_range(0, total)
+        kv_a = self._alloc(allocator, total)
+        req_to_token_pool.write((req_a.req_pool_idx, slice(0, total)), kv_a)
+        req_a.kv_committed_len = total
+        req_a.kv_allocated_len = total
+        req_a.last_node = cache.root_node
+        req_a.cache_protected_len = 0
+        req_a.extra_key = None
+        req_a.swa_evicted_seqlen = total
+        cache.cache_unfinished_req(req_a)
+
+        a_params = req_a.get_tree_cache_lock_params()
+        self.assertIn(ComponentType.SWA, a_params.skip_lock_node_ids)
+        self.assertIn(
+            req_a.last_node.id, a_params.skip_lock_node_ids[ComponentType.SWA]
+        )
+
+        # B restores the final SWA page under the same Full path and locks it.
+        req_b = self._make_req(req_to_token_pool)
+        req_b.origin_input_ids = array("q", tokens)
+        req_b.output_ids = array("q")
+        req_b.full_untruncated_fill_ids = array("q", tokens)
+        req_b.set_extend_range(0, total)
+        kv_b = self._alloc(allocator, total)
+        req_to_token_pool.write((req_b.req_pool_idx, slice(0, total)), kv_b)
+        req_b.kv_committed_len = total
+        req_b.kv_allocated_len = total
+        req_b.last_node = cache.root_node
+        req_b.cache_protected_len = 0
+        req_b.extra_key = None
+        req_b.swa_evicted_seqlen = total - self.page_size
+        cache.cache_unfinished_req(req_b)
+
+        b_swa = req_b.last_node.component_data[ComponentType.SWA]
+        self.assertIsNotNone(b_swa.value)
+        self.assertEqual(b_swa.lock_ref, 1)
+
+        # A never owned B's restored SWA lock. Releasing A must replay its skip
+        # set and leave B's ref intact and non-evictable.
+        cache.dec_lock_ref(req_a.last_node, req_a.get_tree_cache_lock_params())
+        req_a.clear_tree_cache_lock()
+        self.assertEqual(b_swa.lock_ref, 1)
+        evicted = cache.evict(EvictParams(swa_num_tokens=self.page_size))
+        self.assertEqual(evicted.swa_num_tokens_evicted, 0)
+        self.assertIsNotNone(b_swa.value)
+
+        cache.dec_lock_ref(req_b.last_node, req_b.get_tree_cache_lock_params())
+        req_b.clear_tree_cache_lock()
         cache.sanity_check()
 
 
@@ -486,6 +612,13 @@ class TestSWADecodeRadixLargePage(_SWADecodeRadixScenarios, CustomTestCase):
     sliding_window_size = 64
     kv_size = 4096
     max_context_len = 4096
+
+
+class TestSWADecodeRadixProductionPage(_SWADecodeRadixScenarios, CustomTestCase):
+    page_size = 256
+    sliding_window_size = 256
+    kv_size = 8192
+    max_context_len = 8192
 
 
 if __name__ == "__main__":
