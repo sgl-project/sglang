@@ -7,6 +7,7 @@ Each collected request prints a performance log before validation.
 
 from __future__ import annotations
 
+import json
 import os
 import queue
 import threading
@@ -14,6 +15,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
+import numpy as np
 import openai
 import pytest
 import requests
@@ -47,8 +49,11 @@ from sglang.multimodal_gen.test.test_utils import (
     SGL_TEST_FILES_CI_DATA_REVISION,
     _consistency_gt_filenames,
     _get_consistency_gt_dir,
+    action_gt_exists,
     compare_with_gt,
     extract_key_frames_from_video,
+    get_action_consistency_gt_candidates,
+    get_action_consistency_gt_remote_files,
     get_consistency_gt_candidates,
     get_consistency_gt_remote_files,
     get_consistency_threshold_path,
@@ -56,6 +61,7 @@ from sglang.multimodal_gen.test.test_utils import (
     get_dynamic_server_port,
     gt_exists,
     image_bytes_to_numpy,
+    load_action_consistency_gt,
     load_consistency_gt,
     save_consistency_failure_artifact,
     wait_for_req_perf_record,
@@ -593,6 +599,10 @@ class DiffusionServerBase:
             )
             return
 
+        if case.server_args.modality == "action":
+            self._validate_action_consistency(case, content)
+            return
+
         num_gpus = case.server_args.num_gpus
         is_video = case.server_args.modality == "video"
         output_format = case.sampling_params.output_format
@@ -616,13 +626,13 @@ class DiffusionServerBase:
 --- MISSING GROUND TRUTH DETECTED ---
 GT image(s) not found for '{case.id}'.
 
-Add the expected file(s) to sgl-project/ci-data in diffusion-ci/consistency_gt/sglang_generated/ with naming (n=num_gpus).
+Add the expected file(s) to sgl-project/ci-data-diffusion in diffusion-ci/consistency_gt/sglang_generated/ with naming (n=num_gpus).
   Image: {case.id}_{{n}}gpu.<ext> (ext from output_format: png, jpg, webp)
   Video: {case.id}_{{n}}gpu_frame_0.png, {case.id}_{{n}}gpu_frame_mid.png, {case.id}_{{n}}gpu_frame_last.png
 
 For this case, expected file(s): {names}
 
-Repository: https://github.com/sgl-project/ci-data (path: diffusion-ci/consistency_gt/sglang_generated/, with optional platform subdirectories such as 5090/)
+Repository: https://github.com/sgl-project/ci-data-diffusion (path: diffusion-ci/consistency_gt/sglang_generated/, with optional platform subdirectories such as 5090/)
 Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
 
 (Optional) Per-case override in {get_consistency_threshold_path()}:
@@ -727,6 +737,88 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
             f"max_mean_abs_diff={result.max_mean_abs_diff:.4f})"
         )
 
+    def _extract_action_array(
+        self,
+        payload: dict[str, Any],
+        expected_horizon: int,
+        expected_dim: int,
+    ) -> np.ndarray:
+        action = payload["data"][0]["action"]
+        values = action["values"]
+        assert action["shape"] == [expected_horizon, expected_dim]
+        array = np.asarray(values, dtype=np.float32)
+        assert array.shape == (expected_horizon, expected_dim)
+        assert np.isfinite(array).all()
+        return array
+
+    def _validate_action_consistency(
+        self,
+        case: DiffusionTestCase,
+        content: bytes,
+    ) -> None:
+        payload = json.loads(content.decode("utf-8"))
+        expected_horizon = int(case.sampling_params.extras.get("action_horizon", 50))
+        expected_dim = int(case.sampling_params.extras.get("action_dim", 32))
+        output = self._extract_action_array(payload, expected_horizon, expected_dim)
+
+        num_gpus = case.server_args.num_gpus
+        if not action_gt_exists(case.id, num_gpus):
+            names = ", ".join(get_action_consistency_gt_candidates(case.id, num_gpus))
+            logger.error(f"""
+--- MISSING ACTION GROUND TRUTH DETECTED ---
+GT action JSON not found for '{case.id}'.
+
+Add the expected file to sgl-project/ci-data-diffusion in diffusion-ci/consistency_gt/sglang_generated/ with naming:
+  Action: {case.id}_{{n}}gpu.json
+
+For this case, expected file(s): {names}
+
+Repository: https://github.com/sgl-project/ci-data-diffusion (path: diffusion-ci/consistency_gt/sglang_generated/, with optional platform subdirectories such as 5090/)
+Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
+""")
+            pytest.fail(
+                f"GT action JSON not found for {case.id}. See logs for instructions to add GT."
+            )
+
+        gt_payload = load_action_consistency_gt(case.id, num_gpus)
+        gt = self._extract_action_array(gt_payload, expected_horizon, expected_dim)
+        abs_diff = np.abs(output - gt)
+        max_abs_diff = float(abs_diff.max())
+        mean_abs_diff = float(abs_diff.mean())
+        max_abs_threshold = float(
+            case.sampling_params.extras.get("action_max_abs_diff_threshold", 0.05)
+        )
+        mean_abs_threshold = float(
+            case.sampling_params.extras.get("action_mean_abs_diff_threshold", 0.005)
+        )
+
+        if max_abs_diff > max_abs_threshold or mean_abs_diff > mean_abs_threshold:
+            gt_remote_info = "\n".join(
+                f"    - {filename}: {url}"
+                for filename, url in get_action_consistency_gt_remote_files(
+                    case.id,
+                    num_gpus,
+                )
+            )
+            pytest.fail(
+                f"Action consistency check failed for {case.id}:\n"
+                f"  max_abs_diff={max_abs_diff:.6f} "
+                f"(threshold {max_abs_threshold:.6f})\n"
+                f"  mean_abs_diff={mean_abs_diff:.6f} "
+                f"(threshold {mean_abs_threshold:.6f})\n"
+                f"  Compared GT files and links:\n{gt_remote_info}"
+            )
+
+        logger.info(
+            "[Consistency] %s: PASSED action GT check "
+            "(shape=%sx%s, max_abs_diff=%.6f, mean_abs_diff=%.6f)",
+            case.id,
+            expected_horizon,
+            expected_dim,
+            max_abs_diff,
+            mean_abs_diff,
+        )
+
     def _save_gt_output(
         self,
         case: DiffusionTestCase,
@@ -748,6 +840,12 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
 
         num_gpus = case.server_args.num_gpus
         is_video = case.server_args.modality == "video"
+
+        if case.server_args.modality == "action":
+            output_path = out_dir / f"{case.id}_{num_gpus}gpu.json"
+            output_path.write_bytes(content)
+            logger.info(f"Saved GT action JSON: {output_path}")
+            return
 
         if is_video:
             # realtime consistency uses websocket raw frames to avoid lossy mp4 drift

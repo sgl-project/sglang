@@ -164,7 +164,7 @@ class TorchNativeLoRABackend(BaseLoRABackend):
     def init_cuda_graph_batch_info(
         self,
         max_bs_in_cuda_graph: int,
-        num_tokens_per_bs: int,
+        num_tokens_per_req: int,
     ):
         with torch.device("cuda"):
             self.cuda_graph_batch_info = TorchNativeLoRABatchInfo(
@@ -172,14 +172,14 @@ class TorchNativeLoRABackend(BaseLoRABackend):
                 bs=max_bs_in_cuda_graph,
                 num_segments=self.max_loras_per_batch,
                 seg_lens=torch.full(
-                    (max_bs_in_cuda_graph,), num_tokens_per_bs, dtype=torch.int32
+                    (max_bs_in_cuda_graph,), num_tokens_per_req, dtype=torch.int32
                 ),
                 seg_indptr=torch.zeros(max_bs_in_cuda_graph + 1, dtype=torch.int32),
                 weight_indices=torch.zeros(max_bs_in_cuda_graph, dtype=torch.int32),
                 lora_ranks=torch.zeros(self.max_loras_per_batch, dtype=torch.int32),
                 scalings=torch.zeros(self.max_loras_per_batch, dtype=torch.float),
                 permutation=None,
-                max_len=num_tokens_per_bs,
+                max_len=num_tokens_per_req,
             )
 
             # Initialize seg_indptr for CUDA graph as they remain constant

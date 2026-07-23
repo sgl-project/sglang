@@ -398,6 +398,8 @@ class ServerArgsAutoTuner:
 
     def _default_layerwise_components_for_unset_placement(self) -> list[str]:
         args = self.server_args
+        if args.pipeline_config.task_type.is_action_gen():
+            return []
         if (
             args.is_arg_explicitly_set("layerwise_offload_components")
             or args.dit_layerwise_offload is True

@@ -97,19 +97,13 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
   m.def("sgl_per_token_quant_fp8(Tensor input, Tensor output_q, Tensor output_s) -> ()");
   m.impl("sgl_per_token_quant_fp8", torch::kMUSA, &sgl_per_token_quant_fp8);
 
-  m.def("dsv3_fused_a_gemm(Tensor! output, Tensor mat_a, Tensor mat_b) -> ()");
-  m.impl("dsv3_fused_a_gemm", torch::kMUSA, &dsv3_fused_a_gemm);
-
-  m.def("dsv3_router_gemm(Tensor! output, Tensor mat_a, Tensor mat_b) -> ()");
-  m.impl("dsv3_router_gemm", torch::kMUSA, &dsv3_router_gemm);
-
   /*
    * From csrc/moe
    */
   m.def(
       "moe_align_block_size(Tensor topk_ids, int num_experts, int block_size, Tensor! sorted_token_ids, Tensor! "
       "experts_ids, Tensor! num_tokens_post_pad, Tensor! cumsum_buffer, bool "
-      "pad_sorted_token_ids) -> ()");
+      "pad_sorted_token_ids, bool ignore_invalid_expert) -> ()");
   m.impl("moe_align_block_size", torch::kMUSA, &moe_align_block_size);
 
   m.def(
@@ -259,12 +253,6 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
   /*
    * From FlashInfer
    */
-  m.def(
-      "bmm_fp8(Tensor A, Tensor B, Tensor! D, Tensor A_scale, Tensor B_scale, Tensor workspace_buffer, "
-      "int cublas_handle) -> ()",
-      {at::Tag::needs_fixed_stride_order});
-  m.impl("bmm_fp8", torch::kMUSA, &bmm_fp8);
-
   m.def("top_k_renorm_probs(Tensor probs, Tensor! renorm_probs, Tensor? maybe_top_k_arr, int top_k_val) -> ()");
   m.impl("top_k_renorm_probs", torch::kMUSA, &top_k_renorm_probs);
 

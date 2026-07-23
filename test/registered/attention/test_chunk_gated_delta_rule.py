@@ -2,14 +2,19 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.attention.fla.chunk import chunk_gated_delta_rule
-from sglang.srt.layers.attention.fla.fused_recurrent import (
+from sglang.kernels.ops.attention.fla.chunk import chunk_gated_delta_rule
+from sglang.kernels.ops.attention.fla.fused_recurrent import (
     fused_recurrent_gated_delta_rule,
 )
-from sglang.srt.utils import get_device
-from sglang.test.ci.ci_register import register_cuda_ci, register_xpu_ci
+from sglang.srt.utils import get_device, is_hip
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_xpu_ci,
+)
 
 register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-large")
+register_amd_ci(est_time=11, stage="stage-b", runner_config="1-gpu-large-amd")
 register_xpu_ci(est_time=900, suite="stage-b-test-1-gpu-xpu")
 
 
@@ -183,6 +188,11 @@ class TestChunkGatedDeltaRule(unittest.TestCase):
     def test_dim_k_gt_v(self):
         self._check_shape(B=4, T_per_seq=128, H=16, K=128, V=64, pool_size=32)
 
+    @unittest.skipIf(
+        is_hip(),
+        "K=V=256 head dim exceeds the FLA chunk triton kernel's shared-memory "
+        "budget on ROCm (out-of-resource at launch); smaller head dims pass.",
+    )
     def test_dim_256x256(self):
         self._check_shape(B=4, T_per_seq=128, H=16, K=256, V=256, pool_size=32)
 

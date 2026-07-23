@@ -19,6 +19,26 @@ class Ideogram4DiTArchConfig(DiTArchConfig):
     num_attention_heads: int = 18
     num_layers: int = 34
     rope_theta: int = 5_000_000
+    param_names_mapping: dict = field(
+        default_factory=lambda: {
+            r"^(layers\.\d+\.attention)\.to_q\.(.*)$": (
+                r"\1.qkv.\2",
+                0,
+                3,
+            ),
+            r"^(layers\.\d+\.attention)\.to_k\.(.*)$": (
+                r"\1.qkv.\2",
+                1,
+                3,
+            ),
+            r"^(layers\.\d+\.attention)\.to_v\.(.*)$": (
+                r"\1.qkv.\2",
+                2,
+                3,
+            ),
+            r"^(layers\.\d+\.attention)\.to_out\.0\.(.*)$": r"\1.o.\2",
+        }
+    )
     _fsdp_shard_conditions: list = field(default_factory=lambda: [is_layer])
     _supported_attention_backends: set[AttentionBackendEnum] = field(
         default_factory=lambda: {
@@ -37,3 +57,13 @@ class Ideogram4DiTArchConfig(DiTArchConfig):
 class Ideogram4DiTConfig(DiTConfig):
     arch_config: DiTArchConfig = field(default_factory=Ideogram4DiTArchConfig)
     prefix: str = "ideogram4"
+    # The official FP8 checkpoint stores row-wise FP8 weights without a
+    # quantization_config, so its native loader intentionally defaults to the
+    # dedicated weight-only FP8 linears. Distilled fal checkpoints instead
+    # store floating-point weights and must use ordinary TP-aware linears.
+    use_weight_only_fp8_linears: bool = True
+
+
+@dataclass
+class Ideogram4DistilledDiTConfig(Ideogram4DiTConfig):
+    use_weight_only_fp8_linears: bool = False
