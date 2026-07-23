@@ -608,8 +608,11 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             forward_batch.token_to_kv_pool = self.draft_runner_list[
                 step
             ].token_to_kv_pool
+            # DP/MLP-sync padding mutates ForwardBatch fields in place. Keep
+            # those per-runner mutations from leaking into the next MTP step.
+            step_forward_batch = replace(forward_batch)
             output: ModelRunnerOutput = self.draft_runner_list[step].forward(
-                forward_batch
+                step_forward_batch
             )
             maybe_detect_nan(
                 output.logits_output.next_token_logits,
