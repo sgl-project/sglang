@@ -566,15 +566,13 @@ class SchedulerDisaggregationPrefillMixin:
                             window_kv_indices_full
                         )
                     )
-                    return kv_to_page_indices(
-                        window_kv_indices_swa.cpu().numpy(), page_size
-                    )
+                    return kv_to_page_indices(window_kv_indices_swa, page_size)
 
                 def _dsa_payload():
                     kv_indices_full = self.req_to_token_pool.req_to_token[
                         req.req_pool_idx, :seq_len
                     ]
-                    return kv_to_page_indices(kv_indices_full.cpu().numpy(), page_size)
+                    return kv_to_page_indices(kv_indices_full, page_size)
 
                 state_indices = []
                 for st in state_types:

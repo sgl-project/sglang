@@ -3612,11 +3612,9 @@ class Scheduler(
             req.pipelined_kv_sent = False
             start_idx = req.start_send_idx
             end_idx = min(req.extend_range.end, len(req.origin_input_ids))
-            kv_indices = (
-                self.req_to_token_pool.req_to_token[req.req_pool_idx, start_idx:end_idx]
-                .cpu()
-                .numpy()
-            )
+            kv_indices = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, start_idx:end_idx
+            ]
             page_indices = kv_to_page_indices(kv_indices, page_size)
             req_page_indices_list.append(page_indices)
 

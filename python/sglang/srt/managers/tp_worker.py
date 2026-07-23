@@ -634,7 +634,11 @@ class TpModelWorker(BaseTpWorker):
         batch: ScheduleBatch,
     ) -> ForwardBatch:
         """Initialize a ForwardBatch for layer-pipelined split prefill."""
-        forward_batch = ForwardBatch.init_new(batch, self.model_runner)
+        forward_batch = ForwardBatch.init_new(
+            batch,
+            self.model_runner,
+            return_hidden_states_before_norm=False,
+        )
         forward_batch.forward_mode = ForwardMode.SPLIT_PREFILL
         forward_batch.split_index = 0
         return forward_batch
