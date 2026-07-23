@@ -57,7 +57,7 @@ _is_xpu = is_xpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _is_cuda:
-    from sglang.kernels.ops.activation._jit_activation import (
+    from sglang.kernels.ops.activation.activation import (
         gelu_and_mul,
         gelu_tanh_and_mul,
         relu2,
