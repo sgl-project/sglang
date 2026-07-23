@@ -15,7 +15,6 @@ import torch
 
 from sglang.srt.layers.logprob_processor import (
     InputLogprobProcessor,
-    _logits_topk,
     compute_row_log_normalizer,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -30,7 +29,7 @@ TOPK_CYCLE = [2, 0, 3]
 TOKEN_IDS_CYCLE = [[0, 3], None, [1], []]
 
 
-def _build_batch(seq_specs, dtype):
+def _build_batch(seq_specs, dtype, vocab=VOCAB):
     """seq_specs: list of (extend_len, logprob_start_len). Mirrors
     LogitsProcessor._get_pruned_states for the extend-with-logprobs path."""
     pruned_rows = []
@@ -43,7 +42,7 @@ def _build_batch(seq_specs, dtype):
     for idx, (extend_len, start) in enumerate(seq_specs):
         eff_start = start - 1 if extend_len == start else start
         rows = extend_len - eff_start
-        pruned_rows.append(torch.randn(rows, VOCAB).to(dtype))
+        pruned_rows.append(torch.randn(rows, vocab).to(dtype))
         token_to_seq_idx.extend([idx] * rows)
         sample_pt += rows
         sample_indices.append(sample_pt)
@@ -230,36 +229,95 @@ class TestFastInputLogprobs(CustomTestCase):
             )
 
     @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
-    def test_fast_path_run_to_run_deterministic(self):
-        from sglang.srt.layers.logsumexp import row_logsumexp
+    def test_fused_run_to_run_deterministic(self):
+        from sglang.srt.layers.logsumexp import row_logsumexp_topk
 
         torch.manual_seed(0)
         logits = torch.randn(512, 151936, dtype=torch.bfloat16, device="cuda")
-        m1, l1 = row_logsumexp(logits)
-        m2, l2 = row_logsumexp(logits)
-        self.assertTrue(torch.equal(m1, m2) and torch.equal(l1, l2))
-        v1, i1 = _logits_topk(logits, 5)
-        v2, i2 = _logits_topk(logits, 5)
-        self.assertTrue(torch.equal(v1, v2) and torch.equal(i1, i2))
+        a = row_logsumexp_topk(logits, 5)
+        b = row_logsumexp_topk(logits, 5)
+        self.assertTrue(all(torch.equal(p, q) for p, q in zip(a, b)))
 
     @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
-    def test_logits_topk_matches_torch(self):
+    def test_fused_logsumexp_topk_matches_torch(self):
+        from sglang.srt.layers.logsumexp import row_logsumexp, row_logsumexp_topk
+
         torch.manual_seed(0)
-        # fp32 randn is tie-free w.h.p., so indices must match torch exactly.
-        logits = torch.randn(64, 151936, device="cuda")
-        ref_v, ref_i = torch.topk(logits, k=5, dim=-1, sorted=True)
-        got_v, got_i = _logits_topk(logits, 5)
-        torch.testing.assert_close(ref_v, got_v.to(ref_v.dtype))
-        self.assertTrue(torch.equal(ref_i, got_i.to(ref_i.dtype)))
-        # bf16 has value ties; only the sorted values are contractual.
-        logits = torch.randn(64, 151936, device="cuda", dtype=torch.bfloat16)
-        ref_v, _ = torch.topk(logits, k=5, dim=-1, sorted=True)
-        got_v, got_i = _logits_topk(logits, 5)
-        self.assertTrue(torch.equal(ref_v, got_v.to(ref_v.dtype)))
-        # Returned indices must point at the returned values.
-        self.assertTrue(
-            torch.equal(logits.gather(-1, got_i.long()).to(got_v.dtype), got_v)
-        )
+        for k in (1, 2, 3, 5, 8):
+            for dtype in (torch.float32, torch.bfloat16):
+                logits = torch.randn(64, 151936, dtype=dtype, device="cuda")
+                got_m, got_ls, got_v, got_i = row_logsumexp_topk(logits, k)
+                # The (max, log_sum) pair is bitwise the non-fused kernel's.
+                ref_m, ref_ls = row_logsumexp(logits)
+                self.assertTrue(torch.equal(got_m, ref_m), (k, dtype))
+                self.assertTrue(torch.equal(got_ls, ref_ls), (k, dtype))
+                ref_v, ref_i = torch.topk(logits, k, dim=-1, sorted=True)
+                self.assertTrue(torch.equal(got_v, ref_v.float()), (k, dtype))
+                if dtype == torch.float32:
+                    # fp32 randn is tie-free w.h.p.: indices match exactly.
+                    self.assertTrue(torch.equal(got_i, ref_i), (k, dtype))
+                else:
+                    # bf16 has value ties; indices must point at the values.
+                    self.assertTrue(
+                        torch.equal(logits.gather(-1, got_i).float(), got_v),
+                        (k, dtype),
+                    )
+
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+    def test_fused_topk_tie_break_is_lowest_index(self):
+        from sglang.srt.layers.logsumexp import row_logsumexp_topk
+
+        logits = torch.zeros(1, 1000, device="cuda")
+        logits[0, [7, 3, 500]] = 5.0
+        _, _, _, got_i = row_logsumexp_topk(logits, 3)
+        self.assertEqual(got_i[0].tolist(), [3, 7, 500])
+
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+    def test_fused_topk_inf_rows(self):
+        from sglang.srt.layers.logsumexp import row_logsumexp_topk
+
+        logits = torch.full((3, 1000), float("-inf"), device="cuda")
+        logits[1, 3] = 2.5
+        _, _, got_v, got_i = row_logsumexp_topk(logits.bfloat16(), 2)
+        self.assertEqual(got_i[0].tolist(), [0, 1])
+        self.assertEqual(got_i[1, 0].item(), 3)
+        self.assertFalse(got_v.isnan().any().item())
+
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+    def test_fast_path_end_to_end_on_cuda(self):
+        # Exercises the fused-kernel integration inside _forward_by_chunk
+        # (the CPU sweeps only cover the torch fallbacks), including the
+        # k > FUSED_TOPK_MAX_K fallback.
+        torch.manual_seed(0)
+        proc = InputLogprobProcessor()
+        for k_override in (None, 20):
+            # k=20 exceeds FUSED_TOPK_MAX_K, exercising the torch fallback;
+            # it needs a vocab that can supply 20 entries.
+            batch = _build_batch([(4, 1), (6, 2), (3, 0)], torch.float32, vocab=64)
+            pruned_states, sample_indices, lp_indices, t2s, metadata = batch
+            if k_override is not None:
+                metadata.top_logprobs_nums = [k_override] * 3
+            batch = (
+                pruned_states.cuda(),
+                sample_indices.cuda(),
+                lp_indices.cuda(),
+                t2s,
+                metadata,
+            )
+            metadata.extend_input_logprob_token_ids_gpu = (
+                metadata.extend_input_logprob_token_ids_gpu.cuda()
+            )
+            for chunk_size in (None, 2, 5):
+                ref, _ = _run(proc, batch, False, chunk_size)
+                got, _ = _run(proc, batch, True, chunk_size)
+                label = f"k_override={k_override} chunk={chunk_size}"
+                self.assertEqual(ref.top_logprobs_idx, got.top_logprobs_idx, label)
+                _assert_nested_close(
+                    self, ref.top_logprobs_val, got.top_logprobs_val, label, 1e-5, 1e-5
+                )
+                torch.testing.assert_close(
+                    ref.token_logprobs, got.token_logprobs, rtol=1e-5, atol=1e-5
+                )
 
     @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
     def test_row_logsumexp_kernel_matches_reference(self):
