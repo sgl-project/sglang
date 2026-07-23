@@ -1066,6 +1066,7 @@ class ServerArgs:
     enable_cp_decode_attn_tp: A[
         bool,
         "Enable attention tensor-parallel weight slicing during decode under context parallel (cp_size>1). Slices the replicated attention linears to the local CP partition, eliminating redundant decode GEMMs.",
+        NS("parallel"),
     ] = False
     # DP attention
     enable_dp_attention: A[
