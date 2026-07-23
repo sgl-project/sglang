@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterator, Optional, Tuple
 
+import msgspec
 import torch
 
 from sglang.srt.constants import (
@@ -18,6 +19,7 @@ from sglang.srt.constants import (
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.io_struct import (
+    ChecksumInfo,
     CheckWeightsReqInput,
     CheckWeightsReqOutput,
     DestroyWeightsUpdateGroupReqInput,
@@ -289,6 +291,11 @@ class SchedulerWeightUpdaterManager:
                     all_payloads, payload, group=self.tp_cpu_group
                 )
                 payload = all_payloads
+            if payload is not None:
+                # Normalize to one ChecksumInfo per rank so the wire shape is a
+                # uniform List[ChecksumInfo] (tp==1 becomes a single-element list).
+                per_rank = payload if isinstance(payload, list) else [payload]
+                payload = [msgspec.convert(p, ChecksumInfo) for p in per_rank]
             return CheckWeightsReqOutput(
                 success=True, message="Success.", payload=payload
             )
@@ -300,17 +307,17 @@ class SchedulerWeightUpdaterManager:
     def save_remote_model(self, params):
         url = params["url"]
 
-        self.tp_worker.model_runner.save_remote_model(url)
+        self.tp_worker.model_runner.weight_exporter.save_remote_model(url)
 
         if self.draft_worker is not None:
             draft_url = params.get("draft_url", None)
             assert (
                 draft_url is not None
             ), "draft_url must be provided when draft model is enabled"
-            self.draft_worker.model_runner.save_remote_model(draft_url)
+            self.draft_worker.model_runner.weight_exporter.save_remote_model(draft_url)
 
     def save_sharded_model(self, params):
-        self.tp_worker.model_runner.save_sharded_model(
+        self.tp_worker.model_runner.weight_exporter.save_sharded_model(
             path=params["path"],
             pattern=params["pattern"],
             max_size=params["max_size"],

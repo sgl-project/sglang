@@ -1,5 +1,3 @@
-import logging
-
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.common import (
     cpu_has_amx_support,
@@ -10,8 +8,6 @@ from sglang.srt.utils.common import (
     is_npu,
 )
 
-logger = logging.getLogger(__name__)
-
 
 class DraftBackendFactory:
     def __init__(
@@ -20,11 +16,13 @@ class DraftBackendFactory:
         draft_model_runner,
         topk: int,
         speculative_num_steps: int,
+        seed_dsa_topk_from_draft_extend: bool = False,
     ):
         self.server_args = server_args
         self.draft_model_runner = draft_model_runner
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
+        self.seed_dsa_topk_from_draft_extend = seed_dsa_topk_from_draft_extend
         self.draft_attn_backend = server_args.speculative_draft_attention_backend
 
     def _create_backend(
@@ -110,13 +108,20 @@ class DraftBackendFactory:
         )
 
         return DeepseekSparseAttnMultiStepBackend(
-            self.draft_model_runner, self.topk, self.speculative_num_steps
+            self.draft_model_runner,
+            self.topk,
+            self.speculative_num_steps,
+            seed_dsa_topk_from_draft_extend=self.seed_dsa_topk_from_draft_extend,
         )
 
     def _create_dsa_prefill_backend(self):
         from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
 
-        return DeepseekSparseAttnBackend(self.draft_model_runner, skip_prefill=False)
+        return DeepseekSparseAttnBackend(
+            self.draft_model_runner,
+            skip_prefill=False,
+            seed_dsa_topk_from_draft_extend=self.seed_dsa_topk_from_draft_extend,
+        )
 
     def _create_flashinfer_decode_backend(self):
         if not self.draft_model_runner.use_mla_backend:
@@ -365,10 +370,9 @@ class DraftBackendFactory:
         return AscendAttnBackend(self.draft_model_runner)
 
     def _create_flashmla_prefill_backend(self):
-        logger.warning(
-            "flashmla prefill backend is not yet supported for draft extend."
-        )
-        return None
+        from sglang.srt.layers.attention.flashmla_backend import FlashMLABackend
+
+        return FlashMLABackend(self.draft_model_runner, skip_prefill=False)
 
     def _create_dsv4_prefill_backend(self):
         # On NPU the "dsv4" backend resolves to the Ascend V4 subclass; its

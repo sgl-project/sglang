@@ -59,6 +59,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.hunyuan3d import (
     Hunyuan3D2PipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.ideogram import (
+    Ideogram4DistilledPipelineConfig,
     Ideogram4PipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.joy_echo import (
@@ -68,6 +69,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.joy_image import (
     JoyImageEditPipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.krea2 import Krea2PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.longlive2 import LongLive2T2VConfig
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     LTX2PipelineConfig,
     LTX23PipelineConfig,
@@ -118,7 +120,11 @@ from sglang.multimodal_gen.configs.sample.hunyuan import (
     HunyuanSamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.hunyuan3d import Hunyuan3DSamplingParams
-from sglang.multimodal_gen.configs.sample.ideogram import Ideogram4SamplingParams
+from sglang.multimodal_gen.configs.sample.ideogram import (
+    Ideogram4FastSamplingParams,
+    Ideogram4InstantSamplingParams,
+    Ideogram4SamplingParams,
+)
 from sglang.multimodal_gen.configs.sample.joy_echo import JoyEchoSamplingParams
 from sglang.multimodal_gen.configs.sample.joy_image import (
     JoyImageEditSamplingParams,
@@ -129,6 +135,7 @@ from sglang.multimodal_gen.configs.sample.krea2 import (
 from sglang.multimodal_gen.configs.sample.lingbot_world import (
     LingBotWorldSamplingParams,
 )
+from sglang.multimodal_gen.configs.sample.longlive2 import LongLive2SamplingParams
 from sglang.multimodal_gen.configs.sample.ltx_2 import (
     LTX2SamplingParams,
     LTX23HQSamplingParams,
@@ -789,6 +796,15 @@ def _register_configs():
         ],
     )
     register_configs(
+        sampling_param_cls=LongLive2SamplingParams,
+        pipeline_config_cls=LongLive2T2VConfig,
+        hf_model_paths=[
+            # Since LongLive-2.0-5B does not have official diffusers release
+            "Rabinovich/LongLive-2.0-5B-Diffusers",
+            "Efficient-Large-Model/LongLive-2.0-5B",
+        ],
+    )
+    register_configs(
         sampling_param_cls=FastWanT2V480PConfig,
         pipeline_config_cls=FastWan2_1_T2V_480P_Config,
         hf_model_paths=[
@@ -1101,6 +1117,16 @@ def _register_configs():
     )
 
     # Ideogram 4
+    register_configs(
+        sampling_param_cls=Ideogram4FastSamplingParams,
+        pipeline_config_cls=Ideogram4DistilledPipelineConfig,
+        hf_model_paths=["fal/ideogram-v4-fast"],
+    )
+    register_configs(
+        sampling_param_cls=Ideogram4InstantSamplingParams,
+        pipeline_config_cls=Ideogram4DistilledPipelineConfig,
+        hf_model_paths=["fal/ideogram-v4-instant"],
+    )
     register_configs(
         sampling_param_cls=Ideogram4SamplingParams,
         pipeline_config_cls=Ideogram4PipelineConfig,

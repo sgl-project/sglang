@@ -9,6 +9,13 @@ from unittest.mock import MagicMock, patch
 
 import sglang.srt.server_args as server_args_module
 from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
+from sglang.srt.entrypoints.sidecar import (
+    SGLANG_GRPC_ENDPOINT_ENV,
+    Sidecar,
+    _run_sidecar,
+    build_sidecar_endpoint,
+    start_sidecar,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.base import is_cp_enabled, is_interleave
 from sglang.srt.model_executor.cuda_graph_config import (
@@ -57,6 +64,80 @@ class TestPrepareServerArgs(CustomTestCase):
             self.assertEqual(parsed.mm_process_config, {"image": {"resize": 128}})
         finally:
             os.unlink(config_file)
+
+
+class TestMultimodalFeatureTransport(CustomTestCase):
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    def test_cuda_ipc_is_explicit_and_bounded(self, _mock_is_cuda):
+        server_args = ServerArgs(
+            model_path="dummy",
+            mm_feature_transport="cuda_ipc",
+            tokenizer_worker_num=4,
+            base_gpu_id=2,
+        )
+
+        with patch.dict(os.environ, {"SGLANG_USE_CUDA_IPC_TRANSPORT": "0"}):
+            with self.assertLogs(server_args_module.logger, level="INFO") as logs:
+                server_args._handle_multimodal_feature_transport()
+
+            self.assertEqual(server_args.mm_feature_transport, "cuda_ipc")
+            self.assertTrue(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
+
+        output = "\n".join(logs.output)
+        self.assertIn("base GPU 2", output)
+        self.assertIn("4 tokenizer worker", output)
+
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    def test_legacy_keep_flag_maps_to_cuda_ipc(self, _mock_is_cuda):
+        server_args = ServerArgs(model_path="dummy", keep_mm_feature_on_device=True)
+
+        with patch.dict(os.environ, {"SGLANG_USE_CUDA_IPC_TRANSPORT": "0"}):
+            with self.assertLogs(server_args_module.logger, level="WARNING") as logs:
+                server_args._handle_multimodal_feature_transport()
+
+            self.assertEqual(server_args.mm_feature_transport, "cuda_ipc")
+            self.assertFalse(server_args.keep_mm_feature_on_device)
+            self.assertTrue(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
+
+        self.assertIn("deprecated", logs.output[0])
+
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    def test_explicit_cpu_overrides_legacy_environment(self, _mock_is_cuda):
+        server_args = ServerArgs(model_path="dummy", mm_feature_transport="cpu")
+
+        with patch.dict(os.environ, {"SGLANG_USE_CUDA_IPC_TRANSPORT": "1"}):
+            with self.assertLogs(server_args_module.logger, level="WARNING") as logs:
+                server_args._handle_multimodal_feature_transport()
+
+            self.assertEqual(server_args.mm_feature_transport, "cpu")
+            self.assertFalse(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
+
+        self.assertIn("overrides", logs.output[0])
+
+    def test_default_transport_is_cpu(self):
+        server_args = ServerArgs(model_path="dummy")
+
+        with patch.dict(os.environ, {"SGLANG_USE_CUDA_IPC_TRANSPORT": "0"}):
+            server_args._handle_multimodal_feature_transport()
+
+            self.assertEqual(server_args.mm_feature_transport, "cpu")
+            self.assertFalse(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
+
+    @patch("sglang.srt.server_args.is_cuda", return_value=False)
+    def test_cuda_ipc_rejects_non_nvidia_platforms(self, _mock_is_cuda):
+        server_args = ServerArgs(model_path="dummy", mm_feature_transport="cuda_ipc")
+
+        with self.assertRaisesRegex(ValueError, "requires NVIDIA CUDA"):
+            server_args._handle_multimodal_feature_transport()
+
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    def test_cuda_ipc_rejects_multi_node(self, _mock_is_cuda):
+        server_args = ServerArgs(
+            model_path="dummy", mm_feature_transport="cuda_ipc", nnodes=2
+        )
+
+        with self.assertRaisesRegex(ValueError, "single node"):
+            server_args._handle_multimodal_feature_transport()
 
 
 class TestMambaCacheStochasticRounding(unittest.TestCase):
@@ -156,6 +237,22 @@ class TestLoadBalanceMethod(unittest.TestCase):
 
         self.assertFalse(server_args.disable_radix_cache)
         self.assertEqual(server_args.disaggregation_transfer_backend, "mooncake")
+
+
+class TestSkipTokenizerInit(unittest.TestCase):
+    def test_skip_tokenizer_worker_counts(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            skip_tokenizer_init=True,
+            tokenizer_worker_num=4,
+            detokenizer_worker_num=3,
+        )
+
+        server_args._handle_tokenizer_batching()
+
+        # Tokenizer fanout preserved; detokenizer coerced to 1 (no decode work).
+        self.assertEqual(server_args.tokenizer_worker_num, 4)
+        self.assertEqual(server_args.detokenizer_worker_num, 1)
 
 
 class TestHiSparseDsaBackendPolicy(unittest.TestCase):
@@ -973,12 +1070,12 @@ class TestAdaptiveSpecArgs(CustomTestCase):
         self.assertEqual(args.speculative_num_draft_tokens, 4)
 
 
-class TestDeepEPWaterfillArgs(CustomTestCase):
+class TestWaterfillArgs(CustomTestCase):
     def test_waterfill_enforces_shared_experts_fusion(self):
         server_args = ServerArgs(
             model_path="dummy",
             moe_a2a_backend="deepep",
-            enable_deepep_waterfill=True,
+            enable_waterfill=True,
             disable_shared_experts_fusion=True,
         )
         # dummy-model path short-circuits __post_init__; invoke the handler directly.
@@ -995,7 +1092,7 @@ class TestDeepEPWaterfillArgs(CustomTestCase):
         server_args = ServerArgs(
             model_path="dummy",
             moe_a2a_backend="none",
-            enable_deepep_waterfill=True,
+            enable_waterfill=True,
         )
         # dummy-model path short-circuits __post_init__; invoke the handler directly.
         server_args._handle_a2a_moe()
@@ -1006,11 +1103,27 @@ class TestDeepEPWaterfillArgs(CustomTestCase):
         self.assertEqual(resolved_view(server_args).moe_a2a_backend, "deepep")
         self.assertTrue(server_args.enforce_shared_experts_fusion)
 
+    def test_waterfill_keeps_megamoe_backend(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            moe_a2a_backend="megamoe",
+            enable_waterfill=True,
+            disable_shared_experts_fusion=True,
+        )
+        # dummy-model path short-circuits __post_init__; invoke the handler directly.
+        server_args._handle_a2a_moe()
+
+        from sglang.srt.arg_groups.overrides import resolved_view
+
+        self.assertEqual(resolved_view(server_args).moe_a2a_backend, "megamoe")
+        self.assertFalse(resolved_view(server_args).disable_shared_experts_fusion)
+        self.assertTrue(server_args.enforce_shared_experts_fusion)
+
     def test_waterfill_supports_deepep_low_latency_mode(self):
         server_args = ServerArgs(
             model_path="dummy",
             moe_a2a_backend="deepep",
-            enable_deepep_waterfill=True,
+            enable_waterfill=True,
             deepep_mode="low_latency",
         )
         # dummy-model path short-circuits __post_init__; invoke the handler directly.
@@ -1030,7 +1143,7 @@ class TestPrefillOnlyDisableKvCache(unittest.TestCase):
       - disable_radix_cache (radix cache otherwise indexes empty pool slots),
       - no context-parallel attention (CP writes to the pool via set_kv_buffer),
       - no HiSparse (uses a different pool family),
-      - kv_cache_dtype != fp4_e2m1 (FP4 pool is a separate allocation path).
+      - kv_cache_dtype is not nvfp4/fp4_mx_block16 (FP4 pool is a separate allocation path).
     All other configurations must be rejected before model load.
     """
 
@@ -1080,8 +1193,10 @@ class TestPrefillOnlyDisableKvCache(unittest.TestCase):
             self._validate_prefill_only_args(enable_hisparse=True)
 
     def test_rejects_fp4_kv_cache(self):
-        with self.assertRaisesRegex(ValueError, "fp4_e2m1"):
-            self._validate_prefill_only_args(kv_cache_dtype="fp4_e2m1")
+        for kv_cache_dtype in ("nvfp4", "fp4_mx_block16"):
+            with self.subTest(kv_cache_dtype=kv_cache_dtype):
+                with self.assertRaisesRegex(ValueError, "nvfp4.*fp4_mx_block16"):
+                    self._validate_prefill_only_args(kv_cache_dtype=kv_cache_dtype)
 
 
 class TestSessionRadixCacheServerArgs(unittest.TestCase):
@@ -1179,6 +1294,64 @@ class TestCudaGraphDisaggregationRoles(CustomTestCase):
 
         self.assertEqual(args.cuda_graph_config.decode.backend, Backend.FULL)
         self.assertIn((Phase.DECODE, "backend"), args._cuda_graph_config_locked)
+
+
+class TestBreakableCudaGraphMultimodalAllowlist(CustomTestCase):
+    """The BCG "multimodal model" rule exempts archs on the BCG multimodal
+    opt-in allowlist (multimodal_breakable_cuda_graph_supported_model_archs)."""
+
+    def _handled_args(self, *, architectures, is_multimodal, allowlisted):
+        args = ServerArgs(model_path="dummy")
+        args.model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=architectures),
+            is_piecewise_cuda_graph_disabled_model=False,
+            is_multimodal=is_multimodal,
+            is_multimodal_piecewise_cuda_graph_supported=False,
+            is_multimodal_breakable_cuda_graph_supported=allowlisted,
+        )
+        with (
+            patch("sglang.srt.utils.is_cuda", return_value=True),
+            patch.object(ServerArgs, "use_mla_backend", return_value=False),
+        ):
+            args._handle_cuda_graph_config()
+        return args
+
+    def test_multimodal_arch_disables_prefill_breakable(self):
+        args = self._handled_args(
+            architectures=["Qwen3VLForConditionalGeneration"],
+            is_multimodal=True,
+            allowlisted=False,
+        )
+        self.assertEqual(args.cuda_graph_config.prefill.backend, Backend.DISABLED)
+
+    def test_allowlisted_multimodal_arch_keeps_prefill_breakable(self):
+        args = self._handled_args(
+            architectures=["Qwen3_5MoeForConditionalGeneration"],
+            is_multimodal=True,
+            allowlisted=True,
+        )
+        self.assertEqual(args.cuda_graph_config.prefill.backend, Backend.BREAKABLE)
+
+    def test_allowlist_membership(self):
+        from sglang.srt.configs.model_config import (
+            is_multimodal_breakable_cuda_graph_supported,
+        )
+
+        self.assertTrue(
+            is_multimodal_breakable_cuda_graph_supported(
+                ["Qwen3_5MoeForConditionalGeneration"]
+            )
+        )
+        self.assertTrue(
+            is_multimodal_breakable_cuda_graph_supported(
+                ["Qwen3_5ForConditionalGeneration"]
+            )
+        )
+        self.assertFalse(
+            is_multimodal_breakable_cuda_graph_supported(
+                ["Qwen3VLForConditionalGeneration"]
+            )
+        )
 
 
 class TestCutedslMoeMaxNumTokens(CustomTestCase):
@@ -1370,6 +1543,133 @@ class TestGrpcServerArgs(CustomTestCase):
             sa._handle_deprecated_args()
         self.assertEqual(sa.grpc_port, 45000)
 
+    @staticmethod
+    def _sidecar_parser():
+        parser = server_args_module.argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        return parser
+
+    def test_sidecar_builds_loopback_grpc_endpoints(self):
+        self.assertEqual(
+            build_sidecar_endpoint(SimpleNamespace(host="0.0.0.0", grpc_port=50051)),
+            "http://127.0.0.1:50051",
+        )
+        self.assertEqual(
+            build_sidecar_endpoint(SimpleNamespace(host="::", grpc_port=50051)),
+            "http://[::1]:50051",
+        )
+        self.assertEqual(
+            build_sidecar_endpoint(SimpleNamespace(host="[::]", grpc_port=50051)),
+            "http://[::1]:50051",
+        )
+
+    def test_sidecar_args_parse_as_exact_json_argv(self):
+        argv = ["--flag", "value"]
+        parsed = self._sidecar_parser().parse_args(
+            ["--model-path", "dummy", "--sidecar-args", json.dumps(argv)]
+        )
+        self.assertEqual(parsed.sidecar_args, argv)
+
+    def test_start_sidecar_passes_endpoint_and_provider_argv_separately(self):
+        server_args = SimpleNamespace(
+            sidecar="example.sidecar",
+            sidecar_args=[
+                "--sidecar-shutdown-timeout",
+                "42",
+                "--grpc-connections",
+                "2",
+            ],
+            host="127.0.0.1",
+            grpc_port=50051,
+        )
+        with (
+            patch("sglang.srt.entrypoints.sidecar.mp.get_context") as get_context,
+            patch("sglang.srt.entrypoints.sidecar.Sidecar") as sidecar_class,
+        ):
+            start_sidecar(server_args)
+
+        process_kwargs = get_context.return_value.Process.call_args.kwargs
+        self.assertEqual(process_kwargs["name"], "sglang_sidecar_example.sidecar")
+        self.assertEqual(process_kwargs["target"], _run_sidecar)
+        self.assertEqual(
+            process_kwargs["args"],
+            (
+                "example.sidecar",
+                ["--grpc-connections", "2"],
+                "http://127.0.0.1:50051",
+            ),
+        )
+        sidecar_class.assert_called_once_with(
+            get_context.return_value.Process.return_value,
+            "example.sidecar",
+            shutdown_timeout=42.0,
+        )
+
+    def test_sidecar_requires_native_grpc(self):
+        sa = self._args(sidecar="example.sidecar")
+        with self.assertRaisesRegex(ValueError, "requires --grpc-port"):
+            sa._handle_deprecated_args()
+
+    def test_sidecar_rejects_legacy_grpc(self):
+        sa = self._args(sidecar="example.sidecar", smg_grpc_mode=True)
+        with self.assertRaisesRegex(ValueError, "native gRPC server"):
+            sa._handle_deprecated_args()
+
+    def test_sidecar_rejects_empty_value(self):
+        sa = self._args(sidecar="", grpc_port=50051)
+        with self.assertRaisesRegex(ValueError, "must not be empty"):
+            sa._handle_deprecated_args()
+
+    def test_sidecar_sets_endpoint_env_before_import_and_calls_main(self):
+        main = MagicMock()
+
+        def import_module(module_name):
+            self.assertEqual(module_name, "example.sidecar")
+            self.assertEqual(
+                os.environ[SGLANG_GRPC_ENDPOINT_ENV],
+                "http://127.0.0.1:50051",
+            )
+            self.assertEqual(os.environ["DYN_NAMESPACE"], "pluh")
+            return SimpleNamespace(main=main)
+
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    SGLANG_GRPC_ENDPOINT_ENV: "http://stale.example:1",
+                    "DYN_NAMESPACE": "pluh",
+                },
+            ),
+            patch("sglang.srt.entrypoints.sidecar.kill_itself_when_parent_died"),
+            patch(
+                "sglang.srt.entrypoints.sidecar.importlib.import_module",
+                side_effect=import_module,
+            ),
+        ):
+            _run_sidecar(
+                "example.sidecar",
+                ["--provider-flag", "value"],
+                "http://127.0.0.1:50051",
+            )
+
+        main.assert_called_once_with(["--provider-flag", "value"])
+
+    def test_sidecar_stop_uses_configured_shutdown_timeout(self):
+        proc = MagicMock(pid=1234)
+        proc.is_alive.side_effect = [True, True]
+        sidecar = Sidecar(
+            proc,
+            "example.sidecar",
+            shutdown_timeout=42.0,
+        )
+
+        with patch("sglang.srt.entrypoints.sidecar.kill_process_tree") as kill_tree:
+            sidecar.stop()
+
+        proc.terminate.assert_called_once_with()
+        proc.join.assert_called_once_with(timeout=42.0)
+        kill_tree.assert_called_once_with(1234, wait_timeout=42.0)
+
     def test_legacy_smg_derives_grpc_port_from_http_port(self):
         sa = self._args(port=30000, smg_grpc_mode=True)
         sa._handle_deprecated_args()
@@ -1452,7 +1752,7 @@ class TestTwoBatchOverlapBackend(CustomTestCase):
     SGLANG_ENABLE_DP_TBO env: enabling DP TBO now needs no extra flag.
 
     dummy-model short-circuits __post_init__, so the guard handler is invoked
-    directly (same pattern as TestDeepEPWaterfillArgs)."""
+    directly (same pattern as TestWaterfillArgs)."""
 
     def _args(self, **overrides):
         args = ServerArgs(model_path="dummy")

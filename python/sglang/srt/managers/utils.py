@@ -66,6 +66,13 @@ class GenerationBatchResult:
     future_indices: Optional[torch.Tensor] = None
     speculative_num_draft_tokens: Optional[int] = None
 
+    # Grammar FSM advance memoization (spec-v2 overlap). advance_grammar_fsm sets
+    # these once — eagerly via the scheduler's grammar barrier inside verify(), or
+    # lazily in _resolve_spec_v2_tokens — and the latter consumes
+    # grammar_retained_tokens instead of re-advancing the FSM.
+    grammar_advanced: bool = False
+    grammar_retained_tokens: Optional[list] = None
+
     # FIXME(lsyin): maybe move to a better place?
     # sync path: forward stream -> output processor
     accept_lens: Optional[torch.Tensor] = None
@@ -224,6 +231,8 @@ def get_logprob_dict_from_result(result: GenerationBatchResult) -> dict:
         "next_token_top_logprobs_idx": result.logits_output.next_token_top_logprobs_idx,
         "next_token_token_ids_logprobs_val": result.logits_output.next_token_token_ids_logprobs_val,
         "next_token_token_ids_logprobs_idx": result.logits_output.next_token_token_ids_logprobs_idx,
+        "next_token_sampling_mask_idx": result.logits_output.next_token_sampling_mask_idx,
+        "next_token_sampling_logprobs": result.logits_output.next_token_sampling_logprobs,
         "input_token_logprobs": result.logits_output.input_token_logprobs,
         "input_top_logprobs_val": result.logits_output.input_top_logprobs_val,
         "input_top_logprobs_idx": result.logits_output.input_top_logprobs_idx,
@@ -248,6 +257,8 @@ def get_logprob_from_pp_outputs(
         next_token_token_ids_logprobs_idx=next_pp_outputs[
             "next_token_token_ids_logprobs_idx"
         ],
+        next_token_sampling_mask_idx=next_pp_outputs["next_token_sampling_mask_idx"],
+        next_token_sampling_logprobs=next_pp_outputs["next_token_sampling_logprobs"],
         input_token_logprobs=next_pp_outputs["input_token_logprobs"],
         input_top_logprobs_val=next_pp_outputs["input_top_logprobs_val"],
         input_top_logprobs_idx=next_pp_outputs["input_top_logprobs_idx"],

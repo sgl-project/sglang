@@ -26,6 +26,7 @@ from sglang.srt.function_call.glm47_moe_detector import Glm47MoeDetector
 from sglang.srt.function_call.gpt_oss_detector import GptOssDetector
 from sglang.srt.function_call.hermes_detector import HermesDetector
 from sglang.srt.function_call.hunyuan_detector import HunyuanDetector
+from sglang.srt.function_call.inkling_detector import InklingDetector
 from sglang.srt.function_call.internlm_detector import InternlmDetector
 from sglang.srt.function_call.kimik2_detector import KimiK2Detector
 from sglang.srt.function_call.lfm2_detector import Lfm2Detector
@@ -90,6 +91,7 @@ class FunctionCallParser:
         "hunyuan": HunyuanDetector,
         "gigachat3": GigaChat3Detector,
         "gemma4": Gemma4Detector,
+        "inkling": InklingDetector,
     }
 
     def __init__(self, tools: List[Tool], tool_call_parser: str, tokenizer=None):
@@ -137,9 +139,10 @@ class FunctionCallParser:
         """
         if not self.tools:
             return full_text, []
+        has_tool_call = self.detector.has_tool_call(full_text)
         parsed_result = self.detector.detect_and_parse(full_text, self.tools)
         tool_call_list = parsed_result.calls
-        if tool_call_list:
+        if tool_call_list or has_tool_call:
             return parsed_result.normal_text, tool_call_list
         else:
             return full_text, []
@@ -247,6 +250,13 @@ class FunctionCallParser:
 
         # Highest priority: model-native structural_tag when available.
         try:
+            if tool_choice == "auto" and not should_constrain_auto:
+                structural_tag = self.detector.get_auto_tool_call_structural_tag(
+                    tools=self.tools
+                )
+                if structural_tag is not None:
+                    return ("structural_tag", structural_tag)
+
             if is_required or should_constrain_auto:
                 structural_tag = self.detector.get_structural_tag(
                     tools=self.tools,

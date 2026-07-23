@@ -100,7 +100,7 @@ class FillContext:
 
     Carries both the bs-axis and tokens-axis raw/padded counts so a hook can
     derive values regardless of its own slot's axis — e.g. the padded token
-    count (``padded_num_tokens`` == padded_bs * num_tokens_per_bs), which the
+    count (``padded_num_tokens`` == padded_bs * num_tokens_per_req), which the
     global-num-tokens fill and the local-num-token-non-padded transform need.
     """
 
@@ -789,6 +789,8 @@ def build_prefill_registry(
     embed_dtype: Optional[torch.dtype] = None,
     enable_mamba_track: bool = False,
     enable_num_token_non_padded: bool = False,
+    require_gathered_buffer: bool = False,
+    enable_prefill_cp: bool = False,
     register_input_embeds: bool = True,
     share_pool: bool = True,
     source: Optional[Any] = None,
@@ -878,12 +880,32 @@ def build_prefill_registry(
         slots.append(GraphSlot("mamba_track_mask", _bs, torch.bool, axis="bs"))
         slots.append(GraphSlot("mamba_track_seqlens", _bs, torch.int32, axis="bs"))
     if enable_num_token_non_padded:
+        from sglang.srt.model_executor.forward_batch_info import (
+            compute_local_num_token_non_padded_cpu,
+        )
+
+        def _prefill_num_token_non_padded_post_fill(buf, fb, ctx):
+            # The FB tensor was attn-TP-localized against the RAW length, but
+            # replay pads rows up to the capture bucket, moving the shard
+            # boundary — copying it verbatim would make the in-graph pad mask
+            # blank real tokens whenever raw < bucket. Recompute the local
+            # count against the padded bucket from the batch's un-adjusted
+            # global count, mirroring the decode registry's post_fill.
+            if require_gathered_buffer and not enable_prefill_cp:
+                buf.fill_(
+                    compute_local_num_token_non_padded_cpu(
+                        global_num_token_non_padded=fb.num_token_non_padded_cpu,
+                        num_tokens_per_dp=ctx.padded_num_tokens,
+                    )
+                )
+
         slots.append(
             GraphSlot(
                 "num_token_non_padded",
                 lambda _bs2, _mt: (1,),
                 torch.int32,
                 axis="none",
+                post_fill=_prefill_num_token_non_padded_post_fill,
             )
         )
 
