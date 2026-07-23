@@ -5248,8 +5248,8 @@ class ServerArgs:
             view, model_arch
         ), f"extra_buffer is not supported for {model_arch}; use no_buffer."
         assert (
-            is_cuda() or is_musa() or is_npu() or is_hip()
-        ), "extra_buffer needs CUDA/MUSA/NPU/ROCm (FLA)."
+            is_cuda() or is_musa() or is_npu() or is_hip() or is_xpu()
+        ), "extra_buffer needs CUDA/MUSA/NPU/ROCm/XPU (FLA)."
         if view.mamba_radix_cache_strategy == "extra_buffer_lazy":
             # The PD-disagg decode pool is not wired for lazy slots.
             assert view.disaggregation_mode == "null", (
