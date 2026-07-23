@@ -1900,7 +1900,18 @@ class FlashInferIndicesUpdaterPrefill:
                         seq_lens,
                         sliding_window_size + seq_lens - prefix_lens,
                     )
-                    paged_kernel_lens_sum = paged_kernel_lens.sum().item()
+                    if seq_lens_cpu is not None and torch.equal(
+                        prefix_lens, seq_lens
+                    ):
+                        # The lengths reduce to min(seq_lens, window). Use the
+                        # host mirror instead of reading back the CUDA sum.
+                        paged_kernel_lens_sum = int(
+                            torch.clamp(
+                                seq_lens_cpu, max=sliding_window_size
+                            ).sum()
+                        )
+                    else:
+                        paged_kernel_lens_sum = paged_kernel_lens.sum().item()
                     kv_start_idx = seq_lens - paged_kernel_lens
             else:
                 # full attention
