@@ -7,12 +7,12 @@ zeros + index_copy_) across bf16/fp16 and several shape/mask cases.
 import pytest
 import torch
 
-from sglang.jit_kernel.diffusion.triton.varlen_pack_pad import (
+from sglang.kernels.jit.utils import get_ci_test_range
+from sglang.kernels.ops.diffusion.triton.varlen_pack_pad import (
     build_inv_indices,
     fused_pack_qkv,
     fused_scatter_to_padded,
 )
-from sglang.jit_kernel.utils import get_ci_test_range
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-large")

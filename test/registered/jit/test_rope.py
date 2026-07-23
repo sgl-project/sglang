@@ -4,7 +4,7 @@ import pytest
 import torch
 import triton
 
-from sglang.jit_kernel.utils import get_ci_test_range
+from sglang.kernels.jit.utils import get_ci_test_range
 from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
@@ -53,7 +53,7 @@ def sglang_jit_rope(
     positions: torch.Tensor,
     is_neox: bool,
 ) -> None:
-    from sglang.jit_kernel.rope import apply_rope_inplace
+    from sglang.kernels.ops.attention.rope import apply_rope_inplace
 
     apply_rope_inplace(q, k, cos_sin_cache, positions, is_neox=is_neox)
 
@@ -250,7 +250,7 @@ def test_fused_rope_store(
     is_neox: bool,
 ) -> None:
     """Test fused RoPE + KV cache store against separate RoPE + manual store."""
-    from sglang.jit_kernel.rope import apply_rope_inplace_with_kvcache
+    from sglang.kernels.ops.attention.rope import apply_rope_inplace_with_kvcache
 
     num_qo_heads = num_kv_heads * gqa_ratio
     dtype = DTYPE

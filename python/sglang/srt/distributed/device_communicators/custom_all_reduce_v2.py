@@ -25,7 +25,7 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
-from sglang.jit_kernel.all_reduce import (
+from sglang.kernels.ops.communication.all_reduce import (
     AllReduceAlgo,
     Communicator,
     IPCManager,
