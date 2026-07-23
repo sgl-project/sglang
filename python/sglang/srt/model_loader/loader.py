@@ -1689,7 +1689,7 @@ class PreshardedModelLoader(DefaultModelLoader):
         self,
         *,
         model_config: ModelConfig,
-        device_config: "DeviceConfig",
+        device_config: DeviceConfig,
     ) -> nn.Module:
         shard_config = self._collect_shard_config(model_config)
         presharded_dir = self._presharded_dir(model_config, shard_config)
@@ -1760,7 +1760,7 @@ class PreshardedModelLoader(DefaultModelLoader):
             except (AssertionError, AttributeError, RuntimeError):
                 return 1
 
-        server_args = get_global_server_args()
+        server_args = get_server_args()
         return {
             "tp": _safe(get_tensor_model_parallel_world_size),
             "dp": _safe(get_moe_data_parallel_world_size),
@@ -2036,7 +2036,7 @@ class PreshardedModelLoader(DefaultModelLoader):
     def _first_time_load_and_dump(
         self,
         model_config: ModelConfig,
-        device_config: "DeviceConfig",
+        device_config: DeviceConfig,
         presharded_dir: str,
         shard_config: Dict[str, Any],
     ) -> nn.Module:
@@ -2354,7 +2354,7 @@ class PreshardedModelLoader(DefaultModelLoader):
     def _load_from_presharded(
         self,
         model_config: ModelConfig,
-        device_config: "DeviceConfig",
+        device_config: DeviceConfig,
         presharded_dir: str,
     ) -> nn.Module:
         from safetensors.torch import safe_open

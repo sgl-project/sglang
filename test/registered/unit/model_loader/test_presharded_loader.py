@@ -693,7 +693,7 @@ class TestShardConfig(unittest.TestCase):
             "structural_signature",
         }
         with mock.patch(
-            "sglang.srt.model_loader.loader.get_global_server_args",
+            "sglang.srt.model_loader.loader.get_server_args",
             return_value=server_args,
         ), mock.patch(
             "sglang.srt.distributed.get_tensor_model_parallel_world_size",
