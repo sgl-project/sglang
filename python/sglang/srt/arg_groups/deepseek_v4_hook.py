@@ -75,6 +75,7 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
         )
 
     server_args.enable_dsa_prefill_context_parallel = True
+    server_args.enable_prefill_context_parallel = False
     server_args.dsa_prefill_cp_mode = "round-robin-split"
     server_args.enable_dp_attention = True
     server_args.moe_dense_tp_size = 1

@@ -39,6 +39,7 @@ from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    append_draft_kv_data,
     get_dsv4_c128_state_indices,
     get_kv_class,
     is_aborted,
@@ -47,6 +48,7 @@ from sglang.srt.disaggregation.utils import (
     poll_and_all_reduce_attn_cp_tp_group,
     prepare_abort,
     setup_state_kv_args,
+    should_transfer_draft_cache,
 )
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import (
@@ -62,6 +64,7 @@ from sglang.srt.mem_cache.common import (
     maybe_cache_unfinished_req,
     release_kv_cache,
 )
+from sglang.srt.mem_cache.cp_cache_layer_split import is_cp_cache_layer_split_pool
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
@@ -156,14 +159,12 @@ class PrefillBootstrapQueue:
         kv_args.engine_rank = self.tp_rank
         kv_args.pp_rank = self.pp_rank
         kv_args.system_dp_rank = self.scheduler.ps.dp_rank
+        # layer_shard_enabled is the DSA contiguous-range contract used
+        # to derive prefill_start/end_layer. It is not the generic LayerSplit flag.
         layer_shard_enabled = getattr(
             self.token_to_kv_pool, "layer_shard_enabled", False
         )
-        layer_shard_rank = getattr(self.token_to_kv_pool, "layer_shard_rank", None)
-        layer_shard_size = getattr(self.token_to_kv_pool, "layer_shard_size", 1)
-        transfer_draft_cache = (
-            not layer_shard_enabled or layer_shard_rank == layer_shard_size - 1
-        )
+        transfer_draft_cache = should_transfer_draft_cache(self.token_to_kv_pool)
         kv_args.prefill_start_layer = (
             getattr(
                 self.token_to_kv_pool,
@@ -182,20 +183,37 @@ class PrefillBootstrapQueue:
             if layer_shard_enabled
             else getattr(self.token_to_kv_pool, "end_layer", None)
         )
+        kv_data_layout = (
+            self.token_to_kv_pool.get_kv_transfer_layout()
+            if hasattr(self.token_to_kv_pool, "get_kv_transfer_layout")
+            else []
+        )
 
         if self.draft_token_to_kv_pool is not None and transfer_draft_cache:
             # We should also transfer draft model kv cache. The indices are
             # always shared with a target model.
-            draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
-                self.draft_token_to_kv_pool.get_contiguous_buf_infos()
+            append_draft_kv_data(
+                kv_data_ptrs,
+                kv_data_lens,
+                kv_item_lens,
+                kv_data_layout,
+                self.draft_token_to_kv_pool,
             )
-            kv_data_ptrs += draft_kv_data_ptrs
-            kv_data_lens += draft_kv_data_lens
-            kv_item_lens += draft_kv_item_lens
 
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
+        kv_args.kv_data_layout = kv_data_layout
+
+        # Generic PD wire metadata: decode must account for cache layers split
+        # across prefill CP ranks, regardless of whether ownership is contiguous.
+        kv_args.cp_cache_layer_split = is_cp_cache_layer_split_pool(
+            self.token_to_kv_pool
+        )
+        kv_args.require_descriptor_matched_transfer = bool(
+            kv_args.cp_cache_layer_split
+            and self.token_to_kv_pool.requires_descriptor_matched_transfer
+        )
         if not self.is_mla_backend:
             kv_args.kv_head_num = self.token_to_kv_pool.head_num
             kv_args.total_kv_head_num = (

@@ -40,6 +40,9 @@ class KVArgs:
     kv_data_ptrs: List[int]
     kv_data_lens: List[int]
     kv_item_lens: List[int]
+    # Optional per-tensor descriptors used when source/destination buffer
+    # lists are not positional matches, e.g. DeepSeek V4 CP Cache LayerSplit.
+    kv_data_layout: List[tuple]
     aux_data_ptrs: List[int]
     aux_data_lens: List[int]
     aux_item_lens: List[int]
@@ -47,6 +50,7 @@ class KVArgs:
     state_data_ptrs: List[List[int]]
     state_data_lens: List[List[int]]
     state_item_lens: List[List[int]]
+    state_data_layouts: List[List[tuple]]
     # Per-tensor TP slice dim, used when prefill/decode attn_tp_size differ.
     state_dim_per_tensor: List[List[int]]
     is_hybrid_mla_backend: bool
@@ -75,6 +79,13 @@ class KVArgs:
     # the connection layer to slice the buffer-type-organized flat list in a
     # PP-aware manner.
     mla_compression_ratios: Optional[List[int]]
+    # Wire-level CP Cache LayerSplit flag: prefill stores cache across CP ranks,
+    # so decode must pull from every prefill CP rank. This is broader than
+    # KVCache.layer_shard_enabled, which only marks contiguous layer ranges.
+    cp_cache_layer_split: bool
+    # Prefill-side only: require descriptor-matched transfer and fail instead
+    # of falling back to positional order when descriptor metadata is incomplete.
+    require_descriptor_matched_transfer: bool
     # Only used of npu, for kv buf groups
     kv_buf_groups: int
     # Only used of npu, for decode total kv layers

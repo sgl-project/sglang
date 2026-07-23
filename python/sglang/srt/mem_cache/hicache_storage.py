@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 
 # Max pages per batched storage IO call.
 STORAGE_BATCH_SIZE = 128
+CP_CACHE_LAYER_SPLIT_STORAGE_SUFFIX = "layer_split"
 
 
 @dataclass
@@ -37,6 +38,7 @@ class HiCacheStorageConfig:
     model_name: Optional[str]
     tp_lcm_size: Optional[int] = None
     should_split_heads: bool = False
+    cp_cache_layer_split: bool = False
     extra_config: Optional[dict] = None
 
 
@@ -380,8 +382,11 @@ class HiCacheFile(HiCacheStorage):
             self.config_suffix += f"_{tp_rank}_{tp_size}"
         if enable_pp:
             self.config_suffix += f"_{pp_size}_{pp_rank}"
+        if storage_config.cp_cache_layer_split:
+            self.config_suffix += f"_{CP_CACHE_LAYER_SPLIT_STORAGE_SUFFIX}"
         # Under NSA context parallel each CP rank holds a disjoint slice of every
-        # page, so give each rank its own file key to avoid a cross-rank write race.
+        # page; LayerSplit stores disjoint layer ownership. Both need rank-local
+        # file keys to avoid cross-rank write races.
         if attn_cp_size > 1:
             self.config_suffix += f"_cp{attn_cp_rank}_{attn_cp_size}"
 

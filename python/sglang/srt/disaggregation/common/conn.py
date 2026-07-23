@@ -73,7 +73,7 @@ class PrefillServerInfo:
     page_size: Optional[int]
     kv_cache_dtype: Optional[str]
     follow_bootstrap_room: bool
-    enable_dsa_cache_layer_split: bool = False
+    cp_cache_layer_split: bool = False
 
     # PD true-retraction rebootstrap: the prefill's HTTP API port. The decode
     # already knows the prefill host (the bootstrap_addr host), so it can POST
@@ -99,7 +99,7 @@ class PrefillServerInfo:
             str(self.kv_cache_dtype) if self.kv_cache_dtype is not None else None
         )
         self.follow_bootstrap_room = bool(self.follow_bootstrap_room)
-        self.enable_dsa_cache_layer_split = bool(self.enable_dsa_cache_layer_split)
+        self.cp_cache_layer_split = bool(self.cp_cache_layer_split)
         self.prefill_http_port = (
             int(self.prefill_http_port) if self.prefill_http_port is not None else None
         )
@@ -154,8 +154,9 @@ class CommonKVManager(BaseKVManager):
         self.pp_size = server_args.pp_size
         self.pp_rank = self.kv_args.pp_rank
         self.local_ip = get_local_ip_auto()
+        cp_cache_layer_split = bool(self.kv_args.cp_cache_layer_split)
         cp_sharded_prefill = self.attn_cp_size > 1 and (
-            self.is_hybrid_mla_backend or server_args.enable_dsa_cache_layer_split
+            self.is_hybrid_mla_backend or cp_cache_layer_split
         )
 
         hybrid_decode_pulls_all_ranks = (
@@ -538,8 +539,7 @@ class CommonKVManager(BaseKVManager):
         else:
             target_cp_ranks = list(range(info.attn_cp_size))
             pull_from_all_cp_ranks = (
-                self.enable_all_cp_ranks_for_transfer
-                or info.enable_dsa_cache_layer_split
+                self.enable_all_cp_ranks_for_transfer or info.cp_cache_layer_split
             )
             if not pull_from_all_cp_ranks:
                 # Only retrieve from prefill CP rank 0 when not using all ranks
@@ -628,9 +628,7 @@ class CommonKVManager(BaseKVManager):
             "page_size": self.kv_args.page_size,
             "kv_cache_dtype": get_model().kv_cache_dtype,
             "load_balance_method": self.server_args.load_balance_method,
-            "enable_dsa_cache_layer_split": getattr(
-                self.server_args, "enable_dsa_cache_layer_split", False
-            ),
+            "cp_cache_layer_split": bool(self.kv_args.cp_cache_layer_split),
             # Self-register the HTTP API port so the decode can derive the PD
             # retract rebootstrap /generate URL from bootstrap info instead of a
             # router-injected pd_rebootstrap_prefill_url.
@@ -879,6 +877,90 @@ class CommonKVManager(BaseKVManager):
 
         return src_kv_ptrs, sliced_dst
 
+    @staticmethod
+    def build_descriptor_matched_transfer_params(
+        src_data_ptrs,
+        dst_data_ptrs,
+        item_lens,
+        src_data_layout,
+        dst_data_layout,
+        dst_item_lens=None,
+    ) -> List[Tuple[int, int, int]]:
+        """Build transfer params by descriptor instead of positional index.
+
+        DeepSeek V4 LayerSplit compacts multiple cache families into per-rank
+        buffer lists whose count and positional order differ from decode's full
+        layout. Descriptors identify each buffer by family and layer so it is
+        transferred to the matching decode destination.
+        """
+        if not src_data_layout or not dst_data_layout:
+            raise RuntimeError(
+                "Descriptor-matched cache transfer requires descriptors on both "
+                f"source and destination, got src={len(src_data_layout or [])}, "
+                f"dst={len(dst_data_layout or [])}"
+            )
+
+        dst_item_lens = dst_item_lens or []
+        if not dst_item_lens:
+            raise RuntimeError(
+                "Descriptor-matched cache transfer requires destination item sizes"
+            )
+
+        if (
+            len(src_data_layout) != len(src_data_ptrs)
+            or len(src_data_layout) != len(item_lens)
+            or len(dst_data_layout) != len(dst_data_ptrs)
+            or len(dst_data_layout) != len(dst_item_lens)
+        ):
+            raise RuntimeError(
+                "Descriptor-matched cache transfer descriptor length mismatch: "
+                f"src_layout={len(src_data_layout)}, "
+                f"src_ptrs={len(src_data_ptrs)}, item_lens={len(item_lens)}, "
+                f"dst_layout={len(dst_data_layout)}, dst_ptrs={len(dst_data_ptrs)}, "
+                f"dst_item_lens={len(dst_item_lens)}"
+            )
+
+        dst_by_key = {}
+        for key, ptr, dst_item_len in zip(
+            dst_data_layout, dst_data_ptrs, dst_item_lens
+        ):
+            if key is None:
+                continue
+            key = tuple(key)
+            if key in dst_by_key:
+                raise RuntimeError(f"duplicate destination transfer descriptor {key!r}")
+            dst_by_key[key] = (ptr, dst_item_len)
+
+        layers_params = []
+        missing = []
+        seen_src = set()
+        for key, src_ptr, item_len in zip(src_data_layout, src_data_ptrs, item_lens):
+            if key is None:
+                continue
+            key = tuple(key)
+            if key in seen_src:
+                raise RuntimeError(f"duplicate source transfer descriptor {key!r}")
+            seen_src.add(key)
+            dst_match = dst_by_key.get(key)
+            if dst_match is None:
+                missing.append(key)
+                continue
+            dst_ptr, dst_item_len = dst_match
+            if int(item_len) != int(dst_item_len):
+                raise RuntimeError(
+                    "transfer descriptor item size mismatch for "
+                    f"{key!r}: source={int(item_len)}, destination={int(dst_item_len)}"
+                )
+            layers_params.append((int(src_ptr), int(dst_ptr), int(item_len)))
+
+        if missing:
+            raise RuntimeError(
+                "destination is missing transfer descriptors required by source: "
+                f"{missing[:8]}{'...' if len(missing) > 8 else ''}"
+            )
+
+        return layers_params
+
     def _start_heartbeat_checker_thread(self):
         """Start the heartbeat checker thread for Decode worker."""
 
@@ -1092,7 +1174,7 @@ class CommonKVSender(BaseKVSender):
 
         if (
             self.kv_mgr.enable_all_cp_ranks_for_transfer
-            and not self.kv_mgr.server_args.enable_dsa_cache_layer_split
+            and not self.kv_mgr.kv_args.cp_cache_layer_split
         ):
             kv_indices, index_slice = filter_kv_indices_for_cp_rank(
                 self.kv_mgr,
@@ -1447,7 +1529,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.page_size = None
         self.kv_cache_dtype: Optional[str] = None
         self.follow_bootstrap_room: Optional[bool] = None
-        self.enable_dsa_cache_layer_split: Optional[bool] = None
+        self.cp_cache_layer_split: bool = False
         self.prefill_http_port: Optional[int] = None
         self.prefill_port_table: Dict[
             int, Dict[int, Dict[int, Dict[int, PrefillRankInfo]]]
@@ -1516,6 +1598,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         page_size = int(data["page_size"])
         kv_cache_dtype = data["kv_cache_dtype"]
         prefill_http_port = data.get("prefill_http_port")
+        cp_cache_layer_split = bool(data.get("cp_cache_layer_split", False))
 
         if self.attn_tp_size is None:
             self.attn_tp_size = attn_tp_size
@@ -1544,10 +1627,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             )
             self.follow_bootstrap_room = load_balance_method == "follow_bootstrap_room"
 
-        if self.enable_dsa_cache_layer_split is None:
-            self.enable_dsa_cache_layer_split = bool(
-                data.get("enable_dsa_cache_layer_split", False)
-            )
+        self.cp_cache_layer_split = self.cp_cache_layer_split or cp_cache_layer_split
 
         if system_dp_size == 1:
             dp_group = attn_dp_rank
@@ -1612,7 +1692,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                     if self.follow_bootstrap_room is not None
                     else True
                 ),
-                enable_dsa_cache_layer_split=bool(self.enable_dsa_cache_layer_split),
+                cp_cache_layer_split=bool(self.cp_cache_layer_split),
                 prefill_http_port=self.prefill_http_port,
             )
             return web.json_response(dataclasses.asdict(info), status=200)

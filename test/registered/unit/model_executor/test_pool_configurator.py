@@ -13,6 +13,7 @@ from unittest.mock import MagicMock, patch
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -132,7 +133,7 @@ def _make_model_runner(
     sa.disaggregation_mode = disaggregation_mode
     sa.max_running_requests = max_running_requests
     sa.disaggregation_decode_extra_slots = disaggregation_decode_extra_slots
-    sa.enable_dsa_cache_layer_split = False
+    sa.enable_cp_cache_layer_split = False
     sa.kv_cache_dtype = "auto"
     mr.server_args = sa
 
@@ -614,6 +615,44 @@ class TestFactory(unittest.TestCase):
 
         self.assertIsInstance(_cfg(2), SWAChunkCapPoolConfigurator)
         self.assertNotIsInstance(_cfg(None), SWAChunkCapPoolConfigurator)
+
+
+class TestDSV4PoolConfigurator(CustomTestCase):
+    def test_layer_split_budget_reserves_one_staging_buffer_per_family(self):
+        from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
+
+        configurator = object.__new__(DSV4PoolConfigurator)
+        configurator.qk_nope_head_dim = 448
+        configurator.qk_rope_head_dim = 64
+        configurator.indexer_head_dim = 128
+        configurator.c4_ring_size = 8
+        configurator.swa_page_size = 128
+        configurator.swa_ratio = 0.25
+        configurator.c4_shrink_factor = 1
+        configurator.num_layers_total = 15
+        configurator.num_layers_ca4 = 4
+        configurator.num_layers_ca128 = 4
+        configurator.num_layers_ca4_indexer = 4
+        configurator.num_layers_ca4_state = 4
+        configurator.num_layers_ca128_state = 4
+        configurator.num_layers_ca4_indexer_state = 4
+
+        configurator.use_cp_cache_layer_split = False
+        regular_bytes = configurator._get_bytes_per_full_token()
+        configurator.use_cp_cache_layer_split = True
+        layer_split_bytes = configurator._get_bytes_per_full_token()
+
+        kv_bytes = 448 + 64 * 2 + 8
+        indexer_bytes = 128 + 128 // 128 * 4
+        expected_staging_bytes = (
+            0.25 * kv_bytes
+            + 1 / 4 * kv_bytes
+            + 1 / 128 * kv_bytes
+            + 1 / 4 * indexer_bytes
+        )
+        self.assertAlmostEqual(
+            layer_split_bytes - regular_bytes, expected_staging_bytes
+        )
 
 
 if __name__ == "__main__":
