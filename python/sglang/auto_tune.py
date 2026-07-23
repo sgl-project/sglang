@@ -239,22 +239,12 @@ def _load_runtime_config_loader():
 
 
 def _install_runtime_server_args(plan: AutoTunePlan):
-    server_args_module = importlib.import_module("sglang.srt.server_args")
-    previous_server_args = getattr(server_args_module, "_global_server_args", None)
-
-    try:
-        server_args_module.get_global_server_args()
-    except ValueError as exc:
-        if "Global server args is not set" not in str(exc):
-            raise
-        server_args_module.set_global_server_args_for_scheduler(
-            server_args_module.ServerArgs(model_path=plan.model_path)
-        )
-
-    def restore() -> None:
-        server_args_module._global_server_args = previous_server_args
-
-    return restore
+    runtime_context = importlib.import_module("sglang.srt.runtime_context")
+    override = runtime_context.get_context().override_server_args(
+        model_path=plan.model_path
+    )
+    override.install()
+    return override.restore
 
 
 def _dtype_flags(dtype: str) -> dict[str, bool]:

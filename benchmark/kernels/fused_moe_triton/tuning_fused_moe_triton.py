@@ -13,7 +13,7 @@ import ray
 import torch
 import triton
 
-try:
+if __package__:
     from .common_utils import (
         BenchmarkConfig,
         get_config_filename,
@@ -23,7 +23,7 @@ try:
         save_configs,
         sort_config,
     )
-except ImportError:
+else:
     from common_utils import (
         BenchmarkConfig,
         get_config_filename,
@@ -273,9 +273,7 @@ def benchmark_config(
 
 @ray.remote(num_gpus=1)
 class BenchmarkWorker:
-    def __init__(
-        self, seed: int, server_args: ServerArgs, architecture: str
-    ) -> None:
+    def __init__(self, seed: int, server_args: ServerArgs, architecture: str) -> None:
         torch.set_default_device(get_device())
         torch.get_device_module().manual_seed_all(0)
         self.seed = seed

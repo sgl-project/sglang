@@ -30,6 +30,7 @@ def load_auto_tune_module():
 
 auto_tune = load_auto_tune_module()
 RuntimeInfo = auto_tune.RuntimeInfo
+install_runtime_server_args = auto_tune._install_runtime_server_args
 main = auto_tune.main
 parse_args = auto_tune.parse_args
 resolve_output_path = auto_tune.resolve_output_path
@@ -310,6 +311,39 @@ class TestAutoTune(unittest.TestCase):
         self.assertEqual(captured["args"][:3], (8, 1024, "fp8_w8a8"))
         self.assertEqual(captured["kwargs"]["per_channel_quant"], False)
         self.assertGreaterEqual(captured["cache_clears"], 2)
+
+    def test_runtime_loader_validation_uses_scoped_server_args(self):
+        captured = {}
+
+        class FakeOverride:
+            def install(self):
+                captured["installed"] = True
+
+            def restore(self):
+                captured["restored"] = True
+
+        class FakeContext:
+            def override_server_args(self, **kwargs):
+                captured["override_kwargs"] = kwargs
+                return FakeOverride()
+
+        class FakeRuntimeContext:
+            @staticmethod
+            def get_context():
+                return FakeContext()
+
+        plan = type("Plan", (), {"model_path": "fake/model"})()
+        with patch.object(
+            auto_tune.importlib,
+            "import_module",
+            return_value=FakeRuntimeContext,
+        ):
+            restore = install_runtime_server_args(plan)
+
+        self.assertTrue(captured["installed"])
+        self.assertEqual(captured["override_kwargs"], {"model_path": "fake/model"})
+        restore()
+        self.assertTrue(captured["restored"])
 
     def test_missing_ray_dependency_has_actionable_error(self):
         missing_ray = ModuleNotFoundError("No module named 'ray'", name="ray")
