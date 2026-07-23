@@ -111,6 +111,23 @@ class MiniLoadBalancer:
             self.decode_urls[didx],
         )
 
+    def apply_role_switch(self, worker_url, new_role, bootstrap_port=None):
+        """Move a server between the prefill and decode routing lists after its
+        role has been switched on the backend (see the /pd_role_switch endpoint).
+        Idempotent: the server is removed from both lists first, then re-added
+        to the target one."""
+        if worker_url in self.decode_urls:
+            self.decode_urls.remove(worker_url)
+        if worker_url in self.prefill_urls:
+            idx = self.prefill_urls.index(worker_url)
+            self.prefill_urls.pop(idx)
+            self.prefill_bootstrap_ports.pop(idx)
+        if new_role == "prefill":
+            self.prefill_urls.append(worker_url)
+            self.prefill_bootstrap_ports.append(bootstrap_port or 8998)
+        else:
+            self.decode_urls.append(worker_url)
+
     async def generate(
         self, modified_request, prefill_server, decode_server, endpoint
     ) -> ORJSONResponse:
@@ -255,6 +272,32 @@ async def health_generate():
         for i, response in enumerate(asyncio.as_completed(tasks)):
             await response
     return Response(status_code=200)
+
+
+@app.post("/pd_role_switch")
+async def pd_role_switch(request_data: dict):
+    """Switch a running server's PD role (prefill<->decode) at runtime and
+    update the LB's routing lists. Body: {"worker_url", "new_role":
+    "prefill"|"decode", "bootstrap_port"?, "decode_cuda_graph_bs"?}."""
+    worker_url = request_data.get("worker_url")
+    new_role = request_data.get("new_role")
+    if worker_url is None:
+        raise HTTPException(status_code=400, detail="worker_url is required")
+    if new_role not in ("prefill", "decode"):
+        raise HTTPException(status_code=400, detail=f"invalid new_role={new_role!r}")
+
+    body = {"new_role": new_role}
+    if request_data.get("decode_cuda_graph_bs") is not None:
+        body["decode_cuda_graph_bs"] = request_data["decode_cuda_graph_bs"]
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(f"{worker_url}/pd_role_switch", json=body) as resp:
+            result = await resp.json()
+    if resp.status != 200 or not result.get("success", False):
+        return ORJSONResponse(content=result, status_code=resp.status)
+
+    lb.apply_role_switch(worker_url, new_role, request_data.get("bootstrap_port"))
+    return ORJSONResponse(content=result, status_code=200)
 
 
 @app.post("/flush_cache")
