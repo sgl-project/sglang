@@ -48,10 +48,12 @@ from sglang.srt.layers.cp.base import (
     CPAttentionBackendKind,
 )
 from sglang.srt.layers.cp.padding import pad_local_rows
-from sglang.srt.layers.dp_attention import is_allocation_symmetric
+from sglang.srt.layers.dp_attention import (
+    is_allocation_symmetric,
+)
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
-from sglang.srt.runtime_context import get_device, get_parallel
+from sglang.srt.runtime_context import get_parallel
 
 
 @dataclass
@@ -206,8 +208,10 @@ class ZigzagCPStrategy(ContextParallelStrategy):
             actual_seq_q_prev_list.append(block_sizes[cp_rank])
             actual_seq_q_next_list.append(block_sizes[cp_segment_num - cp_rank - 1])
 
+        from sglang.srt.runtime_context import get_server_args
+
         try:
-            device = torch.device(get_device().device)
+            device = torch.device(get_server_args().device)
         except Exception:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         cu_prev = [0] + list(accumulate(actual_seq_q_prev_list))

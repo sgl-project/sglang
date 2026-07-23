@@ -16,8 +16,6 @@ import torch.distributed._symmetric_memory as symm_mem
 import triton
 import triton.language as tl
 
-from sglang.srt.runtime_context import get_parallel
-
 logger = logging.getLogger(__name__)
 
 # Each thread moves _NUMEL_PER_THREAD bf16 via one 128-bit multimem op; the
@@ -468,6 +466,7 @@ class MultimemAllGatherer:
             # Lazy import avoids a module-load dependency on the distributed facade.
             from sglang.srt.distributed import get_tp_group
             from sglang.srt.distributed.parallel_state import in_the_same_node_as
+            from sglang.srt.runtime_context import get_server_args
 
             tp_group = get_tp_group()
             # Only probe node topology when the deployment can actually span
@@ -478,7 +477,7 @@ class MultimemAllGatherer:
             # EP/mooncake setups, and keep multimem enabled.
             if (
                 tp_group.world_size > 1
-                and get_parallel().nnodes > 1
+                and get_server_args().nnodes > 1
                 and not all(in_the_same_node_as(tp_group.cpu_group, source_rank=0))
             ):
                 logger.warning(
