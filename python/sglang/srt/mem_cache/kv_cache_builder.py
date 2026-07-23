@@ -23,7 +23,14 @@ class KVCacheBuildResult:
 
 from typing import TYPE_CHECKING
 
-from sglang.srt.configs.model_config import ModelImpl
+from sglang.srt.configs.hybrid_arch import (
+    hybrid_gdn_config,
+    hybrid_lightning_config,
+    kimi_linear_config,
+    linear_attn_model_spec,
+    mamba2_config,
+)
+from sglang.srt.configs.model_config import ModelImpl, is_deepseek_dsa
 from sglang.srt.environ import envs
 from sglang.srt.managers.mm_utils import init_mm_embedding_cache
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -146,15 +153,16 @@ def build_kv_cache(
 
     # Hybrid memory pool
     is_hybrid_swa = tp_worker.is_hybrid_swa
-    _spec = tp_worker.model_runner.linear_attn_model_spec
+    _spec = linear_attn_model_spec(tp_worker.model_runner.model_config)
     _registry_needs_mamba = _spec.uses_mamba_radix_cache if _spec is not None else False
     is_hybrid_ssm = (
-        tp_worker.model_runner.hybrid_gdn_config is not None
-        or tp_worker.model_runner.mamba2_config is not None
+        hybrid_gdn_config(tp_worker.model_runner.model_config) is not None
+        or mamba2_config(tp_worker.model_runner.model_config) is not None
         or _registry_needs_mamba
-        or tp_worker.model_runner.kimi_linear_config is not None
-        or tp_worker.model_runner.hybrid_lightning_config is not None
+        or kimi_linear_config(tp_worker.model_runner.model_config) is not None
+        or hybrid_lightning_config(tp_worker.model_runner.model_config) is not None
     )
+    is_dsa = is_deepseek_dsa(model_config.hf_config)
 
     sliding_window_size = None
     if is_hybrid_swa:
@@ -234,6 +242,7 @@ def build_kv_cache(
             is_hybrid_swa=is_hybrid_swa,
             full_tokens_per_layer=full_tokens_per_layer,
             is_hybrid_ssm=is_hybrid_ssm,
+            is_dsa=is_dsa,
             enable_hierarchical_cache=enable_hierarchical_cache,
             disable_radix_cache=disable_radix_cache,
             effective_chunked_prefill_size=effective_chunked_prefill_size,

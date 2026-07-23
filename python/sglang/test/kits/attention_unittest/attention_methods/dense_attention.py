@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
@@ -286,7 +287,9 @@ class TinyModelConfig:
             num_key_value_heads=num_kv_heads,
             head_dim=head_dim,
         )
+        self.hf_config.get_text_config = lambda: self.hf_config
         self.hf_text_config = self.hf_config
+        self.linear_attn_registry_result = None
 
     def get_num_attention_heads(self, tp_size: int) -> int:
         assert self.num_attention_heads % tp_size == 0
@@ -322,6 +325,7 @@ class MockModelRunner(ModelRunner):
         self.tp_size = 1
         self.dp_size = 1
         self.pp_size = 1
+        self.ps = ParallelState.trivial()
         self.is_draft_worker = False
         self.spec_algorithm = SpeculativeAlgorithm.NONE
         # The runner lifecycle warms up kernels in capture() / first execute()

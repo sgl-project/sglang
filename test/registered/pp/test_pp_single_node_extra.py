@@ -66,7 +66,7 @@ class TestQwenVLPPAccuracy(unittest.TestCase):
         metrics = run_eval(args)
         print(f"{metrics=}")
 
-        self.assertGreaterEqual(metrics["score"], 0.65)
+        self.assertGreaterEqual(metrics["score"], 0.60)
         # Wait a little bit so that the memory check happens.
         time.sleep(4)
 

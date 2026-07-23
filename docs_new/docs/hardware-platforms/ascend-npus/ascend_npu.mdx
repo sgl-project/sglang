@@ -31,7 +31,7 @@ You can install SGLang using any of the methods below. Please go through `System
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><a href="#obtain-cann-image">Obtain Images</a></td>
     </tr>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Pytorch Adapter</td>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>TorchNPU</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>26.0.0</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://gitcode.com/Ascend/pytorch/releases">link</a></td>
     </tr>
@@ -107,7 +107,7 @@ conda config --set show_channel_urls yes
 conda config --remove channels defaults
 ```
 
-Edit the system-level conda config to remove any hardcoded defaults, e.g. vi ~/miniconda3/.condarc
+Edit the system-level conda config to remove any hardcoded defaults, e.g., vi ~/miniconda3/.condarc
 Then remove the failed environment and recreate it:
 
 ```bash Command
@@ -140,7 +140,7 @@ installed in addition to MemFabric-Hybrid.
 pip install memfabric-zbal==1.1.1
 ```
 
-#### Pytorch and Pytorch Framework Adaptor on Ascend
+#### PyTorch and PyTorch Framework Adaptor on Ascend
 
 ```bash Command
 PYTORCH_VERSION=2.10.0
@@ -242,7 +242,7 @@ git clone https://github.com/sgl-project/sglang.git
 cd sglang/docker
 
 # Build the docker image
-# Replace <arch_tag> with the target architecture, e.g. amd64, arm64.
+# Replace <arch_tag> with the target architecture, e.g., amd64, arm64.
 # Optional build arguments:
 #   --build-arg DEVICE_TYPE=910b          # Required for Atlas 800I A2
 #   --build-arg APTMIRROR=<mirror_url>    # Use a custom APT mirror to improve download speed
