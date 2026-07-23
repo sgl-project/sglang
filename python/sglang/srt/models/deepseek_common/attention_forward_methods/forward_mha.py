@@ -12,7 +12,6 @@ from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.dcp import (
     all_gather_kv_cache_for_mha_chunk_extend,
     all_gather_kv_cache_for_mha_extend,
-
     filter_dcp_local_kv_indices,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
