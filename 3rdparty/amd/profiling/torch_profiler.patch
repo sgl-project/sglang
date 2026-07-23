@@ -1,0 +1,25 @@
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index 62d1ff9..6ecd78c 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -240,7 +240,6 @@ class Scheduler:
+             )
+             self.profiler = torch.profiler.profile(
+                 activities=[
+-                    torch.profiler.ProfilerActivity.CPU,
+                     torch.profiler.ProfilerActivity.CUDA,
+                 ],
+                 with_stack=True,
+@@ -1033,9 +1032,11 @@ class Scheduler:
+         if self.profiler is None:
+             raise RuntimeError("Profiler is not enabled.")
+         self.profiler.stop()
+-        self.profiler.export_chrome_trace(
+-            self.torch_profiler_trace_dir + "/" + str(time.time()) + ".trace.json.gz"
+-        )
++        if self.tp_rank == 0:
++            with open(f"stats_repro_{int(time.time())}.txt", "w") as f:
++                print(self.profiler.key_averages(group_by_input_shape=True).table(sort_by="cuda_time_total", row_limit=-1), file=f)
++                print("Profiling stats done.")
++
+         logger.info("Profiler is done")

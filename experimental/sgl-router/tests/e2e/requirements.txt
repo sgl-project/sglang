@@ -1,0 +1,15 @@
+httpx==0.27.2
+pytest==8.3.3
+pytest-asyncio==0.24.0
+# huggingface_hub is intentionally NOT pinned here. SGLang's
+# `scripts/ci/cuda/ci_install_dependency.sh` already installs a
+# version compatible with the rest of its transitive deps
+# (transformers / diffusers / kernels, which require
+# huggingface_hub >= 1.5 / >= 0.34 / >= 1.3 respectively). An earlier
+# pin of `huggingface_hub==0.26.2` here got installed AFTER the SGLang
+# deps and downgraded huggingface_hub past `is_offline_mode`'s top-
+# level export, which broke `from sglang.srt.server_args import …`
+# at module import time and turned every quick check into a 5-minute
+# `/health` timeout with no actionable signal.
+# The e2e suite only uses huggingface_hub's `try_to_load_from_cache`,
+# which is available in every release SGLang would install.

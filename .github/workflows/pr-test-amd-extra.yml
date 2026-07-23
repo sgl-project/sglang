@@ -1,0 +1,244 @@
+name: PR Test Extra (AMD)
+# Label-gated AMD extra CI workflow — the AMD mirror of pr-test-extra.yml.
+#
+# Adds AMD runtime to a PR only when the author opts in: the PR must carry
+# BOTH `run-ci` (basic-CI prerequisite) and `run-ci-extra` (explicit opt-in).
+# The label check happens at runtime in pr-gate.yml via a live
+# `gh pr view`-style fetch, so reruns after adding the labels (e.g. via a
+# slash command) pick up the new label set — a workflow-level `if` would read
+# the frozen event payload, which never updates on rerun. The job graph also
+# runs unconditionally on workflow_dispatch / workflow_call so it can be
+# triggered manually or chained from the AMD scheduler.
+#
+# Stage: extra-a. Each job mirrors the container bring-up of pr-test-amd.yml
+# and dispatches `run_suite.py --hw amd --suite extra-a-test-{config}-amd`:
+#   - 1-gpu-small: mock-model / kv_canary unit + single-GPU canary e2e tests
+#   - 1-gpu-large: single-GPU model e2e tests (quant fp8kv-triton,
+#                  sessions streaming-session, spec standalone triton,
+#                  kv_canary self-bench)
+#   - 2-gpu-large: multi-GPU (TP/PP/PD) mock-model + kv_canary e2e tests
+# kv_canary e2e is registered to the same extra-a stage as its CUDA siblings
+# (it now exercises the ROCm canary kernels end-to-end).
+
+on:
+  pull_request:
+    # `labeled` lets the workflow re-fire when `run-ci-extra` (or `run-ci`)
+    # is added after the latest push. See call-gate.if for the matching guard
+    # that prevents unrelated label additions from dispatching a full run.
+    types: [opened, synchronize, reopened, labeled]
+  workflow_dispatch:
+    inputs:
+      runner_arch:
+        description: 'AMD runner pool to dispatch GPU jobs to'
+        required: false
+        type: choice
+        default: mi325
+        options:
+          - mi300
+          - mi325
+      rocm_version:
+        description: 'ROCm container variant (empty = Dockerfile default; rocm720 = ROCm 7.2.0)'
+        required: false
+        type: choice
+        default: ''
+        options:
+          - ''
+          - rocm720
+      aiter_ref:
+        description: 'Override AITER commit (optional, leave empty to use Dockerfile default)'
+        required: false
+        type: string
+        default: ''
+      continue_on_error:
+        description: 'Continue on error (do not fail the workflow on test failures)'
+        required: false
+        type: boolean
+        default: false
+  workflow_call:
+    inputs:
+      ref:
+        description: 'Git ref (branch, tag, or SHA) to test. If not provided, uses the default branch.'
+        required: false
+        type: string
+        default: ''
+      rocm_version:
+        description: 'ROCm container variant (empty = Dockerfile default; rocm720 = ROCm 7.2.0)'
+        required: false
+        type: string
+        default: ''
+      aiter_ref:
+        description: 'Override AITER commit (optional, leave empty to use Dockerfile default)'
+        required: false
+        type: string
+        default: ''
+      continue_on_error:
+        description: 'Continue on error (do not fail the workflow on test failures)'
+        required: false
+        type: boolean
+        default: false
+
+env:
+  AITER_COMMIT_OVERRIDE: ${{ inputs.aiter_ref }}
+  DOCKERHUB_AMD_USERNAME: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
+  DOCKERHUB_AMD_TOKEN: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
+
+concurrency:
+  # Mirror pr-test-amd.yml: schedule/dispatch runs key on run_id (unique group,
+  # never cancel each other); PR runs share a per-branch group so pushes cancel
+  # stale runs. (In a reusable workflow github.event_name is the originating
+  # event, never workflow_call, so the guard keys off the real events.)
+  group: pr-test-amd-extra-${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && format('full-{0}', github.run_id) || github.head_ref || github.ref_name || inputs.ref || 'default' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  actions: write
+  contents: read
+  issues: read
+  pull-requests: read
+
+jobs:
+  # =============================================== PR Gate ====================================================
+  # Runtime live-fetch label gate (mirrors pr-test-extra.yml's call-gate):
+  # requires both `run-ci` and `run-ci-extra`. A failure here cascades to
+  # every test job via `needs`, so a PR without the labels ends in one red
+  # ~30s gate job plus a row of skipped jobs instead of consuming AMD runners.
+  #
+  # The job-level `if` only filters the `labeled` event type so that adding an
+  # unrelated label doesn't dispatch a full run; the actual label-presence
+  # gate is enforced at runtime inside pr-gate.yml.
+  call-gate:
+    if: |
+      github.event_name != 'pull_request' ||
+      github.event.action != 'labeled' ||
+      github.event.label.name == 'run-ci' ||
+      github.event.label.name == 'run-ci-extra'
+    uses: ./.github/workflows/pr-gate.yml
+    with:
+      require-run-ci: true
+      require-run-ci-extra: true
+    secrets: inherit
+
+  # =============================================== extra-a (1-gpu-small) ===============================================
+  # Single unpartitioned job: the 21 onboarded unit tests total ~233s, so the
+  # expensive per-job setup (container bring-up + sgl-kernel ROCm build + dep
+  # install, several minutes) dominates. Partitioning would multiply that
+  # setup across scarce AMD GPUs to shave only a couple minutes of test time,
+  # so one GPU running the whole suite sequentially is the better trade.
+  extra-a-test-1-gpu-small-amd:
+    name: ${{ format('extra-a-test-1-gpu-small-amd{0} (linux-{1}-1gpu-sglang)', inputs.rocm_version && format('-{0}', inputs.rocm_version) || '', inputs.runner_arch || 'mi325') }}
+    needs: [call-gate]
+    if: ${{ !cancelled() && needs.call-gate.result == 'success' }}
+    runs-on: ${{ format('linux-{0}-1gpu-sglang', inputs.runner_arch || 'mi325') }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
+
+      - name: Start CI container
+        # `rocm_version` (e.g. rocm720) selects an alternate ROCm container; empty uses the Dockerfile default.
+        run: bash scripts/ci/amd/amd_ci_start_container.sh ${{ inputs.rocm_version && format('--rocm-version {0}', inputs.rocm_version) || '' }}
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
+
+      - name: Run test
+        timeout-minutes: 45
+        run: |
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite extra-a-test-1-gpu-small-amd --timeout-per-file 1800 ${{ inputs.continue_on_error == true && '--continue-on-error' || '' }}
+
+  # =============================================== extra-a (1-gpu-large) ===============================================
+  # Single-GPU lora / spec / quant model e2e tests. Runs on the same 1-gpu
+  # pool as small (AMD GPUs carry enough VRAM that "large" here is a CUDA
+  # memory-tier label, not a separate AMD runner pool).
+  extra-a-test-1-gpu-large-amd:
+    name: ${{ format('extra-a-test-1-gpu-large-amd{0} (linux-{1}-1gpu-sglang)', inputs.rocm_version && format('-{0}', inputs.rocm_version) || '', inputs.runner_arch || 'mi325') }}
+    needs: [call-gate]
+    if: ${{ !cancelled() && needs.call-gate.result == 'success' }}
+    runs-on: ${{ format('linux-{0}-1gpu-sglang', inputs.runner_arch || 'mi325') }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
+
+      - name: Start CI container
+        run: bash scripts/ci/amd/amd_ci_start_container.sh ${{ inputs.rocm_version && format('--rocm-version {0}', inputs.rocm_version) || '' }}
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
+
+      - name: Run test
+        timeout-minutes: 60
+        run: |
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite extra-a-test-1-gpu-large-amd --timeout-per-file 1800 ${{ inputs.continue_on_error == true && '--continue-on-error' || '' }}
+
+  # =============================================== extra-a (2-gpu-large) ===============================================
+  # Multi-GPU TP / PP / PD mock-model + kv_canary e2e tests. Mirrors CUDA's
+  # extra-a 2-gpu-large stage; runs on the 2-GPU AMD pool.
+  extra-a-test-2-gpu-large-amd:
+    name: ${{ format('extra-a-test-2-gpu-large-amd{0} (linux-{1}-2gpu-sglang)', inputs.rocm_version && format('-{0}', inputs.rocm_version) || '', inputs.runner_arch || 'mi325') }}
+    needs: [call-gate]
+    if: ${{ !cancelled() && needs.call-gate.result == 'success' }}
+    runs-on: ${{ format('linux-{0}-2gpu-sglang', inputs.runner_arch || 'mi325') }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
+
+      - name: Start CI container
+        run: bash scripts/ci/amd/amd_ci_start_container.sh ${{ inputs.rocm_version && format('--rocm-version {0}', inputs.rocm_version) || '' }}
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
+
+      - name: Run test
+        timeout-minutes: 60
+        run: |
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite extra-a-test-2-gpu-large-amd --timeout-per-file 1800 ${{ inputs.continue_on_error == true && '--continue-on-error' || '' }}
+
+  # =============================================== aggregator ====================================================
+  # Single fan-in job so branch protection / notifications depend on one job
+  # rather than every matrix leg. Fails if any dependent failed or was
+  # cancelled; `skipped` (e.g. PR without the opt-in labels) is not a failure.
+  pr-test-amd-extra-finish:
+    needs:
+      [
+        call-gate,
+        extra-a-test-1-gpu-small-amd,
+        extra-a-test-1-gpu-large-amd,
+        extra-a-test-2-gpu-large-amd,
+      ]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check all dependent job statuses
+        run: |
+          json_needs='${{ toJson(needs) }}'
+          job_names=$(echo "$json_needs" | jq -r 'keys_unsorted[]')
+          for job in $job_names; do
+            result=$(echo "$json_needs" | jq -r --arg j "$job" '.[$j].result')
+            echo "$job: $result"
+            if [[ "$result" == "failure" || "$result" == "cancelled" ]]; then
+              echo "The above jobs failed."
+              exit 1
+            fi
+          done
+          echo "All jobs completed successfully"
+          exit 0
