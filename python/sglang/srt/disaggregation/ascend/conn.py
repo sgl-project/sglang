@@ -5,6 +5,7 @@ from typing import List, Tuple
 import numpy as np
 import numpy.typing as npt
 
+from sglang.srt.distributed import get_pp_group
 from sglang.srt.disaggregation.ascend.transfer_engine import AscendTransferEngine
 from sglang.srt.disaggregation.common.utils import group_concurrent_contiguous
 from sglang.srt.disaggregation.mooncake.conn import (
@@ -46,30 +47,38 @@ class AscendKVManager(MooncakeKVManager):
     ) -> Tuple[List[int], List[int], int]:
         # src_kv_ptrs: k_data, v_data, index_k_data(optional)
         # dst_kv_ptrs: k_data, v_data, index_k_data(optional)
-        start_layer = self.kv_args.prefill_start_layer
         kv_buf_groups = getattr(self.kv_args, "kv_buf_groups", 1)
-        total_kv_layers = getattr(self.kv_args, "total_kv_layers", 0)
+        hidden_kv_layers = getattr(self.kv_args, "hidden_kv_layers", 0)
+        draft_kv_layers = getattr(self.kv_args, "draft_kv_layers", 0)
         src_layers = len(src_kv_ptrs) // kv_buf_groups
-        # When only speculative-algorithm is enabled for decode
-        # the KV has one more layer than prefill.
-        # The draft layer needs to be skipped.
-        dst_total_layers = (
-            min(len(dst_kv_ptrs) // kv_buf_groups, total_kv_layers)
-            if total_kv_layers
-            else len(dst_kv_ptrs) // kv_buf_groups
-        )
-        end_layer = start_layer + src_layers
-        if src_layers == dst_total_layers:
+        dst_layers = len(dst_kv_ptrs) // kv_buf_groups
+        if src_layers == dst_layers:
             sliced_dst_kv_ptrs = dst_kv_ptrs
         else:
             sliced_dst_kv_ptrs = []
+            start_layer = self.kv_args.prefill_start_layer
+            transfer_draft_kv = get_pp_group().is_last_rank and draft_kv_layers
+            if transfer_draft_kv:
+                end_layer = start_layer + src_layers - draft_kv_layers
+            else:
+                end_layer = start_layer + src_layers
+
+            # target kv
             for i in range(kv_buf_groups):
-                layer_offset = i * dst_total_layers
+                layer_offset = i * hidden_kv_layers
                 sliced_dst_kv_ptrs.extend(
                     dst_kv_ptrs[layer_offset + start_layer : layer_offset + end_layer]
                 )
+            # draft kv
+            if transfer_draft_kv:
+                for i in range(kv_buf_groups):
+                    layer_offset = i * draft_kv_layers + kv_buf_groups*hidden_kv_layers
+                    sliced_dst_kv_ptrs.extend(
+                        dst_kv_ptrs[layer_offset: layer_offset + draft_kv_layers]
+                    )
         layers_current_pp_stage = len(src_kv_ptrs)
         return src_kv_ptrs, sliced_dst_kv_ptrs, layers_current_pp_stage
+            
 
     def send_kvcache(
         self,

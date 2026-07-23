@@ -37,7 +37,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     check_cuda_graph_backend,
 )
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.runner import (
     DecodeCudaGraphRunner,
@@ -305,45 +305,46 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.hot_token_id = None
 
     def init_lm_head(self):
-        embed, head = self.target_worker.model_runner.model.get_embed_and_head()
-        target_lm_head = getattr(self.target_worker.model_runner.model, "lm_head", None)
+        if self.draft_worker.pp_group.is_last_rank:
+            embed, head = self.target_worker.model_runner.model.get_embed_and_head()
+            target_lm_head = getattr(self.target_worker.model_runner.model, "lm_head", None)
 
-        def maybe_share_target_lm_head():
-            if (
-                target_lm_head is not None
-                and self.hot_token_id is None
-                and getattr(self.draft_runner.model, "hot_token_id", None) is None
-                and hasattr(self.draft_runner.model, "set_lm_head_from_target")
-            ):
-                self.draft_runner.model.set_lm_head_from_target(target_lm_head)
+            def maybe_share_target_lm_head():
+                if (
+                    target_lm_head is not None
+                    and self.hot_token_id is None
+                    and getattr(self.draft_runner.model, "hot_token_id", None) is None
+                    and hasattr(self.draft_runner.model, "set_lm_head_from_target")
+                ):
+                    self.draft_runner.model.set_lm_head_from_target(target_lm_head)
 
-        if self.speculative_algorithm.is_eagle3():
-            # most cases EAGLE3 models don't share lm_head
-            # but some models (e.g. nvidia/gpt-oss-120b-Eagle3) shares
-            if (
-                hasattr(self.draft_runner.model, "load_lm_head_from_target")
-                and self.draft_runner.model.load_lm_head_from_target
-            ):
+            if self.speculative_algorithm.is_eagle3():
+                # most cases EAGLE3 models don't share lm_head
+                # but some models (e.g. nvidia/gpt-oss-120b-Eagle3) shares
+                if (
+                    hasattr(self.draft_runner.model, "load_lm_head_from_target")
+                    and self.draft_runner.model.load_lm_head_from_target
+                ):
+                    self.draft_runner.model.set_embed_and_head(embed, head)
+                    maybe_share_target_lm_head()
+                else:
+                    self.draft_runner.model.set_embed(embed)
+
+                # grab hot token ids
+                if self.draft_runner.model.hot_token_id is not None:
+                    self.hot_token_id = self.draft_runner.model.hot_token_id.to(
+                        embed.device
+                    )
+
+            else:
+                if self.hot_token_id is not None:
+                    head = head.clone()
+                    self.hot_token_id = self.hot_token_id.to(head.device)
+                    head.data = head.data[self.hot_token_id]
+
+                # Share the embedding and lm_head
                 self.draft_runner.model.set_embed_and_head(embed, head)
                 maybe_share_target_lm_head()
-            else:
-                self.draft_runner.model.set_embed(embed)
-
-            # grab hot token ids
-            if self.draft_runner.model.hot_token_id is not None:
-                self.hot_token_id = self.draft_runner.model.hot_token_id.to(
-                    embed.device
-                )
-
-        else:
-            if self.hot_token_id is not None:
-                head = head.clone()
-                self.hot_token_id = self.hot_token_id.to(head.device)
-                head.data = head.data[self.hot_token_id]
-
-            # Share the embedding and lm_head
-            self.draft_runner.model.set_embed_and_head(embed, head)
-            maybe_share_target_lm_head()
 
     def init_attention_backend(self):
         # Create multi-step attn backends and cuda graph runners
@@ -1119,43 +1120,48 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     ),
                 )
 
-    def forward_batch_generation(self, batch: ScheduleBatch, on_publish=None):
+    def forward_batch_generation(
+        self, batch: ScheduleBatch, on_publish=None, pp_proxy_tensors: Optional[PPProxyTensors] = None
+    ):
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
-            # Target prefill
-            target_capture_mode = (
-                CaptureHiddenMode.NULL
-                if self.speculative_algorithm.is_standalone()
-                else CaptureHiddenMode.FULL
-            )
-            batch_output = self.target_worker.forward_batch_generation(
-                batch, capture_hidden_mode=target_capture_mode
-            )
-
-            # Spec_v2 convention: batch.seq_lens = length BEFORE this iter's tokens.
-            # Extend processed L prompt tokens; next verify iter expects same L.
-            batch_output.new_seq_lens = batch.seq_lens
-            # Publish before draft_extend so the fence is at target-end.
-            if on_publish is not None:
-                on_publish(batch_output.new_seq_lens)
-
-            # Draft prefill
-            with (
-                self.draft_worker.draft_tp_context(
-                    self.draft_worker.draft_runner.tp_group
-                ),
-                speculative_moe_backend_context(),
-                speculative_moe_a2a_backend_context(),
-                spec_stage_span("draft_extend"),
-            ):
-                batch_output.next_draft_input = (
-                    self.draft_worker._draft_extend_for_prefill(
-                        batch,
-                        batch_output.logits_output.hidden_states,
-                        batch_output.next_token_ids,
-                        batch_output.logits_output.mm_input_embeds,
-                    )
+            if self.draft_worker.draft_worker.pp_group.is_last_rank:
+                # Target prefill
+                target_capture_mode = (
+                    CaptureHiddenMode.NULL
+                    if self.speculative_algorithm.is_standalone()
+                    else CaptureHiddenMode.FULL
                 )
-                return batch_output
+                batch_output = self.target_worker.forward_batch_generation(
+                    batch, capture_hidden_mode=target_capture_mode, pp_proxy_tensors=pp_proxy_tensors
+                )
+
+                # Spec_v2 convention: batch.seq_lens = length BEFORE this iter's tokens.
+                # Extend processed L prompt tokens; next verify iter expects same L.
+                batch_output.new_seq_lens = batch.seq_lens
+                # Publish before draft_extend so the fence is at target-end.
+                if on_publish is not None:
+                    on_publish(batch_output.new_seq_lens)
+
+                # Draft prefill
+                with (
+                    self.draft_worker.draft_tp_context(
+                        self.draft_worker.draft_runner.tp_group
+                    ),
+                    speculative_moe_backend_context(),
+                    speculative_moe_a2a_backend_context(),
+                    spec_stage_span("draft_extend"),
+                ):
+                    batch_output.next_draft_input = (
+                        self.draft_worker._draft_extend_for_prefill(
+                            batch,
+                            batch_output.logits_output.hidden_states,
+                            batch_output.next_token_ids,
+                            batch_output.logits_output.mm_input_embeds,
+                        )
+                    )
+                    return batch_output
+            else:
+                return self.target_worker.forward_batch_generation(batch, pp_proxy_tensors=pp_proxy_tensors)
         else:
             self.activate_step_by_batch(batch.seq_lens.shape[0])
 

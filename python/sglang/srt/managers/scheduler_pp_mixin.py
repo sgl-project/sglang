@@ -1011,6 +1011,23 @@ class SchedulerPPMixin:
                 **tensor_dict,
                 **logprob_dict,
             }
+        
+        if (
+            not batch.spec_algorithm.is_none()
+            and result.next_draft_input is not None
+        ):
+            draft_input = result.next_draft_input
+            if draft_input.topk_p is not None:
+                tensor_dict["draft_topk_p"] = draft_input.topk_p
+            if draft_input.topk_index is not None:
+                tensor_dict["draft_topk_index"] = draft_input.topk_index
+            if draft_input.hidden_states is not None:
+                tensor_dict["draft_hidden_states"] = draft_input.hidden_states
+            if draft_input.dsa_topk_indices is not None:
+                tensor_dict["draft_dsa_topk_indices"] = (
+                    draft_input.dsa_topk_indices
+                )
+
         return tensor_dict
 
     def _pp_send_dict_to_next_stage(
@@ -1124,6 +1141,7 @@ class SchedulerPPMixin:
         pp_outputs: PPProxyTensors,
     ):
         from sglang.srt.managers.scheduler import GenerationBatchResult
+        from sglang.srt.speculative.eagle_info import EagleDraftInput
 
         logits_output = None
         extend_input_len_per_req = None
@@ -1143,6 +1161,22 @@ class SchedulerPPMixin:
             batch.req_pool_indices, RelayPayload(bonus_tokens=next_token_ids)
         )
         batch.input_ids = None
+
+        next_draft_input = None
+        if (
+            not batch.spec_algorithm.is_none()
+            and pp_outputs.tensors.get("draft_topk_p") is not None
+        ):
+            next_draft_input = EagleDraftInput(
+                topk_p=pp_outputs.tensors.get("draft_topk_p"),
+                topk_index=pp_outputs.tensors.get("draft_topk_index"),
+                hidden_states=pp_outputs.tensors.get("draft_hidden_states"),
+                dsa_topk_indices=pp_outputs.tensors.get(
+                    "draft_dsa_topk_indices"
+                ),
+            )
+            batch.spec_info = next_draft_input
+
         output_result = GenerationBatchResult(
             logits_output=logits_output,
             pp_hidden_states_proxy_tensors=None,
@@ -1150,6 +1184,7 @@ class SchedulerPPMixin:
             extend_input_len_per_req=extend_input_len_per_req,
             extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
             can_run_cuda_graph=mb_metadata.can_run_cuda_graph,
+            next_draft_input=next_draft_input,
         )
         return output_result
 
