@@ -36,7 +36,7 @@ def test_npu_backend_selection_priority(
 ):
     monkeypatch.setattr(
         vision,
-        "get_mm",
+        "get_server_args",
         lambda: SimpleNamespace(mm_attention_backend=server_backend),
     )
 
