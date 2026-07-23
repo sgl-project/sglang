@@ -342,7 +342,6 @@ class KimiK3MoE(nn.Module):
         super().__init__()
         hidden_size = config.hidden_size
         moe_intermediate_size = config.moe_intermediate_size
-        num_experts = config.num_experts
         moe_renormalize = config.moe_renormalize
         self.tp_size = get_parallel().tp_size
         self.routed_scaling_factor = config.routed_scaling_factor
