@@ -64,7 +64,14 @@ class UMBPHostTensorAllocator(HostTensorAllocator):
         nbytes = math.prod(int(dim) for dim in dims) * element_size
 
         if self._standalone_process:
-            requested_backing = self._mod.UMBPHostBufferBacking.AnonymousShm
+            # AnonymousShmHugetlb: hugetlbfs-backed AnonymousShm (still
+            # fd-shareable) -- some RDMA NICs need hugepages to register
+            # large regions (small MTT table).
+            requested_backing = (
+                self._mod.UMBPHostBufferBacking.AnonymousShmHugetlb
+                if self._use_hugepage
+                else self._mod.UMBPHostBufferBacking.AnonymousShm
+            )
         else:
             requested_backing = (
                 self._mod.UMBPHostBufferBacking.AnonymousHugetlb
@@ -105,16 +112,25 @@ class UMBPHostTensorAllocator(HostTensorAllocator):
             handle.mapped_size,
             self._numa_node,
         )
-        if (
-            self._use_hugepage
-            and not self._standalone_process
+        demoted_non_standalone = (
+            not self._standalone_process
             and handle.actual_backing == self._mod.UMBPHostBufferBacking.Anonymous
-        ):
+        )
+        demoted_standalone = (
+            self._standalone_process
+            and handle.actual_backing == self._mod.UMBPHostBufferBacking.AnonymousShm
+        )
+        if self._use_hugepage and (demoted_non_standalone or demoted_standalone):
             logger.warning(
-                "UMBPHostTensorAllocator: requested AnonymousHugetlb backing "
-                "but kernel demoted to Anonymous (4 KiB pages). Check "
-                "vm.nr_hugepages and HugePages_Free in /proc/meminfo. "
-                "Performance and AINIC MR-size benefits will not apply."
+                "UMBPHostTensorAllocator: requested %s backing but kernel demoted "
+                "to %s (4 KiB pages). Check vm.nr_hugepages and HugePages_Free in "
+                "/proc/meminfo. Performance and AINIC MR-size benefits will not apply.",
+                (
+                    "AnonymousShmHugetlb"
+                    if self._standalone_process
+                    else "AnonymousHugetlb"
+                ),
+                "AnonymousShm" if self._standalone_process else "Anonymous",
             )
 
         return tensor.view(dims)
