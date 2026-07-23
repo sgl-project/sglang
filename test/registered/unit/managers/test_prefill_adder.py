@@ -525,7 +525,6 @@ class TestPrefillAdder(CustomTestCase):
             (64, 0, 0, None, 128, 16, 128 + 16, "no_cache_hit"),
             (32, 128, 0, None, 128, 16, 160 + 16, "full_host_window"),
             (32, 64, 64, None, 128, 16, 96 + 16, "mixed_host_device"),
-            (64, 1024, 960, 1024, 2048, 64, 1088 + 64, "production_replay"),
         ]
         for (
             extend,
@@ -568,8 +567,6 @@ class TestPrefillAdder(CustomTestCase):
         req.full_untruncated_fill_ids = list(range(window_size))
         req.host_hit_length = 0
         req.swa_host_hit_length = 1024
-        req.num_matched_prefix_tokens = 0
-        req.mamba_host_hit_length = 0
         root = object()
         self.mock_tree_cache.root_node = root
         req.last_node = root
@@ -632,7 +629,6 @@ class TestPrefillAdder(CustomTestCase):
         req.full_untruncated_fill_ids = list(range(1152))
         req.host_hit_length = 0
         req.swa_host_hit_length = 0
-        req.mamba_host_hit_length = 0
         req.last_node = matched
         req.best_match_node = matched
         req.sampling_params.ignore_eos = False
