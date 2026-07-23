@@ -6,7 +6,6 @@ import mmap
 import os
 import uuid
 import weakref
-from typing import Any, List, Optional
 
 import torch
 
