@@ -146,7 +146,12 @@ def update_trtllm_mha_graph_metadata(
     q_stride: int = 0,
     q_mode: int = Q_MODE_NONE,
 ):
-    """Launch the fused metadata update (one kernel for the whole replay init)."""
+    """Launch the fused metadata update (one kernel for the whole replay init).
+
+    Contract: only the live prefix (cdiv(cache_seqlens, page_size) pages) of each
+    page_table / swa_page_table row is (re)written; the tail keeps stale values
+    across replays, so consumers must bound reads by cache_seqlens.
+    """
     if bs == 0:
         return
 

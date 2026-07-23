@@ -575,6 +575,10 @@ def normal_decode_set_metadata(
       5. (optional) swa_page_table for sliding window attention
 
     Achieves ~5.2x speedup on H200 hardware for typical decode workloads.
+
+    Contract: only the live prefix (cdiv(cache_seqlens, page_size) pages) of each
+    page_table / swa_page_table row is (re)written; the tail keeps stale values
+    across CUDA-graph replays, so consumers must bound reads by cache_seqlens.
     """
     assert (
         page_size > 0 and (page_size & (page_size - 1)) == 0

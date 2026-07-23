@@ -130,6 +130,10 @@ def fused_dsa_decode_metadata(
     where the wide table is never read (attention uses topk_indices, the indexer
     uses real_page_table); ``real_page_size`` must be >1 in that case. When a
     tensor is passed, behavior is unchanged (both tables are written).
+
+    Contract: each page-table row is written only over its live prefix
+    ([:cache_seqlens]); the tail keeps stale values across CUDA-graph replays, so
+    consumers must bound reads by cache_seqlens.
     """
     assert seq_lens.is_cuda
     assert req_pool_indices.is_cuda
