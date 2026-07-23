@@ -57,19 +57,34 @@ def metric_block(reference: np.ndarray, candidate: np.ndarray) -> dict:
             "min_frame_ssim": 1.0,
             "changed_value_fraction": 0.0,
         }
-    reference_i = reference.astype(np.int16)
-    candidate_i = candidate.astype(np.int16)
-    abs_error = np.abs(reference_i - candidate_i)
-    error = reference_i.astype(np.float64) - candidate_i.astype(np.float64)
-    rmse = float(np.sqrt(np.mean(np.square(error))))
-    ref_flat = reference.astype(np.float64).reshape(-1)
-    candidate_flat = candidate.astype(np.float64).reshape(-1)
-    denominator = float(np.linalg.norm(ref_flat) * np.linalg.norm(candidate_flat))
-    cosine = (
-        1.0
-        if denominator == 0
-        else float(np.dot(ref_flat, candidate_flat) / denominator)
-    )
+    # Process one frame at a time. A 129-frame 720p uint8 clip is ~325 MiB;
+    # promoting two full clips to float64 would need several GiB just for a
+    # report and can OOM the benchmark after inference has succeeded.
+    value_count = 0
+    changed_count = 0
+    max_abs = 0
+    absolute_sum = 0.0
+    squared_error_sum = 0.0
+    dot_sum = 0.0
+    reference_squared_sum = 0.0
+    candidate_squared_sum = 0.0
+    for ref_frame, candidate_frame in zip(reference, candidate):
+        difference = ref_frame.astype(np.int16) - candidate_frame.astype(np.int16)
+        absolute = np.abs(difference)
+        difference_float = difference.astype(np.float64)
+        ref_float = ref_frame.astype(np.float64)
+        candidate_float = candidate_frame.astype(np.float64)
+        value_count += difference.size
+        changed_count += int(np.count_nonzero(difference))
+        max_abs = max(max_abs, int(absolute.max(initial=0)))
+        absolute_sum += float(absolute.sum(dtype=np.float64))
+        squared_error_sum += float(np.square(difference_float).sum(dtype=np.float64))
+        dot_sum += float(np.multiply(ref_float, candidate_float).sum(dtype=np.float64))
+        reference_squared_sum += float(np.square(ref_float).sum(dtype=np.float64))
+        candidate_squared_sum += float(np.square(candidate_float).sum(dtype=np.float64))
+    rmse = float(math.sqrt(squared_error_sum / value_count)) if value_count else 0.0
+    denominator = math.sqrt(reference_squared_sum * candidate_squared_sum)
+    cosine = 1.0 if denominator == 0 else dot_sum / denominator
     try:
         from skimage.metrics import structural_similarity
 
@@ -91,14 +106,14 @@ def metric_block(reference: np.ndarray, candidate: np.ndarray) -> dict:
         min_frame_ssim = None
     return {
         "bitwise_equal": False,
-        "max_abs": int(abs_error.max(initial=0)),
-        "mean_abs": float(abs_error.mean()),
+        "max_abs": max_abs,
+        "mean_abs": absolute_sum / value_count if value_count else 0.0,
         "rmse": rmse,
         "psnr_db": 999.0 if rmse == 0 else float(20 * math.log10(255.0 / rmse)),
         "cosine_similarity": cosine,
         "ssim": ssim,
         "min_frame_ssim": min_frame_ssim,
-        "changed_value_fraction": float(np.count_nonzero(abs_error) / abs_error.size),
+        "changed_value_fraction": (changed_count / value_count if value_count else 0.0),
     }
 
 

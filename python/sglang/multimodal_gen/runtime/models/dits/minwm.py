@@ -43,6 +43,7 @@ _MINWM_ATTENTION_IMPL = os.environ.get("MINWM_ATTENTION_IMPL", "packed").strip()
 _MINWM_PACKED_ATTENTION_DETERMINISTIC = _env_flag(
     "MINWM_PACKED_ATTENTION_DETERMINISTIC", True
 )
+_MINWM_SEGMENT_COMPILE = _env_flag("MINWM_SEGMENT_COMPILE", True)
 _MINWM_ANNOUNCED_ATTENTION_BACKENDS: set[tuple[str, str]] = set()
 
 
@@ -111,7 +112,7 @@ class _MinWMSegmentCompile:
 
     @classmethod
     def get(cls, function, use_compile: bool):
-        if not use_compile:
+        if not use_compile or not _MINWM_SEGMENT_COMPILE:
             return function
         if function not in cls._compiled:
             kwargs = {}
@@ -612,9 +613,11 @@ class MinWMCausalTransformer3DModel(CausalWanTransformer3DModel):
                 f"{_MINWM_ATTENTION_IMPL!r}"
             )
         logger.info(
-            "MinWM attention profile: impl=%s packed_deterministic=%s",
+            "MinWM execution profile: attention_impl=%s "
+            "packed_deterministic=%s segment_compile=%s",
             _MINWM_ATTENTION_IMPL,
             _MINWM_PACKED_ATTENTION_DETERMINISTIC,
+            _MINWM_SEGMENT_COMPILE,
         )
         deterministic = os.environ.get("MINWM_PARITY_DETERMINISTIC", "0")
         if deterministic.strip().lower() not in {"", "0", "false", "no", "off"}:

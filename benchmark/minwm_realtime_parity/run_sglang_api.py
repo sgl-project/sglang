@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import re
 import time
 from pathlib import Path
 
@@ -38,6 +39,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", default="minwm")
     parser.add_argument("--case", action="append", dest="selected_cases")
     parser.add_argument("--timeout", type=float, default=1800.0)
+    parser.add_argument(
+        "--output-prefix",
+        default="sglang",
+        help="Artifact stem, for example sglang_bitwise or sglang_optimized.",
+    )
+    parser.add_argument(
+        "--engine-name",
+        default="sglang-minwm-realtime-api",
+        help="Engine label written to the aggregate run record.",
+    )
+    parser.add_argument(
+        "--warmup-runs",
+        type=int,
+        default=0,
+        help="Discard this many complete runs of each case before measuring it.",
+    )
     return parser.parse_args()
 
 
@@ -163,6 +180,10 @@ async def run_case(args, case, contract, first_frame: Path):
 
 
 async def async_main(args) -> None:
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", args.output_prefix):
+        raise ValueError("--output-prefix must be a safe filename stem")
+    if args.warmup_runs < 0:
+        raise ValueError("--warmup-runs must be non-negative")
     manifest = load_cases(args.cases)
     contract = manifest["contract"]
     selected = set(args.selected_cases or [])
@@ -179,6 +200,19 @@ async def async_main(args) -> None:
         case_dir = results / "cases" / case["id"]
         case_dir.mkdir(parents=True, exist_ok=True)
         first_frame = materialize_first_frame(case, inputs)
+        for warmup_index in range(args.warmup_runs):
+            await run_case(args, case, contract, first_frame)
+            print(
+                json.dumps(
+                    {
+                        "id": case["id"],
+                        "warmup": warmup_index + 1,
+                        "warmup_runs": args.warmup_runs,
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
         frames, stats, request, timing = await run_case(
             args, case, contract, first_frame
         )
@@ -195,13 +229,14 @@ async def async_main(args) -> None:
             raise AssertionError(
                 f"{case['id']}: video shape {frames.shape} != {expected_shape}"
             )
-        np.save(case_dir / "sglang.npy", frames, allow_pickle=False)
-        save_video(case_dir / "sglang.mp4", frames, int(contract["fps"]))
+        np.save(case_dir / f"{args.output_prefix}.npy", frames, allow_pickle=False)
+        save_video(case_dir / f"{args.output_prefix}.mp4", frames, int(contract["fps"]))
         record = {
             "id": case["id"],
             "frames": int(frames.shape[0]),
-            "video_sha256": sha256_file(case_dir / "sglang.mp4"),
-            "frames_sha256": sha256_file(case_dir / "sglang.npy"),
+            "warmup_runs": args.warmup_runs,
+            "video_sha256": sha256_file(case_dir / f"{args.output_prefix}.mp4"),
+            "frames_sha256": sha256_file(case_dir / f"{args.output_prefix}.npy"),
             "chunk_stats": stats,
             "client_timing": timing,
             "request": {
@@ -210,13 +245,15 @@ async def async_main(args) -> None:
                 if key not in {"first_frame"}
             },
         }
-        write_json(case_dir / "sglang.json", record)
+        write_json(case_dir / f"{args.output_prefix}.json", record)
         records.append(record)
         print(json.dumps({"id": case["id"], "frames": len(frames)}, sort_keys=True))
     write_json(
-        results / "sglang_run.json",
+        results / f"{args.output_prefix}_run.json",
         {
-            "engine": "sglang-minwm-realtime-api",
+            "engine": args.engine_name,
+            "output_prefix": args.output_prefix,
+            "warmup_runs": args.warmup_runs,
             "ws_url": args.ws_url,
             "cases": records,
         },

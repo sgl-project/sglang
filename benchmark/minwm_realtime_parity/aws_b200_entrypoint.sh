@@ -16,7 +16,8 @@ set -euo pipefail
 [[ "${MINWM_BENCHMARK_MODE}" == "smoke" \
   || "${MINWM_BENCHMARK_MODE}" == "full" \
   || "${MINWM_BENCHMARK_MODE}" == "profiles" \
-  || "${MINWM_BENCHMARK_MODE}" == "long720p" ]] || {
+  || "${MINWM_BENCHMARK_MODE}" == "long720p" \
+  || "${MINWM_BENCHMARK_MODE}" == "triptych720p" ]] || {
   echo "unsupported MINWM_BENCHMARK_MODE=${MINWM_BENCHMARK_MODE}" >&2
   exit 2
 }
@@ -159,6 +160,113 @@ export MINWM_CHECKPOINT="${CHECKPOINT}"
 export MINWM_PRETRAINED_DIR="${PRETRAINED}"
 export MINWM_MODEL_DIR="${MODEL_DIR}"
 export MINWM_CONFIG
+
+wait_for_server() {
+  local server_pid="$1" log_path="$2"
+  for _ in $(seq 1 300); do
+    if curl --fail --silent http://127.0.0.1:30000/health >/dev/null; then
+      return 0
+    fi
+    if ! kill -0 "${server_pid}" 2>/dev/null; then
+      tail -300 "${log_path}" >&2
+      return 1
+    fi
+    sleep 2
+  done
+  tail -300 "${log_path}" >&2
+  return 1
+}
+
+if [[ "${MINWM_BENCHMARK_MODE}" == "triptych720p" ]]; then
+  TRIPTYCH_CASES="${MINWM_CASES_PATH:-${SCRIPT_DIR}/cases_720p_compile_smoke.json}"
+  TRIPTYCH_RESULTS="${LOCAL_RESULTS}/triptych-720p"
+  TRIPTYCH_WARMUP_RUNS="${MINWM_TRIPTYCH_WARMUP_RUNS:-1}"
+  if ! [[ "${TRIPTYCH_WARMUP_RUNS}" =~ ^[0-9]+$ ]]; then
+    echo "MINWM_TRIPTYCH_WARMUP_RUNS must be a non-negative integer" >&2
+    exit 2
+  fi
+  mkdir -p "${TRIPTYCH_RESULTS}"
+  python3 "${SCRIPT_DIR}/run_minwm_baseline.py" \
+    --cases "${TRIPTYCH_CASES}" \
+    --minwm-root /workspace/minWM \
+    --checkpoint "${CHECKPOINT}" \
+    --pretrained-dir "${PRETRAINED}" \
+    --config "${MINWM_CONFIG}" \
+    --results "${TRIPTYCH_RESULTS}" \
+    --warmup-runs "${TRIPTYCH_WARMUP_RUNS}" \
+    | tee "${RESULTS}/triptych-baseline.log"
+
+  run_triptych_lane() {
+    local lane="$1" attention_impl="$2" packed_deterministic="$3"
+    local native_components="$4" torch_compile="$5" segment_compile="$6"
+    local parity_deterministic="$7"
+    local server_log="${RESULTS}/triptych-${lane}-server.log"
+    local memory_log="${RESULTS}/triptych-${lane}-gpu-memory.csv"
+    MINWM_ATTENTION_IMPL="${attention_impl}" \
+    MINWM_PACKED_ATTENTION_DETERMINISTIC="${packed_deterministic}" \
+    MINWM_NATIVE_COMPONENTS="${native_components}" \
+    MINWM_SEGMENT_COMPILE="${segment_compile}" \
+    MINWM_PARITY_DETERMINISTIC="${parity_deterministic}" \
+    MINWM_DETERMINISTIC_ATTENTION="${parity_deterministic}" \
+    SGLANG_ENABLE_DETERMINISTIC_INFERENCE="${parity_deterministic}" \
+    sglang serve \
+      --model-path "${MODEL_DIR}" \
+      --pipeline-class-name MinWMCausalDMDPipeline \
+      --attention-backend fa \
+      --performance-mode speed \
+      --enable-torch-compile "${torch_compile}" \
+      --warmup-mode off \
+      --port 30000 \
+      > "${server_log}" 2>&1 &
+    local server_pid=$!
+    if ! wait_for_server "${server_pid}" "${server_log}"; then
+      kill "${server_pid}" 2>/dev/null || true
+      wait "${server_pid}" 2>/dev/null || true
+      return 1
+    fi
+    (
+      while kill -0 "${server_pid}" 2>/dev/null; do
+        nvidia-smi --query-gpu=timestamp,memory.used \
+          --format=csv,noheader,nounits || true
+        sleep 1
+      done
+    ) > "${memory_log}" &
+    local monitor_pid=$!
+    set +e
+    python3 "${SCRIPT_DIR}/run_sglang_api.py" \
+      --cases "${TRIPTYCH_CASES}" \
+      --results "${TRIPTYCH_RESULTS}" \
+      --ws-url ws://127.0.0.1:30000/v1/realtime_video/generate \
+      --output-prefix "sglang_${lane}" \
+      --engine-name "sglang-minwm-${lane}" \
+      --warmup-runs "${TRIPTYCH_WARMUP_RUNS}" \
+      | tee "${RESULTS}/triptych-${lane}-client.log"
+    local lane_status=${PIPESTATUS[0]}
+    set -e
+    kill "${server_pid}" 2>/dev/null || true
+    wait "${server_pid}" 2>/dev/null || true
+    kill "${monitor_pid}" 2>/dev/null || true
+    wait "${monitor_pid}" 2>/dev/null || true
+    return "${lane_status}"
+  }
+
+  run_triptych_lane bitwise packed true text_encoder,vae false true 1
+  # Whole-DiT compilation subsumes minWM's small dynamic segment compiles. The
+  # nested compilers add graph breaks/recompiles, so the speed lane leaves those
+  # helpers eager and lets Inductor own the complete transformer graph.
+  run_triptych_lane optimized dense false "" true false 0
+
+  python3 "${SCRIPT_DIR}/compare_triptych.py" \
+    --cases "${TRIPTYCH_CASES}" \
+    --results "${TRIPTYCH_RESULTS}" \
+    | tee "${RESULTS}/triptych-compare.log"
+  cp -r "${TRIPTYCH_RESULTS}" "${RESULTS}/"
+  cp "${TRIPTYCH_RESULTS}/triptych_report.json" "${RESULTS}/"
+  cp "${TRIPTYCH_RESULTS}/triptych_report.md" "${RESULTS}/"
+  touch "${RESULTS}/triptych-artifacts-ready"
+  echo "MINWM_TRIPTYCH720P_COMPLETE results=${RESULTS}"
+  exit 0
+fi
 
 if [[ "${MINWM_BENCHMARK_MODE}" == "long720p" ]]; then
   LONG_CASES="${MINWM_CASES_PATH:-${SCRIPT_DIR}/cases_720p_5s.json}"
@@ -429,22 +537,6 @@ else
   bitwise_status=0
   numeric_status=0
 fi
-
-wait_for_server() {
-  local server_pid="$1" log_path="$2"
-  for _ in $(seq 1 300); do
-    if curl --fail --silent http://127.0.0.1:30000/health >/dev/null; then
-      return 0
-    fi
-    if ! kill -0 "${server_pid}" 2>/dev/null; then
-      tail -300 "${log_path}" >&2
-      return 1
-    fi
-    sleep 2
-  done
-  tail -300 "${log_path}" >&2
-  return 1
-}
 
 run_throughput_profile() {
   local profile="$1" attention_impl="$2" packed_deterministic="$3"

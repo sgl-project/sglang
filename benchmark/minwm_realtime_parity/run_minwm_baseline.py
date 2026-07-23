@@ -36,11 +36,19 @@ def parse_args() -> argparse.Namespace:
         help="Defaults to Wan21/configs/eval/wan22_5b_varlen_dmd.yaml.",
     )
     parser.add_argument("--case", action="append", dest="selected_cases")
+    parser.add_argument(
+        "--warmup-runs",
+        type=int,
+        default=0,
+        help="Discard this many complete runs of each case before measuring it.",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    if args.warmup_runs < 0:
+        raise ValueError("--warmup-runs must be non-negative")
     deterministic = os.environ.get("MINWM_PARITY_DETERMINISTIC", "1").strip().lower()
     deterministic = deterministic not in {"0", "false", "no", "off"}
     os.environ["MINWM_DETERMINISTIC_ATTENTION"] = "true" if deterministic else "false"
@@ -123,6 +131,11 @@ def main() -> None:
     processor = WanPackedProcessor(config)
 
     dump_root = os.environ.get("MINWM_PARITY_DUMP_DIR")
+    if dump_root and args.warmup_runs:
+        raise ValueError(
+            "MINWM_PARITY_DUMP_DIR cannot be combined with --warmup-runs because "
+            "the hooks would capture the discarded run"
+        )
     if dump_root:
         dump_dir = Path(dump_root) / "baseline"
         dump_dir.mkdir(parents=True, exist_ok=True)
@@ -244,50 +257,67 @@ def main() -> None:
         message = build_minwm_message(case, contract, first_frame)
         write_json(case_dir / "input.json", message)
 
-        pipeline.vae.model.clear_cache()
-        batch = processor.process_inference_messages(message)
-        if dump_root:
-            torch.save(batch["clean_x"], dump_dir / "clean_x.pt")
-        if contract.get("action_output_format") == "primitive_float":
-            temporal_factor = int(config.vae_config.scale_factor_temporal)
-            expected_actions = np.zeros(
-                (
-                    1 + int(contract["generated_latent_frames"]),
-                    temporal_factor,
-                    8,
-                ),
-                dtype=np.float32,
-            )
-            expected_actions[1:] = np.asarray(action_weights(case), dtype=np.float32)
-            actual_actions = batch["action"][0].numpy()
-            if not np.array_equal(actual_actions, expected_actions):
-                raise AssertionError(
-                    f"{case['id']}: processor action weight windows do not match manifest"
+        for run_index in range(args.warmup_runs + 1):
+            pipeline.vae.model.clear_cache()
+            batch = processor.process_inference_messages(message)
+            if dump_root:
+                torch.save(batch["clean_x"], dump_dir / "clean_x.pt")
+            if contract.get("action_output_format") == "primitive_float":
+                temporal_factor = int(config.vae_config.scale_factor_temporal)
+                expected_actions = np.zeros(
+                    (
+                        1 + int(contract["generated_latent_frames"]),
+                        temporal_factor,
+                        8,
+                    ),
+                    dtype=np.float32,
                 )
-        else:
-            expected_actions = [0] + [int(case["action_label"])] * int(
-                contract["generated_latent_frames"]
-            )
-            actual_actions = batch["action"][0].tolist()
-            if actual_actions != expected_actions:
-                raise AssertionError(
-                    f"{case['id']}: processor action labels {actual_actions} != {expected_actions}"
+                expected_actions[1:] = np.asarray(
+                    action_weights(case), dtype=np.float32
                 )
+                actual_actions = batch["action"][0].numpy()
+                if not np.array_equal(actual_actions, expected_actions):
+                    raise AssertionError(
+                        f"{case['id']}: processor action weight windows do not "
+                        "match manifest"
+                    )
+            else:
+                expected_actions = [0] + [int(case["action_label"])] * int(
+                    contract["generated_latent_frames"]
+                )
+                actual_actions = batch["action"][0].tolist()
+                if actual_actions != expected_actions:
+                    raise AssertionError(
+                        f"{case['id']}: processor action labels {actual_actions} "
+                        f"!= {expected_actions}"
+                    )
 
-        # Reset immediately before V3's one-shot BFCHW noise draw. Reference
-        # encoding is deterministic posterior-mode and intentionally outside it.
-        set_seed(int(contract["seed"]), deterministic=deterministic)
-        torch.cuda.synchronize()
-        started = time.perf_counter()
-        video, latents = pipeline.run_processor_batch(batch, return_latents=True)
-        torch.cuda.synchronize()
-        elapsed = time.perf_counter() - started
+            # Reset immediately before V3's one-shot BFCHW noise draw. Reference
+            # encoding is deterministic posterior-mode and intentionally outside it.
+            set_seed(int(contract["seed"]), deterministic=deterministic)
+            torch.cuda.synchronize()
+            started = time.perf_counter()
+            video, latents = pipeline.run_processor_batch(batch, return_latents=True)
+            torch.cuda.synchronize()
+            elapsed = time.perf_counter() - started
 
-        frames = (
-            (255.0 * rearrange(video, "b t c h w -> b t h w c")[0].cpu())
-            .to(torch.uint8)
-            .numpy()
-        )
+            frames = (
+                (255.0 * rearrange(video, "b t c h w -> b t h w c")[0].cpu())
+                .to(torch.uint8)
+                .numpy()
+            )
+            if run_index < args.warmup_runs:
+                print(
+                    json.dumps(
+                        {
+                            "id": case["id"],
+                            "warmup": run_index + 1,
+                            "warmup_runs": args.warmup_runs,
+                        },
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
         expected_pixel_frames = int(contract["reference_pixel_frames"]) + int(
             contract["generated_pixel_frames"]
         )
@@ -306,6 +336,7 @@ def main() -> None:
             "id": case["id"],
             "elapsed_s": elapsed,
             "frames": int(frames.shape[0]),
+            "warmup_runs": args.warmup_runs,
             "video_sha256": sha256_file(case_dir / "baseline.mp4"),
             "frames_sha256": sha256_file(case_dir / "baseline.npy"),
             "latents_sha256": sha256_file(case_dir / "baseline_latents.pt"),
@@ -328,6 +359,7 @@ def main() -> None:
             "checkpoint_size": Path(args.checkpoint).stat().st_size,
             "deterministic": deterministic,
             "deterministic_attention": bool(config.deterministic_attention),
+            "warmup_runs": args.warmup_runs,
             "cases": run_records,
         },
     )
