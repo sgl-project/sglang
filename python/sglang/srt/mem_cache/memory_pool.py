@@ -301,8 +301,17 @@ class ReqToTokenPool:
         need_size = len(reqs) - len(reusing)
         if need_size > len(self.free_slots):
             return None
-        select_index = self.free_slots[:need_size]
-        self.free_slots = self.free_slots[need_size:]
+        if need_size > 0:
+            # Pop from the tail: O(need_size), unlike a prefix pop which is
+            # O(len(free_slots)) due to CPython shifting the remainder.
+            # Allocation order is not meaningful (req_pool_idx is an opaque
+            # row index), so this is a pure perf change, not a behavior change.
+            select_index = self.free_slots[-need_size:]
+            del self.free_slots[-need_size:]
+        else:
+            # need_size == 0 must be handled separately: free_slots[-0:] is
+            # the entire list (-0 == 0), not [].
+            select_index = []
         offset = 0
         for r in reqs:
             if r.req_pool_idx is None:
