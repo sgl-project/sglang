@@ -8,7 +8,7 @@ import torch
 import triton
 import triton.testing
 
-from sglang.kernels.ops.quantization._jit_per_tensor_quant_fp8 import (
+from sglang.kernels.ops.quantization.per_tensor_quant_fp8 import (
     per_tensor_quant_fp8,
 )
 from sglang.utils import is_in_ci
