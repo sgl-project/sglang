@@ -174,7 +174,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   // moe_fused_gate / kimi_k2_moe_fused_gate (AOT) retired: the CUDA gate/topk path
   // now routes through the unified Triton router
-  // (python/sglang/jit_kernel/moe_fused_gate.py).
+  // (python/sglang/kernels/ops/moe/moe_fused_gate.py).
 
   m.def(
       "fp8_blockwise_scaled_grouped_mm(Tensor output, Tensor a_ptrs, Tensor b_ptrs, Tensor out_ptrs, Tensor "

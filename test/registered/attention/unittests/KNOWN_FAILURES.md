@@ -45,7 +45,7 @@ ImportError: cannot import name 'flash_attn_varlen_func' from 'flash_attn'
 ```
 
 **Root cause**: `DualChunkFlashAttentionBackend` calls `flash_attn_varlen_func`
-via `sglang.jit_kernel.flash_attention`. On SM 8.x / 9.x that resolves to
+via `sglang.kernels.ops.attention.flash_attention`. On SM 8.x / 9.x that resolves to
 sgl-kernel's FA3 build (works on H200). On other SMs, the JIT kernel falls
 back to the upstream `flash_attn` (FA2) wheel — but the
 `lmsysorg/sglang:nightly-dev-cu13` container's `flash_attn` package on
