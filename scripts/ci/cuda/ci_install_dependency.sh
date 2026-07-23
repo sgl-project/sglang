@@ -499,13 +499,13 @@ install_extra_deps() {
     MOONCAKE_WHEEL_ZIP_URL=""
     case "$(uname -m)" in
         aarch64)
-            MOONCAKE_WHEEL_ZIP_URL="https://nightly.link/kvcache-ai/Mooncake/actions/runs/28088854345/wheel-arm64-py312.zip"
+            MOONCAKE_WHEEL_ZIP_URL="https://nightly.link/kvcache-ai/Mooncake/actions/artifacts/8496806286.zip"
             ;;
         x86_64)
             if [ "$CU_MAJOR" = "13" ]; then
-                MOONCAKE_WHEEL_ZIP_URL="https://nightly.link/kvcache-ai/Mooncake/actions/runs/28088854345/mooncake-wheel-cu130-ubuntu-py312.zip"
+                MOONCAKE_WHEEL_ZIP_URL="https://nightly.link/kvcache-ai/Mooncake/actions/artifacts/8497021972.zip"
             else
-                MOONCAKE_WHEEL_ZIP_URL="https://nightly.link/kvcache-ai/Mooncake/actions/runs/28088854345/mooncake-wheel-ubuntu-py312.zip"
+                MOONCAKE_WHEEL_ZIP_URL="https://nightly.link/kvcache-ai/Mooncake/actions/artifacts/8497492280.zip"
             fi
             ;;
     esac
