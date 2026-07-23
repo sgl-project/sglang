@@ -657,6 +657,25 @@ def download_safetensors_index_file_from_hf(
             logger.debug("No %s found in local cache.", index_file)
 
 
+def get_safetensors_weight_files(
+    hf_folder: str,
+    index_file: str,
+) -> List[str]:
+    """Return safetensors weight files, preferring the index when available."""
+    index_file_name = os.path.join(hf_folder, index_file)
+    if os.path.isfile(index_file_name):
+        with open(index_file_name) as f:
+            weight_map = json.load(f)["weight_map"]
+        return sorted(
+            {
+                os.path.join(hf_folder, relative_path)
+                for relative_path in weight_map.values()
+            }
+        )
+
+    return glob.glob(os.path.join(hf_folder, "*.safetensors"))
+
+
 # For models like Mistral-7B-v0.3, there are both sharded
 # safetensors files and a consolidated safetensors file.
 # Passing both of these to the weight loader functionality breaks.

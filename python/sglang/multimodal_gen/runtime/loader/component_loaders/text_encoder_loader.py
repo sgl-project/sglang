@@ -35,6 +35,7 @@ from sglang.multimodal_gen.runtime.loader.utils import (
 from sglang.multimodal_gen.runtime.loader.weight_utils import (
     filter_duplicate_safetensors_files,
     filter_files_not_needed_for_inference,
+    get_safetensors_weight_files,
     pt_weights_iterator,
     safetensors_weights_iterator,
 )
@@ -208,7 +209,13 @@ class TextEncoderLoader(ComponentLoader):
 
         hf_weights_files: list[str] = []
         for pattern in allow_patterns:
-            hf_weights_files += glob.glob(os.path.join(hf_folder, pattern))
+            if pattern == "*.safetensors":
+                hf_weights_files += get_safetensors_weight_files(hf_folder, index_file)
+            else:
+                hf_weights_files += glob.glob(
+                    os.path.join(hf_folder, "**", pattern),
+                    recursive=True,
+                )
             if len(hf_weights_files) > 0:
                 if pattern == "*.safetensors":
                     use_safetensors = True

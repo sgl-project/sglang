@@ -99,6 +99,7 @@ from sglang.srt.model_loader.weight_utils import (
     filter_files_not_needed_for_inference,
     get_gguf_extra_tensor_names,
     get_quant_config,
+    get_safetensors_weight_files,
     gguf_quant_weights_iterator,
     initialize_dummy_weights,
     maybe_add_mtp_safetensors,
@@ -492,7 +493,17 @@ class DefaultModelLoader(BaseModelLoader):
 
         hf_weights_files: List[str] = []
         for pattern in allow_patterns:
-            hf_weights_files += glob.glob(os.path.join(hf_folder, pattern))
+            if pattern == "*.safetensors":
+                if not is_local:
+                    download_safetensors_index_file_from_hf(
+                        model_name_or_path,
+                        index_file,
+                        self.load_config.download_dir,
+                        revision,
+                    )
+                hf_weights_files += get_safetensors_weight_files(hf_folder, index_file)
+            else:
+                hf_weights_files += glob.glob(os.path.join(hf_folder, pattern))
             if len(hf_weights_files) > 0:
                 if pattern == "*.safetensors":
                     use_safetensors = True
@@ -504,13 +515,6 @@ class DefaultModelLoader(BaseModelLoader):
             # safetensors file. Using both breaks.
             # Here, we download the `model.safetensors.index.json` and filter
             # any files not found in the index.
-            if not is_local:
-                download_safetensors_index_file_from_hf(
-                    model_name_or_path,
-                    index_file,
-                    self.load_config.download_dir,
-                    revision,
-                )
             hf_weights_files = filter_duplicate_safetensors_files(
                 hf_weights_files, hf_folder, index_file
             )
