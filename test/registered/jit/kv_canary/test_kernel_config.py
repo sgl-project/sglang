@@ -3,15 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from sglang.jit_kernel.kv_canary import consts
-from sglang.jit_kernel.kv_canary.verify import (
-    CanaryLaunchTag,
-    VerifyOrWriteContext,
-    VerifyPlan,
-    launch_canary_verify_kernel,
-)
-from sglang.jit_kernel.kv_canary.write import WritePlan
-from sglang.jit_kernel.tests.kv_canary._canary_helpers import (
+from sglang.kernels.jit.tests.kv_canary._canary_helpers import (
     FakeViolationLog,
     assert_canary_buf_equal,
     assert_canary_state_equal,
@@ -23,16 +15,24 @@ from sglang.jit_kernel.tests.kv_canary._canary_helpers import (
     make_write_plan_pair,
     stamp_clean_chain,
 )
-from sglang.jit_kernel.tests.kv_canary._differential import (
+from sglang.kernels.jit.tests.kv_canary._differential import (
     _assert_plans_byte_equal,
     _run_both_plan,
     _run_both_verify,
     _run_both_write,
 )
-from sglang.jit_kernel.tests.kv_canary._fixtures import (
+from sglang.kernels.jit.tests.kv_canary._fixtures import (
     dummy_pseudo_tensors,
     empty_extras,
 )
+from sglang.kernels.ops.kv_canary import consts
+from sglang.kernels.ops.kv_canary.verify import (
+    CanaryLaunchTag,
+    VerifyOrWriteContext,
+    VerifyPlan,
+    launch_canary_verify_kernel,
+)
+from sglang.kernels.ops.kv_canary.write import WritePlan
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-large")
