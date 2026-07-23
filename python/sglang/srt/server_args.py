@@ -31,8 +31,8 @@ import uuid
 from functools import cached_property
 from typing import Any, Callable, Dict, List, Literal, Optional, Union
 
-from sglang.jit_kernel.kv_canary.consts import RealKvHashMode
 from sglang.kernels.ops.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
+from sglang.kernels.ops.kv_canary.consts import RealKvHashMode
 from sglang.srt.arg_groups.arg_utils import NS, A, Arg, add_cli_args_from_dataclass
 from sglang.srt.arg_groups.argparse_actions import (
     DeprecatedAction,
@@ -211,6 +211,7 @@ ATTENTION_BACKEND_CHOICES = [
     "tokenspeed_mla",
     "trtllm_mha",
     "dual_chunk_flash_attn",
+    "hpc_ops",  # HPC-Ops (https://github.com/Tencent/hpc-ops), Hopper+, requires --page-size 64
     # AMD specific
     "aiter",
     "wave",
@@ -305,7 +306,7 @@ FP4_GEMM_RUNNER_BACKEND_CHOICES = [
     "marlin",
 ]
 
-BF16_GEMM_BACKEND_CHOICES = ["auto", "cutedsl"]
+BF16_GEMM_BACKEND_CHOICES = ["auto", "cutedsl", "torch"]
 
 RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru", "priority"]
 RETRACTION_POLICY_CHOICES = ["length", "priority"]
@@ -1181,6 +1182,24 @@ class ServerArgs:
         "defaults to --port + 10000.",
         NS("serving"),
     ] = None
+    sidecar: A[
+        Optional[str],
+        "Start a locally managed sidecar against the native gRPC server. "
+        "The selected module must expose main(argv) and read the resolved "
+        "native gRPC endpoint from SGLANG_GRPC_ENDPOINT. Requires --grpc-port "
+        "or SGLANG_GRPC_PORT.",
+        NS("serving"),
+    ] = None
+    sidecar_args: A[
+        Optional[List[str]],
+        Arg(
+            help="JSON array passed to the selected sidecar module's "
+            "main(argv) function. --sidecar-shutdown-timeout SECONDS is "
+            "consumed by SGLang.",
+            type_parser=json_list_type,
+        ),
+        NS("serving"),
+    ] = None
     skip_server_warmup: A[bool, "If set, skip warmup.", NS("serving")] = False
     warmups: A[
         Optional[str],
@@ -1643,7 +1662,7 @@ class ServerArgs:
     bf16_gemm_backend: A[
         str,
         Arg(
-            help="Choose the backend for unquantized BF16 GEMM operations. Options: 'auto' (default; uses cuBLAS via torch.nn.functional.linear), 'cutedsl' (SGLang JIT CuTe DSL TGV BF16 GEMM on SM10X; dispatches between the CuTe DSL kernel and cuBLAS).",
+            help="Choose the backend for unquantized BF16 GEMM operations. Options: 'auto' (default; selects 'cutedsl' on SM100/SM103 (Blackwell), otherwise uses cuBLAS via torch.nn.functional.linear), 'cutedsl' (SGLang JIT CuTe DSL TGV BF16 GEMM on SM10X; dispatches between the CuTe DSL kernel and cuBLAS), 'torch' (always uses cuBLAS via torch.nn.functional.linear, even on SM100/SM103).",
             cli_name="--bf16-gemm-backend",
             choices=BF16_GEMM_BACKEND_CHOICES,
         ),
@@ -3730,6 +3749,23 @@ class ServerArgs:
         # Native gRPC is incompatible with launch paths it doesn't wire into.
         # Legacy takes precedence over grpc_port, keeping re-runs idempotent.
         native_grpc = self.grpc_port is not None and not legacy_grpc
+        if self.sidecar_args is not None:
+            if self.sidecar is None:
+                raise ValueError("--sidecar-args requires --sidecar.")
+            if not isinstance(self.sidecar_args, list) or not all(
+                isinstance(arg, str) for arg in self.sidecar_args
+            ):
+                raise ValueError("--sidecar-args must be a JSON array of strings.")
+        if self.sidecar is not None:
+            if not self.sidecar.strip():
+                raise ValueError("--sidecar must not be empty.")
+            if legacy_grpc:
+                raise ValueError(
+                    "--sidecar requires SGLang's native gRPC server; "
+                    "it cannot be combined with --smg-grpc-mode/--grpc-mode."
+                )
+            if self.grpc_port is None:
+                raise ValueError("--sidecar requires --grpc-port or SGLANG_GRPC_PORT.")
         if native_grpc:
             if self.use_ray:
                 raise ValueError(
@@ -5213,6 +5249,19 @@ class ServerArgs:
         if view.page_size is not None:
             assert view.mamba_track_interval % view.page_size == 0
             assert self.mamba_cache_chunk_size is not None
+
+            if (
+                view.chunked_prefill_size is not None
+                and 0 < view.chunked_prefill_size < self.mamba_cache_chunk_size
+            ):
+                logger.warning(
+                    "Mamba radix extra-buffer is enabled with chunked_prefill_size=%s "
+                    "smaller than mamba_cache_chunk_size=%s. This can make "
+                    "mamba_track_mask false for unfinished chunked-prefill handoff "
+                    "and skip Mamba state checkpoints.",
+                    view.chunked_prefill_size,
+                    self.mamba_cache_chunk_size,
+                )
 
     def _handle_mamba_radix_cache(self, model_arch: str):
         # Resolution moved to the resolution pipeline (arg_groups/overrides.py:
@@ -8569,19 +8618,14 @@ class ServerArgs:
 # (decrease-only) by test/registered/unit/test_legacy_global_ratchet.py.
 # Imports are in-function so the two modules stay cycle-free at import time.
 def set_global_server_args_for_scheduler(server_args: ServerArgs):
-    """Legacy publish shim (role=scheduler) — prefer
-    ``runtime_context.publish(server_args, role=...)`` in new code."""
-    from sglang.srt.runtime_context import publish
+    """Legacy publish shim — prefer ``get_context().set_server_args()`` from
+    ``sglang.srt.runtime_context`` in new code."""
+    from sglang.srt.runtime_context import get_context
 
-    publish(server_args, role="scheduler")
+    get_context().set_server_args(server_args)
 
 
-def set_global_server_args_for_tokenizer(server_args: ServerArgs):
-    """Legacy publish shim (role=tokenizer). Not aliased to the scheduler shim:
-    the process role differs."""
-    from sglang.srt.runtime_context import publish
-
-    publish(server_args, role="tokenizer")
+set_global_server_args_for_tokenizer = set_global_server_args_for_scheduler
 
 
 def get_global_server_args() -> ServerArgs:
