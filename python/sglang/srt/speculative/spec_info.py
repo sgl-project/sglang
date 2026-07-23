@@ -304,6 +304,7 @@ class SpecInputType(IntEnum):
     EAGLE_DRAFT = auto()
     EAGLE_DRAFT_EXTEND = auto()
     EAGLE_VERIFY = auto()
+    EAGLE_PP_VERIFY_INPUT_RAW = auto()
     FROZEN_KV_MTP_DRAFT = auto()
     FROZEN_KV_MTP_VERIFY = auto()
     DFLASH_DRAFT = auto()

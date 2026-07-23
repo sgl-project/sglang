@@ -2840,10 +2840,18 @@ class DeepseekV4ForCausalLM(nn.Module):
                             if name.startswith("mtp"):
                                 continue
                     else:
-                        if "shared_head.head" in name or "embed_tokens" in name:
+                        if "shared_head.head" in name:
+                            continue
+                        is_embed = "embed_tokens" in name
+                        # Under PP the draft model loads its own embed_tokens on
+                        # the last rank; otherwise embed is shared from target.
+                        if is_embed and (
+                            self.pp_group.world_size == 1
+                            or not self.pp_group.is_last_rank
+                        ):
                             continue
 
-                        if not name.startswith(nextn_layer_prefix):
+                        if not name.startswith(nextn_layer_prefix) and not is_embed:
                             continue
 
                         in_decoder = True
@@ -2919,6 +2927,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                                 continue
                             if (
                                 ".embed_tokens." in name
+                                and not is_nextn
                                 and not self.pp_group.is_first_rank
                             ):
                                 continue
@@ -3044,7 +3053,11 @@ class DeepseekV4ForCausalLM(nn.Module):
             skipped_checking_patterns.append("model.norm.")
             skipped_checking_patterns.extend(["lm_head", "hc_head_"])
         if is_nextn:
-            skipped_checking_patterns.extend(["lm_head", "embed_tokens"])
+            skipped_checking_patterns.extend(["lm_head"])
+            # Under PP the draft loads embed_tokens itself, so do not skip it here;
+            # under non-PP it is still shared from target by eagle_worker, so skip it.
+            if self.pp_group.world_size == 1:
+                skipped_checking_patterns.extend(["embed_tokens"])
         unloaded_params = {
             p
             for p in unloaded_params
@@ -3066,6 +3079,9 @@ class DeepseekV4ForCausalLM(nn.Module):
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
 
+    def get_head(self):
+        return self.lm_head.weight
+
     def set_embed_and_head(self, embed, head):
         del self.model.embed_tokens.weight
         del self.lm_head.weight
@@ -3073,6 +3089,12 @@ class DeepseekV4ForCausalLM(nn.Module):
         self.lm_head.weight = head
         # Hot weight reload (RL workflows). Use the device-agnostic module
         # accessor so this works on both CUDA/HIP and NPU.
+        torch.get_device_module().empty_cache()
+        torch.get_device_module().synchronize()
+
+    def set_head(self, head):
+        del self.lm_head.weight
+        self.lm_head.weight = head
         torch.get_device_module().empty_cache()
         torch.get_device_module().synchronize()
 

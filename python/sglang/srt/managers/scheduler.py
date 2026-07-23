@@ -1010,6 +1010,13 @@ class Scheduler(
             self.chunked_prefill_size is not None
             and self.server_args.enable_mixed_chunk
         )
+        # Under PP + spec, prefill reqs run as EXTEND and decode reqs as
+        # TARGET_VERIFY, so they cannot be merged into a single MIXED batch.
+        assert not (
+            self.is_mixed_chunk
+            and self.ps.pp_size > 1
+            and not self.spec_algorithm.is_none()
+        ), "PP + spec-v2 does not support mixed-chunk prefill; disable --enable-mixed-chunk."
 
         # Init the dynamic chunking predictor for PP
         self.enable_dynamic_chunking = (
@@ -1132,9 +1139,13 @@ class Scheduler(
             server_args=self.server_args,
         )
 
-        if self.spec_algorithm.carries_draft_hidden_states():
+        if (
+            self.spec_algorithm.carries_draft_hidden_states()
+            and self.draft_worker.draft_worker is not None
+        ):
             # `draft_runner` aliases `draft_runner_list[0]` in the multi-layer
-            # worker, so a single accessor covers both shapes.
+            # worker, so a single accessor covers both shapes. Non-last PP
+            # ranks have no draft worker, so fall through to the default.
             draft_runner = self.draft_worker.draft_worker.draft_runner
             disagg_hidden_size, disagg_hidden_states_dtype = (
                 get_draft_recurrent_hidden_state_spec(draft_runner)
@@ -3434,6 +3445,18 @@ class Scheduler(
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
                 self._relay_forward_payload(batch.req_pool_indices, batch_result)
                 batch.input_ids = None
+            elif not batch.spec_algorithm.is_none() and self.ps.pp_size > 1:
+                # PP + spec non-overlap path: forward receives pp_proxy_tensors
+                # and returns batch_result whose post-processing (KV move,
+                # seq_lens advance) is handled by process_batch_result on every
+                # PP rank. Non-last ranks get EaglePPVerifyInputRaw via spec_info
+                # from _pp_prep_batch_result.
+                resolve_forward_inputs(batch, self.future_map)
+                with self._forward_isolation(batch, overlap=False):
+                    batch_result = self.model_worker.forward_batch_generation(
+                        batch, pp_proxy_tensors=pp_proxy_tensors
+                    )
+                self.update_cache_from_scheduler(batch, batch_result)
             elif not batch.spec_algorithm.is_none():
                 # Non-overlap: drive the V2 worker synchronously (no
                 # future_map relay / on_publish).

@@ -15,6 +15,7 @@ from sglang.srt.layers.attention.dsa.utils import (
 )
 from sglang.srt.layers.dp_attention import (
     dp_gather_partial,
+    get_attention_dp_size,
     get_global_dp_buffer_len,
     is_dp_attention_enabled,
 )
@@ -142,12 +143,22 @@ class DeepseekV4ModelNextN(nn.Module):
         else:
             hidden_states = input_embeds
 
+        spec_hidden = forward_batch.spec_info.hidden_states
+
+        if dsa_use_prefill_cp(forward_batch):
+            assert get_attention_dp_size() == 1
+            hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
+            positions = cp_split_and_rebuild_position(forward_batch, positions)
+            input_ids = cp_round_robin_input_ids(input_ids)
+            spec_hidden = cp_split_and_rebuild_data(
+                forward_batch,
+                spec_hidden.view(-1, self.hc_mult, self.config.hidden_size),
+            )
+
         if hidden_states.shape[0] > 0:
             n_tokens = hidden_states.shape[0]
             d = self.config.hidden_size
-            hc_flat = forward_batch.spec_info.hidden_states.view(
-                n_tokens * self.hc_mult, d
-            )
+            hc_flat = spec_hidden.view(n_tokens * self.hc_mult, d)
             h_proj_out, _ = self.h_proj(self.hnorm(hc_flat))
             h_proj_hidden_states = h_proj_out.view(n_tokens, self.hc_mult, d)
 
@@ -165,12 +176,6 @@ class DeepseekV4ModelNextN(nn.Module):
             dp_gather_partial(input_ids_global, input_ids[:, None], forward_batch)
             input_ids_global = input_ids_global.squeeze(-1)
         else:
-            input_ids_global = input_ids
-
-        if dsa_use_prefill_cp(forward_batch):
-            hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
-            positions = cp_split_and_rebuild_position(forward_batch, positions)
-            input_ids = cp_round_robin_input_ids(input_ids)
             input_ids_global = input_ids
 
         hidden_states, residual, post, comb = self.decoder(

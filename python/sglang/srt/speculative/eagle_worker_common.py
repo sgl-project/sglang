@@ -15,6 +15,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.eagle_utils import (
     TreeMaskMode,
@@ -413,10 +414,15 @@ def _finalize_accept_tree_path(
     hidden_states -- to the contiguous front of each per-req block, which the
     downstream chain-layout code (draft-extend select_index, committed-KV reads)
     assumes. Returns compacted predict; mutates logits_output.hidden_states
-    (moved only when present)."""
-    move_accept_tokens_to_target_kvcache(
-        batch, accept_index, accept_lens - 1, token_to_kv_pool_allocator
-    )
+    (moved only when present).
+
+    Under PP the KV move runs per-rank in the scheduler's batch_result_processor
+    (it needs each rank's own seq_lens / accept_index), so skip it here.
+    """
+    if get_parallel().pp_size == 1:
+        move_accept_tokens_to_target_kvcache(
+            batch, accept_index, accept_lens - 1, token_to_kv_pool_allocator
+        )
     predict = _compact_accept_to_front(
         predict, accept_index, bs, num_draft_tokens=num_draft_tokens
     )
@@ -468,6 +474,7 @@ def run_eagle_verify(
     metadata_ready_pre_pad: bool,
     finalize_tree_path: bool,
     grammar_barrier=None,
+    pp_proxy_tensors=None,
 ) -> GenerationBatchResult:
     """Shared verify step: target-verify forward, sampling, acceptance bookkeeping.
 
@@ -564,8 +571,16 @@ def run_eagle_verify(
         batch=None,
         forward_batch=verify_forward_batch,
         is_verify=True,
+        pp_proxy_tensors=pp_proxy_tensors,
     )
     logits_output = forward_batch_output.logits_output
+
+    # Non-last PP rank: only proxy hidden states, no logits — skip the
+    # sample/accept/grammar post-processing below.
+    pp_enabled = target_worker.server_args.pp_size > 1
+    pp_is_last_rank = target_worker.pp_group.is_last_rank
+    if pp_enabled and not pp_is_last_rank:
+        return forward_batch_output
 
     # Generate vocab mask for constrained decoding
     vocab_mask = None
@@ -679,6 +694,7 @@ def run_eagle_verify(
         speculative_num_draft_tokens=num_draft_tokens,
         next_draft_input=next_draft_input,
         accept_lens=accept_lens,
+        accept_index=accept_index,
         new_seq_lens=new_seq_lens,
         routed_experts_output=forward_batch_output.routed_experts_output,
         indexer_topk_output=forward_batch_output.indexer_topk_output,
