@@ -244,6 +244,23 @@ def create_trtllm_mha_backend(runner):
     return TRTLLMHAAttnBackend(runner)
 
 
+@register_attention_backend("hpc_ops")
+def create_hpc_ops_backend(runner):
+    if runner.use_mla_backend:
+        raise ValueError("hpc_ops backend can only be used with non-MLA models.")
+    if runner.model_config.is_encoder_decoder:
+        raise ValueError(
+            "Cross attention is not supported in the hpc_ops attention backend."
+        )
+    if runner.server_args.speculative_algorithm is not None:
+        raise ValueError(
+            "hpc_ops backend does not support speculative decoding for now."
+        )
+    from sglang.srt.layers.attention.hpc_ops_backend import HPCOpsAttnBackend
+
+    return HPCOpsAttnBackend(runner)
+
+
 @register_attention_backend("intel_amx")
 def create_intel_amx_backend(runner):
     from sglang.srt.layers.attention.intel_amx_backend import IntelAMXAttnBackend
@@ -283,6 +300,13 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         )
 
     if cfg := mambaish_config(runner.model_config):
+        from sglang.srt.configs.inkling import InklingMMConfig, InklingModelConfig
+
+        if isinstance(
+            runner.model_config.hf_config, (InklingModelConfig, InklingMMConfig)
+        ):
+            return full_attn_backend
+
         from sglang.kernels.ops.attention.fla.utils import check_environments
         from sglang.srt.layers.attention.linear.kda_backend import KDAAttnBackend
         from sglang.srt.layers.attention.linear.lightning_backend import (

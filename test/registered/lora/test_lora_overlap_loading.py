@@ -17,6 +17,7 @@ import unittest
 from typing import cast
 from unittest.mock import MagicMock, patch
 
+import torch
 from torch.cuda import Event as CudaEvent
 from torch.cuda import Stream as CudaStream
 
@@ -69,6 +70,7 @@ class TestLoRAOverlapLoaderUnitTests(CustomTestCase):
         self.mock_lora_manager.memory_pool.uid_to_buffer_id = {}
         self.mock_lora_manager.validate_lora_batch.return_value = True
         self.mock_lora_manager.fetch_new_loras.side_effect = self._mark_loras_loaded
+        self.mock_lora_manager.pending_lora_load_events = {}
 
     def tearDown(self):
         self.torch_patcher.stop()
@@ -154,6 +156,46 @@ class TestLoRAOverlapLoaderUnitTests(CustomTestCase):
         self.assertFalse(result)
         self.mock_lora_manager.fetch_new_loras.assert_not_called()
         self.assertIn("lora_A", loader.lora_to_overlap_load_event)
+
+    def test_loader_uses_manager_pending_event_store(self):
+        loader = self._create_loader()
+
+        self.assertIs(
+            loader.lora_to_overlap_load_event,
+            self.mock_lora_manager.pending_lora_load_events,
+        )
+
+    def test_pending_load_is_synchronized_before_unload(self):
+        manager = LoRAManager.__new__(LoRAManager)
+        manager.device = torch.device("cuda:0")
+        manager.pending_lora_load_events = {}
+        manager.memory_pool = MagicMock()
+        manager.configs = {"lora_A": object()}
+        manager.loras = {"lora_A": object()}
+        lora_ref = MagicMock()
+        lora_ref.lora_id = "lora_A"
+        lora_ref.lora_name = "lora_A"
+        lora_ref.lora_path = "/tmp/lora_A"
+        lora_ref.pinned = False
+        manager.lora_refs = {"lora_A": lora_ref}
+        manager.num_pinned_loras = 0
+        manager.lora_modules = []
+
+        order = []
+        event = self._create_mock_event(False)
+        event.synchronize.side_effect = lambda: order.append("synchronize")
+        manager.memory_pool.remove_lora.side_effect = lambda _uid: (
+            order.append("remove") or 0
+        )
+        loader = LoRAOverlapLoader(manager)
+        loader.lora_to_overlap_load_event["lora_A"] = event
+
+        result = manager.unload_lora_adapter(lora_ref)
+
+        self.assertTrue(result.success)
+        self.assertEqual(order, ["synchronize", "remove"])
+        event.synchronize.assert_called_once_with()
+        self.assertNotIn("lora_A", manager.pending_lora_load_events)
 
     def test_full_lifecycle_single_lora_load(self):
         loader = self._create_loader()
