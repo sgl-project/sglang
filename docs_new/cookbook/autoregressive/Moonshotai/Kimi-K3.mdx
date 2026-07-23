@@ -52,6 +52,106 @@ import { benchmarks } from "/src/snippets/configs/moonshotai/kimi-k3-benchmarks.
 
 <Deployment config={config} benchmarks={benchmarks} />
 
+## VLM Serving Profiles
+
+The open-source K3 serving contract currently supports **image input only**. Its
+processor rejects video and audio input; the hosted Kimi API's `video_url` support
+is a separate product contract.
+
+### Recommended high-speed VLM
+
+The command panel now opens on the verified **B300 · Balanced · Single Node**
+recipe below. It makes the VLM-specific performance choices explicit:
+
+```bash Command
+SGLANG_MM_FEATURE_CACHE_MB=1024 \
+sglang serve \
+  --trust-remote-code \
+  --model-path moonshotai/Kimi-K3 \
+  --tp 8 \
+  --context-length 131072 \
+  --moe-runner-backend marlin \
+  --decode-attention-backend trtllm_mla \
+  --enable-symm-mem \
+  --mem-fraction-static 0.85 \
+  --cuda-graph-max-bs 128 \
+  --mm-feature-transport cuda_ipc \
+  --mm-processor-worker-num 2 \
+  --mm-io-worker-num 16 \
+  --skip-server-warmup \
+  --reasoning-parser kimi_k3 \
+  --tool-call-parser kimi_k3 \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
+- `--mm-feature-transport cuda_ipc` avoids the feature CPU round trip on a
+  **single CUDA node**. Its pool is bounded, falls back to CPU per tensor when
+  full, and reserves up to `SGLANG_MM_FEATURE_CACHE_MB` on the base GPU. Do not
+  use it across nodes; the H200/GB300 multi-node recipes intentionally use CPU
+  transport.
+- Two processor workers and 16 I/O workers are the measured K3 defaults. More
+  workers are not generally faster; they can add contention and host-memory use.
+- Omitting `--mm-attention-backend` is intentional: K3 auto-selects the vision
+  attention backend for the device and shape, with a correctness fallback.
+- K3 already shards images across TP ranks. Do **not** add
+  `--mm-enable-dp-encoder`; that flag is unnecessary for K3.
+
+### Should ViT BCG be enabled?
+
+Keep ViT BCG **off for general full-model or random-size serving**. Enable
+`SGLANG_VIT_ENABLE_CUDA_GRAPH=1` for ViT-only / EPD encoder workloads with
+recurring image shapes and sufficient HBM.
+
+- Real K3 GB300 measurements showed roughly `1.05×–5.69×` ViT replay speedups
+  depending on shape, but full TP8 `bench_serving` improved only `+2.5%` in one
+  saturation round (within noise), with no stable TTFT/TPOT gain.
+- The largest tested graph added `37.6 MiB` allocated / `358 MiB` reserved HBM,
+  plus `0.94–16.22 MiB` position metadata per tested cache entry. This is
+  separate from the optional 1 GiB CUDA IPC pool.
+
+The default two-entry exact-shape cache captures after two hits and falls back
+to eager above 6,144 tokens. Do not enlarge it without measuring retained HBM.
+
+### Low-HBM VLM
+
+Use this profile when keeping HBM headroom matters more than peak concurrency.
+It removes the 1 GiB CUDA IPC pool, keeps ViT BCG disabled, bounds the context
+and decode graph, and lowers the static-memory target:
+
+```bash Command
+SGLANG_VIT_ENABLE_CUDA_GRAPH=0 \
+sglang serve \
+  --trust-remote-code \
+  --model-path moonshotai/Kimi-K3 \
+  --tp 8 \
+  --context-length 65536 \
+  --moe-runner-backend marlin \
+  --decode-attention-backend trtllm_mla \
+  --enable-symm-mem \
+  --mem-fraction-static 0.82 \
+  --cuda-graph-max-bs 64 \
+  --max-running-requests 64 \
+  --mm-feature-transport cpu \
+  --mm-processor-worker-num 2 \
+  --mm-io-worker-num 16 \
+  --skip-server-warmup \
+  --reasoning-parser kimi_k3 \
+  --tool-call-parser kimi_k3 \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
+`--mem-fraction-static 0.82` is a conservative B300 starting point, not a
+portable minimum. If the server reports insufficient memory during startup,
+raise it toward the verified `0.85`; if more HBM must be returned to other
+workloads, reduce context/concurrency before changing KV or SSM precision.
+`--kv-cache-dtype fp8_e4m3` and `--mamba-ssm-dtype bfloat16` save substantially
+more cache memory by changing numerical precision. `fp8_e4m3` KV is a standard
+throughput lever — it held GSM8K 200q at `0.990` in the GB300 throughput recipe —
+while `--mamba-ssm-dtype bfloat16` stays workload-gated; re-verify accuracy on
+this B300 path before quoting numbers.
+
 ## Playground
 
 The Playground is where you experiment with **SGLang features beyond the verified matrix**. The Deploy panel above only emits combinations the SGLang team has signed off on; the Playground lets you turn on additional knobs on top of whichever cell the Deploy panel is currently showing.
@@ -62,7 +162,7 @@ import { Playground } from "/src/snippets/_playground.jsx";
 
 ## 1. Model Introduction
 
-**Kimi-K3** is Moonshot AI's flagship hybrid Mixture-of-Experts vision-language model — **2.8 trillion total parameters** with **16 of 896 experts** active per token, reaching roughly **2.5× the scaling efficiency of Kimi-K2**. It is built on **Kimi Delta Attention (KDA)** — a hybrid linear-attention mechanism — together with **Attention Residuals** and the **Stable LatentMoE** framework; in SGLang the backbone runs as 93 layers interleaving KDA (linear) with Multi-head Latent Attention (MLA). K3 has **native visual understanding** (images and video) and supports a context window of up to **1M tokens** with automatic prefix caching. Weights ship in **MXFP4** and are served through SGLang's Marlin (W4A16) runner for accuracy, or the FlashInfer MXFP4 / MegaMoE runners for throughput.
+**Kimi-K3** is Moonshot AI's flagship hybrid Mixture-of-Experts vision-language model — **2.8 trillion total parameters** with **16 of 896 experts** active per token, reaching roughly **2.5× the scaling efficiency of Kimi-K2**. It is built on **Kimi Delta Attention (KDA)** — a hybrid linear-attention mechanism — together with **Attention Residuals** and the **Stable LatentMoE** framework; in SGLang the backbone runs as 93 layers interleaving KDA (linear) with Multi-head Latent Attention (MLA). The current open-source serving path supports image understanding and a context window of up to **1M tokens** with automatic prefix caching. Weights ship in **MXFP4** and are served through SGLang's Marlin (W4A16) runner for accuracy, or the FlashInfer MXFP4 / MegaMoE runners for throughput.
 
 K3 **always runs with thinking enabled**, with reasoning depth controlled by `reasoning_effort` (`low` / `high` / `max`; default `max`).
 
@@ -85,7 +185,7 @@ are pending (greyed until a verified cell lands).
 
 - `--mamba-radix-cache-strategy extra_buffer_lazy` — drops the per-request slot count (S 5→4), ~+25% concurrency at no accuracy cost (used by the High-Throughput recipe).
 - `--mamba-ssm-dtype bfloat16` — roughly doubles state slots (halves the SSM part); accuracy A/B is workload-gated, so it stays a Playground opt-in.
-- `--kv-cache-dtype fp8_e4m3` — the main long-context KV lever (~1.6×); accuracy-gated.
+- `--kv-cache-dtype fp8_e4m3` — the main long-context KV lever (~1.6×); GSM8K 200q held `0.990` in the GB300 throughput recipe, but re-verify on this B300 path.
 
 Raising `--mem-fraction-static` toward `0.90–0.92` when the boot log shows a large idle `Memory pool end. avail mem` is the cheapest first win.
 

@@ -251,6 +251,71 @@ export const config = {
 
   cells: [
     // ====================================================================
+    // B300 — single node, TP8, MXFP4 Marlin (W4A16), trtllm_mla decode.
+    // From benchmark/B300/script/v1/launch-k3.sh (commit d70f59487).
+    // Keep the verified Balanced cell first: it is the command panel default.
+    // ====================================================================
+    {
+      match: { hw: "b300", variant: "default", quant: "mxfp4", strategy: "balanced", nodes: "single" },
+      verified: true,
+      env: [
+        "SGLANG_MM_FEATURE_CACHE_MB=1024",
+      ],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
+        "--context-length 131072",
+        "--moe-runner-backend marlin",
+        "--decode-attention-backend trtllm_mla",
+        "--enable-symm-mem",
+        "--mem-fraction-static 0.85",
+        "--cuda-graph-max-bs 128",
+        "--mm-feature-transport cuda_ipc",
+        "--mm-processor-worker-num 2",
+        "--mm-io-worker-num 16",
+        "--skip-server-warmup",
+        "--reasoning-parser kimi_k3",
+        "--tool-call-parser kimi_k3",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      // Low-latency: balanced recipe + DSPARK/MTP speculative decoding (γ=7).
+      // MTP has not yet completed a B300 serving benchmark round, so this cell
+      // remains unverified.
+      match: { hw: "b300", variant: "default", quant: "mxfp4", strategy: "low-latency", nodes: "single" },
+      verified: false,
+      env: [
+        "SGLANG_MM_FEATURE_CACHE_MB=1024",
+      ],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
+        "--context-length 131072",
+        "--moe-runner-backend marlin",
+        "--decode-attention-backend trtllm_mla",
+        "--speculative-algorithm DSPARK",
+        "--speculative-draft-model-path moonshotai/Kimi-K3-DSpark",
+        "--speculative-dspark-block-size 7",
+        "--speculative-draft-attention-backend flashinfer",
+        "--enable-symm-mem",
+        "--mem-fraction-static 0.85",
+        "--cuda-graph-max-bs 128",
+        "--mm-feature-transport cuda_ipc",
+        "--mm-processor-worker-num 2",
+        "--mm-io-worker-num 16",
+        "--skip-server-warmup",
+        "--reasoning-parser kimi_k3",
+        "--tool-call-parser kimi_k3",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+
+    // ====================================================================
     // H200 — 2×8, TP16/EP16, MXFP4 Marlin, flashmla decode. From
     // benchmark/H200/script/v1/launch-k3.sh (commit 0dc8b030d).
     // Same block runs on both ranks; NIC + host-IP env go in multiNodeHints.
@@ -340,61 +405,6 @@ export const config = {
         "--mamba-full-memory-ratio 0.9",
         "--mamba-radix-cache-strategy extra_buffer_lazy",
         "--cuda-graph-max-bs 256",
-        "--reasoning-parser kimi_k3",
-        "--tool-call-parser kimi_k3",
-        "--host {{HOST_IP}}",
-        "--port {{PORT}}",
-      ],
-    },
-
-    // ====================================================================
-    // B300 — single node, TP8, MXFP4 Marlin (W4A16), trtllm_mla decode.
-    // From benchmark/B300/script/v1/launch-k3.sh (commit d70f59487).
-    // Accuracy-first: no dtype/precision knobs touched (bf16 KV / fp32 ssm).
-    // ====================================================================
-    {
-      // Low-latency: balanced recipe + DSPARK/MTP speculative decoding (γ=7). Draft-
-      // attention flashinfer is the current correctness path. NOT yet benchmarked as a
-      // serving round on B300 (the E02 sweep was NOSPEC) → unverified.
-      match: { hw: "b300", variant: "default", quant: "mxfp4", strategy: "low-latency", nodes: "single" },
-      verified: false,
-      env: [],
-      flags: [
-        "--trust-remote-code",
-        "--model-path {{MODEL_NAME}}",
-        "--tp 8",
-        "--context-length 131072",
-        "--moe-runner-backend marlin",
-        "--decode-attention-backend trtllm_mla",
-        "--speculative-algorithm DSPARK",
-        "--speculative-draft-model-path moonshotai/Kimi-K3-DSpark",
-        "--speculative-dspark-block-size 7",
-        "--speculative-draft-attention-backend flashinfer",
-        "--enable-symm-mem",
-        "--mem-fraction-static 0.85",
-        "--cuda-graph-max-bs 128",
-        "--skip-server-warmup",
-        "--reasoning-parser kimi_k3",
-        "--tool-call-parser kimi_k3",
-        "--host {{HOST_IP}}",
-        "--port {{PORT}}",
-      ],
-    },
-    {
-      match: { hw: "b300", variant: "default", quant: "mxfp4", strategy: "balanced", nodes: "single" },
-      verified: true,
-      env: [],
-      flags: [
-        "--trust-remote-code",
-        "--model-path {{MODEL_NAME}}",
-        "--tp 8",
-        "--context-length 131072",
-        "--moe-runner-backend marlin",
-        "--decode-attention-backend trtllm_mla",
-        "--enable-symm-mem",
-        "--mem-fraction-static 0.85",
-        "--cuda-graph-max-bs 128",
-        "--skip-server-warmup",
         "--reasoning-parser kimi_k3",
         "--tool-call-parser kimi_k3",
         "--host {{HOST_IP}}",
