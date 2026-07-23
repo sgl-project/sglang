@@ -43,7 +43,7 @@ if TYPE_CHECKING:
 if _is_cuda:
     from sgl_kernel import merge_state_v2
 
-    from sglang.jit_kernel.concat_mla import concat_mla_k
+    from sglang.kernels.ops.attention.concat_mla import concat_mla_k
 elif _is_musa:
     from sgl_kernel import concat_mla_k
 

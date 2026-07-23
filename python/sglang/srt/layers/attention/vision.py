@@ -12,7 +12,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
-from sglang.jit_kernel.norm import can_use_fused_inplace_qknorm as can_use_jit_qk_norm
+from sglang.kernels.ops.layernorm._jit_norm import (
+    can_use_fused_inplace_qknorm as can_use_jit_qk_norm,
+)
 from sglang.srt.environ import envs
 from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.runtime_context import get_parallel
@@ -46,11 +48,11 @@ _is_xpu = is_xpu()
 if _is_cuda:
     from flashinfer.prefill import cudnn_batch_prefill_with_kv_cache
 
-    from sglang.jit_kernel.flash_attention import flash_attn_varlen_func
+    from sglang.kernels.ops.attention.flash_attention import flash_attn_varlen_func
 
     def flash_attn_func(*args, ver: int = 3, **kwargs):
         if ver == 4:
-            from sglang.jit_kernel.flash_attention_v4 import (
+            from sglang.kernels.ops.attention.flash_attention_v4 import (
                 flash_attn_varlen_func as flash_attn_varlen_func_fa4,
             )
 
@@ -803,11 +805,11 @@ class VisionAscendAttention(nn.Module):
              [b * s, h, head_size]
         """
         if forward_metadata is not None:
-            seq_lens = forward_metadata.seq_lens
-            if seq_lens.is_npu:
-                seq_lens = seq_lens.to("cpu")
+            # TND fused attention expects cumulative seqlens (cu_seqlens[1:]),
+            # not per-sequence lengths in forward_metadata.seq_lens.
+            cu = forward_metadata.cu_seqlens.to("cpu")
             output = torch.empty_like(q)
-            seq_len_arg = seq_lens.to(torch.int32)
+            seq_len_arg = cu[1:].to(torch.int32)
         elif envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get():
             if "output_ws" not in kwargs:
                 raise RuntimeError("output_ws should be prepared for npu-graph mode")

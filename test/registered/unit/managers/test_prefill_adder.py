@@ -22,6 +22,20 @@ register_amd_ci(est_time=2, suite="stage-b-test-1-gpu-small-amd")
 register_cpu_ci(est_time=8, suite="base-c-test-cpu")
 
 
+class _RecordingDelayer:
+    """Duck-typed stand-in for PrefillDelayerSinglePassExecutor that records
+    the local_prefillable value of every negotiate call and returns a fixed
+    verdict."""
+
+    def __init__(self, allow: bool):
+        self.allow = allow
+        self.calls = []
+
+    def negotiate_should_allow_prefill(self, local_prefillable, **kwargs):
+        self.calls.append(local_prefillable)
+        return self.allow
+
+
 class TestPrefillAdder(CustomTestCase):
     def setUp(self):
         set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
@@ -536,6 +550,131 @@ class TestPrefillAdder(CustomTestCase):
                     rem_chunk_tokens=rem_chunk,
                 )
                 self.assertEqual(adder._swa_budget_for_req(extend), expected)
+
+    def test_delayer_not_consulted_when_kv_budget_rejects(self):
+        """A rank whose first candidate fails the KV-budget gate must NOT
+        report local_prefillable=True: add_one_req returns NO_TOKEN before
+        negotiating, and finalize() later reports the rank as not
+        prefillable. Regression guard: the negotiate used to run at the top
+        of add_one_req, so under KV pressure a full rank still claimed
+        prefillable=True, the delayer saw "all prefillable" and allowed, the
+        full ranks then NO_TOKEN'ed out, and the DP-synced forward mixed
+        prefill and decode — the exact pattern the delayer exists to
+        prevent."""
+        delayer = _RecordingDelayer(allow=True)
+        adder = self._create_delayer_adder(available_tokens=10, delayer=delayer)
+
+        result = adder.add_one_req(
+            self._create_delayer_req(50),
+            has_chunked_req=False,
+            truncation_align_size=None,
+        )
+
+        self.assertEqual(result, AddReqResult.NO_TOKEN)
+        self.assertEqual(delayer.calls, [])
+        self.assertEqual(adder.can_run_list, [])
+
+    def test_delayer_not_consulted_when_post_lock_recheck_rejects(self):
+        """Locking the request's own prefix converts evictable tokens into
+        protected ones, so a request can pass the pre-lock KV gate yet fail
+        the post-lock recheck — precisely the high-utilization regime the
+        delayer targets. The negotiate must sit after that recheck too, or
+        the rank claims prefillable=True and then runs decode."""
+        delayer = _RecordingDelayer(allow=True)
+        adder = self._create_delayer_adder(available_tokens=10, delayer=delayer)
+        # Pre-lock budget is covered by evictable tokens; inc_lock_ref pins
+        # them (evictable -> protected), shrinking the budget below demand.
+        self.mock_tree_cache.evictable_size.return_value = 1000
+        self.mock_tree_cache.full_evictable_size.return_value = 1000
+
+        def _pin_prefix(node):
+            self.mock_tree_cache.evictable_size.return_value = 0
+            self.mock_tree_cache.full_evictable_size.return_value = 0
+            return IncLockRefResult()
+
+        self.mock_tree_cache.inc_lock_ref.side_effect = _pin_prefix
+
+        result = adder.add_one_req(
+            self._create_delayer_req(50),
+            has_chunked_req=False,
+            truncation_align_size=None,
+        )
+
+        self.assertEqual(result, AddReqResult.NO_TOKEN)
+        self.assertEqual(delayer.calls, [])
+        self.assertEqual(adder.can_run_list, [])
+
+    def test_delay_verdict_blocks_admissible_request(self):
+        """An admissible request must still be gated by the (relocated)
+        negotiate: on a delay verdict it is not admitted, and the rank
+        reported prefillable=True exactly once."""
+        delayer = _RecordingDelayer(allow=False)
+        adder = self._create_delayer_adder(available_tokens=100_000, delayer=delayer)
+
+        result = adder.add_one_req(
+            self._create_delayer_req(50),
+            has_chunked_req=False,
+            truncation_align_size=None,
+        )
+
+        self.assertEqual(result, AddReqResult.OTHER)
+        self.assertEqual(delayer.calls, [True])
+        self.assertEqual(adder.can_run_list, [])
+
+    def test_allow_verdict_admits_request(self):
+        """On an allow verdict the request proceeds through admission — the
+        relocated negotiate must not block the commit path."""
+        delayer = _RecordingDelayer(allow=True)
+        adder = self._create_delayer_adder(available_tokens=100_000, delayer=delayer)
+        req = self._create_delayer_req(50)
+
+        result = adder.add_one_req(
+            req, has_chunked_req=False, truncation_align_size=None
+        )
+
+        self.assertEqual(result, AddReqResult.CONTINUE)
+        self.assertEqual(delayer.calls, [True])
+        self.assertIn(req, adder.can_run_list)
+
+    def test_chunked_req_negotiates_prefillable_and_proceeds(self):
+        """A rank resuming a chunked prefill runs it this pass regardless of
+        the verdict, so add_chunked_req must report prefillable=True (else a
+        rank with an empty waiting queue reports False via finalize() and
+        peers delay while it prefills alone) and must not drop the chunk on
+        a delay verdict (that would leak memory)."""
+        delayer = _RecordingDelayer(allow=False)
+        adder = self._create_delayer_adder(
+            available_tokens=100_000, delayer=delayer, rem_chunk_tokens=500
+        )
+        req = self._create_delayer_req(200)
+
+        result = adder.add_chunked_req(req)
+
+        self.assertIsNone(result)  # chunk fully admitted, not truncated
+        self.assertEqual(delayer.calls, [True])
+        self.assertIn(req, adder.can_run_list)
+
+    def _create_delayer_adder(self, *, available_tokens, delayer, **kwargs):
+        self.mock_token_allocator.available_size.return_value = available_tokens
+        self.mock_token_allocator.full_available_size.return_value = available_tokens
+        return self.create_adder(
+            self.create_running_batch(),
+            prefill_delayer_single_pass=delayer,
+            **kwargs,
+        )
+
+    def _create_delayer_req(self, num_tokens: int):
+        req = self.create_mock_req("delayer_req", priority=0, max_new_tokens=8)
+        req.full_untruncated_fill_ids = list(range(num_tokens))
+        req.host_hit_length = 0
+        req.last_node = MagicMock()
+        req.sampling_params.ignore_eos = False
+        req.set_extend_range = MagicMock(
+            side_effect=lambda start, end: setattr(
+                req, "extend_range", Range(start, end)
+            )
+        )
+        return req
 
     def test_add_chunked_req_non_hybrid_no_swa_reservation(self):
         # Non-hybrid path: the SWA-pool reservation must NOT apply, otherwise
