@@ -76,7 +76,7 @@ class SamplingParams(msgspec.Struct, kw_only=True, omit_defaults=True):
     """
     The sampling parameters.
 
-    See docs_new/docs/basic_usage/sampling_params.mdx
+    See docs/docs/basic_usage/sampling_params.mdx
     for the documentation.
     """
 

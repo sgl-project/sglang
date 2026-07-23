@@ -37,7 +37,7 @@ repos:
         args:
           - --select=F401,F821,UP037
           - --fix
-        files: ^(benchmark/|docs_new/|examples/|python/sglang/|sgl-model-gateway/py_*|test/)
+        files: ^(benchmark/|docs/|examples/|python/sglang/|sgl-model-gateway/py_*|test/)
         exclude: |
           (?x)^(
           .*/__init__\.py$|
@@ -72,6 +72,16 @@ repos:
           - '--extra-keys=metadata.kernelspec metadata.language_info.version'
   - repo: local
     hooks:
+      - id: forbid-docs-new-path
+        name: forbid docs_new/ (renamed to docs/)
+        # docs_new/ was renamed to docs/ in #32123. `language: fail` fires only
+        # when a staged path matches `files:` below, then prints the offending
+        # paths — no shell/merge-base logic, so none of the shallow-checkout or
+        # silent-diff pitfalls of the old legacy-docs/ gate apply here.
+        entry: >-
+          docs_new/ was renamed to docs/. Move these changes under docs/ instead.
+        language: fail
+        files: ^docs_new/
       - id: check-chinese-characters
         name: check chinese characters in multimodal_gen
         entry: >-
@@ -118,8 +128,8 @@ repos:
         files: ^experimental/sgl-router/.*\.rs$
         pass_filenames: false
       - id: mint-broken-links
-        name: check docs_new links (Mintlify; opt-in, requires `mint` on PATH)
-        entry: bash -c 'cd docs_new && mint broken-links --check-anchors --check-redirects'
+        name: check docs links (Mintlify; opt-in, requires `mint` on PATH)
+        entry: bash -c 'cd docs && mint broken-links --check-anchors --check-redirects'
         language: system
         pass_filenames: false
         always_run: true

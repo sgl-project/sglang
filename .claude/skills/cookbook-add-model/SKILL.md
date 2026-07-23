@@ -1,6 +1,6 @@
 ---
 name: cookbook-add-model
-description: Add a new model to the SGLang Cookbook (docs_new/, Mintlify), config-driven format — instantiate the model-agnostic template into a per-model config (+ benchmarks) JSX under src/snippets/configs/, an MDX page, the docs.json nav entry, NEW-tag hygiene, and the homepage vendor card. Interactive, multi-phase. Run with /cookbook-add-model.
+description: Add a new model to the SGLang Cookbook (docs/, Mintlify), config-driven format — instantiate the model-agnostic template into a per-model config (+ benchmarks) JSX under src/snippets/configs/, an MDX page, the docs.json nav entry, NEW-tag hygiene, and the homepage vendor card. Interactive, multi-phase. Run with /cookbook-add-model.
 disable-model-invocation: true
 ---
 
@@ -12,16 +12,16 @@ disable-model-invocation: true
 > page (not the user) is the source of truth.
 
 The cookbook is **config-driven**: two shared engines contain NO model-specific code —
-`docs_new/src/snippets/_deployment.jsx` (the 5-dim deploy matrix) and
+`docs/src/snippets/_deployment.jsx` (the 5-dim deploy matrix) and
 `_playground.jsx` (the diff-based override Playground). Adding a model = adding **data**:
 a per-model `config` (+ optional `benchmarks`) consumed by both engines, plus an MDX page
 that imports them. No engine edits.
 
 **Instantiate the model-agnostic template** (NOT a clone of any live cookbook — the
 template is decoupled and covers all hardware + all axes):
-- `templates/config.jsx.tmpl` → `docs_new/src/snippets/configs/<hf-org>/<model-slug>.jsx`
+- `templates/config.jsx.tmpl` → `docs/src/snippets/configs/<hf-org>/<model-slug>.jsx`
 - `templates/benchmarks.jsx.tmpl` → `…/<model-slug>-benchmarks.jsx` (skip if no numbers)
-- `templates/page.mdx.tmpl` → `docs_new/cookbook/<category>/<Vendor>/<ModelName>.mdx`
+- `templates/page.mdx.tmpl` → `docs/cookbook/<category>/<Vendor>/<ModelName>.mdx`
 
 The template uses explicit `__TOKEN__` placeholders; you fill them, prune what the model
 lacks, and replace the EXAMPLE cells with verified recipes. DeepSeek-V4 is a populated
@@ -154,26 +154,26 @@ this table (RTX PRO 6000, GH200, future chips) goes in the model's own `config.h
 
 ### Site-wiring (do all three)
 
-- **`docs_new/docs.json`** — add the page under Cookbook → `<category>` → `<Vendor>`, at
+- **`docs/docs.json`** — add the page under Cookbook → `<category>` → `<Vendor>`, at
   the **top** of that vendor's `pages` (root-relative, no `.mdx`:
   `cookbook/<category>/<Vendor>/<Model>`). New vendor group → insert in the section's
   local ordering.
 - **NEW-tag hygiene** — the new page keeps `tag: NEW` (from the template). Scan the
   vendor dir for existing NEW and strip it from siblings; verify ≤1:
-  `grep -rn 'tag: NEW' docs_new/cookbook/<category>/<Vendor>/` → at most one result. (Scan
+  `grep -rn 'tag: NEW' docs/cookbook/<category>/<Vendor>/` → at most one result. (Scan
   files; don't assume the first `docs.json` entry holds NEW.)
-- **Homepage card** — `docs_new/cookbook/<category>/intro.mdx`: if the org already has a
+- **Homepage card** — `docs/cookbook/<category>/intro.mdx`: if the org already has a
   `<Card>`, update only its `href` (keep `img`). If the org is **new**, add a `<Card>`
   (title = nav-group name; keep card order aligned with `docs.json`) **and create its logo**:
   ask the user for the brand logo, then generate the conforming **icon-only 940×525 RGBA
-  transparent** PNG → `docs_new/cards/logos/<org-slug>.png` per
+  transparent** PNG → `docs/cards/logos/<org-slug>.png` per
   [references/vendor-logo.md](references/vendor-logo.md) (track with `git add -f` — `*.png`
   is gitignored repo-wide). Never invent or copy a logo.
 
 ## Phase 3 — Validate
 
 ```bash
-cd docs_new
+cd docs
 mint validate        # frontmatter, missing nav entries, MDX/JSX errors
 mint broken-links
 mint dev             # visual smoke test at http://localhost:3000/cookbook/<category>/<Vendor>/<Model>
@@ -216,10 +216,10 @@ Always branch — never commit to main directly.
 
 ```bash
 git checkout -b add-<model>-cookbook
-git add docs_new/src/snippets/configs/<hf-org>/<slug>.jsx \
-        docs_new/src/snippets/configs/<hf-org>/<slug>-benchmarks.jsx \
-        docs_new/cookbook/<category>/<Vendor>/<Model>.mdx \
-        docs_new/docs.json docs_new/cookbook/<category>/intro.mdx
+git add docs/src/snippets/configs/<hf-org>/<slug>.jsx \
+        docs/src/snippets/configs/<hf-org>/<slug>-benchmarks.jsx \
+        docs/cookbook/<category>/<Vendor>/<Model>.mdx \
+        docs/docs.json docs/cookbook/<category>/intro.mdx
 git commit -m "Add <Display-Name> cookbook"
 git push -u origin add-<model>-cookbook
 gh pr create --title "Add <Display-Name> cookbook" --body "..."

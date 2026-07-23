@@ -13,6 +13,22 @@ jobs:
         with:
           fetch-depth: 0
 
+      # Fail-fast gate: docs_new/ was renamed to docs/ (#32123). git's rename
+      # detection silently re-adds NEW files under docs_new/ on merge without a
+      # conflict, which would resurrect the directory. We check the checked-out
+      # tree directly (git ls-files) rather than diffing against the base ref —
+      # a presence check needs no merge-base and sidesteps the shallow-checkout
+      # / silent-diff failures that plagued the old legacy-docs/ gate.
+      - name: Forbid docs_new/ (renamed to docs/)
+        run: |
+          set -euo pipefail
+          matches="$(git ls-files -- docs_new)"
+          if [ -n "$matches" ]; then
+            echo "::error::docs_new/ was renamed to docs/. Move these files under docs/ instead:"
+            echo "$matches"
+            exit 1
+          fi
+
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
@@ -31,7 +47,7 @@ jobs:
         with:
           args: --config .github/linters/lychee.toml README.md
 
-      # docs_new/ (Mintlify) internal-link check. Runs only in CI — contributors
+      # docs/ (Mintlify) internal-link check. Runs only in CI — contributors
       # are NOT required to install `mint` for local pre-commit. External links
       # are covered separately by the nightly lychee job (no --check-external here).
       - name: Set up Node
@@ -39,13 +55,13 @@ jobs:
         with:
           node-version: "20"
 
-      # Hard gate: docs_new internal links/anchors/redirects must resolve.
+      # Hard gate: docs internal links/anchors/redirects must resolve.
       # mint is pinned for reproducibility (its heading-slug rules are
       # version-sensitive); bump deliberately after re-verifying locally.
-      - name: Check docs_new links (Mintlify broken-links)
+      - name: Check docs links (Mintlify broken-links)
         run: |
           npm install -g mint@4.2.559
-          cd docs_new
+          cd docs
           mint broken-links --check-anchors --check-redirects
 
       - name: Run sgl-kernel clang-format checks
