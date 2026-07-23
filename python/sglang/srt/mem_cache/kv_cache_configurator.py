@@ -234,6 +234,35 @@ class KVCacheConfigurator:
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
         )
 
+        swa_max_total_num_tokens = sizes.swa_max_total_num_tokens
+        # Unified-KV DSV4: SWA is a fixed per-request ring, so the allocator
+        # reports ring capacity (free_req_slots * ring_cost) from
+        # swa_available_size(), while swa_max_total_num_tokens was sized from
+        # the (vestigial, unallocated) full_token-scaled SWA pool. The idle
+        # pool-leak invariant requires swa total == swa available, so
+        # reconcile the reported SWA total to the allocator's actual idle ring
+        # capacity. Safe: on unified_kv swa_kv_pool is None, so no real buffer
+        # is resized -- this only fixes token accounting / usage reporting.
+        if (
+            self.is_hybrid_swa
+            and not self.is_draft_worker
+            and getattr(pools.token_to_kv_pool, "_unified_kv", False)
+        ):
+            alloc = pools.token_to_kv_pool_allocator
+            if hasattr(alloc, "swa_available_size"):
+                ring_capacity = int(alloc.swa_available_size())
+                # Only reconcile downward to the (smaller) ring capacity. A
+                # value >= the current total means swa_available_size() hit a
+                # non-binding fallback (e.g. req_to_token pool not wired), in
+                # which case leave the reported total untouched.
+                if 0 < ring_capacity < swa_max_total_num_tokens:
+                    logger.info(
+                        "Unified-KV: reconciling swa_max_total_num_tokens "
+                        f"{swa_max_total_num_tokens} -> {ring_capacity} "
+                        "(fixed per-request SWA ring capacity)."
+                    )
+                    swa_max_total_num_tokens = ring_capacity
+
         logger.info(
             f"Memory pool end. "
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
@@ -243,7 +272,7 @@ class KVCacheConfigurator:
             max_total_num_tokens=sizes.max_total_num_tokens,
             max_running_requests=sizes.max_running_requests,
             full_max_total_num_tokens=sizes.full_max_total_num_tokens,
-            swa_max_total_num_tokens=sizes.swa_max_total_num_tokens,
+            swa_max_total_num_tokens=swa_max_total_num_tokens,
             req_to_token_pool=pools.req_to_token_pool,
             token_to_kv_pool=pools.token_to_kv_pool,
             token_to_kv_pool_allocator=pools.token_to_kv_pool_allocator,
