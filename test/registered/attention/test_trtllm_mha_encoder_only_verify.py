@@ -1,13 +1,11 @@
 """Verify-window semantics of trtllm-gen for the DFlash/DSpark draft block.
 
-Two pins against a paged SDPA reference:
-
-1. The spec-decode call (``q_len_per_req = L``) is CAUSAL inside the verify
-   window -- correct for target verify, wrong for the ENCODER_ONLY draft
-   block, which is trained with bidirectional intra-block attention.
-2. The expanded formulation (bs*L single-token rows, kv length = prefix + L)
-   matches the full-window (bidirectional) reference. This is what
-   TRTLLMHAAttnBackend runs for ENCODER_ONLY layers on the draft worker.
+Two pins against a paged SDPA reference: the spec-decode call
+(``q_len_per_req = L``) is causal inside the window (wrong for the
+ENCODER_ONLY draft block, trained bidirectional), and the expanded
+formulation (bs*L single-token rows, kv length = prefix + L) matches the
+full-window reference -- what TRTLLMHAAttnBackend runs for ENCODER_ONLY
+layers on the draft worker.
 """
 
 import math

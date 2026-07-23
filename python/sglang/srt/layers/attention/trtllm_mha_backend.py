@@ -78,11 +78,9 @@ class TRTLLMMHAMetadata:
     # full->SWA translated out_cache_loc (SWA KV-store write target)
     swa_out_cache_loc: torch.Tensor = None
     is_ragged_verify: bool = False
-    # ENCODER_ONLY target-verify (DFlash/DSpark draft block): the block is
-    # trained with bidirectional intra-block attention, but the trtllm-gen
-    # spec-decode kernel is causal inside the verify window. These expand the
-    # batch to bs*L single-token decode rows whose kv length spans the whole
-    # window, so the plain decode kernel yields full-window attention per row.
+    # ENCODER_ONLY target-verify (DFlash/DSpark draft block): bs*L single-token
+    # decode rows whose kv length spans the whole window, so each block token
+    # attends prefix + the full block despite the causal decode kernel.
     encoder_cache_seqlens: torch.Tensor = None
     encoder_page_table: torch.Tensor = None
     encoder_row_map: torch.Tensor = None
@@ -167,11 +165,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         self.speculative_num_draft_tokens = (
             model_runner.server_args.speculative_num_draft_tokens
         )
-        # DFlash/DSpark draft layers declare ENCODER_ONLY: the draft block is
-        # trained with bidirectional intra-block attention. Only their draft
-        # worker runs TARGET_VERIFY over such layers, so gate the expanded
-        # metadata (see TRTLLMMHAMetadata.encoder_*) on it; target workers and
-        # eagle-family draft workers (decode-only) pay nothing.
+        # DFlash/DSpark draft blocks are ENCODER_ONLY (trained bidirectional);
+        # only their draft worker runs TARGET_VERIFY over such layers, so the
+        # expanded metadata (TRTLLMMHAMetadata.encoder_*) is gated on it.
         self.expand_encoder_only_verify = bool(
             model_runner.is_draft_worker
             and model_runner.server_args.speculative_algorithm in ("DSPARK", "DFLASH")
@@ -547,9 +543,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             )
             if self.expand_encoder_only_verify and not metadata.is_ragged_verify:
                 verify_rows = bs * metadata.max_seq_len_q
-                # Static per-capture row map: expanded row i mirrors request
-                # i // L. The recorded body in _apply_cuda_graph_metadata
-                # refreshes the expanded buffers through it on every replay.
+                # Static per-capture row map (expanded row i -> request i // L);
+                # the recorded refresh in _apply_cuda_graph_metadata uses it.
                 metadata.encoder_row_map = (
                     torch.arange(verify_rows, device=self.device)
                     // metadata.max_seq_len_q
@@ -683,8 +678,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             and forward_mode.is_target_verify()
             and metadata.encoder_row_map is not None
         ):
-            # Recorded into the CUDA graph: refresh the expanded single-token
-            # rows from the base metadata the fused kernel just rebuilt.
+            # Recorded into the graph: refresh the expanded rows from the
+            # freshly rebuilt base metadata.
             metadata.encoder_cache_seqlens.copy_(
                 metadata.cache_seqlens_int32[metadata.encoder_row_map]
             )
@@ -1187,12 +1182,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 forward_batch.forward_mode.is_target_verify()
                 and layer.attn_type == AttentionType.ENCODER_ONLY
             ):
-                # DFlash/DSpark draft block: trained with bidirectional
-                # intra-block attention; the spec-decode kernel below is causal
-                # inside the window. Run bs*L single-token decode rows whose kv
-                # length covers the whole window instead (the block K/V were
-                # written to the pool above, so every row sees prefix + the
-                # full block).
+                # ENCODER_ONLY draft block needs bidirectional intra-block
+                # attention; the spec-decode kernel is causal in-window, so run
+                # bs*L single-token rows over the full window instead (block
+                # K/V are already in the pool).
                 assert not self.forward_metadata.is_ragged_verify, (
                     "ENCODER_ONLY target_verify does not support ragged "
                     "verify layouts"
