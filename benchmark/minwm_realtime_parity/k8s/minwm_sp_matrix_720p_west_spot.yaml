@@ -1,14 +1,14 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: minwm-spmatrix720p-h200-west-20260723-25
+  name: minwm-spmatrix720p-h100-west-20260723-26
   namespace: default
   labels:
-    app.kubernetes.io/name: minwm-spmatrix720p-h200-west-20260723-25
+    app.kubernetes.io/name: minwm-spmatrix720p-h100-west-20260723-26
     seedleap.ai/owner: chenshengdong
     seedleap.ai/purpose: minwm-sp-parity-perf
     seedleap.ai/task: minwm-realtime-parity
-    seedleap.ai/run-id: latest-ckpt-v20-spmatrix720p-attempt25-west-h200-spot
+    seedleap.ai/run-id: latest-ckpt-v20-spmatrix720p-attempt26-west-h100-spot
   annotations:
     seedleap.ai/capacity-type: spot
     seedleap.ai/repo: seedleap/sglang
@@ -27,11 +27,11 @@ spec:
   template:
     metadata:
       labels:
-        app.kubernetes.io/name: minwm-spmatrix720p-h200-west-20260723-25
+        app.kubernetes.io/name: minwm-spmatrix720p-h100-west-20260723-26
         seedleap.ai/owner: chenshengdong
         seedleap.ai/purpose: minwm-sp-parity-perf
         seedleap.ai/task: minwm-realtime-parity
-        seedleap.ai/run-id: latest-ckpt-v20-spmatrix720p-attempt25-west-h200-spot
+        seedleap.ai/run-id: latest-ckpt-v20-spmatrix720p-attempt26-west-h100-spot
       annotations:
         seedleap.ai/repo: seedleap/sglang
         seedleap.ai/branch: codex/minwm-realtime-api
@@ -47,8 +47,8 @@ spec:
           effect: NoSchedule
       nodeSelector:
         eks.amazonaws.com/capacityType: SPOT
-        eks.amazonaws.com/nodegroup: minwm-spot-p5e-h200-sglang-0718
-        node.kubernetes.io/instance-type: p5e.48xlarge
+        eks.amazonaws.com/nodegroup: minwm-spot-p5-h100-sglang-0718
+        node.kubernetes.io/instance-type: p5.48xlarge
         seedleap.ai/workload: wan22-ti2v
       containers:
         - name: benchmark
@@ -69,7 +69,7 @@ spec:
             - name: MINWM_BENCHMARK_MODE
               value: spmatrix720p
             - name: MINWM_RUN_ID
-              value: latest-ckpt-v20-spmatrix720p-attempt25-west-h200-spot
+              value: latest-ckpt-v20-spmatrix720p-attempt26-west-h100-spot
             - name: MINWM_SP_WARMUP_RUNS
               value: "1"
             - name: MINWM_STAGE_FROM_MOUNT
