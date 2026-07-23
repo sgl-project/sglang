@@ -19,17 +19,162 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=9, suite="stage-b-test-1-gpu-small-amd")
 
+import ast
 import types
 import unittest
 import unittest.mock as mock
+from enum import Enum
+from pathlib import Path
 
 import torch
 
-from sglang.srt.lora.mem_pool import (
-    LoRAMemoryPool,
-    _get_moe_ep_context,
-    _get_moe_tp_context,
+from sglang.srt.lora.eviction_policy import get_eviction_policy
+
+REPO_ROOT = Path(__file__).resolve().parents[4]
+MOE_UTILS_PATH = REPO_ROOT / "python/sglang/srt/layers/moe/utils.py"
+STANDARD_DISPATCHER_PATH = (
+    REPO_ROOT / "python/sglang/srt/layers/moe/token_dispatcher/standard.py"
 )
+
+
+class _FakeBaseLayerWithLoRA:
+    pass
+
+
+class _FakeFusedMoEWithLoRA(_FakeBaseLayerWithLoRA):
+    pass
+
+
+_LORA_LAYERS_STUB = types.ModuleType("sglang.srt.lora.layers")
+_LORA_LAYERS_STUB.BaseLayerWithLoRA = _FakeBaseLayerWithLoRA
+_LORA_LAYERS_STUB.FusedMoEWithLoRA = _FakeFusedMoEWithLoRA
+_LORA_ADAPTER_STUB = types.ModuleType("sglang.srt.lora.lora")
+_LORA_ADAPTER_STUB.LoRAAdapter = object
+with mock.patch.dict(
+    "sys.modules",
+    {
+        "sglang.srt.lora.layers": _LORA_LAYERS_STUB,
+        "sglang.srt.lora.lora": _LORA_ADAPTER_STUB,
+    },
+):
+    import sglang.srt.lora.mem_pool as mem_pool_module
+    from sglang.srt.lora.mem_pool import (
+        EMPTY_SLOT,
+        LoRAMemoryPool,
+        _get_moe_ep_context,
+        _get_moe_tp_context,
+        _moe_runner_keeps_global_expert_ids,
+    )
+
+
+class _IdentityMoeSlices:
+    def slice_moe_lora_a_weights(self, weights, _rank, _target):
+        return weights
+
+    def slice_moe_lora_b_weights(self, weights, _rank, _target):
+        return weights
+
+
+class _FakeSharedMoeLayer(_IdentityMoeSlices):
+    is_shared_fused_moe = True
+
+    def __init__(self, tp_rank: int = 0):
+        self.moe_tp_rank = tp_rank
+
+
+class _FakeRoutedMoeLayer(_FakeFusedMoEWithLoRA, _IdentityMoeSlices):
+    def __init__(self, tp_rank: int = 0):
+        object.__setattr__(
+            self,
+            "base_layer",
+            types.SimpleNamespace(
+                moe_tp_rank=tp_rank,
+                is_shared_fused_moe=False,
+            ),
+        )
+
+    def slice_moe_lora_a_weights(self, weights, _rank, _target):
+        return weights
+
+    def slice_moe_lora_b_weights(self, weights, _rank, _target):
+        return weights
+
+
+class _FakeDenseLayer:
+    def slice_lora_a_weights(self, weights, _rank):
+        return weights
+
+    def slice_lora_b_weights(self, weights, _rank):
+        return weights
+
+
+def _load_lora_weight_to_buffer(pool, **kwargs):
+    with mock.patch.dict("sys.modules", {"sglang.srt.lora.layers": _LORA_LAYERS_STUB}):
+        return pool.load_lora_weight_to_buffer(**kwargs)
+
+
+def _load_moe_backend_enum():
+    tree = ast.parse(MOE_UTILS_PATH.read_text())
+    backend = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "MoeRunnerBackend"
+    )
+    namespace = {"Enum": Enum}
+    exec(
+        compile(
+            ast.fix_missing_locations(ast.Module(body=[backend], type_ignores=[])),
+            str(MOE_UTILS_PATH),
+            "exec",
+        ),
+        namespace,
+    )
+    return namespace[backend.name]
+
+
+def _load_standard_dispatcher(get_parallel, get_backend):
+    tree = ast.parse(STANDARD_DISPATCHER_PATH.read_text())
+    source = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "StandardDispatcher"
+    )
+    init = next(
+        node
+        for node in source.body
+        if isinstance(node, ast.FunctionDef) and node.name == "__init__"
+    )
+
+    class _DispatcherBase:
+        def __init__(self):
+            pass
+
+    test_class = ast.ClassDef(
+        name="_StandardDispatcherUnderTest",
+        bases=[ast.Name(id="_DispatcherBase", ctx=ast.Load())],
+        keywords=[],
+        body=[init],
+        decorator_list=[],
+    )
+    namespace = {
+        "_DispatcherBase": _DispatcherBase,
+        "MoeRunnerConfig": object,
+        "get_parallel": get_parallel,
+        "get_moe_runner_backend": get_backend,
+        "_use_aiter": False,
+        "get_moe_a2a_backend": lambda: types.SimpleNamespace(
+            supports_aiter=lambda: False
+        ),
+    }
+    exec(
+        compile(
+            ast.fix_missing_locations(ast.Module(body=[test_class], type_ignores=[])),
+            str(STANDARD_DISPATCHER_PATH),
+            "exec",
+        ),
+        namespace,
+    )
+    return namespace[test_class.name]
 
 
 def _make_pool(
@@ -58,6 +203,159 @@ def _make_pool(
     else:
         pool._num_experts_local = num_experts_global
     return pool
+
+
+class _IterationOrderedSet(set):
+    def __init__(self, values, iteration_order):
+        super().__init__(values)
+        self.iteration_order = iteration_order
+
+    def __iter__(self):
+        return iter(self.iteration_order)
+
+
+class TestDeterministicPoolSlots(unittest.TestCase):
+    @staticmethod
+    def _prepare(iteration_order):
+        pool = LoRAMemoryPool.__new__(LoRAMemoryPool)
+        pool.max_loras_per_batch = 4
+        pool.uid_to_buffer_id = {}
+        pool.buffer_id_to_uid = [EMPTY_SLOT] * 4
+        pool.eviction_policy = get_eviction_policy("lru")
+        loaded = []
+        pool.load_lora_weight_to_buffer = lambda uid, slot, *_args: loaded.append(
+            (uid, slot)
+        )
+        uids = _IterationOrderedSet(
+            {None, "adapter-a", "adapter-b", "adapter-c"}, iteration_order
+        )
+
+        pool.prepare_lora_batch(
+            cur_uids=uids,
+            lora_adapters={},
+            lora_modules=[],
+            lora_refs={},
+            lora_embed_tokens_module=None,
+            lora_lm_head_module=None,
+        )
+        return loaded, list(pool.eviction_policy.access_order)
+
+    def test_uid_iteration_order_does_not_change_slots_or_lru(self):
+        forward = [None, "adapter-a", "adapter-b", "adapter-c"]
+        reverse = list(reversed(forward))
+        expected = (
+            [
+                (None, 0),
+                ("adapter-a", 1),
+                ("adapter-b", 2),
+                ("adapter-c", 3),
+            ],
+            ["adapter-a", "adapter-b", "adapter-c"],
+        )
+
+        self.assertEqual(self._prepare(forward), expected)
+        self.assertEqual(self._prepare(reverse), expected)
+
+    @staticmethod
+    def _evict_after_touch(iteration_order):
+        pool = LoRAMemoryPool.__new__(LoRAMemoryPool)
+        pool.max_loras_per_batch = 4
+        pool.uid_to_buffer_id = {
+            None: 0,
+            "adapter-a": 1,
+            "adapter-b": 2,
+            "adapter-c": 3,
+        }
+        pool.buffer_id_to_uid = [None, "adapter-a", "adapter-b", "adapter-c"]
+        pool.eviction_policy = get_eviction_policy("lru")
+        for uid in ("adapter-a", "adapter-b", "adapter-c"):
+            pool.eviction_policy.mark_used(uid)
+        pool.load_lora_weight_to_buffer = lambda *_args: None
+        common = dict(
+            lora_adapters={},
+            lora_modules=[],
+            lora_refs={},
+            lora_embed_tokens_module=None,
+            lora_lm_head_module=None,
+        )
+
+        pool.prepare_lora_batch(
+            cur_uids=_IterationOrderedSet(
+                {"adapter-a", "adapter-b", "adapter-c"}, iteration_order
+            ),
+            **common,
+        )
+        pool.prepare_lora_batch(cur_uids={"adapter-d"}, **common)
+        return pool.uid_to_buffer_id, list(pool.eviction_policy.access_order)
+
+    def test_uid_iteration_order_does_not_change_next_lru_victim(self):
+        forward = ["adapter-a", "adapter-b", "adapter-c"]
+        reverse = list(reversed(forward))
+        expected = (
+            {None: 0, "adapter-d": 1, "adapter-b": 2, "adapter-c": 3},
+            ["adapter-b", "adapter-c", "adapter-d"],
+        )
+
+        self.assertEqual(self._evict_after_touch(forward), expected)
+        self.assertEqual(self._evict_after_touch(reverse), expected)
+
+
+class TestBufferSlotClearing(unittest.TestCase):
+    @staticmethod
+    def _buffers(pool):
+        layered = [
+            tensor
+            for buffers in (*pool.A_buffer.values(), *pool.B_buffer.values())
+            for tensor in buffers
+        ]
+        direct = [
+            tensor
+            for buffers in (
+                pool.embedding_A_buffer,
+                pool.embedding_B_buffer,
+                pool.lm_head_A_buffer,
+                pool.lm_head_B_buffer,
+                pool.new_embeddings_buffer,
+            )
+            for tensor in buffers.values()
+        ]
+        return layered + direct
+
+    @classmethod
+    def _make_pool(cls):
+        pool = LoRAMemoryPool.__new__(LoRAMemoryPool)
+        pool.num_layer = 2
+        pool.A_buffer = {"a": [torch.ones(2, 1, 2) for _ in range(2)]}
+        pool.B_buffer = {"b": [torch.full((2, 1, 2), float("nan")) for _ in range(2)]}
+        pool.embedding_A_buffer = {"a": torch.ones(2, 1, 2)}
+        pool.embedding_B_buffer = {"b": torch.full((2, 1, 2), float("nan"))}
+        pool.lm_head_A_buffer = {"a": torch.ones(2, 1, 2)}
+        pool.lm_head_B_buffer = {"b": torch.full((2, 1, 2), float("inf"))}
+        pool.new_embeddings_buffer = {"embeddings": torch.full((2, 1, 2), float("nan"))}
+        for tensor in cls._buffers(pool):
+            tensor[1].fill_(7)
+
+        pool.uid_to_buffer_id = {"adapter": 0}
+        pool.buffer_id_to_uid = ["adapter", "other"]
+        pool.eviction_policy = get_eviction_policy("lru")
+        pool.eviction_policy.mark_used("adapter")
+        return pool
+
+    def test_remove_lora_clears_slot_in_place_and_residency(self):
+        pool = self._make_pool()
+        tensors = self._buffers(pool)
+        pointers = [tensor.data_ptr() for tensor in tensors]
+
+        self.assertEqual(pool.remove_lora("adapter"), 0)
+
+        for tensor, pointer in zip(tensors, pointers):
+            torch.testing.assert_close(tensor[0], torch.zeros_like(tensor[0]))
+            torch.testing.assert_close(tensor[1], torch.full_like(tensor[1], 7))
+            self.assertTrue(torch.isfinite(tensor).all())
+            self.assertEqual(tensor.data_ptr(), pointer)
+        self.assertNotIn("adapter", pool.uid_to_buffer_id)
+        self.assertIs(pool.buffer_id_to_uid[0], EMPTY_SLOT)
+        self.assertNotIn("adapter", pool.eviction_policy.access_order)
 
 
 def _make_fake_base_model(num_experts: int) -> torch.nn.Module:
@@ -338,6 +636,251 @@ class TestIterLocalExpertWeightsTensor(unittest.TestCase):
             list(pool._iter_local_expert_weights(weights, "weights"))
 
 
+class TestSharedMoeProductionLoad(unittest.TestCase):
+    def test_unmarked_2d_shared_expert_uses_dense_buffers(self):
+        pool = _make_pool(
+            num_experts_global=8,
+            moe_ep_size=1,
+            moe_ep_rank=0,
+            moe_use_local_expert_ids=False,
+        )
+        pool.num_layer = 1
+        pool.tp_rank = 0
+        pool.max_lora_rank = 2
+        pool.target_modules = {"down_proj"}
+        pool.experts_shared_outer_loras = False
+        pool.strict_loading = True
+        pool.lora_added_tokens_size = 0
+        pool.pin_memory_available = False
+        pool.enable_lora_overlap_loading = False
+        pool.base_model = object()
+        pool.A_buffer = {
+            "down_proj": [torch.full((1, 2, 3), -1.0)],
+            "down_proj_shared_moe": [torch.full((1, 2, 2, 3), -7.0)],
+        }
+        pool.B_buffer = {
+            "down_proj": [torch.full((1, 5, 2), -1.0)],
+            "down_proj_shared_moe": [torch.full((1, 1, 5, 2), -7.0)],
+        }
+        pool.embedding_A_buffer = {}
+        pool.embedding_B_buffer = {}
+        pool.lm_head_A_buffer = {}
+        pool.lm_head_B_buffer = {}
+        pool.new_embeddings_buffer = {}
+
+        down_a = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+        down_b = torch.arange(10, dtype=torch.float32).reshape(5, 2)
+        adapter = types.SimpleNamespace(
+            config=types.SimpleNamespace(r=2),
+            scaling=2.5,
+            layers=[
+                types.SimpleNamespace(
+                    weights={
+                        "model.layers.0.mlp.shared_experts.down_proj.lora_A.weight": down_a,
+                        "model.layers.0.mlp.shared_experts.down_proj.lora_B.weight": down_b,
+                    },
+                    pinned_weights={},
+                )
+            ],
+            embedding_layers={},
+            added_tokens_embeddings={},
+        )
+
+        _load_lora_weight_to_buffer(
+            pool,
+            uid="dense-shared",
+            buffer_id=0,
+            lora_adapter=adapter,
+            lora_modules=[
+                {"model.layers.0.mlp.shared_experts.down_proj": _FakeDenseLayer()}
+            ],
+            lora_embed_tokens_module=None,
+            lora_lm_head_module=None,
+        )
+
+        torch.testing.assert_close(pool.A_buffer["down_proj"][0][0], down_a)
+        torch.testing.assert_close(pool.B_buffer["down_proj"][0][0], down_b)
+        self.assertTrue(torch.all(pool.A_buffer["down_proj_shared_moe"][0] == -7))
+        self.assertTrue(torch.all(pool.B_buffer["down_proj_shared_moe"][0] == -7))
+
+    def test_rank3_loads_shared_gate_b_and_down_a(self):
+        """Shared-sink weights stay replicated even on a nonzero EP rank."""
+        pool = _make_pool(
+            num_experts_global=256,
+            moe_ep_size=4,
+            moe_ep_rank=3,
+            moe_use_local_expert_ids=True,
+        )
+        pool.num_layer = 1
+        pool.max_lora_rank = 2
+        pool.target_modules = {"gate_up_proj", "down_proj"}
+        pool.experts_shared_outer_loras = True
+        pool.strict_loading = True
+        pool.lora_added_tokens_size = 0
+        pool.pin_memory_available = False
+        pool.enable_lora_overlap_loading = False
+        pool.base_model = object()
+        pool.A_buffer = {
+            "gate_up_proj": [torch.full((1, 4, 5), -7.0)],
+            "down_proj": [torch.full((1, 2, 3), -7.0)],
+            "gate_up_proj_shared_moe": [torch.full((1, 1, 4, 5), -1.0)],
+            "down_proj_shared_moe": [torch.full((1, 2, 2, 3), -1.0)],
+        }
+        pool.B_buffer = {
+            "gate_up_proj": [torch.full((1, 6, 2), -7.0)],
+            "down_proj": [torch.full((1, 5, 2), -7.0)],
+            "gate_up_proj_shared_moe": [torch.full((1, 2, 6, 2), -1.0)],
+            "down_proj_shared_moe": [torch.full((1, 1, 5, 2), -1.0)],
+        }
+        pool.embedding_A_buffer = {}
+        pool.embedding_B_buffer = {}
+        pool.lm_head_A_buffer = {}
+        pool.lm_head_B_buffer = {}
+        pool.new_embeddings_buffer = {}
+
+        gate_b = torch.arange(2 * 6 * 2, dtype=torch.float32).reshape(2, 6, 2)
+        down_a = torch.arange(2 * 2 * 3, dtype=torch.float32).reshape(2, 2, 3)
+        adapter = types.SimpleNamespace(
+            config=types.SimpleNamespace(r=2),
+            scaling=2.5,
+            layers=[
+                types.SimpleNamespace(
+                    weights={
+                        "model.layers.0.mlp.shared_experts.gate_up_proj.lora_B.weight": gate_b,
+                        "model.layers.0.mlp.shared_experts.down_proj.lora_A.weight": down_a,
+                    },
+                    pinned_weights={},
+                )
+            ],
+            embedding_layers={},
+            added_tokens_embeddings={},
+        )
+
+        shared_sink = _FakeSharedMoeLayer(tp_rank=1)
+
+        _load_lora_weight_to_buffer(
+            pool,
+            uid="shared",
+            buffer_id=0,
+            lora_adapter=adapter,
+            lora_modules=[{"shared_experts": shared_sink}],
+            lora_embed_tokens_module=None,
+            lora_lm_head_module=None,
+        )
+
+        torch.testing.assert_close(pool.A_buffer["down_proj_shared_moe"][0][0], down_a)
+        torch.testing.assert_close(
+            pool.B_buffer["gate_up_proj_shared_moe"][0][0], gate_b * adapter.scaling
+        )
+        self.assertTrue(torch.all(pool.A_buffer["down_proj"][0] == -7))
+        self.assertTrue(torch.all(pool.B_buffer["gate_up_proj"][0] == -7))
+
+        pool.A_buffer["down_proj_shared_moe"][0].fill_(-1)
+        pool.B_buffer["gate_up_proj_shared_moe"][0].fill_(-1)
+        adapter.layers[0].weights = {
+            **{
+                f"model.layers.0.mlp.shared_experts.{i}.gate_up_proj.lora_B.weight": gate_b[
+                    i
+                ]
+                for i in range(2)
+            },
+            **{
+                f"model.layers.0.mlp.shared_experts.{i}.down_proj.lora_A.weight": down_a[
+                    i
+                ]
+                for i in range(2)
+            },
+        }
+        _load_lora_weight_to_buffer(
+            pool,
+            uid="shared-named",
+            buffer_id=0,
+            lora_adapter=adapter,
+            lora_modules=[{"shared_experts": shared_sink}],
+            lora_embed_tokens_module=None,
+            lora_lm_head_module=None,
+        )
+        torch.testing.assert_close(pool.A_buffer["down_proj_shared_moe"][0][0], down_a)
+        torch.testing.assert_close(
+            pool.B_buffer["gate_up_proj_shared_moe"][0][0], gate_b * adapter.scaling
+        )
+
+    def test_missing_inner_factors_clear_reused_shared_and_routed_slots(self):
+        for suffix, expert_path in (
+            ("_shared_moe", "shared_experts"),
+            ("_moe", "experts"),
+        ):
+            with self.subTest(suffix=suffix):
+                pool = _make_pool(
+                    num_experts_global=2,
+                    moe_ep_size=1,
+                    moe_ep_rank=0,
+                    moe_use_local_expert_ids=False,
+                )
+                pool.num_layer = 1
+                pool.max_lora_rank = 2
+                pool.target_modules = {"gate_up_proj", "down_proj"}
+                pool.experts_shared_outer_loras = True
+                pool.strict_loading = True
+                pool.lora_added_tokens_size = 0
+                pool.pin_memory_available = False
+                pool.enable_lora_overlap_loading = False
+                pool.base_model = object()
+                pool.A_buffer = {
+                    f"gate_up_proj{suffix}": [torch.full((1, 1, 4, 5), -1.0)],
+                    f"down_proj{suffix}": [torch.full((1, 2, 2, 3), -1.0)],
+                }
+                pool.B_buffer = {
+                    f"gate_up_proj{suffix}": [torch.full((1, 2, 6, 2), -1.0)],
+                    f"down_proj{suffix}": [torch.full((1, 1, 5, 2), -1.0)],
+                }
+                pool.embedding_A_buffer = {}
+                pool.embedding_B_buffer = {}
+                pool.lm_head_A_buffer = {}
+                pool.lm_head_B_buffer = {}
+                pool.new_embeddings_buffer = {}
+
+                adapter = types.SimpleNamespace(
+                    config=types.SimpleNamespace(r=2),
+                    scaling=2.5,
+                    layers=[
+                        types.SimpleNamespace(
+                            weights={
+                                f"model.layers.0.mlp.{expert_path}.gate_up_proj."
+                                "lora_A.weight": torch.ones(1, 4, 5),
+                                f"model.layers.0.mlp.{expert_path}.down_proj."
+                                "lora_B.weight": torch.ones(1, 5, 2),
+                            },
+                            pinned_weights={},
+                        )
+                    ],
+                    embedding_layers={},
+                    added_tokens_embeddings={},
+                )
+                module = (
+                    _FakeSharedMoeLayer()
+                    if suffix == "_shared_moe"
+                    else _FakeRoutedMoeLayer()
+                )
+
+                _load_lora_weight_to_buffer(
+                    pool,
+                    uid="adapter",
+                    buffer_id=0,
+                    lora_adapter=adapter,
+                    lora_modules=[{"experts": module}],
+                    lora_embed_tokens_module=None,
+                    lora_lm_head_module=None,
+                )
+
+                self.assertEqual(
+                    torch.count_nonzero(pool.A_buffer[f"down_proj{suffix}"][0]), 0
+                )
+                self.assertEqual(
+                    torch.count_nonzero(pool.B_buffer[f"gate_up_proj{suffix}"][0]), 0
+                )
+
+
 class TestModuleLevelHelpers(unittest.TestCase):
     """`_get_moe_ep_context` / `_moe_runner_keeps_global_expert_ids`
     must degrade gracefully when the MoE EP group or runner backend is
@@ -356,6 +899,48 @@ class TestModuleLevelHelpers(unittest.TestCase):
         tp_size, tp_rank = _get_moe_tp_context()
         self.assertEqual(tp_size, 1)
         self.assertEqual(tp_rank, 0)
+
+    def test_keeps_global_expert_ids_defaults_to_false(self):
+        # Without a specific flashinfer backend selected, default is False.
+        self.assertFalse(_moe_runner_keeps_global_expert_ids())
+
+    def test_real_backend_predicate_matches_dispatcher_and_pool(self):
+        backends = _load_moe_backend_enum()
+        expected_global = {
+            backends.FLASHINFER_TRTLLM,
+            backends.EXPERIMENTAL_SGL_TRTLLM,
+            backends.FLASHINFER_TRTLLM_ROUTED,
+            backends.FLASHINFER_CUTLASS,
+            backends.FLASHINFER_MXFP4,
+            backends.FLASHINFER_CUTEDSL,
+        }
+        config = types.SimpleNamespace(
+            num_experts=8,
+            num_local_experts=2,
+            num_fused_shared_experts=0,
+        )
+        parallel = types.SimpleNamespace(moe_ep_size=4, moe_ep_rank=1)
+        state = types.SimpleNamespace(backend=None)
+        standard_dispatcher = _load_standard_dispatcher(
+            get_parallel=lambda: parallel,
+            get_backend=lambda: state.backend,
+        )
+        moe_utils = types.ModuleType("sglang.srt.layers.moe.utils")
+        moe_utils.get_moe_runner_backend = lambda: state.backend
+        for backend in backends:
+            state.backend = backend
+            with mock.patch.dict(
+                "sys.modules", {"sglang.srt.layers.moe.utils": moe_utils}
+            ):
+                dispatcher = standard_dispatcher(config)
+                self.assertEqual(
+                    dispatcher.skip_local_expert_mapping,
+                    backend in expected_global,
+                )
+                self.assertEqual(
+                    _moe_runner_keeps_global_expert_ids(),
+                    backend in expected_global,
+                )
 
 
 class TestPoolInitPicksUpEpContext(unittest.TestCase):
@@ -377,16 +962,19 @@ class TestPoolInitPicksUpEpContext(unittest.TestCase):
         `init_buffers` — we only care about the EP-context state.
         """
         with (
-            mock.patch(
-                "sglang.srt.lora.mem_pool._get_moe_ep_context",
+            mock.patch.object(
+                mem_pool_module,
+                "_get_moe_ep_context",
                 return_value=(ep_size, ep_rank),
             ),
-            mock.patch(
-                "sglang.srt.lora.mem_pool._get_moe_tp_context",
+            mock.patch.object(
+                mem_pool_module,
+                "_get_moe_tp_context",
                 return_value=(moe_tp_size, moe_tp_rank),
             ),
-            mock.patch(
-                "sglang.srt.lora.mem_pool._moe_runner_keeps_global_expert_ids",
+            mock.patch.object(
+                mem_pool_module,
+                "_moe_runner_keeps_global_expert_ids",
                 return_value=keeps_global,
             ),
             mock.patch.object(LoRAMemoryPool, "init_buffers", lambda self, _m: None),
@@ -655,8 +1243,6 @@ class TestLoadBufferPassesMoeTpRankToSlice(unittest.TestCase):
         shapes the test does not provide)."""
 
     def test_moe_tp_rank_used_for_slicing_when_ep_lt_tp(self):
-        from sglang.srt.lora.layers import FusedMoEWithLoRA
-
         # tp=4 ep=2 → moe_tp_size=2. Pick OUTER rank 3 so moe_tp_rank=1.
         # The two values differ; the bug would surface on this exact rank.
         pool = LoRAMemoryPool.__new__(LoRAMemoryPool)
@@ -689,64 +1275,65 @@ class TestLoadBufferPassesMoeTpRankToSlice(unittest.TestCase):
         pool.lm_head_B_buffer = {}
         pool.new_embeddings_buffer = {}
 
-        captured_ranks = []
+        moe_mod = _FakeRoutedMoeLayer(tp_rank=1)
 
-        moe_mod = mock.MagicMock(spec=FusedMoEWithLoRA)
+        for ab in ("A", "B"):
+            with self.subTest(ab=ab):
+                captured_ranks = []
 
-        def capture_a(weights, tp_rank, target_module):
-            captured_ranks.append(("A", target_module, tp_rank))
-            raise TestLoadBufferPassesMoeTpRankToSlice._StopAfterCapture()
+                def capture(weights, tp_rank, target_module):
+                    captured_ranks.append((ab, target_module, tp_rank))
+                    raise TestLoadBufferPassesMoeTpRankToSlice._StopAfterCapture()
 
-        def capture_b(weights, tp_rank, target_module):
-            captured_ranks.append(("B", target_module, tp_rank))
-            raise TestLoadBufferPassesMoeTpRankToSlice._StopAfterCapture()
+                moe_mod.slice_moe_lora_a_weights = (
+                    capture if ab == "A" else lambda weights, *_args: weights
+                )
+                moe_mod.slice_moe_lora_b_weights = (
+                    capture if ab == "B" else lambda weights, *_args: weights
+                )
 
-        moe_mod.slice_moe_lora_a_weights.side_effect = capture_a
-        moe_mod.slice_moe_lora_b_weights.side_effect = capture_b
+                # The per-expert key creates the A or B dictionary whose
+                # production call site invokes the matching MoE slicer.
+                adapter = mock.MagicMock()
+                adapter.config.r = 4
+                adapter.scaling = 1.0
+                adapter.embedding_layers = {}
+                adapter.added_tokens_embeddings = {}
+                adapter.layers = [
+                    types.SimpleNamespace(
+                        weights={
+                            f"model.layers.0.mlp.experts.0.gate_up_proj.lora_{ab}.weight": torch.zeros(
+                                8, 4
+                            ),
+                        },
+                        pinned_weights={},
+                    )
+                ]
 
-        # Adapter with one per-expert MoE LoRA-A weight. The expert regex
-        # `experts\.(\d+)\.` must match the key, which routes the weight
-        # into `temp_A_buffer["gate_up_proj_moe"]` — the dict shape that
-        # makes `temp_A_buffer.get("gate_up_proj_moe") is not None` true,
-        # which in turn triggers `slice_moe_lora_a_weights` (and the
-        # capture).
-        adapter = mock.MagicMock()
-        adapter.config.r = 4
-        adapter.scaling = 1.0
-        adapter.embedding_layers = {}
-        adapter.added_tokens_embeddings = {}
-        adapter.layers = [
-            types.SimpleNamespace(
-                weights={
-                    "model.layers.0.mlp.experts.0.gate_up_proj.lora_A.weight": (
-                        torch.zeros(8, 4)
-                    ),
-                },
-                pinned_weights={},
-            )
-        ]
+                with self.assertRaises(
+                    TestLoadBufferPassesMoeTpRankToSlice._StopAfterCapture
+                ):
+                    _load_lora_weight_to_buffer(
+                        pool,
+                        uid="test",
+                        buffer_id=0,
+                        lora_adapter=adapter,
+                        lora_modules=[{"mlp.experts": moe_mod}],
+                        lora_embed_tokens_module=None,
+                        lora_lm_head_module=None,
+                    )
 
-        with self.assertRaises(TestLoadBufferPassesMoeTpRankToSlice._StopAfterCapture):
-            pool.load_lora_weight_to_buffer(
-                uid="test",
-                buffer_id=0,
-                lora_adapter=adapter,
-                lora_modules=[{"mlp.experts": moe_mod}],
-                lora_embed_tokens_module=None,
-                lora_lm_head_module=None,
-            )
-
-        self.assertGreater(len(captured_ranks), 0, "slicing was never invoked")
-        for ab, target_module, rank in captured_ranks:
-            self.assertEqual(
-                rank,
-                pool.moe_tp_rank,
-                f"slice_moe_lora_{ab.lower()}_weights for {target_module} "
-                f"received rank={rank}; expected moe_tp_rank="
-                f"{pool.moe_tp_rank} (outer tp_rank is {pool.tp_rank}). "
-                "Passing the outer tp_rank slices past "
-                "intermediate_size_per_partition when ep_size < tp_size.",
-            )
+                self.assertEqual(len(captured_ranks), 1, "slicing was never invoked")
+                _, target_module, rank = captured_ranks[0]
+                self.assertEqual(
+                    rank,
+                    pool.moe_tp_rank,
+                    f"slice_moe_lora_{ab.lower()}_weights for {target_module} "
+                    f"received rank={rank}; expected moe_tp_rank="
+                    f"{pool.moe_tp_rank} (outer tp_rank is {pool.tp_rank}). "
+                    "Passing the outer tp_rank slices past "
+                    "intermediate_size_per_partition when ep_size < tp_size.",
+                )
 
 
 if __name__ == "__main__":

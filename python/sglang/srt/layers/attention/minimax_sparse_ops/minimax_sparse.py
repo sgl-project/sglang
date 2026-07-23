@@ -5,12 +5,20 @@ from typing import Callable, List, Optional, Tuple
 
 import torch
 
-from .common.index import topk_index_reduce
-from .common.utils import get_cu_seqblocks
-from .decode.flash_with_topk_idx import flash_decode_with_topk_idx
-from .decode.topk_sparse import flash_decode_with_gqa_share_sparse
-from .prefill.flash_with_topk_idx import flash_prefill_with_topk_index
-from .prefill.topk_sparse import flash_prefill_with_gqa_share_sparse
+from sglang.kernels.ops.attention.minimax_sparse.common.index import topk_index_reduce
+from sglang.kernels.ops.attention.minimax_sparse.common.utils import get_cu_seqblocks
+from sglang.kernels.ops.attention.minimax_sparse.decode.flash_with_topk_idx import (
+    flash_decode_with_topk_idx,
+)
+from sglang.kernels.ops.attention.minimax_sparse.decode.topk_sparse import (
+    flash_decode_with_gqa_share_sparse,
+)
+from sglang.kernels.ops.attention.minimax_sparse.prefill.flash_with_topk_idx import (
+    flash_prefill_with_topk_index,
+)
+from sglang.kernels.ops.attention.minimax_sparse.prefill.topk_sparse import (
+    flash_prefill_with_gqa_share_sparse,
+)
 
 logger = logging.getLogger(__name__)
 _msa_fallback_warned = False
