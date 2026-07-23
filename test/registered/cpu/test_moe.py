@@ -23,6 +23,7 @@ from utils import (
     factor_for_scale,
     fp8_max,
     fp8_min,
+    native_clamped_silu_fused_moe,
     native_fp8_fused_moe,
     precision,
     scaled_weight,
@@ -449,6 +450,69 @@ class TestFusedExperts:
         )
         atol = rtol = precision[torch_output.dtype]
         torch.testing.assert_close(torch_output, fused_output, atol=atol, rtol=rtol)
+
+    @pytest.mark.parametrize("M", [1, 16])
+    @pytest.mark.parametrize("N", [256])
+    @pytest.mark.parametrize("K", [512])
+    @pytest.mark.parametrize("E", [8])
+    @pytest.mark.parametrize("topk", [6])
+    @pytest.mark.parametrize("limit", [None, 10.0])
+    def test_mxfp4_moe_dsv4(self, M, N, K, E, topk, limit):
+        dtype = torch.bfloat16
+
+        a = torch.randn(M, K, dtype=dtype) / 10
+
+        w1_bf16 = torch.randn((E, 2 * N, K), dtype=dtype) / 10
+        w1q, w1s = MXFP4QuantizeUtil.quantize(w1_bf16)
+        w1s = w1s.reshape(E, 2 * N, K // 32)
+        w1dq = MXFP4QuantizeUtil.dequantize(w1q, dtype, w1s)
+
+        w2_bf16 = torch.randn((E, K, N), dtype=dtype) / 10
+        w2q, w2s = MXFP4QuantizeUtil.quantize(w2_bf16)
+        w2s = w2s.reshape(E, K, N // 32)
+        w2dq = MXFP4QuantizeUtil.dequantize(w2q, dtype, w2s)
+
+        score = torch.softmax(
+            torch.randn((M, E), dtype=dtype), dim=-1, dtype=torch.float32
+        )
+        topk_weight, topk_ids = torch.topk(score, topk)
+
+        if limit is None:
+            ref = native_fp8_fused_moe(
+                a, w1dq.float(), w2dq.float(), topk_weight, topk_ids, topk
+            )
+        else:
+            ref = native_clamped_silu_fused_moe(
+                a, w1dq.float(), w2dq.float(), topk_weight, topk_ids, topk, limit
+            )
+
+        w1 = kernel.convert_weight_packed(w1q)
+        w2 = kernel.convert_weight_packed(w2q)
+        w1s = kernel.convert_scale_packed(w1s)
+        w2s = kernel.convert_scale_packed(w2s)
+
+        out = kernel.fused_experts_cpu(
+            a,
+            w1,
+            w2,
+            topk_weight,
+            topk_ids.to(torch.int32),
+            False,  # inplace
+            CPUQuantMethod.MXFP4,
+            w1s,
+            w2s,
+            None,
+            None,
+            None,  # w1_zp, w2_zp, block_size
+            None,
+            None,  # w1_bias, w2_bias  (DSV4 has no bias)
+            None,  # gemm1_alpha       (2604B has no alpha)
+            limit,  # gemm1_clamp_limit (None for 2604; float for 2604B)
+            True,  # is_vnni
+        )
+
+        atol = rtol = precision[dtype]
+        torch.testing.assert_close(ref.bfloat16(), out, atol=atol, rtol=rtol)
 
     @pytest.mark.parametrize("M", [1, 6])
     @pytest.mark.parametrize("N", [512])
