@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import numpy.typing as npt
+import zmq
 
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.common.staging_handler import StagingTransferInfo
@@ -2571,6 +2572,7 @@ class NixlKVReceiver(CommonKVReceiver):
             logger.debug(
                 f"Fetched bootstrap info: {bootstrap_info} for engine rank: {self.kv_mgr.kv_args.engine_rank}"
             )
+            sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
             is_dummy = bootstrap_info["is_dummy"]
             logger.debug(
                 f"Sending to prefill server with bootstrap room {self.bootstrap_room} {is_dummy=}"
@@ -2582,22 +2584,28 @@ class NixlKVReceiver(CommonKVReceiver):
                 if not is_dummy and state_indices is not None
                 else b""
             )
-            if not self._send_multipart_or_fail(
-                bootstrap_info,
-                [
-                    GUARD,
-                    str(self.bootstrap_room).encode("ascii"),
-                    self.kv_mgr.local_ip.encode("ascii"),
-                    str(self.kv_mgr.rank_port).encode("ascii"),
-                    self.kv_mgr.agent.name.encode("ascii"),
-                    kv_indices.tobytes() if not is_dummy else b"",
-                    str(aux_index).encode("ascii"),
-                    str(self.required_dst_info_num).encode("ascii"),
-                    packed_state_indices,
-                    str(decode_prefix_len or 0).encode("ascii"),
-                ],
-                op_name="send_metadata",
-            ):
+            try:
+                with lock:
+                    sock.send_multipart(
+                        [
+                            GUARD,
+                            str(self.bootstrap_room).encode("ascii"),
+                            self.kv_mgr.local_ip.encode("ascii"),
+                            str(self.kv_mgr.rank_port).encode("ascii"),
+                            self.kv_mgr.agent.name.encode("ascii"),
+                            kv_indices.tobytes() if not is_dummy else b"",
+                            str(aux_index).encode("ascii"),
+                            str(self.required_dst_info_num).encode("ascii"),
+                            packed_state_indices,
+                            str(decode_prefix_len or 0).encode("ascii"),
+                        ]
+                    )
+            except zmq.ZMQError:
+                self.kv_mgr.record_failure(
+                    self.bootstrap_room,
+                    f"send_metadata to prefill {bootstrap_info.get('rank_ip')}:{bootstrap_info.get('rank_port')} failed",
+                )
+                self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
                 return
 
         # Mark that we expect state data if state_indices was provided.
@@ -2675,32 +2683,39 @@ class NixlKVReceiver(CommonKVReceiver):
                 // self.kv_mgr.kv_args.kv_item_lens[0]
             )
 
-            if not self._send_multipart_or_fail(
-                bootstrap_info,
-                [
-                    GUARD,
-                    "None".encode("ascii"),
-                    self.kv_mgr.local_ip.encode("ascii"),
-                    str(self.kv_mgr.rank_port).encode("ascii"),
-                    self.kv_mgr.agent.name.encode("ascii"),
-                    self.kv_mgr.agent.get_agent_metadata(),
-                    packed_kv_data_ptrs,
-                    packed_aux_data_ptrs,
-                    packed_state_data_ptrs,
-                    str(self.kv_mgr.kv_args.gpu_id).encode("ascii"),
-                    str(self.kv_mgr.attn_tp_size).encode("ascii"),
-                    str(self.kv_mgr.kv_args.engine_rank).encode("ascii"),
-                    str(self.kv_mgr.kv_args.kv_item_lens[0]).encode("ascii"),
-                    packed_state_item_lens,
-                    packed_state_dim_per_tensor,
-                    packed_staging_base_ptr,
-                    staging_total_size_str,
-                    str(dst_num_slots).encode("ascii"),
-                    packed_kv_data_mem_kinds,
-                    packed_kv_item_lens,
-                ],
-                op_name="_register_kv_args",
-            ):
+            sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
+            try:
+                with lock:
+                    sock.send_multipart(
+                        [
+                            GUARD,
+                            "None".encode("ascii"),
+                            self.kv_mgr.local_ip.encode("ascii"),
+                            str(self.kv_mgr.rank_port).encode("ascii"),
+                            self.kv_mgr.agent.name.encode("ascii"),
+                            self.kv_mgr.agent.get_agent_metadata(),
+                            packed_kv_data_ptrs,
+                            packed_aux_data_ptrs,
+                            packed_state_data_ptrs,
+                            str(self.kv_mgr.kv_args.gpu_id).encode("ascii"),
+                            str(self.kv_mgr.attn_tp_size).encode("ascii"),
+                            str(self.kv_mgr.kv_args.engine_rank).encode("ascii"),
+                            str(self.kv_mgr.kv_args.kv_item_lens[0]).encode("ascii"),
+                            packed_state_item_lens,
+                            packed_state_dim_per_tensor,
+                            packed_staging_base_ptr,
+                            staging_total_size_str,
+                            str(dst_num_slots).encode("ascii"),
+                            packed_kv_data_mem_kinds,
+                            packed_kv_item_lens,
+                        ]
+                    )
+            except zmq.ZMQError:
+                self.kv_mgr.record_failure(
+                    self.bootstrap_room,
+                    f"_register_kv_args to prefill {bootstrap_info.get('rank_ip')}:{bootstrap_info.get('rank_port')} failed",
+                )
+                self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
                 return
 
     def failure_exception(self):
