@@ -168,6 +168,10 @@ _INCREMENTAL_STREAMING_META_INFO_KEYS = (
 )
 
 
+class RequestAbortedError(RuntimeError):
+    status_code = 499
+
+
 @dataclasses.dataclass
 class ReqState:
     """Store the state a request."""
@@ -179,6 +183,7 @@ class ReqState:
 
     # For performance metrics
     time_stats: APIServerReqTimeStats
+    abort_requested: bool = False
     last_completion_tokens: int = 1
     ttft_observed: bool = False
 
@@ -445,6 +450,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def init_running_status(self):
         # Request states
         self.rid_to_state: Dict[str, ReqState] = {}
+        # Parallel sampling keeps one caller-visible logical RID per original
+        # prompt while the scheduler operates on separate prefix/sample RIDs.
+        self.logical_rid_to_child_rids: Dict[str, set[str]] = {}
+        self.child_rid_to_logical_rid: Dict[str, str] = {}
         self.event_loop = None
         self.asyncio_tasks = set()
 
@@ -625,6 +634,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         request: Optional[fastapi.Request] = None,
+        yield_scheduler_errors: bool = False,
     ):
         self.auto_create_handle_loop()
 
@@ -653,23 +663,34 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             async with self.is_pause_cond:
                 await self.is_pause_cond.wait_for(lambda: not self.is_pause)
+            self._raise_if_logical_request_aborted(obj)
 
             async with self.model_update_lock.reader_lock:
                 await self._validate_and_resolve_lora(obj)
+                self._raise_if_logical_request_aborted(obj)
 
                 # Tokenize the request and send it to the scheduler
                 if obj.is_single:
                     tokenized_obj = await self._tokenize_one_request(obj)
+                    self._raise_if_logical_rid_aborted(obj.rid)
                     state = self.rid_to_state[obj.rid]
                     if obj.return_prompt_token_ids:
                         state.prompt_token_ids = list(tokenized_obj.input_ids)
                     self._send_one_request(tokenized_obj)
-                    async for response in self._wait_one_response(obj, request):
+                    async for response in self._wait_one_response(
+                        obj,
+                        request,
+                        yield_scheduler_errors=yield_scheduler_errors,
+                    ):
                         yield response
                 else:
-                    async for response in self._handle_batch_request(obj, request):
+                    async for response in self._handle_batch_request(
+                        obj,
+                        request,
+                        yield_scheduler_errors=yield_scheduler_errors,
+                    ):
                         yield response
-        except Exception:
+        except BaseException:
             # _init_req_state created a rid_to_state entry per (sub-)request up
             # front. The normal remover is the scheduler-response path
             # (_handle_batch_output), so a failure *before* a request reaches the
@@ -677,7 +698,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # request -- would otherwise leak those entries forever. Drop any that
             # are still pending; entries already removed on the normal completion
             # path are left untouched (pop is a no-op).
-            self._discard_pending_req_states(obj)
+            is_parallel = (
+                isinstance(obj, GenerateReqInput)
+                and getattr(obj, "parallel_sample_num", 1) > 1
+            )
+            self._discard_pending_req_states(obj, abort_active_children=is_parallel)
             raise
 
     def _detect_input_format(
@@ -1440,6 +1465,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         out: dict,
         state: ReqState,
         is_stream: bool,
+        yield_scheduler_errors: bool = False,
     ) -> Optional[dict]:
         """Handle abort/error finish reasons from the scheduler.
 
@@ -1447,34 +1473,50 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         for normal flow. Raises ValueError or HTTPException for non-stream aborts.
         """
         finish_reason = out["meta_info"]["finish_reason"]
+        status_code = finish_reason.get("status_code")
 
         if (
             finish_reason.get("type") == "abort"
-            and finish_reason.get("status_code") == HTTPStatus.BAD_REQUEST
+            and status_code == HTTPStatus.BAD_REQUEST
         ):
             if not is_stream:
+                if yield_scheduler_errors:
+                    return out
                 raise ValueError(finish_reason["message"])
             return out
 
-        if finish_reason.get("type") == "abort" and finish_reason.get(
-            "status_code"
-        ) in (
+        if finish_reason.get("type") == "abort" and status_code in (
             HTTPStatus.SERVICE_UNAVAILABLE,
             HTTPStatus.INTERNAL_SERVER_ERROR,
         ):
             # Delete the key to prevent resending abort request to the scheduler and
             # to ensure aborted request state is cleaned up.
             if state.obj.rid in self.rid_to_state:
-                del self.rid_to_state[state.obj.rid]
+                self._remove_req_state(state.obj.rid)
 
             # Mark ongoing LoRA request as finished.
             if self.enable_lora and state.obj.lora_path:
                 await self.lora_registry.release(state.obj.lora_id)
             if not is_stream:
+                if yield_scheduler_errors:
+                    return out
                 raise fastapi.HTTPException(
-                    status_code=finish_reason["status_code"],
+                    status_code=status_code,
                     detail=finish_reason["message"],
                 )
+            return out
+
+        if (
+            yield_scheduler_errors
+            and not is_stream
+            and finish_reason.get("type") == "error"
+            and status_code
+            in (
+                HTTPStatus.BAD_REQUEST,
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                HTTPStatus.SERVICE_UNAVAILABLE,
+            )
+        ):
             return out
 
         return None
@@ -1483,6 +1525,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         request: Optional[fastapi.Request] = None,
+        yield_scheduler_errors: bool = False,
     ):
         """Wait for the response of one request."""
         state = self.rid_to_state[obj.rid]
@@ -1540,9 +1583,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 # Record response sent time right before we log finished results and metrics.
                 if not state.time_stats.response_sent_to_client_time:
                     state.time_stats.set_response_sent_to_client_time()
-                    out["meta_info"][
-                        "response_sent_to_client_ts"
-                    ] = state.time_stats.get_response_sent_to_client_realtime()
+                    out["meta_info"]["response_sent_to_client_ts"] = (
+                        state.time_stats.get_response_sent_to_client_realtime()
+                    )
                 self.request_logger.log_finished_request(
                     obj,
                     out,
@@ -1557,7 +1600,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 # Check if this was an abort/error created by scheduler
                 if isinstance(out["meta_info"].get("finish_reason"), dict):
                     abort_out = await self._handle_abort_finish_reason(
-                        out, state, is_stream
+                        out,
+                        state,
+                        is_stream,
+                        yield_scheduler_errors=yield_scheduler_errors,
                     )
                     if abort_out is not None:
                         yield abort_out
@@ -1570,9 +1616,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 # Record response sent time right before we send response.
                 if not state.time_stats.response_sent_to_client_time:
                     state.time_stats.set_response_sent_to_client_time()
-                    out["meta_info"][
-                        "response_sent_to_client_ts"
-                    ] = state.time_stats.get_response_sent_to_client_realtime()
+                    out["meta_info"]["response_sent_to_client_ts"] = (
+                        state.time_stats.get_response_sent_to_client_realtime()
+                    )
                 yield out
             else:
                 if (
@@ -1591,6 +1637,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         request: Optional[fastapi.Request] = None,
+        yield_scheduler_errors: bool = False,
     ):
         batch_size = obj.batch_size
 
@@ -1599,6 +1646,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if getattr(obj, "parallel_sample_num", 1) == 1:
             if self._should_use_batch_tokenization(batch_size, obj):
                 tokenized_objs = await self._batch_tokenize_and_process(batch_size, obj)
+                self._raise_if_logical_request_aborted(obj)
                 self._send_batch_request(tokenized_objs)
 
                 # Set up generators for each request in the batch
@@ -1607,7 +1655,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     state = self.rid_to_state[tmp_obj.rid]
                     if tmp_obj.return_prompt_token_ids:
                         state.prompt_token_ids = list(tokenized_objs[i].input_ids)
-                    generators.append(self._wait_one_response(tmp_obj, request))
+                    generators.append(
+                        self._wait_one_response(
+                            tmp_obj,
+                            request,
+                            yield_scheduler_errors=yield_scheduler_errors,
+                        )
+                    )
                     rids.append(tmp_obj.rid)
             else:
                 # Sequential tokenization and processing
@@ -1621,11 +1675,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     for i in range(batch_size):
                         tmp_obj = obj[i]
                         tokenized_obj = await self._tokenize_one_request(tmp_obj)
+                        self._raise_if_logical_rid_aborted(tmp_obj.rid)
                         state = self.rid_to_state[tmp_obj.rid]
                         if tmp_obj.return_prompt_token_ids:
                             state.prompt_token_ids = list(tokenized_obj.input_ids)
                         self._send_one_request(tokenized_obj)
-                        generators.append(self._wait_one_response(tmp_obj, request))
+                        generators.append(
+                            self._wait_one_response(
+                                tmp_obj,
+                                request,
+                                yield_scheduler_errors=yield_scheduler_errors,
+                            )
+                        )
                         rids.append(tmp_obj.rid)
         else:
             # FIXME: When using batch and parallel_sample_num together, the perf is not optimal.
@@ -1641,9 +1702,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             tokenized_objs = await asyncio.gather(
                 *(self._tokenize_one_request(obj) for obj in objs)
             )
+            self._raise_if_logical_request_aborted(obj)
 
             # Cache the common prefix for parallel sampling
             for i in range(batch_size):
+                logical_rid = objs[i].rid
+                self._raise_if_logical_rid_aborted(logical_rid)
                 tmp_obj = copy.copy(objs[i])
                 tokenized_obj = copy.copy(tokenized_objs[i])
                 # Ensure independent mm_items so wrap_shm_features won't mutate the original
@@ -1656,13 +1720,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 tokenized_obj.sampling_params = copy.copy(tokenized_obj.sampling_params)
                 tokenized_obj.sampling_params.max_new_tokens = 0
                 tokenized_obj.stream = False
-                self._init_req_state(tmp_obj)
+                self._init_child_req_state(logical_rid, tmp_obj)
                 self._send_one_request(tokenized_obj)
+                # This hidden max_new_tokens=0 request is not a caller-visible
+                # choice, so keep legacy exception behavior for its failures.
                 await self._wait_one_response(tmp_obj, request).__anext__()
+                self._raise_if_logical_rid_aborted(logical_rid)
 
             # Expand requests, assign new rids for them, and send them
             for i in range(batch_size):
+                logical_rid = objs[i].rid
                 for _ in range(obj.parallel_sample_num):
+                    self._raise_if_logical_rid_aborted(logical_rid)
                     tmp_obj = copy.copy(objs[i])
                     tokenized_obj = copy.copy(tokenized_objs[i])
                     # Ensure independent mm_items so wrap_shm_features won't mutate the original
@@ -1672,17 +1741,25 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                             copy.copy(item) for item in tokenized_obj.mm_inputs.mm_items
                         ]
                     tokenized_obj.rid = tmp_obj.regenerate_rid()
-                    self._init_req_state(tmp_obj)
+                    self._init_child_req_state(logical_rid, tmp_obj)
                     state = self.rid_to_state[tmp_obj.rid]
                     tokenized_obj.time_stats = state.time_stats
                     if tmp_obj.return_prompt_token_ids:
                         state.prompt_token_ids = list(tokenized_objs[i].input_ids)
                     self._send_one_request(tokenized_obj)
-                    generators.append(self._wait_one_response(tmp_obj, request))
+                    generators.append(
+                        self._wait_one_response(
+                            tmp_obj,
+                            request,
+                            yield_scheduler_errors=yield_scheduler_errors,
+                        )
+                    )
                     rids.append(tmp_obj.rid)
 
-                self.rid_to_state[objs[i].rid].time_stats.set_finished_time()
-                del self.rid_to_state[objs[i].rid]
+                parent_state = self.rid_to_state.get(logical_rid)
+                if parent_state is not None:
+                    parent_state.time_stats.set_finished_time()
+                self._remove_req_state(logical_rid)
 
         # Wait for all requests
         is_stream = hasattr(obj, "stream") and obj.stream
@@ -1690,8 +1767,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             outputs = await asyncio.gather(*(gen.__anext__() for gen in generators))
             yield outputs
         else:
-            rid_to_index = {rid: i for i, rid in enumerate(rids)}
-            task_map = {asyncio.create_task(gen.__anext__()): gen for gen in generators}
+            async for response in self._stream_batch_responses(generators, rids):
+                yield response
+
+    async def _stream_batch_responses(self, generators, rids):
+        rid_to_index = {rid: i for i, rid in enumerate(rids)}
+        task_map = {asyncio.create_task(gen.__anext__()): gen for gen in generators}
+        try:
             while task_map:
                 done, _ = await asyncio.wait(
                     task_map.keys(), return_when=asyncio.FIRST_COMPLETED
@@ -1707,20 +1789,48 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         task_map[new_task] = gen
                     except StopAsyncIteration:
                         pass
+        finally:
+            pending_tasks = list(task_map)
+            for task in pending_tasks:
+                task.cancel()
+            if pending_tasks:
+                await asyncio.gather(*pending_tasks, return_exceptions=True)
+            await asyncio.gather(
+                *(gen.aclose() for gen in generators),
+                return_exceptions=True,
+            )
 
     def abort_request(self, rid: str = "", abort_all: bool = False):
         # Empty rid would startswith-match every request on the scheduler.
         if not abort_all and not rid:
             logger.warning("Ignore abort_request with empty rid and abort_all=False")
             return
-        if (
-            not abort_all
-            and self.server_args.tokenizer_worker_num == 1
-            and rid not in self.rid_to_state
-        ):
+        self._ensure_rid_lifecycle_state()
+        if abort_all:
+            for state_rid, state in self.rid_to_state.items():
+                if state_rid not in self.child_rid_to_logical_rid:
+                    state.abort_requested = True
+            target_rids = (rid,)
+        elif rid in self.child_rid_to_logical_rid:
+            # Preserve direct child aborts for internal callers.
+            target_rids = (rid,)
+        elif rid in self.rid_to_state:
+            state = self.rid_to_state[rid]
+            state.abort_requested = True
+            if getattr(state.obj, "parallel_sample_num", 1) > 1:
+                # Snapshot because scheduler abort echoes remove child ownership.
+                target_rids = tuple(sorted(self.logical_rid_to_child_rids.get(rid, ())))
+            else:
+                target_rids = (rid,)
+        elif child_rids := self.logical_rid_to_child_rids.get(rid):
+            target_rids = tuple(sorted(child_rids))
+        elif self.server_args.tokenizer_worker_num == 1:
             return
-        req = AbortReq(rid=rid, abort_all=abort_all)
-        self._dispatch_to_scheduler(req)
+        else:
+            target_rids = (rid,)
+
+        for target_rid in target_rids:
+            self._dispatch_to_scheduler(AbortReq(rid=target_rid, abort_all=abort_all))
         if self.enable_metrics:
             # TODO: also use custom_labels from the request
             self.metrics_collector.observe_one_aborted_request(
@@ -1771,9 +1881,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             self.model_update_lock.writer_lock if not is_paused else nullcontext()
         )
         async with lock_context:
-            success, message, num_paused_requests = (
-                await self._wait_for_model_update_from_disk(obj)
-            )
+            (
+                success,
+                message,
+                num_paused_requests,
+            ) = await self._wait_for_model_update_from_disk(obj)
 
         if success and obj.weight_version is not None:
             self._update_weight_version_if_provided(obj.weight_version)
@@ -2162,7 +2274,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         )
                     )
 
-                del self.rid_to_state[rid]
+                self._remove_req_state(rid)
 
                 # Mark ongoing LoRA request as finished.
                 if self.enable_lora and state.obj.lora_path:
@@ -2665,7 +2777,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 filename = os.path.join(
                     self.crash_dump_folder,
                     hostname,
-                    f'crash_dump_{datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}.pkl',
+                    f"crash_dump_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.pkl",
                 )
                 os.makedirs(os.path.dirname(filename), exist_ok=True)
 
@@ -2824,7 +2936,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             "output_ids": output_ids,
             "meta_info": meta_info,
         }
-        del self.rid_to_state[recv_obj.rid]
+        self._remove_req_state(recv_obj.rid)
 
         state.out_list.append(out)
         state.event.set()
@@ -2872,9 +2984,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 scale_phase=self.elastic_scale_phase,
             )
         self.auto_create_handle_loop()
-        responses: List[ScaleElasticEPReqOutput] = (
-            await self.scale_elastic_ep_communicator(obj)
-        )
+        responses: List[
+            ScaleElasticEPReqOutput
+        ] = await self.scale_elastic_ep_communicator(obj)
         for res in responses:
             if not res.success:
                 self.elastic_scale_phase = res.scale_phase
@@ -2980,6 +3092,69 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 obj.lora_id[i] if isinstance(obj.lora_id, list) else obj.lora_id
             )
 
+    def _ensure_rid_lifecycle_state(self) -> None:
+        # Some unit tests construct TokenizerManager with __new__.
+        if not hasattr(self, "logical_rid_to_child_rids"):
+            self.logical_rid_to_child_rids = {}
+        if not hasattr(self, "child_rid_to_logical_rid"):
+            self.child_rid_to_logical_rid = {}
+
+    @staticmethod
+    def _logical_rids(obj) -> List[str]:
+        if not hasattr(obj, "is_single") or obj.is_single:
+            return [obj.rid]
+        return list(obj.rid)
+
+    def _register_child_rid(self, logical_rid: str, child_rid: str) -> None:
+        self._ensure_rid_lifecycle_state()
+        if child_rid == logical_rid:
+            raise ValueError(
+                "Parallel-sampling child RID must differ from its logical RID"
+            )
+        owner = self.child_rid_to_logical_rid.get(child_rid)
+        if owner is not None and owner != logical_rid:
+            raise ValueError(
+                f"Request ID {child_rid} is already owned by logical request {owner}"
+            )
+        self.child_rid_to_logical_rid[child_rid] = logical_rid
+        self.logical_rid_to_child_rids.setdefault(logical_rid, set()).add(child_rid)
+
+    def _init_child_req_state(
+        self,
+        logical_rid: str,
+        obj: Union[GenerateReqInput, EmbeddingReqInput],
+        request: Optional[fastapi.Request] = None,
+    ) -> None:
+        self._raise_if_logical_rid_aborted(logical_rid)
+        self._init_req_state(obj, request)
+        try:
+            self._register_child_rid(logical_rid, obj.rid)
+        except BaseException:
+            self._remove_req_state(obj.rid)
+            raise
+
+    def _remove_req_state(self, rid: str) -> Optional[ReqState]:
+        """Remove a request state and its parallel-sampling ownership."""
+        self._ensure_rid_lifecycle_state()
+        state = self.rid_to_state.pop(rid, None)
+        logical_rid = self.child_rid_to_logical_rid.pop(rid, None)
+        if logical_rid is not None:
+            children = self.logical_rid_to_child_rids.get(logical_rid)
+            if children is not None:
+                children.discard(rid)
+                if not children:
+                    self.logical_rid_to_child_rids.pop(logical_rid, None)
+        return state
+
+    def _raise_if_logical_rid_aborted(self, logical_rid: str) -> None:
+        state = self.rid_to_state.get(logical_rid)
+        if state is not None and state.abort_requested:
+            raise RequestAbortedError(f"Request {logical_rid} was aborted")
+
+    def _raise_if_logical_request_aborted(self, obj) -> None:
+        for logical_rid in self._logical_rids(obj):
+            self._raise_if_logical_rid_aborted(logical_rid)
+
     def _init_req_state(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
@@ -3015,9 +3190,23 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 for i in range(len(obj.rid))
             ]
 
-        for rid, sub_obj, bootstrap_room in items:
-            if rid in self.rid_to_state:
+        self._ensure_rid_lifecycle_state()
+        rids = [rid for rid, _, _ in items]
+        seen_rids = set()
+        for rid in rids:
+            if rid in seen_rids:
                 raise ValueError(f"Duplicate request ID detected: {rid}")
+            seen_rids.add(rid)
+            if (
+                rid in self.rid_to_state
+                or rid in self.logical_rid_to_child_rids
+                or rid in self.child_rid_to_logical_rid
+            ):
+                raise ValueError(f"Duplicate request ID detected: {rid}")
+
+        # Mutate only after every RID passes duplicate validation so a rejected
+        # batch cannot leave a partial rid_to_state insertion behind.
+        for rid, sub_obj, bootstrap_room in items:
             time_stats = APIServerReqTimeStats(disagg_mode=self.disaggregation_mode)
             state = ReqState([], False, asyncio.Event(), sub_obj, time_stats)
             self.rid_to_state[rid] = state
@@ -3025,19 +3214,31 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 time_stats.init_trace_ctx(rid, bootstrap_room, external_trace_header)
             time_stats.set_created_time(created_time)
 
-    def _discard_pending_req_states(self, obj):
-        """Drop rid_to_state entries created by _init_req_state for *obj*.
+    def _discard_pending_req_states(self, obj, *, abort_active_children=False):
+        """Drop all logical and child state owned by *obj*.
 
         Safe to call after a partial/failed dispatch: only entries still present
         are removed, and the scheduler-response path looks up state with
         ``.get(...)`` so a later output for a discarded rid is ignored, not fatal.
         """
-        if not hasattr(obj, "is_single") or obj.is_single:
-            rids = [obj.rid]
-        else:
-            rids = obj.rid
-        for rid in rids:
-            self.rid_to_state.pop(rid, None)
+        self._ensure_rid_lifecycle_state()
+        for logical_rid in self._logical_rids(obj):
+            child_rids = tuple(self.logical_rid_to_child_rids.get(logical_rid, ()))
+            if abort_active_children:
+                for child_rid in child_rids:
+                    try:
+                        self._dispatch_to_scheduler(
+                            AbortReq(rid=child_rid, abort_all=False)
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Failed to abort parallel-sampling child rid=%s",
+                            child_rid,
+                        )
+            for child_rid in child_rids:
+                self._remove_req_state(child_rid)
+            self._remove_req_state(logical_rid)
+            self.logical_rid_to_child_rids.pop(logical_rid, None)
 
     def _should_dispatch_to_encoder(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput]
