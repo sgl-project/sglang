@@ -11,6 +11,57 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def validate_deepseek_v4_cp_mega_moe_token_budget(
+    server_args: ServerArgs,
+) -> None:
+    """Ensure the CP prefill token budget fits MegaMoE's per-rank buffer."""
+    mega_moe_enabled = (
+        server_args.moe_a2a_backend == "megamoe"
+        or envs.SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE.get()
+    )
+    if (
+        not server_args.enable_prefill_cp
+        or not mega_moe_enabled
+        or server_args.disaggregation_mode == "decode"
+    ):
+        return
+
+    if (
+        server_args.chunked_prefill_size is None
+        or server_args.chunked_prefill_size <= 0
+    ):
+        raise ValueError(
+            "DeepSeekV4 CP with MegaMoE requires chunked prefill to be enabled. "
+            "Set --chunked-prefill-size to a positive value; "
+            "--chunked-prefill-size=-1 is unsafe because MegaMoE's per-rank "
+            "token requirement would not have a strict prefill-forward bound."
+        )
+
+    cp_size = server_args.attn_cp_size
+    required_tokens_per_rank = (
+        server_args.chunked_prefill_size + cp_size - 1
+    ) // cp_size
+    max_tokens_per_rank = (
+        envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
+    )
+    if max_tokens_per_rank < required_tokens_per_rank:
+        raise ValueError(
+            "DeepSeekV4 CP with MegaMoE requires "
+            "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK to "
+            "cover each CP rank's effective prefill token budget. "
+            f"Current values: chunked_prefill_size="
+            f"{server_args.chunked_prefill_size}, attn_cp_size={cp_size}, "
+            f"required_per_rank={required_tokens_per_rank}, "
+            "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK="
+            f"{max_tokens_per_rank}. Set "
+            "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK to at "
+            f"least {required_tokens_per_rank}, or lower "
+            "--chunked-prefill-size to <= "
+            f"{max_tokens_per_rank * cp_size}. "
+            "Otherwise MegaMoE falls back to the fused MoE path at runtime."
+        )
+
+
 def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None:
     """Residual imperative arm of the DeepSeek V4 defaults.
 
@@ -91,6 +142,7 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
             "('none', 'deepep', 'megamoe'), "
             f"got {server_args.moe_a2a_backend!r}."
         )
+    validate_deepseek_v4_cp_mega_moe_token_budget(server_args)
     logger.warning(
         "Disabling SGLANG_OPT_FLASHMLA_SPARSE_PREFILL because DeepSeekV4 "
         "context parallelism is enabled."
