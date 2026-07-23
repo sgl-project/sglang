@@ -179,9 +179,9 @@ Thus, the total count is **3**.
 Setting `"enable_thinking": False` disables reasoning for Qwen3. Omitting the parameter follows the model's chat-template default; Qwen3 enables thinking by default. Qwen3-Thinking models always generate reasoning content and do not support the `enable_thinking` parameter.
 </Note>
 
-#### Set a Server-Wide Template Default
+#### Set a Default for OpenAI Chat Completions
 
-If most requests should use the same chat-template mode, set a default when launching the server:
+If most OpenAI chat-completion requests should use the same chat-template mode, set a default when launching the server:
 
 ```bash Command
 python -m sglang.launch_server \
@@ -190,11 +190,13 @@ python -m sglang.launch_server \
   --default-chat-template-kwargs '{"enable_thinking": false}'
 ```
 
-`--default-chat-template-kwargs` accepts a JSON object and merges it into each request's `chat_template_kwargs`. For each key, the precedence is:
+`--default-chat-template-kwargs` accepts a JSON object and merges it into each OpenAI chat-completion request's `chat_template_kwargs`. For ordinary template keys such as `enable_thinking`, the precedence is:
 
 1. An explicit value in the request's `chat_template_kwargs`
 2. The value in `--default-chat-template-kwargs`
 3. The model's chat-template default
+
+`reasoning_effort` follows a separate normalization path, so the precedence list above does not apply to it. Configure `reasoning_effort` in either the server defaults or individual requests, not both.
 
 The accepted keys are model-specific. For example, Qwen3 uses `enable_thinking`, while other model families may use `thinking` or may not expose a reasoning toggle. The reasoning parser controls how reasoning tokens are separated from the response; it does not by itself enable reasoning in the chat template.
 
