@@ -94,11 +94,20 @@ def _get_failure_prob() -> float:
 
 def _poll_with_failure_injection(pollers) -> List[int]:
     if (failure_prob := _get_failure_prob()) > 0:
-        return [
+        polls = [
             int(KVPoll.Failed) if random.random() < failure_prob else int(poller.poll())
             for poller in pollers
         ]
-    return [int(poller.poll()) for poller in pollers]
+    else:
+        polls = [int(poller.poll()) for poller in pollers]
+    return [
+        (
+            int(KVPoll.Failed)
+            if getattr(poller, "is_failure_quiescing", lambda: False)()
+            else poll
+        )
+        for poller, poll in zip(pollers, polls)
+    ]
 
 
 def _is_fake_transfer(req: Req, server_args: ServerArgs) -> bool:
@@ -126,6 +135,34 @@ def _apply_metadata_gate(polls, decode_reqs, metadata_buffers, server_args) -> N
                 polls[i] = int(KVPoll.Transferring)
 
 
+def _reduce_polls_with_quiescence(pollers, polls, groups):
+    poll_tensor = torch.tensor(polls, dtype=torch.uint8, device="cpu")
+    for group in groups:
+        dist.all_reduce(poll_tensor, op=dist.ReduceOp.MIN, group=group)
+
+    reduced_polls = poll_tensor.tolist()
+    failed = [poll == int(KVPoll.Failed) for poll in reduced_polls]
+    if not any(failed):
+        return reduced_polls
+
+    for poller, is_failed in zip(pollers, failed):
+        if is_failed:
+            poller.begin_failure_quiescence()
+
+    quiesced = [
+        int(not is_failed or poller.is_transfer_quiesced())
+        for poller, is_failed in zip(pollers, failed)
+    ]
+    quiesced_tensor = torch.tensor(quiesced, dtype=torch.uint8, device="cpu")
+    for group in groups:
+        dist.all_reduce(quiesced_tensor, op=dist.ReduceOp.MIN, group=group)
+
+    for i, is_failed in enumerate(failed):
+        if is_failed and not quiesced_tensor[i].item():
+            reduced_polls[i] = int(KVPoll.Transferring)
+    return reduced_polls
+
+
 def poll_and_all_reduce(
     pollers,
     gloo_group: dist.ProcessGroup,
@@ -143,9 +180,7 @@ def poll_and_all_reduce(
         and server_args is not None
     ):
         _apply_metadata_gate(polls, decode_reqs, metadata_buffers, server_args)
-    tensor_to_reduce = torch.tensor(polls, dtype=torch.uint8, device="cpu")
-    dist.all_reduce(tensor_to_reduce, op=dist.ReduceOp.MIN, group=gloo_group)
-    return tensor_to_reduce.tolist()
+    return _reduce_polls_with_quiescence(pollers, polls, [gloo_group])
 
 
 def poll_and_all_reduce_attn_cp_tp_group(
@@ -153,19 +188,12 @@ def poll_and_all_reduce_attn_cp_tp_group(
     attn_cp_cpu_group: dist.ProcessGroup,
     attn_tp_cpu_group: dist.ProcessGroup,
 ):
-    # First sync across attn-tp ranks so all TP participants for a given (dp, cp)
-    # shard observe the same status transitions.
-    polls = poll_and_all_reduce(pollers, attn_tp_cpu_group)
-
-    # Then sync across attn-cp ranks, so all TPxCP participants in one DP shard
-    # converge to the same global status.
-    tensor_to_reduce = torch.tensor(polls, dtype=torch.uint8, device="cpu")
-    dist.all_reduce(
-        tensor_to_reduce,
-        op=dist.ReduceOp.MIN,
-        group=attn_cp_cpu_group,
+    polls = _poll_with_failure_injection(pollers)
+    return _reduce_polls_with_quiescence(
+        pollers,
+        polls,
+        [attn_tp_cpu_group, attn_cp_cpu_group],
     )
-    return tensor_to_reduce.tolist()
 
 
 def poll_and_all_reduce_with_staging(
@@ -194,9 +222,13 @@ def poll_and_all_reduce_with_staging(
     # Apply metadata gate on the decode requests to downgrade Success → Transferring for requests whose metadata hasn't landed.
     if metadata_buffers is not None and server_args is not None:
         _apply_metadata_gate(raw_polls, decode_reqs, metadata_buffers, server_args)
-    poll_tensor = torch.tensor(raw_polls, dtype=torch.uint8, device="cpu")
-    dist.all_reduce(poll_tensor, op=dist.ReduceOp.MIN, group=gloo_group)
-    return poll_tensor.tolist()
+    return _reduce_polls_with_quiescence(receivers, raw_polls, [gloo_group])
+
+
+def defer_chunked_prefill_abort(req, inflight_queue) -> None:
+    req.disagg_kv_sender.abort()
+    if req not in inflight_queue:
+        inflight_queue.append(req)
 
 
 #########################

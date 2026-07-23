@@ -164,6 +164,15 @@ class HiCacheRestoreGatedKVReceiver:
             return KVPoll.Transferring
         return poll
 
+    def begin_failure_quiescence(self):
+        return self.decode_req.kv_receiver.begin_failure_quiescence()
+
+    def is_transfer_quiesced(self) -> bool:
+        return self.decode_req.kv_receiver.is_transfer_quiesced()
+
+    def is_failure_quiescing(self) -> bool:
+        return self.decode_req.kv_receiver.is_failure_quiescing()
+
 
 class DecodeHiCacheTransferMixin:
     """HiCache hooks for ``DecodeTransferQueue``: drive restore state machine."""

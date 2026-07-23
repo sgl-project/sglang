@@ -174,6 +174,15 @@ class BaseKVSender(ABC):
         """
         pass
 
+    def begin_failure_quiescence(self):
+        pass
+
+    def is_transfer_quiesced(self) -> bool:
+        return True
+
+    def is_failure_quiescing(self) -> bool:
+        return False
+
 
 class BaseKVReceiver(ABC):
     @abstractmethod
@@ -232,6 +241,15 @@ class BaseKVReceiver(ABC):
         Abort the current transfer.
         """
         pass
+
+    def begin_failure_quiescence(self):
+        pass
+
+    def is_transfer_quiesced(self) -> bool:
+        return True
+
+    def is_failure_quiescing(self) -> bool:
+        return False
 
 
 class BaseKVBootstrapServer(ABC):

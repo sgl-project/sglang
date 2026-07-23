@@ -12,6 +12,7 @@ from sglang.srt.disaggregation.mooncake.conn import (
     MooncakeKVManager,
     MooncakeKVReceiver,
     MooncakeKVSender,
+    _submit_transfer_futures,
 )
 from sglang.srt.utils.network import get_local_ip_auto
 
@@ -156,21 +157,11 @@ class AscendKVManager(MooncakeKVManager):
             return self._transfer_data(mooncake_session_id, transfer_blocks)
 
         if self.enable_custom_mem_pool:
-            futures = [
-                executor.submit(
-                    process_layer,
-                    src_ptr,
-                    dst_ptr,
-                    item_len,
-                )
+            calls = [
+                (process_layer, (src_ptr, dst_ptr, item_len))
                 for (src_ptr, dst_ptr, item_len) in layers_params
             ]
-            for future in concurrent.futures.as_completed(futures):
-                status = future.result()
-                if status != 0:
-                    for f in futures:
-                        f.cancel()
-                    return status
+            return _submit_transfer_futures(executor, calls)
         else:
             # Combining all layers' params in one batch transfer is more efficient
             # compared to using multiple threads
