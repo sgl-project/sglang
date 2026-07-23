@@ -708,6 +708,54 @@ def ensure_workspace_initialized(
     return workspace_manager.initialized
 
 
+def _jit_mnnvl_ar_route(
+    ws, input_tensor, use_oneshot, fp32_acc, is_attn, trigger_completion_at_end=False
+) -> bool:
+    """True only for the env-gated oneshot mnnvl decode regime (task 01; v3-trigger-guard)."""
+    import torch
+
+    from sglang.srt.environ import envs
+
+    if not envs.SGLANG_JIT_MNNVL_AR.get():
+        return False
+    scope = envs.SGLANG_JIT_MNNVL_AR_SCOPE.get()
+    if scope == "attn" and not is_attn:
+        return False
+    if scope == "moe" and is_attn:
+        return False
+    try:
+        if ws is None or getattr(ws, "backend", None) != "mnnvl":
+            return False
+        if fp32_acc or use_oneshot is False:
+            return False
+        # The jit wrapper has no end-of-kernel completion parameter (the
+        # kernel triggers PDL completion before the norm/output writes);
+        # the stock path forwards this flag, so honor it there.
+        if trigger_completion_at_end:
+            return False
+        # The jit module is bf16-only (it asserts); the stock flashinfer path
+        # handles fp16/fp32, so any other dtype must stay on the stock route.
+        if input_tensor.dtype != torch.bfloat16:
+            return False
+        num_tokens, hidden = input_tensor.shape
+        payload = num_tokens * hidden * ws.tp_size * input_tensor.element_size()
+        if payload > 64 * 1024 * 8 * 2:  # flashinfer MNNVL_ONE_SHOT_THRESHOLD
+            return False
+        for attr in (
+            "mc_ptr",
+            "uc_ptrs_dev",
+            "uc_ptr_local",
+            "buffer_flags",
+            "tp_size",
+            "rank",
+        ):
+            if not hasattr(ws, attr):
+                return False
+        return True
+    except Exception:
+        return False
+
+
 def fake_flashinfer_allreduce_residual_rmsnorm(
     input_tensor: torch.Tensor,
     residual: torch.Tensor,
@@ -804,6 +852,33 @@ def flashinfer_allreduce_residual_rmsnorm(
 
     residual_out = torch.empty_like(residual)
     norm_out = torch.empty_like(input_tensor)
+
+    # Task-local env-gated route (SGLANG_JIT_MNNVL_AR=1, default OFF): dispatch
+    # the oneshot mnnvl decode regime to the jit_kernel port of the same
+    # flashinfer kernel; every other case (twoshot/prefill sizes, fp32_acc,
+    # non-bf16 dtype, trigger_completion_at_end, non-mnnvl backend, missing
+    # workspace attrs) stays on the stock path so correctness is never lost.
+    if _jit_mnnvl_ar_route(
+        workspace_manager.workspace,
+        input_tensor,
+        use_oneshot,
+        fp32_acc,
+        use_attn_tp_group,
+        trigger_completion_at_end,
+    ):
+        from sglang.jit_kernel.mnnvl_ar_fused import allreduce_add_rmsnorm
+
+        allreduce_add_rmsnorm(
+            input_tensor,
+            workspace_manager.workspace,
+            norm_out,
+            residual_out,
+            residual,
+            weight,
+            eps,
+            launch_with_pdl=True,
+        )
+        return norm_out, residual_out
 
     kwargs = dict(
         input=input_tensor,
