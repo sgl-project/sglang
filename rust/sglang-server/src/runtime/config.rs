@@ -99,25 +99,6 @@ pub struct ServerArgs {
     /// The resolved Python `ModelConfig`, attached to the blob at dump time.
     #[serde(default)]
     pub model_config: ModelConfig,
-    /// Default sampling params advertised by `/get_model_info`, verbatim from
-    /// `server_args.preferred_sampling_params` (a JSON object or null).
-    #[serde(default)]
-    pub preferred_sampling_params: Option<serde_json::Value>,
-    /// Over-long inputs are truncated to fit the context instead of 400ing, and
-    /// `max_new_tokens` is clamped rather than rejected (Python
-    /// `TokenizerManager._validate_one_request`).
-    #[serde(default)]
-    pub allow_auto_truncate: bool,
-    /// `return_hidden_states` is refused unless the server was launched with it:
-    /// the scheduler simply won't produce them, so the request would 200 with the
-    /// field silently missing.
-    #[serde(default)]
-    pub enable_return_hidden_states: bool,
-    /// Output slots reserved per request on top of its input (eagle stores draft
-    /// tokens there). Not a `server_args` field — `TokenizerManager` derives it and
-    /// `RustServer._build_server_args` stamps it in, so both sides count alike.
-    #[serde(default)]
-    pub num_reserved_tokens: u64,
     /// Launch-time stamps (not `server_args` fields): sglang package version
     /// and the scheduler-derived KV token capacity, reported by `/server_info`.
     #[serde(default)]
@@ -134,8 +115,7 @@ pub struct ModelConfig {
     #[serde(default)]
     pub context_len: Option<u64>,
     /// Bounds client-supplied token ids — ingress 400s out-of-vocab ids before
-    /// they crash the scheduler's embedding lookup;  mandatory at
-    /// boot ([`ServerArgs::validate_mandatory`]).
+    /// they crash the scheduler's embedding lookup. `None` → unvalidated.
     #[serde(default)]
     pub vocab_size: Option<u64>,
 }
@@ -166,9 +146,6 @@ impl ServerArgs {
         }
         if self.model_config.context_len.is_none() {
             return Err("no resolvable context length (model_config.context_len)".into());
-        }
-        if self.model_config.vocab_size.is_none() {
-            return Err("no resolvable vocab size (model_config.vocab_size)".into());
         }
         Ok(())
     }
