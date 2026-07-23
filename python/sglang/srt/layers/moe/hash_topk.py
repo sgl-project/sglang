@@ -203,7 +203,7 @@ class HashTopK(nn.Module):
                 self.routed_scaling_factor,
             )
         elif envs.SGLANG_OPT_USE_FUSED_HASH_TOPK.get():
-            from sglang.jit_kernel.dsv4 import hash_topk
+            from sglang.kernels.ops.attention.dsv4 import hash_topk
 
             topk_weights, topk_ids = hash_topk(
                 router_logits=router_logits,
