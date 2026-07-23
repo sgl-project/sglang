@@ -1097,6 +1097,25 @@ class Indexer(MultiPlatformOp):
         logits_budget_bytes = self._get_mqa_logits_budget_bytes(device_index)
 
         need_chunk = logits_bytes > logits_budget_bytes
+        if need_chunk:
+            # Return unused blocks held by PyTorch's caching allocator to CUDA,
+            # then re-evaluate with the refreshed amount of free device memory.
+            # This does not release memory occupied by live tensors.
+            free_mem_before_empty_cache, _ = torch.cuda.mem_get_info(device_index)
+            torch.cuda.empty_cache()
+            free_mem, total_mem = torch.cuda.mem_get_info(device_index)
+            need_chunk = (logits_bytes * 2 > free_mem) or (
+                logits_bytes > total_mem * self._MQA_LOGITS_TOTAL_MEM_FRACTION
+            )
+            logger.info(
+                "DSA MQA logits released unused PyTorch CUDA cache: "
+                "free memory %.2f GiB -> %.2f GiB, logits %.2f GiB, "
+                "need_chunk=%s",
+                free_mem_before_empty_cache / (1024**3),
+                free_mem / (1024**3),
+                logits_bytes / (1024**3),
+                need_chunk,
+            )
         return need_chunk, logits_budget_bytes
 
     def _get_topk_ragged(
