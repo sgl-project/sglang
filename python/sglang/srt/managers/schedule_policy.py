@@ -1047,8 +1047,6 @@ class PrefillAdder:
         real_input_tokens = cand_extend_input_len - req.host_hit_length
         real_input_tokens = self.ceil_paged_tokens(real_input_tokens)
         prefix_len = len(req.prefix_indices)
-        swa_needed = None
-
         if total_tokens >= self.rem_total_tokens:
             return AddReqResult.NO_TOKEN
 

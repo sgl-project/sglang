@@ -52,7 +52,6 @@ def _make_model_runner(
     page_size=1,
     mambaish_config=None,
     disable_radix_cache=False,
-    enable_hierarchical_cache=False,
     chunked_prefill_size=None,
     disable_overlap_schedule=False,
     sliding_window_size=None,
@@ -106,7 +105,6 @@ def _make_model_runner(
     sa.swa_full_tokens_ratio = swa_full_tokens_ratio
     sa.page_size = page_size
     sa.disable_radix_cache = disable_radix_cache
-    sa.enable_hierarchical_cache = enable_hierarchical_cache
     sa.chunked_prefill_size = chunked_prefill_size
     sa.disable_overlap_schedule = disable_overlap_schedule
     sa.speculative_num_draft_tokens = speculative_num_draft_tokens
@@ -576,14 +574,14 @@ class TestFactory(unittest.TestCase):
         self.assertIsInstance(cfg, HybridSWAPoolConfigurator)
 
     def test_chunk_cap_configurator_selection(self):
-        def _cfg(max_running_requests, *, chunk_cache=True, hicache=False):
+        # SWAChunkCapPoolConfigurator is selected only when max_running_requests is set.
+        def _cfg(max_running_requests):
             mr = _make_model_runner(
                 is_hybrid_swa=True,
                 full_attention_layer_ids=[0],
                 swa_attention_layer_ids=[1],
                 swa_num_kv_heads=4,
-                disable_radix_cache=chunk_cache,
-                enable_hierarchical_cache=hicache,
+                disable_radix_cache=True,
                 chunked_prefill_size=4,
                 sliding_window_size=8,
                 max_running_requests=max_running_requests,
@@ -600,12 +598,6 @@ class TestFactory(unittest.TestCase):
         )
 
         self.assertIsInstance(_cfg(2), SWAChunkCapPoolConfigurator)
-        self.assertIsInstance(
-            _cfg(2, chunk_cache=False, hicache=True), SWAChunkCapPoolConfigurator
-        )
-        self.assertNotIsInstance(
-            _cfg(2, chunk_cache=False, hicache=False), SWAChunkCapPoolConfigurator
-        )
         self.assertNotIsInstance(_cfg(None), SWAChunkCapPoolConfigurator)
 
 

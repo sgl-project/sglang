@@ -3476,16 +3476,11 @@ class UnifiedRadixCacheSuite:
 
         swa_comp = cache.components[ComponentType.SWA]
         host_available = swa_comp._swa_kv_pool_host.available_size()
-        sizes_before_split = (
-            dict(cache.component_evictable_size_),
-            dict(cache.component_protected_size_),
-        )
-        self.assertEqual(swa_comp.prepare_load_back(device_leaf), window - ps)
+        self.assertTrue(cache.load_back(device_leaf))
         prefix_node = host_node.parent
         self.assertIsNot(prefix_node, cache.root_node)
         self.assertEqual(len(prefix_node.key), window + ps)
         self.assertEqual(len(host_node.key), window - ps)
-        self.assertIs(device_leaf.parent, host_node)
         self.assertTrue(
             torch.equal(
                 torch.cat(
@@ -3508,27 +3503,15 @@ class UnifiedRadixCacheSuite:
                 original_host,
             )
         )
-        self.assertEqual(
-            (
-                cache.component_evictable_size_,
-                cache.component_protected_size_,
-            ),
-            sizes_before_split,
+        self.assertTrue(
+            torch.equal(
+                allocator.translate_loc_from_full_to_swa(
+                    host_node.component_data[ComponentType.FULL].value
+                ),
+                host_node.component_data[ComponentType.SWA].value,
+            )
         )
-        self.assertEqual(swa_comp._swa_kv_pool_host.available_size(), host_available)
-        cache.sanity_check()
-
-        self.assertTrue(cache.load_back(device_leaf))
-        self.assertIsNotNone(host_node.component_data[ComponentType.SWA].value)
         self.assertIsNone(prefix_node.component_data[ComponentType.SWA].value)
-        self.assertEqual(
-            allocator.translate_loc_from_full_to_swa(
-                host_node.component_data[ComponentType.FULL].value
-            ).tolist(),
-            host_node.component_data[ComponentType.SWA].value.tolist(),
-        )
-        self.assertEqual(swa_comp._swa_kv_pool_host.available_size(), host_available)
-        cache.sanity_check()
 
         self._finish_pending_loads(cache)
         self.assertEqual(

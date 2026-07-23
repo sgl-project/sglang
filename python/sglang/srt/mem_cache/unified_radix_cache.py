@@ -2854,7 +2854,6 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     if n is not self.root_node
                     and n.component_data[ct].value is None
                     and n.component_data[ct].host_value is not None
-                    and n.component_data[ct].host_lock_ref == 0
                 }
                 host_lru_ids = set(host_lru.cache.keys())
                 if s3_ids != host_lru_ids:
