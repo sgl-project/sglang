@@ -224,9 +224,9 @@ def test_fused_act_quant_filter_expert(
             sentinel_q[token_skip].view(torch.uint8),
         ), "fused kernel modified quantized output for skipped rows"
         # scales should remain NaN (sentinel)
-        assert torch.isnan(skipped_scale).all(), (
-            "fused kernel modified scale output for skipped rows"
-        )
+        assert torch.isnan(
+            skipped_scale
+        ).all(), "fused kernel modified scale output for skipped rows"
 
     # Check that non-skipped rows match the unfused reference
     kept = ~token_skip

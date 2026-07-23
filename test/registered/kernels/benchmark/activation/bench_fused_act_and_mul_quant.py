@@ -89,6 +89,7 @@ def benchmark_tma(
                 op_name, x, act_out, expert_ids=expert_ids, expert_step=expert_step
             )
             return sglang_per_token_group_quant_fp8(act_out, GROUP_SIZE)
+
     else:
 
         def fn():
@@ -145,6 +146,7 @@ def benchmark_non_tma(
                 op_name, x, act_out, expert_ids=expert_ids, expert_step=expert_step
             )
             return sglang_per_token_group_quant_fp8(act_out, GROUP_SIZE)
+
     else:
 
         def fn():
@@ -193,6 +195,7 @@ def benchmark_dense(op_name: str, hidden_dim: int, num_tokens: int, impl: str):
         def fn():
             run_activation(op_name, x, act_out)
             return sglang_per_token_group_quant_fp8(act_out, GROUP_SIZE)
+
     else:
 
         def fn():

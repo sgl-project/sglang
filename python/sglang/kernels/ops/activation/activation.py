@@ -124,9 +124,9 @@ def run_unary_activation(
     Unlike :func:`run_activation`, there is no gate/up split — ``input`` and
     ``out`` share the same shape.
     """
-    assert op_name in SUPPORTED_UNARY_ACTIVATIONS, (
-        f"Unsupported unary activation: {op_name}"
-    )
+    assert (
+        op_name in SUPPORTED_UNARY_ACTIVATIONS
+    ), f"Unsupported unary activation: {op_name}"
     if out is None:
         out = torch.empty_like(input)
     _run_unary_activation_inplace(op_name, input, out)
@@ -277,9 +277,9 @@ def run_activation_quant(
     """
     assert op_name in SUPPORTED_ACTIVATIONS, f"Unsupported activation: {op_name}"
     hidden_size = input.shape[-1] // 2
-    assert hidden_size % group_size == 0, (
-        f"hidden_size ({hidden_size}) must be divisible by group_size ({group_size})"
-    )
+    assert (
+        hidden_size % group_size == 0
+    ), f"hidden_size ({hidden_size}) must be divisible by group_size ({group_size})"
     output_shape = input.shape[:-1] + (hidden_size,)
     scale_shape = input.shape[:-1] + (hidden_size // group_size,)
     if output_q is None:

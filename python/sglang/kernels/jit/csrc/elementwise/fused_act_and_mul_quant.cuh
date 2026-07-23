@@ -48,12 +48,12 @@ SGL_DEVICE float apply_activation_f32(float x) {
 // ============================================================================
 
 struct ActivationQuantParams {
-  const void* __restrict__ input;        // [num_tokens, hidden_dim * 2]
-  void* __restrict__ output_q;           // [num_tokens, hidden_dim], fp8_e4m3
-  void* __restrict__ output_scale;       // [num_tokens, hidden_dim / group_size], float32
-  uint32_t hidden_dim;                   // output hidden dimension (= input_width / 2)
+  const void* __restrict__ input;   // [num_tokens, hidden_dim * 2]
+  void* __restrict__ output_q;      // [num_tokens, hidden_dim], fp8_e4m3
+  void* __restrict__ output_scale;  // [num_tokens, hidden_dim / group_size], float32
+  uint32_t hidden_dim;              // output hidden dimension (= input_width / 2)
   uint32_t num_tokens;
-  uint32_t group_size;                   // quantization group size (128)
+  uint32_t group_size;  // quantization group size (128)
   const int32_t* __restrict__ expert_ids;
   uint32_t expert_step;
 };
@@ -137,12 +137,8 @@ __global__ void act_and_mul_quant_kernel(const __grid_constant__ ActivationQuant
 
   // Quantize and vectorized store FP8 (8 bytes = 1x STG.64)
   {
-    const float4 f4_0 = make_float4(
-        vals[0] * inv_scale, vals[1] * inv_scale,
-        vals[2] * inv_scale, vals[3] * inv_scale);
-    const float4 f4_1 = make_float4(
-        vals[4] * inv_scale, vals[5] * inv_scale,
-        vals[6] * inv_scale, vals[7] * inv_scale);
+    const float4 f4_0 = make_float4(vals[0] * inv_scale, vals[1] * inv_scale, vals[2] * inv_scale, vals[3] * inv_scale);
+    const float4 f4_1 = make_float4(vals[4] * inv_scale, vals[5] * inv_scale, vals[6] * inv_scale, vals[7] * inv_scale);
     const __nv_fp8x4_e4m3 pack0(f4_0);
     const __nv_fp8x4_e4m3 pack1(f4_1);
     uint2 packed;
@@ -213,8 +209,9 @@ struct ActivationQuantKernel {
     RuntimeCheck(hidden_dim * 2 == D_in.unwrap(), "input width must be 2 * output width");
     RuntimeCheck(group_size == 128, "only group_size=128 is supported");
     RuntimeCheck(hidden_dim % group_size == 0, "hidden_dim must be divisible by group_size");
-    RuntimeCheck(D_scale.unwrap() == static_cast<int64_t>(hidden_dim / group_size),
-                 "scale width must equal hidden_dim / group_size");
+    RuntimeCheck(
+        D_scale.unwrap() == static_cast<int64_t>(hidden_dim / group_size),
+        "scale width must equal hidden_dim / group_size");
 
     // Select kernel
     kernel_fn_t kernel = nullptr;
@@ -250,8 +247,15 @@ struct ActivationQuantKernel {
       std::string type,
       int64_t group_size,
       bool scale_ue8m0) {
-    launch(input, output_q, output_scale, type, group_size, scale_ue8m0,
-           /*expert_ids=*/nullptr, /*expert_step=*/1);
+    launch(
+        input,
+        output_q,
+        output_scale,
+        type,
+        group_size,
+        scale_ue8m0,
+        /*expert_ids=*/nullptr,
+        /*expert_step=*/1);
   }
 
   static void run_activation_quant_filtered(
@@ -266,8 +270,15 @@ struct ActivationQuantKernel {
     using namespace host;
     RuntimeCheck(is_type<int32_t>(expert_ids.dtype()), "expert_ids must have dtype int32");
     RuntimeCheck(expert_step >= 1, "expert_step must be positive");
-    launch(input, output_q, output_scale, type, group_size, scale_ue8m0,
-           static_cast<const int32_t*>(expert_ids.data_ptr()), static_cast<uint32_t>(expert_step));
+    launch(
+        input,
+        output_q,
+        output_scale,
+        type,
+        group_size,
+        scale_ue8m0,
+        static_cast<const int32_t*>(expert_ids.data_ptr()),
+        static_cast<uint32_t>(expert_step));
   }
 };
 
