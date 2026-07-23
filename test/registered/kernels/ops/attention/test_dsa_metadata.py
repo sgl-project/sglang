@@ -102,18 +102,35 @@ class TestDSAMetadataKernels(CustomTestCase):
         expected_page_table = req_to_token[req_pool_indices, :max_len].contiguous()
         expected_dsa = _dsa_seqlens(expected_cache, dsa_index_topk)
 
+        # Compare only the live prefix [:seq_len]: whole blocks starting past
+        # the kv length are skipped (keep stale values), while the last
+        # partially live block still writes lanes past it -- the tail is
+        # unspecified either way, and consumers never read past cache_seqlens.
+        cols = torch.arange(max_len, dtype=torch.int32, device=self.device)
+        live_mask = cols.view(1, -1) < expected_cache.view(-1, 1)
+
         _assert_equal(cache_seqlens, expected_cache, "decode cache_seqlens")
         _assert_equal(cu_seqlens_k, _cu_seqlens(expected_cache), "decode cu_seqlens_k")
-        _assert_equal(page_table_1, expected_page_table, "decode page_table_1")
+        _assert_equal(
+            page_table_1[live_mask],
+            expected_page_table[live_mask],
+            "decode page_table_1 (live [:seq_len] prefix)",
+        )
         _assert_equal(dsa_cache_seqlens, expected_dsa, "decode dsa_cache_seqlens")
         _assert_equal(
             dsa_cu_seqlens_k, _cu_seqlens(expected_dsa), "decode dsa_cu_seqlens_k"
         )
         if real_page_size > 1:
+            real_width = real_page_table.shape[1]
+            real_cols = torch.arange(real_width, dtype=torch.int32, device=self.device)
+            real_live_mask = (
+                real_cols.view(1, -1) * real_page_size
+            ) < expected_cache.view(-1, 1)
+            expected_real = _real_page_table(expected_page_table, real_page_size)
             _assert_equal(
-                real_page_table,
-                _real_page_table(expected_page_table, real_page_size),
-                "decode real_page_table",
+                real_page_table[real_live_mask],
+                expected_real[real_live_mask],
+                "decode real_page_table (live [:seq_len] prefix)",
             )
 
     def _check_target_verify(
@@ -194,19 +211,37 @@ class TestDSAMetadataKernels(CustomTestCase):
         expected_expanded = expected_expanded.reshape(-1).contiguous()
         expected_dsa = _dsa_seqlens(expected_expanded, dsa_index_topk)
 
+        # Compare only the live prefix [:seq_len + next_n] per expanded row:
+        # whole blocks starting past the kv length are skipped, the last
+        # partially live block may still write past it -- the tail is
+        # unspecified, and consumers never read past cache_seqlens.
+        row_kv_lens = torch.repeat_interleave(expected_cache, next_n)
+        cols = torch.arange(max_seqlen_k, dtype=torch.int32, device=self.device)
+        live_mask = cols.view(1, -1) < row_kv_lens.view(-1, 1)
+
         _assert_equal(cache_seqlens, expected_cache, "target cache_seqlens")
         _assert_equal(cu_seqlens_k, _cu_seqlens(expected_cache), "target cu_seqlens_k")
-        _assert_equal(page_table_1, expected_page_table, "target page_table_1")
+        _assert_equal(
+            page_table_1[live_mask],
+            expected_page_table[live_mask],
+            "target page_table_1 (live [:seq_len + next_n] prefix)",
+        )
         _assert_equal(seqlens_expanded, expected_expanded, "target seqlens_expanded")
         _assert_equal(dsa_cache_seqlens, expected_dsa, "target dsa_cache_seqlens")
         _assert_equal(
             dsa_cu_seqlens_k, _cu_seqlens(expected_dsa), "target dsa_cu_seqlens_k"
         )
         if real_page_size > 1:
+            real_width = real_page_table.shape[1]
+            real_cols = torch.arange(real_width, dtype=torch.int32, device=self.device)
+            real_live_mask = (
+                real_cols.view(1, -1) * real_page_size
+            ) < row_kv_lens.view(-1, 1)
+            expected_real = _real_page_table(expected_page_table, real_page_size)
             _assert_equal(
-                real_page_table,
-                _real_page_table(expected_page_table, real_page_size),
-                "target real_page_table",
+                real_page_table[real_live_mask],
+                expected_real[real_live_mask],
+                "target real_page_table (live [:seq_len + next_n] prefix)",
             )
         if fill_ctx_lens:
             expected_ctx = expected_cache.view(bs, 1).expand(bs, next_n).contiguous()
@@ -304,9 +339,10 @@ class TestDSAMetadataKernels(CustomTestCase):
         )
         expected_dsa = _dsa_seqlens(expected_expanded, dsa_index_topk)
 
-        # Only the live prefix [:kv_len] per request is defined; the kernel
-        # leaves columns past kv_len untouched. All expanded rows of a request
-        # share its kv length.
+        # Compare only the live prefix [:kv_len]: whole blocks starting past
+        # kv_len are skipped, the last partially live block may still write
+        # past it -- the tail is unspecified, and consumers never read past
+        # cache_seqlens. All expanded rows of a request share its kv length.
         row_kv_lens = torch.repeat_interleave(seq_lens.to(torch.int32), extend_seq_lens)
         cols = torch.arange(max_seqlen_k, dtype=torch.int32, device=self.device)
         live_mask = cols.view(1, -1) < row_kv_lens.view(-1, 1)
