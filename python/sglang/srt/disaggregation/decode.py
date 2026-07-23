@@ -2081,9 +2081,11 @@ class SchedulerDisaggregationDecodeMixin:
         self.last_batch: Optional[ScheduleBatch] = None
 
         def pop_and_process():
-            tmp_batch, tmp_result = self.result_queue.popleft()
+            tmp_batch, tmp_result, replay_ready_batch = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
-            self.validate_token_handoff_decode_step(tmp_batch)
+            self.validate_token_handoff_decode_step(
+                tmp_batch, replay_ready_batch=replay_ready_batch
+            )
 
         while True:
             # Receive requests
@@ -2113,7 +2115,17 @@ class SchedulerDisaggregationDecodeMixin:
             # Launch the current batch
             if batch:
                 batch_result = self.run_batch(batch)
-                self.result_queue.append((batch.copy(), batch_result))
+                self.result_queue.append(
+                    (
+                        batch.copy(),
+                        batch_result,
+                        (
+                            batch
+                            if getattr(batch, "token_handoff_replay_batch", False)
+                            else None
+                        ),
+                    )
+                )
             else:
                 batch_result = None
 
@@ -2205,7 +2217,9 @@ class SchedulerDisaggregationDecodeMixin:
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
     def validate_token_handoff_decode_step(
-        self: Scheduler, batch: ScheduleBatch
+        self: Scheduler,
+        batch: ScheduleBatch,
+        replay_ready_batch: Optional[ScheduleBatch] = None,
     ) -> None:
         """Validate a batched bridge replay and make it decode-ready."""
 
@@ -2246,7 +2260,9 @@ class SchedulerDisaggregationDecodeMixin:
         if replay_batch_verified:
             if not hasattr(self, "token_handoff_replay_ready_batches"):
                 self.token_handoff_replay_ready_batches = []
-            self.token_handoff_replay_ready_batches.append(batch)
+            self.token_handoff_replay_ready_batches.append(
+                replay_ready_batch if replay_ready_batch is not None else batch
+            )
 
     def get_new_prebuilt_batch(
         self: Scheduler, running_batch: ScheduleBatch
