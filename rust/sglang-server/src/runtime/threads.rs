@@ -57,11 +57,15 @@ pub(super) fn plan_cores(cfg: &RuntimeConfig) -> Option<CorePlan> {
     // `cores` carries the pinning decision: `None`/empty → run unpinned. The
     // caller (Python `_partition_cores`) passes this rank's NUMA-local cores
     // minus the scheduler's reserved launch cores.
-    let cores: Vec<CoreId> = match &cfg.cores {
+    let cores: Vec<CoreId> = match &cfg.rust_server_args.cores {
         Some(ids) if !ids.is_empty() => ids.iter().map(|&id| CoreId { id }).collect(),
         _ => return None,
     };
-    if cores.len() < cfg.api_worker_num + cfg.tokenizer_worker_num + cfg.detokenizer_worker_num {
+    if cores.len()
+        < cfg.rust_server_args.api_worker_num
+            + cfg.server_args.tokenizer_worker_num
+            + cfg.server_args.detokenizer_worker_num
+    {
         tracing::warn!(
             available = cores.len(),
             "not enough cores to pin all pools; running unpinned"
@@ -69,9 +73,18 @@ pub(super) fn plan_cores(cfg: &RuntimeConfig) -> Option<CorePlan> {
         return None;
     }
     let mut it = cores.into_iter();
-    let api: Vec<CoreId> = it.by_ref().take(cfg.api_worker_num).collect();
-    let tok = it.by_ref().take(cfg.tokenizer_worker_num).collect();
-    let detok = it.by_ref().take(cfg.detokenizer_worker_num).collect();
+    let api: Vec<CoreId> = it
+        .by_ref()
+        .take(cfg.rust_server_args.api_worker_num)
+        .collect();
+    let tok = it
+        .by_ref()
+        .take(cfg.server_args.tokenizer_worker_num)
+        .collect();
+    let detok = it
+        .by_ref()
+        .take(cfg.server_args.detokenizer_worker_num)
+        .collect();
     // The two TM router threads get up to `TM_CORES` leftover cores; when none
     // are spare they fall back to the API set so they never float onto the
     // CPU-bound tokenizer/detok cores.

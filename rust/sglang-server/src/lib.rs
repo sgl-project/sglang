@@ -97,31 +97,16 @@ impl Server {
                 PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("bad http_addr: {e}"))
             })?;
 
-        let tokenizer_worker_num = server_args.tokenizer_worker_num;
-        let detokenizer_worker_num = server_args.detokenizer_worker_num;
-        let api_worker_num = server_args.api_worker_num();
-
-        // Empty only in minimal standalone blobs (the Python dump always resolves
-        // it); empty → no tokenizer, which `runtime::start` allows only under
-        // `skip_tokenizer_init`.
-        let tokenizer_path =
-            (!server_args.tokenizer_path.is_empty()).then(|| server_args.tokenizer_path.clone());
-        let revision = server_args.revision.clone();
-
-        let server_args = std::sync::Arc::new(server_args);
-
         let cfg = RuntimeConfig {
-            http_addr,
-            api_worker_num,
-            tokenizer_worker_num,
-            detokenizer_worker_num,
-            ingress_ring_cap,
-            egress_ring_cap,
-            channel_cap,
-            cores,
-            tokenizer_path,
-            revision,
-            server_args,
+            rust_server_args: runtime::RustServerServerArgs {
+                http_addr,
+                api_worker_num: server_args.api_worker_num(),
+                ingress_ring_cap,
+                egress_ring_cap,
+                channel_cap,
+                cores,
+            },
+            server_args: std::sync::Arc::new(server_args),
         };
         let rt = runtime::start(cfg).map_err(|e| {
             PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("runtime start failed: {e}"))

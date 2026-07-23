@@ -83,8 +83,10 @@ pub struct GenerateRequest {
     pub sampling_params: Option<rmpv::Value>,
     /// Whether the client asked for SSE streaming.
     pub stream: bool,
-    /// Internal `/health_generate` probe: the scheduler skips it when busy so it
-    /// never occupies a waiting-queue slot. Never set from the client wire.
+    /// Internal `/health_generate` probe. Not a wire field — the probe is
+    /// recognized (and skipped when busy) by its `HEALTH_CHECK_` rid prefix,
+    /// mirroring Python `constants.HEALTH_CHECK_RID_PREFIX`; here it only
+    /// drives that rid minting. Never set from the client wire.
     pub is_health_check: bool,
     /// Logprob / hidden-state options. This path bypasses the Python
     /// `TokenizerManager`, so the ingress replicates its scalar normalization
@@ -159,8 +161,8 @@ impl GenerateRequest {
             Value::from(self.top_logprobs_num.unwrap_or(0)),   // 11 top_logprobs_num
             token_ids_logprob_val,                             // 12 token_ids_logprob
             Value::from(self.stream),                          // 13 stream
-            Value::from(self.return_hidden_states.unwrap_or(false)), // 14 return_hidden_states
-            Value::from(self.is_health_check),                 // 15 is_health_check
+            Value::from(false),                                // 14 return_sampling_mask
+            Value::from(self.return_hidden_states.unwrap_or(false)), // 15 return_hidden_states
         ]);
 
         let mut buf = Vec::new();
@@ -1187,7 +1189,7 @@ mod tests {
             return_logprob: Some(true),
             logprob_start_len: Some(-1),
             top_logprobs_num: Some(3),
-            is_health_check: true,
+            return_hidden_states: Some(true),
             stream: true,
             ..Default::default()
         };
@@ -1208,6 +1210,17 @@ mod tests {
         assert_eq!(arr[9].as_bool(), Some(true), "return_logprob at idx 9");
         assert_eq!(arr[11].as_u64(), Some(3), "top_logprobs_num at idx 11");
         assert_eq!(arr[13].as_bool(), Some(true), "stream at idx 13");
-        assert_eq!(arr[15].as_bool(), Some(true), "is_health_check at idx 15");
+        // idx 14 is `return_sampling_mask` (never client-set); a shift here would
+        // silently flip the wrong scheduler field.
+        assert_eq!(
+            arr[14].as_bool(),
+            Some(false),
+            "return_sampling_mask at idx 14"
+        );
+        assert_eq!(
+            arr[15].as_bool(),
+            Some(true),
+            "return_hidden_states at idx 15"
+        );
     }
 }
