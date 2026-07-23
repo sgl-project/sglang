@@ -33,6 +33,7 @@ from sglang.srt.layers.cp.zigzag import (
     ZigzagContextParallelMetadata,
     ZigzagCPStrategy,
 )
+from sglang.srt.runtime_context import get_parallel
 
 CP_V2_DEFAULT_MODEL_CLASSES = frozenset(
     {
