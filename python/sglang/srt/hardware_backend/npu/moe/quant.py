@@ -29,14 +29,17 @@ class HiddenStatesDynamicQuant(BaseHiddenStatesQuant):
 
     ``torch.float8_e4m3fn`` selects the MX (block-scaled) op, whose scale is a
     ``float8_e8m0fnu`` block scale ``[N, K//64, 2]`` rather than one scalar per
-    token; the int8/int4 dtypes keep the plain per-token op.
+    token. Set ``use_mx_quant`` for other MX dtypes; the int8/int4 dtypes keep
+    the plain per-token op.
 
     Returns ``(quantized_hidden_states, per‑token_scale)``.
     """
 
-    def __init__(self, quant_dtype: torch.dtype) -> None:
+    def __init__(
+        self, quant_dtype: torch.dtype, use_mx_quant: bool = False
+    ) -> None:
         super().__init__(quant_dtype)
-        if quant_dtype == torch.float8_e4m3fn:
+        if use_mx_quant or quant_dtype == torch.float8_e4m3fn:
             self._op = torch.ops.npu.npu_dynamic_mx_quant
         elif quant_dtype in (torch.int8, torch.quint4x2):
             self._op = torch.ops.npu.npu_dynamic_quant

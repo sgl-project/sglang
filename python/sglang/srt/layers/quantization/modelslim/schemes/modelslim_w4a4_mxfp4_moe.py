@@ -14,10 +14,10 @@ from sglang.srt.utils import set_weight_attrs
 
 MXFP4_BLOCK_SIZE = 32
 
-__all__ = ["ModelSlimMXFP4MoE"]
+__all__ = ["ModelSlimW4A4MXFP4MoE"]
 
 
-class ModelSlimMXFP4MoE(ModelSlimMoEScheme):
+class ModelSlimW4A4MXFP4MoE(ModelSlimMoEScheme):
     """Create one ModelSlim MXFP4 expert-weight group (w13 or w2)."""
 
     def __init__(
