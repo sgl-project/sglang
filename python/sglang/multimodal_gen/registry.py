@@ -69,6 +69,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.joy_image import (
     JoyImageEditPipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.krea2 import Krea2PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.longcat_image import (
+    LongCatImagePipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.longlive2 import LongLive2T2VConfig
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     LTX2PipelineConfig,
@@ -134,6 +137,9 @@ from sglang.multimodal_gen.configs.sample.krea2 import (
 )
 from sglang.multimodal_gen.configs.sample.lingbot_world import (
     LingBotWorldSamplingParams,
+)
+from sglang.multimodal_gen.configs.sample.longcat_image import (
+    LongCatImageSamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.longlive2 import LongLive2SamplingParams
 from sglang.multimodal_gen.configs.sample.ltx_2 import (
@@ -1141,6 +1147,18 @@ def _register_configs():
             lambda hf_id: "ideogram-4-nf4" in hf_id.lower(),
             lambda hf_id: "comfy-org/ideogram-4" in hf_id.lower(),
             lambda hf_id: "comfy-org--ideogram-4" in hf_id.lower(),
+        ],
+    )
+
+    # LongCat-Image
+    register_configs(
+        sampling_param_cls=LongCatImageSamplingParams,
+        pipeline_config_cls=LongCatImagePipelineConfig,
+        hf_model_paths=[
+            "meituan-longcat/LongCat-Image",
+        ],
+        model_detectors=[
+            lambda hf_id: "longcat" in hf_id.lower() and "edit" not in hf_id.lower(),
         ],
     )
 
