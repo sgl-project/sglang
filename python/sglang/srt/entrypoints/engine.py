@@ -222,7 +222,6 @@ class Engine(EngineScoreMixin, EngineBase):
                 kwargs["log_level"] = "error"
             server_args = self.server_args_class(**kwargs)
         self.server_args = server_args
-        logger.info(f"{server_args=}")
 
         # Pre-initialize tokenizer_manager so the atexit handler in
         # shutdown() won't hit AttributeError.
