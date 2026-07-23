@@ -1,0 +1,202 @@
+---
+title: Kimi-K3
+description: "Deploy Moonshot AI's Kimi-K3 with SGLang — a 2.8T-parameter hybrid Mixture-of-Experts vision-language model (Kimi Delta Attention + MLA, 16/896 active experts) with verified H200, B300, and GB300 recipes."
+tag: NEW
+---
+
+## Deployment
+
+<a id="install" />
+
+<Accordion title="Install SGLang">
+
+For all methods and hardware platforms, see the [official SGLang installation guide](../../../docs/get-started/install). The two paths below match the **Python / Docker** toggle in the command panel.
+
+<Tabs>
+
+<Tab title="Python (pip / uv)">
+
+```bash Command
+pip install --upgrade pip
+pip install uv
+uv pip install sglang
+```
+
+Then run the **Python** output of the command panel below in that environment.
+
+</Tab>
+
+<Tab title="Docker">
+
+```bash Command
+docker pull lmsysorg/sglang:latest
+```
+
+For how to launch the image, see [Install → Method 3: Using Docker](../../../docs/get-started/install#method-3-using-docker). Substitute the inner `sglang serve ...` with what the command generator below produces.
+
+</Tab>
+
+</Tabs>
+
+</Accordion>
+
+Pick your hardware + recipe to generate the launch command. The three serving strategies cover the common operating points:
+
+- **Low-Latency** — DSPARK/MTP speculative decoding on top of the accuracy config, for the fastest single-user reply. Pick for chat.
+- **Balanced** — the accuracy-preserving default (`--mem-fraction-static 0.85`, no precision knobs touched). Use for typical multi-user serving.
+- **High-Throughput** — throughput-tuned (H200/B300: `extra_buffer_lazy`; GB300: EP8 + MegaMoE + SP-MoE) to lift concurrency. Best for batch jobs.
+
+import { Deployment } from "/src/snippets/_deployment.jsx";
+import { config }     from "/src/snippets/configs/moonshotai/kimi-k3.jsx";
+import { benchmarks } from "/src/snippets/configs/moonshotai/kimi-k3-benchmarks.jsx";
+
+<Deployment config={config} benchmarks={benchmarks} />
+
+## Playground
+
+The Playground is where you experiment with **SGLang features beyond the verified matrix**. The Deploy panel above only emits combinations the SGLang team has signed off on; the Playground lets you turn on additional knobs on top of whichever cell the Deploy panel is currently showing.
+
+import { Playground } from "/src/snippets/_playground.jsx";
+
+<Playground config={config} />
+
+## 1. Model Introduction
+
+**Kimi-K3** is Moonshot AI's flagship hybrid Mixture-of-Experts vision-language model — **2.8 trillion total parameters** with **16 of 896 experts** active per token, reaching roughly **2.5× the scaling efficiency of Kimi-K2**. It is built on **Kimi Delta Attention (KDA)** — a hybrid linear-attention mechanism — together with **Attention Residuals** and the **Stable LatentMoE** framework; in SGLang the backbone runs as 93 layers interleaving KDA (linear) with Multi-head Latent Attention (MLA). K3 has **native visual understanding** (images and video) and supports a context window of up to **1M tokens** with automatic prefix caching. Weights ship in **MXFP4** and are served through SGLang's Marlin (W4A16) runner for accuracy, or the FlashInfer MXFP4 / MegaMoE runners for throughput.
+
+K3 **always runs with thinking enabled**, with reasoning depth controlled by `reasoning_effort` (`low` / `high` / `max`; default `max`).
+
+<Note>
+Kimi-K3 is Moonshot AI's first open-source model in the trillion-plus class; **full model weights
+are scheduled to release by July 27, 2026**. The recipes on this page were validated on the
+[`DarkSharpness/sglang-kimi`](https://github.com/DarkSharpness/sglang-kimi) fork — the HuggingFace
+repository (`moonshotai/Kimi-K3`) and a public `lmsysorg/sglang` image with K3 support will be
+available at launch. The B200 / GB200 / MI350X / MI355X buttons are day-0 targets whose recipes
+are pending (greyed until a verified cell lands).
+</Note>
+
+**Recommended generation:** `temperature=1.0`, `top_p=0.95`, `presence_penalty=0`, `frequency_penalty=0` (fixed by the model; informational — do not hardcode in sample code).
+
+**Resources:** [HuggingFace](https://huggingface.co/moonshotai/Kimi-K3) · [Kimi-K3 Quickstart](https://platform.kimi.ai/docs/guide/kimi-k3-quickstart).
+
+## 2. Configuration Tips
+
+**Hybrid dual-pool memory (KDA state vs full-KV).** K3 splits static memory into a recurrent **KDA state pool** and a paged **MLA KV pool**, divided once at startup by `--mamba-full-memory-ratio` (default `0.9`). The KDA state pool is reserved worst-case (no over-commit), so it usually sets the concurrency ceiling. Levers, exposed in the Playground's flag-select cards:
+
+- `--mamba-radix-cache-strategy extra_buffer_lazy` — drops the per-request slot count (S 5→4), ~+25% concurrency at no accuracy cost (used by the High-Throughput recipe).
+- `--mamba-ssm-dtype bfloat16` — roughly doubles state slots (halves the SSM part); accuracy A/B is workload-gated, so it stays a Playground opt-in.
+- `--kv-cache-dtype fp8_e4m3` — the main long-context KV lever (~1.6×); accuracy-gated.
+
+Raising `--mem-fraction-static` toward `0.90–0.92` when the boot log shows a large idle `Memory pool end. avail mem` is the cheapest first win.
+
+**MoE runner.** Marlin (W4A16) keeps higher-precision activations and reproduces the reference accuracy; the FlashInfer MXFP4 and MegaMoE (Blackwell) runners trade a little precision for throughput. Both are Playground swaps — the verified cells use Marlin, except the GB300 High-Throughput recipe (EP8 + MegaMoE).
+
+**Context length.** K3 supports up to a 1M-token window. The B300 recipe pins `--context-length 131072` (enough for the vision evals); the H200 / GB300 recipes leave it at the model default. Add `--context-length` to bound the KV pool on a smaller budget, and for long contexts `--kv-cache-dtype fp8_e4m3` is the main lever.
+
+**Low-Latency (DSPARK/MTP).** The Low-Latency recipes add DSPARK speculative decoding (`--speculative-algorithm DSPARK --speculative-dspark-block-size 7`, verify window 8) with a separate DSPARK draft checkpoint. `--speculative-draft-attention-backend flashinfer` is currently the correctness path (the DSPARK draft worker allow-lists flashinfer/fa3/fa4/triton). These cells are marked **unverified** until a per-hardware MTP serving round lands — the accuracy configs (Balanced) run NOSPEC.
+
+**H200 multi-node.** The 2×8 TP16/EP16 recipe runs the **same block on both ranks** (rank auto-detected from the NIC). Export the cross-node NIC on both nodes (`GLOO_SOCKET_IFNAME` / `NCCL_SOCKET_IFNAME`) plus `SGLANG_HOST_IP`, and keep `NCCL_MNNVL_ENABLE=1 NCCL_CUMEM_ENABLE=1` for the symmetric-memory path (see the multi-node hints in the command panel).
+
+**GB300 (2×4 MNNVL).** GB300 hosts have 4 GPUs, so TP8 spans 2 nodes over MNNVL — keep `NCCL_MNNVL_ENABLE=1 NCCL_CUMEM_ENABLE=1` on both. High-Throughput uses EP8 + MegaMoE + SP-MoE (which removes the a2a dispatch redundancy) with `cutedsl_mla` decode; this is the first layout to beat the plain TP8 baseline (bs=32 ≈ 857 tok/s/GPU).
+
+**B300 single-node.** The validated recipe is accuracy-first — no `--kv-cache-dtype` / `--mamba-ssm-dtype` overrides, no version-check skips. For more throughput, apply the dual-pool levers above and re-verify before quoting the numbers.
+
+## 3. Advanced Usage
+
+### 3.1 Reasoning
+
+K3 always thinks; the `kimi_k3` reasoning parser (toggle **Reasoning Parser** in the **Parsers** card of the [Playground above](#playground)) separates that thinking from the final answer — thinking lands in `message.reasoning_content`, the answer in `message.content`. Control the reasoning depth with `reasoning_effort` (`low` / `high` / `max`; default `max`).
+
+<Accordion title="Reasoning Example (Python)">
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
+resp = client.chat.completions.create(
+    model="moonshotai/Kimi-K3",
+    messages=[{"role": "user", "content": "What is 15% of 240?"}],
+    reasoning_effort="high",  # "low" | "high" | "max" (default max)
+)
+msg = resp.choices[0].message
+print("Reasoning:", getattr(msg, "reasoning_content", None))
+print("Answer:", msg.content)
+```
+
+</Accordion>
+
+<Accordion title="Example Output">
+
+```text Output
+Pending update...
+```
+
+</Accordion>
+
+### 3.2 Tool Calling
+
+Enable the `kimi_k3` tool-call parser (toggle **Tool Call Parser** in the **Parsers** card of the [Playground above](#playground)) to surface structured tool calls via `message.tool_calls`. Because K3 is a thinking model, the follow-up turn may put text in `reasoning_content` as well as `content` — print both.
+
+<Accordion title="Tool Calling Example (Python)">
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
+tools = [{
+    "type": "function",
+    "function": {
+        "name": "get_weather",
+        "description": "Get the current weather for a city",
+        "parameters": {
+            "type": "object",
+            "properties": {"city": {"type": "string"}},
+            "required": ["city"],
+        },
+    },
+}]
+resp = client.chat.completions.create(
+    model="moonshotai/Kimi-K3",
+    messages=[{"role": "user", "content": "What's the weather in Beijing?"}],
+    tools=tools,
+)
+msg = resp.choices[0].message
+print("Reasoning:", getattr(msg, "reasoning_content", None))
+print("Tool calls:", msg.tool_calls)
+```
+
+</Accordion>
+
+<Accordion title="Example Output">
+
+```text Output
+Pending update...
+```
+
+</Accordion>
+
+### 3.3 HiCache (Hierarchical KV Caching)
+
+K3's hybrid HiCache tiers the paged MLA KV **and** the KDA/mamba recurrent state across L1 (GPU) / L2 (host) / L3 (Mooncake) — enable it from the **Hierarchical KV Cache** card in the [Playground above](#playground) to extend effective cache capacity for long multi-turn workloads.
+
+### 3.4 PD Disaggregation
+
+For serving fleets, K3 supports **prefill/decode (PD) disaggregation** — running prefill and decode on separate server groups so each scales independently. Because K3 is hybrid, the transfer moves **both** the paged MLA latent KV **and** the KDA recurrent state from the prefill role to the decode role; this was validated functionally on a 2-node B300 setup over the Mooncake backend.
+
+Configure it from the **PD Disaggregation** card in the [Playground above](#playground): set one server group to the **Prefill role** and another to the **Decode role**, pick a transfer backend (**Mooncake** or **NiXL**), and front both groups with the generated router command. On GB200/GB300 the Mooncake path also needs `NCCL_MNNVL_ENABLE=1 NCCL_CUMEM_ENABLE=1` (emitted automatically for those GPUs).
+
+<Accordion title="Router (SGLang Model Gateway)">
+
+```bash Command
+python3 -m sglang_router.launch_router \
+  --pd-disaggregation \
+  --prefill http://<prefill-host>:30000 \
+  --decode http://<decode-host>:30001 \
+  --host 0.0.0.0 --port 8000 \
+  --disable-circuit-breaker \
+  --health-check-interval-secs 999999
+```
+
+</Accordion>
+
+Clients then send requests to the router (`:8000`) instead of an individual role server.
