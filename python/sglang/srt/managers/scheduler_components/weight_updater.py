@@ -84,6 +84,7 @@ class SchedulerWeightUpdaterManager:
     metrics_collector: Optional[Any] = None
     offload_tags: set = field(default_factory=set)
     stashed_model_static_state: Any = None
+    cuda_graphs_need_recapture: bool = False
 
     @contextmanager
     def _observe_weight_load(self, source: str) -> Iterator[None]:
@@ -107,6 +108,47 @@ class SchedulerWeightUpdaterManager:
             )
             assert flush_cache_success, "Cache flush failed after updating weights"
 
+    def recapture_cuda_graphs_after_weight_update(self) -> None:
+        # Recapture TP worker CUDA graphs
+        tp_model_runner = self.tp_worker.model_runner
+        if tp_model_runner.graph_runner is not None:
+            logger.info("Recapturing TP worker CUDA graphs after weight update")
+            for graph in tp_model_runner.graph_runner.graphs.values():
+                graph.reset()
+            tp_model_runner.graph_runner.graphs.clear()
+            tp_model_runner.graph_runner.output_buffers.clear()
+            tp_model_runner.graph_runner.capture()
+        if getattr(tp_model_runner, "piecewise_cuda_graph_runner", None) is not None:
+            logger.info(
+                "Recapturing TP worker piecewise CUDA graphs after weight update"
+            )
+            tp_model_runner.init_piecewise_cuda_graphs()
+
+        # Recapture draft worker CUDA graphs if present
+        if self.draft_worker is not None:
+            draft_model_runner = _get_draft_model_runner(self.draft_worker)
+            if draft_model_runner is not None:
+                if draft_model_runner.graph_runner is not None:
+                    logger.info(
+                        "Recapturing draft worker CUDA graphs after weight update"
+                    )
+                    for graph in draft_model_runner.graph_runner.graphs.values():
+                        graph.reset()
+                    draft_model_runner.graph_runner.graphs.clear()
+                    draft_model_runner.graph_runner.output_buffers.clear()
+                    draft_model_runner.graph_runner.capture()
+                if (
+                    getattr(draft_model_runner, "piecewise_cuda_graph_runner", None)
+                    is not None
+                ):
+                    logger.info(
+                        "Recapturing draft worker piecewise CUDA graphs after weight update"
+                    )
+                    draft_model_runner.init_piecewise_cuda_graphs()
+
+    def mark_cuda_graphs_stale(self) -> None:
+        self.cuda_graphs_need_recapture = True
+
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         """In-place update of the weights from disk."""
         with self._observe_weight_load("disk"):
@@ -116,16 +158,15 @@ class SchedulerWeightUpdaterManager:
                 success, message = self.draft_worker.update_weights_from_disk(recv_req)
             if tp_success:
                 self.flush_cache_after_weight_update(recv_req)
+                self.mark_cuda_graphs_stale()
             if not success:
                 logger.error(message)
-            return UpdateWeightFromDiskReqOutput(
-                success=success, message=message, num_paused_requests=0
-            )
+            return UpdateWeightFromDiskReqOutput(success, message, 0)
 
     def init_weights_update_group(self, recv_req: InitWeightsUpdateGroupReqInput):
         """Initialize the online model parameter update group."""
         success, message = self.tp_worker.init_weights_update_group(recv_req)
-        return InitWeightsUpdateGroupReqOutput(success=success, message=message)
+        return InitWeightsUpdateGroupReqOutput(success, message)
 
     def destroy_weights_update_group(
         self,
@@ -133,7 +174,7 @@ class SchedulerWeightUpdaterManager:
     ):
         """Destroy the online model parameter update group."""
         success, message = self.tp_worker.destroy_weights_update_group(recv_req)
-        return DestroyWeightsUpdateGroupReqOutput(success=success, message=message)
+        return DestroyWeightsUpdateGroupReqOutput(success, message)
 
     def update_weights_from_distributed(
         self,
@@ -144,11 +185,10 @@ class SchedulerWeightUpdaterManager:
             success, message = self.tp_worker.update_weights_from_distributed(recv_req)
             if success:
                 self.flush_cache_after_weight_update(recv_req)
+                self.mark_cuda_graphs_stale()
             else:
                 logger.error(message)
-            return UpdateWeightsFromDistributedReqOutput(
-                success=success, message=message
-            )
+            return UpdateWeightsFromDistributedReqOutput(success, message)
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         """Update the online model parameter from tensors."""
@@ -160,10 +200,11 @@ class SchedulerWeightUpdaterManager:
             success, message = worker.update_weights_from_tensor(recv_req)
             if success:
                 self.flush_cache_after_weight_update(recv_req)
+                self.mark_cuda_graphs_stale()
             else:
                 logger.error(message)
             torch.distributed.barrier(group=self.tp_cpu_group)
-            return UpdateWeightsFromTensorReqOutput(success=success, message=message)
+            return UpdateWeightsFromTensorReqOutput(success, message)
 
     def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
         """Update the online model parameter from IPC for checkpoint-engine integration."""
@@ -174,14 +215,15 @@ class SchedulerWeightUpdaterManager:
                 success, message = self.draft_worker.update_weights_from_ipc(recv_req)
             if tp_success:
                 self.flush_cache_after_weight_update(recv_req)
+                self.mark_cuda_graphs_stale()
             if not success:
                 logger.error(message)
             torch.distributed.barrier(group=self.tp_cpu_group)
-            return UpdateWeightsFromIPCReqOutput(success=success, message=message)
+            return UpdateWeightsFromIPCReqOutput(success, message)
 
     def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
         parameter = self.tp_worker.get_weights_by_name(recv_req)
-        return GetWeightsByNameReqOutput(parameter=parameter)
+        return GetWeightsByNameReqOutput(parameter)
 
     def release_memory_occupation(self, recv_req: ReleaseMemoryOccupationReqInput):
         assert (
@@ -266,21 +308,20 @@ class SchedulerWeightUpdaterManager:
                     if queue is not None:
                         queue.resume_memory_occupation()
 
+        if self.cuda_graphs_need_recapture:
+            self.recapture_cuda_graphs_after_weight_update()
+            self.cuda_graphs_need_recapture = False
+
         return ResumeMemoryOccupationReqOutput()
 
     def check_weights(self, recv_req: CheckWeightsReqInput):
         try:
-            payload = self.tp_worker.model_runner.check_weights(
-                action=recv_req.action, allow_quant_error=recv_req.allow_quant_error
-            )
+            payload = self.tp_worker.model_runner.check_weights(action=recv_req.action)
 
             if self.draft_worker is not None:
                 draft_runner = _get_draft_model_runner(self.draft_worker)
                 if draft_runner is not None:
-                    draft_payload = draft_runner.check_weights(
-                        action=recv_req.action,
-                        allow_quant_error=recv_req.allow_quant_error,
-                    )
+                    draft_payload = draft_runner.check_weights(action=recv_req.action)
                     if payload is not None and draft_payload is not None:
                         payload = _merge_checksum_payloads(payload, draft_payload)
 
