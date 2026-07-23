@@ -4,15 +4,16 @@ SGLANG_USE_CPU_ENGINE=1 python3 -m unittest test_autoround
 
 CPU accuracy test for AutoRound INT4 checkpoints. Covers both AutoRound packing
 formats (auto_round:auto_gptq / auto_round:auto_awq) by launching a server and
-running an MMLU eval. Dense linear layers run on any x86 CPU (AVX512 path or
-scalar fallback); AMX is only required for INT4 MoE. Skipped on non-x86 hosts.
+running an MMLU eval. AutoRound INT4 CPU inference uses the Intel AMX backend,
+so the test is skipped on AMD CPUs and other non-AMX CPU hosts.
 """
 
 import os
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.utils import is_host_cpu_x86, kill_process_tree
+from sglang.srt.layers.quantization.auto_round import AutoRoundConfig
+from sglang.srt.utils import cpu_has_amx_support, kill_process_tree
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
@@ -26,9 +27,40 @@ from sglang.test.test_utils import (
 register_cpu_ci(est_time=330, suite="base-a-test-cpu")
 
 
+class TestAutoRoundCPUConfig(CustomTestCase):
+    def test_gptq_defaults_are_explicit(self):
+        quant_config = AutoRoundConfig.from_config(
+            {
+                "bits": 4,
+                "group_size": 128,
+                "sym": True,
+                "packing_format": "auto_round:auto_gptq",
+            }
+        )
+
+        gptq_kwargs = quant_config.get_gptq_config_kwargs(4, 128)
+        self.assertFalse(gptq_kwargs["desc_act"])
+        self.assertFalse(gptq_kwargs["lm_head_quantized"])
+        self.assertEqual(gptq_kwargs["dynamic"], {})
+
+    def test_gptq_desc_act_is_rejected(self):
+        quant_config = AutoRoundConfig.from_config(
+            {
+                "bits": 4,
+                "group_size": 128,
+                "sym": True,
+                "packing_format": "auto_round:auto_gptq",
+                "desc_act": True,
+            }
+        )
+
+        with self.assertRaisesRegex(ValueError, "desc_act=False only"):
+            quant_config.get_gptq_config_kwargs(4, 128)
+
+
 @unittest.skipUnless(
-    is_host_cpu_x86(),
-    "AutoRound dense linear on CPU requires an x86 CPU.",
+    cpu_has_amx_support(),
+    "AutoRound INT4 CPU inference requires the Intel AMX CPU backend.",
 )
 class TestAutoRoundCPU(CustomTestCase):
     @classmethod
