@@ -39,6 +39,13 @@ class StreamingASRState:
     chunk_size_sec: float
     unfixed_chunk_num: int
     unfixed_token_num: int
+    # Maximum chunks of audio sent per inference; 0 = unbounded (each
+    # inference re-encodes the whole utterance, so per-chunk cost grows
+    # linearly and total cost quadratically with utterance length). When
+    # the buffered audio exceeds this, the window rolls: audio whose text
+    # is already emitted is dropped and the transcript continues from the
+    # ``emitted_text`` prompt prefix.
+    window_chunk_num: int = 0
     confirmed_text: str = ""
     # Monotonic accumulator; used as prompt prefix so the model sees a
     # natural continuation point, not the rolled-back ``confirmed_text``.
@@ -80,6 +87,17 @@ class StreamingASRState:
             common_count += 1
         return self._record_emit(" ".join(new_words[common_count:]))
 
+    def start_new_window(self) -> None:
+        """Reset the continuation frame after an audio-window roll.
+
+        ``emitted_text`` (the prompt prefix) carries all confirmed text
+        across the roll; ``confirmed_text``/``full_transcript`` are
+        relative to the model's continuation output, which restarts when
+        the audio the model sees changes.
+        """
+        self.confirmed_text = ""
+        self.full_transcript = ""
+
     def finalize(self) -> str:
         confirmed_words = self.confirmed_text.split()
         all_words = self.full_transcript.split()
@@ -96,11 +114,38 @@ class StreamingASRState:
         return self._record_emit(" ".join(all_words[common_count:]))
 
 
-def split_audio_chunks(audio_data: bytes, chunk_size_sec: float) -> List[bytes]:
+def compute_window_drop(
+    buffered: int,
+    inferred: int,
+    chunk_size: int,
+    state: StreamingASRState,
+) -> int:
+    """How much audio to drop from the buffer head when the window rolls.
+
+    Unit-agnostic (callers pass bytes or samples; ``chunk_size`` is one
+    chunk in the same unit). Only audio that has (a) been through at
+    least one inference pass and (b) sits outside the unfixed rollback
+    zone is safe to drop — its text is already in ``emitted_text`` and
+    conditions the next inference as the prompt prefix. Never-inferred
+    audio (e.g. one giant append before the first inference) is never
+    dropped, so no content is lost regardless of append cadence.
+
+    Returns 0 when windowing is disabled or the buffer fits the window.
+    """
+    if not state.window_chunk_num:
+        return 0
+    if buffered <= state.window_chunk_num * chunk_size:
+        return 0
+    # Keep the unfixed zone plus the newest (not yet inferred) chunk.
+    keep = (state.unfixed_chunk_num + 1) * chunk_size
+    safe = inferred - state.unfixed_chunk_num * chunk_size
+    return max(0, min(buffered - keep, safe))
+
+
+def decode_audio_mono(audio_data: bytes):
+    """Decode an audio file to (float32 mono ndarray, sample_rate)."""
     if not audio_data:
         raise ValueError("audio_data is empty")
-    if chunk_size_sec <= 0:
-        raise ValueError(f"chunk_size_sec must be positive, got {chunk_size_sec}")
     audio_file = io.BytesIO(audio_data)
     try:
         data, sample_rate = sf.read(audio_file, dtype="float32")
@@ -108,6 +153,19 @@ def split_audio_chunks(audio_data: bytes, chunk_size_sec: float) -> List[bytes]:
         raise ValueError(f"failed to decode audio: {e}") from e
     if len(data.shape) > 1:
         data = data.mean(axis=1)
+    return data, sample_rate
+
+
+def encode_wav(data, sample_rate: int) -> bytes:
+    buf = io.BytesIO()
+    sf.write(buf, data, sample_rate, format="WAV")
+    return buf.getvalue()
+
+
+def split_audio_chunks(audio_data: bytes, chunk_size_sec: float) -> List[bytes]:
+    if chunk_size_sec <= 0:
+        raise ValueError(f"chunk_size_sec must be positive, got {chunk_size_sec}")
+    data, sample_rate = decode_audio_mono(audio_data)
     chunk_size_samples = int(chunk_size_sec * sample_rate)
     total_samples = len(data)
     chunks = []
@@ -115,9 +173,7 @@ def split_audio_chunks(audio_data: bytes, chunk_size_sec: float) -> List[bytes]:
         chunk_size_samples, total_samples + chunk_size_samples, chunk_size_samples
     ):
         end = min(end, total_samples)
-        buf = io.BytesIO()
-        sf.write(buf, data[:end], sample_rate, format="WAV")
-        chunks.append(buf.getvalue())
+        chunks.append(encode_wav(data[:end], sample_rate))
     return chunks
 
 

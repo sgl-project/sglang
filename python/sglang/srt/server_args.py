@@ -1323,6 +1323,13 @@ class ServerArgs:
         "Maximum number of concurrent realtime ASR WebSocket sessions served by /v1/realtime. New connections beyond this cap are accepted, sent an error{code:too_many_sessions} frame, and closed. Default 32.",
         NS("serving"),
     ] = 32
+    asr_streaming_mode: A[
+        str,
+        Arg(
+            help="Streaming ASR inference mode. 'chunked' re-transcribes a sliding window of audio each chunk with prefix rollback (default). 'segment' transcribes fixed, disjoint audio segments independently and concatenates them, so each second of audio is encoded exactly once (no re-encoded window), at the cost of accuracy at segment boundaries; requires an adapter that supports it (falls back to chunked otherwise).",
+            choices=["chunked", "segment"],
+        ),
+    ] = "chunked"
     preferred_sampling_params: A[
         Optional[str],
         Arg(

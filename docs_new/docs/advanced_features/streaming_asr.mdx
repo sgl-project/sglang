@@ -1,0 +1,215 @@
+---
+title: "Streaming ASR & Realtime Transcription"
+metatags:
+    description: "Stream speech-to-text with SGLang: chunked vs. segment streaming on /v1/audio/transcriptions, and the /v1/realtime WebSocket with server-side VAD (turn_detection: server_vad)."
+---
+
+SGLang serves streaming automatic speech recognition (ASR) for transcription models such as
+[Qwen3-ASR](https://huggingface.co/Qwen/Qwen3-ASR-0.6B) over two OpenAI-compatible surfaces:
+
+- **`POST /v1/audio/transcriptions`** with `stream=true` — a one-shot audio file transcribed
+  incrementally over Server-Sent Events (SSE).
+- **`/v1/realtime`** — a WebSocket that accepts live audio frames and emits transcription
+  events as the user speaks, with optional server-side voice-activity detection (VAD).
+
+Both are enabled automatically when you launch a supported ASR model; there is no separate flag
+to turn transcription on.
+
+```bash
+python3 -m sglang.launch_server --model-path Qwen/Qwen3-ASR-0.6B --host 0.0.0.0 --port 30000
+```
+
+## Why streaming ASR is different
+
+A causal LLM extends one KV cache token by token, so streaming decode is naturally incremental.
+Qwen3-ASR's audio tower is **bidirectional** — the encoding of an audio frame depends on later
+frames — so you cannot freeze a KV prefix over a growing clip and simply append. Each time new
+audio arrives, the tower must re-run over whatever audio span the model should see. SGLang offers
+two strategies for that, selected with `--asr-streaming-mode`:
+
+| Mode | How it works | Trade-off |
+| --- | --- | --- |
+| `chunked` (default) | Re-transcribes a **bounded, sliding window** of audio each chunk; already-emitted text conditions the next inference as the prompt prefix. | High boundary accuracy; re-encodes the window each chunk. |
+| `segment` | Cuts audio into **fixed, disjoint segments**, transcribes each independently, and concatenates. | Each second of audio is encoded exactly once (cheapest); weaker at segment boundaries. |
+
+`segment` mode requires a model adapter that supports it (Qwen3-ASR does; others fall back to
+`chunked`). It applies to the SSE `/v1/audio/transcriptions` path — the `/v1/realtime` WebSocket
+always uses `chunked`.
+
+## HTTP streaming transcription
+
+Send a normal transcription request with `stream=true`. The response is an SSE stream of JSON
+chunks whose `choices[0].delta.content` carries incremental text, terminated by a chunk with
+`finish_reason: "stop"` and then `data: [DONE]`.
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:30000/v1", api_key="none")
+
+with open("speech.wav", "rb") as f:
+    stream = client.audio.transcriptions.create(
+        model="Qwen/Qwen3-ASR-0.6B",
+        file=f,
+        response_format="json",
+        stream=True,
+    )
+    for event in stream:
+        # event.delta holds the incremental transcript text
+        print(event.delta, end="", flush=True)
+```
+
+Or with `curl`:
+
+```bash
+curl http://127.0.0.1:30000/v1/audio/transcriptions \
+  -F model=Qwen/Qwen3-ASR-0.6B \
+  -F file=@speech.wav \
+  -F stream=true
+```
+
+### Chunked vs. segment mode
+
+The default `chunked` mode overlaps a sliding window for the best transcript continuity. Launch
+with `--asr-streaming-mode segment` to instead encode each second of audio exactly once:
+
+```bash
+python3 -m sglang.launch_server --model-path Qwen/Qwen3-ASR-0.6B \
+  --asr-streaming-mode segment --host 0.0.0.0 --port 30000
+```
+
+In `chunked` mode a small trailing "unfixed" region of text may be revised as more audio arrives
+(rollback); in `segment` mode each emitted delta is final. Because segments are disjoint, a word
+straddling a segment boundary can be clipped — this is the inherent cost of the once-per-second
+encoding and is why `chunked` mode overlaps its window.
+
+## Realtime WebSocket (`/v1/realtime`)
+
+The `/v1/realtime` endpoint implements the transcription subset of OpenAI's Realtime API. A client
+opens a WebSocket, configures the session, streams PCM audio frames, and receives transcription
+events.
+
+**Audio format:** raw **PCM16 little-endian, mono**, base64-encoded in each
+`input_audio_buffer.append`. The wire sample rate is declared in `session.update` via
+`audio.input.format.rate` (accepted: `16000`, `24000`, `48000`; default `24000`) and is resampled
+server-side to the model's input rate.
+
+### Manual commit (client-driven turns)
+
+With `turn_detection: null`, the client decides when an utterance ends by sending
+`input_audio_buffer.commit`.
+
+```python
+import asyncio, base64, json, soundfile as sf, numpy as np, websockets
+
+MODEL = "Qwen/Qwen3-ASR-0.6B"
+
+async def transcribe(path):
+    data, sr = sf.read(path, dtype="float32")          # mono, 16 kHz file
+    pcm = (np.clip(data, -1, 1) * 32767).astype("<i2").tobytes()
+
+    async with websockets.connect("ws://127.0.0.1:30000/v1/realtime") as ws:
+        await ws.recv()  # session.created
+        await ws.send(json.dumps({
+            "type": "session.update",
+            "session": {
+                "type": "transcription",
+                "audio": {"input": {
+                    "format": {"type": "audio/pcm", "rate": 16000},
+                    "transcription": {"model": MODEL},
+                    "turn_detection": None,
+                }},
+            },
+        }))
+
+        # stream 100 ms frames
+        frame = int(0.1 * sr) * 2
+        for off in range(0, len(pcm), frame):
+            await ws.send(json.dumps({
+                "type": "input_audio_buffer.append",
+                "audio": base64.b64encode(pcm[off:off + frame]).decode(),
+            }))
+        await ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
+
+        async for raw in ws:
+            msg = json.loads(raw)
+            if msg["type"].endswith("transcription.delta"):
+                print(msg["delta"], end="", flush=True)
+            elif msg["type"].endswith("transcription.completed"):
+                print("\nFINAL:", msg["transcript"])
+                break
+
+asyncio.run(transcribe("speech.wav"))
+```
+
+### Server-side VAD (`turn_detection: server_vad`)
+
+Set `turn_detection` to `{"type": "server_vad"}` and the server detects speech boundaries with
+[silero-vad](https://github.com/snakers4/silero-vad), auto-commits each utterance at end of
+speech, and skips inference on silence. **Manual commits are rejected in this mode.** An open
+microphone can idle indefinitely without burning compute or hitting the buffer cap.
+
+```json
+{
+  "type": "session.update",
+  "session": {
+    "type": "transcription",
+    "audio": {
+      "input": {
+        "format": {"type": "audio/pcm", "rate": 16000},
+        "transcription": {"model": "Qwen/Qwen3-ASR-0.6B"},
+        "turn_detection": {
+          "type": "server_vad",
+          "threshold": 0.5,
+          "prefix_padding_ms": 300,
+          "silence_duration_ms": 500
+        }
+      }
+    }
+  }
+}
+```
+
+- `threshold` — speech probability at or above which a frame counts as speech (`0`–`1`, default `0.5`).
+- `prefix_padding_ms` — leading audio included before detected speech (default `300`).
+- `silence_duration_ms` — trailing silence that ends an utterance (default `500`).
+
+Server-side VAD **requires a model whose input rate is 16 kHz** (silero-vad's operating rate); the
+server returns a structured error otherwise. A single clip that contains a pause is split into
+multiple utterances, each with its own `speech_started` / `speech_stopped` / `committed` /
+`completed` cycle.
+
+silero-vad is an **optional dependency**. Install it with the `asr-vad` extra (or directly),
+otherwise `server_vad` returns a `not_supported` error with an install hint:
+
+```bash
+pip install "sglang[asr-vad]"    # or: pip install silero-vad
+```
+
+### Event reference
+
+Events emitted by the server on `/v1/realtime`:
+
+| Event `type` | Meaning |
+| --- | --- |
+| `session.created` | Sent on connect. |
+| `session.updated` | Acknowledges a `session.update`. |
+| `input_audio_buffer.speech_started` | (VAD) speech detected; `audio_start_ms` is prefix-padded. |
+| `input_audio_buffer.speech_stopped` | (VAD) end of speech; triggers auto-commit. |
+| `input_audio_buffer.committed` | The buffered audio was committed as an item. |
+| `conversation.item.input_audio_transcription.delta` | Incremental transcript text (`delta`). |
+| `conversation.item.input_audio_transcription.completed` | Final transcript for the item (`transcript`). |
+| `conversation.item.input_audio_transcription.failed` | Transcription failed for the item. |
+| `input_audio_buffer.cleared` | The buffer was cleared. |
+| `error` | Protocol or validation error (`error.code`, `error.message`). |
+
+## Related server arguments
+
+See [Server Arguments](/docs/advanced_features/server_arguments) for the full list. The ASR-specific
+options are:
+
+| Argument | Default | Description |
+| --- | --- | --- |
+| `--asr-streaming-mode` | `chunked` | `chunked` (sliding-window re-transcription) or `segment` (independent fixed segments). Applies to the SSE path. |
+| `--asr-max-buffer-seconds` | `60` | Max seconds of PCM the realtime WS handler accumulates before closing with `buffer_overflow`. Guards against OOM when a client streams faster than inference can consume. |
+| `--asr-max-concurrent-sessions` | `32` | Max concurrent `/v1/realtime` sessions. Connections beyond the cap are sent a `too_many_sessions` error and closed. |
