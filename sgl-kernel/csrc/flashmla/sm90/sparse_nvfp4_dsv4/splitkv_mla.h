@@ -11,13 +11,16 @@ namespace sm90::decode::sparse_nvfp4_dsv4 {
 void run_flash_splitkv_mla_nvfp4_dsv4_sparse_kernel(
     const SparseAttnDecodeParams& params, const float* kv_global_scale, const float* extra_kv_global_scale);
 
+void run_flash_splitkv_mla_nvfp4_v32_sparse_kernel(
+    const SparseAttnDecodeParams& params, const float* kv_global_scale);
+
 // Generate split-K metadata with device-side length clamping. The upstream
 // scheduler assumes every topk_length is already within the corresponding
 // indices width; this private entry point makes that safety property explicit
 // for graph-replayed DSV4 inputs.
 void run_get_dsv4_nvfp4_decoding_sched_meta_kernel(const GetDecodeSchedMetaParams& params);
 
-template <int NUM_HEADS>
+template <int NUM_HEADS, bool IS_V32 = false>
 void run_flash_splitkv_mla_nvfp4_dsv4_sparse_kernel_impl(
     const SparseAttnDecodeParams& params, const float* kv_global_scale, const float* extra_kv_global_scale);
 

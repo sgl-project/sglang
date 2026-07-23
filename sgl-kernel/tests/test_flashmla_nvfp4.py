@@ -42,6 +42,7 @@ else:
 _PAGE_SIZE = 64
 _HEAD_DIM = NVFP4_LATENT_DIM + NVFP4_ROPE_DIM
 _NUM_Q_HEADS = 128
+_GLM_TP8_SCHEDULER_HEADS = 64
 _PROFILE_TOKENS_PER_REQUEST = 32 * 1024
 _PROFILE_PAGES_PER_REQUEST = _PROFILE_TOKENS_PER_REQUEST // _PAGE_SIZE
 
@@ -297,9 +298,9 @@ def _make_glm52_tp8_case(
     cache_seqlens = torch.full((batch_size,), seq_len, dtype=torch.int32, device=device)
     tile_scheduler_metadata, num_splits = get_metadata(
         cache_seqlens,
-        seq_len_q * num_q_heads,
+        seq_len_q * _GLM_TP8_SCHEDULER_HEADS,
         1,
-        num_q_heads,
+        _GLM_TP8_SCHEDULER_HEADS,
         is_fp8_kvcache=True,
         topk=topk,
     )
@@ -439,9 +440,9 @@ def _make_disjoint_32k_case(
     )
     tile_scheduler_metadata, num_splits = get_metadata(
         cache_seqlens,
-        seq_len_q * num_q_heads,
+        seq_len_q * _GLM_TP8_SCHEDULER_HEADS,
         1,
-        num_q_heads,
+        _GLM_TP8_SCHEDULER_HEADS,
         is_fp8_kvcache=True,
         topk=topk,
     )
@@ -462,14 +463,137 @@ def _make_disjoint_32k_case(
     )
 
 
+@pytest.mark.skipif(
+    _flash_mla is None
+    or getattr(_flash_mla, "_flashmla_import_error", None) is not None,
+    reason="sgl_kernel.flash_mla native module unavailable",
+)
+def test_flashmla_sparse_nvfp4_wrapper_pads_and_trims_heads(monkeypatch) -> None:
+    q = (
+        torch.arange(2 * 1 * 8 * _HEAD_DIM, dtype=torch.float32)
+        .to(torch.bfloat16)
+        .view(2, 1, 8, _HEAD_DIM)
+    )
+    k_cache = torch.empty((1, _PAGE_SIZE, 1, NVFP4_BYTES_PER_TOKEN), dtype=torch.uint8)
+    global_scale = torch.ones(1, dtype=torch.float32)
+    cache_seqlens = torch.ones(2, dtype=torch.int32)
+    metadata = torch.empty((1, 8), dtype=torch.int32)
+    num_splits = torch.empty(3, dtype=torch.int32)
+    indices = torch.empty((2, 1, 64), dtype=torch.int32)
+
+    expected_out = (
+        torch.arange(2 * 1 * 64 * NVFP4_LATENT_DIM, dtype=torch.float32)
+        .to(torch.bfloat16)
+        .view(2, 1, 64, NVFP4_LATENT_DIM)
+    )
+    expected_lse = torch.arange(2 * 64, dtype=torch.float32).view(2, 64, 1)
+
+    def fake_op(
+        q_arg,
+        cache_arg,
+        scale_arg,
+        d_v,
+        lengths_arg,
+        sm_scale,
+        metadata_arg,
+        splits_arg,
+        indices_arg,
+    ):
+        assert q_arg.shape == (2, 1, 64, _HEAD_DIM)
+        torch.testing.assert_close(q_arg[:, :, :8], q)
+        assert torch.count_nonzero(q_arg[:, :, 8:]) == 0
+        assert cache_arg is k_cache
+        assert scale_arg is global_scale
+        assert lengths_arg is cache_seqlens
+        assert metadata_arg is metadata
+        assert splits_arg is num_splits
+        assert indices_arg is indices
+        assert d_v == NVFP4_LATENT_DIM
+        assert sm_scale == pytest.approx(0.25)
+        return expected_out, expected_lse
+
+    monkeypatch.setattr(_flash_mla, "_get_nvfp4_decode_op", lambda: fake_op)
+    out, lse = _flash_mla.flash_mla_with_kvcache_nvfp4(
+        q,
+        k_cache,
+        global_scale,
+        cache_seqlens,
+        metadata,
+        num_splits,
+        indices,
+        head_dim_v=NVFP4_LATENT_DIM,
+        softmax_scale=0.25,
+    )
+    torch.testing.assert_close(out, expected_out[:, :, :8])
+    torch.testing.assert_close(lse, expected_lse[:, :8])
+    assert out.shape == (2, 1, 8, NVFP4_LATENT_DIM)
+    assert lse.shape == (2, 8, 1)
+
+    expected_single_out = expected_out[:1, :, :8].contiguous()
+    expected_single_lse = expected_lse[:1, :8].contiguous()
+
+    def fake_singleton_op(
+        q_arg,
+        cache_arg,
+        scale_arg,
+        d_v,
+        lengths_arg,
+        sm_scale,
+        metadata_arg,
+        splits_arg,
+        indices_arg,
+    ):
+        assert q_arg.shape == (1, 1, 8, _HEAD_DIM)
+        torch.testing.assert_close(q_arg, q[:1])
+        assert cache_arg is k_cache
+        assert scale_arg is global_scale
+        assert lengths_arg.shape == (1,)
+        assert metadata_arg is metadata
+        assert splits_arg.shape == (2,)
+        assert indices_arg.shape == (1, 1, 64)
+        assert d_v == NVFP4_LATENT_DIM
+        assert sm_scale == pytest.approx(0.25)
+        return expected_single_out, expected_single_lse
+
+    monkeypatch.setattr(
+        _flash_mla, "_get_nvfp4_decode_op", lambda: fake_singleton_op
+    )
+    singleton_out, singleton_lse = _flash_mla.flash_mla_with_kvcache_nvfp4(
+        q[:1],
+        k_cache,
+        global_scale,
+        cache_seqlens[:1],
+        metadata,
+        num_splits[:2],
+        indices[:1],
+        head_dim_v=NVFP4_LATENT_DIM,
+        softmax_scale=0.25,
+    )
+    torch.testing.assert_close(singleton_out, expected_single_out)
+    torch.testing.assert_close(singleton_lse, expected_single_lse)
+
+    with pytest.raises(ValueError, match="at least one query head"):
+        _flash_mla.flash_mla_with_kvcache_nvfp4(
+            q[:, :, :0],
+            k_cache,
+            global_scale,
+            cache_seqlens,
+            metadata,
+            num_splits,
+            indices,
+            head_dim_v=NVFP4_LATENT_DIM,
+            softmax_scale=0.25,
+        )
+
+
 @pytest.mark.skipif(not _is_sm90_supported(), reason="SM90 and CUDA >= 12.5 required")
 @pytest.mark.parametrize(
-    ("topk", "global_scale_value"),
-    [(64, 0.625), (128, 1.75)],
+    ("topk", "global_scale_value", "num_q_heads"),
+    [(64, 0.625, 8), (128, 1.75, _NUM_Q_HEADS)],
 )
 @torch.inference_mode()
 def test_flashmla_sparse_nvfp4_physical_pages(
-    topk: int, global_scale_value: float
+    topk: int, global_scale_value: float, num_q_heads: int
 ) -> None:
     native_fwd, get_metadata = _get_native_entry_points()
     quantize, dequantize = _require_codec()
@@ -488,7 +612,7 @@ def test_flashmla_sparse_nvfp4_physical_pages(
 
     q = (
         torch.randn(
-            (batch_size, seq_len_q, _NUM_Q_HEADS, _HEAD_DIM),
+            (batch_size, seq_len_q, num_q_heads, _HEAD_DIM),
             dtype=torch.bfloat16,
             device=device,
             generator=generator,
@@ -554,11 +678,12 @@ def test_flashmla_sparse_nvfp4_physical_pages(
     )
 
     cache_seqlens = torch.full((batch_size,), seq_len, dtype=torch.int32, device=device)
+    scheduler_heads = max(num_q_heads, _GLM_TP8_SCHEDULER_HEADS)
     tile_scheduler_metadata, num_splits = get_metadata(
         cache_seqlens,
-        seq_len_q * _NUM_Q_HEADS,
+        seq_len_q * scheduler_heads,
         1,
-        _NUM_Q_HEADS,
+        scheduler_heads,
         is_fp8_kvcache=True,
         topk=topk,
     )
@@ -693,6 +818,24 @@ def test_flashmla_sparse_nvfp4_rejects_invalid_contracts() -> None:
             head_dim_v=NVFP4_LATENT_DIM,
             softmax_scale=softmax_scale,
         )
+    misaligned_storage = torch.empty(
+        k_cache.numel() + 1, dtype=torch.uint8, device=q.device
+    )
+    misaligned_cache = misaligned_storage[1:].view_as(k_cache)
+    assert misaligned_cache.is_contiguous()
+    assert misaligned_cache.data_ptr() % 16 != 0
+    with pytest.raises(RuntimeError, match="16-byte aligned"):
+        native_fwd(
+            q,
+            misaligned_cache,
+            global_scale,
+            cache_seqlens,
+            tile_scheduler_metadata,
+            num_splits,
+            physical_topk,
+            head_dim_v=NVFP4_LATENT_DIM,
+            softmax_scale=softmax_scale,
+        )
 
 
 @pytest.mark.skipif(not _is_sm90_supported(), reason="SM90 and CUDA >= 12.5 required")
@@ -747,8 +890,9 @@ def test_flashmla_sparse_nvfp4_disjoint_32k_ranges(batch_size: int) -> None:
 
 
 @pytest.mark.skipif(not _is_sm90_supported(), reason="SM90 and CUDA >= 12.5 required")
+@pytest.mark.parametrize("batch_size", [1, 2])
 @torch.inference_mode()
-def test_flashmla_sparse_nvfp4_cuda_graph_replay() -> None:
+def test_flashmla_sparse_nvfp4_cuda_graph_replay(batch_size: int) -> None:
     native_fwd, get_metadata = _get_native_entry_points()
     quantize, dequantize = _require_codec()
     (
@@ -761,13 +905,16 @@ def test_flashmla_sparse_nvfp4_cuda_graph_replay() -> None:
         physical_topk,
         dequantized_cache,
         softmax_scale,
-    ) = _make_glm52_tp8_case(quantize, dequantize, get_metadata)
+    ) = _make_glm52_tp8_case(
+        quantize, dequantize, get_metadata, batch_size=batch_size
+    )
 
     # Keep q's address stable across capture/replay.  Starting from zeros makes
     # the post-replay mutation visible even before comparing with the reference.
     static_q = torch.zeros_like(replay_q)
-    assert static_q.shape == (1, 1, 8, _HEAD_DIM)
-    assert physical_topk.shape == (1, 1, 2048)
+    static_indices = physical_topk.clone()
+    assert static_q.shape == (batch_size, 1, 8, _HEAD_DIM)
+    assert static_indices.shape == (batch_size, 1, 2048)
 
     # Warm lazy CUDA state on a side stream so capture contains only the op.
     warmup_stream = torch.cuda.Stream()
@@ -780,7 +927,7 @@ def test_flashmla_sparse_nvfp4_cuda_graph_replay() -> None:
             cache_seqlens,
             tile_scheduler_metadata,
             num_splits,
-            physical_topk,
+            static_indices,
             head_dim_v=NVFP4_LATENT_DIM,
             softmax_scale=softmax_scale,
         )
@@ -795,20 +942,26 @@ def test_flashmla_sparse_nvfp4_cuda_graph_replay() -> None:
             cache_seqlens,
             tile_scheduler_metadata,
             num_splits,
-            physical_topk,
+            static_indices,
             head_dim_v=NVFP4_LATENT_DIM,
             softmax_scale=softmax_scale,
         )
 
     captured_out = graph_out.clone()
     captured_lse = graph_lse.clone()
+    out_data_ptr = graph_out.data_ptr()
+    lse_data_ptr = graph_lse.data_ptr()
     static_q.copy_(replay_q)
+    static_indices.copy_(physical_topk)
+    static_indices[..., 0] = -1
     graph.replay()
     torch.cuda.synchronize()
 
     out_ref, lse_ref = _reference_sparse_attention(
-        replay_q, dequantized_cache, physical_topk, softmax_scale
+        replay_q, dequantized_cache, static_indices, softmax_scale
     )
+    assert graph_out.data_ptr() == out_data_ptr
+    assert graph_lse.data_ptr() == lse_data_ptr
     assert not torch.equal(graph_out, captured_out)
     assert not torch.equal(graph_lse, captured_lse)
     torch.testing.assert_close(graph_out, out_ref, atol=8e-4, rtol=2.01 / 128)

@@ -23,7 +23,8 @@ from sglang.srt.layers.attention.dsa.nvfp4_k_cache import (
     _as_global_scale,
     _decode_e2m1_torch,
     _dequantize_nvfp4_k_cache_paged_kernel,
-    _e2m1_rne_torch,
+    _e2m1_rne_scaled_torch,
+    _quantize_nvfp4_launch_config,
     _quantize_nvfp4_k_cache_into_kernel,
 )
 
@@ -122,7 +123,11 @@ def quantize_dsv4_nvfp4_k_cache_into(
     rope_rows = rows[:, -DSV4_NVFP4_ROPE_BYTES:].view(torch.bfloat16)
 
     if rows.is_cuda:
-        _quantize_nvfp4_k_cache_into_kernel[(loc.numel(), _NUM_NOPE_BLOCKS + 1)](
+        blocks_per_program, num_warps = _quantize_nvfp4_launch_config(loc.numel())
+        grid_parts = (
+            _NUM_NOPE_BLOCKS + blocks_per_program - 1
+        ) // blocks_per_program
+        _quantize_nvfp4_k_cache_into_kernel[(loc.numel(), grid_parts)](
             k_nope,
             k_rope,
             packed_rows,
@@ -137,7 +142,8 @@ def quantize_dsv4_nvfp4_k_cache_into(
             scale_rows.stride(0),
             rope_rows.stride(0),
             NUM_LATENT_BLOCKS=_NUM_NOPE_BLOCKS,
-            num_warps=1,
+            BLOCKS_PER_PROGRAM=blocks_per_program,
+            num_warps=num_warps,
         )
         return
 
@@ -147,8 +153,9 @@ def quantize_dsv4_nvfp4_k_cache_into(
     )
     scale_fp8 = scale.to(torch.float8_e4m3fn)
     denominator = scale_fp8.float().unsqueeze(-1) * global_scale_tensor
-    normalized = torch.where(denominator > 0, blocks / denominator, 0.0)
-    codes = _e2m1_rne_torch(normalized).reshape(-1, DSV4_NVFP4_NOPE_DIM)
+    codes = _e2m1_rne_scaled_torch(blocks, denominator).reshape(
+        -1, DSV4_NVFP4_NOPE_DIM
+    )
     packed = codes[:, 0::2] | (codes[:, 1::2] << 4)
     valid = (loc >= 0) & (loc < rows.shape[0])
     if bool(valid.any()):
@@ -190,9 +197,7 @@ def dequantize_dsv4_nvfp4_k_cache_paged(
     rope_rows = rows[:, -DSV4_NVFP4_ROPE_BYTES:].view(torch.bfloat16)
 
     if rows.is_cuda:
-        _dequantize_nvfp4_k_cache_paged_kernel[
-            (token_indices.numel(), _NUM_NOPE_BLOCKS + 1)
-        ](
+        _dequantize_nvfp4_k_cache_paged_kernel[(token_indices.numel(),)](
             packed_rows,
             scale_rows,
             rope_rows,
@@ -206,7 +211,7 @@ def dequantize_dsv4_nvfp4_k_cache_paged(
             out.stride(0),
             NUM_LATENT_BLOCKS=_NUM_NOPE_BLOCKS,
             LATENT_DIM=DSV4_NVFP4_NOPE_DIM,
-            num_warps=1,
+            num_warps=4,
         )
         return out
 

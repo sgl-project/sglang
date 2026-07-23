@@ -139,6 +139,7 @@ if(FLASHMLA_ENABLE_SM90)
         "csrc/flashmla/sm90/sparse_nvfp4_dsv4/splitkv_mla.cu"
         "csrc/flashmla/sm90/sparse_nvfp4_dsv4/instantiations/model1_persistent_h64.cu"
         "csrc/flashmla/sm90/sparse_nvfp4_dsv4/instantiations/model1_persistent_h128.cu"
+        "csrc/flashmla/sm90/sparse_nvfp4_dsv4/instantiations/v32_persistent_h64.cu"
     )
 endif()
 

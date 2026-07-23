@@ -119,4 +119,10 @@ void run_flash_splitkv_mla_nvfp4_dsv4_sparse_kernel(
   }
 }
 
+void run_flash_splitkv_mla_nvfp4_v32_sparse_kernel(
+    const SparseAttnDecodeParams& params, const float* kv_global_scale) {
+  KU_ASSERT(params.h_q == 64, "V32 NVFP4 sparse decode requires 64 padded query heads");
+  run_flash_splitkv_mla_nvfp4_dsv4_sparse_kernel_impl<64, true>(params, kv_global_scale, nullptr);
+}
+
 }  // namespace sm90::decode::sparse_nvfp4_dsv4

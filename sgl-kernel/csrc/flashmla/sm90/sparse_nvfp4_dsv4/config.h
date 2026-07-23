@@ -13,26 +13,27 @@ using namespace cute;
 
 namespace sm90::decode::sparse_nvfp4_dsv4 {
 
-template <int NUM_HEADS>
+template <int NUM_HEADS, bool IS_V32 = false>
 class KernelTemplate {
  public:
   static_assert(NUM_HEADS == 64 || NUM_HEADS == 128);
+  static_assert(!IS_V32 || NUM_HEADS == 64);
   static constexpr int NUM_M_BLOCKS = NUM_HEADS / 64;
   static constexpr int CLUSTER_SIZE = NUM_M_BLOCKS;
 
-  static constexpr int HEAD_DIM_K = 512;
+  static constexpr int HEAD_DIM_K = IS_V32 ? 576 : 512;
   static constexpr int HEAD_DIM_V = 512;
   static constexpr int HEAD_DIM_ROPE = 64;
-  static constexpr int HEAD_DIM_NOPE = 448;
+  static constexpr int HEAD_DIM_NOPE = IS_V32 ? 512 : 448;
   static constexpr int PACKED_NOPE_BYTES = HEAD_DIM_NOPE / 2;
   static constexpr int SCALE_BLOCK_SIZE = 16;
   static constexpr int NUM_SCALES = HEAD_DIM_NOPE / SCALE_BLOCK_SIZE;
   static constexpr int ROPE_BYTES = HEAD_DIM_ROPE * sizeof(bf16);
   static constexpr int BYTES_PER_TOKEN = PACKED_NOPE_BYTES + NUM_SCALES + ROPE_BYTES;
 
-  static_assert(PACKED_NOPE_BYTES == 224);
-  static_assert(NUM_SCALES == 28);
-  static_assert(BYTES_PER_TOKEN == 380);
+  static_assert(PACKED_NOPE_BYTES == (IS_V32 ? 256 : 224));
+  static_assert(NUM_SCALES == (IS_V32 ? 32 : 28));
+  static_assert(BYTES_PER_TOKEN == (IS_V32 ? 416 : 380));
 
   static constexpr int NUM_THREADS = 128 * 3;
   static constexpr int BLOCK_M = 64;

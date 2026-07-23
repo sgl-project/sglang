@@ -20,6 +20,9 @@ namespace sm90::decode::sparse_nvfp4_dsv4 {
 static constexpr float MAX_INIT_VAL = -1e30;  // Prevent (-inf) - (-inf) = nan
 using cutlass::arch::fence_view_async_shared;
 using cutlass::arch::NamedBarrier;
+using decode::sparse_fp8::L1CacheHint;
+using decode::sparse_fp8::L2PrefetchHint;
+using decode::sparse_fp8::load_128b_from_gmem;
 
 // A 380-byte row is four-byte aligned for every token, but eight-byte aligned
 // only on alternating tokens. PTX u64 and vector loads require the stronger
@@ -101,9 +104,9 @@ __forceinline__ __device__ void scale_softmax(
   if (idx_in_warpgroup % 4 == 0) *(float2*)(sScale + 2 * (idx_in_warpgroup / 4)) = *(float2*)(scale_for_olds);
 }
 
-template <int NUM_HEADS>
+template <int NUM_HEADS, bool IS_V32>
 template <typename TMAParams>
-__device__ void KernelTemplate<NUM_HEADS>::devfunc(
+__device__ void KernelTemplate<NUM_HEADS, IS_V32>::devfunc(
     const SparseAttnDecodeParams& params,
     const TMAParams& tma_params,
     const float* kv_global_scale_ptr,
@@ -574,16 +577,28 @@ __device__ void KernelTemplate<NUM_HEADS>::devfunc(
                                       : -1;
           const bool token_is_valid = token_index >= 0 && static_cast<int64_t>(token_index) < token_capacity;
           const int safe_token_index = token_is_valid ? token_index : 0;
-          const int block_index =
-              page_block_size > 0
-                  ? static_cast<int>(static_cast<uint32_t>(safe_token_index) / static_cast<uint32_t>(page_block_size))
-                  : 0;
-          const int rel_idx_in_block =
-              page_block_size > 0
-                  ? static_cast<int>(static_cast<uint32_t>(safe_token_index) % static_cast<uint32_t>(page_block_size))
-                  : 0;
-          const uint8_t* const gK_base =
-              token_is_valid ? k_ptr + block_index * k_block_stride + rel_idx_in_block * k_row_stride : nullptr;
+          const uint8_t* gK_base = nullptr;
+          if (token_is_valid) {
+            if constexpr (IS_V32) {
+              // V32 is accepted only as a tightly packed [pages, 64, 1, 416]
+              // tensor.  Its flattened physical token index therefore maps
+              // directly to one 416-byte row; avoid a runtime integer divide,
+              // remainder, and the two-stride address calculation per token.
+              gK_base = k_ptr + static_cast<int64_t>(safe_token_index) * BYTES_PER_TOKEN;
+            } else {
+              const int block_index =
+                  page_block_size > 0
+                      ? static_cast<int>(
+                            static_cast<uint32_t>(safe_token_index) / static_cast<uint32_t>(page_block_size))
+                      : 0;
+              const int rel_idx_in_block =
+                  page_block_size > 0
+                      ? static_cast<int>(
+                            static_cast<uint32_t>(safe_token_index) % static_cast<uint32_t>(page_block_size))
+                      : 0;
+              gK_base = k_ptr + block_index * k_block_stride + rel_idx_in_block * k_row_stride;
+            }
+          }
 
           bf16* const sK_nope_base = plan.u.k[buf_idx].data() +
                                      (idx_in_cluster * (TOPK_BLOCK_SIZE / 2) + my_token_idx) * 8 +
@@ -609,7 +624,14 @@ __device__ void KernelTemplate<NUM_HEADS>::devfunc(
             uint64_t packed = 0;
             uint8_t block_scale_bits = 0;
             if (token_is_valid) {
-              packed = load_packed_e2m1x16_unaligned(gK_base + logical_dim / 2);
+              if constexpr (IS_V32) {
+                // V32's 416-byte rows, packed-data base, and every 16-value
+                // fragment are naturally eight-byte aligned.  Avoid the two
+                // scalar u32 loads required by DSV4's 380-byte row layout.
+                packed = nvfp4::load_packed_e2m1x16(gK_base + logical_dim / 2);
+              } else {
+                packed = load_packed_e2m1x16_unaligned(gK_base + logical_dim / 2);
+              }
               block_scale_bits =
                   nvfp4::load_scale_e4m3_bits(gK_base + PACKED_NOPE_BYTES + logical_dim / SCALE_BLOCK_SIZE);
             }
@@ -639,7 +661,14 @@ __device__ void KernelTemplate<NUM_HEADS>::devfunc(
           for (int dim_idx = 0; dim_idx < HEAD_DIM_ROPE / 32; ++dim_idx) {
             bf16x8 rope = {};
             if (token_is_valid) {
-              rope = load_bf16x8_unaligned(gK_rope + dim_idx * 32 * sizeof(bf16));
+              if constexpr (IS_V32) {
+                // The RoPE payload starts at byte 288 in a 416-byte row, so
+                // each lane group's 16-byte vector is aligned.
+                rope = load_128b_from_gmem<bf16x8, L1CacheHint::EVICT_LAST, L2PrefetchHint::B128>(
+                    reinterpret_cast<const bf16*>(gK_rope) + dim_idx * 32);
+              } else {
+                rope = load_bf16x8_unaligned(gK_rope + dim_idx * 32 * sizeof(bf16));
+              }
             }
             const int smem_offset = (HEAD_DIM_NOPE + dim_idx * 32) * TOPK_BLOCK_SIZE;
             *reinterpret_cast<__int128_t*>(sK_rope_base + smem_offset) = *reinterpret_cast<const __int128_t*>(&rope);
@@ -698,8 +727,8 @@ __global__ void __launch_bounds__(Kernel::NUM_THREADS, 1, Kernel::CLUSTER_SIZE)
   Kernel::devfunc(params, tma_params, kv_global_scale, extra_kv_global_scale);
 }
 
-template <int NUM_HEADS>
-void KernelTemplate<NUM_HEADS>::run(
+template <int NUM_HEADS, bool IS_V32>
+void KernelTemplate<NUM_HEADS, IS_V32>::run(
     const SparseAttnDecodeParams& params, const float* kv_global_scale, const float* extra_kv_global_scale) {
   KU_ASSERT(params.h_kv == 1);
   KU_ASSERT(params.topk % TOPK_BLOCK_SIZE == 0);
@@ -712,7 +741,8 @@ void KernelTemplate<NUM_HEADS>::run(
   KU_ASSERT(params.kv != nullptr);
   KU_ASSERT(kv_global_scale != nullptr);
   KU_ASSERT(
-      params.stride_kv_row == BYTES_PER_TOKEN, "Each primary NVFP4 KV row must contain exactly 380 contiguous bytes");
+      params.stride_kv_row == BYTES_PER_TOKEN,
+      "Each primary NVFP4 KV row must match the specialization's contiguous byte width");
   if (params.extra_kv != nullptr) {
     KU_ASSERT(params.extra_indices != nullptr);
     KU_ASSERT(params.extra_page_block_size > 0);
@@ -767,7 +797,7 @@ void KernelTemplate<NUM_HEADS>::run(
 
   TmaParams<decltype(shape_Q), decltype(tma_Q)> tma_params = {shape_Q, tma_Q, tensor_map_o};
   auto mla_kernel =
-      &flash_fwd_splitkv_mla_nvfp4_dsv4_scaled_sparse_kernel<KernelTemplate<NUM_HEADS>, decltype(tma_params)>;
+      &flash_fwd_splitkv_mla_nvfp4_dsv4_scaled_sparse_kernel<KernelTemplate<NUM_HEADS, IS_V32>, decltype(tma_params)>;
 
   constexpr size_t smem_size = sizeof(SharedMemoryPlan);
   KU_CUDA_CHECK(cudaFuncSetAttribute(mla_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
@@ -796,10 +826,10 @@ void KernelTemplate<NUM_HEADS>::run(
   KU_CHECK_KERNEL_LAUNCH();
 }
 
-template <int NUM_HEADS>
+template <int NUM_HEADS, bool IS_V32>
 void run_flash_splitkv_mla_nvfp4_dsv4_sparse_kernel_impl(
     const SparseAttnDecodeParams& params, const float* kv_global_scale, const float* extra_kv_global_scale) {
-  KernelTemplate<NUM_HEADS>::run(params, kv_global_scale, extra_kv_global_scale);
+  KernelTemplate<NUM_HEADS, IS_V32>::run(params, kv_global_scale, extra_kv_global_scale);
 }
 
 }  // namespace sm90::decode::sparse_nvfp4_dsv4

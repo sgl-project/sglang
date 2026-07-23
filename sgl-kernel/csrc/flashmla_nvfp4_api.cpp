@@ -20,7 +20,9 @@
 
 #include <cmath>
 #include <cstdint>
+#include <limits>
 
+#include "flashmla/sm90/sparse_nvfp4_dsv4/splitkv_mla.h"
 #include "flashmla/sm90/sparse_nvfp4/layout.h"
 #include "flashmla/sm90/sparse_nvfp4/legacy_params.h"
 #include "flashmla/sm90/sparse_nvfp4/splitkv_mla.h"
@@ -34,6 +36,11 @@ namespace {
 
 void check_same_device(const at::Tensor& reference, const at::Tensor& tensor, const char* tensor_name) {
   TORCH_CHECK(tensor.device() == reference.device(), tensor_name, " must be on the same CUDA device as q");
+}
+
+int checked_stride(int64_t stride, const char* name) {
+  TORCH_CHECK(stride >= 0 && stride <= std::numeric_limits<int>::max(), name, " stride does not fit in an int32");
+  return static_cast<int>(stride);
 }
 
 }  // namespace
@@ -108,7 +115,9 @@ std::vector<at::Tensor> fwd_kvcache_mla_nvfp4_impl(
       kcache.stride(0) == 64 * sm90::nvfp4::kBytesPerToken && kcache.stride(1) == sm90::nvfp4::kBytesPerToken &&
           kcache.stride(2) == sm90::nvfp4::kBytesPerToken && kcache.stride(3) == 1,
       "kcache must be tightly packed as [num_pages, 64, 1, 416]");
-
+  TORCH_CHECK(
+      reinterpret_cast<std::uintptr_t>(kcache.data_ptr()) % 16 == 0,
+      "kcache data pointer must be 16-byte aligned for the SM90 NVFP4 producer loads");
   TORCH_CHECK(kv_global_scale.numel() == 1, "kv_global_scale must be a device float32 scalar");
   TORCH_CHECK(
       kv_global_scale.dim() == 0 || (kv_global_scale.dim() == 1 && kv_global_scale.size(0) == 1),
@@ -126,6 +135,104 @@ std::vector<at::Tensor> fwd_kvcache_mla_nvfp4_impl(
   const int topk = static_cast<int>(indices.size(2));
   TORCH_CHECK(topk > 0, "topk must be positive");
   TORCH_CHECK(topk % 64 == 0, "topk must be a multiple of 64");
+
+  // The current FlashMLA H64 specialization is substantially faster than
+  // the pinned two-CTA compatibility kernel.  The Python wrapper pads GLM's
+  // TP-local heads to H64, matching the production FP8 path.
+  if (!enable_stage_timing && num_heads_q == 64) {
+    const auto options = q.options();
+    at::Tensor out = torch::empty({batch_size, seqlen_q, num_heads_q, head_size_v}, options);
+    at::Tensor softmax_lse =
+        torch::empty({batch_size, seqlen_q, num_heads_q}, options.dtype(at::kFloat));
+    const int num_sm_parts = static_cast<int>(tile_scheduler_metadata.size(0));
+    const int total_num_splits = batch_size + num_sm_parts;
+    at::Tensor softmax_lse_accum =
+        torch::empty({total_num_splits, seqlen_q, num_heads_q}, options.dtype(at::kFloat));
+    at::Tensor out_accum = torch::empty(
+        {total_num_splits, seqlen_q, num_heads_q, head_size_v}, options.dtype(at::kFloat));
+
+    SparseAttnDecodeParams params = {};
+    params.b = batch_size;
+    params.s_q = seqlen_q;
+    params.h_q = num_heads_q;
+    params.h_kv = 1;
+    params.d_qk = 576;
+    params.d_v = static_cast<int>(head_size_v);
+    params.sm_scale = static_cast<float>(softmax_scale);
+    params.sm_scale_div_log2 = static_cast<float>(softmax_scale * M_LOG2E);
+    params.num_blocks = static_cast<int>(kcache.size(0));
+    params.page_block_size = 64;
+    params.topk = topk;
+    params.model_type = ModelType::V32;
+    params.q = reinterpret_cast<cutlass::bfloat16_t*>(q.data_ptr());
+    params.kv = reinterpret_cast<cutlass::bfloat16_t*>(kcache.data_ptr());
+    params.indices = indices.data_ptr<int>();
+    params.topk_length = nullptr;
+    params.attn_sink = nullptr;
+    params.lse = softmax_lse.data_ptr<float>();
+    params.out = reinterpret_cast<cutlass::bfloat16_t*>(out.data_ptr());
+    params.extra_num_blocks = 0;
+    params.extra_page_block_size = 0;
+    params.extra_topk = 0;
+    params.extra_kv = nullptr;
+    params.extra_indices = nullptr;
+    params.extra_topk_length = nullptr;
+    params.stride_q_b = checked_stride(q.stride(0), "q batch");
+    params.stride_q_s_q = checked_stride(q.stride(1), "q sequence");
+    params.stride_q_h_q = checked_stride(q.stride(2), "q head");
+    params.stride_kv_block = checked_stride(kcache.stride(0), "kcache block");
+    params.stride_kv_row = checked_stride(kcache.stride(1), "kcache row");
+    params.stride_indices_b = checked_stride(indices.stride(0), "indices batch");
+    params.stride_indices_s_q = checked_stride(indices.stride(1), "indices sequence");
+    params.stride_lse_b = checked_stride(softmax_lse.stride(0), "lse batch");
+    params.stride_lse_s_q = checked_stride(softmax_lse.stride(1), "lse sequence");
+    params.stride_o_b = checked_stride(out.stride(0), "out batch");
+    params.stride_o_s_q = checked_stride(out.stride(1), "out sequence");
+    params.stride_o_h_q = checked_stride(out.stride(2), "out head");
+    params.stream = at::cuda::getCurrentCUDAStream().stream();
+    params.lse_accum = softmax_lse_accum.data_ptr<float>();
+    params.o_accum = out_accum.data_ptr<float>();
+    params.stride_lse_accum_split = checked_stride(softmax_lse_accum.stride(0), "lse_accum split");
+    params.stride_lse_accum_s_q = checked_stride(softmax_lse_accum.stride(1), "lse_accum sequence");
+    params.stride_o_accum_split = checked_stride(out_accum.stride(0), "out_accum split");
+    params.stride_o_accum_s_q = checked_stride(out_accum.stride(1), "out_accum sequence");
+    params.stride_o_accum_h_q = checked_stride(out_accum.stride(2), "out_accum head");
+    params.tile_scheduler_metadata_ptr =
+        reinterpret_cast<DecodingSchedMeta*>(tile_scheduler_metadata.data_ptr<int>());
+    params.num_splits_ptr = num_splits.data_ptr<int>();
+    params.num_sm_parts = num_sm_parts;
+
+    sm90::decode::sparse_nvfp4_dsv4::run_flash_splitkv_mla_nvfp4_v32_sparse_kernel(
+        params, kv_global_scale.data_ptr<float>());
+
+    CombineParams combine_params = {};
+    combine_params.b = params.b;
+    combine_params.s_q = params.s_q;
+    combine_params.h_q = params.h_q;
+    combine_params.d_v = params.d_v;
+    combine_params.lse = params.lse;
+    combine_params.out = params.out;
+    combine_params.stride_lse_b = params.stride_lse_b;
+    combine_params.stride_lse_s_q = params.stride_lse_s_q;
+    combine_params.stride_o_b = params.stride_o_b;
+    combine_params.stride_o_s_q = params.stride_o_s_q;
+    combine_params.stride_o_h_q = params.stride_o_h_q;
+    combine_params.lse_accum = params.lse_accum;
+    combine_params.o_accum = params.o_accum;
+    combine_params.stride_lse_accum_split = params.stride_lse_accum_split;
+    combine_params.stride_lse_accum_s_q = params.stride_lse_accum_s_q;
+    combine_params.stride_o_accum_split = params.stride_o_accum_split;
+    combine_params.stride_o_accum_s_q = params.stride_o_accum_s_q;
+    combine_params.stride_o_accum_h_q = params.stride_o_accum_h_q;
+    combine_params.tile_scheduler_metadata_ptr = params.tile_scheduler_metadata_ptr;
+    combine_params.num_splits_ptr = params.num_splits_ptr;
+    combine_params.num_sm_parts = params.num_sm_parts;
+    combine_params.attn_sink = nullptr;
+    combine_params.stream = params.stream;
+    smxx::decode::run_flash_mla_combine_kernel<cutlass::bfloat16_t>(combine_params);
+
+    return {out, softmax_lse.transpose(1, 2)};
+  }
 
   // h_k is fixed to one by the latent-cache ABI.  Fold q heads into the row
   // dimension exactly as the pinned FlashMLA sparse implementation does.

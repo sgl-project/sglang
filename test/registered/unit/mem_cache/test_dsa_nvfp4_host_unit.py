@@ -88,11 +88,13 @@ class TestDSANVFP4HostUnit(unittest.TestCase):
         layer = SimpleNamespace(
             layer_id=0, tp_q_head_num=8, head_dim=576, v_head_dim=512
         )
+        scheduler_metadata = torch.zeros((1, 8), dtype=torch.int32)
+        num_splits = torch.zeros(3, dtype=torch.int32)
         metadata = SimpleNamespace(
             dsa_cache_seqlens_int32=torch.full((2,), 64, dtype=torch.int32),
             flashmla_metadata=SimpleNamespace(
-                flashmla_metadata=torch.zeros((1, 8), dtype=torch.int32),
-                num_splits=torch.zeros(3, dtype=torch.int32),
+                flashmla_metadata=scheduler_metadata,
+                num_splits=num_splits,
             ),
         )
         expected = torch.zeros((2, 1, 8, 512), dtype=torch.bfloat16)
@@ -115,8 +117,37 @@ class TestDSANVFP4HostUnit(unittest.TestCase):
         self.assertIs(actual, expected)
         kwargs = native_fwd.call_args.kwargs
         self.assertIs(kwargs["kv_global_scale"], global_scale)
+        self.assertEqual(tuple(kwargs["q"].shape), (2, 1, 8, 576))
         self.assertEqual(tuple(kwargs["k_cache"].shape), (2, 64, 1, 416))
         self.assertEqual(tuple(kwargs["indices"].shape), (2, 1, 64))
+        self.assertIs(kwargs["tile_scheduler_metadata"], scheduler_metadata)
+        self.assertIs(kwargs["num_splits"], num_splits)
+
+    def test_flashmla_metadata_uses_h64_scheduler_for_tp8_h8(self):
+        backend = object.__new__(DeepseekSparseAttnBackend)
+        backend.flashmla_kv_num_q_heads = 64
+        backend.dsa_index_topk = 2048
+        cache_seqlens = torch.tensor([2048, 1024], dtype=torch.int32)
+        expected_metadata = torch.zeros((1, 8), dtype=torch.int32)
+        expected_splits = torch.zeros(3, dtype=torch.int32)
+
+        with patch(
+            "sgl_kernel.flash_mla.get_mla_metadata",
+            return_value=(expected_metadata, expected_splits),
+            create=True,
+        ) as get_metadata:
+            result = backend._compute_flashmla_metadata(cache_seqlens, seq_len_q=3)
+
+        get_metadata.assert_called_once_with(
+            cache_seqlens=cache_seqlens,
+            num_q_tokens_per_head_k=3 * 64,
+            num_heads_k=1,
+            num_heads_q=64,
+            is_fp8_kvcache=True,
+            topk=2048,
+        )
+        self.assertIs(result.flashmla_metadata, expected_metadata)
+        self.assertIs(result.num_splits, expected_splits)
 
     def test_server_gate_accepts_sm90_native_decode(self):
         args = SimpleNamespace(
