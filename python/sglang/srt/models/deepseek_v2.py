@@ -213,7 +213,7 @@ if _use_aiter:
     pass
 
 if _is_cuda:
-    from sglang.jit_kernel.dsv3_router_gemm import (
+    from sglang.kernels.ops.gemm._jit_dsv3_router_gemm import (
         dsv3_router_gemm as _jit_dsv3_router_gemm,
     )
 elif _is_npu:
@@ -459,14 +459,6 @@ class MoEGate(nn.Module):
                     "fp8",
                     "compressed_tensors",
                     "quark",
-                ):
-                    correction_bias_dtype = torch.bfloat16
-                # NOTE(kpham-sgl): flashinfer trtllm routing requires a bf16
-                # routing_bias; an fp32 bias yields NaN routing on exact ties.
-                # Mirror the fp8 path's cast.
-                if (
-                    quant_config.get_name() == "modelopt_fp4"
-                    and get_moe_runner_backend().is_flashinfer_trtllm()
                 ):
                     correction_bias_dtype = torch.bfloat16
             self.e_score_correction_bias = nn.Parameter(
