@@ -11,7 +11,7 @@ import torch
 
 import sglang.jit_kernel.dsv4.fp8_wo_a as fp8_wo_a_module
 from sglang.jit_kernel.dsv4 import sglang_per_token_group_quant_fp8_dsv4_wo_a
-from sglang.srt.layers.quantization.fp8_kernel import (
+from sglang.kernels.ops.quantization.fp8_kernel import (
     fp8_dtype,
     sglang_per_token_group_quant_fp8,
 )

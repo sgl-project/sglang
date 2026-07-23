@@ -3116,9 +3116,9 @@ class FP4BlockScaleLoraLauncher {
     static int const fuseActQuant = envFlag("SGLANG_OPT_FUSED_MOE_ACTIVATION_QUANT_FUSE") ? 1 : 0;
     static int const actOptMode = envFlag("SGLANG_OPT_FUSED_MOE_ACTIVATION_VEC") ? 1 : 0;
 
-    if (fuseActQuant) {
+    if (fuseActQuant && inter / 16 <= 512) {
       // Fused: gate_up (interleaved) + lora_delta -> act_fp4/sf/per_token + activation_lora_input,
-      // without materializing activated_bf16. inter must be a multiple of 16 (always true here).
+      // without materializing activated_bf16. >512 SF vecs/row falls to the unfused chain below.
       flashinfer::sgl_fused_act_quant::launchFusedActivationQuant(
           num_tokens * top_k,
           inter,

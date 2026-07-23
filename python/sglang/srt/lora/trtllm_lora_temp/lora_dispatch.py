@@ -18,12 +18,12 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.kernels.ops.quantization.fp8_kernel import per_token_group_quant_fp8
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
-from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
 from sglang.srt.utils.common import next_power_of_2
 
 if TYPE_CHECKING:
@@ -52,6 +52,9 @@ def fused_experts_none_to_experimental_sgl_trtllm_fp8_lora(
         trtllm_fp8_block_scale_routed_moe_lora,
     )
     from sglang.jit_kernel.trtllm_lora_temp.topk_pack import fused_pack_topk
+    from sglang.kernels.ops.moe.trtllm_lora_temp.virtual_experts import (
+        merged_experts_fused_moe_lora_add,
+    )
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
     from sglang.srt.layers.moe.topk import TopKOutputChecker
     from sglang.srt.layers.moe.utils import RoutingMethodType
@@ -61,9 +64,6 @@ def fused_experts_none_to_experimental_sgl_trtllm_fp8_lora(
     )
     from sglang.srt.lora.trtllm_lora_temp.shared_add_overlap import (
         maybe_overlap_staged_shared_add,
-    )
-    from sglang.srt.lora.trtllm_lora_temp.triton_ops import (
-        merged_experts_fused_moe_lora_add,
     )
     from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
 
@@ -316,6 +316,9 @@ def fused_experts_none_to_experimental_sgl_trtllm_bf16_lora(
     """
     from sglang.jit_kernel.trtllm_lora_temp import trtllm_bf16_routed_moe_lora
     from sglang.jit_kernel.trtllm_lora_temp.topk_pack import fused_pack_topk
+    from sglang.kernels.ops.moe.trtllm_lora_temp.virtual_experts import (
+        merged_experts_fused_moe_lora_add,
+    )
     from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
         fused_experts_none_to_flashinfer_trtllm_bf16,
         get_activation_type,
@@ -323,9 +326,6 @@ def fused_experts_none_to_experimental_sgl_trtllm_bf16_lora(
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
     from sglang.srt.layers.moe.topk import TopKOutputChecker
     from sglang.srt.layers.moe.utils import RoutingMethodType
-    from sglang.srt.lora.trtllm_lora_temp.triton_ops import (
-        merged_experts_fused_moe_lora_add,
-    )
     from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
 
     assert (
@@ -337,8 +337,13 @@ def fused_experts_none_to_experimental_sgl_trtllm_bf16_lora(
     assert TopKOutputChecker.format_is_standard(topk_output)
     assert runner_config.top_k is not None
 
-    # No active LoRA in a non-capture decode -> plain (fast) bf16 path.
-    if not get_is_capture_mode() and not lora_info.has_active_lora:
+    # No-LoRA non-capture decode -> fast bf16 path, valid only for 4-D block-shuffled
+    # weights ([E, M//128, K//128, 128]); flat [E, 2F, D] stays on the decomposed kernel.
+    if (
+        not get_is_capture_mode()
+        and not lora_info.has_active_lora
+        and quant_info.gemm1_weights.dim() == 4
+    ):
         return fused_experts_none_to_flashinfer_trtllm_bf16(
             dispatch_output, quant_info, runner_config, use_routed_topk=True
         )
@@ -469,14 +474,14 @@ def fused_experts_none_to_experimental_sgl_trtllm_fp4_lora(
         trtllm_fp4_block_scale_routed_moe_lora,
     )
     from sglang.jit_kernel.trtllm_lora_temp.topk_pack import fused_pack_topk
+    from sglang.kernels.ops.moe.trtllm_lora_temp.virtual_experts import (
+        merged_experts_fused_moe_lora_add,
+    )
     from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
         fused_experts_none_to_flashinfer_trtllm_fp4,
     )
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
     from sglang.srt.layers.moe.topk import TopKOutputChecker
-    from sglang.srt.lora.trtllm_lora_temp.triton_ops import (
-        merged_experts_fused_moe_lora_add,
-    )
     from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
 
     assert (

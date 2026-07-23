@@ -6,7 +6,7 @@ from sglang.jit_kernel.benchmark.utils import create_random
 from sglang.jit_kernel.per_token_group_quant_8bit_v2 import (
     per_token_group_quant_8bit_v2,
 )
-from sglang.srt.layers.quantization.fp8_kernel import (
+from sglang.kernels.ops.quantization.fp8_kernel import (
     create_per_token_group_quant_fp8_output_scale,
     fp8_dtype,
     fp8_max,

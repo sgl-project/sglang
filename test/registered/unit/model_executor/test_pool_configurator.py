@@ -10,6 +10,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -94,6 +95,8 @@ def _make_model_runner(
     mc.get_num_kv_heads = lambda tp_size: num_kv_heads
     mc.get_swa_num_kv_heads = lambda tp_size: swa_num_kv_heads or num_kv_heads
     mc.hf_config = SimpleNamespace(architectures=["LlamaForCausalLM"])
+    mc.hf_config.get_text_config = lambda: mc.hf_config
+    mc.linear_attn_registry_result = None
     mr.model_config = mc
 
     mr.kv_cache_dtype = "fake_bf16"
@@ -115,14 +118,25 @@ def _make_model_runner(
     sa.max_running_requests = max_running_requests
     sa.disaggregation_decode_extra_slots = disaggregation_decode_extra_slots
     sa.enable_dsa_cache_layer_split = False
+    sa.kv_cache_dtype = "auto"
     mr.server_args = sa
 
     spec = MagicMock()
     spec.is_eagle.return_value = False
     spec.is_standalone.return_value = False
     spec.is_dflash.return_value = False
+    spec.is_dflash_family.return_value = False
     spec.is_none.return_value = True
     mr.spec_algorithm = spec
+
+    mr.layer_info = SimpleNamespace(
+        start_layer=0, end_layer=num_layers, num_effective_layers=num_layers
+    )
+    mr.ps = ParallelState.trivial()
+    mr.pp_group = SimpleNamespace(rank_in_group=0)
+    mr.spec_aux_config = SimpleNamespace(
+        eagle_draft_num_layers=None, dflash_draft_num_layers=None
+    )
 
     return mr
 
@@ -515,7 +529,7 @@ class TestEagleConfigurator(unittest.TestCase):
         mr.spec_algorithm.is_eagle.return_value = True
         mr.spec_algorithm.is_standalone.return_value = False
         mr.spec_algorithm.is_none.return_value = False
-        mr.eagle_draft_num_layers = eagle_draft_num_layers
+        mr.spec_aux_config.eagle_draft_num_layers = eagle_draft_num_layers
 
         with mock_cpu_env():
             from sglang.srt.model_executor.pool_configurator import (

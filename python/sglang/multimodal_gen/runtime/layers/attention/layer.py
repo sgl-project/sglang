@@ -420,6 +420,7 @@ class LocalAttention(nn.Module):
         softmax_scale: float | None = None,
         causal: bool = False,
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
+        compute_dtype: torch.dtype | None = None,
         **extra_impl_args,
     ) -> None:
         super().__init__()
@@ -430,7 +431,7 @@ class LocalAttention(nn.Module):
         if num_kv_heads is None:
             num_kv_heads = num_heads
 
-        dtype = get_compute_dtype()
+        dtype = compute_dtype or get_compute_dtype()
         attn_backend = get_attn_backend(
             head_size, dtype, supported_attention_backends=supported_attention_backends
         )

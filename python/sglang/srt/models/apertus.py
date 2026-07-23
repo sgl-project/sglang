@@ -96,15 +96,11 @@ class ApertusMLP(nn.Module):
         self,
         x,
         forward_batch=None,
-        use_reduce_scatter: bool = False,
     ):
         # note: with xielu, there's no gate_proj
         x, _ = self.up_proj(x)
         x = self.act_fn(x)
-        x, _ = self.down_proj(
-            x,
-            skip_all_reduce=use_reduce_scatter,
-        )
+        x, _ = self.down_proj(x)
         return x
 
 

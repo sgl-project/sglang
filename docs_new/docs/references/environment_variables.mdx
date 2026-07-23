@@ -59,8 +59,8 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>0</code></td>
     </tr>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_EPLB_ROCM_P2P_BATCH_CHUNK_SIZE</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Number of logical expert IDs per batch when submitting P2P ops during EPLB rebalance on ROCm. Smaller values prevent RCCL GPU-side accumulation hangs but increase overhead.</td>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_EPLB_P2P_BATCH_CHUNK_SIZE</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Number of expert IDs per batch when submitting P2P ops during EPLB rebalance (CUDA and ROCm). Smaller values prevent NCCL/RCCL GPU-side accumulation hangs but increase overhead; set <code>&gt;= num_physical_experts</code> to submit a single batch. Deprecated alias: <code>SGLANG_EPLB_ROCM_P2P_BATCH_CHUNK_SIZE</code>.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>32</code></td>
     </tr>
     <tr>
@@ -166,6 +166,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_SCHEDULER_MAX_RECV_PER_POLL`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Set the maximum number of requests per poll, with a negative value indicating no limit</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`-1`</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_MAX_NEW_TOKENS_LIMIT</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Hard server-side limit for each generation request's `max_new_tokens`; requests asking for more are clipped. Disabled when unset or non-positive.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Not set</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_DATA_PARALLEL_BUDGET_INTERVAL`</td>
@@ -403,7 +408,7 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DISABLE_STATIC_WATERFILL</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Force dynamic DeepEP waterfill with runtime EP all-reduce instead of the default static local-batch path.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Force dynamic Waterfill with runtime EP all-reduce instead of the default static local-batch path.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
     <tr>
@@ -778,6 +783,26 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_FP4_IGNORED_LAYERS</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>A comma-separated list of layer names to keep out of FP4 online quantization, including <code>nvfp4_online</code>. For example: <code>model.layers.40,model.layers.41</code>.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>""</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_HUMMING_ONLINE_QUANT_CONFIG</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>JSON object or JSON file path for Humming online weight quantization. When a layer has no checkpoint quantization config, this config tells Humming how to quantize the loaded fp16/bf16 weight. When the checkpoint already has a Humming config, add <code>"force_requant": true</code> to requantize it to this schema during loading. Common keys include <code>dtype</code>/<code>weight_dtype</code>, <code>scale_dtype</code>, <code>group_size</code>, <code>scale_type</code>, <code>ignored_layers</code>, <code>ignore</code>, and <code>modules_to_not_convert</code>.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>None</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_HUMMING_INPUT_QUANT_CONFIG</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>JSON object or JSON file path for Humming input activation quantization. This controls the activation dtype and scale grouping passed into Humming kernels, independently of the weight schema. For example, <code>{'{"dtype": "float8e4m3"}'}</code> quantizes Humming inputs to FP8 E4M3.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>None</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_HUMMING_USE_F16_ACCUM</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use FP16 accumulation in Humming compute/tuning config. This is only meaningful for Humming dtype combinations that support FP16 accumulation, such as fp16 or FP8 E4M3 activations with float16 output. Leave it <code>false</code> for the default accumulator behavior.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_HUMMING_MOE_GEMM_TYPE</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Select the Humming MoE GEMM path for standard dispatch and DeepEP normal dispatch. <code>indexed</code> uses top-k expert ids directly and is the fallback for unset or unknown values. <code>grouped</code> maps to Humming grouped-contiguous GEMM. DeepEP low-latency dispatch uses grouped-masked GEMM internally and does not use this selector.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>""</code> (<code>indexed</code>)</td>
     </tr>
 </tbody>
 </table>
@@ -1810,11 +1835,6 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_NPU_USE_MLAPO</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use the MLAPO path on NPU.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_NPU_FUSED_MOE_MODE</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Fused MoE mode selector for NPU.</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>1</code></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_NPU_FORWARD_NATIVE_GELUTANH</code></td>

@@ -161,6 +161,15 @@ def _handle_output_by_index(output, i):
             spec_correct_drafts_histogram=_extract_field_by_index(
                 output, "spec_correct_drafts_histogram", i
             ),
+            spec_num_block_accept_tokens=_extract_field_by_index(
+                output, "spec_num_block_accept_tokens", i
+            ),
+            spec_num_cap_tokens=_extract_field_by_index(
+                output, "spec_num_cap_tokens", i
+            ),
+            spec_cap_lens_histogram=_extract_field_by_index(
+                output, "spec_cap_lens_histogram", i
+            ),
             time_stats=_extract_field_by_index(output, "time_stats", i),
             finished_reasons=_extract_field_by_index(output, "finished_reasons", i),
             decoded_texts=_extract_field_by_index(output, "decoded_texts", i),
@@ -223,6 +232,12 @@ def _handle_output_by_index(output, i):
             output_token_entropy_val=_extract_field_by_index(
                 output, "output_token_entropy_val", i, check_length=False
             ),
+            output_token_sampling_mask=_extract_field_by_index(
+                output, "output_token_sampling_mask", i, check_length=False
+            ),
+            output_token_sampling_logprobs=_extract_field_by_index(
+                output, "output_token_sampling_logprobs", i, check_length=False
+            ),
             output_hidden_states=_extract_field_by_index(
                 output, "output_hidden_states", i, check_length=False
             ),
@@ -262,6 +277,15 @@ def _handle_output_by_index(output, i):
             ),
             spec_correct_drafts_histogram=_extract_field_by_index(
                 output, "spec_correct_drafts_histogram", i
+            ),
+            spec_num_block_accept_tokens=_extract_field_by_index(
+                output, "spec_num_block_accept_tokens", i
+            ),
+            spec_num_cap_tokens=_extract_field_by_index(
+                output, "spec_num_cap_tokens", i
+            ),
+            spec_cap_lens_histogram=_extract_field_by_index(
+                output, "spec_cap_lens_histogram", i
             ),
             time_stats=_extract_field_by_index(output, "time_stats", i),
             finished_reasons=_extract_field_by_index(output, "finished_reasons", i),
@@ -316,6 +340,12 @@ def _handle_output_by_index(output, i):
             output_token_entropy_val=_extract_field_by_index(
                 output, "output_token_entropy_val", i, check_length=False
             ),
+            output_token_sampling_mask=_extract_field_by_index(
+                output, "output_token_sampling_mask", i, check_length=False
+            ),
+            output_token_sampling_logprobs=_extract_field_by_index(
+                output, "output_token_sampling_logprobs", i, check_length=False
+            ),
             output_hidden_states=_extract_field_by_index(
                 output, "output_hidden_states", i, check_length=False
             ),
@@ -351,29 +381,31 @@ class MultiHttpWorkerDetokenizerMixin:
     def multi_http_worker_event_loop(self: DetokenizerManager):
         """The event loop that handles requests, for multi multi-http-worker mode"""
         self.socket_mapping = SocketMapping()
+        # Watchdog wiring mirrors DetokenizerManager.event_loop: the watchdog is
+        # paused while waiting for input and fed once per processed message.
         while True:
-            recv_obj = sock_recv(self.recv_from_scheduler)
+            with self.soft_watchdog.disable():
+                recv_obj = sock_recv(self.recv_from_scheduler)
             output = self._request_dispatcher(recv_obj)
-            if output is None:
-                continue
-
-            # Fan out the output back to the originating tokenizer worker(s).
-            # In multi-detokenizer mode the upstream MultiDetokenizerRouter may
-            # forward either batched or single requests, so handle both shapes.
-            if isinstance(recv_obj, BaseBatchReq):
-                for i, ipc_name in enumerate(recv_obj.http_worker_ipcs):
-                    new_output = _handle_output_by_index(output, i)
+            if output is not None:
+                # Fan out the output back to the originating tokenizer worker(s).
+                # In multi-detokenizer mode the upstream MultiDetokenizerRouter may
+                # forward either batched or single requests, so handle both shapes.
+                if isinstance(recv_obj, BaseBatchReq):
+                    for i, ipc_name in enumerate(recv_obj.http_worker_ipcs):
+                        new_output = _handle_output_by_index(output, i)
+                        self.socket_mapping.send_output(
+                            ipc_name, new_output, is_tokenizer=True
+                        )
+                elif isinstance(recv_obj, BaseReq):
                     self.socket_mapping.send_output(
-                        ipc_name, new_output, is_tokenizer=True
+                        recv_obj.http_worker_ipc, output, is_tokenizer=True
                     )
-            elif isinstance(recv_obj, BaseReq):
-                self.socket_mapping.send_output(
-                    recv_obj.http_worker_ipc, output, is_tokenizer=True
-                )
-            else:
-                raise ValueError(
-                    f"multi_http_worker_event_loop got unexpected req type {type(recv_obj)}"
-                )
+                else:
+                    raise ValueError(
+                        f"multi_http_worker_event_loop got unexpected req type {type(recv_obj)}"
+                    )
+            self.soft_watchdog.feed()
 
 
 class MultiTokenizerRouter:
@@ -599,6 +631,9 @@ class TokenizerWorker(TokenizerManager):
         port_args: PortArgs,
     ):
         setproctitle.setproctitle(f"sglang::tokenizer_worker:{os.getpid()}")
+        import torch
+
+        torch.set_num_threads(1)
         # prevent init prefill bootstrapserver again
         disaggregation_mode = server_args.disaggregation_mode
         server_args.override(
@@ -711,9 +746,7 @@ async def print_exception_wrapper(func):
 
 
 def get_main_process_id() -> int:
-    """
-    Get the main process ID.
-    """
+    """Get the main process ID."""
     return multiprocessing.current_process()._parent_pid
 
 

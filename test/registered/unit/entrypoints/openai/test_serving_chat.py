@@ -45,6 +45,7 @@ class _MockTokenizerManager:
             tool_call_parser="hermes",
             reasoning_parser=None,
             stream_response_default_include_usage=False,
+            default_chat_template_kwargs=None,
         )
         # Mock hf_config for _resolve_chat_encoding_spec check
         mock_hf_config = Mock()
@@ -282,6 +283,54 @@ class ServingChatTestCase(unittest.TestCase):
             adapted, _ = self.chat._convert_to_internal_request(req)
 
         self.assertFalse(adapted.require_reasoning)
+
+    def test_default_chat_template_kwargs_applied_when_request_unset(self):
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        self.chat.default_chat_template_kwargs = {"enable_thinking": False}
+
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "What is 2+2?"}],
+        )
+
+        self.chat._process_messages(req, is_multimodal=False)
+
+        kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
+        self.assertIs(kwargs["enable_thinking"], False)
+
+    def test_default_chat_template_kwargs_overridden_per_request(self):
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        self.chat.default_chat_template_kwargs = {"enable_thinking": False}
+
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "What is 2+2?"}],
+            chat_template_kwargs={"enable_thinking": True},
+        )
+
+        self.chat._process_messages(req, is_multimodal=False)
+
+        kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
+        self.assertIs(kwargs["enable_thinking"], True)
+
+    def test_default_chat_template_kwargs_mirrors_reasoning_effort(self):
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        self.chat.default_chat_template_kwargs = {"reasoning_effort": "high"}
+
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "What is 2+2?"}],
+        )
+
+        self.chat._process_messages(req, is_multimodal=False)
+
+        self.assertEqual(req.reasoning_effort, "high")
 
     def test_kimi_tool_call_keeps_template_default_thinking(self):
         self.template_manager.chat_template_name = None
@@ -815,6 +864,81 @@ class ServingChatTestCase(unittest.TestCase):
 
         # Should return None since no completion is needed
         self.assertIsNone(result, "Should return None when no completion is needed")
+
+    def test_unstreamed_tool_args_raw_string_no_completion_needed(self):
+        """Test raw JSON string arguments are not JSON-encoded again at finish."""
+
+        mock_parser = Mock()
+        mock_detector = Mock()
+        mock_detector.prev_tool_call_arr = [
+            {"name": "report_template_recognition_commit", "arguments": "{}"}
+        ]
+        mock_detector.streamed_args_for_tool = ["{}"]
+        mock_parser.detector = mock_detector
+
+        content = {
+            "meta_info": {
+                "id": "chatcmpl-test123",
+            }
+        }
+
+        request = ChatCompletionRequest(
+            model="test",
+            messages=[{"role": "user", "content": "commit"}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {"name": "report_template_recognition_commit"},
+                }
+            ],
+        )
+
+        result = self.chat._check_for_unstreamed_tool_args(
+            parser=mock_parser,
+            content=content,
+            request=request,
+            index=0,
+        )
+
+        self.assertIsNone(result, "Should not append encoded quotes")
+
+    def test_unstreamed_tool_args_raw_string_completion(self):
+        """Test remaining raw JSON string arguments are sent at finish."""
+
+        mock_parser = Mock()
+        mock_detector = Mock()
+        mock_detector.prev_tool_call_arr = [
+            {
+                "name": "get_weather",
+                "arguments": '{"location": "San Francisco", "unit": "celsius"}',
+            }
+        ]
+        mock_detector.streamed_args_for_tool = ['{"location": "San Francisco"']
+        mock_parser.detector = mock_detector
+
+        content = {
+            "meta_info": {
+                "id": "chatcmpl-test123",
+            }
+        }
+
+        request = ChatCompletionRequest(
+            model="test",
+            messages=[{"role": "user", "content": "What's the weather?"}],
+            tools=[{"type": "function", "function": {"name": "get_weather"}}],
+        )
+
+        result = self.chat._check_for_unstreamed_tool_args(
+            parser=mock_parser,
+            content=content,
+            request=request,
+            index=0,
+        )
+
+        self.assertIsNotNone(result, "Should return chunk with remaining arguments")
+        chunk = json.loads(result[6:])
+        tool_calls = chunk["choices"][0]["delta"]["tool_calls"]
+        self.assertEqual(tool_calls[0]["function"]["arguments"], ', "unit": "celsius"}')
 
     def test_unstreamed_tool_args_no_parser_data(self):
         """Test that no completion chunk is sent when parser has no tool call data."""
@@ -2201,6 +2325,29 @@ class TestProcessToolCallsWithRequiredToolChoice(unittest.TestCase):
             self.assertEqual(tool_calls[0].function.name, "get_weather")
             self.assertEqual(fr["type"], "tool_calls")
 
+    def test_empty_parser_result_is_not_reported_as_tool_call(self):
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_chat.FunctionCallParser"
+        ) as ParserMock:
+            parser_instance = ParserMock.return_value
+            parser_instance.has_tool_call.return_value = True
+            parser_instance.detector.supports_structural_tag.return_value = True
+            parser_instance.parse_non_stream.return_value = ("Visible prefix.", [])
+
+            finish_reason = {"type": "stop", "matched": None}
+            tools = [{"type": "function", "function": {"name": "get_weather"}}]
+
+            tool_calls, text, fr = self.chat._process_tool_calls(
+                text="<|malformed_tool_call|>",
+                tools=tools,
+                finish_reason=finish_reason,
+                tool_choice="required",
+            )
+
+            self.assertIsNone(tool_calls)
+            self.assertEqual(text, "Visible prefix.")
+            self.assertEqual(fr, {"type": "stop", "matched": None})
+
     def test_required_without_parser_falls_back_to_json(self):
         """tool_choice='required' without parser should parse as JSON array."""
         self.chat.tool_call_parser = None
@@ -2267,6 +2414,157 @@ class TestNormalizeToolContent(unittest.TestCase):
             "tool", ["plain", {"type": "text", "text": "rich"}]
         )
         self.assertEqual(result, "plain rich")
+
+
+class InklingReasoningEffortTest(unittest.TestCase):
+    """Inkling reasoning-effort mapping and validation."""
+
+    def test_named_levels(self):
+        parse = OpenAIServingChat._parse_inkling_reasoning_effort
+        self.assertEqual(parse("none"), 0.0)
+        self.assertEqual(parse("minimal"), 0.1)
+        self.assertEqual(parse("low"), 0.2)
+        self.assertEqual(parse("medium"), 0.7)
+        self.assertEqual(parse("high"), 0.9)
+        # "xhigh" and "max" are aliases for the same 0.99 ceiling
+        self.assertEqual(parse("xhigh"), 0.99)
+        self.assertEqual(parse("max"), 0.99)
+        self.assertEqual(parse("max"), parse("xhigh"))
+
+    def test_scalar_range_is_validated(self):
+        parse = OpenAIServingChat._parse_inkling_reasoning_effort
+        self.assertEqual(parse(0.5), 0.5)
+        self.assertEqual(parse(0.99), 0.99)
+        for value in (1.0, "1.0", 2.0, "1.5", -1.0, float("nan"), True):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                parse(value)
+
+    def test_invalid_and_none(self):
+        parse = OpenAIServingChat._parse_inkling_reasoning_effort
+        self.assertIsNone(parse(None))
+        with self.assertRaises(ValueError):
+            parse("garbage")
+
+    def test_env_default(self):
+        from sglang.srt.environ import envs
+
+        get = OpenAIServingChat._get_inkling_default_reasoning_effort
+        env = envs.SGLANG_INKLING_DEFAULT_REASONING_EFFORT
+        try:
+            env.clear()  # unset -> EnvStr default "0.9"
+            self.assertEqual(get(), 0.9)
+            env.set("")  # explicit empty still uses the protocol default
+            self.assertEqual(get(), 0.9)
+            env.set("0.7")
+            self.assertEqual(get(), 0.7)
+            for value in ("1.0", "1.1", "garbage"):
+                env.set(value)
+                with self.subTest(value=value), self.assertRaises(ValueError):
+                    get()
+        finally:
+            env.clear()
+
+    def test_serving_does_not_prefill_model_message(self):
+        from sglang.srt.parser.inkling_tokenizer import INKLING_SPECIAL_TOKEN_IDS
+
+        class Tokenizer:
+            def encode(self, text, add_special_tokens=False):
+                return list(text.encode())
+
+        serving = object.__new__(OpenAIServingChat)
+        serving.chat_encoding_spec = "inkling"
+        serving.tokenizer_manager = Mock(tokenizer=Tokenizer())
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "hello"}],
+            reasoning_effort=0.5,
+        )
+        prompt_ids = serving._encode_messages(
+            [message.model_dump() for message in request.messages],
+            request,
+            thinking_mode=None,
+        )
+        self.assertEqual(prompt_ids[-1], INKLING_SPECIAL_TOKEN_IDS["<|end_message|>"])
+
+    def test_continue_final_message_resumes_open_model_text_block(self):
+        """Bug regression: continue_final_message was silently ignored on the
+        inkling path — the trailing assistant message rendered as a CLOSED
+        historical turn (<|end_message|> + <|content_model_end_sampling|>), so
+        the model started a fresh turn instead of continuing. The prefix must
+        render as an OPEN model text block."""
+        from sglang.srt.parser.inkling_tokenizer import INKLING_SPECIAL_TOKEN_IDS
+
+        class Tokenizer:
+            def encode(self, text, add_special_tokens=False):
+                return list(text.encode())
+
+        serving = object.__new__(OpenAIServingChat)
+        serving.chat_encoding_spec = "inkling"
+        serving.tokenizer_manager = Mock(tokenizer=Tokenizer())
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "The answer"},
+            ],
+            reasoning_effort=0.5,
+            continue_final_message=True,
+        )
+        prompt_ids = serving._encode_messages(
+            [message.model_dump() for message in request.messages],
+            request,
+            thinking_mode=None,
+        )
+        open_block = [
+            INKLING_SPECIAL_TOKEN_IDS["<|message_model|>"],
+            INKLING_SPECIAL_TOKEN_IDS["<|content_text|>"],
+            *list(b"The answer"),
+        ]
+        self.assertEqual(prompt_ids[-len(open_block) :], open_block)
+        self.assertNotIn(
+            INKLING_SPECIAL_TOKEN_IDS["<|content_model_end_sampling|>"], prompt_ids
+        )
+
+    def test_continue_final_message_leaves_tool_call_turns_closed(self):
+        """A trailing assistant message with tool_calls cannot be continued —
+        it must keep rendering as a closed historical turn."""
+        from sglang.srt.parser.inkling_tokenizer import INKLING_SPECIAL_TOKEN_IDS
+
+        class Tokenizer:
+            def encode(self, text, add_special_tokens=False):
+                return list(text.encode())
+
+        serving = object.__new__(OpenAIServingChat)
+        serving.chat_encoding_spec = "inkling"
+        serving.tokenizer_manager = Mock(tokenizer=Tokenizer())
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[
+                {"role": "user", "content": "hello"},
+                {
+                    "role": "assistant",
+                    "content": "calling",
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {"name": "weather", "arguments": "{}"},
+                        }
+                    ],
+                },
+            ],
+            reasoning_effort=0.5,
+            continue_final_message=True,
+        )
+        prompt_ids = serving._encode_messages(
+            [message.model_dump() for message in request.messages],
+            request,
+            thinking_mode=None,
+        )
+        self.assertEqual(
+            prompt_ids[-1],
+            INKLING_SPECIAL_TOKEN_IDS["<|content_model_end_sampling|>"],
+        )
 
 
 if __name__ == "__main__":

@@ -26,7 +26,7 @@ pytestmark = pytest.mark.skipif(
 
 @pytest.fixture(scope="module")
 def fused_routing():
-    from sglang.srt.layers.gemma4_fused_ops import gemma4_fused_routing
+    from sglang.kernels.ops.layernorm.gemma4_fused_ops import gemma4_fused_routing
 
     return gemma4_fused_routing
 

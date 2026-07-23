@@ -22,15 +22,16 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt.distributed import (
-    tensor_model_parallel_all_reduce,
-)
-from sglang.srt.layers.activation import GeluAndMul
-from sglang.srt.layers.elementwise import (
+from sglang.kernels.ops.layernorm.elementwise import (
     fused_dual_residual_rmsnorm,
     fused_rmsnorm,
     gelu_and_mul_triton,
 )
+from sglang.kernels.ops.moe.router import fused_moe_router_shim
+from sglang.srt.distributed import (
+    tensor_model_parallel_all_reduce,
+)
+from sglang.srt.layers.activation import GeluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -40,7 +41,6 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
-from sglang.srt.layers.moe.router import fused_moe_router_shim
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention

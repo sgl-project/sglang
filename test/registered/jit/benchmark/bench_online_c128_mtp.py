@@ -148,7 +148,7 @@ def benchmark(
 ) -> tuple[float, float, float]:
     case = make_case(batch_size, num_verify_tokens)
     module = _jit_online_c128_mtp_module(
-        HEAD_DIM, case.seq_lens.dtype, case.req_pool_indices.dtype
+        HEAD_DIM, case.seq_lens.dtype, case.req_pool_indices.dtype, case.state.dtype
     )
     fn = lambda: call_write_prefix(module, case)
 

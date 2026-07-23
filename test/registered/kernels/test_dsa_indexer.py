@@ -261,6 +261,7 @@ class MockModelRunner:
                 "dsa_decode_backend": "fa3",
                 "dsa_topk_backend": "sgl-kernel",
                 "dsa_paged_mqa_logits_backend": "auto",
+                "disaggregation_mode": "null",
             },
         )()
         self.hisparse_coordinator = None
@@ -367,11 +368,9 @@ class TestDSAIndexer(CustomTestCase):
                 extend_prefix_lens=torch.tensor(
                     [total_len - q_len] * batch_size, device=self.device
                 ),
-                extend_prefix_lens_cpu=torch.tensor(
-                    [total_len - q_len] * batch_size, device="cpu"
-                ),
+                extend_prefix_lens_cpu=[total_len - q_len] * batch_size,
                 extend_seq_lens=torch.tensor([q_len] * batch_size, device=self.device),
-                extend_seq_lens_cpu=torch.tensor([q_len] * batch_size, device="cpu"),
+                extend_seq_lens_cpu=[q_len] * batch_size,
             )
         else:  # ForwardMode.DECODE
             decode_len = 1
@@ -721,7 +720,7 @@ class TestDSAIndexer(CustomTestCase):
         self.assertEqual(indexer.layer_id, self.config["layer_id"])
 
     @patch("sglang.srt.layers.attention.dsa.dsa_indexer.deep_gemm")
-    @patch("sglang.srt.layers.attention.dsa.triton_kernel.act_quant")
+    @patch("sglang.kernels.ops.attention.dsa.triton_kernel.act_quant")
     def test_forward_extend_mode(self, mock_act_quant, mock_deep_gemm):
         """Test indexer forward pass in extend mode."""
         if not self.supports_fp8:
@@ -803,7 +802,7 @@ class TestDSAIndexer(CustomTestCase):
         )
 
     @patch("sglang.srt.layers.attention.dsa.dsa_indexer.deep_gemm")
-    @patch("sglang.srt.layers.attention.dsa.triton_kernel.act_quant")
+    @patch("sglang.kernels.ops.attention.dsa.triton_kernel.act_quant")
     def test_forward_decode_mode(self, mock_act_quant, mock_deep_gemm):
         """Test indexer forward pass in decode mode."""
         if not self.supports_fp8:

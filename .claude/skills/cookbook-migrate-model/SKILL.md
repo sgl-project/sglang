@@ -26,7 +26,7 @@ your dispatch prompt, or ask for it.
 
 1. **Never modernize.** Env vars, flags, TP values, docker tags, version strings
    are copied verbatim from the legacy page — even when today's defaults differ
-   (e.g. `SGLANG_ENABLE_SPEC_V2=1` is now default; keep it anyway). The recipe
+   (e.g. a flag whose behavior has since become the default; keep it anyway). The recipe
    that was verified is the recipe as written. Allowed normalizations are ONLY
    the five alias rewrites in dimension-mapping.md §2 (`launch_server`→`sglang
    serve`, `--model`→`--model-path`, `--tp-size`→`--tp`, abbreviated

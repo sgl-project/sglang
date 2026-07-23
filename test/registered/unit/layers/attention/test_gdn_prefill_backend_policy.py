@@ -37,6 +37,7 @@ def make_runner(
 
     return SimpleNamespace(
         server_args=args,
+        model_config=SimpleNamespace(),
         hybrid_gdn_config=SimpleNamespace(
             linear_key_head_dim=key_dim,
             linear_value_head_dim=value_dim,
@@ -60,6 +61,11 @@ class TestFlashInferGDNPrefillBackendPolicy(unittest.TestCase):
         flashinfer_available=True,
     ):
         with (
+            patch.object(
+                gdn_backend,
+                "hybrid_gdn_config",
+                return_value=runner.hybrid_gdn_config,
+            ),
             patch.object(gdn_backend, "is_cuda", return_value=cuda),
             patch.object(torch.cuda, "get_device_capability", return_value=capability),
             patch.object(torch.version, "cuda", cuda_version),

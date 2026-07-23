@@ -98,7 +98,7 @@ if _use_aiter:
     from aiter.ops.rmsnorm import add_rmsnorm_quant as _aiter_add_rmsnorm_quant
     from aiter.ops.rmsnorm import rmsnorm_quant as _aiter_rmsnorm_quant
 
-    from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype as _aiter_fp8_dtype
+    from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype as _aiter_fp8_dtype
 
     if _is_gfx95_supported:
         from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
@@ -385,6 +385,7 @@ class LayerScatterModes:
                 # Token dispatch/combine will be handled outside of LayerCommunicator for these modes.
                 not get_moe_a2a_backend().is_none()
                 or should_use_flashinfer_cutlass_moe_fp4_allgather()
+                or enable_dwdp()
             ):
                 return ScatterMode.SCATTERED
             # DSA CP and MLA CP both don't support MOE_FULL yet; fall back to FULL.
@@ -434,6 +435,10 @@ class LayerScatterModes:
 
 def enable_moe_dense_fully_dp():
     return get_server_args().moe_dense_tp_size == 1
+
+
+def enable_dwdp():
+    return get_server_args().dwdp_size > 1
 
 
 class LayerCommunicator:
@@ -1383,7 +1388,7 @@ class CommunicateSummableTensorPairFn:
         """Scatter MoE output back to TP_ATTN_FULL after MOE_FULL computation.
 
         After moe_tensor_model_parallel_all_reduce (which runs unconditionally since
-        use_reduce_scatter=False for this path), all ranks in the moe_cp group hold the
+        mlp_reduce_scatter=False for this path), all ranks in the moe_cp group hold the
         full MoE result for all cp_per_moe token chunks. We simply slice out this rank's
         CP-local portion.
 

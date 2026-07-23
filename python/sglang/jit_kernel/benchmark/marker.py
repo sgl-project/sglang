@@ -279,6 +279,9 @@ class Benchmark(Generic[F]):
                     if not DISABLE_LOG_BANDWIDTH:
                         bandwidths.append(float("nan"))
                     continue
+                except BaseException:
+                    print(f"Benchmark failed at {system}, kwargs =", kwargs)
+                    raise
                 latencies.append(result.times[0] / self._unit_scale)
                 if not DISABLE_LOG_BANDWIDTH and result.memory_footprint is not None:
                     should_log_bandwidth = True

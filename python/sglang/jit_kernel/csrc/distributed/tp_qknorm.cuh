@@ -11,19 +11,18 @@
 #include <sgl_kernel/vec.cuh>
 #include <sgl_kernel/warp.cuh>
 
-#include <sgl_kernel/distributed/common.cuh>
-#include <sgl_kernel/distributed/custom_all_reduce.cuh>
+#include <sgl_kernel/distributed/communicator.cuh>
 
 #include <cstdint>
 #include <cstring>
 
 namespace {
 
-using device::distributed::PushController;
-using host::distributed::CustomAllReduceBase, host::distributed::CustomAllReduceRef;
+using device::distributed::Counter;
+using host::distributed::CommunicatorObj, host::distributed::CommunicatorRef;
 
 struct ParallelQKNormParams {
-  void* __restrict__ buffer[device::distributed::kMaxNumGPU];
+  void* __restrict__ buffer[device::distributed::kMaxWorldSize];
   void* q_ptr;
   void* k_ptr;
   const void* __restrict__ q_weight;
@@ -102,7 +101,7 @@ struct KernelTrait {
 
 template <typename Trait>
 __global__ __launch_bounds__(Trait::kBlockSize, Trait::kOccupancy) void parallel_qknorm_across_head(
-    const ParallelQKNormParams __grid_constant__ params, const PushController __grid_constant__ ctrl) {
+    const ParallelQKNormParams __grid_constant__ params, Counter* const __restrict__ counters) {
   using namespace device;
 
   // each cta will handle exactly 1 token
@@ -140,10 +139,10 @@ __global__ __launch_bounds__(Trait::kBlockSize, Trait::kOccupancy) void parallel
     const auto start = (bx - num_tokens) * blockDim.x + threadIdx.x;
     const auto stride = (gridDim.x - num_tokens) * blockDim.x;
     for (uint32_t i = start; i < num_clean_up_count; i += stride)
-      ctrl.exit_unsafe(num_tokens + i);
+      counters[num_tokens + i].inc(1);
     return;
   }
-  const auto epoch_offset = ctrl.epoch() * epoch_bytes;  // only for comm
+  const auto epoch_offset = (counters[bx].get() % 2) * epoch_bytes;  // only for comm
 
   __builtin_assume(bx < num_tokens);  // since we have `bx >= num_tokens`
   Storage next_input;
@@ -226,16 +225,20 @@ __global__ __launch_bounds__(Trait::kBlockSize, Trait::kOccupancy) void parallel
     }
     input_i_ptr = input_next_ptr;
   }
-  ctrl.exit();
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    counters[bx].inc(1);  // NOTE: u32 overflow is safe under mod 2
+  }
 }
 
 template <typename DType, uint32_t kNumGPU, int64_t kQDim, int64_t kKDim, bool kUsePDL>
-struct FusedParallelQKNormAcrossHead : public CustomAllReduceBase {
+struct FusedParallelQKNormAcrossHead {
   using Trait = KernelTrait<DType, kNumGPU, kQDim, kKDim, kUsePDL>;
   static constexpr auto kernel = parallel_qknorm_across_head<Trait>;
-  static_assert(kNumGPU <= device::distributed::kMaxNumGPU, "kNumGPU exceeds the maximum supported GPUs");
+  static_assert(kNumGPU <= device::distributed::kMaxWorldSize, "kNumGPU exceeds the maximum supported GPUs");
 
-  void _run(
+  static void _run(
+      const CommunicatorObj& comm,
       const tvm::ffi::Tensor q,
       const tvm::ffi::Tensor k,
       const tvm::ffi::Tensor q_weight,
@@ -271,15 +274,16 @@ struct FusedParallelQKNormAcrossHead : public CustomAllReduceBase {
     // use at most `world_size` blocks to clean up,
     // this is based on the observation that occupancy is usually linear
     // with respect to the world size
-    const bool need_clean = num_tokens < m_max_num_cta_push;
-    const auto num_clean = need_clean ? (m_max_num_cta_push - num_tokens) : 0;
+    const auto max_num_blocks = comm.num_push_blocks;
+    const bool need_clean = num_tokens < max_num_blocks;
+    const auto num_clean = need_clean ? (max_num_blocks - num_tokens) : 0;
     const auto num_blocks = need_clean ? num_tokens + div_ceil(num_clean, Trait::kBlockSize)  //
-                                       : m_max_num_cta_push;                                  //
+                                       : max_num_blocks;                                      //
     const auto num_threads = Trait::kBlockSize;
-    RuntimeCheck(num_blocks <= m_max_num_cta_push, "internal error");
+    RuntimeCheck(num_blocks <= max_num_blocks, "internal error");
     ParallelQKNormParams params;
     for (uint32_t i = 0; i < kNumGPU; ++i) {
-      params.buffer[i] = get_push_buffer(m_peer_storage[i]);
+      params.buffer[i] = comm.push_workspaces[i];
     }
     params.q_ptr = q.data_ptr();
     params.k_ptr = k.data_ptr();
@@ -288,22 +292,21 @@ struct FusedParallelQKNormAcrossHead : public CustomAllReduceBase {
     params.q_stride_bytes = q.stride(0) * sizeof(DType);
     params.k_stride_bytes = k.stride(0) * sizeof(DType);
     params.eps = eps / kNumGPU;  // scale down eps by number of GPUs
-    params.rank = m_rank;
+    params.rank = comm.rank;
     params.num_tokens = num_tokens;
-    params.epoch_bytes = m_push_buffer_bytes;
+    params.epoch_bytes = static_cast<uint32_t>(comm.push_bytes);
     params.num_clean_up_count = num_clean;
 
     const auto needed_buffer_bytes = static_cast<int64_t>(num_tokens) * 2 * sizeof(float);
-    RuntimeCheck(m_num_gpu == kNumGPU, "Number of GPUs mismatch");
-    RuntimeCheck(m_push_ctrl.has_value(), "Controller is not initialized");
+    RuntimeCheck(comm.world_size == kNumGPU, "Number of GPUs mismatch");
     RuntimeCheck(std::bit_cast<intptr_t>(params.q_ptr) % 16 == 0, "q pointer is not properly aligned");
     RuntimeCheck(std::bit_cast<intptr_t>(params.k_ptr) % 16 == 0, "k pointer is not properly aligned");
     RuntimeCheck(std::bit_cast<intptr_t>(params.q_weight) % 16 == 0, "q_weight pointer is not properly aligned");
     RuntimeCheck(std::bit_cast<intptr_t>(params.k_weight) % 16 == 0, "k_weight pointer is not properly aligned");
-    RuntimeCheck(needed_buffer_bytes <= m_push_buffer_bytes, "Push buffer is too small");
+    RuntimeCheck(needed_buffer_bytes <= comm.push_bytes, "Push buffer is too small");
 
     LaunchKernel(num_blocks, num_threads, device)  //
-        .enable_pdl(kUsePDL)(kernel, params, *m_push_ctrl);
+        .enable_pdl(kUsePDL)(kernel, params, comm.push_counter);
   }
 
   static uint32_t get_max_occupancy() {
@@ -311,14 +314,13 @@ struct FusedParallelQKNormAcrossHead : public CustomAllReduceBase {
   }
 
   static void
-  run(CustomAllReduceRef obj,
+  run(CommunicatorRef comm,
       const tvm::ffi::Tensor q,
       const tvm::ffi::Tensor k,
       const tvm::ffi::Tensor q_weight,
       const tvm::ffi::Tensor k_weight,
       const float eps) {
-    using Self = FusedParallelQKNormAcrossHead;
-    return static_cast<Self*>(obj.get())->_run(q, k, q_weight, k_weight, eps);
+    return _run(*comm.get(), q, k, q_weight, k_weight, eps);
   }
 };
 

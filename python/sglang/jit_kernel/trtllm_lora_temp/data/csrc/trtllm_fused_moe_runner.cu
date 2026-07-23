@@ -533,6 +533,9 @@ void Runner::run(
       ptrCtaIdxXyToBatchIdx,
       ptrCtaIdxXyToMnLimit,
       ptrNumNonExitingCtas,
+#if SGLANG_FLASHINFER_HAS_PERMUTED_BIAS_ROW_IDX
+      /* permutedIdxToBiasRowIdx */ nullptr,
+#endif
       bmm1Workspace,
       stream,
       device,
@@ -712,6 +715,9 @@ void Runner::run(
       ptrCtaIdxXyToBatchIdx,
       ptrCtaIdxXyToMnLimit,
       ptrNumNonExitingCtas,
+#if SGLANG_FLASHINFER_HAS_PERMUTED_BIAS_ROW_IDX
+      /* permutedIdxToBiasRowIdx */ nullptr,
+#endif
       bmm2Workspace,
       stream,
       device,

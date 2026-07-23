@@ -26,6 +26,9 @@
 #ifndef cudaDevAttrComputeCapabilityMajor
 #define cudaDevAttrComputeCapabilityMajor hipDeviceAttributeComputeCapabilityMajor
 #endif
+#ifndef cudaDevAttrComputeCapabilityMinor
+#define cudaDevAttrComputeCapabilityMinor hipDeviceAttributeComputeCapabilityMinor
+#endif
 #ifndef cudaRuntimeGetVersion
 #define cudaRuntimeGetVersion hipRuntimeGetVersion
 #endif
@@ -66,6 +69,18 @@ inline auto get_cc_major(int device_id) -> int {
   int cc_major;
   RuntimeDeviceCheck(cudaDeviceGetAttribute(&cc_major, cudaDevAttrComputeCapabilityMajor, device_id));
   return cc_major;
+}
+
+// Return the Minor compute capability for the given device
+inline auto get_cc_minor(int device_id) -> int {
+  int cc_minor;
+  RuntimeDeviceCheck(cudaDeviceGetAttribute(&cc_minor, cudaDevAttrComputeCapabilityMinor, device_id));
+  return cc_minor;
+}
+
+// Return the SM version (major * 10 + minor) for the given device
+inline auto get_sm_version(int device_id) -> int {
+  return get_cc_major(device_id) * 10 + get_cc_minor(device_id);
 }
 
 // Return the runtime version

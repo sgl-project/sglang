@@ -99,6 +99,7 @@ jobs:
     if: |
       always() &&
       !cancelled() &&
+      needs.check-changes.result == 'success' &&
       github.event_name == 'pull_request' &&
       inputs.test_parallel_dispatch != true &&
       (needs.check-changes.outputs.main_package == 'true' || needs.check-changes.outputs.sgl_kernel == 'true') &&
@@ -127,6 +128,7 @@ jobs:
     if: |
       always() &&
       !cancelled() &&
+      needs.check-changes.result == 'success' &&
       github.event_name == 'pull_request' &&
       inputs.test_parallel_dispatch != true &&
       (needs.check-changes.outputs.main_package == 'true' || needs.check-changes.outputs.sgl_kernel == 'true') &&
@@ -266,6 +268,7 @@ jobs:
     needs: [check-changes, call-gate]
     if: |
       always() &&
+      needs.check-changes.result == 'success' &&
       ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
       (needs.check-changes.outputs.main_package == 'true')
     runs-on: ubuntu-latest
@@ -517,19 +520,20 @@ jobs:
       timeout_per_file: '1800'
     secrets: inherit
 
-  base-c-test-4-gpu-gb300:
-    needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels]
-    if: ${{ !failure() && !cancelled() }}
-    uses: ./.github/workflows/_pr-test-stage.yml
-    with:
-      self_name: base-c-test-4-gpu-gb300
-      runner_config: 4-gpu-gb300
-      check_changes: ${{ toJson(needs.check-changes.outputs) }}
-      caller_inputs: ${{ toJson(inputs) }}
-      partitions: ${{ needs.check-changes.outputs.partitions }}
-      run_timeout_minutes: '30'
-      timeout_per_file: '1800'
-    secrets: inherit
+  # temporarily disabled due to runner availability
+#   base-c-test-4-gpu-gb300:
+#     needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels]
+#     if: ${{ !failure() && !cancelled() }}
+#     uses: ./.github/workflows/_pr-test-stage.yml
+#     with:
+#       self_name: base-c-test-4-gpu-gb300
+#       runner_config: 4-gpu-gb300
+#       check_changes: ${{ toJson(needs.check-changes.outputs) }}
+#       caller_inputs: ${{ toJson(inputs) }}
+#       partitions: ${{ needs.check-changes.outputs.partitions }}
+#       run_timeout_minutes: '30'
+#       timeout_per_file: '1800'
+#     secrets: inherit
 
   pr-test-finish:
     needs:
@@ -561,7 +565,7 @@ jobs:
         base-c-test-deepep-4-gpu-b200,
         base-c-test-deepep-8-gpu-h200,
         base-c-test-4-gpu-b200,
-        base-c-test-4-gpu-gb300,
+#         base-c-test-4-gpu-gb300,  # temporarily disabled due to runner availability
       ]
     if: always()
     runs-on: ubuntu-latest

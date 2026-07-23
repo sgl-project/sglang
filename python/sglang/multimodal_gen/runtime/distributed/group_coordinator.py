@@ -602,10 +602,11 @@ class GroupCoordinator:
         group = self.device_group
         metadata_group = self.cpu_group
         assert src < self.world_size, f"Invalid src rank ({src})"
-        src = self.ranks[src]
+        src_rank_in_group = src
+        src_global_rank = self.ranks[src_rank_in_group]
 
         rank = self.rank
-        if rank == src:
+        if rank == src_global_rank:
             metadata_list: List[Tuple[Any, Any]] = []
             assert isinstance(
                 tensor_dict, dict
@@ -614,7 +615,7 @@ class GroupCoordinator:
             # `metadata_list` lives in CPU memory.
             # `broadcast_object_list` has serialization & deserialization,
             # all happening on CPU. Therefore, we can use the CPU group.
-            self.broadcast_object(metadata_list, src=src)
+            self.broadcast_object(metadata_list, src=src_rank_in_group)
             async_handles = []
             for tensor in tensor_list:
                 if tensor.numel() == 0:
@@ -623,19 +624,22 @@ class GroupCoordinator:
                 if tensor.is_cpu:
                     # use metadata_group for CPU tensors
                     handle = torch.distributed.broadcast(
-                        tensor, src=src, group=metadata_group, async_op=True
+                        tensor,
+                        src=src_global_rank,
+                        group=metadata_group,
+                        async_op=True,
                     )
                 else:
                     # use group for GPU tensors
                     handle = torch.distributed.broadcast(
-                        tensor, src=src, group=group, async_op=True
+                        tensor, src=src_global_rank, group=group, async_op=True
                     )
                 async_handles.append(handle)
             for async_handle in async_handles:
                 async_handle.wait()
 
         else:
-            metadata_list = self.broadcast_object(None, src=src)
+            metadata_list = self.broadcast_object(None, src=src_rank_in_group)
             tensor_dict = {}
             async_handles = []
             for key, value in metadata_list:
@@ -650,12 +654,15 @@ class GroupCoordinator:
                     if tensor.is_cpu:
                         # use metadata_group for CPU tensors
                         handle = torch.distributed.broadcast(
-                            tensor, src=src, group=metadata_group, async_op=True
+                            tensor,
+                            src=src_global_rank,
+                            group=metadata_group,
+                            async_op=True,
                         )
                     else:
                         # use group for GPU tensors
                         handle = torch.distributed.broadcast(
-                            tensor, src=src, group=group, async_op=True
+                            tensor, src=src_global_rank, group=group, async_op=True
                         )
                     async_handles.append(handle)
                     _update_nested_dict(tensor_dict, key, tensor)

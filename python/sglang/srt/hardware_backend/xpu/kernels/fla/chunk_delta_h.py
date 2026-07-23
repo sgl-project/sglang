@@ -4,12 +4,12 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.layers.attention.fla.index import (
+from sglang.kernels.ops.attention.fla.index import (
     prepare_chunk_indices,
     prepare_chunk_offsets,
 )
-from sglang.srt.layers.attention.fla.op import exp, make_tensor_descriptor, safe_exp
-from sglang.srt.layers.attention.fla.utils import (
+from sglang.kernels.ops.attention.fla.op import exp, make_tensor_descriptor, safe_exp
+from sglang.kernels.ops.attention.fla.utils import (
     autotune_cache_kwargs,
 )
 
