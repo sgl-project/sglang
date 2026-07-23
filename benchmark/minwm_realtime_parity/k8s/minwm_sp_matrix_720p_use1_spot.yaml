@@ -1,20 +1,20 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: minwm-spmatrix720p-p6-use1-20260723-29
+  name: minwm-spmatrix720p-p6-use1-20260723-30
   namespace: default
   labels:
-    app.kubernetes.io/name: minwm-spmatrix720p-p6-use1-20260723-29
+    app.kubernetes.io/name: minwm-spmatrix720p-p6-use1-20260723-30
     seedleap.ai/owner: chenshengdong
     seedleap.ai/purpose: minwm-sp-parity-perf
     seedleap.ai/task: minwm-realtime-parity
-    seedleap.ai/run-id: latest-ckpt-v20-spmatrix720p-attempt29-use1-p6-spot
+    seedleap.ai/run-id: latest-ckpt-v20-spmatrix720p-attempt30-use1-p6-spot
   annotations:
     seedleap.ai/capacity-type: spot
     seedleap.ai/repo: seedleap/sglang
     seedleap.ai/branch: codex/minwm-realtime-api
-    seedleap.ai/commit: "980a2870aee594343a6d226f027f722bffe702ba"
-    seedleap.ai/sglang-git-ref: "980a2870aee594343a6d226f027f722bffe702ba"
+    seedleap.ai/commit: "e14c9c8026878f076de33f1313e19d8ea1190400"
+    seedleap.ai/sglang-git-ref: "e14c9c8026878f076de33f1313e19d8ea1190400"
     seedleap.ai/minwm-git-ref: "2efc6485f65e8fcab506665efde79bc41406385e"
     seedleap.ai/checkpoint-version-id: "wduScksw2f3yPErnG9lBioOuE2AToyAP"
     seedleap.ai/ttl: 24h
@@ -27,15 +27,15 @@ spec:
   template:
     metadata:
       labels:
-        app.kubernetes.io/name: minwm-spmatrix720p-p6-use1-20260723-29
+        app.kubernetes.io/name: minwm-spmatrix720p-p6-use1-20260723-30
         seedleap.ai/owner: chenshengdong
         seedleap.ai/purpose: minwm-sp-parity-perf
         seedleap.ai/task: minwm-realtime-parity
-        seedleap.ai/run-id: latest-ckpt-v20-spmatrix720p-attempt29-use1-p6-spot
+        seedleap.ai/run-id: latest-ckpt-v20-spmatrix720p-attempt30-use1-p6-spot
       annotations:
         seedleap.ai/repo: seedleap/sglang
         seedleap.ai/branch: codex/minwm-realtime-api
-        seedleap.ai/commit: "980a2870aee594343a6d226f027f722bffe702ba"
+        seedleap.ai/commit: "e14c9c8026878f076de33f1313e19d8ea1190400"
     spec:
       restartPolicy: Never
       terminationGracePeriodSeconds: 60
@@ -62,13 +62,13 @@ spec:
                   key: token
                   optional: true
             - name: SGLANG_GIT_REF
-              value: "980a2870aee594343a6d226f027f722bffe702ba"
+              value: "e14c9c8026878f076de33f1313e19d8ea1190400"
             - name: MINWM_GIT_REF
               value: "2efc6485f65e8fcab506665efde79bc41406385e"
             - name: MINWM_BENCHMARK_MODE
               value: spmatrix720p
             - name: MINWM_RUN_ID
-              value: latest-ckpt-v20-spmatrix720p-attempt29-use1-p6-spot
+              value: latest-ckpt-v20-spmatrix720p-attempt30-use1-p6-spot
             - name: MINWM_SP_WARMUP_RUNS
               value: "1"
             - name: MINWM_STAGE_FROM_MOUNT
