@@ -14,9 +14,15 @@ PROCESSOR_MAPPING = {}
 
 
 def import_processors(package_name: str, overwrite: bool = False):
+    from sglang.srt.environ import envs
+
+    disabled = envs.SGLANG_DISABLED_MODEL_ARCHS.get()
     package = importlib.import_module(package_name)
     for _, name, ispkg in pkgutil.iter_modules(package.__path__, package_name + "."):
         if not ispkg:
+            if name.split(".")[-1] in disabled:
+                logger.debug(f"Skip loading {name} due to SGLANG_DISABLED_MODEL_ARCHS")
+                continue
             try:
                 module = importlib.import_module(name)
             except Exception as e:
@@ -24,13 +30,9 @@ def import_processors(package_name: str, overwrite: bool = False):
                 continue
             all_members = inspect.getmembers(module, inspect.isclass)
             classes = [
-                member
-                for name, member in all_members
-                if member.__module__ == module.__name__
+                member for name, member in all_members if member.__module__ == module.__name__
             ]
-            for cls in (
-                cls for cls in classes if issubclass(cls, BaseMultimodalProcessor)
-            ):
+            for cls in (cls for cls in classes if issubclass(cls, BaseMultimodalProcessor)):
                 assert hasattr(cls, "models")
                 for arch in getattr(cls, "models"):
                     if overwrite:
@@ -54,9 +56,7 @@ def get_mm_processor(
     if model_impl == "auto" and model_config is not None:
         from sglang.srt.model_loader.utils import get_resolved_model_impl
 
-        uses_transformers_backend = (
-            get_resolved_model_impl(model_config) == ModelImpl.TRANSFORMERS
-        )
+        uses_transformers_backend = get_resolved_model_impl(model_config) == ModelImpl.TRANSFORMERS
 
     for model_cls, processor_cls in PROCESSOR_MAPPING.items():
         if model_cls.__name__ not in hf_config.architectures:
@@ -64,9 +64,7 @@ def get_mm_processor(
         if not uses_transformers_backend or getattr(
             processor_cls, "supports_transformers_backend", False
         ):
-            return processor_cls(
-                hf_config, server_args, processor, transport_mode, **kwargs
-            )
+            return processor_cls(hf_config, server_args, processor, transport_mode, **kwargs)
 
     if uses_transformers_backend:
         from sglang.srt.multimodal.processors.transformers_auto import (
