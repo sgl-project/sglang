@@ -1423,6 +1423,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     choices=[],  # Empty choices array as per OpenAI spec
                     model=request.model,
                     usage=usage,
+                    system_fingerprint=content["meta_info"]["weight_version"],
                 )
                 yield f"data: {usage_chunk.model_dump_json()}\n\n"
 
@@ -1602,6 +1603,7 @@ class OpenAIServingChat(OpenAIServingBase):
             choices=choices,
             usage=usage,
             metadata={"weight_version": ret[0]["meta_info"]["weight_version"]},
+            system_fingerprint=ret[0]["meta_info"]["weight_version"],
             sglext=response_sglext,
         )
 

@@ -435,6 +435,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                     choices=[],
                     model=request.model,
                     usage=usage,
+                    system_fingerprint=content["meta_info"]["weight_version"],
                 )
                 final_usage_data = final_usage_chunk.model_dump_json(exclude_none=True)
                 yield f"data: {final_usage_data}\n\n"
@@ -563,6 +564,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
             choices=choices,
             usage=usage,
             metadata={"weight_version": ret[0]["meta_info"]["weight_version"]},
+            system_fingerprint=ret[0]["meta_info"]["weight_version"],
             sglext=response_sglext,
         )
 
