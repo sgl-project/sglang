@@ -192,6 +192,10 @@ def _min_redundant_experts_for_shrink(
 DIST_INIT_ADDR = os.environ.get("SGLANG_MC_DIST_INIT", "127.0.0.1:24655")
 PORT_A = int(os.environ.get("SGLANG_MC_PORT_A", "21100"))
 PORT_B = int(os.environ.get("SGLANG_MC_PORT_B", "10100"))
+# PORT_C is used when a test needs a SECOND joiner subprocess in the
+# same run (e.g. MC14's shrink-recover-then-append chains a recover
+# joiner on PORT_B with an append joiner on PORT_C).
+PORT_C = int(os.environ.get("SGLANG_MC_PORT_C", "10101"))
 HOST_A = os.environ.get("SGLANG_MC_HOST_A", "127.0.0.1")
 BASE_URL_A = f"http://{HOST_A}:{PORT_A}"
 
@@ -1150,6 +1154,121 @@ class TestMooncakeScaleDown4To5To4(_MooncakeShrinkEndToEndBase):
             self._generate_ok("post-grow", routed_dp_rank=4)
 
             self._scale_to(old_ep_size=5, target_ep_size=4)
+            self._generate_ok("post-shrink")
+        finally:
+            try:
+                kill_process_tree(joiner.pid)
+                joiner.wait(timeout=10)
+            except Exception:
+                pass
+
+
+@unittest.skip(
+    "MC13 exercises scale-up-v1 append + subsequent shrink retiring a "
+    "mix of launch-cohort and ex-append-joiner slots. Blocked at the "
+    "Mooncake C++ layer: sub-group Process Groups (``cpu_group`` / "
+    "``device_group``) are sized at PG construction to the launch "
+    "cohort width, and their ``P2PProxy`` peer arrays cannot grow to "
+    "host the appended rank. When the appended rank's socket resets "
+    "at retirement, the sub-group ``ConnectionPoller`` cascades into "
+    "``resetPeerState(peer)`` on a size-N array with peer=N and trips "
+    "the internal ``TORCH_CHECK`` with ``resetPeerState: peer_rank "
+    "out of range: N size: N``. Not fixable at the Python layer; the "
+    "operator-facing workaround is to launch at ``max_ep_size`` and "
+    "pre-shrink so every sub-group P2PProxy is sized to the widest "
+    "cohort at construction time, then only shrink or recover-grow "
+    "within that width. Kept in-tree as a regression trigger: any "
+    "future Mooncake release with a resizable ``P2PProxy`` (or a "
+    "bounds-check in ``ConnectionPoller::pollPeer``) will flip this "
+    "class to PASS."
+)
+class TestMooncakeScaleDown4To5To3(_MooncakeShrinkEndToEndBase):
+    """MC13: ``4 -> 5 -> 3`` scale-up-v1 append, then shrink retiring
+    a mix of launch-cohort and ex-append-joiner slots.
+
+    **Currently skipped** -- see the ``@unittest.skip`` decorator
+    above for the Mooncake C++ ``P2PProxy`` fixed-width-peer-array
+    limitation on ``cpu_group`` / ``device_group``.
+
+    Kept in-tree for two reasons:
+
+      * Diagnostic value. Any future Mooncake release that ships a
+        resizable ``P2PProxy`` (or a bounds-check in
+        ``ConnectionPoller::pollPeer``) will make this class flip to
+        PASS immediately.
+      * Test-matrix documentation. The retire-source table below
+        makes explicit which retiree-provenance combinations are
+        exercised by the baseline versus intentionally excluded:
+
+    +--------------------------+-------------------+
+    | Retiree provenance       | Test class        |
+    +==========================+===================+
+    | Launch cohort only       | MC01/MC05/MC12    |
+    +--------------------------+-------------------+
+    | Ex-recover-mode joiner   | MC10              |
+    +--------------------------+-------------------+
+    | Ex-scale-up-v1 joiner    | **MC13 (this)**   |
+    +--------------------------+-------------------+
+    | Mixed launch + ex-joiner | **MC13 (this)**   |
+    +--------------------------+-------------------+
+
+    Sequence (attempted; blocked at step 3 today):
+      1. Launch primary with ``LAUNCH_EP = 4``, ``MAX_EP = 5``.
+         Cohort is ranks 0-3; slot 4 is born retired.
+      2. Spawn a joiner subprocess with ``join_tp=1, rank_offset=4,
+         join_mode="scale"`` and post ``/scale_elastic_ep
+         {new_ep_size:5}``. Same append pattern as
+         :class:`TestMooncakeScaleDown4To5To4` and
+         :class:`TestMooncakeScaleUpFreshGrow` (MC02B).
+      3. Post ``/scale_elastic_ep {new_ep_size:3}``. Retires slots 3
+         (launch cohort) and 4 (ex-append-joiner). When rank 4's
+         socket resets, the survivor's Mooncake C++
+         ``ConnectionPoller`` on ``cpu_group`` / ``device_group``
+         (sized to 4 at PG construction, valid peer indices
+         ``[0, 4)``) tries ``resetPeerState(4)`` and aborts.
+      4. (Never reached) Verify ``/generate`` survives on the
+         3-rank cohort.
+
+    Why this cannot be fixed at the Python layer: the ``P2PProxy``
+    array is allocated inside Mooncake C++ at PG construction time
+    from ``this_pg->size()`` and never resizes. The
+    launch-at-``max_ep_size`` + pre-shrink pattern sidesteps this by
+    making every sub-group P2PProxy pre-size to the widest cohort
+    the deployment will ever need, so long as that ceiling is
+    established before the first live scale event.
+
+    Single-node topology (once/if unskipped): needs 5 visible GPUs
+    (4 for the primary cohort + 1 for the joiner subprocess).
+    """
+
+    LAUNCH_EP = 4
+    MAX_EP = 5
+    JOIN_TP = 1
+
+    def test_scale_up_then_shrink(self):
+        self._generate_ok("pre-grow")
+
+        joiner = self._launch_offset_joiner(
+            rank_offset=self.LAUNCH_EP,
+            join_tp=self.JOIN_TP,
+            port=PORT_B,
+            join_mode="scale",
+        )
+        try:
+            self.assertIsNone(
+                joiner.poll(),
+                "MC13 joiner exited before scale-up request; see joiner log",
+            )
+            self._scale_to(
+                old_ep_size=self.LAUNCH_EP,
+                target_ep_size=self.LAUNCH_EP + self.JOIN_TP,
+            )
+            self._generate_ok("post-grow", routed_dp_rank=4)
+
+            self._scale_to(
+                old_ep_size=self.LAUNCH_EP + self.JOIN_TP,
+                target_ep_size=3,
+            )
             self._generate_ok("post-shrink")
         finally:
             try:
@@ -2865,6 +2984,119 @@ class TestMooncakeScaleDown5To4To5To4(_MooncakeShrinkEndToEndBase):
                     joiner.wait(timeout=10)
             except Exception:
                 pass
+
+
+@unittest.skipUnless(
+    _count_visible_gpus() >= 5,
+    "MC14 shrink-recover-then-append needs 5 GPUs.",
+)
+class TestMooncakeScaleDown4To3To4To5(_MooncakeShrinkEndToEndBase):
+    """MC14: ``4 -> 3 -> 4 -> 5`` shrink, recover-back, then scale-up-v1 append.
+
+    Chains MC02 (``4 -> 3 -> 4`` recover round-trip) with MC02B
+    (``4 -> 5`` append) end-to-end to verify that a completed
+    shrink+recover cycle leaves the elastic-EP state clean enough for a
+    subsequent scale-up-v1 append to succeed.
+
+    Ends with rank 4 as a WORLD-only append-slot. The test
+    intentionally does NOT retire rank 4 -- retiring the appended slot
+    would trip the Mooncake C++ P2PProxy invariant on the launch-time
+    sub-group backends (``cpu_group`` / ``device_group``), which were
+    sized to 4 at boot and cannot bounds-check ``pollPeer(4)`` when
+    rank 4's socket closes. That crash class is exactly what MC13
+    (:class:`TestMooncakeScaleDown4To5To3`) is the skipped diagnostic
+    for.
+
+    Flow:
+
+    1. Launch at ``ep=4, max_ep=5``. WORLD's P2PProxy is 5-wide;
+       every sub-group's P2PProxy (cpu_group, device_group, TP, DP,
+       EP, moe_ep) is 4-wide because sub-groups inherit width from
+       the launch cohort's rank list.
+    2. Warmup ``/generate`` on the 4-rank cohort.
+    3. Shrink ``4 -> 3`` (MC01 shape). Rank 3 retires. Every
+       P2PProxy's ``pollPeer(3)`` on the retiree socket close is
+       in-bounds (3 < 4 <= 5).
+    4. Warmup on the 3-rank cohort.
+    5. Recover ``3 -> 4`` (MC02 shape). A joiner subprocess boots
+       into slot 3 with ``ep_join_mode=recover``. Every PG's
+       ``recover_ranks(pg, [3])`` writes into the existing slot 3.
+       No new peer indices are touched.
+    6. Warmup on the 4-rank cohort. ``_finalize_scale_recover``
+       cleared ``server_args.ep_join_mode`` on rank 3, so the primary
+       treats it as a normal cohort member for the next scale.
+    7. Append ``4 -> 5`` (MC02B shape). A second joiner subprocess
+       boots into slot 4 with ``ep_join_mode=scale``. Rank 4 joins
+       WORLD only (WORLD is 5-wide, in-bounds). Sub-groups skip the
+       join per the ``include_subgroups=False`` path in
+       ``_join_world_group`` because the joiner's own boot-time sub-
+       PGs have different Mooncake IDs than the primary's launch-
+       time ones.
+    8. Warmup on the 5-rank cohort. Rank 4 is alive; no socket close
+       on index 4 fires anywhere.
+
+    Invariant protected: the elastic-EP state after ``commit_scale``
+    for a recover is indistinguishable (from the primary's / scale-
+    request-handler's perspective) from the state after a fresh boot
+    at the same cohort size, so the very next scale request can be
+    an append.
+    """
+
+    MOE_A2A_BACKEND = "nixl"  # scale-up-v1 requires NIXL a2a (per PR #30164)
+    MAX_EP = 5                # WORLD's P2PProxy must be >= 5-wide for the append
+
+    def test_shrink_recover_then_append(self):
+        self._generate_ok("pre-cycle 4-rank")
+
+        # Half 1: shrink 4 -> 3 (MC01 shape).
+        self._scale_to(old_ep_size=4, target_ep_size=3)
+        self._generate_ok("post-shrink 3-rank")
+
+        # Half 2: recover 3 -> 4 (MC02 shape).
+        recover_joiner = self._launch_offset_joiner(
+            rank_offset=3, join_tp=1, port=PORT_B, join_mode="recover",
+        )
+        append_joiner = None
+        try:
+            self.assertIsNone(
+                recover_joiner.poll(),
+                "MC14 recover joiner exited before the regrow request",
+            )
+            self._scale_to(old_ep_size=3, target_ep_size=4)
+            self._generate_ok("post-recover 4-rank", routed_dp_rank=3)
+            # Absorb first-use NIXL peer-connect + DeepGEMM JIT before
+            # the second scale-up starts (same rationale as MC03/MC03B):
+            # otherwise the append handshake can race a still-warming
+            # NIXL peer connect on the incumbent side.
+            self._generate_ok("post-recover f1")
+            self._generate_ok("post-recover f2")
+
+            # Half 3: scale-up-v1 append 4 -> 5 (MC02B shape).
+            append_joiner = self._launch_offset_joiner(
+                rank_offset=4, join_tp=1, port=PORT_C, join_mode="scale",
+            )
+            self.assertIsNone(
+                append_joiner.poll(),
+                "MC14 append joiner exited before the scale-up request",
+            )
+            self._scale_to(old_ep_size=4, target_ep_size=5)
+            self._generate_ok("post-append 5-rank", routed_dp_rank=4)
+            self._generate_ok("post-append f1")
+            self._generate_ok("post-append f2")
+            # Deliberately end here. Retiring rank 4 next would trip
+            # the Mooncake C++ P2PProxy invariant on cpu_group /
+            # device_group (see TestMooncakeScaleDown4To5To3 / MC13,
+            # which is the skipped diagnostic for that crash class).
+        finally:
+            for j in (append_joiner, recover_joiner):
+                if j is None:
+                    continue
+                try:
+                    if j.poll() is None:
+                        kill_process_tree(j.pid)
+                        j.wait(timeout=10)
+                except Exception:
+                    pass
 
 
 # ---------------------------------------------------------------------------
