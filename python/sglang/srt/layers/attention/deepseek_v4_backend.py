@@ -59,7 +59,10 @@ from sglang.srt.speculative.dspark_components.kernels.dspark_attn_metadata impor
     BuildDsparkSwaPageIndices,
     ComputeDsparkWindowGather,
 )
-from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
+from sglang.srt.speculative.eagle_utils import (
+    TreeMaskMode,
+    per_step_draft_out_cache_loc,
+)
 from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyMode,
     compute_ragged_extend_lengths,
@@ -488,6 +491,7 @@ class DeepseekV4AttnBackend(
     use_captured_forward_metadata_for_breakable_cuda_graph: bool = True
     supports_ragged_verify_graph: bool = True
     needs_cpu_seq_lens: bool = False
+    tree_mask_mode: TreeMaskMode = TreeMaskMode.QLEN_ONLY
 
     def __init__(
         self,
@@ -1501,13 +1505,11 @@ class DeepseekV4AttnBackend(
             max_num_tokens // max_bs if max_bs > 0 else 1
         )
         if self.speculative_num_draft_tokens and not self.is_draft_runner:
-            # DSV4's verify metadata ignores custom_mask, but handing
-            # build_tree a preallocated scratch keeps it from dynamically
-            # allocating a FULL_MASK buffer (bs * max_context_len under the
-            # GPU-only spec path) every verify step.
+            # DSV4's verify metadata ignores custom_mask. Keep a persistent
+            # QLEN_ONLY scratch for the shared tree builder without allocating
+            # or filling the unused context-prefix portion of FULL_MASK.
             self.cuda_graph_custom_mask = torch.zeros(
-                max_num_tokens
-                * (self.max_context_len + self.speculative_num_draft_tokens),
+                max_num_tokens * self.speculative_num_draft_tokens,
                 dtype=torch.bool,
                 device=self.device,
             )

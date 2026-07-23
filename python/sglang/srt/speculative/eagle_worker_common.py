@@ -343,8 +343,12 @@ def build_eagle_verify_input(
 
     # Build tree mask
     # Directly write to cuda graph buffers for verify attn
+    target_attn_backend = target_worker.model_runner.attn_backend
     tree_mask_buf, position_buf = (
-        target_worker.model_runner.attn_backend.get_verify_buffers_to_fill_after_draft()
+        target_attn_backend.get_verify_buffers_to_fill_after_draft()
+    )
+    effective_tree_mask_mode = getattr(
+        target_attn_backend, "tree_mask_mode", tree_mask_mode
     )
 
     # build_tree_kernel uses seq_lens_sum only to size the (non-preallocated)
@@ -352,7 +356,7 @@ def build_eagle_verify_input(
     seq_lens_sum = batch.seq_lens_sum
     if seq_lens_sum is None:
         if tree_mask_buf is None:
-            max_context_len = target_worker.model_runner.attn_backend.max_context_len
+            max_context_len = target_attn_backend.max_context_len
             seq_lens_sum = batch.seq_lens.shape[0] * max_context_len
         else:
             # tree_mask_buf preallocated -> kernel ignores seq_lens_sum.
@@ -375,7 +379,7 @@ def build_eagle_verify_input(
         topk,
         num_steps,
         num_draft_tokens,
-        tree_mask_mode,
+        effective_tree_mask_mode,
         tree_mask_buf,
         position_buf,
     )

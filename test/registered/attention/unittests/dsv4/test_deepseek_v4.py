@@ -304,6 +304,116 @@ class TestDSV4AttentionBackendCorrectness(CustomTestCase):
                 )
 
 
+class TestDSV4VerifyTreeMaskContract(CustomTestCase):
+    def test_dsv4_allocates_qlen_only_scratch(self):
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            DeepseekV4AttnBackend,
+        )
+        from sglang.srt.speculative.eagle_utils import TreeMaskMode
+
+        max_bs = 8
+        num_verify_tokens = 4
+        max_num_tokens = max_bs * num_verify_tokens
+        max_context_len = 4096
+
+        backend = object.__new__(DeepseekV4AttnBackend)
+        backend.speculative_num_draft_tokens = num_verify_tokens
+        backend.is_draft_runner = False
+        backend.max_context_len = max_context_len
+        backend.device = "cpu"
+        backend.cuda_graph_custom_mask = None
+
+        backend.init_cuda_graph_state(max_bs, max_num_tokens)
+
+        expected_numel = max_bs * num_verify_tokens * num_verify_tokens
+        legacy_numel = max_num_tokens * (max_context_len + num_verify_tokens)
+        tree_mask_buf, position_buf = backend.get_verify_buffers_to_fill_after_draft()
+        self.assertEqual(backend.tree_mask_mode, TreeMaskMode.QLEN_ONLY)
+        self.assertEqual(tree_mask_buf.numel(), expected_numel)
+        self.assertNotEqual(tree_mask_buf.numel(), legacy_numel)
+        self.assertEqual(tree_mask_buf.dtype, torch.bool)
+        self.assertIs(tree_mask_buf, backend.cuda_graph_custom_mask)
+        self.assertIsNone(position_buf)
+
+    def test_target_backend_selects_tree_mask_mode(self):
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            DeepseekV4AttnBackend,
+        )
+        from sglang.srt.speculative.eagle_utils import TreeMaskMode
+        from sglang.srt.speculative.eagle_worker_common import (
+            build_eagle_verify_input,
+        )
+
+        num_verify_tokens = 2
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.DECODE,
+            seq_lens=torch.tensor([7], dtype=torch.int32),
+            seq_lens_sum=None,
+        )
+        draft_input = SimpleNamespace(
+            bonus_tokens=torch.tensor([11], dtype=torch.int64)
+        )
+        parent_list = torch.empty((1, 0), dtype=torch.int64)
+        top_scores_index = torch.zeros((1, 1), dtype=torch.int64)
+        draft_tokens = torch.tensor([[12]], dtype=torch.int64)
+        positions = torch.tensor([7, 8], dtype=torch.int64)
+        retrieve_index = torch.tensor([[0, 1]], dtype=torch.int64)
+        retrieve_next_token = torch.tensor([[1, -1]], dtype=torch.int64)
+        retrieve_next_sibling = torch.tensor([[-1, -1]], dtype=torch.int64)
+        flattened_draft_tokens = torch.tensor([11, 12], dtype=torch.int64)
+
+        dsv4_backend = object.__new__(DeepseekV4AttnBackend)
+        dsv4_backend.cuda_graph_custom_mask = torch.empty(
+            num_verify_tokens * num_verify_tokens, dtype=torch.bool
+        )
+        default_mask = torch.empty(32, dtype=torch.bool)
+        default_backend = SimpleNamespace(
+            max_context_len=16,
+            get_verify_buffers_to_fill_after_draft=lambda: (default_mask, None),
+        )
+
+        for backend, expected_mode, expected_mask in (
+            (
+                dsv4_backend,
+                TreeMaskMode.QLEN_ONLY,
+                dsv4_backend.cuda_graph_custom_mask,
+            ),
+            (default_backend, TreeMaskMode.FULL_MASK, default_mask),
+        ):
+            with self.subTest(expected_mode=expected_mode), mock.patch(
+                "sglang.srt.speculative.eagle_worker_common."
+                "build_tree_kernel_efficient",
+                return_value=(
+                    expected_mask,
+                    positions,
+                    retrieve_index,
+                    retrieve_next_token,
+                    retrieve_next_sibling,
+                    flattened_draft_tokens,
+                ),
+            ) as build_tree:
+                verify_input = build_eagle_verify_input(
+                    batch,
+                    draft_input,
+                    parent_list,
+                    top_scores_index,
+                    draft_tokens,
+                    None,
+                    target_worker=SimpleNamespace(
+                        model_runner=SimpleNamespace(attn_backend=backend)
+                    ),
+                    topk=1,
+                    num_steps=1,
+                    num_draft_tokens=num_verify_tokens,
+                    tree_mask_mode=TreeMaskMode.FULL_MASK,
+                    device="cpu",
+                )
+
+            self.assertEqual(build_tree.call_args.args[9], expected_mode)
+            self.assertIs(build_tree.call_args.args[10], expected_mask)
+            self.assertIs(verify_input.custom_mask, expected_mask)
+
+
 class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
     """CPU-only checks for the DSV4 BCG metadata replay contract."""
 
