@@ -1294,9 +1294,7 @@ class MooncakeKVManager(CommonKVManager):
             dst_state_locs = dst_state_locs // compress_ratio
             keep = []
             seen = set()
-            for i, (src_loc, dst_loc) in enumerate(
-                zip(src_state_locs, dst_state_locs)
-            ):
+            for i, (src_loc, dst_loc) in enumerate(zip(src_state_locs, dst_state_locs)):
                 key = (int(src_loc), int(dst_loc))
                 if key in seen:
                     continue
@@ -1312,9 +1310,9 @@ class MooncakeKVManager(CommonKVManager):
                 ring_size,
             )
 
-        def paired_c128_state_rows_from_full_locs() -> Tuple[
-            npt.NDArray[np.int32], npt.NDArray[np.int32], int
-        ]:
+        def paired_c128_state_rows_from_full_locs() -> (
+            Tuple[npt.NDArray[np.int32], npt.NDArray[np.int32], int]
+        ):
             from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
                 get_compress_state_ring_size,
             )
@@ -1341,9 +1339,7 @@ class MooncakeKVManager(CommonKVManager):
                 # loc at the chunk start, not by every physical row touched by
                 # the window. This matters when prefix cache makes the window's
                 # physical locs non-contiguous.
-                common_start = max(
-                    src_state_position_offset, dst_state_position_offset
-                )
+                common_start = max(src_state_position_offset, dst_state_position_offset)
                 common_end = min(
                     src_state_position_offset + src_full.size,
                     dst_state_position_offset + dst_full.size,
@@ -1411,9 +1407,7 @@ class MooncakeKVManager(CommonKVManager):
         assert end_layer is not None
         stage_ratios = ratios[start_layer:end_layer]
         c4_state_count = sum(1 for r in stage_ratios if r == 4)
-        state_entries = [(4, False)] * c4_state_count + [
-            (4, True)
-        ] * c4_state_count
+        state_entries = [(4, False)] * c4_state_count + [(4, True)] * c4_state_count
         rc = 0
         state_buffer_offset = 0
         if swa_ring_state_idx is not None:
@@ -1562,13 +1556,8 @@ class MooncakeKVManager(CommonKVManager):
             if target_rank_registration_info is not None
             else 1
         )
-        if (
-            self._is_dsv4_pool()
-            and (
-                self.dcp_size > 1
-                or dst_dcp_size > 1
-                or envs.SGLANG_DSV4_ENABLE_DCP.get()
-            )
+        if self._is_dsv4_pool() and (
+            self.dcp_size > 1 or dst_dcp_size > 1 or envs.SGLANG_DSV4_ENABLE_DCP.get()
         ):
             return self._send_dsv4_kvcache_dcp(
                 mooncake_session_id,
@@ -1840,7 +1829,10 @@ class MooncakeKVManager(CommonKVManager):
             self.attn_cp_size > 1
             and self.attn_cp_rank != 0
             and not self.server_args.enable_dsa_cache_layer_split
+            and not self.enable_pcp_dcp_rank_affinity
         ):
+            # Without affinity rank 0 is the sole source for replicated state.
+            # With affinity each PCP replica serves its matching DCP rank.
             skip_state = True
 
         return skip_kv, skip_state
@@ -1857,13 +1849,8 @@ class MooncakeKVManager(CommonKVManager):
             if target_rank_registration_info is not None
             else 1
         )
-        if (
-            self._is_dsv4_pool()
-            and (
-                self.dcp_size > 1
-                or dst_dcp_size > 1
-                or envs.SGLANG_DSV4_ENABLE_DCP.get()
-            )
+        if self._is_dsv4_pool() and (
+            self.dcp_size > 1 or dst_dcp_size > 1 or envs.SGLANG_DSV4_ENABLE_DCP.get()
         ):
             if prefill_state_indices and isinstance(
                 prefill_state_indices[0], (list, tuple)

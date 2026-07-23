@@ -74,6 +74,8 @@ class PrefillServerInfo:
     kv_cache_dtype: Optional[str]
     follow_bootstrap_room: bool
     enable_dsa_cache_layer_split: bool = False
+    cp_strategy: Optional[str] = None
+    disaggregation_pcp_dcp_rank_affinity: bool = False
 
     # PD true-retraction rebootstrap: the prefill's HTTP API port. The decode
     # already knows the prefill host (the bootstrap_addr host), so it can POST
@@ -100,6 +102,12 @@ class PrefillServerInfo:
         )
         self.follow_bootstrap_room = bool(self.follow_bootstrap_room)
         self.enable_dsa_cache_layer_split = bool(self.enable_dsa_cache_layer_split)
+        self.cp_strategy = (
+            str(self.cp_strategy) if self.cp_strategy is not None else None
+        )
+        self.disaggregation_pcp_dcp_rank_affinity = bool(
+            self.disaggregation_pcp_dcp_rank_affinity
+        )
         self.prefill_http_port = (
             int(self.prefill_http_port) if self.prefill_http_port is not None else None
         )
@@ -165,6 +173,10 @@ class CommonKVManager(BaseKVManager):
         self.pp_size = server_args.pp_size
         self.pp_rank = self.kv_args.pp_rank
         self.local_ip = get_local_ip_auto()
+        self.enable_pcp_dcp_rank_affinity = (
+            server_args.disaggregation_pcp_dcp_rank_affinity
+        )
+        self._check_pcp_dcp_rank_affinity_local_topology()
         cp_sharded_prefill = self.attn_cp_size > 1 and (
             self.is_hybrid_mla_backend or server_args.enable_dsa_cache_layer_split
         )
@@ -177,6 +189,7 @@ class CommonKVManager(BaseKVManager):
             envs.SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER.get()
             or cp_sharded_prefill
             or hybrid_decode_pulls_all_ranks
+            or self.enable_pcp_dcp_rank_affinity
         )
         self._check_dcp_compat()
 
@@ -278,6 +291,37 @@ class CommonKVManager(BaseKVManager):
                 "disaggregated engine, or pick a backend that has been "
                 "adapted for DCP."
             )
+
+    def _check_pcp_dcp_rank_affinity_local_topology(self) -> None:
+        if not self.enable_pcp_dcp_rank_affinity:
+            return
+        if not getattr(self.kv_args, "mla_compression_ratios", None):
+            raise RuntimeError(
+                "--disaggregation-pcp-dcp-rank-affinity currently supports "
+                "only DeepSeek-V4 compressed KV transfer"
+            )
+        if self.server_args.enable_dsa_cache_layer_split:
+            raise RuntimeError(
+                "--disaggregation-pcp-dcp-rank-affinity is incompatible with "
+                "--enable-dsa-cache-layer-split"
+            )
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            if self.dcp_size != 1:
+                raise RuntimeError(
+                    "PCP-DCP rank affinity requires the prefill cache to be "
+                    f"unsharded (prefill dcp_size=1), got {self.dcp_size}"
+                )
+            if self.attn_cp_size <= 1 or self.server_args.cp_strategy != "interleave":
+                raise RuntimeError(
+                    "PCP-DCP rank affinity on prefill requires interleave CP "
+                    "with attn_cp_size greater than 1"
+                )
+        elif self.disaggregation_mode == DisaggregationMode.DECODE:
+            if self.attn_cp_size != 1 or self.dcp_size <= 1:
+                raise RuntimeError(
+                    "PCP-DCP rank affinity on decode requires attn_cp_size=1 "
+                    "and dcp_size greater than 1"
+                )
 
     def check_status(self, bootstrap_room: int) -> KVPoll:
         return self.request_status[bootstrap_room]
@@ -512,6 +556,15 @@ class CommonKVManager(BaseKVManager):
                 f"Both servers must use the same --kv-cache-dtype value."
             )
 
+        if (
+            info.disaggregation_pcp_dcp_rank_affinity
+            != self.enable_pcp_dcp_rank_affinity
+        ):
+            raise RuntimeError(
+                "--disaggregation-pcp-dcp-rank-affinity must have the same "
+                "value on prefill and decode servers"
+            )
+
         self._resolve_rank_mapping(info)
         self.prefill_info_table[bootstrap_addr] = info
         logger.debug(f"Prefill parallel info for [{bootstrap_addr}]: {info}")
@@ -565,7 +618,19 @@ class CommonKVManager(BaseKVManager):
         assert self.attn_cp_size == 1, (
             f"Decode cp size ({self.attn_cp_size}) should be equal to 1",
         )
-        if self.attn_cp_size == info.attn_cp_size:
+        if self.enable_pcp_dcp_rank_affinity:
+            self._validate_pcp_dcp_rank_affinity(info, required_dst_info_num)
+            target_cp_ranks = [self.dcp_rank]
+            # The strict topology validated above has one decode TP/DCP rank
+            # for each prefill CP rank, so each sender waits for one receiver.
+            required_dst_info_num = 1
+            logger.info(
+                "Using PCP-DCP rank affinity: prefill_cp_rank=%d -> "
+                "decode_dcp_rank=%d",
+                self.dcp_rank,
+                self.dcp_rank,
+            )
+        elif self.attn_cp_size == info.attn_cp_size:
             assert info.attn_cp_size == 1, (
                 f"When prefill cp size is 1, attn cp size should be 1, but got {self.attn_cp_size}",
             )
@@ -599,6 +664,43 @@ class CommonKVManager(BaseKVManager):
         info.target_pp_ranks = target_pp_ranks
         info.required_dst_info_num = required_dst_info_num
         info.required_prefill_response_num = required_prefill_response_num
+
+    def _validate_pcp_dcp_rank_affinity(
+        self, info: PrefillServerInfo, required_dst_info_num: int
+    ) -> None:
+        ratios = getattr(self.kv_args, "mla_compression_ratios", None)
+        if not ratios:
+            raise RuntimeError(
+                "--disaggregation-pcp-dcp-rank-affinity currently supports "
+                "only DeepSeek-V4 compressed KV transfer"
+            )
+        if info.enable_dsa_cache_layer_split:
+            raise RuntimeError(
+                "--disaggregation-pcp-dcp-rank-affinity cannot be used when "
+                "prefill enables DSA cache layer split"
+            )
+        if info.cp_strategy != "interleave":
+            raise RuntimeError(
+                "--disaggregation-pcp-dcp-rank-affinity requires prefill "
+                f"--cp-strategy interleave, got {info.cp_strategy!r}"
+            )
+        if info.attn_cp_size != self.dcp_size:
+            raise RuntimeError(
+                "--disaggregation-pcp-dcp-rank-affinity requires prefill CP "
+                f"size ({info.attn_cp_size}) == decode DCP size ({self.dcp_size})"
+            )
+        if self.attn_tp_size != self.dcp_size or info.attn_tp_size != 1:
+            raise RuntimeError(
+                "--disaggregation-pcp-dcp-rank-affinity currently requires "
+                "decode attention TP == DCP and prefill attention TP == 1; "
+                f"got decode TP={self.attn_tp_size}, DCP={self.dcp_size}, "
+                f"prefill TP={info.attn_tp_size}"
+            )
+        if required_dst_info_num != self.dcp_size:
+            raise RuntimeError(
+                "Unexpected destination fan-out for PCP-DCP rank affinity: "
+                f"expected {self.dcp_size}, got {required_dst_info_num}"
+            )
 
     def _sync_bootstrap_port_across_nodes(self, local_port: int) -> int:
         """Broadcast world-rank-0's bootstrap port to all prefill ranks.
@@ -666,6 +768,8 @@ class CommonKVManager(BaseKVManager):
             "enable_dsa_cache_layer_split": getattr(
                 self.server_args, "enable_dsa_cache_layer_split", False
             ),
+            "cp_strategy": self.server_args.cp_strategy,
+            "disaggregation_pcp_dcp_rank_affinity": (self.enable_pcp_dcp_rank_affinity),
             # Self-register the HTTP API port so the decode can derive the PD
             # retract rebootstrap /generate URL from bootstrap info instead of a
             # router-injected pd_rebootstrap_prefill_url.
@@ -1128,9 +1232,13 @@ class CommonKVSender(BaseKVSender):
         self.curr_idx += len(kv_indices)
         is_last_chunk = self.curr_idx == self.num_kv_indices
 
+        # Affinity deliberately keeps the complete token mapping on each
+        # replicated PCP source. The DSV4 Mooncake path selects the matched
+        # destination's C4/C128 owners after computing compressed slot locs.
         if (
             self.kv_mgr.enable_all_cp_ranks_for_transfer
             and not self.kv_mgr.server_args.enable_dsa_cache_layer_split
+            and not self.kv_mgr.enable_pcp_dcp_rank_affinity
         ):
             kv_indices, index_slice = filter_kv_indices_for_cp_rank(
                 self.kv_mgr,
@@ -1508,6 +1616,8 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.kv_cache_dtype: Optional[str] = None
         self.follow_bootstrap_room: Optional[bool] = None
         self.enable_dsa_cache_layer_split: Optional[bool] = None
+        self.cp_strategy: Optional[str] = None
+        self.disaggregation_pcp_dcp_rank_affinity: Optional[bool] = None
         self.prefill_http_port: Optional[int] = None
         self.prefill_port_table: Dict[
             int, Dict[int, Dict[int, Dict[int, PrefillRankInfo]]]
@@ -1609,6 +1719,14 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 data.get("enable_dsa_cache_layer_split", False)
             )
 
+        if self.cp_strategy is None:
+            self.cp_strategy = data.get("cp_strategy")
+
+        if self.disaggregation_pcp_dcp_rank_affinity is None:
+            self.disaggregation_pcp_dcp_rank_affinity = bool(
+                data.get("disaggregation_pcp_dcp_rank_affinity", False)
+            )
+
         if system_dp_size == 1:
             dp_group = attn_dp_rank
         else:
@@ -1673,6 +1791,10 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                     else True
                 ),
                 enable_dsa_cache_layer_split=bool(self.enable_dsa_cache_layer_split),
+                cp_strategy=self.cp_strategy,
+                disaggregation_pcp_dcp_rank_affinity=bool(
+                    self.disaggregation_pcp_dcp_rank_affinity
+                ),
                 prefill_http_port=self.prefill_http_port,
             )
             return web.json_response(dataclasses.asdict(info), status=200)

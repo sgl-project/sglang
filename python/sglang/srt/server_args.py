@@ -2543,6 +2543,10 @@ class ServerArgs:
         bool,
         "Enable radix cache on decode server (PD mode). Caches KV prefixes to avoid redundant transfers. Incompatible with --enable-hisparse, speculative decoding, and --disaggregation-transfer-backend fake.",
     ] = False
+    disaggregation_pcp_dcp_rank_affinity: A[
+        bool,
+        "Experimental DeepSeek-V4 PD transfer optimization. When prefill CP and decode DCP have the same size, route each decode DCP rank to the matching prefill CP rank. Must be enabled on both prefill and decode servers and currently requires Mooncake with interleave prefill CP.",
+    ] = False
     disaggregation_decode_enable_offload_kvcache: A[
         bool,
         "Enable async KV cache offloading on decode server (PD mode).",

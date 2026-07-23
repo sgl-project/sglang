@@ -26,6 +26,28 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
             "with MC_FORCE_TCP=1 (TCP transport, no RDMA)"
         )
 
+    if server_args.disaggregation_pcp_dcp_rank_affinity:
+        if server_args.disaggregation_mode not in ("prefill", "decode"):
+            raise ValueError(
+                "--disaggregation-pcp-dcp-rank-affinity requires "
+                "--disaggregation-mode prefill or decode"
+            )
+        if server_args.disaggregation_transfer_backend != "mooncake":
+            raise ValueError(
+                "--disaggregation-pcp-dcp-rank-affinity currently requires "
+                "--disaggregation-transfer-backend mooncake"
+            )
+        if server_args.enable_dsa_cache_layer_split:
+            raise ValueError(
+                "--disaggregation-pcp-dcp-rank-affinity is incompatible with "
+                "--enable-dsa-cache-layer-split"
+            )
+        if server_args.disaggregation_mode == "decode" and server_args.dcp_size <= 1:
+            raise ValueError(
+                "--disaggregation-pcp-dcp-rank-affinity on decode requires "
+                "--dcp-size greater than 1"
+            )
+
     if server_args.disaggregation_mode == "decode":
         if server_args.disaggregation_decode_enable_radix_cache:
             if server_args.enable_hisparse:
