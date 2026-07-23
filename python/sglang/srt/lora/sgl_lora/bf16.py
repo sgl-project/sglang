@@ -307,9 +307,10 @@ def token_owned_lora_b_add(
     ``weight`` is flattened ``[adapter * factor, hidden, rank]`` and
     ``intermediate`` is canonical ``[token * top_k, rank]``. Each token owns
     its complete output row, so the top-k reduction is deterministic and needs
-    no atomics. Route weights are BF16-rounded exactly as FlashInfer's packed
-    routed input and are applied once; routed scaling must already be reflected
-    in ``topk_weights``.
+    no atomics. The supplied route coefficients are BF16-rounded exactly as
+    FlashInfer's packed routed input and are applied once. Any layer-level
+    scaling must already be folded into those coefficients or be applied after
+    the complete base-plus-LoRA MoE output.
     """
     num_tokens, top_k = routing.virtual_topk_ids.shape
     if num_tokens == 0:

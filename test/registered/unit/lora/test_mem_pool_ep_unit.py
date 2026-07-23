@@ -957,6 +957,7 @@ class TestPoolInitPicksUpEpContext(unittest.TestCase):
         moe_tp_rank: int = 0,
         tp_size: int = 1,
         tp_rank: int = 0,
+        lora_execution_engine: str = "legacy",
     ) -> LoRAMemoryPool:
         """Construct a pool with `__init__` called, but stop before
         `init_buffers` — we only care about the EP-context state.
@@ -998,6 +999,7 @@ class TestPoolInitPicksUpEpContext(unittest.TestCase):
                 base_model=base_model,
                 eviction_policy="lru",
                 lora_added_tokens_size=0,
+                lora_execution_engine=lora_execution_engine,
             )
 
     def test_no_ep(self):
@@ -1020,6 +1022,15 @@ class TestPoolInitPicksUpEpContext(unittest.TestCase):
         self.assertEqual(pool.moe_ep_size, 4)
         self.assertEqual(pool.moe_ep_rank, 2)
         self.assertFalse(pool.moe_use_local_expert_ids)
+
+    def test_ep4_sgl_lora_localizes_factors_for_global_id_provider(self):
+        pool = self._new_pool_with_ep(
+            ep_size=4,
+            ep_rank=2,
+            keeps_global=True,
+            lora_execution_engine="sgl_lora",
+        )
+        self.assertTrue(pool.moe_use_local_expert_ids)
 
     def test_ep_with_uneven_split_falls_back_to_global_ids(self):
         """If `num_experts % ep_size != 0` (shouldn't happen in practice,

@@ -947,9 +947,7 @@ def post_reorder_deepgemm_triton_kernel(
                 in_data = tl.load(load_ptr_offs, mask=mask).to(tl.float32)
                 if HAS_PAIR_DELTA:
                     pair_idx = src_idx * topk + idx
-                    delta_ptr_offs = (
-                        pair_delta_ptr + pair_idx * hidden_size + offset
-                    )
+                    delta_ptr_offs = pair_delta_ptr + pair_idx * hidden_size + offset
                     in_data += tl.load(delta_ptr_offs, mask=mask).to(tl.float32)
                 sum_vec += in_data * weight_scale
         sum_vec *= routed_scaling_factor

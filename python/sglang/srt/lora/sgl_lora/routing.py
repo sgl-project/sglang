@@ -55,9 +55,7 @@ def _build_virtual_topk_ids_kernel(
         other=-1,
     ).to(tl.int64)
     if USE_FACTOR_MAP:
-        in_map = (routed_expert_ids >= 0) & (
-            routed_expert_ids < factor_map_size
-        )
+        in_map = (routed_expert_ids >= 0) & (routed_expert_ids < factor_map_size)
         factor_ids = tl.load(
             factor_map_ptr + routed_expert_ids,
             mask=pair_mask & in_map,
@@ -92,40 +90,28 @@ def _build_virtual_topk_ids(
         return virtual_topk_ids
 
     if not topk_ids.is_cuda:
-        adapter_valid = (token_lora_mapping >= 0) & (
-            token_lora_mapping < max_loras
-        )
+        adapter_valid = (token_lora_mapping >= 0) & (token_lora_mapping < max_loras)
         if routed_expert_to_factor_id is None:
             factor_ids = topk_ids
         elif routed_expert_to_factor_id.numel() == 0:
             factor_ids = torch.full_like(topk_ids, -1)
         else:
-            in_map = (topk_ids >= 0) & (
-                topk_ids < routed_expert_to_factor_id.numel()
-            )
-            safe_ids = topk_ids.clamp(
-                min=0, max=routed_expert_to_factor_id.numel() - 1
-            )
+            in_map = (topk_ids >= 0) & (topk_ids < routed_expert_to_factor_id.numel())
+            safe_ids = topk_ids.clamp(min=0, max=routed_expert_to_factor_id.numel() - 1)
             factor_ids = torch.where(
                 in_map,
                 routed_expert_to_factor_id[safe_ids],
                 -1,
             )
         factor_valid = (factor_ids >= 0) & (factor_ids < factor_expert_count)
-        virtual_ids = (
-            token_lora_mapping[:, None] * factor_expert_count + factor_ids
-        )
+        virtual_ids = token_lora_mapping[:, None] * factor_expert_count + factor_ids
         return torch.where(adapter_valid[:, None] & factor_valid, virtual_ids, -1)
 
     block_size = 1024
     factor_map = (
-        topk_ids
-        if routed_expert_to_factor_id is None
-        else routed_expert_to_factor_id
+        topk_ids if routed_expert_to_factor_id is None else routed_expert_to_factor_id
     )
-    _build_virtual_topk_ids_kernel[
-        (triton.cdiv(topk_ids.numel(), block_size),)
-    ](
+    _build_virtual_topk_ids_kernel[(triton.cdiv(topk_ids.numel(), block_size),)](
         topk_ids,
         token_lora_mapping,
         factor_map,
@@ -165,24 +151,16 @@ def _align_aot(
         empty = torch.empty(0, dtype=torch.int32, device=flat_ids.device)
         return empty, empty, torch.zeros(1, dtype=torch.int32, device=flat_ids.device)
 
-    capacity = _routing_capacity(
-        flat_ids.numel(), block_size, num_virtual_experts
-    )
-    sorted_pair_ids = torch.empty(
-        capacity, dtype=torch.int32, device=flat_ids.device
-    )
+    capacity = _routing_capacity(flat_ids.numel(), block_size, num_virtual_experts)
+    sorted_pair_ids = torch.empty(capacity, dtype=torch.int32, device=flat_ids.device)
     block_virtual_expert_ids = torch.empty(
         triton.cdiv(capacity, block_size),
         dtype=torch.int32,
         device=flat_ids.device,
     )
-    num_pairs_post_padded = torch.empty(
-        1, dtype=torch.int32, device=flat_ids.device
-    )
+    num_pairs_post_padded = torch.empty(1, dtype=torch.int32, device=flat_ids.device)
     bucket_count = num_virtual_experts + 1
-    cumsum = torch.empty(
-        bucket_count + 1, dtype=torch.int32, device=flat_ids.device
-    )
+    cumsum = torch.empty(bucket_count + 1, dtype=torch.int32, device=flat_ids.device)
     moe_align_block_size(
         flat_ids,
         bucket_count,
@@ -208,14 +186,10 @@ def _align_virtual_topk_ids(
     if num_virtual_experts < 1024:
         return _align_aot(virtual_topk_ids, block_size, num_virtual_experts)
     if num_virtual_experts <= 8191:
-        return _align_block_size_jit(
-            virtual_topk_ids, block_size, num_virtual_experts
-        )
+        return _align_block_size_jit(virtual_topk_ids, block_size, num_virtual_experts)
     # This is a correctness fallback, not a performance policy. Large-domain
     # routing remains a measured optimization gap.
-    return _align_block_size_torch(
-        virtual_topk_ids, block_size, num_virtual_experts
-    )
+    return _align_block_size_torch(virtual_topk_ids, block_size, num_virtual_experts)
 
 
 def build_virtual_expert_routing(

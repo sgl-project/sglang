@@ -92,6 +92,9 @@ class LoRAManager:
         self._experts_shared_outer_override: Optional[bool] = (
             server_args.experts_shared_outer_loras
         )
+        self.lora_execution_engine: str = getattr(
+            server_args, "lora_execution_engine", "legacy"
+        )
         self.lora_use_virtual_experts: bool = server_args.lora_use_virtual_experts
         self.lora_strict_loading: bool = getattr(
             server_args, "lora_strict_loading", False
@@ -799,6 +802,7 @@ class LoRAManager:
             experts_shared_outer_loras=self.experts_shared_outer_loras,
             strict_loading=self.lora_strict_loading,
             enable_lora_overlap_loading=self.enable_lora_overlap_loading,
+            lora_execution_engine=self.lora_execution_engine,
         )
 
         # Initializing memory pool with base model
@@ -806,7 +810,11 @@ class LoRAManager:
 
     def set_lora_module(self, module_name, module):
         """Wrap any module (standard or MoE) with LoRA support."""
-        lora_module = get_lora_layer(module, self.lora_backend)
+        lora_module = get_lora_layer(
+            module,
+            self.lora_backend,
+            lora_execution_engine=self.lora_execution_engine,
+        )
         replace_submodule(self.base_model, module_name, lora_module)
         return lora_module
 
