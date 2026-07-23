@@ -261,6 +261,52 @@ def finalize_push_fits(num_tokens: int) -> bool:
     return nbytes <= min(_PUSH_MAX_BYTES, state.comm.max_push_size)
 
 
+def gemm_ag_up_fits(num_tokens: int) -> bool:
+    """Whether the column-parallel up_proj + multicast all-gather tail
+    (:func:`gemm_ag_up_proj`) covers this decode batch: TP8, the batch is
+    within the kernel's win range, one [num_tokens, 896] staging slice fits
+    a push slot, and the phase-counter array covers both launch grids."""
+    from sglang.jit_kernel.kimi_k3 import gemm_ag as mod
+
+    state = _STATE
+    assert state is not None
+    comm = state.comm
+    return (
+        0 < num_tokens <= mod.MAX_TOKENS
+        and state.world_size == 8
+        and num_tokens * (2 * NORM_DIM // 8) * 2 <= comm.max_push_size
+        and comm.config.num_push_blocks >= 112  # GEMV grid (896 / 8)
+    )
+
+
+def gemm_ag_up_proj(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    b: torch.Tensor,
+    c: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """``up_proj(x) + b (+ c)`` via the column-parallel GEMV + multicast
+    all-gather + fused add3 (one more push-workspace user). ``x`` is the
+    normed [T, 3584] latent, ``weight`` the FULL replicated [7168, 3584]
+    up_proj weight (the kernel slices out this rank's row block itself),
+    ``b`` / ``c`` the [T, 7168] addends. Caller checked
+    :func:`gemm_ag_up_fits`; same call-site contract as
+    :func:`all_reduce`."""
+    from sglang.jit_kernel.kimi_k3 import gemm_ag as mod
+
+    state = _STATE
+    assert state is not None
+    return mod.gemm_ag_up_proj(
+        state.world_size,
+        x,
+        weight,
+        b,
+        c,
+        torch.empty_like(b),
+        ws_mc_base=state.comm.mc_base_ptr,
+    )
+
+
 def finalize_all_reduce_push_norm(
     out: torch.Tensor,
     gemm2_out: torch.Tensor,

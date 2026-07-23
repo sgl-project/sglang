@@ -565,6 +565,21 @@ class KimiK3MoE(nn.Module):
             and self.moe_hidden_size == k3_ar_fusion.NORM_DIM
             and hidden_size == 2 * k3_ar_fusion.NORM_DIM
         )
+        # Static eligibility for the column-parallel up_proj tail (gemm_ag):
+        # per-rank 1/8-column GEMV -> multicast all-gather staged in the v2
+        # push workspace -> spin-add3 with shared_output (+ prefix_sum),
+        # replacing the replicated [3584, 7168] GEMM + _add3 (~1.5-2x at
+        # decode sizes, 1/8 of the weight bytes read per rank). Kernel dims
+        # are fixed to fuse_ar_norm's (3584 -> 7168) over TP8; per-batch
+        # capacity checks live in k3_ar_fusion.gemm_ag_up_fits.
+        self._gemm_ag_up_eligible = (
+            self.fuse_ar_norm
+            and self.tp_size == 8
+            and self.routed_expert_up_proj is not None
+            and isinstance(self.routed_expert_up_proj.weight, torch.Tensor)
+            and self.routed_expert_up_proj.weight.dtype == torch.bfloat16
+            and self.routed_expert_up_proj.weight.is_contiguous()
+        )
 
     def _merge_front_weights(self) -> None:
         """Merge shared gate_up + router gate + latent down_proj weights.
@@ -883,6 +898,19 @@ class KimiK3MoE(nn.Module):
                 )
             else:
                 k3_ar_fusion.all_reduce(latent)
+            # the gemm_ag tail wants the normed latent straight out of the
+            # fused-norm AR (its GEMV chains on it via PDL)
+            if (
+                fused_norm
+                and self._gemm_ag_up_eligible
+                and k3_ar_fusion.gemm_ag_up_fits(num_tokens)
+            ):
+                return k3_ar_fusion.gemm_ag_up_proj(
+                    latent,
+                    self.routed_expert_up_proj.weight,  # type: ignore
+                    shared_output,
+                    prefix_sum,
+                )
         else:  # single collective over the flat [latent | shared] pair
             self._forward_shared(gate_up, shared_output)
             self._forward_routed(hidden_states, router_logits, routed_input, latent)
