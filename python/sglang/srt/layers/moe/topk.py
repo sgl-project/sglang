@@ -680,7 +680,7 @@ def fused_topk_torch_native(
         scores = scoring_func_impl(gating_output)
         scores_for_choice = scores.view(
             -1, n_routed_experts
-        ) + correction_bias.unsqueeze(0)
+        ) + correction_bias
         topk_ids = torch.topk(scores_for_choice, k=topk, dim=-1, sorted=False)[1]
         topk_weights = scores.gather(1, topk_ids)
     else:
