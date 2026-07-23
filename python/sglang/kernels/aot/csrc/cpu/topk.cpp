@@ -231,6 +231,7 @@ void topk_softmax_kernel_impl(
     int64_t topk,
     bool renormalize) {
   const int64_t num_experts_per_group = NUM_EXPERTS;
+  const bool use_correction_bias = correction_bias != nullptr;
   at::parallel_for(0, num_tokens, 0, [&](int64_t begin, int64_t end) {
     alignas(64) float scores[NUM_EXPERTS];
     using elem_t = std::pair<float, int32_t>;
@@ -239,14 +240,9 @@ void topk_softmax_kernel_impl(
     for (int64_t i = begin; i < end; ++i) {
       softmax<scalar_t, NUM_EXPERTS>(scores, gating_output + i * NUM_EXPERTS);
 
-      if (correction_bias == nullptr) {
-        for (int64_t e = 0; e < num_experts_per_group; ++e) {
-          queue[e] = {scores[e], e};
-        }
-      } else {
-        for (int64_t e = 0; e < num_experts_per_group; ++e) {
-          queue[e] = {scores[e] + correction_bias[e], e};
-        }
+      for (int64_t e = 0; e < num_experts_per_group; ++e) {
+        const float score = use_correction_bias ? scores[e] + correction_bias[e] : scores[e];
+        queue[e] = {score, e};
       }
 
       std::partial_sort(queue.begin(), queue.begin() + topk, queue.end(), [](const elem_t& x, const elem_t& y) -> bool {
@@ -477,13 +473,7 @@ std::tuple<at::Tensor, at::Tensor> topk_sigmoid_cpu(
   const float* correction_bias_ptr = nullptr;
   if (correction_bias.has_value()) {
     const auto& correction_bias_tensor = correction_bias.value();
-    CHECK_INPUT(correction_bias_tensor);
-    TORCH_CHECK(correction_bias_tensor.dim() == 1, "correction_bias must be 1D tensor [num_experts]");
-    TORCH_CHECK(correction_bias_tensor.size(0) == num_experts, "Bias shape mismatch");
-    TORCH_CHECK(
-        correction_bias_tensor.scalar_type() == at::kFloat,
-        "correction_bias must be float32, got ",
-        correction_bias_tensor.scalar_type());
+    CHECK_INPUT_SHAPE_DTYPE<false>(correction_bias_tensor, {num_experts}, at::kFloat);
     correction_bias_ptr = correction_bias_tensor.data_ptr<float>();
   }
   at::Tensor topk_weights = at::empty({num_tokens, topk}, hidden_states.options().dtype(at::kFloat));
@@ -552,13 +542,7 @@ std::tuple<at::Tensor, at::Tensor> topk_softmax_cpu(
   const float* correction_bias_ptr = nullptr;
   if (correction_bias.has_value()) {
     const auto& correction_bias_tensor = correction_bias.value();
-    CHECK_INPUT(correction_bias_tensor);
-    TORCH_CHECK(correction_bias_tensor.dim() == 1, "correction_bias must be 1D tensor [num_experts]");
-    TORCH_CHECK(correction_bias_tensor.size(0) == num_experts, "Bias shape mismatch");
-    TORCH_CHECK(
-        correction_bias_tensor.scalar_type() == at::kFloat,
-        "correction_bias must be float32, got ",
-        correction_bias_tensor.scalar_type());
+    CHECK_INPUT_SHAPE_DTYPE<false>(correction_bias_tensor, {num_experts}, at::kFloat);
     correction_bias_ptr = correction_bias_tensor.data_ptr<float>();
   }
 
