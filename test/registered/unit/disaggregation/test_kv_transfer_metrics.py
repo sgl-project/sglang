@@ -65,13 +65,13 @@ class TestTransferMetric(unittest.TestCase):
         self.assertNotIn(room, mgr._transfer_records)
 
     def test_measured_record_pops_and_ignores_replica_factor(self):
-        # Regression: on the measured path _record_transfer accumulates
-        # bytes once per destination rank (called inside the per-dst-rank send
-        # loop), so replication is already baked into record.total_bytes. For
-        # MLA (replica_factor = required_dst_info_num > 1) the buggy code
-        # multiplied by the factor again, over-counting bytes/speed by that
-        # factor. The measured total must equal the raw recorded bytes, and the
-        # record must be popped so a reused room can't inherit it.
+        # On the measured path _record_transfer accumulates bytes once per
+        # destination rank (called inside the per-dst-rank send loop), so
+        # replication is already baked into record.total_bytes. For MLA
+        # (replica_factor = required_dst_info_num > 1) it must NOT be scaled by
+        # the factor again -- that would double-count bytes/speed. The measured
+        # total must equal the raw recorded bytes, and the record must be popped
+        # so a reused room can't inherit it.
         mgr = _make_manager(replica_factor=4)
         room = 42
         mgr.request_status[room] = KVPoll.Transferring
@@ -100,12 +100,13 @@ class TestTransferMetric(unittest.TestCase):
         self.assertEqual(metric.transfer_total_bytes, 4 * mgr._transfer_bytes(4, 1))
 
     def test_dummy_cp_rank_skips_estimate_and_replica_lookup(self):
-        # Regression: dummy CP ranks transfer no KV and never bootstrap, so
-        # _kv_replica_factor never resolves. The pre-guard code fell through to
-        # the fallback estimate and called get_kv_replica_factor(), logging a
+        # Dummy CP ranks transfer no KV and never bootstrap, so
+        # _kv_replica_factor never resolves. get_transfer_metric must
+        # short-circuit to the zero-default metric for such ranks without
+        # touching the replica factor; otherwise it falls through to the
+        # fallback estimate and calls get_kv_replica_factor(), logging a
         # spurious "called before resolve_kv_replica_factor" warning on every
-        # such rank. The guard must short-circuit to the zero-default metric
-        # without touching the replica factor.
+        # dummy rank.
         mgr = _make_manager(replica_factor=None)
         mgr.is_dummy_cp_rank = True
 
@@ -123,7 +124,7 @@ class TestTransferMetric(unittest.TestCase):
         self.assertIsNone(metric.transfer_total_bytes)
 
     def test_status_record_lock_serializes_teardown_against_transfer(self):
-        # Regression: a send-worker transfer that passed _record_transfer's
+        # A send-worker transfer that passed _record_transfer's
         # guard must not run its setdefault after a concurrent
         # update_status(Failed) flips the status and pops the record, or it
         # leaks a record across bootstrap_room reuse. Forced deterministically:
@@ -158,7 +159,8 @@ class TestTransferMetric(unittest.TestCase):
 
         updater = threading.Thread(target=_teardown)
         updater.start()
-        # Fixed: update_status is blocked on the lock. Buggy: it completes now.
+        # update_status must contend for status_record_lock, still held by the
+        # parked worker, so the teardown cannot complete within this window.
         self.assertFalse(update_done.wait(timeout=0.3))
 
         release_worker.set()
