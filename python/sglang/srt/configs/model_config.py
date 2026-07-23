@@ -646,6 +646,9 @@ class ModelConfig:
         if is_draft_model and self.hf_config.architectures[0] in [
             "Qwen3_5ForConditionalGeneration",
             "Qwen3_5MoeForConditionalGeneration",
+            # Pure-text (non-VL) checkpoints share the same MTP draft module.
+            "Qwen3_5ForCausalLM",
+            "Qwen3_5MoeForCausalLM",
             "InternS2PreviewForConditionalGeneration",
         ]:
             self.hf_config.architectures[0] = "Qwen3_5ForCausalLMMTP"
