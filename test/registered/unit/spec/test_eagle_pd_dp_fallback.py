@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.srt.speculative.eagle_worker_v2 import (
     EAGLEWorkerV2,
     _slice_draft_output_to_local_tokens,
@@ -18,18 +19,21 @@ class TestEaglePDDPFallback(CustomTestCase):
         worker = object.__new__(EAGLEWorkerV2)
         worker._draft_worker = SimpleNamespace(seed_dsa_topk_from_draft_extend=True)
 
-        for seed, future_seed, expect_eager in (
-            (None, False, True),
-            (torch.ones((1, 1)), False, False),
-            (None, True, False),
+        for seed, future_indices, future_seed, expect_eager in (
+            (None, None, False, True),
+            (torch.ones((1, 1)), None, False, False),
+            (torch.ones((1, 1)), torch.tensor([1]), False, True),
+            (None, torch.tensor([1]), True, False),
         ):
             with self.subTest(
                 seed_present=seed is not None,
+                overlap=future_indices is not None,
                 future_seed=future_seed,
             ):
                 batch = SimpleNamespace(
                     spec_info=SimpleNamespace(
                         dsa_topk_indices=seed,
+                        future_indices=future_indices,
                         future_dsa_topk_indices_available=future_seed,
                     )
                 )
@@ -42,6 +46,32 @@ class TestEaglePDDPFallback(CustomTestCase):
         self.assertFalse(
             worker.requires_dp_attention_eager_forward(
                 SimpleNamespace(spec_info=SimpleNamespace(dsa_topk_indices=None))
+            )
+        )
+
+    def test_seeded_running_batch_merged_with_seedless_prebuilt_forces_eager(self):
+        worker = object.__new__(EAGLEWorkerV2)
+        worker._draft_worker = SimpleNamespace(seed_dsa_topk_from_draft_extend=True)
+
+        running_input = EagleDraftInput(
+            dsa_topk_indices=torch.ones((1, 2), dtype=torch.int64),
+            future_indices=torch.tensor([1]),
+            future_dsa_topk_indices_available=True,
+        )
+        prebuilt_input = EagleDraftInput(
+            dsa_topk_indices=None,
+            future_indices=torch.tensor([2]),
+            future_dsa_topk_indices_available=False,
+        )
+        running_input.merge_batch(prebuilt_input)
+
+        self.assertFalse(running_input.future_dsa_topk_indices_available)
+        # merge_batch intentionally leaves the currently materialized tensor
+        # untouched; FutureMap will clear it immediately before the forward.
+        self.assertIsNotNone(running_input.dsa_topk_indices)
+        self.assertTrue(
+            worker.requires_dp_attention_eager_forward(
+                SimpleNamespace(spec_info=running_input)
             )
         )
 

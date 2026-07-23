@@ -1118,11 +1118,15 @@ class EAGLEWorkerV2(BaseSpecWorker):
         if draft_input is None:
             return False
 
-        has_seed_now = getattr(draft_input, "dsa_topk_indices", None) is not None
-        has_future_seed = getattr(
-            draft_input, "future_dsa_topk_indices_available", False
-        )
-        return not (has_seed_now or has_future_seed)
+        # Under overlap scheduling, FutureMap resolves the inputs after this
+        # scheduler-side graph vote. The current tensor may be stale after a
+        # seeded running batch merges a seedless prebuilt batch, while the
+        # future flag already reflects the merged batch.
+        if getattr(draft_input, "future_indices", None) is not None:
+            has_seed = getattr(draft_input, "future_dsa_topk_indices_available", False)
+        else:
+            has_seed = getattr(draft_input, "dsa_topk_indices", None) is not None
+        return not has_seed
 
     @property
     def spec_v2_attn_backends(self) -> tuple:
