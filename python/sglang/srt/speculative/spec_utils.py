@@ -772,7 +772,7 @@ def commit_mamba_states_after_verify(
         # NOTE: radix mamba prefix-caching (mamba_track / extra_buffer) would need
         # a device-side force-flush so `temporal` reflects the ring before a
         # snapshot; not wired for Part B (server_args forbids extra_buffer with
-        # --enable-gdn-replayssm-spec), so the per-track scatters are intentionally
+        # --enable-linear-replayssm-spec), so the per-track scatters are intentionally
         # skipped here.
         return
 

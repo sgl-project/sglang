@@ -722,12 +722,12 @@ class KVCacheConfigurator:
         # non-KDA model there would scatter a None intermediate_ssm and crash.
         _algo = (self.server_args.speculative_algorithm or "").upper()
         if (
-            self.server_args.enable_gdn_replayssm_spec
+            self.server_args.enable_linear_replayssm_spec
             and _algo in ("DSPARK", "DFLASH")
             and kimi_linear_config(self.model_config) is None
         ):
             raise ValueError(
-                "--enable-gdn-replayssm-spec with DSPARK/DFLASH requires a KDA "
+                "--enable-linear-replayssm-spec with DSPARK/DFLASH requires a KDA "
                 "(kimi_linear) model; got a non-KDA model."
             )
         req_to_token_pool = HybridReqToTokenPool(
@@ -758,8 +758,8 @@ class KVCacheConfigurator:
             # or KDA fold); activate the pool machinery only for those, so any
             # other mamba-ish model (Mamba2/Nemotron, lightning, ...) run with the
             # flag set stays byte-identical to flag-off.
-            enable_gdn_replayssm_spec=(
-                self.server_args.enable_gdn_replayssm_spec
+            enable_linear_replayssm_spec=(
+                self.server_args.enable_linear_replayssm_spec
                 and (
                     self.hybrid_gdn_config is not None
                     or kimi_linear_config(self.model_config) is not None
@@ -1760,7 +1760,7 @@ class KVCacheConfigurator:
         # no longer reserves the (1 + D/ratio) intermediate factor -- the whole
         # budget goes to persistent slots (K sized like non-spec), which is how the
         # freed ~9GB turns into higher max_running.
-        replayssm_active = self.server_args.enable_gdn_replayssm_spec and (
+        replayssm_active = self.server_args.enable_linear_replayssm_spec and (
             self.hybrid_gdn_config is not None
             or kimi_linear_config(self.model_config) is not None
         )

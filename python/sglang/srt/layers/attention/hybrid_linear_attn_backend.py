@@ -103,7 +103,7 @@ class MambaAttnBackendBase(AttentionBackend):
             # The ring cursor is a per-slot decode counter shared by all GDN layers;
             # manage it once here (snapshot, hand to layers, advance mod L), not per-layer.
             # Gate on the linear_replayssm FLAG, not on cursor-tensor presence: the
-            # spec-verify ring (--enable-gdn-replayssm-spec) shares the write_pos
+            # spec-verify ring (--enable-linear-replayssm-spec) shares the write_pos
             # allocation but owns it exclusively via commit_gdn_replayssm_spec
             # (advance-by-accept-count once per verify step). Advancing it here as
             # well inserts one phantom/stale ring entry per step and cumulatively
@@ -345,7 +345,7 @@ class MambaAttnBackendBase(AttentionBackend):
         """True iff --enable-linear-replayssm is on for this pool.
 
         Gate on the FLAG, not on ``replayssm_write_pos is not None``: the
-        spec-verify ring (--enable-gdn-replayssm-spec) also allocates the
+        spec-verify ring (--enable-linear-replayssm-spec) also allocates the
         cursor tensor but owns it exclusively via commit_gdn_replayssm_spec.
         The decode-ring metadata machinery gated here (per-bs static cursor
         buffers, the per-replay snapshot + advance-by-one in _replay_metadata,

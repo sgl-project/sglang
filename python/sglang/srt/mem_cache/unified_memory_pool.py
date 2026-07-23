@@ -714,7 +714,7 @@ class UnifiedMambaPool(MambaPool):
         self.linear_replayssm_cache_len = 16
         self.replayssm_write_pos = None
         self.replayssm_is_kda = False
-        self.enable_gdn_replayssm_spec = False
+        self.enable_linear_replayssm_spec = False
         self.replayssm_cache_base = None
         self.replayssm_is_flush = None
         self.debug_memory_pool = False
@@ -937,10 +937,10 @@ class UnifiedHybridReqToTokenPool(HybridReqToTokenPool):
         mamba_envelope_layout: bool = False,
         enable_linear_replayssm: bool = False,
         linear_replayssm_cache_len: int = 16,
-        enable_gdn_replayssm_spec: bool = False,
+        enable_linear_replayssm_spec: bool = False,
     ):
         # mamba_envelope_layout / speculative_eagle_topk / enable_linear_replayssm /
-        # linear_replayssm_cache_len / enable_gdn_replayssm_spec: accepted to match
+        # linear_replayssm_cache_len / enable_linear_replayssm_spec: accepted to match
         # the parent signature but NOT forwarded — the shared pool's conv/temporal
         # state are fixed-shape views (replayssm/spec are gated off under unified).
         assert mamba_size == self._shared_mamba_size, (
