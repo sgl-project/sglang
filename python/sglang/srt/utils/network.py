@@ -51,6 +51,8 @@ def find_process_using_port(port: int) -> Optional[psutil.Process]:
 
 
 MAX_VALID_PORT = 65535
+_PORT_WAIT_POLL_INTERVAL_S = 0.1
+_PORT_WAIT_POLLS_PER_SECOND = int(1 / _PORT_WAIT_POLL_INTERVAL_S)
 
 
 def wait_port_available(
@@ -72,11 +74,12 @@ def wait_port_available(
         )
 
     error_message = f"{port_name} at {port} is not available"
-    for i in range(timeout_s):
+    for poll in range(timeout_s * _PORT_WAIT_POLLS_PER_SECOND):
         if is_port_available(port):
             return True
 
-        if i > 10 and i % 5 == 0:
+        elapsed_s = poll // _PORT_WAIT_POLLS_PER_SECOND
+        if elapsed_s >= 10 and poll % (5 * _PORT_WAIT_POLLS_PER_SECOND) == 0:
             process = find_process_using_port(port)
             if process is None:
                 logger.warning(
@@ -86,9 +89,9 @@ def wait_port_available(
                 pid = process.pid
                 error_message = f"{port_name} is used by a process already. {process.name()=}' {process.cmdline()=} {process.status()=} {pid=}"
                 logger.info(
-                    f"port {port} is in use. Waiting for {i} seconds for {port_name} to be available. {error_message}"
+                    f"port {port} is in use. Waiting for {elapsed_s} seconds for {port_name} to be available. {error_message}"
                 )
-        time.sleep(0.1)
+        time.sleep(_PORT_WAIT_POLL_INTERVAL_S)
 
     if raise_exception:
         raise ValueError(
