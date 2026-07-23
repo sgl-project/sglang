@@ -222,6 +222,17 @@ def resolve_cutedsl_standard_scales(
     return w1_alpha, fc2_input_scale, w2_alpha, used_input_scale
 
 
+def _cutedsl_wrapper_activation_type(activation: str, activation_type_cls: Any) -> Any:
+    if activation == "silu":
+        return activation_type_cls.Swiglu
+    if activation == "relu2":
+        return activation_type_cls.Relu2
+    raise ValueError(
+        f"CuteDSL MoE wrapper supports 'silu' (gated) or 'relu2' (non-gated) "
+        f"activation, got {activation!r}."
+    )
+
+
 def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
     """Lazily create CuteDslMoEWrapper and resolve scales on first forward.
 
@@ -237,7 +248,7 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
         return
 
     try:
-        from flashinfer import CuteDslMoEWrapper
+        from flashinfer import ActivationType, CuteDslMoEWrapper
     except ImportError as e:
         raise ImportError(
             "flashinfer_cutedsl backend requires FlashInfer with CuteDSL support. "
@@ -284,7 +295,9 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
             local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
             output_dtype=layer.moe_runner_config.params_dtype,
             device=str(layer.w13_weight.device),
-            activation=layer.moe_runner_config.activation,
+            activation_type=_cutedsl_wrapper_activation_type(
+                layer.moe_runner_config.activation, ActivationType
+            ),
         )
 
     w1_alpha, fc2_input_scale, w2_alpha, used_input_scale = (
