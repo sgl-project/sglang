@@ -63,7 +63,7 @@ ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 RUN python3 -m pip install --no-cache-dir -U pip setuptools setuptools_scm wheel
 
 # Version pins — override with --build-arg to update
-ARG ROCM_VERSION="7.15.0a20260710"
+ARG ROCM_VERSION="7.15.0a20260712"
 ARG INDEX_URL="https://rocm.nightlies.amd.com/whl-multi-arch/"
 ARG PIP_EXTRA_INDEX_URL="https://rocm.prereleases.amd.com/whl-multi-arch/"
 ARG TORCH_VERSION="2.11.0"
