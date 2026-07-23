@@ -204,6 +204,7 @@ class CommonKVManager(BaseKVManager):
         self._socket_cache: Dict[str, zmq.Socket] = {}
         self._monitor_cache: Dict[str, zmq.Socket] = {}
         self._socket_lock = threading.Lock()
+        self._socket_send_locks: Dict[str, threading.Lock] = {}
         self.failure_records: Dict[int, str] = {}
         self.failure_lock = threading.Lock()
 
@@ -842,6 +843,22 @@ class CommonKVManager(BaseKVManager):
                 zmq.EVENT_DISCONNECTED
             )
             return sock
+
+    def _send_multipart(
+        self, endpoint: str, frames: List[bytes], is_ipv6: bool = False
+    ):
+        """Thread-safe multipart send on a cached ZMQ socket.
+
+        ZMQ sockets are not thread-safe. Transfer workers can concurrently send
+        control messages to the same endpoint, so serialize the complete
+        multipart operation per endpoint to keep message frame boundaries
+        intact.
+        """
+        with self._socket_lock:
+            send_lock = self._socket_send_locks.setdefault(endpoint, threading.Lock())
+
+        with send_lock:
+            self._connect(endpoint, is_ipv6=is_ipv6).send_multipart(frames)
 
     def get_mha_kv_ptrs_with_pp(
         self, src_kv_ptrs: List[int], dst_kv_ptrs: List[int]
