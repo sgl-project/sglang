@@ -89,7 +89,9 @@ class TestKVCacheEventQueue(unittest.TestCase):
 
     def test_enqueue_coalesces_compatible_removes(self):
         queue = _KVCacheEventQueue()
-        queue._enqueue_kv_event(BlockRemoved(block_hashes=[1], medium=StorageMedium.GPU))
+        queue._enqueue_kv_event(
+            BlockRemoved(block_hashes=[1], medium=StorageMedium.GPU)
+        )
         queue._enqueue_kv_event(
             BlockRemoved(block_hashes=[2, 3], medium=StorageMedium.GPU)
         )
@@ -114,14 +116,20 @@ class TestKVCacheEventQueue(unittest.TestCase):
 
         queue = _KVCacheEventQueue()
         queue._enqueue_kv_event(self._store(1, None))
-        queue._enqueue_kv_event(BlockRemoved(block_hashes=[1], medium=StorageMedium.GPU))
+        queue._enqueue_kv_event(
+            BlockRemoved(block_hashes=[1], medium=StorageMedium.GPU)
+        )
         queue._enqueue_kv_event(AllBlocksCleared())
         queue._enqueue_kv_event(self._store(2, None))
         self.assertEqual(len(queue.take_events()), 4)
 
         queue = _KVCacheEventQueue()
-        queue._enqueue_kv_event(BlockRemoved(block_hashes=[1], medium=StorageMedium.GPU))
-        queue._enqueue_kv_event(BlockRemoved(block_hashes=[2], medium=StorageMedium.CPU))
+        queue._enqueue_kv_event(
+            BlockRemoved(block_hashes=[1], medium=StorageMedium.GPU)
+        )
+        queue._enqueue_kv_event(
+            BlockRemoved(block_hashes=[2], medium=StorageMedium.CPU)
+        )
         self.assertEqual(len(queue.take_events()), 2)
 
 
