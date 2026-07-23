@@ -112,6 +112,7 @@ def match_prefix_for_req(
             key=RadixKey(token_ids=token_ids, extra_key=req.extra_key, limit=key_limit),
             cow_mamba=cow_mamba,
             req=req if include_req else None,
+            for_reuse=True,
         )
     )
     if envs.SGLANG_RADIX_FORCE_MISS.get():
@@ -285,7 +286,8 @@ class SchedulePolicy:
             if len(r.prefix_indices) <= IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD:
                 match_result = self.waiting_queue_radix_tree.match_prefix(
                     MatchPrefixParams(
-                        key=RadixKey(token_ids=prefix_ids, extra_key=extra_key)
+                        key=RadixKey(token_ids=prefix_ids, extra_key=extra_key),
+                        for_reuse=True,
                     )
                 )
                 if envs.SGLANG_RADIX_FORCE_MISS.get():

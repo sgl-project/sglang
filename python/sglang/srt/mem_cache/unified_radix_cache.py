@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import heapq
 import logging
 import sys
 import threading
@@ -591,7 +592,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             best_match_node,
             best_match_device_node,
             best_match_device_value_len,
-        ) = self._match_prefix_helper(key)
+        ) = self._match_prefix_helper(key, for_reuse=params.for_reuse)
         return self._match_post_processor(
             params,
             value,
@@ -785,6 +786,19 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             skip_swa=getattr(req, "swa_prefix_lock_released", False),
         )
 
+        # Strict SWA: the request is done — drop its per-request device SWA
+        # ring values along the finished prefix so any later cross-request
+        # reuse restores the true window from host (I1) rather than trusting
+        # the recycled device ring. Per-node gates (SWA lock_ref==0, host copy
+        # committed) are enforced inside evict_device_on_owner_release; nodes
+        # still held by another active request (lock_ref>0) are left intact.
+        swa_comp = self.components.get(ComponentType.SWA)
+        if swa_comp is not None:
+            node = req.last_node
+            while node is not None and node is not self.root_node:
+                swa_comp.evict_device_on_owner_release(node)
+                node = node.parent
+
         # cleanup
         for comp in self._components_tuple:
             comp.cleanup_after_caching_req(
@@ -900,18 +914,32 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     # ---- Internal Helpers ----
 
     def _match_prefix_helper(
-        self, key: RadixKey
+        self, key: RadixKey, for_reuse: bool = False
     ) -> tuple[list[torch.Tensor], UnifiedTreeNode, UnifiedTreeNode, int]:
         # Non-HiCache mode has only device-resident matches, so the scheduler
         # device anchor follows the best match. In HiCache mode, host-backed
         # nodes can also match, so we separately track the best device-resident
         # match for scheduler prefix indices and locking.
+        #
+        # `for_reuse` distinguishes cross-request reuse matches (scheduler) from
+        # self-match lookups (`cache_unfinished_req`). On the device-only match
+        # validators, `cd.value` is trusted even without a durable host copy —
+        # required for self-match (the request's own freshly-computed nodes
+        # aren't host-backed yet), but unsafe on reuse (the per-request SWA
+        # device ring is recycled across requests, so a device-only match past
+        # the host-gated boundary can be stale). So on reuse we clamp the FULL
+        # device anchor to the host-gated `best_match_node` boundary below.
         node = self.root_node
         child_key = key.child_key(self.page_size)
         value: list[torch.Tensor] = []
         best_match_node = node
         best_match_device_node = node
         best_match_device_value_len = 0
+        # FULL value-chunk length at the moment `best_match_node` (the node
+        # accepted by ALL validators, i.e. host-gated) was last set. Only
+        # meaningful when `best_match_node` is device-resident at that point,
+        # which holds for the Mine-1 scenario this clamp targets.
+        best_match_value_len = 0
         separate_device_match = self.cache_controller is not None
         if separate_device_match:
             validators = tuple(
@@ -933,9 +961,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         def _update_best_if_valid(node):
             nonlocal best_match_node
             nonlocal best_match_device_value_len, best_match_device_node
+            nonlocal best_match_value_len
             matched = _all_valid(validators, node)
             if matched:
                 best_match_node = node
+                best_match_value_len = len(value)
 
             if not separate_device_match:
                 if matched:
@@ -968,6 +998,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             key = key[prefix_len:]
             if len(key):
                 child_key = key.child_key(self.page_size)
+
+        if for_reuse:
+            # Reuse path only: never let the FULL device anchor extend past the
+            # host-gated best_match_node boundary, even if the per-request
+            # device-only validators (trusting `cd.value`) matched further.
+            # Self-match must NOT clamp here — see docstring above.
+            best_match_device_value_len = min(
+                best_match_device_value_len, best_match_value_len
+            )
 
         return (
             value,
@@ -1314,6 +1353,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self._update_evictable_leaf_sets(node)
 
     def _remove_leaf_from_parent(self, node: UnifiedTreeNode):
+        # R1: free any interior stride carrier's not-yet-promoted SWA capture
+        # page here -- the single true node-removal chokepoint. Pending tracks
+        # the Full (base) lifetime, so it is dropped only on real removal (not on
+        # a device tombstone) and independent of per-component eviction order.
+        swa_comp = self.components.get(ComponentType.SWA)
+        if swa_comp is not None:
+            swa_comp.free_pending_host_on_remove(node)
         key = node.key.child_key(self.page_size)
         v = node.parent.children.pop(key, None)
         assert v == node
@@ -1422,6 +1468,70 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if comp is not None:
             comp.drive_host_eviction(num_tokens, tracker)
         return tracker[component_type]
+
+    def drive_host_leaf_eviction(
+        self,
+        num_tokens: int,
+        key_component: ComponentType,
+        tracker: dict[ComponentType, int],
+    ) -> None:
+        """Evict whole host leaves atomically until
+        ``tracker[key_component] >= num_tokens``, dropping every component
+        (Full + SWA) on each leaf together. Used by strict bit-exact SWA so a
+        Full-host copy never outlives its SWA-host copy.
+        """
+        full_before = tracker.get(BASE_COMPONENT_TYPE, 0)
+        leaves = 0
+        heap = [
+            (self.eviction_strategy.get_priority(n), n)
+            for n in self.evictable_host_leaves
+        ]
+        heapq.heapify(heap)
+        while tracker[key_component] < num_tokens and heap:
+            _, x = heapq.heappop(heap)
+            if x not in self.evictable_host_leaves:
+                continue
+            self._evict_host_leaf(x, tracker)
+            leaves += 1
+            if x.parent is not None and x.parent in self.evictable_host_leaves:
+                heapq.heappush(
+                    heap,
+                    (self.eviction_strategy.get_priority(x.parent), x.parent),
+                )
+        # Full freed by an auxiliary component's (strict SWA) pressure: that pool
+        # is the binding constraint and may throttle Full hit rate.
+        if key_component != BASE_COMPONENT_TYPE:
+            self._note_binding_full_coevict(
+                tracker.get(BASE_COMPONENT_TYPE, 0) - full_before, leaves
+            )
+
+    def _note_binding_full_coevict(self, full_tokens: int, leaves: int) -> None:
+        if full_tokens <= 0 or leaves <= 0:
+            return
+        self._binding_full_coevict_tokens = (
+            getattr(self, "_binding_full_coevict_tokens", 0) + full_tokens
+        )
+        self._binding_full_coevict_leaves = (
+            getattr(self, "_binding_full_coevict_leaves", 0) + leaves
+        )
+        # Warn once, after enough samples to recommend a stable ratio.
+        if getattr(self, "_binding_full_coevict_warned", False):
+            return
+        if self._binding_full_coevict_leaves < 16:
+            return
+        self._binding_full_coevict_warned = True
+        avg_prefix_tokens = (
+            self._binding_full_coevict_tokens / self._binding_full_coevict_leaves
+        )
+        logger.warning(
+            "[SWA-HiCache] SWA host pool is the binding constraint: strict "
+            "co-eviction dropped Full-host copies to free SWA space, lowering "
+            "Full hit rate. Raise --hicache-swa-offload-page-stride to shrink "
+            "the SWA host footprint (coarser reuse granularity), or run "
+            "best-effort (SGLANG_UNIFIED_KV_BIT_EXACT_HICACHE=0) for "
+            "short-prefix workloads. Observed avg cached-prefix ~%.0f tokens.",
+            avg_prefix_tokens,
+        )
 
     def _is_device_leaf(self, node: UnifiedTreeNode) -> bool:
         """D-leaf: Full device value present, no child with Full KV on device,
@@ -1580,7 +1690,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             if evicted < needed:
                 return 0
 
-        aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
+        aux_xfers = [
+            x
+            for xfers in comp_xfers.values()
+            for x in xfers
+            if x.device_indices is not None
+        ]
         aux_xfers.extend(sidecar_xfers)
         host_indices = self.cache_controller.write(
             device_value, node_id=node.id, extra_pools=aux_xfers or None
@@ -2523,6 +2638,22 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             finish_count -= 1
 
     # ---- HiCache: Scheduler Entry Points ----
+
+    def restore_swa_windows(self, reqs, req_pool_indices_cpu):
+        """Deferred positional SWA restore (unified_kv), driven from
+        prepare_for_extend once req_pool_idx is assigned. For each req that
+        stashed a reuse window at load_back, copy the host SWA window into its
+        per-request unified_kv ring block before the first forward reads it."""
+        swa_comp = self.components.get(ComponentType.SWA)
+        if swa_comp is None or not getattr(swa_comp, "_unified_positional_swa", False):
+            return
+        if self.cache_controller is None:
+            return
+        io_backend = self.cache_controller.io_backend
+        idx = req_pool_indices_cpu.tolist()
+        for i, req in enumerate(reqs):
+            if getattr(req, "_swa_restore_windows", None):
+                swa_comp.restore_pending_swa_windows(req, int(idx[i]), io_backend)
 
     def init_load_back(
         self,
