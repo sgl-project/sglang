@@ -3883,7 +3883,15 @@ class ServerArgs:
                 **({"ignore_patterns": ignore_patterns} if ignore_patterns else {}),
             )
 
-        self.model_path = _resolve_or_download(self.model_path, revision=self.revision)
+        self.model_path = _resolve_or_download(
+            self.model_path,
+            revision=self.revision,
+            ignore_patterns=(
+                ["*.bin", "*.safetensors", "*.pt", "*.gguf"]
+                if self.load_format == "dummy"
+                else None
+            ),
+        )
         self.tokenizer_path = _resolve_or_download(
             self.tokenizer_path,
             ignore_patterns=["*.bin", "*.safetensors"],
