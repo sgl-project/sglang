@@ -4,12 +4,18 @@ from sgl_kernel import gelu_and_mul as gelu_and_mul_aot
 from sgl_kernel import gelu_tanh_and_mul as gelu_tanh_and_mul_aot
 from sgl_kernel import silu_and_mul as silu_and_mul_aot
 
-from sglang.jit_kernel.activation import gelu_and_mul as gelu_and_mul_jit
-from sglang.jit_kernel.activation import gelu_tanh_and_mul as gelu_tanh_and_mul_jit
-from sglang.jit_kernel.activation import relu2 as relu2_jit
-from sglang.jit_kernel.activation import silu_and_mul as silu_and_mul_jit
-from sglang.jit_kernel.benchmark import marker
-from sglang.jit_kernel.benchmark.utils import create_random
+from sglang.kernels.jit.benchmark import marker
+from sglang.kernels.jit.benchmark.utils import create_random
+from sglang.kernels.ops.activation._jit_activation import (
+    gelu_and_mul as gelu_and_mul_jit,
+)
+from sglang.kernels.ops.activation._jit_activation import (
+    gelu_tanh_and_mul as gelu_tanh_and_mul_jit,
+)
+from sglang.kernels.ops.activation._jit_activation import relu2 as relu2_jit
+from sglang.kernels.ops.activation._jit_activation import (
+    silu_and_mul as silu_and_mul_jit,
+)
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(

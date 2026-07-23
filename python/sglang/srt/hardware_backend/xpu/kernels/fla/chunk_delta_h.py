@@ -8,7 +8,12 @@ from sglang.kernels.ops.attention.fla.index import (
     prepare_chunk_indices,
     prepare_chunk_offsets,
 )
-from sglang.kernels.ops.attention.fla.op import exp, make_tensor_descriptor, safe_exp
+from sglang.kernels.ops.attention.fla.op import (
+    exp,
+    exp2,
+    make_tensor_descriptor,
+    safe_exp,
+)
 from sglang.kernels.ops.attention.fla.utils import (
     autotune_cache_kwargs,
 )
@@ -52,6 +57,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64_k_loop(
     SAVE_NEW_VALUE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     NT_BUCKET: tl.constexpr,  # this arg is kept to align with the triton kernel for CUDA
+    USE_EXP2: tl.constexpr,
 ):
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
     i_n, i_h = i_nh // H, i_nh % H
@@ -199,7 +205,10 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64_k_loop(
                     mask=(o_k1 < K),
                     other=0.0,
                 )
-                b_h *= tl.expand_dims(exp(b_gk_last1), 0)
+                if USE_EXP2:
+                    b_h *= tl.expand_dims(exp2(b_gk_last1), 0)
+                else:
+                    b_h *= tl.expand_dims(exp(b_gk_last1), 0)
 
             # Delta update: h += k^T @ v
             b_k = tl.trans(k_desc.load([i_t * BT, k_blk]))
@@ -224,7 +233,11 @@ def chunk_gated_delta_rule_fwd_h(
     save_new_value: bool = True,
     cu_seqlens: Optional[torch.LongTensor] = None,
     chunk_indices: Optional[torch.LongTensor] = None,
+    use_exp2: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    assert not (
+        use_exp2 and g is not None
+    ), "use_exp2 covers only the per-channel gk path; scalar g stays natural-exp"
     B, T, Hg, K, V = *k.shape, u.shape[-1]
     H = u.shape[-2]
     BT = CHUNK_SIZE
@@ -276,5 +289,6 @@ def chunk_gated_delta_rule_fwd_h(
         SAVE_NEW_VALUE=v_new is not None,
         IS_VARLEN=cu_seqlens is not None,
         NT_BUCKET=(0 if NT <= 32 else (1 if NT <= 128 else 2)),
+        USE_EXP2=use_exp2,
     )
     return h, v_new

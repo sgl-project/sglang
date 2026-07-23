@@ -114,7 +114,7 @@ def _torch_sparse_attention_ref(
 
 
 def _run_and_check(d_qk, with_sink, s_q=2, topk=TOPK, s_kv=S_KV):
-    from sglang.jit_kernel.sparse_mla_q8kv8_prefill_sm90 import (
+    from sglang.kernels.ops.attention.sparse_mla_q8kv8_prefill_sm90 import (
         sparse_mla_q8kv8_prefill_fwd,
     )
 
@@ -212,7 +212,7 @@ def test_sparse_mla_q8kv8_prefill_precision(d_qk: int, s_q: int, topk: int, s_kv
     """Demonstrate that Q8KV8 kernel precision is near-lossless versus the
     fp32 reference: max/mean/p99 absolute error are small and the fraction
     of elements exceeding 0.1 absolute error is under 1%."""
-    from sglang.jit_kernel.sparse_mla_q8kv8_prefill_sm90 import (
+    from sglang.kernels.ops.attention.sparse_mla_q8kv8_prefill_sm90 import (
         sparse_mla_q8kv8_prefill_fwd,
     )
 
@@ -285,7 +285,7 @@ def test_sparse_mla_q8kv8_prefill_precision(d_qk: int, s_q: int, topk: int, s_kv
 def test_sparse_mla_q8kv8_prefill_no_alias_between_calls():
     """Two default-allocation calls with the same shape must return independent
     storage. This guards against regressing to a module-scope output cache."""
-    from sglang.jit_kernel.sparse_mla_q8kv8_prefill_sm90 import (
+    from sglang.kernels.ops.attention.sparse_mla_q8kv8_prefill_sm90 import (
         sparse_mla_q8kv8_prefill_fwd,
     )
 
@@ -332,7 +332,7 @@ def test_sparse_mla_q8kv8_prefill_no_alias_between_calls():
 def test_sparse_mla_q8kv8_prefill_caller_owned_buffers():
     """Caller-provided ``out`` / ``max_logits`` / ``lse`` tensors must be
     written into in-place and returned as-is."""
-    from sglang.jit_kernel.sparse_mla_q8kv8_prefill_sm90 import (
+    from sglang.kernels.ops.attention.sparse_mla_q8kv8_prefill_sm90 import (
         sparse_mla_q8kv8_prefill_fwd,
     )
 
@@ -373,7 +373,7 @@ def test_sparse_mla_q8kv8_prefill_caller_owned_buffers():
 )
 def test_sparse_mla_q8kv8_prefill_rejects_bad_buffers():
     """Validation: wrong shape/dtype and aliasing must raise ValueError."""
-    from sglang.jit_kernel.sparse_mla_q8kv8_prefill_sm90 import (
+    from sglang.kernels.ops.attention.sparse_mla_q8kv8_prefill_sm90 import (
         sparse_mla_q8kv8_prefill_fwd,
     )
 
@@ -474,7 +474,7 @@ def test_sparse_mla_q8kv8_prefill_masked_sentinels(s_q: int):
     Gate: per-band cos > 0.97 AND magnitude ratio > 0.9
     (the denominator-pollution bug crushes magnitude 50-2000x, unmistakable even
     under fp8 noise)."""
-    from sglang.jit_kernel.sparse_mla_q8kv8_prefill_sm90 import (
+    from sglang.kernels.ops.attention.sparse_mla_q8kv8_prefill_sm90 import (
         sparse_mla_q8kv8_prefill_fwd,
     )
 
@@ -532,7 +532,7 @@ def test_sparse_mla_q8kv8_prefill_sq_envelope(s_q: int):
     """NEW gate (bug class 2): all-valid correctness across the s_q envelope.
     s_q=6144 previously produced first-band NaNs (an is_kv_valid data race that
     only appears past s_q=2048)."""
-    from sglang.jit_kernel.sparse_mla_q8kv8_prefill_sm90 import (
+    from sglang.kernels.ops.attention.sparse_mla_q8kv8_prefill_sm90 import (
         sparse_mla_q8kv8_prefill_fwd,
     )
 
@@ -575,7 +575,7 @@ def test_sparse_mla_q8kv8_prefill_large_skv():
     """NEW gate (bug class 3): large gathered buffers / large index values
     (s_kv=65536, indices in [33000, 65536)).  E2E multi-request gather buffers
     reach tens of thousands of rows; the suite above used s_kv<=1024."""
-    from sglang.jit_kernel.sparse_mla_q8kv8_prefill_sm90 import (
+    from sglang.kernels.ops.attention.sparse_mla_q8kv8_prefill_sm90 import (
         sparse_mla_q8kv8_prefill_fwd,
     )
 

@@ -31,6 +31,9 @@ _GROUPS = (
     "sampling",
     "spatial",
     "speculative",
+    "lplb",
+    "kv_canary",
+    "model",
 )
 
 for _group in _GROUPS:

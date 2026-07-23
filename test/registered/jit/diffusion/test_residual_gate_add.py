@@ -3,7 +3,7 @@ import sys
 import pytest
 import torch
 
-from sglang.jit_kernel.diffusion.residual_gate_add import (
+from sglang.kernels.ops.diffusion.residual_gate_add import (
     can_use_residual_gate_add_cuda,
     residual_gate_add_cuda,
 )

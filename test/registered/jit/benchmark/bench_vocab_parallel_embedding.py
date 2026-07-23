@@ -3,7 +3,7 @@ import torch.nn.functional as F
 import triton
 import triton.testing
 
-from sglang.jit_kernel.benchmark.utils import get_benchmark_range, run_benchmark
+from sglang.kernels.jit.benchmark.utils import get_benchmark_range, run_benchmark
 from sglang.kernels.ops.embeddings.vocab_parallel_embedding import (
     vocab_parallel_embedding,
 )

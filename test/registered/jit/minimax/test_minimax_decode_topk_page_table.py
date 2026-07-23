@@ -16,7 +16,7 @@ import torch
 
 flashinfer = pytest.importorskip("flashinfer")
 
-from sglang.jit_kernel.minimax_decode_topk import (
+from sglang.kernels.ops.attention.minimax_decode_topk import (
     minimax_decode_topk,
     minimax_decode_topk_page_table,
 )

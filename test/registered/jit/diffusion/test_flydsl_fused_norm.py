@@ -58,7 +58,7 @@ FUSED_CASES = [
 
 @pytest.mark.parametrize("norm_type,B,L", FUSED_CASES)
 def test_fused_residual_norm_scale_shift(norm_type, B, L):
-    from sglang.jit_kernel.diffusion.flydsl.fused_residual_norm import (
+    from sglang.kernels.ops.diffusion.flydsl.fused_residual_norm import (
         flydsl_fused_residual_norm_scale_shift,
     )
 
@@ -110,7 +110,7 @@ NSS_CASES = [
 
 @pytest.mark.parametrize("norm_type,B,L", NSS_CASES)
 def test_norm_scale_shift(norm_type, B, L):
-    from sglang.jit_kernel.diffusion.flydsl.fused_residual_norm import (
+    from sglang.kernels.ops.diffusion.flydsl.fused_residual_norm import (
         flydsl_norm_scale_shift,
     )
 

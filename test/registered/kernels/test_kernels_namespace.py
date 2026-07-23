@@ -183,11 +183,12 @@ def test_platform_detect_does_not_raise():
 
 
 def test_import_stays_metadata_only():
-    # Importing the namespace must not pull in sgl_kernel / sglang.jit_kernel.
+    # Importing the namespace must not pull in the AOT backend (sgl_kernel) or
+    # the JIT compilation infra (sglang.kernels.jit), which import torch / nvcc.
     code = (
         "import sys, sglang.kernels.ops; "
         "print('DIRTY' if 'sgl_kernel' in sys.modules or any("
-        "m.startswith('sglang.jit_kernel') for m in sys.modules) else 'CLEAN')"
+        "m.startswith('sglang.kernels.jit') for m in sys.modules) else 'CLEAN')"
     )
     r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
     assert r.returncode == 0, r.stderr

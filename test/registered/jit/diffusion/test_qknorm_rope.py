@@ -48,7 +48,7 @@ def split_qknorm_rope(
 ) -> None:
     from flashinfer.rope import apply_rope_with_cos_sin_cache_inplace
 
-    from sglang.jit_kernel.norm import fused_inplace_qknorm
+    from sglang.kernels.ops.layernorm._jit_norm import fused_inplace_qknorm
 
     fused_inplace_qknorm(q, k, q_weight, k_weight)
     apply_rope_with_cos_sin_cache_inplace(
@@ -70,7 +70,7 @@ def fused_qknorm_rope(
     positions: torch.Tensor,
     is_neox: bool,
 ) -> None:
-    from sglang.jit_kernel.diffusion.qknorm_rope import fused_inplace_qknorm_rope
+    from sglang.kernels.ops.diffusion.qknorm_rope import fused_inplace_qknorm_rope
 
     fused_inplace_qknorm_rope(
         q,

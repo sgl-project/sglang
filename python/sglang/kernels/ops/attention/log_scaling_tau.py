@@ -50,7 +50,7 @@ def apply_log_scaling_tau(x: torch.Tensor, tau: torch.Tensor) -> torch.Tensor:
         # Vectorized JIT kernel (16B loads, one row divide per vector) --
         # bit-identical output (same fp32-mul + bf16-round), ~2-3x the
         # scalar triton kernel below at every size.
-        from sglang.jit_kernel.inkling_row_scale import row_scale_bf16
+        from sglang.kernels.ops.model.inkling.inkling_row_scale import row_scale_bf16
 
         x2d = torch.as_strided(x, (rows, inner), (x.stride(0), 1))
         return row_scale_bf16(x2d, tau.reshape(rows).float()).view(x.shape)

@@ -28,10 +28,13 @@ import torch
 import torch.distributed as dist
 
 import sglang.srt.distributed.parallel_state as ps
-from sglang.jit_kernel.all_reduce import AllReduceAlgo, get_all_reduce_module
-from sglang.jit_kernel.mp import register_comm_cleanup
-from sglang.jit_kernel.tests.utils import multigpu_pytest_main
+from sglang.kernels.jit.tests.utils import multigpu_pytest_main
 from sglang.kernels.jit.utils import cache_once, get_ci_test_range
+from sglang.kernels.ops.communication.all_reduce import (
+    AllReduceAlgo,
+    get_all_reduce_module,
+)
+from sglang.kernels.ops.communication.mp import register_comm_cleanup
 from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
     CustomAllReduceV2,
 )

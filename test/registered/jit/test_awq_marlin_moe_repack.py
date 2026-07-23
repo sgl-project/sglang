@@ -5,7 +5,7 @@ import pytest
 import torch
 from sgl_kernel.scalar_type import scalar_types
 
-from sglang.jit_kernel.awq_marlin_repack import (
+from sglang.kernels.ops.quantization.awq_marlin_repack import (
     awq_marlin_moe_repack as jit_awq_marlin_moe_repack,
 )
 from sglang.srt.layers.quantization.utils import pack_cols, quantize_weights

@@ -5,8 +5,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from sglang.jit_kernel.diffusion.group_norm_silu import apply_group_norm_silu
-from sglang.jit_kernel.diffusion.triton.group_norm_silu import triton_group_norm_silu
+from sglang.kernels.ops.diffusion.group_norm_silu import apply_group_norm_silu
+from sglang.kernels.ops.diffusion.triton.group_norm_silu import triton_group_norm_silu
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=8, stage="base-b-kernel-unit", runner_config="1-gpu-large")

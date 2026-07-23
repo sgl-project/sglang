@@ -10,11 +10,11 @@ from typing import Union
 
 import torch
 
-from sglang.jit_kernel.dsv4 import (
+from sglang.kernels.jit.utils import is_hip_runtime
+from sglang.kernels.ops.attention.dsv4 import (
     CompressorDecodePlan,
     CompressorPrefillPlan,
 )
-from sglang.kernels.jit.utils import is_hip_runtime
 
 _is_hip = is_hip_runtime()
 

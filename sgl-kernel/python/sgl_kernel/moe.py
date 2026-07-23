@@ -106,7 +106,7 @@ def moe_sum(
 
 # moe_fused_gate / kimi_k2_moe_fused_gate (AOT gate kernels) retired — the gate/topk
 # path is consolidated onto the unified Triton router in
-# python/sglang/jit_kernel/moe_fused_gate.py (sglang issue #26771).
+# python/sglang/kernels/ops/moe/moe_fused_gate.py (sglang issue #26771).
 
 
 def fp8_blockwise_scaled_grouped_mm(

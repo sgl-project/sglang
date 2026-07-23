@@ -5,8 +5,8 @@ launch) vs the unfused path (GemmaRMSNorm(q) + GemmaRMSNorm(k) + rotary_emb,
 
 import torch
 
-from sglang.jit_kernel.benchmark import marker
-from sglang.jit_kernel.minimax_qknorm_rope import (
+from sglang.kernels.jit.benchmark import marker
+from sglang.kernels.ops.attention.minimax_qknorm_rope import (
     minimax_qknorm_rope,
     minimax_qknorm_rope_grouped,
 )

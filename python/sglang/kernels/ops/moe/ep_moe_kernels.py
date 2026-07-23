@@ -1555,7 +1555,7 @@ def moe_ep_deepgemm_preprocess(
     block_n, block_k = block_shape[0], block_shape[1]
     is_fp8 = output_dtype == torch.float8_e4m3fn
     if is_fp8 and use_mxfp8:
-        from sglang.jit_kernel.minimax_quant_ue8m0 import (
+        from sglang.kernels.ops.quantization.minimax_quant_ue8m0 import (
             per_token_quant_fp8_ue8m0_scatter,
         )
 
@@ -1981,7 +1981,7 @@ def moe_permute(
     is_ep: bool = False,
     outputs: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    from sglang.jit_kernel.moe_permute_prepare import moe_permute_prepare
+    from sglang.kernels.ops.moe.moe_permute_prepare import moe_permute_prepare
 
     expert_offsets, src2dst = moe_permute_prepare(
         topk_ids=topk_ids,

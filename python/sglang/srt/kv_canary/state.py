@@ -5,7 +5,7 @@ from typing import Optional
 
 import torch
 
-from sglang.jit_kernel.kv_canary.consts import VIOLATION_FIELDS
+from sglang.kernels.ops.kv_canary.consts import VIOLATION_FIELDS
 from sglang.srt.kv_canary.config import CanaryConfig
 
 
@@ -16,7 +16,7 @@ class ViolationLog:
     One instance per canary runner — every launch (head / tail / sweep, K / V half, FULL / SWA group) writes
     into the same ring. The kernel_kind field stamped into each violation row identifies which launch fired
     (kernel_kind is a static IntEnum tag — :class:`CanaryLaunchTag` in
-    ``sglang.jit_kernel.kv_canary.verify`` — with a unique value per (head|tail|sweep, K|V, FULL|SWA) tuple).
+    ``sglang.kernels.ops.kv_canary.verify`` — with a unique value per (head|tail|sweep, K|V, FULL|SWA) tuple).
 
     Ring capacity is sized generously (≥ 1024) so overflow is a non-concern in practice — violations are
     cold-path and the host raises at the first one anyway (or just logs it in mode="log"). atomicAdd

@@ -452,7 +452,8 @@ FUSION_PATTERN_REGISTRY: Tuple[FusionPatternSpec, ...] = (
     FusionPatternSpec(
         pattern="In-place QK RMSNorm",
         candidate_path=(
-            "python/sglang/srt/models/utils.py" "<br>python/sglang/jit_kernel/norm.py"
+            "python/sglang/srt/models/utils.py"
+            "<br>python/sglang/kernels/ops/layernorm/_jit_norm.py"
         ),
         active_keywords=("fused_inplace_qknorm", "minimaxm2rmsnormtp"),
         split_groups=(("apply_qk_norm", "q_norm", "k_norm", "qknorm"),),
@@ -466,7 +467,7 @@ FUSION_PATTERN_REGISTRY: Tuple[FusionPatternSpec, ...] = (
     FusionPatternSpec(
         pattern="Fused QK RMSNorm + RoPE",
         candidate_path=(
-            "python/sglang/jit_kernel/fused_qknorm_rope.py"
+            "python/sglang/kernels/ops/attention/fused_qknorm_rope.py"
             "<br>python/sglang/srt/models/qwen3_moe.py"
         ),
         active_keywords=("fused_qknorm_rope", "fused_qk_norm_rope"),
@@ -499,7 +500,8 @@ FUSION_PATTERN_REGISTRY: Tuple[FusionPatternSpec, ...] = (
     FusionPatternSpec(
         pattern="Fused RoPE + KV cache store",
         candidate_path=(
-            "python/sglang/jit_kernel/rope.py" "<br>python/sglang/srt/models/utils.py"
+            "python/sglang/kernels/ops/attention/rope.py"
+            "<br>python/sglang/srt/models/utils.py"
         ),
         active_keywords=("fused_set_kv_buffer",),
         split_groups=(
@@ -531,7 +533,7 @@ FUSION_PATTERN_REGISTRY: Tuple[FusionPatternSpec, ...] = (
     ),
     FusionPatternSpec(
         pattern="NSA fused metadata copy for graph replay",
-        candidate_path="python/sglang/jit_kernel/fused_metadata_copy.py",
+        candidate_path="python/sglang/kernels/ops/attention/fused_metadata_copy.py",
         active_keywords=(
             "fused_metadata_copy",
             "fused_metadata_copy_multi",
@@ -698,7 +700,7 @@ FUSION_PATTERN_REGISTRY: Tuple[FusionPatternSpec, ...] = (
         pattern="Fused MoE activation + quant / re-quant",
         candidate_path=(
             "python/sglang/srt/layers/moe/ep_moe/kernels.py"
-            "<br>python/sglang/jit_kernel/nvfp4.py"
+            "<br>python/sglang/kernels/ops/quantization/nvfp4_gemm_swiglu_nvfp4_quant.py"
             "<br>python/sglang/srt/layers/moe/cutlass_w4a8_moe.py"
         ),
         active_keywords=(
@@ -759,7 +761,7 @@ FUSION_PATTERN_REGISTRY: Tuple[FusionPatternSpec, ...] = (
     FusionPatternSpec(
         pattern="NSA fused quantize + indexed K-cache store",
         candidate_path=(
-            "python/sglang/jit_kernel/fused_store_index_cache.py"
+            "python/sglang/kernels/ops/attention/fused_store_index_cache.py"
             "<br>python/sglang/srt/layers/attention/nsa/nsa_indexer.py"
         ),
         active_keywords=("fused_store_index_k_cache",),
@@ -859,7 +861,7 @@ FUSION_PATTERN_REGISTRY: Tuple[FusionPatternSpec, ...] = (
         pattern="SGLang LTX2 fused Ada values",
         candidate_path=(
             "PR #29390"
-            "<br>python/sglang/jit_kernel/diffusion/triton/ltx2_ada_values.py"
+            "<br>python/sglang/kernels/ops/diffusion/triton/ltx2_ada_values.py"
             "<br>python/sglang/multimodal_gen/runtime/models/dits/ltx_2.py"
         ),
         active_keywords=(
@@ -886,8 +888,8 @@ FUSION_PATTERN_REGISTRY: Tuple[FusionPatternSpec, ...] = (
         pattern="SGLang LTX2 residual-gate add CUDA fast path",
         candidate_path=(
             "PR #29361"
-            "<br>python/sglang/jit_kernel/diffusion/residual_gate_add.py"
-            "<br>python/sglang/jit_kernel/csrc/diffusion/residual_gate_add.cuh"
+            "<br>python/sglang/kernels/ops/diffusion/residual_gate_add.py"
+            "<br>python/sglang/kernels/jit/csrc/diffusion/residual_gate_add.cuh"
             "<br>python/sglang/multimodal_gen/runtime/models/dits/ltx_2.py"
         ),
         active_keywords=(

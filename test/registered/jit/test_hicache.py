@@ -3,7 +3,7 @@ import sys
 import pytest
 import torch
 
-from sglang.jit_kernel.hicache import can_use_write_back_jit_kernel
+from sglang.kernels.ops.kvcache.hicache import can_use_write_back_jit_kernel
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
