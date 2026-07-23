@@ -12,7 +12,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
-from sglang.kernels.ops.layernorm._jit_norm import (
+from sglang.kernels.ops.layernorm.norm import (
     can_use_fused_inplace_qknorm as can_use_jit_qk_norm,
 )
 from sglang.srt.environ import envs
