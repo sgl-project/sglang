@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
 from torch import nn
 from transformers import PreTrainedModel
 
@@ -48,11 +49,11 @@ def test_language_only_does_not_construct_multimodal_encoders():
     assert model.language_model is text_model
 
 
-def test_language_only_accepts_gemma4_architecture():
+def _server_args(*, language_only, encoder_only):
     server_args = object.__new__(ServerArgs)
     server_args.enable_prefix_mm_cache = False
-    server_args.encoder_only = False
-    server_args.language_only = True
+    server_args.encoder_only = encoder_only
+    server_args.language_only = language_only
     server_args.encoder_urls = []
     server_args.disaggregation_transfer_backend = "zmq_to_scheduler"
     server_args.disaggregation_mode = "null"
@@ -60,5 +61,17 @@ def test_language_only_accepts_gemma4_architecture():
     server_args.get_model_config = lambda: SimpleNamespace(
         hf_config=SimpleNamespace(architectures=["Gemma4ForConditionalGeneration"])
     )
+    return server_args
+
+
+def test_language_only_accepts_gemma4_architecture():
+    server_args = _server_args(language_only=True, encoder_only=False)
 
     server_args._handle_encoder_disaggregation()
+
+
+def test_encoder_only_still_rejects_gemma4_architecture():
+    server_args = _server_args(language_only=False, encoder_only=True)
+
+    with pytest.raises(ValueError, match="not supported"):
+        server_args._handle_encoder_disaggregation()

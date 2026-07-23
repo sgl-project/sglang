@@ -6926,7 +6926,7 @@ class ServerArgs:
         # Validate model type for encoder disaggregation
         hf_config = self.get_model_config().hf_config
         model_arch = hf_config.architectures[0]
-        if (self.encoder_only or self.language_only) and model_arch not in [
+        supported_architectures = [
             "Qwen2VLForConditionalGeneration",
             "Qwen3VLForConditionalGeneration",
             "Qwen2_5_VLForConditionalGeneration",
@@ -6940,11 +6940,20 @@ class ServerArgs:
             "KimiVLForConditionalGeneration",
             "KimiK25ForConditionalGeneration",
             "MiMoV2ForCausalLM",
-            "Gemma4ForConditionalGeneration",
-        ]:
+        ]
+        supported_names = (
+            "Qwen2VL, Qwen3VL, Qwen3.5, InternS2, Qwen2Audio, "
+            "Qwen2.5Omni, Kimi, MiMoV2"
+        )
+        if self.language_only:
+            supported_architectures.append("Gemma4ForConditionalGeneration")
+            supported_names += ", Gemma4"
+        if (self.encoder_only or self.language_only) and model_arch not in (
+            supported_architectures
+        ):
             raise ValueError(
                 f"Model type {model_arch} is not supported for encoder disaggregation. "
-                f"Supported architectures: Qwen2VL, Qwen3VL, Qwen3.5, InternS2, Qwen2Audio, Qwen2.5Omni, Kimi, MiMoV2, Gemma4."
+                f"Supported architectures: {supported_names}."
             )
 
     def _validate_ib_devices(self, device_str: Optional[str]) -> Optional[str]:
