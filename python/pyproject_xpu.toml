@@ -142,6 +142,7 @@ exclude = [
   "playground*",
   "scripts*",
   "tests*",
+  "build*",
 ]
 
 [tool.wheel]
