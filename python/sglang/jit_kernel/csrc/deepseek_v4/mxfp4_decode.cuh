@@ -69,6 +69,7 @@ struct Mxfp4DecodeParams {
   const void* __restrict__ q;
   const uint8_t* __restrict__ k_cache;
   const int32_t* __restrict__ indices;
+  const float* __restrict__ attn_sink;  // [num_queries] or nullptr
   void* __restrict__ o;
   float sm_scale;
   uint32_t page_stride_bytes;
@@ -161,6 +162,19 @@ __global__ void mxfp4_decode_kernel(const __grid_constant__ Mxfp4DecodeParams pa
       o_val[i] = o_val[i] * rc + k_val[i] * e_val;
   }
 
+  // ---- attn_sink (virtual token with V=0) ---------------------------------
+  if (params.attn_sink != nullptr) {
+    const float sink = params.attn_sink[gid];
+    const float m_new = max(m, sink);
+    const float e_sink = expf(sink - m_new);
+    const float rc = expf(m - m_new);
+    s_val = s_val * rc + e_sink;
+    m = m_new;
+#pragma unroll
+    for (int i = 0; i < kValsPerLane; ++i)
+      o_val[i] *= rc;
+  }
+
   // ---- finalize & store -----------------------------------------------------
   const float inv_s = (s_val > 0.0f) ? (1.0f / s_val) : 0.0f;
   auto* o_bf16 = static_cast<bf16_t*>(params.o) + gid * kHeadDim;
@@ -183,6 +197,7 @@ struct Mxfp4DecodeKernel {
       const tvm::ffi::TensorView q,
       const tvm::ffi::TensorView k_cache,
       const tvm::ffi::TensorView indices,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> attn_sink,
       const tvm::ffi::TensorView o,
       float sm_scale,
       int64_t page_size) {
@@ -194,6 +209,11 @@ struct Mxfp4DecodeKernel {
     TensorMatcher({B, kHeadDim}).with_dtype<bf16_t>().with_device(D).verify(q);
     TensorMatcher({-1, kBytesPerToken}).with_dtype<uint8_t>().with_device(D).verify(k_cache);
     TensorMatcher({B}).with_dtype<int32_t>().with_device(D).verify(indices);
+    const float* sink_ptr = nullptr;
+    if (attn_sink.has_value()) {
+      TensorMatcher({B}).with_dtype<float>().with_device(D).verify(attn_sink.value());
+      sink_ptr = static_cast<const float*>(attn_sink.value().data_ptr());
+    }
     TensorMatcher({B, kHeadDim}).with_dtype<bf16_t>().with_device(D).verify(o);
     RuntimeCheck(page_size > 0);
 
@@ -204,6 +224,7 @@ struct Mxfp4DecodeKernel {
         .q = q.data_ptr(),
         .k_cache = static_cast<const uint8_t*>(k_cache.data_ptr()),
         .indices = static_cast<const int32_t*>(indices.data_ptr()),
+        .attn_sink = sink_ptr,
         .o = o.data_ptr(),
         .sm_scale = sm_scale,
         .page_stride_bytes = static_cast<uint32_t>(static_cast<uint32_t>(page_size) * kBytesPerToken),

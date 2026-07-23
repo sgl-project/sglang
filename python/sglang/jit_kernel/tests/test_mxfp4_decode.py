@@ -135,6 +135,7 @@ def reference_decode_attention(
     page_indices: torch.Tensor,
     sm_scale: float,
     page_size: int,
+    attn_sink: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Exact FP32 reference: dequant → QK^T → softmax → ×V."""
     q = q.float()
@@ -142,7 +143,7 @@ def reference_decode_attention(
     out = torch.zeros_like(q)
 
     for i in range(N):
-        page = k_pages[int(page_indices[i])]  # k_pages [num_pages, page_size, 512]
+        page = k_pages[int(page_indices[i])]
         qi = q[i]
 
         m = torch.tensor(float("-inf"), device=q.device)
@@ -160,6 +161,15 @@ def reference_decode_attention(
             m = m_new
 
             o = o * rc + ki.to(torch.float32) * e
+
+        # attn_sink: virtual token with V=0
+        if attn_sink is not None:
+            sink_val = float(attn_sink[i])
+            m_new = torch.max(m, torch.tensor(sink_val, device=q.device))
+            e_sink = (torch.tensor(sink_val, device=q.device) - m_new).exp()
+            rc = (m - m_new).exp()
+            s = s * rc + e_sink
+            o = o * rc
 
         out[i] = (o / s).to(torch.bfloat16)
 

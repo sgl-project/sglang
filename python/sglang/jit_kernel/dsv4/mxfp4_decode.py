@@ -1,19 +1,8 @@
-"""Fused MXFP4 decode attention for DeepSeek V4 — Python entry point.
-
-Reads packed MXFP4 K-cache rows directly in a JIT CUDA kernel, dequantizing
-E2M1 noPE + E8M0 block-32 scales on the fly and computing QK^T + softmax +
-V-weighted sum in a single pass (no intermediate dequant workspace).
-
-Usage::
-
-    o = mxfp4_decode_attention(
-        q, k_cache, page_indices, sm_scale, page_size,
-    )
-"""
+"""Fused MXFP4 decode attention for DeepSeek V4 — Python entry point."""
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -49,20 +38,20 @@ def mxfp4_decode_attention(
     page_indices: torch.Tensor,
     sm_scale: float,
     page_size: int = 128,
+    attn_sink: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Fused MXFP4 decode attention.
 
     Args:
-        q:            [num_queries, 512] BF16 — flattened Q (batch * num_heads,
-                       where each head may correspond to a different page
-                       through ``page_indices``).
-        k_cache:      [num_rows, 368] uint8 — row-major MXFP4 K-cache.
-        page_indices: [num_queries] int32 — which page row each query reads.
+        q:            [N, 512] BF16 — flattened Q (batch * num_heads).
+        k_cache:      [*, 368] uint8 — row-major MXFP4 K-cache.
+        page_indices: [N] int32 — page numbers per query.
         sm_scale:     float — 1/sqrt(head_dim).
-        page_size:    int   — tokens per page (128 for DSV4 SWA).
+        page_size:    int — tokens per page (128 for DSV4 SWA).
+        attn_sink:    [N] float32 or None — per-head sink values.
 
     Returns:
-        o: [num_queries, 512] BF16 attention output.
+        o: [N, 512] BF16 attention output.
     """
     if q.ndim != 2 or q.shape[1] != 512:
         raise ValueError(f"q must be [N, 512] BF16, got {q.shape}")
@@ -76,6 +65,8 @@ def mxfp4_decode_attention(
     q = q.contiguous()
     k_cache = k_cache.contiguous()
     page_indices = page_indices.contiguous().to(torch.int32)
+    if attn_sink is not None:
+        attn_sink = attn_sink.contiguous().to(torch.float32)
 
     o = torch.empty_like(q)
 
@@ -84,6 +75,7 @@ def mxfp4_decode_attention(
         q,
         k_cache,
         page_indices,
+        attn_sink,
         o,
         sm_scale,
         page_size,
