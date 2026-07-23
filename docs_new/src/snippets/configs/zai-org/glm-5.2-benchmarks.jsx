@@ -99,9 +99,9 @@ export const benchmarks = [
     sglang_version: "0.5.15.post1",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1024 },
-        ttft_ms: 259814, tpot_ms: 79.93, tokens_per_sec_per_gpu: 6119 },
+        ttft_ms: 197898, tpot_ms: 95.42, tokens_per_sec_per_gpu: 6892 },
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 4096 },
-        ttft_ms: 1367301, tpot_ms: 81.46, tokens_per_sec_per_gpu: 6054 },
+        ttft_ms: 1214156, tpot_ms: 100.03, tokens_per_sec_per_gpu: 6708 },
     ],
   },
   // ---- B300 + FP8 ----  (8-GPU single node, TP8; serve recipe in glm-5.2.jsx; benchmark pending re-measurement)
@@ -289,9 +289,9 @@ export const benchmarks = [
     sglang_version: "0.5.15.post1",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1024 },
-        ttft_ms: 111104, tpot_ms: 182.37, tokens_per_sec_per_gpu: 7904 },
+        ttft_ms: 92241, tpot_ms: 171.61, tokens_per_sec_per_gpu: 8782 },
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 4096 },
-        ttft_ms: 871704, tpot_ms: 229.03, tokens_per_sec_per_gpu: 7686 },
+        ttft_ms: 692010, tpot_ms: 204.35, tokens_per_sec_per_gpu: 9455 },
     ],
   },
     {

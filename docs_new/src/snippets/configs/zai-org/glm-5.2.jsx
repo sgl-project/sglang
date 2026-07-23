@@ -411,7 +411,8 @@ sgl-eval run aime25 \\
       ],
     },
     {
-      // Throughput saturates at conc 256 — higher conc regresses vs balanced (queueing).
+      // Scales past balanced (verified): mfs 0.90 grows the KV batch, cuda-graph-max-bs 512
+      // sizes the decode capture for it.
       match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
       verified: true,
       env: [
@@ -423,7 +424,8 @@ sgl-eval run aime25 \\
         "--dp 4",
         "--enable-dp-attention",
         "--moe-a2a-backend deepep",
-        "--mem-fraction-static 0.85",
+        "--mem-fraction-static 0.90",
+        "--cuda-graph-max-bs 512",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -873,7 +875,8 @@ sgl-eval run aime25 \\
       ],
     },
     {
-      // Throughput saturates at conc 256 — higher conc regresses vs balanced (queueing).
+      // Scales past balanced (verified): a larger chunked-prefill (16384) lifts throughput
+      // at high concurrency.
       match: { hw: "gb300", variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "single" },
       verified: true,
       env: [],
@@ -883,7 +886,7 @@ sgl-eval run aime25 \\
         "--quantization modelopt_fp4",
         "--dp 4",
         "--enable-dp-attention",
-        "--chunked-prefill-size 8192",
+        "--chunked-prefill-size 16384",
         "--mem-fraction-static 0.92",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
