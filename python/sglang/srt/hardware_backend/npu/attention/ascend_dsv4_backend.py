@@ -12,7 +12,7 @@ from sglang.srt.layers.attention.dsv4.compressor import CompressorBackendMixin
 from sglang.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
 from sglang.srt.model_executor.forward_batch_info import DSV4OutCacheLoc, ForwardMode
 from sglang.srt.model_executor.forward_context import get_attn_backend
-from sglang.srt.runtime_context import get_parallel, get_spec
+from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -1362,8 +1362,9 @@ class DeepseekV4AscendAttnBackend(
             or forward_batch.forward_mode.is_draft_extend_v2()
         ):
             B = forward_batch.batch_size
+            from sglang.srt.runtime_context import get_server_args
 
-            n_draft = get_spec().speculative_num_draft_tokens or 1
+            n_draft = get_server_args().speculative_num_draft_tokens or 1
             actual_q = torch.arange(
                 n_draft, B * n_draft + 1, n_draft, dtype=torch.int32, device=device
             )
@@ -1408,8 +1409,9 @@ class DeepseekV4AscendAttnBackend(
             forward_batch.forward_mode.is_target_verify()
             or forward_batch.forward_mode.is_draft_extend_v2()
         ):
+            from sglang.srt.runtime_context import get_server_args
 
-            max_seqlen_q = get_spec().speculative_num_draft_tokens or 1
+            max_seqlen_q = get_server_args().speculative_num_draft_tokens or 1
         else:
             max_seqlen_q = 1
         return self._kernel_metadata_from_parts(

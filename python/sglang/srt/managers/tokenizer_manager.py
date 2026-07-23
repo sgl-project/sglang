@@ -110,15 +110,6 @@ from sglang.srt.observability.request_metrics_exporter import (
     RequestMetricsExporterManager,
 )
 from sglang.srt.observability.trace import SpanAttributes, extract_trace_headers
-from sglang.srt.runtime_context import (
-    get_device,
-    get_disagg,
-    get_lora,
-    get_model,
-    get_observability,
-    get_parallel,
-    get_serving,
-)
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import (
     PortArgs,
@@ -472,10 +463,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # TODO: Refactor and organize the log export code.
         # Request logging
         self.request_logger = RequestLogger(
-            log_requests=get_observability().log_requests,
-            log_requests_level=get_observability().log_requests_level,
-            log_requests_format=get_observability().log_requests_format,
-            log_requests_target=get_observability().log_requests_target,
+            log_requests=self.server_args.log_requests,
+            log_requests_level=self.server_args.log_requests_level,
+            log_requests_format=self.server_args.log_requests_format,
+            log_requests_target=self.server_args.log_requests_target,
         )
 
         # Dumping
@@ -498,7 +489,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def init_weight_update(self):
         # Initial weights status
         self.initial_weights_loaded = True
-        if get_model().checkpoint_engine_wait_weights_before_ready:
+        if self.server_args.checkpoint_engine_wait_weights_before_ready:
             self.initial_weights_loaded = False
 
         # Weight updates
@@ -518,7 +509,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # The registry dynamically updates as adapters are loaded / unloaded during runtime. It
         # serves as the source of truth for available adapters and maps user-friendly LoRA names
         # to internally used unique LoRA IDs.
-        self.lora_registry = LoRARegistry(get_lora().lora_paths)
+        self.lora_registry = LoRARegistry(self.server_args.lora_paths)
         # Lock to serialize LoRA update operations.
         # Please note that, unlike `model_update_lock`, this does not block inference, allowing
         # LoRA updates and inference to overlap.
@@ -527,13 +518,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # point to their latest LoRARef objects, so that they can be
         # dynamically loaded if needed for inference
         self.lora_ref_cache: Dict[str, LoRARef] = {}
-        if get_lora().lora_paths is not None:
-            for lora_ref in get_lora().lora_paths:
+        if self.server_args.lora_paths is not None:
+            for lora_ref in self.server_args.lora_paths:
                 self.lora_ref_cache[lora_ref.lora_name] = lora_ref
 
     def init_disaggregation(self):
         # PD Disaggregation
-        self.disaggregation_mode = DisaggregationMode(get_disagg().disaggregation_mode)
+        self.disaggregation_mode = DisaggregationMode(
+            self.server_args.disaggregation_mode
+        )
         # Keep a reference so the bootstrap server is not garbage-collected.
         self.bootstrap_server = start_disagg_service(self.server_args)
         # Single-source counter for auto-assigning fake bootstrap_room.
@@ -542,16 +535,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Encoder Disaggregation
         self.encoder_bootstrap_server = None
         if self.server_args.language_only:
-            from sglang.srt.disaggregation.encode_receiver import EncoderBootstrapServer
+            from sglang.srt.disaggregation.encode_receiver import (
+                EncoderBootstrapServer,
+            )
 
             # Shared mutable URL list: the bootstrap server appends / removes
             # entries as encoders register, the receiver reads from the same
             # list.  Pre-populated with static --encoder-urls so the legacy
             # CLI flag still works (alongside dynamic registrations).
-            self.encoder_urls: List[str] = list(get_disagg().encoder_urls)
+            self.encoder_urls: List[str] = list(self.server_args.encoder_urls)
             self.encoder_bootstrap_server = EncoderBootstrapServer(
-                host=get_serving().host,
-                port=get_disagg().encoder_bootstrap_port,
+                host=self.server_args.host,
+                port=self.server_args.encoder_bootstrap_port,
                 urls=self.encoder_urls,
             )
             self.mm_receiver = create_mm_receiver(
@@ -565,22 +560,20 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Metrics
         if self.enable_metrics:
             engine_type = DisaggregationMode.to_engine_type(
-                get_disagg().disaggregation_mode
+                self.server_args.disaggregation_mode
             )
 
             labels = {
-                "model_name": get_serving().served_model_name,
+                "model_name": self.server_args.served_model_name,
                 "engine_type": engine_type,
             }
             if self.enable_priority_scheduling:
                 labels["priority"] = ""
-            if get_observability().tokenizer_metrics_allowed_custom_labels:
-                for (
-                    label
-                ) in get_observability().tokenizer_metrics_allowed_custom_labels:
+            if self.server_args.tokenizer_metrics_allowed_custom_labels:
+                for label in self.server_args.tokenizer_metrics_allowed_custom_labels:
                     labels[label] = ""
-            if get_observability().extra_metric_labels:
-                labels.update(get_observability().extra_metric_labels)
+            if self.server_args.extra_metric_labels:
+                labels.update(self.server_args.extra_metric_labels)
             tokenizer_collector_cls = resolve_collector_class(
                 self.server_args,
                 STAT_LOGGER_ROLE_TOKENIZER,
@@ -589,18 +582,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             self.metrics_collector = tokenizer_collector_cls(
                 server_args=self.server_args,
                 labels=labels,
-                bucket_time_to_first_token=get_observability().bucket_time_to_first_token,
-                bucket_e2e_request_latency=get_observability().bucket_e2e_request_latency,
-                bucket_inter_token_latency=get_observability().bucket_inter_token_latency,
+                bucket_time_to_first_token=self.server_args.bucket_time_to_first_token,
+                bucket_e2e_request_latency=self.server_args.bucket_e2e_request_latency,
+                bucket_inter_token_latency=self.server_args.bucket_inter_token_latency,
             )
 
             start_cpu_monitor_thread("tokenizer")
 
-        if get_observability().gc_warning_threshold_secs > 0.0:
-            configure_gc_warning(get_observability().gc_warning_threshold_secs)
+        if self.server_args.gc_warning_threshold_secs > 0.0:
+            configure_gc_warning(self.server_args.gc_warning_threshold_secs)
         self.soft_watchdog = Watchdog.create(
             debug_name="TokenizerManager",
-            watchdog_timeout=get_device().soft_watchdog_timeout,
+            watchdog_timeout=self.server_args.soft_watchdog_timeout,
             soft=True,
             test_stuck_time=envs.SGLANG_TEST_STUCK_TOKENIZER.get(),
         )
@@ -1366,7 +1359,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         return batch_size > 0 and (
             self.server_args.enable_tokenizer_batch_encode
             or (
-                (not get_parallel().enable_dp_attention)
+                (not self.server_args.enable_dp_attention)
                 and (not self._batch_has_text(batch_size, requests))
             )
         )
@@ -1764,7 +1757,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # default the load format to the server_args
         if obj.load_format is None:
-            obj.load_format = get_model().load_format
+            obj.load_format = self.server_args.load_format
         logger.info("Start update_weights. Load format=%s", obj.load_format)
 
         if obj.abort_all_requests:
@@ -1790,9 +1783,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
     def _update_model_path_info(self, model_path: str, load_format: str):
         self.served_model_name = model_path
-        from sglang.srt.runtime_context import get_context
-
-        get_context().override(
+        self.server_args.override(
             "tokenizer.update_weights", model_path=model_path, load_format=load_format
         )
         self.model_path = model_path
@@ -1936,7 +1927,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 "id": rid,
                 "finish_reason": recv_obj.finished_reasons[i],
                 "prompt_tokens": recv_obj.prompt_tokens[i],
-                "weight_version": get_serving().weight_version,
+                "weight_version": self.server_args.weight_version,
                 "num_retractions": recv_obj.retraction_counts[i],
             }
 
@@ -2810,7 +2801,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         meta_info = {
             "id": recv_obj.rid,
             "finish_reason": finish_reason,
-            "weight_version": get_serving().weight_version,
+            "weight_version": self.server_args.weight_version,
             "e2e_latency": state.time_stats.get_e2e_latency(),
         }
         is_stream = getattr(state.obj, "stream", False)

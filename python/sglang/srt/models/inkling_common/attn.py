@@ -29,7 +29,7 @@ from sglang.srt.models.inkling_common.kernels.comm import (
 from sglang.srt.models.inkling_common.norm import RMSNorm
 from sglang.srt.models.inkling_common.sconv import SconvType, ShortConvolution
 from sglang.srt.models.utils import apply_qk_norm
-from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import add_prefix, get_current_device_stream_fast
 
 try:
@@ -296,7 +296,7 @@ class InklingAttention(nn.Module):
         )
         # --enable-scattered-sconv: the output reduction becomes a hidden-dim
         # reduce-scatter (the consumer attn_sconv runs on the [T, H/P] shard).
-        self.scattered_sconv = get_exec().comm.enable_scattered_sconv
+        self.scattered_sconv = get_server_args().enable_scattered_sconv
 
         if is_local:
             self.rel_extent = local_extent
@@ -364,7 +364,8 @@ class InklingAttention(nn.Module):
 
     def _fused_attn_prologue_verify(self, q, k, v, forward_batch, log_scaling_tau=None):
         """Fused target-verify {k/v sconv + save_windows + qk-norm (+ KV store)}
-        (jit_kernel/inkling_attn_prologue.py); returns ``(q, k, v, did_store)``.
+        (kernels/ops/model/inkling/inkling_attn_prologue.py); returns
+        ``(q, k, v, did_store)``.
 
         The fused kernel writes raw bf16 KV, so it only does the store when the
         KV pool is bf16: full layers at ``out_cache_loc`` in the full pool,
