@@ -2010,8 +2010,11 @@ class DeepseekV2AttentionMLA(
 
     def rebuild_cp_kv_cache(self, latent_cache, forward_batch, k_nope, k_pe):
         # support allgather+rerrange
-        latent_cache[..., : self.kv_lora_rank] = k_nope.squeeze(1)
-        latent_cache[..., self.kv_lora_rank :] = k_pe.squeeze(1)
+        # On the CP + EAGLE verify path k_pe can be a view aliasing the same
+        # latent_cache slice being written, which torch rejects as an in-place
+        # self-overlap; clone the RHS so the copy has independent storage.
+        latent_cache[..., : self.kv_lora_rank] = k_nope.squeeze(1).clone()
+        latent_cache[..., self.kv_lora_rank :] = k_pe.squeeze(1).clone()
         latent_cache_output = cp_all_gather_rerange_output(
             latent_cache.contiguous(),
             self.cp_size,

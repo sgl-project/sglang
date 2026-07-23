@@ -1966,6 +1966,23 @@ class Indexer(MultiPlatformOp):
                 weights = self.weights_proj(x_for_gate)[0].float() * self.n_heads**-0.5
                 weights = self._apply_q_scale_and_softmax_scale(weights, q_scale)
             else:
+                # opus_gemm_a16w16 (weights_proj) requires canonical packed
+                # strides. On the CP + EAGLE verify path x_for_gate can be a
+                # singleton-strided view (e.g. (1,1,6144) stride
+                # (49152,49152,1)) that still reports is_contiguous()==True,
+                # so .contiguous() is a no-op; force a canonical copy via
+                # clone() only when the strides are not packed.
+                if isinstance(x_for_gate, torch.Tensor):
+                    _exp, _canon = 1, True
+                    for _d in range(x_for_gate.dim() - 1, -1, -1):
+                        if x_for_gate.stride(_d) != _exp:
+                            _canon = False
+                            break
+                        _exp *= x_for_gate.shape[_d]
+                    if not _canon:
+                        x_for_gate = x_for_gate.clone(
+                            memory_format=torch.contiguous_format
+                        )
                 weights = self._get_logits_head_gate(x_for_gate, q_scale)
 
         if _is_cuda or _is_hip:
