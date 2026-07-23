@@ -15,6 +15,9 @@ from typing import (
 import torch
 
 from sglang.srt.configs.model_config import get_dsa_index_topk, is_deepseek_dsa
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    use_symmetric_memory,
+)
 from sglang.srt.runtime_context import get_parallel
 
 logger = logging.getLogger(__name__)
@@ -27,6 +30,7 @@ from sglang.kernels.ops.attention.dsa.transform_index import (
     transform_index_page_table_decode,
     transform_index_page_table_prefill,
 )
+from sglang.kernels.ops.attention.fixup_zero_kv import fixup_zero_kv_rows
 from sglang.kernels.ops.attention.utils import (
     concat_mla_absorb_q_general,
     mla_quantize_and_rope_for_fp8,
@@ -539,7 +543,7 @@ class DeepseekSparseAttnBackend(
             self._multi_ctas_kv_counter_buffer = (
                 make_persistent_multi_ctas_kv_counter_buffer(
                     torch.device(self.device),
-                    self.num_q_heads,
+                    self.num_q_heads * self.dcp_size,
                     max_batch_size=model_runner.max_running_requests,
                 )
             )
@@ -3014,7 +3018,7 @@ class DeepseekSparseAttnBackend(
             grow_multi_ctas_kv_counter_buffer_if_needed(
                 self._multi_ctas_kv_counter_buffer,
                 torch.device(self.device),
-                self.num_q_heads,
+                num_heads,
                 batch_size,
             )
         )
@@ -3033,6 +3037,16 @@ class DeepseekSparseAttnBackend(
             seq_chunks = list(torch.split(seq_lens, cp_meta.split_list, dim=0))
             seq_lens = torch.cat([seq_chunks[i] for i in cp_meta.zigzag_index], dim=0)
 
+        lse_buf = None
+        if self.dcp_enabled:
+            # Pre-register the LSE buffer in the symmetric-memory pool so the
+            # kernel writes it directly there — cp_lse_ag_out_rs_mla's
+            # all-gather then needs no separate cast/copy of its own.
+            with use_symmetric_memory(get_parallel().dcp_group):
+                lse_buf = torch.empty(
+                    (batch_size, num_heads), dtype=torch.float32, device=q.device
+                )
+
         out = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
             query=q,
             kv_cache=kv,
@@ -3050,19 +3064,28 @@ class DeepseekSparseAttnBackend(
             # Under DCP each rank attends its filtered top-k shard; the
             # base-2 LSE (ComputeLSEFromMD) feeds the cross-rank combine.
             return_lse=self.dcp_enabled,
+            lse=lse_buf,
             multi_ctas_kv_counter_buffer=self._multi_ctas_kv_counter_buffer,
         )
 
         if self.dcp_enabled:
             out, lse = out
             out = out.view(batch_size, num_heads, -1)
-            lse = lse.view(batch_size, num_heads).to(torch.float32)
+            # lse is lse_buf (flashinfer returns the caller-supplied buffer
+            # unchanged) — already fp32 and pool-registered, so this view is
+            # just a shape check, not a cast.
+            lse = lse.view(batch_size, num_heads)
             # Rows where this rank owns none of the selected tokens must
             # contribute exp2(-inf)=0 to the cross-rank combine (the kernel's
-            # output for count-0 rows is undefined).
-            zero_rows = (dcp_local_counts == 0).view(batch_size, 1)
-            lse = torch.where(zero_rows, torch.full_like(lse, float("-inf")), lse)
-            out = torch.where(zero_rows.unsqueeze(-1), torch.zeros_like(out), out)
+            # raw output for count-0 rows is NaN, not 0). One token per row
+            # here, so cum_seq_lens is just 0..batch_size.
+            fixup_zero_kv_rows(
+                out,
+                lse,
+                dcp_local_counts,
+                self.get_device_int32_arange(batch_size + 1),
+                max_seq_len=1,
+            )
             # q rows are tokens for both decode (bs) and the decode-ized
             # extend; the combine wants out [T, H, D] and lse [T, H] fp32.
             return (out, lse)

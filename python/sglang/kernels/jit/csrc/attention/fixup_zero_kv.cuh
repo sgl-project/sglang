@@ -53,7 +53,7 @@ __device__ __forceinline__ void vec_neginf_fill(float* ptr, int n) {
 
 // -- main kernel -----------------------------------------------------------
 
-template <typename OutT>
+template <typename OutT, bool kUsePDL>
 __global__ void fixup_zero_kv_rows_kernel(
     OutT* __restrict__ out,
     float* __restrict__ lse,
@@ -73,14 +73,18 @@ __global__ void fixup_zero_kv_rows_kernel(
   const int tok = tok_start + blockIdx.x;
   if (tok >= tok_end) return;
 
+  device::PDLWaitPrimary<kUsePDL>();
+
   // Each block handles one token: zero out[tok] and set lse[tok] = -inf.
   vec_zero_fill(out + tok * out_stride, out_stride);
   vec_neginf_fill(lse + tok * lse_stride, lse_stride);
+
+  device::PDLTriggerSecondary<kUsePDL>();
 }
 
 // -- host launcher ---------------------------------------------------------
 
-template <typename OutT>
+template <typename OutT, bool kUsePDL>
 void fixup_zero_kv_rows(
     tvm::ffi::TensorView out,
     tvm::ffi::TensorView lse,
@@ -111,14 +115,15 @@ void fixup_zero_kv_rows(
   dim3 grid(blocks_x, bs);
   dim3 block(kFixupBlockSize);
 
-  LaunchKernel(grid, block, device.unwrap())(
-      fixup_zero_kv_rows_kernel<OutT>,
-      static_cast<OutT*>(out.data_ptr()),
-      static_cast<float*>(lse.data_ptr()),
-      static_cast<const int32_t*>(kv_lens.data_ptr()),
-      static_cast<const int32_t*>(cum_seq_lens.data_ptr()),
-      nh * vd,
-      nh);
+  LaunchKernel(grid, block, device.unwrap())
+      .enable_pdl(kUsePDL)(
+          fixup_zero_kv_rows_kernel<OutT, kUsePDL>,
+          static_cast<OutT*>(out.data_ptr()),
+          static_cast<float*>(lse.data_ptr()),
+          static_cast<const int32_t*>(kv_lens.data_ptr()),
+          static_cast<const int32_t*>(cum_seq_lens.data_ptr()),
+          nh * vd,
+          nh);
 }
 
 }  // namespace

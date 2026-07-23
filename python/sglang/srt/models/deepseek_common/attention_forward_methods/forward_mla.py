@@ -23,6 +23,7 @@ from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.dcp import (
     all_gather_kv_cache_for_mla_extend,
     all_gather_q_for_mla_decode,
+    alloc_dcp_q_combine_buf,
     cp_lse_ag_out_rs_mla,
 )
 from sglang.srt.layers.quantization.fp8_utils import (
@@ -255,6 +256,10 @@ class DeepseekMLAForwardMixin:
         q_pe = None
         k_pe = None
         fusion_plan: Optional[MlaBmmFusionPlan] = None
+        # Set when the plain-bf16 bmm below writes q_nope_out directly into
+        # the DCP Q-gather's combine buffer (see use_fused_dcp_q_buf); passed
+        # to all_gather_q_for_mla_decode so it can skip its torch.cat.
+        combined_q_buf: Optional[torch.Tensor] = None
         # Set when the DSA indexer was forked onto the side stream under DCP;
         # the main stream syncs with it after the q all-gather is issued.
         dsa_dcp_indexer_sync_pending = False
@@ -425,6 +430,34 @@ class DeepseekMLAForwardMixin:
             # this transposed alias directly.
             q_nope_out = fusion_plan.q_nope_out_view
         else:
+            # bmm naturally produces q_nope_out as [H, B, D]; on the DCP
+            # decode/DSA-extend path (no LoRA correction in between) that's
+            # exactly the layout all_gather_q_for_mla_decode wants, so skip
+            # transposing to [B, H, D] here only to transpose back there —
+            # and, for the plain bf16 bmm, write straight into the DCP
+            # gather's combine buffer via out= so the gather doesn't need a
+            # separate torch.cat at all (see combined_q_buf below).
+            defer_q_nope_transpose = (
+                get_parallel().dcp_enabled
+                and not _SGLANG_EXPERIMENTAL_LORA_OPTI
+                and not is_kv_b_lora_active(self)
+                and (
+                    forward_batch.forward_mode.is_decode()
+                    or (
+                        self.use_dsa
+                        and forward_batch.forward_mode.is_extend(
+                            include_draft_extend_v2=True
+                        )
+                    )
+                )
+            )
+            use_fused_dcp_q_buf = (
+                defer_q_nope_transpose
+                and not self.use_deep_gemm_bmm
+                and not _is_hip
+                and self.w_kc.dtype != torch.float8_e4m3fn
+            )
+
             if _SGLANG_EXPERIMENTAL_LORA_OPTI:
                 # Fork the kv_b q-correction A-step onto the LoRA side stream to overlap the bmm.
                 from sglang.srt.lora.trtllm_lora_temp.deepseek_mla_correction import (
@@ -521,18 +554,28 @@ class DeepseekMLAForwardMixin:
                         self.w_scale,
                         torch.bfloat16,
                     )
+            elif use_fused_dcp_q_buf:
+                combined_q_buf = alloc_dcp_q_combine_buf(
+                    q_nope,
+                    self.num_local_heads,
+                    self.qk_rope_head_dim,
+                    self.kv_lora_rank,
+                )
+                q_nope_out = combined_q_buf[..., self.qk_rope_head_dim :]
+                torch.bmm(q_nope.transpose(0, 1), self.w_kc, out=q_nope_out)
             else:
                 q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc)
 
-            q_nope_out = q_nope_out.transpose(0, 1)
-            if _SGLANG_EXPERIMENTAL_LORA_OPTI:
-                from sglang.srt.lora.trtllm_lora_temp.deepseek_mla_correction import (
-                    kv_b_lora_q_apply,
-                )
+            if not defer_q_nope_transpose:
+                q_nope_out = q_nope_out.transpose(0, 1)
+                if _SGLANG_EXPERIMENTAL_LORA_OPTI:
+                    from sglang.srt.lora.trtllm_lora_temp.deepseek_mla_correction import (
+                        kv_b_lora_q_apply,
+                    )
 
-                q_nope_out = kv_b_lora_q_apply(self, q_nope, q_nope_out, _kvb_q)
-            elif is_kv_b_lora_active(self):
-                q_nope_out = apply_kv_b_lora_q_correction(self, q_nope, q_nope_out)
+                    q_nope_out = kv_b_lora_q_apply(self, q_nope, q_nope_out, _kvb_q)
+                elif is_kv_b_lora_active(self):
+                    q_nope_out = apply_kv_b_lora_q_correction(self, q_nope, q_nope_out)
 
         fuse_rope_for_trtllm_mla = self._fuse_rope_for_trtllm_mla(forward_batch)
         skip_rope_for_dsa_tilelang_fused = self._skip_rope_for_dsa_tilelang_fused()
@@ -575,6 +618,7 @@ class DeepseekMLAForwardMixin:
                 q_nope_out, q_pe = all_gather_q_for_mla_decode(
                     q_nope_out=q_nope_out,
                     q_pe=q_pe,
+                    combined_buf=combined_q_buf,
                 )
                 if dsa_dcp_indexer_sync_pending:
                     # The DSA indexer ran on the side stream, overlapped with
@@ -590,6 +634,7 @@ class DeepseekMLAForwardMixin:
                     q_nope_out, q_pe = all_gather_q_for_mla_decode(
                         q_nope_out=q_nope_out,
                         q_pe=q_pe,
+                        combined_buf=combined_q_buf,
                     )
                 elif forward_batch.forward_mode.is_extend():
                     # Dense MLA gathers KV instead; its draft-extend path is

@@ -218,17 +218,43 @@ def all_gather_kv_cache_for_mha_extend(
     return kv_a.contiguous(), k_pe.contiguous()
 
 
+def alloc_dcp_q_combine_buf(
+    q_nope: torch.Tensor,
+    num_heads: int,
+    d_pe: int,
+    d_nope: int,
+) -> torch.Tensor:
+    """Pre-allocate the ``[H, B, d_pe + d_nope]`` buffer an upcoming
+    ``all_gather_q_for_mla_decode`` will gather, from the symmetric-memory
+    pool. Callers write the q_nope bmm's output directly into the returned
+    buffer's ``[..., d_pe:]`` slice via ``out=``, so only q_pe still needs
+    copying in later — no separate concat of the two.
+    """
+    group = get_parallel().dcp_group
+    with use_symmetric_memory(group):
+        return q_nope.new_empty((num_heads, q_nope.shape[0], d_pe + d_nope))
+
+
 def all_gather_q_for_mla_decode(
     q_nope_out: torch.Tensor,
     q_pe: torch.Tensor,
+    combined_buf: Optional[torch.Tensor] = None,
 ):
+    # q_nope_out arrives as [H, B, L] (its bmm's native layout; callers skip
+    # transposing it to [B, H, L] and back just to undo that here). q_pe is
+    # [B, H, L] and needs the transpose.
     group = get_parallel().dcp_group
-    with use_symmetric_memory(group):
-        # transpose q_pe and q_nope_out from [B, H, L] to [H, B, L]
-        combined = torch.cat([q_pe.transpose(0, 1), q_nope_out.transpose(0, 1)], dim=-1)
-    gathered = group.all_gather(combined, dim=0)
     d_pe = q_pe.size(-1)
     d_nope = q_nope_out.size(-1)
+    if combined_buf is not None:
+        # q_nope_out is already this buffer's [..., d_pe:] slice (written by
+        # the caller's bmm out=); only q_pe needs to land in the pool.
+        combined_buf[..., :d_pe].copy_(q_pe.transpose(0, 1))
+        combined = combined_buf
+    else:
+        with use_symmetric_memory(group):
+            combined = torch.cat([q_pe.transpose(0, 1), q_nope_out], dim=-1)
+    gathered = group.all_gather(combined, dim=0)
     q_pe, q_nope_out = gathered.split([d_pe, d_nope], dim=-1)
     q_pe = q_pe.transpose(0, 1)
     q_nope_out = q_nope_out.transpose(0, 1)

@@ -3905,7 +3905,9 @@ class Scheduler(
             "kvcache": round(
                 self.token_to_kv_pool_allocator.get_kvcache().mem_usage, 2
             ),
-            "token_capacity": int(self.max_total_num_tokens),
+            "token_capacity": int(
+                self.max_total_num_tokens * self.server_args.dcp_size
+            ),
             "graph": round(self.tp_worker.model_runner.graph_mem_usage, 2),
         }
         ret["effective_max_running_requests_per_dp"] = self.max_running_requests
