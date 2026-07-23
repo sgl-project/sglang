@@ -375,6 +375,9 @@ class Envs:
     # 0 preserves the existing behavior. This is useful for long cached-prefix
     # hits, which otherwise become one very large synchronous transfer.
     SGLANG_DISAGGREGATION_KV_TRANSFER_CHUNK_SIZE = EnvInt(0)
+    # Emit five-second aggregate diagnostics for Mooncake prefill transfer
+    # queues, high-level send stages, and synchronous engine calls.
+    SGLANG_DISAGGREGATION_TRANSFER_DEBUG = EnvBool(False)
     # Experimental Mooncake-only decode session pool. Each additional session
     # owns a separate TransferEngine/RPC endpoint while registering the same
     # decode KV buffers. A value of 1 preserves the existing singleton path.

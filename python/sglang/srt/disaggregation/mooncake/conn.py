@@ -36,6 +36,9 @@ from sglang.srt.disaggregation.common.utils import (
     pack_int_lists,
     unpack_int_lists,
 )
+from sglang.srt.disaggregation.mooncake.transfer_debug import (
+    MooncakeTransferDebugStats,
+)
 from sglang.srt.disaggregation.mooncake.utils import (
     check_mooncake_custom_mem_pool_enabled,
 )
@@ -282,6 +285,7 @@ class MooncakeKVManager(CommonKVManager):
         self.register_buffer_to_engine()
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         self.enable_trace = server_args.enable_trace
+        self.transfer_debug_stats: Optional[MooncakeTransferDebugStats] = None
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.start_prefill_thread()
             self.session_failures = defaultdict(int)
@@ -298,6 +302,14 @@ class MooncakeKVManager(CommonKVManager):
             self.transfer_queues: List[FastQueue] = [
                 FastQueue() for _ in range(transfer_queue_size)
             ]
+            if envs.SGLANG_DISAGGREGATION_TRANSFER_DEBUG.get():
+                self.transfer_debug_stats = MooncakeTransferDebugStats(
+                    rank_label=(
+                        f"tp{self.attn_tp_rank}/pp{self.pp_rank}/cp{self.attn_cp_rank}"
+                    ),
+                    queue_count=transfer_queue_size,
+                )
+                self.transfer_debug_stats.start()
             self._session_group_queue_shards: dict[Tuple[str, ...], int] = {}
             self._session_group_queue_lock = threading.Lock()
             assert transfer_thread_pool_size >= transfer_queue_size, (
@@ -603,6 +615,12 @@ class MooncakeKVManager(CommonKVManager):
                     f"chunk exceeds ring buffer total size (room={kv_chunk.room}). "
                     f"Increase SGLANG_DISAGG_STAGING_POOL_SIZE_MB."
                 )
+            if (
+                self.transfer_debug_stats is not None
+                and kv_chunk.queue_index is not None
+            ):
+                kv_chunk.enqueue_time = time.perf_counter()
+                self.transfer_debug_stats.record_enqueue(kv_chunk.queue_index)
             queue.put(kv_chunk)
             return (-1, True)
 
@@ -757,13 +775,47 @@ class MooncakeKVManager(CommonKVManager):
             )
         return ret
 
+    def _batch_transfer_sync(
+        self,
+        mooncake_session_id: str,
+        src_addrs: list[int],
+        dst_addrs: list[int],
+        lengths: list[int],
+    ) -> int:
+        stats = self.transfer_debug_stats
+        start_time = 0.0
+        error = False
+        if stats is not None:
+            start_time = time.perf_counter()
+            stats.record_engine_start()
+        try:
+            ret = self.engine.batch_transfer_sync(
+                mooncake_session_id, src_addrs, dst_addrs, lengths
+            )
+            error = ret != 0
+            return ret
+        except Exception:
+            error = True
+            raise
+        finally:
+            if stats is not None:
+                stats.record_engine_done(
+                    time.perf_counter() - start_time,
+                    sum(lengths),
+                    len(lengths),
+                    error=error,
+                )
+
     def _transfer_data(self, mooncake_session_id, transfer_blocks):
         if not transfer_blocks:
             return 0
 
         src_addrs, dst_addrs, lengths = zip(*transfer_blocks)
-        return self.engine.batch_transfer_sync(
-            mooncake_session_id, list(src_addrs), list(dst_addrs), list(lengths)
+        return self._batch_transfer_sync(
+            mooncake_session_id,
+            list(src_addrs),
+            list(dst_addrs),
+            list(lengths),
         )
 
     def _send_kvcache_generic(
@@ -1841,7 +1893,7 @@ class MooncakeKVManager(CommonKVManager):
             dst_addr_list = dst_slice_addrs.reshape(-1).tolist()
             total_slices = len(src_addr_list)
             length_list = [heads_bytes_per_token_to_send] * total_slices
-            return self.engine.batch_transfer_sync(
+            return self._batch_transfer_sync(
                 mooncake_session_id, src_addr_list, dst_addr_list, length_list
             )
 
@@ -2309,16 +2361,25 @@ class MooncakeKVManager(CommonKVManager):
     def sync_status_to_decode_endpoint(
         self, remote: str, dst_port: int, room: int, status: int, prefill_rank: int
     ):
-        na = NetworkAddress(remote, dst_port)
-        self._send_multipart(
-            na.to_tcp(),
-            [
-                str(room).encode("ascii"),
-                str(status).encode("ascii"),
-                str(prefill_rank).encode("ascii"),
-            ],
-            is_ipv6=na.is_ipv6,
+        start_time = (
+            time.perf_counter() if self.transfer_debug_stats is not None else 0.0
         )
+        na = NetworkAddress(remote, dst_port)
+        try:
+            self._send_multipart(
+                na.to_tcp(),
+                [
+                    str(room).encode("ascii"),
+                    str(status).encode("ascii"),
+                    str(prefill_rank).encode("ascii"),
+                ],
+                is_ipv6=na.is_ipv6,
+            )
+        finally:
+            if self.transfer_debug_stats is not None:
+                self.transfer_debug_stats.record_status_sync(
+                    time.perf_counter() - start_time
+                )
 
     def transfer_worker(
         self,
@@ -2336,8 +2397,19 @@ class MooncakeKVManager(CommonKVManager):
             )
 
         while True:
+            chunk_debug_active = False
+            chunk_debug_start = 0.0
             try:
                 kv_chunk: TransferKVChunk = queue.get()
+                if self.transfer_debug_stats is not None:
+                    chunk_debug_start = time.perf_counter()
+                    queue_wait = (
+                        chunk_debug_start - kv_chunk.enqueue_time
+                        if kv_chunk.enqueue_time > 0
+                        else 0.0
+                    )
+                    self.transfer_debug_stats.record_dequeue(worker_index, queue_wait)
+                    chunk_debug_active = True
                 if self.enable_trace:
                     kv_chunk.trace_ctx.rebuild_thread_context()
                     kv_chunk.trace_ctx.trace_slice_start(
@@ -2358,6 +2430,13 @@ class MooncakeKVManager(CommonKVManager):
                             MooncakeRequestStage.MOONCAKE_WORKER_SEND.level,
                             thread_finish_flag=True,
                         )
+                    if self.transfer_debug_stats is not None:
+                        self.transfer_debug_stats.record_chunk_done(
+                            worker_index,
+                            time.perf_counter() - chunk_debug_start,
+                            skipped=True,
+                        )
+                        chunk_debug_active = False
                     continue
 
                 if (
@@ -2422,7 +2501,13 @@ class MooncakeKVManager(CommonKVManager):
                         skip_kv, skip_state = self._get_dsa_cache_transfer_skip_flags(
                             target_rank_registration_info
                         )
-                        if len(kv_chunk.prefill_kv_indices) == 0 or skip_kv:
+                        kv_skipped = len(kv_chunk.prefill_kv_indices) == 0 or skip_kv
+                        kv_send_start = (
+                            time.perf_counter()
+                            if self.transfer_debug_stats is not None
+                            else 0.0
+                        )
+                        if kv_skipped:
                             ret = 0
                         elif (
                             self.is_mla_backend
@@ -2468,6 +2553,12 @@ class MooncakeKVManager(CommonKVManager):
                                 target_rank_registration_info.dst_kv_item_len,
                                 executor,
                             )
+                        if self.transfer_debug_stats is not None:
+                            self.transfer_debug_stats.record_kv_send(
+                                time.perf_counter() - kv_send_start,
+                                len(kv_chunk.prefill_kv_indices),
+                                skipped=kv_skipped,
+                            )
                         if ret != 0:
                             with self.session_lock:
                                 self.session_failures[req.mooncake_session_id] += 1
@@ -2494,19 +2585,37 @@ class MooncakeKVManager(CommonKVManager):
 
                         if kv_chunk.is_last_chunk:
                             if kv_chunk.state_indices and not skip_state:
+                                state_send_start = (
+                                    time.perf_counter()
+                                    if self.transfer_debug_stats is not None
+                                    else 0.0
+                                )
                                 self.maybe_send_extra(
                                     req,
                                     kv_chunk.state_indices,
                                     executor,
                                     target_rank_registration_info,
                                 )
+                                if self.transfer_debug_stats is not None:
+                                    self.transfer_debug_stats.record_state_send(
+                                        time.perf_counter() - state_send_start
+                                    )
 
                             # Only the last chunk we need to send the aux data
+                            aux_send_start = (
+                                time.perf_counter()
+                                if self.transfer_debug_stats is not None
+                                else 0.0
+                            )
                             ret = self.send_aux(
                                 req,
                                 kv_chunk.prefill_aux_index,
                                 target_rank_registration_info.dst_aux_ptrs,
                             )
+                            if self.transfer_debug_stats is not None:
+                                self.transfer_debug_stats.record_aux_send(
+                                    time.perf_counter() - aux_send_start
+                                )
                             polls.append(True if ret == 0 else False)
                             dst_ranks_infos.append(
                                 (req.endpoint, req.dst_port, req.room)
@@ -2545,6 +2654,12 @@ class MooncakeKVManager(CommonKVManager):
                     )
 
                 if staging_deferred:
+                    if self.transfer_debug_stats is not None:
+                        self.transfer_debug_stats.record_chunk_done(
+                            worker_index,
+                            time.perf_counter() - chunk_debug_start,
+                        )
+                        chunk_debug_active = False
                     continue
 
                 if (
@@ -2555,7 +2670,19 @@ class MooncakeKVManager(CommonKVManager):
                         self.transfer_infos.pop(kv_chunk.room)
                     self.req_to_decode_prefix_len.pop(kv_chunk.room, None)
 
+                if self.transfer_debug_stats is not None:
+                    self.transfer_debug_stats.record_chunk_done(
+                        worker_index,
+                        time.perf_counter() - chunk_debug_start,
+                    )
+                    chunk_debug_active = False
             except Exception as e:
+                if self.transfer_debug_stats is not None and chunk_debug_active:
+                    self.transfer_debug_stats.record_chunk_done(
+                        worker_index,
+                        time.perf_counter() - chunk_debug_start,
+                        error=True,
+                    )
                 # NOTE(shangming): Remove this when we make sure the transfer thread is bug-free
                 raise RuntimeError(
                     f"Transfer thread failed because of {e}. Prefill instance with bootstrap_port={self.bootstrap_port} is dead."
@@ -2785,18 +2912,21 @@ class MooncakeKVManager(CommonKVManager):
         if trace_ctx is None:
             trace_ctx = TraceNullContext()
 
-        self.transfer_queues[shard_idx].put(
-            TransferKVChunk(
-                room=bootstrap_room,
-                prefill_kv_indices=kv_indices,
-                index_slice=index_slice,
-                is_last_chunk=is_last_chunk,
-                prefill_aux_index=aux_index,
-                state_indices=state_indices,
-                token_position_offset=token_position_offset,
-                trace_ctx=trace_ctx,
-            )
+        kv_chunk = TransferKVChunk(
+            room=bootstrap_room,
+            prefill_kv_indices=kv_indices,
+            index_slice=index_slice,
+            is_last_chunk=is_last_chunk,
+            prefill_aux_index=aux_index,
+            state_indices=state_indices,
+            token_position_offset=token_position_offset,
+            trace_ctx=trace_ctx,
         )
+        if self.transfer_debug_stats is not None:
+            kv_chunk.enqueue_time = time.perf_counter()
+            kv_chunk.queue_index = shard_idx
+            self.transfer_debug_stats.record_enqueue(shard_idx)
+        self.transfer_queues[shard_idx].put(kv_chunk)
 
     def get_session_id(self):
         return self.engine.get_session_id()

@@ -26,6 +26,8 @@ class TransferKVChunk:
     state_indices: Optional[List]
     token_position_offset: int = 0
     chunk_id: Optional[int] = None
+    enqueue_time: float = 0.0
+    queue_index: Optional[int] = None
     trace_ctx: Union[TraceReqContext, TraceNullContext] = dataclasses.field(
         default_factory=TraceNullContext
     )
