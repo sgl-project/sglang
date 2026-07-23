@@ -1199,7 +1199,7 @@ class MooncakeKVManager(CommonKVManager):
             dst_dcp_size,
             dst_dcp_rank,
         )
-        logger.info(
+        logger.debug(
             "DSV4 KV transfer: tokens=%d dst_tokens=%d offset=%d "
             "c4=%d/%d c128=%d/%d dcp=%d:%d dst_dcp=%d:%d",
             prefill_kv_indices.size,
