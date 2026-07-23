@@ -2472,8 +2472,8 @@ class ServerArgs:
     ] = 15
     disaggregation_token_handoff_min_tokens: A[
         int,
-        "Minimum number of bridge tokens Prefill emits before sealing an already-transferred request.",
-    ] = 8
+        "Minimum number of bridge tokens Prefill emits before sealing an already-transferred request. Keep this at 1 unless a client-side playback buffer needs a larger floor.",
+    ] = 1
 
     # -------------------------------------------------------------------------
     # Encode prefill disaggregation
