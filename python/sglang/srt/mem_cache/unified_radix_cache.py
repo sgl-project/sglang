@@ -593,6 +593,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             # owns the transfer descriptor. Both registrations are required.
             self.cache_controller.register_host_pool_entry(entry)
             self.register_sidecar_pool(spec)
+
     def release_host_resources(self) -> None:
         if self.host_pool_group is not None:
             self.host_pool_group.destroy()
