@@ -8846,13 +8846,21 @@ class PortArgs:
                 scheduler_input_port = worker_ports[dp_rank]
 
             is_joiner = server_args.is_ep_scale_joiner
+            # Under SGLANG_DISTRIBUTED_INIT_METHOD_OVERRIDE, SGLang never binds
+            # dist_init_port / nccl_port (rendezvous uses the externally-managed
+            # store; see distributed/bootstrap.py:_resolve_dist_init_method), so
+            # their prechecks could only false-positive and are skipped.
+            dist_init_overridden = bool(
+                envs.SGLANG_DISTRIBUTED_INIT_METHOD_OVERRIDE.get()
+            )
             try:
                 if dp_rank is None:
-                    if not is_joiner:
+                    if not (is_joiner or dist_init_overridden):
                         wait_port_available(dist_init_port, "dist_init_port")
                     wait_port_available(port_base, "port_base")
                     wait_port_available(detokenizer_port, "detokenizer_port")
-                    wait_port_available(nccl_port, "nccl_port")
+                    if not dist_init_overridden:
+                        wait_port_available(nccl_port, "nccl_port")
                     wait_port_available(rpc_port, "rpc_port")
                     wait_port_available(metrics_port, "metrics_port")
                     if server_args.nnodes > 1:
