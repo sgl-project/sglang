@@ -74,7 +74,6 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqOutput,
 )
 from sglang.srt.managers.load_snapshot import LoadSnapshot
-from sglang.srt.runtime_context import get_lora, get_parallel
 from sglang.srt.server_args import LoRARef, ServerArgs
 from sglang.srt.utils import (
     get_bool_env_var,
@@ -146,8 +145,8 @@ class TokenizerControlMixin:
 
     def update_control_communicator_fan_out(self: TokenizerManager, worker_count: int):
         primary_group_control = (
-            get_parallel().enable_dp_attention
-            and not get_parallel().enable_dp_attention_local_control_broadcast
+            self.server_args.enable_dp_attention
+            and not self.server_args.enable_dp_attention_local_control_broadcast
         )
         if primary_group_control:
             control_fan_out = (
@@ -397,7 +396,7 @@ class TokenizerControlMixin:
     ) -> Tuple[bool, str]:
         self.auto_create_handle_loop()
         assert (
-            get_parallel().dp_size == 1 or get_parallel().enable_dp_attention
+            self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
         ), "dp_size must be 1 or dp attention must be enabled for update weights from distributed"
 
         results = await self.init_weights_update_group_communicator(obj)
@@ -410,7 +409,7 @@ class TokenizerControlMixin:
     ) -> Tuple[bool, str]:
         self.auto_create_handle_loop()
         assert (
-            get_parallel().dp_size == 1 or get_parallel().enable_dp_attention
+            self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
         ), "dp_size must be 1 or dp attention must be enabled for destroy parameter update group"
 
         results = await self.destroy_weights_update_group_communicator(obj)
@@ -423,7 +422,7 @@ class TokenizerControlMixin:
     ) -> Tuple[bool, str]:
         self.auto_create_handle_loop()
         assert (
-            get_parallel().dp_size == 1 or get_parallel().enable_dp_attention
+            self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
         ), "dp_size must be 1 or dp attention must be enabled for update weights from distributed"
 
         if obj.abort_all_requests:
@@ -454,7 +453,7 @@ class TokenizerControlMixin:
         self.auto_create_handle_loop()
         # TODO: support DP
         assert (
-            get_parallel().dp_size == 1
+            self.server_args.dp_size == 1
         ), "dp_size must be 1 for init_weights_send_group_for_remote_instance"
         result = (
             await self.init_weights_send_group_for_remote_instance_communicator(obj)
@@ -469,7 +468,7 @@ class TokenizerControlMixin:
         self.auto_create_handle_loop()
         # TODO: support DP
         assert (
-            get_parallel().dp_size == 1
+            self.server_args.dp_size == 1
         ), "dp_size must be 1 for send_weights_to_remote_instance"
         result = (await self.send_weights_to_remote_instance_communicator(obj))[0]
         return result.success, result.message
@@ -481,7 +480,7 @@ class TokenizerControlMixin:
     ) -> Tuple[bool, str]:
         self.auto_create_handle_loop()
         assert (
-            get_parallel().dp_size == 1 or get_parallel().enable_dp_attention
+            self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
         ), "dp_size must be 1 or dp attention must be enabled for update weights from tensor"
 
         if obj.abort_all_requests:
@@ -517,7 +516,7 @@ class TokenizerControlMixin:
         try:
             # For now, we only support single data parallel instance
             assert (
-                get_parallel().dp_size == 1 or get_parallel().enable_dp_attention
+                self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
             ), "dp_size must be 1 or dp attention must be enabled for update weights from IPC"
             logger.info("Starting IPC weight update")
 
@@ -570,7 +569,7 @@ class TokenizerControlMixin:
         self.auto_create_handle_loop()
 
         try:
-            if not get_lora().enable_lora:
+            if not self.server_args.enable_lora:
                 raise ValueError(
                     "LoRA is not enabled. Please set `--enable-lora` to enable LoRA."
                 )
@@ -578,7 +577,7 @@ class TokenizerControlMixin:
             # TODO (lifuhuang): Remove this after we verify that dynamic lora loading works
             # with dp_size > 1.
             assert (
-                get_parallel().dp_size == 1
+                self.server_args.dp_size == 1
             ), "dp_size must be 1 for dynamic lora loading"
             logger.info(
                 "Start load Lora adapter. Lora name=%s, path=%s",
@@ -603,10 +602,10 @@ class TokenizerControlMixin:
                     await self.lora_registry.register(new_adapter)
                     self.lora_ref_cache[obj.lora_name] = new_adapter
 
-                if get_lora().max_loaded_loras is not None:
+                if self.server_args.max_loaded_loras is not None:
                     while (
                         self.lora_registry.num_registered_loras
-                        > get_lora().max_loaded_loras
+                        > self.server_args.max_loaded_loras
                     ):
                         lru_lora_name = await self.lora_registry.lru_lora_name(
                             exclude_pinned=True
@@ -620,7 +619,7 @@ class TokenizerControlMixin:
                         logger.info(
                             f"Unloading least recently used LoRA adapter '{lru_lora_name}' "
                             f"(current number of adapters: {self.lora_registry.num_registered_loras}, "
-                            f"max allowed: {get_lora().max_loaded_loras})"
+                            f"max allowed: {self.server_args.max_loaded_loras})"
                         )
 
                         unload_result = await self._unload_lora_adapter_locked(
@@ -648,13 +647,13 @@ class TokenizerControlMixin:
         self.auto_create_handle_loop()
 
         try:
-            if not get_lora().enable_lora:
+            if not self.server_args.enable_lora:
                 raise ValueError(
                     "LoRA is not enabled. Please set `--enable-lora` to enable LoRA."
                 )
 
             assert (
-                get_parallel().dp_size == 1
+                self.server_args.dp_size == 1
             ), "dp_size must be 1 for dynamic lora loading"
             logger.info(
                 "Start load Lora adapter from tensors. Lora name=%s",
@@ -673,10 +672,10 @@ class TokenizerControlMixin:
                 if result.success:
                     await self.lora_registry.register(new_adapter)
                     self.lora_ref_cache[obj.lora_name] = new_adapter
-                if get_lora().max_loaded_loras is not None:
+                if self.server_args.max_loaded_loras is not None:
                     while (
                         self.lora_registry.num_registered_loras
-                        > get_lora().max_loaded_loras
+                        > self.server_args.max_loaded_loras
                     ):
                         lru_lora_name = await self.lora_registry.lru_lora_name(
                             exclude_pinned=True
@@ -690,7 +689,7 @@ class TokenizerControlMixin:
                         logger.info(
                             f"Unloading least recently used LoRA adapter '{lru_lora_name}' "
                             f"(current number of adapters: {self.lora_registry.num_registered_loras}, "
-                            f"max allowed: {get_lora().max_loaded_loras})"
+                            f"max allowed: {self.server_args.max_loaded_loras})"
                         )
 
                         unload_result = await self._unload_lora_adapter_locked(
@@ -718,7 +717,7 @@ class TokenizerControlMixin:
         self.auto_create_handle_loop()
 
         try:
-            if not get_lora().enable_lora:
+            if not self.server_args.enable_lora:
                 raise ValueError(
                     "LoRA is not enabled. Please set `--enable-lora` to enable LoRA."
                 )
@@ -730,7 +729,7 @@ class TokenizerControlMixin:
             # TODO (lifuhuang): Remove this after we verify that dynamic lora loading works
             # with dp_size > 1.
             assert (
-                get_parallel().dp_size == 1
+                self.server_args.dp_size == 1
             ), "dp_size must be 1 for dynamic lora loading"
             logger.info(
                 "Start unload Lora adapter. Lora name=%s",
@@ -750,7 +749,7 @@ class TokenizerControlMixin:
         self.auto_create_handle_loop()
         results = await self.get_weights_by_name_communicator(obj)
         all_parameters = [r.parameter for r in results]
-        if get_parallel().dp_size == 1:
+        if self.server_args.dp_size == 1:
             return all_parameters[0]
         else:
             return all_parameters
@@ -894,8 +893,6 @@ class TokenizerControlMixin:
     ) -> None:
         """Update weight version if provided."""
         if weight_version is not None:
-            from sglang.srt.runtime_context import get_context
-
-            get_context().override(
+            self.server_args.override(
                 "tokenizer.weight_version", weight_version=weight_version
             )

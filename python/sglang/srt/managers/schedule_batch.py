@@ -77,7 +77,10 @@ from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
     NewTokenRatioTracker,
 )
-from sglang.srt.mem_cache.allocation import alloc_for_decode, alloc_for_extend
+from sglang.srt.mem_cache.allocation import (
+    alloc_for_decode,
+    alloc_for_extend,
+)
 from sglang.srt.mem_cache.allocation_sizing import get_alloc_reserve_per_decode
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -102,12 +105,7 @@ from sglang.srt.observability.req_time_stats import (
     DPControllerReqTimeStats,
     SchedulerReqTimeStats,
 )
-from sglang.srt.runtime_context import (
-    get_parallel,
-    get_server_args,
-    get_serving,
-    get_spec,
-)
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
@@ -1096,7 +1094,7 @@ class Req(ReqDllmMixin):
         """Check if this request is prefill-only (no token generation needed)."""
         # NOTE: when spec is enabled, prefill_only optimizations are disabled
 
-        spec_alg = get_spec().speculative_algorithm
+        spec_alg = get_server_args().speculative_algorithm
         return self.sampling_params.max_new_tokens == 0 and spec_alg is None
 
     @property
@@ -1117,7 +1115,7 @@ class Req(ReqDllmMixin):
     def effective_kv_committed_len(self) -> int:
         # Report only the prompt prefix so thinking + answer fall into the
         # overallocated range and are reclaimed by release_kv_cache. #22373.
-        if get_serving().strip_thinking_cache and self.reasoning_tokens > 0:
+        if get_server_args().strip_thinking_cache and self.reasoning_tokens > 0:
             return min(self.kv_committed_len, len(self.origin_input_ids))
         return self.kv_committed_len
 
@@ -2616,6 +2614,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         return total
 
     def check_decode_mem(self, selected_indices: Optional[List[int]] = None):
+        """Reclaim evictable tree-cache entries (shortfall only), then report
+        whether the next decode step fits in the KV pool."""
         num_tokens = self.new_tokens_required_next_decode(selected_indices)
         evict_from_tree_cache(self.tree_cache, num_tokens)
         return self.token_to_kv_pool_allocator.available_size() >= num_tokens
@@ -2624,13 +2624,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self, server_args: ServerArgs
     ) -> Tuple[List[Req], float, List[Req]]:
         """Retract the decoding requests when there is not enough memory."""
-        sorted_indices = self._get_decode_retraction_order(
-            self.reqs,
-            server_args,
-            allow_policy_sort=(
-                self.spec_algorithm is None or self.spec_algorithm.is_none()
-            ),
-        )
+        sorted_indices = self._get_decode_retraction_order(self.reqs, server_args)
 
         retracted_reqs = []
         first_iter = True
@@ -2678,7 +2672,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     @staticmethod
     def _get_decode_retraction_order(
-        reqs: List[Req], server_args: ServerArgs, *, allow_policy_sort: bool
+        reqs: List[Req], server_args: ServerArgs
     ) -> List[int]:
         """Return indices ordered from most-preferred to least-preferred to keep.
 
@@ -2688,11 +2682,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         sorted_indices = list(range(len(reqs)))
 
         # TODO(lsyin): improve retraction policy for radix cache
-        # For spec decoding, filter_batch API can only filter requests from the
-        # back, so we can only retract from the back.
-        # TODO(sang): Clean up finish path and support better retract policy.
-        if not allow_policy_sort:
-            return sorted_indices
 
         def length_key(req: Req) -> Tuple[int, int]:
             return (len(req.output_ids), -len(req.origin_input_ids))
@@ -2993,7 +2982,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.spec_info:
             self.spec_info.filter_batch(
                 new_indices=keep_indices_device,
-                has_been_filtered=False,
                 new_indices_cpu=keep_indices,
             )
 

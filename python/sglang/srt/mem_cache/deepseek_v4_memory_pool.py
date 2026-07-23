@@ -6,12 +6,12 @@ from typing import List, Literal, NamedTuple, Optional, Tuple
 
 import torch
 
-from sglang.jit_kernel.dsv4 import (
+from sglang.kernels.ops.attention.dsa import index_buf_accessor
+from sglang.kernels.ops.attention.dsv4 import (
     clear_unaccepted_c128_draft_states,
     fused_k_norm_rope_flashmla,
     fused_store_cache,
 )
-from sglang.kernels.ops.attention.dsa import index_buf_accessor
 from sglang.kernels.ops.attention.dsv4 import (
     index_buf_accessor as dsv4_index_buf_accessor,
 )
@@ -21,7 +21,7 @@ from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.memory_pool import KVCache
-from sglang.srt.runtime_context import get_exec, get_server_args
+from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import ceil_div, is_hip
 
 logger = logging.getLogger(__name__)
@@ -276,7 +276,7 @@ class DeepSeekV4IndexerPool(KVCache):
             end_layer,
         )
         self.index_head_dim = index_head_dim
-        self.use_fp4_indexer = get_exec().kernel.enable_deepseek_v4_fp4_indexer
+        self.use_fp4_indexer = get_server_args().enable_deepseek_v4_fp4_indexer
 
         self._create_buffer()
 
