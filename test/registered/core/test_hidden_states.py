@@ -32,7 +32,7 @@ class TestHiddenState(CustomTestCase):
             model_path=cls.model_path,
             random_seed=42,
             skip_tokenizer_init=True,
-            enable_return_hidden_states=True,
+            return_hidden_states_mode="full",
             mem_fraction_static=0.7,
         )
 
@@ -163,6 +163,34 @@ class TestHiddenState(CustomTestCase):
 
         last_hidden_state = torch.tensor(last_hidden_state)
         self.assertEqual(last_hidden_state.dim(), 1)
+
+    def test_mixed_return_hidden_states_modes_with_warm_cache(self):
+        # Prime the radix cache so each repeated prompt only extends its
+        # uncached suffix during the mixed-mode prefill.
+        self.engine.generate(
+            input_ids=self.input_ids,
+            sampling_params={"temperature": 0, "max_new_tokens": 1},
+            return_hidden_states=False,
+        )
+
+        outputs = self.engine.generate(
+            input_ids=self.input_ids + [self.input_ids[1]],
+            sampling_params={"temperature": 0, "max_new_tokens": 1},
+            return_hidden_states=[True, True, "last"],
+        )
+
+        self.assertEqual(
+            torch.tensor(outputs[0]["meta_info"]["hidden_states"][0]).dim(),
+            2,
+        )
+        self.assertEqual(
+            torch.tensor(outputs[2]["meta_info"]["hidden_states"]).dim(),
+            1,
+        )
+        torch.testing.assert_close(
+            torch.tensor(outputs[1]["meta_info"]["hidden_states"][0])[-1],
+            torch.tensor(outputs[2]["meta_info"]["hidden_states"]),
+        )
 
     def test_repeatedly_changes_hidden_states(self):
         outputs_completion_first_round = self.engine.generate(

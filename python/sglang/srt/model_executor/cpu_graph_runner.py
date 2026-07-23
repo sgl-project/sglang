@@ -35,6 +35,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
     enable_num_token_non_padded,
     get_required_capture_hidden_mode,
+    get_server_return_hidden_states_mode,
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.runner_utils.capture_mode import model_capture_mode
@@ -563,9 +564,12 @@ class CPUGraphRunner:
         # Parse args
         self.model_runner = model_runner
         self.device = model_runner.device
-        self.enable_return_hidden_states = (
-            model_runner.server_args.enable_return_hidden_states
+        self.return_hidden_states_mode = (
+            CaptureHiddenMode.NULL
+            if model_runner.is_draft_worker
+            else get_server_return_hidden_states_mode(model_runner.server_args)
         )
+        self.enable_return_hidden_states = self.return_hidden_states_mode.need_capture()
         # bs -> compiled fn (text-only / skip_cross_attention=True)
         self.graphs = {}
         # bs -> compiled fn (cross-attention / skip_cross_attention=False, enc-dec only)
@@ -590,13 +594,9 @@ class CPUGraphRunner:
         self.pp_size = model_runner.server_args.pp_size
 
         self.capture_forward_mode = ForwardMode.DECODE
-        self.capture_hidden_mode = CaptureHiddenMode.NULL
+        self.capture_hidden_mode = self.return_hidden_states_mode
         # Static capture width: CPU graphs are decode-only.
         self.captured_req_width = 1
-
-        # If returning hidden states is enabled, set initial capture hidden mode to full to avoid double-capture on startup
-        if self.enable_return_hidden_states:
-            self.capture_hidden_mode = CaptureHiddenMode.FULL
 
         assert (
             not self.model_runner.server_args.enable_lora
@@ -857,22 +857,24 @@ class CPUGraphRunner:
                         self.captured_forward_batches_cross[bs] = forward_batch
                     return forward, out
 
-    def recapture_if_needed(self, forward_batch: ForwardBatch) -> None:
+    def _validate_capture_hidden_mode(self, forward_batch: ForwardBatch) -> None:
         required_capture_hidden_mode = get_required_capture_hidden_mode(
             forward_batch.capture_hidden_mode,
             forward_batch.spec_info,
         )
 
-        if self.capture_hidden_mode != required_capture_hidden_mode:
-            self.capture_hidden_mode = required_capture_hidden_mode
-            self.capture()
+        if self.capture_hidden_mode < required_capture_hidden_mode:
+            raise RuntimeError(
+                "The runtime hidden-state mode exceeds the fixed CPU graph "
+                f"capture mode ({self.capture_hidden_mode.name})."
+            )
 
     def prepare_replay(
         self,
         forward_batch: ForwardBatch,
         skip: bool = False,
     ):
-        self.recapture_if_needed(forward_batch)
+        self._validate_capture_hidden_mode(forward_batch)
 
         graphs = self.graphs_cross if not skip else self.graphs
         cfbs = (
