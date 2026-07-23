@@ -346,6 +346,41 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         self.assertTrue(flags.enable_tf32_matmul)
         self.assertFalse(flags.enable_multi_layer_eagle)  # pristine materialize
 
+    def test_minimax_m2_sm100_nvfp4_uses_routed_trtllm(self):
+        from sglang.srt.arg_groups.overrides import _minimax_m2_overrides
+
+        def _args(*, quantization="modelopt_fp4", moe_runner_backend="auto"):
+            return SimpleNamespace(
+                moe_runner_backend=moe_runner_backend,
+                get_model_config=lambda: SimpleNamespace(quantization=quantization),
+            )
+
+        with patch.object(overrides_module, "is_sm100_supported", return_value=True):
+            self.assertEqual(
+                _minimax_m2_overrides(_args(), None),
+                {
+                    "enable_tf32_matmul": True,
+                    "moe_runner_backend": "flashinfer_trtllm_routed",
+                },
+            )
+            self.assertEqual(
+                _minimax_m2_overrides(
+                    _args(moe_runner_backend="flashinfer_cutlass"), None
+                ),
+                {"enable_tf32_matmul": True},
+            )
+            self.assertEqual(
+                _minimax_m2_overrides(_args(quantization="fp8"), None),
+                {"enable_tf32_matmul": True},
+            )
+
+        # Thor (SM110) and other architectures keep the existing auto behavior.
+        with patch.object(overrides_module, "is_sm100_supported", return_value=False):
+            self.assertEqual(
+                _minimax_m2_overrides(_args(), None),
+                {"enable_tf32_matmul": True},
+            )
+
     def test_mimo_v2_declarations(self):
         # Callable-level golden: MiMoV2 archs are hybrid (config-shape heavy),
         # so the declaration is pinned directly for both provider inputs.
