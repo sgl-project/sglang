@@ -12,11 +12,16 @@ import dataclasses
 import logging
 import struct
 import threading
+import time
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
 logger = logging.getLogger(__name__)
+
+# Bounded wait for a watermark advance before re-enqueueing a deferred staging
+# chunk, so the re-enqueue retry does not busy-spin a core.
+STAGING_WATERMARK_WAIT_S = 0.001
 
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.decode import DecodeRequest
@@ -78,20 +83,33 @@ class DecodeStagingHandler:
         self.total_kv_heads = total_kv_heads
         self.tp_rank = tp_rank
         self.scheduler = scheduler
+        # Same stall->Failed semantics (and knob) as _check_waiting_timeout,
+        # which is unreachable once the receiver has concluded Success.
+        from sglang.srt.environ import envs
+
+        self.completion_timeout = float(
+            envs.SGLANG_DISAGGREGATION_WAITING_TIMEOUT.get()
+        )
         self._room_to_decode_req: dict = {}
+        # Stashed at registration: removal paths null decode_req.kv_receiver
+        # before unregister runs, but release_room still needs it.
+        self._room_to_receiver: dict = {}
         self._wm_subscribers: dict = {}
+        # room -> chunk_idx -> [(page_start, num_pages, writer_id)] fan-in
+        # arrivals; handler-owned so room teardown can purge them.
+        self._writer_counts: dict = {}
 
     def register_wm_subscriber(self, receiver, session_id: str) -> None:
         """Register a prefill's bootstrap connection for watermark broadcasts."""
-        if receiver is None or not getattr(receiver, "bootstrap_infos", None):
+        if receiver is None or not receiver.bootstrap_infos:
             return
         key = tuple(str(bi) for bi in receiver.bootstrap_infos)
         if key not in self._wm_subscribers:
             self._wm_subscribers[key] = (receiver, session_id)
 
-    def num_writers_for(self, decode_req) -> int:
+    def num_writers_for(self, receiver) -> int:
         """Compute num_writers for a specific request based on its prefill TP."""
-        prefill_tp = decode_req.kv_receiver.prefill_info.attn_tp_size
+        prefill_tp = receiver.prefill_info.attn_tp_size
         if prefill_tp > self.decode_tp:
             return prefill_tp // max(1, self.decode_tp)
         return 1
@@ -133,10 +151,63 @@ class DecodeStagingHandler:
     # ------------------------------------------------------------------
 
     def register_decode_req(self, room: int, decode_req: DecodeRequest) -> None:
+        # Called once per room from pop_preallocated, before send_metadata.
+        # Scatter offsets shift suffix-relative page_start by the decode
+        # prefix, which is only exact when the prefix is page-aligned.
+        page_size = self.kv_buffer_info["page_size"]
+        if decode_req.req.cache_protected_len % page_size != 0:
+            raise RuntimeError(
+                f"[STAGING] decode prefix length "
+                f"{decode_req.req.cache_protected_len} is not page-aligned "
+                f"(page_size={page_size}); staging scatter offsets would be "
+                f"wrong for room={room}."
+            )
+        decode_req._staging_all_success = False
+        decode_req._staging_success_ts = 0.0
+        decode_req._staging_failed = False
+        decode_req._staging_scatter_done = False
+        decode_req._chunk_events = []
         self._room_to_decode_req[room] = decode_req
+        self._room_to_receiver[room] = decode_req.kv_receiver
 
     def unregister_decode_req(self, room: int) -> None:
-        self._room_to_decode_req.pop(room, None)
+        # Pop before release_room so no new arrival can start consuming the slots.
+        decode_req = self._room_to_decode_req.pop(room, None)
+        receiver = self._room_to_receiver.pop(room, None)
+        self._writer_counts.pop(room, None)
+        if decode_req is not None:
+            self.release_room(room, decode_req, receiver)
+        self.kv_manager._staging_ctx.room_receivers.pop(room, None)
+        self.kv_manager._staging_ctx.room_bootstrap.pop(room, None)
+
+    def release_room(self, room: int, decode_req: DecodeRequest, receiver) -> None:
+        """Free outstanding staging allocations of a room; no-op after a
+        clean Success, releases watermark-pinning leaks on failure/abort."""
+        # Drain in-flight scatters before freeing anything, including one whose
+        # event is not yet in _chunk_events (submit_chunk_scatter records it
+        # after launching the kernel), so no scatter reads a freed staging slot
+        # or writes into KV-pool pages the failure path frees for reuse.
+        stream = self.staging_allocator._scatter_stream
+        if stream is not None:
+            stream.synchronize()
+        chunk_infos = receiver.chunk_staging_infos if receiver is not None else []
+        unscattered_allocs = []
+        for chunk_idx, info in enumerate(chunk_infos):
+            if info[0] >= 0:
+                unscattered_allocs.append((chunk_idx, info[0]))
+                chunk_infos[chunk_idx] = (-1, -1, 0, -1, 0)
+        for chunk_idx, alloc_id in unscattered_allocs:
+            logger.warning(
+                "[STAGING] releasing unscattered staging allocation "
+                "room=%s chunk=%s alloc_id=%s",
+                room,
+                chunk_idx,
+                alloc_id,
+            )
+            self._free_and_send_watermark(alloc_id, decode_req)
+        for _event, alloc_id in decode_req._chunk_events:
+            self._free_and_send_watermark(alloc_id, decode_req)
+        decode_req._chunk_events.clear()
 
     # ------------------------------------------------------------------
     # Scatter submission: called from decode_thread (background)
@@ -160,19 +231,22 @@ class DecodeStagingHandler:
                 chunk_idx,
             )
             return False
-        chunk_infos = getattr(decode_req.kv_receiver, "chunk_staging_infos", [])
+        receiver = self._room_to_receiver.get(room)
+        chunk_infos = receiver.chunk_staging_infos if receiver is not None else []
         if chunk_idx >= len(chunk_infos):
             return False
         alloc_id, staging_offset, _, _, _ = chunk_infos[chunk_idx]
         if staging_offset < 0 or alloc_id < 0:
             return False
 
-        ok = self._scatter_region(staging_offset, page_start, num_pages, decode_req)
+        ok = self._scatter_region(
+            staging_offset, page_start, num_pages, decode_req, receiver
+        )
         if ok:
             event = torch.cuda.Event()
             event.record(self.staging_allocator._scatter_stream)
-            if not hasattr(decode_req, "_chunk_events"):
-                decode_req._chunk_events = []
+            # Append before zeroing so the completion check always sees either
+            # the slot or the event.
             decode_req._chunk_events.append((event, alloc_id))
             chunk_infos[chunk_idx] = (-1, -1, 0, -1, 0)
         else:
@@ -195,38 +269,36 @@ class DecodeStagingHandler:
         page_start: int,
         num_pages: int,
         writer_id: str,
-        chunk_writer_counts: dict,
     ) -> bool:
         """Process a staging chunk arrival from any transport (NIXL RDMA notif or ZMQ CHUNK_READY).
 
-        Accumulates writer arrivals in *chunk_writer_counts* and submits scatter
-        once all writers for this chunk have reported in. Returns True if scatter
-        was submitted.
+        Accumulates writer arrivals and submits scatter once all writers for
+        this chunk have reported in. Returns True if scatter was submitted.
         """
-        chunk_writer_counts[room][chunk_idx].append((page_start, num_pages, writer_id))
-        decode_req = self._room_to_decode_req.get(room)
-        if decode_req is None:
+        # Read from the stash, not decode_req.kv_receiver: a concurrent teardown
+        # nulls the latter before unregister removes the room.
+        receiver = self._room_to_receiver.get(room)
+        if receiver is None:
             logger.warning(
-                "Staging chunk arrived for unregistered room=%s chunk=%d, skipping",
+                "Staging chunk arrived for unregistered room=%s chunk=%d, " "skipping",
                 room,
                 chunk_idx,
             )
             return False
-        writers_arrived = len(chunk_writer_counts[room][chunk_idx])
-        num_writers = self.num_writers_for(decode_req)
-        if writers_arrived >= num_writers:
+        room_counts = self._writer_counts.setdefault(room, {})
+        arrivals = room_counts.setdefault(chunk_idx, [])
+        arrivals.append((page_start, num_pages, writer_id))
+        num_writers = self.num_writers_for(receiver)
+        if len(arrivals) >= num_writers:
             self.submit_chunk_scatter(room, chunk_idx, page_start, num_pages)
-            del chunk_writer_counts[room][chunk_idx]
+            del room_counts[chunk_idx]
             return True
         return False
 
     def submit_last_scatter_async(self, room: int) -> bool:
-        """Submit scatter for the last chunk when all ranks report Success.
-
-        Called from decode_thread.  Sets ``_scatter_event`` **before**
-        ``_staging_last_scatter_submitted`` so the main thread sees the
-        event when it checks the flag (CPython GIL guarantees ordering).
-        """
+        """Record all-ranks Success. Scatter is fully arrival-driven (every
+        chunk, including the last); advance_scatter completes the room once
+        no allocation is still waiting for its arrival."""
         decode_req = self._room_to_decode_req.get(room)
         if decode_req is None:
             logger.warning(
@@ -236,15 +308,11 @@ class DecodeStagingHandler:
                 room,
             )
             return False
-        alloc_id = self._submit_last_scatter(decode_req)
-        if alloc_id >= 0:
-            event = torch.cuda.Event()
-            event.record(self.staging_allocator._scatter_stream)
-            decode_req._scatter_event = event
-            decode_req._scatter_alloc_id = alloc_id
-            decode_req._staging_last_scatter_submitted = True
-        else:
-            decode_req._staging_scatter_done = True
+        if not decode_req._staging_all_success:
+            # Set the timestamp before the flag so the deadline check never
+            # reads a zero ts.
+            decode_req._staging_success_ts = time.monotonic()
+            decode_req._staging_all_success = True
         return True
 
     # ------------------------------------------------------------------
@@ -253,19 +321,21 @@ class DecodeStagingHandler:
 
     def is_done(self, decode_req: DecodeRequest) -> bool:
         """Return True if staging scatter is complete for this request."""
-        if not getattr(decode_req, "_staging_scatter_done", False):
-            return False
-        return not getattr(decode_req, "_chunk_events", None)
+        return decode_req._staging_scatter_done and not decode_req._chunk_events
+
+    def is_failed(self, decode_req: DecodeRequest) -> bool:
+        """Return True if staging completion timed out for this request."""
+        return decode_req._staging_failed
 
     def advance_scatter(self, decode_req: DecodeRequest) -> None:
-        """Check CUDA events and free completed staging allocations.
+        """Poll scatter events, free completed allocations, detect completion.
 
-        Scatter kernels have already been submitted by the decode_thread
-        (via submit_chunk_scatter / submit_last_scatter_async).  This
-        method only polls the recorded events and releases staging memory.
+        The room is done once all ranks reported Success AND every allocation
+        was scattered AND every event fired; gating on outstanding allocations
+        keeps it open while a CHUNK_READY is still in flight after Success.
+        Rooms incomplete past the disaggregation waiting timeout are failed.
         """
-        room = decode_req.req.bootstrap_room
-        chunk_events = getattr(decode_req, "_chunk_events", None)
+        chunk_events = decode_req._chunk_events
         if chunk_events:
             for i in range(len(chunk_events) - 1, -1, -1):
                 event, alloc_id = chunk_events[i]
@@ -273,15 +343,24 @@ class DecodeStagingHandler:
                     chunk_events.pop(i)
                     self._free_and_send_watermark(alloc_id, decode_req)
 
-        if not getattr(decode_req, "_staging_last_scatter_submitted", False):
+        if not decode_req._staging_all_success:
             return
-
-        event = getattr(decode_req, "_scatter_event", None)
-        if event is not None and event.query():
-            self._free_and_send_watermark(decode_req._scatter_alloc_id, decode_req)
-            decode_req._scatter_event = None
-            decode_req._scatter_alloc_id = -1
+        room = decode_req.req.bootstrap_room
+        receiver = self._room_to_receiver.get(room)
+        chunk_infos = receiver.chunk_staging_infos if receiver is not None else []
+        incomplete = bool(chunk_events) or any(info[0] >= 0 for info in chunk_infos)
+        if not incomplete:
             decode_req._staging_scatter_done = True
+            return
+        elapsed = time.monotonic() - decode_req._staging_success_ts
+        if elapsed > self.completion_timeout:
+            logger.error(
+                "[STAGING] room=%s not complete %.0fs after all-ranks Success "
+                "(a scatter never arrived); failing the request.",
+                room,
+                elapsed,
+            )
+            decode_req._staging_failed = True
 
     # ------------------------------------------------------------------
     # Internal methods
@@ -293,6 +372,7 @@ class DecodeStagingHandler:
         page_start: int,
         num_pages: int,
         decode_req: DecodeRequest,
+        receiver,
     ) -> bool:
         """Submit scatter kernels for a staging region to scatter_stream.
 
@@ -312,7 +392,7 @@ class DecodeStagingHandler:
         device = k_buffers[0].device
         torch.cuda.set_device(device)
 
-        if not hasattr(self.staging_allocator, "_scatter_stream"):
+        if self.staging_allocator._scatter_stream is None:
             self.staging_allocator._scatter_stream = torch.cuda.Stream(device=device)
 
         scatter_stream = self.staging_allocator._scatter_stream
@@ -320,9 +400,12 @@ class DecodeStagingHandler:
         staging_view = self.staging_allocator.buffer.buffer[staging_offset:]
 
         req_pool_idx = decode_req.req.req_pool_idx
-        token_start = page_start * page_size
+        # page_start is suffix-relative (pages after the decode-side cached
+        # prefix); req_to_token rows are absolute.
+        prefix_tokens = decode_req.req.cache_protected_len
+        token_start = prefix_tokens + page_start * page_size
         token_end = token_start + num_pages * page_size
-        prefill_tp = decode_req.kv_receiver.prefill_info.attn_tp_size
+        prefill_tp = receiver.prefill_info.attn_tp_size
 
         with torch.cuda.stream(scatter_stream):
             kv_indices = self.scheduler.req_to_token_pool.req_to_token[
@@ -346,28 +429,6 @@ class DecodeStagingHandler:
             )
 
         return True
-
-    def _submit_last_scatter(self, decode_req: DecodeRequest) -> int:
-        """Submit scatter for the last chunk. Returns alloc_id >= 0, or -1."""
-        receiver = decode_req.kv_receiver
-        chunk_infos = getattr(receiver, "chunk_staging_infos", [])
-        if not chunk_infos:
-            return -1
-
-        last_info = chunk_infos[-1]
-        alloc_id, staging_offset, _, _, last_num_pages = last_info
-        if staging_offset < 0 or alloc_id < 0:
-            return -1
-
-        seq_len = len(decode_req.req.origin_input_ids)
-        ps = self.scheduler.token_to_kv_pool_allocator.page_size
-        total_pages = (seq_len + ps - 1) // ps
-        page_start = total_pages - last_num_pages
-
-        ok = self._scatter_region(
-            staging_offset, page_start, last_num_pages, decode_req
-        )
-        return alloc_id if ok else -1
 
     def _free_and_send_watermark(
         self, alloc_id: int, decode_req: DecodeRequest
@@ -497,11 +558,17 @@ class PrefillStagingStrategy:
     """
 
     def __init__(self, kv_manager, staging_buffer):
+        from sglang.srt.disaggregation.common.staging_buffer import (
+            staging_grid_tokens,
+        )
+
         self.kv_manager = kv_manager
         self.staging_buffer = staging_buffer
         page_size = kv_manager.kv_buffer_tensors["page_size"]
-        cps = kv_manager.server_args.chunked_prefill_size or 8192
-        self.full_chunk_pages = max(1, cps // page_size)
+        self.full_chunk_pages = (
+            staging_grid_tokens(kv_manager.server_args.chunked_prefill_size, page_size)
+            // page_size
+        )
 
     def check_ready(
         self,
@@ -601,22 +668,18 @@ def _get_custom_mem_pool(device: str):
     return custom_mem_pool, pool_type
 
 
-def init_staging_buffers(register_fn, kv_args, count: int) -> list:
-    """Create prefill-side staging buffers and register them with the transport.
+def init_staging_buffers(
+    register_fn, kv_args, count: int, chunked_prefill_size: int
+) -> list:
+    """Create prefill-side staging buffers, each sized to one prefill chunk.
 
-    Args:
-        register_fn: callable(ptr: int, size: int) that registers a memory
-            region with the transport backend.
-        kv_args: KVArgs with gpu_id.
-        count: number of staging buffers to create.
-
-    Returns list of StagingBuffer instances.
+    Sizing to one chunk (``chunked_prefill_size`` tokens of this rank's KV) means
+    a chunk can never be too large for the buffer.
     """
     from sglang.srt.disaggregation.common.staging_buffer import StagingBuffer
-    from sglang.srt.environ import envs
 
-    size_mb = envs.SGLANG_DISAGG_STAGING_BUFFER_SIZE_MB.get()
-    size_bytes = size_mb * 1024 * 1024
+    full_chunk_pages = max(1, chunked_prefill_size // kv_args.page_size)
+    size_bytes = full_chunk_pages * sum(kv_args.kv_item_lens)
     gpu_id = kv_args.gpu_id
     device = f"cuda:{gpu_id}"
 
@@ -693,7 +756,7 @@ def handle_staging_req(
             session_id,
         )
         return
-    infos = getattr(receiver, "chunk_staging_infos", [])
+    infos = receiver.chunk_staging_infos
 
     if chunk_idx < len(infos) and infos[chunk_idx][0] >= 0:
         _, offset, rnd, end, _ = infos[chunk_idx]
@@ -790,11 +853,11 @@ def prefetch_staging_reqs(
     """
     import zmq
 
+    from sglang.srt.disaggregation.common.staging_buffer import staging_grid_tokens
     from sglang.srt.utils.network import NetworkAddress
 
     page_size = kv_buffer_tensors["page_size"]
-    cps = chunked_prefill_size or 8192
-    full_chunk_pages = max(1, cps // page_size)
+    full_chunk_pages = staging_grid_tokens(chunked_prefill_size, page_size) // page_size
 
     for session_id, tinfo in transfer_infos[room].items():
         # mooncake exposes is_dummy as a dataclass bool field, NIXL exposes it
