@@ -5,6 +5,7 @@ from torch import nn
 from transformers import PreTrainedModel
 
 from sglang.srt.models.gemma4_mm import Gemma4ForConditionalGeneration
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
@@ -45,3 +46,19 @@ def test_language_only_does_not_construct_multimodal_encoders():
         model = Gemma4ForConditionalGeneration(config)
 
     assert model.language_model is text_model
+
+
+def test_language_only_accepts_gemma4_architecture():
+    server_args = object.__new__(ServerArgs)
+    server_args.enable_prefix_mm_cache = False
+    server_args.encoder_only = False
+    server_args.language_only = True
+    server_args.encoder_urls = []
+    server_args.disaggregation_transfer_backend = "zmq_to_scheduler"
+    server_args.disaggregation_mode = "null"
+    server_args.encoder_transfer_backend = "zmq_to_scheduler"
+    server_args.get_model_config = lambda: SimpleNamespace(
+        hf_config=SimpleNamespace(architectures=["Gemma4ForConditionalGeneration"])
+    )
+
+    server_args._handle_encoder_disaggregation()
