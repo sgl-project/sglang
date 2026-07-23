@@ -369,7 +369,7 @@ async def edits(
     image_array: Optional[List[UploadFile]] = File(None, alias="image[]"),
     url: Optional[List[str]] = Form(None),
     url_array: Optional[List[str]] = Form(None, alias="url[]"),
-    prompt: str = Form(...),
+    prompt: Optional[str] = Form(None),
     mask: Optional[UploadFile] = File(None),
     model: Optional[str] = Form(None),
     n: Optional[int] = Form(1),
