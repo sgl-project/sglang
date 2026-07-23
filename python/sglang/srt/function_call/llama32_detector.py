@@ -69,7 +69,15 @@ class Llama32Detector(BaseFormatDetector):
             try:
                 obj, end = decoder.raw_decode(action_text[idx:])
                 all_actions.append(obj)
-                idx += end + len(self.tool_call_separator)
+                idx += end
+                # Only consume a separator when one is actually present.
+                # Blindly skipping ``len(self.tool_call_separator)`` characters
+                # truncates the first character of any free-form text that
+                # follows the final tool call (e.g. ``{...}}Hello`` -> ``ello``).
+                rest = action_text[idx:]
+                stripped = rest.lstrip()
+                if stripped.startswith(self.tool_call_separator):
+                    idx += (len(rest) - len(stripped)) + len(self.tool_call_separator)
                 safe_idx = idx
             except json.JSONDecodeError:
                 # Try Python dict conversion as fallback
