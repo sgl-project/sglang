@@ -431,6 +431,44 @@ def test_masked_fused():
         assert torch.all(x_q[e, m:].view(torch.int8) == 0), "padding touched"
 
 
+def test_mn_major_tma_aligned_transform_keeps_ownership():
+    """The masked fused quant emits scales already MN-major/TMA-aligned, which
+    makes deep_gemm's get_mn_major_tma_aligned_tensor hit its no-op fast path.
+    In sgl-deep-gemm <= 0.1.4.post1 that path returns a non-owning
+    ``torch::from_blob`` alias across TVM-FFI; the production caller rebinds
+    the result over its only reference, so an alias frees the scale storage
+    before the down GEMM reads it (NaN logits / host-pointer crash under CUDA
+    graph capture). The wrapper must hand back the input tensor itself."""
+    from sglang.srt.layers import deep_gemm_wrapper
+
+    if not deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
+        pytest.skip("deep_gemm unavailable")
+
+    E, N, num_groups = 18, 128, 20  # N 4-aligned -> already-TMA-aligned layout
+    s = torch.empty((E, num_groups, N), device="cuda", dtype=torch.float32)
+    s = s.transpose(-1, -2)
+    s.copy_(torch.rand(E, N, num_groups, device="cuda") + 1.0)
+    expected = s.clone()
+
+    out = deep_gemm_wrapper.get_mn_major_tma_aligned_tensor(s)
+    assert out is s, "already-aligned input must be returned as-is (owning)"
+
+    # The production pattern: rebind + allocator churn between quant and GEMM.
+    del s
+    reuse = torch.full((E, num_groups, N), float("nan"), device="cuda")
+    torch.cuda.synchronize()
+    assert not torch.isnan(out).any(), "scale storage was freed and reused"
+    torch.testing.assert_close(out, expected)
+    del reuse
+
+    # Row-major input still takes the real transform into an owning buffer.
+    row_major = expected.contiguous()
+    out2 = deep_gemm_wrapper.get_mn_major_tma_aligned_tensor(row_major)
+    assert out2.data_ptr() != row_major.data_ptr()
+    assert out2.stride(-2) == 1
+    torch.testing.assert_close(out2, row_major)
+
+
 @pytest.mark.parametrize("out_dtype,column_major_scales,scale_ue8m0", AUTO_ALLOC_CASES)
 def test_auto_allocation(out_dtype, column_major_scales, scale_ue8m0):
     """Omitting output_q/output_s allocates them per out_dtype / major mode /
