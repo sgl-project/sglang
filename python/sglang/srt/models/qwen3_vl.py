@@ -34,6 +34,8 @@ from sglang.srt.layers.attention.vision import (
     FLASHINFER_MAX_SEQLEN_BUCKETS,
     FLASHINFER_WORKSPACE_SIZE_BYTES,
     VisionAttention,
+    VisionAttentionMetadata,
+    prepare_vision_attention_metadata,
 )
 from sglang.srt.layers.conv import Conv3dLayer
 from sglang.srt.layers.dp_attention import (
@@ -68,8 +70,7 @@ from sglang.srt.models.utils import (
 )
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
-from sglang.srt.runtime_context import get_parallel
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import (
     add_prefix,
     cpu_has_amx_support,
@@ -87,7 +88,6 @@ if _is_npu:
     )
 
     graph_runners_dict["npu"] = ViTNpuGraphRunner
-
 
 logger = logging.getLogger(__name__)
 
@@ -225,6 +225,7 @@ class Qwen3_VisionBlock(nn.Module):
         rotary_pos_emb_cos: torch.Tensor,
         rotary_pos_emb_sin: torch.Tensor,
         output_ws: Optional[torch.Tensor] = None,
+        forward_metadata: Optional[VisionAttentionMetadata] = None,
         max_seqlen: Optional[torch.Tensor] = None,
         sequence_lengths: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
@@ -236,6 +237,7 @@ class Qwen3_VisionBlock(nn.Module):
             rotary_pos_emb_cos=rotary_pos_emb_cos,
             rotary_pos_emb_sin=rotary_pos_emb_sin,
             output_ws=output_ws,
+            forward_metadata=forward_metadata,
             max_seqlen=max_seqlen,
             sequence_lengths=sequence_lengths,
         )
@@ -324,9 +326,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         self.num_position_embeddings = vision_config.num_position_embeddings
         self.num_grid_per_side = int(self.num_position_embeddings**0.5)
         self.num_grid = self.num_grid_per_side * self.num_grid_per_side
-        self.align_corners = (
-            get_global_server_args().enable_precise_embedding_interpolation
-        )
+        self.align_corners = get_server_args().enable_precise_embedding_interpolation
         self.patch_size = vision_config.patch_size
         self.spatial_merge_size = vision_config.spatial_merge_size
         self.spatial_merge_unit = self.spatial_merge_size**2
@@ -369,7 +369,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         )
 
         workspace_buffer = None
-        if get_global_server_args().mm_attention_backend == "flashinfer_cudnn":
+        if get_server_args().mm_attention_backend == "flashinfer_cudnn":
             if torch.cuda.is_available() and (not _is_npu):
                 ws_device = torch.device("cuda", torch.cuda.current_device())
             else:
@@ -912,9 +912,12 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             [np.zeros(1, dtype=np.int32), token_cu_seqlens]
         )
 
+        # ---- pre-compute attention metadata once for all layers ----
+        packed_indptrs = None
+        flashinfer_sequence_lengths = None
         flashinfer_max_seqlen = 0
-        cu_seqlens = None
-        if get_global_server_args().mm_attention_backend == "flashinfer_cudnn":
+
+        if get_server_args().mm_attention_backend == "flashinfer_cudnn":
             # real token lens (B,)
             real_seq_lens = token_cu_seqlens[1:] - token_cu_seqlens[:-1]
             flashinfer_max_seqlen = self.bucket_flashinfer_max_seqlen(
@@ -927,11 +930,8 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             )
 
             # element-per-token width on THIS ATTENTION TP rank
-            # q/k/v in VisionAttention are sharded by attention TP
             attn_tp_size = 1 if self.use_data_parallel else self.tp_size
-            elem_per_token = (
-                self.hidden_size // attn_tp_size
-            )  # == heads_per_rank * head_dim
+            elem_per_token = self.hidden_size // attn_tp_size
 
             # (3*(B_padded+1),) packed element indptrs
             offsets_packed = self.compute_flashinfer_batch_offsets_packed(
@@ -939,30 +939,30 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
                 elem_per_token=elem_per_token,
             )
 
-            sequence_lengths = (
+            flashinfer_sequence_lengths = (
                 torch.from_numpy(seq_lens_padded)
                 .to(device=self.device, dtype=torch.int32, non_blocking=True)
                 .view(-1, 1, 1, 1)
-            )  # match cuDNN test style
-
-            cu_seqlens = torch.from_numpy(offsets_packed).to(
+            )
+            packed_indptrs = torch.from_numpy(offsets_packed).to(
                 device=self.device, dtype=torch.int32, non_blocking=True
             )
 
-            max_seqlen = int(flashinfer_max_seqlen)
-            sequence_lengths = sequence_lengths.to(self.device, non_blocking=True)
+        cu_seqlens = torch.from_numpy(token_cu_seqlens)
+        if not _is_npu:
+            cu_seqlens = cu_seqlens.to(self.device, non_blocking=True)
         else:
-            sequence_lengths = None
-            cu_seqlens = torch.from_numpy(token_cu_seqlens)
-            if not _is_npu:
-                cu_seqlens = cu_seqlens.to(self.device, non_blocking=True)
-            else:
-                cu_seqlens = cu_seqlens.to("cpu")
-            max_seqlen = None
+            cu_seqlens = cu_seqlens.to("cpu")
+
+        forward_metadata = prepare_vision_attention_metadata(
+            cu_seqlens,
+            device=self.device,
+            packed_indptrs=packed_indptrs,
+            sequence_lengths=flashinfer_sequence_lengths,
+            flashinfer_max_seqlen=flashinfer_max_seqlen,
+        )
 
         x = x.unsqueeze(1)
-
-        cu_seqlens = cu_seqlens.to(self.device, non_blocking=True)
 
         deepstack_feature_lists = []
         num_deepstack_captured = 0
@@ -973,8 +973,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
                 cu_seqlens=cu_seqlens,
                 rotary_pos_emb_cos=rotary_pos_emb_cos,
                 rotary_pos_emb_sin=rotary_pos_emb_sin,
-                max_seqlen=max_seqlen,
-                sequence_lengths=sequence_lengths,
+                forward_metadata=forward_metadata,
             )
 
             if layer_num in self.deepstack_visual_indexes:
@@ -1234,7 +1233,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         self.pp_group = get_pp_group()
         self.quant_config = quant_config
 
-        self.use_data_parallel = get_global_server_args().mm_enable_dp_encoder
+        self.use_data_parallel = get_server_args().mm_enable_dp_encoder
 
         self.visual = Qwen3VLMoeVisionModel(
             config.vision_config,
@@ -1278,7 +1277,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                         self.config.vocab_size,
                         self.config.hidden_size,
                         quant_config=quant_config,
-                        use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+                        use_attn_tp_group=get_server_args().enable_dp_lm_head,
                         prefix=add_prefix("lm_head", prefix),
                     )
             else:

@@ -18,12 +18,11 @@ if _is_cuda_alike:
     )
 
 if _is_cuda:
-    from sglang.jit_kernel.activation import silu_and_mul
+    from sglang.kernels.ops.activation._jit_activation import silu_and_mul
 else:
     from sgl_kernel import silu_and_mul
 
-from sglang.jit_kernel.per_tensor_quant_fp8 import per_tensor_quant_fp8
-from sglang.srt.layers.moe.ep_moe.kernels import (
+from sglang.kernels.ops.moe.ep_moe_kernels import (
     cutlass_w4_run_moe_ep_preproess,
     deepep_ll_get_cutlass_w4a8_moe_mm_data,
     deepep_permute_triton_kernel,
@@ -33,7 +32,12 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
     post_reorder_for_cutlass_moe,
     pre_reorder_for_cutlass_moe,
     silu_and_mul_masked_post_per_tensor_quant_fwd,
+    silu_mul_dynamic_tensorwise_quant_for_cutlass_moe,
     silu_mul_static_tensorwise_quant_for_cutlass_moe,
+)
+from sglang.kernels.ops.quantization._jit_per_tensor_quant_fp8 import (
+    per_tensor_absmax_fp8,
+    per_tensor_quant_fp8,
 )
 
 
@@ -137,6 +141,11 @@ def cutlass_w4a8_moe(
         dtype=torch.float8_e4m3fn,
     )
 
+    # TODO: fuse per_tensor_absmax_fp8 and pre_reorder_for_cutlass_moe
+    if a1_scale is None:
+        a1_scale = torch.zeros(1, dtype=torch.float32, device=device)
+        per_tensor_absmax_fp8(a, a1_scale)
+
     pre_reorder_for_cutlass_moe(
         a,
         gateup_input,
@@ -188,9 +197,16 @@ def cutlass_w4a8_moe(
     intermediate_q = torch.empty(
         (m * topk, n), dtype=torch.float8_e4m3fn, device=device
     )
-    silu_mul_static_tensorwise_quant_for_cutlass_moe(
-        c1, intermediate_q, a2_scale.float(), expert_offsets[-1:], m * topk, n
-    )
+
+    if a2_scale is None:
+        a2_scale = torch.zeros(1, dtype=torch.float32, device=device)
+        silu_mul_dynamic_tensorwise_quant_for_cutlass_moe(
+            c1, intermediate_q, a2_scale, expert_offsets[-1:], m * topk, n
+        )
+    else:
+        silu_mul_static_tensorwise_quant_for_cutlass_moe(
+            c1, intermediate_q, a2_scale.float(), expert_offsets[-1:], m * topk, n
+        )
 
     cutlass_w4a8_moe_mm(
         c2,

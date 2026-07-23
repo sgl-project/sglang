@@ -8,6 +8,7 @@ Decoding stage for diffusion pipelines.
 import weakref
 
 import torch
+import torch.nn as nn
 
 from sglang.multimodal_gen.runtime.distributed import (
     get_decode_parallel_world_size,
@@ -34,6 +35,11 @@ from sglang.multimodal_gen.runtime.utils.precision import (
     autocast_enabled,
     resolve_precision,
     temporary_module_dtype,
+)
+from sglang.multimodal_gen.runtime.utils.torch_compile import (
+    ActiveTargetCompiledCallable,
+    build_torch_compile_kwargs,
+    resolve_torch_compile_mode,
 )
 
 logger = init_logger(__name__)
@@ -105,6 +111,7 @@ class DecodingStage(PipelineStage):
         self.vae: ParallelTiledVAE = vae
         self.pipeline = weakref.ref(pipeline) if pipeline else None
         self.component_name = component_name
+        self._compiled_vae_decode = ActiveTargetCompiledCallable()
 
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None
@@ -154,6 +161,32 @@ class DecodingStage(PipelineStage):
 
     def scale_and_shift(self, latents: torch.Tensor, server_args):
         return scale_and_shift_latents(latents, server_args, self.vae)
+
+    def _get_vae_decode_fn(self, vae, server_args: ServerArgs):
+        if not server_args.enable_torch_compile or not isinstance(vae, nn.Module):
+            return vae.decode
+
+        will_compile = (
+            self._compiled_vae_decode.target_id != id(vae)
+            or self._compiled_vae_decode.compiled_module is None
+        )
+        if current_platform.is_npu():
+            compile_kwargs = build_torch_compile_kwargs(mode=None)
+            if will_compile:
+                logger.info("Compiling VAE decode with torchair backend on NPU")
+        else:
+            mode = resolve_torch_compile_mode(
+                "SGLANG_VAE_TORCH_COMPILE_MODE",
+                "SGLANG_TORCH_COMPILE_MODE",
+                default="default",
+            )
+            compile_kwargs = build_torch_compile_kwargs(mode=mode)
+            if will_compile:
+                logger.info("Compiling VAE decode with mode: %s", mode)
+
+        return self._compiled_vae_decode.get_or_compile(
+            vae, vae.decode, compile_kwargs=compile_kwargs
+        )
 
     @torch.no_grad()
     def decode(
@@ -209,7 +242,7 @@ class DecodingStage(PipelineStage):
             with temporary_module_dtype(
                 self.vae, vae_dtype, enabled=should_cast_vae
             ) as vae:
-                decode_output = vae.decode(latents)
+                decode_output = self._get_vae_decode_fn(vae, server_args)(latents)
                 image = _ensure_tensor_decode_output(decode_output)
 
         # De-normalize image to [0, 1] range

@@ -111,7 +111,7 @@ class TestStoreCache4D(unittest.TestCase):
         dtype: torch.dtype = torch.bfloat16,
         loc_dtype: torch.dtype = torch.int64,
     ):
-        from sglang.srt.mem_cache.triton_ops.cache_move import store_cache_4d
+        from sglang.kernels.ops.kvcache.cache_move import store_cache_4d
 
         # Two independent target buffers — one for the kernel, one for the
         # legacy reference path.
@@ -197,32 +197,7 @@ class TestStoreCache4D(unittest.TestCase):
 
     # ---- Test 4: int64 loc dtype (already exercised, explicit) ----
 
-    def test_store_cache_4d_int64_loc(self):
-        """The full-side path passes int64 loc (matches the v2p table
-        dtype)."""
-        self._check_parity(
-            num_pages=32,
-            page_size=1,
-            head_num=4,
-            head_dim=64,
-            v_head_dim=64,
-            N=10,
-            loc_dtype=torch.int64,
-        )
-
     # ---- Test 5: bf16 dtype (the production case) ----
-
-    def test_store_cache_4d_dtype_bf16(self):
-        """bf16 is the production K/V dtype for gpt-oss-20b, Falcon-H1."""
-        self._check_parity(
-            num_pages=16,
-            page_size=64,
-            head_num=4,
-            head_dim=128,
-            v_head_dim=128,
-            N=64,
-            dtype=torch.bfloat16,
-        )
 
     # ---- Test 6: fp8_e5m2 dtype ----
 
@@ -244,7 +219,7 @@ class TestStoreCache4D(unittest.TestCase):
     def test_store_cache_4d_empty_loc(self):
         """N=0 must be a no-op: no kernel launch, no exception, no buffer
         mutation."""
-        from sglang.srt.mem_cache.triton_ops.cache_move import store_cache_4d
+        from sglang.kernels.ops.kvcache.cache_move import store_cache_4d
 
         k_view = torch.zeros((8, 4, 4, 64), dtype=torch.bfloat16, device="cuda")
         v_view = torch.zeros((8, 4, 4, 64), dtype=torch.bfloat16, device="cuda")
@@ -284,7 +259,7 @@ class TestStoreCache4DAssertions(unittest.TestCase):
         """Wrapper requires `stride[-1] == 1` and `stride[-2] == head_dim`
         (the trailing two dims must be contiguous). A permutation that
         breaks this should trigger AssertionError."""
-        from sglang.srt.mem_cache.triton_ops.cache_move import store_cache_4d
+        from sglang.kernels.ops.kvcache.cache_move import store_cache_4d
 
         # Build a 4-D view, then permute the last two dims → trailing
         # contiguity violated.
@@ -303,7 +278,7 @@ class TestStoreCache4DAssertions(unittest.TestCase):
     def test_rejects_dtype_mismatch(self):
         """All four tensors must share a dtype; the caller is responsible
         for any cast before the call."""
-        from sglang.srt.mem_cache.triton_ops.cache_move import store_cache_4d
+        from sglang.kernels.ops.kvcache.cache_move import store_cache_4d
 
         k_view = torch.zeros((4, 4, 4, 64), dtype=torch.bfloat16, device="cuda")
         v_view = torch.zeros((4, 4, 4, 64), dtype=torch.bfloat16, device="cuda")

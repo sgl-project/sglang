@@ -35,7 +35,7 @@ HWBackend = _ci_register.HWBackend
 # pr-test-amd.yml / pr-test-npu.yml have their own dispatch.
 _TARGET_BACKENDS = {HWBackend.CUDA, HWBackend.CPU}
 
-# base-a is the critical-path entry gate; pin its fanout to smoke-coverage
+# base-a is the critical-path entry gate; pin its fanout to sanity-coverage
 # defaults instead of est_time. max_parallel = size (no throttle).
 _BASE_A_OVERRIDES = {
     "base-a-test-cpu": 8,
@@ -148,6 +148,11 @@ def compute_partitions(
         fit = fit_table.get(suite) or {}
         coeff = fit.get("coeff", 1.0)
         bias = fit.get("bias", 0.0)
+        # Defense in depth: a non-positive slope is regression noise (more
+        # work cannot reduce wall time), and its runaway intercept can push
+        # every shard budget negative. Fall back to the static estimate.
+        if coeff <= 0:
+            coeff, bias = 1.0, 0.0
 
         # Each shard pays `bias` once, so size >= coeff*total / (target-bias).
         if suite in _BASE_A_OVERRIDES:

@@ -25,13 +25,8 @@ void act_and_mul_kernel_impl(
       int64_t d;
 #pragma GCC unroll 4
       for (d = 0; d <= dim - kVecSize; d += kVecSize) {
-        bVec x_bvec = bVec::loadu(input_ptr + d);
-        fVec x_fvec0, x_fvec1;
-        std::tie(x_fvec0, x_fvec1) = at::vec::convert_to_float(x_bvec);
-
-        bVec y_bvec = bVec::loadu(input_other_ptr + d);
-        fVec y_fvec0, y_fvec1;
-        std::tie(y_fvec0, y_fvec1) = at::vec::convert_to_float(y_bvec);
+        auto [x_fvec0, x_fvec1] = load_float_vec2(input_ptr + d);
+        auto [y_fvec0, y_fvec1] = load_float_vec2(input_other_ptr + d);
 
         x_fvec0 = vf(x_fvec0);
         x_fvec1 = vf(x_fvec1);
@@ -39,8 +34,7 @@ void act_and_mul_kernel_impl(
         x_fvec0 = x_fvec0 * y_fvec0;
         x_fvec1 = x_fvec1 * y_fvec1;
 
-        x_bvec = convert_from_float_ext<scalar_t>(x_fvec0, x_fvec1);
-        x_bvec.store(output_ptr + d);
+        convert_from_float_ext<scalar_t>(x_fvec0, x_fvec1).store(output_ptr + d);
       }
 #pragma GCC unroll 4
       for (; d < dim; ++d) {
@@ -69,7 +63,6 @@ void fused_sigmoid_mul_kernel_impl(
   using fVec = at::vec::Vectorized<float>;
 
   constexpr int64_t kVecSize = bVec::size();
-  const fVec one = fVec(1.f);
   at::parallel_for(0, num_tokens, 0, [&](int64_t begin, int64_t end) {
     for (int64_t i = begin; i < end; ++i) {
       const scalar_t* __restrict__ i_ptr = input + i * dim;
@@ -86,8 +79,8 @@ void fused_sigmoid_mul_kernel_impl(
         for (; d <= head_dim - kVecSize; d += kVecSize) {
           auto [x_fvec0, x_fvec1] = load_float_vec2(attn_ptr + d);
           auto [g_fvec0, g_fvec1] = load_float_vec2(gate_ptr + d);
-          x_fvec0 = x_fvec0 / (one + g_fvec0.neg().exp_u20());
-          x_fvec1 = x_fvec1 / (one + g_fvec1.neg().exp_u20());
+          x_fvec0 = x_fvec0 * fast_sigmoid(g_fvec0);
+          x_fvec1 = x_fvec1 * fast_sigmoid(g_fvec1);
           convert_from_float_ext<scalar_t>(x_fvec0, x_fvec1).store(out_ptr + d);
         }
 #pragma GCC unroll 4
@@ -121,7 +114,7 @@ at::Tensor silu_and_mul_cpu(at::Tensor& input) {
         num_tokens,
         d,
         [](float x) { return x / (1.f + std::exp(-x)); },
-        [](Vec x) { return x / (Vec(1.f) + x.neg().exp_u20()); });
+        [](Vec x) { return fast_silu(x); });
   });
   return out;
 }

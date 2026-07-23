@@ -68,7 +68,7 @@ class TestUnifiedDeepSeekV4FlashHiCache(UnifiedRadixTreeTestMixin, CustomTestCas
             "--chunked-prefill-size",
             "8192",
             "--mem-fraction-static",
-            "0.9",
+            "0.92",
             "--disable-shared-experts-fusion",
             "--enable-hierarchical-cache",
             "--hicache-ratio",
@@ -112,7 +112,7 @@ class TestUnifiedDeepSeekV4FlashHiCache(UnifiedRadixTreeTestMixin, CustomTestCas
 class TestUnifiedDeepSeekV4FlashHiCachePageFirstDirect(
     TestUnifiedDeepSeekV4FlashHiCache
 ):
-    """DeepSeek V4 Flash HiCache layout smoke: page_first_direct + direct."""
+    """DeepSeek V4 Flash HiCache layout check: page_first_direct + direct."""
 
     hicache_io_backend = "kernel"
     hicache_mem_layout = "layer_first"
@@ -148,7 +148,7 @@ class TestUnifiedDeepSeekV4FlashHiCacheL3(AccuracyTwoPassMixin, CustomTestCase):
                 "--chunked-prefill-size",
                 "8192",
                 "--mem-fraction-static",
-                "0.9",
+                "0.92",
                 "--disable-shared-experts-fusion",
                 "--enable-hierarchical-cache",
                 "--hicache-ratio",

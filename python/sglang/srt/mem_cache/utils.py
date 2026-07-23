@@ -15,6 +15,30 @@
 
 from typing import Any, Callable, List, Optional, Tuple
 
+from sglang.kernels.ops.kvcache.mla_buffer import (
+    get_mla_kv_buffer_kernel as get_mla_kv_buffer_kernel,
+)
+from sglang.kernels.ops.kvcache.mla_buffer import (
+    get_mla_kv_buffer_triton as get_mla_kv_buffer_triton,
+)
+from sglang.kernels.ops.kvcache.mla_buffer import (
+    set_mla_kv_buffer_fp8_quant_kernel as set_mla_kv_buffer_fp8_quant_kernel,
+)
+from sglang.kernels.ops.kvcache.mla_buffer import (
+    set_mla_kv_buffer_kernel as set_mla_kv_buffer_kernel,
+)
+from sglang.kernels.ops.kvcache.mla_buffer import (
+    set_mla_kv_buffer_triton as set_mla_kv_buffer_triton,
+)
+from sglang.kernels.ops.kvcache.mla_buffer import (
+    set_mla_kv_buffer_triton_fp8_quant as set_mla_kv_buffer_triton_fp8_quant,
+)
+from sglang.kernels.ops.kvcache.mla_buffer import (
+    set_mla_kv_scale_buffer_kernel as set_mla_kv_scale_buffer_kernel,
+)
+from sglang.kernels.ops.kvcache.mla_buffer import (
+    set_mla_kv_scale_buffer_triton as set_mla_kv_scale_buffer_triton,
+)
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.cpp_utils.native_hash import get_native_hash
 from sglang.srt.mem_cache.evict_policy import (
@@ -26,30 +50,6 @@ from sglang.srt.mem_cache.evict_policy import (
     MRUStrategy,
     PriorityStrategy,
     SLRUStrategy,
-)
-from sglang.srt.mem_cache.triton_ops.mla_buffer import (
-    get_mla_kv_buffer_kernel as get_mla_kv_buffer_kernel,
-)
-from sglang.srt.mem_cache.triton_ops.mla_buffer import (
-    get_mla_kv_buffer_triton as get_mla_kv_buffer_triton,
-)
-from sglang.srt.mem_cache.triton_ops.mla_buffer import (
-    set_mla_kv_buffer_fp8_quant_kernel as set_mla_kv_buffer_fp8_quant_kernel,
-)
-from sglang.srt.mem_cache.triton_ops.mla_buffer import (
-    set_mla_kv_buffer_kernel as set_mla_kv_buffer_kernel,
-)
-from sglang.srt.mem_cache.triton_ops.mla_buffer import (
-    set_mla_kv_buffer_triton as set_mla_kv_buffer_triton,
-)
-from sglang.srt.mem_cache.triton_ops.mla_buffer import (
-    set_mla_kv_buffer_triton_fp8_quant as set_mla_kv_buffer_triton_fp8_quant,
-)
-from sglang.srt.mem_cache.triton_ops.mla_buffer import (
-    set_mla_kv_scale_buffer_kernel as set_mla_kv_scale_buffer_kernel,
-)
-from sglang.srt.mem_cache.triton_ops.mla_buffer import (
-    set_mla_kv_scale_buffer_triton as set_mla_kv_scale_buffer_triton,
 )
 
 _EVICTION_POLICY_FACTORIES: dict[str, Callable[[], EvictionStrategy]] = {

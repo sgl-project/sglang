@@ -16,6 +16,7 @@ def is_activation_quantization_format(format: str) -> bool:
         CompressionFormat.int_quantized.value,
         CompressionFormat.float_quantized.value,
         CompressionFormat.nvfp4_pack_quantized.value,
+        CompressionFormat.pack_quantized.value,
     ]
     return format in _ACTIVATION_QUANTIZATION_FORMATS
 
@@ -59,8 +60,8 @@ def should_ignore_layer(
             # If shard_idx=1+ confirm scheme matches prior shards.
             elif should_ignore_shard != should_ignore_layer:
                 raise ValueError(
-                    f"Found a different quantization schemes for "
-                    f"{shard_proj_names} in {layer_name}. vLLM "
+                    f"Found different quantization schemes for "
+                    f"{shard_proj_names} in {layer_name}. SGLang "
                     "requires all to use the same scheme."
                 )
 

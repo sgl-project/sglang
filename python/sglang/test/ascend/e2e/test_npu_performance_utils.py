@@ -15,11 +15,16 @@ from sglang.test.ascend.e2e.gen_dataset_fixed_len import (
     save_jsonl,
 )
 from sglang.test.ascend.e2e.test_npu_multi_node_utils import (
+    ACTIVE_TEST_CLASS,
+    CONFIGMAP_NAME,
+    NAMESPACE,
     SERVICE_PORT,
     check_role,
     launch_pd_mix_node,
     launch_pd_separation_node,
     launch_router,
+    query_configmap,
+    wait_for_prefill_decode_exit,
     wait_server_ready,
 )
 from sglang.test.test_utils import (
@@ -149,12 +154,18 @@ GLM_5_1_W4A8_MODEL_PATH = "/root/.cache/modelscope/hub/models/Eco-Tech/GLM-5.1-w
 MINIMAX_M2_5_W8A8_MODEL_PATH = (
     "/root/.cache/modelscope/hub/models/Eco-Tech/MiniMax-M2.5-w8a8-QuaRot"
 )
+MIMO_V2_FLASH_MODEL_PATH = (
+    "/root/.cache/modelscope/hub/models/iridiumine/MiMo-V2-Flash-W8A8"
+)
 MINIMAX_M2_5_EAGLE3_MODEL_PATH = (
     "/root/.cache/modelscope/hub/models/sgl-npu/MiniMax-M2.5-eagel-model-0318"
 )
 
 QWEN3_5_397B_W8A8_MODEL_PATH = (
     "/root/.cache/modelscope/hub/models/Eco-Tech/Qwen3.5-397B-A17B-w8a8-mtp"
+)
+DEEPSEEK_V4_FLASH_W8A8_MTP_MODEL_PATH = (
+    "/root/.cache/modelscope/hub/models/Eco-Tech/DeepSeek-V4-Flash-w8a8-mtp"
 )
 QWEN3_5_397B_W4A8_MODEL_PATH = (
     "/root/.cache/modelscope/hub/models/Eco-Tech/Qwen3.5-397B-A17B-w4a8-mtp"
@@ -338,6 +349,7 @@ def run_bench_serving(
     repeat_rate=None,
     temperature=None,
     top_p=None,
+    env=None,
 ):
     metrics_path = os.getenv("METRICS_DATA_FILE")
     result_file = (
@@ -449,7 +461,12 @@ def run_bench_serving(
     metrics = {"mean_ttft": None, "mean_tpot": None, "total_tps": None}
 
     process = subprocess.Popen(
-        cmd_args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
+        cmd_args,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        env=env,
     )
     try:
         # Read output line by line
@@ -883,6 +900,7 @@ class TestNpuPerformanceTestCaseBase(CustomTestCase):
 
     dp = None
     generation_kwargs = None
+    pop_sglang_is_in_ci_for_gsp = False
 
     @classmethod
     def setUpClass(cls):
@@ -961,7 +979,15 @@ class TestNpuPerformanceTestCaseBase(CustomTestCase):
                 "top_p": self.top_p,
             }
             logger.info(f"Starting benchmark with parameters: {bench_params}")
-            metrics = run_bench_serving(**bench_params)
+            if (
+                self.dataset_name == "generated-shared-prefix"
+                and self.pop_sglang_is_in_ci_for_gsp
+            ):
+                bench_env = os.environ.copy()
+                bench_env.pop("SGLANG_IS_IN_CI", None)
+            else:
+                bench_env = None
+            metrics = run_bench_serving(**bench_params, env=bench_env)
             assert_metrics(self, metrics)
 
 
@@ -993,6 +1019,7 @@ class TestNpuPerfMultiNodePdMixTestCaseBase(CustomTestCase):
 
     dp = None
     generation_kwargs = None
+    pop_sglang_is_in_ci_for_gsp = False
 
     @classmethod
     def setUpClass(cls):
@@ -1085,7 +1112,15 @@ class TestNpuPerfMultiNodePdMixTestCaseBase(CustomTestCase):
                 "top_p": self.top_p,
             }
             logger.info(f"Starting benchmark with parameters: {bench_params}")
-            metrics = run_bench_serving(**bench_params)
+            if (
+                self.dataset_name == "generated-shared-prefix"
+                and self.pop_sglang_is_in_ci_for_gsp
+            ):
+                bench_env = os.environ.copy()
+                bench_env.pop("SGLANG_IS_IN_CI", None)
+            else:
+                bench_env = None
+            metrics = run_bench_serving(**bench_params, env=bench_env)
             assert_metrics(self, metrics)
 
 
@@ -1117,6 +1152,7 @@ class TestNpuPerfMultiNodePdSepTestCaseBase(CustomTestCase):
 
     dp = None
     generation_kwargs = None
+    pop_sglang_is_in_ci_for_gsp = False
 
     @classmethod
     def setUpClass(cls):
@@ -1138,15 +1174,25 @@ class TestNpuPerfMultiNodePdSepTestCaseBase(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
+        logger.info("Start exec tearDownClass")
         if cls.process:
             try:
                 kill_process_tree(cls.process.pid)
+                for _ in range(60):
+                    if cls.process.poll() is not None:
+                        logger.info("Process fully exited")
+                        break
+                    time.sleep(1)
+                else:
+                    logger.warning("Process did NOT exit in time")
             except Exception as e:
                 logger.error(f"Error during tearDown: {e}")
+        logger.info("tearDownClass finished")
 
     @classmethod
     @check_role(allowed_roles=["router"])
     def start_router_server(cls):
+        wait_for_prefill_decode_exit(key=ACTIVE_TEST_CLASS, value=cls.__name__)
         logger.info(f"Starting router in thread...")
         sglang_thread = threading.Thread(target=launch_router, args=(cls.model_config,))
         sglang_thread.daemon = True
@@ -1170,6 +1216,13 @@ class TestNpuPerfMultiNodePdSepTestCaseBase(CustomTestCase):
 
         # Loop to check if the process is still running
         while True:
+            configmap = query_configmap(CONFIGMAP_NAME, NAMESPACE)
+            if configmap and configmap.data:
+                executing_class = configmap.data.get(ACTIVE_TEST_CLASS)
+                if executing_class and executing_class != cls.__name__:
+                    logger.info(f"Retrieved ConfigMap data: {configmap.data}")
+                    logger.info(f"[{cls.__name__}] exec completed, exiting waiter.")
+                    return
             if cls.process.poll() is None:
                 # Process is still running
                 time.sleep(30)
@@ -1226,5 +1279,13 @@ class TestNpuPerfMultiNodePdSepTestCaseBase(CustomTestCase):
                 "top_p": self.top_p,
             }
             logger.info(f"Starting benchmark with parameters: {bench_params}")
-            metrics = run_bench_serving(**bench_params)
+            if (
+                self.dataset_name == "generated-shared-prefix"
+                and self.pop_sglang_is_in_ci_for_gsp
+            ):
+                bench_env = os.environ.copy()
+                bench_env.pop("SGLANG_IS_IN_CI", None)
+            else:
+                bench_env = None
+            metrics = run_bench_serving(**bench_params, env=bench_env)
             assert_metrics(self, metrics)

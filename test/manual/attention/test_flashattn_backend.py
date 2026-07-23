@@ -222,15 +222,11 @@ class TestFlashAttentionBackend(CustomTestCase):
                 extend_prefix_lens=torch.tensor(
                     [prefix_len] * self.batch_size, device=self.device
                 ),
-                extend_prefix_lens_cpu=torch.tensor(
-                    [prefix_len] * self.batch_size, device="cpu"
-                ),
+                extend_prefix_lens_cpu=[prefix_len] * self.batch_size,
                 extend_seq_lens=torch.tensor(
                     [q_len] * self.batch_size, device=self.device
                 ),
-                extend_seq_lens_cpu=torch.tensor(
-                    [q_len] * self.batch_size, device="cpu"
-                ),
+                extend_seq_lens_cpu=[q_len] * self.batch_size,
             )
             if attn_cp_size > 1:
                 forward_batch.attn_cp_metadata = type(

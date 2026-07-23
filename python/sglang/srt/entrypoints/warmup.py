@@ -125,3 +125,37 @@ async def voice_chat(disaggregation_mode: str, tokenizer_manager: TokenizerManag
             generate_req_input.bootstrap_host = FAKE_BOOTSTRAP_HOST
 
         await tokenizer_manager.generate_request(generate_req_input, None).__anext__()
+
+
+@warmup("prefill_shapes")
+async def prefill_shapes(disaggregation_mode: str, tokenizer_manager: TokenizerManager):
+    """Warmup Triton kernels across a wide range of prefill seq_lens (up to 32K).
+
+    Uses power-of-2 sizes plus intermediate points to cover the shape space
+    that fused_moe, attention extend, and other Triton kernels may encounter.
+    """
+    page_size = 64
+    sizes = set()
+    base = 64
+    while base <= 32768:
+        sizes.add(base)
+        mid = base * 3 // 2
+        mid = (mid + page_size - 1) // page_size * page_size
+        if mid <= 32768:
+            sizes.add(mid)
+        base *= 2
+    sizes = sorted(sizes)
+
+    for size in tqdm.tqdm(sizes, desc="Warmup prefill shapes (up to 32K)"):
+        generate_req_input = GenerateReqInput(
+            input_ids=(np.random.randint(2**16, size=[size])).tolist(),
+            sampling_params={
+                "max_new_tokens": 1,
+                "temperature": 0.0,
+            },
+        )
+        if disaggregation_mode != "null":
+            generate_req_input.bootstrap_room = 0
+            generate_req_input.bootstrap_host = FAKE_BOOTSTRAP_HOST
+
+        await tokenizer_manager.generate_request(generate_req_input, None).__anext__()

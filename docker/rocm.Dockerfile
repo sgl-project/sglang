@@ -69,6 +69,11 @@ ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
 ENV AITER_COMMIT_DEFAULT="9127c94a18e4398e1eba91f6639e910f0994ad02"
 
+# Local source stage: with BRANCH_TYPE=local the build context is copied here and
+# used instead of git clone (mirrors docker/Dockerfile's local_src stage).
+FROM scratch AS local_src
+COPY . /src
+
 # ===============================
 # Chosen arch and args
 FROM ${GPU_ARCH}
@@ -81,6 +86,7 @@ ENV PYTORCH_ROCM_ARCH=gfx942;gfx950
 ARG SGL_REPO="https://github.com/sgl-project/sglang.git"
 ARG SGL_DEFAULT="main"
 ARG SGL_BRANCH=${SGL_DEFAULT}
+ARG BRANCH_TYPE=remote
 
 # Version override for setuptools_scm (used in nightly builds)
 ARG SETUPTOOLS_SCM_PRETEND_VERSION=""
@@ -110,7 +116,7 @@ ARG ENABLE_MORI=0
 ARG NIC_BACKEND=none
 
 ARG MORI_REPO="https://github.com/ROCm/mori.git"
-ARG MORI_COMMIT="bf99bdf18fc69887a346913ca01c315c2aa9bd4c"
+ARG MORI_COMMIT="f7e6ac6863c53821bc7afb91a578cc6ce38fcad0"
 
 # NIXL (upstream ai-dynamo/nixl) — KV transfer backend for prefill/decode disaggregation.
 # Built from source for ROCm; needs UCX built --with-rocm (built here from openucx).
@@ -282,16 +288,35 @@ RUN pip install IPython \
     && pip install torchao==0.9.0 \
     && pip install pybind11
 
+# Rust toolchain — needed by setuptools-rust to build the sglang-mm extension
+# (sglang.srt.multimodal._core) during the sglang pip install below, and later by
+# sgl-model-gateway. Must precede the sglang install.
+ENV PATH="/root/.cargo/bin:${PATH}"
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
+    && rustc --version && cargo --version
+ENV CARGO_BUILD_JOBS=4
+
 RUN pip uninstall -y sgl_kernel sglang
-RUN git clone ${SGL_REPO} \
-    && cd sglang \
-    && if [ "${SGL_BRANCH}" = ${SGL_DEFAULT} ]; then \
-         echo "Using ${SGL_DEFAULT}, default branch."; \
-         git checkout ${SGL_DEFAULT}; \
+
+# Obtain sglang source: copied from the build context (BRANCH_TYPE=local) or git clone.
+COPY --from=local_src /src /tmp/local_src
+RUN if [ "$BRANCH_TYPE" = "local" ]; then \
+         echo "Using local source (BRANCH_TYPE=local)."; \
+         cp -r /tmp/local_src sglang; \
        else \
-         echo "Using ${SGL_BRANCH} branch."; \
-         git checkout ${SGL_BRANCH}; \
+         git clone ${SGL_REPO} sglang \
+         && cd sglang \
+         && if [ "${SGL_BRANCH}" = ${SGL_DEFAULT} ]; then \
+              echo "Using ${SGL_DEFAULT}, default branch."; \
+              git checkout ${SGL_DEFAULT}; \
+            else \
+              echo "Using ${SGL_BRANCH} branch."; \
+              git checkout ${SGL_BRANCH}; \
+            fi \
+         && cd ..; \
        fi \
+    && rm -rf /tmp/local_src \
+    && cd sglang \
     && cd sgl-kernel \
     && rm -f pyproject.toml \
     && mv pyproject_rocm.toml pyproject.toml \
@@ -311,11 +336,7 @@ RUN find /sgl-workspace/sglang/python/sglang/srt/layers/quantization/configs/ \
          /sgl-workspace/sglang/python/sglang/srt/layers/moe/fused_moe_triton/configs/ \
          -type f -name '*MI300X*' | xargs -I {} sh -c 'vf_config=$(echo "$1" | sed "s/MI300X/MI300X_VF/"); cp "$1" "$vf_config"' -- {}
 
-# Install Rust toolchain for sgl-model-gateway
-ENV PATH="/root/.cargo/bin:${PATH}"
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
-    && rustc --version && cargo --version
-ENV CARGO_BUILD_JOBS=4
+# Rust toolchain already installed above (before the sglang install).
 
 # Build and install sgl-model-gateway
 RUN python3 -m pip install --no-cache-dir "maturin<1.14" \
@@ -357,8 +378,11 @@ RUN /bin/bash -lc 'set -euo pipefail; \
   cp -v /tmp/build-gtest/lib/*.a /usr/lib/x86_64-linux-gnu/ && \
   rm -rf /tmp/build-gtest; \
   \
-  # Keep setuptools < 80 (compat with base image)
-  "$VENV_PIP" install --upgrade "setuptools>=77.0.3,<80" wheel cmake ninja scikit-build-core && \
+  # Keep setuptools < 80 (compat with base image). Pin cmake to the last known-good
+  # 4.3.4: cmake 4.4's gtest_discover_tests breaks the (pinned) MoRI build with a
+  # JSON parse error. This image is rebuilt daily, so pin the exact version for
+  # reproducible builds rather than letting cmake drift.
+  "$VENV_PIP" install --upgrade "setuptools>=77.0.3,<80" wheel "cmake==4.3.4" ninja scikit-build-core && \
   "$VENV_PIP" cache purge || true; \
   \
   # Locate ROCm llvm-config; fallback to installing LLVM 18 if missing
@@ -621,6 +645,36 @@ RUN if [ "$BUILD_TRITON" = "1" ]; then \
      && pip install -e . \
      && if [ -d python/triton_kernels ]; then pip install -e python/triton_kernels --no-deps; fi; \
     fi
+
+# -----------------------
+# Hot patch: transformers dynamic_module_utils symlink bug (v5.12.1).
+# _compute_local_source_files_hash calls Path(...).resolve() on custom-code
+# module files, following the HF-cache snapshots/<hash>/x.py -> blobs/<blob>
+# symlink. trust_remote_code models whose custom code uses relative imports
+# (e.g. Kimi-K2.6's kimi_k25_vision_processing.py: `from .media_utils import`)
+# then crash with FileNotFoundError: .../blobs/<name>.py at processor init.
+# Mirrors upstream transformers PR #46618 (merged, not yet released): drop the
+# .resolve() on the module file and its relative-import sources so the snapshot
+# .py names (not the blob targets) are used. Self-skips once transformers ships
+# the fix; fails the build loudly if the pattern is present but unpatched.
+RUN python3 - <<'PY'
+import pathlib
+import transformers.dynamic_module_utils as m
+
+MARKS = ["Path(resolved_module_file).resolve()", "Path(source_file).resolve()"]
+path = pathlib.Path(m.__file__)
+src = path.read_text()
+if not any(mark in src for mark in MARKS):
+    print("transformers dynamic_module_utils already fixed; no patch needed")
+else:
+    patched = (
+        src.replace("Path(resolved_module_file).resolve()", "Path(resolved_module_file)")
+           .replace("Path(source_file).resolve()", "Path(source_file)")
+    )
+    assert patched != src, "FATAL: transformers symlink patch matched nothing"
+    path.write_text(patched)
+    print("patched transformers dynamic_module_utils.py (symlink hash fix)")
+PY
 
 # -----------------------
 # Performance environment variable.

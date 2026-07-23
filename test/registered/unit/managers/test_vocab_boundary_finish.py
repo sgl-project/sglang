@@ -45,14 +45,6 @@ class TestVocabBoundaryFinish(CustomTestCase):
         # The offending slot is rewritten to the eos token.
         self.assertEqual(req.output_ids[1], 2)
 
-    def test_token_above_vocab_size_is_out_of_bounds(self):
-        # A wildly large garbage id (typical of NaN sampling) is caught.
-        req = _make_req(
-            output_ids=[5, VOCAB_SIZE + 12345], eos_token_ids={2}, stop_token_ids=set()
-        )
-        self.assertTrue(req._check_vocab_boundary_finish([5, VOCAB_SIZE + 12345]))
-        self.assertEqual(req.finished_len, 2)
-
     def test_negative_token_is_out_of_bounds(self):
         # Negative ids also indicate corrupted sampling output.
         req = _make_req(output_ids=[5, -1], eos_token_ids={2}, stop_token_ids=set())

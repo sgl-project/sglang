@@ -102,15 +102,22 @@ def install_canary(
 
 def _patch_model_forward(*, model_runner: ModelRunner, manager: CanaryManager) -> None:
     def _with_canary_bracketing(original: Callable, *args: Any, **kwargs: Any) -> Any:
-        forward_batch = _extract_forward_batch(args, kwargs)
-        assert (
-            forward_batch is not None
-        ), "kv-canary: patched model.forward called without a ForwardBatch"
+        with manager.model_forward_bracket_scope() as should_bracket:
+            if not should_bracket:
+                # Nested model.forward calls share the active SingleForwardManager.
+                # Only the outermost call may run kv-canary pre/post ops; otherwise
+                # the phase checker sees a second pre-op before the first post-op.
+                return original(*args, **kwargs)
 
-        canary_pre_ops_output = manager.pre_ops_maybe_inside_graph(forward_batch)
-        output = original(*args, **kwargs)
-        manager.post_ops_maybe_inside_graph(forward_batch, canary_pre_ops_output)
-        return output
+            forward_batch = _extract_forward_batch(args, kwargs)
+            assert (
+                forward_batch is not None
+            ), "kv-canary: patched model.forward called without a ForwardBatch"
+
+            canary_pre_ops_output = manager.pre_ops_maybe_inside_graph(forward_batch)
+            output = original(*args, **kwargs)
+            manager.post_ops_maybe_inside_graph(forward_batch, canary_pre_ops_output)
+            return output
 
     wrap_method(model_runner.model, "forward", wrapper=_with_canary_bracketing)
 

@@ -11,8 +11,8 @@ _is_cuda = is_cuda()
 if _is_cuda:
     from sgl_kernel import moe_sum_reduce
 
-    from sglang.jit_kernel.activation import silu_and_mul
-    from sglang.jit_kernel.moe_wna16_marlin import moe_wna16_marlin_gemm
+    from sglang.kernels.ops.activation._jit_activation import silu_and_mul
+    from sglang.kernels.ops.moe.moe_wna16_marlin import moe_wna16_marlin_gemm
 
 
 def get_scalar_type(
@@ -204,7 +204,8 @@ def fused_marlin_moe(
         device=hidden_states.device,
         dtype=hidden_states.dtype,
     )
-    intermediate_cache13 = torch.empty(
+    # Marlin skips masked expert rows, so their shared cache must start at zero.
+    intermediate_cache13 = torch.zeros(
         (M * topk_ids.shape[1] * max(gemm1_n, K),),
         device=hidden_states.device,
         dtype=hidden_states.dtype,
