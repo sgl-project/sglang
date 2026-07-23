@@ -239,6 +239,28 @@ class StreamingSession(BasePrefixCache):
             return None
 
         req = params.req
+
+        # [NPU ascend workaround] Ascend's npu_fused_infer_attention_score_v2
+        # reads KV at page granularity. When prefix_len is not page-aligned,
+        # the kernel reads stale/uninitialized KV slots in the partial page
+        # tail, corrupting attention output. Floor-align prefix_len to
+        # page_size so block_tables only references fully-filled pages.
+        # When aligned prefix_len drops to 0 (context < page_size), release
+        # the slot's KV and fall back to radix cache (full prefill). Once
+        # context >= page_size, streaming session kicks in with page-aligned
+        # KV reuse.
+        if self.page_size > 1:
+            expected_prefix_len = min(slot.kv_committed_len, len(params.key))
+            aligned_prefix_len = (expected_prefix_len // self.page_size) * self.page_size
+            if aligned_prefix_len < slot.cache_protected_len or aligned_prefix_len == 0:
+                # Aligned length below protected prefix or zero: release
+                # the slot's KV resources to avoid leak, then return None
+                # so the caller falls back to radix cache (full prefill).
+                # req stays untouched (no req_pool_idx), so alloc_for_extend
+                # treats it as a new request.
+                self.release_session(req.session.session_id)
+                return None
+
         slot.restore_to_req(req)
 
         # token_ids = get_fill_ids()[:input_len-1] (1-token logit reserve
@@ -252,6 +274,12 @@ class StreamingSession(BasePrefixCache):
             f"streaming session prefix shrank: {prefix_len=} < "
             f"{slot.cache_protected_len=}"
         )
+
+        # Floor-align prefix_len to page boundary (NPU ascend workaround).
+        if self.page_size > 1:
+            prefix_len = (prefix_len // self.page_size) * self.page_size
+            req.kv_committed_len = min(req.kv_committed_len, prefix_len)
+            slot.kv_committed_len = min(slot.kv_committed_len, prefix_len)
 
         # Free orphaned tail: alloc_for_extend will overwrite
         # req_to_token[prefix_len:] with new indices. The range
