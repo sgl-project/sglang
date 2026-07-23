@@ -53,35 +53,11 @@ class ExpertDistributionMetrics:
 
 
 @dataclass
-class GathererTensorAddress:
+class TensorAddress:
     offset: int
     length: int
     shape: tuple
     dtype: torch.dtype
-
-
-@torch.jit.script
-def cast_tensor_to_int32(tensor: torch.Tensor) -> torch.Tensor:
-    if tensor.dtype == torch.int64:
-        x = tensor.to(torch.int64)
-        low = (x & 0xFFFFFFFF).to(torch.int32)
-        high = ((x >> 32) & 0xFFFFFFFF).to(torch.int32)
-        packed = torch.stack((low, high), dim=-1)
-        return packed.reshape(-1)
-    else:
-        return tensor.to(torch.int32, non_blocking=True)
-
-
-@torch.jit.script
-def cast_tensor_from_int32(
-    tensor: torch.Tensor, original_dtype: torch.dtype
-) -> torch.Tensor:
-    if original_dtype == torch.int64:
-        low = tensor[0::2].to(torch.int64) & 0xFFFFFFFF
-        high = tensor[1::2].to(torch.int64) & 0xFFFFFFFF
-        return low | (high << 32)
-    else:
-        return tensor.to(original_dtype, non_blocking=True)
 
 
 class ExpertRecorderBuffer:
@@ -90,51 +66,54 @@ class ExpertRecorderBuffer:
         buffer_size_mb: int,
         device: torch.device = torch.device("cpu"),
     ):
-        # buffer copy stream
-        self._log_stream = torch.cuda.Stream()
-        # clone done event to synchronize with the copy stream
-        self._log_ready = torch.cuda.Event()
-        # buffer to store the recorded tensors, using int32 as the universal
-        self._buffer = torch.zeros(
-            buffer_size_mb * 1024 * 1024 // torch.int32.itemsize,
-            dtype=torch.int32,
-            device=device,
-            pin_memory=True,
+        self._buffer_stream = torch.cuda.Stream()
+        self._buffer = torch.as_tensor(
+            torch.UntypedStorage(buffer_size_mb * 1024 * 1024, device=device),
+            dtype=torch.uint8,
         )
-        # pointer to the current write position in the buffer
+        if self._buffer.device.type == "cpu":
+            self._buffer = self._buffer.pin_memory()
+        # pointer to the current write position in the buffer (in bytes)
         self._write_ptr = 0
         # flag to indicate if the buffer is full
         # (i.e. no more records can be stored until reset)
         self._is_full = False
 
-    def store(self, tensor: torch.Tensor) -> GathererTensorAddress:
+    def store(self, tensor: torch.Tensor) -> Optional[TensorAddress]:
         assert tensor.is_cuda, "Input tensor must be on CUDA device"
 
         if self._is_full:
             return None
+        if tensor.numel() == 0:
+            return TensorAddress(
+                offset=self._write_ptr,
+                length=0,
+                shape=tuple(tensor.shape),
+                dtype=tensor.dtype,
+            )
 
-        # protective contiguous clone
-        t = tensor.clone(memory_format=torch.contiguous_format).view(-1)
-        t.record_stream(self._log_stream)  # keep tensor alive
+        # Ensure tensor is contiguous and in uint8 format for storage
+        t = (
+            tensor.clone(memory_format=torch.contiguous_format)
+            .view(-1)
+            .view(torch.uint8)
+        )
 
-        # make sure previous copy is done
-        self._log_ready.record(torch.cuda.current_stream())
+        # Keep tensor alive until buffer stream finishes
+        t.record_stream(self._buffer_stream)
+
+        # Ensure that the current stream waits for the buffer stream to finish
+        ready = torch.cuda.Event()
+        ready.record(torch.cuda.current_stream())
 
         # backup tensor to buffer asynchronously
-        with torch.cuda.stream(self._log_stream):
-            # report event
-            self._log_ready.wait(self._log_stream)
+        with torch.cuda.stream(self._buffer_stream):
+            ready.wait(self._buffer_stream)
 
-            # cast tensor if needed
-            if t.dtype != self._buffer.dtype:
-                t = cast_tensor_to_int32(t)
-
-            # compute dimensions
-            length = t.numel()
-
-            # compute buffer slice
+            # compute byte length and buffer slice
+            nbytes = t.numel()
             start = self._write_ptr
-            end = start + length
+            end = start + nbytes
 
             # buffer size check
             if end <= self._buffer.numel():
@@ -151,32 +130,44 @@ class ExpertRecorderBuffer:
             return None
 
         # return address and metadata needed for reconstruction
-        return GathererTensorAddress(
+        return TensorAddress(
             offset=start,
-            length=length,
+            length=nbytes,
             shape=tuple(tensor.shape),
             dtype=tensor.dtype,
         )
 
-    def get(self, address: GathererTensorAddress):
-        t = self._buffer[address.offset : address.offset + address.length]
-
-        # cast tensor if needed
-        if address.dtype != self._buffer.dtype:
-            t = cast_tensor_from_int32(t, address.dtype)
-
-        # Reshape to original dimensions
-        return t.reshape(address.shape).clone()
+    def get(self, address: TensorAddress, sync: bool = True) -> torch.Tensor:
+        if sync:
+            self.synchronize()
+        raw_bytes = self._buffer[address.offset : address.offset + address.length]
+        return raw_bytes.view(address.dtype).reshape(address.shape).clone()
 
     def synchronize(self):
-        self._log_stream.synchronize()
-
-    def is_full(self):
-        return self._is_full
+        self._buffer_stream.synchronize()
 
     def reset(self):
         self._write_ptr = 0
         self._is_full = False
+
+    @property
+    def is_full(self) -> bool:
+        return self._is_full
+
+    @property
+    def bytes_total(self) -> int:
+        """Total buffer capacity in bytes."""
+        return self._buffer.numel()
+
+    @property
+    def bytes_used(self) -> int:
+        """Bytes written since last reset."""
+        return self._write_ptr
+
+    @property
+    def usage_ratio(self) -> float:
+        """Fraction of buffer used (0.0 ~ 1.0)."""
+        return self._write_ptr / self._buffer.numel()
 
 
 def init_recorder_buffer(
@@ -1050,7 +1041,7 @@ class _BufferedDetailAccumulator(_UtilizationRateAccumulatorMixin):
         single_pass_data: Dict,
         outputs: Dict[str, Any],
     ):
-        if self._data.is_full():
+        if self._data.is_full:
             return  # drop potential broken records
 
         super().append(forward_pass_id, gatherer_key, single_pass_data, outputs)
@@ -1072,14 +1063,14 @@ class _BufferedDetailAccumulator(_UtilizationRateAccumulatorMixin):
     def dump(self, output_mode: _OutputMode):
         assert output_mode == "file"
 
-        # ensure all data is written to the buffer
+        # Ensure all data is written to the buffer
         self._data.synchronize()
 
         for record in self._records:
-            # convert all GathererTensorAddress in record to actual tensors
+            # De-reference TensorAddress to actual tensor data
             for k, v in record.items():
-                if isinstance(v, GathererTensorAddress):
-                    record[k] = self._data.get(v)
+                if isinstance(v, TensorAddress):
+                    record[k] = self._data.get(v, sync=False)
 
         output = dict(
             records=self._records,
