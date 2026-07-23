@@ -579,6 +579,10 @@ class SchedulerPPMixin:
             defaultdict(deque)
         )
 
+    def _pp_get_num_running_reqs(self: Scheduler) -> int:
+        """Return all decode sequences retained by PP microbatch slots."""
+        return sum(len(batch.reqs) for batch in self.running_mbs)
+
     def profile_and_init_predictor(self: Scheduler):
         """
         Profile prefill latency for dynamic chunk sizing.
