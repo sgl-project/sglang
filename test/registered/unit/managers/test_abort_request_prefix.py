@@ -360,9 +360,7 @@ class TestSchedulerDisaggPrefillAbort(CustomTestCase):
         bootstrapped.disagg_kv_sender.abort.assert_not_called()
 
     def test_abort_all_covers_prefill_queues(self):
-        sched = _make_prefill_scheduler(
-            bootstrap_rids=["A::1"], inflight_rids=["B::1"]
-        )
+        sched = _make_prefill_scheduler(bootstrap_rids=["A::1"], inflight_rids=["B::1"])
         Scheduler.abort_request(sched, AbortReq(abort_all=True))
 
         sched.disagg_prefill_bootstrap_queue.queue[
