@@ -252,12 +252,14 @@ impl Server {
 
     /// Pop the native MM result for `rid` (stored strictly before the request
     /// was pushed to the ingress ring). Returns
-    /// `(features_f32, grids, offsets, mrope_i64, mrope_delta)` or `None` when
-    /// the request took the Python path. The two numeric buffers are 1-D numpy
-    /// arrays that take **ownership** of the Rust vectors — no copy. This runs
-    /// on the scheduler loop (`RustServer.drain`, under the GIL) between
-    /// decode steps, so a memcpy here (tens of MB per image-heavy request)
-    /// would stall every running request's inter-token latency.
+    /// `(features_f32, grids, hashes, offsets, mrope_i64, mrope_delta)` or
+    /// `None` when the request took the Python path. The two numeric buffers
+    /// are 1-D numpy arrays that take **ownership** of the Rust vectors — no
+    /// copy — and `hashes` are the worker-precomputed per-image feature
+    /// hashes. This runs on the scheduler loop (`RustServer.drain`, under the
+    /// GIL) between decode steps, so any per-byte work here (memcpy, hashing —
+    /// tens of MB per image-heavy request) would stall every running
+    /// request's inter-token latency.
     fn take_native_mm<'py>(
         &self,
         py: Python<'py>,
@@ -265,6 +267,7 @@ impl Server {
     ) -> Option<(
         Bound<'py, numpy::PyArray1<f32>>,
         Vec<(u32, u32, u32)>,
+        Vec<u64>,
         Vec<(u32, u32)>,
         Bound<'py, numpy::PyArray1<i64>>,
         i64,
@@ -275,7 +278,14 @@ impl Server {
         let features = res.features.into_pyarray(py);
         let mrope = res.mrope.into_pyarray(py);
         let grids = res.grids.iter().map(|g| (g[0], g[1], g[2])).collect();
-        Some((features, grids, res.offsets, mrope, res.mrope_delta))
+        Some((
+            features,
+            grids,
+            res.hashes,
+            res.offsets,
+            mrope,
+            res.mrope_delta,
+        ))
     }
 
     /// Signal all threads to stop (best effort).

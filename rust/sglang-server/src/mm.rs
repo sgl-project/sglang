@@ -37,6 +37,9 @@ pub struct NativeMmResult {
     pub features: Vec<f32>,
     /// Per-image `[t, h, w]` patch grids.
     pub grids: Vec<[u32; 3]>,
+    /// Per-image feature hashes (`MultimodalDataItem.hash`), precomputed in
+    /// the worker so the scheduler's `set_pad_value` never hashes the buffer.
+    pub hashes: Vec<u64>,
     /// Per-image inclusive `(start, end)` token offsets in the expanded ids.
     pub offsets: Vec<(u32, u32)>,
     /// Flattened row-major `[3, input_len]` M-RoPE positions.

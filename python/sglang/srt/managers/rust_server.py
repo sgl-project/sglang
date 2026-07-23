@@ -216,10 +216,14 @@ class MmProcessorHost:
         scheduler's ``MultimodalProcessorOutput``. Only tensor wrapping happens
         here — all processing (load, resize, patchify, token expansion, M-RoPE)
         already ran in Rust. This runs on the scheduler loop, so it must stay
-        copy-free: the numpy arrays from ``take_native_mm`` own the Rust
-        buffers (zero copy) and ``torch.from_numpy`` only wraps them —
-        memcpying the pixel features here (tens of MB per image-heavy request)
-        measurably stalls every running request's inter-token latency."""
+        copy-free AND hash-free: the numpy arrays from ``take_native_mm`` own
+        the Rust buffers (zero copy), ``torch.from_numpy`` only wraps them,
+        and each item's ``hash`` is the worker-precomputed feature hash so the
+        scheduler's ``set_pad_value`` skips ``hash_feature`` (the Python
+        processor path precomputes it at process time the same way). Any
+        per-byte work here (memcpy, sha256 — tens of MB per image-heavy
+        request) measurably stalls every running request's inter-token
+        latency."""
         import torch
 
         from sglang.srt.managers.schedule_batch import (
@@ -228,19 +232,20 @@ class MmProcessorHost:
             MultimodalProcessorOutput,
         )
 
-        features_arr, grids, offsets, mrope_arr, mrope_delta = entry
+        features_arr, grids, hashes, offsets, mrope_arr, mrope_delta = entry
         native = self._native
         features = torch.from_numpy(
             features_arr.reshape(-1, native["feature_dim"])
         )
         items = []
         row = 0
-        for (t, h, w), offset in zip(grids, offsets):
+        for (t, h, w), item_hash, offset in zip(grids, hashes, offsets):
             n = t * h * w
             items.append(
                 MultimodalDataItem(
                     modality=Modality.IMAGE,
                     feature=features[row : row + n],
+                    hash=item_hash,
                     offsets=[tuple(offset)],
                     model_specific_data={
                         "image_grid_thw": torch.tensor([[t, h, w]], dtype=torch.long)

@@ -50,8 +50,13 @@ pub fn process(ctx: &NativeContext, req: &MmRequest) -> Outcome {
 fn try_process(ctx: &NativeContext, req: &MmRequest) -> Result<Vec<i32>, NativeErr> {
     let payload = parse_payload(&req.payload)?;
 
-    // Stage 1+2+3: fetch → decode → preprocess, parallel across images.
-    let processed: Vec<ProcessedImage> = common::pool().install(|| {
+    // Stage 1+2+3: fetch → decode → preprocess → feature hash, parallel
+    // across images. The hash is the scheduler's `MultimodalDataItem.hash`
+    // (pad values / embedding-cache keys, process-local): computing it here —
+    // GIL-free, before the request reaches the scheduler — mirrors the Python
+    // processor's precompute (`base_processor` sets it at process time) so
+    // `set_pad_value` never hashes tens of MB on the scheduler loop.
+    let processed: Vec<(ProcessedImage, u64)> = common::pool().install(|| {
         payload
             .images
             .par_iter()
@@ -64,10 +69,13 @@ fn try_process(ctx: &NativeContext, req: &MmRequest) -> Result<Vec<i32>, NativeE
                     ImgSrc::Bytes(b) => b.clone(),
                 };
                 let (rgb, h, w) = common::decode_rgb(&bytes).map_err(NativeErr::Failed)?;
-                ctx.pipeline
+                let img = ctx
+                    .pipeline
                     .processor
                     .process_image(&rgb, h, w)
-                    .map_err(NativeErr::Failed)
+                    .map_err(NativeErr::Failed)?;
+                let hash = common::sha256_u64(f32_bytes(&img.pixel_values));
+                Ok((img, hash))
             })
             .collect::<Result<Vec<_>, NativeErr>>()
     })?;
@@ -94,7 +102,7 @@ fn try_process(ctx: &NativeContext, req: &MmRequest) -> Result<Vec<i32>, NativeE
     // mismatch (exotic prompt style) falls back to the Python processor.
     let counts: Vec<usize> = processed
         .iter()
-        .map(|p| ctx.pipeline.processor.tokens_per_image(&p.grid_thw))
+        .map(|(p, _)| ctx.pipeline.processor.tokens_per_image(&p.grid_thw))
         .collect();
     let expanded = tokens::expand_placeholders(&ids, ctx.pipeline.image_token_id, &counts)
         .map_err(NativeErr::Fallback)?;
@@ -104,7 +112,7 @@ fn try_process(ctx: &NativeContext, req: &MmRequest) -> Result<Vec<i32>, NativeE
         .offsets
         .iter()
         .zip(&processed)
-        .map(|(&(start, end), p)| MropeItem {
+        .map(|(&(start, end), (p, _))| MropeItem {
             start,
             end,
             grid: p.grid_thw,
@@ -118,23 +126,33 @@ fn try_process(ctx: &NativeContext, req: &MmRequest) -> Result<Vec<i32>, NativeE
 
     // Stage 5: park the buffers for the drain-time adapter — strictly before
     // `MmEncoded`, so a drained request always finds its entry.
-    let mut features = Vec::with_capacity(processed.iter().map(|p| p.pixel_values.len()).sum());
+    let mut features =
+        Vec::with_capacity(processed.iter().map(|(p, _)| p.pixel_values.len()).sum());
     let mut grids = Vec::with_capacity(processed.len());
-    for p in processed {
+    let mut hashes = Vec::with_capacity(processed.len());
+    for (p, hash) in processed {
         features.extend_from_slice(&p.pixel_values);
         grids.push(p.grid_thw);
+        hashes.push(hash);
     }
     ctx.sidecar.lock().unwrap().insert(
         req.rid.clone(),
         NativeMmResult {
             features,
             grids,
+            hashes,
             offsets: expanded.offsets,
             mrope,
             mrope_delta,
         },
     );
     Ok(expanded.input_ids)
+}
+
+/// Reinterpret the pixel buffer as raw bytes for hashing (native endianness).
+fn f32_bytes(v: &[f32]) -> &[u8] {
+    // Safety: f32 is plain-old-data — no padding, alignment only decreases.
+    unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
 }
 
 /// One string- or bytes-typed image source (any other shape → fallback).
