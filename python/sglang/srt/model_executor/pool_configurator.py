@@ -171,66 +171,70 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             else kvc.server_args.max_total_tokens or kvc.model_config.context_len
         )
 
-        # EAGLE/STANDALONE: scale cell_size to account for draft model KV cache.
-        # Assumes draft and target share the same per-layer KV size (head_dim,
-        # num_kv_heads, dtype), which holds for EAGLE/MTP draft models that
-        # reuse the target architecture's attention config.
-        if (
-            kvc.spec_algorithm.is_eagle() or kvc.spec_algorithm.is_standalone()
-        ) and not kvc.is_draft_worker:
-            eagle_draft_num_layers = kvc.spec_aux_config.eagle_draft_num_layers
+        # Under pipeline parallelism the draft worker lives on a single PP rank
+        # (the last one); only that rank's target pool needs to reserve draft
+        # KV. Matches DSV4PoolConfigurator's (pp_size==1 or is_last_rank).
+        if kvc.ps.pp_size == 1 or kvc.pp_group.is_last_rank:
+            # EAGLE/STANDALONE: scale cell_size to account for draft model KV cache.
+            # Assumes draft and target share the same per-layer KV size (head_dim,
+            # num_kv_heads, dtype), which holds for EAGLE/MTP draft models that
+            # reuse the target architecture's attention config.
             if (
-                eagle_draft_num_layers is not None
-                and int(eagle_draft_num_layers) > 0
-                and int(num_layers) > 0
-            ):
-                draft_num_layers = int(eagle_draft_num_layers)
-                if is_deepseek_dsa(kvc.model_config.hf_config):
-                    target_indexer_size = self._compute_dsa_indexer_cell_size(
-                        kvc=kvc,
-                        num_layers=num_layers,
-                    )
-                    target_kv_size = self._cell_size - target_indexer_size
-                    from sglang.srt.layers.cp.utils import (
-                        get_glm_dsa_layer_split_effective_num_layers,
-                    )
+                kvc.spec_algorithm.is_eagle() or kvc.spec_algorithm.is_standalone()
+            ) and not kvc.is_draft_worker:
+                eagle_draft_num_layers = kvc.spec_aux_config.eagle_draft_num_layers
+                if (
+                    eagle_draft_num_layers is not None
+                    and int(eagle_draft_num_layers) > 0
+                    and int(num_layers) > 0
+                ):
+                    draft_num_layers = int(eagle_draft_num_layers)
+                    if is_deepseek_dsa(kvc.model_config.hf_config):
+                        target_indexer_size = self._compute_dsa_indexer_cell_size(
+                            kvc=kvc,
+                            num_layers=num_layers,
+                        )
+                        target_kv_size = self._cell_size - target_indexer_size
+                        from sglang.srt.layers.cp.utils import (
+                            get_glm_dsa_layer_split_effective_num_layers,
+                        )
 
-                    target_kv_num_layers = get_glm_dsa_layer_split_effective_num_layers(
-                        kvc, num_layers
-                    )
-                    draft_kv_size = int(
-                        target_kv_size * draft_num_layers / target_kv_num_layers
-                    )
-                    draft_indexer_size = self._compute_dsa_indexer_cell_size(
-                        kvc=kvc,
-                        num_layers=draft_num_layers,
-                        allocate_all_layers=True,
-                    )
-                    self._cell_size += draft_kv_size + draft_indexer_size
-                else:
-                    self._cell_size = int(
-                        self._cell_size * (1 + draft_num_layers / int(num_layers))
-                    )
+                        target_kv_num_layers = get_glm_dsa_layer_split_effective_num_layers(
+                            kvc, num_layers
+                        )
+                        draft_kv_size = int(
+                            target_kv_size * draft_num_layers / target_kv_num_layers
+                        )
+                        draft_indexer_size = self._compute_dsa_indexer_cell_size(
+                            kvc=kvc,
+                            num_layers=draft_num_layers,
+                            allocate_all_layers=True,
+                        )
+                        self._cell_size += draft_kv_size + draft_indexer_size
+                    else:
+                        self._cell_size = int(
+                            self._cell_size * (1 + draft_num_layers / int(num_layers))
+                        )
 
-        # DFLASH/DSPARK: scale cell_size to account for draft model KV cache
-        if kvc.spec_algorithm.is_dflash_family() and not kvc.is_draft_worker:
-            from sglang.srt.speculative.dflash_utils import (
-                scale_kv_cell_size_per_token_for_dflash,
-            )
-
-            draft_num_layers = kvc.spec_aux_config.dflash_draft_num_layers
-            if (
-                draft_num_layers is not None
-                and int(draft_num_layers) > 0
-                and int(num_layers) > 0
-            ):
-                self._cell_size = scale_kv_cell_size_per_token_for_dflash(
-                    target_cell_size_per_token=self._cell_size,
-                    target_num_layers=int(num_layers),
-                    draft_num_layers=int(draft_num_layers)
-                    * get_parallel().attn_dcp_size,
-                    draft_cell_size_per_token=_dflash_draft_cell_size(kvc) or None,
+            # DFLASH/DSPARK: scale cell_size to account for draft model KV cache
+            if kvc.spec_algorithm.is_dflash_family() and not kvc.is_draft_worker:
+                from sglang.srt.speculative.dflash_utils import (
+                    scale_kv_cell_size_per_token_for_dflash,
                 )
+
+                draft_num_layers = kvc.spec_aux_config.dflash_draft_num_layers
+                if (
+                    draft_num_layers is not None
+                    and int(draft_num_layers) > 0
+                    and int(num_layers) > 0
+                ):
+                    self._cell_size = scale_kv_cell_size_per_token_for_dflash(
+                        target_cell_size_per_token=self._cell_size,
+                        target_num_layers=int(num_layers),
+                        draft_num_layers=int(draft_num_layers)
+                        * get_parallel().attn_dcp_size,
+                        draft_cell_size_per_token=_dflash_draft_cell_size(kvc) or None,
+                    )
 
     def _compute_cell_size(self, kvc: KVCacheConfigurator, num_layers: int) -> int:
         """Compute per-token KV cache cost in bytes. Subclasses can override."""
@@ -778,11 +782,13 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             )
 
         self.bytes_per_full_token = self._get_bytes_per_full_token()
-        if self.is_speculative:
+        if self.is_speculative and (kvc.ps.pp_size == 1 or kvc.pp_group.is_last_rank):
             # Reserve memory for the speculative draft worker by inflating
             # per-token bytes by (target+draft)/target. Equivalent to dflash's
             # scale_kv_cell_size_per_token_for_dflash but applied to
             # bytes_per_full_token: tokens = avail / (bpft * (T+D)/T).
+            # Under pipeline parallelism, only the draft-host PP rank (the last one)
+            # needs this: the draft model's KV pool lives only there.
             draft_layers = 1
             target_layers = self.num_layers_total
             self.bytes_per_full_token *= (target_layers + draft_layers) / target_layers

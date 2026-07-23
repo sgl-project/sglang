@@ -60,6 +60,31 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 
+def get_draft_kv_pool(
+    *,
+    draft_worker: BaseTpWorker,
+    spec_algorithm: SpeculativeAlgorithm,
+    server_args: ServerArgs,
+):
+    """Return the draft token-to-KV pool for the current draft worker,
+    or None when no draft KV pool is available."""
+    if draft_worker is None or spec_algorithm.is_ngram():
+        return None
+
+    # Under PP the draft model only runs on its host PP rank (the last one);
+    # other ranks have no draft worker and thus no draft KV pool.
+    parallel = get_parallel()
+    if parallel.pp_size > 1 and parallel.pp_rank != parallel.pp_size - 1:
+        return None
+
+    # V2 workers nest the draft runner under `.draft_worker`.
+    if server_args.enable_multi_layer_eagle:
+        draft_runner = draft_worker.draft_worker.draft_runner_list[0]
+    else:
+        draft_runner = draft_worker.draft_worker.draft_runner
+    return draft_runner.token_to_kv_pool
+
+
 def maybe_register_hicache_draft(
     *,
     tree_cache,
