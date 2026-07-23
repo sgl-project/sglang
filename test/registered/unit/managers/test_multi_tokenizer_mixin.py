@@ -1,16 +1,22 @@
 import unittest
+from types import SimpleNamespace
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.managers.io_struct import BatchStrOutput
+from sglang.srt.managers.io_struct import (
+    BatchStrOutput,
+    BatchTokenizedEmbeddingReqInput,
+    BatchTokenizedGenerateReqInput,
+)
 from sglang.srt.managers.multi_tokenizer_mixin import (
     TokenizerWorker,
     _handle_output_by_index,
     get_tokenizer_worker_class,
 )
+from sglang.srt.managers.tokenizer_manager import stamp_http_worker_ipc
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -91,6 +97,31 @@ class TestMultiTokenizerMixin(unittest.TestCase):
             single_output.cached_tokens_details,
             [{"device": 1, "host": 3}],
         )
+
+    def test_stamp_http_worker_ipc_populates_tokenized_batch_metadata(self):
+        for batch_cls in (
+            BatchTokenizedGenerateReqInput,
+            BatchTokenizedEmbeddingReqInput,
+        ):
+            with self.subTest(batch_cls=batch_cls):
+                batch_req = batch_cls(
+                    batch=[
+                        SimpleNamespace(rid="rid-0", http_worker_ipc=None),
+                        SimpleNamespace(rid="rid-1", http_worker_ipc=None),
+                    ]
+                )
+
+                stamp_http_worker_ipc(batch_req, "ipc://tokenizer-0")
+
+                self.assertEqual(batch_req.rids, ["rid-0", "rid-1"])
+                self.assertEqual(
+                    batch_req.http_worker_ipcs,
+                    ["ipc://tokenizer-0", "ipc://tokenizer-0"],
+                )
+                self.assertEqual(
+                    [item.http_worker_ipc for item in batch_req.batch],
+                    ["ipc://tokenizer-0", "ipc://tokenizer-0"],
+                )
 
     def test_get_tokenizer_worker_class_uses_default(self):
         self.assertIs(get_tokenizer_worker_class(DefaultServerArgs()), TokenizerWorker)
