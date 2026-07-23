@@ -30,6 +30,7 @@ from sglang.srt.mem_cache.common import (
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     get_required_capture_hidden_mode,
+    get_server_return_hidden_states_mode,
 )
 from sglang.srt.runtime_context import get_server_args
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
@@ -218,7 +219,10 @@ class SchedulerBatchResultProcessor:
             self._validate_pp_skip_output_comm(batch, result)
 
             hidden_state_offset = 0
-            prefill_hidden_capture_mode = self._get_prefill_hidden_capture_mode(batch)
+            prefill_hidden_capture_mode = self._get_prefill_hidden_capture_mode(
+                batch,
+                self.server_args,
+            )
 
             # Check finish conditions
             logprob_pt = 0
@@ -271,11 +275,13 @@ class SchedulerBatchResultProcessor:
                         batch.return_hidden_states
                         and logits_output.hidden_states is not None
                     ):
+                        assert extend_input_len_per_req is not None
                         hidden_state_offset = self._append_prefill_hidden_states(
                             req=req,
                             logits_output=logits_output,
                             hidden_state_offset=hidden_state_offset,
                             capture_hidden_mode=prefill_hidden_capture_mode,
+                            extend_input_len=extend_input_len_per_req[i],
                         )
 
                     if req.grammar is not None:
@@ -483,12 +489,12 @@ class SchedulerBatchResultProcessor:
         logits_output: LogitsProcessorOutput,
         hidden_state_offset: int,
         capture_hidden_mode: CaptureHiddenMode,
+        extend_input_len: int,
     ) -> int:
         if capture_hidden_mode.is_full():
             req_hidden_states = logits_output.hidden_states[
                 hidden_state_offset : (
-                    hidden_state_offset := hidden_state_offset
-                    + len(req.origin_input_ids)
+                    hidden_state_offset := hidden_state_offset + extend_input_len
                 )
             ]
             if req.return_hidden_states is True:
@@ -507,9 +513,15 @@ class SchedulerBatchResultProcessor:
         return hidden_state_offset
 
     @staticmethod
-    def _get_prefill_hidden_capture_mode(batch: ScheduleBatch) -> CaptureHiddenMode:
+    def _get_prefill_hidden_capture_mode(
+        batch: ScheduleBatch,
+        server_args: ServerArgs,
+    ) -> CaptureHiddenMode:
         return get_required_capture_hidden_mode(
-            batch.return_hidden_states_mode,
+            max(
+                batch.return_hidden_states_mode,
+                get_server_return_hidden_states_mode(server_args),
+            ),
             batch.spec_info,
         )
 

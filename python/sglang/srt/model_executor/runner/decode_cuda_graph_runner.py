@@ -258,7 +258,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         # --- capture mode + tokens-per-bs ------------------------------
         self.capture_forward_mode = ForwardMode.DECODE
-        self.capture_hidden_mode = CaptureHiddenMode.NULL
+        self.capture_hidden_mode = self.return_hidden_states_mode
         # Static capture width.
         self.captured_req_width = model_runner.decode_num_tokens_per_req(
             num_draft_tokens=self.speculative_num_draft_tokens
@@ -303,10 +303,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 "tier); disable SGLANG_RAGGED_VERIFY_MODE or the conflicting "
                 "feature."
             )
-
-        # If returning hidden states is enabled, set initial capture hidden mode to full to avoid double-capture on startup
-        if self.enable_return_hidden_states:
-            self.capture_hidden_mode = CaptureHiddenMode.FULL
 
         # Attention backend
         self.max_bs = max(self.capture_bs)
@@ -606,8 +602,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             ),
         )
         capture_hidden_mode_matches = (
-            requested_capture_hidden_mode == CaptureHiddenMode.NULL
-            or requested_capture_hidden_mode == self.capture_hidden_mode
+            requested_capture_hidden_mode <= self.capture_hidden_mode
         )
 
         return (
@@ -1009,16 +1004,17 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     post_warmup_hook=post_warmup_hook,
                 )
 
-    def recapture_if_needed(self, forward_batch: ForwardBatch) -> None:
+    def _validate_capture_hidden_mode(self, forward_batch: ForwardBatch) -> None:
         required_capture_hidden_mode = get_required_capture_hidden_mode(
             forward_batch.capture_hidden_mode,
             forward_batch.spec_info,
         )
 
-        if self.capture_hidden_mode != required_capture_hidden_mode:
-            self.capture_hidden_mode = required_capture_hidden_mode
-            self.backend.cleanup()
-            self.capture()
+        if self.capture_hidden_mode < required_capture_hidden_mode:
+            raise RuntimeError(
+                "The runtime hidden-state mode exceeds the fixed CUDA graph "
+                f"capture mode ({self.capture_hidden_mode.name})."
+            )
 
     def load_batch(
         self,
@@ -1068,7 +1064,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             return
 
         buffers = self.buffers
-        self.recapture_if_needed(forward_batch)
+        self._validate_capture_hidden_mode(forward_batch)
 
         raw_bs = forward_batch.batch_size
 

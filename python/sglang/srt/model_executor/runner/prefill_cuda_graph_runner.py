@@ -197,16 +197,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             self.prefill_backend_name == Backend.BREAKABLE
             and model_runner.spec_algorithm.is_eagle()
         )
-        needs_full_hidden_states = (
-            model_runner.server_args.enable_return_hidden_states
-            or model_runner.spec_algorithm.is_dflash_family()
-        )
         if is_breakable_eagle and model_runner.is_draft_worker:
             self.capture_hidden_mode = CaptureHiddenMode.LAST
-        elif is_breakable_eagle or needs_full_hidden_states:
+        elif is_breakable_eagle or model_runner.spec_algorithm.is_dflash_family():
             self.capture_hidden_mode = CaptureHiddenMode.FULL
         else:
-            self.capture_hidden_mode = CaptureHiddenMode.NULL
+            self.capture_hidden_mode = self.return_hidden_states_mode
 
         self.mamba_track_enabled = self._is_mamba_track_enabled()
 
@@ -1224,20 +1220,21 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             "PPProxyTensors is not supported in PrefillCudaGraphRunner yet."
         )
 
-    def recapture_if_needed(self, forward_batch: ForwardBatch) -> None:
+    def _validate_capture_hidden_mode(self, forward_batch: ForwardBatch) -> None:
         required_capture_hidden_mode = get_required_capture_hidden_mode(
             forward_batch.capture_hidden_mode,
             forward_batch.spec_info,
         )
-        if self.capture_hidden_mode != required_capture_hidden_mode:
-            self.capture_hidden_mode = required_capture_hidden_mode
-            self.backend.cleanup()
-            self.capture()
+        if self.capture_hidden_mode < required_capture_hidden_mode:
+            raise RuntimeError(
+                "The runtime hidden-state mode exceeds the fixed CUDA graph "
+                f"capture mode ({self.capture_hidden_mode.name})."
+            )
 
     def execute(
         self, forward_batch: ForwardBatch, **kwargs
     ) -> Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]:
-        self.recapture_if_needed(forward_batch)
+        self._validate_capture_hidden_mode(forward_batch)
         with self.backend.replay_session():
             static_forward_batch = self.load_batch(forward_batch, **kwargs)
             static_num_tokens = len(static_forward_batch.input_ids)

@@ -32,7 +32,7 @@ import warnings
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
-from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
 
 import torch
 
@@ -216,6 +216,15 @@ class CaptureHiddenMode(IntEnum):
 
     def __lt__(self, other):
         return self.value < other.value
+
+
+def get_server_return_hidden_states_mode(server_args: Any) -> CaptureHiddenMode:
+    mode = getattr(server_args, "return_hidden_states_mode", None)
+    if mode == "last":
+        return CaptureHiddenMode.LAST
+    if mode == "full" or getattr(server_args, "enable_return_hidden_states", False):
+        return CaptureHiddenMode.FULL
+    return CaptureHiddenMode.NULL
 
 
 def get_required_capture_hidden_mode(
@@ -680,19 +689,21 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # init_new must not mutate the input ScheduleBatch; per-forward
         # overrides go through explicit keyword arguments.
 
-        # capture_hidden_mode=None means no override: derive from
-        # SB.return_hidden_states / spec_info.capture_hidden_mode.
+        # capture_hidden_mode=None means no override: capture the server's
+        # configured maximum so lower-mode requests can share one graph.
         if capture_hidden_mode is None:
-            if batch.return_hidden_states:
-                capture_hidden_mode = get_required_capture_hidden_mode(
+            request_capture_hidden_mode = (
+                CaptureHiddenMode.NULL
+                if model_runner.is_draft_worker
+                else max(
                     batch.return_hidden_states_mode,
-                    batch.spec_info,
+                    get_server_return_hidden_states_mode(model_runner.server_args),
                 )
-            else:
-                capture_hidden_mode = get_required_capture_hidden_mode(
-                    CaptureHiddenMode.NULL,
-                    batch.spec_info,
-                )
+            )
+            capture_hidden_mode = get_required_capture_hidden_mode(
+                request_capture_hidden_mode,
+                batch.spec_info,
+            )
 
         # extend-mode-only fields are None on decode/idle
         if batch.forward_mode.is_decode_or_idle():

@@ -155,6 +155,17 @@ def get_return_hidden_states_mode(
     )
 
 
+def get_request_return_hidden_states_mode(
+    return_hidden_states: Union[List[ReturnHiddenStatesMode], ReturnHiddenStatesMode],
+) -> CaptureHiddenMode:
+    if isinstance(return_hidden_states, list):
+        return max(
+            (get_return_hidden_states_mode(mode) for mode in return_hidden_states),
+            default=CaptureHiddenMode.NULL,
+        )
+    return get_return_hidden_states_mode(return_hidden_states)
+
+
 def get_batch_return_hidden_states_mode(reqs: List[Req]) -> CaptureHiddenMode:
     mode = CaptureHiddenMode.NULL
     for req in reqs:
@@ -165,12 +176,7 @@ def get_batch_return_hidden_states_mode(reqs: List[Req]) -> CaptureHiddenMode:
 def need_return_hidden_states(
     return_hidden_states: Union[List[ReturnHiddenStatesMode], ReturnHiddenStatesMode],
 ) -> bool:
-    if isinstance(return_hidden_states, list):
-        return any(
-            get_return_hidden_states_mode(mode).need_capture()
-            for mode in return_hidden_states
-        )
-    return get_return_hidden_states_mode(return_hidden_states).need_capture()
+    return get_request_return_hidden_states_mode(return_hidden_states).need_capture()
 
 
 @lru_cache(maxsize=1)
