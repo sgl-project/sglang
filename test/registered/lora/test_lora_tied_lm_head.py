@@ -55,7 +55,7 @@ register_cuda_ci(est_time=120, suite="nightly-1-gpu", nightly=True)
 register_xpu_ci(est_time=120, suite="stage-a-test-1-gpu-xpu")
 
 
-def _empty_device_cache():
+def empty_gpu_cache():
     """Device-agnostic cache release (cuda/xpu/...)."""
     module = torch.get_device_module(get_device())
     if hasattr(module, "empty_cache"):
@@ -132,7 +132,7 @@ def create_lora_adapter_with_lm_head(base_model_name: str, output_dir: str):
 
     # Clean up the model to free memory
     del peft_model, model
-    _empty_device_cache()
+    empty_gpu_cache()
 
 
 class TestLoRATiedLMHead(CustomTestCase):
@@ -183,7 +183,7 @@ class TestLoRATiedLMHead(CustomTestCase):
                 lora_paths=[self._adapter_dir] * len(prompts),
             )
 
-        _empty_device_cache()
+        empty_gpu_cache()
 
         # Run HuggingFace with LoRA (via PEFT)
         with HFRunner(

@@ -275,7 +275,7 @@ class TestAlignBlockSizeTorchSentinelBucket(_AlignBlockSizeSentinelBucketBase):
 
 
 @unittest.skipUnless(
-    is_cuda() and importlib.util.find_spec("tvm_ffi") is not None,
+    is_xpu() and importlib.util.find_spec("tvm_ffi") is not None,
     "_align_block_size_jit builds a CUDA JIT kernel via tvm_ffi.load_inline "
     "(requires a CUDA/nvcc install); it cannot run on non-CUDA platforms such "
     "as XPU. The torch variant (TestAlignBlockSizeTorchSentinelBucket) covers "
