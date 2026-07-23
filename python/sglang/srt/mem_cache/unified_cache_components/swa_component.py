@@ -148,14 +148,14 @@ class SWAComponent(TreeComponent):
         value_chunks: list[torch.Tensor],
         best_value_len: int,
     ) -> MatchResult:
-        swa_host_hit = self.prepare_load_back(result.best_match_node)
+        swa_host_hit = self.prepare_swa_load_back(result.best_match_node)
         if swa_host_hit > 0:
             return result._replace(
                 swa_host_hit_length=max(result.swa_host_hit_length, swa_host_hit)
             )
         return result
 
-    def prepare_load_back(self, node: UnifiedTreeNode) -> int:
+    def prepare_swa_load_back(self, node: UnifiedTreeNode) -> int:
         ct = self.component_type
         page_size = self.cache.page_size
         window_size = (

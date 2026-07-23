@@ -1677,7 +1677,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         swa = self.components.get(ComponentType.SWA)
         if swa is not None:
-            swa.prepare_load_back(best_match_node)
+            swa.prepare_swa_load_back(best_match_node)
         host_anchor_params = self.inc_host_lock_ref(best_match_node).to_dec_params()
         # Build KV transfer
         kv_xfer = self.components[BASE_COMPONENT_TYPE].build_hicache_transfers(
