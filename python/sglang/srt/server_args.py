@@ -1365,7 +1365,7 @@ class ServerArgs:
     ] = False
     enable_session_radix_cache: A[
         bool,
-        "Track per-session references on radix KV: eviction consumes unreferenced entries before referenced ones, and closing a session only dereferences its KV.",
+        "Track per-session references on UnifiedRadixCache KV: eviction consumes unreferenced entries before referenced ones, and closing a session only dereferences its KV.",
         NS("memory"),
     ] = False
 

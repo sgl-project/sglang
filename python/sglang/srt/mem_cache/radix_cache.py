@@ -46,8 +46,6 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.events import KVCacheEventMixin
-from sglang.srt.mem_cache.evict_policy import SessionAwareEvictionStrategy
-from sglang.srt.mem_cache.session_radix_cache import SessionRadixCacheMixin
 from sglang.srt.mem_cache.utils import (
     get_eviction_strategy,
     get_hash_str,
@@ -240,9 +238,6 @@ class TreeNode:
         # priority for priority-aware eviction
         self.priority = priority
 
-        # Used for RefAware session radix cache
-        self.session_ref = 0
-
         self.id = TreeNode.counter if id is None else id
         TreeNode.counter += 1
 
@@ -281,19 +276,13 @@ class TreeNode:
         return self.last_access_time < other.last_access_time
 
 
-class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
-    def _supports_session_radix_cache(self) -> bool:
-        return type(self) is RadixCache
-
+class RadixCache(KVCacheEventMixin, BasePrefixCache):
     def __init__(self, params: CacheInitParams):
         self.disable = params.disable
         self.req_to_token_pool = params.req_to_token_pool
         self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
         self.page_size = params.page_size
         self.enable_kv_cache_events = params.enable_kv_cache_events
-        self.enable_session_radix_cache = (
-            params.enable_session_radix_cache and self._supports_session_radix_cache()
-        )
         self.is_eagle = params.is_eagle
         self.disable_finished_insert = params.disable_finished_insert
         self.eviction_policy = params.eviction_policy.lower()
@@ -313,10 +302,6 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
             self.device = torch.device("cpu")
 
         self.eviction_strategy = get_eviction_strategy(self.eviction_policy)
-        if self.enable_session_radix_cache:
-            self.eviction_strategy = SessionAwareEvictionStrategy(
-                self.eviction_strategy
-            )
 
         self.evictable_leaves = set()
         self.reset()
@@ -352,7 +337,6 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         self.evictable_size_ = 0
         self.protected_size_ = 0
         self.evictable_leaves.clear()
-        self._reset_session_radix_state()
         self._empty_match_result = MatchResult(
             device_indices=torch.empty(
                 (0,),
@@ -480,13 +464,11 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
             result = self.insert(
                 InsertParams(key=radix_key, value=values, priority=priority)
             )
-            new_last_node = result.last_device_node
             # Free the duplicates that were already in the tree
             self.token_to_kv_pool_allocator.free(
                 kv_indices[req.cache_protected_len : result.prefix_len]
             )
         else:
-            new_last_node = req.last_node
             self.token_to_kv_pool_allocator.free(
                 kv_indices[req.cache_protected_len : key_len]
             )
@@ -497,7 +479,6 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         # Remove req slot release the cache lock
         if req.last_node is not None:
             self.dec_lock_ref(req.last_node)
-        req.last_node = new_last_node
 
     def cache_unfinished_req(self, req: Req, chunked=False):
         """Cache request when it is unfinished."""
@@ -611,7 +592,6 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
                 self.evictable_size_ -= len(node.key)
                 self.protected_size_ += len(node.key)
                 delta -= len(node.key)
-                self._session_on_lock(node)
             node.lock_ref += 1
             self._update_leaf_status(node)
             node = node.parent
@@ -629,7 +609,6 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
                 self.evictable_size_ += len(node.key)
                 self.protected_size_ -= len(node.key)
                 delta += len(node.key)
-                self._session_on_unlock(node)
             node.lock_ref -= 1
             self._update_leaf_status(node)
             if node.parent is None:
@@ -705,8 +684,6 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
             child.hash_value, split_len, self.page_size
         )
 
-        self._session_on_split(new_node, child)
-
         return new_node
 
     def _inc_hit_count(self, node: TreeNode, chunked: bool = False):
@@ -765,7 +742,6 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
             self._inc_hit_count(new_node, chunked)
             node.children[child_key] = new_node
             self.evictable_size_ += len(key)
-            self._account_new_evictable_node(new_node)
             self._update_leaf_status(node)
             self._update_leaf_status(new_node)
             # Hash will be computed lazily during event emission
@@ -796,7 +772,6 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         v = node.parent.children.pop(key, None)
         assert v == node, f"parent does not have child key, {key}"
 
-        self._session_on_delete_leaf(node)
         self.evictable_size_ -= len(node.key)
         if node in self.evictable_leaves:
             self.evictable_leaves.remove(node)

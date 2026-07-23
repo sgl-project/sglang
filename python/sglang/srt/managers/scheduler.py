@@ -962,8 +962,8 @@ class Scheduler(
 
         if not getattr(self.tree_cache, "enable_session_radix_cache", False):
             logger.warning(
-                "enable_session_radix_cache is set but tree_cache is %s, "
-                "session radix cache remains disabled.",
+                "enable_session_radix_cache requires UnifiedRadixCache, but "
+                "tree_cache is %s; session radix cache remains disabled.",
                 type(self.tree_cache).__name__,
             )
 
