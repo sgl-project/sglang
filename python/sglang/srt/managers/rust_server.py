@@ -30,10 +30,9 @@ from sglang.srt.utils.flatten import (
 from sglang.version import __version__
 
 if TYPE_CHECKING:
-    from sglang_server import Server
-
     from sglang.srt.managers.io_struct import BatchTokenIDOutput
     from sglang.srt.managers.scheduler import Scheduler
+    from sglang.srt.server._core import Server
 
 logger = logging.getLogger(__name__)
 
@@ -56,9 +55,7 @@ class RustServer:
         The caller gates this (``SGLANG_RUST_SERVER`` + rank 0); this always
         creates.
         """
-
-        # Lazy import: only required when the rust server is actually enabled.
-        from sglang_server import Server
+        from sglang.srt.server._core import Server
 
         # Force turn off HF tokenizers rayon's unpinned global thread pool.
         os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
