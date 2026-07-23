@@ -1,20 +1,20 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: minwm-spmatrix720p-b200-west-20260723-23
+  name: minwm-spmatrix720p-h200-west-20260723-24
   namespace: default
   labels:
-    app.kubernetes.io/name: minwm-spmatrix720p-b200-west-20260723-23
+    app.kubernetes.io/name: minwm-spmatrix720p-h200-west-20260723-24
     seedleap.ai/owner: chenshengdong
     seedleap.ai/purpose: minwm-sp-parity-perf
     seedleap.ai/task: minwm-realtime-parity
-    seedleap.ai/run-id: latest-ckpt-v20-spmatrix720p-attempt23-west-spot
+    seedleap.ai/run-id: latest-ckpt-v20-spmatrix720p-attempt24-west-h200-spot
   annotations:
     seedleap.ai/capacity-type: spot
     seedleap.ai/repo: seedleap/sglang
     seedleap.ai/branch: codex/minwm-realtime-api
-    seedleap.ai/commit: "64cb2b3b6fc4f3e2cef2be30154c79e4577c8e6e"
-    seedleap.ai/sglang-git-ref: "64cb2b3b6fc4f3e2cef2be30154c79e4577c8e6e"
+    seedleap.ai/commit: "b1596e4af0840cead6c801041a12bd5093575df1"
+    seedleap.ai/sglang-git-ref: "b1596e4af0840cead6c801041a12bd5093575df1"
     seedleap.ai/minwm-git-ref: "2efc6485f65e8fcab506665efde79bc41406385e"
     seedleap.ai/checkpoint-version-id: "wduScksw2f3yPErnG9lBioOuE2AToyAP"
     seedleap.ai/ttl: 24h
@@ -27,15 +27,15 @@ spec:
   template:
     metadata:
       labels:
-        app.kubernetes.io/name: minwm-spmatrix720p-b200-west-20260723-23
+        app.kubernetes.io/name: minwm-spmatrix720p-h200-west-20260723-24
         seedleap.ai/owner: chenshengdong
         seedleap.ai/purpose: minwm-sp-parity-perf
         seedleap.ai/task: minwm-realtime-parity
-        seedleap.ai/run-id: latest-ckpt-v20-spmatrix720p-attempt23-west-spot
+        seedleap.ai/run-id: latest-ckpt-v20-spmatrix720p-attempt24-west-h200-spot
       annotations:
         seedleap.ai/repo: seedleap/sglang
         seedleap.ai/branch: codex/minwm-realtime-api
-        seedleap.ai/commit: "64cb2b3b6fc4f3e2cef2be30154c79e4577c8e6e"
+        seedleap.ai/commit: "b1596e4af0840cead6c801041a12bd5093575df1"
     spec:
       restartPolicy: Never
       priorityClassName: wan22-debug-low
@@ -47,8 +47,8 @@ spec:
           effect: NoSchedule
       nodeSelector:
         eks.amazonaws.com/capacityType: SPOT
-        eks.amazonaws.com/nodegroup: minwm-spot-p6-b200-0703
-        node.kubernetes.io/instance-type: p6-b200.48xlarge
+        eks.amazonaws.com/nodegroup: minwm-spot-p5en-h200-sglang-0718
+        node.kubernetes.io/instance-type: p5en.48xlarge
         seedleap.ai/workload: wan22-ti2v
       containers:
         - name: benchmark
@@ -63,13 +63,13 @@ spec:
                   key: token
                   optional: true
             - name: SGLANG_GIT_REF
-              value: "64cb2b3b6fc4f3e2cef2be30154c79e4577c8e6e"
+              value: "b1596e4af0840cead6c801041a12bd5093575df1"
             - name: MINWM_GIT_REF
               value: "2efc6485f65e8fcab506665efde79bc41406385e"
             - name: MINWM_BENCHMARK_MODE
               value: spmatrix720p
             - name: MINWM_RUN_ID
-              value: latest-ckpt-v20-spmatrix720p-attempt23-west-spot
+              value: latest-ckpt-v20-spmatrix720p-attempt24-west-h200-spot
             - name: MINWM_SP_WARMUP_RUNS
               value: "1"
             - name: MINWM_STAGE_FROM_MOUNT
