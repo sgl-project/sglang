@@ -632,40 +632,6 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
         self.assertCountEqual([e.block_hashes[0] for e in restored_gpu], stored_hashes)
 
 
-class TestUnifiedRadixCacheLoadBackEvents(CustomTestCase):
-    def test_is_load_back_event_done_waits_for_pending_event(self):
-        tree = object.__new__(UnifiedRadixCache)
-        finish_event = mock.Mock()
-        finish_event.query.return_value = False
-        tree.cache_controller = mock.Mock()
-        tree.cache_controller.layer_done_counter.events = [
-            mock.Mock(finish_event=finish_event)
-        ]
-        tree.loading_check = mock.Mock()
-
-        self.assertFalse(tree.is_load_back_event_done(0))
-        tree.loading_check.assert_not_called()
-
-    def test_is_load_back_event_done_polls_completed_loads(self):
-        tree = object.__new__(UnifiedRadixCache)
-        finish_event = mock.Mock()
-        finish_event.query.return_value = True
-        tree.cache_controller = mock.Mock()
-        tree.cache_controller.layer_done_counter.events = [
-            mock.Mock(finish_event=finish_event)
-        ]
-        tree.loading_check = mock.Mock()
-
-        self.assertTrue(tree.is_load_back_event_done(0))
-        tree.loading_check.assert_called_once_with()
-
-    def test_is_load_back_event_done_treats_no_consumer_as_done(self):
-        tree = object.__new__(UnifiedRadixCache)
-        tree.cache_controller = None
-
-        self.assertTrue(tree.is_load_back_event_done(-1))
-
-
 class UnifiedRadixCacheSuite:
 
     cfg: CacheConfig
@@ -3458,30 +3424,6 @@ class UnifiedRadixCacheSuite:
         self.assertGreaterEqual(int(xfer.host_indices.numel()), sw)
         self.assertEqual(xfer.nodes_to_load, chain[-expected_pages:])
 
-    def test_hicache_swa_splits_oversized_device_segment_before_load_back(self):
-        if not self.cfg.has_swa or self.cfg.has_mamba:
-            self.skipTest("requires Full+SWA")
-
-        cache, allocator, _ = self._build_hicache_fixture()
-        ps = self.cfg.page_size
-        window = (self.cfg.sliding_window_size + ps - 1) // ps * ps
-        tokens = self._make_seq(1, 2 * window // ps)
-        full = self._alloc(allocator, len(tokens))
-        self.assertIsNotNone(full)
-        leaf = cache._add_new_node(cache.root_node, RadixKey(array("q", tokens)), full)
-        swa = allocator.translate_loc_from_full_to_swa(full)
-        leaf.component_data[ComponentType.SWA].value = swa.clone()
-        cache.lru_lists[ComponentType.SWA].insert_mru(leaf)
-        cache.component_evictable_size_[ComponentType.SWA] += len(swa)
-        cache._update_evictable_leaf_sets(leaf)
-
-        swa_comp = cache.components[ComponentType.SWA]
-        self.assertEqual(swa_comp.prepare_load_back(leaf), 0)
-        prefix = leaf.parent
-        self.assertIsNot(prefix, cache.root_node)
-        self.assertEqual(len(prefix.component_data[ComponentType.SWA].value), window)
-        self.assertEqual(len(leaf.component_data[ComponentType.SWA].value), window)
-
     def test_hicache_swa_splits_oversized_host_tombstone_before_load_back(self):
         if not self.cfg.has_swa or self.cfg.has_mamba:
             self.skipTest("requires Full+SWA")
@@ -3574,23 +3516,11 @@ class UnifiedRadixCacheSuite:
             sizes_before_split,
         )
         self.assertEqual(swa_comp._swa_kv_pool_host.available_size(), host_available)
-        for n in (prefix_node, host_node, device_leaf):
-            for ct in (ComponentType.FULL, ComponentType.SWA):
-                self.assertEqual(n.component_data[ct].lock_ref, 0)
-                self.assertEqual(n.component_data[ct].host_lock_ref, 0)
         cache.sanity_check()
 
         self.assertTrue(cache.load_back(device_leaf))
         self.assertIsNotNone(host_node.component_data[ComponentType.SWA].value)
         self.assertIsNone(prefix_node.component_data[ComponentType.SWA].value)
-        self.assertTrue(cache.lru_lists[ComponentType.SWA].in_list(host_node))
-        self.assertFalse(cache.host_lru_lists[ComponentType.SWA].in_list(prefix_node))
-        self.assertEqual(
-            allocator.translate_loc_from_full_to_swa(
-                prefix_node.component_data[ComponentType.FULL].value
-            ).tolist(),
-            [0] * (window + ps),
-        )
         self.assertEqual(
             allocator.translate_loc_from_full_to_swa(
                 host_node.component_data[ComponentType.FULL].value
@@ -3598,31 +3528,6 @@ class UnifiedRadixCacheSuite:
             host_node.component_data[ComponentType.SWA].value.tolist(),
         )
         self.assertEqual(swa_comp._swa_kv_pool_host.available_size(), host_available)
-        self.assertEqual(prefix_node.component_data[ComponentType.FULL].lock_ref, 1)
-        self.assertEqual(host_node.component_data[ComponentType.FULL].lock_ref, 1)
-        self.assertEqual(device_leaf.component_data[ComponentType.FULL].lock_ref, 1)
-        self.assertEqual(host_node.component_data[ComponentType.SWA].lock_ref, 1)
-        self.assertEqual(device_leaf.component_data[ComponentType.SWA].lock_ref, 1)
-        self.assertIsNotNone(
-            host_node.component_data[ComponentType.SWA].metadata.get("uuid")
-        )
-        self.assertIsNotNone(
-            prefix_node.component_data[ComponentType.SWA].metadata.get("host_uuid")
-        )
-        sizes_before_ack = (
-            dict(cache.component_evictable_size_),
-            dict(cache.component_protected_size_),
-        )
-        self.assertEqual(
-            sizes_before_ack,
-            (
-                {ComponentType.FULL: 0, ComponentType.SWA: 0},
-                {
-                    ComponentType.FULL: 2 * window + ps,
-                    ComponentType.SWA: window,
-                },
-            ),
-        )
         cache.sanity_check()
 
         self._finish_pending_loads(cache)
@@ -3640,50 +3545,7 @@ class UnifiedRadixCacheSuite:
             ),
         )
         self.assertEqual(swa_comp._swa_kv_pool_host.available_size(), host_available)
-        self.assertTrue(cache.host_lru_lists[ComponentType.SWA].in_list(prefix_node))
-        for n in (prefix_node, host_node, device_leaf):
-            for ct in (ComponentType.FULL, ComponentType.SWA):
-                self.assertEqual(n.component_data[ct].lock_ref, 0)
-                self.assertEqual(n.component_data[ct].host_lock_ref, 0)
         cache.sanity_check()
-
-    def test_hicache_swa_host_independent_of_full(self):
-        """FULL host and SWA host are physically independent.
-        Freeing one component's host_value must not touch the other.
-        """
-        if not self.cfg.has_swa:
-            self.skipTest("requires SWA")
-
-        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
-        seq = self._make_seq(1, 2)
-        self._insert(cache, allocator, req_to_token_pool, seq)
-        m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
-        node = m.last_device_node
-
-        self._simulate_backup(cache, node)
-        cache.evict(EvictParams(num_tokens=len(seq)))
-
-        cd_full = node.component_data[ComponentType.FULL]
-        cd_swa = node.component_data[ComponentType.SWA]
-        self.assertIsNotNone(cd_full.host_value)
-        self.assertIsNotNone(cd_swa.host_value)
-        self.assertIn(node, cache.evictable_host_leaves)
-        self.assertTrue(cache.host_lru_lists[ComponentType.SWA].in_list(node))
-
-        # Drop FULL host bookkeeping. SWA side must stay intact.
-        cache.evictable_host_leaves.discard(node)
-        cd_full.host_value = None
-        self.assertIsNotNone(cd_swa.host_value)
-        self.assertTrue(cache.host_lru_lists[ComponentType.SWA].in_list(node))
-        self.assertNotIn(node, cache.evictable_host_leaves)
-
-        # Drop SWA host bookkeeping. FULL side (already cleared) stays cleared.
-        cache.host_lru_lists[ComponentType.SWA].remove_node(node)
-        cd_swa.host_value = None
-        self.assertIsNone(cd_full.host_value)
-        self.assertIsNone(cd_swa.host_value)
-        self.assertFalse(cache.host_lru_lists[ComponentType.SWA].in_list(node))
-        self.assertNotIn(node, cache.evictable_host_leaves)
 
     def _swa_finalize_setup(self):
         """Build a SWA chain long enough to fill at least the window

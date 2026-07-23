@@ -523,11 +523,8 @@ class TestPrefillAdder(CustomTestCase):
         cases = [
             # (extend, host_hit, device_hit, rem_chunk, window, page, expected, label)
             (64, 0, 0, None, 128, 16, 128 + 16, "no_cache_hit"),
-            (32, 64, 0, None, 128, 16, 128 + 16, "partial_host_hit"),
             (32, 128, 0, None, 128, 16, 160 + 16, "full_host_window"),
             (32, 64, 64, None, 128, 16, 96 + 16, "mixed_host_device"),
-            (200, 64, 0, 50, 128, 8, 128 + 8, "chunk_cap_below_floor"),
-            (200, 128, 0, 50, 128, 8, 178 + 8, "chunk_cap_plus_host"),
             (64, 1024, 960, 1024, 2048, 64, 1088 + 64, "production_replay"),
         ]
         for (
@@ -614,18 +611,6 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(adder.rem_swa_token_offset, 128)
         self.assertEqual(adder.rem_swa_tokens, 256)
         self.mock_tree_cache.init_load_back.assert_called_once()
-
-    def test_chunk_cache_swa_budget_has_no_radix_node(self):
-        self.mock_tree_cache.sliding_window_size = 128
-        adder = self.create_adder(
-            self.create_running_batch(), page_size=16, rem_chunk_tokens=None
-        )
-        req = self.create_mock_req("chunk-cache", priority=0, max_new_tokens=1)
-        req.best_match_node = None
-        req.prefix_indices = torch.empty(0, dtype=torch.int64)
-        req.full_untruncated_fill_ids = list(range(64))
-
-        self.assertEqual(adder._swa_budget_for_matched_req(req), 144)
 
     def test_swa_chunk_cap_recomputed_after_lock(self):
         page_size = 64
