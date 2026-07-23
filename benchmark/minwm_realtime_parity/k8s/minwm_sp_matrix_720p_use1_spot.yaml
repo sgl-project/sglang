@@ -76,14 +76,14 @@ spec:
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: minwm-spmatrix720p-p6-use1-20260723-33
+  name: minwm-spmatrix720p-p6-use1-20260723-34
   namespace: default
   labels:
-    app.kubernetes.io/name: minwm-spmatrix720p-p6-use1-20260723-33
+    app.kubernetes.io/name: minwm-spmatrix720p-p6-use1-20260723-34
     seedleap.ai/owner: chenshengdong
     seedleap.ai/purpose: minwm-sp-parity-perf
     seedleap.ai/task: minwm-realtime-parity
-    seedleap.ai/run-id: latest-ckpt-v20-spmatrix720p-attempt33-use1-p6-spot
+    seedleap.ai/run-id: latest-ckpt-v20-spmatrix720p-attempt34-use1-p6-spot
   annotations:
     seedleap.ai/capacity-type: spot
     seedleap.ai/repo: seedleap/sglang
@@ -102,11 +102,11 @@ spec:
   template:
     metadata:
       labels:
-        app.kubernetes.io/name: minwm-spmatrix720p-p6-use1-20260723-33
+        app.kubernetes.io/name: minwm-spmatrix720p-p6-use1-20260723-34
         seedleap.ai/owner: chenshengdong
         seedleap.ai/purpose: minwm-sp-parity-perf
         seedleap.ai/task: minwm-realtime-parity
-        seedleap.ai/run-id: latest-ckpt-v20-spmatrix720p-attempt33-use1-p6-spot
+        seedleap.ai/run-id: latest-ckpt-v20-spmatrix720p-attempt34-use1-p6-spot
       annotations:
         seedleap.ai/repo: seedleap/sglang
         seedleap.ai/branch: codex/minwm-realtime-api
@@ -143,13 +143,13 @@ spec:
             - name: MINWM_BENCHMARK_MODE
               value: spmatrix720p
             - name: MINWM_RUN_ID
-              value: latest-ckpt-v20-spmatrix720p-attempt33-use1-p6-spot
+              value: latest-ckpt-v20-spmatrix720p-attempt34-use1-p6-spot
             - name: MINWM_SP_WARMUP_RUNS
               value: "1"
             - name: MINWM_SP_DEGREES
-              value: "2"
+              value: "1 2 4 8"
             - name: MINWM_CUDA_LAUNCH_BLOCKING
-              value: "1"
+              value: "0"
             - name: MINWM_STAGE_FROM_MOUNT
               value: "1"
             - name: MINWM_S3_MOUNT
