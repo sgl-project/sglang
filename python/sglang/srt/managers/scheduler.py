@@ -3751,9 +3751,6 @@ class Scheduler(
 
     def flush_cache(self, empty_cache: bool = True):
         """Flush memory pools (e.g., KV cache, Mamba cache) and optionally empty device allocator cache."""
-        # Only ignore waiting requests while genuinely paused — otherwise this would
-        # mask a caller bug that flushes without pausing first, e.g. during a
-        # memory-pressure retract_decode.
         if self.is_fully_idle(ignore_waiting=self._engine_paused):
             self.cur_batch = None
             self.last_batch = None
