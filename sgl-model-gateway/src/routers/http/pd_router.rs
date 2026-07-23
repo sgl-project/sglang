@@ -1126,8 +1126,7 @@ impl PDRouter {
     ) -> Response {
         use crate::core::AttachedBody;
 
-        let (tx, rx) =
-            tokio::sync::mpsc::unbounded_channel::<Result<bytes::Bytes, String>>();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<bytes::Bytes, String>>();
 
         // Uses select! to race stream.next() against tx.closed() so that
         // when the client disconnects the upstream HTTP connection is dropped
@@ -1237,8 +1236,7 @@ impl PDRouter {
     ) -> Response {
         use crate::core::AttachedBody;
 
-        let (tx, rx) =
-            tokio::sync::mpsc::unbounded_channel::<Result<bytes::Bytes, String>>();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<bytes::Bytes, String>>();
         let prefill_for_task = Arc::clone(&prefill);
         let decode_for_task = Arc::clone(&decode);
 
@@ -1272,7 +1270,22 @@ impl PDRouter {
             };
 
             let mut prefill_stream = prefill_response.bytes_stream();
-            while let Some(chunk_result) = prefill_stream.next().await {
+            let done_marker = b"data: [DONE]";
+            let mut pending = bytes::BytesMut::new();
+            loop {
+                let chunk_result = tokio::select! {
+                    chunk_result = prefill_stream.next() => chunk_result,
+                    _ = tx.closed() => {
+                        decode_task.abort();
+                        return;
+                    }
+                };
+                let Some(chunk_result) = chunk_result else {
+                    if !pending.is_empty() {
+                        let _ = tx.send(Ok(pending.freeze()));
+                    }
+                    break;
+                };
                 let chunk = match chunk_result {
                     Ok(chunk) => chunk,
                     Err(error) => {
@@ -1290,16 +1303,28 @@ impl PDRouter {
                 // Prefill is the first stream owner, but its [DONE] is only an
                 // ownership boundary. Keep any final data event and suppress
                 // that sentinel so Decode can continue the same client stream.
-                if let Some(done_pos) = memmem::find(&chunk, b"data: [DONE]") {
+                // Retain a marker-sized suffix because reqwest chunk boundaries
+                // are unrelated to SSE event boundaries.
+                pending.extend_from_slice(&chunk);
+                if let Some(done_pos) = memmem::find(&pending, done_marker) {
                     if done_pos > 0
-                        && tx.send(Ok(chunk.slice(..done_pos))).is_err()
+                        && tx
+                            .send(Ok(pending.split_to(done_pos).freeze()))
+                            .is_err()
                     {
                         decode_task.abort();
                         return;
                     }
                     break;
                 }
-                if tx.send(Ok(chunk)).is_err() {
+                let safe_len = pending
+                    .len()
+                    .saturating_sub(done_marker.len().saturating_sub(1));
+                if safe_len > 0
+                    && tx
+                        .send(Ok(pending.split_to(safe_len).freeze()))
+                        .is_err()
+                {
                     decode_task.abort();
                     return;
                 }
@@ -1338,7 +1363,14 @@ impl PDRouter {
             };
 
             let mut decode_stream = decode_response.bytes_stream();
-            while let Some(chunk_result) = decode_stream.next().await {
+            loop {
+                let chunk_result = tokio::select! {
+                    chunk_result = decode_stream.next() => chunk_result,
+                    _ = tx.closed() => return,
+                };
+                let Some(chunk_result) = chunk_result else {
+                    break;
+                };
                 match chunk_result {
                     Ok(chunk) => {
                         let done = memmem::find(&chunk, b"data: [DONE]").is_some();
