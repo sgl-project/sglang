@@ -7,6 +7,7 @@ service SglangService {
   // SGLang-native RPCs (typed proto)
   rpc TextGenerate(TextGenerateRequest) returns (stream TextGenerateResponse);
   rpc Generate(GenerateRequest) returns (stream GenerateResponse);
+  rpc TypedGenerate(GenerateRequest) returns (stream TypedGenerateResponse);
   rpc TextEmbed(TextEmbedRequest) returns (TextEmbedResponse);
   rpc Embed(EmbedRequest) returns (EmbedResponse);
   rpc Classify(ClassifyRequest) returns (ClassifyResponse);
@@ -65,8 +66,8 @@ message SamplingParams {
   repeated int32 stop_token_ids = 11;
   optional bool ignore_eos = 12;
   optional int32 n = 13;
-  reserved 14, 15;
-  reserved "json_schema", "regex";
+  optional string json_schema = 14 [deprecated = true];
+  optional string regex = 15 [deprecated = true];
   optional int64 seed = 16;
   optional GuidedDecoding guided_decoding = 17;
   optional bool require_reasoning = 18;
@@ -132,17 +133,21 @@ message GenerateRequest {
 }
 
 message GenerateResponse {
-  repeated int32 delta_output_ids = 1;
-  reserved 2, 3;
-  reserved "meta_info", "finished";
-  int32 choice_index = 4;
-  optional Logprobs logprobs = 5;
-  optional Usage usage = 6;
-  optional RoutedExpertMetadata routed_experts = 7;
-  google.protobuf.Struct engine_metadata = 8;
+  repeated int32 output_ids = 1;
+  map<string, string> meta_info = 2;
+  bool finished = 3;
+}
+
+message TypedGenerateResponse {
+  string request_id = 1;
+  int32 choice_index = 2;
+  repeated int32 delta_output_ids = 3;
+  optional Logprobs logprobs = 4;
+  optional Usage usage = 5;
+  google.protobuf.Struct engine_metadata = 6;
   oneof terminal {
-    GenerationFinish finish = 9;
-    GenerationError error = 10;
+    GenerationFinish finish = 7;
+    GenerationError error = 8;
   }
 }
 
@@ -169,12 +174,6 @@ message Usage {
   uint64 prompt_tokens = 1;
   uint64 completion_tokens = 2;
   uint64 cached_prompt_tokens = 3;
-}
-
-message RoutedExpertMetadata {
-  bytes packed_expert_ids = 1;
-  repeated int64 shape = 2;
-  int32 start_position = 3;
 }
 
 enum FinishReason {

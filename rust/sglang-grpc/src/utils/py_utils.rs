@@ -58,5 +58,17 @@ pub(crate) fn py_value_to_json_value(value: &Bound<'_, PyAny>) -> PyResult<serde
     }
 }
 
+pub(crate) fn py_value_to_json_string(value: &Bound<'_, PyAny>) -> PyResult<String> {
+    match value
+        .py()
+        .import("json")
+        .and_then(|json| json.call_method1("dumps", (value,)))
+        .and_then(|json_str| json_str.extract::<String>())
+    {
+        Ok(serialized) => Ok(serialized),
+        Err(_) => Ok(serde_json::Value::String(value.str()?.to_string()).to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests;

@@ -16,7 +16,6 @@ license = "Apache-2.0"
 # where needed).
 [workspace.dependencies]
 async-stream = "0.3"
-base64 = "0.22"
 bytes = "1"
 futures = "0.3"
 prost-types = "0.13"

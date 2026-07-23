@@ -17,6 +17,7 @@ fn regex_escape_literal(value: &str) -> String {
 }
 
 /// Convert proto SamplingParams to a serde_json map (used as Python dict via PyO3).
+#[allow(deprecated)]
 fn sampling_params_to_map(
     params: &Option<proto::SamplingParams>,
 ) -> Result<serde_json::Value, String> {
@@ -74,6 +75,11 @@ fn sampling_params_to_map(
                     serde_json::json!({"thinking_budget": max_thinking_tokens}),
                 );
             }
+            if p.guided_decoding.is_some() && (p.json_schema.is_some() || p.regex.is_some()) {
+                return Err(
+                    "legacy json_schema/regex cannot be combined with guided_decoding".into(),
+                );
+            }
             if let Some(guided) = p.guided_decoding.as_ref() {
                 use proto::guided_decoding::Constraint;
                 match guided.constraint.as_ref() {
@@ -109,6 +115,13 @@ fn sampling_params_to_map(
                     }
                     Some(_) => return Err("guided decoding constraint must not be empty".into()),
                     None => return Err("guided decoding constraint must be specified".into()),
+                }
+            } else {
+                if let Some(value) = p.json_schema.as_ref() {
+                    map.insert("json_schema".into(), serde_json::json!(value));
+                }
+                if let Some(value) = p.regex.as_ref() {
+                    map.insert("regex".into(), serde_json::json!(value));
                 }
             }
             Ok(serde_json::Value::Object(map))
@@ -341,6 +354,7 @@ pub(crate) fn build_classify_dict(
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
 
@@ -480,6 +494,43 @@ mod tests {
             let mapped = build_generate_dict("request", &request).unwrap();
             assert_eq!(mapped["sampling_params"][key], serde_json::json!(expected));
         }
+    }
+
+    #[test]
+    fn legacy_guided_decoding_fields_are_mapped_and_cannot_mix_with_new_contract() {
+        let legacy = proto::GenerateRequest {
+            sampling_params: Some(proto::SamplingParams {
+                json_schema: Some("{\"type\":\"string\"}".into()),
+                regex: Some("[a-z]+".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mapped = build_generate_dict("request", &legacy).unwrap();
+        assert_eq!(
+            mapped["sampling_params"]["json_schema"],
+            serde_json::json!("{\"type\":\"string\"}")
+        );
+        assert_eq!(
+            mapped["sampling_params"]["regex"],
+            serde_json::json!("[a-z]+")
+        );
+
+        let conflicting = proto::GenerateRequest {
+            sampling_params: Some(proto::SamplingParams {
+                regex: Some("[a-z]+".into()),
+                guided_decoding: Some(proto::GuidedDecoding {
+                    constraint: Some(proto::guided_decoding::Constraint::Regex("[0-9]+".into())),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(
+            build_generate_dict("request", &conflicting)
+                .unwrap_err()
+                .contains("cannot be combined")
+        );
     }
 
     #[test]
