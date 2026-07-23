@@ -775,6 +775,12 @@ class DeepseekV2MoE(nn.Module):
                 ):
                     # For compressed-tensors ptpc model, don't need to check the weight_block_size
                     pass
+                elif not hasattr(
+                    self.shared_experts.gate_up_proj.quant_method, "quant_config"
+                ):
+                    # PTPC per-tensor/per-token fp8 (e.g. w8a8_fp8 W8A8Fp8LinearMethod) has
+                    # no block-scaled weights: nothing to validate/store (block_size=None).
+                    self.shared_experts_weight_block_size = None
                 else:
                     assert (
                         self.shared_experts.gate_up_proj.quant_method.quant_config.weight_block_size
