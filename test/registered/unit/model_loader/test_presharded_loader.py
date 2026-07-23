@@ -9,6 +9,8 @@ import json
 import os
 import tempfile
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
@@ -434,6 +436,150 @@ class TestBuildDumpPlan(unittest.TestCase):
             ) as f:
                 f.write("{}")
             self.assertTrue(PreshardedModelLoader._presharded_ready(tmp))
+
+
+class TestStructuralSignature(unittest.TestCase):
+    """The structural signature is the long-term fix for the underlying
+    problem `moe_dense_tp_size` was an instance of: instead of hand-
+    enumerating every parallelism knob that might change a rank's tensor
+    shapes, hash the (name, shape, dtype) of every parameter in a
+    meta-device model skeleton built under the live parallel state. Any
+    future sharding knob that changes shapes is automatically caught
+    without touching `_build_subfolder_name`."""
+
+    def test_hash_is_deterministic(self):
+        sig_input = [("a.weight", (4, 4), "torch.float32")]
+        self.assertEqual(
+            PreshardedModelLoader._hash_structural_signature(sig_input),
+            PreshardedModelLoader._hash_structural_signature(list(sig_input)),
+        )
+
+    def test_hash_changes_with_shape(self):
+        a = [("a.weight", (4, 4), "torch.float32")]
+        b = [("a.weight", (4, 8), "torch.float32")]
+        self.assertNotEqual(
+            PreshardedModelLoader._hash_structural_signature(a),
+            PreshardedModelLoader._hash_structural_signature(b),
+        )
+
+    def test_hash_changes_with_dtype(self):
+        a = [("a.weight", (4, 4), "torch.float32")]
+        b = [("a.weight", (4, 4), "torch.float16")]
+        self.assertNotEqual(
+            PreshardedModelLoader._hash_structural_signature(a),
+            PreshardedModelLoader._hash_structural_signature(b),
+        )
+
+    def test_hash_changes_with_added_or_removed_tensor(self):
+        # Simulates a new sharding knob splitting one tensor into two (or
+        # adding a new per-rank buffer) -- the exact case manual flag
+        # enumeration would miss if nobody updates _build_subfolder_name.
+        a = [("a.weight", (4, 4), "torch.float32")]
+        b = [
+            ("a.weight", (4, 4), "torch.float32"),
+            ("a.extra_buf", (4,), "torch.float32"),
+        ]
+        self.assertNotEqual(
+            PreshardedModelLoader._hash_structural_signature(a),
+            PreshardedModelLoader._hash_structural_signature(b),
+        )
+
+    def test_hash_is_order_independent_given_presorted_input(self):
+        # _compute_structural_signature always sorts before hashing, so
+        # callers that pre-sort (as it does) get a stable hash regardless
+        # of the original state_dict iteration order.
+        a = [("a.weight", (4, 4), "torch.float32"), ("b.weight", (2,), "torch.int8")]
+        b = sorted(reversed(a))
+        self.assertEqual(
+            PreshardedModelLoader._hash_structural_signature(a),
+            PreshardedModelLoader._hash_structural_signature(sorted(b)),
+        )
+
+    def test_compute_structural_signature_returns_none_on_failure(self):
+        # No self.load_config (and no real model class behind
+        # SimpleNamespace) means _get_quantization_config / _initialize_model
+        # will raise; this must be swallowed and return None, never raise,
+        # since a model class that can't be built on meta device must not
+        # break the overall load.
+        loader = object.__new__(PreshardedModelLoader)
+        model_config = SimpleNamespace(quantization=None)
+        self.assertIsNone(loader._compute_structural_signature(model_config))
+
+    def test_compute_structural_signature_picks_up_meta_model_shapes(self):
+        # End-to-end on a tiny real nn.Module standing in for the model
+        # class, to prove the meta-device construction + hashing wiring
+        # actually reflects shapes that depend on the live parallel state
+        # (here simulated via a width captured at construction time).
+        import torch.nn as nn
+
+        class FakeModelLoader(PreshardedModelLoader):
+            def __init__(self, width):
+                self._width = width
+                self.load_config = SimpleNamespace()
+
+        def _initialize_model_stub(model_config, load_config, quant_config):
+            return nn.Linear(4, model_config.width, bias=False)
+
+        with mock.patch(
+            "sglang.srt.model_loader.loader._get_quantization_config",
+            return_value=None,
+        ), mock.patch(
+            "sglang.srt.model_loader.loader._initialize_model",
+            side_effect=_initialize_model_stub,
+        ), mock.patch(
+            "sglang.srt.model_loader.loader.set_default_torch_dtype",
+            return_value=mock.MagicMock(__enter__=mock.Mock(), __exit__=mock.Mock()),
+        ):
+            loader_narrow = FakeModelLoader(width=2)
+            loader_wide = FakeModelLoader(width=8)
+            model_config_narrow = SimpleNamespace(
+                quantization=None, dtype=torch.float32, width=2
+            )
+            model_config_wide = SimpleNamespace(
+                quantization=None, dtype=torch.float32, width=8
+            )
+            sig_narrow = loader_narrow._compute_structural_signature(
+                model_config_narrow
+            )
+            sig_wide = loader_wide._compute_structural_signature(model_config_wide)
+        self.assertIsNotNone(sig_narrow)
+        self.assertIsNotNone(sig_wide)
+        self.assertNotEqual(sig_narrow, sig_wide)
+
+    def test_meta_rope_cache_cleared_even_on_failure(self):
+        # If _initialize_model partially populates _ROPE_DICT with meta-device
+        # entries before raising, _compute_structural_signature must still
+        # clean them up (via finally), otherwise the real model init reuses
+        # the meta module and fails with "Cannot copy out of meta tensor".
+        import torch.nn as nn
+        from sglang.srt.layers.rotary_embedding.factory import _ROPE_DICT
+
+        # Plant a fake meta-device rotary module in the global cache.
+        fake_key = ("_test_meta_rope_cleanup_sentinel",)
+        fake_module = nn.Linear(4, 4)
+        with torch.device("meta"):
+            fake_module = nn.Linear(4, 4)
+        _ROPE_DICT[fake_key] = fake_module
+
+        loader = object.__new__(PreshardedModelLoader)
+        loader.load_config = SimpleNamespace()
+
+        with mock.patch(
+            "sglang.srt.model_loader.loader._get_quantization_config",
+            return_value=None,
+        ), mock.patch(
+            "sglang.srt.model_loader.loader._initialize_model",
+            side_effect=RuntimeError("simulated init failure"),
+        ), mock.patch(
+            "sglang.srt.model_loader.loader.set_default_torch_dtype",
+            return_value=mock.MagicMock(__enter__=mock.Mock(), __exit__=mock.Mock()),
+        ):
+            result = loader._compute_structural_signature(
+                SimpleNamespace(quantization=None, dtype=torch.float32)
+            )
+
+        self.assertIsNone(result)
+        self.assertNotIn(fake_key, _ROPE_DICT)
 
 
 if __name__ == "__main__":

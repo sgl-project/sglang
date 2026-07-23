@@ -1691,8 +1691,11 @@ class PreshardedModelLoader(DefaultModelLoader):
         model_config: ModelConfig,
         device_config: "DeviceConfig",
     ) -> nn.Module:
-        presharded_dir = self._presharded_dir(model_config)
-        if self._presharded_ready(presharded_dir):
+        shard_config = self._collect_shard_config(model_config)
+        presharded_dir = self._presharded_dir(model_config, shard_config)
+        if self._presharded_ready(presharded_dir) and self._shard_config_matches(
+            presharded_dir, shard_config
+        ):
             logger.info("Loading from presharded checkpoint at %s", presharded_dir)
             return self._load_from_presharded(
                 model_config, device_config, presharded_dir
@@ -1702,7 +1705,7 @@ class PreshardedModelLoader(DefaultModelLoader):
             presharded_dir,
         )
         return self._first_time_load_and_dump(
-            model_config, device_config, presharded_dir
+            model_config, device_config, presharded_dir, shard_config
         )
 
     @classmethod
@@ -1715,17 +1718,35 @@ class PreshardedModelLoader(DefaultModelLoader):
         last, after the final barrier in ``_dump_state_to_disk``."""
         return os.path.isfile(os.path.join(presharded_dir, cls.READY_FILENAME))
 
-    def _presharded_dir(self, model_config: ModelConfig) -> str:
+    def _presharded_dir(
+        self,
+        model_config: ModelConfig,
+        shard_config: Optional[Dict[str, Any]] = None,
+    ) -> str:
         if self._presharded_path_override is not None:
             return self._presharded_path_override
+        if shard_config is None:
+            shard_config = self._collect_shard_config(model_config)
         return os.path.join(
             model_config.model_path,
             self.DEFAULT_SUBDIR,
-            self._build_subfolder_name(model_config),
+            self._build_subfolder_name(shard_config),
         )
 
-    @staticmethod
-    def _build_subfolder_name(model_config: ModelConfig) -> str:
+    def _collect_shard_config(self, model_config: ModelConfig) -> Dict[str, Any]:
+        """Collect every dimension that affects per-rank tensor shapes or
+        content into a JSON-native dict. This dict is the cache key: it is
+        hashed into the subfolder name, and also persisted verbatim inside
+        checksum.json (``shard_config`` key) for debugging and load-time
+        verification.
+
+        Shape-affecting knobs are additionally covered by the structural
+        signature (a hash of every parameter's (name, shape, dtype) from a
+        meta-device model skeleton), so a future sharding knob missing from
+        this enumeration is still caught as long as it changes some tensor's
+        shape. Content-only knobs (e.g. EPLB fields, which change WHICH
+        logical expert lands in a physical slot without changing shapes)
+        must be enumerated here explicitly."""
         from sglang.srt.distributed import (
             get_moe_data_parallel_world_size,
             get_moe_expert_parallel_world_size,
@@ -1739,21 +1760,116 @@ class PreshardedModelLoader(DefaultModelLoader):
             except (AssertionError, AttributeError, RuntimeError):
                 return 1
 
-        tp = _safe(get_tensor_model_parallel_world_size)
-        dp = _safe(get_moe_data_parallel_world_size)
-        ep = _safe(get_moe_expert_parallel_world_size)
-        pp = _safe(get_pipeline_model_parallel_world_size)
+        server_args = get_global_server_args()
+        return {
+            "tp": _safe(get_tensor_model_parallel_world_size),
+            "dp": _safe(get_moe_data_parallel_world_size),
+            "ep": _safe(get_moe_expert_parallel_world_size),
+            "pp": _safe(get_pipeline_model_parallel_world_size),
+            "moe_dense_tp_size": getattr(server_args, "moe_dense_tp_size", None),
+            "quantization": model_config.quantization,
+            "model_dtype": str(getattr(model_config, "dtype", "unknown")),
+            "ep_num_redundant_experts": getattr(
+                server_args, "ep_num_redundant_experts", None
+            ),
+            "init_expert_location": getattr(
+                server_args, "init_expert_location", None
+            ),
+            "structural_signature": self._compute_structural_signature(model_config),
+        }
 
-        parts = [f"TP-{tp}"]
-        if dp > 1:
-            parts.append(f"DP-{dp}")
-        if ep > 1:
-            parts.append(f"EP-{ep}")
-        if pp > 1:
-            parts.append(f"PP-{pp}")
-        if model_config.quantization:
-            parts.append(f"dtype-{model_config.quantization}")
-        return "-".join(parts)
+    def _build_subfolder_name(self, shard_config: Dict[str, Any]) -> str:
+        """``TP-{tp}-sig-{hash16}``: TP stays human-readable (the dimension
+        people most often distinguish deployments by when browsing the cache
+        dir); every other field -- including the structural signature -- is
+        folded into one hash so the name never grows as new dimensions are
+        added. The full field values live in checksum.json for debugging."""
+        combined = hashlib.sha1(
+            json.dumps(shard_config, sort_keys=True).encode()
+        ).hexdigest()[:16]
+        return f"TP-{shard_config['tp']}-sig-{combined}"
+
+    def _shard_config_matches(
+        self, presharded_dir: str, shard_config: Dict[str, Any]
+    ) -> bool:
+        """Belt-and-braces check against hash collisions or key-derivation
+        bugs: compare the shard_config recorded in checksum.json at dump time
+        against the current one. A mismatch is treated as a cache miss (the
+        caller falls back to first-time load + re-dump)."""
+        try:
+            with open(os.path.join(presharded_dir, self.CHECKSUM_FILENAME)) as f:
+                stored = json.load(f).get("shard_config")
+        except (OSError, ValueError):
+            stored = None
+        # JSON round-trip the current config so both sides compare in the
+        # same representation (e.g. tuples vs lists).
+        current = json.loads(json.dumps(shard_config))
+        if stored == current:
+            return True
+        logger.warning(
+            "Presharded checkpoint at %s was dumped with a different shard "
+            "config than the current launch (stored=%s, current=%s). "
+            "Treating as a cache miss and re-dumping.",
+            presharded_dir,
+            stored,
+            current,
+        )
+        return False
+
+    def _compute_structural_signature(
+        self, model_config: ModelConfig
+    ) -> Optional[str]:
+        from sglang.srt.layers.rotary_embedding.factory import _ROPE_DICT
+
+        def _clear_meta_rope_cache() -> None:
+            # _ROPE_DICT keys do not include device; remove any entries whose
+            # parameters or buffers live on meta so the real model init does
+            # not reuse them and fail with "Cannot copy out of meta tensor".
+            meta_keys = [
+                k
+                for k, v in _ROPE_DICT.items()
+                if any(p.device.type == "meta" for p in v.parameters())
+                or any(b.device.type == "meta" for b in v.buffers())
+            ]
+            for k in meta_keys:
+                del _ROPE_DICT[k]
+
+        try:
+            quant_config = _get_quantization_config(model_config, self.load_config)
+            with set_default_torch_dtype(model_config.dtype):
+                with torch.device("meta"):
+                    meta_model = _initialize_model(
+                        model_config, self.load_config, quant_config
+                    )
+                state_dict = meta_model.state_dict()
+                sig_input = sorted(
+                    (name, tuple(t.shape), str(t.dtype))
+                    for name, t in state_dict.items()
+                )
+            del meta_model
+            return self._hash_structural_signature(sig_input)
+        except Exception as e:
+            logger.warning(
+                "Failed to build a structural signature for the presharded "
+                "cache key (model_class=%s); falling back to the manually "
+                "enumerated parallelism key only. This preserves existing "
+                "behavior, but only the explicitly enumerated key fields will "
+                "be protected -- sharding knobs not listed in "
+                "_collect_shard_config won't be caught automatically. "
+                "Error: %s",
+                getattr(getattr(model_config, "hf_config", None), "model_type", "unknown"),
+                e,
+            )
+            return None
+        finally:
+            _clear_meta_rope_cache()
+
+    @staticmethod
+    def _hash_structural_signature(
+        sig_input: List[Tuple[str, Tuple[int, ...], str]]
+    ) -> str:
+        h = hashlib.sha1(repr(sig_input).encode())
+        return h.hexdigest()[:16]
 
     @staticmethod
     def _world_rank_and_size() -> Tuple[int, int]:
@@ -1858,6 +1974,7 @@ class PreshardedModelLoader(DefaultModelLoader):
         model_config: ModelConfig,
         device_config: "DeviceConfig",
         presharded_dir: str,
+        shard_config: Dict[str, Any],
     ) -> nn.Module:
         # Capture state AFTER both ``model.load_weights`` (which for some
         # models internally calls ``post_load_weights`` and installs auxiliary
@@ -1883,7 +2000,7 @@ class PreshardedModelLoader(DefaultModelLoader):
 
             state_dict = ShardedStateLoader._filter_subtensors(model.state_dict())
             extras = self._collect_extra_tensors(model)
-            self._dump_state_to_disk(state_dict, extras, presharded_dir)
+            self._dump_state_to_disk(state_dict, extras, presharded_dir, shard_config)
             del state_dict
             del extras
             gc.collect()
@@ -1897,6 +2014,7 @@ class PreshardedModelLoader(DefaultModelLoader):
         state_dict: Dict[str, torch.Tensor],
         extras: Dict[str, torch.Tensor],
         presharded_dir: str,
+        shard_config: Dict[str, Any],
     ) -> None:
         rank, world_size = self._world_rank_and_size()
         tmp_dir = os.path.join(presharded_dir, self.TMP_SUBDIR)
@@ -1940,6 +2058,10 @@ class PreshardedModelLoader(DefaultModelLoader):
 
         if rank == 0:
             plan = self._build_dump_plan(world_size, tmp_dir, self._max_file_bytes)
+            # Record the full shard config alongside the plan: human-readable
+            # provenance for the hashed subfolder name, and the reference for
+            # load-time verification in _shard_config_matches.
+            plan["shard_config"] = shard_config
             with open(os.path.join(presharded_dir, self.CHECKSUM_FILENAME), "w") as f:
                 json.dump(plan, f, indent=2)
         self._world_barrier()
