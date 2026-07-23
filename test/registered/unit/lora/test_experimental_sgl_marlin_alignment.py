@@ -34,7 +34,7 @@ def _load_align_function():
     namespace = {
         "torch": torch,
         "jit_moe_align_block_size": sys.modules[
-            "sglang.jit_kernel.moe_align"
+            "sglang.kernels.ops.moe.moe_align"
         ].moe_align_block_size,
     }
     exec(compile(module, str(ALIGN_PATH), "exec"), namespace)
@@ -62,7 +62,7 @@ def test_experimental_alignment_geometry_and_empty_input(monkeypatch):
 
     monkeypatch.setitem(
         sys.modules,
-        "sglang.jit_kernel.moe_align",
+        "sglang.kernels.ops.moe.moe_align",
         types.SimpleNamespace(moe_align_block_size=fake_jit_align),
     )
     align = _load_align_function()
@@ -155,7 +155,7 @@ def _assert_shared_outer_merged_align_semantics(
 def test_multi_slot_shared_outer_merged_align_cuda_graph_parity(num_slots):
     """The fused hot path must replay with current multi-LoRA routing data."""
 
-    from sglang.jit_kernel.trtllm_lora_temp.moe_lora_merged_align import (
+    from sglang.kernels.ops.moe.trtllm_lora_temp.moe_lora_merged_align import (
         moe_lora_merged_align,
     )
 

@@ -200,7 +200,7 @@ class StandardDispatcher(BaseDispatcher):
                     )
 
         if self.local_expert_mapping is not None and not self.skip_local_expert_mapping:
-            if self.use_aiter_moe_runner:
+            if self.use_aiter_moe_runner and self.expert_mask_gpu is None:
                 self.expert_mask_gpu = (
                     (
                         (self.local_expert_mapping >= 0)
@@ -209,7 +209,7 @@ class StandardDispatcher(BaseDispatcher):
                     .to(torch.int32)
                     .to(device="cuda")
                 )
-            else:
+            elif not self.use_aiter_moe_runner:
                 if TopKOutputChecker.format_is_standard(topk_output):
                     topk_output = topk_output._replace(
                         topk_ids=self.local_expert_mapping[topk_output.topk_ids]
