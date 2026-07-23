@@ -107,9 +107,7 @@ class TestEncoderDecoderPageAlignment(CustomTestCase):
                 self.assertTrue(
                     torch.equal(
                         batch.out_cache_loc,
-                        torch.arange(
-                            reserve, reserve + decode_len, dtype=torch.int64
-                        ),
+                        torch.arange(reserve, reserve + decode_len, dtype=torch.int64),
                     )
                 )
                 self.assertEqual(len(batch.out_cache_loc), batch.extend_num_tokens)
@@ -212,7 +210,9 @@ class TestEncoderDecoderPageAlignment(CustomTestCase):
 
         expected = torch.cat(
             [
-                torch.arange(reserve, ext0, dtype=torch.int64),  # req0: reserve stripped
+                torch.arange(
+                    reserve, ext0, dtype=torch.int64
+                ),  # req0: reserve stripped
                 torch.arange(ext0, total, dtype=torch.int64),  # req1: untouched
             ]
         )
