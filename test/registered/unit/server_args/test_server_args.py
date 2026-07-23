@@ -1830,6 +1830,15 @@ class TestDeepseekV4MegaMoETokenBudget(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "required_per_rank=8192"):
             self._validate(args, 8191)
 
+    def test_pp_dynamic_chunking_skips_validation(self):
+        args = self._args(
+            chunked_prefill_size=8193,
+            pp_size=2,
+            enable_dynamic_chunking=True,
+        )
+
+        self._validate(args, 1)
+
     def test_requires_chunked_prefill(self):
         args = self._args(chunked_prefill_size=-1)
 

@@ -22,6 +22,9 @@ def validate_deepseek_v4_mega_moe_token_budget(
     if not mega_moe_enabled or server_args.disaggregation_mode == "decode":
         return
 
+    if server_args.pp_size > 1 and server_args.enable_dynamic_chunking:
+        return
+
     if (
         server_args.chunked_prefill_size is None
         or server_args.chunked_prefill_size <= 0
@@ -51,8 +54,7 @@ def validate_deepseek_v4_mega_moe_token_budget(
             server_args.chunked_prefill_size // token_partition_size
         )
     else:
-        # pure TP and PP with static chunking are handled here.
-        # PP with dynamic chunking hasn't been covered.
+        # Pure TP and PP with static chunking are handled here.
         token_partition_size = 1
         token_partition_name = "none"
         # global_num_tokens will ceil_align to attn_tp_size so the validation needs to do alignment as well
