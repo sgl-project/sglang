@@ -268,6 +268,8 @@ class KDAKernelDispatcher:
             cache_steps=cache_steps,
             retrieve_parent_token=retrieve_parent_token,
             lower_bound=lower_bound,
+            # Forward extras (e.g. the fused ring-write cache_ring/replayssm_*).
+            **kwargs,
         )
 
     def extend(
@@ -790,39 +792,21 @@ class KDAAttnBackend(MambaAttnBackendBase):
         # checkpoint, replacing the per-step intermediate_ssm. Dense verify only
         # (there is no intermediate_ssm fallback under replayssm); the compact/
         # ragged tier is refused at startup (see server_args).
+        # the ReplaySSM ring-write is fused into the verify kernel (CACHE_RING)
+        # -- it stores pre-norm k / raw v / in-kernel gate / beta per step from the
+        # values the recurrent kernel already holds, replacing the eager torch
+        # scatter. Dense verify only; ring_kwargs is empty otherwise (and for
+        # non-triton verify kernels, which never see replayssm).
         replayssm_rawv = getattr(mamba_cache_params, "replayssm_rawv", None)
+        ring_kwargs = {}
         if replayssm_rawv is not None and ragged_layout is None:
-            HVh, Kd, Vd = v.shape[2], k.shape[-1], v.shape[-1]
-            T = draft_token_num
-            # Under cuda graph the captured batch includes padding rows whose slot
-            # is PAD_SLOT_ID (-1); a raw index_put_ with -1 device-asserts (CUDA
-            # bounds-checks without wrapping). Clamp to slot 0 -- the reserved null
-            # slot (allocator hands out 1..size), never read by any real commit --
-            # so padding rows write harmlessly. Real slots (>=1) are unchanged.
-            slots = cache_indices[:batch_size].clamp(min=0).to(torch.long)
-            kk = k[0].reshape(batch_size, T, HVh, Kd)  # pre-norm k
-            vv = v[0].reshape(batch_size, T, HVh, Vd)
-            aa = a[0].reshape(batch_size, T, HVh, Kd)
-            bb = b[0].reshape(batch_size, T, HVh)
-            a_log = layer.A_log.reshape(HVh)
-            dtb = layer.dt_bias.reshape(HVh, Kd)
-            # gate MUST match the verify kernel's two branches exactly
-            # (fused_sigmoid_gating_recurrent): safe gate when lower_bound is set
-            # (K3), plain softplus otherwise. A mismatch silently commits the
-            # wrong state.
-            x = aa.float() + dtb.reshape(1, 1, HVh, Kd)
-            exp_a_log = torch.exp(a_log).reshape(1, 1, HVh, 1)
-            if layer.lower_bound is not None:
-                gk = layer.lower_bound * torch.sigmoid(exp_a_log * x)
-            else:
-                gk = (-exp_a_log) * torch.nn.functional.softplus(x)
-            beta = torch.sigmoid(bb.float())
-            replayssm_rawv[slots, :, :T] = vv.transpose(1, 2).to(replayssm_rawv.dtype)
-            mamba_cache_params.replayssm_rawk[slots, :, :T] = kk.transpose(1, 2).to(
-                mamba_cache_params.replayssm_rawk.dtype
+            ring_kwargs = dict(
+                cache_ring=True,
+                replayssm_rawv=replayssm_rawv,
+                replayssm_rawk=mamba_cache_params.replayssm_rawk,
+                replayssm_g=mamba_cache_params.replayssm_g,
+                replayssm_beta=mamba_cache_params.replayssm_beta,
             )
-            mamba_cache_params.replayssm_g[slots, :, :T] = gk.transpose(1, 2)
-            mamba_cache_params.replayssm_beta[slots, :, :T] = beta.transpose(1, 2)
 
         core_attn_out = self.kernel_dispatcher.target_verify(
             A_log=layer.A_log,
@@ -840,6 +824,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             cache_steps=draft_token_num,
             retrieve_parent_token=retrieve_parent_token,
             lower_bound=layer.lower_bound,
+            **ring_kwargs,
         )
         if dense_token_indices is not None:
             # Kernel output is empty-allocated and the capped qsl skips the
