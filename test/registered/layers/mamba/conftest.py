@@ -1,7 +1,7 @@
 import pytest
 
-from sglang.srt.layers.attention.mamba.ops import ssu_dispatch
-from sglang.srt.layers.attention.mamba.ops.ssu_dispatch import (
+from sglang.kernels.ops.mamba.triton_ops import ssu_dispatch
+from sglang.kernels.ops.mamba.triton_ops.ssu_dispatch import (
     initialize_mamba_selective_state_update_backend,
 )
 from sglang.srt.server_args import ServerArgs
