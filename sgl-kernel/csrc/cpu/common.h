@@ -82,27 +82,6 @@ namespace {
     }                                                            \
   }()
 
-// dispatch: float, bfloat16, float16
-#define CPU_DISPATCH_FLOATING_TYPES(TYPE, NAME, ...)                      \
-  [&] {                                                                   \
-    switch (TYPE) {                                                       \
-      case at::ScalarType::Float: {                                       \
-        using scalar_t = float;                                           \
-        return __VA_ARGS__();                                             \
-      }                                                                   \
-      case at::ScalarType::BFloat16: {                                    \
-        using scalar_t = at::BFloat16;                                    \
-        return __VA_ARGS__();                                             \
-      }                                                                   \
-      case at::ScalarType::Half: {                                        \
-        using scalar_t = at::Half;                                        \
-        return __VA_ARGS__();                                             \
-      }                                                                   \
-      default:                                                            \
-        TORCH_CHECK(false, NAME, ": unsupported dtype ", toString(TYPE)); \
-    }                                                                     \
-  }()
-
 // Helper MICRO for CPU_DISPATCH_FLOATING_TYPES_EXT:
 //   TYPE1: the primary dtype (input, output, weight);
 //   TYPE2: defined as PARAM_T input
@@ -304,33 +283,6 @@ int inline adjust_num_threads(int m) {
     return actual_nth;
   }
   return std::max(1, (actual_nth >> 1) * 2);
-}
-
-// Like parallel_2d but with explicit nth_m × nth_n decomposition.
-// Caller is responsible for choosing nth_m and nth_n.
-template <typename func_t>
-inline void parallel_2d_tiled(int m, int n, int nth_m, int nth_n, const func_t& f) {
-  const int nth = nth_m * nth_n;
-#if defined(_OPENMP)
-#pragma omp parallel num_threads(nth)
-  {
-    int ith = omp_get_thread_num();
-    int ith_m = ith / nth_n;
-    int ith_n = ith % nth_n;
-
-    int thread_block_m = div_up(m, nth_m);
-    int thread_block_n = div_up(n, nth_n);
-
-    int begin_m = std::min(ith_m * thread_block_m, m);
-    int end_m = std::min(begin_m + thread_block_m, m);
-    int begin_n = std::min(ith_n * thread_block_n, n);
-    int end_n = std::min(begin_n + thread_block_n, n);
-
-    f(begin_m, end_m, begin_n, end_n);
-  }
-#else
-  f(0, m, 0, n);
-#endif
 }
 
 template <typename func_t>

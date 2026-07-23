@@ -545,11 +545,6 @@ void fused_experts_kernel_impl(
         for (int64_t m = 0; m < m_size; ++m) {
           silu_and_mul_stub(ic1 + (offset + m) * N + nb * BLOCK_N, C0 + m * BLOCK_N, C1 + m * BLOCK_N, BLOCK_N);
         }
-      } else if (act_func == CPUActMethod::clamped_silu_and_mul && use_brgemm) {
-        for (int64_t m = 0; m < m_size; ++m) {
-          clamped_silu_and_mul_stub(
-              ic1 + (offset + m) * N + nb * BLOCK_N, C0 + m * BLOCK_N, C1 + m * BLOCK_N, BLOCK_N, limit);
-        }
       } else if (act_func == CPUActMethod::swiglu) {
         for (int64_t m = 0; m < m_size; ++m) {
           scalar_t* __restrict__ ic1_row = ic1 + (offset + m) * N;
@@ -619,12 +614,12 @@ void fused_experts_kernel_impl(
             /* ldb   */ n_size,
             /* ldc   */ BLOCK_N);
       }
+
       if (with_bias) {
         for (int64_t m = 0; m < m_size; ++m) {
           add_bias_stub(C + m * BLOCK_N, B_bias, n_size);
         }
       }
-
       // 2.b copy from C to ic2 in original order
       //   and also mul topk_weights in float32
       for (int64_t m = 0; m < m_size; ++m) {
@@ -1060,7 +1055,7 @@ at::Tensor fused_experts_cpu(
       scalar_t* __restrict__ intermediate_cache0 = (scalar_t*)((void*)(C_tmp + num_threads * 2 * BLOCK_M * BLOCK_N));
       scalar_t* __restrict__ B_tmp = (scalar_t*)((void*)(intermediate_cache0 + M * topk * 2 * N));
       bool with_bias = w1_bias.has_value();
-      auto act_func = select_act_func(alpha, limit);
+      auto act_func = alpha.has_value() && limit.has_value() ? CPUActMethod::swiglu : CPUActMethod::silu_and_mul;
 
       CHECK_MOE_SCALES_FP8(1, 2);
       fused_experts_fp_kernel_impl<scalar_t, at::Float8_e4m3fn, float, false>(
@@ -1100,7 +1095,7 @@ at::Tensor fused_experts_cpu(
       scalar_t* __restrict__ intermediate_cache0 = (scalar_t*)((void*)(C_tmp + num_threads * 2 * BLOCK_M * BLOCK_N));
       scalar_t* __restrict__ B_tmp = (scalar_t*)((void*)(intermediate_cache0 + M * topk * 2 * N));
       bool with_bias = w1_bias.has_value();
-      auto act_func = select_act_func(alpha, limit);
+      auto act_func = alpha.has_value() && limit.has_value() ? CPUActMethod::swiglu : CPUActMethod::silu_and_mul;
 
       // mxfp4 supports only group size of 32 (2^5)
       constexpr int64_t group_size = 32;
@@ -1185,7 +1180,7 @@ at::Tensor fused_experts_cpu(
       scalar_t* __restrict__ A_tmp = intermediate_cache2 + M * topk * K;
       float* __restrict__ C_tmp = (float*)((void*)(A_tmp + num_threads * BLOCK_M * K));
       bool with_bias = w1_bias.has_value();
-      auto act_func = select_act_func(alpha, limit);
+      auto act_func = alpha.has_value() && limit.has_value() ? CPUActMethod::swiglu : CPUActMethod::silu_and_mul;
 
       fused_experts_kernel_impl<scalar_t>(
           out_hidden_states.data_ptr<scalar_t>(),
@@ -1232,12 +1227,9 @@ at::Tensor shared_expert_cpu(
     bool inplace,
     bool use_int8_w8a8,
     bool use_fp8_w8a16,
-    bool use_mxfp4,
     const std::optional<at::Tensor>& w1_scale,
     const std::optional<at::Tensor>& w2_scale,
     const std::optional<std::vector<int64_t>> block_size,
-    const std::optional<double>& alpha,
-    const std::optional<double>& limit,
     bool is_vnni) {
   auto packed_w1 = is_vnni ? w1 : convert_weight_packed(w1);
   auto packed_w2 = is_vnni ? w2 : convert_weight_packed(w2);
@@ -1268,8 +1260,8 @@ at::Tensor shared_expert_cpu(
   int64_t N = w1.size(0) / 2;
 
   // we use int32_t compensation for int8 w8a8
-  int64_t packed_K = use_mxfp4 ? get_row_size<uint8_t>(K) : get_row_size(K, use_int8_w8a8);
-  int64_t packed_N = use_mxfp4 ? get_row_size<uint8_t>(N) : get_row_size(N, use_int8_w8a8);
+  int64_t packed_K = get_row_size(K, use_int8_w8a8);
+  int64_t packed_N = get_row_size(N, use_int8_w8a8);
 
   // check weight shapes
   CHECK_EQ(w2.size(0), K);
@@ -1293,7 +1285,7 @@ at::Tensor shared_expert_cpu(
   //   3. Aq_tmp : [M, K] or [M, N]
   //   4. As_tmp : [M]
   //
-  // for fp8 w8a16 and mxfp4:
+  // for fp8 w8a16:
   //   5. intermediate_cache0 : [M, 2N]
   //   6. B_tmp: [T, MAX_CACHE_BLOCK_SIZE, BLOCK_M, max(K, N)]
   //
@@ -1303,7 +1295,7 @@ at::Tensor shared_expert_cpu(
   if (use_int8_w8a8) {
     buffer_size_nbytes += std::max(M * K, M * N) + M * sizeof(float);
   }
-  if (use_fp8_w8a16 || use_mxfp4) {
+  if (use_fp8_w8a16) {
     buffer_size_nbytes += M * 2 * N * 2 + num_threads * MAX_CACHE_BLOCK_SIZE * BLOCK_M * std::max(K, N) * 2;
   }
 
@@ -1340,10 +1332,9 @@ at::Tensor shared_expert_cpu(
     } else if (use_fp8_w8a16) {
       scalar_t* __restrict__ intermediate_cache0 = (scalar_t*)((void*)(C_tmp + num_threads * 2 * BLOCK_M * BLOCK_N));
       scalar_t* __restrict__ B_tmp = (scalar_t*)((void*)(intermediate_cache0 + M * 2 * N));
-      auto act_func = select_act_func(alpha, limit);
 
       CHECK_MOE_SCALES_FP8(0, 1);
-      shared_expert_fp_kernel_impl<scalar_t, at::Float8_e4m3fn, float, false>(
+      shared_expert_fp8_kernel_impl<scalar_t>(
           out_hidden_states.data_ptr<scalar_t>(),
           intermediate_cache0,
           intermediate_cache1,
@@ -1360,42 +1351,7 @@ at::Tensor shared_expert_cpu(
           routed_scaling_factor_value,
           M,
           N,
-          K,
-          alpha.has_value() ? float(alpha.value()) : 0,
-          limit.has_value() ? float(limit.value()) : 0,
-          act_func);
-    } else if (use_mxfp4) {
-      scalar_t* __restrict__ intermediate_cache0 = (scalar_t*)((void*)(C_tmp + num_threads * 2 * BLOCK_M * BLOCK_N));
-      scalar_t* __restrict__ B_tmp = (scalar_t*)((void*)(intermediate_cache0 + M * 2 * N));
-      auto act_func = select_act_func(alpha, limit);
-
-      // mxfp4 supports only group size of 32 (2^5)
-      constexpr int64_t group_size = 32;
-      auto w1s = w1_scale.value();
-      auto w2s = w2_scale.value();
-      TORCH_CHECK(w1s.numel(), 2 * N * K >> 5);
-      TORCH_CHECK(w2s.numel(), K * N >> 5);
-      shared_expert_fp_kernel_impl<scalar_t, uint8_t, uint8_t, true>(
-          out_hidden_states.data_ptr<scalar_t>(),
-          intermediate_cache0,
-          intermediate_cache1,
-          B_tmp,
-          C_tmp,
-          hidden_states.data_ptr<scalar_t>(),
-          packed_w1.data_ptr<uint8_t>(),
-          packed_w2.data_ptr<uint8_t>(),
-          w1s.data_ptr<uint8_t>(),
-          w2s.data_ptr<uint8_t>(),
-          /*block_size_N*/ 1,
-          /*block_size_K*/ group_size,
-          conditional_data_ptr<scalar_t>(fused_experts_out),
-          routed_scaling_factor_value,
-          M,
-          N,
-          K,
-          alpha.has_value() ? float(alpha.value()) : 0,
-          limit.has_value() ? float(limit.value()) : 0,
-          act_func);
+          K);
     } else {
       shared_expert_kernel_impl<scalar_t>(
           out_hidden_states.data_ptr<scalar_t>(),
