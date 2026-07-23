@@ -77,7 +77,7 @@ export const InternS2PreviewDeployment = () => {
     if (reasoning === 'enabled') flags.push('  --reasoning-parser qwen3');
     if (toolcall === 'enabled') flags.push('  --tool-call-parser qwen3_coder');
     if (mtp === 'enabled') {
-      flags.push('  --mamba-scheduler-strategy extra_buffer');
+      flags.push('  --mamba-radix-cache-strategy extra_buffer');
       flags.push("  --speculative-algo 'NEXTN'");
       flags.push('  --speculative-eagle-topk 1');
       flags.push('  --speculative-num-steps 3');

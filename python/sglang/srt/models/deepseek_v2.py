@@ -29,7 +29,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.jit_kernel.dsv4 import (
+from sglang.kernels.ops.attention.dsv4 import (
     silu_and_mul_clamp,
     silu_and_mul_contig_post_quant,
 )
@@ -77,6 +77,7 @@ from sglang.srt.layers.communicator_dsa_cp import (
     DSACPLayerCommunicator,
     maybe_prefetch_next_full_attention_kv,
 )
+from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.dcp.planner import (
     prepare_decode_context_parallel_metadata,
 )
@@ -179,10 +180,12 @@ from sglang.srt.models.deepseek_common.utils import (
     _use_aiter,
     _use_aiter_bpreshuffle_gfx95,
     _use_aiter_gfx95,
+    is_wint4afp8_or_wint4a16_config,
 )
 from sglang.srt.runtime_context import (
     get_flags,
     get_forward,
+    get_model,
     get_parallel,
     get_server_args,
 )
@@ -210,8 +213,8 @@ if _use_aiter:
     pass
 
 if _is_cuda:
-    from sglang.jit_kernel.dsv3_router_gemm import (
-        dsv3_router_gemm as _jit_dsv3_router_gemm,
+    from sglang.kernels.ops.gemm.dsv3_router_gemm import (
+        dsv3_router_gemm as dsv3_router_gemm,
     )
 elif _is_npu:
     from sglang.srt.hardware_backend.npu.modules.deepseek_v2_attention_mla_npu import (
@@ -225,7 +228,7 @@ elif _is_npu:
 else:
     pass
 
-from sglang.jit_kernel.fused_a_gemm import (
+from sglang.kernels.ops.gemm.fused_a_gemm import (
     fused_a_gemm_weight_eligible,
     linear_with_fused_a_gemm,
 )
@@ -458,14 +461,6 @@ class MoEGate(nn.Module):
                     "quark",
                 ):
                     correction_bias_dtype = torch.bfloat16
-                # NOTE(kpham-sgl): flashinfer trtllm routing requires a bf16
-                # routing_bias; an fp32 bias yields NaN routing on exact ties.
-                # Mirror the fp8 path's cast.
-                if (
-                    quant_config.get_name() == "modelopt_fp4"
-                    and get_moe_runner_backend().is_flashinfer_trtllm()
-                ):
-                    correction_bias_dtype = torch.bfloat16
             self.e_score_correction_bias = nn.Parameter(
                 torch.empty((config.n_routed_experts), dtype=correction_bias_dtype)
             )
@@ -503,7 +498,7 @@ class MoEGate(nn.Module):
             )
         ):
             if _is_cuda:
-                from sglang.jit_kernel.dsv4 import linear_bf16_fp32
+                from sglang.kernels.ops.attention.dsv4 import linear_bf16_fp32
 
                 return linear_bf16_fp32(hidden_states, self.weight)
             return F.linear(hidden_states, self.weight, None)
@@ -517,7 +512,7 @@ class MoEGate(nn.Module):
                 and (self.weight.shape[0] == 256 or self.weight.shape[0] == 384)
                 and _device_sm >= 90
             ):
-                logits = _jit_dsv3_router_gemm(
+                logits = dsv3_router_gemm(
                     hidden_states, self.weight, out_dtype=torch.float32
                 )
 
@@ -527,7 +522,7 @@ class MoEGate(nn.Module):
                 logits = F.linear(hidden_states, self.weight, None)
             else:
                 # cuBLAS bf16 x bf16 -> fp32 GEMM (torch.mm's out_dtype kwarg is CUDA-only)
-                from sglang.jit_kernel.dsv4 import linear_bf16_fp32
+                from sglang.kernels.ops.attention.dsv4 import linear_bf16_fp32
 
                 logits = linear_bf16_fp32(hidden_states, self.weight)
 
@@ -1603,7 +1598,7 @@ class DeepseekV2AttentionMLA(
         self.scaling = self.qk_head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
-        self.kv_cache_dtype = get_server_args().kv_cache_dtype
+        self.kv_cache_dtype = get_model().kv_cache_dtype
 
         # NOTE modification to rope_scaling must be done early enough, b/c e.g. Indexer needs it
         if rope_scaling:
@@ -2553,9 +2548,13 @@ class DeepseekV2Model(nn.Module):
             else None
         )
 
-        if dsa_use_prefill_cp(
-            forward_batch, self.dsa_enable_prefill_cp
-        ) or mla_use_prefill_cp(forward_batch, self.mla_enable_prefill_cp):
+        # CP-v2 shards/gathers at the eager-runner boundary instead.
+        use_cp_v1 = (
+            dsa_use_prefill_cp(forward_batch, self.dsa_enable_prefill_cp)
+            or mla_use_prefill_cp(forward_batch, self.mla_enable_prefill_cp)
+        ) and not is_cp_v2_active(forward_batch)
+
+        if use_cp_v1:
             if self.pp_group.is_first_rank:
                 hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
             positions = cp_split_and_rebuild_position(forward_batch, positions)
@@ -2658,10 +2657,7 @@ class DeepseekV2Model(nn.Module):
                 else:
                     hidden_states, _ = self.norm(hidden_states, residual)
 
-        if self.pp_group.is_last_rank and (
-            dsa_use_prefill_cp(forward_batch, self.dsa_enable_prefill_cp)
-            or mla_use_prefill_cp(forward_batch, self.mla_enable_prefill_cp)
-        ):
+        if self.pp_group.is_last_rank and use_cp_v1:
             # allgather + rerrange
             hidden_states = cp_all_gather_rerange_output(
                 hidden_states,
@@ -2808,8 +2804,8 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
                 "Only Deepseek V3/R1 on AMD-platform with capability >= gfx942(MI30x) "
                 "can use shared experts fusion optimization under expert parallelism."
             )
-        elif self.quant_config and self.quant_config.get_name() == "w4afp8":
-            disable_reason = "Deepseek V3/R1 W4AFP8 model uses different quant method for routed experts and shared experts."
+        elif is_wint4afp8_or_wint4a16_config(self.quant_config):
+            disable_reason = "Deepseek V3/R1 W4AFP8/W4A16 model uses different quant method for routed experts and shared experts."
 
         if disable_reason is not None:
             from sglang.srt.arg_groups.overrides import declare_load_time_override

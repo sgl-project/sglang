@@ -52,6 +52,8 @@ class EPLBManager:
             self._server_args.eplb_rebalance_layers_per_chunk
         )
         self._rebalance_num_iterations = self._server_args.eplb_rebalance_num_iterations
+        self._rebalance_disabled_reason = None
+        self._rebalance_disabled_logged = False
 
         # Otherwise, the circular buffer will contain stale data. If the case is needed, it can be implemented.
         assert (
@@ -74,6 +76,11 @@ class EPLBManager:
     def reset_generator(self):
         self._main_generator = self._entrypoint()
 
+    def disable_rebalance(self, reason: str):
+        self._rebalance_disabled_reason = reason
+        self._rebalance_disabled_logged = False
+        self.reset_generator()
+
     # can be more complex if needed
     def _entrypoint(self):
         while True:
@@ -83,6 +90,15 @@ class EPLBManager:
             yield from self.rebalance()
 
     def rebalance(self):
+        if self._rebalance_disabled_reason is not None:
+            if not self._rebalance_disabled_logged:
+                logger.debug(
+                    "[EPLBManager] rebalance disabled: %s",
+                    self._rebalance_disabled_reason,
+                )
+                self._rebalance_disabled_logged = True
+            return
+
         logger.info("[EPLBManager] rebalance start")
 
         enable_timing = self._rebalance_layers_per_chunk is None

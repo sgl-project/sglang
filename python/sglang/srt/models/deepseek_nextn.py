@@ -24,7 +24,7 @@ from safetensors.torch import load_file
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.jit_kernel.fused_eh_norm import fused_eh_norm
+from sglang.kernels.ops.layernorm.fused_eh_norm import fused_eh_norm
 from sglang.srt.configs.model_config import is_deepseek_dsa
 from sglang.srt.distributed import get_pp_group
 from sglang.srt.environ import envs
@@ -35,6 +35,7 @@ from sglang.srt.layers.attention.dsa.utils import (
     is_dsa_enable_prefill_cp,
     is_dsa_prefill_cp_round_robin_split,
 )
+from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -251,10 +252,12 @@ class DeepseekModelNextN(nn.Module):
                 else:
                     hidden_states = self.eh_proj(eh_input)
 
-            use_cp = dsa_use_prefill_cp(
-                forward_batch, self.dsa_enable_prefill_cp
-            ) or mla_use_prefill_cp(forward_batch, self.mla_enable_prefill_cp)
-            if use_cp:
+            # CP-v2 shards/gathers at the eager-runner boundary instead.
+            use_cp_v1 = (
+                dsa_use_prefill_cp(forward_batch, self.dsa_enable_prefill_cp)
+                or mla_use_prefill_cp(forward_batch, self.mla_enable_prefill_cp)
+            ) and not is_cp_v2_active(forward_batch)
+            if use_cp_v1:
                 hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
                 positions = cp_split_and_rebuild_position(forward_batch, positions)
             residual = None
@@ -285,7 +288,7 @@ class DeepseekModelNextN(nn.Module):
                 else:
                     hidden_states = self.shared_head.norm(hidden_states)
 
-                if use_cp:
+                if use_cp_v1:
                     local_num_tokens = hidden_states.shape[0]
                     hidden_states = cp_all_gather_rerange_output(
                         hidden_states,
