@@ -164,8 +164,9 @@ class ViTNpuGraphRunner(ViTCudaGraphRunner):
                 self.sin_cos_ws[graph_key] = (rotary_pos_emb_cos, rotary_pos_emb_sin)
 
         if graph_key not in self.cu_seq_lens:
-            seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
-            self.cu_seq_lens[graph_key] = seq_lens.to("cpu").to(torch.int32)
+            # TND fused attention expects cumulative seqlens (cu_seqlens[1:]),
+            # not per-sequence lengths.
+            self.cu_seq_lens[graph_key] = cu_seqlens[1:].to("cpu").to(torch.int32)
 
         if rotary_pos_emb_cos is not None and rotary_pos_emb_sin is not None:
             self._create_graph(

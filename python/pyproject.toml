@@ -30,8 +30,8 @@ dependencies = [
   "easydict",  # Required by remote model code (e.g. DeepSeek-OCR) loaded via trust_remote_code; validated by transformers 5.4+ check_imports
   "einops",
   "fastapi",
-  "flash-attn-4==4.0.0b15",
-  "flashinfer_python[cu13]==0.6.14", # keep it aligned with jit-cache version in Dockerfile
+  "flash-attn-4>=4.0.0b18",
+  "flashinfer_python[cu13]==0.6.15.post1", # keep it aligned with jit-cache version in Dockerfile
   "gguf",
   "helion==0.2.6",
   "humming-kernels[cu13]==0.1.10",
@@ -45,7 +45,7 @@ dependencies = [
   "ninja",
   "numba==0.65.1",
   "numpy",
-  "nvidia-cutlass-dsl[cu13]==4.5.2",
+  "nvidia-cutlass-dsl[cu13]==4.6.0",
   "nvidia-mathdx==25.6.0",
   "nvidia-ml-py",
   "openai==2.6.1",
@@ -62,7 +62,7 @@ dependencies = [
   "pydantic",
   "python-multipart",
   "pyzmq>=25.1.2",
-  "quack-kernels>=0.4.1",
+  "quack-kernels>=0.6.1",
   "requests",
   "scipy",
   "sentencepiece",
@@ -192,7 +192,7 @@ killall_sglang = "sglang.cli.killall:main"
 [tool.setuptools.package-data]
 "sglang" = [
   "srt/**/*",
-  "jit_kernel/**/*",
+  "kernels/**/*",
   "multimodal_gen/apps/realtime_webui/**/*"
 ]
 

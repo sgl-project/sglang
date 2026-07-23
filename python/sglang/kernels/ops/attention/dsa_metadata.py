@@ -524,6 +524,15 @@ def _fused_dsa_draft_extend_metadata_kernel(
         mask=req_row < bs,
         other=0,
     ).to(tl.int32)
+    # Skip column blocks past the request's kv length: no consumer reads there
+    # (attention and the indexer both stay within cache_seqlens).
+    kv_len = tl.load(
+        seq_lens + req_row * seq_lens_stride,
+        mask=req_row < bs,
+        other=0,
+    ).to(tl.int32)
+    if col_block * BLOCK_N >= kv_len:
+        return
     if STATIC_EXTEND_LEN:
         prefix = req_row * qo_len
     else:

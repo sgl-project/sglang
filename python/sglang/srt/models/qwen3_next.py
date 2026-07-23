@@ -6,9 +6,11 @@ import torch
 import triton
 from torch import nn
 
-from sglang.jit_kernel.triton.gdn_fused_proj import fused_qkvzba_split_reshape_cat
 from sglang.kernels.ops.attention.fla.fused_norm_gate import FusedRMSNormGated
 from sglang.kernels.ops.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
+from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
+    fused_qkvzba_split_reshape_cat,
+)
 from sglang.srt.configs.qwen3_next import Qwen3NextConfig
 from sglang.srt.distributed import get_pp_group
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -831,7 +833,7 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
 
         if self.attn_output_gate:
             if _is_hip:
-                from sglang.jit_kernel.triton.sigmoid_gate_mul import (
+                from sglang.kernels.ops.moe.triton_sigmoid_gate_mul import (
                     sigmoid_gate_mul,
                 )
 

@@ -782,6 +782,20 @@ class InklingDetector(BaseReasoningFormatDetector):
             self._buffer = ""
         return self._parse_blocks(text)
 
+    def finish(self) -> StreamingParseResult:
+        # Flush reasoning buffered under stream_reasoning=False when the stream
+        # ends before a control/end token closes the block (e.g. max_tokens cut
+        # a thinking block short). Mirrors the non-streaming flush in
+        # detect_and_parse; without it the trailing reasoning trace is dropped.
+        reasoning_text = ""
+        if self._kind == "reasoning" and not self.stream_reasoning:
+            reasoning_text = self._pending_reasoning
+        self._buffer = ""
+        self._pending_reasoning = ""
+        self._pending_header = ""
+        self._kind = None
+        return StreamingParseResult(reasoning_text=reasoning_text)
+
     @staticmethod
     def _partial_control_length(text: str) -> int:
         max_token_len = max(map(len, _INKLING_CONTROL_TOKENS))
