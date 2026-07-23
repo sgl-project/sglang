@@ -645,6 +645,19 @@ impl RouterTrait for RouterManager {
         }
     }
 
+    async fn abort_request(&self, headers: Option<&HeaderMap>, body: &Value) -> Response {
+        let router = self.select_router_for_request(headers, None);
+        if let Some(router) = router {
+            router.abort_request(headers, body).await
+        } else {
+            (
+                StatusCode::NOT_FOUND,
+                "No router available to abort request",
+            )
+                .into_response()
+        }
+    }
+
     async fn delete_response(&self, _headers: Option<&HeaderMap>, _response_id: &str) -> Response {
         (
             StatusCode::NOT_IMPLEMENTED,

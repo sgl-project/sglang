@@ -271,6 +271,14 @@ async fn v1_responses_cancel(
         .await
 }
 
+async fn abort_request(
+    State(state): State<Arc<AppState>>,
+    headers: http::HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    state.router.abort_request(Some(&headers), &body).await
+}
+
 async fn v1_responses_delete(
     State(state): State<Arc<AppState>>,
     Path(response_id): Path<String>,
@@ -549,6 +557,7 @@ pub fn build_app(
         .route("/v1/responses", post(v1_responses))
         .route("/v1/embeddings", post(v1_embeddings))
         .route("/v1/classify", post(v1_classify))
+        .route("/abort_request", post(abort_request))
         .route("/v1/responses/{response_id}", get(v1_responses_get))
         .route(
             "/v1/responses/{response_id}/cancel",
