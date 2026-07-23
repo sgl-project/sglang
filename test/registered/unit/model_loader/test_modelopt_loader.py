@@ -12,7 +12,7 @@ import torch
 import torch.nn as nn
 
 from sglang.srt.configs.device_config import DeviceConfig
-from sglang.srt.configs.load_config import LoadConfig
+from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
 from sglang.srt.layers.modelopt_utils import QUANT_CFG_CHOICES
@@ -399,6 +399,63 @@ class TestModelOptModelLoader(CustomTestCase):
         config_auto = ModelConfig(model_path=self.model_path, quantization="modelopt")
         # Should default to fp8 when no config is detected
         self.assertEqual(config_auto._get_modelopt_quant_type(), "fp8")
+
+    def test_prequantized_sharded_state_uses_sharded_loader(self):
+        """Pre-quantized ModelOpt checkpoints should respect sharded_state format."""
+
+        loader = ModelOptModelLoader(
+            LoadConfig(
+                load_format=LoadFormat.SHARDED_STATE,
+                model_loader_extra_config={"pattern": "custom-rank-{rank}.safetensors"},
+            )
+        )
+        model_config = MagicMock(spec=ModelConfig)
+        model_config.model_path = self.model_path
+        model_config._is_already_quantized.return_value = True
+        sharded_model = MagicMock(spec=nn.Module)
+
+        with patch(
+            "sglang.srt.model_loader.loader.ShardedStateLoader.load_model",
+            return_value=sharded_model,
+        ) as mock_sharded_load:
+            with patch(
+                "sglang.srt.model_loader.loader.DefaultModelLoader.load_model"
+            ) as mock_default_load:
+                result_model = loader.load_model(
+                    model_config=model_config, device_config=self.device_config
+                )
+
+        self.assertIs(result_model, sharded_model)
+        mock_sharded_load.assert_called_once_with(
+            model_config=model_config, device_config=self.device_config
+        )
+        mock_default_load.assert_not_called()
+
+    def test_prequantized_non_sharded_state_keeps_default_loader(self):
+        """Pre-quantized ModelOpt checkpoints should keep default loading otherwise."""
+
+        loader = ModelOptModelLoader(LoadConfig(load_format=LoadFormat.AUTO))
+        model_config = MagicMock(spec=ModelConfig)
+        model_config.model_path = self.model_path
+        model_config._is_already_quantized.return_value = True
+        default_model = MagicMock(spec=nn.Module)
+
+        with patch(
+            "sglang.srt.model_loader.loader.ShardedStateLoader.load_model"
+        ) as mock_sharded_load:
+            with patch(
+                "sglang.srt.model_loader.loader.DefaultModelLoader.load_model",
+                return_value=default_model,
+            ) as mock_default_load:
+                result_model = loader.load_model(
+                    model_config=model_config, device_config=self.device_config
+                )
+
+        self.assertIs(result_model, default_model)
+        mock_default_load.assert_called_once_with(
+            model_config=model_config, device_config=self.device_config
+        )
+        mock_sharded_load.assert_not_called()
 
 
 class TestModelOptLoaderIntegration(CustomTestCase):

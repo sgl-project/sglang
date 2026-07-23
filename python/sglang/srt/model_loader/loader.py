@@ -395,7 +395,7 @@ class DefaultModelLoader(BaseModelLoader):
     def __init__(self, load_config: LoadConfig):
         super().__init__(load_config)
         extra_config = load_config.model_loader_extra_config
-        allowed_keys = {"enable_multithread_load", "num_threads"}
+        allowed_keys = {"enable_multithread_load", "num_threads", "pattern"}
         unexpected_keys = set(extra_config.keys()) - allowed_keys
 
         if unexpected_keys:
@@ -2895,6 +2895,11 @@ class ModelOptModelLoader(DefaultModelLoader):
         # Check if model is already quantized
         if model_config._is_already_quantized():
             logger.info("Model is already quantized, loading directly...")
+            if self.load_config.load_format == LoadFormat.SHARDED_STATE:
+                sharded_state_loader = ShardedStateLoader(self.load_config)
+                return sharded_state_loader.load_model(
+                    model_config=model_config, device_config=device_config
+                )
             # Use default loading for pre-quantized models
             return super().load_model(
                 model_config=model_config, device_config=device_config
