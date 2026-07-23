@@ -273,6 +273,8 @@ def _minwm_frame_indices(hidden_states: torch.Tensor, num_frames: int) -> torch.
                 f"sequence length: {frame_indices.numel()} vs "
                 f"{hidden_states.shape[1]}."
             )
+        if num_frames == 1:
+            return torch.zeros_like(frame_indices)
         return frame_indices
 
     if hidden_states.shape[1] % num_frames != 0:

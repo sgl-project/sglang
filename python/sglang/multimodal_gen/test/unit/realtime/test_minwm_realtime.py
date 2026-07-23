@@ -435,6 +435,7 @@ def test_minwm_sequence_shard_frame_indices_support_mid_frame_boundaries(monkeyp
 
     hidden_states = torch.zeros(1, 3, 8)
     assert _minwm_frame_indices(hidden_states, 4).tolist() == [1, 1, 2]
+    assert _minwm_frame_indices(hidden_states, 1).tolist() == [0, 0, 0]
 
 
 def test_minwm_sequence_shard_rope_uses_flattened_token_positions():
