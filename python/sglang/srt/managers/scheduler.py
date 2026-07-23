@@ -472,10 +472,7 @@ class Scheduler(
         self.disable_radix_cache = result.disable_radix_cache
         self.tree_cache = result.tree_cache
 
-        if (
-            _is_npu
-            and self.tp_worker.model_runner.model_config.is_deepseek_v4_arch
-        ):
+        if _is_npu and self.tp_worker.model_runner.model_config.is_deepseek_v4_arch:
             rank = (
                 self.ps.dp_rank
                 if self.ps.dp_rank is not None
