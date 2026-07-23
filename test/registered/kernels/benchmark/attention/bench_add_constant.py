@@ -7,7 +7,7 @@ from sglang.kernels.jit.benchmark.utils import (
     get_benchmark_range,
     run_benchmark_no_cudagraph,
 )
-from sglang.kernels.ops.attention.add_constant import (
+from sglang.kernels.ops.elementwise.add_constant import (
     _jit_add_constant_module,
     add_constant,
 )

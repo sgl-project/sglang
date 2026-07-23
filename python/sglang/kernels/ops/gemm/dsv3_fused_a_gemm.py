@@ -25,7 +25,7 @@ if TYPE_CHECKING:
 
 
 @cache_once
-def _jit_dsv3_fused_a_gemm_module(hd_in: int, hd_out: int, use_pdl: bool) -> Module:
+def dsv3_fused_a_gemm_module(hd_in: int, hd_out: int, use_pdl: bool) -> Module:
     args = make_cpp_args(hd_in, hd_out, use_pdl)
     return load_jit(
         "dsv3_fused_a_gemm",
@@ -44,7 +44,7 @@ def _dsv3_fused_a_gemm_run(mat_a: torch.Tensor, mat_b: torch.Tensor) -> torch.Te
         device=mat_a.device,
         dtype=mat_a.dtype,
     )
-    module = _jit_dsv3_fused_a_gemm_module(
+    module = dsv3_fused_a_gemm_module(
         mat_a.shape[1], mat_b.shape[1], is_arch_support_pdl()
     )
     module.dsv3_fused_a_gemm(mat_a, mat_b, output)
