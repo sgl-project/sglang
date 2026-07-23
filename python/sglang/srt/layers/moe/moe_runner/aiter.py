@@ -162,7 +162,22 @@ class AiterRunnerCore(MoeRunnerCore):
             extra["num_local_tokens"] = runner_input.num_local_tokens
         if runner_input.output_dtype is not None:
             extra["dtype"] = runner_input.output_dtype
-        if quant_info.swiglu_limit > 0:
+        # Gated clamped-swiglu (gpt-oss / MiniMax-M3): aiter's FlyDSL MoE kernel
+        # computes gate*sigmoid(alpha*gate)*(up+1) only under ActivationType.Swiglu
+        # + a swiglu_limit. M3 declares the MoE activation as "silu" with the clamp
+        # in gemm1_clamp_limit (swiglu_limit stays 0), so passing the mapped Silu here
+        # would run plain silu on the kernel (wrong output). Force Swiglu whenever the
+        # gated-swiglu alpha is set and take the limit from gemm1_clamp_limit.
+        _is_gated_swiglu = getattr(self.config, "gemm1_alpha", None) is not None
+        _eff_swiglu_limit = quant_info.swiglu_limit
+        if _is_gated_swiglu and not _eff_swiglu_limit:
+            _eff_swiglu_limit = getattr(self.config, "gemm1_clamp_limit", 0.0) or 0.0
+        _activation = (
+            _aiter_activation("swiglu")
+            if _is_gated_swiglu
+            else _aiter_activation(self.config.activation)
+        )
+        if _eff_swiglu_limit > 0:
             # GateMode is only needed for the gpt-oss MXFP4 swiglu_limit path.
             # Import lazily so models that don't use it (e.g. DeepSeek-V3 fp8,
             # swiglu_limit==0) still run on aiter builds where this module
@@ -179,7 +194,7 @@ class AiterRunnerCore(MoeRunnerCore):
                 if envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
                 else GateMode.SEPARATED.value
             )
-            extra["swiglu_limit"] = quant_info.swiglu_limit
+            extra["swiglu_limit"] = _eff_swiglu_limit
         if self.config.no_combine:
             extra["no_combine"] = True
 
@@ -190,7 +205,7 @@ class AiterRunnerCore(MoeRunnerCore):
             topk_weight=runner_input.topk_weights,
             topk_ids=runner_input.topk_ids,
             quant_type=_aiter_quant_type(runner_input.quant_type),
-            activation=_aiter_activation(self.config.activation),
+            activation=_activation,
             w1_scale=quant_info.w13_scale,
             w2_scale=quant_info.w2_scale,
             a1_scale=a1_scale,

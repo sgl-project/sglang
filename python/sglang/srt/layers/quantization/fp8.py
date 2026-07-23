@@ -1955,6 +1955,34 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         layer.w13_input_scale = None
         layer.w2_input_scale = None
 
+        # Native MXFP8 experts on the aiter FlyDSL MoE (afp8_wfp8, per_1x32): the
+        # kernel consumes gate/up-interleaved pre-shuffled weights + correspondingly
+        # shuffled 1x32 scales, and (with MoeRunner passing ActivationType.Swiglu +
+        # swiglu_limit) computes the clamped SwiGLU. Shuffle here for the aiter runner;
+        # other runners (triton/cutlass/deepgemm) keep the canonical layout.
+        _moe_runner_is_aiter = (
+            getattr(self, "runner", None) is not None
+            and self.runner.runner_backend.is_aiter()
+        )
+        if _use_aiter and _moe_runner_is_aiter:
+            gu_intv = envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
+            for _sn, _is_w13 in (
+                ("w13_weight_scale_inv", True),
+                ("w2_weight_scale_inv", False),
+            ):
+                _s = getattr(layer, _sn)
+                _s.data = shuffle_scale(
+                    _s.reshape(-1, _s.shape[-1]), _s.shape[0], gu_intv, _is_w13
+                )
+            layer.w13_weight.data = shuffle_weight(
+                layer.w13_weight, is_guinterleave=gu_intv, gate_up=True
+            )
+            layer.w2_weight.data = shuffle_weight(
+                layer.w2_weight, is_guinterleave=gu_intv, gate_up=False
+            )
+            layer.w13_weight.is_shuffled = True
+            layer.w2_weight.is_shuffled = True
+
         if (
             get_moe_runner_backend().is_flashinfer_trtllm()
             or get_moe_runner_backend().is_flashinfer_trtllm_routed()
