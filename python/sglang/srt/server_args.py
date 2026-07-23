@@ -8068,7 +8068,7 @@ class ServerArgs:
 
         if self.pp_size > 1:
             assert (
-                self.disable_overlap_schedule and self.speculative_algorithm is None
+                self.disable_overlap_schedule
             ), "Pipeline parallelism is not compatible with overlap schedule, speculative decoding"
 
         assert not (

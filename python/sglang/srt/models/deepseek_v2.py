@@ -2369,7 +2369,7 @@ class DeepseekV2Model(nn.Module):
         else:
             self.cp_size = None
 
-        if self.pp_group.is_first_rank:
+        if self.pp_group.is_first_rank or self.pp_group.is_last_rank:
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
