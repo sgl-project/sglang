@@ -34,7 +34,11 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import available_and_evictable_str
-from sglang.srt.mem_cache.hicache_storage import PoolName
+from sglang.srt.mem_cache.hicache_storage import (
+    PoolName,
+    PoolTransfer,
+    PoolTransferResult,
+)
 from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
     HybridReqToTokenPool,
@@ -4301,6 +4305,8 @@ class TestUnifiedRadixPrefetchCorruption(CustomTestCase):
         host_idx = host_idx.to(dtype=torch.int64)
         hashes = [f"h{i}" for i in range(len(child_key) // ps)]
         res = cache._insert_helper_host(parent, child_key, host_idx, hashes)
+        if res.host_insert_dropped:
+            cache.cache_controller.mem_pool_host.free(host_idx)
         return res.inserted_host_node
 
     def test_prefetch_refill_under_unbacked_parent_is_dropped(self):
@@ -4314,6 +4320,101 @@ class TestUnifiedRadixPrefetchCorruption(CustomTestCase):
         child = self._attach_host_child(cache, parent, start_token=1000)
         self.assertIsNone(child)
         self.assertEqual(len(parent.children), 0)
+        cache.sanity_check()
+
+    def test_dropped_prefetch_releases_all_host_resources(self):
+        """The caller owns every completed buffer when host insertion drops."""
+        cache, allocator, _ = build_fixture(self.cfg)
+        self._init_hicache(cache)
+
+        parent = self._insert_device(cache, allocator, list(range(1, 1 + 3 * self.ps)))
+        prefetch_key = RadixKey(
+            array("q", list(range(1000, 1000 + 2 * self.ps)))
+        ).page_aligned(self.ps)
+        completed_tokens = len(prefetch_key)
+        full_available_before = cache.cache_controller.mem_pool_host.available_size()
+        host_indices = cache.cache_controller.mem_pool_host.alloc(completed_tokens)
+        self.assertIsNotNone(host_indices)
+
+        swa_transfer = PoolTransfer(
+            name=PoolName.SWA,
+            host_indices=torch.arange(self.ps, dtype=torch.int64),
+        )
+        mamba_transfer = PoolTransfer(
+            name=PoolName.MAMBA,
+            host_indices=torch.arange(1, dtype=torch.int64),
+        )
+        swa_component = mock.Mock()
+        mamba_component = mock.Mock()
+        cache.components[ComponentType.SWA] = swa_component
+        cache.components[ComponentType.MAMBA] = mamba_component
+        comp_xfers = {
+            ComponentType.SWA: [swa_transfer],
+            ComponentType.MAMBA: [mamba_transfer],
+        }
+
+        operation = mock.Mock()
+        operation.host_indices = host_indices
+        operation.pool_storage_result = PoolTransferResult(
+            kv_hit_pages=completed_tokens // self.ps,
+            extra_pool_hit_pages={
+                PoolName.SWA: 1,
+                PoolName.MAMBA: 1,
+            },
+        )
+        anchor_lock_params = cache.inc_host_lock_ref(parent).to_dec_params()
+        req_id = "drop-all-resources"
+        cache.ongoing_prefetch[req_id] = (
+            parent,
+            prefetch_key,
+            host_indices,
+            operation,
+            anchor_lock_params,
+            comp_xfers,
+        )
+        cache.cache_controller.prefetch_tokens_occupied = completed_tokens
+        hashes = [f"h{i}" for i in range(completed_tokens // self.ps)]
+
+        with (
+            mock.patch.object(cache, "can_terminate_prefetch", return_value=True),
+            mock.patch.object(
+                cache.cache_controller,
+                "terminate_prefetch",
+                return_value=(completed_tokens, hashes),
+            ),
+            mock.patch.object(
+                cache.cache_controller,
+                "append_host_mem_release",
+                wraps=cache.cache_controller.append_host_mem_release,
+            ) as release,
+        ):
+            self.assertTrue(cache.check_prefetch_progress(req_id))
+
+        swa_component.commit_hicache_transfer.assert_not_called()
+        mamba_component.commit_hicache_transfer.assert_not_called()
+        self.assertEqual(cache.pop_prefetch_loaded_tokens(req_id), 0)
+        self.assertEqual(len(parent.children), 0)
+
+        drop_releases = [
+            call
+            for call in release.call_args_list
+            if call.kwargs.get("extra_pools") is not None
+        ]
+        self.assertEqual(len(drop_releases), 1)
+        self.assertTrue(
+            torch.equal(
+                drop_releases[0].kwargs["host_indices"],
+                host_indices[:completed_tokens],
+            )
+        )
+        self.assertIs(drop_releases[0].kwargs["extra_pools"][0], swa_transfer)
+        self.assertIs(drop_releases[0].kwargs["extra_pools"][1], mamba_transfer)
+
+        cache.drain_storage_control_queues()
+        self.assertEqual(
+            cache.cache_controller.mem_pool_host.available_size(),
+            full_available_before,
+        )
         cache.sanity_check()
 
     def test_prefetch_refill_leaves_eviction_path_uncorrupted(self):
