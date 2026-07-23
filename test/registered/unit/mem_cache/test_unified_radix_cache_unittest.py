@@ -4434,7 +4434,6 @@ class TestUnifiedRadixPrefetchCorruption(CustomTestCase):
             array("q", list(range(1000, 1000 + 2 * self.ps)))
         ).page_aligned(self.ps)
         completed_tokens = len(prefetch_key)
-        full_available_before = cache.cache_controller.mem_pool_host.available_size()
         host_indices = cache.cache_controller.mem_pool_host.alloc(completed_tokens)
         self.assertIsNotNone(host_indices)
 
@@ -4479,15 +4478,22 @@ class TestUnifiedRadixPrefetchCorruption(CustomTestCase):
 
         with (
             mock.patch.object(cache, "can_terminate_prefetch", return_value=True),
+            # Isolate the drop-release branch under test from the hybrid-sync
+            # step: treat the whole fetched prefix as usable so the insert runs.
+            mock.patch.object(
+                cache,
+                "_sync_and_check_hybrid_prefetch_result",
+                return_value=completed_tokens,
+            ),
             mock.patch.object(
                 cache.cache_controller,
                 "terminate_prefetch",
                 return_value=(completed_tokens, hashes),
             ),
+            # No storage backend in this fixture, so the real release queues
+            # don't exist; assert on the release call instead of draining them.
             mock.patch.object(
-                cache.cache_controller,
-                "append_host_mem_release",
-                wraps=cache.cache_controller.append_host_mem_release,
+                cache.cache_controller, "append_host_mem_release"
             ) as release,
         ):
             self.assertTrue(cache.check_prefetch_progress(req_id))
@@ -4512,11 +4518,6 @@ class TestUnifiedRadixPrefetchCorruption(CustomTestCase):
         self.assertIs(drop_releases[0].kwargs["extra_pools"][0], swa_transfer)
         self.assertIs(drop_releases[0].kwargs["extra_pools"][1], mamba_transfer)
 
-        cache.drain_storage_control_queues()
-        self.assertEqual(
-            cache.cache_controller.mem_pool_host.available_size(),
-            full_available_before,
-        )
         cache.sanity_check()
 
     def test_prefetch_refill_leaves_eviction_path_uncorrupted(self):
