@@ -785,20 +785,6 @@ class Scheduler(
             target_worker=self.tp_worker,
         )
 
-        if self.server_args.speculative_draft_load_format is not None:
-            # Write the draft load_format onto server_args (not just the bag):
-            # the draft worker is built from a copy of self.server_args and
-            # build_load_config reads server_args.load_format, so a bag-only
-            # override would be ignored and the draft would load in the target's
-            # format.
-            self.server_args.override(
-                "scheduler.draft_load_format",
-                load_format=self.server_args.speculative_draft_load_format,
-            )
-            logger.info(
-                f"Using draft model load_format: '{self.server_args.speculative_draft_load_format}'"
-            )
-
         DraftWorkerClass = self.spec_algorithm.create_worker(self.server_args)
         self.draft_worker = DraftWorkerClass(**draft_worker_kwargs)
 

@@ -287,6 +287,8 @@ class TpModelWorker(BaseTpWorker):
         context_length: Optional[int] = None,
     ):
         # Parse args
+        if is_draft_worker:
+            server_args = server_args.copy_for_draft_worker()
         self.server_args = server_args
         self.ps = ps
         self.gpu_id = gpu_id

@@ -28,6 +28,7 @@ import random
 import socket
 import tempfile
 import uuid
+from copy import deepcopy
 from functools import cached_property
 from typing import Any, Callable, Dict, List, Literal, Optional, Union
 
@@ -6769,21 +6770,9 @@ class ServerArgs:
         )
 
         run_post_process_pass(self, _gguf_quantization)
-        if (
-            self.load_format == "auto" or self.load_format == "gguf"
-        ) and check_gguf_file(self.model_path):
-            self.load_format = "gguf"
-
-        if self.load_format == "auto" and self._is_mistral_native_format():
-            self.load_format = "mistral"
-            logger.info(
-                "Detected Mistral native format checkpoint, setting load_format='mistral'"
-            )
-
-        if is_runai_obj_uri(self.model_path):
-            self.load_format = "runai_streamer"
-        elif is_remote_url(self.model_path):
-            self.load_format = "remote"
+        self.load_format = self._resolve_load_format_for_model(
+            self.load_format, self.model_path
+        )
 
         if self.custom_weight_loader is None:
             self.custom_weight_loader = []
@@ -6820,7 +6809,44 @@ class ServerArgs:
                 self.validate_transfer_engine()
             )
 
-    def _is_mistral_native_format(self) -> bool:
+    def _resolve_load_format_for_model(self, load_format: str, model_path: str) -> str:
+        if is_runai_obj_uri(model_path):
+            return "runai_streamer"
+        if is_remote_url(model_path):
+            return "remote"
+        if load_format in ("auto", "gguf") and check_gguf_file(model_path):
+            return "gguf"
+        if load_format == "auto" and self._is_mistral_native_format(model_path):
+            logger.info(
+                "Detected Mistral native format checkpoint, setting load_format='mistral'"
+            )
+            return "mistral"
+        return load_format
+
+    def copy_for_draft_worker(self) -> ServerArgs:
+        draft_server_args = deepcopy(self)
+        requested_load_format = draft_server_args.speculative_draft_load_format
+        if requested_load_format is None:
+            return draft_server_args
+
+        draft_model_path = (
+            draft_server_args.speculative_draft_model_path
+            or draft_server_args.model_path
+        )
+        resolved_load_format = (
+            draft_server_args._resolve_load_format_for_model(
+                requested_load_format, draft_model_path
+            )
+            if requested_load_format == "auto"
+            else requested_load_format
+        )
+        draft_server_args.override(
+            "draft_worker.load_format", load_format=resolved_load_format
+        )
+        logger.info("Using draft model load_format: %r", resolved_load_format)
+        return draft_server_args
+
+    def _is_mistral_native_format(self, model_path: str) -> bool:
         """True iff the checkpoint requires load_format=mistral.
 
         Looks for consolidated*.safetensors with no competing
@@ -6840,7 +6866,7 @@ class ServerArgs:
             "leanstral",
         )
         name_matches = any(
-            p in str(self.model_path).lower() for p in _MISTRAL_NATIVE_PATTERNS
+            p in str(model_path).lower() for p in _MISTRAL_NATIVE_PATTERNS
         )
 
         def _check_format(has_params, has_consolidated, has_hf_weights) -> bool:
@@ -6848,23 +6874,21 @@ class ServerArgs:
                 return True
             return has_consolidated and not has_hf_weights
 
-        if os.path.isdir(self.model_path):
+        if os.path.isdir(model_path):
             return _check_format(
-                has_params=os.path.exists(os.path.join(self.model_path, "params.json")),
+                has_params=os.path.exists(os.path.join(model_path, "params.json")),
                 has_consolidated=bool(
-                    glob.glob(
-                        os.path.join(self.model_path, "consolidated*.safetensors")
-                    )
+                    glob.glob(os.path.join(model_path, "consolidated*.safetensors"))
                 ),
                 has_hf_weights=bool(
-                    glob.glob(os.path.join(self.model_path, "model-*.safetensors"))
+                    glob.glob(os.path.join(model_path, "model-*.safetensors"))
                 ),
             )
 
         try:
             from huggingface_hub import HfApi
 
-            files = {s.rfilename for s in HfApi().model_info(self.model_path).siblings}
+            files = {s.rfilename for s in HfApi().model_info(model_path).siblings}
             return _check_format(
                 has_params="params.json" in files,
                 has_consolidated=any(

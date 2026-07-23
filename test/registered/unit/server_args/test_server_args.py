@@ -1510,6 +1510,96 @@ class TestHandleCrashDumpEnv(CustomTestCase):
             )
 
 
+class TestDraftWorkerServerArgs(unittest.TestCase):
+    def _server_args(
+        self,
+        *,
+        target_load_format="runai_streamer",
+        draft_load_format=None,
+        target_model_path="s3://bucket/target",
+        draft_model_path="s3://bucket/draft",
+    ):
+        server_args = ServerArgs.__new__(ServerArgs)
+        server_args.load_format = target_load_format
+        server_args.speculative_draft_load_format = draft_load_format
+        server_args.model_path = target_model_path
+        server_args.speculative_draft_model_path = draft_model_path
+        return server_args
+
+    def test_unspecified_format_inherits_target_without_mutating_it(self):
+        server_args = self._server_args(draft_load_format=None)
+
+        draft_server_args = server_args.copy_for_draft_worker()
+
+        self.assertIsNot(draft_server_args, server_args)
+        self.assertEqual(draft_server_args.load_format, "runai_streamer")
+        self.assertEqual(server_args.load_format, "runai_streamer")
+
+    def test_explicit_format_only_updates_draft_copy(self):
+        server_args = self._server_args(draft_load_format="dummy")
+
+        draft_server_args = server_args.copy_for_draft_worker()
+
+        self.assertEqual(draft_server_args.load_format, "dummy")
+        self.assertEqual(server_args.load_format, "runai_streamer")
+
+    def test_auto_uses_runai_streamer_for_s3_draft(self):
+        server_args = self._server_args(draft_load_format="auto")
+
+        draft_server_args = server_args.copy_for_draft_worker()
+
+        self.assertEqual(draft_server_args.load_format, "runai_streamer")
+        self.assertEqual(server_args.load_format, "runai_streamer")
+
+    def test_auto_uses_remote_loader_for_http_draft(self):
+        server_args = self._server_args(
+            draft_load_format="auto",
+            draft_model_path="https://example.com/draft.safetensors",
+        )
+
+        draft_server_args = server_args.copy_for_draft_worker()
+
+        self.assertEqual(draft_server_args.load_format, "remote")
+
+    @patch("sglang.srt.server_args.check_gguf_file", return_value=True)
+    def test_auto_uses_gguf_loader_for_gguf_draft(self, _mock_check_gguf):
+        server_args = self._server_args(
+            draft_load_format="auto",
+            draft_model_path="/models/draft.gguf",
+        )
+
+        draft_server_args = server_args.copy_for_draft_worker()
+
+        self.assertEqual(draft_server_args.load_format, "gguf")
+
+    @patch.object(ServerArgs, "_is_mistral_native_format", return_value=True)
+    @patch("sglang.srt.server_args.check_gguf_file", return_value=False)
+    def test_auto_uses_mistral_loader_for_native_draft(
+        self, _mock_check_gguf, _mock_is_mistral
+    ):
+        server_args = self._server_args(
+            draft_load_format="auto",
+            draft_model_path="mistralai/native-draft",
+        )
+
+        draft_server_args = server_args.copy_for_draft_worker()
+
+        self.assertEqual(draft_server_args.load_format, "mistral")
+
+    @patch.object(ServerArgs, "_is_mistral_native_format", return_value=False)
+    @patch("sglang.srt.server_args.check_gguf_file", return_value=False)
+    def test_auto_stays_auto_for_local_draft(self, _mock_check_gguf, _mock_is_mistral):
+        server_args = self._server_args(
+            draft_load_format="auto",
+            draft_model_path="/models/draft",
+        )
+
+        draft_server_args = server_args.copy_for_draft_worker()
+
+        self.assertEqual(draft_server_args.load_format, "auto")
+        self.assertEqual(server_args.load_format, "runai_streamer")
+
+
 class TestGrpcServerArgs(CustomTestCase):
     """Native gRPC is enabled by --grpc-port (or SGLANG_GRPC_PORT) and runs
     alongside HTTP; --smg-grpc-mode (and the deprecated --grpc-mode) select the
