@@ -481,6 +481,21 @@ class CausalDMDDenoisingStage(DenoisingStage):
     ) -> torch.Tensor:
         return timestep.reshape(1).to(device=device).expand(batch_size)
 
+    def _flow_prediction_to_x0(
+        self,
+        *,
+        flow_prediction: torch.Tensor,
+        noisy_latent: torch.Tensor,
+        timestep: torch.Tensor,
+        scheduler,
+    ) -> torch.Tensor:
+        return pred_noise_to_pred_video(
+            pred_noise=flow_prediction,
+            noise_input_latent=noisy_latent,
+            timestep=timestep,
+            scheduler=scheduler,
+        )
+
     def _forward_causal_transformer(
         self,
         batch: Req,
@@ -573,9 +588,9 @@ class CausalDMDDenoisingStage(DenoisingStage):
             autocast_enabled=autocast_enabled,
         )
         pred_noise_btchw = pred_noise.permute(0, 2, 1, 3, 4)
-        x0_btchw = pred_noise_to_pred_video(
-            pred_noise=pred_noise_btchw.flatten(0, 1),
-            noise_input_latent=noise_latents_btchw.flatten(0, 1),
+        x0_btchw = self._flow_prediction_to_x0(
+            flow_prediction=pred_noise_btchw.flatten(0, 1),
+            noisy_latent=noise_latents_btchw.flatten(0, 1),
             timestep=timestep_2d,
             scheduler=scheduler,
         ).unflatten(0, pred_noise_btchw.shape[:2])
@@ -1095,6 +1110,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
         *,
         sequence_shard_enabled: bool = False,
         kv_cache_size: int | None = None,
+        allow_growth: bool = False,
     ) -> None:
         """
         Initialize (but not fill) a Per-GPU KV cache aligned with the model assumptions.
@@ -1119,6 +1135,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
             ),
             sink_tokens=self._get_causal_sink_tokens(),
             attention_window_size=self._get_causal_attention_window_size(kv_cache_size),
+            allow_growth=allow_growth,
         )
 
     def _initialize_crossattn_cache(

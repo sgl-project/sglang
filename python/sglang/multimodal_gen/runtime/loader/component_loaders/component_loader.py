@@ -251,32 +251,11 @@ class ComponentLoader(ABC):
                     attn_backend.name.lower(),
                     matched_backend_key,
                 )
-        try:
-            component = self._load_customized_with_context(
-                component_model_path,
-                server_args,
-                component_name,
-                attn_backend,
-                component_attn_name,
-            )
-            source = "sgl-diffusion"
-        except Exception as e:
-            if self.should_raise_customized_load_error(server_args, component_name):
-                traceback.print_exc()
-                raise RuntimeError(
-                    f"Failed to load customized {component_name}; native fallback "
-                    "is disabled for this component configuration."
-                ) from e
-            if "Unsupported model architecture" in str(e):
-                logger.info(
-                    f"Component: {component_name} doesn't have a customized version yet, using native version"
-                )
-            else:
-                traceback.print_exc()
-                logger.error(
-                    f"Error while loading customized {component_name}, falling back to native version"
-                )
-            # fallback to native version
+        native_component_names = getattr(
+            server_args.pipeline_config, "native_component_names", ()
+        )
+        require_native = component_name in native_component_names
+        if require_native:
             component = self._load_native_with_context(
                 component_model_path,
                 server_args,
@@ -285,12 +264,53 @@ class ComponentLoader(ABC):
                 attn_backend,
                 component_attn_name,
             )
-            source = "native"
-            logger.warning(
-                "Native component %s: %s is loaded, performance may be sub-optimal",
+            source = "native-required"
+            logger.info(
+                "Pipeline numerical contract requires native %s: %s",
                 component_name,
                 component.__class__.__name__,
             )
+        else:
+            try:
+                component = self._load_customized_with_context(
+                    component_model_path,
+                    server_args,
+                    component_name,
+                    attn_backend,
+                    component_attn_name,
+                )
+                source = "sgl-diffusion"
+            except Exception as e:
+                if self.should_raise_customized_load_error(server_args, component_name):
+                    traceback.print_exc()
+                    raise RuntimeError(
+                        f"Failed to load customized {component_name}; native fallback "
+                        "is disabled for this component configuration."
+                    ) from e
+                if "Unsupported model architecture" in str(e):
+                    logger.info(
+                        f"Component: {component_name} doesn't have a customized version yet, using native version"
+                    )
+                else:
+                    traceback.print_exc()
+                    logger.error(
+                        f"Error while loading customized {component_name}, falling back to native version"
+                    )
+                # fallback to native version
+                component = self._load_native_with_context(
+                    component_model_path,
+                    server_args,
+                    component_name,
+                    transformers_or_diffusers,
+                    attn_backend,
+                    component_attn_name,
+                )
+                source = "native"
+                logger.warning(
+                    "Native component %s: %s is loaded, performance may be sub-optimal",
+                    component_name,
+                    component.__class__.__name__,
+                )
 
         if component is None:
             logger.error("Load %s failed", component_name)
@@ -450,9 +470,9 @@ class ComponentLoader(ABC):
             ]
             expected_library = loader_cls.expected_library
             # Assert that the library matches what's expected for this component type
-            assert (
-                transformers_or_diffusers == expected_library
-            ), f"{component_name} must be loaded from {expected_library}, got {transformers_or_diffusers}"
+            assert transformers_or_diffusers == expected_library, (
+                f"{component_name} must be loaded from {expected_library}, got {transformers_or_diffusers}"
+            )
             loader = loader_cls()
             loader.component_architecture = component_architecture
             return loader

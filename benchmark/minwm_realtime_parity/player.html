@@ -1,0 +1,218 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <link rel="icon" href="data:,">
+  <title>MinWM baseline vs SGLang</title>
+  <style>
+    :root { color-scheme: dark; font-family: ui-sans-serif, system-ui, sans-serif; }
+    body { margin: 0; background: #0b0e14; color: #e8ecf2; }
+    header, main { max-width: 1500px; margin: auto; padding: 16px 22px; }
+    header { display: flex; gap: 14px; align-items: center; flex-wrap: wrap; }
+    select, button, input { font: inherit; }
+    select, button { background: #202634; color: #fff; border: 1px solid #3a4355; border-radius: 7px; padding: 7px 10px; }
+    #summary { color: #aeb7c8; }
+    .case-list { display: grid; gap: 22px; }
+    .case-card { background: #10151f; border: 1px solid #2a3140; border-radius: 12px; padding: 14px; }
+    .case-heading { display: flex; gap: 12px; align-items: baseline; flex-wrap: wrap; margin: 0 0 12px; }
+    .case-title { margin: 0; font-size: 18px; }
+    .case-meta, .resource-status { color: #aeb7c8; }
+    .resource-status.error { color: #ff7b86; }
+    .videos { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+    .panel { background: #141924; border: 1px solid #2a3140; border-radius: 10px; overflow: hidden; }
+    .label { padding: 8px 12px; font-weight: 700; }
+    video { width: 100%; display: block; background: #000; }
+    .controls { display: grid; grid-template-columns: auto auto auto 1fr auto auto; align-items: center; gap: 9px; margin: 14px 0 0; }
+    .seek { width: 100%; }
+    .time { min-width: 92px; text-align: right; font-variant-numeric: tabular-nums; }
+    details { margin-top: 10px; color: #aeb7c8; }
+    pre { white-space: pre-wrap; background: #141924; border: 1px solid #2a3140; padding: 12px; border-radius: 9px; }
+    .pass { color: #66d9a3; } .fail { color: #ff7b86; }
+    @media (max-width: 850px) {
+      .videos { grid-template-columns: 1fr; }
+      .controls { grid-template-columns: repeat(3, auto); }
+      .seek { grid-column: 1 / -1; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <strong>MinWM baseline ↔ SGLang realtime API</strong>
+    <span id="summary">Loading report…</span>
+  </header>
+  <main>
+    <div id="cases" class="case-list"></div>
+  </main>
+  <script id="embedded-report" type="application/json">__MINWM_EMBEDDED_REPORT__</script>
+  <script>
+    const caseList = document.querySelector('#cases');
+    const summary = document.querySelector('#summary');
+    const fps = 24;
+
+    function formatTime(seconds) {
+      if (!Number.isFinite(seconds)) return '0:00';
+      const minutes = Math.floor(seconds / 60);
+      return `${minutes}:${String(Math.floor(seconds % 60)).padStart(2, '0')}`;
+    }
+
+    function waitUntilReady(video, label) {
+      return new Promise((resolve, reject) => {
+        video.addEventListener('canplay', resolve, {once: true});
+        video.addEventListener('error', () => reject(new Error(`${label} failed to load`)), {once: true});
+      });
+    }
+
+    function createCaseCard(item, index, caseCount) {
+      const card = document.createElement('section');
+      card.className = 'case-card';
+      card.innerHTML = `
+        <div class="case-heading">
+          <h2 class="case-title"></h2>
+          <strong class="case-result"></strong>
+          <span class="case-meta"></span>
+          <span class="resource-status">Loading videos…</span>
+        </div>
+        <div class="videos">
+          <div class="panel">
+            <div class="label">minWM main / V3 baseline</div>
+            <video class="baseline" aria-label="Baseline video" preload="metadata" muted playsinline></video>
+          </div>
+          <div class="panel">
+            <div class="label">SGLang realtime API</div>
+            <video class="candidate" aria-label="SGLang video" preload="metadata" muted playsinline></video>
+          </div>
+        </div>
+        <div class="controls">
+          <button class="play">Play both</button>
+          <button class="prev">−1 frame</button>
+          <button class="next">+1 frame</button>
+          <input class="seek" aria-label="Seek both videos" type="range" min="0" max="1" step="0.001" value="0">
+          <span class="time">0:00 / 0:00</span>
+          <select class="rate" aria-label="Playback rate"><option>0.25</option><option>0.5</option><option selected>1</option><option>2</option></select>
+        </div>
+        <details><summary>Metrics and inputs</summary><pre></pre></details>`;
+
+      const baseline = card.querySelector('.baseline');
+      const candidate = card.querySelector('.candidate');
+      const seek = card.querySelector('.seek');
+      const playButton = card.querySelector('.play');
+      const resourceStatus = card.querySelector('.resource-status');
+      const time = card.querySelector('.time');
+      const casePath = `../cases/${encodeURIComponent(item.id)}`;
+      const baselinePath = `${casePath}/baseline.mp4`;
+      const candidatePath = `${casePath}/sglang.mp4`;
+      let pendingSeek = null;
+
+      card.querySelector('.case-title').textContent = `${index + 1}. ${item.id}`;
+      const result = card.querySelector('.case-result');
+      result.className = `case-result ${item.passed ? 'pass' : 'fail'}`;
+      result.textContent = item.passed ? 'PASS' : 'FAIL';
+      card.querySelector('.case-meta').textContent = `action ${item.action_label} · case ${index + 1}/${caseCount}`;
+      card.querySelector('pre').textContent = JSON.stringify({
+        prompt: item.prompt,
+        action_label: item.action_label,
+        keys: item.keys,
+        baseline_video: baselinePath,
+        sglang_video: candidatePath,
+        failures: item.failures,
+        generated_frames: item.metrics.generated_frames
+      }, null, 2);
+
+      function sync(force=false) {
+        if (pendingSeek === null && (force || Math.abs(candidate.currentTime - baseline.currentTime) > 0.025)) {
+          candidate.currentTime = baseline.currentTime;
+        }
+        const duration = Number.isFinite(baseline.duration) ? baseline.duration : 0;
+        const currentTime = pendingSeek ?? baseline.currentTime;
+        seek.max = duration || 1;
+        seek.value = currentTime;
+        time.textContent = `${formatTime(currentTime)} / ${formatTime(duration)}`;
+      }
+
+      function seekBoth(seconds) {
+        const duration = Number.isFinite(baseline.duration) ? baseline.duration : seconds;
+        pendingSeek = Math.min(Math.max(0, seconds), duration);
+        baseline.currentTime = pendingSeek;
+        candidate.currentTime = pendingSeek;
+        seek.value = pendingSeek;
+        time.textContent = `${formatTime(pendingSeek)} / ${formatTime(duration)}`;
+      }
+
+      const readyPromise = Promise.all([
+        waitUntilReady(baseline, 'baseline.mp4'),
+        waitUntilReady(candidate, 'sglang.mp4')
+      ]);
+      baseline.src = baselinePath;
+      candidate.src = candidatePath;
+      baseline.load();
+      candidate.load();
+      readyPromise.then(() => {
+        resourceStatus.textContent = 'Ready';
+        sync(true);
+      }).catch(error => {
+        resourceStatus.className = 'resource-status error';
+        resourceStatus.textContent = error.message;
+      });
+
+      playButton.onclick = async () => {
+        if (baseline.paused) {
+          try {
+            await readyPromise;
+            sync(true);
+            await Promise.all([baseline.play(), candidate.play()]);
+            playButton.textContent = 'Pause both';
+          } catch (error) {
+            baseline.pause();
+            candidate.pause();
+            resourceStatus.className = 'resource-status error';
+            resourceStatus.textContent = error.message;
+          }
+        } else {
+          baseline.pause();
+          candidate.pause();
+        }
+      };
+      baseline.ontimeupdate = () => sync(false);
+      baseline.onseeked = () => { pendingSeek = null; sync(true); };
+      baseline.onpause = () => { candidate.pause(); playButton.textContent = 'Play both'; };
+      seek.oninput = () => seekBoth(Number(seek.value));
+      card.querySelector('.rate').onchange = event => {
+        baseline.playbackRate = candidate.playbackRate = Number(event.target.value);
+      };
+      card.querySelector('.prev').onclick = () => {
+        baseline.pause(); candidate.pause(); seekBoth(Number(seek.value) - 1/fps);
+      };
+      card.querySelector('.next').onclick = () => {
+        baseline.pause(); candidate.pause(); seekBoth(Number(seek.value) + 1/fps);
+      };
+      return card;
+    }
+
+    function renderReport(report) {
+      summary.textContent = `${report.summary.passed}/${report.summary.case_count} passed · ${report.summary.all_generated_bitwise ? 'bitwise exact' : 'numerical comparison'}`;
+      report.cases.forEach((item, index) => {
+        caseList.append(createCaseCard(item, index, report.cases.length));
+      });
+    }
+
+    const embeddedReportText = document.querySelector('#embedded-report').textContent.trim();
+    let embeddedReport = null;
+    try {
+      embeddedReport = JSON.parse(embeddedReportText);
+    } catch (_) {
+      // The source template keeps a placeholder; generated players embed the report.
+    }
+    const reportPromise = embeddedReport
+      ? Promise.resolve(embeddedReport)
+      : fetch('../report.json').then(response => {
+          if (!response.ok) throw new Error(`HTTP ${response.status}`);
+          return response.json();
+        });
+    reportPromise.then(renderReport).catch(error => {
+      summary.className = 'fail';
+      summary.textContent = `Comparison report failed to load: ${error.message}`;
+    });
+  </script>
+</body>
+</html>

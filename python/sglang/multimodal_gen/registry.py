@@ -37,6 +37,7 @@ from sglang.multimodal_gen.configs.pipeline_configs import (
     HunyuanConfig,
     LingBotWorldCausalDMDConfig,
     LingBotWorldV2CausalDMDConfig,
+    MinWMCausalDMDConfig,
     WanI2V480PConfig,
     WanI2V720PConfig,
     WanT2V480PConfig,
@@ -128,6 +129,7 @@ from sglang.multimodal_gen.configs.sample.krea2 import (
 from sglang.multimodal_gen.configs.sample.lingbot_world import (
     LingBotWorldSamplingParams,
 )
+from sglang.multimodal_gen.configs.sample.minwm import MinWMSamplingParams
 from sglang.multimodal_gen.configs.sample.ltx_2 import (
     LTX2SamplingParams,
     LTX23HQSamplingParams,
@@ -773,6 +775,11 @@ def _register_configs():
         ],
     )
     register_configs(
+        sampling_param_cls=MinWMSamplingParams,
+        pipeline_config_cls=MinWMCausalDMDConfig,
+        model_detectors=[lambda model_id: "minwm" in model_id.lower()],
+    )
+    register_configs(
         sampling_param_cls=FastWanT2V480PConfig,
         pipeline_config_cls=FastWan2_1_T2V_480P_Config,
         hf_model_paths=[
@@ -997,7 +1004,7 @@ def _register_configs():
         ],
         model_detectors=[
             # Match "sana-wm" or "sana_wm" but NOT plain T2I "sana" checkpoints.
-            lambda hf_id: ("sana-wm" in hf_id.lower() or "sana_wm" in hf_id.lower()),
+            lambda hf_id: "sana-wm" in hf_id.lower() or "sana_wm" in hf_id.lower(),
         ],
     )
 
@@ -1079,8 +1086,10 @@ def _register_configs():
             "jdopensource/JoyAI-Echo",
         ],
         model_detectors=[
-            lambda hf_id: ("joy-echo" in hf_id.lower() or "joyai-echo" in hf_id.lower())
-            and "image-edit" not in hf_id.lower(),
+            lambda hf_id: (
+                ("joy-echo" in hf_id.lower() or "joyai-echo" in hf_id.lower())
+                and "image-edit" not in hf_id.lower()
+            ),
         ],
     )
 

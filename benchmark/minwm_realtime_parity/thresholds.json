@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "profiles": {
+    "bitwise": {
+      "description": "Every lossless uint8 output frame must be identical.",
+      "require_bitwise": true
+    },
+    "bf16_backend_candidate": {
+      "description": "Candidate guardrail; replace only with a reviewed, measured bound from the same GPU/backend matrix.",
+      "require_bitwise": false,
+      "max_abs_lte": 8,
+      "rmse_lte": 1.0,
+      "ssim_gte": 0.995
+    }
+  }
+}

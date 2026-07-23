@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "contract": {
+    "case_count": 3,
+    "seed": 42,
+    "width": 1248,
+    "height": 704,
+    "fps": 24,
+    "generated_latent_frames": 32,
+    "chunks": 8,
+    "latent_frames_per_chunk": 4,
+    "generated_pixel_frames": 128,
+    "reference_pixel_frames": 1,
+    "action_type": "primitive_token_residual",
+    "action_output_format": "primitive_float",
+    "action_order": ["w", "a", "s", "d", "i", "j", "k", "l"]
+  },
+  "cases": [
+    {
+      "id": "00_forward_080_pottery_720p",
+      "source_id": "testset100_v2/G1/G1_short_w_p02",
+      "prompt": "Inside a dim, rustic pottery workshop, a pair of wet clay-covered hands cups a spinning lump of grey clay on a wheel, shaping it into a small vessel. A bowl of murky water sits nearby, and shelves of finished pots and tools line the warm, earthy-toned room behind.",
+      "first_frame": "s3://leap-world-us-east-2/world-model/eval/platform/eval_sets/minWM/testset100_v2/img/p02.png",
+      "action_label": 9,
+      "keys": ["w"],
+      "action_weights": [0.8, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    },
+    {
+      "id": "01_idle_ocean_720p",
+      "source_id": "testset100_v2/G1/G1_standard_idle_p15",
+      "prompt": "Through a round porthole window, the dark blue depths of the ocean glow faintly. A translucent jellyfish drifts near the glass with another floating above, while pale specks and small creatures hover in the murky water. The heavy metal frame around the window keeps the mood dim and mysterious.",
+      "first_frame": "s3://leap-world-us-east-2/world-model/eval/platform/eval_sets/minWM/testset100_v2/img/p15.png",
+      "action_label": 0,
+      "keys": []
+    },
+    {
+      "id": "02_forward_060_yaw_right_040_pottery_720p",
+      "source_id": "testset100_v2/G3/G3_p02",
+      "prompt": "Inside a dim, rustic pottery workshop, a pair of wet clay-covered hands cups a spinning lump of grey clay on a wheel, shaping it into a small vessel. A bowl of murky water sits nearby, and shelves of finished pots and tools line the warm, earthy-toned room behind.",
+      "first_frame": "s3://leap-world-us-east-2/world-model/eval/platform/eval_sets/minWM/testset100_v2/img/p02.png",
+      "action_label": 10,
+      "keys": ["w", "l"],
+      "action_weights": [0.6, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.4]
+    }
+  ]
+}

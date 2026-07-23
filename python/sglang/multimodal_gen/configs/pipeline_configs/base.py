@@ -185,6 +185,12 @@ class PipelineConfig:
     model_path: str = ""
     pipeline_config_path: str | None = None
 
+    # Components that must use the upstream diffusers/transformers
+    # implementation instead of SGLang's optimized implementation.  This is
+    # intentionally opt-in: a pipeline should only use it when its numerical
+    # contract depends on the exact upstream kernels and module structure.
+    native_component_names: tuple[str, ...] = field(default_factory=tuple)
+
     # precision and autocast
     enable_autocast: bool = True
 
@@ -207,6 +213,10 @@ class PipelineConfig:
     vae_tiling: bool = True
     vae_slicing: bool = False
     vae_sp: bool = True
+    # Most pipelines preprocess in the VAE compute dtype. Models whose wire
+    # contract needs the lossless FP32 image grid can opt into running the
+    # model-specific hook before that cast.
+    preprocess_vae_encode_before_dtype_cast: bool = False
 
     # Image encoder configuration
     image_encoder_config: EncoderConfig = field(default_factory=EncoderConfig)
@@ -1070,9 +1080,9 @@ class PipelineConfig:
                 elif isinstance(current_value, tuple) and all(
                     isinstance(v, ModelConfig) for v in current_value
                 ):
-                    assert len(current_value) == len(
-                        new_value
-                    ), "Users shouldn't delete or add text encoder config objects in your json"
+                    assert len(current_value) == len(new_value), (
+                        "Users shouldn't delete or add text encoder config objects in your json"
+                    )
                     for target_config, source_config in zip(
                         current_value, new_value, strict=True
                     ):
