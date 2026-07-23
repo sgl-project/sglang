@@ -252,26 +252,28 @@ impl Server {
 
     /// Pop the native MM result for `rid` (stored strictly before the request
     /// was pushed to the ingress ring). Returns
-    /// `(features_f32_bytes, grids, offsets, mrope_i64_bytes, mrope_delta)`
-    /// or `None` when the request took the Python path. Called by
-    /// `RustServer.drain` under the GIL — the buffers are wrapped zero-copy
-    /// into tensors there; no processing happens Python-side.
+    /// `(features_f32, grids, offsets, mrope_i64, mrope_delta)` or `None` when
+    /// the request took the Python path. The two numeric buffers are 1-D numpy
+    /// arrays that take **ownership** of the Rust vectors — no copy. This runs
+    /// on the scheduler loop (`RustServer.drain`, under the GIL) between
+    /// decode steps, so a memcpy here (tens of MB per image-heavy request)
+    /// would stall every running request's inter-token latency.
     fn take_native_mm<'py>(
         &self,
         py: Python<'py>,
         rid: &str,
     ) -> Option<(
-        Bound<'py, PyBytes>,
+        Bound<'py, numpy::PyArray1<f32>>,
         Vec<(u32, u32, u32)>,
         Vec<(u32, u32)>,
-        Bound<'py, PyBytes>,
+        Bound<'py, numpy::PyArray1<i64>>,
         i64,
     )> {
+        use numpy::IntoPyArray;
+
         let res = self.rt.mm_native.lock().unwrap().remove(rid)?;
-        // f32/i64 → native-endian byte views (numpy `frombuffer` reads the
-        // same layout on the Python side).
-        let features = PyBytes::new(py, cast_bytes(&res.features));
-        let mrope = PyBytes::new(py, cast_bytes(&res.mrope));
+        let features = res.features.into_pyarray(py);
+        let mrope = res.mrope.into_pyarray(py);
         let grids = res.grids.iter().map(|g| (g[0], g[1], g[2])).collect();
         Some((features, grids, res.offsets, mrope, res.mrope_delta))
     }
@@ -280,13 +282,6 @@ impl Server {
     fn shutdown(&self) {
         self.rt.request_shutdown();
     }
-}
-
-/// Reinterpret a plain-old-data slice as its raw bytes (native endianness).
-fn cast_bytes<T: Copy>(v: &[T]) -> &[u8] {
-    // Safety: `T` is a primitive numeric here (f32/i64) — no padding, any
-    // byte pattern valid, alignment only decreases.
-    unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
 }
 
 /// Keeps the non-blocking log writer's background thread alive for the process

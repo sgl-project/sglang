@@ -13,6 +13,10 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 # --- Python boundary (only crossed by recv_requests / push_chunk) ---
 pyo3 = { version = "0.29.0", features = ["extension-module"] }
+# numpy arrays for the native-MM drain handoff: `take_native_mm` moves the
+# feature/mrope vectors into arrays (zero copy) so the scheduler loop never
+# memcpys multi-MB pixel buffers under the GIL.
+numpy = "0.29.0"
 
 # --- async API server (I/O bound) ---
 tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "macros", "time", "signal"] }

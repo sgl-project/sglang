@@ -215,8 +215,11 @@ class MmProcessorHost:
         """Drain-time adapter: wrap the Rust-produced buffers into the
         scheduler's ``MultimodalProcessorOutput``. Only tensor wrapping happens
         here — all processing (load, resize, patchify, token expansion, M-RoPE)
-        already ran in Rust."""
-        import numpy as np
+        already ran in Rust. This runs on the scheduler loop, so it must stay
+        copy-free: the numpy arrays from ``take_native_mm`` own the Rust
+        buffers (zero copy) and ``torch.from_numpy`` only wraps them —
+        memcpying the pixel features here (tens of MB per image-heavy request)
+        measurably stalls every running request's inter-token latency."""
         import torch
 
         from sglang.srt.managers.schedule_batch import (
@@ -225,13 +228,10 @@ class MmProcessorHost:
             MultimodalProcessorOutput,
         )
 
-        features_b, grids, offsets, mrope_b, mrope_delta = entry
+        features_arr, grids, offsets, mrope_arr, mrope_delta = entry
         native = self._native
-        # bytearray: torch.from_numpy needs a writable buffer (one memcpy).
         features = torch.from_numpy(
-            np.frombuffer(bytearray(features_b), dtype=np.float32).reshape(
-                -1, native["feature_dim"]
-            )
+            features_arr.reshape(-1, native["feature_dim"])
         )
         items = []
         row = 0
@@ -251,9 +251,7 @@ class MmProcessorHost:
         if envs.SGLANG_MM_PRECOMPUTE_HASH.get():
             for item in items:
                 item.set_pad_value()
-        mrope_positions = torch.from_numpy(
-            np.frombuffer(bytearray(mrope_b), dtype=np.int64).reshape(3, -1)
-        )
+        mrope_positions = torch.from_numpy(mrope_arr.reshape(3, -1))
         return MultimodalProcessorOutput(
             mm_items=items,
             im_token_id=native["image_token_id"],
