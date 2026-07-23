@@ -4,8 +4,8 @@
 /docs @wisclmy0611 @zijiexia @sogalin
 /docs_new @wisclmy0611 @zijiexia @Richardczl98 @JustinTong0323 @sogalin
 /python/pyproject.toml @merrymercy @Fridge003 @ispobock
-/python/sglang/jit_kernel @DarkSharpness @BBuf @celve @HydraQYH @yuan-luo
-/python/sglang/jit_kernel/diffusion @yingluosanqian @BBuf @mickqian
+/python/sglang/kernels @DarkSharpness @BBuf @celve @HydraQYH @yuan-luo
+/python/sglang/kernels/ops/diffusion @yingluosanqian @BBuf @mickqian
 /python/sglang/kernels/ops/attention/fla @yizhang2077 @hebiao064 @yuan-luo
 /python/sglang/multimodal_gen @mickqian @ping1jing2 @HaiShaw @yichiche @AgainstEntropy @BBuf
 /python/sglang/multimodal_gen/runtime/cache @DefTruth
@@ -101,5 +101,5 @@
 /python/sglang/srt/speculative/adaptive_*.py @Qiaolin-Yu @alphabetc1
 /python/sglang/srt/speculative/cpp_ngram @hnyls2002 @Qiaolin-Yu @kpham-sgl
 /python/sglang/srt/speculative/frozen_kv_mtp_*.py @hnyls2002 @Qiaolin-Yu @kpham-sgl @pyc96
-/python/sglang/jit_kernel/ngram_*.py @hnyls2002 @Qiaolin-Yu @kpham-sgl
-/python/sglang/jit_kernel/csrc/ngram_corpus @hnyls2002 @Qiaolin-Yu @kpham-sgl
+/python/sglang/kernels/ops/speculative/ngram_*.py @hnyls2002 @Qiaolin-Yu @kpham-sgl
+/python/sglang/kernels/jit/csrc/ngram_corpus @hnyls2002 @Qiaolin-Yu @kpham-sgl

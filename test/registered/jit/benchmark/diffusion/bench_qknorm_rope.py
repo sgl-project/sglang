@@ -5,7 +5,7 @@ import torch
 import triton
 import triton.testing
 
-from sglang.jit_kernel.benchmark.utils import (
+from sglang.kernels.jit.benchmark.utils import (
     DEFAULT_DEVICE,
     DEFAULT_DTYPE,
     get_benchmark_range,
@@ -131,7 +131,7 @@ def clone_inputs(
 def split_qknorm_rope(inputs: dict[str, torch.Tensor | bool]) -> None:
     from flashinfer.rope import apply_rope_with_cos_sin_cache_inplace
 
-    from sglang.jit_kernel.norm import fused_inplace_qknorm
+    from sglang.kernels.ops.layernorm._jit_norm import fused_inplace_qknorm
 
     q = inputs["q"]
     k = inputs["k"]

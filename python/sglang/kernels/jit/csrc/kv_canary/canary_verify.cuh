@@ -139,7 +139,7 @@ __global__ void canary_verify_kernel(const VerifyKernelParams __grid_constant__ 
 
 }  // namespace
 
-// API source of truth: docstring of canary_verify_step in python/sglang/jit_kernel/kv_canary/verify.py.
+// API source of truth: docstring of canary_verify_step in python/sglang/kernels/ops/kv_canary/verify.py.
 //
 // ABI notes:
 // - real_kv_buf_0 .. real_kv_buf_3 are 4 fixed uint8 tensor slots. Unused slots are dummy 1-byte tensors;

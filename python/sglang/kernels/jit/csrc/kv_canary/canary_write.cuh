@@ -166,7 +166,7 @@ __global__ void canary_write_kernel(const WriteKernelParams __grid_constant__ p)
 
 }  // namespace
 
-// API source of truth: docstring of canary_write_step in python/sglang/jit_kernel/kv_canary/write.py.
+// API source of truth: docstring of canary_write_step in python/sglang/kernels/ops/kv_canary/write.py.
 //
 // ABI notes (same as verify):
 // - real_kv_buf_0 .. real_kv_buf_3 are 4 fixed uint8 tensor slots.

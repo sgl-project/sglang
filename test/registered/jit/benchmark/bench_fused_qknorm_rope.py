@@ -14,7 +14,7 @@ import torch
 import triton
 import triton.testing
 
-from sglang.jit_kernel.benchmark.utils import get_benchmark_range, run_benchmark
+from sglang.kernels.jit.benchmark.utils import get_benchmark_range, run_benchmark
 from sglang.kernels.ops.attention.fused_qknorm_rope import (
     fused_qk_norm_rope as fused_qk_norm_rope_jit,
 )

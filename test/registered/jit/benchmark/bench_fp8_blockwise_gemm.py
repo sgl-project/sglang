@@ -5,7 +5,7 @@ import sys
 import torch
 import triton
 
-from sglang.jit_kernel.benchmark.utils import get_benchmark_range, run_benchmark
+from sglang.kernels.jit.benchmark.utils import get_benchmark_range, run_benchmark
 from sglang.kernels.ops.gemm.fp8_blockwise_gemm import fp8_blockwise_scaled_mm
 from sglang.srt.utils import is_sm120_supported
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
