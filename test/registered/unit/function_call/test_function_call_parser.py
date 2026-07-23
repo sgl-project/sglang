@@ -49,6 +49,30 @@ class TestInklingDetector(unittest.TestCase):
             )
         ]
 
+    def test_streaming_string_payload_does_not_raise(self):
+        """A JSON-string payload must not escape the streaming entry point.
+
+        partial_json_parser raises PartialJSON for an incomplete string while
+        Allow.STR is masked off. PartialJSON subclasses partial_json_parser's
+        own JSONDecodeError, not the stdlib one, so it slipped past the handler
+        and propagated out of parse_streaming_increment. Non-streaming already
+        rejected these payloads gracefully.
+        """
+        for source in (
+            '<|content_invoke_tool_json|>"hello"<|end_message|>',
+            '<|message_model|>weather<|content_invoke_tool_json|>"hello"<|end_message|>',
+            '<|content_invoke_tool_json|>"unterminated',
+        ):
+            with self.subTest(source=source):
+                detector = InklingDetector()
+                for ch in source:
+                    detector.parse_streaming_increment(ch, self.tools)
+                # And the non-streaming path stays graceful on the same input.
+                self.assertEqual(
+                    len(InklingDetector().detect_and_parse(source, self.tools).calls),
+                    0,
+                )
+
     def test_canonical_header_is_not_visible_content(self):
         detector = InklingDetector()
         source = (
