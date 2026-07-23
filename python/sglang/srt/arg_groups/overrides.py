@@ -497,7 +497,12 @@ def _minimax_m3_overrides(server_args: Any, hf_config: Any) -> dict:
             )
             overrides["enable_aiter_allreduce_fusion"] = False
             aiter_fusion_resolved = False
-        if not aiter_fusion_resolved:
+        # By default MiniMax-M3 on ROCm keeps NCCL all-reduce (custom AR off)
+        # whenever aiter all-reduce fusion is not used. Opting in via
+        # SGLANG_M3_ALLOW_CUSTOM_AR keeps custom all-reduce enabled so the
+        # quick-reduce path (ROCM_QUICK_REDUCE_QUANTIZATION=INT4/INT6/INT8) can
+        # accelerate the large prefill all-reduce.
+        if not aiter_fusion_resolved and not envs.SGLANG_M3_ALLOW_CUSTOM_AR.get():
             overrides["disable_custom_all_reduce"] = True
     elif is_sm100_supported():
         if server_args.is_attention_backend_not_set():
