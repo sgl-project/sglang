@@ -19,7 +19,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 register_cuda_ci(est_time=128, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 # Exact M×N Hadamard matrices (±1 entries) copied from
-# python/sglang/jit_kernel/csrc/fast-hadamard-transform/code_gen.py.
+# python/sglang/kernels/jit/csrc/fast-hadamard-transform/code_gen.py.
 # These are non-power-of-2 Hadamard matrices constructed via Paley/Williamson methods.
 # "+" = +1, "-" = -1.  Used by the _12n/_20n/_28n/_40n kernel variants.
 
@@ -145,7 +145,7 @@ def _parse_hadamard_str(s):
 
 
 # Parsed M×M special Hadamard matrices, keyed by M (the "multiple").
-# Copied from python/sglang/jit_kernel/csrc/fast-hadamard-transform/code_gen.py
+# Copied from python/sglang/kernels/jit/csrc/fast-hadamard-transform/code_gen.py
 # (had_12_paley, had_20_will, had_28_will, had_40_tpal)
 _SPECIAL_MATRICES = {
     12: _parse_hadamard_str(_HAD_12_STR),
@@ -187,7 +187,7 @@ def hadamard_transform_mn_ref(x, multiple, scale=1.0):
     x = x.reshape(-1, dim)
 
     # The kernel requires dim % (4*M) == 0 (for vectorized memory access).
-    # See python/sglang/jit_kernel/hadamard.py: pad_multiple = 4 * 12 / 4 * 20 / etc.
+    # See python/sglang/kernels/ops/attention/hadamard.py: pad_multiple = 4 * 12 / 4 * 20 / etc.
     pad_multiple = 4 * multiple
     if dim % pad_multiple != 0:
         pad_size = pad_multiple - dim % pad_multiple
@@ -319,7 +319,7 @@ def test_hadamard_transform_scale_one(dtype):
 
 # Test dimensions for M×N variants: dim = M * N where N = 2^k.
 # M = 12/20/28/40 are the non-power-of-2 Hadamard sizes registered in
-# python/sglang/jit_kernel/hadamard.py (Hadamard12NKernel, ..., Hadamard40NKernel).
+# python/sglang/kernels/ops/attention/hadamard.py (Hadamard12NKernel, ..., Hadamard40NKernel).
 # range(2,9) gives N = 4,8,...,256 so dims cover a practical range.
 _12N_DIMS = [12 * (2**k) for k in range(2, 9)]  # 48, 96, ... , 3072
 _20N_DIMS = [20 * (2**k) for k in range(2, 9)]  # 80, 160, ... , 5120

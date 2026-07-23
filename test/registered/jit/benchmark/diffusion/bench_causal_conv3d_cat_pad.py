@@ -2,7 +2,7 @@ from dataclasses import dataclass
 
 import torch
 
-from sglang.jit_kernel.benchmark import marker
+from sglang.kernels.jit.benchmark import marker
 from sglang.kernels.ops.diffusion.causal_conv3d_cat_pad import (
     fused_causal_conv3d_cat_pad_cuda,
 )

@@ -372,6 +372,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         # HiCache D↔H defaults (overridden by init_hicache)
         self.cache_controller: Optional[HybridCacheController] = None
+        self.host_pool_group = None  # set by attach_hybrid_pool_to_unified_cache
         self.write_through_threshold = 256
         self.prefetch_stop_policy = "best_effort"
         self.prefetch_threshold = 256
@@ -592,6 +593,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             # owns the transfer descriptor. Both registrations are required.
             self.cache_controller.register_host_pool_entry(entry)
             self.register_sidecar_pool(spec)
+    def release_host_resources(self) -> None:
+        if self.host_pool_group is not None:
+            self.host_pool_group.destroy()
 
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         result = self.session.try_match_prefix(params)

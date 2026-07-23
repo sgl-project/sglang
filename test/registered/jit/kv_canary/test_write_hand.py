@@ -7,7 +7,7 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from sglang.jit_kernel.tests.kv_canary._canary_helpers import (
+from sglang.kernels.jit.tests.kv_canary._canary_helpers import (
     FakeViolationLog,
     assert_canary_state_equal,
     assert_only_bits_set,
@@ -24,15 +24,15 @@ from sglang.jit_kernel.tests.kv_canary._canary_helpers import (
     stamp_pair,
     to_signed_int64,
 )
-from sglang.jit_kernel.tests.kv_canary._differential import (
+from sglang.kernels.jit.tests.kv_canary._differential import (
     _run_both_write,
     run_write_diff,
 )
-from sglang.jit_kernel.tests.kv_canary._fixtures import (
+from sglang.kernels.jit.tests.kv_canary._fixtures import (
     clone_real_kv_sources,
     dummy_pseudo_tensors,
 )
-from sglang.jit_kernel.tests.kv_canary._hand_oracle import (
+from sglang.kernels.jit.tests.kv_canary._hand_oracle import (
     _hand_fold_all,
     _hand_fold_partial,
 )

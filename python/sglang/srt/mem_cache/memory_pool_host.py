@@ -1582,6 +1582,10 @@ class HostPoolGroup:
         for entry in self.entries:
             entry.host_pool.clear()
 
+    def destroy(self) -> None:
+        for entry in self.entries:
+            entry.host_pool.destroy()
+
     def available_size(self):
         return self.anchor_entry.host_pool.available_size()
 

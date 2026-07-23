@@ -7,7 +7,7 @@ import torch
 import triton
 import triton.testing
 
-from sglang.jit_kernel.benchmark.kv_canary.utils import (
+from sglang.kernels.jit.benchmark.kv_canary.utils import (
     POOL_AXIS,
     SWA_WINDOW,
     BenchCase,
@@ -15,7 +15,7 @@ from sglang.jit_kernel.benchmark.kv_canary.utils import (
     build_full_matrix_cases,
     naive_cumsum_fn,
 )
-from sglang.jit_kernel.benchmark.utils import (
+from sglang.kernels.jit.benchmark.utils import (
     DEFAULT_DEVICE,
     get_benchmark_range,
     run_benchmark,

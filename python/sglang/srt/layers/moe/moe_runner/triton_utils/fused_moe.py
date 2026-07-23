@@ -28,7 +28,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
 from sglang.srt.layers.moe.utils import get_moe_padding_size
-from sglang.srt.runtime_context import get_exec
+from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -60,7 +60,7 @@ _is_musa = is_musa()
 if _is_cuda:
     from sgl_kernel import moe_sum_reduce
 
-    from sglang.jit_kernel.activation import gelu_and_mul, silu_and_mul
+    from sglang.kernels.ops.activation._jit_activation import gelu_and_mul, silu_and_mul
 elif _is_cpu and _is_cpu_amx_available:
     pass
 elif _is_hip:
@@ -506,7 +506,7 @@ def _fused_moe_kernel_sequence(
             out_hidden_states = torch.empty_like(hidden_states)
 
     use_fused_moe_sum_all_reduce = (
-        get_exec().moe.enable_fused_moe_sum_all_reduce
+        get_server_args().enable_fused_moe_sum_all_reduce
         and (not no_combine)
         and (topk > 2)
         and (not use_int8_w8a16)

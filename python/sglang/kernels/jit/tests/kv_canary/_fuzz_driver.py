@@ -3,7 +3,7 @@ from __future__ import annotations
 import random
 from typing import Any, Callable
 
-from sglang.jit_kernel.tests.kv_canary._differential import (
+from sglang.kernels.jit.tests.kv_canary._differential import (
     ShrinkResult,
     shrink_inputs,
 )

@@ -42,7 +42,9 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.attention.mamba.mamba import mamba_v2_sharded_weight_loader
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
-from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+from sglang.srt.layers.dp_attention import (
+    is_dp_attention_enabled,
+)
 
 # Layers - Others
 from sglang.srt.layers.layernorm import GemmaRMSNorm
@@ -89,7 +91,6 @@ from sglang.srt.models.utils import (
     fused_qk_gemma_rmsnorm_with_gate,
 )
 from sglang.srt.runtime_context import (
-    get_exec,
     get_forward,
     get_parallel,
     get_server_args,
@@ -137,7 +138,7 @@ cached_get_processor = lru_cache(get_processor)
 def _disable_shared_experts_fusion() -> bool:
     # Resolved lazily: the global server args is not set at module import time
     # (e.g. when this module is imported by unit tests).
-    return get_exec().moe.disable_shared_experts_fusion
+    return get_server_args().disable_shared_experts_fusion
 
 
 if _is_cuda:
@@ -1310,7 +1311,7 @@ class Qwen3_5ForCausalLM(nn.Module):
         # so the model still gets the #25885 multi-streaming path. ROCm-only.
         if (
             config.model_type == "qwen3_5_moe_text"
-            and not get_exec().moe.disable_shared_experts_fusion
+            and not get_server_args().disable_shared_experts_fusion
             and not can_fuse_shared_expert(config, quant_config)
         ):
             from sglang.srt.arg_groups.overrides import declare_load_time_override

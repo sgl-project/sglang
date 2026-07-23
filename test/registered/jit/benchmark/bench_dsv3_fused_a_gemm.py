@@ -8,9 +8,9 @@ import torch
 import torch.nn.functional as F
 import triton.testing
 
-from sglang.jit_kernel.benchmark import marker
-from sglang.jit_kernel.dsv3_fused_a_gemm import dsv3_fused_a_gemm
+from sglang.kernels.jit.benchmark import marker
 from sglang.kernels.jit.utils import get_jit_cuda_arch, is_hip_runtime
+from sglang.kernels.ops.gemm._jit_dsv3_fused_a_gemm import dsv3_fused_a_gemm
 from sglang.kernels.ops.gemm.cutedsl_dsv3_fused_a_gemm import (
     dsv3_fused_a_gemm as cutedsl_dsv3_fused_a_gemm,
 )
