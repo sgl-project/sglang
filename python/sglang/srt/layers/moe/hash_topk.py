@@ -22,12 +22,14 @@ from sglang.srt.layers.moe.topk import (
     remap_topk_for_per_rank_shared_slots,
 )
 from sglang.srt.layers.moe.utils import has_per_rank_fused_shared_slots
-from sglang.srt.utils import is_hip, is_npu
+from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_hip, is_npu
 
 logger = logging.getLogger(__name__)
 
 _is_hip = is_hip()
 _is_npu = is_npu()
+_is_cpu = is_cpu()
+_is_cpu_amx_available = cpu_has_amx_support()
 
 
 class HashTopK(nn.Module):
@@ -188,8 +190,19 @@ class HashTopK(nn.Module):
         assert (
             input_ids.shape[0] == hidden_states.shape[0] == router_logits.shape[0]
         ), f"{input_ids.shape=} {hidden_states.shape=} {router_logits.shape=}"
-
-        if envs.SGLANG_OPT_USE_FUSED_HASH_TOPK.get():
+        if _is_cpu and _is_cpu_amx_available:
+            # CPU SGL kernel path: tid2eid lookup done in Python, kernel does scoring + gather
+            tid2eid_for_tokens = self.tid2eid[input_ids]  # [num_tokens, routed_topk]
+            topk_weights, topk_ids = torch.ops.sgl_kernel.hash_topk_cpu(
+                router_logits,
+                tid2eid_for_tokens,
+                self.topk,
+                self.score_func,
+                self.num_fused_shared_experts,
+                self.num_experts,
+                self.routed_scaling_factor,
+            )
+        elif envs.SGLANG_OPT_USE_FUSED_HASH_TOPK.get():
             from sglang.kernels.ops.attention.dsv4 import hash_topk
 
             topk_weights, topk_ids = hash_topk(

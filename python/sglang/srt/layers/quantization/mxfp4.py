@@ -146,6 +146,7 @@ if TYPE_CHECKING:
 _is_cpu = is_cpu()
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_is_cpu_amx_available = cpu_has_amx_support()
 _is_shuffle_moe_mxfp4 = is_gfx95_supported()
 _is_cpu_amx_available = cpu_has_amx_support()
 
@@ -1122,6 +1123,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     self.moe_runner_config,
                 )
             return StandardCombineInput(hidden_states=output)
+
+        if use_intel_amx_backend(layer):
+            from sglang.srt.layers.amx_utils import amx_fused_experts_mxfp4
+
+            return amx_fused_experts_mxfp4(
+                layer, dispatch_output, self.moe_runner_config
+            )
 
         if self.use_marlin:
             assert TopKOutputChecker.format_is_standard(topk_output)

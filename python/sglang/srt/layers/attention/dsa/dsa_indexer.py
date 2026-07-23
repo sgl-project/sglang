@@ -44,7 +44,9 @@ from sglang.srt.state_capturer.indexer_topk import (
 from sglang.srt.utils import (
     add_prefix,
     ceil_align,
+    cpu_has_amx_support,
     get_bool_env_var,
+    is_cpu,
     is_cuda,
     is_gfx95_supported,
     is_hip,
@@ -82,6 +84,9 @@ else:
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_fp8_fnuz = is_fp8_fnuz()
 _is_gfx95_supported = is_gfx95_supported()
+_is_cpu = is_cpu()
+_cpu_amx = cpu_has_amx_support()
+
 # Whether the aiter preshuffle paged-MQA path (page_size=64 + Preshuffle=True +
 # KVBlockSize=64) can be used. Falls back to the legacy page_size=1 / KVBlockSize=1
 # path when the gluon kernel is unavailable (Triton<3.5 and no AOT bundle).
@@ -340,6 +345,8 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     # from sgl_kernel import hadamard_transform
     if _is_hip:
         from fast_hadamard_transform import hadamard_transform
+    elif _is_cpu and _cpu_amx:
+        hadamard_transform = torch.ops.sgl_kernel.fast_hadamard_transform_cpu
     elif _is_xpu:
         from sgl_kernel import hadamard_transform
     else:

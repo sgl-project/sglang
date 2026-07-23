@@ -6,10 +6,13 @@ import triton.language as tl
 
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
-from sglang.srt.utils import get_bool_env_var, is_hip
+from sglang.srt.utils import cpu_has_amx_support, get_bool_env_var, is_cpu, is_hip
 
 _is_hip = is_hip()
 _is_fp8_fnuz = is_fp8_fnuz()
+_is_cpu = is_cpu()
+_cpu_amx = cpu_has_amx_support()
+
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 # aiter cp_gather kernel with preshuffle=True is only valid when the indexer
 # uses the page_size=64 preshuffle layout (i.e. when the matching MQA gluon path
@@ -256,7 +259,19 @@ class GetKAndS:
 class SetKAndS:
     @classmethod
     def execute(cls, *args, buf, **kwargs):
-        cls.triton(*args, **kwargs, buf=buf)
+        if _is_cpu and _cpu_amx:
+            cls.execute_cpu(*args, **kwargs, buf=buf)
+        else:
+            cls.triton(*args, **kwargs, buf=buf)
+
+    @classmethod
+    def execute_cpu(cls, pool, buf, loc, index_k, index_k_scale):
+        torch.ops.sgl_kernel.set_k_cpu(
+            buf, loc, index_k, pool.page_size, pool.index_head_dim
+        )
+        torch.ops.sgl_kernel.set_s_cpu(
+            buf, loc, index_k_scale, pool.page_size, pool.index_head_dim
+        )
 
     @classmethod
     def triton(cls, pool, buf, loc, index_k, index_k_scale):

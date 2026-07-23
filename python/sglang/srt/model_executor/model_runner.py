@@ -191,7 +191,7 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     enable_show_time_cost,
     get_available_gpu_memory,
-    is_host_cpu_arm64,
+    is_cpu,
     is_npu,
     numa_utils,
     require_gathered_buffer,
@@ -210,9 +210,9 @@ from sglang.srt.utils.profile_utils import build_step_span_name
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.weight_checker import WeightChecker
 
+_is_cpu = is_cpu()
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
-_is_cpu_arm64 = is_host_cpu_arm64()
 
 if _is_npu:
     from sglang.srt.hardware_backend.npu.utils import init_npu_backend
@@ -1293,7 +1293,11 @@ class ModelRunner:
             self.msprobe_debugger.start(model=self.model, rank_id=rank_id)
 
         # Step span
-        step_span_ctx = profile_range(build_step_span_name(forward_batch))
+        step_span_ctx = (
+            profile_range(build_step_span_name(forward_batch))
+            if not (_is_cpu and _is_cpu_amx_available)
+            else contextlib.nullcontext()
+        )
 
         canary_ctx = (
             context_tuple(

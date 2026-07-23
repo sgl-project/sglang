@@ -1717,6 +1717,35 @@ def biased_grouped_topk_cpu(
     )
 
 
+def biased_topk_cpu(
+    hidden_states: torch.Tensor,
+    gating_output: torch.Tensor,
+    correction_bias: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+    scoring_func: str = "sigmoid",
+    num_fused_shared_experts: int = 0,
+    routed_scaling_factor: Optional[float] = None,
+    num_token_non_padded: Optional[torch.Tensor] = None,
+    expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+    apply_routed_scaling_factor_on_output: Optional[bool] = False,
+):
+    topk_weights, topk_ids = torch.ops.sgl_kernel.biased_topk_cpu(
+        hidden_states,
+        gating_output,
+        correction_bias,
+        topk,
+        renormalize,
+        scoring_func,
+        num_fused_shared_experts,
+        routed_scaling_factor,
+        apply_routed_scaling_factor_on_output or False,
+    )
+    topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
+    _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
+    return topk_weights, topk_ids
+
+
 if _is_cpu and _is_cpu_amx_available:
     biased_grouped_topk = biased_grouped_topk_cpu
     grouped_topk = grouped_topk_cpu
@@ -2071,28 +2100,46 @@ def select_experts(
         if scoring_func not in ("sqrtsoftplus", "sigmoid"):
             assert not apply_routed_scaling_factor_on_output, "Not implemented"
 
-        # Keep sigmoid flag-off byte-identical: only use the JIT gate when the flag is on.
-        use_jit_fused_gate = envs.SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK.get()
-        if scoring_func == "sqrtsoftplus" or (
-            scoring_func == "sigmoid" and use_jit_fused_gate
-        ):
-            _biased_topk = (
-                biased_topk_jit_kernel_impl if use_jit_fused_gate else biased_topk_impl
-            )
+        if scoring_func == "sqrtsoftplus":
+            if _is_cpu and _is_cpu_amx_available:
+                topk_weights, topk_ids = biased_topk_cpu(
+                    hidden_states=hidden_states,
+                    gating_output=router_logits,
+                    correction_bias=correction_bias,
+                    topk=top_k,
+                    renormalize=renormalize,
+                    scoring_func=scoring_func,
+                    num_fused_shared_experts=num_fused_shared_experts,
+                    routed_scaling_factor=routed_scaling_factor,
+                    num_token_non_padded=num_token_non_padded,
+                    expert_location_dispatch_info=expert_location_dispatch_info,
+                    apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+                )
+            else:
+                # Keep sigmoid flag-off byte-identical: only use the JIT gate when the flag is on.
+                use_jit_fused_gate = envs.SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK.get()
+                if scoring_func == "sqrtsoftplus" or (
+                    scoring_func == "sigmoid" and use_jit_fused_gate
+                ):
+                    _biased_topk = (
+                        biased_topk_jit_kernel_impl
+                        if use_jit_fused_gate
+                        else biased_topk_impl
+                    )
 
-            topk_weights, topk_ids = _biased_topk(
-                hidden_states=hidden_states,
-                gating_output=router_logits,
-                correction_bias=correction_bias,
-                topk=num_routed_topk if _use_aiter else top_k,
-                renormalize=renormalize,
-                scoring_func=scoring_func,
-                num_fused_shared_experts=num_fused_shared_experts,
-                routed_scaling_factor=routed_scaling_factor,
-                num_token_non_padded=num_token_non_padded,
-                expert_location_dispatch_info=expert_location_dispatch_info,
-                apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
-            )
+                topk_weights, topk_ids = _biased_topk(
+                    hidden_states=hidden_states,
+                    gating_output=router_logits,
+                    correction_bias=correction_bias,
+                    topk=num_routed_topk if _use_aiter else top_k,
+                    renormalize=renormalize,
+                    scoring_func=scoring_func,
+                    num_fused_shared_experts=num_fused_shared_experts,
+                    routed_scaling_factor=routed_scaling_factor,
+                    num_token_non_padded=num_token_non_padded,
+                    expert_location_dispatch_info=expert_location_dispatch_info,
+                    apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+                )
         elif (
             get_moe_runner_backend().is_flashinfer_trtllm_routed()
             and scoring_func == "softmax"

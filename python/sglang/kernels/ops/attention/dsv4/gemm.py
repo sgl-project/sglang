@@ -5,10 +5,12 @@ from typing import Optional
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.utils import get_bool_env_var, is_hip
+from sglang.srt.utils import cpu_has_amx_support, get_bool_env_var, is_cpu, is_hip
 
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_is_cpu = is_cpu()
+_cpu_amx = cpu_has_amx_support()
 
 if _use_aiter:
     from aiter.tuned_gemm import tgemm
@@ -113,7 +115,11 @@ def linear_bf16_fp32(
     *,
     hpc_kernel_min_m: Optional[int] = None,
 ) -> torch.Tensor:
-    if _use_aiter and y.dtype == torch.bfloat16:
+    if _is_cpu and _cpu_amx:
+        return torch.ops.sgl_kernel.weight_packed_linear(
+            x, y, None, True, torch.float32
+        )
+    elif _use_aiter and y.dtype == torch.bfloat16:
         return tgemm.mm(x, y, otype=x.dtype).float()
     elif hpc_kernel_min_m is not None:
         output = _linear_bf16_fp32_hpc(x, y, min_m=hpc_kernel_min_m)

@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from sglang.kernels.ops.attention.dsv4 import (
     fused_q_indexer_rope_hadamard_fp4_quant,
     fused_q_indexer_rope_hadamard_quant,
+    fused_rope_inplace,
     topk_transform_512,
     topk_transform_512_v2,
 )
@@ -30,9 +31,18 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
-from sglang.srt.utils import add_prefix, is_cuda, is_hip, is_xpu
+from sglang.srt.utils import (
+    add_prefix,
+    cpu_has_amx_support,
+    is_cpu,
+    is_cuda,
+    is_hip,
+    is_xpu,
+)
 from sglang.srt.utils.common import is_sm120_supported
 
+_is_cpu = is_cpu()
+_cpu_amx = cpu_has_amx_support()
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
     from sglang.srt.layers.attention.dsv4.compressor import (
@@ -45,6 +55,16 @@ if TYPE_CHECKING:
 
 FP8_DTYPE = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
 
+
+if _is_cpu and _cpu_amx:
+
+    def act_quant_cpu(
+        x: torch.Tensor, block_size: int = 128, scale_fmt: Optional[str] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return torch.ops.sgl_kernel.act_quant_cpu(x, block_size, scale_fmt)
+
+    act_quant = act_quant_cpu
+    from sglang.srt.layers.attention.nsa.nsa_indexer import rotate_activation
 
 IndexerQuery: TypeAlias = Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
 
@@ -328,6 +348,53 @@ def topk_transform_512_pytorch_vectorized(
         raw_indices = raw_indices.clone()
         raw_indices.masked_fill_(~valid_topk, -1)
         out_raw_indices.copy_(raw_indices)
+
+
+def fp8_paged_mqa_logits_cpu(
+    q_fp8: torch.Tensor,
+    kvcache_fp8: torch.Tensor,
+    weight: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_table: torch.Tensor,
+    deep_gemm_metadata: Any,
+    max_seq_len: int,
+    clean_logits: bool = True,
+) -> torch.Tensor:
+    return torch.ops.sgl_kernel.fp8_paged_mqa_logits_cpu(
+        q_fp8,
+        kvcache_fp8,
+        weight,
+        seq_lens,
+        page_table,
+        max_seq_len,
+        clean_logits,
+    )
+
+
+def topk_transform_512_cpu(
+    scores: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_tables: torch.Tensor,
+    out_page_indices: torch.Tensor,
+    page_size: int,
+    out_raw_indices: Optional[torch.Tensor] = None,
+) -> None:
+    torch.ops.sgl_kernel.topk_transform_512_cpu(
+        scores,
+        seq_lens,
+        page_tables,
+        out_page_indices,
+        page_size,
+        out_raw_indices,
+    )
+
+
+def fused_scale_cpu(
+    weight: torch.Tensor,
+    out_scale: float,
+    q_scale: torch.Tensor,
+) -> torch.Tensor:
+    return torch.ops.sgl_kernel.fused_scale_cpu(weight, out_scale, q_scale)
 
 
 class C4IndexerBackendMixin:
@@ -642,6 +709,8 @@ class C4IndexerBackendMixin:
                 fn = fp8_paged_mqa_logits_torch_sm120
             else:
                 fn = fp8_paged_mqa_logits_torch
+        elif _is_cpu and _cpu_amx:
+            fn = fp8_paged_mqa_logits_cpu
         elif is_xpu():
             from sgl_kernel import fp8_paged_mqa_logits_triton
 
@@ -671,7 +740,12 @@ class C4IndexerBackendMixin:
             envs.SGLANG_OPT_USE_TILELANG_INDEXER.get() and not use_fp4_indexer
         )
         _use_aiter = envs.SGLANG_OPT_USE_AITER_INDEXER.get() and not use_fp4_indexer
-        if _c4sl.dim() == 1 and not _use_tilelang and not _use_aiter:
+        if (
+            _c4sl.dim() == 1
+            and not _use_tilelang
+            and not _use_aiter
+            and not (_is_cpu and _cpu_amx)
+        ):
             _c4sl = _c4sl.unsqueeze(-1)
         nonpaged_plan = self._get_nonpaged_indexer_plan(
             c4_indexer=c4_indexer,
@@ -738,6 +812,15 @@ class C4IndexerBackendMixin:
                 c4_seq_lens,
                 page_table,
                 c4_sparse_page_indices,
+                indexer_metadata.c4_page_size,
+                raw_indices,
+            )
+        elif _is_cpu and _cpu_amx:
+            topk_transform_512_cpu(
+                logits,
+                indexer_metadata.c4_seq_lens,
+                core_metadata.page_table,
+                core_metadata.c4_sparse_page_indices,
                 indexer_metadata.c4_page_size,
                 raw_indices,
             )
@@ -851,6 +934,19 @@ class C4Indexer(nn.Module):
     ) -> Tuple[IndexerQuery, torch.Tensor]:
         q, _ = self.wq_b(q_lora)
         q = q.view(-1, self.n_local_heads, self.head_dim)
+        if _is_cpu and _cpu_amx:
+            # TODO: fuse below
+            fused_rope_inplace(
+                q[..., -self.rope_head_dim :],
+                None,
+                self.freqs_cis,
+                positions=positions,
+            )
+            q = rotate_activation(q)
+            q_fp8, q_scale = act_quant(q)
+            weight = fused_scale_cpu(weight, self.weight_scale, q_scale)
+            return q_fp8, weight
+
         if self.use_fp4_indexer:
             return fused_q_indexer_rope_hadamard_fp4_quant(
                 q.contiguous(), weight, self.weight_scale, self.freqs_cis, positions

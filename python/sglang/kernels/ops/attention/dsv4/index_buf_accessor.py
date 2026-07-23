@@ -10,6 +10,10 @@ import triton.language as tl
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 
 fp8_dtype = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
+from sglang.srt.utils import cpu_has_amx_support, is_cpu
+
+_is_cpu = is_cpu()
+_cpu_amx = cpu_has_amx_support()
 
 
 @dataclass
@@ -34,11 +38,24 @@ class NopeFp8RopeBf16Pack:
 class SetKAndS:
     @classmethod
     def execute(cls, pool, buf, loc, nope_fp8_rope_bf16_pack: NopeFp8RopeBf16Pack):
-        cls.triton(pool, buf, loc, nope_fp8_rope_bf16_pack)
+        if _is_cpu:
+            cls.torch(pool, buf, loc, nope_fp8_rope_bf16_pack)
+        else:
+            cls.triton(pool, buf, loc, nope_fp8_rope_bf16_pack)
 
     @classmethod
     def torch(cls, pool, buf, loc, nope_fp8_rope_bf16_pack: NopeFp8RopeBf16Pack):
-        _set_k_and_s_torch(buf, loc, nope_fp8_rope_bf16_pack, pool.page_size)
+        if _is_cpu and _cpu_amx:
+            torch.ops.sgl_kernel.set_k_and_s_cpu(
+                buf,
+                loc,
+                nope_fp8_rope_bf16_pack.k_nope_fp8,
+                nope_fp8_rope_bf16_pack.k_rope_bf16,
+                nope_fp8_rope_bf16_pack.scale_k_nope_ue8m0,
+                pool.page_size,
+            )
+        else:
+            _set_k_and_s_torch(buf, loc, nope_fp8_rope_bf16_pack, pool.page_size)
 
     @classmethod
     def triton(cls, pool, buf, loc, nope_fp8_rope_bf16_pack: NopeFp8RopeBf16Pack):

@@ -396,6 +396,13 @@ class Fp8Config(QuantizationConfig):
                 )
 
                 return Mxfp4FlashinferTrtllmMoEMethod(fp8_method, prefix=prefix)
+
+            if self.is_fp4_experts and _is_cpu and _is_cpu_amx_available:
+                from sglang.srt.layers.quantization.mxfp4_fp8config_cpu_moe import (
+                    Mxfp4Fp8ConfigCpuMoEMethod,
+                )
+
+                return Mxfp4Fp8ConfigCpuMoEMethod()
             return fp8_method
         elif isinstance(layer, RadixAttention):
             return Fp8KVCacheMethod(self)

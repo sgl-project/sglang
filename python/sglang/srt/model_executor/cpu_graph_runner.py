@@ -323,10 +323,11 @@ def register_fake_ops(tp_size: int):
         return mat2.shape[0]
 
     @register_cpu_compile_fake("weight_packed_linear")
-    def _(mat1, mat2, bias, is_vnni):
+    def _(mat1, mat2, bias, is_vnni, out_dtype=None):
         M = mat1.shape[0]
         N = get_n_size(mat2, is_vnni)
-        return mat1.new_empty(M, N)
+        dtype = out_dtype if out_dtype is not None else mat1.dtype
+        return mat1.new_empty(M, N, dtype=dtype)
 
     @register_cpu_compile_fake("per_token_quant_int8_cpu")
     def _(input):

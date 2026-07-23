@@ -8,11 +8,13 @@ from sglang.kernels.jit.utils import (
     load_jit,
     make_cpp_args,
 )
-from sglang.srt.utils import is_hip, is_xpu
+from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_hip, is_xpu
 
 from .utils import make_name
 
 _is_hip = is_hip()
+_is_cpu = is_cpu()
+_cpu_amx = cpu_has_amx_support()
 _is_xpu = is_xpu()
 
 
@@ -131,7 +133,11 @@ def fused_rope_inplace(
         if k is not None:
             apply_rotary_emb_triton(k, freqs_cis, positions=positions, inverse=inverse)
         return
-
+    elif _is_cpu and _cpu_amx:
+        torch.ops.sgl_kernel.apply_rotary_emb_interleaved_cpu(
+            q, freqs_cis, inverse, positions, k
+        )
+        return
     freqs_real = torch.view_as_real(freqs_cis).flatten(-2).contiguous()
     module = _jit_fused_rope_module()
     module.forward(q, k, freqs_real, positions, inverse)

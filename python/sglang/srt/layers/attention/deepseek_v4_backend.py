@@ -68,9 +68,33 @@ from sglang.srt.speculative.ragged_verify import (
     read_ragged_verify_mode,
     resolve_ragged_verify_layout,
 )
-from sglang.srt.utils import ceil_align, is_cuda, is_xpu
+from sglang.srt.utils import ceil_align, cpu_has_amx_support, is_cpu, is_cuda, is_xpu
 from sglang.srt.utils.common import is_sm120_supported
 
+_is_cpu = is_cpu()
+_cpu_amx = cpu_has_amx_support()
+_use_compressor_v2 = envs.SGLANG_OPT_USE_COMPRESSOR_V2.get()
+if _is_cpu and _cpu_amx:
+    from sglang.kernels.ops.attention.dsv4.metadata_kernel import (
+        init_compression_metadata_torch,
+    )
+
+    _init_compression_metadata_triton = init_compression_metadata_torch
+    _use_compressor_v2 = False  # TODO: add support for v2
+
+if _use_compressor_v2:
+    # NOTE: should eventually be the only compressor backend
+    from sglang.srt.layers.attention.dsv4.compressor_v2 import (
+        CompressorBackendMixin,
+        FusedCompressMetadata,
+        create_paged_compressor_data,
+    )
+else:
+    from sglang.srt.layers.attention.dsv4.compressor import (
+        CompressorBackendMixin,
+        FusedCompressMetadata,
+        create_paged_compressor_data,
+    )
 if TYPE_CHECKING:
     from sgl_kernel.flash_mla import FlashMLASchedMeta
 
@@ -134,7 +158,7 @@ def _pad_last_dim(x: T, multiples_of: int = PAGE_INDEX_ALIGNED_SIZE) -> T:
 
 
 def _create_flashmla_metadata():
-    if _is_sm120 or _is_xpu:
+    if _is_sm120 or _is_xpu or _is_cpu:
         return None
     import sgl_kernel.flash_mla as flash_mla
 
@@ -1582,8 +1606,22 @@ class DeepseekV4AttnBackend(
     def store_cache(
         self, layer_id: int, swa_k: torch.Tensor, forward_batch: ForwardBatch
     ) -> None:
+
         swa_loc = self.get_swa_out_cache_loc(forward_batch)
-        if envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():
+        if _is_cpu and _cpu_amx:
+            from sglang.kernels.ops.attention.dsv4.index_buf_accessor import (
+                NopeFp8RopeBf16Pack,
+            )
+
+            swa_k_pack = NopeFp8RopeBf16Pack(
+                *torch.ops.sgl_kernel.quant_to_nope_fp8_rope_bf16_pack_cpu(swa_k)
+            )
+            self.token_to_kv_pool.set_swa_key_buffer_radix(
+                layer_id=layer_id,
+                swa_loc=swa_loc,
+                cache_nope_fp8_rope_bf16_pack=swa_k_pack,
+            )
+        elif envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():
             self.token_to_kv_pool.set_swa_key_buffer_radix_fused(
                 layer_id=layer_id,
                 swa_loc=swa_loc,
@@ -1690,10 +1728,11 @@ class DeepseekV4AttnBackend(
                     extra_indices.shape[-1] % 64 == 0
                 ), f"{extra_indices.shape=}'s last dimension is not aligned to 64"
 
-            # sparse_prefill_fwd does not support SM120.
+            # sparse_prefill_fwd does not support SM120 and CPU.
             if (
                 forward_batch.forward_mode.is_extend_without_speculative()
                 and not _is_sm120
+                and not (_is_cpu and _cpu_amx)
                 and (
                     q.shape[0] > _LARGE_INDEXER_QUERY_THRESHOLD
                     or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
@@ -1729,6 +1768,10 @@ class DeepseekV4AttnBackend(
             else:
                 if _is_xpu:
                     from sgl_kernel import flash_mla_with_kvcache
+                elif _is_cpu and _cpu_amx:
+                    from sgl_kernel.flash_mla import (
+                        flash_mla_with_kvcache_cpu as flash_mla_with_kvcache,
+                    )
                 else:
                     from sgl_kernel.flash_mla import flash_mla_with_kvcache
 

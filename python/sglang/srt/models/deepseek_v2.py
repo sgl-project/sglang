@@ -690,6 +690,7 @@ class DeepseekV2MoE(nn.Module):
 
         self.shared_experts_is_int8 = False
         self.shared_experts_is_fp8 = False
+        self.shared_experts_is_mxfp4 = False
         self.shared_experts_weight_block_size = None
         self._shared_expert_tp1 = False
         # Shared experts: skip when fused into MoE kernel
@@ -762,6 +763,10 @@ class DeepseekV2MoE(nn.Module):
             self.shared_experts_is_int8 = (
                 not is_packed_weight
                 and self.shared_experts.gate_up_proj.weight.dtype == torch.int8
+            )
+            self.shared_experts_is_mxfp4 = (
+                not is_packed_weight
+                and self.shared_experts.gate_up_proj.weight.dtype == torch.uint8
             )
             self.shared_experts_is_fp8 = (
                 not is_packed_weight
@@ -1025,7 +1030,7 @@ class DeepseekV2MoE(nn.Module):
         if hasattr(self, "shared_experts") and use_intel_amx_backend(
             self.shared_experts.gate_up_proj
         ):
-            return self.forward_cpu(hidden_states)
+            return self.forward_cpu(hidden_states, input_ids_global)
         server_args = get_server_args()
         dispatch_info = (
             ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
@@ -1139,10 +1144,12 @@ class DeepseekV2MoE(nn.Module):
     def forward_cpu(
         self,
         hidden_states: torch.Tensor,
+        input_ids_global: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         # router_logits: (num_tokens, n_experts)
         router_logits = self.gate(hidden_states)
-        topk_output = self.topk(hidden_states, router_logits)
+        topk_kwargs = {"input_ids": input_ids_global} if self.is_hash else {}
+        topk_output = self.topk(hidden_states, router_logits, **topk_kwargs)
         fused_experts_out = self.experts(
             hidden_states=hidden_states, topk_output=topk_output
         )
@@ -1162,6 +1169,7 @@ class DeepseekV2MoE(nn.Module):
             True,  # inplace
             self.shared_experts_is_int8,  # use_int8_w8a8
             self.shared_experts_is_fp8,  # use_fp8_w8a16
+            self.shared_experts_is_mxfp4,  # use_mxfp4
             (
                 self.shared_experts.gate_up_proj.weight_scale
                 if self.shared_experts_is_int8
@@ -1185,6 +1193,8 @@ class DeepseekV2MoE(nn.Module):
                 if self.shared_experts_is_fp8
                 else None
             ),  # block_size
+            None,  # alpha
+            self.shared_experts.swiglu_limit,  # swiglu_limit
             True,  # is_vnni
         )
         if self.tp_size > 1 and not get_forward().fuse_mlp_allreduce:

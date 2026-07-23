@@ -204,3 +204,53 @@ def triton_create_paged_compress_data(
     if not is_overlap:
         out_1.squeeze_(1)
     return out_0, out_1
+
+
+def torch_create_paged_compress_data(
+    *,
+    compress_ratio: int,
+    is_overlap: bool,
+    swa_page_size: int,
+    ring_size: int,
+    req_pool_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    extend_seq_lens: torch.Tensor,
+    req_to_token: torch.Tensor,
+    full_to_swa_index_mapping: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    batch_size = req_pool_indices.shape[0]
+    device = req_pool_indices.device
+
+    rid = req_pool_indices.to(torch.int32)
+    seq_len = seq_lens[:batch_size].to(torch.int32)
+    extend_len = extend_seq_lens[:batch_size].to(torch.int32)
+    prefix_len = seq_len - extend_len
+
+    cr = compress_ratio
+    write_pos = ((seq_len - 1) // cr) * cr
+    load_pos = ((prefix_len - 1) // cr) * cr
+    write_overlap_pos = write_pos - cr
+    load_overlap_pos = load_pos - cr
+
+    def compute_state_loc(pos: torch.Tensor) -> torch.Tensor:
+        pos = pos.clamp(min=0)
+        loc = req_to_token[rid, pos].to(torch.int32)
+        swa_loc = full_to_swa_index_mapping[loc].to(torch.int32)
+        swa_page = swa_loc // swa_page_size
+        state_loc = swa_page * ring_size + (swa_loc % ring_size)
+        state_loc = state_loc // cr
+        return state_loc
+
+    v0 = compute_state_loc(load_pos)  # i == 0
+    v1 = compute_state_loc(write_pos)  # i == 1
+    v2 = compute_state_loc(load_overlap_pos)  # i == 2
+    v3 = compute_state_loc(write_overlap_pos)  # i == 3
+
+    out_0 = v1.clone()
+
+    if is_overlap:
+        out_1 = torch.stack([v2, v0, v3, write_pos.to(torch.int32)], dim=1)
+    else:
+        out_1 = v0.clone()
+
+    return out_0, out_1

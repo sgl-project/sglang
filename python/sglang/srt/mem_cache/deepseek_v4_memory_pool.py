@@ -19,15 +19,18 @@ from sglang.kernels.ops.attention.dsv4.index_buf_accessor import NopeFp8RopeBf16
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
-from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
+from sglang.srt.mem_cache.deepseek_v4_compress_state import (
+    CompressStatePool,
+    CompressStateSeparate,
+)
 from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.runtime_context import get_server_args
-from sglang.srt.utils import ceil_div, is_hip
+from sglang.srt.utils import ceil_div, cpu_has_amx_support, is_cpu, is_hip
 
 logger = logging.getLogger(__name__)
-
 _is_hip = is_hip()
-
+_is_cpu = is_cpu()
+_cpu_amx = cpu_has_amx_support()
 ONLINE_C128 = not _is_hip and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
 
 
@@ -648,6 +651,8 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
         if _is_hip:
             self._init_paged_compress_states(False)
+        elif _is_cpu and _cpu_amx:
+            self._init_non_paged_compress_states(enable_memory_saver)
         else:
             self._init_paged_compress_states(enable_memory_saver)
 
@@ -940,6 +945,42 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                     ratio, enable_memory_saver
                 )
 
+    def _init_non_paged_compress_states(self, enable_memory_saver: bool):
+        """Allocate non-paged CompressStateSeparate buffers
+
+        Layout per layer: ``(max_num_reqs, ratio*coff, 2*head_dim*coff)``.
+        The buffers are small relative to the paged ring pools and only
+        materialised when the radix path is off.
+        """
+        self.compress_states: List[Optional[CompressStateSeparate]] = []
+        self.indexer_compress_states: List[Optional[CompressStateSeparate]] = []
+        attn_kv_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+        for ratio in self.compression_ratios:
+            overlap = ratio == 4
+            compress_state = indexer_compress_state = None
+            if ratio != 0:
+                compress_state = CompressStateSeparate(
+                    max_num_reqs=self.max_num_reqs,
+                    ratio=ratio,
+                    overlap=overlap,
+                    head_dim=attn_kv_head_dim,
+                    device=self.device,
+                    dtype=self.c4_state_dtype if ratio == 4 else self.c128_state_dtype,
+                    enable_memory_saver=enable_memory_saver,
+                )
+            if ratio == 4:
+                indexer_compress_state = CompressStateSeparate(
+                    max_num_reqs=self.max_num_reqs,
+                    ratio=ratio,
+                    overlap=overlap,
+                    head_dim=self.indexer_head_dim,
+                    device=self.device,
+                    dtype=self.c4_state_dtype if ratio == 4 else self.c128_state_dtype,
+                    enable_memory_saver=enable_memory_saver,
+                )
+            self.compress_states.append(compress_state)
+            self.indexer_compress_states.append(indexer_compress_state)
+
     def _init_compressed_layer_mapping(self):
         c1_cnt = c4_cnt = c128_cnt = 0
         total_L = len(self.compression_ratios)
@@ -976,11 +1017,15 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
     def get_attention_compress_states(self, layer_id: int) -> CompressStatePool:
         self.wait_layer_transfer(layer_id)
-        compress_state_pool = self.compress_state_pools[layer_id]
-        assert (
-            compress_state_pool is not None
-        ), "Only c4/c128 layers have attention states."
-        return compress_state_pool
+        if not (_is_cpu and _cpu_amx):
+            compress_state_pool = self.compress_state_pools[layer_id]
+            assert (
+                compress_state_pool is not None
+            ), "Only c4/c128 layers have attention states."
+            return compress_state_pool
+        compress_state = self.compress_states[layer_id]
+        assert compress_state is not None, "Only c4/c128 layers have attention states."
+        return compress_state.get_state()
 
     def get_online_c128_mtp_state_slot_offset(self) -> int:
         for pool in self.compress_state_pools:
@@ -1047,11 +1092,15 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
     def get_indexer_compress_states(self, layer_id: int) -> CompressStatePool:
         self.wait_layer_transfer(layer_id)
-        indexer_compress_state_pool = self.indexer_compress_state_pools[layer_id]
-        assert (
-            indexer_compress_state_pool is not None
-        ), "Only c4 layers have indexer states."
-        return indexer_compress_state_pool
+        if not (_is_cpu and _cpu_amx):
+            indexer_compress_state_pool = self.indexer_compress_state_pools[layer_id]
+            assert (
+                indexer_compress_state_pool is not None
+            ), "Only c4 layers have indexer states."
+            return indexer_compress_state_pool
+        compress_state = self.indexer_compress_states[layer_id]
+        assert compress_state is not None, "Only c4 layers have indexer states."
+        return compress_state.get_state()
 
     def _swa_local_layer_id(self, layer_id: int) -> int:
         """Convert absolute model layer_id to SWA-pool-local (PP-stage-local) index."""
