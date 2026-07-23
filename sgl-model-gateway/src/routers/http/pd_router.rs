@@ -1307,11 +1307,7 @@ impl PDRouter {
                 // are unrelated to SSE event boundaries.
                 pending.extend_from_slice(&chunk);
                 if let Some(done_pos) = memmem::find(&pending, done_marker) {
-                    if done_pos > 0
-                        && tx
-                            .send(Ok(pending.split_to(done_pos).freeze()))
-                            .is_err()
-                    {
+                    if done_pos > 0 && tx.send(Ok(pending.split_to(done_pos).freeze())).is_err() {
                         decode_task.abort();
                         return;
                     }
@@ -1320,11 +1316,7 @@ impl PDRouter {
                 let safe_len = pending
                     .len()
                     .saturating_sub(done_marker.len().saturating_sub(1));
-                if safe_len > 0
-                    && tx
-                        .send(Ok(pending.split_to(safe_len).freeze()))
-                        .is_err()
-                {
+                if safe_len > 0 && tx.send(Ok(pending.split_to(safe_len).freeze())).is_err() {
                     decode_task.abort();
                     return;
                 }
