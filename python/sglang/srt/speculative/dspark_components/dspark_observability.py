@@ -16,7 +16,6 @@ from sglang.srt.environ import envs
 from sglang.srt.kv_canary.runner.future_tensor import FutureTensors
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
-from sglang.srt.speculative.dflash_utils import compute_dflash_correct_drafts_and_bonus
 from sglang.srt.speculative.dspark_components.dspark_block_accept_estimator import (
     create_block_accept_estimate_recorder,
 )
@@ -28,6 +27,17 @@ from sglang.srt.speculative.dspark_components.dspark_verify import (
 logger = logging.getLogger(__name__)
 
 _NULL_SEGMENT = nullcontext()
+
+
+def _compute_correct_drafts_and_bonus(
+    *, candidates: torch.Tensor, target_predict: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    matches = candidates[:, 1:] == target_predict[:, :-1]
+    correct_len = matches.to(torch.int32).cumprod(dim=1).sum(dim=1)
+    bonus = target_predict[
+        torch.arange(candidates.shape[0], device=candidates.device), correct_len
+    ]
+    return correct_len, bonus.to(torch.int64)
 
 ALL_COMPONENTS_TOKEN = "all"
 
@@ -703,7 +713,7 @@ class ConfidenceMetricsProbe:
         target_predict = torch.argmax(target_logits, dim=-1).view(
             bs, self.verify_num_draft_tokens
         )
-        num_correct_drafts, _ = compute_dflash_correct_drafts_and_bonus(
+        num_correct_drafts, _ = _compute_correct_drafts_and_bonus(
             candidates=verify_ids_2d,
             target_predict=target_predict,
         )
@@ -951,7 +961,7 @@ class DsparkStepObservers:
         target_predict = torch.argmax(target_logits, dim=-1).view(
             bs, self._verify_num_draft_tokens
         )
-        num_correct_drafts, _ = compute_dflash_correct_drafts_and_bonus(
+        num_correct_drafts, _ = _compute_correct_drafts_and_bonus(
             candidates=verify_ids_2d,
             target_predict=target_predict,
         )
