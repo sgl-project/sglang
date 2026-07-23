@@ -253,9 +253,23 @@ class DecodeKVCacheOffloadManager:
     def _release_finished_req(self, req: Req, start_offset: int):
         # Defensive guard: ReqToTokenPool.free sets req_pool_idx to None,
         # so a previously-released request must be skipped here to avoid
-        # non-idempotent side effects (e.g. tree_cache.protected_size_
-        # double-decrement, host pool double-free).
+        # non-idempotent side effects (e.g. host pool double-free).
         if req.req_pool_idx is None or req.req_pool_idx == -1:
+            return
+
+        if not self.tree_cache.disable:
+            # Decode radix cache is enabled: the raw frees below would
+            # double-free tree-owned prefix slots (rows [0, cache_protected_len)
+            # hold canonical tree indices) and would leak the prefix lock taken
+            # at prealloc (protected_size_ would drift negative while lock_ref
+            # stays >0). Route through the radix-aware release instead: it
+            # inserts the committed KV into the tree, frees only duplicates,
+            # the unaligned tail and spec-overallocated slots, releases the
+            # req slot, and balances the lock via dec_lock_ref.
+            from sglang.srt.mem_cache.common import release_kv_cache
+
+            release_kv_cache(req, self.tree_cache, is_insert=True)
+            self.offloaded_state.pop(req.rid, None)
             return
 
         kv_committed_len = req.effective_kv_committed_len()
@@ -290,7 +304,10 @@ class DecodeKVCacheOffloadManager:
 
         self.req_to_token_pool.free(req)
         req.kv = None
-        self.tree_cache.protected_size_ -= len(req.prefix_indices)
+        # NOTE: no raw tree_cache.protected_size_ manipulation here. ChunkCache
+        # reports protected_size() == 0 unconditionally, and for radix caches
+        # the balanced inc/dec_lock_ref pair owns that counter (see the
+        # release_kv_cache routing above).
         if req.rid in self.offloaded_state:
             del self.offloaded_state[req.rid]
 
