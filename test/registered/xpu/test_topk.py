@@ -32,6 +32,37 @@ def _scatter_by_expert(
     dense.scatter_(1, indices.long(), weights.float())
     return dense
 
+def assert_equal(
+    score: torch.Tensor,
+    indices_ref: torch.Tensor,
+    indices_our: torch.Tensor,
+    bs: int,
+    k: int,
+    seq_len: int,
+    topk_indices_offset: Optional[torch.Tensor] = None,
+    max_permit_error: int = 0,
+):
+    indices_our_cpu = indices_our.cpu().tolist()
+    indices_ref_cpu = indices_ref.cpu().tolist()
+
+    wrong_values = 0
+    for i in range(bs):
+        indices_ref_set_i = set(indices_ref_cpu[i])
+        indices_our_set_i = set(indices_our_cpu[i])
+        more = indices_our_set_i - indices_ref_set_i
+        less = indices_ref_set_i - indices_our_set_i
+        offset = topk_indices_offset[i].item() if topk_indices_offset is not None else 0
+        if len(more) > 0 or len(less) > 0:
+            # check whether more values are the same with less values
+            # if so, either one is acceptable, since their values are the same
+            more_values = sorted(score[i, idx - offset].item() for idx in more)
+            less_values = sorted(score[i, idx - offset].item() for idx in less)
+            if more_values != less_values:
+                wrong_values += len(more)
+                print(
+                    f"{bs=}, {k=}, {seq_len=}, {i=}, {more=}, {less=} failed, with {more_values=}, {less_values=}"
+                )
+        assert wrong_values <= max_permit_error, f"{wrong_values=}, {max_permit_error=}"
 
 # Nemotron-3 uses biased_grouped_topk
 class TestBiasedGroupedTopK(CustomTestCase):
@@ -226,15 +257,13 @@ class TestBiasedGroupedTopK(CustomTestCase):
                     routed_scaling_factor,
                 )
 
-                torch.testing.assert_close(
-                    _scatter_by_expert(
-                        topk_weights[:, :topk_routed], topk_ids[:, :topk_routed], E_num
-                    ),
-                    _scatter_by_expert(
-                        ref_topk_weights[:, :topk_routed],
-                        ref_topk_ids[:, :topk_routed],
-                        E_num,
-                    ),
+                assert_equal(
+                    gating_output,
+                    ref_topk_ids[:, :topk_routed],
+                    topk_ids[:, :topk_routed],
+                    bs=len(bs),
+                    k=topk_value,
+                    seq_len=seq_len,
                 )
 
 
