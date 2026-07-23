@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.utils.common import is_flashinfer_available
 
 if TYPE_CHECKING:
     from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorOutput
@@ -80,22 +79,6 @@ def compute_row_log_normalizer(
     row_log_sum = torch.logsumexp(x - row_max[:, None], dim=-1)
     row_log_sum = torch.where(row_max.isinf(), 0.0, row_log_sum)
     return row_max, row_log_sum
-
-
-def _logits_topk(logits: torch.Tensor, k: int):
-    """Row-wise top-k, sorted descending.
-
-    flashinfer's top_k reads the row once (3-6x over torch.topk's multi-pass
-    radix select at LLM vocab sizes) but breaks value ties in
-    implementation-defined order rather than lowest-index-first.
-    """
-    if not logits.is_cuda:
-        return torch.topk(logits, k=k, dim=-1, sorted=True)
-    import flashinfer
-
-    values, indices = flashinfer.top_k(logits, k=k, sorted=False, deterministic=True)
-    order = values.argsort(dim=-1, descending=True)
-    return values.gather(-1, order), indices.gather(-1, order)
 
 
 def get_top_logprobs_raw(
@@ -208,6 +191,7 @@ def get_top_logprobs_chunk(
     top_logprobs_idx: List,
     split_pruned_len: int,
     log_normalizer: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    precomputed_topk: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> int:
     """Get top-k logprobs for each sequence in the chunk.
 
@@ -221,6 +205,8 @@ def get_top_logprobs_chunk(
         top_logprobs_idx: List to store top-k token indices
         split_pruned_len: Length of pruned tokens from previous chunk
         log_normalizer: Per-row (max, logsumexp - max) of the logits
+        precomputed_topk: (raw fp32 top values, indices) from the fused
+            logsumexp+top-k kernel, sorted with lowest-index tie-breaking
 
     Returns:
         int: Number of remaining tokens to process in next chunk
@@ -229,7 +215,10 @@ def get_top_logprobs_chunk(
     max_k = max(top_k_nums)
     if log_normalizer is not None:
         row_max, row_log_sum = log_normalizer
-        values_tensor, indices_tensor = _logits_topk(logprobs, max_k)
+        if precomputed_topk is not None:
+            values_tensor, indices_tensor = precomputed_topk
+        else:
+            values_tensor, indices_tensor = logprobs.topk(max_k, dim=1)
         values_tensor = (values_tensor.float() - row_max[:, None]) - row_log_sum[
             :, None
         ]
@@ -438,12 +427,6 @@ class InputLogprobProcessor:
         # compute logprobs from logits + logsumexp, skipping the full-vocab
         # log-softmax materialization
         self.enable_fast_input_logprobs = envs.SGLANG_ENABLE_FAST_INPUT_LOGPROBS.get()
-        if self.enable_fast_input_logprobs and torch.cuda.is_available():
-            assert is_flashinfer_available(), (
-                "The fast input-logprob path requires flashinfer for top-k; "
-                "set SGLANG_ENABLE_FAST_INPUT_LOGPROBS=0 to use the "
-                "log-softmax path."
-            )
 
     def forward(
         self,
@@ -563,23 +546,47 @@ class InputLogprobProcessor:
             # Zero-logprob-row chunks still need the per-sequence bookkeeping below.
             chunk_logprobs = chunk_logits[chunk_indices]
             del chunk_logits
-            if self.enable_fast_input_logprobs:
-                # Every consumer below needs only small gathers / top-k plus a
-                # per-row normalizer, so keep the raw logits and skip the
-                # full-vocab log-softmax materialization entirely.
-                chunk_log_normalizer = compute_row_log_normalizer(chunk_logprobs)
-            else:
-                # Free the raw logits before the out-of-place log_softmax:
-                # keeping all three alive is a 3x peak, which OOMs when the
-                # single chunk covers a large batch.
-                chunk_log_normalizer = None
-                chunk_logprobs = torch.nn.functional.log_softmax(chunk_logprobs, dim=-1)
 
             # End at the last row inside the chunk; token_to_seq_idx[end_idx]
             # belongs to the next chunk and would emit its sequence twice.
             chunk_slice = slice(
                 token_to_seq_idx[start_idx], token_to_seq_idx[end_idx - 1] + 1
             )
+
+            chunk_precomputed_topk = None
+            if self.enable_fast_input_logprobs:
+                # Every consumer below needs only small gathers / top-k plus a
+                # per-row normalizer, so keep the raw logits and skip the
+                # full-vocab log-softmax materialization entirely. When top-k
+                # is requested, the fused kernel produces the normalizer and
+                # the top-k in the same single read of the logits.
+                max_k = (
+                    max(logits_metadata.top_logprobs_nums[chunk_slice])
+                    if logits_metadata.extend_return_top_logprob
+                    else 0
+                )
+                use_fused = False
+                if chunk_logprobs.is_cuda and max_k > 0:
+                    from sglang.srt.layers.logsumexp import (
+                        FUSED_TOPK_MAX_K,
+                        row_logsumexp_topk,
+                    )
+
+                    use_fused = max_k <= FUSED_TOPK_MAX_K
+                if use_fused:
+                    row_max, row_log_sum, top_vals, top_idx = row_logsumexp_topk(
+                        chunk_logprobs, max_k
+                    )
+                    chunk_log_normalizer = (row_max, row_log_sum)
+                    chunk_precomputed_topk = (top_vals, top_idx)
+                else:
+                    chunk_log_normalizer = compute_row_log_normalizer(chunk_logprobs)
+            else:
+                # Free the raw logits before the out-of-place log_softmax:
+                # keeping all three alive is a 3x peak, which OOMs when the
+                # single chunk covers a large batch.
+                chunk_log_normalizer = None
+                chunk_logprobs = torch.nn.functional.log_softmax(chunk_logprobs, dim=-1)
 
             # Get the logprob of top-k tokens
             if logits_metadata.extend_return_top_logprob:
@@ -595,6 +602,7 @@ class InputLogprobProcessor:
                     top_logprobs_idx,
                     split_len_topk,
                     log_normalizer=chunk_log_normalizer,
+                    precomputed_topk=chunk_precomputed_topk,
                 )
 
             # Get the logprob of given token id
