@@ -1,4 +1,4 @@
-"""DEPRECATED: superseded by ``sglang.kernels.ops.quantization._jit_per_token_group_quant`` (the
+"""DEPRECATED: superseded by ``sglang.kernels.ops.quantization.per_token_group_quant`` (the
 default CUDA path). No sglang runtime code may call this kernel; it is kept
 only as the perf baseline for the per_token_group_quant benchmarks and its own
 bit-parity tests, and will be deleted once those move to torch references.
