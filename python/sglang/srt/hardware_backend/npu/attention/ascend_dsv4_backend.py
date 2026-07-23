@@ -126,9 +126,9 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
             # _compute_compress_locs builds positions_cmp_padding / start_pos /
             # seqused only for decode. Every eager prefill uses the fused compressor,
             # so build its global block positions, state metadata, and output locs
-            # here. Keep this gated to is_extend() so the cu.cpu() host read never
+            # here. Exclude speculative modes so the cu.cpu() host read never
             # runs for target_verify / draft_extend (potentially graph-captured).
-            if forward_batch.forward_mode.is_extend():
+            if forward_batch.forward_mode.is_extend_without_speculative():
                 self._build_npu_compress_metadata_prefill(forward_batch)
 
         if _verify_compress:
@@ -980,7 +980,7 @@ class C4IndexerAscendBackendMixin(C4IndexerBackendMixin):
             None,
             cos4,
             sin4,
-            qk_nope=qk_nope,
+            qk_nope_dim=qk_nope,
         )
         return _apply_hadamard(q, c4_indexer.hadamard_matrix)
 

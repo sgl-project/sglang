@@ -1040,7 +1040,7 @@ class MQALayer(MqaAttentionBase):
                 kv.unsqueeze(1),
                 cos4,
                 sin4,
-                qk_nope=self.qk_nope_head_dim,
+                qk_nope_dim=self.qk_nope_head_dim,
             )
             attn_backend.store_cache(
                 layer_id=self.layer_id,
@@ -1130,7 +1130,6 @@ class MQALayer(MqaAttentionBase):
         enable_multi_stream = (
             envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
             and self.alt_streams is not None
-            and not _is_npu
             and get_is_capture_mode()
             and x.shape[0] <= self._multi_stream_bs_limit
             and not (self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch))
@@ -1253,7 +1252,7 @@ class MQALayer(MqaAttentionBase):
                 None,
                 cos4,
                 sin4,
-                qk_nope=self.qk_nope_head_dim,
+                qk_nope_dim=self.qk_nope_head_dim,
             )
         else:
             fused_rope_inplace(
@@ -1343,7 +1342,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             layer_id=layer_id,
             quant_config=quant_config,
             prefix=add_prefix("self_attn", prefix),
-            alt_streams=alt_streams,
+            alt_streams=None if _is_npu else alt_streams,
             compress_ratio_override=compress_ratio_override,
         )
         moe_alt_stream = (

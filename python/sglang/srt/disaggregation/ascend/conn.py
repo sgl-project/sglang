@@ -52,17 +52,21 @@ class AscendKVManager(MooncakeKVManager):
         )
 
     def register_buffer_to_engine(self):
-        self.engine.batch_register(self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens)
-        # The Ascend backend optimize batch registration for small memory blocks.
-        self.engine.batch_register(
-            self.kv_args.aux_data_ptrs, self.kv_args.aux_data_lens
-        )
-        # Batch register state/extra pool data buffers
+        # MemFabric aligns registered buffers to 2 MiB. Register everything in
+        # one batch so overlapping aligned ranges from small tensors are merged
+        # before they are published to the peer.
+        ptrs = list(self.kv_args.kv_data_ptrs)
+        lens = list(self.kv_args.kv_data_lens)
+        ptrs.extend(self.kv_args.aux_data_ptrs)
+        lens.extend(self.kv_args.aux_data_lens)
         for component_ptrs, component_lens in zip(
             self.kv_args.state_data_ptrs or [],
             self.kv_args.state_data_lens or [],
         ):
-            self.engine.batch_register(component_ptrs, component_lens)
+            ptrs.extend(component_ptrs)
+            lens.extend(component_lens)
+        if ptrs:
+            self.engine.batch_register(ptrs, lens)
 
     def get_mla_kv_ptrs_with_pp(
         self, src_kv_ptrs: List[int], dst_kv_ptrs: List[int], state_type=None
