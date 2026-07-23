@@ -17,7 +17,6 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
-from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import BAR_FORMAT, get_bool_env_var, is_hip, set_weight_attrs
 
 if TYPE_CHECKING:
