@@ -4,7 +4,7 @@ import concurrent.futures
 import functools
 import logging
 import time
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -60,6 +60,7 @@ from sglang.srt.layers.communicator_dsa_cp import (
     dsa_cp_gather_hidden_states,
     dsa_cp_reduce_scatter_hidden_states,
 )
+from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
 from sglang.srt.layers.dp_attention import (
     _tbo_event,
     attn_tp_all_gather,
@@ -453,9 +454,7 @@ class MqaAttentionBase(nn.Module):
         self.fuse_wqa_wkv = fuse
 
         self.attn_sink = nn.Parameter(torch.empty(self.n_heads, dtype=torch.float32))
-        self._attn_sink_local: Optional[torch.Tensor] = (
-            self.attn_sink if self.attn_tp_size == 1 else None
-        )
+        self._attn_sink_local: Optional[torch.Tensor] = None
         if fuse:
             self.wqkv_a = ReplicatedLinear(
                 self.hidden_size,
@@ -545,6 +544,51 @@ class MqaAttentionBase(nn.Module):
         self.register_buffer("freqs_cis", freqs_cis, persistent=False)
         self.freqs_cis: torch.Tensor
 
+    def _local_attn_sink(self) -> torch.Tensor:
+        if self.attn_tp_size == 1:
+            return self.attn_sink
+        if self._attn_sink_local is None:
+            rank = self.attn_tp_rank
+            num_heads = self.n_local_heads
+            padded_num_heads = 64 if num_heads <= 64 else self.n_heads
+            sink = self.attn_sink.new_zeros(padded_num_heads)
+            sink[:num_heads] = self.attn_sink[rank * num_heads : (rank + 1) * num_heads]
+            self._attn_sink_local = sink
+        return self._attn_sink_local
+
+    @contextmanager
+    def maybe_use_decode_attn_tp(self, forward_batch: ForwardBatch):
+        ctx = get_cp_decode_attn_tp_ctx()
+        attn = self.attn_mqa if isinstance(self, MQALayer) else self.attn
+        with ctx.maybe_use_decode_attn_tp(
+            forward_batch,
+            [self.wq_b, self.wo_a, self.wo_b],
+            radix_attn=attn,
+        ):
+            if ctx.use_decode_attn_tp:
+                orig = (
+                    self.n_local_heads,
+                    self.n_local_groups,
+                    self.attn_tp_rank,
+                    self.attn_tp_size,
+                )
+                decode_tp_size = ctx.decode_tp_size
+                self.n_local_heads = self.n_heads // decode_tp_size
+                self.n_local_groups = self.n_groups // decode_tp_size
+                self.attn_tp_rank = ctx.decode_tp_rank
+                self.attn_tp_size = decode_tp_size
+                try:
+                    yield
+                finally:
+                    (
+                        self.n_local_heads,
+                        self.n_local_groups,
+                        self.attn_tp_rank,
+                        self.attn_tp_size,
+                    ) = orig
+            else:
+                yield
+
 
 class MQALayer(MqaAttentionBase):
     def __init__(
@@ -563,8 +607,6 @@ class MQALayer(MqaAttentionBase):
             prefix,
             compress_ratio=compress_ratio_override,
         )
-        self.tp_rank = self.attn_tp_rank
-        self.tp_size = self.attn_tp_size
 
         if self.rope_scaling:
             self.rope_scaling["rope_type"] = "deepseek_yarn"
@@ -1107,7 +1149,7 @@ class MQALayer(MqaAttentionBase):
         )
 
         tp_slice, q_padded, q_out = slice(None), None, None
-        if self.tp_size > 1:
+        if self.attn_tp_size > 1:
             # FlashMLA's fp8 sparse decode kernel only specializes h_q for {64, 128}.
             # Pad the per-rank heads to 64 (not the full n_heads) when they fit, to
             # dispatch the cheaper decode::head64 variant; attn_sink is sliced to
@@ -1123,15 +1165,7 @@ class MQALayer(MqaAttentionBase):
                 q_padded = x.new_empty(x.shape[0], padded_num_heads, self.head_dim)
             tp_slice = slice(0, self.n_local_heads)
             q_out = q_padded[:, tp_slice, :]
-            if self._attn_sink_local is None:
-                # Build once on the first forward (post weight load); a per-call
-                # rebuild would replay a fill+copy per layer in the decode graph.
-                rank = self.tp_rank
-                sink = self.attn_sink.new_zeros(padded_num_heads)
-                sink[: self.n_local_heads] = self.attn_sink[
-                    rank * self.n_local_heads : (rank + 1) * self.n_local_heads
-                ]
-                self._attn_sink_local = sink
+        attn_sink = self._local_attn_sink()
 
         if enable_multi_stream:
             # Multi-stream path always fuses cache write into the K kernel,
@@ -1198,7 +1232,7 @@ class MQALayer(MqaAttentionBase):
                     o,
                     self.attn_mqa.layer_id,
                     self.compress_ratio,
-                    self._attn_sink_local,
+                    attn_sink,
                     save_kv_cache,
                 )
             else:
@@ -1209,7 +1243,7 @@ class MQALayer(MqaAttentionBase):
                     layer=self.attn_mqa,
                     forward_batch=forward_batch,
                     compress_ratio=self.compress_ratio,
-                    attn_sink=self._attn_sink_local,
+                    attn_sink=attn_sink,
                     save_kv_cache=save_kv_cache,
                 )
             o = o[:, tp_slice, :]
@@ -1267,7 +1301,7 @@ class MQALayer(MqaAttentionBase):
             o = torch.einsum("tgd,grd->tgr", o, wo_a)
 
         o, _ = self.wo_b(o.flatten(1))
-        if self.tp_size > 1 and self.tp_size < get_parallel().tp_size:
+        if self.attn_tp_size > 1 and self.attn_tp_size < get_parallel().tp_size:
             o = attn_tp_all_reduce(o)
 
         return o
@@ -1605,12 +1639,13 @@ class DeepseekV4DecoderLayer(nn.Module):
             else:
                 x_quant = None
 
-        hidden_states = self.self_attn(
-            x=hidden_states,
-            positions=positions,
-            forward_batch=forward_batch,
-            x_quant=x_quant,
-        )
+        with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
+            hidden_states = self.self_attn(
+                x=hidden_states,
+                positions=positions,
+                forward_batch=forward_batch,
+                x_quant=x_quant,
+            )
 
         if use_fused:
             fused_mhc = try_fused_hc_post_pre(
