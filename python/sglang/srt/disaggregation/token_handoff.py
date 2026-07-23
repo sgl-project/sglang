@@ -12,6 +12,7 @@ class HandoffProtocolError(RuntimeError):
 class HandoffPhase(str, Enum):
     COPYING_PROMPT_KV = "copying_prompt_kv"
     REPLAYING = "replaying"
+    DRAINING_FINAL_SUFFIX = "draining_final_suffix"
     READY_TO_COMMIT = "ready_to_commit"
     COMMITTED = "committed"
     CANCELLED = "cancelled"
@@ -96,6 +97,7 @@ class TokenHandoffState:
     owner: OutputOwner = OutputOwner.PREFILL
     replayed_count: int = 0
     committed_count: int = 0
+    sealed_count: int | None = None
     token_log: list[int] = field(default_factory=list)
     failure_reason: str | None = None
 
@@ -134,6 +136,10 @@ class TokenHandoffState:
         self._check_active()
         if self.owner is not OutputOwner.PREFILL:
             raise HandoffProtocolError("prefill cannot append after ownership commit")
+        if self.sealed_count is not None:
+            raise HandoffProtocolError(
+                "prefill cannot append after the token log is sealed"
+            )
         token_ids = [int(token_id) for token_id in token_ids]
 
         fragment_end = first_output_index + len(token_ids)
@@ -172,6 +178,31 @@ class TokenHandoffState:
             else HandoffPhase.REPLAYING
         )
 
+    def seal_token_log(self, *, epoch: int) -> int:
+        """Freeze the final output boundary so Decode can drain a finite suffix.
+
+        A live producer can append another token during every replay launch,
+        especially when short extends have a non-trivial fixed startup cost.
+        The runtime therefore seals the log only after Prompt KV is ready and
+        Decode is sufficiently close. Prefill remains the output owner until
+        commit, but it must stop scheduling new Decode steps for this request.
+        """
+
+        self._check_epoch(epoch)
+        self._check_active()
+        if self.phase is HandoffPhase.COPYING_PROMPT_KV:
+            raise HandoffProtocolError("cannot seal before prompt KV is ready")
+        if self.sealed_count is not None:
+            return self.sealed_count
+
+        self.sealed_count = self.produced_count
+        self.phase = (
+            HandoffPhase.READY_TO_COMMIT
+            if self.replayed_count == self.sealed_count
+            else HandoffPhase.DRAINING_FINAL_SUFFIX
+        )
+        return self.sealed_count
+
     def acknowledge_replay(self, *, epoch: int, replayed_count: int) -> None:
         self._check_epoch(epoch)
         self._check_active()
@@ -185,11 +216,12 @@ class TokenHandoffState:
             )
 
         self.replayed_count = replayed_count
-        self.phase = (
-            HandoffPhase.READY_TO_COMMIT
-            if replayed_count == self.produced_count
-            else HandoffPhase.REPLAYING
-        )
+        if replayed_count == self.produced_count:
+            self.phase = HandoffPhase.READY_TO_COMMIT
+        elif self.sealed_count is not None:
+            self.phase = HandoffPhase.DRAINING_FINAL_SUFFIX
+        else:
+            self.phase = HandoffPhase.REPLAYING
 
     def commit(self, *, epoch: int, produced_count: int) -> None:
         """Atomically transfer output ownership at an exact token boundary."""
@@ -204,6 +236,10 @@ class TokenHandoffState:
         if self.replayed_count != produced_count:
             raise HandoffProtocolError(
                 "decode has not materialized KV for the full token log"
+            )
+        if self.sealed_count != produced_count:
+            raise HandoffProtocolError(
+                "token log must be sealed at the committed output boundary"
             )
 
         self.committed_count = produced_count

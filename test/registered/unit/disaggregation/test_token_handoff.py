@@ -16,6 +16,7 @@ def test_exact_count_commit_transfers_single_output_owner():
     state.append_tokens(epoch=7, first_output_index=0, token_ids=[11, 12, 13])
     state.mark_prompt_kv_ready(epoch=7)
     state.acknowledge_replay(epoch=7, replayed_count=3)
+    state.seal_token_log(epoch=7)
     state.commit(epoch=7, produced_count=3)
 
     assert state.phase is HandoffPhase.COMMITTED
@@ -38,8 +39,36 @@ def test_new_prefill_token_after_replay_ack_forces_decode_to_catch_up_again():
         state.commit(epoch=1, produced_count=2)
 
     state.acknowledge_replay(epoch=1, replayed_count=3)
+    state.seal_token_log(epoch=1)
     state.commit(epoch=1, produced_count=3)
     assert state.owner is OutputOwner.DECODE
+
+
+def test_sealed_log_stops_live_producer_and_bounds_final_replay():
+    state = TokenHandoffState("req-seal", epoch=5, prompt_token_count=32768)
+    state.append_tokens(epoch=5, first_output_index=0, token_ids=[1, 2, 3, 4])
+    state.mark_prompt_kv_ready(epoch=5)
+    state.acknowledge_replay(epoch=5, replayed_count=2)
+
+    assert state.seal_token_log(epoch=5) == 4
+    assert state.phase is HandoffPhase.DRAINING_FINAL_SUFFIX
+    with pytest.raises(HandoffProtocolError, match="sealed"):
+        state.append_tokens(epoch=5, first_output_index=4, token_ids=[5])
+
+    state.acknowledge_replay(epoch=5, replayed_count=4)
+    assert state.phase is HandoffPhase.READY_TO_COMMIT
+    state.commit(epoch=5, produced_count=4)
+    assert state.owner is OutputOwner.DECODE
+
+
+def test_commit_requires_a_sealed_output_boundary():
+    state = TokenHandoffState("req-unsealed", epoch=6, prompt_token_count=4096)
+    state.append_tokens(epoch=6, first_output_index=0, token_ids=[8])
+    state.mark_prompt_kv_ready(epoch=6)
+    state.acknowledge_replay(epoch=6, replayed_count=1)
+
+    with pytest.raises(HandoffProtocolError, match="must be sealed"):
+        state.commit(epoch=6, produced_count=1)
 
 
 def test_stale_epoch_cannot_advance_or_cancel_handoff():
