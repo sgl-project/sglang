@@ -2512,6 +2512,14 @@ class ServerArgs:
         "The size of host KV cache memory pool in gigabytes, which will override the hicache_ratio if set.",
         NS("memory"),
     ] = 0
+    hicache_swa_offload_page_stride: A[
+        int,
+        "Strict bit-exact SWA HiCache: offload one SWA sliding window every N "
+        "pages (plus the sequence tail window, always captured). 1 = per-page "
+        "(finest reuse granularity, most host memory). Larger N trades reuse "
+        "granularity for host memory; the SWA host pool is sized as "
+        "ceil(full_host_pages / N) + tail.",
+    ] = 1
     hicache_write_policy: A[
         str,
         Arg(
