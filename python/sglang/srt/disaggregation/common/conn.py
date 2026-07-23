@@ -690,7 +690,6 @@ class CommonKVManager(BaseKVManager):
             sock = self._zmq_ctx.socket(zmq.PUSH)
             if is_ipv6:
                 sock.setsockopt(zmq.IPV6, 1)
-            sock.setsockopt(zmq.RECONNECT_IVL, -1)
             sock.setsockopt(zmq.SNDTIMEO, 30000)
             sock.setsockopt(zmq.LINGER, 0)
             sock.setsockopt(zmq.TCP_KEEPALIVE, 1)
