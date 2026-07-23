@@ -18,8 +18,7 @@ class TestStandaloneV2SpeculativeDecodingBase(StandaloneServerBase, CustomTestCa
 class TestStandaloneV2SpeculativeDecodingTriton(
     StandaloneServerBase, CustomTestCase, RegexConstrainedMixin, JSONConstrainedMixin
 ):
-    # Constrained decoding reuses this server; with overlap on (fixture
-    # default), grammar decode goes through the spec-v2 grammar barrier.
+    # Constrained mixins reuse this server; overlap on -> grammar barrier path.
     attention_backend = "triton"
 
 
