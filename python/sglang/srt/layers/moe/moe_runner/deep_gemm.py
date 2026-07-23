@@ -8,6 +8,9 @@ import torch
 
 from sglang.kernels.ops.attention.dsv4 import silu_and_mul_masked_post_quant
 from sglang.kernels.ops.quantization import per_token_group_quant
+from sglang.kernels.ops.quantization.fp8_kernel import (
+    create_per_token_group_quant_fp8_output_scale,
+)
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
@@ -1011,18 +1014,31 @@ def _varlen_deep_gemm_silu_mul_quant(
             down_input_scale = down_input_scale.transpose(-1, -2)
         return down_input, down_input_scale
 
-    # Default plain-silu path: the unified JIT masked fused quant. It allocates
-    # the outputs itself, with scales directly in the layout deep_gemm consumes
-    # (packed-int32 col-major for UE8M0, TMA-aligned col-major fp32 otherwise).
+    # Keep these allocations at the DeepGEMM call site. On Hopper, use a
+    # row-major FP32 scale so the existing layout transform creates a separate
+    # owning TMA buffer, matching the pre-#30924 lifetime boundary. Blackwell
+    # keeps the packed UE8M0 layout that DeepGEMM consumes directly.
+    down_input = torch.empty(
+        (E, N, D), device=hidden_states_device, dtype=torch.float8_e4m3fn
+    )
+    down_input_scale = create_per_token_group_quant_fp8_output_scale(
+        x_shape=down_input.shape,
+        device=hidden_states_device,
+        group_size=group_size,
+        column_major_scales=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+        scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+        scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+    )
     expected_m = ceil_div(num_real_tokens * topk, E) if num_real_tokens else None
     return per_token_group_quant(
         gateup_output,
+        output_q=down_input,
+        output_s=down_input_scale,
         group_size=group_size,
         scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
         fuse_silu_and_mul=True,
         masked_m=masked_m,
         expected_m=expected_m,
-        column_major_scales=True,
     )
 
 

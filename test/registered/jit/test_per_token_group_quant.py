@@ -455,6 +455,52 @@ def test_deep_gemm_preserves_tma_aligned_scale_owner(monkeypatch):
     assert prepared.data_ptr() == scale.untyped_storage().data_ptr()
 
 
+def test_masked_fused_deep_gemm_caller_owns_outputs(monkeypatch):
+    from sglang.srt.layers import deep_gemm_wrapper
+    from sglang.srt.layers.moe.moe_runner import deep_gemm as deep_gemm_runner
+
+    x = torch.randn(3, 17, 1024, device="cuda", dtype=torch.bfloat16)
+    masked_m = torch.tensor([17, 9, 1], device="cuda", dtype=torch.int32)
+    captured = {}
+
+    def capture_outputs(input, output_q=None, output_s=None, **kwargs):
+        captured["q"] = output_q
+        captured["s"] = output_s
+        return output_q, output_s
+
+    monkeypatch.setattr(deep_gemm_runner, "per_token_group_quant", capture_outputs)
+    output_q, output_s = deep_gemm_runner._varlen_deep_gemm_silu_mul_quant(
+        x,
+        masked_m,
+        group_size=G,
+        topk=8,
+    )
+
+    assert output_q is captured["q"]
+    assert output_s is captured["s"]
+    assert output_q.shape == (3, 17, 512)
+    if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+        assert output_s.dtype == torch.int32
+        assert output_s.stride(-2) == 1
+    else:
+        assert output_s.dtype == torch.float32
+        assert output_s.is_contiguous()
+
+
+def test_deep_gemm_transforms_row_major_scale_to_owned_tma_buffer():
+    from sglang.srt.layers.deep_gemm_wrapper import entrypoint
+
+    scale = torch.randn(18, 127, 20, device="cuda", dtype=torch.float32)
+    prepared = entrypoint.get_mn_major_tma_aligned_tensor(scale)
+
+    assert prepared is not scale
+    assert prepared.data_ptr() != scale.data_ptr()
+    assert prepared.shape == scale.shape
+    assert prepared.stride(-2) == 1
+    assert prepared.stride(-1) == 128
+    torch.testing.assert_close(prepared, scale)
+
+
 @pytest.mark.parametrize("out_dtype,column_major_scales,scale_ue8m0", AUTO_ALLOC_CASES)
 def test_auto_allocation(out_dtype, column_major_scales, scale_ue8m0):
     """Omitting output_q/output_s allocates them per out_dtype / major mode /
