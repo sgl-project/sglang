@@ -3563,9 +3563,14 @@ class UnifiedRadixCacheSuite:
         retry_slot = req_to_token_pool.mamba_allocator.alloc(1)
 
         # first alloc fails -> prepare must evict a mamba slot and retry
-        with mock.patch.object(
-            req_to_token_pool.mamba_allocator, "alloc", side_effect=[None, retry_slot]
-        ), mock.patch.object(cache, "evict", autospec=True) as evict:
+        with (
+            mock.patch.object(
+                req_to_token_pool.mamba_allocator,
+                "alloc",
+                side_effect=[None, retry_slot],
+            ),
+            mock.patch.object(cache, "evict", autospec=True) as evict,
+        ):
             prep = comp.prepare_load_back(leaf, req=req)
         evict.assert_called_once_with(EvictParams(num_tokens=0, mamba_num=1))
         self.assertIs(prep.allocated_mamba_slot, retry_slot)
