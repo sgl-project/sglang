@@ -67,6 +67,7 @@ def minimax_sparse_prefill(
     max_seqblock_q: Optional[int] = None,
     all_seqblock_q: Optional[int] = None,
     seqlens_cpu: Optional[List[int]] = None,
+    seq_lens_cpu: Optional[torch.Tensor] = None,
 ):
     """Run MiniMax-M3 sparse prefill.
 
@@ -106,6 +107,7 @@ def minimax_sparse_prefill(
         cu_seqblocks_q=cu_seqblocks_q,
         max_seqblock_q=max_seqblock_q,
         all_seqblock_q=all_seqblock_q,
+        seq_lens_cpu=seq_lens_cpu,
     )
     # Step 2: Reduce topk idx if num_idx_heads > num_kv_heads
     num_idx_heads = idx_q.shape[1]
