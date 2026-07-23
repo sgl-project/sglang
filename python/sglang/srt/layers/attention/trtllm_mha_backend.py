@@ -78,9 +78,9 @@ class TRTLLMMHAMetadata:
     # full->SWA translated out_cache_loc (SWA KV-store write target)
     swa_out_cache_loc: torch.Tensor = None
     is_ragged_verify: bool = False
-    # ENCODER_ONLY target-verify (DFlash/DSpark draft block): bs*L single-token
-    # decode rows whose kv length spans the whole window, so each block token
-    # attends prefix + the full block despite the causal decode kernel.
+    # ENCODER_ONLY target-verify (bidirectional attention over the window):
+    # bs*L single-token decode rows whose kv length spans the whole window,
+    # so each token attends the full window despite the causal decode kernel.
     encoder_cache_seqlens: torch.Tensor = None
     encoder_page_table: torch.Tensor = None
     encoder_row_map: torch.Tensor = None
@@ -165,13 +165,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         self.speculative_num_draft_tokens = (
             model_runner.server_args.speculative_num_draft_tokens
         )
-        # DFlash/DSpark draft blocks are ENCODER_ONLY (trained bidirectional);
-        # only their draft worker runs TARGET_VERIFY over such layers, so the
-        # expanded metadata (TRTLLMMHAMetadata.encoder_*) is gated on it.
-        self.expand_encoder_only_verify = bool(
-            model_runner.is_draft_worker
-            and model_runner.server_args.speculative_algorithm in ("DSPARK", "DFLASH")
-        )
+        # Draft models may declare ENCODER_ONLY (bidirectional) attention;
+        # only draft workers run TARGET_VERIFY over such layers, so the
+        # expanded metadata (TRTLLMMHAMetadata.encoder_*) is draft-only.
+        self.expand_encoder_only_verify = bool(model_runner.is_draft_worker)
 
         # SWA hybrid models split the KV cache into full and SWA pools with
         # separate index spaces; SWA layers need a translated page_table.
@@ -1182,10 +1179,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 forward_batch.forward_mode.is_target_verify()
                 and layer.attn_type == AttentionType.ENCODER_ONLY
             ):
-                # ENCODER_ONLY draft block needs bidirectional intra-block
-                # attention; the spec-decode kernel is causal in-window, so run
-                # bs*L single-token rows over the full window instead (block
-                # K/V are already in the pool).
+                # ENCODER_ONLY layers need bidirectional attention over the
+                # verify window; the spec-decode kernel is causal in-window, so
+                # run bs*L single-token rows over the full window instead (the
+                # window's K/V are already in the pool).
                 assert not self.forward_metadata.is_ragged_verify, (
                     "ENCODER_ONLY target_verify does not support ragged "
                     "verify layouts"

@@ -1,11 +1,11 @@
-"""Verify-window semantics of trtllm-gen for the DFlash/DSpark draft block.
+"""Verify-window semantics of trtllm-gen for ENCODER_ONLY layers.
 
 Two pins against a paged SDPA reference: the spec-decode call
-(``q_len_per_req = L``) is causal inside the window (wrong for the
-ENCODER_ONLY draft block, trained bidirectional), and the expanded
-formulation (bs*L single-token rows, kv length = prefix + L) matches the
-full-window reference -- what TRTLLMHAAttnBackend runs for ENCODER_ONLY
-layers on the draft worker.
+(``q_len_per_req = L``) is causal inside the window (wrong for ENCODER_ONLY
+layers, which need bidirectional attention), and the expanded formulation
+(bs*L single-token rows, kv length = prefix + L) matches the full-window
+reference -- what TRTLLMHAAttnBackend runs for ENCODER_ONLY layers on the
+draft worker.
 """
 
 import math
@@ -109,8 +109,8 @@ class TestTrtllmMhaEncoderOnlyVerify(CustomTestCase):
             atol=2e-2,
             rtol=2e-2,
         )
-        # And it is NOT the bidirectional attention the draft was trained
-        # with (would only coincide if the references degenerate).
+        # And it is NOT full-window bidirectional attention (the two
+        # references would only coincide if they degenerate).
         self.assertFalse(
             torch.allclose(causal_ref.float(), full_ref.float(), atol=2e-2, rtol=2e-2)
         )
