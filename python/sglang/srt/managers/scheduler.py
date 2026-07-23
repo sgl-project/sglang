@@ -1106,9 +1106,6 @@ class Scheduler(
         self.disagg_prefill_inflight_queue = None
         self.disagg_decode_prealloc_queue = None
         self.disagg_decode_transfer_queue = None
-        self.disagg_token_handoff_replay_queue = None
-        self.disagg_token_handoff_replay_completed_batches = None
-        self.disagg_token_handoff_replay_inflight = None
 
         self.disaggregation_mode = DisaggregationMode(
             self.server_args.disaggregation_mode
@@ -1168,11 +1165,6 @@ class Scheduler(
                 scheduler=self,
                 tree_cache=self.tree_cache,
             )
-            self.disagg_token_handoff_replay_queue: List[Req] = []
-            self.disagg_token_handoff_replay_completed_batches: List[
-                ScheduleBatch
-            ] = []
-
             # The decode requests pending for pre-allocation
             self.disagg_decode_prealloc_queue = DecodePreallocQueue(
                 req_to_token_pool=self.req_to_token_pool,
