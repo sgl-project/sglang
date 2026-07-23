@@ -670,7 +670,11 @@ class GroupCoordinator:
             # and recompile per shape; defer the selection to runtime inside
             # the opaque custom op. Groups without any accelerated
             # communicator keep the inplace split op so their collective
-            # stays outside captured graphs.
+            # stays outside captured graphs. The symmetric-memory in-place
+            # path below is deliberately bypassed under compile: its raw
+            # pynccl call is untraceable (hard error with fullgraph, graph
+            # break otherwise) and its in-place contract does not fit the
+            # outplace custom op.
             if (
                 self.ca_comm is None
                 and self.qr_comm is None
@@ -908,6 +912,9 @@ class GroupCoordinator:
                 # clone to honor the op's no-mutation contract.
                 input_ = input_.clone()
             elif outplace_all_reduce_method is None:
+                # Force pynccl over the in-place fallback: it is graph-capture
+                # safe and NCCL is natively out-of-place, avoiding the clone
+                # the in-place fallback needs.
                 if self.pynccl_comm is not None:
                     outplace_all_reduce_method = "pynccl"
                 else:
