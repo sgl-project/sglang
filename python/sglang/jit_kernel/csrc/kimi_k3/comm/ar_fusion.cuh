@@ -318,6 +318,9 @@ __global__ __launch_bounds__(kNormRowVecs / kClusterSize) __cluster_dims__(kClus
   __shared__ alignas(8) float smem_raw[2][kClusterSize][kNumWarps];
   uint32_t parity = 0;
 
+  // NOTE: launch PDL earlier for low latency case
+  PDLTriggerSecondary<kUsePDL>();
+
   for (auto row = row_idx; row < num_rows; row += num_row_clusters) {
     const auto vid = row * kNormRowVecs + cluster_rank * kBlockSize + tx;
     vec_t vec[kWorldSize];
@@ -385,7 +388,6 @@ __global__ __launch_bounds__(kNormRowVecs / kClusterSize) __cluster_dims__(kClus
 
   // epilogue: each row cluster flips its own counter; the bumper cluster
   // flips every remaining one so the whole array stays globally uniform
-  PDLTriggerSecondary<kUsePDL>();
   if (cluster_rank == 0 && tx == 0) {
     params.push_counter[row_idx].set(phase ^ 1);
   }

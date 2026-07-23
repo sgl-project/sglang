@@ -126,9 +126,8 @@ __global__ __launch_bounds__(K / kVecSize) void gemm_ag_gemv_kernel(
     const auto base = reinterpret_cast<bf16_t*>(params.ws_mc + phase * params.half_bytes);
     const auto dst = reinterpret_cast<uint32_t*>(base + elem);
     asm volatile("multimem.st.relaxed.sys.global.b32 [%0], %1;" ::"l"(dst), "r"(bits) : "memory");
-  } else {
-    PDLTriggerSecondary<kUsePDL>();
   }
+  PDLTriggerSecondary<kUsePDL>();
 }
 
 // ---------------------------------------------------------------------------
@@ -147,7 +146,7 @@ struct ConsumerParams {
 };
 
 template <uint32_t N, bool kHasC, bool kUsePDL>
-__global__ __launch_bounds__(kSpinBlock) void spin_add3_kernel(const __grid_constant__ ConsumerParams params) {
+__global__ void spin_add3_kernel(const __grid_constant__ ConsumerParams params) {
   using namespace device;
   using vec_t = AlignedVector<bf16x2_t, kSpinVec / 2>;  // 8 bf16 as 4 pairs
   constexpr uint32_t kNLocal = N / kWorld;
@@ -163,6 +162,7 @@ __global__ __launch_bounds__(kSpinBlock) void spin_add3_kernel(const __grid_cons
   // past the grid (work blocks flip [0, num_blocks - 1) themselves)
   if (const auto num_blocks = gridDim.x; bx == num_blocks - 1) {
     [[unlikely]];
+    __syncthreads();  // ensure phase is ready for all threads
     for (uint32_t i = num_blocks - 1 + tx; i < params.num_counters; i += kSpinBlock) {
       params.counter[i].set(phase ^ 1);
     }
@@ -196,12 +196,12 @@ __global__ __launch_bounds__(kSpinBlock) void spin_add3_kernel(const __grid_cons
       out_vec[j] = Trait::add(gathered[j], b_vec[j]);
       if constexpr (kHasC) out_vec[j] = Trait::add(out_vec[j], c_vec[j]);
     }
-    PDLTriggerSecondary<kUsePDL>();
     out_vec.store(params.out + elem);
     AlignedVector<uint32_t, 4> zero;
     zero.fill(0);
     zero.store(src);
   }
+  PDLTriggerSecondary<kUsePDL>();
   __syncthreads();
   if (tx == 0) params.counter[bx].set(phase ^ 1);
 }
