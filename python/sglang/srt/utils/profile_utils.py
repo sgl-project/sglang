@@ -414,11 +414,19 @@ class _ProfilerRPD(_ProfilerConcreteBase):
             rpd_to_chrome_trace("trace.rpd", self.rpd_profile_path)
 
 
-def build_step_span_name(forward_batch: ForwardBatch) -> str:
-    """Build a profile-trace span name for one forward step."""
+def build_step_span_name(forward_batch: ForwardBatch, is_draft: bool = False) -> str:
+    """Build a profile-trace span name for one forward step.
+
+    When ``is_draft`` is set the span gets a ``draft `` prefix. A speculative
+    draft proposer runs on its own ``ModelRunner`` (``is_draft_worker=True``) but
+    reuses a target ``ForwardMode`` (e.g. EAGLE proposes with ``DECODE`` /
+    ``TARGET_VERIFY``), so without the prefix its span is indistinguishable from
+    the target model's forward of the same mode in the trace.
+    """
+    prefix = "draft " if is_draft else ""
     mode = forward_batch.forward_mode
     bs = forward_batch.batch_size
     if mode == ForwardMode.EXTEND:
         ext_toks = forward_batch.extend_num_tokens or 0
-        return f"step[EXTEND bs={bs} toks={ext_toks}]"
-    return f"step[{mode.name} bs={bs}]"
+        return f"{prefix}step[EXTEND bs={bs} toks={ext_toks}]"
+    return f"{prefix}step[{mode.name} bs={bs}]"

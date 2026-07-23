@@ -1148,7 +1148,9 @@ class ModelRunner:
             self.msprobe_debugger.start(model=self.model, rank_id=rank_id)
 
         # Step span
-        step_span_ctx = profile_range(build_step_span_name(forward_batch))
+        step_span_ctx = profile_range(
+            build_step_span_name(forward_batch, self.is_draft_worker)
+        )
 
         canary_ctx = (
             context_tuple(
