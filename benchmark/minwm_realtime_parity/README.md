@@ -105,10 +105,21 @@ The long-video contract uses current minWM eval's valid 720p tier, 1248x704. Exa
 1280x720 is incompatible with the `/16` VAE followed by the DiT's 2x2 spatial
 patch. At 24 FPS, eight fixed 16-frame chunks plus the reference produce 129 frames
 or 5.375 seconds; the harness does not resize or trim that boundary.
-`MINWM_LONG_ENABLE_TORCH_COMPILE` defaults to `false`: the 1248x704 whole-DiT
-compile failed in Torch 2.11 Inductor before producing an output, so it has not
-passed the user's strict-bitwise gate. minWM's native compiled fused segments
-remain enabled in both baseline and serving paths.
+`MINWM_LONG_ENABLE_TORCH_COMPILE` defaults to `false` for the exact lane.
+The 1248x704 non-parity speed lane can now compile the transformer module after
+disabling the nested minWM segment compilers. SGLang calls `module.compile` with
+`fullgraph=False`, so “whole-DiT” describes compilation scope, not a single
+graph without breaks. minWM's native compiled fused segments remain enabled in
+the exact baseline/serving paths. The compiled lane must be evaluated as a
+separate numerical and cold-start profile.
+
+`MINWM_BENCHMARK_MODE=triptych720p` runs one warmed 1248x704, 129-frame case
+through minWM baseline, the accepted SGLang bitwise path, and the combined
+SGLang speed path. It writes lossless arrays, MP4s, timing/metric JSON, GPU
+memory samples, and a self-contained `player/index.html`. The speed path uses
+dense attention, SGLang VAE/T5 components, nondeterministic execution,
+whole-DiT compile, and no nested segment compilers; its delta from the exact
+path therefore must not be attributed to compile alone.
 
 Use the same converted MinWM 5B checkpoint for each server profile. A MinWM
 checkpoint cannot be loaded into the LingBot model class: MinWM is a 30-layer,
@@ -191,6 +202,22 @@ First-case TTFF is `10.343 s` because it includes first-shape fused-segment
 compilation; the next two are `1.963 s` and `1.960 s`. The verified flat player is
 at `results/latest-checkpoint-720p-5s-h200/latest/player/index.html`. These H200
 720p values are not substituted for the formal B200 832x480 matrix.
+
+The later single-case H200 triptych run is under
+`results/latest-checkpoint-720p-triptych-h200/latest/`. Its accepted bitwise
+lane measured `10.822` steady client FPS. A dense/SGLang-components/
+nondeterministic eager control measured `10.853` FPS, while the otherwise
+identical whole-DiT-compiled lane measured `12.711` FPS. This isolates a
+`17.12%` compile gain at 1248x704; the full compiled speed lane is `17.46%`
+faster than the bitwise lane. The first compiled chunk took `235.6 s` in the
+scheduler, whereas the warmed compiled TTFF was `1.701 s`. Peak memory was
+`53,159 MiB` for bitwise and `51,269 MiB` for compiled optimized.
+
+The bitwise video still has zero generated-frame error. The optimized video is
+intentionally non-parity (`RMSE=29.466`, `SSIM=0.838568`, `PSNR=18.744 dB`).
+All three MP4 files were probed as 1248x704, 24 FPS, 129 frames, and 5.375
+seconds. The local player embeds its report and exposes one-button synchronized
+playback for all three lanes.
 
 Artifact export publishes `720p-artifacts-ready` only after the complete result
 tree has been copied and can optionally retain the pod for a capture window. The

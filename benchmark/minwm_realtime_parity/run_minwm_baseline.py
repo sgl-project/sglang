@@ -257,6 +257,7 @@ def main() -> None:
         message = build_minwm_message(case, contract, first_frame)
         write_json(case_dir / "input.json", message)
 
+        warmup_elapsed_s = []
         for run_index in range(args.warmup_runs + 1):
             pipeline.vae.model.clear_cache()
             batch = processor.process_inference_messages(message)
@@ -307,6 +308,7 @@ def main() -> None:
                 .numpy()
             )
             if run_index < args.warmup_runs:
+                warmup_elapsed_s.append(elapsed)
                 print(
                     json.dumps(
                         {
@@ -337,6 +339,7 @@ def main() -> None:
             "elapsed_s": elapsed,
             "frames": int(frames.shape[0]),
             "warmup_runs": args.warmup_runs,
+            "warmup_elapsed_s": warmup_elapsed_s,
             "video_sha256": sha256_file(case_dir / "baseline.mp4"),
             "frames_sha256": sha256_file(case_dir / "baseline.npy"),
             "latents_sha256": sha256_file(case_dir / "baseline_latents.pt"),

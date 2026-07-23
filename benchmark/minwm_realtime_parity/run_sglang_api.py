@@ -200,8 +200,18 @@ async def async_main(args) -> None:
         case_dir = results / "cases" / case["id"]
         case_dir.mkdir(parents=True, exist_ok=True)
         first_frame = materialize_first_frame(case, inputs)
+        warmups = []
         for warmup_index in range(args.warmup_runs):
-            await run_case(args, case, contract, first_frame)
+            warmup_frames, warmup_stats, _, warmup_timing = await run_case(
+                args, case, contract, first_frame
+            )
+            warmups.append(
+                {
+                    "frames": int(warmup_frames.shape[0]),
+                    "chunk_stats": warmup_stats,
+                    "client_timing": warmup_timing,
+                }
+            )
             print(
                 json.dumps(
                     {
@@ -235,6 +245,7 @@ async def async_main(args) -> None:
             "id": case["id"],
             "frames": int(frames.shape[0]),
             "warmup_runs": args.warmup_runs,
+            "warmups": warmups,
             "video_sha256": sha256_file(case_dir / f"{args.output_prefix}.mp4"),
             "frames_sha256": sha256_file(case_dir / f"{args.output_prefix}.npy"),
             "chunk_stats": stats,

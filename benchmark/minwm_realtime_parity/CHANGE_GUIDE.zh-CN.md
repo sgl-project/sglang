@@ -128,10 +128,30 @@ bounded 请求按完整 horizon 预分配；unbounded 请求允许 cache 增长�
 | B200 optimized components | 832x480 | 25.541 FPS | 不再保持同一 native boundary |
 | B200 whole-DiT compile | 832x480 | 32.222 FPS | 非 parity 性能上限 |
 | H200 exact、完整历史 KV | 1248x704 | 10.393 client FPS | 720p 长视频正式 bitwise 路径 |
+| H200 triptych bitwise | 1248x704 | 10.822 client FPS | 同 case、warm full-clip exact lane |
+| H200 optimized eager | 1248x704 | 10.853 client FPS | 与下一行只差 whole-DiT compile |
+| H200 optimized compiled | 1248x704 | 12.711 client FPS | 非 parity、组合性能 lane |
 
 在相同 720p case 的 warm full-case 口径下，minWM baseline 约为 8.20 generated FPS，
 SGLang API 约为 10.095 generated FPS，API 快约 23%。不要把 832x480 的 23 FPS
 和 1248x704 的 10 FPS 直接比较：像素数、token 数、GPU 和 KV 历史都不同。
+
+最新三路复测把同一张 H200、同一 0721 checkpoint、同一 129 帧 case 固定后，bitwise
+lane 为 `10.822 client FPS`，保持其他 speed 设置不变但关闭 whole-DiT compile 的
+optimized eager control 为 `10.853 FPS`，compiled speed lane 为 `12.711 FPS`。
+因此本次 720p 上 whole-DiT compile 的受控增量为 `17.12%`，compiled speed lane
+相对 bitwise 总增量为 `17.46%`；两者不能混写。首次 compiled chunk 的 scheduler
+时间为 `235.6 s`，完整 warmup 请求约四分钟；预热后的 TTFF 为 `1.701 s`。
+
+三路 lossless 比较中，bitwise generated frames 仍为 `max_abs=0、RMSE=0、SSIM=1`；
+optimized generated frames 为 `RMSE=29.466、SSIM=0.838568、PSNR=18.744 dB`，所以
+性能 lane 明确不是 tolerance-parity lane。bitwise/optimized 峰值显存分别为
+`53,159/51,269 MiB`。
+
+页面所列 minWM baseline 是一次完整 clip 的端到端计时，当前复测为 `6.138 output
+FPS`；同一哈希的前一次 H200 重跑为 `8.612 FPS`。这个单次整体计时包含 encode、
+全 horizon、decode 等，重复波动明显，不能与排除 chunk 0 后的 SGLang steady FPS
+当成同口径 microbenchmark。
 
 为了 bitwise 所付的正式 B200 税可拆为：
 
@@ -139,8 +159,18 @@ SGLang API 约为 10.095 generated FPS，API 快约 23%。不要把 832x480 的 
 - native VAE/T5 boundary：约 `3.24%`；
 - exact profile 相对已测非 exact 优化组合：合计约 `9.65%`。
 
-Whole-DiT compile 目前不能默认打开。1248x704 首图在 Torch 2.11 Inductor
-post-grad 阶段触发 `FakeTensor * Node`，没有产生可做 parity 比较的输出。
+Whole-DiT compile 现在可以在 1248x704 的非 parity 性能 profile 中完成。这里的
+“whole-DiT”表示对整个 transformer module 调用 `module.compile`；SGLang 当前传入
+`fullgraph=False`，所以 Dynamo 仍允许内部 graph break，它不是单一的无断点巨图。
+性能 profile 同时关闭 minWM 的小粒度动态 segment compile，避免嵌套编译边界引入
+重复 graph break/recompile；这组配置不再复现早期 Torch 2.11 的
+`FakeTensor * Node` 失败。
+
+这不意味着可以把 compile 打开成 bitwise 默认值。正式 exact lane 仍关闭 whole-DiT
+compile，并保留与 minWM `main` 相同的局部 fused-segment compile；性能 lane 则同时
+采用 dense attention、SGLang VAE/T5、非确定性执行和 whole-DiT compile。三路页面
+因此用于比较“已验收 exact”与“组合性能上限”，不能把总差值全部归因给 compile。
+832x480 的受控矩阵中，compile 在相同 dense/优化组件上单独贡献了约 `26.16%`。
 
 ## 9. Sequence Parallel 审计与 24 FPS 上限
 
@@ -212,10 +242,12 @@ causal KV、数值 parity、benchmark、同步播放器和中英文文档。它�
 推荐的下一阶段顺序是：先 profile VAE/RGB，做 decode/DiT pipeline overlap；再实现
 MinWM packed attention 的 Ulysses all-to-all 和 KV ownership；最后在相同
 prompt/seed/首帧/action 的多卡环境中重新建立 bitwise 或预声明 tolerance 的验收矩阵。
+Whole-DiT performance profile 若要成为产品默认值，也必须单独定义并通过数值 tolerance
+和冷启动预算，而不能继承 eager exact lane 的 bitwise 结论。
 
 ## 必须通过的测验
 
-通过标准：总分至少 `17/20`，并且标有“关键”的第 2、5、8、12、15、17、19 题必须
+通过标准：总分至少 `19/22`，并且标有“关键”的第 2、5、8、12、15、17、19、21 题必须
 全部正确。回答时必须用自己的话解释；只写“是/否”不得分。评审者可以要求指出对应
 代码或实验字段。
 
@@ -240,6 +272,10 @@ prompt/seed/首帧/action 的多卡环境中重新建立 bitwise 或预声明 to
 19. **关键：** 为什么任何有限 Ulysses degree 都不能单独达到 720p 24 FPS？
 20. 如果由你负责下一轮优化，请列出三个按优先级排序的工作，并说明每项如何验证性能
     和数值一致性没有回退。
+21. **关键：** 三路页面里的 optimized lane 为什么不能叫“compiled bitwise”？列出
+    它相对 bitwise lane 同时改变的四项执行边界。
+22. 为什么必须把首次 compile/autotune 时间、warm TTFF 和 steady FPS 分开？若三路
+    总加速为 18%，为什么不能宣称 “torch.compile 单独加速 18%”？
 
 答题模板：
 
@@ -247,5 +283,5 @@ prompt/seed/首帧/action 的多卡环境中重新建立 bitwise 或预声明 to
 1. ...
 2. ...
 ...
-20. ...
+22. ...
 ```

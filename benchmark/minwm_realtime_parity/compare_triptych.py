@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from pathlib import Path
 
 import numpy as np
@@ -115,6 +116,12 @@ def write_player(results: Path, report: dict) -> None:
 
 def main() -> None:
     args = parse_args()
+    for name, value in (
+        ("--bitwise-prefix", args.bitwise_prefix),
+        ("--optimized-prefix", args.optimized_prefix),
+    ):
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", value):
+            raise ValueError(f"{name} must be a safe filename stem")
     manifest = load_cases(args.cases)
     results = Path(args.results).resolve()
     baseline_run = load_json(results / "baseline_run.json")

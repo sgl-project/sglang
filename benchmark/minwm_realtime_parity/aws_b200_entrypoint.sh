@@ -181,8 +181,13 @@ if [[ "${MINWM_BENCHMARK_MODE}" == "triptych720p" ]]; then
   TRIPTYCH_CASES="${MINWM_CASES_PATH:-${SCRIPT_DIR}/cases_720p_compile_smoke.json}"
   TRIPTYCH_RESULTS="${LOCAL_RESULTS}/triptych-720p"
   TRIPTYCH_WARMUP_RUNS="${MINWM_TRIPTYCH_WARMUP_RUNS:-1}"
+  ARTIFACT_HOLD_SECONDS="${MINWM_ARTIFACT_HOLD_SECONDS:-0}"
   if ! [[ "${TRIPTYCH_WARMUP_RUNS}" =~ ^[0-9]+$ ]]; then
     echo "MINWM_TRIPTYCH_WARMUP_RUNS must be a non-negative integer" >&2
+    exit 2
+  fi
+  if ! [[ "${ARTIFACT_HOLD_SECONDS}" =~ ^[0-9]+$ ]]; then
+    echo "MINWM_ARTIFACT_HOLD_SECONDS must be a non-negative integer" >&2
     exit 2
   fi
   mkdir -p "${TRIPTYCH_RESULTS}"
@@ -253,7 +258,7 @@ if [[ "${MINWM_BENCHMARK_MODE}" == "triptych720p" ]]; then
   run_triptych_lane bitwise packed true text_encoder,vae false true 1
   # Whole-DiT compilation subsumes minWM's small dynamic segment compiles. The
   # nested compilers add graph breaks/recompiles, so the speed lane leaves those
-  # helpers eager and lets Inductor own the complete transformer graph.
+  # helpers eager and lets module-level Inductor own the transformer scope.
   run_triptych_lane optimized dense false "" true false 0
 
   python3 "${SCRIPT_DIR}/compare_triptych.py" \
@@ -265,6 +270,10 @@ if [[ "${MINWM_BENCHMARK_MODE}" == "triptych720p" ]]; then
   cp "${TRIPTYCH_RESULTS}/triptych_report.md" "${RESULTS}/"
   touch "${RESULTS}/triptych-artifacts-ready"
   echo "MINWM_TRIPTYCH720P_COMPLETE results=${RESULTS}"
+  if (( ARTIFACT_HOLD_SECONDS > 0 )); then
+    echo "MINWM_ARTIFACT_HOLD seconds=${ARTIFACT_HOLD_SECONDS}"
+    sleep "${ARTIFACT_HOLD_SECONDS}"
+  fi
   exit 0
 fi
 

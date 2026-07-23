@@ -97,6 +97,42 @@ case 的 TTFF 为 `10.343 s`，包含首次 shape 的 minWM 原生局部 fused-s
 `benchmark/minwm_realtime_parity/results/latest-checkpoint-720p-5s-h200/latest/`；
 `player/index.html` 为每个 case 提供一键同步播放、seek、倍速和逐帧控制。
 
+### 720p 三路 whole-DiT compile 复测
+
+2026-07-23 的 H200 attempt 20 固定同一 0721 checkpoint、同一
+`00_forward_080_pottery_720p` prompt/seed/首帧/连续 `w=0.8` action，按顺序生成：
+
+1. minWM `main` / V3 baseline；
+2. SGLang 已验收 bitwise lane；
+3. SGLang 性能 lane：dense attention、SGLang VAE/T5、非确定性执行、关闭内层
+   segment compile、打开 whole-DiT `module.compile`。
+
+三支 MP4 均经 `ffprobe` 验证为 `1248x704`、24 FPS、129 帧、5.375 秒。Bitwise lane
+与 baseline 的 lossless generated frames 仍逐字节相同：
+`max_abs=0、RMSE=0、SSIM=1`。性能 lane 有意不要求 parity，其 generated-frame
+指标为 `RMSE=29.4657、SSIM=0.838568、PSNR=18.7445 dB`。
+
+| Lane | Steady client FPS | Scheduler FPS | Warm TTFF | Peak GPU |
+| --- | ---: | ---: | ---: | ---: |
+| SGLang bitwise | 10.822 | 10.799 | 1.976 s | 53,159 MiB |
+| optimized eager control | 10.853 | 10.817 | 1.900 s | 未单独采样 |
+| optimized whole-DiT compiled | 12.711 | 12.643 | 1.701 s | 51,269 MiB |
+
+保持 optimized profile 其他设置不变时，whole-DiT compile 单独带来 `17.12%` 的
+steady client FPS 增量；完整 compiled speed lane 相对 bitwise lane 提升 `17.46%`。
+首次 compiled chunk 的 scheduler 时间为 `235.6 s`，完整 warmup 请求约四分钟，
+所以这个配置适合常驻服务，不适合频繁冷启动。
+
+这里的 whole-DiT 是对 transformer module 调用 `module.compile`；SGLang 当前参数是
+`fullgraph=False`，允许内部 graph break。它不等于单一无断点巨图。性能 lane 关闭
+MinWM 的小粒度动态 segment compile，是为了避免外层和内层嵌套编译边界。这个组合
+不再复现早期 `FakeTensor * Node`，但由于同时改变了多个配置，只能说明该失败可规避，
+不能从这一次实验断言 segment compile 是唯一根因。
+
+本地三路同步播放器和报告位于
+`benchmark/minwm_realtime_parity/results/latest-checkpoint-720p-triptych-h200/latest/`。
+`player/index.html` 同屏展示三路，并提供一键播放/暂停、同步 seek、倍速和逐帧控制。
+
 两个 checkpoint 路径中都包含 `stage3`，尽管需求描述的是“stage4 DMD”模型。实现不会根据文件名
 进行重新解释。最新对象的原生匹配配置是非 varlen 的 `wan22_5b_dmd.yaml`；首帧 API
 对比则有意采用 V3 compatibility contract。Benchmark 报告中必须始终保留这一命名与
@@ -254,12 +290,15 @@ cross-attention KV；在第一个生成 latent chunk 之前，它还会送入 re
 | D31 | 将连续 `action_weights` 作为 `primitive_token_residual` 的一等 API 输入，同时保留 81 类 label。 | minWM `main` 的 conditioner 原生接受 `[B,F,S,8]` 权重；此前 SGLang adapter 只暴露 label，无法表达 `w=0.8`。API 现在校验 `[0,1]`、按 VAE temporal factor 分窗，并禁止 session 内切换 action tensor rank。 |
 | D32 | 默认 KV contract 改为 minWM 的无界历史；45/128 只保留为显式 benchmark override。 | `model_wan22_5B.yaml` 的唯一真源是 `local_attn_size=-1,sink_size=0`。Bounded request 预分配完整 horizon，无界 request 允许 cache 增长，避免把历史性能实验误当成模型语义。 |
 | D33 | 720p 长视频回归使用 1248x704、129 帧，而不静默 resize 或裁成正好五秒。 | 这是当前 minWM eval 的合法 720p 档；1280x720 与 DiT patch geometry 不兼容。129/24=5.375 秒是八个完整 realtime chunk 加首帧，保留了模型与传输边界。 |
-| D34 | 只有 whole-DiT compiled 路径通过 strict bitwise 后才允许把它设为默认；当前继续关闭。 | Torch 2.11 的 1248x704 首图编译在 Inductor post-grad 阶段触发 `FakeTensor * Node`，尚未产生可比较输出；更早的 832x480 whole-compile profile 也只代表非 parity 性能上限。因此产品默认只保留与 minWM `main` 相同的局部 fused-segment compile。 |
+| D34 | Whole-DiT compile 只在独立的非 parity 性能 profile 中开启，bitwise 默认继续关闭。 | 1248x704 性能 lane 现在能够完成模块级 compile，但 SGLang 使用 `fullgraph=False`，允许内部 graph break；该 lane 的输出也不再逐字节相同。产品默认仍只保留与 minWM `main` 相同的局部 fused-segment compile，不能用 eager exact 结论替 compiled lane 背书。 |
 | D35 | FA4/FA3/FA2 必须采用与 minWM `main` 相同的“设备 + 可用性”回退规则，不能在 Hopper 上强制 FA4。 | 第一轮 H200 720p 长测中，baseline 实际选择 FA2，而 SGLang 强制 FA4；即使 idle action 也从第一生成帧开始漂移。跟随源实现选择 backend 后消除了硬件相关的数值契约缺口，同时不改变 B200 的 FA4 路径。 |
 | D36 | 将无界 cache 的 `allow_growth` 策略透传到通用 cache initializer。 | Allocator 原本已经支持增长，但 initializer 丢掉了参数；第一轮原生 KV 长测才在真实运行时暴露。新增单测保证 MinWM policy 会到达每一层 cache。 |
 | D37 | 只有完整结果目录复制结束后才发布 artifact-ready 标记，并保留 120 秒抓取窗口。 | 第一份成功的 H200 长测先写出 summary、后复制约 2 GB 结果；外部抓取器过早判定完成，而 Pod 退出时 emptyDir 被回收。显式完成标记把“推理完成”和“产物可导出”分开。 |
 | D38 | 对已经 `array_equal` 的 lossless 数组直接返回恒等 metric。 | 旧比较器仍会把 720p exact pair 转为多份 float64，并重复计算 cosine 与逐帧 SSIM。短路只在已经证明 byte-equal 后触发，结论数学上不变，但避免长视频验收的无意义 CPU/内存开销。 |
 | D39 | 在 MinWM 真正实现 Ulysses/Ring 前，显式拒绝所有非一的 SP 参数。 | 当前 batch 不会进入 sequence shard，source-shaped packed attention 也没有 all-to-all；静默接受参数会让多卡重复计算被误认为有效加速。Causal KV ownership、action history、absolute position 和 output gather 必须一起设计并重做 parity 验证。 |
+| D40 | Whole-DiT 性能 lane 关闭 MinWM 的小粒度动态 segment compile。 | 对整个 transformer 调用 `module.compile` 时，再在 AdaLN、RMSNorm 和 QK+RoPE 内嵌套 `torch.compile(dynamic=True)` 会形成重复 graph boundary 和 recompile。性能 lane 让 Inductor 管理外层模块，exact lane 则保留 source-shaped segment boundary；两种 scope 不混用。 |
+| D41 | 三路页面固定同一 case，并把首次完整请求作为 warmup 后再计量。 | 首次 whole-DiT compile/autotune 是分钟级冷启动，若把它混入 5.375 秒 clip FPS，会掩盖服务稳态能力。页面同时保存 baseline、bitwise、optimized 的 lossless arrays、MP4、TTFF、steady FPS 和误差，而 optimized 的组合收益不会被误写成纯 compile 收益。 |
+| D42 | artifact-ready 标记之后仍允许显式保留容器。 | Kubernetes `emptyDir` 会随 Pod 退出立即消失；第一次三路成功运行虽有完整日志和摘要，却无法事后恢复视频。`MINWM_ARTIFACT_HOLD_SECONDS` 将计算完成与人工/自动拷贝窗口分离，不改变模型运行。 |
 
 ## 实现过程中发现的差异
 
@@ -399,12 +438,17 @@ cross-attention KV；在第一个生成 latent chunk 之前，它还会送入 re
 31. H200 首轮能运行的长测仍未 parity：minWM 按设备回退到 FA2，SGLang 却硬编码
     packed FA4。把 backend 选择改为和 source 相同的 Blackwell/FA4、Hopper/FA3、否则
     FA2 可用性规则后，三组长视频都达到 bitwise exact。
-32. 1248x704 的 whole-DiT `torch.compile` 在 Torch 2.11 Inductor post-grad 阶段因
-    `FakeTensor * Node` 报错，首个可比较输出尚未产生。因此它没有通过用户要求的
-    bitwise gate；只保留 minWM `main` 本来就使用的局部 fused-segment compile。
+32. 1248x704 的第一次 whole-DiT `torch.compile` 尝试在 Torch 2.11 Inductor
+    post-grad 阶段因 `FakeTensor * Node` 报错。随后把外层模块 compile 与 MinWM
+    内层动态 segment compile 分开，非 parity 性能 lane 能够完成编译和 129 帧推理。
+    这说明早期失败不是“720p 永远不可编译”，但不能仅凭组合配置变化断言唯一根因。
+    Compiled output 不再 bitwise，因此 exact 默认仍关闭 whole-DiT compile。
 33. 第一份成功的长测结果因 summary 早于目录复制完成而未被外部 watcher 保存；Pod
     退出后 emptyDir 已回收，恢复 Pod 也确认没有残留数据。重跑加入最终 ready marker
     和保留窗口，才完整抓取视频、报告、日志与显存采样。
+34. 第一次成功的三路编译运行同样暴露了 `emptyDir` 生命周期：计算和报告全部成功，
+    但容器退出后视频不可恢复。重跑在同一 H200、同一 checkpoint 和同一 case 上验证
+    哈希与吞吐，同时增加一小时只读抓取窗口；实现也将该窗口做成可选环境变量。
 
 ## 一致性验收门槛
 
@@ -555,6 +599,10 @@ s3://leap-world-us-east-2/world-model/evals/minwm/realtime-parity/20260722-codex
 - whole compile 进一步把优化路径提升 `26.16%` 到 `32.222 FPS`，但 TTFF 增至
   `75.36 s`，并且会改变数值轨迹；它是性能上限 profile，不是 parity 选项。若拿它
   与 exact 比，exact 吞吐低 `28.39%`，其中包含 compile 与非 exact component 的共同影响。
+- 1248x704、原生全历史 KV 的同 case control 中，optimized eager 为 `10.853 FPS`，
+  otherwise-identical whole-DiT compiled 为 `12.711 FPS`，所以 H200 720p 下 compile
+  单项增量为 `17.12%`。Compiled 相对 bitwise 的 `17.46%` 是组合收益，不能反过来
+  当作 compile 单项。
 - KV 128 与 KV 45 的 FPS 只差 `0.39%`，但 pipeline peak memory 从 `46,512 MB`
   降到 `35,042 MB`。客户端与 scheduler FPS 的差小于 `0.06%`，说明 WebSocket、
   raw RGB payload 和网络不是这次吞吐不符预期的主因。
@@ -614,6 +662,10 @@ s3://leap-world-us-east-2/world-model/evals/minwm/realtime-parity/20260722-codex
     `max_chunks`，SGLang 应增长 cache 还是淘汰旧帧？KV45/KV128 为什么不能叫原生 window？
 18. 打开 whole-model `torch.compile` 后，为什么必须同时报告 TTFF 和 steady FPS？如果
     eager 已经 bitwise exact，但 compiled 路径只通过 tolerance，能否称 compiled bitwise？
+19. 三路页面的 optimized lane 同时改变了哪些执行边界？为什么它相对 bitwise 的
+    `17.46%` 不能直接归因于 `torch.compile`？
+20. 解释 `module.compile(fullgraph=False)` 与“单一无 graph break 的完整大图”之间的
+    差别。为什么 performance lane 要关闭内层 segment compile，而 exact lane反而保留它？
 
 答案必须引用上文具体的 cache/action/RNG 契约，不能只复述通用 diffusion 概念。
 
@@ -622,7 +674,7 @@ s3://leap-world-us-east-2/world-model/evals/minwm/realtime-parity/20260722-codex
 上面十五题每题四分：机制正确两分，指出具体 tensor/state 一分，解释错误表现一分。
 剩余四十分来自四个实操题：
 
-第 16–18 题为每题四分的专题加分题，不改变原 100 分总分。
+第 16–20 题为每题四分的专题加分题，不改变原 100 分总分。
 
 1. **Action trace（10 分）：** 某 session 的三个 chunk 依次为 `idle`、`w`、
    `w+l`。写出 chunk 2 的 label，以及 action encoder 实际看到的八帧窗口。
@@ -682,6 +734,16 @@ cache 对应实现。
   复测并保存在本地平铺播放器中。修正 artifact-ready 的发布顺序后，六个 MP4、报告、
   日志和显存采样均成功导出；同运行时 cache/backend 定向测试 4 项全部通过。Whole-DiT
   compile 仍关闭，minWM 原生局部 fused-segment compile 保持开启。
+- 2026-07-23 — 将 whole-DiT compile 与 MinWM 内层动态 segment compile 分离：
+  exact lane 保留 source-shaped segment compile 并关闭 whole-DiT；performance lane
+  关闭内层 segment compile，对 transformer module 使用
+  `max-autotune-no-cudagraphs`、`fullgraph=False`。1248x704 首图编译不再触发早期
+  `FakeTensor * Node`，但输出不再 bitwise，因此没有修改产品默认值。
+- 2026-07-23 — H200 attempt 19 首次完成 baseline/bitwise/compiled 三路计算，但
+  Pod 退出后 `emptyDir` 立即回收，视频无法恢复。Attempt 20 在同一节点重跑并加入
+  `MINWM_ARTIFACT_HOLD_SECONDS`；三支 MP4、lossless 指标、服务日志和显存采样均成功
+  抓取。随后补跑 otherwise-identical optimized eager control，把 720p compile 单项
+  增量定为 `17.12%`，而不是把组合 profile 的 `17.46%` 全部归因给 compile。
 
 - 2026-07-21 — 将 minWM baseline 锁定为当前 `main`；拒绝使用更早的
   camera/PRoPE branch 作为 serving 事实来源。
