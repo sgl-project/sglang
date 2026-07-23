@@ -184,6 +184,7 @@ if [[ "${MINWM_BENCHMARK_MODE}" == "spmatrix720p" ]]; then
   # then skip valid SP artifacts instead of discarding an entire matrix.
   SP_RESULTS="${MINWM_SP_RESULTS_DIR:-${RESULTS}/sp-matrix-720p}"
   SP_WARMUP_RUNS="${MINWM_SP_WARMUP_RUNS:-1}"
+  SP_DEGREES="${MINWM_SP_DEGREES:-1 2 4 8}"
   ARTIFACT_HOLD_SECONDS="${MINWM_ARTIFACT_HOLD_SECONDS:-0}"
   if ! [[ "${SP_WARMUP_RUNS}" =~ ^[0-9]+$ ]]; then
     echo "MINWM_SP_WARMUP_RUNS must be a non-negative integer" >&2
@@ -258,6 +259,7 @@ PY
     MINWM_ATTENTION_IMPL=packed \
     MINWM_PACKED_ATTENTION_DETERMINISTIC=true \
     MINWM_NATIVE_COMPONENTS=text_encoder,vae \
+    CUDA_LAUNCH_BLOCKING="${MINWM_CUDA_LAUNCH_BLOCKING:-0}" \
     sglang serve \
       --model-path "${MODEL_DIR}" \
       --pipeline-class-name MinWMCausalDMDPipeline \
@@ -304,17 +306,30 @@ PY
     wait "${monitor_pid}" 2>/dev/null || true
     if (( lane_status == 0 )); then
       sync_sp_results
+    else
+      echo "MINWM_SP_LANE_FAILED degree=${degree}; server log follows" >&2
+      tail -300 "${server_log}" >&2
     fi
     return "${lane_status}"
   }
 
-  for degree in 1 2 4 8; do
+  read -r -a sp_degrees <<< "${SP_DEGREES}"
+  for degree in "${sp_degrees[@]}"; do
+    if ! [[ "${degree}" =~ ^(1|2|4|8)$ ]]; then
+      echo "MINWM_SP_DEGREES contains unsupported degree: ${degree}" >&2
+      exit 2
+    fi
     if sp_lane_complete "sp${degree}"; then
       echo "MINWM_SP_RESUME_SKIP degree=${degree}"
     else
       run_sp_lane "${degree}"
     fi
   done
+  if [[ "${sp_degrees[*]}" != "1 2 4 8" ]]; then
+    echo "MINWM_SP_PARTIAL_COMPLETE degrees=${sp_degrees[*]} results=${SP_RESULTS}"
+    sync_sp_results
+    exit 0
+  fi
   python3 "${SCRIPT_DIR}/compare_sp_matrix.py" \
     --cases "${SP_CASES}" \
     --results "${SP_RESULTS}" \
