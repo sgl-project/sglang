@@ -7,13 +7,13 @@ import torch.nn.functional as F
 import triton
 import triton.testing
 
-from sglang.jit_kernel.benchmark.utils import (
+from sglang.kernels.jit.benchmark.utils import (
     DEFAULT_DEVICE,
     DEFAULT_DTYPE,
     get_benchmark_range,
     run_benchmark,
 )
-from sglang.jit_kernel.hadamard import hadamard_transform
+from sglang.kernels.ops.attention.hadamard import hadamard_transform
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(

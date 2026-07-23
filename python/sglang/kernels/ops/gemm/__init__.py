@@ -59,26 +59,26 @@ register_kernel(
     KernelSpec(
         op="gemm.dsv3_fused_a_gemm",
         backend=KernelBackend.JIT,
-        target="sglang.jit_kernel.dsv3_fused_a_gemm:dsv3_fused_a_gemm",
+        target="sglang.kernels.ops.gemm._jit_dsv3_fused_a_gemm:dsv3_fused_a_gemm",
         capabilities=_CUDA,
         format_signature=FormatSignature(
             supported_dtypes=("bfloat16",),
             description="DeepSeek-V3 fused QKV-A GEMM (drop-in with AOT signature)",
         ),
-        description="DeepSeek-V3 fused-A GEMM (sglang.jit_kernel).",
+        description="DeepSeek-V3 fused-A GEMM (sglang.kernels.jit).",
     )
 )
 register_kernel(
     KernelSpec(
         op="gemm.dsv3_router_gemm",
         backend=KernelBackend.JIT,
-        target="sglang.jit_kernel.dsv3_router_gemm:dsv3_router_gemm",
+        target="sglang.kernels.ops.gemm._jit_dsv3_router_gemm:dsv3_router_gemm",
         capabilities=_CUDA,
         format_signature=FormatSignature(
             supported_dtypes=("bfloat16",),
             description="DeepSeek-V3 router GEMM; num_tokens in [1, 16]",
         ),
-        description="DeepSeek-V3 router GEMM (sglang.jit_kernel, JIT-only).",
+        description="DeepSeek-V3 router GEMM (sglang.kernels.jit, JIT-only).",
     )
 )
 

@@ -28,7 +28,7 @@ try:
 except:
     pass
 
-from sglang.jit_kernel.utils import is_arch_support_pdl
+from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.utils import (
     ceil_align,
@@ -55,12 +55,12 @@ _is_sm120_supported = is_sm120_supported()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _is_cuda or _is_musa:
-    from sglang.jit_kernel.per_tensor_quant_fp8 import (
-        per_tensor_quant_fp8 as sgl_per_tensor_quant_fp8,
-    )
     from sglang.kernels.ops.quantization import (
         per_token_group_quant,
         sgl_per_token_quant_fp8,
+    )
+    from sglang.kernels.ops.quantization._jit_per_tensor_quant_fp8 import (
+        per_tensor_quant_fp8 as sgl_per_tensor_quant_fp8,
     )
 
 if _is_musa:
@@ -543,7 +543,7 @@ def _run_per_token_group_quant_8bit_kernel(
     ``sglang_per_token_quant_fp8``.
     """
     if scale_ue8m0 and x_s.dtype == torch.float32 and not _is_musa:
-        from sglang.jit_kernel.per_token_group_quant_8bit_v2 import (
+        from sglang.kernels.ops.quantization._jit_per_token_group_quant_8bit_v2 import (
             per_token_group_quant_8bit_v2,
         )
 
