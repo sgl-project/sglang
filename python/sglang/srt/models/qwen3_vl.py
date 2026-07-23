@@ -1237,9 +1237,10 @@ class Qwen3VLForConditionalGeneration(nn.Module):
 
         self.visual = Qwen3VLMoeVisionModel(
             config.vision_config,
-            # NOTE: Qwen3-VL vision encoder currently supports BitsAndBytes 4-bit quantization.
-            # Other quantization methods (e.g., GPTQ, AWQ) are untested and may not be supported.
-            quant_config=None,
+            # Keep the vision tower aligned with the checkpoint quantization.
+            # ModelSlim checkpoints may contain quantized visual Linear weights
+            # and their weight_scale parameters.
+            quant_config=quant_config,
             norm_eps=getattr(config, "rms_norm_eps", 1e-6),
             prefix=add_prefix("model.visual", prefix),
             use_data_parallel=self.use_data_parallel,

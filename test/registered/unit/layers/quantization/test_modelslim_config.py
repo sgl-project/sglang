@@ -57,6 +57,37 @@ class TestModelSlimPackedModuleResolution(CustomTestCase):
                 self.assertIsInstance(method, ModelSlimLinearMethod)
                 self.assertIsInstance(layer.scheme, ModelSlimMXFP8Scheme)
 
+    def test_resolves_qwen35_visual_projections(self):
+        visual_prefix = "model.visual.blocks.0"
+        quant_config = ModelSlimConfig(
+            {
+                f"{visual_prefix}.attn.qkv.weight": "W8A8_MXFP8",
+                f"{visual_prefix}.attn.proj.weight": "W8A8_MXFP8",
+                f"{visual_prefix}.mlp.linear_fc1.weight": "W8A8_MXFP8",
+                f"{visual_prefix}.mlp.linear_fc2.weight": "W8A8_MXFP8",
+                "packed_modules_mapping": {
+                    "visual": {
+                        "qkv_proj": ["qkv"],
+                    }
+                },
+            }
+        )
+
+        for projection in (
+            "attn.qkv_proj",
+            "attn.proj",
+            "mlp.linear_fc1",
+            "mlp.linear_fc2",
+        ):
+            with self.subTest(projection=projection):
+                layer = self._make_linear_layer()
+                method = quant_config.get_quant_method(
+                    layer, f"{visual_prefix}.{projection}"
+                )
+
+                self.assertIsInstance(method, ModelSlimLinearMethod)
+                self.assertIsInstance(layer.scheme, ModelSlimMXFP8Scheme)
+
 
 if __name__ == "__main__":
     unittest.main()
