@@ -1695,6 +1695,41 @@ class MooncakeKVManager(CommonKVManager):
             )
         )
 
+    def resend_aux(self, bootstrap_room: int, prefill_aux_index: int) -> None:
+        """Rewrite the tiny metadata row after the prompt KV copy completes.
+
+        Token handoff intentionally sends the initial metadata with
+        ``bootstrap_room=0`` so Decode's metadata gate cannot commit a partial
+        token log. Once Prefill seals the log, this synchronous rewrite
+        publishes the final token IDs and non-zero room without retransmitting
+        prompt KV.
+        """
+
+        transfer_infos = self.transfer_infos.get(bootstrap_room)
+        if not transfer_infos:
+            raise RuntimeError(
+                f"No Mooncake transfer info for bootstrap_room={bootstrap_room}"
+            )
+
+        for session_id, req in transfer_infos.items():
+            if req.is_dummy:
+                continue
+            register_info = self.decode_kv_args_table.get(session_id)
+            if register_info is None:
+                raise RuntimeError(
+                    f"No Mooncake KV registration for session {session_id}"
+                )
+            ret = self.send_aux(
+                req,
+                prefill_aux_index,
+                register_info.dst_aux_ptrs,
+            )
+            if ret != 0:
+                raise RuntimeError(
+                    f"Failed to rewrite token handoff metadata for "
+                    f"bootstrap_room={bootstrap_room}, session={session_id}"
+                )
+
     def get_session_id(self):
         return self.engine.get_session_id()
 
@@ -1812,6 +1847,11 @@ class MooncakeKVSender(CommonKVSender):
             return status
         else:
             return self.conclude_state
+
+    def resend_aux(self) -> None:
+        if self.aux_index is None:
+            raise RuntimeError("Cannot resend Mooncake aux data before sender init")
+        self.kv_mgr.resend_aux(self.bootstrap_room, self.aux_index)
 
     def failure_exception(self):
         # Explicitly set the status to failure since this request has failed in another rank

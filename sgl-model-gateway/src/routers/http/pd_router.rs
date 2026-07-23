@@ -694,6 +694,19 @@ impl PDRouter {
             false,
         );
 
+        if context.is_stream
+            && !context.return_logprob
+            && std::env::var_os("SGLANG_PD_TOKEN_HANDOFF").is_some()
+        {
+            return self.create_token_handoff_streaming_response(
+                prefill_request,
+                decode_request,
+                headers.cloned(),
+                prefill,
+                decode,
+            );
+        }
+
         // Run both in this handler task (not a detached tokio::spawn) so a client
         // disconnect cancels the pending decode request too, keeping the
         // upstream-cancel behavior from #19524.
@@ -1113,7 +1126,8 @@ impl PDRouter {
     ) -> Response {
         use crate::core::AttachedBody;
 
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, rx) =
+            tokio::sync::mpsc::unbounded_channel::<Result<bytes::Bytes, String>>();
 
         // Uses select! to race stream.next() against tx.closed() so that
         // when the client disconnects the upstream HTTP connection is dropped
@@ -1210,6 +1224,157 @@ impl PDRouter {
         response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
         *response.headers_mut() = response_headers;
 
+        AttachedBody::wrap_response(response, guards)
+    }
+
+    fn create_token_handoff_streaming_response(
+        &self,
+        prefill_request: reqwest::RequestBuilder,
+        decode_request: reqwest::RequestBuilder,
+        headers: Option<HeaderMap>,
+        prefill: Arc<dyn Worker>,
+        decode: Arc<dyn Worker>,
+    ) -> Response {
+        use crate::core::AttachedBody;
+
+        let (tx, rx) =
+            tokio::sync::mpsc::unbounded_channel::<Result<bytes::Bytes, String>>();
+        let prefill_for_task = Arc::clone(&prefill);
+        let decode_for_task = Arc::clone(&decode);
+
+        tokio::spawn(async move {
+            // Start Decode immediately so it can bootstrap and register its KV
+            // destination while Prefill computes and streams bridge tokens.
+            let decode_task = tokio::spawn(async move { decode_request.send().await });
+
+            let prefill_response = match prefill_request.send().await {
+                Ok(response) if response.status().is_success() => response,
+                Ok(response) => {
+                    prefill_for_task.record_outcome(response.status().is_client_error());
+                    let _ = tx.send(Ok(bytes::Bytes::from(format!(
+                        "data: {{\"error\":\"token handoff prefill returned {}\"}}\n\n\
+                         data: [DONE]\n\n",
+                        response.status()
+                    ))));
+                    decode_task.abort();
+                    return;
+                }
+                Err(error) => {
+                    prefill_for_task.record_outcome(false);
+                    let _ = tx.send(Ok(bytes::Bytes::from(format!(
+                        "data: {{\"error\":\"token handoff prefill failed: {}\"}}\n\n\
+                         data: [DONE]\n\n",
+                        error
+                    ))));
+                    decode_task.abort();
+                    return;
+                }
+            };
+
+            let mut prefill_stream = prefill_response.bytes_stream();
+            while let Some(chunk_result) = prefill_stream.next().await {
+                let chunk = match chunk_result {
+                    Ok(chunk) => chunk,
+                    Err(error) => {
+                        prefill_for_task.record_outcome(false);
+                        let _ = tx.send(Ok(bytes::Bytes::from(format!(
+                            "data: {{\"error\":\"token handoff prefill stream failed: {}\"}}\n\n\
+                             data: [DONE]\n\n",
+                            error
+                        ))));
+                        decode_task.abort();
+                        return;
+                    }
+                };
+
+                // Prefill is the first stream owner, but its [DONE] is only an
+                // ownership boundary. Keep any final data event and suppress
+                // that sentinel so Decode can continue the same client stream.
+                if let Some(done_pos) = memmem::find(&chunk, b"data: [DONE]") {
+                    if done_pos > 0
+                        && tx.send(Ok(chunk.slice(..done_pos))).is_err()
+                    {
+                        decode_task.abort();
+                        return;
+                    }
+                    break;
+                }
+                if tx.send(Ok(chunk)).is_err() {
+                    decode_task.abort();
+                    return;
+                }
+            }
+            prefill_for_task.record_outcome(true);
+
+            let decode_response = match decode_task.await {
+                Ok(Ok(response)) if response.status().is_success() => response,
+                Ok(Ok(response)) => {
+                    decode_for_task.record_outcome(response.status().is_client_error());
+                    let _ = tx.send(Ok(bytes::Bytes::from(format!(
+                        "data: {{\"error\":\"token handoff decode returned {}\"}}\n\n\
+                         data: [DONE]\n\n",
+                        response.status()
+                    ))));
+                    return;
+                }
+                Ok(Err(error)) => {
+                    decode_for_task.record_outcome(false);
+                    let _ = tx.send(Ok(bytes::Bytes::from(format!(
+                        "data: {{\"error\":\"token handoff decode failed: {}\"}}\n\n\
+                         data: [DONE]\n\n",
+                        error
+                    ))));
+                    return;
+                }
+                Err(error) => {
+                    decode_for_task.record_outcome(false);
+                    let _ = tx.send(Ok(bytes::Bytes::from(format!(
+                        "data: {{\"error\":\"token handoff decode task failed: {}\"}}\n\n\
+                         data: [DONE]\n\n",
+                        error
+                    ))));
+                    return;
+                }
+            };
+
+            let mut decode_stream = decode_response.bytes_stream();
+            while let Some(chunk_result) = decode_stream.next().await {
+                match chunk_result {
+                    Ok(chunk) => {
+                        let done = memmem::find(&chunk, b"data: [DONE]").is_some();
+                        if tx.send(Ok(chunk)).is_err() {
+                            return;
+                        }
+                        if done {
+                            decode_for_task.record_outcome(true);
+                            return;
+                        }
+                    }
+                    Err(error) => {
+                        decode_for_task.record_outcome(false);
+                        let _ = tx.send(Ok(bytes::Bytes::from(format!(
+                            "data: {{\"error\":\"token handoff decode stream failed: {}\"}}\n\n\
+                             data: [DONE]\n\n",
+                            error
+                        ))));
+                        return;
+                    }
+                }
+            }
+            decode_for_task.record_outcome(true);
+        });
+
+        let stream = UnboundedReceiverStream::new(rx);
+        let body = Body::from_stream(stream);
+        let guards = vec![
+            WorkerLoadGuard::new(prefill, headers.as_ref()),
+            WorkerLoadGuard::new(decode, headers.as_ref()),
+        ];
+        let mut response = Response::new(body);
+        *response.status_mut() = StatusCode::OK;
+        let mut response_headers = headers.unwrap_or_default();
+        response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+        *response.headers_mut() = response_headers;
         AttachedBody::wrap_response(response, guards)
     }
 

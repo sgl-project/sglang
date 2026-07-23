@@ -380,9 +380,23 @@ class MetadataBuffers:
             self.bootstrap_room[idx].clone(),
         )
 
-    def set_buf(self, req: Req):
-
-        self.output_ids[req.metadata_buffer_index][0] = req.output_ids[0]
+    def set_buf(self, req: Req, token_handoff_ready: bool = True):
+        output_row = self.output_ids[req.metadata_buffer_index]
+        output_row.zero_()
+        if getattr(req, "token_handoff_enabled", False):
+            token_log = list(req.output_ids)
+            if not 1 <= len(token_log) <= 15:
+                raise RuntimeError(
+                    f"Token handoff log length must be in [1, 15], got "
+                    f"{len(token_log)} for request {req.rid}"
+                )
+            output_row[: len(token_log)] = torch.tensor(
+                token_log, dtype=torch.int32, device=output_row.device
+            )
+            # Slot 15 is the protocol discriminator and exact sealed count.
+            output_row[15] = len(token_log)
+        else:
+            output_row[0] = req.output_ids[0]
         # The cached_tokens buffer is (size, 16); slots 0-3 hold cached token
         # counts and slots 4-6 are reused for multimodal prompt token counts
         # (slots 7-15 remain spare). This avoids adding new RDMA buffers.
@@ -496,9 +510,11 @@ class MetadataBuffers:
                 else:
                     self.output_dsa_topk_indices[req.metadata_buffer_index].fill_(-1)
         # Store bootstrap_room for validation on decode side
-        self.bootstrap_room[req.metadata_buffer_index, 0] = (
-            req.bootstrap_room if req.bootstrap_room is not None else 0
-        )
+        self.bootstrap_room[req.metadata_buffer_index].zero_()
+        if token_handoff_ready:
+            self.bootstrap_room[req.metadata_buffer_index, 0] = (
+                req.bootstrap_room if req.bootstrap_room is not None else 0
+            )
 
 
 #########################

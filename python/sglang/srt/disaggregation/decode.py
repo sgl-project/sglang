@@ -1750,12 +1750,49 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             decode_req.is_rebootstrap
             and decode_req.req.pd_rebootstrap_forced_output_id is not None
         )
+        token_handoff_count = (
+            int(output_id[15].item())
+            if self.scheduler.server_args.enable_disaggregation_token_handoff
+            else 0
+        )
+        token_handoff_log = (
+            [int(x) for x in output_id[:token_handoff_count].tolist()]
+            if token_handoff_count > 0
+            else None
+        )
+
         if replayed_boundary:
             committed_output_id = decode_req.req.pd_rebootstrap_forced_output_id
             decode_req.req.pd_rebootstrap_forced_output_id = None
+        elif token_handoff_log is not None:
+            committed_output_id = token_handoff_log[0]
         else:
             committed_output_id = output_id[0].item()
-        decode_req.req.output_ids.append(committed_output_id)
+
+        if token_handoff_log is not None and token_handoff_count > 1:
+            req = decode_req.req
+            req.output_ids.extend(token_handoff_log[:-1])
+            req.token_handoff_replay_expected_id = token_handoff_log[-1]
+            req.token_handoff_original_stream = req.stream
+            req.stream = False
+            prompt_len = len(req.origin_input_ids)
+            req.prefix_indices = self.scheduler.req_to_token_pool.req_to_token[
+                req.req_pool_idx, :prompt_len
+            ].clone()
+            req._refresh_fill_ids()
+            req.set_extend_range(
+                prompt_len,
+                prompt_len + token_handoff_count - 1,
+            )
+        else:
+            decode_req.req.output_ids.append(committed_output_id)
+            if token_handoff_log is not None:
+                # Prefill already streamed this boundary token. Prime Decode's
+                # incremental detokenizer and suppress it from the chained
+                # response.
+                decode_ids, _ = decode_req.req.init_incremental_detokenize()
+                decode_req.req.send_decode_id_offset = len(decode_ids)
+                decode_req.req.send_token_offset = token_handoff_count
         decode_req.req.cached_tokens = cached_tokens[0].item()
         # The prefill node already reported its prefix-cache hit in
         # cached_tokens[0]. Seed already_computed with it so that
@@ -2085,6 +2122,59 @@ class SchedulerDisaggregationDecodeMixin:
         self: Scheduler, running_batch: ScheduleBatch
     ) -> NextBatchPlan:
         """Process prebuilt batch and schedule the next decode batch."""
+        if (
+            self.last_batch
+            and getattr(self.last_batch, "token_handoff_replay_batch", False)
+        ):
+            replay_batch = self.last_batch
+            for req in replay_batch.reqs:
+                expected = req.token_handoff_replay_expected_id
+                actual = int(req.output_ids[-1])
+                if actual != expected:
+                    prepare_abort(
+                        req,
+                        f"Token handoff replay mismatch: expected {expected}, "
+                        f"got {actual}",
+                        status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                    )
+                    release_kv_cache(req, self.tree_cache, is_insert=False)
+                    self.output_streamer.stream_output([req], req.return_logprob)
+                    continue
+                req.stream = req.token_handoff_original_stream
+                decode_ids, _ = req.init_incremental_detokenize()
+                req.send_decode_id_offset = len(decode_ids)
+                req.send_token_offset = len(req.output_ids)
+                del req.token_handoff_replay_expected_id
+                del req.token_handoff_original_stream
+
+            replay_batch.filter_batch()
+            if not replay_batch.is_empty():
+                if running_batch.is_empty():
+                    running_batch = replay_batch
+                else:
+                    running_batch.merge_batch(replay_batch)
+            self.last_batch = None
+
+        if self.disagg_token_handoff_replay_queue:
+            replay_reqs = self.disagg_token_handoff_replay_queue
+            self.disagg_token_handoff_replay_queue = []
+            replay_batch = ScheduleBatch.init_new(
+                replay_reqs,
+                self.req_to_token_pool,
+                self.token_to_kv_pool_allocator,
+                self.tree_cache,
+                self.model_config,
+                self.enable_overlap,
+                self.spec_algorithm,
+            )
+            replay_batch.prepare_for_extend()
+            replay_batch.token_handoff_replay_batch = True
+            set_schedule_time_batch(replay_batch)
+            return NextBatchPlan(
+                batch_to_run=replay_batch,
+                running_batch=running_batch,
+            )
+
         # Process pending prebuilt batch: output processing + filter + merge
         new_prebuilt_batch = self.get_new_prebuilt_batch(running_batch)
         if new_prebuilt_batch:
@@ -2214,4 +2304,12 @@ class SchedulerDisaggregationDecodeMixin:
                 for req in transferred_reqs:
                     # Direct-to-host: KV data already in host pool, skip staging
                     self.hisparse_coordinator.admit_request_direct(req)
-            self.waiting_queue.extend(transferred_reqs)
+            replay_reqs = [
+                req
+                for req in transferred_reqs
+                if hasattr(req, "token_handoff_replay_expected_id")
+            ]
+            self.disagg_token_handoff_replay_queue.extend(replay_reqs)
+            self.waiting_queue.extend(
+                req for req in transferred_reqs if req not in replay_reqs
+            )

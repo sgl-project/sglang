@@ -136,6 +136,26 @@ class TestEagleDsaSeedTransfer(unittest.TestCase):
         self.assertEqual(data_lens[-2], buffers.output_dsa_topk_indices.nbytes)
         self.assertEqual(item_lens[-2], buffers.output_dsa_topk_indices[0].nbytes)
 
+    def test_token_handoff_metadata_is_gated_until_log_is_sealed(self):
+        buffers = MetadataBuffers(
+            size=1,
+            hidden_size=2,
+            hidden_states_dtype=torch.float32,
+            output_dsa_topk_indices_dim=3,
+        )
+        req = self._make_req(None)
+        req.rid = "handoff-test"
+        req.token_handoff_enabled = True
+        req.output_ids = [101, 102, 103]
+
+        buffers.set_buf(req, token_handoff_ready=False)
+        self.assertEqual(buffers.output_ids[0, :3].tolist(), [101, 102, 103])
+        self.assertEqual(buffers.output_ids[0, 15].item(), 3)
+        self.assertEqual(buffers.bootstrap_room[0, 0].item(), 0)
+
+        buffers.set_buf(req, token_handoff_ready=True)
+        self.assertEqual(buffers.bootstrap_room[0, 0].item(), req.bootstrap_room)
+
     def test_decode_input_requires_valid_seed_for_every_request(self):
         seeds = (
             torch.tensor([1, 2, 3], dtype=torch.int32),

@@ -2462,6 +2462,14 @@ class ServerArgs:
         int,
         "Number of optimistic prefill forward passes that skip the bootstrap wait.",
     ] = 0
+    enable_disaggregation_token_handoff: A[
+        bool,
+        "EXPERIMENTAL: let a PD prefill worker temporarily decode while prompt KV is in flight, then replay the emitted token log on decode. Restricted to Mooncake, page_size=1, greedy 1P1D requests.",
+    ] = False
+    disaggregation_token_handoff_max_tokens: A[
+        int,
+        "Maximum number of output tokens carried by the experimental PD token handoff log.",
+    ] = 15
 
     # -------------------------------------------------------------------------
     # Encode prefill disaggregation
