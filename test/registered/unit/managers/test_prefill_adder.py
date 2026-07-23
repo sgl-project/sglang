@@ -2,6 +2,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import torch
+
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.managers.scheduler import Scheduler
@@ -667,6 +669,7 @@ class TestPrefillAdder(CustomTestCase):
 
     def _create_delayer_req(self, num_tokens: int):
         req = self.create_mock_req("delayer_req", priority=0, max_new_tokens=8)
+        req.kv_committed_len = 0
         req.full_untruncated_fill_ids = list(range(num_tokens))
         req.host_hit_length = 0
         req.last_node = MagicMock()
@@ -710,6 +713,23 @@ class TestPrefillAdder(CustomTestCase):
         )
 
         self.assertEqual(adder.rem_total_token_offset, 262144)
+
+    def test_chunked_req_charges_only_new_pages_after_committed_prefix(self):
+        self.mock_token_allocator.available_size.return_value = 1024
+        self.mock_token_allocator.full_available_size.return_value = 1024
+
+        def charge(committed_len):
+            adder = self.create_adder(
+                self.create_running_batch(), page_size=64, rem_chunk_tokens=1024
+            )
+            req = self._create_delayer_req(1)
+            req.kv_committed_len = committed_len
+            req.sampling_params.max_new_tokens = 0
+            adder.add_chunked_req(req)
+            return adder.rem_total_token_offset
+
+        self.assertEqual(charge(63), 0)
+        self.assertEqual(charge(64), 64)
 
     def test_full_kv_page_boundary_admission(self):
         capacity = 262144
