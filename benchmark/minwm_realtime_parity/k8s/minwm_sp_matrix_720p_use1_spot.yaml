@@ -1,3 +1,14 @@
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: minwm-spmatrix-gp3-auto-20260723
+provisioner: ebs.csi.eks.amazonaws.com
+parameters:
+  type: gp3
+reclaimPolicy: Delete
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true
+---
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -9,7 +20,7 @@ metadata:
 spec:
   accessModes:
     - ReadWriteOnce
-  storageClassName: gp2
+  storageClassName: minwm-spmatrix-gp3-auto-20260723
   resources:
     requests:
       storage: 50Gi
