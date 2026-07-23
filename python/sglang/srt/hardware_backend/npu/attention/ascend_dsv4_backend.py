@@ -1218,14 +1218,8 @@ class DeepseekV4AscendAttnBackend(
             dst[n:].fill_(0)
 
     def _build_dsv4_graph_replay_ctx(self, forward_batch: ForwardBatch):
-        graph_mode = (
-            getattr(forward_batch, "global_forward_mode", None)
-            or forward_batch.forward_mode
-        )
-        runtime_mode = (
-            getattr(forward_batch, "actual_forward_mode", None)
-            or forward_batch.forward_mode
-        )
+        graph_mode = forward_batch.forward_mode
+        runtime_mode = getattr(forward_batch, "actual_forward_mode", None) or graph_mode
         bs = forward_batch.batch_size
         seq_lens_cpu = forward_batch.seq_lens_cpu
         assert seq_lens_cpu is not None, "V4 graph replay requires seq_lens_cpu."
@@ -1247,9 +1241,7 @@ class DeepseekV4AscendAttnBackend(
         is_idle_replay = runtime_mode.is_idle()
         has_compress = self._dsv4_has_c4 or self._dsv4_has_c128
         active_target_verify = (
-            graph_mode.is_target_verify()
-            and runtime_mode.is_target_verify()
-            and has_compress
+            graph_mode.is_target_verify() and not is_idle_replay and has_compress
         )
         compress_seq_lens = live_seq_lens
         compress_seq_lens_max = int(seq_lens_cpu[:bs].max()) if bs > 0 else 0
