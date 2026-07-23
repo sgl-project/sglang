@@ -742,23 +742,6 @@ class Envs:
     SGLANG_KDA_FUSED_DECODE_TMA_LOAD = EnvBool(True)
     SGLANG_KDA_FUSED_DECODE_TMA_STAGES = EnvInt(0)
 
-    # Kimi K3 decode optimizations (all fusions default on; "0" to A/B the
-    # unfused path). See python/sglang/srt/models/kimi_k3.py.
-    # Horizontal fusion of same-input GEMMs: shared gate_up + router gate +
-    # latent down_proj -> one GEMM / KDA b_proj + f_a_proj -> one GEMV.
-    SGLANG_K3_FUSE_MOE_FRONT = EnvBool(True)
-    SGLANG_K3_FUSE_KDA_BFA = EnvBool(True)
-    # Dedicated CTA-per-output GEMV kernel for the skinny KDA decode
-    # projections (T <= 8) instead of cublas gemvx/dot dispatch.
-    SGLANG_K3_DECODE_GEMV = EnvBoolWithAlias(
-        True, deprecated_name="SGLANG_K3_TINY_GEMV"
-    )
-    # MLA output gate x * sigmoid(g) fused into one kernel.
-    SGLANG_K3_FUSE_O_GATE = EnvBool(True)
-    # Multi-stream overlap of off-critical-path work with the attention core
-    # (capture mode only, deepseek_v4-style alt-stream pool): the MLA
-    # output-gate GEMM.
-    SGLANG_K3_MULTI_STREAM = EnvBool(True)
     # MNNVL fused all-reduce (bf16, TP8): zero-copy 1shot multicast-push for
     # small messages and in-place NVLS 2shot on symmetric-memory tensors for
     # large ones, with an optional fused residual add. Covers the KDA o_proj
