@@ -1232,7 +1232,7 @@ class KimiK3DeltaAttention(nn.Module):
         kernel pair, f_a in a splitK GEMM. One [H, head_dim + heads/tp (+pad)]
         GEMV replaces both. f_a leads so its output slice starts at offset 0,
         and the width is padded to a multiple of 8 so every fused-output row
-        stays 16-byte aligned for vectorized consumers (decode_gemv on f_b).
+        stays 16-byte aligned for vectorized consumers (tiny-GEMM on f_b).
 
         Called once from load_weights (after all weights are loaded, before
         cuda graph capture)."""
