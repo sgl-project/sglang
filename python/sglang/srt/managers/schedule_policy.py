@@ -89,6 +89,25 @@ IN_BATCH_PREFIX_CACHING_DEPRIORITIZE_THRESHOLD = int(
 IGNORE_EOS_RESERVE_TOKENS = 1
 
 
+def _prefix_match_token_ids(req: Req) -> List[int]:
+    """Token sequence used as the prefix-match key for ``req``.
+
+    Skips concatenation when ``output_ids`` is empty -- the common case for
+    fresh waiting-queue requests, where ``origin_input_ids + []`` would
+    otherwise allocate and copy the entire prompt list every scheduling cycle.
+    Retracted requests carry generated tokens and still take the concat path.
+
+    The returned list may alias ``req.origin_input_ids``, and downstream
+    ``RadixKey`` consumers can retain the alias inside tree nodes. Callers
+    must not mutate the returned list in-place; ``req.origin_input_ids`` is
+    only ever reassigned (e.g. truncation in ``managers/utils.py``) and never
+    mutated, so the alias is safe under existing call sites.
+    """
+    if req.output_ids:
+        return req.origin_input_ids + req.output_ids
+    return req.origin_input_ids
+
+
 def match_prefix_for_req(
     tree_cache: BasePrefixCache,
     req: Req,
@@ -98,7 +117,7 @@ def match_prefix_for_req(
     include_req: bool = False,
 ):
     if token_ids is None:
-        token_ids = req.origin_input_ids + req.output_ids
+        token_ids = _prefix_match_token_ids(req)
 
     # unified_kv SWA lives in a per-request ring that's not content-stable and is
     # never stored in the radix tree, so a reused prefix carries stale SWA. Cap
@@ -269,7 +288,7 @@ class SchedulePolicy:
         self.waiting_queue_radix_tree.reset()
 
         for r in waiting_queue:
-            prefix_ids = r.origin_input_ids + r.output_ids
+            prefix_ids = _prefix_match_token_ids(r)
             extra_key = r.extra_key
             match_result = match_prefix_for_req(
                 self.tree_cache, r, prefix_ids, include_req=True
