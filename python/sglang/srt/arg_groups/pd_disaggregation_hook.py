@@ -51,6 +51,14 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                     "--enable-disaggregation-token-handoff is incompatible with "
                     "speculative decoding"
                 )
+            if server_args.disaggregation_token_handoff_replay_mode not in (
+                "decode",
+                "extend",
+            ):
+                raise ValueError(
+                    "--disaggregation-token-handoff-replay-mode must be "
+                    "'decode' or 'extend'"
+                )
         if server_args.disaggregation_decode_enable_radix_cache:
             if server_args.enable_hisparse:
                 raise ValueError(
@@ -122,6 +130,14 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                 raise ValueError(
                     "--enable-disaggregation-token-handoff is incompatible with "
                     "speculative decoding"
+                )
+            if server_args.disaggregation_token_handoff_replay_mode not in (
+                "decode",
+                "extend",
+            ):
+                raise ValueError(
+                    "--disaggregation-token-handoff-replay-mode must be "
+                    "'decode' or 'extend'"
                 )
 
     if server_args.disaggregation_mode in ("prefill", "decode"):

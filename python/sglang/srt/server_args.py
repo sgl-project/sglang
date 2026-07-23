@@ -2474,6 +2474,10 @@ class ServerArgs:
         int,
         "Minimum number of bridge tokens Prefill emits before sealing an already-transferred request. Keep this at 1 unless a client-side playback buffer needs a larger floor.",
     ] = 1
+    disaggregation_token_handoff_replay_mode: A[
+        str,
+        "Replay engine for PD token handoff: 'decode' preserves bitwise greedy behavior with native Decode steps; 'extend' teacher-forces the bridge in one batch but may differ numerically from sequential Decode.",
+    ] = "decode"
 
     # -------------------------------------------------------------------------
     # Encode prefill disaggregation

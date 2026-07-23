@@ -1794,7 +1794,13 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         else:
             committed_output_id = output_id[0].item()
 
-        if token_handoff_log is not None and token_handoff_count > 1:
+        use_batched_replay = (
+            token_handoff_log is not None
+            and token_handoff_count > 1
+            and self.scheduler.server_args.disaggregation_token_handoff_replay_mode
+            == "extend"
+        )
+        if use_batched_replay:
             req = decode_req.req
             replay_plan = build_batched_replay_plan(token_handoff_log)
             # Teacher-force all bridge tokens except the final boundary token
@@ -1806,6 +1812,13 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 replay_plan.expected_next_token_id
             )
             req.token_handoff_replay_bridge_tokens = token_handoff_count
+            req.token_handoff_original_stream = req.stream
+            req.token_handoff_prefill_owned_tokens = token_handoff_prefill_owned
+            req.stream = False
+        elif token_handoff_log is not None and token_handoff_count > 1:
+            req = decode_req.req
+            req.output_ids.append(token_handoff_log[0])
+            req.token_handoff_replay_remaining = token_handoff_log[1:]
             req.token_handoff_original_stream = req.stream
             req.token_handoff_prefill_owned_tokens = token_handoff_prefill_owned
             req.stream = False
@@ -2225,6 +2238,39 @@ class SchedulerDisaggregationDecodeMixin:
 
         replay_batch_verified = False
         for req in batch.reqs:
+            remaining = getattr(req, "token_handoff_replay_remaining", None)
+            if remaining:
+                expected = remaining.pop(0)
+                actual = int(req.output_ids[-1])
+                if actual != expected:
+                    prepare_abort(
+                        req,
+                        "Token handoff replay mismatch: "
+                        f"expected {expected}, got {actual}",
+                        status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                    )
+                    release_kv_cache(req, self.tree_cache, is_insert=False)
+                    self.output_streamer.stream_output([req], req.return_logprob)
+                    continue
+
+                if not remaining:
+                    req.stream = req.token_handoff_original_stream
+                    owned_tokens = req.token_handoff_prefill_owned_tokens
+                    req.prime_incremental_detokenize_at_output_offset(owned_tokens)
+                    req.send_decode_id_offset = 0
+                    req.send_token_offset = owned_tokens
+                    logger.info(
+                        "Token handoff exact replay verified rid=%s "
+                        "bridge_tokens=%d prefill_owned_tokens=%d",
+                        req.rid,
+                        len(req.output_ids),
+                        owned_tokens,
+                    )
+                    del req.token_handoff_replay_remaining
+                    del req.token_handoff_original_stream
+                    del req.token_handoff_prefill_owned_tokens
+                continue
+
             expected = getattr(req, "token_handoff_replay_expected_token", None)
             if expected is None:
                 continue
