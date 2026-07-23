@@ -1843,8 +1843,6 @@ class MMEncoder:
                     f"nbytes={embedding.nbytes} shared_mr={mr_already_registered}"
                 )
 
-            mm_data.embedding = None
-
         # Send ack/data
         if url is not None:
             endpoint = NetworkAddress.parse(url).to_tcp()
@@ -2009,8 +2007,6 @@ class MMEncoder:
                 task.cancel()
         # Also clean up embedding data and forward state
         mm_data = self.embedding_to_send.pop(req_id, None)
-        if mm_data is not None:
-            mm_data.cached_embedding = None
         # Release the rkey after all /send calls have completed.
         forward_state = self._forward_results.pop(req_id, None)
         if forward_state is not None:
@@ -2022,6 +2018,11 @@ class MMEncoder:
                     logger.warning(
                         f"Shared-MR deregister failed for {req_id}: {dereg_err}"
                     )
+            forward_state.pop("embedding", None)
+        # Release the embedding only after the MR is deregistered.
+        if mm_data is not None:
+            mm_data.embedding = None
+            mm_data.cached_embedding = None
         self._forward_ready_events.pop(req_id, None)
 
     def _schedule_inflight_encode_cleanup(self, req_id: str):
