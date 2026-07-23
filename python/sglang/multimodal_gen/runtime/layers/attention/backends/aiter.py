@@ -203,5 +203,6 @@ class AITerImpl(AttentionImpl):
             causal=self.causal,
             return_attn_probs=False,
             return_lse=True,
+            how_v3_bf16_cvt=2,  # 2: RTZ (Round to Zero) rounding mode for BF16 conversion
         )
         return output
