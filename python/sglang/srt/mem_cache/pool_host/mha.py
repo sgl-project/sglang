@@ -6,26 +6,26 @@ import threading
 import psutil
 import torch
 
-from sglang.jit_kernel.hicache import (
+from sglang.kernels.ops.kvcache.hicache import (
     can_use_hicache_jit_kernel,
     can_use_write_back_jit_kernel,
 )
-from sglang.jit_kernel.hicache import (
+from sglang.kernels.ops.kvcache.hicache import (
     transfer_hicache_all_layer as jit_transfer_hicache_all_layer,
 )
-from sglang.jit_kernel.hicache import (
+from sglang.kernels.ops.kvcache.hicache import (
     transfer_hicache_all_layer_mla as jit_transfer_hicache_all_layer_mla,
 )
-from sglang.jit_kernel.hicache import (
+from sglang.kernels.ops.kvcache.hicache import (
     transfer_hicache_all_layer_mla_staged_lf_pf as jit_transfer_hicache_all_layer_mla_staged_lf_pf,
 )
-from sglang.jit_kernel.hicache import (
+from sglang.kernels.ops.kvcache.hicache import (
     transfer_hicache_all_layer_staged_lf_pf as jit_transfer_hicache_all_layer_staged_lf_pf,
 )
-from sglang.jit_kernel.hicache import (
+from sglang.kernels.ops.kvcache.hicache import (
     transfer_hicache_one_layer as jit_transfer_hicache_one_layer,
 )
-from sglang.jit_kernel.hicache import (
+from sglang.kernels.ops.kvcache.hicache import (
     transfer_hicache_one_layer_mla as jit_transfer_hicache_one_layer_mla,
 )
 from sglang.srt.mem_cache.memory_pool import MHATokenToKOnlyPool, MHATokenToKVPool

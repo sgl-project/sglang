@@ -34,7 +34,7 @@ def sglang_jit_qknorm(
     q_weight: torch.Tensor,
     k_weight: torch.Tensor,
 ) -> None:
-    from sglang.jit_kernel.norm import fused_inplace_qknorm
+    from sglang.kernels.ops.layernorm._jit_norm import fused_inplace_qknorm
 
     fused_inplace_qknorm(q, k, q_weight, k_weight)
 

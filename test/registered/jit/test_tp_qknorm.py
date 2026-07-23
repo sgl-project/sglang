@@ -14,14 +14,14 @@ import torch.distributed as dist
 import triton
 
 import sglang.srt.distributed.parallel_state as ps
-from sglang.jit_kernel.all_reduce import (
+from sglang.kernels.jit.tests.utils import multigpu_pytest_main
+from sglang.kernels.jit.utils import cache_once
+from sglang.kernels.ops.communication.all_reduce import (
     fused_parallel_qknorm,
     get_all_reduce_module,
     get_fused_parallel_qknorm_module,
 )
-from sglang.jit_kernel.mp import register_comm_cleanup
-from sglang.jit_kernel.tests.utils import multigpu_pytest_main
-from sglang.kernels.jit.utils import cache_once
+from sglang.kernels.ops.communication.mp import register_comm_cleanup
 from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
     CustomAllReduceV2,
 )
