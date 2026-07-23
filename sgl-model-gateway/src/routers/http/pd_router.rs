@@ -123,6 +123,42 @@ fn token_handoff_prefill_frame_is_terminal(frame: &[u8]) -> bool {
         .any(|reason| reason != "length")
 }
 
+fn token_handoff_prefill_frame_for_client(frame: bytes::Bytes) -> Option<bytes::Bytes> {
+    let Ok(frame_text) = std::str::from_utf8(&frame) else {
+        return Some(frame);
+    };
+    let Some(data) = frame_text
+        .lines()
+        .find_map(|line| line.strip_prefix("data: "))
+    else {
+        return Some(frame);
+    };
+    if data == "[DONE]" {
+        return None;
+    }
+
+    let Ok(mut event) = serde_json::from_str::<Value>(data) else {
+        return Some(frame);
+    };
+    let mut changed = false;
+    if let Some(choices) = event.get_mut("choices").and_then(Value::as_array_mut) {
+        for choice in choices {
+            if choice.get("finish_reason").and_then(Value::as_str) == Some("length") {
+                choice["finish_reason"] = Value::Null;
+                changed = true;
+            }
+        }
+    }
+    if !changed {
+        return Some(frame);
+    }
+
+    match serde_json::to_string(&event) {
+        Ok(event) => Some(bytes::Bytes::from(format!("data: {event}\n\n"))),
+        Err(_) => Some(frame),
+    }
+}
+
 impl PDRouter {
     fn inject_token_handoff_request_id(request: &mut Value) -> Result<String, String> {
         let object = request
@@ -1372,10 +1408,9 @@ impl PDRouter {
             };
 
             let mut prefill_stream = prefill_response.bytes_stream();
-            let done_marker = b"data: [DONE]";
             let mut pending = bytes::BytesMut::new();
-            let mut inspection_pending = bytes::BytesMut::new();
             let mut prefill_finished_request = false;
+            let mut reached_prefill_done = false;
             loop {
                 let chunk_result = tokio::select! {
                     chunk_result = prefill_stream.next() => chunk_result,
@@ -1411,21 +1446,16 @@ impl PDRouter {
                     }
                 };
 
-                inspection_pending.extend_from_slice(&chunk);
-                while let Some(frame_end) = memmem::find(&inspection_pending, b"\n\n") {
-                    let frame = inspection_pending.split_to(frame_end + 2);
+                pending.extend_from_slice(&chunk);
+                while let Some(frame_end) = memmem::find(&pending, b"\n\n") {
+                    let frame = pending.split_to(frame_end + 2).freeze();
                     prefill_finished_request |=
                         token_handoff_prefill_frame_is_terminal(&frame);
-                }
-
-                // Prefill is the first stream owner, but its [DONE] is only an
-                // ownership boundary. Keep any final data event and suppress
-                // that sentinel so Decode can continue the same client stream.
-                // Retain a marker-sized suffix because reqwest chunk boundaries
-                // are unrelated to SSE event boundaries.
-                pending.extend_from_slice(&chunk);
-                if let Some(done_pos) = memmem::find(&pending, done_marker) {
-                    if done_pos > 0 && tx.send(Ok(pending.split_to(done_pos).freeze())).is_err() {
+                    let Some(frame) = token_handoff_prefill_frame_for_client(frame) else {
+                        reached_prefill_done = true;
+                        break;
+                    };
+                    if tx.send(Ok(frame)).is_err() {
                         Self::abort_token_handoff_pair(
                             &client,
                             &prefill_url,
@@ -1436,21 +1466,9 @@ impl PDRouter {
                         decode_task.abort();
                         return;
                     }
-                    break;
                 }
-                let safe_len = pending
-                    .len()
-                    .saturating_sub(done_marker.len().saturating_sub(1));
-                if safe_len > 0 && tx.send(Ok(pending.split_to(safe_len).freeze())).is_err() {
-                    Self::abort_token_handoff_pair(
-                        &client,
-                        &prefill_url,
-                        &decode_url,
-                        &rid,
-                    )
-                    .await;
-                    decode_task.abort();
-                    return;
+                if reached_prefill_done {
+                    break;
                 }
             }
             prefill_for_task.record_outcome(true);
@@ -2106,6 +2124,34 @@ mod tests {
 "#
         ));
         assert!(!token_handoff_prefill_frame_is_terminal(b"data: [DONE]\n\n"));
+    }
+
+    #[test]
+    fn test_token_handoff_prefill_boundary_is_not_client_terminal() {
+        let boundary = bytes::Bytes::from_static(
+            br#"data: {"choices":[{"text":" bridge","finish_reason":"length"}]}
+
+"#,
+        );
+        let sanitized =
+            token_handoff_prefill_frame_for_client(boundary).expect("boundary data frame");
+        let event: Value = serde_json::from_slice(
+            sanitized
+                .strip_prefix(b"data: ")
+                .expect("SSE data prefix")
+                .strip_suffix(b"\n\n")
+                .expect("SSE frame suffix"),
+        )
+        .expect("valid JSON");
+
+        assert_eq!(event["choices"][0]["text"], " bridge");
+        assert!(event["choices"][0]["finish_reason"].is_null());
+        assert!(
+            token_handoff_prefill_frame_for_client(bytes::Bytes::from_static(
+                b"data: [DONE]\n\n"
+            ))
+            .is_none()
+        );
     }
 
     #[test]
