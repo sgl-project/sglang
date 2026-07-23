@@ -2074,6 +2074,9 @@ class SchedulerDisaggregationDecodeMixin:
             )
             self.running_batch = plan.running_batch
             batch = plan.batch_to_run
+            batch = self.ngram_embedding_manager.prepare_for_forward(
+                batch, chunked_req=self.chunked_req
+            )
             self.cur_batch_for_debug = batch
 
             # Launch the current batch
@@ -2108,14 +2111,15 @@ class SchedulerDisaggregationDecodeMixin:
                 continue
             self.process_decode_queue()
 
-            self._apply_war_barrier()
-
             # Get the next batch to run
             plan = self.get_next_disagg_decode_batch_to_run(
                 running_batch=self.running_batch
             )
             self.running_batch = plan.running_batch
             batch = plan.batch_to_run
+            batch = self.ngram_embedding_manager.prepare_for_forward(
+                batch, chunked_req=self.chunked_req
+            )
             self.cur_batch_for_debug = batch
             # overlap + spec + grammar is unsupported (would desync DP ranks).
             disable_overlap_for_batch = self.is_disable_overlap_for_batch(
@@ -2128,6 +2132,7 @@ class SchedulerDisaggregationDecodeMixin:
             # Launch the current batch
             if batch:
                 batch_result = self.run_batch(batch)
+                self._apply_war_barrier()
                 self.result_queue.append(
                     (
                         batch.copy(),

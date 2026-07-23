@@ -159,12 +159,10 @@ class ExpertBackupClient:
                         param = param.narrow(
                             0, param.shape[0] // 2, param.shape[0] // 2
                         )
-                    server_ptr_list.append(weight_info["weight_ptr"])
+                    server_ptr_list.append(weight_info.weight_ptr)
                     local_ptr_list.append(param.data_ptr())
-                    assert (
-                        param.numel() * param.element_size() == weight_info["byte_size"]
-                    )
-                    weight_size_list.append(weight_info["byte_size"])
+                    assert param.numel() * param.element_size() == weight_info.byte_size
+                    weight_size_list.append(weight_info.byte_size)
             before_transfer = time.time()
             ret = self.transfer_engine.engine.batch_transfer_sync_read(
                 self.session_id_list[i],
