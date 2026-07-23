@@ -2,7 +2,7 @@ import torch
 from torch import nn
 from torch.nn import Parameter
 
-from sglang.jit_kernel.ngram_embedding import compute_n_gram_ids
+from sglang.kernels.ops.speculative.ngram_embedding import compute_n_gram_ids
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -138,11 +138,20 @@ class NgramEmbedding(torch.nn.Module):
             or forward_batch.forward_mode.is_decode()
         ):
             ngram_embedding_info = forward_batch.ngram_embedding_info
+            # NGRAM_BS_GUARD: the ngram_info arrays can be shorter than
+            # forward_batch.batch_size in mixed/overlap batches; drive the req loop
+            # off the array length so the kernel never reads column_starts/req_lens
+            # out of bounds (cudaErrorIllegalAddress).
+            _ng_bs = min(
+                forward_batch.batch_size,
+                ngram_embedding_info.req_lens.shape[0],
+                ngram_embedding_info.column_starts.shape[0],
+            )
             torch.cumsum(
-                ngram_embedding_info.req_lens,
+                ngram_embedding_info.req_lens[:_ng_bs],
                 dim=0,
                 dtype=torch.int32,
-                out=self.exclusive_req_len_sums[1 : 1 + forward_batch.batch_size],
+                out=self.exclusive_req_len_sums[1 : 1 + _ng_bs],
             )
             compute_n_gram_ids(
                 ne_n=self.over_embedding_n,
@@ -151,12 +160,10 @@ class NgramEmbedding(torch.nn.Module):
                 ne_mods=self.oe_mods,
                 tokens=input_ids.to(torch.int32),
                 exclusive_ne_embedder_size_sums=self.exclusive_oe_embedder_size_sums,
-                exclusive_req_len_sums=self.exclusive_req_len_sums[
-                    : forward_batch.batch_size + 1
-                ],
+                exclusive_req_len_sums=self.exclusive_req_len_sums[: _ng_bs + 1],
                 ne_token_table=ngram_embedding_info.token_table,
-                row_indices=forward_batch.req_pool_indices,
-                column_starts=ngram_embedding_info.column_starts,
+                row_indices=forward_batch.req_pool_indices[:_ng_bs],
+                column_starts=ngram_embedding_info.column_starts[:_ng_bs],
                 n_gram_ids=self.oe_n_gram_ids[: len(input_ids)],
                 eos_token_id=self.eos_token_id,
             )

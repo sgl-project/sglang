@@ -2,6 +2,7 @@ import logging
 import re
 import threading
 import time
+from typing import Any, Callable
 
 import torch
 import zmq
@@ -29,17 +30,25 @@ def extract_layer_and_expert_id(param_name):
 
 
 class ExpertBackupClient:
-    def __init__(self, server_args: ServerArgs, model_runner):
+    def __init__(
+        self,
+        *,
+        server_args: ServerArgs,
+        model_config,
+        moe_ep_size: int,
+        moe_ep_rank: int,
+        get_model: Callable[[], Any],
+    ):
         context = zmq.Context(2)
         self.server_args = server_args
         self.engine_num = server_args.nnodes
         self.engine_rank = server_args.node_rank
         self.recv_list = [None] * self.engine_num
         self.ready_sockets = [None] * self.engine_num
-        self.model_runner = model_runner
-        self.moe_ep_size = model_runner.moe_ep_size
-        self.model_config = model_runner.model_config
-        self.moe_ep_rank = model_runner.moe_ep_rank
+        self._get_model = get_model
+        self.moe_ep_size = moe_ep_size
+        self.model_config = model_config
+        self.moe_ep_rank = moe_ep_rank
         self.dram_map_list = [None] * self.engine_num
         self.session_id_list = [None] * self.engine_num
         self.transfer_engine = None
@@ -87,7 +96,7 @@ class ExpertBackupClient:
 
         self.transfer_engine = get_mooncake_transfer_engine()
 
-        self.params_dict = dict(self.model_runner.model.named_parameters())
+        self.params_dict = dict(self._get_model().named_parameters())
         for name, param in self.params_dict.items():
             param_data = param.data
             ret_value = self.transfer_engine.engine.register_memory(
@@ -150,12 +159,10 @@ class ExpertBackupClient:
                         param = param.narrow(
                             0, param.shape[0] // 2, param.shape[0] // 2
                         )
-                    server_ptr_list.append(weight_info["weight_ptr"])
+                    server_ptr_list.append(weight_info.weight_ptr)
                     local_ptr_list.append(param.data_ptr())
-                    assert (
-                        param.numel() * param.element_size() == weight_info["byte_size"]
-                    )
-                    weight_size_list.append(weight_info["byte_size"])
+                    assert param.numel() * param.element_size() == weight_info.byte_size
+                    weight_size_list.append(weight_info.byte_size)
             before_transfer = time.time()
             ret = self.transfer_engine.engine.batch_transfer_sync_read(
                 self.session_id_list[i],
