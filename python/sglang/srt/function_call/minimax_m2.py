@@ -47,9 +47,9 @@ class MinimaxM2Detector(BaseFormatDetector):
         # Streaming state variables
         self._current_function_name: str = ""
         self._current_parameters: Dict[str, Any] = {}
-        self._streamed_parameters: Dict[str, str] = (
-            {}
-        )  # Track what parameter content we've streamed
+        self._streamed_parameters: Dict[
+            str, str
+        ] = {}  # Track what parameter content we've streamed
         self._in_tool_call: bool = False
         self._function_name_sent: bool = False
 
@@ -471,10 +471,12 @@ class MinimaxM2Detector(BaseFormatDetector):
                 break
             block = text[s : e + len(self.tool_call_end_token)]
             cursor = e + len(self.tool_call_end_token)
-            calls.extend(self._parse_block(block, tools))
+            calls.extend(self._parse_block(block, tools, index_offset=len(calls)))
         return "".join(normal_parts), calls
 
-    def _parse_block(self, block: str, tools: List[Tool]) -> List[ToolCallItem]:
+    def _parse_block(
+        self, block: str, tools: List[Tool], index_offset: int = 0
+    ) -> List[ToolCallItem]:
         res: List[ToolCallItem] = []
         for m in self.tool_call_function_regex.findall(block):
             txt = m[0] if m[0] else m[1]
@@ -494,9 +496,14 @@ class MinimaxM2Detector(BaseFormatDetector):
                 params[pname] = self._parse_parameter(fname, pname, pval, tools)
             raw = {"name": fname, "arguments": params}
             try:
-                # TODO: fix idx in function call, the index for a function
-                # call will always be -1 in parse_base_json
-                res.extend(self.parse_base_json(raw, tools))
+                for call in self.parse_base_json(raw, tools):
+                    res.append(
+                        ToolCallItem(
+                            tool_index=index_offset + len(res),
+                            name=call.name,
+                            parameters=call.parameters,
+                        )
+                    )
             except Exception:
                 logger.warning("invalid tool call for %s dropped", fname)
         return res
