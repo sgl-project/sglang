@@ -162,6 +162,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     buffer population, attention metadata init, and output slicing.
     """
 
+    # DSA forces use_mha=False inside BCG capture/replay (see
+    # DeepseekSparseAttnBackend.set_dsa_prefill_impl), so the captured graph
+    # runs the sparse path for any prefix and the MHA-prefix replay ban does
+    # not apply. Class-level default keeps partially-constructed instances
+    # (unit tests via __new__) on the conservative ban.
+    dsa_sparse_prefill_forced: bool = False
+
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
         # --- model flags ----------------------------------------------
@@ -241,10 +248,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             source=self.buffers,
         )
 
-        # DSA forces use_mha=False inside BCG capture/replay (see
-        # DeepseekSparseAttnBackend.set_dsa_prefill_impl), so the captured
-        # graph runs the sparse path for any prefix; the MHA-prefix replay
-        # ban below does not apply.
         from sglang.srt.configs.model_config import is_deepseek_dsa
 
         self.dsa_sparse_prefill_forced = is_deepseek_dsa(
