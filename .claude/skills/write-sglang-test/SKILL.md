@@ -16,7 +16,7 @@ This skill covers **how to write and register tests**. For CI pipeline internals
 5. **Prefer mock over real server** — when testing logic that doesn't need a server / engine launch (middleware, request routing, config validation, argument parsing), use `unittest.mock.patch` / `MagicMock` and place tests in `test/registered/unit/`. Only launch a real server when the test genuinely needs inference results or server lifecycle behavior.
 
 JIT kernel notes:
-- If the task is adding or updating code under `python/sglang/jit_kernel/`, prefer the `add-jit-kernel` skill first.
+- If the task is adding or updating code under `python/sglang/kernels/jit/`, prefer the `add-jit-kernel` skill first.
 - JIT kernel correctness tests use `test/registered/jit/**/test_*.py`.
 - JIT kernel benchmarks use `test/registered/jit/benchmark/**/bench_*.py`.
 - Those files are executed by `test/run_suite.py` through dedicated kernel suites (`base-b-kernel-*`); a `register_*_ci(...)` call placed under `python/sglang/` is rejected by the `check-no-registered-tests-in-package` pre-commit hook.
@@ -391,7 +391,7 @@ test/
 ├── manual/              # Non-CI: debugging, one-off, manual verification
 └── run_suite.py         # CI runner (scans registered/ plus jit_kernel test/benchmark files)
 
-python/sglang/jit_kernel/
+python/sglang/kernels/jit/
 ├── tests/               # JIT kernel correctness tests (CI-discovered by test/run_suite.py)
 └── benchmark/           # JIT kernel benchmarks (CI-discovered by test/run_suite.py)
 ```
@@ -443,7 +443,7 @@ Before submitting a test:
 - [ ] Inherits from `CustomTestCase` (not `unittest.TestCase`)
 - [ ] Has `register_*_ci(...)` call at module level
 - [ ] Placed in `test/registered/<category>/` (JIT kernel test/benchmark → `test/registered/jit/` or `test/registered/jit/benchmark/`)
-- [ ] JIT kernel work: test files live in `test/registered/jit/`; only test-only helpers stay under `python/sglang/jit_kernel/`
+- [ ] JIT kernel work: test files live in `test/registered/jit/`; only test-only helpers stay under `python/sglang/kernels/jit/`
 - [ ] Backend-independent tests: `register_cuda_ci` only + smallest model
 - [ ] Logic that doesn't need a server / engine launch → unit test in `registered/unit/` (see Unit Tests section)
 - [ ] `setUpClass` launches server, `tearDownClass` kills it (if server-based)
