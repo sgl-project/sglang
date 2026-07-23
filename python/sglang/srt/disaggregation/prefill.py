@@ -29,7 +29,6 @@ from typing import TYPE_CHECKING, List, Optional
 import numpy as np
 import torch
 
-from sglang.srt.distributed import get_pp_group
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.common.conn import CommonKVManager
@@ -184,7 +183,7 @@ class PrefillBootstrapQueue:
             else getattr(self.token_to_kv_pool, "end_layer", None)
         )
 
-        if self.draft_token_to_kv_pool is not None and transfer_draft_cache  and get_pp_group().is_last_rank:
+        if self.draft_token_to_kv_pool is not None and transfer_draft_cache:
             # We should also transfer draft model kv cache. The indices are
             # always shared with a target model.
             draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
