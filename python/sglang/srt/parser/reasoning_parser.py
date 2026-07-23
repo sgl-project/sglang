@@ -1398,6 +1398,7 @@ class ReasoningParser:
         "minimax": Qwen3Detector,
         "minimax-append-think": MiniMaxAppendThinkDetector,
         "minimax-m3": MiniMaxM3Detector,
+        "nanbeige": Qwen3Detector,
         "step3": DeepSeekR1Detector,
         "step3p5": DeepSeekR1Detector,
         "mistral": MistralDetector,

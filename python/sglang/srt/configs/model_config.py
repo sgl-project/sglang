@@ -982,6 +982,9 @@ class ModelConfig:
         if "IQuestLoopCoderForCausalLM" in self.hf_config.architectures:
             loop_num = getattr(self.hf_text_config, "loop_num", 1)
             self.num_attention_layers = int(self.num_hidden_layers * int(loop_num))
+        if "NanbeigeForCausalLM" in self.hf_config.architectures:
+            num_loops = getattr(self.hf_text_config, "num_loops", 1)
+            self.num_attention_layers = int(self.num_hidden_layers * int(num_loops))
         if "WhisperForConditionalGeneration" in self.hf_config.architectures:
             # Whisper has unique layer ID scheme:
             # - Encoder self-attention: 0 to encoder_layers-1 (no KV cache)
