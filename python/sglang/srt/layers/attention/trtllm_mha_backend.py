@@ -165,10 +165,12 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         self.speculative_num_draft_tokens = (
             model_runner.server_args.speculative_num_draft_tokens
         )
-        # Draft models may declare ENCODER_ONLY (bidirectional) attention;
-        # only draft workers run TARGET_VERIFY over such layers, so the
-        # expanded metadata (TRTLLMMHAMetadata.encoder_*) is draft-only.
-        self.expand_encoder_only_verify = bool(model_runner.is_draft_worker)
+        # True iff the model declares ENCODER_ONLY (bidirectional) layers, which
+        # need the expanded TARGET_VERIFY metadata (TRTLLMMHAMetadata.encoder_*).
+        self.expand_encoder_only_verify = any(
+            getattr(module, "attn_type", None) == AttentionType.ENCODER_ONLY
+            for module in model_runner.model.modules()
+        )
 
         # SWA hybrid models split the KV cache into full and SWA pools with
         # separate index spaces; SWA layers need a translated page_table.
@@ -579,9 +581,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
     def _needs_encoder_only_expand(
         self, forward_mode: ForwardMode, metadata: TRTLLMMHAMetadata
     ) -> bool:
-        # Single gate for preparing the expanded ENCODER_ONLY verify metadata
-        # (TRTLLMMHAMetadata.encoder_*); the per-layer forward path consumes it
-        # only for layers whose attn_type is ENCODER_ONLY.
+        # The single gate for building the expanded ENCODER_ONLY verify
+        # metadata; forward() consumes it per-layer where attn_type is ENCODER_ONLY.
         return (
             self.expand_encoder_only_verify
             and forward_mode.is_target_verify()
