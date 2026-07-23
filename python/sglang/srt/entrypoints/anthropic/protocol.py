@@ -108,6 +108,35 @@ class RedactedThinkingBlock(BaseModel):
     data: Optional[str] = None
 
 
+class DocumentBlockSource(BaseModel):
+    """Source for a document block (base64, text, or URL)."""
+
+    type: Literal["base64", "text", "url"]
+    # base64 / text source fields
+    media_type: Optional[str] = None
+    data: Optional[str] = None
+    # text source field
+    text: Optional[str] = None
+    # url source field
+    url: Optional[str] = None
+
+
+class DocumentBlock(BaseModel):
+    """Anthropic document content block (PDF / plain-text document).
+
+    The Anthropic API added ``"type": "document"`` in mid-2024 to support
+    native PDF ingestion. Local models cannot truly parse binary PDF content,
+    so the serving layer converts this block into a best-effort text
+    representation passed as a ``text`` content part.
+    """
+
+    type: Literal["document"] = "document"
+    source: Optional[Union[DocumentBlockSource, dict[str, Any]]] = None
+    title: Optional[str] = None
+    context: Optional[str] = None
+    citations: Optional[dict[str, Any]] = None
+
+
 AnthropicContentBlock = Annotated[
     Union[
         TextBlock,
@@ -118,6 +147,7 @@ AnthropicContentBlock = Annotated[
         SearchResultBlock,
         ThinkingBlock,
         RedactedThinkingBlock,
+        DocumentBlock,
     ],
     Field(discriminator="type"),
 ]
