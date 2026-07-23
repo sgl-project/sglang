@@ -534,19 +534,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             self._process_weights_for_sm90_cutlass(layer)
             return
         if self.use_flashinfer:
-            # TODO: these values are hardcoded for now, we need to get them from the model
-            layer.gemm1_alpha = Parameter(
-                torch.tensor([1.702] * self.num_experts, dtype=torch.float32).cuda(),
-                requires_grad=False,
-            )
-            layer.gemm1_beta = Parameter(
-                torch.tensor([1.0] * self.num_experts, dtype=torch.float32).cuda(),
-                requires_grad=False,
-            )
-            layer.gemm1_clamp_limit = Parameter(
-                torch.tensor([7.0] * self.num_experts, dtype=torch.float32).cuda(),
-                requires_grad=False,
-            )
             sf_block_size = 32  # mxfp4 block size
 
             assert (
@@ -966,20 +953,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         w2_bias_padded = torch.zeros(E, K_pad, dtype=bias_dtype, device=device)
         w2_bias_padded[:, :K_un] = layer.w2_weight_bias.data
 
-        # ---- Per-expert SwiGLU scalars (GPT-OSS defaults) ------------------
-        layer.swiglu_alpha = Parameter(
-            torch.full((E,), 1.702, dtype=torch.float32, device=device),
-            requires_grad=False,
-        )
-        layer.swiglu_beta = Parameter(
-            torch.full((E,), 1.0, dtype=torch.float32, device=device),
-            requires_grad=False,
-        )
-        layer.swiglu_limit = Parameter(
-            torch.full((E,), 7.0, dtype=torch.float32, device=device),
-            requires_grad=False,
-        )
-
         # ---- FlashInfer SM90 byte / scale interleave -----------------------
         # The padded buffers above are contiguous by construction (allocated
         # via torch.zeros + slice assignment), so we feed them straight in.
@@ -1008,10 +981,65 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         torch.cuda.empty_cache()
 
+    def _init_flashinfer_swiglu_scalars(self, layer, moe_runner_config):
+        """Build per-expert SwiGLU scalar tensors for the FlashInfer trtllm-gen
+        and SM90 cutlass MXFP4 kernels from ``moe_runner_config``.
+
+        GPT-OSS (and any future MXFP4 model on these paths) plumbs the activation
+        scalars end-to-end: HF config (``hidden_act_alpha`` / ``swiglu_limit``) ->
+        models/gpt_oss.py -> FusedMoE -> MoeRunnerConfig (``gemm1_alpha`` /
+        ``gemm1_clamp_limit``). The limit always comes from ``gemm1_clamp_limit``
+        (``moe_runner_config.swiglu_limit`` is the DSv4 sibling field and is None
+        for GPT-OSS). ``beta`` has no config field -- it is a fixed 1.0 for this
+        SwiGLU kernel family. Fail loud if the model did not plumb the scalars,
+        instead of silently corrupting activations with GPT-OSS defaults.
+
+        Returns a (alpha, beta, limit) tuple of fp32 per-expert Parameters.
+        """
+        alpha = moe_runner_config.gemm1_alpha
+        limit = moe_runner_config.gemm1_clamp_limit
+        if alpha is None or limit is None:
+            raise ValueError(
+                "MXFP4 FlashInfer MoE requires SwiGLU activation scalars to be "
+                "plumbed via moe_runner_config, but got "
+                f"gemm1_alpha={alpha}, gemm1_clamp_limit={limit} "
+                f"(layer_id={moe_runner_config.layer_id}). The model definition "
+                "must set hidden_act_alpha and swiglu_limit (see "
+                "GptOssSparseMoeBlock in srt/models/gpt_oss.py)."
+            )
+        num_experts = self.num_experts
+        device = layer.w13_weight.device
+
+        def _per_expert(value):
+            return Parameter(
+                torch.full(
+                    (num_experts,), float(value), dtype=torch.float32, device=device
+                ),
+                requires_grad=False,
+            )
+
+        return _per_expert(alpha), _per_expert(1.0), _per_expert(limit)
+
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
+        # Per-expert SwiGLU scalars now come from the config (was hardcoded to
+        # GPT-OSS defaults). Built here because moe_runner_config is only passed
+        # to create_moe_runner, not to process_weights_after_loading (their old
+        # home). Mirror the path guards used there.
+        if self._fi_kernel == "cutlass_sm90":
+            (
+                layer.swiglu_alpha,
+                layer.swiglu_beta,
+                layer.swiglu_limit,
+            ) = self._init_flashinfer_swiglu_scalars(layer, moe_runner_config)
+        elif self.use_flashinfer:
+            (
+                layer.gemm1_alpha,
+                layer.gemm1_beta,
+                layer.gemm1_clamp_limit,
+            ) = self._init_flashinfer_swiglu_scalars(layer, moe_runner_config)
         moe_runner_backend = get_moe_runner_backend()
         if moe_runner_backend.is_auto():
             # Must match apply() priority: _use_aiter before use_triton_kernels.
