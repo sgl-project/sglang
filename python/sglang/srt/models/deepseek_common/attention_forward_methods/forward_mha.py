@@ -21,6 +21,7 @@ from sglang.srt.model_executor.forward_context import (
     get_token_to_kv_pool,
 )
 from sglang.srt.models.deepseek_common.utils import (
+    _is_block_scale_fp8,
     _is_cuda,
     _is_hip,
     _is_musa,
@@ -218,13 +219,7 @@ class DeepseekMHAForwardMixin:
                     None,
                 )
                 q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
-            elif (
-                _use_aiter_gfx95
-                and self.q_b_proj.weight.dtype == torch.float8_e4m3fn
-                and hasattr(self.q_b_proj, "weight_scale")
-                and self.q_b_proj.weight_scale.dim() == 2
-                and self.q_b_proj.weight_scale.shape[-1] > 1
-            ):
+            elif _use_aiter_gfx95 and _is_block_scale_fp8(self.q_b_proj):
                 q, _, _, _ = fused_rms_fp8_group_quant(
                     q,
                     self.q_a_layernorm.weight,
@@ -253,13 +248,7 @@ class DeepseekMHAForwardMixin:
         kv_a, _ = latent_cache.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         latent_cache = latent_cache.unsqueeze(1)
 
-        if (
-            _use_aiter_gfx95
-            and self.kv_b_proj.weight.dtype == torch.float8_e4m3fn
-            and hasattr(self.kv_b_proj, "weight_scale")
-            and self.kv_b_proj.weight_scale.dim() == 2
-            and self.kv_b_proj.weight_scale.shape[-1] > 1
-        ):
+        if _use_aiter_gfx95 and _is_block_scale_fp8(self.kv_b_proj):
             kv_a_quanted, kv_a, _, _ = fused_rms_fp8_group_quant(
                 kv_a,
                 self.kv_a_layernorm.weight,
@@ -349,13 +338,7 @@ class DeepseekMHAForwardMixin:
                 )
             )[0]
         else:
-            if (
-                _use_aiter_gfx95
-                and self.kv_b_proj.weight.dtype == torch.float8_e4m3fn
-                and hasattr(self.kv_b_proj, "weight_scale")
-                and self.kv_b_proj.weight_scale.dim() == 2
-                and self.kv_b_proj.weight_scale.shape[-1] > 1
-            ):
+            if _use_aiter_gfx95 and _is_block_scale_fp8(self.kv_b_proj):
                 kv = self.kv_b_proj(kv_a_quanted)[0]
             else:
                 kv = self.kv_b_proj(kv_a)[0]

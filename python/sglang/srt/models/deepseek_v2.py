@@ -169,6 +169,7 @@ from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
 from sglang.srt.models.deepseek_common.utils import (
     _device_sm,
     _get_llama_4_scaling,
+    _is_block_scale_fp8,
     _is_cpu,
     _is_cpu_amx_available,
     _is_cuda,
@@ -2177,15 +2178,15 @@ class DeepseekV2DecoderLayer(nn.Module):
         if weight.dtype == torch.uint8:
             return "mxfp4"
         if weight.dtype == getattr(torch, "float8_e4m3fn", None):
-            # Only use the fused fp8 block-scale path when weight_scale is a
-            # block scale (2D, K/128 cols). Per-channel scale [N, 1] is
-            # incompatible with the 1x128 group-scale activation tuple.
+            # Use _is_block_scale_fp8 to distinguish block-scale fp8 (K/128 scale
+            # cols, compatible with fused_rms_fp8_group_quant) from per-channel fp8
+            # ([N, 1] scale, must use the plain bf16 path).
+            # weight_scale may not be reshaped yet at __init__ time — return
+            # "fp8_pending" so _resolve_gfx95_quant_format re-checks on first forward.
             weight_scale = getattr(proj, "weight_scale", None)
-            if weight_scale is not None and weight_scale.dim() == 2:
-                return "fp8" if weight_scale.shape[-1] > 1 else ""
-            # weight_scale not yet reshaped (called before process_weights_after_loading)
-            # — will be resolved on first forward call via _resolve_gfx95_quant_format.
-            return "fp8_pending"
+            if weight_scale is None:
+                return "fp8_pending"
+            return "fp8" if _is_block_scale_fp8(proj) else ""
         return ""
 
     def _resolve_gfx95_quant_format(self) -> str:
@@ -2194,7 +2195,8 @@ class DeepseekV2DecoderLayer(nn.Module):
         if fmt == "fp8_pending":
             fmt = self._detect_gfx95_quant_format()
             if fmt == "fp8_pending":
-                fmt = "fp8"  # fallback if weight_scale still unavailable
+                # weight_scale still unavailable — default to bf16 (safe fallback).
+                fmt = ""
             self._gfx95_quant_format = fmt
         return fmt
 

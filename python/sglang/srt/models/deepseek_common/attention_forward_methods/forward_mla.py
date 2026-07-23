@@ -55,6 +55,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 )
 from sglang.srt.models.deepseek_common.utils import (
     FORWARD_ABSORB_CORE_ATTENTION_BACKENDS,
+    _is_block_scale_fp8,
     _is_cpu,
     _is_cublas_ge_129,
     _is_cuda,
@@ -286,19 +287,7 @@ class DeepseekMLAForwardMixin:
                     )
                 else:
                     q_lora = None
-                    # Only use fused fp8 group-quant when q_b_proj uses block-scale
-                    # fp8 (weight_scale has K/128 columns). Per-channel fp8 has
-                    # weight_scale [N, 1] and is incompatible with the group-scale
-                    # activation tuple — fall through to the bf16 path instead.
-                    _q_b_is_block_fp8 = (
-                        _use_aiter_gfx95
-                        and self.q_b_proj.weight.dtype == torch.float8_e4m3fn
-                        and hasattr(self.q_b_proj, "weight_scale")
-                        and getattr(self.q_b_proj.weight_scale, "shape", None) is not None
-                        and self.q_b_proj.weight_scale.dim() == 2
-                        and self.q_b_proj.weight_scale.shape[-1] > 1
-                    )
-                    if _q_b_is_block_fp8:
+                    if _use_aiter_gfx95 and _is_block_scale_fp8(self.q_b_proj):
                         if self.use_dsa:
                             q_quanted, q_lora, k_nope, _ = fused_rms_fp8_group_quant(
                                 q,
@@ -874,12 +863,7 @@ class DeepseekMLAForwardMixin:
                 # _bmm_buf is already (batch, heads, dim) contiguous
                 if self.o_proj.weight.dtype == torch.uint8:
                     attn_bmm_output = fused_flatten_mxfp4_quant(_bmm_buf)
-                elif (
-                    self.o_proj.weight.dtype == torch.float8_e4m3fn
-                    and hasattr(self.o_proj, "weight_scale")
-                    and self.o_proj.weight_scale.dim() == 2
-                    and self.o_proj.weight_scale.shape[-1] > 1
-                ):
+                elif _is_block_scale_fp8(self.o_proj):
                     attn_bmm_output = fused_flatten_fp8_group_quant(
                         _bmm_buf,
                         group_size=128,
@@ -891,12 +875,7 @@ class DeepseekMLAForwardMixin:
             elif self.o_proj.weight.dtype == torch.uint8:
                 attn_bmm_output = attn_bmm_output.transpose(0, 1)
                 attn_bmm_output = fused_flatten_mxfp4_quant(attn_bmm_output)
-            elif (
-                self.o_proj.weight.dtype == torch.float8_e4m3fn
-                and hasattr(self.o_proj, "weight_scale")
-                and self.o_proj.weight_scale.dim() == 2
-                and self.o_proj.weight_scale.shape[-1] > 1
-            ):
+            elif _is_block_scale_fp8(self.o_proj):
                 attn_bmm_output = attn_bmm_output.transpose(0, 1)
                 attn_bmm_output = fused_flatten_fp8_group_quant(
                     attn_bmm_output,
