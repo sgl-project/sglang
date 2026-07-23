@@ -1868,7 +1868,8 @@ class Scheduler(
         """Return this DP rank's decode requests across all PP slots."""
         if self.ps.pp_size == 1:
             return len(self.running_batch.reqs)
-        return self._pp_get_num_running_reqs()
+        else:
+            return self._pp_get_num_running_reqs()
 
     def init_output_streamer(self) -> None:
         self.output_streamer = SchedulerOutputStreamer(
