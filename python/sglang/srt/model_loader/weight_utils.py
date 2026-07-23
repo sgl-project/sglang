@@ -829,16 +829,17 @@ class CheckpointFilePrefetchHandle:
     def __init__(
         self,
         *,
-        done_event: threading.Event,
+        thread: threading.Thread,
         cancel_event: threading.Event,
         errors: List[Tuple[str, Exception]],
     ) -> None:
-        self._done_event = done_event
+        self._thread = thread
         self._cancel_event = cancel_event
         self._errors = errors
 
     def wait(self, timeout: Optional[float] = None) -> None:
-        if not self._done_event.wait(timeout):
+        self._thread.join(timeout)
+        if self._thread.is_alive():
             raise TimeoutError("Timed out waiting for checkpoint prefetching")
 
     def cancel(self) -> None:
@@ -896,14 +897,8 @@ def _prefetch_all_checkpoints(
 
     my_files = sorted_files[local_rank::local_world_size]
     total_for_rank = len(my_files)
-    done_event = threading.Event()
     cancel_event = threading.Event()
     errors: List[Tuple[str, Exception]] = []
-    handle = CheckpointFilePrefetchHandle(
-        done_event=done_event,
-        cancel_event=cancel_event,
-        errors=errors,
-    )
 
     logger.info(
         "Rank %d: prefetching %d/%d checkpoint shards into page cache "
@@ -975,19 +970,21 @@ def _prefetch_all_checkpoints(
 
     def _run_prefetch() -> None:
         start = time.perf_counter()
-        try:
-            _prefetch_all()
-        finally:
-            elapsed = time.perf_counter() - start
-            logger.info(
-                "Rank %d: prefetching checkpoint files into page cache "
-                "finished in %.2fs",
-                local_rank,
-                elapsed,
-            )
-            done_event.set()
+        _prefetch_all()
+        elapsed = time.perf_counter() - start
+        logger.info(
+            "Rank %d: prefetching checkpoint files into page cache finished in %.2fs",
+            local_rank,
+            elapsed,
+        )
 
-    threading.Thread(target=_run_prefetch, daemon=True).start()
+    thread = threading.Thread(target=_run_prefetch, daemon=True)
+    handle = CheckpointFilePrefetchHandle(
+        thread=thread,
+        cancel_event=cancel_event,
+        errors=errors,
+    )
+    thread.start()
     return handle
 
 

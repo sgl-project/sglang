@@ -37,6 +37,12 @@ class _InlineThread:
     def start(self):
         self.target()
 
+    def join(self, timeout=None):
+        pass
+
+    def is_alive(self):
+        return False
+
 
 class _InlineExecutor:
     def __init__(self, max_workers):
@@ -98,6 +104,26 @@ class TestPrefetchCheckpoints(CustomTestCase):
     def test_prefetch_rejects_invalid_thread_count(self):
         with self.assertRaisesRegex(ValueError, "num_threads"):
             _prefetch_all_checkpoints(["dummy.safetensors"], num_threads=0)
+
+    @patch("torch.distributed.is_initialized", return_value=False)
+    def test_wait_returns_after_worker_thread_failure(self, _):
+        worker_errors = []
+
+        with (
+            patch(
+                "concurrent.futures.ThreadPoolExecutor",
+                side_effect=RuntimeError("worker failed"),
+            ),
+            patch(
+                "threading.excepthook",
+                side_effect=lambda args: worker_errors.append(args.exc_value),
+            ),
+        ):
+            handle = _prefetch_all_checkpoints(["dummy.safetensors"], num_threads=1)
+            handle.wait(timeout=5)
+
+        self.assertEqual(len(worker_errors), 1)
+        self.assertIsInstance(worker_errors[0], RuntimeError)
 
     @patch("torch.distributed.is_initialized", return_value=False)
     def test_prefetch_keeps_bounded_pending_window(self, _):
@@ -221,6 +247,8 @@ class TestPrefetchCheckpoints(CustomTestCase):
         ):
             handle = _prefetch_all_checkpoints(paths, num_threads=1)
             self.assertTrue(started.wait(timeout=5))
+            with self.assertRaisesRegex(TimeoutError, "checkpoint prefetching"):
+                handle.wait(timeout=0)
             handle.cancel()
             release.set()
             handle.wait(timeout=5)
