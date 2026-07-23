@@ -43,6 +43,19 @@ async def test_in_place_pause_refuses_active_request_without_pausing():
 
 
 @pytest.mark.asyncio
+async def test_in_place_refusal_preserves_existing_pause():
+    tm = _bare_tokenizer_manager()
+    tm.is_pause = True
+    await tm.model_update_lock.acquire_reader()
+
+    with pytest.raises(RuntimeError, match="requests are active"):
+        await tm.pause_generation(PauseGenerationReqInput(mode="in_place"))
+
+    assert tm.is_pause is True
+    await tm.model_update_lock.release_reader()
+
+
+@pytest.mark.asyncio
 async def test_request_admission_cannot_be_liminal_during_pause():
     tm = _bare_tokenizer_manager()
     original_acquire_reader = tm.model_update_lock.acquire_reader
@@ -60,17 +73,50 @@ async def test_request_admission_cannot_be_liminal_during_pause():
     pause_task = asyncio.create_task(
         tm.pause_generation(PauseGenerationReqInput(mode="in_place"))
     )
-    await asyncio.sleep(0)
-    assert not pause_task.done(), "pause crossed a request still being admitted"
+    await asyncio.wait_for(pause_task, timeout=0.1)
+    tm._async_dispatch_to_scheduler.assert_awaited_once()
 
     admission_release.set()
-    reader_lock = await admission_task
+    await asyncio.sleep(0)
+    assert not admission_task.done(), "request crossed the closed pause gate"
 
-    with pytest.raises(RuntimeError, match="requests are active"):
-        await pause_task
-    assert tm.is_pause is False
-    tm._async_dispatch_to_scheduler.assert_not_awaited()
+    async with tm.is_pause_cond:
+        tm.is_pause = False
+        tm.is_pause_cond.notify_all()
+    reader_lock = await admission_task
     await reader_lock.__aexit__(None, None, None)
+
+
+@pytest.mark.asyncio
+async def test_waiting_writer_does_not_block_abort_from_closing_gate():
+    tm = _bare_tokenizer_manager()
+    abort_called = asyncio.Event()
+    tm.abort_request = Mock(side_effect=lambda **_: abort_called.set())
+    await tm.model_update_lock.acquire_reader()
+
+    writer_release = asyncio.Event()
+
+    async def hold_writer():
+        async with tm.model_update_lock.writer_lock:
+            await writer_release.wait()
+
+    writer_task = asyncio.create_task(hold_writer())
+    while tm.model_update_lock._waiting_writers == 0:
+        await asyncio.sleep(0)
+
+    admission_task = asyncio.create_task(tm._acquire_generation_reader())
+    pause_task = asyncio.create_task(
+        tm.pause_generation(PauseGenerationReqInput(mode="abort"))
+    )
+    await asyncio.wait_for(abort_called.wait(), timeout=0.1)
+    tm.abort_request.assert_called_with(abort_all=True)
+
+    pause_task.cancel()
+    admission_task.cancel()
+    await asyncio.gather(pause_task, admission_task, return_exceptions=True)
+    await tm.model_update_lock.release_reader()
+    writer_release.set()
+    await writer_task
 
 
 @pytest.mark.asyncio

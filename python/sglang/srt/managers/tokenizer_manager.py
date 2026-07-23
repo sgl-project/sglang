@@ -687,11 +687,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
     async def _acquire_generation_reader(self):
         """Atomically pass the pause gate and join the admitted request set."""
-        reader_lock = self.model_update_lock.reader_lock
-        async with self.is_pause_cond:
-            await self.is_pause_cond.wait_for(lambda: not self.is_pause)
+        while True:
+            async with self.is_pause_cond:
+                await self.is_pause_cond.wait_for(lambda: not self.is_pause)
+
+            reader_lock = self.model_update_lock.reader_lock
             await reader_lock.__aenter__()
-        return reader_lock
+            async with self.is_pause_cond:
+                if not self.is_pause:
+                    return reader_lock
+            await reader_lock.__aexit__(None, None, None)
 
     def _detect_input_format(
         self, texts: Union[str, List[str]], is_cross_encoder: bool
@@ -1742,9 +1747,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
     async def pause_generation(self, obj: PauseGenerationReqInput):
         async with self.is_pause_cond:
+            was_paused = self.is_pause
             self.is_pause = True
             if obj.mode == "in_place" and await self.model_update_lock.is_locked():
-                self.is_pause = False
+                self.is_pause = was_paused
                 self.is_pause_cond.notify_all()
                 raise RuntimeError(
                     "Cannot pause generation in place while requests are active."
@@ -1754,7 +1760,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     await self._async_dispatch_to_scheduler(obj)
                 except Exception:
                     if obj.mode == "in_place":
-                        self.is_pause = False
+                        self.is_pause = was_paused
                         self.is_pause_cond.notify_all()
                     raise
             else:
