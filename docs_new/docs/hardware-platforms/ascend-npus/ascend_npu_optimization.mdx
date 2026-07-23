@@ -745,7 +745,11 @@ Separates the prefill (P) and decode (D) phases onto different device groups, al
 
 ### Quantization (`--quantization`)
 
-Reduces model weight and activation precision (e.g., W8A8, W4A8, W4A16) to decrease memory usage and increase throughput. On Ascend, the natively supported and highly optimized quantization method is ModelSlim (supporting W4A4, W8A8, W4A8 dynamic/static). Support for other community formats (such as AWQ, GPTQ, Auto-round, and Compressed-tensors) depends on the availability of specific Ascend custom kernels in your environment; see quantization for details and compatibility matrices.
+Reduces model weight and activation precision (e.g., W8A8, W4A8, W4A16) to decrease memory usage and increase throughput.
+On Ascend, the natively supported and highly optimized quantization method is ModelSlim (supporting W4A4, W8A8, W4A8 dynamic/static).
+Support for other community formats (such as AWQ, GPTQ, Auto-round, and Compressed-tensors) depends on the availability
+of specific Ascend custom kernels in your environment;
+see [Quantization on Ascend](/docs/hardware-platforms/ascend-npus/ascend_npu_quantization) for details and compatibility matrices.
 
 ### Chunked Prefill (`--chunked-prefill-size`)
 
