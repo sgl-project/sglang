@@ -30,19 +30,13 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# FlashInfer-version-coupled: re-sync with FLASHINFER_AUTOTUNE_OP_CHOICES in
-# server_args.py when upgrading FlashInfer.
-FLASHINFER_MANDATORY_AUTOTUNE_SKIPS = frozenset({"mxfp8_gemm"})
+# TODO: Remove after FlashInfer fixes the mxfp8_gemm autotuning IMA.
+FLASHINFER_AUTOTUNE_WORKAROUND_SKIPS = frozenset({"mxfp8_gemm"})
 
 
 def get_flashinfer_autotune_skip_ops(model_runner: ModelRunner) -> set[str]:
-    """Return user-requested and SGLang-required FlashInfer autotune skips."""
     skip_ops = set(model_runner.server_args.flashinfer_autotune_skip_ops or ())
-
-    # Autotuning mxfp8_gemm hits an illegal memory access. It is fixed-config
-    # and needs no tuning, so always keep it on FlashInfer's heuristic path.
-    skip_ops.update(FLASHINFER_MANDATORY_AUTOTUNE_SKIPS)
-
+    skip_ops.update(FLASHINFER_AUTOTUNE_WORKAROUND_SKIPS)
     return skip_ops
 
 
@@ -139,10 +133,7 @@ def flashinfer_autotune_cache_path(model_runner: ModelRunner) -> Path:
         str(mr.ps.moe_ep_size),
         str(mr.model_config.hf_config.__class__.__name__),
     ]
-    # Partition by the full effective set so a pre-existing cached tactic can
-    # never defeat either a mandatory or user-selected skip after this tuning
-    # context exits. Introducing a mandatory skip intentionally refreshes old
-    # cache keys once; subsequent runs reuse the new partition.
+    # A different skip policy must not reuse previously tuned tactics.
     skip_ops = get_flashinfer_autotune_skip_ops(mr)
     model_key_parts.append("skip_ops=" + ",".join(sorted(skip_ops)))
     if mr.is_draft_worker:

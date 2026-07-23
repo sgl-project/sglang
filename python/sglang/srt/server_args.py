@@ -101,40 +101,6 @@ logger = logging.getLogger(__name__)
 # Define constants
 DEFAULT_UVICORN_ACCESS_LOG_EXCLUDE_PREFIXES = ()
 
-# Exact ``custom_op`` identifiers passed to AutoTuner.choose_one() by the
-# FlashInfer version pinned by SGLang. Keep this synchronized when upgrading
-# FlashInfer. Dynamic identifiers are expanded to every value their local
-# enums/backend registry can produce so the CLI remains explicit and helpful.
-# This is a FlashInfer-wide inventory; a given SGLang configuration reaches
-# only the subset used by its selected model, quantization, and backends.
-# The other FlashInfer-version-coupled constant, FLASHINFER_MANDATORY_AUTOTUNE_SKIPS,
-# lives in flashinfer_autotune.py; update both together on upgrade.
-FLASHINFER_AUTOTUNE_OP_CHOICES = [
-    "CuteDslFusedMoE::run_moe_nvfp4",
-    "CuteDslMoEWrapper::run",
-    "bf16_fp4_cute_dsl_gemm",
-    "bf16_fp4_gemm",
-    "bf16_gemm",
-    "bf16_tgv_gemm",
-    "flashinfer::trtllm_bf16_moe",
-    "flashinfer::trtllm_fp4_block_scale_moe",
-    "flashinfer::trtllm_fp8_block_scale_moe",
-    "flashinfer::trtllm_fp8_per_tensor_scale_moe",
-    "flashinfer::trtllm_mxint4_block_scale_moe",
-    "fp16_tgv_gemm",
-    "fp4_gemm",
-    "fp8_gemm",
-    "moe_cute_dsl_nvfp4",
-    "moe_trtllm_fp4_routed",
-    "mxfp8_gemm",
-    "sparse_mla_sm120_decode_dsv3_2",
-    "sparse_mla_sm120_decode_dsv4",
-    "trtllm::fused_moe::gemm1",
-    "trtllm::fused_moe::gemm2",
-    "trtllm_batch_decode_mla",
-    "trtllm_low_latency_gemm",
-]
-
 SAMPLING_BACKEND_CHOICES = {"flashinfer", "pytorch", "ascend"}
 if envs.SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.get():
     SAMPLING_BACKEND_CHOICES.add("token_oracle")
@@ -1743,17 +1709,11 @@ class ServerArgs:
         Optional[List[str]],
         Arg(
             help=(
-                "FlashInfer custom-op names to exclude from autotuning. Skipped "
-                "ops use FlashInfer's heuristic fallback. For example: "
-                "--flashinfer-autotune-skip-ops fp4_gemm. The "
-                "accepted identifiers are shown as choices in --help; only "
-                "ops reached by the selected SGLang backends have an effect. "
-                "mxfp8_gemm is always skipped for safety. Skip configuration "
-                "changes use a separate autotune cache, causing a one-time "
-                "cache refresh for all models when this policy is introduced."
+                "FlashInfer custom-op identifiers to skip during autotuning. "
+                "Skipped ops use FlashInfer's heuristic fallback. SGLang "
+                "temporarily skips mxfp8_gemm by default due to an IMA."
             ),
             nargs="+",
-            choices=FLASHINFER_AUTOTUNE_OP_CHOICES,
         ),
         NS("exec.kernel"),
     ] = None
