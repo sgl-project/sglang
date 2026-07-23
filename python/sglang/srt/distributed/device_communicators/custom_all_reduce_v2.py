@@ -155,10 +155,22 @@ class CustomAllReduceV2:
         return self._all_reduce(input)
 
     def close(self):
-        if not self.disabled and hasattr(self, "obj"):
-            self.obj.free(self.group)
-        if hasattr(self, "_vmm_graph_input_manager"):
-            self._vmm_graph_input_manager.close()
+        # `obj.free()` closes the peers' IPC handles, barriers on `self.group`
+        # so that no peer is still mapping the storage, and only then frees it.
+        # That barrier makes close() order-sensitive: it has to run while the
+        # group is still alive (the owner calls it before destroying the group)
+        # and it has to run exactly once. So drop `obj` up front -- otherwise a
+        # later `__del__` re-enters free() on a group that is gone by then, the
+        # barrier raises inside a destructor where the exception is swallowed,
+        # and the storage is never freed (there is no C++ destructor).
+        obj = getattr(self, "obj", None)
+        self.obj = None
+        manager = getattr(self, "_vmm_graph_input_manager", None)
+        self._vmm_graph_input_manager = None
+        if not self.disabled and obj is not None:
+            obj.free(self.group)
+        if manager is not None:
+            manager.close()
 
     def _all_reduce(self, input: torch.Tensor) -> torch.Tensor:
         """Perform the actual all-reduce via JIT kernel."""

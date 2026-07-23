@@ -172,9 +172,12 @@ class CustomAllreduce:
 
     @staticmethod
     def free_shared_buffer(
-        pointers: List[int], group: Optional[ProcessGroup] = None
+        pointers: List[int],
+        group: Optional[ProcessGroup] = None,
+        rank: Optional[int] = None,
     ) -> None:
-        rank = dist.get_rank(group=group)
+        if rank is None:
+            rank = dist.get_rank(group=group)
         lib = CudaRTLibrary()
         lib.cudaFree(ctypes.c_void_p(pointers[rank]))
 
@@ -333,8 +336,13 @@ class CustomAllreduce:
             if ops is not None:
                 ops.dispose(self._ptr)
             if _is_cuda:
-                self.free_shared_buffer(self.meta_ptrs)
-                self.free_shared_buffer(self.buffer_ptrs)
+                # Pass the cached group rank explicitly: `pointers` is indexed
+                # by rank *within self.group*, and close() may run after the
+                # group has been destroyed, in which case resolving the rank
+                # from the group is either wrong (get_rank(None) returns the
+                # global rank) or an error.
+                self.free_shared_buffer(self.meta_ptrs, rank=self.rank)
+                self.free_shared_buffer(self.buffer_ptrs, rank=self.rank)
             self._ptr = 0
 
     def __del__(self):

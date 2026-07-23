@@ -79,6 +79,45 @@ REDUCE_OP_SUM = int(torch.distributed.ReduceOp.SUM)
 # creation so runtime collectives do not silently fall back to backend defaults.
 _MODEL_PARALLEL_GROUP_TIMEOUT: Optional[timedelta] = None
 
+# Backend strings for the in-tree "nccl2" backend.
+#
+# The world PG must be device-qualified: "nccl2" is a CUSTOM backend rather than
+# a device default, so a bare "nccl2" recorded in the parent PG's pg_map cannot
+# be parsed by split_group (_parse_backend_string only resolves bare names via
+# default_device_backend_map). The world also carries "cpu:gloo" so CPU
+# subgroups can be split out of it.
+NCCL2_WORLD_BACKEND = "cpu:gloo,cuda:nccl2"
+# Filter for a device (CUDA collective) subgroup split off the world PG.
+NCCL2_DEVICE_BACKEND = "cuda:nccl2"
+# Filter for a CPU-coordination subgroup split off the world PG. It has to keep
+# "cuda:nccl2" as well: ProcessGroup::splitGroup requires the deviceTypes filter
+# to include the parent's default backend device type (cuda here), so a pure
+# "cpu:gloo" split is rejected outright. The resulting group is compound, which
+# is fine for CPU collectives and for dist.monitored_barrier (it checks for a
+# CPU-capable backend via group._device_types, not for the literal "gloo" name).
+NCCL2_CPU_BACKEND = "cpu:gloo,cuda:nccl2"
+
+
+def is_nccl2_world() -> bool:
+    """Whether the default (world) PG is the device-bound nccl2 group.
+
+    Derived from the live world PG rather than from the requested backend
+    string, because the world may have been initialized by someone other than
+    ``init_distributed_environment`` (an embedding trainer, or
+    ``multimodal_gen``, which does not route ``nccl`` -> ``nccl2``). Splitting a
+    stock-``nccl`` parent with ``backend="cuda:nccl2"`` would fail with a
+    backend mismatch, so those worlds must keep the upstream ``new_group`` path.
+    """
+    if not torch.distributed.is_initialized():
+        return False
+    world_pg = torch.distributed.group.WORLD
+    if world_pg is None:
+        return False
+    # split_group requires an eagerly device-bound parent communicator.
+    if getattr(world_pg, "bound_device_id", None) is None:
+        return False
+    return "nccl2" in torch.distributed.get_backend(world_pg)
+
 
 def get_torch_distributed_pg_options(group_name=None):
     if not _is_npu:
@@ -297,11 +336,32 @@ class GroupCoordinator:
             self.device = torch.device("cpu")
         self.device_module = torch.get_device_module(self.device)
 
+        # The world PG uses the in-tree "nccl2" backend and is created eagerly
+        # device-bound (see init_distributed_environment). Subgroups are carved
+        # from it with split_group, which requires the parent communicator to be
+        # initialized/bound up front. The device subgroup keeps only the parent's
+        # "cuda:nccl2" backend; the cpu subgroup additionally keeps "cpu:gloo"
+        # for direct CPU-side coordination.
+        #
+        # The pipeline-parallel group (group_name "pp") is the sole exception:
+        # its device subgroup uses the "nccl-lazy" backend for per-peer lazy P2P
+        # comms (send/recv overlap). nccl2 does not implement the eager new_group
+        # no-color-split path, so that nccl-lazy device group is built
+        # members-only via new_group with use_local_synchronization=True, which
+        # short-circuits non-members before they would reach that missing path.
+        # Its cpu group is split from the world PG like every other cpu group.
+        #
+        # Non-nccl2 paths (a plain gloo, mooncake, or NPU/XPU run, or a world PG
+        # that someone else initialized with stock nccl) fall back to the
+        # upstream new_group path.
+        is_mooncake = "mooncake" in torch_distributed_backend
+        use_nccl2 = is_nccl2_world()
+        is_pipeline = group_name == "pp"
         for ranks in group_ranks:
             active_ranks = torch.ones(len(ranks), dtype=torch.int32, device=self.device)
             active_ranks_cpu = torch.ones(len(ranks), dtype=torch.int32)
             subgroup_timeout = _MODEL_PARALLEL_GROUP_TIMEOUT
-            if "mooncake" in torch_distributed_backend:
+            if is_mooncake:
                 from mooncake.ep import MooncakeBackendOptions
 
                 device_group = torch.distributed.new_group(
@@ -315,6 +375,49 @@ class GroupCoordinator:
                     backend="mooncake-cpu",
                     pg_options=MooncakeBackendOptions(active_ranks_cpu, recovered_rank),
                     timeout=subgroup_timeout,
+                )
+            elif use_nccl2:
+                if is_pipeline:
+                    # Members-only nccl-lazy subgroup for per-peer P2P; bound to
+                    # this rank's real CUDA device so non-contiguous PP recv
+                    # lands on the right device.
+                    device_group = torch.distributed.new_group(
+                        ranks,
+                        backend="nccl-lazy",
+                        pg_options=get_torch_distributed_pg_options(group_name),
+                        use_local_synchronization=True,
+                        timeout=subgroup_timeout,
+                        device_id=torch.device(f"cuda:{local_rank}"),
+                    )
+                else:
+                    # split_group is collective over the parent (world) PG, so
+                    # every world rank enters this call with the same split;
+                    # ranks outside `ranks` get a non-group member handle that
+                    # is never used below.
+                    device_group = torch.distributed.split_group(
+                        split_ranks=[ranks],
+                        backend=NCCL2_DEVICE_BACKEND,
+                        pg_options=get_torch_distributed_pg_options(group_name),
+                        timeout=subgroup_timeout,
+                    )
+                # A group carrying a `gloo` CPU backend, to allow direct
+                # coordination between processes through the CPU. Also split
+                # from the world PG, and likewise collective over it.
+                #
+                # The split necessarily keeps the parent's cuda:nccl2 backend
+                # alongside cpu:gloo -- ProcessGroup::splitGroup requires the
+                # deviceTypes filter to contain the parent's default backend
+                # device type, so a pure cpu:gloo split is rejected. That is
+                # fine for CPU collectives, and dist.monitored_barrier (used on
+                # the TP cpu group during model load) accepts it: it checks for
+                # a CPU-capable backend via group._device_types rather than
+                # matching the literal "gloo" backend name. Note this does mean
+                # get_backend() on the cpu group returns the full
+                # "cpu:gloo,cuda:nccl2" config string.
+                cpu_group = torch.distributed.split_group(
+                    split_ranks=[ranks],
+                    backend=NCCL2_CPU_BACKEND,
+                    timeout=gloo_timeout,
                 )
             else:
                 pg_options = get_torch_distributed_pg_options(group_name)
@@ -1479,18 +1582,25 @@ class GroupCoordinator:
         return tensor
 
     def destroy(self):
+        # Close the communicators before the process groups they were built
+        # from, and close them explicitly rather than dropping the reference:
+        # CustomAllReduceV2.close() barriers on cpu_group between closing the
+        # peers' IPC handles and freeing its device storage, so running it from
+        # __del__ after cpu_group is gone raises inside a destructor, where the
+        # exception is swallowed and the storage is leaked.
+        if self.ca_comm is not None:
+            self.ca_comm.close()
+            self.ca_comm = None
+        if self.pymscclpp_comm is not None:
+            self.pymscclpp_comm.destroy()
+        if self.pynccl_comm is not None:
+            self.pynccl_comm = None
         if self.device_group is not None:
             torch.distributed.destroy_process_group(self.device_group)
             self.device_group = None
         if self.cpu_group is not None:
             torch.distributed.destroy_process_group(self.cpu_group)
             self.cpu_group = None
-        if self.pynccl_comm is not None:
-            self.pynccl_comm = None
-        if self.pymscclpp_comm is not None:
-            self.pymscclpp_comm.destroy()
-        if self.ca_comm is not None:
-            self.ca_comm = None
         if self.mq_broadcaster is not None:
             self.mq_broadcaster = None
 
@@ -1792,6 +1902,17 @@ def init_distributed_environment(
             ) from e
         mooncake_ep.set_host_ip(get_local_ip_auto())
 
+    # Resolve local_rank up front: it is not available on a torch ProcessGroup
+    # (see https://github.com/pytorch/pytorch/issues/122816) and is needed both
+    # for the world device binding below and for init_world_group.
+    if local_rank == -1:
+        # local rank not set, this usually happens in single-node setting,
+        # where we can use rank as local rank
+        if distributed_init_method == "env://":
+            local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        else:
+            local_rank = rank
+
     if not torch.distributed.is_initialized():
         global _MODEL_PARALLEL_GROUP_TIMEOUT
         assert distributed_init_method is not None, (
@@ -1814,30 +1935,37 @@ def init_distributed_environment(
         else:
             pg_options = get_torch_distributed_pg_options()
 
+        # Bind the world PG to its CUDA device so subgroups can be carved from it
+        # with split_group, which requires an eagerly initialized/bound parent
+        # communicator. Split subgroups reuse the c10d store, so no extra
+        # MASTER_PORT or per-backend env seeding is needed.
+        device_id = (
+            torch.device(f"cuda:{local_rank}")
+            if is_cuda_alike() and backend != "gloo"
+            else None
+        )
+
+        # Route the world backend to the in-tree nccl2 backend, device-qualified
+        # (see NCCL2_WORLD_BACKEND for why the qualification is mandatory).
+        world_backend = backend
+        if world_backend in ("nccl", "cuda:nccl"):
+            world_backend = NCCL2_WORLD_BACKEND
+
         # this backend is used for WORLD
         torch.distributed.init_process_group(
-            backend=backend,
+            backend=world_backend,
             init_method=distributed_init_method,
             world_size=world_size,
             rank=rank,
             timeout=timeout,
             pg_options=pg_options,
+            device_id=device_id,
         )
 
         # Create a global TCPStore for coordination (used by NIXL)
         if moe_a2a_backend == "nixl":
             _create_global_tcp_store(rank, world_size)
 
-    # set the local rank
-    # local_rank is not available in torch ProcessGroup,
-    # see https://github.com/pytorch/pytorch/issues/122816
-    if local_rank == -1:
-        # local rank not set, this usually happens in single-node
-        # setting, where we can use rank as local rank
-        if distributed_init_method == "env://":
-            local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-        else:
-            local_rank = rank
     global _WORLD
     if _WORLD is None:
         ranks = list(range(torch.distributed.get_world_size()))
@@ -2139,15 +2267,25 @@ def initialize_model_parallel(
 
 
 def create_custom_parallel_group(
-    group_ranks: List[int], backend: str = "gloo"
+    group_ranks: List[int],
+    backend: str = "gloo",
+    timeout: Optional[timedelta] = None,
 ) -> Optional[torch.distributed.ProcessGroup]:
     """
     Create a custom parallel group based on the provided ranks.
 
+    This is collective over the whole world: every rank must call it, and the
+    per-rank ``group_ranks`` must together form a partition of the world.
+
     Args:
         group_ranks: The list of ranks that the CURRENT process wants to join.
                      (e.g., Rank 0 passes [0...7], Rank 8 passes [8...15])
-        backend: The communication backend (default: "gloo").
+        backend: The communication backend (default: "gloo"). Ignored on the
+                 nccl2 path, where the group is split off the world PG and so
+                 necessarily carries the parent's backends
+                 (``cpu:gloo,cuda:nccl2``).
+        timeout: Process group timeout. ``None`` keeps the backend default
+                 (30 minutes for gloo / for a device-qualified backend string).
 
     Returns:
         The ProcessGroup if the current rank is in group_ranks, else None.
@@ -2173,10 +2311,43 @@ def create_custom_parallel_group(
 
     unique_groups.sort(key=lambda x: x[0])
 
+    if is_nccl2_world():
+        # Over an nccl2 world an eager new_group() is fatal: non-member ranks
+        # take the no-color-split path in _new_process_group_helper and call
+        # perform_nocolor_split(), which ProcessGroupNCCL2 does not implement.
+        # Split the world PG instead -- a single collective that hands every
+        # rank the split it belongs to. All ranks already reach this point
+        # (the all_gather_object above is world-collective) and agree on
+        # `unique_groups`, so the split is consistent.
+        covered: set = set()
+        for g_ranks in unique_groups:
+            if covered & set(g_ranks):
+                raise ValueError(
+                    "create_custom_parallel_group requires disjoint groups on "
+                    f"the nccl2 path, but got overlapping splits: {unique_groups}"
+                )
+            covered |= set(g_ranks)
+        # split_ranks are ranks in the parent PG; the parent is the world PG,
+        # so they are the global ranks gathered above.
+        my_new_group = torch.distributed.split_group(
+            split_ranks=unique_groups,
+            backend=NCCL2_CPU_BACKEND,
+            timeout=timeout,
+        )
+        if my_new_group is torch.distributed.GroupMember.NON_GROUP_MEMBER:
+            my_new_group = None
+        else:
+            logger.debug(
+                f"Rank {rank} successfully created/joined custom group: {local_config}"
+            )
+        return my_new_group
+
     my_new_group = None
 
     for g_ranks in unique_groups:
-        group = torch.distributed.new_group(ranks=g_ranks, backend=backend)
+        group = torch.distributed.new_group(
+            ranks=g_ranks, backend=backend, timeout=timeout
+        )
 
         if set(g_ranks) == set(local_config):
             my_new_group = group
