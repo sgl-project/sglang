@@ -126,6 +126,9 @@ def main() -> None:
     degrees = parse_degrees(args.degrees)
     manifest = load_cases(args.cases)
     results = Path(args.results).resolve()
+    runtime_path = results.parent / "runtime.json"
+    runtime = json.loads(runtime_path.read_text()) if runtime_path.exists() else {}
+    gpu_name = runtime.get("gpu", "NVIDIA GPU")
 
     lane_runs = {}
     lanes = []
@@ -185,7 +188,7 @@ def main() -> None:
         "title": "MinWM 720p causal Ulysses SP matrix",
         "contract": {
             **manifest["contract"],
-            "hardware": "single-node 8x NVIDIA B200 Spot",
+            "hardware": f"single-node {max(degrees)}x {gpu_name} Spot",
             "attention": "packed deterministic causal attention",
             "reference_lane": "sp1",
             "parity_scope": "generated uint8 frames",
