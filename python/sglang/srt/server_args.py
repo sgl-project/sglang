@@ -4970,9 +4970,13 @@ class ServerArgs:
         elif model_arch in [
             "DeepseekV4ForCausalLM",
         ]:
-            from sglang.srt.arg_groups.deepseek_v4_hook import validate_deepseek_v4_cp
+            from sglang.srt.arg_groups.deepseek_v4_hook import (
+                validate_deepseek_v4_cp,
+                validate_deepseek_v4_mega_moe_token_budget,
+            )
 
             validate_deepseek_v4_cp(self)
+            validate_deepseek_v4_mega_moe_token_budget(self)
 
             # The SM120 marlin fallback moved to the resolution pipeline
             # (arg_groups/overrides.py: _deepseek_v4_sm120_moe), invoked here
