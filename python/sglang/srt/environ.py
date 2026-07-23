@@ -744,9 +744,6 @@ class Envs:
 
     # Kimi K3 decode optimizations (all fusions default on; "0" to A/B the
     # unfused path). See python/sglang/srt/models/kimi_k3.py.
-    # Latent-MoE TP reduce strategy: baseline | concat | fi_fused;
-    # unset = resolve by topology (multi-node -> concat).
-    SGLANG_K3_MOE_REDUCE_MODE = EnvStr(None)
     # Horizontal fusion of same-input GEMMs: shared gate_up + router gate +
     # latent down_proj -> one GEMM / KDA b_proj + f_a_proj -> one GEMV.
     SGLANG_K3_FUSE_MOE_FRONT = EnvBool(True)
@@ -775,7 +772,6 @@ class Envs:
     # packed-routing trtllm-gen path) only; sizes beyond the push window
     # fall back to the in-op finalize.
     SGLANG_K3_DEFER_MOE_FINALIZE = EnvBool(False)
-    SGLANG_K3_ATTN_RES_FUSED_MIN_T = EnvInt(999999)
 
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)
