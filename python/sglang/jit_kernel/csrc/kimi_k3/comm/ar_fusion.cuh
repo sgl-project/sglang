@@ -165,8 +165,7 @@ SGL_DEVICE float fma_f32_bf16(bf16_t a, bf16_t b, float acc) {
 #endif
 }
 
-// One 16B vector of the deferred MoE finalize (fused twin of the standalone
-// kimi_k3/moe_finalize.cuh, latent width fixed to kNormDim):
+// One 16B vector of the deferred MoE finalize (latent width fixed to kNormDim):
 //   local[t] = sum_k fin_weights[t, k] * fin_gemm2[fin_idx[t*16 + k]]
 // All 16 gathers issue before the FMA chain; threads of the same token
 // broadcast-load the same routing rows.

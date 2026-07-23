@@ -2,7 +2,6 @@ import torch
 
 from sglang.jit_kernel.benchmark import marker
 from sglang.jit_kernel.benchmark.utils import create_empty, create_random
-from sglang.jit_kernel.kimi_k3.decode_gemv import decode_gemv
 from sglang.jit_kernel.tiny_gemm import tiny_k_gemm_bf16, tiny_n_gemm_bf16
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -20,17 +19,12 @@ def _tiny_impl(x: torch.Tensor, w: torch.Tensor, out: torch.Tensor) -> None:
         tiny_n_gemm_bf16(x, w, out=out)
 
 
-def _gemv_impl(x: torch.Tensor, w: torch.Tensor, out: torch.Tensor) -> None:
-    decode_gemv(x, w, out)
-
-
 def _torch_impl(x: torch.Tensor, w: torch.Tensor, out: torch.Tensor) -> None:
     torch.mm(x, w.t(), out=out)
 
 
 FN_MAP = {
     "tiny": _tiny_impl,
-    "gemv": _gemv_impl,
     "torch": _torch_impl,
 }
 
@@ -41,7 +35,7 @@ FN_MAP = {
     ci_vals=[(144, 7168)],
 )
 @marker.parametrize("m", list(range(1, 17)), [1, 8])
-@marker.benchmark("impl", ["tiny", "gemv", "torch"])
+@marker.benchmark("impl", ["tiny", "torch"])
 def benchmark(n: int, k: int, m: int, impl: str):
     x = create_random(m, k)
     w = create_random(n, k)

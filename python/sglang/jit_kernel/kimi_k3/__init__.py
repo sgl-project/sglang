@@ -1,12 +1,7 @@
 import torch
 
 from .activation import situ_and_mul
-from .attn_res import (
-    attn_res_chain,
-    attn_res_combine,
-    attn_res_score,
-)
-from .moe import moe_finalize, situ_and_mul_masked_post_quant
+from .moe import situ_and_mul_masked_post_quant
 
 _K3_N_GEMM_DISPATCH_MAP = {
     (144, 7168): 16,
@@ -35,11 +30,7 @@ def kimi_k3_tiny_gemm(
 
 
 __all__ = [
-    "attn_res_chain",
-    "attn_res_combine",
-    "attn_res_score",
     "situ_and_mul",
     "situ_and_mul_masked_post_quant",
-    "moe_finalize",
     "kimi_k3_tiny_gemm",
 ]

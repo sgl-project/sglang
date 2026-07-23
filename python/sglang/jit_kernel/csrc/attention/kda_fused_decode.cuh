@@ -25,7 +25,7 @@
 //     pool updates, mirroring kda_packed_decode;
 //   * tvm-ffi host wrapper (KdaFusedDecodeKernel) with TensorMatcher shape /
 //     stride / dtype validation replaces the pybind binding;
-//   * optional 1D-TMA bulk state load (SGLANG_KDA_FUSED_DECODE_TMA_LOAD),
+//   * automatic 1D-TMA bulk state load for aligned recurrent-state layouts,
 //     ported from the standalone KDA_decode/kda_decode_fusion_kernel.cu
 //     experiment on chunan/kda (same mbarrier staging, same 3/4-stage
 //     dispatch by grid size);
@@ -236,16 +236,6 @@ __device__ __forceinline__ void tma_state_chunk_stage(
   const int64_t slot_base = static_cast<int64_t>(slot) * state_slot_stride;
   const float* src = state + slot_base + ((i_hv * kDimV + chunk * kStageChunkV) * kDimK);
   tma_load_1d(dst, src, bar, kBytes);
-}
-
-bool kda_fused_decode_use_tma_load() {
-  const char* v = std::getenv("SGLANG_KDA_FUSED_DECODE_TMA_LOAD");
-  return v != nullptr && v[0] == '1';
-}
-
-int kda_fused_decode_tma_stages_override() {
-  const char* v = std::getenv("SGLANG_KDA_FUSED_DECODE_TMA_STAGES");
-  return v != nullptr ? std::atoi(v) : 0;
 }
 
 __device__ __forceinline__ float block_reduce_sum(float value, float* scratch) {
@@ -908,8 +898,8 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
 // chunk prefetched, active onorm reduction, conv cache updated in place,
 // beta sigmoid in-kernel. Both forget-gate variants are compiled (softplus
 // and lower-bounded sigmoid) and selected at launch from the model config.
-// kUseTmaLoad/kTmaStages select the optional 1D-TMA state-staging path
-// (SGLANG_KDA_FUSED_DECODE_TMA_LOAD) in place of the default cp.async path.
+// kUseTmaLoad/kTmaStages select the 1D-TMA state-staging path in place of the
+// cp.async fallback used for a misaligned recurrent-state slot stride.
 template <bool kUseLowerBound, bool kUsePDL, bool kUseTmaLoad = false, int kTmaStages = kNumChunks>
 constexpr auto kda_fused_decode_k3_kernel = kda_decode_fusion_many_heads_kernel<
     /*kApplyOnorm=*/true,
@@ -1015,18 +1005,14 @@ struct KdaFusedDecodeKernel {
     // satisfy this; a pathological stride falls back to cp.async (still fully
     // fused, just no TMA) rather than silently mis-addressing the descriptor.
     const bool tma_slot_stride_aligned = (state_slot_stride % 4) == 0;
-    if (kda_fused_decode_use_tma_load() && tma_slot_stride_aligned) {
+    if (tma_slot_stride_aligned) {
       // Full-state staging (4 stages, 64KB, sync-free) wins while the grid
       // is small enough that occupancy isn't the limiter; past that the
       // 48KB 3-stage variant (one sync for the single stage reuse) benches
       // fastest. Mirrors the KDA_decode standalone-kernel dispatch on
-      // chunan/kda (KDA_DECODE_TMA_LOAD/KDA_DECODE_TMA_STAGES).
-      const int override_stages = kda_fused_decode_tma_stages_override();
-      tma_stages = override_stages != 0 ? override_stages : (B * static_cast<int>(kH) >= 1024 ? 3 : 4);
-      if (tma_stages == 2) {
-        kernel = use_lower_bound ? kda_fused_decode_k3_kernel<true, kUsePDL, true, 2>
-                                 : kda_fused_decode_k3_kernel<false, kUsePDL, true, 2>;
-      } else if (tma_stages == 3) {
+      // chunan/kda.
+      tma_stages = B * static_cast<int>(kH) >= 1024 ? 3 : 4;
+      if (tma_stages == 3) {
         kernel = use_lower_bound ? kda_fused_decode_k3_kernel<true, kUsePDL, true, 3>
                                  : kda_fused_decode_k3_kernel<false, kUsePDL, true, 3>;
       } else {

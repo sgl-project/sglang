@@ -734,34 +734,7 @@ class Envs:
     # model hands off the output-norm gate (Kimi K3); tolerance-level
     # differences vs the unfused chain.
     SGLANG_KDA_FUSED_DECODE = EnvBool(True)
-    # Stage the fused-decode kernel's recurrent-state read via 1D TMA bulk
-    # copy (mbarrier complete-tx) instead of cp.async; bit-exact vs the
-    # cp.async path. Stage count auto-dispatches by grid size (B*HV >= 1024
-    # -> 3 stages, else 4); override with SGLANG_KDA_FUSED_DECODE_TMA_STAGES
-    # (2/3/4). Requires sm_90+.
-    SGLANG_KDA_FUSED_DECODE_TMA_LOAD = EnvBool(True)
-    SGLANG_KDA_FUSED_DECODE_TMA_STAGES = EnvInt(0)
 
-    # Kimi K3 decode optimizations (all fusions default on; "0" to A/B the
-    # unfused path). See python/sglang/srt/models/kimi_k3.py.
-    # Latent-MoE TP reduce strategy: baseline | concat | fi_fused;
-    # unset = resolve by topology (multi-node -> concat).
-    SGLANG_K3_MOE_REDUCE_MODE = EnvStr(None)
-    # Horizontal fusion of same-input GEMMs: shared gate_up + router gate +
-    # latent down_proj -> one GEMM / KDA b_proj + f_a_proj -> one GEMV.
-    SGLANG_K3_FUSE_MOE_FRONT = EnvBool(True)
-    SGLANG_K3_FUSE_KDA_BFA = EnvBool(True)
-    # Dedicated CTA-per-output GEMV kernel for the skinny KDA decode
-    # projections (T <= 8) instead of cublas gemvx/dot dispatch.
-    SGLANG_K3_DECODE_GEMV = EnvBoolWithAlias(
-        True, deprecated_name="SGLANG_K3_TINY_GEMV"
-    )
-    # MLA output gate x * sigmoid(g) fused into one kernel.
-    SGLANG_K3_FUSE_O_GATE = EnvBool(True)
-    # Multi-stream overlap of off-critical-path work with the attention core
-    # (capture mode only, deepseek_v4-style alt-stream pool): the MLA
-    # output-gate GEMM.
-    SGLANG_K3_MULTI_STREAM = EnvBool(True)
     # MNNVL fused all-reduce (bf16, TP8): zero-copy 1shot multicast-push for
     # small messages and in-place NVLS 2shot on symmetric-memory tensors for
     # large ones, with an optional fused residual add. Covers the KDA o_proj
@@ -775,7 +748,6 @@ class Envs:
     # packed-routing trtllm-gen path) only; sizes beyond the push window
     # fall back to the in-op finalize.
     SGLANG_K3_DEFER_MOE_FINALIZE = EnvBool(True)
-    SGLANG_K3_ATTN_RES_FUSED_MIN_T = EnvInt(999999)
 
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)
