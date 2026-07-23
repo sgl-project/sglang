@@ -313,10 +313,10 @@ def maybe_init_int8_mamba_checkpoint_pool(
     allocating, so an oversized ``--int8-mamba-ckpt-size`` fails with an actionable
     message instead of a cryptic mid-allocation CUDA OOM.
     """
-    from sglang.srt.server_args import get_global_server_args
+    from sglang.srt.runtime_context import get_server_args
 
     try:
-        _sa = get_global_server_args()
+        _sa = get_server_args()
     except ValueError:
         # Some unit-test / mock runners construct HybridReqToTokenPool directly
         # without a global server-args context. The int8 checkpoint pool is opt-in

@@ -28,6 +28,7 @@ from sglang.srt.configs.mamba_utils import (
     Mamba2StateShape,
     mamba2_state_dtype,
 )
+from sglang.srt.runtime_context import get_parallel
 
 logger = logging.get_logger(__name__)
 
@@ -422,10 +423,9 @@ class NemotronHConfig(PretrainedConfig):
 
     @property
     def mamba2_cache_params(self) -> Mamba2CacheParams:
-        from sglang.srt.layers.dp_attention import get_attention_tp_size
 
         shape = Mamba2StateShape.create(
-            tp_world_size=get_attention_tp_size(),
+            tp_world_size=get_parallel().attn_tp_size,
             intermediate_size=self.mamba_num_heads * self.mamba_head_dim,
             n_groups=self.n_groups,
             num_heads=self.mamba_num_heads,

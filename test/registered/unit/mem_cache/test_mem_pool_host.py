@@ -1,11 +1,16 @@
-"""Unit tests for HostKVCache alloc/free bookkeeping (double-alloc / double-free detection)."""
+"""Unit tests for host-pool allocation and free-list bookkeeping."""
 
+import threading
 import unittest
 
 import torch
 
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
-from sglang.srt.mem_cache.memory_pool_host import MHATokenToKVPoolHost
+from sglang.srt.mem_cache.memory_pool_host import (
+    DeepSeekV4PagedHostPool,
+    MambaPoolHost,
+)
+from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -77,6 +82,86 @@ class TestHostKVCache(CustomTestCase):
         msg = str(ctx.exception)
         self.assertIn("Double-free", msg)
         self.assertIn(str(indices.tolist()), msg)
+
+    def test_empty_free_keeps_release_list_empty(self):
+        self.assertEqual(self.host_pool.free(torch.empty(0, dtype=torch.int64)), 0)
+        self.assertEqual(self.host_pool.num_release_slots, 0)
+        self.assertEqual(self.host_pool.release_slots, [])
+
+
+class TestLazyHostPoolRelease(CustomTestCase):
+    @staticmethod
+    def _make_mamba_pool():
+        pool = MambaPoolHost.__new__(MambaPoolHost)
+        pool.size = 8
+        pool.page_size = 1
+        pool.device = "cpu"
+        pool.lock = threading.RLock()
+        pool.clear()
+        return pool
+
+    @staticmethod
+    def _make_deepseek_v4_pool():
+        pool = DeepSeekV4PagedHostPool.__new__(DeepSeekV4PagedHostPool)
+        pool.size = 8
+        pool.slot_page_size = 2
+        pool.lock = threading.RLock()
+        pool.clear()
+        return pool
+
+    def _assert_lazy_release(self, pool):
+        self.assertEqual(pool.free(torch.empty(0, dtype=torch.int64)), 0)
+        self.assertEqual(pool.num_release_slots, 0)
+        self.assertEqual(pool.release_slots, [])
+
+        allocated = pool.alloc(6)
+        free_slots_before = pool.free_slots
+
+        pool.free(allocated[:2])
+
+        # free() should keep the primary free-list untouched and only record
+        # the released chunk for a later merge.
+        self.assertIs(pool.free_slots, free_slots_before)
+        self.assertEqual(pool.num_release_slots, 2)
+        self.assertEqual(len(pool.release_slots), 1)
+        self.assertEqual(pool.available_size(), 4)
+
+        # Consume the primary free-list first without merging pending slots.
+        self.assertTrue(torch.equal(pool.alloc(2), torch.tensor([6, 7])))
+        self.assertEqual(pool.num_release_slots, 2)
+
+        # Once the primary free-list is exhausted, alloc() merges and reuses
+        # the pending slots.
+        self.assertTrue(torch.equal(pool.alloc(2), torch.tensor([0, 1])))
+        self.assertEqual(pool.num_release_slots, 0)
+        self.assertEqual(pool.release_slots, [])
+        self.assertEqual(pool.available_size(), 0)
+
+        pool.free(torch.tensor([0, 1]))
+        pool.clear()
+        self.assertEqual(pool.num_release_slots, 0)
+        self.assertEqual(pool.release_slots, [])
+        self.assertEqual(pool.available_size(), 8)
+
+        # Exercise the general merge path with multiple released chunks.
+        allocated = pool.alloc(8)
+        pool.free(allocated[:2])
+        pool.free(allocated[2:4])
+        self.assertEqual(len(pool.release_slots), 2)
+        self.assertTrue(torch.equal(pool.alloc(4), torch.tensor([0, 1, 2, 3])))
+        self.assertEqual(pool.num_release_slots, 0)
+        self.assertEqual(pool.release_slots, [])
+
+    def test_mamba_pool_lazy_release(self):
+        self._assert_lazy_release(self._make_mamba_pool())
+
+    def test_deepseek_v4_pool_lazy_release(self):
+        pool = self._make_deepseek_v4_pool()
+        self._assert_lazy_release(pool)
+
+        # Preserve the pool's page-aligned allocation behavior.
+        pool.clear()
+        self.assertEqual(len(pool.alloc(1)), 2)
 
 
 if __name__ == "__main__":

@@ -22,7 +22,6 @@ QWEN3_6_35B_A3B_64K_1K_ENVS = {
     "GLOO_SOCKET_IFNAME": "lo",
     "HCCL_OP_EXPANSION_MODE": "AIV",
     "SGLANG_SET_CPU_AFFINITY": "1",
-    "SGLANG_ENABLE_SPEC_V2": "1",
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
     "ASCEND_USE_FIA": "1",
     "SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES": "1",
@@ -74,6 +73,10 @@ QWEN3_6_35B_A3B_64K_1K_OTHER_ARGS = [
     1,
     "--speculative-num-draft-tokens",
     4,
+    "--reasoning-parser",
+    "qwen3",
+    "--tool-call-parser",
+    "qwen3_coder",
 ]
 
 
@@ -91,6 +94,7 @@ class TestNPUQwen3_6_35BA3B_1P_In64k_Out1k_50ms(TestNpuPerformanceTestCaseBase):
     input_len = 64000
     output_len = 1000
     random_range_ratio = 1
+    seed = 1
     tpot = 50
     output_token_throughput = 141.72
 

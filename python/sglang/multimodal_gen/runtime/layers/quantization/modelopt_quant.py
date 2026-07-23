@@ -20,8 +20,8 @@ from sglang.multimodal_gen.runtime.models.parameter import (
     ModelWeightParameter,
     PerTensorScaleParameter,
 )
-from sglang.multimodal_gen.runtime.models.utils import set_weight_attrs
 from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.utils.weight_attrs import set_weight_attrs
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
     cutlass_fp8_supported,
@@ -187,7 +187,11 @@ class ModelOptFp8Config(ModelOptQuantConfig):
         return 89
 
     @classmethod
-    def from_config(cls, config: Dict[str, Any]) -> ModelOptFp8Config:
+    def from_config(
+        cls,
+        config: Dict[str, Any],
+        ignore_remap: Optional[Dict[str, str]] = None,
+    ) -> ModelOptFp8Config:
         quant_method = config.get("quant_algo")
         exclude_modules = config.get("ignore")
         if quant_method is None:
@@ -204,6 +208,9 @@ class ModelOptFp8Config(ModelOptQuantConfig):
             raise ValueError(
                 "ModelOptFp8Config only supports static FP8 quantization in SGLang diffusion."
             )
+
+        if ignore_remap and exclude_modules:
+            exclude_modules = [ignore_remap.get(p, p) for p in exclude_modules]
 
         return cls(
             is_checkpoint_fp8_serialized=True,
@@ -630,7 +637,7 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         fp4_quantize = _get_fp4_quantize_op()
         if fp4_quantize is None:
             raise RuntimeError(
-                "No FP4 quantization kernel available. Install flashinfer or sgl_kernel."
+                "No FP4 quantization kernel available. Install flashinfer."
             )
 
         x_fp4, x_scale_interleaved = fp4_quantize(x, layer.input_scale_inv)
@@ -645,29 +652,17 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         if w_scale_interleaved.dtype == torch.uint8:
             w_scale_interleaved = w_scale_interleaved.view(torch.float8_e4m3fn)
         fp4_gemm, flashinfer_backend = _get_fp4_gemm_op()
-        if flashinfer_backend is not None:
-            out = fp4_gemm(
-                x_fp4,
-                w.T,
-                x_scale_interleaved,
-                w_scale_interleaved.T,
-                layer.alpha,
-                output_dtype,
-                backend=flashinfer_backend,
-            )
-        elif fp4_gemm is not None:
-            out = fp4_gemm(
-                x_fp4,
-                w,
-                x_scale_interleaved,
-                w_scale_interleaved,
-                layer.alpha,
-                output_dtype,
-            )
-        else:
-            raise RuntimeError(
-                "No FP4 GEMM kernel available. Install flashinfer or sgl_kernel."
-            )
+        if fp4_gemm is None:
+            raise RuntimeError("No FP4 GEMM kernel available. Install flashinfer.")
+        out = fp4_gemm(
+            x_fp4,
+            w.T,
+            x_scale_interleaved,
+            w_scale_interleaved.T,
+            layer.alpha,
+            output_dtype,
+            backend=flashinfer_backend,
+        )
 
         out = slice_nvfp4_output(out, output_size)
 

@@ -24,6 +24,12 @@
 #   SLURM_NODELIST     - optional explicit node pin (else scheduler chooses)
 #   SLURM_EXCLUDE      - optional comma-separated nodes to keep the scheduler
 #                        off (e.g. hosts with a broken RDMA driver)
+#   SGLANG_USE_CHECKOUT_RUNTIME
+#                      - default 1. Reinstall this workflow checkout's Python
+#                        sglang package inside each runtime container, and the
+#                        checkout sglang-router package inside the bench
+#                        container, before launching servers/bench. Set 0 to
+#                        use the image's baked-in packages.
 #   RUNNER_NAME        - GitHub runner name (a built-in default env var)
 #   GITHUB_RUN_ID      - GitHub Actions run id (a built-in default env var)
 #                        The allocation is named
@@ -52,6 +58,11 @@ set -x
 SLURM_PARTITION="${SLURM_PARTITION:-amd-sglang}"
 TIME_LIMIT="${TIME_LIMIT:-02:30:00}"
 MODEL_PATH="${MODEL_PATH:-${MODEL:-}}"
+SGLANG_USE_CHECKOUT_RUNTIME="${SGLANG_USE_CHECKOUT_RUNTIME:-1}"
+case "${SGLANG_USE_CHECKOUT_RUNTIME,,}" in
+    0|false|no|off) SGLANG_USE_CHECKOUT_RUNTIME=0 ;;
+    *) SGLANG_USE_CHECKOUT_RUNTIME=1 ;;
+esac
 
 if [[ -z "$MODEL_PATH" ]]; then
     echo "ERROR: set MODEL_PATH (local snapshot) or MODEL" >&2
@@ -111,6 +122,7 @@ emit("LBPORT", rt["lb_port"])
 emit("MEMFRAC", rt["mem_fraction_static"])
 emit("PAGE", rt["page_size"])
 emit("MAXREQ", rt["max_running_requests"])
+emit("MAXTOK", rt.get("max_total_tokens", ""))
 emit("CHUNK", rt["chunked_prefill_size"])
 # swa is DSV4-specific; emit empty when a model omits it so the flag is dropped.
 emit("SWA", rt.get("swa_full_tokens_ratio", ""))
@@ -162,6 +174,23 @@ echo "recipe: image=$IMAGE attn=${ATTN:-$PATTN/$DATTN} ib=$IB ptp=$PTP dtp=$DTP 
 WORKDIR="$HOME/.mi355x_ci/${MATRIX_CONFIG_NAME}"
 rm -rf "$WORKDIR"; mkdir -p "$WORKDIR"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Stage the workflow checkout on shared NFS so Slurm compute-node containers can
+# reinstall the same code SHA the workflow checked out. The container gets a
+# read-only mount and copies it to /tmp before mutating pyproject.toml.
+CHECKOUT_DOCKER_ARGS="-e SGLANG_USE_CHECKOUT_RUNTIME=$SGLANG_USE_CHECKOUT_RUNTIME"
+if [[ "$SGLANG_USE_CHECKOUT_RUNTIME" == "1" ]]; then
+    CHECKOUT_STAGE="$WORKDIR/checkout"
+    CHECKOUT_SHA="$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD)"
+    echo "Staging checkout runtime: sha=$CHECKOUT_SHA -> $CHECKOUT_STAGE"
+    rm -rf "$CHECKOUT_STAGE"
+    mkdir -p "$CHECKOUT_STAGE"
+    tar --exclude='__pycache__' --exclude='*.pyc' --exclude='.git/config' \
+        -C "$GITHUB_WORKSPACE" -cf - . | tar -C "$CHECKOUT_STAGE" -xf -
+    CHECKOUT_DOCKER_ARGS="$CHECKOUT_DOCKER_ARGS -e SGLANG_CHECKOUT_SHA=$CHECKOUT_SHA -v $CHECKOUT_STAGE:/sglang-checkout:ro"
+else
+    echo "SGLANG_USE_CHECKOUT_RUNTIME=0; using sglang package baked into image."
+fi
 
 # Accuracy-gate helpers (written when enabled). Pre-stage the GSM8K test set on
 # shared NFS from the login node (which has internet) so the in-container eval
@@ -239,6 +268,7 @@ PY
 EXTRA_FLAGS=""
 (( PDP > 1 )) && EXTRA_FLAGS="$EXTRA_FLAGS --enable-dp-attention --dp-size $PDP"
 (( PEP > 1 )) && EXTRA_FLAGS="$EXTRA_FLAGS --ep-size $PEP"
+[[ -n "$MAXTOK" ]] && EXTRA_FLAGS="$EXTRA_FLAGS --max-total-tokens $MAXTOK"
 if [[ "$MTP_ENABLED" == "1" ]]; then
     EXTRA_FLAGS="$EXTRA_FLAGS --speculative-algorithm $MTP_ALGO \
 --speculative-num-steps $MTP_STEPS --speculative-eagle-topk $MTP_TOPK \
@@ -281,7 +311,7 @@ fi
 DOCKER_COMMON="--rm --network host --ipc host --shm-size 32g --privileged \
 --security-opt seccomp=unconfined \
 --device /dev/kfd --device /dev/dri --device /dev/infiniband \
--v /it-share:/it-share:ro -v $HOME:/host_home"
+-v /it-share:/it-share:ro -v $HOME:/host_home $CHECKOUT_DOCKER_ARGS"
 
 # ---------------------------------------------------------------------------
 # Write per-role scripts that srun dispatches to each compute node.
@@ -292,16 +322,183 @@ DOCKER_COMMON="--rm --network host --ipc host --shm-size 32g --privileged \
 # `${MODEL_SERVER_ARGS[@]}` refs are backslash-escaped to survive into the script
 # and expand after `source`. For DSV4 those arrays are empty and $DSV4_ENV_STR is
 # set, so the resulting docker argv is byte-identical to the pre-Kimi launcher.
+cat > "$WORKDIR/install_checkout_sglang.sh" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+
+case "${SGLANG_USE_CHECKOUT_RUNTIME:-1}" in
+  0|false|False|FALSE|no|No|NO|off|Off|OFF)
+    echo "[checkout-sglang] disabled; using image-baked sglang"
+    exit 0
+    ;;
+esac
+
+CHECKOUT_SRC="${CHECKOUT_SRC:-/sglang-checkout}"
+RUNTIME_CHECKOUT="${RUNTIME_CHECKOUT:-/tmp/sglang-checkout-runtime}"
+
+if [[ ! -f "$CHECKOUT_SRC/python/sglang/version.py" ]]; then
+  echo "[checkout-sglang] ERROR: invalid checkout mount: $CHECKOUT_SRC" >&2
+  exit 1
+fi
+
+echo "[checkout-sglang] reinstalling sglang from $CHECKOUT_SRC"
+rm -rf "$RUNTIME_CHECKOUT"
+mkdir -p "$RUNTIME_CHECKOUT"
+tar --exclude='__pycache__' --exclude='*.pyc' \
+  -C "$CHECKOUT_SRC" -cf - . | tar -C "$RUNTIME_CHECKOUT" -xf -
+
+git config --global --add safe.directory "$RUNTIME_CHECKOUT" || true
+
+# The ROCm pyproject variant is the one used by AMD CI. Mutate only the private
+# /tmp copy so prefill/decode/bench never race on the read-only checkout mount.
+rm -f "$RUNTIME_CHECKOUT/python/pyproject.toml"
+cp "$RUNTIME_CHECKOUT/python/pyproject_other.toml" "$RUNTIME_CHECKOUT/python/pyproject.toml"
+for f in README.md LICENSE; do
+  if [[ -f "$RUNTIME_CHECKOUT/$f" && ! -e "$RUNTIME_CHECKOUT/python/$f" ]]; then
+    cp "$RUNTIME_CHECKOUT/$f" "$RUNTIME_CHECKOUT/python/$f"
+  fi
+done
+
+python3 -m pip uninstall -y sglang || true
+python3 -m pip install --no-deps --no-build-isolation -e "$RUNTIME_CHECKOUT/python"
+
+export RUNTIME_CHECKOUT
+export PYTHONPATH="$RUNTIME_CHECKOUT/python:${PYTHONPATH:-}"
+python3 - <<'PY'
+import importlib.metadata
+import os
+import subprocess
+import sglang
+
+checkout = os.environ["RUNTIME_CHECKOUT"]
+expected = os.path.realpath(os.path.join(checkout, "python", "sglang")) + os.sep
+actual = os.path.realpath(os.path.dirname(sglang.__file__)) + os.sep
+try:
+    sha = subprocess.check_output(
+        ["git", "-C", checkout, "rev-parse", "HEAD"], text=True
+    ).strip()
+except Exception:
+    sha = os.environ.get("SGLANG_CHECKOUT_SHA", "unknown")
+
+print(f"[checkout-sglang] sha={sha}")
+print(f"[checkout-sglang] sglang_file={sglang.__file__}")
+print(f"[checkout-sglang] sglang_version={importlib.metadata.version('sglang')}")
+if not actual.startswith(expected):
+    raise SystemExit(f"sglang did not import from checkout: {sglang.__file__}")
+PY
+EOF
+
+cat > "$WORKDIR/install_checkout_router.sh" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+
+case "${SGLANG_USE_CHECKOUT_RUNTIME:-1}" in
+  0|false|False|FALSE|no|No|NO|off|Off|OFF)
+    echo "[checkout-router] disabled; using image-baked sglang-router"
+    python3 - <<'PY' || true
+import importlib.metadata
+import sglang_router
+
+print(f"[checkout-router] sglang_router_file={sglang_router.__file__}")
+print(
+    "[checkout-router] sglang_router_version="
+    f"{importlib.metadata.version('sglang-router')}"
+)
+try:
+    import sglang_router.sglang_router_rs as rs
+
+    print(f"[checkout-router] sglang_router_rs_file={rs.__file__}")
+except Exception as exc:
+    print(f"[checkout-router] sglang_router_rs_import_error={exc}")
+PY
+    exit 0
+    ;;
+esac
+
+RUNTIME_CHECKOUT="${RUNTIME_CHECKOUT:-/tmp/sglang-checkout-runtime}"
+ROUTER_SRC="$RUNTIME_CHECKOUT/sgl-model-gateway/bindings/python"
+WHEEL_DIR="${SGLANG_ROUTER_WHEEL_DIR:-/tmp/sglang-router-wheels}"
+
+if [[ ! -f "$ROUTER_SRC/pyproject.toml" ]]; then
+  echo "[checkout-router] ERROR: invalid router checkout: $ROUTER_SRC" >&2
+  exit 1
+fi
+
+echo "[checkout-router] building sglang-router from $ROUTER_SRC"
+export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}"
+python3 -m maturin --version >/dev/null 2>&1 \
+  || python3 -m pip install --no-cache-dir "maturin<1.14"
+
+# Match the ROCm image build recipe when compiling from the checkout copy.
+if [[ -f "$RUNTIME_CHECKOUT/sgl-model-gateway/Cargo.toml" ]]; then
+  sed -i -E 's|^(smg-[a-zA-Z-]+)\s*=\s*"~1\.0\.0"|\1 = "=1.0.0"|' \
+    "$RUNTIME_CHECKOUT/sgl-model-gateway/Cargo.toml"
+fi
+
+rm -rf "$WHEEL_DIR"
+mkdir -p "$WHEEL_DIR"
+(
+  cd "$ROUTER_SRC"
+  ulimit -n 65536 || true
+  python3 -m maturin build --release --features vendored-openssl --out "$WHEEL_DIR"
+)
+
+python3 -m pip uninstall -y sglang-router || true
+python3 -m pip install --force-reinstall --no-deps "$WHEEL_DIR"/*.whl
+
+python3 - <<'PY'
+import importlib.metadata
+import sglang_router
+import sglang_router.sglang_router_rs as rs
+from sglang_router.sglang_router_rs import Router
+
+print(f"[checkout-router] sglang_router_file={sglang_router.__file__}")
+print(
+    "[checkout-router] sglang_router_version="
+    f"{importlib.metadata.version('sglang-router')}"
+)
+print(f"[checkout-router] sglang_router_rs_file={rs.__file__}")
+print(f"[checkout-router] Router={Router}")
+PY
+EOF
+
+cat > "$WORKDIR/prefill_entry.sh" <<EOF
+#!/bin/bash
+set -euo pipefail
+CIDIR=/host_home/.mi355x_ci/${MATRIX_CONFIG_NAME}
+source "\$CIDIR/model_flags.sh"
+bash "\$CIDIR/install_checkout_sglang.sh"
+if [[ "\${SGLANG_USE_CHECKOUT_RUNTIME:-1}" != "0" ]]; then
+  export PYTHONPATH=/tmp/sglang-checkout-runtime/python:\${PYTHONPATH:-}
+fi
+exec python3 -m sglang.launch_server \
+  --model-path $MODEL_PATH --host 0.0.0.0 --port $PPORT \
+  $COMMON_FLAGS "\${MODEL_SERVER_ARGS[@]}" \
+  --disaggregation-mode prefill --disaggregation-bootstrap-port $PBOOT
+EOF
+
+cat > "$WORKDIR/decode_entry.sh" <<EOF
+#!/bin/bash
+set -euo pipefail
+CIDIR=/host_home/.mi355x_ci/${MATRIX_CONFIG_NAME}
+source "\$CIDIR/model_flags.sh"
+bash "\$CIDIR/install_checkout_sglang.sh"
+if [[ "\${SGLANG_USE_CHECKOUT_RUNTIME:-1}" != "0" ]]; then
+  export PYTHONPATH=/tmp/sglang-checkout-runtime/python:\${PYTHONPATH:-}
+fi
+exec python3 -m sglang.launch_server \
+  --model-path $MODEL_PATH --host 0.0.0.0 --port $DPORT \
+  $COMMON_FLAGS "\${MODEL_SERVER_ARGS[@]}" \
+  --disaggregation-mode decode --disaggregation-bootstrap-port $DBOOT
+EOF
+
 cat > "$WORKDIR/prefill.sh" <<EOF
 #!/bin/bash
 source "$WORKDIR/model_flags.sh"
 docker rm -f mi355x_prefill 2>/dev/null || true
 docker run $DOCKER_COMMON --name mi355x_prefill \
   -e HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 $MORI_ENV $DSV4_ENV_STR "\${MODEL_ENV_ARGS[@]}" \
-  $IMAGE python3 -m sglang.launch_server \
-  --model-path $MODEL_PATH --host 0.0.0.0 --port $PPORT \
-  $COMMON_FLAGS "\${MODEL_SERVER_ARGS[@]}" \
-  --disaggregation-mode prefill --disaggregation-bootstrap-port $PBOOT
+  $IMAGE bash /host_home/.mi355x_ci/${MATRIX_CONFIG_NAME}/prefill_entry.sh
 EOF
 
 cat > "$WORKDIR/decode.sh" <<EOF
@@ -310,10 +507,7 @@ source "$WORKDIR/model_flags.sh"
 docker rm -f mi355x_decode 2>/dev/null || true
 docker run $DOCKER_COMMON --name mi355x_decode \
   -e HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 $MORI_ENV $DSV4_ENV_STR "\${MODEL_ENV_ARGS[@]}" \
-  $IMAGE python3 -m sglang.launch_server \
-  --model-path $MODEL_PATH --host 0.0.0.0 --port $DPORT \
-  $COMMON_FLAGS "\${MODEL_SERVER_ARGS[@]}" \
-  --disaggregation-mode decode --disaggregation-bootstrap-port $DBOOT
+  $IMAGE bash /host_home/.mi355x_ci/${MATRIX_CONFIG_NAME}/decode_entry.sh
 EOF
 
 # Probe payload + validator (separate files to avoid quoting inside the
@@ -341,7 +535,14 @@ docker rm -f mi355x_bench 2>/dev/null || true
 docker run $DOCKER_COMMON --name mi355x_bench \
   -e PIP=\$PIP -e DIP=\$DIP \
   $IMAGE bash -lc '
-    export PYTHONPATH=/sgl-workspace/sglang/python:\$PYTHONPATH
+    CIDIR=/host_home/.mi355x_ci/${MATRIX_CONFIG_NAME}
+    bash \$CIDIR/install_checkout_sglang.sh
+    if [ "\${SGLANG_USE_CHECKOUT_RUNTIME:-1}" != "0" ]; then
+      export PYTHONPATH=/tmp/sglang-checkout-runtime/python:\${PYTHONPATH:-}
+    else
+      export PYTHONPATH=/sgl-workspace/sglang/python:\${PYTHONPATH:-}
+    fi
+    bash \$CIDIR/install_checkout_router.sh
     echo "[wait] prefill"; for i in \$(seq 1 600); do curl -sf http://\$PIP:$PPORT/health >/dev/null && break; sleep 5; done
     echo "[wait] decode";  for i in \$(seq 1 600); do curl -sf http://\$DIP:$DPORT/health >/dev/null && break; sleep 5; done
     python3 -m sglang_router.launch_router \
@@ -351,7 +552,6 @@ docker run $DOCKER_COMMON --name mi355x_bench \
       --host 0.0.0.0 --port $LBPORT \
       --disable-circuit-breaker &
     for i in \$(seq 1 30); do curl -sf http://127.0.0.1:$LBPORT/health >/dev/null && break; sleep 2; done
-    CIDIR=/host_home/.mi355x_ci/${MATRIX_CONFIG_NAME}
     echo "[probe] PD end-to-end check via LB"
     curl -sf -X POST http://127.0.0.1:$LBPORT/generate \
       -H "content-type: application/json" -d @\$CIDIR/probe.json > \$CIDIR/probe_out.json \

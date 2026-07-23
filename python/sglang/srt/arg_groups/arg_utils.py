@@ -77,9 +77,46 @@ class Arg:
     no_cli: bool = False
     # When True, this field may be written by config resolution (model
     # overrides and post-process passes): it is part of the whitelist accepted
-    # by the apply_model_overrides gate, and its resolved value lives on the
-    # flags tier (the server_args field itself stays the pristine user input).
+    # by the declaration stash, and its resolved value materializes onto the
+    # field at the end of __post_init__.
     resolvable: bool = False
+
+
+@dataclasses.dataclass(frozen=True)
+class NS:
+    """Namespace-path marker for a ServerArgs field, attached alongside the
+    field's metadata in ``Annotated``:
+
+        field: A[int, "help", NS("parallel")] = 1
+        field: A[str, Arg(help="…"), NS("exec.moe")] = "auto"
+
+    Kept separate from ``Arg`` (CLI metadata) so the ~400 existing bare-string /
+    multiline field annotations gain a namespace by *appending* one element,
+    without rewriting each ``Arg(...)`` call. ``namespace_of`` reads it to build
+    the RuntimeContext config-bag tree."""
+
+    path: str
+
+
+@functools.lru_cache(maxsize=None)
+def namespace_of(cls) -> dict:
+    """``{field_name: dotted namespace path}`` from the ``NS`` marker in each
+    field's ``Annotated`` metadata.
+
+    Fields without an ``NS`` marker are absent from the map (the coverage lint
+    flags them). Non-dataclass types yield an empty map."""
+    if not dataclasses.is_dataclass(cls):
+        return {}
+    hints = get_type_hints(cls, include_extras=True)
+    out = {}
+    for field in dataclasses.fields(cls):
+        tp = hints.get(field.name, field.type)
+        if get_origin(tp) is Annotated:
+            for a in get_args(tp)[1:]:
+                if isinstance(a, NS):
+                    out[field.name] = a.path
+                    break
+    return out
 
 
 @functools.lru_cache(maxsize=None)

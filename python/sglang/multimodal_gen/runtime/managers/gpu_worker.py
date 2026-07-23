@@ -480,7 +480,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             self._materialize_raw_frame_transport(output_batch, req)
         elif req.save_output and req.return_file_paths_only:
             self._materialize_file_path_transport(output_batch, save_output_paths)
-        elif req.return_frames:
+        elif getattr(req, "return_frames", False):
             self._materialize_frame_outputs_for_return(output_batch, req)
 
     def _materialize_raw_frame_transport(
@@ -518,7 +518,11 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         self, output_batch: OutputBatch, req: Req
     ) -> None:
         """materialize the output from tensor to numpy frames for faster serialization"""
-        if self.rank != 0 or output_batch.output is None or not req.return_frames:
+        if (
+            self.rank != 0
+            or output_batch.output is None
+            or not getattr(req, "return_frames", False)
+        ):
             return
 
         if (
@@ -692,7 +696,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             mismatched = [
                 field
                 for field in shared_output_fields
-                if getattr(req, field) != getattr(first_req, field)
+                if getattr(req, field, None) != getattr(first_req, field, None)
             ]
             if mismatched:
                 raise ValueError(

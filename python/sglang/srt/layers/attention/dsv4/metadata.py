@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any, List, Optional
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_hip, is_xpu
 
 if TYPE_CHECKING:
     pass
@@ -122,6 +122,7 @@ class PagedIndexerMetadata:
     def __post_init__(self):
         if (
             envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
+            or is_xpu()
             or envs.SGLANG_OPT_USE_AITER_INDEXER.get()
         ):
             self.deep_gemm_metadata = None
@@ -133,7 +134,9 @@ class PagedIndexerMetadata:
                 or self.c4_seq_lens.numel() > _LARGE_INDEXER_QUERY_THRESHOLD
             )
             if use_jit_indexer:
-                from sglang.jit_kernel.dsv4 import get_paged_mqa_logits_metadata
+                from sglang.kernels.ops.attention.dsv4 import (
+                    get_paged_mqa_logits_metadata,
+                )
             else:
                 from deep_gemm import get_paged_mqa_logits_metadata
 
@@ -148,7 +151,7 @@ class PagedIndexerMetadata:
 
             assert isinstance(self.deep_gemm_metadata, torch.Tensor)
 
-        from sglang.jit_kernel.dsv4 import plan_topk_v2
+        from sglang.kernels.ops.attention.dsv4 import plan_topk_v2
 
         if envs.SGLANG_OPT_USE_TOPK_V2.get():
             self.topk_metadata = plan_topk_v2(self.c4_seq_lens)

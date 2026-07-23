@@ -26,7 +26,10 @@ from sglang.test.test_utils import CustomTestCase
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-_FLASH_MLA_AVAILABLE = importlib.util.find_spec("flash_mla") is not None
+_FLASH_MLA_AVAILABLE = (
+    importlib.util.find_spec("sgl_kernel") is not None
+    and importlib.util.find_spec("sgl_kernel.flash_mla") is not None
+)
 
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.attention_unittest.attention_methods.dsv4_attention import (  # noqa: E402
@@ -35,6 +38,7 @@ from sglang.test.kits.attention_unittest.attention_methods.dsv4_attention import
     make_dsv4_cases,
     run_dsv4_attention_case,
     run_dsv4_compress_attention_case,
+    run_dsv4_draft_extend_attention_case,
     run_dsv4_target_verify_attention_case,
 )
 from sglang.test.kits.attention_unittest.runner_modes.cuda_graph_decode_runner import (  # noqa: E402
@@ -254,7 +258,25 @@ class TestDSV4AttentionBackendCorrectness(CustomTestCase):
                 backend=case.backend,
                 compress_ratio=case.compress_ratio,
             ):
-                run_dsv4_eagle_verify_cuda_graph_case(self, case, topk=1)
+                run_dsv4_eagle_verify_cuda_graph_case(
+                    self, case, topk=1, force_gpu_only_seq_lens=True
+                )
+
+    def test_eagle_draft_extend_without_cpu_seq_lens(self):
+        case = DSV4AttentionCase(
+            name="dsv4_swa_eagle_draft_extend_gpu_only_seq_lens",
+            backend="dsv4",
+            forward_mode=ForwardMode.DRAFT_EXTEND_V2,
+            num_heads=64,
+            page_size=DSV4_PAGE_SIZE,
+            prefix_lens=(64, 96),
+            extend_lens=(4, 4),
+        )
+        run_dsv4_draft_extend_attention_case(
+            self,
+            case,
+            force_gpu_only_seq_lens=True,
+        )
 
     # Production EAGLE draft graph runner (chain only, SWA only). The runner
     # routes through `DeepseekV4MultiStepBackend` (one `DeepseekV4AttnBackend`
@@ -275,7 +297,11 @@ class TestDSV4AttentionBackendCorrectness(CustomTestCase):
     def test_runner_mode_production_eagle_draft_cuda_graph_runner_cases(self):
         for case in self.PRODUCTION_EAGLE_DRAFT_RUNNER_CASES:
             with self.subTest(case=case.name, backend=case.backend):
-                run_dsv4_eagle_draft_cuda_graph_runner_case(self, case)
+                run_dsv4_eagle_draft_cuda_graph_runner_case(
+                    self,
+                    case,
+                    force_gpu_only_seq_lens=True,
+                )
 
 
 class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
