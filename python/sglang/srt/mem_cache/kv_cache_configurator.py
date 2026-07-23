@@ -882,6 +882,17 @@ class KVCacheConfigurator:
         if not _is_npu:
             assert swa_page_size == 256, "In paged swa mode, page_size must be 256."
 
+        (
+            physical_swa_tokens,
+            physical_c4_tokens,
+            physical_c128_tokens,
+            c4_indexer_tokens,
+        ) = self._get_dsv4_physical_pool_sizes(
+            swa_max_total_num_tokens=swa_max_total_num_tokens,
+            c4_max_total_num_tokens=c4_max_total_num_tokens,
+            c128_max_total_num_tokens=c128_max_total_num_tokens,
+        )
+
         if self.is_draft_worker:
             from sglang.srt.models.deepseek_v4_nextn import (
                 COMPRESS_RATIO_NEXTN_LAYER,
@@ -930,9 +941,11 @@ class KVCacheConfigurator:
             # SWA ring is indexed by req_pool_idx; PD decode inflates req_to_token
             # past max_running_requests (pre-alloc), so size to the real capacity.
             num_req_slots=req_to_token_pool.req_to_token.shape[0],
-            swa_size=swa_max_total_num_tokens,
-            c4_size=c4_max_total_num_tokens,
-            c128_size=c128_max_total_num_tokens,
+            swa_size=physical_swa_tokens,
+            c4_size=physical_c4_tokens,
+            c128_size=physical_c128_tokens,
+            # The C4 indexer cache remains replicated in global C4 space.
+            c4_indexer_size=c4_indexer_tokens,
             c4_state_pool_size=c4_state_pool_size,
             c128_state_pool_size=c128_state_pool_size,
             page_size=self.server_args.page_size,
@@ -956,6 +969,36 @@ class KVCacheConfigurator:
             ),
         )
         return token_to_kv_pool
+
+    def _get_dsv4_physical_pool_sizes(
+        self,
+        *,
+        swa_max_total_num_tokens: Optional[int],
+        c4_max_total_num_tokens: int,
+        c128_max_total_num_tokens: int,
+    ) -> tuple[int, int, int, int]:
+        assert swa_max_total_num_tokens is not None
+
+        # The pool configurator reports logical, cluster-wide capacities.
+        # DSV4 writers map logical locations to rank-local offsets under DCP,
+        # so the physical sequence-addressed buffers only need one DCP shard.
+        dcp_size = max(int(getattr(self.server_args, "dcp_size", 1)), 1)
+        physical_swa_tokens = swa_max_total_num_tokens // dcp_size
+        physical_c4_tokens = (
+            c4_max_total_num_tokens
+            if self.server_args.enable_hisparse
+            else c4_max_total_num_tokens // dcp_size
+        )
+        physical_c128_tokens = c128_max_total_num_tokens // dcp_size
+
+        # The C4 indexer cache remains replicated in global C4 space.
+        c4_indexer_tokens = c128_max_total_num_tokens * 32
+        return (
+            physical_swa_tokens,
+            physical_c4_tokens,
+            physical_c128_tokens,
+            c4_indexer_tokens,
+        )
 
     def _build_oot_dsa_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
         PoolCls = current_platform.get_dsa_kv_pool_cls()

@@ -13,6 +13,7 @@ from unittest.mock import MagicMock, patch
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -543,6 +544,115 @@ class TestEagleConfigurator(unittest.TestCase):
         total_layers = num_layers + eagle_draft_num_layers
         used = config.max_total_num_tokens * full_pt * total_layers
         self.assertLessEqual(used, available)
+
+
+class TestDSV4DCPConfigurator(CustomTestCase):
+    """DSV4 DCP separates logical capacity from rank-local physical pools."""
+
+    @staticmethod
+    def _make_kvc(dcp_size: int):
+        model_config = SimpleNamespace(
+            qk_nope_head_dim=448,
+            qk_rope_head_dim=64,
+            index_head_dim=128,
+            context_len=131072,
+            compress_ratios=[0, 4, 128, 4],
+            window_size=256,
+        )
+        server_args = SimpleNamespace(
+            swa_full_tokens_ratio=0.1,
+            dcp_size=dcp_size,
+            speculative_algorithm=None,
+            max_speculative_num_draft_tokens=0,
+            max_running_requests=64,
+            disaggregation_mode="decode",
+            disaggregation_decode_extra_slots=0,
+            enable_hisparse=False,
+        )
+        spec_algorithm = MagicMock()
+        spec_algorithm.is_none.return_value = True
+        spec_algorithm.is_eagle.return_value = False
+        return SimpleNamespace(
+            model_config=model_config,
+            layer_info=SimpleNamespace(start_layer=0, end_layer=4),
+            ps=SimpleNamespace(pp_size=1, attn_dp_size=1),
+            pp_group=SimpleNamespace(rank_in_group=0),
+            server_args=server_args,
+            spec_algorithm=spec_algorithm,
+        )
+
+    def _run(self, dcp_size: int, available_bytes: int = 2_000_000_000):
+        with mock_cpu_env():
+            from sglang.srt.model_executor.pool_configurator import (
+                DSV4PoolConfigurator,
+            )
+
+            configurator = DSV4PoolConfigurator(self._make_kvc(dcp_size))
+            config = configurator.calculate_pool_sizes(available_bytes, page_size=256)
+        return configurator, config
+
+    def test_dcp_expands_logical_capacity_with_replicated_costs(self):
+        dcp1, config1 = self._run(1)
+        dcp2, config2 = self._run(2)
+
+        self.assertGreater(
+            config2.full_max_total_num_tokens,
+            config1.full_max_total_num_tokens,
+        )
+        self.assertLess(
+            config2.full_max_total_num_tokens,
+            config1.full_max_total_num_tokens * 2,
+        )
+        self.assertAlmostEqual(
+            dcp2.bytes_per_full_token,
+            dcp2.sharded_bytes_per_full_token / 2
+            + dcp2.replicated_bytes_per_full_token,
+        )
+
+    def test_dcp_logical_capacity_fits_each_rank_memory_budget(self):
+        available_bytes = 2_000_000_000
+        configurator, config = self._run(2, available_bytes)
+        fixed_bytes = configurator._get_c128_state_fixed_bytes(64)
+        per_rank_token_bytes = (
+            config.full_max_total_num_tokens * configurator.bytes_per_full_token
+        )
+
+        self.assertLessEqual(per_rank_token_bytes + fixed_bytes, available_bytes)
+        self.assertEqual(config.full_max_total_num_tokens % 256, 0)
+
+    def test_physical_sequence_pools_use_one_dcp_shard(self):
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+
+        configurator = KVCacheConfigurator.__new__(KVCacheConfigurator)
+        configurator.server_args = SimpleNamespace(
+            dcp_size=2,
+            enable_hisparse=False,
+        )
+
+        sizes = configurator._get_dsv4_physical_pool_sizes(
+            swa_max_total_num_tokens=4096,
+            c4_max_total_num_tokens=2048,
+            c128_max_total_num_tokens=64,
+        )
+
+        self.assertEqual(sizes, (2048, 1024, 32, 2048))
+
+    def test_hisparse_c4_pool_remains_replicated(self):
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+
+        configurator = KVCacheConfigurator.__new__(KVCacheConfigurator)
+        configurator.server_args = SimpleNamespace(
+            dcp_size=2,
+            enable_hisparse=True,
+        )
+
+        sizes = configurator._get_dsv4_physical_pool_sizes(
+            swa_max_total_num_tokens=4096,
+            c4_max_total_num_tokens=2048,
+            c128_max_total_num_tokens=64,
+        )
+
+        self.assertEqual(sizes, (2048, 2048, 32, 2048))
 
 
 class TestFactory(unittest.TestCase):
