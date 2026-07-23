@@ -50,8 +50,7 @@ cu_seqlens is cached into a dict during create_graph(), and its contents are not
 For the same graph_key = S, you not only require the input shape to match, but also require the segmentation pattern in cu_seqlens (and window seqlens) to be identical. Otherwise, attention will segment the sequence incorrectly.
 
 ### Rotary buffer management
-The feature reallocates a larger sin_cos_ws when seq_len increases.
-The max_content_len is used to make sure the maximum size of the allocated rotary buffer.
+`sin_cos_ws` is keyed by `graph_key`, one exact-size `(graph_key, head_dim)` allocation per shape. The buffer for a captured shape is never freed or moved while its graph is live, so replay always reads the storage the graph was captured against.
 
 
 ## Command Example
