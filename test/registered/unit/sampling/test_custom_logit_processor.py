@@ -17,6 +17,7 @@ from sglang.srt.sampling.custom_logit_processor import (
     DeepseekOCRNoRepeatNGramLogitProcessor,
     DeepSeekR1ThinkingBudgetLogitProcessor,
     DisallowedTokensLogitsProcessor,
+    MinerUNoRepeatNGramLogitProcessor,
     Qwen3ThinkingBudgetLogitProcessor,
     _cache_from_str,
 )
@@ -441,6 +442,144 @@ class TestDeepseekOCRNoRepeatNGramLogitProcessor(CustomTestCase):
         # Batch 1: prefix is (5), no matching prefix in window → no bans
         self.assertEqual(result[1, 3].item(), 0.0)
         self.assertEqual(result[1, 4].item(), 0.0)
+
+
+# MinerUNoRepeatNGramLogitProcessor
+class TestMinerUNoRepeatNGramLogitProcessor(CustomTestCase):
+    VOCAB = 100
+
+    def setUp(self):
+        self.processor = MinerUNoRepeatNGramLogitProcessor()
+
+    def _logits(self, batch_size=1):
+        return torch.zeros(batch_size, self.VOCAB)
+
+    def test_bans_repeated_bigram(self):
+        """Token that completes a previously seen bigram is banned."""
+        # output [1,2,3,1,2]: trailing prefix is (2), which was followed by 3.
+        req = _make_req(output_ids=[1, 2, 3, 1, 2])
+        params = [{"__req__": req, "ngram_size": 2}]
+        result = self.processor(self._logits(), params)
+        self.assertTrue(torch.isinf(result[0, 3]) and result[0, 3] < 0)
+
+    def test_non_repeated_token_unchanged(self):
+        """Tokens that do not complete a repeated ngram stay untouched."""
+        req = _make_req(output_ids=[1, 2, 3, 1, 2])
+        params = [{"__req__": req, "ngram_size": 2}]
+        result = self.processor(self._logits(), params)
+        # Prefix (2) was only ever followed by 3, so token 1 is not banned.
+        self.assertEqual(result[0, 1].item(), 0.0)
+
+    def test_bans_repeated_trigram(self):
+        """ngram_size=3 bans the token completing a repeated trigram prefix."""
+        # output [1,2,3,4,1,2,3]: trailing prefix (2,3) was once followed by 4.
+        req = _make_req(output_ids=[1, 2, 3, 4, 1, 2, 3])
+        params = [{"__req__": req, "ngram_size": 3}]
+        result = self.processor(self._logits(), params)
+        self.assertTrue(torch.isinf(result[0, 4]) and result[0, 4] < 0)
+
+    def test_full_history_by_default(self):
+        """With no window_size, a far-back repeat is still blocked (MinerU semantics)."""
+        # The (2,3) bigram is 7 tokens back; trailing prefix is (2).
+        req = _make_req(output_ids=[2, 3, 9, 9, 9, 9, 9, 2])
+        params = [{"__req__": req, "ngram_size": 2}]
+        result = self.processor(self._logits(), params)
+        self.assertTrue(torch.isinf(result[0, 3]) and result[0, 3] < 0)
+
+    def test_window_size_limits_search(self):
+        """window_size bounds the lookback; ngrams outside it are ignored."""
+        # Full history would ban 3 via (2,3); window of 3 covers only [5,1,2].
+        req = _make_req(output_ids=[1, 2, 3, 4, 5, 1, 2])
+        params = [{"__req__": req, "ngram_size": 2, "window_size": 3}]
+        result = self.processor(self._logits(), params)
+        self.assertEqual(result[0, 3].item(), 0.0)
+
+    def test_default_ngram_size_is_100(self):
+        """Omitting ngram_size uses 100; short outputs are left unchanged."""
+        req = _make_req(output_ids=[7] * 50)
+        params = [{"__req__": req}]
+        logits = self._logits()
+        original = logits.clone()
+        result = self.processor(logits, params)
+        self.assertTrue(torch.equal(result, original))
+
+    def test_ngram_size_zero_skips(self):
+        """ngram_size<=0 disables the processor."""
+        req = _make_req(output_ids=[1, 2, 1, 2])
+        params = [{"__req__": req, "ngram_size": 0}]
+        logits = self._logits()
+        original = logits.clone()
+        result = self.processor(logits, params)
+        self.assertTrue(torch.equal(result, original))
+
+    def test_short_sequence_skips(self):
+        """Output shorter than ngram_size is skipped."""
+        req = _make_req(output_ids=[1, 2])
+        params = [{"__req__": req, "ngram_size": 3}]
+        logits = self._logits()
+        original = logits.clone()
+        result = self.processor(logits, params)
+        self.assertTrue(torch.equal(result, original))
+
+    def test_none_req_skips(self):
+        """A batch item without __req__ is skipped."""
+        params = [{"ngram_size": 2}]
+        logits = self._logits()
+        original = logits.clone()
+        result = self.processor(logits, params)
+        self.assertTrue(torch.equal(result, original))
+
+    def test_invalid_ngram_size_type_skips(self):
+        """Non-numeric ngram_size is handled gracefully."""
+        req = _make_req(output_ids=[1, 2, 1, 2])
+        params = [{"__req__": req, "ngram_size": "invalid"}]
+        logits = self._logits()
+        original = logits.clone()
+        result = self.processor(logits, params)
+        self.assertTrue(torch.equal(result, original))
+
+    def test_empty_params_returns_unchanged(self):
+        """None param list returns logits unchanged (early return)."""
+        logits = self._logits()
+        original = logits.clone()
+        result = self.processor(logits, None)
+        self.assertTrue(torch.equal(result, original))
+
+    def test_batch_processing(self):
+        """Batch items are processed independently."""
+        req1 = _make_req(output_ids=[1, 2, 3, 1, 2])  # prefix (2) → ban 3
+        req2 = _make_req(output_ids=[3, 4, 5])  # no repeat
+        params = [
+            {"__req__": req1, "ngram_size": 2},
+            {"__req__": req2, "ngram_size": 2},
+        ]
+        result = self.processor(self._logits(batch_size=2), params)
+        self.assertTrue(torch.isinf(result[0, 3]) and result[0, 3] < 0)
+        self.assertEqual(result[1, 3].item(), 0.0)
+        self.assertEqual(result[1, 4].item(), 0.0)
+
+    def test_unigram_bans_all_seen_tokens(self):
+        """ngram_size=1 bans every token already present in the output."""
+        req = _make_req(output_ids=[5, 10, 15])
+        params = [{"__req__": req, "ngram_size": 1}]
+        result = self.processor(self._logits(), params)
+        for t in (5, 10, 15):
+            self.assertTrue(torch.isinf(result[0, t]) and result[0, t] < 0)
+        self.assertEqual(result[0, 0].item(), 0.0)
+
+    def test_window_size_zero_uses_full_history(self):
+        """window_size<=0 means 'no window' (full history), not 'disable'."""
+        # The (2,3) bigram is far back; with full history token 3 is still banned.
+        req = _make_req(output_ids=[2, 3, 9, 9, 9, 9, 9, 2])
+        params = [{"__req__": req, "ngram_size": 2, "window_size": 0}]
+        result = self.processor(self._logits(), params)
+        self.assertTrue(torch.isinf(result[0, 3]) and result[0, 3] < 0)
+
+    def test_round_trip_serialization(self):
+        """The processor serializes and deserializes like its siblings."""
+        s = MinerUNoRepeatNGramLogitProcessor.to_str()
+        processor = CustomLogitProcessor.from_str(s)
+        self.assertIsInstance(processor, MinerUNoRepeatNGramLogitProcessor)
 
 
 if __name__ == "__main__":
