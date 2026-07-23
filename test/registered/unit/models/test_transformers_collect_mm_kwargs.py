@@ -3,13 +3,6 @@ Unit tests for MultiModalMixin._collect_mm_kwargs' handling of 5D
 pixel_values features in the generic Transformers fallback backend
 (sglang.srt.models.transformers).
 
-Anyres-tiled multimodal models with no native sglang implementation (e.g.
-LLaVA-OneVision via `--model-impl transformers`) produce per-item
-pixel_values shaped (num_images, num_patches, C, H, W). Different items in
-the same batch can have a different num_patches (tile count), so they can't
-be naively flattened-and-concatenated -- each item must be zero-padded to
-the batch-wide max num_patches first. These tests exercise that padding
-logic directly, without needing a real model/checkpoint/GPU.
 """
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -72,7 +65,7 @@ class TestCollectMmKwargs5DPadding(unittest.TestCase):
         self.assertTrue(torch.all(pixel_values[1] == 2.0))
 
     def test_different_patch_counts_padded_to_batch_max(self):
-        """Regression test: items with a different tile count must be
+        """Test: items with a different tile count must be
         zero-padded to the batch-wide max num_patches, not just concatenated
         as-is (which would crash on mismatched shapes or misalign data)."""
         item_small = _make_item("IMAGE", torch.full((1, 3, 3, 4, 4), 1.0))  # 3 patches
