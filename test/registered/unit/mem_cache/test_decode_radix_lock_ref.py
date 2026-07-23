@@ -430,9 +430,7 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         self.assertEqual(preallocated, [])
         self.assertEqual(failed, [])
         queue._pre_alloc.assert_not_called()
-        queue.tree_cache.dec_swa_lock_only.assert_called_once_with(
-            req.last_node, 123
-        )
+        queue.tree_cache.dec_swa_lock_only.assert_called_once_with(req.last_node, 123)
         queue.tree_cache.dec_lock_ref.assert_called_once_with(
             req.last_node,
             DecLockRefParams(swa_uuid_for_lock=123),

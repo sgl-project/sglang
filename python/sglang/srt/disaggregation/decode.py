@@ -387,9 +387,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         required = ((swa_tail_len + page_size - 1) // page_size) * page_size
         available = self.token_to_kv_pool_allocator.swa_available_size()
         if available < required:
-            self.tree_cache.evict(
-                EvictParams(swa_num_tokens=required - available)
-            )
+            self.tree_cache.evict(EvictParams(swa_num_tokens=required - available))
             available = self.token_to_kv_pool_allocator.swa_available_size()
 
         if available < required:
@@ -754,11 +752,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self._pre_alloc(req)
             full_allocatable_tokens -= full_required
             if uses_swa_tail_prealloc:
-                swa_allocatable_tokens = (
-                    self._swa_tail_allocatable_token_budget(
-                        count_retracted=False,
-                        extra_reserved_reqs=len(resumed_reqs),
-                    )
+                swa_allocatable_tokens = self._swa_tail_allocatable_token_budget(
+                    count_retracted=False,
+                    extra_reserved_reqs=len(resumed_reqs),
                 )
 
             # load from cpu, release the cpu copy
@@ -1075,13 +1071,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     hicache_reserved_tokens=reserved_restore_tokens,
                 )
                 if uses_swa_tail_prealloc:
-                    swa_allocatable_tokens = (
-                        self._swa_tail_allocatable_token_budget(
-                            retractable_tokens=retractable_tokens,
-                            retractable_swa_tokens=retractable_swa_tokens,
-                            count_retracted=True,
-                            extra_reserved_reqs=len(preallocated_reqs),
-                        )
+                    swa_allocatable_tokens = self._swa_tail_allocatable_token_budget(
+                        retractable_tokens=retractable_tokens,
+                        retractable_swa_tokens=retractable_swa_tokens,
+                        count_retracted=True,
+                        extra_reserved_reqs=len(preallocated_reqs),
                     )
             else:
                 prefix_indices = None
