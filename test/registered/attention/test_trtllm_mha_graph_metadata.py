@@ -266,10 +266,8 @@ def _make_swa_mapping(pool_token_cap, seed):
 @pytest.mark.parametrize("q_mode", [Q_MODE_NONE, Q_MODE_CUMSUM, Q_MODE_STRIDED])
 @pytest.mark.parametrize("with_swa", [False, True])
 # static_width=True exercises the production path: the backend passes the STATIC
-# max_num_pages (full upper bound), not a per-batch dynamic width. The kernel
-# self-guards on the device-side seqlen: pages past cdiv(cache_seqlen, PAGE_SIZE)
-# keep stale values the attention kernel never reads (it is bounded by
-# cache_seqlens), so the page-table checks compare the live prefix per row.
+# max_num_pages upper bound, not a per-batch dynamic width. The kernel self-guards
+# on the device-side seqlen, so the checks compare only the live prefix per row.
 @pytest.mark.parametrize("static_width", [False, True])
 def test_metadata_correctness(bs, seqlen_offset, q_mode, with_swa, static_width):
     if not torch.cuda.is_available():
