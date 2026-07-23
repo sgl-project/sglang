@@ -264,6 +264,7 @@ class MambaPoolHost(HostKVCache):
         self.free_slots = torch.arange(self.size, dtype=torch.int64)
         self.release_slots = []
         self.num_release_slots = 0
+        self._init_slot_used()
 
     def available_size(self):
         return len(self.free_slots) + self.num_release_slots
@@ -281,6 +282,7 @@ class MambaPoolHost(HostKVCache):
 
         select_index = self.free_slots[:need_size]
         self.free_slots = self.free_slots[need_size:]
+        self._mark_slot_allocated(select_index)
         return select_index
 
     @synchronized
@@ -291,6 +293,7 @@ class MambaPoolHost(HostKVCache):
 
         self.release_slots.append(indices_cpu)
         self.num_release_slots += len(indices_cpu)
+        self._mark_slot_freed(indices_cpu)
         return len(indices)
 
     def get_size_per_token(self):
@@ -883,6 +886,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         self.free_slots = torch.arange(self.size, dtype=torch.int64)
         self.release_slots = []
         self.num_release_slots = 0
+        self._init_slot_used()
 
     def available_size(self):
         return len(self.free_slots) + self.num_release_slots
@@ -900,6 +904,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
 
         select_index = self.free_slots[:need_size]
         self.free_slots = self.free_slots[need_size:]
+        self._mark_slot_allocated(select_index)
         return select_index
 
     @synchronized
@@ -910,6 +915,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
 
         self.release_slots.append(indices_cpu)
         self.num_release_slots += len(indices_cpu)
+        self._mark_slot_freed(indices)
         return len(indices)
 
     def backup_from_device_all_layer(
