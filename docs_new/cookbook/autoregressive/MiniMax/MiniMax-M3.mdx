@@ -35,10 +35,11 @@ Then run the **Python** output of the command panel below in that environment. T
 <Tab title="Docker">
 
 ```bash Command
-docker pull lmsysorg/sglang:latest
+# Pull the M3 image the command panel selects for your platform, e.g.:
+docker pull lmsysorg/sglang:dev-cu13-minimax-m3
 ```
 
-On NVIDIA the command panel below uses `lmsysorg/sglang:latest` (CUDA 13, multi-arch — H200 + all Blackwell). On AMD Instinct it uses the matching ROCm image (MI300X/MI325X → `aigmkt/minimax-m3-sglang-rocm700-mi30x`, MI350X/MI355X → `aigmkt/minimax-m3-sglang-rocm720-mi35x`). For how to launch the image, see [Install → Method 3: Using Docker](../../../docs/get-started/install#method-3-using-docker), substituting the inner `sglang serve ...` with what the command generator produces.
+The command panel below fills in the right tag per platform: `dev-cu13-minimax-m3` (CUDA 13 — B300, GB200, GB300), `dev-cu12-minimax-m3` (CUDA 12 — Hopper H200), or `dev-minimax-m3` (default). On AMD Instinct it uses the matching ROCm image (MI300X/MI325X → `aigmkt/minimax-m3-sglang-rocm700-mi30x`, MI350X/MI355X → `aigmkt/minimax-m3-sglang-rocm720-mi35x`). For how to launch the image, see [Install → Method 3: Using Docker](../../../docs/get-started/install#method-3-using-docker), substituting the inner `sglang serve ...` with what the command generator produces.
 
 <Note>
 These M3 dev images now **bundle MiniMax's MSA sparse-attention kernel** (`fmha_sm100`), so Blackwell users get the recommended fast path automatically — no manual install needed (see **§2.1**). On a custom image without it, the same recipe still serves on the built-in Triton sparse path.
@@ -86,7 +87,7 @@ Key characteristics as served by SGLang:
 
 ### 2.1 MSA sparse-attention fast path (recommended for Blackwell users)
 
-[MiniMax MSA](https://github.com/MiniMax-AI/MSA) (`fmha_sm100`, MIT-licensed) is the recommended Blackwell kernel for M3's main sparse-attention step — faster and more memory-efficient than the built-in Triton fallback. **It ships pre-installed in `lmsysorg/sglang:latest`**, so the Blackwell recipe above engages it automatically with no extra setup — `import fmha_sm100` works out of the box and the kernels JIT-compile on first use. It is otherwise purely additive: on a custom image, install it (below) and the recipe engages it automatically; without it the same recipe still serves on the built-in Triton path. The swap is numerically equivalent (cosine ≥ 0.99999 vs Triton), decode stays CUDA-graph-capturable, prefill TTFT drops ~9–12% at 8K–64K context, and the MSA path survives memory configurations where the Triton path OOMs.
+[MiniMax MSA](https://github.com/MiniMax-AI/MSA) (`fmha_sm100`, MIT-licensed) is the recommended Blackwell kernel for M3's main sparse-attention step — faster and more memory-efficient than the built-in Triton fallback. **It ships pre-installed in the M3 dev image** (`lmsysorg/sglang:dev-minimax-m3`, also published under the `dev-cu13-minimax-m3` tag), so the Blackwell recipe above engages it automatically with no extra setup — `import fmha_sm100` works out of the box and the kernels JIT-compile on first use. It is otherwise purely additive: on a custom image, install it (below) and the recipe engages it automatically; without it the same recipe still serves on the built-in Triton path. The swap is numerically equivalent (cosine ≥ 0.99999 vs Triton), decode stays CUDA-graph-capturable, prefill TTFT drops ~9–12% at 8K–64K context, and the MSA path survives memory configurations where the Triton path OOMs.
 
 **Requirements** (from the [MSA README](https://github.com/MiniMax-AI/MSA#requirements)):
 
