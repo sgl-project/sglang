@@ -1071,7 +1071,7 @@ def causal_conv1d_update(
     if out is None:
         out = torch.empty_like(x)
     else:
-        # Option A (gdn cache_mode=none): callers may pass a persistent `out`
+        # gdn cache_mode=none: callers may pass a persistent `out`
         # buffer so the post-conv output survives until the deferred accepted-
         # state recovery reads it — avoiding the per-step k/v stash copy on the
         # verify critical path. Must match x's shape/dtype/device; the kernel

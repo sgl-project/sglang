@@ -367,7 +367,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         # to the FlashInfer WY output-only kernel (flashinfer PR#3720) — a single
         # launch over all T draft tokens (T x T GEMM + Neumann inverse on tensor
         # cores), faster than the per-token state kernel. Recovery is unaffected
-        # (FI cuda-graph path reading Option A conv-out views on the bf16 state
+        # (FI cuda-graph path reading the persistent conv-out views on the bf16 state
         # pool, or Triton with a flat k/v stash otherwise).
         if self.use_state_pool:
             from sglang.srt.server_args import get_global_server_args

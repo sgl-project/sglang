@@ -844,8 +844,8 @@ class HybridLinearAttnBackend(AttentionBackend):
         self._recovery_stream: Optional[torch.cuda.Stream] = None
         self._recovery_event: Optional[torch.cuda.Event] = None
         self._recovery_event_pending: bool = False
-        # CUDA graph for FlashInfer recovery: replace the ~45 per-layer kernel
-        # launches (~675us of CPU dispatch) with a single replay (~10us). Captured
+        # CUDA graph for FlashInfer recovery: replace the per-layer kernel
+        # launches (their CPU dispatch cost) with a single graph replay. Captured
         # AND replayed on _recovery_stream so it still overlaps draft_extend + next
         # draft. Stable fixed-address buffers hold the per-step state/accepted-step
         # indices; contents are refreshed each step before replay.
@@ -1119,7 +1119,7 @@ class HybridLinearAttnBackend(AttentionBackend):
             )
 
     def _persist_kv(self, layer_id, conv_dims, b_rows, cache_steps):
-        """FlashInfer-recovery (Option A) post-conv (k, v) as zero-copy strided
+        """FlashInfer-recovery post-conv (k, v) as zero-copy strided
         views of the persistent conv-out buffer, shaped [1, b_rows*cache_steps,
         H, D]. The buffer is [pool_size, cache_steps, conv_dim] token-major; k/v
         are the column slices [q_dim:q_dim+k_dim] / [q_dim+k_dim:...] (token
@@ -1136,21 +1136,21 @@ class HybridLinearAttnBackend(AttentionBackend):
         return k, v
 
     def _fi_recovery_launch(self, n, stash_per_layer, pool, gated_delta_rule_mtp):
-        """Issue the ~45 per-layer FlashInfer recovery launches for the first ``n``
+        """Issue the per-layer FlashInfer recovery launches for the first ``n``
         rows, reading the stable index buffers and the [:n] stash slices. Shared
         by warmup graph capture, graph-less eager fallback, and the warm-compile
         pass. The stash is pre-shaped [pool_size, T, H] so [:n] is [n, T, H].
-        FI recovery is bound to Option A: the k/v come from strided views of the
-        persistent conv-out buffer, a/b from the stash."""
+        FI recovery reads k/v from strided views of the persistent conv-out
+        buffer, a/b from the stash."""
         _state_idx = self._rec_state_idx_buf[:n]
         _acc_steps = self._rec_acc_steps_buf[:n]
         _T = self.linear_attn_backend._no_cache_draft_token_num
         for layer_id, stash in stash_per_layer.items():
             layer_ssm_states = pool.mamba2_layer_cache(layer_id).temporal
-            # FI recovery is bound to Option A: the FI path always stashes
-            # conv_dims (never k/v), so k/v come from the persistent conv-out
-            # buffer. Reshape the [1, n*T, H, D] views to the [n, T, H, D] the
-            # kernel expects (q == k: the kernel l2-norms both).
+            # The FI path always stashes conv_dims (never k/v), so k/v come from
+            # the persistent conv-out buffer. Reshape the [1, n*T, H, D] views to
+            # the [n, T, H, D] the kernel expects (q == k: the kernel l2-norms
+            # both).
             conv_dims = stash["conv_dims"]
             k_pv, v_pv = self._persist_kv(layer_id, conv_dims, n, _T)
             q_k = k_pv.view(n, _T, k_pv.shape[2], k_pv.shape[3])
@@ -1366,8 +1366,8 @@ class HybridLinearAttnBackend(AttentionBackend):
 
                 conv_dims = stash.get("conv_dims")
                 if conv_dims is not None:
-                    # Option A: k/v are strided views of the persistent conv-out
-                    # buffer ([1, actual_seq_len, H, D]); no stash copy.
+                    # k/v are strided views of the persistent conv-out buffer
+                    # ([1, actual_seq_len, H, D]); no stash copy.
                     k_recov, v_recov = self._persist_kv(
                         layer_id, conv_dims, batch_size, cache_steps
                     )

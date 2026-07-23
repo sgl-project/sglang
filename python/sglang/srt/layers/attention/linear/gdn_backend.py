@@ -344,7 +344,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         self._no_cache_stash: Dict[int, Dict[str, torch.Tensor]] = {}
         # Cached once on first forward; stable across calls.
         self._no_cache_draft_token_num: Optional[int] = None
-        # FlashInfer-recovery (Option A) per-layer persistent token-major post-conv
+        # FlashInfer-recovery per-layer persistent token-major post-conv
         # buffer [pool_size, draft, conv_dim]. The verify conv writes into it (out=)
         # so recovery reads k/v as strided views — no stash copy. Allocated once
         # per layer (stable address for CUDA graph replay); empty and unused on the
@@ -518,7 +518,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             batch_size = seq_len // forward_batch.spec_info.draft_token_num
             draft_token_num = forward_batch.spec_info.draft_token_num
             # cache_mode=none accepted-state recovery uses the FlashInfer state
-            # kernel (Option A: k/v read as strided views of a persistent conv-out
+            # kernel (k/v read as strided views of a persistent conv-out
             # buffer) when the decode kernel is FlashInfer + bf16 state pool;
             # otherwise the Triton recover kernel with a flat k/v stash. Decided
             # here so the verify conv can write out= for the FI path (and the
@@ -531,7 +531,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             mixed_qkv_reshaped = mixed_qkv.view(
                 batch_size, draft_token_num, -1
             ).transpose(1, 2)
-            # FI recovery (Option A): write the post-conv output straight into a
+            # FI recovery: write the post-conv output straight into a
             # persistent token-major buffer [pool_size, draft, conv_dim] so
             # recovery reads k/v as strided views (no k/v stash copy). The out=
             # arg is pbuf[:bs].transpose(1, 2) — shape [bs, conv_dim, draft] with
@@ -646,7 +646,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
                 stash_entry = self._no_cache_stash.get(layer.layer_id)
                 if _use_fi_recovery:
-                    # FlashInfer recovery (Option A): k/v are strided views of the
+                    # FlashInfer recovery: k/v are strided views of the
                     # persistent conv-out buffer written above via out=, so only
                     # a/b (projection outputs), the gating params, and the slice
                     # geometry are stashed. FlashInfer wants [B, T, H] tensors, so
