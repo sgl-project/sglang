@@ -98,10 +98,7 @@ fn token_handoff_prefill_frame_is_terminal(frame: &[u8]) -> bool {
     let Ok(frame) = std::str::from_utf8(frame) else {
         return false;
     };
-    let Some(data) = frame
-        .lines()
-        .find_map(|line| line.strip_prefix("data: "))
-    else {
+    let Some(data) = frame.lines().find_map(|line| line.strip_prefix("data: ")) else {
         return false;
     };
     if data == "[DONE]" {
@@ -1462,8 +1459,7 @@ impl PDRouter {
                 pending.extend_from_slice(&chunk);
                 while let Some(frame_end) = memmem::find(&pending, b"\n\n") {
                     let frame = pending.split_to(frame_end + 2).freeze();
-                    prefill_finished_request |=
-                        token_handoff_prefill_frame_is_terminal(&frame);
+                    prefill_finished_request |= token_handoff_prefill_frame_is_terminal(&frame);
                     let Some(frame) = token_handoff_prefill_frame_for_client(frame) else {
                         reached_prefill_done = true;
                         break;
@@ -1472,13 +1468,8 @@ impl PDRouter {
                         continue;
                     }
                     if tx.send(Ok(frame)).is_err() {
-                        Self::abort_token_handoff_pair(
-                            &client,
-                            &prefill_url,
-                            &decode_url,
-                            &rid,
-                        )
-                        .await;
+                        Self::abort_token_handoff_pair(&client, &prefill_url, &decode_url, &rid)
+                            .await;
                         decode_task.abort();
                         return;
                     }
@@ -2139,7 +2130,9 @@ mod tests {
 
 "#
         ));
-        assert!(!token_handoff_prefill_frame_is_terminal(b"data: [DONE]\n\n"));
+        assert!(!token_handoff_prefill_frame_is_terminal(
+            b"data: [DONE]\n\n"
+        ));
     }
 
     #[test]
@@ -2172,10 +2165,8 @@ mod tests {
             .is_empty()
         );
         assert!(
-            token_handoff_prefill_frame_for_client(bytes::Bytes::from_static(
-                b"data: [DONE]\n\n"
-            ))
-            .is_none()
+            token_handoff_prefill_frame_for_client(bytes::Bytes::from_static(b"data: [DONE]\n\n"))
+                .is_none()
         );
     }
 
