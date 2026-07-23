@@ -125,9 +125,10 @@ impl Drop for RequestAbortGuard {
 fn spawn_abort(bridge: Arc<PyBridge>, rid: String) {
     match tokio::runtime::Handle::try_current() {
         Ok(handle) => {
-            let _ = handle.spawn_blocking(move || {
+            // Fire-and-forget: dropping the JoinHandle detaches the task.
+            drop(handle.spawn_blocking(move || {
                 let _ = bridge.abort(&rid, false);
-            });
+            }));
         }
         Err(_) => {
             tracing::warn!(

@@ -3,8 +3,8 @@
 //! Each model implements `ImageProcessorSpec` and registers itself. The Python
 //! layer looks up a processor by model name at init time.
 
-use pyo3::exceptions::PyValueError;
-use pyo3::prelude::*;
+/// `(height, width, patches_as_u16_bits, content_hash)` for one image.
+pub type PreprocessedImage = (usize, usize, Vec<u16>, u64);
 
 /// Trait that each model's image processor must implement.
 pub trait ImageProcessorSpec: Send + Sync {
@@ -12,20 +12,24 @@ pub trait ImageProcessorSpec: Send + Sync {
     fn name(&self) -> &'static str;
 
     /// Process a batch of raw image bytes: decode + preprocess + hash.
-    ///
-    /// Returns `(height, width, patches_as_u16_bits, content_hash)` per image.
     fn preprocess_batch(
         &self,
         datas: &[Vec<u8>],
         patch_size: usize,
         rescale_frac: Option<f64>,
         rescale_cap: Option<i64>,
-    ) -> Result<Vec<(usize, usize, Vec<u16>, u64)>, String>;
+    ) -> Result<Vec<PreprocessedImage>, String>;
 }
 
 /// Global registry of available processors.
 pub struct ProcessorRegistry {
     specs: Vec<Box<dyn ImageProcessorSpec>>,
+}
+
+impl Default for ProcessorRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ProcessorRegistry {

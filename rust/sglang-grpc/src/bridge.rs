@@ -66,7 +66,10 @@ impl TerminalError {
     }
 }
 
-#[pyclass(eq, eq_int)]
+// skip_from_py_object: this enum is only returned to Python, never received
+// from it, so it opts out of pyo3's (deprecated-by-default) FromPyObject
+// derive for Clone pyclasses.
+#[pyclass(eq, eq_int, skip_from_py_object)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChunkSendStatus {
     Ready,

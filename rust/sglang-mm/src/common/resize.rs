@@ -46,14 +46,14 @@ fn precompute_coeffs(in_size: usize, out_size: usize) -> Coeffs {
         let count = (xmax - xmin) as usize;
         let k = &mut kkf[xx * ksize..(xx + 1) * ksize];
         let mut ww = 0.0f64;
-        for x in 0..count {
+        for (x, kv) in k[..count].iter_mut().enumerate() {
             let w = lanczos((x as f64 + xmin as f64 - center + 0.5) * ss);
-            k[x] = w;
+            *kv = w;
             ww += w;
         }
         if ww != 0.0 {
-            for x in 0..count {
-                k[x] /= ww;
+            for kv in k[..count].iter_mut() {
+                *kv /= ww;
             }
         }
         bounds[xx] = (xmin as usize, count);

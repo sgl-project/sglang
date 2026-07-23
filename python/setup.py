@@ -23,10 +23,12 @@ Two filters can narrow the discovered set:
   sglang.srt.environ, which is not importable until the package is built.
 """
 
+import json
 import os
+import re
+import subprocess
 from pathlib import Path
 
-import tomli
 from setuptools import setup
 
 try:
@@ -43,9 +45,40 @@ _PYTHON_DIR = Path(__file__).resolve().parent
 _RUST_WORKSPACE_DIR = _PYTHON_DIR.parent / "rust"
 
 
-def _load_toml(path):
-    with open(path, "rb") as f:
-        return tomli.load(f)
+def _cargo_workspace_metadata():
+    """The rust/ cargo workspace as JSON, straight from cargo's own parser."""
+    manifest_path = _RUST_WORKSPACE_DIR / "Cargo.toml"
+    if not manifest_path.is_file():
+        raise RuntimeError(
+            f"no cargo workspace at {manifest_path} (building outside a repo "
+            f"checkout?); set {_BUILD_RUST_EXTS_ENV}=none to build without "
+            "Rust extensions"
+        )
+    try:
+        out = subprocess.run(
+            [
+                "cargo",
+                "metadata",
+                "--format-version",
+                "1",
+                "--no-deps",
+                "--manifest-path",
+                str(manifest_path),
+            ],
+            capture_output=True,
+            check=True,
+            text=True,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            "cargo is required to discover the Rust extension modules in "
+            f"{_RUST_WORKSPACE_DIR} (and to build them); install a Rust "
+            f"toolchain, or set {_BUILD_RUST_EXTS_ENV}=none to build without "
+            "Rust extensions"
+        ) from exc
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(f"cargo metadata failed:\n{exc.stderr}") from exc
+    return json.loads(out.stdout)
 
 
 def _match_by_substring(declared, tokens, source):
@@ -70,38 +103,41 @@ def _match_by_substring(declared, tokens, source):
 def _discovered_rust_extensions():
     """One RustExtension per workspace crate declaring a python-module."""
     extensions = []
-    for manifest_path in sorted(_RUST_WORKSPACE_DIR.glob("*/Cargo.toml")):
-        package = _load_toml(manifest_path).get("package")
-        if package is None:
-            continue
-        sglang_meta = package.get("metadata", {}).get("sglang", {})
+    for package in sorted(
+        _cargo_workspace_metadata()["packages"], key=lambda p: p["name"]
+    ):
+        sglang_meta = (package["metadata"] or {}).get("sglang", {})
         if "python-module" not in sglang_meta:
             continue
         extensions.append(
             RustExtension(
                 target=sglang_meta["python-module"],
-                path=str(manifest_path),
+                path=package["manifest_path"],
                 binding=Binding.PyO3,
                 debug=sglang_meta.get("debug"),
             )
         )
     if not extensions:
         raise RuntimeError(
-            f"no Rust extension crates found under {_RUST_WORKSPACE_DIR} "
-            "(building outside a repo checkout?); set "
-            f"{_BUILD_RUST_EXTS_ENV}=none to build without them"
+            f"no crate under {_RUST_WORKSPACE_DIR} declares "
+            "[package.metadata.sglang] python-module; set "
+            f"{_BUILD_RUST_EXTS_ENV}=none to build without Rust extensions"
         )
     return extensions
 
 
+# Deliberately not a TOML parser (keeps setup.py stdlib-only): the allowlist
+# must be written as a single line, e.g. rust-extensions = ["multimodal"].
+_ALLOWLIST_RE = re.compile(r"^rust-extensions\s*=\s*\[([^\]]*)\]", re.MULTILINE)
+
+
 def _pyproject_rust_extensions(declared):
     """Apply the active pyproject's [tool.sglang] rust-extensions allowlist."""
-    sglang_tool = (
-        _load_toml(_PYTHON_DIR / "pyproject.toml").get("tool", {}).get("sglang", {})
-    )
-    tokens = sglang_tool.get("rust-extensions")
-    if tokens is None:
+    pyproject_text = (_PYTHON_DIR / "pyproject.toml").read_text(encoding="utf-8")
+    match = _ALLOWLIST_RE.search(pyproject_text)
+    if match is None:
         return declared
+    tokens = re.findall(r'"([^"]*)"', match.group(1))
     return _match_by_substring(
         declared=declared,
         tokens=[token.lower() for token in tokens],

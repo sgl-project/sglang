@@ -8,6 +8,15 @@ use rayon::prelude::*;
 
 use crate::common;
 
+/// `(height, width, patches_as_u16_bits)` for one decoded image.
+type Patches = (usize, usize, Vec<u16>);
+/// [`Patches`] plus the image content hash.
+type HashedPatches = (usize, usize, Vec<u16>, u64);
+/// [`Patches`] with the patch data as a numpy array bound to `'py`.
+type PyPatches<'py> = (usize, usize, Bound<'py, PyArray1<u16>>);
+/// [`PyPatches`] plus the image content hash.
+type PyHashedPatches<'py> = (usize, usize, Bound<'py, PyArray1<u16>>, u64);
+
 const MEAN: [f32; 3] = [
     0.48145466f64 as f32,
     0.4578275f64 as f32,
@@ -40,7 +49,7 @@ fn luts() -> &'static [[u16; 256]; 3] {
 
 #[inline]
 pub fn grid(h: usize, w: usize, ps: usize) -> (usize, usize) {
-    ((h + ps - 1) / ps, w / ps + 1)
+    (h.div_ceil(ps), w / ps + 1)
 }
 
 fn patchify_into(arr: &[u8], h: usize, w: usize, ps: usize, out: &mut [u16]) {
@@ -153,9 +162,9 @@ fn decode_patchify_batch<'py>(
     patch_size: usize,
     rescale_frac: Option<f64>,
     rescale_cap: Option<i64>,
-) -> PyResult<Vec<(usize, usize, Bound<'py, PyArray1<u16>>)>> {
+) -> PyResult<Vec<PyPatches<'py>>> {
     check_ps(patch_size)?;
-    let results: Vec<Result<(usize, usize, Vec<u16>), String>> = py.detach(move || {
+    let results: Vec<Result<Patches, String>> = py.detach(move || {
         common::pool().install(|| {
             datas
                 .par_iter()
@@ -183,9 +192,9 @@ fn preprocess_images<'py>(
     patch_size: usize,
     rescale_frac: Option<f64>,
     rescale_cap: Option<i64>,
-) -> PyResult<Vec<(usize, usize, Bound<'py, PyArray1<u16>>, u64)>> {
+) -> PyResult<Vec<PyHashedPatches<'py>>> {
     check_ps(patch_size)?;
-    let results: Vec<Result<(usize, usize, Vec<u16>, u64), String>> = py.detach(move || {
+    let results: Vec<Result<HashedPatches, String>> = py.detach(move || {
         common::pool().install(|| {
             datas
                 .par_iter()

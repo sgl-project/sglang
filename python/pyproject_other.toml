@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61.0", "setuptools-rust>=1.10", "setuptools-scm>=8.0", "wheel", "tomli>=1.1.0"]
+requires = ["setuptools>=61.0", "setuptools-rust>=1.10", "setuptools-scm>=8.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -196,6 +196,8 @@ sglang = "sglang.cli.main:main"
 # workspace in ../rust; this allowlist restricts which of them this platform
 # builds (case-insensitive substrings of the target module). grpc is
 # intentionally omitted here (it needs proto/tonic); ROCm only builds mm.
+# NOTE: setup.py reads this with a line regex, not a TOML parser — keep the
+# assignment on a single line.
 [tool.sglang]
 rust-extensions = ["multimodal"]
 
