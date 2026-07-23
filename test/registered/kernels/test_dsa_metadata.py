@@ -102,8 +102,10 @@ class TestDSAMetadataKernels(CustomTestCase):
         expected_page_table = req_to_token[req_pool_indices, :max_len].contiguous()
         expected_dsa = _dsa_seqlens(expected_cache, dsa_index_topk)
 
-        # Only the live prefix [:seq_len] per request is defined; the kernel
-        # leaves columns past the kv length untouched.
+        # Compare only the live prefix [:seq_len]: whole blocks starting past
+        # the kv length are skipped (keep stale values), while the last
+        # partially live block still writes lanes past it -- the tail is
+        # unspecified either way, and consumers never read past cache_seqlens.
         cols = torch.arange(max_len, dtype=torch.int32, device=self.device)
         live_mask = cols.view(1, -1) < expected_cache.view(-1, 1)
 
@@ -209,8 +211,10 @@ class TestDSAMetadataKernels(CustomTestCase):
         expected_expanded = expected_expanded.reshape(-1).contiguous()
         expected_dsa = _dsa_seqlens(expected_expanded, dsa_index_topk)
 
-        # Only the live prefix [:seq_len + next_n] per expanded row is defined;
-        # the kernel leaves columns past the request's kv length untouched.
+        # Compare only the live prefix [:seq_len + next_n] per expanded row:
+        # whole blocks starting past the kv length are skipped, the last
+        # partially live block may still write past it -- the tail is
+        # unspecified, and consumers never read past cache_seqlens.
         row_kv_lens = torch.repeat_interleave(expected_cache, next_n)
         cols = torch.arange(max_seqlen_k, dtype=torch.int32, device=self.device)
         live_mask = cols.view(1, -1) < row_kv_lens.view(-1, 1)
@@ -335,9 +339,10 @@ class TestDSAMetadataKernels(CustomTestCase):
         )
         expected_dsa = _dsa_seqlens(expected_expanded, dsa_index_topk)
 
-        # Only the live prefix [:kv_len] per request is defined; the kernel
-        # leaves columns past kv_len untouched. All expanded rows of a request
-        # share its kv length.
+        # Compare only the live prefix [:kv_len]: whole blocks starting past
+        # kv_len are skipped, the last partially live block may still write
+        # past it -- the tail is unspecified, and consumers never read past
+        # cache_seqlens. All expanded rows of a request share its kv length.
         row_kv_lens = torch.repeat_interleave(seq_lens.to(torch.int32), extend_seq_lens)
         cols = torch.arange(max_seqlen_k, dtype=torch.int32, device=self.device)
         live_mask = cols.view(1, -1) < row_kv_lens.view(-1, 1)
