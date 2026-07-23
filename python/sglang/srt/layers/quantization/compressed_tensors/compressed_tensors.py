@@ -368,7 +368,12 @@ class CompressedTensorsConfig(QuantizationConfig):
         )
 
     def _is_wint4afp8(self, weight_quant: BaseModel, input_quant: BaseModel) -> bool:
-        """Detect W4AFP8: packed INT4 weights + 8-bit dynamic per-token activations."""
+        """Detect W4AFP8: packed INT4 weights + 8-bit activations (dynamic or static).
+
+        Supports both dynamic per-token and static per-tensor activation quantization.
+        For static W4A8, the CUTLASS kernel will use dynamic quantization as fallback
+        when pre-computed activation scales are not available.
+        """
         if weight_quant is None or input_quant is None:
             return False
         return (
@@ -379,7 +384,6 @@ class CompressedTensorsConfig(QuantizationConfig):
             and not weight_quant.dynamic
             and input_quant.num_bits == 8
             and input_quant.type in [QuantizationType.FLOAT, QuantizationType.INT]
-            and input_quant.dynamic  # currently not support static input scales
         )
 
     def _is_wint4abf16(self, weight_quant: BaseModel, input_quant: BaseModel) -> bool:
