@@ -229,21 +229,52 @@ You can use the built-in SGLang diffusion benchmark script to evaluate Wan2.1 pe
     **Server Command**:
 
     ```bash Command
-    sglang serve --model-path Wan-AI/Wan2.1-T2V-14B-Diffusers --device npu --dit-layerwise-offload false ЗАГЛУШКА
+    ASCEND_RT_VISIBLE_DEVICES=8,9,10,11 sglang serve \
+      --model-path /models/Wan-AI/Wan2.1-T2V-14B-Diffusers/ \
+      --tp-size 2 \
+      --sp-degree 2 \
+      --num-gpus 4 \
+      --port 20006 \
+      --attention-backend laser_attn
     ```
 
     **Benchmark Command**:
 
     ```bash Command
     python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
-        --backend sglang-video --dataset vbench --task text-to-video --num-prompts 1 --max-concurrency 1 --device npu ЗАГЛУШКА
+      --port 20006 \
+      --dataset vbench \
+      --task text-to-video \
+      --num-prompts 1 \
+      --max-concurrency 1
     ```
 
     **Result**:
 
     ```text Output
     ================= Serving Benchmark Result =================
-    ЗАГЛУШКА (Здесь будут результаты бенчмарка)
+    Task:                                         text-to-video
+    Model:                                        /models/Wan-AI/Wan2.1-T2V-14B-Diffusers/
+    Dataset:                                      vbench
+    --------------------------------------------------
+    Benchmark duration (s):                       1282.90
+    Request rate:                                 inf
+    Max request concurrency:                      1
+    Successful requests:                          1/1
+    Completed outputs:                            1
+    Outputs per prompt:                           1
+    --------------------------------------------------
+    Request throughput (req/s):                   0.00
+    Output throughput (outputs/s):                0.00
+    Latency Mean (s):                             1282.90
+    Latency Median (s):                           1282.90
+    Latency P90 (s):                              1282.90
+    Latency P95 (s):                              1282.90
+    Latency P99 (s):                              1282.90
+    --------------------------------------------------
+    Peak Memory Max (MB):                         31938.00
+    Peak Memory Mean (MB):                        31938.00
+    Peak Memory Median (MB):                      31938.00
     ============================================================
     ```
   </Tab>
@@ -298,26 +329,66 @@ You can use the built-in SGLang diffusion benchmark script to evaluate Wan2.1 pe
     ============================================================
     ```
   </Tab>
-  
+
   <Tab title="Ascend A3">
     **Server Command**:
 
     ```bash Command
-    sglang serve --model-path Wan-AI/Wan2.1-T2V-14B-Diffusers ЗАГЛУШКА
+    SGLANG_CACHE_DIT_FN=2 \
+    SGLANG_CACHE_DIT_BN=1 \
+    SGLANG_CACHE_DIT_WARMUP=4 \
+    SGLANG_CACHE_DIT_RDT=0.4 \
+    SGLANG_CACHE_DIT_MC=4 \
+    SGLANG_CACHE_DIT_TAYLORSEER=true \
+    SGLANG_CACHE_DIT_TS_ORDER=2 \
+    SGLANG_CACHE_DIT_ENABLED=true \
+    ASCEND_RT_VISIBLE_DEVICES=8,9,10,11 sglang serve \
+      --model-path /models/Wan-AI/Wan2.1-T2V-14B-Diffusers/ \
+      --tp-size 2 \
+      --sp-degree 2 \
+      --num-gpus 4 \
+      --port 20006 \
+      --attention-backend laser_attn
     ```
 
     **Benchmark Command**:
 
     ```bash Command
     python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
-        --backend sglang-video --dataset vbench --task text-to-video --num-prompts 1 --max-concurrency 1 ЗАГЛУШКА
+      --port 20006 \
+      --dataset vbench \
+      --task text-to-video \
+      --num-prompts 1 \
+      --max-concurrency 1
     ```
 
     **Result**:
 
     ```text Output
-    ЗАГЛУШКА (Здесь будут результаты бенчмарка для A3)
+    ================= Serving Benchmark Result =================
+    Task:                                         text-to-video
+    Model:                                        /models/Wan-AI/Wan2.1-T2V-14B-Diffusers/
+    Dataset:                                      vbench
+    --------------------------------------------------
+    Benchmark duration (s):                       413.88
+    Request rate:                                 inf
+    Max request concurrency:                      1
+    Successful requests:                          1/1
+    Completed outputs:                            1
+    Outputs per prompt:                           1
+    --------------------------------------------------
+    Request throughput (req/s):                   0.00
+    Output throughput (outputs/s):                0.00
+    Latency Mean (s):                             413.88
+    Latency Median (s):                           413.88
+    Latency P90 (s):                              413.88
+    Latency P95 (s):                              413.88
+    Latency P99 (s):                              413.88
+    --------------------------------------------------
+    Peak Memory Max (MB):                         32782.00
+    Peak Memory Mean (MB):                        32782.00
+    Peak Memory Median (MB):                      32782.00
+    ============================================================
     ```
   </Tab>
 </Tabs>
-

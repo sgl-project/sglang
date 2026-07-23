@@ -298,21 +298,58 @@ Test Environment:
   <Tab title="Ascend A3">
     **Server Command**:
     ```shell Command
-    sglang serve --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers --device npu --dit-layerwise-offload false
+    SGLANG_CACHE_DIT_FN=2 \
+    SGLANG_CACHE_DIT_BN=1 \
+    SGLANG_CACHE_DIT_WARMUP=4 \
+    SGLANG_CACHE_DIT_RDT=0.4 \
+    SGLANG_CACHE_DIT_MC=4 \
+    SGLANG_CACHE_DIT_TAYLORSEER=true \
+    SGLANG_CACHE_DIT_TS_ORDER=2 \
+    SGLANG_CACHE_DIT_ENABLED=true \
+    ASCEND_RT_VISIBLE_DEVICES=8,9,10,11,12,13,14,15 sglang serve \
+      --model-path /models/Wan-AI/Wan2.2-T2V-A14B-Diffusers/ \
+      --tp-size 2 \
+      --sp-degree 4 \
+      --num-gpus 8 \
+      --port 30006 \
+      --attention-backend laser_attn
     ```
 
     **Benchmark Command**:
     ```shell Command
     python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
-        --backend sglang-video --dataset vbench --task t2v --num-prompts 1 --max-concurrency 1 --device npu
+      --port 30006 \
+      --dataset vbench \
+      --task text-to-video \
+      --num-prompts 1 \
+      --max-concurrency 1
     ```
 
     **Result**:
     ```text Output
     ================= Serving Benchmark Result =================
-    Backend:                                 sglang-video
-    Model:                                   Wan-AI/Wan2.2-T2V-A14B-Diffusers
-    ЗАГЛУШКА: Ascend A3 benchmark results are not available yet.
+    Task:                                         text-to-video
+    Model:                                        /models/Wan-AI/Wan2.2-T2V-A14B-Diffusers/
+    Dataset:                                      vbench
+    --------------------------------------------------
+    Benchmark duration (s):                       214.50
+    Request rate:                                 inf
+    Max request concurrency:                      1
+    Successful requests:                          1/1
+    Completed outputs:                            1
+    Outputs per prompt:                           1
+    --------------------------------------------------
+    Request throughput (req/s):                   0.00
+    Output throughput (outputs/s):                0.00
+    Latency Mean (s):                             214.50
+    Latency Median (s):                           214.50
+    Latency P90 (s):                              214.50
+    Latency P95 (s):                              214.50
+    Latency P99 (s):                              214.50
+    --------------------------------------------------
+    Peak Memory Max (MB):                         46692.00
+    Peak Memory Mean (MB):                        46692.00
+    Peak Memory Median (MB):                      46692.00
     ============================================================
     ```
   </Tab>
@@ -369,25 +406,66 @@ Test Environment:
     ============================================================
     ```
   </Tab>
-  
+
   <Tab title="Ascend A3">
     **Server Command**:
 
     ```shell Command
-    sglang serve --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers ЗАГЛУШКА
+    SGLANG_CACHE_DIT_FN=2 \
+    SGLANG_CACHE_DIT_BN=1 \
+    SGLANG_CACHE_DIT_WARMUP=4 \
+    SGLANG_CACHE_DIT_RDT=0.4 \
+    SGLANG_CACHE_DIT_MC=4 \
+    SGLANG_CACHE_DIT_TAYLORSEER=true \
+    SGLANG_CACHE_DIT_TS_ORDER=2 \
+    SGLANG_CACHE_DIT_ENABLED=true \
+    ASCEND_RT_VISIBLE_DEVICES=8,9,10,11,12,13,14,15 sglang serve \
+      --model-path /models/Wan-AI/Wan2.2-T2V-A14B-Diffusers/ \
+      --tp-size 2 \
+      --sp-degree 4 \
+      --num-gpus 8 \
+      --port 30006 \
+      --attention-backend laser_attn
     ```
 
     **Benchmark Command**:
 
     ```shell Command
     python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
-        --backend sglang-video --dataset vbench --task t2v --num-prompts 20 --max-concurrency 20 ЗАГЛУШКА
+      --port 30006 \
+      --dataset vbench \
+      --task text-to-video \
+      --num-prompts 20 \
+      --max-concurrency 20
     ```
 
     **Result**:
 
     ```text Output
-    ЗАГЛУШКА: Ascend A3 benchmark results are not available yet.
+    ================= Serving Benchmark Result =================
+    Task:                                         text-to-video
+    Model:                                        /models/Wan-AI/Wan2.2-T2V-A14B-Diffusers/
+    Dataset:                                      vbench
+    --------------------------------------------------
+    Benchmark duration (s):                       4384.65
+    Request rate:                                 inf
+    Max request concurrency:                      20
+    Successful requests:                          20/20
+    Completed outputs:                            20
+    Outputs per prompt:                           1
+    --------------------------------------------------
+    Request throughput (req/s):                   0.00
+    Output throughput (outputs/s):                0.00
+    Latency Mean (s):                             2304.17
+    Latency Median (s):                           2297.69
+    Latency P90 (s):                              3972.32
+    Latency P95 (s):                              4178.99
+    Latency P99 (s):                              4343.52
+    --------------------------------------------------
+    Peak Memory Max (MB):                         46692.00
+    Peak Memory Mean (MB):                        46691.90
+    Peak Memory Median (MB):                      46692.00
+    ============================================================
     ```
   </Tab>
 </Tabs>

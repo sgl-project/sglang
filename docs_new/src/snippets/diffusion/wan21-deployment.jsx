@@ -66,10 +66,10 @@ export const Wan21Deployment = () => {
     },
     bestPractice: {
       name: 'bestPractice',
-      title: 'Sequence Parallelism',
+      title: 'Optimization',
       items: [
         { id: 'off', label: 'Standard', default: true },
-        { id: 'on', label: 'Best Practice (4 GPUs)', default: false },
+        { id: 'on', label: 'Best Practice', default: false },
       ],
     },
   };
@@ -118,14 +118,14 @@ export const Wan21Deployment = () => {
 
   useEffect(() => {
     const isAscend = values.hardware === 'ascend2' || values.hardware === 'ascend3';
-    
+
     const targetTabName = isAscend ? 'Ascend A3' : 'NVIDIA B200';
 
     const allTabs = document.querySelectorAll('button, [role="tab"]');
-    
+
     allTabs.forEach((tab) => {
       const text = tab.textContent.trim();
-      
+
       if (text === targetTabName && tab.getAttribute('aria-selected') !== 'true') {
         tab.click();
       }
@@ -181,6 +181,20 @@ export const Wan21Deployment = () => {
     }
 
     if (hardware === 'ascend2' || hardware === 'ascend3') {
+      if (task === 't2v' && modelsize === '14b') {
+        const hardConfig = bestPractice === 'on'
+          ? `SGLANG_CACHE_DIT_FN=2 SGLANG_CACHE_DIT_BN=1 SGLANG_CACHE_DIT_WARMUP=4 SGLANG_CACHE_DIT_RDT=0.4 SGLANG_CACHE_DIT_MC=4 SGLANG_CACHE_DIT_TAYLORSEER=true SGLANG_CACHE_DIT_TS_ORDER=2 SGLANG_CACHE_DIT_ENABLED=true `
+          : '';
+
+        return `${hardConfig}ASCEND_RT_VISIBLE_DEVICES=8,9,10,11 sglang serve \\
+  --model-path /models/Wan-AI/Wan2.1-T2V-14B-Diffusers/ \\
+  --tp-size 2 \\
+  --sp-degree 2 \\
+  --num-gpus 4 \\
+  --port 20006 \\
+  --attention-backend laser_attn`;
+      }
+
       if (task === 't2v' && modelsize === '1_3b') {
         return `sglang serve \\
   --model-path /models/Wan-AI/Wan2.1-T2V-1.3B-Diffusers/ \\
