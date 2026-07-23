@@ -274,6 +274,13 @@ class SchedulePolicy:
             match_result = match_prefix_for_req(
                 self.tree_cache, r, prefix_ids, include_req=True
             )
+            # Waiting requests can gain a longer shared prefix while another
+            # request is in flight. Keep the protected boundary aligned with the
+            # rematched prefix so later cache release does not free shared KV.
+            if match_result.cache_protected_len is not None:
+                r.cache_protected_len = match_result.cache_protected_len
+            else:
+                r.cache_protected_len = len(r.prefix_indices)
 
             # NOTE(sang): This logic is for in-batch prefix caching;
             # If there are more than 1 request that have small matching prefix from
