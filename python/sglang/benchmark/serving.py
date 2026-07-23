@@ -1386,11 +1386,27 @@ async def benchmark(
         lora_name = None
 
     # Create the test input once
+    # For prefix-cache datasets, warmup with only the shared system_prompt
+    # portion so formal requests hit ~90% prefix cache rather than 100%.
+    warmup_prompt = test_request.prompt
+    warmup_prompt_len = test_request.prompt_len
+    print(f"{test_request.system_prompt=}")
+    if (
+        hasattr(test_request, "system_prompt")
+        and test_request.system_prompt is not None
+    ):
+        warmup_prompt = test_request.system_prompt
+        warmup_prompt_len = len(tokenizer.encode(warmup_prompt))
+        print(
+            f"Warmup with system_prompt only: {warmup_prompt_len} tokens "
+            f"(full prompt: {test_request.prompt_len} tokens)"
+        )
+
     test_input = RequestFuncInput(
         model=model_id,
-        prompt=test_request.prompt,
+        prompt=warmup_prompt,
         api_url=api_url,
-        prompt_len=test_request.prompt_len,
+        prompt_len=warmup_prompt_len,
         output_len=min(test_request.output_len, 32),
         lora_name=lora_name,
         image_data=test_request.image_data,
