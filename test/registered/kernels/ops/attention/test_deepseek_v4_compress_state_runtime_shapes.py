@@ -94,11 +94,11 @@ from sglang.kernels.ops.attention.dsv4 import (
     CompressorPrefillPlan,
     compress_forward,
 )
-from sglang.kernels.testing.deepseek_v4.common import (
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.kernels.deepseek_v4.common import (
     make_legacy_context,
     to_seq_extend,
 )
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.utils import is_in_ci
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")

@@ -14,7 +14,7 @@ import torch
 from sglang.kernels.ops.kv_canary import consts
 from sglang.kernels.ops.kv_canary.verify import CanaryLaunchTag, VerifyPlan
 from sglang.kernels.ops.kv_canary.write import WritePlan
-from sglang.kernels.testing.kv_canary._canary_helpers import FakeViolationLog
+from sglang.test.kernels.kv_canary._canary_helpers import FakeViolationLog
 
 
 class PlanInvariants:

@@ -24,7 +24,8 @@ from sglang.kernels.ops.kv_canary.verify_ref import (
 from sglang.kernels.ops.kv_canary.write_ref import (
     launch_canary_write_kernel_torch_reference,
 )
-from sglang.kernels.testing.kv_canary._canary_helpers import (
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.kernels.kv_canary._canary_helpers import (
     FakeViolationLog,
     assert_only_bits_set,
     chain_anchor_signed,
@@ -42,16 +43,15 @@ from sglang.kernels.testing.kv_canary._canary_helpers import (
     to_signed_int64,
     write_slot_fields,
 )
-from sglang.kernels.testing.kv_canary._differential import (
+from sglang.test.kernels.kv_canary._differential import (
     _run_both_verify,
     run_verify_diff,
 )
-from sglang.kernels.testing.kv_canary._fixtures import clone_real_kv_sources
-from sglang.kernels.testing.kv_canary._hand_oracle import (
+from sglang.test.kernels.kv_canary._fixtures import clone_real_kv_sources
+from sglang.test.kernels.kv_canary._hand_oracle import (
     _hand_fold_all,
     _hand_fold_partial,
 )
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_amd_ci(est_time=30, stage="jit-kernel-unit", runner_config="amd")

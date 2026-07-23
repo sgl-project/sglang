@@ -24,7 +24,7 @@ from sglang.kernels.ops.kv_canary.write import WritePlan, launch_canary_write_ke
 from sglang.kernels.ops.kv_canary.write_ref import (
     launch_canary_write_kernel_torch_reference,
 )
-from sglang.kernels.testing.kv_canary._canary_helpers import (
+from sglang.test.kernels.kv_canary._canary_helpers import (
     FakeViolationLog,
     assert_canary_buf_equal,
     assert_canary_state_equal,

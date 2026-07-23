@@ -12,24 +12,24 @@ from sglang.kernels.ops.kv_canary.verify import (
     RealKvSource,
     VerifyPlan,
 )
-from sglang.kernels.testing.kv_canary._canary_helpers import (
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.kernels.kv_canary._canary_helpers import (
     FakeViolationLog,
     make_canary_buf,
     make_log_pair,
     make_verify_plan_pair,
     stamp_clean_chain,
 )
-from sglang.kernels.testing.kv_canary._differential import _run_both_verify
-from sglang.kernels.testing.kv_canary._fixtures import (
+from sglang.test.kernels.kv_canary._differential import _run_both_verify
+from sglang.test.kernels.kv_canary._fixtures import (
     clone_real_kv_sources,
     make_real_kv_sources,
 )
-from sglang.kernels.testing.kv_canary._fuzz_driver import (
+from sglang.test.kernels.kv_canary._fuzz_driver import (
     FUZZ_SEEDS_PR,
     run_fuzz_combo,
 )
-from sglang.kernels.testing.kv_canary._invariants import VerifyInvariants
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.kernels.kv_canary._invariants import VerifyInvariants
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_amd_ci(est_time=30, stage="jit-kernel-unit", runner_config="amd")

@@ -24,7 +24,8 @@ from sglang.kernels.ops.kv_canary.write import WritePlan, launch_canary_write_ke
 from sglang.kernels.ops.kv_canary.write_ref import (
     launch_canary_write_kernel_torch_reference,
 )
-from sglang.kernels.testing.kv_canary._canary_helpers import (
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.kernels.kv_canary._canary_helpers import (
     FakeViolationLog,
     assert_canary_buf_equal,
     assert_canary_state_equal,
@@ -33,12 +34,11 @@ from sglang.kernels.testing.kv_canary._canary_helpers import (
     stamp_clean_chain,
     write_slot_fields,
 )
-from sglang.kernels.testing.kv_canary._fixtures import (
+from sglang.test.kernels.kv_canary._fixtures import (
     clone_real_kv_sources,
     empty_extras,
     make_req_to_token,
 )
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_amd_ci(est_time=30, stage="jit-kernel-unit", runner_config="amd")

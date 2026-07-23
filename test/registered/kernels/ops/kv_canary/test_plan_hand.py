@@ -11,16 +11,16 @@ from sglang.kernels.ops.kv_canary.plan_ref import (
 )
 from sglang.kernels.ops.kv_canary.verify import VerifyPlan
 from sglang.kernels.ops.kv_canary.write import WritePlan
-from sglang.kernels.testing.kv_canary._differential import run_plan_diff
-from sglang.kernels.testing.kv_canary._fixtures import (
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.kernels.kv_canary._differential import run_plan_diff
+from sglang.test.kernels.kv_canary._fixtures import (
     allocate_plan_pair,
     derive_plan_capacity,
     empty_extras,
     make_lut,
     make_req_to_token,
 )
-from sglang.kernels.testing.kv_canary._invariants import PlanInvariants
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.kernels.kv_canary._invariants import PlanInvariants
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_amd_ci(est_time=30, stage="jit-kernel-unit", runner_config="amd")

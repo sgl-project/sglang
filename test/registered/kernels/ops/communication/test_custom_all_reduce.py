@@ -34,11 +34,11 @@ from sglang.kernels.ops.communication.all_reduce import (
     get_all_reduce_module,
 )
 from sglang.kernels.ops.communication.mp import register_comm_cleanup
-from sglang.kernels.testing.utils import multigpu_pytest_main
 from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
     CustomAllReduceV2,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.kernels.utils import multigpu_pytest_main
 
 register_cuda_ci(
     est_time=300,
