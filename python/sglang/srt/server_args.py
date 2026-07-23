@@ -2470,6 +2470,10 @@ class ServerArgs:
         int,
         "Maximum number of output tokens carried by the experimental PD token handoff log.",
     ] = 15
+    disaggregation_token_handoff_min_tokens: A[
+        int,
+        "Minimum number of bridge tokens Prefill emits before sealing an already-transferred request.",
+    ] = 8
 
     # -------------------------------------------------------------------------
     # Encode prefill disaggregation

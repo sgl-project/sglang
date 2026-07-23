@@ -37,6 +37,15 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                 raise ValueError(
                     "--disaggregation-token-handoff-max-tokens must be in [1, 15]"
                 )
+            if not (
+                1
+                <= server_args.disaggregation_token_handoff_min_tokens
+                <= server_args.disaggregation_token_handoff_max_tokens
+            ):
+                raise ValueError(
+                    "--disaggregation-token-handoff-min-tokens must be in "
+                    "[1, --disaggregation-token-handoff-max-tokens]"
+                )
             if server_args.speculative_algorithm is not None:
                 raise ValueError(
                     "--enable-disaggregation-token-handoff is incompatible with "
@@ -99,6 +108,15 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
             if not 1 <= server_args.disaggregation_token_handoff_max_tokens <= 15:
                 raise ValueError(
                     "--disaggregation-token-handoff-max-tokens must be in [1, 15]"
+                )
+            if not (
+                1
+                <= server_args.disaggregation_token_handoff_min_tokens
+                <= server_args.disaggregation_token_handoff_max_tokens
+            ):
+                raise ValueError(
+                    "--disaggregation-token-handoff-min-tokens must be in "
+                    "[1, --disaggregation-token-handoff-max-tokens]"
                 )
             if server_args.speculative_algorithm is not None:
                 raise ValueError(

@@ -356,6 +356,10 @@ class PrefillBootstrapQueue:
                 req.sampling_params.max_new_tokens - 1,
                 self.scheduler.server_args.disaggregation_token_handoff_max_tokens,
             )
+            req.token_handoff_min_tokens = min(
+                req.token_handoff_max_tokens,
+                self.scheduler.server_args.disaggregation_token_handoff_min_tokens,
+            )
             # Keep one unreachable token beyond the bridge budget so the
             # generic finish-state logic does not finalize and release this
             # request while its already-started prompt KV transfer is pending.
@@ -555,6 +559,10 @@ class SchedulerDisaggregationPrefillMixin:
                     or (
                         not req.finished()
                         and len(req.output_ids) < req.token_handoff_max_tokens
+                        and (
+                            not getattr(req, "token_handoff_kv_ready", False)
+                            or len(req.output_ids) < req.token_handoff_min_tokens
+                        )
                     )
                 ]
             )
@@ -901,6 +909,13 @@ class SchedulerDisaggregationPrefillMixin:
                 undone_reqs.append(req)
             elif poll == KVPoll.Success:  # transfer done
                 if getattr(req, "token_handoff_enabled", False):
+                    req.token_handoff_kv_ready = True
+                    if (
+                        not req.finished()
+                        and len(req.output_ids) < req.token_handoff_min_tokens
+                    ):
+                        undone_reqs.append(req)
+                        continue
                     # Seal the live producer before publishing the final token
                     # log. Decode's metadata gate is still closed because the
                     # initial aux row carried bootstrap_room=0.
@@ -911,6 +926,11 @@ class SchedulerDisaggregationPrefillMixin:
                     )
                     try:
                         req.disagg_kv_sender.resend_aux()
+                        logger.info(
+                            "Token handoff sealed rid=%s bridge_tokens=%d",
+                            req.rid,
+                            len(req.output_ids),
+                        )
                     except Exception:
                         logger.exception(
                             "Failed to publish sealed token handoff log for rid=%s",

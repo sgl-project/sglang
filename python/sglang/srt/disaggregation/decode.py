@@ -1760,6 +1760,12 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             if token_handoff_count > 0
             else None
         )
+        if token_handoff_log is not None:
+            logger.info(
+                "Token handoff received rid=%s bridge_tokens=%d",
+                decode_req.req.rid,
+                token_handoff_count,
+            )
 
         if replayed_boundary:
             committed_output_id = decode_req.req.pd_rebootstrap_forced_output_id
@@ -2144,6 +2150,11 @@ class SchedulerDisaggregationDecodeMixin:
                 decode_ids, _ = req.init_incremental_detokenize()
                 req.send_decode_id_offset = len(decode_ids)
                 req.send_token_offset = len(req.output_ids)
+                logger.info(
+                    "Token handoff replay verified rid=%s bridge_tokens=%d",
+                    req.rid,
+                    len(req.output_ids),
+                )
                 del req.token_handoff_replay_expected_id
                 del req.token_handoff_original_stream
 
