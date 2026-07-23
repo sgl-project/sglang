@@ -450,6 +450,10 @@ class _DeepEPDispatcherImplBase:
         config = config_map[self.deepep_output_dtype]
         self.use_fp8 = config["use_fp8"]
         self.use_nvfp4 = config["use_nvfp4"]
+        logger.info_once(
+            "DeepEP dispatcher output dtype resolved to "
+            f"{self.deepep_output_dtype.value}."
+        )
 
         # Handle environment variables
         if _is_npu:
@@ -610,6 +614,12 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
     ):
+
+        if hidden_states.dtype != torch.bfloat16:
+            raise TypeError(
+                "DeepEP normal combine requires BF16 expert output, "
+                f"got {hidden_states.dtype}."
+            )
 
         if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM or _use_aiter or _is_npu:
             output = hidden_states

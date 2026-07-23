@@ -371,18 +371,18 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
             cutlass_w4a8_moe_deepep_normal,
         )
 
-        hidden_states, topk_idx, topk_weights = (
+        hidden_states, hidden_states_scale, topk_idx, topk_weights = (
             dispatch_output.hidden_states,
+            dispatch_output.hidden_states_scale,
             dispatch_output.topk_ids,
             dispatch_output.topk_weights,
         )
-        if isinstance(hidden_states, tuple):
-            hidden_states = hidden_states[0]
 
         num_tokens = hidden_states.shape[0]
         if num_tokens > 0:
             return cutlass_w4a8_moe_deepep_normal(
                 hidden_states,
+                hidden_states_scale,
                 layer.w13_weight,
                 layer.w2_weight,
                 layer.w13_weight_scale_inv,
@@ -404,4 +404,6 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
                 layer.w2_input_scale,
             )
         else:
-            return hidden_states
+            # DeepEP normal combine expects BF16 expert output. Keep the empty
+            # path consistent with the non-empty Cutlass result.
+            return torch.empty_like(hidden_states, dtype=torch.bfloat16)
