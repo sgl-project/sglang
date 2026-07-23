@@ -15,6 +15,7 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
     configure_nixl_pd_backend,
 )
 from sglang.test.test_utils import (
+    DEFAULT_HYBRID_GDN_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     is_in_ci,
@@ -341,6 +342,52 @@ class TestDisaggregationNixlFailure(NixlPDDisaggregationServerBase):
         assert_process_healthy(
             self, "decode", self.process_decode, self.decode_url, "/health_generate"
         )
+
+
+@unittest.skipUnless(
+    _HAS_CONFIGURED_NIXL_BACKEND,
+    "NIXL with the configured backend is required for this test.",
+)
+class TestDisaggregationNixlHeteroTPReplicatedKV(NixlPDDisaggregationServerBase):
+    """NIXL PD with prefill attn_tp=1 -> decode attn_tp=4 on a GQA model whose
+    num_key_value_heads (2) is smaller than the decode attn_tp (4).
+
+    This exercises the heterogeneous-TP *scatter* path in
+    NixlKVManager._init_hetero_tp_prep_handle. When decode_tp_size >
+    total_kv_heads the decode ranks replicate a shared KV head, so the source
+    dlist must interleave one group per *unique* source head-slice. Before the
+    fix, num_groups = decode_tp // prefill_tp (=4) over-interleaved the 2 KV
+    heads and addressed past the registered KV region, so prep_xfer_dlist raised
+    NIXL_ERR_NOT_FOUND and every request failed. The equal-TP NIXL matrix in
+    TestDisaggregationNixlBasic/Accuracy does not cover this scatter path.
+    """
+
+    prefill_tp_size = 1
+    decode_tp_size = 4
+    decode_base_gpu_id = 4
+
+    @classmethod
+    def setUpClass(cls):
+        _require_configured_nixl_backend()
+        _clear_disagg_failure_env()
+        super().setUpClass()
+        cls.model = try_cached_model(DEFAULT_HYBRID_GDN_SMALL_MODEL_NAME_FOR_TEST)
+        configure_nixl_pd_backend(cls)
+        cls.launch_all()
+
+    def test_gsm8k(self):
+        args = SimpleNamespace(
+            base_url=f"http://{self.base_host}:{self.lb_port}",
+            model=self.model,
+            eval_name="gsm8k",
+            api="completion",
+            max_tokens=512,
+            num_examples=200,
+            num_threads=128,
+        )
+        metrics = run_eval(args)
+        print(f"[NixlHeteroTPReplicatedKV] Evaluation metrics: {metrics}")
+        self.assertGreater(metrics["score"], NIXL_GSM8K_SCORE_THRESHOLD)
 
 
 if __name__ == "__main__":
