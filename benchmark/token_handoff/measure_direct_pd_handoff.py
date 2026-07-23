@@ -106,6 +106,8 @@ def main() -> None:
         "decode_event_count": len(decode["events"]),
         "prefill_done_count": prefill["done_count"],
         "decode_done_count": decode["done_count"],
+        "prefill_texts": [event["text"] for event in prefill["events"]],
+        "decode_texts": [event["text"] for event in decode["events"]],
         "merged_text": "".join(event["text"] for event in merged),
         "merged_event_times_ms": [event["at_ms"] for event in merged],
         "prefill_event_times_ms": [
