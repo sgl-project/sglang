@@ -9,6 +9,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsv4.indexer import FP8_DTYPE, C4IndexerBackendMixin
 from sglang.srt.layers.attention.dsv4.metadata import NonPagedIndexerPlan
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -39,7 +40,7 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
             envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.override(False),
             patch(f"{_INDEXER}.is_cuda", return_value=True),
             patch(f"{_INDEXER}.is_hip", return_value=False),
-            patch(f"{_INDEXER}.get_attention_cp_size", return_value=1),
+            get_parallel().override(attn_cp_size=1),
             patch(
                 f"{_INDEXER}.is_in_tc_piecewise_cuda_graph",
                 return_value=overrides.get("piecewise_graph", False),
@@ -55,7 +56,10 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
             )
 
     def test_eligibility_is_fail_closed(self):
-        self.assertIs(envs.SGLANG_OPT_DSV4_NONPAGED_INDEXER.default, False)
+        self.assertIs(envs.SGLANG_OPT_DSV4_NONPAGED_INDEXER.default, True)
+        self.assertEqual(
+            envs.SGLANG_OPT_DSV4_NONPAGED_INDEXER_MIN_QUERY_TOKENS.default, 8192
+        )
         self.assertTrue(self._is_eligible())
         for case in (
             {"enabled": False},
@@ -98,7 +102,11 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
                 query_rows=query_rows,
             )
 
-        plan = build_plan()
+        threshold = envs.SGLANG_OPT_DSV4_NONPAGED_INDEXER_MIN_QUERY_TOKENS
+        with threshold.override(threshold.default):
+            self.assertIsNone(build_plan())
+        with threshold.override(query_rows):
+            plan = build_plan()
         self.assertEqual(
             (plan.seq_len_sum, plan.max_seqlen_k, plan.query_rows),
             (65, 128, query_rows),
@@ -109,7 +117,8 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
 
         metadata.nonpaged_plan = None
         batch.extend_seq_lens_cpu = [2, 2]
-        self.assertIsNone(build_plan())
+        with threshold.override(0):
+            self.assertIsNone(build_plan())
 
     def test_extreme_plan_metadata_is_bounded_and_fail_closed(self):
         backend = SimpleNamespace(_can_use_nonpaged_indexer=lambda **_: True)
@@ -140,7 +149,9 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
                 query_rows=query_rows,
             )
 
-        plan = build_plan()
+        threshold = envs.SGLANG_OPT_DSV4_NONPAGED_INDEXER_MIN_QUERY_TOKENS
+        with threshold.override(query_rows):
+            plan = build_plan()
         self.assertEqual(plan.seq_len_sum, 125_000)
         self.assertEqual(plan.max_seq_len, 125_000)
         self.assertEqual(plan.max_seqlen_k, 125_056)
@@ -151,7 +162,53 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
         batch.extend_seq_lens_cpu = [2, 2]
         batch.extend_seq_lens = torch.tensor([2, 2], dtype=torch.int32)
         batch.extend_start_loc = torch.tensor([0, 2], dtype=torch.int32)
-        self.assertIsNone(build_plan())
+        with threshold.override(query_rows):
+            self.assertIsNone(build_plan())
+
+    def test_query_threshold_boundary(self):
+        can_use_nonpaged_indexer = MagicMock(return_value=True)
+        backend = SimpleNamespace(_can_use_nonpaged_indexer=can_use_nonpaged_indexer)
+        c4_indexer = SimpleNamespace(use_fp4_indexer=False)
+        metadata = SimpleNamespace(nonpaged_plan=None, c4_page_size=64)
+
+        def build_plan(query_rows):
+            batch = SimpleNamespace(
+                seq_lens=torch.tensor([query_rows], dtype=torch.int32),
+                seq_lens_cpu=[query_rows],
+                extend_seq_lens_cpu=[query_rows],
+                extend_seq_lens=torch.tensor([query_rows], dtype=torch.int32),
+                extend_start_loc=torch.tensor([0], dtype=torch.int32),
+                extend_num_tokens=query_rows,
+            )
+            c4_seq_lens = torch.div(
+                torch.arange(1, query_rows + 1, dtype=torch.int32),
+                4,
+                rounding_mode="floor",
+            ).clamp_min_(1)
+            return C4IndexerBackendMixin._get_nonpaged_indexer_plan(
+                backend,
+                c4_indexer=c4_indexer,
+                forward_batch=batch,
+                indexer_metadata=metadata,
+                page_table=torch.zeros((query_rows, 1), dtype=torch.int32),
+                c4_seq_lens=c4_seq_lens,
+                query_rows=query_rows,
+            )
+
+        for query_rows, expected in ((8191, False), (8192, True), (8193, True)):
+            with self.subTest(query_rows=query_rows):
+                metadata.nonpaged_plan = None
+                can_use_nonpaged_indexer.reset_mock()
+                self.assertIs(build_plan(query_rows) is not None, expected)
+                if expected:
+                    can_use_nonpaged_indexer.assert_called_once()
+                else:
+                    can_use_nonpaged_indexer.assert_not_called()
+
+        metadata.nonpaged_plan = None
+        threshold = envs.SGLANG_OPT_DSV4_NONPAGED_INDEXER_MIN_QUERY_TOKENS
+        with threshold.override(8193):
+            self.assertIsNone(build_plan(8192))
 
     def test_nonpaged_dispatch_uses_gathered_kv_contract(self):
         query_rows = 4

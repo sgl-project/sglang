@@ -1,0 +1,127 @@
+---
+title: "Diffusion models with AR stage like GLM-Image"
+---
+
+## Quick Start
+
+Run model with transformers implementation for AR stage (default)
+```bash
+# Terminal 1 : launch server
+sglang serve --model-path zai-org/GLM-Image --port ${PORT}
+```
+```bash
+# Terminal 2 : launch client
+curl http://${HOST}:${PORT}/v1/images/generations \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "prompt",
+    "n": 1,
+    "size": "widthxheight"
+  }'
+```
+Run model with SGLang srt implementation for AR stage (high performance)
+```bash
+# Terminal 1 : launch server with AR model
+sglang serve --model-path /path/to/zai-org/GLM-Image/vision_language_encoder/ \
+--tokenizer-path /path/to/zai-org/GLM-Image/processor/ --enable-multimodal --port ${AR_PORT}
+```
+```bash
+# Terminal 2 : launch server with Diffusion model
+sglang serve --model-path /path/to/zai-org/GLM-Image/ --srt-encoder-url "http://${HOST}:${AR_PORT}"
+```
+```bash
+# Terminal 3 : launch client
+curl http://${HOST}:${PORT}/v1/images/generations \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "prompt",
+    "n": 1,
+    "size": "widthxheight"
+  }'
+```
+
+## Support matrix
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "10%"}} />
+    <col style={{width: "45%"}} />
+    <col style={{width: "45%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Model</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Transformers backend</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>SGLang backend</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>GLM-Image</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)", whiteSpace: "nowrap"}}>T2I, I2I, V2I</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>T2I</td>
+    </tr>
+</tbody>
+</table>
+
+## Deployment Assumptions & Limitations
+
+:::warning
+**Network Latency & Timeouts:** In SGLang backend mode, the Diffusion server sends an HTTP request to `--srt-encoder-url` for **every auto-regressive (AR) step**.
+- To prevent requests from breaking during long model generations, increase `--srt-encoder-timeout` (e.g., set to 100 seconds).
+- To protect the system against temporary network delays or brief drops in connection, use `--srt-encoder-connection-timeout`.
+:::
+
+- **Recommended Setup:** Run both servers on the same machine or inside the same fast local network.
+- **Cross-Region Warning:** Running the Diffusion server and the AR server in different geographic regions will slow down token generation and heavily reduce performance.
+- **Startup Connection Check:** SGLang automatically checks the connection to `--srt-encoder-url` when starting up. The server will stop immediately if the remote AR host is offline.
+
+## Ascend NPU ENV
+
+To run 2 servers on same group of NPU you need to specify env variables
+https://www.hiascend.com/document/detail/zh/canncommercial/850/maintenref/envvar/envref_07_0144.html
+
+Example:
+
+```bash
+# Terminal 1 : server with AR model
+export HCCL_IF_BASE_PORT=23000
+export HCCL_HOST_SOCKET_PORT_RANGE="23000-23199"
+export HCCL_NPU_SOCKET_PORT_RANGE="23200-23399"
+```
+```bash
+# Terminal 2 : server with diffusion model
+export HCCL_IF_BASE_PORT=24000
+export HCCL_HOST_SOCKET_PORT_RANGE="24000-24199"
+export HCCL_NPU_SOCKET_PORT_RANGE="24200-24399"
+```
+
+## Best practices
+
+GLM-Image example for Ascend A3 2 cards (4 devices)
+```bash
+# Terminal 1 : server with AR model
+export HCCL_IF_BASE_PORT=23000
+export HCCL_HOST_SOCKET_PORT_RANGE="23000-23199"
+export HCCL_NPU_SOCKET_PORT_RANGE="23200-23399"
+sglang serve --model-path /path/to/zai-org/GLM-Image/vision_language_encoder/ \
+--tokenizer-path /path/to/zai-org/GLM-Image/processor/ --enable-multimodal \
+--cuda-graph-bs 1 --device npu --attention-backend ascend --disable-fast-image-processor \
+--tp-size 4 --port ${PORT} --mem-fraction-static 0.4
+```
+Second terminal with diffusion server:
+```bash
+# Terminal 2 : run SGL-Diffusion generate command
+export HCCL_IF_BASE_PORT=24000
+export HCCL_HOST_SOCKET_PORT_RANGE="24000-24199"
+export HCCL_NPU_SOCKET_PORT_RANGE="24200-24399"
+SGLANG_CACHE_DIT_FN=2 SGLANG_CACHE_DIT_BN=1 SGLANG_CACHE_DIT_WARMUP=4 SGLANG_CACHE_DIT_RDT=0.4 \
+SGLANG_CACHE_DIT_MC=4 SGLANG_CACHE_DIT_TAYLORSEER=true SGLANG_CACHE_DIT_TS_ORDER=2 \
+SGLANG_CACHE_DIT_ENABLED=true sglang generate --model-path /path/to/zai-org/GLM-Image/ \
+--prompt "A curious raccoon" --height 1920 --width 1088 --num-inference-steps 50 --num-gpus 4 \
+--sp-degree 4 --srt-encoder-url "http://${HOST}:${PORT}" --warmup
+```
+Result:
+```bash
+Warmed-up request processed in 33.82 seconds (with warmup excluded)
+```

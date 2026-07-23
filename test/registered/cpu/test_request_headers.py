@@ -19,6 +19,7 @@ def _obj():
         conversation_id=None,
         routed_dp_rank=None,
         disagg_prefill_dp_rank=None,
+        priority=None,
     )
 
 
@@ -36,6 +37,7 @@ class TestApplyRoutingHeaders(unittest.TestCase):
                     "x-override-conversation-id": "c1",
                     "x-override-routed-dp-rank": "3",
                     "x-override-disagg-prefill-dp-rank": "5",
+                    "x-override-priority": "7",
                 }
             ),
         )
@@ -46,6 +48,7 @@ class TestApplyRoutingHeaders(unittest.TestCase):
         self.assertEqual(obj.conversation_id, "c1")
         self.assertEqual(obj.routed_dp_rank, 3)
         self.assertEqual(obj.disagg_prefill_dp_rank, 5)
+        self.assertEqual(obj.priority, 7)
 
     def test_absent_headers_leave_obj_unchanged(self):
         obj = _obj()
@@ -75,6 +78,31 @@ class TestApplyRoutingHeaders(unittest.TestCase):
             apply_header_overrides(
                 obj, Headers({"x-override-bootstrap-port": "not-an-int"})
             )
+
+    def test_priority_header_overrides_body_value(self):
+        # The scheduler reads obj.priority, so the header value must be the one
+        # that ends up on the object even when the body already set a priority.
+        obj = _obj()
+        obj.priority = 1
+        apply_header_overrides(obj, Headers({"x-override-priority": "5"}))
+        self.assertEqual(obj.priority, 5)
+
+    def test_negative_priority_header_is_applied(self):
+        obj = _obj()
+        obj.priority = 1
+        apply_header_overrides(obj, Headers({"x-override-priority": "-3"}))
+        self.assertEqual(obj.priority, -3)
+
+    def test_priority_body_value_preserved_when_header_absent(self):
+        obj = _obj()
+        obj.priority = 2
+        apply_header_overrides(obj, Headers({}))
+        self.assertEqual(obj.priority, 2)
+
+    def test_invalid_priority_fails_loud(self):
+        obj = _obj()
+        with self.assertRaises(HTTPException):
+            apply_header_overrides(obj, Headers({"x-override-priority": "high"}))
 
 
 if __name__ == "__main__":

@@ -432,6 +432,17 @@ def add_common_data_to_response(
 
     response["id"] = request_id
 
+    if result.action_pred is not None:
+        t = result.action_pred
+        response["action"] = {
+            "data": t.tolist(),
+            "shape": list(t.shape),
+            "dtype": str(t.dtype).replace("torch.", ""),
+            "raw_action_dim": result.action_raw_action_dim,
+            "action_mode": result.action_mode,
+            "domain_id": result.action_domain_id,
+        }
+
     return response
 
 
