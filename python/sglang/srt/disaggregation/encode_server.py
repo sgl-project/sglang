@@ -4157,12 +4157,6 @@ async def health_generate():
     if encoder is None:
         return Response(status_code=503)
 
-    # Skip the dummy encode when real requests are already in flight — the
-    # ongoing traffic already proves liveness, matching the scheduler's
-    # `is_fully_idle`-based health-check skip pattern.
-    if encoder.embedding_to_send:
-        return Response(status_code=200)
-
     # Pick the first available modality for the dummy encode
     if encoder.image_processor is not None:
         mm_items = [f"data:image/png;base64,{MINIMUM_PNG_PICTURE_BASE64}"]
@@ -4186,21 +4180,26 @@ async def health_generate():
             "part_idx": 0,
         }
 
-        # Broadcast to other TP ranks so distributed ops stay in sync
-        for socket in send_sockets:
-            sock_send(socket, wrap_as_pickle(dummy_request))
+        # A health encode participates in the same TP collectives as a real
+        # request. Serialize its broadcast and rank-0 forward with every other
+        # collective dispatch, then recheck whether traffic made the probe
+        # unnecessary while it waited for the lock.
+        async with encoder.encode_dispatch_lock:
+            if encoder.embedding_to_send:
+                return Response(status_code=200)
+            for socket in send_sockets:
+                sock_send(socket, wrap_as_pickle(dummy_request))
 
-        # Run encode on rank 0 with timeout
-        _, _, _, error_msg, _ = await asyncio.wait_for(
-            encoder.encode(
-                mm_items=mm_items,
-                modality=modality,
-                req_id=req_id,
-                num_parts=1,
-                part_idx=0,
-            ),
-            timeout=HEALTH_CHECK_TIMEOUT,
-        )
+            _, _, _, error_msg, _ = await asyncio.wait_for(
+                encoder.encode(
+                    mm_items=mm_items,
+                    modality=modality,
+                    req_id=req_id,
+                    num_parts=1,
+                    part_idx=0,
+                ),
+                timeout=HEALTH_CHECK_TIMEOUT,
+            )
 
         # Clean up stored embedding
         encoder.embedding_to_send.pop(req_id, None)
