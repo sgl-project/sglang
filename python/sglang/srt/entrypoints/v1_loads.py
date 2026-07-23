@@ -20,14 +20,22 @@ metrics for load balancing, monitoring, and capacity planning.
 
 import time
 from datetime import datetime, timezone
+from functools import lru_cache
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import Response
 
+from sglang.srt.utils import get_device_name
 from sglang.version import __version__
 
 router = APIRouter()
+
+
+@lru_cache(maxsize=1)
+def _accelerator_name() -> Optional[str]:
+    """Return the accelerator name, or None if unavailable."""
+    return get_device_name()
 
 
 def _get_tokenizer_manager():
@@ -87,7 +95,7 @@ async def get_loads(
         format: Response format - 'json' (default) or 'prometheus'
 
     Returns:
-        JSON response with timestamp, version, and per-DP-rank loads
+        JSON response with timestamp, version, accelerator, and per-DP-rank loads
     """
     include_list = [s.strip() for s in include.split(",")] if include else None
 
@@ -119,5 +127,6 @@ async def get_loads(
     return {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "version": __version__,
+        "accelerator": _accelerator_name(),
         "loads": loads,
     }
