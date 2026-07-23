@@ -23,16 +23,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import sglang.srt.models.deepseek_v2 as deepseek_v2
-from sglang.jit_kernel.dsv4 import (
-    fused_norm_rope_inplace,
-    fused_q_norm_rope,
-    fused_rope_inplace,
-    sglang_per_token_group_quant_fp8_dsv4_wo_a,
-)
 from sglang.kernels.ops.attention.deepseek_v4_rope import (
     ensure_npu_interleaved_rope_cache,
     get_npu_interleaved_rope_cos_sin,
     npu_partial_rotary_mul_inplace,
+)
+from sglang.kernels.ops.attention.dsv4 import (
+    fused_norm_rope_inplace,
+    fused_q_norm_rope,
+    fused_rope_inplace,
+    sglang_per_token_group_quant_fp8_dsv4_wo_a,
 )
 from sglang.kernels.ops.quantization.fp8_kernel import (
     sglang_per_token_group_quant_fp8,
