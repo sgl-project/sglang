@@ -14,6 +14,14 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 
+def _requires_dsa_seed_for_cuda_graph(hf_config, topk: int) -> bool:
+    return (
+        topk == 1
+        and getattr(hf_config, "index_share_for_mtp_iteration", False)
+        and getattr(hf_config, "index_topk", None) is not None
+    )
+
+
 def build_eagle_disagg_draft_input(
     batch: ScheduleBatch,
     server_args: ServerArgs,
@@ -58,12 +66,20 @@ def build_eagle_disagg_draft_input(
         if torch.any(torch.all(dsa_topk_indices < 0, dim=1)).item():
             dsa_topk_indices = None
 
+    requires_dsa_seed_for_cuda_graph = _requires_dsa_seed_for_cuda_graph(
+        batch.model_config.hf_config,
+        server_args.speculative_eagle_topk,
+    )
+
     spec_info = EagleDraftInput(
         topk_p=topk_p,
         topk_index=topk_index,
         hidden_states=hidden_states,
         bonus_tokens=last_tokens_tensor,
         dsa_topk_indices=dsa_topk_indices,
+        cuda_graph_compatible=not (
+            requires_dsa_seed_for_cuda_graph and dsa_topk_indices is None
+        ),
     )
     spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
 

@@ -177,6 +177,10 @@ class EagleDraftInput(SpecInput):
     future_indices: Optional[torch.Tensor] = None
     future_dsa_topk_indices_available: bool = False
 
+    # False when this input is missing model-required state for graph replay.
+    # DP attention synchronizes the bit across ranks before the worker runs.
+    cuda_graph_compatible: bool = True
+
     def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_DRAFT)
 
@@ -229,12 +233,23 @@ class EagleDraftInput(SpecInput):
     def merge_batch(self, spec_info: "EagleDraftInput"):
         if self.future_indices is not None:
             assert spec_info.future_indices is not None
+            self_was_empty = len(self.future_indices) == 0
+            spec_info_is_empty = len(spec_info.future_indices) == 0
+            if self_was_empty:
+                self.cuda_graph_compatible = spec_info.cuda_graph_compatible
+                self.future_dsa_topk_indices_available = (
+                    spec_info.future_dsa_topk_indices_available
+                )
+            elif not spec_info_is_empty:
+                self.cuda_graph_compatible = (
+                    self.cuda_graph_compatible and spec_info.cuda_graph_compatible
+                )
+                self.future_dsa_topk_indices_available = (
+                    self.future_dsa_topk_indices_available
+                    and spec_info.future_dsa_topk_indices_available
+                )
             self.future_indices = torch.cat(
                 [self.future_indices, spec_info.future_indices]
-            )
-            self.future_dsa_topk_indices_available = (
-                self.future_dsa_topk_indices_available
-                and spec_info.future_dsa_topk_indices_available
             )
             return
 
@@ -242,6 +257,7 @@ class EagleDraftInput(SpecInput):
         # shape[0] == 0 across all fields). Don't use `hidden_states is None`:
         # for STANDALONE all non-idle inputs also have None hidden_states.
         if len(self.topk_index) == 0:
+            self.cuda_graph_compatible = spec_info.cuda_graph_compatible
             self.hidden_states = spec_info.hidden_states
             self.bonus_tokens = spec_info.bonus_tokens
             self.topk_p = spec_info.topk_p
@@ -251,6 +267,9 @@ class EagleDraftInput(SpecInput):
             return
         if len(spec_info.topk_index) == 0:
             return
+        self.cuda_graph_compatible = (
+            self.cuda_graph_compatible and spec_info.cuda_graph_compatible
+        )
         if self.hidden_states is not None and spec_info.hidden_states is not None:
             self.hidden_states = torch.cat(
                 [self.hidden_states, spec_info.hidden_states], axis=0

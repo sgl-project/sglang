@@ -851,6 +851,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             num_tokens_per_req=1,
             num_tokens_for_logprob_per_req=1,
             dsa_topk_indices=prefill_dsa_topk,
+            cuda_graph_compatible=not (seed_from_extend and prefill_dsa_topk is None),
         )
 
     def _get_dsa_extend_topk_buf(self, num_tokens: int) -> torch.Tensor:
@@ -1016,6 +1017,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             next_draft_input.draft_probs = ret_draft_probs
         if self.seed_dsa_topk_from_draft_extend:
             next_draft_input.dsa_topk_indices = dsa_seed_topk_indices
+        next_draft_input.cuda_graph_compatible = not (
+            self.seed_dsa_topk_from_draft_extend and dsa_seed_topk_indices is None
+        )
 
 
 class EAGLEWorkerV2(BaseSpecWorker):
