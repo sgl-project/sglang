@@ -6,8 +6,8 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.jit_kernel.kv_canary.verify import CanaryLaunchTag, VerifyPlan
-from sglang.jit_kernel.kv_canary.write import WritePlan
+from sglang.kernels.ops.kv_canary.verify import CanaryLaunchTag, VerifyPlan
+from sglang.kernels.ops.kv_canary.write import WritePlan
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup
 from sglang.srt.kv_canary.config import CanaryConfig
 from sglang.srt.kv_canary.endpoint import CanaryEndpoint
@@ -66,7 +66,7 @@ class SingleForwardManager:
         device_state: CanaryDeviceState,
         buffer_groups: tuple[CanaryBufferGroup, ...],
         endpoints: tuple[CanaryEndpoint, ...],
-        req_to_token_pool: "ReqToTokenPool",
+        req_to_token_pool: ReqToTokenPool,
         swa_window_size: int,
         per_forward_verify_capacity: int,
         per_forward_write_req_capacity: int,
@@ -119,7 +119,7 @@ class SingleForwardManager:
         return self._phase_checker
 
     def pre_ops_outside_graph(
-        self, *, maybe_inaccurate_forward_batch: "ForwardBatch"
+        self, *, maybe_inaccurate_forward_batch: ForwardBatch
     ) -> None:
         self._phase_checker.update(
             expect_phase=_SingleForwardPhase.IDLE,
@@ -150,8 +150,8 @@ class SingleForwardManager:
             )
 
     def pre_ops_maybe_inside_graph(
-        self, forward_batch: "ForwardBatch"
-    ) -> "_PreOpsMaybeInsideGraphOutput":
+        self, forward_batch: ForwardBatch
+    ) -> _PreOpsMaybeInsideGraphOutput:
         self._phase_checker.update(
             expect_phase=_SingleForwardPhase.AFTER_PRE_OUT,
             next_phase=_SingleForwardPhase.AFTER_PRE_MAYBE_IN,
@@ -238,8 +238,8 @@ class SingleForwardManager:
 
     def post_ops_maybe_inside_graph(
         self,
-        forward_batch: "ForwardBatch",
-        pre_ops_output: "_PreOpsMaybeInsideGraphOutput",
+        forward_batch: ForwardBatch,
+        pre_ops_output: _PreOpsMaybeInsideGraphOutput,
     ) -> None:
         self._phase_checker.update(
             expect_phase=_SingleForwardPhase.AFTER_PRE_MAYBE_IN,
@@ -293,7 +293,7 @@ class SingleForwardManager:
         self._enable_warner.tick(self._output_buffer.verify_plan_enable)
 
     def _should_enable_write_input_assert_for_launch(
-        self, forward_batch: "ForwardBatch"
+        self, forward_batch: ForwardBatch
     ) -> bool:
         if not self._config.enable_write_input_assert:
             return False

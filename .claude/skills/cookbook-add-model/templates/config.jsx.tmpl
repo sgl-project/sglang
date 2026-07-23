@@ -48,6 +48,12 @@ export const config = {
     { id: "fp8",  label: "FP8"  },
     { id: "fp4",  label: "FP4"  },
   ],
+  // 4th dim. The count follows the model's operating points: 1 recipe → a
+  // single "balanced"; 2 → low-latency + high-throughput; 3 → the full trio
+  // (the ideal). Per-combination: a single-recipe combination (e.g. a CPU
+  // platform) parks under its semantically honest tier — no slant → balanced;
+  // the page's list is the union and the engine greys unused chips. Never
+  // invent a recipe just to fill chips.
   strategies: [
     { id: "low-latency",     label: "Low-Latency"     },
     { id: "balanced",        label: "Balanced"        },
@@ -91,7 +97,8 @@ export const config = {
   --model {{MODEL_NAME}} \\
   --dataset-name {{DATASET}} \\
   --random-input-len {{ISL}} --random-output-len {{OSL}} \\
-  --num-prompts {{NUM_PROMPTS}} --max-concurrency {{MAX_CONCURRENCY}}`,
+  --num-prompts {{NUM_PROMPTS}} --max-concurrency {{MAX_CONCURRENCY}} \\
+  --flush-cache`,
     // One entry per accuracy field. A value is a string, OR a {[variant]: string}
     // object when the command differs per variant. Keys must match ACCURACY_LABELS
     // in _deployment.jsx + the per-cell/defaultAccuracy keys.
@@ -108,10 +115,19 @@ sgl-eval run gsm8k \\
 
   // OPTIONAL — per-variant accuracy applied to EVERY cell of a variant (hardware-
   // independent, e.g. GPQA/AIME). Per-cell `accuracy` overrides. Keys must match
-  // ACCURACY_LABELS + benchmarkCommands.accuracy. Delete if no numbers yet.
+  // the effective accuracy labels + benchmarkCommands.accuracy. Delete if no numbers yet.
   defaultAccuracy: {
     default: { gsm8k_pct: null },
   },
+
+  // The eval set rendered in the benchmark card + "⚡ Reproduce" — the engine
+  // ships NO default; required whenever the benchmarks carry accuracy data
+  // (without it the accuracy rows silently don't render). [key, label, unit]
+  // tuples; keys must match benchmarks[].accuracy + defaultAccuracy +
+  // benchmarkCommands.accuracy. Delete only if there are no accuracy numbers.
+  accuracyLabels: [
+    ["gsm8k_pct", "GSM8K", "%"],
+  ],
 
   // OPTIONAL — `# ...` hint lines prepended to multi-node commands, ONLY for hw
   // whose fabric needs manual NIC env (e.g. gb200 NVL72/MNNVL). NOT every multi-N
@@ -125,10 +141,12 @@ sgl-eval run gsm8k \\
     ],
   },
 
-  // Per-hw image for `docker run` framing. ASK the user which sglang build the recipes ran
-  // on; don't guess a supporting release. Default below is :dev (nightly) — replace the tag
-  // with the user's release if they give one. NVIDIA share one image; AMD uses ROCm tags.
-  // GB200/GB300/B300 may need a `-cu130` (CUDA 13) tag — confirm per release.
+  // Image for `docker run` framing, keyed by `hw` (or `hw|quant`, resolved first, when one
+  // quant on a shared GPU needs its own image — e.g. an FP4 dev build while FP8/BF16 use the
+  // release tag). ASK the user which sglang build the recipes ran on; don't guess a supporting
+  // release. Default below is :dev (nightly) — replace the tag with the user's release if they
+  // give one. NVIDIA share one image; AMD uses ROCm tags. GB200/GB300/B300 may need a
+  // `-cu130` (CUDA 13) tag — confirm per release.
   dockerImages: {
     h100:  "lmsysorg/sglang:dev",
     h200:  "lmsysorg/sglang:dev",
@@ -142,13 +160,17 @@ sgl-eval run gsm8k \\
     mi355x: "lmsysorg/sglang:dev-rocm720-mi35x",
   },
 
-  // Pre-selects the issue template's `model` dropdown on "Submit verified cell".
-  // Must match that dropdown's value (usually `<hf-org>/<model-slug>`).
+  // Prefills the issue template's free-form `model` field on "Submit verified cell".
+  // Use the HF id (`<hf-org>/<model-slug>`). Do NOT delete this block when pruning —
+  // without it the engine falls back to "deepseek-ai/deepseek-v4" and mislabels submissions.
   github: {
     cookbookModel: "__HF_ORG__/__MODEL_SLUG__",
   },
 
-  // Opt-in per axis. DELETE any axis your model doesn't expose (don't leave a stub).
+  // Opt-OUT per axis: general axes (attention / moe-for-MoE / parsers /
+  // speculative / pdDisagg / hicache) ship on every cookbook — DELETE only the
+  // axes this model genuinely cannot use (e.g. hisparse on non-DSA models, moe
+  // on pure-dense models); prefer disable+disableReason for variant/hw subsets.
   playgroundFeatures: {
 
     // ----- Card: "Attention Parallelism" -----  KEEP if the model exposes TP/CP/DP
@@ -178,8 +200,30 @@ sgl-eval run gsm8k \\
         options: [
           { id: null,               label: "Inherited" },
           { id: "deepep",           label: "DeepEP",            flags: ["--moe-a2a-backend deepep"] },
+          // KEEP the MegaMoE option + the megamoeQuant block below ONLY for Blackwell
+          // MoE kernel-fusion models; DELETE both otherwise. requiresHw gates it to
+          // Blackwell (the engine hides it elsewhere); add excludesStrategy: [...] too
+          // for a strategy gate. Selecting MegaMoE reveals the Quantization sub-select.
+          { id: "megamoe",          label: "MegaMoE",           flags: ["--moe-a2a-backend megamoe"],
+            requiresHw: ["b200", "b300", "gb200", "gb300"] },
           { id: "flashinfer_mxfp4", label: "FlashInfer (MXFP4)", flags: ["--moe-runner-backend flashinfer_mxfp4"] },
           { id: "marlin",           label: "Marlin (W4A16)",    flags: ["--moe-runner-backend marlin"] },
+        ],
+      },
+      // MegaMoE quantization sub-select — shown only when backend === "megamoe".
+      // W4A4 adds the FP4-activations env vars; both strip the DeepEP dispatch env.
+      // DELETE this block if there's no MegaMoE backend option above.
+      megamoeQuant: {
+        stripEnv: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK"],
+        options: [
+          { id: "w4a8", label: "W4A8",
+            env: ["SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320"] },
+          { id: "w4a4", label: "W4A4",
+            env: [
+              "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320",
+              "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS=1",
+              "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND=1",
+            ] },
         ],
       },
       ep: { label: "EP", values: [
@@ -275,24 +319,14 @@ sgl-eval run gsm8k \\
       ],
       defaultHostRatio: 10,
     },
-
-    // ----- Card: "MegaMoE" -----  KEEP only for Blackwell MoE kernel-fusion models.
-    megamoe: {
-      requiresHw: ["b200", "b300", "gb200", "gb300"],
-      excludesStrategy: ["low-latency", "balanced"],
-      stripEnv: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK"],
-      options: [
-        { id: "disabled", label: "Disabled" },
-        { id: "w4a8",     label: "W4A8",
-          flags: ["--moe-a2a-backend megamoe"],
-          env: ["SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320"] },
-      ],
-    },
   },
 
   // EXAMPLE cells — one per hardware family to show the shape. REPLACE each with
   // your model's verified recipe, or DELETE families you don't support. `match`
   // MUST have exactly the 5 keys; env/flags are flat literals.
+  // Accuracy-degrading flags (W4A4-style runtime quant, lossy --kv-cache-dtype)
+  // default to Playground/tips — putting one in a cell needs explicit user
+  // confirmation (authoring-reference §2.2).
   cells: [
     // ==== NVIDIA Blackwell + FP4 (single node) ====
     {

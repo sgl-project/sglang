@@ -46,7 +46,7 @@ Columns are runner modes; rows are kernel-path modes of the single
 ## Container Gate (SM10.x)
 
 `DualChunkFlashAttentionBackend` calls `flash_attn_varlen_func` via
-`sglang.jit_kernel.flash_attention`. On SM8.x / SM9.x that resolves to sgl-kernel's
+`sglang.kernels.ops.attention.flash_attention`. On SM8.x / SM9.x that resolves to sgl-kernel's
 FA3 build; on SM != {8, 9} (notably SM10.x / GB300) the JIT kernel falls back
 to the upstream `flash_attn` (FA2) wheel, which the
 `lmsysorg/sglang:nightly-dev-cu13` container ships without an SM10.x-compiled

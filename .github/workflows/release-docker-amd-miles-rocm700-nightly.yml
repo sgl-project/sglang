@@ -1,0 +1,55 @@
+name: Release Docker Images Nightly Miles ROCm7.0 (AMD)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 12 * * *"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.number || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: amd-docker-scale
+    environment: "prod"
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        variant:
+          - rocm700-mi35x
+          - rocm700-mi30x
+    steps:
+      - name: Checkout miles repository
+        uses: actions/checkout@v4
+        with:
+          repository: radixark/miles
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Record miles commit
+        run: echo "Building from miles main @ $(git rev-parse HEAD)"
+
+      - name: Set date
+        run: echo "DATE=$(date +%Y%m%d)" >> $GITHUB_ENV
+
+      - name: Install docker/build.py dependencies
+        run: python3 -m pip install --quiet typer
+
+      - name: Build image via miles docker/build.py and tag with date
+        run: |
+          python3 docker/build.py --variant ${{ matrix.variant }} --image-tag custom --custom-tag miles
+          docker tag rocm/sgl-dev:miles-${{ matrix.variant }} rocm/sgl-dev:miles-${{ matrix.variant }}-${DATE}
+
+      - name: Login to Docker Hub (AMD)
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
+
+      - name: Push dated tag
+        run: docker push rocm/sgl-dev:miles-${{ matrix.variant }}-${DATE}

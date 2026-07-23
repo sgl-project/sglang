@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.jit_kernel.kv_canary.verify import VerifyPlan
+from sglang.kernels.ops.kv_canary.verify import VerifyPlan
 from sglang.srt.environ import envs
 from sglang.srt.kv_canary.buffer_group import PoolKind
 from sglang.srt.kv_canary.runner import swa_divergence as swa_div_module
@@ -15,12 +15,13 @@ from sglang.srt.kv_canary.runner.swa_divergence import (
     SwaDivergenceReporter,
     compute_swa_full_idx_divergence,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kv_canary.fixtures import make_buffer_group
 from sglang.test.kv_canary.runner_test_base import CanaryManagerTestCase, make_manager
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=45, stage="extra-a", runner_config="1-gpu-small")
+register_amd_ci(est_time=45, suite="extra-a-test-1-gpu-small-amd")
 
 _DEVICE = torch.device("cuda")
 

@@ -97,6 +97,16 @@ export const Nemotron3UltraDeployment = () => {
         });
       }
     },
+    ep: {
+      name: 'ep',
+      title: 'Expert Parallel (EP)',
+      items: [
+        { id: 'enabled',  label: 'Enabled', subtitle: 'EP = TP' },
+        { id: 'disabled', label: 'Disabled', default: true }
+      ],
+      // This MoE only supports ep_size == 1 or ep_size == tp_size; when on, EP equals TP.
+      commandRule: (value, state) => value === 'enabled' ? `--ep ${state.tp}` : null
+    },
     dpattention: {
       name: 'dpattention',
       title: 'DP Attention',
@@ -126,16 +136,6 @@ export const Nemotron3UltraDeployment = () => {
           ? `--dp ${value} \\\n  --enable-dp-attention`
           : null
     },
-    ep: {
-      name: 'ep',
-      title: 'Expert Parallel (EP)',
-      items: [
-        { id: 'enabled',  label: 'Enabled', subtitle: 'EP = TP' },
-        { id: 'disabled', label: 'Disabled', default: true }
-      ],
-      // This MoE only supports ep_size == 1 or ep_size == tp_size; when on, EP equals TP.
-      commandRule: (value, state) => value === 'enabled' ? `--ep ${state.tp}` : null
-    },
     mtp: {
       name: 'mtp',
       title: 'Multi-token Prediction (MTP)',
@@ -143,8 +143,7 @@ export const Nemotron3UltraDeployment = () => {
         { id: 'enabled',  label: 'Enabled',  default: true  },
         { id: 'disabled', label: 'Disabled', default: false }
       ],
-      // On Blackwell, the flashinfer default breaks the spec-v2 overlap scheduler, so override to trtllm_mha
-      commandRule: (value, state) => value === 'enabled' ? '--speculative-algorithm EAGLE \\\n  --speculative-num-steps 3 \\\n  --speculative-eagle-topk 1 \\\n  --speculative-num-draft-tokens 4 \\\n  --mamba-scheduler-strategy extra_buffer' + (['b200', 'gb200', 'b300', 'gb300'].includes(state.hardware) ? ' \\\n  --attention-backend trtllm_mha' : '') : null
+      commandRule: (value) => value === 'enabled' ? '--speculative-algorithm EAGLE \\\n  --speculative-num-steps 5 \\\n  --speculative-eagle-topk 1 \\\n  --speculative-num-draft-tokens 6' : null
     },
     kvcache: {
       name: 'kvcache',
@@ -154,6 +153,36 @@ export const Nemotron3UltraDeployment = () => {
         { id: 'fp8_e4m3', label: 'fp8_e4m3', default: false },
         { id: 'bf16',     label: 'bf16',     default: false }
       ]
+    },
+    mambabackend: {
+      name: 'mambabackend',
+      title: 'Mamba Backend',
+      items: [
+        { id: 'triton',     label: 'Triton',     subtitle: 'Default', default: true  },
+        { id: 'flashinfer', label: 'FlashInfer', subtitle: 'Faster',  default: false }
+      ],
+      commandRule: (value) => value === 'flashinfer' ? '--mamba-backend flashinfer' : null
+    },
+    mambassmdtype: {
+      name: 'mambassmdtype',
+      title: 'Mamba SSM DType',
+      items: [
+        { id: 'default', label: 'Default', subtitle: 'Model config', default: true  },
+        { id: 'float16', label: 'float16', subtitle: 'Less memory',   default: false }
+      ],
+      commandRule: (value) => value === 'float16' ? '--mamba-ssm-dtype float16' : null
+    },
+    mambastochasticrounding: {
+      name: 'mambastochasticrounding',
+      title: 'Mamba Stochastic Rounding',
+      items: [
+        { id: 'disabled', label: 'Disabled', default: true  },
+        { id: 'enabled',  label: 'Enabled',  subtitle: 'FP16 SSM' }
+      ],
+      commandRule: (value, state) =>
+        value === 'enabled' && state.mambassmdtype === 'float16'
+          ? '--enable-mamba-cache-stochastic-rounding'
+          : null
     },
     thinking: {
       name: 'thinking',
@@ -208,11 +237,24 @@ export const Nemotron3UltraDeployment = () => {
 
     const modelPath = MODEL_PATHS[model] || MODEL_PATHS['bf16'];
 
-    const specV2Env = values.mtp === 'enabled' ? 'SGLANG_ENABLE_SPEC_V2=1 ' : '';
-    let cmd = `${specV2Env}python3 -m sglang.launch_server \\\n`;
+    let cmd = `python3 -m sglang.launch_server \\\n`;
     cmd += `  --model-path ${modelPath} \\\n`;
     cmd += `  --trust-remote-code \\\n`;
     cmd += `  --tp ${tp} \\\n`;
+
+    for (const [key, option] of Object.entries(options)) {
+      if (option.commandRule) {
+        const rule = option.commandRule(values[key], values);
+        if (rule) {
+          cmd += `  ${rule} \\\n`;
+        }
+      }
+    }
+
+    cmd += `  --mamba-radix-cache-strategy extra_buffer \\\n`;
+    if (['b200', 'gb200', 'b300', 'gb300'].includes(hardware)) {
+      cmd += `  --attention-backend trtllm_mha \\\n`;
+    }
 
     if (kvcache && kvcache !== 'none') {
       cmd += `  --kv-cache-dtype ${kvcache} \\\n`;
@@ -222,15 +264,6 @@ export const Nemotron3UltraDeployment = () => {
       cmd += `  --dist-init-addr <head-node-ip>:5000 \\\n`;
       cmd += `  --nnodes 2 \\\n`;
       cmd += `  --node-rank <0|1> \\\n`;
-    }
-
-    for (const [key, option] of Object.entries(options)) {
-      if (option.commandRule) {
-        const rule = option.commandRule(values[key], values);
-        if (rule) {
-          cmd += `  ${rule} \\\n`;
-        }
-      }
     }
 
     cmd = cmd.trimEnd();

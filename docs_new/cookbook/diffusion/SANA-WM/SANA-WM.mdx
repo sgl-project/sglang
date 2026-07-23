@@ -44,9 +44,9 @@ For more details, see the [SANA-WM paper (arXiv)](https://arxiv.org/abs/2605.151
 
 ## 2. Installation
 
-SGLang-diffusion offers multiple installation methods depending on your hardware platform. Please refer to the [official SGLang-diffusion installation guide](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/docs/install.md).
+SGLang-diffusion offers multiple installation methods depending on your hardware platform. Please refer to the [SGLang Diffusion installation guide](../../../docs/sglang-diffusion/installation).
 
-SANA-WM adds the `SanaWMTransformer3DModel` + GDN kernels, the `SanaWMTwoStagePipeline` (dense bidirectional + chunk-causal streaming), and the `SanaWMRealtimePipeline` with the `/v1/realtime_video` WebSocket router. The diffusion server CLI is invoked as `python -m sglang.multimodal_gen.runtime.entrypoints.cli.main`.
+SANA-WM adds the `SanaWMTransformer3DModel` + GDN kernels, the `SanaWMTwoStagePipeline` (dense bidirectional + chunk-causal streaming), and the `SanaWMRealtimePipeline` with the `/v1/realtime_video` WebSocket router. Use `sglang serve` to launch the diffusion server.
 
 ## 3. Model Setup
 
@@ -87,7 +87,7 @@ The **bidirectional** checkpoint generates the whole clip in **one shot** (full 
 Launch with the two-stage pipeline and **no** `--streaming` flag (dense is the default — `streaming` defaults to `False`):
 
 ```bash Command
-python -m sglang.multimodal_gen.runtime.entrypoints.cli.main serve \
+sglang serve \
   --model-path Efficient-Large-Model/SANA-WM_bidirectional \
   --pipeline-class-name SanaWMTwoStagePipeline \
   --host 127.0.0.1 --port 30000
@@ -122,7 +122,7 @@ The **streaming** checkpoint generates a **full camera-controlled clip in one re
 Launch with the two-stage pipeline + the streaming flags:
 
 ```bash Command
-python -m sglang.multimodal_gen.runtime.entrypoints.cli.main serve \
+sglang serve \
   --model-path Efficient-Large-Model/SANA-WM_streaming \
   --pipeline-class-name SanaWMTwoStagePipeline \
   --streaming --refiner-chunked \
@@ -167,7 +167,7 @@ The response is a `VideoResponse`; fetch the rendered MP4 via the returned refer
 Launch with the realtime pipeline **pinned** — the checkpoint defaults to `SanaWMTwoStagePipeline`, so realtime must be selected explicitly (see §3). The `/v1/realtime_video` router is always mounted and becomes functional once the realtime config is active, because `SanaWMRealtimeConfig` has a registered realtime adapter (`SanaWMRealtimeAdapter`).
 
 ```bash Command
-python -m sglang.multimodal_gen.runtime.entrypoints.cli.main serve \
+sglang serve \
   --model-path Efficient-Large-Model/SANA-WM_streaming \
   --pipeline-class-name SanaWMRealtimePipeline \
   --host 127.0.0.1 --port 30000
@@ -177,20 +177,20 @@ Common launch variants:
 
 ```bash Command
 # recommended multi-GPU realtime profile
-python -m sglang.multimodal_gen.runtime.entrypoints.cli.main serve \
+sglang serve \
   --model-path Efficient-Large-Model/SANA-WM_streaming \
   --pipeline-class-name SanaWMRealtimePipeline \
   --num-gpus 8 --sp-degree 8 \
   --host 127.0.0.1 --port 30000
 
 # single GPU
-python -m sglang.multimodal_gen.runtime.entrypoints.cli.main serve \
+sglang serve \
   --model-path Efficient-Large-Model/SANA-WM_streaming \
   --pipeline-class-name SanaWMRealtimePipeline \
   --num-gpus 1 --host 127.0.0.1 --port 30000
 
 # offload DiT + text encoder to CPU (tight VRAM)
-python -m sglang.multimodal_gen.runtime.entrypoints.cli.main serve \
+sglang serve \
   --model-path Efficient-Large-Model/SANA-WM_streaming \
   --pipeline-class-name SanaWMRealtimePipeline \
   --host 127.0.0.1 --port 30000 \

@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.jit_kernel.kv_canary.scatter_req_token_ids import (
+from sglang.kernels.ops.kv_canary.scatter_req_token_ids import (
     launch_scatter_req_token_ids_kernel,
 )
 from sglang.srt.utils.common import flatten_arrays_to_int64_tensor
@@ -15,7 +15,7 @@ if TYPE_CHECKING:
 
 
 def compute_req_all_ids_info(
-    reqs: "list[Req]",
+    reqs: list[Req],
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Snapshot per-req (origin_input_ids + output_ids) as pinned CPU int64 tensors.
 
@@ -38,7 +38,7 @@ def compute_req_all_ids_info(
 
 def populate_req_to_expected_token_ids(
     *,
-    forward_batch: "ForwardBatch",
+    forward_batch: ForwardBatch,
     req_to_verify_expected_tokens: Optional[torch.Tensor],
 ) -> None:
     """Scatter the forward batch's per-req token-id snapshot into the device-side pool."""

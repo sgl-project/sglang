@@ -119,6 +119,11 @@ class TransferInfo:
     dst_state_indices: List[npt.NDArray[np.int32]]
     required_dst_info_num: int
     is_dummy: bool
+    # Number of tokens decode already holds in its radix cache; prefill should
+    # only send pages beyond this prefix. None means the receiver did not
+    # populate this field (older receiver or radix-cache feature off) -> treat
+    # as 0 (no prefix hit, full send) for backward compatibility.
+    decode_prefix_len: Optional[int] = None
 
     @classmethod
     def from_zmq(cls, payload: List[bytes]) -> TransferInfo:
@@ -145,7 +150,19 @@ class TransferInfo:
         required_dst_info_num = (
             int(payload[7].decode("ascii")) if len(payload) > 7 else 1
         )
-        is_dummy = dst_kv_indices.size == 0 and dst_aux_index < 0
+
+        if len(payload) > 8 and payload[8]:
+            decode_prefix_len: Optional[int] = int(payload[8].decode("ascii"))
+        else:
+            decode_prefix_len = None
+
+        # A transfer is "dummy" only when the receiver does not need any
+        # kv/aux/state delivered. When decode_prefix_len > 0 and the delta is
+        # exactly zero (full prefix hit), dst_kv_indices is empty but aux is
+        # still needed -> not dummy.
+        is_dummy = (
+            dst_kv_indices.size == 0 and dst_aux_index < 0 and not decode_prefix_len
+        )
         return cls(
             room=room,
             endpoint=endpoint,
@@ -156,6 +173,7 @@ class TransferInfo:
             dst_state_indices=dst_state_indices,
             required_dst_info_num=required_dst_info_num,
             is_dummy=is_dummy,
+            decode_prefix_len=decode_prefix_len,
         )
 
 
@@ -272,12 +290,13 @@ class TransferTarget:
 
 @dataclasses.dataclass
 class _TransferChunk:
-    sender: "MoriKVSender"
+    sender: MoriKVSender
     kv_indices: npt.NDArray[np.int32]
     index_slice: slice
     is_last_chunk: bool
     aux_index: Optional[int]
     normalized_state: Optional[List[Optional[npt.NDArray[np.int32]]]]
+    wait_event: Optional[object] = None
 
 
 class MoriKVManager(CommonKVManager):
@@ -488,11 +507,38 @@ class MoriKVManager(CommonKVManager):
                 infos[transfer_info.engine_key] = transfer_info
 
                 if len(infos) >= transfer_info.required_dst_info_num:
-                    logger.debug(
-                        "Bootstrap room %s got enough transfer info (%s)",
-                        transfer_info.room,
-                        len(infos),
+                    self.resolve_kv_replica_factor(infos)
+                    # All decode peers reported their dst metadata; pick a
+                    # non-None decode_prefix_len if any peer set it (they
+                    # should all agree, but be defensive). 0 means "no
+                    # prefix hit", which is the same as "feature off".
+                    chosen_prefix_len = next(
+                        (
+                            info.decode_prefix_len
+                            for info in infos.values()
+                            if info.decode_prefix_len is not None
+                        ),
+                        0,
                     )
+                    self.req_to_decode_prefix_len[transfer_info.room] = (
+                        chosen_prefix_len
+                    )
+                    if chosen_prefix_len > 0:
+                        # Surface incremental KV transfer at INFO so it's
+                        # visible without bumping the global log level.
+                        logger.info(
+                            "MoriKV incremental: room=%s prefix_len=%s peers=%s",
+                            transfer_info.room,
+                            chosen_prefix_len,
+                            len(infos),
+                        )
+                    else:
+                        logger.debug(
+                            "Bootstrap room %s got enough transfer info (%s), "
+                            "decode_prefix_len=0",
+                            transfer_info.room,
+                            len(infos),
+                        )
                     self.update_status(transfer_info.room, KVPoll.WaitingForInput)
         except Exception:
             logger.exception("Failed to parse transfer info message")
@@ -1048,7 +1094,7 @@ class MoriKVManager(CommonKVManager):
                         dst_dims,
                     )
                 )
-            elif st in ("swa", "dsa"):
+            elif st in ("swa", "dsa", "swa_ring", "c128_state", "minimax_index_k"):
                 statuses.extend(
                     self._send_swa_dsa_state(
                         peer_info,
@@ -1175,13 +1221,37 @@ class MoriKVManager(CommonKVManager):
                 f"PD state transfer does not support TP-mismatched non-MLA SWA models "
                 f"(prefill_tp_size={self.attn_tp_size}, decode_tp_size={peer_info.decode_tp_size})"
             )
+        if state_type == "minimax_index_k":
+            if self.pp_size is not None and self.pp_size > 1:
+                raise RuntimeError(
+                    "PD disagg: PP>1 not supported for MiniMax sparse index yet."
+                )
+            if peer_info.decode_tp_size != self.attn_tp_size:
+                raise RuntimeError(
+                    "PD disagg: heterogeneous TP not supported for MiniMax sparse index yet."
+                )
 
         common_len = min(src_state_indices.size, dst_state_indices.size)
+        if (
+            state_type == "c128_state"
+            and common_len == 0
+            and src_state_indices.size == 0
+            and dst_state_indices.size == 0
+        ):
+            return []
         if common_len == 0 and max(src_state_indices.size, dst_state_indices.size) > 0:
             raise RuntimeError(
                 f"No overlapping state indices for state_type={state_type}"
             )
         if src_state_indices.size != dst_state_indices.size:
+            # These components are position- or request-indexed: truncating
+            # silently misaligns rows and corrupts KV. Paged swa/dsa tolerate
+            # a 1-page drift -> keep truncation.
+            if state_type in ("swa_ring", "c128_state"):
+                raise RuntimeError(
+                    f"{state_type.upper()} state index length mismatch: "
+                    f"src={src_state_indices.size}, dst={dst_state_indices.size}"
+                )
             logger.warning(
                 "State index length mismatch for %s: src=%d dst=%d; truncating to common prefix=%d",
                 state_type,
@@ -1324,8 +1394,16 @@ class MoriKVSender(CommonKVSender):
         bootstrap_room: int,
         dest_tp_ranks: List[int],
         pp_rank: int,
+        req_has_disagg_prefill_dp_rank: bool = False,
     ):
-        super().__init__(mgr, bootstrap_addr, bootstrap_room, dest_tp_ranks, pp_rank)
+        super().__init__(
+            mgr,
+            bootstrap_addr,
+            bootstrap_room,
+            dest_tp_ranks,
+            pp_rank,
+            req_has_disagg_prefill_dp_rank,
+        )
         self.transfer_statuses: List[TransferStatus] = []
         self.pending_infos: Optional[List[TransferInfo]] = None
         self.conclude_state: Optional[KVPoll] = None
@@ -1352,6 +1430,8 @@ class MoriKVSender(CommonKVSender):
             else None
         )
         self._record_transfer_indices(kv_indices, state_indices)
+        wait_event = getattr(self, "_early_send_wait_event", None)
+        self._early_send_wait_event = None
         self.kv_mgr.enqueue_transfer(
             _TransferChunk(
                 sender=self,
@@ -1360,6 +1440,7 @@ class MoriKVSender(CommonKVSender):
                 is_last_chunk=is_last_chunk,
                 aux_index=self.aux_index if is_last_chunk else None,
                 normalized_state=normalized_state,
+                wait_event=wait_event,
             )
         )
         self._maybe_finalize_if_room_failed()
@@ -1376,6 +1457,11 @@ class MoriKVSender(CommonKVSender):
         if self.kv_mgr.request_status.get(self.bootstrap_room) == KVPoll.Failed:
             self._finalize_failure()
             return
+
+        # Wait for the prefill forward that produced these KV pages before
+        # issuing the RDMA read (early-send overlaps that forward).
+        if task.wait_event is not None:
+            task.wait_event.synchronize()
 
         statuses, infos = self.kv_mgr.add_transfer_request(
             self.bootstrap_room,
@@ -1628,6 +1714,12 @@ class MoriKVReceiver(CommonKVReceiver):
         aux_bytes = str(aux_index).encode("ascii") if aux_index is not None else b""
         normalized_state = _normalize_state_indices_per_component(state_indices)
 
+        decode_prefix_bytes = (
+            str(int(decode_prefix_len)).encode("ascii")
+            if decode_prefix_len is not None and decode_prefix_len > 0
+            else b""
+        )
+
         for bootstrap_info in self.bootstrap_infos:
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
             is_dummy = bootstrap_info.get("is_dummy", False)
@@ -1647,6 +1739,7 @@ class MoriKVReceiver(CommonKVReceiver):
                         aux_bytes if not is_dummy else b"",
                         state_bytes,
                         str(self.required_dst_info_num).encode("ascii"),
+                        decode_prefix_bytes,
                     ]
                 )
         self.init_time = time.time()
