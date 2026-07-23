@@ -312,7 +312,12 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
                 g1_scale_c=layer.g1_scale_c,
                 g1_alphas=layer.g1_alphas,
                 g2_alphas=layer.g2_alphas,
-                w13_input_scale_quant=layer.w13_input_scale_quant,
+                # global_scale must be shape [1]: the cute-dsl fp4_quantize
+                # backend reshapes it to [1]. process_weights_after_loading
+                # expands this to [num_local_experts] (all equal), so slice the
+                # single value out (matches ModelOptNvFp4FusedMoEMethod, which
+                # feeds a scalar).
+                w13_input_scale_quant=layer.w13_input_scale_quant[:1],
                 global_num_experts=layer.num_experts,
                 local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
                 local_num_experts=layer.num_local_experts,
