@@ -141,8 +141,18 @@ fn token_handoff_prefill_frame_for_client(frame: bytes::Bytes) -> Option<bytes::
         return Some(frame);
     };
     let mut changed = false;
+    let mut has_visible_output = false;
     if let Some(choices) = event.get_mut("choices").and_then(Value::as_array_mut) {
         for choice in choices {
+            has_visible_output |= choice
+                .get("text")
+                .and_then(Value::as_str)
+                .is_some_and(|text| !text.is_empty());
+            has_visible_output |= choice
+                .get("delta")
+                .and_then(|delta| delta.get("content"))
+                .and_then(Value::as_str)
+                .is_some_and(|content| !content.is_empty());
             if choice.get("finish_reason").and_then(Value::as_str) == Some("length") {
                 choice["finish_reason"] = Value::Null;
                 changed = true;
@@ -151,6 +161,9 @@ fn token_handoff_prefill_frame_for_client(frame: bytes::Bytes) -> Option<bytes::
     }
     if !changed {
         return Some(frame);
+    }
+    if !has_visible_output {
+        return Some(bytes::Bytes::new());
     }
 
     match serde_json::to_string(&event) {
@@ -1455,6 +1468,9 @@ impl PDRouter {
                         reached_prefill_done = true;
                         break;
                     };
+                    if frame.is_empty() {
+                        continue;
+                    }
                     if tx.send(Ok(frame)).is_err() {
                         Self::abort_token_handoff_pair(
                             &client,
@@ -2146,6 +2162,15 @@ mod tests {
 
         assert_eq!(event["choices"][0]["text"], " bridge");
         assert!(event["choices"][0]["finish_reason"].is_null());
+        assert!(
+            token_handoff_prefill_frame_for_client(bytes::Bytes::from_static(
+                br#"data: {"choices":[{"text":"","finish_reason":"length"}]}
+
+"#
+            ))
+            .expect("empty boundary frame")
+            .is_empty()
+        );
         assert!(
             token_handoff_prefill_frame_for_client(bytes::Bytes::from_static(
                 b"data: [DONE]\n\n"
