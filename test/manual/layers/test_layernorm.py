@@ -3,7 +3,12 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.layernorm import GemmaRMSNorm, LayerNorm, RMSNorm
+from sglang.srt.layers.layernorm import (
+    Gemma3RMSNorm,
+    GemmaRMSNorm,
+    LayerNorm,
+    RMSNorm,
+)
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -107,6 +112,94 @@ class TestGemmaRMSNorm(CustomTestCase):
                 seed=params[4],
             ):
                 self._run_gemma_rms_norm_test(*params)
+
+
+class TestGemma3RMSNorm(CustomTestCase):
+    """Guards Gemma3RMSNorm.forward_cuda, which routes contiguous inputs to the
+    fused gemma_rmsnorm kernel and falls back to forward_native otherwise.
+
+    Two failure modes are covered:
+    1. Numerical: the fused kernel must match the fp32 native reference.
+    2. Layout: for the non-contiguous transposed q/k tensors that
+       Gemma3Attention feeds in, forward_cuda must preserve the input's
+       memory layout. An earlier fused implementation used .contiguous(),
+       which silently re-laid-out memory to standard order; the values stayed
+       correct but a downstream permute().view() (the attention KV write)
+       then failed with a stride error. Comparing only values would not catch
+       this, so we also assert stride parity and replay that permute().view().
+    """
+
+    DTYPES = [torch.half, torch.bfloat16]
+    NUM_TOKENS = [7, 83, 4096]
+    HIDDEN_SIZES = [768, 2560, 5376]
+    SEEDS = [0]
+
+    @classmethod
+    def setUpClass(cls):
+        if not torch.cuda.is_available():
+            raise unittest.SkipTest("CUDA is not available")
+        torch.set_default_device("cuda")
+
+    def _make_layer(self, dim, dtype):
+        layer = Gemma3RMSNorm(dim).to(dtype=dtype)
+        # Gemma weights are zero-centered (kernel applies the +1 internally).
+        layer.weight.data.normal_(mean=0.0, std=0.1)
+        return layer
+
+    def test_contiguous_matches_native(self):
+        # 2D hidden-size norms (the common, fused path).
+        for num_tokens, hidden_size, dtype, seed in itertools.product(
+            self.NUM_TOKENS, self.HIDDEN_SIZES, self.DTYPES, self.SEEDS
+        ):
+            with self.subTest(
+                num_tokens=num_tokens,
+                hidden_size=hidden_size,
+                dtype=dtype,
+                seed=seed,
+            ):
+                torch.manual_seed(seed)
+                layer = self._make_layer(hidden_size, dtype)
+                x = torch.randn(num_tokens, hidden_size, dtype=dtype) / (
+                    2 * hidden_size
+                )
+                with torch.inference_mode():
+                    ref = layer.forward_native(x)
+                    out = layer(x)
+                self.assertTrue(torch.allclose(out, ref, atol=1e-2, rtol=1e-2))
+                self.assertEqual(out.stride(), ref.stride())
+
+    def test_transposed_qk_layout_preserved(self):
+        # Reproduces the exact non-contiguous q/k tensor Gemma3Attention builds:
+        # [s, h*d] -> unflatten -> [s, h, d] -> transpose(0,1).unsqueeze(0)
+        #   -> [1, h, s, d]  (non-contiguous view over [s, h, d] memory)
+        head_dim = 256
+        for num_tokens, num_heads, dtype in itertools.product(
+            [7, 83], [4, 8], self.DTYPES
+        ):
+            with self.subTest(num_tokens=num_tokens, num_heads=num_heads, dtype=dtype):
+                torch.manual_seed(0)
+                layer = self._make_layer(head_dim, dtype)
+                flat = torch.randn(num_tokens, num_heads * head_dim, dtype=dtype)
+                x = flat.unflatten(-1, (num_heads, head_dim))
+                x = x.transpose(0, 1).unsqueeze(0)
+                self.assertFalse(x.is_contiguous())
+                with torch.inference_mode():
+                    ref = layer.forward_native(x)
+                    out = layer(x)
+                # values match ...
+                self.assertTrue(torch.allclose(out, ref, atol=1e-2, rtol=1e-2))
+                # ... and the memory layout is preserved (the regression guard).
+                self.assertEqual(out.stride(), ref.stride())
+                # the downstream op that crashed on the buggy layout must work.
+                permuted = out.permute(0, 2, 1, 3)
+                permuted.reshape(-1, num_heads, head_dim).view(-1, num_heads * head_dim)
+
+    def test_empty_input(self):
+        layer = self._make_layer(2560, torch.bfloat16)
+        x = torch.empty(0, 2560, dtype=torch.bfloat16)
+        with torch.inference_mode():
+            out = layer(x)
+        self.assertEqual(out.shape, x.shape)
 
 
 class TestLayerNorm(CustomTestCase):
