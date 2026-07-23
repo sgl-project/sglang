@@ -18,7 +18,7 @@ class TargetVerifyTopk1Output(NamedTuple):
     bonus_tokens: torch.Tensor
     new_seq_lens: torch.Tensor
     select_index: torch.Tensor
-    draft_input_ids: torch.Tensor
+    draft_tokens: torch.Tensor
 
 
 @triton.jit
@@ -118,7 +118,7 @@ def _target_verify_topk1_finalize_kernel(
     bonus_tokens,
     new_seq_lens,
     select_index,
-    draft_input_ids,
+    draft_tokens,
     num_splits: tl.constexpr,
     NUM_DRAFT_TOKENS: tl.constexpr,
     ROW_BLOCK: tl.constexpr,
@@ -129,7 +129,7 @@ def _target_verify_topk1_finalize_kernel(
     rows = tl.arange(0, ROW_BLOCK)
     splits = tl.arange(0, SPLIT_BLOCK)
 
-    # Finish every row reduction for this request in parallel. The accepted
+    # Finish every row reduction for this request in parallel. The accept
     # chain then selects from these register-resident token ids.
     partial_offsets = (request_base + rows[:, None]) * num_splits + splits[None, :]
     partial_mask = (rows[:, None] < NUM_DRAFT_TOKENS) & (splits[None, :] < num_splits)
@@ -151,7 +151,7 @@ def _target_verify_topk1_finalize_kernel(
     last_global = tl.load(retrieve_index + request_base)
     current_node = tl.cast(0, last_global.dtype)
     accept_values = tl.where(rows == 0, last_global, accept_values)
-    accepted = 0
+    num_correct_drafts_value = 0
     active = True
 
     # topk=1 produces a chain, so there are no siblings to search. Keeping an
@@ -176,32 +176,34 @@ def _target_verify_topk1_finalize_kernel(
         predict_values = tl.where(
             matched & (rows == last_local), target_id, predict_values
         )
-        next_accepted = accepted + 1
+        next_num_correct_drafts = num_correct_drafts_value + 1
         accept_values = tl.where(
-            matched & (rows == next_accepted), next_global, accept_values
+            matched & (rows == next_num_correct_drafts), next_global, accept_values
         )
 
-        accepted = tl.where(matched, next_accepted, accepted)
+        num_correct_drafts_value = tl.where(
+            matched, next_num_correct_drafts, num_correct_drafts_value
+        )
         current_node = tl.where(matched, safe_next, current_node)
         last_global = tl.where(matched, next_global, last_global)
         active = matched
 
-    # The target token following the last accepted draft is the bonus token.
+    # The target token following the final correct draft is the bonus token.
     last_local = last_global - request_base
     bonus_token = tl.sum(tl.where(rows == last_local, target_ids, 0), axis=0)
     predict_values = tl.where(rows == last_local, bonus_token, predict_values)
 
     row_mask = rows < NUM_DRAFT_TOKENS
     tl.store(predict + request_base + rows, predict_values, mask=row_mask)
-    tl.store(draft_input_ids + request_base + rows, predict_values, mask=row_mask)
+    tl.store(draft_tokens + request_base + rows, predict_values, mask=row_mask)
     tl.store(accept_index + request_base + rows, accept_values, mask=row_mask)
 
-    accept_len = accepted + 1
-    tl.store(num_correct_drafts + batch_idx, accepted)
+    accept_len = num_correct_drafts_value + 1
+    tl.store(num_correct_drafts + batch_idx, num_correct_drafts_value)
     tl.store(accept_lens + batch_idx, accept_len)
     tl.store(bonus_tokens + batch_idx, bonus_token)
     tl.store(new_seq_lens + batch_idx, tl.load(seq_lens + batch_idx) + accept_len)
-    tl.store(select_index + batch_idx, request_base + accepted)
+    tl.store(select_index + batch_idx, request_base + num_correct_drafts_value)
 
 
 @triton.jit
@@ -468,7 +470,7 @@ def target_verify_topk1_postprocess(
     bonus_tokens = torch.empty((batch_size,), dtype=torch.int32, device=device)
     new_seq_lens = torch.empty_like(seq_lens)
     select_index = torch.empty((batch_size,), dtype=torch.int64, device=device)
-    draft_input_ids = torch.empty((total_rows,), dtype=torch.int64, device=device)
+    draft_tokens = torch.empty((total_rows,), dtype=torch.int64, device=device)
     if batch_size == 0:
         return TargetVerifyTopk1Output(
             predict=predict,
@@ -478,7 +480,7 @@ def target_verify_topk1_postprocess(
             bonus_tokens=bonus_tokens,
             new_seq_lens=new_seq_lens,
             select_index=select_index,
-            draft_input_ids=draft_input_ids,
+            draft_tokens=draft_tokens,
         )
 
     num_splits, partial_vals, partial_indices = _launch_draft_topk1_partials(
@@ -498,7 +500,7 @@ def target_verify_topk1_postprocess(
         bonus_tokens,
         new_seq_lens,
         select_index,
-        draft_input_ids,
+        draft_tokens,
         num_splits,
         NUM_DRAFT_TOKENS=num_draft_tokens,
         ROW_BLOCK=triton.next_power_of_2(num_draft_tokens),
@@ -513,7 +515,7 @@ def target_verify_topk1_postprocess(
         bonus_tokens=bonus_tokens,
         new_seq_lens=new_seq_lens,
         select_index=select_index,
-        draft_input_ids=draft_input_ids,
+        draft_tokens=draft_tokens,
     )
 
 

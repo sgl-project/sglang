@@ -422,7 +422,7 @@ def _finalize_accept_tree_path(
     token_to_kv_pool_allocator: Any,
     num_draft_tokens: int,
 ) -> torch.Tensor:
-    """Tree drafting (topk > 1): move the accepted path -- KV slots, predict,
+    """Tree drafting (topk > 1): move the accept path -- KV slots, predict,
     hidden_states -- to the contiguous front of each per-req block, which the
     downstream chain-layout code (draft-extend select_index, committed-KV reads)
     assumes. Returns compacted predict; mutates logits_output.hidden_states
@@ -450,7 +450,7 @@ def _compact_accept_to_front(
     *,
     num_draft_tokens: int,
 ) -> torch.Tensor:
-    """Gather the accepted tree path to the front of each per-req block.
+    """Gather the accept tree path to the front of each per-req block.
 
     ``x`` is node-indexed over the whole tree (``[bs * num_draft_tokens, ...]``),
     ``accept_index`` is ``[bs, spec_steps + 1]`` global node indices (-1 padded).
@@ -491,7 +491,7 @@ def run_eagle_verify(
     - ``metadata_ready_pre_pad``: multi-layer marks forward metadata ready
       pre-pad unconditionally; single-layer relies on eagle_prepare_for_verify
       marking it only when the cuda-graph path ran.
-    - ``finalize_tree_path``: single-layer compacts the accepted tree path to
+    - ``finalize_tree_path``: single-layer compacts the accept tree path to
       the front of each per-req block for topk > 1; multi-layer has never run
       this compaction.
     - ``enable_target_verify_topk1``: only the single-layer internal
@@ -687,7 +687,7 @@ def run_eagle_verify(
         compute_spec_v2_logprobs(batch, logits_output, predict, accept_index, num_steps)
 
     if finalize_tree_path and not batch.forward_mode.is_idle() and topk > 1:
-        # topk == 1 needs nothing here: the accepted path is already the front
+        # topk == 1 needs nothing here: the accept path is already the front
         # chain, so the whole compaction is an identity transform.
         predict = _finalize_accept_tree_path(
             batch,

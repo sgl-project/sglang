@@ -7,11 +7,13 @@ from typing import Any, Callable
 import torch
 import zmq
 
-from sglang.srt.distributed.parallel_state import get_world_group, get_world_size
+from sglang.srt.distributed.parallel_state import (
+    get_world_group,
+    get_world_size,
+)
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
 from sglang.srt.managers.io_struct import UpdateExpertBackupReq, sock_recv, sock_send
-from sglang.srt.runtime_context import get_exec
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.network import get_local_ip_auto
 
@@ -109,7 +111,7 @@ class ExpertBackupClient:
         global_expert_location_metadata = get_global_expert_location_metadata()
         num_experts = (
             self.model_config.hf_config.n_routed_experts
-            + get_exec().moe.ep_num_redundant_experts
+            + self.server_args.ep_num_redundant_experts
         )
         num_local_experts = num_experts // self.moe_ep_size
         for i in range(self.engine_num):
