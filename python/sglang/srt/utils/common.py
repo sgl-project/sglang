@@ -2063,7 +2063,6 @@ def graceful_kill_process_tree(
 
     children = itself.children(recursive=True)
 
-    # Step 1: SIGTERM all children to let them clean up.
     signaled = []
     for child in children:
         if child.pid == skip_pid:
@@ -2072,12 +2071,11 @@ def graceful_kill_process_tree(
             logger.info(
                 f"Sending SIGTERM to child process {child.pid} ({child.name()})"
             )
-            child.terminate()  # SIGTERM
+            child.terminate()
             signaled.append(child)
         except psutil.NoSuchProcess:
             pass
 
-    # Step 2: wait for graceful exit, then SIGKILL the rest.
     if signaled:
         logger.info(
             f"Waiting up to {timeout}s for {len(signaled)} child process(es) "
@@ -2098,10 +2096,9 @@ def graceful_kill_process_tree(
             )
             for child in alive:
                 try:
-                    child.kill()  # SIGKILL
+                    child.kill()
                 except psutil.NoSuchProcess:
                     pass
-            # Best-effort wait for the kernel to reap them.
             kill_deadline = time.monotonic() + 3
             while _still_holding_resources(alive) and time.monotonic() < kill_deadline:
                 time.sleep(0.1)
@@ -2119,27 +2116,26 @@ def install_graceful_sigterm_handler(
     logger: logging.Logger,
     label: str,
     on_shutdown: Optional[Callable[[], None]] = None,
+    is_shutting_down: Optional[Callable[[], bool]] = None,
 ):
-    """Install a SIGTERM handler that runs an optional hook, then exits with 0.
+    """Install a SIGTERM handler that unwinds through process cleanup.
 
-    Re-arms SIGTERM to SIG_IGN to block re-entry, logs, runs on_shutdown, then
-    sys.exit(0). Exit 0 lets atexit/C++ destructors run (Mooncake/hicache RDMA
-    teardown) and avoids SubprocessWatchdog treating it as a crash. on_shutdown
-    is evaluated when the signal fires, so it may reference objects created after
-    this call; its exceptions are logged and swallowed.
+    An already-running cleanup is left uninterrupted. Other exits remain nonzero
+    so an active SubprocessWatchdog still treats them as unexpected.
     """
 
     def _handler(signum, frame):
-        signal.signal(signal.SIGTERM, signal.SIG_IGN)  # prevent re-entry
-        logger.info(
-            f"SIGTERM received in {label}; exiting normally to allow cleanup..."
-        )
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        if is_shutting_down is not None and is_shutting_down():
+            logger.info("SIGTERM received in %s while cleanup is in progress.", label)
+            return
+        logger.info("SIGTERM received in %s; starting cleanup before exit.", label)
         if on_shutdown is not None:
             try:
                 on_shutdown()
             except Exception:
                 logger.exception("Error in SIGTERM cleanup hook")
-        sys.exit(0)
+        sys.exit(128 + signum)
 
     signal.signal(signal.SIGTERM, _handler)
 

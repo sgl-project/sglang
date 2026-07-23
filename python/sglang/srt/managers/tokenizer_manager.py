@@ -34,7 +34,17 @@ from datetime import datetime
 from enum import Enum
 from functools import lru_cache
 from http import HTTPStatus
-from typing import Any, Awaitable, Dict, Iterable, List, Optional, Tuple, Union
+from typing import (
+    Any,
+    Awaitable,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Tuple,
+    Union,
+)
 
 import fastapi
 import pybase64
@@ -146,6 +156,25 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 _REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
 
 logger = logging.getLogger(__name__)
+
+
+def shutdown_scheduler_and_child_processes(
+    dispatch_shutdown: Callable[[], None],
+) -> None:
+    try:
+        dispatch_shutdown()
+    except Exception:
+        logger.exception("Failed to dispatch scheduler shutdown request")
+    else:
+        deadline = time.monotonic() + envs.SGLANG_SCHEDULER_SHUTDOWN_TIMEOUT.get()
+        while time.monotonic() < deadline and collect_scheduler_processes():
+            time.sleep(0.1)
+
+    graceful_kill_process_tree(
+        os.getpid(),
+        include_parent=False,
+        timeout=envs.SGLANG_CHILD_PROCESS_SHUTDOWN_TIMEOUT.get(),
+    )
 
 
 @lru_cache(maxsize=1)
@@ -2759,27 +2788,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             else:
                 break
 
-        # Stop watchdog first — otherwise child exits trigger false crash detection.
+        # Child exits are expected after this point.
         if self._subprocess_watchdog is not None:
             self._subprocess_watchdog.stop()
-        with self.soft_watchdog.disable():
-            # Ask schedulers to release resources in userspace and exit via ShutdownReq.
-            # Wait for them to exit before sending SIGTERM to remaining children,
-            # otherwise the SIGTERM would race with ShutdownReq processing.
-            self._dispatch_to_scheduler(ShutdownReq())
-            deadline = time.monotonic() + envs.SGLANG_SCHEDULER_SHUTDOWN_TIMEOUT.get()
-            while time.monotonic() < deadline and collect_scheduler_processes():
-                time.sleep(0.1)
+        if self.server_args.tokenizer_worker_num == 1:
+            with self.soft_watchdog.disable():
+                shutdown_scheduler_and_child_processes(
+                    lambda: self._dispatch_to_scheduler(ShutdownReq())
+                )
 
-            # SIGTERM remaining children (detokenizer, hicache sidecar, etc.),
-            # then SIGKILL stragglers after timeout.
-            graceful_kill_process_tree(
-                os.getpid(),
-                include_parent=False,
-                timeout=envs.SGLANG_CHILD_PROCESS_SHUTDOWN_TIMEOUT.get(),
-            )
-
-        # os._exit: sys.exit() would be caught by the asyncio event loop.
+        # SystemExit is absorbed by the task wrapper.
         os._exit(0)
 
     def force_exit_handler(self):

@@ -4604,8 +4604,6 @@ def run_scheduler_process(
     parent_process = psutil.Process().parent()
     scheduler = None
 
-    # SIGTERM → mark gracefully_exit so the finally block frees host resources.
-    # The lambda is evaluated at signal time, seeing the scheduler created below.
     install_graceful_sigterm_handler(
         logger,
         f"scheduler process (TP{tp_rank} PP{pp_rank})",
@@ -4614,6 +4612,7 @@ def run_scheduler_process(
             if scheduler is not None
             else None
         ),
+        is_shutting_down=lambda: (scheduler is not None and scheduler.gracefully_exit),
     )
 
     # Set up tracing
