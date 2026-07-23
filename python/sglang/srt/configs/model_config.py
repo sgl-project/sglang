@@ -1372,6 +1372,7 @@ class ModelConfig:
             "modelslim",
             "humming",
             "quark_mxfp4",
+            "auto-round",
         ]
         compatible_quantization_methods = {
             "modelopt_fp8": ["modelopt"],
