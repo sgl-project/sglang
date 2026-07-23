@@ -97,6 +97,7 @@ from typing_extensions import Literal
 from sglang.srt.environ import envs
 from sglang.srt.observability.func_timer import enable_func_timer
 from sglang.srt.platforms import current_platform
+from sglang.srt.plugins import PLATFORM_PLUGINS_GROUP
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.video_decoder import _BACKEND, VideoDecoderWrapper
 
@@ -522,7 +523,7 @@ def get_available_gpu_memory(
             raise ValueError(
                 f"Unsupported device type: {device!r}. "
                 "If this is an OOT platform, ensure it is properly registered "
-                "via the 'sglang.platform_plugins' entry point."
+                f"via the '{PLATFORM_PLUGINS_GROUP}' entry point."
             )
         total_mem = current_platform.get_device_total_memory(gpu_id)
         used_mem = current_platform.get_current_memory_usage()
