@@ -646,7 +646,9 @@ def _fused_moe_kernel_sequence(
                 and block_shape[1] == 128
             )
             if _use_fused_act_quant:
-                from sglang.kernels.ops.activation.activation import run_activation_quant
+                from sglang.kernels.ops.activation.activation import (
+                    run_activation_quant,
+                )
 
                 _expert_ids_arg = None
                 _expert_step_arg = 1
@@ -698,7 +700,9 @@ def _fused_moe_kernel_sequence(
                 and block_shape[1] == 128
             )
             if _use_fused_act_quant:
-                from sglang.kernels.ops.activation.activation import run_activation_quant
+                from sglang.kernels.ops.activation.activation import (
+                    run_activation_quant,
+                )
 
                 _expert_ids_arg = None
                 _expert_step_arg = 1

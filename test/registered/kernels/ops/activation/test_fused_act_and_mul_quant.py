@@ -16,12 +16,12 @@ import sys
 import pytest
 import torch
 
+from sglang.kernels.jit.utils import get_ci_test_range
 from sglang.kernels.ops.activation.activation import (
     SUPPORTED_ACTIVATIONS,
     run_activation,
     run_activation_quant,
 )
-from sglang.kernels.jit.utils import get_ci_test_range
 from sglang.kernels.ops.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
 from sglang.test.ci.ci_register import register_cuda_ci
 
