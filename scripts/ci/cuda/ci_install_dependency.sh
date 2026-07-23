@@ -503,7 +503,14 @@ install_extra_deps() {
             ;;
         x86_64)
             if [ "$CU_MAJOR" = "13" ]; then
-                MOONCAKE_WHEEL_ZIP_URL="https://nightly.link/kvcache-ai/Mooncake/actions/artifacts/8497021972.zip"
+                # The x86 CU13 disagg runner is CPython 3.10, so a cp312 wheel is
+                # rejected ("incompatible with the current platform"). Pick the
+                # ABI-matching artifact by SYS_PYTHON_VER.
+                if [ "$SYS_PYTHON_VER" = "3.10" ]; then
+                    MOONCAKE_WHEEL_ZIP_URL="https://nightly.link/kvcache-ai/Mooncake/actions/artifacts/8497008026.zip"
+                else
+                    MOONCAKE_WHEEL_ZIP_URL="https://nightly.link/kvcache-ai/Mooncake/actions/artifacts/8497021972.zip"
+                fi
             else
                 MOONCAKE_WHEEL_ZIP_URL="https://nightly.link/kvcache-ai/Mooncake/actions/artifacts/8497492280.zip"
             fi
@@ -516,7 +523,7 @@ install_extra_deps() {
         python3 -c "import zipfile,sys; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])" \
             "${MOONCAKE_WHEEL_DIR}/wheel.zip" "${MOONCAKE_WHEEL_DIR}"
         MOONCAKE_PKG="$(ls "${MOONCAKE_WHEEL_DIR}"/*.whl)"
-        echo "TEMP: overriding mooncake with custom wheel for $(uname -m)/CU${CU_MAJOR}: ${MOONCAKE_PKG}"
+        echo "TEMP: overriding mooncake with custom wheel for $(uname -m)/CU${CU_MAJOR}/py${SYS_PYTHON_VER}: ${MOONCAKE_PKG}"
     fi
     # <<< TEMP ------------------------------------------------------------------
 
