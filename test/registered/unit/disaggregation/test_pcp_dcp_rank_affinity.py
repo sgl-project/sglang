@@ -127,6 +127,7 @@ class TestPCPDCPRankAffinity(CustomTestCase):
             enable_pcp_dcp_rank_affinity=True,
             attn_cp_size=2,
             attn_cp_rank=1,
+            is_dummy_cp_rank=False,
             server_args=SimpleNamespace(enable_dsa_cache_layer_split=False),
         )
         sender = CommonKVSender.__new__(CommonKVSender)

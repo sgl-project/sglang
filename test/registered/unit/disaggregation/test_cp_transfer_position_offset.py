@@ -19,8 +19,11 @@ class TestCPTransferPositionOffset(CustomTestCase):
         sender = CommonKVSender.__new__(CommonKVSender)
         sender.kv_mgr = SimpleNamespace(
             enable_all_cp_ranks_for_transfer=True,
+            enable_pcp_dcp_rank_affinity=False,
             attn_cp_rank=cp_rank,
             attn_cp_size=cp_size,
+            is_dummy_cp_rank=False,
+            server_args=SimpleNamespace(enable_dsa_cache_layer_split=False),
         )
         sender.num_kv_indices = total
         sender.curr_idx = current
