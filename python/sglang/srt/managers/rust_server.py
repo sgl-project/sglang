@@ -100,10 +100,10 @@ class RustServer:
         request objects. The scheduler's request receiver calls this instead of
         polling the zmq socket when `rust_server_mode` is set.
 
-        The transfer is **columnar**: `recv_requests` returns scalar msgpack
-        `headers` (with `input_ids` omitted) plus one concatenated raw int64
-        `ids_buf` and per-request `lengths`, so the large `input_ids` lists
-        never go through msgpack. Each header is `msgpack_decode`d (yielding
+        The transfer is **columnar**: `recv_requests` returns an `IngressBatch`
+        of scalar msgpack `headers` (with `input_ids` omitted) plus one
+        concatenated raw int64 `data` buffer and per-request `lengths`, so the
+        large `input_ids` lists never go through msgpack. Each header is `msgpack_decode`d (yielding
         the same `TokenizedGenerateReqInput` / control objects the zmq path
         produces, so the IPC schema is tracked automatically) and its `input_ids`
         slice is wrapped as the `array("q")` the scheduler expects. `recv_requests`
@@ -111,11 +111,13 @@ class RustServer:
         across a wait — same contract as `zmq.NOBLOCK`.
         """
         limit = max_recv if max_recv > 0 else self._max_per_poll
-        headers, ids_buf, lengths = self.server.recv_requests(limit)
+        batch = self.server.recv_requests(limit)
+        # Bind once: each attribute access converts the rust vec to a fresh list.
+        headers, data, lengths = batch.headers, batch.data, batch.lengths
         if not headers:
             return []
 
-        ids_view = memoryview(ids_buf)
+        ids_view = memoryview(data)
         out = []
         pos = 0  # byte offset into ids_buf
         for header, n in zip(headers, lengths):

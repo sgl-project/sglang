@@ -29,10 +29,18 @@ use pyo3::types::PyBytes;
 
 use crate::runtime::{Runtime, RuntimeConfig};
 
-/// Columnar ingress batch handed to Python by [`Server::recv_requests`]:
-/// `(headers, ids_buf, lengths)` — per-request scalar msgpack headers, all
-/// requests' raw int64 ids concatenated, and per-request token counts.
-type IngressBatch<'py> = (Vec<Bound<'py, PyBytes>>, Bound<'py, PyBytes>, Vec<u32>);
+/// Columnar ingress batch handed to Python by [`Server::recv_requests`].
+/// `frozen`: immutable snapshot, so field access never contends on a borrow.
+#[pyclass(frozen, get_all)]
+struct IngressBatch {
+    /// One msgpack scalar header per request (`input_ids` omitted).
+    headers: Vec<Py<PyBytes>>,
+    /// The raw-data plane today just all requests' raw little-endian int64
+    /// ids, concatenated; sliced per request via `lengths`.
+    data: Py<PyBytes>,
+    /// Per-request token count (0 for control requests).
+    lengths: Vec<u32>,
+}
 
 /// Handle owned by the Python scheduler process. Construct once via
 /// [`Server::start`], then poll it from the scheduler event loop.
@@ -121,23 +129,22 @@ impl Server {
         Ok(Server { rt })
     }
 
-    /// Non-blocking drain of the ingress ring, returned **columnar** so the large
-    /// `input_ids` tensor never goes through msgpack. Yields a 3-tuple:
-    ///   * `headers`: `list[bytes]` — one msgpack scalar header per request
-    ///     (`input_ids` omitted), decoded individually by the scheduler;
-    ///   * `ids_buf`: `bytes` — all requests' raw little-endian int64 ids,
-    ///     concatenated; sliced per request and wrapped as `array("q")`;
-    ///   * `lengths`: `list[int]` — per-request token count (0 for control reqs),
-    ///     so the scheduler can slice `ids_buf`.
-    /// The GIL is released for the drain + columnar split; only the `PyBytes`
-    /// marshaling needs it. The `ids` cells are copied **directly into the result
-    /// `bytes`** (one copy, no intermediate buffer).
+    /// Non-blocking drain of the ingress ring, returned **columnar** as an
+    /// [`IngressBatch`] so the large `input_ids` tensor never goes through
+    /// msgpack (see the field docs for the layout). The GIL is released for the
+    /// drain + columnar split; only the `PyBytes` marshaling needs it. The `ids`
+    /// cells are copied **directly into the result `bytes`** (one copy, no
+    /// intermediate buffer).
     #[pyo3(signature = (max = 256))]
-    fn recv_requests<'py>(&self, py: Python<'py>, max: usize) -> PyResult<IngressBatch<'py>> {
+    fn recv_requests(&self, py: Python<'_>, max: usize) -> PyResult<IngressBatch> {
         let cols = py.detach(|| self.rt.ingress.drain(max));
-        let headers = cols.headers.iter().map(|h| PyBytes::new(py, h)).collect();
+        let headers = cols
+            .headers
+            .iter()
+            .map(|h| PyBytes::new(py, h).unbind())
+            .collect();
         // Single pass: copy each raw ids cell straight into the output `bytes`.
-        let ids_buf = PyBytes::new_with(py, cols.ids_total, |buf| {
+        let data = PyBytes::new_with(py, cols.ids_total, |buf| {
             let mut pos = 0;
             for cell in &cols.ids {
                 let end = pos + cell.len();
@@ -145,8 +152,13 @@ impl Server {
                 pos = end;
             }
             Ok(())
-        })?;
-        Ok((headers, ids_buf, cols.lengths))
+        })?
+        .unbind();
+        Ok(IngressBatch {
+            headers,
+            data,
+            lengths: cols.lengths,
+        })
     }
 
     /// Park up to `timeout_ms` for an incoming request so the idle scheduler loop
@@ -225,5 +237,6 @@ fn sglang_server(m: &Bound<'_, PyModule>) -> PyResult<()> {
         .with_writer(writer)
         .try_init();
     m.add_class::<Server>()?;
+    m.add_class::<IngressBatch>()?;
     Ok(())
 }
