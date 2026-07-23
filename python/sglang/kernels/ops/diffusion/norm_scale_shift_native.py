@@ -59,7 +59,7 @@ def _row_bf16(t, device: torch.device):
 
 
 @cache_once
-def _jit_norm_scale_shift_module() -> Module:
+def norm_scale_shift_module() -> Module:
     return load_jit(
         "qwen_image_norm_scale_shift_native",
         cuda_files=["diffusion/norm_scale_shift.cuh"],
@@ -77,7 +77,7 @@ def _jit_norm_scale_shift_module() -> Module:
     )
 
 
-_module = _jit_norm_scale_shift_module
+_module = norm_scale_shift_module
 
 
 def try_fused_norm_scale_shift(x, weight, bias, scale, shift, norm_type, eps):

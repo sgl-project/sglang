@@ -44,7 +44,7 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     get_remote_instance_transfer_engine_info_per_rank,
     register_memory_region,
 )
-from sglang.srt.runtime_context import get_exec, get_server_args
+from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import get_available_gpu_memory
 
 # Try to import accelerate (optional dependency)
@@ -71,7 +71,9 @@ from sglang.srt.connector import (
     get_connector_type,
 )
 from sglang.srt.connector.utils import parse_model_name
-from sglang.srt.distributed import model_parallel_is_initialized
+from sglang.srt.distributed import (
+    model_parallel_is_initialized,
+)
 from sglang.srt.layers.modelopt_utils import QUANT_CFG_CHOICES
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
@@ -863,8 +865,9 @@ class LayeredModelLoader(DefaultModelLoader):
         device_config: DeviceConfig,
     ) -> nn.Module:
         from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
+        from sglang.srt.runtime_context import get_server_args
 
-        torchao_config = get_exec().graph.torchao_config
+        torchao_config = get_server_args().torchao_config
         target_device = torch.device(device_config.device)
         quant_config = _get_quantization_config(model_config, self.load_config)
 

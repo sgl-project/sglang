@@ -40,7 +40,7 @@ register_kernel(
             in_place=True,
             description="MoE align-block-size (JIT variant, AOT signature)",
         ),
-        description="MoE align-block-size (sglang.jit_kernel).",
+        description="MoE align-block-size (sglang.kernels.jit).",
     )
 )
 register_kernel(

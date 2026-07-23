@@ -10,18 +10,13 @@ from torch import nn
 from triton.language.extra import libdevice
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
-from sglang.kernels.ops.model.inkling.inkling_gate_topk_renorm import (
+from sglang.kernels.ops.moe.gate_topk import gate_topk
+from sglang.kernels.ops.moe.inkling_gate_topk_renorm import (
     ensure_gate_gemv_fused_scratch,
     inkling_gate_gemv,
     inkling_gate_gemv_fused,
 )
-from sglang.srt.configs.inkling import InklingModelConfig
-from sglang.srt.distributed import get_tensor_model_parallel_group
-from sglang.srt.environ import GateGemvMode, envs
-from sglang.srt.layers.moe import get_moe_runner_backend
-from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-from sglang.srt.layers.moe.moe_runner.triton_utils.gate_topk import gate_topk
-from sglang.srt.layers.moe.moe_runner.triton_utils.inkling_moe import (
+from sglang.kernels.ops.moe.inkling_moe import (
     FUSED_PREPROCESS_WIN_TOKENS,
     compute_grouped_gemm_metadata,
     fused_moe_preprocess,
@@ -32,9 +27,16 @@ from sglang.srt.layers.moe.moe_runner.triton_utils.inkling_moe import (
     select_grouped_gemm_block_m,
     silu_and_mul_helion,
 )
-from sglang.srt.layers.moe.moe_runner.triton_utils.sigmoid_gate_topk_renorm import (
+from sglang.kernels.ops.moe.sigmoid_gate_topk_renorm import (
     sigmoid_gate_topk_renorm,
 )
+from sglang.srt.configs.inkling import InklingModelConfig
+from sglang.srt.distributed import (
+    get_tensor_model_parallel_group,
+)
+from sglang.srt.environ import GateGemvMode, envs
+from sglang.srt.layers.moe import get_moe_runner_backend
+from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import PackedTopKOutput, StandardTopKOutput
 from sglang.srt.layers.moe.utils import RoutingMethodType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -57,7 +59,7 @@ from sglang.srt.models.inkling_common.util import (
     lora_compatible_layout_enabled,
     use_inkling_shared_fused_moe,
 )
-from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 from sglang.srt.utils import add_prefix, is_cuda, is_hip
 
@@ -889,8 +891,9 @@ class InklingMoE(nn.Module):
         )
         # --enable-scattered-sconv: the output reduction becomes a hidden-dim
         # reduce-scatter (the consumer mlp_sconv runs on the [T, H/P] shard).
+        from sglang.srt.runtime_context import get_server_args
 
-        self.scattered_sconv = get_exec().comm.enable_scattered_sconv
+        self.scattered_sconv = get_server_args().enable_scattered_sconv
         # Fold the shared-expert partials into the custom AR kernels (or their
         # stage-in copies) instead of a separate torch.add per MoE layer.
         self._fused_ar_shared = envs.SGLANG_OPT_USE_INKLING_FUSED_AR_SHARED.get()
