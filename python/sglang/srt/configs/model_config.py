@@ -120,6 +120,10 @@ def is_deepseek_dsa(config) -> bool:
     )
 
 
+def is_kimi_k3(config) -> bool:
+    return _hf_arch(config) == "KimiK3ForConditionalGeneration"
+
+
 def is_deepseek_v4(config) -> bool:
     return _hf_arch(config) in (
         "DeepseekV4ForCausalLM",

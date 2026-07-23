@@ -712,6 +712,14 @@ class ModelRunner:
             start_layer=self.layer_info.start_layer,
         )
 
+    def get_pp_proxy_residual_num_blocks(self) -> Optional[int]:
+        return misc_utils.resolve_pp_proxy_residual_num_blocks(
+            model_config=self.model_config,
+            pp_size=self.ps.pp_size,
+            pp_rank=self.ps.pp_rank,
+            start_layer=self.layer_info.start_layer,
+        )
+
     def decode_num_tokens_per_req(
         self, *, num_draft_tokens: Optional[int] = None
     ) -> int:
