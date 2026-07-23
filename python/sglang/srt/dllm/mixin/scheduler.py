@@ -78,8 +78,7 @@ class SchedulerDllmMixin:
             not fdfo_mode or result.accept_length_per_req_cpu is not None
         ), "FDFO dLLM result is missing accept lengths."
 
-        # Sync mode emits tokens only once a block fully resolves; FDFO always
-        # commits (resolved blocks decode, unresolved blocks stash + free KV).
+        # FDFO also commits unresolved blocks so their KV can be reused.
         if fdfo_mode or result.next_token_ids:
             block_size = self.dllm_config.block_size
             algo_states = result.dllm_algo_state
@@ -111,20 +110,11 @@ class SchedulerDllmMixin:
                 assert len(next_token_ids) == block_size
 
                 if result.accept_length_per_req_cpu[idx] == 0:
-                    # Block unresolved: stash partial state and free the KV slots
-                    # of the still-masked block so the next FDFO round can
-                    # re-denoise it without leaking the previous allocation.
+                    # Unresolved: keep partial state and KV for the next FDFO round.
                     req.dllm_incomplete_ids = array("q", next_token_ids)
                     req.dllm_algo_state = (
                         algo_states[idx] if algo_states is not None else None
                     )
-                    old_prefix_len = len(req.prefix_indices)
-                    new_fill_len = req.extend_range.end
-                    if new_fill_len > old_prefix_len:
-                        kv_indices_to_free = self.req_to_token_pool.req_to_token[
-                            req.req_pool_idx, old_prefix_len:new_fill_len
-                        ]
-                        self.token_to_kv_pool_allocator.free(kv_indices_to_free)
                     continue
 
                 req.dllm_incomplete_ids = array("q")
@@ -425,6 +415,25 @@ class DllmManager:
         """Remove finished requests from both queues."""
         self.waiting_queue = [req for req in self.waiting_queue if not req.finished()]
         self.staging_queue = [req for req in self.staging_queue if not req.finished()]
+
+    def pop_aborted_reqs(self, abort_all: bool, rid: str) -> List[Req]:
+        aborted_reqs: List[Req] = []
+        seen: Set[int] = set()
+
+        for queue_name in ("waiting_queue", "staging_queue"):
+            queue = getattr(self, queue_name)
+            kept_queue = []
+            for req in queue:
+                if abort_all or req.rid.startswith(rid):
+                    req_id = id(req)
+                    if req_id not in seen:
+                        aborted_reqs.append(req)
+                        seen.add(req_id)
+                else:
+                    kept_queue.append(req)
+            setattr(self, queue_name, kept_queue)
+
+        return aborted_reqs
 
     def init_next_round(self) -> None:
         """Initialize staging requests for next round and clear staging queue."""
