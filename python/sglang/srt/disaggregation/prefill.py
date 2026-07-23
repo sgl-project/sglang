@@ -958,9 +958,7 @@ class SchedulerDisaggregationPrefillMixin:
                         done_reqs.append(req)
                         req.time_stats.set_prefill_kv_transfer_finish_time()
                         continue
-                    if (
-                        len(req.output_ids) < req.token_handoff_min_tokens
-                    ):
+                    if len(req.output_ids) < req.token_handoff_min_tokens:
                         undone_reqs.append(req)
                         continue
                     # Seal the live producer before publishing the final token

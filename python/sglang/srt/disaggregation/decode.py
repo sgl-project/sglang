@@ -67,8 +67,8 @@ from sglang.srt.managers.schedule_batch import (
     ReqKvInfo,
     ScheduleBatch,
 )
-from sglang.srt.managers.scheduler_components.metrics_reporter import PrefillStats
 from sglang.srt.managers.schedule_policy import match_prefix_for_req
+from sglang.srt.managers.scheduler_components.metrics_reporter import PrefillStats
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
@@ -1808,9 +1808,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             # gives us an end-to-end model/config consistency check while
             # materializing the whole post-prompt KV tail in one forward.
             req.output_ids.extend(replay_plan.input_token_ids)
-            req.token_handoff_replay_expected_token = (
-                replay_plan.expected_next_token_id
-            )
+            req.token_handoff_replay_expected_token = replay_plan.expected_next_token_id
             req.token_handoff_replay_bridge_tokens = token_handoff_count
             req.token_handoff_original_stream = req.stream
             req.token_handoff_prefill_owned_tokens = token_handoff_prefill_owned
@@ -2177,9 +2175,7 @@ class SchedulerDisaggregationDecodeMixin:
         self: Scheduler, running_batch: ScheduleBatch
     ) -> NextBatchPlan:
         """Process prebuilt batch and schedule the next decode batch."""
-        replay_ready_batches = getattr(
-            self, "token_handoff_replay_ready_batches", None
-        )
+        replay_ready_batches = getattr(self, "token_handoff_replay_ready_batches", None)
         if replay_ready_batches:
             for replay_batch in replay_ready_batches:
                 self.token_handoff_replay_reserved_reqs = max(
@@ -2342,9 +2338,7 @@ class SchedulerDisaggregationDecodeMixin:
 
         replay_mode = bool(
             self.waiting_queue
-            and hasattr(
-                self.waiting_queue[0], "token_handoff_replay_expected_token"
-            )
+            and hasattr(self.waiting_queue[0], "token_handoff_replay_expected_token")
         )
         for req in self.waiting_queue:
             is_replay = hasattr(req, "token_handoff_replay_expected_token")
@@ -2368,9 +2362,7 @@ class SchedulerDisaggregationDecodeMixin:
                     # `pop_preallocated`. Retracted requests reset `last_node`,
                     # so re-match only when that state is missing.
                     if self.server_args.disaggregation_decode_enable_radix_cache:
-                        tree_cache = (
-                            self.tree_cache if req.last_node is None else None
-                        )
+                        tree_cache = self.tree_cache if req.last_node is None else None
                     else:
                         tree_cache = self.tree_cache
                     req.init_next_round_input(tree_cache)

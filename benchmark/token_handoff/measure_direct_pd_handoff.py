@@ -131,9 +131,7 @@ def main() -> None:
         "decode_texts": [event["text"] for event in decode["events"]],
         "merged_text": merged_text,
         "merged_event_times_ms": [event["at_ms"] for event in merged],
-        "prefill_event_times_ms": [
-            event["at_ms"] for event in prefill["events"]
-        ],
+        "prefill_event_times_ms": [event["at_ms"] for event in prefill["events"]],
         "decode_event_times_ms": [event["at_ms"] for event in decode["events"]],
         "latency_ms": (time.perf_counter() - started) * 1000.0,
     }
