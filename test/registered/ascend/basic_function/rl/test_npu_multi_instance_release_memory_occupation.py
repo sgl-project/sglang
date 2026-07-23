@@ -99,7 +99,6 @@ class EngineWrapper:
             # to ServerArgs, so these match the CLI flag names exactly.
             attention_backend="ascend",
             disable_cuda_graph=True,
-            disable_piecewise_cuda_graph=True,
         )
         self._engine = None
         if first_rank_in_node:
