@@ -73,7 +73,7 @@ from sglang.srt.layers.attention.aiter_utils import (
 )
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
-from sglang.srt.utils import get_bool_env_var
+from sglang.srt.utils import get_bool_env_var, get_int_env_var
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +93,7 @@ _use_fp8_prefill_attn = (
 _use_fmha_fp8_hd256 = (
     get_bool_env_var("SGLANG_AITER_FMHA_FP8_HD256", "False") and is_gfx95_supported()
 )
+_fmha_fp8_hd256_min_len = get_int_env_var("SGLANG_AITER_FMHA_FP8_HD256_MIN_LEN", 16384)
 
 # Persist
 # fast_mode=True if _use_mla_ps_kernel else False
@@ -2347,6 +2348,7 @@ class AiterAttnBackend(AttentionBackend):
                     and window_size == (-1, -1)
                     and not forward_batch.forward_mode.is_draft_extend_v2()
                     and not any(forward_batch.extend_prefix_lens_cpu)
+                    and self.forward_metadata.max_q_len >= _fmha_fp8_hd256_min_len
                 )
 
             if use_hd256_fastpath:
