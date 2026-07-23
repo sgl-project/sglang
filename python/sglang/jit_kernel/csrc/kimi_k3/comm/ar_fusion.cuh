@@ -106,6 +106,9 @@ __global__ __launch_bounds__(1024, 1) void all_reduce_push_res_kernel(const __gr
     st_multimem_16B(vec, push_ptr, vid);
   }
 
+  // launch pdl early for low latency case
+  device::PDLTriggerSecondary<kUsePDL>();
+
   // stage 2: poll all slots, reduce (+ residual), write back in place,
   // re-establish the empty markers for the next same-phase round
   vec_t zero_vec;
@@ -137,9 +140,8 @@ __global__ __launch_bounds__(1024, 1) void all_reduce_push_res_kernel(const __gr
   }
 
   // epilogue: flip this block's phase
-  device::PDLTriggerSecondary<kUsePDL>();
   __syncthreads();
-  if (tx == 0) params.push_counter[bx].inc(1);  // u32 overflow is safe under mod 2
+  if (tx == 0) params.push_counter[bx].set(phase ^ 1);
 }
 
 // --- deferred-finalize staging (finalize_push_norm) ------------------------

@@ -158,6 +158,8 @@ __global__ void spin_add3_kernel(const __grid_constant__ ConsumerParams params) 
   const uint32_t elem = tid * kSpinVec;  // first bf16 of this thread's vector
   const uint32_t phase = params.counter[bx].get() & 1;
 
+  PDLTriggerSecondary<kUsePDL>();
+
   // use the last block to clean up: it flips ITS OWN counter and every one
   // past the grid (work blocks flip [0, num_blocks - 1) themselves)
   if (const auto num_blocks = gridDim.x; bx == num_blocks - 1) {
@@ -166,7 +168,7 @@ __global__ void spin_add3_kernel(const __grid_constant__ ConsumerParams params) 
     for (uint32_t i = num_blocks - 1 + tx; i < params.num_counters; i += kSpinBlock) {
       params.counter[i].set(phase ^ 1);
     }
-    return PDLTriggerSecondary<kUsePDL>();
+    return void();  // this block is done, no output to write
   }
 
   // Deliberately NO PDLWaitPrimary: the dependency is carried through data
@@ -201,7 +203,6 @@ __global__ void spin_add3_kernel(const __grid_constant__ ConsumerParams params) 
     zero.fill(0);
     zero.store(src);
   }
-  PDLTriggerSecondary<kUsePDL>();
   __syncthreads();
   if (tx == 0) params.counter[bx].set(phase ^ 1);
 }
