@@ -304,10 +304,19 @@ class TestDSAMetadataKernels(CustomTestCase):
         )
         expected_dsa = _dsa_seqlens(expected_expanded, dsa_index_topk)
 
+        # Only the live prefix [:kv_len] per request is defined; the kernel
+        # leaves columns past kv_len untouched. All expanded rows of a request
+        # share its kv length.
+        row_kv_lens = torch.repeat_interleave(seq_lens.to(torch.int32), extend_seq_lens)
+        cols = torch.arange(max_seqlen_k, dtype=torch.int32, device=self.device)
+        live_mask = cols.view(1, -1) < row_kv_lens.view(-1, 1)
+
         _assert_equal(cache_seqlens, expected_cache, "draft cache_seqlens")
         _assert_equal(cu_seqlens_k, _cu_seqlens(expected_cache), "draft cu_seqlens_k")
         _assert_equal(
-            page_table_1[:total_len], expected_page_table, "draft page_table_1"
+            page_table_1[:total_len][live_mask],
+            expected_page_table[live_mask],
+            "draft page_table_1 (live [:kv_len] prefix)",
         )
         _assert_equal(
             seqlens_expanded[:total_len], expected_expanded, "draft seqlens_expanded"
@@ -321,10 +330,17 @@ class TestDSAMetadataKernels(CustomTestCase):
             "draft dsa_cu_seqlens_k",
         )
         if real_page_size > 1:
+            # Real-page column real_col maps to source column real_col*real_page_size.
+            real_width = real_page_table.shape[1]
+            real_cols = torch.arange(real_width, dtype=torch.int32, device=self.device)
+            real_live_mask = (
+                real_cols.view(1, -1) * real_page_size
+            ) < row_kv_lens.view(-1, 1)
+            expected_real = _real_page_table(expected_page_table, real_page_size)
             _assert_equal(
-                real_page_table[:total_len],
-                _real_page_table(expected_page_table, real_page_size),
-                "draft real_page_table",
+                real_page_table[:total_len][real_live_mask],
+                expected_real[real_live_mask],
+                "draft real_page_table (live [:kv_len] prefix)",
             )
 
     def test_decode_matches_eager_reference(self):

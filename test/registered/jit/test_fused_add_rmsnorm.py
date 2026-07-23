@@ -4,7 +4,7 @@ import sys
 import pytest
 import torch
 
-from sglang.jit_kernel.utils import get_ci_test_range
+from sglang.kernels.jit.utils import get_ci_test_range
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -20,7 +20,7 @@ def sglang_jit_fused_add_rmsnorm(
     *,
     cast_x_before_out_mul: bool = False,
 ) -> None:
-    from sglang.jit_kernel.norm import fused_add_rmsnorm
+    from sglang.kernels.ops.layernorm._jit_norm import fused_add_rmsnorm
 
     fused_add_rmsnorm(
         input, residual, weight, eps, cast_x_before_out_mul=cast_x_before_out_mul

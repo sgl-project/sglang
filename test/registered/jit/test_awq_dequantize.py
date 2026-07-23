@@ -4,7 +4,9 @@ import sys
 import pytest
 import torch
 
-from sglang.jit_kernel.awq_dequantize import awq_dequantize as jit_awq_dequantize
+from sglang.kernels.ops.quantization.awq_dequantize import (
+    awq_dequantize as jit_awq_dequantize,
+)
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=9, stage="base-b-kernel-unit", runner_config="1-gpu-large")

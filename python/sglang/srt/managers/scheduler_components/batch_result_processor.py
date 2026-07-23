@@ -21,6 +21,7 @@ from sglang.srt.managers.schedule_batch import (
     FINISH_MATCHED_TOKEN,
     Req,
     ScheduleBatch,
+    mamba_lazy_spec_in_window,
 )
 from sglang.srt.mem_cache.common import (
     maybe_cache_unfinished_req,
@@ -1012,6 +1013,11 @@ class SchedulerBatchResultProcessor:
             req, batch, result, i
         )
 
+        if lazy and not batch.spec_algorithm.is_none():
+            # For spec, at_boundary means this step actually crossed an interval.
+            self._mamba_lazy_spec_update(req, batch, i, at_boundary, track_seqlen)
+            return
+
         if not at_boundary:
             return
 
@@ -1024,6 +1030,63 @@ class SchedulerBatchResultProcessor:
                     req.mamba_next_track_idx
                 )
             )
+
+    def _mamba_lazy_spec_update(
+        self, req: Req, batch: ScheduleBatch, i: int, crossed: bool, track_seqlen: int
+    ) -> None:
+        """Lazy + spec post-processing.
+
+        Running req with a confirmed crossing: the commit scattered the
+        crossing state into the planned position; promote it to keep unless
+        the plan already pointed at the keep slot (in-place fallback, or
+        promoted by an earlier overlapped confirmation).
+        Finishing req: donate the keep slot only if no scatter wrote it
+        (this step) or may still write it (the in-flight next step).
+        """
+        positions = batch.mamba_lazy_spec_track_positions_cpu
+        planned_pos = (
+            positions[i]
+            if positions is not None and i < len(positions)
+            else None  # filtered/merged snapshot without a plan: be conservative
+        )
+
+        if req.finished():
+            # Skip the donation if a scatter wrote or may still write the keep slot.
+            keep_written_by_this_step = (
+                crossed and planned_pos == req.mamba_next_track_idx
+            )
+            server_args = get_server_args()
+            other_idx = 1 - req.mamba_next_track_idx
+            # Recompute the in-flight verify's plan (kv_committed_len is
+            # frozen since its prepare, so the recompute is exact).
+            keep_may_be_written_in_flight = req.mamba_ping_pong_track_buffer[
+                other_idx
+            ].item() == -1 and mamba_lazy_spec_in_window(
+                req,
+                server_args.mamba_track_interval,
+                server_args.max_speculative_num_draft_tokens,
+            )
+            if (
+                planned_pos is None
+                or keep_written_by_this_step
+                or keep_may_be_written_in_flight
+            ):
+                req.mamba_lazy_is_insert = False
+            return
+
+        if not crossed or planned_pos is None:
+            return
+        if planned_pos != req.mamba_next_track_idx:
+            # Promote pending -> keep: free the old checkpoint, repoint.
+            pool = batch.req_to_token_pool
+            keep_idx = req.mamba_next_track_idx
+            keep_val = req.mamba_ping_pong_track_buffer[keep_idx]
+            pool.mamba_allocator.free(keep_val.unsqueeze(0))
+            pool.set_mamba_ping_pong_slot(req, keep_idx, -1)
+            req.mamba_next_track_idx = planned_pos
+        # else: in-place fallback, or promoted by an earlier confirmation —
+        # keep holds the track_seqlen state either way.
+        req.mamba_last_track_seqlen = track_seqlen
 
     def _mamba_check_track_boundary(self, req, batch, result, i):
         """Check if this decode step crosses a mamba track interval boundary.

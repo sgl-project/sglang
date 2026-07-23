@@ -1,7 +1,7 @@
 import torch
 
-from sglang.jit_kernel.benchmark import marker
-from sglang.jit_kernel.dsv4.topk import (
+from sglang.kernels.jit.benchmark import marker
+from sglang.kernels.ops.attention.dsv4.topk import (
     plan_topk_v2,
     topk_transform_512,
     topk_transform_512_v2,

@@ -1,7 +1,6 @@
 from typing import Optional
 
 import torch
-from sgl_kernel.utils import _get_cache_buf
 
 
 def awq_dequantize(
@@ -30,60 +29,6 @@ def fp8_scaled_mm(mat_a, mat_b, scales_a, scales_b, out_dtype, bias=None):
         out_dtype,
         bias,
     )
-
-
-def _bmm_fp8_internal(
-    workspace_buffer: torch.Tensor,
-    A: torch.Tensor,
-    B: torch.Tensor,
-    D: torch.Tensor,
-    A_scale: torch.Tensor,
-    B_scale: torch.Tensor,
-) -> None:
-    cublas_handle = torch.cuda.current_blas_handle()
-    torch.ops.sgl_kernel.bmm_fp8.default(
-        A,
-        B,
-        D,
-        A_scale,
-        B_scale,
-        workspace_buffer,
-        cublas_handle,
-    )
-
-
-def bmm_fp8(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    A_scale: torch.Tensor,
-    B_scale: torch.Tensor,
-    dtype: torch.dtype,
-    out: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    if out is None:
-        out = torch.empty(
-            (A.shape[0], A.shape[1], B.shape[2]),
-            device=A.device,
-            dtype=dtype,
-        )
-    workspace_buffer = _get_cache_buf("bmm_fp8_workspace", 32 * 1024 * 1024, A.device)
-    _bmm_fp8_internal(workspace_buffer, A, B, out, A_scale, B_scale)
-    return out
-
-
-def dsv3_fused_a_gemm(
-    mat_a: torch.Tensor,
-    mat_b: torch.Tensor,
-    output: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    if output is None:
-        output = torch.empty(
-            (mat_a.shape[0], mat_b.shape[1]),
-            device=mat_a.device,
-            dtype=mat_a.dtype,
-        )
-    torch.ops.sgl_kernel.dsv3_fused_a_gemm.default(output, mat_a, mat_b)
-    return output
 
 
 def sgl_per_token_group_quant_8bit(

@@ -28,7 +28,7 @@ implementations with a single switch.
 
 Like the rest of ``sglang.kernels``, importing this module (and instantiating
 subclasses) never imports a kernel backend (``sgl_kernel`` /
-``sglang.jit_kernel``) or triggers JIT compilation; backends are imported
+``sglang.kernels.jit``) or triggers JIT compilation; backends are imported
 lazily inside the ``forward_<backend>`` methods.
 """
 

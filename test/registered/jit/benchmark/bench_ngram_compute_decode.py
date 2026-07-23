@@ -2,12 +2,12 @@ import torch
 import triton
 import triton.testing
 
-from sglang.jit_kernel.benchmark.utils import (
+from sglang.kernels.jit.benchmark.utils import (
     DEFAULT_DEVICE,
     get_benchmark_range,
     run_benchmark_no_cudagraph,
 )
-from sglang.jit_kernel.ngram_embedding import (
+from sglang.kernels.ops.speculative.ngram_embedding import (
     compute_n_gram_ids,
     compute_n_gram_ids_decode,
 )

@@ -1,9 +1,9 @@
 import torch
 from sgl_kernel import sgl_per_token_group_quant_8bit
 
-from sglang.jit_kernel.benchmark import marker
-from sglang.jit_kernel.benchmark.utils import create_random
-from sglang.jit_kernel.per_token_group_quant_8bit_v2 import (
+from sglang.kernels.jit.benchmark import marker
+from sglang.kernels.jit.benchmark.utils import create_random
+from sglang.kernels.ops.quantization._jit_per_token_group_quant_8bit_v2 import (
     per_token_group_quant_8bit_v2,
 )
 from sglang.kernels.ops.quantization.fp8_kernel import (

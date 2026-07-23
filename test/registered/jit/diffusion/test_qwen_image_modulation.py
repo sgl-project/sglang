@@ -4,12 +4,12 @@ import pytest
 import torch
 import triton
 
-from sglang.jit_kernel.diffusion.triton.norm import norm_infer
-from sglang.jit_kernel.diffusion.triton.scale_shift import (
+from sglang.kernels.jit.utils import get_ci_test_range
+from sglang.kernels.ops.diffusion.triton.norm import norm_infer
+from sglang.kernels.ops.diffusion.triton.scale_shift import (
     fuse_layernorm_scale_shift_gate_select01_kernel,
     fuse_residual_layernorm_scale_shift_gate_select01_kernel,
 )
-from sglang.jit_kernel.utils import get_ci_test_range
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-large")

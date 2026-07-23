@@ -4,12 +4,14 @@ import torch
 import triton
 import triton.testing
 
-from sglang.jit_kernel.benchmark.utils import (
+from sglang.kernels.jit.benchmark.utils import (
     DEFAULT_DEVICE,
     get_benchmark_range,
     run_benchmark,
 )
-from sglang.jit_kernel.resolve_future_token_ids import resolve_future_token_ids_cuda
+from sglang.kernels.ops.speculative.resolve_future_token_ids import (
+    resolve_future_token_ids_cuda,
+)
 from sglang.srt.utils import get_compiler_backend
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 

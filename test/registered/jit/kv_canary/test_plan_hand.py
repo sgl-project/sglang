@@ -5,21 +5,21 @@ import random
 import pytest
 import torch
 
-from sglang.jit_kernel.kv_canary.plan import launch_canary_plan_kernels
-from sglang.jit_kernel.kv_canary.plan_ref import (
-    launch_canary_plan_kernels_torch_reference,
-)
-from sglang.jit_kernel.kv_canary.verify import VerifyPlan
-from sglang.jit_kernel.kv_canary.write import WritePlan
-from sglang.jit_kernel.tests.kv_canary._differential import run_plan_diff
-from sglang.jit_kernel.tests.kv_canary._fixtures import (
+from sglang.kernels.jit.tests.kv_canary._differential import run_plan_diff
+from sglang.kernels.jit.tests.kv_canary._fixtures import (
     allocate_plan_pair,
     derive_plan_capacity,
     empty_extras,
     make_lut,
     make_req_to_token,
 )
-from sglang.jit_kernel.tests.kv_canary._invariants import PlanInvariants
+from sglang.kernels.jit.tests.kv_canary._invariants import PlanInvariants
+from sglang.kernels.ops.kv_canary.plan import launch_canary_plan_kernels
+from sglang.kernels.ops.kv_canary.plan_ref import (
+    launch_canary_plan_kernels_torch_reference,
+)
+from sglang.kernels.ops.kv_canary.verify import VerifyPlan
+from sglang.kernels.ops.kv_canary.write import WritePlan
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")

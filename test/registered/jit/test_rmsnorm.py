@@ -4,7 +4,7 @@ import sys
 import pytest
 import torch
 
-from sglang.jit_kernel.utils import get_ci_test_range
+from sglang.kernels.jit.utils import get_ci_test_range
 from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
@@ -26,7 +26,7 @@ def sglang_jit_rmsnorm(
     output: torch.Tensor | None = None,
     eps: float = EPS,
 ) -> None:
-    from sglang.jit_kernel.norm import rmsnorm
+    from sglang.kernels.ops.layernorm._jit_norm import rmsnorm
 
     rmsnorm(input, weight, out=output, eps=eps)
 
@@ -127,7 +127,7 @@ def test_rmsnorm(
 
 @pytest.mark.parametrize("hidden_size", [64, 128, 256, 512, 8192, 8704, 16384])
 def test_rmsnorm_hidden_size_support(hidden_size: int) -> None:
-    from sglang.jit_kernel.norm import _is_supported_rmsnorm_hidden_size
+    from sglang.kernels.ops.layernorm._jit_norm import _is_supported_rmsnorm_hidden_size
 
     assert _is_supported_rmsnorm_hidden_size(hidden_size)
 
@@ -148,7 +148,7 @@ def test_rmsnorm_hidden_size_support(hidden_size: int) -> None:
     ],
 )
 def test_rmsnorm_kernel_dispatch(hidden_size: int, expected: str) -> None:
-    from sglang.jit_kernel.norm import _rmsnorm_kernel_class
+    from sglang.kernels.ops.layernorm._jit_norm import _rmsnorm_kernel_class
 
     assert _rmsnorm_kernel_class(hidden_size) == expected
 

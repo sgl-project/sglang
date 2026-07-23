@@ -6,12 +6,12 @@ import torch
 import triton
 import triton.testing
 
-from sglang.jit_kernel.benchmark.utils import (
+from sglang.kernels.jit.benchmark.utils import (
     DEFAULT_DEVICE,
     get_benchmark_range,
     run_benchmark_no_cudagraph,
 )
-from sglang.jit_kernel.kv_canary.scatter_req_token_ids import (
+from sglang.kernels.ops.kv_canary.scatter_req_token_ids import (
     launch_scatter_req_token_ids_kernel,
 )
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci

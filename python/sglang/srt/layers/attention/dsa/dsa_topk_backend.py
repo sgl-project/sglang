@@ -267,7 +267,7 @@ def _topk_transform_v2_paged(
     padded rows to 0 (see ``fused_dsa_draft_extend_metadata`` /
     ``seqlens_expand_kernel``); 0 takes the trivial all-(-1) output path.
     """
-    from sglang.jit_kernel.dsv4.topk import topk_transform_512_v2
+    from sglang.kernels.ops.attention.dsv4.topk import topk_transform_512_v2
     from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 
     num_rows = logits.shape[0]

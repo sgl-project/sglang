@@ -40,6 +40,29 @@ def tensor_model_parallel_fused_allreduce_rmsnorm(
     return get_tp_group().fused_allreduce_rmsnorm(input_, residual_inp_, weight_, eps)
 
 
+def tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_group(
+    input_: torch.Tensor,
+    residual_inp_: torch.Tensor,
+    weight_: torch.Tensor,
+    eps: float,
+    group_size: int = 128,
+    emit_bf16: bool = False,
+) -> Optional[Tuple[torch.Tensor, ...]]:
+    """Fused TP all-reduce + RMSNorm + per-group FP8 quant (ROCm/aiter).
+
+    Returns ``(fp8_output, residual_out, per_group_scale)`` by default, or
+    ``(fp8_output, residual_out, per_group_scale, bf16_output)`` when
+    ``emit_bf16=True`` (kernel writes both fp8 and the pre-quantization bf16
+    normed output — no extra kernel). ``None`` when the backend cannot
+    service the request (non-AMD, custom AR disabled, shape unsupported).
+    Callers MUST handle ``None`` by falling back to the separate
+    fused-AR-RMSNorm + per-group-quant path.
+    """
+    return get_tp_group().fused_allreduce_rmsnorm_quant_per_group(
+        input_, residual_inp_, weight_, eps, group_size, emit_bf16=emit_bf16
+    )
+
+
 def tensor_model_parallel_all_gather(
     input_: torch.Tensor, dim: int = -1
 ) -> torch.Tensor:

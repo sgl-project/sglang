@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
-from sglang.jit_kernel.kv_canary.verify import VerifyPlan
+from sglang.kernels.ops.kv_canary.verify import VerifyPlan
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
 from sglang.srt.kv_canary.runner.future_tensor import DelayedDeviceHostHandler
 

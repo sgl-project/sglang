@@ -6,7 +6,7 @@ from unittest.mock import Mock
 
 import torch
 
-from sglang.jit_kernel.kv_canary.verify import CanaryLaunchTag
+from sglang.kernels.ops.kv_canary.verify import CanaryLaunchTag
 from sglang.srt.kv_canary.config import CanaryConfig
 from sglang.srt.kv_canary.runner import stats_logger as stats_logger_module
 from sglang.srt.kv_canary.runner.health_checker import KernelRunCounterHealthChecker

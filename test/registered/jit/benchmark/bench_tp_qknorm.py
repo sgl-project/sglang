@@ -23,16 +23,16 @@ import torch
 import torch.distributed as dist
 
 import sglang.srt.distributed.parallel_state as ps
-from sglang.jit_kernel.all_reduce import (
+from sglang.kernels.jit.benchmark import marker
+from sglang.kernels.jit.benchmark.utils import multigpu_bench_main
+from sglang.kernels.jit.utils import cache_once, get_ci_test_range
+from sglang.kernels.ops.communication.all_reduce import (
     fused_parallel_qknorm,
     get_all_reduce_module,
     get_fused_parallel_qknorm_max_occupancy,
     get_fused_parallel_qknorm_module,
 )
-from sglang.jit_kernel.benchmark import marker
-from sglang.jit_kernel.benchmark.utils import multigpu_bench_main
-from sglang.jit_kernel.mp import register_comm_cleanup
-from sglang.jit_kernel.utils import cache_once, get_ci_test_range
+from sglang.kernels.ops.communication.mp import register_comm_cleanup
 from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
     CustomAllReduceV2,
 )
