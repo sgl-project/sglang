@@ -8,7 +8,6 @@ from functools import lru_cache
 from typing import Any
 
 import torch
-import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -21,6 +20,12 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_tp_rank,
     get_tp_world_size,
     sequence_model_parallel_all_gather,
+)
+from sglang.multimodal_gen.runtime.distributed.sp_shard_utils import (
+    compute_sequence_splits,
+    gather_sequence_varlen,
+    sequence_splits_are_uniform,
+    shard_sequence_varlen,
 )
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ring_parallel_world_size,
@@ -113,49 +118,6 @@ def _safe_tensor_version(tensor: torch.Tensor) -> int:
 
 if _use_aiter:
     from aiter.ops.rope import rope_cached_2c_fwd_inplace
-
-
-def _compute_sequence_splits(total_len: int, world_size: int) -> list[int]:
-    base = total_len // world_size
-    remainder = total_len % world_size
-    return [base + (1 if rank < remainder else 0) for rank in range(world_size)]
-
-
-def _sequence_splits_are_uniform(seq_splits: list[int]) -> bool:
-    return len(seq_splits) <= 1 or all(
-        seq_len == seq_splits[0] for seq_len in seq_splits
-    )
-
-
-def _sequence_shard_tensor(
-    x: torch.Tensor, seq_splits: list[int], rank: int
-) -> torch.Tensor:
-    start = sum(seq_splits[:rank])
-    end = start + seq_splits[rank]
-    return x[:, start:end, ...].contiguous()
-
-
-def _sequence_all_gather_varlen(
-    x: torch.Tensor,
-    seq_splits: list[int],
-    group: dist.ProcessGroup,
-) -> torch.Tensor:
-    rank = get_sp_parallel_rank()
-    if _sequence_splits_are_uniform(seq_splits):
-        return sequence_model_parallel_all_gather(x.contiguous(), dim=1)
-
-    max_seq = max(seq_splits)
-    local_seq = seq_splits[rank]
-    if local_seq < max_seq:
-        pad_shape = list(x.shape)
-        pad_shape[1] = max_seq - local_seq
-        pad = torch.zeros(pad_shape, dtype=x.dtype, device=x.device)
-        x = torch.cat([x, pad], dim=1)
-    gathered = [torch.empty_like(x) for _ in seq_splits]
-    dist.all_gather(gathered, x.contiguous(), group=group)
-    return torch.cat(
-        [chunk[:, :seq_len, ...] for chunk, seq_len in zip(gathered, seq_splits)], dim=1
-    )
 
 
 class LingBotWorldCamConditioner(nn.Module):
@@ -279,7 +241,7 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
                     "LingBot causal sequence sharding requires forward_batch.sequence_shard_splits."
                 )
             seq_splits = list(seq_splits)
-            uniform_seq_splits = _sequence_splits_are_uniform(seq_splits)
+            uniform_seq_splits = sequence_splits_are_uniform(seq_splits)
             # Pack Q/K/V to avoid launching three Ulysses all-to-all collectives.
             qkv = torch.cat([roped_query, roped_key, v], dim=-1)
             qkv = (
@@ -1517,7 +1479,7 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
         post_patch_height = height // p_h
         post_patch_width = width // p_w
         if sequence_shard_enabled:
-            seq_shard_splits = _compute_sequence_splits(
+            seq_shard_splits = compute_sequence_splits(
                 post_patch_num_frames * post_patch_height * post_patch_width,
                 self.sp_size,
             )
@@ -1540,11 +1502,11 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
             sp_rank = get_sp_parallel_rank()
             seq_shard_splits = list(forward_batch.sequence_shard_splits)
             local_seq_len = seq_shard_splits[sp_rank]
-            hidden_states = _sequence_shard_tensor(
+            hidden_states = shard_sequence_varlen(
                 hidden_states, seq_shard_splits, sp_rank
             )
             if c2ws_plucker_emb is not None:
-                c2ws_plucker_emb = _sequence_shard_tensor(
+                c2ws_plucker_emb = shard_sequence_varlen(
                     c2ws_plucker_emb, seq_shard_splits, sp_rank
                 )
             frame_stride = post_patch_height * post_patch_width
@@ -1611,7 +1573,7 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
         hidden_states = self.norm_out(hidden_states, shift, scale)
         hidden_states = self.proj_out(hidden_states)
         if sequence_shard_enabled:
-            hidden_states = _sequence_all_gather_varlen(
+            hidden_states = gather_sequence_varlen(
                 hidden_states.contiguous(),
                 list(forward_batch.sequence_shard_splits),
                 get_sp_group().device_group,

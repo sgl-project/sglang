@@ -14,11 +14,36 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.multimodal_gen.configs.models.dits.minwm import MinWMVideoConfig
+from sglang.multimodal_gen.runtime.distributed import (
+    get_sp_group,
+    get_sp_parallel_rank,
+    get_sp_world_size,
+    get_tp_world_size,
+)
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_ring_parallel_world_size,
+    get_ulysses_parallel_world_size,
+)
+from sglang.multimodal_gen.runtime.distributed.sp_shard_utils import (
+    compute_sequence_splits,
+    gather_sequence_varlen,
+    sequence_splits_are_uniform,
+    shard_sequence_varlen,
+)
+from sglang.multimodal_gen.runtime.layers.attention import LocalAttention
 from sglang.multimodal_gen.runtime.layers.layernorm import tensor_parallel_rms_norm
+from sglang.multimodal_gen.runtime.layers.rotary_embedding import get_rotary_pos_embed
+from sglang.multimodal_gen.runtime.layers.usp import (
+    _usp_input_all_to_all,
+    _usp_input_all_to_all_varlen,
+    _usp_output_all_to_all,
+    _usp_output_all_to_all_varlen,
+)
 from sglang.multimodal_gen.runtime.layers.visual_embedding import (
     PatchEmbed,
     TimestepEmbedder,
 )
+from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
 from sglang.multimodal_gen.runtime.models.dits.causal_wanvideo import (
     CausalWanSelfAttention,
     CausalWanTransformerBlock,
@@ -28,6 +53,10 @@ from sglang.multimodal_gen.runtime.models.dits.minwm_action import (
     PrimitiveTokenResidualActionEncoder,
 )
 from sglang.multimodal_gen.runtime.models.dits.wanvideo import WanT2VCrossAttention
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -223,6 +252,39 @@ def _minwm_adaln(hidden_states: torch.Tensor, *args, **kwargs):
     )
 
 
+def _minwm_frame_indices(hidden_states: torch.Tensor, num_frames: int) -> torch.Tensor:
+    """Map each local token to its frame, including shards cut inside a frame."""
+    forward_batch = get_forward_context().forward_batch
+    if (
+        forward_batch is not None
+        and getattr(forward_batch, "enable_sequence_shard", False)
+        and get_ulysses_parallel_world_size() > 1
+    ):
+        frame_indices = getattr(forward_batch, "sequence_shard_frame_indices", None)
+        if frame_indices is None:
+            raise ValueError(
+                "MinWM sequence sharding requires "
+                "forward_batch.sequence_shard_frame_indices."
+            )
+        if frame_indices.numel() != hidden_states.shape[1]:
+            raise ValueError(
+                "MinWM sequence shard frame indices do not match the local "
+                f"sequence length: {frame_indices.numel()} vs "
+                f"{hidden_states.shape[1]}."
+            )
+        return frame_indices
+
+    if hidden_states.shape[1] % num_frames != 0:
+        raise ValueError(
+            f"MinWM sequence length {hidden_states.shape[1]} must be divisible "
+            f"by num_frames {num_frames} when sequence sharding is disabled."
+        )
+    tokens_per_frame = hidden_states.shape[1] // num_frames
+    return torch.arange(num_frames, device=hidden_states.device).repeat_interleave(
+        tokens_per_frame
+    )
+
+
 def _minwm_qk_norm_rope_op(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -346,6 +408,32 @@ def _minwm_packed_attention_backend(device: torch.device) -> str:
 class MinWMCausalSelfAttention(CausalWanSelfAttention):
     """SGLang cache ownership with minWM main's FA4 call shape."""
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        ulysses_world_size = max(get_ulysses_parallel_world_size(), 1)
+        if self.num_heads % ulysses_world_size != 0:
+            raise ValueError(
+                f"num_heads ({self.num_heads}) must be divisible by "
+                f"ulysses_degree ({ulysses_world_size})."
+            )
+        self.ulysses_num_heads = self.num_heads // ulysses_world_size
+        self.ulysses_attn = (
+            self.attn
+            if ulysses_world_size == 1
+            else LocalAttention(
+                num_heads=self.ulysses_num_heads,
+                head_size=self.head_dim,
+                dropout_rate=0,
+                softmax_scale=None,
+                causal=False,
+                supported_attention_backends=(
+                    AttentionBackendEnum.FA,
+                    AttentionBackendEnum.AITER,
+                    AttentionBackendEnum.TORCH_SDPA,
+                ),
+            )
+        )
+
     def forward(
         self,
         query,
@@ -376,22 +464,61 @@ class MinWMCausalSelfAttention(CausalWanSelfAttention):
             cos, sin = freqs_cis
             roped_query = apply_minwm_rotary_embedding(query, cos, sin).type_as(value)
             roped_key = apply_minwm_rotary_embedding(key, cos, sin).type_as(value)
-        if kv_cache.can_direct_current_attention(roped_key.shape[1]):
+
+        forward_batch = get_forward_context().forward_batch
+        sequence_shard_enabled = (
+            forward_batch is not None
+            and getattr(forward_batch, "enable_sequence_shard", False)
+            and get_ulysses_parallel_world_size() > 1
+        )
+        seq_splits = None
+        uniform_seq_splits = False
+        if sequence_shard_enabled:
+            seq_splits = getattr(forward_batch, "sequence_shard_splits", None)
+            if seq_splits is None:
+                raise ValueError(
+                    "MinWM causal sequence sharding requires "
+                    "forward_batch.sequence_shard_splits."
+                )
+            seq_splits = list(seq_splits)
+            uniform_seq_splits = sequence_splits_are_uniform(seq_splits)
+            qkv = torch.cat([roped_query, roped_key, value], dim=-1)
+            qkv = (
+                _usp_input_all_to_all(qkv, head_dim=2)
+                if uniform_seq_splits
+                else _usp_input_all_to_all_varlen(qkv, seq_splits, head_dim=2)
+            )
+            roped_query, roped_key, value = qkv.chunk(3, dim=-1)
+
+        if not sequence_shard_enabled and kv_cache.can_direct_current_attention(
+            roped_key.shape[1]
+        ):
             attention_key, attention_value = roped_key, value
         else:
             cache_view = kv_cache.update_and_get_attention_kv(
                 key=roped_key,
                 value=value,
                 current_chunk_start=current_start,
-                cache_head_start=self.head_start,
+                cache_head_start=0 if sequence_shard_enabled else self.head_start,
                 debug_name="MinWM causal KV cache",
             )
             attention_key, attention_value = cache_view.k, cache_view.v
         if _MINWM_ATTENTION_IMPL == "dense":
-            return self.attn(roped_query, attention_key, attention_value)
-        return _minwm_packed_varlen_attention(
-            roped_query, attention_key, attention_value
-        )
+            output = (self.ulysses_attn if sequence_shard_enabled else self.attn)(
+                roped_query, attention_key, attention_value
+            )
+        else:
+            output = _minwm_packed_varlen_attention(
+                roped_query, attention_key, attention_value
+            )
+        if sequence_shard_enabled:
+            assert seq_splits is not None
+            output = (
+                _usp_output_all_to_all(output, head_dim=2)
+                if uniform_seq_splits
+                else _usp_output_all_to_all_varlen(output, seq_splits, head_dim=2)
+            )
+        return output
 
 
 class MinWMPackedCrossAttention(WanT2VCrossAttention):
@@ -500,10 +627,7 @@ class MinWMCausalTransformerBlock(CausalWanTransformerBlock):
         num_frames = temb.shape[1]
         orig_dtype = hidden_states.dtype
         modulation = self.scale_shift_table.to(orig_dtype)
-        tokens_per_frame = hidden_states.shape[1] // num_frames
-        frame_index = torch.arange(num_frames, device=temb.device).repeat_interleave(
-            tokens_per_frame
-        )
+        frame_index = _minwm_frame_indices(hidden_states, num_frames)
         # minWM main first expands the full [B, F, 6, D] tensor with advanced
         # indexing, then selects a modulation slice. Besides equal values, this
         # preserves its non-contiguous 6*D token stride for the compiled AdaLN.
@@ -623,6 +747,7 @@ class MinWMCausalTransformer3DModel(CausalWanTransformer3DModel):
         if deterministic.strip().lower() not in {"", "0", "false", "no", "off"}:
             torch.use_deterministic_algorithms(True)
         super().__init__(config, hf_config, quant_config)
+        self.sp_size = get_sp_world_size()
         old_time = self.condition_embedder.time_embedder
         exact_time = _MinWMTimestepEmbedder(
             self.hidden_size,
@@ -651,6 +776,183 @@ class MinWMCausalTransformer3DModel(CausalWanTransformer3DModel):
                 f"2 * (action_kernel_size - 1) = {expected_history}"
             )
         self._install_parity_debug_hooks()
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor | list[torch.Tensor],
+        timestep: torch.LongTensor,
+        encoder_hidden_states_image: torch.Tensor | list[torch.Tensor] | None = None,
+        kv_cache=None,
+        crossattn_cache=None,
+        current_start: int = 0,
+        cache_start: int = 0,
+        start_frame: int = 0,
+        action: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        forward_batch = get_forward_context().forward_batch
+        sequence_shard_enabled = (
+            forward_batch is not None
+            and getattr(forward_batch, "enable_sequence_shard", False)
+            and self.sp_size > 1
+        )
+        if not sequence_shard_enabled:
+            return super().forward(
+                hidden_states,
+                encoder_hidden_states,
+                timestep,
+                encoder_hidden_states_image=encoder_hidden_states_image,
+                kv_cache=kv_cache,
+                crossattn_cache=crossattn_cache,
+                current_start=current_start,
+                cache_start=cache_start,
+                start_frame=start_frame,
+                action=action,
+            )
+
+        ulysses_world_size = get_ulysses_parallel_world_size()
+        if get_ring_parallel_world_size() > 1:
+            raise NotImplementedError(
+                "MinWM causal sequence sharding supports Ulysses with "
+                "ring_degree = 1 only."
+            )
+        if ulysses_world_size <= 1 or ulysses_world_size != self.sp_size:
+            raise ValueError(
+                "MinWM causal sequence sharding requires "
+                "sp_degree == ulysses_degree > 1."
+            )
+        if get_tp_world_size() > 1:
+            raise NotImplementedError(
+                "MinWM causal sequence sharding cannot be combined with tensor "
+                "parallelism yet."
+            )
+        if kv_cache is None or crossattn_cache is None:
+            raise ValueError(
+                "MinWM causal sequence sharding requires self- and "
+                "cross-attention KV caches."
+            )
+
+        orig_dtype = hidden_states.dtype
+        if not isinstance(encoder_hidden_states, torch.Tensor):
+            encoder_hidden_states = encoder_hidden_states[0]
+        if (
+            isinstance(encoder_hidden_states_image, list)
+            and len(encoder_hidden_states_image) > 0
+        ):
+            encoder_hidden_states_image = encoder_hidden_states_image[0]
+        else:
+            encoder_hidden_states_image = None
+
+        batch_size, _, num_frames, height, width = hidden_states.shape
+        p_t, p_h, p_w = self.patch_size
+        post_patch_num_frames = num_frames // p_t
+        post_patch_height = height // p_h
+        post_patch_width = width // p_w
+        frame_stride = post_patch_height * post_patch_width
+        total_seq_len = post_patch_num_frames * frame_stride
+        seq_splits = compute_sequence_splits(total_seq_len, self.sp_size)
+        sp_rank = get_sp_parallel_rank()
+        local_start = sum(seq_splits[:sp_rank])
+        local_end = local_start + seq_splits[sp_rank]
+        forward_batch.sequence_shard_splits = tuple(seq_splits)
+        forward_batch.sequence_shard_frame_indices = (
+            torch.arange(
+                local_start,
+                local_end,
+                device=hidden_states.device,
+                dtype=torch.long,
+            )
+            // frame_stride
+        )
+
+        d = self.hidden_size // self.num_attention_heads
+        rope_dim_list = [d - 4 * (d // 6), 2 * (d // 6), 2 * (d // 6)]
+        freqs_cos, freqs_sin = get_rotary_pos_embed(
+            (
+                post_patch_num_frames,
+                post_patch_height,
+                post_patch_width,
+            ),
+            self.hidden_size,
+            self.num_attention_heads,
+            rope_dim_list,
+            dtype=(
+                torch.float64
+                if current_platform.is_float64_supported()
+                else torch.float32
+            ),
+            rope_theta=10000,
+            start_frame=start_frame,
+        )
+        freqs_cis = (
+            freqs_cos.to(hidden_states.device)[local_start:local_end].float(),
+            freqs_sin.to(hidden_states.device)[local_start:local_end].float(),
+        )
+
+        hidden_states = self.patch_embedding(hidden_states)
+        hidden_states = hidden_states.flatten(2).transpose(1, 2)
+        hidden_states = self._apply_patch_token_condition(
+            hidden_states,
+            action=action,
+            num_frames=post_patch_num_frames,
+            height=post_patch_height,
+            width=post_patch_width,
+        )
+        hidden_states = shard_sequence_varlen(hidden_states, seq_splits, sp_rank)
+
+        (
+            temb,
+            timestep_proj,
+            encoder_hidden_states,
+            encoder_hidden_states_image,
+        ) = self.condition_embedder(
+            timestep.flatten(), encoder_hidden_states, encoder_hidden_states_image
+        )
+        timestep_proj = timestep_proj.unflatten(1, (6, self.hidden_size)).unflatten(
+            dim=0, sizes=timestep.shape
+        )
+        if encoder_hidden_states_image is not None:
+            encoder_hidden_states = torch.concat(
+                [encoder_hidden_states_image, encoder_hidden_states], dim=1
+            )
+        if current_platform.is_mps():
+            encoder_hidden_states = encoder_hidden_states.to(orig_dtype)
+        if encoder_hidden_states.dtype != orig_dtype:
+            raise ValueError(
+                "MinWM encoder hidden-state dtype must match the latent dtype."
+            )
+
+        for block_index, block in enumerate(self.blocks):
+            hidden_states = block(
+                hidden_states,
+                encoder_hidden_states,
+                timestep_proj,
+                freqs_cis,
+                block_mask=self.block_mask,
+                kv_cache=kv_cache[block_index],
+                crossattn_cache=crossattn_cache[block_index],
+                current_start=current_start,
+                cache_start=cache_start,
+            )
+
+        hidden_states = self._apply_output_head(hidden_states, temb, timestep)
+        hidden_states = gather_sequence_varlen(
+            hidden_states,
+            seq_splits,
+            get_sp_group().device_group,
+        )
+        hidden_states = hidden_states.reshape(
+            batch_size,
+            post_patch_num_frames,
+            post_patch_height,
+            post_patch_width,
+            p_t,
+            p_h,
+            p_w,
+            -1,
+        )
+        hidden_states = hidden_states.permute(0, 7, 1, 4, 2, 5, 3, 6)
+        return hidden_states.flatten(6, 7).flatten(4, 5).flatten(2, 3)
 
     def _install_parity_debug_hooks(self) -> None:
         dump_root = os.environ.get("MINWM_PARITY_DUMP_DIR")
@@ -752,9 +1054,7 @@ class MinWMCausalTransformer3DModel(CausalWanTransformer3DModel):
         num_frames = timestep.shape[1]
         temb = temb.unflatten(dim=0, sizes=timestep.shape).to(hidden_states.dtype)
         modulation = self.scale_shift_table.to(hidden_states.dtype)
-        frame_index = torch.arange(num_frames, device=temb.device).repeat_interleave(
-            hidden_states.shape[1] // num_frames
-        )
+        frame_index = _minwm_frame_indices(hidden_states, num_frames)
         timestep_value = temb[:, frame_index]
         _, normalized = _minwm_adaln(
             hidden_states,

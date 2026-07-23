@@ -299,6 +299,12 @@ cross-attention KV；在第一个生成 latent chunk 之前，它还会送入 re
 | D40 | Whole-DiT 性能 lane 关闭 MinWM 的小粒度动态 segment compile。 | 对整个 transformer 调用 `module.compile` 时，再在 AdaLN、RMSNorm 和 QK+RoPE 内嵌套 `torch.compile(dynamic=True)` 会形成重复 graph boundary 和 recompile。性能 lane 让 Inductor 管理外层模块，exact lane 则保留 source-shaped segment boundary；两种 scope 不混用。 |
 | D41 | 三路页面固定同一 case，并把首次完整请求作为 warmup 后再计量。 | 首次 whole-DiT compile/autotune 是分钟级冷启动，若把它混入 5.375 秒 clip FPS，会掩盖服务稳态能力。页面同时保存 baseline、bitwise、optimized 的 lossless arrays、MP4、TTFF、steady FPS 和误差，而 optimized 的组合收益不会被误写成纯 compile 收益。 |
 | D42 | artifact-ready 标记之后仍允许显式保留容器。 | Kubernetes `emptyDir` 会随 Pod 退出立即消失；第一次三路成功运行虽有完整日志和摘要，却无法事后恢复视频。`MINWM_ARTIFACT_HOLD_SECONDS` 将计算完成与人工/自动拷贝窗口分离，不改变模型运行。 |
+| D43 | 第一阶段 causal Ulysses 只支持 `sp_degree == ulysses_degree > 1` 且 `ring_degree == 1`。 | MinWM 现在会对 patch/action token 做 contiguous shard，把完成 RoPE 的 Q/K/V 合并成一次 input all-to-all，每个 rank 只保存 full-history causal KV 的 local head，attention 后执行 reverse collective，并在 scheduler/VAE 前 gather output projection token。Head 必须可整除；Ring、TP+SP、FSDP+SP、whole-DiT compile+SP 继续拒绝。 |
+
+<Warning>
+  Causal Ulysses 已有本地单测与隔离运行覆盖，但本文尚未记录 SP2/SP4/SP8 的 GPU parity
+  和性能矩阵。不能用历史 SP1 结果替代多卡 bitwise 或加速结论。
+</Warning>
 
 ## 实现过程中发现的差异
 

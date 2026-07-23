@@ -12,8 +12,14 @@ WebSocket API，支持首帧、prompt、seed 和 `primitive_token_residual` acti
 在同一运行时、相同输入和确定性 kernel 配置下，正式的十用例 B200 验证达到了
 generated frame 逐字节相同；H200 上的三组 1248x704、129 帧长视频也逐字节相同。
 
-当前实现是单卡、batch-one 的 causal session。它**不支持** Ulysses/Ring sequence
-parallel；非一的 SP 配置会被显式拒绝，避免多卡重复计算被误报成有效 SP。
+当前实现仍是 batch-one 的 causal session，但已经接通第一阶段 causal Ulysses
+sequence parallel：支持 `sp_degree == ulysses_degree > 1`、`ring_degree == 1`，
+并要求 24 个 attention head 能被 Ulysses degree 整除。优先验收拓扑是 SP2/SP4/SP8。
+Ring、TP+SP、FSDP+SP 和 whole-DiT compile+SP 仍会被显式拒绝。
+
+本地单测覆盖了 uniform/varlen shard、帧内 shard 边界、packed QKV collective 和
+local-head KV ownership；多卡 bitwise 与性能矩阵尚未写入本报告，因此当前实现不能
+引用下文 SP1 的历史数据来声称 SP2/SP4/SP8 已完成生产验收。
 
 ## 2. 背景和真正的兼容性目标
 
@@ -174,16 +180,20 @@ compile，并保留与 minWM `main` 相同的局部 fused-segment compile；性�
 
 ## 9. Sequence Parallel 审计与 24 FPS 上限
 
-当前 MinWM 路径不支持 Ulysses SP，原因不是缺一个启动参数，而是下面四个合同都尚未
-实现分片通信：
+MinWM 现在复用 LingBot 的 varlen Ulysses collective 骨架，并补齐以下 causal 合同：
 
-1. MinWM 的 source-shaped packed-varlen attention 没有 Ulysses all-to-all；
-2. causal K/V cache 没有按 sequence/head rank 定义所有权；
-3. action 的四帧历史和 chunk 边界没有跨 rank 交换；
-4. absolute RoPE position 和 output gather 没有经过多卡 bitwise 验证。
+1. patch token 与完整 action residual 相加后，按 flattened sequence 做 contiguous
+   varlen shard；边界可以落在一帧中间；
+2. Q/K 完成 absolute RoPE 后与 V 合并，只做一次 input all-to-all；
+3. 每个 rank 只保存连续的 local-head causal KV，token cursor 仍使用全局坐标；
+4. reverse all-to-all 恢复 local sequence，output projection 后再做 varlen all-gather，
+   让 scheduler、re-noise RNG 和 VAE 继续看到完整 latent。
 
-因此 PR 会拒绝所有非一的 `sp_degree`、`ulysses_degree` 或 `ring_degree`。生产扩吞吐时，
-目前正确的方法是每卡一个独立 replica，让负载均衡器按 session 路由。
+当前只允许 `sp_degree == ulysses_degree > 1` 且 `ring_degree == 1`。Sampling params
+必须保持 `enable_sequence_shard=True`；SP>1 却显式关闭 shard 会直接报错。Ring、
+TP+SP、FSDP+SP 和 whole-DiT compile+SP 尚未实现。多卡 GPU 验收仍需覆盖 reference
+clean commit、四次 DMD forward、clean-final KV 写入、连续 action、prompt update、
+bounded/unbounded history 以及 SP2/SP4/SP8。
 
 即使将来接通 Ulysses，单靠 SP 也无法让当前 720p 串行 pipeline 到 24 FPS。H200
 24-chunk profile 的中位时间约为：
@@ -231,17 +241,20 @@ SP2/SP4。MinWM 有 24 个 attention heads；未来 Ulysses degree 还必须满�
 ## 11. 变更边界和后续工作
 
 这次 PR 已覆盖 checkpoint 转换、模型注册、realtime adapter、action conditioning、
-causal KV、数值 parity、benchmark、同步播放器和中英文文档。它没有声称完成：
+causal KV、数值 parity、benchmark、同步播放器、中英文文档和第一阶段 causal
+Ulysses 实现。它没有声称完成：
 
-- Ulysses/Ring sequence parallel；
+- Ring Attention，以及 Ulysses 与 TP/FSDP/whole-DiT compile 的组合；
+- SP2/SP4/SP8 的多卡 bitwise 与性能验收；
 - 多 session dynamic batching；
 - 720p 24 FPS；
 - whole-DiT compile 的 strict parity；
 - 0721 checkpoint 的原生首帧训练合同。
 
-推荐的下一阶段顺序是：先 profile VAE/RGB，做 decode/DiT pipeline overlap；再实现
-MinWM packed attention 的 Ulysses all-to-all 和 KV ownership；最后在相同
-prompt/seed/首帧/action 的多卡环境中重新建立 bitwise 或预声明 tolerance 的验收矩阵。
+推荐的下一阶段顺序是：先在相同 prompt/seed/首帧/action 的多卡环境中完成
+SP2/SP4/SP8 bitwise 或预声明 tolerance 的验收矩阵，并分开记录 all-to-all 与 final
+all-gather；再 profile VAE/RGB，做 decode/DiT pipeline overlap；最后评估 Ring 或混合
+并行是否值得。
 Whole-DiT performance profile 若要成为产品默认值，也必须单独定义并通过数值 tolerance
 和冷启动预算，而不能继承 eager exact lane 的 bitwise 结论。
 
@@ -267,7 +280,8 @@ Whole-DiT performance profile 若要成为产品默认值，也必须单独定�
 14. TTFF、warm chunk latency 和 steady-state FPS 分别回答什么问题？
 15. **关键：** MinWM 默认 KV window 是多少？bounded 和 unbounded session 怎样分配 cache？
 16. 为什么 `frame_batch` 不能直接作为模型 chunk 的延迟完成条件？
-17. **关键：** 当前设置 `ulysses_degree=2` 会发生什么？PR 为什么选择 fail-fast？
+17. **关键：** 当前设置 SP2/Ulysses2 会怎样分配 sequence 与 causal KV？哪些不受支持
+    的组合仍然 fail-fast？
 18. 在“DiT 理想无限加速”的假设下，720p pipeline 的 FPS 上限约是多少？
 19. **关键：** 为什么任何有限 Ulysses degree 都不能单独达到 720p 24 FPS？
 20. 如果由你负责下一轮优化，请列出三个按优先级排序的工作，并说明每项如何验证性能

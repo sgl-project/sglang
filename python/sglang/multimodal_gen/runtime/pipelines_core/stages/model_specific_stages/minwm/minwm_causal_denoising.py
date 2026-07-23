@@ -15,6 +15,10 @@ from sglang.multimodal_gen.configs.pipeline_configs.minwm import (
     MINWM_TOTAL_CHUNKS_CONDITION,
 )
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_ring_parallel_world_size,
+    get_ulysses_parallel_world_size,
+)
 from sglang.multimodal_gen.runtime.models.dits.minwm_action import (
     validate_action_labels,
     validate_action_weights,
@@ -23,6 +27,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.causal_denoising import (
     CausalDMDDenoisingStage,
+    CausalDMDCachePolicy,
     CausalDMDForwardContext,
     CausalDMDRealtimeCacheContext,
 )
@@ -144,6 +149,38 @@ class MinWMChunkLatentPreparationStage(PipelineStage):
 class MinWMCausalDMDDenoisingStage(CausalDMDDenoisingStage):
     """One clean reference commit followed by four-frame action DMD chunks."""
 
+    def _causal_sequence_shard_enabled(self, batch: Req) -> bool:
+        return bool(
+            getattr(batch, "enable_sequence_shard", False)
+            and get_ulysses_parallel_world_size() > 1
+        )
+
+    def _num_causal_cache_attention_heads(
+        self,
+        *,
+        sequence_shard_enabled: bool,
+    ) -> int:
+        num_attention_heads = self.transformer.num_attention_heads
+        if not sequence_shard_enabled:
+            return num_attention_heads
+
+        ulysses_world_size = get_ulysses_parallel_world_size()
+        if get_ring_parallel_world_size() > 1:
+            raise NotImplementedError(
+                "MinWM causal sequence sharding supports Ulysses with "
+                "ring_degree = 1 only."
+            )
+        if ulysses_world_size <= 1:
+            raise ValueError(
+                "MinWM causal sequence sharding requires ulysses_degree > 1."
+            )
+        if num_attention_heads % ulysses_world_size != 0:
+            raise ValueError(
+                f"num_attention_heads ({num_attention_heads}) must be divisible "
+                f"by ulysses_degree ({ulysses_world_size})."
+            )
+        return num_attention_heads // ulysses_world_size
+
     def _apply_causal_cache_overrides(
         self,
         batch: Req,
@@ -169,9 +206,19 @@ class MinWMCausalDMDDenoisingStage(CausalDMDDenoisingStage):
                 self.num_frames_per_block
             )
 
-    def _causal_kv_cache_kwargs(self, policy) -> dict:
-        del policy
-        return {"allow_growth": bool(getattr(self, "_minwm_unbounded_cache", True))}
+    def _causal_kv_cache_kwargs(self, policy: CausalDMDCachePolicy) -> dict:
+        return {
+            "sequence_shard_enabled": policy.sequence_shard_enabled,
+            "kv_cache_size": policy.expected_cache_tokens,
+            "allow_growth": bool(getattr(self, "_minwm_unbounded_cache", True)),
+        }
+
+    def _use_causal_cache_int_indices(
+        self,
+        *,
+        sequence_shard_enabled: bool,
+    ) -> bool:
+        return sequence_shard_enabled
 
     def _should_reset_realtime_causal_caches(
         self,

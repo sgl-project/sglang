@@ -273,6 +273,14 @@ generated latent chunk. Later chunks retain both transformer and VAE state.
 | D37 | Publish an artifact-ready marker only after the full result tree is copied, then keep a 120-second capture window. | The first successful H200 long run wrote its summary before copying roughly 2 GB of output. The external collector declared completion too early, and Kubernetes reclaimed the emptyDir when the pod exited. The explicit marker separates inference completion from export readiness. |
 | D38 | Return identity metrics immediately for lossless arrays already proven `array_equal`. | The old comparator still converted exact 720p pairs into multiple float64 arrays and repeated cosine and per-frame SSIM work. The fast path runs only after byte equality is established, so the conclusion is mathematically unchanged while avoiding pointless CPU and memory cost. |
 | D39 | Reject every non-unit SP setting until MinWM actually implements Ulysses/Ring. | The current batch never enters sequence sharding and the source-shaped packed attention has no all-to-all; silently accepting the flags would make duplicated multi-GPU work look like useful acceleration. Causal KV ownership, action history, absolute positions, and output gather must be designed together and revalidated for parity. |
+| D40 | Enable the first causal Ulysses phase only for `sp_degree == ulysses_degree > 1` with `ring_degree == 1`. | MinWM now shards contiguous patch/action tokens, packs RoPE-applied Q/K/V into one input all-to-all, stores only local attention heads in the full-history causal KV cache, reverses the collective after attention, and gathers projected output tokens before scheduler and VAE work. Head divisibility is mandatory; Ring, TP+SP, FSDP+SP, and whole-DiT compile+SP remain rejected. |
+
+<Warning>
+  The causal Ulysses implementation has local unit and isolated runtime coverage,
+  but this document does not yet contain the SP2/SP4/SP8 GPU parity and performance
+  matrix. Do not reuse the historical SP1 results as evidence for multi-GPU
+  bitwise equality or speedup.
+</Warning>
 
 ## Differences discovered during implementation
 

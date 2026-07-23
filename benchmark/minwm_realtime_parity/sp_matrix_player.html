@@ -1,0 +1,194 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <link rel="icon" href="data:,">
+  <title>MinWM 720p Ulysses SP 对比</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, sans-serif;
+      background: #090b10;
+      color: #f4f5f7;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: radial-gradient(circle at 50% -20%, #25324b 0, #090b10 45%); }
+    header, main { width: min(1500px, 100%); margin: auto; padding: 24px; }
+    header { padding-bottom: 8px; }
+    h1 { margin: 0; font-size: clamp(24px, 4vw, 44px); letter-spacing: -.04em; }
+    .lede { color: #aeb8ca; margin: 10px 0 0; }
+    .status { display: inline-flex; margin-top: 16px; padding: 7px 11px; border-radius: 999px; background: #183c31; color: #87edc5; }
+    .status.fail { background: #4a2028; color: #ff9eaa; }
+    .metric-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin: 20px 0; }
+    .metric { padding: 16px; border: 1px solid #2a3242; border-radius: 14px; background: rgba(17, 22, 32, .92); }
+    .metric strong { display: block; font-size: 24px; font-variant-numeric: tabular-nums; }
+    .metric span { color: #93a0b5; font-size: 13px; }
+    .table-wrap { overflow-x: auto; border: 1px solid #2a3242; border-radius: 14px; }
+    table { width: 100%; border-collapse: collapse; background: rgba(17, 22, 32, .92); font-variant-numeric: tabular-nums; }
+    th, td { padding: 12px 14px; text-align: right; border-bottom: 1px solid #252d3b; white-space: nowrap; }
+    th:first-child, td:first-child { text-align: left; }
+    tr:last-child td { border-bottom: 0; }
+    .viewer { margin-top: 24px; padding: 16px; border: 1px solid #2a3242; border-radius: 16px; background: rgba(17, 22, 32, .95); }
+    .viewer-head, .controls { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+    .viewer-head { justify-content: space-between; margin-bottom: 14px; }
+    select, button, input { font: inherit; }
+    select, button { padding: 9px 12px; color: #f4f5f7; border: 1px solid #3b465a; border-radius: 9px; background: #202838; }
+    button.primary { background: #f4f5f7; color: #10131a; border-color: #f4f5f7; font-weight: 750; }
+    .videos { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .panel { overflow: hidden; border: 1px solid #2a3242; border-radius: 12px; background: #050609; }
+    .label { padding: 10px 12px; font-weight: 750; background: #151b26; }
+    video { display: block; width: 100%; background: #000; }
+    .controls { margin-top: 14px; }
+    .seek { flex: 1 1 300px; }
+    .time { min-width: 110px; color: #aeb8ca; font-variant-numeric: tabular-nums; }
+    details { margin-top: 18px; color: #aeb8ca; }
+    pre { overflow-x: auto; padding: 14px; border-radius: 10px; background: #080b10; }
+    @media (max-width: 900px) {
+      .metric-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .videos { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>MinWM 720p · Causal Ulysses SP</h1>
+    <p class="lede">单机 8×B200 Spot，同一 checkpoint、输入、seed 与 deterministic packed attention。默认一键同步播放 SP1 与 SP2。</p>
+    <span id="status" class="status">读取实测报告…</span>
+  </header>
+  <main>
+    <section id="metrics" class="metric-grid"></section>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>并行度</th><th>Scheduler FPS</th><th>Client FPS</th><th>相对 SP1</th><th>TTFF</th><th>峰值显存/GPU</th><th>Parity</th></tr></thead>
+        <tbody id="matrix"></tbody>
+      </table>
+    </div>
+    <section class="viewer">
+      <div class="viewer-head">
+        <strong id="case-title">720p 5s 视频对比</strong>
+        <label>右侧视频
+          <select id="candidate"></select>
+        </label>
+      </div>
+      <div class="videos">
+        <div class="panel">
+          <div class="label">SP1 · reference</div>
+          <video id="reference-video" preload="metadata" muted playsinline></video>
+        </div>
+        <div class="panel">
+          <div id="candidate-label" class="label">SP2 · Ulysses</div>
+          <video id="candidate-video" preload="metadata" muted playsinline></video>
+        </div>
+      </div>
+      <div class="controls">
+        <button id="play" class="primary">一键播放两路视频</button>
+        <button id="prev">−1 帧</button>
+        <button id="next">+1 帧</button>
+        <input id="seek" class="seek" aria-label="同步进度" type="range" min="0" max="1" step="0.001" value="0">
+        <span id="time" class="time">0:00 / 0:00</span>
+      </div>
+      <details><summary>实测报告与输入</summary><pre id="details"></pre></details>
+    </section>
+  </main>
+  <script id="report" type="application/json">__MINWM_SP_MATRIX_REPORT__</script>
+  <script>
+    const report = JSON.parse(document.querySelector('#report').textContent);
+    const status = document.querySelector('#status');
+    const metrics = document.querySelector('#metrics');
+    const matrix = document.querySelector('#matrix');
+    const candidateSelect = document.querySelector('#candidate');
+    const referenceVideo = document.querySelector('#reference-video');
+    const candidateVideo = document.querySelector('#candidate-video');
+    const candidateLabel = document.querySelector('#candidate-label');
+    const seek = document.querySelector('#seek');
+    const timeLabel = document.querySelector('#time');
+    const playButton = document.querySelector('#play');
+    const caseItem = report.cases[0];
+    const laneMap = new Map(report.lanes.map(lane => [lane.degree, lane]));
+    const fps = report.contract.fps;
+
+    const fmt = (value, digits=2) => value == null ? 'n/a' : Number(value).toFixed(digits);
+    const formatTime = seconds => `${Math.floor(seconds / 60)}:${String(Math.floor(seconds % 60)).padStart(2, '0')}`;
+    const parityFor = degree => degree === 1 || caseItem.comparisons[`sp${degree}`]?.bitwise_equal;
+    status.textContent = report.summary.all_generated_bitwise ? '全部 SP lane generated frames bitwise exact' : '检测到数值漂移';
+    if (!report.summary.all_generated_bitwise) status.classList.add('fail');
+
+    const sp2 = laneMap.get(2);
+    [
+      ['SP2 Client FPS', fmt(sp2?.performance.client_fps, 3)],
+      ['SP2 加速比', `${fmt(sp2?.performance.client_speedup_vs_sp1, 3)}×`],
+      ['视频规格', `${report.contract.width}×${report.contract.height}`],
+      ['时长 / 帧数', `${fmt((report.contract.reference_pixel_frames + report.contract.generated_pixel_frames) / fps, 3)}s / ${report.contract.reference_pixel_frames + report.contract.generated_pixel_frames}`],
+    ].forEach(([label, value]) => {
+      const card = document.createElement('div');
+      card.className = 'metric';
+      card.innerHTML = `<strong>${value}</strong><span>${label}</span>`;
+      metrics.append(card);
+    });
+
+    report.lanes.forEach(lane => {
+      const p = lane.performance;
+      const row = document.createElement('tr');
+      row.innerHTML = `<td>SP${lane.degree}</td><td>${fmt(p.scheduler_fps, 3)}</td><td>${fmt(p.client_fps, 3)}</td><td>${fmt(p.client_speedup_vs_sp1, 3)}×</td><td>${fmt(p.ttff_ms / 1000, 3)}s</td><td>${fmt(p.peak_max_gpu_mb, 0)} MiB</td><td>${parityFor(lane.degree) ? 'bitwise' : 'drift'}</td>`;
+      matrix.append(row);
+      if (lane.degree > 1) {
+        const option = document.createElement('option');
+        option.value = lane.degree;
+        option.textContent = `SP${lane.degree}`;
+        candidateSelect.append(option);
+      }
+    });
+
+    const casePath = `../cases/${encodeURIComponent(caseItem.id)}`;
+    referenceVideo.src = `${casePath}/sp1.mp4`;
+    document.querySelector('#case-title').textContent = `${caseItem.id} · ${caseItem.keys.join('+')}`;
+    document.querySelector('#details').textContent = JSON.stringify({contract: report.contract, case: caseItem, lanes: report.lanes}, null, 2);
+
+    function loadCandidate() {
+      const degree = Number(candidateSelect.value || 2);
+      candidateLabel.textContent = `SP${degree} · Ulysses`;
+      candidateVideo.src = `${casePath}/sp${degree}.mp4`;
+      candidateVideo.load();
+      referenceVideo.currentTime = candidateVideo.currentTime = 0;
+    }
+    candidateSelect.value = '2';
+    loadCandidate();
+    candidateSelect.onchange = loadCandidate;
+
+    function sync(force=false) {
+      if (force || Math.abs(candidateVideo.currentTime - referenceVideo.currentTime) > 0.025) {
+        candidateVideo.currentTime = referenceVideo.currentTime;
+      }
+      const duration = Number.isFinite(referenceVideo.duration) ? referenceVideo.duration : 0;
+      seek.max = duration || 1;
+      seek.value = referenceVideo.currentTime;
+      timeLabel.textContent = `${formatTime(referenceVideo.currentTime)} / ${formatTime(duration)}`;
+    }
+    function seekBoth(seconds) {
+      const duration = Number.isFinite(referenceVideo.duration) ? referenceVideo.duration : seconds;
+      const target = Math.min(Math.max(0, seconds), duration);
+      referenceVideo.currentTime = candidateVideo.currentTime = target;
+      sync(true);
+    }
+    playButton.onclick = async () => {
+      if (referenceVideo.paused) {
+        sync(true);
+        await Promise.all([referenceVideo.play(), candidateVideo.play()]);
+        playButton.textContent = '暂停两路视频';
+      } else {
+        referenceVideo.pause();
+        candidateVideo.pause();
+      }
+    };
+    referenceVideo.ontimeupdate = () => sync(false);
+    referenceVideo.onpause = () => {
+      candidateVideo.pause();
+      playButton.textContent = '一键播放两路视频';
+    };
+    seek.oninput = () => seekBoth(Number(seek.value));
+    document.querySelector('#prev').onclick = () => seekBoth(Number(seek.value) - 1 / fps);
+    document.querySelector('#next').onclick = () => seekBoth(Number(seek.value) + 1 / fps);
+  </script>
+</body>
+</html>

@@ -17,7 +17,8 @@ set -euo pipefail
   || "${MINWM_BENCHMARK_MODE}" == "full" \
   || "${MINWM_BENCHMARK_MODE}" == "profiles" \
   || "${MINWM_BENCHMARK_MODE}" == "long720p" \
-  || "${MINWM_BENCHMARK_MODE}" == "triptych720p" ]] || {
+  || "${MINWM_BENCHMARK_MODE}" == "triptych720p" \
+  || "${MINWM_BENCHMARK_MODE}" == "spmatrix720p" ]] || {
   echo "unsupported MINWM_BENCHMARK_MODE=${MINWM_BENCHMARK_MODE}" >&2
   exit 2
 }
@@ -176,6 +177,98 @@ wait_for_server() {
   tail -300 "${log_path}" >&2
   return 1
 }
+
+if [[ "${MINWM_BENCHMARK_MODE}" == "spmatrix720p" ]]; then
+  SP_CASES="${MINWM_CASES_PATH:-${SCRIPT_DIR}/cases_720p_compile_smoke.json}"
+  SP_RESULTS="${LOCAL_RESULTS}/sp-matrix-720p"
+  SP_WARMUP_RUNS="${MINWM_SP_WARMUP_RUNS:-1}"
+  ARTIFACT_HOLD_SECONDS="${MINWM_ARTIFACT_HOLD_SECONDS:-0}"
+  if ! [[ "${SP_WARMUP_RUNS}" =~ ^[0-9]+$ ]]; then
+    echo "MINWM_SP_WARMUP_RUNS must be a non-negative integer" >&2
+    exit 2
+  fi
+  if ! [[ "${ARTIFACT_HOLD_SECONDS}" =~ ^[0-9]+$ ]]; then
+    echo "MINWM_ARTIFACT_HOLD_SECONDS must be a non-negative integer" >&2
+    exit 2
+  fi
+  mkdir -p "${SP_RESULTS}"
+  nvidia-smi -L | tee "${RESULTS}/sp-gpus.txt"
+  nvidia-smi topo -m | tee "${RESULTS}/sp-topology.txt"
+
+  run_sp_lane() {
+    local degree="$1"
+    local prefix="sp${degree}"
+    local server_log="${SP_RESULTS}/${prefix}-server.log"
+    local memory_log="${SP_RESULTS}/${prefix}-gpu-memory.csv"
+    MINWM_ATTENTION_IMPL=packed \
+    MINWM_PACKED_ATTENTION_DETERMINISTIC=true \
+    MINWM_NATIVE_COMPONENTS=text_encoder,vae \
+    sglang serve \
+      --model-path "${MODEL_DIR}" \
+      --pipeline-class-name MinWMCausalDMDPipeline \
+      --attention-backend fa \
+      --performance-mode speed \
+      --num-gpus "${degree}" \
+      --tp-size 1 \
+      --sp-degree "${degree}" \
+      --ulysses-degree "${degree}" \
+      --ring-degree 1 \
+      --enable-cfg-parallel false \
+      --enable-torch-compile false \
+      --warmup-mode off \
+      --port 30000 \
+      > "${server_log}" 2>&1 &
+    local server_pid=$!
+    if ! wait_for_server "${server_pid}" "${server_log}"; then
+      kill "${server_pid}" 2>/dev/null || true
+      wait "${server_pid}" 2>/dev/null || true
+      return 1
+    fi
+    (
+      while kill -0 "${server_pid}" 2>/dev/null; do
+        nvidia-smi --query-gpu=timestamp,index,memory.used \
+          --format=csv,noheader,nounits || true
+        sleep 1
+      done
+    ) > "${memory_log}" &
+    local monitor_pid=$!
+    set +e
+    python3 "${SCRIPT_DIR}/run_sglang_api.py" \
+      --cases "${SP_CASES}" \
+      --results "${SP_RESULTS}" \
+      --ws-url ws://127.0.0.1:30000/v1/realtime_video/generate \
+      --output-prefix "${prefix}" \
+      --engine-name "sglang-minwm-${prefix}-ulysses" \
+      --warmup-runs "${SP_WARMUP_RUNS}" \
+      | tee "${SP_RESULTS}/${prefix}-client.log"
+    local lane_status=${PIPESTATUS[0]}
+    set -e
+    kill "${server_pid}" 2>/dev/null || true
+    wait "${server_pid}" 2>/dev/null || true
+    kill "${monitor_pid}" 2>/dev/null || true
+    wait "${monitor_pid}" 2>/dev/null || true
+    return "${lane_status}"
+  }
+
+  for degree in 1 2 4 8; do
+    run_sp_lane "${degree}"
+  done
+  python3 "${SCRIPT_DIR}/compare_sp_matrix.py" \
+    --cases "${SP_CASES}" \
+    --results "${SP_RESULTS}" \
+    --degrees 1,2,4,8 \
+    | tee "${RESULTS}/sp-matrix-compare.log"
+  cp -r "${SP_RESULTS}" "${RESULTS}/"
+  cp "${SP_RESULTS}/sp_matrix_report.json" "${RESULTS}/"
+  cp "${SP_RESULTS}/sp_matrix_report.md" "${RESULTS}/"
+  touch "${RESULTS}/sp-matrix-artifacts-ready"
+  echo "MINWM_B200_SP_MATRIX_COMPLETE results=${RESULTS}"
+  if (( ARTIFACT_HOLD_SECONDS > 0 )); then
+    echo "MINWM_ARTIFACT_HOLD seconds=${ARTIFACT_HOLD_SECONDS}"
+    sleep "${ARTIFACT_HOLD_SECONDS}"
+  fi
+  exit 0
+fi
 
 if [[ "${MINWM_BENCHMARK_MODE}" == "triptych720p" ]]; then
   TRIPTYCH_CASES="${MINWM_CASES_PATH:-${SCRIPT_DIR}/cases_720p_compile_smoke.json}"

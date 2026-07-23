@@ -8,7 +8,9 @@ import torch
 from sglang.multimodal_gen.runtime.distributed import sp_shard_utils as sps
 from sglang.multimodal_gen.runtime.distributed.sp_shard_utils import (
     SpShard,
+    compute_sequence_splits,
     shard_like,
+    shard_sequence_varlen,
     tail_attn_meta,
 )
 
@@ -17,6 +19,49 @@ def _fake_sp(monkeypatch, sp_size, sp_rank=0, ring=1):
     monkeypatch.setattr(sps, "get_sp_world_size", lambda: sp_size)
     monkeypatch.setattr(sps, "get_sp_parallel_rank", lambda: sp_rank)
     monkeypatch.setattr(sps, "get_ring_parallel_world_size", lambda: ring)
+
+
+# --- unpadded varlen shards -------------------------------------------------
+
+
+def test_compute_sequence_splits_distributes_remainder_first():
+    assert compute_sequence_splits(10, 3) == [4, 3, 3]
+    assert compute_sequence_splits(12, 3) == [4, 4, 4]
+
+
+def test_compute_sequence_splits_rejects_invalid_inputs():
+    with pytest.raises(ValueError, match="non-negative"):
+        compute_sequence_splits(-1, 2)
+    with pytest.raises(ValueError, match="positive"):
+        compute_sequence_splits(4, 0)
+
+
+def test_shard_sequence_varlen_preserves_global_order():
+    x = torch.arange(20).view(1, 10, 2)
+    splits = compute_sequence_splits(10, 3)
+    assert shard_sequence_varlen(x, splits, 0).flatten().tolist() == list(range(8))
+    assert shard_sequence_varlen(x, splits, 1).flatten().tolist() == list(range(8, 14))
+    assert shard_sequence_varlen(x, splits, 2).flatten().tolist() == list(range(14, 20))
+
+
+def test_gather_sequence_varlen_restores_global_order(monkeypatch):
+    _fake_sp(monkeypatch, 3, sp_rank=1)
+    splits = [4, 3, 3]
+    local = torch.tensor([[[4.0], [5.0], [6.0]]])
+    rank_chunks = [
+        torch.tensor([[[0.0], [1.0], [2.0], [3.0]]]),
+        torch.tensor([[[4.0], [5.0], [6.0], [0.0]]]),
+        torch.tensor([[[7.0], [8.0], [9.0], [0.0]]]),
+    ]
+
+    def fake_all_gather(outputs, _input, group):
+        assert group == "sp"
+        for output, chunk in zip(outputs, rank_chunks):
+            output.copy_(chunk)
+
+    monkeypatch.setattr(sps.dist, "all_gather", fake_all_gather)
+    gathered = sps.gather_sequence_varlen(local, splits, "sp")
+    assert gathered.flatten().tolist() == [float(i) for i in range(10)]
 
 
 # --- build_shard_plan math --------------------------------------------------------

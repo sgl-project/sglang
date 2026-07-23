@@ -11,6 +11,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.minwm import (
     MinWMCausalDMDConfig,
     minwm_t5_postprocess_text,
 )
+from sglang.multimodal_gen.configs.sample.minwm import MinWMSamplingParams
 from sglang.multimodal_gen.runtime.models.dits.minwm_action import (
     PrimitiveTokenResidualActionEncoder,
     action_labels_to_primitive_bits,
@@ -19,12 +20,14 @@ from sglang.multimodal_gen.runtime.models.dits.minwm_action import (
     validate_action_weights,
 )
 from sglang.multimodal_gen.runtime.models.dits.minwm import (
+    MinWMCausalSelfAttention,
     MinWMPatchEmbed,
     MinWMRMSNorm,
     _frame_gate,
     _frame_modulation,
     _minwm_adaln_op,
     _minwm_adaln_modulation,
+    _minwm_frame_indices,
     _minwm_layer_norm,
     _minwm_packed_attention_backend,
     _minwm_qk_norm_rope_op,
@@ -333,14 +336,220 @@ def test_minwm_converter_defaults_to_requested_0721_checkpoint():
     )
 
 
-def test_minwm_rejects_unimplemented_sequence_parallelism():
+@pytest.mark.parametrize("degree", [2, 4, 8])
+def test_minwm_accepts_supported_ulysses_sequence_parallelism(degree):
     MinWMCausalDMDPipeline._validate_sequence_parallelism_args(
         SimpleNamespace(sp_degree=1, ulysses_degree=1, ring_degree=1)
     )
-    with pytest.raises(ValueError, match="does not support sequence parallelism"):
-        MinWMCausalDMDPipeline._validate_sequence_parallelism_args(
-            SimpleNamespace(sp_degree=2, ulysses_degree=2, ring_degree=1)
+    MinWMCausalDMDPipeline._validate_sequence_parallelism_args(
+        SimpleNamespace(
+            sp_degree=degree,
+            ulysses_degree=degree,
+            ring_degree=1,
+            tp_size=1,
         )
+    )
+
+
+@pytest.mark.parametrize(
+    ("args", "message"),
+    [
+        (
+            SimpleNamespace(sp_degree=2, ulysses_degree=1, ring_degree=2),
+            "ring-degree 1",
+        ),
+        (
+            SimpleNamespace(sp_degree=4, ulysses_degree=2, ring_degree=1),
+            "sp-degree == --ulysses-degree",
+        ),
+        (
+            SimpleNamespace(sp_degree=5, ulysses_degree=5, ring_degree=1),
+            "must be divisible",
+        ),
+        (
+            SimpleNamespace(sp_degree=2, ulysses_degree=2, ring_degree=1, tp_size=2),
+            "tensor parallelism",
+        ),
+        (
+            SimpleNamespace(
+                sp_degree=2,
+                ulysses_degree=2,
+                ring_degree=1,
+                use_fsdp_inference=True,
+            ),
+            "FSDP",
+        ),
+        (
+            SimpleNamespace(
+                sp_degree=2,
+                ulysses_degree=2,
+                ring_degree=1,
+                enable_torch_compile=True,
+            ),
+            "torch.compile",
+        ),
+    ],
+)
+def test_minwm_rejects_unsupported_parallelism_combinations(args, message):
+    with pytest.raises(ValueError, match=message):
+        MinWMCausalDMDPipeline._validate_sequence_parallelism_args(args)
+
+
+def test_minwm_sp_request_cannot_disable_sequence_sharding(monkeypatch):
+    monkeypatch.setattr(
+        MinWMSamplingParams.__mro__[1],
+        "_adjust",
+        lambda _self, _server_args: None,
+    )
+    params = MinWMSamplingParams(enable_sequence_shard=False)
+    with pytest.raises(ValueError, match="requires enable_sequence_shard=True"):
+        params._adjust(SimpleNamespace(sp_degree=2))
+
+
+def test_minwm_sp_request_enables_sequence_sharding(monkeypatch):
+    monkeypatch.setattr(
+        MinWMSamplingParams.__mro__[1],
+        "_adjust",
+        lambda _self, _server_args: None,
+    )
+    params = MinWMSamplingParams(enable_sequence_shard=None)
+    params._adjust(SimpleNamespace(sp_degree=4))
+    assert params.enable_sequence_shard is True
+    assert params.adjust_frames is False
+
+
+def test_minwm_sequence_shard_frame_indices_support_mid_frame_boundaries(monkeypatch):
+    import sglang.multimodal_gen.runtime.models.dits.minwm as minwm_module
+
+    forward_batch = SimpleNamespace(
+        enable_sequence_shard=True,
+        sequence_shard_frame_indices=torch.tensor([1, 1, 2]),
+    )
+    monkeypatch.setattr(
+        minwm_module,
+        "get_forward_context",
+        lambda: SimpleNamespace(forward_batch=forward_batch),
+    )
+    monkeypatch.setattr(minwm_module, "get_ulysses_parallel_world_size", lambda: 2)
+
+    hidden_states = torch.zeros(1, 3, 8)
+    assert _minwm_frame_indices(hidden_states, 4).tolist() == [1, 1, 2]
+
+
+def test_minwm_causal_cache_uses_local_ulysses_heads(monkeypatch):
+    import sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minwm.minwm_causal_denoising as stage_module
+
+    stage = MinWMCausalDMDDenoisingStage.__new__(MinWMCausalDMDDenoisingStage)
+    stage.transformer = SimpleNamespace(num_attention_heads=24)
+    stage._minwm_unbounded_cache = True
+    monkeypatch.setattr(stage_module, "get_ulysses_parallel_world_size", lambda: 4)
+    monkeypatch.setattr(stage_module, "get_ring_parallel_world_size", lambda: 1)
+
+    assert stage._causal_sequence_shard_enabled(
+        SimpleNamespace(enable_sequence_shard=True)
+    )
+    assert stage._num_causal_cache_attention_heads(sequence_shard_enabled=True) == 6
+    assert stage._use_causal_cache_int_indices(sequence_shard_enabled=True)
+    assert stage._causal_kv_cache_kwargs(
+        SimpleNamespace(sequence_shard_enabled=True, expected_cache_tokens=123)
+    ) == {
+        "sequence_shard_enabled": True,
+        "kv_cache_size": 123,
+        "allow_growth": True,
+    }
+
+
+@pytest.mark.parametrize("seq_splits", [(2, 2), (3, 2)])
+def test_minwm_causal_attention_packs_one_ulysses_collective(monkeypatch, seq_splits):
+    import sglang.multimodal_gen.runtime.models.dits.minwm as minwm_module
+
+    local_seq = seq_splits[0]
+    global_seq = sum(seq_splits)
+    local_heads = 2
+    head_dim = 2
+    forward_batch = SimpleNamespace(
+        enable_sequence_shard=True,
+        sequence_shard_splits=seq_splits,
+    )
+    monkeypatch.setattr(
+        minwm_module,
+        "get_forward_context",
+        lambda: SimpleNamespace(forward_batch=forward_batch),
+    )
+    monkeypatch.setattr(minwm_module, "get_ulysses_parallel_world_size", lambda: 2)
+    monkeypatch.setattr(minwm_module, "_MINWM_ATTENTION_IMPL", "packed")
+
+    calls = {"input": 0, "output": 0}
+
+    def fake_input(qkv, *args, **kwargs):
+        calls["input"] += 1
+        assert qkv.shape == (1, local_seq, 4, 3 * head_dim)
+        return torch.cat(
+            [
+                torch.ones(1, global_seq, local_heads, head_dim),
+                torch.full((1, global_seq, local_heads, head_dim), 2.0),
+                torch.full((1, global_seq, local_heads, head_dim), 3.0),
+            ],
+            dim=-1,
+        )
+
+    def fake_output(output, *args, **kwargs):
+        calls["output"] += 1
+        assert output.shape == (1, global_seq, local_heads, head_dim)
+        return torch.zeros(1, local_seq, 4, head_dim)
+
+    if seq_splits[0] == seq_splits[1]:
+        monkeypatch.setattr(minwm_module, "_usp_input_all_to_all", fake_input)
+        monkeypatch.setattr(minwm_module, "_usp_output_all_to_all", fake_output)
+    else:
+        monkeypatch.setattr(minwm_module, "_usp_input_all_to_all_varlen", fake_input)
+        monkeypatch.setattr(minwm_module, "_usp_output_all_to_all_varlen", fake_output)
+
+    attention = MinWMCausalSelfAttention.__new__(MinWMCausalSelfAttention)
+    torch.nn.Module.__init__(attention)
+    attention.head_start = 0
+
+    class Cache:
+        def __init__(self):
+            self.kwargs = None
+
+        def can_direct_current_attention(self, _num_tokens):
+            return False
+
+        def update_and_get_attention_kv(self, **kwargs):
+            self.kwargs = kwargs
+            return SimpleNamespace(k=kwargs["key"], v=kwargs["value"])
+
+    cache = Cache()
+
+    def fake_attention(query, key, value):
+        assert torch.count_nonzero(query != 1).item() == 0
+        assert torch.count_nonzero(key != 2).item() == 0
+        assert torch.count_nonzero(value != 3).item() == 0
+        return query
+
+    monkeypatch.setattr(minwm_module, "_minwm_packed_varlen_attention", fake_attention)
+    output = attention.forward(
+        torch.ones(1, local_seq, 4, head_dim),
+        torch.full((1, local_seq, 4, head_dim), 2.0),
+        torch.full((1, local_seq, 4, head_dim), 3.0),
+        (torch.empty(0), torch.empty(0)),
+        block_mask=None,
+        kv_cache=cache,
+        current_start=17,
+        qk_already_roped=True,
+    )
+
+    assert output.shape == (1, local_seq, 4, head_dim)
+    assert calls == {"input": 1, "output": 1}
+    assert cache.kwargs["key"].shape == (
+        1,
+        global_seq,
+        local_heads,
+        head_dim,
+    )
+    assert cache.kwargs["current_chunk_start"] == 17
+    assert cache.kwargs["cache_head_start"] == 0
 
 
 @pytest.mark.parametrize(

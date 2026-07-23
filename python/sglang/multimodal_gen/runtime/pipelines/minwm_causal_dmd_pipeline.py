@@ -47,15 +47,42 @@ class MinWMCausalDMDPipeline(LoRAPipeline, ComposedPipelineBase):
         sp_degree = getattr(server_args, "sp_degree", 1) or 1
         ulysses_degree = getattr(server_args, "ulysses_degree", 1) or 1
         ring_degree = getattr(server_args, "ring_degree", 1) or 1
-        if (sp_degree, ulysses_degree, ring_degree) != (1, 1, 1):
+        if (sp_degree, ulysses_degree, ring_degree) == (1, 1, 1):
+            return
+        if ring_degree != 1:
             raise ValueError(
-                "MinWM causal realtime does not support sequence parallelism yet. "
-                "Its source-shaped packed attention, causal KV cache, action history, "
-                "and absolute-position schedule have not been sharded with the required "
-                "all-to-all/state exchange. Use one independent MinWM replica per GPU "
-                "instead of "
-                f"--sp-degree {sp_degree}, --ulysses-degree {ulysses_degree}, "
-                f"--ring-degree {ring_degree}."
+                "MinWM causal realtime supports Ulysses sequence parallelism "
+                "with --ring-degree 1 only."
+            )
+        if sp_degree <= 1 or sp_degree != ulysses_degree:
+            raise ValueError(
+                "MinWM causal realtime requires --sp-degree == --ulysses-degree > 1."
+            )
+        num_attention_heads = 24
+        pipeline_config = getattr(server_args, "pipeline_config", None)
+        dit_config = getattr(pipeline_config, "dit_config", None)
+        arch_config = getattr(dit_config, "arch_config", None)
+        if arch_config is not None:
+            num_attention_heads = int(
+                getattr(arch_config, "num_attention_heads", num_attention_heads)
+            )
+        if num_attention_heads % ulysses_degree != 0:
+            raise ValueError(
+                f"MinWM attention heads ({num_attention_heads}) must be "
+                f"divisible by ulysses_degree ({ulysses_degree})."
+            )
+        if (getattr(server_args, "tp_size", 1) or 1) != 1:
+            raise ValueError(
+                "MinWM causal Ulysses cannot be combined with tensor parallelism yet."
+            )
+        if bool(getattr(server_args, "use_fsdp_inference", False)):
+            raise ValueError(
+                "MinWM causal Ulysses cannot be combined with FSDP inference yet."
+            )
+        if bool(getattr(server_args, "enable_torch_compile", False)):
+            raise ValueError(
+                "MinWM causal Ulysses cannot be combined with whole-DiT "
+                "torch.compile yet."
             )
 
     def create_pipeline_stages(self, server_args: ServerArgs) -> None:
