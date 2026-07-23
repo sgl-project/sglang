@@ -1078,7 +1078,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
     </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--default-chat-template-kwargs`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>A JSON object used as defaults for <code>chat_template_kwargs</code> on OpenAI-compatible chat-completion requests. For ordinary template keys, explicit per-request values take precedence. Keys are specific to the selected model's chat template; <code>reasoning_effort</code> is normalized separately.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>A JSON object used as defaults for <code>chat_template_kwargs</code> by Chat Completions, Responses, Anthropic-compatible requests, and chat tokenization. Direct Ollama and embedding paths do not consume these defaults. For ordinary template keys, explicit per-request values take precedence. Keys are specific to the selected model's chat template; <code>reasoning_effort</code> is normalized separately.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: JSON / Dict</td>
     </tr>
