@@ -118,11 +118,6 @@ def _cdiv(a: int, b: int) -> int:
     return (a + b - 1) // b
 
 
-# Horizontal fusion of same-input GEMMs (decode is launch/BW bound):
-#   moe_front: shared gate_up + router gate + latent down_proj -> one GEMM
-#   kda_bfa:   KDA b_proj + f_a_proj -> one GEMV
-_K3_FUSE_MOE_FRONT = envs.SGLANG_K3_FUSE_MOE_FRONT.get()
-
 # MegaMoE SiTU sentinel: the patched deep_gemm mega kernel selects the K3 SiTU
 # activation when activation_clamp == 0.03125 (2^-5: exactly representable and
 # unused by any legitimate swiglu clamp; the host asserts clamp >= 0 so a
@@ -164,23 +159,11 @@ def _k3_bf16_gemm(
     return torch.mm(x, weight.t(), out=out)
 
 
-_K3_FUSE_KDA_BFA = envs.SGLANG_K3_FUSE_KDA_BFA.get()
-# Use the dedicated CUDA decode-GEMV kernel for the skinny KDA projections
-# (b+f_a merged, f_b) instead of cublas gemvx/dot dispatch.
-_K3_DECODE_GEMV = envs.SGLANG_K3_DECODE_GEMV.get()
-# MLA output gate x * sigmoid(g) in one kernel instead of two elementwise.
-_K3_FUSE_O_GATE = envs.SGLANG_K3_FUSE_O_GATE.get()
 # Fully fused KDA decode step (conv1d + delta rule + gated RMSNorm in one
 # kernel, jit_kernel/kda_fused_decode). The model hands the output-norm gate
 # to the KDA backend via an attempt-and-verify stash on the attention layer;
 # unconsumed stashes fall back to the unfused chain + o_norm here.
 _K3_KDA_FUSED_DECODE = envs.SGLANG_KDA_FUSED_DECODE.get()
-
-# Multi-stream overlap (deepseek_v4-style alt-stream pool, capture mode only):
-# the MLA output-gate GEMM is independent of the attention core, so it is
-# issued on an alt stream and runs while attention occupies the main stream.
-_K3_MULTI_STREAM = envs.SGLANG_K3_MULTI_STREAM.get()
-
 
 def _merge_weights_as_views(
     mods: list, pad_rows_to: int = 1
@@ -545,11 +528,7 @@ class KimiK3MoE(nn.Module):
         cuda graph capture); only plain bf16/fp16 dense weights are merged —
         quantized or mixed-dtype checkpoints keep the unfused path.
         """
-        if not (
-            _K3_FUSE_MOE_FRONT
-            and self.use_latent_moe
-            and self.shared_experts is not None
-        ):
+        if not (self.use_latent_moe and self.shared_experts is not None):
             return
         mods = [
             self.shared_experts.gate_up_proj,
@@ -575,8 +554,7 @@ class KimiK3MoE(nn.Module):
         returns the complete sum — all-reducing it again would multiply by
         tp_size) and a dense shared down weight for the direct out= GEMM."""
         return (
-            _K3_FUSE_MOE_FRONT
-            and self.use_latent_moe
+            self.use_latent_moe
             and self.shared_experts is not None
             and self._front_w is not None
             and get_moe_a2a_backend().is_none()
@@ -1235,7 +1213,7 @@ class KimiK3DeltaAttention(nn.Module):
 
         Called once from load_weights (after all weights are loaded, before
         cuda graph capture)."""
-        if not (_K3_FUSE_KDA_BFA and self.use_full_rank_gate):
+        if not self.use_full_rank_gate:
             return
         self._bfa_w, sizes = _merge_weights_as_views(
             [self.f_a_proj, self.b_proj], pad_rows_to=8
@@ -1301,14 +1279,10 @@ class KimiK3DeltaAttention(nn.Module):
             if self._bfa_w is not None:
                 w = self._bfa_w
                 n_fa, n_b = self._bfa_fa_size, self._bfa_b_size
-                if _K3_DECODE_GEMV:
-                    from sglang.jit_kernel.kimi_k3 import kimi_k3_tiny_gemm as gemm
+                from sglang.jit_kernel.kimi_k3 import kimi_k3_tiny_gemm as gemm
 
-                    bfa = gemm(hidden_states, w)
-                    forget_gate = gemm(bfa[..., :n_fa], self.f_b_proj.weight)
-                else:
-                    bfa = torch.nn.functional.linear(hidden_states, w)
-                    forget_gate = self.f_b_proj(bfa[..., :n_fa])[0]
+                bfa = gemm(hidden_states, w)
+                forget_gate = gemm(bfa[..., :n_fa], self.f_b_proj.weight)
                 beta = bfa[..., n_fa : n_fa + n_b]
             else:
                 beta = self.b_proj(hidden_states)[0]
@@ -1465,7 +1439,7 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             # (gate, ready event) issued on the alt stream by forward();
             # None when the lazy path computes the gate here instead.
             self._gate_precomputed = None
-            self._gate_alt_stream = gate_alt_stream if _K3_MULTI_STREAM else None
+            self._gate_alt_stream = gate_alt_stream
             # Above this token count the attention-core kernels fill the SMs
             # on their own and the overlap only adds sync overhead (same
             # bound as deepseek_v4).
@@ -1494,7 +1468,7 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
                     )
                     from sglang.jit_kernel.kimi_k3 import mla_output_gate
 
-                    if _K3_FUSE_O_GATE and mla_output_gate.covered(x, gate):
+                    if mla_output_gate.covered(x, gate):
                         # One kernel for x * sigmoid(gate); double rounding
                         # matches the unfused pair bit-for-bit.
                         x = mla_output_gate.kimi_k3_mla_output_gate(x, gate)
