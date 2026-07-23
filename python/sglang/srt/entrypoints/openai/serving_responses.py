@@ -478,6 +478,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 else True
             ),
             stop=request.stop,
+            reasoning_effort=(request.reasoning.effort if request.reasoning else None),
         )
 
         is_multimodal = self.tokenizer_manager.model_config.is_multimodal

@@ -16,7 +16,7 @@ On A3 each card has 2 dies, so `--tp-size` is twice the card count; see [Ascend 
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | Qwen3.6-27B | Atlas 800I A3 | 1 | PD Mixed | 1024x1024 (30)+1024 | 50ms | BF16 | [Optimal Configuration](#qwen3-6-27b-1p-in1024x1024-30-out1024-50ms) |
 | Qwen3.6-27B | Atlas 800I A3 | 1 | PD Mixed | 1080p_30+256 | 50ms | BF16 | [Optimal Configuration](#qwen3-6-27b-1p-in1080p-30-out256-50ms) |
-| Qwen3.6-27B | Atlas 800I A3 | 2 | PD Mixed | 64k+1k (90% prefix cache hit rate) | 50ms | BF16 | [Optimal Configuration](#qwen3-6-27b-2p-in64k-out1k-prefix90-50ms) |
+| Qwen3.6-27B | Atlas 800I A3 | 1 | PD Mixed | 64k+1k (90% prefix cache hit rate) | 50ms | BF16 | [Optimal Configuration](#qwen3-6-27b-1p-in64k-out1k-prefix90-50ms) |
 | Qwen3.6-27B | Atlas 800I A3 | 1 | PD Mixed | 3.5k+1.5k | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-6-27b-w8a8-1p-in3k5-out1k5-50ms) |
 | Qwen3.6-27B | Atlas 800I A3 | 1 | PD Mixed | 64k+1k | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-6-27b-w8a8-1p-in64k-out1k-50ms) |
 | Qwen3.6-27B | Atlas 800I A3 | 2 | PD Mixed | 128k+1k | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-6-27b-w8a8-2p-in128k-out1k-50ms) |
@@ -224,13 +224,13 @@ python -m sglang.bench_serving \
     --random-range-ratio 1
 ```
 
-### Qwen3.6-27B 2P IN64K OUT1K PREFIX90 50ms
+### Qwen3.6-27B 1P IN64K OUT1K PREFIX90 50ms
 
 **Model**: Qwen3.6-27B
 
 **Hardware**: Atlas 800I A3
 
-**Cards**: 2
+**Cards**: 1
 
 **Deploy Mode**: PD Mixed
 
@@ -307,7 +307,7 @@ python3 -m sglang.launch_server \
 
 We tested it based on the `generated-shared-prefix` dataset with 90% cache hit (`repeat_rate = 0.9`):
 `--gsp-system-prompt-len 57600` = `int(64000 * 0.9)` is the shared prefix portion.
-`--gsp-question-len 6399` = `int(64000 * (1 - 0.9))` is the unique per-request suffix.
+`--gsp-question-len 6400` = `int(64000 * (1 - 0.9))` is the unique per-request suffix.
 `--gsp-num-groups 1` keeps all requests in one prefix group for maximum cache reuse.
 
 ```bash Command
@@ -319,7 +319,7 @@ python -m sglang.bench_serving \
     --gsp-num-groups 1 \
     --gsp-prompts-per-group 80 \
     --gsp-system-prompt-len 57600 \
-    --gsp-question-len 6399 \
+    --gsp-question-len 6400 \
     --gsp-output-len 1000 \
     --max-concurrency 20 \
     --num-prompts 80 \
