@@ -8,6 +8,24 @@ import torch
 from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
     is_unified_kv_triton,
 )
+from sglang.kernels.ops.speculative.dspark.dspark_accept import (
+    AcceptGreedy,
+    AcceptSampling,
+    FinalizeAcceptLens,
+    SelectMixedAccept,
+    SoftmaxTemp,
+    accept_greedy_triton,
+    finalize_accept_lens_triton,
+)
+from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
+    BuildCommitInjectLayout,
+    BuildOutTokens,
+    BuildRaggedVerifyWindow,
+    RaggedVerifyWindow,
+    ScatterCompactToStrided,
+    build_unified_commit_inject_layout,
+    scatter_compact_to_strided_into,
+)
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
@@ -21,24 +39,6 @@ from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
 from sglang.srt.speculative.dspark_components.dspark_planner import (
     VerifyWindow,
     apply_logits_adjustments_strided,
-)
-from sglang.srt.speculative.dspark_components.kernels.dspark_accept import (
-    AcceptGreedy,
-    AcceptSampling,
-    FinalizeAcceptLens,
-    SelectMixedAccept,
-    SoftmaxTemp,
-    accept_greedy_triton,
-    finalize_accept_lens_triton,
-)
-from sglang.srt.speculative.dspark_components.kernels.dspark_verify_window import (
-    BuildCommitInjectLayout,
-    BuildOutTokens,
-    BuildRaggedVerifyWindow,
-    RaggedVerifyWindow,
-    ScatterCompactToStrided,
-    build_unified_commit_inject_layout,
-    scatter_compact_to_strided_into,
 )
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 

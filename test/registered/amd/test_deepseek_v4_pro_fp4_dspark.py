@@ -16,7 +16,7 @@ import requests
 import torch
 
 from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import runtime
-from sglang.srt.speculative.dspark_components.kernels import dspark_verify_window
+from sglang.kernels.ops.speculative.dspark import dspark_verify_window
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
