@@ -125,12 +125,22 @@ def _make_inputs(
 # -----------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize(
+    "verify_width",
+    [
+        pytest.param(2, id="minimum"),
+        pytest.param(4, id="legacy-limit"),
+        pytest.param(5, id="first-over-limit"),
+        pytest.param(8, id="default"),
+        pytest.param(12, id="ring-capacity"),
+    ],
+)
 @pytest.mark.parametrize("planner_on_device", [False, True], ids=["cpu", "gpu"])
 def test_paged_prefill_dspark_rewrites_full_verify_window(
     planner_on_device: bool,
+    verify_width: int,
 ) -> None:
-    """All gamma+1 verifier rows must be present in the write plan."""
-    verify_width = 5  # DSpark gamma=4 verifies gamma+1 target rows.
+    """Every valid DSpark verify width must be present in the write plan."""
     ctx = make_paged_context(bs=1, compress_ratio=RATIO, ring_size=16)
     seq_lens = torch.tensor([100], dtype=torch.int64)
     extend_lens = torch.tensor([verify_width], dtype=torch.int64)
