@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Optional, Union
+from typing import TYPE_CHECKING, Optional, Union
 
 import msgspec
 import torch
@@ -15,11 +15,7 @@ from sglang.srt.managers.overlap_utils import (
     FutureMap,
     ResolvedConfidence,
 )
-from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
-from sglang.srt.speculative.dflash_utils import apply_dflash_verify_logits_adjustments
 from sglang.srt.speculative.dspark_components.dspark_sps import (
     SpsAdditiveCostTable,
     SpsCostTable,
@@ -46,6 +42,11 @@ from sglang.srt.utils.async_probe import (
     maybe_detect_in_closed_range,
 )
 from sglang.srt.utils.common import require_mlp_tp_gather
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import ScheduleBatch
+    from sglang.srt.server_args import ServerArgs
+    from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 
 logger = logging.getLogger(__name__)
 
@@ -866,6 +867,10 @@ def apply_logits_adjustments_strided(
 ) -> None:
     if sampling_info is None:
         return
+    from sglang.srt.speculative.dflash_utils import (
+        apply_dflash_verify_logits_adjustments,
+    )
+
     apply_dflash_verify_logits_adjustments(
         next_token_logits=next_token_logits,
         sampling_info=sampling_info,

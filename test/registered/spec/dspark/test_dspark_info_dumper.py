@@ -20,7 +20,6 @@ from sglang.srt.speculative.dspark_components.dspark_observability import (
 )
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -84,7 +83,7 @@ def make_obs(
     )
 
 
-class TestResolveComponents(CustomTestCase):
+class TestResolveComponents(unittest.TestCase):
     def test_empty_disables(self):
         self.assertEqual(resolve_components(()), set())
 
@@ -123,7 +122,7 @@ class TestResolveComponents(CustomTestCase):
                 )
 
 
-class TestCoreAndCpuTiming(CustomTestCase):
+class TestCoreAndCpuTiming(unittest.TestCase):
     def test_disabled_dumper_records_nothing(self):
         dumper, clock = make_dumper(set())
         dumper.begin_step()
@@ -231,7 +230,7 @@ class TestCoreAndCpuTiming(CustomTestCase):
         self.assertEqual([r["forward_ct"] for r in dumper.dump()["records"]], [9, 10])
 
 
-class TestPredictedStepFields(CustomTestCase):
+class TestPredictedStepFields(unittest.TestCase):
     def test_predicted_fields_recorded_under_core(self):
         dumper, clock = make_dumper({"core"})
         dumper.observe_decode_step(
@@ -273,7 +272,7 @@ def _pending(*, bs, budget, num_verify_tokens, predicted_step_ms):
     )
 
 
-class TestOnlineSpsReporter(CustomTestCase):
+class TestOnlineSpsReporter(unittest.TestCase):
     def test_report_interval_enables_dumper_and_gpu_timing(self):
         dumper, _ = make_dumper(set(), sps_report_interval=2)
         self.assertTrue(dumper.enabled)
@@ -332,7 +331,7 @@ class TestOnlineSpsReporter(CustomTestCase):
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA for d2h staging")
-class TestReqsAndGpuTiming(CustomTestCase):
+class TestReqsAndGpuTiming(unittest.TestCase):
     def _cuda_obs(self, *, forward_ct, bs=4):
         obs = make_obs(forward_ct=forward_ct, bs=bs)
         return DecodeStepObservation(

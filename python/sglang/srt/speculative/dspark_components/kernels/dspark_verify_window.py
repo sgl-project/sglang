@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import msgspec
 import torch
 import triton
 import triton.language as tl
 
 from sglang.kernels.ops.speculative.cache_locs import assign_extend_cache_locs_func
-from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.speculative.dspark_components.kernels.dispatch import inputs_on_cuda
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import ScheduleBatch
 
 
 class RaggedVerifyWindow(msgspec.Struct, frozen=True):
