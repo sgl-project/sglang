@@ -142,6 +142,9 @@ class EagleDraftCudaGraphRunnerAdapter:
     init_eager_metadata: Callable[
         [Any, ForwardBatch, EagleDraftRunnerSettings], None
     ] = None
+    assert_backend_state: Callable[[Any, Any, EagleDraftRunnerSettings, str], None] = (
+        lambda _testcase, _backend, _settings, _phase: None
+    )
 
 
 @dataclass(frozen=True)
@@ -510,6 +513,12 @@ def run_eagle_draft_cuda_graph_runner_case(
             init_eager_metadata=adapter.init_eager_metadata,
             settings=settings,
         )
+        adapter.assert_backend_state(
+            testcase,
+            eager_worker.draft_attn_backend,
+            settings,
+            "eager",
+        )
 
         graph_fixture, graph_worker, graph_backend = _build_eagle_draft_fixture(
             testcase,
@@ -525,10 +534,22 @@ def run_eagle_draft_cuda_graph_runner_case(
             graph_backend,
             settings,
         )
+        adapter.assert_backend_state(
+            testcase,
+            graph_backend,
+            settings,
+            "capture",
+        )
         adapter.prepare_replay_state(graph_fixture, case, draft_inputs, settings)
 
         testcase.assertTrue(graph_runner.can_run_graph(graph_batch))
         actual = graph_runner.execute(graph_batch)
+        adapter.assert_backend_state(
+            testcase,
+            graph_backend,
+            settings,
+            "replay",
+        )
         adapter.assert_outputs_close(actual, expected, settings)
     finally:
         _reset_cuda_graph_test_buffers()
@@ -1405,17 +1426,76 @@ def _init_dsv4_eager_metadata(
     batch: ForwardBatch,
     settings: EagleDraftRunnerSettings,
 ) -> None:
-    """Per-step DSV4 init for the eager comparison path.
+    """Aggregate DSV4 init for the eager comparison path.
 
     After PR #26239 `DeepseekV4AttnBackend.init_forward_metadata` slices the
     multi-step `out_cache_loc` internally using `self.speculative_step_id`
     (each per-step backend in `multi_step_backend.attn_backends[i]` was
-    constructed with `speculative_step_id=i`). Pass the full
-    `bs * topk * num_steps` buffer through each per-step init unchanged.
+    constructed with `speculative_step_id=i`). The aggregate backend initializes
+    only the `num_steps - 1` backends that execute a draft forward.
     """
-    multi_step_backend = worker.draft_attn_backend
-    for attn_backend in multi_step_backend.attn_backends:
-        attn_backend.init_forward_metadata(batch)
+    del settings
+    worker.draft_attn_backend.init_forward_metadata(batch)
+
+
+def _assert_dsv4_draft_backend_state(
+    testcase,
+    multi_step_backend,
+    settings: EagleDraftRunnerSettings,
+    phase: str,
+) -> None:
+    from sglang.srt.layers.attention.deepseek_v4_backend import (
+        DSV4Metadata,
+        DSV4RawDecodeMetadata,
+    )
+
+    expected_step_ids = list(range(max(settings.speculative_num_steps - 1, 0)))
+    active_backends = [
+        backend
+        for backend in multi_step_backend.attn_backends
+        if backend.forward_metadata is not None
+    ]
+    testcase.assertEqual(
+        [backend.speculative_step_id for backend in active_backends],
+        expected_step_ids,
+        f"{phase}: only draft steps that execute forwards should prepare metadata",
+    )
+
+    for backend in active_backends:
+        metadata = backend.forward_metadata
+        if isinstance(metadata, DSV4RawDecodeMetadata):
+            # PREP_IN_CUDA_GRAPH restores raw metadata after capture. The
+            # patched compression builders in the caller prove that its
+            # recorded Raw->Full upgrade remains SWA-only.
+            continue
+        testcase.assertIsInstance(metadata, DSV4Metadata)
+        testcase.assertIsNone(metadata.indexer_metadata)
+        testcase.assertIsNone(metadata.c4_compress_metadata)
+        testcase.assertIsNone(metadata.c128_compress_metadata)
+
+        core = metadata.core_attn_metadata
+        testcase.assertEqual(
+            core.page_table.shape[-1],
+            1,
+            f"{phase}: draft SWA metadata should use a one-page table",
+        )
+        for field_name in (
+            "c4_out_loc",
+            "c4_topk_lengths_raw",
+            "c4_topk_lengths_clamp1",
+            "c4_sparse_topk_lengths",
+            "c4_sparse_page_indices",
+            "c4_sparse_raw_indices",
+            "c128_out_loc",
+            "c128_page_indices",
+            "c128_topk_lengths_clamp1",
+            "c4_flashmla_metadata",
+            "c128_flashmla_metadata",
+        ):
+            testcase.assertIsNone(
+                getattr(core, field_name),
+                f"{phase}: draft metadata unexpectedly populated {field_name}",
+            )
 
 
 def _make_dsv4_eagle_draft_forward_batch(
@@ -1515,18 +1595,44 @@ def run_dsv4_eagle_draft_cuda_graph_runner_case(
         make_forward_batch=_make_forward_batch,
         check_case=_check_dsv4_draft_cache_layout,
         init_eager_metadata=_init_dsv4_eager_metadata,
+        assert_backend_state=_assert_dsv4_draft_backend_state,
     )
-    run_eagle_draft_cuda_graph_runner_case(
-        testcase,
-        case,
-        adapter=adapter,
-        build_kwargs=dict(
-            max_context_len=max_context_len,
-            dtype=dtype,
-            device=device,
+    from sglang.srt.layers.attention import deepseek_v4_backend
+
+    with (
+        patch.object(
+            deepseek_v4_backend.DSV4AttnMetadata,
+            "init_compression_metadata",
+            side_effect=AssertionError(
+                "DSV4 draft decode must not initialize compression metadata"
+            ),
         ),
-        settings=settings,
-    )
+        patch.object(
+            deepseek_v4_backend.DeepseekV4AttnBackend,
+            "init_forward_metadata_indexer",
+            side_effect=AssertionError(
+                "DSV4 draft decode must not initialize indexer metadata"
+            ),
+        ),
+        patch.object(
+            deepseek_v4_backend,
+            "create_paged_compressor_data",
+            side_effect=AssertionError(
+                "DSV4 draft decode must not initialize compressor metadata"
+            ),
+        ),
+    ):
+        run_eagle_draft_cuda_graph_runner_case(
+            testcase,
+            case,
+            adapter=adapter,
+            build_kwargs=dict(
+                max_context_len=max_context_len,
+                dtype=dtype,
+                device=device,
+            ),
+            settings=settings,
+        )
 
 
 # ---------------------------------------------------------------------------

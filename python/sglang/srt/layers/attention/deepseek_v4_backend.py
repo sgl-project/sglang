@@ -671,14 +671,38 @@ class DeepseekV4AttnBackend(
                 out_cache_loc=out_cache_loc,
             )
 
+        return self._make_forward_metadata_decode(
+            max_seq_len=max_seq_len,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            out_cache_loc=out_cache_loc,
+        )
+
+    def _make_forward_metadata_decode(
+        self,
+        max_seq_len: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        out_cache_loc: torch.Tensor,
+    ) -> DSV4Metadata:
+        # DSV4 draft models contain only the ratio-0 NextN/DSpark attention
+        # layer. Avoid materializing the full-context page table and compressed
+        # attention metadata that only ratio-4/128 target layers consume.
+        need_compress = not self.is_draft_runner
         core_attn_metadata = self.make_core_attn_metadata(
             req_to_token=self.req_to_token,
             req_pool_indices_repeated=req_pool_indices,
             seq_lens_casual=seq_lens,
-            max_seq_len=max_seq_len,
+            max_seq_len=max_seq_len if need_compress else self.page_size,
             out_loc=out_cache_loc,
-            need_compress=True,
+            need_compress=need_compress,
         )
+
+        if not need_compress:
+            return DSV4Metadata(
+                core_attn_metadata=core_attn_metadata,
+                indexer_metadata=None,
+            )
 
         indexer_metadata = self.init_forward_metadata_indexer(core_attn_metadata)
 
@@ -1016,34 +1040,11 @@ class DeepseekV4AttnBackend(
         self,
         raw_metadata: DSV4RawDecodeMetadata,
     ) -> DSV4Metadata:
-        req_pool_indices = raw_metadata.req_pool_indices
-        seq_lens = raw_metadata.seq_lens
-        out_cache_loc = raw_metadata.out_cache_loc
-
-        core_attn_metadata = self.make_core_attn_metadata(
-            req_to_token=self.req_to_token,
-            req_pool_indices_repeated=req_pool_indices,
-            seq_lens_casual=seq_lens,
+        return self._make_forward_metadata_decode(
             max_seq_len=self.MAX_SEQ_LEN_FOR_CAPTURE,
-            out_loc=out_cache_loc,
-            need_compress=True,
-        )
-        indexer_metadata = self.init_forward_metadata_indexer(core_attn_metadata)
-
-        create = functools.partial(
-            create_paged_compressor_data,
-            is_prefill=False,
-            token_to_kv_pool=self.token_to_kv_pool,
-            req_to_token=self.req_to_token,
-            req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens,
-        )
-
-        return DSV4Metadata(
-            core_attn_metadata,
-            indexer_metadata,
-            c4_compress_metadata=create(compress_ratio=4),
-            c128_compress_metadata=create(compress_ratio=128),
+            req_pool_indices=raw_metadata.req_pool_indices,
+            seq_lens=raw_metadata.seq_lens,
+            out_cache_loc=raw_metadata.out_cache_loc,
         )
 
     def init_forward_metadata_draft_extend(
@@ -1544,8 +1545,10 @@ class DeepseekV4AttnBackend(
         ):
             core = metadata.core_attn_metadata
             core.c1_flashmla_metadata = _create_flashmla_metadata()
-            core.c4_flashmla_metadata = _create_flashmla_metadata()
-            core.c128_flashmla_metadata = _create_flashmla_metadata()
+            if core.c4_flashmla_metadata is not None:
+                core.c4_flashmla_metadata = _create_flashmla_metadata()
+            if core.c128_flashmla_metadata is not None:
+                core.c128_flashmla_metadata = _create_flashmla_metadata()
 
         # PREP_IN_CUDA_GRAPH=True: warmup upgraded raw->full on the host;
         # restore raw so capture re-runs the upgrade inside the graph.
@@ -1609,6 +1612,11 @@ class DeepseekV4AttnBackend(
         attn_sink: Optional[torch.Tensor] = None,
         **_,
     ) -> torch.Tensor:
+        assert not self.is_draft_runner or compress_ratio == 0, (
+            "DSV4 draft attention only supports compress_ratio == 0, "
+            f"got {compress_ratio=}"
+        )
+
         if self.mtp_enabled and forward_batch.forward_mode.is_idle():
             return q.new_empty(q.shape[0], q.shape[1], layer.v_head_dim)
 
@@ -2051,8 +2059,8 @@ class DeepseekV4MultiStepBackend(DeepseekV4AttnBackend):
             )
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
-        for attn_backend in self.attn_backends:
-            attn_backend.init_forward_metadata_in_graph(forward_batch)
+        for i in range(self.speculative_num_steps - 1):
+            self.attn_backends[i].init_forward_metadata_in_graph(forward_batch)
 
     def init_forward_metadata_out_graph(
         self,
@@ -2080,7 +2088,7 @@ class DeepseekV4MultiStepBackend(DeepseekV4AttnBackend):
             spec_info=forward_batch.spec_info,
         )
         if in_capture:
-            for i in range(self.speculative_num_steps):
+            for i in range(self.speculative_num_steps - 1):
                 self.attn_backends[i].init_forward_metadata_out_graph(
                     inner_fb, in_capture=True
                 )
